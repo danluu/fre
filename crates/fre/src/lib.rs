@@ -6,10 +6,12 @@
 //! experimental, explicit opt-in 16-byte exact-literal JIT leaf with portable
 //! fallback outside its evidence-gated large-window envelope. No default
 //! facade selects that native route.
-//! The default-off `explicit-search-span-aot` feature adds only a safe binder
-//! from an already-adopted static Search Span handle to the authenticated
-//! portable exact-literal owner. It does not adopt, link, compile, authorize,
-//! or automatically select AOT code.
+//! The default-off `explicit-search-span-aot` feature adds safe binders from
+//! an already-adopted static Search Span handle to the authenticated portable
+//! exact-literal owner. Exact legacy rows remain explicit AOT-only calls. A
+//! separately typed automatic wrapper is available only when the adopted
+//! broad production family carries a source-qualified window/prefix/evidence
+//! policy; no default [`PortableRegex`] call selects AOT code.
 //! The separate default-off `explicit-count-v3-aot` feature binds an
 //! already-adopted optimizing Count-v3 handle only to the live fixed-policy
 //! exact-literal Count owner whose literal, semantic identity, and planning
@@ -299,7 +301,8 @@ pub use fre_aggregate::{
 };
 #[cfg(feature = "explicit-search-span-aot")]
 pub use fre_aot_static_runtime::{
-    StaticSearchSpanCallErrorV1, StaticSearchSpanThreadContractErrorV1, VerifiedStaticSearchSpanV1,
+    StaticSearchSpanCallErrorV1, StaticSearchSpanFamilyExecutionPolicyV1,
+    StaticSearchSpanThreadContractErrorV1, VerifiedStaticSearchSpanV1,
 };
 pub use fre_capture_lab::{
     AggregateLimits as CaptureAggregateLimits, BuildError as CaptureEngineBuildError,
@@ -508,7 +511,8 @@ pub use search_aot::{
 };
 #[cfg(feature = "explicit-search-span-aot")]
 pub use search_aot_facade::{
-    SearchExactLiteralAotBindErrorV1, SearchExactLiteralAotThreadSessionV1, SearchExactLiteralAotV1,
+    SearchExactLiteralAotBindErrorV1, SearchExactLiteralAotThreadSessionV1,
+    SearchExactLiteralAotV1, SearchExactLiteralAutoAotV1,
 };
 pub use set::{
     PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION, PortableRegexSet, PortableRegexSetBuildError,

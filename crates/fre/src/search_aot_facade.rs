@@ -7,21 +7,28 @@
 //! semantic identity and the live literal width before a native call can be
 //! reached.
 //!
-//! The wrapper never falls back, compiles, links, populates an authority row,
-//! adopts an address, or borrows JIT authority. Every call delegates exactly
-//! once to the static runtime's checked call boundary, which performs the one
-//! literal resource preflight before entering native code.
+//! [`SearchExactLiteralAotV1`] never falls back and delegates exactly once to
+//! the static runtime's checked call boundary. The separately typed
+//! [`SearchExactLiteralAutoAotV1`] requires a source-qualified broad-family
+//! execution policy: below-floor work stays directly portable, while eligible
+//! work receives one full preflight followed by a portable prefix and a
+//! disjoint static tail. Neither wrapper compiles, links, populates authority,
+//! adopts an address, or borrows JIT authority.
 
 use core::fmt;
 
 use fre_aot_static_runtime::{
-    StaticSearchSpanCallErrorV1, StaticSearchSpanThreadContractErrorV1,
-    StaticSearchSpanThreadSessionV1, VerifiedStaticSearchSpanV1,
+    StaticSearchSpanCallErrorV1, StaticSearchSpanFamilyExecutionPolicyV1,
+    StaticSearchSpanThreadContractErrorV1, StaticSearchSpanThreadSessionV1,
+    VerifiedStaticSearchSpanV1,
 };
-use fre_kernel_ir::{MatchSpan, SearchWindow as NativeSearchWindow};
+use fre_kernel_ir::{CheckedSearchWindow, MatchSpan, SearchWindow as NativeSearchWindow};
+use fre_kernels::{
+    LiteralAccounting, LiteralPlan, LiteralSearchPreflight, Window as LiteralWindow,
+};
 
 use crate::{
-    Match, PortableRegex, SearchAccounting, SearchExactLiteralAotCandidate,
+    Match, PortablePlan, PortableRegex, SearchAccounting, SearchExactLiteralAotCandidate,
     SearchExactLiteralAotSemanticBindingIdentity, SearchLimits, SearchWindow, literal_limits,
 };
 
@@ -52,6 +59,14 @@ pub enum SearchExactLiteralAotBindErrorV1 {
     /// The adopted compiler-domain literal identity does not authenticate the
     /// portable owner's exact literal bytes.
     LiteralIdentityMismatch,
+    /// Only a broad, source-qualified production family can authorize
+    /// automatic workload routing. Exact legacy rows remain AOT-only.
+    ProductionFamilyExecutionPolicyRequired,
+    /// The authenticated family floor cannot be represented on this target.
+    MinimumWindowBytesNotRepresentable { bytes: u32 },
+    /// The authenticated portable-prefix size cannot be represented on this
+    /// target.
+    PortablePrefixCandidateStartsNotRepresentable { starts: u32 },
 }
 
 impl fmt::Display for SearchExactLiteralAotBindErrorV1 {
@@ -69,6 +84,13 @@ impl std::error::Error for SearchExactLiteralAotBindErrorV1 {}
 struct CheckedBindingV1 {
     semantic_binding_identity: SearchExactLiteralAotSemanticBindingIdentity,
     literal_bytes: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CheckedAutomaticPolicyV1 {
+    source: StaticSearchSpanFamilyExecutionPolicyV1,
+    minimum_window_bytes: usize,
+    portable_prefix_candidate_starts: usize,
 }
 
 /// Safe, explicit Search-v1 Span AOT view of one portable exact-literal owner.
@@ -230,6 +252,158 @@ impl<'binding> SearchExactLiteralAotV1<'binding> {
     }
 }
 
+/// Safe automatic portable/AOT view of one source-qualified static Search
+/// family.
+///
+/// This wrapper is deliberately separate from [`SearchExactLiteralAotV1`].
+/// Exact legacy rows can still be called explicitly through that type, but
+/// they cannot acquire automatic routing authority. Construction here
+/// requires the source-qualified family policy retained by the adopted
+/// handle, including its minimum window, portable-prefix ownership, and
+/// qualification identities.
+///
+/// Calls below the authenticated window floor execute the portable owner
+/// directly. Eligible calls perform one full-window resource preflight,
+/// search the family-owned portable prefix, and invoke the static entry only
+/// for the disjoint tail. A native failure is returned to the caller; it is
+/// never hidden by retrying the portable engine.
+pub struct SearchExactLiteralAutoAotV1<'binding> {
+    portable_owner: &'binding PortableRegex,
+    portable_plan: &'binding LiteralPlan,
+    verified: &'binding VerifiedStaticSearchSpanV1,
+    checked: CheckedBindingV1,
+    policy: CheckedAutomaticPolicyV1,
+}
+
+impl fmt::Debug for SearchExactLiteralAutoAotV1<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SearchExactLiteralAutoAotV1")
+            .field("portable_owner", &self.portable_owner)
+            .field(
+                "semantic_binding_identity",
+                &self.checked.semantic_binding_identity,
+            )
+            .field("literal_bytes", &self.checked.literal_bytes)
+            .field("backend_version", &self.verified.backend_version())
+            .field("family_execution_policy", &self.policy.source)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'binding> SearchExactLiteralAutoAotV1<'binding> {
+    /// Bind a portable exact-literal semantic owner to one adopted production
+    /// family and its authenticated automatic-routing policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchExactLiteralAotBindErrorV1`] if either the semantic
+    /// binding or the source-qualified execution policy is unavailable.
+    pub fn bind(
+        portable_owner: &'binding PortableRegex,
+        verified: &'binding VerifiedStaticSearchSpanV1,
+    ) -> Result<Self, SearchExactLiteralAotBindErrorV1> {
+        let checked = check_binding_v1(
+            portable_owner.exact_literal_search_aot_candidate(),
+            verified.semantic_binding_identity(),
+            verified.live_literal_bytes(),
+            |literal| verified.authenticates_literal(literal),
+        )?;
+        let policy =
+            checked_automatic_policy_v1(verified.family_execution_policy().ok_or(
+                SearchExactLiteralAotBindErrorV1::ProductionFamilyExecutionPolicyRequired,
+            )?)?;
+        let PortablePlan::ExactLiteral(portable_plan) = &portable_owner.plan else {
+            return Err(SearchExactLiteralAotBindErrorV1::PortableOwnerIsNotExactLiteralCandidate);
+        };
+        Ok(Self {
+            portable_owner,
+            portable_plan,
+            verified,
+            checked,
+            policy,
+        })
+    }
+
+    /// Search a complete haystack with the authenticated portable-prefix/AOT-
+    /// tail policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StaticSearchSpanCallErrorV1`] for a portable preflight
+    /// refusal, a native result failure, or a backend thread-contract
+    /// requirement.
+    #[inline]
+    pub fn find(
+        &self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<(Option<Match>, SearchAccounting), StaticSearchSpanCallErrorV1> {
+        self.find_window(haystack, SearchWindow::new(0, haystack.len()), limits)
+    }
+
+    /// Search one half-open window with the authenticated portable-prefix/AOT-
+    /// tail policy.
+    ///
+    /// Invalid or below-floor windows go directly through the portable owner,
+    /// before a [`CheckedSearchWindow`] or native preflight token is created.
+    /// Eligible windows receive one authoritative full-window preflight. A
+    /// prefix match returns that full accounting; otherwise the exact same
+    /// token is narrowed to the disjoint AOT tail.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StaticSearchSpanCallErrorV1`] without retrying a failed native
+    /// call.
+    #[inline]
+    pub fn find_window(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<(Option<Match>, SearchAccounting), StaticSearchSpanCallErrorV1> {
+        find_window_automatically_v1(
+            self.portable_plan,
+            haystack,
+            window,
+            limits,
+            self.policy.minimum_window_bytes,
+            self.policy.portable_prefix_candidate_starts,
+            |tail| self.verified.search_preflighted(tail),
+        )
+    }
+
+    /// Portable matcher retained as the semantic and fallback owner.
+    #[must_use]
+    pub const fn portable_owner(&self) -> &PortableRegex {
+        self.portable_owner
+    }
+
+    /// Adopted source-family handle retained as the tail executor.
+    #[must_use]
+    pub const fn verified_handle(&self) -> &VerifiedStaticSearchSpanV1 {
+        self.verified
+    }
+
+    /// Complete facade semantic identity checked at binding.
+    #[must_use]
+    pub const fn semantic_binding_identity(&self) -> SearchExactLiteralAotSemanticBindingIdentity {
+        self.checked.semantic_binding_identity
+    }
+
+    /// Exact live literal width checked at binding.
+    #[must_use]
+    pub const fn literal_bytes(&self) -> u32 {
+        self.checked.literal_bytes
+    }
+
+    /// Authenticated production-family execution and evidence policy.
+    #[must_use]
+    pub const fn family_execution_policy(&self) -> StaticSearchSpanFamilyExecutionPolicyV1 {
+        self.policy.source
+    }
+}
+
 /// Same-thread invocation token for a bound static Search-v1 Span handle.
 ///
 /// The embedded static-runtime token makes this value neither `Send` nor
@@ -342,6 +516,94 @@ impl SearchExactLiteralAotThreadSessionV1<'_> {
     }
 }
 
+fn checked_automatic_policy_v1(
+    source: StaticSearchSpanFamilyExecutionPolicyV1,
+) -> Result<CheckedAutomaticPolicyV1, SearchExactLiteralAotBindErrorV1> {
+    let minimum_window_bytes = usize::try_from(source.minimum_window_bytes()).map_err(|_| {
+        SearchExactLiteralAotBindErrorV1::MinimumWindowBytesNotRepresentable {
+            bytes: source.minimum_window_bytes(),
+        }
+    })?;
+    let portable_prefix_candidate_starts =
+        usize::try_from(source.portable_prefix_candidate_starts()).map_err(|_| {
+            SearchExactLiteralAotBindErrorV1::PortablePrefixCandidateStartsNotRepresentable {
+                starts: source.portable_prefix_candidate_starts(),
+            }
+        })?;
+    Ok(CheckedAutomaticPolicyV1 {
+        source,
+        minimum_window_bytes,
+        portable_prefix_candidate_starts,
+    })
+}
+
+#[inline]
+fn find_window_automatically_v1<'plan, 'haystack>(
+    portable: &'plan LiteralPlan,
+    haystack: &'haystack [u8],
+    window: SearchWindow,
+    limits: SearchLimits,
+    minimum_window_bytes: usize,
+    portable_prefix_candidate_starts: usize,
+    invoke_tail: impl FnOnce(
+        LiteralSearchPreflight<'plan, 'haystack>,
+    ) -> Result<
+        (Option<MatchSpan>, LiteralAccounting),
+        StaticSearchSpanCallErrorV1,
+    >,
+) -> Result<(Option<Match>, SearchAccounting), StaticSearchSpanCallErrorV1> {
+    let start = window.start();
+    let end = window.end();
+    let searched_bytes = end.checked_sub(start);
+    if end > haystack.len() || searched_bytes.is_none_or(|bytes| bytes < minimum_window_bytes) {
+        return find_window_portably_v1(portable, haystack, window, limits);
+    }
+
+    let checked = CheckedSearchWindow::new(haystack, NativeSearchWindow::new(start, end))
+        .ok_or_else(|| {
+            StaticSearchSpanCallErrorV1::from(fre_kernels::LiteralError::InvalidWindow {
+                start,
+                end,
+                haystack_len: haystack.len(),
+            })
+        })?;
+    let full = portable.preflight_checked_window(checked, literal_limits(limits))?;
+    if let Some((start, end)) =
+        full.find_prefix_candidate_starts(portable_prefix_candidate_starts)?
+    {
+        return Ok((
+            Some(Match { start, end }),
+            SearchAccounting::ExactLiteral(full.accounting()),
+        ));
+    }
+    let Some(tail) = full.after_prefix_candidate_starts(portable_prefix_candidate_starts)? else {
+        return Ok((None, SearchAccounting::ExactLiteral(full.accounting())));
+    };
+    let (matched, accounting) = invoke_tail(tail)?;
+    Ok((
+        matched.map(project_match),
+        SearchAccounting::ExactLiteral(accounting),
+    ))
+}
+
+#[inline]
+fn find_window_portably_v1(
+    portable: &LiteralPlan,
+    haystack: &[u8],
+    window: SearchWindow,
+    limits: SearchLimits,
+) -> Result<(Option<Match>, SearchAccounting), StaticSearchSpanCallErrorV1> {
+    let (matched, accounting) = portable.find_window(
+        haystack,
+        LiteralWindow::new(window.start(), window.end()),
+        literal_limits(limits),
+    )?;
+    Ok((
+        matched.map(|(start, end)| Match { start, end }),
+        SearchAccounting::ExactLiteral(accounting),
+    ))
+}
+
 fn check_binding_v1(
     candidate: Option<SearchExactLiteralAotCandidate<'_>>,
     adopted_semantic_binding_identity: &[u8; 32],
@@ -390,8 +652,11 @@ const fn project_match(matched: MatchSpan) -> Match {
 
 #[cfg(test)]
 mod tests {
+    use core::cell::Cell;
+
     use super::*;
     use crate::PortableBuilder;
+    use fre_kernels::{LiteralBuildLimits, LiteralError};
 
     #[test]
     fn source_binding_accepts_only_the_candidates_own_identity_and_width() {
@@ -495,5 +760,168 @@ mod tests {
         let matched = project_match(MatchSpan::new(7, 13));
         assert_eq!(matched.start(), 7);
         assert_eq!(matched.end(), 13);
+    }
+
+    #[test]
+    fn automatic_route_sends_below_floor_and_invalid_windows_directly_portable() {
+        let plan = LiteralPlan::new(b"needle", LiteralBuildLimits::default()).unwrap();
+        let mut haystack = vec![b'x'; 64];
+        haystack[21..27].copy_from_slice(b"needle");
+        let tail_calls = Cell::new(0_u32);
+
+        let (matched, accounting) = find_window_automatically_v1(
+            &plan,
+            &haystack,
+            SearchWindow::new(0, haystack.len()),
+            SearchLimits::unlimited(),
+            4_093,
+            256,
+            |_| {
+                tail_calls.set(tail_calls.get() + 1);
+                unreachable!("below-floor calls must not create or invoke an AOT tail")
+            },
+        )
+        .unwrap();
+        assert_eq!(matched, Some(Match { start: 21, end: 27 }));
+        assert_eq!(tail_calls.get(), 0);
+        assert_eq!(
+            accounting,
+            SearchAccounting::ExactLiteral(LiteralAccounting {
+                needle_bytes: 6,
+                searched_bytes: 64,
+                linear_terms: 70,
+                scratch_bytes: 0,
+            })
+        );
+
+        let error = find_window_automatically_v1(
+            &plan,
+            &haystack,
+            SearchWindow::new(17, 11),
+            SearchLimits::unlimited(),
+            4_093,
+            256,
+            |_| unreachable!("an invalid window must not reach an AOT tail"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            StaticSearchSpanCallErrorV1::Preflight(LiteralError::InvalidWindow {
+                start: 17,
+                end: 11,
+                haystack_len: 64,
+            })
+        );
+    }
+
+    #[test]
+    fn automatic_route_owns_exact_prefix_and_tail_candidate_boundaries() {
+        const PREFIX_STARTS: usize = 4;
+        let plan = LiteralPlan::new(b"abc", LiteralBuildLimits::default()).unwrap();
+
+        let mut prefix_haystack = vec![b'x'; 32];
+        prefix_haystack[3..6].copy_from_slice(b"abc");
+        let (prefix_match, prefix_accounting) = find_window_automatically_v1(
+            &plan,
+            &prefix_haystack,
+            SearchWindow::new(0, prefix_haystack.len()),
+            SearchLimits::unlimited(),
+            16,
+            PREFIX_STARTS,
+            |_| unreachable!("candidate start three belongs to the portable prefix"),
+        )
+        .unwrap();
+        assert_eq!(prefix_match, Some(Match { start: 3, end: 6 }));
+
+        let mut tail_haystack = vec![b'x'; 32];
+        tail_haystack[4..7].copy_from_slice(b"abc");
+        let tail_calls = Cell::new(0_u32);
+        let (tail_match, tail_accounting) = find_window_automatically_v1(
+            &plan,
+            &tail_haystack,
+            SearchWindow::new(0, tail_haystack.len()),
+            SearchLimits::unlimited(),
+            16,
+            PREFIX_STARTS,
+            |tail| {
+                tail_calls.set(tail_calls.get() + 1);
+                assert_eq!(tail.checked_window().window().start(), PREFIX_STARTS);
+                let accounting = tail.accounting();
+                let matched = tail.find()?.map(|(start, end)| MatchSpan::new(start, end));
+                Ok((matched, accounting))
+            },
+        )
+        .unwrap();
+        assert_eq!(tail_calls.get(), 1);
+        assert_eq!(tail_match, Some(Match { start: 4, end: 7 }));
+        assert_eq!(tail_accounting, prefix_accounting);
+        assert_eq!(
+            tail_accounting,
+            SearchAccounting::ExactLiteral(LiteralAccounting {
+                needle_bytes: 3,
+                searched_bytes: 32,
+                linear_terms: 35,
+                scratch_bytes: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn automatic_route_retains_nonzero_window_offsets_and_full_limit_preflight() {
+        let plan = LiteralPlan::new(b"abc", LiteralBuildLimits::default()).unwrap();
+        let mut haystack = vec![b'x'; 48];
+        haystack[13..16].copy_from_slice(b"abc");
+        let window = SearchWindow::new(7, 39);
+        let (matched, accounting) = find_window_automatically_v1(
+            &plan,
+            &haystack,
+            window,
+            SearchLimits::unlimited(),
+            16,
+            4,
+            |tail| {
+                assert_eq!(tail.checked_window().window().start(), 11);
+                let accounting = tail.accounting();
+                let matched = tail.find()?.map(|(start, end)| MatchSpan::new(start, end));
+                Ok((matched, accounting))
+            },
+        )
+        .unwrap();
+        assert_eq!(matched, Some(Match { start: 13, end: 16 }));
+        assert_eq!(
+            accounting,
+            SearchAccounting::ExactLiteral(LiteralAccounting {
+                needle_bytes: 3,
+                searched_bytes: 32,
+                linear_terms: 35,
+                scratch_bytes: 0,
+            })
+        );
+
+        let tail_calls = Cell::new(0_u32);
+        let error = find_window_automatically_v1(
+            &plan,
+            &haystack,
+            window,
+            SearchLimits {
+                max_work: 34,
+                max_scratch_bytes: usize::MAX,
+            },
+            16,
+            4,
+            |_| {
+                tail_calls.set(tail_calls.get() + 1);
+                unreachable!("full-window limit refusal must precede prefix and tail execution")
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            StaticSearchSpanCallErrorV1::Preflight(LiteralError::LinearTermLimit {
+                needed: 35,
+                limit: 34,
+            })
+        );
+        assert_eq!(tail_calls.get(), 0);
     }
 }
