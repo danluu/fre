@@ -56,6 +56,12 @@ pub const SEARCH_BACKEND_ASIMD_TAG22_V1: u16 = 22;
 /// This is an inert compiler/static-link identity until a separately frozen
 /// qualification family grants execution authority.
 pub const SEARCH_BACKEND_ASIMD_TAG23_V1: u16 = 23;
+/// Advanced SIMD Search V12/tag25 with length-specialized exact confirmation.
+///
+/// This remains an inert compiler/static-link identity until a separately
+/// frozen qualification family grants execution authority. Tag24 is
+/// intentionally absent because its candidate was not promoted.
+pub const SEARCH_BACKEND_ASIMD_TAG25_V1: u16 = 25;
 /// Explicit fixed-VL16 SVE2 candidate backend. This never changes the V8
 /// default or grants qualification authority.
 pub const SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1: u16 = 21;
@@ -308,10 +314,10 @@ impl ClaimedSearchMetadataV1 {
 
 /// Decode and validate exactly one complete Search `MetadataV1` record.
 ///
-/// Besides checking an admitted macOS-V8, Linux-V8, or Linux-tag21 target and
-/// image shape, this recomputes the platform-specific `MetadataV1` compile
-/// identity. The resulting value remains a claim; no support row, mapped image,
-/// or callable address is authorized here.
+/// Besides checking an admitted macOS/Linux ASIMD candidate or Linux-tag21
+/// target and image shape, this recomputes the platform-specific `MetadataV1`
+/// compile identity. The resulting value remains a claim; no support row,
+/// mapped image, or callable address is authorized here.
 pub fn inspect_search_metadata_v1(
     bytes: &[u8],
 ) -> Result<ClaimedSearchMetadataV1, SearchMetadataErrorV1> {
@@ -503,7 +509,10 @@ fn compute_elf_metadata_compile_identity_v1(metadata: ClaimedSearchMetadataV1) -
 const fn valid_metadata_target_profile(backend: u16, platform: u8, features: u64) -> bool {
     let asimd = matches!(
         backend,
-        SEARCH_BACKEND_VERSION_V1 | SEARCH_BACKEND_ASIMD_TAG22_V1 | SEARCH_BACKEND_ASIMD_TAG23_V1
+        SEARCH_BACKEND_VERSION_V1
+            | SEARCH_BACKEND_ASIMD_TAG22_V1
+            | SEARCH_BACKEND_ASIMD_TAG23_V1
+            | SEARCH_BACKEND_ASIMD_TAG25_V1
     ) && (platform == SEARCH_PLATFORM_MACOS_V1 || platform == SEARCH_PLATFORM_LINUX_V1)
         && features == SEARCH_REQUIRED_ASIMD_FEATURES_V1;
     let tag21 = backend == SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1
@@ -521,32 +530,18 @@ const fn valid_expectation_target_profile(
     matches!(
         (backend, platform, features, symbol_info),
         (
-            SEARCH_BACKEND_VERSION_V1,
+            SEARCH_BACKEND_VERSION_V1
+                | SEARCH_BACKEND_ASIMD_TAG22_V1
+                | SEARCH_BACKEND_ASIMD_TAG23_V1
+                | SEARCH_BACKEND_ASIMD_TAG25_V1,
             SEARCH_PLATFORM_MACOS_V1,
             SEARCH_REQUIRED_ASIMD_FEATURES_V1,
             SEARCH_EXPORTED_SYMBOL_N_TYPE_V1,
         ) | (
-            SEARCH_BACKEND_ASIMD_TAG22_V1,
-            SEARCH_PLATFORM_MACOS_V1,
-            SEARCH_REQUIRED_ASIMD_FEATURES_V1,
-            SEARCH_EXPORTED_SYMBOL_N_TYPE_V1,
-        ) | (
-            SEARCH_BACKEND_ASIMD_TAG23_V1,
-            SEARCH_PLATFORM_MACOS_V1,
-            SEARCH_REQUIRED_ASIMD_FEATURES_V1,
-            SEARCH_EXPORTED_SYMBOL_N_TYPE_V1,
-        ) | (
-            SEARCH_BACKEND_VERSION_V1,
-            SEARCH_PLATFORM_LINUX_V1,
-            SEARCH_REQUIRED_ASIMD_FEATURES_V1,
-            SEARCH_EXPORTED_SYMBOL_INFO_ELF_FUNCTION_V1,
-        ) | (
-            SEARCH_BACKEND_ASIMD_TAG22_V1,
-            SEARCH_PLATFORM_LINUX_V1,
-            SEARCH_REQUIRED_ASIMD_FEATURES_V1,
-            SEARCH_EXPORTED_SYMBOL_INFO_ELF_FUNCTION_V1,
-        ) | (
-            SEARCH_BACKEND_ASIMD_TAG23_V1,
+            SEARCH_BACKEND_VERSION_V1
+                | SEARCH_BACKEND_ASIMD_TAG22_V1
+                | SEARCH_BACKEND_ASIMD_TAG23_V1
+                | SEARCH_BACKEND_ASIMD_TAG25_V1,
             SEARCH_PLATFORM_LINUX_V1,
             SEARCH_REQUIRED_ASIMD_FEATURES_V1,
             SEARCH_EXPORTED_SYMBOL_INFO_ELF_FUNCTION_V1,
@@ -1250,6 +1245,7 @@ mod tests {
         assert_eq!(SEARCH_BACKEND_VERSION_V1, 8);
         assert_eq!(SEARCH_BACKEND_ASIMD_TAG22_V1, 22);
         assert_eq!(SEARCH_BACKEND_ASIMD_TAG23_V1, 23);
+        assert_eq!(SEARCH_BACKEND_ASIMD_TAG25_V1, 25);
         assert_eq!(SEARCH_SPAN_OUTPUT_KIND_V1, 3);
         assert_eq!(SEARCH_REQUIRED_ASIMD_FEATURES_V1, 1);
         assert_eq!(MIN_STATIC_SEARCH_SPAN_LITERAL_BYTES_V1, 1);
@@ -1268,7 +1264,7 @@ mod tests {
     }
 
     #[test]
-    fn linux_v8_v9_v10_and_explicit_tag21_profiles_are_structurally_admitted() {
+    fn linux_v8_v9_v10_v12_and_explicit_tag21_profiles_are_structurally_admitted() {
         for (backend, features) in [
             (SEARCH_BACKEND_VERSION_V1, SEARCH_REQUIRED_ASIMD_FEATURES_V1),
             (
@@ -1277,6 +1273,10 @@ mod tests {
             ),
             (
                 SEARCH_BACKEND_ASIMD_TAG23_V1,
+                SEARCH_REQUIRED_ASIMD_FEATURES_V1,
+            ),
+            (
+                SEARCH_BACKEND_ASIMD_TAG25_V1,
                 SEARCH_REQUIRED_ASIMD_FEATURES_V1,
             ),
             (

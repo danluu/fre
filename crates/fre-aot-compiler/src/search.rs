@@ -25,7 +25,7 @@ use fre_aot_macho::{
     AbiKind, BindingIdentity, BindingIdentityError, BuiltObject, CompileIdentity, MetadataV1,
     ObjectError, ObjectIdentity, ObjectLimits, inspect_object,
 };
-use fre_aot_search_contract::SEARCH_BACKEND_ASIMD_TAG23_V1;
+use fre_aot_search_contract::{SEARCH_BACKEND_ASIMD_TAG23_V1, SEARCH_BACKEND_ASIMD_TAG25_V1};
 use fre_jit_aarch64::{
     ArtifactIdentity, BackendVersion, CpuFeatures, EmitError, EmitLimits, ImageStats, NativeImage,
     SearchBackendPolicy, TargetSpec, emit_with_backend,
@@ -159,8 +159,8 @@ impl std::error::Error for SearchManifestErrorV1 {}
 /// Explicit macOS `AArch64` code-generation profile.
 ///
 /// The default remains V8 so all existing manifests and artifact identities
-/// remain byte-for-byte stable. V9 and V10 are reachable only through named
-/// candidate constructors until source qualification grants deployment
+/// remain byte-for-byte stable. V9, V10, and V12 are reachable only through
+/// named candidate constructors until source qualification grants deployment
 /// authority.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum MacosAarch64SearchBackendV1 {
@@ -168,6 +168,7 @@ pub enum MacosAarch64SearchBackendV1 {
     AsimdV8,
     AsimdV9,
     AsimdV10,
+    AsimdV12,
 }
 
 impl MacosAarch64SearchBackendV1 {
@@ -177,6 +178,7 @@ impl MacosAarch64SearchBackendV1 {
             Self::AsimdV8 => SearchBackendPolicy::AsimdV8,
             Self::AsimdV9 => SearchBackendPolicy::AsimdV9,
             Self::AsimdV10 => SearchBackendPolicy::AsimdV10,
+            Self::AsimdV12 => SearchBackendPolicy::AsimdV12,
         }
     }
 
@@ -249,6 +251,12 @@ impl<O: Operation> MacosAarch64ExactSearchManifestV1<O> {
         Self::with_backend(policy, MacosAarch64SearchBackendV1::AsimdV10)
     }
 
+    /// Construct an explicit ASIMD V12/tag25 candidate manifest. This does not
+    /// grant runtime or automatic-routing authority.
+    pub fn v12_candidate(policy: SearchCompilePolicyV1) -> Result<Self, SearchManifestErrorV1> {
+        Self::with_backend(policy, MacosAarch64SearchBackendV1::AsimdV12)
+    }
+
     /// Construct a named candidate by its static-contract backend tag.
     ///
     /// This keeps evidence runners independent of Rust enum variant names.
@@ -260,6 +268,7 @@ impl<O: Operation> MacosAarch64ExactSearchManifestV1<O> {
     ) -> Result<Self, SearchManifestErrorV1> {
         match backend_tag {
             SEARCH_BACKEND_ASIMD_TAG23_V1 => Self::v10_candidate(policy),
+            SEARCH_BACKEND_ASIMD_TAG25_V1 => Self::v12_candidate(policy),
             requested => Err(SearchManifestErrorV1::UnsupportedCandidateBackendTag { requested }),
         }
     }
@@ -668,6 +677,7 @@ impl SearchCompileReceiptV1 {
                 value if value == BackendVersion::SEARCH_V8.0
                     || value == BackendVersion::SEARCH_V9.0
                     || value == BackendVersion::SEARCH_V10.0
+                    || value == BackendVersion::SEARCH_V12.0
             )
             && metadata.abi_kind() == AbiKind::Search
             && metadata.literal_bytes() == 0
@@ -1769,6 +1779,64 @@ mod tests {
             claim.backend_version(),
             fre_aot_search_contract::SEARCH_BACKEND_ASIMD_TAG23_V1
         );
+        assert!(expectation.authenticates_claim(&claim));
+    }
+
+    #[test]
+    fn explicit_v12_tag25_is_deterministic_static_and_candidate_only() {
+        let v10_manifest = MacosAarch64ExactSearchManifestV1::<Span>::v10_candidate(
+            SearchCompilePolicyV1::default(),
+        )
+        .expect("V10 candidate manifest");
+        let v12_manifest = MacosAarch64ExactSearchManifestV1::<Span>::v12_candidate(
+            SearchCompilePolicyV1::default(),
+        )
+        .expect("V12 candidate manifest");
+        let tagged = MacosAarch64ExactSearchManifestV1::<Span>::candidate_backend_tag(
+            SearchCompilePolicyV1::default(),
+            SEARCH_BACKEND_ASIMD_TAG25_V1,
+        )
+        .expect("tag25 candidate manifest");
+        assert_eq!(
+            v12_manifest.backend(),
+            MacosAarch64SearchBackendV1::AsimdV12
+        );
+        assert_eq!(tagged.backend(), v12_manifest.backend());
+        assert_eq!(tagged.identity(), v12_manifest.identity());
+        assert_ne!(v12_manifest.identity(), v10_manifest.identity());
+        assert!(matches!(
+            MacosAarch64ExactSearchManifestV1::<Span>::candidate_backend_tag(
+                SearchCompilePolicyV1::default(),
+                24,
+            ),
+            Err(SearchManifestErrorV1::UnsupportedCandidateBackendTag { requested: 24 })
+        ));
+
+        let first = plan_and_compile_macos_aarch64_exact_search_v1(
+            v12_manifest,
+            b"needle".to_vec(),
+            RustProfile::default(),
+        )
+        .expect("first V12 object");
+        let second = plan_and_compile_macos_aarch64_exact_search_v1(
+            v12_manifest,
+            b"needle".to_vec(),
+            RustProfile::default(),
+        )
+        .expect("second V12 object");
+        assert_eq!(
+            first.receipt().metadata().backend_version(),
+            BackendVersion::SEARCH_V12.0
+        );
+        assert_eq!(first.object().as_bytes(), second.object().as_bytes());
+        assert_eq!(first.receipt(), second.receipt());
+        let expectation = crate::build_static_search_span_expectation_v1(&first)
+            .expect("V12 neutral expectation");
+        let claim = fre_aot_search_contract::inspect_static_search_span_expectation_v1(
+            expectation.as_bytes(),
+        )
+        .expect("V12 expectation inspection");
+        assert_eq!(claim.backend_version(), SEARCH_BACKEND_ASIMD_TAG25_V1);
         assert!(expectation.authenticates_claim(&claim));
     }
 
