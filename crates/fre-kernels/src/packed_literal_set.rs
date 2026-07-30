@@ -281,6 +281,7 @@ enum PackedLiteralEngine {
 pub struct PackedLiteralSetPlan {
     engine: PackedLiteralEngine,
     build: PackedLiteralSetBuildAccounting,
+    verification_bytes_per_position: usize,
 }
 
 impl PackedLiteralSetPlan {
@@ -309,7 +310,15 @@ impl PackedLiteralSetPlan {
             } else {
                 return Err(PackedLiteralSetError::UnsupportedTargetOrShape);
             };
-        Ok(Self { engine, build })
+        let verification_bytes_per_position = build
+            .pattern_bytes
+            .checked_add(build.patterns)
+            .expect("successful preflight proved the packed verification coefficient");
+        Ok(Self {
+            engine,
+            build,
+            verification_bytes_per_position,
+        })
     }
 
     /// Checked construction facts and actual persistent footprint.
@@ -337,6 +346,10 @@ impl PackedLiteralSetPlan {
     ///
     /// Returns a checked window, arithmetic, or work-limit error before
     /// searching.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the validated slice and packed engine contracts prove these window-relative additions"
+    )]
     pub fn find_window(
         &self,
         haystack: &[u8],
@@ -350,24 +363,9 @@ impl PackedLiteralSetPlan {
                 haystack_len: haystack.len(),
             });
         }
-        let searched_bytes = window.end().checked_sub(window.start()).ok_or(
-            PackedLiteralSetError::ArithmeticOverflow {
-                computation: "packed literal window length",
-            },
-        )?;
-        let positions_upper_bound =
-            searched_bytes
-                .checked_add(1)
-                .ok_or(PackedLiteralSetError::ArithmeticOverflow {
-                    computation: "packed literal candidate positions",
-                })?;
-        let verification_bytes_per_position = self
-            .build
-            .pattern_bytes
-            .checked_add(self.build.patterns)
-            .ok_or(PackedLiteralSetError::ArithmeticOverflow {
-                computation: "packed literal verification span",
-            })?;
+        let searched_bytes = window.end() - window.start();
+        let positions_upper_bound = searched_bytes + 1;
+        let verification_bytes_per_position = self.verification_bytes_per_position;
         let work_upper_bound = positions_upper_bound
             .checked_mul(verification_bytes_per_position)
             .ok_or(PackedLiteralSetError::ArithmeticOverflow {
@@ -379,13 +377,13 @@ impl PackedLiteralSetPlan {
                 limit: limits.max_work,
             });
         }
-        let accounting = PackedLiteralSetAccounting {
+        let mut accounting = PackedLiteralSetAccounting {
             searched_bytes,
             positions_upper_bound,
             verification_bytes_per_position,
             work_upper_bound,
             scratch_bytes: 0,
-            factored_columns: matches!(&self.engine, PackedLiteralEngine::Factored(_)),
+            factored_columns: false,
             simd_eligible_length: searched_bytes >= self.build.simd_minimum_haystack_bytes,
         };
         let window_bytes = &haystack[window.start()..window.end()];
@@ -393,23 +391,17 @@ impl PackedLiteralSetPlan {
             PackedLiteralEngine::Native(searcher) => searcher
                 .find(window_bytes)
                 .map(|matched| (matched.start(), matched.end())),
-            PackedLiteralEngine::Factored(factored) => factored.find(window_bytes),
+            PackedLiteralEngine::Factored(factored) => {
+                accounting.factored_columns = true;
+                factored.find(window_bytes)
+            }
         };
-        let matched = matched
-            .map(|(relative_start, relative_end)| {
-                let start = window.start().checked_add(relative_start).ok_or(
-                    PackedLiteralSetError::ArithmeticOverflow {
-                        computation: "packed literal match start",
-                    },
-                )?;
-                let end = window.start().checked_add(relative_end).ok_or(
-                    PackedLiteralSetError::ArithmeticOverflow {
-                        computation: "packed literal match end",
-                    },
-                )?;
-                Ok((start, end))
-            })
-            .transpose()?;
+        let matched = matched.map(|(relative_start, relative_end)| {
+            (
+                window.start() + relative_start,
+                window.start() + relative_end,
+            )
+        });
         Ok((matched, accounting))
     }
 }
@@ -630,8 +622,8 @@ fn preflight<P: AsRef<[u8]>>(
 #[cfg(test)]
 mod tests {
     use super::{
-        PackedLiteralEngine, PackedLiteralSetBuildLimits, PackedLiteralSetError,
-        PackedLiteralSetPlan, PackedLiteralSetSearchLimits,
+        BUILD_FACTOR, PackedLiteralEngine, PackedLiteralSetAccounting, PackedLiteralSetBuildLimits,
+        PackedLiteralSetError, PackedLiteralSetPlan, PackedLiteralSetSearchLimits,
     };
     use crate::Window;
 
@@ -698,6 +690,121 @@ mod tests {
             }
         }
         patterns
+    }
+
+    fn assert_invalid_windows_precede_work(plan: &PackedLiteralSetPlan, haystack: &[u8]) {
+        let zero_work = PackedLiteralSetSearchLimits { max_work: 0 };
+        assert_eq!(
+            plan.find_window(haystack, Window::new(1, 0), zero_work),
+            Err(PackedLiteralSetError::InvalidWindow {
+                start: 1,
+                end: 0,
+                haystack_len: haystack.len(),
+            })
+        );
+        let past_end = haystack.len().checked_add(1).unwrap();
+        assert_eq!(
+            plan.find_window(haystack, Window::new(0, past_end), zero_work),
+            Err(PackedLiteralSetError::InvalidWindow {
+                start: 0,
+                end: past_end,
+                haystack_len: haystack.len(),
+            })
+        );
+    }
+
+    fn assert_search_certificate(
+        plan: &PackedLiteralSetPlan,
+        factored_columns: bool,
+        haystack: &[u8],
+        window: Window,
+        expected_match: Option<(usize, usize)>,
+    ) {
+        let (matched, accounting) = plan
+            .find_window(haystack, window, PackedLiteralSetSearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(matched, expected_match);
+        let build = plan.build_accounting();
+        let searched_bytes = window.end().checked_sub(window.start()).unwrap();
+        let positions_upper_bound = searched_bytes.checked_add(1).unwrap();
+        let verification_bytes_per_position =
+            build.pattern_bytes.checked_add(build.patterns).unwrap();
+        let work_upper_bound = positions_upper_bound
+            .checked_mul(verification_bytes_per_position)
+            .unwrap();
+        assert_eq!(
+            plan.verification_bytes_per_position
+                .checked_mul(BUILD_FACTOR),
+            Some(build.build_work_upper_bound)
+        );
+        assert_eq!(
+            accounting,
+            PackedLiteralSetAccounting {
+                searched_bytes,
+                positions_upper_bound,
+                verification_bytes_per_position,
+                work_upper_bound,
+                scratch_bytes: 0,
+                factored_columns,
+                simd_eligible_length: searched_bytes >= build.simd_minimum_haystack_bytes,
+            }
+        );
+        assert_eq!(
+            plan.find_window(
+                haystack,
+                window,
+                PackedLiteralSetSearchLimits {
+                    max_work: work_upper_bound,
+                },
+            ),
+            Ok((expected_match, accounting))
+        );
+        let one_below = work_upper_bound.checked_sub(1).unwrap();
+        assert_eq!(
+            plan.find_window(
+                haystack,
+                window,
+                PackedLiteralSetSearchLimits {
+                    max_work: one_below,
+                },
+            ),
+            Err(PackedLiteralSetError::WorkLimit {
+                needed: work_upper_bound,
+                limit: one_below,
+            })
+        );
+    }
+
+    #[test]
+    fn native_and_factored_certificates_preserve_windows_limits_and_accounting() {
+        let Some(native) = plan(&[b"ab", b"cd"]) else {
+            return;
+        };
+        assert!(matches!(&native.engine, PackedLiteralEngine::Native(_)));
+        let native_haystack = b"ab--cd";
+        assert_invalid_windows_precede_work(&native, native_haystack);
+        for (window, expected) in [
+            (Window::full(native_haystack), Some((0, 2))),
+            (Window::new(4, 6), Some((4, 6))),
+            (Window::new(2, 4), None),
+        ] {
+            assert_search_certificate(&native, false, native_haystack, window, expected);
+        }
+
+        let patterns = cartesian_patterns();
+        let refs = pattern_refs(&patterns);
+        let factored =
+            PackedLiteralSetPlan::new(&refs, PackedLiteralSetBuildLimits::default()).unwrap();
+        assert!(matches!(&factored.engine, PackedLiteralEngine::Factored(_)));
+        let factored_haystack = b"m3Tu--r8Tv";
+        assert_invalid_windows_precede_work(&factored, factored_haystack);
+        for (window, expected) in [
+            (Window::full(factored_haystack), Some((0, 4))),
+            (Window::new(6, 10), Some((6, 10))),
+            (Window::new(4, 6), None),
+        ] {
+            assert_search_certificate(&factored, true, factored_haystack, window, expected);
+        }
     }
 
     #[test]
