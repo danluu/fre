@@ -32,6 +32,7 @@ const ORDINARY_START_FILTER_PROOF: StartFilterProof = StartFilterProof {
 const BYTE_ALPHABET: usize = 256;
 const LAZY_MAX_STATES: usize = 64;
 const LAZY_MAX_ITEMS: usize = 16_384;
+const EXACT_LAZY_CAPACITY_MAX_ITEMS: usize = 3;
 const LAZY_CELL_ACCEPT: u32 = 1 << 31;
 const LAZY_CELL_RESTART: u32 = 1 << 30;
 const LAZY_CELL_STATE_MASK: u32 = LAZY_CELL_RESTART - 1;
@@ -575,6 +576,21 @@ enum LazyInterned {
     State(u32),
     BudgetDeclined,
     CapacityFull,
+}
+
+fn validate_lazy_capacity_full(
+    item_universe: usize,
+    detail: &'static str,
+) -> Result<(), SearchError> {
+    // Through three distinct consuming items, every ordered subset, pending
+    // mode, and reachable empty identity fits below LAZY_MAX_STATES. The
+    // corresponding aggregate item arena is exact as well. CapacityFull in
+    // that regime therefore proves a broken layout or cache invariant rather
+    // than ordinary bounded-cache saturation.
+    if item_universe <= EXACT_LAZY_CAPACITY_MAX_ITEMS {
+        return Err(SearchError::InternalInvariant { detail });
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2696,7 +2712,7 @@ fn context_lazy_initial(
         return Ok(None);
     }
     let (state, encoded) =
-        retain_context_lazy_scratch(false, workspace, meter, core_reserve, position)?;
+        retain_context_lazy_scratch(automaton, false, workspace, meter, core_reserve, position)?;
     if let Some(encoded) = encoded {
         let cell = encoded | LAZY_CELL_RESTART;
         workspace.lazy.context.publish(
@@ -2785,8 +2801,14 @@ fn build_context_lazy_cached_transition(
         return Ok(ContextLazyTransition::Ready(cell));
     }
 
-    let (next, encoded) =
-        retain_context_lazy_scratch(next_pending, workspace, meter, core_reserve, position)?;
+    let (next, encoded) = retain_context_lazy_scratch(
+        automaton,
+        next_pending,
+        workspace,
+        meter,
+        core_reserve,
+        position,
+    )?;
     let accepted_bit = if accepted { LAZY_CELL_ACCEPT } else { 0 };
     let restart_bit = if restartable { LAZY_CELL_RESTART } else { 0 };
     if let Some(encoded) = encoded {
@@ -2897,6 +2919,7 @@ fn build_context_lazy_inline_transition(
 }
 
 fn retain_context_lazy_scratch(
+    automaton: &Automaton,
     pending: bool,
     workspace: &mut K0Workspace,
     meter: &mut WorkMeter,
@@ -2923,6 +2946,10 @@ fn retain_context_lazy_scratch(
             Ok((LazyState::Inline { pending }, None))
         }
         LazyInterned::CapacityFull => {
+            validate_lazy_capacity_full(
+                automaton.stats().consuming_states(),
+                "exact small contextual lazy DFA exhausted its proven capacity",
+            )?;
             workspace.lazy.saturated = true;
             workspace.lazy.retain_scratch_as_frontier()?;
             Ok((LazyState::Inline { pending }, None))
@@ -3183,6 +3210,7 @@ fn build_lazy_cached_transition(
         });
     }
     finish_lazy_cached_transition(
+        automaton,
         state,
         byte,
         accepted,
@@ -3199,6 +3227,7 @@ fn build_lazy_cached_transition(
     reason = "cache publication authenticates one complete transition and its work reserve"
 )]
 fn finish_lazy_cached_transition(
+    automaton: &Automaton,
     state: u32,
     byte: u8,
     accepted: bool,
@@ -3229,6 +3258,10 @@ fn finish_lazy_cached_transition(
                 });
             }
             LazyInterned::CapacityFull => {
+                validate_lazy_capacity_full(
+                    automaton.stats().consuming_states(),
+                    "exact small lazy DFA exhausted its proven capacity",
+                )?;
                 workspace.lazy.saturated = true;
                 workspace.lazy.retain_scratch_as_frontier()?;
                 return Ok(LazyTransition::Inline {
@@ -3658,6 +3691,7 @@ fn build_reverse_cached_transition(
     }
     collect_reverse_frontier(automaton, workspace, meter, position)?;
     finish_reverse_cached_transition(
+        automaton,
         state,
         byte,
         reaches_start,
@@ -3673,6 +3707,7 @@ fn build_reverse_cached_transition(
     reason = "reverse cache publication authenticates one complete transition"
 )]
 fn finish_reverse_cached_transition(
+    automaton: &Automaton,
     state: u32,
     byte: u8,
     reaches_start: bool,
@@ -3698,6 +3733,10 @@ fn finish_reverse_cached_transition(
                 return Ok(ReverseTransition::Inline { reaches_start });
             }
             LazyInterned::CapacityFull => {
+                validate_lazy_capacity_full(
+                    automaton.stats().consuming_edges(),
+                    "exact small reverse DFA exhausted its proven capacity",
+                )?;
                 workspace.reverse.saturated = true;
                 workspace.reverse.retain_scratch_as_frontier()?;
                 return Ok(ReverseTransition::Inline { reaches_start });
@@ -3989,7 +4028,7 @@ fn context_reverse_initial(
         return Ok(None);
     }
     let (state, encoded) =
-        retain_context_reverse_scratch(workspace, meter, core_reserve, position)?;
+        retain_context_reverse_scratch(automaton, workspace, meter, core_reserve, position)?;
     if let Some(encoded) = encoded {
         workspace.reverse.context.publish(
             slot,
@@ -4060,7 +4099,7 @@ fn build_context_reverse_cached_transition(
         return Ok(ReverseTransition::Ready(cell));
     }
     let (_next, encoded) =
-        retain_context_reverse_scratch(workspace, meter, core_reserve, position)?;
+        retain_context_reverse_scratch(automaton, workspace, meter, core_reserve, position)?;
     if let Some(encoded) = encoded {
         let cell = encoded | if reaches_start { LAZY_CELL_ACCEPT } else { 0 };
         workspace.reverse.context.publish(
@@ -4121,6 +4160,7 @@ fn build_context_reverse_inline_transition(
 }
 
 fn retain_context_reverse_scratch(
+    automaton: &Automaton,
     workspace: &mut K0Workspace,
     meter: &mut WorkMeter,
     core_reserve: u64,
@@ -4146,6 +4186,10 @@ fn retain_context_reverse_scratch(
             Ok((ReverseState::Inline, None))
         }
         LazyInterned::CapacityFull => {
+            validate_lazy_capacity_full(
+                automaton.stats().consuming_edges(),
+                "exact small contextual reverse DFA exhausted its proven capacity",
+            )?;
             workspace.reverse.saturated = true;
             workspace.reverse.retain_scratch_as_frontier()?;
             Ok((ReverseState::Inline, None))
@@ -5214,51 +5258,82 @@ fn prepare_prevalidated_invocation(
     may_use_lazy: bool,
     may_use_reverse: bool,
 ) -> Result<(WorkMeter, u64), SearchError> {
-    let required_generations = window
-        .end()
-        .checked_sub(window.start())
-        // Up to sixteen proof generations precede one generation for the
-        // initial boundary and one for every admitted byte.
-        .and_then(|length| length.checked_add(START_FILTER_POSITION_COUNT))
-        .and_then(|length| length.checked_add(1))
-        // An assertion-free accelerator derives one immutable initial
-        // closure. A contextual accelerator may additionally rebuild a pure
-        // initial closure after every scanner-selected candidate.
-        .and_then(|length| {
-            if may_use_lazy && automaton.stats().assertion_edges() != 0 {
-                window
-                    .end()
-                    .checked_sub(window.start())
-                    .and_then(|bytes| bytes.checked_add(1))
-                    .and_then(|contextual| length.checked_add(contextual))
-            } else {
-                length.checked_add(usize::from(may_use_lazy))
-            }
-        })
-        // Full-span recovery can use one reverse closure per source byte plus
-        // one immutable Accept-seeded initial closure.
-        .and_then(|length| {
-            if may_use_reverse {
-                window
-                    .end()
-                    .checked_sub(window.start())
-                    .and_then(|bytes| bytes.checked_add(1))
-                    .and_then(|reverse| length.checked_add(reverse))
-            } else {
-                Some(length)
-            }
-        })
-        .ok_or(SearchError::ArithmeticOverflow {
-            computation: "required boundary generations",
-        })?;
     let required_generations =
-        u64::try_from(required_generations).map_err(|_| SearchError::ArithmeticOverflow {
-            computation: "required boundary generation conversion",
-        })?;
+        required_generation_count(automaton, window, may_use_lazy, may_use_reverse)?;
     let mut meter = WorkMeter::new(limits.max_work, setup.work);
     workspace.begin_invocation(required_generations, &mut meter, setup, window.start())?;
     let setup_work = meter.consumed;
     Ok((meter, setup_work))
+}
+
+fn required_generation_count(
+    automaton: &Automaton,
+    window: SearchWindow,
+    may_use_lazy: bool,
+    may_use_reverse: bool,
+) -> Result<u64, SearchError> {
+    let bytes =
+        window
+            .end()
+            .checked_sub(window.start())
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "required boundary generations",
+            })?;
+
+    // Base execution has one closure at the initial boundary and at most one
+    // after each admitted byte. Cold start-filter derivation can precede it
+    // with one generation for each exact proof position.
+    let mut required = bytes
+        .checked_add(1)
+        .and_then(|count| count.checked_add(START_FILTER_POSITION_COUNT))
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "required boundary generations",
+        })?;
+
+    if may_use_lazy {
+        // Direct lazy execution adds only its immutable initial closure; its
+        // per-byte transition closures are already covered by `bytes` above.
+        // Contextual execution may additionally rebuild an initial closure
+        // after every scanner-selected candidate, for at most bytes + 1
+        // source boundaries.
+        let forward_initials = if automaton.stats().assertion_edges() == 0 {
+            1
+        } else {
+            bytes
+                .checked_add(1)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "required boundary generations",
+                })?
+        };
+        required =
+            required
+                .checked_add(forward_initials)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "required boundary generations",
+                })?;
+    }
+
+    if may_use_reverse {
+        // Reverse recovery has one Accept-seeded initial closure and at most
+        // one closure per source byte. A cold direct nullable call may reserve
+        // this and then discover a pending forward initial state; a warm call
+        // derives `may_use_reverse = false` and omits the reserve.
+        required = required
+            .checked_add(
+                bytes
+                    .checked_add(1)
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "required boundary generations",
+                    })?,
+            )
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "required boundary generations",
+            })?;
+    }
+
+    u64::try_from(required).map_err(|_| SearchError::ArithmeticOverflow {
+        computation: "required boundary generation conversion",
+    })
 }
 
 fn expand_boundary_roots(
@@ -9828,6 +9903,204 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "cold and warm ordinary/prevalidated/cursor modes share one rollover proof"
+    )]
+    fn nullable_generation_preflight_tracks_live_mode_and_cursor_parity() {
+        let plan = empty_or_ab(false);
+        plan.start_filter_proof
+            .set(&StartFilterProof {
+                scanner: None,
+                guard: None,
+                force_haystack_start: false,
+                relaxed_nullable: true,
+            })
+            .expect("fresh nullable automaton");
+        let limits = SearchLimits::unlimited();
+        let cold_haystack = b"abxx";
+        let cold_window = SearchWindow::new(0, cold_haystack.len());
+
+        let mut ordinary_preflight =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let mut prepared_preflight =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let capabilities = super::lazy_capabilities(&plan, &ordinary_preflight, true);
+        let mode =
+            super::effective_lazy_mode(&plan, &ordinary_preflight, true, capabilities).unwrap();
+        assert_eq!(
+            mode,
+            super::EffectiveLazyMode {
+                lazy: true,
+                reverse: false,
+            }
+        );
+        let endpoint_required =
+            super::required_generation_count(&plan, cold_window, mode.lazy, mode.reverse).unwrap();
+        assert_eq!(
+            endpoint_required,
+            u64::try_from(cold_haystack.len() + 1 + START_FILTER_POSITION_COUNT + 1,).unwrap()
+        );
+        ordinary_preflight.generation = u64::MAX - endpoint_required;
+        prepared_preflight.generation = u64::MAX - endpoint_required;
+        let mut ordinary_setup =
+            crate::SetupAccounting::empty(ordinary_preflight.retained_bytes, true);
+        let mut prepared_setup =
+            crate::SetupAccounting::empty(prepared_preflight.retained_bytes, true);
+        let ordinary_prepared = super::prepare_invocation(
+            &plan,
+            &mut ordinary_preflight,
+            cold_window,
+            limits,
+            &mut ordinary_setup,
+            mode.lazy,
+            mode.reverse,
+        )
+        .unwrap();
+        let prevalidated = super::prepare_prevalidated_invocation(
+            &plan,
+            &mut prepared_preflight,
+            cold_window,
+            limits,
+            &mut prepared_setup,
+            mode.lazy,
+            mode.reverse,
+        )
+        .unwrap();
+        assert_eq!(ordinary_prepared.0.consumed, prevalidated.0.consumed);
+        assert_eq!(ordinary_prepared.1, prevalidated.1);
+        assert_eq!(ordinary_setup, prepared_setup);
+        assert_eq!(ordinary_preflight.generation, prepared_preflight.generation);
+
+        let mut endpoint_ordinary =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let mut endpoint_cursor =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        endpoint_ordinary.generation = u64::MAX - endpoint_required;
+        endpoint_cursor.generation = u64::MAX - endpoint_required;
+        let ordinary_report = plan
+            .prepare::<Span>()
+            .search_window_with_workspace(
+                cold_haystack,
+                cold_window,
+                &mut endpoint_ordinary,
+                limits,
+            )
+            .unwrap();
+        let cursor_report = super::search_span_with_workspace_cursor(
+            &plan,
+            cold_haystack,
+            0,
+            &mut endpoint_cursor,
+            limits,
+        )
+        .unwrap();
+        assert_eq!(ordinary_report.output(), &cursor_report.found);
+        assert_eq!(ordinary_report.accounting(), cursor_report.accounting);
+        assert_eq!(endpoint_ordinary.generation, endpoint_cursor.generation);
+        assert_eq!(ordinary_report.accounting().setup().initialized_bytes(), 0);
+
+        let mut full_ordinary =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let mut full_cursor =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let cold_full_mode = super::effective_lazy_mode(
+            &plan,
+            &full_ordinary,
+            true,
+            super::lazy_capabilities(&plan, &full_ordinary, true),
+        )
+        .unwrap();
+        assert_eq!(
+            cold_full_mode,
+            super::EffectiveLazyMode {
+                lazy: true,
+                reverse: true,
+            }
+        );
+        let cold_full_required = super::required_generation_count(
+            &plan,
+            cold_window,
+            cold_full_mode.lazy,
+            cold_full_mode.reverse,
+        )
+        .unwrap();
+        assert_eq!(
+            cold_full_required,
+            endpoint_required + u64::try_from(cold_haystack.len() + 1).unwrap()
+        );
+        full_ordinary.generation = u64::MAX - cold_full_required;
+        full_cursor.generation = u64::MAX - cold_full_required;
+        let ordinary_cold = plan
+            .prepare::<Span>()
+            .search_window_with_workspace(cold_haystack, cold_window, &mut full_ordinary, limits)
+            .unwrap();
+        let cursor_cold = super::search_span_with_workspace_cursor(
+            &plan,
+            cold_haystack,
+            0,
+            &mut full_cursor,
+            limits,
+        )
+        .unwrap();
+        assert_eq!(ordinary_cold.output(), &cursor_cold.found);
+        assert_eq!(ordinary_cold.accounting(), cursor_cold.accounting);
+        assert_eq!(full_ordinary.generation, full_cursor.generation);
+        assert!(!full_ordinary.reverse.initialized);
+        assert!(!full_cursor.reverse.initialized);
+
+        let warm_haystack = b"xxab";
+        let warm_window = SearchWindow::new(2, warm_haystack.len());
+        let warm_ordinary_mode = super::effective_lazy_mode(
+            &plan,
+            &full_ordinary,
+            true,
+            super::lazy_capabilities(&plan, &full_ordinary, true),
+        )
+        .unwrap();
+        let warm_cursor_cache =
+            super::prepare_span_cursor(&plan, &mut full_cursor, limits).unwrap();
+        let warm_cursor_mode =
+            super::effective_lazy_mode(&plan, &full_cursor, true, warm_cursor_cache.capabilities)
+                .unwrap();
+        assert_eq!(warm_ordinary_mode, warm_cursor_mode);
+        assert_eq!(
+            warm_ordinary_mode,
+            super::EffectiveLazyMode {
+                lazy: true,
+                reverse: false,
+            }
+        );
+        let warm_required = super::required_generation_count(
+            &plan,
+            warm_window,
+            warm_ordinary_mode.lazy,
+            warm_ordinary_mode.reverse,
+        )
+        .unwrap();
+        full_ordinary.seen_at.fill(0);
+        full_cursor.seen_at.fill(0);
+        full_ordinary.generation = u64::MAX - warm_required;
+        full_cursor.generation = u64::MAX - warm_required;
+        let ordinary_warm = plan
+            .prepare::<Span>()
+            .search_window_with_workspace(warm_haystack, warm_window, &mut full_ordinary, limits)
+            .unwrap();
+        let cursor_warm = super::search_span_with_workspace_cursor(
+            &plan,
+            warm_haystack,
+            warm_window.start(),
+            &mut full_cursor,
+            limits,
+        )
+        .unwrap();
+        assert_eq!(ordinary_warm.output(), &cursor_warm.found);
+        assert_eq!(ordinary_warm.accounting(), cursor_warm.accounting);
+        assert_eq!(full_ordinary.generation, full_cursor.generation);
+        assert_eq!(ordinary_warm.accounting().setup().initialized_bytes(), 0);
+    }
+
+    #[test]
     fn sparse_ascii_root_skips_impossible_starts_and_preserves_the_span() {
         let automaton = Automaton::from_raw(
             RawPlan {
@@ -11005,6 +11278,48 @@ mod tests {
     }
 
     #[test]
+    fn exact_small_contextual_capacity_exhaustion_is_an_invariant_failure() {
+        let plan = asserted_line_a();
+        assert!(plan.stats().consuming_states() <= super::EXACT_LAZY_CAPACITY_MAX_ITEMS);
+        assert!(plan.stats().consuming_edges() <= super::EXACT_LAZY_CAPACITY_MAX_ITEMS);
+
+        let mut forward =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        forward.lazy.offsets.truncate(0);
+        forward.lazy.scratch[0] = 1;
+        forward.lazy.scratch_len = 1;
+        let mut forward_meter = WorkMeter::new(u64::MAX, 0);
+        assert!(matches!(
+            super::retain_context_lazy_scratch(
+                &plan,
+                false,
+                &mut forward,
+                &mut forward_meter,
+                0,
+                0,
+            ),
+            Err(SearchError::InternalInvariant {
+                detail: "exact small contextual lazy DFA exhausted its proven capacity",
+            })
+        ));
+        assert!(!forward.lazy.saturated);
+
+        let mut reverse =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        reverse.reverse.offsets.truncate(0);
+        reverse.reverse.scratch[0] = 0;
+        reverse.reverse.scratch_len = 1;
+        let mut reverse_meter = WorkMeter::new(u64::MAX, 0);
+        assert!(matches!(
+            super::retain_context_reverse_scratch(&plan, &mut reverse, &mut reverse_meter, 0, 0,),
+            Err(SearchError::InternalInvariant {
+                detail: "exact small contextual reverse DFA exhausted its proven capacity",
+            })
+        ));
+        assert!(!reverse.reverse.saturated);
+    }
+
+    #[test]
     fn span_is_a_typed_pike_fallback_and_contextual_graphs_get_bounded_storage() {
         let eligible = a_plus(true);
         let ordinary = eligible.workspace_layout().unwrap();
@@ -11250,26 +11565,44 @@ mod tests {
         );
 
         let capacity_plan = byte_chain(&[(b'a', b'a'), (b'b', b'b')]);
-        let mut pike = K0Workspace::new(&capacity_plan, WorkspaceLimits::unlimited()).unwrap();
         let mut saturated =
             K0Workspace::new_bidirectional(&capacity_plan, WorkspaceLimits::unlimited()).unwrap();
         saturated.reverse.offsets.truncate(1);
         saturated.reverse.lengths.truncate(1);
         saturated.reverse.hashes.truncate(1);
-        for haystack in [b"zabx".as_slice(), b"abab", b"xxab"] {
-            let want = capacity_plan
+        assert!(matches!(
+            capacity_plan.prepare::<Span>().search_with_workspace(
+                b"zabx",
+                &mut saturated,
+                SearchLimits::unlimited(),
+            ),
+            Err(SearchError::InternalInvariant {
+                detail: "exact small reverse DFA exhausted its proven capacity",
+            })
+        ));
+        assert!(!saturated.reverse.saturated);
+
+        let large_plan = byte_chain(&[(b'a', b'a'), (b'b', b'b'), (b'c', b'c'), (b'd', b'd')]);
+        let mut pike = K0Workspace::new(&large_plan, WorkspaceLimits::unlimited()).unwrap();
+        let mut large_saturated =
+            K0Workspace::new_bidirectional(&large_plan, WorkspaceLimits::unlimited()).unwrap();
+        large_saturated.reverse.offsets.truncate(1);
+        large_saturated.reverse.lengths.truncate(1);
+        large_saturated.reverse.hashes.truncate(1);
+        for haystack in [b"zabcdx".as_slice(), b"abcdabcd", b"xxabcd"] {
+            let want = large_plan
                 .prepare::<Span>()
                 .search_with_workspace(haystack, &mut pike, SearchLimits::unlimited())
                 .unwrap()
                 .into_output();
-            let got = capacity_plan
+            let got = large_plan
                 .prepare::<Span>()
-                .search_with_workspace(haystack, &mut saturated, SearchLimits::unlimited())
+                .search_with_workspace(haystack, &mut large_saturated, SearchLimits::unlimited())
                 .unwrap()
                 .into_output();
-            assert_eq!(got, want, "saturated reverse source={haystack:?}");
+            assert_eq!(got, want, "large saturated reverse source={haystack:?}");
         }
-        assert!(saturated.reverse.saturated);
+        assert!(large_saturated.reverse.saturated);
     }
 
     #[test]
@@ -11304,7 +11637,7 @@ mod tests {
 
     #[test]
     fn saturated_lazy_cache_continues_inline_without_replaying_and_stays_correct() {
-        let plan = greedy_a_plus_or_a();
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b'), (b'c', b'c'), (b'd', b'd')]);
         let mut pike = K0Workspace::new(&plan, WorkspaceLimits::unlimited()).unwrap();
         let mut accelerated =
             K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
@@ -11317,7 +11650,7 @@ mod tests {
         accelerated.lazy.modes.truncate(1);
         accelerated.lazy.hashes.truncate(1);
 
-        for haystack in [b"baaaaaax".as_slice(), b"aaaa", b"xaaaax", b"\xffaax"] {
+        for haystack in [b"zabcdx".as_slice(), b"abcdabcd", b"xabcdx", b"\xffabcdx"] {
             let want = plan
                 .prepare::<SelectedEnd>()
                 .search_with_workspace(haystack, &mut pike, SearchLimits::unlimited())
@@ -11338,7 +11671,6 @@ mod tests {
     fn nullable_lazy_cache_budget_and_capacity_handoffs_preserve_priority() {
         let plan = empty_or_ab(false);
         pin_without_start_filter(&plan);
-        let mut pike = K0Workspace::new(&plan, WorkspaceLimits::unlimited()).unwrap();
         let mut saturated =
             K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
         saturated.lazy.offsets.truncate(1);
@@ -11346,36 +11678,17 @@ mod tests {
         saturated.lazy.modes.truncate(1);
         saturated.lazy.hashes.truncate(1);
 
-        for haystack in [b"ab".as_slice(), b"aba", b"a\xffb", b"\xffab", b""] {
-            for start in 0..=haystack.len() {
-                let window = SearchWindow::new(start, haystack.len());
-                let want = plan
-                    .prepare::<SelectedEnd>()
-                    .search_window_with_workspace(
-                        haystack,
-                        window,
-                        &mut pike,
-                        SearchLimits::unlimited(),
-                    )
-                    .unwrap()
-                    .into_output();
-                let got = plan
-                    .prepare::<SelectedEnd>()
-                    .search_window_with_workspace(
-                        haystack,
-                        window,
-                        &mut saturated,
-                        SearchLimits::unlimited(),
-                    )
-                    .unwrap()
-                    .into_output();
-                assert_eq!(
-                    got, want,
-                    "saturated nullable source={haystack:?}/{window:?}"
-                );
-            }
-        }
-        assert!(saturated.lazy.saturated);
+        assert!(matches!(
+            plan.prepare::<SelectedEnd>().search_with_workspace(
+                b"ab",
+                &mut saturated,
+                SearchLimits::unlimited(),
+            ),
+            Err(SearchError::InternalInvariant {
+                detail: "exact small lazy DFA exhausted its proven capacity",
+            })
+        ));
+        assert!(!saturated.lazy.saturated);
         assert!(saturated.lazy.initialized);
 
         let mut retryable =
