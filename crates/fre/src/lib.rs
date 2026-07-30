@@ -4549,6 +4549,125 @@ impl PortableRegex {
                     u64::try_from(accounting.transitions_upper_bound).unwrap_or(u64::MAX),
                 ))
             }
+            PortablePlan::RequiredLiteral(required) => {
+                let (matched, accounting) = required.find_window(
+                    haystack,
+                    window,
+                    required_literal_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    accounting.work_upper_bound,
+                ))
+            }
+            PortablePlan::DispatchedRequiredLiteral(required) => {
+                let (matched, accounting) = required.find_window(
+                    haystack,
+                    window,
+                    required_literal_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    accounting.work_upper_bound,
+                ))
+            }
+            PortablePlan::BoundedRequiredLiteral(required) => {
+                let (matched, accounting) = required.find_window(
+                    haystack,
+                    window,
+                    required_literal_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    accounting.work_upper_bound,
+                ))
+            }
+            PortablePlan::DispatchedBoundedRequiredLiteral(required) => {
+                let (matched, accounting) = required.find_window(
+                    haystack,
+                    window,
+                    required_literal_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    accounting.work_upper_bound,
+                ))
+            }
+            PortablePlan::LiteralClassRunLiteral(plan) => {
+                let (matched, accounting) = plan.find_window(
+                    haystack,
+                    window,
+                    literal_class_run_literal_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    accounting.work_upper_bound,
+                ))
+            }
+            PortablePlan::LiteralClassRunSearch(plan) => {
+                let (matched, accounting) = plan.find_window(
+                    haystack,
+                    window,
+                    literal_class_run_literal_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    accounting.work_upper_bound,
+                ))
+            }
+            PortablePlan::ForwardAnchored(forward) => {
+                let (matched, accounting) =
+                    forward.find_window(haystack, window, forward_anchored_limits(limits))?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    accounting.work_upper_bound,
+                ))
+            }
+            PortablePlan::DispatchedForwardAnchored(forward) => {
+                let (matched, accounting) =
+                    forward.find_window(haystack, window, forward_anchored_limits(limits))?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    accounting.work_upper_bound,
+                ))
+            }
+            PortablePlan::ForwardEndFixed(fixed) => {
+                let (matched, accounting) =
+                    fixed.find_window(haystack, window, forward_anchored_limits(limits))?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    accounting.work_upper_bound,
+                ))
+            }
+            PortablePlan::UnicodeFoldedLiteral(plan) => {
+                let (matched, accounting) = plan.find_window(
+                    haystack,
+                    window,
+                    unicode_folded_literal_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|candidate| Match {
+                        start: candidate.start(),
+                        end: candidate.end(),
+                    }),
+                    u64::try_from(accounting.actual.work).unwrap_or(u64::MAX),
+                ))
+            }
+            PortablePlan::UnicodeWordRun(plan) => {
+                let (matched, accounting) =
+                    plan.find_window(haystack, SearchWindow::new(start, haystack.len()), limits)?;
+                Ok((matched, accounting.work()))
+            }
+            PortablePlan::AsciiWordRun(plan) => {
+                let (matched, accounting) =
+                    plan.find_window(haystack, SearchWindow::new(start, haystack.len()), limits)?;
+                Ok((matched, accounting.work()))
+            }
+            PortablePlan::BoundedWordClass(plan) => {
+                let (matched, accounting) =
+                    plan.find_window(haystack, SearchWindow::new(start, haystack.len()), limits)?;
+                Ok((matched, accounting.work()))
+            }
             _ => {
                 let (matched, accounting) =
                     self.find_window(haystack, SearchWindow::new(start, haystack.len()), limits)?;
