@@ -5437,6 +5437,24 @@ fn next_set_start_candidate(
     end: usize,
     meter: &mut WorkMeter,
 ) -> Result<usize, SearchError> {
+    // A table classifier has a higher fixed cost than one bitmap lookup. Keep
+    // the first complete classifier-width block scalar so short searches and
+    // repeated nearby candidates retain the low-latency path; vector work is
+    // reserved for the long no-candidate spans that can amortize it.
+    let set = classifier.set();
+    let scalar_prefix_end = position.saturating_add(BYTE_SET_BLOCK_BYTES).min(end);
+    while position < scalar_prefix_end {
+        meter.charge(1, position)?;
+        if set.contains(haystack[position]) {
+            return Ok(position);
+        }
+        position = position
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "scalar start-set prefix position",
+            })?;
+    }
+
     // Start-filter work counts each logically examined source byte once. This
     // preserves the scalar scanner's hard-limit threshold and monotonicity.
     let block_work =
@@ -5470,7 +5488,6 @@ fn next_set_start_candidate(
         position = block_end;
     }
 
-    let set = classifier.set();
     while position < end {
         meter.charge(1, position)?;
         if set.contains(haystack[position]) {
@@ -8324,6 +8341,16 @@ mod tests {
     fn expected_full_byte_scanner_work(start: usize, end: usize, expected: usize) -> u64 {
         let mut position = start;
         let mut work = 0_usize;
+        let scalar_prefix_end = start
+            .saturating_add(fre_simd_kernels::BYTE_SET_BLOCK_BYTES)
+            .min(end);
+        while position < scalar_prefix_end {
+            work = work.checked_add(1).unwrap();
+            if position == expected {
+                return u64::try_from(work).unwrap();
+            }
+            position = position.checked_add(1).unwrap();
+        }
         while end.saturating_sub(position) >= fre_simd_kernels::BYTE_SET_BLOCK_BYTES {
             work = work
                 .checked_add(fre_simd_kernels::BYTE_SET_BLOCK_BYTES)
