@@ -119,6 +119,9 @@ pub enum SearchBackendPolicy {
     /// Search V22 candidate: V21 learning with the mismatch column retained
     /// across later 64-candidate groups.
     AsimdV22,
+    /// Search V23 candidate: V22 persistence with a pointer-authoritative
+    /// primary-empty wide loop and exact index reconstruction on every exit.
+    AsimdV23,
     /// SVE screening with exactly sixteen active byte lanes.
     Sve16,
     /// SVE2 `MATCH` screening with exactly sixteen active byte lanes,
@@ -154,6 +157,7 @@ impl SearchBackendPolicy {
             Self::AsimdV20 => BackendVersion::SEARCH_V20,
             Self::AsimdV21 => BackendVersion::SEARCH_V21,
             Self::AsimdV22 => BackendVersion::SEARCH_V22,
+            Self::AsimdV23 => BackendVersion::SEARCH_V23,
             Self::Sve16 => BackendVersion::SEARCH_SVE16_V1,
             Self::Sve2Fixed16 => BackendVersion::SEARCH_SVE2_16_V1,
             Self::Sve16V6 => BackendVersion::SEARCH_SVE16_V6,
@@ -377,6 +381,7 @@ fn emit_search_image<O: Operation>(
             | BackendVersion::SEARCH_V20
             | BackendVersion::SEARCH_V21
             | BackendVersion::SEARCH_V22
+            | BackendVersion::SEARCH_V23
             | BackendVersion::SEARCH_SVE16_V1
             | BackendVersion::SEARCH_SVE2_16_V1
             | BackendVersion::SEARCH_SVE16_V6
@@ -435,6 +440,11 @@ fn emit_search_image<O: Operation>(
             reason: UnsupportedReason::KernelShape,
         });
     }
+    if backend_version == BackendVersion::SEARCH_V23 && !plan.is_v23_policy_shape() {
+        return Err(EmitError::Unsupported {
+            reason: UnsupportedReason::KernelShape,
+        });
+    }
     if matches!(
         backend_version,
         BackendVersion::SEARCH_V9
@@ -451,6 +461,7 @@ fn emit_search_image<O: Operation>(
             | BackendVersion::SEARCH_V20
             | BackendVersion::SEARCH_V21
             | BackendVersion::SEARCH_V22
+            | BackendVersion::SEARCH_V23
     ) && !plan.is_v9_policy_shape()
     {
         return Err(EmitError::Unsupported {
@@ -588,6 +599,7 @@ fn emit_search_image<O: Operation>(
                 | BackendVersion::SEARCH_V20
                 | BackendVersion::SEARCH_V21
                 | BackendVersion::SEARCH_V22
+                | BackendVersion::SEARCH_V23
                 | BackendVersion::SEARCH_SVE16_V1
                 | BackendVersion::SEARCH_SVE2_16_V1
                 | BackendVersion::SEARCH_SVE16_V6
@@ -1555,6 +1567,20 @@ impl<'a> Plan<'a> {
         )
     }
 
+    const fn is_v23_policy_shape(self) -> bool {
+        matches!(
+            self,
+            Self::Exact {
+                literal,
+                anchors:
+                    AnchorFlags {
+                        start: false,
+                        end: false,
+                    },
+            } if literal.len() >= 6 && literal.len() <= 32
+        )
+    }
+
     const fn is_sve2_fixed16_v2_policy_shape(self) -> bool {
         matches!(
             self,
@@ -1701,6 +1727,7 @@ impl<'a> Plan<'a> {
                         | BackendVersion::SEARCH_V20
                         | BackendVersion::SEARCH_V21
                         | BackendVersion::SEARCH_V22
+                        | BackendVersion::SEARCH_V23
                         | BackendVersion::SEARCH_SVE16_V6
                         | BackendVersion::SEARCH_SVE2_FIXED16_V2
                 ) =>
@@ -1762,6 +1789,7 @@ impl<'a> Plan<'a> {
                 | BackendVersion::SEARCH_V20
                 | BackendVersion::SEARCH_V21
                 | BackendVersion::SEARCH_V22
+                | BackendVersion::SEARCH_V23
                 | BackendVersion::SEARCH_SVE16_V1
                 | BackendVersion::SEARCH_SVE2_16_V1
                 | BackendVersion::SEARCH_SVE16_V6
@@ -1816,6 +1844,7 @@ impl<'a> Plan<'a> {
                         | BackendVersion::SEARCH_V20
                         | BackendVersion::SEARCH_V21
                         | BackendVersion::SEARCH_V22
+                        | BackendVersion::SEARCH_V23
                         | BackendVersion::SEARCH_SVE16_V1
                         | BackendVersion::SEARCH_SVE2_16_V1
                         | BackendVersion::SEARCH_SVE16_V6
@@ -1837,6 +1866,7 @@ impl<'a> Plan<'a> {
                                 | BackendVersion::SEARCH_V20
                                 | BackendVersion::SEARCH_V21
                                 | BackendVersion::SEARCH_V22
+                                | BackendVersion::SEARCH_V23
                         ) {
                             admission.select_offsets_v3()
                         } else if matches!(
@@ -1924,6 +1954,7 @@ impl<'a> Plan<'a> {
                     | BackendVersion::SEARCH_V20
                     | BackendVersion::SEARCH_V21
                     | BackendVersion::SEARCH_V22
+                    | BackendVersion::SEARCH_V23
             ) && (shape != SearchShape::ExactLiteral
                 || candidate_policy.is_none_or(|offsets| {
                     !candidate_signature_is_cyclic_phase_unique(literal, offsets)
@@ -1979,6 +2010,7 @@ impl<'a> Plan<'a> {
                                 | BackendVersion::SEARCH_V20
                                 | BackendVersion::SEARCH_V21
                                 | BackendVersion::SEARCH_V22
+                                | BackendVersion::SEARCH_V23
                         ) && shape == SearchShape::ExactLiteral
                         {
                             SEARCH_CANDIDATE_POLICY_V11
@@ -2393,6 +2425,19 @@ fn emit_exact(
         }
         BackendVersion::SEARCH_V22 => {
             emit_vector_candidate_skip_v22(
+                assembler,
+                literal,
+                primary_offset,
+                secondary_offset,
+                verification_offset,
+                quaternary_offset,
+                quinary_offset,
+                none,
+                found,
+            )?;
+        }
+        BackendVersion::SEARCH_V23 => {
+            emit_vector_candidate_skip_v23(
                 assembler,
                 literal,
                 primary_offset,
@@ -3864,6 +3909,54 @@ fn emit_vector_candidate_skip_v22(
 
 #[allow(
     clippy::too_many_arguments,
+    reason = "the V23 wire freezes V22's first-candidate path while selecting a distinct pointer-authoritative wide graph"
+)]
+fn emit_vector_candidate_skip_v23(
+    assembler: &mut Assembler,
+    literal: &[u8],
+    primary_offset: u16,
+    secondary_offset: Option<u16>,
+    verification_offset: Option<u16>,
+    quaternary_offset: Option<u16>,
+    quinary_offset: Option<u16>,
+    none: Label,
+    found: Label,
+) -> Result<(), EmitError> {
+    let first_candidate_miss = assembler.new_label(LabelKind::Internal)?;
+    let selected = literal
+        .get(usize::from(primary_offset))
+        .copied()
+        .ok_or(EmitError::InternalInvariant)?;
+
+    assembler.add_reg(X15, X9, X5)?;
+    assembler.load_byte(X10, X15, primary_offset)?;
+    assembler.cmp_imm32(X10, u16::from(selected))?;
+    assembler.branch_cond(Condition::NotEqual, first_candidate_miss)?;
+    if literal.len() > 1 {
+        emit_literal_equality_specialized(assembler, X15, X8, literal.len(), first_candidate_miss)?;
+    }
+    assembler.mov_reg(X13, X5)?;
+    assembler.add_reg(X14, X5, X12)?;
+    assembler.branch(found)?;
+
+    assembler.bind(first_candidate_miss)?;
+    assembler.add_imm(X5, X5, 1)?;
+    emit_vector_candidate_skip_v8(
+        assembler,
+        literal,
+        primary_offset,
+        secondary_offset,
+        verification_offset,
+        quaternary_offset,
+        quinary_offset,
+        BackendVersion::SEARCH_V23,
+        none,
+        found,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
     clippy::too_many_lines,
     reason = "the versioned v8 graph keeps its paired 64-candidate screen and authenticated staged recovery explicit"
 )]
@@ -3879,6 +3972,11 @@ fn emit_vector_candidate_skip_v8(
     none: Label,
     found: Label,
 ) -> Result<(), EmitError> {
+    let persistent_backend = matches!(
+        backend_version,
+        BackendVersion::SEARCH_V22 | BackendVersion::SEARCH_V23
+    );
+    let pointer_authoritative_wide = backend_version == BackendVersion::SEARCH_V23;
     let wide = assembler.new_label(LabelKind::Loop)?;
     let wide_advance = assembler.new_label(LabelKind::Internal)?;
     let secondary_only = secondary_offset
@@ -3898,7 +3996,10 @@ fn emit_vector_candidate_skip_v8(
         .transpose()?;
     let wide_remaining_columns = matches!(
         backend_version,
-        BackendVersion::SEARCH_V20 | BackendVersion::SEARCH_V21 | BackendVersion::SEARCH_V22
+        BackendVersion::SEARCH_V20
+            | BackendVersion::SEARCH_V21
+            | BackendVersion::SEARCH_V22
+            | BackendVersion::SEARCH_V23
     )
     .then(|| assembler.new_label(LabelKind::SlowPath))
     .transpose()?;
@@ -3908,6 +4009,7 @@ fn emit_vector_candidate_skip_v8(
             | BackendVersion::SEARCH_V20
             | BackendVersion::SEARCH_V21
             | BackendVersion::SEARCH_V22
+            | BackendVersion::SEARCH_V23
     )
     .then(|| assembler.new_label(LabelKind::SlowPath))
     .transpose()?;
@@ -3917,6 +4019,7 @@ fn emit_vector_candidate_skip_v8(
             | BackendVersion::SEARCH_V20
             | BackendVersion::SEARCH_V21
             | BackendVersion::SEARCH_V22
+            | BackendVersion::SEARCH_V23
     )
     .then(|| assembler.new_label(LabelKind::Loop))
     .transpose()?;
@@ -3926,6 +4029,7 @@ fn emit_vector_candidate_skip_v8(
             | BackendVersion::SEARCH_V20
             | BackendVersion::SEARCH_V21
             | BackendVersion::SEARCH_V22
+            | BackendVersion::SEARCH_V23
     )
     .then(|| assembler.new_label(LabelKind::Loop))
     .transpose()?;
@@ -3935,6 +4039,7 @@ fn emit_vector_candidate_skip_v8(
             | BackendVersion::SEARCH_V20
             | BackendVersion::SEARCH_V21
             | BackendVersion::SEARCH_V22
+            | BackendVersion::SEARCH_V23
     )
     .then(|| assembler.new_label(LabelKind::Internal))
     .transpose()?;
@@ -3944,49 +4049,50 @@ fn emit_vector_candidate_skip_v8(
             | BackendVersion::SEARCH_V20
             | BackendVersion::SEARCH_V21
             | BackendVersion::SEARCH_V22
+            | BackendVersion::SEARCH_V23
     )
     .then(|| assembler.new_label(LabelKind::Internal))
     .transpose()?;
     let wide_learn_select = matches!(
         backend_version,
-        BackendVersion::SEARCH_V21 | BackendVersion::SEARCH_V22
+        BackendVersion::SEARCH_V21 | BackendVersion::SEARCH_V22 | BackendVersion::SEARCH_V23
     )
     .then(|| assembler.new_label(LabelKind::SlowPath))
     .transpose()?;
     let wide_learn_candidate = matches!(
         backend_version,
-        BackendVersion::SEARCH_V21 | BackendVersion::SEARCH_V22
+        BackendVersion::SEARCH_V21 | BackendVersion::SEARCH_V22 | BackendVersion::SEARCH_V23
     )
     .then(|| assembler.new_label(LabelKind::Loop))
     .transpose()?;
     let wide_learn_miss = matches!(
         backend_version,
-        BackendVersion::SEARCH_V21 | BackendVersion::SEARCH_V22
+        BackendVersion::SEARCH_V21 | BackendVersion::SEARCH_V22 | BackendVersion::SEARCH_V23
     )
     .then(|| assembler.new_label(LabelKind::Internal))
     .transpose()?;
     let wide_learn_discover = matches!(
         backend_version,
-        BackendVersion::SEARCH_V21 | BackendVersion::SEARCH_V22
+        BackendVersion::SEARCH_V21 | BackendVersion::SEARCH_V22 | BackendVersion::SEARCH_V23
     )
     .then(|| assembler.new_label(LabelKind::Loop))
     .transpose()?;
     let wide_learn_ready = matches!(
         backend_version,
-        BackendVersion::SEARCH_V21 | BackendVersion::SEARCH_V22
+        BackendVersion::SEARCH_V21 | BackendVersion::SEARCH_V22 | BackendVersion::SEARCH_V23
     )
     .then(|| assembler.new_label(LabelKind::SlowPath))
     .transpose()?;
     let wide_learn_empty = matches!(
         backend_version,
-        BackendVersion::SEARCH_V21 | BackendVersion::SEARCH_V22
+        BackendVersion::SEARCH_V21 | BackendVersion::SEARCH_V22 | BackendVersion::SEARCH_V23
     )
     .then(|| assembler.new_label(LabelKind::Internal))
     .transpose()?;
-    let persistent_wide = (backend_version == BackendVersion::SEARCH_V22)
+    let persistent_wide = persistent_backend
         .then(|| assembler.new_label(LabelKind::Loop))
         .transpose()?;
-    let persistent_advance = (backend_version == BackendVersion::SEARCH_V22)
+    let persistent_advance = persistent_backend
         .then(|| assembler.new_label(LabelKind::Internal))
         .transpose()?;
     let narrow_setup = assembler.new_label(LabelKind::Internal)?;
@@ -4024,6 +4130,7 @@ fn emit_vector_candidate_skip_v8(
             | BackendVersion::SEARCH_V20
             | BackendVersion::SEARCH_V21
             | BackendVersion::SEARCH_V22
+            | BackendVersion::SEARCH_V23
     )
     .then(|| assembler.new_label(LabelKind::Loop))
     .transpose()?;
@@ -4038,6 +4145,7 @@ fn emit_vector_candidate_skip_v8(
             | BackendVersion::SEARCH_V20
             | BackendVersion::SEARCH_V21
             | BackendVersion::SEARCH_V22
+            | BackendVersion::SEARCH_V23
     )
     .then(|| assembler.new_label(LabelKind::SlowPath))
     .transpose()?;
@@ -4052,6 +4160,7 @@ fn emit_vector_candidate_skip_v8(
             | BackendVersion::SEARCH_V20
             | BackendVersion::SEARCH_V21
             | BackendVersion::SEARCH_V22
+            | BackendVersion::SEARCH_V23
     )
     .then(|| assembler.new_label(LabelKind::Internal))
     .transpose()?;
@@ -4066,6 +4175,7 @@ fn emit_vector_candidate_skip_v8(
             | BackendVersion::SEARCH_V20
             | BackendVersion::SEARCH_V21
             | BackendVersion::SEARCH_V22
+            | BackendVersion::SEARCH_V23
     )
     .then(|| assembler.new_label(LabelKind::Loop))
     .transpose()?;
@@ -4086,6 +4196,7 @@ fn emit_vector_candidate_skip_v8(
             | BackendVersion::SEARCH_V20
             | BackendVersion::SEARCH_V21
             | BackendVersion::SEARCH_V22
+            | BackendVersion::SEARCH_V23
     )
     .then(|| assembler.new_label(LabelKind::SlowPath))
     .transpose()?;
@@ -4148,6 +4259,7 @@ fn emit_vector_candidate_skip_v8(
             | BackendVersion::SEARCH_V20
             | BackendVersion::SEARCH_V21
             | BackendVersion::SEARCH_V22
+            | BackendVersion::SEARCH_V23
     ) {
         if !filters_cover_zero {
             return Err(EmitError::InternalInvariant);
@@ -4179,6 +4291,15 @@ fn emit_vector_candidate_skip_v8(
     assembler.cmp_imm64(X10, 63)?;
     assembler.branch_cond(Condition::CarryClear, narrow_setup)?;
     assembler.sub_imm(X7, X6, 63)?;
+    if pointer_authoritative_wide {
+        // X13 is the inclusive primary-column pointer for the final complete
+        // 64-candidate group. X15 alone is authoritative until a pointer-only
+        // exit reconstructs the candidate index in X5.
+        assembler.add_reg(X13, X9, X7)?;
+        if primary_offset != 0 {
+            assembler.add_imm(X13, X13, primary_offset)?;
+        }
+    }
 
     // Test four primary columns before loading any secondary data. Paired Q
     // loads halve the load-instruction footprint without changing the exact
@@ -4200,16 +4321,33 @@ fn emit_vector_candidate_skip_v8(
     }
 
     assembler.bind(wide_advance)?;
-    assembler.add_imm(X5, X5, 64)?;
-    assembler.add_imm(X15, X15, 64)?;
-    assembler.cmp_reg64(X5, X7)?;
-    assembler.branch_cond(Condition::LowerOrSame, wide)?;
-    assembler.branch(narrow_setup)?;
+    if pointer_authoritative_wide {
+        assembler.add_imm(X15, X15, 64)?;
+        assembler.cmp_reg64(X15, X13)?;
+        assembler.branch_cond(Condition::LowerOrSame, wide)?;
+        assembler.sub_reg(X5, X15, X9)?;
+        if primary_offset != 0 {
+            assembler.sub_imm(X5, X5, primary_offset)?;
+        }
+        assembler.branch(narrow_setup)?;
+    } else {
+        assembler.add_imm(X5, X5, 64)?;
+        assembler.add_imm(X15, X15, 64)?;
+        assembler.cmp_reg64(X5, X7)?;
+        assembler.branch_cond(Condition::LowerOrSame, wide)?;
+        assembler.branch(narrow_setup)?;
+    }
 
     if let Some(wide_second_filter) = wide_second_filter {
         let offset = secondary_offset.expect("wide second-filter label requires an offset");
         let delta = offset.abs_diff(primary_offset);
         assembler.bind(wide_second_filter)?;
+        if pointer_authoritative_wide {
+            assembler.sub_reg(X5, X15, X9)?;
+            if primary_offset != 0 {
+                assembler.sub_imm(X5, X5, primary_offset)?;
+            }
+        }
         if offset > primary_offset {
             assembler.add_imm(X10, X15, delta)?;
         } else {
@@ -4237,7 +4375,10 @@ fn emit_vector_candidate_skip_v8(
             assembler.compare_branch_zero(X10, true, saved)?;
         } else if matches!(
             backend_version,
-            BackendVersion::SEARCH_V20 | BackendVersion::SEARCH_V21 | BackendVersion::SEARCH_V22
+            BackendVersion::SEARCH_V20
+                | BackendVersion::SEARCH_V21
+                | BackendVersion::SEARCH_V22
+                | BackendVersion::SEARCH_V23
         ) {
             let pair_empty = secondary_only_advance.ok_or(EmitError::InternalInvariant)?;
             let remaining = wide_remaining_columns.ok_or(EmitError::InternalInvariant)?;
@@ -4335,6 +4476,7 @@ fn emit_vector_candidate_skip_v8(
                 BackendVersion::SEARCH_V20
                     | BackendVersion::SEARCH_V21
                     | BackendVersion::SEARCH_V22
+                    | BackendVersion::SEARCH_V23
             ) {
                 assembler.branch(wide_remaining_columns.ok_or(EmitError::InternalInvariant)?)?;
             }
@@ -4452,13 +4594,13 @@ fn emit_vector_candidate_skip_v8(
         // four original group masks. The sampled false lane necessarily drops.
         assembler.bind(column_ready)?;
         assembler.dup_byte16(24, X13)?;
-        if backend_version == BackendVersion::SEARCH_V22 {
+        if persistent_backend {
             assembler.dup_byte16(25, X11)?;
             assembler.mov_imm64(X11, 1)?;
         }
         assembler.add_reg(X15, X9, X7)?;
-        if backend_version == BackendVersion::SEARCH_V22 {
-            // X11 is persistent state in V22, so recover the dynamic offset
+        if persistent_backend {
+            // X11 is persistent state in V22/V23, so recover the dynamic offset
             // from Q25 after the state transition.
             assembler.move_vector_byte_to32(X10, 25)?;
             assembler.add_reg(X15, X15, X10)?;
@@ -4478,7 +4620,7 @@ fn emit_vector_candidate_skip_v8(
         emit_four_block_presence_v8(assembler)?;
         assembler.compare_branch_zero(X10, false, learned_empty)?;
         assembler.mov_reg(X5, X7)?;
-        if backend_version != BackendVersion::SEARCH_V22 {
+        if !persistent_backend {
             assembler.mov_imm64(X11, 0)?;
         }
         assembler.branch(saved)?;
@@ -4492,7 +4634,7 @@ fn emit_vector_candidate_skip_v8(
         if primary_offset != 0 {
             assembler.add_imm(X15, X15, primary_offset)?;
         }
-        if backend_version == BackendVersion::SEARCH_V22 {
+        if persistent_backend {
             assembler.sub_imm(X7, X6, 63)?;
             assembler.branch(persistent_advance.ok_or(EmitError::InternalInvariant)?)?;
         } else {
@@ -4664,10 +4806,7 @@ fn emit_vector_candidate_skip_v8(
         // and reconstruct the primary pointer and wide bound. V22 restores its
         // persistent learned state; earlier versions resume the frozen graph.
         assembler.bind(done)?;
-        assembler.mov_imm64(
-            X11,
-            u64::from(backend_version == BackendVersion::SEARCH_V22),
-        )?;
+        assembler.mov_imm64(X11, u64::from(persistent_backend))?;
         assembler.add_imm(X5, X7, 16)?;
         assembler.add_reg(X15, X9, X5)?;
         if primary_offset != 0 {
@@ -4843,6 +4982,7 @@ fn emit_vector_candidate_skip_v8(
             | BackendVersion::SEARCH_V20
             | BackendVersion::SEARCH_V21
             | BackendVersion::SEARCH_V22
+            | BackendVersion::SEARCH_V23
     ) {
         emit_literal_equality_specialized(assembler, X15, X8, literal.len(), candidate_miss)?;
     } else if literal.len() == 16 {
@@ -4915,6 +5055,7 @@ fn emit_vector_candidate_skip_v8(
             | BackendVersion::SEARCH_V20
             | BackendVersion::SEARCH_V21
             | BackendVersion::SEARCH_V22
+            | BackendVersion::SEARCH_V23
     ) {
         let discover = learned_discover.ok_or(EmitError::InternalInvariant)?;
         let column_ready = learned_column_ready.ok_or(EmitError::InternalInvariant)?;
@@ -4929,6 +5070,7 @@ fn emit_vector_candidate_skip_v8(
                 | BackendVersion::SEARCH_V20
                 | BackendVersion::SEARCH_V21
                 | BackendVersion::SEARCH_V22
+                | BackendVersion::SEARCH_V23
         );
 
         // X11 is initialized once before scanning. State zero enters
@@ -5012,6 +5154,7 @@ fn emit_vector_candidate_skip_v8(
                 | BackendVersion::SEARCH_V20
                 | BackendVersion::SEARCH_V21
                 | BackendVersion::SEARCH_V22
+                | BackendVersion::SEARCH_V23
         ) {
             // A learned byte may recur elsewhere in the literal (and hence in
             // near-miss streams at shifted candidate phases). Test presence
