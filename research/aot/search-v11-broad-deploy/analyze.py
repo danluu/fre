@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate paired Search V11/V10/portable development CSVs."""
+"""Validate paired Search V12/V11/portable development CSVs."""
 
 import csv
 import json
@@ -8,11 +8,11 @@ import statistics
 import sys
 from collections import defaultdict
 
-SCHEMA = "fre-search-v11-broad-devscreen-v1"
+SCHEMA = "fre-search-v12-broad-devscreen-v1"
 ENGINES = (
-    "native-v10-aot-code-tag23",
     "native-v11-aot-code-tag24",
-    "hybrid-portable256-v11-tag24-floor4093-width2",
+    "native-v12-aot-code-tag25",
+    "hybrid-portable256-v12-tag25-floor4093-width2",
     "portable-memmem",
 )
 REPETITIONS = {"screen": 3}
@@ -174,20 +174,20 @@ def main():
             for field in ("iterations", "checksum", "semantic"):
                 if len({row[field] for row in paired}) != 1:
                     fail(f"paired {field} mismatch: {fixture} repetition={repetition}")
-        v10 = medians[ENGINES[0]]
-        v11 = medians[ENGINES[1]]
+        v11 = medians[ENGINES[0]]
+        v12 = medians[ENGINES[1]]
         hybrid = medians[ENGINES[2]]
         portable = medians[ENGINES[3]]
         fixture_ratios.append(
             {
                 "fixture": fixture,
-                "v10_over_v11": v10 / v11,
-                "v11_over_v10": v11 / v10,
+                "v11_over_v12": v11 / v12,
+                "v12_over_v11": v12 / v11,
+                "portable_over_v12": portable / v12,
                 "portable_over_v11": portable / v11,
-                "portable_over_v10": portable / v10,
                 "portable_over_hybrid": portable / hybrid,
                 "hybrid_over_portable": hybrid / portable,
-                "v11_over_hybrid": v11 / hybrid,
+                "v12_over_hybrid": v12 / hybrid,
                 "hybrid_minus_portable_ns": hybrid - portable,
             }
         )
@@ -203,13 +203,13 @@ def main():
         }
 
     ratio_names = (
-        "v10_over_v11",
-        "v11_over_v10",
+        "v11_over_v12",
+        "v12_over_v11",
+        "portable_over_v12",
         "portable_over_v11",
-        "portable_over_v10",
         "portable_over_hybrid",
         "hybrid_over_portable",
-        "v11_over_hybrid",
+        "v12_over_hybrid",
     )
 
     def selected(ratio, predicate):
@@ -384,7 +384,7 @@ def main():
     }
 
     output = {
-        "schema": "fre-search-v11-broad-devscreen-analysis-v1",
+        "schema": "fre-search-v12-broad-devscreen-analysis-v1",
         "phase": expected_phase,
         "fixtures": len(rows),
         "rows": seen_phase_rows,
@@ -394,30 +394,30 @@ def main():
         },
         "by_width": {
             ratio: grouped("width", ratio)
-            for ratio in ("v10_over_v11", "portable_over_v11", "portable_over_hybrid")
+            for ratio in ("v11_over_v12", "portable_over_v12", "portable_over_hybrid")
         },
         "by_size": {
             ratio: grouped("size", ratio)
-            for ratio in ("v10_over_v11", "portable_over_v11", "portable_over_hybrid")
+            for ratio in ("v11_over_v12", "portable_over_v12", "portable_over_hybrid")
         },
         "by_shape": {
             ratio: grouped("shape", ratio)
-            for ratio in ("v10_over_v11", "portable_over_v11", "portable_over_hybrid")
+            for ratio in ("v11_over_v12", "portable_over_v12", "portable_over_hybrid")
         },
         "by_scenario": {
             ratio: grouped("scenario", ratio)
-            for ratio in ("v10_over_v11", "portable_over_v11", "portable_over_hybrid")
+            for ratio in ("v11_over_v12", "portable_over_v12", "portable_over_hybrid")
         },
         "predeclared_screen_gates": {
             "candidate_independent_every_offset_mutation_vs_portable": mutation_gate,
-            "v11_first_candidate_vs_v10": geomean_gate(
-                "v10_over_v11", first_candidate, 0.98
+            "v12_first_candidate_vs_v11": geomean_gate(
+                "v11_over_v12", first_candidate, 0.98
             ),
             "hybrid_tail_owned_long_scan_vs_portable": long_scan_gate(
                 lambda fixture: True
             ),
-            "v11_nonfirst_tail_guard_vs_v10": parity_gate(
-                "v11_over_v10", lambda fixture: not first_candidate(fixture)
+            "v12_nonfirst_tail_guard_vs_v11": parity_gate(
+                "v12_over_v11", lambda fixture: not first_candidate(fixture)
             ),
             "hybrid_prefix_owned_absolute_overhead_vs_portable": fixed_overhead_gate(
                 lambda fixture: hybrid_eligible(fixture) and safety_scenario(fixture)

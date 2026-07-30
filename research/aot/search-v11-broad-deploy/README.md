@@ -1,18 +1,18 @@
-# Search V11 broad development screen
+# Search V12 broad development screen
 
 This screen carries the already-frozen candidate-independent mutation
-inventory into separately authenticated Search V10/tag 23 and Search V11/tag
-24 machine code. V11 keeps the five-column schema but reserves both literal
-endpoints when the packed pair omits them. The portable baseline remains
-`memmem::Finder`. Construction, independent whole-template audit, and
-strict-W^X publication happen outside timing. Each timed native call retains
-the same checked window and literal-resource preflight as the static AOT
-facade.
+inventory into separately authenticated Search V11/tag 24 and Search V12/tag
+25 machine code. V12 preserves V11's five-column screen and replaces generic
+exact confirmation with one or two exact width-specialized byte/u16/u32/u64/
+ASIMD blocks. The portable baseline remains `memmem::Finder`. Construction,
+independent whole-template audit, and strict-W^X publication happen outside
+timing. Each timed native call retains the same checked window and
+literal-resource preflight as the static AOT facade.
 
 The fourth engine is the development broad-routing candidate. Literal widths
 2 through 32 and checked windows of at least 4,093 bytes use one authoritative
 full-window preflight, portable search for exactly the first 256 candidate
-starts, and V11 for the disjoint tail. Width 1 and smaller windows stay
+starts, and V12 for the disjoint tail. Width 1 and smaller windows stay
 entirely portable.
 
 This binary is development-only and mechanically accepts only `screen`. It
@@ -51,8 +51,8 @@ python3 research/aot/search-v11-broad-deploy/analyze.py \
   screen screen-*.csv > screen-analysis.json
 ```
 
-Ratios above one favor the denominator: `v10_over_v11` favors V11 and
-`portable_over_v11` favors V11. The analyzer fails closed on missing engines,
+Ratios above one favor the denominator: `v11_over_v12` favors V12 and
+`portable_over_v12` favors V12. The analyzer fails closed on missing engines,
 duplicate shards, repetition gaps, or paired semantic/checksum/iteration
 mismatches. It additionally fails closed unless every mutation offset exists
 for every seed/width/shape/size cell. Aggregate mutation performance and the
