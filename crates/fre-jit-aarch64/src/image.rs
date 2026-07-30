@@ -115,6 +115,11 @@ impl BackendVersion {
     ///
     /// Tag 36 is a distinct candidate; tags 30 through 35 remain frozen.
     pub const SEARCH_V23: Self = Self(36);
+    /// Search V23 with one deterministic sixth static column applied only
+    /// after all five authenticated static columns leave survivors.
+    ///
+    /// Tag 37 is a distinct candidate; tags 30 through 36 remain frozen.
+    pub const SEARCH_V24: Self = Self(37);
     /// Compatibility name for the original search backend.
     pub const SEARCH_LEGACY: Self = Self::SEARCH_V1;
     /// Current search backend and AOT wire contract.
@@ -746,6 +751,7 @@ pub(crate) fn aot_size(image: &NativeImage) -> Result<usize, EmitError> {
                 | BackendVersion::SEARCH_V21
                 | BackendVersion::SEARCH_V22
                 | BackendVersion::SEARCH_V23
+                | BackendVersion::SEARCH_V24
         ) {
             56
         } else if matches!(
@@ -835,6 +841,7 @@ fn aot_magic(image: &NativeImage) -> Result<&'static [u8; 8], EmitError> {
         BackendVersion::SEARCH_V21 => Ok(b"FREA64\0\x22"),
         BackendVersion::SEARCH_V22 => Ok(b"FREA64\0\x23"),
         BackendVersion::SEARCH_V23 => Ok(b"FREA64\0\x24"),
+        BackendVersion::SEARCH_V24 => Ok(b"FREA64\0\x25"),
         _ => Err(EmitError::InternalInvariant),
     }
 }
@@ -881,6 +888,7 @@ fn encode_aot_manifest(image: &NativeImage, write: &mut impl FnMut(&[u8])) {
                 | BackendVersion::SEARCH_V21
                 | BackendVersion::SEARCH_V22
                 | BackendVersion::SEARCH_V23
+                | BackendVersion::SEARCH_V24
                 | BackendVersion::SEARCH_SVE16_V1
                 | BackendVersion::SEARCH_SVE2_16_V1
                 | BackendVersion::SEARCH_SVE16_V6
@@ -907,6 +915,7 @@ fn encode_aot_manifest(image: &NativeImage, write: &mut impl FnMut(&[u8])) {
                 | BackendVersion::SEARCH_V21
                 | BackendVersion::SEARCH_V22
                 | BackendVersion::SEARCH_V23
+                | BackendVersion::SEARCH_V24
                 | BackendVersion::SEARCH_SVE16_V1
                 | BackendVersion::SEARCH_SVE2_16_V1
                 | BackendVersion::SEARCH_SVE16_V6
@@ -931,6 +940,7 @@ fn encode_aot_manifest(image: &NativeImage, write: &mut impl FnMut(&[u8])) {
                 | BackendVersion::SEARCH_V21
                 | BackendVersion::SEARCH_V22
                 | BackendVersion::SEARCH_V23
+                | BackendVersion::SEARCH_V24
         ) {
             write(&manifest.quinary_offset.to_le_bytes());
         }

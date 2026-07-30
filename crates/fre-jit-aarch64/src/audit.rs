@@ -318,6 +318,7 @@ fn validate_search_backend_version(image: &NativeImage) -> Result<BackendVersion
         | BackendVersion::SEARCH_V21
         | BackendVersion::SEARCH_V22
         | BackendVersion::SEARCH_V23
+        | BackendVersion::SEARCH_V24
         | BackendVersion::SEARCH_SVE16_V1
         | BackendVersion::SEARCH_SVE2_16_V1
         | BackendVersion::SEARCH_SVE16_V6
@@ -365,6 +366,7 @@ fn authenticate_search_envelope<'image>(
             | BackendVersion::SEARCH_V21
             | BackendVersion::SEARCH_V22
             | BackendVersion::SEARCH_V23
+            | BackendVersion::SEARCH_V24
             | BackendVersion::SEARCH_SVE16_V1
             | BackendVersion::SEARCH_SVE2_16_V1
             | BackendVersion::SEARCH_SVE16_V6
@@ -616,6 +618,7 @@ fn authenticate_search_manifest<'image>(
                     | BackendVersion::SEARCH_V21
                     | BackendVersion::SEARCH_V22
                     | BackendVersion::SEARCH_V23
+                    | BackendVersion::SEARCH_V24
             ) && (manifest.anchors != AnchorFlags::default() || literal_len == 0)
             {
                 return Err(AuditError::InvalidSearchManifest);
@@ -673,6 +676,7 @@ fn authenticate_class_suffix_manifest(
             | BackendVersion::SEARCH_V21
             | BackendVersion::SEARCH_V22
             | BackendVersion::SEARCH_V23
+            | BackendVersion::SEARCH_V24
     ) {
         return Err(AuditError::InvalidSearchManifest);
     }
@@ -872,6 +876,7 @@ fn authenticate_search_candidate_policy(
                         | BackendVersion::SEARCH_V21
                         | BackendVersion::SEARCH_V22
                         | BackendVersion::SEARCH_V23
+                        | BackendVersion::SEARCH_V24
                 ) {
                     independent_ranked_verification_offsets_v3(literal, primary, secondary)
                 } else if matches!(
@@ -945,6 +950,7 @@ fn authenticate_search_candidate_policy(
             | BackendVersion::SEARCH_V21
             | BackendVersion::SEARCH_V22
             | BackendVersion::SEARCH_V23
+            | BackendVersion::SEARCH_V24
     ) {
         let selected = selected.ok_or(AuditError::InvalidSearchManifest)?;
         if !independently_authenticate_v15_phase_unique(literal, selected) {
@@ -998,6 +1004,7 @@ fn authenticate_search_candidate_policy(
                         | BackendVersion::SEARCH_V21
                         | BackendVersion::SEARCH_V22
                         | BackendVersion::SEARCH_V23
+                        | BackendVersion::SEARCH_V24
                 ) && manifest.shape == SearchShape::ExactLiteral
                 {
                     SEARCH_CANDIDATE_POLICY_V11
@@ -4926,6 +4933,7 @@ fn first_forbidden_search_vector_register(
                 | BackendVersion::SEARCH_V21
                 | BackendVersion::SEARCH_V22
                 | BackendVersion::SEARCH_V23
+                | BackendVersion::SEARCH_V24
                 | BackendVersion::SEARCH_SVE16_V6
                 | BackendVersion::SEARCH_SVE2_FIXED16_V2 => register >= 16,
                 _ => false,
