@@ -1,0 +1,29 @@
+{
+  "schema": "fre-search-aot-candidate-preregistration-clarification-v1",
+  "candidate": "v24-sixth-static-r1",
+  "clarifies": {
+    "path": "research/aot/search-v24-sixth-static-r1/preregistration-v2-gate-amendment.json",
+    "sha256": "37b39cbaf706ac3657dde97155b21d29ce909015f6ebc77a988c6f9dcde07110",
+    "field": "replacement_acceptance.cell_tail.ratio"
+  },
+  "timing_status_at_clarification": "NO_V24_BUILD_EXECUTION_OR_TIMING_HAS_OCCURRED",
+  "authoritative_cell_estimator": {
+    "method": "Retain the frozen V23 runner method exactly: for each cell, collect 12 paired candidate/reference elapsed-time ratios, exercising all six portable/reference/candidate execution orders twice, then take the ordinary median of the 12 paired ratios.",
+    "printed_precision": "The runner emits the cell ratio with exactly six digits after the decimal point. The authenticated analyzer parses that emitted finite positive value; the independently printed candidate_ns and reference_ns medians are reporting fields and their quotient is not substituted for the paired-ratio median.",
+    "aggregation": "Overall and broad-stratum values are equal-cell-weight geometric means of the authenticated emitted cell ratios, computed as exp(fsum(log(ratio))/count).",
+    "threshold_comparison": "All thresholds are inclusive. A cell equal to 1.050000 does not count as over 1.05; a cell equal to 1.100000 satisfies the maximum guard.",
+    "p95_reporting": "Sort all 1,944 authenticated emitted cell ratios ascending and select the one-indexed nearest rank ceil(0.95 * 1,944) = 1,847. This statistic is reported but is redundant with the stronger at-most-19-cells-over-1.05 gate.",
+    "tail_count": "Count exactly the authenticated cells whose emitted ratio is strictly greater than 1.050000. At most floor(0.01 * 1,944) = 19 may do so.",
+    "maximum": "The maximum over all 1,944 authenticated emitted cell ratios must be at most 1.100000."
+  },
+  "inventory_hard_failures": [
+    "Anything other than exactly 1,944 unique frozen case keys",
+    "Any missing or duplicate case key",
+    "Any missing or duplicate prepared artifact pair",
+    "Any non-finite or non-positive timing or ratio field",
+    "Any unpaired execution or wrong repetition/order inventory",
+    "Any artifact, code-size, fixture, window, outcome, or version mismatch",
+    "Any semantic, ABI, audit, mutation, identity, or guard-page mismatch"
+  ],
+  "scope": "This clarification freezes an ambiguity in the prospective v2 text. It changes no implementation, workload, membership, timing method, threshold, or terminal rule."
+}
