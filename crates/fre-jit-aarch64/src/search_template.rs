@@ -746,6 +746,10 @@ fn emit_preamble(template: &mut Template, none: Label) {
     template.branch_cond(Condition::Higher, none);
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the versioned exact-template dispatch keeps every frozen backend and V23 explicit"
+)]
 fn emit_exact(
     template: &mut Template,
     manifest: SearchManifest,

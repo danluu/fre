@@ -11779,6 +11779,10 @@ fn v23_pointer_wide_cfg_and_x13_liveness_hold_for_every_width() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the V23 mutation test authenticates the bound, advance, comparison, and both reconstruction exits together"
+)]
 fn v23_rejects_resealed_bound_advance_compare_and_both_reconstruction_mutations() {
     let literal = v23_pointer_test_literal(13, false);
     let program =
@@ -12303,6 +12307,10 @@ fn v23_every_width_primary_offset_and_window_shape_matches_the_kir_oracle() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the complete frozen backend matrix keeps its topology generator and authenticated digest adjacent"
+)]
 fn v23_frozen_all_prior_search_aot_matrix_bytes_are_exact() {
     fn gate_literal(topology: u8, width: usize) -> Vec<u8> {
         match topology {
