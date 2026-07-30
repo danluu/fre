@@ -102,32 +102,36 @@ def main() -> None:
     )
     expected_timed = freeze["timed_projection"]
     actual_timed = summary["timed_projection"]
+    frozen_count_fields = {
+        "width_counts",
+        "topology_counts",
+        "learned_source_kind_counts",
+        "learned_source_relation_counts",
+        "topology_relation_counts",
+        "literal_phase_class_counts",
+        "selector_primary_offset_class_counts",
+        "logical_prefix_counts",
+        "mapping_counts",
+        "physical_window_start_mod16_counts",
+        "physical_window_start_mod16_counts_by_mapping",
+        "window_counts",
+    }
+    exact_counts = expected_timed["exact_stratification_counts"]
     require(
         actual_timed["rows"] == expected_timed["rows"]
         and actual_timed["sha256"] == expected_timed["sha256"]
-        and set(map(int, actual_timed["width_counts"]))
-        == set(range(
-            expected_timed["eligible_widths"]["minimum"],
-            expected_timed["eligible_widths"]["maximum"] + 1,
-        ))
-        and set(actual_timed["topology_counts"])
-        == set(expected_timed["eligible_topologies"])
-        and set(actual_timed["learned_source_relation_counts"])
-        == {
-            "absent-from-literal",
-            "singleton-in-literal",
-            "repeated-in-literal",
-            "equals-primary",
-            "equals-secondary",
-            "equals-verification",
-            "equals-quaternary",
-            "equals-quinary",
-            "equals-terminal",
-        }
-        and set(map(int, actual_timed["phase_counts"])) == set(range(5))
-        and set(map(int, actual_timed["alignment_counts"])) == set(range(16))
-        and set(map(int, actual_timed["window_counts"]))
-        == set(expected_timed["window_bytes"]),
+        and set(exact_counts) == frozen_count_fields
+        and all(
+            json.loads(
+                json.dumps(
+                    actual_timed[field],
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+            == exact_counts[field]
+            for field in frozen_count_fields
+        ),
         "timed stratified projection changed",
     )
     require(

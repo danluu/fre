@@ -40,7 +40,7 @@ ROW_DOMAIN = b"FRE-SEARCH-TAG29-TOPOLOGY-ROW\0\x01"
 
 WIDTHS = tuple(range(4, 33))
 ELIGIBLE_WIDTHS = tuple(range(6, 33))
-PHASE_PLACEMENTS = tuple(range(5))
+LITERAL_PHASE_CLASSES = tuple(range(5))
 MUTATION_CLASSES = tuple(range(19))
 ALIGNMENTS = tuple(range(16))
 GEOMETRIES = tuple(
@@ -436,8 +436,8 @@ def projection_row(
 ) -> dict[str, Any]:
     topology = TOPOLOGIES[topology_index]
     size_class, alignment = GEOMETRIES[geometry_index]
-    phase = geometry_index % len(PHASE_PLACEMENTS)
-    literal, offsets = build_literal(width, topology, phase)
+    literal_phase_class = geometry_index % len(LITERAL_PHASE_CLASSES)
+    literal, offsets = build_literal(width, topology, literal_phase_class)
     eligible, checked_offsets = selector_eligible(literal)
     require(offsets == checked_offsets, "selector reconstruction changed")
     require_unselected = eligible and size_class == "long"
@@ -487,6 +487,7 @@ def projection_row(
         if outcome == "absent"
         else alignment + window_bytes - width
     )
+    right_guarded = (geometry_index + mutation_class) % 2 == 0
     sentinel = absent_byte(literal)
     validate_near_miss_tile(literal, near_miss, sentinel)
     literal_sha256 = sha256(literal)
@@ -504,7 +505,8 @@ def projection_row(
         "literal_hex": literal.hex(),
         "literal_bytes": width,
         "topology": topology,
-        "selector_phase_placement": phase,
+        "literal_phase_class": literal_phase_class,
+        "selector_primary_offset_class": offsets[0] % 5,
         "selected_offsets": list(offsets),
         "selector_eligible": eligible,
         "mutation_class": mutation_class,
@@ -518,7 +520,7 @@ def projection_row(
         "learned_source_byte": source,
         "learned_source_relations": sorted(source_relations),
         "near_miss_hex": near_miss.hex(),
-        "alignment": alignment,
+        "logical_prefix_bytes": alignment,
         "size_class": size_class,
         "window_bytes": window_bytes,
         "candidate_starts": candidate_starts,
@@ -532,13 +534,23 @@ def projection_row(
             "tag29-object" if eligible else "structural-refusal"
         ),
         "expected_static_invoked": expected_route == "tag29-static-tail",
-        "right_guarded": (geometry_index + mutation_class) % 2 == 0,
+        "right_guarded": right_guarded,
+        "expected_physical_window_start_mod16": (
+            (-window_bytes) % 16
+            if right_guarded
+            else alignment
+        ),
         "fixture_recipe": {
             "construction_version": "near-miss-sentinel-tile-tail-v1",
             "background_byte": sentinel,
             "near_miss_tile_hex": near_miss.hex() + f"{sentinel:02x}",
             "window_start": alignment,
             "window_end": alignment + window_bytes,
+            "physical_mapping": (
+                "place checked-window end at a page-aligned right guard"
+                if right_guarded
+                else "place checked-window start at the recorded mod-16 address"
+            ),
             "true_literal_guard_bytes": width - 1,
             "steps": [
                 "fill the checked window with the near-miss tile, truncating at window end",
@@ -569,12 +581,12 @@ def is_timed_row(row: Mapping[str, Any]) -> bool:
     ):
         return False
     topology_index = ELIGIBLE_TOPOLOGIES.index(row["topology"])
-    expected_alignment = (
+    expected_logical_prefix = (
         row["literal_bytes"] * 11
         + topology_index * 5
         + row["mutation_class"] * 7
     ) % len(ALIGNMENTS)
-    return row["alignment"] == expected_alignment
+    return row["logical_prefix_bytes"] == expected_logical_prefix
 
 
 class ProjectionDigest:
@@ -617,16 +629,26 @@ def generate(
     timed_topologies: Counter[str] = Counter()
     timed_sources: Counter[str] = Counter()
     timed_source_relations: Counter[str] = Counter()
-    timed_phases: Counter[int] = Counter()
-    timed_alignments: Counter[int] = Counter()
+    timed_literal_phases: Counter[int] = Counter()
+    timed_selector_primary_classes: Counter[int] = Counter()
+    timed_logical_prefixes: Counter[int] = Counter()
+    timed_physical_alignments: Counter[int] = Counter()
+    timed_mapping_counts: Counter[str] = Counter()
+    timed_mapping_alignments: dict[str, Counter[int]] = {
+        "right-guarded": Counter(),
+        "right-padded": Counter(),
+    }
     timed_windows: Counter[int] = Counter()
+    timed_topology_relations: dict[str, Counter[str]] = {
+        topology: Counter() for topology in ELIGIBLE_TOPOLOGIES
+    }
     for row in full_rows():
         full.add(row)
         full_routes[row["expected_route"]] += 1
         literal_key = (
             row["literal_bytes"],
             row["topology"],
-            row["selector_phase_placement"],
+            row["literal_phase_class"],
             row["literal_sha256"],
         )
         if literal_key not in literal_keys:
@@ -646,9 +668,26 @@ def generate(
             timed_sources[row["learned_source_kind"]] += 1
             for relation in row["learned_source_relations"]:
                 timed_source_relations[relation] += 1
-            timed_phases[row["selector_phase_placement"]] += 1
-            timed_alignments[row["alignment"]] += 1
+            timed_literal_phases[row["literal_phase_class"]] += 1
+            timed_selector_primary_classes[
+                row["selector_primary_offset_class"]
+            ] += 1
+            timed_logical_prefixes[row["logical_prefix_bytes"]] += 1
+            timed_physical_alignments[
+                row["expected_physical_window_start_mod16"]
+            ] += 1
+            mapping = (
+                "right-guarded"
+                if row["right_guarded"]
+                else "right-padded"
+            )
+            timed_mapping_counts[mapping] += 1
+            timed_mapping_alignments[mapping][
+                row["expected_physical_window_start_mod16"]
+            ] += 1
             timed_windows[row["window_bytes"]] += 1
+            for relation in row["learned_source_relations"]:
+                timed_topology_relations[row["topology"]][relation] += 1
     full_count, full_sha256 = full.finish()
     timed_count, timed_sha256 = timed.finish()
     require(full_count == EXPECTED_FULL_ROWS, "full projection count changed")
@@ -656,8 +695,10 @@ def generate(
     require(
         set(timed_widths) == set(ELIGIBLE_WIDTHS)
         and set(timed_topologies) == set(ELIGIBLE_TOPOLOGIES)
-        and set(timed_phases) == set(PHASE_PLACEMENTS)
-        and set(timed_alignments) == set(ALIGNMENTS)
+        and set(timed_literal_phases) == set(LITERAL_PHASE_CLASSES)
+        and set(timed_selector_primary_classes) == set(range(5))
+        and set(timed_logical_prefixes) == set(ALIGNMENTS)
+        and set(timed_physical_alignments) == set(ALIGNMENTS)
         and set(timed_windows) == set(LONG_WINDOW_BYTES),
         "timed stratification coverage changed",
     )
@@ -684,10 +725,13 @@ def generate(
             "topologies": list(TOPOLOGIES),
             "eligible_topologies": list(ELIGIBLE_TOPOLOGIES),
             "mutation_classes": list(MUTATION_CLASSES),
-            "phase_placements": list(PHASE_PLACEMENTS),
-            "alignments": list(ALIGNMENTS),
+            "literal_phase_classes": list(LITERAL_PHASE_CLASSES),
+            "logical_prefix_bytes": list(ALIGNMENTS),
             "geometries": [
-                {"size_class": size_class, "alignment": alignment}
+                {
+                    "size_class": size_class,
+                    "logical_prefix_bytes": alignment,
+                }
                 for size_class, alignment in GEOMETRIES
             ],
             "short_window_bytes": list(SHORT_WINDOW_BYTES),
@@ -714,8 +758,27 @@ def generate(
             "learned_source_relation_counts": dict(
                 sorted(timed_source_relations.items())
             ),
-            "phase_counts": dict(sorted(timed_phases.items())),
-            "alignment_counts": dict(sorted(timed_alignments.items())),
+            "topology_relation_counts": {
+                topology: dict(sorted(counts.items()))
+                for topology, counts in timed_topology_relations.items()
+            },
+            "literal_phase_class_counts": dict(
+                sorted(timed_literal_phases.items())
+            ),
+            "selector_primary_offset_class_counts": dict(
+                sorted(timed_selector_primary_classes.items())
+            ),
+            "logical_prefix_counts": dict(
+                sorted(timed_logical_prefixes.items())
+            ),
+            "physical_window_start_mod16_counts": dict(
+                sorted(timed_physical_alignments.items())
+            ),
+            "mapping_counts": dict(sorted(timed_mapping_counts.items())),
+            "physical_window_start_mod16_counts_by_mapping": {
+                mapping: dict(sorted(counts.items()))
+                for mapping, counts in timed_mapping_alignments.items()
+            },
             "window_counts": dict(sorted(timed_windows.items())),
         },
         "gates": {

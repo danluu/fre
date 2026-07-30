@@ -7,7 +7,7 @@
   },
   "generator": {
     "path": "research/aot/search-tag29-topology-generalization-v1/generate_projection.py",
-    "sha256": "4c7e3735ea1611803bc83a1cabd3fac8d4d39da0cc6d31779b8055e5f016ed1a"
+    "sha256": "35aacbca100dde74a2ead493ceab1197c813d37c17d5f4a9d3e62938c3a2b610"
   },
   "selector": {
     "contract_path": "research/aot/search-phase-unique-selector-v1/selector-contract-v1.json",
@@ -29,7 +29,7 @@
   },
   "full_projection": {
     "rows": 123424,
-    "sha256": "3ffd244824b59fc42ad001f76f7f3775ec3f9566e67194be96cd8f93e6490a21",
+    "sha256": "5d548159e8c93d6ddb8d57847e01cc97ea2b661f736b2e8a126df6cd35cf612f",
     "literal_inventory_rows": 1015,
     "literal_inventory_sha256": "2286c399f5e0bb3129c98dc7c7d9a9b1f9951f9bf90addc3262ca30c228224ae",
     "portable_only_rows": 74176,
@@ -42,7 +42,7 @@
   },
   "timed_projection": {
     "rows": 3078,
-    "sha256": "f0f3423bf3a05d21c00eb82c5d07dfae9b349e41314614cdc4203d9836dd70aa",
+    "sha256": "72d85a032a90e4347be2d537c2ff11bac15016787c055332843f143da72e487f",
     "selection": "one frozen long geometry for every eligible width/topology/mutation-class cell",
     "eligible_widths": {
       "minimum": 6,
@@ -60,7 +60,8 @@
     ],
     "rows_each_topology": 513,
     "mutation_classes": 19,
-    "selector_phase_placements": 5,
+    "literal_phase_classes": 5,
+    "selector_primary_offset_classes": 5,
     "alignments": 16,
     "window_bytes": [
       4093,
@@ -87,14 +88,235 @@
       "each host independently",
       "combined hosts"
     ],
+    "exact_stratification_counts": {
+      "width_counts": {
+        "6": 114,
+        "7": 114,
+        "8": 114,
+        "9": 114,
+        "10": 114,
+        "11": 114,
+        "12": 114,
+        "13": 114,
+        "14": 114,
+        "15": 114,
+        "16": 114,
+        "17": 114,
+        "18": 114,
+        "19": 114,
+        "20": 114,
+        "21": 114,
+        "22": 114,
+        "23": 114,
+        "24": 114,
+        "25": 114,
+        "26": 114,
+        "27": 114,
+        "28": 114,
+        "29": 114,
+        "30": 114,
+        "31": 114,
+        "32": 114
+      },
+      "topology_counts": {
+        "binary-aperiodic": 513,
+        "common-markers-rare-fill": 513,
+        "high-entropy-distinct": 513,
+        "rare-markers-common-fill": 513,
+        "terminal-repeated-high-entropy": 513,
+        "ternary-aperiodic": 513
+      },
+      "learned_source_kind_counts": {
+        "absent": 648,
+        "mode": 479,
+        "mode-absent-fallback": 7,
+        "primary": 648,
+        "secondary": 636,
+        "secondary-absent-fallback": 12,
+        "terminal": 634,
+        "terminal-absent-fallback": 14
+      },
+      "learned_source_relation_counts": {
+        "absent-from-literal": 681,
+        "equals-primary": 1059,
+        "equals-quaternary": 630,
+        "equals-quinary": 1139,
+        "equals-secondary": 914,
+        "equals-terminal": 1193,
+        "equals-verification": 712,
+        "repeated-in-literal": 1354,
+        "singleton-in-literal": 1043
+      },
+      "literal_phase_class_counts": {
+        "0": 578,
+        "1": 772,
+        "2": 576,
+        "3": 576,
+        "4": 576
+      },
+      "selector_primary_offset_class_counts": {
+        "0": 1015,
+        "1": 707,
+        "2": 522,
+        "3": 383,
+        "4": 451
+      },
+      "logical_prefix_counts": {
+        "0": 193,
+        "1": 192,
+        "2": 192,
+        "3": 192,
+        "4": 193,
+        "5": 193,
+        "6": 192,
+        "7": 192,
+        "8": 192,
+        "9": 193,
+        "10": 193,
+        "11": 192,
+        "12": 192,
+        "13": 192,
+        "14": 192,
+        "15": 193
+      },
+      "mapping_counts": {
+        "right-guarded": 1539,
+        "right-padded": 1539
+      },
+      "physical_window_start_mod16_counts": {
+        "0": 1470,
+        "1": 102,
+        "2": 88,
+        "3": 263,
+        "4": 93,
+        "5": 100,
+        "6": 91,
+        "7": 104,
+        "8": 90,
+        "9": 100,
+        "10": 93,
+        "11": 100,
+        "12": 89,
+        "13": 103,
+        "14": 92,
+        "15": 100
+      },
+      "physical_window_start_mod16_counts_by_mapping": {
+        "right-guarded": {
+          "0": 1377,
+          "3": 162
+        },
+        "right-padded": {
+          "0": 93,
+          "1": 102,
+          "2": 88,
+          "3": 101,
+          "4": 93,
+          "5": 100,
+          "6": 91,
+          "7": 104,
+          "8": 90,
+          "9": 100,
+          "10": 93,
+          "11": 100,
+          "12": 89,
+          "13": 103,
+          "14": 92,
+          "15": 100
+        }
+      },
+      "window_counts": {
+        "4093": 324,
+        "4096": 324,
+        "8192": 324,
+        "16384": 324,
+        "32768": 324,
+        "65536": 324,
+        "131072": 324,
+        "262144": 324,
+        "524288": 162,
+        "1048576": 324
+      },
+      "topology_relation_counts": {
+        "binary-aperiodic": {
+          "absent-from-literal": 130,
+          "equals-primary": 227,
+          "equals-quaternary": 214,
+          "equals-quinary": 254,
+          "equals-secondary": 211,
+          "equals-terminal": 254,
+          "equals-verification": 220,
+          "repeated-in-literal": 382,
+          "singleton-in-literal": 1
+        },
+        "common-markers-rare-fill": {
+          "absent-from-literal": 108,
+          "equals-primary": 267,
+          "equals-quaternary": 167,
+          "equals-quinary": 208,
+          "equals-secondary": 154,
+          "equals-terminal": 217,
+          "equals-verification": 252,
+          "repeated-in-literal": 252,
+          "singleton-in-literal": 153
+        },
+        "high-entropy-distinct": {
+          "absent-from-literal": 108,
+          "equals-primary": 128,
+          "equals-quaternary": 5,
+          "equals-quinary": 96,
+          "equals-secondary": 144,
+          "equals-terminal": 125,
+          "equals-verification": 13,
+          "singleton-in-literal": 405
+        },
+        "rare-markers-common-fill": {
+          "absent-from-literal": 110,
+          "equals-primary": 111,
+          "equals-quaternary": 92,
+          "equals-quinary": 151,
+          "equals-secondary": 113,
+          "equals-terminal": 164,
+          "repeated-in-literal": 134,
+          "singleton-in-literal": 269
+        },
+        "terminal-repeated-high-entropy": {
+          "absent-from-literal": 111,
+          "equals-primary": 117,
+          "equals-quaternary": 4,
+          "equals-quinary": 206,
+          "equals-secondary": 128,
+          "equals-terminal": 206,
+          "equals-verification": 18,
+          "repeated-in-literal": 206,
+          "singleton-in-literal": 196
+        },
+        "ternary-aperiodic": {
+          "absent-from-literal": 114,
+          "equals-primary": 209,
+          "equals-quaternary": 148,
+          "equals-quinary": 224,
+          "equals-secondary": 164,
+          "equals-terminal": 227,
+          "equals-verification": 209,
+          "repeated-in-literal": 380,
+          "singleton-in-literal": 19
+        }
+      }
+    },
     "failed_cell_disposition": "the broad tag29 family is not authorized; no result-derived exclusion is permitted"
   },
   "dimensions": {
     "widths": "every integer 4 through 32",
     "topologies": 7,
     "mutation_classes": 19,
-    "geometries": "16 alignments crossed with short and long window strata",
-    "selector_phase_placements": 5,
+    "geometries": "16 logical prefix lengths crossed with short and long window strata",
+    "literal_phase_classes": 5,
+    "selector_primary_offset_classes": 5,
+    "physical_mapping": {
+      "right-padded": "the checked-window start is placed at the recorded mod-16 address",
+      "right-guarded": "the checked-window end is placed at a page-aligned guard, so start mod16 is (-window_bytes) mod16"
+    },
     "outcomes": [
       "absent",
       "tail-hit"
