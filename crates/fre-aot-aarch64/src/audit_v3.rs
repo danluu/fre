@@ -4354,6 +4354,7 @@ fn policy_multi_specialized_v3(
     sve_tail: Option<bool>,
     done: PolicyLabelV3,
 ) -> Result<(), CountAotError> {
+    let static_wide = strategy == AuditLoweringStrategyV3::SparseRareColumns && literal.len() == 5;
     let vector = policy.new_label(LabelKindV3::VectorLoop)?;
     let candidate = policy.new_label(LabelKindV3::CandidateLoop)?;
     let candidate_miss = policy.new_label(LabelKindV3::Miss)?;
@@ -4372,7 +4373,7 @@ fn policy_multi_specialized_v3(
     } else {
         None
     };
-    let narrow_vector = if wide_batch.is_some() {
+    let narrow_vector = if wide_batch.is_some() && !static_wide {
         Some(policy.new_label(LabelKindV3::VectorLoop)?)
     } else {
         None
@@ -4387,7 +4388,7 @@ fn policy_multi_specialized_v3(
     } else {
         None
     };
-    let wide_pair_to_narrow = if wide_batch.is_some() {
+    let wide_pair_to_narrow = if wide_batch.is_some() && !static_wide {
         Some(policy.new_label(LabelKindV3::Internal)?)
     } else {
         None
@@ -4580,10 +4581,34 @@ fn policy_multi_specialized_v3(
         )?;
     }
 
+    if static_wide {
+        exact_v3(
+            policy,
+            DecodedInstructionV3::OrBytes16 {
+                destination: 20,
+                left: vector_registers[0],
+                right: vector_registers[0],
+            },
+        )?;
+        subtract_register64_v3(policy, X5, X4, X3)?;
+        compare_immediate64_v3(policy, X5, SPARSE_SCAN_STARTS_V3 - 1)?;
+        condition_v3(policy, ConditionV3::CarryClear, vector)?;
+        compare_immediate64_v3(policy, X16, 4)?;
+        condition_v3(
+            policy,
+            ConditionV3::Equal,
+            wide_pair_batch.expect("static wide retains an audited cold pair graph"),
+        )?;
+    }
     policy.bind(vector)?;
     compare_register64_v3(policy, X3, X4)?;
     condition_v3(policy, ConditionV3::Higher, done)?;
-    if let (
+    if static_wide {
+        let wide_batch = wide_batch.expect("five-byte sparse recipe has a wide batch");
+        subtract_register64_v3(policy, X5, X4, X3)?;
+        compare_immediate64_v3(policy, X5, SPARSE_SCAN_STARTS_V3 - 1)?;
+        condition_v3(policy, ConditionV3::CarrySet, wide_batch)?;
+    } else if let (
         Some(narrow_vector),
         Some(wide_pair_batch),
         Some(wide_pair_to_narrow),
@@ -4835,17 +4860,21 @@ fn policy_multi_specialized_v3(
                 source: 1,
             },
         )?;
-        exact_v3(
-            policy,
-            DecodedInstructionV3::AndRegister64 {
-                destination: X16,
-                left: X16,
-                right: X8,
-            },
-        )?;
+        if !static_wide {
+            exact_v3(
+                policy,
+                DecodedInstructionV3::AndRegister64 {
+                    destination: X16,
+                    left: X16,
+                    right: X8,
+                },
+            )?;
+        }
         compare_immediate64_v3(policy, X8, 0)?;
         condition_v3(policy, ConditionV3::Equal, wide_batch_empty)?;
-        add_immediate64_v3(policy, X16, X16, 8)?;
+        if !static_wide {
+            add_immediate64_v3(policy, X16, X16, 8)?;
+        }
 
         for block in 0..usize::from(SPARSE_SCAN_BLOCKS_V3) {
             let mask = u8::try_from(usize::from(SPARSE_BLOCK_MASK_BASE_V3) + block)
@@ -4868,14 +4897,16 @@ fn policy_multi_specialized_v3(
                     source: 1,
                 },
             )?;
-            exact_v3(
-                policy,
-                DecodedInstructionV3::AndRegister64 {
-                    destination: X16,
-                    left: X16,
-                    right: X8,
-                },
-            )?;
+            if !static_wide {
+                exact_v3(
+                    policy,
+                    DecodedInstructionV3::AndRegister64 {
+                        destination: X16,
+                        left: X16,
+                        right: X8,
+                    },
+                )?;
+            }
             compare_immediate64_v3(policy, X8, 0)?;
             condition_v3(policy, ConditionV3::Equal, wide_advance)?;
 
@@ -4921,7 +4952,9 @@ fn policy_multi_specialized_v3(
             )?;
             compare_immediate64_v3(policy, X8, 0)?;
             condition_v3(policy, ConditionV3::Equal, wide_advance)?;
-            policy_mov_minimal_v3(policy, X16, 0)?;
+            if !static_wide {
+                policy_mov_minimal_v3(policy, X16, 0)?;
+            }
             for index in 1..usize::from(filter.len) {
                 if filter.offsets[index] == semantic_secondary_offset {
                     continue;
@@ -5054,25 +5087,27 @@ fn policy_multi_specialized_v3(
             policy.bind(wide_advance)?;
             add_immediate64_v3(policy, X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
         }
-        compare_immediate64_v3(policy, X16, 0)?;
-        condition_v3(policy, ConditionV3::Equal, wide_batch_done)?;
-        exact_v3(
-            policy,
-            DecodedInstructionV3::AndLowBits64 {
-                destination: X16,
-                source: X16,
-                bits: 2,
-            },
-        )?;
-        add_immediate64_v3(policy, X16, X16, 1)?;
-        exact_v3(
-            policy,
-            DecodedInstructionV3::OrBytes16 {
-                destination: 20,
-                left: vector_registers[0],
-                right: vector_registers[0],
-            },
-        )?;
+        if !static_wide {
+            compare_immediate64_v3(policy, X16, 0)?;
+            condition_v3(policy, ConditionV3::Equal, wide_batch_done)?;
+            exact_v3(
+                policy,
+                DecodedInstructionV3::AndLowBits64 {
+                    destination: X16,
+                    source: X16,
+                    bits: 2,
+                },
+            )?;
+            add_immediate64_v3(policy, X16, X16, 1)?;
+            exact_v3(
+                policy,
+                DecodedInstructionV3::OrBytes16 {
+                    destination: 20,
+                    left: vector_registers[0],
+                    right: vector_registers[0],
+                },
+            )?;
+        }
         policy.bind(wide_batch_done)?;
         branch_v3(policy, vector)?;
 

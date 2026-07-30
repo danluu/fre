@@ -2869,6 +2869,13 @@ fn emit_multi_specialized_v3(
     sve_tail: Option<HybridSveTailV3>,
     done: LabelV3,
 ) -> Result<(), CountAotError> {
+    // Five-byte sparse recipes are a broad, pattern-only Rebar class whose
+    // rare primary already makes the 128-start retained-mask loop stable.
+    // Keep that class on the static wide schedule: runtime pair-mode learning
+    // adds branches and state traffic to its hot empty-batch path without
+    // changing the selected literal or consulting the haystack at compile
+    // time.
+    let static_wide = strategy == LoweringStrategyV3::SparseRareColumns && literal.len() == 5;
     let vector = assembler.new_label(LabelKindV3::VectorLoop)?;
     let candidate = assembler.new_label(LabelKindV3::CandidateLoop)?;
     let candidate_miss = assembler.new_label(LabelKindV3::Miss)?;
@@ -2887,7 +2894,7 @@ fn emit_multi_specialized_v3(
     } else {
         None
     };
-    let narrow_vector = if wide_batch.is_some() {
+    let narrow_vector = if wide_batch.is_some() && !static_wide {
         Some(assembler.new_label(LabelKindV3::VectorLoop)?)
     } else {
         None
@@ -2902,7 +2909,7 @@ fn emit_multi_specialized_v3(
     } else {
         None
     };
-    let wide_pair_to_narrow = if wide_batch.is_some() {
+    let wide_pair_to_narrow = if wide_batch.is_some() && !static_wide {
         Some(assembler.new_label(LabelKindV3::Internal)?)
     } else {
         None
@@ -3060,10 +3067,30 @@ fn emit_multi_specialized_v3(
         assembler.move_x_to_vector_double(OVERLAPPING_SUFFIX_VECTOR_V3, X8)?;
     }
 
+    if static_wide {
+        // Keep the cold fused subgraph closed and independently auditable
+        // without testing its mode on every hot 128-start iteration. X16 was
+        // initialized to zero and is immutable in this schedule, so the
+        // guarded equality is a one-time structural edge only.
+        assembler.or_bytes16(20, vector_registers[0], vector_registers[0])?;
+        assembler.sub_reg(X5, X4, X3)?;
+        assembler.cmp_imm64(X5, SPARSE_SCAN_STARTS_V3 - 1)?;
+        assembler.branch_cond(ConditionV3::CarryClear, vector)?;
+        assembler.cmp_imm64(X16, 4)?;
+        assembler.branch_cond(
+            ConditionV3::Equal,
+            wide_pair_batch.expect("static wide retains an audited cold pair graph"),
+        )?;
+    }
     assembler.bind(vector)?;
     assembler.cmp_reg64(X3, X4)?;
     assembler.branch_cond(ConditionV3::Higher, done)?;
-    if let (
+    if static_wide {
+        let wide_batch = wide_batch.expect("five-byte sparse recipe has a wide batch");
+        assembler.sub_reg(X5, X4, X3)?;
+        assembler.cmp_imm64(X5, SPARSE_SCAN_STARTS_V3 - 1)?;
+        assembler.branch_cond(ConditionV3::CarrySet, wide_batch)?;
+    } else if let (
         Some(narrow_vector),
         Some(wide_pair_batch),
         Some(wide_pair_to_narrow),
@@ -3178,12 +3205,16 @@ fn emit_multi_specialized_v3(
         assembler.or_bytes16(1, 0, 1)?;
         assembler.unsigned_max_across_bytes16(1, 1)?;
         assembler.move_vector_byte_to32(X8, 1)?;
-        assembler.and_reg(X16, X16, X8)?;
+        if !static_wide {
+            assembler.and_reg(X16, X16, X8)?;
+        }
         assembler.cmp_imm64(X8, 0)?;
         assembler.branch_cond(ConditionV3::Equal, wide_batch_empty)?;
         // Bit three is the current-batch qualification marker; the low two
         // bits retain the prior consecutive count until the batch closes.
-        assembler.add_imm(X16, X16, 8)?;
+        if !static_wide {
+            assembler.add_imm(X16, X16, 8)?;
+        }
 
         for block in 0..usize::from(SPARSE_SCAN_BLOCKS_V3) {
             let mask = u8::try_from(usize::from(SPARSE_BLOCK_MASK_BASE_V3) + block)
@@ -3196,7 +3227,9 @@ fn emit_multi_specialized_v3(
             // survivor and the semantic endpoint rejects all of its lanes.
             assembler.unsigned_max_across_bytes16(1, mask)?;
             assembler.move_vector_byte_to32(X8, 1)?;
-            assembler.and_reg(X16, X16, X8)?;
+            if !static_wide {
+                assembler.and_reg(X16, X16, X8)?;
+            }
             assembler.cmp_imm64(X8, 0)?;
             assembler.branch_cond(ConditionV3::Equal, wide_advance)?;
 
@@ -3209,7 +3242,9 @@ fn emit_multi_specialized_v3(
             assembler.move_vector_byte_to32(X8, 1)?;
             assembler.cmp_imm64(X8, 0)?;
             assembler.branch_cond(ConditionV3::Equal, wide_advance)?;
-            assembler.mov_imm64_minimal(X16, 0)?;
+            if !static_wide {
+                assembler.mov_imm64_minimal(X16, 0)?;
+            }
             for index in 1..usize::from(filter.len) {
                 if filter.offsets[index] == semantic_secondary_offset {
                     continue;
@@ -3256,14 +3291,16 @@ fn emit_multi_specialized_v3(
             assembler.bind(wide_advance)?;
             assembler.add_imm(X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
         }
-        assembler.cmp_imm64(X16, 0)?;
-        assembler.branch_cond(ConditionV3::Equal, wide_batch_done)?;
-        assembler.and_low_bits(X16, X16, 2)?;
-        assembler.add_imm(X16, X16, 1)?;
-        // v20 is outside the LD1 scratch window and remains the primary
-        // splat after four consecutive exact all-eight-primary,
-        // endpoint-empty observations.
-        assembler.or_bytes16(20, vector_registers[0], vector_registers[0])?;
+        if !static_wide {
+            assembler.cmp_imm64(X16, 0)?;
+            assembler.branch_cond(ConditionV3::Equal, wide_batch_done)?;
+            assembler.and_low_bits(X16, X16, 2)?;
+            assembler.add_imm(X16, X16, 1)?;
+            // v20 is outside the LD1 scratch window and remains the primary
+            // splat after four consecutive exact all-eight-primary,
+            // endpoint-empty observations.
+            assembler.or_bytes16(20, vector_registers[0], vector_registers[0])?;
+        }
         assembler.bind(wide_batch_done)?;
         assembler.branch(vector)?;
 
