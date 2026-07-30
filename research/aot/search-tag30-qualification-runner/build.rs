@@ -38,7 +38,7 @@ const CONTRACT_SCHEMA: &str = "fre.aot.search-tag30-qualification-campaign-contr
 const PREPARED_INPUTS_SCHEMA: &str = "fre.aot.search-tag30-prepared-inputs.v1";
 const DISCOVERY_AUTHORIZATION_SCHEMA: &str =
     "fre.aot.search-tag30-qualification-discovery-authorization.v1";
-const CONTRACT_SHA256: &str = "d0089e28142c22dac9819f5241a61b6d5f4eea344ac05768a246b7617d51287f";
+const CONTRACT_SHA256: &str = "f5a3319b1178ea97766b735bc39b589a6a1a33e8cc9257a947ea9feff7c5f702";
 const LEARNED_FREEZE_SHA256: &str =
     "367ad3655ec2f70d4a8173f68df76013fdf32dd95e07d1ebeeedb14c580b817f";
 const LEARNED_GENERATOR_SHA256: &str =

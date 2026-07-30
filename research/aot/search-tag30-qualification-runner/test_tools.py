@@ -466,6 +466,25 @@ class ImmutabilityTests(unittest.TestCase):
             }
             for repetition in range(6)
         ]
+
+        def calibration_anchor(elapsed_ns: int) -> dict[str, object]:
+            return {
+                "iterations": 1,
+                "elapsed_ns": elapsed_ns,
+                "checksum": 1,
+                "cpu_before": 3,
+                "cpu_after": 3,
+                "cpu_retries": 0,
+                "cpu_attempts": [
+                    {
+                        "attempt": 0,
+                        "cpu_before": 3,
+                        "cpu_after": 3,
+                        "accepted": True,
+                    }
+                ],
+            }
+
         record = {
             "schema": analyzer.TIMING_SCHEMA,
             "ordinal": 0,
@@ -484,43 +503,18 @@ class ImmutabilityTests(unittest.TestCase):
             "calibration": {
                 "target_elapsed_ns": analyzer.CALIBRATION_TARGET_NS,
                 "floor_elapsed_ns": analyzer.CALIBRATION_FLOOR_NS,
+                "anchor_samples": analyzer.CALIBRATION_ANCHOR_SAMPLES,
                 "maximum_iterations": analyzer.MAXIMUM_ITERATIONS,
                 "selected_iterations": 14,
                 "portable_pilots": [
-                    {
-                        "iterations": 1,
-                        "elapsed_ns": 44_000_000,
-                        "checksum": 1,
-                        "cpu_before": 3,
-                        "cpu_after": 3,
-                        "cpu_retries": 0,
-                        "cpu_attempts": [
-                            {
-                                "attempt": 0,
-                                "cpu_before": 3,
-                                "cpu_after": 3,
-                                "accepted": True,
-                            }
-                        ],
-                    }
+                    calibration_anchor(50_000_000),
+                    calibration_anchor(44_000_000),
+                    calibration_anchor(48_000_000),
                 ],
                 "candidate_pilots": [
-                    {
-                        "iterations": 1,
-                        "elapsed_ns": 44_000_000,
-                        "checksum": 1,
-                        "cpu_before": 3,
-                        "cpu_after": 3,
-                        "cpu_retries": 0,
-                        "cpu_attempts": [
-                            {
-                                "attempt": 0,
-                                "cpu_before": 3,
-                                "cpu_after": 3,
-                                "accepted": True,
-                            }
-                        ],
-                    }
+                    calibration_anchor(50_000_000),
+                    calibration_anchor(44_000_000),
+                    calibration_anchor(48_000_000),
                 ],
             },
             "pairs": pairs,
@@ -544,22 +538,60 @@ class ImmutabilityTests(unittest.TestCase):
             )
         pairs[1]["portable_checksum"] = 7
         pairs[1]["candidate_checksum"] = 7
+        record["calibration"]["anchor_samples"] = 2
+        with self.assertRaises(analyzer.Refusal):
+            analyzer.parse_timing_record(
+                record, expected, row, 0, "universal", 3
+            )
+        record["calibration"]["anchor_samples"] = (
+            analyzer.CALIBRATION_ANCHOR_SAMPLES
+        )
+        removed_anchor = record["calibration"]["candidate_pilots"].pop()
+        with self.assertRaises(analyzer.Refusal):
+            analyzer.parse_timing_record(
+                record, expected, row, 0, "universal", 3
+            )
+        record["calibration"]["candidate_pilots"].append(removed_anchor)
+        candidate_anchor = record["calibration"]["candidate_pilots"][-1]
+        candidate_anchor["iterations"] = 2
+        with self.assertRaises(analyzer.Refusal):
+            analyzer.parse_timing_record(
+                record, expected, row, 0, "universal", 3
+            )
+        candidate_anchor["iterations"] = 1
+        record["calibration"]["selected_iterations"] = 12
+        for pair in pairs:
+            pair["iterations"] = 12
+        with self.assertRaises(analyzer.Refusal):
+            analyzer.parse_timing_record(
+                record, expected, row, 0, "universal", 3
+            )
+        record["calibration"]["selected_iterations"] = 14
+        for pair in pairs:
+            pair["iterations"] = 14
+        candidate_anchor["checksum"] = 2
+        with self.assertRaises(analyzer.Refusal):
+            analyzer.parse_timing_record(
+                record, expected, row, 0, "universal", 3
+            )
+        candidate_anchor["checksum"] = 1
         record["logical_cpu"] = 12
         for pilots in (
             record["calibration"]["portable_pilots"],
             record["calibration"]["candidate_pilots"],
         ):
-            pilots[0]["cpu_before"] = 12
-            pilots[0]["cpu_after"] = 12
-            pilots[0]["cpu_retries"] = 0
-            pilots[0]["cpu_attempts"] = [
-                {
-                    "attempt": 0,
-                    "cpu_before": 12,
-                    "cpu_after": 12,
-                    "accepted": True,
-                }
-            ]
+            for pilot in pilots:
+                pilot["cpu_before"] = 12
+                pilot["cpu_after"] = 12
+                pilot["cpu_retries"] = 0
+                pilot["cpu_attempts"] = [
+                    {
+                        "attempt": 0,
+                        "cpu_before": 12,
+                        "cpu_after": 12,
+                        "accepted": True,
+                    }
+                ]
         portable_pilot = record["calibration"]["portable_pilots"][0]
         portable_pilot["cpu_before"] = 12
         portable_pilot["cpu_after"] = 13
@@ -628,6 +660,7 @@ class ImmutabilityTests(unittest.TestCase):
                 12,
                 analyzer.HOSTS[0],
             )
+
     def test_output_is_create_new(self) -> None:
         with tempfile.TemporaryDirectory() as raw_directory:
             output = Path(raw_directory) / "existing.json"

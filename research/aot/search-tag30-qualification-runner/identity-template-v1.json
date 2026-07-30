@@ -141,6 +141,9 @@
     "paired_order": "alternating",
     "repetitions": 6,
     "target_elapsed_ns": 600000000,
+    "calibration_floor_elapsed_ns": 50000000,
+    "calibration_anchor_samples": 3,
+    "calibration_iteration_selection": "fastest-same-iteration-anchor-per-variant-then-maximum",
     "minimum_elapsed_ns": 400000000,
     "calibrate_both_variants": true
   },

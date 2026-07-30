@@ -18,7 +18,7 @@ from typing import Any, BinaryIO, Iterable, Iterator, Mapping, Sequence
 
 CONTRACT_SCHEMA = "fre.aot.search-tag30-qualification-campaign-contract.v1"
 CONTRACT_SHA256 = (
-    "d0089e28142c22dac9819f5241a61b6d5f4eea344ac05768a246b7617d51287f"
+    "f5a3319b1178ea97766b735bc39b589a6a1a33e8cc9257a947ea9feff7c5f702"
 )
 HEADER_SCHEMA = "fre.aot.search-tag30-qualification-fragment-header.v1"
 CORRECTNESS_SCHEMA = "fre.aot.search-tag30-qualification-correctness-row.v1"
@@ -36,7 +36,8 @@ SHARDS = 16
 REPETITIONS = 6
 MINIMUM_NS = 400_000_000
 CALIBRATION_TARGET_NS = 600_000_000
-CALIBRATION_FLOOR_NS = 5_000_000
+CALIBRATION_FLOOR_NS = 50_000_000
+CALIBRATION_ANCHOR_SAMPLES = 3
 MAXIMUM_ITERATIONS = 1 << 30
 MAXIMUM_CPU_ONLY_RETRIES = 64
 MACOS_SUPER_CPUS = tuple(range(12, 18))
@@ -222,6 +223,7 @@ CPU_ATTEMPT_FIELDS = {
 CALIBRATION_FIELDS = {
     "target_elapsed_ns",
     "floor_elapsed_ns",
+    "anchor_samples",
     "maximum_iterations",
     "selected_iterations",
     "portable_pilots",
@@ -725,11 +727,12 @@ def validate_calibration_pilots(
     context: str,
 ) -> Sequence[Mapping[str, Any]]:
     require(
-        isinstance(value, list) and value,
-        f"{context}: calibration pilot set is empty",
+        isinstance(value, list) and len(value) >= CALIBRATION_ANCHOR_SAMPLES,
+        f"{context}: calibration pilot set lacks frozen anchors",
     )
     pilots: list[Mapping[str, Any]] = []
     expected_iterations = 1
+    anchor_start = len(value) - CALIBRATION_ANCHOR_SAMPLES
     for ordinal, raw_pilot in enumerate(value):
         pilot = exact_keys(
             raw_pilot, CALIBRATION_PILOT_FIELDS, f"{context} pilot"
@@ -753,7 +756,7 @@ def validate_calibration_pilots(
             f"{context} pilot {ordinal}",
         )
         pilots.append(pilot)
-        if ordinal + 1 < len(value):
+        if ordinal < anchor_start:
             require(
                 pilot["elapsed_ns"] < CALIBRATION_FLOOR_NS
                 and pilot["iterations"] < MAXIMUM_ITERATIONS,
@@ -762,12 +765,22 @@ def validate_calibration_pilots(
             expected_iterations = min(
                 MAXIMUM_ITERATIONS, pilot["iterations"] * 4
             )
+        elif ordinal + 1 < len(value):
+            expected_iterations = pilot["iterations"]
     require(
-        pilots[-1]["elapsed_ns"] >= CALIBRATION_FLOOR_NS
-        or pilots[-1]["iterations"] == MAXIMUM_ITERATIONS,
+        pilots[anchor_start]["elapsed_ns"] >= CALIBRATION_FLOOR_NS
+        or pilots[anchor_start]["iterations"] == MAXIMUM_ITERATIONS,
         f"{context}: calibration stopped before the frozen floor",
     )
-    return pilots
+    anchor_iterations = pilots[anchor_start]["iterations"]
+    require(
+        all(
+            pilot["iterations"] == anchor_iterations
+            for pilot in pilots[anchor_start:]
+        ),
+        f"{context}: calibration anchor iterations changed",
+    )
+    return pilots[anchor_start:]
 
 
 def validate_calibration(
@@ -777,6 +790,7 @@ def validate_calibration(
     require(
         calibration["target_elapsed_ns"] == CALIBRATION_TARGET_NS
         and calibration["floor_elapsed_ns"] == CALIBRATION_FLOOR_NS
+        and calibration["anchor_samples"] == CALIBRATION_ANCHOR_SAMPLES
         and calibration["maximum_iterations"] == MAXIMUM_ITERATIONS,
         f"{context}: calibration constants changed",
     )
@@ -793,11 +807,19 @@ def validate_calibration(
         f"{context} candidate",
     )
     selected = max(
-        scaled_iterations(portable[-1]), scaled_iterations(candidate[-1])
+        *(scaled_iterations(pilot) for pilot in portable),
+        *(scaled_iterations(pilot) for pilot in candidate),
     )
     require(
-        calibration["selected_iterations"] == selected,
-        f"{context}: selected iteration count changed",
+        calibration["selected_iterations"] == selected
+        and len(
+            {
+                pilot["checksum"]
+                for pilot in (*portable, *candidate)
+            }
+        )
+        == 1,
+        f"{context}: selected iteration count or anchor checksum changed",
     )
     return selected
 

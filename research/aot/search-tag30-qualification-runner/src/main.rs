@@ -43,7 +43,7 @@ mod generated {
 
 type DynError = Box<dyn Error>;
 
-const CONTRACT_SHA256: &str = "d0089e28142c22dac9819f5241a61b6d5f4eea344ac05768a246b7617d51287f";
+const CONTRACT_SHA256: &str = "f5a3319b1178ea97766b735bc39b589a6a1a33e8cc9257a947ea9feff7c5f702";
 const CONTRACT_SCHEMA: &str = "fre.aot.search-tag30-qualification-campaign-contract.v1";
 const UNIVERSAL_ROW_SCHEMA: &str = "fre.aot.search-tag30-learned-continuation-projection.v1";
 const LONG_ROW_SCHEMA: &str = "fre.aot.search-tag30-long-input-policy-projection.v1";
@@ -72,7 +72,8 @@ const DIAGNOSTIC_ROWS: usize = 30;
 const REPETITIONS: usize = 6;
 const MINIMUM_ELAPSED_NS: u64 = 400_000_000;
 const CALIBRATION_TARGET_NS: u64 = 600_000_000;
-const CALIBRATION_FLOOR_NS: u64 = 5_000_000;
+const CALIBRATION_FLOOR_NS: u64 = 50_000_000;
+const CALIBRATION_ANCHOR_SAMPLES: usize = 3;
 const MAXIMUM_ITERATIONS: usize = 1 << 30;
 const MAXIMUM_ROW_BYTES: usize = 32 * 1024;
 const MAXIMUM_CONTRACT_BYTES: u64 = 128 * 1024;
@@ -1390,18 +1391,8 @@ fn calibrated_iterations(
     for measurement in portable_pilots.iter().chain(&candidate_pilots) {
         require_measurement_cpu(measurement, cpu)?;
     }
-    let portable_iterations = scaled_iterations(
-        CALIBRATION_TARGET_NS,
-        portable_pilots
-            .last()
-            .ok_or_else(|| invalid("portable calibration is empty"))?,
-    )?;
-    let candidate_iterations = scaled_iterations(
-        CALIBRATION_TARGET_NS,
-        candidate_pilots
-            .last()
-            .ok_or_else(|| invalid("candidate calibration is empty"))?,
-    )?;
+    let portable_iterations = scaled_anchor_iterations(CALIBRATION_TARGET_NS, &portable_pilots)?;
+    let candidate_iterations = scaled_anchor_iterations(CALIBRATION_TARGET_NS, &candidate_pilots)?;
     Ok(CalibrationReceipt {
         portable_pilots,
         candidate_pilots,
@@ -1424,7 +1415,31 @@ fn pilot(
         result = measure(iterations)?;
         results.push(result.clone());
     }
+    for _ in 1..CALIBRATION_ANCHOR_SAMPLES {
+        results.push(measure(iterations)?);
+    }
     Ok(results)
+}
+
+fn scaled_anchor_iterations(target_ns: u64, pilots: &[Measurement]) -> Result<usize, io::Error> {
+    require(
+        pilots.len() >= CALIBRATION_ANCHOR_SAMPLES,
+        "calibration lacks frozen anchor samples",
+    )?;
+    let anchors = &pilots[pilots.len() - CALIBRATION_ANCHOR_SAMPLES..];
+    let anchor_iterations = anchors[0].iterations;
+    require(
+        anchors
+            .iter()
+            .all(|measurement| measurement.iterations == anchor_iterations),
+        "calibration anchor iterations changed",
+    )?;
+    anchors
+        .iter()
+        .map(|measurement| scaled_iterations(target_ns, measurement))
+        .try_fold(1_usize, |selected, scaled| {
+            scaled.map(|iterations| selected.max(iterations))
+        })
 }
 
 fn scaled_iterations(target_ns: u64, pilot: &Measurement) -> Result<usize, io::Error> {
@@ -1554,6 +1569,7 @@ fn calibration_receipt(calibration: &CalibrationReceipt) -> Value {
     json!({
         "target_elapsed_ns": CALIBRATION_TARGET_NS,
         "floor_elapsed_ns": CALIBRATION_FLOOR_NS,
+        "anchor_samples": CALIBRATION_ANCHOR_SAMPLES,
         "maximum_iterations": MAXIMUM_ITERATIONS,
         "selected_iterations": calibration.selected_iterations,
         "portable_pilots": calibration

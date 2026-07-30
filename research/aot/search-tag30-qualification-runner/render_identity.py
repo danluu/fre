@@ -31,7 +31,7 @@ DISCOVERY_AUTHORIZATION_SCHEMA = (
 )
 CONTRACT_SCHEMA = "fre.aot.search-tag30-qualification-campaign-contract.v1"
 CONTRACT_SHA256 = (
-    "d0089e28142c22dac9819f5241a61b6d5f4eea344ac05768a246b7617d51287f"
+    "f5a3319b1178ea97766b735bc39b589a6a1a33e8cc9257a947ea9feff7c5f702"
 )
 OBJECT_SCHEMA = "fre.aot.search-tag30-qualification-object-candidates.v1"
 OBJECT_SHA256 = (
@@ -697,6 +697,9 @@ def load_template(directory: Path) -> dict[str, Any]:
             "paired_order",
             "repetitions",
             "target_elapsed_ns",
+            "calibration_floor_elapsed_ns",
+            "calibration_anchor_samples",
+            "calibration_iteration_selection",
             "minimum_elapsed_ns",
             "calibrate_both_variants",
         },
@@ -766,7 +769,15 @@ def load_template(directory: Path) -> dict[str, Any]:
         and template["auto_routing"]["maximum_literal_bytes"] == 32
         and template["auto_routing"]["minimum_window_bytes"] == 65_536
         and template["auto_routing"]["portable_prefix_candidate_starts"]
-        == 256,
+        == 256
+        and template["runner"]["repetitions"] == 6
+        and template["runner"]["target_elapsed_ns"] == 600_000_000
+        and template["runner"]["calibration_floor_elapsed_ns"] == 50_000_000
+        and template["runner"]["calibration_anchor_samples"] == 3
+        and template["runner"]["calibration_iteration_selection"]
+        == "fastest-same-iteration-anchor-per-variant-then-maximum"
+        and template["runner"]["minimum_elapsed_ns"] == 400_000_000
+        and template["runner"]["calibrate_both_variants"] is True,
         "identity template authority changed",
     )
     return template

@@ -6,7 +6,7 @@ policy. Rebar, benchmark output, and campaign results cannot change literal
 membership, fixture membership, sharding, routing, gates, or exclusions.
 
 The contract SHA-256 is
-`d0089e28142c22dac9819f5241a61b6d5f4eea344ac05768a246b7617d51287f`.
+`f5a3319b1178ea97766b735bc39b589a6a1a33e8cc9257a947ea9feff7c5f702`.
 Prepare the closed input set from a clean repository into a new directory:
 
 ```text
@@ -116,9 +116,12 @@ is accepted only when both endpoint samples are in the exact Super set.
 Otherwise it is discarded solely by those endpoints and the same variant is
 retried, up to 64 CPU-only retries. Every calibration-pilot and formal-variant
 attempt records both endpoints, acceptance, and the retry count. Elapsed time
-never controls retry. Each accepted formal variant must run for at least 400
-ms. Guarded fixtures end at a `PROT_NONE` page and padded fixtures retain the
-frozen mod-16 address.
+never controls retry. Each variant's calibration grows geometrically through
+50 ms, records three samples at the resulting iteration count, and scales from
+the fastest of those three rates to the 600 ms target. The analyzer requires
+all six portable/candidate anchor checksums to agree. Each accepted formal
+variant must run for at least 400 ms. Guarded fixtures end at a `PROT_NONE`
+page and padded fixtures retain the frozen mod-16 address.
 
 Run the preregistered 30-cell `diagnostic` timing subset on each host before
 formal timing, in separate diagnostic directories. It spans every width,

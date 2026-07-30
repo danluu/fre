@@ -125,7 +125,7 @@
     },
     "ordinal_interval": "zero-based-half-open",
     "assignment": "one immutable fragment per exact interval",
-    "pair_placement": "all six timing pairs remain in one row-worker process; both variants calibrate through at least 5000000 ns to a 600000000 ns target; Linux variants remain on the requested CPU and accepted macOS variants remain in the authenticated Super CPU class",
+    "pair_placement": "all six timing pairs remain in one row-worker process; both variants calibrate through at least 50000000 ns and retain three same-iteration, same-semantic-checksum anchor samples, selecting the fastest observed anchor rate for a 600000000 ns target; Linux variants remain on the requested CPU and accepted macOS variants remain in the authenticated Super CPU class",
     "cpu_residence": {
       "linux": "hard sched_setaffinity binding plus CPU-before/after samples for every measured variant",
       "macos": {
