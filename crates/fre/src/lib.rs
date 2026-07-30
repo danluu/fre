@@ -5220,9 +5220,9 @@ impl<'r> PortableSearchSession<'r> {
         limits: SearchLimits,
     ) -> Result<Option<Match>, SearchError> {
         match &mut self.plan {
-            PortableSearchSessionPlan::Native(regex) => {
-                regex.find_window_value(haystack, window, limits)
-            }
+            PortableSearchSessionPlan::Native(regex) => regex
+                .find_window(haystack, window, limits)
+                .map(|(matched, _)| matched),
             PortableSearchSessionPlan::K0 { session } => session
                 .search_window::<Span>(haystack, window, limits)
                 .map(|report| {
