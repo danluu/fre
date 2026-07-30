@@ -138,6 +138,28 @@ const COMPILED_REQUIRED_ISA: &str = "neon";
 const COMPILED_REQUIRED_ISA: &str = "sve-vl16";
 #[cfg(fre_count_v3_sve2)]
 const COMPILED_REQUIRED_ISA: &str = "sve2-vl16";
+#[cfg(fre_count_v3_neon)]
+const COMPILED_REQUIRED_ISA_ID: u64 = 1;
+#[cfg(fre_count_v3_sve)]
+const COMPILED_REQUIRED_ISA_ID: u64 = 2;
+#[cfg(fre_count_v3_sve2)]
+const COMPILED_REQUIRED_ISA_ID: u64 = 3;
+#[cfg(fre_count_v3_neon)]
+const COMPILED_REGISTER_PLAN_ID: u64 = 1;
+#[cfg(fre_count_v3_sve)]
+const COMPILED_REGISTER_PLAN_ID: u64 = 4;
+#[cfg(fre_count_v3_sve2)]
+const COMPILED_REGISTER_PLAN_ID: u64 = 5;
+#[cfg(fre_count_v3_neon)]
+const COMPILED_FEATURES: u64 = 1;
+#[cfg(fre_count_v3_sve)]
+const COMPILED_FEATURES: u64 = 3;
+#[cfg(fre_count_v3_sve2)]
+const COMPILED_FEATURES: u64 = 7;
+#[cfg(fre_count_v3_neon)]
+const COMPILED_SVE_VECTOR_BYTES: u64 = 0;
+#[cfg(any(fre_count_v3_sve, fre_count_v3_sve2))]
+const COMPILED_SVE_VECTOR_BYTES: u64 = 16;
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -661,12 +683,39 @@ fn validate_embedded_authority() -> Result<(), RunnerError> {
                         "Count-v3 registry row has the wrong runtime authority",
                     ));
                 }
+                validate_embedded_count_v3_target(engine)?;
             }
         }
     }
     if v3_rows != ARTIFACTS.len() {
         return Err(RunnerError::new(
             "Count-v3 registry authority rows differ from the linked artifact table",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_embedded_count_v3_target(engine: &Value) -> Result<(), RunnerError> {
+    let tuple = engine
+        .get("general_eligibility_tuple")
+        .and_then(Value::as_object)
+        .ok_or_else(|| RunnerError::new("Count-v3 registry row lacks its eligibility tuple"))?;
+    let field = |name: &str| {
+        tuple
+            .get(name)
+            .and_then(Value::as_u64)
+            .ok_or_else(|| RunnerError::new(format!("Count-v3 tuple lacks integer {name}")))
+    };
+    if field("required_isa_id")? != COMPILED_REQUIRED_ISA_ID
+        || field("register_plan_id")? != COMPILED_REGISTER_PLAN_ID
+        || field("actual_features")? != COMPILED_FEATURES
+        || field("allowed_features")? != COMPILED_FEATURES
+        || field("candidate_block_starts")? != 16
+        || field("vector_bytes")? != 16
+        || field("sve_vector_length_bytes")? != COMPILED_SVE_VECTOR_BYTES
+    {
+        return Err(RunnerError::new(
+            "Count-v3 registry tuple differs from the compiled mixed register/feature plan",
         ));
     }
     Ok(())

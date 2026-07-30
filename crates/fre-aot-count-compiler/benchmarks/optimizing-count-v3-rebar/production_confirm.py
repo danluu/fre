@@ -120,6 +120,26 @@ GENERAL_ELIGIBILITY_FIELDS = (
     "sve_vector_length_bytes",
     "max_literal_bytes",
 )
+COUNT_V3_ASIMD_FEATURE = 1
+COUNT_V3_SVE_FEATURE = 1 << 1
+COUNT_V3_SVE2_FEATURE = 1 << 2
+COUNT_V3_CLOSED_TARGETS = {
+    # required_isa_id: (register_plan_id, exact features, exact SVE VL,
+    #                   admitted object-format wire IDs)
+    1: (1, COUNT_V3_ASIMD_FEATURE, 0, frozenset((1, 2))),
+    2: (
+        4,
+        COUNT_V3_ASIMD_FEATURE | COUNT_V3_SVE_FEATURE,
+        16,
+        frozenset((2,)),
+    ),
+    3: (
+        5,
+        COUNT_V3_ASIMD_FEATURE | COUNT_V3_SVE_FEATURE | COUNT_V3_SVE2_FEATURE,
+        16,
+        frozenset((2,)),
+    ),
+}
 
 
 class ConfirmationError(RuntimeError):
@@ -558,6 +578,24 @@ def _validate_eligibility_tuple(value: Any, label: str) -> dict[str, Any]:
         fail(f"{label} literal width exceeds max_literal_bytes")
     if row["actual_features"] & ~row["allowed_features"]:
         fail(f"{label}.actual_features escapes allowed_features")
+    target = COUNT_V3_CLOSED_TARGETS.get(row["required_isa_id"])
+    if target is None:
+        fail(f"{label}.required_isa_id is not a closed Count-v3 target")
+    register_plan_id, features, sve_vector_bytes, object_formats = target
+    if (
+        row["register_plan_id"] != register_plan_id
+        or row["actual_features"] != features
+        or row["allowed_features"] != features
+        or row["object_format"] not in object_formats
+        or row["architecture"] != 1
+        or row["pointer_width"] != 64
+        or row["target_abi"] != 1
+        or row["candidate_block_starts"] != 16
+        or row["vector_bytes"] != 16
+        or row["sve_vector_length_bytes"] != sve_vector_bytes
+        or row["max_literal_bytes"] != 32
+    ):
+        fail(f"{label} differs from its exact mixed register/feature target")
     return dict(row)
 
 

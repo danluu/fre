@@ -44,6 +44,13 @@ The build is fail-closed and accepts these environment variables:
   `neoverse-v2-v3`.
 - `FRE_COUNT_V3_REQUIRED_ISA`: `neon`, `sve-vl16`, or `sve2-vl16`. The selected
   optimizer/backend must independently emit that exact ISA row.
+
+The SVE rows are mixed-register targets, not legacy pure-predicate targets:
+`sve-vl16` requires register plan `4` and exact feature mask
+`ASIMD|SVE`; `sve2-vl16` requires register plan `5` and exact feature mask
+`ASIMD|SVE|SVE2`. Both require ELF64/AArch64 and exact VL16. The build,
+embedded runner, production-proposal controller, and source-authority adopter
+all reject legacy plans `2`/`3` and feature masks that omit ASIMD.
 - `FRE_COUNT_V3_PROMOTION_PROPOSAL_SHA256` and
   `FRE_COUNT_V3_PROMOTION_MANIFEST_SHA256`: required only for a production
   build. They are the full-file digests (including the final LF) of the

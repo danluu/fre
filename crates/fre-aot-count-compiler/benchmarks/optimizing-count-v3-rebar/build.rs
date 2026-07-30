@@ -17,7 +17,7 @@ use fre::{
     AggregateExactLiteralSemantics, AggregatePlanIdentity, AggregatePlanKind,
     AggregatePlanSelection, AggregateStrategy, LiteralAggregateOperation, RustProfile,
 };
-use fre_aot_aarch64::{CountEmitLimitsV2, emit_count_v2};
+use fre_aot_aarch64::{AotCountCpuFeatures, CountEmitLimitsV2, emit_count_v2};
 use fre_aot_count_compiler::{
     CountCompileLimitsV3, CountCompileRequestV3, CountCompileTargetV3, CountObjectFormatV3,
     CountObjectLimitsV2, CountObjectLimitsV3, CountSemanticCandidateV3, compile_count_v3,
@@ -28,7 +28,7 @@ use fre_aot_count_compiler::{
 use fre_aot_count_contract::v3::{
     CountGeneralEligibilityTupleV3, inspect_static_count_expectation_v3,
 };
-use fre_aot_optimizer::{CountV3RequiredIsa, CountV3TuningClass};
+use fre_aot_optimizer::{CountV3RegisterPlanId, CountV3RequiredIsa, CountV3TuningClass};
 use fre_kernel_ir::{Count, ValidateLimits, build_exact_aggregate};
 use inventory::{CompilerArtifactInput, Inventory, digest_fields, hex, parse_hex_32};
 use serde::{Deserialize, Serialize};
@@ -818,6 +818,7 @@ fn compile_artifact(
             input.pattern_input_id
         ));
     }
+    validate_compiled_target_eligibility_v3(inspected_eligibility, target)?;
     let general_eligibility_tuple = general_eligibility_tuple_registry(inspected_eligibility)?;
     let compile_identity = hex(object.compile_identity());
     let expectation_symbol = format!("{EXPECTATION_SYMBOL_PREFIX}{compile_identity}");
@@ -1356,6 +1357,46 @@ fn general_eligibility_tuple_registry(
         );
     }
     Ok(value)
+}
+
+fn validate_compiled_target_eligibility_v3(
+    tuple: CountGeneralEligibilityTupleV3,
+    target: &TargetConfig,
+) -> Result<(), String> {
+    let (register_plan, features, sve_vector_length_bytes) = match target.required_isa {
+        CountV3RequiredIsa::Aarch64Neon128 => (
+            CountV3RegisterPlanId::Aarch64NeonV1,
+            AotCountCpuFeatures::ASIMD,
+            0,
+        ),
+        CountV3RequiredIsa::Aarch64SveVl16 => (
+            CountV3RegisterPlanId::Aarch64NeonSveVl16V1,
+            AotCountCpuFeatures::ASIMD.union(AotCountCpuFeatures::SVE),
+            16,
+        ),
+        CountV3RequiredIsa::Aarch64Sve2Vl16 => (
+            CountV3RegisterPlanId::Aarch64NeonSve2Vl16V1,
+            AotCountCpuFeatures::ASIMD
+                .union(AotCountCpuFeatures::SVE)
+                .union(AotCountCpuFeatures::SVE2),
+            16,
+        ),
+    };
+    if tuple.object_format != target.object_format
+        || tuple.required_isa_id != target.required_isa.wire_id()
+        || tuple.register_plan_id != register_plan.wire_id()
+        || tuple.actual_features != features.bits()
+        || tuple.allowed_features != features.bits()
+        || tuple.candidate_block_starts != 16
+        || tuple.vector_bytes != 16
+        || tuple.sve_vector_length_bytes != sve_vector_length_bytes
+    {
+        return Err(format!(
+            "compiled Count-v3 eligibility target differs from the closed {} register/feature plan",
+            target.required_isa_name
+        ));
+    }
+    Ok(())
 }
 
 fn generate_bindings(
