@@ -26,7 +26,7 @@ const HELDOUT_SIZES: [usize; 3] = [4_093, 65_521, 1_048_573];
 const SCREEN_ALIGNMENTS: [u8; 4] = [0, 1, 7, 15];
 const HELDOUT_ALIGNMENTS: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 const HEADER: &str = "schema,phase,seed,width,shape,size,scenario,alignment,window_start,window_end,repetition,order,engine,iterations,total_ns,ns_per_iter,checksum,semantic";
-const SCHEMA: &str = "fre-search-v8-broad-deploy-v1";
+const SCHEMA: &str = "fre-search-v9-broad-deploy-v2";
 const CHECKSUM_SEED: u64 = 0x243f_6a88_85a3_08d3;
 const MAX_CALIBRATION_ITERATIONS: usize = 1 << 30;
 
@@ -190,14 +190,16 @@ impl Scenario {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Engine {
-    Native,
+    NativeV8,
+    NativeV9,
     Portable,
 }
 
 impl Engine {
     const fn name(self) -> &'static str {
         match self {
-            Self::Native => "native-v8-aot-code",
+            Self::NativeV8 => "native-v8-aot-code-tag8",
+            Self::NativeV9 => "native-v9-aot-code-tag22",
             Self::Portable => "portable-memmem",
         }
     }
@@ -313,29 +315,43 @@ fn run_case(
     let portable = LiteralPlan::new(literal, LiteralBuildLimits::default())?;
     let program =
         build_exact_literal::<Span>(literal, AnchorFlags::default(), ValidateLimits::default())?;
-    let image = emit_audited_with_backend(
+    let image_v8 = emit_audited_with_backend(
         &program,
         SearchBackendPolicy::AsimdV8,
         EmitLimits::default(),
     )?;
-    let kernel = publish_audited::<Span>(&image, PublicationLimits::default())?;
-    let session = kernel.begin_current_thread_session()?;
+    let image_v9 = emit_audited_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV9,
+        EmitLimits::default(),
+    )?;
+    let kernel_v8 = publish_audited::<Span>(&image_v8, PublicationLimits::default())?;
+    let kernel_v9 = publish_audited::<Span>(&image_v9, PublicationLimits::default())?;
+    let session_v8 = kernel_v8.begin_current_thread_session()?;
+    let session_v9 = kernel_v9.begin_current_thread_session()?;
 
     let expected = encode_portable(
         portable
             .find_window(bytes, portable_window, LiteralSearchLimits::unlimited())?
             .0,
     );
-    let actual = invoke_native(&session, bytes, native_window, literal.len())?;
+    let actual_v8 = invoke_native(&session_v8, bytes, native_window, literal.len())?;
+    let actual_v9 = invoke_native(&session_v9, bytes, native_window, literal.len())?;
     require(
-        expected == actual,
-        "native/portable semantic mismatch before timing",
+        expected == actual_v8 && expected == actual_v9,
+        "native V8/V9/portable semantic mismatch before timing",
     )?;
 
     for _ in 0..3 {
         black_box(invoke_portable(&portable, bytes, portable_window)?);
         black_box(invoke_native(
-            &session,
+            &session_v8,
+            bytes,
+            native_window,
+            literal.len(),
+        )?);
+        black_box(invoke_native(
+            &session_v9,
             bytes,
             native_window,
             literal.len(),
@@ -343,7 +359,8 @@ fn run_case(
     }
     let iterations = calibrate(
         &portable,
-        &session,
+        &session_v8,
+        &session_v9,
         bytes,
         portable_window,
         native_window,
@@ -353,16 +370,24 @@ fn run_case(
     )?;
     let scenario_name = scenario.name();
     for repetition in 0..phase.repetitions() {
-        let order = if repetition % 2 == 0 {
-            [Engine::Native, Engine::Portable]
-        } else {
-            [Engine::Portable, Engine::Native]
+        let order = match repetition % 3 {
+            0 => [Engine::NativeV8, Engine::NativeV9, Engine::Portable],
+            1 => [Engine::NativeV9, Engine::Portable, Engine::NativeV8],
+            _ => [Engine::Portable, Engine::NativeV8, Engine::NativeV9],
         };
-        let order_name = format!("{}+{}", order[0].name(), order[1].name());
+        let order_name = format!(
+            "{}+{}+{}",
+            order[0].name(),
+            order[1].name(),
+            order[2].name()
+        );
         for engine in order {
             let measurement = match engine {
-                Engine::Native => measure(iterations, expected, || {
-                    invoke_native(&session, bytes, native_window, literal.len())
+                Engine::NativeV8 => measure(iterations, expected, || {
+                    invoke_native(&session_v8, bytes, native_window, literal.len())
+                })?,
+                Engine::NativeV9 => measure(iterations, expected, || {
+                    invoke_native(&session_v9, bytes, native_window, literal.len())
                 })?,
                 Engine::Portable => measure(iterations, expected, || {
                     invoke_portable(&portable, bytes, portable_window)
@@ -391,7 +416,8 @@ fn run_case(
 #[allow(clippy::too_many_arguments)]
 fn calibrate(
     portable: &LiteralPlan,
-    session: &PublishedKernelThreadSession<'_, Span>,
+    session_v8: &PublishedKernelThreadSession<'_, Span>,
+    session_v9: &PublishedKernelThreadSession<'_, Span>,
     haystack: &[u8],
     portable_window: PortableWindow,
     native_window: NativeWindow,
@@ -401,13 +427,20 @@ fn calibrate(
 ) -> Result<usize, DynError> {
     let mut iterations = 1_usize;
     loop {
-        let native = measure(iterations, expected, || {
-            invoke_native(session, haystack, native_window, literal_bytes)
+        let native_v8 = measure(iterations, expected, || {
+            invoke_native(session_v8, haystack, native_window, literal_bytes)
+        })?;
+        let native_v9 = measure(iterations, expected, || {
+            invoke_native(session_v9, haystack, native_window, literal_bytes)
         })?;
         let portable_measurement = measure(iterations, expected, || {
             invoke_portable(portable, haystack, portable_window)
         })?;
-        let faster_ns = native.total_ns.min(portable_measurement.total_ns).max(1);
+        let faster_ns = native_v8
+            .total_ns
+            .min(native_v9.total_ns)
+            .min(portable_measurement.total_ns)
+            .max(1);
         if faster_ns >= target_ns / 4 || iterations == MAX_CALIBRATION_ITERATIONS {
             let scale = target_ns
                 .checked_add(faster_ns - 1)

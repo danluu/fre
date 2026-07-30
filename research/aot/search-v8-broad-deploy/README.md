@@ -1,10 +1,13 @@
-# Search V8 broad-deployment matrix
+# Search V9 broad-deployment matrix
 
-This is a deterministic, non-Rebar comparison of the native code shared by
-Search-v1 AOT/JIT and the current portable exact-literal `memmem::Finder`.
-Construction and publication happen outside timing. Each timed native call
-retains the same checked window and literal-resource preflight as the static
-AOT facade.
+This is a deterministic, non-Rebar comparison of separately authenticated
+Search V8/tag 8, Search V9/tag 22, and the current portable exact-literal
+`memmem::Finder`. V9 adds an exact first-candidate check before entering the
+otherwise unchanged V8 graph. Construction and publication happen outside
+timing. Each timed native call retains the same checked window and
+literal-resource preflight as the static AOT facade. The CSV `engine` field
+names the exact backend tag, so every fixture supports V9/V8 and V9/portable
+paired comparisons.
 
 The split was fixed before looking at results:
 
@@ -37,4 +40,3 @@ Arguments are `PHASE SHARD SHARDS TARGET_MILLISECONDS`. Run disjoint shards
 concurrently, then concatenate one header and all data rows. `heldout` uses
 seven repetitions per engine; `confirm` uses the same held-out matrix with
 twelve repetitions.
-
