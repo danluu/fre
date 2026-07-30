@@ -3996,7 +3996,51 @@ fn policy_multi_specialized_v3(
             condition_v3(policy, ConditionV3::Equal, wide_advance)?;
 
             add_register64_v3(policy, X15, X0, X3)?;
+            add_immediate64_v3(policy, X8, X15, u16::from(semantic_secondary_offset))?;
+            exact_v3(
+                policy,
+                DecodedInstructionV3::LoadVector128 {
+                    destination: 0,
+                    base: X8,
+                    offset: 0,
+                },
+            )?;
+            exact_v3(
+                policy,
+                DecodedInstructionV3::CompareEqualBytes16 {
+                    destination: 0,
+                    left: 0,
+                    right: SEMANTIC_SECONDARY_VECTOR_V3,
+                },
+            )?;
+            exact_v3(
+                policy,
+                DecodedInstructionV3::AndBytes16 {
+                    destination: mask,
+                    left: mask,
+                    right: 0,
+                },
+            )?;
+            exact_v3(
+                policy,
+                DecodedInstructionV3::UnsignedMaxAcrossBytes16 {
+                    destination: 1,
+                    source: mask,
+                },
+            )?;
+            exact_v3(
+                policy,
+                DecodedInstructionV3::MoveVectorByteTo32 {
+                    destination: X8,
+                    source: 1,
+                },
+            )?;
+            compare_immediate64_v3(policy, X8, 0)?;
+            condition_v3(policy, ConditionV3::Equal, wide_advance)?;
             for index in 1..usize::from(filter.len) {
+                if filter.offsets[index] == semantic_secondary_offset {
+                    continue;
+                }
                 add_immediate64_v3(policy, X8, X15, u16::from(filter.offsets[index]))?;
                 exact_v3(
                     policy,

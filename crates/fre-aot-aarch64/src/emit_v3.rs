@@ -2596,7 +2596,18 @@ fn emit_multi_specialized_v3(
             assembler.branch_cond(ConditionV3::Equal, wide_advance)?;
 
             assembler.add_reg(X15, X0, X3)?;
+            assembler.add_imm(X8, X15, u16::from(semantic_secondary_offset))?;
+            assembler.load_vector128(0, X8)?;
+            assembler.compare_equal_bytes16(0, 0, SEMANTIC_SECONDARY_VECTOR_V3)?;
+            assembler.and_bytes16(mask, mask, 0)?;
+            assembler.unsigned_max_across_bytes16(1, mask)?;
+            assembler.move_vector_byte_to32(X8, 1)?;
+            assembler.cmp_imm64(X8, 0)?;
+            assembler.branch_cond(ConditionV3::Equal, wide_advance)?;
             for index in 1..usize::from(filter.len) {
+                if filter.offsets[index] == semantic_secondary_offset {
+                    continue;
+                }
                 assembler.add_imm(X8, X15, u16::from(filter.offsets[index]))?;
                 assembler.load_vector128(0, X8)?;
                 assembler.compare_equal_bytes16(0, 0, vector_registers[index])?;
