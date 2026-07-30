@@ -1,0 +1,103 @@
+{
+  "schema": "fre.aot.external-regex-1.12.4-contamination-sources-development.v1",
+  "development_inventory": {
+    "path": "research/aot/external-regex-1.12.4/development-inventory-v1.json",
+    "sha256": "3b409957d42482b170df43ac58bfb08c019c4236b9bee95304a8419931f3d52f"
+  },
+  "sources": [
+    {
+      "kind": "expanded-rebar-manifest",
+      "path": "/private/tmp/fre-count-v3-inventory-463d-r1/expanded-manifest.json",
+      "sha256": "42996c32be23fc88f9441a3cc17c6b62de4078397ca3bf2af29245e4edfb1fd7"
+    },
+    {
+      "kind": "optimizing-count-inventory",
+      "path": "/private/tmp/fre-count-v3-inventory-463d-r1/inventory.json",
+      "sha256": "ba27c831a8e718db2026f4fd1b30575d9e7036d7c1bb47a93fa6b6fe6df4c42c"
+    },
+    {
+      "kind": "blind-fenced",
+      "path": "/private/tmp/fre-count-v3-disjoint-inventory-r1/inventory.json",
+      "reason": "protected inventory is deliberately unopened pending authorized final handoff"
+    },
+    {
+      "kind": "optimizing-count-inventory",
+      "path": "/private/tmp/fre-count-v3-disjoint-inventory-r1-failed-identity-order/inventory.json",
+      "sha256": "6212e67cd468dc8e91283c834962c5fb00bf7d314c34c95be384b22714a362ba"
+    },
+    {
+      "kind": "optimizing-count-inventory",
+      "path": "/private/tmp/fre-count-lifted-inventory.LfM5Y1/inventory/inventory.json",
+      "sha256": "cf5f07736255816e71542e052ca747ffb88c9179e711bb1ef35865d39f5b6e98"
+    },
+    {
+      "kind": "optimizing-count-inventory",
+      "path": "/private/tmp/fre-multipattern-lifted-inventory.4NoFqd/inventory/inventory.json",
+      "sha256": "7a5505922ca5cfcac10f1ad5137d0e478b64e49322ed55cd092f7928825ed41b"
+    },
+    {
+      "kind": "optimizing-count-inventory",
+      "path": "/private/tmp/fre-count-v3-public-training-r1/inventory.json",
+      "sha256": "5fe9a2182269b97ce0fc96f368c81cd353e322fa812a0deeab57215481f04e26"
+    },
+    {
+      "kind": "optimizing-count-inventory",
+      "path": "/private/tmp/fre-count-v3-public-validation-r1/inventory.json",
+      "sha256": "8cd412ba2b09f46d6fd798bd83011bcc8a3255944c1487193b511eddfed11daf"
+    },
+    {
+      "kind": "optimizing-count-inventory",
+      "path": "/private/tmp/fre-count-v3-training-rederive.lvpNjc/output/inventory.json",
+      "sha256": "5fe9a2182269b97ce0fc96f368c81cd353e322fa812a0deeab57215481f04e26"
+    },
+    {
+      "kind": "optimizing-count-inventory",
+      "path": "/private/tmp/fre-count-v3-d3e-final-holdout-inventory-r1/inventory.json",
+      "sha256": "b45c6826ac4c49987b3de19cdde5351aaad33680b6dd1ed406664de4be2762d4"
+    },
+    {
+      "kind": "optimizing-count-inventory",
+      "path": "/private/tmp/fre-count-v3-d3e-final-holdout-inventory-r2/inventory.json",
+      "sha256": "e2f9306329438ad7f8ee69dddf65c43a3a11ca41aeceda4154fdfe853095ea5e"
+    },
+    {
+      "kind": "optimizing-count-inventory",
+      "path": "/private/tmp/fre-count-v3-static-wide-cross-corpus-r1/inventory.json",
+      "sha256": "c09f49d63df53e0c0a97aa4c81b217a72d0a0489707aa0cb11e61417e87034ea"
+    },
+    {
+      "kind": "optimizing-count-inventory",
+      "path": "/private/tmp/fre-count-v3-static-wide-cross-corpus-r2/inventory.json",
+      "sha256": "68985f718302e9cd15001dd6ca4c31177b72c83ab61fe8bb8d0d1d5d8d394c1e"
+    },
+    {
+      "kind": "optimizing-count-inventory",
+      "path": "/private/tmp/fre-count-v3-static-sparse-all-widths-cross-corpus-r2/inventory.json",
+      "sha256": "f90c0a000a7d04798878a2f0ee0fc12fd2630658f8e94a685a3e82303a0e921e"
+    },
+    {
+      "kind": "source-tree",
+      "path": "/private/tmp/fre-count-v3-broad-aot-r1/crates/fre-aot-count-compiler/benchmarks/optimizing-count-v3-rebar",
+      "files": {
+        "Cargo.lock": "2ae2aaadac8a78c2fec567d6bb0d16e8fa9fce17062f643def9441f95bb3421e",
+        "Cargo.toml": "dd6f9f2fe616946c96776a32a04725f44c4061fb65347263a144412b77280f59",
+        "README.md": "dfdb1090b1b8f9c3ed536efcd15147e6a9cccbd9826e0aa7f565eb38cf232c7f",
+        "build.rs": "a79c9d6afbc08fae0fc63d0534588374e330da2934a512f01283947016eb26f2",
+        "build_support/expectation_object.rs": "66ff5e2d97f6db4160701eb0becfd31564bb4b05960e82846a902ad013bc5d0b",
+        "build_support/inventory.rs": "b8668e3755413e6a337501575e4cb74a2fcb3e3b7ce69b005b362b43450dbef6",
+        "production_confirm.py": "180b32599fbc9f41106f881eb61114e5a422262674e9eca2d8ff22c5ff165a70",
+        "src/main.rs": "20a614f3b521b48052e32551b3e287c9195f6feb87f9dd7a1e00b2dbc3f9e8b1",
+        "test_production_confirm.py": "05705f6aae659e694efea7a2f23bef6c284f02f961611f1b78bf106b13a94ea2",
+        "test_verify_linux_expectations.py": "ecfb9f3c8d4893eaea992d5bbe32adfd0395fd2fc1a9a92e418c398053c89524",
+        "test_verify_production_identity.py": "175580084824dce7ec3628b43a7c2a22618514ed1af254ebf7f3f25729659577",
+        "verify_linux_expectations.py": "199949b46cbf638177ab28291505961e612f6dcce2831978270128495b798cf1",
+        "verify_production_identity.py": "2d3265311d36952719d45bed707e6a3a3cf865b9852d9193631a1ae02644281c"
+      }
+    },
+    {
+      "kind": "source-file",
+      "path": "/private/tmp/fre-count-v3-broad-aot-r1/tools/rebar-compare/examples/optimizing_count_v3_inventory.rs",
+      "sha256": "f5c8d9b2531df19c27161dc2b1698c772c605aa0b3d343756eb7b12f8a50db1e"
+    }
+  ]
+}
