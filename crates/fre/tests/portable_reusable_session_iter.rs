@@ -107,7 +107,7 @@ fn reusable_byte_and_text_empty_iteration_preserve_distinct_progress_rules() {
     )
     .expect("empty byte iteration");
     assert_eq!(spans(&byte_matches), vec![(0, 0), (1, 1), (2, 2)]);
-    assert_eq!(byte_accounting.search_calls, 6);
+    assert_eq!(byte_accounting.search_calls, 3);
     assert_eq!(byte_accounting.matches, 3);
     assert_eq!(byte_accounting.suppressed_empty, 3);
     assert_eq!(byte_accounting.utf8_progress_byte_probes, 0);
@@ -131,11 +131,128 @@ fn reusable_byte_and_text_empty_iteration_preserve_distinct_progress_rules() {
         .map(|matched| matched.expect("empty text match"))
         .collect::<Vec<_>>();
     assert_eq!(spans(&text_matches), vec![(0, 0), (2, 2)]);
-    assert_eq!(text_iterator.accounting().search_calls, 4);
+    assert_eq!(text_iterator.accounting().search_calls, 2);
     assert_eq!(text_iterator.accounting().matches, 2);
     assert_eq!(text_iterator.accounting().suppressed_empty, 2);
     assert_eq!(text_iterator.accounting().utf8_progress_byte_probes, 1);
     assert_eq!(text_iterator.accounting().utf8_progress_work, 3);
+}
+
+#[test]
+fn empty_replay_elision_is_linear_and_preserves_context_limits_and_reuse() {
+    let empty = PortableBuilder::new("")
+        .unicode(false)
+        .plan_selection(PlanSelection::ForceK0)
+        .build()
+        .expect("portable empty K0");
+    let upstream_empty = regex::bytes::RegexBuilder::new("")
+        .unicode(false)
+        .build()
+        .expect("upstream empty bytes regex");
+    let mut empty_session = empty
+        .search_session(SearchSessionLimits::unlimited())
+        .expect("empty K0 session");
+    collect_bytes(
+        &mut empty_session,
+        b"warm",
+        PortableFindIterRunLimits::unlimited(),
+    )
+    .expect("warm empty session");
+
+    let mut measured_work = Vec::new();
+    for length in [64_usize, 128] {
+        let haystack = vec![b'x'; length];
+        let expected = upstream_empty
+            .find_iter(&haystack)
+            .map(|matched| (matched.start(), matched.end()))
+            .collect::<Vec<_>>();
+        let (actual, accounting) = collect_bytes(
+            &mut empty_session,
+            &haystack,
+            PortableFindIterRunLimits::unlimited(),
+        )
+        .expect("empty iteration");
+        assert_eq!(spans(&actual), expected);
+        assert_eq!(accounting.matches, length + 1);
+        assert_eq!(accounting.search_calls, length + 1);
+        assert_eq!(accounting.suppressed_empty, length + 1);
+        measured_work.push(accounting.work_or_linear_terms);
+    }
+    assert!(measured_work[0] > 0);
+    assert!(
+        measured_work[1] <= measured_work[0].saturating_mul(3),
+        "doubling the empty-match haystack must retain linear charged work"
+    );
+
+    let contextual = PortableBuilder::new(r"\A|a$")
+        .unicode(false)
+        .plan_selection(PlanSelection::ForceK0)
+        .build()
+        .expect("portable contextual nullable K0");
+    let upstream_contextual = regex::bytes::RegexBuilder::new(r"\A|a$")
+        .unicode(false)
+        .build()
+        .expect("upstream contextual bytes regex");
+    let haystack = b"ba";
+    let expected_spans = upstream_contextual
+        .find_iter(haystack)
+        .map(|matched| (matched.start(), matched.end()))
+        .collect::<Vec<_>>();
+    assert_eq!(expected_spans, vec![(0, 0), (1, 2)]);
+    let mut contextual_session = contextual
+        .search_session(SearchSessionLimits::unlimited())
+        .expect("contextual K0 session");
+
+    let (actual, full) = collect_bytes(
+        &mut contextual_session,
+        haystack,
+        PortableFindIterRunLimits::unlimited(),
+    )
+    .expect("contextual iteration");
+    assert_eq!(spans(&actual), expected_spans);
+    assert_eq!(full.search_calls, 3);
+    assert_eq!(full.matches, 2);
+    assert_eq!(full.suppressed_empty, 1);
+
+    let (exact, exact_accounting) = collect_bytes(
+        &mut contextual_session,
+        haystack,
+        PortableFindIterRunLimits {
+            max_search_calls: full.search_calls,
+            ..PortableFindIterRunLimits::unlimited()
+        },
+    )
+    .expect("exact contextual search-call limit");
+    assert_eq!(exact, actual);
+    assert_eq!(exact_accounting.search_calls, full.search_calls);
+
+    {
+        let mut below = contextual_session.find_iter(
+            haystack,
+            PortableFindIterRunLimits {
+                max_search_calls: full.search_calls - 1,
+                ..PortableFindIterRunLimits::unlimited()
+            },
+        );
+        assert_eq!(below.next(), Some(Ok(actual[0])));
+        assert_eq!(below.next(), Some(Ok(actual[1])));
+        assert_eq!(
+            below.next(),
+            Some(Err(PortableFindIterError::SearchCallLimit {
+                needed: full.search_calls,
+                limit: full.search_calls - 1,
+            }))
+        );
+        assert!(below.next().is_none(), "terminal refusal must fuse");
+    }
+
+    let (recovered, _) = collect_bytes(
+        &mut contextual_session,
+        haystack,
+        PortableFindIterRunLimits::unlimited(),
+    )
+    .expect("session recovery after contextual refusal");
+    assert_eq!(recovered, actual);
 }
 
 #[test]

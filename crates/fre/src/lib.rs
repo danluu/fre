@@ -1547,10 +1547,11 @@ impl From<UnicodeWordRunError> for SearchError {
 
 /// Hard limits for complete non-overlapping match iteration.
 ///
-/// `max_search_calls` bounds the whole iterator, including searches that
-/// suppress a repeated empty match while making byte- or scalar-wise progress.
-/// The session and per-search limits retain their existing operation-specific
-/// meanings.
+/// `max_search_calls` bounds the contextual searches actually executed across
+/// the whole iterator. A deterministic replay of an already emitted empty
+/// match is suppressed without executing another search; its byte- or
+/// scalar-wise progress remains accounted separately. The session and
+/// per-search limits retain their existing operation-specific meanings.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PortableFindIterLimits {
     /// One-time reusable K0 workspace construction limits.
@@ -1635,13 +1636,15 @@ impl Default for PortableFindIterRunLimits {
 /// iterators.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PortableFindIterAccounting {
-    /// Contextual search invocations, including the final miss and suppressed
-    /// repeated empty matches.
+    /// Contextual searches actually executed, including a final miss or an
+    /// observed repeated-empty probe. Proven same-cursor empty replays do not
+    /// execute or count another search.
     pub search_calls: usize,
     /// Non-overlapping matches returned to the caller.
     pub matches: usize,
     /// Repeated empty matches suppressed to guarantee byte- or scalar-wise
-    /// progress, according to the facade.
+    /// progress, including deterministic same-cursor replays proven without
+    /// another search.
     pub suppressed_empty: usize,
     /// Sum of charged work or conservative linear terms from successful
     /// contextual searches and UTF-8 empty-match progress.
@@ -4562,6 +4565,7 @@ struct PortableMatchIterState<'h> {
     empty_match_progress: EmptyMatchProgress,
     start: usize,
     last_match_end: Option<usize>,
+    pending_empty_progress: bool,
     accounting: PortableFindIterAccounting,
     finished: bool,
 }
@@ -4584,6 +4588,7 @@ impl<'h> PortableMatchIterState<'h> {
             empty_match_progress,
             start: 0,
             last_match_end: None,
+            pending_empty_progress: false,
             accounting: PortableFindIterAccounting {
                 search_calls: 0,
                 matches: 0,
@@ -4659,11 +4664,77 @@ impl<'h> PortableMatchIterState<'h> {
         Ok(())
     }
 
+    fn advance_past_repeated_empty(&mut self) -> Result<bool, PortableFindIterError> {
+        self.accounting.suppressed_empty = self.accounting.suppressed_empty.checked_add(1).ok_or(
+            PortableFindIterError::AccountingOverflow {
+                counter: "suppressed-empty",
+            },
+        )?;
+        if self.start == self.haystack.len() {
+            self.finished = true;
+            return Ok(true);
+        }
+        self.start = match self.empty_match_progress {
+            EmptyMatchProgress::Byte => self.start.saturating_add(1),
+            EmptyMatchProgress::Utf8Scalar => {
+                // This mode is constructed only from `&str`. Starting at a
+                // scalar boundary, skip its UTF-8 continuation bytes to reach
+                // the next scalar boundary. Charge the initial increment,
+                // every byte classification, and every continuation-byte
+                // increment.
+                let mut next = self.start.saturating_add(1);
+                let mut byte_probes = 0_u64;
+                let mut progress_work = 1_u64;
+                while next < self.haystack.len() {
+                    byte_probes = byte_probes.checked_add(1).ok_or(
+                        PortableFindIterError::AccountingOverflow {
+                            counter: "utf8-progress-byte-probe",
+                        },
+                    )?;
+                    progress_work = progress_work.checked_add(1).ok_or(
+                        PortableFindIterError::AccountingOverflow {
+                            counter: "utf8-progress-work",
+                        },
+                    )?;
+                    if (self.haystack[next] & 0b1100_0000) != 0b1000_0000 {
+                        break;
+                    }
+                    progress_work = progress_work.checked_add(1).ok_or(
+                        PortableFindIterError::AccountingOverflow {
+                            counter: "utf8-progress-work",
+                        },
+                    )?;
+                    next = next.saturating_add(1);
+                }
+                self.record_utf8_progress(byte_probes, progress_work)?;
+                next
+            }
+        };
+        Ok(false)
+    }
+
+    fn advance_pending_empty(&mut self) -> Result<bool, PortableFindIterError> {
+        if !self.pending_empty_progress {
+            return Ok(false);
+        }
+        self.pending_empty_progress = false;
+        // The immutable matcher, original haystack, assertion context, and
+        // cursor are unchanged since the emitted empty match. Repeating the
+        // same search can only select that same empty span, so suppress it
+        // without another invocation and perform the standard progress step.
+        self.advance_past_repeated_empty()
+    }
+
     fn next_match(
         &mut self,
         session: &mut PortableSearchSession<'_>,
     ) -> Option<Result<Match, PortableFindIterError>> {
         while !self.finished {
+            match self.advance_pending_empty() {
+                Ok(false) => {}
+                Ok(true) => return None,
+                Err(error) => return Some(self.fail(error)),
+            }
             if let Err(error) = self.begin_search() {
                 return Some(self.fail(error));
             }
@@ -4681,74 +4752,16 @@ impl<'h> PortableMatchIterState<'h> {
             };
 
             if matched.is_empty() && self.last_match_end == Some(matched.end()) {
-                let Some(suppressed_empty) = self.accounting.suppressed_empty.checked_add(1) else {
-                    return Some(self.fail(PortableFindIterError::AccountingOverflow {
-                        counter: "suppressed-empty",
-                    }));
-                };
-                self.accounting.suppressed_empty = suppressed_empty;
-                if self.start == self.haystack.len() {
-                    self.finished = true;
-                    return None;
+                match self.advance_past_repeated_empty() {
+                    Ok(false) => continue,
+                    Ok(true) => return None,
+                    Err(error) => return Some(self.fail(error)),
                 }
-                self.start = match self.empty_match_progress {
-                    EmptyMatchProgress::Byte => self.start.saturating_add(1),
-                    EmptyMatchProgress::Utf8Scalar => {
-                        // This mode is constructed only from `&str`. Starting
-                        // at a scalar boundary, skip its UTF-8 continuation
-                        // bytes to reach the next scalar boundary. Charge the
-                        // initial increment, every byte classification, and
-                        // every continuation-byte increment.
-                        let mut next = self.start.saturating_add(1);
-                        let mut byte_probes = 0_u64;
-                        let mut progress_work = 1_u64;
-                        while next < self.haystack.len() {
-                            byte_probes = match byte_probes.checked_add(1) {
-                                Some(value) => value,
-                                None => {
-                                    return Some(self.fail(
-                                        PortableFindIterError::AccountingOverflow {
-                                            counter: "utf8-progress-byte-probe",
-                                        },
-                                    ));
-                                }
-                            };
-                            progress_work = match progress_work.checked_add(1) {
-                                Some(value) => value,
-                                None => {
-                                    return Some(self.fail(
-                                        PortableFindIterError::AccountingOverflow {
-                                            counter: "utf8-progress-work",
-                                        },
-                                    ));
-                                }
-                            };
-                            if (self.haystack[next] & 0b1100_0000) != 0b1000_0000 {
-                                break;
-                            }
-                            progress_work = match progress_work.checked_add(1) {
-                                Some(value) => value,
-                                None => {
-                                    return Some(self.fail(
-                                        PortableFindIterError::AccountingOverflow {
-                                            counter: "utf8-progress-work",
-                                        },
-                                    ));
-                                }
-                            };
-                            next = next.saturating_add(1);
-                        }
-                        if let Err(error) = self.record_utf8_progress(byte_probes, progress_work) {
-                            return Some(self.fail(error));
-                        }
-                        next
-                    }
-                };
-                continue;
             }
 
             self.start = matched.end();
             self.last_match_end = Some(matched.end());
+            self.pending_empty_progress = matched.is_empty();
             let Some(emitted_count) = self.accounting.matches.checked_add(1) else {
                 return Some(
                     self.fail(PortableFindIterError::AccountingOverflow { counter: "match" }),

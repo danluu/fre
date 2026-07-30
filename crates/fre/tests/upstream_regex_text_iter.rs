@@ -96,7 +96,7 @@ fn empty_text_iteration_uses_scalar_progress_and_exact_terminal_limits() {
     assert_eq!(actual, expected);
     assert_eq!(unlimited.accounting().matches, 3);
     assert_eq!(unlimited.accounting().suppressed_empty, 3);
-    assert_eq!(unlimited.accounting().search_calls, 6);
+    assert_eq!(unlimited.accounting().search_calls, 3);
     assert_eq!(unlimited.accounting().utf8_progress_byte_probes, 4);
     assert_eq!(unlimited.accounting().utf8_progress_work, 9);
     assert!(unlimited.accounting().work_or_linear_terms >= 9);
@@ -124,13 +124,13 @@ fn empty_text_iteration_uses_scalar_progress_and_exact_terminal_limits() {
         .expect("limited text iterator construction");
     let emitted = limited
         .by_ref()
-        .take(expected.len())
+        .take(expected.len() - 1)
         .map(|matched| {
             let matched = matched.expect("limited text match before terminal refusal");
             (matched.start(), matched.end())
         })
         .collect::<Vec<_>>();
-    assert_eq!(emitted, expected);
+    assert_eq!(emitted, expected[..expected.len() - 1]);
     assert_eq!(
         limited.next(),
         Some(Err(PortableFindIterError::SearchCallLimit {

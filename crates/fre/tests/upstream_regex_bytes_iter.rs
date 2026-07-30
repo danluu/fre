@@ -185,7 +185,7 @@ fn borrowed_find_iter_preserves_limit_errors_workspace_and_fusion() {
             None => panic!("borrowed iterator silently exhausted below its exact limit"),
         }
     };
-    assert_eq!(emitted, probe.matches);
+    assert_eq!(emitted, probe.matches - 1);
     assert_eq!(
         error,
         PortableFindIterError::SearchCallLimit {
@@ -462,7 +462,7 @@ fn whole_iterator_search_call_limit_is_exact_and_terminal() {
         .expect("warm empty-pattern iterator path");
     let (_, probe) = collect(&regex, b"ab", PortableFindIterLimits::unlimited())
         .expect("unlimited accounting probe");
-    assert_eq!(probe.search_calls, 6);
+    assert_eq!(probe.search_calls, 3);
     assert_eq!(probe.matches, 3);
     assert_eq!(probe.suppressed_empty, 3);
 
@@ -488,7 +488,7 @@ fn whole_iterator_search_call_limit_is_exact_and_terminal() {
             None => panic!("below-limit iterator silently exhausted"),
         }
     };
-    assert_eq!(matches, probe.matches);
+    assert_eq!(matches, probe.matches - 1);
     assert_eq!(
         error,
         PortableFindIterError::SearchCallLimit {
@@ -686,10 +686,23 @@ fn collect_uncursored(
         .map_err(PortableFindIterError::Search)?;
     let mut start = 0_usize;
     let mut last_match_end = None;
+    let mut pending_empty_progress = false;
     let mut results = Vec::new();
     let mut accounting = PortableFindIterAccounting::default();
 
     loop {
+        if pending_empty_progress {
+            pending_empty_progress = false;
+            accounting.suppressed_empty = accounting.suppressed_empty.checked_add(1).ok_or(
+                PortableFindIterError::AccountingOverflow {
+                    counter: "suppressed-empty",
+                },
+            )?;
+            if start == haystack.len() {
+                break;
+            }
+            start = start.saturating_add(1);
+        }
         let needed = accounting.search_calls.checked_add(1).ok_or(
             PortableFindIterError::AccountingOverflow {
                 counter: "search-call",
@@ -726,6 +739,7 @@ fn collect_uncursored(
         }
         start = found.end();
         last_match_end = Some(found.end());
+        pending_empty_progress = found.is_empty();
         accounting.matches = accounting
             .matches
             .checked_add(1)
