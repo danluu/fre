@@ -1393,6 +1393,7 @@ fn audit_impl_v3(
         } else if audit_recipe.strategy == AuditLoweringStrategyV3::SparseRareColumns
             && literal_len == 5
             && audit_recipe.tuning_class == CountV3TuningClass::AppleMSeries
+            && audit_recipe.required_isa == CountV3RequiredIsa::Aarch64Neon128
         {
             // The static Apple schedule omits the adaptive fused-pair graph:
             // one ordinary pack plus eight retained wide-block packs.
@@ -4370,7 +4371,8 @@ fn policy_multi_specialized_v3(
 ) -> Result<(), CountAotError> {
     let static_wide = strategy == AuditLoweringStrategyV3::SparseRareColumns
         && literal.len() == 5
-        && tuning_class == CountV3TuningClass::AppleMSeries;
+        && tuning_class == CountV3TuningClass::AppleMSeries
+        && sve_tail.is_none();
     let vector = policy.new_label(LabelKindV3::VectorLoop)?;
     let candidate = policy.new_label(LabelKindV3::CandidateLoop)?;
     let candidate_miss = policy.new_label(LabelKindV3::Miss)?;

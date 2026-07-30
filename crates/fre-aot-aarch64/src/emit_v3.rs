@@ -2881,7 +2881,8 @@ fn emit_multi_specialized_v3(
     // target evidence supports the same choice.
     let static_wide = strategy == LoweringStrategyV3::SparseRareColumns
         && literal.len() == 5
-        && tuning_class == CountV3TuningClass::AppleMSeries;
+        && tuning_class == CountV3TuningClass::AppleMSeries
+        && sve_tail.is_none();
     let vector = assembler.new_label(LabelKindV3::VectorLoop)?;
     let candidate = assembler.new_label(LabelKindV3::CandidateLoop)?;
     let candidate_miss = assembler.new_label(LabelKindV3::Miss)?;
