@@ -3350,7 +3350,10 @@ fn v17_learned_continuation_executes_across_guarded_repeated_survivors() {
             let mut bytes = Vec::new();
             bytes.extend_from_slice(&first_near_miss);
             bytes.extend_from_slice(&first_near_miss);
-            for _ in 0..257 {
+            // Keep the largest width inside one 4 KiB guarded-test page so
+            // this hardware test exercises the same repeated-survivor graph
+            // on Linux hosts as it does on 16 KiB-page macOS hosts.
+            for _ in 0..123 {
                 bytes.extend_from_slice(&later_near_miss);
             }
             if install_match {
