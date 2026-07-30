@@ -1582,6 +1582,61 @@ fn every_width_and_tuning_class_stays_inside_the_source_envelope() {
 }
 
 #[test]
+fn apple_static_wide_omits_the_adaptive_pair_subgraph() {
+    let literal = [0_u8, 1, 2, 3, 4];
+    let program =
+        build_exact_aggregate::<Count>(&literal, ValidateLimits::default()).expect("Count KIR");
+    let emit_for = |tuning| {
+        let optimized = optimize_count_v3(&program, tuning, CountV3OptimizerLimits::default())
+            .expect("five-byte sparse optimization");
+        assert_eq!(
+            optimized.recipe().strategy(),
+            CountV3Strategy::SparseRareColumns
+        );
+        let image = emit_count_v3(&program, optimized.recipe(), CountEmitLimitsV3::default())
+            .expect("audited five-byte image");
+        assert_eq!(
+            audit_count_image_v3(&program, optimized.recipe(), &image)
+                .expect("independent policy audit"),
+            image.build_receipt().audit
+        );
+        image
+    };
+
+    let apple = emit_for(CountV3TuningClass::AppleMSeries);
+    let generic = emit_for(CountV3TuningClass::GenericAarch64);
+    let neoverse = emit_for(CountV3TuningClass::NeoverseV2V3);
+    assert_eq!(apple.build_receipt().audit.simd_candidate_blocks, 9);
+    assert_eq!(generic.build_receipt().audit.simd_candidate_blocks, 10);
+    assert_eq!(neoverse.build_receipt().audit.simd_candidate_blocks, 10);
+    assert!(apple.stats().code_bytes < generic.stats().code_bytes);
+    assert!(apple.stats().labels < generic.stats().labels);
+    assert!(apple.stats().relocations < generic.stats().relocations);
+
+    let apple_instructions = decoded_v3(&apple);
+    assert!(!apple_instructions.iter().any(|instruction| matches!(
+        instruction,
+        DecodedInstructionV3::MoveZero64 {
+            destination: 16,
+            ..
+        } | DecodedInstructionV3::MoveKeep64 {
+            destination: 16,
+            ..
+        } | DecodedInstructionV3::AndLowBits64 {
+            destination: 16,
+            ..
+        }
+    )));
+    assert!(decoded_v3(&generic).iter().any(|instruction| matches!(
+        instruction,
+        DecodedInstructionV3::AndLowBits64 {
+            destination: 16,
+            ..
+        }
+    )));
+}
+
+#[test]
 fn audit_rejects_code_and_recipe_manifest_mutation() {
     let (program, optimized) = optimized(b"abababab");
     let recipe = optimized.recipe();

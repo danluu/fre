@@ -7,7 +7,8 @@ use core::mem::size_of;
 
 use fre_aot_optimizer::{
     CountRecipeV3, CountV3RegisterPlanId, CountV3RequiredIsa, CountV3ScheduleId, CountV3Strategy,
-    CountV3SuccessorMode, decode_count_recipe_v3, encode_count_recipe_v3, validate_count_recipe_v3,
+    CountV3SuccessorMode, CountV3TuningClass, decode_count_recipe_v3, encode_count_recipe_v3,
+    validate_count_recipe_v3,
 };
 use fre_exact_alloc::{CopyError, ExactVec};
 use fre_kernel_ir::{
@@ -103,6 +104,7 @@ impl CandidateFilterV3 {
 pub(crate) struct LoweringRecipeV3 {
     pub(crate) strategy: LoweringStrategyV3,
     pub(crate) required_isa: CountV3RequiredIsa,
+    pub(crate) tuning_class: CountV3TuningClass,
     pub(crate) filter: Option<CandidateFilterV3>,
     pub(crate) confirmation_order: [u8; 32],
     pub(crate) confirmation_len: u8,
@@ -731,6 +733,7 @@ fn project_recipe_v3(
         LoweringRecipeV3 {
             strategy,
             required_isa: recipe.required_isa(),
+            tuning_class: recipe.tuning_class(),
             filter,
             confirmation_order,
             confirmation_len: u8::try_from(order.len()).expect("bounded literal width"),
@@ -1441,6 +1444,7 @@ pub(crate) fn canonical_template_v3(
                             filter,
                             recipe.confirmation_order(),
                             recipe.strategy,
+                            recipe.tuning_class,
                             None,
                             done,
                         )?,
@@ -1496,6 +1500,7 @@ pub(crate) fn canonical_template_v3(
                             filter,
                             recipe.confirmation_order(),
                             recipe.strategy,
+                            recipe.tuning_class,
                             sve_tail,
                             done,
                         )?,
@@ -2866,16 +2871,17 @@ fn emit_multi_specialized_v3(
     filter: CandidateFilterV3,
     confirmation_order: &[u8],
     strategy: LoweringStrategyV3,
+    tuning_class: CountV3TuningClass,
     sve_tail: Option<HybridSveTailV3>,
     done: LabelV3,
 ) -> Result<(), CountAotError> {
-    // Five-byte sparse recipes are a broad, pattern-only Rebar class whose
-    // rare primary already makes the 128-start retained-mask loop stable.
-    // Keep that class on the static wide schedule: runtime pair-mode learning
-    // adds branches and state traffic to its hot empty-batch path without
-    // changing the selected literal or consulting the haystack at compile
-    // time.
-    let static_wide = strategy == LoweringStrategyV3::SparseRareColumns && literal.len() == 5;
+    // Five-byte sparse Apple recipes are a pattern-only Rebar class whose rare
+    // primary already makes the 128-start retained-mask loop stable. Keep
+    // other tuning classes on the adaptive schedule unless their independent
+    // target evidence supports the same choice.
+    let static_wide = strategy == LoweringStrategyV3::SparseRareColumns
+        && literal.len() == 5
+        && tuning_class == CountV3TuningClass::AppleMSeries;
     let vector = assembler.new_label(LabelKindV3::VectorLoop)?;
     let candidate = assembler.new_label(LabelKindV3::CandidateLoop)?;
     let candidate_miss = assembler.new_label(LabelKindV3::Miss)?;
@@ -2899,12 +2905,12 @@ fn emit_multi_specialized_v3(
     } else {
         None
     };
-    let wide_pair_batch = if wide_batch.is_some() {
+    let wide_pair_batch = if wide_batch.is_some() && !static_wide {
         Some(assembler.new_label(LabelKindV3::VectorLoop)?)
     } else {
         None
     };
-    let wide_pair_hit = if wide_batch.is_some() {
+    let wide_pair_hit = if wide_batch.is_some() && !static_wide {
         Some(assembler.new_label(LabelKindV3::Internal)?)
     } else {
         None
@@ -2914,7 +2920,7 @@ fn emit_multi_specialized_v3(
     } else {
         None
     };
-    let wide_batch_done = if wide_batch.is_some() {
+    let wide_batch_done = if wide_batch.is_some() && !static_wide {
         Some(assembler.new_label(LabelKindV3::Internal)?)
     } else {
         None
@@ -3013,7 +3019,7 @@ fn emit_multi_specialized_v3(
     assembler.branch_cond(ConditionV3::CarryClear, done)?;
     assembler.sub_imm(X4, X1, width)?;
     assembler.mov_imm64_minimal(X3, 0)?;
-    if wide_batch.is_some() {
+    if wide_pair_batch.is_some() {
         // Runtime mode is learned only from batch survival. Values zero
         // through three count consecutive fully dense endpoint-empty batches;
         // four selects the fused primary/endpoint absence scan.
@@ -3067,21 +3073,6 @@ fn emit_multi_specialized_v3(
         assembler.move_x_to_vector_double(OVERLAPPING_SUFFIX_VECTOR_V3, X8)?;
     }
 
-    if static_wide {
-        // Keep the cold fused subgraph closed and independently auditable
-        // without testing its mode on every hot 128-start iteration. X16 was
-        // initialized to zero and is immutable in this schedule, so the
-        // guarded equality is a one-time structural edge only.
-        assembler.or_bytes16(20, vector_registers[0], vector_registers[0])?;
-        assembler.sub_reg(X5, X4, X3)?;
-        assembler.cmp_imm64(X5, SPARSE_SCAN_STARTS_V3 - 1)?;
-        assembler.branch_cond(ConditionV3::CarryClear, vector)?;
-        assembler.cmp_imm64(X16, 4)?;
-        assembler.branch_cond(
-            ConditionV3::Equal,
-            wide_pair_batch.expect("static wide retains an audited cold pair graph"),
-        )?;
-    }
     assembler.bind(vector)?;
     assembler.cmp_reg64(X3, X4)?;
     assembler.branch_cond(ConditionV3::Higher, done)?;
@@ -3148,18 +3139,12 @@ fn emit_multi_specialized_v3(
     if let (
         Some(wide_batch),
         Some(wide_batch_empty),
-        Some(wide_pair_batch),
-        Some(wide_pair_hit),
-        Some(wide_batch_done),
         Some(wide_candidates),
         Some(wide_candidate_misses),
         Some(wide_advances),
     ) = (
         wide_batch,
         wide_batch_empty,
-        wide_pair_batch,
-        wide_pair_hit,
-        wide_batch_done,
         wide_candidates,
         wide_candidate_misses,
         wide_advances,
@@ -3291,7 +3276,7 @@ fn emit_multi_specialized_v3(
             assembler.bind(wide_advance)?;
             assembler.add_imm(X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
         }
-        if !static_wide {
+        if let Some(wide_batch_done) = wide_batch_done {
             assembler.cmp_imm64(X16, 0)?;
             assembler.branch_cond(ConditionV3::Equal, wide_batch_done)?;
             assembler.and_low_bits(X16, X16, 2)?;
@@ -3300,88 +3285,89 @@ fn emit_multi_specialized_v3(
             // splat after four consecutive exact all-eight-primary,
             // endpoint-empty observations.
             assembler.or_bytes16(20, vector_registers[0], vector_registers[0])?;
+            assembler.bind(wide_batch_done)?;
         }
-        assembler.bind(wide_batch_done)?;
         assembler.branch(vector)?;
 
-        assembler.bind(wide_pair_batch)?;
-        assembler.add_reg(X15, X0, X3)?;
-        assembler.add_imm(X8, X15, u16::from(filter.offsets[0]))?;
-        assembler.load_vectors4x128(SPARSE_BLOCK_MASK_BASE_V3, X8)?;
-        assembler.add_imm(X9, X8, SIMD_CANDIDATE_STARTS_V3 * 4)?;
-        assembler.load_vectors4x128(SPARSE_BLOCK_MASK_BASE_V3 + 4, X9)?;
-        for block in 0..SPARSE_SCAN_BLOCKS_V3 {
-            let mask = u8::try_from(u16::from(SPARSE_BLOCK_MASK_BASE_V3) + block)
-                .expect("eight fused primary masks");
-            assembler.compare_equal_bytes16(mask, mask, 20)?;
-        }
-        assembler.add_imm(X8, X15, u16::from(semantic_secondary_offset))?;
-        assembler.add_imm(X9, X8, SIMD_CANDIDATE_STARTS_V3 * 4)?;
-        for (mask_base, base) in [
-            (SPARSE_BLOCK_MASK_BASE_V3, X8),
-            (SPARSE_BLOCK_MASK_BASE_V3 + 4, X9),
-        ] {
-            assembler.load_vectors4x128(0, base)?;
-            for lane in 0_u8..4 {
-                assembler.compare_equal_bytes16(lane, lane, SEMANTIC_SECONDARY_VECTOR_V3)?;
-                assembler.and_bytes16(mask_base + lane, mask_base + lane, lane)?;
+        if let (Some(wide_pair_batch), Some(wide_pair_hit)) = (wide_pair_batch, wide_pair_hit) {
+            assembler.bind(wide_pair_batch)?;
+            assembler.add_reg(X15, X0, X3)?;
+            assembler.add_imm(X8, X15, u16::from(filter.offsets[0]))?;
+            assembler.load_vectors4x128(SPARSE_BLOCK_MASK_BASE_V3, X8)?;
+            assembler.add_imm(X9, X8, SIMD_CANDIDATE_STARTS_V3 * 4)?;
+            assembler.load_vectors4x128(SPARSE_BLOCK_MASK_BASE_V3 + 4, X9)?;
+            for block in 0..SPARSE_SCAN_BLOCKS_V3 {
+                let mask = u8::try_from(u16::from(SPARSE_BLOCK_MASK_BASE_V3) + block)
+                    .expect("eight fused primary masks");
+                assembler.compare_equal_bytes16(mask, mask, 20)?;
             }
-        }
-        assembler.or_bytes16(0, SPARSE_BLOCK_MASK_BASE_V3, SPARSE_BLOCK_MASK_BASE_V3 + 1)?;
-        assembler.or_bytes16(
-            1,
-            SPARSE_BLOCK_MASK_BASE_V3 + 2,
-            SPARSE_BLOCK_MASK_BASE_V3 + 3,
-        )?;
-        assembler.or_bytes16(0, 0, 1)?;
-        assembler.or_bytes16(
-            1,
-            SPARSE_BLOCK_MASK_BASE_V3 + 4,
-            SPARSE_BLOCK_MASK_BASE_V3 + 5,
-        )?;
-        assembler.or_bytes16(0, 0, 1)?;
-        assembler.or_bytes16(
-            1,
-            SPARSE_BLOCK_MASK_BASE_V3 + 6,
-            SPARSE_BLOCK_MASK_BASE_V3 + 7,
-        )?;
-        assembler.or_bytes16(1, 0, 1)?;
-        assembler.unsigned_max_across_bytes16(1, 1)?;
-        assembler.move_vector_byte_to32(X8, 1)?;
-        assembler.cmp_imm64(X8, 0)?;
-        assembler.branch_cond(ConditionV3::NotEqual, wide_pair_hit)?;
-        assembler.add_imm(X3, X3, SPARSE_SCAN_STARTS_V3)?;
-        assembler.branch(vector)?;
+            assembler.add_imm(X8, X15, u16::from(semantic_secondary_offset))?;
+            assembler.add_imm(X9, X8, SIMD_CANDIDATE_STARTS_V3 * 4)?;
+            for (mask_base, base) in [
+                (SPARSE_BLOCK_MASK_BASE_V3, X8),
+                (SPARSE_BLOCK_MASK_BASE_V3 + 4, X9),
+            ] {
+                assembler.load_vectors4x128(0, base)?;
+                for lane in 0_u8..4 {
+                    assembler.compare_equal_bytes16(lane, lane, SEMANTIC_SECONDARY_VECTOR_V3)?;
+                    assembler.and_bytes16(mask_base + lane, mask_base + lane, lane)?;
+                }
+            }
+            assembler.or_bytes16(0, SPARSE_BLOCK_MASK_BASE_V3, SPARSE_BLOCK_MASK_BASE_V3 + 1)?;
+            assembler.or_bytes16(
+                1,
+                SPARSE_BLOCK_MASK_BASE_V3 + 2,
+                SPARSE_BLOCK_MASK_BASE_V3 + 3,
+            )?;
+            assembler.or_bytes16(0, 0, 1)?;
+            assembler.or_bytes16(
+                1,
+                SPARSE_BLOCK_MASK_BASE_V3 + 4,
+                SPARSE_BLOCK_MASK_BASE_V3 + 5,
+            )?;
+            assembler.or_bytes16(0, 0, 1)?;
+            assembler.or_bytes16(
+                1,
+                SPARSE_BLOCK_MASK_BASE_V3 + 6,
+                SPARSE_BLOCK_MASK_BASE_V3 + 7,
+            )?;
+            assembler.or_bytes16(1, 0, 1)?;
+            assembler.unsigned_max_across_bytes16(1, 1)?;
+            assembler.move_vector_byte_to32(X8, 1)?;
+            assembler.cmp_imm64(X8, 0)?;
+            assembler.branch_cond(ConditionV3::NotEqual, wide_pair_hit)?;
+            assembler.add_imm(X3, X3, SPARSE_SCAN_STARTS_V3)?;
+            assembler.branch(vector)?;
 
-        assembler.bind(wide_pair_hit)?;
-        for index in 0..usize::from(filter.len).min(2) {
-            assembler.dup_byte16(vector_registers[index], value_registers[index])?;
-        }
-        // The fused scan retained exact primary+endpoint masks for the
-        // current 128 starts. Consume its current 16-start block through the
-        // shared forward candidate loop instead of entering the sparse
-        // scanner, whose normal entry has already consumed that block. An
-        // empty or exhausted mask advances 16 starts before returning to the
-        // vector loop; a match resumes at its non-overlapping successor.
-        assembler.mov_imm64_minimal(X16, 0)?;
-        assembler.add_reg(X15, X0, X3)?;
-        for index in 1..usize::from(filter.len) {
-            if filter.offsets[index] == semantic_secondary_offset {
-                continue;
+            assembler.bind(wide_pair_hit)?;
+            for index in 0..usize::from(filter.len).min(2) {
+                assembler.dup_byte16(vector_registers[index], value_registers[index])?;
             }
-            assembler.add_imm(X8, X15, u16::from(filter.offsets[index]))?;
-            assembler.load_vector128(0, X8)?;
-            assembler.compare_equal_bytes16(0, 0, vector_registers[index])?;
-            assembler.and_bytes16(SPARSE_BLOCK_MASK_BASE_V3, SPARSE_BLOCK_MASK_BASE_V3, 0)?;
+            // The fused scan retained exact primary+endpoint masks for the
+            // current 128 starts. Consume its current 16-start block through
+            // the shared forward candidate loop instead of entering the
+            // sparse scanner, whose normal entry has already consumed that
+            // block.
+            assembler.mov_imm64_minimal(X16, 0)?;
+            assembler.add_reg(X15, X0, X3)?;
+            for index in 1..usize::from(filter.len) {
+                if filter.offsets[index] == semantic_secondary_offset {
+                    continue;
+                }
+                assembler.add_imm(X8, X15, u16::from(filter.offsets[index]))?;
+                assembler.load_vector128(0, X8)?;
+                assembler.compare_equal_bytes16(0, 0, vector_registers[index])?;
+                assembler.and_bytes16(SPARSE_BLOCK_MASK_BASE_V3, SPARSE_BLOCK_MASK_BASE_V3, 0)?;
+            }
+            assembler.or_bytes16(0, SPARSE_BLOCK_MASK_BASE_V3, SPARSE_BLOCK_MASK_BASE_V3)?;
+            assembler.shrink_narrow_bytes_from_halfwords(0, 0, 4)?;
+            assembler.move_vector_double_to64(X6, 0)?;
+            assembler.and_reg(X6, X6, X17)?;
+            assembler.cmp_imm64(X6, 0)?;
+            assembler.branch_cond(ConditionV3::NotEqual, candidate)?;
+            assembler.add_imm(X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
+            assembler.branch(vector)?;
         }
-        assembler.or_bytes16(0, SPARSE_BLOCK_MASK_BASE_V3, SPARSE_BLOCK_MASK_BASE_V3)?;
-        assembler.shrink_narrow_bytes_from_halfwords(0, 0, 4)?;
-        assembler.move_vector_double_to64(X6, 0)?;
-        assembler.and_reg(X6, X6, X17)?;
-        assembler.cmp_imm64(X6, 0)?;
-        assembler.branch_cond(ConditionV3::NotEqual, candidate)?;
-        assembler.add_imm(X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
-        assembler.branch(vector)?;
 
         assembler.bind(wide_batch_empty)?;
         assembler.add_imm(X3, X3, SPARSE_SCAN_STARTS_V3)?;

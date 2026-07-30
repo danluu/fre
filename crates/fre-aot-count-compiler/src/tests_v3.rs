@@ -284,7 +284,8 @@ fn fused_pair_promotion_preserves_current_block_and_nonoverlap() {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    const CASES: usize = 24;
+    const STATIC_WIDE_CASES: usize = 16;
+    const CASES: usize = STATIC_WIDE_CASES + 24;
     const PROMOTION_BATCHES: usize = 8;
     const BATCH_STARTS: usize = 128;
     const PROMOTED_START: usize = PROMOTION_BATCHES * BATCH_STARTS;
@@ -336,7 +337,11 @@ fn fused_pair_promotion_preserves_current_block_and_nonoverlap() {
     let mut object_paths = Vec::with_capacity(CASES);
 
     for case_index in 0..CASES {
-        let width = 9 + case_index;
+        let width = if case_index < STATIC_WIDE_CASES {
+            5
+        } else {
+            9 + case_index - STATIC_WIDE_CASES
+        };
         let literal: Vec<u8> = (0..width)
             .map(|index| {
                 let value = (index * 37 + case_index * 53) % 251;
@@ -384,10 +389,11 @@ fn fused_pair_promotion_preserves_current_block_and_nonoverlap() {
             .expect("literal leaves a filler byte");
         haystack[..PROMOTED_START + width + 32].fill(filler);
 
-        // Eight primary-positive, endpoint-empty batches force the general
-        // sustained-signal promotion without depending on the stricter
-        // all-eight-block shortcut. Keeping the sole primary in each batch's
-        // first block also avoids any look-ahead overlap with the next batch.
+        // For the adaptive cases, eight primary-positive, endpoint-empty
+        // batches force sustained-signal promotion without the stricter
+        // all-eight-block shortcut. The width-five Apple cases statically
+        // omit that graph and exercise all 16 input alignments over the same
+        // prefix.
         for batch in 0..PROMOTION_BATCHES {
             let start = batch * BATCH_STARTS;
             haystack[start + primary_offset] = literal[primary_offset];
