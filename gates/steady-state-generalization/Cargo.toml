@@ -1,0 +1,22 @@
+[package]
+name = "fre-steady-state-generalization"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[features]
+default = []
+static-dispatch-arm-41-d84 = ["fre/static-dispatch-arm-41-d84"]
+
+[dependencies]
+fre = { path = "../../crates/fre" }
+regex-automata = "=0.4.14"
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.150"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"

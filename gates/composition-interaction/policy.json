@@ -1,0 +1,64 @@
+{
+  "schema": "fre.composition-interaction-gate.policy.v1",
+  "intent": "Candidate-blind composition and interaction gate over broad public steady-state operations.",
+  "source_blind": {
+    "accepted_cursor_commit": "a48a2f4439747a230c230a3b7815467d4c8435aa",
+    "accepted_cursor_tree": "371a48a30691f6bc443c21d0b785926b835bf5b6",
+    "forbidden_inputs": [
+      "cursor-plus-nullable composition source",
+      "nullable candidate source",
+      "self-loop candidate source",
+      "prior nullable or self-loop gate corpora",
+      "Rebar",
+      "final holdout"
+    ]
+  },
+  "timing": {
+    "repetitions": 4,
+    "schedule_seed": 15138664749778706691,
+    "max_workers": 96,
+    "one_process_per_point": true,
+    "no_retries": true,
+    "no_exclusions": true,
+    "no_affinity": true,
+    "no_cgroups": true,
+    "primary_excludes_transition": true
+  },
+  "candidate_over_base": {
+    "primary_geomean_min": 1.015,
+    "primary_p10_min": 0.97,
+    "primary_worst_min": 0.75,
+    "steady_cohort_geomean_min": 0.97,
+    "family_geomean_min": 0.97,
+    "native_control_geomean_min": 0.985,
+    "transition_geomean_min": 0.9
+  },
+  "rust_relative": {
+    "overall_comparable_geomean_min": 1.0,
+    "candidate_vs_base_ratio_min_by_cohort": 0.985,
+    "absolute_geomean_min_by_cohort": {
+      "byte-direct": 0.85,
+      "byte-cursor": 0.85,
+      "byte-endpoint-session": 0.9,
+      "byte-bidirectional-session": 0.9,
+      "byte-iterator": 0.65,
+      "text-direct": 0.8,
+      "text-cursor": 0.8,
+      "text-iterator": 0.65
+    },
+    "rust_control_candidate_over_base_min": 0.97,
+    "rust_control_candidate_over_base_max": 1.03
+  },
+  "receipts": {
+    "semantic_exact_match": true,
+    "finite_schedule_exact_match": true,
+    "candidate_setup_total_over_base_max": 1.2,
+    "required_schedules": [
+      "default finite",
+      "exact finite",
+      "unlimited",
+      "one-below refusal",
+      "recovery after refusal"
+    ]
+  }
+}
