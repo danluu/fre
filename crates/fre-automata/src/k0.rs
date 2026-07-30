@@ -1,8 +1,8 @@
 use core::{fmt, mem::size_of};
 
 use fre_simd_kernels::{
-    AsciiByteSet, AsciiByteSetClassifier, ByteSet256, ByteSetClassifier, ASCII_NARROW_BYTES,
-    ASCII_WIDE_BYTES, BYTE_SET_BLOCK_BYTES,
+    classify_byte_delta_16, AsciiByteSet, AsciiByteSetClassifier, ByteSet256, ByteSetClassifier,
+    ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, BYTE_SET_BLOCK_BYTES,
 };
 use memchr::{memchr, memchr2, memchr3};
 
@@ -12,9 +12,10 @@ use crate::{
         StartFilterProof, StartFilterProofCell, StartFilterPublication, StartPositionClass,
         StartPositionScanner, StartScanner, BYTE_START_ASCII_CLASSIFIER_SELECTION_WORK,
         BYTE_START_BITMAP_POPULATION_WORK, BYTE_START_MEMBER_EXTRACTION_WORK,
-        BYTE_START_SET_CLASSIFIER_BUILD_WORK, BYTE_START_SMALL_MAX_MEMBERS,
-        START_FILTER_GUARD_MAX_CARDINALITY, START_FILTER_GUARD_SELECTION_WORK,
-        START_FILTER_POSITION_COUNT, START_FILTER_SCANNER_SELECTION_WORK,
+        BYTE_START_RANGE_DETECTION_WORK, BYTE_START_SET_CLASSIFIER_BUILD_WORK,
+        BYTE_START_SMALL_MAX_MEMBERS, START_FILTER_GUARD_MAX_CARDINALITY,
+        START_FILTER_GUARD_SELECTION_WORK, START_FILTER_POSITION_COUNT,
+        START_FILTER_SCANNER_SELECTION_WORK,
     },
     Automaton, EdgeKind, MatchSpan, OutputContract, ResourceKind, SearchAccounting, SearchError,
     SearchLimits, SearchWindow, SetupAccounting, StateRole, UnicodeLookMatcher,
@@ -2879,27 +2880,46 @@ fn execute_context_lazy_loop(
         contract,
         OutputContract::Exists | OutputContract::EarliestEnd
     );
-    let initial_mask = enabled_assertion_mask(automaton, haystack, window.start(), meter)?;
+    let mut position = window.start();
+    let mut boundaries = 0usize;
+    let mut initial_candidate_scanned = false;
+    if let Some(scanner) = scanner {
+        // An absolute-start branch may contribute only at original haystack
+        // boundary zero. Otherwise the proven scanner can establish the first
+        // viable root before contextual initialization, avoiding construction
+        // of an initial state that would be discarded immediately.
+        if !(force_haystack_start && position == 0) {
+            position =
+                next_start_candidate(scanner, haystack, position, window.end(), guard, meter)?;
+            if position == window.end() {
+                return Ok(Some((None, boundaries)));
+            }
+            initial_candidate_scanned = true;
+        }
+    }
+    let initial_mask = enabled_assertion_mask(automaton, haystack, position, meter)?;
     let Some((mut state, mut restartable)) = context_lazy_initial(
         automaton,
         initial_mask,
         workspace,
         meter,
         core_reserve,
-        window.start(),
+        position,
     )?
     else {
         return Ok(None);
     };
     workspace.lazy.initialized = true;
 
-    let mut position = window.start();
-    let mut boundaries = 0usize;
     let mut pending_end = None;
     let mut entered = false;
 
     loop {
-        if pending_end.is_none() && restartable && !(force_haystack_start && position == 0) {
+        if (!initial_candidate_scanned || entered)
+            && pending_end.is_none()
+            && restartable
+            && !(force_haystack_start && position == 0)
+        {
             let candidate = if let Some(scanner) = scanner {
                 next_start_candidate(scanner, haystack, position, window.end(), guard, meter)?
             } else {
@@ -3820,10 +3840,11 @@ fn contextual_execution_work_upper(
                 computation: "contextual assertion-symbol work",
             })?;
 
-    // One initial symbol is always evaluated. Every later symbol is either a
-    // consumed transition or an initial-state rebuild after a scanner jump.
-    // A rebuild skips at least one byte, so those disjoint progress counts sum
-    // to at most the input length.
+    // Reserve one initial symbol for every candidate-bearing execution, even
+    // though a scanner miss returns before evaluating one. Every later symbol
+    // is either a consumed transition or an initial-state rebuild after a
+    // scanner jump. A rebuild skips at least one byte, so those disjoint
+    // progress counts sum to at most the input length.
     let forward_symbols = input
         .checked_add(1)
         .ok_or(SearchError::ArithmeticOverflow {
@@ -5238,6 +5259,14 @@ fn build_byte_start_scanner(
         });
     }
 
+    meter.charge(
+        u64::try_from(BYTE_START_RANGE_DETECTION_WORK).expect("range detection work fits u64"),
+        position,
+    )?;
+    if let Some((start, end)) = inclusive_byte_range(set, cardinality) {
+        return Ok(StartScanner::Range { start, end });
+    }
+
     if let Some(ascii) = ascii_start_set(set) {
         meter.charge(
             u64::try_from(BYTE_START_ASCII_CLASSIFIER_SELECTION_WORK)
@@ -5256,6 +5285,34 @@ fn build_byte_start_scanner(
         position,
     )?;
     Ok(StartScanner::Set(build_full_byte_start_classifier(set)))
+}
+
+fn inclusive_byte_range(set: ByteSet, cardinality: u32) -> Option<(u8, u8)> {
+    debug_assert_eq!(set.cardinality(), cardinality);
+    let words = set.words();
+    let mut first_word = None;
+    let mut last_word = None;
+    for (index, word) in words.into_iter().enumerate() {
+        if word != 0 {
+            first_word.get_or_insert(index);
+            last_word = Some(index);
+        }
+    }
+    let first_word = first_word?;
+    let last_word = last_word?;
+    let word_bits = usize::try_from(u64::BITS).ok()?;
+    let first_bit = usize::try_from(words[first_word].trailing_zeros()).ok()?;
+    let last_bit = u64::BITS
+        .checked_sub(1)?
+        .checked_sub(words[last_word].leading_zeros())
+        .and_then(|bit| usize::try_from(bit).ok())?;
+    let start = first_word.checked_mul(word_bits)?.checked_add(first_bit)?;
+    let end = last_word.checked_mul(word_bits)?.checked_add(last_bit)?;
+    let span = end.checked_sub(start)?.checked_add(1)?;
+    if u32::try_from(span).ok()? != cardinality {
+        return None;
+    }
+    Some((u8::try_from(start).ok()?, u8::try_from(end).ok()?))
 }
 
 fn ascii_start_set(set: ByteSet) -> Option<AsciiByteSet> {
@@ -5364,6 +5421,10 @@ fn next_scanner_candidate(
                 memchr3(*first, *second, *third, source)
             })
         }
+        StartScanner::Range {
+            start,
+            end: range_end,
+        } => next_range_start_candidate(*start, *range_end, haystack, position, end, meter),
         StartScanner::AsciiSet { classifier, .. } => {
             next_ascii_start_candidate(classifier.classifier(), haystack, position, end, meter)
         }
@@ -5400,12 +5461,11 @@ fn next_small_start_candidate(
         })
         .transpose()?
         .unwrap_or(admitted);
-    meter.charge(
+    let scanned_work =
         u64::try_from(scanned).map_err(|_| SearchError::ArithmeticOverflow {
             computation: "small start-scanner work",
-        })?,
-        position,
-    )?;
+        })?;
+    meter.charge_admitted(scanned_work);
 
     if let Some(relative) = relative {
         return position
@@ -5428,6 +5488,80 @@ fn next_small_start_candidate(
     Err(SearchError::InternalInvariant {
         detail: "start scanner admitted progress beyond the work limit",
     })
+}
+
+fn next_range_start_candidate(
+    start: u8,
+    range_end: u8,
+    haystack: &[u8],
+    mut position: usize,
+    end: usize,
+    meter: &mut WorkMeter,
+) -> Result<usize, SearchError> {
+    debug_assert!(start <= range_end);
+    let width = range_end.wrapping_sub(start);
+
+    // Nearby candidates are cheaper as direct comparisons, and a guard that
+    // rejects one candidate can re-enter at the following byte without
+    // repeatedly classifying an overlapping fixed-width block.
+    let scalar_prefix_end = position.saturating_add(BYTE_SET_BLOCK_BYTES).min(end);
+    while position < scalar_prefix_end {
+        meter.charge(1, position)?;
+        if haystack[position].wrapping_sub(start) <= width {
+            return Ok(position);
+        }
+        position = position
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "scalar start-range prefix position",
+            })?;
+    }
+
+    // Charge a complete logical block before its first source read. A match
+    // in any lane therefore has the same hard-limit threshold as the broad
+    // full-byte classifier it replaces.
+    let block_work = u64::try_from(BYTE_SET_BLOCK_BYTES).expect("range block width fits in u64");
+    while end.saturating_sub(position) >= BYTE_SET_BLOCK_BYTES && meter.remaining() >= block_work {
+        meter.charge_admitted(block_work);
+        let block_end =
+            position
+                .checked_add(BYTE_SET_BLOCK_BYTES)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "start-range block end",
+                })?;
+        let block: &[u8; BYTE_SET_BLOCK_BYTES] = haystack
+            .get(position..block_end)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "start-range scanner exceeded the validated search window",
+            })?
+            .try_into()
+            .expect("checked start-range block extent");
+        let members =
+            classify_byte_delta_16(start, range_end.wrapping_sub(start), block).member_mask();
+        if members != 0 {
+            let offset = usize::try_from(members.trailing_zeros())
+                .expect("a start-range lane fits in usize");
+            return position
+                .checked_add(offset)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "start-range candidate",
+                });
+        }
+        position = block_end;
+    }
+
+    while position < end {
+        meter.charge(1, position)?;
+        if haystack[position].wrapping_sub(start) <= width {
+            return Ok(position);
+        }
+        position = position
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "scalar start-range position",
+            })?;
+    }
+    Ok(end)
 }
 
 fn next_set_start_candidate(
@@ -5460,7 +5594,7 @@ fn next_set_start_candidate(
     let block_work =
         u64::try_from(BYTE_SET_BLOCK_BYTES).expect("classifier block width fits in u64");
     while end.saturating_sub(position) >= BYTE_SET_BLOCK_BYTES && meter.remaining() >= block_work {
-        meter.charge(block_work, position)?;
+        meter.charge_admitted(block_work);
         let block_end =
             position
                 .checked_add(BYTE_SET_BLOCK_BYTES)
@@ -5512,10 +5646,9 @@ fn next_ascii_start_candidate(
     while end.saturating_sub(position) >= ASCII_WIDE_BYTES
         && meter.remaining() >= u64::try_from(ASCII_WIDE_BYTES).expect("classifier width fits u64")
     {
-        meter.charge(
+        meter.charge_admitted(
             u64::try_from(ASCII_WIDE_BYTES).expect("classifier width fits u64"),
-            position,
-        )?;
+        );
         let block_end =
             position
                 .checked_add(ASCII_WIDE_BYTES)
@@ -5541,10 +5674,9 @@ fn next_ascii_start_candidate(
         && meter.remaining()
             >= u64::try_from(ASCII_NARROW_BYTES).expect("classifier width fits u64")
     {
-        meter.charge(
+        meter.charge_admitted(
             u64::try_from(ASCII_NARROW_BYTES).expect("classifier width fits u64"),
-            position,
-        )?;
+        );
         let block_end =
             position
                 .checked_add(ASCII_NARROW_BYTES)
@@ -6613,22 +6745,23 @@ mod tests {
     };
 
     use super::{
-        scratch_bytes, ContextTransitionSlot, WorkMeter, ASCII_NARROW_BYTES, ASCII_WIDE_BYTES,
-        CONTEXT_INITIAL_SOURCE, INVOCATION_RESET_WORK,
+        classify_byte_delta_16, scratch_bytes, ContextTransitionSlot, WorkMeter,
+        ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, CONTEXT_INITIAL_SOURCE, INVOCATION_RESET_WORK,
     };
     use crate::{
         plan::{
             ByteSet, StartFilterProof, StartFilterProofCell, StartPositionClass,
             StartPositionScanner, StartScanner, BYTE_START_ASCII_CLASSIFIER_SELECTION_WORK,
             BYTE_START_BITMAP_POPULATION_WORK, BYTE_START_MEMBER_EXTRACTION_WORK,
-            BYTE_START_SET_CLASSIFIER_BUILD_WORK, BYTE_START_SMALL_MAX_MEMBERS,
-            START_FILTER_GUARD_MAX_CARDINALITY, START_FILTER_GUARD_SELECTION_WORK,
-            START_FILTER_MAX_OFFSET, START_FILTER_MAX_SELECTION_WORK, START_FILTER_POSITION_COUNT,
+            BYTE_START_RANGE_DETECTION_WORK, BYTE_START_SET_CLASSIFIER_BUILD_WORK,
+            BYTE_START_SMALL_MAX_MEMBERS, START_FILTER_GUARD_MAX_CARDINALITY,
+            START_FILTER_GUARD_SELECTION_WORK, START_FILTER_MAX_OFFSET,
+            START_FILTER_MAX_SELECTION_WORK, START_FILTER_POSITION_COUNT,
             START_FILTER_SCANNER_SELECTION_WORK,
         },
         Automaton, CompileLimits, EarliestEnd, EdgeKind, Exists, K0SearchSession, K0Workspace,
-        MatchSpan, RawPlan, ResourceKind, SearchError, SearchLimits, SearchWindow, SelectedEnd,
-        Span, StateRole, WorkspaceLimits,
+        MatchSpan, OutputContract, RawPlan, ResourceKind, SearchError, SearchLimits, SearchWindow,
+        SelectedEnd, Span, StateRole, WorkspaceLimits,
     };
 
     fn ascii_literal(byte: u8) -> Automaton {
@@ -6972,6 +7105,34 @@ mod tests {
                 edge_kinds: vec![EdgeKind::AssertLineStartLf, EdgeKind::ByteRange],
                 byte_starts: vec![0, b'a'],
                 byte_ends: vec![0, b'a'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn digit_slash_then_line_end_or_bang() -> Automaton {
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 1, 2, 4, 5, 5],
+                edge_targets: vec![1, 2, 4, 3, 4],
+                edge_kinds: vec![
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::AssertLineEndLf,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                ],
+                byte_starts: vec![b'0', b'/', 0, 0, b'!'],
+                byte_ends: vec![b'9', b'/', 0, 0, b'!'],
             },
             CompileLimits::default(),
         )
@@ -8263,15 +8424,25 @@ mod tests {
     }
 
     fn expected_scanner_construction_work(bytes: &[u8]) -> u64 {
-        let construction = if bytes.len() <= BYTE_START_SMALL_MAX_MEMBERS {
-            bytes
-                .len()
+        let set = byte_set(bytes);
+        let cardinality = usize::try_from(set.cardinality()).unwrap();
+        let construction = if cardinality <= BYTE_START_SMALL_MAX_MEMBERS {
+            cardinality
                 .checked_mul(BYTE_START_MEMBER_EXTRACTION_WORK)
                 .unwrap()
-        } else if bytes.iter().all(u8::is_ascii) {
-            BYTE_START_ASCII_CLASSIFIER_SELECTION_WORK
         } else {
-            BYTE_START_SET_CLASSIFIER_BUILD_WORK
+            let fallback = if super::inclusive_byte_range(set, u32::try_from(cardinality).unwrap())
+                .is_some()
+            {
+                0
+            } else if bytes.iter().all(u8::is_ascii) {
+                BYTE_START_ASCII_CLASSIFIER_SELECTION_WORK
+            } else {
+                BYTE_START_SET_CLASSIFIER_BUILD_WORK
+            };
+            BYTE_START_RANGE_DETECTION_WORK
+                .checked_add(fallback)
+                .unwrap()
         };
         u64::try_from(construction).unwrap()
     }
@@ -8408,10 +8579,11 @@ mod tests {
                     .checked_mul(START_FILTER_GUARD_SELECTION_WORK)
                     .and_then(|guards| work.checked_add(guards))
             })
+            .and_then(|work| work.checked_add(BYTE_START_RANGE_DETECTION_WORK))
             .and_then(|work| work.checked_add(BYTE_START_SET_CLASSIFIER_BUILD_WORK))
             .unwrap();
         assert_eq!(START_FILTER_MAX_SELECTION_WORK, expected_selection_work);
-        assert_eq!(START_FILTER_MAX_SELECTION_WORK, 352);
+        assert_eq!(START_FILTER_MAX_SELECTION_WORK, 356);
 
         // All exact-position sets remain a transient cold stack value. The
         // immutable owner still retains only its selected scanner and guard.
@@ -8486,23 +8658,32 @@ mod tests {
 
             let mut one_below = WorkMeter::new(expected.checked_sub(1).unwrap(), 0);
             let error = super::byte_start_scanner(byte_set(bytes), &mut one_below, 17).unwrap_err();
-            let expected_tail = if bytes.is_empty() {
+            let set = byte_set(bytes);
+            let cardinality = usize::try_from(set.cardinality()).unwrap();
+            let range = (cardinality > BYTE_START_SMALL_MAX_MEMBERS)
+                .then(|| super::inclusive_byte_range(set, u32::try_from(cardinality).unwrap()))
+                .flatten();
+            let expected_tail = if cardinality == 0 {
                 u64::try_from(BYTE_START_BITMAP_POPULATION_WORK).unwrap()
-            } else if bytes.len() <= BYTE_START_SMALL_MAX_MEMBERS {
+            } else if cardinality <= BYTE_START_SMALL_MAX_MEMBERS {
                 u64::try_from(
-                    bytes
-                        .len()
+                    cardinality
                         .checked_mul(BYTE_START_MEMBER_EXTRACTION_WORK)
                         .unwrap(),
                 )
                 .unwrap()
+            } else if range.is_some() {
+                u64::try_from(BYTE_START_RANGE_DETECTION_WORK).unwrap()
             } else if bytes.iter().all(u8::is_ascii) {
                 u64::try_from(BYTE_START_ASCII_CLASSIFIER_SELECTION_WORK).unwrap()
             } else {
                 u64::try_from(BYTE_START_SET_CLASSIFIER_BUILD_WORK).unwrap()
             };
-            let expected_consumed = if bytes.is_empty() {
+            let expected_consumed = if cardinality == 0 {
                 0
+            } else if cardinality > BYTE_START_SMALL_MAX_MEMBERS && range.is_none() {
+                u64::try_from(BYTE_START_BITMAP_POPULATION_WORK + BYTE_START_RANGE_DETECTION_WORK)
+                    .unwrap()
             } else {
                 u64::try_from(BYTE_START_BITMAP_POPULATION_WORK).unwrap()
             };
@@ -8516,6 +8697,481 @@ mod tests {
                 } if consumed == expected_consumed && requested == expected_tail
             ));
         }
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the candidate-first differential keeps the proven scanner inputs explicit"
+    )]
+    fn assert_context_candidate_first_case(
+        name: &str,
+        plan: &Automaton,
+        haystack: &[u8],
+        window: SearchWindow,
+        scanner: &StartPositionScanner,
+        guard: Option<&StartPositionClass>,
+        force_haystack_start: bool,
+    ) {
+        let mut reference = K0Workspace::new(plan, WorkspaceLimits::unlimited()).unwrap();
+        let expected = plan
+            .prepare::<EarliestEnd>()
+            .search_window_with_workspace(
+                haystack,
+                window,
+                &mut reference,
+                SearchLimits::unlimited(),
+            )
+            .unwrap()
+            .into_output();
+
+        for limits in [SearchLimits::default(), SearchLimits::unlimited()] {
+            let mut accelerated =
+                K0Workspace::new_accelerated(plan, WorkspaceLimits::unlimited()).unwrap();
+            let actual = plan
+                .prepare::<EarliestEnd>()
+                .search_window_with_workspace(haystack, window, &mut accelerated, limits)
+                .unwrap()
+                .into_output();
+            assert_eq!(
+                actual, expected,
+                "{name}: public contextual result source={haystack:?} window={window:?}"
+            );
+        }
+
+        let run = |limit| {
+            let mut workspace =
+                K0Workspace::new_accelerated(plan, WorkspaceLimits::unlimited()).unwrap();
+            let mut meter = WorkMeter::new(limit, 0);
+            let result = super::execute_context_lazy_loop(
+                plan,
+                haystack,
+                window,
+                &mut workspace,
+                &mut meter,
+                OutputContract::EarliestEnd,
+                0,
+                Some(scanner),
+                guard,
+                force_haystack_start,
+                false,
+            );
+            (result, meter.consumed, workspace.lazy.initialized)
+        };
+
+        let expected_initialized = if force_haystack_start && window.start() == 0 {
+            true
+        } else {
+            let mut meter = WorkMeter::new(u64::MAX, 0);
+            super::next_start_candidate(
+                scanner,
+                haystack,
+                window.start(),
+                window.end(),
+                guard,
+                &mut meter,
+            )
+            .unwrap()
+                != window.end()
+        };
+        let (unlimited, unlimited_work, initialized) = run(u64::MAX);
+        let unlimited = unlimited
+            .unwrap()
+            .expect("the allocated contextual executor must accept the plan");
+        assert_eq!(
+            unlimited.0.map(MatchSpan::end),
+            expected,
+            "{name}: direct unlimited result source={haystack:?} window={window:?}"
+        );
+        assert_eq!(
+            initialized, expected_initialized,
+            "{name}: a scanner miss must return before contextual initialization"
+        );
+        assert!(
+            unlimited_work > 0,
+            "{name}: the scanner must charge actual work"
+        );
+
+        // Unlimited execution may spend optional work publishing reusable
+        // states. Find the exact finite allowance for the same result so the
+        // boundary below tests mandatory work rather than optional learning.
+        let exact_work = (0..=unlimited_work)
+            .find(|&limit| {
+                matches!(
+                    run(limit).0,
+                    Ok(Some(result)) if result == unlimited
+                )
+            })
+            .expect("unlimited actual work must admit an equivalent finite execution");
+        let (exact, consumed, exact_initialized) = run(exact_work);
+        assert_eq!(
+            exact.unwrap(),
+            Some(unlimited),
+            "{name}: exact-work execution changed its result"
+        );
+        assert_eq!(consumed, exact_work, "{name}: exact work was not consumed");
+        assert_eq!(exact_initialized, initialized);
+
+        let one_below = exact_work.checked_sub(1).unwrap();
+        let (error, consumed, _) = run(one_below);
+        let SearchError::WorkLimitExceeded {
+            limit,
+            consumed: reported,
+            requested,
+            position,
+        } = error.expect_err("one-below work must fail")
+        else {
+            panic!("{name}: one-below returned the wrong error");
+        };
+        assert_eq!(limit, one_below);
+        assert_eq!(reported, consumed);
+        assert!(reported.checked_add(requested).unwrap() > limit);
+        assert!(
+            (window.start()..=window.end()).contains(&position),
+            "{name}: failure position escaped the search window"
+        );
+    }
+
+    #[test]
+    fn contextual_candidate_first_is_differential_for_line_modes_bytes_and_windows() {
+        let mut haystacks = bounded_words(&[b'a', b'x', b'!', b'\r', b'\n', 0x80, 0xff], 3);
+        haystacks.extend([
+            b"a\n".to_vec(),
+            b"xxa\n".to_vec(),
+            b"a\r\n".to_vec(),
+            b"xxa\r\n".to_vec(),
+            vec![0xf0, 0x28, 0x8c, 0xbc, b'a', b'\n', 0xff],
+            vec![0xff, b'x', b'a', b'\r', b'\n', 0x80],
+        ]);
+        for kind in [EdgeKind::AssertLineEndLf, EdgeKind::AssertLineEndCrlf] {
+            let plan = trailing_assertion_or_bang(kind);
+            assert_contextual_all_contracts(&plan, &haystacks);
+            let proof = plan
+                .start_filter_proof
+                .get()
+                .expect("exhaustive contextual search publishes its start proof");
+            assert!(!proof.force_haystack_start);
+            assert!(proof.guard.is_none());
+            assert!(matches!(
+                proof.scanner,
+                Some(StartPositionScanner {
+                    offset: 0,
+                    scanner: StartScanner::One(b'a'),
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn contextual_candidate_first_work_limits_are_exact() {
+        let scanner = StartPositionScanner {
+            offset: 0,
+            scanner: StartScanner::One(b'a'),
+        };
+        let cases: &[(&str, EdgeKind, &[u8], SearchWindow)] = &[
+            (
+                "lf-candidate-zero",
+                EdgeKind::AssertLineEndLf,
+                b"a\n",
+                SearchWindow::new(0, 2),
+            ),
+            (
+                "lf-candidate-interior",
+                EdgeKind::AssertLineEndLf,
+                b"xxa\n",
+                SearchWindow::new(0, 4),
+            ),
+            (
+                "lf-no-candidate",
+                EdgeKind::AssertLineEndLf,
+                b"xxxx",
+                SearchWindow::new(0, 4),
+            ),
+            (
+                "lf-nonzero-window",
+                EdgeKind::AssertLineEndLf,
+                b"za\nx",
+                SearchWindow::new(1, 3),
+            ),
+            (
+                "crlf-candidate-zero",
+                EdgeKind::AssertLineEndCrlf,
+                b"a\r\n",
+                SearchWindow::new(0, 3),
+            ),
+            (
+                "crlf-candidate-interior",
+                EdgeKind::AssertLineEndCrlf,
+                b"xxa\r\n",
+                SearchWindow::new(0, 5),
+            ),
+            (
+                "invalid-utf8-window",
+                EdgeKind::AssertLineEndLf,
+                &[0xf0, 0x28, 0x8c, 0xbc, b'a', b'\n', 0xff],
+                SearchWindow::new(1, 6),
+            ),
+            (
+                "high-byte-window",
+                EdgeKind::AssertLineEndCrlf,
+                &[0xff, b'x', b'a', b'\r', b'\n', 0x80],
+                SearchWindow::new(1, 5),
+            ),
+        ];
+        for &(name, kind, haystack, window) in cases {
+            let plan = trailing_assertion_or_bang(kind);
+            assert_context_candidate_first_case(
+                name, &plan, haystack, window, &scanner, None, false,
+            );
+        }
+    }
+
+    #[test]
+    fn contextual_candidate_first_preserves_absolute_start_priority() {
+        let scanner = StartPositionScanner {
+            offset: 0,
+            scanner: StartScanner::One(b':'),
+        };
+        let guard = StartPositionClass {
+            offset: 1,
+            set: byte_set(b"a"),
+        };
+        let cases: &[(&str, &[u8], SearchWindow)] = &[
+            (
+                "absolute-high-byte-at-zero",
+                b"\xff:a",
+                SearchWindow::new(0, 3),
+            ),
+            (
+                "absolute-high-byte-nonzero-window",
+                b"x\xff:a",
+                SearchWindow::new(1, 4),
+            ),
+            (
+                "absolute-sibling-interior",
+                b"xx:a",
+                SearchWindow::new(1, 4),
+            ),
+            ("absolute-no-sibling", b"x\xffxx", SearchWindow::new(1, 4)),
+        ];
+        for &(name, haystack, window) in cases {
+            let plan = absolute_high_byte_or_colon_a();
+            assert_context_candidate_first_case(
+                name,
+                &plan,
+                haystack,
+                window,
+                &scanner,
+                Some(&guard),
+                true,
+            );
+        }
+    }
+
+    #[test]
+    fn contextual_candidate_first_misses_preserve_work_boundaries_and_cache_state() {
+        let plan = trailing_assertion_or_bang(EdgeKind::AssertLineEndLf);
+        let scanner = StartPositionScanner {
+            offset: 0,
+            scanner: StartScanner::One(b'a'),
+        };
+        let run = |workspace: &mut K0Workspace, haystack: &[u8]| {
+            let mut meter = WorkMeter::new(u64::MAX, 0);
+            let result = super::execute_context_lazy_loop(
+                &plan,
+                haystack,
+                SearchWindow::full(haystack),
+                workspace,
+                &mut meter,
+                OutputContract::EarliestEnd,
+                0,
+                Some(&scanner),
+                None,
+                false,
+                false,
+            )
+            .unwrap()
+            .unwrap();
+            (result, meter.consumed)
+        };
+
+        let mut cold_miss =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        assert_eq!(run(&mut cold_miss, b"xxxx"), ((None, 0), 4));
+        assert!(!cold_miss.lazy.initialized);
+        assert_eq!(cold_miss.lazy.state_len, 0);
+        assert_eq!(cold_miss.lazy.item_len, 0);
+        assert_eq!(cold_miss.lazy.context.occupied_slots(), 0);
+
+        let mut warm = K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let (cold_result, cold_work) = run(&mut warm, b"a\n");
+        assert_eq!(cold_result, (Some(MatchSpan::new(0, 1)), 2));
+        assert!(warm.lazy.initialized);
+        assert!(warm.lazy.state_len > 0);
+        assert!(warm.lazy.item_len > 0);
+        let warm_state_len = warm.lazy.state_len;
+        let warm_item_len = warm.lazy.item_len;
+        let warm_slots = warm.lazy.context.occupied_slots();
+        assert!(warm_slots > 0);
+
+        let (cached_result, cached_work) = run(&mut warm, b"a\n");
+        assert_eq!(cached_result, cold_result);
+        assert!(
+            cached_work < cold_work,
+            "the second contextual execution must use its retained cache"
+        );
+        assert_eq!(warm.lazy.state_len, warm_state_len);
+        assert_eq!(warm.lazy.item_len, warm_item_len);
+        assert_eq!(warm.lazy.context.occupied_slots(), warm_slots);
+
+        assert_eq!(run(&mut warm, b"xxxx"), ((None, 0), 4));
+        assert_eq!(warm.lazy.state_len, warm_state_len);
+        assert_eq!(warm.lazy.item_len, warm_item_len);
+        assert_eq!(warm.lazy.context.occupied_slots(), warm_slots);
+
+        let no_scanner = asserted_line_a();
+        let mut no_scanner_workspace =
+            K0Workspace::new_accelerated(&no_scanner, WorkspaceLimits::unlimited()).unwrap();
+        let mut no_scanner_meter = WorkMeter::new(u64::MAX, 0);
+        let empty = super::execute_context_lazy_loop(
+            &no_scanner,
+            b"",
+            SearchWindow::new(0, 0),
+            &mut no_scanner_workspace,
+            &mut no_scanner_meter,
+            OutputContract::EarliestEnd,
+            0,
+            None,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(empty, Some((None, 0)));
+        assert!(no_scanner_workspace.lazy.initialized);
+        assert!(no_scanner_meter.consumed > 0);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "offset clipping and both public contracts share one proof and window matrix"
+    )]
+    fn contextual_candidate_first_handles_offset_scanners_clipped_windows_and_span_contracts() {
+        let plan = digit_slash_then_line_end_or_bang();
+        let haystack = &[0xff, b'x', b'5', b'/', b'\n', 0x80];
+        let mut proof_workspace = K0Workspace::new(&plan, WorkspaceLimits::unlimited()).unwrap();
+        plan.prepare::<Span>()
+            .search_with_workspace(haystack, &mut proof_workspace, SearchLimits::unlimited())
+            .unwrap();
+        let proof = plan
+            .start_filter_proof
+            .get()
+            .expect("successful search publishes the offset scanner");
+        assert_eq!(
+            proof,
+            &StartFilterProof {
+                scanner: Some(positioned_scanner(1, StartScanner::One(b'/'))),
+                guard: Some(StartPositionClass {
+                    offset: 0,
+                    set: byte_range_set(b'0', b'9'),
+                }),
+                force_haystack_start: false,
+                relaxed_nullable: false,
+            }
+        );
+        let scanner = proof.scanner.as_ref().unwrap();
+        let guard = proof.guard.as_ref();
+
+        let windows = [
+            SearchWindow::full(haystack),
+            SearchWindow::new(1, 5),
+            // The assertion at byte boundary 4 observes the original newline
+            // even though the search window ends immediately before it.
+            SearchWindow::new(2, 4),
+            SearchWindow::new(2, 3),
+            SearchWindow::new(3, 5),
+        ];
+        for window in windows {
+            let mut ordinary = K0Workspace::new(&plan, WorkspaceLimits::unlimited()).unwrap();
+            let expected_end = plan
+                .prepare::<SelectedEnd>()
+                .search_window_with_workspace(
+                    haystack,
+                    window,
+                    &mut ordinary,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap();
+            let mut ordinary_span = K0Workspace::new(&plan, WorkspaceLimits::unlimited()).unwrap();
+            let expected_span = plan
+                .prepare::<Span>()
+                .search_window_with_workspace(
+                    haystack,
+                    window,
+                    &mut ordinary_span,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap();
+
+            for limits in [SearchLimits::default(), SearchLimits::unlimited()] {
+                let mut endpoint =
+                    K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+                let actual_end = plan
+                    .prepare::<SelectedEnd>()
+                    .search_window_with_workspace(haystack, window, &mut endpoint, limits)
+                    .unwrap();
+                assert_eq!(actual_end.output(), expected_end.output());
+                assert_eq!(
+                    actual_end.accounting().boundaries(),
+                    expected_end.accounting().boundaries(),
+                    "SelectedEnd boundary mismatch window={window:?} limits={limits:?}"
+                );
+
+                let mut bidirectional =
+                    K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+                let actual_span = plan
+                    .prepare::<Span>()
+                    .search_window_with_workspace(haystack, window, &mut bidirectional, limits)
+                    .unwrap();
+                assert_eq!(actual_span.output(), expected_span.output());
+                if actual_span.output().is_none() {
+                    assert_eq!(actual_span.accounting().boundaries(), 0);
+                }
+            }
+        }
+
+        assert_context_candidate_first_case(
+            "offset-scanner-original-context",
+            &plan,
+            haystack,
+            SearchWindow::new(2, 4),
+            scanner,
+            guard,
+            false,
+        );
+
+        let mut clipped =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let mut clipped_meter = WorkMeter::new(u64::MAX, 0);
+        let clipped_result = super::execute_context_lazy_loop(
+            &plan,
+            haystack,
+            SearchWindow::new(2, 3),
+            &mut clipped,
+            &mut clipped_meter,
+            OutputContract::SelectedEnd,
+            0,
+            Some(scanner),
+            guard,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(clipped_result, Some((None, 0)));
+        assert_eq!(clipped_meter.consumed, 0);
+        assert!(!clipped.lazy.initialized);
+        assert_eq!(clipped.lazy.context.occupied_slots(), 0);
     }
 
     #[test]
@@ -8814,6 +9470,71 @@ mod tests {
     }
 
     #[test]
+    fn contiguous_start_ranges_are_selected_without_displacing_small_scanners() {
+        for (start, end) in [
+            (0_u8, 3_u8),
+            (62, 65),
+            (0x7e, 0x81),
+            (0x80, 0x9f),
+            (0xfc, 0xff),
+            (0, 0xfe),
+        ] {
+            let set = byte_range_set(start, end);
+            let mut meter = WorkMeter::new(u64::MAX, 0);
+            let scanner = super::byte_start_scanner(set, &mut meter, 0).unwrap();
+            assert_eq!(scanner, StartScanner::Range { start, end });
+            assert_eq!(
+                meter.consumed,
+                u64::try_from(BYTE_START_BITMAP_POPULATION_WORK + BYTE_START_RANGE_DETECTION_WORK)
+                    .unwrap()
+            );
+        }
+
+        for (bytes, expected) in [
+            (&[0x80][..], StartScanner::One(0x80)),
+            (&[0x80, 0x81][..], StartScanner::Two(0x80, 0x81)),
+            (
+                &[0x80, 0x81, 0x82][..],
+                StartScanner::Three(0x80, 0x81, 0x82),
+            ),
+        ] {
+            assert_eq!(scanner_for(bytes), expected);
+        }
+
+        let ascii_hole = scanner_for(&[0, 1, 3, 4]);
+        assert!(matches!(ascii_hole, StartScanner::AsciiSet { .. }));
+        let full_byte_hole = scanner_for(&[0x7f, 0x80, 0x82, 0x83]);
+        assert!(matches!(full_byte_hole, StartScanner::Set(_)));
+    }
+
+    #[test]
+    fn start_range_mask_is_exact_for_all_interval_boundaries_and_lanes() {
+        for start in 0_u8..=u8::MAX {
+            for end in [start, start.saturating_add(1), u8::MAX] {
+                let block: [u8; fre_simd_kernels::BYTE_SET_BLOCK_BYTES] =
+                    core::array::from_fn(|lane| {
+                        u8::try_from(
+                            lane.wrapping_mul(197)
+                                .wrapping_add(usize::from(start))
+                                .wrapping_add(usize::from(end))
+                                & 255,
+                        )
+                        .unwrap()
+                    });
+                let actual =
+                    classify_byte_delta_16(start, end.wrapping_sub(start), &block).member_mask();
+                let expected = block.iter().enumerate().fold(0_u16, |mask, (lane, &byte)| {
+                    mask | (u16::from((start..=end).contains(&byte)) << lane)
+                });
+                assert_eq!(
+                    actual, expected,
+                    "range {start:#04x}..={end:#04x} block={block:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn byte_start_scanners_match_scalar_reference_for_every_window() {
         let scanner_sets: &[&[u8]] = &[
             &[],
@@ -8823,7 +9544,10 @@ mod tests {
             b"ac\x7f",
             b"\x80\xff",
             b"\0a\xff",
+            b"\0\x01\x02\x03",
             b"abcd",
+            b"\x7e\x7f\x80\x81",
+            b"\xfc\xfd\xfe\xff",
             b"\x3f\x40AB",
             b"\x80\x81\x8f\x90",
             b"\0\x1f\x40\x7f\x80\xbf\xc0\xff",
@@ -8869,7 +9593,7 @@ mod tests {
                             StartScanner::AsciiSet { .. } => {
                                 expected_ascii_scanner_work(start, end, expected)
                             }
-                            StartScanner::Set(_) => {
+                            StartScanner::Set(_) | StartScanner::Range { .. } => {
                                 expected_full_byte_scanner_work(start, end, expected)
                             }
                             StartScanner::Empty => 0,
@@ -8896,8 +9620,6 @@ mod tests {
     #[test]
     fn broad_full_byte_scanners_match_every_window_and_vector_threshold() {
         let mut sets = vec![
-            byte_range_set(0x80, 0xff),
-            byte_range_set(0x70, 0x90),
             byte_set(&[0x80, 0x81, 0x8e, 0x8f]),
             byte_set(&[0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]),
             byte_set(&[0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xff]),
@@ -9453,8 +10175,8 @@ mod tests {
             proof.scanner,
             Some(StartPositionScanner {
                 offset: 1,
-                scanner: StartScanner::AsciiSet { set, .. },
-            }) if set == byte_range_set(0, 64)
+                scanner: StartScanner::Range { start: 0, end: 64 },
+            })
         ));
         assert_eq!(proof.guard, None);
         assert!(!proof.force_haystack_start);
@@ -9854,7 +10576,13 @@ mod tests {
                     | (b"a", StartScanner::One(b'a'))
                     | (b"ab", StartScanner::Two(b'a', b'b'))
                     | (b"abc", StartScanner::Three(b'a', b'b', b'c'))
-                    | (b"abcd", StartScanner::AsciiSet { .. })
+                    | (
+                        b"abcd",
+                        StartScanner::Range {
+                            start: b'a',
+                            end: b'd'
+                        }
+                    )
             ));
 
             let mut meter = WorkMeter::new(u64::MAX, 0);

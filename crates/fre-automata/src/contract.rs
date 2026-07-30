@@ -460,6 +460,7 @@ impl K0SearchSession<'_> {
     /// Returns [`SearchError`] under the same range and resource contract as
     /// [`Self::search_window`].
     #[doc(hidden)]
+    #[inline]
     pub fn search_span_at_cursor(
         &mut self,
         haystack: &[u8],

@@ -6,6 +6,38 @@ use core::arch::x86_64::{
 };
 
 use super::{ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, AsciiMasks16, AsciiMasks32, HIGH_NIBBLE_BITS};
+use crate::{BYTE_SET_BLOCK_BYTES, ByteSetMask16};
+
+#[allow(
+    unsafe_code,
+    reason = "this private target-feature leaf loads one exact block after the compiler target proved SSE2 usable"
+)]
+#[allow(
+    clippy::cast_ptr_alignment,
+    reason = "_mm_loadu_si128 explicitly accepts an unaligned byte-backed address"
+)]
+#[target_feature(enable = "sse2")]
+#[inline]
+pub(super) unsafe fn classify_byte_delta_16_sse2(
+    origin: u8,
+    maximum_delta: u8,
+    bytes: &[u8; BYTE_SET_BLOCK_BYTES],
+) -> ByteSetMask16 {
+    use core::arch::x86_64::{_mm_sub_epi8, _mm_subs_epu8};
+
+    // SAFETY: `bytes` is an initialized `[u8; 16]`; the unaligned load reads
+    // exactly that object, and the compiler target proves SSE2.
+    let input = unsafe { _mm_loadu_si128(bytes.as_ptr().cast::<__m128i>()) };
+    let origin_lanes = _mm_set1_epi8(i8::from_ne_bytes([origin]));
+    let maximum_delta_lanes = _mm_set1_epi8(i8::from_ne_bytes([maximum_delta]));
+    let offsets = _mm_sub_epi8(input, origin_lanes);
+    let above_range = _mm_subs_epu8(offsets, maximum_delta_lanes);
+    let member_lanes = _mm_cmpeq_epi8(above_range, _mm_setzero_si128());
+    ByteSetMask16::new(
+        u16::try_from(_mm_movemask_epi8(member_lanes))
+            .expect("a sixteen-lane movemask fits in u16"),
+    )
+}
 
 #[allow(
     unsafe_code,

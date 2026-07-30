@@ -40,6 +40,7 @@ mod aarch64;
 #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
 mod aarch64_sve2;
 mod byte_bucket;
+mod byte_range;
 mod byte_set;
 #[cfg_attr(
     feature = "static-dispatch",
@@ -66,6 +67,7 @@ pub use byte_bucket::{
     BYTE_BUCKET_BLOCK_BYTES, BYTE_BUCKET_COUNT, BYTE_BUCKET_MAX_COLUMNS, ByteBucketClassifier,
     ByteBucketMasks16, ByteBucketTableError, ByteBucketTables,
 };
+pub use byte_range::classify_byte_delta_16;
 pub use byte_set::{
     BYTE_SET_BLOCK_BYTES, BYTE_SET_CLASSIFIER_BUILD_WORK, ByteSet256, ByteSetClassifier,
     ByteSetMask16,

@@ -35,6 +35,9 @@ pub(crate) const BYTE_START_BITMAP_POPULATION_WORK: usize = 4;
 pub(crate) const BYTE_START_MEMBER_EXTRACTION_WORK: usize = 1;
 /// Largest cardinality represented by direct `memchr` scanners.
 pub(crate) const BYTE_START_SMALL_MAX_MEMBERS: usize = 3;
+/// Exact abstract work to inspect all four bitmap words for one inclusive
+/// range after the member cardinality is known.
+pub(crate) const BYTE_START_RANGE_DETECTION_WORK: usize = 4;
 /// Exact abstract work to compile a broad full-byte bitmap classifier.
 ///
 /// Construction visits the complete 256-byte domain once while populating two
@@ -58,6 +61,7 @@ pub(crate) const START_FILTER_GUARD_MAX_CARDINALITY: u32 = 64;
 pub(crate) const START_FILTER_MAX_SELECTION_WORK: usize = START_FILTER_POSITION_COUNT
     * (BYTE_START_BITMAP_POPULATION_WORK + START_FILTER_SCANNER_SELECTION_WORK)
     + START_FILTER_MAX_OFFSET * START_FILTER_GUARD_SELECTION_WORK
+    + BYTE_START_RANGE_DETECTION_WORK
     + BYTE_START_SET_CLASSIFIER_BUILD_WORK;
 
 /// The structural role of a Thompson state.
@@ -508,6 +512,10 @@ pub(crate) enum StartScanner {
     One(u8),
     Two(u8, u8),
     Three(u8, u8, u8),
+    Range {
+        start: u8,
+        end: u8,
+    },
     AsciiSet {
         set: ByteSet,
         classifier: StartAsciiClassifier,
