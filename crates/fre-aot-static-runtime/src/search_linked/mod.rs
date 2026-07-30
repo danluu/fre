@@ -13,9 +13,9 @@ use std::{
 use fre_aot_search_contract::{
     ClaimedSearchMetadataV1, SEARCH_BACKEND_ASIMD_TAG22_V1, SEARCH_BACKEND_ASIMD_TAG23_V1,
     SEARCH_BACKEND_ASIMD_TAG25_V1, SEARCH_BACKEND_ASIMD_TAG26_V1, SEARCH_BACKEND_ASIMD_TAG28_V1,
-    SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1, SEARCH_BACKEND_VERSION_V1, SEARCH_METADATA_BYTES_V1,
-    SEARCH_PLATFORM_LINUX_V1, SEARCH_PLATFORM_MACOS_V1, STATIC_SEARCH_SPAN_EXPECTATION_BYTES_V1,
-    inspect_search_metadata_v1,
+    SEARCH_BACKEND_ASIMD_TAG29_V1, SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1, SEARCH_BACKEND_VERSION_V1,
+    SEARCH_METADATA_BYTES_V1, SEARCH_PLATFORM_LINUX_V1, SEARCH_PLATFORM_MACOS_V1,
+    STATIC_SEARCH_SPAN_EXPECTATION_BYTES_V1, inspect_search_metadata_v1,
 };
 use fre_jit_aarch64::{EmitLimits, SearchBackendPolicy, TargetSpec, emit_audited_with_backend};
 use fre_kernel_ir::{
@@ -1554,6 +1554,7 @@ pub(super) fn require_semantic_payload_reconstruction_v1(
         SEARCH_BACKEND_ASIMD_TAG25_V1 => SearchBackendPolicy::AsimdV12,
         SEARCH_BACKEND_ASIMD_TAG26_V1 => SearchBackendPolicy::AsimdV13,
         SEARCH_BACKEND_ASIMD_TAG28_V1 => SearchBackendPolicy::AsimdV15,
+        SEARCH_BACKEND_ASIMD_TAG29_V1 => SearchBackendPolicy::AsimdV16,
         SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1 => SearchBackendPolicy::Sve2Fixed16V2,
         _ => return Err(StaticSearchSpanVerifyErrorV1::SemanticPayloadReconstruction),
     };

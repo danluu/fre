@@ -310,7 +310,8 @@ impl MetadataV1 {
                     || version == BackendVersion::SEARCH_V10.0
                     || version == BackendVersion::SEARCH_V12.0
                     || version == BackendVersion::SEARCH_V13.0
-                    || version == BackendVersion::SEARCH_V15.0 =>
+                    || version == BackendVersion::SEARCH_V15.0
+                    || version == BackendVersion::SEARCH_V16.0 =>
             {
                 self.features == CpuFeatures::ASIMD.bits()
             }

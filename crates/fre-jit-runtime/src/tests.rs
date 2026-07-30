@@ -3212,6 +3212,81 @@ fn v15_phase_unique_images_publish_and_respect_guarded_width_tail_boundaries() {
 }
 
 #[test]
+fn v16_learned_recovery_images_publish_and_respect_guarded_adversarial_streams() {
+    let _lock = native_test_lock();
+    let mut literals = [6_usize, 7, 8, 15, 16, 23, 24, 32]
+        .into_iter()
+        .map(|width| {
+            (0..width)
+                .map(|offset| {
+                    u8::try_from(offset)
+                        .expect("bounded V16 width")
+                        .wrapping_mul(61)
+                        .wrapping_add(7)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    // A second occurrence of the primary byte near the end makes this literal
+    // exercise the learned-mask recovery path instead of only the
+    // phase-unique fast path.
+    literals.push(vec![
+        0x63, 0x1c, 0x0e, 0x53, 0xc4, 0xe4, 0xb3, 0x5c, 0xf7, 0x1d, 0x14, 0xcc, 0x07, 0xdb, 0x88,
+        0x7b, 0xa2, 0x41, 0x99, 0xb9, 0x02, 0x92, 0xbb, 0x79, 0x4c, 0xe1, 0x0b, 0x28, 0x92, 0x63,
+        0x68, 0x3d,
+    ]);
+
+    let mut comparisons = 0_u64;
+    for literal in literals {
+        let width = literal.len();
+        let program = build_exact_literal::<Span>(
+            &literal,
+            AnchorFlags::default(),
+            ValidateLimits::default(),
+        )
+        .expect("V16 exact program");
+        let image = emit_audited_with_backend(
+            &program,
+            SearchBackendPolicy::AsimdV16,
+            EmitLimits::default(),
+        )
+        .expect("audited V16 image");
+        assert_eq!(
+            image.as_image().backend_version(),
+            BackendVersion::SEARCH_V16
+        );
+        let kernel =
+            publish_audited::<Span>(&image, PublicationLimits::default()).expect("publish V16");
+        let avoid = (0_u16..=255)
+            .map(|value| u8::try_from(value).expect("bounded byte"))
+            .find(|byte| !literal.contains(byte))
+            .expect("V16 literal leaves one avoiding byte");
+
+        for mutation_offset in 0..width {
+            let mut near_miss = literal.clone();
+            near_miss[mutation_offset] = avoid;
+            let mut bytes = vec![avoid; 4_093];
+            for chunk in bytes.chunks_exact_mut(width) {
+                chunk.copy_from_slice(&near_miss);
+            }
+            let match_start = bytes.len() - width;
+            install_literal(&mut bytes, match_start, &literal);
+            platform::with_guarded_haystack(&bytes, true, |guarded| {
+                assert_native_matches(
+                    &program,
+                    &kernel,
+                    guarded,
+                    SearchWindow::new(0, guarded.len()),
+                );
+            })
+            .expect("guarded V16 learned-recovery tail stream");
+            comparisons = comparisons.checked_add(1).expect("bounded comparisons");
+        }
+    }
+    assert_eq!(comparisons, 163);
+}
+
+#[test]
 fn v8_adaptive_secondary_screen_rechecks_primary_before_fallback() {
     const WIDE_CANDIDATES: usize = 64;
     const PRIMARY_OFFSET: usize = 7;

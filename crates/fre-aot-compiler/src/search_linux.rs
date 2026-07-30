@@ -23,7 +23,7 @@ use fre_aot_elf::{
 use fre_aot_search_contract::{
     ClaimedSearchMetadataV1, ClaimedStaticSearchSpanExpectationV1, SEARCH_BACKEND_ASIMD_TAG23_V1,
     SEARCH_BACKEND_ASIMD_TAG25_V1, SEARCH_BACKEND_ASIMD_TAG26_V1, SEARCH_BACKEND_ASIMD_TAG28_V1,
-    inspect_static_search_span_expectation_v1,
+    SEARCH_BACKEND_ASIMD_TAG29_V1, inspect_static_search_span_expectation_v1,
 };
 use fre_jit_aarch64::{
     ArtifactIdentity, AuditedNativeImage, BackendVersion, CpuFeatures, EmitError, EmitLimits,
@@ -137,6 +137,7 @@ pub enum LinuxAarch64SearchBackendV1 {
     AsimdV12,
     AsimdV13,
     AsimdV15,
+    AsimdV16,
     Sve2Fixed16Tag21Vl16,
 }
 
@@ -150,6 +151,7 @@ impl LinuxAarch64SearchBackendV1 {
             Self::AsimdV12 => SearchBackendPolicy::AsimdV12,
             Self::AsimdV13 => SearchBackendPolicy::AsimdV13,
             Self::AsimdV15 => SearchBackendPolicy::AsimdV15,
+            Self::AsimdV16 => SearchBackendPolicy::AsimdV16,
             Self::Sve2Fixed16Tag21Vl16 => SearchBackendPolicy::Sve2Fixed16V2,
         }
     }
@@ -167,7 +169,8 @@ impl LinuxAarch64SearchBackendV1 {
             | Self::AsimdV10
             | Self::AsimdV12
             | Self::AsimdV13
-            | Self::AsimdV15 => CpuFeatures::ASIMD,
+            | Self::AsimdV15
+            | Self::AsimdV16 => CpuFeatures::ASIMD,
             Self::Sve2Fixed16Tag21Vl16 => CpuFeatures::ASIMD_SVE2,
         }
     }
@@ -180,7 +183,8 @@ impl LinuxAarch64SearchBackendV1 {
             | Self::AsimdV10
             | Self::AsimdV12
             | Self::AsimdV13
-            | Self::AsimdV15 => 0,
+            | Self::AsimdV15
+            | Self::AsimdV16 => 0,
             Self::Sve2Fixed16Tag21Vl16 => 16,
         }
     }
@@ -193,6 +197,7 @@ impl LinuxAarch64SearchBackendV1 {
             Self::AsimdV12 => 5,
             Self::AsimdV13 => 6,
             Self::AsimdV15 => 7,
+            Self::AsimdV16 => 8,
             Self::Sve2Fixed16Tag21Vl16 => 2,
         }
     }
@@ -333,6 +338,14 @@ impl<O: Operation> LinuxAarch64ExactSearchManifestV1<O> {
         Self::new(policy, LinuxAarch64SearchBackendV1::AsimdV15)
     }
 
+    /// Construct an explicit ASIMD V16/tag29 staged learned-recovery
+    /// candidate. This does not grant runtime or automatic-routing authority.
+    pub fn v16_candidate(
+        policy: LinuxAarch64SearchCompilePolicyV1,
+    ) -> Result<Self, LinuxSearchManifestErrorV1> {
+        Self::new(policy, LinuxAarch64SearchBackendV1::AsimdV16)
+    }
+
     /// Construct a named candidate by its static-contract backend tag.
     ///
     /// The external evidence runner can therefore carry the backend as sealed
@@ -347,6 +360,7 @@ impl<O: Operation> LinuxAarch64ExactSearchManifestV1<O> {
             SEARCH_BACKEND_ASIMD_TAG25_V1 => Self::v12_candidate(policy),
             SEARCH_BACKEND_ASIMD_TAG26_V1 => Self::v13_candidate(policy),
             SEARCH_BACKEND_ASIMD_TAG28_V1 => Self::v15_candidate(policy),
+            SEARCH_BACKEND_ASIMD_TAG29_V1 => Self::v16_candidate(policy),
             requested => {
                 Err(LinuxSearchManifestErrorV1::UnsupportedCandidateBackendTag { requested })
             }
@@ -1369,7 +1383,8 @@ const fn target_for_backend(backend: LinuxAarch64SearchBackendV1) -> TargetSpec 
         | LinuxAarch64SearchBackendV1::AsimdV10
         | LinuxAarch64SearchBackendV1::AsimdV12
         | LinuxAarch64SearchBackendV1::AsimdV13
-        | LinuxAarch64SearchBackendV1::AsimdV15 => TargetSpec::AARCH64_AAPCS64,
+        | LinuxAarch64SearchBackendV1::AsimdV15
+        | LinuxAarch64SearchBackendV1::AsimdV16 => TargetSpec::AARCH64_AAPCS64,
         LinuxAarch64SearchBackendV1::Sve2Fixed16Tag21Vl16 => TargetSpec::AARCH64_AAPCS64_SVE2_16,
     }
 }
@@ -1455,6 +1470,7 @@ fn decode_backend_profile(
         LinuxAarch64SearchBackendV1::AsimdV12,
         LinuxAarch64SearchBackendV1::AsimdV13,
         LinuxAarch64SearchBackendV1::AsimdV15,
+        LinuxAarch64SearchBackendV1::AsimdV16,
         LinuxAarch64SearchBackendV1::Sve2Fixed16Tag21Vl16,
     ] {
         if tag == backend.tag()
@@ -1943,6 +1959,60 @@ mod tests {
         let claim = inspect_static_search_span_expectation_v1(expectation.as_bytes())
             .expect("Linux V15 expectation inspection");
         assert_eq!(claim.backend_version(), SEARCH_BACKEND_ASIMD_TAG28_V1);
+        assert!(expectation.authenticates_claim(&claim));
+    }
+
+    #[test]
+    fn explicit_v16_tag29_is_deterministic_static_and_candidate_only() {
+        let v15_manifest = LinuxAarch64ExactSearchManifestV1::<Span>::v15_candidate(
+            LinuxAarch64SearchCompilePolicyV1::default(),
+        )
+        .expect("V15 candidate manifest");
+        let v16_manifest = LinuxAarch64ExactSearchManifestV1::<Span>::v16_candidate(
+            LinuxAarch64SearchCompilePolicyV1::default(),
+        )
+        .expect("V16 candidate manifest");
+        let tagged = LinuxAarch64ExactSearchManifestV1::<Span>::candidate_backend_tag(
+            LinuxAarch64SearchCompilePolicyV1::default(),
+            SEARCH_BACKEND_ASIMD_TAG29_V1,
+        )
+        .expect("tag29 candidate manifest");
+        assert_eq!(
+            v16_manifest.backend(),
+            LinuxAarch64SearchBackendV1::AsimdV16
+        );
+        assert_eq!(tagged.backend(), v16_manifest.backend());
+        assert_eq!(tagged.identity(), v16_manifest.identity());
+        assert_ne!(v16_manifest.identity(), v15_manifest.identity());
+
+        let source = b"phase-unique-16!".to_vec();
+        let first = plan_and_compile_linux_aarch64_exact_search_v1(
+            v16_manifest,
+            source.clone(),
+            RustProfile::default(),
+        )
+        .expect("first Linux V16 object");
+        let second = plan_and_compile_linux_aarch64_exact_search_v1(
+            v16_manifest,
+            source,
+            RustProfile::default(),
+        )
+        .expect("second Linux V16 object");
+        assert_eq!(
+            first.receipt().backend(),
+            LinuxAarch64SearchBackendV1::AsimdV16
+        );
+        assert_eq!(
+            first.receipt().metadata().backend_version(),
+            BackendVersion::SEARCH_V16.0
+        );
+        assert_eq!(first.object().as_bytes(), second.object().as_bytes());
+        assert_eq!(first.receipt(), second.receipt());
+        let expectation = crate::build_linux_static_search_span_expectation_v1(&first)
+            .expect("Linux V16 neutral expectation");
+        let claim = inspect_static_search_span_expectation_v1(expectation.as_bytes())
+            .expect("Linux V16 expectation inspection");
+        assert_eq!(claim.backend_version(), SEARCH_BACKEND_ASIMD_TAG29_V1);
         assert!(expectation.authenticates_claim(&claim));
     }
 

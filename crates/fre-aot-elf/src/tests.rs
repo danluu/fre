@@ -43,6 +43,11 @@ fn v8_v12_v13_v15_and_explicit_tag21_emit_deterministic_strict_elf_objects() {
             SearchBackendPolicy::AsimdV15,
             BackendVersion::SEARCH_V15,
         ),
+        (
+            b"phase-unique-16!".as_slice(),
+            SearchBackendPolicy::AsimdV16,
+            BackendVersion::SEARCH_V16,
+        ),
     ] {
         let image = image(literal, backend);
         let binding = BindingIdentity::new(TEST_BINDING).expect("nonzero test binding");
