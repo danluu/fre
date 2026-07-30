@@ -434,18 +434,20 @@ fn fre_outcome(
         }
         Operation::Find => {
             if let Some(matched) = session
-                .find(haystack, SearchLimits::unlimited())
+                .find_value(haystack, SearchLimits::unlimited())
                 .map_err(|error| format!("FRE find: {error:?}"))?
-                .0
             {
                 digest.push(matched.start(), matched.end());
             }
         }
         Operation::FindAt => {
             if let Some(matched) = session
-                .find_at(haystack, find_at_start(haystack), SearchLimits::unlimited())
+                .find_at_value(
+                    haystack,
+                    find_at_start(haystack),
+                    SearchLimits::unlimited(),
+                )
                 .map_err(|error| format!("FRE find_at: {error:?}"))?
-                .0
             {
                 digest.push(matched.start(), matched.end());
             }

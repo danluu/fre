@@ -69,6 +69,20 @@ fn pinned_ranged_search_examples_preserve_original_haystack_context() {
         None
     );
     assert_eq!(
+        fre.find_at_value(haystack, 2, SearchLimits::unlimited())
+            .expect("contextual value-only span search"),
+        None
+    );
+    assert_eq!(
+        fre.find_window_value(
+            haystack,
+            SearchWindow::new(2, haystack.len()),
+            SearchLimits::unlimited(),
+        )
+        .expect("contextual value-only windowed span search"),
+        None
+    );
+    assert_eq!(
         fre.find_at_borrowed(haystack, 2, SearchLimits::unlimited())
             .expect("contextual borrowed search")
             .0,
@@ -89,6 +103,22 @@ fn pinned_ranged_search_examples_preserve_original_haystack_context() {
             .find_at(haystack, 2, SearchLimits::unlimited())
             .expect("reused contextual span search")
             .0,
+        None
+    );
+    assert_eq!(
+        session
+            .find_at_value(haystack, 2, SearchLimits::unlimited())
+            .expect("reused contextual value-only span search"),
+        None
+    );
+    assert_eq!(
+        session
+            .find_window_value(
+                haystack,
+                SearchWindow::new(2, haystack.len()),
+                SearchLimits::unlimited(),
+            )
+            .expect("reused contextual value-only windowed span search"),
         None
     );
     assert_eq!(
@@ -271,6 +301,126 @@ fn value_only_existence_preserves_plan_resource_refusals() {
 }
 
 #[test]
+fn value_only_find_matches_reporting_across_every_portable_plan() {
+    let haystacks: &[&[u8]] = &[
+        b"",
+        b"ab",
+        b"xxfoobaz-alphaZ-Sherlock",
+        "--αβγ--".as_bytes(),
+        &[0xFF, b'a', b'b', b'Z', 0xFF],
+    ];
+
+    for (fre, upstream, expected_plan) in ranged_cases() {
+        for &haystack in haystacks {
+            let expected = upstream
+                .find(haystack)
+                .map(|matched| (matched.start(), matched.end()));
+            assert_eq!(
+                fre.find_value(haystack, SearchLimits::unlimited())
+                    .map(span),
+                Ok(expected),
+                "cold full {expected_plan:?}/{haystack:?}"
+            );
+
+            let mut reporting_session = fre
+                .search_session(SearchSessionLimits::unlimited())
+                .expect("fresh reporting full-span session");
+            let mut value_session = fre
+                .search_session(SearchSessionLimits::unlimited())
+                .expect("fresh value-only full-span session");
+            let reporting = reporting_session
+                .find(haystack, SearchLimits::unlimited())
+                .map(|(matched, _)| matched);
+            let value_only = value_session.find_value(haystack, SearchLimits::unlimited());
+            assert_eq!(value_only, reporting, "reused full {expected_plan:?}");
+            assert_eq!(value_only.map(span), Ok(expected));
+
+            for start in 0..=haystack.len() {
+                let expected = upstream
+                    .find_at(haystack, start)
+                    .map(|matched| (matched.start(), matched.end()));
+                let window = SearchWindow::new(start, haystack.len());
+                assert_eq!(
+                    fre.find_at_value(haystack, start, SearchLimits::unlimited())
+                        .map(span),
+                    Ok(expected),
+                    "cold ranged {expected_plan:?}/{haystack:?}/{start}"
+                );
+                assert_eq!(
+                    fre.find_window_value(haystack, window, SearchLimits::unlimited())
+                        .map(span),
+                    Ok(expected),
+                    "cold windowed {expected_plan:?}/{haystack:?}/{start}"
+                );
+
+                let mut reporting_session = fre
+                    .search_session(SearchSessionLimits::unlimited())
+                    .expect("fresh reporting ranged session");
+                let mut value_session = fre
+                    .search_session(SearchSessionLimits::unlimited())
+                    .expect("fresh value-only ranged session");
+                let reporting = reporting_session
+                    .find_at(haystack, start, SearchLimits::unlimited())
+                    .map(|(matched, _)| matched);
+                let value_only =
+                    value_session.find_at_value(haystack, start, SearchLimits::unlimited());
+                assert_eq!(
+                    value_only, reporting,
+                    "reused ranged {expected_plan:?}/{haystack:?}/{start}"
+                );
+                assert_eq!(value_only.map(span), Ok(expected));
+
+                let mut reporting_session = fre
+                    .search_session(SearchSessionLimits::unlimited())
+                    .expect("fresh reporting windowed session");
+                let mut value_session = fre
+                    .search_session(SearchSessionLimits::unlimited())
+                    .expect("fresh value-only windowed session");
+                let reporting = reporting_session
+                    .find_window(haystack, window, SearchLimits::unlimited())
+                    .map(|(matched, _)| matched);
+                let value_only =
+                    value_session.find_window_value(haystack, window, SearchLimits::unlimited());
+                assert_eq!(
+                    value_only, reporting,
+                    "reused windowed {expected_plan:?}/{haystack:?}/{start}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn value_only_find_preserves_plan_resource_refusals_from_fresh_state() {
+    let haystack = b"xxfoobaz-alphaZ-Sherlock";
+    let window = SearchWindow::new(2, haystack.len());
+    let limits = SearchLimits {
+        max_work: 0,
+        max_scratch_bytes: 0,
+    };
+
+    for (fre, _, expected_plan) in ranged_cases() {
+        let reporting = fre
+            .find_window(haystack, window, limits)
+            .map(|(matched, _)| matched);
+        let value_only = fre.find_window_value(haystack, window, limits);
+        assert_eq!(value_only, reporting, "cold {expected_plan:?}");
+
+        let mut reporting_session = fre
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("fresh reporting resource-parity session");
+        let mut value_session = fre
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("fresh value-only resource-parity session");
+        let reporting = reporting_session
+            .find_window(haystack, window, limits)
+            .map(|(matched, _)| matched);
+        let value_only = value_session.find_window_value(haystack, window, limits);
+        assert_eq!(value_only, reporting, "reused {expected_plan:?}");
+    }
+}
+
+#[test]
 fn out_of_bounds_start_is_a_typed_cold_and_reused_error() {
     let fre = portable("(?:ab)+", false, PlanSelection::ForceK0);
     let haystack = b"ab";
@@ -281,6 +431,14 @@ fn out_of_bounds_start_is_a_typed_cold_and_reused_error() {
             .expect_err("cold find_at must reject an out-of-bounds start"),
         fre.find_at_borrowed(haystack, start, SearchLimits::unlimited())
             .expect_err("cold find_at_borrowed must reject an out-of-bounds start"),
+        fre.find_at_value(haystack, start, SearchLimits::unlimited())
+            .expect_err("cold value-only find_at must reject an out-of-bounds start"),
+        fre.find_window_value(
+            haystack,
+            SearchWindow::new(start, haystack.len()),
+            SearchLimits::unlimited(),
+        )
+        .expect_err("cold value-only find window must reject an out-of-bounds start"),
         fre.is_match_at(haystack, start, SearchLimits::unlimited())
             .expect_err("cold is_match_at must reject an out-of-bounds start"),
         fre.is_match_value_at(haystack, start, SearchLimits::unlimited())
@@ -315,6 +473,26 @@ fn out_of_bounds_start_is_a_typed_cold_and_reused_error() {
     ));
     assert!(matches!(
         session.find_at_borrowed(haystack, start, SearchLimits::unlimited()),
+        Err(SearchError::K0(K0SearchError::InvalidWindow {
+            start: 3,
+            end: 2,
+            haystack_len: 2,
+        }))
+    ));
+    assert!(matches!(
+        session.find_at_value(haystack, start, SearchLimits::unlimited()),
+        Err(SearchError::K0(K0SearchError::InvalidWindow {
+            start: 3,
+            end: 2,
+            haystack_len: 2,
+        }))
+    ));
+    assert!(matches!(
+        session.find_window_value(
+            haystack,
+            SearchWindow::new(start, haystack.len()),
+            SearchLimits::unlimited(),
+        ),
         Err(SearchError::K0(K0SearchError::InvalidWindow {
             start: 3,
             end: 2,

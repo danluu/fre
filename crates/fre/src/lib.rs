@@ -4202,6 +4202,24 @@ impl PortableRegex {
         self.find_window(haystack, SearchWindow::full(haystack), limits)
     }
 
+    /// Return only the profile-selected leftmost-first match.
+    ///
+    /// This is the value-only counterpart to [`Self::find`]. It preserves the
+    /// same selected plan, checked execution limits and typed failures. K0
+    /// stays outside the facade [`SearchAccounting`] projection boundary;
+    /// native owners retain their existing concrete search implementations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] if scratch/work limits refuse the operation.
+    pub fn find_value(
+        &self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<Option<Match>, SearchError> {
+        self.find_window_value(haystack, SearchWindow::full(haystack), limits)
+    }
+
     /// Return the profile-selected leftmost-first match while retaining the
     /// exact original haystack.
     ///
@@ -4302,6 +4320,23 @@ impl PortableRegex {
         limits: SearchLimits,
     ) -> Result<(Option<Match>, SearchAccounting), SearchError> {
         self.find_window(haystack, SearchWindow::new(start, haystack.len()), limits)
+    }
+
+    /// Return only the selected match at or after `start`.
+    ///
+    /// Assertions inspect the complete original haystack. Range validation,
+    /// execution limits and typed failures are identical to [`Self::find_at`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] for an invalid start or a resource refusal.
+    pub fn find_at_value(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<Option<Match>, SearchError> {
+        self.find_window_value(haystack, SearchWindow::new(start, haystack.len()), limits)
     }
 
     /// Return the selected match at or after `start` while retaining the
@@ -4514,6 +4549,38 @@ impl PortableRegex {
                 let (matched, accounting) = plan.find_window(haystack, window, limits)?;
                 Ok((matched, SearchAccounting::UnicodeWordRun(accounting)))
             }
+        }
+    }
+
+    /// Return only the selected match wholly inside a search range.
+    ///
+    /// Assertions retain original-haystack context. K0 executes its typed span
+    /// contract directly; native plans retain their existing concrete search
+    /// implementations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] for an invalid window or a resource refusal.
+    pub fn find_window_value(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<Option<Match>, SearchError> {
+        match &self.plan {
+            PortablePlan::K0(automaton) => automaton
+                .prepare::<Span>()
+                .search_window(haystack, window, limits)
+                .map(|report| {
+                    report.into_output().map(|span| Match {
+                        start: span.start(),
+                        end: span.end(),
+                    })
+                })
+                .map_err(SearchError::from),
+            _ => self
+                .find_window(haystack, window, limits)
+                .map(|(matched, _)| matched),
         }
     }
 
@@ -5034,6 +5101,21 @@ impl<'r> PortableSearchSession<'r> {
         self.find_window(haystack, SearchWindow::full(haystack), limits)
     }
 
+    /// Return only the profile-selected leftmost-first match, reusing K0 state
+    /// when applicable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same per-invocation limits as
+    /// [`PortableRegex::find_value`].
+    pub fn find_value(
+        &mut self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<Option<Match>, SearchError> {
+        self.find_window_value(haystack, SearchWindow::full(haystack), limits)
+    }
+
     /// Return the selected match while retaining the complete original
     /// haystack and reusing K0 state.
     ///
@@ -5063,6 +5145,22 @@ impl<'r> PortableSearchSession<'r> {
         limits: SearchLimits,
     ) -> Result<(Option<Match>, SearchAccounting), SearchError> {
         self.find_window(haystack, SearchWindow::new(start, haystack.len()), limits)
+    }
+
+    /// Return only the selected match at or after `start`, reusing K0 state
+    /// when applicable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same range and resource contract as
+    /// [`PortableRegex::find_at_value`].
+    pub fn find_at_value(
+        &mut self,
+        haystack: &[u8],
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<Option<Match>, SearchError> {
+        self.find_window_value(haystack, SearchWindow::new(start, haystack.len()), limits)
     }
 
     /// Return the selected match at or after `start` while retaining the
@@ -5105,6 +5203,35 @@ impl<'r> PortableSearchSession<'r> {
                 });
                 Ok((matched, SearchAccounting::K0(accounting)))
             }
+        }
+    }
+
+    /// Return only the selected match wholly inside a search range, reusing K0
+    /// state and retaining original-haystack assertion context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same range and resource contract as
+    /// [`PortableRegex::find_window_value`].
+    pub fn find_window_value(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<Option<Match>, SearchError> {
+        match &mut self.plan {
+            PortableSearchSessionPlan::Native(regex) => {
+                regex.find_window_value(haystack, window, limits)
+            }
+            PortableSearchSessionPlan::K0 { session } => session
+                .search_window::<Span>(haystack, window, limits)
+                .map(|report| {
+                    report.into_output().map(|span| Match {
+                        start: span.start(),
+                        end: span.end(),
+                    })
+                })
+                .map_err(SearchError::from),
         }
     }
 
