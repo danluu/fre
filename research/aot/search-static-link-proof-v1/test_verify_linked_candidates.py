@@ -11,6 +11,9 @@ from pathlib import Path
 
 DIRECTORY = Path(__file__).resolve().parent
 REPO = DIRECTORY.parents[2]
+APPLICATION_DIRECTORY = (
+    REPO / "research/aot/search-ripgrep-application-independent-v2"
+)
 VERIFIER_PATH = DIRECTORY / "verify_linked_candidates.py"
 SPEC = importlib.util.spec_from_file_location("_search_link_proof", VERIFIER_PATH)
 assert SPEC is not None and SPEC.loader is not None
@@ -27,6 +30,51 @@ class LinkProofTests(unittest.TestCase):
         self.assertEqual(contract["object_candidates"]["count"], 808)
         self.assertEqual(contract["authority"]["rebar_inputs"], [])
         self.assertFalse(contract["authority"]["promotion_authority"])
+
+    def test_exact_application_contract_and_manifests_pass(self) -> None:
+        raw = (
+            APPLICATION_DIRECTORY / "link-proof-contract-v1.json"
+        ).read_bytes()
+        profile = VERIFIER.contract_profile(raw)
+        contract = VERIFIER.validate_contract(raw)
+        self.assertEqual(contract["profile"], "ripgrep-application-v2")
+        self.assertEqual(profile["object_count"], 5)
+        self.assertEqual(profile["refusal_count"], 6)
+        object_root = VERIFIER.load_envelope(
+            (
+                APPLICATION_DIRECTORY / "object-candidates-v1.json"
+            ).read_bytes(),
+            profile["object_schema"],
+            profile["object_sha256"],
+            profile["object_payload_sha256"],
+            "application objects",
+        )
+        candidates = VERIFIER.validate_candidate_manifest(
+            object_root, profile
+        )
+        dispositions = VERIFIER.load_envelope(
+            (
+                APPLICATION_DIRECTORY / "literal-dispositions-v1.json"
+            ).read_bytes(),
+            profile["dispositions_schema"],
+            profile["dispositions_sha256"],
+            profile["dispositions_payload_sha256"],
+            "application dispositions",
+        )
+        refusals = VERIFIER.validate_dispositions(
+            dispositions, candidates, profile
+        )
+        self.assertEqual(len(candidates), 5)
+        self.assertEqual(len(refusals), 6)
+
+    def test_contract_parameter_bytes_are_authority_pinned(self) -> None:
+        raw = (
+            APPLICATION_DIRECTORY / "link-proof-contract-v1.json"
+        ).read_bytes()
+        with self.assertRaisesRegex(
+            VERIFIER.Refusal, "contract bytes changed"
+        ):
+            VERIFIER.validate_contract(raw + b"\n")
 
     def test_apple_map_binds_exact_provider_and_address(self) -> None:
         text = """\

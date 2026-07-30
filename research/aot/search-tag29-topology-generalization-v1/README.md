@@ -103,7 +103,7 @@ manifests; external verifier, build, link, map and final-image identities;
 and the authority-pinned linked image.
 
 The accepted link-proof verifier source SHA-256 is
-`8b3d13c5233e68b6ef4f398a713792515f8fb1b1001ca699e39b81746d2ac9bb`;
+`5e7e347f8796941fb7dfa654ad011400c20461d53784837d53a793e7756db38d`;
 its contract SHA-256 is
 `42921564050b795b4a097c8b74dde2e947b914931e71dd5faafe274a4975e60e`.
 

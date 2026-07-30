@@ -22,6 +22,9 @@ from typing import Any, Iterable
 
 
 CONTRACT_SHA256 = "42921564050b795b4a097c8b74dde2e947b914931e71dd5faafe274a4975e60e"
+APPLICATION_CONTRACT_SHA256 = (
+    "8119ee1d6449b7c4d29cc917d0611e2f05234bf34f4e1be8ec90a564995e72a9"
+)
 OBJECT_MANIFEST_SHA256 = (
     "90b9eb70dff30e36901b86ecff34ba91938f27afa155ebb17f6daa33d3baca2c"
 )
@@ -43,6 +46,27 @@ OUTPUT_SCHEMA = "fre.aot.search-tag29-compiler-object-link-evidence.v1"
 OBJECT_COUNT = 808
 REFUSAL_COUNT = 114
 DISPOSITION_COUNT = 922
+APPLICATION_OBJECT_SCHEMA = (
+    "fre.aot.search-tag29-application-object-candidates.v1"
+)
+APPLICATION_DISPOSITIONS_SCHEMA = (
+    "fre.aot.search-tag29-application-literal-dispositions.v1"
+)
+APPLICATION_OBJECT_MANIFEST_SHA256 = (
+    "2e6612dc25e1186e0dd78597f045a4ece6ecc8dafcc2270cacc445be8753aff4"
+)
+APPLICATION_OBJECT_MANIFEST_PAYLOAD_SHA256 = (
+    "5ffcb2ba1816a0bca3f5e4d74773e1cfff90288eb3c40d599256b380b3342dab"
+)
+APPLICATION_DISPOSITIONS_SHA256 = (
+    "69246c2df3cf3f408af2a88d0243e7a55fd3c0f8b55cdebc6ef396e12b61b2f4"
+)
+APPLICATION_DISPOSITIONS_PAYLOAD_SHA256 = (
+    "a25ed0def38578ea854be59e65c49b2b322b6a96c6d93d1749c48fb88b460227"
+)
+APPLICATION_OBJECT_COUNT = 5
+APPLICATION_REFUSAL_COUNT = 6
+APPLICATION_DISPOSITION_COUNT = 11
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 SAFE_BASENAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}\Z")
 IMPLEMENTATION_BASENAME = re.compile(
@@ -786,113 +810,207 @@ def load_json(raw: bytes, label: str) -> dict[str, Any]:
     return value
 
 
-def validate_contract(raw: bytes) -> dict[str, Any]:
-    require(sha256(raw) == CONTRACT_SHA256, "link-proof contract bytes changed")
-    contract = load_json(raw, "link-proof contract")
+CONTRACT_PROFILES: dict[str, dict[str, Any]] = {
+    CONTRACT_SHA256: {
+        "contract_schema": CONTRACT_SCHEMA,
+        "profile": None,
+        "source_authority": None,
+        "object_schema": OBJECT_SCHEMA,
+        "object_sha256": OBJECT_MANIFEST_SHA256,
+        "object_payload_sha256": OBJECT_MANIFEST_PAYLOAD_SHA256,
+        "object_count": OBJECT_COUNT,
+        "dispositions_schema": DISPOSITIONS_SCHEMA,
+        "dispositions_sha256": DISPOSITIONS_SHA256,
+        "dispositions_payload_sha256": DISPOSITIONS_PAYLOAD_SHA256,
+        "disposition_count": DISPOSITION_COUNT,
+        "refusal_count": REFUSAL_COUNT,
+    },
+    APPLICATION_CONTRACT_SHA256: {
+        "contract_schema": (
+            "fre.aot.search-tag29-static-link-proof-contract.v2"
+        ),
+        "profile": "ripgrep-application-v2",
+        "source_authority": {
+            "fixture_manifest_payload_sha256": (
+                "1cbda700087f5506daa91b0657070cbf39fac68222ff84e273d1d83c09f6ebfd"
+            ),
+            "fixture_manifest_sha256": (
+                "b20181470c604d01d2ec236259293cfcb6e5eff145bcd3e4daa91554c8cebcca"
+            ),
+            "freeze_payload_sha256": (
+                "3359ab7c620482d67d67d09903981c8b322c5268cfe0640e273de0f778192822"
+            ),
+            "freeze_sha256": (
+                "a491f2fd1e19d01cca9a237770c8cdefa04a90e3623dadfcc4c79012eb2abd52"
+            ),
+            "inventory_payload_sha256": (
+                "68af2c6dd547935d3c4dd095f18958035104d153b355ff416c46c78a922b0979"
+            ),
+            "inventory_sha256": (
+                "2aec7b83cfcafbd0f8a9cab2e08941882b34d39786d26f26837c671378f1275b"
+            ),
+            "manifest_preparer_source_sha256": (
+                "b85e6c55d4f0641ffee858246a479412eb859f93d3a43b4fd51b9d5abbf3bee3"
+            ),
+            "selector_contract_sha256": (
+                "38ca5ebc1b239b541afcf9eeb679bf8b156c8690e7422a96f69a9457a155daf0"
+            ),
+            "selector_implementation_sha256": (
+                "35aacbca100dde74a2ead493ceab1197c813d37c17d5f4a9d3e62938c3a2b610"
+            ),
+            "upstream_commit": (
+                "f9c05a949d1a0dc8e16dee28ca9605d38611faeb"
+            ),
+            "upstream_tree": "ce81df4f8cad2dbfd1afb6b3ba53fd19846a5794",
+        },
+        "object_schema": APPLICATION_OBJECT_SCHEMA,
+        "object_sha256": APPLICATION_OBJECT_MANIFEST_SHA256,
+        "object_payload_sha256": (
+            APPLICATION_OBJECT_MANIFEST_PAYLOAD_SHA256
+        ),
+        "object_count": APPLICATION_OBJECT_COUNT,
+        "dispositions_schema": APPLICATION_DISPOSITIONS_SCHEMA,
+        "dispositions_sha256": APPLICATION_DISPOSITIONS_SHA256,
+        "dispositions_payload_sha256": (
+            APPLICATION_DISPOSITIONS_PAYLOAD_SHA256
+        ),
+        "disposition_count": APPLICATION_DISPOSITION_COUNT,
+        "refusal_count": APPLICATION_REFUSAL_COUNT,
+    },
+}
+
+
+def contract_profile(raw: bytes) -> dict[str, Any]:
+    digest = sha256(raw)
     require(
-        contract
-        == {
-            "schema": CONTRACT_SCHEMA,
-            "status": "result-blind-prequalification",
-            "object_candidates": {
-                "schema": OBJECT_SCHEMA,
-                "file_sha256": OBJECT_MANIFEST_SHA256,
-                "payload_sha256": OBJECT_MANIFEST_PAYLOAD_SHA256,
-                "count": OBJECT_COUNT,
-            },
-            "literal_dispositions": {
-                "schema": DISPOSITIONS_SCHEMA,
-                "file_sha256": DISPOSITIONS_SHA256,
-                "payload_sha256": DISPOSITIONS_PAYLOAD_SHA256,
-                "count": DISPOSITION_COUNT,
-                "object_count": OBJECT_COUNT,
-                "refusal_count": REFUSAL_COUNT,
-            },
-            "engine": {
-                "architecture": "aarch64",
-                "backend_tag": 29,
-                "backend_version": "SEARCH_V16",
-                "candidate_policy": 15,
-                "backend_name": "AsimdV16",
-                "llvm": False,
-            },
-            "targets": {
-                "macos": {
-                    "triple": "aarch64-apple-darwin",
-                    "object_format": "macho64-arm64",
-                    "link_map_format": "apple-ld",
-                    "frozen_host": "local-apple-aarch64-asimd",
-                    "canonical_host": "apple-aarch64-asimd",
-                    "features": {
-                        "architecture": "aarch64",
-                        "asimd": True,
-                        "sve": False,
-                        "sve2": False,
-                        "sve_vector_bytes": None,
-                    },
-                },
-                "linux": {
-                    "triple": "aarch64-unknown-linux-gnu",
-                    "object_format": "elf64-little-aarch64",
-                    "link_map_format": "gnu-or-lld",
-                    "frozen_host": "zstd-eval-ec2-aarch64-asimd-sve2-vl16",
-                    "canonical_host": "c9g-aarch64-asimd-sve2",
-                    "features": {
-                        "architecture": "aarch64",
-                        "asimd": True,
-                        "sve": True,
-                        "sve2": True,
-                        "sve_vector_bytes": 16,
-                    },
+        digest in CONTRACT_PROFILES,
+        "link-proof contract bytes changed",
+    )
+    return CONTRACT_PROFILES[digest]
+
+
+def expected_contract(profile: dict[str, Any]) -> dict[str, Any]:
+    contract = {
+        "schema": profile["contract_schema"],
+        "status": "result-blind-prequalification",
+        "object_candidates": {
+            "schema": profile["object_schema"],
+            "file_sha256": profile["object_sha256"],
+            "payload_sha256": profile["object_payload_sha256"],
+            "count": profile["object_count"],
+        },
+        "literal_dispositions": {
+            "schema": profile["dispositions_schema"],
+            "file_sha256": profile["dispositions_sha256"],
+            "payload_sha256": profile["dispositions_payload_sha256"],
+            "count": profile["disposition_count"],
+            "object_count": profile["object_count"],
+            "refusal_count": profile["refusal_count"],
+        },
+        "engine": {
+            "architecture": "aarch64",
+            "backend_tag": 29,
+            "backend_version": "SEARCH_V16",
+            "candidate_policy": 15,
+            "backend_name": "AsimdV16",
+            "llvm": False,
+        },
+        "targets": {
+            "macos": {
+                "triple": "aarch64-apple-darwin",
+                "object_format": "macho64-arm64",
+                "link_map_format": "apple-ld",
+                "frozen_host": "local-apple-aarch64-asimd",
+                "canonical_host": "apple-aarch64-asimd",
+                "features": {
+                    "architecture": "aarch64",
+                    "asimd": True,
+                    "sve": False,
+                    "sve2": False,
+                    "sve_vector_bytes": None,
                 },
             },
-            "artifacts": {
-                "implementation_basename": "external-search-{ordinal}-implementation.o",
-                "glue_basename": "external-search-{ordinal}-family-glue.o",
-                "compile_receipt_basename": "external-search-{ordinal}-compile-receipt.bin",
-                "implementation_linker_input_multiplicity": 1,
-                "glue_linker_input_multiplicity": 1,
-            },
-            "symbols": {
-                "entry_prefix": ENTRY_PREFIX,
-                "payload_prefix": PAYLOAD_PREFIX,
-                "metadata_prefix": METADATA_PREFIX,
-                "glue_prefix": GLUE_PREFIX,
-                "identity_hex_bytes": 32,
-                "glue_required_implementation_relocation_targets": [
-                    "entry",
-                    "payload",
-                    "metadata",
-                ],
-            },
-            "receipt_domains": {
-                "glue_symbol": "FRE-SEARCH-TAG29-GLUE-SYMBOL\\0\\x01",
-                "link_map_origin": "FRE-SEARCH-TAG29-LINK-MAP-ORIGIN\\0\\x01",
-                "final_image_retention": "FRE-SEARCH-TAG29-FINAL-IMAGE-RETENTION\\0\\x01",
-            },
-            "limits": {
-                "maximum_manifest_bytes": 4194304,
-                "maximum_build_receipt_bytes": 4194304,
-                "maximum_link_receipt_bytes": 8388608,
-                "maximum_object_bytes": 16777216,
-                "maximum_compile_receipt_bytes": 65536,
-                "maximum_link_map_bytes": 134217728,
-                "maximum_linked_image_bytes": 536870912,
-                "maximum_linker_arguments": 65536,
-                "maximum_linker_argument_bytes": 1048576,
-                "maximum_symbols": 4000000,
-                "maximum_sections": 65535,
-                "maximum_relocations": 4000000,
-            },
-            "authority": {
-                "timing_results_read": False,
-                "benchmark_result_inputs": [],
-                "rebar_inputs": [],
-                "network": False,
-                "promotion_authority": False,
-                "required_output_schema": OUTPUT_SCHEMA,
+            "linux": {
+                "triple": "aarch64-unknown-linux-gnu",
+                "object_format": "elf64-little-aarch64",
+                "link_map_format": "gnu-or-lld",
+                "frozen_host": "zstd-eval-ec2-aarch64-asimd-sve2-vl16",
+                "canonical_host": "c9g-aarch64-asimd-sve2",
+                "features": {
+                    "architecture": "aarch64",
+                    "asimd": True,
+                    "sve": True,
+                    "sve2": True,
+                    "sve_vector_bytes": 16,
+                },
             },
         },
+        "artifacts": {
+            "implementation_basename": (
+                "external-search-{ordinal}-implementation.o"
+            ),
+            "glue_basename": "external-search-{ordinal}-family-glue.o",
+            "compile_receipt_basename": (
+                "external-search-{ordinal}-compile-receipt.bin"
+            ),
+            "implementation_linker_input_multiplicity": 1,
+            "glue_linker_input_multiplicity": 1,
+        },
+        "symbols": {
+            "entry_prefix": ENTRY_PREFIX,
+            "payload_prefix": PAYLOAD_PREFIX,
+            "metadata_prefix": METADATA_PREFIX,
+            "glue_prefix": GLUE_PREFIX,
+            "identity_hex_bytes": 32,
+            "glue_required_implementation_relocation_targets": [
+                "entry",
+                "payload",
+                "metadata",
+            ],
+        },
+        "receipt_domains": {
+            "glue_symbol": "FRE-SEARCH-TAG29-GLUE-SYMBOL\\0\\x01",
+            "link_map_origin": (
+                "FRE-SEARCH-TAG29-LINK-MAP-ORIGIN\\0\\x01"
+            ),
+            "final_image_retention": (
+                "FRE-SEARCH-TAG29-FINAL-IMAGE-RETENTION\\0\\x01"
+            ),
+        },
+        "limits": {
+            "maximum_manifest_bytes": 4194304,
+            "maximum_build_receipt_bytes": 4194304,
+            "maximum_link_receipt_bytes": 8388608,
+            "maximum_object_bytes": 16777216,
+            "maximum_compile_receipt_bytes": 65536,
+            "maximum_link_map_bytes": 134217728,
+            "maximum_linked_image_bytes": 536870912,
+            "maximum_linker_arguments": 65536,
+            "maximum_linker_argument_bytes": 1048576,
+            "maximum_symbols": 4000000,
+            "maximum_sections": 65535,
+            "maximum_relocations": 4000000,
+        },
+        "authority": {
+            "timing_results_read": False,
+            "benchmark_result_inputs": [],
+            "rebar_inputs": [],
+            "network": False,
+            "promotion_authority": False,
+            "required_output_schema": OUTPUT_SCHEMA,
+        },
+    }
+    if profile["profile"] is not None:
+        contract["profile"] = profile["profile"]
+        contract["source_authority"] = profile["source_authority"]
+    return contract
+
+
+def validate_contract(raw: bytes) -> dict[str, Any]:
+    profile = contract_profile(raw)
+    contract = load_json(raw, "link-proof contract")
+    require(
+        contract == expected_contract(profile),
         "link-proof contract fields changed",
     )
     return contract
@@ -902,14 +1020,16 @@ def candidate_key(candidate: dict[str, Any]) -> tuple[str, str]:
     return candidate["semantic_candidate_sha256"], candidate["literal_sha256"]
 
 
-def validate_candidate_manifest(root: dict[str, Any]) -> list[dict[str, Any]]:
+def validate_candidate_manifest(
+    root: dict[str, Any], profile: dict[str, Any]
+) -> list[dict[str, Any]]:
     payload = root["payload"]
     candidates = payload.get("candidates")
     require(
         is_strict_int(payload.get("candidate_count"), 1)
-        and payload["candidate_count"] == OBJECT_COUNT
+        and payload["candidate_count"] == profile["object_count"]
         and isinstance(candidates, list)
-        and len(candidates) == OBJECT_COUNT,
+        and len(candidates) == profile["object_count"],
         "object-candidate cardinality changed",
     )
     semantic: set[str] = set()
@@ -941,13 +1061,15 @@ def validate_candidate_manifest(root: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def validate_dispositions(
-    root: dict[str, Any], candidates: list[dict[str, Any]]
+    root: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    profile: dict[str, Any],
 ) -> list[dict[str, Any]]:
     payload = root["payload"]
     rows = payload.get("dispositions")
     require(
         isinstance(rows, list)
-        and len(rows) == DISPOSITION_COUNT,
+        and len(rows) == profile["disposition_count"],
         "literal-disposition cardinality changed",
     )
     eligible = [
@@ -961,8 +1083,8 @@ def validate_dispositions(
         if row.get("expected_compiler_disposition") == "structural-refusal"
     ]
     require(
-        len(eligible) == OBJECT_COUNT
-        and len(refusals) == REFUSAL_COUNT
+        len(eligible) == profile["object_count"]
+        and len(refusals) == profile["refusal_count"]
         and [candidate_key(row) for row in eligible]
         == [candidate_key(candidate) for candidate in candidates],
         "literal dispositions do not biject to object candidates",
@@ -1045,6 +1167,7 @@ def validate_build_receipt(
     candidates: list[dict[str, Any]],
     expected_refusals: list[dict[str, Any]],
     target_os: str,
+    profile: dict[str, Any],
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
     receipt = load_json(raw, "build receipt")
     required = {
@@ -1076,24 +1199,28 @@ def validate_build_receipt(
         and receipt["backend_version"] == "SEARCH_V16"
         and receipt["candidate_policy"] == 15
         and receipt["llvm"] is False
-        and receipt["object_candidate_manifest_schema"] == OBJECT_SCHEMA
-        and receipt["object_candidate_manifest_sha256"] == OBJECT_MANIFEST_SHA256
+        and receipt["object_candidate_manifest_schema"]
+        == profile["object_schema"]
+        and receipt["object_candidate_manifest_sha256"]
+        == profile["object_sha256"]
         and receipt["object_candidate_manifest_payload_sha256"]
-        == OBJECT_MANIFEST_PAYLOAD_SHA256
-        and receipt["object_candidate_count"] == OBJECT_COUNT
-        and receipt["literal_dispositions_sha256"] == DISPOSITIONS_SHA256
+        == profile["object_payload_sha256"]
+        and receipt["object_candidate_count"] == profile["object_count"]
+        and receipt["literal_dispositions_sha256"]
+        == profile["dispositions_sha256"]
         and receipt["literal_dispositions_payload_sha256"]
-        == DISPOSITIONS_PAYLOAD_SHA256
-        and receipt["literal_disposition_count"] == DISPOSITION_COUNT,
+        == profile["dispositions_payload_sha256"]
+        and receipt["literal_disposition_count"]
+        == profile["disposition_count"],
         "build receipt engine/input identity changed",
     )
     built = receipt["candidates"]
     refusals = receipt["refusals"]
     require(
         isinstance(built, list)
-        and len(built) == OBJECT_COUNT
+        and len(built) == profile["object_count"]
         and isinstance(refusals, list)
-        and len(refusals) == REFUSAL_COUNT,
+        and len(refusals) == profile["refusal_count"],
         "build receipt disposition cardinality changed",
     )
     compile_identities: set[str] = set()
@@ -1184,7 +1311,10 @@ def validate_build_receipt(
 
 
 def validate_link_receipt(
-    raw: bytes, build_sha: str, target_os: str
+    raw: bytes,
+    build_sha: str,
+    target_os: str,
+    profile: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[tuple[int, str], dict[str, Any]]]:
     root = load_json(raw, "link invocation receipt")
     exact_keys(root, {"schema", "payload_sha256", "payload"}, "link receipt")
@@ -1258,12 +1388,13 @@ def validate_link_receipt(
     )
     inputs = payload["inputs"]
     require(
-        isinstance(inputs, list) and len(inputs) == OBJECT_COUNT * 2,
+        isinstance(inputs, list)
+        and len(inputs) == profile["object_count"] * 2,
         "link input cardinality changed",
     )
     expected_order = [
         (ordinal, kind)
-        for ordinal in range(OBJECT_COUNT)
+        for ordinal in range(profile["object_count"])
         for kind in ("implementation", "glue")
     ]
     indexed: dict[tuple[int, str], dict[str, Any]] = {}
@@ -1299,7 +1430,7 @@ def validate_link_receipt(
         or GLUE_BASENAME.search(argument.rsplit("/", 1)[-1])
     ]
     require(
-        len(external_object_arguments) == OBJECT_COUNT * 2
+        len(external_object_arguments) == profile["object_count"] * 2
         and set(external_object_arguments) == candidate_paths,
         "expanded linker argv contains missing or extra candidate objects",
     )
@@ -1494,6 +1625,7 @@ def verify(
     contract_raw = read_path_regular(
         contract_path, 128 * 1024, "link-proof contract"
     )
+    profile = contract_profile(contract_raw)
     contract = validate_contract(contract_raw)
     limits = contract["limits"]
     object_raw = read_path_regular(
@@ -1503,12 +1635,12 @@ def verify(
     )
     object_root = load_envelope(
         object_raw,
-        OBJECT_SCHEMA,
-        OBJECT_MANIFEST_SHA256,
-        OBJECT_MANIFEST_PAYLOAD_SHA256,
+        profile["object_schema"],
+        profile["object_sha256"],
+        profile["object_payload_sha256"],
         "object-candidate manifest",
     )
-    candidates = validate_candidate_manifest(object_root)
+    candidates = validate_candidate_manifest(object_root, profile)
     dispositions_raw = read_path_regular(
         dispositions_path,
         limits["maximum_manifest_bytes"],
@@ -1516,12 +1648,14 @@ def verify(
     )
     dispositions_root = load_envelope(
         dispositions_raw,
-        DISPOSITIONS_SCHEMA,
-        DISPOSITIONS_SHA256,
-        DISPOSITIONS_PAYLOAD_SHA256,
+        profile["dispositions_schema"],
+        profile["dispositions_sha256"],
+        profile["dispositions_payload_sha256"],
         "literal dispositions",
     )
-    expected_refusals = validate_dispositions(dispositions_root, candidates)
+    expected_refusals = validate_dispositions(
+        dispositions_root, candidates, profile
+    )
 
     directory = HeldDirectory(artifact_directory)
     try:
@@ -1543,10 +1677,10 @@ def verify(
         )
         require(target_os in {"macos", "linux"}, "link receipt target OS changed")
         build_receipt, built_candidates, built_refusals = validate_build_receipt(
-            build_raw, candidates, expected_refusals, target_os
+            build_raw, candidates, expected_refusals, target_os, profile
         )
         link_payload, link_inputs = validate_link_receipt(
-            link_raw, sha256(build_raw), target_os
+            link_raw, sha256(build_raw), target_os, profile
         )
         link_map_raw = directory.read(
             link_payload["link_map_basename"],
@@ -1633,10 +1767,14 @@ def verify(
         "canonical_host": link_payload["canonical_host"],
         "target_triple": link_payload["target_triple"],
         "features": link_payload["features"],
-        "object_manifest_sha256": OBJECT_MANIFEST_SHA256,
-        "object_manifest_payload_sha256": OBJECT_MANIFEST_PAYLOAD_SHA256,
-        "literal_dispositions_sha256": DISPOSITIONS_SHA256,
-        "literal_dispositions_payload_sha256": DISPOSITIONS_PAYLOAD_SHA256,
+        "object_manifest_sha256": profile["object_sha256"],
+        "object_manifest_payload_sha256": profile[
+            "object_payload_sha256"
+        ],
+        "literal_dispositions_sha256": profile["dispositions_sha256"],
+        "literal_dispositions_payload_sha256": profile[
+            "dispositions_payload_sha256"
+        ],
         "verifier_source_sha256": sha256(self_raw),
         "verifier_contract_sha256": sha256(contract_raw),
         "external_build_receipt_sha256": sha256(build_raw),

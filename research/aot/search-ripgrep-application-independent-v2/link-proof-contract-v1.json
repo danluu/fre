@@ -1,0 +1,116 @@
+{
+  "artifacts": {
+    "compile_receipt_basename": "external-search-{ordinal}-compile-receipt.bin",
+    "glue_basename": "external-search-{ordinal}-family-glue.o",
+    "glue_linker_input_multiplicity": 1,
+    "implementation_basename": "external-search-{ordinal}-implementation.o",
+    "implementation_linker_input_multiplicity": 1
+  },
+  "authority": {
+    "benchmark_result_inputs": [],
+    "network": false,
+    "promotion_authority": false,
+    "rebar_inputs": [],
+    "required_output_schema": "fre.aot.search-tag29-compiler-object-link-evidence.v1",
+    "timing_results_read": false
+  },
+  "engine": {
+    "architecture": "aarch64",
+    "backend_name": "AsimdV16",
+    "backend_tag": 29,
+    "backend_version": "SEARCH_V16",
+    "candidate_policy": 15,
+    "llvm": false
+  },
+  "limits": {
+    "maximum_build_receipt_bytes": 4194304,
+    "maximum_compile_receipt_bytes": 65536,
+    "maximum_link_map_bytes": 134217728,
+    "maximum_link_receipt_bytes": 8388608,
+    "maximum_linked_image_bytes": 536870912,
+    "maximum_linker_argument_bytes": 1048576,
+    "maximum_linker_arguments": 65536,
+    "maximum_manifest_bytes": 4194304,
+    "maximum_object_bytes": 16777216,
+    "maximum_relocations": 4000000,
+    "maximum_sections": 65535,
+    "maximum_symbols": 4000000
+  },
+  "literal_dispositions": {
+    "count": 11,
+    "file_sha256": "69246c2df3cf3f408af2a88d0243e7a55fd3c0f8b55cdebc6ef396e12b61b2f4",
+    "object_count": 5,
+    "payload_sha256": "a25ed0def38578ea854be59e65c49b2b322b6a96c6d93d1749c48fb88b460227",
+    "refusal_count": 6,
+    "schema": "fre.aot.search-tag29-application-literal-dispositions.v1"
+  },
+  "object_candidates": {
+    "count": 5,
+    "file_sha256": "2e6612dc25e1186e0dd78597f045a4ece6ecc8dafcc2270cacc445be8753aff4",
+    "payload_sha256": "5ffcb2ba1816a0bca3f5e4d74773e1cfff90288eb3c40d599256b380b3342dab",
+    "schema": "fre.aot.search-tag29-application-object-candidates.v1"
+  },
+  "profile": "ripgrep-application-v2",
+  "receipt_domains": {
+    "final_image_retention": "FRE-SEARCH-TAG29-FINAL-IMAGE-RETENTION\\0\\x01",
+    "glue_symbol": "FRE-SEARCH-TAG29-GLUE-SYMBOL\\0\\x01",
+    "link_map_origin": "FRE-SEARCH-TAG29-LINK-MAP-ORIGIN\\0\\x01"
+  },
+  "schema": "fre.aot.search-tag29-static-link-proof-contract.v2",
+  "source_authority": {
+    "fixture_manifest_payload_sha256": "1cbda700087f5506daa91b0657070cbf39fac68222ff84e273d1d83c09f6ebfd",
+    "fixture_manifest_sha256": "b20181470c604d01d2ec236259293cfcb6e5eff145bcd3e4daa91554c8cebcca",
+    "freeze_payload_sha256": "3359ab7c620482d67d67d09903981c8b322c5268cfe0640e273de0f778192822",
+    "freeze_sha256": "a491f2fd1e19d01cca9a237770c8cdefa04a90e3623dadfcc4c79012eb2abd52",
+    "inventory_payload_sha256": "68af2c6dd547935d3c4dd095f18958035104d153b355ff416c46c78a922b0979",
+    "inventory_sha256": "2aec7b83cfcafbd0f8a9cab2e08941882b34d39786d26f26837c671378f1275b",
+    "manifest_preparer_source_sha256": "b85e6c55d4f0641ffee858246a479412eb859f93d3a43b4fd51b9d5abbf3bee3",
+    "selector_contract_sha256": "38ca5ebc1b239b541afcf9eeb679bf8b156c8690e7422a96f69a9457a155daf0",
+    "selector_implementation_sha256": "35aacbca100dde74a2ead493ceab1197c813d37c17d5f4a9d3e62938c3a2b610",
+    "upstream_commit": "f9c05a949d1a0dc8e16dee28ca9605d38611faeb",
+    "upstream_tree": "ce81df4f8cad2dbfd1afb6b3ba53fd19846a5794"
+  },
+  "status": "result-blind-prequalification",
+  "symbols": {
+    "entry_prefix": "fre_aot_search_entry_v1_",
+    "glue_prefix": "fre_aot_search_span_glue_v1_",
+    "glue_required_implementation_relocation_targets": [
+      "entry",
+      "payload",
+      "metadata"
+    ],
+    "identity_hex_bytes": 32,
+    "metadata_prefix": "fre_aot_metadata_v1_",
+    "payload_prefix": "fre_aot_payload_v1_"
+  },
+  "targets": {
+    "linux": {
+      "canonical_host": "c9g-aarch64-asimd-sve2",
+      "features": {
+        "architecture": "aarch64",
+        "asimd": true,
+        "sve": true,
+        "sve2": true,
+        "sve_vector_bytes": 16
+      },
+      "frozen_host": "zstd-eval-ec2-aarch64-asimd-sve2-vl16",
+      "link_map_format": "gnu-or-lld",
+      "object_format": "elf64-little-aarch64",
+      "triple": "aarch64-unknown-linux-gnu"
+    },
+    "macos": {
+      "canonical_host": "apple-aarch64-asimd",
+      "features": {
+        "architecture": "aarch64",
+        "asimd": true,
+        "sve": false,
+        "sve2": false,
+        "sve_vector_bytes": null
+      },
+      "frozen_host": "local-apple-aarch64-asimd",
+      "link_map_format": "apple-ld",
+      "object_format": "macho64-arm64",
+      "triple": "aarch64-apple-darwin"
+    }
+  }
+}
