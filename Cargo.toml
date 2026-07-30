@@ -37,6 +37,7 @@ members = [
     "tools/rebar-manifest",
     "tools/rust-regex-conformance",
     "tools/fre-holdout",
+    "tools/search-production-family-promotion",
     "tools/fre-unsafe-lint-boundary",
 ]
 
