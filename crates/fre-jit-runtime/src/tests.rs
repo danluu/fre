@@ -3054,6 +3054,104 @@ fn v13_adaptive_recovery_respects_every_guarded_width_shape_and_mutation_offset(
 }
 
 #[test]
+fn v14_learned_column_respects_guarded_empty_hit_disable_and_tail_transitions() {
+    let _lock = native_test_lock();
+    let mut comparisons = 0_u64;
+
+    for width in 2_usize..=32 {
+        for literal in [
+            vec![b'a'; width],
+            (0..width)
+                .map(|offset| if offset & 1 == 0 { b'a' } else { b'b' })
+                .collect::<Vec<_>>(),
+        ] {
+            let program = build_exact_literal::<Span>(
+                &literal,
+                AnchorFlags::default(),
+                ValidateLimits::default(),
+            )
+            .expect("V14 exact program");
+            let image = emit_audited_with_backend(
+                &program,
+                SearchBackendPolicy::AsimdV14,
+                EmitLimits::default(),
+            )
+            .expect("audited V14 image");
+            assert_eq!(
+                image.as_image().backend_version(),
+                BackendVersion::SEARCH_V14
+            );
+            let kernel =
+                publish_audited::<Span>(&image, PublicationLimits::default()).expect("publish V14");
+            let avoid = (0_u16..=255)
+                .map(|value| u8::try_from(value).expect("bounded byte"))
+                .find(|byte| !literal.contains(byte))
+                .expect("literal leaves one avoiding byte");
+
+            for mutation_offset in 0..width {
+                let mut near_miss = literal.clone();
+                near_miss[mutation_offset] = avoid;
+                let mut bytes = vec![avoid; 4_093];
+                for chunk in bytes.chunks_exact_mut(width) {
+                    chunk.copy_from_slice(&near_miss);
+                }
+                let match_start = bytes.len() - width;
+                install_literal(&mut bytes, match_start, &literal);
+                platform::with_guarded_haystack(&bytes, true, |guarded| {
+                    assert_native_matches(
+                        &program,
+                        &kernel,
+                        guarded,
+                        SearchWindow::new(0, guarded.len()),
+                    );
+                })
+                .expect("guarded every-offset V14 learned-empty/tail stream");
+                comparisons = comparisons.checked_add(1).expect("bounded comparisons");
+            }
+        }
+    }
+    assert_eq!(comparisons, 1_054);
+
+    // Teach one unselected mismatch, force the one-way fallback with a later
+    // six-column survivor, and finally find the exact literal. This exercises
+    // disabled-state persistence across later misses on actual strict-W^X
+    // published code.
+    let literal = [b'a'; 16];
+    let program =
+        build_exact_literal::<Span>(&literal, AnchorFlags::default(), ValidateLimits::default())
+            .expect("V14 transition program");
+    let image = emit_audited_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV14,
+        EmitLimits::default(),
+    )
+    .expect("audited V14 transition image");
+    let kernel =
+        publish_audited::<Span>(&image, PublicationLimits::default()).expect("publish V14");
+    let mut bytes = Vec::new();
+    // The frozen repeated-byte five-column policy selects 0, 1, 2, 3, and
+    // 15 at width 16, leaving both transition offsets unselected.
+    for (mutation, chunks) in [(5_u16, 16_usize), (7, 16)] {
+        let mut near_miss = literal;
+        near_miss[usize::from(mutation)] = b'x';
+        for _ in 0..chunks {
+            bytes.extend_from_slice(&near_miss);
+        }
+    }
+    bytes.extend_from_slice(&[b'z'; 13]);
+    bytes.extend_from_slice(&literal);
+    platform::with_guarded_haystack(&bytes, true, |guarded| {
+        assert_native_matches(
+            &program,
+            &kernel,
+            guarded,
+            SearchWindow::new(0, guarded.len()),
+        );
+    })
+    .expect("guarded V14 learned-hit/relearn transition");
+}
+
+#[test]
 fn v8_adaptive_secondary_screen_rechecks_primary_before_fallback() {
     const WIDE_CANDIDATES: usize = 64;
     const PRIMARY_OFFSET: usize = 7;

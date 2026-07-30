@@ -4551,6 +4551,7 @@ fn explicit_search_backend_policy_selects_distinct_artifact_identities() {
         (SearchBackendPolicy::AsimdV11, BackendVersion::SEARCH_V11),
         (SearchBackendPolicy::AsimdV12, BackendVersion::SEARCH_V12),
         (SearchBackendPolicy::AsimdV13, BackendVersion::SEARCH_V13),
+        (SearchBackendPolicy::AsimdV14, BackendVersion::SEARCH_V14),
         (SearchBackendPolicy::Sve16, BackendVersion::SEARCH_SVE16_V1),
         (
             SearchBackendPolicy::Sve2Fixed16,
@@ -6811,6 +6812,394 @@ fn v13_adaptive_retained_mask_is_audited_and_matches_every_offset() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the V14 matrix binds its learned-state instruction graph, every width/offset/shape semantic, nonstationary transitions, output contracts, and relabel resistance"
+)]
+fn v14_persistent_learned_column_is_audited_and_matches_every_offset() {
+    let mut comparisons = 0_u64;
+    for width in 1_usize..=MAX_REPEATED_CONFIRM_BYTES {
+        let literals = [
+            (0..width)
+                .map(|offset| {
+                    u8::try_from(offset)
+                        .expect("bounded width")
+                        .wrapping_mul(61)
+                        .wrapping_add(7)
+                })
+                .collect::<Vec<_>>(),
+            vec![b'a'; width],
+            (0..width)
+                .map(|offset| if offset & 1 == 0 { b'a' } else { b'b' })
+                .collect::<Vec<_>>(),
+        ];
+        for literal in literals {
+            let program = build_exact_literal::<Span>(
+                &literal,
+                AnchorFlags::default(),
+                ValidateLimits::default(),
+            )
+            .expect("V14 Span IR");
+            let image = emit_with_backend(
+                &program,
+                SearchBackendPolicy::AsimdV14,
+                EmitLimits::default(),
+            )
+            .expect("V14 exact image");
+            assert_eq!(image.backend_version(), BackendVersion::SEARCH_V14);
+            let manifest = image.search_manifest().expect("V14 manifest");
+            assert_eq!(manifest.candidate_policy_version, 14);
+            assert!(
+                [
+                    manifest.primary_offset,
+                    manifest.secondary_offset,
+                    manifest.verification_offset,
+                    manifest.quaternary_offset,
+                    manifest.quinary_offset,
+                ]
+                .contains(&0),
+                "the authenticated dual-endpoint policy always covers literal byte zero"
+            );
+            audit(&image).expect("independent V14 whole-template audit");
+            let aot = image.to_aot(AotLimits::default()).expect("bounded V14 AOT");
+            assert_eq!(&aot.as_bytes()[..8], b"FREA64\0\x1b");
+
+            let decoded = decode(image.code()).expect("V14 decode");
+            assert_eq!(
+                decoded
+                    .iter()
+                    .filter(|instruction| {
+                        **instruction
+                            == DecodedInstruction::DuplicateByte16 {
+                                destination: 24,
+                                source: 13,
+                            }
+                    })
+                    .count(),
+                1
+            );
+            assert_eq!(
+                decoded
+                    .iter()
+                    .filter(|instruction| {
+                        **instruction
+                            == DecodedInstruction::DuplicateByte16 {
+                                destination: 25,
+                                source: 11,
+                            }
+                    })
+                    .count(),
+                1
+            );
+            assert_eq!(
+                decoded
+                    .iter()
+                    .filter(|instruction| {
+                        **instruction
+                            == DecodedInstruction::MoveVectorByteTo32 {
+                                destination: 10,
+                                source: 25,
+                            }
+                    })
+                    .count(),
+                2
+            );
+
+            let avoid = (0_u16..=255)
+                .map(|value| u8::try_from(value).expect("bounded byte"))
+                .find(|byte| !literal.contains(byte))
+                .expect("literal leaves an avoiding byte");
+            for mutation_offset in 0..width {
+                let mut near_miss = literal.clone();
+                near_miss[mutation_offset] = avoid;
+                let mut haystack = Vec::new();
+                for _ in 0..17 {
+                    haystack.extend_from_slice(&near_miss);
+                }
+                haystack.extend_from_slice(&literal);
+                for (start, end) in [
+                    (0, haystack.len()),
+                    (haystack.len().min(1), haystack.len()),
+                    (0, haystack.len().saturating_sub(1)),
+                ] {
+                    let window = SearchWindow::new(start, end);
+                    let expected = program
+                        .execute(&haystack, window, ExecutionLimits::unlimited())
+                        .expect("V14 oracle")
+                        .output()
+                        .map(|span| (span.start(), span.end()));
+                    let actual =
+                        simulate(&image, &haystack, start, end).expect("V14 safe ISA simulation");
+                    assert_eq!(
+                        span_output(actual),
+                        expected,
+                        "width={width} mutation={mutation_offset} literal={literal:?} \
+                         window={start}..{end}"
+                    );
+                    comparisons = comparisons.checked_add(1).expect("bounded matrix");
+                }
+            }
+        }
+    }
+    assert_eq!(comparisons, 4_752);
+
+    // The first region teaches one unselected mismatch column and immediately
+    // produces a six-column survivor, forcing the one-way V13 fallback. The
+    // second region then exercises multiple later exact misses without any
+    // re-entry to discovery before the final exact match.
+    let literal = [b'a'; 16];
+    let program =
+        build_exact_literal::<Span>(&literal, AnchorFlags::default(), ValidateLimits::default())
+            .expect("V14 transition IR");
+    let image = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV14,
+        EmitLimits::default(),
+    )
+    .expect("V14 transition image");
+    let selected = {
+        let manifest = image.search_manifest().expect("V14 transition manifest");
+        [
+            manifest.primary_offset,
+            manifest.secondary_offset,
+            manifest.verification_offset,
+            manifest.quaternary_offset,
+            manifest.quinary_offset,
+        ]
+    };
+    let unselected = (0_u16..16)
+        .filter(|offset| !selected.contains(offset))
+        .collect::<Vec<_>>();
+    assert!(unselected.len() >= 2);
+    let mut haystack = Vec::new();
+    for (mutation, chunks) in [(unselected[0], 8_usize), (unselected[1], 8)] {
+        let mut near_miss = literal;
+        near_miss[usize::from(mutation)] = b'x';
+        for _ in 0..chunks {
+            haystack.extend_from_slice(&near_miss);
+        }
+    }
+    haystack.extend_from_slice(&literal);
+    let expected = program
+        .execute(
+            &haystack,
+            SearchWindow::new(0, haystack.len()),
+            ExecutionLimits::unlimited(),
+        )
+        .expect("V14 transition oracle")
+        .output()
+        .map(|span| (span.start(), span.end()));
+    let decoded = decode(image.code()).expect("V14 transition decode");
+    let learned_byte = decoded
+        .iter()
+        .position(|instruction| {
+            *instruction
+                == DecodedInstruction::DuplicateByte16 {
+                    destination: 24,
+                    source: 13,
+                }
+        })
+        .expect("V14 learned-byte DUP");
+    let learned_offset = decoded
+        .iter()
+        .position(|instruction| {
+            *instruction
+                == DecodedInstruction::DuplicateByte16 {
+                    destination: 25,
+                    source: 11,
+                }
+        })
+        .expect("V14 learned-offset DUP");
+    assert_eq!(learned_offset, learned_byte + 1);
+    let candidate_miss = decoded
+        .windows(3)
+        .position(|window| {
+            window[0]
+                == DecodedInstruction::SubtractImmediate64 {
+                    destination: 10,
+                    source: 0,
+                    immediate: 1,
+                }
+                && window[1]
+                    == DecodedInstruction::AndRegister64 {
+                        destination: 0,
+                        left: 0,
+                        right: 10,
+                    }
+                && matches!(
+                    window[2],
+                    DecodedInstruction::CompareBranchZero64 {
+                        register: 11,
+                        nonzero: false,
+                        ..
+                    }
+                )
+        })
+        .expect("V14 candidate-miss state gate");
+    let target = |index: usize| {
+        let displacement = match decoded[index] {
+            DecodedInstruction::Branch { displacement }
+            | DecodedInstruction::BranchCondition { displacement, .. }
+            | DecodedInstruction::CompareBranchZero64 { displacement, .. } => displacement,
+            _ => panic!("instruction {index} is not a decoded V14 branch"),
+        };
+        let address = i64::try_from(index)
+            .expect("small instruction index")
+            .checked_mul(4)
+            .and_then(|address| address.checked_add(i64::from(displacement)))
+            .expect("bounded V14 branch target");
+        assert_eq!(address % 4, 0);
+        usize::try_from(address / 4).expect("nonnegative V14 target")
+    };
+    let discover = target(candidate_miss + 2);
+    let learned_column_probes = decoded
+        .iter()
+        .enumerate()
+        .filter_map(|(index, instruction)| {
+            (*instruction
+                == DecodedInstruction::MoveVectorByteTo32 {
+                    destination: 10,
+                    source: 25,
+                })
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(learned_column_probes.len(), 2);
+    let disable_sites = decoded
+        .iter()
+        .enumerate()
+        .filter_map(|(index, instruction)| {
+            (*instruction
+                == DecodedInstruction::MoveZero64 {
+                    destination: 11,
+                    immediate: 2,
+                    shift: 0,
+                })
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(disable_sites.len(), 3);
+    let six_survivor_disable = disable_sites
+        .iter()
+        .copied()
+        .find(|index| learned_column_probes[0] < *index && *index < learned_column_probes[1])
+        .expect("current six-column survivor disable site");
+    assert!(
+        decoded
+            .iter()
+            .enumerate()
+            .skip(learned_offset + 1)
+            .all(|(index, instruction)| {
+                !matches!(
+                    instruction,
+                    DecodedInstruction::Branch { .. }
+                        | DecodedInstruction::BranchCondition { .. }
+                        | DecodedInstruction::CompareBranchZero64 { .. }
+                ) || target(index) != discover
+            }),
+        "no post-discovery CFG edge may re-enter discovery"
+    );
+
+    let (actual, trace) = simulate_with_instruction_trace(&image, &haystack, 0, haystack.len())
+        .expect("V14 nonstationary traced safe ISA simulation");
+    assert_eq!(span_output(actual), expected);
+    assert_eq!(
+        trace.iter().filter(|&&index| index == learned_byte).count(),
+        1,
+        "the learned-byte DUP executes exactly once"
+    );
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|&&index| index == learned_offset)
+            .count(),
+        1,
+        "the learned-offset DUP executes exactly once"
+    );
+    let disable_trace = trace
+        .iter()
+        .position(|&index| index == six_survivor_disable)
+        .expect("the current six-column survivor disables learned mode");
+    assert!(
+        trace[disable_trace + 1..]
+            .iter()
+            .filter(|&&index| index == candidate_miss)
+            .count()
+            >= 2,
+        "at least two later exact misses remain in the one-way V13 fallback"
+    );
+
+    for image in [
+        {
+            let program = build_exact_literal::<Exists>(
+                &literal,
+                AnchorFlags::default(),
+                ValidateLimits::default(),
+            )
+            .expect("V14 Exists IR");
+            emit_with_backend(
+                &program,
+                SearchBackendPolicy::AsimdV14,
+                EmitLimits::default(),
+            )
+            .expect("V14 Exists")
+        },
+        {
+            let program = build_exact_literal::<SelectedEnd>(
+                &literal,
+                AnchorFlags::default(),
+                ValidateLimits::default(),
+            )
+            .expect("V14 SelectedEnd IR");
+            emit_with_backend(
+                &program,
+                SearchBackendPolicy::AsimdV14,
+                EmitLimits::default(),
+            )
+            .expect("V14 SelectedEnd")
+        },
+    ] {
+        audit(&image).expect("independent V14 output-template audit");
+    }
+
+    let canonical_v13 = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV13,
+        EmitLimits::default(),
+    )
+    .expect("canonical V13");
+    let canonical_v14 = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV14,
+        EmitLimits::default(),
+    )
+    .expect("canonical V14");
+    assert_ne!(canonical_v14.code(), canonical_v13.code());
+    assert_ne!(
+        canonical_v14.artifact_identity(),
+        canonical_v13.artifact_identity()
+    );
+
+    let mut v14_as_v13 = canonical_v14;
+    v14_as_v13.backend_version = BackendVersion::SEARCH_V13;
+    {
+        let manifest = v14_as_v13.search.as_mut().expect("V14 manifest");
+        manifest.backend_version = BackendVersion::SEARCH_V13;
+        manifest.candidate_policy_version = 13;
+    }
+    assert_resealed_search_rejected(v14_as_v13, "V14 code resealed as V13");
+
+    let mut v13_as_v14 = canonical_v13;
+    v13_as_v14.backend_version = BackendVersion::SEARCH_V14;
+    {
+        let manifest = v13_as_v14.search.as_mut().expect("V13 manifest");
+        manifest.backend_version = BackendVersion::SEARCH_V14;
+        manifest.candidate_policy_version = 14;
+    }
+    assert_resealed_search_rejected(v13_as_v14, "V13 code resealed as V14");
+}
+
+#[test]
 fn v13_adaptive_recovery_decoded_edges_cover_zero_one_and_max_remaining_columns() {
     for (width, expected_columns) in [(5_usize, 0_usize), (6, 1), (32, 27)] {
         let literal = vec![b'a'; width];
@@ -6999,13 +7388,14 @@ fn v13_adaptive_recovery_decoded_edges_cover_zero_one_and_max_remaining_columns(
 }
 
 #[test]
-fn v9_through_v13_reject_shapes_without_one_nonempty_unanchored_exact_candidate() {
+fn v9_through_v14_reject_shapes_without_one_nonempty_unanchored_exact_candidate() {
     for backend in [
         SearchBackendPolicy::AsimdV9,
         SearchBackendPolicy::AsimdV10,
         SearchBackendPolicy::AsimdV11,
         SearchBackendPolicy::AsimdV12,
         SearchBackendPolicy::AsimdV13,
+        SearchBackendPolicy::AsimdV14,
     ] {
         for anchors in [
             AnchorFlags {
@@ -9625,6 +10015,7 @@ fn simulate(
         instructions: &instructions,
         image,
         haystack,
+        instruction_trace: None,
     };
     machine.registers[0] = HAYSTACK_BASE;
     machine.registers[1] = u64::try_from(haystack.len()).map_err(|_| SimError::Arithmetic)?;
@@ -9632,6 +10023,40 @@ fn simulate(
     machine.registers[3] = u64::try_from(window_end).map_err(|_| SimError::Arithmetic)?;
     machine.registers[4] = RESULT_BASE;
     machine.run()
+}
+
+fn simulate_with_instruction_trace(
+    image: &NativeImage,
+    haystack: &[u8],
+    window_start: usize,
+    window_end: usize,
+) -> Result<(SimResult, Vec<usize>), SimError> {
+    let instructions = decode(image.code()).map_err(|_| SimError::InvalidProgramCounter)?;
+    let mut machine = SimMachine {
+        registers: [0; 32],
+        vectors: [[0; 16]; 32],
+        predicates: [0; 16],
+        zero: false,
+        carry: false,
+        pc: 0,
+        slot: NativeResult::default(),
+        steps: 0,
+        instruction_trace: Some(Vec::new()),
+        instructions: &instructions,
+        image,
+        haystack,
+    };
+    machine.registers[0] = HAYSTACK_BASE;
+    machine.registers[1] = u64::try_from(haystack.len()).map_err(|_| SimError::Arithmetic)?;
+    machine.registers[2] = u64::try_from(window_start).map_err(|_| SimError::Arithmetic)?;
+    machine.registers[3] = u64::try_from(window_end).map_err(|_| SimError::Arithmetic)?;
+    machine.registers[4] = RESULT_BASE;
+    let result = machine.run()?;
+    let trace = machine
+        .instruction_trace
+        .take()
+        .expect("trace-enabled simulator owns a trace");
+    Ok((result, trace))
 }
 
 fn simulate_aggregate(
@@ -9652,6 +10077,7 @@ fn simulate_aggregate(
         instructions: &instructions,
         image,
         haystack,
+        instruction_trace: None,
     };
     machine.registers[0] = HAYSTACK_BASE;
     machine.registers[1] = u64::try_from(haystack.len()).map_err(|_| SimError::Arithmetic)?;
@@ -9671,6 +10097,7 @@ struct SimMachine<'a> {
     instructions: &'a [DecodedInstruction],
     image: &'a NativeImage,
     haystack: &'a [u8],
+    instruction_trace: Option<Vec<usize>>,
 }
 
 impl SimMachine<'_> {
@@ -9697,6 +10124,9 @@ impl SimMachine<'_> {
             }
             self.steps += 1;
             let index = usize::try_from(self.pc / 4).map_err(|_| SimError::Arithmetic)?;
+            if let Some(instruction_trace) = self.instruction_trace.as_mut() {
+                instruction_trace.push(index);
+            }
             let instruction = *self
                 .instructions
                 .get(index)
