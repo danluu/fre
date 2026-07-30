@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     error::Error,
     fs,
     hint::black_box,
@@ -122,27 +123,34 @@ struct Measurement {
 
 fn main() -> Result<(), DynError> {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
-    let [mode, fixture_root] = arguments.as_slice() else {
-        return Err(invalid("usage: inspect|run FIXTURE_ROOT").into());
-    };
     if !generated::LINKED {
         return Err(invalid(
             "runner is selector-neutral; rebuild with FRE_EXTERNAL_SEARCH_STATIC_IDENTITY",
         )
         .into());
     }
-    let root = canonical_fixture_root(Path::new(fixture_root))?;
-    let manifest = load_manifest(&root)?;
-    match mode.as_str() {
-        "inspect" => inspect(&root, &manifest),
-        "run" => {
+    match arguments.as_slice() {
+        [mode, fixture_root] if mode == "inspect" => {
+            let root = canonical_fixture_root(Path::new(fixture_root))?;
+            let manifest = load_manifest(&root)?;
+            inspect(&root, &manifest)
+        }
+        [mode, fixture_root, shard, shards] if mode == "run" => {
             require(
                 generated::TIMING_PERMITTED,
                 "linked identity does not permit development timing",
             )?;
-            run(&root, &manifest)
+            let root = canonical_fixture_root(Path::new(fixture_root))?;
+            let manifest = load_manifest(&root)?;
+            let shard = parse_usize(shard, "shard")?;
+            let shards = parse_usize(shards, "shards")?;
+            require(
+                shards > 0 && shard < shards && shards <= manifest.payload.fixture_count,
+                "invalid shard coordinates",
+            )?;
+            run(&root, &manifest, shard, shards)
         }
-        _ => Err(invalid("mode must be inspect or run").into()),
+        _ => Err(invalid("usage: inspect FIXTURE_ROOT | run FIXTURE_ROOT SHARD SHARDS").into()),
     }
 }
 
@@ -151,20 +159,22 @@ fn inspect(root: &Path, manifest: &FixtureManifest) -> Result<(), DynError> {
     for candidate in &manifest.payload.candidates {
         let index = linked_candidate_index(candidate)?;
         let portable = build_portable(candidate)?;
-        let verified = adopt(index)?;
-        let automatic = SearchExactLiteralAutoAotV1::bind(&portable, verified)?;
-        require(
-            automatic.literal_bytes() == u32::try_from(candidate.literal_bytes)?,
-            "adopted literal width differs from fixture candidate",
-        )?;
+        let verified = index.map(adopt).transpose()?;
+        let automatic = verified
+            .map(|verified| SearchExactLiteralAutoAotV1::bind(&portable, verified))
+            .transpose()?;
+        if let Some(automatic) = &automatic {
+            require(
+                automatic.literal_bytes() == u32::try_from(candidate.literal_bytes)?,
+                "adopted literal width differs from fixture candidate",
+            )?;
+        }
         for row in &candidate.fixtures {
             let fixture = load_fixture(root, row)?;
             let literal = decode_hex(&candidate.literal_hex)?;
             verify_oracle(fixture.bytes(), &literal, row)?;
             let portable_match = portable.find(fixture.bytes(), SearchLimits::unlimited())?.0;
-            let automatic_match = automatic
-                .find(fixture.bytes(), SearchLimits::unlimited())?
-                .0;
+            let automatic_match = find_automatic(&portable, automatic.as_ref(), fixture.bytes())?;
             require(
                 project(portable_match) == row.expected_leftmost_span
                     && project(automatic_match) == row.expected_leftmost_span,
@@ -204,25 +214,51 @@ fn inspect(root: &Path, manifest: &FixtureManifest) -> Result<(), DynError> {
     Ok(())
 }
 
-fn run(root: &Path, manifest: &FixtureManifest) -> Result<(), DynError> {
+#[allow(
+    clippy::too_many_lines,
+    reason = "one auditable measurement transaction keeps sharding, calibration, paired ordering, semantic equality, minimum duration, and exact row emission adjacent"
+)]
+fn run(
+    root: &Path,
+    manifest: &FixtureManifest,
+    shard: usize,
+    shards: usize,
+) -> Result<(), DynError> {
     let stdout = io::stdout();
     let mut output = BufWriter::new(stdout.lock());
     writeln!(
         output,
         "schema,identity_sha256,runner_source_sha256,backend_name,backend_tag,family_selector,candidate_sha256,literal_hex,scenario,fixture_sha256,alignment,repetition,order,engine,route,iterations,total_ns,ns_per_iter,checksum,semantic,expected_nonoverlapping_count,tail_owned"
     )?;
+    let mut fixture_ordinal = 0_usize;
+    let mut selected_fixtures = 0_usize;
     for candidate in &manifest.payload.candidates {
         let index = linked_candidate_index(candidate)?;
         let portable = build_portable(candidate)?;
-        let verified = adopt(index)?;
-        let automatic = SearchExactLiteralAutoAotV1::bind(&portable, verified)?;
+        let verified = index.map(adopt).transpose()?;
+        let automatic = verified
+            .map(|verified| SearchExactLiteralAutoAotV1::bind(&portable, verified))
+            .transpose()?;
         for row in &candidate.fixtures {
+            let selected = fixture_ordinal
+                .checked_rem(shards)
+                .ok_or_else(|| invalid("zero shard count"))?
+                == shard;
+            fixture_ordinal = fixture_ordinal
+                .checked_add(1)
+                .ok_or_else(|| invalid("fixture ordinal overflow"))?;
+            if !selected {
+                continue;
+            }
+            selected_fixtures = selected_fixtures
+                .checked_add(1)
+                .ok_or_else(|| invalid("selected fixture count overflow"))?;
             let fixture = load_fixture(root, row)?;
             let literal = decode_hex(&candidate.literal_hex)?;
             verify_oracle(fixture.bytes(), &literal, row)?;
-            verify_pair(&portable, &automatic, fixture.bytes(), row)?;
-            let iterations = calibrated_iterations(&portable, &automatic, fixture.bytes())?;
-            let tail_owned = tail_owned(row, candidate.literal_bytes)?;
+            verify_pair(&portable, automatic.as_ref(), fixture.bytes(), row)?;
+            let iterations = calibrated_iterations(&portable, automatic.as_ref(), fixture.bytes())?;
+            let tail_owned = tail_owned(row, automatic.is_some());
             for repetition in 0..REPETITIONS {
                 let order = if repetition % 2 == 0 {
                     [Engine::Portable, Engine::StaticAutoAot]
@@ -236,9 +272,12 @@ fn run(root: &Path, manifest: &FixtureManifest) -> Result<(), DynError> {
                         Engine::Portable => {
                             measure_portable(&portable, fixture.bytes(), iterations)?
                         }
-                        Engine::StaticAutoAot => {
-                            measure_automatic(&automatic, fixture.bytes(), iterations)?
-                        }
+                        Engine::StaticAutoAot => measure_automatic(
+                            &portable,
+                            automatic.as_ref(),
+                            fixture.bytes(),
+                            iterations,
+                        )?,
                     };
                     require(
                         measured.total_ns >= MINIMUM_NS,
@@ -284,6 +323,10 @@ fn run(root: &Path, manifest: &FixtureManifest) -> Result<(), DynError> {
             }
         }
     }
+    require(
+        fixture_ordinal == manifest.payload.fixture_count && selected_fixtures > 0,
+        "sharded fixture traversal differs from manifest",
+    )?;
     Ok(())
 }
 
@@ -340,7 +383,7 @@ fn build_portable(candidate: &FixtureCandidate) -> Result<PortableRegex, DynErro
     Ok(portable)
 }
 
-fn linked_candidate_index(candidate: &FixtureCandidate) -> Result<usize, io::Error> {
+fn linked_candidate_index(candidate: &FixtureCandidate) -> Result<Option<usize>, io::Error> {
     let mut matches = generated::CANDIDATES
         .iter()
         .enumerate()
@@ -348,10 +391,7 @@ fn linked_candidate_index(candidate: &FixtureCandidate) -> Result<usize, io::Err
             linked.semantic_candidate_sha256 == candidate.semantic_candidate_sha256
                 && linked.literal_hex == candidate.literal_hex
         });
-    let index = matches
-        .next()
-        .map(|(index, _)| index)
-        .ok_or_else(|| invalid("fixture candidate has no linked object/glue pair"))?;
+    let index = matches.next().map(|(index, _)| index);
     require(
         matches.next().is_none(),
         "fixture candidate maps to multiple linked object/glue pairs",
@@ -361,12 +401,12 @@ fn linked_candidate_index(candidate: &FixtureCandidate) -> Result<usize, io::Err
 
 fn verify_pair(
     portable: &PortableRegex,
-    automatic: &SearchExactLiteralAutoAotV1<'_>,
+    automatic: Option<&SearchExactLiteralAutoAotV1<'_>>,
     haystack: &[u8],
     row: &FixtureRow,
 ) -> Result<(), DynError> {
     let portable_match = portable.find(haystack, SearchLimits::unlimited())?.0;
-    let automatic_match = automatic.find(haystack, SearchLimits::unlimited())?.0;
+    let automatic_match = find_automatic(portable, automatic, haystack)?;
     require(
         project(portable_match) == row.expected_leftmost_span
             && project(automatic_match) == row.expected_leftmost_span,
@@ -377,11 +417,11 @@ fn verify_pair(
 
 fn calibrated_iterations(
     portable: &PortableRegex,
-    automatic: &SearchExactLiteralAutoAotV1<'_>,
+    automatic: Option<&SearchExactLiteralAutoAotV1<'_>>,
     haystack: &[u8],
 ) -> Result<usize, DynError> {
     let portable_pilot = pilot_portable(portable, haystack)?;
-    let automatic_pilot = pilot_automatic(automatic, haystack)?;
+    let automatic_pilot = pilot_automatic(portable, automatic, haystack)?;
     require(
         portable_pilot.semantic == automatic_pilot.semantic,
         "pilot semantics differ",
@@ -438,12 +478,13 @@ fn pilot_portable(portable: &PortableRegex, haystack: &[u8]) -> Result<Measureme
 }
 
 fn pilot_automatic(
-    automatic: &SearchExactLiteralAutoAotV1<'_>,
+    portable: &PortableRegex,
+    automatic: Option<&SearchExactLiteralAutoAotV1<'_>>,
     haystack: &[u8],
 ) -> Result<Measurement, DynError> {
     let mut iterations = 1_usize;
     loop {
-        let measured = measure_automatic(automatic, haystack, iterations)?;
+        let measured = measure_automatic(portable, automatic, haystack, iterations)?;
         if measured.total_ns >= PILOT_NS {
             return Ok(measured);
         }
@@ -467,15 +508,26 @@ fn measure_portable(
 }
 
 fn measure_automatic(
-    automatic: &SearchExactLiteralAutoAotV1<'_>,
+    portable: &PortableRegex,
+    automatic: Option<&SearchExactLiteralAutoAotV1<'_>>,
     haystack: &[u8],
     iterations: usize,
 ) -> Result<Measurement, DynError> {
     measure(iterations, || {
-        Ok(automatic
-            .find(black_box(haystack), SearchLimits::unlimited())?
-            .0)
+        find_automatic(portable, automatic, black_box(haystack))
     })
+}
+
+fn find_automatic(
+    portable: &PortableRegex,
+    automatic: Option<&SearchExactLiteralAutoAotV1<'_>>,
+    haystack: &[u8],
+) -> Result<Option<Match>, DynError> {
+    if let Some(automatic) = automatic {
+        Ok(automatic.find(haystack, SearchLimits::unlimited())?.0)
+    } else {
+        Ok(portable.find(haystack, SearchLimits::unlimited())?.0)
+    }
 }
 
 fn measure(
@@ -523,8 +575,8 @@ fn load_manifest(root: &Path) -> Result<FixtureManifest, DynError> {
     let bytes = regular_file(&root.join("manifest.json"), 1 << 20)?;
     let (expected_sha256, expected_schema) = if generated::CANONICAL_BYTE_ESCAPED_SOURCES {
         (
-            generated::OBJECT_CANDIDATE_MANIFEST_SHA256,
-            generated::OBJECT_CANDIDATE_MANIFEST_SCHEMA,
+            generated::FIXTURE_MANIFEST_SHA256,
+            generated::FIXTURE_MANIFEST_SCHEMA,
         )
     } else {
         (FIXTURE_MANIFEST_SHA256, FIXTURE_SCHEMA)
@@ -550,21 +602,27 @@ fn load_manifest(root: &Path) -> Result<FixtureManifest, DynError> {
         "fixture cardinality differs",
     )?;
     let mut fixture_count = 0_usize;
+    let mut linked_indexes = BTreeSet::new();
     for candidate in &manifest.payload.candidates {
-        let linked = generated::CANDIDATES
-            .get(linked_candidate_index(candidate)?)
-            .ok_or_else(|| invalid("linked object candidate index is invalid"))?;
-        require(
-            !linked.implementation_sha256.is_empty() && !linked.glue_sha256.is_empty(),
-            "linked candidate identity differs from fixture candidate",
-        )?;
+        if let Some(index) = linked_candidate_index(candidate)? {
+            let linked = generated::CANDIDATES
+                .get(index)
+                .ok_or_else(|| invalid("linked object candidate index is invalid"))?;
+            require(
+                !linked.implementation_sha256.is_empty()
+                    && !linked.glue_sha256.is_empty()
+                    && linked_indexes.insert(index),
+                "linked candidate identity differs or is duplicated",
+            )?;
+        }
         fixture_count = fixture_count
             .checked_add(candidate.fixtures.len())
             .ok_or_else(|| invalid("fixture cardinality overflow"))?;
     }
     require(
-        fixture_count == manifest.payload.fixture_count,
-        "fixture row cardinality differs",
+        fixture_count == manifest.payload.fixture_count
+            && linked_indexes.len() == generated::CANDIDATES.len(),
+        "fixture row or linked-object cardinality differs",
     )?;
     Ok(manifest)
 }
@@ -710,21 +768,20 @@ fn encode(matched: Option<Match>) -> u64 {
     })
 }
 
-fn tail_owned(row: &FixtureRow, literal_bytes: usize) -> Result<bool, io::Error> {
-    if row.bytes < generated::MINIMUM_WINDOW_BYTES {
-        return Ok(false);
-    }
-    let candidate_starts = row
-        .bytes
-        .checked_sub(literal_bytes)
-        .and_then(|last| last.checked_add(1))
-        .ok_or_else(|| invalid("literal is wider than fixture"))?;
-    if candidate_starts <= generated::PORTABLE_PREFIX_CANDIDATE_STARTS {
-        return Ok(false);
-    }
-    Ok(row
-        .expected_leftmost_span
-        .is_none_or(|[start, _]| start >= generated::PORTABLE_PREFIX_CANDIDATE_STARTS))
+fn tail_owned(row: &FixtureRow, eligible: bool) -> bool {
+    eligible && !matches!(row.scenario.as_str(), "early" | "dense")
+}
+
+fn parse_usize(value: &str, label: &str) -> Result<usize, io::Error> {
+    require(
+        !value.is_empty()
+            && value.bytes().all(|byte| byte.is_ascii_digit())
+            && (value == "0" || !value.starts_with('0')),
+        &format!("{label} is not a canonical unsigned integer"),
+    )?;
+    value
+        .parse()
+        .map_err(|_| invalid(format!("{label} is out of range")))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

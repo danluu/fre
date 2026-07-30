@@ -194,6 +194,7 @@ dependencies = [
  "fre",
  "fre-aot-compiler",
  "fre-aot-static-runtime",
+ "fre-jit-aarch64",
  "fre-kernel-ir",
  "serde",
  "serde_json",

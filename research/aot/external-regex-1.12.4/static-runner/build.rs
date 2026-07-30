@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use std::{
     collections::BTreeSet,
     env,
@@ -9,13 +11,15 @@ use std::{
 use fre::{PortableBuilder, RustProfile};
 use fre_aot_compiler::{
     LinuxAarch64ExactSearchManifestV1, LinuxAarch64SearchCompilePolicyV1,
-    LinuxSearchSpanFinalImageGlueLimitsV1, MacosAarch64ExactSearchManifestV1,
-    SearchCompilePolicyV1, SearchSpanFinalImageGlueLimitsV1,
-    build_linux_static_search_span_expectation_v1, build_static_search_span_expectation_v1,
-    plan_and_compile_linux_aarch64_exact_search_v1, plan_and_compile_macos_aarch64_exact_search_v1,
+    LinuxSearchCompileErrorV1, LinuxSearchSpanFinalImageGlueLimitsV1,
+    MacosAarch64ExactSearchManifestV1, SearchCompileErrorV1, SearchCompilePolicyV1,
+    SearchSpanFinalImageGlueLimitsV1, build_linux_static_search_span_expectation_v1,
+    build_static_search_span_expectation_v1, plan_and_compile_linux_aarch64_exact_search_v1,
+    plan_and_compile_macos_aarch64_exact_search_v1,
     publish_linux_search_span_family_qualification_final_image_glue_v1,
     publish_search_span_family_qualification_final_image_glue_v1,
 };
+use fre_jit_aarch64::{EmitError, UnsupportedReason};
 use fre_kernel_ir::Span;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -25,38 +29,88 @@ const IDENTITY_ENV: &str = "FRE_EXTERNAL_SEARCH_STATIC_IDENTITY";
 const REVISION_ENV: &str = "FRE_EXTERNAL_SEARCH_RUNNER_REVISION";
 const UNSEALED_ENV: &str = "FRE_EXTERNAL_SEARCH_ALLOW_UNSEALED_ARTIFACT_BUILD";
 const CANDIDATE_MANIFEST_ENV: &str = "FRE_EXTERNAL_SEARCH_OBJECT_CANDIDATE_MANIFEST";
+const LITERAL_DISPOSITIONS_ENV: &str = "FRE_EXTERNAL_SEARCH_LITERAL_DISPOSITIONS";
 const IDENTITY_SCHEMA_V1: &str = "fre.aot.external-regex-1.12.4-static-runner-identity.v1";
 const IDENTITY_SCHEMA_V2: &str = "fre.aot.external-regex-1.12.4-static-runner-identity.v2";
+const IDENTITY_SCHEMA_V3: &str = "fre.aot.search-tag28-static-runner-identity.v1";
 const FIXTURE_SCHEMA: &str = "fre.aot.external-regex-1.12.4-development-fixtures.v2";
+const SOURCE_FIXTURE_SCHEMA: &str = "fre.aot.search-source-literal-generalization-fixtures.v1";
+const SOURCE_FIXTURE_MANIFEST_SHA256: &str =
+    "462ff2f14d926f4aa7f0c827a23db825ebc5be3b9d604ca024368eabebd2defc";
+const APPLICATION_FIXTURE_SCHEMA_V1: &str = "fre.aot.search-ripgrep-application-fixtures.v1";
+const APPLICATION_FIXTURE_MANIFEST_SHA256_V1: &str =
+    "d99de4f622e297b0b28da70ff4269deed32973ab487d8b27906ee1382c0e35b9";
+const APPLICATION_FIXTURE_SCHEMA_V2: &str = "fre.aot.search-ripgrep-application-fixtures.v2";
+const APPLICATION_FIXTURE_MANIFEST_SHA256_V2: &str =
+    "b20181470c604d01d2ec236259293cfcb6e5eff145bcd3e4daa91554c8cebcca";
 const CANONICAL_SOURCE_CONSTRUCTION: &str = "canonical-byte-escaped-exact";
 const FIXTURE_MANIFEST_SHA256: &str =
     "b979ed327db7e9623bccba1ef775d1957b7323c8b30edb44f40593176f52b44a";
 const MAXIMUM_CANDIDATE_MANIFEST_BYTES: u64 = 1 << 20;
+const MAXIMUM_LITERAL_DISPOSITIONS_BYTES: u64 = 4 << 20;
 const MAXIMUM_CANDIDATES: usize = 1 << 10;
+const MAXIMUM_LITERAL_DISPOSITIONS: usize = 2 << 10;
 const SOURCE_DOMAIN: &[u8] = b"FRE-EXTERNAL-REGEX-STATIC-RUNNER-SOURCE\0\x01";
+const TAG29_CANDIDATE_DOMAIN: &[u8] = b"FRE-SEARCH-TAG29-TOPOLOGY-CANDIDATE\0\x01";
 const GLUE_SYMBOL_PREFIX: &str = "fre_aot_search_span_glue_v1_";
+const LITERAL_DISPOSITIONS_SCHEMA: &str = "fre.aot.search-tag29-topology-literal-dispositions.v1";
+const REFUSAL_RECEIPT_SCHEMA: &str = "fre.aot.search-tag29-structural-refusal-compile-receipt.v1";
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct Candidate {
     semantic_candidate_sha256: String,
     source: Vec<u8>,
     literal: Vec<u8>,
     literal_hex: String,
+    literal_sha256: String,
 }
 
 #[derive(Debug)]
 struct CandidateManifest {
     schema: String,
     sha256: String,
+    payload_sha256: String,
     canonical_byte_escaped_sources: bool,
     candidates: Vec<Candidate>,
+}
+
+#[derive(Debug)]
+struct LiteralDispositions {
+    sha256: String,
+    payload_sha256: String,
+    literal_count: usize,
+    refusals: Vec<Candidate>,
 }
 
 struct BuiltCandidate {
     implementation: Vec<u8>,
     glue: Vec<u8>,
+    compile_receipt: Vec<u8>,
     compile_identity: [u8; 32],
     manifest_identity: [u8; 32],
+    implementation_symbols: [String; 3],
+    glue_symbol: String,
+}
+
+#[derive(Debug)]
+struct StagedCandidate {
+    candidate: Candidate,
+    compile_identity: String,
+    compile_receipt_sha256: String,
+    compile_receipt_basename: String,
+    implementation_object_sha256: String,
+    glue_object_sha256: String,
+    implementation_object_basename: String,
+    glue_object_basename: String,
+    implementation_symbols: [String; 3],
+    glue_symbol: String,
+}
+
+#[derive(Debug)]
+struct StagedRefusal {
+    candidate: Candidate,
+    compile_receipt_sha256: String,
+    compile_receipt_basename: String,
 }
 
 #[allow(
@@ -68,6 +122,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed={REVISION_ENV}");
     println!("cargo:rerun-if-env-changed={UNSEALED_ENV}");
     println!("cargo:rerun-if-env-changed={CANDIDATE_MANIFEST_ENV}");
+    println!("cargo:rerun-if-env-changed={LITERAL_DISPOSITIONS_ENV}");
     println!("cargo:rerun-if-changed=runner-source-files.txt");
     for source in source_manifest().expect("runner source manifest") {
         println!("cargo:rerun-if-changed={source}");
@@ -98,12 +153,37 @@ fn main() {
         .and_then(Value::as_str)
         .expect("static runner identity schema");
     require(
-        matches!(identity_schema, IDENTITY_SCHEMA_V1 | IDENTITY_SCHEMA_V2),
+        matches!(
+            identity_schema,
+            IDENTITY_SCHEMA_V1 | IDENTITY_SCHEMA_V2 | IDENTITY_SCHEMA_V3
+        ),
         "static runner identity schema changed",
     );
+    let fixture_manifest_sha256 =
+        path_str(&identity, &["external_evidence", "fixture_manifest_sha256"]);
+    let fixture_manifest_schema = if identity_schema == IDENTITY_SCHEMA_V3 {
+        path_str(&identity, &["external_evidence", "fixture_manifest_schema"])
+    } else {
+        FIXTURE_SCHEMA
+    };
+    let exact_tag28_fixture = matches!(
+        (fixture_manifest_schema, fixture_manifest_sha256),
+        (SOURCE_FIXTURE_SCHEMA, SOURCE_FIXTURE_MANIFEST_SHA256)
+            | (
+                APPLICATION_FIXTURE_SCHEMA_V1,
+                APPLICATION_FIXTURE_MANIFEST_SHA256_V1
+            )
+            | (
+                APPLICATION_FIXTURE_SCHEMA_V2,
+                APPLICATION_FIXTURE_MANIFEST_SHA256_V2
+            )
+    );
     require(
-        path_str(&identity, &["external_evidence", "fixture_manifest_sha256"])
-            == FIXTURE_MANIFEST_SHA256,
+        if identity_schema == IDENTITY_SCHEMA_V3 {
+            exact_tag28_fixture
+        } else {
+            fixture_manifest_sha256 == FIXTURE_MANIFEST_SHA256
+        },
         "fixture manifest identity changed",
     );
     require(
@@ -113,7 +193,7 @@ fn main() {
     let backend_tag = path_u16(&identity, &["static_pipeline", "backend_tag"]);
     let backend_name = path_str(&identity, &["static_pipeline", "backend_name"]);
     require(!backend_name.is_empty(), "backend name is empty");
-    if identity_schema == IDENTITY_SCHEMA_V2 {
+    if matches!(identity_schema, IDENTITY_SCHEMA_V2 | IDENTITY_SCHEMA_V3) {
         require(
             path_u16(&identity, &["emitter", "backend_tag"]) == backend_tag
                 && path_str(&identity, &["emitter", "backend"]) == backend_name
@@ -142,8 +222,12 @@ fn main() {
         "automatic routing qualification identity is malformed",
     );
     require(
-        minimum_literal_bytes <= 3 && maximum_literal_bytes >= 4,
-        "family width envelope excludes an external candidate",
+        if identity_schema == IDENTITY_SCHEMA_V3 {
+            minimum_literal_bytes == 6 && maximum_literal_bytes == 32
+        } else {
+            minimum_literal_bytes <= 3 && maximum_literal_bytes >= 4
+        },
+        "family width envelope differs from the evidence scope",
     );
     let candidate_manifest_path = PathBuf::from(
         env::var_os(CANDIDATE_MANIFEST_ENV)
@@ -161,6 +245,21 @@ fn main() {
         maximum_literal_bytes,
     )
     .expect("authenticated object-candidate manifest");
+    let literal_dispositions_path = PathBuf::from(
+        env::var_os(LITERAL_DISPOSITIONS_ENV)
+            .unwrap_or_else(|| panic!("linked builds require {LITERAL_DISPOSITIONS_ENV}")),
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        literal_dispositions_path.display()
+    );
+    let literal_dispositions = load_literal_dispositions(
+        &literal_dispositions_path,
+        &candidate_manifest,
+        minimum_literal_bytes,
+        maximum_literal_bytes,
+    )
+    .expect("authenticated literal dispositions");
     require(
         minimum_window_bytes > 0
             && portable_prefix_candidate_starts > 0
@@ -326,6 +425,16 @@ fn main() {
     .unwrap();
     writeln!(
         generated,
+        "pub(crate) const FIXTURE_MANIFEST_SCHEMA: &str = {fixture_manifest_schema:?};"
+    )
+    .unwrap();
+    writeln!(
+        generated,
+        "pub(crate) const FIXTURE_MANIFEST_SHA256: &str = {fixture_manifest_sha256:?};"
+    )
+    .unwrap();
+    writeln!(
+        generated,
         "pub(crate) const CANONICAL_BYTE_ESCAPED_SOURCES: bool = {};",
         candidate_manifest.canonical_byte_escaped_sources
     )
@@ -334,6 +443,11 @@ fn main() {
 
     let mut built_candidates = Vec::new();
     let mut emitted_manifest_identity = None;
+    let mut compile_identities = BTreeSet::new();
+    let mut compile_receipts = BTreeSet::new();
+    let mut implementation_objects = BTreeSet::new();
+    let mut glue_objects = BTreeSet::new();
+    let mut glue_symbols = BTreeSet::new();
     for (index, candidate) in candidate_manifest.candidates.iter().enumerate() {
         let built = if target_os == "macos" {
             build_macos(candidate, backend_tag, family_selector)
@@ -355,10 +469,15 @@ fn main() {
         } else {
             emitted_manifest_identity = Some(built_manifest_identity);
         }
-        let implementation_path = output.join(format!("external-search-{index}-implementation.o"));
-        let glue_path = output.join(format!("external-search-{index}-family-glue.o"));
+        let implementation_object_basename = format!("external-search-{index}-implementation.o");
+        let glue_object_basename = format!("external-search-{index}-family-glue.o");
+        let compile_receipt_basename = format!("external-search-{index}-compile-receipt.bin");
+        let implementation_path = output.join(&implementation_object_basename);
+        let glue_path = output.join(&glue_object_basename);
+        let compile_receipt_path = output.join(&compile_receipt_basename);
         fs::write(&implementation_path, &built.implementation).expect("implementation object");
         fs::write(&glue_path, &built.glue).expect("family glue object");
+        fs::write(&compile_receipt_path, &built.compile_receipt).expect("compiler receipt");
         println!(
             "cargo:rustc-link-arg-bin={BINARY}={}",
             implementation_path.display()
@@ -367,14 +486,62 @@ fn main() {
         writeln!(
             generated,
             "    #[link_name = {:?}] fn external_search_glue_{index}(output: *mut fre_aot_static_runtime::RawStaticSearchSpanAdoptionOutputV1) -> u32;",
-            format!("{GLUE_SYMBOL_PREFIX}{}", hex(&built.compile_identity))
+            built.glue_symbol
         )
         .unwrap();
-        built_candidates.push((
-            candidate.clone(),
-            hex(&sha256(&built.implementation)),
-            hex(&sha256(&built.glue)),
-        ));
+        let candidate_compile_identity = hex(&built.compile_identity);
+        let compile_receipt_sha256 = hex(&sha256(&built.compile_receipt));
+        let implementation_object_sha256 = hex(&sha256(&built.implementation));
+        let glue_object_sha256 = hex(&sha256(&built.glue));
+        require(
+            compile_identities.insert(candidate_compile_identity.clone())
+                && compile_receipts.insert(compile_receipt_sha256.clone())
+                && implementation_objects.insert(implementation_object_sha256.clone())
+                && glue_objects.insert(glue_object_sha256.clone())
+                && glue_symbols.insert(built.glue_symbol.clone()),
+            "candidate compile, object, or symbol identity is not injective",
+        );
+        built_candidates.push(StagedCandidate {
+            candidate: candidate.clone(),
+            compile_identity: candidate_compile_identity,
+            compile_receipt_sha256,
+            compile_receipt_basename,
+            implementation_object_sha256,
+            glue_object_sha256,
+            implementation_object_basename,
+            glue_object_basename,
+            implementation_symbols: built.implementation_symbols,
+            glue_symbol: built.glue_symbol,
+        });
+    }
+    let manifest_identity = emitted_manifest_identity
+        .clone()
+        .expect("one emitted manifest identity");
+    let mut built_refusals = Vec::new();
+    for (index, candidate) in literal_dispositions.refusals.iter().enumerate() {
+        let (compile_receipt, refusal_manifest_identity) = if target_os == "macos" {
+            refuse_macos(candidate, backend_tag, index)
+        } else {
+            refuse_linux(candidate, backend_tag, index)
+        };
+        require(
+            hex(&refusal_manifest_identity) == manifest_identity,
+            "refusal and object compiler manifests differ",
+        );
+        let compile_receipt_basename =
+            format!("external-search-refusal-{index}-compile-receipt.bin");
+        let compile_receipt_sha256 = hex(&sha256(&compile_receipt));
+        require(
+            compile_receipts.insert(compile_receipt_sha256.clone()),
+            "refusal compiler receipt identity is not injective",
+        );
+        fs::write(output.join(&compile_receipt_basename), compile_receipt)
+            .expect("structural-refusal compiler receipt");
+        built_refusals.push(StagedRefusal {
+            candidate: candidate.clone(),
+            compile_receipt_sha256,
+            compile_receipt_basename,
+        });
     }
     generated.push_str("}\n");
     generated.push_str(
@@ -391,14 +558,14 @@ fn main() {
         "        _ => fre_aot_static_runtime::STATIC_SEARCH_SPAN_ADOPT_STATUS_UNQUALIFIED_SELECTOR_V1,\n    }\n}\n",
     );
     generated.push_str("pub(crate) static CANDIDATES: &[CandidateIdentity] = &[\n");
-    for (candidate, implementation_sha256, glue_sha256) in &built_candidates {
+    for built in &built_candidates {
         writeln!(
             generated,
             "    CandidateIdentity {{ semantic_candidate_sha256: {:?}, literal_hex: {:?}, implementation_sha256: {:?}, glue_sha256: {:?} }},",
-            candidate.semantic_candidate_sha256,
-            candidate.literal_hex,
-            implementation_sha256,
-            glue_sha256,
+            built.candidate.semantic_candidate_sha256,
+            built.candidate.literal_hex,
+            built.implementation_object_sha256,
+            built.glue_object_sha256,
         )
         .unwrap();
     }
@@ -407,7 +574,7 @@ fn main() {
     fs::write(output.join("identity.json"), &identity_bytes).expect("copied identity");
 
     let receipt = json!({
-        "schema": "fre.aot.external-regex-1.12.4-static-runner-build-receipt.v1",
+        "schema": "fre.aot.external-regex-1.12.4-static-runner-build-receipt.v2",
         "identity_sha256": hex(&identity_sha256),
         "runner_revision": revision,
         "runner_source_sha256": hex(&source_identity),
@@ -415,8 +582,11 @@ fn main() {
         "target_arch": target_arch,
         "backend_name": backend_name,
         "backend_tag": backend_tag,
+        "backend_version": "SEARCH_V16",
+        "candidate_policy": 15,
+        "llvm": false,
         "compiler_identity": compiler_identity,
-        "manifest_identity": emitted_manifest_identity.expect("one emitted manifest identity"),
+        "manifest_identity": manifest_identity,
         "family_selector": family_selector,
         "minimum_window_bytes": minimum_window_bytes,
         "portable_prefix_candidate_starts": portable_prefix_candidate_starts,
@@ -426,13 +596,41 @@ fn main() {
         "timing_permitted": timing_permitted,
         "object_candidate_manifest_schema": candidate_manifest.schema,
         "object_candidate_manifest_sha256": candidate_manifest.sha256,
+        "object_candidate_manifest_payload_sha256": candidate_manifest.payload_sha256,
         "object_candidate_count": candidate_manifest.candidates.len(),
+        "literal_dispositions_sha256": literal_dispositions.sha256,
+        "literal_dispositions_payload_sha256": literal_dispositions.payload_sha256,
+        "literal_disposition_count": literal_dispositions.literal_count,
+        "fixture_manifest_schema": fixture_manifest_schema,
+        "fixture_manifest_sha256": fixture_manifest_sha256,
         "canonical_byte_escaped_sources": candidate_manifest.canonical_byte_escaped_sources,
-        "candidates": built_candidates.iter().map(|(candidate, implementation, glue)| json!({
-            "semantic_candidate_sha256": candidate.semantic_candidate_sha256,
-            "literal_hex": candidate.literal_hex,
-            "implementation_sha256": implementation,
-            "glue_sha256": glue,
+        "candidates": built_candidates.iter().enumerate().map(|(ordinal, built)| json!({
+            "ordinal": ordinal,
+            "semantic_candidate_sha256": built.candidate.semantic_candidate_sha256,
+            "literal_sha256": built.candidate.literal_sha256,
+            "literal_hex": built.candidate.literal_hex,
+            "compile_identity": built.compile_identity,
+            "compile_receipt_sha256": built.compile_receipt_sha256,
+            "compile_receipt_basename": built.compile_receipt_basename,
+            "implementation_object_sha256": built.implementation_object_sha256,
+            "glue_object_sha256": built.glue_object_sha256,
+            "implementation_object_basename": built.implementation_object_basename,
+            "glue_object_basename": built.glue_object_basename,
+            "implementation_symbols": {
+                "entry": built.implementation_symbols[0],
+                "payload": built.implementation_symbols[1],
+                "metadata": built.implementation_symbols[2],
+            },
+            "glue_symbol": built.glue_symbol,
+        })).collect::<Vec<_>>(),
+        "refusals": built_refusals.iter().enumerate().map(|(ordinal, built)| json!({
+            "ordinal": ordinal,
+            "semantic_candidate_sha256": built.candidate.semantic_candidate_sha256,
+            "literal_sha256": built.candidate.literal_sha256,
+            "literal_hex": built.candidate.literal_hex,
+            "disposition": "structural-refusal",
+            "compile_receipt_sha256": built.compile_receipt_sha256,
+            "compile_receipt_basename": built.compile_receipt_basename,
         })).collect::<Vec<_>>(),
     });
     fs::write(
@@ -486,11 +684,25 @@ fn build_macos(candidate: &Candidate, backend_tag: u16, selector: u16) -> BuiltC
         SearchSpanFinalImageGlueLimitsV1::default(),
     )
     .expect("macOS private-family glue");
+    let symbols = compiled.object().exported_symbols();
+    let compile_identity = *compiled.receipt().compile_identity().as_bytes();
+    let glue_symbol = format!("{GLUE_SYMBOL_PREFIX}{}", hex(&compile_identity));
     BuiltCandidate {
         implementation: compiled.object().as_bytes().to_vec(),
         glue: glue.object().as_bytes().to_vec(),
-        compile_identity: *compiled.receipt().compile_identity().as_bytes(),
+        compile_receipt: compiled
+            .receipt()
+            .canonical_bytes()
+            .expect("canonical macOS compiler receipt")
+            .to_vec(),
+        compile_identity,
         manifest_identity,
+        implementation_symbols: [
+            symbols.entry().as_str().to_owned(),
+            symbols.payload().as_str().to_owned(),
+            symbols.metadata().as_str().to_owned(),
+        ],
+        glue_symbol,
     }
 }
 
@@ -521,12 +733,129 @@ fn build_linux(candidate: &Candidate, backend_tag: u16, selector: u16) -> BuiltC
         LinuxSearchSpanFinalImageGlueLimitsV1::default(),
     )
     .expect("Linux private-family glue");
+    let symbols = compiled.object().exported_symbols();
+    let glue_symbols = glue
+        .object()
+        .exported_symbols()
+        .expect("canonical Linux final-image symbols");
+    let compile_identity = *compiled.receipt().compile_identity().as_bytes();
+    require(
+        glue_symbols.entry().as_str() == symbols.entry().as_str()
+            && glue_symbols.payload().as_str() == symbols.payload().as_str()
+            && glue_symbols.metadata().as_str() == symbols.metadata().as_str(),
+        "Linux glue implementation namespace differs from compiler object",
+    );
     BuiltCandidate {
         implementation: compiled.object().as_bytes().to_vec(),
         glue: glue.object().as_bytes().to_vec(),
-        compile_identity: *compiled.receipt().compile_identity().as_bytes(),
+        compile_receipt: compiled
+            .receipt()
+            .canonical_receipt_bytes()
+            .expect("canonical Linux compiler receipt")
+            .to_vec(),
+        compile_identity,
         manifest_identity,
+        implementation_symbols: [
+            symbols.entry().as_str().to_owned(),
+            symbols.payload().as_str().to_owned(),
+            symbols.metadata().as_str().to_owned(),
+        ],
+        glue_symbol: glue_symbols.glue().as_str().to_owned(),
     }
+}
+
+fn refusal_receipt(
+    candidate: &Candidate,
+    target_os: &str,
+    manifest_identity: &[u8; 32],
+    ordinal: usize,
+) -> Vec<u8> {
+    let payload = json!({
+        "target_os": target_os,
+        "target_arch": "aarch64",
+        "backend_name": "AsimdV16",
+        "backend_tag": 29,
+        "backend_version": "SEARCH_V16",
+        "candidate_policy": 15,
+        "llvm": false,
+        "manifest_identity": hex(manifest_identity),
+        "ordinal": ordinal,
+        "semantic_candidate_sha256": candidate.semantic_candidate_sha256,
+        "literal_sha256": candidate.literal_sha256,
+        "literal_hex": candidate.literal_hex,
+        "literal_bytes": candidate.literal.len(),
+        "source_construction": "canonical-byte-escaped-exact",
+        "source_sha256": hex(&sha256(&candidate.source)),
+        "compiler_entrypoint": if target_os == "macos" {
+            "plan_and_compile_macos_aarch64_exact_search_v1"
+        } else {
+            "plan_and_compile_linux_aarch64_exact_search_v1"
+        },
+        "compiler_outcome": "error",
+        "compiler_error": "Native(Unsupported { reason: KernelShape })",
+        "disposition": "structural-refusal",
+    });
+    let payload_bytes = serde_json::to_vec(&payload).expect("canonical refusal payload JSON");
+    let envelope = json!({
+        "schema": REFUSAL_RECEIPT_SCHEMA,
+        "payload_sha256": hex(&sha256(&payload_bytes)),
+        "payload": payload,
+    });
+    let mut encoded = serde_json::to_vec(&envelope).expect("canonical refusal receipt JSON");
+    encoded.push(b'\n');
+    encoded
+}
+
+fn refuse_macos(candidate: &Candidate, backend_tag: u16, ordinal: usize) -> (Vec<u8>, [u8; 32]) {
+    let manifest = MacosAarch64ExactSearchManifestV1::<Span>::candidate_backend_tag(
+        SearchCompilePolicyV1::high_fuel(),
+        backend_tag,
+    )
+    .expect("supported macOS candidate backend tag");
+    let manifest_identity = *manifest.identity().as_bytes();
+    match plan_and_compile_macos_aarch64_exact_search_v1(
+        manifest,
+        exact_source(&candidate.source),
+        RustProfile::default(),
+    ) {
+        Err(SearchCompileErrorV1::Native(EmitError::Unsupported {
+            reason: UnsupportedReason::KernelShape,
+        })) => {}
+        Err(error) => {
+            panic!("macOS structural-refusal compile returned a different error: {error:?}")
+        }
+        Ok(_) => panic!("macOS structural-refusal compile emitted an object"),
+    }
+    (
+        refusal_receipt(candidate, "macos", &manifest_identity, ordinal),
+        manifest_identity,
+    )
+}
+
+fn refuse_linux(candidate: &Candidate, backend_tag: u16, ordinal: usize) -> (Vec<u8>, [u8; 32]) {
+    let manifest = LinuxAarch64ExactSearchManifestV1::<Span>::candidate_backend_tag(
+        LinuxAarch64SearchCompilePolicyV1::high_fuel(),
+        backend_tag,
+    )
+    .expect("supported Linux candidate backend tag");
+    let manifest_identity = *manifest.identity().as_bytes();
+    match plan_and_compile_linux_aarch64_exact_search_v1(
+        manifest,
+        exact_source(&candidate.source),
+        RustProfile::default(),
+    ) {
+        Err(LinuxSearchCompileErrorV1::Native(EmitError::Unsupported {
+            reason: UnsupportedReason::KernelShape,
+        })) => {}
+        Err(error) => {
+            panic!("Linux structural-refusal compile returned a different error: {error:?}")
+        }
+        Ok(_) => panic!("Linux structural-refusal compile emitted an object"),
+    }
+    (
+        refusal_receipt(candidate, "linux", &manifest_identity, ordinal),
+        manifest_identity,
+    )
 }
 
 fn load_candidate_manifest(
@@ -544,7 +873,8 @@ fn load_candidate_manifest(
         .get("schema")
         .and_then(Value::as_str)
         .ok_or_else(|| "object-candidate manifest lacks a string schema".to_owned())?;
-    let canonical_byte_escaped_sources = identity_schema == IDENTITY_SCHEMA_V2;
+    let canonical_byte_escaped_sources =
+        matches!(identity_schema, IDENTITY_SCHEMA_V2 | IDENTITY_SCHEMA_V3);
     if canonical_byte_escaped_sources
         && path_str(identity, &["object_candidates", "source_construction"])
             != CANONICAL_SOURCE_CONSTRUCTION
@@ -571,17 +901,19 @@ fn load_candidate_manifest(
     if manifest_sha256 != expected_sha256 {
         return Err("object-candidate manifest SHA-256 differs from identity".to_owned());
     }
-    if root
+    let payload_sha256 = root
         .get("payload_sha256")
         .and_then(Value::as_str)
-        .is_some_and(|value| !is_hex(value, 64))
-    {
-        return Err("object-candidate payload identity is malformed".to_owned());
-    }
+        .ok_or_else(|| "object-candidate payload identity is absent".to_owned())?;
     let payload = root
         .get("payload")
         .and_then(Value::as_object)
         .ok_or_else(|| "object-candidate manifest lacks an object payload".to_owned())?;
+    let payload_bytes = serde_json::to_vec(payload)
+        .map_err(|error| format!("object-candidate payload JSON: {error}"))?;
+    if !is_hex(payload_sha256, 64) || payload_sha256 != hex(&sha256(&payload_bytes)) {
+        return Err("object-candidate payload identity is malformed".to_owned());
+    }
     if payload
         .get("timing_permitted")
         .and_then(Value::as_bool)
@@ -629,8 +961,221 @@ fn load_candidate_manifest(
     Ok(CandidateManifest {
         schema: schema.to_owned(),
         sha256: manifest_sha256,
+        payload_sha256: payload_sha256.to_owned(),
         canonical_byte_escaped_sources,
         candidates,
+    })
+}
+
+fn candidate_signature_is_cyclic_phase_unique(literal: &[u8], selected: &[usize]) -> bool {
+    if !(6..=32).contains(&literal.len())
+        || selected.len() != 5
+        || selected.iter().any(|&offset| offset >= literal.len())
+        || selected
+            .iter()
+            .enumerate()
+            .any(|(index, offset)| selected[..index].contains(offset))
+    {
+        return false;
+    }
+    (1..literal.len()).all(|shift| {
+        selected.iter().any(|&offset| {
+            let shifted = offset
+                .checked_add(shift)
+                .expect("bounded tag29 cyclic offset")
+                .checked_rem(literal.len())
+                .expect("nonempty tag29 literal");
+            literal[offset] != literal[shifted]
+        })
+    })
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one transaction authenticates the complete disposition envelope, structural classifier, and exact object/refusal partition"
+)]
+fn load_literal_dispositions(
+    path: &Path,
+    candidates: &CandidateManifest,
+    minimum_literal_bytes: u32,
+    maximum_literal_bytes: u32,
+) -> Result<LiteralDispositions, String> {
+    let bytes = regular_file(path, MAXIMUM_LITERAL_DISPOSITIONS_BYTES)?;
+    let file_sha256 = hex(&sha256(&bytes));
+    let root: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("literal-dispositions JSON: {error}"))?;
+    let object = root
+        .as_object()
+        .ok_or_else(|| "literal-dispositions root is not an object".to_owned())?;
+    let root_keys = object.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    if root_keys != BTreeSet::from(["schema", "payload_sha256", "payload"])
+        || root.get("schema").and_then(Value::as_str) != Some(LITERAL_DISPOSITIONS_SCHEMA)
+    {
+        return Err("literal-dispositions envelope changed".to_owned());
+    }
+    let payload_sha256 = root
+        .get("payload_sha256")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "literal-dispositions payload identity is absent".to_owned())?;
+    let payload = root
+        .get("payload")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "literal-dispositions payload is absent".to_owned())?;
+    let payload_keys = payload.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    if payload_keys
+        != BTreeSet::from([
+            "freeze_sha256",
+            "selector_contract_sha256",
+            "full_projection_digest",
+            "timing_permitted",
+            "timing_feedback_permitted",
+            "external_inputs",
+            "benchmark_results",
+            "rebar_inputs",
+            "network",
+            "literal_count",
+            "eligible_literal_count",
+            "ineligible_literal_count",
+            "dispositions",
+        ])
+        || payload.get("timing_permitted").and_then(Value::as_bool) != Some(false)
+        || payload
+            .get("timing_feedback_permitted")
+            .and_then(Value::as_bool)
+            != Some(false)
+        || payload.get("network").and_then(Value::as_bool) != Some(false)
+        || ["external_inputs", "benchmark_results", "rebar_inputs"]
+            .iter()
+            .any(|field| {
+                payload
+                    .get(*field)
+                    .and_then(Value::as_array)
+                    .is_none_or(|values| !values.is_empty())
+            })
+    {
+        return Err("literal-dispositions authority changed".to_owned());
+    }
+    let canonical_payload = serde_json::to_vec(payload)
+        .map_err(|error| format!("literal-dispositions payload JSON: {error}"))?;
+    if !is_hex(payload_sha256, 64) || payload_sha256 != hex(&sha256(&canonical_payload)) {
+        return Err("literal-dispositions payload identity differs".to_owned());
+    }
+    let dispositions = payload
+        .get("dispositions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "literal-dispositions rows are absent".to_owned())?;
+    let literal_count = payload
+        .get("literal_count")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| "literal-dispositions count is invalid".to_owned())?;
+    let eligible_count = payload
+        .get("eligible_literal_count")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| "eligible literal count is invalid".to_owned())?;
+    let ineligible_count = payload
+        .get("ineligible_literal_count")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| "ineligible literal count is invalid".to_owned())?;
+    if literal_count == 0
+        || literal_count > MAXIMUM_LITERAL_DISPOSITIONS
+        || dispositions.len() != literal_count
+        || eligible_count != candidates.candidates.len()
+        || eligible_count.checked_add(ineligible_count) != Some(literal_count)
+    {
+        return Err("literal-dispositions cardinality changed".to_owned());
+    }
+    let mut semantic_identities = BTreeSet::new();
+    let mut literal_identities = BTreeSet::new();
+    let mut eligible = Vec::new();
+    let mut refusals = Vec::new();
+    for (ordinal, raw) in dispositions.iter().enumerate() {
+        let row = raw
+            .as_object()
+            .ok_or_else(|| format!("literal disposition {ordinal} is not an object"))?;
+        let row_keys = row.keys().map(String::as_str).collect::<BTreeSet<_>>();
+        if row_keys
+            != BTreeSet::from([
+                "semantic_candidate_sha256",
+                "literal_hex",
+                "literal_sha256",
+                "literal_bytes",
+                "selected_offsets",
+                "selector_eligible",
+                "expected_compiler_disposition",
+            ])
+        {
+            return Err(format!("literal disposition {ordinal} fields changed"));
+        }
+        let candidate = parse_candidate(
+            raw,
+            1,
+            maximum_literal_bytes,
+            true,
+            &mut semantic_identities,
+            &mut literal_identities,
+        )?;
+        let selected_values = row
+            .get("selected_offsets")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("literal disposition {ordinal} offsets changed"))?;
+        let selected = selected_values
+            .iter()
+            .map(|value| {
+                value
+                    .as_u64()
+                    .and_then(|offset| usize::try_from(offset).ok())
+                    .ok_or_else(|| format!("literal disposition {ordinal} offset changed"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if selected.is_empty() || selected.len() > 5 {
+            return Err(format!(
+                "literal disposition {ordinal} offset count changed"
+            ));
+        }
+        let actual_eligible =
+            candidate_signature_is_cyclic_phase_unique(&candidate.literal, &selected);
+        let declared_eligible = row
+            .get("selector_eligible")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| format!("literal disposition {ordinal} eligibility changed"))?;
+        let disposition = row
+            .get("expected_compiler_disposition")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("literal disposition {ordinal} compiler outcome changed"))?;
+        if declared_eligible != actual_eligible
+            || disposition
+                != if actual_eligible {
+                    "tag29-object"
+                } else {
+                    "structural-refusal"
+                }
+            || (actual_eligible
+                && (u32::try_from(candidate.literal.len()).ok() < Some(minimum_literal_bytes)))
+        {
+            return Err(format!(
+                "literal disposition {ordinal} structural classification changed"
+            ));
+        }
+        if actual_eligible {
+            eligible.push(candidate);
+        } else {
+            refusals.push(candidate);
+        }
+    }
+    if eligible != candidates.candidates
+        || eligible.len() != eligible_count
+        || refusals.len() != ineligible_count
+    {
+        return Err("literal dispositions do not biject to object candidates".to_owned());
+    }
+    Ok(LiteralDispositions {
+        sha256: file_sha256,
+        payload_sha256: payload_sha256.to_owned(),
+        literal_count,
+        refusals,
     })
 }
 
@@ -676,12 +1221,15 @@ fn parse_candidate(
     {
         return Err("object candidate literal width differs".to_owned());
     }
-    if candidate
-        .get("literal_sha256")
-        .and_then(Value::as_str)
-        .is_some_and(|identity| identity != hex(&sha256(&literal)))
-    {
+    let literal_sha256 = hex(&sha256(&literal));
+    if candidate.get("literal_sha256").and_then(Value::as_str) != Some(literal_sha256.as_str()) {
         return Err("object candidate literal identity differs".to_owned());
+    }
+    let mut semantic = Sha256::new();
+    semantic.update(TAG29_CANDIDATE_DOMAIN);
+    semantic.update(&literal);
+    if semantic_candidate_sha256 != hex(&semantic.finalize()) {
+        return Err("object candidate semantic identity differs".to_owned());
     }
     let source = if canonical_byte_escaped_sources {
         canonical_exact_source(&literal).into_bytes()
@@ -708,6 +1256,7 @@ fn parse_candidate(
         source,
         literal,
         literal_hex: literal_hex.to_owned(),
+        literal_sha256,
     })
 }
 
@@ -767,7 +1316,7 @@ fn write_scaffold(output: &Path) -> Result<(), std::io::Error> {
         "#[derive(Clone, Copy, Debug)]\npub(crate) struct CandidateIdentity { pub(crate) semantic_candidate_sha256: &'static str, pub(crate) literal_hex: &'static str, pub(crate) implementation_sha256: &'static str, pub(crate) glue_sha256: &'static str }\n",
     );
     generated.push_str(
-        "pub(crate) const LINKED: bool = false;\npub(crate) const TIMING_PERMITTED: bool = false;\npub(crate) const BACKEND_TAG: u16 = 0;\npub(crate) const BACKEND_NAME: &str = \"unresolved\";\npub(crate) const FAMILY_SELECTOR: u16 = 0;\npub(crate) const MINIMUM_WINDOW_BYTES: usize = 1;\npub(crate) const PORTABLE_PREFIX_CANDIDATE_STARTS: usize = 1;\npub(crate) const PLAN_IDENTITY: &str = \"unresolved\";\npub(crate) const ANALYZER_IDENTITY: &str = \"unresolved\";\npub(crate) const EVIDENCE_IDENTITY: &str = \"unresolved\";\npub(crate) const IDENTITY_SHA256: &str = \"unresolved\";\npub(crate) const RUNNER_SOURCE_SHA256: &str = \"unresolved\";\npub(crate) const OBJECT_CANDIDATE_MANIFEST_SCHEMA: &str = \"unresolved\";\npub(crate) const OBJECT_CANDIDATE_MANIFEST_SHA256: &str = \"unresolved\";\npub(crate) const CANONICAL_BYTE_ESCAPED_SOURCES: bool = false;\npub(crate) static CANDIDATES: &[CandidateIdentity] = &[];\n",
+        "pub(crate) const LINKED: bool = false;\npub(crate) const TIMING_PERMITTED: bool = false;\npub(crate) const BACKEND_TAG: u16 = 0;\npub(crate) const BACKEND_NAME: &str = \"unresolved\";\npub(crate) const FAMILY_SELECTOR: u16 = 0;\npub(crate) const MINIMUM_WINDOW_BYTES: usize = 1;\npub(crate) const PORTABLE_PREFIX_CANDIDATE_STARTS: usize = 1;\npub(crate) const PLAN_IDENTITY: &str = \"unresolved\";\npub(crate) const ANALYZER_IDENTITY: &str = \"unresolved\";\npub(crate) const EVIDENCE_IDENTITY: &str = \"unresolved\";\npub(crate) const IDENTITY_SHA256: &str = \"unresolved\";\npub(crate) const RUNNER_SOURCE_SHA256: &str = \"unresolved\";\npub(crate) const OBJECT_CANDIDATE_MANIFEST_SCHEMA: &str = \"unresolved\";\npub(crate) const OBJECT_CANDIDATE_MANIFEST_SHA256: &str = \"unresolved\";\npub(crate) const FIXTURE_MANIFEST_SCHEMA: &str = \"unresolved\";\npub(crate) const FIXTURE_MANIFEST_SHA256: &str = \"unresolved\";\npub(crate) const CANONICAL_BYTE_ESCAPED_SOURCES: bool = false;\npub(crate) static CANDIDATES: &[CandidateIdentity] = &[];\n",
     );
     generated.push_str(
         "#[allow(unsafe_code, unused_variables, reason = \"selector-neutral scaffold has no linked glue to invoke\")]\npub(crate) unsafe fn invoke(index: usize, output: *mut fre_aot_static_runtime::RawStaticSearchSpanAdoptionOutputV1) -> u32 { fre_aot_static_runtime::STATIC_SEARCH_SPAN_ADOPT_STATUS_NO_QUALIFIED_ROW_V1 }\n",
