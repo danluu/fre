@@ -348,6 +348,7 @@ struct LazyCapabilities {
 struct EffectiveLazyMode {
     lazy: bool,
     reverse: bool,
+    direct_ready: bool,
 }
 
 // Source-independent facts that are invariant across suffix searches using
@@ -2181,7 +2182,16 @@ fn effective_lazy_mode(
     // will decline the span acceleration and use Pike.
     let may_prove_start_without_reverse = wants_span && !capabilities.contextual;
     let lazy = capabilities.lazy && (!wants_span || reverse || may_prove_start_without_reverse);
-    Ok(EffectiveLazyMode { lazy, reverse })
+    let direct_ready = capabilities.lazy
+        && !capabilities.contextual
+        && workspace.lazy.is_bound_to(automaton)
+        && workspace.lazy.initialized
+        && !workspace.lazy.declined;
+    Ok(EffectiveLazyMode {
+        lazy,
+        reverse,
+        direct_ready,
+    })
 }
 
 fn effective_bound_lazy_mode(
@@ -2197,7 +2207,15 @@ fn effective_bound_lazy_mode(
     let reverse = capabilities.reverse && wants_span && !cached_start_known;
     let may_prove_start_without_reverse = wants_span && !capabilities.contextual;
     let lazy = capabilities.lazy && (!wants_span || reverse || may_prove_start_without_reverse);
-    Ok(EffectiveLazyMode { lazy, reverse })
+    let direct_ready = capabilities.lazy
+        && !capabilities.contextual
+        && workspace.lazy.initialized
+        && !workspace.lazy.declined;
+    Ok(EffectiveLazyMode {
+        lazy,
+        reverse,
+        direct_ready,
+    })
 }
 
 pub(crate) fn search_span_with_workspace_cursor(
@@ -2249,6 +2267,7 @@ pub(crate) fn search_span_with_workspace_cursor(
         OutputContract::Span,
         mode.lazy,
         mode.reverse,
+        mode.direct_ready,
         cursor.capabilities.contextual,
         meter,
         setup_work,
@@ -2308,6 +2327,7 @@ fn search_span_with_bound_cursor(
         OutputContract::Span,
         mode.lazy,
         mode.reverse,
+        mode.direct_ready,
         capabilities.contextual,
         meter,
         setup_work,
@@ -2348,6 +2368,7 @@ fn execute(
         EffectiveLazyMode {
             lazy: allow_lazy && workspace.lazy.is_allocated(),
             reverse: false,
+            direct_ready: false,
         }
     };
     let mut setup = setup;
@@ -2371,6 +2392,7 @@ fn execute(
         contract,
         mode.lazy,
         mode.reverse,
+        mode.direct_ready,
         contextual,
         meter,
         setup_work,
@@ -2400,6 +2422,10 @@ fn execute_bound(
         EffectiveLazyMode {
             lazy: capabilities.lazy,
             reverse: false,
+            direct_ready: capabilities.lazy
+                && !capabilities.contextual
+                && workspace.lazy.initialized
+                && !workspace.lazy.declined,
         }
     };
     let mut setup = SetupAccounting::empty(workspace.retained_bytes, true);
@@ -2423,6 +2449,7 @@ fn execute_bound(
         contract,
         mode.lazy,
         mode.reverse,
+        mode.direct_ready,
         capabilities.contextual,
         meter,
         setup_work,
@@ -2431,6 +2458,7 @@ fn execute_bound(
 }
 
 #[allow(
+    clippy::fn_params_excessive_bools,
     clippy::too_many_arguments,
     clippy::too_many_lines,
     reason = "the shared Pike/lazy entry authenticates one complete invocation"
@@ -2445,6 +2473,7 @@ fn execute_prepared(
     contract: OutputContract,
     may_use_lazy: bool,
     may_use_reverse: bool,
+    mut direct_ready: bool,
     contextual: bool,
     mut meter: WorkMeter,
     mut setup_work: u64,
@@ -2529,8 +2558,10 @@ fn execute_prepared(
                     .remaining()
                     .checked_sub(lazy_core_reserve)
                     .is_some_and(|optional| combined_preparation <= optional);
-            if !admitted
-                || !prepare_lazy(
+            if !admitted {
+                false
+            } else if direct_ready
+                || prepare_lazy(
                     automaton,
                     workspace,
                     &mut meter,
@@ -2538,8 +2569,7 @@ fn execute_prepared(
                     window.start(),
                 )?
             {
-                false
-            } else {
+                direct_ready = true;
                 lazy_initial_has_pending(workspace)?
                     || (may_use_reverse
                         && prepare_reverse_lazy(
@@ -2549,6 +2579,8 @@ fn execute_prepared(
                             lazy_core_reserve,
                             window.start(),
                         )?)
+            } else {
+                false
             }
         }
     } else {
@@ -2584,6 +2616,7 @@ fn execute_prepared(
                 lazy_core_reserve,
                 start_proof.proof().scanner.as_ref(),
                 start_proof.proof().guard.as_ref(),
+                direct_ready,
             )?
         }
     } else {
@@ -2696,6 +2729,7 @@ fn execute_lazy_loop(
     core_reserve: u64,
     scanner: Option<&StartPositionScanner>,
     guard: Option<&StartPositionClass>,
+    direct_ready: bool,
 ) -> Result<Option<(Option<MatchSpan>, usize)>, SearchError> {
     if !matches!(
         contract,
@@ -2703,7 +2737,8 @@ fn execute_lazy_loop(
             | OutputContract::EarliestEnd
             | OutputContract::SelectedEnd
             | OutputContract::Span
-    ) || !prepare_lazy(automaton, workspace, meter, core_reserve, window.start())?
+    ) || (!direct_ready
+        && !prepare_lazy(automaton, workspace, meter, core_reserve, window.start())?)
     {
         return Ok(None);
     }
@@ -11555,6 +11590,7 @@ mod tests {
             super::EffectiveLazyMode {
                 lazy: true,
                 reverse: false,
+                direct_ready: false,
             }
         );
         let endpoint_required =
@@ -11638,6 +11674,7 @@ mod tests {
             super::EffectiveLazyMode {
                 lazy: true,
                 reverse: true,
+                direct_ready: false,
             }
         );
         let cold_full_required = super::required_generation_count(
@@ -11691,6 +11728,7 @@ mod tests {
             super::EffectiveLazyMode {
                 lazy: true,
                 reverse: false,
+                direct_ready: true,
             }
         );
         let warm_required = super::required_generation_count(
@@ -13591,6 +13629,7 @@ mod tests {
             super::EffectiveLazyMode {
                 lazy: true,
                 reverse: false,
+                direct_ready: false,
             }
         );
         let endpoint_report =
@@ -13609,6 +13648,7 @@ mod tests {
             super::EffectiveLazyMode {
                 lazy: true,
                 reverse: true,
+                direct_ready: false,
             }
         );
         let full_report =
@@ -13624,6 +13664,7 @@ mod tests {
             super::EffectiveLazyMode {
                 lazy: true,
                 reverse: false,
+                direct_ready: true,
             }
         );
         let warm_report =
