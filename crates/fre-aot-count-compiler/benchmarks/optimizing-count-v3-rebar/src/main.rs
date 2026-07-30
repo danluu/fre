@@ -113,6 +113,9 @@ const BUILD_AUTHORITY_BINDING_DOMAIN: &[u8] =
 const MAX_REQUEST_BYTES: u64 = 4_096;
 const MAX_EXECUTABLE_BYTES: usize = 512 * 1_048_576;
 const MAX_ARTIFACT_BYTES: usize = 64 * 1_048_576;
+// Keep the complete qualification universe available for code-identity audit.
+// Production authorization applies the stricter facade floor per selected cell.
+const MINIMUM_AUTHENTICATED_INVENTORY_BYTES: usize = 4_096;
 
 #[cfg(feature = "qualification-private")]
 const COMPILED_BUILD_AUTHORITY: &str = "qualification-private";
@@ -459,6 +462,7 @@ fn run_production_authorization(
         .map_err(|error| RunnerError::new(format!("decode canonical runner request: {error}")))?;
     validate_request(&request, &request_bytes)?;
     let cell = find_cell(&cell_id)?;
+    require_production_cell_floor(cell)?;
     let artifact = ARTIFACTS
         .get(cell.artifact_index)
         .ok_or_else(|| RunnerError::new("cell artifact index escaped the embedded table"))?;
@@ -747,10 +751,9 @@ fn validate_embedded_tables() -> Result<(), RunnerError> {
                 "embedded cell has an out-of-range artifact index",
             ));
         }
-        #[cfg(feature = "production")]
-        if cell.input_bytes < AGGREGATE_COUNT_EXACT_LITERAL_AOT_MIN_HAYSTACK_BYTES_V3 {
+        if cell.input_bytes < MINIMUM_AUTHENTICATED_INVENTORY_BYTES {
             return Err(RunnerError::new(
-                "production confirmation cell is below the evidence-backed AOT route floor",
+                "embedded cell is below the authenticated qualification-inventory floor",
             ));
         }
     }
@@ -784,6 +787,17 @@ fn find_cell(cell_id: &str) -> Result<&'static CellDescriptor, RunnerError> {
         .ok()
         .and_then(|index| CELLS.get(index))
         .ok_or_else(|| RunnerError::new("cell ID is absent from the frozen inventory"))
+}
+
+#[cfg(feature = "production")]
+fn require_production_cell_floor(cell: &CellDescriptor) -> Result<(), RunnerError> {
+    if cell.input_bytes < AGGREGATE_COUNT_EXACT_LITERAL_AOT_MIN_HAYSTACK_BYTES_V3 {
+        Err(RunnerError::new(
+            "production confirmation cell is below the evidence-backed AOT route floor",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn load_haystack(cell: &CellDescriptor) -> Result<Vec<u8>, RunnerError> {

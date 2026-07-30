@@ -64,6 +64,9 @@ ORDERS = (
     ("count-v3-aot", "count-v2-current", "portable-current"),
 )
 TEMPORARY_UNAVAILABLE = 75
+# The runner exposes the complete qualification registry for code-identity
+# verification; only plan-selected production cells use the stricter AOT floor.
+MINIMUM_INVENTORY_BYTES = 4_096
 MINIMUM_AOT_BYTES = 65_536
 MINIMUM_REPETITIONS = 30
 MAXIMUM_REPETITIONS = 60
@@ -994,6 +997,24 @@ def load_registry(
     return registry
 
 
+def select_production_cells(
+    cells: Mapping[str, Mapping[str, Any]],
+    selected: Sequence[Mapping[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    selected_ids = {row["cell_id"] for row in selected}
+    if len(selected_ids) != len(selected) or not selected_ids.issubset(cells):
+        fail("plan cell selection is duplicated or escapes the production registry")
+    result = {cell_id: dict(cells[cell_id]) for cell_id in sorted(selected_ids)}
+    for cell_id, cell in result.items():
+        require_uint(
+            cell["input_bytes"],
+            MINIMUM_AOT_BYTES,
+            1 << 40,
+            f"selected production cell {cell_id} input bytes",
+        )
+    return result
+
+
 def index_registry(
     registry: Mapping[str, Any],
     selected: Sequence[Mapping[str, Any]],
@@ -1027,7 +1048,7 @@ def index_registry(
                 row["expected_count"], 0, (1 << 64) - 1, "expected count"
             ),
             "input_bytes": require_uint(
-                row["input_bytes"], MINIMUM_AOT_BYTES, 1 << 40, "input bytes"
+                row["input_bytes"], MINIMUM_INVENTORY_BYTES, 1 << 40, "input bytes"
             ),
             "input_sha256": require_string(
                 row["input_sha256"], "input SHA-256", HEX64
@@ -1044,10 +1065,7 @@ def index_registry(
         }
         cells[cell_id] = normalized
 
-    selected_ids = {row["cell_id"] for row in selected}
-    if len(selected_ids) != len(selected) or not selected_ids.issubset(cells):
-        fail("plan cell selection is duplicated or escapes the production registry")
-    cells = {cell_id: cells[cell_id] for cell_id in sorted(selected_ids)}
+    cells = select_production_cells(cells, selected)
 
     artifacts: dict[tuple[str, str], dict[str, Any]] = {}
     for ordinal, raw in enumerate(

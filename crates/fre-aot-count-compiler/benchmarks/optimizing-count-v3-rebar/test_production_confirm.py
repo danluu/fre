@@ -58,6 +58,7 @@ def eligibility(**changes):
 
 class EligibilityTargetTests(unittest.TestCase):
     def test_production_confirmation_floor_is_64_kib(self) -> None:
+        self.assertEqual(production_confirm.MINIMUM_INVENTORY_BYTES, 4_096)
         self.assertEqual(production_confirm.MINIMUM_AOT_BYTES, 65_536)
         self.assertEqual(
             production_confirm.LONG_SCAN_POLICY,
@@ -79,6 +80,31 @@ class EligibilityTargetTests(unittest.TestCase):
             ),
             65_536,
         )
+
+    def test_only_selected_production_cells_must_reach_64_kib(self) -> None:
+        cells = {
+            "cell-below-floor": {
+                "cell_id": "cell-below-floor",
+                "input_bytes": 4_096,
+            },
+            "cell-production": {
+                "cell_id": "cell-production",
+                "input_bytes": 65_536,
+            },
+        }
+        self.assertEqual(
+            production_confirm.select_production_cells(
+                cells, [{"cell_id": "cell-production"}]
+            ),
+            {"cell-production": cells["cell-production"]},
+        )
+        with self.assertRaisesRegex(
+            production_confirm.ConfirmationError,
+            "selected production cell cell-below-floor input bytes",
+        ):
+            production_confirm.select_production_cells(
+                cells, [{"cell_id": "cell-below-floor"}]
+            )
 
     def test_accepts_closed_neon_sve_and_sve2_targets(self) -> None:
         for row in [
