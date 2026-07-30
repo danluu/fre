@@ -50,6 +50,7 @@ const SEARCH_CANDIDATE_POLICY_V5: u16 = 9;
 const SEARCH_CANDIDATE_POLICY_V6: u16 = 10;
 const SEARCH_CANDIDATE_POLICY_V7: u16 = 11;
 const SEARCH_CANDIDATE_POLICY_V8: u16 = 12;
+const SEARCH_CANDIDATE_POLICY_V9: u16 = 13;
 const SEARCH_CANDIDATE_BLOCK_WIDTH: u16 = 16;
 const SEARCH_CANDIDATE_OFFSET_NONE: u16 = u16::MAX;
 const SVE2_CLASS_TABLE_DATA_ID: u32 = 2;
@@ -86,6 +87,9 @@ pub enum SearchBackendPolicy {
     /// Search V12 candidate: V11 screening plus length-specialized loop-free
     /// exact confirmation for the complete 1..=32-byte envelope.
     AsimdV12,
+    /// Search V13 candidate: V12 plus adaptive exact retained-mask recovery
+    /// after the first recovered candidate misses.
+    AsimdV13,
     /// SVE screening with exactly sixteen active byte lanes.
     Sve16,
     /// SVE2 `MATCH` screening with exactly sixteen active byte lanes,
@@ -111,6 +115,7 @@ impl SearchBackendPolicy {
             Self::AsimdV10 => BackendVersion::SEARCH_V10,
             Self::AsimdV11 => BackendVersion::SEARCH_V11,
             Self::AsimdV12 => BackendVersion::SEARCH_V12,
+            Self::AsimdV13 => BackendVersion::SEARCH_V13,
             Self::Sve16 => BackendVersion::SEARCH_SVE16_V1,
             Self::Sve2Fixed16 => BackendVersion::SEARCH_SVE2_16_V1,
             Self::Sve16V6 => BackendVersion::SEARCH_SVE16_V6,
@@ -324,6 +329,7 @@ fn emit_search_image<O: Operation>(
             | BackendVersion::SEARCH_V10
             | BackendVersion::SEARCH_V11
             | BackendVersion::SEARCH_V12
+            | BackendVersion::SEARCH_V13
             | BackendVersion::SEARCH_SVE16_V1
             | BackendVersion::SEARCH_SVE2_16_V1
             | BackendVersion::SEARCH_SVE16_V6
@@ -388,6 +394,7 @@ fn emit_search_image<O: Operation>(
             | BackendVersion::SEARCH_V10
             | BackendVersion::SEARCH_V11
             | BackendVersion::SEARCH_V12
+            | BackendVersion::SEARCH_V13
     ) && !plan.is_v9_policy_shape()
     {
         return Err(EmitError::Unsupported {
@@ -515,6 +522,7 @@ fn emit_search_image<O: Operation>(
                 | BackendVersion::SEARCH_V10
                 | BackendVersion::SEARCH_V11
                 | BackendVersion::SEARCH_V12
+                | BackendVersion::SEARCH_V13
                 | BackendVersion::SEARCH_SVE16_V1
                 | BackendVersion::SEARCH_SVE2_16_V1
                 | BackendVersion::SEARCH_SVE16_V6
@@ -1574,6 +1582,7 @@ impl<'a> Plan<'a> {
                         | BackendVersion::SEARCH_V10
                         | BackendVersion::SEARCH_V11
                         | BackendVersion::SEARCH_V12
+                        | BackendVersion::SEARCH_V13
                         | BackendVersion::SEARCH_SVE16_V6
                         | BackendVersion::SEARCH_SVE2_FIXED16_V2
                 ) =>
@@ -1625,6 +1634,7 @@ impl<'a> Plan<'a> {
                 | BackendVersion::SEARCH_V10
                 | BackendVersion::SEARCH_V11
                 | BackendVersion::SEARCH_V12
+                | BackendVersion::SEARCH_V13
                 | BackendVersion::SEARCH_SVE16_V1
                 | BackendVersion::SEARCH_SVE2_16_V1
                 | BackendVersion::SEARCH_SVE16_V6
@@ -1669,6 +1679,7 @@ impl<'a> Plan<'a> {
                         | BackendVersion::SEARCH_V10
                         | BackendVersion::SEARCH_V11
                         | BackendVersion::SEARCH_V12
+                        | BackendVersion::SEARCH_V13
                         | BackendVersion::SEARCH_SVE16_V1
                         | BackendVersion::SEARCH_SVE2_16_V1
                         | BackendVersion::SEARCH_SVE16_V6
@@ -1678,7 +1689,9 @@ impl<'a> Plan<'a> {
                     Some(
                         if matches!(
                             backend_version,
-                            BackendVersion::SEARCH_V11 | BackendVersion::SEARCH_V12
+                            BackendVersion::SEARCH_V11
+                                | BackendVersion::SEARCH_V12
+                                | BackendVersion::SEARCH_V13
                         ) {
                             admission.select_offsets_v3()
                         } else if matches!(
@@ -1783,6 +1796,10 @@ impl<'a> Plan<'a> {
                         && shape == SearchShape::ExactLiteral
                     {
                         SEARCH_CANDIDATE_POLICY_V8
+                    } else if backend_version == BackendVersion::SEARCH_V13
+                        && shape == SearchShape::ExactLiteral
+                    {
+                        SEARCH_CANDIDATE_POLICY_V9
                     } else if backend_version == BackendVersion::SEARCH_V9
                         && shape == SearchShape::ExactLiteral
                     {
@@ -2063,6 +2080,19 @@ fn emit_exact(
         }
         BackendVersion::SEARCH_V12 => {
             emit_vector_candidate_skip_v12(
+                assembler,
+                literal,
+                primary_offset,
+                secondary_offset,
+                verification_offset,
+                quaternary_offset,
+                quinary_offset,
+                none,
+                found,
+            )?;
+        }
+        BackendVersion::SEARCH_V13 => {
+            emit_vector_candidate_skip_v13(
                 assembler,
                 literal,
                 primary_offset,
@@ -3051,6 +3081,54 @@ fn emit_vector_candidate_skip_v12(
 
 #[allow(
     clippy::too_many_arguments,
+    reason = "the V13 prefix preserves V12 exactly before selecting its distinct adaptive recovery graph"
+)]
+fn emit_vector_candidate_skip_v13(
+    assembler: &mut Assembler,
+    literal: &[u8],
+    primary_offset: u16,
+    secondary_offset: Option<u16>,
+    verification_offset: Option<u16>,
+    quaternary_offset: Option<u16>,
+    quinary_offset: Option<u16>,
+    none: Label,
+    found: Label,
+) -> Result<(), EmitError> {
+    let first_candidate_miss = assembler.new_label(LabelKind::Internal)?;
+    let selected = literal
+        .get(usize::from(primary_offset))
+        .copied()
+        .ok_or(EmitError::InternalInvariant)?;
+
+    assembler.add_reg(X15, X9, X5)?;
+    assembler.load_byte(X10, X15, primary_offset)?;
+    assembler.cmp_imm32(X10, u16::from(selected))?;
+    assembler.branch_cond(Condition::NotEqual, first_candidate_miss)?;
+    if literal.len() > 1 {
+        emit_literal_equality_specialized(assembler, X15, X8, literal.len(), first_candidate_miss)?;
+    }
+    assembler.mov_reg(X13, X5)?;
+    assembler.add_reg(X14, X5, X12)?;
+    assembler.branch(found)?;
+
+    assembler.bind(first_candidate_miss)?;
+    assembler.add_imm(X5, X5, 1)?;
+    emit_vector_candidate_skip_v8(
+        assembler,
+        literal,
+        primary_offset,
+        secondary_offset,
+        verification_offset,
+        quaternary_offset,
+        quinary_offset,
+        BackendVersion::SEARCH_V13,
+        none,
+        found,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
     clippy::too_many_lines,
     reason = "the versioned v8 graph keeps its paired 64-candidate screen and authenticated staged recovery explicit"
 )]
@@ -3080,6 +3158,12 @@ fn emit_vector_candidate_skip_v8(
     let recover = assembler.new_label(LabelKind::SlowPath)?;
     let lane_loop = assembler.new_label(LabelKind::Loop)?;
     let candidate_miss = assembler.new_label(LabelKind::Internal)?;
+    let recovery_exhausted = (backend_version == BackendVersion::SEARCH_V13)
+        .then(|| assembler.new_label(LabelKind::Internal))
+        .transpose()?;
+    let adaptive_recovery = (backend_version == BackendVersion::SEARCH_V13)
+        .then(|| assembler.new_label(LabelKind::SlowPath))
+        .transpose()?;
     let tail_setup = assembler.new_label(LabelKind::SlowPath)?;
     let wide_second_filter = secondary_offset
         .map(|_| assembler.new_label(LabelKind::SlowPath))
@@ -3385,7 +3469,10 @@ fn emit_vector_candidate_skip_v8(
                 X13,
             )?;
         }
-    } else if backend_version == BackendVersion::SEARCH_V12 {
+    } else if matches!(
+        backend_version,
+        BackendVersion::SEARCH_V12 | BackendVersion::SEARCH_V13
+    ) {
         emit_literal_equality_specialized(assembler, X15, X8, literal.len(), candidate_miss)?;
     } else if literal.len() == 16 {
         emit_literal_equality_16_with_vectors(assembler, X15, X8, candidate_miss, 16, 17)?;
@@ -3408,7 +3495,47 @@ fn emit_vector_candidate_skip_v8(
     assembler.bind(candidate_miss)?;
     assembler.sub_imm(X10, X0, 1)?;
     assembler.and_reg(X0, X0, X10)?;
-    assembler.compare_branch_zero(X0, true, lane_loop)?;
+    if backend_version == BackendVersion::SEARCH_V13 {
+        let exhausted = recovery_exhausted.ok_or(EmitError::InternalInvariant)?;
+        assembler.compare_branch_zero(X0, false, exhausted)?;
+        let adaptive = candidate_adaptive_offsets_v13(
+            literal,
+            primary_offset,
+            secondary_offset,
+            verification_offset,
+            quaternary_offset,
+            quinary_offset,
+        );
+        let adaptive_entry = adaptive_recovery.ok_or(EmitError::InternalInvariant)?;
+        emit_branch_if_mask_has_multiple(assembler, X0, X10, adaptive_entry)?;
+        assembler.branch(lane_loop)?;
+        assembler.bind(adaptive_entry)?;
+        assembler.add_reg(X13, X9, X7)?;
+        for (index, &offset) in adaptive.offsets().iter().enumerate() {
+            assembler.load_byte(X10, X8, offset)?;
+            assembler.dup_byte16(17, X10)?;
+            let column = if offset == 0 {
+                X13
+            } else {
+                assembler.add_imm(X15, X13, offset)?;
+                X15
+            };
+            assembler.load_vector128(16, column, 0)?;
+            assembler.compare_equal_bytes16(16, 16, 17)?;
+            emit_sparse_lane_mask_to(assembler, 16, 18, X10)?;
+            assembler.and_reg(X0, X0, X10)?;
+            assembler.compare_branch_zero(X0, false, exhausted)?;
+            if index + 1 < adaptive.len {
+                assembler.sub_imm(X10, X0, 1)?;
+                assembler.and_reg(X10, X0, X10)?;
+                assembler.compare_branch_zero(X10, false, lane_loop)?;
+            }
+        }
+        assembler.branch(lane_loop)?;
+        assembler.bind(exhausted)?;
+    } else {
+        assembler.compare_branch_zero(X0, true, lane_loop)?;
+    }
     assembler.add_imm(X5, X7, 16)?;
     assembler.add_reg(X15, X9, X5)?;
     if primary_offset != 0 {
@@ -3750,6 +3877,17 @@ fn emit_sparse_lane_mask_v7(assembler: &mut Assembler) -> Result<(), EmitError> 
     assembler.shift_right_narrow_halfwords_to_bytes8(2, 0)?;
     assembler.move_vector_double_to64(X0, 2)?;
     assembler.and_reg(X0, X0, X14)
+}
+
+fn emit_sparse_lane_mask_to(
+    assembler: &mut Assembler,
+    source: u8,
+    vector_scratch: u8,
+    destination: u8,
+) -> Result<(), EmitError> {
+    assembler.shift_right_narrow_halfwords_to_bytes8(vector_scratch, source)?;
+    assembler.move_vector_double_to64(destination, vector_scratch)?;
+    assembler.and_reg(destination, destination, X14)
 }
 
 fn emit_sparse_lane_mask(assembler: &mut Assembler) -> Result<(), EmitError> {
@@ -4094,6 +4232,64 @@ fn candidate_ranked_verification_offsets_v3(
         selected[next] = terminal_offset;
     }
     (selected[0], selected[1], selected[2])
+}
+
+struct AdaptiveOffsetsV13 {
+    values: [u16; MAX_REPEATED_CONFIRM_BYTES],
+    len: usize,
+}
+
+impl AdaptiveOffsetsV13 {
+    fn offsets(&self) -> &[u16] {
+        &self.values[..self.len]
+    }
+}
+
+fn candidate_adaptive_offsets_v13(
+    literal: &[u8],
+    primary_offset: u16,
+    secondary_offset: Option<u16>,
+    verification_offset: Option<u16>,
+    quaternary_offset: Option<u16>,
+    quinary_offset: Option<u16>,
+) -> AdaptiveOffsetsV13 {
+    // Every column excluded here is manifest-authenticated and has already
+    // participated whenever multi-survivor recovery is reachable. Rank every
+    // remaining column by the same frozen literal-byte frequency table as the
+    // initial screen, then stable source offset. No fixture or corpus fact can
+    // affect this order.
+    let selected = [
+        Some(primary_offset),
+        secondary_offset,
+        verification_offset,
+        quaternary_offset,
+        quinary_offset,
+    ];
+    let mut values = [0_u16; MAX_REPEATED_CONFIRM_BYTES];
+    let mut len = 0_usize;
+    for (offset, &byte) in literal.iter().enumerate() {
+        let offset = u16::try_from(offset).expect("bounded confirmation offset fits u16");
+        if selected.contains(&Some(offset)) {
+            continue;
+        }
+        let key = (V7_BYTE_FREQUENCY_RANK[usize::from(byte)], offset);
+        let mut insertion = len;
+        while insertion > 0 {
+            let previous = values[insertion - 1];
+            let previous_key = (
+                V7_BYTE_FREQUENCY_RANK[usize::from(literal[usize::from(previous)])],
+                previous,
+            );
+            if previous_key <= key {
+                break;
+            }
+            values[insertion] = previous;
+            insertion -= 1;
+        }
+        values[insertion] = offset;
+        len += 1;
+    }
+    AdaptiveOffsetsV13 { values, len }
 }
 
 // Frozen memchr 2.8.3 packed-pair frequency order. V7 uses the same ranking

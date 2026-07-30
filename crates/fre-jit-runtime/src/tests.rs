@@ -2994,6 +2994,66 @@ fn v12_specialized_confirmation_respects_every_guarded_width_and_mutation_offset
 }
 
 #[test]
+fn v13_adaptive_recovery_respects_every_guarded_width_shape_and_mutation_offset() {
+    let _lock = native_test_lock();
+    let mut comparisons = 0_u64;
+
+    for width in 2_usize..=32 {
+        for literal in [
+            vec![b'a'; width],
+            (0..width)
+                .map(|offset| if offset & 1 == 0 { b'a' } else { b'b' })
+                .collect::<Vec<_>>(),
+        ] {
+            let program = build_exact_literal::<Span>(
+                &literal,
+                AnchorFlags::default(),
+                ValidateLimits::default(),
+            )
+            .expect("V13 exact program");
+            let image = emit_audited_with_backend(
+                &program,
+                SearchBackendPolicy::AsimdV13,
+                EmitLimits::default(),
+            )
+            .expect("audited V13 image");
+            assert_eq!(
+                image.as_image().backend_version(),
+                BackendVersion::SEARCH_V13
+            );
+            let kernel =
+                publish_audited::<Span>(&image, PublicationLimits::default()).expect("publish V13");
+            let avoid = (0_u16..=255)
+                .map(|value| u8::try_from(value).expect("bounded byte"))
+                .find(|byte| !literal.contains(byte))
+                .expect("literal leaves one avoiding byte");
+
+            for mutation_offset in 0..width {
+                let mut near_miss = literal.clone();
+                near_miss[mutation_offset] = avoid;
+                let mut bytes = vec![avoid; 4_093];
+                for chunk in bytes.chunks_exact_mut(width) {
+                    chunk.copy_from_slice(&near_miss);
+                }
+                let match_start = bytes.len() - width;
+                install_literal(&mut bytes, match_start, &literal);
+                platform::with_guarded_haystack(&bytes, true, |guarded| {
+                    assert_native_matches(
+                        &program,
+                        &kernel,
+                        guarded,
+                        SearchWindow::new(0, guarded.len()),
+                    );
+                })
+                .expect("guarded every-offset V13 mutation stream");
+                comparisons = comparisons.checked_add(1).expect("bounded comparisons");
+            }
+        }
+    }
+    assert_eq!(comparisons, 1_054);
+}
+
+#[test]
 fn v8_adaptive_secondary_screen_rechecks_primary_before_fallback() {
     const WIDE_CANDIDATES: usize = 64;
     const PRIMARY_OFFSET: usize = 7;

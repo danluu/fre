@@ -851,6 +851,7 @@ fn preflight_search_backend_version(image: &NativeImage) -> Result<(), PublishEr
         | BackendVersion::SEARCH_V10
         | BackendVersion::SEARCH_V11
         | BackendVersion::SEARCH_V12
+        | BackendVersion::SEARCH_V13
         | BackendVersion::SEARCH_SVE16_V1
         | BackendVersion::SEARCH_SVE2_16_V1
         | BackendVersion::SEARCH_SVE16_V6

@@ -4550,6 +4550,7 @@ fn explicit_search_backend_policy_selects_distinct_artifact_identities() {
         (SearchBackendPolicy::AsimdV10, BackendVersion::SEARCH_V10),
         (SearchBackendPolicy::AsimdV11, BackendVersion::SEARCH_V11),
         (SearchBackendPolicy::AsimdV12, BackendVersion::SEARCH_V12),
+        (SearchBackendPolicy::AsimdV13, BackendVersion::SEARCH_V13),
         (SearchBackendPolicy::Sve16, BackendVersion::SEARCH_SVE16_V1),
         (
             SearchBackendPolicy::Sve2Fixed16,
@@ -6626,12 +6627,385 @@ fn v12_specialized_confirmation_is_audited_and_matches_every_offset() {
 }
 
 #[test]
-fn v9_through_v12_reject_shapes_without_one_nonempty_unanchored_exact_candidate() {
+#[allow(
+    clippy::too_many_lines,
+    reason = "the V13 matrix binds adaptive instruction count, independent audit, every width/offset/shape semantic, output contracts, and relabel resistance"
+)]
+fn v13_adaptive_retained_mask_is_audited_and_matches_every_offset() {
+    let mut comparisons = 0_u64;
+    for width in 1_usize..=MAX_REPEATED_CONFIRM_BYTES {
+        let literals = [
+            (0..width)
+                .map(|offset| {
+                    u8::try_from(offset)
+                        .expect("bounded width")
+                        .wrapping_mul(61)
+                        .wrapping_add(7)
+                })
+                .collect::<Vec<_>>(),
+            vec![b'a'; width],
+            (0..width)
+                .map(|offset| if offset & 1 == 0 { b'a' } else { b'b' })
+                .collect::<Vec<_>>(),
+        ];
+        for literal in literals {
+            let program = build_exact_literal::<Span>(
+                &literal,
+                AnchorFlags::default(),
+                ValidateLimits::default(),
+            )
+            .expect("V13 Span IR");
+            let image = emit_with_backend(
+                &program,
+                SearchBackendPolicy::AsimdV13,
+                EmitLimits::default(),
+            )
+            .expect("V13 exact image");
+            assert_eq!(image.backend_version(), BackendVersion::SEARCH_V13);
+            let manifest = image.search_manifest().expect("V13 manifest");
+            assert_eq!(manifest.candidate_policy_version, 13);
+            audit(&image).expect("independent V13 whole-template audit");
+            let aot = image.to_aot(AotLimits::default()).expect("bounded V13 AOT");
+            assert_eq!(&aot.as_bytes()[..8], b"FREA64\0\x1a");
+
+            let selected = [
+                manifest.primary_offset,
+                manifest.secondary_offset,
+                manifest.verification_offset,
+                manifest.quaternary_offset,
+                manifest.quinary_offset,
+            ];
+            let selected_count = selected
+                .into_iter()
+                .filter(|offset| *offset != u16::MAX)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len();
+            let expected_adaptive_columns = width.saturating_sub(selected_count);
+            let decoded = decode(image.code()).expect("V13 decode");
+            assert_eq!(
+                decoded
+                    .iter()
+                    .filter(|instruction| {
+                        matches!(
+                            instruction,
+                            DecodedInstruction::ShiftRightNarrowHalfwordsToBytes8 {
+                                destination: 18,
+                                source: 16
+                            }
+                        )
+                    })
+                    .count(),
+                expected_adaptive_columns
+            );
+
+            let avoid = (0_u16..=255)
+                .map(|value| u8::try_from(value).expect("bounded byte"))
+                .find(|byte| !literal.contains(byte))
+                .expect("literal leaves an avoiding byte");
+            for mutation_offset in 0..width {
+                let mut near_miss = literal.clone();
+                near_miss[mutation_offset] = avoid;
+                let mut haystack = Vec::new();
+                for _ in 0..17 {
+                    haystack.extend_from_slice(&near_miss);
+                }
+                haystack.extend_from_slice(&literal);
+                for (start, end) in [
+                    (0, haystack.len()),
+                    (haystack.len().min(1), haystack.len()),
+                    (0, haystack.len().saturating_sub(1)),
+                ] {
+                    let window = SearchWindow::new(start, end);
+                    let expected = program
+                        .execute(&haystack, window, ExecutionLimits::unlimited())
+                        .expect("V13 oracle")
+                        .output()
+                        .map(|span| (span.start(), span.end()));
+                    let actual =
+                        simulate(&image, &haystack, start, end).expect("V13 safe ISA simulation");
+                    assert_eq!(
+                        span_output(actual),
+                        expected,
+                        "width={width} mutation={mutation_offset} literal={literal:?} \
+                         window={start}..{end}"
+                    );
+                    comparisons = comparisons.checked_add(1).expect("bounded matrix");
+                }
+            }
+        }
+    }
+    assert_eq!(comparisons, 4_752);
+
+    let literal = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    for image in [
+        {
+            let program = build_exact_literal::<Exists>(
+                literal,
+                AnchorFlags::default(),
+                ValidateLimits::default(),
+            )
+            .expect("V13 Exists IR");
+            emit_with_backend(
+                &program,
+                SearchBackendPolicy::AsimdV13,
+                EmitLimits::default(),
+            )
+            .expect("V13 Exists")
+        },
+        {
+            let program = build_exact_literal::<SelectedEnd>(
+                literal,
+                AnchorFlags::default(),
+                ValidateLimits::default(),
+            )
+            .expect("V13 SelectedEnd IR");
+            emit_with_backend(
+                &program,
+                SearchBackendPolicy::AsimdV13,
+                EmitLimits::default(),
+            )
+            .expect("V13 SelectedEnd")
+        },
+    ] {
+        audit(&image).expect("independent V13 output-template audit");
+    }
+
+    let program =
+        build_exact_literal::<Span>(literal, AnchorFlags::default(), ValidateLimits::default())
+            .expect("V12/V13 identity program");
+    let canonical_v12 = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV12,
+        EmitLimits::default(),
+    )
+    .expect("canonical V12");
+    let canonical_v13 = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV13,
+        EmitLimits::default(),
+    )
+    .expect("canonical V13");
+    assert_ne!(canonical_v13.code(), canonical_v12.code());
+    assert_ne!(
+        canonical_v13.artifact_identity(),
+        canonical_v12.artifact_identity()
+    );
+
+    let mut v13_as_v12 = canonical_v13;
+    v13_as_v12.backend_version = BackendVersion::SEARCH_V12;
+    {
+        let manifest = v13_as_v12.search.as_mut().expect("V13 manifest");
+        manifest.backend_version = BackendVersion::SEARCH_V12;
+        manifest.candidate_policy_version = 12;
+    }
+    assert_resealed_search_rejected(v13_as_v12, "V13 code resealed as V12");
+
+    let mut v12_as_v13 = canonical_v12;
+    v12_as_v13.backend_version = BackendVersion::SEARCH_V13;
+    {
+        let manifest = v12_as_v13.search.as_mut().expect("V12 manifest");
+        manifest.backend_version = BackendVersion::SEARCH_V13;
+        manifest.candidate_policy_version = 13;
+    }
+    assert_resealed_search_rejected(v12_as_v13, "V12 code resealed as V13");
+}
+
+#[test]
+fn v13_adaptive_recovery_decoded_edges_cover_zero_one_and_max_remaining_columns() {
+    for (width, expected_columns) in [(5_usize, 0_usize), (6, 1), (32, 27)] {
+        let literal = vec![b'a'; width];
+        let program = build_exact_literal::<Span>(
+            &literal,
+            AnchorFlags::default(),
+            ValidateLimits::default(),
+        )
+        .expect("V13 boundary-column IR");
+        let image = emit_with_backend(
+            &program,
+            SearchBackendPolicy::AsimdV13,
+            EmitLimits::default(),
+        )
+        .expect("V13 boundary-column image");
+        let decoded = decode(image.code()).expect("V13 boundary-column decode");
+
+        let target = |index: usize| {
+            let displacement = match decoded[index] {
+                DecodedInstruction::Branch { displacement }
+                | DecodedInstruction::CompareBranchZero64 { displacement, .. } => displacement,
+                _ => panic!("instruction {index} is not a decoded V13 branch"),
+            };
+            let address = i64::try_from(index)
+                .expect("small instruction index")
+                .checked_mul(4)
+                .and_then(|address| address.checked_add(i64::from(displacement)))
+                .expect("bounded V13 target");
+            assert_eq!(address % 4, 0);
+            usize::try_from(address / 4).expect("nonnegative V13 target")
+        };
+        let adaptive_entry = decoded
+            .iter()
+            .position(|instruction| {
+                *instruction
+                    == DecodedInstruction::AddRegister64 {
+                        destination: 13,
+                        left: 9,
+                        right: 7,
+                    }
+            })
+            .expect("V13 adaptive entry");
+        assert!(adaptive_entry >= 7);
+        assert_eq!(
+            &decoded[adaptive_entry - 7..adaptive_entry],
+            &[
+                DecodedInstruction::SubtractImmediate64 {
+                    destination: 10,
+                    source: 0,
+                    immediate: 1,
+                },
+                DecodedInstruction::AndRegister64 {
+                    destination: 0,
+                    left: 0,
+                    right: 10,
+                },
+                decoded[adaptive_entry - 5],
+                DecodedInstruction::SubtractImmediate64 {
+                    destination: 10,
+                    source: 0,
+                    immediate: 1,
+                },
+                DecodedInstruction::AndRegister64 {
+                    destination: 10,
+                    left: 0,
+                    right: 10,
+                },
+                decoded[adaptive_entry - 2],
+                decoded[adaptive_entry - 1],
+            ]
+        );
+        assert!(matches!(
+            decoded[adaptive_entry - 5],
+            DecodedInstruction::CompareBranchZero64 {
+                register: 0,
+                nonzero: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            decoded[adaptive_entry - 2],
+            DecodedInstruction::CompareBranchZero64 {
+                register: 10,
+                nonzero: true,
+                ..
+            }
+        ));
+        assert_eq!(target(adaptive_entry - 2), adaptive_entry);
+
+        let adaptive_masks = decoded
+            .iter()
+            .enumerate()
+            .filter_map(|(index, instruction)| {
+                (*instruction
+                    == DecodedInstruction::ShiftRightNarrowHalfwordsToBytes8 {
+                        destination: 18,
+                        source: 16,
+                    })
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(adaptive_masks.len(), expected_columns);
+        let exhausted_target = target(adaptive_entry - 5);
+        assert_eq!(
+            decoded[exhausted_target],
+            DecodedInstruction::AddImmediate64 {
+                destination: 5,
+                source: 7,
+                immediate: 16,
+            }
+        );
+        let lane_loop_target = target(adaptive_entry - 1);
+        assert_eq!(
+            decoded[lane_loop_target],
+            DecodedInstruction::ReverseBits64 {
+                destination: 10,
+                source: 0,
+            }
+        );
+
+        for (ordinal, &mask) in adaptive_masks.iter().enumerate() {
+            assert_eq!(
+                decoded.get(mask..mask + 5),
+                Some(
+                    [
+                        DecodedInstruction::ShiftRightNarrowHalfwordsToBytes8 {
+                            destination: 18,
+                            source: 16,
+                        },
+                        DecodedInstruction::MoveVectorDoubleTo64 {
+                            destination: 10,
+                            source: 18,
+                        },
+                        DecodedInstruction::AndRegister64 {
+                            destination: 10,
+                            left: 10,
+                            right: 14,
+                        },
+                        DecodedInstruction::AndRegister64 {
+                            destination: 0,
+                            left: 0,
+                            right: 10,
+                        },
+                        decoded[mask + 4],
+                    ]
+                    .as_slice()
+                )
+            );
+            assert!(matches!(
+                decoded[mask + 4],
+                DecodedInstruction::CompareBranchZero64 {
+                    register: 0,
+                    nonzero: false,
+                    ..
+                }
+            ));
+            assert_eq!(target(mask + 4), exhausted_target);
+            if ordinal + 1 < adaptive_masks.len() {
+                assert_eq!(
+                    &decoded[mask + 5..mask + 7],
+                    &[
+                        DecodedInstruction::SubtractImmediate64 {
+                            destination: 10,
+                            source: 0,
+                            immediate: 1,
+                        },
+                        DecodedInstruction::AndRegister64 {
+                            destination: 10,
+                            left: 0,
+                            right: 10,
+                        },
+                    ]
+                );
+                assert!(matches!(
+                    decoded[mask + 7],
+                    DecodedInstruction::CompareBranchZero64 {
+                        register: 10,
+                        nonzero: false,
+                        ..
+                    }
+                ));
+                assert_eq!(target(mask + 7), lane_loop_target);
+            }
+        }
+    }
+}
+
+#[test]
+fn v9_through_v13_reject_shapes_without_one_nonempty_unanchored_exact_candidate() {
     for backend in [
         SearchBackendPolicy::AsimdV9,
         SearchBackendPolicy::AsimdV10,
         SearchBackendPolicy::AsimdV11,
         SearchBackendPolicy::AsimdV12,
+        SearchBackendPolicy::AsimdV13,
     ] {
         for anchors in [
             AnchorFlags {

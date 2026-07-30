@@ -831,6 +831,9 @@ fn emit_exact(
         BackendVersion::SEARCH_V12 => {
             emit_exact_candidates_v12(template, manifest, literal, none, found)
         }
+        BackendVersion::SEARCH_V13 => {
+            emit_exact_candidates_v13(template, manifest, literal, none, found)
+        }
         BackendVersion::SEARCH_SVE2_FIXED16_V2 => {
             emit_exact_candidates_sve2_fixed16_v2(template, manifest, literal, none, found)
         }
@@ -1312,6 +1315,35 @@ fn emit_exact_candidates_v10(
 }
 
 fn emit_exact_candidates_v12(
+    template: &mut Template,
+    manifest: SearchManifest,
+    literal: &[u8],
+    none: Label,
+    found: Label,
+) -> Result<(), AuditError> {
+    let first_candidate_miss = template.new_label(LabelKind::Internal);
+    let selected = literal
+        .get(usize::from(manifest.primary_offset))
+        .copied()
+        .ok_or(AuditError::InvalidSearchManifest)?;
+
+    template.add_reg(15, 9, 5);
+    template.load_byte(10, 15, manifest.primary_offset);
+    template.cmp_imm32(10, u16::from(selected));
+    template.branch_cond(Condition::NotEqual, first_candidate_miss);
+    if literal.len() > 1 {
+        emit_literal_equality_specialized(template, 15, 8, literal.len(), first_candidate_miss)?;
+    }
+    template.mov_reg(13, 5);
+    template.add_reg(14, 5, 12);
+    template.branch(found);
+
+    template.bind(first_candidate_miss)?;
+    template.add_imm(5, 5, 1);
+    emit_exact_candidates_v8(template, manifest, literal, none, found)
+}
+
+fn emit_exact_candidates_v13(
     template: &mut Template,
     manifest: SearchManifest,
     literal: &[u8],
@@ -1826,6 +1858,10 @@ fn emit_exact_candidates_v8(
     let recover = template.new_label(LabelKind::SlowPath);
     let lane_loop = template.new_label(LabelKind::Loop);
     let candidate_miss = template.new_label(LabelKind::Internal);
+    let recovery_exhausted = (manifest.backend_version == BackendVersion::SEARCH_V13)
+        .then(|| template.new_label(LabelKind::Internal));
+    let adaptive_recovery = (manifest.backend_version == BackendVersion::SEARCH_V13)
+        .then(|| template.new_label(LabelKind::SlowPath));
     let tail_setup = template.new_label(LabelKind::SlowPath);
     let wide_second_filter = secondary_offset.map(|_| template.new_label(LabelKind::SlowPath));
     let second_filter = secondary_offset.map(|_| template.new_label(LabelKind::SlowPath));
@@ -2101,7 +2137,10 @@ fn emit_exact_candidates_v8(
                 13,
             )?;
         }
-    } else if manifest.backend_version == BackendVersion::SEARCH_V12 {
+    } else if matches!(
+        manifest.backend_version,
+        BackendVersion::SEARCH_V12 | BackendVersion::SEARCH_V13
+    ) {
         emit_literal_equality_specialized(template, 15, 8, literal.len(), candidate_miss)?;
     } else if literal.len() == 16 {
         emit_literal_equality_16_with_vectors(template, 15, 8, candidate_miss, 16, 17);
@@ -2124,7 +2163,47 @@ fn emit_exact_candidates_v8(
     template.bind(candidate_miss)?;
     template.sub_imm(10, 0, 1);
     template.and_reg(0, 0, 10);
-    template.compare_branch_zero(0, true, lane_loop);
+    if manifest.backend_version == BackendVersion::SEARCH_V13 {
+        let exhausted = recovery_exhausted.ok_or(AuditError::InvalidSearchManifest)?;
+        template.compare_branch_zero(0, false, exhausted);
+        let adaptive = independent_adaptive_offsets_v13(
+            literal,
+            primary_offset,
+            secondary_offset,
+            verification_offset,
+            quaternary_offset,
+            quinary_offset,
+        );
+        let adaptive_entry = adaptive_recovery.ok_or(AuditError::InvalidSearchManifest)?;
+        emit_branch_if_mask_has_multiple(template, 0, 10, adaptive_entry);
+        template.branch(lane_loop);
+        template.bind(adaptive_entry)?;
+        template.add_reg(13, 9, 7);
+        for (index, &offset) in adaptive.iter().enumerate() {
+            template.load_byte(10, 8, offset);
+            template.dup_byte16(17, 10);
+            let column = if offset == 0 {
+                13
+            } else {
+                template.add_imm(15, 13, offset);
+                15
+            };
+            template.load_vector128(16, column, 0);
+            template.compare_equal_bytes16(16, 16, 17);
+            emit_sparse_lane_mask_to(template, 16, 18, 10);
+            template.and_reg(0, 0, 10);
+            template.compare_branch_zero(0, false, exhausted);
+            if index + 1 < adaptive.len() {
+                template.sub_imm(10, 0, 1);
+                template.and_reg(10, 0, 10);
+                template.compare_branch_zero(10, false, lane_loop);
+            }
+        }
+        template.branch(lane_loop);
+        template.bind(exhausted)?;
+    } else {
+        template.compare_branch_zero(0, true, lane_loop);
+    }
     template.add_imm(5, 7, 16);
     template.add_reg(15, 9, 5);
     if primary_offset != 0 {
@@ -2444,6 +2523,97 @@ fn emit_sparse_lane_mask_v7(template: &mut Template) {
     template.move_vector_double_to64(0, 2);
     template.and_reg(0, 0, 14);
 }
+
+fn emit_sparse_lane_mask_to(
+    template: &mut Template,
+    source: u8,
+    vector_scratch: u8,
+    destination: u8,
+) {
+    template.shift_right_narrow_halfwords_to_bytes8(vector_scratch, source);
+    template.move_vector_double_to64(destination, vector_scratch);
+    template.and_reg(destination, destination, 14);
+}
+
+struct IndependentAdaptiveOffsetsV13 {
+    values: [u16; crate::MAX_REPEATED_CONFIRM_BYTES],
+    len: usize,
+}
+
+impl IndependentAdaptiveOffsetsV13 {
+    fn iter(&self) -> core::slice::Iter<'_, u16> {
+        self.values[..self.len].iter()
+    }
+
+    const fn len(&self) -> usize {
+        self.len
+    }
+}
+
+fn independent_adaptive_offsets_v13(
+    literal: &[u8],
+    primary_offset: u16,
+    secondary_offset: Option<u16>,
+    verification_offset: Option<u16>,
+    quaternary_offset: Option<u16>,
+    quinary_offset: Option<u16>,
+) -> IndependentAdaptiveOffsetsV13 {
+    let selected = [
+        Some(primary_offset),
+        secondary_offset,
+        verification_offset,
+        quaternary_offset,
+        quinary_offset,
+    ];
+    let mut values = [0_u16; crate::MAX_REPEATED_CONFIRM_BYTES];
+    let mut len = 0_usize;
+    for (offset, &byte) in literal.iter().enumerate() {
+        let offset = u16::try_from(offset).expect("bounded independent offset fits u16");
+        if selected.contains(&Some(offset)) {
+            continue;
+        }
+        let key = (
+            INDEPENDENT_V13_BYTE_FREQUENCY_RANK[usize::from(byte)],
+            offset,
+        );
+        let mut insertion = len;
+        while insertion > 0 {
+            let previous = values[insertion - 1];
+            let previous_key = (
+                INDEPENDENT_V13_BYTE_FREQUENCY_RANK[usize::from(literal[usize::from(previous)])],
+                previous,
+            );
+            if previous_key <= key {
+                break;
+            }
+            values[insertion] = previous;
+            insertion -= 1;
+        }
+        values[insertion] = offset;
+        len += 1;
+    }
+    IndependentAdaptiveOffsetsV13 { values, len }
+}
+
+// Independently pinned copy of the memchr 2.8.3 packed-pair byte-frequency
+// order. The template must not consume the emitter's table when reconstructing
+// V13's exact adaptive instruction stream.
+const INDEPENDENT_V13_BYTE_FREQUENCY_RANK: [u8; 256] = [
+    55, 52, 51, 50, 49, 48, 47, 46, 45, 103, 242, 66, 67, 229, 44, 43, 42, 41, 40, 39, 38, 37, 36,
+    35, 34, 33, 56, 32, 31, 30, 29, 28, 255, 148, 164, 149, 136, 160, 155, 173, 221, 222, 134, 122,
+    232, 202, 215, 224, 208, 220, 204, 187, 183, 179, 177, 168, 178, 200, 226, 195, 154, 184, 174,
+    126, 120, 191, 157, 194, 170, 189, 162, 161, 150, 193, 142, 137, 171, 176, 185, 167, 186, 112,
+    175, 192, 188, 156, 140, 143, 123, 133, 128, 147, 138, 146, 114, 223, 151, 249, 216, 238, 236,
+    253, 227, 218, 230, 247, 135, 180, 241, 233, 246, 244, 231, 139, 245, 243, 251, 235, 201, 196,
+    240, 214, 152, 182, 205, 181, 127, 27, 212, 211, 210, 213, 228, 197, 169, 159, 131, 172, 105,
+    80, 98, 96, 97, 81, 207, 145, 116, 115, 144, 130, 153, 121, 107, 132, 109, 110, 124, 111, 82,
+    108, 118, 141, 113, 129, 119, 125, 165, 117, 92, 106, 83, 72, 99, 93, 65, 79, 166, 237, 163,
+    199, 190, 225, 209, 203, 198, 217, 219, 206, 234, 248, 158, 239, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255,
+];
 
 fn emit_sparse_lane_mask(template: &mut Template) {
     template.shift_right_narrow_halfwords_to_bytes8(2, 0);
