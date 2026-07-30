@@ -425,11 +425,14 @@ pub use fre_kernels::{
     GraphemeScalarDfaRole, GraphemeScalarDfaSemantics, GraphemeScalarDfaUpperBounds,
     LITERAL_AGGREGATE_ACCOUNTING_VERSION, LITERAL_AGGREGATE_ALGORITHM_VERSION,
     LITERAL_ASSERTIONS_COUNT_OPERATION_ID, LITERAL_ASSERTIONS_PLAN_ID,
-    LITERAL_ASSERTIONS_SPAN_SUM_OPERATION_ID, LITERAL_CLASS_RUN_LITERAL_COUNT_OPERATION_ID,
-    LITERAL_CLASS_RUN_LITERAL_PLAN_ID, LITERAL_CLASS_RUN_LITERAL_SPAN_SUM_OPERATION_ID,
-    LiteralAggregateActualCounters, LiteralAggregateBuildAccounting, LiteralAggregateBuildError,
-    LiteralAggregateBuildLimits, LiteralAggregateCountAttempt, LiteralAggregateDeclaredFallback,
-    LiteralAggregateOperation, LiteralAggregateOperationIdentity, LiteralAggregatePlanOrigin,
+    LITERAL_ASSERTIONS_SPAN_SUM_OPERATION_ID, LITERAL_CLASS_RUN_GENERAL_SEARCH_OPERATION_ID,
+    LITERAL_CLASS_RUN_GENERAL_SEARCH_PLAN_ID,
+    LITERAL_CLASS_RUN_GENERAL_SHORTEST_SEARCH_OPERATION_ID,
+    LITERAL_CLASS_RUN_LITERAL_COUNT_OPERATION_ID, LITERAL_CLASS_RUN_LITERAL_PLAN_ID,
+    LITERAL_CLASS_RUN_LITERAL_SPAN_SUM_OPERATION_ID, LiteralAggregateActualCounters,
+    LiteralAggregateBuildAccounting, LiteralAggregateBuildError, LiteralAggregateBuildLimits,
+    LiteralAggregateCountAttempt, LiteralAggregateDeclaredFallback, LiteralAggregateOperation,
+    LiteralAggregateOperationIdentity, LiteralAggregatePlanOrigin,
     LiteralAggregateReduceAccounting, LiteralAggregateReduceAttemptError,
     LiteralAggregateReduceAttemptReceipt, LiteralAggregateReduceError,
     LiteralAggregateReduceInvocation, LiteralAggregateReduceLimits, LiteralAggregateSpanSumAttempt,
@@ -443,15 +446,15 @@ pub use fre_kernels::{
     LiteralClassRunLiteralReduceError, LiteralClassRunLiteralReduceLimits,
     LiteralClassRunLiteralSearchAccounting, LiteralClassRunLiteralSearchError,
     LiteralClassRunLiteralSearchLimits, LiteralClassRunLiteralUpperBounds,
-    ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, ORDERED_LITERAL_COUNT_PLAN_ID,
-    ORDERED_LITERAL_SPAN_SUM_PLAN_ID, OrderedLiteralAggregateActualCounters,
-    OrderedLiteralAggregateBuildAccounting, OrderedLiteralAggregateBuildError,
-    OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateReduceError,
-    OrderedLiteralAggregateReduceLimits, OrderedLiteralAggregateUpperBounds,
-    PACKED_BOUNDED_PREFIX_LITERAL_COUNT_PLAN_ID, PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
-    PACKED_ORDERED_LITERAL_COUNT_PLAN_ID, PACKED_ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
-    PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID, PREFIX_CLASS_ALTERNATION_PLAN_ID,
-    PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID,
+    LiteralClassRunSearchMinimum, ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+    ORDERED_LITERAL_COUNT_PLAN_ID, ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
+    OrderedLiteralAggregateActualCounters, OrderedLiteralAggregateBuildAccounting,
+    OrderedLiteralAggregateBuildError, OrderedLiteralAggregateBuildLimits,
+    OrderedLiteralAggregateReduceError, OrderedLiteralAggregateReduceLimits,
+    OrderedLiteralAggregateUpperBounds, PACKED_BOUNDED_PREFIX_LITERAL_COUNT_PLAN_ID,
+    PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, PACKED_ORDERED_LITERAL_COUNT_PLAN_ID,
+    PACKED_ORDERED_LITERAL_SPAN_SUM_PLAN_ID, PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID,
+    PREFIX_CLASS_ALTERNATION_PLAN_ID, PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID,
     PREFIX_CLASS_UNIFORM_PARTICIPATION_ACCOUNTING_VERSION,
     PREFIX_CLASS_UNIFORM_PARTICIPATION_ALGORITHM_VERSION,
     PREFIX_CLASS_UNIFORM_PARTICIPATION_OPERATION_ID, PREFIX_CLASS_UNIFORM_PARTICIPATION_PLAN_ID,
@@ -550,12 +553,13 @@ use fre_kernels::{
     ForwardAnchoredBuildAccounting, ForwardAnchoredBuildError, ForwardAnchoredBuildLimits,
     ForwardAnchoredPlan, ForwardAnchoredSearchAccounting, ForwardAnchoredSearchError,
     ForwardAnchoredSearchLimits, LiteralAccounting, LiteralBuildLimits, LiteralClassRunLiteralPlan,
-    LiteralError, LiteralPlan, LiteralSearchLimits, LiteralSetAccounting, LiteralSetBuildLimits,
-    LiteralSetError, LiteralSetPlan, LiteralSetSearchLimits, PackedLiteralSetAccounting,
-    PackedLiteralSetBuildLimits, PackedLiteralSetError, PackedLiteralSetPlan,
-    PackedLiteralSetSearchLimits, RequiredLiteralBuildAccounting, RequiredLiteralBuildError,
-    RequiredLiteralBuildLimits, RequiredLiteralPlan, RequiredLiteralSearchAccounting,
-    RequiredLiteralSearchError, RequiredLiteralSearchLimits, Window as LiteralWindow,
+    LiteralClassRunSearchPlan, LiteralError, LiteralPlan, LiteralSearchLimits,
+    LiteralSetAccounting, LiteralSetBuildLimits, LiteralSetError, LiteralSetPlan,
+    LiteralSetSearchLimits, PackedLiteralSetAccounting, PackedLiteralSetBuildLimits,
+    PackedLiteralSetError, PackedLiteralSetPlan, PackedLiteralSetSearchLimits,
+    RequiredLiteralBuildAccounting, RequiredLiteralBuildError, RequiredLiteralBuildLimits,
+    RequiredLiteralPlan, RequiredLiteralSearchAccounting, RequiredLiteralSearchError,
+    RequiredLiteralSearchLimits, Window as LiteralWindow,
 };
 use fre_lower::{LowerLimits, LowerStats, OperationSemantics};
 use fre_syntax::{
@@ -1040,7 +1044,10 @@ fn literal_class_run_literal_failure_class(
         | LiteralClassRunLiteralBuildError::PrefixBoundaryInClass
         | LiteralClassRunLiteralBuildError::SuffixBoundaryInClass
         | LiteralClassRunLiteralBuildError::InexactAsciiWordClass
-        | LiteralClassRunLiteralBuildError::SuffixByteOutsideAsciiWordClass => {
+        | LiteralClassRunLiteralBuildError::SuffixByteOutsideAsciiWordClass
+        | LiteralClassRunLiteralBuildError::UnsupportedSearchMinimum
+        | LiteralClassRunLiteralBuildError::ClassOutsideAsciiWord
+        | LiteralClassRunLiteralBuildError::SuffixByteOutsideAsciiWord => {
             BuildFailureClass::Unsupported
         }
         LiteralClassRunLiteralBuildError::AllocationFailed { .. }
@@ -2512,67 +2519,93 @@ impl PortableBuilder {
                 });
             }
             if let literal_class_run_literal::InspectionOutcome::Eligible(inspection) = inspection {
-                let ranges = || {
-                    inspection
-                        .class
-                        .ranges()
-                        .iter()
-                        .map(|range| (range.start(), range.end()))
-                };
                 let dispatch = SimdDispatchContext::capture();
-                let plan = match inspection.boundary_semantics {
-                    LiteralClassRunLiteralBoundarySemantics::Unguarded => {
-                        LiteralClassRunLiteralPlan::build_with_dispatch(
-                            dispatch,
-                            inspection.prefix,
-                            ranges(),
-                            inspection.suffix,
-                            self.limits.literal_class_run_literal,
-                        )
+                let built = if inspection.generalized_search {
+                    LiteralClassRunSearchPlan::build_with_dispatch(
+                        dispatch,
+                        inspection.prefix,
+                        inspection.class.ranges(),
+                        inspection.suffix,
+                        inspection.minimum,
+                        inspection.boundary_semantics,
+                        self.limits.literal_class_run_literal,
+                    )
+                    .map(PortablePlan::LiteralClassRunSearch)
+                } else {
+                    match inspection.boundary_semantics {
+                        LiteralClassRunLiteralBoundarySemantics::Unguarded => {
+                            LiteralClassRunLiteralPlan::build_with_dispatch(
+                                dispatch,
+                                inspection.prefix,
+                                inspection.class.ranges(),
+                                inspection.suffix,
+                                self.limits.literal_class_run_literal,
+                            )
+                        }
+                        LiteralClassRunLiteralBoundarySemantics::CompleteAsciiWordRun => {
+                            LiteralClassRunLiteralPlan::build_complete_ascii_word_run_with_dispatch(
+                                dispatch,
+                                inspection.prefix,
+                                inspection.class.ranges(),
+                                inspection.suffix,
+                                self.limits.literal_class_run_literal,
+                            )
+                        }
                     }
-                    LiteralClassRunLiteralBoundarySemantics::CompleteAsciiWordRun => {
-                        LiteralClassRunLiteralPlan::build_complete_ascii_word_run_with_dispatch(
-                            dispatch,
-                            inspection.prefix,
-                            ranges(),
-                            inspection.suffix,
-                            self.limits.literal_class_run_literal,
-                        )
+                    .map(PortablePlan::LiteralClassRunLiteral)
+                };
+                let plan = match built {
+                    Ok(plan) => Some(plan),
+                    Err(error)
+                        if literal_class_run_literal_failure_class(&error)
+                            == BuildFailureClass::Unsupported =>
+                    {
+                        None
                     }
-                }
-                .map_err(BuildError::LiteralClassRunLiteral)?;
-                let build = plan.build_accounting();
-                return Ok(PortableRegex {
-                    source,
-                    capture_names,
-                    line_total_grep_plan,
-                    plan: PortablePlan::LiteralClassRunLiteral(plan),
-                    profile: profile.clone(),
-                    limits: self.limits,
-                    selection: self.selection,
-                    report: BuildReport {
+                    Err(error) => return Err(BuildError::LiteralClassRunLiteral(error)),
+                };
+                if let Some(plan) = plan {
+                    let build = match &plan {
+                        PortablePlan::LiteralClassRunLiteral(plan) => plan.build_accounting(),
+                        PortablePlan::LiteralClassRunSearch(plan) => plan.build_accounting(),
+                        _ => {
+                            return Err(BuildError::InternalInvariant(
+                                "literal/class-run admission built another plan family",
+                            ));
+                        }
+                    };
+                    return Ok(PortableRegex {
+                        source,
+                        capture_names,
+                        line_total_grep_plan,
+                        plan,
                         profile: profile.clone(),
-                        admission,
-                        syntax,
-                        plan: PlanKind::LiteralClassRunLiteral,
-                        planner_work: literal_class_run_work,
-                        lowering: None,
-                        states: 0,
-                        edges: 0,
-                        plan_storage_bytes: build.persistent_bytes,
-                        source_storage_bytes,
-                        capture_name_storage_bytes,
-                        charged_persistent_bytes: 0,
-                        persistent_byte_limit: 0,
-                        captures_len,
-                        static_captures_len,
-                        minimum_match_bytes,
-                        required_literal: None,
-                        literal_class_run_literal: Some(build),
-                        forward_anchored: None,
-                    }
-                    .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
-                });
+                        limits: self.limits,
+                        selection: self.selection,
+                        report: BuildReport {
+                            profile: profile.clone(),
+                            admission,
+                            syntax,
+                            plan: PlanKind::LiteralClassRunLiteral,
+                            planner_work: literal_class_run_work,
+                            lowering: None,
+                            states: 0,
+                            edges: 0,
+                            plan_storage_bytes: build.persistent_bytes,
+                            source_storage_bytes,
+                            capture_name_storage_bytes,
+                            charged_persistent_bytes: 0,
+                            persistent_byte_limit: 0,
+                            captures_len,
+                            static_captures_len,
+                            minimum_match_bytes,
+                            required_literal: None,
+                            literal_class_run_literal: Some(build),
+                            forward_anchored: None,
+                        }
+                        .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
+                    });
+                }
             }
         }
         let (finite_words, finite_work) = finite::extract(
@@ -3063,6 +3096,7 @@ enum PortablePlan {
     RequiredLiteral(RequiredLiteralPlan),
     DispatchedRequiredLiteral(DispatchedRequiredLiteralPlan),
     LiteralClassRunLiteral(LiteralClassRunLiteralPlan),
+    LiteralClassRunSearch(LiteralClassRunSearchPlan),
     ForwardAnchored(ForwardAnchoredPlan),
     DispatchedForwardAnchored(DispatchedForwardAnchoredPlan),
     ForwardEndFixed(AbsoluteEndFixedPlan),
@@ -3082,6 +3116,7 @@ impl PortablePlan {
             Self::RequiredLiteral(required) => required.plan_id(),
             Self::DispatchedRequiredLiteral(required) => required.plan_id(),
             Self::LiteralClassRunLiteral(_) => fre_kernels::LITERAL_CLASS_RUN_LITERAL_PLAN_ID,
+            Self::LiteralClassRunSearch(plan) => plan.plan_id(),
             Self::ForwardAnchored(forward) => forward.plan_id(),
             Self::DispatchedForwardAnchored(forward) => forward.plan_id(),
             Self::ForwardEndFixed(fixed) => fixed.plan_id(),
@@ -3501,6 +3536,17 @@ impl PortableRegex {
                     SearchAccounting::LiteralClassRunLiteral(accounting),
                 ))
             }
+            PortablePlan::LiteralClassRunSearch(plan) => {
+                let (matched, accounting) = plan.shortest_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    literal_class_run_literal_limits(limits),
+                )?;
+                Ok((
+                    matched.is_some(),
+                    SearchAccounting::LiteralClassRunLiteral(accounting),
+                ))
+            }
             PortablePlan::ForwardAnchored(forward) => {
                 let literal_window = LiteralWindow::new(window.start(), window.end());
                 let (matched, accounting) = forward.find_window(
@@ -3633,6 +3679,14 @@ impl PortableRegex {
                 .map(|(matched, _)| matched.is_some())
                 .map_err(SearchError::from),
             PortablePlan::LiteralClassRunLiteral(plan) => plan
+                .shortest_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    literal_class_run_literal_limits(limits),
+                )
+                .map(|(matched, _)| matched.is_some())
+                .map_err(SearchError::from),
+            PortablePlan::LiteralClassRunSearch(plan) => plan
                 .shortest_window(
                     haystack,
                     LiteralWindow::new(window.start(), window.end()),
@@ -3804,6 +3858,14 @@ impl PortableRegex {
                 )?;
                 Ok((end, SearchAccounting::LiteralClassRunLiteral(accounting)))
             }
+            PortablePlan::LiteralClassRunSearch(plan) => {
+                let (end, accounting) = plan.shortest_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    literal_class_run_literal_limits(limits),
+                )?;
+                Ok((end, SearchAccounting::LiteralClassRunLiteral(accounting)))
+            }
             PortablePlan::ForwardAnchored(forward) => {
                 let literal_window = LiteralWindow::new(window.start(), window.end());
                 let (matched, accounting) = forward.find_window(
@@ -3931,6 +3993,14 @@ impl PortableRegex {
                 ))
             }
             PortablePlan::LiteralClassRunLiteral(plan) => {
+                let (matched, accounting) =
+                    plan.find(haystack, literal_class_run_literal_limits(limits))?;
+                Ok((
+                    matched.map(|(_, end)| end),
+                    SearchAccounting::LiteralClassRunLiteral(accounting),
+                ))
+            }
+            PortablePlan::LiteralClassRunSearch(plan) => {
                 let (matched, accounting) =
                     plan.find(haystack, literal_class_run_literal_limits(limits))?;
                 Ok((
@@ -4217,6 +4287,17 @@ impl PortableRegex {
                 ))
             }
             PortablePlan::LiteralClassRunLiteral(plan) => {
+                let (matched, accounting) = plan.find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    literal_class_run_literal_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    SearchAccounting::LiteralClassRunLiteral(accounting),
+                ))
+            }
+            PortablePlan::LiteralClassRunSearch(plan) => {
                 let (matched, accounting) = plan.find_window(
                     haystack,
                     LiteralWindow::new(window.start(), window.end()),
@@ -5169,7 +5250,10 @@ fn required_literal_limits(limits: SearchLimits) -> RequiredLiteralSearchLimits 
 fn literal_class_run_literal_limits(limits: SearchLimits) -> LiteralClassRunLiteralSearchLimits {
     LiteralClassRunLiteralSearchLimits {
         max_work_upper_bound: limits.max_work,
-        max_candidate_visits: usize::try_from(limits.max_work).unwrap_or(usize::MAX),
+        // The public facade exposes work and scratch limits only. Candidate
+        // visits remain a separately metered kernel unit and must not inherit
+        // a numerically unrelated work budget.
+        max_candidate_visits: usize::MAX,
         max_scratch_bytes: limits.max_scratch_bytes,
     }
 }
@@ -5248,7 +5332,7 @@ mod tests {
     }
 
     #[test]
-    fn facade_exposes_only_the_certified_byte_path() {
+    fn facade_selects_the_certified_literal_class_run_path() {
         let regex = PortableBuilder::new("ab[0-3]+")
             .unicode(false)
             .build()
@@ -5257,7 +5341,12 @@ mod tests {
         let matched = matched.unwrap();
         assert_eq!((matched.start(), matched.end()), (2, 7));
         assert!(accounting.work_or_linear_terms() > 0);
-        assert!(regex.build_report().states > 0);
+        assert_eq!(regex.build_report().plan, PlanKind::LiteralClassRunLiteral);
+        assert_eq!(regex.build_report().states, 0);
+        assert!(matches!(
+            accounting,
+            SearchAccounting::LiteralClassRunLiteral(_)
+        ));
     }
 
     #[test]
@@ -5583,15 +5672,18 @@ mod tests {
             ))
         ));
 
-        // The singleton repetition is canonicalized as a repeated literal,
-        // outside both direct byte-class plans, so Auto retains K0.
-        let safe_fallback = PortableBuilder::new("b+aba")
+        // Canonical singleton repetitions are represented as one-byte
+        // classes by the structural search admission.
+        let singleton_run = PortableBuilder::new("b+aba")
             .unicode(false)
             .build()
             .unwrap();
-        assert_eq!(safe_fallback.build_report().plan, PlanKind::K0);
         assert_eq!(
-            safe_fallback
+            singleton_run.build_report().plan,
+            PlanKind::LiteralClassRunLiteral
+        );
+        assert_eq!(
+            singleton_run
                 .find(b"ababa", SearchLimits::unlimited())
                 .unwrap()
                 .0

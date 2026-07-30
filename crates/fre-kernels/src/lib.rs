@@ -339,7 +339,11 @@ pub use literal_class_run_literal::{
     BuildLimits as LiteralClassRunLiteralBuildLimits,
     COUNT_OPERATION_ID as LITERAL_CLASS_RUN_LITERAL_COUNT_OPERATION_ID,
     ClassScanIdentity as LiteralClassRunLiteralClassScanIdentity,
-    CountResult as LiteralClassRunLiteralCountResult, LiteralClassRunLiteralPlan,
+    CountResult as LiteralClassRunLiteralCountResult,
+    GENERAL_SEARCH_OPERATION_ID as LITERAL_CLASS_RUN_GENERAL_SEARCH_OPERATION_ID,
+    GENERAL_SEARCH_PLAN_ID as LITERAL_CLASS_RUN_GENERAL_SEARCH_PLAN_ID,
+    GENERAL_SHORTEST_SEARCH_OPERATION_ID as LITERAL_CLASS_RUN_GENERAL_SHORTEST_SEARCH_OPERATION_ID,
+    LiteralClassRunLiteralPlan, LiteralClassRunSearchPlan,
     OperationIdentity as LiteralClassRunLiteralOperationIdentity,
     PLAN_ID as LITERAL_CLASS_RUN_LITERAL_PLAN_ID,
     ReduceAccounting as LiteralClassRunLiteralReduceAccounting,
@@ -353,6 +357,7 @@ pub use literal_class_run_literal::{
     SearchAccounting as LiteralClassRunLiteralSearchAccounting,
     SearchError as LiteralClassRunLiteralSearchError,
     SearchLimits as LiteralClassRunLiteralSearchLimits,
+    SearchRunMinimum as LiteralClassRunSearchMinimum,
     SpanSumResult as LiteralClassRunLiteralSpanSumResult,
 };
 

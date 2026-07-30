@@ -11085,6 +11085,16 @@ impl AggregateBuilder {
             None
         };
         let literal_class_run_literal_planner_work = match literal_class_run_literal_inspection {
+            Some(literal_class_run_literal::InspectionOutcome::Eligible(inspection))
+                if inspection.generalized_search =>
+            {
+                record_construction_ineligible(
+                    construction,
+                    AggregateConstructionStage::LiteralClassRunLiteral,
+                    inspection.work,
+                );
+                inspection.work
+            }
             Some(literal_class_run_literal::InspectionOutcome::Eligible(inspection)) => {
                 select_construction_stage(
                     construction,
@@ -11100,14 +11110,7 @@ impl AggregateBuilder {
                         detail: "syntax summary differs from literal/class-run/literal inspection",
                     });
                 }
-                let ranges = || {
-                    inspection
-                        .class
-                        .ranges()
-                        .iter()
-                        .copied()
-                        .map(class_bytes_range_tuple)
-                };
+                let ranges = || inspection.class.ranges();
                 let attempt = match inspection.boundary_semantics {
                     LiteralClassRunLiteralBoundarySemantics::Unguarded => {
                         LiteralClassRunLiteralPlan::build_attempt_with_dispatch(

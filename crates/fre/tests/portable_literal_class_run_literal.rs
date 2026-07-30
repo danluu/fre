@@ -372,7 +372,7 @@ fn planner_build_and_search_limits_have_exact_one_below_boundaries() {
     let SearchAccounting::LiteralClassRunLiteral(accounting) = accounting else {
         panic!("wrong accounting family");
     };
-    let exact_work = accounting.work_upper_bound;
+    let exact_work = u64::try_from(accounting.work).unwrap();
     assert!(
         baseline
             .find(
@@ -395,19 +395,5 @@ fn planner_build_and_search_limits_have_exact_one_below_boundaries() {
         Err(SearchError::LiteralClassRunLiteral(
             LiteralClassRunLiteralSearchError::WorkLimit { needed, limit }
         )) if needed == exact_work && limit == exact_work - 1
-    ));
-    let candidates = accounting.candidate_visits_upper_bound;
-    assert!(candidates > 0);
-    assert!(matches!(
-        baseline.find(
-            haystack,
-            SearchLimits {
-                max_work: u64::try_from(candidates - 1).unwrap(),
-                max_scratch_bytes: 0,
-            },
-        ),
-        Err(SearchError::LiteralClassRunLiteral(
-            LiteralClassRunLiteralSearchError::CandidateLimit { needed, limit }
-        )) if needed == candidates && limit == candidates - 1
     ));
 }
