@@ -1585,12 +1585,12 @@ mod tests {
     #[test]
     #[allow(
         unsafe_code,
-        reason = "source-empty authority proves refusal precedes address use"
+        reason = "absent movable-ASIMD authority proves refusal precedes address use"
     )]
     fn production_refuses_before_reading_any_address() {
         let linked = StaticCountLinkedAddressesV3::from_exposed_addresses(1, 2, 3, 4);
-        // SAFETY: source-empty production authority must return before any
-        // supplied address is inspected.
+        // SAFETY: absent movable-ASIMD authority must return before any
+        // supplied address is inspected, even when SVE2 authority exists.
         assert_eq!(
             unsafe { adopt_linked_static_count_v3(linked) }.unwrap_err(),
             StaticCountVerifyErrorV3::NoProductionAuthority
@@ -1600,7 +1600,7 @@ mod tests {
     #[test]
     #[allow(
         unsafe_code,
-        reason = "source-empty SVE authority proves exact-tuple refusal precedes address use"
+        reason = "exact SVE tuple authority proves refusal precedes address use"
     )]
     fn production_sve_refuses_authority_before_reading_any_address() {
         let compiled = compiled_fixture_v3();
@@ -1613,11 +1613,11 @@ mod tests {
             expected.eligibility_tuple(),
         );
         let facade = StaticCountSveFacadeBindingV3::new(b"needle", [3; 32], [4; 32]);
-        // SAFETY: the empty production table must refuse the independently
-        // supplied tuple before dereferencing any sentinel address.
+        // SAFETY: exact source authority must refuse this independently
+        // supplied unpromoted tuple before dereferencing any sentinel address.
         assert_eq!(
             unsafe { adopt_linked_static_count_sve_v3(linked, facade) }.unwrap_err(),
-            StaticCountVerifyErrorV3::NoProductionAuthority
+            StaticCountVerifyErrorV3::EligibilityTupleNotAuthorized
         );
     }
 
