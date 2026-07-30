@@ -253,3 +253,23 @@ registry, proposal, manifest, production-authority source, payload, plan,
 journal, production registry, source set, runner, and timing wrapper. This
 confirmation is downstream of promotion; it does not replace held-out
 qualification evidence or create source authority.
+
+Before running confirmation, prove that the production rebuild is the exact
+machine code frozen by qualification:
+
+```text
+python3 verify_production_identity.py \
+  /absolute/frozen/qualification-registry.json QUALIFICATION_REGISTRY_SHA256 \
+  /absolute/sealed/production-registry.json PRODUCTION_REGISTRY_SHA256 \
+  /absolute/create-only/production-code-identity-receipt.json
+```
+
+The verifier authenticates both canonical registries, closes the current
+hybrid NEON/SVE/SVE2 target rows, and compares every Count-v3 payload, object,
+metadata, expectation, compile, optimizer, recipe, and binding identity for
+every compiled pattern. Only content-addressed paths, source receipts, and the
+expected qualification-versus-production authority labels may differ. A
+create-only, read-only pass receipt binds both registry hashes, the common
+target contract, the exact code-identity projection, and the verifier source.
+That receipt is a mandatory input to the source-promotion review; a manifest
+hash alone does not establish rebuild identity.
