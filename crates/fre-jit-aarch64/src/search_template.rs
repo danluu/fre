@@ -852,6 +852,9 @@ fn emit_exact(
         BackendVersion::SEARCH_V19 => {
             emit_exact_candidates_v19(template, manifest, literal, none, found)
         }
+        BackendVersion::SEARCH_V20 => {
+            emit_exact_candidates_v20(template, manifest, literal, none, found)
+        }
         BackendVersion::SEARCH_SVE2_FIXED16_V2 => {
             emit_exact_candidates_sve2_fixed16_v2(template, manifest, literal, none, found)
         }
@@ -1565,6 +1568,35 @@ fn emit_exact_candidates_v19(
     emit_exact_candidates_v8(template, manifest, literal, none, found)
 }
 
+fn emit_exact_candidates_v20(
+    template: &mut Template,
+    manifest: SearchManifest,
+    literal: &[u8],
+    none: Label,
+    found: Label,
+) -> Result<(), AuditError> {
+    let first_candidate_miss = template.new_label(LabelKind::Internal);
+    let selected = literal
+        .get(usize::from(manifest.primary_offset))
+        .copied()
+        .ok_or(AuditError::InvalidSearchManifest)?;
+
+    template.add_reg(15, 9, 5);
+    template.load_byte(10, 15, manifest.primary_offset);
+    template.cmp_imm32(10, u16::from(selected));
+    template.branch_cond(Condition::NotEqual, first_candidate_miss);
+    if literal.len() > 1 {
+        emit_literal_equality_specialized(template, 15, 8, literal.len(), first_candidate_miss)?;
+    }
+    template.mov_reg(13, 5);
+    template.add_reg(14, 5, 12);
+    template.branch(found);
+
+    template.bind(first_candidate_miss)?;
+    template.add_imm(5, 5, 1);
+    emit_exact_candidates_v8(template, manifest, literal, none, found)
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the complete v4 mask-guided control-flow template remains independent and reviewable"
@@ -2051,16 +2083,33 @@ fn emit_exact_candidates_v8(
         .then(|| template.new_label(LabelKind::SlowPath));
     let wide_dense_pair = (manifest.backend_version == BackendVersion::SEARCH_V18)
         .then(|| template.new_label(LabelKind::SlowPath));
-    let saved_mask_recover = (manifest.backend_version == BackendVersion::SEARCH_V19)
+    let wide_remaining_columns = (manifest.backend_version == BackendVersion::SEARCH_V20)
         .then(|| template.new_label(LabelKind::SlowPath));
-    let saved_mask_next = (manifest.backend_version == BackendVersion::SEARCH_V19)
-        .then(|| template.new_label(LabelKind::Loop));
-    let saved_mask_lane = (manifest.backend_version == BackendVersion::SEARCH_V19)
-        .then(|| template.new_label(LabelKind::Loop));
-    let saved_mask_miss = (manifest.backend_version == BackendVersion::SEARCH_V19)
-        .then(|| template.new_label(LabelKind::Internal));
-    let saved_mask_done = (manifest.backend_version == BackendVersion::SEARCH_V19)
-        .then(|| template.new_label(LabelKind::Internal));
+    let saved_mask_recover = matches!(
+        manifest.backend_version,
+        BackendVersion::SEARCH_V19 | BackendVersion::SEARCH_V20
+    )
+    .then(|| template.new_label(LabelKind::SlowPath));
+    let saved_mask_next = matches!(
+        manifest.backend_version,
+        BackendVersion::SEARCH_V19 | BackendVersion::SEARCH_V20
+    )
+    .then(|| template.new_label(LabelKind::Loop));
+    let saved_mask_lane = matches!(
+        manifest.backend_version,
+        BackendVersion::SEARCH_V19 | BackendVersion::SEARCH_V20
+    )
+    .then(|| template.new_label(LabelKind::Loop));
+    let saved_mask_miss = matches!(
+        manifest.backend_version,
+        BackendVersion::SEARCH_V19 | BackendVersion::SEARCH_V20
+    )
+    .then(|| template.new_label(LabelKind::Internal));
+    let saved_mask_done = matches!(
+        manifest.backend_version,
+        BackendVersion::SEARCH_V19 | BackendVersion::SEARCH_V20
+    )
+    .then(|| template.new_label(LabelKind::Internal));
     let narrow_setup = template.new_label(LabelKind::Internal);
     let narrow = template.new_label(LabelKind::Loop);
     let advance = template.new_label(LabelKind::Internal);
@@ -2091,6 +2140,7 @@ fn emit_exact_candidates_v8(
             | BackendVersion::SEARCH_V17
             | BackendVersion::SEARCH_V18
             | BackendVersion::SEARCH_V19
+            | BackendVersion::SEARCH_V20
     )
     .then(|| template.new_label(LabelKind::Loop));
     let learned_column_ready = matches!(
@@ -2101,6 +2151,7 @@ fn emit_exact_candidates_v8(
             | BackendVersion::SEARCH_V17
             | BackendVersion::SEARCH_V18
             | BackendVersion::SEARCH_V19
+            | BackendVersion::SEARCH_V20
     )
     .then(|| template.new_label(LabelKind::SlowPath));
     let learned_advance = matches!(
@@ -2111,6 +2162,7 @@ fn emit_exact_candidates_v8(
             | BackendVersion::SEARCH_V17
             | BackendVersion::SEARCH_V18
             | BackendVersion::SEARCH_V19
+            | BackendVersion::SEARCH_V20
     )
     .then(|| template.new_label(LabelKind::Internal));
     let learned_scan = matches!(
@@ -2121,6 +2173,7 @@ fn emit_exact_candidates_v8(
             | BackendVersion::SEARCH_V17
             | BackendVersion::SEARCH_V18
             | BackendVersion::SEARCH_V19
+            | BackendVersion::SEARCH_V20
     )
     .then(|| template.new_label(LabelKind::Loop));
     let learned_disabled = matches!(
@@ -2136,6 +2189,7 @@ fn emit_exact_candidates_v8(
             | BackendVersion::SEARCH_V17
             | BackendVersion::SEARCH_V18
             | BackendVersion::SEARCH_V19
+            | BackendVersion::SEARCH_V20
     )
     .then(|| template.new_label(LabelKind::SlowPath));
     let tail_setup = template.new_label(LabelKind::SlowPath);
@@ -2182,6 +2236,7 @@ fn emit_exact_candidates_v8(
             | BackendVersion::SEARCH_V17
             | BackendVersion::SEARCH_V18
             | BackendVersion::SEARCH_V19
+            | BackendVersion::SEARCH_V20
     ) {
         if !filters_cover_zero {
             return Err(AuditError::InvalidSearchManifest);
@@ -2251,6 +2306,11 @@ fn emit_exact_candidates_v8(
         } else if manifest.backend_version == BackendVersion::SEARCH_V19 {
             let saved = saved_mask_recover.ok_or(AuditError::InvalidSearchManifest)?;
             template.compare_branch_zero(10, true, saved);
+        } else if manifest.backend_version == BackendVersion::SEARCH_V20 {
+            let pair_empty = secondary_only_advance.ok_or(AuditError::InvalidSearchManifest)?;
+            let remaining = wide_remaining_columns.ok_or(AuditError::InvalidSearchManifest)?;
+            template.compare_branch_zero(10, false, pair_empty);
+            template.branch(remaining);
         } else {
             template.compare_branch_zero(10, true, narrow_setup);
         }
@@ -2327,6 +2387,60 @@ fn emit_exact_candidates_v8(
             template.and_bytes16(6, 6, 21);
             emit_four_block_presence_v8(template);
             template.compare_branch_zero(10, false, wide_advance);
+            if manifest.backend_version == BackendVersion::SEARCH_V20 {
+                template.branch(wide_remaining_columns.ok_or(AuditError::InvalidSearchManifest)?);
+            }
+        }
+    }
+
+    if let Some(remaining) = wide_remaining_columns {
+        let saved = saved_mask_recover.ok_or(AuditError::InvalidSearchManifest)?;
+        let columns = [
+            (verification_offset, 5_u8),
+            (quaternary_offset, 7_u8),
+            (quinary_offset, 23_u8),
+        ];
+        let column_count = columns
+            .iter()
+            .filter(|(offset, _)| offset.is_some())
+            .count();
+        let mut emitted_columns = 0_usize;
+
+        template.bind(remaining)?;
+        for &(offset, constant) in &columns {
+            let Some(offset) = offset else {
+                continue;
+            };
+            let delta = offset.abs_diff(primary_offset);
+            if offset > primary_offset {
+                template.add_imm(10, 15, delta);
+            } else {
+                template.sub_imm(10, 15, delta);
+            }
+            template.load_vector_pair128(18, 19, 10, 0);
+            template.load_vector_pair128(20, 21, 10, 32);
+            template.compare_equal_bytes16(18, 18, constant);
+            template.and_bytes16(0, 0, 18);
+            template.compare_equal_bytes16(19, 19, constant);
+            template.and_bytes16(2, 2, 19);
+            template.compare_equal_bytes16(20, 20, constant);
+            template.and_bytes16(4, 4, 20);
+            template.compare_equal_bytes16(21, 21, constant);
+            template.and_bytes16(6, 6, 21);
+            emitted_columns = emitted_columns
+                .checked_add(1)
+                .ok_or(AuditError::ArithmeticOverflow)?;
+            if emitted_columns == 1 && column_count > 1 {
+                emit_four_block_presence_v8(template);
+                template.compare_branch_zero(10, false, wide_advance);
+            }
+        }
+        if emitted_columns == 0 {
+            template.branch(saved);
+        } else {
+            emit_four_block_presence_v8(template);
+            template.compare_branch_zero(10, false, wide_advance);
+            template.branch(saved);
         }
     }
 
@@ -2544,6 +2658,7 @@ fn emit_exact_candidates_v8(
             | BackendVersion::SEARCH_V17
             | BackendVersion::SEARCH_V18
             | BackendVersion::SEARCH_V19
+            | BackendVersion::SEARCH_V20
     ) {
         emit_literal_equality_specialized(template, 15, 8, literal.len(), candidate_miss)?;
     } else if literal.len() == 16 {
@@ -2613,6 +2728,7 @@ fn emit_exact_candidates_v8(
             | BackendVersion::SEARCH_V17
             | BackendVersion::SEARCH_V18
             | BackendVersion::SEARCH_V19
+            | BackendVersion::SEARCH_V20
     ) {
         let discover = learned_discover.ok_or(AuditError::InvalidSearchManifest)?;
         let column_ready = learned_column_ready.ok_or(AuditError::InvalidSearchManifest)?;
@@ -2621,7 +2737,10 @@ fn emit_exact_candidates_v8(
         let finish_tail = learned_tail.ok_or(AuditError::InvalidSearchManifest)?;
         let continue_learned = matches!(
             manifest.backend_version,
-            BackendVersion::SEARCH_V17 | BackendVersion::SEARCH_V18 | BackendVersion::SEARCH_V19
+            BackendVersion::SEARCH_V17
+                | BackendVersion::SEARCH_V18
+                | BackendVersion::SEARCH_V19
+                | BackendVersion::SEARCH_V20
         );
 
         // State zero enters discovery. V17 and V18 clear a failed retained bit and
@@ -2698,6 +2817,7 @@ fn emit_exact_candidates_v8(
                 | BackendVersion::SEARCH_V17
                 | BackendVersion::SEARCH_V18
                 | BackendVersion::SEARCH_V19
+                | BackendVersion::SEARCH_V20
         ) {
             template.unsigned_max_pairwise_bytes16(18, 16, 16);
             template.move_vector_double_to64(0, 18);

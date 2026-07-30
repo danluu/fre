@@ -110,6 +110,9 @@ pub enum SearchBackendPolicy {
     /// Search V19 candidate: V17 screening with saved four-block masks and
     /// one shared exact-verification queue before narrow fallback.
     AsimdV19,
+    /// Search V20 candidate: V19 saved-mask recovery after every remaining
+    /// authenticated literal column refines the four wide masks.
+    AsimdV20,
     /// SVE screening with exactly sixteen active byte lanes.
     Sve16,
     /// SVE2 `MATCH` screening with exactly sixteen active byte lanes,
@@ -142,6 +145,7 @@ impl SearchBackendPolicy {
             Self::AsimdV17 => BackendVersion::SEARCH_V17,
             Self::AsimdV18 => BackendVersion::SEARCH_V18,
             Self::AsimdV19 => BackendVersion::SEARCH_V19,
+            Self::AsimdV20 => BackendVersion::SEARCH_V20,
             Self::Sve16 => BackendVersion::SEARCH_SVE16_V1,
             Self::Sve2Fixed16 => BackendVersion::SEARCH_SVE2_16_V1,
             Self::Sve16V6 => BackendVersion::SEARCH_SVE16_V6,
@@ -362,6 +366,7 @@ fn emit_search_image<O: Operation>(
             | BackendVersion::SEARCH_V17
             | BackendVersion::SEARCH_V18
             | BackendVersion::SEARCH_V19
+            | BackendVersion::SEARCH_V20
             | BackendVersion::SEARCH_SVE16_V1
             | BackendVersion::SEARCH_SVE2_16_V1
             | BackendVersion::SEARCH_SVE16_V6
@@ -433,6 +438,7 @@ fn emit_search_image<O: Operation>(
             | BackendVersion::SEARCH_V17
             | BackendVersion::SEARCH_V18
             | BackendVersion::SEARCH_V19
+            | BackendVersion::SEARCH_V20
     ) && !plan.is_v9_policy_shape()
     {
         return Err(EmitError::Unsupported {
@@ -567,6 +573,7 @@ fn emit_search_image<O: Operation>(
                 | BackendVersion::SEARCH_V17
                 | BackendVersion::SEARCH_V18
                 | BackendVersion::SEARCH_V19
+                | BackendVersion::SEARCH_V20
                 | BackendVersion::SEARCH_SVE16_V1
                 | BackendVersion::SEARCH_SVE2_16_V1
                 | BackendVersion::SEARCH_SVE16_V6
@@ -1677,6 +1684,7 @@ impl<'a> Plan<'a> {
                         | BackendVersion::SEARCH_V17
                         | BackendVersion::SEARCH_V18
                         | BackendVersion::SEARCH_V19
+                        | BackendVersion::SEARCH_V20
                         | BackendVersion::SEARCH_SVE16_V6
                         | BackendVersion::SEARCH_SVE2_FIXED16_V2
                 ) =>
@@ -1735,6 +1743,7 @@ impl<'a> Plan<'a> {
                 | BackendVersion::SEARCH_V17
                 | BackendVersion::SEARCH_V18
                 | BackendVersion::SEARCH_V19
+                | BackendVersion::SEARCH_V20
                 | BackendVersion::SEARCH_SVE16_V1
                 | BackendVersion::SEARCH_SVE2_16_V1
                 | BackendVersion::SEARCH_SVE16_V6
@@ -1786,6 +1795,7 @@ impl<'a> Plan<'a> {
                         | BackendVersion::SEARCH_V17
                         | BackendVersion::SEARCH_V18
                         | BackendVersion::SEARCH_V19
+                        | BackendVersion::SEARCH_V20
                         | BackendVersion::SEARCH_SVE16_V1
                         | BackendVersion::SEARCH_SVE2_16_V1
                         | BackendVersion::SEARCH_SVE16_V6
@@ -1804,6 +1814,7 @@ impl<'a> Plan<'a> {
                                 | BackendVersion::SEARCH_V17
                                 | BackendVersion::SEARCH_V18
                                 | BackendVersion::SEARCH_V19
+                                | BackendVersion::SEARCH_V20
                         ) {
                             admission.select_offsets_v3()
                         } else if matches!(
@@ -1888,6 +1899,7 @@ impl<'a> Plan<'a> {
                     | BackendVersion::SEARCH_V17
                     | BackendVersion::SEARCH_V18
                     | BackendVersion::SEARCH_V19
+                    | BackendVersion::SEARCH_V20
             ) && (shape != SearchShape::ExactLiteral
                 || candidate_policy.is_none_or(|offsets| {
                     !candidate_signature_is_cyclic_phase_unique(literal, offsets)
@@ -1940,6 +1952,7 @@ impl<'a> Plan<'a> {
                                 | BackendVersion::SEARCH_V17
                                 | BackendVersion::SEARCH_V18
                                 | BackendVersion::SEARCH_V19
+                                | BackendVersion::SEARCH_V20
                         ) && shape == SearchShape::ExactLiteral
                         {
                             SEARCH_CANDIDATE_POLICY_V11
@@ -2315,6 +2328,19 @@ fn emit_exact(
         }
         BackendVersion::SEARCH_V19 => {
             emit_vector_candidate_skip_v19(
+                assembler,
+                literal,
+                primary_offset,
+                secondary_offset,
+                verification_offset,
+                quaternary_offset,
+                quinary_offset,
+                none,
+                found,
+            )?;
+        }
+        BackendVersion::SEARCH_V20 => {
+            emit_vector_candidate_skip_v20(
                 assembler,
                 literal,
                 primary_offset,
@@ -3642,6 +3668,54 @@ fn emit_vector_candidate_skip_v19(
 
 #[allow(
     clippy::too_many_arguments,
+    reason = "the V20 wire freezes V19 recovery while selecting a distinct wide-refinement graph"
+)]
+fn emit_vector_candidate_skip_v20(
+    assembler: &mut Assembler,
+    literal: &[u8],
+    primary_offset: u16,
+    secondary_offset: Option<u16>,
+    verification_offset: Option<u16>,
+    quaternary_offset: Option<u16>,
+    quinary_offset: Option<u16>,
+    none: Label,
+    found: Label,
+) -> Result<(), EmitError> {
+    let first_candidate_miss = assembler.new_label(LabelKind::Internal)?;
+    let selected = literal
+        .get(usize::from(primary_offset))
+        .copied()
+        .ok_or(EmitError::InternalInvariant)?;
+
+    assembler.add_reg(X15, X9, X5)?;
+    assembler.load_byte(X10, X15, primary_offset)?;
+    assembler.cmp_imm32(X10, u16::from(selected))?;
+    assembler.branch_cond(Condition::NotEqual, first_candidate_miss)?;
+    if literal.len() > 1 {
+        emit_literal_equality_specialized(assembler, X15, X8, literal.len(), first_candidate_miss)?;
+    }
+    assembler.mov_reg(X13, X5)?;
+    assembler.add_reg(X14, X5, X12)?;
+    assembler.branch(found)?;
+
+    assembler.bind(first_candidate_miss)?;
+    assembler.add_imm(X5, X5, 1)?;
+    emit_vector_candidate_skip_v8(
+        assembler,
+        literal,
+        primary_offset,
+        secondary_offset,
+        verification_offset,
+        quaternary_offset,
+        quinary_offset,
+        BackendVersion::SEARCH_V20,
+        none,
+        found,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
     clippy::too_many_lines,
     reason = "the versioned v8 graph keeps its paired 64-candidate screen and authenticated staged recovery explicit"
 )]
@@ -3674,21 +3748,39 @@ fn emit_vector_candidate_skip_v8(
     let wide_dense_pair = (backend_version == BackendVersion::SEARCH_V18)
         .then(|| assembler.new_label(LabelKind::SlowPath))
         .transpose()?;
-    let saved_mask_recover = (backend_version == BackendVersion::SEARCH_V19)
+    let wide_remaining_columns = (backend_version == BackendVersion::SEARCH_V20)
         .then(|| assembler.new_label(LabelKind::SlowPath))
         .transpose()?;
-    let saved_mask_next = (backend_version == BackendVersion::SEARCH_V19)
-        .then(|| assembler.new_label(LabelKind::Loop))
-        .transpose()?;
-    let saved_mask_lane = (backend_version == BackendVersion::SEARCH_V19)
-        .then(|| assembler.new_label(LabelKind::Loop))
-        .transpose()?;
-    let saved_mask_miss = (backend_version == BackendVersion::SEARCH_V19)
-        .then(|| assembler.new_label(LabelKind::Internal))
-        .transpose()?;
-    let saved_mask_done = (backend_version == BackendVersion::SEARCH_V19)
-        .then(|| assembler.new_label(LabelKind::Internal))
-        .transpose()?;
+    let saved_mask_recover = matches!(
+        backend_version,
+        BackendVersion::SEARCH_V19 | BackendVersion::SEARCH_V20
+    )
+    .then(|| assembler.new_label(LabelKind::SlowPath))
+    .transpose()?;
+    let saved_mask_next = matches!(
+        backend_version,
+        BackendVersion::SEARCH_V19 | BackendVersion::SEARCH_V20
+    )
+    .then(|| assembler.new_label(LabelKind::Loop))
+    .transpose()?;
+    let saved_mask_lane = matches!(
+        backend_version,
+        BackendVersion::SEARCH_V19 | BackendVersion::SEARCH_V20
+    )
+    .then(|| assembler.new_label(LabelKind::Loop))
+    .transpose()?;
+    let saved_mask_miss = matches!(
+        backend_version,
+        BackendVersion::SEARCH_V19 | BackendVersion::SEARCH_V20
+    )
+    .then(|| assembler.new_label(LabelKind::Internal))
+    .transpose()?;
+    let saved_mask_done = matches!(
+        backend_version,
+        BackendVersion::SEARCH_V19 | BackendVersion::SEARCH_V20
+    )
+    .then(|| assembler.new_label(LabelKind::Internal))
+    .transpose()?;
     let narrow_setup = assembler.new_label(LabelKind::Internal)?;
     let narrow = assembler.new_label(LabelKind::Loop)?;
     let advance = assembler.new_label(LabelKind::Internal)?;
@@ -3721,6 +3813,7 @@ fn emit_vector_candidate_skip_v8(
             | BackendVersion::SEARCH_V17
             | BackendVersion::SEARCH_V18
             | BackendVersion::SEARCH_V19
+            | BackendVersion::SEARCH_V20
     )
     .then(|| assembler.new_label(LabelKind::Loop))
     .transpose()?;
@@ -3732,6 +3825,7 @@ fn emit_vector_candidate_skip_v8(
             | BackendVersion::SEARCH_V17
             | BackendVersion::SEARCH_V18
             | BackendVersion::SEARCH_V19
+            | BackendVersion::SEARCH_V20
     )
     .then(|| assembler.new_label(LabelKind::SlowPath))
     .transpose()?;
@@ -3743,6 +3837,7 @@ fn emit_vector_candidate_skip_v8(
             | BackendVersion::SEARCH_V17
             | BackendVersion::SEARCH_V18
             | BackendVersion::SEARCH_V19
+            | BackendVersion::SEARCH_V20
     )
     .then(|| assembler.new_label(LabelKind::Internal))
     .transpose()?;
@@ -3754,6 +3849,7 @@ fn emit_vector_candidate_skip_v8(
             | BackendVersion::SEARCH_V17
             | BackendVersion::SEARCH_V18
             | BackendVersion::SEARCH_V19
+            | BackendVersion::SEARCH_V20
     )
     .then(|| assembler.new_label(LabelKind::Loop))
     .transpose()?;
@@ -3771,6 +3867,7 @@ fn emit_vector_candidate_skip_v8(
             | BackendVersion::SEARCH_V17
             | BackendVersion::SEARCH_V18
             | BackendVersion::SEARCH_V19
+            | BackendVersion::SEARCH_V20
     )
     .then(|| assembler.new_label(LabelKind::SlowPath))
     .transpose()?;
@@ -3830,6 +3927,7 @@ fn emit_vector_candidate_skip_v8(
             | BackendVersion::SEARCH_V17
             | BackendVersion::SEARCH_V18
             | BackendVersion::SEARCH_V19
+            | BackendVersion::SEARCH_V20
     ) {
         if !filters_cover_zero {
             return Err(EmitError::InternalInvariant);
@@ -3917,6 +4015,11 @@ fn emit_vector_candidate_skip_v8(
         } else if backend_version == BackendVersion::SEARCH_V19 {
             let saved = saved_mask_recover.ok_or(EmitError::InternalInvariant)?;
             assembler.compare_branch_zero(X10, true, saved)?;
+        } else if backend_version == BackendVersion::SEARCH_V20 {
+            let pair_empty = secondary_only_advance.ok_or(EmitError::InternalInvariant)?;
+            let remaining = wide_remaining_columns.ok_or(EmitError::InternalInvariant)?;
+            assembler.compare_branch_zero(X10, false, pair_empty)?;
+            assembler.branch(remaining)?;
         } else {
             assembler.compare_branch_zero(X10, true, narrow_setup)?;
         }
@@ -4004,6 +4107,60 @@ fn emit_vector_candidate_skip_v8(
             assembler.and_bytes16(6, 6, 21)?;
             emit_four_block_presence_v8(assembler)?;
             assembler.compare_branch_zero(X10, false, wide_advance)?;
+            if backend_version == BackendVersion::SEARCH_V20 {
+                assembler.branch(wide_remaining_columns.ok_or(EmitError::InternalInvariant)?)?;
+            }
+        }
+    }
+
+    if let Some(remaining) = wide_remaining_columns {
+        let saved = saved_mask_recover.ok_or(EmitError::InternalInvariant)?;
+        let columns = [
+            (verification_offset, 5_u8),
+            (quaternary_offset, 7_u8),
+            (quinary_offset, 23_u8),
+        ];
+        let column_count = columns
+            .iter()
+            .filter(|(offset, _)| offset.is_some())
+            .count();
+        let mut emitted_columns = 0_usize;
+
+        assembler.bind(remaining)?;
+        for &(offset, constant) in &columns {
+            let Some(offset) = offset else {
+                continue;
+            };
+            let delta = offset.abs_diff(primary_offset);
+            if offset > primary_offset {
+                assembler.add_imm(X10, X15, delta)?;
+            } else {
+                assembler.sub_imm(X10, X15, delta)?;
+            }
+            assembler.load_vector_pair128(18, 19, X10, 0)?;
+            assembler.load_vector_pair128(20, 21, X10, 32)?;
+            assembler.compare_equal_bytes16(18, 18, constant)?;
+            assembler.and_bytes16(0, 0, 18)?;
+            assembler.compare_equal_bytes16(19, 19, constant)?;
+            assembler.and_bytes16(2, 2, 19)?;
+            assembler.compare_equal_bytes16(20, 20, constant)?;
+            assembler.and_bytes16(4, 4, 20)?;
+            assembler.compare_equal_bytes16(21, 21, constant)?;
+            assembler.and_bytes16(6, 6, 21)?;
+            emitted_columns = emitted_columns
+                .checked_add(1)
+                .ok_or(EmitError::InternalInvariant)?;
+            if emitted_columns == 1 && column_count > 1 {
+                emit_four_block_presence_v8(assembler)?;
+                assembler.compare_branch_zero(X10, false, wide_advance)?;
+            }
+        }
+        if emitted_columns == 0 {
+            assembler.branch(saved)?;
+        } else {
+            emit_four_block_presence_v8(assembler)?;
+            assembler.compare_branch_zero(X10, false, wide_advance)?;
+            assembler.branch(saved)?;
         }
     }
 
@@ -4235,6 +4392,7 @@ fn emit_vector_candidate_skip_v8(
             | BackendVersion::SEARCH_V17
             | BackendVersion::SEARCH_V18
             | BackendVersion::SEARCH_V19
+            | BackendVersion::SEARCH_V20
     ) {
         emit_literal_equality_specialized(assembler, X15, X8, literal.len(), candidate_miss)?;
     } else if literal.len() == 16 {
@@ -4304,6 +4462,7 @@ fn emit_vector_candidate_skip_v8(
             | BackendVersion::SEARCH_V17
             | BackendVersion::SEARCH_V18
             | BackendVersion::SEARCH_V19
+            | BackendVersion::SEARCH_V20
     ) {
         let discover = learned_discover.ok_or(EmitError::InternalInvariant)?;
         let column_ready = learned_column_ready.ok_or(EmitError::InternalInvariant)?;
@@ -4312,7 +4471,10 @@ fn emit_vector_candidate_skip_v8(
         let finish_tail = learned_tail.ok_or(EmitError::InternalInvariant)?;
         let continue_learned = matches!(
             backend_version,
-            BackendVersion::SEARCH_V17 | BackendVersion::SEARCH_V18 | BackendVersion::SEARCH_V19
+            BackendVersion::SEARCH_V17
+                | BackendVersion::SEARCH_V18
+                | BackendVersion::SEARCH_V19
+                | BackendVersion::SEARCH_V20
         );
 
         // X11 is initialized once before scanning. State zero enters
@@ -4393,6 +4555,7 @@ fn emit_vector_candidate_skip_v8(
                 | BackendVersion::SEARCH_V17
                 | BackendVersion::SEARCH_V18
                 | BackendVersion::SEARCH_V19
+                | BackendVersion::SEARCH_V20
         ) {
             // A learned byte may recur elsewhere in the literal (and hence in
             // near-miss streams at shifted candidate phases). Test presence
@@ -7426,6 +7589,48 @@ mod encoding_tests {
                 *mask = u16::try_from(state & u64::from(u16::MAX)).expect("masked to u16");
             }
             assert_saved_mask_queue(masks);
+        }
+    }
+
+    #[test]
+    fn refined_saved_mask_algebra_exhausts_all_three_to_the_sixteenth_relations() {
+        // For each lane there are exactly three reachable refinement states:
+        // absent from both masks, present only before refinement, or present
+        // before and after refinement. Enumerating every submask of every
+        // initial u16 therefore covers all 3^16 survivor relations without
+        // wasting work on the unreachable "created by refinement" state.
+        let sparse = (0_u32..=u32::from(u16::MAX))
+            .map(|mask| {
+                reference_sparse_mask(u16::try_from(mask).expect("bounded exhaustive mask"))
+            })
+            .collect::<Vec<_>>();
+        let mut relations = 0_u64;
+        for initial in 0_u32..=u32::from(u16::MAX) {
+            let initial = u16::try_from(initial).expect("bounded exhaustive mask");
+            let mut refined = initial;
+            loop {
+                assert_eq!(initial & refined, refined);
+                assert_eq!(
+                    sparse[usize::from(initial)] & sparse[usize::from(refined)],
+                    sparse[usize::from(refined)]
+                );
+                relations = relations.checked_add(1).expect("3^16 is bounded");
+                if refined == 0 {
+                    break;
+                }
+                refined = refined.wrapping_sub(1) & initial;
+            }
+        }
+        assert_eq!(relations, 3_u64.pow(16));
+
+        // The underlying per-lane CMEQ/AND refinement cannot create a lane.
+        for (before, filter, expected) in [
+            (false, false, false),
+            (false, true, false),
+            (true, false, false),
+            (true, true, true),
+        ] {
+            assert_eq!(before & filter, expected);
         }
     }
 

@@ -3493,6 +3493,111 @@ fn v19_saved_mask_queue_executes_natively_across_blocks_widths_and_guards() {
 }
 
 #[test]
+fn v20_refined_saved_mask_queue_executes_natively_across_blocks_widths_and_guards() {
+    let _lock = native_test_lock();
+    let mut comparisons = 0_u64;
+    for width in [6_usize, 7, 13, 16, 24, 32] {
+        let literal = (0..width)
+            .map(|offset| {
+                u8::try_from(offset)
+                    .expect("bounded V20 width")
+                    .wrapping_mul(61)
+                    .wrapping_add(7)
+            })
+            .collect::<Vec<_>>();
+        let program = build_exact_literal::<Span>(
+            &literal,
+            AnchorFlags::default(),
+            ValidateLimits::default(),
+        )
+        .expect("V20 native program");
+        let image = emit_audited_with_backend(
+            &program,
+            SearchBackendPolicy::AsimdV20,
+            EmitLimits::default(),
+        )
+        .expect("audited V20 native image");
+        assert_eq!(
+            image.as_image().backend_version(),
+            BackendVersion::SEARCH_V20
+        );
+        let selected = decode(image.as_image().code())
+            .expect("V20 native decode")
+            .into_iter()
+            .filter_map(|instruction| match instruction {
+                DecodedInstruction::LoadByte {
+                    destination: 11,
+                    base: 8,
+                    offset,
+                } => Some(usize::from(offset)),
+                _ => None,
+            })
+            .take(5)
+            .collect::<Vec<_>>();
+        assert_eq!(selected.len(), 5);
+        let avoid = (0_u16..=255)
+            .map(|value| u8::try_from(value).expect("bounded byte"))
+            .find(|byte| !literal.contains(byte))
+            .expect("V20 literal leaves one avoiding byte");
+        let kernel =
+            publish_audited::<Span>(&image, PublicationLimits::default()).expect("publish V20");
+        let window_start = 3_usize;
+        let wide_base = window_start + 1;
+        let lanes = if width == 13 {
+            (0..16).collect::<Vec<_>>()
+        } else {
+            vec![0, 7, 15]
+        };
+
+        for block in 0..4_usize {
+            for &lane in &lanes {
+                let candidate = wide_base + block * 16 + lane;
+                let mut bytes = vec![avoid; 256];
+                install_literal(&mut bytes, candidate, &literal);
+                for right_boundary in [false, true] {
+                    platform::with_guarded_haystack(&bytes, right_boundary, |guarded| {
+                        assert_native_matches(
+                            &program,
+                            &kernel,
+                            guarded,
+                            SearchWindow::new(window_start, guarded.len()),
+                        );
+                    })
+                    .expect("guarded V20 block/lane execution");
+                    comparisons = comparisons.checked_add(1).expect("bounded comparisons");
+                }
+            }
+        }
+
+        for install_match in [false, true] {
+            let mut bytes = vec![avoid; 256];
+            for false_offset in [0_usize, 17, 34, 51] {
+                let false_candidate = wide_base + false_offset;
+                for &selected_offset in &selected {
+                    bytes[false_candidate + selected_offset] = literal[selected_offset];
+                }
+            }
+            if install_match {
+                install_literal(&mut bytes, wide_base + 70, &literal);
+            }
+            for right_boundary in [false, true] {
+                platform::with_guarded_haystack(&bytes, right_boundary, |guarded| {
+                    assert_native_matches(
+                        &program,
+                        &kernel,
+                        guarded,
+                        SearchWindow::new(window_start, guarded.len()),
+                    );
+                })
+                .expect("guarded V20 refined false-survivor execution");
+                comparisons = comparisons.checked_add(1).expect("bounded comparisons");
+            }
+        }
+    }
+    assert_eq!(comparisons, 272);
+}
+
+#[test]
 #[allow(
     clippy::too_many_lines,
     reason = "the width/topology matrix keeps learned-mode, vector-tail, one-candidate, and clipped-window guard cases explicit"

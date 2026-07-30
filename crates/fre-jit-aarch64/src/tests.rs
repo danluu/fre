@@ -4560,6 +4560,7 @@ fn explicit_search_backend_policy_selects_distinct_artifact_identities() {
         (SearchBackendPolicy::AsimdV17, BackendVersion::SEARCH_V17),
         (SearchBackendPolicy::AsimdV18, BackendVersion::SEARCH_V18),
         (SearchBackendPolicy::AsimdV19, BackendVersion::SEARCH_V19),
+        (SearchBackendPolicy::AsimdV20, BackendVersion::SEARCH_V20),
         (SearchBackendPolicy::Sve16, BackendVersion::SEARCH_SVE16_V1),
         (
             SearchBackendPolicy::Sve2Fixed16,
@@ -8644,6 +8645,612 @@ fn v19_every_width_and_window_shape_matches_the_kir_oracle() {
 }
 
 #[test]
+fn v20_pair_empty_switches_to_secondary_only_then_refines_a_real_pair() {
+    let literal = b"0123456789abcdef";
+    let program =
+        build_exact_literal::<Span>(literal, AnchorFlags::default(), ValidateLimits::default())
+            .expect("V20 explicit-edge IR");
+    let image = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV20,
+        EmitLimits::default(),
+    )
+    .expect("V20 explicit-edge image");
+    audit(&image).expect("V20 explicit-edge independent template");
+    let manifest = image.search_manifest().expect("V20 explicit-edge manifest");
+    let selected = [
+        manifest.primary_offset,
+        manifest.secondary_offset,
+        manifest.verification_offset,
+        manifest.quaternary_offset,
+        manifest.quinary_offset,
+    ]
+    .map(usize::from);
+    assert_eq!(selected.iter().copied().collect::<BTreeSet<_>>().len(), 5);
+    let [primary, secondary, verification, _, _] = selected;
+    let avoid = (0_u16..=255)
+        .map(|value| u8::try_from(value).expect("bounded avoiding byte"))
+        .find(|byte| !literal.contains(byte))
+        .expect("literal leaves an avoiding byte");
+
+    // The exact first-candidate miss advances the wide base from zero to one.
+    // Group zero has a primary hit but no secondary hit, selecting
+    // secondary-only for group one. Group one's real pair then reaches the
+    // shared remaining-column block.
+    let first_wide_base = 1_usize;
+    let secondary_only_base = first_wide_base + 64;
+    let resumed_primary_base = secondary_only_base + 64;
+    let group_zero_primary = first_wide_base + 7;
+    let group_one_candidate = secondary_only_base + 11;
+    let group_two_candidate = resumed_primary_base + 13;
+
+    let mut exact_in_secondary_only = vec![avoid; 240];
+    exact_in_secondary_only[group_zero_primary + primary] = literal[primary];
+    exact_in_secondary_only[group_one_candidate..group_one_candidate + literal.len()]
+        .copy_from_slice(literal);
+    let secondary_result = simulate(&image, &exact_in_secondary_only, 0, 240)
+        .expect("V20 secondary-only real-pair simulation");
+    assert_eq!(
+        span_output(secondary_result),
+        Some((group_one_candidate, group_one_candidate + literal.len()))
+    );
+
+    // The same reachable edge with only the pair present must be eliminated by
+    // the first remaining column, resume primary-first at group two, and find
+    // the later exact match. This also proves a primary-empty group never
+    // spuriously enters secondary-only: only a primary-present/pair-empty
+    // group selects that state.
+    let mut third_column_empty = vec![avoid; 240];
+    third_column_empty[group_zero_primary + primary] = literal[primary];
+    third_column_empty[group_one_candidate + primary] = literal[primary];
+    third_column_empty[group_one_candidate + secondary] = literal[secondary];
+    assert_eq!(
+        third_column_empty[group_one_candidate + verification],
+        avoid
+    );
+    third_column_empty[group_two_candidate..group_two_candidate + literal.len()]
+        .copy_from_slice(literal);
+    let resumed_result = simulate(&image, &third_column_empty, 0, 240)
+        .expect("V20 third-column-empty resumed simulation");
+    assert_eq!(
+        span_output(resumed_result),
+        Some((group_two_candidate, group_two_candidate + literal.len()))
+    );
+}
+
+#[test]
+fn v20_dense_pair_preserving_streams_are_filtered_at_each_remaining_column() {
+    let literal = b"0123456789abcdef";
+    let program =
+        build_exact_literal::<Span>(literal, AnchorFlags::default(), ValidateLimits::default())
+            .expect("V20 dense-refinement IR");
+    let image = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV20,
+        EmitLimits::default(),
+    )
+    .expect("V20 dense-refinement image");
+    audit(&image).expect("V20 dense-refinement independent template");
+    let manifest = image
+        .search_manifest()
+        .expect("V20 dense-refinement manifest");
+    let remaining = [
+        manifest.verification_offset,
+        manifest.quaternary_offset,
+        manifest.quinary_offset,
+    ]
+    .map(usize::from);
+    let avoid = (0_u16..=255)
+        .map(|value| u8::try_from(value).expect("bounded avoiding byte"))
+        .find(|byte| !literal.contains(byte))
+        .expect("literal leaves an avoiding byte");
+
+    for (stage, mutation) in remaining.into_iter().enumerate() {
+        let mut near_miss = *literal;
+        near_miss[mutation] = avoid;
+        let mut haystack = Vec::with_capacity(literal.len() * 17);
+        for _ in 0..16 {
+            haystack.extend_from_slice(&near_miss);
+        }
+        let exact = haystack.len();
+        haystack.extend_from_slice(literal);
+        let expected = program
+            .execute(
+                &haystack,
+                SearchWindow::new(0, haystack.len()),
+                ExecutionLimits::unlimited(),
+            )
+            .expect("V20 dense-refinement oracle")
+            .output()
+            .map(|span| (span.start(), span.end()));
+        let actual = simulate(&image, &haystack, 0, haystack.len())
+            .expect("V20 dense-refinement safe ISA simulation");
+        assert_eq!(expected, Some((exact, exact + literal.len())));
+        assert_eq!(span_output(actual), expected, "remaining stage={stage}");
+    }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the V20 structural gate freezes its exact wide-refinement instruction model, explicit entries, wire, code size, and mutation rejection"
+)]
+fn v20_wide_refinement_matches_the_preregistered_instruction_model() {
+    const REFINEMENT_INSTRUCTIONS: usize = 46;
+    let literal = b"0123456789abcdef";
+    let program =
+        build_exact_literal::<Span>(literal, AnchorFlags::default(), ValidateLimits::default())
+            .expect("V20 structural IR");
+    let v17 = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV17,
+        EmitLimits::default(),
+    )
+    .expect("frozen V17 structural image");
+    let v19 = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV19,
+        EmitLimits::default(),
+    )
+    .expect("frozen V19 structural image");
+    let v20 = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV20,
+        EmitLimits::default(),
+    )
+    .expect("V20 structural image");
+    audit(&v20).expect("independent V20 structural template");
+    assert_eq!(v20.backend_version(), BackendVersion::SEARCH_V20);
+    assert_eq!(
+        &v20.to_aot(AotLimits::default())
+            .expect("bounded V20 AOT")
+            .as_bytes()[..8],
+        b"FREA64\0\x21"
+    );
+    assert_eq!(
+        v20.code().len().checked_sub(v19.code().len()),
+        Some(192),
+        "three columns, one intermediate checkpoint, explicit final edges, and two explicit entries"
+    );
+    assert!(v20.code().len() <= 1_792);
+    assert_ne!(v20.artifact_identity(), v19.artifact_identity());
+    assert_ne!(v20.artifact_identity(), v17.artifact_identity());
+    let v17_manifest = v17.search_manifest().expect("V17 structural manifest");
+    let v20_manifest = v20.search_manifest().expect("V20 structural manifest");
+    assert_eq!(
+        (
+            v20_manifest.primary_offset,
+            v20_manifest.secondary_offset,
+            v20_manifest.verification_offset,
+            v20_manifest.quaternary_offset,
+            v20_manifest.quinary_offset,
+        ),
+        (
+            v17_manifest.primary_offset,
+            v17_manifest.secondary_offset,
+            v17_manifest.verification_offset,
+            v17_manifest.quaternary_offset,
+            v17_manifest.quinary_offset,
+        ),
+        "V20 reuses the frozen phase-unique V17 selector"
+    );
+
+    let decoded = decode(v20.code()).expect("V20 structural decode");
+    let conversions = [(0_u8, 0_u8), (2, 1), (4, 2), (6, 3)];
+    let saved_starts = decoded
+        .windows(12)
+        .enumerate()
+        .filter_map(|(start, window)| {
+            conversions
+                .iter()
+                .enumerate()
+                .all(|(ordinal, &(source, destination))| {
+                    let base = ordinal * 3;
+                    window[base]
+                        == DecodedInstruction::ShiftRightNarrowHalfwordsToBytes8 {
+                            destination: 16,
+                            source,
+                        }
+                        && window[base + 1]
+                            == DecodedInstruction::MoveVectorDoubleTo64 {
+                                destination,
+                                source: 16,
+                            }
+                        && window[base + 2]
+                            == DecodedInstruction::AndRegister64 {
+                                destination,
+                                left: destination,
+                                right: 14,
+                            }
+                })
+                .then_some(start)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(saved_starts.len(), 1);
+    let saved = saved_starts[0];
+    let remaining_start = saved
+        .checked_sub(REFINEMENT_INSTRUCTIONS)
+        .expect("V20 refinement precedes conversion");
+    let refinement = &decoded[remaining_start..saved];
+    assert_eq!(
+        refinement
+            .iter()
+            .filter(|instruction| matches!(
+                instruction,
+                DecodedInstruction::LoadVectorPair128 { .. }
+            ))
+            .count(),
+        6
+    );
+    for constant in [5_u8, 7, 23] {
+        assert_eq!(
+            refinement
+                .iter()
+                .filter(|instruction| matches!(
+                    instruction,
+                    DecodedInstruction::CompareEqualBytes16 { right, .. } if *right == constant
+                ))
+                .count(),
+            4,
+            "four blocks use Q{constant}"
+        );
+    }
+    assert_eq!(
+        refinement
+            .iter()
+            .filter(|instruction| matches!(instruction, DecodedInstruction::AndBytes16 { .. }))
+            .count(),
+        12
+    );
+    assert_eq!(
+        refinement
+            .iter()
+            .filter(|instruction| matches!(
+                instruction,
+                DecodedInstruction::UnsignedMaxPairwiseBytes16 { .. }
+            ))
+            .count(),
+        8
+    );
+    assert_eq!(
+        refinement
+            .iter()
+            .filter(|instruction| matches!(
+                instruction,
+                DecodedInstruction::MoveVectorDoubleTo64 {
+                    destination: 10,
+                    source: 16
+                }
+            ))
+            .count(),
+        2
+    );
+    assert_eq!(
+        refinement
+            .iter()
+            .filter(|instruction| matches!(
+                instruction,
+                DecodedInstruction::CompareBranchZero64 {
+                    register: 10,
+                    nonzero: false,
+                    ..
+                }
+            ))
+            .count(),
+        2
+    );
+
+    let branch_target = |index: usize| {
+        let displacement = match decoded[index] {
+            DecodedInstruction::Branch { displacement }
+            | DecodedInstruction::BranchCondition { displacement, .. }
+            | DecodedInstruction::CompareBranchZero64 { displacement, .. } => displacement,
+            _ => panic!("instruction {index} is not a V20 branch"),
+        };
+        let address = i64::try_from(index)
+            .expect("small V20 graph")
+            .checked_mul(4)
+            .and_then(|address| address.checked_add(i64::from(displacement)))
+            .expect("bounded V20 branch target");
+        assert_eq!(address % 4, 0);
+        usize::try_from(address / 4).expect("nonnegative V20 branch target")
+    };
+    let explicit_entries = decoded[..remaining_start]
+        .iter()
+        .enumerate()
+        .filter_map(|(index, instruction)| {
+            matches!(instruction, DecodedInstruction::Branch { .. })
+                .then(|| branch_target(index))
+                .filter(|&target| target == remaining_start)
+                .map(|_| index)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(explicit_entries.len(), 2);
+    for entry in explicit_entries {
+        assert!(matches!(
+            decoded[entry - 1],
+            DecodedInstruction::CompareBranchZero64 {
+                register: 10,
+                nonzero: false,
+                ..
+            }
+        ));
+    }
+    assert!(matches!(
+        decoded[saved - 2],
+        DecodedInstruction::CompareBranchZero64 {
+            register: 10,
+            nonzero: false,
+            ..
+        }
+    ));
+    assert!(matches!(
+        decoded[saved - 1],
+        DecodedInstruction::Branch { .. }
+    ));
+    assert_eq!(branch_target(saved - 1), saved);
+
+    let first_refinement_and = refinement
+        .iter()
+        .position(|instruction| matches!(instruction, DecodedInstruction::AndBytes16 { .. }))
+        .map(|offset| remaining_start + offset)
+        .expect("V20 wide refinement AND");
+    let mut bypassed_refinement = v20.clone();
+    replace_test_decoded_at(
+        &mut bypassed_refinement,
+        first_refinement_and,
+        DecodedInstruction::AndBytes16 {
+            destination: 0,
+            left: 0,
+            right: 0,
+        },
+    );
+    assert_resealed_search_rejected(
+        bypassed_refinement,
+        "V20 bypassed one authenticated wide refinement",
+    );
+
+    let mut v20_as_v19 = v20.clone();
+    v20_as_v19.backend_version = BackendVersion::SEARCH_V19;
+    v20_as_v19
+        .search
+        .as_mut()
+        .expect("V20 manifest")
+        .backend_version = BackendVersion::SEARCH_V19;
+    assert_resealed_search_rejected(v20_as_v19, "V20 code resealed as V19");
+
+    let mut v19_as_v20 = v19;
+    v19_as_v20.backend_version = BackendVersion::SEARCH_V20;
+    v19_as_v20
+        .search
+        .as_mut()
+        .expect("V19 manifest")
+        .backend_version = BackendVersion::SEARCH_V20;
+    assert_resealed_search_rejected(v19_as_v20, "V19 code resealed as V20");
+}
+
+#[test]
+fn v20_code_size_delta_is_fixed_and_bounded_across_every_gate_width() {
+    for width in 6_usize..=MAX_REPEATED_CONFIRM_BYTES {
+        let literal = (0..width)
+            .map(|offset| {
+                u8::try_from(offset)
+                    .expect("bounded V20 width")
+                    .wrapping_mul(61)
+                    .wrapping_add(7)
+            })
+            .collect::<Vec<_>>();
+        let program = build_exact_literal::<Span>(
+            &literal,
+            AnchorFlags::default(),
+            ValidateLimits::default(),
+        )
+        .expect("V20 size-bound IR");
+        let v19 = emit_with_backend(
+            &program,
+            SearchBackendPolicy::AsimdV19,
+            EmitLimits::default(),
+        )
+        .expect("V19 size-bound image");
+        let v20 = emit_with_backend(
+            &program,
+            SearchBackendPolicy::AsimdV20,
+            EmitLimits::default(),
+        )
+        .expect("V20 size-bound image");
+        assert_eq!(
+            v20.code().len().checked_sub(v19.code().len()),
+            Some(192),
+            "width={width}"
+        );
+        assert!(v20.code().len() <= 1_792, "width={width}");
+    }
+}
+
+#[test]
+fn v20_refined_saved_masks_cover_every_lane_block_and_false_survivor_shape() {
+    let literal = [11_u8, 37, 63, 89, 115, 141, 167, 193, 219, 245, 17, 43, 69];
+    let program =
+        build_exact_literal::<Span>(&literal, AnchorFlags::default(), ValidateLimits::default())
+            .expect("V20 four-block IR");
+    let image = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV20,
+        EmitLimits::default(),
+    )
+    .expect("V20 four-block image");
+    audit(&image).expect("V20 four-block image audit");
+    let manifest = image.search_manifest().expect("V20 four-block manifest");
+    let selected = [
+        manifest.primary_offset,
+        manifest.secondary_offset,
+        manifest.verification_offset,
+        manifest.quaternary_offset,
+        manifest.quinary_offset,
+    ]
+    .map(usize::from);
+    let avoid = (0_u16..=255)
+        .map(|value| u8::try_from(value).expect("bounded byte"))
+        .find(|byte| !literal.contains(byte))
+        .expect("V20 literal leaves an avoiding byte");
+    let window_start = 3_usize;
+    let wide_base = window_start + 1;
+
+    for block in 0..4_usize {
+        for lane in 0..16_usize {
+            let candidate = wide_base + block * 16 + lane;
+            let mut haystack = vec![avoid; 192];
+            haystack[candidate..candidate + literal.len()].copy_from_slice(&literal);
+            let expected = program
+                .execute(
+                    &haystack,
+                    SearchWindow::new(window_start, haystack.len()),
+                    ExecutionLimits::unlimited(),
+                )
+                .expect("V20 lane/block oracle")
+                .output()
+                .map(|span| (span.start(), span.end()));
+            let actual = simulate(&image, &haystack, window_start, haystack.len())
+                .expect("V20 lane/block simulation");
+            assert_eq!(span_output(actual), expected, "block={block} lane={lane}");
+            assert_eq!(expected, Some((candidate, candidate + literal.len())));
+        }
+    }
+
+    let scenarios: &[(&[usize], Option<usize>)] = &[
+        (&[0, 20, 40], Some(60)),
+        (&[2, 18, 34, 50], None),
+        (&[0, 17], Some(51)),
+        (&[1, 22, 43], Some(64)),
+    ];
+    for (scenario, &(false_offsets, exact_offset)) in scenarios.iter().enumerate() {
+        let mut haystack = vec![avoid; 192];
+        for &offset in false_offsets {
+            let candidate = wide_base + offset;
+            for &selected_offset in &selected {
+                haystack[candidate + selected_offset] = literal[selected_offset];
+            }
+        }
+        if let Some(offset) = exact_offset {
+            let candidate = wide_base + offset;
+            haystack[candidate..candidate + literal.len()].copy_from_slice(&literal);
+        }
+        let expected = program
+            .execute(
+                &haystack,
+                SearchWindow::new(window_start, haystack.len()),
+                ExecutionLimits::unlimited(),
+            )
+            .expect("V20 survivor-shape oracle")
+            .output()
+            .map(|span| (span.start(), span.end()));
+        let actual = simulate(&image, &haystack, window_start, haystack.len())
+            .expect("V20 survivor-shape simulation");
+        assert_eq!(
+            span_output(actual),
+            expected,
+            "refined false-survivor scenario={scenario}"
+        );
+        assert_eq!(
+            expected,
+            exact_offset.map(|offset| {
+                let start = wide_base + offset;
+                (start, start + literal.len())
+            })
+        );
+    }
+}
+
+#[test]
+fn v20_every_width_and_window_shape_matches_the_kir_oracle() {
+    let mut state = 0x83c1_b75e_d2a9_460f_u64;
+    let mut comparisons = 0_u64;
+    for width in 6_usize..=MAX_REPEATED_CONFIRM_BYTES {
+        let literal = (0..width)
+            .map(|offset| {
+                u8::try_from(offset)
+                    .expect("bounded V20 width")
+                    .wrapping_mul(61)
+                    .wrapping_add(7)
+            })
+            .collect::<Vec<_>>();
+        let program = build_exact_literal::<Span>(
+            &literal,
+            AnchorFlags::default(),
+            ValidateLimits::default(),
+        )
+        .expect("V20 every-width IR");
+        let image = emit_with_backend(
+            &program,
+            SearchBackendPolicy::AsimdV20,
+            EmitLimits::default(),
+        )
+        .expect("V20 every-width image");
+        audit(&image).expect("V20 every-width image audit");
+
+        for case in 0..8_usize {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let hay_len = 112 + usize::try_from(state >> 24).expect("host usize") % 97;
+            let mut haystack = Vec::with_capacity(hay_len);
+            for _ in 0..hay_len {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                haystack.push(state.to_le_bytes()[0]);
+            }
+
+            let exact = (case & 1 == 0).then(|| {
+                5 + (usize::try_from(state >> 8).expect("host usize")
+                    % (haystack.len() - width - 5))
+            });
+            if let Some(candidate) = exact {
+                haystack[candidate..candidate + width].copy_from_slice(&literal);
+            }
+
+            let random_start =
+                usize::try_from(state >> 16).expect("host usize") % (haystack.len() + 1);
+            let random_end = random_start
+                + (usize::try_from(state >> 32).expect("host usize")
+                    % (haystack.len() - random_start + 1));
+            let short_end = width.saturating_sub(1).min(haystack.len());
+            let exact_window = exact
+                .map(|candidate| (candidate, candidate + width))
+                .unwrap_or((random_start, random_end));
+            let windows = [
+                (0, 0),
+                (0, short_end),
+                (0, haystack.len()),
+                (random_start, haystack.len()),
+                (random_start, random_end),
+                exact_window,
+            ];
+            for (start, end) in windows {
+                let expected = program
+                    .execute(
+                        &haystack,
+                        SearchWindow::new(start, end),
+                        ExecutionLimits::unlimited(),
+                    )
+                    .expect("V20 every-width oracle")
+                    .output()
+                    .map(|span| (span.start(), span.end()));
+                let actual = simulate(&image, &haystack, start, end)
+                    .expect("V20 every-width safe ISA simulation");
+                assert_eq!(
+                    span_output(actual),
+                    expected,
+                    "width={width} case={case} window={start}..{end}"
+                );
+                comparisons = comparisons.checked_add(1).expect("bounded V20 matrix");
+            }
+        }
+    }
+    assert_eq!(comparisons, 1_296);
+}
+
+#[test]
 fn v17_post_window_setup_leaves_x1_x2_x3_available_for_saved_masks() {
     let literal = b"0123456789abcdef";
     let program =
@@ -8671,7 +9278,7 @@ fn v17_post_window_setup_leaves_x1_x2_x3_available_for_saved_masks() {
             decoded[window_setup + 1..]
                 .iter()
                 .all(|instruction| !instruction.uses_gpr(register)),
-            "X{register} must be dead after X5/X6 capture for V19 saved masks"
+            "X{register} must be dead after X5/X6 capture for V19/V20 saved masks"
         );
     }
     assert!(
@@ -8871,7 +9478,7 @@ fn v13_adaptive_recovery_decoded_edges_cover_zero_one_and_max_remaining_columns(
 }
 
 #[test]
-fn v9_through_v19_reject_shapes_without_one_nonempty_unanchored_exact_candidate() {
+fn v9_through_v20_reject_shapes_without_one_nonempty_unanchored_exact_candidate() {
     for backend in [
         SearchBackendPolicy::AsimdV9,
         SearchBackendPolicy::AsimdV10,
@@ -8884,6 +9491,7 @@ fn v9_through_v19_reject_shapes_without_one_nonempty_unanchored_exact_candidate(
         SearchBackendPolicy::AsimdV17,
         SearchBackendPolicy::AsimdV18,
         SearchBackendPolicy::AsimdV19,
+        SearchBackendPolicy::AsimdV20,
     ] {
         for anchors in [
             AnchorFlags {
