@@ -2527,9 +2527,11 @@ fn policy_periodic_sve_v3(
     sve2: bool,
     done: PolicyLabelV3,
 ) -> Result<(), CountAotError> {
-    if periodic_stride == 0 || usize::from(periodic_stride) >= literal.len() {
+    if periodic_stride == 0 || usize::from(periodic_stride) >= literal.len() || filter.len != 2 {
         return Err(invalid_v3("invalid periodic SVE policy stride"));
     }
+    let wide = policy.new_label(LabelKindV3::VectorLoop)?;
+    let wide_hit = policy.new_label(LabelKindV3::Internal)?;
     let vector = policy.new_label(LabelKindV3::VectorLoop)?;
     let candidate = policy.new_label(LabelKindV3::CandidateLoop)?;
     let candidate_miss = policy.new_label(LabelKindV3::Miss)?;
@@ -2560,6 +2562,107 @@ fn policy_periodic_sve_v3(
             },
         )?;
     }
+
+    policy.bind(wide)?;
+    compare_register64_v3(policy, X3, X4)?;
+    condition_v3(policy, ConditionV3::Higher, done)?;
+    subtract_register64_v3(policy, X6, X4, X3)?;
+    compare_immediate64_v3(policy, X6, SPARSE_SCAN_STARTS_V3 - 1)?;
+    condition_v3(policy, ConditionV3::CarryClear, vector)?;
+    add_register64_v3(policy, X15, X0, X3)?;
+    let first_offset = filter.offsets[0];
+    let first_base = if first_offset == 0 {
+        X15
+    } else {
+        add_immediate64_v3(policy, X8, X15, u16::from(first_offset))?;
+        X8
+    };
+    let second_offset = filter.offsets[1];
+    let second_base = if second_offset == 0 {
+        X15
+    } else {
+        add_immediate64_v3(policy, X9, X15, u16::from(second_offset))?;
+        X9
+    };
+    for block in 0_u8..8 {
+        let block_predicate = 4_u8.checked_add(block).expect("p4 through p11");
+        let vector_offset = i8::try_from(block).expect("nonnegative imm4");
+        policy_sve_load_bytes_mul_vl_v3(policy, 0, 0, first_base, vector_offset)?;
+        policy_sve_compare_bytes_v3(policy, block_predicate, 0, 0, constants[0], sve2)?;
+        policy_sve_load_bytes_mul_vl_v3(policy, 0, 0, second_base, vector_offset)?;
+        policy_sve_compare_bytes_v3(policy, 2, 0, 0, constants[1], sve2)?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::SveAndPredicateBytes {
+                destination: block_predicate,
+                predicate: 0,
+                left: block_predicate,
+                right: 2,
+            },
+        )?;
+    }
+    for (destination, left, right) in [(12, 4, 5), (13, 6, 7), (14, 8, 9), (15, 10, 11)] {
+        exact_v3(
+            policy,
+            DecodedInstructionV3::SveOrPredicateBytes {
+                destination,
+                predicate: 0,
+                left,
+                right,
+            },
+        )?;
+    }
+    exact_v3(
+        policy,
+        DecodedInstructionV3::SveOrPredicateBytes {
+            destination: 1,
+            predicate: 0,
+            left: 12,
+            right: 13,
+        },
+    )?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::SveOrPredicateBytes {
+            destination: 2,
+            predicate: 0,
+            left: 14,
+            right: 15,
+        },
+    )?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::SveOrPredicateBytes {
+            destination: 1,
+            predicate: 0,
+            left: 1,
+            right: 2,
+        },
+    )?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::SveTestPredicateBytes {
+            predicate: 0,
+            tested: 1,
+        },
+    )?;
+    condition_v3(policy, ConditionV3::NotEqual, wide_hit)?;
+    add_immediate64_v3(policy, X3, X3, SPARSE_SCAN_STARTS_V3)?;
+    branch_v3(policy, wide)?;
+
+    policy.bind(wide_hit)?;
+    for block_predicate in 4_u8..11 {
+        exact_v3(
+            policy,
+            DecodedInstructionV3::SveTestPredicateBytes {
+                predicate: 0,
+                tested: block_predicate,
+            },
+        )?;
+        condition_v3(policy, ConditionV3::NotEqual, vector)?;
+        add_immediate64_v3(policy, X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
+    }
+    branch_v3(policy, vector)?;
 
     policy.bind(vector)?;
     compare_register64_v3(policy, X3, X4)?;
@@ -2658,7 +2761,7 @@ fn policy_periodic_sve_v3(
     condition_v3(policy, ConditionV3::NotEqual, candidate)?;
     policy.bind(advance)?;
     add_immediate64_v3(policy, X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
-    branch_v3(policy, vector)?;
+    branch_v3(policy, wide)?;
 
     policy.bind(match_run)?;
     compare_register64_v3(policy, X3, X4)?;
@@ -2677,7 +2780,7 @@ fn policy_periodic_sve_v3(
     branch_v3(policy, match_run)?;
     policy.bind(match_run_miss)?;
     add_immediate64_v3(policy, X3, X3, 1)?;
-    branch_v3(policy, vector)?;
+    branch_v3(policy, wide)?;
 
     policy.bind(tail)?;
     compare_register64_v3(policy, X3, X4)?;

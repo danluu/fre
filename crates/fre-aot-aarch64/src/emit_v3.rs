@@ -1993,11 +1993,10 @@ fn emit_sve_filtered_v3(
 
 /// Fixed-VL16 SVE/SVE2 periodic scan.
 ///
-/// The sealed periodic recipe supplies a complete structural filter (the
-/// first period boundary, its successor, and both literal boundaries where
-/// distinct). Every filter column is intersected before the single predicate
-/// test, so common period bytes cannot enter scalar confirmation on their own.
-/// A confirmed match enters a straight non-overlapping successor run.
+/// The sealed periodic recipe supplies the two adjacent period-boundary
+/// columns. Both columns are intersected before a predicate test, so a common
+/// period byte cannot enter scalar confirmation alone. A confirmed match
+/// enters a straight non-overlapping successor run.
 #[allow(
     clippy::too_many_lines,
     reason = "the closed periodic predicate and successor graph is intentionally explicit"
@@ -2011,11 +2010,13 @@ fn emit_periodic_sve_v3(
     sve2: bool,
     done: LabelV3,
 ) -> Result<(), CountAotError> {
-    if periodic_stride == 0 || usize::from(periodic_stride) >= literal.len() {
+    if periodic_stride == 0 || usize::from(periodic_stride) >= literal.len() || filter.len != 2 {
         return Err(CountAotError::InternalInvariant {
             at: "invalid periodic SVE stride",
         });
     }
+    let wide = assembler.new_label(LabelKindV3::VectorLoop)?;
+    let wide_hit = assembler.new_label(LabelKindV3::Internal)?;
     let vector = assembler.new_label(LabelKindV3::VectorLoop)?;
     let candidate = assembler.new_label(LabelKindV3::CandidateLoop)?;
     let candidate_miss = assembler.new_label(LabelKindV3::Miss)?;
@@ -2039,6 +2040,58 @@ fn emit_periodic_sve_v3(
         assembler.mov_imm64_minimal(X8, u64::from(literal[usize::from(offset)]))?;
         assembler.sve_duplicate_byte(constants[index], X8)?;
     }
+
+    // Scan eight fixed-VL16 blocks before paying lane recovery. P4-P11 retain
+    // the exact two-column masks, so a rare hit can re-enter the existing
+    // complete 16-start graph at its earliest block without semantic risk.
+    assembler.bind(wide)?;
+    assembler.cmp_reg64(X3, X4)?;
+    assembler.branch_cond(ConditionV3::Higher, done)?;
+    assembler.sub_reg(X6, X4, X3)?;
+    assembler.cmp_imm64(X6, SPARSE_SCAN_STARTS_V3 - 1)?;
+    assembler.branch_cond(ConditionV3::CarryClear, vector)?;
+    assembler.add_reg(X15, X0, X3)?;
+    let first_offset = filter.offsets[0];
+    let first_base = if first_offset == 0 {
+        X15
+    } else {
+        assembler.add_imm(X8, X15, u16::from(first_offset))?;
+        X8
+    };
+    let second_offset = filter.offsets[1];
+    let second_base = if second_offset == 0 {
+        X15
+    } else {
+        assembler.add_imm(X9, X15, u16::from(second_offset))?;
+        X9
+    };
+    for block in 0_u8..8 {
+        let block_predicate = 4_u8.checked_add(block).expect("p4 through p11");
+        let vector_offset = i8::try_from(block).expect("nonnegative imm4");
+        assembler.sve_load_bytes_mul_vl(0, 0, first_base, vector_offset)?;
+        emit_sve_compare_bytes_v3(assembler, block_predicate, 0, 0, constants[0], sve2)?;
+        assembler.sve_load_bytes_mul_vl(0, 0, second_base, vector_offset)?;
+        emit_sve_compare_bytes_v3(assembler, 2, 0, 0, constants[1], sve2)?;
+        assembler.sve_and_predicate_bytes(block_predicate, 0, block_predicate, 2)?;
+    }
+    for (destination, left, right) in [(12, 4, 5), (13, 6, 7), (14, 8, 9), (15, 10, 11)] {
+        assembler.sve_or_predicate_bytes(destination, 0, left, right)?;
+    }
+    assembler.sve_or_predicate_bytes(1, 0, 12, 13)?;
+    assembler.sve_or_predicate_bytes(2, 0, 14, 15)?;
+    assembler.sve_or_predicate_bytes(1, 0, 1, 2)?;
+    assembler.sve_test_predicate_bytes(0, 1)?;
+    assembler.branch_cond(ConditionV3::NotEqual, wide_hit)?;
+    assembler.add_imm(X3, X3, SPARSE_SCAN_STARTS_V3)?;
+    assembler.branch(wide)?;
+
+    assembler.bind(wide_hit)?;
+    for block_predicate in 4_u8..11 {
+        assembler.sve_test_predicate_bytes(0, block_predicate)?;
+        assembler.branch_cond(ConditionV3::NotEqual, vector)?;
+        assembler.add_imm(X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
+    }
+    assembler.branch(vector)?;
 
     assembler.bind(vector)?;
     assembler.cmp_reg64(X3, X4)?;
@@ -2087,7 +2140,7 @@ fn emit_periodic_sve_v3(
     assembler.branch_cond(ConditionV3::NotEqual, candidate)?;
     assembler.bind(advance)?;
     assembler.add_imm(X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
-    assembler.branch(vector)?;
+    assembler.branch(wide)?;
 
     assembler.bind(match_run)?;
     assembler.cmp_reg64(X3, X4)?;
@@ -2106,7 +2159,7 @@ fn emit_periodic_sve_v3(
     assembler.branch(match_run)?;
     assembler.bind(match_run_miss)?;
     assembler.add_imm(X3, X3, 1)?;
-    assembler.branch(vector)?;
+    assembler.branch(wide)?;
 
     assembler.bind(tail)?;
     assembler.cmp_reg64(X3, X4)?;

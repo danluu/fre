@@ -525,6 +525,79 @@ fn direct_masks_and_periodic_absence_batching_have_distinct_graphs() {
 }
 
 #[test]
+fn periodic_sve_rows_batch_both_boundary_columns_across_128_starts() {
+    for (required_isa, sve2) in [
+        (CountV3RequiredIsa::Aarch64SveVl16, false),
+        (CountV3RequiredIsa::Aarch64Sve2Vl16, true),
+    ] {
+        let (program, optimized) = optimized_for(b"aeaeaeaeae", required_isa);
+        assert_eq!(optimized.recipe().strategy(), CountV3Strategy::PeriodicRun);
+        assert_eq!(optimized.recipe().filter_offsets(), &[0, 1]);
+        let image =
+            emit_count_v3(&program, optimized.recipe(), CountEmitLimitsV3::default()).unwrap();
+        let decoded = decoded_v3(&image);
+
+        for block in 0_u8..8 {
+            let offset = i8::try_from(block).unwrap();
+            let block_predicate = 4 + block;
+            assert!(decoded.windows(5).any(|window| {
+                let first_load = if offset == 0 {
+                    DecodedInstructionV3::SveLoadBytes {
+                        destination: 0,
+                        predicate: 0,
+                        base: 15,
+                    }
+                } else {
+                    DecodedInstructionV3::SveLoadBytesMulVl {
+                        destination: 0,
+                        predicate: 0,
+                        base: 15,
+                        vector_offset: offset,
+                    }
+                };
+                let second_load = if offset == 0 {
+                    DecodedInstructionV3::SveLoadBytes {
+                        destination: 0,
+                        predicate: 0,
+                        base: 9,
+                    }
+                } else {
+                    DecodedInstructionV3::SveLoadBytesMulVl {
+                        destination: 0,
+                        predicate: 0,
+                        base: 9,
+                        vector_offset: offset,
+                    }
+                };
+                window[0] == first_load
+                    && window[1] == sve_compare_instruction_v3(sve2, block_predicate, 2)
+                    && window[2] == second_load
+                    && window[3] == sve_compare_instruction_v3(sve2, 2, 3)
+                    && window[4]
+                        == DecodedInstructionV3::SveAndPredicateBytes {
+                            destination: block_predicate,
+                            predicate: 0,
+                            left: block_predicate,
+                            right: 2,
+                        }
+            }));
+        }
+        assert!(decoded.iter().any(|instruction| {
+            *instruction
+                == DecodedInstructionV3::AddImmediate64 {
+                    destination: 3,
+                    source: 3,
+                    immediate: 128,
+                }
+        }));
+        assert_eq!(
+            audit_count_image_v3(&program, optimized.recipe(), &image).unwrap(),
+            image.build_receipt().audit
+        );
+    }
+}
+
+#[test]
 fn primary_empty_scan_and_semantic_endpoint_fallback_are_disjoint() {
     let (program, optimized) = optimized(b"not-periodic");
     assert_eq!(
