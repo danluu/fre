@@ -19,8 +19,8 @@ use std::{
 };
 
 use fre::{
-    Match, PortableBuilder, PortableRegex, SearchExactLiteralAotV1, SearchExactLiteralAutoAotV1,
-    SearchLimits, SearchWindow,
+    Match, PortableBuilder, PortableRegex, SearchAccounting, SearchExactLiteralAotV1,
+    SearchExactLiteralAutoAotV1, SearchLimits, SearchWindow,
 };
 use fre_aot_static_runtime::{
     RawStaticSearchSpanAdoptionOutputV1, VerifiedStaticSearchSpanV1,
@@ -177,16 +177,31 @@ enum CandidateView<'a> {
 }
 
 impl CandidateView<'_> {
-    fn find(&self, haystack: &[u8]) -> Result<Option<Match>, DynError> {
-        let window = SearchWindow::new(0, haystack.len());
+    fn dispatch<T>(
+        &self,
+        portable: impl FnOnce(&PortableRegex) -> T,
+        automatic: impl FnOnce(&SearchExactLiteralAutoAotV1<'_>) -> T,
+    ) -> T {
         match self {
-            Self::Portable(portable) => Ok(portable
-                .find_window(haystack, window, SearchLimits::unlimited())?
-                .0),
-            Self::Automatic(automatic) => Ok(automatic
-                .find_window(haystack, window, SearchLimits::unlimited())?
-                .0),
+            Self::Portable(selected) => portable(selected),
+            Self::Automatic(selected) => automatic(selected),
         }
+    }
+
+    fn find_accounted(
+        &self,
+        haystack: &[u8],
+    ) -> Result<(Option<Match>, SearchAccounting), DynError> {
+        let window = SearchWindow::new(0, haystack.len());
+        let limits = SearchLimits::unlimited();
+        self.dispatch(
+            |portable| Ok(portable.find_window(haystack, window, limits)?),
+            |automatic| Ok(automatic.find_window(haystack, window, limits)?),
+        )
+    }
+
+    fn find(&self, haystack: &[u8]) -> Result<Option<Match>, DynError> {
+        Ok(self.find_accounted(haystack)?.0)
     }
 }
 
@@ -1287,13 +1302,24 @@ fn measure_portable(
     iterations: usize,
     cpu: usize,
 ) -> Result<Measurement, DynError> {
+    let window = SearchWindow::new(0, haystack.len());
+    let limits = SearchLimits::unlimited();
     measure(iterations, cpu, || {
-        Ok(portable
-            .find_window(
-                black_box(haystack),
-                SearchWindow::new(0, haystack.len()),
-                SearchLimits::unlimited(),
-            )?
+        Ok(portable.find_window(black_box(haystack), window, limits)?.0)
+    })
+}
+
+fn measure_automatic(
+    automatic: &SearchExactLiteralAutoAotV1<'_>,
+    haystack: &[u8],
+    iterations: usize,
+    cpu: usize,
+) -> Result<Measurement, DynError> {
+    let window = SearchWindow::new(0, haystack.len());
+    let limits = SearchLimits::unlimited();
+    measure(iterations, cpu, || {
+        Ok(automatic
+            .find_window(black_box(haystack), window, limits)?
             .0)
     })
 }
@@ -1304,7 +1330,10 @@ fn measure_candidate(
     iterations: usize,
     cpu: usize,
 ) -> Result<Measurement, DynError> {
-    measure(iterations, cpu, || candidate.find(black_box(haystack)))
+    candidate.dispatch(
+        |portable| measure_portable(portable, haystack, iterations, cpu),
+        |automatic| measure_automatic(automatic, haystack, iterations, cpu),
+    )
 }
 
 fn measure(
@@ -1914,6 +1943,8 @@ fn invalid(message: impl Into<String>) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
 
     #[test]
@@ -1970,6 +2001,56 @@ mod tests {
     fn zero_resolution_elapsed_is_published_as_positive() {
         assert_eq!(positive_elapsed_ns(0).unwrap(), 1);
         assert_eq!(positive_elapsed_ns(17).unwrap(), 17);
+    }
+
+    #[test]
+    fn portable_candidate_dispatch_preserves_matches_and_accounting() {
+        let portable = PortableBuilder::new("needle").build().unwrap();
+        let candidate = CandidateView::Portable(&portable);
+        for haystack in [
+            b"needle at the front".as_slice(),
+            b"late needle".as_slice(),
+            b"absent".as_slice(),
+        ] {
+            let expected = portable
+                .find_window(
+                    haystack,
+                    SearchWindow::new(0, haystack.len()),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap();
+            assert_eq!(candidate.find_accounted(haystack).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn portable_candidate_dispatches_once_before_repeated_calls() {
+        let portable = PortableBuilder::new("needle").build().unwrap();
+        let candidate = CandidateView::Portable(&portable);
+        let dispatches = Cell::new(0_usize);
+        let invocations = Cell::new(0_usize);
+        let matches = candidate.dispatch(
+            |selected| {
+                dispatches.set(dispatches.get() + 1);
+                (0..257)
+                    .map(|_| {
+                        invocations.set(invocations.get() + 1);
+                        selected
+                            .find_window(
+                                b"prefix needle suffix",
+                                SearchWindow::new(0, 20),
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap()
+                            .0
+                    })
+                    .collect::<Vec<_>>()
+            },
+            |_| unreachable!("a portable fallback cannot acquire an automatic route"),
+        );
+        assert_eq!(dispatches.get(), 1);
+        assert_eq!(invocations.get(), 257);
+        assert!(matches.into_iter().all(|matched| matched.is_some()));
     }
 
     #[cfg(target_os = "macos")]
