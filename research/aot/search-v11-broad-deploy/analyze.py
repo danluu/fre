@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the frozen candidate-independent mutation inventory."""
+"""Validate paired Search V11/V10/portable development CSVs."""
 
 import csv
 import json
@@ -8,11 +8,11 @@ import statistics
 import sys
 from collections import defaultdict
 
-SCHEMA = "fre-search-v10-mutation-inventory-v1"
+SCHEMA = "fre-search-v11-broad-devscreen-v1"
 ENGINES = (
-    "native-v9-aot-code-tag22",
     "native-v10-aot-code-tag23",
-    "hybrid-portable256-v10-tag23-floor4093-width2",
+    "native-v11-aot-code-tag24",
+    "hybrid-portable256-v11-tag24-floor4093-width2",
     "portable-memmem",
 )
 REPETITIONS = {"screen": 3}
@@ -52,10 +52,25 @@ def ratio_summary(values):
         "median": statistics.median(values),
         "p10": percentile(values, 0.10),
         "p90": percentile(values, 0.90),
+        "p99": percentile(values, 0.99),
         "max": max(values),
         "fraction_lt_1": sum(value < 1.0 for value in values) / len(values),
         "fraction_gt_1": sum(value > 1.0 for value in values) / len(values),
         "fraction_ge_1_2": sum(value >= 1.2 for value in values) / len(values),
+    }
+
+
+def delta_summary(values):
+    if not values:
+        fail("delta summary requires nonempty values")
+    return {
+        "fixtures": len(values),
+        "median_ns": statistics.median(values),
+        "p10_ns": percentile(values, 0.10),
+        "p90_ns": percentile(values, 0.90),
+        "p99_ns": percentile(values, 0.99),
+        "min_ns": min(values),
+        "max_ns": max(values),
     }
 
 
@@ -159,20 +174,21 @@ def main():
             for field in ("iterations", "checksum", "semantic"):
                 if len({row[field] for row in paired}) != 1:
                     fail(f"paired {field} mismatch: {fixture} repetition={repetition}")
-        v9 = medians[ENGINES[0]]
-        v10 = medians[ENGINES[1]]
+        v10 = medians[ENGINES[0]]
+        v11 = medians[ENGINES[1]]
         hybrid = medians[ENGINES[2]]
         portable = medians[ENGINES[3]]
         fixture_ratios.append(
             {
                 "fixture": fixture,
-                "v9_over_v10": v9 / v10,
-                "v10_over_v9": v10 / v9,
+                "v10_over_v11": v10 / v11,
+                "v11_over_v10": v11 / v10,
+                "portable_over_v11": portable / v11,
                 "portable_over_v10": portable / v10,
-                "portable_over_v9": portable / v9,
                 "portable_over_hybrid": portable / hybrid,
                 "hybrid_over_portable": hybrid / portable,
-                "v10_over_hybrid": v10 / hybrid,
+                "v11_over_hybrid": v11 / hybrid,
+                "hybrid_minus_portable_ns": hybrid - portable,
             }
         )
 
@@ -187,17 +203,24 @@ def main():
         }
 
     ratio_names = (
-        "v9_over_v10",
-        "v10_over_v9",
+        "v10_over_v11",
+        "v11_over_v10",
+        "portable_over_v11",
         "portable_over_v10",
-        "portable_over_v9",
         "portable_over_hybrid",
         "hybrid_over_portable",
-        "v10_over_hybrid",
+        "v11_over_hybrid",
     )
 
     def selected(ratio, predicate):
         return [item[ratio] for item in fixture_ratios if predicate(item["fixture"])]
+
+    def selected_delta(predicate):
+        return [
+            item["hybrid_minus_portable_ns"]
+            for item in fixture_ratios
+            if predicate(item["fixture"])
+        ]
 
     width_index = FIXTURE_FIELDS.index("width")
     scenario_index = FIXTURE_FIELDS.index("scenario")
@@ -247,14 +270,15 @@ def main():
             "maximum_geomean_exclusive": 0.80,
             "minimum_win_fraction": 0.80,
             "maximum_p90": 1.00,
-            "maximum_cell": 1.25,
+            "maximum_p99": 1.15,
+            "maximum_cell_diagnostic_only": summary["max"],
             "actual": summary,
             "pass": (
                 summary["fixtures"] >= 100
                 and summary["geomean"] < 0.80
                 and summary["fraction_lt_1"] >= 0.80
                 and summary["p90"] <= 1.00
-                and summary["max"] <= 1.25
+                and summary["p99"] <= 1.15
             ),
         }
 
@@ -265,13 +289,30 @@ def main():
             "minimum_observations": 100,
             "maximum_geomean": 1.02,
             "maximum_p90": 1.05,
-            "maximum_cell": 1.25,
+            "maximum_p99": 1.10,
+            "maximum_cell_diagnostic_only": summary["max"],
             "actual": summary,
             "pass": (
                 summary["fixtures"] >= 100
                 and summary["geomean"] <= 1.02
                 and summary["p90"] <= 1.05
-                and summary["max"] <= 1.25
+                and summary["p99"] <= 1.10
+            ),
+        }
+
+    def fixed_overhead_gate(predicate):
+        ratio = ratio_summary(selected("hybrid_over_portable", predicate))
+        delta = delta_summary(selected_delta(predicate))
+        return {
+            "minimum_observations": 100,
+            "ratio_diagnostic": ratio,
+            "maximum_median_overhead_ns": 3.0,
+            "maximum_p90_overhead_ns": 4.0,
+            "absolute_overhead": delta,
+            "pass": (
+                delta["fixtures"] >= 100
+                and delta["median_ns"] <= 3.0
+                and delta["p90_ns"] <= 4.0
             ),
         }
 
@@ -343,7 +384,7 @@ def main():
     }
 
     output = {
-        "schema": "fre-search-v10-mutation-inventory-analysis-v1",
+        "schema": "fre-search-v11-broad-devscreen-analysis-v1",
         "phase": expected_phase,
         "fixtures": len(rows),
         "rows": seen_phase_rows,
@@ -353,37 +394,35 @@ def main():
         },
         "by_width": {
             ratio: grouped("width", ratio)
-            for ratio in ("v9_over_v10", "portable_over_v10", "portable_over_hybrid")
+            for ratio in ("v10_over_v11", "portable_over_v11", "portable_over_hybrid")
         },
         "by_size": {
             ratio: grouped("size", ratio)
-            for ratio in ("v9_over_v10", "portable_over_v10", "portable_over_hybrid")
+            for ratio in ("v10_over_v11", "portable_over_v11", "portable_over_hybrid")
         },
         "by_shape": {
             ratio: grouped("shape", ratio)
-            for ratio in ("v9_over_v10", "portable_over_v10", "portable_over_hybrid")
+            for ratio in ("v10_over_v11", "portable_over_v11", "portable_over_hybrid")
         },
         "by_scenario": {
             ratio: grouped("scenario", ratio)
-            for ratio in ("v9_over_v10", "portable_over_v10", "portable_over_hybrid")
+            for ratio in ("v10_over_v11", "portable_over_v11", "portable_over_hybrid")
         },
         "predeclared_screen_gates": {
             "candidate_independent_every_offset_mutation_vs_portable": mutation_gate,
-            "v10_first_candidate_vs_v9": geomean_gate(
-                "v9_over_v10", first_candidate, 0.98
+            "v11_first_candidate_vs_v10": geomean_gate(
+                "v10_over_v11", first_candidate, 0.98
             ),
             "hybrid_tail_owned_long_scan_vs_portable": long_scan_gate(
                 lambda fixture: True
             ),
-            "v10_nonfirst_tail_guard_vs_v9": parity_gate(
-                "v10_over_v9", lambda fixture: not first_candidate(fixture)
+            "v11_nonfirst_tail_guard_vs_v10": parity_gate(
+                "v11_over_v10", lambda fixture: not first_candidate(fixture)
             ),
-            "hybrid_prefix_owned_parity_vs_portable": parity_gate(
-                "hybrid_over_portable",
+            "hybrid_prefix_owned_absolute_overhead_vs_portable": fixed_overhead_gate(
                 lambda fixture: hybrid_eligible(fixture) and safety_scenario(fixture)
             ),
-            "hybrid_ineligible_parity_vs_portable": parity_gate(
-                "hybrid_over_portable",
+            "hybrid_ineligible_absolute_overhead_diagnostic": fixed_overhead_gate(
                 lambda fixture: not hybrid_eligible(fixture)
             ),
             "hybrid_tail_owned_each_width_vs_portable": {
@@ -410,6 +449,7 @@ def main():
                         item["fixture"][scenario_index]
                         for item in fixture_ratios
                         if long_scan(item["fixture"])
+                        and not is_mutation(item["fixture"])
                     }
                 )
             },

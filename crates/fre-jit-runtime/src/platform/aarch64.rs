@@ -370,6 +370,7 @@ impl Mapping for ExecutableMapping {
                     | BackendVersion::SEARCH_V8
                     | BackendVersion::SEARCH_V9
                     | BackendVersion::SEARCH_V10
+                    | BackendVersion::SEARCH_V11
                     | BackendVersion::SEARCH_SVE16_V1
                     | BackendVersion::SEARCH_SVE2_16_V1
                     | BackendVersion::SEARCH_SVE16_V6

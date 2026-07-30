@@ -33,7 +33,7 @@ const WIDTHS: [usize; 32] = [
 const SCREEN_SIZES: [usize; 7] = [257, 1_021, 4_093, 16_381, 65_521, 262_139, 1_048_573];
 const SCREEN_ALIGNMENTS: [u8; 4] = [0, 1, 7, 15];
 const HEADER: &str = "schema,phase,seed,width,shape,size,scenario,alignment,window_start,window_end,repetition,order,engine,iterations,total_ns,ns_per_iter,checksum,semantic";
-const SCHEMA: &str = "fre-search-v10-mutation-inventory-v1";
+const SCHEMA: &str = "fre-search-v11-broad-devscreen-v1";
 const CHECKSUM_SEED: u64 = 0x243f_6a88_85a3_08d3;
 const MAX_CALIBRATION_ITERATIONS: usize = 1 << 30;
 const HYBRID_MIN_LITERAL_BYTES: usize = 2;
@@ -204,18 +204,18 @@ impl Scenario {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Engine {
-    NativeV9,
     NativeV10,
-    HybridV10,
+    NativeV11,
+    HybridV11,
     Portable,
 }
 
 impl Engine {
     const fn name(self) -> &'static str {
         match self {
-            Self::NativeV9 => "native-v9-aot-code-tag22",
             Self::NativeV10 => "native-v10-aot-code-tag23",
-            Self::HybridV10 => "hybrid-portable256-v10-tag23-floor4093-width2",
+            Self::NativeV11 => "native-v11-aot-code-tag24",
+            Self::HybridV11 => "hybrid-portable256-v11-tag24-floor4093-width2",
             Self::Portable => "portable-memmem",
         }
     }
@@ -257,8 +257,8 @@ fn main() -> Result<(), DynError> {
         "SHARD must be less than nonzero SHARDS",
     )?;
     require(
-        (1..=1_000).contains(&target_ms),
-        "target milliseconds outside 1..=1000",
+        (3..=1_000).contains(&target_ms),
+        "target milliseconds outside 3..=1000",
     )?;
     let target_ns = u64::try_from(target_ms)?
         .checked_mul(1_000_000)
@@ -336,57 +336,57 @@ fn run_case(
     let portable = LiteralPlan::new(literal, LiteralBuildLimits::default())?;
     let program =
         build_exact_literal::<Span>(literal, AnchorFlags::default(), ValidateLimits::default())?;
-    let image_v9 = emit_audited_with_backend(
-        &program,
-        SearchBackendPolicy::AsimdV9,
-        EmitLimits::default(),
-    )?;
     let image_v10 = emit_audited_with_backend(
         &program,
         SearchBackendPolicy::AsimdV10,
         EmitLimits::default(),
     )?;
-    let primary_offset = first_candidate_primary_offset(image_v10.as_image().code())?;
+    let image_v11 = emit_audited_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV11,
+        EmitLimits::default(),
+    )?;
+    let primary_offset = first_candidate_primary_offset(image_v11.as_image().code())?;
     let fixture = make_fixture(seed, size, scenario, literal, primary_offset)?;
     let bytes = fixture.bytes();
     let portable_window = PortableWindow::new(fixture.window_start, fixture.window_end);
     let native_window = NativeWindow::new(fixture.window_start, fixture.window_end);
-    let kernel_v9 = publish_audited::<Span>(&image_v9, PublicationLimits::default())?;
     let kernel_v10 = publish_audited::<Span>(&image_v10, PublicationLimits::default())?;
-    let session_v9 = kernel_v9.begin_current_thread_session()?;
+    let kernel_v11 = publish_audited::<Span>(&image_v11, PublicationLimits::default())?;
     let session_v10 = kernel_v10.begin_current_thread_session()?;
+    let session_v11 = kernel_v11.begin_current_thread_session()?;
 
     let expected = encode_portable(
         portable
             .find_window(bytes, portable_window, LiteralSearchLimits::unlimited())?
             .0,
     );
-    let actual_v9 = invoke_native(&session_v9, bytes, native_window, literal.len())?;
     let actual_v10 = invoke_native(&session_v10, bytes, native_window, literal.len())?;
+    let actual_v11 = invoke_native(&session_v11, bytes, native_window, literal.len())?;
     let actual_hybrid =
-        invoke_hybrid(&portable, &session_v10, bytes, native_window, literal.len())?;
+        invoke_hybrid(&portable, &session_v11, bytes, native_window, literal.len())?;
     require(
-        expected == actual_v9 && expected == actual_v10 && expected == actual_hybrid,
-        "native V9/V10/hybrid/portable semantic mismatch before timing",
+        expected == actual_v10 && expected == actual_v11 && expected == actual_hybrid,
+        "native V10/V11/hybrid/portable semantic mismatch before timing",
     )?;
 
     for _ in 0..3 {
         black_box(invoke_portable(&portable, bytes, portable_window)?);
         black_box(invoke_native(
-            &session_v9,
+            &session_v10,
             bytes,
             native_window,
             literal.len(),
         )?);
         black_box(invoke_native(
-            &session_v10,
+            &session_v11,
             bytes,
             native_window,
             literal.len(),
         )?);
         black_box(invoke_hybrid(
             &portable,
-            &session_v10,
+            &session_v11,
             bytes,
             native_window,
             literal.len(),
@@ -394,8 +394,8 @@ fn run_case(
     }
     let iterations = calibrate(
         &portable,
-        &session_v9,
         &session_v10,
+        &session_v11,
         bytes,
         portable_window,
         native_window,
@@ -407,28 +407,28 @@ fn run_case(
     for repetition in 0..phase.repetitions() {
         let order = match repetition % 4 {
             0 => [
-                Engine::NativeV9,
                 Engine::NativeV10,
-                Engine::HybridV10,
+                Engine::NativeV11,
+                Engine::HybridV11,
                 Engine::Portable,
             ],
             1 => [
-                Engine::NativeV10,
-                Engine::HybridV10,
+                Engine::NativeV11,
+                Engine::HybridV11,
                 Engine::Portable,
-                Engine::NativeV9,
+                Engine::NativeV10,
             ],
             2 => [
-                Engine::HybridV10,
+                Engine::HybridV11,
                 Engine::Portable,
-                Engine::NativeV9,
                 Engine::NativeV10,
+                Engine::NativeV11,
             ],
             _ => [
                 Engine::Portable,
-                Engine::NativeV9,
                 Engine::NativeV10,
-                Engine::HybridV10,
+                Engine::NativeV11,
+                Engine::HybridV11,
             ],
         };
         let order_name = format!(
@@ -440,14 +440,14 @@ fn run_case(
         );
         for engine in order {
             let measurement = match engine {
-                Engine::NativeV9 => measure(iterations, expected, || {
-                    invoke_native(&session_v9, bytes, native_window, literal.len())
-                })?,
                 Engine::NativeV10 => measure(iterations, expected, || {
                     invoke_native(&session_v10, bytes, native_window, literal.len())
                 })?,
-                Engine::HybridV10 => measure(iterations, expected, || {
-                    invoke_hybrid(&portable, &session_v10, bytes, native_window, literal.len())
+                Engine::NativeV11 => measure(iterations, expected, || {
+                    invoke_native(&session_v11, bytes, native_window, literal.len())
+                })?,
+                Engine::HybridV11 => measure(iterations, expected, || {
+                    invoke_hybrid(&portable, &session_v11, bytes, native_window, literal.len())
                 })?,
                 Engine::Portable => measure(iterations, expected, || {
                     invoke_portable(&portable, bytes, portable_window)
@@ -490,8 +490,8 @@ fn first_candidate_primary_offset(code: &[u8]) -> Result<usize, DynError> {
 #[allow(clippy::too_many_arguments)]
 fn calibrate(
     portable: &LiteralPlan,
-    session_v9: &PublishedKernelThreadSession<'_, Span>,
     session_v10: &PublishedKernelThreadSession<'_, Span>,
+    session_v11: &PublishedKernelThreadSession<'_, Span>,
     haystack: &[u8],
     portable_window: PortableWindow,
     native_window: NativeWindow,
@@ -501,16 +501,16 @@ fn calibrate(
 ) -> Result<usize, DynError> {
     let mut iterations = 1_usize;
     loop {
-        let native_v9 = measure(iterations, expected, || {
-            invoke_native(session_v9, haystack, native_window, literal_bytes)
-        })?;
         let native_v10 = measure(iterations, expected, || {
             invoke_native(session_v10, haystack, native_window, literal_bytes)
         })?;
-        let hybrid_v10 = measure(iterations, expected, || {
+        let native_v11 = measure(iterations, expected, || {
+            invoke_native(session_v11, haystack, native_window, literal_bytes)
+        })?;
+        let hybrid_v11 = measure(iterations, expected, || {
             invoke_hybrid(
                 portable,
-                session_v10,
+                session_v11,
                 haystack,
                 native_window,
                 literal_bytes,
@@ -519,10 +519,10 @@ fn calibrate(
         let portable_measurement = measure(iterations, expected, || {
             invoke_portable(portable, haystack, portable_window)
         })?;
-        let faster_ns = native_v9
+        let faster_ns = native_v10
             .total_ns
-            .min(native_v10.total_ns)
-            .min(hybrid_v10.total_ns)
+            .min(native_v11.total_ns)
+            .min(hybrid_v11.total_ns)
             .min(portable_measurement.total_ns)
             .max(1);
         if faster_ns >= target_ns / 4 || iterations == MAX_CALIBRATION_ITERATIONS {

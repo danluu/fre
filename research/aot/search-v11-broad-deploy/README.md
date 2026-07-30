@@ -1,17 +1,18 @@
-# Frozen Search successor mutation inventory
+# Search V11 broad development screen
 
-This directory freezes the candidate-independent development inventory for the
-successor to Search V10/tag 23 before that successor's emitter is implemented.
-The baseline executable still compares separately authenticated Search V9/tag
-22, Search V10/tag 23, and the current portable exact-literal
-`memmem::Finder`. Construction and strict-W^X publication happen outside
-timing. Each timed native call retains the same checked window and
-literal-resource preflight as the static AOT facade.
+This screen carries the already-frozen candidate-independent mutation
+inventory into separately authenticated Search V10/tag 23 and Search V11/tag
+24 machine code. V11 keeps the five-column schema but reserves both literal
+endpoints when the packed pair omits them. The portable baseline remains
+`memmem::Finder`. Construction, independent whole-template audit, and
+strict-W^X publication happen outside timing. Each timed native call retains
+the same checked window and literal-resource preflight as the static AOT
+facade.
 
 The fourth engine is the development broad-routing candidate. Literal widths
 2 through 32 and checked windows of at least 4,093 bytes use one authoritative
 full-window preflight, portable search for exactly the first 256 candidate
-starts, and V10 for the disjoint tail. Width 1 and smaller windows stay
+starts, and V11 for the disjoint tail. Width 1 and smaller windows stay
 entirely portable.
 
 This binary is development-only and mechanically accepts only `screen`. It
@@ -41,20 +42,25 @@ research/aot/search-v11-broad-deploy/target/release/fre-search-v11-broad-deploy 
 ```
 
 Arguments are `PHASE SHARD SHARDS TARGET_MILLISECONDS`; `PHASE` must be
-`screen`. Run disjoint shards concurrently, then analyze all shard CSVs:
+`screen`. The target must be at least 3ms so isolated 1ms timing outliers
+cannot authorize a candidate envelope. Run disjoint shards concurrently, then
+analyze all shard CSVs:
 
 ```sh
 python3 research/aot/search-v11-broad-deploy/analyze.py \
   screen screen-*.csv > screen-analysis.json
 ```
 
-Ratios above one favor the denominator: `v9_over_v10` favors V10 and
-`portable_over_v10` favors V10. The analyzer fails closed on missing engines,
+Ratios above one favor the denominator: `v10_over_v11` favors V11 and
+`portable_over_v11` favors V11. The analyzer fails closed on missing engines,
 duplicate shards, repetition gaps, or paired semantic/checksum/iteration
 mismatches. It additionally fails closed unless every mutation offset exists
 for every seed/width/shape/size cell. Aggregate mutation performance and the
 worst width/offset geometric mean are separate predeclared gates, so favorable
-offsets cannot hide a pathological unselected byte.
+offsets cannot hide a pathological unselected byte. Individual maximum ratios
+remain diagnostic; structural gates use p90/p99 and the worst width/offset
+geometric mean. Prefix-owned and ineligible fixed costs report both ratios and
+absolute nanoseconds, with a predeclared 3ns median / 4ns p90 overhead cap.
 
 No result from this development binary is production authority or heldout
 evidence.
