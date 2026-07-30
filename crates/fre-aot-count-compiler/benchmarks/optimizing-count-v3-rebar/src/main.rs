@@ -34,6 +34,11 @@ compile_error!("exactly one optimizing Count-v3 ISA cfg must be selected");
 #[cfg(not(any(fre_count_v3_neon, fre_count_v3_sve, fre_count_v3_sve2)))]
 compile_error!("the optimizing Count-v3 build script did not select an ISA cfg");
 
+#[cfg(all(
+    feature = "qualification-private",
+    any(fre_count_v3_sve, fre_count_v3_sve2)
+))]
+use std::num::NonZeroU64;
 use std::{
     env,
     error::Error,
@@ -45,11 +50,6 @@ use std::{
     path::{Path, PathBuf},
     time::Instant,
 };
-#[cfg(all(
-    feature = "qualification-private",
-    any(fre_count_v3_sve, fre_count_v3_sve2)
-))]
-use std::num::NonZeroU64;
 
 #[cfg(all(feature = "qualification-private", fre_count_v3_neon))]
 use fre::AggregateCountExactLiteralAotQualificationV3;
