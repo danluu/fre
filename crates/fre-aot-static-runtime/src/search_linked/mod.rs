@@ -40,8 +40,18 @@ use crate::{
     },
 };
 
-pub const HARD_MAX_STATIC_SEARCH_SPAN_OBJECTS_V1: usize =
-    HARD_MAX_STATIC_SEARCH_SPAN_QUALIFICATION_ROWS_V1;
+/// Process-wide bound on independently verified linked Search objects.
+///
+/// This is deliberately independent of the exact-row qualification limit:
+/// one artifact-independent compiler-family qualification can authenticate
+/// many concrete literals. Keeping the old row-table bound here made broad
+/// families fail after only 256 successful adoptions even though every later
+/// object was independently authenticated.
+pub const HARD_MAX_STATIC_SEARCH_SPAN_OBJECTS_V1: usize = 4_096;
+
+const _: () = assert!(
+    HARD_MAX_STATIC_SEARCH_SPAN_OBJECTS_V1 > HARD_MAX_STATIC_SEARCH_SPAN_QUALIFICATION_ROWS_V1
+);
 
 pub const STATIC_SEARCH_SPAN_ADOPT_STATUS_OK_V1: u32 = 0;
 pub const STATIC_SEARCH_SPAN_ADOPT_STATUS_NO_QUALIFIED_ROW_V1: u32 = 1;
@@ -2122,6 +2132,16 @@ mod tests {
         assert_eq!((*first_value, *second_value, *retry), (101, 202, 101));
         assert!(ptr::eq(first_value, retry));
         assert!(!ptr::eq(first_value, second_value));
+    }
+
+    #[test]
+    fn broad_family_registry_capacity_is_independent_of_exact_row_capacity() {
+        assert_eq!(HARD_MAX_STATIC_SEARCH_SPAN_OBJECTS_V1, 4_096);
+        assert_eq!(HARD_MAX_STATIC_SEARCH_SPAN_QUALIFICATION_ROWS_V1, 256);
+        assert_ne!(
+            HARD_MAX_STATIC_SEARCH_SPAN_OBJECTS_V1,
+            HARD_MAX_STATIC_SEARCH_SPAN_QUALIFICATION_ROWS_V1
+        );
     }
 
     #[test]
