@@ -2750,16 +2750,62 @@ fn emit_multi_specialized_v3(
         assembler.bind(wide_batch)?;
         assembler.add_reg(X15, X0, X3)?;
         assembler.add_imm(X8, X15, u16::from(filter.offsets[0]))?;
+        // Two structure loads collect all 128 primary bytes directly into
+        // the retained masks. This is both denser than eight scalar Q loads
+        // and leaves v0-v3 available for the semantic endpoint pass below.
+        assembler.load_vectors4x128(SPARSE_BLOCK_MASK_BASE_V3, X8)?;
+        assembler.add_imm(X9, X8, SIMD_CANDIDATE_STARTS_V3 * 4)?;
+        assembler.load_vectors4x128(SPARSE_BLOCK_MASK_BASE_V3 + 4, X9)?;
         for block in 0..SPARSE_SCAN_BLOCKS_V3 {
-            let offset = block.checked_mul(SIMD_CANDIDATE_STARTS_V3).ok_or(
-                CountAotError::ArithmeticOverflow {
-                    site: CountAotArithmeticSite::CodeOffset,
-                },
-            )?;
             let mask = u8::try_from(u16::from(SPARSE_BLOCK_MASK_BASE_V3) + block)
                 .expect("eight wide primary masks");
-            assembler.load_vector128_offset(mask, X8, offset)?;
             assembler.compare_equal_bytes16(mask, mask, vector_registers[0])?;
+        }
+        assembler.or_bytes16(0, SPARSE_BLOCK_MASK_BASE_V3, SPARSE_BLOCK_MASK_BASE_V3 + 1)?;
+        assembler.or_bytes16(
+            1,
+            SPARSE_BLOCK_MASK_BASE_V3 + 2,
+            SPARSE_BLOCK_MASK_BASE_V3 + 3,
+        )?;
+        assembler.or_bytes16(0, 0, 1)?;
+        assembler.or_bytes16(
+            1,
+            SPARSE_BLOCK_MASK_BASE_V3 + 4,
+            SPARSE_BLOCK_MASK_BASE_V3 + 5,
+        )?;
+        assembler.or_bytes16(0, 0, 1)?;
+        assembler.or_bytes16(
+            1,
+            SPARSE_BLOCK_MASK_BASE_V3 + 6,
+            SPARSE_BLOCK_MASK_BASE_V3 + 7,
+        )?;
+        assembler.or_bytes16(1, 0, 1)?;
+        assembler.unsigned_max_across_bytes16(1, 1)?;
+        assembler.move_vector_byte_to32(X8, 1)?;
+        assembler.cmp_imm64(X8, 0)?;
+        assembler.branch_cond(ConditionV3::Equal, wide_batch_empty)?;
+
+        // A common primary can survive in every 16-start block even when the
+        // regex is absent. Refine the opposite semantic endpoint across the
+        // whole retained batch before entering any block-local control flow.
+        // This converts dense near-misses into one 128-start empty proof.
+        assembler.add_imm(X8, X15, u16::from(semantic_secondary_offset))?;
+        assembler.add_imm(X9, X8, SIMD_CANDIDATE_STARTS_V3 * 4)?;
+        for (mask_base, base) in [
+            (SPARSE_BLOCK_MASK_BASE_V3, X8),
+            (SPARSE_BLOCK_MASK_BASE_V3 + 4, X9),
+        ] {
+            assembler.load_vectors4x128(0, base)?;
+            for lane in 0_u8..4 {
+                assembler.compare_equal_bytes16(lane, lane, SEMANTIC_SECONDARY_VECTOR_V3)?;
+                assembler.and_bytes16(mask_base + lane, mask_base + lane, lane)?;
+            }
+        }
+        // LD1 {v0-v3} clobbers the first two filter splats. The scalar values
+        // remain hoisted, so restoring them costs only one DUP each on the
+        // primary-hit path.
+        for index in 0..usize::from(filter.len).min(2) {
+            assembler.dup_byte16(vector_registers[index], value_registers[index])?;
         }
         assembler.or_bytes16(0, SPARSE_BLOCK_MASK_BASE_V3, SPARSE_BLOCK_MASK_BASE_V3 + 1)?;
         assembler.or_bytes16(
@@ -2801,14 +2847,6 @@ fn emit_multi_specialized_v3(
             assembler.branch_cond(ConditionV3::Equal, wide_advance)?;
 
             assembler.add_reg(X15, X0, X3)?;
-            assembler.add_imm(X8, X15, u16::from(semantic_secondary_offset))?;
-            assembler.load_vector128(0, X8)?;
-            assembler.compare_equal_bytes16(0, 0, SEMANTIC_SECONDARY_VECTOR_V3)?;
-            assembler.and_bytes16(mask, mask, 0)?;
-            assembler.unsigned_max_across_bytes16(1, mask)?;
-            assembler.move_vector_byte_to32(X8, 1)?;
-            assembler.cmp_imm64(X8, 0)?;
-            assembler.branch_cond(ConditionV3::Equal, wide_advance)?;
             for index in 1..usize::from(filter.len) {
                 if filter.offsets[index] == semantic_secondary_offset {
                     continue;
