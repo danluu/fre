@@ -97,11 +97,12 @@ pub use search::{
     AOT_SEARCH_COMPILE_RECEIPT_SCHEMA_VERSION_V1, AOT_SEARCH_COMPILER_VERSION_V1,
     AOT_SEARCH_MANIFEST_SCHEMA_VERSION_V1, MAX_AOT_SEARCH_LITERAL_BYTES_V1,
     MAX_AOT_SEARCH_SOURCE_BYTES_V1, MIN_AOT_SEARCH_LITERAL_BYTES_V1,
-    MacosAarch64ExactSearchManifestV1, SEARCH_COMPILE_RECEIPT_CANONICAL_BYTES_V1,
-    SearchAotRuntimeAuthorityV1, SearchCompileAccountingV1, SearchCompileErrorV1,
-    SearchCompilePolicyV1, SearchCompileReceiptIdentityV1, SearchCompileReceiptV1,
-    SearchCompiledObjectV1, SearchLiteralIdentityV1, SearchManifestErrorV1,
-    SearchManifestIdentityV1, SearchReceiptMismatchV1, SearchReceiptValidationErrorV1,
+    MacosAarch64ExactSearchManifestV1, MacosAarch64SearchBackendV1,
+    SEARCH_COMPILE_RECEIPT_CANONICAL_BYTES_V1, SearchAotRuntimeAuthorityV1,
+    SearchCompileAccountingV1, SearchCompileErrorV1, SearchCompilePolicyV1,
+    SearchCompileReceiptIdentityV1, SearchCompileReceiptV1, SearchCompiledObjectV1,
+    SearchLiteralIdentityV1, SearchManifestErrorV1, SearchManifestIdentityV1,
+    SearchReceiptMismatchV1, SearchReceiptValidationErrorV1,
     plan_and_compile_macos_aarch64_exact_search_v1,
 };
 pub use search_glue::{

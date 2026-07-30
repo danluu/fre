@@ -11,15 +11,18 @@ use std::{
 };
 
 use fre_aot_search_contract::{
-    ClaimedSearchMetadataV1, SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1, SEARCH_BACKEND_VERSION_V1,
-    SEARCH_METADATA_BYTES_V1, SEARCH_PLATFORM_LINUX_V1, SEARCH_PLATFORM_MACOS_V1,
-    STATIC_SEARCH_SPAN_EXPECTATION_BYTES_V1, inspect_search_metadata_v1,
+    ClaimedSearchMetadataV1, SEARCH_BACKEND_ASIMD_TAG22_V1, SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1,
+    SEARCH_BACKEND_VERSION_V1, SEARCH_METADATA_BYTES_V1, SEARCH_PLATFORM_LINUX_V1,
+    SEARCH_PLATFORM_MACOS_V1, STATIC_SEARCH_SPAN_EXPECTATION_BYTES_V1, inspect_search_metadata_v1,
 };
 use fre_jit_aarch64::{EmitLimits, SearchBackendPolicy, TargetSpec, emit_audited_with_backend};
 use fre_kernel_ir::{
     AnchorFlags, MatchSpan, SearchWindow, Span, ValidateLimits, build_exact_literal,
 };
-use fre_kernels::{LiteralAccounting, LiteralSearchLimits, Window, preflight_literal_window};
+use fre_kernels::{
+    LiteralAccounting, LiteralSearchLimits, LiteralSearchPreflight, Window,
+    preflight_literal_window,
+};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -631,11 +634,49 @@ pub(super) struct CopiedSearchSpanExpectationV1 {
 }
 
 /// Process-lifetime proof of one source-qualified linked Search-v1 Span tuple.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StaticSearchSpanFamilyExecutionPolicyV1 {
+    minimum_window_bytes: u32,
+    portable_prefix_candidate_starts: u32,
+    plan_identity: [u8; 32],
+    analyzer_identity: [u8; 32],
+    evidence_identity: [u8; 32],
+}
+
+impl StaticSearchSpanFamilyExecutionPolicyV1 {
+    #[must_use]
+    pub const fn minimum_window_bytes(self) -> u32 {
+        self.minimum_window_bytes
+    }
+
+    #[must_use]
+    pub const fn portable_prefix_candidate_starts(self) -> u32 {
+        self.portable_prefix_candidate_starts
+    }
+
+    #[must_use]
+    pub const fn plan_identity(self) -> [u8; 32] {
+        self.plan_identity
+    }
+
+    #[must_use]
+    pub const fn analyzer_identity(self) -> [u8; 32] {
+        self.analyzer_identity
+    }
+
+    #[must_use]
+    pub const fn evidence_identity(self) -> [u8; 32] {
+        self.evidence_identity
+    }
+}
+
+/// Process-lifetime proof of one source-qualified linked Search-v1 Span tuple.
 #[derive(Debug)]
 pub struct VerifiedStaticSearchSpanV1 {
     expected: ExpectedStaticSearchSpanV1,
     entry: SearchSpanEntryV1,
     row_selector: u16,
+    family_execution_policy: Option<StaticSearchSpanFamilyExecutionPolicyV1>,
     accounting: StaticSearchSpanInspectionAccountingV1,
 }
 
@@ -745,6 +786,31 @@ impl VerifiedStaticSearchSpanV1 {
         )
     }
 
+    /// Consume an already-authoritative literal preflight without repeating
+    /// window or resource admission.
+    ///
+    /// The token's exact literal is authenticated against this linked image
+    /// before its checked haystack/window can reach native code. Tag21 still
+    /// requires a same-thread session.
+    #[doc(hidden)]
+    #[inline]
+    pub fn search_preflighted(
+        &self,
+        preflight: LiteralSearchPreflight<'_, '_>,
+    ) -> Result<(Option<MatchSpan>, LiteralAccounting), StaticSearchSpanCallErrorV1> {
+        if self.requires_thread_session() {
+            return Err(StaticSearchSpanCallErrorV1::ThreadSessionRequired {
+                backend_version: self.backend_version(),
+            });
+        }
+        invoke_static_search_span_preflighted_v1(
+            self.expected.live_literal_bytes(),
+            preflight,
+            |literal| self.authenticates_literal(literal),
+            self.entry,
+        )
+    }
+
     /// Search the complete haystack.
     #[inline]
     pub fn find(
@@ -784,6 +850,15 @@ impl VerifiedStaticSearchSpanV1 {
     #[must_use]
     pub const fn row_selector(&self) -> u16 {
         self.row_selector
+    }
+
+    /// Source-qualified workload policy for a broad compiler-family handle.
+    ///
+    /// Exact legacy rows return `None` and therefore cannot be selected by
+    /// the broad hybrid facade.
+    #[must_use]
+    pub const fn family_execution_policy(&self) -> Option<StaticSearchSpanFamilyExecutionPolicyV1> {
+        self.family_execution_policy
     }
 
     #[must_use]
@@ -886,6 +961,22 @@ impl StaticSearchSpanThreadSessionV1<'_> {
         limits: LiteralSearchLimits,
     ) -> Result<(Option<MatchSpan>, LiteralAccounting), StaticSearchSpanCallErrorV1> {
         self.search(haystack, SearchWindow::new(0, haystack.len()), limits)
+    }
+
+    /// Consume one already-authoritative literal preflight without a second
+    /// preflight or a per-call vector-length syscall.
+    #[doc(hidden)]
+    #[inline]
+    pub fn search_preflighted(
+        &self,
+        preflight: LiteralSearchPreflight<'_, '_>,
+    ) -> Result<(Option<MatchSpan>, LiteralAccounting), StaticSearchSpanCallErrorV1> {
+        invoke_static_search_span_preflighted_v1(
+            self.live_literal_bytes,
+            preflight,
+            |literal| self.handle.authenticates_literal(literal),
+            self.entry,
+        )
     }
 
     #[must_use]
@@ -999,6 +1090,37 @@ fn checked_static_search_span_v1(
         limits,
     )?;
     let output = decode_search_call_v1::<Span>(invoke(), window, literal_len)?;
+    Ok((output, accounting))
+}
+
+#[inline]
+fn invoke_static_search_span_preflighted_v1(
+    live_literal_bytes: u32,
+    preflight: LiteralSearchPreflight<'_, '_>,
+    authenticates_literal: impl FnOnce(&[u8]) -> bool,
+    entry: SearchSpanEntryV1,
+) -> Result<(Option<MatchSpan>, LiteralAccounting), StaticSearchSpanCallErrorV1> {
+    let actual_bytes = preflight.literal_bytes();
+    let expected_bytes = usize::try_from(live_literal_bytes).map_err(|_| {
+        StaticSearchSpanCallErrorV1::LiteralWidthNotRepresentable {
+            bytes: live_literal_bytes,
+        }
+    })?;
+    if actual_bytes != expected_bytes || !authenticates_literal(preflight.literal()) {
+        return Err(StaticSearchSpanCallErrorV1::PreflightLiteralMismatch {
+            expected_bytes: live_literal_bytes,
+            actual_bytes,
+        });
+    }
+    let accounting = preflight.accounting();
+    let checked_window = preflight.checked_window();
+    let haystack = checked_window.haystack();
+    let window = checked_window.window();
+    let output = decode_search_call_v1::<Span>(
+        implementation::invoke_search_span(entry, haystack, window),
+        window,
+        expected_bytes,
+    )?;
     Ok((output, accounting))
 }
 
@@ -1230,6 +1352,7 @@ unsafe fn adopt_source_qualified_static_search_span_v1(
             expected,
             entry,
             row_selector: row.selector(),
+            family_execution_policy: None,
             accounting,
         })
     })
@@ -1266,6 +1389,13 @@ unsafe fn adopt_source_qualified_static_search_span_family_v1(
             expected,
             entry,
             row_selector: family.selector(),
+            family_execution_policy: Some(StaticSearchSpanFamilyExecutionPolicyV1 {
+                minimum_window_bytes: family.minimum_window_bytes(),
+                portable_prefix_candidate_starts: family.portable_prefix_candidate_starts(),
+                plan_identity: *family.plan_identity(),
+                analyzer_identity: *family.analyzer_identity(),
+                evidence_identity: *family.evidence_identity(),
+            }),
             accounting,
         })
     })
@@ -1335,6 +1465,7 @@ pub(super) fn require_semantic_payload_reconstruction_v1(
     }
     let policy = match metadata.backend_version() {
         SEARCH_BACKEND_VERSION_V1 => SearchBackendPolicy::AsimdV8,
+        SEARCH_BACKEND_ASIMD_TAG22_V1 => SearchBackendPolicy::AsimdV9,
         SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1 => SearchBackendPolicy::Sve2Fixed16V2,
         _ => return Err(StaticSearchSpanVerifyErrorV1::SemanticPayloadReconstruction),
     };
@@ -1464,7 +1595,8 @@ mod tests {
 
     use fre::RustProfile;
     use fre_aot_compiler::{
-        LinuxAarch64ExactSearchManifestV1, MacosAarch64ExactSearchManifestV1,
+        LinuxAarch64ExactSearchManifestV1, LinuxAarch64SearchCompilePolicyV1,
+        MacosAarch64ExactSearchManifestV1, SearchCompilePolicyV1,
         build_linux_static_search_span_expectation_v1, build_static_search_span_expectation_v1,
         plan_and_compile_linux_aarch64_exact_search_v1,
         plan_and_compile_macos_aarch64_exact_search_v1,
@@ -1660,12 +1792,13 @@ mod tests {
     fn macos_family_compiler_fixture(literal: &[u8]) -> FamilyCompilerFixture {
         let mut profile = RustProfile::default();
         profile.options.unicode = false;
-        let compiled = plan_and_compile_macos_aarch64_exact_search_v1(
-            MacosAarch64ExactSearchManifestV1::<Span>::default(),
-            literal.to_vec(),
-            profile,
+        let manifest = MacosAarch64ExactSearchManifestV1::<Span>::v9_candidate(
+            SearchCompilePolicyV1::default(),
         )
-        .expect("macOS family compiler fixture");
+        .expect("macOS V9 manifest");
+        let compiled =
+            plan_and_compile_macos_aarch64_exact_search_v1(manifest, literal.to_vec(), profile)
+                .expect("macOS family compiler fixture");
         let expectation =
             build_static_search_span_expectation_v1(&compiled).expect("macOS expectation");
         let inspection = fre_aot_macho::inspect_object(
@@ -1693,12 +1826,13 @@ mod tests {
     fn linux_family_compiler_fixture(literal: &[u8]) -> FamilyCompilerFixture {
         let mut profile = RustProfile::default();
         profile.options.unicode = false;
-        let compiled = plan_and_compile_linux_aarch64_exact_search_v1(
-            LinuxAarch64ExactSearchManifestV1::<Span>::default(),
-            literal.to_vec(),
-            profile,
+        let manifest = LinuxAarch64ExactSearchManifestV1::<Span>::v9_candidate(
+            LinuxAarch64SearchCompilePolicyV1::default(),
         )
-        .expect("Linux family compiler fixture");
+        .expect("Linux V9 manifest");
+        let compiled =
+            plan_and_compile_linux_aarch64_exact_search_v1(manifest, literal.to_vec(), profile)
+                .expect("Linux family compiler fixture");
         let expectation =
             build_linux_static_search_span_expectation_v1(&compiled).expect("Linux expectation");
         let inspection = compiled
@@ -1787,6 +1921,15 @@ mod tests {
                 expected: fixture.expected,
                 entry: dummy_entry,
                 row_selector: fixture.family.selector(),
+                family_execution_policy: Some(StaticSearchSpanFamilyExecutionPolicyV1 {
+                    minimum_window_bytes: fixture.family.minimum_window_bytes(),
+                    portable_prefix_candidate_starts: fixture
+                        .family
+                        .portable_prefix_candidate_starts(),
+                    plan_identity: *fixture.family.plan_identity(),
+                    analyzer_identity: *fixture.family.analyzer_identity(),
+                    evidence_identity: *fixture.family.evidence_identity(),
+                }),
                 accounting: StaticSearchSpanInspectionAccountingV1::checked(
                     fixture.payload.len(),
                     3,
@@ -2257,6 +2400,7 @@ mod tests {
             expected,
             entry: dummy_entry,
             row_selector: fixture.row.selector(),
+            family_execution_policy: None,
             accounting: StaticSearchSpanInspectionAccountingV1::checked(256, 0)
                 .expect("bounded test accounting"),
         };
@@ -2294,6 +2438,7 @@ mod tests {
             expected,
             entry: session_test_entry,
             row_selector: fixture.row.selector(),
+            family_execution_policy: None,
             accounting: StaticSearchSpanInspectionAccountingV1::checked(256, 0)
                 .expect("bounded test accounting"),
         };
@@ -2344,5 +2489,75 @@ mod tests {
                 calls_before
             );
         }
+    }
+
+    #[cfg(all(
+        feature = "linked-search-span-v1",
+        target_arch = "aarch64",
+        target_pointer_width = "64",
+        target_endian = "little",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    fn preflighted_family_tail_retains_full_accounting_and_authenticates_literal() {
+        let fixture = macos_family_compiler_fixture(b"0123456789abcdef");
+        let handle = VerifiedStaticSearchSpanV1 {
+            expected: fixture.expected,
+            entry: session_test_entry,
+            row_selector: fixture.family.selector(),
+            family_execution_policy: Some(StaticSearchSpanFamilyExecutionPolicyV1 {
+                minimum_window_bytes: fixture.family.minimum_window_bytes(),
+                portable_prefix_candidate_starts: fixture.family.portable_prefix_candidate_starts(),
+                plan_identity: *fixture.family.plan_identity(),
+                analyzer_identity: *fixture.family.analyzer_identity(),
+                evidence_identity: *fixture.family.evidence_identity(),
+            }),
+            accounting: StaticSearchSpanInspectionAccountingV1::checked(fixture.payload.len(), 3)
+                .expect("test inspection accounting"),
+        };
+        let plan = fre_kernels::LiteralPlan::new(
+            &fixture.literal,
+            fre_kernels::LiteralBuildLimits::default(),
+        )
+        .expect("exact portable owner");
+        let haystack = [b'x'; 24];
+        let checked = fre_kernel_ir::CheckedSearchWindow::new(
+            &haystack,
+            SearchWindow::new(0, haystack.len()),
+        )
+        .expect("checked full window");
+        let full = plan
+            .preflight_checked_window(checked, LiteralSearchLimits::unlimited())
+            .expect("authoritative full preflight");
+        let tail = full
+            .after_prefix_candidate_starts(2)
+            .expect("tail split")
+            .expect("tail remains");
+
+        SESSION_TEST_ENTRY_CALLS.store(0, Ordering::SeqCst);
+        let (matched, accounting) = handle
+            .search_preflighted(tail)
+            .expect("authenticated preflighted tail");
+        assert_eq!(matched, Some(MatchSpan::new(2, 18)));
+        assert_eq!(accounting, full.accounting());
+        assert_eq!(accounting.searched_bytes, haystack.len());
+        assert_eq!(SESSION_TEST_ENTRY_CALLS.load(Ordering::SeqCst), 1);
+
+        let wrong_plan = fre_kernels::LiteralPlan::new(
+            b"fedcba9876543210",
+            fre_kernels::LiteralBuildLimits::default(),
+        )
+        .expect("same-width wrong portable owner");
+        let wrong = wrong_plan
+            .preflight_checked_window(checked, LiteralSearchLimits::unlimited())
+            .expect("internally valid wrong preflight");
+        assert_eq!(
+            handle.search_preflighted(wrong),
+            Err(StaticSearchSpanCallErrorV1::PreflightLiteralMismatch {
+                expected_bytes: 16,
+                actual_bytes: 16,
+            })
+        );
+        assert_eq!(SESSION_TEST_ENTRY_CALLS.load(Ordering::SeqCst), 1);
     }
 }

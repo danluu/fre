@@ -1,8 +1,8 @@
 use fre_aot_search_contract::{
     AOT_SEARCH_COMPILER_VERSION_V1, ClaimedStaticSearchSpanExpectationV1,
     MAX_STATIC_SEARCH_SPAN_LITERAL_BYTES_V1, MIN_STATIC_SEARCH_SPAN_LITERAL_BYTES_V1,
-    SEARCH_ARCHITECTURE_AARCH64_V1, SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1,
-    SEARCH_BACKEND_VERSION_V1, SEARCH_CALL_ABI_SCHEMA_V1,
+    SEARCH_ARCHITECTURE_AARCH64_V1, SEARCH_BACKEND_ASIMD_TAG22_V1,
+    SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1, SEARCH_BACKEND_VERSION_V1, SEARCH_CALL_ABI_SCHEMA_V1,
     SEARCH_EXPORTED_SYMBOL_INFO_ELF_FUNCTION_V1, SEARCH_EXPORTED_SYMBOL_N_TYPE_V1,
     SEARCH_EXPORTED_SYMBOL_SCHEMA_VERSION_V1, SEARCH_METADATA_VERSION_V1, SEARCH_PLATFORM_LINUX_V1,
     SEARCH_PLATFORM_MACOS_V1, SEARCH_POINTER_WIDTH_V1, SEARCH_REQUIRED_ASIMD_FEATURES_V1,
@@ -60,6 +60,9 @@ source_qualified_identity_v1!(SourceQualifiedObjectIdentityV1);
 source_qualified_identity_v1!(SourceQualifiedReceiptIdentityV1);
 source_qualified_identity_v1!(SourceQualifiedExpectationIdentityV1);
 source_qualified_identity_v1!(SourceQualifiedPayloadIdentityV1);
+source_qualified_identity_v1!(SourceQualifiedPlanIdentityV1);
+source_qualified_identity_v1!(SourceQualifiedAnalyzerIdentityV1);
+source_qualified_identity_v1!(SourceQualifiedEvidenceIdentityV1);
 
 /// Artifact-independent production authority for one compiler/backend family.
 ///
@@ -87,7 +90,12 @@ pub(crate) struct SourceQualifiedStaticSearchSpanFamilyV1 {
     required_features: u64,
     minimum_literal_bytes: u32,
     maximum_literal_bytes: u32,
+    minimum_window_bytes: u32,
+    portable_prefix_candidate_starts: u32,
     manifest_identity: SourceQualifiedManifestIdentityV1,
+    plan_identity: SourceQualifiedPlanIdentityV1,
+    analyzer_identity: SourceQualifiedAnalyzerIdentityV1,
+    evidence_identity: SourceQualifiedEvidenceIdentityV1,
 }
 
 impl SourceQualifiedStaticSearchSpanFamilyV1 {
@@ -113,7 +121,12 @@ impl SourceQualifiedStaticSearchSpanFamilyV1 {
         required_features: u64,
         minimum_literal_bytes: u32,
         maximum_literal_bytes: u32,
+        minimum_window_bytes: u32,
+        portable_prefix_candidate_starts: u32,
         manifest_identity: [u8; 32],
+        plan_identity: [u8; 32],
+        analyzer_identity: [u8; 32],
+        evidence_identity: [u8; 32],
     ) -> Self {
         Self {
             selector,
@@ -133,7 +146,12 @@ impl SourceQualifiedStaticSearchSpanFamilyV1 {
             required_features,
             minimum_literal_bytes,
             maximum_literal_bytes,
+            minimum_window_bytes,
+            portable_prefix_candidate_starts,
             manifest_identity: SourceQualifiedManifestIdentityV1(manifest_identity),
+            plan_identity: SourceQualifiedPlanIdentityV1(plan_identity),
+            analyzer_identity: SourceQualifiedAnalyzerIdentityV1(analyzer_identity),
+            evidence_identity: SourceQualifiedEvidenceIdentityV1(evidence_identity),
         }
     }
 
@@ -161,7 +179,12 @@ impl SourceQualifiedStaticSearchSpanFamilyV1 {
             1,
             minimum_literal_bytes,
             maximum_literal_bytes,
+            4_093,
+            256,
             [0x5a; 32],
+            [0x6b; 32],
+            [0x7c; 32],
+            [0x8d; 32],
         )
     }
 
@@ -190,7 +213,12 @@ impl SourceQualifiedStaticSearchSpanFamilyV1 {
             claim.required_features(),
             minimum_literal_bytes,
             maximum_literal_bytes,
+            4_093,
+            256,
             *claim.manifest_identity(),
+            [0x6b; 32],
+            [0x7c; 32],
+            [0x8d; 32],
         )
     }
 
@@ -200,6 +228,26 @@ impl SourceQualifiedStaticSearchSpanFamilyV1 {
 
     pub(crate) const fn manifest_identity(&self) -> &[u8; 32] {
         self.manifest_identity.as_bytes()
+    }
+
+    pub(crate) const fn minimum_window_bytes(&self) -> u32 {
+        self.minimum_window_bytes
+    }
+
+    pub(crate) const fn portable_prefix_candidate_starts(&self) -> u32 {
+        self.portable_prefix_candidate_starts
+    }
+
+    pub(crate) const fn plan_identity(&self) -> &[u8; 32] {
+        self.plan_identity.as_bytes()
+    }
+
+    pub(crate) const fn analyzer_identity(&self) -> &[u8; 32] {
+        self.analyzer_identity.as_bytes()
+    }
+
+    pub(crate) const fn evidence_identity(&self) -> &[u8; 32] {
+        self.evidence_identity.as_bytes()
     }
 
     pub(crate) fn authenticates_claim(
@@ -439,6 +487,9 @@ const fn production_families_are_canonical(
         let row = &rows[index];
         if !production_family_profile_is_canonical(row)
             || identity_is_zero(&row.manifest_identity.0)
+            || identity_is_zero(&row.plan_identity.0)
+            || identity_is_zero(&row.analyzer_identity.0)
+            || identity_is_zero(&row.evidence_identity.0)
         {
             return false;
         }
@@ -454,6 +505,10 @@ const fn production_families_are_canonical(
                     row.minimum_literal_bytes,
                     row.maximum_literal_bytes,
                 )
+                && execution_envelopes_overlap(
+                    rows[earlier].minimum_window_bytes,
+                    row.minimum_window_bytes,
+                )
             {
                 return false;
             }
@@ -467,6 +522,15 @@ const fn production_families_are_canonical(
 const fn production_family_profile_is_canonical(
     family: &SourceQualifiedStaticSearchSpanFamilyV1,
 ) -> bool {
+    let Some(prefix_with_literal_bytes) = family
+        .portable_prefix_candidate_starts
+        .checked_add(family.maximum_literal_bytes)
+    else {
+        return false;
+    };
+    let Some(minimum_prefix_window_bytes) = prefix_with_literal_bytes.checked_sub(1) else {
+        return false;
+    };
     if family.compiler_version != AOT_SEARCH_COMPILER_VERSION_V1
         || family.metadata_version != SEARCH_METADATA_VERSION_V1
         || family.call_abi_schema != SEARCH_CALL_ABI_SCHEMA_V1
@@ -480,6 +544,9 @@ const fn production_family_profile_is_canonical(
         || family.minimum_literal_bytes < MIN_STATIC_SEARCH_SPAN_LITERAL_BYTES_V1
         || family.maximum_literal_bytes > MAX_STATIC_SEARCH_SPAN_LITERAL_BYTES_V1
         || family.minimum_literal_bytes > family.maximum_literal_bytes
+        || family.minimum_window_bytes == 0
+        || family.portable_prefix_candidate_starts == 0
+        || family.minimum_window_bytes < minimum_prefix_window_bytes
     {
         return false;
     }
@@ -498,6 +565,18 @@ const fn production_family_profile_is_canonical(
         | (
             SEARCH_PLATFORM_LINUX_V1,
             SEARCH_BACKEND_VERSION_V1,
+            SEARCH_REQUIRED_ASIMD_FEATURES_V1,
+            SEARCH_EXPORTED_SYMBOL_INFO_ELF_FUNCTION_V1,
+        )
+        | (
+            SEARCH_PLATFORM_MACOS_V1,
+            SEARCH_BACKEND_ASIMD_TAG22_V1,
+            SEARCH_REQUIRED_ASIMD_FEATURES_V1,
+            SEARCH_EXPORTED_SYMBOL_N_TYPE_V1,
+        )
+        | (
+            SEARCH_PLATFORM_LINUX_V1,
+            SEARCH_BACKEND_ASIMD_TAG22_V1,
             SEARCH_REQUIRED_ASIMD_FEATURES_V1,
             SEARCH_EXPORTED_SYMBOL_INFO_ELF_FUNCTION_V1,
         ) => true,
@@ -529,7 +608,14 @@ const fn same_production_family_profile(
         && left.status_bits == right.status_bits
         && left.exported_symbol_n_type == right.exported_symbol_n_type
         && left.required_features == right.required_features
-        && identities_equal(&left.manifest_identity.0, &right.manifest_identity.0)
+}
+
+/// A minimum-only deployment envelope extends to every larger input. Two
+/// source families with the same machine profile therefore remain ambiguous
+/// above the larger floor; changing the floor cannot make overlapping literal
+/// widths disjoint.
+const fn execution_envelopes_overlap(left_minimum: u32, right_minimum: u32) -> bool {
+    left_minimum != 0 && right_minimum != 0
 }
 
 const fn ranges_overlap(
@@ -545,17 +631,6 @@ const fn identity_is_zero(identity: &[u8; 32]) -> bool {
     let mut index = 0_usize;
     while index < identity.len() {
         if identity[index] != 0 {
-            return false;
-        }
-        index += 1;
-    }
-    true
-}
-
-const fn identities_equal(left: &[u8; 32], right: &[u8; 32]) -> bool {
-    let mut index = 0_usize;
-    while index < left.len() {
-        if left[index] != right[index] {
             return false;
         }
         index += 1;
@@ -775,6 +850,17 @@ mod tests {
             SourceQualifiedStaticSearchSpanFamilyV1::test_only(9, 8, 32),
         ];
         assert!(!production_families_are_canonical(&overlapping));
+        let mut overlapping_different_manifest = overlapping;
+        overlapping_different_manifest[1].manifest_identity =
+            SourceQualifiedManifestIdentityV1([0xa5; 32]);
+        assert!(!production_families_are_canonical(
+            &overlapping_different_manifest
+        ));
+        let mut overlapping_different_floor = overlapping;
+        overlapping_different_floor[1].minimum_window_bytes = 8_192;
+        assert!(!production_families_are_canonical(
+            &overlapping_different_floor
+        ));
 
         let mut wrong_backend = valid[0];
         wrong_backend.backend_version = 7;
@@ -785,6 +871,27 @@ mod tests {
         let mut wrong_features = valid[0];
         wrong_features.required_features = SEARCH_REQUIRED_SVE2_FIXED16_FEATURES_V1;
         assert!(!production_families_are_canonical(&[wrong_features]));
+        let mut v9 = valid[0];
+        v9.backend_version = SEARCH_BACKEND_ASIMD_TAG22_V1;
+        assert!(production_families_are_canonical(&[v9]));
+        let mut zero_floor = valid[0];
+        zero_floor.minimum_window_bytes = 0;
+        assert!(!production_families_are_canonical(&[zero_floor]));
+        let mut zero_prefix = valid[0];
+        zero_prefix.portable_prefix_candidate_starts = 0;
+        assert!(!production_families_are_canonical(&[zero_prefix]));
+        let mut prefix_exceeds_floor = valid[0];
+        prefix_exceeds_floor.minimum_window_bytes = 262;
+        assert!(!production_families_are_canonical(&[prefix_exceeds_floor]));
+        let mut zero_plan = valid[0];
+        zero_plan.plan_identity = SourceQualifiedPlanIdentityV1([0; 32]);
+        assert!(!production_families_are_canonical(&[zero_plan]));
+        let mut zero_analyzer = valid[0];
+        zero_analyzer.analyzer_identity = SourceQualifiedAnalyzerIdentityV1([0; 32]);
+        assert!(!production_families_are_canonical(&[zero_analyzer]));
+        let mut zero_evidence = valid[0];
+        zero_evidence.evidence_identity = SourceQualifiedEvidenceIdentityV1([0; 32]);
+        assert!(!production_families_are_canonical(&[zero_evidence]));
 
         let fixture = crate::search_test_fixture::static_search_span_fixture_v1();
         let ambiguous = [SourceQualifiedStaticSearchSpanFamilyV1::test_only(

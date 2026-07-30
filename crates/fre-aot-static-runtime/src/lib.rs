@@ -111,8 +111,8 @@ pub use search_linked::{
     STATIC_SEARCH_SPAN_ADOPT_STATUS_NO_QUALIFIED_ROW_V1, STATIC_SEARCH_SPAN_ADOPT_STATUS_OK_V1,
     STATIC_SEARCH_SPAN_ADOPT_STATUS_REFUSED_V1,
     STATIC_SEARCH_SPAN_ADOPT_STATUS_UNQUALIFIED_SELECTOR_V1, StaticSearchSpanEntryV1,
-    StaticSearchSpanInspectionAccountingV1, StaticSearchSpanLinkedAddressV1,
-    StaticSearchSpanThreadSessionV1, VerifiedStaticSearchSpanV1,
+    StaticSearchSpanFamilyExecutionPolicyV1, StaticSearchSpanInspectionAccountingV1,
+    StaticSearchSpanLinkedAddressV1, StaticSearchSpanThreadSessionV1, VerifiedStaticSearchSpanV1,
     adopt_linked_static_search_span_v1, fre_aot_static_search_span_adopt_raw_v1,
 };
 #[cfg(feature = "search-span-qualification-private-v1")]

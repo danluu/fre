@@ -380,8 +380,16 @@ impl std::error::Error for StaticSearchSpanThreadContractErrorV1 {}
 #[non_exhaustive]
 pub enum StaticSearchSpanCallErrorV1 {
     Preflight(LiteralError),
-    LiteralWidthNotRepresentable { bytes: u32 },
-    ThreadSessionRequired { backend_version: u16 },
+    LiteralWidthNotRepresentable {
+        bytes: u32,
+    },
+    PreflightLiteralMismatch {
+        expected_bytes: u32,
+        actual_bytes: usize,
+    },
+    ThreadSessionRequired {
+        backend_version: u16,
+    },
     Decode(crate::SearchCallErrorV1),
 }
 
@@ -399,7 +407,9 @@ impl std::error::Error for StaticSearchSpanCallErrorV1 {
         match self {
             Self::Preflight(error) => Some(error),
             Self::Decode(error) => Some(error),
-            Self::LiteralWidthNotRepresentable { .. } | Self::ThreadSessionRequired { .. } => None,
+            Self::LiteralWidthNotRepresentable { .. }
+            | Self::PreflightLiteralMismatch { .. }
+            | Self::ThreadSessionRequired { .. } => None,
         }
     }
 }

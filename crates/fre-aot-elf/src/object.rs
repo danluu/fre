@@ -328,7 +328,14 @@ fn validate_image_shape(image: &NativeImage) -> Result<(), ElfObjectError> {
     let target = image.target();
     let baseline = TargetSpec::AARCH64_AAPCS64;
     let supported = match image.backend_version() {
-        version if version == BackendVersion::SEARCH_V8 => target.features == CpuFeatures::ASIMD,
+        version
+            if matches!(
+                version,
+                BackendVersion::SEARCH_V8 | BackendVersion::SEARCH_V9
+            ) =>
+        {
+            target.features == CpuFeatures::ASIMD
+        }
         version if version == BackendVersion::SEARCH_SVE2_FIXED16_V2 => {
             target.features == CpuFeatures::ASIMD_SVE2
         }

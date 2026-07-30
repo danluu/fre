@@ -49,6 +49,8 @@ pub const SEARCH_EXPORTED_SYMBOL_IDENTITY_HEX_BYTES_V1: u16 = 64;
 pub const SEARCH_EXPORTED_SYMBOL_N_TYPE_V1: u8 = 0x0f;
 /// Fixed Search backend selected by the inert source-first compiler.
 pub const SEARCH_BACKEND_VERSION_V1: u16 = 8;
+/// Advanced SIMD Search V9/tag22 with the exact first-candidate fast path.
+pub const SEARCH_BACKEND_ASIMD_TAG22_V1: u16 = 22;
 /// Explicit fixed-VL16 SVE2 candidate backend. This never changes the V8
 /// default or grants qualification authority.
 pub const SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1: u16 = 21;
@@ -494,13 +496,15 @@ fn compute_elf_metadata_compile_identity_v1(metadata: ClaimedSearchMetadataV1) -
 }
 
 const fn valid_metadata_target_profile(backend: u16, platform: u8, features: u64) -> bool {
-    let v8 = backend == SEARCH_BACKEND_VERSION_V1
-        && (platform == SEARCH_PLATFORM_MACOS_V1 || platform == SEARCH_PLATFORM_LINUX_V1)
+    let asimd = matches!(
+        backend,
+        SEARCH_BACKEND_VERSION_V1 | SEARCH_BACKEND_ASIMD_TAG22_V1
+    ) && (platform == SEARCH_PLATFORM_MACOS_V1 || platform == SEARCH_PLATFORM_LINUX_V1)
         && features == SEARCH_REQUIRED_ASIMD_FEATURES_V1;
     let tag21 = backend == SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1
         && platform == SEARCH_PLATFORM_LINUX_V1
         && features == SEARCH_REQUIRED_SVE2_FIXED16_FEATURES_V1;
-    v8 || tag21
+    asimd || tag21
 }
 
 const fn valid_expectation_target_profile(
@@ -517,7 +521,17 @@ const fn valid_expectation_target_profile(
             SEARCH_REQUIRED_ASIMD_FEATURES_V1,
             SEARCH_EXPORTED_SYMBOL_N_TYPE_V1,
         ) | (
+            SEARCH_BACKEND_ASIMD_TAG22_V1,
+            SEARCH_PLATFORM_MACOS_V1,
+            SEARCH_REQUIRED_ASIMD_FEATURES_V1,
+            SEARCH_EXPORTED_SYMBOL_N_TYPE_V1,
+        ) | (
             SEARCH_BACKEND_VERSION_V1,
+            SEARCH_PLATFORM_LINUX_V1,
+            SEARCH_REQUIRED_ASIMD_FEATURES_V1,
+            SEARCH_EXPORTED_SYMBOL_INFO_ELF_FUNCTION_V1,
+        ) | (
+            SEARCH_BACKEND_ASIMD_TAG22_V1,
             SEARCH_PLATFORM_LINUX_V1,
             SEARCH_REQUIRED_ASIMD_FEATURES_V1,
             SEARCH_EXPORTED_SYMBOL_INFO_ELF_FUNCTION_V1,

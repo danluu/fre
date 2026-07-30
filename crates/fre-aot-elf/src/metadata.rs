@@ -304,7 +304,10 @@ impl MetadataV1 {
             && self.pointer_width == 64
             && self.target_abi == 1;
         let backend_ok = match self.backend_version {
-            version if version == BackendVersion::SEARCH_V8.0 => {
+            version
+                if version == BackendVersion::SEARCH_V8.0
+                    || version == BackendVersion::SEARCH_V9.0 =>
+            {
                 self.features == CpuFeatures::ASIMD.bits()
             }
             version if version == BackendVersion::SEARCH_SVE2_FIXED16_V2.0 => {

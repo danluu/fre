@@ -1,8 +1,8 @@
-//! Inert source-first nonempty exact-literal Search V8 object compilation.
+//! Inert source-first nonempty exact-literal Search object compilation.
 //!
 //! This is deliberately narrower than runtime deployment. It accepts only a
 //! facade-authenticated nonempty exact-literal plan built under the fixed automatic
-//! policy, emits one typed Search V8 `NativeImage`, and wraps it as a
+//! policy, emits one typed Search `NativeImage`, and wraps it as a
 //! deterministic macOS `AArch64` `MH_OBJECT`. The result carries no runtime
 //! authority and this module never probes the build host, invokes a linker,
 //! maps code, or calls a generated entry.
@@ -95,7 +95,7 @@ identity!(
     "SearchCompileReceiptIdentityV1"
 );
 
-/// Caller-selected finite limits for the source-first Search V8 compiler.
+/// Caller-selected finite limits for the source-first Search compiler.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SearchCompilePolicyV1 {
     pub max_source_bytes: u64,
@@ -114,7 +114,7 @@ pub struct SearchCompilePolicyV1 {
 }
 
 impl SearchCompilePolicyV1 {
-    /// Explicit finite defaults for the exact-literal Search V8 slice.
+    /// Explicit finite defaults for the exact-literal Search slice.
     #[must_use]
     pub fn high_fuel() -> Self {
         Self {
@@ -154,9 +154,38 @@ impl fmt::Display for SearchManifestErrorV1 {
 
 impl std::error::Error for SearchManifestErrorV1 {}
 
-/// Sealed macOS `AArch64` Search V8 request for one compile-time output type.
+/// Explicit macOS `AArch64` code-generation profile.
+///
+/// The default remains V8 so all existing manifests and artifact identities
+/// remain byte-for-byte stable. V9 is reachable only through its named
+/// candidate constructor until source qualification grants deployment
+/// authority.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MacosAarch64SearchBackendV1 {
+    #[default]
+    AsimdV8,
+    AsimdV9,
+}
+
+impl MacosAarch64SearchBackendV1 {
+    #[must_use]
+    pub const fn emitter_policy(self) -> SearchBackendPolicy {
+        match self {
+            Self::AsimdV8 => SearchBackendPolicy::AsimdV8,
+            Self::AsimdV9 => SearchBackendPolicy::AsimdV9,
+        }
+    }
+
+    #[must_use]
+    pub const fn backend_version(self) -> BackendVersion {
+        self.emitter_policy().backend_version()
+    }
+}
+
+/// Sealed macOS `AArch64` Search request for one compile-time output type.
 pub struct MacosAarch64ExactSearchManifestV1<O: Operation> {
     policy: SearchCompilePolicyV1,
+    backend: MacosAarch64SearchBackendV1,
     identity: SearchManifestIdentityV1,
     identity_bytes_hashed: u64,
     operation: PhantomData<fn() -> O>,
@@ -175,6 +204,7 @@ impl<O: Operation> fmt::Debug for MacosAarch64ExactSearchManifestV1<O> {
         formatter
             .debug_struct("MacosAarch64ExactSearchManifestV1")
             .field("policy", &self.policy)
+            .field("backend", &self.backend)
             .field("identity", &self.identity)
             .field("identity_bytes_hashed", &self.identity_bytes_hashed)
             .field("output", &O::KIND)
@@ -184,20 +214,39 @@ impl<O: Operation> fmt::Debug for MacosAarch64ExactSearchManifestV1<O> {
 
 impl<O: Operation> MacosAarch64ExactSearchManifestV1<O> {
     pub fn new(policy: SearchCompilePolicyV1) -> Result<Self, SearchManifestErrorV1> {
+        Self::with_backend(policy, MacosAarch64SearchBackendV1::AsimdV8)
+    }
+
+    fn with_backend(
+        policy: SearchCompilePolicyV1,
+        backend: MacosAarch64SearchBackendV1,
+    ) -> Result<Self, SearchManifestErrorV1> {
         validate_policy(&policy)?;
         let (identity, identity_bytes_hashed) =
-            encode_manifest::<O>(&policy).map_err(map_manifest_canonical)?;
+            encode_manifest::<O>(&policy, backend).map_err(map_manifest_canonical)?;
         Ok(Self {
             policy,
+            backend,
             identity: SearchManifestIdentityV1::new(identity),
             identity_bytes_hashed,
             operation: PhantomData,
         })
     }
 
+    /// Construct an explicit ASIMD V9 candidate manifest. This does not grant
+    /// runtime or automatic-routing authority.
+    pub fn v9_candidate(policy: SearchCompilePolicyV1) -> Result<Self, SearchManifestErrorV1> {
+        Self::with_backend(policy, MacosAarch64SearchBackendV1::AsimdV9)
+    }
+
     #[must_use]
     pub const fn policy(&self) -> &SearchCompilePolicyV1 {
         &self.policy
+    }
+
+    #[must_use]
+    pub const fn backend(&self) -> MacosAarch64SearchBackendV1 {
+        self.backend
     }
 
     #[must_use]
@@ -217,7 +266,7 @@ impl<O: Operation> MacosAarch64ExactSearchManifestV1<O> {
 
     fn authenticates_itself(&self) -> bool {
         validate_policy(&self.policy).is_ok()
-            && encode_manifest::<O>(&self.policy).is_ok_and(|(identity, bytes)| {
+            && encode_manifest::<O>(&self.policy, self.backend).is_ok_and(|(identity, bytes)| {
                 self.identity == SearchManifestIdentityV1::new(identity)
                     && self.identity_bytes_hashed == bytes
             })
@@ -589,7 +638,11 @@ impl SearchCompileReceiptV1 {
             && u64::from(self.literal_bytes) <= MAX_AOT_SEARCH_LITERAL_BYTES_V1
             && output_tag(self.output) == metadata.output_kind()
             && metadata.format_version() == fre_aot_macho::METADATA_VERSION
-            && metadata.backend_version() == BackendVersion::SEARCH_V8.0
+            && matches!(
+                metadata.backend_version(),
+                value if value == BackendVersion::SEARCH_V8.0
+                    || value == BackendVersion::SEARCH_V9.0
+            )
             && metadata.abi_kind() == AbiKind::Search
             && metadata.literal_bytes() == 0
             && metadata.source_identity() == self.kir_identity.as_bytes()
@@ -749,7 +802,7 @@ impl<O: Operation> SearchCompiledObjectV1<O> {
     }
 }
 
-/// Plan and compile one owned UTF-8 source into an inert Search V8 object.
+/// Plan and compile one owned UTF-8 source into an inert Search object.
 ///
 /// Source length and allocation capacity are checked before UTF-8 validation
 /// or syntax work. The normal facade must select its live exact-literal plan;
@@ -817,10 +870,10 @@ pub fn plan_and_compile_macos_aarch64_exact_search_v1<O: Operation>(
     let kernel_stats = program.stats();
     let image = emit_with_backend(
         &program,
-        SearchBackendPolicy::AsimdV8,
+        manifest.backend.emitter_policy(),
         manifest.policy.native,
     )?;
-    authenticate_image::<O>(&image, kir_identity)?;
+    authenticate_image::<O>(&image, kir_identity, manifest.backend)?;
 
     let literal_identity = literal_identity(candidate.literal());
     let (binding_bytes, object_binding_bytes_hashed) = object_binding_identity(
@@ -837,7 +890,13 @@ pub fn plan_and_compile_macos_aarch64_exact_search_v1<O: Operation>(
     let binding_identity = BindingIdentity::new(binding_bytes)?;
     let object =
         fre_aot_macho::emit_search_object(&image, binding_identity, manifest.policy.object)?;
-    authenticate_object::<O>(&object, &image, binding_identity, manifest.policy.object)?;
+    authenticate_object::<O>(
+        &object,
+        &image,
+        binding_identity,
+        manifest.backend,
+        manifest.policy.object,
+    )?;
 
     let accounting = compile_accounting(
         &manifest,
@@ -918,13 +977,14 @@ fn validate_policy(policy: &SearchCompilePolicyV1) -> Result<(), SearchManifestE
 
 fn encode_manifest<O: Operation>(
     policy: &SearchCompilePolicyV1,
+    backend: MacosAarch64SearchBackendV1,
 ) -> Result<([u8; 32], u64), CanonicalError> {
     let mut encoder = CanonicalEncoder::hashing();
     encoder.raw(MANIFEST_DOMAIN)?;
     encoder.u16(AOT_SEARCH_COMPILER_VERSION_V1)?;
     encoder.u16(AOT_SEARCH_MANIFEST_SCHEMA_VERSION_V1)?;
     encoder.u8(output_tag(O::KIND))?;
-    encoder.u16(BackendVersion::SEARCH_V8.0)?;
+    encoder.u16(backend.backend_version().0)?;
     encode_target(&mut encoder, TargetSpec::AARCH64_AAPCS64)?;
     encoder.u64(CpuFeatures::ASIMD.bits())?;
     encoder.u64(policy.max_source_bytes)?;
@@ -1005,10 +1065,11 @@ fn literal_identity(literal: &[u8]) -> SearchLiteralIdentityV1 {
 fn authenticate_image<O: Operation>(
     image: &NativeImage,
     kir_identity: CacheIdentity,
+    backend: MacosAarch64SearchBackendV1,
 ) -> Result<(), SearchCompileErrorV1> {
     let target = image.target();
     let baseline = TargetSpec::AARCH64_AAPCS64;
-    if image.backend_version() != BackendVersion::SEARCH_V8
+    if image.backend_version() != backend.backend_version()
         || image.output() != O::KIND
         || image.source_identity() != kir_identity
         || target.architecture != baseline.architecture
@@ -1018,11 +1079,11 @@ fn authenticate_image<O: Operation>(
         || target.features != CpuFeatures::ASIMD
     {
         return Err(SearchCompileErrorV1::ContractMismatch {
-            field: "Search V8 native image",
+            field: "Search native image",
         });
     }
     fre_jit_aarch64::audit(image).map_err(|_| SearchCompileErrorV1::ContractMismatch {
-        field: "independent Search V8 image audit",
+        field: "independent Search image audit",
     })?;
     Ok(())
 }
@@ -1031,13 +1092,14 @@ fn authenticate_object<O: Operation>(
     object: &BuiltObject,
     image: &NativeImage,
     binding: BindingIdentity,
+    backend: MacosAarch64SearchBackendV1,
     object_limits: ObjectLimits,
 ) -> Result<(), SearchCompileErrorV1> {
     let metadata = object.metadata();
     let report = object.report();
     if metadata.format_version() != fre_aot_macho::METADATA_VERSION
         || usize::from(metadata.record_bytes()) != fre_aot_macho::METADATA_BYTES_V1
-        || metadata.backend_version() != BackendVersion::SEARCH_V8.0
+        || metadata.backend_version() != backend.backend_version().0
         || metadata.abi_kind() != AbiKind::Search
         || metadata.output_kind() != output_tag(O::KIND)
         || metadata.architecture() != image.target().architecture
@@ -1063,7 +1125,7 @@ fn authenticate_object<O: Operation>(
         || report.object_identity != object.object_identity()
     {
         return Err(SearchCompileErrorV1::ContractMismatch {
-            field: "Search V8 Mach-O object",
+            field: "Search Mach-O object",
         });
     }
     fre_aot_macho::validate_search_object(image, binding, object.as_bytes(), object_limits)
@@ -1575,6 +1637,48 @@ mod tests {
         assert_ne!(exists.identity(), end.identity());
         assert_ne!(exists.identity(), span.identity());
         assert_ne!(end.identity(), span.identity());
+    }
+
+    #[test]
+    fn explicit_v9_is_deterministic_and_identity_disjoint_from_unchanged_v8_default() {
+        let v8_manifest = MacosAarch64ExactSearchManifestV1::<Span>::default();
+        let v9_manifest = MacosAarch64ExactSearchManifestV1::<Span>::v9_candidate(
+            SearchCompilePolicyV1::default(),
+        )
+        .expect("V9 candidate manifest");
+        assert_eq!(v8_manifest.backend(), MacosAarch64SearchBackendV1::AsimdV8);
+        assert_eq!(v9_manifest.backend(), MacosAarch64SearchBackendV1::AsimdV9);
+        assert_ne!(v8_manifest.identity(), v9_manifest.identity());
+
+        let first = plan_and_compile_macos_aarch64_exact_search_v1(
+            v9_manifest,
+            b"needle".to_vec(),
+            RustProfile::default(),
+        )
+        .expect("first V9 object");
+        let second = plan_and_compile_macos_aarch64_exact_search_v1(
+            v9_manifest,
+            b"needle".to_vec(),
+            RustProfile::default(),
+        )
+        .expect("second V9 object");
+        assert_eq!(
+            first.receipt().metadata().backend_version(),
+            BackendVersion::SEARCH_V9.0
+        );
+        assert_eq!(first.object().as_bytes(), second.object().as_bytes());
+        assert_eq!(first.receipt(), second.receipt());
+        let expectation =
+            crate::build_static_search_span_expectation_v1(&first).expect("V9 neutral expectation");
+        let claim = fre_aot_search_contract::inspect_static_search_span_expectation_v1(
+            expectation.as_bytes(),
+        )
+        .expect("V9 expectation inspection");
+        assert_eq!(
+            claim.backend_version(),
+            fre_aot_search_contract::SEARCH_BACKEND_ASIMD_TAG22_V1
+        );
+        assert!(expectation.authenticates_claim(&claim));
     }
 
     #[test]

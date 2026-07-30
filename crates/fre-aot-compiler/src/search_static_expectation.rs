@@ -23,13 +23,12 @@ use fre_aot_search_contract::{
     AOT_STATIC_SEARCH_SPAN_EXPECTATION_SCHEMA_VERSION_V1, ClaimedSearchMetadataV1,
     ClaimedStaticSearchSpanExpectationV1, MAX_STATIC_SEARCH_SPAN_LITERAL_BYTES_V1,
     MIN_STATIC_SEARCH_SPAN_LITERAL_BYTES_V1, SEARCH_ARCHITECTURE_AARCH64_V1,
-    SEARCH_BACKEND_VERSION_V1, SEARCH_CALL_ABI_SCHEMA_V1, SEARCH_DEFAULT_END_ANCHOR_V1,
-    SEARCH_DEFAULT_START_ANCHOR_V1, SEARCH_EXPORTED_SYMBOL_N_TYPE_V1,
-    SEARCH_EXPORTED_SYMBOL_SCHEMA_VERSION_V1, SEARCH_LITTLE_ENDIAN_V1, SEARCH_METADATA_BYTES_V1,
-    SEARCH_METADATA_VERSION_V1, SEARCH_PLATFORM_MACOS_V1, SEARCH_POINTER_WIDTH_V1,
-    SEARCH_REQUIRED_ASIMD_FEATURES_V1, SEARCH_SPAN_OUTPUT_KIND_V1, SEARCH_STATUS_BITS_V1,
-    SEARCH_TARGET_ABI_AAPCS64_V1, STATIC_SEARCH_SPAN_EXPECTATION_BYTES_V1,
-    STATIC_SEARCH_SPAN_EXPECTATION_IDENTITY_BODY_BYTES_V1,
+    SEARCH_CALL_ABI_SCHEMA_V1, SEARCH_DEFAULT_END_ANCHOR_V1, SEARCH_DEFAULT_START_ANCHOR_V1,
+    SEARCH_EXPORTED_SYMBOL_N_TYPE_V1, SEARCH_EXPORTED_SYMBOL_SCHEMA_VERSION_V1,
+    SEARCH_LITTLE_ENDIAN_V1, SEARCH_METADATA_BYTES_V1, SEARCH_METADATA_VERSION_V1,
+    SEARCH_PLATFORM_MACOS_V1, SEARCH_POINTER_WIDTH_V1, SEARCH_REQUIRED_ASIMD_FEATURES_V1,
+    SEARCH_SPAN_OUTPUT_KIND_V1, SEARCH_STATUS_BITS_V1, SEARCH_TARGET_ABI_AAPCS64_V1,
+    STATIC_SEARCH_SPAN_EXPECTATION_BYTES_V1, STATIC_SEARCH_SPAN_EXPECTATION_IDENTITY_BODY_BYTES_V1,
     STATIC_SEARCH_SPAN_EXPECTATION_IDENTITY_OFFSET_V1,
     STATIC_SEARCH_SPAN_EXPECTATION_METADATA_OFFSET_V1,
     StaticSearchSpanExpectationErrorV1 as NeutralExpectationErrorV1,
@@ -285,7 +284,7 @@ impl StaticSearchSpanExpectationV1 {
             && claim.compiler_version() == CONTRACT_AOT_SEARCH_COMPILER_VERSION_V1
             && usize::from(claim.metadata_record_bytes()) == SEARCH_METADATA_BYTES_V1
             && claim.metadata_version() == SEARCH_METADATA_VERSION_V1
-            && claim.backend_version() == SEARCH_BACKEND_VERSION_V1
+            && claim.backend_version() == self.metadata.backend_version()
             && claim.call_abi_schema() == SEARCH_CALL_ABI_SCHEMA_V1
             && claim.exported_symbol_schema() == SEARCH_EXPORTED_SYMBOL_SCHEMA_VERSION_V1
             && claim.output_kind() == SEARCH_SPAN_OUTPUT_KIND_V1
@@ -358,6 +357,7 @@ pub fn build_static_search_span_expectation_v1(
         .try_into()
         .map_err(|_| wire_layout("object metadata bytes"))?;
     let fields = ExpectationFields {
+        backend_version: receipt.metadata().backend_version(),
         manifest_identity: *receipt.manifest_identity().as_bytes(),
         semantic_binding_identity: *receipt.semantic_binding_identity().as_bytes(),
         literal_identity: *receipt.literal_identity().as_bytes(),
@@ -429,6 +429,7 @@ fn metadata_claim_matches_trusted(claim: ClaimedSearchMetadataV1, trusted: Metad
 
 #[derive(Clone, Copy)]
 struct ExpectationFields {
+    backend_version: u16,
     manifest_identity: [u8; 32],
     semantic_binding_identity: [u8; 32],
     literal_identity: [u8; 32],
@@ -460,7 +461,7 @@ fn encode_expectation_wire(
                 .map_err(|_| wire_layout("metadata record bytes"))?,
         )?;
         writer.u16(SEARCH_METADATA_VERSION_V1)?;
-        writer.u16(SEARCH_BACKEND_VERSION_V1)?;
+        writer.u16(fields.backend_version)?;
         writer.u16(SEARCH_CALL_ABI_SCHEMA_V1)?;
         writer.u16(SEARCH_EXPORTED_SYMBOL_SCHEMA_VERSION_V1)?;
         writer.u8(SEARCH_SPAN_OUTPUT_KIND_V1)?;
@@ -564,6 +565,7 @@ const fn wire_layout(at: &'static str) -> StaticSearchSpanExpectationBuildErrorV
 mod tests {
     use super::*;
     use fre::RustProfile;
+    use fre_aot_search_contract::SEARCH_BACKEND_VERSION_V1;
     use fre_aot_search_contract::inspect_search_metadata_v1;
     use sha2::{Digest, Sha256};
 
@@ -633,6 +635,7 @@ mod tests {
     fn fixture_wire() -> StaticSearchSpanExpectationWireV1 {
         let metadata = fixture_metadata();
         encode_expectation_wire(&ExpectationFields {
+            backend_version: SEARCH_BACKEND_VERSION_V1,
             manifest_identity: [0x51; 32],
             semantic_binding_identity: [0x52; 32],
             literal_identity: [0x53; 32],
