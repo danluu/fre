@@ -2881,6 +2881,7 @@ fn execute_context_lazy_loop(
     );
     let mut position = window.start();
     let mut boundaries = 0usize;
+    let mut initial_candidate_scanned = false;
     if let Some(scanner) = scanner {
         // An absolute-start branch may contribute only at original haystack
         // boundary zero. Otherwise the proven scanner can establish the first
@@ -2892,6 +2893,7 @@ fn execute_context_lazy_loop(
             if position == window.end() {
                 return Ok(Some((None, boundaries)));
             }
+            initial_candidate_scanned = true;
         }
     }
     let initial_mask = enabled_assertion_mask(automaton, haystack, position, meter)?;
@@ -2912,7 +2914,7 @@ fn execute_context_lazy_loop(
     let mut entered = false;
 
     loop {
-        if entered
+        if (!initial_candidate_scanned || entered)
             && pending_end.is_none()
             && restartable
             && !(force_haystack_start && position == 0)
@@ -3837,10 +3839,11 @@ fn contextual_execution_work_upper(
                 computation: "contextual assertion-symbol work",
             })?;
 
-    // One initial symbol is always evaluated. Every later symbol is either a
-    // consumed transition or an initial-state rebuild after a scanner jump.
-    // A rebuild skips at least one byte, so those disjoint progress counts sum
-    // to at most the input length.
+    // Reserve one initial symbol for every candidate-bearing execution, even
+    // though a scanner miss returns before evaluating one. Every later symbol
+    // is either a consumed transition or an initial-state rebuild after a
+    // scanner jump. A rebuild skips at least one byte, so those disjoint
+    // progress counts sum to at most the input length.
     let forward_symbols = input
         .checked_add(1)
         .ok_or(SearchError::ArithmeticOverflow {
@@ -6995,6 +6998,34 @@ mod tests {
         .unwrap()
     }
 
+    fn digit_slash_then_line_end_or_bang() -> Automaton {
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 1, 2, 4, 5, 5],
+                edge_targets: vec![1, 2, 4, 3, 4],
+                edge_kinds: vec![
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::AssertLineEndLf,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                ],
+                byte_starts: vec![b'0', b'/', 0, 0, b'!'],
+                byte_ends: vec![b'9', b'/', 0, 0, b'!'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
     fn asserted_line_three_classes() -> Automaton {
         Automaton::from_raw(
             RawPlan {
@@ -8802,6 +8833,212 @@ mod tests {
                 true,
             );
         }
+    }
+
+    #[test]
+    fn contextual_candidate_first_misses_preserve_work_boundaries_and_cache_state() {
+        let plan = trailing_assertion_or_bang(EdgeKind::AssertLineEndLf);
+        let scanner = StartPositionScanner {
+            offset: 0,
+            scanner: StartScanner::One(b'a'),
+        };
+        let run = |workspace: &mut K0Workspace, haystack: &[u8]| {
+            let mut meter = WorkMeter::new(u64::MAX, 0);
+            let result = super::execute_context_lazy_loop(
+                &plan,
+                haystack,
+                SearchWindow::full(haystack),
+                workspace,
+                &mut meter,
+                OutputContract::EarliestEnd,
+                0,
+                Some(&scanner),
+                None,
+                false,
+                false,
+            )
+            .unwrap()
+            .unwrap();
+            (result, meter.consumed)
+        };
+
+        let mut cold_miss =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        assert_eq!(run(&mut cold_miss, b"xxxx"), ((None, 0), 4));
+        assert!(!cold_miss.lazy.initialized);
+        assert_eq!(cold_miss.lazy.state_len, 0);
+        assert_eq!(cold_miss.lazy.item_len, 0);
+        assert_eq!(cold_miss.lazy.context.occupied_slots(), 0);
+
+        let mut warm = K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let (cold_result, cold_work) = run(&mut warm, b"a\n");
+        assert_eq!(cold_result, (Some(MatchSpan::new(0, 1)), 2));
+        assert!(warm.lazy.initialized);
+        assert!(warm.lazy.state_len > 0);
+        assert!(warm.lazy.item_len > 0);
+        let warm_state_len = warm.lazy.state_len;
+        let warm_item_len = warm.lazy.item_len;
+        let warm_slots = warm.lazy.context.occupied_slots();
+        assert!(warm_slots > 0);
+
+        let (cached_result, cached_work) = run(&mut warm, b"a\n");
+        assert_eq!(cached_result, cold_result);
+        assert!(
+            cached_work < cold_work,
+            "the second contextual execution must use its retained cache"
+        );
+        assert_eq!(warm.lazy.state_len, warm_state_len);
+        assert_eq!(warm.lazy.item_len, warm_item_len);
+        assert_eq!(warm.lazy.context.occupied_slots(), warm_slots);
+
+        assert_eq!(run(&mut warm, b"xxxx"), ((None, 0), 4));
+        assert_eq!(warm.lazy.state_len, warm_state_len);
+        assert_eq!(warm.lazy.item_len, warm_item_len);
+        assert_eq!(warm.lazy.context.occupied_slots(), warm_slots);
+
+        let no_scanner = asserted_line_a();
+        let mut no_scanner_workspace =
+            K0Workspace::new_accelerated(&no_scanner, WorkspaceLimits::unlimited()).unwrap();
+        let mut no_scanner_meter = WorkMeter::new(u64::MAX, 0);
+        let empty = super::execute_context_lazy_loop(
+            &no_scanner,
+            b"",
+            SearchWindow::new(0, 0),
+            &mut no_scanner_workspace,
+            &mut no_scanner_meter,
+            OutputContract::EarliestEnd,
+            0,
+            None,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(empty, Some((None, 0)));
+        assert!(no_scanner_workspace.lazy.initialized);
+        assert!(no_scanner_meter.consumed > 0);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "offset clipping and both public contracts share one proof and window matrix"
+    )]
+    fn contextual_candidate_first_handles_offset_scanners_clipped_windows_and_span_contracts() {
+        let plan = digit_slash_then_line_end_or_bang();
+        let haystack = &[0xff, b'x', b'5', b'/', b'\n', 0x80];
+        let mut proof_workspace = K0Workspace::new(&plan, WorkspaceLimits::unlimited()).unwrap();
+        plan.prepare::<Span>()
+            .search_with_workspace(haystack, &mut proof_workspace, SearchLimits::unlimited())
+            .unwrap();
+        let proof = plan
+            .start_filter_proof
+            .get()
+            .expect("successful search publishes the offset scanner");
+        assert_eq!(
+            proof,
+            &StartFilterProof {
+                scanner: Some(positioned_scanner(1, StartScanner::One(b'/'))),
+                guard: Some(StartPositionClass {
+                    offset: 0,
+                    set: byte_range_set(b'0', b'9'),
+                }),
+                force_haystack_start: false,
+                relaxed_nullable: false,
+            }
+        );
+        let scanner = proof.scanner.as_ref().unwrap();
+        let guard = proof.guard.as_ref();
+
+        let windows = [
+            SearchWindow::full(haystack),
+            SearchWindow::new(1, 5),
+            // The assertion at byte boundary 4 observes the original newline
+            // even though the search window ends immediately before it.
+            SearchWindow::new(2, 4),
+            SearchWindow::new(2, 3),
+            SearchWindow::new(3, 5),
+        ];
+        for window in windows {
+            let mut ordinary = K0Workspace::new(&plan, WorkspaceLimits::unlimited()).unwrap();
+            let expected_end = plan
+                .prepare::<SelectedEnd>()
+                .search_window_with_workspace(
+                    haystack,
+                    window,
+                    &mut ordinary,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap();
+            let mut ordinary_span = K0Workspace::new(&plan, WorkspaceLimits::unlimited()).unwrap();
+            let expected_span = plan
+                .prepare::<Span>()
+                .search_window_with_workspace(
+                    haystack,
+                    window,
+                    &mut ordinary_span,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap();
+
+            for limits in [SearchLimits::default(), SearchLimits::unlimited()] {
+                let mut endpoint =
+                    K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+                let actual_end = plan
+                    .prepare::<SelectedEnd>()
+                    .search_window_with_workspace(haystack, window, &mut endpoint, limits)
+                    .unwrap();
+                assert_eq!(actual_end.output(), expected_end.output());
+                assert_eq!(
+                    actual_end.accounting().boundaries(),
+                    expected_end.accounting().boundaries(),
+                    "SelectedEnd boundary mismatch window={window:?} limits={limits:?}"
+                );
+
+                let mut bidirectional =
+                    K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+                let actual_span = plan
+                    .prepare::<Span>()
+                    .search_window_with_workspace(haystack, window, &mut bidirectional, limits)
+                    .unwrap();
+                assert_eq!(actual_span.output(), expected_span.output());
+                if actual_span.output().is_none() {
+                    assert_eq!(actual_span.accounting().boundaries(), 0);
+                }
+            }
+        }
+
+        assert_context_candidate_first_case(
+            "offset-scanner-original-context",
+            &plan,
+            haystack,
+            SearchWindow::new(2, 4),
+            scanner,
+            guard,
+            false,
+        );
+
+        let mut clipped =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let mut clipped_meter = WorkMeter::new(u64::MAX, 0);
+        let clipped_result = super::execute_context_lazy_loop(
+            &plan,
+            haystack,
+            SearchWindow::new(2, 3),
+            &mut clipped,
+            &mut clipped_meter,
+            OutputContract::SelectedEnd,
+            0,
+            Some(scanner),
+            guard,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(clipped_result, Some((None, 0)));
+        assert_eq!(clipped_meter.consumed, 0);
+        assert!(!clipped.lazy.initialized);
+        assert_eq!(clipped.lazy.context.occupied_slots(), 0);
     }
 
     #[test]
