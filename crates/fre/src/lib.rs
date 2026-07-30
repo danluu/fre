@@ -532,7 +532,8 @@ pub use set::{
 pub use split::{AggregateSplit, PortableSplit};
 pub use text::{
     PortableTextBuildError, PortableTextBuildReport, PortableTextBuilder, PortableTextMatches,
-    PortableTextProof, PortableTextRegex, PortableTextSearchError,
+    PortableTextProof, PortableTextRegex, PortableTextSearchError, PortableTextSearchSession,
+    PortableTextSessionMatches,
 };
 pub use text_match::{PortableTextBorrowedMatches, PortableTextMatch};
 pub use text_set::{
@@ -1569,12 +1570,60 @@ impl PortableFindIterLimits {
             max_search_calls: usize::MAX,
         }
     }
+
+    /// Retain only the limits applied after session construction.
+    ///
+    /// This is useful when moving from [`PortableRegex::find_iter`], which
+    /// constructs a fresh session, to [`PortableSearchSession::find_iter`],
+    /// which reuses an already constructed session.
+    #[must_use]
+    pub const fn run(self) -> PortableFindIterRunLimits {
+        PortableFindIterRunLimits {
+            search: self.search,
+            max_search_calls: self.max_search_calls,
+        }
+    }
 }
 
 impl Default for PortableFindIterLimits {
     fn default() -> Self {
         Self {
             session: SearchSessionLimits::default(),
+            search: SearchLimits::default(),
+            max_search_calls: 1_000_000,
+        }
+    }
+}
+
+/// Hard limits for one complete iteration on an existing search session.
+///
+/// Unlike [`PortableFindIterLimits`], this has no session-construction
+/// allowance: [`PortableSearchSession::find_iter`] reuses the session's
+/// already allocated K0 workspace. Each new iterator starts fresh
+/// whole-iterator accounting while the one-time setup facts remain available
+/// from [`PortableSearchSession::workspace_setup_accounting`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PortableFindIterRunLimits {
+    /// Limits applied independently to each contextual search.
+    pub search: SearchLimits,
+    /// Maximum contextual searches across the entire iterator.
+    pub max_search_calls: usize,
+}
+
+impl PortableFindIterRunLimits {
+    /// Limits that accept every representable iterator execution.
+    #[must_use]
+    pub const fn unlimited() -> Self {
+        Self {
+            search: SearchLimits::unlimited(),
+            max_search_calls: usize::MAX,
+        }
+    }
+}
+
+impl Default for PortableFindIterRunLimits {
+    fn default() -> Self {
+        Self {
             search: SearchLimits::default(),
             max_search_calls: 1_000_000,
         }
@@ -3704,13 +3753,7 @@ impl PortableRegex {
         let session = self.search_session(limits.session)?;
         Ok(PortableMatches {
             session,
-            haystack,
-            limits,
-            empty_match_progress,
-            start: 0,
-            last_match_end: None,
-            accounting: PortableFindIterAccounting::default(),
-            finished: false,
+            state: PortableMatchIterState::new(haystack, limits.run(), empty_match_progress),
         })
     }
 
@@ -4032,7 +4075,7 @@ enum PortableSearchSessionPlan<'a> {
     K0 { session: K0SearchSession<'a> },
 }
 
-impl PortableSearchSession<'_> {
+impl<'r> PortableSearchSession<'r> {
     /// Stable runtime identity of the borrowed matcher.
     #[must_use]
     pub const fn runtime_implementation_id(&self) -> &'static str {
@@ -4322,6 +4365,48 @@ impl PortableSearchSession<'_> {
         }
     }
 
+    /// Iterate over every non-overlapping byte match while reusing this
+    /// session's existing workspace.
+    ///
+    /// Session construction and its one-time accounting happened before this
+    /// call. Constructing this iterator allocates nothing, and its
+    /// [`PortableFindIterAccounting`] starts at zero for this haystack.
+    /// Dropping the iterator early, or dropping it after a yielded error,
+    /// releases the mutable borrow so the session can be used again.
+    ///
+    /// [`PortableRegex::find_iter`] remains the cold/fresh convenience API:
+    /// it constructs and owns a new session for each iterator. This method is
+    /// the explicit steady-state API for callers that choose to retain one
+    /// session across haystacks.
+    #[must_use]
+    pub fn find_iter<'s, 'h>(
+        &'s mut self,
+        haystack: &'h [u8],
+        limits: PortableFindIterRunLimits,
+    ) -> PortableSessionMatches<'s, 'r, 'h> {
+        self.find_iter_with_progress(haystack, limits, EmptyMatchProgress::Byte)
+    }
+
+    pub(crate) fn find_iter_utf8<'s, 'h>(
+        &'s mut self,
+        haystack: &'h str,
+        limits: PortableFindIterRunLimits,
+    ) -> PortableSessionMatches<'s, 'r, 'h> {
+        self.find_iter_with_progress(haystack.as_bytes(), limits, EmptyMatchProgress::Utf8Scalar)
+    }
+
+    fn find_iter_with_progress<'s, 'h>(
+        &'s mut self,
+        haystack: &'h [u8],
+        limits: PortableFindIterRunLimits,
+        empty_match_progress: EmptyMatchProgress,
+    ) -> PortableSessionMatches<'s, 'r, 'h> {
+        PortableSessionMatches {
+            session: self,
+            state: PortableMatchIterState::new(haystack, limits, empty_match_progress),
+        }
+    }
+
     fn find_iter_at(
         &mut self,
         haystack: &[u8],
@@ -4354,8 +4439,25 @@ impl PortableSearchSession<'_> {
 #[derive(Debug)]
 pub struct PortableMatches<'r, 'h> {
     session: PortableSearchSession<'r>,
+    state: PortableMatchIterState<'h>,
+}
+
+/// Fallible byte-match iterator borrowing an existing search session.
+///
+/// The mutable borrow is held for the iterator's lifetime, preventing
+/// overlapping use of the same workspace. Dropping this iterator releases the
+/// session for another haystack. Unlike [`PortableMatches`], this type performs
+/// no session construction and owns no workspace.
+#[derive(Debug)]
+pub struct PortableSessionMatches<'s, 'r, 'h> {
+    session: &'s mut PortableSearchSession<'r>,
+    state: PortableMatchIterState<'h>,
+}
+
+#[derive(Debug)]
+struct PortableMatchIterState<'h> {
     haystack: &'h [u8],
-    limits: PortableFindIterLimits,
+    limits: PortableFindIterRunLimits,
     empty_match_progress: EmptyMatchProgress,
     start: usize,
     last_match_end: Option<usize>,
@@ -4369,17 +4471,28 @@ enum EmptyMatchProgress {
     Utf8Scalar,
 }
 
-impl PortableMatches<'_, '_> {
-    /// Exact counters accumulated through the most recent iterator action.
-    #[must_use]
-    pub const fn accounting(&self) -> PortableFindIterAccounting {
-        self.accounting
-    }
-
-    /// One-time K0 workspace setup facts, or `None` for native plans.
-    #[must_use]
-    pub const fn workspace_setup_accounting(&self) -> Option<SearchSessionSetupAccounting> {
-        self.session.workspace_setup_accounting()
+impl<'h> PortableMatchIterState<'h> {
+    const fn new(
+        haystack: &'h [u8],
+        limits: PortableFindIterRunLimits,
+        empty_match_progress: EmptyMatchProgress,
+    ) -> Self {
+        Self {
+            haystack,
+            limits,
+            empty_match_progress,
+            start: 0,
+            last_match_end: None,
+            accounting: PortableFindIterAccounting {
+                search_calls: 0,
+                matches: 0,
+                suppressed_empty: 0,
+                work_or_linear_terms: 0,
+                utf8_progress_byte_probes: 0,
+                utf8_progress_work: 0,
+            },
+            finished: false,
+        }
     }
 
     fn fail(&mut self, error: PortableFindIterError) -> Result<Match, PortableFindIterError> {
@@ -4444,19 +4557,16 @@ impl PortableMatches<'_, '_> {
         self.accounting.utf8_progress_work = next_progress_work;
         Ok(())
     }
-}
 
-impl Iterator for PortableMatches<'_, '_> {
-    type Item = Result<Match, PortableFindIterError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
+    fn next_match(
+        &mut self,
+        session: &mut PortableSearchSession<'_>,
+    ) -> Option<Result<Match, PortableFindIterError>> {
         while !self.finished {
             if let Err(error) = self.begin_search() {
                 return Some(self.fail(error));
             }
-            let searched = self
-                .session
-                .find_iter_at(self.haystack, self.start, self.limits.search);
+            let searched = session.find_iter_at(self.haystack, self.start, self.limits.search);
             let (matched, search_accounting) = match searched {
                 Ok(result) => result,
                 Err(error) => return Some(self.fail(PortableFindIterError::Search(error))),
@@ -4550,7 +4660,59 @@ impl Iterator for PortableMatches<'_, '_> {
     }
 }
 
+impl PortableMatches<'_, '_> {
+    /// Exact counters accumulated through the most recent iterator action.
+    #[must_use]
+    pub const fn accounting(&self) -> PortableFindIterAccounting {
+        self.state.accounting
+    }
+
+    /// One-time K0 workspace setup facts, or `None` for native plans.
+    #[must_use]
+    pub const fn workspace_setup_accounting(&self) -> Option<SearchSessionSetupAccounting> {
+        self.session.workspace_setup_accounting()
+    }
+}
+
+impl Iterator for PortableMatches<'_, '_> {
+    type Item = Result<Match, PortableFindIterError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.state.next_match(&mut self.session)
+    }
+}
+
 impl core::iter::FusedIterator for PortableMatches<'_, '_> {}
+
+impl PortableSessionMatches<'_, '_, '_> {
+    /// Exact counters accumulated by this iterator.
+    ///
+    /// Every new iterator starts from zero even when the same session has
+    /// already searched other haystacks.
+    #[must_use]
+    pub const fn accounting(&self) -> PortableFindIterAccounting {
+        self.state.accounting
+    }
+
+    /// The reused session's one-time K0 setup facts.
+    ///
+    /// These facts predate this iterator and are not included in
+    /// [`Self::accounting`]. Native plans return `None`.
+    #[must_use]
+    pub const fn workspace_setup_accounting(&self) -> Option<SearchSessionSetupAccounting> {
+        self.session.workspace_setup_accounting()
+    }
+}
+
+impl Iterator for PortableSessionMatches<'_, '_, '_> {
+    type Item = Result<Match, PortableFindIterError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.state.next_match(self.session)
+    }
+}
+
+impl core::iter::FusedIterator for PortableSessionMatches<'_, '_, '_> {}
 
 /// Fallible iterator over borrowed, non-overlapping byte matches.
 ///
@@ -4580,7 +4742,7 @@ impl<'h> Iterator for PortableByteMatches<'_, 'h> {
     type Item = Result<ByteMatch<'h>, PortableFindIterError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let haystack = self.inner.haystack;
+        let haystack = self.inner.state.haystack;
         self.inner
             .next()
             .map(|result| result.map(|span| ByteMatch { haystack, span }))
@@ -4688,44 +4850,44 @@ mod tests {
             .find_iter_utf8("é", PortableFindIterLimits::unlimited())
             .unwrap();
 
-        iterator.accounting = PortableFindIterAccounting {
+        iterator.state.accounting = PortableFindIterAccounting {
             work_or_linear_terms: u64::MAX,
             ..PortableFindIterAccounting::default()
         };
-        let before = iterator.accounting;
+        let before = iterator.state.accounting;
         assert_eq!(
-            iterator.record_utf8_progress(1, 1),
+            iterator.state.record_utf8_progress(1, 1),
             Err(PortableFindIterError::AccountingOverflow {
                 counter: "utf8-progress-work",
             })
         );
-        assert_eq!(iterator.accounting, before);
+        assert_eq!(iterator.state.accounting, before);
 
-        iterator.accounting = PortableFindIterAccounting {
+        iterator.state.accounting = PortableFindIterAccounting {
             utf8_progress_work: u64::MAX,
             ..PortableFindIterAccounting::default()
         };
-        let before = iterator.accounting;
+        let before = iterator.state.accounting;
         assert_eq!(
-            iterator.record_utf8_progress(1, 1),
+            iterator.state.record_utf8_progress(1, 1),
             Err(PortableFindIterError::AccountingOverflow {
                 counter: "utf8-progress-work",
             })
         );
-        assert_eq!(iterator.accounting, before);
+        assert_eq!(iterator.state.accounting, before);
 
-        iterator.accounting = PortableFindIterAccounting {
+        iterator.state.accounting = PortableFindIterAccounting {
             utf8_progress_byte_probes: u64::MAX,
             ..PortableFindIterAccounting::default()
         };
-        let before = iterator.accounting;
+        let before = iterator.state.accounting;
         assert_eq!(
-            iterator.record_utf8_progress(1, 1),
+            iterator.state.record_utf8_progress(1, 1),
             Err(PortableFindIterError::AccountingOverflow {
                 counter: "utf8-progress-byte-probe",
             })
         );
-        assert_eq!(iterator.accounting, before);
+        assert_eq!(iterator.state.accounting, before);
     }
 
     #[test]

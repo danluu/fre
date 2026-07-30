@@ -8,8 +8,10 @@ use regex_syntax::hir::{Hir, HirKind, Look, LookSet};
 use crate::{
     BuildError, BuildLimits, BuildReport, CompatibilityProfile, Match, PlanSelection,
     PortableBuilder, PortableFindIterAccounting, PortableFindIterError, PortableFindIterLimits,
-    PortableMatches, PortableRegex, RustProfile, SearchAccounting, SearchError, SearchLimits,
-    SearchSessionSetupAccounting, SearchWindow, charge_planner, finite, reserve_planner,
+    PortableFindIterRunLimits, PortableMatches, PortableRegex, PortableSearchSession,
+    PortableSessionMatches, RustProfile, SearchAccounting, SearchError, SearchLimits,
+    SearchSessionLimits, SearchSessionSetupAccounting, SearchWindow, charge_planner, finite,
+    reserve_planner,
 };
 
 /// Construction evidence for the first sound Rust text execution slices.
@@ -919,6 +921,28 @@ impl PortableTextRegex {
         self.inner.find(haystack.as_bytes(), limits)
     }
 
+    /// Prepare an explicit reusable session for text match iteration.
+    ///
+    /// K0 workspace construction and its setup limits are paid once here.
+    /// Each subsequent [`PortableTextSearchSession::find_iter`] borrows this
+    /// session mutably, allocates no new K0 workspace, and starts independent
+    /// whole-iterator accounting. The wrapper preserves this matcher's text
+    /// equivalence proof, so scalar-wise empty-match progress is not exposed
+    /// on an arbitrary byte matcher.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same one-time setup contract as
+    /// [`PortableRegex::search_session`].
+    pub fn search_session(
+        &self,
+        limits: SearchSessionLimits,
+    ) -> Result<PortableTextSearchSession<'_>, SearchError> {
+        Ok(PortableTextSearchSession {
+            inner: self.inner.search_session(limits)?,
+        })
+    }
+
     /// Iterate over every non-overlapping match with Rust text empty-match
     /// progress and original-haystack assertion context.
     ///
@@ -1008,6 +1032,86 @@ impl PortableTextRegex {
         self.inner.selected_end(haystack.as_bytes(), limits)
     }
 }
+
+/// Reusable, text-proof-preserving wrapper around [`PortableSearchSession`].
+///
+/// The session owns one construction-selected workspace. Its iterators borrow
+/// it mutably, so only one search can use that workspace at a time and an
+/// iterator drop deterministically makes the session reusable.
+#[derive(Debug)]
+pub struct PortableTextSearchSession<'r> {
+    inner: PortableSearchSession<'r>,
+}
+
+impl<'r> PortableTextSearchSession<'r> {
+    /// Stable runtime identity of the borrowed matcher.
+    #[must_use]
+    pub const fn runtime_implementation_id(&self) -> &'static str {
+        self.inner.runtime_implementation_id()
+    }
+
+    /// One-time K0 workspace allocation and initialization facts.
+    ///
+    /// These are charged once when [`PortableTextRegex::search_session`]
+    /// constructs this session, not once per iterator. Native plans return
+    /// `None`.
+    #[must_use]
+    pub const fn workspace_setup_accounting(&self) -> Option<SearchSessionSetupAccounting> {
+        self.inner.workspace_setup_accounting()
+    }
+
+    /// Iterate over non-overlapping matches in one UTF-8 haystack while
+    /// reusing this session's existing workspace.
+    ///
+    /// Repeated empty matches advance by one UTF-8 scalar. Construction is
+    /// infallible because setup already succeeded; per-search and
+    /// whole-iterator refusals remain yielded
+    /// [`PortableFindIterError`] items. Dropping the iterator, including after
+    /// an error, releases the mutable borrow for the next haystack.
+    #[must_use]
+    pub fn find_iter<'s, 'h>(
+        &'s mut self,
+        haystack: &'h str,
+        limits: PortableFindIterRunLimits,
+    ) -> PortableTextSessionMatches<'s, 'r, 'h> {
+        PortableTextSessionMatches {
+            inner: self.inner.find_iter_utf8(haystack, limits),
+        }
+    }
+}
+
+/// Fallible text-match iterator borrowing an existing text search session.
+#[derive(Debug)]
+pub struct PortableTextSessionMatches<'s, 'r, 'h> {
+    inner: PortableSessionMatches<'s, 'r, 'h>,
+}
+
+impl PortableTextSessionMatches<'_, '_, '_> {
+    /// Exact counters accumulated by this iterator.
+    #[must_use]
+    pub const fn accounting(&self) -> PortableFindIterAccounting {
+        self.inner.accounting()
+    }
+
+    /// The reused session's one-time K0 setup facts.
+    ///
+    /// These facts predate this iterator and are not included in
+    /// [`Self::accounting`].
+    #[must_use]
+    pub const fn workspace_setup_accounting(&self) -> Option<SearchSessionSetupAccounting> {
+        self.inner.workspace_setup_accounting()
+    }
+}
+
+impl Iterator for PortableTextSessionMatches<'_, '_, '_> {
+    type Item = Result<Match, PortableFindIterError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+}
+
+impl core::iter::FusedIterator for PortableTextSessionMatches<'_, '_, '_> {}
 
 /// Fallible iterator over every non-overlapping Rust text match.
 ///
