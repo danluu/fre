@@ -125,7 +125,7 @@
     },
     "ordinal_interval": "zero-based-half-open",
     "assignment": "one immutable fragment per exact interval",
-    "pair_placement": "all six timing pairs remain in one row-worker process; Linux variants remain on the requested CPU and accepted macOS variants remain in the authenticated Super CPU class",
+    "pair_placement": "all six timing pairs remain in one row-worker process; both variants calibrate through at least 5000000 ns to a 600000000 ns target; Linux variants remain on the requested CPU and accepted macOS variants remain in the authenticated Super CPU class",
     "cpu_residence": {
       "linux": "hard sched_setaffinity binding plus CPU-before/after samples for every measured variant",
       "macos": {
@@ -254,7 +254,7 @@
       "timed_sha256": "a92a59554188a82b6e7c49833dda599aa7d87014ae6815ba9fbe0f5502b31a4c",
       "correctness_static_rows": 49248,
       "correctness_portable_rows": 74176,
-      "timing_role": "complete immutable mechanism prerequisite; every frozen universal gate remains mandatory, while direct V17 candidate measurements grant no production-policy authority"
+      "timing_role": "complete immutable mechanism prerequisite with the frozen 4093-byte direct-mechanism floor; every frozen universal gate remains mandatory, while direct V17 candidate measurements grant no production-policy authority"
     },
     "long-policy": {
       "schema": "fre.aot.search-tag30-long-input-policy-projection.v1",

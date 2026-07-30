@@ -38,7 +38,7 @@ const CONTRACT_SCHEMA: &str = "fre.aot.search-tag30-qualification-campaign-contr
 const PREPARED_INPUTS_SCHEMA: &str = "fre.aot.search-tag30-prepared-inputs.v1";
 const DISCOVERY_AUTHORIZATION_SCHEMA: &str =
     "fre.aot.search-tag30-qualification-discovery-authorization.v1";
-const CONTRACT_SHA256: &str = "0ea6b3aefac2d31e67aae3acdef3b9f65d0b0fa91421a9ec5c3afe5517c9b2fd";
+const CONTRACT_SHA256: &str = "d0089e28142c22dac9819f5241a61b6d5f4eea344ac05768a246b7617d51287f";
 const LEARNED_FREEZE_SHA256: &str =
     "367ad3655ec2f70d4a8173f68df76013fdf32dd95e07d1ebeeedb14c580b817f";
 const LEARNED_GENERATOR_SHA256: &str =
@@ -166,6 +166,9 @@ struct StagedRefusal {
     reason = "the build transaction deliberately keeps identity validation, object emission, and exact linker publication in one auditable sequence"
 )]
 fn main() {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+        println!("cargo:rustc-link-arg=-Wl,-z,separate-code");
+    }
     println!("cargo:rerun-if-env-changed={IDENTITY_ENV}");
     println!("cargo:rerun-if-env-changed={REVISION_ENV}");
     println!("cargo:rerun-if-env-changed={SOURCE_ARCHIVE_ENV}");

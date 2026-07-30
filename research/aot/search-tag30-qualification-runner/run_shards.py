@@ -16,7 +16,7 @@ from typing import Any, Mapping, Sequence
 
 
 CONTRACT_SHA256 = (
-    "0ea6b3aefac2d31e67aae3acdef3b9f65d0b0fa91421a9ec5c3afe5517c9b2fd"
+    "d0089e28142c22dac9819f5241a61b6d5f4eea344ac05768a246b7617d51287f"
 )
 CONTRACT_SCHEMA = "fre.aot.search-tag30-qualification-campaign-contract.v1"
 HOST_TARGETS = {

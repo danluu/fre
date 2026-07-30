@@ -140,7 +140,7 @@
     "fixture_oracle": "scalar-overlapping-leftmost",
     "paired_order": "alternating",
     "repetitions": 6,
-    "target_elapsed_ns": 440000000,
+    "target_elapsed_ns": 600000000,
     "minimum_elapsed_ns": 400000000,
     "calibrate_both_variants": true
   },

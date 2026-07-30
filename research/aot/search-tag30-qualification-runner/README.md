@@ -6,7 +6,7 @@ policy. Rebar, benchmark output, and campaign results cannot change literal
 membership, fixture membership, sharding, routing, gates, or exclusions.
 
 The contract SHA-256 is
-`0ea6b3aefac2d31e67aae3acdef3b9f65d0b0fa91421a9ec5c3afe5517c9b2fd`.
+`d0089e28142c22dac9819f5241a61b6d5f4eea344ac05768a246b7617d51287f`.
 Prepare the closed input set from a clean repository into a new directory:
 
 ```text
@@ -17,7 +17,7 @@ The preparer creates four projections, the 808-object-candidate manifest, the
 922-literal disposition manifest (including 114 structural refusals), the
 projection summaries, and `prepared-inputs.json`. Two independent generations
 must be byte-identical. For this contract the prepared-input file SHA-256 is
-`e8a8c4a74a55372fb3651cc84de7ab58147f65f20b806812d5af4ae1580e5c85`.
+`9801e5977fae3592b2c1ceeb9a6d483afce658df5489640f05f4d00e603a487c`.
 All files are created new and made read-only.
 
 ## Two-stage private-family sealing
@@ -49,6 +49,11 @@ neutral-inspected 20-field family tuple and all 808 object receipts plus 114
 structural-refusal receipts. Review and SHA-pin both target receipts, then
 make the reviewed copies read-only and create the authorization from the same
 clean discovery checkout:
+
+On Linux the package itself passes `-Wl,-z,separate-code`. The final ELF must
+therefore expose distinct read-only, read-execute, and read-write load
+segments; the runtime verifier rejects an executable mapping for immutable
+expectation or metadata bytes.
 
 ```text
 python3 prepare_discovery_authorization.py \

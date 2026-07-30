@@ -436,7 +436,7 @@ class ImmutabilityTests(unittest.TestCase):
                     if repetition % 2 == 0
                     else "candidate-first"
                 ),
-                "iterations": 10,
+                "iterations": 14,
                 "portable_elapsed_ns": 500_000_000,
                 "candidate_elapsed_ns": 450_000_000,
                 "portable_checksum": 7,
@@ -485,7 +485,7 @@ class ImmutabilityTests(unittest.TestCase):
                 "target_elapsed_ns": analyzer.CALIBRATION_TARGET_NS,
                 "floor_elapsed_ns": analyzer.CALIBRATION_FLOOR_NS,
                 "maximum_iterations": analyzer.MAXIMUM_ITERATIONS,
-                "selected_iterations": 10,
+                "selected_iterations": 14,
                 "portable_pilots": [
                     {
                         "iterations": 1,
@@ -530,12 +530,12 @@ class ImmutabilityTests(unittest.TestCase):
         analyzer.parse_timing_record(
             record, expected, row, 0, "universal", 3
         )
-        pairs[1]["iterations"] = 11
+        pairs[1]["iterations"] = 15
         with self.assertRaises(analyzer.Refusal):
             analyzer.parse_timing_record(
                 record, expected, row, 0, "universal", 3
             )
-        pairs[1]["iterations"] = 10
+        pairs[1]["iterations"] = 14
         pairs[1]["portable_checksum"] = 9
         pairs[1]["candidate_checksum"] = 9
         with self.assertRaises(analyzer.Refusal):

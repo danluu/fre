@@ -43,7 +43,7 @@ mod generated {
 
 type DynError = Box<dyn Error>;
 
-const CONTRACT_SHA256: &str = "0ea6b3aefac2d31e67aae3acdef3b9f65d0b0fa91421a9ec5c3afe5517c9b2fd";
+const CONTRACT_SHA256: &str = "d0089e28142c22dac9819f5241a61b6d5f4eea344ac05768a246b7617d51287f";
 const CONTRACT_SCHEMA: &str = "fre.aot.search-tag30-qualification-campaign-contract.v1";
 const UNIVERSAL_ROW_SCHEMA: &str = "fre.aot.search-tag30-learned-continuation-projection.v1";
 const LONG_ROW_SCHEMA: &str = "fre.aot.search-tag30-long-input-policy-projection.v1";
@@ -63,6 +63,7 @@ const LONG_FULL_SHA256: &str = "c912b402244ff9814fe6160f9f5a117d7b253af5ff35ee69
 const LONG_TIMED_ROWS: usize = 1_458;
 const LONG_TIMED_SHA256: &str = "b3093f9fed70fd500852742d18994fce80d4a144cb9b9cbaac4ad0e7f84ccffd";
 const EXPECTED_CANDIDATES: usize = 808;
+const UNIVERSAL_DIRECT_MINIMUM_WINDOW_BYTES: usize = 4_093;
 const PRODUCTION_INPUT_FLOOR: usize = 65_536;
 const PORTABLE_PREFIX_CANDIDATE_STARTS: usize = 256;
 const FAMILY_SELECTOR: u16 = 13;
@@ -70,8 +71,8 @@ const SHARDS: usize = 16;
 const DIAGNOSTIC_ROWS: usize = 30;
 const REPETITIONS: usize = 6;
 const MINIMUM_ELAPSED_NS: u64 = 400_000_000;
-const CALIBRATION_TARGET_NS: u64 = 440_000_000;
-const CALIBRATION_FLOOR_NS: u64 = 100_000;
+const CALIBRATION_TARGET_NS: u64 = 600_000_000;
+const CALIBRATION_FLOOR_NS: u64 = 5_000_000;
 const MAXIMUM_ITERATIONS: usize = 1 << 30;
 const MAXIMUM_ROW_BYTES: usize = 32 * 1024;
 const MAXIMUM_CONTRACT_BYTES: u64 = 128 * 1024;
@@ -1144,6 +1145,10 @@ fn adopt(index: usize) -> Result<&'static VerifiedStaticSearchSpanV1, DynError> 
     Ok(verified)
 }
 
+const fn universal_direct_route_expected(selector_eligible: bool, window_bytes: usize) -> bool {
+    selector_eligible && window_bytes >= UNIVERSAL_DIRECT_MINIMUM_WINDOW_BYTES
+}
+
 fn validate_row(kind: ProjectionKind, row: &ProjectionRow) -> Result<(), io::Error> {
     require(row.schema == kind.row_schema(), "projection schema changed")?;
     let universal_contract = row.fixture_recipe.construction_version
@@ -1166,7 +1171,8 @@ fn validate_row(kind: ProjectionKind, row: &ProjectionRow) -> Result<(), io::Err
         ProjectionKind::Universal => require(
             row.parent_schema.is_none()
                 && row.expected_static_invoked == (row.expected_route == "tag30-static-tail")
-                && row.expected_static_invoked == row.selector_eligible,
+                && row.expected_static_invoked
+                    == universal_direct_route_expected(row.selector_eligible, row.window_bytes),
             "universal tag30 route changed",
         ),
         ProjectionKind::LongPolicy | ProjectionKind::Diagnostic => {
@@ -2013,6 +2019,13 @@ mod tests {
             ProjectionKind::LongPolicy.expected_route_counts(),
             (23_328, 100_096)
         );
+    }
+
+    #[test]
+    fn universal_direct_route_has_the_frozen_mechanism_floor() {
+        assert!(!universal_direct_route_expected(true, 4_092));
+        assert!(universal_direct_route_expected(true, 4_093));
+        assert!(!universal_direct_route_expected(false, usize::MAX));
     }
 
     #[cfg(target_os = "linux")]
