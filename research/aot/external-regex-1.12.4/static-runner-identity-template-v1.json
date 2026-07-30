@@ -1,0 +1,80 @@
+{
+  "schema": "fre.aot.external-regex-1.12.4-static-runner-identity.v1",
+  "external_evidence": {
+    "source_commit": "93c24d3b2618597c3336457ee570cbe00cc33bd3",
+    "development_inventory_sha256": "3b409957d42482b170df43ac58bfb08c019c4236b9bee95304a8419931f3d52f",
+    "contamination_index_sha256": "0d5b663c5da923f1284b1577e0866d78b54ecb7890942604d6d09b0a4737d08b",
+    "fixture_algorithm_sha256": "e99dfb5dce720484968fb074b0807f2636724e297cc682fd87575b8d5ceadd48",
+    "fixture_manifest_sha256": "b979ed327db7e9623bccba1ef775d1957b7323c8b30edb44f40593176f52b44a",
+    "candidate_count": 4,
+    "fixture_count": 28,
+    "rebar_overlap_disposition": "corroboration-only"
+  },
+  "emitter": {
+    "source_commit": "1632949174b6a1f95981e0f68133217a267a4f8e",
+    "backend": "AsimdV10",
+    "backend_tag": 23,
+    "aot_magic_hex": "4652454136340017",
+    "candidate_policy": 10,
+    "authorization": false,
+    "llvm": false
+  },
+  "static_pipeline": {
+    "source_commit": null,
+    "object_contract_schema": null,
+    "compiler_identity": null,
+    "object_formats": [
+      "macho-aarch64",
+      "elf-aarch64"
+    ],
+    "link_interface_schema": null
+  },
+  "auto_routing": {
+    "source_commit": null,
+    "policy_identity": null,
+    "minimum_literal_bytes": null,
+    "maximum_literal_bytes": null,
+    "minimum_window_bytes": null,
+    "portable_prefix_candidate_starts": null,
+    "full_window_preflight_authoritative": null
+  },
+  "static_facade": {
+    "source_commit": null,
+    "source_set_sha256": null,
+    "abi": null,
+    "output": "Span",
+    "jit_publication": false,
+    "construction_in_steady_timing": false,
+    "link_adoption_in_steady_timing": false
+  },
+  "platform_artifacts": {
+    "macos_aarch64": {
+      "object_sha256": null,
+      "linked_image_sha256": null,
+      "symbol_receipt_sha256": null,
+      "facade_receipt_sha256": null
+    },
+    "linux_aarch64": {
+      "object_sha256": null,
+      "linked_image_sha256": null,
+      "symbol_receipt_sha256": null,
+      "facade_receipt_sha256": null
+    }
+  },
+  "runner": {
+    "source_commit": null,
+    "source_set_sha256": null,
+    "compiler_family": null,
+    "fixture_oracle": "scalar-overlapping-leftmost-and-nonoverlapping-count",
+    "paired_order": "alternating",
+    "repetitions": 6,
+    "target_elapsed_ns": 500000000,
+    "minimum_elapsed_ns": 400000000,
+    "calibrate_both_variants": true
+  },
+  "state": {
+    "heldout_materialized": false,
+    "development_timing_permitted": false,
+    "blocker": "static object/link/facade and auto-routing identities are unresolved"
+  }
+}
