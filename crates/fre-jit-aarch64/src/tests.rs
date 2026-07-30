@@ -4557,6 +4557,7 @@ fn explicit_search_backend_policy_selects_distinct_artifact_identities() {
         (SearchBackendPolicy::AsimdV14, BackendVersion::SEARCH_V14),
         (SearchBackendPolicy::AsimdV15, BackendVersion::SEARCH_V15),
         (SearchBackendPolicy::AsimdV16, BackendVersion::SEARCH_V16),
+        (SearchBackendPolicy::AsimdV17, BackendVersion::SEARCH_V17),
         (SearchBackendPolicy::Sve16, BackendVersion::SEARCH_SVE16_V1),
         (
             SearchBackendPolicy::Sve2Fixed16,
@@ -7678,6 +7679,326 @@ fn v16_stages_repeated_learned_bytes_before_full_recovery() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the V17 graph test binds continuation edges, traced repeated misses, mutations, wire identity, and cross-version sealing together"
+)]
+fn v17_retains_learned_masks_across_exact_candidate_misses() {
+    let literal = [
+        0x63, 0x1c, 0x0e, 0x53, 0xc4, 0xe4, 0xb3, 0x5c, 0xf7, 0x1d, 0x14, 0xcc, 0x07, 0xdb, 0x88,
+        0x7b, 0xa2, 0x41, 0x99, 0xb9, 0x02, 0x92, 0xbb, 0x79, 0x4c, 0xe1, 0x0b, 0x28, 0x92, 0x63,
+        0x68, 0x3d,
+    ];
+    let program =
+        build_exact_literal::<Span>(&literal, AnchorFlags::default(), ValidateLimits::default())
+            .expect("V17 continuation IR");
+    let v16 = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV16,
+        EmitLimits::default(),
+    )
+    .expect("frozen V16 image");
+    let v17 = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV17,
+        EmitLimits::default(),
+    )
+    .expect("V17 continuation image");
+    assert_eq!(v17.backend_version(), BackendVersion::SEARCH_V17);
+    assert_eq!(
+        v17.search_manifest()
+            .expect("V17 manifest")
+            .candidate_policy_version,
+        15,
+        "V17 changes only the graph, not phase-unique admission"
+    );
+    assert_eq!(
+        &v17.to_aot(AotLimits::default())
+            .expect("bounded V17 AOT")
+            .as_bytes()[..8],
+        b"FREA64\0\x1e"
+    );
+    assert_ne!(v17.code(), v16.code());
+    assert_ne!(v17.artifact_identity(), v16.artifact_identity());
+    audit(&v17).expect("independent V17 learned-continuation template");
+
+    let decoded = decode(v17.code()).expect("V17 continuation decode");
+    assert!(
+        !decoded.iter().any(|instruction| {
+            *instruction
+                == DecodedInstruction::MoveZero64 {
+                    destination: 11,
+                    immediate: 2,
+                    shift: 0,
+                }
+        }),
+        "V17 must not contain the learned-disabled state transition"
+    );
+    let learned_byte = decoded
+        .iter()
+        .position(|instruction| {
+            *instruction
+                == DecodedInstruction::DuplicateByte16 {
+                    destination: 24,
+                    source: 13,
+                }
+        })
+        .expect("V17 learned byte");
+    let learned_offset = decoded
+        .iter()
+        .position(|instruction| {
+            *instruction
+                == DecodedInstruction::DuplicateByte16 {
+                    destination: 25,
+                    source: 11,
+                }
+        })
+        .expect("V17 learned offset");
+    assert_eq!(learned_offset, learned_byte + 1);
+    let candidate_miss = decoded
+        .windows(5)
+        .position(|window| {
+            window[0]
+                == DecodedInstruction::SubtractImmediate64 {
+                    destination: 10,
+                    source: 0,
+                    immediate: 1,
+                }
+                && window[1]
+                    == DecodedInstruction::AndRegister64 {
+                        destination: 0,
+                        left: 0,
+                        right: 10,
+                    }
+                && matches!(
+                    window[2],
+                    DecodedInstruction::CompareBranchZero64 {
+                        register: 11,
+                        nonzero: false,
+                        ..
+                    }
+                )
+                && matches!(
+                    window[3],
+                    DecodedInstruction::CompareBranchZero64 {
+                        register: 0,
+                        nonzero: true,
+                        ..
+                    }
+                )
+                && matches!(window[4], DecodedInstruction::Branch { .. })
+        })
+        .expect("V17 candidate-miss continuation gate");
+
+    let manifest = v17.search_manifest().expect("V17 selected offsets");
+    let selected = [
+        manifest.primary_offset,
+        manifest.secondary_offset,
+        manifest.verification_offset,
+        manifest.quaternary_offset,
+        manifest.quinary_offset,
+    ];
+    let unselected = (0_u16..u16::try_from(literal.len()).expect("small literal"))
+        .filter(|offset| !selected.contains(offset))
+        .collect::<Vec<_>>();
+    assert!(unselected.len() >= 2);
+    let learned_mutation = usize::from(unselected[0]);
+    let later_mutation = usize::from(unselected[1]);
+    let mut first_near_miss = literal;
+    first_near_miss[learned_mutation] = literal[learned_mutation].wrapping_add(1);
+    let mut later_near_miss = literal;
+    later_near_miss[later_mutation] = literal[later_mutation].wrapping_add(1);
+    let mut haystack = Vec::new();
+    // Candidate zero takes the frozen first-candidate path. The second copy
+    // reaches ordinary recovery and teaches `learned_mutation`; every later
+    // copy matches that newly learned column but misses at `later_mutation`.
+    haystack.extend_from_slice(&first_near_miss);
+    haystack.extend_from_slice(&first_near_miss);
+    for _ in 0..96 {
+        haystack.extend_from_slice(&later_near_miss);
+    }
+    haystack.extend_from_slice(&literal);
+    let expected = program
+        .execute(
+            &haystack,
+            SearchWindow::new(0, haystack.len()),
+            ExecutionLimits::unlimited(),
+        )
+        .expect("V17 traced oracle")
+        .output()
+        .map(|span| (span.start(), span.end()));
+    let (actual, trace) = simulate_with_instruction_trace(&v17, &haystack, 0, haystack.len())
+        .expect("V17 traced safe ISA simulation");
+    assert_eq!(span_output(actual), expected);
+    assert_eq!(
+        trace.iter().filter(|&&index| index == learned_byte).count(),
+        1,
+        "the mismatch column is learned once"
+    );
+    assert!(
+        trace
+            .iter()
+            .filter(|&&index| index == candidate_miss)
+            .count()
+            >= 32,
+        "many later exact misses must return through the same active learned gate"
+    );
+    let learned_block_probe = decoded
+        .iter()
+        .enumerate()
+        .filter_map(|(index, instruction)| {
+            (*instruction
+                == DecodedInstruction::MoveVectorByteTo32 {
+                    destination: 10,
+                    source: 25,
+                })
+            .then_some(index)
+        })
+        .nth(1)
+        .expect("V17 subsequent learned-block probe");
+    assert!(
+        trace
+            .iter()
+            .filter(|&&index| index == learned_block_probe)
+            .count()
+            >= 32,
+        "later blocks must continue probing the retained learned column"
+    );
+
+    let DecodedInstruction::CompareBranchZero64 {
+        register,
+        displacement,
+        ..
+    } = decoded[candidate_miss + 3]
+    else {
+        unreachable!("selected V17 active-mask branch")
+    };
+    let mut inverted_continuation = v17.clone();
+    replace_test_branch_and_relocation_at(
+        &mut inverted_continuation,
+        candidate_miss + 3,
+        DecodedInstruction::CompareBranchZero64 {
+            register,
+            nonzero: false,
+            displacement,
+        },
+    );
+    assert_resealed_search_rejected(
+        inverted_continuation,
+        "V17 active retained-mask continuation inversion",
+    );
+
+    let mut v17_as_v16 = v17;
+    v17_as_v16.backend_version = BackendVersion::SEARCH_V16;
+    v17_as_v16
+        .search
+        .as_mut()
+        .expect("V17 manifest")
+        .backend_version = BackendVersion::SEARCH_V16;
+    assert_resealed_search_rejected(v17_as_v16, "V17 code resealed as V16");
+
+    let mut v16_as_v17 = v16;
+    v16_as_v17.backend_version = BackendVersion::SEARCH_V17;
+    v16_as_v17
+        .search
+        .as_mut()
+        .expect("V16 manifest")
+        .backend_version = BackendVersion::SEARCH_V17;
+    assert_resealed_search_rejected(v16_as_v17, "V16 code resealed as V17");
+}
+
+#[test]
+fn v17_bounded_deterministic_fuzz_matches_the_kir_oracle() {
+    let mut state = 0x86a3_5b19_d20f_47c1_u64;
+    let mut comparisons = 0_u64;
+    for width in 6_usize..=MAX_REPEATED_CONFIRM_BYTES {
+        let literal = (0..width)
+            .map(|offset| {
+                u8::try_from(offset)
+                    .expect("bounded V17 width")
+                    .wrapping_mul(61)
+                    .wrapping_add(7)
+            })
+            .collect::<Vec<_>>();
+        let program = build_exact_literal::<Span>(
+            &literal,
+            AnchorFlags::default(),
+            ValidateLimits::default(),
+        )
+        .expect("V17 fuzz IR");
+        let image = emit_with_backend(
+            &program,
+            SearchBackendPolicy::AsimdV17,
+            EmitLimits::default(),
+        )
+        .expect("V17 fuzz image");
+        audit(&image).expect("V17 fuzz image audit");
+        let manifest = image.search_manifest().expect("V17 fuzz manifest");
+        let selected = [
+            manifest.primary_offset,
+            manifest.secondary_offset,
+            manifest.verification_offset,
+            manifest.quaternary_offset,
+            manifest.quinary_offset,
+        ]
+        .map(usize::from);
+        let unselected = (0..width)
+            .filter(|offset| !selected.contains(offset))
+            .collect::<Vec<_>>();
+        assert!(!unselected.is_empty());
+        let avoid = (0_u16..=255)
+            .map(|value| u8::try_from(value).expect("bounded byte"))
+            .find(|byte| !literal.contains(byte))
+            .expect("V17 fuzz literal leaves an avoiding byte");
+
+        for case in 0..8_usize {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let mutation_offset =
+                unselected[usize::try_from(state).expect("host usize") % unselected.len()];
+            let mut near_miss = literal.clone();
+            near_miss[mutation_offset] = literal[(mutation_offset + 1) % width];
+            let prefix = usize::try_from(state >> 8).expect("host usize") & 15;
+            let repetitions = 5 + (usize::try_from(state >> 16).expect("host usize") % 37);
+            let mut haystack = vec![avoid; prefix];
+            for _ in 0..repetitions {
+                haystack.extend_from_slice(&near_miss);
+            }
+            if case & 1 == 0 {
+                haystack.extend_from_slice(&literal);
+            } else {
+                haystack.extend_from_slice(&near_miss);
+            }
+            for (start, end) in [
+                (0, haystack.len()),
+                (prefix.min(haystack.len()), haystack.len()),
+                (0, haystack.len().saturating_sub(case & 1)),
+            ] {
+                let expected = program
+                    .execute(
+                        &haystack,
+                        SearchWindow::new(start, end),
+                        ExecutionLimits::unlimited(),
+                    )
+                    .expect("V17 fuzz oracle")
+                    .output()
+                    .map(|span| (span.start(), span.end()));
+                let actual =
+                    simulate(&image, &haystack, start, end).expect("V17 fuzz safe ISA simulation");
+                assert_eq!(
+                    span_output(actual),
+                    expected,
+                    "width={width} case={case} mutation={mutation_offset} window={start}..{end}"
+                );
+                comparisons = comparisons.checked_add(1).expect("bounded fuzz matrix");
+            }
+        }
+    }
+    assert_eq!(comparisons, 648);
+}
+
+#[test]
 fn v13_adaptive_recovery_decoded_edges_cover_zero_one_and_max_remaining_columns() {
     for (width, expected_columns) in [(5_usize, 0_usize), (6, 1), (32, 27)] {
         let literal = vec![b'a'; width];
@@ -7866,7 +8187,7 @@ fn v13_adaptive_recovery_decoded_edges_cover_zero_one_and_max_remaining_columns(
 }
 
 #[test]
-fn v9_through_v16_reject_shapes_without_one_nonempty_unanchored_exact_candidate() {
+fn v9_through_v17_reject_shapes_without_one_nonempty_unanchored_exact_candidate() {
     for backend in [
         SearchBackendPolicy::AsimdV9,
         SearchBackendPolicy::AsimdV10,
@@ -7876,6 +8197,7 @@ fn v9_through_v16_reject_shapes_without_one_nonempty_unanchored_exact_candidate(
         SearchBackendPolicy::AsimdV14,
         SearchBackendPolicy::AsimdV15,
         SearchBackendPolicy::AsimdV16,
+        SearchBackendPolicy::AsimdV17,
     ] {
         for anchors in [
             AnchorFlags {

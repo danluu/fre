@@ -3291,6 +3291,91 @@ fn v16_learned_recovery_images_publish_and_respect_guarded_adversarial_streams()
 }
 
 #[test]
+fn v17_learned_continuation_executes_across_guarded_repeated_survivors() {
+    let _lock = native_test_lock();
+    let mut comparisons = 0_u64;
+    for width in [7_usize, 16, 32] {
+        let literal = (0..width)
+            .map(|offset| {
+                u8::try_from(offset)
+                    .expect("bounded V17 width")
+                    .wrapping_mul(61)
+                    .wrapping_add(7)
+            })
+            .collect::<Vec<_>>();
+        let program = build_exact_literal::<Span>(
+            &literal,
+            AnchorFlags::default(),
+            ValidateLimits::default(),
+        )
+        .expect("V17 continuation program");
+        let image = emit_audited_with_backend(
+            &program,
+            SearchBackendPolicy::AsimdV17,
+            EmitLimits::default(),
+        )
+        .expect("audited V17 continuation image");
+        assert_eq!(
+            image.as_image().backend_version(),
+            BackendVersion::SEARCH_V17
+        );
+        let selected = decode(image.as_image().code())
+            .expect("V17 continuation decode")
+            .into_iter()
+            .filter_map(|instruction| match instruction {
+                DecodedInstruction::LoadByte {
+                    destination: 11,
+                    base: 8,
+                    offset,
+                } => Some(usize::from(offset)),
+                _ => None,
+            })
+            .take(5)
+            .collect::<Vec<_>>();
+        assert_eq!(selected.len(), 5);
+        let unselected = (0..width)
+            .filter(|offset| !selected.contains(offset))
+            .collect::<Vec<_>>();
+        assert!(unselected.len() >= 2);
+        let learned_mutation = unselected[0];
+        let later_mutation = unselected[1];
+        let mut first_near_miss = literal.clone();
+        first_near_miss[learned_mutation] = literal[learned_mutation].wrapping_add(1);
+        let mut later_near_miss = literal.clone();
+        later_near_miss[later_mutation] = literal[later_mutation].wrapping_add(1);
+        let kernel =
+            publish_audited::<Span>(&image, PublicationLimits::default()).expect("publish V17");
+
+        for install_match in [false, true] {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&first_near_miss);
+            bytes.extend_from_slice(&first_near_miss);
+            for _ in 0..257 {
+                bytes.extend_from_slice(&later_near_miss);
+            }
+            if install_match {
+                bytes.extend_from_slice(&literal);
+            } else {
+                bytes.extend_from_slice(&later_near_miss);
+            }
+            for right_boundary in [false, true] {
+                platform::with_guarded_haystack(&bytes, right_boundary, |guarded| {
+                    assert_native_matches(
+                        &program,
+                        &kernel,
+                        guarded,
+                        SearchWindow::new(0, guarded.len()),
+                    );
+                })
+                .expect("guarded V17 repeated learned survivors");
+                comparisons = comparisons.checked_add(1).expect("bounded comparisons");
+            }
+        }
+    }
+    assert_eq!(comparisons, 12);
+}
+
+#[test]
 #[allow(
     clippy::too_many_lines,
     reason = "the width/topology matrix keeps learned-mode, vector-tail, one-candidate, and clipped-window guard cases explicit"

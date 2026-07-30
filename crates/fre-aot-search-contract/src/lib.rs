@@ -81,6 +81,12 @@ pub const SEARCH_BACKEND_ASIMD_TAG28_V1: u16 = 28;
 /// frozen broad qualification family grants execution authority. Tag28
 /// remains frozen and rejected.
 pub const SEARCH_BACKEND_ASIMD_TAG29_V1: u16 = 29;
+/// Advanced SIMD Search V17/tag30 with retained learned-mask continuation.
+///
+/// This remains an inert compiler/static-link identity until a separately
+/// frozen broad qualification family grants execution authority. Tag29
+/// remains frozen and unchanged.
+pub const SEARCH_BACKEND_ASIMD_TAG30_V1: u16 = 30;
 /// Explicit fixed-VL16 SVE2 candidate backend. This never changes the V8
 /// default or grants qualification authority.
 pub const SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1: u16 = 21;
@@ -535,6 +541,7 @@ const fn valid_metadata_target_profile(backend: u16, platform: u8, features: u64
             | SEARCH_BACKEND_ASIMD_TAG26_V1
             | SEARCH_BACKEND_ASIMD_TAG28_V1
             | SEARCH_BACKEND_ASIMD_TAG29_V1
+            | SEARCH_BACKEND_ASIMD_TAG30_V1
     ) && (platform == SEARCH_PLATFORM_MACOS_V1 || platform == SEARCH_PLATFORM_LINUX_V1)
         && features == SEARCH_REQUIRED_ASIMD_FEATURES_V1;
     let tag21 = backend == SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1
@@ -558,7 +565,8 @@ const fn valid_expectation_target_profile(
                 | SEARCH_BACKEND_ASIMD_TAG25_V1
                 | SEARCH_BACKEND_ASIMD_TAG26_V1
                 | SEARCH_BACKEND_ASIMD_TAG28_V1
-                | SEARCH_BACKEND_ASIMD_TAG29_V1,
+                | SEARCH_BACKEND_ASIMD_TAG29_V1
+                | SEARCH_BACKEND_ASIMD_TAG30_V1,
             SEARCH_PLATFORM_MACOS_V1,
             SEARCH_REQUIRED_ASIMD_FEATURES_V1,
             SEARCH_EXPORTED_SYMBOL_N_TYPE_V1,
@@ -569,7 +577,8 @@ const fn valid_expectation_target_profile(
                 | SEARCH_BACKEND_ASIMD_TAG25_V1
                 | SEARCH_BACKEND_ASIMD_TAG26_V1
                 | SEARCH_BACKEND_ASIMD_TAG28_V1
-                | SEARCH_BACKEND_ASIMD_TAG29_V1,
+                | SEARCH_BACKEND_ASIMD_TAG29_V1
+                | SEARCH_BACKEND_ASIMD_TAG30_V1,
             SEARCH_PLATFORM_LINUX_V1,
             SEARCH_REQUIRED_ASIMD_FEATURES_V1,
             SEARCH_EXPORTED_SYMBOL_INFO_ELF_FUNCTION_V1,
@@ -1277,6 +1286,7 @@ mod tests {
         assert_eq!(SEARCH_BACKEND_ASIMD_TAG26_V1, 26);
         assert_eq!(SEARCH_BACKEND_ASIMD_TAG28_V1, 28);
         assert_eq!(SEARCH_BACKEND_ASIMD_TAG29_V1, 29);
+        assert_eq!(SEARCH_BACKEND_ASIMD_TAG30_V1, 30);
         assert_eq!(SEARCH_SPAN_OUTPUT_KIND_V1, 3);
         assert_eq!(SEARCH_REQUIRED_ASIMD_FEATURES_V1, 1);
         assert_eq!(MIN_STATIC_SEARCH_SPAN_LITERAL_BYTES_V1, 1);
@@ -1295,7 +1305,7 @@ mod tests {
     }
 
     #[test]
-    fn linux_v8_v9_v10_v12_v13_v15_v16_and_explicit_tag21_profiles_are_structurally_admitted() {
+    fn linux_v8_through_v17_candidates_and_explicit_tag21_are_structurally_admitted() {
         for (backend, features) in [
             (SEARCH_BACKEND_VERSION_V1, SEARCH_REQUIRED_ASIMD_FEATURES_V1),
             (
@@ -1320,6 +1330,10 @@ mod tests {
             ),
             (
                 SEARCH_BACKEND_ASIMD_TAG29_V1,
+                SEARCH_REQUIRED_ASIMD_FEATURES_V1,
+            ),
+            (
+                SEARCH_BACKEND_ASIMD_TAG30_V1,
                 SEARCH_REQUIRED_ASIMD_FEATURES_V1,
             ),
             (
