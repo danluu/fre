@@ -20,6 +20,7 @@ libc = "=0.2.186"
 [build-dependencies]
 fre = { path = "../../../crates/fre", default-features = false }
 fre-aot-compiler = { path = "../../../crates/fre-aot-compiler" }
+fre-aot-search-contract = { path = "../../../crates/fre-aot-search-contract" }
 fre-jit-aarch64 = { path = "../../../crates/fre-jit-aarch64" }
 fre-kernel-ir = { path = "../../../crates/fre-kernel-ir" }
 serde_json = "=1.0.150"

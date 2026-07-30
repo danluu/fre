@@ -233,6 +233,7 @@ version = "0.1.0"
 dependencies = [
  "fre",
  "fre-aot-compiler",
+ "fre-aot-search-contract",
  "fre-aot-static-runtime",
  "fre-jit-aarch64",
  "fre-kernel-ir",
