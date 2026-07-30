@@ -64,7 +64,7 @@ ORDERS = (
     ("count-v3-aot", "count-v2-current", "portable-current"),
 )
 TEMPORARY_UNAVAILABLE = 75
-MINIMUM_AOT_BYTES = 4_096
+MINIMUM_AOT_BYTES = 65_536
 MINIMUM_REPETITIONS = 30
 MAXIMUM_REPETITIONS = 60
 MINIMUM_SAMPLE_NS = 1_000_000_000
@@ -81,7 +81,7 @@ HEX64 = re.compile(r"^[0-9a-f]{64}$")
 SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,95}$")
 RESULT_DOMAIN = b"fre.optimizing-count-v3.production-confirmation.result.v1\0"
 WORK_DOMAIN = b"fre.optimizing-count-v3.production-confirmation.work.v1\0"
-LONG_SCAN_POLICY = "minimum-haystack-4096-bytes-v1"
+LONG_SCAN_POLICY = "minimum-haystack-65536-bytes-v1"
 TIMING_WRAPPER_CONTRACT = "full-lifetime-holder-no-child-on-exit-75-v1"
 GENERAL_ELIGIBILITY_FIELDS = (
     "compiler_version",

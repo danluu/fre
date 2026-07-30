@@ -57,6 +57,29 @@ def eligibility(**changes):
 
 
 class EligibilityTargetTests(unittest.TestCase):
+    def test_production_confirmation_floor_is_64_kib(self) -> None:
+        self.assertEqual(production_confirm.MINIMUM_AOT_BYTES, 65_536)
+        self.assertEqual(
+            production_confirm.LONG_SCAN_POLICY,
+            "minimum-haystack-65536-bytes-v1",
+        )
+        with self.assertRaises(production_confirm.ConfirmationError):
+            production_confirm.require_uint(
+                65_535,
+                production_confirm.MINIMUM_AOT_BYTES,
+                1 << 40,
+                "input bytes",
+            )
+        self.assertEqual(
+            production_confirm.require_uint(
+                65_536,
+                production_confirm.MINIMUM_AOT_BYTES,
+                1 << 40,
+                "input bytes",
+            ),
+            65_536,
+        )
+
     def test_accepts_closed_neon_sve_and_sve2_targets(self) -> None:
         for row in [
             eligibility(

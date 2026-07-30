@@ -13,10 +13,12 @@ fixed-policy exact-literal facade owner from source, and emits exactly one
 fresh Count-v2 control object and one optimizing Count-v3 object for each
 distinct pattern/semantic artifact row.
 
-The authenticated selector universe is restricted before splitting or timing
-by `minimum-haystack-4096-bytes-v1`: every selected cell has
-`input_bytes >= 4096`. The build script independently enforces that floor.
-Haystack length remains absent from the pattern-only compiler input.
+The authenticated production selector is restricted before confirmation by
+`minimum-haystack-65536-bytes-v1`: every selected production cell has
+`input_bytes >= 65536`. This is a conservative tightening of the original
+4,096-byte qualification-universe floor. The build script independently
+enforces the production floor. Haystack length remains absent from the
+pattern-only compiler input.
 
 The regex payload compiler receives no cell, job, family, partition, haystack,
 oracle, or timing value. Cell attribution is joined only after all objects have
