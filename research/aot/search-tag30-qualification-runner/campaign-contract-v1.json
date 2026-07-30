@@ -161,7 +161,8 @@
         "hard_binding_claimed": false,
         "accepted_cpu_class": "Super",
         "accepted_cpu_ids": [12, 13, 14, 15, 16, 17],
-        "pre_variant_wait_yields": 100000,
+        "super_class_wait_timeout_ns": 5000000000,
+        "super_class_wait_poll": "yield-now",
         "maximum_cpu_only_retries_per_variant": 64,
         "retry_rule": "discard and retry the same variant solely when either CPU endpoint is outside the Super set; elapsed time is never consulted for retry",
         "attempt_receipt": "record every discarded and accepted CPU-before/after endpoint plus the exact retry count for calibration pilots and formal timed variants"

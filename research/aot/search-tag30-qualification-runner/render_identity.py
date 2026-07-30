@@ -31,7 +31,7 @@ DISCOVERY_AUTHORIZATION_SCHEMA = (
 )
 CONTRACT_SCHEMA = "fre.aot.search-tag30-qualification-campaign-contract.v1"
 CONTRACT_SHA256 = (
-    "f5a3319b1178ea97766b735bc39b589a6a1a33e8cc9257a947ea9feff7c5f702"
+    "d39dc02c741a13adc8e0c7c3cc818ffa69e96132af89caf0fef6b5dad6d14333"
 )
 OBJECT_SCHEMA = "fre.aot.search-tag30-qualification-object-candidates.v1"
 OBJECT_SHA256 = (
@@ -700,6 +700,7 @@ def load_template(directory: Path) -> dict[str, Any]:
             "calibration_floor_elapsed_ns",
             "calibration_anchor_samples",
             "calibration_iteration_selection",
+            "macos_super_class_wait_timeout_ns",
             "minimum_elapsed_ns",
             "calibrate_both_variants",
         },
@@ -776,6 +777,8 @@ def load_template(directory: Path) -> dict[str, Any]:
         and template["runner"]["calibration_anchor_samples"] == 3
         and template["runner"]["calibration_iteration_selection"]
         == "fastest-same-iteration-anchor-per-variant-then-maximum"
+        and template["runner"]["macos_super_class_wait_timeout_ns"]
+        == 5_000_000_000
         and template["runner"]["minimum_elapsed_ns"] == 400_000_000
         and template["runner"]["calibrate_both_variants"] is True,
         "identity template authority changed",

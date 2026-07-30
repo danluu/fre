@@ -144,6 +144,7 @@
     "calibration_floor_elapsed_ns": 50000000,
     "calibration_anchor_samples": 3,
     "calibration_iteration_selection": "fastest-same-iteration-anchor-per-variant-then-maximum",
+    "macos_super_class_wait_timeout_ns": 5000000000,
     "minimum_elapsed_ns": 400000000,
     "calibrate_both_variants": true
   },

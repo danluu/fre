@@ -708,8 +708,8 @@ class ImmutabilityTests(unittest.TestCase):
             "host_id": analyzer.HOSTS[0],
             "logical_cpu": 12,
             "cpu_residence_method": (
-                "macos-user-interactive-qos-affinity-hint-super-class-"
-                "cpu-only-retry"
+                "macos-user-interactive-qos-affinity-hint-bounded-super-"
+                "wait-cpu-only-retry"
             ),
             "affinity_request_status": 46,
             "qos_class": 0x21,
@@ -718,6 +718,9 @@ class ImmutabilityTests(unittest.TestCase):
             "accepted_cpu_ids": list(analyzer.MACOS_SUPER_CPUS),
             "macos_performance_levels": (
                 analyzer.MACOS_PERFORMANCE_LEVEL_RECEIPT
+            ),
+            "macos_super_class_wait_timeout_ns": (
+                analyzer.MACOS_SUPER_CLASS_WAIT_TIMEOUT_NS
             ),
             "maximum_cpu_only_retries_per_variant": 64,
             "runner_source_sha256": "4" * 64,
@@ -786,6 +789,18 @@ class ImmutabilityTests(unittest.TestCase):
             original = analyzer.PROJECTIONS[("universal", "correctness")]
             analyzer.PROJECTIONS[("universal", "correctness")] = spec
             try:
+                changed_wait = dict(header)
+                changed_wait["macos_super_class_wait_timeout_ns"] -= 1
+                with self.assertRaises(analyzer.Refusal):
+                    analyzer.parse_header(
+                        changed_wait,
+                        analyzer.HOSTS[0],
+                        "correctness",
+                        "universal",
+                        0,
+                        0,
+                        1,
+                    )
                 parsed = analyzer.parse_fragment(
                     path,
                     analyzer.HOSTS[0],

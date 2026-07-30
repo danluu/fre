@@ -43,7 +43,7 @@ mod generated {
 
 type DynError = Box<dyn Error>;
 
-const CONTRACT_SHA256: &str = "f5a3319b1178ea97766b735bc39b589a6a1a33e8cc9257a947ea9feff7c5f702";
+const CONTRACT_SHA256: &str = "d39dc02c741a13adc8e0c7c3cc818ffa69e96132af89caf0fef6b5dad6d14333";
 const CONTRACT_SCHEMA: &str = "fre.aot.search-tag30-qualification-campaign-contract.v1";
 const UNIVERSAL_ROW_SCHEMA: &str = "fre.aot.search-tag30-learned-continuation-projection.v1";
 const LONG_ROW_SCHEMA: &str = "fre.aot.search-tag30-long-input-policy-projection.v1";
@@ -82,7 +82,7 @@ const CHECKSUM_SEED: u64 = 0x6a09_e667_f3bc_c909;
 #[cfg(target_os = "macos")]
 const MAXIMUM_CPU_ONLY_RETRIES: usize = 64;
 #[cfg(target_os = "macos")]
-const MACOS_PRE_VARIANT_WAIT_YIELDS: usize = 100_000;
+const MACOS_SUPER_CLASS_WAIT_TIMEOUT_NS: u64 = 5_000_000_000;
 #[cfg(target_os = "macos")]
 const MACOS_SUPER_CPUS: [usize; 6] = [12, 13, 14, 15, 16, 17];
 #[cfg(target_os = "macos")]
@@ -611,6 +611,7 @@ fn run(
         "accepted_cpu_class": cpu_residence.accepted_cpu_class,
         "accepted_cpu_ids": cpu_residence.accepted_cpu_ids,
         "macos_performance_levels": cpu_residence.macos_performance_levels,
+        "macos_super_class_wait_timeout_ns": macos_super_class_wait_timeout_ns(),
         "maximum_cpu_only_retries_per_variant": maximum_cpu_only_retries(),
         "runner_source_sha256": generated::RUNNER_SOURCE_SHA256,
         "runner_binary_sha256": runner_binary_sha256,
@@ -1670,7 +1671,7 @@ fn pin_current_thread(cpu: usize) -> Result<CpuResidenceReceipt, io::Error> {
     }
     wait_for_measurement_cpu(cpu)?;
     Ok(CpuResidenceReceipt {
-        method: "macos-user-interactive-qos-affinity-hint-super-class-cpu-only-retry",
+        method: "macos-user-interactive-qos-affinity-hint-bounded-super-wait-cpu-only-retry",
         affinity_request_status: status,
         qos_class: Some(QOS_CLASS_USER_INTERACTIVE_RAW),
         qos_request_status: Some(qos_status),
@@ -1871,9 +1872,19 @@ const fn maximum_cpu_only_retries() -> usize {
     MAXIMUM_CPU_ONLY_RETRIES
 }
 
+#[cfg(target_os = "macos")]
+const fn macos_super_class_wait_timeout_ns() -> Option<u64> {
+    Some(MACOS_SUPER_CLASS_WAIT_TIMEOUT_NS)
+}
+
 #[cfg(not(target_os = "macos"))]
 const fn maximum_cpu_only_retries() -> usize {
     0
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn macos_super_class_wait_timeout_ns() -> Option<u64> {
+    None
 }
 
 #[cfg(target_os = "linux")]
@@ -1887,9 +1898,13 @@ fn wait_for_measurement_cpu(expected: usize) -> Result<(), io::Error> {
         MACOS_SUPER_CPUS.contains(&expected),
         "macOS worker label is outside the frozen Super set",
     )?;
-    for _ in 0..MACOS_PRE_VARIANT_WAIT_YIELDS {
+    let start = Instant::now();
+    loop {
         if MACOS_SUPER_CPUS.contains(&current_cpu()?) {
             return Ok(());
+        }
+        if start.elapsed().as_nanos() >= u128::from(MACOS_SUPER_CLASS_WAIT_TIMEOUT_NS) {
+            break;
         }
         std::thread::yield_now();
     }

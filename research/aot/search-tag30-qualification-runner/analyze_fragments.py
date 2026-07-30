@@ -18,7 +18,7 @@ from typing import Any, BinaryIO, Iterable, Iterator, Mapping, Sequence
 
 CONTRACT_SCHEMA = "fre.aot.search-tag30-qualification-campaign-contract.v1"
 CONTRACT_SHA256 = (
-    "f5a3319b1178ea97766b735bc39b589a6a1a33e8cc9257a947ea9feff7c5f702"
+    "d39dc02c741a13adc8e0c7c3cc818ffa69e96132af89caf0fef6b5dad6d14333"
 )
 HEADER_SCHEMA = "fre.aot.search-tag30-qualification-fragment-header.v1"
 CORRECTNESS_SCHEMA = "fre.aot.search-tag30-qualification-correctness-row.v1"
@@ -40,6 +40,7 @@ CALIBRATION_FLOOR_NS = 50_000_000
 CALIBRATION_ANCHOR_SAMPLES = 3
 MAXIMUM_ITERATIONS = 1 << 30
 MAXIMUM_CPU_ONLY_RETRIES = 64
+MACOS_SUPER_CLASS_WAIT_TIMEOUT_NS = 5_000_000_000
 MACOS_SUPER_CPUS = tuple(range(12, 18))
 MACOS_PERFORMANCE_CPUS = tuple(range(12))
 MACOS_PERFORMANCE_LEVEL_RECEIPT = {
@@ -126,6 +127,7 @@ HEADER_FIELDS = {
     "accepted_cpu_class",
     "accepted_cpu_ids",
     "macos_performance_levels",
+    "macos_super_class_wait_timeout_ns",
     "maximum_cpu_only_retries_per_variant",
     "runner_source_sha256",
     "runner_binary_sha256",
@@ -522,8 +524,8 @@ def parse_header(
             host == HOSTS[0]
             and header["cpu_residence_method"]
             == (
-                "macos-user-interactive-qos-affinity-hint-super-class-"
-                "cpu-only-retry"
+                "macos-user-interactive-qos-affinity-hint-bounded-super-"
+                "wait-cpu-only-retry"
             )
             and header["affinity_request_status"] in {0, 46}
             and header["qos_class"] == 0x21
@@ -532,6 +534,8 @@ def parse_header(
             and header["accepted_cpu_ids"] == list(MACOS_SUPER_CPUS)
             and header["macos_performance_levels"]
             == MACOS_PERFORMANCE_LEVEL_RECEIPT
+            and header["macos_super_class_wait_timeout_ns"]
+            == MACOS_SUPER_CLASS_WAIT_TIMEOUT_NS
             and header["logical_cpu"] in MACOS_SUPER_CPUS
         )
         or (
@@ -544,6 +548,7 @@ def parse_header(
             and header["accepted_cpu_class"] == "exact-requested"
             and header["accepted_cpu_ids"] == [header["logical_cpu"]]
             and header["macos_performance_levels"] is None
+            and header["macos_super_class_wait_timeout_ns"] is None
         )
     )
     require(

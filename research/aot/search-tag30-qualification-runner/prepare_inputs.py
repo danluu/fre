@@ -19,7 +19,7 @@ CONTRACT_RELATIVE = f"{DIRECTORY_RELATIVE}/campaign-contract-v1.json"
 CONTRACT_SCHEMA = "fre.aot.search-tag30-qualification-campaign-contract.v1"
 # Rotated whenever the immutable campaign contract changes.
 CONTRACT_SHA256 = (
-    "f5a3319b1178ea97766b735bc39b589a6a1a33e8cc9257a947ea9feff7c5f702"
+    "d39dc02c741a13adc8e0c7c3cc818ffa69e96132af89caf0fef6b5dad6d14333"
 )
 LEARNED_FREEZE_RELATIVE = (
     "research/aot/search-tag30-learned-continuation-v1/freeze-v1.json"
