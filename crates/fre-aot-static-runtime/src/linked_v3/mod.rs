@@ -100,11 +100,13 @@ use unavailable as platform;
 const POISONED_COUNT_RESULT_V3: u64 = u64::MAX;
 const HARD_MAX_MAPPED_PAYLOAD_BYTES_V3: usize = 4 << 20;
 static EMPTY_HAYSTACK_SENTINEL_V3: u8 = 0;
-/// Native Count-v3 production evidence covers only long-running inputs.
+/// Native Count-v3 production evidence covers only sustained long inputs.
 ///
 /// Safe automatic facades route shorter inputs through their retained portable
 /// owner. Low-level production handles reject them before the native entry.
-pub const STATIC_COUNT_PRODUCTION_MIN_HAYSTACK_BYTES_V3: usize = 4_096;
+/// Independent cross-corpus replication found that the qualified shape did
+/// not consistently clear its performance gate below 64 KiB.
+pub const STATIC_COUNT_PRODUCTION_MIN_HAYSTACK_BYTES_V3: usize = 64 * 1_024;
 
 /// Raw result slot fixed by Count call ABI schema 2.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
