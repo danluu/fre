@@ -3227,9 +3227,10 @@ fn v16_learned_recovery_images_publish_and_respect_guarded_adversarial_streams()
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    // A second occurrence of the primary byte near the end makes this literal
-    // exercise the learned-mask recovery path instead of only the
-    // phase-unique fast path.
+    // A second occurrence of the mismatch-directed learned byte near the end
+    // makes this literal exercise learned-mask recovery instead of only the
+    // phase-unique fast path. The independently selected primary remains
+    // distinct.
     literals.push(vec![
         0x63, 0x1c, 0x0e, 0x53, 0xc4, 0xe4, 0xb3, 0x5c, 0xf7, 0x1d, 0x14, 0xcc, 0x07, 0xdb, 0x88,
         0x7b, 0xa2, 0x41, 0x99, 0xb9, 0x02, 0x92, 0xbb, 0x79, 0x4c, 0xe1, 0x0b, 0x28, 0x92, 0x63,
