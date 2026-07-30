@@ -71,10 +71,13 @@ Four seeds times four shapes provide 16 development literals and 16 unopened
 held-out literals at every width.
 
 The screen gates were fixed before the expanded screen. V9/V8 geometric mean
-at `first_candidate_exact` must be at least 1.20; V9/V8 outside that scenario
-must be at least 0.98. Only eligible tail-owned long-scan cells contribute to
-the AOT speedup claim. For their contiguous 2..32 aggregate and independently
-for every width, shape, and long-scan scenario, `hybrid_ns / portable_ns`
+at `first_candidate_exact` must be at least 1.20. Outside that scenario,
+`v9_ns / v8_ns` must have geometric mean at most 1.02, p90 at most 1.05,
+maximum cell at most 1.25, and at least 100 observations. Only eligible
+tail-owned long-scan cells contribute to the AOT speedup claim. For their
+contiguous 2..32 aggregate and independently for every width, shape,
+long-scan scenario, actual checked-window size (including exactly 4,093),
+alignment, and full/nonzero-window topology, `hybrid_ns / portable_ns`
 geometric mean must be strictly below 0.80, at least 80% of cells must win,
 p90 must be at most 1.00, the maximum cell must be at most 1.25, and there
 must be at least 100 observations. Eligible prefix-owned

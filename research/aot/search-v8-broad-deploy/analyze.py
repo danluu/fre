@@ -120,6 +120,7 @@ def main():
             {
                 "fixture": fixture,
                 "v8_over_v9": v8 / v9,
+                "v9_over_v8": v9 / v8,
                 "portable_over_v9": portable / v9,
                 "portable_over_v8": portable / v8,
                 "portable_over_hybrid": portable / hybrid,
@@ -140,6 +141,7 @@ def main():
 
     ratio_names = (
         "v8_over_v9",
+        "v9_over_v8",
         "portable_over_v9",
         "portable_over_v8",
         "portable_over_hybrid",
@@ -208,8 +210,8 @@ def main():
             ),
         }
 
-    def parity_gate(predicate):
-        values = selected("hybrid_over_portable", predicate)
+    def parity_gate(ratio, predicate):
+        values = selected(ratio, predicate)
         summary = ratio_summary(values)
         return {
             "minimum_observations": 100,
@@ -254,16 +256,18 @@ def main():
             "v9_first_candidate_vs_v8": geomean_gate(
                 "v8_over_v9", first_candidate, 1.20
             ),
-            "v9_nonfirst_no_regression_vs_v8": geomean_gate(
-                "v8_over_v9", lambda fixture: not first_candidate(fixture), 0.98
-            ),
             "hybrid_tail_owned_long_scan_vs_portable": long_scan_gate(
                 lambda fixture: True
             ),
+            "v9_nonfirst_tail_guard_vs_v8": parity_gate(
+                "v9_over_v8", lambda fixture: not first_candidate(fixture)
+            ),
             "hybrid_prefix_owned_parity_vs_portable": parity_gate(
+                "hybrid_over_portable",
                 lambda fixture: hybrid_eligible(fixture) and safety_scenario(fixture)
             ),
             "hybrid_ineligible_parity_vs_portable": parity_gate(
+                "hybrid_over_portable",
                 lambda fixture: not hybrid_eligible(fixture)
             ),
             "hybrid_tail_owned_each_width_vs_portable": {
@@ -292,6 +296,49 @@ def main():
                         if long_scan(item["fixture"])
                     }
                 )
+            },
+            "hybrid_tail_owned_each_window_size_vs_portable": {
+                str(window_bytes): long_scan_gate(
+                    lambda fixture, window_bytes=window_bytes: (
+                        int(fixture[end_index]) - int(fixture[start_index])
+                        == window_bytes
+                    )
+                )
+                for window_bytes in sorted(
+                    {
+                        int(item["fixture"][end_index])
+                        - int(item["fixture"][start_index])
+                        for item in fixture_ratios
+                        if hybrid_eligible(item["fixture"])
+                        and long_scan(item["fixture"])
+                    }
+                )
+            },
+            "hybrid_tail_owned_each_alignment_vs_portable": {
+                alignment: long_scan_gate(
+                    lambda fixture, alignment=alignment: fixture[
+                        FIXTURE_FIELDS.index("alignment")
+                    ]
+                    == alignment
+                )
+                for alignment in sorted(
+                    {
+                        item["fixture"][FIXTURE_FIELDS.index("alignment")]
+                        for item in fixture_ratios
+                        if hybrid_eligible(item["fixture"])
+                        and long_scan(item["fixture"])
+                    },
+                    key=int,
+                )
+            },
+            "hybrid_tail_owned_each_window_topology_vs_portable": {
+                topology: long_scan_gate(
+                    lambda fixture, topology=topology: (
+                        ("nonzero" if int(fixture[start_index]) > 0 else "full")
+                        == topology
+                    )
+                )
+                for topology in ("full", "nonzero")
             },
         },
     }
