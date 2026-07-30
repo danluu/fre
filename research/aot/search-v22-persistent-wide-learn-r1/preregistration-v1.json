@@ -54,6 +54,7 @@
     "persistent_learned_wide_entry": [
       "Entry requires X11 equal to one, Q24 equal to the learned literal byte, Q25 equal to the learned offset in every byte lane, X5 at a 64-candidate group base, X15 at that group's primary column, and X7 equal to end_index minus 63.",
       "Extract the Q25 byte offset into a scalar scratch register; Q25 remains unchanged.",
+      "Form the learned-column address through X13 and X10 from haystack plus X5 plus the extracted offset; persistent learned/static screening never uses X15 as address scratch.",
       "Load four 16-byte learned-column blocks with two paired loads into Q0/Q2/Q4/Q6 and compare all four against Q24.",
       "If all four learned masks are empty, advance by 64 without loading a static column.",
       "Intersect a nonempty learned mask with the primary column and test presence.",
@@ -95,6 +96,7 @@
     "wide_state": [
       "X5 = current 64-candidate group base",
       "X15 = haystack plus X5 plus primary offset",
+      "X15 remains the primary-column pointer throughout persistent learned/static screening and is reconstructed after every exact-verification queue",
       "X7 = end_index minus 63 outside the queue",
       "X6 = end index",
       "X8 = literal base",
@@ -109,7 +111,8 @@
       "Q24/Q25 remain live and unchanged"
     ],
     "scratch": [
-      "X0, X1, X2, X3, X10, X13, X15, Q0, Q2, Q4, Q6, Q16, Q18, Q19, Q20, Q21, and condition flags may be clobbered according to the active phase"
+      "X0, X1, X2, X3, X10, X13, Q0, Q2, Q4, Q6, Q16, Q18, Q19, Q20, Q21, and condition flags may be clobbered according to the active phase",
+      "X15 may be clobbered by exact confirmation and queue verification only; every such exit reconstructs it before persistent learned-wide re-entry"
     ],
     "persistence": "Q24/Q25 and X11 state persist across 64-candidate groups within one invocation only."
   },
@@ -128,6 +131,7 @@
     "required": [
       "Emitter/template byte-for-byte agreement and whole-image audit acceptance.",
       "Version 35, magic 0x23, AOT, audit, runtime allowlist, mutation, and reseal rejection coverage.",
+      "All supported search output contracts emit, audit, serialize, adopt, and execute or explicitly reject V22 consistently.",
       "Mechanical byte identity for frozen V17, V19, V20, and V21 paths against the implementation base commit.",
       "Decoded liveness proof that Q24/Q25 survive sparse conversion, every specialized equality shape for widths 6 through 32, and queue restoration.",
       "Decoded control-flow proof that every persistent entry has X11 equal to one and initialized Q24/Q25.",
