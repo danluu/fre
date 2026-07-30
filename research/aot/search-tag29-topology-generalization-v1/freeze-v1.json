@@ -7,7 +7,7 @@
   },
   "generator": {
     "path": "research/aot/search-tag29-topology-generalization-v1/generate_projection.py",
-    "sha256": "7aff08aa2b859dacb4e54daf1526f733cb22a79527a22a4c65321dc68a2e8a96"
+    "sha256": "4c7e3735ea1611803bc83a1cabd3fac8d4d39da0cc6d31779b8055e5f016ed1a"
   },
   "selector": {
     "contract_path": "research/aot/search-phase-unique-selector-v1/selector-contract-v1.json",
@@ -29,7 +29,7 @@
   },
   "full_projection": {
     "rows": 123424,
-    "sha256": "aef7465153ec69267fa16fc6c010b81d591319a735775f073450307da6c91eac",
+    "sha256": "3ffd244824b59fc42ad001f76f7f3775ec3f9566e67194be96cd8f93e6490a21",
     "literal_inventory_rows": 1015,
     "literal_inventory_sha256": "2286c399f5e0bb3129c98dc7c7d9a9b1f9951f9bf90addc3262ca30c228224ae",
     "portable_only_rows": 74176,
@@ -42,7 +42,7 @@
   },
   "timed_projection": {
     "rows": 3078,
-    "sha256": "c97d1e75e1f1fc410128c0e8827531583ee9cb641aa44b212628daf5114dfe97",
+    "sha256": "f0f3423bf3a05d21c00eb82c5d07dfae9b349e41314614cdc4203d9836dd70aa",
     "selection": "one frozen long geometry for every eligible width/topology/mutation-class cell",
     "eligible_widths": {
       "minimum": 6,

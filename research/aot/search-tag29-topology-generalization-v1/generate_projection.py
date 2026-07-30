@@ -382,7 +382,10 @@ def validate_near_miss_tile(
 
 
 def mutation(
-    literal: bytes, offsets: Sequence[int], mutation_class: int
+    literal: bytes,
+    offsets: Sequence[int],
+    mutation_class: int,
+    require_unselected: bool,
 ) -> tuple[int, int, str, bytes]:
     requested = SOURCE_KINDS[mutation_class % len(SOURCE_KINDS)]
     counts = Counter(literal)
@@ -395,12 +398,19 @@ def mutation(
         "mode": mode,
     }
     source = source_by_kind[requested]
-    target = min(
-        len(literal) - 1,
-        (mutation_class * len(literal)) // len(MUTATION_CLASSES),
+    target_domain = (
+        [offset for offset in range(len(literal)) if offset not in offsets]
+        if require_unselected
+        else list(range(len(literal)))
     )
-    for delta in range(len(literal)):
-        candidate = (target + delta) % len(literal)
+    require(bool(target_domain), "mutation target domain is empty")
+    target_index = min(
+        len(target_domain) - 1,
+        (mutation_class * len(target_domain)) // len(MUTATION_CLASSES),
+    )
+    target = target_domain[target_index]
+    for delta in range(len(target_domain)):
+        candidate = target_domain[(target_index + delta) % len(target_domain)]
         if literal[candidate] != source:
             target = candidate
             break
@@ -430,8 +440,9 @@ def projection_row(
     literal, offsets = build_literal(width, topology, phase)
     eligible, checked_offsets = selector_eligible(literal)
     require(offsets == checked_offsets, "selector reconstruction changed")
+    require_unselected = eligible and size_class == "long"
     mutation_offset, source, source_kind, near_miss = mutation(
-        literal, offsets, mutation_class
+        literal, offsets, mutation_class, require_unselected
     )
     source_count = literal.count(source)
     source_relations = []
@@ -464,6 +475,12 @@ def projection_row(
         if eligible and window_bytes >= 4_093
         else "portable-only"
     )
+    if expected_route == "tag29-static-tail":
+        require(
+            mutation_offset not in offsets
+            and all(near_miss[offset] == literal[offset] for offset in offsets),
+            "learned-recovery row does not survive the five-column screen",
+        )
     outcome = "absent" if mutation_class % 3 == 0 else "tail-hit"
     match_start = (
         None
@@ -492,6 +509,11 @@ def projection_row(
         "selector_eligible": eligible,
         "mutation_class": mutation_class,
         "mutation_offset": mutation_offset,
+        "mutation_column": (
+            "unselected-learned"
+            if require_unselected
+            else "general-correctness"
+        ),
         "learned_source_kind": source_kind,
         "learned_source_byte": source,
         "learned_source_relations": sorted(source_relations),

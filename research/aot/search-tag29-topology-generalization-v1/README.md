@@ -20,6 +20,13 @@ guard-page boundaries, absent searches, tail matches, every selector phase,
 and learned bytes that are absent, selected-primary, selected-secondary,
 terminal, or modal literal bytes.
 
+Every eligible long/native row mutates only an unselected literal offset and
+the generator asserts that all five selected columns remain equal. These rows
+therefore survive the initial filter, reach an exact false candidate, and
+exercise mismatch-directed learning. Selected/general mutations remain in the
+short portable correctness stratum and in the separate exhaustive
+one-literal-per-width campaign; they cannot masquerade as learned timing.
+
 Long timing is intentionally not the full Cartesian product. Before any
 result exists, `freeze-v1.json` selects one long geometry for each eligible
 width/topology/mutation cell: 3,078 fixtures. This retains every width 6..32,
