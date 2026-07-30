@@ -2846,6 +2846,15 @@ mod tests {
         assert!(permit.contains("impl Drop for QualificationCandidateExecutionPermit"));
         assert!(permit.contains("TEST_CANDIDATE_EXECUTION.with("));
 
+        let authority_start = position(source, "enum QualificationSessionAuthority<'session> {");
+        let authority_end = authority_start
+            + position(
+                &source[authority_start..],
+                "\n/// Qualification-only facade session",
+            );
+        let authority = &source[authority_start..authority_end];
+        assert!(authority.contains("_permit: &'session QualificationCandidateExecutionPermit"));
+
         let qualification_session_start = position(
             source,
             "struct QualifiedExactSearchFacadeQualificationThreadSession<'session>",
@@ -2858,10 +2867,6 @@ mod tests {
         let qualification_session = &source[qualification_session_start..qualification_session_end];
         assert!(
             qualification_session.contains("authority: QualificationSessionAuthority<'session>")
-        );
-        assert!(
-            qualification_session
-                .contains("_permit: &'session QualificationCandidateExecutionPermit")
         );
     }
 
