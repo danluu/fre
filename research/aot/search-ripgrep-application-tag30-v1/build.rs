@@ -569,6 +569,7 @@ fn main() {
     let manifest_identity = emitted_manifest_identity
         .clone()
         .expect("one emitted manifest identity");
+    generated.push_str("}\n");
     writeln!(
         generated,
         "pub(crate) const COMPILER_IDENTITY: &str = {compiler_identity:?};"
@@ -615,7 +616,6 @@ fn main() {
             compile_receipt_basename,
         });
     }
-    generated.push_str("}\n");
     generated.push_str(
         "#[allow(unsafe_code, unsafe_op_in_unsafe_fn)]\npub(crate) unsafe fn invoke(index: usize, output: *mut fre_aot_static_runtime::RawStaticSearchSpanAdoptionOutputV1) -> u32 {\n    match index {\n",
     );
