@@ -924,4 +924,104 @@ mod tests {
         );
         assert_eq!(tail_calls.get(), 0);
     }
+
+    #[test]
+    fn automatic_route_partition_matches_portable_across_broad_literal_shapes() {
+        const ABSENT: usize = usize::MAX;
+
+        for width in 1_usize..=32 {
+            for shape in 0_u8..4 {
+                let literal = automatic_test_literal(width, shape);
+                let plan = LiteralPlan::new(&literal, LiteralBuildLimits::default()).unwrap();
+                let haystack_len = width + 80;
+                let placements = [
+                    ABSENT,
+                    0,
+                    1,
+                    3,
+                    4,
+                    17,
+                    haystack_len / 2,
+                    haystack_len - width,
+                ];
+
+                for placement in placements {
+                    let mut haystack = vec![0x55; haystack_len];
+                    if placement != ABSENT {
+                        haystack[placement..placement + width].copy_from_slice(&literal);
+                    }
+                    let windows = [
+                        SearchWindow::new(0, haystack_len),
+                        SearchWindow::new(2, haystack_len - 3),
+                        SearchWindow::new(7, haystack_len),
+                        SearchWindow::new(11, 5),
+                        SearchWindow::new(haystack_len + 1, haystack_len + 2),
+                    ];
+
+                    for window in windows {
+                        for minimum_window_bytes in [0, 16, haystack_len + 1] {
+                            for prefix_candidate_starts in [0, 1, 4, 17, haystack_len + 4] {
+                                let expected = plan
+                                    .find_window(
+                                        &haystack,
+                                        LiteralWindow::new(window.start(), window.end()),
+                                        literal_limits(SearchLimits::unlimited()),
+                                    )
+                                    .map(|(matched, accounting)| {
+                                        (
+                                            matched.map(|(start, end)| Match { start, end }),
+                                            SearchAccounting::ExactLiteral(accounting),
+                                        )
+                                    })
+                                    .map_err(StaticSearchSpanCallErrorV1::from);
+                                let actual = find_window_automatically_v1(
+                                    &plan,
+                                    &haystack,
+                                    window,
+                                    SearchLimits::unlimited(),
+                                    minimum_window_bytes,
+                                    prefix_candidate_starts,
+                                    |tail| {
+                                        let accounting = tail.accounting();
+                                        let matched = tail
+                                            .find()?
+                                            .map(|(start, end)| MatchSpan::new(start, end));
+                                        Ok((matched, accounting))
+                                    },
+                                );
+
+                                assert_eq!(
+                                    actual, expected,
+                                    "width={width} shape={shape} placement={placement} \
+                                     window={window:?} floor={minimum_window_bytes} \
+                                     prefix={prefix_candidate_starts}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn automatic_test_literal(width: usize, shape: u8) -> Vec<u8> {
+        match shape {
+            0 => (0..width)
+                .map(|index| {
+                    u8::try_from(1 + (index * 37) % 251)
+                        .expect("the generated distinct byte is bounded")
+                })
+                .collect(),
+            1 => vec![0xa7; width],
+            2 => (0..width)
+                .map(|index| if index % 2 == 0 { 0x13 } else { 0xe9 })
+                .collect(),
+            3 => [0x00, 0xff, 0x80, 0x55, 0xaa, 0x7f]
+                .into_iter()
+                .cycle()
+                .take(width)
+                .collect(),
+            _ => unreachable!("the test enumerates four literal shapes"),
+        }
+    }
 }
