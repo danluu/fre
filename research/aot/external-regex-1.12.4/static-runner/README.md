@@ -80,7 +80,8 @@ match the warning from the selector-neutral check.
   inspect /private/tmp/fre-external-regex-dev-fixtures-v2
 
 /absolute/path/fre-external-static-target/release/fre-external-regex-static-runner \
-  run /private/tmp/fre-external-regex-dev-fixtures-v2 > /absolute/path/results.csv
+  run /private/tmp/fre-external-regex-dev-fixtures-v2 0 1 \
+  > /absolute/path/results.csv
 
 python3 research/aot/external-regex-1.12.4/static-runner/analyze.py \
   /absolute/path/results.csv
@@ -88,5 +89,11 @@ python3 research/aot/external-regex-1.12.4/static-runner/analyze.py \
 
 Each engine sample is at least 400 ms, engine order alternates, both engines
 use the same calibrated iterations, and checksums and semantics must agree.
-Tail ownership is derived from the frozen window floor and portable-prefix
-policy, not from fixture scenario names.
+For the broad evidence manifests, tail ownership is derived from the frozen
+source-only eligibility projection and the preregistered prefix-owned
+`early`/`dense` scenarios. The result adapter independently recomputes it.
+
+The final two arguments are a zero-based shard index and a positive shard
+count. Fixtures are assigned by canonical manifest ordinal modulo shard
+count. Every independently launched shard emits its own header; evidence
+adapters must authenticate, deduplicate, and join the complete shard set.
