@@ -627,6 +627,14 @@ enum ReverseState {
     Inline,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LazyInitialKind {
+    Uninitialized,
+    Positive,
+    NullablePrefix,
+    NullableTerminal,
+}
+
 /// Fixed ordered-subset rows owned by one exact immutable automaton session.
 ///
 /// `modes` makes the pending selected-end bit part of state identity. The
@@ -651,6 +659,7 @@ struct LazyWorkspace {
     state_len: usize,
     item_len: usize,
     initial: u32,
+    initial_kind: LazyInitialKind,
     initialized: bool,
     declined: bool,
     saturated: bool,
@@ -692,6 +701,7 @@ impl LazyWorkspace {
             state_len: 0,
             item_len: 0,
             initial: LAZY_NO_STATE,
+            initial_kind: LazyInitialKind::Uninitialized,
             initialized: false,
             declined: false,
             saturated: false,
@@ -715,6 +725,7 @@ impl LazyWorkspace {
             state_len: 0,
             item_len: 0,
             initial: LAZY_NO_STATE,
+            initial_kind: LazyInitialKind::Uninitialized,
             initialized: false,
             declined: true,
             saturated: false,
@@ -1927,11 +1938,13 @@ fn lazy_capabilities(
     automaton: &Automaton,
     workspace: &K0Workspace,
     allow_lazy: bool,
+    wants_span: bool,
 ) -> LazyCapabilities {
     let lazy = allow_lazy && workspace.lazy.is_allocated();
     LazyCapabilities {
         lazy,
         reverse: lazy
+            && wants_span
             && workspace.reverse.is_allocated()
             && workspace.reverse.is_bound_to(automaton),
         contextual: automaton.stats().assertion_edges() != 0,
@@ -2037,7 +2050,7 @@ fn execute(
 ) -> Result<UntypedReport, SearchError> {
     validate_window(haystack, window)?;
     let wants_span = matches!(contract, OutputContract::Span);
-    let capabilities = lazy_capabilities(automaton, workspace, allow_lazy);
+    let capabilities = lazy_capabilities(automaton, workspace, allow_lazy, wants_span);
     let mode = effective_lazy_mode(automaton, workspace, wants_span, capabilities)?;
     let mut setup = setup;
     let (mut meter, setup_work) = prepare_invocation(
@@ -2345,6 +2358,54 @@ fn execute_lazy_loop(
         return Ok(None);
     }
 
+    match workspace.lazy.initial_kind {
+        LazyInitialKind::NullablePrefix | LazyInitialKind::NullableTerminal => {
+            execute_prepared_lazy_loop::<true>(
+                automaton,
+                haystack,
+                window,
+                workspace,
+                meter,
+                contract,
+                core_reserve,
+                scanner,
+                guard,
+            )
+        }
+        LazyInitialKind::Positive => execute_prepared_lazy_loop::<false>(
+            automaton,
+            haystack,
+            window,
+            workspace,
+            meter,
+            contract,
+            core_reserve,
+            scanner,
+            guard,
+        ),
+        LazyInitialKind::Uninitialized => Err(SearchError::InternalInvariant {
+            detail: "initialized lazy DFA has no cached initial kind",
+        }),
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "separate positive and nullable instantiations keep the positive hot loop compact"
+)]
+#[inline(never)]
+fn execute_prepared_lazy_loop<const INITIAL_NULLABLE: bool>(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    contract: OutputContract,
+    core_reserve: u64,
+    scanner: Option<&StartPositionScanner>,
+    guard: Option<&StartPositionClass>,
+) -> Result<Option<(Option<MatchSpan>, usize)>, SearchError> {
     let earliest = matches!(
         contract,
         OutputContract::Exists | OutputContract::EarliestEnd
@@ -2355,19 +2416,30 @@ fn execute_lazy_loop(
             detail: "initialized lazy DFA has no initial state",
         });
     }
-    let (_, initial_length, initial_pending) = workspace.lazy.state_bounds(initial)?;
-    if initial_pending && (earliest || initial_length == 0) {
-        return Ok(Some((
-            Some(MatchSpan::new(window.start(), window.start())),
-            1,
-        )));
+    if INITIAL_NULLABLE {
+        if !matches!(
+            workspace.lazy.initial_kind,
+            LazyInitialKind::NullablePrefix | LazyInitialKind::NullableTerminal
+        ) {
+            return Err(SearchError::InternalInvariant {
+                detail: "nullable lazy DFA initial state lost its pending match",
+            });
+        }
+        if earliest || workspace.lazy.initial_kind == LazyInitialKind::NullableTerminal {
+            return Ok(Some((
+                Some(MatchSpan::new(window.start(), window.start())),
+                1,
+            )));
+        }
+    } else {
+        debug_assert_eq!(workspace.lazy.initial_kind, LazyInitialKind::Positive);
     }
     // Even a physically full cache retains useful prefix rows. Start from the
     // cached initial state and hand off only when an unfilled edge is reached.
     let mut state = LazyState::Cached(initial);
     let mut position = window.start();
     let mut boundaries = 0usize;
-    let mut pending_end = initial_pending.then_some(window.start());
+    let mut pending_end = INITIAL_NULLABLE.then_some(window.start());
     let mut entered = false;
 
     loop {
@@ -3058,8 +3130,19 @@ fn prepare_lazy(
     // retained are precisely the higher-priority alternatives that may still
     // replace this initial empty match. The existing pending mode therefore
     // represents nullable execution without pattern-specific cases.
+    let initial_kind = match (accepted, workspace.lazy.scratch_len == 0) {
+        (false, false) => LazyInitialKind::Positive,
+        (true, false) => LazyInitialKind::NullablePrefix,
+        (true, true) => LazyInitialKind::NullableTerminal,
+        (false, true) => {
+            return Err(SearchError::InternalInvariant {
+                detail: "nonnullable lazy DFA initial state has no consuming items",
+            });
+        }
+    };
     let initial = workspace.lazy.intern_initial(accepted, meter, position)?;
     workspace.lazy.initial = initial;
+    workspace.lazy.initial_kind = initial_kind;
     workspace.lazy.initialized = true;
     Ok(true)
 }
@@ -3072,8 +3155,7 @@ fn lazy_initial_is_terminal(workspace: &K0Workspace) -> Result<bool, SearchError
             detail: "initialized lazy DFA has no initial state",
         });
     }
-    let (_, length, pending) = workspace.lazy.state_bounds(initial)?;
-    Ok(pending && length == 0)
+    Ok(workspace.lazy.initial_kind == LazyInitialKind::NullableTerminal)
 }
 
 fn lazy_initial_has_pending(workspace: &K0Workspace) -> Result<bool, SearchError> {
@@ -3083,8 +3165,10 @@ fn lazy_initial_has_pending(workspace: &K0Workspace) -> Result<bool, SearchError
             detail: "initialized lazy DFA has no initial state",
         });
     }
-    let (_, _, pending) = workspace.lazy.state_bounds(initial)?;
-    Ok(pending)
+    Ok(matches!(
+        workspace.lazy.initial_kind,
+        LazyInitialKind::NullablePrefix | LazyInitialKind::NullableTerminal
+    ))
 }
 
 fn begin_lazy_closure(
@@ -5233,7 +5317,7 @@ fn prepare_span_cursor(
     let cursor = SpanCursorCache {
         binding: Some(binding),
         start_proof: retained_span_cursor_start_proof(automaton),
-        capabilities: lazy_capabilities(automaton, workspace, true),
+        capabilities: lazy_capabilities(automaton, workspace, true, true),
     };
     workspace.span_cursor = cursor;
     Ok(cursor)
@@ -9925,7 +10009,7 @@ mod tests {
             K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
         let mut prepared_preflight =
             K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
-        let capabilities = super::lazy_capabilities(&plan, &ordinary_preflight, true);
+        let capabilities = super::lazy_capabilities(&plan, &ordinary_preflight, true, true);
         let mode =
             super::effective_lazy_mode(&plan, &ordinary_preflight, true, capabilities).unwrap();
         assert_eq!(
@@ -10008,7 +10092,7 @@ mod tests {
             &plan,
             &full_ordinary,
             true,
-            super::lazy_capabilities(&plan, &full_ordinary, true),
+            super::lazy_capabilities(&plan, &full_ordinary, true, true),
         )
         .unwrap();
         assert_eq!(
@@ -10055,7 +10139,7 @@ mod tests {
             &plan,
             &full_ordinary,
             true,
-            super::lazy_capabilities(&plan, &full_ordinary, true),
+            super::lazy_capabilities(&plan, &full_ordinary, true, true),
         )
         .unwrap();
         let warm_cursor_cache =
@@ -11405,6 +11489,76 @@ mod tests {
         assert_eq!(report.accounting().boundaries(), 1);
         assert!(nullable_span.lazy.initialized);
         assert!(!nullable_span.reverse.initialized);
+    }
+
+    #[test]
+    fn cached_lazy_initial_kind_matches_immutable_state_metadata() {
+        let terminal = Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![StateRole::Accept],
+                edge_offsets: vec![0, 0],
+                edge_targets: vec![],
+                edge_kinds: vec![],
+                byte_starts: vec![],
+                byte_ends: vec![],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap();
+
+        for (plan, haystack, expected_pending, expected_terminal) in [
+            (a_plus(true), b"a".as_slice(), false, false),
+            (a_star(true), b"a".as_slice(), true, false),
+            (terminal, b"".as_slice(), true, true),
+        ] {
+            let mut workspace =
+                K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+            let _ = plan
+                .prepare::<SelectedEnd>()
+                .search_with_workspace(haystack, &mut workspace, SearchLimits::unlimited())
+                .unwrap();
+            let initial = workspace.lazy.initial;
+            let (_, length, pending) = workspace.lazy.state_bounds(initial).unwrap();
+            assert_eq!(
+                matches!(
+                    workspace.lazy.initial_kind,
+                    super::LazyInitialKind::NullablePrefix
+                        | super::LazyInitialKind::NullableTerminal
+                ),
+                pending
+            );
+            assert_eq!(
+                workspace.lazy.initial_kind == super::LazyInitialKind::NullableTerminal,
+                pending && length == 0
+            );
+            assert_eq!(pending, expected_pending);
+            assert_eq!(
+                workspace.lazy.initial_kind == super::LazyInitialKind::NullableTerminal,
+                expected_terminal
+            );
+
+            let cached = workspace.lazy.initial_kind;
+            let _ = plan
+                .prepare::<SelectedEnd>()
+                .search_with_workspace(haystack, &mut workspace, SearchLimits::unlimited())
+                .unwrap();
+            assert_eq!(workspace.lazy.initial_kind, cached);
+        }
+    }
+
+    #[test]
+    fn endpoint_capabilities_skip_reverse_probe() {
+        let plan = a_plus(true);
+        let workspace =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let endpoint = super::lazy_capabilities(&plan, &workspace, true, false);
+        let span = super::lazy_capabilities(&plan, &workspace, true, true);
+        assert!(endpoint.lazy);
+        assert!(!endpoint.reverse);
+        assert!(span.lazy);
+        assert!(span.reverse);
+        assert_eq!(endpoint.contextual, span.contextual);
     }
 
     #[test]
