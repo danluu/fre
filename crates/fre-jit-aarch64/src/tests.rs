@@ -7468,6 +7468,10 @@ fn v15_phase_unique_selector_is_exhaustive_audited_and_semantic() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the V16 semantic seed, staged-graph mutations, and cross-version resealing checks jointly authenticate one new backend boundary"
+)]
 fn v16_stages_repeated_learned_bytes_before_full_recovery() {
     let literal = [
         0x63, 0x1c, 0x0e, 0x53, 0xc4, 0xe4, 0xb3, 0x5c, 0xf7, 0x1d, 0x14, 0xcc, 0x07, 0xdb, 0x88,
@@ -7551,6 +7555,126 @@ fn v16_stages_repeated_learned_bytes_before_full_recovery() {
             "mutation offset {mutation_offset}"
         );
     }
+
+    let decoded = decode(v16.code()).expect("V16 mutation decode");
+    let primary_stage = decoded
+        .windows(3)
+        .position(|window| {
+            matches!(
+                window,
+                [
+                    DecodedInstruction::CompareEqualBytes16 {
+                        destination: 18,
+                        left: 18,
+                        right: 1,
+                    },
+                    DecodedInstruction::AndBytes16 {
+                        destination: 16,
+                        left: 16,
+                        right: 18,
+                    },
+                    DecodedInstruction::UnsignedMaxPairwiseBytes16 {
+                        destination: 18,
+                        left: 16,
+                        right: 16,
+                    },
+                ]
+            )
+        })
+        .expect("V16 learned/primary stage");
+    let mut wrong_primary = v16.clone();
+    replace_test_decoded_at(
+        &mut wrong_primary,
+        primary_stage,
+        DecodedInstruction::CompareEqualBytes16 {
+            destination: 18,
+            left: 18,
+            right: 3,
+        },
+    );
+    assert_resealed_search_rejected(wrong_primary, "V16 wrong primary constant");
+
+    let mut omitted_learned = v16.clone();
+    replace_test_decoded_at(
+        &mut omitted_learned,
+        primary_stage + 1,
+        DecodedInstruction::AndBytes16 {
+            destination: 16,
+            left: 18,
+            right: 18,
+        },
+    );
+    assert_resealed_search_rejected(omitted_learned, "V16 omitted learned-mask intersection");
+
+    let staged_empty_branches = decoded
+        .windows(3)
+        .enumerate()
+        .filter_map(|(index, window)| {
+            matches!(
+                window,
+                [
+                    DecodedInstruction::UnsignedMaxPairwiseBytes16 {
+                        destination: 18,
+                        left: 16,
+                        right: 16,
+                    },
+                    DecodedInstruction::MoveVectorDoubleTo64 {
+                        destination: 0,
+                        source: 18,
+                    },
+                    DecodedInstruction::CompareBranchZero64 {
+                        register: 0,
+                        nonzero: false,
+                        ..
+                    },
+                ]
+            )
+            .then_some(index + 2)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        staged_empty_branches.len(),
+        2,
+        "V16 has one learned-presence and one learned/primary-presence branch"
+    );
+    let branch = staged_empty_branches[1];
+    let DecodedInstruction::CompareBranchZero64 {
+        register,
+        displacement,
+        ..
+    } = decoded[branch]
+    else {
+        unreachable!("selected V16 staged-empty branch")
+    };
+    let mut inverted_empty = v16.clone();
+    replace_test_branch_and_relocation_at(
+        &mut inverted_empty,
+        branch,
+        DecodedInstruction::CompareBranchZero64 {
+            register,
+            nonzero: true,
+            displacement,
+        },
+    );
+    assert_resealed_search_rejected(inverted_empty, "V16 staged-empty branch inversion");
+
+    let mut v16_as_v15 = v16;
+    v16_as_v15.backend_version = BackendVersion::SEARCH_V15;
+    v16_as_v15
+        .search
+        .as_mut()
+        .expect("V16 manifest")
+        .backend_version = BackendVersion::SEARCH_V15;
+    assert_resealed_search_rejected(v16_as_v15, "V16 code resealed as V15");
+
+    let mut v15_as_v16 = v15;
+    v15_as_v16.backend_version = BackendVersion::SEARCH_V16;
+    v15_as_v16
+        .search
+        .as_mut()
+        .expect("V15 manifest")
+        .backend_version = BackendVersion::SEARCH_V16;
+    assert_resealed_search_rejected(v15_as_v16, "V15 code resealed as V16");
 }
 
 #[test]
