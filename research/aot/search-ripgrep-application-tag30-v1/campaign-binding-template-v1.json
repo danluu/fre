@@ -1,6 +1,6 @@
 {
   "schema": "fre.aot.search-tag30-ripgrep-application-campaign-binding.v1",
-  "payload_sha256": "bc188ac8d517a30f22b369567fb131b7fb53d9e93100af93ab437ffa9e00a7ed",
+  "payload_sha256": "391f2729b05838cfa6e11f855404c3fb50ed634d696918521f8ff2664824239b",
   "payload": {
     "contract_sha256": "db2faa1308d3a103a2b5fc5ebb2c26c0461fadddffc3f214cfcd23e25a8dbfc7",
     "projection_sha256": "1ea6896b7d89bb812130d6f6c4b743d9eed79169c0154f0b6bb37686576b9332",
@@ -10,13 +10,13 @@
     "literal_dispositions_sha256": "433029525cfb74122f275f4282901fc6e7711b34aa7115b4bd53ef537dd5e1a1",
     "application_analyzer_source_sha256": "139002fa7385729bc9d24b1e9acb470bb493546b17dde1eb173deb23cc76b50a",
     "campaign_plan_identity": "d39dc02c741a13adc8e0c7c3cc818ffa69e96132af89caf0fef6b5dad6d14333",
-    "campaign_analyzer_identity": "0a32b5a20c03077b856f51741216289aa8399f213261d07e5c8874bf2d3fe6ec",
-    "campaign_evidence_identity": "baf4c23db6318c6658b8eba72a3eff6b165d42a085cc8a1e656ad6650b477f00",
-    "private_family_authorization_identity": "aaa0527f255eb5912001b5ba9d9efab69c0be5848bdef595435b90aadbf284da",
+    "campaign_analyzer_identity": "01839636097d4727263d24cc9194954b883997fe0535452b230595885562c8db",
+    "campaign_evidence_identity": "90996b64e980df84292318bb0129adf1cc6eae1b18bc962f8a707af0aee9e2fa",
+    "private_family_authorization_identity": "e4c2a5e115e26dfbd903522171b8c350bfba11b17e98f2b82c4bc486c1fa975b",
     "runner_source_commit": null,
     "runner_source_sha256": "f8dde5ba8bee8bd4e54d77703ec43d724f363bb1e590f21416ba1a433cfb4bb9",
     "source_archive_sha256": null,
-    "private_family_source_sha256": "aeb4f4daa91a162172948c13e1ac9eeb5261727dea2e027087c54858d01441b6",
+    "private_family_source_sha256": "c96ade0dc836ee11bdfed8f1ded90fbb90fbf23f7f7e04cc525d2c27fe752bab",
     "hosts": [
       {
         "host_id": "local-apple-aarch64-asimd",
