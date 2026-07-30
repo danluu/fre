@@ -1,0 +1,60 @@
+{
+  "schema": "fre.aot.external-regex-1.12.4-fixture-algorithm-development.v1",
+  "fixture_bytes": 1048576,
+  "fixture_domain_hex": "6672652e616f742e65787465726e616c2d72656765782d312e31322e342e666978747572652e763100",
+  "candidate_filter": {
+    "contamination_disposition": "independent",
+    "search_applicable": true,
+    "literal_width_min": 2,
+    "literal_width_max": 32
+  },
+  "alignment": {
+    "digest": "sha256(fixture_domain || candidate_sha256_bytes || scenario_utf8)",
+    "offset": "digest[0] & 15",
+    "meaning": "offset of the 1 MiB haystack slice within an overallocated runner buffer"
+  },
+  "background": {
+    "block": "sha256(fixture_domain || candidate_sha256_bytes || scenario_utf8 || counter_u64_le)",
+    "counter_start": 0,
+    "mapping": "0x20 + (digest_byte % 95)",
+    "sentinel": "lowest byte in inclusive range 0x20..0x7e absent from the literal",
+    "repair": "find the leftmost literal occurrence at or after cursor, replace its first byte with sentinel, set cursor=start+1, repeat to exhaustion"
+  },
+  "scenarios": {
+    "absent": {
+      "construction": "repaired scenario-keyed background",
+      "expected_leftmost": null,
+      "expected_count": 0
+    },
+    "early": {
+      "start": 64,
+      "construction": "repaired background, sentinel guard width-1 on each in-range side, then insert one literal"
+    },
+    "middle": {
+      "start": "floor((1048576-literal_width)/2)",
+      "construction": "repaired background, sentinel guard width-1 on each in-range side, then insert one literal"
+    },
+    "tail": {
+      "start": "1048576-literal_width",
+      "construction": "repaired background, sentinel guard width-1 on each in-range side, then insert one literal"
+    },
+    "dense": {
+      "construction": "repeat the literal floor((1048576-1)/literal_width) times from offset zero and fill the nonempty suffix with sentinel",
+      "expected_leftmost": 0,
+      "expected_count": "floor((1048576-1)/literal_width)"
+    }
+  },
+  "oracle": {
+    "search": "scalar overlapping left-to-right byte comparison; first start becomes the half-open leftmost span",
+    "count": "scalar nonoverlapping left-to-right byte comparison",
+    "requirements": [
+      "absent has zero occurrences",
+      "early, middle, and tail have exactly one occurrence at the prescribed start",
+      "dense has exactly the prescribed nonoverlapping count and no extra occurrence in the sentinel suffix"
+    ]
+  },
+  "backend_identity": {
+    "status": "required-unresolved-input",
+    "timing_forbidden_until": "V10 source, tag, object ABI, static linker, facade, and auto-routing policy are frozen"
+  }
+}
