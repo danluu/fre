@@ -1325,7 +1325,7 @@ fn measure(
                 encode(black_box(invoke()?)) ^ u64::try_from(ordinal).unwrap_or(u64::MAX),
             );
         }
-        let elapsed_ns = u64::try_from(start.elapsed().as_nanos())?;
+        let elapsed_ns = positive_elapsed_ns(start.elapsed().as_nanos())?;
         let cpu_after = current_cpu()?;
         let accepted = measurement_cpu_accepted(cpu_before, cpu_after, cpu);
         attempts.push(CpuAttempt {
@@ -1345,6 +1345,12 @@ fn measure(
         }
     }
     Err(invalid("measured variant exhausted the frozen CPU-only retry bound").into())
+}
+
+fn positive_elapsed_ns(raw_elapsed_ns: u128) -> Result<u64, io::Error> {
+    let elapsed_ns = u64::try_from(raw_elapsed_ns)
+        .map_err(|_| invalid("measured elapsed time exceeds u64 nanoseconds"))?;
+    Ok(elapsed_ns.max(1))
 }
 
 fn require_measurement_cpu(measurement: &Measurement, expected: usize) -> Result<(), io::Error> {
@@ -1958,6 +1964,12 @@ mod tests {
             scaled_anchor_iterations(CALIBRATION_TARGET_NS, &anchors).unwrap(),
             10,
         );
+    }
+
+    #[test]
+    fn zero_resolution_elapsed_is_published_as_positive() {
+        assert_eq!(positive_elapsed_ns(0).unwrap(), 1);
+        assert_eq!(positive_elapsed_ns(17).unwrap(), 17);
     }
 
     #[cfg(target_os = "macos")]

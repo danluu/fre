@@ -589,6 +589,23 @@ def run(repo: Path, ripgrep_root: Path, fixture_root: Path) -> None:
                 cpu,
             ),
         )
+        zero_duration_pilot = timing_row(
+            analyzer,
+            static,
+            cpu,
+            90_001,
+        )
+        zero_duration_pilot["calibration"]["portable_pilots"][0][
+            "elapsed_ns"
+        ] = 0
+        expect_refusal(
+            "zero-duration calibration receipt",
+            lambda: analyzer.validate_timing(
+                zero_duration_pilot,
+                static,
+                cpu,
+            ),
+        )
         require(
             not (
                 analyzer.validate_timing(strict_boundary, static, cpu)
