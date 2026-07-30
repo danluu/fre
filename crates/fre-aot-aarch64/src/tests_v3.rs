@@ -525,6 +525,74 @@ fn direct_masks_and_periodic_absence_batching_have_distinct_graphs() {
 }
 
 #[test]
+fn wide_direct_masks_skip_later_columns_after_an_empty_pair() {
+    let (program, optimized_result) = optimized(b"abc");
+    assert_eq!(
+        optimized_result.recipe().strategy(),
+        CountV3Strategy::DirectExactMask
+    );
+    let image = emit_count_v3(
+        &program,
+        optimized_result.recipe(),
+        CountEmitLimitsV3::default(),
+    )
+    .unwrap();
+    let decoded = decoded_v3(&image);
+    let pair_test = decoded
+        .windows(3)
+        .position(|window| {
+            window[0]
+                == DecodedInstructionV3::UnsignedMaxAcrossBytes16 {
+                    destination: 1,
+                    source: 21,
+                }
+                && window[1]
+                    == DecodedInstructionV3::MoveVectorByteTo32 {
+                        destination: 6,
+                        source: 1,
+                    }
+                && window[2]
+                    == DecodedInstructionV3::CompareImmediate64 {
+                        register: 6,
+                        immediate: 0,
+                    }
+        })
+        .expect("batch-wide two-column emptiness test");
+    let skip = pair_test + 3;
+    assert!(matches!(
+        decoded[skip],
+        DecodedInstructionV3::BranchCondition {
+            condition: crate::ConditionV3::Equal,
+            ..
+        }
+    ));
+    let advance = usize::try_from(branch_target_v3(&decoded, skip) / 4).unwrap();
+    assert_eq!(
+        decoded[advance],
+        DecodedInstructionV3::AddImmediate64 {
+            destination: 3,
+            source: 3,
+            immediate: 64,
+        }
+    );
+
+    let (width_two_program, width_two_optimized) = optimized(b"ab");
+    let width_two = emit_count_v3(
+        &width_two_program,
+        width_two_optimized.recipe(),
+        CountEmitLimitsV3::default(),
+    )
+    .unwrap();
+    assert!(!decoded_v3(&width_two).iter().any(|instruction| {
+        *instruction
+            == DecodedInstructionV3::UnsignedMaxAcrossBytes16 {
+                destination: 1,
+                source: 21,
+            }
+    }));
+}
+
+#[test]
 fn periodic_sve_rows_batch_both_boundary_columns_across_128_starts() {
     for (required_isa, sve2) in [
         (CountV3RequiredIsa::Aarch64SveVl16, false),

@@ -1583,6 +1583,11 @@ fn emit_direct_exact_mask_v3(
     done: LabelV3,
 ) -> Result<(), CountAotError> {
     let vector64 = assembler.new_label(LabelKindV3::VectorLoop)?;
+    let vector64_advance = if filter.len >= 3 {
+        Some(assembler.new_label(LabelKindV3::Internal)?)
+    } else {
+        None
+    };
     let vector16 = assembler.new_label(LabelKindV3::VectorLoop)?;
     let tail = assembler.new_label(LabelKindV3::ScalarTail)?;
     let tail_miss = assembler.new_label(LabelKindV3::Miss)?;
@@ -1620,15 +1625,57 @@ fn emit_direct_exact_mask_v3(
             u16::from(filter.offsets[index]),
         )?;
     }
-    for (block, mask) in block_masks.into_iter().enumerate() {
-        let block_offset = u16::try_from(block * usize::from(SIMD_CANDIDATE_STARTS_V3))
-            .expect("four direct-mask blocks");
-        for index in 0..usize::from(filter.len) {
-            let destination = if index == 0 { mask } else { 1 };
-            assembler.load_vector128_offset(destination, pointer_registers[index], block_offset)?;
-            assembler.compare_equal_bytes16(destination, destination, vector_registers[index])?;
-            if index != 0 {
-                assembler.and_bytes16(mask, mask, destination)?;
+    if filter.len < 3 {
+        for (block, mask) in block_masks.into_iter().enumerate() {
+            let block_offset = u16::try_from(block * usize::from(SIMD_CANDIDATE_STARTS_V3))
+                .expect("four direct-mask blocks");
+            for index in 0..usize::from(filter.len) {
+                let destination = if index == 0 { mask } else { 1 };
+                assembler.load_vector128_offset(
+                    destination,
+                    pointer_registers[index],
+                    block_offset,
+                )?;
+                assembler.compare_equal_bytes16(
+                    destination,
+                    destination,
+                    vector_registers[index],
+                )?;
+                if index != 0 {
+                    assembler.and_bytes16(mask, mask, destination)?;
+                }
+            }
+        }
+    } else {
+        // Form two-column masks for the whole 64-start batch first. If their
+        // union is empty, later exact columns and the horizontal count are
+        // provably unnecessary. Dense batches retain the direct count path.
+        for (block, mask) in block_masks.into_iter().enumerate() {
+            let block_offset = u16::try_from(block * usize::from(SIMD_CANDIDATE_STARTS_V3))
+                .expect("four direct-mask blocks");
+            assembler.load_vector128_offset(mask, pointer_registers[0], block_offset)?;
+            assembler.compare_equal_bytes16(mask, mask, vector_registers[0])?;
+            assembler.load_vector128_offset(1, pointer_registers[1], block_offset)?;
+            assembler.compare_equal_bytes16(1, 1, vector_registers[1])?;
+            assembler.and_bytes16(mask, mask, 1)?;
+        }
+        assembler.or_bytes16(21, block_masks[0], block_masks[1])?;
+        assembler.or_bytes16(22, block_masks[2], block_masks[3])?;
+        assembler.or_bytes16(21, 21, 22)?;
+        assembler.unsigned_max_across_bytes16(1, 21)?;
+        assembler.move_vector_byte_to32(X6, 1)?;
+        assembler.cmp_imm64(X6, 0)?;
+        assembler.branch_cond(
+            ConditionV3::Equal,
+            vector64_advance.expect("wide direct advance"),
+        )?;
+        for index in 2..usize::from(filter.len) {
+            for (block, mask) in block_masks.into_iter().enumerate() {
+                let block_offset = u16::try_from(block * usize::from(SIMD_CANDIDATE_STARTS_V3))
+                    .expect("four direct-mask blocks");
+                assembler.load_vector128_offset(1, pointer_registers[index], block_offset)?;
+                assembler.compare_equal_bytes16(1, 1, vector_registers[index])?;
+                assembler.and_bytes16(mask, mask, 1)?;
             }
         }
     }
@@ -1640,6 +1687,9 @@ fn emit_direct_exact_mask_v3(
     assembler.sub_reg(X6, X5, X6)?;
     assembler.and_low_bits(X6, X6, 8)?;
     assembler.add_reg(X13, X13, X6)?;
+    if let Some(vector64_advance) = vector64_advance {
+        assembler.bind(vector64_advance)?;
+    }
     assembler.add_imm(X3, X3, 64)?;
     assembler.branch(vector64)?;
 

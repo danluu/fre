@@ -2083,6 +2083,11 @@ fn policy_direct_exact_mask_v3(
     done: PolicyLabelV3,
 ) -> Result<(), CountAotError> {
     let vector64 = policy.new_label(LabelKindV3::VectorLoop)?;
+    let vector64_advance = if filter.len >= 3 {
+        Some(policy.new_label(LabelKindV3::Internal)?)
+    } else {
+        None
+    };
     let vector16 = policy.new_label(LabelKindV3::VectorLoop)?;
     let tail = policy.new_label(LabelKindV3::ScalarTail)?;
     let tail_miss = policy.new_label(LabelKindV3::Miss)?;
@@ -2125,34 +2130,155 @@ fn policy_direct_exact_mask_v3(
             u16::from(filter.offsets[index]),
         )?;
     }
-    for (block, mask) in block_masks.into_iter().enumerate() {
-        let block_offset = u16::try_from(block * usize::from(SIMD_CANDIDATE_STARTS_V3))
-            .expect("four direct-mask blocks");
-        for index in 0..usize::from(filter.len) {
-            let destination = if index == 0 { mask } else { 1 };
+    if filter.len < 3 {
+        for (block, mask) in block_masks.into_iter().enumerate() {
+            let block_offset = u16::try_from(block * usize::from(SIMD_CANDIDATE_STARTS_V3))
+                .expect("four direct-mask blocks");
+            for index in 0..usize::from(filter.len) {
+                let destination = if index == 0 { mask } else { 1 };
+                exact_v3(
+                    policy,
+                    DecodedInstructionV3::LoadVector128 {
+                        destination,
+                        base: pointer_registers[index],
+                        offset: block_offset,
+                    },
+                )?;
+                exact_v3(
+                    policy,
+                    DecodedInstructionV3::CompareEqualBytes16 {
+                        destination,
+                        left: destination,
+                        right: vector_registers[index],
+                    },
+                )?;
+                if index != 0 {
+                    exact_v3(
+                        policy,
+                        DecodedInstructionV3::AndBytes16 {
+                            destination: mask,
+                            left: mask,
+                            right: destination,
+                        },
+                    )?;
+                }
+            }
+        }
+    } else {
+        for (block, mask) in block_masks.into_iter().enumerate() {
+            let block_offset = u16::try_from(block * usize::from(SIMD_CANDIDATE_STARTS_V3))
+                .expect("four direct-mask blocks");
             exact_v3(
                 policy,
                 DecodedInstructionV3::LoadVector128 {
-                    destination,
-                    base: pointer_registers[index],
+                    destination: mask,
+                    base: pointer_registers[0],
                     offset: block_offset,
                 },
             )?;
             exact_v3(
                 policy,
                 DecodedInstructionV3::CompareEqualBytes16 {
-                    destination,
-                    left: destination,
-                    right: vector_registers[index],
+                    destination: mask,
+                    left: mask,
+                    right: vector_registers[0],
                 },
             )?;
-            if index != 0 {
+            exact_v3(
+                policy,
+                DecodedInstructionV3::LoadVector128 {
+                    destination: 1,
+                    base: pointer_registers[1],
+                    offset: block_offset,
+                },
+            )?;
+            exact_v3(
+                policy,
+                DecodedInstructionV3::CompareEqualBytes16 {
+                    destination: 1,
+                    left: 1,
+                    right: vector_registers[1],
+                },
+            )?;
+            exact_v3(
+                policy,
+                DecodedInstructionV3::AndBytes16 {
+                    destination: mask,
+                    left: mask,
+                    right: 1,
+                },
+            )?;
+        }
+        exact_v3(
+            policy,
+            DecodedInstructionV3::OrBytes16 {
+                destination: 21,
+                left: block_masks[0],
+                right: block_masks[1],
+            },
+        )?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::OrBytes16 {
+                destination: 22,
+                left: block_masks[2],
+                right: block_masks[3],
+            },
+        )?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::OrBytes16 {
+                destination: 21,
+                left: 21,
+                right: 22,
+            },
+        )?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::UnsignedMaxAcrossBytes16 {
+                destination: 1,
+                source: 21,
+            },
+        )?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::MoveVectorByteTo32 {
+                destination: X6,
+                source: 1,
+            },
+        )?;
+        compare_immediate64_v3(policy, X6, 0)?;
+        condition_v3(
+            policy,
+            ConditionV3::Equal,
+            vector64_advance.expect("wide direct advance"),
+        )?;
+        for index in 2..usize::from(filter.len) {
+            for (block, mask) in block_masks.into_iter().enumerate() {
+                let block_offset = u16::try_from(block * usize::from(SIMD_CANDIDATE_STARTS_V3))
+                    .expect("four direct-mask blocks");
+                exact_v3(
+                    policy,
+                    DecodedInstructionV3::LoadVector128 {
+                        destination: 1,
+                        base: pointer_registers[index],
+                        offset: block_offset,
+                    },
+                )?;
+                exact_v3(
+                    policy,
+                    DecodedInstructionV3::CompareEqualBytes16 {
+                        destination: 1,
+                        left: 1,
+                        right: vector_registers[index],
+                    },
+                )?;
                 exact_v3(
                     policy,
                     DecodedInstructionV3::AndBytes16 {
                         destination: mask,
                         left: mask,
-                        right: destination,
+                        right: 1,
                     },
                 )?;
             }
@@ -2192,6 +2318,9 @@ fn policy_direct_exact_mask_v3(
         },
     )?;
     add_register64_v3(policy, X13, X13, X6)?;
+    if let Some(vector64_advance) = vector64_advance {
+        policy.bind(vector64_advance)?;
+    }
     add_immediate64_v3(policy, X3, X3, 64)?;
     branch_v3(policy, vector64)?;
 
