@@ -66,3 +66,96 @@ Recompute the frozen identities without materializing JSONL:
 ```sh
 python3 research/aot/search-tag29-topology-generalization-v1/validate_freeze.py
 ```
+
+## Fail-closed result contract
+
+`analyze_qualification_results.py` uses the v2 result contract. Its invocation
+is:
+
+```text
+analyze_qualification_results.py QUALIFICATION_DIR \
+  CAMPAIGN_AUTHORITY EXPECTED_AUTHORITY_FILE_SHA256 RESULT_MANIFEST
+```
+
+`CAMPAIGN_AUTHORITY` must have the exact flat name
+`campaign-authority.json`. The controller supplies its whole-file SHA-256
+separately, before any result exists. The result manifest does not contain an
+authority object; it contains only the exact authority-file SHA-256 and the
+campaign identity derived from that SHA-256. Consequently, rehashing a
+result-supplied authority cannot authorize a campaign.
+
+The authority pins the analyzer and qualification validator sources, runner,
+controller, sealer, source set, plan, backend, ordinary and baseline entries,
+single timed-function identity, exact host attestations and build/link
+identities, and a nonempty sorted set of allowed logical CPUs for each host.
+It also pins one exact flat compiler/link evidence file per host:
+
+```text
+apple-aarch64-asimd.compiler-object-link-evidence.json
+c9g-aarch64-asimd-sve2.compiler-object-link-evidence.json
+```
+
+The evidence is an envelope with schema
+`fre.aot.search-tag29-compiler-object-link-evidence.v1`, a canonical payload
+hash, and a payload. The payload binds the exact frozen/canonical host,
+target triple and feature object; both qualification object/disposition
+manifests; external verifier, build, link, map and final-image identities;
+and the authority-pinned linked image.
+
+The accepted link-proof verifier source SHA-256 is
+`8b3d13c5233e68b6ef4f398a713792515f8fb1b1001ca699e39b81746d2ac9bb`;
+its contract SHA-256 is
+`42921564050b795b4a097c8b74dde2e947b914931e71dd5faafe274a4975e60e`.
+
+Its `objects` array is an exact ordered bijection with all 808 object
+candidates. Each entry contains:
+
+```text
+ordinal
+literal_sha256
+semantic_candidate_sha256
+compile_identity
+compile_receipt_sha256
+implementation_object_sha256
+glue_object_sha256
+implementation_symbols {entry, payload, metadata}
+glue_symbol
+glue_symbol_identity_sha256
+glue_relocation_targets [entry, payload, metadata]
+implementation_linker_input_multiplicity
+glue_linker_input_multiplicity
+link_map_origins
+final_image_retentions
+```
+
+Both multiplicities must be the strict integer `1`. Every implementation
+symbol and the glue symbol must suffix-match the full nonzero 64-hex compile
+identity. Compile identities, compile receipts, implementation objects, glue
+objects, and symbols are injective. Origin and retention arrays are exact
+ordered records `{symbol, object_sha256, receipt_sha256}` for entry, payload,
+metadata, then glue. Their symbol/object pairs must match their enclosing
+objects and every proof receipt is injective. `refusals` is the exact ordered
+114-literal structural-refusal bijection with a unique compile receipt.
+
+The result directory has exact flat bundle names. Each host supplies one
+`*.correctness.jsonl` with all 123,424 frozen rows and one `*.timing.jsonl`
+with all 3,078 preselected cells. Both correctness bundles are fully consumed
+and authenticated before either timing bundle is read. The correctness pass
+checks scalar, forced-portable and candidate spans and counts; exact compiler
+disposition and external object proof; exact route/static invocation; and
+physical padding/guard receipts for every row.
+
+All input files are opened relative to held directory descriptors with
+`O_NOFOLLOW`. The analyzer hashes and parses the same held descriptor,
+rejects links and metadata changes, and permits only exact flat names. Result
+integer fields reject booleans, mappings require nonzero bounded allocation
+ranges, receipt identities are unique and case-bound, CPUs must belong to the
+pre-authorized host set, and one semantic accumulator must remain constant
+across all six order-paired measurements.
+
+Run the full synthetic v2 contract and adversarial mutation test with:
+
+```sh
+python3 research/aot/search-tag29-topology-generalization-v1/test_qualification_tools.py \
+  QUALIFICATION_DIR
+```
