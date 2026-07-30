@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate paired Search V9/V8/portable CSVs and summarize median ratios."""
+"""Validate paired Search V10/V9/portable development CSVs."""
 
 import csv
 import json
@@ -8,14 +8,14 @@ import statistics
 import sys
 from collections import defaultdict
 
-SCHEMA = "fre-search-v9-broad-deploy-v2"
+SCHEMA = "fre-search-v10-broad-devscreen-v1"
 ENGINES = (
-    "native-v8-aot-code-tag8",
     "native-v9-aot-code-tag22",
-    "hybrid-portable256-v9-tag22-floor4093-width2",
+    "native-v10-aot-code-tag23",
+    "hybrid-portable256-v10-tag23-floor4093-width2",
     "portable-memmem",
 )
-REPETITIONS = {"screen": 3, "heldout": 7, "confirm": 12}
+REPETITIONS = {"screen": 3}
 FIXTURE_FIELDS = (
     "phase",
     "seed",
@@ -65,7 +65,7 @@ def main():
     expected_phase = sys.argv[1]
     expected_repetitions = REPETITIONS.get(expected_phase)
     if expected_repetitions is None:
-        fail("PHASE must be screen, heldout, or confirm")
+        fail("this development analyzer accepts only PHASE=screen")
 
     rows = defaultdict(lambda: defaultdict(list))
     seen_phase_rows = 0
@@ -112,20 +112,20 @@ def main():
             for field in ("iterations", "checksum", "semantic"):
                 if len({row[field] for row in paired}) != 1:
                     fail(f"paired {field} mismatch: {fixture} repetition={repetition}")
-        v8 = medians[ENGINES[0]]
-        v9 = medians[ENGINES[1]]
+        v9 = medians[ENGINES[0]]
+        v10 = medians[ENGINES[1]]
         hybrid = medians[ENGINES[2]]
         portable = medians[ENGINES[3]]
         fixture_ratios.append(
             {
                 "fixture": fixture,
-                "v8_over_v9": v8 / v9,
-                "v9_over_v8": v9 / v8,
+                "v9_over_v10": v9 / v10,
+                "v10_over_v9": v10 / v9,
+                "portable_over_v10": portable / v10,
                 "portable_over_v9": portable / v9,
-                "portable_over_v8": portable / v8,
                 "portable_over_hybrid": portable / hybrid,
                 "hybrid_over_portable": hybrid / portable,
-                "v9_over_hybrid": v9 / hybrid,
+                "v10_over_hybrid": v10 / hybrid,
             }
         )
 
@@ -140,13 +140,13 @@ def main():
         }
 
     ratio_names = (
-        "v8_over_v9",
-        "v9_over_v8",
+        "v9_over_v10",
+        "v10_over_v9",
+        "portable_over_v10",
         "portable_over_v9",
-        "portable_over_v8",
         "portable_over_hybrid",
         "hybrid_over_portable",
-        "v9_over_hybrid",
+        "v10_over_hybrid",
     )
 
     def selected(ratio, predicate):
@@ -228,7 +228,7 @@ def main():
         }
 
     output = {
-        "schema": "fre-search-v9-broad-deploy-analysis-v1",
+        "schema": "fre-search-v10-broad-devscreen-analysis-v1",
         "phase": expected_phase,
         "fixtures": len(rows),
         "rows": seen_phase_rows,
@@ -238,29 +238,29 @@ def main():
         },
         "by_width": {
             ratio: grouped("width", ratio)
-            for ratio in ("v8_over_v9", "portable_over_v9", "portable_over_hybrid")
+            for ratio in ("v9_over_v10", "portable_over_v10", "portable_over_hybrid")
         },
         "by_size": {
             ratio: grouped("size", ratio)
-            for ratio in ("v8_over_v9", "portable_over_v9", "portable_over_hybrid")
+            for ratio in ("v9_over_v10", "portable_over_v10", "portable_over_hybrid")
         },
         "by_shape": {
             ratio: grouped("shape", ratio)
-            for ratio in ("v8_over_v9", "portable_over_v9", "portable_over_hybrid")
+            for ratio in ("v9_over_v10", "portable_over_v10", "portable_over_hybrid")
         },
         "by_scenario": {
             ratio: grouped("scenario", ratio)
-            for ratio in ("v8_over_v9", "portable_over_v9", "portable_over_hybrid")
+            for ratio in ("v9_over_v10", "portable_over_v10", "portable_over_hybrid")
         },
         "predeclared_screen_gates": {
-            "v9_first_candidate_vs_v8": geomean_gate(
-                "v8_over_v9", first_candidate, 1.20
+            "v10_first_candidate_vs_v9": geomean_gate(
+                "v9_over_v10", first_candidate, 0.98
             ),
             "hybrid_tail_owned_long_scan_vs_portable": long_scan_gate(
                 lambda fixture: True
             ),
-            "v9_nonfirst_tail_guard_vs_v8": parity_gate(
-                "v9_over_v8", lambda fixture: not first_candidate(fixture)
+            "v10_nonfirst_tail_guard_vs_v9": parity_gate(
+                "v10_over_v9", lambda fixture: not first_candidate(fixture)
             ),
             "hybrid_prefix_owned_parity_vs_portable": parity_gate(
                 "hybrid_over_portable",

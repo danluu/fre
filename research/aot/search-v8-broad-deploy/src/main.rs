@@ -26,22 +26,14 @@ const SCREEN_SEEDS: [u64; 4] = [
     0x6b47_3a9d_e120_85cf,
     0xc2e9_5714_8ab6_3d01,
 ];
-const HELDOUT_SEEDS: [u64; 4] = [
-    0x8d19_74b2_c63e_50af,
-    0xd3a5_2f91_6c48_b7e0,
-    0x39f0_6c82_b517_e4ad,
-    0xe781_2d5a_94c3_60bf,
-];
 const WIDTHS: [usize; 32] = [
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
-    26, 27, 28, 29, 30, 31, 32,
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
+    27, 28, 29, 30, 31, 32,
 ];
 const SCREEN_SIZES: [usize; 7] = [257, 1_021, 4_093, 16_381, 65_521, 262_139, 1_048_573];
-const HELDOUT_SIZES: [usize; 3] = [4_093, 65_521, 1_048_573];
 const SCREEN_ALIGNMENTS: [u8; 4] = [0, 1, 7, 15];
-const HELDOUT_ALIGNMENTS: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 const HEADER: &str = "schema,phase,seed,width,shape,size,scenario,alignment,window_start,window_end,repetition,order,engine,iterations,total_ns,ns_per_iter,checksum,semantic";
-const SCHEMA: &str = "fre-search-v9-broad-deploy-v2";
+const SCHEMA: &str = "fre-search-v10-broad-devscreen-v1";
 const CHECKSUM_SEED: u64 = 0x243f_6a88_85a3_08d3;
 const MAX_CALIBRATION_ITERATIONS: usize = 1 << 30;
 const HYBRID_MIN_LITERAL_BYTES: usize = 2;
@@ -51,54 +43,43 @@ const HYBRID_PREFIX_CANDIDATE_STARTS: usize = 256;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Phase {
     Screen,
-    Heldout,
-    Confirm,
 }
 
 impl Phase {
     fn parse(value: &str) -> Result<Self, DynError> {
         match value {
             "screen" => Ok(Self::Screen),
-            "heldout" => Ok(Self::Heldout),
-            "confirm" => Ok(Self::Confirm),
-            _ => Err(invalid("PHASE must be screen, heldout, or confirm").into()),
+            _ => Err(invalid("this development binary accepts only PHASE=screen").into()),
         }
     }
 
     const fn name(self) -> &'static str {
         match self {
             Self::Screen => "screen",
-            Self::Heldout => "heldout",
-            Self::Confirm => "confirm",
         }
     }
 
     const fn seeds(self) -> &'static [u64] {
         match self {
             Self::Screen => &SCREEN_SEEDS,
-            Self::Heldout | Self::Confirm => &HELDOUT_SEEDS,
         }
     }
 
     const fn sizes(self) -> &'static [usize] {
         match self {
             Self::Screen => &SCREEN_SIZES,
-            Self::Heldout | Self::Confirm => &HELDOUT_SIZES,
         }
     }
 
     const fn alignments(self) -> &'static [u8] {
         match self {
             Self::Screen => &SCREEN_ALIGNMENTS,
-            Self::Heldout | Self::Confirm => &HELDOUT_ALIGNMENTS,
         }
     }
 
     const fn repetitions(self) -> usize {
         match self {
             Self::Screen => 3,
-            Self::Heldout => 7,
-            Self::Confirm => 12,
         }
     }
 }
@@ -142,6 +123,7 @@ enum Scenario {
     Tail,
     Dense,
     FirstByteDenseAbsent,
+    NearMissHead,
     NearMissTail,
     BinaryTail,
     FirstCandidateExact,
@@ -152,7 +134,7 @@ enum Scenario {
 }
 
 impl Scenario {
-    const BASE: [Self; 13] = [
+    const BASE: [Self; 14] = [
         Self::AbsentEntropy,
         Self::AbsentFiller,
         Self::Early,
@@ -160,6 +142,7 @@ impl Scenario {
         Self::Tail,
         Self::Dense,
         Self::FirstByteDenseAbsent,
+        Self::NearMissHead,
         Self::NearMissTail,
         Self::BinaryTail,
         Self::FirstCandidateExact,
@@ -177,12 +160,11 @@ impl Scenario {
             Self::Tail => "tail".to_owned(),
             Self::Dense => "dense".to_owned(),
             Self::FirstByteDenseAbsent => "first-byte-dense-absent".to_owned(),
+            Self::NearMissHead => "near-miss-head".to_owned(),
             Self::NearMissTail => "near-miss-tail".to_owned(),
             Self::BinaryTail => "binary-tail".to_owned(),
             Self::FirstCandidateExact => "first_candidate_exact".to_owned(),
-            Self::SelectedByteHitThenFullMiss => {
-                "selected_byte_hit_then_full_miss".to_owned()
-            }
+            Self::SelectedByteHitThenFullMiss => "selected_byte_hit_then_full_miss".to_owned(),
             Self::WindowAbsent => "window-absent".to_owned(),
             Self::WindowTail => "window-tail".to_owned(),
             Self::AlignmentTail(residue) => format!("alignment-tail-{residue}"),
@@ -198,6 +180,7 @@ impl Scenario {
             Self::Tail => 0x11f,
             Self::Dense => 0x137,
             Self::FirstByteDenseAbsent => 0x151,
+            Self::NearMissHead => 0x163,
             Self::NearMissTail => 0x16d,
             Self::BinaryTail => 0x181,
             Self::FirstCandidateExact => 0x197,
@@ -218,18 +201,18 @@ impl Scenario {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Engine {
-    NativeV8,
     NativeV9,
-    HybridV9,
+    NativeV10,
+    HybridV10,
     Portable,
 }
 
 impl Engine {
     const fn name(self) -> &'static str {
         match self {
-            Self::NativeV8 => "native-v8-aot-code-tag8",
             Self::NativeV9 => "native-v9-aot-code-tag22",
-            Self::HybridV9 => "hybrid-portable256-v9-tag22-floor4093-width2",
+            Self::NativeV10 => "native-v10-aot-code-tag23",
+            Self::HybridV10 => "hybrid-portable256-v10-tag23-floor4093-width2",
             Self::Portable => "portable-memmem",
         }
     }
@@ -344,62 +327,57 @@ fn run_case(
     let portable = LiteralPlan::new(literal, LiteralBuildLimits::default())?;
     let program =
         build_exact_literal::<Span>(literal, AnchorFlags::default(), ValidateLimits::default())?;
-    let image_v8 = emit_audited_with_backend(
-        &program,
-        SearchBackendPolicy::AsimdV8,
-        EmitLimits::default(),
-    )?;
     let image_v9 = emit_audited_with_backend(
         &program,
         SearchBackendPolicy::AsimdV9,
         EmitLimits::default(),
     )?;
-    let primary_offset = v9_prefix_primary_offset(image_v9.as_image().code())?;
+    let image_v10 = emit_audited_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV10,
+        EmitLimits::default(),
+    )?;
+    let primary_offset = first_candidate_primary_offset(image_v10.as_image().code())?;
     let fixture = make_fixture(seed, size, scenario, literal, primary_offset)?;
     let bytes = fixture.bytes();
     let portable_window = PortableWindow::new(fixture.window_start, fixture.window_end);
     let native_window = NativeWindow::new(fixture.window_start, fixture.window_end);
-    let kernel_v8 = publish_audited::<Span>(&image_v8, PublicationLimits::default())?;
     let kernel_v9 = publish_audited::<Span>(&image_v9, PublicationLimits::default())?;
-    let session_v8 = kernel_v8.begin_current_thread_session()?;
+    let kernel_v10 = publish_audited::<Span>(&image_v10, PublicationLimits::default())?;
     let session_v9 = kernel_v9.begin_current_thread_session()?;
+    let session_v10 = kernel_v10.begin_current_thread_session()?;
 
     let expected = encode_portable(
         portable
             .find_window(bytes, portable_window, LiteralSearchLimits::unlimited())?
             .0,
     );
-    let actual_v8 = invoke_native(&session_v8, bytes, native_window, literal.len())?;
     let actual_v9 = invoke_native(&session_v9, bytes, native_window, literal.len())?;
-    let actual_hybrid = invoke_hybrid(
-        &portable,
-        &session_v9,
-        bytes,
-        native_window,
-        literal.len(),
-    )?;
+    let actual_v10 = invoke_native(&session_v10, bytes, native_window, literal.len())?;
+    let actual_hybrid =
+        invoke_hybrid(&portable, &session_v10, bytes, native_window, literal.len())?;
     require(
-        expected == actual_v8 && expected == actual_v9 && expected == actual_hybrid,
-        "native V8/V9/hybrid/portable semantic mismatch before timing",
+        expected == actual_v9 && expected == actual_v10 && expected == actual_hybrid,
+        "native V9/V10/hybrid/portable semantic mismatch before timing",
     )?;
 
     for _ in 0..3 {
         black_box(invoke_portable(&portable, bytes, portable_window)?);
         black_box(invoke_native(
-            &session_v8,
+            &session_v9,
             bytes,
             native_window,
             literal.len(),
         )?);
         black_box(invoke_native(
-            &session_v9,
+            &session_v10,
             bytes,
             native_window,
             literal.len(),
         )?);
         black_box(invoke_hybrid(
             &portable,
-            &session_v9,
+            &session_v10,
             bytes,
             native_window,
             literal.len(),
@@ -407,8 +385,8 @@ fn run_case(
     }
     let iterations = calibrate(
         &portable,
-        &session_v8,
         &session_v9,
+        &session_v10,
         bytes,
         portable_window,
         native_window,
@@ -420,28 +398,28 @@ fn run_case(
     for repetition in 0..phase.repetitions() {
         let order = match repetition % 4 {
             0 => [
-                Engine::NativeV8,
                 Engine::NativeV9,
-                Engine::HybridV9,
+                Engine::NativeV10,
+                Engine::HybridV10,
                 Engine::Portable,
             ],
             1 => [
-                Engine::NativeV9,
-                Engine::HybridV9,
+                Engine::NativeV10,
+                Engine::HybridV10,
                 Engine::Portable,
-                Engine::NativeV8,
+                Engine::NativeV9,
             ],
             2 => [
-                Engine::HybridV9,
+                Engine::HybridV10,
                 Engine::Portable,
-                Engine::NativeV8,
                 Engine::NativeV9,
+                Engine::NativeV10,
             ],
             _ => [
                 Engine::Portable,
-                Engine::NativeV8,
                 Engine::NativeV9,
-                Engine::HybridV9,
+                Engine::NativeV10,
+                Engine::HybridV10,
             ],
         };
         let order_name = format!(
@@ -453,20 +431,14 @@ fn run_case(
         );
         for engine in order {
             let measurement = match engine {
-                Engine::NativeV8 => measure(iterations, expected, || {
-                    invoke_native(&session_v8, bytes, native_window, literal.len())
-                })?,
                 Engine::NativeV9 => measure(iterations, expected, || {
                     invoke_native(&session_v9, bytes, native_window, literal.len())
                 })?,
-                Engine::HybridV9 => measure(iterations, expected, || {
-                    invoke_hybrid(
-                        &portable,
-                        &session_v9,
-                        bytes,
-                        native_window,
-                        literal.len(),
-                    )
+                Engine::NativeV10 => measure(iterations, expected, || {
+                    invoke_native(&session_v10, bytes, native_window, literal.len())
+                })?,
+                Engine::HybridV10 => measure(iterations, expected, || {
+                    invoke_hybrid(&portable, &session_v10, bytes, native_window, literal.len())
                 })?,
                 Engine::Portable => measure(iterations, expected, || {
                     invoke_portable(&portable, bytes, portable_window)
@@ -492,7 +464,7 @@ fn run_case(
     Ok(())
 }
 
-fn v9_prefix_primary_offset(code: &[u8]) -> Result<usize, DynError> {
+fn first_candidate_primary_offset(code: &[u8]) -> Result<usize, DynError> {
     decode(code)?
         .into_iter()
         .find_map(|instruction| match instruction {
@@ -503,14 +475,14 @@ fn v9_prefix_primary_offset(code: &[u8]) -> Result<usize, DynError> {
             } => Some(usize::from(offset)),
             _ => None,
         })
-        .ok_or_else(|| invalid("V9 prefix selected-byte load missing").into())
+        .ok_or_else(|| invalid("first-candidate prefix selected-byte load missing").into())
 }
 
 #[allow(clippy::too_many_arguments)]
 fn calibrate(
     portable: &LiteralPlan,
-    session_v8: &PublishedKernelThreadSession<'_, Span>,
     session_v9: &PublishedKernelThreadSession<'_, Span>,
+    session_v10: &PublishedKernelThreadSession<'_, Span>,
     haystack: &[u8],
     portable_window: PortableWindow,
     native_window: NativeWindow,
@@ -520,16 +492,16 @@ fn calibrate(
 ) -> Result<usize, DynError> {
     let mut iterations = 1_usize;
     loop {
-        let native_v8 = measure(iterations, expected, || {
-            invoke_native(session_v8, haystack, native_window, literal_bytes)
-        })?;
         let native_v9 = measure(iterations, expected, || {
             invoke_native(session_v9, haystack, native_window, literal_bytes)
         })?;
-        let hybrid_v9 = measure(iterations, expected, || {
+        let native_v10 = measure(iterations, expected, || {
+            invoke_native(session_v10, haystack, native_window, literal_bytes)
+        })?;
+        let hybrid_v10 = measure(iterations, expected, || {
             invoke_hybrid(
                 portable,
-                session_v9,
+                session_v10,
                 haystack,
                 native_window,
                 literal_bytes,
@@ -538,10 +510,10 @@ fn calibrate(
         let portable_measurement = measure(iterations, expected, || {
             invoke_portable(portable, haystack, portable_window)
         })?;
-        let faster_ns = native_v8
+        let faster_ns = native_v9
             .total_ns
-            .min(native_v9.total_ns)
-            .min(hybrid_v9.total_ns)
+            .min(native_v10.total_ns)
+            .min(hybrid_v10.total_ns)
             .min(portable_measurement.total_ns)
             .max(1);
         if faster_ns >= target_ns / 4 || iterations == MAX_CALIBRATION_ITERATIONS {
@@ -613,30 +585,25 @@ fn invoke_portable(
 
 fn invoke_hybrid(
     portable: &LiteralPlan,
-    session_v9: &PublishedKernelThreadSession<'_, Span>,
+    native_tail: &PublishedKernelThreadSession<'_, Span>,
     haystack: &[u8],
     window: NativeWindow,
     literal_bytes: usize,
 ) -> Result<u64, DynError> {
     let checked = CheckedSearchWindow::new(black_box(haystack), window)
         .ok_or_else(|| invalid("hybrid window rejected"))?;
-    let full = portable
-        .preflight_checked_window(checked, LiteralSearchLimits::unlimited())?;
-    if literal_bytes < HYBRID_MIN_LITERAL_BYTES
-        || full.searched_bytes() < HYBRID_MIN_WINDOW_BYTES
-    {
+    let full = portable.preflight_checked_window(checked, LiteralSearchLimits::unlimited())?;
+    if literal_bytes < HYBRID_MIN_LITERAL_BYTES || full.searched_bytes() < HYBRID_MIN_WINDOW_BYTES {
         return Ok(encode_portable(full.find()?));
     }
-    if let Some(matched) =
-        full.find_prefix_candidate_starts(HYBRID_PREFIX_CANDIDATE_STARTS)?
-    {
+    if let Some(matched) = full.find_prefix_candidate_starts(HYBRID_PREFIX_CANDIDATE_STARTS)? {
         return Ok(encode_portable(Some(matched)));
     }
     let Some(tail) = full.after_prefix_candidate_starts(HYBRID_PREFIX_CANDIDATE_STARTS)? else {
         return Ok(encode_portable(None));
     };
     Ok(encode_native(
-        session_v9.search_checked(tail.checked_window())?,
+        native_tail.search_checked(tail.checked_window())?,
     ))
 }
 
@@ -699,7 +666,7 @@ fn make_fixture(
     )?;
     require(
         primary_offset < literal.len(),
-        "invalid V9 primary literal offset",
+        "invalid native primary literal offset",
     )?;
     let mut storage = vec![
         0_u8;
@@ -753,12 +720,17 @@ fn make_fixture(
                 scrub_matches(haystack, 0, len, literal, avoid);
             }
         }
-        Scenario::NearMissTail => {
+        Scenario::NearMissHead | Scenario::NearMissTail => {
             haystack.fill(avoid);
             if literal.len() > 1 {
                 for chunk in haystack.chunks_exact_mut(literal.len()) {
                     chunk.copy_from_slice(literal);
-                    chunk[literal.len() - 1] = avoid;
+                    let mutation_offset = if scenario == Scenario::NearMissHead {
+                        0
+                    } else {
+                        literal.len() - 1
+                    };
+                    chunk[mutation_offset] = avoid;
                 }
             }
             scrub_matches(haystack, 0, len, literal, avoid);

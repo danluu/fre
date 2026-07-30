@@ -2808,6 +2808,57 @@ fn v9_first_candidate_prefix_preserves_windows_alignments_and_guard_boundaries()
 }
 
 #[test]
+fn v10_terminal_filtered_images_publish_and_match_mutation_streams() {
+    let _lock = native_test_lock();
+    let mut comparisons = 0_u64;
+
+    for literal in [
+        b"abc".as_slice(),
+        b"0123456789abcdef",
+        b"0123456789abcdefghijklmnopqrstuv",
+    ] {
+        let program =
+            build_exact_literal::<Span>(literal, AnchorFlags::default(), ValidateLimits::default())
+                .expect("V10 exact program");
+        let image = emit_audited_with_backend(
+            &program,
+            SearchBackendPolicy::AsimdV10,
+            EmitLimits::default(),
+        )
+        .expect("audited V10 image");
+        assert_eq!(
+            image.as_image().backend_version(),
+            BackendVersion::SEARCH_V10
+        );
+        let kernel =
+            publish_audited::<Span>(&image, PublicationLimits::default()).expect("publish V10");
+
+        let avoid = (0_u16..=255)
+            .map(|value| u8::try_from(value).expect("bounded byte"))
+            .find(|byte| !literal.contains(byte))
+            .expect("literal leaves one avoiding byte");
+        for mutation_offset in [0, literal.len() / 2, literal.len() - 1] {
+            let mut haystack = vec![avoid; 4_096];
+            for chunk in haystack.chunks_exact_mut(literal.len()) {
+                chunk.copy_from_slice(literal);
+                chunk[mutation_offset] = avoid;
+            }
+            let match_start = haystack.len() - literal.len();
+            install_literal(&mut haystack, match_start, literal);
+            let window = SearchWindow::new(0, haystack.len());
+            for right_boundary in [false, true] {
+                platform::with_guarded_haystack(&haystack, right_boundary, |guarded| {
+                    assert_native_matches(&program, &kernel, guarded, window);
+                })
+                .expect("guarded V10 mutation stream");
+                comparisons = comparisons.checked_add(1).expect("bounded comparisons");
+            }
+        }
+    }
+    assert_eq!(comparisons, 18);
+}
+
+#[test]
 fn v8_adaptive_secondary_screen_rechecks_primary_before_fallback() {
     const WIDE_CANDIDATES: usize = 64;
     const PRIMARY_OFFSET: usize = 7;
