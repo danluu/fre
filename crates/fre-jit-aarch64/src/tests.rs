@@ -11889,6 +11889,399 @@ fn v23_rejects_resealed_bound_advance_compare_and_both_reconstruction_mutations(
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the V23 pointer-state semantic gate keeps every exit and pre-learning backedge scenario explicit"
+)]
+fn v23_primary_pointer_exits_and_static_backedges_match_the_kir_oracle() {
+    let mut comparisons = 0_u64;
+    for width in [6_usize, 13, 32] {
+        for zero_primary in [true, false] {
+            let literal = v23_pointer_test_literal(width, zero_primary);
+            let program = build_exact_literal::<Span>(
+                &literal,
+                AnchorFlags::default(),
+                ValidateLimits::default(),
+            )
+            .expect("V23 pointer semantic IR");
+            let image = emit_with_backend(
+                &program,
+                SearchBackendPolicy::AsimdV23,
+                EmitLimits::default(),
+            )
+            .expect("V23 pointer semantic image");
+            audit(&image).expect("V23 pointer semantic audit");
+            let manifest = image.search_manifest().expect("V23 pointer manifest");
+            let selected = [
+                manifest.primary_offset,
+                manifest.secondary_offset,
+                manifest.verification_offset,
+                manifest.quaternary_offset,
+                manifest.quinary_offset,
+            ]
+            .map(usize::from);
+            let avoid = (0_u16..=255)
+                .map(|value| u8::try_from(value).expect("bounded byte"))
+                .find(|byte| !literal.contains(byte))
+                .expect("V23 pointer literal leaves an avoiding byte");
+            let window_start = 3_usize;
+            let wide_base = window_start + 1;
+            let post_three_wide = wide_base + 3 * 64;
+
+            // The first three complete primary groups are empty. Exercise
+            // every pointer-only exit: another wide group containing a match,
+            // wide exhaustion into narrow, wide exhaustion into scalar tail,
+            // and a no-match exhaustion.
+            for (kind, exact, last_candidate) in [
+                (
+                    "wide exact",
+                    Some(post_three_wide + 11),
+                    post_three_wide + 80,
+                ),
+                (
+                    "narrow exact",
+                    Some(post_three_wide + 7),
+                    post_three_wide + 20,
+                ),
+                ("tail exact", Some(post_three_wide + 7), post_three_wide + 7),
+                ("no match", None, post_three_wide + 7),
+            ] {
+                let window_end = last_candidate + width;
+                let mut haystack = vec![avoid; window_end + 17];
+                if let Some(candidate) = exact {
+                    haystack[candidate..candidate + width].copy_from_slice(&literal);
+                }
+                let expected = program
+                    .execute(
+                        &haystack,
+                        SearchWindow::new(window_start, window_end),
+                        ExecutionLimits::unlimited(),
+                    )
+                    .expect("V23 pointer-exit oracle")
+                    .output()
+                    .map(|span| (span.start(), span.end()));
+                let actual = simulate(&image, &haystack, window_start, window_end)
+                    .expect("V23 pointer-exit simulation");
+                assert_eq!(
+                    span_output(actual),
+                    expected,
+                    "width={width} zero_primary={zero_primary} exit={kind}"
+                );
+                assert_eq!(
+                    expected,
+                    exact.map(|candidate| (candidate, candidate + width)),
+                    "width={width} zero_primary={zero_primary} exit={kind}"
+                );
+                comparisons = comparisons.checked_add(1).expect("bounded exit matrix");
+            }
+
+            // Passing primary and secondary before each remaining static
+            // column becomes empty must return through pointer-wide advance.
+            // Repeat across three groups so stale X5 or clobbered X13 cannot
+            // accidentally survive a single transition.
+            for missing_stage in 2_usize..selected.len() {
+                let exact = post_three_wide + 7;
+                let last_candidate = post_three_wide + 20;
+                let window_end = last_candidate + width;
+                let mut haystack = vec![avoid; window_end + 17];
+                for group in 0..3_usize {
+                    let false_candidate = wide_base + group * 64 + 5;
+                    for &offset in &selected[..missing_stage] {
+                        haystack[false_candidate + offset] = literal[offset];
+                    }
+                    assert_eq!(haystack[false_candidate + selected[missing_stage]], avoid);
+                }
+                haystack[exact..exact + width].copy_from_slice(&literal);
+                let expected = program
+                    .execute(
+                        &haystack,
+                        SearchWindow::new(window_start, window_end),
+                        ExecutionLimits::unlimited(),
+                    )
+                    .expect("V23 static-empty oracle")
+                    .output()
+                    .map(|span| (span.start(), span.end()));
+                let actual = simulate(&image, &haystack, window_start, window_end)
+                    .expect("V23 static-empty simulation");
+                assert_eq!(
+                    span_output(actual),
+                    expected,
+                    "width={width} zero_primary={zero_primary} missing_stage={missing_stage}"
+                );
+                assert_eq!(expected, Some((exact, exact + width)));
+                comparisons = comparisons
+                    .checked_add(1)
+                    .expect("bounded static-empty matrix");
+            }
+
+            // A primary hit without its secondary enters secondary-only
+            // mode. An empty secondary group advances in that mode; a later
+            // secondary hit without primary rechecks the primary masks and
+            // returns to pointer-wide advance before the exact group.
+            let primary_only = wide_base + 5;
+            let secondary_only = wide_base + 2 * 64 + 9;
+            let exact = wide_base + 3 * 64 + 11;
+            let window_end = exact + width + 80;
+            let mut haystack = vec![avoid; window_end + 17];
+            haystack[primary_only + selected[0]] = literal[selected[0]];
+            assert_eq!(haystack[primary_only + selected[1]], avoid);
+            haystack[secondary_only + selected[1]] = literal[selected[1]];
+            assert_eq!(haystack[secondary_only + selected[0]], avoid);
+            haystack[exact..exact + width].copy_from_slice(&literal);
+            let expected = program
+                .execute(
+                    &haystack,
+                    SearchWindow::new(window_start, window_end),
+                    ExecutionLimits::unlimited(),
+                )
+                .expect("V23 secondary-only oracle")
+                .output()
+                .map(|span| (span.start(), span.end()));
+            let actual = simulate(&image, &haystack, window_start, window_end)
+                .expect("V23 secondary-only simulation");
+            assert_eq!(
+                span_output(actual),
+                expected,
+                "width={width} zero_primary={zero_primary} secondary-only"
+            );
+            assert_eq!(expected, Some((exact, exact + width)));
+            comparisons = comparisons
+                .checked_add(1)
+                .expect("bounded secondary-only matrix");
+        }
+    }
+    assert_eq!(comparisons, 3 * 2 * (4 + 3 + 1));
+}
+
+#[test]
+fn v23_learns_every_unselected_mismatch_at_zero_and_nonzero_primary_offsets() {
+    let mut comparisons = 0_u64;
+    for width in 6_usize..=MAX_REPEATED_CONFIRM_BYTES {
+        for zero_primary in [true, false] {
+            let literal = v23_pointer_test_literal(width, zero_primary);
+            let program = build_exact_literal::<Span>(
+                &literal,
+                AnchorFlags::default(),
+                ValidateLimits::default(),
+            )
+            .expect("V23 every-mismatch IR");
+            let image = emit_with_backend(
+                &program,
+                SearchBackendPolicy::AsimdV23,
+                EmitLimits::default(),
+            )
+            .expect("V23 every-mismatch image");
+            audit(&image).expect("V23 every-mismatch audit");
+            let manifest = image
+                .search_manifest()
+                .expect("V23 every-mismatch manifest");
+            let selected = [
+                manifest.primary_offset,
+                manifest.secondary_offset,
+                manifest.verification_offset,
+                manifest.quaternary_offset,
+                manifest.quinary_offset,
+            ]
+            .map(usize::from);
+            let avoid = (0_u16..=255)
+                .map(|value| u8::try_from(value).expect("bounded byte"))
+                .find(|byte| !literal.contains(byte))
+                .expect("V23 literal leaves an avoiding byte");
+            let window_start = 3_usize;
+            let wide_base = window_start + 1;
+            let false_candidate = wide_base + 7;
+            let exact = wide_base + 4 * 64 + 11;
+
+            for mismatch in (0..width).filter(|offset| !selected.contains(offset)) {
+                let mut haystack = vec![avoid; exact + width + 96];
+                haystack[false_candidate..false_candidate + width].copy_from_slice(&literal);
+                haystack[false_candidate + mismatch] = avoid;
+                haystack[exact..exact + width].copy_from_slice(&literal);
+                let expected = program
+                    .execute(
+                        &haystack,
+                        SearchWindow::new(window_start, haystack.len()),
+                        ExecutionLimits::unlimited(),
+                    )
+                    .expect("V23 every-mismatch oracle")
+                    .output()
+                    .map(|span| (span.start(), span.end()));
+                let actual = simulate(&image, &haystack, window_start, haystack.len())
+                    .expect("V23 every-mismatch simulation");
+                assert_eq!(
+                    span_output(actual),
+                    expected,
+                    "width={width} zero_primary={zero_primary} mismatch={mismatch}"
+                );
+                assert_eq!(expected, Some((exact, exact + width)));
+                comparisons = comparisons
+                    .checked_add(1)
+                    .expect("bounded V23 mismatch matrix");
+            }
+        }
+    }
+    assert_eq!(comparisons, 2 * (513 - 27 * 5));
+}
+
+#[test]
+fn v23_wide_to_narrow_and_tail_boundaries_cover_every_window_residue() {
+    let mut comparisons = 0_u64;
+    for width in [6_usize, 13, 32] {
+        for zero_primary in [true, false] {
+            let literal = v23_pointer_test_literal(width, zero_primary);
+            let program = build_exact_literal::<Span>(
+                &literal,
+                AnchorFlags::default(),
+                ValidateLimits::default(),
+            )
+            .expect("V23 boundary IR");
+            let image = emit_with_backend(
+                &program,
+                SearchBackendPolicy::AsimdV23,
+                EmitLimits::default(),
+            )
+            .expect("V23 boundary image");
+            let manifest = image.search_manifest().expect("V23 boundary manifest");
+            let selected = [
+                manifest.primary_offset,
+                manifest.secondary_offset,
+                manifest.verification_offset,
+                manifest.quaternary_offset,
+                manifest.quinary_offset,
+            ]
+            .map(usize::from);
+            let avoid = (0_u16..=255)
+                .map(|value| u8::try_from(value).expect("bounded byte"))
+                .find(|byte| !literal.contains(byte))
+                .expect("V23 boundary literal leaves an avoiding byte");
+
+            for window_start in 0_usize..16 {
+                let wide_base = window_start + 1;
+                let false_candidate = wide_base + 5;
+                for (kind, exact, last_candidate) in [
+                    ("narrow", wide_base + 64 + 7, wide_base + 64 + 20),
+                    ("tail", wide_base + 64 + 18, wide_base + 64 + 18),
+                ] {
+                    let window_end = last_candidate + width;
+                    let mut haystack = vec![avoid; window_end + 17];
+                    for &offset in &selected {
+                        haystack[false_candidate + offset] = literal[offset];
+                    }
+                    haystack[exact..exact + width].copy_from_slice(&literal);
+                    let expected = program
+                        .execute(
+                            &haystack,
+                            SearchWindow::new(window_start, window_end),
+                            ExecutionLimits::unlimited(),
+                        )
+                        .expect("V23 boundary oracle")
+                        .output()
+                        .map(|span| (span.start(), span.end()));
+                    let actual = simulate(&image, &haystack, window_start, window_end)
+                        .expect("V23 boundary simulation");
+                    assert_eq!(
+                        span_output(actual),
+                        expected,
+                        "width={width} zero_primary={zero_primary} residue={window_start} kind={kind}"
+                    );
+                    assert_eq!(expected, Some((exact, exact + width)));
+                    comparisons = comparisons
+                        .checked_add(1)
+                        .expect("bounded V23 boundary matrix");
+                }
+            }
+        }
+    }
+    assert_eq!(comparisons, 3 * 2 * 16 * 2);
+}
+
+#[test]
+fn v23_every_width_primary_offset_and_window_shape_matches_the_kir_oracle() {
+    let mut state = 0x8c74_15a9_d20e_f36b_u64;
+    let mut comparisons = 0_u64;
+    for width in 6_usize..=MAX_REPEATED_CONFIRM_BYTES {
+        for zero_primary in [true, false] {
+            let literal = v23_pointer_test_literal(width, zero_primary);
+            let program = build_exact_literal::<Span>(
+                &literal,
+                AnchorFlags::default(),
+                ValidateLimits::default(),
+            )
+            .expect("V23 every-width IR");
+            let image = emit_with_backend(
+                &program,
+                SearchBackendPolicy::AsimdV23,
+                EmitLimits::default(),
+            )
+            .expect("V23 every-width image");
+            audit(&image).expect("V23 every-width audit");
+
+            for case in 0..8_usize {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let hay_len = 256 + usize::try_from(state >> 24).expect("host usize") % 257;
+                let mut haystack = Vec::with_capacity(hay_len);
+                for _ in 0..hay_len {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    haystack.push(state.to_le_bytes()[0]);
+                }
+
+                let exact = (case & 1 == 0).then(|| {
+                    5 + (usize::try_from(state >> 8).expect("host usize")
+                        % (haystack.len() - width - 5))
+                });
+                if let Some(candidate) = exact {
+                    haystack[candidate..candidate + width].copy_from_slice(&literal);
+                }
+
+                let random_start =
+                    usize::try_from(state >> 16).expect("host usize") % (haystack.len() + 1);
+                let random_end = random_start
+                    + (usize::try_from(state >> 32).expect("host usize")
+                        % (haystack.len() - random_start + 1));
+                let short_end = width.saturating_sub(1).min(haystack.len());
+                let exact_window = exact.map_or((random_start, random_end), |candidate| {
+                    (candidate, candidate + width)
+                });
+                let windows = [
+                    (0, 0),
+                    (0, short_end),
+                    (0, haystack.len()),
+                    (random_start, haystack.len()),
+                    (random_start, random_end),
+                    exact_window,
+                ];
+                for (start, end) in windows {
+                    let expected = program
+                        .execute(
+                            &haystack,
+                            SearchWindow::new(start, end),
+                            ExecutionLimits::unlimited(),
+                        )
+                        .expect("V23 every-width oracle")
+                        .output()
+                        .map(|span| (span.start(), span.end()));
+                    let actual = simulate(&image, &haystack, start, end)
+                        .expect("V23 every-width safe ISA simulation");
+                    assert_eq!(
+                        span_output(actual),
+                        expected,
+                        "width={width} zero_primary={zero_primary} case={case} window={start}..{end}"
+                    );
+                    comparisons = comparisons
+                        .checked_add(1)
+                        .expect("bounded V23 random matrix");
+                }
+            }
+        }
+    }
+    assert_eq!(comparisons, 2_592);
+}
+
+#[test]
 fn v23_frozen_all_prior_search_aot_matrix_bytes_are_exact() {
     fn gate_literal(topology: u8, width: usize) -> Vec<u8> {
         match topology {
