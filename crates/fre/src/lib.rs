@@ -4517,6 +4517,46 @@ impl PortableRegex {
         }
     }
 
+    fn find_iter_at(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<(Option<Match>, u64), SearchError> {
+        let window = LiteralWindow::new(start, haystack.len());
+        match &self.plan {
+            PortablePlan::ExactLiteral(literal) => {
+                let (matched, accounting) =
+                    literal.find_window(haystack, window, literal_limits(limits))?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    u64::try_from(accounting.linear_terms).unwrap_or(u64::MAX),
+                ))
+            }
+            PortablePlan::PackedLiteralSet(literal_set) => {
+                let (matched, accounting) =
+                    literal_set.find_window(haystack, window, packed_literal_set_limits(limits))?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    u64::try_from(accounting.work_upper_bound).unwrap_or(u64::MAX),
+                ))
+            }
+            PortablePlan::LiteralSetDfa(literal_set) => {
+                let (matched, accounting) =
+                    literal_set.find_window(haystack, window, literal_set_limits(limits))?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    u64::try_from(accounting.transitions_upper_bound).unwrap_or(u64::MAX),
+                ))
+            }
+            _ => {
+                let (matched, accounting) =
+                    self.find_window(haystack, SearchWindow::new(start, haystack.len()), limits)?;
+                Ok((matched, accounting.work_or_linear_terms()))
+            }
+        }
+    }
+
     /// Produce the complete equality key for a required-literal operation.
     ///
     /// `None` means this matcher selected another plan family. Search limits
@@ -4998,14 +5038,7 @@ impl<'r> PortableSearchSession<'r> {
         limits: SearchLimits,
     ) -> Result<(Option<Match>, u64), SearchError> {
         match &mut self.plan {
-            PortableSearchSessionPlan::Native(regex) => {
-                let (matched, accounting) = regex.find_window(
-                    haystack,
-                    SearchWindow::new(start, haystack.len()),
-                    limits,
-                )?;
-                Ok((matched, accounting.work_or_linear_terms()))
-            }
+            PortableSearchSessionPlan::Native(regex) => regex.find_iter_at(haystack, start, limits),
             PortableSearchSessionPlan::K0 { session } => {
                 let report = session.search_span_at_cursor(haystack, start, limits)?;
                 let work = report.accounting().work();
@@ -5604,6 +5637,43 @@ mod tests {
                     "pattern={pattern:?}, haystack={haystack:?}"
                 );
                 assert_eq!(accounting.plan(), fre.build_report().plan);
+            }
+        }
+    }
+
+    #[test]
+    fn native_iterator_projection_matches_facade_spans_and_work() {
+        let exact = PortableBuilder::new("aba").unicode(false).build().unwrap();
+        let packed = PortableBuilder::new("ab|ac|ad")
+            .unicode(false)
+            .build()
+            .unwrap();
+        let dfa = PortableBuilder::new("ab|ac|ad")
+            .unicode(false)
+            .limits(BuildLimits {
+                packed_literal_set: fre_kernels::PackedLiteralSetBuildLimits {
+                    max_patterns: 0,
+                    ..fre_kernels::PackedLiteralSetBuildLimits::default()
+                },
+                ..BuildLimits::default()
+            })
+            .build()
+            .unwrap();
+        assert_eq!(exact.build_report().plan, PlanKind::ExactLiteral);
+        assert_eq!(packed.build_report().plan, PlanKind::PackedLiteralSet);
+        assert_eq!(dfa.build_report().plan, PlanKind::LiteralSetDfa);
+
+        let haystack = b"zzabacada";
+        for regex in [&exact, &packed, &dfa] {
+            for start in 0..=haystack.len() {
+                let (expected, accounting) = regex
+                    .find_at(haystack, start, SearchLimits::unlimited())
+                    .unwrap();
+                let actual = regex
+                    .find_iter_at(haystack, start, SearchLimits::unlimited())
+                    .unwrap();
+                assert_eq!(actual.0, expected);
+                assert_eq!(actual.1, accounting.work_or_linear_terms());
             }
         }
     }
