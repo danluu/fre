@@ -26,3 +26,11 @@ Timing is not: the final V10 emitter source, object and linker identity, static
 facade, and auto-routing policy are mandatory unresolved inputs until the
 Search owner freezes them. The runner must execute the statically emitted and
 linked facade; JIT publication is outside this evidence.
+
+The development materialization produced 20 fixtures for four independent
+candidates at `/private/tmp/fre-external-regex-dev-fixtures-v1`. Its manifest
+SHA-256 is
+`80dcf139225b506e294de158251bae5dbd7a2ffd0af87630420c695df7678c2b`.
+An independent second generation was byte-identical for the manifest and all
+20 one-MiB files. The manifest deliberately records
+`backend_identity=required-unresolved-input` and `timing_permitted=false`.
