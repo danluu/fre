@@ -4833,19 +4833,24 @@ impl<'r> PortableSearchSession<'r> {
         haystack: &[u8],
         start: usize,
         limits: SearchLimits,
-    ) -> Result<(Option<Match>, SearchAccounting), SearchError> {
+    ) -> Result<(Option<Match>, u64), SearchError> {
         match &mut self.plan {
             PortableSearchSessionPlan::Native(regex) => {
-                regex.find_window(haystack, SearchWindow::new(start, haystack.len()), limits)
+                let (matched, accounting) = regex.find_window(
+                    haystack,
+                    SearchWindow::new(start, haystack.len()),
+                    limits,
+                )?;
+                Ok((matched, accounting.work_or_linear_terms()))
             }
             PortableSearchSessionPlan::K0 { session } => {
                 let report = session.search_span_at_cursor(haystack, start, limits)?;
-                let accounting = report.accounting();
+                let work = report.accounting().work();
                 let matched = report.into_output().map(|span| Match {
                     start: span.start(),
                     end: span.end(),
                 });
-                Ok((matched, SearchAccounting::K0(accounting)))
+                Ok((matched, work))
             }
         }
     }
@@ -4939,14 +4944,11 @@ impl<'h> PortableMatchIterState<'h> {
         Ok(())
     }
 
-    fn record_search(
-        &mut self,
-        accounting: &SearchAccounting,
-    ) -> Result<(), PortableFindIterError> {
+    fn record_search_work(&mut self, work: u64) -> Result<(), PortableFindIterError> {
         self.accounting.work_or_linear_terms = self
             .accounting
             .work_or_linear_terms
-            .checked_add(accounting.work_or_linear_terms())
+            .checked_add(work)
             .ok_or(PortableFindIterError::AccountingOverflow { counter: "work" })?;
         Ok(())
     }
@@ -5056,11 +5058,11 @@ impl<'h> PortableMatchIterState<'h> {
                 return Some(self.fail(error));
             }
             let searched = session.find_iter_at(self.haystack, self.start, self.limits.search);
-            let (matched, search_accounting) = match searched {
+            let (matched, search_work) = match searched {
                 Ok(result) => result,
                 Err(error) => return Some(self.fail(PortableFindIterError::Search(error))),
             };
-            if let Err(error) = self.record_search(&search_accounting) {
+            if let Err(error) = self.record_search_work(search_work) {
                 return Some(self.fail(error));
             }
             let Some(matched) = matched else {
