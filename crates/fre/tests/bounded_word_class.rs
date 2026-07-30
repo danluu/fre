@@ -7,7 +7,7 @@ use fre::{
 };
 use regex_automata::{Input, meta::Regex as MetaRegex, util::syntax};
 
-const PLAN_ID: &str = "bounded-word-class-linear-v1";
+const PLAN_ID: &str = "bounded-word-class-linear-candidate32-v2";
 
 fn fre_regex(pattern: &str, unicode: bool) -> fre::PortableRegex {
     PortableBuilder::new(pattern)
@@ -346,6 +346,69 @@ fn long_over_max_runs_and_word_run_nonmembers_do_not_create_partial_matches() {
             .expect("iterator item");
         assert_eq!(spans(actual.into_iter()), expected);
     }
+}
+
+#[test]
+fn bounded_mixed_runs_stop_after_lookahead_and_iterate_in_linear_work() {
+    let pattern = r"(?-u:\b[\w-]{1,8}\b)";
+    let fre = fre_regex(pattern, false);
+    let oracle = upstream_regex(pattern, false);
+    assert_eq!(fre.runtime_implementation_id(), PLAN_ID);
+
+    let alternating = |length: usize| {
+        (0..length)
+            .map(|index| if index % 2 == 0 { b'a' } else { b'-' })
+            .collect::<Vec<_>>()
+    };
+    let mut first_work = None;
+    for length in [4_096_usize, 8_192] {
+        let haystack = alternating(length);
+        let (matched, accounting) = fre
+            .find(&haystack, SearchLimits::unlimited())
+            .expect("bounded-lookahead find");
+        assert_eq!(
+            matched.map(|span| (span.start(), span.end())),
+            oracle
+                .find(&haystack)
+                .map(|span| (span.start(), span.end()))
+        );
+        assert_eq!(matched.expect("early mixed-run match").range(), 0..8);
+        if let Some(expected) = first_work {
+            assert_eq!(
+                accounting.work_or_linear_terms(),
+                expected,
+                "doubling the untouched suffix must not enlarge first-match work"
+            );
+        } else {
+            first_work = Some(accounting.work_or_linear_terms());
+        }
+        assert!(accounting.work_or_linear_terms() < 128);
+    }
+
+    let haystack = alternating(16_384);
+    let expected = oracle
+        .find_iter(&haystack)
+        .map(|matched| (matched.start(), matched.end()))
+        .collect::<Vec<_>>();
+    let mut iterator = fre
+        .find_iter(&haystack, PortableFindIterLimits::unlimited())
+        .expect("bounded-lookahead iterator");
+    let actual = iterator
+        .by_ref()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("bounded-lookahead iterator item");
+    assert_eq!(spans(actual.into_iter()), expected);
+    let accounting = iterator.accounting();
+    assert_eq!(accounting.matches, expected.len());
+    assert_eq!(accounting.search_calls, expected.len() + 1);
+    assert!(
+        accounting.work_or_linear_terms
+            <= u64::try_from(haystack.len())
+                .unwrap()
+                .checked_mul(8)
+                .unwrap(),
+        "bounded mixed-run iteration must remain linear: {accounting:?}"
+    );
 }
 
 #[test]

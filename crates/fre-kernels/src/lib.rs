@@ -13,10 +13,11 @@ use fre_exact_alloc::CopyError;
 use memchr::memmem::{Finder, FinderBuilder};
 
 pub use fre_simd_kernels::{
-    ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier,
-    AsciiByteSetRunScanner, AsciiSelection, AsciiWordSpaceClassifier, AsciiWordSpaceMasks16,
-    AsciiWordSpaceMasks32, DispatchPolicy, DispatchProfile, Feature, FeatureSet, SelectionReceipt,
-    SimdDispatchContext, TuningClass, UnsupportedRequiredFeatures, dispatch_profile,
+    ASCII_CLASSIFIER_BUILD_WORK, ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, AsciiByteSet,
+    AsciiByteSetClassifier, AsciiByteSetRunScanner, AsciiSelection, AsciiWordSpaceClassifier,
+    AsciiWordSpaceMasks16, AsciiWordSpaceMasks32, DispatchPolicy, DispatchProfile, Feature,
+    FeatureSet, SelectionReceipt, SimdDispatchContext, TuningClass, UnsupportedRequiredFeatures,
+    dispatch_profile,
 };
 
 mod anchored_line_capture;

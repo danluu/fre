@@ -2130,9 +2130,15 @@ impl PortableBuilder {
                 .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
             });
         }
+        let mut planner_work = 0_u64;
         if self.selection == PlanSelection::Auto {
-            let inspection = bounded_word_class::inspect(&rust.hir, self.limits.max_planner_work)
-                .map_err(|error| match error {
+            let inspection = bounded_word_class::inspect(
+                &rust.hir,
+                SimdDispatchContext::capture(),
+                planner_work,
+                self.limits.max_planner_work,
+            )
+            .map_err(|error| match error {
                 bounded_word_class::InspectionError::WorkLimit { needed, limit } => {
                     BuildError::PlannerWorkLimit { needed, limit }
                 }
@@ -2140,7 +2146,8 @@ impl PortableBuilder {
                     BuildError::InternalInvariant(detail)
                 }
             })?;
-            if let Some(inspection) = inspection {
+            planner_work = inspection.planner_work();
+            if let bounded_word_class::InspectionOutcome::Eligible(inspection) = inspection {
                 let plan_storage_bytes = inspection.storage_bytes();
                 let charged_persistent_bytes = source_storage_bytes
                     .checked_add(capture_name_storage_bytes)
@@ -2152,7 +2159,6 @@ impl PortableBuilder {
                         limit: self.limits.max_persistent_bytes,
                     });
                 }
-                let planner_work = inspection.planner_work();
                 let plan = inspection.build()?;
                 if plan.storage_bytes() != plan_storage_bytes {
                     return Err(BuildError::InternalInvariant(
@@ -2191,12 +2197,12 @@ impl PortableBuilder {
                 });
             }
         }
-        let mut planner_work = 0_u64;
         if matches!(
             self.selection,
             PlanSelection::Auto | PlanSelection::ForceForwardAnchored
         ) {
-            let forward = forward_anchored::extract(&rust.hir, 0, self.limits.max_planner_work)?;
+            let forward =
+                forward_anchored::extract(&rust.hir, planner_work, self.limits.max_planner_work)?;
             planner_work = forward.work;
             if let Some(shape) = forward.shape {
                 if self.selection == PlanSelection::ForceForwardAnchored && shape.anchors.end {

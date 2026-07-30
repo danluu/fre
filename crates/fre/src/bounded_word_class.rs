@@ -8,6 +8,10 @@
 //! haystack, independently of class membership.
 
 use fre_exact_alloc::{CopyError, ExactVec};
+use fre_kernels::{
+    ASCII_CLASSIFIER_BUILD_WORK, ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, AsciiByteSet,
+    AsciiByteSetClassifier, DispatchPolicy, SimdDispatchContext,
+};
 use regex_syntax::hir::{Class, Hir, HirKind, Look};
 
 use crate::{
@@ -15,7 +19,12 @@ use crate::{
     unicode_word_run::{Accounting, Error},
 };
 
-pub(crate) const PLAN_ID: &str = "bounded-word-class-linear-v1";
+pub(crate) const PLAN_ID: &str = "bounded-word-class-linear-candidate32-v2";
+
+/// Pointwise checks stay cheaper than entering a fixed-width classifier when
+/// a candidate is close to the current cursor. This constant is independent
+/// of the regex and haystack.
+const CANDIDATE_SCALAR_PREFIX_BYTES: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BoundaryMode {
@@ -38,11 +47,26 @@ enum ClassMatcher {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CandidateMode {
+    /// Every class member is ASCII, so the classifier's member mask is exact.
+    ExactAsciiMembers,
+    /// ASCII members and every high byte require scalar Unicode inspection.
+    UnicodeAsciiMemberOrNonAscii,
+}
+
+#[derive(Debug)]
+struct CandidateScanner {
+    classifier: AsciiByteSetClassifier,
+    mode: CandidateMode,
+}
+
 /// Immutable, allocation-free-at-search-time native plan.
 #[derive(Debug)]
 pub(crate) struct Plan {
     mode: BoundaryMode,
     class: ClassMatcher,
+    candidate_scanner: Option<CandidateScanner>,
     minimum_units: usize,
     maximum_units: Option<usize>,
     storage_bytes: usize,
@@ -64,10 +88,27 @@ enum InspectedClass<'a> {
 pub(crate) struct Inspection<'a> {
     mode: BoundaryMode,
     class: InspectedClass<'a>,
+    candidate_mode: Option<CandidateMode>,
+    dispatch: SimdDispatchContext,
     minimum_units: usize,
     maximum_units: Option<usize>,
     planner_work: u64,
     storage_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum InspectionOutcome<'a> {
+    Eligible(Inspection<'a>),
+    Ineligible { planner_work: u64 },
+}
+
+impl InspectionOutcome<'_> {
+    pub(crate) const fn planner_work(self) -> u64 {
+        match self {
+            Self::Eligible(inspection) => inspection.planner_work(),
+            Self::Ineligible { planner_work } => planner_work,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,6 +123,289 @@ struct BoundaryCursor {
     units: usize,
     run_end: usize,
     done: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ScanningBoundaryPoint {
+    point: BoundaryPoint,
+    has_member_after: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ScanningBoundaryCursor {
+    position: usize,
+    units: usize,
+    end: usize,
+    done: bool,
+}
+
+impl ScanningBoundaryCursor {
+    const fn new(run_start: usize, end: usize) -> Self {
+        Self {
+            position: run_start,
+            units: 0,
+            end,
+            done: false,
+        }
+    }
+
+    fn next(
+        &mut self,
+        plan: &Plan,
+        haystack: &[u8],
+        accounting: &mut Accounting,
+        limits: SearchLimits,
+    ) -> Result<Option<ScanningBoundaryPoint>, Error> {
+        while !self.done {
+            let point = BoundaryPoint {
+                byte: self.position,
+                units: self.units,
+            };
+            let has_member_after = if self.position == self.end {
+                self.done = true;
+                false
+            } else {
+                let (admitted, width, _) =
+                    plan.classify_unit(haystack, self.position, self.end, accounting, limits)?;
+                if admitted {
+                    self.position = self
+                        .position
+                        .checked_add(width)
+                        .ok_or_else(|| accounting_overflow(limits))?;
+                    self.units = self
+                        .units
+                        .checked_add(1)
+                        .ok_or_else(|| accounting_overflow(limits))?;
+                    true
+                } else {
+                    self.done = true;
+                    false
+                }
+            };
+            charge(accounting, limits)?;
+            if plan.is_word_boundary(haystack, point.byte) {
+                return Ok(Some(ScanningBoundaryPoint {
+                    point,
+                    has_member_after,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    const fn run_end(self) -> usize {
+        self.position
+    }
+
+    fn last_boundary_through(
+        &mut self,
+        plan: &Plan,
+        haystack: &[u8],
+        unit_limit: usize,
+        mut selected: BoundaryPoint,
+        accounting: &mut Accounting,
+        limits: SearchLimits,
+    ) -> Result<BoundaryPoint, Error> {
+        // A valid end for the earliest start already exists. Search only its
+        // remaining finite greedy horizon; no later start can supersede it.
+        while !self.done && self.units <= unit_limit {
+            let point = BoundaryPoint {
+                byte: self.position,
+                units: self.units,
+            };
+            if self.units == unit_limit {
+                charge(accounting, limits)?;
+                if plan.is_word_boundary(haystack, point.byte) {
+                    selected = point;
+                }
+                break;
+            }
+            if self.position == self.end {
+                self.done = true;
+            } else {
+                let (admitted, width, _) =
+                    plan.classify_unit(haystack, self.position, self.end, accounting, limits)?;
+                if admitted {
+                    self.position = self
+                        .position
+                        .checked_add(width)
+                        .ok_or_else(|| accounting_overflow(limits))?;
+                    self.units = self
+                        .units
+                        .checked_add(1)
+                        .ok_or_else(|| accounting_overflow(limits))?;
+                } else {
+                    self.done = true;
+                }
+            }
+            charge(accounting, limits)?;
+            if plan.is_word_boundary(haystack, point.byte) {
+                selected = point;
+            }
+        }
+        Ok(selected)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScannedCandidate {
+    AsciiMember { position: usize, byte: u8 },
+    NonAscii { position: usize },
+}
+
+impl CandidateScanner {
+    fn next(
+        &self,
+        haystack: &[u8],
+        mut position: usize,
+        end: usize,
+        accounting: &mut Accounting,
+        limits: SearchLimits,
+    ) -> Result<Option<ScannedCandidate>, Error> {
+        let prefix_end = position
+            .checked_add(
+                end.saturating_sub(position)
+                    .min(CANDIDATE_SCALAR_PREFIX_BYTES),
+            )
+            .ok_or_else(|| accounting_overflow(limits))?;
+        while position < prefix_end {
+            if let Some(candidate) =
+                self.scalar_candidate(haystack, position, accounting, limits)?
+            {
+                return Ok(Some(candidate));
+            }
+            position = position
+                .checked_add(1)
+                .ok_or_else(|| accounting_overflow(limits))?;
+        }
+
+        while end.saturating_sub(position) >= ASCII_WIDE_BYTES {
+            charge_many(accounting, ASCII_WIDE_BYTES, limits)?;
+            let block_end = position
+                .checked_add(ASCII_WIDE_BYTES)
+                .ok_or_else(|| accounting_overflow(limits))?;
+            let block: &[u8; ASCII_WIDE_BYTES] = haystack[position..block_end]
+                .try_into()
+                .expect("the candidate scanner checked its wide extent");
+            let masks = self.classifier.classify_32(block);
+            let decoded = match self.mode {
+                CandidateMode::ExactAsciiMembers => ASCII_WIDE_BYTES,
+                CandidateMode::UnicodeAsciiMemberOrNonAscii => {
+                    usize::try_from(masks.ascii_mask().count_ones())
+                        .expect("a 32-bit ASCII lane count fits usize")
+                }
+            };
+            record_source(accounting, ASCII_WIDE_BYTES, decoded, limits)?;
+            let candidates = match self.mode {
+                CandidateMode::ExactAsciiMembers => masks.member_mask(),
+                CandidateMode::UnicodeAsciiMemberOrNonAscii => {
+                    masks.member_mask() | !masks.ascii_mask()
+                }
+            };
+            if candidates != 0 {
+                let offset = usize::try_from(candidates.trailing_zeros())
+                    .expect("a 32-bit candidate lane fits usize");
+                let candidate_position = position
+                    .checked_add(offset)
+                    .ok_or_else(|| accounting_overflow(limits))?;
+                let bit = 1_u32
+                    .checked_shl(u32::try_from(offset).expect("wide lane fits u32"))
+                    .expect("a wide candidate lane is below 32");
+                if masks.member_mask() & bit != 0 {
+                    charge(accounting, limits)?;
+                    record_source(accounting, 1, 0, limits)?;
+                    return Ok(Some(ScannedCandidate::AsciiMember {
+                        position: candidate_position,
+                        byte: block[offset],
+                    }));
+                }
+                return Ok(Some(ScannedCandidate::NonAscii {
+                    position: candidate_position,
+                }));
+            }
+            position = block_end;
+        }
+
+        if end.saturating_sub(position) >= ASCII_NARROW_BYTES {
+            charge_many(accounting, ASCII_NARROW_BYTES, limits)?;
+            let block_end = position
+                .checked_add(ASCII_NARROW_BYTES)
+                .ok_or_else(|| accounting_overflow(limits))?;
+            let block: &[u8; ASCII_NARROW_BYTES] = haystack[position..block_end]
+                .try_into()
+                .expect("the candidate scanner checked its narrow extent");
+            let masks = self.classifier.classify_16(block);
+            let decoded = match self.mode {
+                CandidateMode::ExactAsciiMembers => ASCII_NARROW_BYTES,
+                CandidateMode::UnicodeAsciiMemberOrNonAscii => {
+                    usize::try_from(masks.ascii_mask().count_ones())
+                        .expect("a 16-bit ASCII lane count fits usize")
+                }
+            };
+            record_source(accounting, ASCII_NARROW_BYTES, decoded, limits)?;
+            let candidates = match self.mode {
+                CandidateMode::ExactAsciiMembers => masks.member_mask(),
+                CandidateMode::UnicodeAsciiMemberOrNonAscii => {
+                    masks.member_mask() | !masks.ascii_mask()
+                }
+            };
+            if candidates != 0 {
+                let offset = usize::try_from(candidates.trailing_zeros())
+                    .expect("a 16-bit candidate lane fits usize");
+                let candidate_position = position
+                    .checked_add(offset)
+                    .ok_or_else(|| accounting_overflow(limits))?;
+                let bit = 1_u16
+                    .checked_shl(u32::try_from(offset).expect("narrow lane fits u32"))
+                    .expect("a narrow candidate lane is below 16");
+                if masks.member_mask() & bit != 0 {
+                    charge(accounting, limits)?;
+                    record_source(accounting, 1, 0, limits)?;
+                    return Ok(Some(ScannedCandidate::AsciiMember {
+                        position: candidate_position,
+                        byte: block[offset],
+                    }));
+                }
+                return Ok(Some(ScannedCandidate::NonAscii {
+                    position: candidate_position,
+                }));
+            }
+            position = block_end;
+        }
+
+        while position < end {
+            if let Some(candidate) =
+                self.scalar_candidate(haystack, position, accounting, limits)?
+            {
+                return Ok(Some(candidate));
+            }
+            position = position
+                .checked_add(1)
+                .ok_or_else(|| accounting_overflow(limits))?;
+        }
+        Ok(None)
+    }
+
+    fn scalar_candidate(
+        &self,
+        haystack: &[u8],
+        position: usize,
+        accounting: &mut Accounting,
+        limits: SearchLimits,
+    ) -> Result<Option<ScannedCandidate>, Error> {
+        charge(accounting, limits)?;
+        let byte = haystack[position];
+        let decoded =
+            usize::from(matches!(self.mode, CandidateMode::ExactAsciiMembers) || byte.is_ascii());
+        record_source(accounting, 1, decoded, limits)?;
+        if self.classifier.set().contains(byte) {
+            return Ok(Some(ScannedCandidate::AsciiMember { position, byte }));
+        }
+        if matches!(self.mode, CandidateMode::UnicodeAsciiMemberOrNonAscii) && !byte.is_ascii() {
+            return Ok(Some(ScannedCandidate::NonAscii { position }));
+        }
+        Ok(None)
+    }
 }
 
 impl BoundaryCursor {
@@ -111,19 +435,15 @@ impl BoundaryCursor {
             } else {
                 let width = plan.known_member_width(haystack, self.position, self.run_end);
                 charge(accounting, limits)?;
-                accounting.bytes_examined = accounting.bytes_examined.saturating_add(width);
-                accounting.scalars_decoded = accounting.scalars_decoded.saturating_add(1);
-                self.position =
-                    self.position
-                        .checked_add(width)
-                        .ok_or(Error::WorkLimitExceeded {
-                            needed: u64::MAX,
-                            limit: limits.max_work,
-                        })?;
-                self.units = self.units.checked_add(1).ok_or(Error::WorkLimitExceeded {
-                    needed: u64::MAX,
-                    limit: limits.max_work,
-                })?;
+                record_source(accounting, width, 1, limits)?;
+                self.position = self
+                    .position
+                    .checked_add(width)
+                    .ok_or_else(|| accounting_overflow(limits))?;
+                self.units = self
+                    .units
+                    .checked_add(1)
+                    .ok_or_else(|| accounting_overflow(limits))?;
             }
             charge(accounting, limits)?;
             if plan.is_word_boundary(haystack, point.byte) {
@@ -184,9 +504,52 @@ impl Inspection<'_> {
                 }
             }
         };
+        let candidate_scanner = match (self.candidate_mode, &class) {
+            (None, _) => None,
+            (Some(CandidateMode::ExactAsciiMembers), ClassMatcher::Bytes(words)) => {
+                if words[2] != 0 || words[3] != 0 {
+                    return Err(crate::BuildError::InternalInvariant(
+                        "exact-ASCII candidate scanner retained a high-byte class member",
+                    ));
+                }
+                let classifier = self
+                    .dispatch
+                    .ascii_byte_set_classifier(
+                        AsciiByteSet::from_words([words[0], words[1]]),
+                        DispatchPolicy::Auto,
+                    )
+                    .expect("automatic ASCII classifier dispatch retains a scalar fallback");
+                Some(CandidateScanner {
+                    classifier,
+                    mode: CandidateMode::ExactAsciiMembers,
+                })
+            }
+            (
+                Some(CandidateMode::UnicodeAsciiMemberOrNonAscii),
+                ClassMatcher::Unicode { ascii_words, .. },
+            ) => {
+                let classifier = self
+                    .dispatch
+                    .ascii_byte_set_classifier(
+                        AsciiByteSet::from_words(*ascii_words),
+                        DispatchPolicy::Auto,
+                    )
+                    .expect("automatic ASCII classifier dispatch retains a scalar fallback");
+                Some(CandidateScanner {
+                    classifier,
+                    mode: CandidateMode::UnicodeAsciiMemberOrNonAscii,
+                })
+            }
+            (Some(_), _) => {
+                return Err(crate::BuildError::InternalInvariant(
+                    "bounded word-class candidate mode differs from its class representation",
+                ));
+            }
+        };
         Ok(Plan {
             mode: self.mode,
             class,
+            candidate_scanner,
             minimum_units: self.minimum_units,
             maximum_units: self.maximum_units,
             storage_bytes: self.storage_bytes,
@@ -241,19 +604,43 @@ impl Plan {
         };
         let mut position = window.start();
         while position < window.end() {
-            let (admitted, mut width, run_word) =
-                self.classify_unit(haystack, position, window.end(), &mut accounting, limits)?;
-            if !admitted {
-                position = position
-                    .checked_add(width)
-                    .ok_or(Error::WorkLimitExceeded {
-                        needed: u64::MAX,
-                        limit: limits.max_work,
-                    })?;
+            let Some((run_start, mut width, run_word)) = (if self.candidate_scanner.is_some() {
+                self.next_scanned_member(haystack, position, window.end(), &mut accounting, limits)?
+            } else {
+                let (admitted, width, run_word) =
+                    self.classify_unit(haystack, position, window.end(), &mut accounting, limits)?;
+                if admitted {
+                    Some((position, width, run_word))
+                } else {
+                    position = position
+                        .checked_add(width)
+                        .ok_or_else(|| accounting_overflow(limits))?;
+                    None
+                }
+            }) else {
+                if self.candidate_scanner.is_some() {
+                    break;
+                }
+                continue;
+            };
+            position = run_start;
+            if let Some(maximum_units) = self.maximum_units {
+                let (matched, run_end) = self.search_bounded_class_run(
+                    haystack,
+                    run_start,
+                    window.end(),
+                    maximum_units,
+                    &mut accounting,
+                    limits,
+                    greedy,
+                )?;
+                if let Some(matched) = matched {
+                    return Ok((Some(matched), accounting));
+                }
+                position = run_end;
                 continue;
             }
 
-            let run_start = position;
             let mut run_units = 0_usize;
             let mut homogeneous_wordness = true;
             loop {
@@ -295,6 +682,129 @@ impl Plan {
             }
         }
         Ok((None, accounting))
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "two monotone bounded cursors share the caller's exact search ledger"
+    )]
+    fn search_bounded_class_run(
+        &self,
+        haystack: &[u8],
+        run_start: usize,
+        window_end: usize,
+        maximum_units: usize,
+        accounting: &mut Accounting,
+        limits: SearchLimits,
+        greedy: bool,
+    ) -> Result<(Option<Match>, usize), Error> {
+        let mut starts = ScanningBoundaryCursor::new(run_start, window_end);
+        let mut start = next_member_boundary(&mut starts, self, haystack, accounting, limits)?;
+        if start.is_none() {
+            return Ok((None, starts.run_end()));
+        }
+        let mut ends = ScanningBoundaryCursor::new(run_start, window_end);
+        let mut end = ends.next(self, haystack, accounting, limits)?;
+        if !greedy {
+            while let Some(current_end) = end {
+                let Some(latest_start) = current_end.point.units.checked_sub(self.minimum_units)
+                else {
+                    end = ends.next(self, haystack, accounting, limits)?;
+                    continue;
+                };
+                let earliest_start = current_end.point.units.saturating_sub(maximum_units);
+                while start.is_some_and(|candidate| candidate.point.units < earliest_start) {
+                    start = next_member_boundary(&mut starts, self, haystack, accounting, limits)?;
+                }
+                let Some(candidate) = start else {
+                    return Ok((None, starts.run_end().max(ends.run_end())));
+                };
+                if candidate.point.units <= latest_start {
+                    return Ok((
+                        Some(Match {
+                            start: candidate.point.byte,
+                            end: current_end.point.byte,
+                        }),
+                        current_end.point.byte,
+                    ));
+                }
+                end = ends.next(self, haystack, accounting, limits)?;
+            }
+            return Ok((None, starts.run_end().max(ends.run_end())));
+        }
+
+        while let Some(current_start) = start {
+            let minimum_end = current_start.point.units.saturating_add(self.minimum_units);
+            let maximum_end = current_start.point.units.saturating_add(maximum_units);
+            while end.is_some_and(|candidate| candidate.point.units < minimum_end) {
+                end = ends.next(self, haystack, accounting, limits)?;
+            }
+            let Some(first_end) = end else {
+                return Ok((None, ends.run_end()));
+            };
+            if first_end.point.units > maximum_end {
+                if !first_end.has_member_after {
+                    // This is the terminal run boundary and there were no
+                    // intervening boundaries, so no later start exists.
+                    return Ok((None, ends.run_end()));
+                }
+                start = next_member_boundary(&mut starts, self, haystack, accounting, limits)?;
+                continue;
+            }
+
+            let selected = ends.last_boundary_through(
+                self,
+                haystack,
+                maximum_end,
+                first_end.point,
+                accounting,
+                limits,
+            )?;
+            return Ok((
+                Some(Match {
+                    start: current_start.point.byte,
+                    end: selected.byte,
+                }),
+                selected.byte,
+            ));
+        }
+        Ok((None, starts.run_end().max(ends.run_end())))
+    }
+
+    fn next_scanned_member(
+        &self,
+        haystack: &[u8],
+        mut position: usize,
+        end: usize,
+        accounting: &mut Accounting,
+        limits: SearchLimits,
+    ) -> Result<Option<(usize, usize, bool)>, Error> {
+        let scanner = self
+            .candidate_scanner
+            .as_ref()
+            .expect("the scanned path retains a candidate classifier");
+        loop {
+            let Some(candidate) = scanner.next(haystack, position, end, accounting, limits)? else {
+                return Ok(None);
+            };
+            match candidate {
+                ScannedCandidate::AsciiMember { position, byte } => {
+                    return Ok(Some((position, 1, is_ascii_word(byte))));
+                }
+                ScannedCandidate::NonAscii {
+                    position: candidate,
+                } => {
+                    let (admitted, width, word) =
+                        self.classify_unit(haystack, candidate, end, accounting, limits)?;
+                    if admitted {
+                        return Ok(Some((candidate, width, word)));
+                    }
+                    position = candidate
+                        .checked_add(width)
+                        .ok_or_else(|| accounting_overflow(limits))?;
+                }
+            }
+        }
     }
 
     #[allow(
@@ -386,8 +896,7 @@ impl Plan {
         charge(accounting, limits)?;
         match &self.class {
             ClassMatcher::Bytes(words) => {
-                accounting.bytes_examined = accounting.bytes_examined.saturating_add(1);
-                accounting.scalars_decoded = accounting.scalars_decoded.saturating_add(1);
+                record_source(accounting, 1, 1, limits)?;
                 let byte = haystack[position];
                 Ok((byte_set_contains(*words, byte), 1, is_ascii_word(byte)))
             }
@@ -396,11 +905,10 @@ impl Plan {
                 ranges,
             } => {
                 let Some((scalar, width)) = decode_first(&haystack[position..end]) else {
-                    accounting.bytes_examined = accounting.bytes_examined.saturating_add(1);
+                    record_source(accounting, 1, 0, limits)?;
                     return Ok((false, 1, false));
                 };
-                accounting.bytes_examined = accounting.bytes_examined.saturating_add(width);
-                accounting.scalars_decoded = accounting.scalars_decoded.saturating_add(1);
+                record_source(accounting, width, 1, limits)?;
                 let admitted = if scalar.is_ascii() {
                     let byte = u8::try_from(u32::from(scalar))
                         .expect("an ASCII scalar fits exactly in one byte");
@@ -447,22 +955,30 @@ impl Plan {
 
 /// Inspect one exact root without allocating or retaining borrowed HIR data.
 ///
-/// Unsupported shapes return `Ok(None)`. Crossing the caller's planner bound
-/// is a typed refusal even when the eventual shape would have been
-/// unsupported, so every visited node/range remains covered by the published
-/// construction budget.
+/// Unsupported shapes return an ineligible receipt with the exact cumulative
+/// planner work retained. Crossing the caller's planner bound is a typed
+/// refusal even when the eventual shape would have been unsupported, so every
+/// visited node/range remains covered by the published construction budget.
 #[allow(
     clippy::too_many_lines,
     reason = "one allocation-free structural proof keeps every shape and range charge adjacent"
 )]
 pub(crate) fn inspect(
     hir: &Hir,
+    dispatch: SimdDispatchContext,
+    planner_work_already: u64,
     max_planner_work: u64,
-) -> Result<Option<Inspection<'_>>, InspectionError> {
-    let mut work = 0_u64;
+) -> Result<InspectionOutcome<'_>, InspectionError> {
+    if planner_work_already > max_planner_work {
+        return Err(InspectionError::WorkLimit {
+            needed: planner_work_already,
+            limit: max_planner_work,
+        });
+    }
+    let mut work = planner_work_already;
     let root = peel_captures(hir, &mut work, max_planner_work)?;
     let HirKind::Concat(parts) = root.kind() else {
-        return Ok(None);
+        return Ok(InspectionOutcome::Ineligible { planner_work: work });
     };
     charge_build(
         &mut work,
@@ -471,7 +987,7 @@ pub(crate) fn inspect(
         max_planner_work,
     )?;
     let [start, repeated, end] = parts.as_slice() else {
-        return Ok(None);
+        return Ok(InspectionOutcome::Ineligible { planner_work: work });
     };
     let start = peel_captures(start, &mut work, max_planner_work)?;
     let end = peel_captures(end, &mut work, max_planner_work)?;
@@ -480,15 +996,17 @@ pub(crate) fn inspect(
         (HirKind::Look(Look::WordUnicode), HirKind::Look(Look::WordUnicode)) => {
             BoundaryMode::Unicode
         }
-        _ => return Ok(None),
+        _ => {
+            return Ok(InspectionOutcome::Ineligible { planner_work: work });
+        }
     };
     let repeated = peel_captures(repeated, &mut work, max_planner_work)?;
     let HirKind::Repetition(repetition) = repeated.kind() else {
-        return Ok(None);
+        return Ok(InspectionOutcome::Ineligible { planner_work: work });
     };
     charge_build(&mut work, 1, max_planner_work)?;
     if repetition.min == 0 || !repetition.greedy {
-        return Ok(None);
+        return Ok(InspectionOutcome::Ineligible { planner_work: work });
     }
     let minimum_units = usize::try_from(repetition.min)
         .map_err(|_| InspectionError::ArithmeticOverflow("minimum repetition"))?;
@@ -498,36 +1016,43 @@ pub(crate) fn inspect(
         .transpose()
         .map_err(|_| InspectionError::ArithmeticOverflow("maximum repetition"))?;
     let class = peel_captures(&repetition.sub, &mut work, max_planner_work)?;
-    let inspected = match (mode, class.kind()) {
-        (BoundaryMode::Ascii, HirKind::Class(Class::Bytes(class))) => {
-            let range_count = u64::try_from(class.ranges().len())
-                .map_err(|_| InspectionError::ArithmeticOverflow("byte class ranges"))?;
-            let members = class.ranges().iter().try_fold(0_u64, |total, range| {
-                let width = u64::from(range.end())
-                    .checked_sub(u64::from(range.start()))
-                    .and_then(|value| value.checked_add(1))
-                    .ok_or(InspectionError::ArithmeticOverflow("byte class members"))?;
-                total
-                    .checked_add(width)
-                    .ok_or(InspectionError::ArithmeticOverflow("byte class members"))
-            })?;
-            charge_build(&mut work, range_count, max_planner_work)?;
-            charge_build(&mut work, members, max_planner_work)?;
-            InspectedClass::Bytes(class)
-        }
-        (BoundaryMode::Unicode, HirKind::Class(Class::Unicode(class))) => {
-            let range_count = u64::try_from(class.ranges().len())
-                .map_err(|_| InspectionError::ArithmeticOverflow("Unicode class ranges"))?;
-            // One range inspection and one exact retained-range copy.
-            let range_work =
-                range_count
-                    .checked_mul(2)
-                    .ok_or(InspectionError::ArithmeticOverflow(
-                        "Unicode class range work",
-                    ))?;
-            charge_build(&mut work, range_work, max_planner_work)?;
-            let ascii_members =
-                class.ranges().iter().try_fold(0_u64, |total, range| {
+    let (inspected, candidate_mode) =
+        match (mode, class.kind()) {
+            (BoundaryMode::Ascii, HirKind::Class(Class::Bytes(class))) => {
+                let range_count = u64::try_from(class.ranges().len())
+                    .map_err(|_| InspectionError::ArithmeticOverflow("byte class ranges"))?;
+                let (members, ascii_only) = class.ranges().iter().try_fold(
+                    (0_u64, true),
+                    |(total, ascii_only), range| {
+                        let width = u64::from(range.end())
+                            .checked_sub(u64::from(range.start()))
+                            .and_then(|value| value.checked_add(1))
+                            .ok_or(InspectionError::ArithmeticOverflow("byte class members"))?;
+                        let total = total
+                            .checked_add(width)
+                            .ok_or(InspectionError::ArithmeticOverflow("byte class members"))?;
+                        Ok::<_, InspectionError>((total, ascii_only && range.end().is_ascii()))
+                    },
+                )?;
+                charge_build(&mut work, range_count, max_planner_work)?;
+                charge_build(&mut work, members, max_planner_work)?;
+                (
+                    InspectedClass::Bytes(class),
+                    ascii_only.then_some(CandidateMode::ExactAsciiMembers),
+                )
+            }
+            (BoundaryMode::Unicode, HirKind::Class(Class::Unicode(class))) => {
+                let range_count = u64::try_from(class.ranges().len())
+                    .map_err(|_| InspectionError::ArithmeticOverflow("Unicode class ranges"))?;
+                // One range inspection and one exact retained-range copy.
+                let range_work =
+                    range_count
+                        .checked_mul(2)
+                        .ok_or(InspectionError::ArithmeticOverflow(
+                            "Unicode class range work",
+                        ))?;
+                charge_build(&mut work, range_work, max_planner_work)?;
+                let ascii_members = class.ranges().iter().try_fold(0_u64, |total, range| {
                     let start = u32::from(range.start());
                     let end = u32::from(range.end()).min(0x7F);
                     if start > end {
@@ -544,11 +1069,24 @@ pub(crate) fn inspect(
                         )
                     }
                 })?;
-            charge_build(&mut work, ascii_members, max_planner_work)?;
-            InspectedClass::Unicode(class)
-        }
-        _ => return Ok(None),
-    };
+                charge_build(&mut work, ascii_members, max_planner_work)?;
+                (
+                    InspectedClass::Unicode(class),
+                    Some(CandidateMode::UnicodeAsciiMemberOrNonAscii),
+                )
+            }
+            _ => {
+                return Ok(InspectionOutcome::Ineligible { planner_work: work });
+            }
+        };
+    if candidate_mode.is_some() {
+        charge_build(
+            &mut work,
+            u64::try_from(ASCII_CLASSIFIER_BUILD_WORK)
+                .map_err(|_| InspectionError::ArithmeticOverflow("ASCII classifier work"))?,
+            max_planner_work,
+        )?;
+    }
     let range_bytes = match inspected {
         InspectedClass::Bytes(_) => 0,
         InspectedClass::Unicode(class) => class
@@ -564,9 +1102,11 @@ pub(crate) fn inspect(
         .ok_or(InspectionError::ArithmeticOverflow(
             "bounded word-class plan storage",
         ))?;
-    Ok(Some(Inspection {
+    Ok(InspectionOutcome::Eligible(Inspection {
         mode,
         class: inspected,
+        candidate_mode,
+        dispatch,
         minimum_units,
         maximum_units,
         planner_work: work,
@@ -599,6 +1139,23 @@ fn charge_build(work: &mut u64, amount: u64, limit: u64) -> Result<(), Inspectio
     Ok(())
 }
 
+fn next_member_boundary(
+    cursor: &mut ScanningBoundaryCursor,
+    plan: &Plan,
+    haystack: &[u8],
+    accounting: &mut Accounting,
+    limits: SearchLimits,
+) -> Result<Option<ScanningBoundaryPoint>, Error> {
+    loop {
+        let Some(point) = cursor.next(plan, haystack, accounting, limits)? else {
+            return Ok(None);
+        };
+        if point.has_member_after {
+            return Ok(Some(point));
+        }
+    }
+}
+
 fn validate_window(haystack: &[u8], window: SearchWindow) -> Result<(), Error> {
     if window.start() > window.end() || window.end() > haystack.len() {
         return Err(Error::InvalidWindow {
@@ -611,7 +1168,19 @@ fn validate_window(haystack: &[u8], window: SearchWindow) -> Result<(), Error> {
 }
 
 fn charge(accounting: &mut Accounting, limits: SearchLimits) -> Result<(), Error> {
-    let needed = accounting.work.saturating_add(1);
+    charge_many(accounting, 1, limits)
+}
+
+fn charge_many(
+    accounting: &mut Accounting,
+    amount: usize,
+    limits: SearchLimits,
+) -> Result<(), Error> {
+    let amount = u64::try_from(amount).map_err(|_| accounting_overflow(limits))?;
+    let needed = accounting
+        .work
+        .checked_add(amount)
+        .ok_or_else(|| accounting_overflow(limits))?;
     if needed > limits.max_work {
         return Err(Error::WorkLimitExceeded {
             needed,
@@ -620,6 +1189,30 @@ fn charge(accounting: &mut Accounting, limits: SearchLimits) -> Result<(), Error
     }
     accounting.work = needed;
     Ok(())
+}
+
+fn record_source(
+    accounting: &mut Accounting,
+    bytes: usize,
+    scalars: usize,
+    limits: SearchLimits,
+) -> Result<(), Error> {
+    accounting.bytes_examined = accounting
+        .bytes_examined
+        .checked_add(bytes)
+        .ok_or_else(|| accounting_overflow(limits))?;
+    accounting.scalars_decoded = accounting
+        .scalars_decoded
+        .checked_add(scalars)
+        .ok_or_else(|| accounting_overflow(limits))?;
+    Ok(())
+}
+
+const fn accounting_overflow(limits: SearchLimits) -> Error {
+    Error::WorkLimitExceeded {
+        needed: u64::MAX,
+        limit: limits.max_work,
+    }
 }
 
 fn set_byte_range(words: &mut [u64; 4], start: u8, end: u8) {
@@ -710,10 +1303,16 @@ fn decode_last(bytes: &[u8]) -> Option<(char, usize)> {
 
 #[cfg(test)]
 mod tests {
+    use fre_kernels::SimdDispatchContext;
     use regex_syntax::ParserBuilder;
 
-    use super::{PLAN_ID, inspect};
-    use crate::{SearchLimits, SearchWindow};
+    use super::{
+        ASCII_CLASSIFIER_BUILD_WORK, CandidateMode, InspectionError, InspectionOutcome, PLAN_ID,
+        inspect,
+    };
+    use crate::{
+        BuildError, BuildLimits, PlanSelection, PortableBuilder, SearchLimits, SearchWindow,
+    };
 
     fn plan(pattern: &str, unicode: bool) -> super::Plan {
         let hir = ParserBuilder::new()
@@ -722,11 +1321,12 @@ mod tests {
             .build()
             .parse(pattern)
             .expect("test pattern");
-        inspect(&hir, u64::MAX)
-            .expect("inspection")
-            .expect("eligible shape")
-            .build()
-            .expect("plan build")
+        let InspectionOutcome::Eligible(inspection) =
+            inspect(&hir, SimdDispatchContext::capture(), 0, u64::MAX).expect("inspection")
+        else {
+            panic!("eligible shape");
+        };
+        inspection.build().expect("plan build")
     }
 
     #[test]
@@ -771,5 +1371,245 @@ mod tests {
             .0
             .expect("first match");
         assert_eq!(first.range(), 1..3);
+    }
+
+    #[test]
+    fn classifier_admission_build_work_and_fallback_are_exact() {
+        let parse = |pattern: &str| {
+            ParserBuilder::new()
+                .unicode(false)
+                .utf8(false)
+                .build()
+                .parse(pattern)
+                .expect("test pattern")
+        };
+        let ascii_hir = parse(r"(?-u:\b[A-B]{1,3}\b)");
+        let high_hir = parse(r"(?-u:\b[\x80-\x81]{1,3}\b)");
+        let InspectionOutcome::Eligible(ascii) =
+            inspect(&ascii_hir, SimdDispatchContext::capture(), 0, u64::MAX)
+                .expect("ASCII inspection")
+        else {
+            panic!("ASCII class should be eligible");
+        };
+        let InspectionOutcome::Eligible(high) =
+            inspect(&high_hir, SimdDispatchContext::capture(), 0, u64::MAX)
+                .expect("high-byte inspection")
+        else {
+            panic!("high-byte class should be eligible");
+        };
+        assert_eq!(ascii.candidate_mode, Some(CandidateMode::ExactAsciiMembers));
+        assert_eq!(high.candidate_mode, None);
+        assert_eq!(
+            ascii.planner_work(),
+            high.planner_work()
+                .checked_add(u64::try_from(ASCII_CLASSIFIER_BUILD_WORK).unwrap())
+                .unwrap()
+        );
+        assert_eq!(ascii.storage_bytes(), high.storage_bytes());
+
+        let ascii = ascii.build().expect("ASCII plan");
+        let high = high.build().expect("high-byte plan");
+        assert!(ascii.candidate_scanner.is_some());
+        assert!(high.candidate_scanner.is_none());
+        assert_eq!(ascii.storage_bytes(), high.storage_bytes());
+    }
+
+    #[test]
+    fn ineligible_inspection_retains_prior_work_and_facade_composes_it() {
+        let hir = ParserBuilder::new()
+            .unicode(false)
+            .utf8(false)
+            .build()
+            .parse("needle")
+            .expect("test pattern");
+        let local =
+            inspect(&hir, SimdDispatchContext::capture(), 0, u64::MAX).expect("local inspection");
+        assert!(matches!(local, InspectionOutcome::Ineligible { .. }));
+        let local_work = local.planner_work();
+        assert!(local_work > 0);
+
+        let prior = 37_u64;
+        let cumulative = inspect(&hir, SimdDispatchContext::capture(), prior, u64::MAX)
+            .expect("cumulative inspection");
+        assert_eq!(
+            cumulative.planner_work(),
+            prior.checked_add(local_work).unwrap()
+        );
+        let needed = cumulative.planner_work();
+        assert!(matches!(
+            inspect(
+                &hir,
+                SimdDispatchContext::capture(),
+                prior,
+                needed - 1
+            ),
+            Err(InspectionError::WorkLimit {
+                needed: actual,
+                limit,
+            }) if actual == needed && limit == needed - 1
+        ));
+
+        let regex = PortableBuilder::new("needle")
+            .unicode(false)
+            .plan_selection(PlanSelection::Auto)
+            .build()
+            .expect("facade fallback");
+        let facade_work = regex.build_report().planner_work;
+        assert!(facade_work >= local_work);
+        let exact = PortableBuilder::new("needle")
+            .unicode(false)
+            .plan_selection(PlanSelection::Auto)
+            .limits(BuildLimits {
+                max_planner_work: facade_work,
+                ..BuildLimits::default()
+            })
+            .build()
+            .expect("exact cumulative planner limit");
+        assert_eq!(exact.build_report().planner_work, facade_work);
+        assert!(matches!(
+            PortableBuilder::new("needle")
+                .unicode(false)
+                .plan_selection(PlanSelection::Auto)
+                .limits(BuildLimits {
+                    max_planner_work: facade_work - 1,
+                    ..BuildLimits::default()
+                })
+                .build(),
+            Err(BuildError::PlannerWorkLimit {
+                needed,
+                limit,
+            }) if needed == facade_work && limit == facade_work - 1
+        ));
+    }
+
+    #[test]
+    fn scalar_crossover_and_wide_absent_scans_have_exact_ledgers() {
+        let plan = plan(r"(?-u:\b[A-B]{1,3}\b)", false);
+
+        let absent = vec![b'-'; 64];
+        let (matched, accounting) = plan
+            .find_window(
+                &absent,
+                SearchWindow::full(&absent),
+                SearchLimits::unlimited(),
+            )
+            .expect("absent scan");
+        assert_eq!(matched, None);
+        assert_eq!(accounting.work(), 64);
+        assert_eq!(accounting.bytes_examined(), 64);
+        assert_eq!(accounting.scalars_decoded(), 64);
+        assert!(
+            plan.find_window(
+                &absent,
+                SearchWindow::full(&absent),
+                SearchLimits {
+                    max_work: accounting.work(),
+                    max_scratch_bytes: 0,
+                },
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            plan.find_window(
+                &absent,
+                SearchWindow::full(&absent),
+                SearchLimits {
+                    max_work: accounting.work() - 1,
+                    max_scratch_bytes: 0,
+                },
+            ),
+            Err(crate::UnicodeWordRunError::WorkLimitExceeded {
+                needed: 64,
+                limit: 63,
+            })
+        ));
+
+        let mut near = vec![b'-'; 64];
+        near[3] = b'A';
+        let (matched, accounting) = plan
+            .find_window(&near, SearchWindow::full(&near), SearchLimits::unlimited())
+            .expect("scalar-prefix candidate");
+        assert_eq!(matched.expect("near match").range(), 3..4);
+        assert_eq!(accounting.work(), 10);
+        assert_eq!(accounting.bytes_examined(), 7);
+        assert_eq!(accounting.scalars_decoded(), 7);
+
+        let mut wide = vec![b'-'; 64];
+        wide[20] = b'A';
+        let (matched, accounting) = plan
+            .find_window(&wide, SearchWindow::full(&wide), SearchLimits::unlimited())
+            .expect("wide candidate");
+        assert_eq!(matched.expect("wide match").range(), 20..21);
+        assert_eq!(accounting.work(), 47);
+        assert_eq!(accounting.bytes_examined(), 44);
+        assert_eq!(accounting.scalars_decoded(), 43);
+        assert!(matches!(
+            plan.find_window(
+                &wide,
+                SearchWindow::full(&wide),
+                SearchLimits {
+                    max_work: accounting.work() - 1,
+                    max_scratch_bytes: 0,
+                },
+            ),
+            Err(crate::UnicodeWordRunError::WorkLimitExceeded {
+                needed: 47,
+                limit: 46,
+            })
+        ));
+    }
+
+    #[test]
+    fn unicode_vector_candidates_include_high_bytes_and_decode_malformed_normally() {
+        let plan = plan(r"\b\p{Greek}{2,3}\b", true);
+        let mut source = vec![b'-'; 64];
+        source[20..24].copy_from_slice("αβ".as_bytes());
+        let (matched, accounting) = plan
+            .find_window(
+                &source,
+                SearchWindow::full(&source),
+                SearchLimits::unlimited(),
+            )
+            .expect("Unicode vector candidate");
+        assert_eq!(matched.expect("Greek match").range(), 20..24);
+        assert_eq!(accounting.work(), 49);
+        assert_eq!(accounting.bytes_examined(), 49);
+        assert_eq!(accounting.scalars_decoded(), 41);
+
+        source[12] = 0xFF;
+        let (matched, malformed_accounting) = plan
+            .find_window(
+                &source,
+                SearchWindow::full(&source),
+                SearchLimits::unlimited(),
+            )
+            .expect("malformed candidate recovery");
+        assert_eq!(
+            matched.expect("Greek match after malformed byte").range(),
+            20..24
+        );
+        assert!(malformed_accounting.work() > accounting.work());
+        assert!(
+            plan.find_window(
+                &source,
+                SearchWindow::full(&source),
+                SearchLimits {
+                    max_work: malformed_accounting.work(),
+                    max_scratch_bytes: 0,
+                },
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            plan.find_window(
+                &source,
+                SearchWindow::full(&source),
+                SearchLimits {
+                    max_work: malformed_accounting.work() - 1,
+                    max_scratch_bytes: 0,
+                },
+            ),
+            Err(crate::UnicodeWordRunError::WorkLimitExceeded { .. })
+        ));
     }
 }
