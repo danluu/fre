@@ -1218,6 +1218,17 @@ fn push_frontier(frontier: &mut ColumnFrontier, offset: u8) {
 
 fn column_rank(literal: &[u8], multiplicity: &[u8; 256], offset: u8) -> (u32, u8, u8) {
     let byte = literal[usize::from(offset)];
+    let prevalence = primary_selection_prevalence(byte);
+    let repeats = u32::from(multiplicity[usize::from(byte)]);
+    (
+        prevalence.saturating_mul(repeats),
+        multiplicity[usize::from(byte)],
+        offset,
+    )
+}
+
+fn coarse_column_rank(literal: &[u8], multiplicity: &[u8; 256], offset: u8) -> (u32, u8, u8) {
+    let byte = literal[usize::from(offset)];
     let prevalence = u32::from(BYTE_PREVALENCE_WEIGHT[usize::from(byte)]);
     let repeats = u32::from(multiplicity[usize::from(byte)]);
     (
@@ -1546,9 +1557,20 @@ fn canonicalize_filter_order(
     }
     for insertion in 1..filters.len() {
         let key = filters[insertion];
-        let key_rank = column_rank(literal, multiplicity, key);
+        let key_rank = if strategy == CountV3Strategy::PeriodicRun {
+            coarse_column_rank(literal, multiplicity, key)
+        } else {
+            column_rank(literal, multiplicity, key)
+        };
         let mut cursor = insertion;
-        while cursor != 0 && key_rank < column_rank(literal, multiplicity, filters[cursor - 1]) {
+        while cursor != 0
+            && key_rank
+                < if strategy == CountV3Strategy::PeriodicRun {
+                    coarse_column_rank(literal, multiplicity, filters[cursor - 1])
+                } else {
+                    column_rank(literal, multiplicity, filters[cursor - 1])
+                }
+        {
             filters[cursor] = filters[cursor - 1];
             cursor -= 1;
         }
@@ -2233,6 +2255,36 @@ fn to_u32(value: usize, at: &'static str) -> Result<u32, CountV3OptimizeError> {
 }
 
 const BYTE_PREVALENCE_WEIGHT: [u16; 256] = build_byte_prevalence_weight();
+
+/// Pattern-only prevalence ordering for the primary filter column.
+///
+/// The cost model deliberately retains coarse encoding-class weights: its
+/// purpose is to compare schedule shapes without pretending to know the
+/// deployment corpus. Primary ordering has a narrower job. A false-positive
+/// primary wakes the entire vector filter, so ties between ASCII letters are
+/// expensive. Use the pinned memchr-2.8.3 default ASCII frequency ranks to
+/// break those ties. This is a general static prior, not profile or benchmark
+/// feedback. Non-ASCII bytes preserve the existing encoding-class ordering
+/// exactly (scaled only to share the rank domain), which avoids changing the
+/// already-qualified UTF-8 lead/continuation preference.
+fn primary_selection_prevalence(byte: u8) -> u32 {
+    if byte.is_ascii() {
+        u32::from(ASCII_PRIMARY_FREQUENCY_RANK[usize::from(byte)])
+    } else {
+        u32::from(BYTE_PREVALENCE_WEIGHT[usize::from(byte)]) * 4
+    }
+}
+
+/// Pinned memchr-2.8.3 default ranks for ASCII bytes. Lower is rarer.
+const ASCII_PRIMARY_FREQUENCY_RANK: [u8; 128] = [
+    55, 52, 51, 50, 49, 48, 47, 46, 45, 103, 242, 66, 67, 229, 44, 43, 42, 41, 40, 39, 38, 37, 36,
+    35, 34, 33, 56, 32, 31, 30, 29, 28, 255, 148, 164, 149, 136, 160, 155, 173, 221, 222, 134, 122,
+    232, 202, 215, 224, 208, 220, 204, 187, 183, 179, 177, 168, 178, 200, 226, 195, 154, 184, 174,
+    126, 120, 191, 157, 194, 170, 189, 162, 161, 150, 193, 142, 137, 171, 176, 185, 167, 186, 112,
+    175, 192, 188, 156, 140, 143, 123, 133, 128, 147, 138, 146, 114, 223, 151, 249, 216, 238, 236,
+    253, 227, 218, 230, 247, 135, 180, 241, 233, 246, 244, 231, 139, 245, 243, 251, 235, 201, 196,
+    240, 214, 152, 182, 205, 181, 127, 27,
+];
 
 const fn build_byte_prevalence_weight() -> [u16; 256] {
     // Coarse encoding classes only: no language- or benchmark-specific byte

@@ -323,8 +323,8 @@ fn primary_filter_rank_is_pattern_only_and_encoding_structural() {
     let e = column_rank(english, &analysis.multiplicity, 0);
     let t = column_rank(english, &analysis.multiplicity, 1);
     let a = column_rank(english, &analysis.multiplicity, 2);
-    assert_eq!((e.0, e.1), (t.0, t.1));
-    assert_eq!((t.0, t.1), (a.0, a.1));
+    assert!(a < t);
+    assert!(t < e);
     let mut reversed = [2, 1, 0];
     canonicalize_filter_order(
         english,
@@ -332,7 +332,7 @@ fn primary_filter_rank_is_pattern_only_and_encoding_structural() {
         CountV3Strategy::SparseRareColumns,
         &mut reversed,
     );
-    assert_eq!(reversed, [0, 1, 2]);
+    assert_eq!(reversed, [2, 1, 0]);
 
     let endpoint_literal = "a中".as_bytes();
     let mut work = Work::default();
