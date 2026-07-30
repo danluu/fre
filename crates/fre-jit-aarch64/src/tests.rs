@@ -4564,6 +4564,7 @@ fn explicit_search_backend_policy_selects_distinct_artifact_identities() {
         (SearchBackendPolicy::AsimdV20, BackendVersion::SEARCH_V20),
         (SearchBackendPolicy::AsimdV21, BackendVersion::SEARCH_V21),
         (SearchBackendPolicy::AsimdV22, BackendVersion::SEARCH_V22),
+        (SearchBackendPolicy::AsimdV23, BackendVersion::SEARCH_V23),
         (SearchBackendPolicy::Sve16, BackendVersion::SEARCH_SVE16_V1),
         (
             SearchBackendPolicy::Sve2Fixed16,
@@ -11358,6 +11359,26 @@ fn v23_cfg_reaches(
 
 #[test]
 fn v23_policy_version_wire_and_output_contracts_are_explicit() {
+    for width in 1_usize..6 {
+        let literal = vec![b'x'; width];
+        let outside_envelope = build_exact_literal::<Span>(
+            &literal,
+            AnchorFlags::default(),
+            ValidateLimits::default(),
+        )
+        .expect("valid exact literal below the V23 envelope");
+        assert_eq!(
+            emit_with_backend(
+                &outside_envelope,
+                SearchBackendPolicy::AsimdV23,
+                EmitLimits::default(),
+            ),
+            Err(EmitError::Unsupported {
+                reason: UnsupportedReason::KernelShape,
+            }),
+            "width={width}"
+        );
+    }
     let literal = v23_pointer_test_literal(13, false);
     let span =
         build_exact_literal::<Span>(&literal, AnchorFlags::default(), ValidateLimits::default())
@@ -12622,7 +12643,7 @@ fn v13_adaptive_recovery_decoded_edges_cover_zero_one_and_max_remaining_columns(
 }
 
 #[test]
-fn v9_through_v22_reject_shapes_without_one_nonempty_unanchored_exact_candidate() {
+fn v9_through_v23_reject_shapes_without_one_nonempty_unanchored_exact_candidate() {
     for backend in [
         SearchBackendPolicy::AsimdV9,
         SearchBackendPolicy::AsimdV10,
@@ -12638,6 +12659,7 @@ fn v9_through_v22_reject_shapes_without_one_nonempty_unanchored_exact_candidate(
         SearchBackendPolicy::AsimdV20,
         SearchBackendPolicy::AsimdV21,
         SearchBackendPolicy::AsimdV22,
+        SearchBackendPolicy::AsimdV23,
     ] {
         for anchors in [
             AnchorFlags {
