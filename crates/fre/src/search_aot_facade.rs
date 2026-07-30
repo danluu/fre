@@ -24,7 +24,8 @@ use fre_aot_static_runtime::{
 };
 use fre_kernel_ir::{CheckedSearchWindow, MatchSpan, SearchWindow as NativeSearchWindow};
 use fre_kernels::{
-    LiteralAccounting, LiteralPlan, LiteralSearchPreflight, Window as LiteralWindow,
+    LiteralAccounting, LiteralPlan, LiteralSearchPrefixSplit, LiteralSearchPreflight,
+    Window as LiteralWindow,
 };
 
 use crate::{
@@ -567,23 +568,30 @@ fn find_window_automatically_v1<'plan, 'haystack>(
                 haystack_len: haystack.len(),
             })
         })?;
-    let full = portable.preflight_checked_window(checked, literal_limits(limits))?;
-    if let Some((start, end)) =
-        full.find_prefix_candidate_starts(portable_prefix_candidate_starts)?
-    {
-        return Ok((
+    match portable.preflight_checked_window_prefix(
+        checked,
+        literal_limits(limits),
+        portable_prefix_candidate_starts,
+    )? {
+        LiteralSearchPrefixSplit::Match {
+            start,
+            end,
+            accounting,
+        } => Ok((
             Some(Match { start, end }),
-            SearchAccounting::ExactLiteral(full.accounting()),
-        ));
+            SearchAccounting::ExactLiteral(accounting),
+        )),
+        LiteralSearchPrefixSplit::Exhausted { accounting } => {
+            Ok((None, SearchAccounting::ExactLiteral(accounting)))
+        }
+        LiteralSearchPrefixSplit::Tail(tail) => {
+            let (matched, accounting) = invoke_tail(tail)?;
+            Ok((
+                matched.map(project_match),
+                SearchAccounting::ExactLiteral(accounting),
+            ))
+        }
     }
-    let Some(tail) = full.after_prefix_candidate_starts(portable_prefix_candidate_starts)? else {
-        return Ok((None, SearchAccounting::ExactLiteral(full.accounting())));
-    };
-    let (matched, accounting) = invoke_tail(tail)?;
-    Ok((
-        matched.map(project_match),
-        SearchAccounting::ExactLiteral(accounting),
-    ))
 }
 
 #[inline]

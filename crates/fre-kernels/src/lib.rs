@@ -803,6 +803,25 @@ pub struct LiteralSearchPreflight<'plan, 'haystack> {
     accounting: LiteralAccounting,
 }
 
+/// Result of one fused full-window preflight and portable-prefix split.
+///
+/// All variants retain the accounting for the original full window. `Tail`
+/// carries the same non-forgeable admission token narrowed to the first
+/// candidate start not owned by the portable prefix.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub enum LiteralSearchPrefixSplit<'plan, 'haystack> {
+    Match {
+        start: usize,
+        end: usize,
+        accounting: LiteralAccounting,
+    },
+    Exhausted {
+        accounting: LiteralAccounting,
+    },
+    Tail(LiteralSearchPreflight<'plan, 'haystack>),
+}
+
 impl<'plan, 'haystack> LiteralSearchPreflight<'plan, 'haystack> {
     /// Exact accounting produced by the authoritative literal preflight.
     #[doc(hidden)]
@@ -938,6 +957,71 @@ impl<'plan, 'haystack> LiteralSearchPreflight<'plan, 'haystack> {
             computation: "literal candidate tail window",
         })?;
         Ok(Some(Self {
+            plan: self.plan,
+            window: tail,
+            accounting: self.accounting,
+        }))
+    }
+
+    /// Search and split prefix ownership in one pass.
+    ///
+    /// Unlike separate calls to [`Self::find_prefix_candidate_starts`] and
+    /// [`Self::after_prefix_candidate_starts`], this computes the legal
+    /// candidate count once. A miss returns either the already-accounted
+    /// exhausted result or the exact tail token.
+    #[doc(hidden)]
+    #[inline]
+    pub fn split_prefix_candidate_starts(
+        self,
+        candidate_starts: usize,
+    ) -> Result<LiteralSearchPrefixSplit<'plan, 'haystack>, LiteralError> {
+        let available = self.available_candidate_starts()?;
+        let owned = candidate_starts.min(available);
+        let original = self.window.window();
+        if owned != 0 {
+            let prefix_end = if self.accounting.needle_bytes == 0 {
+                original.start()
+            } else {
+                original
+                    .start()
+                    .checked_add(owned)
+                    .and_then(|end| end.checked_add(self.accounting.needle_bytes))
+                    .and_then(|end| end.checked_sub(1))
+                    .ok_or(LiteralError::ArithmeticOverflow {
+                        computation: "literal candidate prefix end",
+                    })?
+            };
+            if let Some((start, end)) = self.plan.find_after_preflight(
+                self.window.haystack(),
+                Window::new(original.start(), prefix_end),
+            )? {
+                return Ok(LiteralSearchPrefixSplit::Match {
+                    start,
+                    end,
+                    accounting: self.accounting,
+                });
+            }
+        }
+        if owned == available {
+            return Ok(LiteralSearchPrefixSplit::Exhausted {
+                accounting: self.accounting,
+            });
+        }
+        let tail_start =
+            original
+                .start()
+                .checked_add(owned)
+                .ok_or(LiteralError::ArithmeticOverflow {
+                    computation: "literal candidate tail start",
+                })?;
+        let tail = CheckedSearchWindow::new(
+            self.window.haystack(),
+            fre_kernel_ir::SearchWindow::new(tail_start, original.end()),
+        )
+        .ok_or(LiteralError::ArithmeticOverflow {
+            computation: "literal candidate tail window",
+        })?;
+        Ok(LiteralSearchPrefixSplit::Tail(Self {
             plan: self.plan,
             window: tail,
             accounting: self.accounting,
@@ -1087,6 +1171,20 @@ impl LiteralPlan {
             accounting,
         })
     }
+
+    /// Perform one authoritative full-window preflight and immediately split
+    /// the portable prefix from a disjoint native tail.
+    #[doc(hidden)]
+    #[inline]
+    pub fn preflight_checked_window_prefix<'plan, 'haystack>(
+        &'plan self,
+        window: CheckedSearchWindow<'haystack>,
+        limits: LiteralSearchLimits,
+        portable_prefix_candidate_starts: usize,
+    ) -> Result<LiteralSearchPrefixSplit<'plan, 'haystack>, LiteralError> {
+        self.preflight_checked_window(window, limits)?
+            .split_prefix_candidate_starts(portable_prefix_candidate_starts)
+    }
 }
 
 fn copy_literal_exact(needle: &[u8]) -> Result<Vec<u8>, LiteralError> {
@@ -1153,8 +1251,8 @@ mod tests {
 
     use super::{
         LiteralAccounting, LiteralBuildLimits, LiteralError, LiteralPlan, LiteralSearchLimits,
-        Window, copy_literal_exact, exact_literal_copy_probe, preflight_checked_literal_window,
-        preflight_literal_window,
+        LiteralSearchPrefixSplit, Window, copy_literal_exact, exact_literal_copy_probe,
+        preflight_checked_literal_window, preflight_literal_window,
     };
 
     #[test]
@@ -1277,6 +1375,41 @@ mod tests {
                 tail.find().expect("tail uses retained full accounting"),
                 (!prefix_owns).then_some((candidate, candidate + plan.needle().len()))
             );
+
+            let fused = plan
+                .preflight_checked_window_prefix(
+                    checked,
+                    LiteralSearchLimits::unlimited(),
+                    PREFIX_STARTS,
+                )
+                .expect("fused preflight and prefix split");
+            match (prefix_owns, fused) {
+                (
+                    true,
+                    LiteralSearchPrefixSplit::Match {
+                        start,
+                        end,
+                        accounting: fused_accounting,
+                    },
+                ) => {
+                    assert_eq!((start, end), (candidate, candidate + plan.needle().len()));
+                    assert_eq!(fused_accounting, accounting);
+                }
+                (false, LiteralSearchPrefixSplit::Tail(tail)) => {
+                    assert_eq!(tail.accounting(), accounting);
+                    assert_eq!(
+                        tail.checked_window().window().start(),
+                        WINDOW_START + PREFIX_STARTS
+                    );
+                    assert_eq!(
+                        tail.find().expect("fused tail search"),
+                        Some((candidate, candidate + plan.needle().len()))
+                    );
+                }
+                (expected_prefix, actual) => {
+                    panic!("unexpected fused split: prefix={expected_prefix} actual={actual:?}")
+                }
+            }
         }
 
         let one_candidate_haystack = b"needle";
@@ -1302,6 +1435,23 @@ mod tests {
                 .expect("bounded split")
                 .is_none()
         );
+        let absent = plan
+            .preflight_checked_window_prefix(
+                CheckedSearchWindow::new(
+                    b"xxxxxx",
+                    KernelSearchWindow::new(0, plan.needle().len()),
+                )
+                .expect("one absent candidate window"),
+                LiteralSearchLimits::unlimited(),
+                PREFIX_STARTS,
+            )
+            .expect("fused exhausted prefix");
+        assert!(matches!(
+            absent,
+            LiteralSearchPrefixSplit::Exhausted { accounting }
+                if accounting.needle_bytes == plan.needle().len()
+                    && accounting.searched_bytes == plan.needle().len()
+        ));
     }
 
     #[test]
