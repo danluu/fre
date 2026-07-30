@@ -1,7 +1,7 @@
 use fre_aot_search_contract::{
     AOT_SEARCH_COMPILER_VERSION_V1, ClaimedStaticSearchSpanExpectationV1,
     MAX_STATIC_SEARCH_SPAN_LITERAL_BYTES_V1, MIN_STATIC_SEARCH_SPAN_LITERAL_BYTES_V1,
-    SEARCH_ARCHITECTURE_AARCH64_V1, SEARCH_BACKEND_ASIMD_TAG22_V1,
+    SEARCH_ARCHITECTURE_AARCH64_V1, SEARCH_BACKEND_ASIMD_TAG22_V1, SEARCH_BACKEND_ASIMD_TAG23_V1,
     SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1, SEARCH_BACKEND_VERSION_V1, SEARCH_CALL_ABI_SCHEMA_V1,
     SEARCH_EXPORTED_SYMBOL_INFO_ELF_FUNCTION_V1, SEARCH_EXPORTED_SYMBOL_N_TYPE_V1,
     SEARCH_EXPORTED_SYMBOL_SCHEMA_VERSION_V1, SEARCH_METADATA_VERSION_V1, SEARCH_PLATFORM_LINUX_V1,
@@ -579,6 +579,18 @@ const fn production_family_profile_is_canonical(
             SEARCH_BACKEND_ASIMD_TAG22_V1,
             SEARCH_REQUIRED_ASIMD_FEATURES_V1,
             SEARCH_EXPORTED_SYMBOL_INFO_ELF_FUNCTION_V1,
+        )
+        | (
+            SEARCH_PLATFORM_MACOS_V1,
+            SEARCH_BACKEND_ASIMD_TAG23_V1,
+            SEARCH_REQUIRED_ASIMD_FEATURES_V1,
+            SEARCH_EXPORTED_SYMBOL_N_TYPE_V1,
+        )
+        | (
+            SEARCH_PLATFORM_LINUX_V1,
+            SEARCH_BACKEND_ASIMD_TAG23_V1,
+            SEARCH_REQUIRED_ASIMD_FEATURES_V1,
+            SEARCH_EXPORTED_SYMBOL_INFO_ELF_FUNCTION_V1,
         ) => true,
         (
             SEARCH_PLATFORM_LINUX_V1,
@@ -874,6 +886,9 @@ mod tests {
         let mut v9 = valid[0];
         v9.backend_version = SEARCH_BACKEND_ASIMD_TAG22_V1;
         assert!(production_families_are_canonical(&[v9]));
+        let mut v10 = valid[0];
+        v10.backend_version = SEARCH_BACKEND_ASIMD_TAG23_V1;
+        assert!(production_families_are_canonical(&[v10]));
         let mut zero_floor = valid[0];
         zero_floor.minimum_window_bytes = 0;
         assert!(!production_families_are_canonical(&[zero_floor]));

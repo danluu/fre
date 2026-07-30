@@ -157,14 +157,15 @@ impl std::error::Error for SearchManifestErrorV1 {}
 /// Explicit macOS `AArch64` code-generation profile.
 ///
 /// The default remains V8 so all existing manifests and artifact identities
-/// remain byte-for-byte stable. V9 is reachable only through its named
-/// candidate constructor until source qualification grants deployment
+/// remain byte-for-byte stable. V9 and V10 are reachable only through named
+/// candidate constructors until source qualification grants deployment
 /// authority.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum MacosAarch64SearchBackendV1 {
     #[default]
     AsimdV8,
     AsimdV9,
+    AsimdV10,
 }
 
 impl MacosAarch64SearchBackendV1 {
@@ -173,6 +174,7 @@ impl MacosAarch64SearchBackendV1 {
         match self {
             Self::AsimdV8 => SearchBackendPolicy::AsimdV8,
             Self::AsimdV9 => SearchBackendPolicy::AsimdV9,
+            Self::AsimdV10 => SearchBackendPolicy::AsimdV10,
         }
     }
 
@@ -237,6 +239,12 @@ impl<O: Operation> MacosAarch64ExactSearchManifestV1<O> {
     /// runtime or automatic-routing authority.
     pub fn v9_candidate(policy: SearchCompilePolicyV1) -> Result<Self, SearchManifestErrorV1> {
         Self::with_backend(policy, MacosAarch64SearchBackendV1::AsimdV9)
+    }
+
+    /// Construct an explicit ASIMD V10 candidate manifest. This does not
+    /// grant runtime or automatic-routing authority.
+    pub fn v10_candidate(policy: SearchCompilePolicyV1) -> Result<Self, SearchManifestErrorV1> {
+        Self::with_backend(policy, MacosAarch64SearchBackendV1::AsimdV10)
     }
 
     #[must_use]
@@ -642,6 +650,7 @@ impl SearchCompileReceiptV1 {
                 metadata.backend_version(),
                 value if value == BackendVersion::SEARCH_V8.0
                     || value == BackendVersion::SEARCH_V9.0
+                    || value == BackendVersion::SEARCH_V10.0
             )
             && metadata.abi_kind() == AbiKind::Search
             && metadata.literal_bytes() == 0
@@ -1677,6 +1686,55 @@ mod tests {
         assert_eq!(
             claim.backend_version(),
             fre_aot_search_contract::SEARCH_BACKEND_ASIMD_TAG22_V1
+        );
+        assert!(expectation.authenticates_claim(&claim));
+    }
+
+    #[test]
+    fn explicit_v10_is_deterministic_static_and_identity_disjoint_from_v8_v9() {
+        let v8_manifest = MacosAarch64ExactSearchManifestV1::<Span>::default();
+        let v9_manifest = MacosAarch64ExactSearchManifestV1::<Span>::v9_candidate(
+            SearchCompilePolicyV1::default(),
+        )
+        .expect("V9 candidate manifest");
+        let v10_manifest = MacosAarch64ExactSearchManifestV1::<Span>::v10_candidate(
+            SearchCompilePolicyV1::default(),
+        )
+        .expect("V10 candidate manifest");
+        assert_eq!(
+            v10_manifest.backend(),
+            MacosAarch64SearchBackendV1::AsimdV10
+        );
+        assert_ne!(v10_manifest.identity(), v8_manifest.identity());
+        assert_ne!(v10_manifest.identity(), v9_manifest.identity());
+
+        let first = plan_and_compile_macos_aarch64_exact_search_v1(
+            v10_manifest,
+            b"needle".to_vec(),
+            RustProfile::default(),
+        )
+        .expect("first V10 object");
+        let second = plan_and_compile_macos_aarch64_exact_search_v1(
+            v10_manifest,
+            b"needle".to_vec(),
+            RustProfile::default(),
+        )
+        .expect("second V10 object");
+        assert_eq!(
+            first.receipt().metadata().backend_version(),
+            BackendVersion::SEARCH_V10.0
+        );
+        assert_eq!(first.object().as_bytes(), second.object().as_bytes());
+        assert_eq!(first.receipt(), second.receipt());
+        let expectation = crate::build_static_search_span_expectation_v1(&first)
+            .expect("V10 neutral expectation");
+        let claim = fre_aot_search_contract::inspect_static_search_span_expectation_v1(
+            expectation.as_bytes(),
+        )
+        .expect("V10 expectation inspection");
+        assert_eq!(
+            claim.backend_version(),
+            fre_aot_search_contract::SEARCH_BACKEND_ASIMD_TAG23_V1
         );
         assert!(expectation.authenticates_claim(&claim));
     }

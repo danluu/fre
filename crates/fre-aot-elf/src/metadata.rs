@@ -306,7 +306,8 @@ impl MetadataV1 {
         let backend_ok = match self.backend_version {
             version
                 if version == BackendVersion::SEARCH_V8.0
-                    || version == BackendVersion::SEARCH_V9.0 =>
+                    || version == BackendVersion::SEARCH_V9.0
+                    || version == BackendVersion::SEARCH_V10.0 =>
             {
                 self.features == CpuFeatures::ASIMD.bits()
             }

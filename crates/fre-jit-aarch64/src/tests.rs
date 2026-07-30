@@ -6077,6 +6077,13 @@ fn v10_terminal_filter_is_distinct_audited_and_matches_the_oracle() {
             near_miss_stream.extend_from_slice(&terminal_near_miss);
         }
         near_miss_stream.extend_from_slice(&literal);
+        let mut head_near_miss = literal.clone();
+        head_near_miss[0] ^= 0x80;
+        let mut head_near_miss_stream = Vec::new();
+        for _ in 0..8 {
+            head_near_miss_stream.extend_from_slice(&head_near_miss);
+        }
+        head_near_miss_stream.extend_from_slice(&literal);
         let mut dense_matches = Vec::new();
         for _ in 0..8 {
             dense_matches.extend_from_slice(&literal);
@@ -6086,6 +6093,7 @@ fn v10_terminal_filter_is_distinct_audited_and_matches_the_oracle() {
             literal.clone(),
             vec![0xa5; 257],
             near_miss_stream,
+            head_near_miss_stream,
             dense_matches,
         ];
         for candidate_start in [0_usize, 1, 15, 16, 17, 31, 32, 63] {
@@ -6117,7 +6125,7 @@ fn v10_terminal_filter_is_distinct_audited_and_matches_the_oracle() {
             }
         }
     }
-    assert_eq!(comparisons, 1_248);
+    assert_eq!(comparisons, 1_344);
 
     let literal = b"0123456789abcdef";
     let program =

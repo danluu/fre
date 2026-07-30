@@ -1481,6 +1481,8 @@ fn require_hex64_or_commit(value: &str, label: &str) -> Result<(), DynError> {
 const fn backend_name(backend: LinuxAarch64SearchBackendV1) -> &'static str {
     match backend {
         LinuxAarch64SearchBackendV1::AsimdV8 => "v8-asimd",
+        LinuxAarch64SearchBackendV1::AsimdV9 => "v9-asimd",
+        LinuxAarch64SearchBackendV1::AsimdV10 => "v10-asimd",
         LinuxAarch64SearchBackendV1::Sve2Fixed16Tag21Vl16 => "tag21-sve2-fixed16",
     }
 }

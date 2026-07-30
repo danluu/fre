@@ -712,7 +712,8 @@ impl MetadataV1 {
         let backend_contract = match (self.abi_kind, self.backend_version) {
             (AbiKind::Search, version)
                 if version == BackendVersion::SEARCH_V8.0
-                    || version == BackendVersion::SEARCH_V9.0 =>
+                    || version == BackendVersion::SEARCH_V9.0
+                    || version == BackendVersion::SEARCH_V10.0 =>
             {
                 (1..=3).contains(&self.output_kind) && self.literal_bytes == 0
             }

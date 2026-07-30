@@ -331,7 +331,7 @@ fn validate_image_shape(image: &NativeImage) -> Result<(), ElfObjectError> {
         version
             if matches!(
                 version,
-                BackendVersion::SEARCH_V8 | BackendVersion::SEARCH_V9
+                BackendVersion::SEARCH_V8 | BackendVersion::SEARCH_V9 | BackendVersion::SEARCH_V10
             ) =>
         {
             target.features == CpuFeatures::ASIMD

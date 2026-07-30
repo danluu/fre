@@ -1,9 +1,9 @@
 //! Source-first Linux `AArch64` exact-literal Search compilation.
 //!
 //! This vertical slice is deliberately parallel to the byte-stable macOS V8
-//! path. A sealed manifest explicitly selects Linux ASIMD V8, the ASIMD V9
-//! candidate, or the fixed-VL16 SVE2 tag21 candidate. Selection here stamps an
-//! inert compiler artifact only: candidate profiles remain inert and this
+//! path. A sealed manifest explicitly selects Linux ASIMD V8, an ASIMD V9/V10
+//! candidate, or the fixed-VL16 SVE2 tag21 candidate. Selection here stamps
+//! an inert compiler artifact only: candidate profiles remain inert and this
 //! module neither changes automatic routing nor grants qualification/runtime
 //! authority.
 
@@ -132,6 +132,7 @@ pub enum LinuxAarch64SearchBackendV1 {
     #[default]
     AsimdV8,
     AsimdV9,
+    AsimdV10,
     Sve2Fixed16Tag21Vl16,
 }
 
@@ -141,6 +142,7 @@ impl LinuxAarch64SearchBackendV1 {
         match self {
             Self::AsimdV8 => SearchBackendPolicy::AsimdV8,
             Self::AsimdV9 => SearchBackendPolicy::AsimdV9,
+            Self::AsimdV10 => SearchBackendPolicy::AsimdV10,
             Self::Sve2Fixed16Tag21Vl16 => SearchBackendPolicy::Sve2Fixed16V2,
         }
     }
@@ -153,7 +155,7 @@ impl LinuxAarch64SearchBackendV1 {
     #[must_use]
     pub const fn required_features(self) -> CpuFeatures {
         match self {
-            Self::AsimdV8 | Self::AsimdV9 => CpuFeatures::ASIMD,
+            Self::AsimdV8 | Self::AsimdV9 | Self::AsimdV10 => CpuFeatures::ASIMD,
             Self::Sve2Fixed16Tag21Vl16 => CpuFeatures::ASIMD_SVE2,
         }
     }
@@ -161,7 +163,7 @@ impl LinuxAarch64SearchBackendV1 {
     #[must_use]
     pub const fn fixed_active_vector_bytes(self) -> u16 {
         match self {
-            Self::AsimdV8 | Self::AsimdV9 => 0,
+            Self::AsimdV8 | Self::AsimdV9 | Self::AsimdV10 => 0,
             Self::Sve2Fixed16Tag21Vl16 => 16,
         }
     }
@@ -170,6 +172,7 @@ impl LinuxAarch64SearchBackendV1 {
         match self {
             Self::AsimdV8 => 1,
             Self::AsimdV9 => 3,
+            Self::AsimdV10 => 4,
             Self::Sve2Fixed16Tag21Vl16 => 2,
         }
     }
@@ -275,6 +278,14 @@ impl<O: Operation> LinuxAarch64ExactSearchManifestV1<O> {
         policy: LinuxAarch64SearchCompilePolicyV1,
     ) -> Result<Self, LinuxSearchManifestErrorV1> {
         Self::new(policy, LinuxAarch64SearchBackendV1::AsimdV9)
+    }
+
+    /// Explicit ASIMD V10 candidate constructor. No automatic/default call
+    /// reaches this profile.
+    pub fn v10_candidate(
+        policy: LinuxAarch64SearchCompilePolicyV1,
+    ) -> Result<Self, LinuxSearchManifestErrorV1> {
+        Self::new(policy, LinuxAarch64SearchBackendV1::AsimdV10)
     }
 
     #[must_use]
@@ -1288,9 +1299,9 @@ fn authenticate_audited_image<O: Operation>(
 
 const fn target_for_backend(backend: LinuxAarch64SearchBackendV1) -> TargetSpec {
     match backend {
-        LinuxAarch64SearchBackendV1::AsimdV8 | LinuxAarch64SearchBackendV1::AsimdV9 => {
-            TargetSpec::AARCH64_AAPCS64
-        }
+        LinuxAarch64SearchBackendV1::AsimdV8
+        | LinuxAarch64SearchBackendV1::AsimdV9
+        | LinuxAarch64SearchBackendV1::AsimdV10 => TargetSpec::AARCH64_AAPCS64,
         LinuxAarch64SearchBackendV1::Sve2Fixed16Tag21Vl16 => TargetSpec::AARCH64_AAPCS64_SVE2_16,
     }
 }
@@ -1372,6 +1383,7 @@ fn decode_backend_profile(
     for backend in [
         LinuxAarch64SearchBackendV1::AsimdV8,
         LinuxAarch64SearchBackendV1::AsimdV9,
+        LinuxAarch64SearchBackendV1::AsimdV10,
         LinuxAarch64SearchBackendV1::Sve2Fixed16Tag21Vl16,
     ] {
         if tag == backend.tag()
@@ -1603,6 +1615,79 @@ mod tests {
         assert_eq!(
             claim.backend_version(),
             fre_aot_search_contract::SEARCH_BACKEND_ASIMD_TAG22_V1
+        );
+        assert!(expectation.authenticates_claim(&claim));
+    }
+
+    #[test]
+    fn explicit_v10_is_deterministic_static_and_identity_disjoint_from_v8_v9() {
+        let v8_manifest = LinuxAarch64ExactSearchManifestV1::<Span>::default();
+        let v9_manifest = LinuxAarch64ExactSearchManifestV1::<Span>::v9_candidate(
+            LinuxAarch64SearchCompilePolicyV1::default(),
+        )
+        .expect("V9 candidate manifest");
+        let v10_manifest = LinuxAarch64ExactSearchManifestV1::<Span>::v10_candidate(
+            LinuxAarch64SearchCompilePolicyV1::default(),
+        )
+        .expect("V10 candidate manifest");
+        let source = b"needle".to_vec();
+        let v8 = plan_and_compile_linux_aarch64_exact_search_v1(
+            v8_manifest,
+            source.clone(),
+            RustProfile::default(),
+        )
+        .expect("Linux V8 object");
+        let v9 = plan_and_compile_linux_aarch64_exact_search_v1(
+            v9_manifest,
+            source.clone(),
+            RustProfile::default(),
+        )
+        .expect("Linux V9 object");
+        let first = plan_and_compile_linux_aarch64_exact_search_v1(
+            v10_manifest,
+            source.clone(),
+            RustProfile::default(),
+        )
+        .expect("first Linux V10 object");
+        let second = plan_and_compile_linux_aarch64_exact_search_v1(
+            v10_manifest,
+            source,
+            RustProfile::default(),
+        )
+        .expect("second Linux V10 object");
+        assert_eq!(
+            first.receipt().backend(),
+            LinuxAarch64SearchBackendV1::AsimdV10
+        );
+        assert_eq!(
+            first.receipt().metadata().backend_version(),
+            BackendVersion::SEARCH_V10.0
+        );
+        assert_ne!(
+            v8.receipt().manifest_identity(),
+            first.receipt().manifest_identity()
+        );
+        assert_ne!(
+            v9.receipt().manifest_identity(),
+            first.receipt().manifest_identity()
+        );
+        assert_ne!(
+            v8.receipt().artifact_identity(),
+            first.receipt().artifact_identity()
+        );
+        assert_ne!(
+            v9.receipt().artifact_identity(),
+            first.receipt().artifact_identity()
+        );
+        assert_eq!(first.object().as_bytes(), second.object().as_bytes());
+        assert_eq!(first.receipt(), second.receipt());
+        let expectation = crate::build_linux_static_search_span_expectation_v1(&first)
+            .expect("Linux V10 neutral expectation");
+        let claim = inspect_static_search_span_expectation_v1(expectation.as_bytes())
+            .expect("Linux V10 expectation inspection");
+        assert_eq!(
+            claim.backend_version(),
+            fre_aot_search_contract::SEARCH_BACKEND_ASIMD_TAG23_V1
         );
         assert!(expectation.authenticates_claim(&claim));
     }

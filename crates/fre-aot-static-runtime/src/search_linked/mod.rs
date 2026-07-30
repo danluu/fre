@@ -11,9 +11,10 @@ use std::{
 };
 
 use fre_aot_search_contract::{
-    ClaimedSearchMetadataV1, SEARCH_BACKEND_ASIMD_TAG22_V1, SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1,
-    SEARCH_BACKEND_VERSION_V1, SEARCH_METADATA_BYTES_V1, SEARCH_PLATFORM_LINUX_V1,
-    SEARCH_PLATFORM_MACOS_V1, STATIC_SEARCH_SPAN_EXPECTATION_BYTES_V1, inspect_search_metadata_v1,
+    ClaimedSearchMetadataV1, SEARCH_BACKEND_ASIMD_TAG22_V1, SEARCH_BACKEND_ASIMD_TAG23_V1,
+    SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1, SEARCH_BACKEND_VERSION_V1, SEARCH_METADATA_BYTES_V1,
+    SEARCH_PLATFORM_LINUX_V1, SEARCH_PLATFORM_MACOS_V1, STATIC_SEARCH_SPAN_EXPECTATION_BYTES_V1,
+    inspect_search_metadata_v1,
 };
 use fre_jit_aarch64::{EmitLimits, SearchBackendPolicy, TargetSpec, emit_audited_with_backend};
 use fre_kernel_ir::{
@@ -1466,6 +1467,7 @@ pub(super) fn require_semantic_payload_reconstruction_v1(
     let policy = match metadata.backend_version() {
         SEARCH_BACKEND_VERSION_V1 => SearchBackendPolicy::AsimdV8,
         SEARCH_BACKEND_ASIMD_TAG22_V1 => SearchBackendPolicy::AsimdV9,
+        SEARCH_BACKEND_ASIMD_TAG23_V1 => SearchBackendPolicy::AsimdV10,
         SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1 => SearchBackendPolicy::Sve2Fixed16V2,
         _ => return Err(StaticSearchSpanVerifyErrorV1::SemanticPayloadReconstruction),
     };
@@ -1789,13 +1791,23 @@ mod tests {
         literal: Vec<u8>,
     }
 
-    fn macos_family_compiler_fixture(literal: &[u8]) -> FamilyCompilerFixture {
+    fn macos_family_compiler_fixture_with_backend(
+        literal: &[u8],
+        v10: bool,
+    ) -> FamilyCompilerFixture {
         let mut profile = RustProfile::default();
         profile.options.unicode = false;
-        let manifest = MacosAarch64ExactSearchManifestV1::<Span>::v9_candidate(
-            SearchCompilePolicyV1::default(),
-        )
-        .expect("macOS V9 manifest");
+        let manifest = if v10 {
+            MacosAarch64ExactSearchManifestV1::<Span>::v10_candidate(
+                SearchCompilePolicyV1::default(),
+            )
+            .expect("macOS V10 manifest")
+        } else {
+            MacosAarch64ExactSearchManifestV1::<Span>::v9_candidate(
+                SearchCompilePolicyV1::default(),
+            )
+            .expect("macOS V9 manifest")
+        };
         let compiled =
             plan_and_compile_macos_aarch64_exact_search_v1(manifest, literal.to_vec(), profile)
                 .expect("macOS family compiler fixture");
@@ -1823,13 +1835,27 @@ mod tests {
         }
     }
 
-    fn linux_family_compiler_fixture(literal: &[u8]) -> FamilyCompilerFixture {
+    fn macos_family_compiler_fixture(literal: &[u8]) -> FamilyCompilerFixture {
+        macos_family_compiler_fixture_with_backend(literal, false)
+    }
+
+    fn linux_family_compiler_fixture_with_backend(
+        literal: &[u8],
+        v10: bool,
+    ) -> FamilyCompilerFixture {
         let mut profile = RustProfile::default();
         profile.options.unicode = false;
-        let manifest = LinuxAarch64ExactSearchManifestV1::<Span>::v9_candidate(
-            LinuxAarch64SearchCompilePolicyV1::default(),
-        )
-        .expect("Linux V9 manifest");
+        let manifest = if v10 {
+            LinuxAarch64ExactSearchManifestV1::<Span>::v10_candidate(
+                LinuxAarch64SearchCompilePolicyV1::default(),
+            )
+            .expect("Linux V10 manifest")
+        } else {
+            LinuxAarch64ExactSearchManifestV1::<Span>::v9_candidate(
+                LinuxAarch64SearchCompilePolicyV1::default(),
+            )
+            .expect("Linux V9 manifest")
+        };
         let compiled =
             plan_and_compile_linux_aarch64_exact_search_v1(manifest, literal.to_vec(), profile)
                 .expect("Linux family compiler fixture");
@@ -1857,6 +1883,10 @@ mod tests {
             payload,
             literal: literal.to_vec(),
         }
+    }
+
+    fn linux_family_compiler_fixture(literal: &[u8]) -> FamilyCompilerFixture {
+        linux_family_compiler_fixture_with_backend(literal, false)
     }
 
     fn assert_family_payload_mutations_refused(fixture: &FamilyCompilerFixture) {
@@ -1911,10 +1941,12 @@ mod tests {
     }
 
     #[test]
-    fn broad_family_reconstructs_and_binds_literals_on_both_object_platforms() {
+    fn broad_v9_and_v10_families_reconstruct_and_bind_literals_on_both_object_platforms() {
         for fixture in [
             macos_family_compiler_fixture(b"mac-family-lit16"),
             linux_family_compiler_fixture(b"lin-family-lit16"),
+            macos_family_compiler_fixture_with_backend(b"mac-v10-family16", true),
+            linux_family_compiler_fixture_with_backend(b"lin-v10-family16", true),
         ] {
             assert_family_payload_mutations_refused(&fixture);
             let handle = VerifiedStaticSearchSpanV1 {

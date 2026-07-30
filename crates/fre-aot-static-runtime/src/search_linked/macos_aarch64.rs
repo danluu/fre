@@ -1,8 +1,8 @@
 use core::{mem, ptr, slice};
 
 use fre_aot_search_contract::{
-    SEARCH_BACKEND_ASIMD_TAG22_V1, SEARCH_BACKEND_VERSION_V1, SEARCH_METADATA_BYTES_V1,
-    SEARCH_PLATFORM_MACOS_V1, SEARCH_REQUIRED_ASIMD_FEATURES_V1,
+    SEARCH_BACKEND_ASIMD_TAG22_V1, SEARCH_BACKEND_ASIMD_TAG23_V1, SEARCH_BACKEND_VERSION_V1,
+    SEARCH_METADATA_BYTES_V1, SEARCH_PLATFORM_MACOS_V1, SEARCH_REQUIRED_ASIMD_FEATURES_V1,
     STATIC_SEARCH_SPAN_EXPECTATION_BYTES_V1,
 };
 use fre_kernel_ir::SearchWindow;
@@ -181,7 +181,9 @@ fn require_mapped_metadata_correlations(
     require_search_span_v1(
         matches!(
             actual.backend_version(),
-            SEARCH_BACKEND_VERSION_V1 | SEARCH_BACKEND_ASIMD_TAG22_V1
+            SEARCH_BACKEND_VERSION_V1
+                | SEARCH_BACKEND_ASIMD_TAG22_V1
+                | SEARCH_BACKEND_ASIMD_TAG23_V1
         ) && actual.platform() == SEARCH_PLATFORM_MACOS_V1
             && actual.features() == SEARCH_REQUIRED_ASIMD_FEATURES_V1,
         StaticSearchSpanContractFieldV1::Metadata,
