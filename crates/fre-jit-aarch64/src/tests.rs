@@ -4565,6 +4565,7 @@ fn explicit_search_backend_policy_selects_distinct_artifact_identities() {
         (SearchBackendPolicy::AsimdV21, BackendVersion::SEARCH_V21),
         (SearchBackendPolicy::AsimdV22, BackendVersion::SEARCH_V22),
         (SearchBackendPolicy::AsimdV23, BackendVersion::SEARCH_V23),
+        (SearchBackendPolicy::AsimdV24, BackendVersion::SEARCH_V24),
         (SearchBackendPolicy::Sve16, BackendVersion::SEARCH_SVE16_V1),
         (
             SearchBackendPolicy::Sve2Fixed16,
@@ -11357,6 +11358,46 @@ fn v23_cfg_reaches(
     false
 }
 
+fn v24_sixth_static_start(decoded: &[DecodedInstruction], sixth_offset: u16) -> usize {
+    decoded
+        .windows(2)
+        .position(|window| {
+            window
+                == [
+                    DecodedInstruction::LoadByte {
+                        destination: 10,
+                        base: 8,
+                        offset: sixth_offset,
+                    },
+                    DecodedInstruction::DuplicateByte16 {
+                        destination: 24,
+                        source: 10,
+                    },
+                ]
+        })
+        .expect("V24 lazy sixth-static literal broadcast")
+}
+
+fn v24_writes_vector(instruction: DecodedInstruction, register: u8) -> bool {
+    match instruction {
+        DecodedInstruction::LoadVector128 { destination, .. }
+        | DecodedInstruction::DuplicateByte16 { destination, .. }
+        | DecodedInstruction::CompareEqualBytes16 { destination, .. }
+        | DecodedInstruction::AndBytes16 { destination, .. }
+        | DecodedInstruction::ShiftRightNarrowHalfwordsToBytes8 { destination, .. }
+        | DecodedInstruction::UnsignedMinBytes16 { destination, .. }
+        | DecodedInstruction::UnsignedMaxBytes16 { destination, .. }
+        | DecodedInstruction::UnsignedMaxPairwiseBytes16 { destination, .. }
+        | DecodedInstruction::AddAcrossBytes16 { destination, .. } => destination == register,
+        DecodedInstruction::LoadVectorPair128 {
+            first_destination,
+            second_destination,
+            ..
+        } => first_destination == register || second_destination == register,
+        _ => false,
+    }
+}
+
 #[test]
 fn v23_policy_version_wire_and_output_contracts_are_explicit() {
     for width in 1_usize..6 {
@@ -12309,6 +12350,1130 @@ fn v23_every_width_primary_offset_and_window_shape_matches_the_kir_oracle() {
 #[test]
 #[allow(
     clippy::too_many_lines,
+    reason = "the all-width V24 decoded proof keeps sixth selection, five-column dominance, empty routing, and Q24 overwrite liveness adjacent"
+)]
+fn v24_policy_wire_sixth_selection_cfg_and_q24_liveness_are_explicit() {
+    for width in 1_usize..6 {
+        let literal = vec![b'x'; width];
+        let program = build_exact_literal::<Span>(
+            &literal,
+            AnchorFlags::default(),
+            ValidateLimits::default(),
+        )
+        .expect("valid exact literal below the V24 envelope");
+        assert_eq!(
+            emit_with_backend(
+                &program,
+                SearchBackendPolicy::AsimdV24,
+                EmitLimits::default(),
+            ),
+            Err(EmitError::Unsupported {
+                reason: UnsupportedReason::KernelShape,
+            }),
+            "width={width}"
+        );
+    }
+    assert_eq!(
+        SearchBackendPolicy::AsimdV24.backend_version(),
+        BackendVersion::SEARCH_V24
+    );
+
+    let mut cases = 0_u64;
+    for width in 6_usize..=MAX_REPEATED_CONFIRM_BYTES {
+        for zero_primary in [true, false] {
+            let literal = v23_pointer_test_literal(width, zero_primary);
+            let program = build_exact_literal::<Span>(
+                &literal,
+                AnchorFlags::default(),
+                ValidateLimits::default(),
+            )
+            .expect("V24 structural IR");
+            let v23 = emit_with_backend(
+                &program,
+                SearchBackendPolicy::AsimdV23,
+                EmitLimits::default(),
+            )
+            .expect("frozen V23 structural image");
+            let v24 = emit_with_backend(
+                &program,
+                SearchBackendPolicy::AsimdV24,
+                EmitLimits::default(),
+            )
+            .expect("V24 structural image");
+            let report = audit(&v24).expect("independent V24 template");
+            assert_eq!(
+                (report.decode_passes, report.source_identity_rebuilds),
+                (1, 1)
+            );
+            assert_eq!(v24.backend_version(), BackendVersion::SEARCH_V24);
+            assert!(v24.code().len() <= 3_072, "width={width}");
+            assert_eq!(
+                &v24.to_aot(AotLimits::default())
+                    .expect("bounded V24 AOT")
+                    .as_bytes()[..8],
+                b"FREA64\0\x25"
+            );
+            assert_ne!(v24.artifact_identity(), v23.artifact_identity());
+
+            let manifest = v24.search_manifest().expect("V24 structural manifest");
+            let prior = v23.search_manifest().expect("V23 structural manifest");
+            assert_eq!(
+                (
+                    manifest.primary_offset,
+                    manifest.secondary_offset,
+                    manifest.verification_offset,
+                    manifest.quaternary_offset,
+                    manifest.quinary_offset,
+                ),
+                (
+                    prior.primary_offset,
+                    prior.secondary_offset,
+                    prior.verification_offset,
+                    prior.quaternary_offset,
+                    prior.quinary_offset,
+                ),
+                "V24 changes no manifest field width={width} zero_primary={zero_primary}"
+            );
+            let sixth =
+                crate::search_template::independent_sixth_static_offset_v24(&literal, manifest)
+                    .expect("one remaining V24 offset");
+            assert!(usize::from(sixth) < width);
+            assert!(
+                ![
+                    manifest.primary_offset,
+                    manifest.secondary_offset,
+                    manifest.verification_offset,
+                    manifest.quaternary_offset,
+                    manifest.quinary_offset,
+                ]
+                .contains(&sixth),
+                "sixth offset is distinct width={width} zero_primary={zero_primary}"
+            );
+
+            let decoded = decode(v24.code()).expect("V24 structural decode");
+            let sixth_start = v24_sixth_static_start(&decoded, sixth);
+            assert!(
+                decoded[..sixth_start]
+                    .iter()
+                    .all(|&instruction| !v24_writes_vector(instruction, 24)),
+                "Q24 is dead before lazy sixth entry width={width} zero_primary={zero_primary}"
+            );
+            let delta = sixth.abs_diff(manifest.primary_offset);
+            assert_eq!(
+                decoded[sixth_start + 2],
+                if sixth > manifest.primary_offset {
+                    DecodedInstruction::AddImmediate64 {
+                        destination: 10,
+                        source: 15,
+                        immediate: delta,
+                    }
+                } else {
+                    DecodedInstruction::SubtractImmediate64 {
+                        destination: 10,
+                        source: 15,
+                        immediate: delta,
+                    }
+                },
+                "sixth column address width={width} zero_primary={zero_primary}"
+            );
+            assert_eq!(
+                &decoded[sixth_start + 3..sixth_start + 13],
+                &[
+                    DecodedInstruction::LoadVectorPair128 {
+                        first_destination: 18,
+                        second_destination: 19,
+                        base: 10,
+                        offset: 0,
+                    },
+                    DecodedInstruction::LoadVectorPair128 {
+                        first_destination: 20,
+                        second_destination: 21,
+                        base: 10,
+                        offset: 32,
+                    },
+                    DecodedInstruction::CompareEqualBytes16 {
+                        destination: 18,
+                        left: 18,
+                        right: 24,
+                    },
+                    DecodedInstruction::AndBytes16 {
+                        destination: 0,
+                        left: 0,
+                        right: 18,
+                    },
+                    DecodedInstruction::CompareEqualBytes16 {
+                        destination: 19,
+                        left: 19,
+                        right: 24,
+                    },
+                    DecodedInstruction::AndBytes16 {
+                        destination: 2,
+                        left: 2,
+                        right: 19,
+                    },
+                    DecodedInstruction::CompareEqualBytes16 {
+                        destination: 20,
+                        left: 20,
+                        right: 24,
+                    },
+                    DecodedInstruction::AndBytes16 {
+                        destination: 4,
+                        left: 4,
+                        right: 20,
+                    },
+                    DecodedInstruction::CompareEqualBytes16 {
+                        destination: 21,
+                        left: 21,
+                        right: 24,
+                    },
+                    DecodedInstruction::AndBytes16 {
+                        destination: 6,
+                        left: 6,
+                        right: 21,
+                    },
+                ],
+                "exact sixth static algebra width={width} zero_primary={zero_primary}"
+            );
+
+            let fifth_empty = decoded[..sixth_start]
+                .iter()
+                .rposition(|instruction| {
+                    matches!(
+                        instruction,
+                        DecodedInstruction::CompareBranchZero64 {
+                            register: 10,
+                            nonzero: false,
+                            ..
+                        }
+                    )
+                })
+                .expect("five-column empty branch");
+            assert_eq!(
+                fifth_empty + 1,
+                sixth_start,
+                "sixth load is the fallthrough after five-column survival"
+            );
+            let sixth_empty = decoded[sixth_start + 13..]
+                .iter()
+                .position(|instruction| {
+                    matches!(
+                        instruction,
+                        DecodedInstruction::CompareBranchZero64 {
+                            register: 10,
+                            nonzero: false,
+                            ..
+                        }
+                    )
+                })
+                .map(|offset| sixth_start + 13 + offset)
+                .expect("sixth-empty branch");
+            assert_eq!(
+                v23_direct_target(fifth_empty, decoded[fifth_empty]),
+                v23_direct_target(sixth_empty, decoded[sixth_empty]),
+                "five-empty and sixth-empty share V23 wide advance"
+            );
+            let learn_edge = sixth_empty + 1;
+            assert!(matches!(
+                decoded[learn_edge],
+                DecodedInstruction::Branch { .. }
+            ));
+            let learn_select = v23_direct_target(learn_edge, decoded[learn_edge])
+                .expect("V24 branch to unchanged wide_learn_select");
+            assert_eq!(
+                &decoded[learn_select..learn_select + 2],
+                &[
+                    DecodedInstruction::MoveRegister64 {
+                        destination: 7,
+                        source: 5,
+                    },
+                    DecodedInstruction::MoveZero64 {
+                        destination: 13,
+                        immediate: 0,
+                        shift: 0,
+                    },
+                ]
+            );
+
+            let learned_overwrite = decoded[learn_select..]
+                .iter()
+                .position(|instruction| {
+                    *instruction
+                        == DecodedInstruction::DuplicateByte16 {
+                            destination: 24,
+                            source: 13,
+                        }
+                })
+                .map(|offset| learn_select + offset)
+                .expect("V24 learned Q24 overwrite");
+            assert!(
+                decoded[sixth_start + 2..learned_overwrite]
+                    .iter()
+                    .all(|&instruction| !v24_writes_vector(instruction, 24)),
+                "only the sixth broadcast owns Q24 before learned overwrite"
+            );
+            let learned_consumer = decoded[learned_overwrite + 1..]
+                .iter()
+                .position(|instruction| {
+                    matches!(
+                        instruction,
+                        DecodedInstruction::CompareEqualBytes16 { right: 24, .. }
+                    )
+                })
+                .map(|offset| learned_overwrite + 1 + offset)
+                .expect("V24 learned Q24 consumer");
+            assert!(
+                !v23_cfg_reaches(
+                    &decoded,
+                    learn_select,
+                    learned_consumer,
+                    Some(learned_overwrite),
+                ),
+                "learned Q24 overwrite dominates learned consumers"
+            );
+            cases = cases.checked_add(1).expect("bounded V24 cases");
+        }
+    }
+    assert_eq!(cases, 54);
+}
+
+#[test]
+fn v24_all_search_output_contracts_emit_audit_and_serialize() {
+    let literal = v23_pointer_test_literal(13, false);
+    let exists =
+        build_exact_literal::<Exists>(&literal, AnchorFlags::default(), ValidateLimits::default())
+            .expect("V24 Exists IR");
+    let selected_end = build_exact_literal::<SelectedEnd>(
+        &literal,
+        AnchorFlags::default(),
+        ValidateLimits::default(),
+    )
+    .expect("V24 SelectedEnd IR");
+    let span =
+        build_exact_literal::<Span>(&literal, AnchorFlags::default(), ValidateLimits::default())
+            .expect("V24 Span IR");
+    for (output, image) in [
+        (
+            OutputKind::Exists,
+            emit_with_backend(
+                &exists,
+                SearchBackendPolicy::AsimdV24,
+                EmitLimits::default(),
+            )
+            .expect("V24 Exists image"),
+        ),
+        (
+            OutputKind::SelectedEnd,
+            emit_with_backend(
+                &selected_end,
+                SearchBackendPolicy::AsimdV24,
+                EmitLimits::default(),
+            )
+            .expect("V24 SelectedEnd image"),
+        ),
+        (
+            OutputKind::Span,
+            emit_with_backend(&span, SearchBackendPolicy::AsimdV24, EmitLimits::default())
+                .expect("V24 Span image"),
+        ),
+    ] {
+        assert_eq!(image.backend_version(), BackendVersion::SEARCH_V24);
+        assert_eq!(image.output(), output);
+        audit(&image).expect("whole-template V24 output audit");
+        assert!(image.code().len() <= 3_072);
+        assert_eq!(
+            &image
+                .to_aot(AotLimits::default())
+                .expect("bounded V24 output AOT")
+                .as_bytes()[..8],
+            b"FREA64\0\x25"
+        );
+    }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the V24 mutation gate authenticates every new sixth-static operand and edge at one reviewable site"
+)]
+fn v24_rejects_resealed_sixth_load_address_broadcast_filter_and_branch_mutations() {
+    let literal = v23_pointer_test_literal(13, false);
+    let program =
+        build_exact_literal::<Span>(&literal, AnchorFlags::default(), ValidateLimits::default())
+            .expect("V24 mutation IR");
+    let image = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV24,
+        EmitLimits::default(),
+    )
+    .expect("V24 mutation image");
+    let manifest = image.search_manifest().expect("V24 mutation manifest");
+    let sixth = crate::search_template::independent_sixth_static_offset_v24(&literal, manifest)
+        .expect("V24 mutation sixth offset");
+    let decoded = decode(image.code()).expect("V24 mutation decode");
+    let start = v24_sixth_static_start(&decoded, sixth);
+    let sixth_empty = decoded[start + 13..]
+        .iter()
+        .position(|instruction| {
+            matches!(
+                instruction,
+                DecodedInstruction::CompareBranchZero64 {
+                    register: 10,
+                    nonzero: false,
+                    ..
+                }
+            )
+        })
+        .map(|offset| start + 13 + offset)
+        .expect("V24 mutation sixth-empty branch");
+
+    let mut wrong_literal_offset = image.clone();
+    replace_test_decoded_at(
+        &mut wrong_literal_offset,
+        start,
+        DecodedInstruction::LoadByte {
+            destination: 10,
+            base: 8,
+            offset: (sixth + 1) % 13,
+        },
+    );
+    assert_resealed_search_rejected(
+        wrong_literal_offset,
+        "V24 sixth literal load offset substitution",
+    );
+
+    let mut wrong_address = image.clone();
+    replace_test_decoded_at(
+        &mut wrong_address,
+        start + 2,
+        match decoded[start + 2] {
+            DecodedInstruction::AddImmediate64 {
+                destination,
+                source,
+                immediate,
+            } => DecodedInstruction::AddImmediate64 {
+                destination,
+                source,
+                immediate: immediate + 1,
+            },
+            DecodedInstruction::SubtractImmediate64 {
+                destination,
+                source,
+                immediate,
+            } => DecodedInstruction::SubtractImmediate64 {
+                destination,
+                source,
+                immediate: immediate + 1,
+            },
+            instruction => panic!("unexpected V24 sixth address: {instruction:?}"),
+        },
+    );
+    assert_resealed_search_rejected(wrong_address, "V24 sixth column address substitution");
+
+    let mut wrong_broadcast = image.clone();
+    replace_test_decoded_at(
+        &mut wrong_broadcast,
+        start + 1,
+        DecodedInstruction::DuplicateByte16 {
+            destination: 22,
+            source: 10,
+        },
+    );
+    assert_resealed_search_rejected(wrong_broadcast, "V24 sixth Q24 broadcast substitution");
+
+    let mut wrong_pair_base = image.clone();
+    replace_test_decoded_at(
+        &mut wrong_pair_base,
+        start + 3,
+        DecodedInstruction::LoadVectorPair128 {
+            first_destination: 18,
+            second_destination: 19,
+            base: 11,
+            offset: 0,
+        },
+    );
+    assert_resealed_search_rejected(wrong_pair_base, "V24 sixth column pair-load base");
+
+    for index in [start + 5, start + 7, start + 9, start + 11] {
+        let DecodedInstruction::CompareEqualBytes16 {
+            destination,
+            left,
+            right: 24,
+        } = decoded[index]
+        else {
+            panic!("unexpected V24 sixth comparison at {index}");
+        };
+        let mut wrong_comparison = image.clone();
+        replace_test_decoded_at(
+            &mut wrong_comparison,
+            index,
+            DecodedInstruction::CompareEqualBytes16 {
+                destination,
+                left,
+                right: 23,
+            },
+        );
+        assert_resealed_search_rejected(
+            wrong_comparison,
+            &format!("V24 sixth comparison substitution at {index}"),
+        );
+    }
+    for index in [start + 6, start + 8, start + 10, start + 12] {
+        let DecodedInstruction::AndBytes16 {
+            destination,
+            left,
+            right,
+        } = decoded[index]
+        else {
+            panic!("unexpected V24 sixth intersection at {index}");
+        };
+        let mut wrong_intersection = image.clone();
+        replace_test_decoded_at(
+            &mut wrong_intersection,
+            index,
+            DecodedInstruction::AndBytes16 {
+                destination,
+                left,
+                right: if right == 17 { 18 } else { 17 },
+            },
+        );
+        assert_resealed_search_rejected(
+            wrong_intersection,
+            &format!("V24 sixth intersection substitution at {index}"),
+        );
+    }
+
+    let DecodedInstruction::CompareBranchZero64 {
+        register,
+        nonzero,
+        displacement,
+    } = decoded[sixth_empty]
+    else {
+        panic!("unexpected V24 sixth-empty edge");
+    };
+    let mut inverted_empty = image.clone();
+    replace_test_decoded_at(
+        &mut inverted_empty,
+        sixth_empty,
+        DecodedInstruction::CompareBranchZero64 {
+            register,
+            nonzero: !nonzero,
+            displacement,
+        },
+    );
+    assert_resealed_search_rejected(inverted_empty, "V24 sixth-empty branch inversion");
+
+    let v23 = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV23,
+        EmitLimits::default(),
+    )
+    .expect("frozen V23 relabel image");
+    let mut v24_as_v23 = image;
+    v24_as_v23.backend_version = BackendVersion::SEARCH_V23;
+    v24_as_v23
+        .search
+        .as_mut()
+        .expect("V24 relabel manifest")
+        .backend_version = BackendVersion::SEARCH_V23;
+    assert_resealed_search_rejected(v24_as_v23, "V24 code resealed as V23");
+
+    let mut v23_as_v24 = v23;
+    v23_as_v24.backend_version = BackendVersion::SEARCH_V24;
+    v23_as_v24
+        .search
+        .as_mut()
+        .expect("V23 relabel manifest")
+        .backend_version = BackendVersion::SEARCH_V24;
+    assert_resealed_search_rejected(v23_as_v24, "V23 code resealed as V24");
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the V24 semantic matrix keeps every preregistered cold path in one auditable test"
+)]
+fn v24_sixth_empty_false_survivor_exact_narrow_tail_and_no_match_paths_are_exact() {
+    let mut comparisons = 0_u64;
+    for width in [6_usize, 13, 32] {
+        for zero_primary in [true, false] {
+            let literal = v23_pointer_test_literal(width, zero_primary);
+            let program = build_exact_literal::<Span>(
+                &literal,
+                AnchorFlags::default(),
+                ValidateLimits::default(),
+            )
+            .expect("V24 path semantic IR");
+            let image = emit_with_backend(
+                &program,
+                SearchBackendPolicy::AsimdV24,
+                EmitLimits::default(),
+            )
+            .expect("V24 path semantic image");
+            audit(&image).expect("V24 path semantic audit");
+            let manifest = image.search_manifest().expect("V24 path manifest");
+            let sixth = usize::from(
+                crate::search_template::independent_sixth_static_offset_v24(&literal, manifest)
+                    .expect("V24 path sixth offset"),
+            );
+            let selected = [
+                manifest.primary_offset,
+                manifest.secondary_offset,
+                manifest.verification_offset,
+                manifest.quaternary_offset,
+                manifest.quinary_offset,
+            ]
+            .map(usize::from);
+            let mut all_static = selected.to_vec();
+            all_static.push(sixth);
+            let avoid = (0_u16..=255)
+                .map(|value| u8::try_from(value).expect("bounded byte"))
+                .find(|byte| !literal.contains(byte))
+                .expect("V24 literal leaves an avoiding byte");
+            let window_start = 3_usize;
+            let wide_base = window_start + 1;
+            let post_three_wide = wide_base + 3 * 64;
+
+            // Three groups survive all five manifest columns but fail only at
+            // the new sixth column. A later exact group must still be found.
+            let exact = post_three_wide + 11;
+            let window_end = exact + width + 80;
+            let mut sixth_empty = vec![avoid; window_end + 17];
+            for group in 0..3_usize {
+                let candidate = wide_base + group * 64 + 5;
+                for &offset in &selected {
+                    sixth_empty[candidate + offset] = literal[offset];
+                }
+                assert_eq!(sixth_empty[candidate + sixth], avoid);
+            }
+            sixth_empty[exact..exact + width].copy_from_slice(&literal);
+            let expected = program
+                .execute(
+                    &sixth_empty,
+                    SearchWindow::new(window_start, window_end),
+                    ExecutionLimits::unlimited(),
+                )
+                .expect("V24 sixth-empty oracle")
+                .output()
+                .map(|span| (span.start(), span.end()));
+            assert_eq!(expected, Some((exact, exact + width)));
+            assert_eq!(
+                span_output(
+                    simulate(&image, &sixth_empty, window_start, window_end)
+                        .expect("V24 sixth-empty simulation")
+                ),
+                expected
+            );
+            comparisons += 1;
+
+            // Widths above six have a source offset outside all six static
+            // columns. Passing the sixth filter and missing there must enter
+            // the unchanged learned graph before a later exact group.
+            if let Some(mismatch) = (0..width).find(|offset| !all_static.contains(offset)) {
+                let false_candidate = wide_base + 7;
+                let mut false_survivor = vec![avoid; window_end + 17];
+                false_survivor[false_candidate..false_candidate + width].copy_from_slice(&literal);
+                false_survivor[false_candidate + mismatch] = avoid;
+                false_survivor[exact..exact + width].copy_from_slice(&literal);
+                let expected = program
+                    .execute(
+                        &false_survivor,
+                        SearchWindow::new(window_start, window_end),
+                        ExecutionLimits::unlimited(),
+                    )
+                    .expect("V24 sixth-survivor oracle")
+                    .output()
+                    .map(|span| (span.start(), span.end()));
+                assert_eq!(expected, Some((exact, exact + width)));
+                assert_eq!(
+                    span_output(
+                        simulate(&image, &false_survivor, window_start, window_end)
+                            .expect("V24 sixth-survivor simulation")
+                    ),
+                    expected
+                );
+                comparisons += 1;
+            }
+
+            for (kind, exact, last_candidate) in [
+                (
+                    "wide exact",
+                    Some(post_three_wide + 11),
+                    post_three_wide + 80,
+                ),
+                (
+                    "narrow exact",
+                    Some(post_three_wide + 7),
+                    post_three_wide + 20,
+                ),
+                ("tail exact", Some(post_three_wide + 7), post_three_wide + 7),
+                ("no match", None, post_three_wide + 7),
+            ] {
+                let window_end = last_candidate + width;
+                let mut haystack = vec![avoid; window_end + 17];
+                for group in 0..3_usize {
+                    let candidate = wide_base + group * 64 + 5;
+                    for &offset in &selected {
+                        haystack[candidate + offset] = literal[offset];
+                    }
+                }
+                if let Some(candidate) = exact {
+                    haystack[candidate..candidate + width].copy_from_slice(&literal);
+                }
+                let expected = program
+                    .execute(
+                        &haystack,
+                        SearchWindow::new(window_start, window_end),
+                        ExecutionLimits::unlimited(),
+                    )
+                    .expect("V24 exit oracle")
+                    .output()
+                    .map(|span| (span.start(), span.end()));
+                assert_eq!(
+                    span_output(
+                        simulate(&image, &haystack, window_start, window_end)
+                            .expect("V24 exit simulation")
+                    ),
+                    expected,
+                    "width={width} zero_primary={zero_primary} path={kind}"
+                );
+                assert_eq!(
+                    expected,
+                    exact.map(|candidate| (candidate, candidate + width))
+                );
+                comparisons += 1;
+            }
+        }
+    }
+    assert_eq!(comparisons, 3 * 2 * 5 + 2 * 2);
+}
+
+#[test]
+fn v24_learns_every_offset_outside_the_six_static_columns_for_every_width() {
+    let mut comparisons = 0_u64;
+    for width in 6_usize..=MAX_REPEATED_CONFIRM_BYTES {
+        for zero_primary in [true, false] {
+            let literal = v23_pointer_test_literal(width, zero_primary);
+            let program = build_exact_literal::<Span>(
+                &literal,
+                AnchorFlags::default(),
+                ValidateLimits::default(),
+            )
+            .expect("V24 every-mismatch IR");
+            let image = emit_with_backend(
+                &program,
+                SearchBackendPolicy::AsimdV24,
+                EmitLimits::default(),
+            )
+            .expect("V24 every-mismatch image");
+            audit(&image).expect("V24 every-mismatch audit");
+            let manifest = image
+                .search_manifest()
+                .expect("V24 every-mismatch manifest");
+            let sixth = usize::from(
+                crate::search_template::independent_sixth_static_offset_v24(&literal, manifest)
+                    .expect("V24 every-mismatch sixth"),
+            );
+            let mut selected = [
+                manifest.primary_offset,
+                manifest.secondary_offset,
+                manifest.verification_offset,
+                manifest.quaternary_offset,
+                manifest.quinary_offset,
+            ]
+            .map(usize::from)
+            .to_vec();
+            selected.push(sixth);
+            let avoid = (0_u16..=255)
+                .map(|value| u8::try_from(value).expect("bounded byte"))
+                .find(|byte| !literal.contains(byte))
+                .expect("V24 every-mismatch avoiding byte");
+            let window_start = 3_usize;
+            let false_candidate = window_start + 1 + 7;
+            let exact = window_start + 1 + 4 * 64 + 11;
+
+            for mismatch in (0..width).filter(|offset| !selected.contains(offset)) {
+                let mut haystack = vec![avoid; exact + width + 96];
+                haystack[false_candidate..false_candidate + width].copy_from_slice(&literal);
+                haystack[false_candidate + mismatch] = avoid;
+                haystack[exact..exact + width].copy_from_slice(&literal);
+                let expected = program
+                    .execute(
+                        &haystack,
+                        SearchWindow::new(window_start, haystack.len()),
+                        ExecutionLimits::unlimited(),
+                    )
+                    .expect("V24 every-mismatch oracle")
+                    .output()
+                    .map(|span| (span.start(), span.end()));
+                assert_eq!(expected, Some((exact, exact + width)));
+                assert_eq!(
+                    span_output(
+                        simulate(&image, &haystack, window_start, haystack.len())
+                            .expect("V24 every-mismatch simulation")
+                    ),
+                    expected,
+                    "width={width} zero_primary={zero_primary} mismatch={mismatch}"
+                );
+                comparisons += 1;
+            }
+        }
+    }
+    assert_eq!(comparisons, 2 * (513 - 27 * 6));
+}
+
+#[test]
+fn v24_third_policy_scan_is_precharged_and_total_work_is_exact() {
+    let literal = v23_pointer_test_literal(MAX_REPEATED_CONFIRM_BYTES, false);
+    let program =
+        build_exact_literal::<Span>(&literal, AnchorFlags::default(), ValidateLimits::default())
+            .expect("V24 work IR");
+    let policy_work = u64::try_from(literal.len())
+        .expect("bounded V24 width")
+        .checked_mul(3)
+        .expect("three bounded policy scans");
+    let one_less = policy_work.checked_sub(1).expect("nonzero V24 policy work");
+    assert_eq!(
+        emit_with_backend(
+            &program,
+            SearchBackendPolicy::AsimdV24,
+            EmitLimits {
+                max_data_bytes: 0,
+                max_emission_work: one_less,
+                ..EmitLimits::default()
+            },
+        ),
+        Err(EmitError::ResourceLimit {
+            resource: ResourceKind::EmissionWork,
+            limit: one_less,
+            required: policy_work,
+        }),
+        "the complete third scan is admitted before any sixth-offset work"
+    );
+
+    let image = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV24,
+        EmitLimits::default(),
+    )
+    .expect("V24 work image");
+    let exact_work = image.stats().emission_work;
+    emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV24,
+        EmitLimits {
+            max_emission_work: exact_work,
+            ..EmitLimits::default()
+        },
+    )
+    .expect("exact V24 work receipt succeeds");
+    assert_eq!(
+        emit_with_backend(
+            &program,
+            SearchBackendPolicy::AsimdV24,
+            EmitLimits {
+                max_emission_work: exact_work - 1,
+                ..EmitLimits::default()
+            },
+        ),
+        Err(EmitError::ResourceLimit {
+            resource: ResourceKind::EmissionWork,
+            limit: exact_work - 1,
+            required: exact_work,
+        })
+    );
+}
+
+#[test]
+fn v24_sixth_empty_wide_to_narrow_and_tail_cover_every_modulo_16_boundary() {
+    let mut comparisons = 0_u64;
+    for width in [6_usize, 13, 32] {
+        for zero_primary in [true, false] {
+            let literal = v23_pointer_test_literal(width, zero_primary);
+            let program = build_exact_literal::<Span>(
+                &literal,
+                AnchorFlags::default(),
+                ValidateLimits::default(),
+            )
+            .expect("V24 boundary IR");
+            let image = emit_with_backend(
+                &program,
+                SearchBackendPolicy::AsimdV24,
+                EmitLimits::default(),
+            )
+            .expect("V24 boundary image");
+            let manifest = image.search_manifest().expect("V24 boundary manifest");
+            let sixth = usize::from(
+                crate::search_template::independent_sixth_static_offset_v24(&literal, manifest)
+                    .expect("V24 boundary sixth"),
+            );
+            let selected = [
+                manifest.primary_offset,
+                manifest.secondary_offset,
+                manifest.verification_offset,
+                manifest.quaternary_offset,
+                manifest.quinary_offset,
+            ]
+            .map(usize::from);
+            let avoid = (0_u16..=255)
+                .map(|value| u8::try_from(value).expect("bounded byte"))
+                .find(|byte| !literal.contains(byte))
+                .expect("V24 boundary avoiding byte");
+
+            for window_start in 0_usize..16 {
+                let wide_base = window_start + 1;
+                let false_candidate = wide_base + 5;
+                for (kind, exact, last_candidate) in [
+                    ("narrow", wide_base + 64 + 7, wide_base + 64 + 20),
+                    ("tail", wide_base + 64 + 18, wide_base + 64 + 18),
+                ] {
+                    let window_end = last_candidate + width;
+                    let mut haystack = vec![avoid; window_end + 17];
+                    for &offset in &selected {
+                        haystack[false_candidate + offset] = literal[offset];
+                    }
+                    assert_eq!(haystack[false_candidate + sixth], avoid);
+                    haystack[exact..exact + width].copy_from_slice(&literal);
+                    let expected = program
+                        .execute(
+                            &haystack,
+                            SearchWindow::new(window_start, window_end),
+                            ExecutionLimits::unlimited(),
+                        )
+                        .expect("V24 boundary oracle")
+                        .output()
+                        .map(|span| (span.start(), span.end()));
+                    assert_eq!(expected, Some((exact, exact + width)));
+                    assert_eq!(
+                        span_output(
+                            simulate(&image, &haystack, window_start, window_end)
+                                .expect("V24 boundary simulation")
+                        ),
+                        expected,
+                        "width={width} zero_primary={zero_primary} residue={window_start} path={kind}"
+                    );
+                    comparisons += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(comparisons, 3 * 2 * 16 * 2);
+}
+
+#[test]
+fn v24_every_width_primary_offset_and_randomized_window_matches_the_kir_oracle() {
+    let mut state = 0x2d9c_71e5_a408_63bf_u64;
+    let mut comparisons = 0_u64;
+    for width in 6_usize..=MAX_REPEATED_CONFIRM_BYTES {
+        for zero_primary in [true, false] {
+            let literal = v23_pointer_test_literal(width, zero_primary);
+            let program = build_exact_literal::<Span>(
+                &literal,
+                AnchorFlags::default(),
+                ValidateLimits::default(),
+            )
+            .expect("V24 randomized IR");
+            let image = emit_with_backend(
+                &program,
+                SearchBackendPolicy::AsimdV24,
+                EmitLimits::default(),
+            )
+            .expect("V24 randomized image");
+            audit(&image).expect("V24 randomized audit");
+
+            for case in 0..8_usize {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let hay_len = 256 + usize::try_from(state >> 24).expect("host usize") % 257;
+                let mut haystack = Vec::with_capacity(hay_len);
+                for _ in 0..hay_len {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    haystack.push(state.to_le_bytes()[0]);
+                }
+                let exact = (case & 1 == 0).then(|| {
+                    5 + (usize::try_from(state >> 8).expect("host usize")
+                        % (haystack.len() - width - 5))
+                });
+                if let Some(candidate) = exact {
+                    haystack[candidate..candidate + width].copy_from_slice(&literal);
+                }
+
+                let random_start =
+                    usize::try_from(state >> 16).expect("host usize") % (haystack.len() + 1);
+                let random_end = random_start
+                    + (usize::try_from(state >> 32).expect("host usize")
+                        % (haystack.len() - random_start + 1));
+                let short_end = width.saturating_sub(1).min(haystack.len());
+                let exact_window = exact.map_or((random_start, random_end), |candidate| {
+                    (candidate, candidate + width)
+                });
+                for (start, end) in [
+                    (0, 0),
+                    (0, short_end),
+                    (0, haystack.len()),
+                    (random_start, haystack.len()),
+                    (random_start, random_end),
+                    exact_window,
+                ] {
+                    let expected = program
+                        .execute(
+                            &haystack,
+                            SearchWindow::new(start, end),
+                            ExecutionLimits::unlimited(),
+                        )
+                        .expect("V24 randomized oracle")
+                        .output()
+                        .map(|span| (span.start(), span.end()));
+                    assert_eq!(
+                        span_output(
+                            simulate(&image, &haystack, start, end)
+                                .expect("V24 randomized simulation")
+                        ),
+                        expected,
+                        "width={width} zero_primary={zero_primary} case={case} window={start}..{end}"
+                    );
+                    comparisons += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(comparisons, 2_592);
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the frozen V23 output/topology matrix keeps its generator and authenticated AOT digest adjacent"
+)]
+fn v24_frozen_v23_aot_code_manifest_and_output_matrix_bytes_are_exact() {
+    fn gate_literal(topology: u8, width: usize) -> Vec<u8> {
+        match topology {
+            0 => (0..width)
+                .map(|offset| 33 + u8::try_from((17 * offset) % 64).expect("bounded"))
+                .collect(),
+            1 => {
+                let mut literal = vec![b'~'; width];
+                literal[..5].copy_from_slice(b"A3mQz");
+                literal
+            }
+            2 => {
+                let mut literal = vec![b'x'; width];
+                for (offset, byte) in [0, width / 4, width / 2, (3 * width) / 4, width - 1]
+                    .into_iter()
+                    .zip(*b"MNOPR")
+                {
+                    literal[offset] = byte;
+                }
+                literal
+            }
+            3 => {
+                const ALPHABET: &[u8; 16] = b"0123456789ABCDEF";
+                let mut state =
+                    0x9e37_79b9_7f4a_7c15_u64 ^ u64::try_from(width).expect("host width");
+                (0..width)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        ALPHABET[usize::from(state.to_le_bytes()[0] & 15)]
+                    })
+                    .collect()
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    let mut digest = Sha256::new();
+    digest.update(b"FRE-V24-FROZEN-V23-ALL-OUTPUT-AOT-MATRIX-V1\0");
+    let mut images = 0_u64;
+    for output in [
+        OutputKind::Exists,
+        OutputKind::SelectedEnd,
+        OutputKind::Span,
+    ] {
+        let output_tag = match output {
+            OutputKind::Exists => 1_u8,
+            OutputKind::SelectedEnd => 2,
+            OutputKind::Span => 3,
+        };
+        digest.update([output_tag]);
+        for width in 6_usize..=MAX_REPEATED_CONFIRM_BYTES {
+            for topology in 0_u8..4 {
+                let literal = gate_literal(topology, width);
+                let image = match output {
+                    OutputKind::Exists => {
+                        let program = build_exact_literal::<Exists>(
+                            &literal,
+                            AnchorFlags::default(),
+                            ValidateLimits::default(),
+                        )
+                        .expect("frozen V23 Exists IR");
+                        emit_search_version_for_test(
+                            &program,
+                            EmitLimits::default(),
+                            BackendVersion::SEARCH_V23,
+                        )
+                        .expect("frozen V23 Exists image")
+                    }
+                    OutputKind::SelectedEnd => {
+                        let program = build_exact_literal::<SelectedEnd>(
+                            &literal,
+                            AnchorFlags::default(),
+                            ValidateLimits::default(),
+                        )
+                        .expect("frozen V23 SelectedEnd IR");
+                        emit_search_version_for_test(
+                            &program,
+                            EmitLimits::default(),
+                            BackendVersion::SEARCH_V23,
+                        )
+                        .expect("frozen V23 SelectedEnd image")
+                    }
+                    OutputKind::Span => {
+                        let program = build_exact_literal::<Span>(
+                            &literal,
+                            AnchorFlags::default(),
+                            ValidateLimits::default(),
+                        )
+                        .expect("frozen V23 Span IR");
+                        emit_search_version_for_test(
+                            &program,
+                            EmitLimits::default(),
+                            BackendVersion::SEARCH_V23,
+                        )
+                        .expect("frozen V23 Span image")
+                    }
+                };
+                audit(&image).expect("frozen V23 output image audit");
+                assert_eq!(image.backend_version(), BackendVersion::SEARCH_V23);
+                assert_eq!(image.output(), output);
+                let aot = image
+                    .to_aot(AotLimits::default())
+                    .expect("frozen V23 bounded AOT");
+                digest.update([topology]);
+                digest.update(u64::try_from(width).expect("width").to_le_bytes());
+                digest.update(
+                    u64::try_from(aot.as_bytes().len())
+                        .expect("AOT length")
+                        .to_le_bytes(),
+                );
+                digest.update(aot.as_bytes());
+                images += 1;
+            }
+        }
+    }
+    assert_eq!(images, 3 * 27 * 4);
+    assert_eq!(
+        format!("{:x}", digest.finalize()),
+        "23038d31987fe49dd30624d699284ca17b1447a9e3c97f48d01e3b8ccb17a561"
+    );
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
     reason = "the complete frozen backend matrix keeps its topology generator and authenticated digest adjacent"
 )]
 fn v23_frozen_all_prior_search_aot_matrix_bytes_are_exact() {
@@ -12651,7 +13816,7 @@ fn v13_adaptive_recovery_decoded_edges_cover_zero_one_and_max_remaining_columns(
 }
 
 #[test]
-fn v9_through_v23_reject_shapes_without_one_nonempty_unanchored_exact_candidate() {
+fn v9_through_v24_reject_shapes_without_one_nonempty_unanchored_exact_candidate() {
     for backend in [
         SearchBackendPolicy::AsimdV9,
         SearchBackendPolicy::AsimdV10,
@@ -12668,6 +13833,7 @@ fn v9_through_v23_reject_shapes_without_one_nonempty_unanchored_exact_candidate(
         SearchBackendPolicy::AsimdV21,
         SearchBackendPolicy::AsimdV22,
         SearchBackendPolicy::AsimdV23,
+        SearchBackendPolicy::AsimdV24,
     ] {
         for anchors in [
             AnchorFlags {

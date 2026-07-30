@@ -4167,6 +4167,248 @@ fn v23_all_search_output_contracts_publish_and_execute() {
 #[test]
 #[allow(
     clippy::too_many_lines,
+    reason = "the V24 native test keeps every preregistered cold path and guard orientation together"
+)]
+fn v24_sixth_static_executes_natively_across_cold_paths_and_both_guard_pages() {
+    fn pointer_literal(width: usize, zero_primary: bool) -> Vec<u8> {
+        let primary = if zero_primary { 0 } else { width - 1 };
+        let secondary = if zero_primary { width - 1 } else { 0 };
+        let mut literal = vec![b'e'; width];
+        literal[primary] = 0x1f;
+        literal[secondary] = 0x1e;
+        literal
+    }
+
+    let _lock = native_test_lock();
+    let mut comparisons = 0_u64;
+    for width in [6_usize, 13, 32] {
+        for zero_primary in [true, false] {
+            let literal = pointer_literal(width, zero_primary);
+            let program = build_exact_literal::<Span>(
+                &literal,
+                AnchorFlags::default(),
+                ValidateLimits::default(),
+            )
+            .expect("V24 native program");
+            let image = emit_audited_with_backend(
+                &program,
+                SearchBackendPolicy::AsimdV24,
+                EmitLimits::default(),
+            )
+            .expect("audited V24 native image");
+            assert_eq!(
+                image.as_image().backend_version(),
+                BackendVersion::SEARCH_V24
+            );
+            let decoded = decode(image.as_image().code()).expect("V24 native decode");
+            let selected = decoded
+                .iter()
+                .filter_map(|instruction| match instruction {
+                    DecodedInstruction::LoadByte {
+                        destination: 11,
+                        base: 8,
+                        offset,
+                    } => Some(usize::from(*offset)),
+                    _ => None,
+                })
+                .take(5)
+                .collect::<Vec<_>>();
+            assert_eq!(selected.len(), 5);
+            assert_eq!(selected[0], if zero_primary { 0 } else { width - 1 });
+            let sixth = decoded
+                .windows(2)
+                .find_map(|window| match window {
+                    [
+                        DecodedInstruction::LoadByte {
+                            destination: 10,
+                            base: 8,
+                            offset,
+                        },
+                        DecodedInstruction::DuplicateByte16 {
+                            destination: 24,
+                            source: 10,
+                        },
+                    ] => Some(usize::from(*offset)),
+                    _ => None,
+                })
+                .expect("V24 native sixth offset");
+            assert!(sixth < width);
+            assert!(!selected.contains(&sixth));
+            let mut all_static = selected.clone();
+            all_static.push(sixth);
+            let avoid = (0_u16..=255)
+                .map(|value| u8::try_from(value).expect("bounded byte"))
+                .find(|byte| !literal.contains(byte))
+                .expect("V24 native avoiding byte");
+            let kernel = publish_audited::<Span>(&image, PublicationLimits::default())
+                .expect("publish V24 image");
+            let window_start = 3_usize;
+            let wide_base = window_start + 1;
+            let exact = wide_base + 4 * 64 + 11;
+            let window_end = exact + width + 80;
+
+            let mut sixth_empty = vec![avoid; window_end + 17];
+            for group in 0..3_usize {
+                let candidate = wide_base + group * 64 + 5;
+                for &offset in &selected {
+                    sixth_empty[candidate + offset] = literal[offset];
+                }
+            }
+            install_literal(&mut sixth_empty, exact, &literal);
+            for right_boundary in [false, true] {
+                platform::with_guarded_haystack(&sixth_empty, right_boundary, |guarded| {
+                    assert_native_matches(
+                        &program,
+                        &kernel,
+                        guarded,
+                        SearchWindow::new(window_start, window_end),
+                    );
+                })
+                .expect("guarded V24 sixth-empty execution");
+                comparisons += 1;
+            }
+
+            if let Some(mismatch) = (0..width).find(|offset| !all_static.contains(offset)) {
+                let false_candidate = wide_base + 7;
+                let mut false_survivor = vec![avoid; window_end + 17];
+                install_literal(&mut false_survivor, false_candidate, &literal);
+                false_survivor[false_candidate + mismatch] = avoid;
+                install_literal(&mut false_survivor, exact, &literal);
+                for right_boundary in [false, true] {
+                    platform::with_guarded_haystack(&false_survivor, right_boundary, |guarded| {
+                        assert_native_matches(
+                            &program,
+                            &kernel,
+                            guarded,
+                            SearchWindow::new(window_start, window_end),
+                        );
+                    })
+                    .expect("guarded V24 sixth-survivor execution");
+                    comparisons += 1;
+                }
+            }
+
+            let post_three_wide = wide_base + 3 * 64;
+            for (kind, exact, last_candidate) in [
+                (
+                    "narrow exact",
+                    Some(post_three_wide + 7),
+                    post_three_wide + 20,
+                ),
+                ("tail exact", Some(post_three_wide + 7), post_three_wide + 7),
+                ("no match", None, post_three_wide + 7),
+            ] {
+                let window_end = last_candidate + width;
+                let mut bytes = vec![avoid; window_end + 17];
+                for group in 0..3_usize {
+                    let candidate = wide_base + group * 64 + 5;
+                    for &offset in &selected {
+                        bytes[candidate + offset] = literal[offset];
+                    }
+                }
+                if let Some(candidate) = exact {
+                    install_literal(&mut bytes, candidate, &literal);
+                }
+                for right_boundary in [false, true] {
+                    platform::with_guarded_haystack(&bytes, right_boundary, |guarded| {
+                        assert_native_matches(
+                            &program,
+                            &kernel,
+                            guarded,
+                            SearchWindow::new(window_start, window_end),
+                        );
+                    })
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "guarded V24 exit width={width} zero_primary={zero_primary} kind={kind}: {error:?}"
+                        )
+                    });
+                    comparisons += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(comparisons, 3 * 2 * 4 * 2 + 2 * 2 * 2);
+}
+
+#[test]
+fn v24_all_search_output_contracts_publish_and_execute() {
+    let _lock = native_test_lock();
+    let mut literal = vec![b'e'; 13];
+    literal[0] = 0x1f;
+    literal[12] = 0x1e;
+    let exists_program =
+        build_exact_literal::<Exists>(&literal, AnchorFlags::default(), ValidateLimits::default())
+            .expect("V24 Exists program");
+    let selected_end_program = build_exact_literal::<SelectedEnd>(
+        &literal,
+        AnchorFlags::default(),
+        ValidateLimits::default(),
+    )
+    .expect("V24 SelectedEnd program");
+    let span_program =
+        build_exact_literal::<Span>(&literal, AnchorFlags::default(), ValidateLimits::default())
+            .expect("V24 Span program");
+    let exists_image = emit_audited_with_backend(
+        &exists_program,
+        SearchBackendPolicy::AsimdV24,
+        EmitLimits::default(),
+    )
+    .expect("V24 Exists image");
+    let selected_end_image = emit_audited_with_backend(
+        &selected_end_program,
+        SearchBackendPolicy::AsimdV24,
+        EmitLimits::default(),
+    )
+    .expect("V24 SelectedEnd image");
+    let span_image = emit_audited_with_backend(
+        &span_program,
+        SearchBackendPolicy::AsimdV24,
+        EmitLimits::default(),
+    )
+    .expect("V24 Span image");
+    for image in [
+        exists_image.as_image(),
+        selected_end_image.as_image(),
+        span_image.as_image(),
+    ] {
+        assert_eq!(image.backend_version(), BackendVersion::SEARCH_V24);
+    }
+
+    let exists = publish_audited::<Exists>(&exists_image, PublicationLimits::default())
+        .expect("publish V24 Exists");
+    let selected_end =
+        publish_audited::<SelectedEnd>(&selected_end_image, PublicationLimits::default())
+            .expect("publish V24 SelectedEnd");
+    let span = publish_audited::<Span>(&span_image, PublicationLimits::default())
+        .expect("publish V24 Span");
+    let avoid = 0xff_u8;
+    assert!(!literal.contains(&avoid));
+    let window_start = 3_usize;
+    let exact = window_start + 4 * 64 + 11;
+    let mut bytes = vec![avoid; exact + literal.len() + 96];
+    install_literal(&mut bytes, exact, &literal);
+    for right_boundary in [false, true] {
+        platform::with_guarded_haystack(&bytes, right_boundary, |guarded| {
+            let window = SearchWindow::new(window_start, guarded.len());
+            assert_eq!(exists.search(guarded, window), Ok(true));
+            assert_eq!(
+                selected_end.search(guarded, window),
+                Ok(Some(exact + literal.len()))
+            );
+            let found = span
+                .search(guarded, window)
+                .expect("V24 Span call")
+                .expect("V24 Span match");
+            assert_eq!((found.start(), found.end()), (exact, exact + literal.len()));
+        })
+        .expect("guarded V24 output-contract execution");
+    }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
     reason = "the width/topology matrix keeps learned-mode, vector-tail, one-candidate, and clipped-window guard cases explicit"
 )]
 fn v16_repeated_learned_byte_topologies_match_kir_and_portable_at_guarded_tails() {

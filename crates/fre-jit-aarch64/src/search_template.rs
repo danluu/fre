@@ -3945,6 +3945,24 @@ fn independent_adaptive_offsets_v13(
     IndependentAdaptiveOffsetsV13 { values, len }
 }
 
+#[cfg(test)]
+pub(crate) fn independent_sixth_static_offset_v24(
+    literal: &[u8],
+    manifest: SearchManifest,
+) -> Option<u16> {
+    independent_adaptive_offsets_v13(
+        literal,
+        manifest.primary_offset,
+        (manifest.secondary_offset != u16::MAX).then_some(manifest.secondary_offset),
+        (manifest.verification_offset != u16::MAX).then_some(manifest.verification_offset),
+        (manifest.quaternary_offset != u16::MAX).then_some(manifest.quaternary_offset),
+        (manifest.quinary_offset != u16::MAX).then_some(manifest.quinary_offset),
+    )
+    .iter()
+    .next()
+    .copied()
+}
+
 // Independently pinned copy of the memchr 2.8.3 packed-pair byte-frequency
 // order. The template must not consume the emitter's table when reconstructing
 // V13's exact adaptive instruction stream.

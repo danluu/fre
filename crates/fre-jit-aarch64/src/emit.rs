@@ -1508,12 +1508,16 @@ mod v7_policy_scan_admission {
     }
 
     impl<'a> Admission<'a> {
-        pub(super) fn charge(literal: &'a [u8], meter: &mut WorkMeter) -> Result<Self, EmitError> {
+        pub(super) fn charge(
+            literal: &'a [u8],
+            scan_count: u64,
+            meter: &mut WorkMeter,
+        ) -> Result<Self, EmitError> {
             let scan_work = u64::try_from(literal.len())
                 .map_err(|_| EmitError::ArithmeticOverflow {
                     site: ArithmeticSite::EmissionWork,
                 })?
-                .checked_mul(2)
+                .checked_mul(scan_count)
                 .ok_or(EmitError::ArithmeticOverflow {
                     site: ArithmeticSite::EmissionWork,
                 })?;
@@ -1815,9 +1819,15 @@ impl<'a> Plan<'a> {
         }
 
         // The move-only token is minted by one combined charge and is the only
-        // route to both ranked scans. Older backends retain their historical
-        // receipts and adjacent emission charge.
-        V7PolicyScanAdmission::charge(literal, meter).map(Some)
+        // route to the ranked scans. V24 admits one additional complete scan
+        // for its first remaining adaptive-ranked offset. Every older backend
+        // retains its historical exact two-scan receipt.
+        let scan_count = if backend_version == BackendVersion::SEARCH_V24 {
+            3
+        } else {
+            2
+        };
+        V7PolicyScanAdmission::charge(literal, scan_count, meter).map(Some)
     }
 
     #[allow(
@@ -4060,7 +4070,7 @@ fn emit_vector_candidate_skip_v8(
     );
     let sixth_static_offset = (backend_version == BackendVersion::SEARCH_V24)
         .then(|| {
-            candidate_adaptive_offsets_v13(
+            candidate_sixth_static_offset_v24(
                 literal,
                 primary_offset,
                 secondary_offset,
@@ -4068,9 +4078,6 @@ fn emit_vector_candidate_skip_v8(
                 quaternary_offset,
                 quinary_offset,
             )
-            .offsets()
-            .first()
-            .copied()
             .ok_or(EmitError::InternalInvariant)
         })
         .transpose()?;
@@ -6265,6 +6272,33 @@ fn candidate_adaptive_offsets_v13(
         len += 1;
     }
     AdaptiveOffsetsV13 { values, len }
+}
+
+fn candidate_sixth_static_offset_v24(
+    literal: &[u8],
+    primary_offset: u16,
+    secondary_offset: Option<u16>,
+    verification_offset: Option<u16>,
+    quaternary_offset: Option<u16>,
+    quinary_offset: Option<u16>,
+) -> Option<u16> {
+    let selected = [
+        Some(primary_offset),
+        secondary_offset,
+        verification_offset,
+        quaternary_offset,
+        quinary_offset,
+    ];
+    literal
+        .iter()
+        .enumerate()
+        .filter_map(|(offset, &byte)| {
+            let offset = u16::try_from(offset).ok()?;
+            (!selected.contains(&Some(offset)))
+                .then_some((V7_BYTE_FREQUENCY_RANK[usize::from(byte)], offset))
+        })
+        .min()
+        .map(|(_, offset)| offset)
 }
 
 // Frozen memchr 2.8.3 packed-pair frequency order. V7 uses the same ranking
