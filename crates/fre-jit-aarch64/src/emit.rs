@@ -104,6 +104,9 @@ pub enum SearchBackendPolicy {
     /// Search V17 candidate: V16 screening with the learned mismatch column
     /// retained across exact-candidate misses.
     AsimdV17,
+    /// Search V18 candidate: V17 recovery with a third authenticated
+    /// wide-screen column before permanent narrow fallback.
+    AsimdV18,
     /// SVE screening with exactly sixteen active byte lanes.
     Sve16,
     /// SVE2 `MATCH` screening with exactly sixteen active byte lanes,
@@ -134,6 +137,7 @@ impl SearchBackendPolicy {
             Self::AsimdV15 => BackendVersion::SEARCH_V15,
             Self::AsimdV16 => BackendVersion::SEARCH_V16,
             Self::AsimdV17 => BackendVersion::SEARCH_V17,
+            Self::AsimdV18 => BackendVersion::SEARCH_V18,
             Self::Sve16 => BackendVersion::SEARCH_SVE16_V1,
             Self::Sve2Fixed16 => BackendVersion::SEARCH_SVE2_16_V1,
             Self::Sve16V6 => BackendVersion::SEARCH_SVE16_V6,
@@ -352,6 +356,7 @@ fn emit_search_image<O: Operation>(
             | BackendVersion::SEARCH_V15
             | BackendVersion::SEARCH_V16
             | BackendVersion::SEARCH_V17
+            | BackendVersion::SEARCH_V18
             | BackendVersion::SEARCH_SVE16_V1
             | BackendVersion::SEARCH_SVE2_16_V1
             | BackendVersion::SEARCH_SVE16_V6
@@ -421,6 +426,7 @@ fn emit_search_image<O: Operation>(
             | BackendVersion::SEARCH_V15
             | BackendVersion::SEARCH_V16
             | BackendVersion::SEARCH_V17
+            | BackendVersion::SEARCH_V18
     ) && !plan.is_v9_policy_shape()
     {
         return Err(EmitError::Unsupported {
@@ -553,6 +559,7 @@ fn emit_search_image<O: Operation>(
                 | BackendVersion::SEARCH_V15
                 | BackendVersion::SEARCH_V16
                 | BackendVersion::SEARCH_V17
+                | BackendVersion::SEARCH_V18
                 | BackendVersion::SEARCH_SVE16_V1
                 | BackendVersion::SEARCH_SVE2_16_V1
                 | BackendVersion::SEARCH_SVE16_V6
@@ -1661,6 +1668,7 @@ impl<'a> Plan<'a> {
                         | BackendVersion::SEARCH_V15
                         | BackendVersion::SEARCH_V16
                         | BackendVersion::SEARCH_V17
+                        | BackendVersion::SEARCH_V18
                         | BackendVersion::SEARCH_SVE16_V6
                         | BackendVersion::SEARCH_SVE2_FIXED16_V2
                 ) =>
@@ -1717,6 +1725,7 @@ impl<'a> Plan<'a> {
                 | BackendVersion::SEARCH_V15
                 | BackendVersion::SEARCH_V16
                 | BackendVersion::SEARCH_V17
+                | BackendVersion::SEARCH_V18
                 | BackendVersion::SEARCH_SVE16_V1
                 | BackendVersion::SEARCH_SVE2_16_V1
                 | BackendVersion::SEARCH_SVE16_V6
@@ -1766,6 +1775,7 @@ impl<'a> Plan<'a> {
                         | BackendVersion::SEARCH_V15
                         | BackendVersion::SEARCH_V16
                         | BackendVersion::SEARCH_V17
+                        | BackendVersion::SEARCH_V18
                         | BackendVersion::SEARCH_SVE16_V1
                         | BackendVersion::SEARCH_SVE2_16_V1
                         | BackendVersion::SEARCH_SVE16_V6
@@ -1782,6 +1792,7 @@ impl<'a> Plan<'a> {
                                 | BackendVersion::SEARCH_V15
                                 | BackendVersion::SEARCH_V16
                                 | BackendVersion::SEARCH_V17
+                                | BackendVersion::SEARCH_V18
                         ) {
                             admission.select_offsets_v3()
                         } else if matches!(
@@ -1864,6 +1875,7 @@ impl<'a> Plan<'a> {
                 BackendVersion::SEARCH_V15
                     | BackendVersion::SEARCH_V16
                     | BackendVersion::SEARCH_V17
+                    | BackendVersion::SEARCH_V18
             ) && (shape != SearchShape::ExactLiteral
                 || candidate_policy.is_none_or(|offsets| {
                     !candidate_signature_is_cyclic_phase_unique(literal, offsets)
@@ -1914,6 +1926,7 @@ impl<'a> Plan<'a> {
                             BackendVersion::SEARCH_V15
                                 | BackendVersion::SEARCH_V16
                                 | BackendVersion::SEARCH_V17
+                                | BackendVersion::SEARCH_V18
                         ) && shape == SearchShape::ExactLiteral
                         {
                             SEARCH_CANDIDATE_POLICY_V11
@@ -2263,6 +2276,19 @@ fn emit_exact(
         }
         BackendVersion::SEARCH_V17 => {
             emit_vector_candidate_skip_v17(
+                assembler,
+                literal,
+                primary_offset,
+                secondary_offset,
+                verification_offset,
+                quaternary_offset,
+                quinary_offset,
+                none,
+                found,
+            )?;
+        }
+        BackendVersion::SEARCH_V18 => {
+            emit_vector_candidate_skip_v18(
                 assembler,
                 literal,
                 primary_offset,
@@ -3494,6 +3520,54 @@ fn emit_vector_candidate_skip_v17(
 
 #[allow(
     clippy::too_many_arguments,
+    reason = "the V18 wire freezes V17 continuation and selects a distinct authenticated wide-screen graph"
+)]
+fn emit_vector_candidate_skip_v18(
+    assembler: &mut Assembler,
+    literal: &[u8],
+    primary_offset: u16,
+    secondary_offset: Option<u16>,
+    verification_offset: Option<u16>,
+    quaternary_offset: Option<u16>,
+    quinary_offset: Option<u16>,
+    none: Label,
+    found: Label,
+) -> Result<(), EmitError> {
+    let first_candidate_miss = assembler.new_label(LabelKind::Internal)?;
+    let selected = literal
+        .get(usize::from(primary_offset))
+        .copied()
+        .ok_or(EmitError::InternalInvariant)?;
+
+    assembler.add_reg(X15, X9, X5)?;
+    assembler.load_byte(X10, X15, primary_offset)?;
+    assembler.cmp_imm32(X10, u16::from(selected))?;
+    assembler.branch_cond(Condition::NotEqual, first_candidate_miss)?;
+    if literal.len() > 1 {
+        emit_literal_equality_specialized(assembler, X15, X8, literal.len(), first_candidate_miss)?;
+    }
+    assembler.mov_reg(X13, X5)?;
+    assembler.add_reg(X14, X5, X12)?;
+    assembler.branch(found)?;
+
+    assembler.bind(first_candidate_miss)?;
+    assembler.add_imm(X5, X5, 1)?;
+    emit_vector_candidate_skip_v8(
+        assembler,
+        literal,
+        primary_offset,
+        secondary_offset,
+        verification_offset,
+        quaternary_offset,
+        quinary_offset,
+        BackendVersion::SEARCH_V18,
+        none,
+        found,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
     clippy::too_many_lines,
     reason = "the versioned v8 graph keeps its paired 64-candidate screen and authenticated staged recovery explicit"
 )]
@@ -3516,6 +3590,15 @@ fn emit_vector_candidate_skip_v8(
         .transpose()?;
     let secondary_only_advance = secondary_offset
         .map(|_| assembler.new_label(LabelKind::Internal))
+        .transpose()?;
+    let wide_third_filter = (backend_version == BackendVersion::SEARCH_V18)
+        .then(|| assembler.new_label(LabelKind::SlowPath))
+        .transpose()?;
+    let wide_third_column = (backend_version == BackendVersion::SEARCH_V18)
+        .then(|| assembler.new_label(LabelKind::SlowPath))
+        .transpose()?;
+    let wide_dense_pair = (backend_version == BackendVersion::SEARCH_V18)
+        .then(|| assembler.new_label(LabelKind::SlowPath))
         .transpose()?;
     let narrow_setup = assembler.new_label(LabelKind::Internal)?;
     let narrow = assembler.new_label(LabelKind::Loop)?;
@@ -3547,6 +3630,7 @@ fn emit_vector_candidate_skip_v8(
             | BackendVersion::SEARCH_V15
             | BackendVersion::SEARCH_V16
             | BackendVersion::SEARCH_V17
+            | BackendVersion::SEARCH_V18
     )
     .then(|| assembler.new_label(LabelKind::Loop))
     .transpose()?;
@@ -3556,6 +3640,7 @@ fn emit_vector_candidate_skip_v8(
             | BackendVersion::SEARCH_V15
             | BackendVersion::SEARCH_V16
             | BackendVersion::SEARCH_V17
+            | BackendVersion::SEARCH_V18
     )
     .then(|| assembler.new_label(LabelKind::SlowPath))
     .transpose()?;
@@ -3565,6 +3650,7 @@ fn emit_vector_candidate_skip_v8(
             | BackendVersion::SEARCH_V15
             | BackendVersion::SEARCH_V16
             | BackendVersion::SEARCH_V17
+            | BackendVersion::SEARCH_V18
     )
     .then(|| assembler.new_label(LabelKind::Internal))
     .transpose()?;
@@ -3574,6 +3660,7 @@ fn emit_vector_candidate_skip_v8(
             | BackendVersion::SEARCH_V15
             | BackendVersion::SEARCH_V16
             | BackendVersion::SEARCH_V17
+            | BackendVersion::SEARCH_V18
     )
     .then(|| assembler.new_label(LabelKind::Loop))
     .transpose()?;
@@ -3589,6 +3676,7 @@ fn emit_vector_candidate_skip_v8(
             | BackendVersion::SEARCH_V15
             | BackendVersion::SEARCH_V16
             | BackendVersion::SEARCH_V17
+            | BackendVersion::SEARCH_V18
     )
     .then(|| assembler.new_label(LabelKind::SlowPath))
     .transpose()?;
@@ -3646,6 +3734,7 @@ fn emit_vector_candidate_skip_v8(
             | BackendVersion::SEARCH_V15
             | BackendVersion::SEARCH_V16
             | BackendVersion::SEARCH_V17
+            | BackendVersion::SEARCH_V18
     ) {
         if !filters_cover_zero {
             return Err(EmitError::InternalInvariant);
@@ -3653,7 +3742,7 @@ fn emit_vector_candidate_skip_v8(
         // V14's dual-endpoint policy authenticates offset zero, leaving X11
         // available for per-invocation learned-mode state:
         // 0 = not learned, 1 = active. V14-V16 also use 2 = permanently
-        // disabled; V17 never leaves active learned mode.
+        // disabled; V17 and V18 never leave active learned mode.
         assembler.mov_imm64(X11, 0)?;
     } else if !filters_cover_zero {
         // X11 remains live across the staged screen. Candidate confirmation
@@ -3681,8 +3770,8 @@ fn emit_vector_candidate_skip_v8(
     // Test four primary columns before loading any secondary data. Paired Q
     // loads halve the load-instruction footprint without changing the exact
     // authenticated 64-byte range. A primary miss proves all 64 candidate
-    // starts impossible. A pair hit permanently enters the unchanged 16-wide
-    // staged recovery graph so pair-heavy inputs pay this wide probe only once.
+    // starts impossible. V18 applies the authenticated third column to a pair
+    // hit before deciding whether the historical narrow graph is necessary.
     assembler.bind(wide)?;
     assembler.load_vector_pair128(0, 2, X15, 0)?;
     assembler.load_vector_pair128(4, 6, X15, 32)?;
@@ -3724,7 +3813,52 @@ fn emit_vector_candidate_skip_v8(
         assembler.compare_equal_bytes16(21, 21, 3)?;
         assembler.and_bytes16(6, 6, 21)?;
         emit_four_block_presence_v8(assembler)?;
-        assembler.compare_branch_zero(X10, true, narrow_setup)?;
+        if backend_version == BackendVersion::SEARCH_V18 {
+            let pair_empty = secondary_only_advance.ok_or(EmitError::InternalInvariant)?;
+            // One forward CBZ keeps the tag30 decision footprint: an empty
+            // pair enters the relocated secondary-only graph, while a real
+            // pair falls directly into the adjacent V18 third-column policy.
+            assembler.compare_branch_zero(X10, false, pair_empty)?;
+        } else {
+            assembler.compare_branch_zero(X10, true, narrow_setup)?;
+        }
+    }
+
+    if let Some(wide_third_filter) = wide_third_filter {
+        assembler.bind(wide_third_filter)?;
+        let third_column = wide_third_column.ok_or(EmitError::InternalInvariant)?;
+        let dense_pair = wide_dense_pair.ok_or(EmitError::InternalInvariant)?;
+        emit_branch_if_four_masks_have_multiple(assembler, dense_pair)?;
+        assembler.bind(third_column)?;
+        let offset = verification_offset.ok_or(EmitError::InternalInvariant)?;
+        let delta = offset.abs_diff(primary_offset);
+        if offset > primary_offset {
+            assembler.add_imm(X10, X15, delta)?;
+        } else {
+            assembler.sub_imm(X10, X15, delta)?;
+        }
+        assembler.load_vector_pair128(18, 19, X10, 0)?;
+        assembler.load_vector_pair128(20, 21, X10, 32)?;
+        assembler.compare_equal_bytes16(18, 18, 5)?;
+        assembler.and_bytes16(0, 0, 18)?;
+        assembler.compare_equal_bytes16(19, 19, 5)?;
+        assembler.and_bytes16(2, 2, 19)?;
+        assembler.compare_equal_bytes16(20, 20, 5)?;
+        assembler.and_bytes16(4, 4, 20)?;
+        assembler.compare_equal_bytes16(21, 21, 5)?;
+        assembler.and_bytes16(6, 6, 21)?;
+        emit_four_block_presence_v8(assembler)?;
+        assembler.compare_branch_zero(X10, false, wide_advance)?;
+        assembler.branch(narrow_setup)?;
+
+        // One dense pair group may be an isolated random collision. Pay the
+        // third column once and remember it in X11. A second dense group
+        // enters the frozen narrow graph; narrow_setup clears X11 before the
+        // learned-column state machine observes it.
+        assembler.bind(dense_pair)?;
+        assembler.compare_branch_zero(X11, true, narrow_setup)?;
+        assembler.mov_imm64(X11, 1)?;
+        assembler.branch(third_column)?;
     }
 
     // One primary-present/pair-empty group is enough to establish that the
@@ -3737,43 +3871,57 @@ fn emit_vector_candidate_skip_v8(
     if let (Some(secondary_only), Some(secondary_only_advance), Some(offset)) =
         (secondary_only, secondary_only_advance, secondary_offset)
     {
-        assembler.bind(secondary_only_advance)?;
-        assembler.add_imm(X5, X5, 64)?;
-        assembler.add_imm(X15, X15, 64)?;
-        assembler.cmp_reg64(X5, X7)?;
-        assembler.branch_cond(Condition::LowerOrSame, secondary_only)?;
-        assembler.branch(narrow_setup)?;
+        if backend_version != BackendVersion::SEARCH_V18 {
+            assembler.bind(secondary_only_advance)?;
+            assembler.add_imm(X5, X5, 64)?;
+            assembler.add_imm(X15, X15, 64)?;
+            assembler.cmp_reg64(X5, X7)?;
+            assembler.branch_cond(Condition::LowerOrSame, secondary_only)?;
+            assembler.branch(narrow_setup)?;
 
-        assembler.bind(secondary_only)?;
-        let delta = offset.abs_diff(primary_offset);
-        if offset > primary_offset {
-            assembler.add_imm(X10, X15, delta)?;
-        } else {
-            assembler.sub_imm(X10, X15, delta)?;
+            assembler.bind(secondary_only)?;
+            let delta = offset.abs_diff(primary_offset);
+            if offset > primary_offset {
+                assembler.add_imm(X10, X15, delta)?;
+            } else {
+                assembler.sub_imm(X10, X15, delta)?;
+            }
+            assembler.load_vector_pair128(0, 2, X10, 0)?;
+            assembler.load_vector_pair128(4, 6, X10, 32)?;
+            assembler.compare_equal_bytes16(0, 0, 3)?;
+            assembler.compare_equal_bytes16(2, 2, 3)?;
+            assembler.compare_equal_bytes16(4, 4, 3)?;
+            assembler.compare_equal_bytes16(6, 6, 3)?;
+            emit_four_block_presence_v8(assembler)?;
+            assembler.compare_branch_zero(X10, false, secondary_only_advance)?;
+            assembler.load_vector_pair128(18, 19, X15, 0)?;
+            assembler.load_vector_pair128(20, 21, X15, 32)?;
+            assembler.compare_equal_bytes16(18, 18, 1)?;
+            assembler.and_bytes16(0, 0, 18)?;
+            assembler.compare_equal_bytes16(19, 19, 1)?;
+            assembler.and_bytes16(2, 2, 19)?;
+            assembler.compare_equal_bytes16(20, 20, 1)?;
+            assembler.and_bytes16(4, 4, 20)?;
+            assembler.compare_equal_bytes16(21, 21, 1)?;
+            assembler.and_bytes16(6, 6, 21)?;
+            emit_four_block_presence_v8(assembler)?;
+            assembler.compare_branch_zero(X10, false, wide_advance)?;
         }
-        assembler.load_vector_pair128(0, 2, X10, 0)?;
-        assembler.load_vector_pair128(4, 6, X10, 32)?;
-        assembler.compare_equal_bytes16(0, 0, 3)?;
-        assembler.compare_equal_bytes16(2, 2, 3)?;
-        assembler.compare_equal_bytes16(4, 4, 3)?;
-        assembler.compare_equal_bytes16(6, 6, 3)?;
-        emit_four_block_presence_v8(assembler)?;
-        assembler.compare_branch_zero(X10, false, secondary_only_advance)?;
-        assembler.load_vector_pair128(18, 19, X15, 0)?;
-        assembler.load_vector_pair128(20, 21, X15, 32)?;
-        assembler.compare_equal_bytes16(18, 18, 1)?;
-        assembler.and_bytes16(0, 0, 18)?;
-        assembler.compare_equal_bytes16(19, 19, 1)?;
-        assembler.and_bytes16(2, 2, 19)?;
-        assembler.compare_equal_bytes16(20, 20, 1)?;
-        assembler.and_bytes16(4, 4, 20)?;
-        assembler.compare_equal_bytes16(21, 21, 1)?;
-        assembler.and_bytes16(6, 6, 21)?;
-        emit_four_block_presence_v8(assembler)?;
-        assembler.compare_branch_zero(X10, false, wide_advance)?;
+    }
+
+    if backend_version == BackendVersion::SEARCH_V18 {
+        // The adjacent policy plus dense-event hysteresis consumes 29 words.
+        // Four unreachable words plus narrow_setup's X11 clear retain V17's
+        // exact narrow instruction indices.
+        for _ in 0..4 {
+            assembler.mov_reg(X10, X10)?;
+        }
     }
 
     assembler.bind(narrow_setup)?;
+    if backend_version == BackendVersion::SEARCH_V18 {
+        assembler.mov_imm64(X11, 0)?;
+    }
     assembler.sub_imm(X7, X6, 15)?;
     assembler.cmp_reg64(X5, X7)?;
     assembler.branch_cond(Condition::LowerOrSame, narrow)?;
@@ -3920,6 +4068,7 @@ fn emit_vector_candidate_skip_v8(
             | BackendVersion::SEARCH_V15
             | BackendVersion::SEARCH_V16
             | BackendVersion::SEARCH_V17
+            | BackendVersion::SEARCH_V18
     ) {
         emit_literal_equality_specialized(assembler, X15, X8, literal.len(), candidate_miss)?;
     } else if literal.len() == 16 {
@@ -3987,13 +4136,17 @@ fn emit_vector_candidate_skip_v8(
             | BackendVersion::SEARCH_V15
             | BackendVersion::SEARCH_V16
             | BackendVersion::SEARCH_V17
+            | BackendVersion::SEARCH_V18
     ) {
         let discover = learned_discover.ok_or(EmitError::InternalInvariant)?;
         let column_ready = learned_column_ready.ok_or(EmitError::InternalInvariant)?;
         let learned_next = learned_advance.ok_or(EmitError::InternalInvariant)?;
         let learned_block = learned_scan.ok_or(EmitError::InternalInvariant)?;
         let finish_tail = learned_tail.ok_or(EmitError::InternalInvariant)?;
-        let continue_learned = backend_version == BackendVersion::SEARCH_V17;
+        let continue_learned = matches!(
+            backend_version,
+            BackendVersion::SEARCH_V17 | BackendVersion::SEARCH_V18
+        );
 
         // X11 is initialized once before scanning. State zero enters
         // discovery. V14-V16 retain their frozen one-way V13 transition;
@@ -4069,7 +4222,7 @@ fn emit_vector_candidate_skip_v8(
         assembler.compare_equal_bytes16(16, 16, 24)?;
         if matches!(
             backend_version,
-            BackendVersion::SEARCH_V16 | BackendVersion::SEARCH_V17
+            BackendVersion::SEARCH_V16 | BackendVersion::SEARCH_V17 | BackendVersion::SEARCH_V18
         ) {
             // A learned byte may recur elsewhere in the literal (and hence in
             // near-miss streams at shifted candidate phases). Test presence
@@ -4230,7 +4383,49 @@ fn emit_vector_candidate_skip_v8(
         assembler.mov_reg(X10, X10)?;
     }
     assembler.bind(tail_setup)?;
-    emit_scalar_candidates_legacy(assembler, literal, true, none, found)
+    emit_scalar_candidates_legacy(assembler, literal, true, none, found)?;
+
+    if backend_version == BackendVersion::SEARCH_V18 {
+        let secondary_only = secondary_only.ok_or(EmitError::InternalInvariant)?;
+        let secondary_only_advance = secondary_only_advance.ok_or(EmitError::InternalInvariant)?;
+        let offset = secondary_offset.ok_or(EmitError::InternalInvariant)?;
+        assembler.bind(secondary_only_advance)?;
+        assembler.add_imm(X5, X5, 64)?;
+        assembler.add_imm(X15, X15, 64)?;
+        assembler.cmp_reg64(X5, X7)?;
+        assembler.branch_cond(Condition::LowerOrSame, secondary_only)?;
+        assembler.branch(narrow_setup)?;
+
+        assembler.bind(secondary_only)?;
+        let delta = offset.abs_diff(primary_offset);
+        if offset > primary_offset {
+            assembler.add_imm(X10, X15, delta)?;
+        } else {
+            assembler.sub_imm(X10, X15, delta)?;
+        }
+        assembler.load_vector_pair128(0, 2, X10, 0)?;
+        assembler.load_vector_pair128(4, 6, X10, 32)?;
+        assembler.compare_equal_bytes16(0, 0, 3)?;
+        assembler.compare_equal_bytes16(2, 2, 3)?;
+        assembler.compare_equal_bytes16(4, 4, 3)?;
+        assembler.compare_equal_bytes16(6, 6, 3)?;
+        emit_four_block_presence_v8(assembler)?;
+        assembler.compare_branch_zero(X10, false, secondary_only_advance)?;
+        assembler.load_vector_pair128(18, 19, X15, 0)?;
+        assembler.load_vector_pair128(20, 21, X15, 32)?;
+        assembler.compare_equal_bytes16(18, 18, 1)?;
+        assembler.and_bytes16(0, 0, 18)?;
+        assembler.compare_equal_bytes16(19, 19, 1)?;
+        assembler.and_bytes16(2, 2, 19)?;
+        assembler.compare_equal_bytes16(20, 20, 1)?;
+        assembler.and_bytes16(4, 4, 20)?;
+        assembler.compare_equal_bytes16(21, 21, 1)?;
+        assembler.and_bytes16(6, 6, 21)?;
+        emit_four_block_presence_v8(assembler)?;
+        assembler.compare_branch_zero(X10, false, wide_advance)?;
+        assembler.branch(narrow_setup)?;
+    }
+    Ok(())
 }
 
 #[allow(
@@ -4536,6 +4731,19 @@ fn emit_four_block_presence_v8(assembler: &mut Assembler) -> Result<(), EmitErro
     assembler.unsigned_max_pairwise_bytes16(16, 16, 17)?;
     assembler.unsigned_max_pairwise_bytes16(16, 16, 16)?;
     assembler.move_vector_double_to64(X10, 16)
+}
+
+fn emit_branch_if_four_masks_have_multiple(
+    assembler: &mut Assembler,
+    target: Label,
+) -> Result<(), EmitError> {
+    // The final wide-presence reduction leaves one 0xff byte per occupied
+    // eight-candidate bucket in X10. Collapse those bytes to one bit each,
+    // then use the standard multiple-bit test. Dense pair streams enter the
+    // frozen narrow graph; a sparse singleton earns the third wide column.
+    assembler.mov_imm64(X16, 0x0101_0101_0101_0101)?;
+    assembler.and_reg(X10, X10, X16)?;
+    emit_branch_if_mask_has_multiple(assembler, X10, X16, target)
 }
 
 fn emit_branch_if_mask_has_multiple(

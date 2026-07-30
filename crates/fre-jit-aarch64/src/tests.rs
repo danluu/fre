@@ -4558,6 +4558,7 @@ fn explicit_search_backend_policy_selects_distinct_artifact_identities() {
         (SearchBackendPolicy::AsimdV15, BackendVersion::SEARCH_V15),
         (SearchBackendPolicy::AsimdV16, BackendVersion::SEARCH_V16),
         (SearchBackendPolicy::AsimdV17, BackendVersion::SEARCH_V17),
+        (SearchBackendPolicy::AsimdV18, BackendVersion::SEARCH_V18),
         (SearchBackendPolicy::Sve16, BackendVersion::SEARCH_SVE16_V1),
         (
             SearchBackendPolicy::Sve2Fixed16,
@@ -7908,14 +7909,199 @@ fn v17_retains_learned_masks_across_exact_candidate_misses() {
 }
 
 #[test]
-fn v17_bounded_deterministic_fuzz_matches_the_kir_oracle() {
+fn v18_wide_screen_applies_third_filter_before_narrow_fallback() {
+    let literal = [11_u8, 37, 63, 89, 115, 141, 167, 193, 219, 245, 17, 43, 69];
+    let program =
+        build_exact_literal::<Span>(&literal, AnchorFlags::default(), ValidateLimits::default())
+            .expect("V18 wide-third IR");
+    let v17 = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV17,
+        EmitLimits::default(),
+    )
+    .expect("frozen V17 permanent-narrow image");
+    let v18 = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV18,
+        EmitLimits::default(),
+    )
+    .expect("V18 wide-third image");
+    audit(&v18).expect("independent V18 wide-third template");
+
+    let manifest = v18.search_manifest().expect("V18 selected offsets");
+    let primary = usize::from(manifest.primary_offset);
+    let secondary = usize::from(manifest.secondary_offset);
+    let verification = usize::from(manifest.verification_offset);
+    let candidate = 7_usize;
+    let mut haystack = vec![0_u8; 2_048];
+    haystack[candidate + primary] = literal[primary];
+    haystack[candidate + secondary] = literal[secondary];
+    assert_eq!(haystack[candidate + verification], 0);
+    assert_ne!(literal[verification], 0);
+
+    let expected = program
+        .execute(
+            &haystack,
+            SearchWindow::new(0, haystack.len()),
+            ExecutionLimits::unlimited(),
+        )
+        .expect("V18 wide-third oracle")
+        .output()
+        .map(|span| (span.start(), span.end()));
+    let (actual_v17, trace_v17) =
+        simulate_with_instruction_trace(&v17, &haystack, 0, haystack.len())
+            .expect("frozen V17 permanent-narrow trace");
+    let (actual_v18, trace_v18) =
+        simulate_with_instruction_trace(&v18, &haystack, 0, haystack.len())
+            .expect("V18 wide-third trace");
+    assert_eq!(span_output(actual_v17), expected);
+    assert_eq!(span_output(actual_v18), expected);
+
+    let wide_load = DecodedInstruction::LoadVectorPair128 {
+        first_destination: 0,
+        second_destination: 2,
+        base: 15,
+        offset: 0,
+    };
+    let decoded_v17 = decode(v17.code()).expect("frozen V17 witness decode");
+    let decoded_v18 = decode(v18.code()).expect("V18 wide-third witness decode");
+    let wide_v17 = decoded_v17
+        .iter()
+        .position(|instruction| *instruction == wide_load)
+        .expect("V17 wide entry");
+    let wide_v18 = decoded_v18
+        .iter()
+        .position(|instruction| *instruction == wide_load)
+        .expect("V18 wide entry");
+    assert_eq!(
+        trace_v17
+            .iter()
+            .filter(|&&instruction| instruction == wide_v17)
+            .count(),
+        1,
+        "V17 retains its frozen permanent-narrow behavior"
+    );
+    assert!(
+        trace_v18
+            .iter()
+            .filter(|&&instruction| instruction == wide_v18)
+            .count()
+            >= 2,
+        "V18 must revisit the 64-candidate screen after the third column eliminates the pair"
+    );
+
+    let third_wide_filter = decoded_v18
+        .iter()
+        .position(|instruction| {
+            *instruction
+                == DecodedInstruction::CompareEqualBytes16 {
+                    destination: 18,
+                    left: 18,
+                    right: 5,
+                }
+        })
+        .expect("V18 wide third filter");
+    let narrow_load = DecodedInstruction::LoadVector128 {
+        destination: 0,
+        base: 15,
+        offset: 0,
+    };
+    let narrow_v17 = decoded_v17
+        .iter()
+        .position(|instruction| *instruction == narrow_load)
+        .expect("V17 narrow entry");
+    let narrow_v18 = decoded_v18
+        .iter()
+        .position(|instruction| *instruction == narrow_load)
+        .expect("V18 narrow entry");
+    assert_eq!(
+        narrow_v18, narrow_v17,
+        "V18 keeps the frozen V17 narrow-loop placement"
+    );
+    assert!(
+        third_wide_filter < narrow_v18,
+        "V18's optional third-wide policy stays adjacent to the wide screen"
+    );
+    assert!(
+        !decoded_v17[..narrow_v17].iter().any(|instruction| {
+            *instruction
+                == DecodedInstruction::CompareEqualBytes16 {
+                    destination: 18,
+                    left: 18,
+                    right: 5,
+                }
+        }),
+        "V17 retains its frozen pair-only wide screen"
+    );
+    let wide_advance = decoded_v18
+        .windows(2)
+        .position(|window| {
+            window[0]
+                == DecodedInstruction::AddImmediate64 {
+                    destination: 5,
+                    source: 5,
+                    immediate: 64,
+                }
+                && window[1]
+                    == DecodedInstruction::AddImmediate64 {
+                        destination: 15,
+                        source: 15,
+                        immediate: 64,
+                    }
+        })
+        .expect("V18 wide advance");
+    let empty_third = decoded_v18[third_wide_filter..]
+        .iter()
+        .position(|instruction| {
+            matches!(
+                instruction,
+                DecodedInstruction::CompareBranchZero64 {
+                    register: 10,
+                    nonzero: false,
+                    ..
+                }
+            )
+        })
+        .map(|offset| third_wide_filter + offset)
+        .expect("V18 wide third-filter empty edge");
+    let DecodedInstruction::CompareBranchZero64 {
+        register,
+        displacement,
+        ..
+    } = decoded_v18[empty_third]
+    else {
+        unreachable!("selected V18 third-filter branch")
+    };
+    let target = i64::try_from(empty_third)
+        .expect("small V18 graph")
+        .checked_mul(4)
+        .and_then(|address| address.checked_add(i64::from(displacement)))
+        .and_then(|address| usize::try_from(address / 4).ok())
+        .expect("bounded V18 wide-empty target");
+    assert_eq!(target, wide_advance);
+
+    let mut inverted_empty = v18;
+    replace_test_branch_and_relocation_at(
+        &mut inverted_empty,
+        empty_third,
+        DecodedInstruction::CompareBranchZero64 {
+            register,
+            nonzero: true,
+            displacement,
+        },
+    );
+    assert_resealed_search_rejected(inverted_empty, "V18 wide third-filter empty-edge inversion");
+}
+
+#[test]
+fn v18_bounded_deterministic_fuzz_matches_the_kir_oracle() {
     let mut state = 0x86a3_5b19_d20f_47c1_u64;
     let mut comparisons = 0_u64;
     for width in 6_usize..=MAX_REPEATED_CONFIRM_BYTES {
         let literal = (0..width)
             .map(|offset| {
                 u8::try_from(offset)
-                    .expect("bounded V17 width")
+                    .expect("bounded V18 width")
                     .wrapping_mul(61)
                     .wrapping_add(7)
             })
@@ -7925,15 +8111,15 @@ fn v17_bounded_deterministic_fuzz_matches_the_kir_oracle() {
             AnchorFlags::default(),
             ValidateLimits::default(),
         )
-        .expect("V17 fuzz IR");
+        .expect("V18 fuzz IR");
         let image = emit_with_backend(
             &program,
-            SearchBackendPolicy::AsimdV17,
+            SearchBackendPolicy::AsimdV18,
             EmitLimits::default(),
         )
-        .expect("V17 fuzz image");
-        audit(&image).expect("V17 fuzz image audit");
-        let manifest = image.search_manifest().expect("V17 fuzz manifest");
+        .expect("V18 fuzz image");
+        audit(&image).expect("V18 fuzz image audit");
+        let manifest = image.search_manifest().expect("V18 fuzz manifest");
         let selected = [
             manifest.primary_offset,
             manifest.secondary_offset,
@@ -7949,7 +8135,7 @@ fn v17_bounded_deterministic_fuzz_matches_the_kir_oracle() {
         let avoid = (0_u16..=255)
             .map(|value| u8::try_from(value).expect("bounded byte"))
             .find(|byte| !literal.contains(byte))
-            .expect("V17 fuzz literal leaves an avoiding byte");
+            .expect("V18 fuzz literal leaves an avoiding byte");
 
         for case in 0..8_usize {
             state ^= state << 13;
@@ -7981,11 +8167,11 @@ fn v17_bounded_deterministic_fuzz_matches_the_kir_oracle() {
                         SearchWindow::new(start, end),
                         ExecutionLimits::unlimited(),
                     )
-                    .expect("V17 fuzz oracle")
+                    .expect("V18 fuzz oracle")
                     .output()
                     .map(|span| (span.start(), span.end()));
                 let actual =
-                    simulate(&image, &haystack, start, end).expect("V17 fuzz safe ISA simulation");
+                    simulate(&image, &haystack, start, end).expect("V18 fuzz safe ISA simulation");
                 assert_eq!(
                     span_output(actual),
                     expected,
@@ -8187,7 +8373,7 @@ fn v13_adaptive_recovery_decoded_edges_cover_zero_one_and_max_remaining_columns(
 }
 
 #[test]
-fn v9_through_v17_reject_shapes_without_one_nonempty_unanchored_exact_candidate() {
+fn v9_through_v18_reject_shapes_without_one_nonempty_unanchored_exact_candidate() {
     for backend in [
         SearchBackendPolicy::AsimdV9,
         SearchBackendPolicy::AsimdV10,
@@ -8198,6 +8384,7 @@ fn v9_through_v17_reject_shapes_without_one_nonempty_unanchored_exact_candidate(
         SearchBackendPolicy::AsimdV15,
         SearchBackendPolicy::AsimdV16,
         SearchBackendPolicy::AsimdV17,
+        SearchBackendPolicy::AsimdV18,
     ] {
         for anchors in [
             AnchorFlags {

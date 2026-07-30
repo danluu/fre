@@ -846,6 +846,9 @@ fn emit_exact(
         BackendVersion::SEARCH_V17 => {
             emit_exact_candidates_v17(template, manifest, literal, none, found)
         }
+        BackendVersion::SEARCH_V18 => {
+            emit_exact_candidates_v18(template, manifest, literal, none, found)
+        }
         BackendVersion::SEARCH_SVE2_FIXED16_V2 => {
             emit_exact_candidates_sve2_fixed16_v2(template, manifest, literal, none, found)
         }
@@ -1501,6 +1504,35 @@ fn emit_exact_candidates_v17(
     emit_exact_candidates_v8(template, manifest, literal, none, found)
 }
 
+fn emit_exact_candidates_v18(
+    template: &mut Template,
+    manifest: SearchManifest,
+    literal: &[u8],
+    none: Label,
+    found: Label,
+) -> Result<(), AuditError> {
+    let first_candidate_miss = template.new_label(LabelKind::Internal);
+    let selected = literal
+        .get(usize::from(manifest.primary_offset))
+        .copied()
+        .ok_or(AuditError::InvalidSearchManifest)?;
+
+    template.add_reg(15, 9, 5);
+    template.load_byte(10, 15, manifest.primary_offset);
+    template.cmp_imm32(10, u16::from(selected));
+    template.branch_cond(Condition::NotEqual, first_candidate_miss);
+    if literal.len() > 1 {
+        emit_literal_equality_specialized(template, 15, 8, literal.len(), first_candidate_miss)?;
+    }
+    template.mov_reg(13, 5);
+    template.add_reg(14, 5, 12);
+    template.branch(found);
+
+    template.bind(first_candidate_miss)?;
+    template.add_imm(5, 5, 1);
+    emit_exact_candidates_v8(template, manifest, literal, none, found)
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the complete v4 mask-guided control-flow template remains independent and reviewable"
@@ -1981,6 +2013,12 @@ fn emit_exact_candidates_v8(
     let wide_advance = template.new_label(LabelKind::Internal);
     let secondary_only = secondary_offset.map(|_| template.new_label(LabelKind::Loop));
     let secondary_only_advance = secondary_offset.map(|_| template.new_label(LabelKind::Internal));
+    let wide_third_filter = (manifest.backend_version == BackendVersion::SEARCH_V18)
+        .then(|| template.new_label(LabelKind::SlowPath));
+    let wide_third_column = (manifest.backend_version == BackendVersion::SEARCH_V18)
+        .then(|| template.new_label(LabelKind::SlowPath));
+    let wide_dense_pair = (manifest.backend_version == BackendVersion::SEARCH_V18)
+        .then(|| template.new_label(LabelKind::SlowPath));
     let narrow_setup = template.new_label(LabelKind::Internal);
     let narrow = template.new_label(LabelKind::Loop);
     let advance = template.new_label(LabelKind::Internal);
@@ -2009,6 +2047,7 @@ fn emit_exact_candidates_v8(
             | BackendVersion::SEARCH_V15
             | BackendVersion::SEARCH_V16
             | BackendVersion::SEARCH_V17
+            | BackendVersion::SEARCH_V18
     )
     .then(|| template.new_label(LabelKind::Loop));
     let learned_column_ready = matches!(
@@ -2017,6 +2056,7 @@ fn emit_exact_candidates_v8(
             | BackendVersion::SEARCH_V15
             | BackendVersion::SEARCH_V16
             | BackendVersion::SEARCH_V17
+            | BackendVersion::SEARCH_V18
     )
     .then(|| template.new_label(LabelKind::SlowPath));
     let learned_advance = matches!(
@@ -2025,6 +2065,7 @@ fn emit_exact_candidates_v8(
             | BackendVersion::SEARCH_V15
             | BackendVersion::SEARCH_V16
             | BackendVersion::SEARCH_V17
+            | BackendVersion::SEARCH_V18
     )
     .then(|| template.new_label(LabelKind::Internal));
     let learned_scan = matches!(
@@ -2033,6 +2074,7 @@ fn emit_exact_candidates_v8(
             | BackendVersion::SEARCH_V15
             | BackendVersion::SEARCH_V16
             | BackendVersion::SEARCH_V17
+            | BackendVersion::SEARCH_V18
     )
     .then(|| template.new_label(LabelKind::Loop));
     let learned_disabled = matches!(
@@ -2046,6 +2088,7 @@ fn emit_exact_candidates_v8(
             | BackendVersion::SEARCH_V15
             | BackendVersion::SEARCH_V16
             | BackendVersion::SEARCH_V17
+            | BackendVersion::SEARCH_V18
     )
     .then(|| template.new_label(LabelKind::SlowPath));
     let tail_setup = template.new_label(LabelKind::SlowPath);
@@ -2090,6 +2133,7 @@ fn emit_exact_candidates_v8(
             | BackendVersion::SEARCH_V15
             | BackendVersion::SEARCH_V16
             | BackendVersion::SEARCH_V17
+            | BackendVersion::SEARCH_V18
     ) {
         if !filters_cover_zero {
             return Err(AuditError::InvalidSearchManifest);
@@ -2153,49 +2197,98 @@ fn emit_exact_candidates_v8(
         template.compare_equal_bytes16(21, 21, 3);
         template.and_bytes16(6, 6, 21);
         emit_four_block_presence_v8(template);
-        template.compare_branch_zero(10, true, narrow_setup);
+        if manifest.backend_version == BackendVersion::SEARCH_V18 {
+            let pair_empty = secondary_only_advance.ok_or(AuditError::InvalidSearchManifest)?;
+            template.compare_branch_zero(10, false, pair_empty);
+        } else {
+            template.compare_branch_zero(10, true, narrow_setup);
+        }
     }
 
-    if let (Some(secondary_only), Some(secondary_only_advance), Some(offset)) =
-        (secondary_only, secondary_only_advance, secondary_offset)
-    {
-        template.bind(secondary_only_advance)?;
-        template.add_imm(5, 5, 64);
-        template.add_imm(15, 15, 64);
-        template.cmp_reg64(5, 7);
-        template.branch_cond(Condition::LowerOrSame, secondary_only);
-        template.branch(narrow_setup);
-
-        template.bind(secondary_only)?;
+    if let Some(wide_third_filter) = wide_third_filter {
+        template.bind(wide_third_filter)?;
+        let third_column = wide_third_column.ok_or(AuditError::InvalidSearchManifest)?;
+        let dense_pair = wide_dense_pair.ok_or(AuditError::InvalidSearchManifest)?;
+        emit_branch_if_four_masks_have_multiple(template, dense_pair);
+        template.bind(third_column)?;
+        let offset = verification_offset.ok_or(AuditError::InvalidSearchManifest)?;
         let delta = offset.abs_diff(primary_offset);
         if offset > primary_offset {
             template.add_imm(10, 15, delta);
         } else {
             template.sub_imm(10, 15, delta);
         }
-        template.load_vector_pair128(0, 2, 10, 0);
-        template.load_vector_pair128(4, 6, 10, 32);
-        template.compare_equal_bytes16(0, 0, 3);
-        template.compare_equal_bytes16(2, 2, 3);
-        template.compare_equal_bytes16(4, 4, 3);
-        template.compare_equal_bytes16(6, 6, 3);
-        emit_four_block_presence_v8(template);
-        template.compare_branch_zero(10, false, secondary_only_advance);
-        template.load_vector_pair128(18, 19, 15, 0);
-        template.load_vector_pair128(20, 21, 15, 32);
-        template.compare_equal_bytes16(18, 18, 1);
+        template.load_vector_pair128(18, 19, 10, 0);
+        template.load_vector_pair128(20, 21, 10, 32);
+        template.compare_equal_bytes16(18, 18, 5);
         template.and_bytes16(0, 0, 18);
-        template.compare_equal_bytes16(19, 19, 1);
+        template.compare_equal_bytes16(19, 19, 5);
         template.and_bytes16(2, 2, 19);
-        template.compare_equal_bytes16(20, 20, 1);
+        template.compare_equal_bytes16(20, 20, 5);
         template.and_bytes16(4, 4, 20);
-        template.compare_equal_bytes16(21, 21, 1);
+        template.compare_equal_bytes16(21, 21, 5);
         template.and_bytes16(6, 6, 21);
         emit_four_block_presence_v8(template);
         template.compare_branch_zero(10, false, wide_advance);
+        template.branch(narrow_setup);
+
+        template.bind(dense_pair)?;
+        template.compare_branch_zero(11, true, narrow_setup);
+        template.mov_imm64(11, 1);
+        template.branch(third_column);
+    }
+
+    if let (Some(secondary_only), Some(secondary_only_advance), Some(offset)) =
+        (secondary_only, secondary_only_advance, secondary_offset)
+    {
+        if manifest.backend_version != BackendVersion::SEARCH_V18 {
+            template.bind(secondary_only_advance)?;
+            template.add_imm(5, 5, 64);
+            template.add_imm(15, 15, 64);
+            template.cmp_reg64(5, 7);
+            template.branch_cond(Condition::LowerOrSame, secondary_only);
+            template.branch(narrow_setup);
+
+            template.bind(secondary_only)?;
+            let delta = offset.abs_diff(primary_offset);
+            if offset > primary_offset {
+                template.add_imm(10, 15, delta);
+            } else {
+                template.sub_imm(10, 15, delta);
+            }
+            template.load_vector_pair128(0, 2, 10, 0);
+            template.load_vector_pair128(4, 6, 10, 32);
+            template.compare_equal_bytes16(0, 0, 3);
+            template.compare_equal_bytes16(2, 2, 3);
+            template.compare_equal_bytes16(4, 4, 3);
+            template.compare_equal_bytes16(6, 6, 3);
+            emit_four_block_presence_v8(template);
+            template.compare_branch_zero(10, false, secondary_only_advance);
+            template.load_vector_pair128(18, 19, 15, 0);
+            template.load_vector_pair128(20, 21, 15, 32);
+            template.compare_equal_bytes16(18, 18, 1);
+            template.and_bytes16(0, 0, 18);
+            template.compare_equal_bytes16(19, 19, 1);
+            template.and_bytes16(2, 2, 19);
+            template.compare_equal_bytes16(20, 20, 1);
+            template.and_bytes16(4, 4, 20);
+            template.compare_equal_bytes16(21, 21, 1);
+            template.and_bytes16(6, 6, 21);
+            emit_four_block_presence_v8(template);
+            template.compare_branch_zero(10, false, wide_advance);
+        }
+    }
+
+    if manifest.backend_version == BackendVersion::SEARCH_V18 {
+        for _ in 0..4 {
+            template.mov_reg(10, 10);
+        }
     }
 
     template.bind(narrow_setup)?;
+    if manifest.backend_version == BackendVersion::SEARCH_V18 {
+        template.mov_imm64(11, 0);
+    }
     template.sub_imm(7, 6, 15);
     template.cmp_reg64(5, 7);
     template.branch_cond(Condition::LowerOrSame, narrow);
@@ -2342,6 +2435,7 @@ fn emit_exact_candidates_v8(
             | BackendVersion::SEARCH_V15
             | BackendVersion::SEARCH_V16
             | BackendVersion::SEARCH_V17
+            | BackendVersion::SEARCH_V18
     ) {
         emit_literal_equality_specialized(template, 15, 8, literal.len(), candidate_miss)?;
     } else if literal.len() == 16 {
@@ -2409,15 +2503,19 @@ fn emit_exact_candidates_v8(
             | BackendVersion::SEARCH_V15
             | BackendVersion::SEARCH_V16
             | BackendVersion::SEARCH_V17
+            | BackendVersion::SEARCH_V18
     ) {
         let discover = learned_discover.ok_or(AuditError::InvalidSearchManifest)?;
         let column_ready = learned_column_ready.ok_or(AuditError::InvalidSearchManifest)?;
         let learned_next = learned_advance.ok_or(AuditError::InvalidSearchManifest)?;
         let learned_block = learned_scan.ok_or(AuditError::InvalidSearchManifest)?;
         let finish_tail = learned_tail.ok_or(AuditError::InvalidSearchManifest)?;
-        let continue_learned = manifest.backend_version == BackendVersion::SEARCH_V17;
+        let continue_learned = matches!(
+            manifest.backend_version,
+            BackendVersion::SEARCH_V17 | BackendVersion::SEARCH_V18
+        );
 
-        // State zero enters discovery. V17 clears a failed retained bit and
+        // State zero enters discovery. V17 and V18 clear a failed retained bit and
         // continues with the learned column; V14-V16 keep their frozen
         // one-way transition to V13.
         template.compare_branch_zero(11, false, discover);
@@ -2487,7 +2585,7 @@ fn emit_exact_candidates_v8(
         template.compare_equal_bytes16(16, 16, 24);
         if matches!(
             manifest.backend_version,
-            BackendVersion::SEARCH_V16 | BackendVersion::SEARCH_V17
+            BackendVersion::SEARCH_V16 | BackendVersion::SEARCH_V17 | BackendVersion::SEARCH_V18
         ) {
             template.unsigned_max_pairwise_bytes16(18, 16, 16);
             template.move_vector_double_to64(0, 18);
@@ -2638,7 +2736,50 @@ fn emit_exact_candidates_v8(
         template.mov_reg(10, 10);
     }
     template.bind(tail_setup)?;
-    emit_scalar_candidates_v2(template, literal, none, found)
+    emit_scalar_candidates_v2(template, literal, none, found)?;
+
+    if manifest.backend_version == BackendVersion::SEARCH_V18 {
+        let secondary_only = secondary_only.ok_or(AuditError::InvalidSearchManifest)?;
+        let secondary_only_advance =
+            secondary_only_advance.ok_or(AuditError::InvalidSearchManifest)?;
+        let offset = secondary_offset.ok_or(AuditError::InvalidSearchManifest)?;
+        template.bind(secondary_only_advance)?;
+        template.add_imm(5, 5, 64);
+        template.add_imm(15, 15, 64);
+        template.cmp_reg64(5, 7);
+        template.branch_cond(Condition::LowerOrSame, secondary_only);
+        template.branch(narrow_setup);
+
+        template.bind(secondary_only)?;
+        let delta = offset.abs_diff(primary_offset);
+        if offset > primary_offset {
+            template.add_imm(10, 15, delta);
+        } else {
+            template.sub_imm(10, 15, delta);
+        }
+        template.load_vector_pair128(0, 2, 10, 0);
+        template.load_vector_pair128(4, 6, 10, 32);
+        template.compare_equal_bytes16(0, 0, 3);
+        template.compare_equal_bytes16(2, 2, 3);
+        template.compare_equal_bytes16(4, 4, 3);
+        template.compare_equal_bytes16(6, 6, 3);
+        emit_four_block_presence_v8(template);
+        template.compare_branch_zero(10, false, secondary_only_advance);
+        template.load_vector_pair128(18, 19, 15, 0);
+        template.load_vector_pair128(20, 21, 15, 32);
+        template.compare_equal_bytes16(18, 18, 1);
+        template.and_bytes16(0, 0, 18);
+        template.compare_equal_bytes16(19, 19, 1);
+        template.and_bytes16(2, 2, 19);
+        template.compare_equal_bytes16(20, 20, 1);
+        template.and_bytes16(4, 4, 20);
+        template.compare_equal_bytes16(21, 21, 1);
+        template.and_bytes16(6, 6, 21);
+        emit_four_block_presence_v8(template);
+        template.compare_branch_zero(10, false, wide_advance);
+        template.branch(narrow_setup);
+    }
+    Ok(())
 }
 
 #[allow(
@@ -2928,6 +3069,12 @@ fn emit_four_block_presence_v8(template: &mut Template) {
     template.unsigned_max_pairwise_bytes16(16, 16, 17);
     template.unsigned_max_pairwise_bytes16(16, 16, 16);
     template.move_vector_double_to64(10, 16);
+}
+
+fn emit_branch_if_four_masks_have_multiple(template: &mut Template, target: Label) {
+    template.mov_imm64(16, 0x0101_0101_0101_0101);
+    template.and_reg(10, 10, 16);
+    emit_branch_if_mask_has_multiple(template, 10, 16, target);
 }
 
 fn emit_branch_if_mask_has_multiple(template: &mut Template, mask: u8, scratch: u8, target: Label) {
