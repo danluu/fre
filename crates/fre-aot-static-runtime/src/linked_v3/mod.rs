@@ -364,10 +364,10 @@ struct VerifiedCoreV3 {
 /// Production-only callable Count-v3 handle.
 ///
 /// Its fields are private and the production adopter can construct it only
-/// after an exact source-row match. The currently empty production table means
-/// no ordinary build can yet obtain this value. This movable handle remains
-/// ASIMD-only; SVE evidence promotion requires a separate source-authorized
-/// production same-thread handle/session.
+/// after an exact source-row match. This movable handle remains ASIMD-only;
+/// SVE/SVE2 authority is disjoint and cannot open its raw-address adopter.
+/// SVE evidence promotion uses a separate source-authorized production
+/// same-thread handle/session.
 #[derive(Debug)]
 pub struct VerifiedStaticCountV3 {
     core: VerifiedCoreV3,
@@ -882,7 +882,8 @@ impl VerifiedCoreV3 {
 
 /// Adopt one production-linked image.
 ///
-/// The empty production table is checked before any supplied address is read.
+/// The movable-ASIMD production table is checked before any supplied address
+/// is read. SVE/SVE2-only authority cannot open this address boundary.
 ///
 /// # Safety
 ///
@@ -896,7 +897,7 @@ impl VerifiedCoreV3 {
 pub unsafe fn adopt_linked_static_count_v3(
     linked: StaticCountLinkedAddressesV3,
 ) -> Result<VerifiedStaticCountV3, StaticCountVerifyErrorV3> {
-    support_v3::require_nonempty_production_authority()?;
+    support_v3::require_nonempty_production_asimd_authority()?;
     if !cfg!(feature = "linked-count-v3") {
         return Err(StaticCountVerifyErrorV3::LinkedCountV3FeatureDisabled);
     }

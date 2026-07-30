@@ -31,9 +31,17 @@ const _: () = assert!(
 );
 
 /// Refuse before touching any caller-provided address when production has no
-/// source-reviewed class.
-pub(crate) fn require_nonempty_production_authority() -> Result<(), StaticCountVerifyErrorV3> {
-    if PRODUCTION_COUNT_V3_ELIGIBILITY_ROWS.is_empty() {
+/// source-reviewed movable ASIMD class.
+///
+/// SVE/SVE2 rows use the disjoint same-thread adopter, which authenticates its
+/// caller-supplied tuple before reading an address. An SVE-only promotion must
+/// therefore not open the ordinary movable-handle address boundary.
+pub(crate) fn require_nonempty_production_asimd_authority() -> Result<(), StaticCountVerifyErrorV3>
+{
+    if !PRODUCTION_COUNT_V3_ELIGIBILITY_ROWS
+        .iter()
+        .any(|tuple| tuple.required_isa_id == 1 && production_tuple_target_shape_is_closed(tuple))
+    {
         Err(StaticCountVerifyErrorV3::NoProductionAuthority)
     } else {
         Ok(())
@@ -44,7 +52,9 @@ pub(crate) fn require_nonempty_production_authority() -> Result<(), StaticCountV
 pub(crate) fn require_production_tuple(
     tuple: CountGeneralEligibilityTupleV3,
 ) -> Result<(), StaticCountVerifyErrorV3> {
-    require_nonempty_production_authority()?;
+    if PRODUCTION_COUNT_V3_ELIGIBILITY_ROWS.is_empty() {
+        return Err(StaticCountVerifyErrorV3::NoProductionAuthority);
+    }
     if production_tuple_target_shape_is_closed(&tuple)
         && PRODUCTION_COUNT_V3_ELIGIBILITY_ROWS.contains(&tuple)
     {
@@ -140,7 +150,7 @@ mod tests {
     #[test]
     fn production_authority_is_source_empty() {
         assert_eq!(
-            require_nonempty_production_authority(),
+            require_nonempty_production_asimd_authority(),
             Err(StaticCountVerifyErrorV3::NoProductionAuthority)
         );
         assert!(identity_is_zero(&COUNT_V3_PROMOTION_BUNDLE_MANIFEST_SHA256));
