@@ -123,6 +123,10 @@ class LinkProofTests(unittest.TestCase):
         self.assertFalse(VERIFIER.is_strict_int(True))
         self.assertTrue(VERIFIER.is_strict_int(1, 1))
 
+    def test_zero_identity_is_refused(self) -> None:
+        with self.assertRaises(VERIFIER.Refusal):
+            VERIFIER.require_sha("0" * 64, "zero identity")
+
 
 if __name__ == "__main__":
     unittest.main()

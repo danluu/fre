@@ -106,7 +106,12 @@ def is_strict_int(value: Any, minimum: int = 0) -> bool:
 
 
 def require_sha(value: Any, label: str) -> str:
-    require(isinstance(value, str) and HEX64.fullmatch(value) is not None, label)
+    require(
+        isinstance(value, str)
+        and HEX64.fullmatch(value) is not None
+        and value != "0" * 64,
+        label,
+    )
     return value
 
 
@@ -306,7 +311,7 @@ def ascii_c_string(table: bytes, offset: int, label: str) -> str:
         value = table[offset:end].decode("ascii")
     except UnicodeDecodeError as error:
         raise Refusal(f"{label} string is not ASCII") from error
-    require(0 < len(value) <= 1024, f"{label} string length is invalid")
+    require(0 < len(value) <= 1 << 20, f"{label} string length is invalid")
     return value
 
 
@@ -410,7 +415,7 @@ def parse_macho(
     for index in range(symbol_count):
         entry = MACH_NLIST_64.unpack_from(raw, symbol_offset + index * MACH_NLIST_64.size)
         string_index, symbol_type, section_ordinal, _description, value = entry
-        if string_index == 0:
+        if string_index == 0 or symbol_type & N_STAB:
             indexed_names.append(None)
             continue
         name = normalize_mach_symbol(
@@ -421,8 +426,6 @@ def parse_macho(
             if relocation_tables or wanted_symbols is None or name in wanted_symbols
             else None
         )
-        if symbol_type & N_STAB:
-            continue
         kind = symbol_type & N_TYPE
         defined = kind == N_SECT and section_ordinal != 0
         if not defined and kind != N_UNDF:
@@ -617,12 +620,15 @@ class MapDefinition:
     address: int
 
 
-def strict_ascii(raw: bytes, label: str) -> str:
-    require(raw.endswith(b"\n") and b"\0" not in raw and b"\r" not in raw, f"{label} is not canonical text")
-    try:
-        return raw.decode("ascii")
-    except UnicodeDecodeError as error:
-        raise Refusal(f"{label} is not ASCII") from error
+def link_map_text(raw: bytes) -> str:
+    require(
+        raw.endswith(b"\n") and b"\0" not in raw and b"\r" not in raw,
+        "link map is not one LF-terminated byte stream",
+    )
+    # Apple ld includes raw non-UTF-8 literal payloads in map diagnostics.
+    # Latin-1 preserves each byte one-to-one; every accepted candidate path,
+    # address, provider label, and symbol line is independently ASCII-shaped.
+    return raw.decode("latin-1")
 
 
 def map_symbol_name(value: str, target_os: str) -> str:
@@ -1580,7 +1586,7 @@ def verify(
             final_image.kind.endswith("-image"),
             "linked-image artifact is not a final image",
         )
-        map_text = strict_ascii(link_map_raw, "link map")
+        map_text = link_map_text(link_map_raw)
         expected_paths = {
             item["linker_path"] for item in link_payload["inputs"]
         }
