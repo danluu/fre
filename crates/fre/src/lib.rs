@@ -5607,6 +5607,50 @@ mod tests {
     }
 
     #[test]
+    fn guarded_suffix_inside_class_bounded_shortest_matches_earliest_oracle() {
+        for (pattern, haystack) in [
+            (r"\b[AB]+B\b", b"\xff!AABB!CBB!\x80".as_slice()),
+            (r"\b[A-T]+T\b", b"\x80!AMTT!UT!\xff".as_slice()),
+        ] {
+            let regex = PortableBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            assert_eq!(
+                regex.build_report().plan,
+                PlanKind::LiteralClassRunLiteral,
+                "{pattern:?}"
+            );
+            let oracle = regex::bytes::RegexBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            let mut bounded_windows = 0_usize;
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let expected = oracle
+                        .shortest_match_at(haystack, start)
+                        .filter(|&matched_end| matched_end <= end);
+                    let actual = regex
+                        .shortest_match_window(
+                            haystack,
+                            SearchWindow::new(start, end),
+                            SearchLimits::unlimited(),
+                        )
+                        .unwrap()
+                        .0;
+                    assert_eq!(
+                        actual, expected,
+                        "pattern={pattern:?} haystack={haystack:?} window={start}..{end}"
+                    );
+                    bounded_windows += usize::from(end < haystack.len());
+                }
+            }
+            assert!(bounded_windows > 0);
+        }
+    }
+
+    #[test]
     fn production_routing_selects_only_the_evidence_backed_anchor_slice() {
         let selected = PortableBuilder::new("[a-z]+Z")
             .unicode(false)

@@ -138,6 +138,75 @@ fn assert_exhaustive_windows(pattern: &str, alphabet: &[u8], maximum_length: usi
     }
 }
 
+fn assert_metered_window_matches_oracle(pattern: &str, haystack: &[u8], start: usize, end: usize) {
+    let regex = portable(pattern);
+    let expected = oracle(pattern)
+        .find(Input::new(haystack).span(start..end))
+        .map(|matched| (matched.start(), matched.end()));
+    let (unlimited, unlimited_accounting) = regex
+        .find_window(
+            haystack,
+            SearchWindow::new(start, end),
+            SearchLimits::unlimited(),
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "unlimited search failed pattern={pattern:?} haystack={haystack:?} \
+                 window={start}..{end}: {error}"
+            )
+        });
+    assert_eq!(
+        unlimited.map(|matched| (matched.start(), matched.end())),
+        expected,
+        "unlimited pattern={pattern:?} haystack={haystack:?} window={start}..{end}"
+    );
+    let SearchAccounting::LiteralClassRunLiteral(unlimited_accounting) = unlimited_accounting
+    else {
+        panic!("wrong unlimited accounting family for {pattern:?}");
+    };
+    let exact_work = u64::try_from(unlimited_accounting.work).unwrap();
+    assert!(
+        exact_work < unlimited_accounting.work_upper_bound,
+        "test must select metered scalar service pattern={pattern:?} \
+         haystack={haystack:?} window={start}..{end}"
+    );
+
+    let (metered, metered_accounting) = regex
+        .find_window(
+            haystack,
+            SearchWindow::new(start, end),
+            SearchLimits {
+                max_work: exact_work,
+                max_scratch_bytes: unlimited_accounting.scratch_bytes,
+            },
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "exact metered search failed pattern={pattern:?} haystack={haystack:?} \
+                 window={start}..{end} max_work={exact_work}: {error}"
+            )
+        });
+    assert_eq!(
+        metered.map(|matched| (matched.start(), matched.end())),
+        expected,
+        "metered pattern={pattern:?} haystack={haystack:?} window={start}..{end}"
+    );
+    let SearchAccounting::LiteralClassRunLiteral(metered_accounting) = metered_accounting else {
+        panic!("wrong metered accounting family for {pattern:?}");
+    };
+    assert_eq!(metered_accounting.work, unlimited_accounting.work);
+    assert_eq!(
+        metered_accounting.source_reads,
+        unlimited_accounting.source_reads
+    );
+    assert_eq!(
+        metered_accounting.candidate_visits,
+        unlimited_accounting.candidate_visits
+    );
+    assert!(u64::try_from(metered_accounting.work).unwrap() <= exact_work);
+    assert!(metered_accounting.work_upper_bound > exact_work);
+}
+
 #[test]
 fn generalized_and_singleton_shapes_have_stable_route_identity() {
     let singleton = portable(r"ab+c");
@@ -181,6 +250,12 @@ fn exhaustive_singleton_star_overlap_and_word_subset_match_oracles() {
     assert_exhaustive_windows(r"a[ab]+c", b"abc!", 5);
     assert_exhaustive_windows(r"a[bc]*", b"abc!", 5);
     assert_exhaustive_windows(r"\b[A-B]+T\b", b"ABT!0_\xff", 5);
+}
+
+#[test]
+fn exhaustive_guarded_suffix_inside_class_windows_match_oracles() {
+    assert_exhaustive_windows(r"\b[AB]+B\b", b"ABC!\x80\xff", 4);
+    assert_exhaustive_windows(r"\b[A-T]+T\b", b"AMTU!\x80\xff", 4);
 }
 
 #[test]
@@ -468,6 +543,30 @@ fn large_windows_meter_actual_work_instead_of_refusing_the_full_envelope() {
             }
         ))
     ));
+}
+
+#[test]
+fn metered_scalar_interior_matches_and_no_match_tails_match_oracles() {
+    let general = b"!!!!!!!!abxyxycd!!!!!!!!!!!!";
+    let general_match = oracle(r"ab[xy]+cd").find(general).unwrap();
+    assert_metered_window_matches_oracle(r"ab[xy]+cd", general, 0, general.len());
+    assert_metered_window_matches_oracle(r"ab[xy]+cd", general, 3, general.len() - 3);
+    assert_metered_window_matches_oracle(r"ab[xy]+cd", general, general_match.end(), general.len());
+
+    let rejected = b"!!!!abxyxyce!!!!abxxxxx!!!!";
+    assert_metered_window_matches_oracle(r"ab[xy]+cd", rejected, 0, rejected.len());
+    assert_metered_window_matches_oracle(r"ab[xy]+cd", rejected, 2, rejected.len() - 2);
+
+    let guarded = b"\xffCC!!AABB!!CC\x80";
+    let guarded_match = oracle(r"\b[AB]+B\b").find(guarded).unwrap();
+    assert_metered_window_matches_oracle(r"\b[AB]+B\b", guarded, 0, guarded.len());
+    assert_metered_window_matches_oracle(r"\b[AB]+B\b", guarded, 2, guarded.len() - 2);
+    assert_metered_window_matches_oracle(
+        r"\b[AB]+B\b",
+        guarded,
+        guarded_match.end(),
+        guarded.len(),
+    );
 }
 
 #[test]
