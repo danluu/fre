@@ -1258,10 +1258,15 @@ unsafe fn adopt_selected_static_search_span_family_v1(
     );
     // SAFETY: family resolution preceded every address operation and the raw
     // boundary supplies process-lifetime final-image symbols.
-    let Ok(verified) =
-        (unsafe { adopt_source_qualified_static_search_span_family_v1(registry, symbols, family) })
-    else {
-        return STATIC_SEARCH_SPAN_ADOPT_STATUS_REFUSED_V1;
+    let verified = match unsafe {
+        adopt_source_qualified_static_search_span_family_v1(registry, symbols, family)
+    } {
+        Ok(verified) => verified,
+        Err(error) => {
+            #[cfg(feature = "search-span-qualification-private-v1")]
+            eprintln!("FRE private Search family qualification verification refused: {error:?}");
+            return STATIC_SEARCH_SPAN_ADOPT_STATUS_REFUSED_V1;
+        }
     };
     // SAFETY: output is a caller-owned writable slot touched only after the
     // complete family, mapped-image, and semantic reconstruction audit.
