@@ -5102,6 +5102,13 @@ fn policy_multi_specialized_v3(
             )?;
             policy.bind(wide_batch_done)?;
         }
+        if static_wide {
+            compare_register64_v3(policy, X3, X4)?;
+            condition_v3(policy, ConditionV3::Higher, done)?;
+            subtract_register64_v3(policy, X5, X4, X3)?;
+            compare_immediate64_v3(policy, X5, SPARSE_SCAN_STARTS_V3 - 1)?;
+            condition_v3(policy, ConditionV3::CarrySet, wide_batch)?;
+        }
         branch_v3(policy, vector)?;
 
         if let (Some(wide_pair_batch), Some(wide_pair_hit)) = (wide_pair_batch, wide_pair_hit) {
@@ -5337,6 +5344,13 @@ fn policy_multi_specialized_v3(
 
         policy.bind(wide_batch_empty)?;
         add_immediate64_v3(policy, X3, X3, SPARSE_SCAN_STARTS_V3)?;
+        if static_wide {
+            compare_register64_v3(policy, X3, X4)?;
+            condition_v3(policy, ConditionV3::Higher, done)?;
+            subtract_register64_v3(policy, X5, X4, X3)?;
+            compare_immediate64_v3(policy, X5, SPARSE_SCAN_STARTS_V3 - 1)?;
+            condition_v3(policy, ConditionV3::CarrySet, wide_batch)?;
+        }
         branch_v3(policy, vector)?;
     }
 

@@ -3288,6 +3288,17 @@ fn emit_multi_specialized_v3(
             assembler.or_bytes16(20, vector_registers[0], vector_registers[0])?;
             assembler.bind(wide_batch_done)?;
         }
+        if static_wide {
+            // A complete retained batch advanced exactly 128 starts. Keep the
+            // static hot path closed when another full batch is available
+            // instead of redoing the generic vector-head exhaustion and
+            // remaining-length checks on every iteration.
+            assembler.cmp_reg64(X3, X4)?;
+            assembler.branch_cond(ConditionV3::Higher, done)?;
+            assembler.sub_reg(X5, X4, X3)?;
+            assembler.cmp_imm64(X5, SPARSE_SCAN_STARTS_V3 - 1)?;
+            assembler.branch_cond(ConditionV3::CarrySet, wide_batch)?;
+        }
         assembler.branch(vector)?;
 
         if let (Some(wide_pair_batch), Some(wide_pair_hit)) = (wide_pair_batch, wide_pair_hit) {
@@ -3372,6 +3383,13 @@ fn emit_multi_specialized_v3(
 
         assembler.bind(wide_batch_empty)?;
         assembler.add_imm(X3, X3, SPARSE_SCAN_STARTS_V3)?;
+        if static_wide {
+            assembler.cmp_reg64(X3, X4)?;
+            assembler.branch_cond(ConditionV3::Higher, done)?;
+            assembler.sub_reg(X5, X4, X3)?;
+            assembler.cmp_imm64(X5, SPARSE_SCAN_STARTS_V3 - 1)?;
+            assembler.branch_cond(ConditionV3::CarrySet, wide_batch)?;
+        }
         assembler.branch(vector)?;
     }
 
