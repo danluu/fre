@@ -49,6 +49,9 @@ pub enum SearchExactLiteralAotBindErrorV1 {
         portable_bytes: u32,
         adopted_bytes: u32,
     },
+    /// The adopted compiler-domain literal identity does not authenticate the
+    /// portable owner's exact literal bytes.
+    LiteralIdentityMismatch,
 }
 
 impl fmt::Display for SearchExactLiteralAotBindErrorV1 {
@@ -121,6 +124,7 @@ impl<'binding> SearchExactLiteralAotV1<'binding> {
             portable_owner.exact_literal_search_aot_candidate(),
             verified.semantic_binding_identity(),
             verified.live_literal_bytes(),
+            |literal| verified.authenticates_literal(literal),
         )?;
         Ok(Self {
             portable_owner,
@@ -342,6 +346,7 @@ fn check_binding_v1(
     candidate: Option<SearchExactLiteralAotCandidate<'_>>,
     adopted_semantic_binding_identity: &[u8; 32],
     adopted_literal_bytes: u32,
+    authenticates_literal: impl FnOnce(&[u8]) -> bool,
 ) -> Result<CheckedBindingV1, SearchExactLiteralAotBindErrorV1> {
     let candidate = candidate
         .ok_or(SearchExactLiteralAotBindErrorV1::PortableOwnerIsNotExactLiteralCandidate)?;
@@ -360,6 +365,9 @@ fn check_binding_v1(
             portable_bytes: portable_literal_bytes,
             adopted_bytes: adopted_literal_bytes,
         });
+    }
+    if !authenticates_literal(candidate.literal()) {
+        return Err(SearchExactLiteralAotBindErrorV1::LiteralIdentityMismatch);
     }
     Ok(CheckedBindingV1 {
         semantic_binding_identity: portable_identity,
@@ -392,8 +400,13 @@ mod tests {
         let identity = *candidate.semantic_binding_identity().as_bytes();
         let width = u32::try_from(candidate.literal().len()).unwrap();
 
-        let checked =
-            check_binding_v1(regex.exact_literal_search_aot_candidate(), &identity, width).unwrap();
+        let checked = check_binding_v1(
+            regex.exact_literal_search_aot_candidate(),
+            &identity,
+            width,
+            |_| true,
+        )
+        .unwrap();
 
         assert_eq!(checked.semantic_binding_identity.as_bytes(), &identity);
         assert_eq!(checked.literal_bytes, width);
@@ -412,6 +425,7 @@ mod tests {
                 regex.exact_literal_search_aot_candidate(),
                 &different_identity,
                 width,
+                |_| true,
             ),
             Err(SearchExactLiteralAotBindErrorV1::SemanticBindingIdentityMismatch { .. })
         ));
@@ -420,6 +434,7 @@ mod tests {
                 regex.exact_literal_search_aot_candidate(),
                 &identity,
                 width.checked_add(1).unwrap(),
+                |_| true,
             ),
             Err(SearchExactLiteralAotBindErrorV1::LiveLiteralWidthMismatch {
                 portable_bytes: width,
@@ -432,9 +447,28 @@ mod tests {
             check_binding_v1(
                 nonexact.exact_literal_search_aot_candidate(),
                 &identity,
-                width
+                width,
+                |_| true,
             ),
             Err(SearchExactLiteralAotBindErrorV1::PortableOwnerIsNotExactLiteralCandidate)
+        );
+    }
+
+    #[test]
+    fn source_binding_refuses_same_width_literal_substitution() {
+        let regex = PortableBuilder::new("needle").build().unwrap();
+        let candidate = regex.exact_literal_search_aot_candidate().unwrap();
+        let identity = *candidate.semantic_binding_identity().as_bytes();
+        let width = u32::try_from(candidate.literal().len()).unwrap();
+
+        assert_eq!(
+            check_binding_v1(
+                regex.exact_literal_search_aot_candidate(),
+                &identity,
+                width,
+                |literal| literal == b"former",
+            ),
+            Err(SearchExactLiteralAotBindErrorV1::LiteralIdentityMismatch)
         );
     }
 

@@ -32,7 +32,11 @@ libc = "=0.2.186"
 sha2 = "=0.10.9"
 
 [dev-dependencies]
+fre = { path = "../fre", default-features = false }
+fre-aot-compiler = { path = "../fre-aot-compiler" }
 fre-aot-count-compiler = { path = "../fre-aot-count-compiler" }
+fre-aot-elf = { path = "../fre-aot-elf" }
+fre-aot-macho = { path = "../fre-aot-macho" }
 
 [lints.rust]
 unsafe_code = "deny"

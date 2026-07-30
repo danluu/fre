@@ -1,9 +1,25 @@
-use fre_aot_search_contract::ClaimedStaticSearchSpanExpectationV1;
+use fre_aot_search_contract::{
+    AOT_SEARCH_COMPILER_VERSION_V1, ClaimedStaticSearchSpanExpectationV1,
+    MAX_STATIC_SEARCH_SPAN_LITERAL_BYTES_V1, MIN_STATIC_SEARCH_SPAN_LITERAL_BYTES_V1,
+    SEARCH_ARCHITECTURE_AARCH64_V1, SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1,
+    SEARCH_BACKEND_VERSION_V1, SEARCH_CALL_ABI_SCHEMA_V1,
+    SEARCH_EXPORTED_SYMBOL_INFO_ELF_FUNCTION_V1, SEARCH_EXPORTED_SYMBOL_N_TYPE_V1,
+    SEARCH_EXPORTED_SYMBOL_SCHEMA_VERSION_V1, SEARCH_METADATA_VERSION_V1, SEARCH_PLATFORM_LINUX_V1,
+    SEARCH_PLATFORM_MACOS_V1, SEARCH_POINTER_WIDTH_V1, SEARCH_REQUIRED_ASIMD_FEATURES_V1,
+    SEARCH_REQUIRED_SVE2_FIXED16_FEATURES_V1, SEARCH_SPAN_OUTPUT_KIND_V1, SEARCH_STATUS_BITS_V1,
+    SEARCH_TARGET_ABI_AAPCS64_V1,
+};
 
 use crate::{StaticSearchSpanContractFieldV1, StaticSearchSpanVerifyErrorV1};
 
 pub(crate) const HARD_MAX_STATIC_SEARCH_SPAN_QUALIFICATION_ROWS_V1: usize = 256;
 pub(crate) const HARD_MAX_STATIC_SEARCH_SPAN_PRODUCTION_FAMILIES_V1: usize = 32;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SourceQualifiedStaticSearchSpanAuthorityV1 {
+    Exact(&'static SourceQualifiedStaticSearchSpanRowV1),
+    Family(&'static SourceQualifiedStaticSearchSpanFamilyV1),
+}
 
 mod production_rows;
 use production_rows::PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SPAN_ROWS_V1;
@@ -146,6 +162,35 @@ impl SourceQualifiedStaticSearchSpanFamilyV1 {
             minimum_literal_bytes,
             maximum_literal_bytes,
             [0x5a; 32],
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_claim(
+        selector: u16,
+        claim: ClaimedStaticSearchSpanExpectationV1,
+        minimum_literal_bytes: u32,
+        maximum_literal_bytes: u32,
+    ) -> Self {
+        Self::production(
+            selector,
+            claim.compiler_version(),
+            claim.metadata_version(),
+            claim.backend_version(),
+            claim.call_abi_schema(),
+            claim.exported_symbol_schema(),
+            claim.output_kind(),
+            claim.architecture(),
+            claim.little_endian(),
+            claim.pointer_width(),
+            claim.target_abi(),
+            claim.platform(),
+            claim.status_bits(),
+            claim.exported_symbol_n_type(),
+            claim.required_features(),
+            minimum_literal_bytes,
+            maximum_literal_bytes,
+            *claim.manifest_identity(),
         )
     }
 
@@ -392,8 +437,7 @@ const fn production_families_are_canonical(
     let mut index = 0_usize;
     while index < rows.len() {
         let row = &rows[index];
-        if row.minimum_literal_bytes == 0
-            || row.minimum_literal_bytes > row.maximum_literal_bytes
+        if !production_family_profile_is_canonical(row)
             || identity_is_zero(&row.manifest_identity.0)
         {
             return false;
@@ -401,9 +445,100 @@ const fn production_families_are_canonical(
         if index > 0 && rows[index - 1].selector >= row.selector {
             return false;
         }
+        let mut earlier = 0_usize;
+        while earlier < index {
+            if same_production_family_profile(&rows[earlier], row)
+                && ranges_overlap(
+                    rows[earlier].minimum_literal_bytes,
+                    rows[earlier].maximum_literal_bytes,
+                    row.minimum_literal_bytes,
+                    row.maximum_literal_bytes,
+                )
+            {
+                return false;
+            }
+            earlier += 1;
+        }
         index += 1;
     }
     true
+}
+
+const fn production_family_profile_is_canonical(
+    family: &SourceQualifiedStaticSearchSpanFamilyV1,
+) -> bool {
+    if family.compiler_version != AOT_SEARCH_COMPILER_VERSION_V1
+        || family.metadata_version != SEARCH_METADATA_VERSION_V1
+        || family.call_abi_schema != SEARCH_CALL_ABI_SCHEMA_V1
+        || family.exported_symbol_schema != SEARCH_EXPORTED_SYMBOL_SCHEMA_VERSION_V1
+        || family.output_kind != SEARCH_SPAN_OUTPUT_KIND_V1
+        || family.architecture != SEARCH_ARCHITECTURE_AARCH64_V1
+        || !family.little_endian
+        || family.pointer_width != SEARCH_POINTER_WIDTH_V1
+        || family.target_abi != SEARCH_TARGET_ABI_AAPCS64_V1
+        || family.status_bits != SEARCH_STATUS_BITS_V1
+        || family.minimum_literal_bytes < MIN_STATIC_SEARCH_SPAN_LITERAL_BYTES_V1
+        || family.maximum_literal_bytes > MAX_STATIC_SEARCH_SPAN_LITERAL_BYTES_V1
+        || family.minimum_literal_bytes > family.maximum_literal_bytes
+    {
+        return false;
+    }
+    match (
+        family.platform,
+        family.backend_version,
+        family.required_features,
+        family.exported_symbol_n_type,
+    ) {
+        (
+            SEARCH_PLATFORM_MACOS_V1,
+            SEARCH_BACKEND_VERSION_V1,
+            SEARCH_REQUIRED_ASIMD_FEATURES_V1,
+            SEARCH_EXPORTED_SYMBOL_N_TYPE_V1,
+        )
+        | (
+            SEARCH_PLATFORM_LINUX_V1,
+            SEARCH_BACKEND_VERSION_V1,
+            SEARCH_REQUIRED_ASIMD_FEATURES_V1,
+            SEARCH_EXPORTED_SYMBOL_INFO_ELF_FUNCTION_V1,
+        ) => true,
+        (
+            SEARCH_PLATFORM_LINUX_V1,
+            SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1,
+            SEARCH_REQUIRED_SVE2_FIXED16_FEATURES_V1,
+            SEARCH_EXPORTED_SYMBOL_INFO_ELF_FUNCTION_V1,
+        ) => family.minimum_literal_bytes == 16 && family.maximum_literal_bytes == 16,
+        _ => false,
+    }
+}
+
+const fn same_production_family_profile(
+    left: &SourceQualifiedStaticSearchSpanFamilyV1,
+    right: &SourceQualifiedStaticSearchSpanFamilyV1,
+) -> bool {
+    left.compiler_version == right.compiler_version
+        && left.metadata_version == right.metadata_version
+        && left.backend_version == right.backend_version
+        && left.call_abi_schema == right.call_abi_schema
+        && left.exported_symbol_schema == right.exported_symbol_schema
+        && left.output_kind == right.output_kind
+        && left.architecture == right.architecture
+        && left.little_endian == right.little_endian
+        && left.pointer_width == right.pointer_width
+        && left.target_abi == right.target_abi
+        && left.platform == right.platform
+        && left.status_bits == right.status_bits
+        && left.exported_symbol_n_type == right.exported_symbol_n_type
+        && left.required_features == right.required_features
+        && identities_equal(&left.manifest_identity.0, &right.manifest_identity.0)
+}
+
+const fn ranges_overlap(
+    left_minimum: u32,
+    left_maximum: u32,
+    right_minimum: u32,
+    right_maximum: u32,
+) -> bool {
+    left_minimum <= right_maximum && right_minimum <= left_maximum
 }
 
 const fn identity_is_zero(identity: &[u8; 32]) -> bool {
@@ -415,6 +550,64 @@ const fn identity_is_zero(identity: &[u8; 32]) -> bool {
         index += 1;
     }
     true
+}
+
+const fn identities_equal(left: &[u8; 32], right: &[u8; 32]) -> bool {
+    let mut index = 0_usize;
+    while index < left.len() {
+        if left[index] != right[index] {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+fn production_authority_tables_are_canonical() -> bool {
+    production_authority_tables_are_canonical_for(
+        PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SPAN_ROWS_V1,
+        PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SPAN_FAMILIES_V1,
+    )
+}
+
+fn production_authority_tables_are_canonical_for(
+    rows: &[SourceQualifiedStaticSearchSpanRowV1],
+    families: &[SourceQualifiedStaticSearchSpanFamilyV1],
+) -> bool {
+    if !qualification_rows_are_canonical(rows) || !production_families_are_canonical(families) {
+        return false;
+    }
+    for row in rows {
+        if families
+            .iter()
+            .any(|family| family.selector == row.selector)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+pub(crate) fn require_production_search_span_authority_v1(
+    selector: u32,
+) -> Result<SourceQualifiedStaticSearchSpanAuthorityV1, StaticSearchSpanVerifyErrorV1> {
+    let rows = PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SPAN_ROWS_V1;
+    let families = PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SPAN_FAMILIES_V1;
+    if rows.is_empty() && families.is_empty() {
+        return Err(StaticSearchSpanVerifyErrorV1::NoQualifiedStaticSearchSpanRowV1);
+    }
+    if !production_authority_tables_are_canonical() {
+        return Err(StaticSearchSpanVerifyErrorV1::MalformedStaticSearchSpanQualificationTableV1);
+    }
+    let selector = u16::try_from(selector)
+        .map_err(|_| StaticSearchSpanVerifyErrorV1::UnqualifiedStaticSearchSpanSelectorV1)?;
+    if let Some(row) = rows.iter().find(|row| row.selector == selector) {
+        return Ok(SourceQualifiedStaticSearchSpanAuthorityV1::Exact(row));
+    }
+    if let Some(family) = families.iter().find(|family| family.selector == selector) {
+        return Ok(SourceQualifiedStaticSearchSpanAuthorityV1::Family(family));
+    }
+    Err(StaticSearchSpanVerifyErrorV1::UnqualifiedStaticSearchSpanSelectorV1)
 }
 
 pub(crate) fn require_production_search_span_family_v1(
@@ -459,8 +652,9 @@ pub(crate) fn require_private_qualification_search_span_row_v1(
 }
 
 #[cfg(test)]
-pub(crate) const fn production_rows_are_empty_for_test_v1() -> bool {
+pub(crate) const fn production_authorities_are_empty_for_test_v1() -> bool {
     PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SPAN_ROWS_V1.is_empty()
+        && PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SPAN_FAMILIES_V1.is_empty()
 }
 
 #[cfg(all(test, feature = "search-span-qualification-private-v1"))]
@@ -576,6 +770,41 @@ mod tests {
         assert!(!production_families_are_canonical(&empty_width));
         let inverted = [SourceQualifiedStaticSearchSpanFamilyV1::test_only(3, 9, 8)];
         assert!(!production_families_are_canonical(&inverted));
+        let overlapping = [
+            SourceQualifiedStaticSearchSpanFamilyV1::test_only(3, 2, 16),
+            SourceQualifiedStaticSearchSpanFamilyV1::test_only(9, 8, 32),
+        ];
+        assert!(!production_families_are_canonical(&overlapping));
+
+        let mut wrong_backend = valid[0];
+        wrong_backend.backend_version = 7;
+        assert!(!production_families_are_canonical(&[wrong_backend]));
+        let mut wrong_platform = valid[0];
+        wrong_platform.platform = 9;
+        assert!(!production_families_are_canonical(&[wrong_platform]));
+        let mut wrong_features = valid[0];
+        wrong_features.required_features = SEARCH_REQUIRED_SVE2_FIXED16_FEATURES_V1;
+        assert!(!production_families_are_canonical(&[wrong_features]));
+
+        let fixture = crate::search_test_fixture::static_search_span_fixture_v1();
+        let ambiguous = [SourceQualifiedStaticSearchSpanFamilyV1::test_only(
+            fixture.row.selector(),
+            1,
+            32,
+        )];
+        assert!(!production_authority_tables_are_canonical_for(
+            &[fixture.row],
+            &ambiguous,
+        ));
+        let disjoint = [SourceQualifiedStaticSearchSpanFamilyV1::test_only(
+            fixture.row.selector().checked_add(1).unwrap(),
+            1,
+            32,
+        )];
+        assert!(production_authority_tables_are_canonical_for(
+            &[fixture.row],
+            &disjoint,
+        ));
     }
 
     #[cfg(feature = "search-span-qualification-private-v1")]

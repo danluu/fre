@@ -230,9 +230,13 @@ dependencies = [
 name = "fre-aot-static-runtime"
 version = "0.1.0"
 dependencies = [
+ "fre",
  "fre-aot-aarch64",
+ "fre-aot-compiler",
  "fre-aot-count-compiler",
  "fre-aot-count-contract",
+ "fre-aot-elf",
+ "fre-aot-macho",
  "fre-aot-optimizer",
  "fre-aot-search-contract",
  "fre-jit-aarch64",

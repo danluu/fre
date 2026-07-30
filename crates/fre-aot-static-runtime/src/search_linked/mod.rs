@@ -12,7 +12,8 @@ use std::{
 
 use fre_aot_search_contract::{
     ClaimedSearchMetadataV1, SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1, SEARCH_BACKEND_VERSION_V1,
-    SEARCH_METADATA_BYTES_V1, STATIC_SEARCH_SPAN_EXPECTATION_BYTES_V1, inspect_search_metadata_v1,
+    SEARCH_METADATA_BYTES_V1, SEARCH_PLATFORM_LINUX_V1, SEARCH_PLATFORM_MACOS_V1,
+    STATIC_SEARCH_SPAN_EXPECTATION_BYTES_V1, inspect_search_metadata_v1,
 };
 use fre_jit_aarch64::{EmitLimits, SearchBackendPolicy, TargetSpec, emit_audited_with_backend};
 use fre_kernel_ir::{
@@ -29,7 +30,8 @@ use crate::{
     search_expected::ExpectedStaticSearchSpanV1,
     search_support::{
         self, HARD_MAX_STATIC_SEARCH_SPAN_QUALIFICATION_ROWS_V1,
-        SourceQualifiedStaticSearchSpanFamilyV1, SourceQualifiedStaticSearchSpanRowV1,
+        SourceQualifiedStaticSearchSpanAuthorityV1, SourceQualifiedStaticSearchSpanFamilyV1,
+        SourceQualifiedStaticSearchSpanRowV1,
     },
 };
 
@@ -208,6 +210,14 @@ impl LinkedStaticSearchSpanSymbolsV1 {
             payload_address,
             metadata_address,
         }
+    }
+
+    fn with_authenticated_compile_identity(
+        mut self,
+        expected: &ExpectedStaticSearchSpanV1,
+    ) -> Self {
+        self.claimed_compile_identity = *expected.compile_identity();
+        self
     }
 
     #[cfg(test)]
@@ -796,6 +806,18 @@ impl VerifiedStaticSearchSpanV1 {
         self.expected.literal_identity()
     }
 
+    /// Authenticate exact literal bytes against the compiler-domain identity
+    /// retained by this mapped image.
+    ///
+    /// Broad compiler-family authority deliberately does not pin one literal
+    /// in source. A semantic facade must therefore call this boundary before
+    /// binding a portable owner to the verified native entry.
+    #[must_use]
+    pub fn authenticates_literal(&self, literal: &[u8]) -> bool {
+        compute_search_literal_identity_v1(self.expected.metadata().platform(), literal)
+            .is_some_and(|identity| &identity == self.expected.literal_identity())
+    }
+
     #[must_use]
     pub const fn kir_identity(&self) -> &[u8; 32] {
         self.expected.kir_identity()
@@ -1005,8 +1027,9 @@ pub unsafe extern "C" fn fre_aot_static_search_span_adopt_raw_v1(
     payload: *const u8,
     metadata: *const u8,
 ) -> u32 {
-    let family = match search_support::require_production_search_span_family_v1(row_selector) {
-        Ok(family) => family,
+    let authority = match search_support::require_production_search_span_authority_v1(row_selector)
+    {
+        Ok(authority) => authority,
         Err(StaticSearchSpanVerifyErrorV1::NoQualifiedStaticSearchSpanRowV1) => {
             return STATIC_SEARCH_SPAN_ADOPT_STATUS_NO_QUALIFIED_ROW_V1;
         }
@@ -1015,18 +1038,37 @@ pub unsafe extern "C" fn fre_aot_static_search_span_adopt_raw_v1(
         }
         Err(_) => return STATIC_SEARCH_SPAN_ADOPT_STATUS_REFUSED_V1,
     };
-    // SAFETY: the source-qualified production row was selected before any
-    // pointer use and the caller owns the complete documented raw contract.
-    unsafe {
-        adopt_selected_static_search_span_family_v1(
-            &PRODUCTION_STATIC_SEARCH_SPAN_REGISTRY_V1,
-            output,
-            expectation,
-            entry,
-            payload,
-            metadata,
-            family,
-        )
+    match authority {
+        SourceQualifiedStaticSearchSpanAuthorityV1::Exact(row) => {
+            // SAFETY: the source-qualified exact production row was selected
+            // before every pointer use and the caller owns the raw contract.
+            unsafe {
+                adopt_selected_static_search_span_v1(
+                    &PRODUCTION_STATIC_SEARCH_SPAN_REGISTRY_V1,
+                    output,
+                    expectation,
+                    entry,
+                    payload,
+                    metadata,
+                    row,
+                )
+            }
+        }
+        SourceQualifiedStaticSearchSpanAuthorityV1::Family(family) => {
+            // SAFETY: the source-qualified production family was selected
+            // before every pointer use and the caller owns the raw contract.
+            unsafe {
+                adopt_selected_static_search_span_family_v1(
+                    &PRODUCTION_STATIC_SEARCH_SPAN_REGISTRY_V1,
+                    output,
+                    expectation,
+                    entry,
+                    payload,
+                    metadata,
+                    family,
+                )
+            }
+        }
     }
 }
 
@@ -1211,6 +1253,12 @@ unsafe fn adopt_source_qualified_static_search_span_family_v1(
     let copied = unsafe { implementation::copy_expectation(symbols.expectation_address)? };
     let expected =
         ExpectedStaticSearchSpanV1::from_source_qualified_family_bytes(&copied.bytes, family)?;
+    // The untrusted raw boundary cannot choose a registry key. Only after the
+    // canonical expectation and family authenticate one another do we key the
+    // registry by the concrete compile identity recomputed by the neutral
+    // decoder. Distinct literals in one broad family therefore remain
+    // independently addressable.
+    let symbols = symbols.with_authenticated_compile_identity(&expected);
     registry.adopt(&copied.bytes, symbols, || {
         let (entry, accounting) =
             implementation::verify(&expected, symbols, copied.vm_regions_checked)?;
@@ -1250,8 +1298,6 @@ pub(super) fn require_semantic_payload_reconstruction_v1(
     expected: &ExpectedStaticSearchSpanV1,
     payload: &[u8],
 ) -> Result<(), StaticSearchSpanVerifyErrorV1> {
-    const LITERAL_IDENTITY_DOMAIN_V1: &[u8] = b"FRE-AOT-LINUX-SEARCH-LITERAL\0\x01";
-
     let metadata = expected.metadata();
     let code_end = usize::try_from(metadata.code_bytes())
         .map_err(|_| StaticSearchSpanVerifyErrorV1::SemanticPayloadReconstruction)?;
@@ -1275,15 +1321,8 @@ pub(super) fn require_semantic_payload_reconstruction_v1(
         return Err(StaticSearchSpanVerifyErrorV1::SemanticPayloadReconstruction);
     }
 
-    let mut literal_hasher = Sha256::new();
-    literal_hasher.update(LITERAL_IDENTITY_DOMAIN_V1);
-    literal_hasher.update(
-        u64::try_from(literal.len())
-            .map_err(|_| StaticSearchSpanVerifyErrorV1::SemanticPayloadReconstruction)?
-            .to_le_bytes(),
-    );
-    literal_hasher.update(literal);
-    let literal_identity: [u8; 32] = literal_hasher.finalize().into();
+    let literal_identity = compute_search_literal_identity_v1(metadata.platform(), literal)
+        .ok_or(StaticSearchSpanVerifyErrorV1::SemanticPayloadReconstruction)?;
     if &literal_identity != expected.literal_identity() {
         return Err(StaticSearchSpanVerifyErrorV1::SemanticPayloadReconstruction);
     }
@@ -1311,6 +1350,7 @@ pub(super) fn require_semantic_payload_reconstruction_v1(
     };
     let layout = image.layout();
     if image.backend_version().0 != metadata.backend_version()
+        || image.target().features.bits() != metadata.features()
         || image.target() != target
         || image.source_identity().as_bytes() != expected.kir_identity()
         || image.artifact_identity().as_bytes() != expected.artifact_identity()
@@ -1324,6 +1364,23 @@ pub(super) fn require_semantic_payload_reconstruction_v1(
         return Err(StaticSearchSpanVerifyErrorV1::SemanticPayloadReconstruction);
     }
     Ok(())
+}
+
+fn compute_search_literal_identity_v1(platform: u8, literal: &[u8]) -> Option<[u8; 32]> {
+    const MACOS_LITERAL_IDENTITY_DOMAIN_V1: &[u8] = b"FRE-AOT-SEARCH-COMPILER-LITERAL\0\x01";
+    const LINUX_LITERAL_IDENTITY_DOMAIN_V1: &[u8] = b"FRE-AOT-LINUX-SEARCH-LITERAL\0\x01";
+
+    let domain = match platform {
+        SEARCH_PLATFORM_MACOS_V1 => MACOS_LITERAL_IDENTITY_DOMAIN_V1,
+        SEARCH_PLATFORM_LINUX_V1 => LINUX_LITERAL_IDENTITY_DOMAIN_V1,
+        _ => return None,
+    };
+    let literal_bytes = u64::try_from(literal.len()).ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(literal_bytes.to_le_bytes());
+    hasher.update(literal);
+    Some(hasher.finalize().into())
 }
 
 #[allow(
@@ -1403,6 +1460,21 @@ mod tests {
             atomic::{AtomicUsize, Ordering},
         },
         thread,
+    };
+
+    use fre::RustProfile;
+    use fre_aot_compiler::{
+        LinuxAarch64ExactSearchManifestV1, MacosAarch64ExactSearchManifestV1,
+        build_linux_static_search_span_expectation_v1, build_static_search_span_expectation_v1,
+        plan_and_compile_linux_aarch64_exact_search_v1,
+        plan_and_compile_macos_aarch64_exact_search_v1,
+    };
+    use fre_aot_search_contract::{
+        STATIC_SEARCH_SPAN_EXPECTATION_IDENTITY_BODY_BYTES_V1,
+        STATIC_SEARCH_SPAN_EXPECTATION_IDENTITY_OFFSET_V1,
+        STATIC_SEARCH_SPAN_EXPECTATION_METADATA_OFFSET_V1,
+        compute_static_search_span_expectation_identity_v1,
+        inspect_static_search_span_expectation_v1,
     };
 
     use super::*;
@@ -1577,6 +1649,193 @@ mod tests {
         bytes
     }
 
+    struct FamilyCompilerFixture {
+        expectation: [u8; STATIC_SEARCH_SPAN_EXPECTATION_BYTES_V1],
+        expected: ExpectedStaticSearchSpanV1,
+        family: SourceQualifiedStaticSearchSpanFamilyV1,
+        payload: Vec<u8>,
+        literal: Vec<u8>,
+    }
+
+    fn macos_family_compiler_fixture(literal: &[u8]) -> FamilyCompilerFixture {
+        let mut profile = RustProfile::default();
+        profile.options.unicode = false;
+        let compiled = plan_and_compile_macos_aarch64_exact_search_v1(
+            MacosAarch64ExactSearchManifestV1::<Span>::default(),
+            literal.to_vec(),
+            profile,
+        )
+        .expect("macOS family compiler fixture");
+        let expectation =
+            build_static_search_span_expectation_v1(&compiled).expect("macOS expectation");
+        let inspection = fre_aot_macho::inspect_object(
+            compiled.object().as_bytes(),
+            fre_aot_macho::ObjectLimits::default(),
+        )
+        .expect("macOS object inspection");
+        let payload = inspection.payload().to_vec();
+        let expectation = *expectation.as_bytes();
+        let claim =
+            inspect_static_search_span_expectation_v1(&expectation).expect("macOS neutral claim");
+        let family = SourceQualifiedStaticSearchSpanFamilyV1::from_test_claim(41, claim, 1, 32);
+        let expected =
+            ExpectedStaticSearchSpanV1::from_source_qualified_family_bytes(&expectation, &family)
+                .expect("macOS family expectation");
+        FamilyCompilerFixture {
+            expectation,
+            expected,
+            family,
+            payload,
+            literal: literal.to_vec(),
+        }
+    }
+
+    fn linux_family_compiler_fixture(literal: &[u8]) -> FamilyCompilerFixture {
+        let mut profile = RustProfile::default();
+        profile.options.unicode = false;
+        let compiled = plan_and_compile_linux_aarch64_exact_search_v1(
+            LinuxAarch64ExactSearchManifestV1::<Span>::default(),
+            literal.to_vec(),
+            profile,
+        )
+        .expect("Linux family compiler fixture");
+        let expectation =
+            build_linux_static_search_span_expectation_v1(&compiled).expect("Linux expectation");
+        let inspection = compiled
+            .receipt()
+            .validate_object(
+                compiled.object().as_bytes(),
+                fre_aot_elf::ObjectLimitsV1::default(),
+            )
+            .expect("Linux object inspection");
+        let payload = inspection.payload().to_vec();
+        let expectation = *expectation.as_bytes();
+        let claim =
+            inspect_static_search_span_expectation_v1(&expectation).expect("Linux neutral claim");
+        let family = SourceQualifiedStaticSearchSpanFamilyV1::from_test_claim(43, claim, 1, 32);
+        let expected =
+            ExpectedStaticSearchSpanV1::from_source_qualified_family_bytes(&expectation, &family)
+                .expect("Linux family expectation");
+        FamilyCompilerFixture {
+            expectation,
+            expected,
+            family,
+            payload,
+            literal: literal.to_vec(),
+        }
+    }
+
+    fn assert_family_payload_mutations_refused(fixture: &FamilyCompilerFixture) {
+        require_semantic_payload_reconstruction_v1(&fixture.expected, &fixture.payload)
+            .expect("canonical payload reconstruction");
+
+        let metadata = fixture.expected.metadata();
+        let code_bytes = usize::try_from(metadata.code_bytes()).expect("code extent");
+        let rodata_offset = usize::try_from(metadata.rodata_offset()).expect("rodata offset");
+        let mut code = fixture.payload.clone();
+        code[0] ^= 1;
+        assert_eq!(
+            require_semantic_payload_reconstruction_v1(&fixture.expected, &code),
+            Err(StaticSearchSpanVerifyErrorV1::SemanticPayloadReconstruction)
+        );
+
+        assert!(
+            code_bytes < rodata_offset,
+            "test candidate must exercise canonical zero padding"
+        );
+        let mut padding = fixture.payload.clone();
+        padding[code_bytes] = 1;
+        assert_eq!(
+            require_semantic_payload_reconstruction_v1(&fixture.expected, &padding),
+            Err(StaticSearchSpanVerifyErrorV1::SemanticPayloadReconstruction)
+        );
+
+        let mut literal = fixture.payload.clone();
+        literal[rodata_offset] ^= 1;
+        assert_eq!(
+            require_semantic_payload_reconstruction_v1(&fixture.expected, &literal),
+            Err(StaticSearchSpanVerifyErrorV1::SemanticPayloadReconstruction)
+        );
+
+        let mut metadata_splice = fixture.expectation;
+        metadata_splice[STATIC_SEARCH_SPAN_EXPECTATION_METADATA_OFFSET_V1 + 56] ^= 1;
+        let body: &[u8; STATIC_SEARCH_SPAN_EXPECTATION_IDENTITY_BODY_BYTES_V1] = metadata_splice
+            [..STATIC_SEARCH_SPAN_EXPECTATION_IDENTITY_OFFSET_V1]
+            .try_into()
+            .expect("fixed expectation identity body");
+        let identity = compute_static_search_span_expectation_identity_v1(body);
+        metadata_splice[STATIC_SEARCH_SPAN_EXPECTATION_IDENTITY_OFFSET_V1..]
+            .copy_from_slice(&identity);
+        assert!(
+            ExpectedStaticSearchSpanV1::from_source_qualified_family_bytes(
+                &metadata_splice,
+                &fixture.family,
+            )
+            .is_err(),
+            "internally rehashed metadata splice gained family authority"
+        );
+    }
+
+    #[test]
+    fn broad_family_reconstructs_and_binds_literals_on_both_object_platforms() {
+        for fixture in [
+            macos_family_compiler_fixture(b"mac-family-lit16"),
+            linux_family_compiler_fixture(b"lin-family-lit16"),
+        ] {
+            assert_family_payload_mutations_refused(&fixture);
+            let handle = VerifiedStaticSearchSpanV1 {
+                expected: fixture.expected,
+                entry: dummy_entry,
+                row_selector: fixture.family.selector(),
+                accounting: StaticSearchSpanInspectionAccountingV1::checked(
+                    fixture.payload.len(),
+                    3,
+                )
+                .expect("test inspection accounting"),
+            };
+            assert!(handle.authenticates_literal(&fixture.literal));
+            let mut substituted = fixture.literal.clone();
+            substituted[0] ^= 1;
+            assert!(!handle.authenticates_literal(&substituted));
+        }
+    }
+
+    #[test]
+    fn broad_family_registry_keys_two_real_compiler_objects_independently() {
+        let first = macos_family_compiler_fixture(b"family-literal-a");
+        let second = macos_family_compiler_fixture(b"family-literal-b");
+        assert_ne!(
+            first.expected.compile_identity(),
+            second.expected.compile_identity()
+        );
+
+        let registry = StaticSearchSpanRegistryV1::<u64, 4>::new();
+        let untrusted = LinkedStaticSearchSpanSymbolsV1 {
+            row_selector: first.family.selector(),
+            claimed_compile_identity: [0; 32],
+            expectation_address: symbols(7, 1).expectation_address,
+            entry_address: symbols(7, 1).entry_address,
+            payload_address: symbols(7, 1).payload_address,
+            metadata_address: symbols(7, 1).metadata_address,
+        };
+        let first_symbols = untrusted.with_authenticated_compile_identity(&first.expected);
+        let second_symbols = untrusted.with_authenticated_compile_identity(&second.expected);
+        let first_value = registry
+            .adopt(&first.expectation, first_symbols, || Ok(101))
+            .expect("first broad-family registry value");
+        let second_value = registry
+            .adopt(&second.expectation, second_symbols, || Ok(202))
+            .expect("second broad-family registry value");
+        let retry = registry
+            .adopt(&first.expectation, first_symbols, || {
+                panic!("identical retry must not reinitialize")
+            })
+            .expect("identical broad-family retry");
+        assert_eq!((*first_value, *second_value, *retry), (101, 202, 101));
+        assert!(ptr::eq(first_value, retry));
+        assert!(!ptr::eq(first_value, second_value));
+    }
+
     #[test]
     #[allow(
         unsafe_code,
@@ -1585,7 +1844,7 @@ mod tests {
     fn production_table_refuses_unrepresentable_selector_before_every_pointer_use() {
         let conversions_before = implementation::verified_entry_conversion_count();
         let unrepresentable_selector = u32::from(u16::MAX) + 1;
-        let expected_status = if search_support::production_rows_are_empty_for_test_v1() {
+        let expected_status = if search_support::production_authorities_are_empty_for_test_v1() {
             STATIC_SEARCH_SPAN_ADOPT_STATUS_NO_QUALIFIED_ROW_V1
         } else {
             STATIC_SEARCH_SPAN_ADOPT_STATUS_UNQUALIFIED_SELECTOR_V1
