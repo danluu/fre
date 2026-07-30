@@ -2121,8 +2121,22 @@ fn execute(
 ) -> Result<UntypedReport, SearchError> {
     validate_window(haystack, window)?;
     let wants_span = matches!(contract, OutputContract::Span);
-    let capabilities = lazy_capabilities(automaton, workspace, allow_lazy, wants_span);
-    let mode = effective_lazy_mode(automaton, workspace, wants_span, capabilities)?;
+    let contextual = automaton.stats().assertion_edges() != 0;
+    let mode = if wants_span {
+        effective_lazy_mode(
+            automaton,
+            workspace,
+            true,
+            lazy_capabilities(automaton, workspace, allow_lazy, true),
+        )?
+    } else {
+        // Endpoint contracts never recover a start, so reverse capability,
+        // binding, and nullable-start proof checks cannot affect their mode.
+        EffectiveLazyMode {
+            lazy: allow_lazy && workspace.lazy.is_allocated(),
+            reverse: false,
+        }
+    };
     let mut setup = setup;
     let (mut meter, setup_work) = prepare_invocation(
         automaton,
@@ -2144,7 +2158,7 @@ fn execute(
         contract,
         mode.lazy,
         mode.reverse,
-        capabilities.contextual,
+        contextual,
         meter,
         setup_work,
         start_proof,
@@ -6701,6 +6715,33 @@ mod tests {
                 edge_kinds: vec![EdgeKind::Epsilon, EdgeKind::Epsilon, EdgeKind::ByteRange],
                 byte_starts: vec![0, 0, b'a'],
                 byte_ends: vec![0, 0, b'a'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn greedy_a_star_b() -> Automaton {
+        // a*b: globally positive with a nullable repeated prefix.
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 2, 3, 4, 4],
+                edge_targets: vec![1, 2, 0, 3],
+                edge_kinds: vec![
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                ],
+                byte_starts: vec![0, 0, b'a', b'b'],
+                byte_ends: vec![0, 0, b'a', b'b'],
             },
             CompileLimits::default(),
         )
@@ -11631,6 +11672,7 @@ mod tests {
 
         for (plan, haystack, expected_pending, expected_terminal) in [
             (a_plus(true), b"a".as_slice(), false, false),
+            (greedy_a_star_b(), b"aaab".as_slice(), false, false),
             (a_star(true), b"a".as_slice(), true, false),
             (terminal, b"".as_slice(), true, true),
         ] {
