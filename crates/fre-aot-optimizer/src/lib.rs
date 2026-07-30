@@ -109,6 +109,10 @@ pub enum CountV3RegisterPlanId {
     Aarch64NeonV1 = 1,
     Aarch64SveVl16V1 = 2,
     Aarch64Sve2Vl16V1 = 3,
+    /// NEON hot loops with an exact fixed-VL16 SVE predicate tail.
+    Aarch64NeonSveVl16V1 = 4,
+    /// NEON hot loops with an exact fixed-VL16 SVE2 predicate tail.
+    Aarch64NeonSve2Vl16V1 = 5,
 }
 
 impl CountV3RegisterPlanId {
@@ -2001,8 +2005,8 @@ fn materialize_recipe(
 const fn register_plan_for_isa(required_isa: CountV3RequiredIsa) -> CountV3RegisterPlanId {
     match required_isa {
         CountV3RequiredIsa::Aarch64Neon128 => CountV3RegisterPlanId::Aarch64NeonV1,
-        CountV3RequiredIsa::Aarch64SveVl16 => CountV3RegisterPlanId::Aarch64SveVl16V1,
-        CountV3RequiredIsa::Aarch64Sve2Vl16 => CountV3RegisterPlanId::Aarch64Sve2Vl16V1,
+        CountV3RequiredIsa::Aarch64SveVl16 => CountV3RegisterPlanId::Aarch64NeonSveVl16V1,
+        CountV3RequiredIsa::Aarch64Sve2Vl16 => CountV3RegisterPlanId::Aarch64NeonSve2Vl16V1,
     }
 }
 
@@ -2405,6 +2409,8 @@ fn inspect_recipe(
         1 => CountV3RegisterPlanId::Aarch64NeonV1,
         2 => CountV3RegisterPlanId::Aarch64SveVl16V1,
         3 => CountV3RegisterPlanId::Aarch64Sve2Vl16V1,
+        4 => CountV3RegisterPlanId::Aarch64NeonSveVl16V1,
+        5 => CountV3RegisterPlanId::Aarch64NeonSve2Vl16V1,
         value => return Err(CountV3RecipeDecodeError::UnknownRegisterPlan(value)),
     };
     let required_isa = match bytes[16] {
@@ -2429,10 +2435,10 @@ fn inspect_recipe(
             CountV3RegisterPlanId::Aarch64NeonV1,
             CountV3RequiredIsa::Aarch64Neon128
         ) | (
-            CountV3RegisterPlanId::Aarch64SveVl16V1,
+            CountV3RegisterPlanId::Aarch64NeonSveVl16V1,
             CountV3RequiredIsa::Aarch64SveVl16
         ) | (
-            CountV3RegisterPlanId::Aarch64Sve2Vl16V1,
+            CountV3RegisterPlanId::Aarch64NeonSve2Vl16V1,
             CountV3RequiredIsa::Aarch64Sve2Vl16
         )
     );

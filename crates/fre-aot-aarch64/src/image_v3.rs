@@ -73,7 +73,7 @@ pub const SUPPORTED_AOT_COUNT_BACKEND_TUPLES_V3: &[AotCountBackendSupportV3] = &
         little_endian: true,
         pointer_width: 64,
         target_abi: 1,
-        allowed_features: AotCountCpuFeatures::SVE,
+        allowed_features: AotCountCpuFeatures::ASIMD.union(AotCountCpuFeatures::SVE),
         max_literal_bytes: 32,
         candidate_block_starts: 16,
         vector_bytes: 16,
@@ -89,7 +89,9 @@ pub const SUPPORTED_AOT_COUNT_BACKEND_TUPLES_V3: &[AotCountBackendSupportV3] = &
         little_endian: true,
         pointer_width: 64,
         target_abi: 1,
-        allowed_features: AotCountCpuFeatures::SVE.union(AotCountCpuFeatures::SVE2),
+        allowed_features: AotCountCpuFeatures::ASIMD
+            .union(AotCountCpuFeatures::SVE)
+            .union(AotCountCpuFeatures::SVE2),
         max_literal_bytes: 32,
         candidate_block_starts: 16,
         vector_bytes: 16,

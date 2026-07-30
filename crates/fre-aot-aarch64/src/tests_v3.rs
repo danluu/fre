@@ -122,15 +122,17 @@ fn target_aware_sve_rows_emit_real_independently_audited_opcodes() {
     for (required_isa, register_plan, features, support_index, expect_match) in [
         (
             CountV3RequiredIsa::Aarch64SveVl16,
-            CountV3RegisterPlanId::Aarch64SveVl16V1,
-            AotCountCpuFeatures::SVE,
+            CountV3RegisterPlanId::Aarch64NeonSveVl16V1,
+            AotCountCpuFeatures::ASIMD.union(AotCountCpuFeatures::SVE),
             1,
             false,
         ),
         (
             CountV3RequiredIsa::Aarch64Sve2Vl16,
-            CountV3RegisterPlanId::Aarch64Sve2Vl16V1,
-            AotCountCpuFeatures::SVE.union(AotCountCpuFeatures::SVE2),
+            CountV3RegisterPlanId::Aarch64NeonSve2Vl16V1,
+            AotCountCpuFeatures::ASIMD
+                .union(AotCountCpuFeatures::SVE)
+                .union(AotCountCpuFeatures::SVE2),
             2,
             true,
         ),
@@ -148,6 +150,10 @@ fn target_aware_sve_rows_emit_real_independently_audited_opcodes() {
             assert_eq!(image.support().vector_bytes, 16);
             assert_eq!(image.support().sve_vector_length_bytes, 16);
             let decoded = decoded_v3(&image);
+            assert!(decoded.iter().any(|instruction| matches!(
+                instruction,
+                DecodedInstructionV3::LoadVector128 { .. }
+            )));
             assert!(decoded.iter().any(|instruction| matches!(
                 instruction,
                 DecodedInstructionV3::SvePtrueBytesVl16 { .. }
@@ -187,7 +193,106 @@ fn target_aware_sve_rows_emit_real_independently_audited_opcodes() {
 }
 
 #[test]
-fn sve_direct_64_start_body_is_column_major_and_mul_vl_addressed() {
+fn hybrid_sve_rows_use_neon_hot_loops_and_exact_predicate_tails() {
+    for (required_isa, register_plan, features, expect_match) in [
+        (
+            CountV3RequiredIsa::Aarch64SveVl16,
+            CountV3RegisterPlanId::Aarch64NeonSveVl16V1,
+            AotCountCpuFeatures::ASIMD.union(AotCountCpuFeatures::SVE),
+            false,
+        ),
+        (
+            CountV3RequiredIsa::Aarch64Sve2Vl16,
+            CountV3RegisterPlanId::Aarch64NeonSve2Vl16V1,
+            AotCountCpuFeatures::ASIMD
+                .union(AotCountCpuFeatures::SVE)
+                .union(AotCountCpuFeatures::SVE2),
+            true,
+        ),
+    ] {
+        for literal in [
+            &b"x"[..],
+            &b"abc"[..],
+            &b"not-periodic"[..],
+            &b"aeaeaeaeae"[..],
+            &b"metadata-cannot-relabel-opcodes"[..],
+        ] {
+            let (program, optimized) = optimized_for(literal, required_isa);
+            assert_eq!(optimized.recipe().register_plan_id(), register_plan);
+            let image =
+                emit_count_v3(&program, optimized.recipe(), CountEmitLimitsV3::default()).unwrap();
+            assert_eq!(image.target().features, features);
+            let decoded = decoded_v3(&image);
+            assert!(decoded.iter().any(|instruction| matches!(
+                instruction,
+                DecodedInstructionV3::LoadVector128 { .. }
+                    | DecodedInstructionV3::LoadVectors4x128 { .. }
+            )));
+            let ptrue = decoded
+                .iter()
+                .position(|instruction| {
+                    matches!(
+                        instruction,
+                        DecodedInstructionV3::SvePtrueBytesVl16 { destination: 0 }
+                    )
+                })
+                .expect("functional fixed-VL16 tail");
+            assert!(decoded[..ptrue].iter().any(|instruction| matches!(
+                instruction,
+                DecodedInstructionV3::BranchCondition {
+                    condition: crate::ConditionV3::Equal,
+                    ..
+                }
+            )));
+            assert_eq!(
+                decoded
+                    .iter()
+                    .filter(|instruction| matches!(
+                        instruction,
+                        DecodedInstructionV3::SveLoadBytes {
+                            destination: 0,
+                            predicate: 0,
+                            ..
+                        }
+                    ))
+                    .count(),
+                literal.len()
+            );
+            assert_eq!(
+                decoded
+                    .iter()
+                    .filter(|instruction| matches!(
+                        instruction,
+                        DecodedInstructionV3::Sve2MatchBytes { .. }
+                    ))
+                    .count(),
+                if expect_match { literal.len() } else { 0 }
+            );
+            assert!(decoded[ptrue..].iter().any(|instruction| matches!(
+                instruction,
+                DecodedInstructionV3::SveBreakBeforeBytes { .. }
+            )));
+            assert!(decoded[ptrue..].iter().any(|instruction| matches!(
+                instruction,
+                DecodedInstructionV3::AddImmediate64 {
+                    destination: 3,
+                    source: 5,
+                    immediate,
+                } if usize::from(*immediate) == literal.len()
+            )));
+            assert_eq!(
+                audit_count_image_v3(&program, optimized.recipe(), &image).unwrap(),
+                image.build_receipt().audit
+            );
+        }
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "historical pure-SVE structural fixture retained beside its hybrid replacement"
+)]
+fn legacy_pure_sve_direct_64_start_body_is_column_major_and_mul_vl_addressed() {
     for (required_isa, sve2) in [
         (CountV3RequiredIsa::Aarch64SveVl16, false),
         (CountV3RequiredIsa::Aarch64Sve2Vl16, true),
@@ -592,8 +697,11 @@ fn wide_direct_masks_skip_later_columns_after_an_empty_pair() {
     }));
 }
 
-#[test]
-fn periodic_sve_rows_batch_both_boundary_columns_across_128_starts() {
+#[allow(
+    dead_code,
+    reason = "historical pure-SVE structural fixture retained beside its hybrid replacement"
+)]
+fn legacy_pure_periodic_sve_rows_batch_both_boundary_columns_across_128_starts() {
     for (required_isa, sve2) in [
         (CountV3RequiredIsa::Aarch64SveVl16, false),
         (CountV3RequiredIsa::Aarch64Sve2Vl16, true),
@@ -982,8 +1090,11 @@ fn neon_ext_decode_and_both_sliding_pair_rings_are_exact() {
     }
 }
 
-#[test]
-fn sve_primary_empty_batch_advances_128_starts_with_closed_quarter_reentry() {
+#[allow(
+    dead_code,
+    reason = "historical pure-SVE structural fixture retained beside its hybrid replacement"
+)]
+fn legacy_pure_sve_primary_empty_batch_advances_128_starts_with_closed_quarter_reentry() {
     for (required_isa, sve2) in [
         (CountV3RequiredIsa::Aarch64SveVl16, false),
         (CountV3RequiredIsa::Aarch64Sve2Vl16, true),

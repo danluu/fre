@@ -1373,7 +1373,7 @@ fn audit_impl_v3(
         }
     }
     let (expected_candidate_blocks, expected_lane_recoveries, expected_staged_checks) =
-        if literal_len < 2 || audit_recipe.required_isa != CountV3RequiredIsa::Aarch64Neon128 {
+        if literal_len < 2 {
             (0, 0, 0)
         } else if audit_recipe.strategy == AuditLoweringStrategyV3::DirectExactMask {
             (0, 0, 0)
@@ -1424,10 +1424,12 @@ fn audit_impl_v3(
     } else {
         match audit_recipe.required_isa {
             CountV3RequiredIsa::Aarch64Neon128 => AotCountCpuFeatures::ASIMD,
-            CountV3RequiredIsa::Aarch64SveVl16 => AotCountCpuFeatures::SVE,
-            CountV3RequiredIsa::Aarch64Sve2Vl16 => {
-                AotCountCpuFeatures::SVE.union(AotCountCpuFeatures::SVE2)
+            CountV3RequiredIsa::Aarch64SveVl16 => {
+                AotCountCpuFeatures::ASIMD.union(AotCountCpuFeatures::SVE)
             }
+            CountV3RequiredIsa::Aarch64Sve2Vl16 => AotCountCpuFeatures::ASIMD
+                .union(AotCountCpuFeatures::SVE)
+                .union(AotCountCpuFeatures::SVE2),
         }
     };
     let instruction_classes_match = match audit_recipe.required_isa {
@@ -1437,11 +1439,11 @@ fn audit_impl_v3(
         }
         CountV3RequiredIsa::Aarch64SveVl16 => {
             literal.is_empty()
-                || (asimd_instructions == 0 && sve_instructions != 0 && sve2_instructions == 0)
+                || (asimd_instructions != 0 && sve_instructions != 0 && sve2_instructions == 0)
         }
         CountV3RequiredIsa::Aarch64Sve2Vl16 => {
             literal.is_empty()
-                || (asimd_instructions == 0 && sve_instructions != 0 && sve2_instructions != 0)
+                || (asimd_instructions != 0 && sve_instructions != 0 && sve2_instructions != 0)
         }
     };
     if !instruction_classes_match
@@ -1512,8 +1514,8 @@ fn audit_project_recipe_v3(
     }
     let expected_register_plan = match recipe.required_isa() {
         CountV3RequiredIsa::Aarch64Neon128 => CountV3RegisterPlanId::Aarch64NeonV1,
-        CountV3RequiredIsa::Aarch64SveVl16 => CountV3RegisterPlanId::Aarch64SveVl16V1,
-        CountV3RequiredIsa::Aarch64Sve2Vl16 => CountV3RegisterPlanId::Aarch64Sve2Vl16V1,
+        CountV3RequiredIsa::Aarch64SveVl16 => CountV3RegisterPlanId::Aarch64NeonSveVl16V1,
+        CountV3RequiredIsa::Aarch64Sve2Vl16 => CountV3RegisterPlanId::Aarch64NeonSve2Vl16V1,
     };
     if recipe.register_plan_id() != expected_register_plan
         || recipe.successor_mode() != CountV3SuccessorMode::NonOverlapping
@@ -1883,15 +1885,15 @@ fn independent_policy_template_v3(
     } else {
         match recipe.required_isa {
             CountV3RequiredIsa::Aarch64Neon128 => match literal.len() {
-                1 => policy_single_v3(&mut policy, literal[0], done)?,
+                1 => policy_single_v3(&mut policy, literal[0], None, done)?,
                 _ => {
                     let filter = recipe.filter.ok_or(invalid_v3("v3 policy filter"))?;
                     match recipe.strategy {
                         AuditLoweringStrategyV3::Incumbent => {
-                            policy_multi_incumbent_v3(&mut policy, literal, filter, done)?;
+                            policy_multi_incumbent_v3(&mut policy, literal, filter, None, done)?;
                         }
                         AuditLoweringStrategyV3::DirectExactMask => {
-                            policy_direct_exact_mask_v3(&mut policy, literal, filter, done)?;
+                            policy_direct_exact_mask_v3(&mut policy, literal, filter, None, done)?;
                         }
                         AuditLoweringStrategyV3::SparseRareColumns
                         | AuditLoweringStrategyV3::EndpointDense => policy_multi_specialized_v3(
@@ -1900,6 +1902,7 @@ fn independent_policy_template_v3(
                             filter,
                             recipe.confirmation_order(),
                             recipe.strategy,
+                            None,
                             done,
                         )?,
                         AuditLoweringStrategyV3::PeriodicRun => policy_periodic_neon_v3(
@@ -1908,6 +1911,7 @@ fn independent_policy_template_v3(
                             filter,
                             recipe.confirmation_order(),
                             recipe.periodic_stride,
+                            None,
                             done,
                         )?,
                     }
@@ -1915,32 +1919,49 @@ fn independent_policy_template_v3(
             },
             CountV3RequiredIsa::Aarch64SveVl16 | CountV3RequiredIsa::Aarch64Sve2Vl16 => {
                 let sve2 = recipe.required_isa == CountV3RequiredIsa::Aarch64Sve2Vl16;
-                if literal.len() == 1 || recipe.strategy == AuditLoweringStrategyV3::DirectExactMask
-                {
-                    policy_sve_direct_exact_v3(&mut policy, literal, sve2, done)?;
-                } else if recipe.strategy == AuditLoweringStrategyV3::PeriodicRun {
-                    let filter = recipe
-                        .filter
-                        .ok_or(invalid_v3("v3 periodic SVE policy filter"))?;
-                    policy_periodic_sve_v3(
-                        &mut policy,
-                        literal,
-                        filter,
-                        recipe.confirmation_order(),
-                        recipe.periodic_stride,
-                        sve2,
-                        done,
-                    )?;
+                if literal.len() == 1 {
+                    policy_single_v3(&mut policy, literal[0], Some(sve2), done)?;
                 } else {
-                    let filter = recipe.filter.ok_or(invalid_v3("v3 SVE policy filter"))?;
-                    policy_sve_filtered_v3(
-                        &mut policy,
-                        literal,
-                        filter,
-                        recipe.confirmation_order(),
-                        sve2,
-                        done,
-                    )?;
+                    let filter = recipe.filter.ok_or(invalid_v3("v3 hybrid policy filter"))?;
+                    match recipe.strategy {
+                        AuditLoweringStrategyV3::Incumbent => {
+                            policy_multi_incumbent_v3(
+                                &mut policy,
+                                literal,
+                                filter,
+                                Some(sve2),
+                                done,
+                            )?;
+                        }
+                        AuditLoweringStrategyV3::DirectExactMask => {
+                            policy_direct_exact_mask_v3(
+                                &mut policy,
+                                literal,
+                                filter,
+                                Some(sve2),
+                                done,
+                            )?;
+                        }
+                        AuditLoweringStrategyV3::SparseRareColumns
+                        | AuditLoweringStrategyV3::EndpointDense => policy_multi_specialized_v3(
+                            &mut policy,
+                            literal,
+                            filter,
+                            recipe.confirmation_order(),
+                            recipe.strategy,
+                            Some(sve2),
+                            done,
+                        )?,
+                        AuditLoweringStrategyV3::PeriodicRun => policy_periodic_neon_v3(
+                            &mut policy,
+                            literal,
+                            filter,
+                            recipe.confirmation_order(),
+                            recipe.periodic_stride,
+                            Some(sve2),
+                            done,
+                        )?,
+                    }
                 }
             }
         }
@@ -1991,11 +2012,17 @@ fn policy_empty_v3(policy: &mut PolicySinkV3, done: PolicyLabelV3) -> Result<(),
 fn policy_single_v3(
     policy: &mut PolicySinkV3,
     literal: u8,
+    sve_tail: Option<bool>,
     done: PolicyLabelV3,
 ) -> Result<(), CountAotError> {
     let vector64 = policy.new_label(LabelKindV3::VectorLoop)?;
     let vector16 = policy.new_label(LabelKindV3::VectorLoop)?;
     let tail = policy.new_label(LabelKindV3::ScalarTail)?;
+    let scalar = if sve_tail.is_some() {
+        policy.new_label(LabelKindV3::ScalarTail)?
+    } else {
+        tail
+    };
     let miss = policy.new_label(LabelKindV3::Miss)?;
     policy_mov_minimal_v3(policy, X13, 0)?;
     policy_mov_minimal_v3(policy, X3, 0)?;
@@ -2085,7 +2112,11 @@ fn policy_single_v3(
             immediate: SIMD_CANDIDATE_STARTS_V3,
         },
     )?;
-    condition_v3(policy, ConditionV3::CarryClear, tail)?;
+    condition_v3(policy, ConditionV3::CarryClear, scalar)?;
+    if sve_tail.is_some() {
+        compare_immediate64_v3(policy, X6, SIMD_CANDIDATE_STARTS_V3)?;
+        condition_v3(policy, ConditionV3::Equal, tail)?;
+    }
     exact_v3(
         policy,
         DecodedInstructionV3::AddRegister64 {
@@ -2158,6 +2189,16 @@ fn policy_single_v3(
     )?;
     branch_v3(policy, vector16)?;
     policy.bind(tail)?;
+    if let Some(sve2) = sve_tail {
+        policy_hybrid_sve_exact_tail_v3(
+            policy,
+            core::slice::from_ref(&literal),
+            sve2,
+            scalar,
+            done,
+        )?;
+        policy.bind(scalar)?;
+    }
     exact_v3(
         policy,
         DecodedInstructionV3::CompareRegister64 {
@@ -2199,7 +2240,7 @@ fn policy_single_v3(
             immediate: 1,
         },
     )?;
-    branch_v3(policy, tail)
+    branch_v3(policy, scalar)
 }
 
 #[allow(
@@ -2210,6 +2251,7 @@ fn policy_direct_exact_mask_v3(
     policy: &mut PolicySinkV3,
     literal: &[u8],
     filter: AuditCandidateFilterV3,
+    sve_tail: Option<bool>,
     done: PolicyLabelV3,
 ) -> Result<(), CountAotError> {
     let vector64 = policy.new_label(LabelKindV3::VectorLoop)?;
@@ -2220,6 +2262,11 @@ fn policy_direct_exact_mask_v3(
     };
     let vector16 = policy.new_label(LabelKindV3::VectorLoop)?;
     let tail = policy.new_label(LabelKindV3::ScalarTail)?;
+    let scalar = if sve_tail.is_some() {
+        policy.new_label(LabelKindV3::ScalarTail)?
+    } else {
+        tail
+    };
     let tail_miss = policy.new_label(LabelKindV3::Miss)?;
     let width = u16::try_from(literal.len()).expect("bounded width");
     let value_registers = [X10, X11, X12, X14];
@@ -2458,8 +2505,12 @@ fn policy_direct_exact_mask_v3(
     compare_register64_v3(policy, X3, X4)?;
     condition_v3(policy, ConditionV3::Higher, done)?;
     subtract_register64_v3(policy, X6, X4, X3)?;
-    compare_immediate64_v3(policy, X6, 15)?;
-    condition_v3(policy, ConditionV3::CarryClear, tail)?;
+    compare_immediate64_v3(policy, X6, SIMD_CANDIDATE_STARTS_V3 - 1)?;
+    condition_v3(policy, ConditionV3::CarryClear, scalar)?;
+    if sve_tail.is_some() {
+        compare_immediate64_v3(policy, X6, SIMD_CANDIDATE_STARTS_V3 - 1)?;
+        condition_v3(policy, ConditionV3::Equal, tail)?;
+    }
     add_register64_v3(policy, X15, X0, X3)?;
     for index in 0..usize::from(filter.len) {
         add_immediate64_v3(
@@ -2524,6 +2575,10 @@ fn policy_direct_exact_mask_v3(
     branch_v3(policy, vector16)?;
 
     policy.bind(tail)?;
+    if let Some(sve2) = sve_tail {
+        policy_hybrid_sve_exact_tail_v3(policy, literal, sve2, scalar, done)?;
+        policy.bind(scalar)?;
+    }
     compare_register64_v3(policy, X3, X4)?;
     condition_v3(policy, ConditionV3::Higher, done)?;
     add_register64_v3(policy, X15, X0, X3)?;
@@ -2535,7 +2590,7 @@ fn policy_direct_exact_mask_v3(
     add_immediate64_v3(policy, X13, X13, 1)?;
     policy.bind(tail_miss)?;
     add_immediate64_v3(policy, X3, X3, 1)?;
-    branch_v3(policy, tail)
+    branch_v3(policy, scalar)
 }
 
 fn policy_sve_compare_bytes_v3(
@@ -2566,6 +2621,106 @@ fn policy_sve_compare_bytes_v3(
     )
 }
 
+fn policy_hybrid_sve_exact_tail_v3(
+    policy: &mut PolicySinkV3,
+    literal: &[u8],
+    sve2: bool,
+    scalar: PolicyLabelV3,
+    done: PolicyLabelV3,
+) -> Result<(), CountAotError> {
+    let no_match = policy.new_label(LabelKindV3::Miss)?;
+    let width = u16::try_from(literal.len()).expect("bounded hybrid tail width");
+
+    exact_v3(
+        policy,
+        DecodedInstructionV3::SvePtrueBytesVl16 { destination: 0 },
+    )?;
+    compare_register64_v3(policy, X3, X4)?;
+    condition_v3(policy, ConditionV3::Higher, done)?;
+    subtract_register64_v3(policy, X6, X4, X3)?;
+    compare_immediate64_v3(policy, X6, SIMD_CANDIDATE_STARTS_V3 - 1)?;
+    condition_v3(policy, ConditionV3::CarryClear, scalar)?;
+    add_register64_v3(policy, X15, X0, X3)?;
+    for (offset, byte) in literal.iter().copied().enumerate() {
+        policy_mov_minimal_v3(policy, X8, u64::from(byte))?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::SveDuplicateByte {
+                destination: 1,
+                source: X8,
+            },
+        )?;
+        let base = if offset == 0 {
+            X15
+        } else {
+            add_immediate64_v3(
+                policy,
+                X9,
+                X15,
+                u16::try_from(offset).expect("bounded hybrid tail offset"),
+            )?;
+            X9
+        };
+        exact_v3(
+            policy,
+            DecodedInstructionV3::SveLoadBytes {
+                destination: 0,
+                predicate: 0,
+                base,
+            },
+        )?;
+        let destination = if offset == 0 { 1 } else { 2 };
+        policy_sve_compare_bytes_v3(policy, destination, 0, 0, 1, sve2)?;
+        if offset != 0 {
+            exact_v3(
+                policy,
+                DecodedInstructionV3::SveAndPredicateBytes {
+                    destination: 1,
+                    predicate: 0,
+                    left: 1,
+                    right: 2,
+                },
+            )?;
+        }
+    }
+    exact_v3(
+        policy,
+        DecodedInstructionV3::SveTestPredicateBytes {
+            predicate: 0,
+            tested: 1,
+        },
+    )?;
+    condition_v3(policy, ConditionV3::Equal, no_match)?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::SveBreakBeforeBytes {
+            destination: 3,
+            predicate: 0,
+            source: 1,
+        },
+    )?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::SveCountPredicateBytes {
+            destination: X7,
+            predicate: 0,
+            source: 3,
+        },
+    )?;
+    add_register64_v3(policy, X5, X3, X7)?;
+    add_immediate64_v3(policy, X13, X13, 1)?;
+    add_immediate64_v3(policy, X3, X5, width)?;
+    branch_v3(policy, scalar)?;
+
+    policy.bind(no_match)?;
+    add_immediate64_v3(policy, X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
+    branch_v3(policy, scalar)
+}
+
+#[allow(
+    dead_code,
+    reason = "retained as a policy reference for the superseded pure-SVE lowering"
+)]
 fn policy_sve_load_bytes_mul_vl_v3(
     policy: &mut PolicySinkV3,
     destination: u8,
@@ -2594,6 +2749,10 @@ fn policy_sve_load_bytes_mul_vl_v3(
     )
 }
 
+#[allow(
+    dead_code,
+    reason = "retained as a policy reference for the superseded pure-SVE lowering"
+)]
 fn policy_scalar_confirmation_sve_v3(
     policy: &mut PolicySinkV3,
     literal: &[u8],
@@ -2614,8 +2773,9 @@ fn policy_scalar_confirmation_sve_v3(
 }
 
 #[allow(
+    dead_code,
     clippy::too_many_lines,
-    reason = "the independent SVE direct policy mirrors two unrolled vector loops and its exact scalar tail"
+    reason = "retained as a policy reference for the superseded pure-SVE direct graph"
 )]
 fn policy_sve_direct_exact_v3(
     policy: &mut PolicySinkV3,
@@ -2774,8 +2934,9 @@ fn policy_sve_direct_exact_v3(
 /// sealed filter is intersected before the sole predicate test; successful
 /// candidates enter a non-overlapping successor run.
 #[allow(
+    dead_code,
     clippy::too_many_lines,
-    reason = "the independent periodic predicate and successor graph is intentionally explicit"
+    reason = "retained as a policy reference for the superseded pure-SVE periodic graph"
 )]
 fn policy_periodic_sve_v3(
     policy: &mut PolicySinkV3,
@@ -3055,8 +3216,9 @@ fn policy_periodic_sve_v3(
 }
 
 #[allow(
+    dead_code,
     clippy::too_many_lines,
-    reason = "the independent SVE filtered policy retains the full predicate-recovery graph"
+    reason = "retained as a policy reference for the superseded pure-SVE filtered graph"
 )]
 fn policy_sve_filtered_v3(
     policy: &mut PolicySinkV3,
@@ -3361,6 +3523,7 @@ fn policy_multi_incumbent_v3(
     policy: &mut PolicySinkV3,
     literal: &[u8],
     filter: AuditCandidateFilterV3,
+    sve_tail: Option<bool>,
     done: PolicyLabelV3,
 ) -> Result<(), CountAotError> {
     let vector = policy.new_label(LabelKindV3::VectorLoop)?;
@@ -3375,9 +3538,22 @@ fn policy_multi_incumbent_v3(
     let block_advance = policy.new_label(LabelKindV3::Internal)?;
     let dense_scan = policy.new_label(LabelKindV3::VectorLoop)?;
     let dense_absent = policy.new_label(LabelKindV3::Internal)?;
-    let match_run = policy.new_label(LabelKindV3::CandidateLoop)?;
-    let match_run_miss = policy.new_label(LabelKindV3::Miss)?;
+    let match_run = if sve_tail.is_none() {
+        Some(policy.new_label(LabelKindV3::CandidateLoop)?)
+    } else {
+        None
+    };
+    let match_run_miss = if sve_tail.is_none() {
+        Some(policy.new_label(LabelKindV3::Miss)?)
+    } else {
+        None
+    };
     let scalar = policy.new_label(LabelKindV3::ScalarTail)?;
+    let scalar_loop = if sve_tail.is_some() {
+        policy.new_label(LabelKindV3::ScalarTail)?
+    } else {
+        scalar
+    };
     let scalar_miss = policy.new_label(LabelKindV3::Miss)?;
     let width = u16::try_from(literal.len()).expect("bounded width");
     let primary = u16::from(filter.offsets[0]);
@@ -3513,8 +3689,12 @@ fn policy_multi_incumbent_v3(
     compare_register64_v3(policy, X3, X4)?;
     condition_v3(policy, ConditionV3::Higher, done)?;
     subtract_register64_v3(policy, X5, X4, X3)?;
-    compare_immediate64_v3(policy, X5, 15)?;
-    condition_v3(policy, ConditionV3::CarryClear, scalar)?;
+    compare_immediate64_v3(policy, X5, SIMD_CANDIDATE_STARTS_V3 - 1)?;
+    condition_v3(policy, ConditionV3::CarryClear, scalar_loop)?;
+    if sve_tail.is_some() {
+        compare_immediate64_v3(policy, X5, SIMD_CANDIDATE_STARTS_V3 - 1)?;
+        condition_v3(policy, ConditionV3::Equal, scalar)?;
+    }
     add_register64_v3(policy, X15, X0, X3)?;
     add_immediate64_v3(policy, X8, X15, primary)?;
     exact_v3(
@@ -3802,7 +3982,7 @@ fn policy_multi_incumbent_v3(
     policy_confirmation_v3(policy, literal, filter.offsets(), X15, candidate_miss)?;
     add_immediate64_v3(policy, X13, X13, 1)?;
     add_immediate64_v3(policy, X3, X5, width)?;
-    branch_v3(policy, match_run)?;
+    branch_v3(policy, match_run.unwrap_or(vector))?;
     policy.bind(candidate_miss)?;
     compare_immediate64_v3(policy, X6, 0)?;
     condition_v3(policy, ConditionV3::NotEqual, candidate)?;
@@ -3810,17 +3990,19 @@ fn policy_multi_incumbent_v3(
     add_immediate64_v3(policy, X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
     branch_v3(policy, vector)?;
 
-    policy.bind(match_run)?;
-    compare_register64_v3(policy, X3, X4)?;
-    condition_v3(policy, ConditionV3::Higher, done)?;
-    add_register64_v3(policy, X15, X0, X3)?;
-    policy_confirmation_v3(policy, literal, &[], X15, match_run_miss)?;
-    add_immediate64_v3(policy, X13, X13, 1)?;
-    add_immediate64_v3(policy, X3, X3, width)?;
-    branch_v3(policy, match_run)?;
-    policy.bind(match_run_miss)?;
-    add_immediate64_v3(policy, X3, X3, 1)?;
-    branch_v3(policy, vector)?;
+    if let (Some(match_run), Some(match_run_miss)) = (match_run, match_run_miss) {
+        policy.bind(match_run)?;
+        compare_register64_v3(policy, X3, X4)?;
+        condition_v3(policy, ConditionV3::Higher, done)?;
+        add_register64_v3(policy, X15, X0, X3)?;
+        policy_confirmation_v3(policy, literal, &[], X15, match_run_miss)?;
+        add_immediate64_v3(policy, X13, X13, 1)?;
+        add_immediate64_v3(policy, X3, X3, width)?;
+        branch_v3(policy, match_run)?;
+        policy.bind(match_run_miss)?;
+        add_immediate64_v3(policy, X3, X3, 1)?;
+        branch_v3(policy, vector)?;
+    }
 
     policy.bind(dense_absent)?;
     add_immediate64_v3(policy, X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
@@ -4120,6 +4302,10 @@ fn policy_multi_incumbent_v3(
     branch_v3(policy, vector)?;
 
     policy.bind(scalar)?;
+    if let Some(sve2) = sve_tail {
+        policy_hybrid_sve_exact_tail_v3(policy, literal, sve2, scalar_loop, done)?;
+        policy.bind(scalar_loop)?;
+    }
     compare_register64_v3(policy, X3, X4)?;
     condition_v3(policy, ConditionV3::Higher, done)?;
     add_register64_v3(policy, X15, X0, X3)?;
@@ -4142,10 +4328,17 @@ fn policy_multi_incumbent_v3(
     policy_confirmation_v3(policy, literal, filter.offsets(), X15, scalar_miss)?;
     add_immediate64_v3(policy, X13, X13, 1)?;
     add_immediate64_v3(policy, X3, X3, width)?;
-    branch_v3(policy, match_run)?;
+    branch_v3(
+        policy,
+        if sve_tail.is_some() {
+            scalar_loop
+        } else {
+            match_run.expect("incumbent policy match run")
+        },
+    )?;
     policy.bind(scalar_miss)?;
     add_immediate64_v3(policy, X3, X3, 1)?;
-    branch_v3(policy, scalar)
+    branch_v3(policy, scalar_loop)
 }
 
 #[allow(
@@ -4158,6 +4351,7 @@ fn policy_multi_specialized_v3(
     filter: AuditCandidateFilterV3,
     confirmation_order: &[u8],
     strategy: AuditLoweringStrategyV3,
+    sve_tail: Option<bool>,
     done: PolicyLabelV3,
 ) -> Result<(), CountAotError> {
     let vector = policy.new_label(LabelKindV3::VectorLoop)?;
@@ -4278,6 +4472,11 @@ fn policy_multi_specialized_v3(
         None
     };
     let scalar = policy.new_label(LabelKindV3::ScalarTail)?;
+    let scalar_loop = if sve_tail.is_some() {
+        policy.new_label(LabelKindV3::ScalarTail)?
+    } else {
+        scalar
+    };
     let scalar_miss = policy.new_label(LabelKindV3::Miss)?;
     let width = u16::try_from(literal.len()).expect("bounded width");
     let sliding_required_remaining =
@@ -4417,7 +4616,11 @@ fn policy_multi_specialized_v3(
     }
     subtract_register64_v3(policy, X5, X4, X3)?;
     compare_immediate64_v3(policy, X5, SIMD_CANDIDATE_STARTS_V3 - 1)?;
-    condition_v3(policy, ConditionV3::CarryClear, scalar)?;
+    condition_v3(policy, ConditionV3::CarryClear, scalar_loop)?;
+    if sve_tail.is_some() {
+        compare_immediate64_v3(policy, X5, SIMD_CANDIDATE_STARTS_V3 - 1)?;
+        condition_v3(policy, ConditionV3::Equal, scalar)?;
+    }
     add_register64_v3(policy, X15, X0, X3)?;
     add_immediate64_v3(policy, X8, X15, u16::from(filter.offsets[0]))?;
     exact_v3(
@@ -5563,6 +5766,10 @@ fn policy_multi_specialized_v3(
     }
 
     policy.bind(scalar)?;
+    if let Some(sve2) = sve_tail {
+        policy_hybrid_sve_exact_tail_v3(policy, literal, sve2, scalar_loop, done)?;
+        policy.bind(scalar_loop)?;
+    }
     compare_register64_v3(policy, X3, X4)?;
     condition_v3(policy, ConditionV3::Higher, done)?;
     add_register64_v3(policy, X15, X0, X3)?;
@@ -5581,10 +5788,17 @@ fn policy_multi_specialized_v3(
     )?;
     add_immediate64_v3(policy, X13, X13, 1)?;
     add_immediate64_v3(policy, X3, X3, width)?;
-    branch_v3(policy, match_run.unwrap_or(vector))?;
+    branch_v3(
+        policy,
+        if sve_tail.is_some() {
+            scalar_loop
+        } else {
+            match_run.unwrap_or(vector)
+        },
+    )?;
     policy.bind(scalar_miss)?;
     add_immediate64_v3(policy, X3, X3, 1)?;
-    branch_v3(policy, scalar)
+    branch_v3(policy, scalar_loop)
 }
 
 /// Independent policy for the compact periodic NEON graph. Unlike the generic
@@ -5600,6 +5814,7 @@ fn policy_periodic_neon_v3(
     filter: AuditCandidateFilterV3,
     confirmation_order: &[u8],
     periodic_stride: u8,
+    sve_tail: Option<bool>,
     done: PolicyLabelV3,
 ) -> Result<(), CountAotError> {
     if periodic_stride == 0 || usize::from(periodic_stride) >= literal.len() || filter.len != 2 {
@@ -5611,9 +5826,22 @@ fn policy_periodic_neon_v3(
     let candidate = policy.new_label(LabelKindV3::CandidateLoop)?;
     let candidate_miss = policy.new_label(LabelKindV3::Miss)?;
     let advance = policy.new_label(LabelKindV3::Internal)?;
-    let match_run = policy.new_label(LabelKindV3::CandidateLoop)?;
-    let match_run_miss = policy.new_label(LabelKindV3::Miss)?;
+    let match_run = if sve_tail.is_none() {
+        Some(policy.new_label(LabelKindV3::CandidateLoop)?)
+    } else {
+        None
+    };
+    let match_run_miss = if sve_tail.is_none() {
+        Some(policy.new_label(LabelKindV3::Miss)?)
+    } else {
+        None
+    };
     let scalar = policy.new_label(LabelKindV3::ScalarTail)?;
+    let scalar_loop = if sve_tail.is_some() {
+        policy.new_label(LabelKindV3::ScalarTail)?
+    } else {
+        scalar
+    };
     let scalar_miss = policy.new_label(LabelKindV3::Miss)?;
     let width = u16::try_from(literal.len()).expect("bounded width");
     let value_registers = [X10, X11, X12, X14];
@@ -5850,7 +6078,11 @@ fn policy_periodic_neon_v3(
     condition_v3(policy, ConditionV3::Higher, done)?;
     subtract_register64_v3(policy, X5, X4, X3)?;
     compare_immediate64_v3(policy, X5, SIMD_CANDIDATE_STARTS_V3 - 1)?;
-    condition_v3(policy, ConditionV3::CarryClear, scalar)?;
+    condition_v3(policy, ConditionV3::CarryClear, scalar_loop)?;
+    if sve_tail.is_some() {
+        compare_immediate64_v3(policy, X5, SIMD_CANDIDATE_STARTS_V3 - 1)?;
+        condition_v3(policy, ConditionV3::Equal, scalar)?;
+    }
     add_register64_v3(policy, X15, X0, X3)?;
     for index in 0..usize::from(filter.len) {
         let mask_register = if index == 0 { 0 } else { 1 };
@@ -5952,7 +6184,7 @@ fn policy_periodic_neon_v3(
     )?;
     add_immediate64_v3(policy, X13, X13, 1)?;
     add_immediate64_v3(policy, X3, X5, width)?;
-    branch_v3(policy, match_run)?;
+    branch_v3(policy, match_run.unwrap_or(wide))?;
 
     policy.bind(candidate_miss)?;
     compare_immediate64_v3(policy, X6, 0)?;
@@ -5961,26 +6193,32 @@ fn policy_periodic_neon_v3(
     add_immediate64_v3(policy, X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
     branch_v3(policy, wide)?;
 
-    policy.bind(match_run)?;
-    compare_register64_v3(policy, X3, X4)?;
-    condition_v3(policy, ConditionV3::Higher, done)?;
-    add_register64_v3(policy, X15, X0, X3)?;
-    policy_confirmation_ordered_v3(
-        policy,
-        literal,
-        confirmation_order,
-        &[],
-        X15,
-        match_run_miss,
-    )?;
-    add_immediate64_v3(policy, X13, X13, 1)?;
-    add_immediate64_v3(policy, X3, X3, width)?;
-    branch_v3(policy, match_run)?;
-    policy.bind(match_run_miss)?;
-    add_immediate64_v3(policy, X3, X3, 1)?;
-    branch_v3(policy, wide)?;
+    if let (Some(match_run), Some(match_run_miss)) = (match_run, match_run_miss) {
+        policy.bind(match_run)?;
+        compare_register64_v3(policy, X3, X4)?;
+        condition_v3(policy, ConditionV3::Higher, done)?;
+        add_register64_v3(policy, X15, X0, X3)?;
+        policy_confirmation_ordered_v3(
+            policy,
+            literal,
+            confirmation_order,
+            &[],
+            X15,
+            match_run_miss,
+        )?;
+        add_immediate64_v3(policy, X13, X13, 1)?;
+        add_immediate64_v3(policy, X3, X3, width)?;
+        branch_v3(policy, match_run)?;
+        policy.bind(match_run_miss)?;
+        add_immediate64_v3(policy, X3, X3, 1)?;
+        branch_v3(policy, wide)?;
+    }
 
     policy.bind(scalar)?;
+    if let Some(sve2) = sve_tail {
+        policy_hybrid_sve_exact_tail_v3(policy, literal, sve2, scalar_loop, done)?;
+        policy.bind(scalar_loop)?;
+    }
     compare_register64_v3(policy, X3, X4)?;
     condition_v3(policy, ConditionV3::Higher, done)?;
     add_register64_v3(policy, X15, X0, X3)?;
@@ -5999,10 +6237,17 @@ fn policy_periodic_neon_v3(
     )?;
     add_immediate64_v3(policy, X13, X13, 1)?;
     add_immediate64_v3(policy, X3, X3, width)?;
-    branch_v3(policy, match_run)?;
+    branch_v3(
+        policy,
+        if sve_tail.is_some() {
+            scalar_loop
+        } else {
+            match_run.expect("periodic policy match run")
+        },
+    )?;
     policy.bind(scalar_miss)?;
     add_immediate64_v3(policy, X3, X3, 1)?;
-    branch_v3(policy, scalar)
+    branch_v3(policy, scalar_loop)
 }
 
 fn policy_confirmation_ordered_v3(
@@ -6427,6 +6672,10 @@ fn compare_immediate64_v3(
     )
 }
 
+#[allow(
+    dead_code,
+    reason = "retained by the superseded pure-SVE policy reference"
+)]
 fn compare_immediate32_v3(
     policy: &mut PolicySinkV3,
     register: u8,

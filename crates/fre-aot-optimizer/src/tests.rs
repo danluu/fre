@@ -72,12 +72,12 @@ fn explicit_isa_plans_are_sealed_before_recipe_identity() {
         (
             &sve,
             CountV3RequiredIsa::Aarch64SveVl16,
-            CountV3RegisterPlanId::Aarch64SveVl16V1,
+            CountV3RegisterPlanId::Aarch64NeonSveVl16V1,
         ),
         (
             &sve2,
             CountV3RequiredIsa::Aarch64Sve2Vl16,
-            CountV3RegisterPlanId::Aarch64Sve2Vl16V1,
+            CountV3RegisterPlanId::Aarch64NeonSve2Vl16V1,
         ),
     ] {
         assert_eq!(optimized.recipe().required_isa(), required_isa);

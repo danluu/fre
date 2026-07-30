@@ -560,8 +560,8 @@ fn project_recipe_v3(
     }
     let expected_register_plan = match recipe.required_isa() {
         CountV3RequiredIsa::Aarch64Neon128 => CountV3RegisterPlanId::Aarch64NeonV1,
-        CountV3RequiredIsa::Aarch64SveVl16 => CountV3RegisterPlanId::Aarch64SveVl16V1,
-        CountV3RequiredIsa::Aarch64Sve2Vl16 => CountV3RegisterPlanId::Aarch64Sve2Vl16V1,
+        CountV3RequiredIsa::Aarch64SveVl16 => CountV3RegisterPlanId::Aarch64NeonSveVl16V1,
+        CountV3RequiredIsa::Aarch64Sve2Vl16 => CountV3RegisterPlanId::Aarch64NeonSve2Vl16V1,
     };
     if recipe.register_plan_id() != expected_register_plan {
         return Err(CountAotError::Unsupported {
@@ -788,7 +788,7 @@ fn preflight_program_dimensions_v3(
 pub(crate) fn prospective_v3(literal_len: usize) -> Result<ProspectiveV3, CountAotError> {
     let (instruction_upper_bound, labels, relocations) = match literal_len {
         0 => (24_usize, 3_usize, 4_usize),
-        1 => (64, 6, 12),
+        1 => (96, 8, 20),
         _ => {
             let chunks = literal_len / 8;
             let tail = literal_len % 8;
@@ -1422,17 +1422,17 @@ pub(crate) fn canonical_template_v3(
     } else {
         match recipe.required_isa {
             CountV3RequiredIsa::Aarch64Neon128 => match literal.len() {
-                1 => emit_single_v3(&mut assembler, literal[0], done)?,
+                1 => emit_single_v3(&mut assembler, literal[0], None, done)?,
                 _ => {
                     let filter = recipe.filter.ok_or(CountAotError::InternalInvariant {
                         at: "missing v3 candidate filter",
                     })?;
                     match recipe.strategy {
                         LoweringStrategyV3::Incumbent => {
-                            emit_multi_incumbent_v3(&mut assembler, literal, filter, done)?;
+                            emit_multi_incumbent_v3(&mut assembler, literal, filter, None, done)?;
                         }
                         LoweringStrategyV3::DirectExactMask => {
-                            emit_direct_exact_mask_v3(&mut assembler, literal, filter, done)?;
+                            emit_direct_exact_mask_v3(&mut assembler, literal, filter, None, done)?;
                         }
                         LoweringStrategyV3::SparseRareColumns
                         | LoweringStrategyV3::EndpointDense => emit_multi_specialized_v3(
@@ -1441,6 +1441,7 @@ pub(crate) fn canonical_template_v3(
                             filter,
                             recipe.confirmation_order(),
                             recipe.strategy,
+                            None,
                             done,
                         )?,
                         LoweringStrategyV3::PeriodicRun => emit_periodic_neon_v3(
@@ -1449,40 +1450,65 @@ pub(crate) fn canonical_template_v3(
                             filter,
                             recipe.confirmation_order(),
                             recipe.periodic_stride,
+                            None,
                             done,
                         )?,
                     }
                 }
             },
             CountV3RequiredIsa::Aarch64SveVl16 | CountV3RequiredIsa::Aarch64Sve2Vl16 => {
-                let sve2 = recipe.required_isa == CountV3RequiredIsa::Aarch64Sve2Vl16;
-                if literal.len() == 1 || recipe.strategy == LoweringStrategyV3::DirectExactMask {
-                    emit_sve_direct_exact_v3(&mut assembler, literal, sve2, done)?;
-                } else if recipe.strategy == LoweringStrategyV3::PeriodicRun {
-                    let filter = recipe.filter.ok_or(CountAotError::InternalInvariant {
-                        at: "missing v3 periodic SVE candidate filter",
-                    })?;
-                    emit_periodic_sve_v3(
-                        &mut assembler,
-                        literal,
-                        filter,
-                        recipe.confirmation_order(),
-                        recipe.periodic_stride,
-                        sve2,
-                        done,
-                    )?;
+                let sve_tail = Some(
+                    if recipe.required_isa == CountV3RequiredIsa::Aarch64Sve2Vl16 {
+                        HybridSveTailV3::Sve2
+                    } else {
+                        HybridSveTailV3::Sve
+                    },
+                );
+                if literal.len() == 1 {
+                    emit_single_v3(&mut assembler, literal[0], sve_tail, done)?;
                 } else {
                     let filter = recipe.filter.ok_or(CountAotError::InternalInvariant {
-                        at: "missing v3 SVE candidate filter",
+                        at: "missing v3 hybrid candidate filter",
                     })?;
-                    emit_sve_filtered_v3(
-                        &mut assembler,
-                        literal,
-                        filter,
-                        recipe.confirmation_order(),
-                        sve2,
-                        done,
-                    )?;
+                    match recipe.strategy {
+                        LoweringStrategyV3::Incumbent => {
+                            emit_multi_incumbent_v3(
+                                &mut assembler,
+                                literal,
+                                filter,
+                                sve_tail,
+                                done,
+                            )?;
+                        }
+                        LoweringStrategyV3::DirectExactMask => {
+                            emit_direct_exact_mask_v3(
+                                &mut assembler,
+                                literal,
+                                filter,
+                                sve_tail,
+                                done,
+                            )?;
+                        }
+                        LoweringStrategyV3::SparseRareColumns
+                        | LoweringStrategyV3::EndpointDense => emit_multi_specialized_v3(
+                            &mut assembler,
+                            literal,
+                            filter,
+                            recipe.confirmation_order(),
+                            recipe.strategy,
+                            sve_tail,
+                            done,
+                        )?,
+                        LoweringStrategyV3::PeriodicRun => emit_periodic_neon_v3(
+                            &mut assembler,
+                            literal,
+                            filter,
+                            recipe.confirmation_order(),
+                            recipe.periodic_stride,
+                            sve_tail,
+                            done,
+                        )?,
+                    }
                 }
             }
         }
@@ -1506,14 +1532,36 @@ fn emit_empty_v3(assembler: &mut AssemblerV3, done: LabelV3) -> Result<(), Count
     assembler.ret()
 }
 
+/// Feature-exact mixed register plan: Advanced SIMD owns the hot loops and
+/// the final complete 16-start block is consumed by a real SVE predicate
+/// kernel. The lower 128 bits of Z0/Z1 alias V0/V1, but the mixed graph never
+/// returns to an Advanced SIMD body after entering this tail.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HybridSveTailV3 {
+    Sve,
+    Sve2,
+}
+
+impl HybridSveTailV3 {
+    const fn is_sve2(self) -> bool {
+        matches!(self, Self::Sve2)
+    }
+}
+
 fn emit_single_v3(
     assembler: &mut AssemblerV3,
     literal: u8,
+    sve_tail: Option<HybridSveTailV3>,
     done: LabelV3,
 ) -> Result<(), CountAotError> {
     let vector64 = assembler.new_label(LabelKindV3::VectorLoop)?;
     let vector16 = assembler.new_label(LabelKindV3::VectorLoop)?;
     let tail = assembler.new_label(LabelKindV3::ScalarTail)?;
+    let scalar = if sve_tail.is_some() {
+        assembler.new_label(LabelKindV3::ScalarTail)?
+    } else {
+        tail
+    };
     let tail_miss = assembler.new_label(LabelKindV3::Miss)?;
     assembler.mov_imm64_minimal(X13, 0)?;
     assembler.mov_imm64_minimal(X3, 0)?;
@@ -1547,7 +1595,11 @@ fn emit_single_v3(
     assembler.bind(vector16)?;
     assembler.sub_reg(X6, X1, X3)?;
     assembler.cmp_imm64(X6, SIMD_CANDIDATE_STARTS_V3)?;
-    assembler.branch_cond(ConditionV3::CarryClear, tail)?;
+    assembler.branch_cond(ConditionV3::CarryClear, scalar)?;
+    if sve_tail.is_some() {
+        assembler.cmp_imm64(X6, SIMD_CANDIDATE_STARTS_V3)?;
+        assembler.branch_cond(ConditionV3::Equal, tail)?;
+    }
     assembler.add_reg(X15, X0, X3)?;
     assembler.load_vector128(0, X15)?;
     assembler.compare_equal_bytes16(0, 0, 1)?;
@@ -1559,6 +1611,16 @@ fn emit_single_v3(
     assembler.add_imm(X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
     assembler.branch(vector16)?;
     assembler.bind(tail)?;
+    if let Some(sve_tail) = sve_tail {
+        emit_hybrid_sve_exact_tail_v3(
+            assembler,
+            core::slice::from_ref(&literal),
+            sve_tail,
+            scalar,
+            done,
+        )?;
+        assembler.bind(scalar)?;
+    }
     assembler.cmp_reg64(X3, X1)?;
     assembler.branch_cond(ConditionV3::CarrySet, done)?;
     assembler.load_byte_reg(X6, X0, X3)?;
@@ -1567,7 +1629,7 @@ fn emit_single_v3(
     assembler.add_imm(X13, X13, 1)?;
     assembler.bind(tail_miss)?;
     assembler.add_imm(X3, X3, 1)?;
-    assembler.branch(tail)
+    assembler.branch(scalar)
 }
 
 /// Count an exact, self-non-overlapping literal directly from equality masks.
@@ -1580,6 +1642,7 @@ fn emit_direct_exact_mask_v3(
     assembler: &mut AssemblerV3,
     literal: &[u8],
     filter: CandidateFilterV3,
+    sve_tail: Option<HybridSveTailV3>,
     done: LabelV3,
 ) -> Result<(), CountAotError> {
     let vector64 = assembler.new_label(LabelKindV3::VectorLoop)?;
@@ -1590,6 +1653,11 @@ fn emit_direct_exact_mask_v3(
     };
     let vector16 = assembler.new_label(LabelKindV3::VectorLoop)?;
     let tail = assembler.new_label(LabelKindV3::ScalarTail)?;
+    let scalar = if sve_tail.is_some() {
+        assembler.new_label(LabelKindV3::ScalarTail)?
+    } else {
+        tail
+    };
     let tail_miss = assembler.new_label(LabelKindV3::Miss)?;
     let width = u16::try_from(literal.len()).map_err(|_| CountAotError::ArithmeticOverflow {
         site: CountAotArithmeticSite::CodeOffset,
@@ -1697,8 +1765,12 @@ fn emit_direct_exact_mask_v3(
     assembler.cmp_reg64(X3, X4)?;
     assembler.branch_cond(ConditionV3::Higher, done)?;
     assembler.sub_reg(X6, X4, X3)?;
-    assembler.cmp_imm64(X6, 15)?;
-    assembler.branch_cond(ConditionV3::CarryClear, tail)?;
+    assembler.cmp_imm64(X6, SIMD_CANDIDATE_STARTS_V3 - 1)?;
+    assembler.branch_cond(ConditionV3::CarryClear, scalar)?;
+    if sve_tail.is_some() {
+        assembler.cmp_imm64(X6, SIMD_CANDIDATE_STARTS_V3 - 1)?;
+        assembler.branch_cond(ConditionV3::Equal, tail)?;
+    }
     assembler.add_reg(X15, X0, X3)?;
     for index in 0..usize::from(filter.len) {
         assembler.add_imm(
@@ -1722,6 +1794,10 @@ fn emit_direct_exact_mask_v3(
     assembler.branch(vector16)?;
 
     assembler.bind(tail)?;
+    if let Some(sve_tail) = sve_tail {
+        emit_hybrid_sve_exact_tail_v3(assembler, literal, sve_tail, scalar, done)?;
+        assembler.bind(scalar)?;
+    }
     assembler.cmp_reg64(X3, X4)?;
     assembler.branch_cond(ConditionV3::Higher, done)?;
     assembler.add_reg(X15, X0, X3)?;
@@ -1733,7 +1809,7 @@ fn emit_direct_exact_mask_v3(
     assembler.add_imm(X13, X13, 1)?;
     assembler.bind(tail_miss)?;
     assembler.add_imm(X3, X3, 1)?;
-    assembler.branch(tail)
+    assembler.branch(scalar)
 }
 
 fn emit_sve_compare_bytes_v3(
@@ -1751,6 +1827,69 @@ fn emit_sve_compare_bytes_v3(
     }
 }
 
+/// Consume every complete 16-start block remaining after the Advanced SIMD
+/// graph, then transfer fewer than 16 starts to the scalar suffix.
+///
+/// Every literal column participates in the predicate, so a set lane is
+/// already an exact semantic match. BRKB/CNTP recover the earliest lane and
+/// the width successor enforces non-overlap before the next predicate block.
+fn emit_hybrid_sve_exact_tail_v3(
+    assembler: &mut AssemblerV3,
+    literal: &[u8],
+    sve_tail: HybridSveTailV3,
+    scalar: LabelV3,
+    done: LabelV3,
+) -> Result<(), CountAotError> {
+    let no_match = assembler.new_label(LabelKindV3::Miss)?;
+    let width = u16::try_from(literal.len()).map_err(|_| CountAotError::ArithmeticOverflow {
+        site: CountAotArithmeticSite::CodeOffset,
+    })?;
+
+    assembler.sve_ptrue_bytes_vl16(0)?;
+    assembler.cmp_reg64(X3, X4)?;
+    assembler.branch_cond(ConditionV3::Higher, done)?;
+    assembler.sub_reg(X6, X4, X3)?;
+    assembler.cmp_imm64(X6, SIMD_CANDIDATE_STARTS_V3 - 1)?;
+    assembler.branch_cond(ConditionV3::CarryClear, scalar)?;
+    assembler.add_reg(X15, X0, X3)?;
+    for (offset, byte) in literal.iter().copied().enumerate() {
+        assembler.mov_imm64_minimal(X8, u64::from(byte))?;
+        assembler.sve_duplicate_byte(1, X8)?;
+        let base = if offset == 0 {
+            X15
+        } else {
+            assembler.add_imm(
+                X9,
+                X15,
+                u16::try_from(offset).expect("bounded literal offset"),
+            )?;
+            X9
+        };
+        assembler.sve_load_bytes(0, 0, base)?;
+        let destination = if offset == 0 { 1 } else { 2 };
+        emit_sve_compare_bytes_v3(assembler, destination, 0, 0, 1, sve_tail.is_sve2())?;
+        if offset != 0 {
+            assembler.sve_and_predicate_bytes(1, 0, 1, 2)?;
+        }
+    }
+    assembler.sve_test_predicate_bytes(0, 1)?;
+    assembler.branch_cond(ConditionV3::Equal, no_match)?;
+    assembler.sve_break_before_bytes(3, 0, 1)?;
+    assembler.sve_count_predicate_bytes(X7, 0, 3)?;
+    assembler.add_reg(X5, X3, X7)?;
+    assembler.add_imm(X13, X13, 1)?;
+    assembler.add_imm(X3, X5, width)?;
+    assembler.branch(scalar)?;
+
+    assembler.bind(no_match)?;
+    assembler.add_imm(X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
+    assembler.branch(scalar)
+}
+
+#[allow(
+    dead_code,
+    reason = "retained as a reference for the superseded pure-SVE lowering"
+)]
 fn emit_scalar_confirmation_sve_v3(
     assembler: &mut AssemblerV3,
     literal: &[u8],
@@ -1776,6 +1915,10 @@ fn emit_scalar_confirmation_sve_v3(
 /// The SVE2 row replaces every equality compare with the genuinely SVE2-only
 /// MATCH instruction. Duplicating one byte across the right-hand vector makes
 /// MATCH's set-membership result exactly byte equality.
+#[allow(
+    dead_code,
+    reason = "retained as a reference for the superseded pure-SVE lowering"
+)]
 fn emit_sve_direct_exact_v3(
     assembler: &mut AssemblerV3,
     literal: &[u8],
@@ -1882,6 +2025,10 @@ fn emit_sve_direct_exact_v3(
 /// Predicate recovery retains every candidate lane in the current block:
 /// BRKB/CNTP materialize the first lane, while BRKA/BICS remove only a rejected
 /// lane. A confirmed match resumes at its semantic non-overlapping successor.
+#[allow(
+    dead_code,
+    reason = "retained as a reference for the superseded pure-SVE lowering"
+)]
 fn emit_sve_filtered_v3(
     assembler: &mut AssemblerV3,
     literal: &[u8],
@@ -2048,8 +2195,9 @@ fn emit_sve_filtered_v3(
 /// period byte cannot enter scalar confirmation alone. A confirmed match
 /// enters a straight non-overlapping successor run.
 #[allow(
+    dead_code,
     clippy::too_many_lines,
-    reason = "the closed periodic predicate and successor graph is intentionally explicit"
+    reason = "retained as an explicit reference for the superseded pure-SVE periodic graph"
 )]
 fn emit_periodic_sve_v3(
     assembler: &mut AssemblerV3,
@@ -2232,6 +2380,7 @@ fn emit_multi_incumbent_v3(
     assembler: &mut AssemblerV3,
     literal: &[u8],
     filter: CandidateFilterV3,
+    sve_tail: Option<HybridSveTailV3>,
     done: LabelV3,
 ) -> Result<(), CountAotError> {
     let vector = assembler.new_label(LabelKindV3::VectorLoop)?;
@@ -2246,9 +2395,22 @@ fn emit_multi_incumbent_v3(
     let block_advance = assembler.new_label(LabelKindV3::Internal)?;
     let dense_scan = assembler.new_label(LabelKindV3::VectorLoop)?;
     let dense_absent = assembler.new_label(LabelKindV3::Internal)?;
-    let match_run = assembler.new_label(LabelKindV3::CandidateLoop)?;
-    let match_run_miss = assembler.new_label(LabelKindV3::Miss)?;
+    let match_run = if sve_tail.is_none() {
+        Some(assembler.new_label(LabelKindV3::CandidateLoop)?)
+    } else {
+        None
+    };
+    let match_run_miss = if sve_tail.is_none() {
+        Some(assembler.new_label(LabelKindV3::Miss)?)
+    } else {
+        None
+    };
     let scalar = assembler.new_label(LabelKindV3::ScalarTail)?;
+    let scalar_loop = if sve_tail.is_some() {
+        assembler.new_label(LabelKindV3::ScalarTail)?
+    } else {
+        scalar
+    };
     let scalar_miss = assembler.new_label(LabelKindV3::Miss)?;
     let width = u16::try_from(literal.len()).map_err(|_| CountAotError::ArithmeticOverflow {
         site: CountAotArithmeticSite::CodeOffset,
@@ -2317,8 +2479,12 @@ fn emit_multi_incumbent_v3(
     assembler.cmp_reg64(X3, X4)?;
     assembler.branch_cond(ConditionV3::Higher, done)?;
     assembler.sub_reg(X5, X4, X3)?;
-    assembler.cmp_imm64(X5, 15)?;
-    assembler.branch_cond(ConditionV3::CarryClear, scalar)?;
+    assembler.cmp_imm64(X5, SIMD_CANDIDATE_STARTS_V3 - 1)?;
+    assembler.branch_cond(ConditionV3::CarryClear, scalar_loop)?;
+    if sve_tail.is_some() {
+        assembler.cmp_imm64(X5, SIMD_CANDIDATE_STARTS_V3 - 1)?;
+        assembler.branch_cond(ConditionV3::Equal, scalar)?;
+    }
     assembler.add_reg(X15, X0, X3)?;
     assembler.add_imm(X8, X15, primary)?;
     assembler.load_vector128(0, X8)?;
@@ -2399,7 +2565,7 @@ fn emit_multi_incumbent_v3(
     assembler.add_imm(X13, X13, 1)?;
     // Discard the old mask and enter a full-confirmation successor run.
     assembler.add_imm(X3, X5, width)?;
-    assembler.branch(match_run)?;
+    assembler.branch(match_run.unwrap_or(vector))?;
 
     assembler.bind(candidate_miss)?;
     assembler.cmp_imm64(X6, 0)?;
@@ -2411,17 +2577,19 @@ fn emit_multi_incumbent_v3(
     // Match-heavy input avoids rebuilding filter masks at every exact
     // semantic successor. The first failed successor is consumed once before
     // returning to adaptive SIMD filtering.
-    assembler.bind(match_run)?;
-    assembler.cmp_reg64(X3, X4)?;
-    assembler.branch_cond(ConditionV3::Higher, done)?;
-    assembler.add_reg(X15, X0, X3)?;
-    emit_confirmation_v3(assembler, literal, &[], X15, match_run_miss)?;
-    assembler.add_imm(X13, X13, 1)?;
-    assembler.add_imm(X3, X3, width)?;
-    assembler.branch(match_run)?;
-    assembler.bind(match_run_miss)?;
-    assembler.add_imm(X3, X3, 1)?;
-    assembler.branch(vector)?;
+    if let (Some(match_run), Some(match_run_miss)) = (match_run, match_run_miss) {
+        assembler.bind(match_run)?;
+        assembler.cmp_reg64(X3, X4)?;
+        assembler.branch_cond(ConditionV3::Higher, done)?;
+        assembler.add_reg(X15, X0, X3)?;
+        emit_confirmation_v3(assembler, literal, &[], X15, match_run_miss)?;
+        assembler.add_imm(X13, X13, 1)?;
+        assembler.add_imm(X3, X3, width)?;
+        assembler.branch(match_run)?;
+        assembler.bind(match_run_miss)?;
+        assembler.add_imm(X3, X3, 1)?;
+        assembler.branch(vector)?;
+    }
 
     // Once a pair-dense block has no semantic first/last candidate, eight
     // consecutive first/last blocks share one reduction. Any possible match
@@ -2556,6 +2724,10 @@ fn emit_multi_incumbent_v3(
     assembler.branch(vector)?;
 
     assembler.bind(scalar)?;
+    if let Some(sve_tail) = sve_tail {
+        emit_hybrid_sve_exact_tail_v3(assembler, literal, sve_tail, scalar_loop, done)?;
+        assembler.bind(scalar_loop)?;
+    }
     assembler.cmp_reg64(X3, X4)?;
     assembler.branch_cond(ConditionV3::Higher, done)?;
     assembler.add_reg(X15, X0, X3)?;
@@ -2578,10 +2750,14 @@ fn emit_multi_incumbent_v3(
     emit_confirmation_v3(assembler, literal, filter.offsets(), X15, scalar_miss)?;
     assembler.add_imm(X13, X13, 1)?;
     assembler.add_imm(X3, X3, width)?;
-    assembler.branch(match_run)?;
+    assembler.branch(if sve_tail.is_some() {
+        scalar_loop
+    } else {
+        match_run.expect("incumbent match run")
+    })?;
     assembler.bind(scalar_miss)?;
     assembler.add_imm(X3, X3, 1)?;
-    assembler.branch(scalar)
+    assembler.branch(scalar_loop)
 }
 
 /// Return the max-cursor slack required for an aligned sliding-window pair
@@ -2690,6 +2866,7 @@ fn emit_multi_specialized_v3(
     filter: CandidateFilterV3,
     confirmation_order: &[u8],
     strategy: LoweringStrategyV3,
+    sve_tail: Option<HybridSveTailV3>,
     done: LabelV3,
 ) -> Result<(), CountAotError> {
     let vector = assembler.new_label(LabelKindV3::VectorLoop)?;
@@ -2810,6 +2987,11 @@ fn emit_multi_specialized_v3(
         None
     };
     let scalar = assembler.new_label(LabelKindV3::ScalarTail)?;
+    let scalar_loop = if sve_tail.is_some() {
+        assembler.new_label(LabelKindV3::ScalarTail)?
+    } else {
+        scalar
+    };
     let scalar_miss = assembler.new_label(LabelKindV3::Miss)?;
     let width = u16::try_from(literal.len()).map_err(|_| CountAotError::ArithmeticOverflow {
         site: CountAotArithmeticSite::CodeOffset,
@@ -2908,7 +3090,11 @@ fn emit_multi_specialized_v3(
     }
     assembler.sub_reg(X5, X4, X3)?;
     assembler.cmp_imm64(X5, SIMD_CANDIDATE_STARTS_V3 - 1)?;
-    assembler.branch_cond(ConditionV3::CarryClear, scalar)?;
+    assembler.branch_cond(ConditionV3::CarryClear, scalar_loop)?;
+    if sve_tail.is_some() {
+        assembler.cmp_imm64(X5, SIMD_CANDIDATE_STARTS_V3 - 1)?;
+        assembler.branch_cond(ConditionV3::Equal, scalar)?;
+    }
     assembler.add_reg(X15, X0, X3)?;
     assembler.add_imm(X8, X15, u16::from(filter.offsets[0]))?;
     assembler.load_vector128(0, X8)?;
@@ -3395,6 +3581,10 @@ fn emit_multi_specialized_v3(
     }
 
     assembler.bind(scalar)?;
+    if let Some(sve_tail) = sve_tail {
+        emit_hybrid_sve_exact_tail_v3(assembler, literal, sve_tail, scalar_loop, done)?;
+        assembler.bind(scalar_loop)?;
+    }
     assembler.cmp_reg64(X3, X4)?;
     assembler.branch_cond(ConditionV3::Higher, done)?;
     assembler.add_reg(X15, X0, X3)?;
@@ -3413,10 +3603,14 @@ fn emit_multi_specialized_v3(
     )?;
     assembler.add_imm(X13, X13, 1)?;
     assembler.add_imm(X3, X3, width)?;
-    assembler.branch(match_run.unwrap_or(vector))?;
+    assembler.branch(if sve_tail.is_some() {
+        scalar_loop
+    } else {
+        match_run.unwrap_or(vector)
+    })?;
     assembler.bind(scalar_miss)?;
     assembler.add_imm(X3, X3, 1)?;
-    assembler.branch(scalar)
+    assembler.branch(scalar_loop)
 }
 
 /// NEON periodic scan with one complete-filter reduction per 16 starts.
@@ -3436,6 +3630,7 @@ fn emit_periodic_neon_v3(
     filter: CandidateFilterV3,
     confirmation_order: &[u8],
     periodic_stride: u8,
+    sve_tail: Option<HybridSveTailV3>,
     done: LabelV3,
 ) -> Result<(), CountAotError> {
     if periodic_stride == 0 || usize::from(periodic_stride) >= literal.len() || filter.len != 2 {
@@ -3449,9 +3644,22 @@ fn emit_periodic_neon_v3(
     let candidate = assembler.new_label(LabelKindV3::CandidateLoop)?;
     let candidate_miss = assembler.new_label(LabelKindV3::Miss)?;
     let advance = assembler.new_label(LabelKindV3::Internal)?;
-    let match_run = assembler.new_label(LabelKindV3::CandidateLoop)?;
-    let match_run_miss = assembler.new_label(LabelKindV3::Miss)?;
+    let match_run = if sve_tail.is_none() {
+        Some(assembler.new_label(LabelKindV3::CandidateLoop)?)
+    } else {
+        None
+    };
+    let match_run_miss = if sve_tail.is_none() {
+        Some(assembler.new_label(LabelKindV3::Miss)?)
+    } else {
+        None
+    };
     let scalar = assembler.new_label(LabelKindV3::ScalarTail)?;
+    let scalar_loop = if sve_tail.is_some() {
+        assembler.new_label(LabelKindV3::ScalarTail)?
+    } else {
+        scalar
+    };
     let scalar_miss = assembler.new_label(LabelKindV3::Miss)?;
     let width = u16::try_from(literal.len()).map_err(|_| CountAotError::ArithmeticOverflow {
         site: CountAotArithmeticSite::CodeOffset,
@@ -3579,7 +3787,11 @@ fn emit_periodic_neon_v3(
     assembler.branch_cond(ConditionV3::Higher, done)?;
     assembler.sub_reg(X5, X4, X3)?;
     assembler.cmp_imm64(X5, SIMD_CANDIDATE_STARTS_V3 - 1)?;
-    assembler.branch_cond(ConditionV3::CarryClear, scalar)?;
+    assembler.branch_cond(ConditionV3::CarryClear, scalar_loop)?;
+    if sve_tail.is_some() {
+        assembler.cmp_imm64(X5, SIMD_CANDIDATE_STARTS_V3 - 1)?;
+        assembler.branch_cond(ConditionV3::Equal, scalar)?;
+    }
     assembler.add_reg(X15, X0, X3)?;
     for index in 0..usize::from(filter.len) {
         let mask_register = if index == 0 { 0 } else { 1 };
@@ -3614,7 +3826,7 @@ fn emit_periodic_neon_v3(
     )?;
     assembler.add_imm(X13, X13, 1)?;
     assembler.add_imm(X3, X5, width)?;
-    assembler.branch(match_run)?;
+    assembler.branch(match_run.unwrap_or(wide))?;
 
     assembler.bind(candidate_miss)?;
     assembler.cmp_imm64(X6, 0)?;
@@ -3623,26 +3835,32 @@ fn emit_periodic_neon_v3(
     assembler.add_imm(X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
     assembler.branch(wide)?;
 
-    assembler.bind(match_run)?;
-    assembler.cmp_reg64(X3, X4)?;
-    assembler.branch_cond(ConditionV3::Higher, done)?;
-    assembler.add_reg(X15, X0, X3)?;
-    emit_confirmation_ordered_v3(
-        assembler,
-        literal,
-        confirmation_order,
-        &[],
-        X15,
-        match_run_miss,
-    )?;
-    assembler.add_imm(X13, X13, 1)?;
-    assembler.add_imm(X3, X3, width)?;
-    assembler.branch(match_run)?;
-    assembler.bind(match_run_miss)?;
-    assembler.add_imm(X3, X3, 1)?;
-    assembler.branch(wide)?;
+    if let (Some(match_run), Some(match_run_miss)) = (match_run, match_run_miss) {
+        assembler.bind(match_run)?;
+        assembler.cmp_reg64(X3, X4)?;
+        assembler.branch_cond(ConditionV3::Higher, done)?;
+        assembler.add_reg(X15, X0, X3)?;
+        emit_confirmation_ordered_v3(
+            assembler,
+            literal,
+            confirmation_order,
+            &[],
+            X15,
+            match_run_miss,
+        )?;
+        assembler.add_imm(X13, X13, 1)?;
+        assembler.add_imm(X3, X3, width)?;
+        assembler.branch(match_run)?;
+        assembler.bind(match_run_miss)?;
+        assembler.add_imm(X3, X3, 1)?;
+        assembler.branch(wide)?;
+    }
 
     assembler.bind(scalar)?;
+    if let Some(sve_tail) = sve_tail {
+        emit_hybrid_sve_exact_tail_v3(assembler, literal, sve_tail, scalar_loop, done)?;
+        assembler.bind(scalar_loop)?;
+    }
     assembler.cmp_reg64(X3, X4)?;
     assembler.branch_cond(ConditionV3::Higher, done)?;
     assembler.add_reg(X15, X0, X3)?;
@@ -3661,10 +3879,14 @@ fn emit_periodic_neon_v3(
     )?;
     assembler.add_imm(X13, X13, 1)?;
     assembler.add_imm(X3, X3, width)?;
-    assembler.branch(match_run)?;
+    assembler.branch(if sve_tail.is_some() {
+        scalar_loop
+    } else {
+        match_run.expect("periodic match run")
+    })?;
     assembler.bind(scalar_miss)?;
     assembler.add_imm(X3, X3, 1)?;
-    assembler.branch(scalar)
+    assembler.branch(scalar_loop)
 }
 
 fn emit_confirmation_ordered_v3(
@@ -4416,6 +4638,10 @@ impl AssemblerV3 {
         )
     }
 
+    #[allow(
+        dead_code,
+        reason = "retained for the superseded pure-SVE lowering reference"
+    )]
     fn sve_or_predicate_bytes(
         &mut self,
         destination: u8,
@@ -4433,6 +4659,10 @@ impl AssemblerV3 {
         )
     }
 
+    #[allow(
+        dead_code,
+        reason = "retained for the superseded pure-SVE lowering reference"
+    )]
     fn sve_bit_clear_predicate_bytes_set_flags(
         &mut self,
         destination: u8,
@@ -4472,6 +4702,10 @@ impl AssemblerV3 {
         )
     }
 
+    #[allow(
+        dead_code,
+        reason = "retained for the superseded pure-SVE lowering reference"
+    )]
     fn sve_break_after_bytes(
         &mut self,
         destination: u8,
