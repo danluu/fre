@@ -304,6 +304,7 @@ fn validate_search_backend_version(image: &NativeImage) -> Result<BackendVersion
         | BackendVersion::SEARCH_V7
         | BackendVersion::SEARCH_V8
         | BackendVersion::SEARCH_V9
+        | BackendVersion::SEARCH_V10
         | BackendVersion::SEARCH_SVE16_V1
         | BackendVersion::SEARCH_SVE2_16_V1
         | BackendVersion::SEARCH_SVE16_V6
@@ -337,6 +338,7 @@ fn authenticate_search_envelope<'image>(
             | BackendVersion::SEARCH_V7
             | BackendVersion::SEARCH_V8
             | BackendVersion::SEARCH_V9
+            | BackendVersion::SEARCH_V10
             | BackendVersion::SEARCH_SVE16_V1
             | BackendVersion::SEARCH_SVE2_16_V1
             | BackendVersion::SEARCH_SVE16_V6
@@ -571,8 +573,10 @@ fn authenticate_search_manifest<'image>(
             {
                 return Err(AuditError::InvalidSearchManifest);
             }
-            if manifest.backend_version == BackendVersion::SEARCH_V9
-                && (manifest.anchors != AnchorFlags::default() || literal_len == 0)
+            if matches!(
+                manifest.backend_version,
+                BackendVersion::SEARCH_V9 | BackendVersion::SEARCH_V10
+            ) && (manifest.anchors != AnchorFlags::default() || literal_len == 0)
             {
                 return Err(AuditError::InvalidSearchManifest);
             }
@@ -615,6 +619,7 @@ fn authenticate_class_suffix_manifest(
         BackendVersion::SEARCH_SVE16_V6
             | BackendVersion::SEARCH_SVE2_FIXED16_V2
             | BackendVersion::SEARCH_V9
+            | BackendVersion::SEARCH_V10
     ) {
         return Err(AuditError::InvalidSearchManifest);
     }
@@ -700,6 +705,7 @@ const SEARCH_CANDIDATE_POLICY_SVE16_V1: u16 = 5;
 const SEARCH_CANDIDATE_POLICY_SVE2_16_V1: u16 = 6;
 const SEARCH_CANDIDATE_POLICY_SVE2_FIXED16_V2: u16 = 8;
 const SEARCH_CANDIDATE_POLICY_V5: u16 = 9;
+const SEARCH_CANDIDATE_POLICY_V6: u16 = 10;
 const SEARCH_CANDIDATE_BLOCK_WIDTH: u16 = 16;
 const SEARCH_CANDIDATE_OFFSET_NONE: u16 = u16::MAX;
 const SVE2_CLASS_TABLE_DATA_ID: u32 = 2;
@@ -743,9 +749,10 @@ fn authenticate_search_candidate_policy(
                 )
             } else {
                 let (primary, secondary) = independent_exact_candidate_pair(literal);
-                let (verification, quaternary, quinary) = if manifest.backend_version
-                    == BackendVersion::SEARCH_SVE2_FIXED16_V2
-                {
+                let (verification, quaternary, quinary) = if matches!(
+                    manifest.backend_version,
+                    BackendVersion::SEARCH_SVE2_FIXED16_V2 | BackendVersion::SEARCH_V10
+                ) {
                     independent_ranked_verification_offsets_v2(literal, primary, secondary)
                 } else if matches!(
                     manifest.backend_version,
@@ -818,6 +825,10 @@ fn authenticate_search_candidate_policy(
                     && manifest.shape == SearchShape::ExactLiteral
                 {
                     SEARCH_CANDIDATE_POLICY_SVE2_FIXED16_V2
+                } else if manifest.backend_version == BackendVersion::SEARCH_V10
+                    && manifest.shape == SearchShape::ExactLiteral
+                {
+                    SEARCH_CANDIDATE_POLICY_V6
                 } else if manifest.backend_version == BackendVersion::SEARCH_V9
                     && manifest.shape == SearchShape::ExactLiteral
                 {
@@ -4660,6 +4671,7 @@ fn first_forbidden_search_vector_register(
                 BackendVersion::SEARCH_V7 => matches!(register, 16 | 17),
                 BackendVersion::SEARCH_V8
                 | BackendVersion::SEARCH_V9
+                | BackendVersion::SEARCH_V10
                 | BackendVersion::SEARCH_SVE16_V6
                 | BackendVersion::SEARCH_SVE2_FIXED16_V2 => register >= 16,
                 _ => false,

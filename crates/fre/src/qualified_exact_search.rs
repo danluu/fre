@@ -68,9 +68,10 @@ const fn qualification_for_backend_with_atoms(
         QualifiedExactSearchBackendPolicy::Sve16V6 => sve16_v6,
         QualifiedExactSearchBackendPolicy::Sve2Fixed16 => sve2_fixed16,
         QualifiedExactSearchBackendPolicy::Sve2Fixed16V2 => sve2_fixed16_v2,
-        QualifiedExactSearchBackendPolicy::AsimdV7 | QualifiedExactSearchBackendPolicy::Sve16 => {
-            QualifiedExactSearchQualification::Candidate
-        }
+        QualifiedExactSearchBackendPolicy::AsimdV7
+        | QualifiedExactSearchBackendPolicy::AsimdV9
+        | QualifiedExactSearchBackendPolicy::AsimdV10
+        | QualifiedExactSearchBackendPolicy::Sve16 => QualifiedExactSearchQualification::Candidate,
     }
 }
 
@@ -871,6 +872,8 @@ const fn selected_end_register_backend_v2(
             Some(SelectedEndRegisterBackendV2::Sve2Fixed16Tag21Vl16)
         }
         QualifiedExactSearchBackendPolicy::AsimdV7
+        | QualifiedExactSearchBackendPolicy::AsimdV9
+        | QualifiedExactSearchBackendPolicy::AsimdV10
         | QualifiedExactSearchBackendPolicy::Sve16
         | QualifiedExactSearchBackendPolicy::Sve2Fixed16 => None,
     }
@@ -2659,6 +2662,8 @@ mod tests {
         ));
         for policy in [
             QualifiedExactSearchBackendPolicy::AsimdV7,
+            QualifiedExactSearchBackendPolicy::AsimdV9,
+            QualifiedExactSearchBackendPolicy::AsimdV10,
             QualifiedExactSearchBackendPolicy::Sve16,
         ] {
             assert_eq!(selected_end_register_backend_v2(policy), None);

@@ -801,6 +801,9 @@ fn emit_exact(
         BackendVersion::SEARCH_V9 => {
             emit_exact_candidates_v9(template, manifest, literal, none, found)
         }
+        BackendVersion::SEARCH_V10 => {
+            emit_exact_candidates_v10(template, manifest, literal, none, found)
+        }
         BackendVersion::SEARCH_SVE2_FIXED16_V2 => {
             emit_exact_candidates_sve2_fixed16_v2(template, manifest, literal, none, found)
         }
@@ -1224,6 +1227,35 @@ fn emit_scalar_candidates_v3(
 }
 
 fn emit_exact_candidates_v9(
+    template: &mut Template,
+    manifest: SearchManifest,
+    literal: &[u8],
+    none: Label,
+    found: Label,
+) -> Result<(), AuditError> {
+    let first_candidate_miss = template.new_label(LabelKind::Internal);
+    let selected = literal
+        .get(usize::from(manifest.primary_offset))
+        .copied()
+        .ok_or(AuditError::InvalidSearchManifest)?;
+
+    template.add_reg(15, 9, 5);
+    template.load_byte(10, 15, manifest.primary_offset);
+    template.cmp_imm32(10, u16::from(selected));
+    template.branch_cond(Condition::NotEqual, first_candidate_miss);
+    if literal.len() > 1 {
+        emit_literal_equality(template, 15, 8, literal.len(), first_candidate_miss)?;
+    }
+    template.mov_reg(13, 5);
+    template.add_reg(14, 5, 12);
+    template.branch(found);
+
+    template.bind(first_candidate_miss)?;
+    template.add_imm(5, 5, 1);
+    emit_exact_candidates_v8(template, manifest, literal, none, found)
+}
+
+fn emit_exact_candidates_v10(
     template: &mut Template,
     manifest: SearchManifest,
     literal: &[u8],
@@ -1727,6 +1759,7 @@ fn emit_exact_candidates_v8(
         (manifest.verification_offset != u16::MAX).then_some(manifest.verification_offset);
     let quaternary_offset =
         (manifest.quaternary_offset != u16::MAX).then_some(manifest.quaternary_offset);
+    let quinary_offset = (manifest.quinary_offset != u16::MAX).then_some(manifest.quinary_offset);
     let wide = template.new_label(LabelKind::Loop);
     let wide_advance = template.new_label(LabelKind::Internal);
     let secondary_only = secondary_offset.map(|_| template.new_label(LabelKind::Loop));
@@ -1742,10 +1775,12 @@ fn emit_exact_candidates_v8(
     let second_filter = secondary_offset.map(|_| template.new_label(LabelKind::SlowPath));
     let third_filter = verification_offset.map(|_| template.new_label(LabelKind::SlowPath));
     let fourth_filter = quaternary_offset.map(|_| template.new_label(LabelKind::SlowPath));
+    let fifth_filter = quinary_offset.map(|_| template.new_label(LabelKind::SlowPath));
     let filters_cover_zero = primary_offset == 0
         || secondary_offset == Some(0)
         || verification_offset == Some(0)
-        || quaternary_offset == Some(0);
+        || quaternary_offset == Some(0)
+        || quinary_offset == Some(0);
     let sve_confirmation =
         manifest.backend_version == BackendVersion::SEARCH_SVE16_V6 && literal.len() >= 16;
 
@@ -1762,6 +1797,10 @@ fn emit_exact_candidates_v8(
     if let Some(offset) = quaternary_offset {
         template.load_byte(11, 8, offset);
         template.dup_byte16(7, 11);
+    }
+    if let Some(offset) = quinary_offset {
+        template.load_byte(11, 8, offset);
+        template.dup_byte16(23, 11);
     }
     if sve_confirmation {
         template.sve_ptrue_bytes_vl16(0);
@@ -1913,7 +1952,7 @@ fn emit_exact_candidates_v8(
         if let Some(third_filter) = third_filter {
             emit_branch_if_mask_has_multiple(template, 0, 10, third_filter);
         }
-        template.branch(recover);
+        template.branch(fifth_filter.unwrap_or(recover));
     }
 
     if let Some(third_filter) = third_filter {
@@ -1933,7 +1972,7 @@ fn emit_exact_candidates_v8(
         if let Some(fourth_filter) = fourth_filter {
             emit_branch_if_mask_has_multiple(template, 0, 10, fourth_filter);
         }
-        template.branch(recover);
+        template.branch(fifth_filter.unwrap_or(recover));
     }
 
     if let Some(fourth_filter) = fourth_filter {
@@ -1948,6 +1987,23 @@ fn emit_exact_candidates_v8(
         template.load_vector128(6, 10, 0);
         template.compare_equal_bytes16(6, 6, 7);
         template.and_bytes16(0, 0, 6);
+        emit_sparse_lane_mask_v7(template);
+        template.compare_branch_zero(0, true, fifth_filter.unwrap_or(recover));
+        template.branch(advance);
+    }
+
+    if let Some(fifth_filter) = fifth_filter {
+        let offset = quinary_offset.ok_or(AuditError::InvalidSearchManifest)?;
+        let delta = offset.abs_diff(primary_offset);
+        template.bind(fifth_filter)?;
+        if offset > primary_offset {
+            template.add_imm(10, 15, delta);
+        } else {
+            template.sub_imm(10, 15, delta);
+        }
+        template.load_vector128(22, 10, 0);
+        template.compare_equal_bytes16(22, 22, 23);
+        template.and_bytes16(0, 0, 22);
         emit_sparse_lane_mask_v7(template);
         template.compare_branch_zero(0, true, recover);
         template.branch(advance);

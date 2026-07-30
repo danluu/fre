@@ -47,6 +47,7 @@ const SEARCH_CANDIDATE_POLICY_SVE16_V1: u16 = 5;
 const SEARCH_CANDIDATE_POLICY_SVE2_16_V1: u16 = 6;
 const SEARCH_CANDIDATE_POLICY_SVE2_FIXED16_V2: u16 = 8;
 const SEARCH_CANDIDATE_POLICY_V5: u16 = 9;
+const SEARCH_CANDIDATE_POLICY_V6: u16 = 10;
 const SEARCH_CANDIDATE_BLOCK_WIDTH: u16 = 16;
 const SEARCH_CANDIDATE_OFFSET_NONE: u16 = u16::MAX;
 const SVE2_CLASS_TABLE_DATA_ID: u32 = 2;
@@ -75,6 +76,8 @@ pub enum SearchBackendPolicy {
     AsimdV8,
     /// Search V9 candidate: V8 plus an exact first-candidate fast path.
     AsimdV9,
+    /// Search V10 candidate: V9 plus a terminal-aware fifth ASIMD filter.
+    AsimdV10,
     /// SVE screening with exactly sixteen active byte lanes.
     Sve16,
     /// SVE2 `MATCH` screening with exactly sixteen active byte lanes,
@@ -97,6 +100,7 @@ impl SearchBackendPolicy {
             Self::AsimdV7 => BackendVersion::SEARCH_V7,
             Self::AsimdV8 => BackendVersion::SEARCH_V8,
             Self::AsimdV9 => BackendVersion::SEARCH_V9,
+            Self::AsimdV10 => BackendVersion::SEARCH_V10,
             Self::Sve16 => BackendVersion::SEARCH_SVE16_V1,
             Self::Sve2Fixed16 => BackendVersion::SEARCH_SVE2_16_V1,
             Self::Sve16V6 => BackendVersion::SEARCH_SVE16_V6,
@@ -307,6 +311,7 @@ fn emit_search_image<O: Operation>(
             | BackendVersion::SEARCH_V7
             | BackendVersion::SEARCH_V8
             | BackendVersion::SEARCH_V9
+            | BackendVersion::SEARCH_V10
             | BackendVersion::SEARCH_SVE16_V1
             | BackendVersion::SEARCH_SVE2_16_V1
             | BackendVersion::SEARCH_SVE16_V6
@@ -365,7 +370,11 @@ fn emit_search_image<O: Operation>(
             reason: UnsupportedReason::KernelShape,
         });
     }
-    if backend_version == BackendVersion::SEARCH_V9 && !plan.is_v9_policy_shape() {
+    if matches!(
+        backend_version,
+        BackendVersion::SEARCH_V9 | BackendVersion::SEARCH_V10
+    ) && !plan.is_v9_policy_shape()
+    {
         return Err(EmitError::Unsupported {
             reason: UnsupportedReason::KernelShape,
         });
@@ -488,6 +497,7 @@ fn emit_search_image<O: Operation>(
                 | BackendVersion::SEARCH_V7
                 | BackendVersion::SEARCH_V8
                 | BackendVersion::SEARCH_V9
+                | BackendVersion::SEARCH_V10
                 | BackendVersion::SEARCH_SVE16_V1
                 | BackendVersion::SEARCH_SVE2_16_V1
                 | BackendVersion::SEARCH_SVE16_V6
@@ -1530,6 +1540,7 @@ impl<'a> Plan<'a> {
                     backend_version,
                     BackendVersion::SEARCH_V8
                         | BackendVersion::SEARCH_V9
+                        | BackendVersion::SEARCH_V10
                         | BackendVersion::SEARCH_SVE16_V6
                         | BackendVersion::SEARCH_SVE2_FIXED16_V2
                 ) =>
@@ -1578,6 +1589,7 @@ impl<'a> Plan<'a> {
             BackendVersion::SEARCH_V7
                 | BackendVersion::SEARCH_V8
                 | BackendVersion::SEARCH_V9
+                | BackendVersion::SEARCH_V10
                 | BackendVersion::SEARCH_SVE16_V1
                 | BackendVersion::SEARCH_SVE2_16_V1
                 | BackendVersion::SEARCH_SVE16_V6
@@ -1619,6 +1631,7 @@ impl<'a> Plan<'a> {
                     BackendVersion::SEARCH_V7
                         | BackendVersion::SEARCH_V8
                         | BackendVersion::SEARCH_V9
+                        | BackendVersion::SEARCH_V10
                         | BackendVersion::SEARCH_SVE16_V1
                         | BackendVersion::SEARCH_SVE2_16_V1
                         | BackendVersion::SEARCH_SVE16_V6
@@ -1626,7 +1639,10 @@ impl<'a> Plan<'a> {
                 ) {
                     let admission = v7_policy_scan_admission.ok_or(EmitError::InternalInvariant)?;
                     Some(
-                        if backend_version == BackendVersion::SEARCH_SVE2_FIXED16_V2 {
+                        if matches!(
+                            backend_version,
+                            BackendVersion::SEARCH_SVE2_FIXED16_V2 | BackendVersion::SEARCH_V10
+                        ) {
                             admission.select_offsets_v2()
                         } else {
                             admission.select_offsets()
@@ -1713,6 +1729,10 @@ impl<'a> Plan<'a> {
                         && shape == SearchShape::ExactLiteral
                     {
                         SEARCH_CANDIDATE_POLICY_SVE2_FIXED16_V2
+                    } else if backend_version == BackendVersion::SEARCH_V10
+                        && shape == SearchShape::ExactLiteral
+                    {
+                        SEARCH_CANDIDATE_POLICY_V6
                     } else if backend_version == BackendVersion::SEARCH_V9
                         && shape == SearchShape::ExactLiteral
                     {
@@ -1959,7 +1979,21 @@ fn emit_exact(
                 secondary_offset,
                 verification_offset,
                 quaternary_offset,
+                None,
                 backend_version,
+                none,
+                found,
+            )?;
+        }
+        BackendVersion::SEARCH_V10 => {
+            emit_vector_candidate_skip_v10(
+                assembler,
+                literal,
+                primary_offset,
+                secondary_offset,
+                verification_offset,
+                quaternary_offset,
+                quinary_offset,
                 none,
                 found,
             )?;
@@ -2836,7 +2870,56 @@ fn emit_vector_candidate_skip_v9(
         secondary_offset,
         verification_offset,
         quaternary_offset,
+        None,
         BackendVersion::SEARCH_V8,
+        none,
+        found,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the V10 prefix is explicit before entering its terminal-filter extension of V8"
+)]
+fn emit_vector_candidate_skip_v10(
+    assembler: &mut Assembler,
+    literal: &[u8],
+    primary_offset: u16,
+    secondary_offset: Option<u16>,
+    verification_offset: Option<u16>,
+    quaternary_offset: Option<u16>,
+    quinary_offset: Option<u16>,
+    none: Label,
+    found: Label,
+) -> Result<(), EmitError> {
+    let first_candidate_miss = assembler.new_label(LabelKind::Internal)?;
+    let selected = literal
+        .get(usize::from(primary_offset))
+        .copied()
+        .ok_or(EmitError::InternalInvariant)?;
+
+    assembler.add_reg(X15, X9, X5)?;
+    assembler.load_byte(X10, X15, primary_offset)?;
+    assembler.cmp_imm32(X10, u16::from(selected))?;
+    assembler.branch_cond(Condition::NotEqual, first_candidate_miss)?;
+    if literal.len() > 1 {
+        emit_literal_equality(assembler, X15, X8, literal.len(), first_candidate_miss)?;
+    }
+    assembler.mov_reg(X13, X5)?;
+    assembler.add_reg(X14, X5, X12)?;
+    assembler.branch(found)?;
+
+    assembler.bind(first_candidate_miss)?;
+    assembler.add_imm(X5, X5, 1)?;
+    emit_vector_candidate_skip_v8(
+        assembler,
+        literal,
+        primary_offset,
+        secondary_offset,
+        verification_offset,
+        quaternary_offset,
+        quinary_offset,
+        BackendVersion::SEARCH_V10,
         none,
         found,
     )
@@ -2854,6 +2937,7 @@ fn emit_vector_candidate_skip_v8(
     secondary_offset: Option<u16>,
     verification_offset: Option<u16>,
     quaternary_offset: Option<u16>,
+    quinary_offset: Option<u16>,
     backend_version: BackendVersion,
     none: Label,
     found: Label,
@@ -2885,10 +2969,14 @@ fn emit_vector_candidate_skip_v8(
     let fourth_filter = quaternary_offset
         .map(|_| assembler.new_label(LabelKind::SlowPath))
         .transpose()?;
+    let fifth_filter = quinary_offset
+        .map(|_| assembler.new_label(LabelKind::SlowPath))
+        .transpose()?;
     let filters_cover_zero = primary_offset == 0
         || secondary_offset == Some(0)
         || verification_offset == Some(0)
-        || quaternary_offset == Some(0);
+        || quaternary_offset == Some(0)
+        || quinary_offset == Some(0);
     let sve_confirmation =
         backend_version == BackendVersion::SEARCH_SVE16_V6 && literal.len() >= 16;
 
@@ -2905,6 +2993,10 @@ fn emit_vector_candidate_skip_v8(
     if let Some(offset) = quaternary_offset {
         assembler.load_byte(X11, X8, offset)?;
         assembler.dup_byte16(7, X11)?;
+    }
+    if let Some(offset) = quinary_offset {
+        assembler.load_byte(X11, X8, offset)?;
+        assembler.dup_byte16(23, X11)?;
     }
     if sve_confirmation {
         // Establish the fixed predicate and immutable literal once per call.
@@ -3076,7 +3168,7 @@ fn emit_vector_candidate_skip_v8(
         if let Some(third_filter) = third_filter {
             emit_branch_if_mask_has_multiple(assembler, X0, X10, third_filter)?;
         }
-        assembler.branch(recover)?;
+        assembler.branch(fifth_filter.unwrap_or(recover))?;
     }
 
     if let Some(third_filter) = third_filter {
@@ -3096,7 +3188,7 @@ fn emit_vector_candidate_skip_v8(
         if let Some(fourth_filter) = fourth_filter {
             emit_branch_if_mask_has_multiple(assembler, X0, X10, fourth_filter)?;
         }
-        assembler.branch(recover)?;
+        assembler.branch(fifth_filter.unwrap_or(recover))?;
     }
 
     if let Some(fourth_filter) = fourth_filter {
@@ -3111,6 +3203,23 @@ fn emit_vector_candidate_skip_v8(
         assembler.load_vector128(6, X10, 0)?;
         assembler.compare_equal_bytes16(6, 6, 7)?;
         assembler.and_bytes16(0, 0, 6)?;
+        emit_sparse_lane_mask_v7(assembler)?;
+        assembler.compare_branch_zero(X0, true, fifth_filter.unwrap_or(recover))?;
+        assembler.branch(advance)?;
+    }
+
+    if let Some(fifth_filter) = fifth_filter {
+        let offset = quinary_offset.expect("fifth-filter label requires an offset");
+        let delta = offset.abs_diff(primary_offset);
+        assembler.bind(fifth_filter)?;
+        if offset > primary_offset {
+            assembler.add_imm(X10, X15, delta)?;
+        } else {
+            assembler.sub_imm(X10, X15, delta)?;
+        }
+        assembler.load_vector128(22, X10, 0)?;
+        assembler.compare_equal_bytes16(22, 22, 23)?;
+        assembler.and_bytes16(0, 0, 22)?;
         emit_sparse_lane_mask_v7(assembler)?;
         assembler.compare_branch_zero(X0, true, recover)?;
         assembler.branch(advance)?;
