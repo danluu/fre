@@ -52,6 +52,12 @@ impl BackendVersion {
     ///
     /// Tag 23 remains candidate-only until independent broad qualification.
     pub const SEARCH_V10: Self = Self(23);
+    /// V9 first-candidate path plus a five-column ASIMD filter set that
+    /// reserves both literal endpoints before filling remaining columns by
+    /// frequency rank.
+    ///
+    /// Tag 24 is a distinct candidate; Search V10/tag 23 remains frozen.
+    pub const SEARCH_V11: Self = Self(24);
     /// Compatibility name for the original search backend.
     pub const SEARCH_LEGACY: Self = Self::SEARCH_V1;
     /// Current search backend and AOT wire contract.
@@ -321,7 +327,8 @@ pub(crate) struct SearchManifest {
     ///
     /// This field is serialized only by
     /// [`BackendVersion::SEARCH_SVE2_FIXED16_V2`] and
-    /// [`BackendVersion::SEARCH_V10`]; every older search tag retains its
+    /// [`BackendVersion::SEARCH_V10`] and
+    /// [`BackendVersion::SEARCH_V11`]; every older search tag retains its
     /// byte-for-byte AOT layout.
     pub(crate) quinary_offset: u16,
 }
@@ -656,9 +663,9 @@ impl fmt::Display for ArtifactIdentity {
 pub(crate) fn aot_size(image: &NativeImage) -> Result<usize, EmitError> {
     // Search v3 and later add an independently authenticated, source-bound
     // semantic envelope. V5 and later include the sealed verification offset;
-    // V7, V8, V9, V10, and the original fixed-lane SVE backends also include
-    // the sealed fourth ranked offset. Search tags 21 and 23 add a fifth
-    // ranked/terminal offset.
+    // V7, V8, V9, V10, V11, and the original fixed-lane SVE backends also
+    // include the sealed fourth ranked offset. Search tags 21, 23, and 24 add
+    // a fifth ranked/reserved offset.
     // Aggregate serialization retains its separate four-byte extension and
     // does not inherit the search wire contract.
     let manifest_bytes = if image.aggregate.is_some() {
@@ -666,7 +673,9 @@ pub(crate) fn aot_size(image: &NativeImage) -> Result<usize, EmitError> {
     } else if image.search.is_some() {
         if matches!(
             image.backend_version,
-            BackendVersion::SEARCH_SVE2_FIXED16_V2 | BackendVersion::SEARCH_V10
+            BackendVersion::SEARCH_SVE2_FIXED16_V2
+                | BackendVersion::SEARCH_V10
+                | BackendVersion::SEARCH_V11
         ) {
             56
         } else if matches!(
@@ -743,6 +752,7 @@ fn aot_magic(image: &NativeImage) -> Result<&'static [u8; 8], EmitError> {
         BackendVersion::SEARCH_SVE2_FIXED16_V2 => Ok(b"FREA64\0\x15"),
         BackendVersion::SEARCH_V9 => Ok(b"FREA64\0\x16"),
         BackendVersion::SEARCH_V10 => Ok(b"FREA64\0\x17"),
+        BackendVersion::SEARCH_V11 => Ok(b"FREA64\0\x18"),
         _ => Err(EmitError::InternalInvariant),
     }
 }
@@ -776,6 +786,7 @@ fn encode_aot_manifest(image: &NativeImage, write: &mut impl FnMut(&[u8])) {
                 | BackendVersion::SEARCH_V8
                 | BackendVersion::SEARCH_V9
                 | BackendVersion::SEARCH_V10
+                | BackendVersion::SEARCH_V11
                 | BackendVersion::SEARCH_SVE16_V1
                 | BackendVersion::SEARCH_SVE2_16_V1
                 | BackendVersion::SEARCH_SVE16_V6
@@ -789,6 +800,7 @@ fn encode_aot_manifest(image: &NativeImage, write: &mut impl FnMut(&[u8])) {
                 | BackendVersion::SEARCH_V8
                 | BackendVersion::SEARCH_V9
                 | BackendVersion::SEARCH_V10
+                | BackendVersion::SEARCH_V11
                 | BackendVersion::SEARCH_SVE16_V1
                 | BackendVersion::SEARCH_SVE2_16_V1
                 | BackendVersion::SEARCH_SVE16_V6
@@ -798,7 +810,9 @@ fn encode_aot_manifest(image: &NativeImage, write: &mut impl FnMut(&[u8])) {
         }
         if matches!(
             image.backend_version,
-            BackendVersion::SEARCH_SVE2_FIXED16_V2 | BackendVersion::SEARCH_V10
+            BackendVersion::SEARCH_SVE2_FIXED16_V2
+                | BackendVersion::SEARCH_V10
+                | BackendVersion::SEARCH_V11
         ) {
             write(&manifest.quinary_offset.to_le_bytes());
         }

@@ -305,6 +305,7 @@ fn validate_search_backend_version(image: &NativeImage) -> Result<BackendVersion
         | BackendVersion::SEARCH_V8
         | BackendVersion::SEARCH_V9
         | BackendVersion::SEARCH_V10
+        | BackendVersion::SEARCH_V11
         | BackendVersion::SEARCH_SVE16_V1
         | BackendVersion::SEARCH_SVE2_16_V1
         | BackendVersion::SEARCH_SVE16_V6
@@ -339,6 +340,7 @@ fn authenticate_search_envelope<'image>(
             | BackendVersion::SEARCH_V8
             | BackendVersion::SEARCH_V9
             | BackendVersion::SEARCH_V10
+            | BackendVersion::SEARCH_V11
             | BackendVersion::SEARCH_SVE16_V1
             | BackendVersion::SEARCH_SVE2_16_V1
             | BackendVersion::SEARCH_SVE16_V6
@@ -575,7 +577,7 @@ fn authenticate_search_manifest<'image>(
             }
             if matches!(
                 manifest.backend_version,
-                BackendVersion::SEARCH_V9 | BackendVersion::SEARCH_V10
+                BackendVersion::SEARCH_V9 | BackendVersion::SEARCH_V10 | BackendVersion::SEARCH_V11
             ) && (manifest.anchors != AnchorFlags::default() || literal_len == 0)
             {
                 return Err(AuditError::InvalidSearchManifest);
@@ -620,6 +622,7 @@ fn authenticate_class_suffix_manifest(
             | BackendVersion::SEARCH_SVE2_FIXED16_V2
             | BackendVersion::SEARCH_V9
             | BackendVersion::SEARCH_V10
+            | BackendVersion::SEARCH_V11
     ) {
         return Err(AuditError::InvalidSearchManifest);
     }
@@ -706,6 +709,7 @@ const SEARCH_CANDIDATE_POLICY_SVE2_16_V1: u16 = 6;
 const SEARCH_CANDIDATE_POLICY_SVE2_FIXED16_V2: u16 = 8;
 const SEARCH_CANDIDATE_POLICY_V5: u16 = 9;
 const SEARCH_CANDIDATE_POLICY_V6: u16 = 10;
+const SEARCH_CANDIDATE_POLICY_V7: u16 = 11;
 const SEARCH_CANDIDATE_BLOCK_WIDTH: u16 = 16;
 const SEARCH_CANDIDATE_OFFSET_NONE: u16 = u16::MAX;
 const SVE2_CLASS_TABLE_DATA_ID: u32 = 2;
@@ -749,7 +753,11 @@ fn authenticate_search_candidate_policy(
                 )
             } else {
                 let (primary, secondary) = independent_exact_candidate_pair(literal);
-                let (verification, quaternary, quinary) = if matches!(
+                let (verification, quaternary, quinary) = if manifest.backend_version
+                    == BackendVersion::SEARCH_V11
+                {
+                    independent_ranked_verification_offsets_v3(literal, primary, secondary)
+                } else if matches!(
                     manifest.backend_version,
                     BackendVersion::SEARCH_SVE2_FIXED16_V2 | BackendVersion::SEARCH_V10
                 ) {
@@ -829,6 +837,10 @@ fn authenticate_search_candidate_policy(
                     && manifest.shape == SearchShape::ExactLiteral
                 {
                     SEARCH_CANDIDATE_POLICY_V6
+                } else if manifest.backend_version == BackendVersion::SEARCH_V11
+                    && manifest.shape == SearchShape::ExactLiteral
+                {
+                    SEARCH_CANDIDATE_POLICY_V7
                 } else if manifest.backend_version == BackendVersion::SEARCH_V9
                     && manifest.shape == SearchShape::ExactLiteral
                 {
@@ -1107,6 +1119,66 @@ fn independent_ranked_verification_offsets_v2(
             selected[2].map(|(_, offset)| offset)
         },
     )
+}
+
+fn independent_ranked_verification_offsets_v3(
+    literal: &[u8],
+    primary_offset: u16,
+    secondary_offset: Option<u16>,
+) -> (Option<u16>, Option<u16>, Option<u16>) {
+    // Independently reconstruct tag 24's fixed five-column schema. Missing
+    // endpoints are appended in head/terminal order after the number of
+    // frequency-ranked columns that remain available.
+    let head = (!literal.is_empty()).then_some(0_u16);
+    let terminal = literal
+        .len()
+        .checked_sub(1)
+        .and_then(|offset| u16::try_from(offset).ok());
+    let reserve_head =
+        head.is_some_and(|offset| offset != primary_offset && Some(offset) != secondary_offset);
+    let reserve_terminal = terminal.is_some_and(|offset| {
+        Some(offset) != head && offset != primary_offset && Some(offset) != secondary_offset
+    });
+    let ranked_limit = 3 - usize::from(reserve_head) - usize::from(reserve_terminal);
+    let mut ranked = [None; 3];
+    for candidate in literal
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(offset, byte)| {
+            let offset = u16::try_from(offset).ok()?;
+            (offset != primary_offset
+                && Some(offset) != secondary_offset
+                && (!reserve_head || Some(offset) != head)
+                && (!reserve_terminal || Some(offset) != terminal))
+                .then_some((INDEPENDENT_BYTE_FREQUENCY_RANK[usize::from(byte)], offset))
+        })
+    {
+        if ranked[0].is_none_or(|current| candidate < current) {
+            ranked[2] = ranked[1];
+            ranked[1] = ranked[0];
+            ranked[0] = Some(candidate);
+        } else if ranked[1].is_none_or(|current| candidate < current) {
+            ranked[2] = ranked[1];
+            ranked[1] = Some(candidate);
+        } else if ranked[2].is_none_or(|current| candidate < current) {
+            ranked[2] = Some(candidate);
+        }
+    }
+
+    let mut offsets = [None; 3];
+    for index in 0..ranked_limit {
+        offsets[index] = ranked[index].map(|(_, offset)| offset);
+    }
+    let mut next = ranked_limit;
+    if reserve_head {
+        offsets[next] = head;
+        next += 1;
+    }
+    if reserve_terminal {
+        offsets[next] = terminal;
+    }
+    (offsets[0], offsets[1], offsets[2])
 }
 
 // Frozen copy of memchr 2.8.3's default packed-pair frequency policy. The
@@ -4672,6 +4744,7 @@ fn first_forbidden_search_vector_register(
                 BackendVersion::SEARCH_V8
                 | BackendVersion::SEARCH_V9
                 | BackendVersion::SEARCH_V10
+                | BackendVersion::SEARCH_V11
                 | BackendVersion::SEARCH_SVE16_V6
                 | BackendVersion::SEARCH_SVE2_FIXED16_V2 => register >= 16,
                 _ => false,

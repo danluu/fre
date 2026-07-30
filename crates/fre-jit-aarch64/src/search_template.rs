@@ -801,7 +801,7 @@ fn emit_exact(
         BackendVersion::SEARCH_V9 => {
             emit_exact_candidates_v9(template, manifest, literal, none, found)
         }
-        BackendVersion::SEARCH_V10 => {
+        BackendVersion::SEARCH_V10 | BackendVersion::SEARCH_V11 => {
             emit_exact_candidates_v10(template, manifest, literal, none, found)
         }
         BackendVersion::SEARCH_SVE2_FIXED16_V2 => {

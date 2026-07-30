@@ -4548,6 +4548,7 @@ fn explicit_search_backend_policy_selects_distinct_artifact_identities() {
         (SearchBackendPolicy::AsimdV8, BackendVersion::SEARCH_V8),
         (SearchBackendPolicy::AsimdV9, BackendVersion::SEARCH_V9),
         (SearchBackendPolicy::AsimdV10, BackendVersion::SEARCH_V10),
+        (SearchBackendPolicy::AsimdV11, BackendVersion::SEARCH_V11),
         (SearchBackendPolicy::Sve16, BackendVersion::SEARCH_SVE16_V1),
         (
             SearchBackendPolicy::Sve2Fixed16,
@@ -6182,8 +6183,255 @@ fn v10_terminal_filter_is_distinct_audited_and_matches_the_oracle() {
 }
 
 #[test]
-fn v9_and_v10_reject_shapes_without_one_nonempty_unanchored_exact_candidate() {
-    for backend in [SearchBackendPolicy::AsimdV9, SearchBackendPolicy::AsimdV10] {
+#[allow(
+    clippy::too_many_lines,
+    reason = "the V11 contract keeps endpoint reservations, frozen wire identity, independent audit, relabel resistance, and every-offset semantics together"
+)]
+fn v11_dual_endpoint_filter_is_distinct_audited_and_matches_every_offset() {
+    let mut comparisons = 0_u64;
+    for width in 1_usize..=MAX_REPEATED_CONFIRM_BYTES {
+        let literal: Vec<u8> = (0..width)
+            .map(|offset| {
+                u8::try_from(offset)
+                    .expect("bounded width")
+                    .wrapping_mul(61)
+                    .wrapping_add(7)
+            })
+            .collect();
+        let program = build_exact_literal::<Span>(
+            &literal,
+            AnchorFlags::default(),
+            ValidateLimits::default(),
+        )
+        .expect("V11 Span IR");
+        let image = emit_with_backend(
+            &program,
+            SearchBackendPolicy::AsimdV11,
+            EmitLimits::default(),
+        )
+        .expect("V11 exact image");
+        assert_eq!(image.backend_version(), BackendVersion::SEARCH_V11);
+        let manifest = image.search_manifest().expect("V11 manifest");
+        assert_eq!(manifest.candidate_policy_version, 11);
+        let terminal = u16::try_from(width - 1).expect("bounded terminal offset");
+        let selected_offsets = [
+            manifest.primary_offset,
+            manifest.secondary_offset,
+            manifest.verification_offset,
+            manifest.quaternary_offset,
+            manifest.quinary_offset,
+        ];
+        assert!(
+            selected_offsets.contains(&0),
+            "V11 must select the literal head at width {width}"
+        );
+        assert!(
+            selected_offsets.contains(&terminal),
+            "V11 must select the literal terminal at width {width}"
+        );
+        for left in 0..selected_offsets.len() {
+            if selected_offsets[left] == u16::MAX {
+                continue;
+            }
+            assert!(usize::from(selected_offsets[left]) < width);
+            for right in left + 1..selected_offsets.len() {
+                assert_ne!(selected_offsets[left], selected_offsets[right]);
+            }
+        }
+        let report = audit(&image).expect("independent V11 whole-template audit");
+        assert_eq!(
+            (report.decode_passes, report.source_identity_rebuilds),
+            (1, 1)
+        );
+        let aot = image.to_aot(AotLimits::default()).expect("bounded V11 AOT");
+        assert_eq!(&aot.as_bytes()[..8], b"FREA64\0\x18");
+        assert_eq!(aot.identity(), image.artifact_identity());
+
+        for extra_image in [
+            {
+                let extra = build_exact_literal::<Exists>(
+                    &literal,
+                    AnchorFlags::default(),
+                    ValidateLimits::default(),
+                )
+                .expect("V11 Exists IR");
+                emit_with_backend(&extra, SearchBackendPolicy::AsimdV11, EmitLimits::default())
+                    .expect("V11 Exists image")
+            },
+            {
+                let extra = build_exact_literal::<SelectedEnd>(
+                    &literal,
+                    AnchorFlags::default(),
+                    ValidateLimits::default(),
+                )
+                .expect("V11 SelectedEnd IR");
+                emit_with_backend(&extra, SearchBackendPolicy::AsimdV11, EmitLimits::default())
+                    .expect("V11 SelectedEnd image")
+            },
+        ] {
+            assert_eq!(extra_image.backend_version(), BackendVersion::SEARCH_V11);
+            assert_eq!(
+                extra_image
+                    .search_manifest()
+                    .expect("V11 output manifest")
+                    .candidate_policy_version,
+                11
+            );
+            audit(&extra_image).expect("independent V11 output-template audit");
+            assert_eq!(
+                &extra_image
+                    .to_aot(AotLimits::default())
+                    .expect("bounded V11 output AOT")
+                    .as_bytes()[..8],
+                b"FREA64\0\x18"
+            );
+        }
+
+        let decoded = decode(image.code()).expect("V11 decode");
+        let has_fifth_filter = decoded.iter().any(|instruction| {
+            matches!(
+                instruction,
+                DecodedInstruction::CompareEqualBytes16 {
+                    destination: 22,
+                    left: 22,
+                    right: 23,
+                }
+            )
+        });
+        assert_eq!(
+            has_fifth_filter,
+            manifest.quinary_offset != u16::MAX,
+            "the fifth code column and authenticated offset must be present together"
+        );
+
+        let mut dense_matches = Vec::new();
+        for _ in 0..8 {
+            dense_matches.extend_from_slice(&literal);
+        }
+        let mut haystacks = vec![Vec::new(), literal.clone(), vec![0xa5; 257], dense_matches];
+        for candidate_start in [0_usize, 15, 16, 31] {
+            let mut haystack = vec![0xe3; candidate_start + width + 67];
+            haystack[candidate_start..candidate_start + width].copy_from_slice(&literal);
+            haystacks.push(haystack);
+        }
+        for mutation_offset in 0..width {
+            let mut near_miss = literal.clone();
+            near_miss[mutation_offset] ^= 0x80;
+            let mut stream = Vec::new();
+            for _ in 0..8 {
+                stream.extend_from_slice(&near_miss);
+            }
+            stream.extend_from_slice(&literal);
+            haystacks.push(stream);
+        }
+        for haystack in &haystacks {
+            for (start, end) in [
+                (0, haystack.len()),
+                (haystack.len().min(1), haystack.len()),
+                (0, haystack.len().saturating_sub(1)),
+            ] {
+                let window = SearchWindow::new(start, end);
+                let expected = program
+                    .execute(haystack, window, ExecutionLimits::unlimited())
+                    .expect("V11 oracle execution")
+                    .output()
+                    .map(|span| (span.start(), span.end()));
+                let actual =
+                    simulate(&image, haystack, start, end).expect("V11 safe ISA simulation");
+                assert_eq!(
+                    span_output(actual),
+                    expected,
+                    "width={width} haystack_len={} window={start}..{end}",
+                    haystack.len()
+                );
+                comparisons = comparisons.checked_add(1).expect("bounded matrix");
+            }
+        }
+    }
+    assert_eq!(comparisons, 2_352);
+
+    let literal = b"0123456789abcdef";
+    let program =
+        build_exact_literal::<Span>(literal, AnchorFlags::default(), ValidateLimits::default())
+            .expect("V10/V11 identity program");
+    let canonical_v10 = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV10,
+        EmitLimits::default(),
+    )
+    .expect("canonical V10");
+    let canonical_v11 = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV11,
+        EmitLimits::default(),
+    )
+    .expect("canonical V11");
+    assert_ne!(canonical_v11.code(), canonical_v10.code());
+    assert_ne!(
+        canonical_v11.artifact_identity(),
+        canonical_v10.artifact_identity()
+    );
+    let v10_offsets = {
+        let manifest = canonical_v10.search_manifest().expect("V10 manifest");
+        (
+            manifest.primary_offset,
+            manifest.secondary_offset,
+            manifest.verification_offset,
+            manifest.quaternary_offset,
+            manifest.quinary_offset,
+        )
+    };
+    let v11_offsets = {
+        let manifest = canonical_v11.search_manifest().expect("V11 manifest");
+        (
+            manifest.primary_offset,
+            manifest.secondary_offset,
+            manifest.verification_offset,
+            manifest.quaternary_offset,
+            manifest.quinary_offset,
+        )
+    };
+
+    let mut v11_as_v10 = canonical_v11;
+    v11_as_v10.backend_version = BackendVersion::SEARCH_V10;
+    {
+        let manifest = v11_as_v10.search.as_mut().expect("V11 manifest");
+        manifest.backend_version = BackendVersion::SEARCH_V10;
+        manifest.candidate_policy_version = 10;
+        (
+            manifest.primary_offset,
+            manifest.secondary_offset,
+            manifest.verification_offset,
+            manifest.quaternary_offset,
+            manifest.quinary_offset,
+        ) = v10_offsets;
+    }
+    assert_resealed_search_rejected(v11_as_v10, "V11 code resealed as V10");
+
+    let mut v10_as_v11 = canonical_v10;
+    v10_as_v11.backend_version = BackendVersion::SEARCH_V11;
+    {
+        let manifest = v10_as_v11.search.as_mut().expect("V10 manifest");
+        manifest.backend_version = BackendVersion::SEARCH_V11;
+        manifest.candidate_policy_version = 11;
+        (
+            manifest.primary_offset,
+            manifest.secondary_offset,
+            manifest.verification_offset,
+            manifest.quaternary_offset,
+            manifest.quinary_offset,
+        ) = v11_offsets;
+    }
+    assert_resealed_search_rejected(v10_as_v11, "V10 code resealed as V11");
+}
+
+#[test]
+fn v9_v10_and_v11_reject_shapes_without_one_nonempty_unanchored_exact_candidate() {
+    for backend in [
+        SearchBackendPolicy::AsimdV9,
+        SearchBackendPolicy::AsimdV10,
+        SearchBackendPolicy::AsimdV11,
+    ] {
         for anchors in [
             AnchorFlags {
                 start: true,

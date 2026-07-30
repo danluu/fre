@@ -48,6 +48,7 @@ const SEARCH_CANDIDATE_POLICY_SVE2_16_V1: u16 = 6;
 const SEARCH_CANDIDATE_POLICY_SVE2_FIXED16_V2: u16 = 8;
 const SEARCH_CANDIDATE_POLICY_V5: u16 = 9;
 const SEARCH_CANDIDATE_POLICY_V6: u16 = 10;
+const SEARCH_CANDIDATE_POLICY_V7: u16 = 11;
 const SEARCH_CANDIDATE_BLOCK_WIDTH: u16 = 16;
 const SEARCH_CANDIDATE_OFFSET_NONE: u16 = u16::MAX;
 const SVE2_CLASS_TABLE_DATA_ID: u32 = 2;
@@ -78,6 +79,9 @@ pub enum SearchBackendPolicy {
     AsimdV9,
     /// Search V10 candidate: V9 plus a terminal-aware fifth ASIMD filter.
     AsimdV10,
+    /// Search V11 candidate: V9 plus five ASIMD columns that reserve both
+    /// literal endpoints before frequency-ranked columns.
+    AsimdV11,
     /// SVE screening with exactly sixteen active byte lanes.
     Sve16,
     /// SVE2 `MATCH` screening with exactly sixteen active byte lanes,
@@ -101,6 +105,7 @@ impl SearchBackendPolicy {
             Self::AsimdV8 => BackendVersion::SEARCH_V8,
             Self::AsimdV9 => BackendVersion::SEARCH_V9,
             Self::AsimdV10 => BackendVersion::SEARCH_V10,
+            Self::AsimdV11 => BackendVersion::SEARCH_V11,
             Self::Sve16 => BackendVersion::SEARCH_SVE16_V1,
             Self::Sve2Fixed16 => BackendVersion::SEARCH_SVE2_16_V1,
             Self::Sve16V6 => BackendVersion::SEARCH_SVE16_V6,
@@ -312,6 +317,7 @@ fn emit_search_image<O: Operation>(
             | BackendVersion::SEARCH_V8
             | BackendVersion::SEARCH_V9
             | BackendVersion::SEARCH_V10
+            | BackendVersion::SEARCH_V11
             | BackendVersion::SEARCH_SVE16_V1
             | BackendVersion::SEARCH_SVE2_16_V1
             | BackendVersion::SEARCH_SVE16_V6
@@ -372,7 +378,7 @@ fn emit_search_image<O: Operation>(
     }
     if matches!(
         backend_version,
-        BackendVersion::SEARCH_V9 | BackendVersion::SEARCH_V10
+        BackendVersion::SEARCH_V9 | BackendVersion::SEARCH_V10 | BackendVersion::SEARCH_V11
     ) && !plan.is_v9_policy_shape()
     {
         return Err(EmitError::Unsupported {
@@ -498,6 +504,7 @@ fn emit_search_image<O: Operation>(
                 | BackendVersion::SEARCH_V8
                 | BackendVersion::SEARCH_V9
                 | BackendVersion::SEARCH_V10
+                | BackendVersion::SEARCH_V11
                 | BackendVersion::SEARCH_SVE16_V1
                 | BackendVersion::SEARCH_SVE2_16_V1
                 | BackendVersion::SEARCH_SVE16_V6
@@ -1339,6 +1346,7 @@ mod v7_policy_scan_admission {
     use super::{
         ArithmeticSite, CandidateOffsets, EmitError, WorkMeter, candidate_byte_pair,
         candidate_ranked_verification_offsets, candidate_ranked_verification_offsets_v2,
+        candidate_ranked_verification_offsets_v3,
     };
 
     /// Move-only proof that both complete V7 policy scans were admitted.
@@ -1380,6 +1388,19 @@ mod v7_policy_scan_admission {
             let (primary, secondary) = candidate_byte_pair(self.literal);
             let (verification, quaternary, quinary) =
                 candidate_ranked_verification_offsets_v2(self.literal, primary, secondary);
+            CandidateOffsets {
+                primary,
+                secondary,
+                verification,
+                quaternary,
+                quinary,
+            }
+        }
+
+        pub(super) fn select_offsets_v3(self) -> CandidateOffsets {
+            let (primary, secondary) = candidate_byte_pair(self.literal);
+            let (verification, quaternary, quinary) =
+                candidate_ranked_verification_offsets_v3(self.literal, primary, secondary);
             CandidateOffsets {
                 primary,
                 secondary,
@@ -1541,6 +1562,7 @@ impl<'a> Plan<'a> {
                     BackendVersion::SEARCH_V8
                         | BackendVersion::SEARCH_V9
                         | BackendVersion::SEARCH_V10
+                        | BackendVersion::SEARCH_V11
                         | BackendVersion::SEARCH_SVE16_V6
                         | BackendVersion::SEARCH_SVE2_FIXED16_V2
                 ) =>
@@ -1590,6 +1612,7 @@ impl<'a> Plan<'a> {
                 | BackendVersion::SEARCH_V8
                 | BackendVersion::SEARCH_V9
                 | BackendVersion::SEARCH_V10
+                | BackendVersion::SEARCH_V11
                 | BackendVersion::SEARCH_SVE16_V1
                 | BackendVersion::SEARCH_SVE2_16_V1
                 | BackendVersion::SEARCH_SVE16_V6
@@ -1632,22 +1655,23 @@ impl<'a> Plan<'a> {
                         | BackendVersion::SEARCH_V8
                         | BackendVersion::SEARCH_V9
                         | BackendVersion::SEARCH_V10
+                        | BackendVersion::SEARCH_V11
                         | BackendVersion::SEARCH_SVE16_V1
                         | BackendVersion::SEARCH_SVE2_16_V1
                         | BackendVersion::SEARCH_SVE16_V6
                         | BackendVersion::SEARCH_SVE2_FIXED16_V2
                 ) {
                     let admission = v7_policy_scan_admission.ok_or(EmitError::InternalInvariant)?;
-                    Some(
-                        if matches!(
-                            backend_version,
-                            BackendVersion::SEARCH_SVE2_FIXED16_V2 | BackendVersion::SEARCH_V10
-                        ) {
-                            admission.select_offsets_v2()
-                        } else {
-                            admission.select_offsets()
-                        },
-                    )
+                    Some(if backend_version == BackendVersion::SEARCH_V11 {
+                        admission.select_offsets_v3()
+                    } else if matches!(
+                        backend_version,
+                        BackendVersion::SEARCH_SVE2_FIXED16_V2 | BackendVersion::SEARCH_V10
+                    ) {
+                        admission.select_offsets_v2()
+                    } else {
+                        admission.select_offsets()
+                    })
                 } else {
                     if v7_policy_scan_admission.is_some() {
                         return Err(EmitError::InternalInvariant);
@@ -1733,6 +1757,10 @@ impl<'a> Plan<'a> {
                         && shape == SearchShape::ExactLiteral
                     {
                         SEARCH_CANDIDATE_POLICY_V6
+                    } else if backend_version == BackendVersion::SEARCH_V11
+                        && shape == SearchShape::ExactLiteral
+                    {
+                        SEARCH_CANDIDATE_POLICY_V7
                     } else if backend_version == BackendVersion::SEARCH_V9
                         && shape == SearchShape::ExactLiteral
                     {
@@ -1986,6 +2014,19 @@ fn emit_exact(
             )?;
         }
         BackendVersion::SEARCH_V10 => {
+            emit_vector_candidate_skip_v10(
+                assembler,
+                literal,
+                primary_offset,
+                secondary_offset,
+                verification_offset,
+                quaternary_offset,
+                quinary_offset,
+                none,
+                found,
+            )?;
+        }
+        BackendVersion::SEARCH_V11 => {
             emit_vector_candidate_skip_v10(
                 assembler,
                 literal,
@@ -3901,6 +3942,75 @@ fn candidate_ranked_verification_offsets_v2(
     )
 }
 
+fn candidate_ranked_verification_offsets_v3(
+    literal: &[u8],
+    primary_offset: u16,
+    secondary_offset: Option<u16>,
+) -> (Option<u16>, Option<u16>, Option<u16>) {
+    // Keep the five-column schema frozen: the packed pair owns the first two
+    // columns. Any endpoint absent from that pair is reserved in the remaining
+    // three columns, with byte zero before the terminal byte, and all earlier
+    // columns retain the frozen frequency rank. Thus no favorable ranked
+    // selection can omit either endpoint.
+    let head_offset = (!literal.is_empty()).then_some(0_u16);
+    let terminal_offset = literal
+        .len()
+        .checked_sub(1)
+        .and_then(|offset| u16::try_from(offset).ok());
+    let force_head = head_offset
+        .is_some_and(|offset| offset != primary_offset && Some(offset) != secondary_offset);
+    let force_terminal = terminal_offset.is_some_and(|offset| {
+        Some(offset) != head_offset && offset != primary_offset && Some(offset) != secondary_offset
+    });
+    let reserved = usize::from(force_head) + usize::from(force_terminal);
+    let ranked_slots = 3_usize
+        .checked_sub(reserved)
+        .expect("at most two distinct endpoints");
+    let mut ranked = [None; 3];
+    for (offset, &byte) in literal.iter().enumerate() {
+        let offset = u16::try_from(offset).expect("bounded repeated-confirmation offset fits u16");
+        if offset == primary_offset
+            || Some(offset) == secondary_offset
+            || (force_head && Some(offset) == head_offset)
+            || (force_terminal && Some(offset) == terminal_offset)
+        {
+            continue;
+        }
+        let key = (V7_BYTE_FREQUENCY_RANK[usize::from(byte)], offset);
+        if ranked[0].is_none_or(|current| {
+            let current_byte = literal[usize::from(current)];
+            key < (V7_BYTE_FREQUENCY_RANK[usize::from(current_byte)], current)
+        }) {
+            ranked[2] = ranked[1];
+            ranked[1] = ranked[0];
+            ranked[0] = Some(offset);
+        } else if ranked[1].is_none_or(|current| {
+            let current_byte = literal[usize::from(current)];
+            key < (V7_BYTE_FREQUENCY_RANK[usize::from(current_byte)], current)
+        }) {
+            ranked[2] = ranked[1];
+            ranked[1] = Some(offset);
+        } else if ranked[2].is_none_or(|current| {
+            let current_byte = literal[usize::from(current)];
+            key < (V7_BYTE_FREQUENCY_RANK[usize::from(current_byte)], current)
+        }) {
+            ranked[2] = Some(offset);
+        }
+    }
+
+    let mut selected = [None; 3];
+    selected[..ranked_slots].copy_from_slice(&ranked[..ranked_slots]);
+    let mut next = ranked_slots;
+    if force_head {
+        selected[next] = head_offset;
+        next += 1;
+    }
+    if force_terminal {
+        selected[next] = terminal_offset;
+    }
+    (selected[0], selected[1], selected[2])
+}
+
 // Frozen memchr 2.8.3 packed-pair frequency order. V7 uses the same ranking
 // after excluding the already-selected primary and secondary columns.
 const V7_BYTE_FREQUENCY_RANK: [u8; 256] = [
@@ -5704,7 +5814,8 @@ mod encoding_tests {
     use super::{
         BranchKind, EmitError, MAX_REPEATED_CONFIRM_BYTES, RelocationKind, candidate_byte_pair,
         candidate_ranked_verification_offsets, candidate_ranked_verification_offsets_v2,
-        candidate_verification_offset, resolve_word, signed_range,
+        candidate_ranked_verification_offsets_v3, candidate_verification_offset, resolve_word,
+        signed_range,
     };
 
     #[test]
@@ -5730,6 +5841,10 @@ mod encoding_tests {
             candidate_ranked_verification_offsets_v2(b"0123456789abcdef", 7, Some(6)),
             (Some(8), Some(5), Some(15))
         );
+        assert_eq!(
+            candidate_ranked_verification_offsets_v3(b"0123456789abcdef", 7, Some(6)),
+            (Some(8), Some(0), Some(15))
+        );
         let mut terminal_pair = [b'e'; 16];
         terminal_pair[15] = 0x1f;
         terminal_pair[4] = 0x1e;
@@ -5737,6 +5852,14 @@ mod encoding_tests {
         assert_eq!(
             candidate_ranked_verification_offsets_v2(&terminal_pair, 15, Some(4)),
             (Some(0), Some(1), Some(2))
+        );
+        assert_eq!(
+            candidate_ranked_verification_offsets_v3(&terminal_pair, 15, Some(4)),
+            (Some(1), Some(2), Some(0))
+        );
+        assert_eq!(
+            candidate_ranked_verification_offsets_v3(&[b'e'; 16], 0, Some(1)),
+            (Some(2), Some(3), Some(15))
         );
         let mut subtract = [b'e'; 16];
         subtract[8] = 0x1f;
