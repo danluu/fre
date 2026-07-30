@@ -233,6 +233,47 @@ pub struct PlanStats {
     validation_work: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BoundaryContextClassifier {
+    assertions: u32,
+}
+
+impl BoundaryContextClassifier {
+    const ABSOLUTE: u32 = (1 << 0) | (1 << 1);
+    const CONFIGURED_LINE: u32 = (1 << 2) | (1 << 3);
+    const CRLF_LINE: u32 = (1 << 4) | (1 << 5);
+    const ASCII_WORD: u32 = (1 << 6) | (1 << 7) | (1 << 8) | (1 << 9) | (1 << 10) | (1 << 11);
+    const UNICODE_WORD: u32 = (1 << 12) | (1 << 13) | (1 << 14) | (1 << 15) | (1 << 16) | (1 << 17);
+
+    pub(crate) const fn new(assertions: u32) -> Self {
+        Self { assertions }
+    }
+
+    pub(crate) const fn assertions(self) -> u32 {
+        self.assertions
+    }
+
+    pub(crate) const fn absolute(self) -> u32 {
+        self.assertions & Self::ABSOLUTE
+    }
+
+    pub(crate) const fn configured_line(self) -> u32 {
+        self.assertions & Self::CONFIGURED_LINE
+    }
+
+    pub(crate) const fn crlf_line(self) -> u32 {
+        self.assertions & Self::CRLF_LINE
+    }
+
+    pub(crate) const fn ascii_word(self) -> u32 {
+        self.assertions & Self::ASCII_WORD
+    }
+
+    pub(crate) const fn unicode_word(self) -> u32 {
+        self.assertions & Self::UNICODE_WORD
+    }
+}
+
 impl PlanStats {
     #[must_use]
     pub const fn states(self) -> usize {
@@ -635,6 +676,10 @@ impl Automaton {
 
     pub(crate) const fn identity(&self) -> u64 {
         self.identity
+    }
+
+    pub(crate) const fn boundary_context_classifier(&self) -> BoundaryContextClassifier {
+        BoundaryContextClassifier::new(self.stats.assertion_kinds)
     }
 
     /// Compute the fixed K0 workspace shape without allocating it.

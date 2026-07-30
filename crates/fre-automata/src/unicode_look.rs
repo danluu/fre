@@ -36,6 +36,68 @@ impl std::error::Error for UnicodeLookError {}
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct UnicodeLookMatcher;
 
+/// The validity and Unicode-word status of the scalars adjacent to one byte
+/// boundary.
+///
+/// K0's contextual executor uses this once per boundary to answer every
+/// Unicode word-look variant used by the compiled automaton. Keeping validity
+/// separate from word membership preserves the fail-closed semantics of
+/// negated and half assertions on malformed UTF-8.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct UnicodeWordBoundary {
+    left: UnicodeWordSide,
+    right: UnicodeWordSide,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UnicodeWordSide {
+    Invalid,
+    NonWord,
+    Word,
+}
+
+impl UnicodeWordSide {
+    const fn valid(self) -> bool {
+        !matches!(self, Self::Invalid)
+    }
+
+    const fn word(self) -> bool {
+        matches!(self, Self::Word)
+    }
+}
+
+impl UnicodeWordBoundary {
+    pub(crate) const fn class(self) -> usize {
+        match (self.left, self.right) {
+            (UnicodeWordSide::Invalid, UnicodeWordSide::Invalid) => 0,
+            (UnicodeWordSide::NonWord, UnicodeWordSide::Invalid) => 1,
+            (UnicodeWordSide::Word, UnicodeWordSide::Invalid) => 2,
+            (UnicodeWordSide::Invalid, UnicodeWordSide::NonWord) => 3,
+            (UnicodeWordSide::NonWord, UnicodeWordSide::NonWord) => 4,
+            (UnicodeWordSide::Word, UnicodeWordSide::NonWord) => 5,
+            (UnicodeWordSide::Invalid, UnicodeWordSide::Word) => 6,
+            (UnicodeWordSide::NonWord, UnicodeWordSide::Word) => 7,
+            (UnicodeWordSide::Word, UnicodeWordSide::Word) => 8,
+        }
+    }
+
+    fn matches(self, look: Look) -> bool {
+        let left_valid = self.left.valid();
+        let right_valid = self.right.valid();
+        let left_word = self.left.word();
+        let right_word = self.right.word();
+        match look {
+            Look::WordUnicode => left_word != right_word,
+            Look::WordUnicodeNegate => left_valid && right_valid && left_word == right_word,
+            Look::WordStartUnicode => !left_word && right_word,
+            Look::WordEndUnicode => left_word && !right_word,
+            Look::WordStartHalfUnicode => left_valid && !left_word,
+            Look::WordEndHalfUnicode => right_valid && !right_word,
+            _ => unreachable!("matches rejects non-Unicode looks"),
+        }
+    }
+}
+
 impl UnicodeLookMatcher {
     #[must_use]
     pub const fn new() -> Self {
@@ -58,23 +120,28 @@ impl UnicodeLookMatcher {
     pub(crate) fn matches_prevalidated(look: Look, haystack: &[u8], at: usize) -> bool {
         debug_assert!(at <= haystack.len());
         debug_assert!(is_supported(look));
+        Self::classify_prevalidated(haystack, at).matches(look)
+    }
+
+    pub(crate) fn classify_prevalidated(haystack: &[u8], at: usize) -> UnicodeWordBoundary {
+        debug_assert!(at <= haystack.len());
         let before = &haystack[..at];
         let after = &haystack[at..];
         let left_scalar = decode_last_utf8(before);
         let right_scalar = decode_utf8(after);
-        let left_valid = before.is_empty() || left_scalar.is_some();
-        let right_valid = after.is_empty() || right_scalar.is_some();
-        let left_word = left_scalar.is_some_and(is_unicode_word_character);
-        let right_word = right_scalar.is_some_and(is_unicode_word_character);
-        match look {
-            Look::WordUnicode => left_word != right_word,
-            Look::WordUnicodeNegate => left_valid && right_valid && left_word == right_word,
-            Look::WordStartUnicode => !left_word && right_word,
-            Look::WordEndUnicode => left_word && !right_word,
-            Look::WordStartHalfUnicode => left_valid && !left_word,
-            Look::WordEndHalfUnicode => right_valid && !right_word,
-            _ => unreachable!("matches rejects non-Unicode looks"),
+        UnicodeWordBoundary {
+            left: classify_unicode_word_side(left_scalar, before.is_empty()),
+            right: classify_unicode_word_side(right_scalar, after.is_empty()),
         }
+    }
+}
+
+fn classify_unicode_word_side(scalar: Option<char>, empty: bool) -> UnicodeWordSide {
+    match scalar {
+        Some(character) if is_unicode_word_character(character) => UnicodeWordSide::Word,
+        Some(_) => UnicodeWordSide::NonWord,
+        None if empty => UnicodeWordSide::NonWord,
+        None => UnicodeWordSide::Invalid,
     }
 }
 

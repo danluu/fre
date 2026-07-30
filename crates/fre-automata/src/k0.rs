@@ -7,13 +7,13 @@ use memchr::{memchr, memchr2, memchr3};
 
 use crate::{
     plan::{
-        ByteSet, StartAsciiClassifier, StartFilterProof, StartFilterProofCell,
-        StartFilterPublication, StartPositionClass, StartPositionScanner, StartScanner,
-        BYTE_START_ASCII_CLASSIFIER_SELECTION_WORK, BYTE_START_BITMAP_POPULATION_WORK,
-        BYTE_START_MEMBER_EXTRACTION_WORK, BYTE_START_SET_SCANNER_SELECTION_WORK,
-        BYTE_START_SMALL_MAX_MEMBERS, START_FILTER_GUARD_MAX_CARDINALITY,
-        START_FILTER_GUARD_SELECTION_WORK, START_FILTER_POSITION_COUNT,
-        START_FILTER_SCANNER_SELECTION_WORK,
+        BoundaryContextClassifier, ByteSet, StartAsciiClassifier, StartFilterProof,
+        StartFilterProofCell, StartFilterPublication, StartPositionClass, StartPositionScanner,
+        StartScanner, BYTE_START_ASCII_CLASSIFIER_SELECTION_WORK,
+        BYTE_START_BITMAP_POPULATION_WORK, BYTE_START_MEMBER_EXTRACTION_WORK,
+        BYTE_START_SET_SCANNER_SELECTION_WORK, BYTE_START_SMALL_MAX_MEMBERS,
+        START_FILTER_GUARD_MAX_CARDINALITY, START_FILTER_GUARD_SELECTION_WORK,
+        START_FILTER_POSITION_COUNT, START_FILTER_SCANNER_SELECTION_WORK,
     },
     Automaton, EdgeKind, MatchSpan, OutputContract, ResourceKind, SearchAccounting, SearchError,
     SearchLimits, SearchWindow, SetupAccounting, StateRole, UnicodeLookMatcher,
@@ -38,6 +38,7 @@ const LAZY_CELL_RESTART: u32 = 1 << 30;
 const LAZY_CELL_STATE_MASK: u32 = LAZY_CELL_RESTART - 1;
 const LAZY_CELL_UNFILLED: u32 = u32::MAX;
 const LAZY_NO_STATE: u32 = u32::MAX;
+#[cfg(test)]
 const ASSERTION_KIND_COUNT: usize = 18;
 const CONTEXT_SYMBOL_BYTE_BITS: u32 = 9;
 const CONTEXT_INITIAL_BYTE: u32 = 256;
@@ -48,6 +49,7 @@ const CONTEXT_TRANSITION_MAX_BUCKETS: usize =
 const CONTEXT_EMPTY_SOURCE: u32 = u32::MAX;
 const CONTEXT_INITIAL_SOURCE: u32 = u32::MAX - 1;
 
+#[cfg(test)]
 const ASSERTION_KINDS: [EdgeKind; ASSERTION_KIND_COUNT] = [
     EdgeKind::AssertHaystackStart,
     EdgeKind::AssertHaystackEnd,
@@ -67,6 +69,27 @@ const ASSERTION_KINDS: [EdgeKind; ASSERTION_KIND_COUNT] = [
     EdgeKind::AssertWordEndUnicode,
     EdgeKind::AssertWordStartHalfUnicode,
     EdgeKind::AssertWordEndHalfUnicode,
+];
+
+const ABSOLUTE_ENABLED_BY_CLASS: [u32; 4] = [0, 1 << 0, 1 << 1, (1 << 0) | (1 << 1)];
+const CONFIGURED_LINE_ENABLED_BY_CLASS: [u32; 4] = [0, 1 << 2, 1 << 3, (1 << 2) | (1 << 3)];
+const CRLF_LINE_ENABLED_BY_CLASS: [u32; 4] = [0, 1 << 4, 1 << 5, (1 << 4) | (1 << 5)];
+const ASCII_WORD_ENABLED_BY_CLASS: [u32; 4] = [
+    (1 << 7) | (1 << 10) | (1 << 11),
+    (1 << 6) | (1 << 9) | (1 << 11),
+    (1 << 6) | (1 << 8) | (1 << 10),
+    1 << 7,
+];
+const UNICODE_WORD_ENABLED_BY_CLASS: [u32; 9] = [
+    0,
+    1 << 16,
+    (1 << 12) | (1 << 15),
+    1 << 17,
+    (1 << 13) | (1 << 16) | (1 << 17),
+    (1 << 12) | (1 << 15) | (1 << 17),
+    (1 << 12) | (1 << 14),
+    (1 << 12) | (1 << 14) | (1 << 16),
+    1 << 13,
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5863,19 +5886,93 @@ fn enabled_assertion_mask(
     position: usize,
     meter: &mut WorkMeter,
 ) -> Result<u32, SearchError> {
-    let mut used = automaton.stats().assertion_kinds();
-    let mut enabled = 0_u32;
-    while used != 0 {
-        let ordinal = usize::try_from(used.trailing_zeros()).expect("assertion ordinal fits usize");
-        let kind = ASSERTION_KINDS[ordinal];
-        let bit = 1_u32 << used.trailing_zeros();
-        meter.charge(1, position)?;
-        if zero_width_edge_enabled(automaton, kind, haystack, position)? {
-            enabled |= bit;
+    enabled_assertion_mask_with_classifier(
+        automaton.boundary_context_classifier(),
+        automaton.line_terminator(),
+        haystack,
+        position,
+        meter,
+    )
+}
+
+fn enabled_assertion_mask_with_classifier(
+    classifier: BoundaryContextClassifier,
+    line_terminator: u8,
+    haystack: &[u8],
+    position: usize,
+    meter: &mut WorkMeter,
+) -> Result<u32, SearchError> {
+    debug_assert!(position <= haystack.len());
+    let checks = u64::from(classifier.assertions().count_ones());
+    if checks <= meter.remaining() {
+        meter.charge_admitted(checks);
+    } else {
+        // Preserve the canonical evaluator's one-unit failure report and the
+        // exact amount consumed before a finite limit rejects this boundary.
+        for _ in 0..checks {
+            meter.charge(1, position)?;
         }
-        used &= used.wrapping_sub(1);
+    }
+
+    let mut enabled = 0_u32;
+    let absolute = classifier.absolute();
+    if absolute != 0 {
+        let class = binary_boundary_class(position == 0, position == haystack.len());
+        enabled |= ABSOLUTE_ENABLED_BY_CLASS[class] & absolute;
+    }
+
+    let configured_line = classifier.configured_line();
+    let crlf_line = classifier.crlf_line();
+    let ascii_word = classifier.ascii_word();
+    let byte_context_used = configured_line | crlf_line | ascii_word != 0;
+    let (before, after) = if byte_context_used {
+        (
+            position
+                .checked_sub(1)
+                .and_then(|index| haystack.get(index))
+                .copied(),
+            haystack.get(position).copied(),
+        )
+    } else {
+        (None, None)
+    };
+
+    if configured_line != 0 {
+        let class = binary_boundary_class(
+            position == 0 || before == Some(line_terminator),
+            position == haystack.len() || after == Some(line_terminator),
+        );
+        enabled |= CONFIGURED_LINE_ENABLED_BY_CLASS[class] & configured_line;
+    }
+    if crlf_line != 0 {
+        let class = binary_boundary_class(
+            position == 0 || before == Some(b'\n') || before == Some(b'\r') && after != Some(b'\n'),
+            position == haystack.len()
+                || after == Some(b'\r')
+                || after == Some(b'\n') && before != Some(b'\r'),
+        );
+        enabled |= CRLF_LINE_ENABLED_BY_CLASS[class] & crlf_line;
+    }
+    if ascii_word != 0 {
+        let class = binary_boundary_class(
+            before.is_some_and(is_ascii_word),
+            after.is_some_and(is_ascii_word),
+        );
+        enabled |= ASCII_WORD_ENABLED_BY_CLASS[class] & ascii_word;
+    }
+
+    let unicode_word = classifier.unicode_word();
+    if unicode_word != 0 {
+        let class = UnicodeLookMatcher::classify_prevalidated(haystack, position).class();
+        enabled |= UNICODE_WORD_ENABLED_BY_CLASS[class] & unicode_word;
     }
     Ok(enabled)
+}
+
+const fn binary_boundary_class(left: bool, right: bool) -> usize {
+    let left = if left { 1 } else { 0 };
+    let right = if right { 1 } else { 0 };
+    left | (right << 1)
 }
 
 fn assertion_enabled(kind: EdgeKind, enabled: u32) -> Result<bool, SearchError> {
@@ -6758,6 +6855,23 @@ mod tests {
                 ],
                 byte_starts: vec![0, 0, b'a', b':'],
                 byte_ends: vec![0, 0, b'a', b':'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn every_assertion() -> Automaton {
+        let edges = u32::try_from(super::ASSERTION_KINDS.len()).unwrap();
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![StateRole::Split, StateRole::Accept],
+                edge_offsets: vec![0, edges, edges],
+                edge_targets: vec![1; super::ASSERTION_KINDS.len()],
+                edge_kinds: super::ASSERTION_KINDS.to_vec(),
+                byte_starts: vec![0; super::ASSERTION_KINDS.len()],
+                byte_ends: vec![0; super::ASSERTION_KINDS.len()],
             },
             CompileLimits::default(),
         )
@@ -11190,6 +11304,98 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn compiled_context_classifier_matches_every_canonical_assertion_together() {
+        fn check(plan: &Automaton, haystack: &[u8], position: usize) {
+            let expected = super::ASSERTION_KINDS
+                .into_iter()
+                .filter(|&kind| {
+                    super::zero_width_edge_enabled(plan, kind, haystack, position).unwrap()
+                })
+                .fold(0_u32, |mask, kind| mask | kind.assertion_bit().unwrap());
+            let mut meter = WorkMeter::new(u64::MAX, 0);
+            let got = super::enabled_assertion_mask(plan, haystack, position, &mut meter).unwrap();
+            assert_eq!(
+                got,
+                expected,
+                "source={haystack:?} position={position} terminator={}",
+                plan.line_terminator()
+            );
+            assert_eq!(
+                meter.consumed,
+                u64::try_from(super::ASSERTION_KIND_COUNT).unwrap()
+            );
+        }
+
+        for line_terminator in u8::MIN..=u8::MAX {
+            let plan = every_assertion().with_line_terminator(line_terminator);
+            let haystacks = [
+                vec![],
+                vec![line_terminator],
+                vec![b'\r', line_terminator, b'\n'],
+                vec![line_terminator, b'\r', b'\n', line_terminator],
+            ];
+            for haystack in haystacks {
+                for position in 0..=haystack.len() {
+                    check(&plan, &haystack, position);
+                }
+            }
+        }
+
+        let plan = every_assertion().with_line_terminator(b';');
+        check(&plan, &[], 0);
+        for byte in u8::MIN..=u8::MAX {
+            check(&plan, &[byte], 0);
+            check(&plan, &[byte], 1);
+        }
+        for left in u8::MIN..=u8::MAX {
+            for right in u8::MIN..=u8::MAX {
+                check(&plan, &[left, right], 1);
+            }
+        }
+
+        let mut haystacks = bounded_words(&[0, b'\r', b'\n', b';', b'a', b'_', 0x80], 3);
+        haystacks.extend([
+            "é".as_bytes().to_vec(),
+            "α_".as_bytes().to_vec(),
+            " aβ\u{200C}!".as_bytes().to_vec(),
+            vec![0xf0, 0x9f, 0x92, 0xa9],
+            vec![0xf0, 0x28, 0x8c, 0xbc],
+            vec![0xc3],
+            vec![0x80, b'a'],
+            vec![b'a', 0xed, 0xa0, 0x80, b'_'],
+            vec![0xf4, 0x90, 0x80, 0x80],
+        ]);
+        for haystack in haystacks {
+            for position in 0..=haystack.len() {
+                check(&plan, &haystack, position);
+            }
+        }
+    }
+
+    #[test]
+    fn compiled_context_classifier_preserves_finite_work_failure_timing() {
+        let plan = every_assertion();
+        let haystack = b"a_b";
+        let checks = u64::try_from(super::ASSERTION_KIND_COUNT).unwrap();
+        for limit in 0..checks {
+            let mut meter = WorkMeter::new(limit, 0);
+            assert_eq!(
+                super::enabled_assertion_mask(&plan, haystack, 1, &mut meter),
+                Err(SearchError::WorkLimitExceeded {
+                    limit,
+                    consumed: limit,
+                    requested: 1,
+                    position: 1,
+                })
+            );
+            assert_eq!(meter.consumed, limit);
+        }
+        let mut meter = WorkMeter::new(checks, 0);
+        super::enabled_assertion_mask(&plan, haystack, 1, &mut meter).unwrap();
+        assert_eq!(meter.consumed, checks);
     }
 
     #[test]
