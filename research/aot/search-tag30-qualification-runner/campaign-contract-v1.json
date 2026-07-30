@@ -1,0 +1,132 @@
+{
+  "schema": "fre.aot.search-tag30-qualification-campaign-contract.v1",
+  "result_blind": true,
+  "rebar_inputs": [],
+  "result_derived_selection": false,
+  "result_derived_exclusions": false,
+  "backend": {
+    "tag": 30,
+    "name": "AsimdV17",
+    "version": "SEARCH_V17",
+    "candidate_policy": 15,
+    "aot_magic_hex": "465245413634001e",
+    "llvm": false
+  },
+  "hosts": [
+    {
+      "id": "local-apple-aarch64-asimd",
+      "target_os": "macos",
+      "target_arch": "aarch64",
+      "asimd": true
+    },
+    {
+      "id": "zstd-eval-c9g-neoverse-v3-aarch64-asimd",
+      "target_os": "linux",
+      "target_arch": "aarch64",
+      "asimd": true
+    }
+  ],
+  "sharding": {
+    "workers": 16,
+    "ordinal_interval": "zero-based-half-open",
+    "assignment": "one immutable fragment per exact interval",
+    "all_six_timing_pairs_remain_in_one_row-worker process on one logical CPU",
+    "correctness_ranges": [
+      [0, 7714],
+      [7714, 15428],
+      [15428, 23142],
+      [23142, 30856],
+      [30856, 38570],
+      [38570, 46284],
+      [46284, 53998],
+      [53998, 61712],
+      [61712, 69426],
+      [69426, 77140],
+      [77140, 84854],
+      [84854, 92568],
+      [92568, 100282],
+      [100282, 107996],
+      [107996, 115710],
+      [115710, 123424]
+    ],
+    "universal_timing_ranges": [
+      [0, 193],
+      [193, 386],
+      [386, 579],
+      [579, 772],
+      [772, 965],
+      [965, 1158],
+      [1158, 1350],
+      [1350, 1542],
+      [1542, 1734],
+      [1734, 1926],
+      [1926, 2118],
+      [2118, 2310],
+      [2310, 2502],
+      [2502, 2694],
+      [2694, 2886],
+      [2886, 3078]
+    ],
+    "long_policy_timing_ranges": [
+      [0, 92],
+      [92, 184],
+      [184, 275],
+      [275, 366],
+      [366, 457],
+      [457, 548],
+      [548, 639],
+      [639, 730],
+      [730, 821],
+      [821, 912],
+      [912, 1003],
+      [1003, 1094],
+      [1094, 1185],
+      [1185, 1276],
+      [1276, 1367],
+      [1367, 1458]
+    ]
+  },
+  "projections": {
+    "universal": {
+      "schema": "fre.aot.search-tag30-learned-continuation-projection.v1",
+      "digest_domain_hex": "4652452d5345415243482d54414732392d544f504f4c4f47592d50524f4a454354494f4e0001",
+      "full_rows": 123424,
+      "full_sha256": "0326944c2c95dfd10740d2ea0a72c910dd1a03df8c16e3a2180391d069841480",
+      "timed_rows": 3078,
+      "timed_sha256": "a92a59554188a82b6e7c49833dda599aa7d87014ae6815ba9fbe0f5502b31a4c",
+      "correctness_static_rows": 49248,
+      "correctness_portable_rows": 74176,
+      "timing_role": "complete immutable mechanism experiment; direct V17 candidate measurements are non-production-policy evidence"
+    },
+    "long-policy": {
+      "schema": "fre.aot.search-tag30-long-input-policy-projection.v1",
+      "digest_domain_hex": "4652452d5345415243482d54414733302d4c4f4e472d494e5055542d504f4c4943592d50524f4a454354494f4e0001",
+      "full_rows": 123424,
+      "full_sha256": "c912b402244ff9814fe6160f9f5a117d7b253af5ff35ee69a78a6250aae94561",
+      "timed_rows": 1458,
+      "timed_sha256": "b3093f9fed70fd500852742d18994fce80d4a144cb9b9cbaac4ad0e7f84ccffd",
+      "correctness_static_rows": 23328,
+      "correctness_portable_rows": 100096,
+      "production_input_floor_bytes": 65536,
+      "timing_role": "complete production-policy authority input"
+    }
+  },
+  "long_policy_gates": {
+    "correctness": "every full-projection row on each host before any timing result is consumed",
+    "timing_repetitions": 6,
+    "minimum_elapsed_ns_each_variant": 400000000,
+    "cell_ratio": "median of the six exact candidate_elapsed_ns/portable_elapsed_ns rational ratios; for six values median=(sorted[2]+sorted[3])/2",
+    "aggregate_candidate_over_portable_exclusive_maximum": 0.8,
+    "each_width_geomean_exclusive_maximum": 0.8,
+    "each_topology_geomean_exclusive_maximum": 0.8,
+    "each_window_geomean_exclusive_maximum": 0.8,
+    "each_outcome_geomean_exclusive_maximum": 0.8,
+    "each_learned_source_kind_geomean_exclusive_maximum": 0.8,
+    "individual_cell_inclusive_maximum": 1.05,
+    "strict_pair_win": "one paired repetition whose candidate_elapsed_ns is strictly less than its portable_elapsed_ns",
+    "strict_pair_win_fraction_minimum": 0.8,
+    "strict_pair_win_fraction_scope": "all 1458 cells times six pairs, separately for each complete host projection",
+    "one_failure_rejects_whole_class": true,
+    "result_derived_exclusions": false
+  }
+}
