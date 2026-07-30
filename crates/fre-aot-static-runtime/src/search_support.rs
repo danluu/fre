@@ -1,9 +1,14 @@
-use crate::StaticSearchSpanVerifyErrorV1;
+use fre_aot_search_contract::ClaimedStaticSearchSpanExpectationV1;
+
+use crate::{StaticSearchSpanContractFieldV1, StaticSearchSpanVerifyErrorV1};
 
 pub(crate) const HARD_MAX_STATIC_SEARCH_SPAN_QUALIFICATION_ROWS_V1: usize = 256;
+pub(crate) const HARD_MAX_STATIC_SEARCH_SPAN_PRODUCTION_FAMILIES_V1: usize = 32;
 
 mod production_rows;
 use production_rows::PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SPAN_ROWS_V1;
+mod production_families;
+use production_families::PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SPAN_FAMILIES_V1;
 
 #[cfg(feature = "search-span-qualification-private-v1")]
 mod private_rows;
@@ -39,6 +44,154 @@ source_qualified_identity_v1!(SourceQualifiedObjectIdentityV1);
 source_qualified_identity_v1!(SourceQualifiedReceiptIdentityV1);
 source_qualified_identity_v1!(SourceQualifiedExpectationIdentityV1);
 source_qualified_identity_v1!(SourceQualifiedPayloadIdentityV1);
+
+/// Artifact-independent production authority for one compiler/backend family.
+///
+/// Unlike a legacy exact row, this tuple intentionally contains no literal,
+/// KIR, artifact, object, receipt, or payload identity. Those values remain
+/// mandatory and are authenticated from each linked image, then the runtime
+/// independently rebuilds the exact KIR and native payload from the mapped
+/// literal before a callable can exist.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SourceQualifiedStaticSearchSpanFamilyV1 {
+    selector: u16,
+    compiler_version: u16,
+    metadata_version: u16,
+    backend_version: u16,
+    call_abi_schema: u16,
+    exported_symbol_schema: u16,
+    output_kind: u8,
+    architecture: u8,
+    little_endian: bool,
+    pointer_width: u8,
+    target_abi: u8,
+    platform: u8,
+    status_bits: u8,
+    exported_symbol_n_type: u8,
+    required_features: u64,
+    minimum_literal_bytes: u32,
+    maximum_literal_bytes: u32,
+    manifest_identity: SourceQualifiedManifestIdentityV1,
+}
+
+impl SourceQualifiedStaticSearchSpanFamilyV1 {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the production family is the complete artifact-independent Search-v1 wire tuple"
+    )]
+    const fn production(
+        selector: u16,
+        compiler_version: u16,
+        metadata_version: u16,
+        backend_version: u16,
+        call_abi_schema: u16,
+        exported_symbol_schema: u16,
+        output_kind: u8,
+        architecture: u8,
+        little_endian: bool,
+        pointer_width: u8,
+        target_abi: u8,
+        platform: u8,
+        status_bits: u8,
+        exported_symbol_n_type: u8,
+        required_features: u64,
+        minimum_literal_bytes: u32,
+        maximum_literal_bytes: u32,
+        manifest_identity: [u8; 32],
+    ) -> Self {
+        Self {
+            selector,
+            compiler_version,
+            metadata_version,
+            backend_version,
+            call_abi_schema,
+            exported_symbol_schema,
+            output_kind,
+            architecture,
+            little_endian,
+            pointer_width,
+            target_abi,
+            platform,
+            status_bits,
+            exported_symbol_n_type,
+            required_features,
+            minimum_literal_bytes,
+            maximum_literal_bytes,
+            manifest_identity: SourceQualifiedManifestIdentityV1(manifest_identity),
+        }
+    }
+
+    #[cfg(test)]
+    const fn test_only(
+        selector: u16,
+        minimum_literal_bytes: u32,
+        maximum_literal_bytes: u32,
+    ) -> Self {
+        Self::production(
+            selector,
+            1,
+            1,
+            8,
+            1,
+            1,
+            3,
+            1,
+            true,
+            64,
+            1,
+            2,
+            64,
+            0x12,
+            1,
+            minimum_literal_bytes,
+            maximum_literal_bytes,
+            [0x5a; 32],
+        )
+    }
+
+    pub(crate) const fn selector(&self) -> u16 {
+        self.selector
+    }
+
+    pub(crate) const fn manifest_identity(&self) -> &[u8; 32] {
+        self.manifest_identity.as_bytes()
+    }
+
+    pub(crate) fn authenticates_claim(
+        &self,
+        claim: ClaimedStaticSearchSpanExpectationV1,
+    ) -> Result<(), StaticSearchSpanVerifyErrorV1> {
+        let header_matches = claim.compiler_version() == self.compiler_version
+            && claim.metadata_version() == self.metadata_version
+            && claim.backend_version() == self.backend_version
+            && claim.call_abi_schema() == self.call_abi_schema
+            && claim.exported_symbol_schema() == self.exported_symbol_schema
+            && claim.output_kind() == self.output_kind
+            && !claim.anchor_start()
+            && !claim.anchor_end()
+            && claim.architecture() == self.architecture
+            && claim.little_endian() == self.little_endian
+            && claim.pointer_width() == self.pointer_width
+            && claim.target_abi() == self.target_abi
+            && claim.platform() == self.platform
+            && claim.status_bits() == self.status_bits
+            && claim.exported_symbol_n_type() == self.exported_symbol_n_type
+            && claim.required_features() == self.required_features
+            && (self.minimum_literal_bytes..=self.maximum_literal_bytes)
+                .contains(&claim.live_literal_bytes());
+        if !header_matches {
+            return Err(StaticSearchSpanVerifyErrorV1::ContractMismatch {
+                field: StaticSearchSpanContractFieldV1::ProductionFamily,
+            });
+        }
+        if claim.manifest_identity() != self.manifest_identity() {
+            return Err(StaticSearchSpanVerifyErrorV1::ContractMismatch {
+                field: StaticSearchSpanContractFieldV1::ManifestIdentity,
+            });
+        }
+        Ok(())
+    }
+}
 
 /// One exact, source-reviewed final-image Search-v1 Span decision.
 ///
@@ -230,6 +383,59 @@ const fn qualification_rows_are_canonical(rows: &[SourceQualifiedStaticSearchSpa
     true
 }
 
+const fn production_families_are_canonical(
+    rows: &[SourceQualifiedStaticSearchSpanFamilyV1],
+) -> bool {
+    if rows.len() > HARD_MAX_STATIC_SEARCH_SPAN_PRODUCTION_FAMILIES_V1 {
+        return false;
+    }
+    let mut index = 0_usize;
+    while index < rows.len() {
+        let row = &rows[index];
+        if row.minimum_literal_bytes == 0
+            || row.minimum_literal_bytes > row.maximum_literal_bytes
+            || identity_is_zero(&row.manifest_identity.0)
+        {
+            return false;
+        }
+        if index > 0 && rows[index - 1].selector >= row.selector {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+const fn identity_is_zero(identity: &[u8; 32]) -> bool {
+    let mut index = 0_usize;
+    while index < identity.len() {
+        if identity[index] != 0 {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+pub(crate) fn require_production_search_span_family_v1(
+    selector: u32,
+) -> Result<&'static SourceQualifiedStaticSearchSpanFamilyV1, StaticSearchSpanVerifyErrorV1> {
+    if PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SPAN_FAMILIES_V1.is_empty() {
+        return Err(StaticSearchSpanVerifyErrorV1::NoQualifiedStaticSearchSpanRowV1);
+    }
+    if !production_families_are_canonical(
+        PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SPAN_FAMILIES_V1,
+    ) {
+        return Err(StaticSearchSpanVerifyErrorV1::MalformedStaticSearchSpanQualificationTableV1);
+    }
+    let selector = u16::try_from(selector)
+        .map_err(|_| StaticSearchSpanVerifyErrorV1::UnqualifiedStaticSearchSpanSelectorV1)?;
+    PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SPAN_FAMILIES_V1
+        .iter()
+        .find(|family| family.selector == selector)
+        .ok_or(StaticSearchSpanVerifyErrorV1::UnqualifiedStaticSearchSpanSelectorV1)
+}
+
 pub(crate) fn require_production_search_span_row_v1(
     selector: u32,
 ) -> Result<&'static SourceQualifiedStaticSearchSpanRowV1, StaticSearchSpanVerifyErrorV1> {
@@ -342,6 +548,34 @@ mod tests {
             require_production_search_span_row_v1(u32::from(u16::MAX) + 1),
             Err(expected)
         );
+    }
+
+    #[test]
+    fn production_family_state_is_canonical_bounded_and_fails_closed() {
+        assert!(production_families_are_canonical(
+            PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SPAN_FAMILIES_V1
+        ));
+        assert!(
+            PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SPAN_FAMILIES_V1.len()
+                <= HARD_MAX_STATIC_SEARCH_SPAN_PRODUCTION_FAMILIES_V1
+        );
+        if PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SPAN_FAMILIES_V1.is_empty() {
+            assert_eq!(
+                require_production_search_span_family_v1(0),
+                Err(StaticSearchSpanVerifyErrorV1::NoQualifiedStaticSearchSpanRowV1)
+            );
+        }
+        let valid = [
+            SourceQualifiedStaticSearchSpanFamilyV1::test_only(3, 2, 8),
+            SourceQualifiedStaticSearchSpanFamilyV1::test_only(9, 16, 32),
+        ];
+        assert!(production_families_are_canonical(&valid));
+        let reversed = [valid[1], valid[0]];
+        assert!(!production_families_are_canonical(&reversed));
+        let empty_width = [SourceQualifiedStaticSearchSpanFamilyV1::test_only(3, 0, 8)];
+        assert!(!production_families_are_canonical(&empty_width));
+        let inverted = [SourceQualifiedStaticSearchSpanFamilyV1::test_only(3, 9, 8)];
+        assert!(!production_families_are_canonical(&inverted));
     }
 
     #[cfg(feature = "search-span-qualification-private-v1")]

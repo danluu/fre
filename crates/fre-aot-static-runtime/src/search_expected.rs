@@ -4,8 +4,11 @@ use fre_aot_search_contract::{
 };
 
 use crate::{
-    StaticSearchSpanContractFieldV1, StaticSearchSpanVerifyErrorV1, error::require_search_span_v1,
-    search_support::SourceQualifiedStaticSearchSpanRowV1,
+    StaticSearchSpanContractFieldV1, StaticSearchSpanVerifyErrorV1,
+    error::require_search_span_v1,
+    search_support::{
+        SourceQualifiedStaticSearchSpanFamilyV1, SourceQualifiedStaticSearchSpanRowV1,
+    },
 };
 
 /// Private typed projection of a strictly inspected, source-qualified Search
@@ -19,6 +22,19 @@ pub(crate) struct ExpectedStaticSearchSpanV1 {
 }
 
 impl ExpectedStaticSearchSpanV1 {
+    pub(crate) fn from_source_qualified_family_bytes(
+        bytes: &[u8],
+        family: &SourceQualifiedStaticSearchSpanFamilyV1,
+    ) -> Result<Self, StaticSearchSpanVerifyErrorV1> {
+        let claim = inspect_static_search_span_expectation_v1(bytes)?;
+        family.authenticates_claim(claim)?;
+        // The neutral decoder already recomputed the expectation identity,
+        // metadata compile identity, and all duplicated metadata fields.
+        // The mapped-image boundary completes concrete semantic authority by
+        // independently regenerating the exact KIR and payload.
+        Ok(Self { claim })
+    }
+
     pub(crate) fn from_source_qualified_bytes(
         bytes: &[u8],
         row: &SourceQualifiedStaticSearchSpanRowV1,

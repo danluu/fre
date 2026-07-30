@@ -11,12 +11,15 @@ use std::{
 };
 
 use fre_aot_search_contract::{
-    ClaimedSearchMetadataV1, SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1, SEARCH_METADATA_BYTES_V1,
-    STATIC_SEARCH_SPAN_EXPECTATION_BYTES_V1, inspect_search_metadata_v1,
+    ClaimedSearchMetadataV1, SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1, SEARCH_BACKEND_VERSION_V1,
+    SEARCH_METADATA_BYTES_V1, STATIC_SEARCH_SPAN_EXPECTATION_BYTES_V1, inspect_search_metadata_v1,
 };
-use fre_kernel_ir::{MatchSpan, SearchWindow, Span};
+use fre_jit_aarch64::{EmitLimits, SearchBackendPolicy, TargetSpec, emit_audited_with_backend};
+use fre_kernel_ir::{
+    AnchorFlags, MatchSpan, SearchWindow, Span, ValidateLimits, build_exact_literal,
+};
 use fre_kernels::{LiteralAccounting, LiteralSearchLimits, Window, preflight_literal_window};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 
 use crate::{
     RawSearchCallV1, RawSearchResultV1, StaticSearchSpanAdoptionErrorV1,
@@ -26,7 +29,7 @@ use crate::{
     search_expected::ExpectedStaticSearchSpanV1,
     search_support::{
         self, HARD_MAX_STATIC_SEARCH_SPAN_QUALIFICATION_ROWS_V1,
-        SourceQualifiedStaticSearchSpanRowV1,
+        SourceQualifiedStaticSearchSpanFamilyV1, SourceQualifiedStaticSearchSpanRowV1,
     },
 };
 
@@ -179,6 +182,27 @@ impl LinkedStaticSearchSpanSymbolsV1 {
         Self {
             row_selector: row.selector(),
             claimed_compile_identity: *row.compile_identity(),
+            expectation_address,
+            entry_address,
+            payload_address,
+            metadata_address,
+        }
+    }
+
+    const fn from_source_qualified_family(
+        family: &SourceQualifiedStaticSearchSpanFamilyV1,
+        expectation_address: StaticSearchSpanLinkedAddressV1,
+        entry_address: StaticSearchSpanLinkedAddressV1,
+        payload_address: StaticSearchSpanLinkedAddressV1,
+        metadata_address: StaticSearchSpanLinkedAddressV1,
+    ) -> Self {
+        Self {
+            row_selector: family.selector(),
+            // A broad family cannot pin an artifact-specific compile identity
+            // before address inspection. The neutral expectation recomputes
+            // that identity and deterministic payload reconstruction binds the
+            // concrete mapped image instead.
+            claimed_compile_identity: [0; 32],
             expectation_address,
             entry_address,
             payload_address,
@@ -981,8 +1005,8 @@ pub unsafe extern "C" fn fre_aot_static_search_span_adopt_raw_v1(
     payload: *const u8,
     metadata: *const u8,
 ) -> u32 {
-    let row = match search_support::require_production_search_span_row_v1(row_selector) {
-        Ok(row) => row,
+    let family = match search_support::require_production_search_span_family_v1(row_selector) {
+        Ok(family) => family,
         Err(StaticSearchSpanVerifyErrorV1::NoQualifiedStaticSearchSpanRowV1) => {
             return STATIC_SEARCH_SPAN_ADOPT_STATUS_NO_QUALIFIED_ROW_V1;
         }
@@ -994,16 +1018,56 @@ pub unsafe extern "C" fn fre_aot_static_search_span_adopt_raw_v1(
     // SAFETY: the source-qualified production row was selected before any
     // pointer use and the caller owns the complete documented raw contract.
     unsafe {
-        adopt_selected_static_search_span_v1(
+        adopt_selected_static_search_span_family_v1(
             &PRODUCTION_STATIC_SEARCH_SPAN_REGISTRY_V1,
             output,
             expectation,
             entry,
             payload,
             metadata,
-            row,
+            family,
         )
     }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the selected family boundary owns final-image address retention and the one verified output write"
+)]
+unsafe fn adopt_selected_static_search_span_family_v1(
+    registry: &'static VerifiedSearchSpanRegistryV1,
+    output: *mut RawStaticSearchSpanAdoptionOutputV1,
+    expectation: *const u8,
+    entry: *const u8,
+    payload: *const u8,
+    metadata: *const u8,
+    family: &'static SourceQualifiedStaticSearchSpanFamilyV1,
+) -> u32 {
+    if output.is_null() {
+        return STATIC_SEARCH_SPAN_ADOPT_STATUS_REFUSED_V1;
+    }
+    let symbols = LinkedStaticSearchSpanSymbolsV1::from_source_qualified_family(
+        family,
+        StaticSearchSpanLinkedAddressV1::from_exposed_address(expectation.expose_provenance()),
+        StaticSearchSpanLinkedAddressV1::from_exposed_address(entry.expose_provenance()),
+        StaticSearchSpanLinkedAddressV1::from_exposed_address(payload.expose_provenance()),
+        StaticSearchSpanLinkedAddressV1::from_exposed_address(metadata.expose_provenance()),
+    );
+    // SAFETY: family resolution preceded every address operation and the raw
+    // boundary supplies process-lifetime final-image symbols.
+    let Ok(verified) =
+        (unsafe { adopt_source_qualified_static_search_span_family_v1(registry, symbols, family) })
+    else {
+        return STATIC_SEARCH_SPAN_ADOPT_STATUS_REFUSED_V1;
+    };
+    // SAFETY: output is a caller-owned writable slot touched only after the
+    // complete family, mapped-image, and semantic reconstruction audit.
+    unsafe {
+        output.write(RawStaticSearchSpanAdoptionOutputV1 {
+            verified: ptr::from_ref(verified).cast(),
+        });
+    }
+    STATIC_SEARCH_SPAN_ADOPT_STATUS_OK_V1
 }
 
 /// Separately named private qualification-only raw adoption boundary.
@@ -1130,6 +1194,36 @@ unsafe fn adopt_source_qualified_static_search_span_v1(
 }
 
 #[allow(
+    unsafe_code,
+    reason = "the platform verifier owns all raw final-image reads after source-family selection"
+)]
+unsafe fn adopt_source_qualified_static_search_span_family_v1(
+    registry: &'static VerifiedSearchSpanRegistryV1,
+    symbols: LinkedStaticSearchSpanSymbolsV1,
+    family: &SourceQualifiedStaticSearchSpanFamilyV1,
+) -> Result<&'static VerifiedStaticSearchSpanV1, StaticSearchSpanVerifyErrorV1> {
+    require_search_span_v1(
+        symbols.row_selector == family.selector(),
+        StaticSearchSpanContractFieldV1::ProductionFamily,
+    )?;
+    // SAFETY: the source-qualified raw boundary established all caller
+    // obligations before passing retained addresses to the platform verifier.
+    let copied = unsafe { implementation::copy_expectation(symbols.expectation_address)? };
+    let expected =
+        ExpectedStaticSearchSpanV1::from_source_qualified_family_bytes(&copied.bytes, family)?;
+    registry.adopt(&copied.bytes, symbols, || {
+        let (entry, accounting) =
+            implementation::verify(&expected, symbols, copied.vm_regions_checked)?;
+        Ok(VerifiedStaticSearchSpanV1 {
+            expected,
+            entry,
+            row_selector: family.selector(),
+            accounting,
+        })
+    })
+}
+
+#[allow(
     dead_code,
     reason = "mapped verification is feature and source-row gated while its strict source tests remain available"
 )]
@@ -1143,6 +1237,93 @@ pub(super) fn validate_mapped_search_span_metadata_v1(
         StaticSearchSpanContractFieldV1::Metadata,
     )?;
     Ok(actual)
+}
+
+/// Rebuild the exact semantic KIR and canonical native payload from mapped
+/// rodata before a source-family-qualified image becomes callable.
+///
+/// This is deliberately independent of compiler/object identities. It turns a
+/// broad source-reviewed compiler family into per-artifact proof: arbitrary
+/// self-consistent expectation bytes are insufficient unless their immutable
+/// code and literal bytes are exactly what the reviewed emitter regenerates.
+pub(super) fn require_semantic_payload_reconstruction_v1(
+    expected: &ExpectedStaticSearchSpanV1,
+    payload: &[u8],
+) -> Result<(), StaticSearchSpanVerifyErrorV1> {
+    const LITERAL_IDENTITY_DOMAIN_V1: &[u8] = b"FRE-AOT-LINUX-SEARCH-LITERAL\0\x01";
+
+    let metadata = expected.metadata();
+    let code_end = usize::try_from(metadata.code_bytes())
+        .map_err(|_| StaticSearchSpanVerifyErrorV1::SemanticPayloadReconstruction)?;
+    let rodata_start = usize::try_from(metadata.rodata_offset())
+        .map_err(|_| StaticSearchSpanVerifyErrorV1::SemanticPayloadReconstruction)?;
+    let rodata_bytes = usize::try_from(metadata.rodata_bytes())
+        .map_err(|_| StaticSearchSpanVerifyErrorV1::SemanticPayloadReconstruction)?;
+    let rodata_end = rodata_start
+        .checked_add(rodata_bytes)
+        .ok_or(StaticSearchSpanVerifyErrorV1::SemanticPayloadReconstruction)?;
+    let code = payload
+        .get(..code_end)
+        .ok_or(StaticSearchSpanVerifyErrorV1::SemanticPayloadReconstruction)?;
+    let padding = payload
+        .get(code_end..rodata_start)
+        .ok_or(StaticSearchSpanVerifyErrorV1::SemanticPayloadReconstruction)?;
+    let literal = payload
+        .get(rodata_start..rodata_end)
+        .ok_or(StaticSearchSpanVerifyErrorV1::SemanticPayloadReconstruction)?;
+    if rodata_end != payload.len() || padding.iter().any(|byte| *byte != 0) {
+        return Err(StaticSearchSpanVerifyErrorV1::SemanticPayloadReconstruction);
+    }
+
+    let mut literal_hasher = Sha256::new();
+    literal_hasher.update(LITERAL_IDENTITY_DOMAIN_V1);
+    literal_hasher.update(
+        u64::try_from(literal.len())
+            .map_err(|_| StaticSearchSpanVerifyErrorV1::SemanticPayloadReconstruction)?
+            .to_le_bytes(),
+    );
+    literal_hasher.update(literal);
+    let literal_identity: [u8; 32] = literal_hasher.finalize().into();
+    if &literal_identity != expected.literal_identity() {
+        return Err(StaticSearchSpanVerifyErrorV1::SemanticPayloadReconstruction);
+    }
+
+    let program =
+        build_exact_literal::<Span>(literal, AnchorFlags::default(), ValidateLimits::default())
+            .map_err(|_| StaticSearchSpanVerifyErrorV1::SemanticPayloadReconstruction)?;
+    if program.cache_identity().as_bytes() != expected.kir_identity() {
+        return Err(StaticSearchSpanVerifyErrorV1::SemanticPayloadReconstruction);
+    }
+    let policy = match metadata.backend_version() {
+        SEARCH_BACKEND_VERSION_V1 => SearchBackendPolicy::AsimdV8,
+        SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1 => SearchBackendPolicy::Sve2Fixed16V2,
+        _ => return Err(StaticSearchSpanVerifyErrorV1::SemanticPayloadReconstruction),
+    };
+    let rebuilt = emit_audited_with_backend(&program, policy, EmitLimits::default())
+        .map_err(|_| StaticSearchSpanVerifyErrorV1::SemanticPayloadReconstruction)?;
+    let image = rebuilt.as_image();
+    let target = TargetSpec {
+        architecture: metadata.architecture(),
+        little_endian: metadata.little_endian(),
+        pointer_width: metadata.pointer_width(),
+        abi: metadata.target_abi(),
+        features: image.target().features,
+    };
+    let layout = image.layout();
+    if image.backend_version().0 != metadata.backend_version()
+        || image.target() != target
+        || image.source_identity().as_bytes() != expected.kir_identity()
+        || image.artifact_identity().as_bytes() != expected.artifact_identity()
+        || image.code() != code
+        || image.rodata() != literal
+        || image.stats().code_bytes != metadata.code_bytes()
+        || image.stats().data_bytes != metadata.rodata_bytes()
+        || layout.rodata_from_code_start != metadata.rodata_offset()
+        || layout.total_mapped_bytes != metadata.payload_bytes()
+    {
+        return Err(StaticSearchSpanVerifyErrorV1::SemanticPayloadReconstruction);
+    }
+    Ok(())
 }
 
 #[allow(

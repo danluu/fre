@@ -18,7 +18,8 @@ use crate::{
     search_linked::{
         CopiedSearchSpanExpectationV1, LinkedStaticSearchSpanSymbolsV1, SearchSpanEntryV1,
         StaticSearchSpanInspectionAccountingV1, StaticSearchSpanLinkedAddressV1,
-        validate_mapped_search_span_metadata_v1, verified_search_span_call_v1,
+        require_semantic_payload_reconstruction_v1, validate_mapped_search_span_metadata_v1,
+        verified_search_span_call_v1,
     },
 };
 
@@ -157,6 +158,7 @@ pub(super) fn verify(
         )
     };
     require_payload_digest(payload, actual_metadata.payload_sha256())?;
+    require_semantic_payload_reconstruction_v1(expected, payload)?;
 
     let vm_regions_checked = expectation_regions
         .checked_add(metadata_regions)

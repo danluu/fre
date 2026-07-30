@@ -201,6 +201,7 @@ impl From<AggregateExecuteError> for CallError {
 #[non_exhaustive]
 pub enum StaticSearchSpanContractFieldV1 {
     SelectedRow,
+    ProductionFamily,
     SelectedCompileIdentity,
     ManifestIdentity,
     SemanticBindingIdentity,
@@ -279,6 +280,7 @@ pub enum StaticSearchSpanVerifyErrorV1 {
         required_alignment: usize,
     },
     MappedPayloadDigestMismatch,
+    SemanticPayloadReconstruction,
     AlreadyInitializedForDifferentExpectation,
     AlreadyInitializedForDifferentSymbols,
     StaticRegistryFull {

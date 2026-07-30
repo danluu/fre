@@ -24,6 +24,7 @@ fre-aot-aarch64 = { path = "../fre-aot-aarch64" }
 fre-aot-count-contract = { path = "../fre-aot-count-contract" }
 fre-aot-optimizer = { path = "../fre-aot-optimizer" }
 fre-aot-search-contract = { path = "../fre-aot-search-contract" }
+fre-jit-aarch64 = { path = "../fre-jit-aarch64" }
 fre-kernel-ir = { path = "../fre-kernel-ir" }
 fre-kernels = { path = "../fre-kernels" }
 fre-target-features = { path = "../fre-target-features" }

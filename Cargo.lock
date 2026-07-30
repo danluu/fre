@@ -235,6 +235,7 @@ dependencies = [
  "fre-aot-count-contract",
  "fre-aot-optimizer",
  "fre-aot-search-contract",
+ "fre-jit-aarch64",
  "fre-kernel-ir",
  "fre-kernels",
  "fre-target-features",
