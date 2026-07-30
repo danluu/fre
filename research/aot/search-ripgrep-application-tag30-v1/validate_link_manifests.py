@@ -35,19 +35,22 @@ IDENTITY_TEMPLATE = f"{DIRECTORY}/qualification-identity-template-v1.json"
 BINDING_TEMPLATE = f"{DIRECTORY}/campaign-binding-template-v1.json"
 CONTRACT = f"{DIRECTORY}/campaign-contract-v1.json"
 CONTRACT_SHA256 = (
-    "c52132527ffa184c0efceb66f4b1eb4a4b19b964c48d58d989520b8a1a906da5"
+    "121c44149d1b758fa5ac750aa524621669c92d23c4c095bab7f36bc767faa34b"
 )
 CAMPAIGN_PLAN_IDENTITY = (
-    "0ea6b3aefac2d31e67aae3acdef3b9f65d0b0fa91421a9ec5c3afe5517c9b2fd"
+    "f5a3319b1178ea97766b735bc39b589a6a1a33e8cc9257a947ea9feff7c5f702"
 )
 CAMPAIGN_ANALYZER_IDENTITY = (
-    "9ed68cd09ffc5ac4f012026f19cf1fb2b3a61da84a84ab0919bfd7a8df40621d"
+    "0a32b5a20c03077b856f51741216289aa8399f213261d07e5c8874bf2d3fe6ec"
 )
 CAMPAIGN_EVIDENCE_IDENTITY = (
-    "3477aa1a605fe591065d0fcab11fa07ec548409afed2b07fe66b02c5fe23c4c1"
+    "baf4c23db6318c6658b8eba72a3eff6b165d42a085cc8a1e656ad6650b477f00"
 )
 PRIVATE_FAMILY_AUTHORIZATION_IDENTITY = (
-    "e78b63696306afe20d65c09d38f9f874d21521aa2d8ddddce24beb25f9604fa1"
+    "aaa0527f255eb5912001b5ba9d9efab69c0be5848bdef595435b90aadbf284da"
+)
+PRIVATE_FAMILY_SOURCE_SHA256 = (
+    "aeb4f4daa91a162172948c13e1ac9eeb5261727dea2e027087c54858d01441b6"
 )
 
 
@@ -166,7 +169,20 @@ def main() -> None:
             "private_family_authorization_identity"
         ]
         == PRIVATE_FAMILY_AUTHORIZATION_IDENTITY
+        and identity["private_family"]["source_path"]
+        == "crates/fre-aot-static-runtime/src/search_support/private_rows.rs"
+        and identity["private_family"]["source_sha256"]
+        == PRIVATE_FAMILY_SOURCE_SHA256
+        and sha256(
+            regular(
+                repo
+                / "crates/fre-aot-static-runtime/src/search_support/private_rows.rs",
+                1 << 18,
+            )
+        )
+        == PRIVATE_FAMILY_SOURCE_SHA256
         and identity["runner"]["source_commit"] is None
+        and identity["runner"]["source_archive_sha256"] is None
         and identity["static_pipeline"]["compiler_identity"] is None
         and all(
             platform["manifest_identity"] is None
@@ -205,10 +221,14 @@ def main() -> None:
         == CAMPAIGN_EVIDENCE_IDENTITY
         and binding_payload["private_family_authorization_identity"]
         == PRIVATE_FAMILY_AUTHORIZATION_IDENTITY
+        and binding_payload["private_family_source_sha256"]
+        == PRIVATE_FAMILY_SOURCE_SHA256
         and binding_payload["runner_source_commit"] is None
         and binding_payload["runner_source_sha256"]
         == identity["runner"]["source_set_sha256"]
         and binding_payload["source_archive_sha256"] is None
+        and binding_payload["hosts"][1]["allowed_logical_cpus"]
+        == list(range(64, 80))
         and binding_payload["timing_sealed"] is False
         and binding_payload["bindings_complete"] is False
         and binding_payload["application_qualification_authority"] is False

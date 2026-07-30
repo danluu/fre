@@ -10,7 +10,7 @@
     "blocker": "bind the exact runner revision, source archive, compiler identity, and per-platform manifest identities and sealed build receipts"
   },
   "application": {
-    "contract_sha256": "c52132527ffa184c0efceb66f4b1eb4a4b19b964c48d58d989520b8a1a906da5",
+    "contract_sha256": "121c44149d1b758fa5ac750aa524621669c92d23c4c095bab7f36bc767faa34b",
     "projection_sha256": "1ea6896b7d89bb812130d6f6c4b743d9eed79169c0154f0b6bb37686576b9332",
     "candidate_count": 11,
     "fixture_count": 154,
@@ -41,10 +41,10 @@
     "minimum_window_bytes": 65536,
     "portable_prefix_candidate_starts": 256,
     "full_window_preflight_authoritative": true,
-    "plan_identity": "0ea6b3aefac2d31e67aae3acdef3b9f65d0b0fa91421a9ec5c3afe5517c9b2fd",
-    "analyzer_identity": "9ed68cd09ffc5ac4f012026f19cf1fb2b3a61da84a84ab0919bfd7a8df40621d",
-    "evidence_identity": "3477aa1a605fe591065d0fcab11fa07ec548409afed2b07fe66b02c5fe23c4c1",
-    "private_family_authorization_identity": "e78b63696306afe20d65c09d38f9f874d21521aa2d8ddddce24beb25f9604fa1"
+    "plan_identity": "f5a3319b1178ea97766b735bc39b589a6a1a33e8cc9257a947ea9feff7c5f702",
+    "analyzer_identity": "0a32b5a20c03077b856f51741216289aa8399f213261d07e5c8874bf2d3fe6ec",
+    "evidence_identity": "baf4c23db6318c6658b8eba72a3eff6b165d42a085cc8a1e656ad6650b477f00",
+    "private_family_authorization_identity": "aaa0527f255eb5912001b5ba9d9efab69c0be5848bdef595435b90aadbf284da"
   },
   "object_candidates": {
     "manifest_schema": "fre.aot.search-tag30-application-object-candidates.v1",
@@ -60,7 +60,12 @@
   },
   "runner": {
     "source_commit": null,
-    "source_set_sha256": "9062a504883bade2fcbe14368efbc747da8924611a07d4352666f088007f0c77"
+    "source_set_sha256": "4fc528612218137e27e795f2fe1c8fd4b79d2cbe04e6d334d2b2b03844c2fd6a",
+    "source_archive_sha256": null
+  },
+  "private_family": {
+    "source_path": "crates/fre-aot-static-runtime/src/search_support/private_rows.rs",
+    "source_sha256": "aeb4f4daa91a162172948c13e1ac9eeb5261727dea2e027087c54858d01441b6"
   },
   "platform_artifacts": {
     "macos_aarch64": {
