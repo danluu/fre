@@ -164,13 +164,41 @@ fn assert_metered_window_matches_oracle(pattern: &str, haystack: &[u8], start: u
     else {
         panic!("wrong unlimited accounting family for {pattern:?}");
     };
-    let exact_work = u64::try_from(unlimited_accounting.work).unwrap();
-    assert!(
-        exact_work < unlimited_accounting.work_upper_bound,
-        "test must select metered scalar service pattern={pattern:?} \
-         haystack={haystack:?} window={start}..{end}"
+    let probe_limit = unlimited_accounting
+        .work_upper_bound
+        .checked_sub(1)
+        .expect("literal/class-run search has nonzero fixed work");
+    let (probe, probe_accounting) = regex
+        .find_window(
+            haystack,
+            SearchWindow::new(start, end),
+            SearchLimits {
+                max_work: probe_limit,
+                max_scratch_bytes: unlimited_accounting.scratch_bytes,
+            },
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "metered scalar probe failed pattern={pattern:?} haystack={haystack:?} \
+                 window={start}..{end} max_work={probe_limit}: {error}"
+            )
+        });
+    assert_eq!(
+        probe.map(|matched| (matched.start(), matched.end())),
+        expected,
+        "metered probe pattern={pattern:?} haystack={haystack:?} window={start}..{end}"
     );
+    let SearchAccounting::LiteralClassRunLiteral(probe_accounting) = probe_accounting else {
+        panic!("wrong metered probe accounting family for {pattern:?}");
+    };
+    assert_eq!(
+        probe_accounting.work_upper_bound,
+        unlimited_accounting.work_upper_bound
+    );
+    assert!(u64::try_from(probe_accounting.work).unwrap() <= probe_limit);
+    assert!(probe_accounting.work_upper_bound > probe_limit);
 
+    let exact_work = u64::try_from(probe_accounting.work).unwrap();
     let (metered, metered_accounting) = regex
         .find_window(
             haystack,
@@ -194,14 +222,14 @@ fn assert_metered_window_matches_oracle(pattern: &str, haystack: &[u8], start: u
     let SearchAccounting::LiteralClassRunLiteral(metered_accounting) = metered_accounting else {
         panic!("wrong metered accounting family for {pattern:?}");
     };
-    assert_eq!(metered_accounting.work, unlimited_accounting.work);
+    assert_eq!(metered_accounting.work, probe_accounting.work);
     assert_eq!(
         metered_accounting.source_reads,
-        unlimited_accounting.source_reads
+        probe_accounting.source_reads
     );
     assert_eq!(
         metered_accounting.candidate_visits,
-        unlimited_accounting.candidate_visits
+        probe_accounting.candidate_visits
     );
     assert!(u64::try_from(metered_accounting.work).unwrap() <= exact_work);
     assert!(metered_accounting.work_upper_bound > exact_work);
