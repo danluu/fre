@@ -840,6 +840,9 @@ fn emit_exact(
         BackendVersion::SEARCH_V15 => {
             emit_exact_candidates_v15(template, manifest, literal, none, found)
         }
+        BackendVersion::SEARCH_V16 => {
+            emit_exact_candidates_v16(template, manifest, literal, none, found)
+        }
         BackendVersion::SEARCH_SVE2_FIXED16_V2 => {
             emit_exact_candidates_sve2_fixed16_v2(template, manifest, literal, none, found)
         }
@@ -1437,6 +1440,35 @@ fn emit_exact_candidates_v15(
     emit_exact_candidates_v8(template, manifest, literal, none, found)
 }
 
+fn emit_exact_candidates_v16(
+    template: &mut Template,
+    manifest: SearchManifest,
+    literal: &[u8],
+    none: Label,
+    found: Label,
+) -> Result<(), AuditError> {
+    let first_candidate_miss = template.new_label(LabelKind::Internal);
+    let selected = literal
+        .get(usize::from(manifest.primary_offset))
+        .copied()
+        .ok_or(AuditError::InvalidSearchManifest)?;
+
+    template.add_reg(15, 9, 5);
+    template.load_byte(10, 15, manifest.primary_offset);
+    template.cmp_imm32(10, u16::from(selected));
+    template.branch_cond(Condition::NotEqual, first_candidate_miss);
+    if literal.len() > 1 {
+        emit_literal_equality_specialized(template, 15, 8, literal.len(), first_candidate_miss)?;
+    }
+    template.mov_reg(13, 5);
+    template.add_reg(14, 5, 12);
+    template.branch(found);
+
+    template.bind(first_candidate_miss)?;
+    template.add_imm(5, 5, 1);
+    emit_exact_candidates_v8(template, manifest, literal, none, found)
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the complete v4 mask-guided control-flow template remains independent and reviewable"
@@ -1925,42 +1957,48 @@ fn emit_exact_candidates_v8(
     let candidate_miss = template.new_label(LabelKind::Internal);
     let recovery_exhausted = matches!(
         manifest.backend_version,
-        BackendVersion::SEARCH_V13 | BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
+        BackendVersion::SEARCH_V13
+            | BackendVersion::SEARCH_V14
+            | BackendVersion::SEARCH_V15
+            | BackendVersion::SEARCH_V16
     )
     .then(|| template.new_label(LabelKind::Internal));
     let adaptive_recovery = matches!(
         manifest.backend_version,
-        BackendVersion::SEARCH_V13 | BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
+        BackendVersion::SEARCH_V13
+            | BackendVersion::SEARCH_V14
+            | BackendVersion::SEARCH_V15
+            | BackendVersion::SEARCH_V16
     )
     .then(|| template.new_label(LabelKind::SlowPath));
     let learned_discover = matches!(
         manifest.backend_version,
-        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
+        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15 | BackendVersion::SEARCH_V16
     )
     .then(|| template.new_label(LabelKind::Loop));
     let learned_column_ready = matches!(
         manifest.backend_version,
-        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
+        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15 | BackendVersion::SEARCH_V16
     )
     .then(|| template.new_label(LabelKind::SlowPath));
     let learned_advance = matches!(
         manifest.backend_version,
-        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
+        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15 | BackendVersion::SEARCH_V16
     )
     .then(|| template.new_label(LabelKind::Internal));
     let learned_scan = matches!(
         manifest.backend_version,
-        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
+        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15 | BackendVersion::SEARCH_V16
     )
     .then(|| template.new_label(LabelKind::Loop));
     let learned_disabled = matches!(
         manifest.backend_version,
-        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
+        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15 | BackendVersion::SEARCH_V16
     )
     .then(|| template.new_label(LabelKind::SlowPath));
     let learned_tail = matches!(
         manifest.backend_version,
-        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
+        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15 | BackendVersion::SEARCH_V16
     )
     .then(|| template.new_label(LabelKind::SlowPath));
     let tail_setup = template.new_label(LabelKind::SlowPath);
@@ -2001,7 +2039,7 @@ fn emit_exact_candidates_v8(
     }
     if matches!(
         manifest.backend_version,
-        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
+        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15 | BackendVersion::SEARCH_V16
     ) {
         if !filters_cover_zero {
             return Err(AuditError::InvalidSearchManifest);
@@ -2252,6 +2290,7 @@ fn emit_exact_candidates_v8(
             | BackendVersion::SEARCH_V13
             | BackendVersion::SEARCH_V14
             | BackendVersion::SEARCH_V15
+            | BackendVersion::SEARCH_V16
     ) {
         emit_literal_equality_specialized(template, 15, 8, literal.len(), candidate_miss)?;
     } else if literal.len() == 16 {
@@ -2315,7 +2354,7 @@ fn emit_exact_candidates_v8(
         template.bind(exhausted)?;
     } else if matches!(
         manifest.backend_version,
-        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
+        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15 | BackendVersion::SEARCH_V16
     ) {
         let discover = learned_discover.ok_or(AuditError::InvalidSearchManifest)?;
         let column_ready = learned_column_ready.ok_or(AuditError::InvalidSearchManifest)?;
@@ -2383,41 +2422,83 @@ fn emit_exact_candidates_v8(
         template.add_reg(15, 13, 10);
         template.load_vector128(16, 15, 0);
         template.compare_equal_bytes16(16, 16, 24);
-        emit_sparse_lane_mask_to(template, 16, 18, 0);
-        template.compare_branch_zero(0, false, learned_next);
+        if manifest.backend_version == BackendVersion::SEARCH_V16 {
+            template.unsigned_max_pairwise_bytes16(18, 16, 16);
+            template.move_vector_double_to64(0, 18);
+            template.compare_branch_zero(0, false, learned_next);
 
-        // A learned-byte hit is intersected with all five authenticated
-        // columns. A surviving candidate permanently disables learned mode.
-        let primary_column = if primary_offset == 0 {
-            13
-        } else {
-            template.add_imm(15, 13, primary_offset);
-            15
-        };
-        template.load_vector128(16, primary_column, 0);
-        template.compare_equal_bytes16(16, 16, 1);
-        for (offset, constant) in [
-            (secondary_offset, 3_u8),
-            (verification_offset, 5_u8),
-            (quaternary_offset, 7_u8),
-            (quinary_offset, 23_u8),
-        ] {
-            let Some(offset) = offset else {
-                continue;
-            };
-            let column = if offset == 0 {
+            let primary_column = if primary_offset == 0 {
                 13
             } else {
-                template.add_imm(15, 13, offset);
+                template.add_imm(15, 13, primary_offset);
                 15
             };
-            template.load_vector128(18, column, 0);
-            template.compare_equal_bytes16(18, 18, constant);
+            template.load_vector128(18, primary_column, 0);
+            template.compare_equal_bytes16(18, 18, 1);
             template.and_bytes16(16, 16, 18);
+            template.unsigned_max_pairwise_bytes16(18, 16, 16);
+            template.move_vector_double_to64(0, 18);
+            template.compare_branch_zero(0, false, learned_next);
+
+            for (offset, constant) in [
+                (secondary_offset, 3_u8),
+                (verification_offset, 5_u8),
+                (quaternary_offset, 7_u8),
+                (quinary_offset, 23_u8),
+            ] {
+                let Some(offset) = offset else {
+                    continue;
+                };
+                let column = if offset == 0 {
+                    13
+                } else {
+                    template.add_imm(15, 13, offset);
+                    15
+                };
+                template.load_vector128(18, column, 0);
+                template.compare_equal_bytes16(18, 18, constant);
+                template.and_bytes16(16, 16, 18);
+            }
+            emit_sparse_lane_mask_to(template, 16, 18, 0);
+            template.compare_branch_zero(0, false, learned_next);
+        } else {
+            emit_sparse_lane_mask_to(template, 16, 18, 0);
+            template.compare_branch_zero(0, false, learned_next);
+
+            // A learned-byte hit is intersected with all five authenticated
+            // columns. A surviving candidate permanently disables learned
+            // mode.
+            let primary_column = if primary_offset == 0 {
+                13
+            } else {
+                template.add_imm(15, 13, primary_offset);
+                15
+            };
+            template.load_vector128(16, primary_column, 0);
+            template.compare_equal_bytes16(16, 16, 1);
+            for (offset, constant) in [
+                (secondary_offset, 3_u8),
+                (verification_offset, 5_u8),
+                (quaternary_offset, 7_u8),
+                (quinary_offset, 23_u8),
+            ] {
+                let Some(offset) = offset else {
+                    continue;
+                };
+                let column = if offset == 0 {
+                    13
+                } else {
+                    template.add_imm(15, 13, offset);
+                    15
+                };
+                template.load_vector128(18, column, 0);
+                template.compare_equal_bytes16(18, 18, constant);
+                template.and_bytes16(16, 16, 18);
+            }
+            emit_sparse_lane_mask_to(template, 16, 18, 10);
+            template.and_reg(0, 0, 10);
+            template.compare_branch_zero(0, false, learned_next);
         }
-        emit_sparse_lane_mask_to(template, 16, 18, 10);
-        template.and_reg(0, 0, 10);
-        template.compare_branch_zero(0, false, learned_next);
         template.mov_imm64(11, 2);
         template.branch(disabled);
 

@@ -98,6 +98,9 @@ pub enum SearchBackendPolicy {
     /// Search V15 candidate: the V14 learned-column graph admitted only when
     /// its authenticated five-byte signature is cyclic-phase unique.
     AsimdV15,
+    /// Search V16 candidate: V15 admission with a staged learned/primary
+    /// discriminator before the complete retained-mask recovery graph.
+    AsimdV16,
     /// SVE screening with exactly sixteen active byte lanes.
     Sve16,
     /// SVE2 `MATCH` screening with exactly sixteen active byte lanes,
@@ -126,6 +129,7 @@ impl SearchBackendPolicy {
             Self::AsimdV13 => BackendVersion::SEARCH_V13,
             Self::AsimdV14 => BackendVersion::SEARCH_V14,
             Self::AsimdV15 => BackendVersion::SEARCH_V15,
+            Self::AsimdV16 => BackendVersion::SEARCH_V16,
             Self::Sve16 => BackendVersion::SEARCH_SVE16_V1,
             Self::Sve2Fixed16 => BackendVersion::SEARCH_SVE2_16_V1,
             Self::Sve16V6 => BackendVersion::SEARCH_SVE16_V6,
@@ -342,6 +346,7 @@ fn emit_search_image<O: Operation>(
             | BackendVersion::SEARCH_V13
             | BackendVersion::SEARCH_V14
             | BackendVersion::SEARCH_V15
+            | BackendVersion::SEARCH_V16
             | BackendVersion::SEARCH_SVE16_V1
             | BackendVersion::SEARCH_SVE2_16_V1
             | BackendVersion::SEARCH_SVE16_V6
@@ -409,6 +414,7 @@ fn emit_search_image<O: Operation>(
             | BackendVersion::SEARCH_V13
             | BackendVersion::SEARCH_V14
             | BackendVersion::SEARCH_V15
+            | BackendVersion::SEARCH_V16
     ) && !plan.is_v9_policy_shape()
     {
         return Err(EmitError::Unsupported {
@@ -539,6 +545,7 @@ fn emit_search_image<O: Operation>(
                 | BackendVersion::SEARCH_V13
                 | BackendVersion::SEARCH_V14
                 | BackendVersion::SEARCH_V15
+                | BackendVersion::SEARCH_V16
                 | BackendVersion::SEARCH_SVE16_V1
                 | BackendVersion::SEARCH_SVE2_16_V1
                 | BackendVersion::SEARCH_SVE16_V6
@@ -1645,6 +1652,7 @@ impl<'a> Plan<'a> {
                         | BackendVersion::SEARCH_V13
                         | BackendVersion::SEARCH_V14
                         | BackendVersion::SEARCH_V15
+                        | BackendVersion::SEARCH_V16
                         | BackendVersion::SEARCH_SVE16_V6
                         | BackendVersion::SEARCH_SVE2_FIXED16_V2
                 ) =>
@@ -1699,6 +1707,7 @@ impl<'a> Plan<'a> {
                 | BackendVersion::SEARCH_V13
                 | BackendVersion::SEARCH_V14
                 | BackendVersion::SEARCH_V15
+                | BackendVersion::SEARCH_V16
                 | BackendVersion::SEARCH_SVE16_V1
                 | BackendVersion::SEARCH_SVE2_16_V1
                 | BackendVersion::SEARCH_SVE16_V6
@@ -1746,6 +1755,7 @@ impl<'a> Plan<'a> {
                         | BackendVersion::SEARCH_V13
                         | BackendVersion::SEARCH_V14
                         | BackendVersion::SEARCH_V15
+                        | BackendVersion::SEARCH_V16
                         | BackendVersion::SEARCH_SVE16_V1
                         | BackendVersion::SEARCH_SVE2_16_V1
                         | BackendVersion::SEARCH_SVE16_V6
@@ -1760,6 +1770,7 @@ impl<'a> Plan<'a> {
                                 | BackendVersion::SEARCH_V13
                                 | BackendVersion::SEARCH_V14
                                 | BackendVersion::SEARCH_V15
+                                | BackendVersion::SEARCH_V16
                         ) {
                             admission.select_offsets_v3()
                         } else if matches!(
@@ -1837,11 +1848,13 @@ impl<'a> Plan<'a> {
             quaternary_offset,
             quinary_offset,
         ) = {
-            if backend_version == BackendVersion::SEARCH_V15
-                && (shape != SearchShape::ExactLiteral
-                    || candidate_policy.is_none_or(|offsets| {
-                        !candidate_signature_is_cyclic_phase_unique(literal, offsets)
-                    }))
+            if matches!(
+                backend_version,
+                BackendVersion::SEARCH_V15 | BackendVersion::SEARCH_V16
+            ) && (shape != SearchShape::ExactLiteral
+                || candidate_policy.is_none_or(|offsets| {
+                    !candidate_signature_is_cyclic_phase_unique(literal, offsets)
+                }))
             {
                 return Err(EmitError::Unsupported {
                     reason: UnsupportedReason::KernelShape,
@@ -1883,8 +1896,10 @@ impl<'a> Plan<'a> {
                             && shape == SearchShape::ExactLiteral
                         {
                             SEARCH_CANDIDATE_POLICY_V10
-                        } else if backend_version == BackendVersion::SEARCH_V15
-                            && shape == SearchShape::ExactLiteral
+                        } else if matches!(
+                            backend_version,
+                            BackendVersion::SEARCH_V15 | BackendVersion::SEARCH_V16
+                        ) && shape == SearchShape::ExactLiteral
                         {
                             SEARCH_CANDIDATE_POLICY_V11
                         } else if backend_version == BackendVersion::SEARCH_V9
@@ -2207,6 +2222,19 @@ fn emit_exact(
         }
         BackendVersion::SEARCH_V15 => {
             emit_vector_candidate_skip_v15(
+                assembler,
+                literal,
+                primary_offset,
+                secondary_offset,
+                verification_offset,
+                quaternary_offset,
+                quinary_offset,
+                none,
+                found,
+            )?;
+        }
+        BackendVersion::SEARCH_V16 => {
+            emit_vector_candidate_skip_v16(
                 assembler,
                 literal,
                 primary_offset,
@@ -3342,6 +3370,54 @@ fn emit_vector_candidate_skip_v15(
 
 #[allow(
     clippy::too_many_arguments,
+    reason = "the V16 wire retains V15 admission while selecting a distinct staged learned-recovery graph"
+)]
+fn emit_vector_candidate_skip_v16(
+    assembler: &mut Assembler,
+    literal: &[u8],
+    primary_offset: u16,
+    secondary_offset: Option<u16>,
+    verification_offset: Option<u16>,
+    quaternary_offset: Option<u16>,
+    quinary_offset: Option<u16>,
+    none: Label,
+    found: Label,
+) -> Result<(), EmitError> {
+    let first_candidate_miss = assembler.new_label(LabelKind::Internal)?;
+    let selected = literal
+        .get(usize::from(primary_offset))
+        .copied()
+        .ok_or(EmitError::InternalInvariant)?;
+
+    assembler.add_reg(X15, X9, X5)?;
+    assembler.load_byte(X10, X15, primary_offset)?;
+    assembler.cmp_imm32(X10, u16::from(selected))?;
+    assembler.branch_cond(Condition::NotEqual, first_candidate_miss)?;
+    if literal.len() > 1 {
+        emit_literal_equality_specialized(assembler, X15, X8, literal.len(), first_candidate_miss)?;
+    }
+    assembler.mov_reg(X13, X5)?;
+    assembler.add_reg(X14, X5, X12)?;
+    assembler.branch(found)?;
+
+    assembler.bind(first_candidate_miss)?;
+    assembler.add_imm(X5, X5, 1)?;
+    emit_vector_candidate_skip_v8(
+        assembler,
+        literal,
+        primary_offset,
+        secondary_offset,
+        verification_offset,
+        quaternary_offset,
+        quinary_offset,
+        BackendVersion::SEARCH_V16,
+        none,
+        found,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
     clippy::too_many_lines,
     reason = "the versioned v8 graph keeps its paired 64-candidate screen and authenticated staged recovery explicit"
 )]
@@ -3373,49 +3449,55 @@ fn emit_vector_candidate_skip_v8(
     let candidate_miss = assembler.new_label(LabelKind::Internal)?;
     let recovery_exhausted = matches!(
         backend_version,
-        BackendVersion::SEARCH_V13 | BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
+        BackendVersion::SEARCH_V13
+            | BackendVersion::SEARCH_V14
+            | BackendVersion::SEARCH_V15
+            | BackendVersion::SEARCH_V16
     )
     .then(|| assembler.new_label(LabelKind::Internal))
     .transpose()?;
     let adaptive_recovery = matches!(
         backend_version,
-        BackendVersion::SEARCH_V13 | BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
+        BackendVersion::SEARCH_V13
+            | BackendVersion::SEARCH_V14
+            | BackendVersion::SEARCH_V15
+            | BackendVersion::SEARCH_V16
     )
     .then(|| assembler.new_label(LabelKind::SlowPath))
     .transpose()?;
     let learned_discover = matches!(
         backend_version,
-        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
+        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15 | BackendVersion::SEARCH_V16
     )
     .then(|| assembler.new_label(LabelKind::Loop))
     .transpose()?;
     let learned_column_ready = matches!(
         backend_version,
-        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
+        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15 | BackendVersion::SEARCH_V16
     )
     .then(|| assembler.new_label(LabelKind::SlowPath))
     .transpose()?;
     let learned_advance = matches!(
         backend_version,
-        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
+        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15 | BackendVersion::SEARCH_V16
     )
     .then(|| assembler.new_label(LabelKind::Internal))
     .transpose()?;
     let learned_scan = matches!(
         backend_version,
-        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
+        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15 | BackendVersion::SEARCH_V16
     )
     .then(|| assembler.new_label(LabelKind::Loop))
     .transpose()?;
     let learned_disabled = matches!(
         backend_version,
-        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
+        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15 | BackendVersion::SEARCH_V16
     )
     .then(|| assembler.new_label(LabelKind::SlowPath))
     .transpose()?;
     let learned_tail = matches!(
         backend_version,
-        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
+        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15 | BackendVersion::SEARCH_V16
     )
     .then(|| assembler.new_label(LabelKind::SlowPath))
     .transpose()?;
@@ -3469,7 +3551,7 @@ fn emit_vector_candidate_skip_v8(
     }
     if matches!(
         backend_version,
-        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
+        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15 | BackendVersion::SEARCH_V16
     ) {
         if !filters_cover_zero {
             return Err(EmitError::InternalInvariant);
@@ -3741,6 +3823,7 @@ fn emit_vector_candidate_skip_v8(
             | BackendVersion::SEARCH_V13
             | BackendVersion::SEARCH_V14
             | BackendVersion::SEARCH_V15
+            | BackendVersion::SEARCH_V16
     ) {
         emit_literal_equality_specialized(assembler, X15, X8, literal.len(), candidate_miss)?;
     } else if literal.len() == 16 {
@@ -3804,7 +3887,7 @@ fn emit_vector_candidate_skip_v8(
         assembler.bind(exhausted)?;
     } else if matches!(
         backend_version,
-        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
+        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15 | BackendVersion::SEARCH_V16
     ) {
         let discover = learned_discover.ok_or(EmitError::InternalInvariant)?;
         let column_ready = learned_column_ready.ok_or(EmitError::InternalInvariant)?;
@@ -3875,42 +3958,90 @@ fn emit_vector_candidate_skip_v8(
         assembler.add_reg(X15, X13, X10)?;
         assembler.load_vector128(16, X15, 0)?;
         assembler.compare_equal_bytes16(16, 16, 24)?;
-        emit_sparse_lane_mask_to(assembler, 16, 18, X0)?;
-        assembler.compare_branch_zero(X0, false, learned_next)?;
+        if backend_version == BackendVersion::SEARCH_V16 {
+            // A learned byte may recur elsewhere in the literal (and hence in
+            // near-miss streams at shifted candidate phases). Test presence
+            // without destroying V16, then intersect the rare primary column
+            // before paying for the remaining authenticated columns. The
+            // primary offset necessarily differs from a discovered mismatch:
+            // every recovered candidate has already passed the primary
+            // filter.
+            assembler.unsigned_max_pairwise_bytes16(18, 16, 16)?;
+            assembler.move_vector_double_to64(X0, 18)?;
+            assembler.compare_branch_zero(X0, false, learned_next)?;
 
-        // A learned-byte hit is not itself evidence of a candidate. Intersect
-        // it with all five authenticated columns before deciding whether the
-        // learned mode remains safe.
-        let primary_column = if primary_offset == 0 {
-            X13
-        } else {
-            assembler.add_imm(X15, X13, primary_offset)?;
-            X15
-        };
-        assembler.load_vector128(16, primary_column, 0)?;
-        assembler.compare_equal_bytes16(16, 16, 1)?;
-        for (offset, constant) in [
-            (secondary_offset, 3_u8),
-            (verification_offset, 5_u8),
-            (quaternary_offset, 7_u8),
-            (quinary_offset, 23_u8),
-        ] {
-            let Some(offset) = offset else {
-                continue;
-            };
-            let column = if offset == 0 {
+            let primary_column = if primary_offset == 0 {
                 X13
             } else {
-                assembler.add_imm(X15, X13, offset)?;
+                assembler.add_imm(X15, X13, primary_offset)?;
                 X15
             };
-            assembler.load_vector128(18, column, 0)?;
-            assembler.compare_equal_bytes16(18, 18, constant)?;
+            assembler.load_vector128(18, primary_column, 0)?;
+            assembler.compare_equal_bytes16(18, 18, 1)?;
             assembler.and_bytes16(16, 16, 18)?;
+            assembler.unsigned_max_pairwise_bytes16(18, 16, 16)?;
+            assembler.move_vector_double_to64(X0, 18)?;
+            assembler.compare_branch_zero(X0, false, learned_next)?;
+
+            for (offset, constant) in [
+                (secondary_offset, 3_u8),
+                (verification_offset, 5_u8),
+                (quaternary_offset, 7_u8),
+                (quinary_offset, 23_u8),
+            ] {
+                let Some(offset) = offset else {
+                    continue;
+                };
+                let column = if offset == 0 {
+                    X13
+                } else {
+                    assembler.add_imm(X15, X13, offset)?;
+                    X15
+                };
+                assembler.load_vector128(18, column, 0)?;
+                assembler.compare_equal_bytes16(18, 18, constant)?;
+                assembler.and_bytes16(16, 16, 18)?;
+            }
+            emit_sparse_lane_mask_to(assembler, 16, 18, X0)?;
+            assembler.compare_branch_zero(X0, false, learned_next)?;
+        } else {
+            emit_sparse_lane_mask_to(assembler, 16, 18, X0)?;
+            assembler.compare_branch_zero(X0, false, learned_next)?;
+
+            // A learned-byte hit is not itself evidence of a candidate.
+            // Intersect it with all five authenticated columns before
+            // deciding whether the learned mode remains safe.
+            let primary_column = if primary_offset == 0 {
+                X13
+            } else {
+                assembler.add_imm(X15, X13, primary_offset)?;
+                X15
+            };
+            assembler.load_vector128(16, primary_column, 0)?;
+            assembler.compare_equal_bytes16(16, 16, 1)?;
+            for (offset, constant) in [
+                (secondary_offset, 3_u8),
+                (verification_offset, 5_u8),
+                (quaternary_offset, 7_u8),
+                (quinary_offset, 23_u8),
+            ] {
+                let Some(offset) = offset else {
+                    continue;
+                };
+                let column = if offset == 0 {
+                    X13
+                } else {
+                    assembler.add_imm(X15, X13, offset)?;
+                    X15
+                };
+                assembler.load_vector128(18, column, 0)?;
+                assembler.compare_equal_bytes16(18, 18, constant)?;
+                assembler.and_bytes16(16, 16, 18)?;
+            }
+            emit_sparse_lane_mask_to(assembler, 16, 18, X10)?;
+            assembler.and_reg(X0, X0, X10)?;
+            assembler.compare_branch_zero(X0, false, learned_next)?;
         }
-        emit_sparse_lane_mask_to(assembler, 16, 18, X10)?;
-        assembler.and_reg(X0, X0, X10)?;
-        assembler.compare_branch_zero(X0, false, learned_next)?;
         assembler.mov_imm64(X11, 2)?;
         assembler.branch(disabled)?;
 

@@ -4556,6 +4556,7 @@ fn explicit_search_backend_policy_selects_distinct_artifact_identities() {
         (SearchBackendPolicy::AsimdV13, BackendVersion::SEARCH_V13),
         (SearchBackendPolicy::AsimdV14, BackendVersion::SEARCH_V14),
         (SearchBackendPolicy::AsimdV15, BackendVersion::SEARCH_V15),
+        (SearchBackendPolicy::AsimdV16, BackendVersion::SEARCH_V16),
         (SearchBackendPolicy::Sve16, BackendVersion::SEARCH_SVE16_V1),
         (
             SearchBackendPolicy::Sve2Fixed16,
@@ -7467,6 +7468,92 @@ fn v15_phase_unique_selector_is_exhaustive_audited_and_semantic() {
 }
 
 #[test]
+fn v16_stages_repeated_learned_bytes_before_full_recovery() {
+    let literal = [
+        0x63, 0x1c, 0x0e, 0x53, 0xc4, 0xe4, 0xb3, 0x5c, 0xf7, 0x1d, 0x14, 0xcc, 0x07, 0xdb, 0x88,
+        0x7b, 0xa2, 0x41, 0x99, 0xb9, 0x02, 0x92, 0xbb, 0x79, 0x4c, 0xe1, 0x0b, 0x28, 0x92, 0x63,
+        0x68, 0x3d,
+    ];
+    let program =
+        build_exact_literal::<Span>(&literal, AnchorFlags::default(), ValidateLimits::default())
+            .expect("V16 repeated-learned-byte IR");
+    let v15 = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV15,
+        EmitLimits::default(),
+    )
+    .expect("V15 diagnostic image");
+    let v16 = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV16,
+        EmitLimits::default(),
+    )
+    .expect("V16 staged image");
+
+    assert_eq!(v16.backend_version(), BackendVersion::SEARCH_V16);
+    assert_eq!(
+        v16.search_manifest()
+            .expect("V16 manifest")
+            .candidate_policy_version,
+        15,
+        "V16 changes recovery, not the frozen phase-unique selector"
+    );
+    assert_eq!(
+        &v16.to_aot(AotLimits::default())
+            .expect("bounded V16 AOT")
+            .as_bytes()[..8],
+        b"FREA64\0\x1d"
+    );
+    assert_ne!(v16.code(), v15.code());
+    assert_ne!(v16.artifact_identity(), v15.artifact_identity());
+    audit(&v16).expect("independent V16 staged-template audit");
+
+    let staged_reductions = decode(v16.code())
+        .expect("V16 decode")
+        .into_iter()
+        .filter(|instruction| {
+            matches!(
+                instruction,
+                DecodedInstruction::UnsignedMaxPairwiseBytes16 {
+                    destination: 18,
+                    left: 16,
+                    right: 16,
+                }
+            )
+        })
+        .count();
+    assert!(
+        staged_reductions >= 2,
+        "V16 must separately test learned-byte and learned/primary presence"
+    );
+
+    for mutation_offset in 0..literal.len() {
+        let mut near_miss = literal;
+        near_miss[mutation_offset] = 0;
+        let mut haystack = Vec::new();
+        for _ in 0..257 {
+            haystack.extend_from_slice(&near_miss);
+        }
+        haystack.extend_from_slice(&literal);
+        let expected = program
+            .execute(
+                &haystack,
+                SearchWindow::new(0, haystack.len()),
+                ExecutionLimits::unlimited(),
+            )
+            .expect("V16 semantic oracle")
+            .output()
+            .map(|span| (span.start(), span.end()));
+        let actual = simulate(&v16, &haystack, 0, haystack.len()).expect("V16 safe ISA simulation");
+        assert_eq!(
+            span_output(actual),
+            expected,
+            "mutation offset {mutation_offset}"
+        );
+    }
+}
+
+#[test]
 fn v13_adaptive_recovery_decoded_edges_cover_zero_one_and_max_remaining_columns() {
     for (width, expected_columns) in [(5_usize, 0_usize), (6, 1), (32, 27)] {
         let literal = vec![b'a'; width];
@@ -7655,7 +7742,7 @@ fn v13_adaptive_recovery_decoded_edges_cover_zero_one_and_max_remaining_columns(
 }
 
 #[test]
-fn v9_through_v15_reject_shapes_without_one_nonempty_unanchored_exact_candidate() {
+fn v9_through_v16_reject_shapes_without_one_nonempty_unanchored_exact_candidate() {
     for backend in [
         SearchBackendPolicy::AsimdV9,
         SearchBackendPolicy::AsimdV10,
@@ -7664,6 +7751,7 @@ fn v9_through_v15_reject_shapes_without_one_nonempty_unanchored_exact_candidate(
         SearchBackendPolicy::AsimdV13,
         SearchBackendPolicy::AsimdV14,
         SearchBackendPolicy::AsimdV15,
+        SearchBackendPolicy::AsimdV16,
     ] {
         for anchors in [
             AnchorFlags {
