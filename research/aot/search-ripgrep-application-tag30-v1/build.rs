@@ -668,6 +668,7 @@ fn main() {
             output.join("linked-image.map").display()
         );
     } else {
+        println!("cargo:rustc-link-arg-bin={BINARY}=-Wl,-z,separate-code");
         println!("cargo:rustc-link-arg-bin={BINARY}=-Wl,-z,noexecstack");
         println!("cargo:rustc-link-arg-bin={BINARY}=-Wl,--build-id=none");
         println!(

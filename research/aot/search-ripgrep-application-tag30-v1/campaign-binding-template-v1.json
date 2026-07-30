@@ -1,6 +1,6 @@
 {
   "schema": "fre.aot.search-tag30-ripgrep-application-campaign-binding.v1",
-  "payload_sha256": "25e74d6c8fcdae990f3b02407c3d1de9d15fcfb9361ed2b9367095270b759a87",
+  "payload_sha256": "896b0281115dfcd7a669318b39fa29e8f204e49ab0a2b2e0a6b6738e7b5aafb5",
   "payload": {
     "contract_sha256": "c52132527ffa184c0efceb66f4b1eb4a4b19b964c48d58d989520b8a1a906da5",
     "projection_sha256": "1ea6896b7d89bb812130d6f6c4b743d9eed79169c0154f0b6bb37686576b9332",
@@ -14,7 +14,7 @@
     "campaign_evidence_identity": "3477aa1a605fe591065d0fcab11fa07ec548409afed2b07fe66b02c5fe23c4c1",
     "private_family_authorization_identity": "e78b63696306afe20d65c09d38f9f874d21521aa2d8ddddce24beb25f9604fa1",
     "runner_source_commit": null,
-    "runner_source_sha256": "9efbe32efcfcb2db908117b7df2eaecbc987b8ce63b2b936edbcc9dde7958354",
+    "runner_source_sha256": "9062a504883bade2fcbe14368efbc747da8924611a07d4352666f088007f0c77",
     "source_archive_sha256": null,
     "hosts": [
       {

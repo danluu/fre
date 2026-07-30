@@ -60,7 +60,7 @@
   },
   "runner": {
     "source_commit": null,
-    "source_set_sha256": "9efbe32efcfcb2db908117b7df2eaecbc987b8ce63b2b936edbcc9dde7958354"
+    "source_set_sha256": "9062a504883bade2fcbe14368efbc747da8924611a07d4352666f088007f0c77"
   },
   "platform_artifacts": {
     "macos_aarch64": {
