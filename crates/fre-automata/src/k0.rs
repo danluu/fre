@@ -2879,27 +2879,44 @@ fn execute_context_lazy_loop(
         contract,
         OutputContract::Exists | OutputContract::EarliestEnd
     );
-    let initial_mask = enabled_assertion_mask(automaton, haystack, window.start(), meter)?;
+    let mut position = window.start();
+    let mut boundaries = 0usize;
+    if let Some(scanner) = scanner {
+        // An absolute-start branch may contribute only at original haystack
+        // boundary zero. Otherwise the proven scanner can establish the first
+        // viable root before contextual initialization, avoiding construction
+        // of an initial state that would be discarded immediately.
+        if !(force_haystack_start && position == 0) {
+            position =
+                next_start_candidate(scanner, haystack, position, window.end(), guard, meter)?;
+            if position == window.end() {
+                return Ok(Some((None, boundaries)));
+            }
+        }
+    }
+    let initial_mask = enabled_assertion_mask(automaton, haystack, position, meter)?;
     let Some((mut state, mut restartable)) = context_lazy_initial(
         automaton,
         initial_mask,
         workspace,
         meter,
         core_reserve,
-        window.start(),
+        position,
     )?
     else {
         return Ok(None);
     };
     workspace.lazy.initialized = true;
 
-    let mut position = window.start();
-    let mut boundaries = 0usize;
     let mut pending_end = None;
     let mut entered = false;
 
     loop {
-        if pending_end.is_none() && restartable && !(force_haystack_start && position == 0) {
+        if entered
+            && pending_end.is_none()
+            && restartable
+            && !(force_haystack_start && position == 0)
+        {
             let candidate = if let Some(scanner) = scanner {
                 next_start_candidate(scanner, haystack, position, window.end(), guard, meter)?
             } else {
@@ -6627,8 +6644,8 @@ mod tests {
             START_FILTER_SCANNER_SELECTION_WORK,
         },
         Automaton, CompileLimits, EarliestEnd, EdgeKind, Exists, K0SearchSession, K0Workspace,
-        MatchSpan, RawPlan, ResourceKind, SearchError, SearchLimits, SearchWindow, SelectedEnd,
-        Span, StateRole, WorkspaceLimits,
+        MatchSpan, OutputContract, RawPlan, ResourceKind, SearchError, SearchLimits, SearchWindow,
+        SelectedEnd, Span, StateRole, WorkspaceLimits,
     };
 
     fn ascii_literal(byte: u8) -> Automaton {
@@ -8515,6 +8532,275 @@ mod tests {
                     ..
                 } if consumed == expected_consumed && requested == expected_tail
             ));
+        }
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the candidate-first differential keeps the proven scanner inputs explicit"
+    )]
+    fn assert_context_candidate_first_case(
+        name: &str,
+        plan: &Automaton,
+        haystack: &[u8],
+        window: SearchWindow,
+        scanner: &StartPositionScanner,
+        guard: Option<&StartPositionClass>,
+        force_haystack_start: bool,
+    ) {
+        let mut reference = K0Workspace::new(plan, WorkspaceLimits::unlimited()).unwrap();
+        let expected = plan
+            .prepare::<EarliestEnd>()
+            .search_window_with_workspace(
+                haystack,
+                window,
+                &mut reference,
+                SearchLimits::unlimited(),
+            )
+            .unwrap()
+            .into_output();
+
+        for limits in [SearchLimits::default(), SearchLimits::unlimited()] {
+            let mut accelerated =
+                K0Workspace::new_accelerated(plan, WorkspaceLimits::unlimited()).unwrap();
+            let actual = plan
+                .prepare::<EarliestEnd>()
+                .search_window_with_workspace(haystack, window, &mut accelerated, limits)
+                .unwrap()
+                .into_output();
+            assert_eq!(
+                actual, expected,
+                "{name}: public contextual result source={haystack:?} window={window:?}"
+            );
+        }
+
+        let run = |limit| {
+            let mut workspace =
+                K0Workspace::new_accelerated(plan, WorkspaceLimits::unlimited()).unwrap();
+            let mut meter = WorkMeter::new(limit, 0);
+            let result = super::execute_context_lazy_loop(
+                plan,
+                haystack,
+                window,
+                &mut workspace,
+                &mut meter,
+                OutputContract::EarliestEnd,
+                0,
+                Some(scanner),
+                guard,
+                force_haystack_start,
+                false,
+            );
+            (result, meter.consumed, workspace.lazy.initialized)
+        };
+
+        let expected_initialized = if force_haystack_start && window.start() == 0 {
+            true
+        } else {
+            let mut meter = WorkMeter::new(u64::MAX, 0);
+            super::next_start_candidate(
+                scanner,
+                haystack,
+                window.start(),
+                window.end(),
+                guard,
+                &mut meter,
+            )
+            .unwrap()
+                != window.end()
+        };
+        let (unlimited, unlimited_work, initialized) = run(u64::MAX);
+        let unlimited = unlimited
+            .unwrap()
+            .expect("the allocated contextual executor must accept the plan");
+        assert_eq!(
+            unlimited.0.map(MatchSpan::end),
+            expected,
+            "{name}: direct unlimited result source={haystack:?} window={window:?}"
+        );
+        assert_eq!(
+            initialized, expected_initialized,
+            "{name}: a scanner miss must return before contextual initialization"
+        );
+        assert!(
+            unlimited_work > 0,
+            "{name}: the scanner must charge actual work"
+        );
+
+        // Unlimited execution may spend optional work publishing reusable
+        // states. Find the exact finite allowance for the same result so the
+        // boundary below tests mandatory work rather than optional learning.
+        let exact_work = (0..=unlimited_work)
+            .find(|&limit| {
+                matches!(
+                    run(limit).0,
+                    Ok(Some(result)) if result == unlimited
+                )
+            })
+            .expect("unlimited actual work must admit an equivalent finite execution");
+        let (exact, consumed, exact_initialized) = run(exact_work);
+        assert_eq!(
+            exact.unwrap(),
+            Some(unlimited),
+            "{name}: exact-work execution changed its result"
+        );
+        assert_eq!(consumed, exact_work, "{name}: exact work was not consumed");
+        assert_eq!(exact_initialized, initialized);
+
+        let one_below = exact_work.checked_sub(1).unwrap();
+        let (error, consumed, _) = run(one_below);
+        let SearchError::WorkLimitExceeded {
+            limit,
+            consumed: reported,
+            requested,
+            position,
+        } = error.expect_err("one-below work must fail")
+        else {
+            panic!("{name}: one-below returned the wrong error");
+        };
+        assert_eq!(limit, one_below);
+        assert_eq!(reported, consumed);
+        assert!(reported.checked_add(requested).unwrap() > limit);
+        assert!(
+            (window.start()..=window.end()).contains(&position),
+            "{name}: failure position escaped the search window"
+        );
+    }
+
+    #[test]
+    fn contextual_candidate_first_is_differential_for_line_modes_bytes_and_windows() {
+        let mut haystacks = bounded_words(&[b'a', b'x', b'!', b'\r', b'\n', 0x80, 0xff], 3);
+        haystacks.extend([
+            b"a\n".to_vec(),
+            b"xxa\n".to_vec(),
+            b"a\r\n".to_vec(),
+            b"xxa\r\n".to_vec(),
+            vec![0xf0, 0x28, 0x8c, 0xbc, b'a', b'\n', 0xff],
+            vec![0xff, b'x', b'a', b'\r', b'\n', 0x80],
+        ]);
+        for kind in [EdgeKind::AssertLineEndLf, EdgeKind::AssertLineEndCrlf] {
+            let plan = trailing_assertion_or_bang(kind);
+            assert_contextual_all_contracts(&plan, &haystacks);
+            let proof = plan
+                .start_filter_proof
+                .get()
+                .expect("exhaustive contextual search publishes its start proof");
+            assert!(!proof.force_haystack_start);
+            assert!(proof.guard.is_none());
+            assert!(matches!(
+                proof.scanner,
+                Some(StartPositionScanner {
+                    offset: 0,
+                    scanner: StartScanner::One(b'a'),
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn contextual_candidate_first_work_limits_are_exact() {
+        let scanner = StartPositionScanner {
+            offset: 0,
+            scanner: StartScanner::One(b'a'),
+        };
+        let cases: &[(&str, EdgeKind, &[u8], SearchWindow)] = &[
+            (
+                "lf-candidate-zero",
+                EdgeKind::AssertLineEndLf,
+                b"a\n",
+                SearchWindow::new(0, 2),
+            ),
+            (
+                "lf-candidate-interior",
+                EdgeKind::AssertLineEndLf,
+                b"xxa\n",
+                SearchWindow::new(0, 4),
+            ),
+            (
+                "lf-no-candidate",
+                EdgeKind::AssertLineEndLf,
+                b"xxxx",
+                SearchWindow::new(0, 4),
+            ),
+            (
+                "lf-nonzero-window",
+                EdgeKind::AssertLineEndLf,
+                b"za\nx",
+                SearchWindow::new(1, 3),
+            ),
+            (
+                "crlf-candidate-zero",
+                EdgeKind::AssertLineEndCrlf,
+                b"a\r\n",
+                SearchWindow::new(0, 3),
+            ),
+            (
+                "crlf-candidate-interior",
+                EdgeKind::AssertLineEndCrlf,
+                b"xxa\r\n",
+                SearchWindow::new(0, 5),
+            ),
+            (
+                "invalid-utf8-window",
+                EdgeKind::AssertLineEndLf,
+                &[0xf0, 0x28, 0x8c, 0xbc, b'a', b'\n', 0xff],
+                SearchWindow::new(1, 6),
+            ),
+            (
+                "high-byte-window",
+                EdgeKind::AssertLineEndCrlf,
+                &[0xff, b'x', b'a', b'\r', b'\n', 0x80],
+                SearchWindow::new(1, 5),
+            ),
+        ];
+        for &(name, kind, haystack, window) in cases {
+            let plan = trailing_assertion_or_bang(kind);
+            assert_context_candidate_first_case(
+                name, &plan, haystack, window, &scanner, None, false,
+            );
+        }
+    }
+
+    #[test]
+    fn contextual_candidate_first_preserves_absolute_start_priority() {
+        let scanner = StartPositionScanner {
+            offset: 0,
+            scanner: StartScanner::One(b':'),
+        };
+        let guard = StartPositionClass {
+            offset: 1,
+            set: byte_set(b"a"),
+        };
+        let cases: &[(&str, &[u8], SearchWindow)] = &[
+            (
+                "absolute-high-byte-at-zero",
+                b"\xff:a",
+                SearchWindow::new(0, 3),
+            ),
+            (
+                "absolute-high-byte-nonzero-window",
+                b"x\xff:a",
+                SearchWindow::new(1, 4),
+            ),
+            (
+                "absolute-sibling-interior",
+                b"xx:a",
+                SearchWindow::new(1, 4),
+            ),
+            ("absolute-no-sibling", b"x\xffxx", SearchWindow::new(1, 4)),
+        ];
+        for &(name, haystack, window) in cases {
+            let plan = absolute_high_byte_or_colon_a();
+            assert_context_candidate_first_case(
+                name,
+                &plan,
+                haystack,
+                window,
+                &scanner,
+                Some(&guard),
+                true,
+            );
         }
     }
 
