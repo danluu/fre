@@ -21,7 +21,7 @@ CONTRACT_RELATIVE = (
     "campaign-contract-v1.json"
 )
 CONTRACT_SHA256 = (
-    "c52132527ffa184c0efceb66f4b1eb4a4b19b964c48d58d989520b8a1a906da5"
+    "121c44149d1b758fa5ac750aa524621669c92d23c4c095bab7f36bc767faa34b"
 )
 PROJECTION_RELATIVE = (
     "research/aot/search-ripgrep-application-tag30-v1/"
@@ -84,8 +84,42 @@ CASES = 154
 SHARDS = 16
 REPETITIONS = 6
 MINIMUM_NS = 400_000_000
+CALIBRATION_TARGET_NS = 500_000_000
+CALIBRATION_FLOOR_NS = 50_000_000
+CALIBRATION_ANCHOR_SAMPLES = 3
+MAXIMUM_ITERATIONS = 1 << 30
 STATIC_GATE = Fraction(4, 5)
 NONTARGET_GATE = Fraction(21, 20)
+MAXIMUM_CPU_ONLY_RETRIES = 64
+MACOS_SUPER_CPUS = tuple(range(12, 18))
+MACOS_PERFORMANCE_CPUS = tuple(range(12))
+MACOS_PERFORMANCE_LEVEL_RECEIPT = {
+    "machine_model": "Mac17,7",
+    "chip": "Apple M5 Max",
+    "mapping_authority": "ioreg-cluster-type-logical-cluster-plus-sysctl",
+    "levels": [
+        {
+            "index": 0,
+            "name": "Super",
+            "physical_cpus": 6,
+            "logical_cpus": 6,
+            "cpus_per_l2": 6,
+            "l1_data_cache_bytes": 131_072,
+            "l2_cache_bytes": 16_777_216,
+            "logical_cpu_ids": list(MACOS_SUPER_CPUS),
+        },
+        {
+            "index": 1,
+            "name": "Performance",
+            "physical_cpus": 12,
+            "logical_cpus": 12,
+            "cpus_per_l2": 6,
+            "l1_data_cache_bytes": 65_536,
+            "l2_cache_bytes": 8_388_608,
+            "logical_cpu_ids": list(MACOS_PERFORMANCE_CPUS),
+        },
+    ],
+}
 EXPECTED_HOSTS = {
     "local-apple-aarch64-asimd": {
         "canonical_host": "apple-aarch64-asimd",
@@ -121,9 +155,21 @@ HEADER_FIELDS = {
     "shard_end",
     "host_id",
     "logical_cpu",
+    "cpu_residence_method",
+    "affinity_request_status",
+    "qos_class",
+    "qos_request_status",
+    "accepted_cpu_class",
+    "accepted_cpu_ids",
+    "macos_performance_levels",
+    "maximum_cpu_only_retries_per_variant",
     "runner_binary_sha256",
     "runner_source_sha256",
     "runner_identity_sha256",
+    "source_archive_sha256",
+    "private_family_source_sha256",
+    "compiler_identity",
+    "platform_manifest_identity",
     "build_receipt_sha256",
     "object_manifest_sha256",
     "literal_dispositions_sha256",
@@ -194,6 +240,7 @@ TIMING_FIELDS = {
     "mapping",
     "logical_cpu",
     "minimum_elapsed_ns_each_variant",
+    "calibration",
     "pairs",
     "pass",
     "production_authority",
@@ -209,8 +256,36 @@ PAIR_FIELDS = {
     "candidate_checksum",
     "portable_cpu_before",
     "portable_cpu_after",
+    "portable_cpu_retries",
+    "portable_cpu_attempts",
     "candidate_cpu_before",
     "candidate_cpu_after",
+    "candidate_cpu_retries",
+    "candidate_cpu_attempts",
+}
+CPU_ATTEMPT_FIELDS = {
+    "attempt",
+    "cpu_before",
+    "cpu_after",
+    "accepted",
+}
+CALIBRATION_FIELDS = {
+    "target_elapsed_ns",
+    "floor_elapsed_ns",
+    "anchor_samples",
+    "maximum_iterations",
+    "selected_iterations",
+    "portable_pilots",
+    "candidate_pilots",
+}
+CALIBRATION_PILOT_FIELDS = {
+    "iterations",
+    "elapsed_ns",
+    "checksum",
+    "cpu_before",
+    "cpu_after",
+    "cpu_retries",
+    "cpu_attempts",
 }
 TRAILER_FIELDS = {
     "schema",
@@ -418,6 +493,7 @@ def load_binding(
         "runner_source_commit",
         "runner_source_sha256",
         "source_archive_sha256",
+        "private_family_source_sha256",
         "hosts",
         "timing_sealed",
         "bindings_complete",
@@ -453,6 +529,7 @@ def load_binding(
                 "private_family_authorization_identity",
                 "runner_source_sha256",
                 "source_archive_sha256",
+                "private_family_source_sha256",
             )
         )
         and is_hex(payload["runner_source_commit"], 40)
@@ -490,16 +567,18 @@ def load_binding(
     for host in hosts:
         expected = EXPECTED_HOSTS[host["host_id"]]
         cpus = host.get("allowed_logical_cpus")
+        expected_cpus = (
+            list(MACOS_SUPER_CPUS)
+            if host["host_id"] == "local-apple-aarch64-asimd"
+            else list(range(64, 80))
+        )
         require(
             isinstance(host, dict)
             and set(host) == host_fields
             and host["canonical_host"] == expected["canonical_host"]
             and host["target_triple"] == expected["target_triple"]
             and host["features"] == expected["features"]
-            and isinstance(cpus, list)
-            and cpus
-            and len(cpus) == len(set(cpus))
-            and all(uint(cpu) and cpu < (1 << 31) for cpu in cpus)
+            and cpus == expected_cpus
             and all(
                 is_hex(host[field])
                 for field in (
@@ -544,6 +623,40 @@ def validate_header(
     binding: dict[str, Any],
 ) -> None:
     start, end = shard_bounds(shard)
+    host_id = host["host_id"]
+    cpu_residence_valid = (
+        (
+            host_id == "local-apple-aarch64-asimd"
+            and header.get("cpu_residence_method")
+            == (
+                "macos-user-interactive-qos-affinity-hint-super-class-"
+                "cpu-only-retry"
+            )
+            and header.get("affinity_request_status") in {0, 46}
+            and header.get("qos_class") == 0x21
+            and header.get("qos_request_status") == 0
+            and header.get("accepted_cpu_class") == "Super"
+            and header.get("accepted_cpu_ids") == list(MACOS_SUPER_CPUS)
+            and header.get("macos_performance_levels")
+            == MACOS_PERFORMANCE_LEVEL_RECEIPT
+            and header.get("logical_cpu") in MACOS_SUPER_CPUS
+            and header.get("maximum_cpu_only_retries_per_variant")
+            == MAXIMUM_CPU_ONLY_RETRIES
+        )
+        or (
+            host_id == "zstd-eval-c9g-neoverse-v3-aarch64-asimd"
+            and header.get("cpu_residence_method")
+            == "linux-sched-setaffinity-plus-samples"
+            and header.get("affinity_request_status") == 0
+            and header.get("qos_class") is None
+            and header.get("qos_request_status") is None
+            and header.get("accepted_cpu_class") == "exact-requested"
+            and header.get("accepted_cpu_ids")
+            == [header.get("logical_cpu")]
+            and header.get("macos_performance_levels") is None
+            and header.get("maximum_cpu_only_retries_per_variant") == 0
+        )
+    )
     require(
         isinstance(header, dict)
         and set(header) == HEADER_FIELDS
@@ -563,12 +676,20 @@ def validate_header(
         and header["shard_end"] == end
         and header["host_id"] == host["host_id"]
         and header["logical_cpu"] in host["allowed_logical_cpus"]
+        and cpu_residence_valid
         and header["runner_binary_sha256"]
         == host["runner_binary_sha256"]
         and header["runner_source_sha256"]
         == binding["runner_source_sha256"]
         and header["runner_identity_sha256"]
         == host["runner_identity_sha256"]
+        and header["source_archive_sha256"]
+        == binding["source_archive_sha256"]
+        and header["private_family_source_sha256"]
+        == binding["private_family_source_sha256"]
+        and header["compiler_identity"] == host["compiler_identity"]
+        and header["platform_manifest_identity"]
+        == host["manifest_identity"]
         and header["build_receipt_sha256"]
         == host["build_receipt_sha256"]
         and header["object_manifest_sha256"]
@@ -677,8 +798,187 @@ def validate_correctness(
     )
 
 
+def validate_cpu_attempts(
+    value: Any,
+    retries: Any,
+    host_id: str,
+    requested_cpu: int,
+    accepted_before: Any,
+    accepted_after: Any,
+    context: str,
+) -> None:
+    maximum_retries = (
+        MAXIMUM_CPU_ONLY_RETRIES
+        if host_id == "local-apple-aarch64-asimd"
+        else 0
+    )
+    require(
+        isinstance(value, list)
+        and 1 <= len(value) <= maximum_retries + 1
+        and retries == len(value) - 1,
+        f"{context}: CPU retry extent changed",
+    )
+    for ordinal, raw_attempt in enumerate(value):
+        require(
+            isinstance(raw_attempt, dict)
+            and set(raw_attempt) == CPU_ATTEMPT_FIELDS,
+            f"{context}: CPU attempt fields changed",
+        )
+        before = raw_attempt["cpu_before"]
+        after = raw_attempt["cpu_after"]
+        require(
+            raw_attempt["attempt"] == ordinal
+            and uint(before)
+            and uint(after),
+            f"{context}: CPU attempt framing changed",
+        )
+        if host_id == "local-apple-aarch64-asimd":
+            require(
+                before in (*MACOS_PERFORMANCE_CPUS, *MACOS_SUPER_CPUS)
+                and after in (*MACOS_PERFORMANCE_CPUS, *MACOS_SUPER_CPUS),
+                f"{context}: CPU endpoint is outside the authenticated machine",
+            )
+            accepted = (
+                before in MACOS_SUPER_CPUS and after in MACOS_SUPER_CPUS
+            )
+        else:
+            accepted = before == requested_cpu and after == requested_cpu
+        require(
+            raw_attempt["accepted"] is accepted
+            and accepted is (ordinal == len(value) - 1),
+            f"{context}: retry was not decided solely by CPU class",
+        )
+    last = value[-1]
+    require(
+        last["cpu_before"] == accepted_before
+        and last["cpu_after"] == accepted_after,
+        f"{context}: accepted endpoints differ from the attempt receipt",
+    )
+
+
+def scaled_iterations(pilot: dict[str, Any]) -> int:
+    numerator = (
+        CALIBRATION_TARGET_NS * pilot["iterations"]
+        + pilot["elapsed_ns"]
+        - 1
+    )
+    return min(
+        MAXIMUM_ITERATIONS,
+        max(1, numerator // pilot["elapsed_ns"]),
+    )
+
+
+def validate_calibration_pilots(
+    value: Any,
+    host_id: str,
+    requested_cpu: int,
+    context: str,
+) -> list[dict[str, Any]]:
+    require(
+        isinstance(value, list) and len(value) >= CALIBRATION_ANCHOR_SAMPLES,
+        f"{context}: calibration pilot set lacks frozen anchors",
+    )
+    pilots: list[dict[str, Any]] = []
+    expected_iterations = 1
+    anchor_start = len(value) - CALIBRATION_ANCHOR_SAMPLES
+    for ordinal, raw_pilot in enumerate(value):
+        require(
+            isinstance(raw_pilot, dict)
+            and set(raw_pilot) == CALIBRATION_PILOT_FIELDS,
+            f"{context} pilot {ordinal}: fields changed",
+        )
+        require(
+            raw_pilot["iterations"] == expected_iterations
+            and uint(raw_pilot["elapsed_ns"])
+            and raw_pilot["elapsed_ns"] > 0
+            and uint(raw_pilot["checksum"])
+            and uint(raw_pilot["cpu_before"])
+            and uint(raw_pilot["cpu_after"]),
+            f"{context} pilot {ordinal}: calibration receipt changed",
+        )
+        validate_cpu_attempts(
+            raw_pilot["cpu_attempts"],
+            raw_pilot["cpu_retries"],
+            host_id,
+            requested_cpu,
+            raw_pilot["cpu_before"],
+            raw_pilot["cpu_after"],
+            f"{context} pilot {ordinal}",
+        )
+        pilots.append(raw_pilot)
+        if ordinal < anchor_start:
+            require(
+                raw_pilot["elapsed_ns"] < CALIBRATION_FLOOR_NS
+                and raw_pilot["iterations"] < MAXIMUM_ITERATIONS,
+                f"{context} pilot {ordinal}: unnecessary pilot followed",
+            )
+            expected_iterations = min(
+                MAXIMUM_ITERATIONS,
+                raw_pilot["iterations"] * 4,
+            )
+        elif ordinal + 1 < len(value):
+            expected_iterations = raw_pilot["iterations"]
+    require(
+        pilots[anchor_start]["elapsed_ns"] >= CALIBRATION_FLOOR_NS
+        or pilots[anchor_start]["iterations"] == MAXIMUM_ITERATIONS,
+        f"{context}: calibration stopped before the frozen floor",
+    )
+    anchor_iterations = pilots[anchor_start]["iterations"]
+    require(
+        all(
+            pilot["iterations"] == anchor_iterations
+            for pilot in pilots[anchor_start:]
+        ),
+        f"{context}: calibration anchor iterations changed",
+    )
+    return pilots[anchor_start:]
+
+
+def validate_calibration(
+    value: Any,
+    host_id: str,
+    requested_cpu: int,
+    context: str,
+) -> int:
+    require(
+        isinstance(value, dict) and set(value) == CALIBRATION_FIELDS,
+        f"{context}: calibration fields changed",
+    )
+    require(
+        value["target_elapsed_ns"] == CALIBRATION_TARGET_NS
+        and value["floor_elapsed_ns"] == CALIBRATION_FLOOR_NS
+        and value["anchor_samples"] == CALIBRATION_ANCHOR_SAMPLES
+        and value["maximum_iterations"] == MAXIMUM_ITERATIONS,
+        f"{context}: calibration constants changed",
+    )
+    portable = validate_calibration_pilots(
+        value["portable_pilots"],
+        host_id,
+        requested_cpu,
+        f"{context} portable",
+    )
+    candidate = validate_calibration_pilots(
+        value["candidate_pilots"],
+        host_id,
+        requested_cpu,
+        f"{context} candidate",
+    )
+    selected = max(
+        *(scaled_iterations(pilot) for pilot in portable),
+        *(scaled_iterations(pilot) for pilot in candidate),
+    )
+    require(
+        value["selected_iterations"] == selected,
+        f"{context}: selected iterations changed",
+    )
+    return selected
+
+
 def validate_timing(
-    result: Any, row: dict[str, Any], logical_cpu: int
+    result: Any,
+    row: dict[str, Any],
+    logical_cpu: int,
+    host_id: str = "local-apple-aarch64-asimd",
 ) -> Fraction:
     common_row(result, row, TIMING_FIELDS)
     require(
@@ -690,6 +990,12 @@ def validate_timing(
         and isinstance(result["pairs"], list)
         and len(result["pairs"]) == REPETITIONS,
         f"case {row['ordinal']}: timing contract changed",
+    )
+    selected_iterations = validate_calibration(
+        result["calibration"],
+        host_id,
+        logical_cpu,
+        f"case {row['ordinal']} calibration",
     )
     ratios = []
     iterations = None
@@ -710,7 +1016,7 @@ def validate_timing(
             and uint(pair["portable_checksum"])
             and pair["portable_checksum"] == pair["candidate_checksum"]
             and all(
-                pair[field] == logical_cpu
+                uint(pair[field])
                 for field in (
                     "portable_cpu_before",
                     "portable_cpu_after",
@@ -719,6 +1025,24 @@ def validate_timing(
                 )
             ),
             f"case {row['ordinal']} pair {repetition}: measurement changed",
+        )
+        validate_cpu_attempts(
+            pair["portable_cpu_attempts"],
+            pair["portable_cpu_retries"],
+            host_id,
+            logical_cpu,
+            pair["portable_cpu_before"],
+            pair["portable_cpu_after"],
+            f"case {row['ordinal']} pair {repetition} portable",
+        )
+        validate_cpu_attempts(
+            pair["candidate_cpu_attempts"],
+            pair["candidate_cpu_retries"],
+            host_id,
+            logical_cpu,
+            pair["candidate_cpu_before"],
+            pair["candidate_cpu_after"],
+            f"case {row['ordinal']} pair {repetition} candidate",
         )
         if iterations is None:
             iterations = pair["iterations"]
@@ -735,6 +1059,10 @@ def validate_timing(
             )
         )
     ratios.sort()
+    require(
+        iterations == selected_iterations,
+        f"case {row['ordinal']}: calibrated iterations changed",
+    )
     return (ratios[2] + ratios[3]) / 2
 
 
@@ -772,7 +1100,12 @@ def parse_fragment(
             validate_correctness(result, row, header["logical_cpu"])
         else:
             ratios.append(
-                validate_timing(result, row, header["logical_cpu"])
+                validate_timing(
+                    result,
+                    row,
+                    header["logical_cpu"],
+                    header["host_id"],
+                )
             )
     _, trailer = canonical_line(stream, 64 * 1024, "fragment trailer")
     require(

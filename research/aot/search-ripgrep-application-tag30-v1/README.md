@@ -30,8 +30,11 @@ exact route proof are consumed before the analyzer opens timing:
 
 A fixture median sorts six alternating-order exact rational
 `candidate_elapsed_ns / portable_elapsed_ns` ratios and averages the middle
-two without pre-rounding. Each variant independently runs for at least 400 ms
-with the same iteration count, output checksum, and logical CPU. There is no
+two without pre-rounding. Each variant ramps to a 50 ms calibration floor,
+retains three same-iteration anchors, and the pair uses the largest
+target-rate projection across all six anchors. Each timed variant
+independently runs for at least 400 ms with the same iteration count and
+output checksum under its authenticated CPU-residence contract. There is no
 aggregate rescue and no result-derived exclusion.
 
 `projection-v1.jsonl` is a byte-exact derivation of the old source and fixture
@@ -47,7 +50,12 @@ private-family authorization identities. It deliberately remains unsealed:
 the application runner revision/source archive, compiler identity, platform
 manifest identities, and sealed build receipts are unresolved.
 `campaign-binding-template-v1.json` carries the same fail-closed state for
-analysis and pre-registers Apple CPUs 12–17 and C9g CPUs 40–55.
+analysis and pre-registers Apple Super-cluster worker labels 12–17 and
+disjoint C9g CPUs 64–79. On the authenticated M5 Max, Mach affinity status
+zero or `KERN_NOT_SUPPORTED` is accepted only after the exact machine and
+performance-level topology is authenticated. Every measured variant records
+bounded CPU-only retries and is accepted only when both sampled endpoints are
+in the Super class. Linux retains exact requested-CPU residence.
 
 The two pending campaign values are deliberately distinct. The private-family
 authorization identity is the raw discovery-authorization file SHA-256. The
@@ -59,8 +67,9 @@ The required sequence is:
 
 1. Merge this application runner on top of the final tag-30 campaign and
    renderer commits.
-2. Fill the application identity with the exact application runner revision
-   and source-archive identities.
+2. Fill the application identity with the exact application runner revision,
+   source-archive identity, compiler-source identity derived from both, and
+   the exact installed private-family source identity.
 3. Perform application object-only discovery on both targets, bind both
    emitted manifest identities, and rebuild from one exact source archive.
 4. Set `bindings_complete`,

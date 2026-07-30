@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 #![allow(
     clippy::arithmetic_side_effects,
     clippy::as_conversions,
@@ -42,7 +43,7 @@ mod generated {
 type DynError = Box<dyn Error>;
 
 const CONTRACT_SCHEMA: &str = "fre.aot.search-tag30-ripgrep-application-contract.v1";
-const CONTRACT_SHA256: &str = "c52132527ffa184c0efceb66f4b1eb4a4b19b964c48d58d989520b8a1a906da5";
+const CONTRACT_SHA256: &str = "121c44149d1b758fa5ac750aa524621669c92d23c4c095bab7f36bc767faa34b";
 const PROJECTION_SCHEMA: &str = "fre.aot.search-tag30-ripgrep-application-projection-row.v1";
 const PROJECTION_DOMAIN: &[u8] = b"FRE-SEARCH-TAG30-RIPGREP-APPLICATION-PROJECTION\0\x01";
 const PROJECTION_ROWS: usize = 154;
@@ -68,7 +69,8 @@ const SHARDS: usize = 16;
 const REPETITIONS: usize = 6;
 const MINIMUM_ELAPSED_NS: u64 = 400_000_000;
 const CALIBRATION_TARGET_NS: u64 = 500_000_000;
-const CALIBRATION_FLOOR_NS: u64 = 100_000;
+const CALIBRATION_FLOOR_NS: u64 = 50_000_000;
+const CALIBRATION_ANCHOR_SAMPLES: usize = 3;
 const MAXIMUM_ITERATIONS: usize = 1 << 30;
 const MAXIMUM_ROW_BYTES: usize = 32 * 1024;
 const MAXIMUM_PROJECTION_BYTES: u64 = 1 << 20;
@@ -77,6 +79,14 @@ const MAXIMUM_BUILD_RECEIPT_BYTES: u64 = 4 * 1024 * 1024;
 const MAXIMUM_FIXTURE_BYTES: u64 = 2 * 1024 * 1024;
 const CHECKSUM_SEED: u64 = 0x6a09_e667_f3bc_c909;
 const ALLOCATION_DOMAIN: &[u8] = b"FRE-SEARCH-TAG30-RIPGREP-APPLICATION-ALLOCATION\0\x01";
+#[cfg(target_os = "macos")]
+const MAXIMUM_CPU_ONLY_RETRIES: usize = 64;
+#[cfg(target_os = "macos")]
+const MACOS_PRE_VARIANT_WAIT_YIELDS: usize = 100_000;
+#[cfg(target_os = "macos")]
+const MACOS_SUPER_CPUS: [usize; 6] = [12, 13, 14, 15, 16, 17];
+#[cfg(target_os = "macos")]
+const MACOS_PERFORMANCE_CPUS: [usize; 12] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
 #[cfg(target_os = "macos")]
 const EXPECTED_HOST: &str = "local-apple-aarch64-asimd";
 #[cfg(target_os = "linux")]
@@ -176,12 +186,38 @@ impl CandidateView<'_> {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct CpuAttempt {
+    cpu_before: usize,
+    cpu_after: usize,
+    accepted: bool,
+}
+
+#[derive(Clone, Debug)]
 struct Measurement {
     iterations: usize,
     elapsed_ns: u64,
     checksum: u64,
     cpu_before: usize,
     cpu_after: usize,
+    cpu_attempts: Vec<CpuAttempt>,
+}
+
+#[derive(Clone, Debug)]
+struct CalibrationReceipt {
+    portable_pilots: Vec<Measurement>,
+    candidate_pilots: Vec<Measurement>,
+    selected_iterations: usize,
+}
+
+#[derive(Clone, Debug)]
+struct CpuResidenceReceipt {
+    method: &'static str,
+    affinity_request_status: i32,
+    qos_class: Option<u32>,
+    qos_request_status: Option<i32>,
+    accepted_cpu_class: &'static str,
+    accepted_cpu_ids: Vec<usize>,
+    macos_performance_levels: Option<Value>,
 }
 
 struct FragmentWriter {
@@ -295,6 +331,7 @@ fn run(
         "host ID does not match runner target",
     )?;
     require(shard < SHARDS, "shard ID is outside the frozen set")?;
+    validate_worker_cpu(cpu)?;
     if mode == Mode::Timing {
         require(
             generated::TIMING_PERMITTED,
@@ -302,7 +339,7 @@ fn run(
         )?;
     }
     let build_receipt_sha256 = authenticate_build_receipt(build_receipt)?;
-    pin_current_thread(cpu)?;
+    let cpu_residence = pin_current_thread(cpu)?;
     let (shard_start, shard_end) = shard_bounds(shard)?;
     let rows = load_projection_shard(projection, shard_start, shard_end)?;
     let header = json!({
@@ -319,9 +356,21 @@ fn run(
         "shard_end": shard_end,
         "host_id": host,
         "logical_cpu": cpu,
+        "cpu_residence_method": cpu_residence.method,
+        "affinity_request_status": cpu_residence.affinity_request_status,
+        "qos_class": cpu_residence.qos_class,
+        "qos_request_status": cpu_residence.qos_request_status,
+        "accepted_cpu_class": cpu_residence.accepted_cpu_class,
+        "accepted_cpu_ids": cpu_residence.accepted_cpu_ids,
+        "macos_performance_levels": cpu_residence.macos_performance_levels,
+        "maximum_cpu_only_retries_per_variant": maximum_cpu_only_retries(),
         "runner_binary_sha256": current_binary_sha256()?,
         "runner_source_sha256": generated::RUNNER_SOURCE_SHA256,
         "runner_identity_sha256": generated::IDENTITY_SHA256,
+        "source_archive_sha256": generated::SOURCE_ARCHIVE_SHA256,
+        "private_family_source_sha256": generated::PRIVATE_FAMILY_SOURCE_SHA256,
+        "compiler_identity": generated::COMPILER_IDENTITY,
+        "platform_manifest_identity": generated::PLATFORM_MANIFEST_IDENTITY,
         "build_receipt_sha256": build_receipt_sha256,
         "object_manifest_sha256": generated::OBJECT_CANDIDATE_MANIFEST_SHA256,
         "literal_dispositions_sha256": generated::LITERAL_DISPOSITIONS_SHA256,
@@ -520,25 +569,27 @@ fn timing_rows(
         let expected = row.expected_span;
         verify_pair(&engine.portable, &candidate, fixture.haystack(), expected)?;
         require_current_cpu(cpu)?;
-        let iterations =
+        let calibration =
             calibrated_iterations(&engine.portable, &candidate, fixture.haystack(), cpu)?;
+        let iterations = calibration.selected_iterations;
         let mut pairs = Vec::with_capacity(REPETITIONS);
         for repetition in 0..REPETITIONS {
             require_current_cpu(cpu)?;
             let (portable, candidate_measurement, order) = if repetition % 2 == 0 {
                 (
-                    measure_portable(&engine.portable, fixture.haystack(), iterations)?,
-                    measure_candidate(&candidate, fixture.haystack(), iterations)?,
+                    measure_portable(&engine.portable, fixture.haystack(), iterations, cpu)?,
+                    measure_candidate(&candidate, fixture.haystack(), iterations, cpu)?,
                     "portable-first",
                 )
             } else {
                 let candidate_measurement =
-                    measure_candidate(&candidate, fixture.haystack(), iterations)?;
-                let portable = measure_portable(&engine.portable, fixture.haystack(), iterations)?;
+                    measure_candidate(&candidate, fixture.haystack(), iterations, cpu)?;
+                let portable =
+                    measure_portable(&engine.portable, fixture.haystack(), iterations, cpu)?;
                 (portable, candidate_measurement, "candidate-first")
             };
-            require_measurement_cpu(portable, cpu)?;
-            require_measurement_cpu(candidate_measurement, cpu)?;
+            require_measurement_cpu(&portable, cpu)?;
+            require_measurement_cpu(&candidate_measurement, cpu)?;
             require(
                 portable.iterations == candidate_measurement.iterations
                     && portable.checksum == candidate_measurement.checksum,
@@ -559,8 +610,12 @@ fn timing_rows(
                 "candidate_checksum": candidate_measurement.checksum,
                 "portable_cpu_before": portable.cpu_before,
                 "portable_cpu_after": portable.cpu_after,
+                "portable_cpu_retries": portable.cpu_attempts.len() - 1,
+                "portable_cpu_attempts": cpu_attempt_receipts(&portable),
                 "candidate_cpu_before": candidate_measurement.cpu_before,
                 "candidate_cpu_after": candidate_measurement.cpu_after,
+                "candidate_cpu_retries": candidate_measurement.cpu_attempts.len() - 1,
+                "candidate_cpu_attempts": cpu_attempt_receipts(&candidate_measurement),
             }));
         }
         require_current_cpu(cpu)?;
@@ -579,6 +634,7 @@ fn timing_rows(
             "mapping": fixture.receipt,
             "logical_cpu": cpu,
             "minimum_elapsed_ns_each_variant": MINIMUM_ELAPSED_NS,
+            "calibration": calibration_receipt(&calibration),
             "pairs": pairs,
             "pass": true,
             "production_authority": false,
@@ -646,6 +702,16 @@ fn authenticate_build_receipt(path: &Path) -> Result<String, DynError> {
                 == Some(generated::IDENTITY_SHA256)
             && receipt.get("runner_source_sha256").and_then(Value::as_str)
                 == Some(generated::RUNNER_SOURCE_SHA256)
+            && receipt.get("source_archive_sha256").and_then(Value::as_str)
+                == Some(generated::SOURCE_ARCHIVE_SHA256)
+            && receipt
+                .get("private_family_source_sha256")
+                .and_then(Value::as_str)
+                == Some(generated::PRIVATE_FAMILY_SOURCE_SHA256)
+            && receipt.get("compiler_identity").and_then(Value::as_str)
+                == Some(generated::COMPILER_IDENTITY)
+            && receipt.get("manifest_identity").and_then(Value::as_str)
+                == Some(generated::PLATFORM_MANIFEST_IDENTITY)
             && receipt.get("backend_tag").and_then(Value::as_u64) == Some(30)
             && receipt.get("backend_name").and_then(Value::as_str) == Some("AsimdV17")
             && receipt.get("backend_version").and_then(Value::as_str) == Some("SEARCH_V17")
@@ -1134,52 +1200,78 @@ fn calibrated_iterations(
     candidate: &CandidateView<'_>,
     haystack: &[u8],
     cpu: usize,
-) -> Result<usize, DynError> {
-    let portable_pilot = pilot(
-        || measure_portable(portable, haystack, 1),
-        |iterations| measure_portable(portable, haystack, iterations),
-        cpu,
+) -> Result<CalibrationReceipt, DynError> {
+    let portable_pilots = pilot(
+        || measure_portable(portable, haystack, 1, cpu),
+        |iterations| measure_portable(portable, haystack, iterations, cpu),
     )?;
-    let candidate_pilot = pilot(
-        || measure_candidate(candidate, haystack, 1),
-        |iterations| measure_candidate(candidate, haystack, iterations),
-        cpu,
+    let candidate_pilots = pilot(
+        || measure_candidate(candidate, haystack, 1, cpu),
+        |iterations| measure_candidate(candidate, haystack, iterations, cpu),
     )?;
-    Ok(scaled_iterations(CALIBRATION_TARGET_NS, portable_pilot)?
-        .max(scaled_iterations(CALIBRATION_TARGET_NS, candidate_pilot)?))
+    for measurement in portable_pilots.iter().chain(&candidate_pilots) {
+        require_measurement_cpu(measurement, cpu)?;
+    }
+    let portable_iterations = scaled_anchor_iterations(CALIBRATION_TARGET_NS, &portable_pilots)?;
+    let candidate_iterations = scaled_anchor_iterations(CALIBRATION_TARGET_NS, &candidate_pilots)?;
+    Ok(CalibrationReceipt {
+        portable_pilots,
+        candidate_pilots,
+        selected_iterations: portable_iterations.max(candidate_iterations),
+    })
 }
 
 fn pilot(
     mut single: impl FnMut() -> Result<Measurement, DynError>,
     mut multiple: impl FnMut(usize) -> Result<Measurement, DynError>,
-    cpu: usize,
-) -> Result<Measurement, DynError> {
-    let one = single()?;
-    require_measurement_cpu(one, cpu)?;
-    if one.elapsed_ns >= CALIBRATION_FLOOR_NS {
-        return Ok(one);
+) -> Result<Vec<Measurement>, DynError> {
+    let mut result = single()?;
+    let mut results = vec![result.clone()];
+    let mut iterations = 1_usize;
+    while result.elapsed_ns < CALIBRATION_FLOOR_NS && iterations < MAXIMUM_ITERATIONS {
+        iterations = iterations
+            .checked_mul(4)
+            .unwrap_or(MAXIMUM_ITERATIONS)
+            .min(MAXIMUM_ITERATIONS);
+        result = multiple(iterations)?;
+        results.push(result.clone());
     }
-    let iterations = usize::try_from(
-        u128::from(CALIBRATION_FLOOR_NS)
-            .checked_add(u128::from(one.elapsed_ns.max(1)) - 1)
-            .ok_or_else(|| invalid("pilot ceil overflow"))?
-            / u128::from(one.elapsed_ns.max(1)),
-    )?
-    .clamp(2, 1 << 20);
-    let measured = multiple(iterations)?;
-    require_measurement_cpu(measured, cpu)?;
-    Ok(measured)
+    for _ in 1..CALIBRATION_ANCHOR_SAMPLES {
+        results.push(multiple(iterations)?);
+    }
+    Ok(results)
 }
 
-fn scaled_iterations(target_ns: u64, pilot: Measurement) -> Result<usize, io::Error> {
-    let elapsed = pilot.elapsed_ns.max(1);
+fn scaled_anchor_iterations(target_ns: u64, pilots: &[Measurement]) -> Result<usize, io::Error> {
+    require(
+        pilots.len() >= CALIBRATION_ANCHOR_SAMPLES,
+        "calibration lacks frozen anchor samples",
+    )?;
+    let anchors = &pilots[pilots.len() - CALIBRATION_ANCHOR_SAMPLES..];
+    let anchor_iterations = anchors[0].iterations;
+    require(
+        anchors
+            .iter()
+            .all(|measurement| measurement.iterations == anchor_iterations),
+        "calibration anchor iterations changed",
+    )?;
+    anchors
+        .iter()
+        .map(|measurement| scaled_iterations(target_ns, measurement))
+        .try_fold(1_usize, |selected, scaled| {
+            scaled.map(|iterations| selected.max(iterations))
+        })
+}
+
+fn scaled_iterations(target_ns: u64, pilot: &Measurement) -> Result<usize, io::Error> {
+    require(pilot.elapsed_ns > 0, "zero-duration pilot")?;
     let numerator = u128::from(target_ns)
         .checked_mul(
             u128::try_from(pilot.iterations).map_err(|_| invalid("pilot iterations overflow"))?,
         )
-        .and_then(|value| value.checked_add(u128::from(elapsed) - 1))
+        .and_then(|value| value.checked_add(u128::from(pilot.elapsed_ns) - 1))
         .ok_or_else(|| invalid("calibration overflow"))?;
-    let scaled = usize::try_from(numerator / u128::from(elapsed))
+    let scaled = usize::try_from(numerator / u128::from(pilot.elapsed_ns))
         .map_err(|_| invalid("calibrated iterations overflow"))?;
     Ok(scaled.clamp(1, MAXIMUM_ITERATIONS))
 }
@@ -1188,8 +1280,9 @@ fn measure_portable(
     portable: &PortableRegex,
     haystack: &[u8],
     iterations: usize,
+    cpu: usize,
 ) -> Result<Measurement, DynError> {
-    measure(iterations, || {
+    measure(iterations, cpu, || {
         Ok(portable
             .find_window(
                 black_box(haystack),
@@ -1204,43 +1297,117 @@ fn measure_candidate(
     candidate: &CandidateView<'_>,
     haystack: &[u8],
     iterations: usize,
+    cpu: usize,
 ) -> Result<Measurement, DynError> {
-    measure(iterations, || candidate.find(black_box(haystack)))
+    measure(iterations, cpu, || candidate.find(black_box(haystack)))
 }
 
 fn measure(
     iterations: usize,
+    cpu: usize,
     mut invoke: impl FnMut() -> Result<Option<Match>, DynError>,
 ) -> Result<Measurement, DynError> {
-    let cpu_before = current_cpu()?;
-    let start = Instant::now();
-    let mut checksum = CHECKSUM_SEED;
-    for ordinal in 0..iterations {
-        checksum = mix(
-            checksum,
-            encode(black_box(invoke()?)) ^ u64::try_from(ordinal).unwrap_or(u64::MAX),
-        );
+    let maximum_retries = maximum_cpu_only_retries();
+    let mut attempts = Vec::with_capacity(maximum_retries + 1);
+    for _ in 0..=maximum_retries {
+        wait_for_measurement_cpu(cpu)?;
+        let cpu_before = current_cpu()?;
+        let start = Instant::now();
+        let mut checksum = CHECKSUM_SEED;
+        for ordinal in 0..iterations {
+            checksum = mix(
+                checksum,
+                encode(black_box(invoke()?)) ^ u64::try_from(ordinal).unwrap_or(u64::MAX),
+            );
+        }
+        let elapsed_ns = u64::try_from(start.elapsed().as_nanos())?;
+        let cpu_after = current_cpu()?;
+        let accepted = measurement_cpu_accepted(cpu_before, cpu_after, cpu);
+        attempts.push(CpuAttempt {
+            cpu_before,
+            cpu_after,
+            accepted,
+        });
+        if accepted {
+            return Ok(Measurement {
+                iterations,
+                elapsed_ns,
+                checksum: black_box(checksum),
+                cpu_before,
+                cpu_after,
+                cpu_attempts: attempts,
+            });
+        }
     }
-    let elapsed_ns = u64::try_from(start.elapsed().as_nanos())?;
-    let cpu_after = current_cpu()?;
-    Ok(Measurement {
-        iterations,
-        elapsed_ns,
-        checksum: black_box(checksum),
-        cpu_before,
-        cpu_after,
-    })
+    Err(invalid("measured variant exhausted the frozen CPU-only retry bound").into())
 }
 
-fn require_measurement_cpu(measurement: Measurement, expected: usize) -> Result<(), io::Error> {
+fn require_measurement_cpu(measurement: &Measurement, expected: usize) -> Result<(), io::Error> {
     require(
-        measurement.cpu_before == expected && measurement.cpu_after == expected,
-        "worker migrated during a measured variant",
+        !measurement.cpu_attempts.is_empty()
+            && measurement.cpu_attempts.len() <= maximum_cpu_only_retries() + 1
+            && measurement
+                .cpu_attempts
+                .last()
+                .is_some_and(|attempt| attempt.accepted)
+            && measurement.cpu_attempts[..measurement.cpu_attempts.len() - 1]
+                .iter()
+                .all(|attempt| !attempt.accepted)
+            && measurement_cpu_accepted(measurement.cpu_before, measurement.cpu_after, expected),
+        "measured variant CPU receipt changed",
     )
 }
 
+fn cpu_attempt_receipts(measurement: &Measurement) -> Vec<Value> {
+    measurement
+        .cpu_attempts
+        .iter()
+        .enumerate()
+        .map(|(attempt, receipt)| {
+            json!({
+                "attempt": attempt,
+                "cpu_before": receipt.cpu_before,
+                "cpu_after": receipt.cpu_after,
+                "accepted": receipt.accepted,
+            })
+        })
+        .collect()
+}
+
+fn calibration_measurement_receipt(measurement: &Measurement) -> Value {
+    json!({
+        "iterations": measurement.iterations,
+        "elapsed_ns": measurement.elapsed_ns,
+        "checksum": measurement.checksum,
+        "cpu_before": measurement.cpu_before,
+        "cpu_after": measurement.cpu_after,
+        "cpu_retries": measurement.cpu_attempts.len() - 1,
+        "cpu_attempts": cpu_attempt_receipts(measurement),
+    })
+}
+
+fn calibration_receipt(calibration: &CalibrationReceipt) -> Value {
+    json!({
+        "target_elapsed_ns": CALIBRATION_TARGET_NS,
+        "floor_elapsed_ns": CALIBRATION_FLOOR_NS,
+        "anchor_samples": CALIBRATION_ANCHOR_SAMPLES,
+        "maximum_iterations": MAXIMUM_ITERATIONS,
+        "selected_iterations": calibration.selected_iterations,
+        "portable_pilots": calibration
+            .portable_pilots
+            .iter()
+            .map(calibration_measurement_receipt)
+            .collect::<Vec<_>>(),
+        "candidate_pilots": calibration
+            .candidate_pilots
+            .iter()
+            .map(calibration_measurement_receipt)
+            .collect::<Vec<_>>(),
+    })
+}
+
 #[cfg(target_os = "linux")]
-fn pin_current_thread(cpu: usize) -> Result<(), io::Error> {
+fn pin_current_thread(cpu: usize) -> Result<CpuResidenceReceipt, io::Error> {
     require(
         cpu < libc::CPU_SETSIZE as usize,
         "logical CPU is out of range",
@@ -1263,19 +1430,42 @@ fn pin_current_thread(cpu: usize) -> Result<(), io::Error> {
     {
         return Err(io::Error::last_os_error());
     }
-    require_current_cpu(cpu)
+    require_current_cpu(cpu)?;
+    Ok(CpuResidenceReceipt {
+        method: "linux-sched-setaffinity-plus-samples",
+        affinity_request_status: 0,
+        qos_class: None,
+        qos_request_status: None,
+        accepted_cpu_class: "exact-requested",
+        accepted_cpu_ids: vec![cpu],
+        macos_performance_levels: None,
+    })
 }
 
 #[cfg(target_os = "macos")]
-fn pin_current_thread(cpu: usize) -> Result<(), io::Error> {
+fn pin_current_thread(cpu: usize) -> Result<CpuResidenceReceipt, io::Error> {
     #[repr(C)]
     struct ThreadAffinityPolicy {
         affinity_tag: i32,
     }
     const THREAD_AFFINITY_POLICY: i32 = 4;
+    const QOS_CLASS_USER_INTERACTIVE_RAW: u32 = 0x21;
     unsafe extern "C" {
         fn mach_thread_self() -> u32;
         fn thread_policy_set(thread: u32, flavor: i32, policy_info: *const i32, count: u32) -> i32;
+    }
+    authenticate_macos_performance_levels()?;
+    require(
+        MACOS_SUPER_CPUS.contains(&cpu),
+        "macOS worker label is outside the frozen Super set",
+    )?;
+    // SAFETY: the QoS class is a declared libc enum value and zero is the
+    // documented relative priority for this class.
+    let qos_status = unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0)
+    };
+    if qos_status != 0 {
+        return Err(io::Error::from_raw_os_error(qos_status));
     }
     let affinity_tag = i32::try_from(
         cpu.checked_add(1)
@@ -1292,19 +1482,163 @@ fn pin_current_thread(cpu: usize) -> Result<(), io::Error> {
             1,
         )
     };
-    require(status == 0, "failed to install macOS affinity")?;
-    for _ in 0..100_000 {
-        if current_cpu()? == cpu {
-            return Ok(());
-        }
-        std::thread::yield_now();
+    if !matches!(status, 0 | 46) {
+        return Err(invalid(format!(
+            "failed to install macOS thread affinity: Mach status {status}"
+        )));
     }
-    Err(invalid("worker did not reach requested macOS CPU"))
+    wait_for_measurement_cpu(cpu)?;
+    Ok(CpuResidenceReceipt {
+        method: "macos-user-interactive-qos-affinity-hint-super-class-cpu-only-retry",
+        affinity_request_status: status,
+        qos_class: Some(QOS_CLASS_USER_INTERACTIVE_RAW),
+        qos_request_status: Some(qos_status),
+        accepted_cpu_class: "Super",
+        accepted_cpu_ids: MACOS_SUPER_CPUS.to_vec(),
+        macos_performance_levels: Some(macos_performance_level_receipt()),
+    })
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn pin_current_thread(_cpu: usize) -> Result<(), io::Error> {
+fn pin_current_thread(_cpu: usize) -> Result<CpuResidenceReceipt, io::Error> {
     Err(invalid("application runner requires Linux or macOS"))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_sysctl_bytes(name: &'static [u8]) -> Result<Vec<u8>, io::Error> {
+    require(
+        name.last() == Some(&0),
+        "macOS sysctl name is not NUL terminated",
+    )?;
+    let mut length = 0_usize;
+    // SAFETY: name is NUL terminated; the first call requests the exact size.
+    if unsafe {
+        libc::sysctlbyname(
+            name.as_ptr().cast(),
+            std::ptr::null_mut(),
+            std::ptr::from_mut(&mut length),
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    require(
+        (1..=1 << 20).contains(&length),
+        "macOS sysctl value has an invalid extent",
+    )?;
+    let mut bytes = vec![0_u8; length];
+    // SAFETY: bytes has the exact extent returned by the size query.
+    if unsafe {
+        libc::sysctlbyname(
+            name.as_ptr().cast(),
+            bytes.as_mut_ptr().cast(),
+            std::ptr::from_mut(&mut length),
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    bytes.truncate(length);
+    Ok(bytes)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_sysctl_string(name: &'static [u8]) -> Result<String, io::Error> {
+    let mut bytes = macos_sysctl_bytes(name)?;
+    require(
+        bytes.last() == Some(&0),
+        "macOS string sysctl lacks NUL termination",
+    )?;
+    bytes.pop();
+    String::from_utf8(bytes).map_err(|_| invalid("macOS string sysctl is not UTF-8"))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_sysctl_u64(name: &'static [u8]) -> Result<u64, io::Error> {
+    let bytes = macos_sysctl_bytes(name)?;
+    match bytes.len() {
+        4 => Ok(u64::from(u32::from_ne_bytes(
+            bytes.as_slice().try_into().expect("four-byte sysctl value"),
+        ))),
+        8 => Ok(u64::from_ne_bytes(
+            bytes
+                .as_slice()
+                .try_into()
+                .expect("eight-byte sysctl value"),
+        )),
+        _ => Err(invalid("macOS integer sysctl has an unexpected width")),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn authenticate_macos_performance_levels() -> Result<(), io::Error> {
+    let exact_strings = [
+        (b"machdep.cpu.brand_string\0".as_slice(), "Apple M5 Max"),
+        (b"hw.model\0".as_slice(), "Mac17,7"),
+        (b"hw.perflevel0.name\0".as_slice(), "Super"),
+        (b"hw.perflevel1.name\0".as_slice(), "Performance"),
+    ];
+    for (name, expected) in exact_strings {
+        require(
+            macos_sysctl_string(name)? == expected,
+            "macOS machine or performance-level name changed",
+        )?;
+    }
+    let exact_integers = [
+        (b"hw.nperflevels\0".as_slice(), 2),
+        (b"hw.perflevel0.physicalcpu\0".as_slice(), 6),
+        (b"hw.perflevel0.logicalcpu\0".as_slice(), 6),
+        (b"hw.perflevel0.cpusperl2\0".as_slice(), 6),
+        (b"hw.perflevel0.l1dcachesize\0".as_slice(), 131_072),
+        (b"hw.perflevel0.l2cachesize\0".as_slice(), 16_777_216),
+        (b"hw.perflevel1.physicalcpu\0".as_slice(), 12),
+        (b"hw.perflevel1.logicalcpu\0".as_slice(), 12),
+        (b"hw.perflevel1.cpusperl2\0".as_slice(), 6),
+        (b"hw.perflevel1.l1dcachesize\0".as_slice(), 65_536),
+        (b"hw.perflevel1.l2cachesize\0".as_slice(), 8_388_608),
+    ];
+    for (name, expected) in exact_integers {
+        require(
+            macos_sysctl_u64(name)? == expected,
+            "macOS performance-level tuple changed",
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_performance_level_receipt() -> Value {
+    json!({
+        "machine_model": "Mac17,7",
+        "chip": "Apple M5 Max",
+        "mapping_authority": "ioreg-cluster-type-logical-cluster-plus-sysctl",
+        "levels": [
+            {
+                "index": 0,
+                "name": "Super",
+                "physical_cpus": 6,
+                "logical_cpus": 6,
+                "cpus_per_l2": 6,
+                "l1_data_cache_bytes": 131_072,
+                "l2_cache_bytes": 16_777_216,
+                "logical_cpu_ids": MACOS_SUPER_CPUS,
+            },
+            {
+                "index": 1,
+                "name": "Performance",
+                "physical_cpus": 12,
+                "logical_cpus": 12,
+                "cpus_per_l2": 6,
+                "l1_data_cache_bytes": 65_536,
+                "l2_cache_bytes": 8_388_608,
+                "logical_cpu_ids": MACOS_PERFORMANCE_CPUS,
+            },
+        ],
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -1334,11 +1668,87 @@ fn current_cpu() -> Result<usize, io::Error> {
     Err(invalid("application runner requires Linux or macOS"))
 }
 
-fn require_current_cpu(expected: usize) -> Result<(), io::Error> {
+#[cfg(target_os = "linux")]
+const fn measurement_cpu_accepted(cpu_before: usize, cpu_after: usize, expected: usize) -> bool {
+    cpu_before == expected && cpu_after == expected
+}
+
+#[cfg(target_os = "macos")]
+fn measurement_cpu_accepted(cpu_before: usize, cpu_after: usize, expected: usize) -> bool {
+    MACOS_SUPER_CPUS.contains(&expected)
+        && MACOS_SUPER_CPUS.contains(&cpu_before)
+        && MACOS_SUPER_CPUS.contains(&cpu_after)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const fn measurement_cpu_accepted(_cpu_before: usize, _cpu_after: usize, _expected: usize) -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+const fn maximum_cpu_only_retries() -> usize {
+    MAXIMUM_CPU_ONLY_RETRIES
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn maximum_cpu_only_retries() -> usize {
+    0
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_measurement_cpu(expected: usize) -> Result<(), io::Error> {
+    require_current_cpu(expected)
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_measurement_cpu(expected: usize) -> Result<(), io::Error> {
     require(
-        current_cpu()? == expected,
-        "worker is not on its requested CPU",
+        MACOS_SUPER_CPUS.contains(&expected),
+        "macOS worker label is outside the frozen Super set",
+    )?;
+    for _ in 0..MACOS_PRE_VARIANT_WAIT_YIELDS {
+        if MACOS_SUPER_CPUS.contains(&current_cpu()?) {
+            return Ok(());
+        }
+        std::thread::yield_now();
+    }
+    Err(invalid(
+        "worker did not reach the authenticated macOS Super class",
+    ))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn wait_for_measurement_cpu(_expected: usize) -> Result<(), io::Error> {
+    Err(invalid("application runner requires Linux or macOS"))
+}
+
+fn require_current_cpu(expected: usize) -> Result<(), io::Error> {
+    let actual = current_cpu()?;
+    require(
+        measurement_cpu_accepted(actual, actual, expected),
+        "worker is outside its authenticated CPU residence",
     )
+}
+
+#[cfg(target_os = "linux")]
+fn validate_worker_cpu(cpu: usize) -> Result<(), io::Error> {
+    require(
+        (64..80).contains(&cpu),
+        "Linux worker CPU is outside the frozen disjoint set",
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn validate_worker_cpu(cpu: usize) -> Result<(), io::Error> {
+    require(
+        MACOS_SUPER_CPUS.contains(&cpu),
+        "macOS worker label is outside the frozen Super set",
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn validate_worker_cpu(_cpu: usize) -> Result<(), io::Error> {
+    Err(invalid("application runner requires Linux or macOS"))
 }
 
 fn current_binary_sha256() -> Result<String, DynError> {
@@ -1513,6 +1923,41 @@ mod tests {
     fn scalar_oracle_is_nonoverlapping() {
         assert_eq!(scalar_nonoverlapping(b"aaaaa", b"aa"), (Some([0, 2]), 2));
         assert_eq!(scalar_nonoverlapping(b"xxxxx", b"aa"), (None, 0));
+    }
+
+    #[test]
+    fn calibration_selects_fastest_anchor_rate() {
+        let measurement = |elapsed_ns| Measurement {
+            iterations: 1,
+            elapsed_ns,
+            checksum: 0,
+            cpu_before: 0,
+            cpu_after: 0,
+            cpu_attempts: vec![CpuAttempt {
+                cpu_before: 0,
+                cpu_after: 0,
+                accepted: true,
+            }],
+        };
+        let anchors = [
+            measurement(60_000_000),
+            measurement(50_000_000),
+            measurement(70_000_000),
+        ];
+        assert_eq!(
+            scaled_anchor_iterations(CALIBRATION_TARGET_NS, &anchors).unwrap(),
+            10,
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_measurement_acceptance_is_super_class_only() {
+        assert!(measurement_cpu_accepted(12, 17, 12));
+        assert!(measurement_cpu_accepted(17, 12, 17));
+        assert!(!measurement_cpu_accepted(0, 12, 12));
+        assert!(!measurement_cpu_accepted(12, 0, 12));
+        assert!(!measurement_cpu_accepted(12, 17, 0));
     }
 
     #[test]

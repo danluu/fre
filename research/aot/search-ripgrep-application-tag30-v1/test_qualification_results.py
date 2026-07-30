@@ -9,6 +9,7 @@ import importlib.util
 import json
 import sys
 import tempfile
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -57,7 +58,11 @@ def binding_payload(analyzer: Any) -> dict[str, Any]:
                 "canonical_host": expected["canonical_host"],
                 "target_triple": expected["target_triple"],
                 "features": expected["features"],
-                "allowed_logical_cpus": [6 + index * 34],
+                "allowed_logical_cpus": (
+                    list(analyzer.MACOS_SUPER_CPUS)
+                    if index == 0
+                    else list(range(64, 80))
+                ),
                 "runner_binary_sha256": identity(f"binary:{index}"),
                 "runner_identity_sha256": identity(f"identity:{index}"),
                 "build_receipt_sha256": identity(f"build:{index}"),
@@ -84,6 +89,7 @@ def binding_payload(analyzer: Any) -> dict[str, Any]:
         "runner_source_commit": identity("revision")[:40],
         "runner_source_sha256": identity("runner-source"),
         "source_archive_sha256": identity("source-archive"),
+        "private_family_source_sha256": identity("private-source"),
         "hosts": hosts,
         "timing_sealed": True,
         "bindings_complete": True,
@@ -105,6 +111,7 @@ def header(
     shard: int,
 ) -> dict[str, Any]:
     start, end = analyzer.shard_bounds(shard)
+    macos = host["host_id"] == "local-apple-aarch64-asimd"
     return {
         "schema": analyzer.FRAGMENT_HEADER_SCHEMA,
         "mode": mode,
@@ -123,9 +130,38 @@ def header(
         "shard_end": end,
         "host_id": host["host_id"],
         "logical_cpu": host["allowed_logical_cpus"][0],
+        "cpu_residence_method": (
+            "macos-user-interactive-qos-affinity-hint-super-class-"
+            "cpu-only-retry"
+            if macos
+            else "linux-sched-setaffinity-plus-samples"
+        ),
+        "affinity_request_status": 46 if macos else 0,
+        "qos_class": 0x21 if macos else None,
+        "qos_request_status": 0 if macos else None,
+        "accepted_cpu_class": "Super" if macos else "exact-requested",
+        "accepted_cpu_ids": (
+            list(analyzer.MACOS_SUPER_CPUS)
+            if macos
+            else [host["allowed_logical_cpus"][0]]
+        ),
+        "macos_performance_levels": (
+            analyzer.MACOS_PERFORMANCE_LEVEL_RECEIPT
+            if macos
+            else None
+        ),
+        "maximum_cpu_only_retries_per_variant": (
+            analyzer.MAXIMUM_CPU_ONLY_RETRIES if macos else 0
+        ),
         "runner_binary_sha256": host["runner_binary_sha256"],
         "runner_source_sha256": binding["runner_source_sha256"],
         "runner_identity_sha256": host["runner_identity_sha256"],
+        "source_archive_sha256": binding["source_archive_sha256"],
+        "private_family_source_sha256": (
+            binding["private_family_source_sha256"]
+        ),
+        "compiler_identity": host["compiler_identity"],
+        "platform_manifest_identity": host["manifest_identity"],
         "build_receipt_sha256": host["build_receipt_sha256"],
         "object_manifest_sha256": analyzer.OBJECT_MANIFEST_SHA256,
         "literal_dispositions_sha256": analyzer.DISPOSITIONS_SHA256,
@@ -233,6 +269,22 @@ def timing_row(
             else 1_000_000_000
         )
     checksum = row["ordinal"] + 17
+    anchor = {
+        "iterations": 1,
+        "elapsed_ns": 60_000_000,
+        "checksum": checksum,
+        "cpu_before": cpu,
+        "cpu_after": cpu,
+        "cpu_retries": 0,
+        "cpu_attempts": [
+            {
+                "attempt": 0,
+                "cpu_before": cpu,
+                "cpu_after": cpu,
+                "accepted": True,
+            }
+        ],
+    }
     pairs = [
         {
             "repetition": repetition,
@@ -248,8 +300,26 @@ def timing_row(
             "candidate_checksum": checksum,
             "portable_cpu_before": cpu,
             "portable_cpu_after": cpu,
+            "portable_cpu_retries": 0,
+            "portable_cpu_attempts": [
+                {
+                    "attempt": 0,
+                    "cpu_before": cpu,
+                    "cpu_after": cpu,
+                    "accepted": True,
+                }
+            ],
             "candidate_cpu_before": cpu,
             "candidate_cpu_after": cpu,
+            "candidate_cpu_retries": 0,
+            "candidate_cpu_attempts": [
+                {
+                    "attempt": 0,
+                    "cpu_before": cpu,
+                    "cpu_after": cpu,
+                    "accepted": True,
+                }
+            ],
         }
         for repetition in range(analyzer.REPETITIONS)
     ]
@@ -259,6 +329,21 @@ def timing_row(
         "mapping": mapping(analyzer, row, salt),
         "logical_cpu": cpu,
         "minimum_elapsed_ns_each_variant": analyzer.MINIMUM_NS,
+        "calibration": {
+            "target_elapsed_ns": analyzer.CALIBRATION_TARGET_NS,
+            "floor_elapsed_ns": analyzer.CALIBRATION_FLOOR_NS,
+            "anchor_samples": analyzer.CALIBRATION_ANCHOR_SAMPLES,
+            "maximum_iterations": analyzer.MAXIMUM_ITERATIONS,
+            "selected_iterations": 9,
+            "portable_pilots": [
+                copy.deepcopy(anchor)
+                for _ in range(analyzer.CALIBRATION_ANCHOR_SAMPLES)
+            ],
+            "candidate_pilots": [
+                copy.deepcopy(anchor)
+                for _ in range(analyzer.CALIBRATION_ANCHOR_SAMPLES)
+            ],
+        },
         "pairs": pairs,
         "pass": True,
         "production_authority": False,
@@ -405,6 +490,34 @@ def run(repo: Path, ripgrep_root: Path, fixture_root: Path) -> None:
                 analyzer.analyzer_source_sha256(),
             ),
         )
+        wrong_cpus = copy.deepcopy(binding)
+        wrong_cpus["hosts"][1]["allowed_logical_cpus"] = list(
+            range(65, 81)
+        )
+        wrong_cpus_path = root / "wrong-cpus.json"
+        wrong_cpus_root = envelope(
+            analyzer,
+            analyzer.BINDING_SCHEMA,
+            wrong_cpus,
+        )
+        wrong_cpus_path.write_bytes(
+            json.dumps(
+                wrong_cpus_root,
+                sort_keys=True,
+                indent=2,
+            ).encode("ascii")
+            + b"\n"
+        )
+        expect_refusal(
+            "non-disjoint Linux CPU binding",
+            lambda: analyzer.load_binding(
+                wrong_cpus_path,
+                hashlib.sha256(
+                    wrong_cpus_path.read_bytes()
+                ).hexdigest(),
+                analyzer.analyzer_source_sha256(),
+            ),
+        )
 
         static = next(
             row
@@ -429,6 +542,47 @@ def run(repo: Path, ripgrep_root: Path, fixture_root: Path) -> None:
             analyzer.validate_timing(strict_boundary, static, cpu)
             == analyzer.STATIC_GATE,
             "strict boundary construction changed",
+        )
+        retried = timing_row(analyzer, static, cpu, 90_000)
+        retried_pair = retried["pairs"][0]
+        retried_pair["portable_cpu_before"] = 13
+        retried_pair["portable_cpu_after"] = 17
+        retried_pair["portable_cpu_retries"] = 1
+        retried_pair["portable_cpu_attempts"] = [
+            {
+                "attempt": 0,
+                "cpu_before": 0,
+                "cpu_after": 1,
+                "accepted": False,
+            },
+            {
+                "attempt": 1,
+                "cpu_before": 13,
+                "cpu_after": 17,
+                "accepted": True,
+            },
+        ]
+        require(
+            analyzer.validate_timing(retried, static, cpu)
+            == Fraction(7, 10),
+            "authenticated Super-only retry was not accepted",
+        )
+        ignored_fast_anchor = timing_row(
+            analyzer,
+            static,
+            cpu,
+            90_000,
+        )
+        ignored_fast_anchor["calibration"]["candidate_pilots"][1][
+            "elapsed_ns"
+        ] = analyzer.CALIBRATION_FLOOR_NS
+        expect_refusal(
+            "ignored fastest calibration anchor",
+            lambda: analyzer.validate_timing(
+                ignored_fast_anchor,
+                static,
+                cpu,
+            ),
         )
         require(
             not (
@@ -473,9 +627,11 @@ def run(repo: Path, ripgrep_root: Path, fixture_root: Path) -> None:
             ),
         )
         migrated = timing_row(analyzer, static, cpu, 90_006)
-        migrated["pairs"][3]["candidate_cpu_after"] = cpu + 1
+        migrated_pair = migrated["pairs"][3]
+        migrated_pair["candidate_cpu_after"] = 0
+        migrated_pair["candidate_cpu_attempts"][0]["cpu_after"] = 0
         expect_refusal(
-            "CPU migration",
+            "CPU class migration",
             lambda: analyzer.validate_timing(migrated, static, cpu),
         )
         unequal_work = timing_row(analyzer, static, cpu, 90_007)
@@ -532,10 +688,28 @@ def run(repo: Path, ripgrep_root: Path, fixture_root: Path) -> None:
                 binding,
             ),
         )
+        wrong_affinity = header(
+            analyzer,
+            binding,
+            binding["hosts"][0],
+            "timing",
+            0,
+        )
+        wrong_affinity["affinity_request_status"] = 47
+        expect_refusal(
+            "unrecognized Mach affinity status",
+            lambda: analyzer.validate_header(
+                wrong_affinity,
+                "timing",
+                0,
+                binding["hosts"][0],
+                binding,
+            ),
+        )
 
     print(
         "search-tag30-application-tests: PASS "
-        "baseline=1 adversarial=12 candidates=11 fixtures=154 "
+        "baseline=1 adversarial=15 cpu_retry=1 candidates=11 fixtures=154 "
         "rebar_inputs=0 heldout_materialized=false"
     )
 

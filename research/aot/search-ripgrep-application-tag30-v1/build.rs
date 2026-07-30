@@ -27,6 +27,7 @@ use sha2::{Digest, Sha256};
 const BINARY: &str = "fre-search-tag30-ripgrep-application-runner";
 const IDENTITY_ENV: &str = "FRE_SEARCH_TAG30_APPLICATION_IDENTITY";
 const REVISION_ENV: &str = "FRE_SEARCH_TAG30_APPLICATION_RUNNER_REVISION";
+const SOURCE_ARCHIVE_ENV: &str = "FRE_SEARCH_TAG30_APPLICATION_SOURCE_ARCHIVE_SHA256";
 const UNSEALED_ENV: &str = "FRE_SEARCH_TAG30_APPLICATION_ALLOW_UNSEALED_ARTIFACT_BUILD";
 const CANDIDATE_MANIFEST_ENV: &str = "FRE_SEARCH_TAG30_APPLICATION_OBJECT_CANDIDATES";
 const LITERAL_DISPOSITIONS_ENV: &str = "FRE_SEARCH_TAG30_APPLICATION_LITERAL_DISPOSITIONS";
@@ -44,6 +45,9 @@ const GLUE_SYMBOL_PREFIX: &str = "fre_aot_search_span_glue_v1_";
 const LITERAL_DISPOSITIONS_SCHEMA: &str =
     "fre.aot.search-tag30-application-literal-dispositions.v1";
 const REFUSAL_RECEIPT_SCHEMA: &str = "fre.aot.search-tag30-structural-refusal-compile-receipt.v1";
+const PRIVATE_FAMILY_SOURCE: &str =
+    "../../../crates/fre-aot-static-runtime/src/search_support/private_rows.rs";
+const COMPILER_IDENTITY_DOMAIN: &[u8] = b"FRE-SEARCH-TAG30-COMPILER-SOURCE-IDENTITY\0\x01";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Candidate {
@@ -109,10 +113,12 @@ struct StagedRefusal {
 fn main() {
     println!("cargo:rerun-if-env-changed={IDENTITY_ENV}");
     println!("cargo:rerun-if-env-changed={REVISION_ENV}");
+    println!("cargo:rerun-if-env-changed={SOURCE_ARCHIVE_ENV}");
     println!("cargo:rerun-if-env-changed={UNSEALED_ENV}");
     println!("cargo:rerun-if-env-changed={CANDIDATE_MANIFEST_ENV}");
     println!("cargo:rerun-if-env-changed={LITERAL_DISPOSITIONS_ENV}");
     println!("cargo:rerun-if-changed=runner-source-files.txt");
+    println!("cargo:rerun-if-changed={PRIVATE_FAMILY_SOURCE}");
     for source in source_manifest().expect("runner source manifest") {
         println!("cargo:rerun-if-changed={source}");
     }
@@ -189,12 +195,19 @@ fn main() {
         &identity,
         &["auto_routing", "private_family_authorization_identity"],
     );
+    let expected_private_family_source_sha256 =
+        path_str(&identity, &["private_family", "source_sha256"]);
+    let private_family_source = regular_file(Path::new(PRIVATE_FAMILY_SOURCE), 1 << 18)
+        .expect("bounded private family source");
+    let private_family_source_sha256 = hex(&sha256(&private_family_source));
     let application_contract_identity = path_str(&identity, &["application", "contract_sha256"]);
     require(
         is_hex(plan_identity, 64)
             && is_hex(analyzer_identity, 64)
             && is_hex(evidence_identity, 64)
             && is_hex(private_authorization_identity, 64)
+            && is_hex(expected_private_family_source_sha256, 64)
+            && expected_private_family_source_sha256 == private_family_source_sha256
             && is_hex(application_contract_identity, 64),
         "automatic routing qualification identity is malformed",
     );
@@ -264,6 +277,17 @@ fn main() {
         .pointer("/state/development_timing_permitted")
         .and_then(Value::as_bool)
         .expect("development timing state");
+    if timing_permitted {
+        let private_source_text =
+            std::str::from_utf8(&private_family_source).expect("private family source UTF-8");
+        require(
+            private_source_text
+                .matches("SourceQualifiedStaticSearchSpanFamilyV1::private_qualification(")
+                .count()
+                == 2,
+            "timing-sealed build lacks both target-conditional private family rows",
+        );
+    }
     require(
         identity
             .pointer("/state/heldout_materialized")
@@ -320,6 +344,16 @@ fn main() {
     } else {
         require(unsealed, "sealed build lacks runner source-set identity");
     }
+    let source_archive_sha256 =
+        env::var(SOURCE_ARCHIVE_ENV).expect("application source archive SHA-256");
+    require(
+        is_hex(&source_archive_sha256, 64)
+            && identity
+                .pointer("/runner/source_archive_sha256")
+                .and_then(Value::as_str)
+                == Some(source_archive_sha256.as_str()),
+        "application source archive identity differs",
+    );
 
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").expect("target arch");
     let target_os = env::var("CARGO_CFG_TARGET_OS").expect("target OS");
@@ -331,10 +365,13 @@ fn main() {
 
     let compiler_identity = identity
         .pointer("/static_pipeline/compiler_identity")
-        .and_then(Value::as_str);
-    if compiler_identity.is_none() {
-        require(unsealed, "sealed build lacks compiler identity");
-    }
+        .and_then(Value::as_str)
+        .expect("application compiler identity");
+    require(
+        is_hex(compiler_identity, 64)
+            && compiler_identity == compiler_source_identity(&revision, &source_archive_sha256),
+        "application compiler source identity differs",
+    );
     let platform_key = if target_os == "macos" {
         "macos_aarch64"
     } else {
@@ -532,6 +569,26 @@ fn main() {
     let manifest_identity = emitted_manifest_identity
         .clone()
         .expect("one emitted manifest identity");
+    writeln!(
+        generated,
+        "pub(crate) const COMPILER_IDENTITY: &str = {compiler_identity:?};"
+    )
+    .unwrap();
+    writeln!(
+        generated,
+        "pub(crate) const PLATFORM_MANIFEST_IDENTITY: &str = {manifest_identity:?};"
+    )
+    .unwrap();
+    writeln!(
+        generated,
+        "pub(crate) const SOURCE_ARCHIVE_SHA256: &str = {source_archive_sha256:?};"
+    )
+    .unwrap();
+    writeln!(
+        generated,
+        "pub(crate) const PRIVATE_FAMILY_SOURCE_SHA256: &str = {private_family_source_sha256:?};"
+    )
+    .unwrap();
     let mut built_refusals = Vec::new();
     for (index, candidate) in literal_dispositions.refusals.iter().enumerate() {
         let (compile_receipt, refusal_manifest_identity) = if target_os == "macos" {
@@ -593,6 +650,8 @@ fn main() {
         "identity_sha256": hex(&identity_sha256),
         "runner_revision": revision,
         "runner_source_sha256": hex(&source_identity),
+        "source_archive_sha256": source_archive_sha256,
+        "private_family_source_sha256": private_family_source_sha256,
         "target_os": target_os,
         "target_arch": target_arch,
         "backend_name": backend_name,
@@ -1344,7 +1403,7 @@ fn write_scaffold(output: &Path) -> Result<(), std::io::Error> {
         "#[derive(Clone, Copy, Debug)]\npub(crate) struct CandidateIdentity { pub(crate) semantic_candidate_sha256: &'static str, pub(crate) literal_hex: &'static str, pub(crate) implementation_sha256: &'static str, pub(crate) glue_sha256: &'static str }\n",
     );
     generated.push_str(
-        "pub(crate) const LINKED: bool = false;\npub(crate) const TIMING_PERMITTED: bool = false;\npub(crate) const BACKEND_TAG: u16 = 0;\npub(crate) const BACKEND_NAME: &str = \"unresolved\";\npub(crate) const FAMILY_SELECTOR: u16 = 0;\npub(crate) const MINIMUM_WINDOW_BYTES: usize = 1;\npub(crate) const PORTABLE_PREFIX_CANDIDATE_STARTS: usize = 1;\npub(crate) const PLAN_IDENTITY: &str = \"unresolved\";\npub(crate) const ANALYZER_IDENTITY: &str = \"unresolved\";\npub(crate) const EVIDENCE_IDENTITY: &str = \"unresolved\";\npub(crate) const PRIVATE_AUTHORIZATION_IDENTITY: &str = \"unresolved\";\npub(crate) const APPLICATION_CONTRACT_IDENTITY: &str = \"unresolved\";\npub(crate) const IDENTITY_SHA256: &str = \"unresolved\";\npub(crate) const RUNNER_SOURCE_SHA256: &str = \"unresolved\";\npub(crate) const OBJECT_CANDIDATE_MANIFEST_SCHEMA: &str = \"unresolved\";\npub(crate) const OBJECT_CANDIDATE_MANIFEST_SHA256: &str = \"unresolved\";\npub(crate) const LITERAL_DISPOSITIONS_SHA256: &str = \"unresolved\";\npub(crate) const FIXTURE_MANIFEST_SCHEMA: &str = \"unresolved\";\npub(crate) const FIXTURE_MANIFEST_SHA256: &str = \"unresolved\";\npub(crate) const CANONICAL_BYTE_ESCAPED_SOURCES: bool = false;\npub(crate) static CANDIDATES: &[CandidateIdentity] = &[];\n",
+        "pub(crate) const LINKED: bool = false;\npub(crate) const TIMING_PERMITTED: bool = false;\npub(crate) const BACKEND_TAG: u16 = 0;\npub(crate) const BACKEND_NAME: &str = \"unresolved\";\npub(crate) const FAMILY_SELECTOR: u16 = 0;\npub(crate) const MINIMUM_WINDOW_BYTES: usize = 1;\npub(crate) const PORTABLE_PREFIX_CANDIDATE_STARTS: usize = 1;\npub(crate) const PLAN_IDENTITY: &str = \"unresolved\";\npub(crate) const ANALYZER_IDENTITY: &str = \"unresolved\";\npub(crate) const EVIDENCE_IDENTITY: &str = \"unresolved\";\npub(crate) const PRIVATE_AUTHORIZATION_IDENTITY: &str = \"unresolved\";\npub(crate) const APPLICATION_CONTRACT_IDENTITY: &str = \"unresolved\";\npub(crate) const IDENTITY_SHA256: &str = \"unresolved\";\npub(crate) const RUNNER_SOURCE_SHA256: &str = \"unresolved\";\npub(crate) const SOURCE_ARCHIVE_SHA256: &str = \"unresolved\";\npub(crate) const PRIVATE_FAMILY_SOURCE_SHA256: &str = \"unresolved\";\npub(crate) const COMPILER_IDENTITY: &str = \"unresolved\";\npub(crate) const PLATFORM_MANIFEST_IDENTITY: &str = \"unresolved\";\npub(crate) const OBJECT_CANDIDATE_MANIFEST_SCHEMA: &str = \"unresolved\";\npub(crate) const OBJECT_CANDIDATE_MANIFEST_SHA256: &str = \"unresolved\";\npub(crate) const LITERAL_DISPOSITIONS_SHA256: &str = \"unresolved\";\npub(crate) const FIXTURE_MANIFEST_SCHEMA: &str = \"unresolved\";\npub(crate) const FIXTURE_MANIFEST_SHA256: &str = \"unresolved\";\npub(crate) const CANONICAL_BYTE_ESCAPED_SOURCES: bool = false;\npub(crate) static CANDIDATES: &[CandidateIdentity] = &[];\n",
     );
     generated.push_str(
         "#[allow(unsafe_code, unused_variables, reason = \"selector-neutral scaffold has no linked glue to invoke\")]\npub(crate) unsafe fn invoke(index: usize, output: *mut fre_aot_static_runtime::RawStaticSearchSpanAdoptionOutputV1) -> u32 { fre_aot_static_runtime::STATIC_SEARCH_SPAN_ADOPT_STATUS_NO_QUALIFIED_ROW_V1 }\n",
@@ -1452,6 +1511,16 @@ fn is_hex(value: &str, bytes: usize) -> bool {
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
+}
+
+fn compiler_source_identity(revision: &str, archive_sha256: &str) -> String {
+    let revision_bytes = decode_hex(revision).expect("canonical source revision hex");
+    let archive_bytes = decode_hex(archive_sha256).expect("canonical source archive hex");
+    let mut hasher = Sha256::new();
+    hasher.update(COMPILER_IDENTITY_DOMAIN);
+    hasher.update(revision_bytes);
+    hasher.update(archive_bytes);
+    hex(&hasher.finalize())
 }
 
 fn hex(bytes: &[u8]) -> String {
