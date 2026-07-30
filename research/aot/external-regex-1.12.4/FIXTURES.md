@@ -34,3 +34,20 @@ SHA-256 is
 An independent second generation was byte-identical for the manifest and all
 20 one-MiB files. The manifest deliberately records
 `backend_identity=required-unresolved-input` and `timing_permitted=false`.
+
+## Endpoint-adversary successor
+
+`fixture-algorithm-development-v2.json` is a transparent successor: it binds
+the v1 algorithm, generator, and materialized manifest hashes and requires all
+20 predecessor fixture bytes to remain identical. It adds two scenarios for
+each independent literal of width at least two:
+
+- `wrong-final-dense` repeats `literal[..width-1] || wrong_byte`.
+- `wrong-first-dense` repeats `wrong_byte || literal[1..]`.
+
+`wrong_byte` is the smallest printable ASCII byte absent from the complete
+literal. It is derived without inspecting emitted code or filter positions.
+Because blocks have the literal width and contain the absent byte at a fixed
+endpoint, every literal-width window—including one crossing a block
+boundary—contains that byte and cannot match. A scalar overlapping oracle must
+still prove zero occurrences over the complete fixture.

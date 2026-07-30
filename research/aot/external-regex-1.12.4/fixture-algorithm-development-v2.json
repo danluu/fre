@@ -1,0 +1,63 @@
+{
+  "schema": "fre.aot.external-regex-1.12.4-fixture-algorithm-development.v2",
+  "predecessor": {
+    "algorithm_sha256": "2459a245c6842d98a923de13c97caf5938f92c180b76069215017fb462147242",
+    "generator_sha256": "c9f62b668cd7bf42391dfec1ece666e49d0f7f56971b3f783557ad3fdda84316",
+    "fixture_manifest_sha256": "80dcf139225b506e294de158251bae5dbd7a2ffd0af87630420c695df7678c2b",
+    "preserve_all_predecessor_fixture_bytes": true
+  },
+  "fixture_bytes": 1048576,
+  "fixture_domain_hex": "6672652e616f742e65787465726e616c2d72656765782d312e31322e342e666978747572652e763100",
+  "candidate_filter": {
+    "contamination_disposition": "independent",
+    "search_applicable": true,
+    "literal_width_min": 2,
+    "literal_width_max": 32
+  },
+  "predecessor_scenarios": [
+    "absent",
+    "early",
+    "middle",
+    "tail",
+    "dense"
+  ],
+  "successor_scenarios": {
+    "wrong-final-dense": {
+      "block": "literal[0..literal_width-1] || wrong_byte",
+      "construction": "repeat the width-byte block and truncate to exactly 1048576 bytes",
+      "expected_leftmost": null,
+      "expected_count": 0
+    },
+    "wrong-first-dense": {
+      "block": "wrong_byte || literal[1..literal_width]",
+      "construction": "repeat the width-byte block and truncate to exactly 1048576 bytes",
+      "expected_leftmost": null,
+      "expected_count": 0
+    }
+  },
+  "wrong_byte": {
+    "selection": "lowest byte in inclusive range 0x20..0x7e absent from the complete literal",
+    "backend_independent": true,
+    "rationale": "every literal-width window over a repeated block contains the absent wrong byte, including windows crossing block boundaries"
+  },
+  "alignment": {
+    "digest": "sha256(fixture_domain || candidate_sha256_bytes || scenario_utf8)",
+    "offset": "digest[0] & 15",
+    "meaning": "offset of the 1 MiB haystack slice within an overallocated runner buffer"
+  },
+  "oracle": {
+    "search": "scalar overlapping left-to-right byte comparison",
+    "count": "scalar nonoverlapping left-to-right byte comparison",
+    "requirements": [
+      "both successor scenarios have zero literal occurrences",
+      "every complete adversarial block differs from the literal at exactly one endpoint byte",
+      "all predecessor fixture bytes and receipts remain identical"
+    ]
+  },
+  "backend_identity": {
+    "status": "required-unresolved-input",
+    "known_emitter_checkpoint": "16329491",
+    "known_backend": "AsimdV10-tag23-candidate-policy10",
+    "timing_forbidden_until": "static Mach-O and ELF object/link/facade support and auto-routing policy are frozen"
+  }
+}
