@@ -176,6 +176,7 @@ impl From<AggregateExecuteError> for StaticCountCallErrorV3 {
 #[non_exhaustive]
 pub enum StaticCountSveThreadContractErrorV3 {
     UnsupportedHost,
+    RequiredAsimdUnavailable,
     RequiredSveUnavailable,
     RequiredSve2Unavailable,
     SveVectorLengthQueryFailed {

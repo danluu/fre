@@ -1388,13 +1388,16 @@ fn exact_sve_target_contract_fields_v3(
     vector_bytes: u16,
     sve_vector_length_bytes: u16,
 ) -> bool {
-    let sve = AotCountCpuFeatures::SVE.bits();
-    let sve2 = AotCountCpuFeatures::SVE
+    let sve = AotCountCpuFeatures::ASIMD
+        .union(AotCountCpuFeatures::SVE)
+        .bits();
+    let sve2 = AotCountCpuFeatures::ASIMD
+        .union(AotCountCpuFeatures::SVE)
         .union(AotCountCpuFeatures::SVE2)
         .bits();
     let exact_recipe_target = match required_isa_id {
-        2 => register_plan_id == 2 && actual_features == sve && allowed_features == sve,
-        3 => register_plan_id == 3 && actual_features == sve2 && allowed_features == sve2,
+        2 => register_plan_id == 4 && actual_features == sve && allowed_features == sve,
+        3 => register_plan_id == 5 && actual_features == sve2 && allowed_features == sve2,
         _ => false,
     };
     exact_recipe_target
@@ -1635,8 +1638,11 @@ mod tests {
 
     #[test]
     fn movable_handle_remains_closed_to_sve_and_sve2() {
-        let sve = AotCountCpuFeatures::SVE.bits();
-        let sve2 = AotCountCpuFeatures::SVE
+        let sve = AotCountCpuFeatures::ASIMD
+            .union(AotCountCpuFeatures::SVE)
+            .bits();
+        let sve2 = AotCountCpuFeatures::ASIMD
+            .union(AotCountCpuFeatures::SVE)
             .union(AotCountCpuFeatures::SVE2)
             .bits();
         assert_eq!(
@@ -1651,14 +1657,17 @@ mod tests {
 
     #[test]
     fn sve_production_and_qualification_target_fields_are_exact_and_closed() {
-        let sve = AotCountCpuFeatures::SVE.bits();
-        let sve2 = AotCountCpuFeatures::SVE
+        let sve = AotCountCpuFeatures::ASIMD
+            .union(AotCountCpuFeatures::SVE)
+            .bits();
+        let sve2 = AotCountCpuFeatures::ASIMD
+            .union(AotCountCpuFeatures::SVE)
             .union(AotCountCpuFeatures::SVE2)
             .bits();
         let neon = AotCountCpuFeatures::ASIMD.bits();
         assert!(exact_sve_target_contract_fields_v3(
             2,
-            2,
+            4,
             sve,
             sve,
             CountObjectFormatV3::Elf64Aarch64,
@@ -1667,7 +1676,7 @@ mod tests {
         ));
         assert!(exact_sve_target_contract_fields_v3(
             3,
-            3,
+            5,
             sve2,
             sve2,
             CountObjectFormatV3::Elf64Aarch64,
@@ -1677,15 +1686,15 @@ mod tests {
         assert!(!exact_sve_target_contract_fields_v3(
             2,
             2,
-            sve | neon,
-            sve | neon,
+            sve,
+            sve,
             CountObjectFormatV3::Elf64Aarch64,
             16,
             16,
         ));
         assert!(!exact_sve_target_contract_fields_v3(
             3,
-            3,
+            5,
             sve2,
             sve2,
             CountObjectFormatV3::MachOArm64,
@@ -1694,7 +1703,7 @@ mod tests {
         ));
         assert!(!exact_sve_target_contract_fields_v3(
             3,
-            2,
+            4,
             sve2,
             sve2,
             CountObjectFormatV3::Elf64Aarch64,
@@ -1703,7 +1712,7 @@ mod tests {
         ));
         assert!(!exact_sve_target_contract_fields_v3(
             3,
-            3,
+            5,
             sve2,
             sve2,
             CountObjectFormatV3::Elf64Aarch64,
@@ -1712,7 +1721,7 @@ mod tests {
         ));
         assert!(!exact_sve_target_contract_fields_v3(
             3,
-            3,
+            5,
             AotCountCpuFeatures::SVE2.bits(),
             AotCountCpuFeatures::SVE2.bits(),
             CountObjectFormatV3::Elf64Aarch64,
@@ -1721,16 +1730,16 @@ mod tests {
         ));
         assert!(!exact_sve_target_contract_fields_v3(
             3,
-            3,
+            5,
             sve2,
-            sve,
+            sve2 ^ neon,
             CountObjectFormatV3::Elf64Aarch64,
             16,
             16,
         ));
         assert!(!exact_sve_target_contract_fields_v3(
             2,
-            2,
+            4,
             sve,
             sve,
             CountObjectFormatV3::Elf64Aarch64,

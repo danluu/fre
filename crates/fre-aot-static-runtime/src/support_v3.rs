@@ -5,7 +5,7 @@
 //! eligibility tuple.  The table starts empty and can change only in a
 //! reviewed source promotion.
 
-use fre_aot_count_contract::v3::CountGeneralEligibilityTupleV3;
+use fre_aot_count_contract::v3::{CountGeneralEligibilityTupleV3, CountObjectFormatV3};
 
 use crate::StaticCountVerifyErrorV3;
 
@@ -45,10 +45,67 @@ pub(crate) fn require_production_tuple(
     tuple: CountGeneralEligibilityTupleV3,
 ) -> Result<(), StaticCountVerifyErrorV3> {
     require_nonempty_production_authority()?;
-    if PRODUCTION_COUNT_V3_ELIGIBILITY_ROWS.contains(&tuple) {
+    if production_tuple_target_shape_is_closed(&tuple)
+        && PRODUCTION_COUNT_V3_ELIGIBILITY_ROWS.contains(&tuple)
+    {
         Ok(())
     } else {
         Err(StaticCountVerifyErrorV3::EligibilityTupleNotAuthorized)
+    }
+}
+
+fn production_tuple_target_shape_is_closed(tuple: &CountGeneralEligibilityTupleV3) -> bool {
+    production_target_shape_is_closed(
+        tuple.required_isa_id,
+        tuple.register_plan_id,
+        tuple.actual_features,
+        tuple.allowed_features,
+        tuple.object_format,
+        tuple.candidate_block_starts,
+        tuple.vector_bytes,
+        tuple.sve_vector_length_bytes,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the source-authority target closure is an explicit fixed wire projection"
+)]
+const fn production_target_shape_is_closed(
+    required_isa_id: u8,
+    register_plan_id: u8,
+    actual_features: u64,
+    allowed_features: u64,
+    object_format: CountObjectFormatV3,
+    candidate_block_starts: u8,
+    vector_bytes: u16,
+    sve_vector_length_bytes: u16,
+) -> bool {
+    if candidate_block_starts != 16 || vector_bytes != 16 {
+        return false;
+    }
+    match required_isa_id {
+        1 => {
+            register_plan_id == 1
+                && actual_features == 1
+                && allowed_features == 1
+                && sve_vector_length_bytes == 0
+        }
+        2 => {
+            register_plan_id == 4
+                && actual_features == 3
+                && allowed_features == 3
+                && matches!(object_format, CountObjectFormatV3::Elf64Aarch64)
+                && sve_vector_length_bytes == 16
+        }
+        3 => {
+            register_plan_id == 5
+                && actual_features == 7
+                && allowed_features == 7
+                && matches!(object_format, CountObjectFormatV3::Elf64Aarch64)
+                && sve_vector_length_bytes == 16
+        }
+        _ => false,
     }
 }
 
@@ -86,6 +143,46 @@ mod tests {
             require_nonempty_production_authority(),
             Err(StaticCountVerifyErrorV3::NoProductionAuthority)
         );
+        assert!(identity_is_zero(&COUNT_V3_PROMOTION_BUNDLE_MANIFEST_SHA256));
+    }
+
+    #[test]
+    fn dormant_source_rows_represent_only_mixed_sve_register_plans() {
+        assert!(production_target_shape_is_closed(
+            2,
+            4,
+            3,
+            3,
+            CountObjectFormatV3::Elf64Aarch64,
+            16,
+            16,
+            16,
+        ));
+        assert!(production_target_shape_is_closed(
+            3,
+            5,
+            7,
+            7,
+            CountObjectFormatV3::Elf64Aarch64,
+            16,
+            16,
+            16,
+        ));
+        for (required_isa_id, register_plan_id, features) in
+            [(2, 2, 2), (3, 3, 6), (2, 4, 2), (3, 5, 6)]
+        {
+            assert!(!production_target_shape_is_closed(
+                required_isa_id,
+                register_plan_id,
+                features,
+                features,
+                CountObjectFormatV3::Elf64Aarch64,
+                16,
+                16,
+                16,
+            ));
+        }
+        assert!(PRODUCTION_COUNT_V3_ELIGIBILITY_ROWS.is_empty());
         assert!(identity_is_zero(&COUNT_V3_PROMOTION_BUNDLE_MANIFEST_SHA256));
     }
 }

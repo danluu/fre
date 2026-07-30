@@ -775,8 +775,12 @@ pub fn inspect_static_count_expectation_v3(
 fn required_features_for_isa(required_isa_id: u8) -> Option<AotCountCpuFeatures> {
     match required_isa_id {
         1 => Some(AotCountCpuFeatures::ASIMD),
-        2 => Some(AotCountCpuFeatures::SVE),
-        3 => Some(AotCountCpuFeatures::SVE.union(AotCountCpuFeatures::SVE2)),
+        2 => Some(AotCountCpuFeatures::ASIMD.union(AotCountCpuFeatures::SVE)),
+        3 => Some(
+            AotCountCpuFeatures::ASIMD
+                .union(AotCountCpuFeatures::SVE)
+                .union(AotCountCpuFeatures::SVE2),
+        ),
         _ => None,
     }
 }
@@ -955,12 +959,17 @@ mod tests {
         );
         assert_eq!(
             required_features_for_isa(2).map(AotCountCpuFeatures::bits),
-            Some(AotCountCpuFeatures::SVE.bits())
+            Some(
+                AotCountCpuFeatures::ASIMD
+                    .union(AotCountCpuFeatures::SVE)
+                    .bits()
+            )
         );
         assert_eq!(
             required_features_for_isa(3).map(AotCountCpuFeatures::bits),
             Some(
-                AotCountCpuFeatures::SVE
+                AotCountCpuFeatures::ASIMD
+                    .union(AotCountCpuFeatures::SVE)
                     .union(AotCountCpuFeatures::SVE2)
                     .bits()
             )
@@ -976,9 +985,12 @@ mod tests {
             .bits();
         assert_eq!(
             required,
-            AotCountCpuFeatures::SVE.bits() | AotCountCpuFeatures::SVE2.bits()
+            AotCountCpuFeatures::ASIMD.bits()
+                | AotCountCpuFeatures::SVE.bits()
+                | AotCountCpuFeatures::SVE2.bits()
         );
         for removed in [
+            AotCountCpuFeatures::ASIMD.bits(),
             AotCountCpuFeatures::SVE.bits(),
             AotCountCpuFeatures::SVE2.bits(),
         ] {

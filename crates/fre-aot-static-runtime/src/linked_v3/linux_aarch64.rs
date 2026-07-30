@@ -179,10 +179,16 @@ pub(super) fn require_sve_host_contract(
 ) -> Result<(), StaticCountVerifyErrorV3> {
     let (hwcap, hwcap2) = host_hwcap_v3();
     let exact_features = match required_isa_id {
-        2 => actual_features == AotCountCpuFeatures::SVE.bits(),
+        2 => {
+            actual_features
+                == AotCountCpuFeatures::ASIMD
+                    .union(AotCountCpuFeatures::SVE)
+                    .bits()
+        }
         3 => {
             actual_features
-                == AotCountCpuFeatures::SVE
+                == AotCountCpuFeatures::ASIMD
+                    .union(AotCountCpuFeatures::SVE)
                     .union(AotCountCpuFeatures::SVE2)
                     .bits()
         }
@@ -190,6 +196,7 @@ pub(super) fn require_sve_host_contract(
     };
     if sve_vector_length_bytes != COUNT_V3_SVE_VECTOR_BYTES
         || !exact_features
+        || !std::arch::is_aarch64_feature_detected!("neon")
         || hwcap & AARCH64_HWCAP_SVE_V3 == 0
     {
         return Err(StaticCountVerifyErrorV3::RequiredCpuFeaturesUnavailable);
@@ -276,11 +283,18 @@ pub(super) fn require_current_thread_sve_target_v3(
     if hwcap & AARCH64_HWCAP_SVE_V3 == 0 {
         return Err(StaticCountSveThreadContractErrorV3::RequiredSveUnavailable);
     }
+    if !std::arch::is_aarch64_feature_detected!("neon") {
+        return Err(StaticCountSveThreadContractErrorV3::RequiredAsimdUnavailable);
+    }
     match required_isa_id {
-        2 if actual_features == AotCountCpuFeatures::SVE.bits() => {}
+        2 if actual_features
+            == AotCountCpuFeatures::ASIMD
+                .union(AotCountCpuFeatures::SVE)
+                .bits() => {}
         2 => return Err(StaticCountSveThreadContractErrorV3::RequiredSveUnavailable),
         3 if actual_features
-            != AotCountCpuFeatures::SVE
+            != AotCountCpuFeatures::ASIMD
+                .union(AotCountCpuFeatures::SVE)
                 .union(AotCountCpuFeatures::SVE2)
                 .bits() =>
         {

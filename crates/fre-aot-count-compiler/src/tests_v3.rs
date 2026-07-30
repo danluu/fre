@@ -9,8 +9,9 @@ use fre_aot_count_contract::v3::{
     inspect_static_count_expectation_v3,
 };
 use fre_aot_optimizer::{
-    COUNT_V3_OPTIMIZER_VERSION, COUNT_V3_RECIPE_SCHEMA_VERSION, CountV3RequiredIsa,
-    CountV3TuningClass, encode_count_recipe_v3, inspect_count_v3_optimizer_receipt,
+    COUNT_V3_OPTIMIZER_VERSION, COUNT_V3_RECIPE_SCHEMA_VERSION, CountV3RegisterPlanId,
+    CountV3RequiredIsa, CountV3TuningClass, encode_count_recipe_v3,
+    inspect_count_v3_optimizer_receipt,
 };
 use fre_kernel_ir::{Count, ValidateLimits, build_exact_aggregate};
 use sha2::{Digest, Sha256};
@@ -152,14 +153,20 @@ fn sve2_expectation_rejects_each_missing_prerequisite_feature() {
     let original_metadata =
         inspect_count_metadata_v3(compiled.implementation_object().metadata_bytes())
             .expect("valid SVE2 metadata");
-    let complete_features = AotCountCpuFeatures::SVE
+    let complete_features = AotCountCpuFeatures::ASIMD
+        .union(AotCountCpuFeatures::SVE)
         .union(AotCountCpuFeatures::SVE2)
         .bits();
     assert_eq!(original_metadata.actual_features(), complete_features);
+    assert_eq!(
+        original_metadata.register_plan_id(),
+        CountV3RegisterPlanId::Aarch64NeonSve2Vl16V1.wire_id()
+    );
     let support = SUPPORTED_AOT_COUNT_BACKEND_TUPLES_V3[2];
     assert_eq!(support.allowed_features.bits(), complete_features);
 
     for removed in [
+        AotCountCpuFeatures::ASIMD.bits(),
         AotCountCpuFeatures::SVE.bits(),
         AotCountCpuFeatures::SVE2.bits(),
     ] {
