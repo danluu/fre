@@ -12,6 +12,7 @@ use fre_kernel_ir::{
     Span, SpanSum, ValidateError, ValidateLimits, build_class_suffix, build_exact_aggregate,
     build_exact_literal,
 };
+use sha2::{Digest, Sha256};
 
 use crate::{
     AggregateResultLayout, AotLimits, AuditError, BackendVersion, Condition, ConfirmationKind,
@@ -8720,6 +8721,74 @@ fn v20_pair_empty_switches_to_secondary_only_then_refines_a_real_pair() {
 }
 
 #[test]
+fn v21_preserves_primary_present_pair_empty_secondary_only_transitions() {
+    let literal = b"0123456789abcdef";
+    let program =
+        build_exact_literal::<Span>(literal, AnchorFlags::default(), ValidateLimits::default())
+            .expect("V21 explicit-edge IR");
+    let image = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV21,
+        EmitLimits::default(),
+    )
+    .expect("V21 explicit-edge image");
+    audit(&image).expect("V21 explicit-edge independent template");
+    let manifest = image.search_manifest().expect("V21 explicit-edge manifest");
+    let selected = [
+        manifest.primary_offset,
+        manifest.secondary_offset,
+        manifest.verification_offset,
+        manifest.quaternary_offset,
+        manifest.quinary_offset,
+    ]
+    .map(usize::from);
+    assert_eq!(selected.iter().copied().collect::<BTreeSet<_>>().len(), 5);
+    let [primary, secondary, verification, _, _] = selected;
+    let avoid = (0_u16..=255)
+        .map(|value| u8::try_from(value).expect("bounded avoiding byte"))
+        .find(|byte| !literal.contains(byte))
+        .expect("literal leaves an avoiding byte");
+
+    let first_wide_base = 1_usize;
+    let secondary_only_base = first_wide_base + 64;
+    let resumed_primary_base = secondary_only_base + 64;
+    let group_zero_primary = first_wide_base + 7;
+    let group_one_candidate = secondary_only_base + 11;
+    let group_two_candidate = resumed_primary_base + 13;
+
+    let mut exact_in_secondary_only = vec![avoid; 240];
+    exact_in_secondary_only[group_zero_primary + primary] = literal[primary];
+    exact_in_secondary_only[group_one_candidate..group_one_candidate + literal.len()]
+        .copy_from_slice(literal);
+    let secondary_result = simulate(&image, &exact_in_secondary_only, 0, 240)
+        .expect("V21 secondary-only real-pair simulation");
+    assert_eq!(
+        span_output(secondary_result),
+        Some((group_one_candidate, group_one_candidate + literal.len()))
+    );
+
+    // A real primary/secondary pair that fails the next authenticated column
+    // resumes the primary-first graph. It must not enter current-group
+    // learning, whose precondition is a complete five-column survivor.
+    let mut third_column_empty = vec![avoid; 240];
+    third_column_empty[group_zero_primary + primary] = literal[primary];
+    third_column_empty[group_one_candidate + primary] = literal[primary];
+    third_column_empty[group_one_candidate + secondary] = literal[secondary];
+    assert_eq!(
+        third_column_empty[group_one_candidate + verification],
+        avoid
+    );
+    third_column_empty[group_two_candidate..group_two_candidate + literal.len()]
+        .copy_from_slice(literal);
+    let resumed_result = simulate(&image, &third_column_empty, 0, 240)
+        .expect("V21 third-column-empty resumed simulation");
+    assert_eq!(
+        span_output(resumed_result),
+        Some((group_two_candidate, group_two_candidate + literal.len()))
+    );
+}
+
+#[test]
 fn v20_dense_pair_preserving_streams_are_filtered_at_each_remaining_column() {
     let literal = b"0123456789abcdef";
     let program =
@@ -9319,6 +9388,111 @@ fn v21_current_group_learning_is_distinct_bounded_and_independently_audited() {
                 }
         })
         .expect("V21 learned literal byte");
+    let selection_conversions = decoded[..learned_dup]
+        .iter()
+        .enumerate()
+        .filter_map(|(index, instruction)| match instruction {
+            DecodedInstruction::ShiftRightNarrowHalfwordsToBytes8 {
+                destination: 16,
+                source: 0 | 2 | 4 | 6,
+            } => Some(index),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        selection_conversions
+            .iter()
+            .map(|&index| match decoded[index] {
+                DecodedInstruction::ShiftRightNarrowHalfwordsToBytes8 { source, .. } => source,
+                _ => unreachable!(),
+            })
+            .collect::<Vec<_>>(),
+        [0, 2, 4, 6],
+        "V21 selects from Q0/Q2/Q4/Q6 without overwriting them"
+    );
+    for &index in &selection_conversions {
+        assert_eq!(
+            decoded[index + 1],
+            DecodedInstruction::MoveVectorDoubleTo64 {
+                destination: 0,
+                source: 16,
+            }
+        );
+        assert_eq!(
+            decoded[index + 2],
+            DecodedInstruction::AndRegister64 {
+                destination: 0,
+                left: 0,
+                right: 14,
+            }
+        );
+    }
+
+    let candidate_entry = decoded[selection_conversions[3] + 3..learned_dup]
+        .iter()
+        .position(|instruction| {
+            *instruction
+                == DecodedInstruction::AddRegister64 {
+                    destination: 5,
+                    left: 7,
+                    right: 13,
+                }
+        })
+        .map(|offset| selection_conversions[3] + 3 + offset)
+        .expect("V21 sampled-candidate entry");
+    let confirmation_pointer = decoded[candidate_entry..learned_dup]
+        .iter()
+        .position(|instruction| {
+            *instruction
+                == DecodedInstruction::AddRegister64 {
+                    destination: 15,
+                    left: 9,
+                    right: 5,
+                }
+        })
+        .map(|offset| candidate_entry + offset)
+        .expect("V21 sampled exact pointer");
+    let success_publish = decoded[confirmation_pointer + 1..learned_dup]
+        .iter()
+        .position(|instruction| {
+            *instruction
+                == DecodedInstruction::MoveRegister64 {
+                    destination: 13,
+                    source: 5,
+                }
+        })
+        .map(|offset| confirmation_pointer + 1 + offset)
+        .expect("V21 sampled exact success publication");
+    let retained_vectors = [0_u8, 2, 4, 6];
+    for &instruction in &decoded[confirmation_pointer + 1..success_publish] {
+        assert_ne!(
+            instruction.written_gpr(),
+            Some(14),
+            "sampled exact confirmation must retain X14"
+        );
+        match instruction {
+            DecodedInstruction::LoadVector128 { destination, .. }
+            | DecodedInstruction::DuplicateByte16 { destination, .. }
+            | DecodedInstruction::CompareEqualBytes16 { destination, .. }
+            | DecodedInstruction::AndBytes16 { destination, .. }
+            | DecodedInstruction::ShiftRightNarrowHalfwordsToBytes8 { destination, .. }
+            | DecodedInstruction::UnsignedMinBytes16 { destination, .. }
+            | DecodedInstruction::UnsignedMaxBytes16 { destination, .. }
+            | DecodedInstruction::UnsignedMaxPairwiseBytes16 { destination, .. }
+            | DecodedInstruction::AddAcrossBytes16 { destination, .. } => {
+                assert!(!retained_vectors.contains(&destination));
+            }
+            DecodedInstruction::LoadVectorPair128 {
+                first_destination,
+                second_destination,
+                ..
+            } => {
+                assert!(!retained_vectors.contains(&first_destination));
+                assert!(!retained_vectors.contains(&second_destination));
+            }
+            _ => {}
+        }
+    }
     assert_eq!(
         decoded[learned_dup + 1],
         DecodedInstruction::AddRegister64 {
@@ -9403,6 +9577,140 @@ fn v21_current_group_learning_is_distinct_bounded_and_independently_audited() {
         .expect("V20 manifest")
         .backend_version = BackendVersion::SEARCH_V21;
     assert_resealed_search_rejected(v20_as_v21, "V20 code resealed as V21");
+}
+
+#[test]
+fn v21_all_width_code_bound_and_frozen_old_backend_bytes_are_exact() {
+    fn gate_literal(topology: u8, width: usize) -> Vec<u8> {
+        match topology {
+            0 => (0..width)
+                .map(|offset| 33 + u8::try_from((17 * offset) % 64).expect("bounded"))
+                .collect(),
+            1 => {
+                let mut literal = vec![b'~'; width];
+                literal[..5].copy_from_slice(b"A3mQz");
+                literal
+            }
+            2 => {
+                let mut literal = vec![b'x'; width];
+                for (offset, byte) in [0, width / 4, width / 2, (3 * width) / 4, width - 1]
+                    .into_iter()
+                    .zip(*b"MNOPR")
+                {
+                    literal[offset] = byte;
+                }
+                literal
+            }
+            3 => {
+                const ALPHABET: &[u8; 16] = b"0123456789ABCDEF";
+                let mut state =
+                    0x9e37_79b9_7f4a_7c15_u64 ^ u64::try_from(width).expect("host width");
+                (0..width)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        ALPHABET[usize::from(state.to_le_bytes()[0] & 15)]
+                    })
+                    .collect()
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    // These digests were generated from the exact frozen V20 base commit
+    // 9f03761d0b02258ce44771dff936852e10355e17, tree
+    // 3a3f8d2158603ca0097fb82ad7e2216096fae011. Each digest frames and hashes
+    // complete AOT bytes for all four preregistered topologies at widths 6..32.
+    for (name, policy, expected) in [
+        (
+            "V17",
+            SearchBackendPolicy::AsimdV17,
+            "e940a3075ad75f876df48cc8777d01834475282f0ed12671fd7a1b10142f2089",
+        ),
+        (
+            "V19",
+            SearchBackendPolicy::AsimdV19,
+            "015a7eb171419bbec91876a1a6023160ef5814cbb5e88231555c65c49d62942d",
+        ),
+        (
+            "V20",
+            SearchBackendPolicy::AsimdV20,
+            "84e6e4879358ba27d964bfda6de9918bc709b32d5e4e0bedd32e4e786814b978",
+        ),
+    ] {
+        let mut digest = Sha256::new();
+        digest.update(b"FRE-V21-FROZEN-OLD-BACKEND-MATRIX-V1\0");
+        digest.update(policy.backend_version().0.to_le_bytes());
+        for width in 6_usize..=MAX_REPEATED_CONFIRM_BYTES {
+            for topology in 0_u8..4 {
+                let literal = gate_literal(topology, width);
+                let program = build_exact_literal::<Span>(
+                    &literal,
+                    AnchorFlags::default(),
+                    ValidateLimits::default(),
+                )
+                .expect("old-backend byte-identity IR");
+                let image = emit_with_backend(&program, policy, EmitLimits::default())
+                    .expect("old-backend byte-identity image");
+                audit(&image).expect("old-backend byte-identity audit");
+                let aot = image
+                    .to_aot(AotLimits::default())
+                    .expect("old-backend bounded AOT");
+                digest.update([topology]);
+                digest.update(u64::try_from(width).expect("width").to_le_bytes());
+                digest.update(
+                    u64::try_from(aot.as_bytes().len())
+                        .expect("AOT length")
+                        .to_le_bytes(),
+                );
+                digest.update(aot.as_bytes());
+            }
+        }
+        assert_eq!(format!("{:x}", digest.finalize()), expected, "{name}");
+    }
+
+    let mut maximum = 0_usize;
+    let mut maximum_case = None;
+    for width in 6_usize..=MAX_REPEATED_CONFIRM_BYTES {
+        for topology in 0_u8..4 {
+            let literal = gate_literal(topology, width);
+            let program = build_exact_literal::<Span>(
+                &literal,
+                AnchorFlags::default(),
+                ValidateLimits::default(),
+            )
+            .expect("V21 all-width size IR");
+            let image = emit_with_backend(
+                &program,
+                SearchBackendPolicy::AsimdV21,
+                EmitLimits::default(),
+            )
+            .expect("V21 all-width size image");
+            audit(&image).expect("V21 all-width size audit");
+            if image.code().len() > maximum {
+                maximum = image.code().len();
+                maximum_case = Some((width, topology, format!("{}", image.artifact_identity())));
+            }
+            assert!(
+                image.code().len() <= 2_304,
+                "width={width} topology={topology} code_bytes={}",
+                image.code().len()
+            );
+        }
+    }
+    assert_eq!(
+        (maximum, maximum_case),
+        (
+            2_072,
+            Some((
+                17,
+                0,
+                "5d9c1c7a5eebbd75e93c525f05dc2f004bb5335567d8773f1dfef802833849f9".to_owned(),
+            )),
+        ),
+        "the first deterministic worst-case artifact is source-bound"
+    );
 }
 
 #[test]

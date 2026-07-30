@@ -7795,7 +7795,7 @@ mod encoding_tests {
     }
 
     #[test]
-    fn refined_saved_mask_algebra_exhausts_all_three_to_the_sixteenth_relations() {
+    fn v21_learned_refinement_exhausts_submasks_and_four_mask_topologies() {
         // For each lane there are exactly three reachable refinement states:
         // absent from both masks, present only before refinement, or present
         // before and after refinement. Enumerating every submask of every
@@ -7833,6 +7833,40 @@ mod encoding_tests {
             (true, true, true),
         ] {
             assert_eq!(before & filter, expected);
+        }
+
+        // V21 applies the learned column to all four retained masks before
+        // reducing presence and entering the existing ordered queue. Exercise
+        // that four-mask algebra with a deterministic, independently generated
+        // topology stream in addition to the exhaustive one-mask lattice.
+        let mut state = 0xd6e8_feb8_6659_fd93_u64;
+        for _ in 0..65_536 {
+            let mut initial = [0_u16; 4];
+            let mut learned_filter = [0_u16; 4];
+            for mask in initial.iter_mut().chain(&mut learned_filter) {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                *mask = u16::try_from(state & u64::from(u16::MAX))
+                    .expect("masked deterministic topology");
+            }
+            let refined = std::array::from_fn(|block| initial[block] & learned_filter[block]);
+            for block in 0..4 {
+                assert_eq!(initial[block] & refined[block], refined[block]);
+                assert_eq!(
+                    reference_sparse_mask(initial[block])
+                        & reference_sparse_mask(learned_filter[block]),
+                    reference_sparse_mask(refined[block])
+                );
+            }
+            assert_eq!(
+                refined.iter().any(|&mask| mask != 0),
+                refined
+                    .iter()
+                    .map(|&mask| reference_sparse_mask(mask))
+                    .any(|mask| mask != 0)
+            );
+            assert_saved_mask_queue(refined);
         }
     }
 
