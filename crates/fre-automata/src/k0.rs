@@ -348,8 +348,15 @@ struct LazyCapabilities {
 struct EffectiveLazyMode {
     lazy: bool,
     reverse: bool,
-    direct_ready: bool,
 }
+
+// A zero-sized proof that the direct lazy initial row is ready for this
+// invocation. Only leftmost-first reducers retain this proof across the
+// preparation/loop boundary; first-accept reducers use the ordinary
+// preparation entry so they do not carry a readiness mode through their short
+// path.
+#[derive(Clone, Copy, Debug)]
+struct DirectLazyReady;
 
 // Source-independent facts that are invariant across suffix searches using
 // one workspace. Haystack bytes, the changing start, and the effective
@@ -2182,16 +2189,7 @@ fn effective_lazy_mode(
     // will decline the span acceleration and use Pike.
     let may_prove_start_without_reverse = wants_span && !capabilities.contextual;
     let lazy = capabilities.lazy && (!wants_span || reverse || may_prove_start_without_reverse);
-    let direct_ready = capabilities.lazy
-        && !capabilities.contextual
-        && workspace.lazy.is_bound_to(automaton)
-        && workspace.lazy.initialized
-        && !workspace.lazy.declined;
-    Ok(EffectiveLazyMode {
-        lazy,
-        reverse,
-        direct_ready,
-    })
+    Ok(EffectiveLazyMode { lazy, reverse })
 }
 
 fn effective_bound_lazy_mode(
@@ -2207,15 +2205,7 @@ fn effective_bound_lazy_mode(
     let reverse = capabilities.reverse && wants_span && !cached_start_known;
     let may_prove_start_without_reverse = wants_span && !capabilities.contextual;
     let lazy = capabilities.lazy && (!wants_span || reverse || may_prove_start_without_reverse);
-    let direct_ready = capabilities.lazy
-        && !capabilities.contextual
-        && workspace.lazy.initialized
-        && !workspace.lazy.declined;
-    Ok(EffectiveLazyMode {
-        lazy,
-        reverse,
-        direct_ready,
-    })
+    Ok(EffectiveLazyMode { lazy, reverse })
 }
 
 pub(crate) fn search_span_with_workspace_cursor(
@@ -2267,7 +2257,6 @@ pub(crate) fn search_span_with_workspace_cursor(
         OutputContract::Span,
         mode.lazy,
         mode.reverse,
-        mode.direct_ready,
         cursor.capabilities.contextual,
         meter,
         setup_work,
@@ -2327,7 +2316,6 @@ fn search_span_with_bound_cursor(
         OutputContract::Span,
         mode.lazy,
         mode.reverse,
-        mode.direct_ready,
         capabilities.contextual,
         meter,
         setup_work,
@@ -2368,7 +2356,6 @@ fn execute(
         EffectiveLazyMode {
             lazy: allow_lazy && workspace.lazy.is_allocated(),
             reverse: false,
-            direct_ready: false,
         }
     };
     let mut setup = setup;
@@ -2392,7 +2379,6 @@ fn execute(
         contract,
         mode.lazy,
         mode.reverse,
-        mode.direct_ready,
         contextual,
         meter,
         setup_work,
@@ -2422,10 +2408,6 @@ fn execute_bound(
         EffectiveLazyMode {
             lazy: capabilities.lazy,
             reverse: false,
-            direct_ready: capabilities.lazy
-                && !capabilities.contextual
-                && workspace.lazy.initialized
-                && !workspace.lazy.declined,
         }
     };
     let mut setup = SetupAccounting::empty(workspace.retained_bytes, true);
@@ -2449,7 +2431,6 @@ fn execute_bound(
         contract,
         mode.lazy,
         mode.reverse,
-        mode.direct_ready,
         capabilities.contextual,
         meter,
         setup_work,
@@ -2458,7 +2439,6 @@ fn execute_bound(
 }
 
 #[allow(
-    clippy::fn_params_excessive_bools,
     clippy::too_many_arguments,
     clippy::too_many_lines,
     reason = "the shared Pike/lazy entry authenticates one complete invocation"
@@ -2473,13 +2453,28 @@ fn execute_prepared(
     contract: OutputContract,
     may_use_lazy: bool,
     may_use_reverse: bool,
-    mut direct_ready: bool,
     contextual: bool,
     mut meter: WorkMeter,
     mut setup_work: u64,
     start_proof: InvocationStartProof<'_>,
 ) -> Result<UntypedReport, SearchError> {
     let wants_span = matches!(contract, OutputContract::Span);
+    let supported_contract = matches!(
+        contract,
+        OutputContract::Exists
+            | OutputContract::EarliestEnd
+            | OutputContract::SelectedEnd
+            | OutputContract::Span
+    );
+    let retains_priority_prefix =
+        matches!(contract, OutputContract::SelectedEnd | OutputContract::Span);
+    let mut direct_ready = (retains_priority_prefix
+        && may_use_lazy
+        && !contextual
+        && workspace.lazy.is_bound_to(automaton)
+        && workspace.lazy.initialized
+        && !workspace.lazy.declined)
+        .then_some(DirectLazyReady);
     // Cache learning is optional work. Preserve the ordinary reusable-work
     // certificate by reserving its complete transition allowance before any
     // initial-state publication or speculative interning. Unlimited callers
@@ -2560,7 +2555,7 @@ fn execute_prepared(
                     .is_some_and(|optional| combined_preparation <= optional);
             if !admitted {
                 false
-            } else if direct_ready
+            } else if direct_ready.is_some()
                 || prepare_lazy(
                     automaton,
                     workspace,
@@ -2569,7 +2564,7 @@ fn execute_prepared(
                     window.start(),
                 )?
             {
-                direct_ready = true;
+                direct_ready = Some(DirectLazyReady);
                 lazy_initial_has_pending(workspace)?
                     || (may_use_reverse
                         && prepare_reverse_lazy(
@@ -2590,7 +2585,7 @@ fn execute_prepared(
         contract,
         OutputContract::Exists | OutputContract::EarliestEnd
     );
-    let lazy = if may_use_lazy && bidirectional_ready {
+    let lazy = if may_use_lazy && bidirectional_ready && supported_contract {
         if contextual {
             execute_context_lazy_loop(
                 automaton,
@@ -2606,18 +2601,34 @@ fn execute_prepared(
                 start_proof.proof().relaxed_nullable,
             )?
         } else {
-            execute_lazy_loop(
-                automaton,
-                haystack,
-                window,
-                workspace,
-                &mut meter,
-                contract,
-                lazy_core_reserve,
-                start_proof.proof().scanner.as_ref(),
-                start_proof.proof().guard.as_ref(),
-                direct_ready,
-            )?
+            let ready = if let Some(ready) = direct_ready {
+                Some(ready)
+            } else {
+                prepare_lazy(
+                    automaton,
+                    workspace,
+                    &mut meter,
+                    lazy_core_reserve,
+                    window.start(),
+                )?
+                .then_some(DirectLazyReady)
+            };
+            if let Some(ready) = ready {
+                execute_lazy_loop(
+                    automaton,
+                    haystack,
+                    window,
+                    workspace,
+                    &mut meter,
+                    contract,
+                    lazy_core_reserve,
+                    start_proof.proof().scanner.as_ref(),
+                    start_proof.proof().guard.as_ref(),
+                    ready,
+                )?
+            } else {
+                None
+            }
         }
     } else {
         None
@@ -2729,19 +2740,19 @@ fn execute_lazy_loop(
     core_reserve: u64,
     scanner: Option<&StartPositionScanner>,
     guard: Option<&StartPositionClass>,
-    direct_ready: bool,
+    _ready: DirectLazyReady,
 ) -> Result<Option<(Option<MatchSpan>, usize)>, SearchError> {
-    if !matches!(
+    debug_assert!(matches!(
         contract,
         OutputContract::Exists
             | OutputContract::EarliestEnd
             | OutputContract::SelectedEnd
             | OutputContract::Span
-    ) || (!direct_ready
-        && !prepare_lazy(automaton, workspace, meter, core_reserve, window.start())?)
-    {
-        return Ok(None);
-    }
+    ));
+    debug_assert!(workspace.lazy.is_allocated());
+    debug_assert!(workspace.lazy.is_bound_to(automaton));
+    debug_assert!(workspace.lazy.initialized);
+    debug_assert!(!workspace.lazy.declined);
 
     let (initial_pending, initial_terminal) = match workspace.lazy.initial_kind {
         LazyInitialKind::Positive => (false, false),
@@ -11590,7 +11601,6 @@ mod tests {
             super::EffectiveLazyMode {
                 lazy: true,
                 reverse: false,
-                direct_ready: false,
             }
         );
         let endpoint_required =
@@ -11674,7 +11684,6 @@ mod tests {
             super::EffectiveLazyMode {
                 lazy: true,
                 reverse: true,
-                direct_ready: false,
             }
         );
         let cold_full_required = super::required_generation_count(
@@ -11728,7 +11737,6 @@ mod tests {
             super::EffectiveLazyMode {
                 lazy: true,
                 reverse: false,
-                direct_ready: true,
             }
         );
         let warm_required = super::required_generation_count(
@@ -13629,7 +13637,6 @@ mod tests {
             super::EffectiveLazyMode {
                 lazy: true,
                 reverse: false,
-                direct_ready: false,
             }
         );
         let endpoint_report =
@@ -13648,7 +13655,6 @@ mod tests {
             super::EffectiveLazyMode {
                 lazy: true,
                 reverse: true,
-                direct_ready: false,
             }
         );
         let full_report =
@@ -13664,7 +13670,6 @@ mod tests {
             super::EffectiveLazyMode {
                 lazy: true,
                 reverse: false,
-                direct_ready: true,
             }
         );
         let warm_report =
