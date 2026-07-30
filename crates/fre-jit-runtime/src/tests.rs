@@ -2646,6 +2646,110 @@ fn vector_candidate_tails_and_haystack_alignments_match_oracle() {
 }
 
 #[test]
+fn v9_first_candidate_prefix_preserves_windows_alignments_and_guard_boundaries() {
+    let _lock = native_test_lock();
+    let literals = [
+        b"a".as_slice(),
+        b"ab",
+        b"aba",
+        b"01234567",
+        b"0123456789abcdef",
+        b"0123456789abcdefg",
+        b"0123456789abcdefghijklmn",
+        b"0123456789abcdefghijklmnopqrstuv",
+    ];
+    let mut comparisons = 0_u64;
+
+    for literal in literals {
+        let program =
+            build_exact_literal::<Span>(literal, AnchorFlags::default(), ValidateLimits::default())
+                .expect("V9 exact program");
+        let image = emit_audited_with_backend(
+            &program,
+            SearchBackendPolicy::AsimdV9,
+            EmitLimits::default(),
+        )
+        .expect("audited V9 image");
+        assert_eq!(
+            image.as_image().backend_version(),
+            BackendVersion::SEARCH_V9
+        );
+        let kernel =
+            publish_audited::<Span>(&image, PublicationLimits::default()).expect("publish V9");
+        let avoid = (0_u16..=255)
+            .map(|value| u8::try_from(value).expect("bounded byte"))
+            .find(|byte| !literal.contains(byte))
+            .expect("literal leaves one avoiding byte");
+
+        for alignment in 0_usize..16 {
+            let window_start = 5;
+            let len = window_start + literal.len() + 96;
+            let mut storage = vec![avoid; len + 32];
+            let offset = alignment
+                .wrapping_add(16)
+                .wrapping_sub(storage.as_ptr().addr() & 15)
+                & 15;
+            let haystack = &mut storage[offset..offset + len];
+            assert_eq!(haystack.as_ptr().addr() & 15, alignment);
+
+            for match_start in [
+                None,
+                Some(window_start),
+                Some(window_start + 1),
+                Some(window_start + 63),
+                Some(len - literal.len()),
+            ] {
+                haystack.fill(avoid);
+                if let Some(start) = match_start {
+                    install_literal(haystack, start, literal);
+                }
+                let window = SearchWindow::new(window_start, len);
+                for right_boundary in [false, true] {
+                    platform::with_guarded_haystack(haystack, right_boundary, |guarded| {
+                        assert_native_matches(&program, &kernel, guarded, window);
+                    })
+                    .expect("guarded V9 haystack");
+                    comparisons = comparisons.checked_add(1).expect("bounded comparisons");
+                }
+            }
+
+            // A one-candidate window exercises V9's X5 += 1 handoff into
+            // V8's initial X5 > X6 gate on both the hit and miss paths.
+            for present in [false, true] {
+                haystack.fill(avoid);
+                if present {
+                    install_literal(haystack, window_start, literal);
+                }
+                let end = window_start + literal.len();
+                assert_native_matches(
+                    &program,
+                    &kernel,
+                    haystack,
+                    SearchWindow::new(window_start, end),
+                );
+                comparisons = comparisons.checked_add(1).expect("bounded comparisons");
+            }
+
+            // Matches immediately outside either boundary must not leak into
+            // the checked window.
+            haystack.fill(avoid);
+            install_literal(haystack, 0, literal);
+            let inner_start = literal.len() + 3;
+            let inner_end = len - literal.len() - 3;
+            install_literal(haystack, inner_end, literal);
+            assert_native_matches(
+                &program,
+                &kernel,
+                haystack,
+                SearchWindow::new(inner_start, inner_end),
+            );
+            comparisons = comparisons.checked_add(1).expect("bounded comparisons");
+        }
+    }
+    assert_eq!(comparisons, 1_664);
+}
+
+#[test]
 fn v8_adaptive_secondary_screen_rechecks_primary_before_fallback() {
     const WIDE_CANDIDATES: usize = 64;
     const PRIMARY_OFFSET: usize = 7;

@@ -17,7 +17,7 @@ use crate::{
     CpuFeatures, DataSymbol, DataSymbolKind, DecodeError, DecodedInstruction, EmitError,
     EmitLimits, LabelKind, MAX_REPEATED_CONFIRM_BYTES, NativeAggregateImage, NativeAggregateResult,
     NativeImage, NativeResult, RelocationKind, RelocationTarget, ResourceKind, ResultLayout,
-    SearchBackendPolicy, audit, audit_aggregate, decode, decode_one, emit,
+    SearchBackendPolicy, UnsupportedReason, audit, audit_aggregate, decode, decode_one, emit,
     emit::emit_search_version_for_test, emit_audited_with_backend, emit_exact_aggregate,
     emit_exact_aggregate_sve2_fixed16_count_experimental,
     emit_exact_aggregate_sve2_fixed16_pair_count_experimental,
@@ -4546,6 +4546,7 @@ fn explicit_search_backend_policy_selects_distinct_artifact_identities() {
     let policies = [
         (SearchBackendPolicy::AsimdV7, BackendVersion::SEARCH_V7),
         (SearchBackendPolicy::AsimdV8, BackendVersion::SEARCH_V8),
+        (SearchBackendPolicy::AsimdV9, BackendVersion::SEARCH_V9),
         (SearchBackendPolicy::Sve16, BackendVersion::SEARCH_SVE16_V1),
         (
             SearchBackendPolicy::Sve2Fixed16,
@@ -5818,6 +5819,176 @@ fn v8_every_admitted_width_audits_and_round_trips_for_every_output() {
             kind: ConfirmationKind::ExactLiteral,
             limit: MAX_REPEATED_CONFIRM_BYTES,
             required: MAX_REPEATED_CONFIRM_BYTES + 1,
+        })
+    );
+}
+
+#[test]
+fn v9_is_a_distinct_audited_exact_literal_contract_and_v8_remains_sealed() {
+    for width in 1_usize..=MAX_REPEATED_CONFIRM_BYTES {
+        let literal: Vec<u8> = (0..width)
+            .map(|offset| {
+                u8::try_from(offset)
+                    .expect("bounded width")
+                    .wrapping_mul(61)
+                    .wrapping_add(7)
+            })
+            .collect();
+        for output in [
+            OutputKind::Exists,
+            OutputKind::SelectedEnd,
+            OutputKind::Span,
+        ] {
+            let image = match output {
+                OutputKind::Exists => {
+                    let program = build_exact_literal::<Exists>(
+                        &literal,
+                        AnchorFlags::default(),
+                        ValidateLimits::default(),
+                    )
+                    .expect("V9 Exists IR");
+                    emit_with_backend(
+                        &program,
+                        SearchBackendPolicy::AsimdV9,
+                        EmitLimits::default(),
+                    )
+                }
+                OutputKind::SelectedEnd => {
+                    let program = build_exact_literal::<SelectedEnd>(
+                        &literal,
+                        AnchorFlags::default(),
+                        ValidateLimits::default(),
+                    )
+                    .expect("V9 SelectedEnd IR");
+                    emit_with_backend(
+                        &program,
+                        SearchBackendPolicy::AsimdV9,
+                        EmitLimits::default(),
+                    )
+                }
+                OutputKind::Span => {
+                    let program = build_exact_literal::<Span>(
+                        &literal,
+                        AnchorFlags::default(),
+                        ValidateLimits::default(),
+                    )
+                    .expect("V9 Span IR");
+                    emit_with_backend(
+                        &program,
+                        SearchBackendPolicy::AsimdV9,
+                        EmitLimits::default(),
+                    )
+                }
+            }
+            .expect("V9 exact image");
+            assert_eq!(image.backend_version(), BackendVersion::SEARCH_V9);
+            assert_eq!(
+                image
+                    .search_manifest()
+                    .expect("V9 manifest")
+                    .candidate_policy_version,
+                9
+            );
+            let report = audit(&image).expect("independent V9 whole-template audit");
+            assert_eq!(
+                (report.decode_passes, report.source_identity_rebuilds),
+                (1, 1)
+            );
+            let aot = image.to_aot(AotLimits::default()).expect("bounded V9 AOT");
+            assert_eq!(&aot.as_bytes()[..8], b"FREA64\0\x16");
+            assert_eq!(aot.identity(), image.artifact_identity());
+        }
+    }
+
+    let literal = b"0123456789abcdef";
+    let program =
+        build_exact_literal::<Span>(literal, AnchorFlags::default(), ValidateLimits::default())
+            .expect("V8/V9 identity program");
+    let canonical_v8 = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV8,
+        EmitLimits::default(),
+    )
+    .expect("canonical V8");
+    let canonical_v9 = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV9,
+        EmitLimits::default(),
+    )
+    .expect("canonical V9");
+    assert_ne!(canonical_v8.code(), canonical_v9.code());
+    assert_ne!(
+        canonical_v8.artifact_identity(),
+        canonical_v9.artifact_identity()
+    );
+
+    let mut v9_as_v8 = canonical_v9.clone();
+    v9_as_v8.backend_version = BackendVersion::SEARCH_V8;
+    {
+        let manifest = v9_as_v8.search.as_mut().expect("V9 manifest");
+        manifest.backend_version = BackendVersion::SEARCH_V8;
+        manifest.candidate_policy_version = 4;
+    }
+    assert_resealed_search_rejected(v9_as_v8, "V9 code resealed as V8");
+
+    let mut v8_as_v9 = canonical_v8;
+    v8_as_v9.backend_version = BackendVersion::SEARCH_V9;
+    {
+        let manifest = v8_as_v9.search.as_mut().expect("V8 manifest");
+        manifest.backend_version = BackendVersion::SEARCH_V9;
+        manifest.candidate_policy_version = 9;
+    }
+    assert_resealed_search_rejected(v8_as_v9, "V8 code resealed as V9");
+}
+
+#[test]
+fn v9_rejects_shapes_without_one_nonempty_unanchored_exact_candidate() {
+    for anchors in [
+        AnchorFlags {
+            start: true,
+            end: false,
+        },
+        AnchorFlags {
+            start: false,
+            end: true,
+        },
+        AnchorFlags {
+            start: true,
+            end: true,
+        },
+    ] {
+        let anchored =
+            build_exact_literal::<Span>(b"x", anchors, ValidateLimits::default()).expect("IR");
+        assert_eq!(
+            emit_with_backend(
+                &anchored,
+                SearchBackendPolicy::AsimdV9,
+                EmitLimits::default()
+            ),
+            Err(EmitError::Unsupported {
+                reason: UnsupportedReason::KernelShape,
+            })
+        );
+    }
+    let empty = build_exact_literal::<Span>(b"", AnchorFlags::default(), ValidateLimits::default())
+        .expect("empty IR");
+    assert_eq!(
+        emit_with_backend(&empty, SearchBackendPolicy::AsimdV9, EmitLimits::default()),
+        Err(EmitError::Unsupported {
+            reason: UnsupportedReason::KernelShape,
+        })
+    );
+    let class = build_class_suffix::<Span>(
+        ByteClass::from_bytes(b"a"),
+        b"bc",
+        AnchorFlags::default(),
+        ValidateLimits::default(),
+    )
+    .expect("class IR");
+    assert_eq!(
+        emit_with_backend(&class, SearchBackendPolicy::AsimdV9, EmitLimits::default()),
+        Err(EmitError::Unsupported {
+            reason: UnsupportedReason::KernelShape,
         })
     );
 }

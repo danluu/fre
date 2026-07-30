@@ -46,6 +46,7 @@ const SEARCH_CANDIDATE_POLICY_V4: u16 = 4;
 const SEARCH_CANDIDATE_POLICY_SVE16_V1: u16 = 5;
 const SEARCH_CANDIDATE_POLICY_SVE2_16_V1: u16 = 6;
 const SEARCH_CANDIDATE_POLICY_SVE2_FIXED16_V2: u16 = 8;
+const SEARCH_CANDIDATE_POLICY_V5: u16 = 9;
 const SEARCH_CANDIDATE_BLOCK_WIDTH: u16 = 16;
 const SEARCH_CANDIDATE_OFFSET_NONE: u16 = u16::MAX;
 const SVE2_CLASS_TABLE_DATA_ID: u32 = 2;
@@ -72,6 +73,8 @@ pub enum SearchBackendPolicy {
     /// Advanced SIMD Search V8, including its authenticated AOT contract.
     #[default]
     AsimdV8,
+    /// Search V9 candidate: V8 plus an exact first-candidate fast path.
+    AsimdV9,
     /// SVE screening with exactly sixteen active byte lanes.
     Sve16,
     /// SVE2 `MATCH` screening with exactly sixteen active byte lanes,
@@ -93,6 +96,7 @@ impl SearchBackendPolicy {
         match self {
             Self::AsimdV7 => BackendVersion::SEARCH_V7,
             Self::AsimdV8 => BackendVersion::SEARCH_V8,
+            Self::AsimdV9 => BackendVersion::SEARCH_V9,
             Self::Sve16 => BackendVersion::SEARCH_SVE16_V1,
             Self::Sve2Fixed16 => BackendVersion::SEARCH_SVE2_16_V1,
             Self::Sve16V6 => BackendVersion::SEARCH_SVE16_V6,
@@ -302,6 +306,7 @@ fn emit_search_image<O: Operation>(
             | BackendVersion::SEARCH_V6
             | BackendVersion::SEARCH_V7
             | BackendVersion::SEARCH_V8
+            | BackendVersion::SEARCH_V9
             | BackendVersion::SEARCH_SVE16_V1
             | BackendVersion::SEARCH_SVE2_16_V1
             | BackendVersion::SEARCH_SVE16_V6
@@ -356,6 +361,11 @@ fn emit_search_image<O: Operation>(
     if backend_version == BackendVersion::SEARCH_SVE2_FIXED16_V2
         && !plan.is_sve2_fixed16_v2_policy_shape()
     {
+        return Err(EmitError::Unsupported {
+            reason: UnsupportedReason::KernelShape,
+        });
+    }
+    if backend_version == BackendVersion::SEARCH_V9 && !plan.is_v9_policy_shape() {
         return Err(EmitError::Unsupported {
             reason: UnsupportedReason::KernelShape,
         });
@@ -477,6 +487,7 @@ fn emit_search_image<O: Operation>(
                 | BackendVersion::SEARCH_V6
                 | BackendVersion::SEARCH_V7
                 | BackendVersion::SEARCH_V8
+                | BackendVersion::SEARCH_V9
                 | BackendVersion::SEARCH_SVE16_V1
                 | BackendVersion::SEARCH_SVE2_16_V1
                 | BackendVersion::SEARCH_SVE16_V6
@@ -1373,6 +1384,19 @@ mod v7_policy_scan_admission {
 use v7_policy_scan_admission::Admission as V7PolicyScanAdmission;
 
 impl<'a> Plan<'a> {
+    const fn is_v9_policy_shape(self) -> bool {
+        matches!(
+            self,
+            Self::Exact {
+                literal: [_, ..],
+                anchors: AnchorFlags {
+                    start: false,
+                    end: false,
+                },
+            }
+        )
+    }
+
     const fn is_sve2_fixed16_v2_policy_shape(self) -> bool {
         matches!(
             self,
@@ -1505,6 +1529,7 @@ impl<'a> Plan<'a> {
                 if matches!(
                     backend_version,
                     BackendVersion::SEARCH_V8
+                        | BackendVersion::SEARCH_V9
                         | BackendVersion::SEARCH_SVE16_V6
                         | BackendVersion::SEARCH_SVE2_FIXED16_V2
                 ) =>
@@ -1552,6 +1577,7 @@ impl<'a> Plan<'a> {
             backend_version,
             BackendVersion::SEARCH_V7
                 | BackendVersion::SEARCH_V8
+                | BackendVersion::SEARCH_V9
                 | BackendVersion::SEARCH_SVE16_V1
                 | BackendVersion::SEARCH_SVE2_16_V1
                 | BackendVersion::SEARCH_SVE16_V6
@@ -1592,6 +1618,7 @@ impl<'a> Plan<'a> {
                     backend_version,
                     BackendVersion::SEARCH_V7
                         | BackendVersion::SEARCH_V8
+                        | BackendVersion::SEARCH_V9
                         | BackendVersion::SEARCH_SVE16_V1
                         | BackendVersion::SEARCH_SVE2_16_V1
                         | BackendVersion::SEARCH_SVE16_V6
@@ -1686,6 +1713,10 @@ impl<'a> Plan<'a> {
                         && shape == SearchShape::ExactLiteral
                     {
                         SEARCH_CANDIDATE_POLICY_SVE2_FIXED16_V2
+                    } else if backend_version == BackendVersion::SEARCH_V9
+                        && shape == SearchShape::ExactLiteral
+                    {
+                        SEARCH_CANDIDATE_POLICY_V5
                     } else if backend_version == BackendVersion::SEARCH_V8
                         && shape == SearchShape::ExactLiteral
                     {
@@ -1929,6 +1960,18 @@ fn emit_exact(
                 verification_offset,
                 quaternary_offset,
                 backend_version,
+                none,
+                found,
+            )?;
+        }
+        BackendVersion::SEARCH_V9 => {
+            emit_vector_candidate_skip_v9(
+                assembler,
+                literal,
+                primary_offset,
+                secondary_offset,
+                verification_offset,
+                quaternary_offset,
                 none,
                 found,
             )?;
@@ -2747,6 +2790,56 @@ fn emit_vector_candidate_skip_sve16(
 
     assembler.bind(tail)?;
     emit_scalar_candidates_legacy(assembler, literal, true, none, found)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the V9 prefix is deliberately explicit before entering the unchanged V8 graph"
+)]
+fn emit_vector_candidate_skip_v9(
+    assembler: &mut Assembler,
+    literal: &[u8],
+    primary_offset: u16,
+    secondary_offset: Option<u16>,
+    verification_offset: Option<u16>,
+    quaternary_offset: Option<u16>,
+    none: Label,
+    found: Label,
+) -> Result<(), EmitError> {
+    let first_candidate_miss = assembler.new_label(LabelKind::Internal)?;
+    let selected = literal
+        .get(usize::from(primary_offset))
+        .copied()
+        .ok_or(EmitError::InternalInvariant)?;
+
+    // The caller has already proved that X5 is one legal candidate start.
+    // Rejecting on the ranked byte avoids full equality on the common miss.
+    assembler.add_reg(X15, X9, X5)?;
+    assembler.load_byte(X10, X15, primary_offset)?;
+    assembler.cmp_imm32(X10, u16::from(selected))?;
+    assembler.branch_cond(Condition::NotEqual, first_candidate_miss)?;
+    if literal.len() > 1 {
+        emit_literal_equality(assembler, X15, X8, literal.len(), first_candidate_miss)?;
+    }
+    assembler.mov_reg(X13, X5)?;
+    assembler.add_reg(X14, X5, X12)?;
+    assembler.branch(found)?;
+
+    // Advance exactly one candidate. V8's own initial X5 > X6 gate handles
+    // the single-candidate window without reading beyond its checked extent.
+    assembler.bind(first_candidate_miss)?;
+    assembler.add_imm(X5, X5, 1)?;
+    emit_vector_candidate_skip_v8(
+        assembler,
+        literal,
+        primary_offset,
+        secondary_offset,
+        verification_offset,
+        quaternary_offset,
+        BackendVersion::SEARCH_V8,
+        none,
+        found,
+    )
 }
 
 #[allow(

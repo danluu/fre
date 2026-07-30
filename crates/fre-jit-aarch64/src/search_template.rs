@@ -798,6 +798,9 @@ fn emit_exact(
         BackendVersion::SEARCH_V8 | BackendVersion::SEARCH_SVE16_V6 => {
             emit_exact_candidates_v8(template, manifest, literal, none, found)
         }
+        BackendVersion::SEARCH_V9 => {
+            emit_exact_candidates_v9(template, manifest, literal, none, found)
+        }
         BackendVersion::SEARCH_SVE2_FIXED16_V2 => {
             emit_exact_candidates_sve2_fixed16_v2(template, manifest, literal, none, found)
         }
@@ -1218,6 +1221,35 @@ fn emit_scalar_candidates_v3(
     template.branch_cond(Condition::Higher, none);
     template.branch(tail_setup);
     Ok(())
+}
+
+fn emit_exact_candidates_v9(
+    template: &mut Template,
+    manifest: SearchManifest,
+    literal: &[u8],
+    none: Label,
+    found: Label,
+) -> Result<(), AuditError> {
+    let first_candidate_miss = template.new_label(LabelKind::Internal);
+    let selected = literal
+        .get(usize::from(manifest.primary_offset))
+        .copied()
+        .ok_or(AuditError::InvalidSearchManifest)?;
+
+    template.add_reg(15, 9, 5);
+    template.load_byte(10, 15, manifest.primary_offset);
+    template.cmp_imm32(10, u16::from(selected));
+    template.branch_cond(Condition::NotEqual, first_candidate_miss);
+    if literal.len() > 1 {
+        emit_literal_equality(template, 15, 8, literal.len(), first_candidate_miss)?;
+    }
+    template.mov_reg(13, 5);
+    template.add_reg(14, 5, 12);
+    template.branch(found);
+
+    template.bind(first_candidate_miss)?;
+    template.add_imm(5, 5, 1);
+    emit_exact_candidates_v8(template, manifest, literal, none, found)
 }
 
 #[allow(
