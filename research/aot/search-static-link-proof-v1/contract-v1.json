@@ -1,0 +1,102 @@
+{
+  "schema": "fre.aot.search-tag29-static-link-proof-contract.v1",
+  "status": "result-blind-prequalification",
+  "object_candidates": {
+    "schema": "fre.aot.search-tag29-topology-object-candidates.v1",
+    "file_sha256": "90b9eb70dff30e36901b86ecff34ba91938f27afa155ebb17f6daa33d3baca2c",
+    "payload_sha256": "772d7e03b9c2f1d2ef7ccf40ef248e10f46c66153d08ba686351bf580c49c6cd",
+    "count": 808
+  },
+  "literal_dispositions": {
+    "schema": "fre.aot.search-tag29-topology-literal-dispositions.v1",
+    "file_sha256": "a6204205fcfd87faf8bf8d6c2a5c53859ad68e81979ba8e47626afbabdd4ee4d",
+    "payload_sha256": "b4855d3d4cfa53cc60164c8f9adc5e70511c986831a84d401043ee121b3bef88",
+    "count": 922,
+    "object_count": 808,
+    "refusal_count": 114
+  },
+  "engine": {
+    "architecture": "aarch64",
+    "backend_tag": 29,
+    "backend_version": "SEARCH_V16",
+    "candidate_policy": 15,
+    "backend_name": "AsimdV16",
+    "llvm": false
+  },
+  "targets": {
+    "macos": {
+      "triple": "aarch64-apple-darwin",
+      "object_format": "macho64-arm64",
+      "link_map_format": "apple-ld",
+      "frozen_host": "local-apple-aarch64-asimd",
+      "canonical_host": "apple-aarch64-asimd",
+      "features": {
+        "architecture": "aarch64",
+        "asimd": true,
+        "sve": false,
+        "sve2": false,
+        "sve_vector_bytes": null
+      }
+    },
+    "linux": {
+      "triple": "aarch64-unknown-linux-gnu",
+      "object_format": "elf64-little-aarch64",
+      "link_map_format": "gnu-or-lld",
+      "frozen_host": "zstd-eval-ec2-aarch64-asimd-sve2-vl16",
+      "canonical_host": "c9g-aarch64-asimd-sve2",
+      "features": {
+        "architecture": "aarch64",
+        "asimd": true,
+        "sve": true,
+        "sve2": true,
+        "sve_vector_bytes": 16
+      }
+    }
+  },
+  "artifacts": {
+    "implementation_basename": "external-search-{ordinal}-implementation.o",
+    "glue_basename": "external-search-{ordinal}-family-glue.o",
+    "compile_receipt_basename": "external-search-{ordinal}-compile-receipt.bin",
+    "implementation_linker_input_multiplicity": 1,
+    "glue_linker_input_multiplicity": 1
+  },
+  "symbols": {
+    "entry_prefix": "fre_aot_search_entry_v1_",
+    "payload_prefix": "fre_aot_payload_v1_",
+    "metadata_prefix": "fre_aot_metadata_v1_",
+    "glue_prefix": "fre_aot_search_span_glue_v1_",
+    "identity_hex_bytes": 32,
+    "glue_required_implementation_relocation_targets": [
+      "entry",
+      "payload",
+      "metadata"
+    ]
+  },
+  "receipt_domains": {
+    "glue_symbol": "FRE-SEARCH-TAG29-GLUE-SYMBOL\\0\\x01",
+    "link_map_origin": "FRE-SEARCH-TAG29-LINK-MAP-ORIGIN\\0\\x01",
+    "final_image_retention": "FRE-SEARCH-TAG29-FINAL-IMAGE-RETENTION\\0\\x01"
+  },
+  "limits": {
+    "maximum_manifest_bytes": 4194304,
+    "maximum_build_receipt_bytes": 4194304,
+    "maximum_link_receipt_bytes": 8388608,
+    "maximum_object_bytes": 16777216,
+    "maximum_compile_receipt_bytes": 65536,
+    "maximum_link_map_bytes": 134217728,
+    "maximum_linked_image_bytes": 536870912,
+    "maximum_linker_arguments": 65536,
+    "maximum_linker_argument_bytes": 1048576,
+    "maximum_symbols": 4000000,
+    "maximum_sections": 65535,
+    "maximum_relocations": 4000000
+  },
+  "authority": {
+    "timing_results_read": false,
+    "benchmark_result_inputs": [],
+    "rebar_inputs": [],
+    "network": false,
+    "promotion_authority": false,
+    "required_output_schema": "fre.aot.search-tag29-compiler-object-link-evidence.v1"
+  }
+}
