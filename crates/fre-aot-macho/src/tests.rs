@@ -628,23 +628,25 @@ fn search_object_has_the_distinct_five_argument_contract() {
 }
 
 #[test]
-fn search_v12_object_is_deterministic_inspectable_and_inert() {
-    let image = search_image_with_backend(b"needle", SearchBackendPolicy::AsimdV12);
-    let binding = BindingIdentity::new([0x6b; 32]).expect("nonzero test binding");
-    let first = emit_search_object(&image, binding, ObjectLimits::default())
-        .expect("first V12 Mach-O object");
-    let second = emit_search_object(&image, binding, ObjectLimits::default())
-        .expect("second V12 Mach-O object");
-    assert_eq!(first.as_bytes(), second.as_bytes());
-    assert_eq!(first.object_identity(), second.object_identity());
-    let inspection = inspect_object(first.as_bytes(), ObjectLimits::default())
-        .expect("strict V12 Mach-O inspection");
-    assert_eq!(
-        inspection.metadata().backend_version(),
-        BackendVersion::SEARCH_V12.0
-    );
-    validate_search_object(&image, binding, first.as_bytes(), ObjectLimits::default())
-        .expect("expected-image V12 validation");
+fn search_v12_v13_objects_are_deterministic_inspectable_and_inert() {
+    for (policy, version) in [
+        (SearchBackendPolicy::AsimdV12, BackendVersion::SEARCH_V12.0),
+        (SearchBackendPolicy::AsimdV13, BackendVersion::SEARCH_V13.0),
+    ] {
+        let image = search_image_with_backend(b"needle", policy);
+        let binding = BindingIdentity::new([0x6b; 32]).expect("nonzero test binding");
+        let first = emit_search_object(&image, binding, ObjectLimits::default())
+            .expect("first candidate Mach-O object");
+        let second = emit_search_object(&image, binding, ObjectLimits::default())
+            .expect("second candidate Mach-O object");
+        assert_eq!(first.as_bytes(), second.as_bytes());
+        assert_eq!(first.object_identity(), second.object_identity());
+        let inspection = inspect_object(first.as_bytes(), ObjectLimits::default())
+            .expect("strict candidate Mach-O inspection");
+        assert_eq!(inspection.metadata().backend_version(), version);
+        validate_search_object(&image, binding, first.as_bytes(), ObjectLimits::default())
+            .expect("expected-image candidate validation");
+    }
 }
 
 #[test]

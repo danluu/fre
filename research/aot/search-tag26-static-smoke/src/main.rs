@@ -28,7 +28,7 @@ fn main() {
         result,
         Err(StaticSearchSpanAdoptionErrorV1::NoQualifiedStaticSearchSpanRow)
     ));
-    println!("tag25_static_link=true");
+    println!("tag26_static_link=true");
     println!("private_family_adoption=no-qualified-row");
     println!("native_entry_executed=false");
 }

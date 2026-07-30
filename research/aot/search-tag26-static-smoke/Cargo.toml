@@ -1,7 +1,7 @@
 [workspace]
 
 [package]
-name = "fre-search-tag25-static-smoke"
+name = "fre-search-tag26-static-smoke"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.93"
@@ -19,7 +19,7 @@ fre-aot-search-contract = { path = "../../../crates/fre-aot-search-contract" }
 fre-kernel-ir = { path = "../../../crates/fre-kernel-ir" }
 
 [[bin]]
-name = "fre-search-tag25-static-smoke"
+name = "fre-search-tag26-static-smoke"
 path = "src/main.rs"
 
 [lints.rust]

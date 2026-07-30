@@ -1,9 +1,9 @@
-# Search tag25 static fail-closed smoke
+# Search tag26 static fail-closed smoke
 
 This package is a non-authoritative integration test for the inert Search
-V12/tag25 static path. Its build script:
+V13/tag26 static path. Its build script:
 
-- compiles one exact-literal Span object through the explicit tag25 candidate
+- compiles one exact-literal Span object through the explicit tag26 candidate
   constructor;
 - builds one neutral expectation and one private-family glue object;
 - links both exact object paths into the executable; and
@@ -19,5 +19,5 @@ Run on AArch64 macOS or Linux:
 
 ```sh
 cargo run --release --locked \
-  --manifest-path research/aot/search-tag25-static-smoke/Cargo.toml
+  --manifest-path research/aot/search-tag26-static-smoke/Cargo.toml
 ```

@@ -291,40 +291,40 @@ fn assert_linked_bytes(section: LinkedSection, address: u64, expected: &[u8], li
 }
 
 #[test]
-fn apple_tools_link_and_execute_inert_search_v12_object() {
+fn apple_tools_link_and_execute_inert_search_v13_object() {
     let program =
         build_exact_literal::<Span>(b"needle", AnchorFlags::default(), ValidateLimits::default())
-            .expect("Search V12 program");
+            .expect("Search V13 program");
     let image = emit_with_backend(
         &program,
-        SearchBackendPolicy::AsimdV12,
+        SearchBackendPolicy::AsimdV13,
         EmitLimits::default(),
     )
-    .expect("Search V12 image");
+    .expect("Search V13 image");
     let object = emit_search_object(
         &image,
-        BindingIdentity::new([0x25; 32]).expect("nonzero test binding"),
+        BindingIdentity::new([0x26; 32]).expect("nonzero test binding"),
         ObjectLimits::default(),
     )
-    .expect("Search V12 Mach-O object");
+    .expect("Search V13 Mach-O object");
     let inspection =
-        inspect_object(object.as_bytes(), ObjectLimits::default()).expect("inspect V12 object");
+        inspect_object(object.as_bytes(), ObjectLimits::default()).expect("inspect V13 object");
     assert_eq!(
         inspection.metadata().backend_version(),
-        BackendVersion::SEARCH_V12.0
+        BackendVersion::SEARCH_V13.0
     );
 
     let directory = PrivateDirectory::new();
-    let object_path = directory.path().join("search_v12.o");
-    let header_path = directory.path().join("fre_aot_search_v12.h");
-    let driver_path = directory.path().join("search_v12_driver.c");
-    let driver_object_path = directory.path().join("search_v12_driver.o");
-    let executable_path = directory.path().join("search_v12_driver");
+    let object_path = directory.path().join("search_v13.o");
+    let header_path = directory.path().join("fre_aot_search_v13.h");
+    let driver_path = directory.path().join("search_v13_driver.c");
+    let driver_object_path = directory.path().join("search_v13_driver.o");
+    let executable_path = directory.path().join("search_v13_driver");
     write_new(&object_path, object.as_bytes());
     write_new(&header_path, generated_header(&object).as_bytes());
     write_new(
         &driver_path,
-        br#"#include "fre_aot_search_v12.h"
+        br#"#include "fre_aot_search_v13.h"
 
 int main(void) {
     static const uint8_t haystack[] = "xxneedleyy";
@@ -334,7 +334,7 @@ int main(void) {
     if (status != 1u || result.start != 2u || result.end != 8u) {
         return 40;
     }
-    if (FRE_AOT_SELECTED_METADATA.backend_version != UINT16_C(25) ||
+    if (FRE_AOT_SELECTED_METADATA.backend_version != UINT16_C(26) ||
         FRE_AOT_SELECTED_METADATA.abi_kind != FRE_AOT_ABI_SEARCH_V1) {
         return 41;
     }
@@ -351,10 +351,10 @@ int main(void) {
         .arg("-o")
         .arg(&driver_object_path)
         .output()
-        .expect("compile Search V12 driver");
+        .expect("compile Search V13 driver");
     assert!(
         compile.status.success(),
-        "clang rejected Search V12 driver: {}",
+        "clang rejected Search V13 driver: {}",
         String::from_utf8_lossy(&compile.stderr)
     );
     let link = Command::new("/usr/bin/clang")
@@ -367,18 +367,18 @@ int main(void) {
         .arg("-o")
         .arg(&executable_path)
         .output()
-        .expect("link Search V12 driver");
+        .expect("link Search V13 driver");
     assert!(
         link.status.success(),
-        "clang rejected Search V12 object: {}",
+        "clang rejected Search V13 object: {}",
         String::from_utf8_lossy(&link.stderr)
     );
     let execution = Command::new(&executable_path)
         .output()
-        .expect("execute linked Search V12 object");
+        .expect("execute linked Search V13 object");
     assert!(
         execution.status.success(),
-        "linked Search V12 failed: status={:?} stderr={}",
+        "linked Search V13 failed: status={:?} stderr={}",
         execution.status.code(),
         String::from_utf8_lossy(&execution.stderr)
     );

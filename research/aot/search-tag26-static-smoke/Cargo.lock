@@ -227,7 +227,7 @@ name = "fre-re2-syntax"
 version = "0.1.0"
 
 [[package]]
-name = "fre-search-tag25-static-smoke"
+name = "fre-search-tag26-static-smoke"
 version = "0.1.0"
 dependencies = [
  "fre",

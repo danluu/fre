@@ -331,7 +331,8 @@ fn validate_image_shape(image: &NativeImage) -> Result<(), ElfObjectError> {
         BackendVersion::SEARCH_V8
         | BackendVersion::SEARCH_V9
         | BackendVersion::SEARCH_V10
-        | BackendVersion::SEARCH_V12 => target.features == CpuFeatures::ASIMD,
+        | BackendVersion::SEARCH_V12
+        | BackendVersion::SEARCH_V13 => target.features == CpuFeatures::ASIMD,
         version if version == BackendVersion::SEARCH_SVE2_FIXED16_V2 => {
             target.features == CpuFeatures::ASIMD_SVE2
         }
