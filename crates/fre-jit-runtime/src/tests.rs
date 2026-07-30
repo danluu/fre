@@ -2647,15 +2647,20 @@ fn vector_candidate_tails_and_haystack_alignments_match_oracle() {
 
 #[test]
 fn v9_first_candidate_prefix_preserves_windows_alignments_and_guard_boundaries() {
+    const LITERAL_15: [u8; 15] = [b'q'; 15];
+    const LITERAL_31: [u8; 31] = [b'r'; 31];
+
     let _lock = native_test_lock();
     let literals = [
         b"a".as_slice(),
         b"ab",
         b"aba",
         b"01234567",
+        LITERAL_15.as_slice(),
         b"0123456789abcdef",
         b"0123456789abcdefg",
         b"0123456789abcdefghijklmn",
+        LITERAL_31.as_slice(),
         b"0123456789abcdefghijklmnopqrstuv",
     ];
     let mut comparisons = 0_u64;
@@ -2674,6 +2679,19 @@ fn v9_first_candidate_prefix_preserves_windows_alignments_and_guard_boundaries()
             image.as_image().backend_version(),
             BackendVersion::SEARCH_V9
         );
+        let primary_offset = decode(image.as_image().code())
+            .expect("V9 image decodes")
+            .into_iter()
+            .find_map(|instruction| match instruction {
+                DecodedInstruction::LoadByte {
+                    destination: 10,
+                    base: 15,
+                    offset,
+                } => Some(usize::from(offset)),
+                _ => None,
+            })
+            .expect("V9 prefix has an authenticated selected-byte load");
+        assert!(primary_offset < literal.len());
         let kernel =
             publish_audited::<Span>(&image, PublicationLimits::default()).expect("publish V9");
         let avoid = (0_u16..=255)
@@ -2713,6 +2731,24 @@ fn v9_first_candidate_prefix_preserves_windows_alignments_and_guard_boundaries()
                 }
             }
 
+            if literal.len() > 1 {
+                // Force the selected-byte branch to pass while a different
+                // literal byte rejects full equality. This makes the exact
+                // comparison failure/handoff path non-vacuous.
+                haystack.fill(avoid);
+                haystack[window_start + primary_offset] = literal[primary_offset];
+                let non_primary = usize::from(primary_offset == 0);
+                assert_ne!(non_primary, primary_offset);
+                assert_ne!(haystack[window_start + non_primary], literal[non_primary]);
+                assert_native_matches(
+                    &program,
+                    &kernel,
+                    haystack,
+                    SearchWindow::new(window_start, len),
+                );
+                comparisons = comparisons.checked_add(1).expect("bounded comparisons");
+            }
+
             // A one-candidate window exercises V9's X5 += 1 handoff into
             // V8's initial X5 > X6 gate on both the hit and miss paths.
             for present in [false, true] {
@@ -2727,6 +2763,28 @@ fn v9_first_candidate_prefix_preserves_windows_alignments_and_guard_boundaries()
                     haystack,
                     SearchWindow::new(window_start, end),
                 );
+                comparisons = comparisons.checked_add(1).expect("bounded comparisons");
+            }
+
+            // Put the one legal candidate exactly against an inaccessible
+            // right page. In the miss case, any load after X5 += 1 would fault.
+            let right_guard_len = window_start + literal.len();
+            let mut right_guarded = vec![avoid; right_guard_len];
+            for present in [false, true] {
+                right_guarded.fill(avoid);
+                if present {
+                    install_literal(&mut right_guarded, window_start, literal);
+                }
+                platform::with_guarded_haystack(&right_guarded, true, |guarded| {
+                    assert_eq!(guarded.len(), right_guard_len);
+                    assert_native_matches(
+                        &program,
+                        &kernel,
+                        guarded,
+                        SearchWindow::new(window_start, guarded.len()),
+                    );
+                })
+                .expect("exact-right-guard V9 one-candidate haystack");
                 comparisons = comparisons.checked_add(1).expect("bounded comparisons");
             }
 
@@ -2746,7 +2804,7 @@ fn v9_first_candidate_prefix_preserves_windows_alignments_and_guard_boundaries()
             comparisons = comparisons.checked_add(1).expect("bounded comparisons");
         }
     }
-    assert_eq!(comparisons, 1_664);
+    assert_eq!(comparisons, 2_544);
 }
 
 #[test]

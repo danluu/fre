@@ -5,7 +5,9 @@ use std::{
     time::Instant,
 };
 
-use fre_jit_aarch64::{EmitLimits, SearchBackendPolicy, emit_audited_with_backend};
+use fre_jit_aarch64::{
+    DecodedInstruction, EmitLimits, SearchBackendPolicy, decode, emit_audited_with_backend,
+};
 use fre_jit_runtime::{PublicationLimits, PublishedKernelThreadSession, publish_audited};
 use fre_kernel_ir::{
     AnchorFlags, CheckedSearchWindow, MatchSpan, SearchWindow as NativeWindow, Span,
@@ -18,9 +20,22 @@ use fre_kernels::{
 
 type DynError = Box<dyn Error>;
 
-const SCREEN_SEEDS: [u64; 2] = [0xa551_0001_7e23_914d, 0xf117_0002_3c84_d6a9];
-const HELDOUT_SEEDS: [u64; 2] = [0x8d19_74b2_c63e_50af, 0xd3a5_2f91_6c48_b7e0];
-const WIDTHS: [usize; 11] = [1, 2, 3, 4, 5, 6, 8, 12, 16, 24, 32];
+const SCREEN_SEEDS: [u64; 4] = [
+    0xa551_0001_7e23_914d,
+    0xf117_0002_3c84_d6a9,
+    0x6b47_3a9d_e120_85cf,
+    0xc2e9_5714_8ab6_3d01,
+];
+const HELDOUT_SEEDS: [u64; 4] = [
+    0x8d19_74b2_c63e_50af,
+    0xd3a5_2f91_6c48_b7e0,
+    0x39f0_6c82_b517_e4ad,
+    0xe781_2d5a_94c3_60bf,
+];
+const WIDTHS: [usize; 32] = [
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+    26, 27, 28, 29, 30, 31, 32,
+];
 const SCREEN_SIZES: [usize; 7] = [257, 1_021, 4_093, 16_381, 65_521, 262_139, 1_048_573];
 const HELDOUT_SIZES: [usize; 3] = [4_093, 65_521, 1_048_573];
 const SCREEN_ALIGNMENTS: [u8; 4] = [0, 1, 7, 15];
@@ -29,6 +44,9 @@ const HEADER: &str = "schema,phase,seed,width,shape,size,scenario,alignment,wind
 const SCHEMA: &str = "fre-search-v9-broad-deploy-v2";
 const CHECKSUM_SEED: u64 = 0x243f_6a88_85a3_08d3;
 const MAX_CALIBRATION_ITERATIONS: usize = 1 << 30;
+const HYBRID_MIN_LITERAL_BYTES: usize = 2;
+const HYBRID_MIN_WINDOW_BYTES: usize = 4_093;
+const HYBRID_PREFIX_CANDIDATE_STARTS: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Phase {
@@ -126,13 +144,15 @@ enum Scenario {
     FirstByteDenseAbsent,
     NearMissTail,
     BinaryTail,
+    FirstCandidateExact,
+    SelectedByteHitThenFullMiss,
     WindowAbsent,
     WindowTail,
     AlignmentTail(u8),
 }
 
 impl Scenario {
-    const BASE: [Self; 11] = [
+    const BASE: [Self; 13] = [
         Self::AbsentEntropy,
         Self::AbsentFiller,
         Self::Early,
@@ -142,6 +162,8 @@ impl Scenario {
         Self::FirstByteDenseAbsent,
         Self::NearMissTail,
         Self::BinaryTail,
+        Self::FirstCandidateExact,
+        Self::SelectedByteHitThenFullMiss,
         Self::WindowAbsent,
         Self::WindowTail,
     ];
@@ -157,6 +179,10 @@ impl Scenario {
             Self::FirstByteDenseAbsent => "first-byte-dense-absent".to_owned(),
             Self::NearMissTail => "near-miss-tail".to_owned(),
             Self::BinaryTail => "binary-tail".to_owned(),
+            Self::FirstCandidateExact => "first_candidate_exact".to_owned(),
+            Self::SelectedByteHitThenFullMiss => {
+                "selected_byte_hit_then_full_miss".to_owned()
+            }
             Self::WindowAbsent => "window-absent".to_owned(),
             Self::WindowTail => "window-tail".to_owned(),
             Self::AlignmentTail(residue) => format!("alignment-tail-{residue}"),
@@ -174,6 +200,8 @@ impl Scenario {
             Self::FirstByteDenseAbsent => 0x151,
             Self::NearMissTail => 0x16d,
             Self::BinaryTail => 0x181,
+            Self::FirstCandidateExact => 0x197,
+            Self::SelectedByteHitThenFullMiss => 0x19d,
             Self::WindowAbsent => 0x1a7,
             Self::WindowTail => 0x1c3,
             Self::AlignmentTail(residue) => 0x200 + residue as u64,
@@ -192,6 +220,7 @@ impl Scenario {
 enum Engine {
     NativeV8,
     NativeV9,
+    HybridV9,
     Portable,
 }
 
@@ -200,6 +229,7 @@ impl Engine {
         match self {
             Self::NativeV8 => "native-v8-aot-code-tag8",
             Self::NativeV9 => "native-v9-aot-code-tag22",
+            Self::HybridV9 => "hybrid-portable256-v9-tag22-floor4093-width2",
             Self::Portable => "portable-memmem",
         }
     }
@@ -258,6 +288,9 @@ fn main() -> Result<(), DynError> {
                 let literal = make_literal(seed, width, shape);
                 for &size in phase.sizes() {
                     for scenario in scenarios(phase) {
+                        if scenario == Scenario::SelectedByteHitThenFullMiss && width == 1 {
+                            continue;
+                        }
                         let selected = ordinal % shards == shard;
                         ordinal = ordinal
                             .checked_add(1)
@@ -308,10 +341,6 @@ fn run_case(
     literal: &[u8],
     target_ns: u64,
 ) -> Result<(), DynError> {
-    let fixture = make_fixture(seed, size, scenario, literal)?;
-    let bytes = fixture.bytes();
-    let portable_window = PortableWindow::new(fixture.window_start, fixture.window_end);
-    let native_window = NativeWindow::new(fixture.window_start, fixture.window_end);
     let portable = LiteralPlan::new(literal, LiteralBuildLimits::default())?;
     let program =
         build_exact_literal::<Span>(literal, AnchorFlags::default(), ValidateLimits::default())?;
@@ -325,6 +354,11 @@ fn run_case(
         SearchBackendPolicy::AsimdV9,
         EmitLimits::default(),
     )?;
+    let primary_offset = v9_prefix_primary_offset(image_v9.as_image().code())?;
+    let fixture = make_fixture(seed, size, scenario, literal, primary_offset)?;
+    let bytes = fixture.bytes();
+    let portable_window = PortableWindow::new(fixture.window_start, fixture.window_end);
+    let native_window = NativeWindow::new(fixture.window_start, fixture.window_end);
     let kernel_v8 = publish_audited::<Span>(&image_v8, PublicationLimits::default())?;
     let kernel_v9 = publish_audited::<Span>(&image_v9, PublicationLimits::default())?;
     let session_v8 = kernel_v8.begin_current_thread_session()?;
@@ -337,9 +371,16 @@ fn run_case(
     );
     let actual_v8 = invoke_native(&session_v8, bytes, native_window, literal.len())?;
     let actual_v9 = invoke_native(&session_v9, bytes, native_window, literal.len())?;
+    let actual_hybrid = invoke_hybrid(
+        &portable,
+        &session_v9,
+        bytes,
+        native_window,
+        literal.len(),
+    )?;
     require(
-        expected == actual_v8 && expected == actual_v9,
-        "native V8/V9/portable semantic mismatch before timing",
+        expected == actual_v8 && expected == actual_v9 && expected == actual_hybrid,
+        "native V8/V9/hybrid/portable semantic mismatch before timing",
     )?;
 
     for _ in 0..3 {
@@ -351,6 +392,13 @@ fn run_case(
             literal.len(),
         )?);
         black_box(invoke_native(
+            &session_v9,
+            bytes,
+            native_window,
+            literal.len(),
+        )?);
+        black_box(invoke_hybrid(
+            &portable,
             &session_v9,
             bytes,
             native_window,
@@ -370,16 +418,38 @@ fn run_case(
     )?;
     let scenario_name = scenario.name();
     for repetition in 0..phase.repetitions() {
-        let order = match repetition % 3 {
-            0 => [Engine::NativeV8, Engine::NativeV9, Engine::Portable],
-            1 => [Engine::NativeV9, Engine::Portable, Engine::NativeV8],
-            _ => [Engine::Portable, Engine::NativeV8, Engine::NativeV9],
+        let order = match repetition % 4 {
+            0 => [
+                Engine::NativeV8,
+                Engine::NativeV9,
+                Engine::HybridV9,
+                Engine::Portable,
+            ],
+            1 => [
+                Engine::NativeV9,
+                Engine::HybridV9,
+                Engine::Portable,
+                Engine::NativeV8,
+            ],
+            2 => [
+                Engine::HybridV9,
+                Engine::Portable,
+                Engine::NativeV8,
+                Engine::NativeV9,
+            ],
+            _ => [
+                Engine::Portable,
+                Engine::NativeV8,
+                Engine::NativeV9,
+                Engine::HybridV9,
+            ],
         };
         let order_name = format!(
-            "{}+{}+{}",
+            "{}+{}+{}+{}",
             order[0].name(),
             order[1].name(),
-            order[2].name()
+            order[2].name(),
+            order[3].name()
         );
         for engine in order {
             let measurement = match engine {
@@ -388,6 +458,15 @@ fn run_case(
                 })?,
                 Engine::NativeV9 => measure(iterations, expected, || {
                     invoke_native(&session_v9, bytes, native_window, literal.len())
+                })?,
+                Engine::HybridV9 => measure(iterations, expected, || {
+                    invoke_hybrid(
+                        &portable,
+                        &session_v9,
+                        bytes,
+                        native_window,
+                        literal.len(),
+                    )
                 })?,
                 Engine::Portable => measure(iterations, expected, || {
                     invoke_portable(&portable, bytes, portable_window)
@@ -413,6 +492,20 @@ fn run_case(
     Ok(())
 }
 
+fn v9_prefix_primary_offset(code: &[u8]) -> Result<usize, DynError> {
+    decode(code)?
+        .into_iter()
+        .find_map(|instruction| match instruction {
+            DecodedInstruction::LoadByte {
+                destination: 10,
+                base: 15,
+                offset,
+            } => Some(usize::from(offset)),
+            _ => None,
+        })
+        .ok_or_else(|| invalid("V9 prefix selected-byte load missing").into())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn calibrate(
     portable: &LiteralPlan,
@@ -433,12 +526,22 @@ fn calibrate(
         let native_v9 = measure(iterations, expected, || {
             invoke_native(session_v9, haystack, native_window, literal_bytes)
         })?;
+        let hybrid_v9 = measure(iterations, expected, || {
+            invoke_hybrid(
+                portable,
+                session_v9,
+                haystack,
+                native_window,
+                literal_bytes,
+            )
+        })?;
         let portable_measurement = measure(iterations, expected, || {
             invoke_portable(portable, haystack, portable_window)
         })?;
         let faster_ns = native_v8
             .total_ns
             .min(native_v9.total_ns)
+            .min(hybrid_v9.total_ns)
             .min(portable_measurement.total_ns)
             .max(1);
         if faster_ns >= target_ns / 4 || iterations == MAX_CALIBRATION_ITERATIONS {
@@ -508,6 +611,35 @@ fn invoke_portable(
     ))
 }
 
+fn invoke_hybrid(
+    portable: &LiteralPlan,
+    session_v9: &PublishedKernelThreadSession<'_, Span>,
+    haystack: &[u8],
+    window: NativeWindow,
+    literal_bytes: usize,
+) -> Result<u64, DynError> {
+    let checked = CheckedSearchWindow::new(black_box(haystack), window)
+        .ok_or_else(|| invalid("hybrid window rejected"))?;
+    let full = portable
+        .preflight_checked_window(checked, LiteralSearchLimits::unlimited())?;
+    if literal_bytes < HYBRID_MIN_LITERAL_BYTES
+        || full.searched_bytes() < HYBRID_MIN_WINDOW_BYTES
+    {
+        return Ok(encode_portable(full.find()?));
+    }
+    if let Some(matched) =
+        full.find_prefix_candidate_starts(HYBRID_PREFIX_CANDIDATE_STARTS)?
+    {
+        return Ok(encode_portable(Some(matched)));
+    }
+    let Some(tail) = full.after_prefix_candidate_starts(HYBRID_PREFIX_CANDIDATE_STARTS)? else {
+        return Ok(encode_portable(None));
+    };
+    Ok(encode_native(
+        session_v9.search_checked(tail.checked_window())?,
+    ))
+}
+
 fn encode_native(matched: Option<MatchSpan>) -> u64 {
     matched.map_or(0, |span| encode_span(span.start(), span.end()))
 }
@@ -559,10 +691,15 @@ fn make_fixture(
     len: usize,
     scenario: Scenario,
     literal: &[u8],
+    primary_offset: usize,
 ) -> Result<Fixture, DynError> {
     require(
         !literal.is_empty() && literal.len() <= len,
         "invalid fixture literal width",
+    )?;
+    require(
+        primary_offset < literal.len(),
+        "invalid V9 primary literal offset",
     )?;
     let mut storage = vec![
         0_u8;
@@ -636,6 +773,29 @@ fn make_fixture(
             clear_around(haystack, maximum, literal.len(), avoid);
             install_literal(haystack, maximum, literal)?;
         }
+        Scenario::FirstCandidateExact => {
+            window_start = 37.min(maximum);
+            window_end = len.saturating_sub(23).max(window_start + literal.len());
+            window_end = window_end.min(len);
+            haystack.fill(avoid);
+            install_literal(haystack, window_start, literal)?;
+        }
+        Scenario::SelectedByteHitThenFullMiss => {
+            require(
+                literal.len() > 1,
+                "selected-byte/full-miss fixture requires width > 1",
+            )?;
+            window_start = 37.min(maximum);
+            window_end = len.saturating_sub(23).max(window_start + literal.len());
+            window_end = window_end.min(len);
+            haystack.fill(avoid);
+            haystack[window_start + primary_offset] = literal[primary_offset];
+            let non_primary = usize::from(primary_offset == 0);
+            require(
+                haystack[window_start + non_primary] != literal[non_primary],
+                "selected-byte/full-miss witness is vacuous",
+            )?;
+        }
         Scenario::WindowAbsent | Scenario::WindowTail => {
             window_start = 37.min(maximum);
             window_end = len.saturating_sub(23).max(window_start + literal.len());
@@ -665,6 +825,7 @@ fn make_fixture(
         Scenario::AbsentEntropy
         | Scenario::AbsentFiller
         | Scenario::FirstByteDenseAbsent
+        | Scenario::SelectedByteHitThenFullMiss
         | Scenario::WindowAbsent => {
             require(found.is_none(), "intended-absent fixture contains a match")?;
         }
