@@ -3291,6 +3291,198 @@ fn v16_learned_recovery_images_publish_and_respect_guarded_adversarial_streams()
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the width/topology matrix keeps learned-mode, vector-tail, one-candidate, and clipped-window guard cases explicit"
+)]
+fn v16_repeated_learned_byte_topologies_match_kir_and_portable_at_guarded_tails() {
+    const PRIMARY_BYTE: u8 = 0x05;
+    const REPEATED_BYTE: u8 = 0x61;
+    const AVOID_BYTE: u8 = 0xfe;
+    const LONG_HAYSTACK_BYTES: usize = 4_093;
+    const WINDOW_START: usize = 7;
+
+    let _lock = native_test_lock();
+    let mut comparisons = 0_u64;
+
+    for width in 6_usize..=14 {
+        // The frozen selector chooses offsets 0, 1, 2, 3, and the terminal
+        // offset for both families. The penultimate offset therefore remains
+        // available for mismatch-directed learning at every admitted width.
+        //
+        // In the first family the source mismatch is REPEATED_BYTE, which is
+        // distinct from PRIMARY_BYTE and also occurs at the literal terminal.
+        let mut repeated_distinct_literal = vec![PRIMARY_BYTE; width];
+        repeated_distinct_literal[width - 1] = REPEATED_BYTE;
+        let mut repeated_distinct_near_miss = repeated_distinct_literal.clone();
+        repeated_distinct_near_miss[width - 2] = REPEATED_BYTE;
+
+        // In the second family the source mismatch is PRIMARY_BYTE itself.
+        // The expected penultimate byte and terminal byte are both
+        // REPEATED_BYTE, so the learned source byte is common elsewhere in the
+        // literal and aliases the primary filter constant.
+        let mut learned_primary_literal = vec![PRIMARY_BYTE; width];
+        learned_primary_literal[width - 2] = REPEATED_BYTE;
+        learned_primary_literal[width - 1] = REPEATED_BYTE;
+        let mut learned_primary_near_miss = learned_primary_literal.clone();
+        learned_primary_near_miss[width - 2] = PRIMARY_BYTE;
+
+        for (topology, literal, near_miss) in [
+            (
+                "learned-distinct-repeated-terminal",
+                repeated_distinct_literal,
+                repeated_distinct_near_miss,
+            ),
+            (
+                "learned-equals-primary",
+                learned_primary_literal,
+                learned_primary_near_miss,
+            ),
+        ] {
+            let program = build_exact_literal::<Span>(
+                &literal,
+                AnchorFlags::default(),
+                ValidateLimits::default(),
+            )
+            .expect("V16 structural-stress exact program");
+            let image = emit_audited_with_backend(
+                &program,
+                SearchBackendPolicy::AsimdV16,
+                EmitLimits::default(),
+            )
+            .expect("audited phase-unique V16 image");
+            assert_eq!(
+                image.as_image().backend_version(),
+                BackendVersion::SEARCH_V16
+            );
+            let kernel = publish_audited::<Span>(&image, PublicationLimits::default())
+                .expect("publish structural-stress V16");
+            let portable = LiteralPlan::new(&literal, LiteralBuildLimits::default())
+                .expect("portable structural-stress literal");
+
+            let mut long = vec![AVOID_BYTE; LONG_HAYSTACK_BYTES];
+            for chunk in long.chunks_exact_mut(width) {
+                chunk.copy_from_slice(&near_miss);
+            }
+            let long_match_start = long.len() - width;
+            install_literal(&mut long, long_match_start, &literal);
+            for right_boundary in [false, true] {
+                platform::with_guarded_haystack(&long, right_boundary, |guarded| {
+                    for window_start in [0, width + 3] {
+                        let found = assert_span_native_matches_kir_and_portable(
+                            &program,
+                            &kernel,
+                            &portable,
+                            guarded,
+                            SearchWindow::new(window_start, guarded.len()),
+                        );
+                        assert_eq!(
+                            found,
+                            Some((long_match_start, long_match_start + width)),
+                            "width={width} topology={topology} long right={right_boundary}"
+                        );
+                        comparisons = comparisons.checked_add(1).expect("bounded comparisons");
+                    }
+                })
+                .expect("guarded V16 learned-mode stream");
+            }
+
+            for candidate_starts in [15_usize, 16, 17] {
+                let window_len = candidate_starts
+                    .checked_add(width)
+                    .and_then(|value| value.checked_sub(1))
+                    .expect("bounded V16 candidate window");
+                let mut bytes = vec![AVOID_BYTE; WINDOW_START + window_len];
+                install_literal(&mut bytes, WINDOW_START, &near_miss);
+                let match_start = WINDOW_START + candidate_starts - 1;
+                install_literal(&mut bytes, match_start, &literal);
+                platform::with_guarded_haystack(&bytes, true, |guarded| {
+                    let found = assert_span_native_matches_kir_and_portable(
+                        &program,
+                        &kernel,
+                        &portable,
+                        guarded,
+                        SearchWindow::new(WINDOW_START, guarded.len()),
+                    );
+                    assert_eq!(
+                        found,
+                        Some((match_start, match_start + width)),
+                        "width={width} topology={topology} starts={candidate_starts}"
+                    );
+                    comparisons = comparisons.checked_add(1).expect("bounded comparisons");
+                })
+                .expect("right-guarded V16 vector/tail transition");
+            }
+
+            for (scenario, candidate) in [
+                ("one-candidate-hit", literal.as_slice()),
+                ("one-candidate-miss", near_miss.as_slice()),
+            ] {
+                let mut bytes = vec![AVOID_BYTE; WINDOW_START];
+                bytes.extend_from_slice(candidate);
+                platform::with_guarded_haystack(&bytes, true, |guarded| {
+                    let found = assert_span_native_matches_kir_and_portable(
+                        &program,
+                        &kernel,
+                        &portable,
+                        guarded,
+                        SearchWindow::new(WINDOW_START, guarded.len()),
+                    );
+                    let expected =
+                        (scenario == "one-candidate-hit").then_some((WINDOW_START, guarded.len()));
+                    assert_eq!(
+                        found, expected,
+                        "width={width} topology={topology} scenario={scenario}"
+                    );
+                    comparisons = comparisons.checked_add(1).expect("bounded comparisons");
+                })
+                .expect("right-guarded V16 one-candidate window");
+            }
+
+            let left_match_start = 3_usize;
+            let right_match_start = left_match_start + width + 19;
+            let mut clipped = vec![AVOID_BYTE; right_match_start + width];
+            install_literal(&mut clipped, left_match_start, &literal);
+            install_literal(&mut clipped, right_match_start, &literal);
+            let clipped_cases = [
+                (
+                    "exclude-left",
+                    SearchWindow::new(left_match_start + 1, clipped.len()),
+                    Some((right_match_start, right_match_start + width)),
+                ),
+                (
+                    "exclude-right",
+                    SearchWindow::new(0, right_match_start + width - 1),
+                    Some((left_match_start, left_match_start + width)),
+                ),
+                (
+                    "exclude-both",
+                    SearchWindow::new(left_match_start + 1, right_match_start + width - 1),
+                    None,
+                ),
+            ];
+            for right_boundary in [false, true] {
+                platform::with_guarded_haystack(&clipped, right_boundary, |guarded| {
+                    for (scenario, window, expected) in clipped_cases {
+                        let found = assert_span_native_matches_kir_and_portable(
+                            &program, &kernel, &portable, guarded, window,
+                        );
+                        assert_eq!(
+                            found, expected,
+                            "width={width} topology={topology} scenario={scenario} right={right_boundary}"
+                        );
+                        comparisons = comparisons.checked_add(1).expect("bounded comparisons");
+                    }
+                })
+                .expect("guarded V16 clipped search windows");
+            }
+        }
+    }
+
+    assert_eq!(comparisons, 270);
+}
+
+#[test]
 fn v8_adaptive_secondary_screen_rechecks_primary_before_fallback() {
     const WIDE_CANDIDATES: usize = 64;
     const PRIMARY_OFFSET: usize = 7;
@@ -4414,6 +4606,45 @@ fn assert_native_matches<O: RuntimeOperation>(
         window.start(),
         window.end()
     );
+}
+
+fn assert_span_native_matches_kir_and_portable(
+    program: &fre_kernel_ir::ValidatedProgram<Span>,
+    kernel: &crate::PublishedKernel<Span>,
+    portable: &LiteralPlan,
+    haystack: &[u8],
+    window: SearchWindow,
+) -> Option<(usize, usize)> {
+    let expected = program
+        .execute(haystack, window, ExecutionLimits::unlimited())
+        .expect("KIR structural-stress oracle")
+        .into_output();
+    let actual = kernel
+        .search(haystack, window)
+        .expect("native structural-stress execution");
+    assert_eq!(
+        actual,
+        expected,
+        "native/KIR haystack={haystack:?} window={}..{}",
+        window.start(),
+        window.end()
+    );
+
+    let checked = CheckedSearchWindow::new(haystack, window).expect("checked portable window");
+    let portable_match = portable
+        .preflight_checked_window(checked, LiteralSearchLimits::unlimited())
+        .expect("portable structural-stress preflight")
+        .find()
+        .expect("portable structural-stress execution");
+    let expected_match = expected.map(|span| (span.start(), span.end()));
+    assert_eq!(
+        portable_match,
+        expected_match,
+        "portable/KIR haystack={haystack:?} window={}..{}",
+        window.start(),
+        window.end()
+    );
+    expected_match
 }
 
 fn assert_aggregate_matches<A: RuntimeAggregateOperation>(
