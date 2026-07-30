@@ -148,7 +148,8 @@ fn main() -> Result<(), DynError> {
 
 fn inspect(root: &Path, manifest: &FixtureManifest) -> Result<(), DynError> {
     let mut fixture_total = 0_usize;
-    for (index, candidate) in manifest.payload.candidates.iter().enumerate() {
+    for candidate in &manifest.payload.candidates {
+        let index = linked_candidate_index(candidate)?;
         let portable = build_portable(candidate)?;
         let verified = adopt(index)?;
         let automatic = SearchExactLiteralAutoAotV1::bind(&portable, verified)?;
@@ -188,6 +189,15 @@ fn inspect(root: &Path, manifest: &FixtureManifest) -> Result<(), DynError> {
         generated::BACKEND_TAG
     );
     println!("family_selector={}", generated::FAMILY_SELECTOR);
+    println!(
+        "object_candidate_manifest_schema={}",
+        generated::OBJECT_CANDIDATE_MANIFEST_SCHEMA
+    );
+    println!(
+        "object_candidate_manifest_sha256={}",
+        generated::OBJECT_CANDIDATE_MANIFEST_SHA256
+    );
+    println!("linked_object_candidates={}", generated::CANDIDATES.len());
     println!("candidates={}", manifest.payload.candidate_count);
     println!("fixtures={fixture_total}");
     println!("correctness=pass");
@@ -201,7 +211,8 @@ fn run(root: &Path, manifest: &FixtureManifest) -> Result<(), DynError> {
         output,
         "schema,identity_sha256,runner_source_sha256,backend_name,backend_tag,family_selector,candidate_sha256,literal_hex,scenario,fixture_sha256,alignment,repetition,order,engine,route,iterations,total_ns,ns_per_iter,checksum,semantic,expected_nonoverlapping_count,tail_owned"
     )?;
-    for (index, candidate) in manifest.payload.candidates.iter().enumerate() {
+    for candidate in &manifest.payload.candidates {
+        let index = linked_candidate_index(candidate)?;
         let portable = build_portable(candidate)?;
         let verified = adopt(index)?;
         let automatic = SearchExactLiteralAutoAotV1::bind(&portable, verified)?;
@@ -311,17 +322,41 @@ fn adopt(
 }
 
 fn build_portable(candidate: &FixtureCandidate) -> Result<PortableRegex, DynError> {
-    let source = String::from_utf8(decode_hex(&candidate.literal_hex)?)?;
-    let portable = PortableBuilder::new(source).unicode(true).build()?;
+    let literal = decode_hex(&candidate.literal_hex)?;
+    let portable = if generated::CANONICAL_BYTE_ESCAPED_SOURCES {
+        PortableBuilder::new(canonical_exact_source(&literal)).build()?
+    } else {
+        PortableBuilder::new(String::from_utf8(literal.clone())?)
+            .unicode(true)
+            .build()?
+    };
     let exact = portable
         .exact_literal_search_aot_candidate()
         .ok_or_else(|| invalid("fixture source is not an exact-literal AOT candidate"))?;
     require(
-        exact.literal() == decode_hex(&candidate.literal_hex)?
-            && sha256_hex(exact.literal()) == candidate.literal_sha256,
+        exact.literal() == literal && sha256_hex(exact.literal()) == candidate.literal_sha256,
         "portable candidate literal differs from external identity",
     )?;
     Ok(portable)
+}
+
+fn linked_candidate_index(candidate: &FixtureCandidate) -> Result<usize, io::Error> {
+    let mut matches = generated::CANDIDATES
+        .iter()
+        .enumerate()
+        .filter(|(_, linked)| {
+            linked.semantic_candidate_sha256 == candidate.semantic_candidate_sha256
+                && linked.literal_hex == candidate.literal_hex
+        });
+    let index = matches
+        .next()
+        .map(|(index, _)| index)
+        .ok_or_else(|| invalid("fixture candidate has no linked object/glue pair"))?;
+    require(
+        matches.next().is_none(),
+        "fixture candidate maps to multiple linked object/glue pairs",
+    )?;
+    Ok(index)
 }
 
 fn verify_pair(
@@ -486,12 +521,20 @@ fn format_ns_per_iter(total_ns: u64, iterations: usize) -> Result<String, DynErr
 
 fn load_manifest(root: &Path) -> Result<FixtureManifest, DynError> {
     let bytes = regular_file(&root.join("manifest.json"), 1 << 20)?;
+    let (expected_sha256, expected_schema) = if generated::CANONICAL_BYTE_ESCAPED_SOURCES {
+        (
+            generated::OBJECT_CANDIDATE_MANIFEST_SHA256,
+            generated::OBJECT_CANDIDATE_MANIFEST_SCHEMA,
+        )
+    } else {
+        (FIXTURE_MANIFEST_SHA256, FIXTURE_SCHEMA)
+    };
     require(
-        sha256_hex(&bytes) == FIXTURE_MANIFEST_SHA256,
+        sha256_hex(&bytes) == expected_sha256,
         "fixture manifest SHA-256 differs",
     )?;
     let manifest: FixtureManifest = serde_json::from_slice(&bytes)?;
-    require(manifest.schema == FIXTURE_SCHEMA, "fixture schema differs")?;
+    require(manifest.schema == expected_schema, "fixture schema differs")?;
     require(
         manifest.payload_sha256.len() == 64,
         "fixture payload identity is malformed",
@@ -502,27 +545,27 @@ fn load_manifest(root: &Path) -> Result<FixtureManifest, DynError> {
         "immutable fixture generator improperly granted backend/timing authority",
     )?;
     require(
-        manifest.payload.candidate_count == generated::CANDIDATES.len()
-            && manifest.payload.candidates.len() == generated::CANDIDATES.len()
-            && manifest.payload.fixture_count == 28
+        manifest.payload.candidate_count == manifest.payload.candidates.len()
             && manifest.payload.fixture_bytes_each == 1_048_576,
         "fixture cardinality differs",
     )?;
-    for (candidate, expected) in manifest
-        .payload
-        .candidates
-        .iter()
-        .zip(generated::CANDIDATES)
-    {
+    let mut fixture_count = 0_usize;
+    for candidate in &manifest.payload.candidates {
+        let linked = generated::CANDIDATES
+            .get(linked_candidate_index(candidate)?)
+            .ok_or_else(|| invalid("linked object candidate index is invalid"))?;
         require(
-            candidate.semantic_candidate_sha256 == expected.semantic_candidate_sha256
-                && candidate.literal_hex == expected.literal_hex
-                && !expected.implementation_sha256.is_empty()
-                && !expected.glue_sha256.is_empty()
-                && candidate.fixtures.len() == 7,
+            !linked.implementation_sha256.is_empty() && !linked.glue_sha256.is_empty(),
             "linked candidate identity differs from fixture candidate",
         )?;
+        fixture_count = fixture_count
+            .checked_add(candidate.fixtures.len())
+            .ok_or_else(|| invalid("fixture cardinality overflow"))?;
     }
+    require(
+        fixture_count == manifest.payload.fixture_count,
+        "fixture row cardinality differs",
+    )?;
     Ok(manifest)
 }
 
@@ -635,6 +678,23 @@ fn decode_hex(value: &str) -> Result<Vec<u8>, DynError> {
         output.push(u8::from_str_radix(text, 16)?);
     }
     Ok(output)
+}
+
+fn canonical_exact_source(literal: &[u8]) -> String {
+    let mut source = String::with_capacity(
+        literal
+            .len()
+            .checked_mul(4)
+            .and_then(|bytes| bytes.checked_add(6))
+            .expect("bounded fixture literal source"),
+    );
+    source.push_str("(?-u:");
+    for byte in literal {
+        use std::fmt::Write as _;
+        write!(source, "\\x{byte:02x}").expect("String formatting");
+    }
+    source.push(')');
+    source
 }
 
 fn project(matched: Option<Match>) -> Option<[usize; 2]> {

@@ -1,11 +1,12 @@
 use std::{
+    collections::BTreeSet,
     env,
     fmt::Write as _,
     fs,
     path::{Path, PathBuf},
 };
 
-use fre::RustProfile;
+use fre::{PortableBuilder, RustProfile};
 use fre_aot_compiler::{
     LinuxAarch64ExactSearchManifestV1, LinuxAarch64SearchCompilePolicyV1,
     LinuxSearchSpanFinalImageGlueLimitsV1, MacosAarch64ExactSearchManifestV1,
@@ -23,41 +24,33 @@ const BINARY: &str = "fre-external-regex-static-runner";
 const IDENTITY_ENV: &str = "FRE_EXTERNAL_SEARCH_STATIC_IDENTITY";
 const REVISION_ENV: &str = "FRE_EXTERNAL_SEARCH_RUNNER_REVISION";
 const UNSEALED_ENV: &str = "FRE_EXTERNAL_SEARCH_ALLOW_UNSEALED_ARTIFACT_BUILD";
-const IDENTITY_SCHEMA: &str = "fre.aot.external-regex-1.12.4-static-runner-identity.v1";
+const CANDIDATE_MANIFEST_ENV: &str = "FRE_EXTERNAL_SEARCH_OBJECT_CANDIDATE_MANIFEST";
+const IDENTITY_SCHEMA_V1: &str = "fre.aot.external-regex-1.12.4-static-runner-identity.v1";
+const IDENTITY_SCHEMA_V2: &str = "fre.aot.external-regex-1.12.4-static-runner-identity.v2";
+const FIXTURE_SCHEMA: &str = "fre.aot.external-regex-1.12.4-development-fixtures.v2";
+const CANONICAL_SOURCE_CONSTRUCTION: &str = "canonical-byte-escaped-exact";
 const FIXTURE_MANIFEST_SHA256: &str =
     "b979ed327db7e9623bccba1ef775d1957b7323c8b30edb44f40593176f52b44a";
+const MAXIMUM_CANDIDATE_MANIFEST_BYTES: u64 = 1 << 20;
+const MAXIMUM_CANDIDATES: usize = 1 << 10;
 const SOURCE_DOMAIN: &[u8] = b"FRE-EXTERNAL-REGEX-STATIC-RUNNER-SOURCE\0\x01";
 const GLUE_SYMBOL_PREFIX: &str = "fre_aot_search_span_glue_v1_";
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Debug)]
 struct Candidate {
-    semantic_candidate_sha256: &'static str,
-    source: &'static [u8],
-    literal_hex: &'static str,
+    semantic_candidate_sha256: String,
+    source: Vec<u8>,
+    literal: Vec<u8>,
+    literal_hex: String,
 }
 
-const CANDIDATES: [Candidate; 4] = [
-    Candidate {
-        semantic_candidate_sha256: "81f5693f70a77293f3e3f0dd59107a406db75773ab9f6ed8614803db5b078ce3",
-        source: b"\xe2\x98\x83",
-        literal_hex: "e29883",
-    },
-    Candidate {
-        semantic_candidate_sha256: "a2a9256b163317b5c6b4bfefd969adf0c68d671c21bd2cc24cf0dc8b0eadcdca",
-        source: b"\xd0\x88\x30\x31",
-        literal_hex: "d0883031",
-    },
-    Candidate {
-        semantic_candidate_sha256: "b720c057945898d49a18f82a3096743173bd59629cdda7405c1656cf22791904",
-        source: b"\xe2\x80\xa8",
-        literal_hex: "e280a8",
-    },
-    Candidate {
-        semantic_candidate_sha256: "fccc7aa283c35d3484418b43513a97b6e36f539bce8b6a2fc00514ff6667876b",
-        source: b"abc",
-        literal_hex: "616263",
-    },
-];
+#[derive(Debug)]
+struct CandidateManifest {
+    schema: String,
+    sha256: String,
+    canonical_byte_escaped_sources: bool,
+    candidates: Vec<Candidate>,
+}
 
 struct BuiltCandidate {
     implementation: Vec<u8>,
@@ -74,6 +67,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed={IDENTITY_ENV}");
     println!("cargo:rerun-if-env-changed={REVISION_ENV}");
     println!("cargo:rerun-if-env-changed={UNSEALED_ENV}");
+    println!("cargo:rerun-if-env-changed={CANDIDATE_MANIFEST_ENV}");
     println!("cargo:rerun-if-changed=runner-source-files.txt");
     for source in source_manifest().expect("runner source manifest") {
         println!("cargo:rerun-if-changed={source}");
@@ -99,8 +93,12 @@ fn main() {
     let identity_bytes = regular_file(&identity_path, 1 << 20).expect("bounded identity file");
     let identity_sha256 = sha256(&identity_bytes);
     let identity: Value = serde_json::from_slice(&identity_bytes).expect("identity JSON");
+    let identity_schema = identity
+        .get("schema")
+        .and_then(Value::as_str)
+        .expect("static runner identity schema");
     require(
-        identity.get("schema").and_then(Value::as_str) == Some(IDENTITY_SCHEMA),
+        matches!(identity_schema, IDENTITY_SCHEMA_V1 | IDENTITY_SCHEMA_V2),
         "static runner identity schema changed",
     );
     require(
@@ -115,6 +113,19 @@ fn main() {
     let backend_tag = path_u16(&identity, &["static_pipeline", "backend_tag"]);
     let backend_name = path_str(&identity, &["static_pipeline", "backend_name"]);
     require(!backend_name.is_empty(), "backend name is empty");
+    if identity_schema == IDENTITY_SCHEMA_V2 {
+        require(
+            path_u16(&identity, &["emitter", "backend_tag"]) == backend_tag
+                && path_str(&identity, &["emitter", "backend"]) == backend_name
+                && path_u16(&identity, &["emitter", "candidate_policy"]) > 0
+                && is_hex(path_str(&identity, &["emitter", "aot_magic_hex"]), 16)
+                && identity
+                    .pointer("/emitter/authorization")
+                    .and_then(Value::as_bool)
+                    == Some(false),
+            "emitter and static candidate identities differ",
+        );
+    }
     let family_selector = path_u16(&identity, &["auto_routing", "family_selector"]);
     let minimum_literal_bytes = path_u32(&identity, &["auto_routing", "minimum_literal_bytes"]);
     let maximum_literal_bytes = path_u32(&identity, &["auto_routing", "maximum_literal_bytes"]);
@@ -134,6 +145,22 @@ fn main() {
         minimum_literal_bytes <= 3 && maximum_literal_bytes >= 4,
         "family width envelope excludes an external candidate",
     );
+    let candidate_manifest_path = PathBuf::from(
+        env::var_os(CANDIDATE_MANIFEST_ENV)
+            .unwrap_or_else(|| panic!("linked builds require {CANDIDATE_MANIFEST_ENV}")),
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        candidate_manifest_path.display()
+    );
+    let candidate_manifest = load_candidate_manifest(
+        &candidate_manifest_path,
+        &identity,
+        identity_schema,
+        minimum_literal_bytes,
+        maximum_literal_bytes,
+    )
+    .expect("authenticated object-candidate manifest");
     require(
         minimum_window_bytes > 0
             && portable_prefix_candidate_starts > 0
@@ -285,11 +312,29 @@ fn main() {
         hex(&source_identity)
     )
     .unwrap();
+    writeln!(
+        generated,
+        "pub(crate) const OBJECT_CANDIDATE_MANIFEST_SCHEMA: &str = {:?};",
+        candidate_manifest.schema
+    )
+    .unwrap();
+    writeln!(
+        generated,
+        "pub(crate) const OBJECT_CANDIDATE_MANIFEST_SHA256: &str = {:?};",
+        candidate_manifest.sha256
+    )
+    .unwrap();
+    writeln!(
+        generated,
+        "pub(crate) const CANONICAL_BYTE_ESCAPED_SOURCES: bool = {};",
+        candidate_manifest.canonical_byte_escaped_sources
+    )
+    .unwrap();
     generated.push_str("#[allow(unsafe_code)]\nunsafe extern \"C\" {\n");
 
     let mut built_candidates = Vec::new();
     let mut emitted_manifest_identity = None;
-    for (index, candidate) in CANDIDATES.into_iter().enumerate() {
+    for (index, candidate) in candidate_manifest.candidates.iter().enumerate() {
         let built = if target_os == "macos" {
             build_macos(candidate, backend_tag, family_selector)
         } else {
@@ -326,7 +371,7 @@ fn main() {
         )
         .unwrap();
         built_candidates.push((
-            candidate,
+            candidate.clone(),
             hex(&sha256(&built.implementation)),
             hex(&sha256(&built.glue)),
         ));
@@ -335,7 +380,7 @@ fn main() {
     generated.push_str(
         "#[allow(unsafe_code, unsafe_op_in_unsafe_fn)]\npub(crate) unsafe fn invoke(index: usize, output: *mut fre_aot_static_runtime::RawStaticSearchSpanAdoptionOutputV1) -> u32 {\n    match index {\n",
     );
-    for index in 0..CANDIDATES.len() {
+    for index in 0..candidate_manifest.candidates.len() {
         writeln!(
             generated,
             "        {index} => unsafe {{ external_search_glue_{index}(output) }},"
@@ -345,7 +390,7 @@ fn main() {
     generated.push_str(
         "        _ => fre_aot_static_runtime::STATIC_SEARCH_SPAN_ADOPT_STATUS_UNQUALIFIED_SELECTOR_V1,\n    }\n}\n",
     );
-    generated.push_str("pub(crate) const CANDIDATES: [CandidateIdentity; 4] = [\n");
+    generated.push_str("pub(crate) static CANDIDATES: &[CandidateIdentity] = &[\n");
     for (candidate, implementation_sha256, glue_sha256) in &built_candidates {
         writeln!(
             generated,
@@ -379,6 +424,10 @@ fn main() {
         "analyzer_identity": analyzer_identity,
         "evidence_identity": evidence_identity,
         "timing_permitted": timing_permitted,
+        "object_candidate_manifest_schema": candidate_manifest.schema,
+        "object_candidate_manifest_sha256": candidate_manifest.sha256,
+        "object_candidate_count": candidate_manifest.candidates.len(),
+        "canonical_byte_escaped_sources": candidate_manifest.canonical_byte_escaped_sources,
         "candidates": built_candidates.iter().map(|(candidate, implementation, glue)| json!({
             "semantic_candidate_sha256": candidate.semantic_candidate_sha256,
             "literal_hex": candidate.literal_hex,
@@ -410,7 +459,7 @@ fn main() {
     }
 }
 
-fn build_macos(candidate: Candidate, backend_tag: u16, selector: u16) -> BuiltCandidate {
+fn build_macos(candidate: &Candidate, backend_tag: u16, selector: u16) -> BuiltCandidate {
     let manifest = MacosAarch64ExactSearchManifestV1::<Span>::candidate_backend_tag(
         SearchCompilePolicyV1::high_fuel(),
         backend_tag,
@@ -419,10 +468,15 @@ fn build_macos(candidate: Candidate, backend_tag: u16, selector: u16) -> BuiltCa
     let manifest_identity = *manifest.identity().as_bytes();
     let compiled = plan_and_compile_macos_aarch64_exact_search_v1(
         manifest,
-        exact_source(candidate.source),
+        exact_source(&candidate.source),
         RustProfile::default(),
     )
     .expect("macOS external Search object");
+    require(
+        compiled.receipt().literal_bytes()
+            == u32::try_from(candidate.literal.len()).expect("bounded literal width"),
+        "macOS compiled literal width differs from object-candidate manifest",
+    );
     let expectation =
         build_static_search_span_expectation_v1(&compiled).expect("macOS static expectation");
     let glue = publish_search_span_family_qualification_final_image_glue_v1(
@@ -440,7 +494,7 @@ fn build_macos(candidate: Candidate, backend_tag: u16, selector: u16) -> BuiltCa
     }
 }
 
-fn build_linux(candidate: Candidate, backend_tag: u16, selector: u16) -> BuiltCandidate {
+fn build_linux(candidate: &Candidate, backend_tag: u16, selector: u16) -> BuiltCandidate {
     let manifest = LinuxAarch64ExactSearchManifestV1::<Span>::candidate_backend_tag(
         LinuxAarch64SearchCompilePolicyV1::high_fuel(),
         backend_tag,
@@ -449,10 +503,15 @@ fn build_linux(candidate: Candidate, backend_tag: u16, selector: u16) -> BuiltCa
     let manifest_identity = *manifest.identity().as_bytes();
     let compiled = plan_and_compile_linux_aarch64_exact_search_v1(
         manifest,
-        exact_source(candidate.source),
+        exact_source(&candidate.source),
         RustProfile::default(),
     )
     .expect("Linux external Search object");
+    require(
+        compiled.receipt().literal_bytes()
+            == u32::try_from(candidate.literal.len()).expect("bounded literal width"),
+        "Linux compiled literal width differs from object-candidate manifest",
+    );
     let expectation =
         build_linux_static_search_span_expectation_v1(&compiled).expect("Linux static expectation");
     let glue = publish_linux_search_span_family_qualification_final_image_glue_v1(
@@ -468,6 +527,228 @@ fn build_linux(candidate: Candidate, backend_tag: u16, selector: u16) -> BuiltCa
         compile_identity: *compiled.receipt().compile_identity().as_bytes(),
         manifest_identity,
     }
+}
+
+fn load_candidate_manifest(
+    path: &Path,
+    identity: &Value,
+    identity_schema: &str,
+    minimum_literal_bytes: u32,
+    maximum_literal_bytes: u32,
+) -> Result<CandidateManifest, String> {
+    let bytes = regular_file(path, MAXIMUM_CANDIDATE_MANIFEST_BYTES)?;
+    let manifest_sha256 = hex(&sha256(&bytes));
+    let root: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("object-candidate manifest JSON: {error}"))?;
+    let schema = root
+        .get("schema")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "object-candidate manifest lacks a string schema".to_owned())?;
+    let canonical_byte_escaped_sources = identity_schema == IDENTITY_SCHEMA_V2;
+    if canonical_byte_escaped_sources
+        && path_str(identity, &["object_candidates", "source_construction"])
+            != CANONICAL_SOURCE_CONSTRUCTION
+    {
+        return Err("object-candidate source construction differs".to_owned());
+    }
+    let (expected_schema, expected_sha256, expected_count) =
+        if identity_schema == IDENTITY_SCHEMA_V1 {
+            (
+                FIXTURE_SCHEMA,
+                path_str(identity, &["external_evidence", "fixture_manifest_sha256"]),
+                path_usize(identity, &["external_evidence", "candidate_count"]),
+            )
+        } else {
+            (
+                path_str(identity, &["object_candidates", "manifest_schema"]),
+                path_str(identity, &["object_candidates", "manifest_sha256"]),
+                path_usize(identity, &["object_candidates", "candidate_count"]),
+            )
+        };
+    if schema != expected_schema {
+        return Err("object-candidate manifest schema differs from identity".to_owned());
+    }
+    if manifest_sha256 != expected_sha256 {
+        return Err("object-candidate manifest SHA-256 differs from identity".to_owned());
+    }
+    if root
+        .get("payload_sha256")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !is_hex(value, 64))
+    {
+        return Err("object-candidate payload identity is malformed".to_owned());
+    }
+    let payload = root
+        .get("payload")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "object-candidate manifest lacks an object payload".to_owned())?;
+    if payload
+        .get("timing_permitted")
+        .and_then(Value::as_bool)
+        .is_some_and(|permitted| permitted)
+        || payload
+            .get("timing_feedback_permitted")
+            .and_then(Value::as_bool)
+            .is_some_and(|permitted| permitted)
+    {
+        return Err("object-candidate source manifest improperly grants timing".to_owned());
+    }
+    let declared_count = payload
+        .get("candidate_count")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| "object-candidate manifest count is invalid".to_owned())?;
+    let raw_candidates = payload
+        .get("candidates")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "object-candidate manifest lacks a candidate array".to_owned())?;
+    if expected_count == 0
+        || expected_count > MAXIMUM_CANDIDATES
+        || declared_count != expected_count
+        || raw_candidates.len() != expected_count
+    {
+        return Err("object-candidate manifest cardinality differs from identity".to_owned());
+    }
+
+    let mut semantic_identities = BTreeSet::new();
+    let mut literal_identities = BTreeSet::new();
+    let mut candidates = Vec::new();
+    candidates
+        .try_reserve_exact(expected_count)
+        .map_err(|_| "object-candidate allocation failed".to_owned())?;
+    for raw in raw_candidates {
+        candidates.push(parse_candidate(
+            raw,
+            minimum_literal_bytes,
+            maximum_literal_bytes,
+            canonical_byte_escaped_sources,
+            &mut semantic_identities,
+            &mut literal_identities,
+        )?);
+    }
+    Ok(CandidateManifest {
+        schema: schema.to_owned(),
+        sha256: manifest_sha256,
+        canonical_byte_escaped_sources,
+        candidates,
+    })
+}
+
+fn parse_candidate(
+    raw: &Value,
+    minimum_literal_bytes: u32,
+    maximum_literal_bytes: u32,
+    canonical_byte_escaped_sources: bool,
+    semantic_identities: &mut BTreeSet<String>,
+    literal_identities: &mut BTreeSet<Vec<u8>>,
+) -> Result<Candidate, String> {
+    let candidate = raw
+        .as_object()
+        .ok_or_else(|| "object candidate is not an object".to_owned())?;
+    let semantic_candidate_sha256 = candidate
+        .get("semantic_candidate_sha256")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "object candidate lacks a semantic identity".to_owned())?;
+    if !is_hex(semantic_candidate_sha256, 64)
+        || !semantic_identities.insert(semantic_candidate_sha256.to_owned())
+    {
+        return Err("object candidate semantic identity is malformed or duplicated".to_owned());
+    }
+    let literal_hex = candidate
+        .get("literal_hex")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "object candidate lacks literal hex".to_owned())?;
+    let literal = decode_hex(literal_hex)?;
+    let width = u32::try_from(literal.len())
+        .map_err(|_| "object candidate literal width overflows".to_owned())?;
+    if width < minimum_literal_bytes
+        || width > maximum_literal_bytes
+        || !literal_identities.insert(literal.clone())
+    {
+        return Err(
+            "object candidate literal is duplicated or outside the routing envelope".to_owned(),
+        );
+    }
+    if candidate
+        .get("literal_bytes")
+        .and_then(Value::as_u64)
+        .is_some_and(|declared| declared != u64::from(width))
+    {
+        return Err("object candidate literal width differs".to_owned());
+    }
+    if candidate
+        .get("literal_sha256")
+        .and_then(Value::as_str)
+        .is_some_and(|identity| identity != hex(&sha256(&literal)))
+    {
+        return Err("object candidate literal identity differs".to_owned());
+    }
+    let source = if canonical_byte_escaped_sources {
+        canonical_exact_source(&literal).into_bytes()
+    } else {
+        literal.clone()
+    };
+    let source_text = String::from_utf8(source.clone())
+        .map_err(|_| "object candidate source is not UTF-8".to_owned())?;
+    let mut builder = PortableBuilder::new(source_text).profile(RustProfile::default());
+    if !canonical_byte_escaped_sources {
+        builder = builder.unicode(true);
+    }
+    let portable = builder
+        .build()
+        .map_err(|error| format!("object candidate source does not compile: {error}"))?;
+    let exact = portable
+        .exact_literal_search_aot_candidate()
+        .ok_or_else(|| "object candidate source is not one exact literal".to_owned())?;
+    if exact.literal() != literal {
+        return Err("object candidate source and literal differ".to_owned());
+    }
+    Ok(Candidate {
+        semantic_candidate_sha256: semantic_candidate_sha256.to_owned(),
+        source,
+        literal,
+        literal_hex: literal_hex.to_owned(),
+    })
+}
+
+fn canonical_exact_source(literal: &[u8]) -> String {
+    let mut source = String::with_capacity(
+        literal
+            .len()
+            .checked_mul(4)
+            .and_then(|bytes| bytes.checked_add(6))
+            .expect("bounded object candidate source"),
+    );
+    source.push_str("(?-u:");
+    for byte in literal {
+        write!(source, "\\x{byte:02x}").expect("String formatting");
+    }
+    source.push(')');
+    source
+}
+
+fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
+    if value.is_empty()
+        || !value.len().is_multiple_of(2)
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("object candidate literal is not canonical lowercase hex".to_owned());
+    }
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(value.len() / 2)
+        .map_err(|_| "object candidate literal allocation failed".to_owned())?;
+    for pair in value.as_bytes().chunks_exact(2) {
+        let text = std::str::from_utf8(pair)
+            .map_err(|_| "object candidate literal hex is not UTF-8".to_owned())?;
+        output.push(
+            u8::from_str_radix(text, 16)
+                .map_err(|_| "object candidate literal hex is invalid".to_owned())?,
+        );
+    }
+    Ok(output)
 }
 
 fn exact_source(bytes: &[u8]) -> Vec<u8> {
@@ -486,7 +767,7 @@ fn write_scaffold(output: &Path) -> Result<(), std::io::Error> {
         "#[derive(Clone, Copy, Debug)]\npub(crate) struct CandidateIdentity { pub(crate) semantic_candidate_sha256: &'static str, pub(crate) literal_hex: &'static str, pub(crate) implementation_sha256: &'static str, pub(crate) glue_sha256: &'static str }\n",
     );
     generated.push_str(
-        "pub(crate) const LINKED: bool = false;\npub(crate) const TIMING_PERMITTED: bool = false;\npub(crate) const BACKEND_TAG: u16 = 0;\npub(crate) const BACKEND_NAME: &str = \"unresolved\";\npub(crate) const FAMILY_SELECTOR: u16 = 0;\npub(crate) const MINIMUM_WINDOW_BYTES: usize = 1;\npub(crate) const PORTABLE_PREFIX_CANDIDATE_STARTS: usize = 1;\npub(crate) const PLAN_IDENTITY: &str = \"unresolved\";\npub(crate) const ANALYZER_IDENTITY: &str = \"unresolved\";\npub(crate) const EVIDENCE_IDENTITY: &str = \"unresolved\";\npub(crate) const IDENTITY_SHA256: &str = \"unresolved\";\npub(crate) const RUNNER_SOURCE_SHA256: &str = \"unresolved\";\npub(crate) const CANDIDATES: [CandidateIdentity; 4] = [CandidateIdentity { semantic_candidate_sha256: \"\", literal_hex: \"\", implementation_sha256: \"\", glue_sha256: \"\" }; 4];\n",
+        "pub(crate) const LINKED: bool = false;\npub(crate) const TIMING_PERMITTED: bool = false;\npub(crate) const BACKEND_TAG: u16 = 0;\npub(crate) const BACKEND_NAME: &str = \"unresolved\";\npub(crate) const FAMILY_SELECTOR: u16 = 0;\npub(crate) const MINIMUM_WINDOW_BYTES: usize = 1;\npub(crate) const PORTABLE_PREFIX_CANDIDATE_STARTS: usize = 1;\npub(crate) const PLAN_IDENTITY: &str = \"unresolved\";\npub(crate) const ANALYZER_IDENTITY: &str = \"unresolved\";\npub(crate) const EVIDENCE_IDENTITY: &str = \"unresolved\";\npub(crate) const IDENTITY_SHA256: &str = \"unresolved\";\npub(crate) const RUNNER_SOURCE_SHA256: &str = \"unresolved\";\npub(crate) const OBJECT_CANDIDATE_MANIFEST_SCHEMA: &str = \"unresolved\";\npub(crate) const OBJECT_CANDIDATE_MANIFEST_SHA256: &str = \"unresolved\";\npub(crate) const CANONICAL_BYTE_ESCAPED_SOURCES: bool = false;\npub(crate) static CANDIDATES: &[CandidateIdentity] = &[];\n",
     );
     generated.push_str(
         "#[allow(unsafe_code, unused_variables, reason = \"selector-neutral scaffold has no linked glue to invoke\")]\npub(crate) unsafe fn invoke(index: usize, output: *mut fre_aot_static_runtime::RawStaticSearchSpanAdoptionOutputV1) -> u32 { fre_aot_static_runtime::STATIC_SEARCH_SPAN_ADOPT_STATUS_NO_QUALIFIED_ROW_V1 }\n",
@@ -561,6 +842,10 @@ fn path_u16(root: &Value, path: &[&str]) -> u16 {
 
 fn path_u32(root: &Value, path: &[&str]) -> u32 {
     u32::try_from(path_u64(root, path)).unwrap_or_else(|_| panic!("non-u32 {path:?}"))
+}
+
+fn path_usize(root: &Value, path: &[&str]) -> usize {
+    usize::try_from(path_u64(root, path)).unwrap_or_else(|_| panic!("non-usize {path:?}"))
 }
 
 fn path_u64(root: &Value, path: &[&str]) -> u64 {

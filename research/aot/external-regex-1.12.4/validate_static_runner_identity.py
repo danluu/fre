@@ -9,7 +9,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
-SCHEMA = "fre.aot.external-regex-1.12.4-static-runner-identity.v1"
+SCHEMA_V1 = "fre.aot.external-regex-1.12.4-static-runner-identity.v1"
+SCHEMA_V2 = "fre.aot.external-regex-1.12.4-static-runner-identity.v2"
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 HEX40 = re.compile(r"[0-9a-f]{40}\Z")
 EXTERNAL_COMMIT = "93c24d3b2618597c3336457ee570cbe00cc33bd3"
@@ -79,22 +80,26 @@ def pending_paths(value: Any, prefix: str = "") -> list[str]:
 
 
 def validate(value: dict[str, Any]) -> list[str]:
+    schema = value.get("schema")
+    refuse(schema in {SCHEMA_V1, SCHEMA_V2}, "identity schema changed")
+    expected_keys = {
+        "schema",
+        "external_evidence",
+        "emitter",
+        "static_pipeline",
+        "auto_routing",
+        "static_facade",
+        "platform_artifacts",
+        "runner",
+        "state",
+    }
+    if schema == SCHEMA_V2:
+        expected_keys.add("object_candidates")
     exact_keys(
         value,
-        {
-            "schema",
-            "external_evidence",
-            "emitter",
-            "static_pipeline",
-            "auto_routing",
-            "static_facade",
-            "platform_artifacts",
-            "runner",
-            "state",
-        },
+        expected_keys,
         "identity",
     )
-    refuse(value["schema"] == SCHEMA, "identity schema changed")
     external = require_object(value["external_evidence"], "external evidence")
     exact_keys(
         external,
@@ -128,21 +133,97 @@ def validate(value: dict[str, Any]) -> list[str]:
         "fixture_manifest_sha256",
     ):
         require_sha(external.get(field), f"external evidence {field} is invalid")
+    if schema == SCHEMA_V2:
+        object_candidates = require_object(
+            value["object_candidates"], "object candidates"
+        )
+        exact_keys(
+            object_candidates,
+            {
+                "manifest_schema",
+                "manifest_sha256",
+                "candidate_count",
+                "source_construction",
+            },
+            "object candidates",
+        )
+        refuse(
+            object_candidates["source_construction"]
+            == "canonical-byte-escaped-exact",
+            "object candidate source construction changed",
+        )
+        require_optional_text(
+            object_candidates["manifest_schema"],
+            "object candidate manifest schema is invalid",
+        )
+        require_optional_sha(
+            object_candidates["manifest_sha256"],
+            "object candidate manifest SHA-256 is invalid",
+        )
+        if object_candidates["candidate_count"] is not None:
+            refuse(
+                isinstance(object_candidates["candidate_count"], int)
+                and not isinstance(object_candidates["candidate_count"], bool)
+                and 0 < object_candidates["candidate_count"] <= 1024,
+                "object candidate count is invalid",
+            )
 
     emitter = require_object(value["emitter"], "emitter")
-    refuse(
-        emitter
-        == {
-            "source_commit": EMITTER_COMMIT,
-            "backend": "AsimdV10",
-            "backend_tag": 23,
-            "aot_magic_hex": "4652454136340017",
-            "candidate_policy": 10,
-            "authorization": False,
-            "llvm": False,
-        },
-        "emitter identity changed",
-    )
+    if schema == SCHEMA_V1:
+        refuse(
+            emitter
+            == {
+                "source_commit": EMITTER_COMMIT,
+                "backend": "AsimdV10",
+                "backend_tag": 23,
+                "aot_magic_hex": "4652454136340017",
+                "candidate_policy": 10,
+                "authorization": False,
+                "llvm": False,
+            },
+            "emitter identity changed",
+        )
+    else:
+        exact_keys(
+            emitter,
+            {
+                "source_commit",
+                "backend",
+                "backend_tag",
+                "aot_magic_hex",
+                "candidate_policy",
+                "authorization",
+                "llvm",
+            },
+            "emitter",
+        )
+        refuse(
+            emitter["authorization"] is False and emitter["llvm"] is False,
+            "emitter granted authority or LLVM",
+        )
+        require_optional_commit(emitter["source_commit"], "emitter commit is invalid")
+        require_optional_text(emitter["backend"], "emitter backend is invalid")
+        if emitter["backend_tag"] is not None:
+            refuse(
+                isinstance(emitter["backend_tag"], int)
+                and not isinstance(emitter["backend_tag"], bool)
+                and 0 < emitter["backend_tag"] <= 0xFFFF,
+                "emitter backend tag is invalid",
+            )
+        if emitter["aot_magic_hex"] is not None:
+            refuse(
+                isinstance(emitter["aot_magic_hex"], str)
+                and re.fullmatch(r"[0-9a-f]{16}", emitter["aot_magic_hex"])
+                is not None,
+                "emitter magic is invalid",
+            )
+        if emitter["candidate_policy"] is not None:
+            refuse(
+                isinstance(emitter["candidate_policy"], int)
+                and not isinstance(emitter["candidate_policy"], bool)
+                and 0 < emitter["candidate_policy"] <= 0xFFFF,
+                "emitter candidate policy is invalid",
+            )
     static = require_object(value["static_pipeline"], "static pipeline")
     exact_keys(
         static,
@@ -177,6 +258,12 @@ def validate(value: dict[str, Any]) -> list[str]:
     require_optional_text(
         static["link_interface_schema"], "link interface schema is invalid"
     )
+    if schema == SCHEMA_V2 and emitter["backend_tag"] is not None:
+        refuse(
+            emitter["backend"] == static["backend_name"]
+            and emitter["backend_tag"] == static["backend_tag"],
+            "emitter and static backend identities differ",
+        )
     routing = require_object(value["auto_routing"], "auto routing")
     exact_keys(
         routing,
