@@ -2910,6 +2910,90 @@ fn v11_dual_endpoint_images_publish_and_match_every_mutation_offset() {
 }
 
 #[test]
+fn v12_specialized_confirmation_respects_every_guarded_width_and_mutation_offset() {
+    let _lock = native_test_lock();
+    let mut comparisons = 0_u64;
+
+    for width in 1_usize..=32 {
+        let literal = (0..width)
+            .map(|offset| {
+                u8::try_from(offset)
+                    .expect("bounded width")
+                    .wrapping_mul(61)
+                    .wrapping_add(7)
+            })
+            .collect::<Vec<_>>();
+        let program = build_exact_literal::<Span>(
+            &literal,
+            AnchorFlags::default(),
+            ValidateLimits::default(),
+        )
+        .expect("V12 exact program");
+        let image = emit_audited_with_backend(
+            &program,
+            SearchBackendPolicy::AsimdV12,
+            EmitLimits::default(),
+        )
+        .expect("audited V12 image");
+        assert_eq!(
+            image.as_image().backend_version(),
+            BackendVersion::SEARCH_V12
+        );
+        let kernel =
+            publish_audited::<Span>(&image, PublicationLimits::default()).expect("publish V12");
+        let avoid = (0_u16..=255)
+            .map(|value| u8::try_from(value).expect("bounded byte"))
+            .find(|byte| !literal.contains(byte))
+            .expect("literal leaves one avoiding byte");
+
+        for residue in [0_usize, 1, 7, 15] {
+            let slack = (16 - ((residue + width) & 15)) & 15;
+            let len = 1_021_usize
+                .checked_add(slack)
+                .expect("bounded guarded length");
+            let window_end = len.checked_sub(slack).expect("bounded guarded window");
+            let match_start = window_end
+                .checked_sub(width)
+                .expect("literal fits guarded window");
+            let mut bytes = vec![avoid; len];
+            install_literal(&mut bytes, match_start, &literal);
+            platform::with_guarded_haystack(&bytes, true, |guarded| {
+                assert_eq!(
+                    guarded[match_start..].as_ptr().addr() & 15,
+                    residue,
+                    "width={width} requested residue={residue}"
+                );
+                assert_native_matches(&program, &kernel, guarded, SearchWindow::new(0, window_end));
+            })
+            .expect("guarded final-candidate V12 search");
+            comparisons = comparisons.checked_add(1).expect("bounded comparisons");
+        }
+
+        for mutation_offset in 0..width {
+            let mut near_miss = literal.clone();
+            near_miss[mutation_offset] ^= 0x80;
+            let mut bytes = vec![avoid; 1_021];
+            for chunk in bytes.chunks_exact_mut(width) {
+                chunk.copy_from_slice(&near_miss);
+            }
+            let match_start = bytes.len() - width;
+            install_literal(&mut bytes, match_start, &literal);
+            platform::with_guarded_haystack(&bytes, true, |guarded| {
+                assert_native_matches(
+                    &program,
+                    &kernel,
+                    guarded,
+                    SearchWindow::new(0, guarded.len()),
+                );
+            })
+            .expect("guarded every-offset V12 mutation stream");
+            comparisons = comparisons.checked_add(1).expect("bounded comparisons");
+        }
+    }
+    assert_eq!(comparisons, 656);
+}
+
+#[test]
 fn v8_adaptive_secondary_screen_rechecks_primary_before_fallback() {
     const WIDE_CANDIDATES: usize = 64;
     const PRIMARY_OFFSET: usize = 7;

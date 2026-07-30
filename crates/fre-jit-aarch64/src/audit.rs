@@ -306,6 +306,7 @@ fn validate_search_backend_version(image: &NativeImage) -> Result<BackendVersion
         | BackendVersion::SEARCH_V9
         | BackendVersion::SEARCH_V10
         | BackendVersion::SEARCH_V11
+        | BackendVersion::SEARCH_V12
         | BackendVersion::SEARCH_SVE16_V1
         | BackendVersion::SEARCH_SVE2_16_V1
         | BackendVersion::SEARCH_SVE16_V6
@@ -341,6 +342,7 @@ fn authenticate_search_envelope<'image>(
             | BackendVersion::SEARCH_V9
             | BackendVersion::SEARCH_V10
             | BackendVersion::SEARCH_V11
+            | BackendVersion::SEARCH_V12
             | BackendVersion::SEARCH_SVE16_V1
             | BackendVersion::SEARCH_SVE2_16_V1
             | BackendVersion::SEARCH_SVE16_V6
@@ -577,7 +579,10 @@ fn authenticate_search_manifest<'image>(
             }
             if matches!(
                 manifest.backend_version,
-                BackendVersion::SEARCH_V9 | BackendVersion::SEARCH_V10 | BackendVersion::SEARCH_V11
+                BackendVersion::SEARCH_V9
+                    | BackendVersion::SEARCH_V10
+                    | BackendVersion::SEARCH_V11
+                    | BackendVersion::SEARCH_V12
             ) && (manifest.anchors != AnchorFlags::default() || literal_len == 0)
             {
                 return Err(AuditError::InvalidSearchManifest);
@@ -623,6 +628,7 @@ fn authenticate_class_suffix_manifest(
             | BackendVersion::SEARCH_V9
             | BackendVersion::SEARCH_V10
             | BackendVersion::SEARCH_V11
+            | BackendVersion::SEARCH_V12
     ) {
         return Err(AuditError::InvalidSearchManifest);
     }
@@ -710,6 +716,7 @@ const SEARCH_CANDIDATE_POLICY_SVE2_FIXED16_V2: u16 = 8;
 const SEARCH_CANDIDATE_POLICY_V5: u16 = 9;
 const SEARCH_CANDIDATE_POLICY_V6: u16 = 10;
 const SEARCH_CANDIDATE_POLICY_V7: u16 = 11;
+const SEARCH_CANDIDATE_POLICY_V8: u16 = 12;
 const SEARCH_CANDIDATE_BLOCK_WIDTH: u16 = 16;
 const SEARCH_CANDIDATE_OFFSET_NONE: u16 = u16::MAX;
 const SVE2_CLASS_TABLE_DATA_ID: u32 = 2;
@@ -753,9 +760,10 @@ fn authenticate_search_candidate_policy(
                 )
             } else {
                 let (primary, secondary) = independent_exact_candidate_pair(literal);
-                let (verification, quaternary, quinary) = if manifest.backend_version
-                    == BackendVersion::SEARCH_V11
-                {
+                let (verification, quaternary, quinary) = if matches!(
+                    manifest.backend_version,
+                    BackendVersion::SEARCH_V11 | BackendVersion::SEARCH_V12
+                ) {
                     independent_ranked_verification_offsets_v3(literal, primary, secondary)
                 } else if matches!(
                     manifest.backend_version,
@@ -841,6 +849,10 @@ fn authenticate_search_candidate_policy(
                     && manifest.shape == SearchShape::ExactLiteral
                 {
                     SEARCH_CANDIDATE_POLICY_V7
+                } else if manifest.backend_version == BackendVersion::SEARCH_V12
+                    && manifest.shape == SearchShape::ExactLiteral
+                {
+                    SEARCH_CANDIDATE_POLICY_V8
                 } else if manifest.backend_version == BackendVersion::SEARCH_V9
                     && manifest.shape == SearchShape::ExactLiteral
                 {
@@ -4586,6 +4598,15 @@ pub(crate) fn first_forbidden_explicit_gpr(instruction: DecodedInstruction) -> O
         } => forbidden(&[destination, source]),
         DecodedInstruction::LoadByte {
             destination, base, ..
+        }
+        | DecodedInstruction::Load16 {
+            destination, base, ..
+        }
+        | DecodedInstruction::Load32 {
+            destination, base, ..
+        }
+        | DecodedInstruction::Load64 {
+            destination, base, ..
         } => forbidden(&[destination, base]),
         DecodedInstruction::LoadVector128 { base, .. }
         | DecodedInstruction::LoadVectorPair128 { base, .. }
@@ -4745,6 +4766,7 @@ fn first_forbidden_search_vector_register(
                 | BackendVersion::SEARCH_V9
                 | BackendVersion::SEARCH_V10
                 | BackendVersion::SEARCH_V11
+                | BackendVersion::SEARCH_V12
                 | BackendVersion::SEARCH_SVE16_V6
                 | BackendVersion::SEARCH_SVE2_FIXED16_V2 => register >= 16,
                 _ => false,
@@ -5780,6 +5802,9 @@ fn aggregate_gpr_reads(instruction: DecodedInstruction) -> u32 {
         DecodedInstruction::ReverseBits64 { source, .. }
         | DecodedInstruction::CountLeadingZeros64 { source, .. } => register_mask(&[source]),
         DecodedInstruction::LoadByte { base, .. }
+        | DecodedInstruction::Load16 { base, .. }
+        | DecodedInstruction::Load32 { base, .. }
+        | DecodedInstruction::Load64 { base, .. }
         | DecodedInstruction::LoadVector128 { base, .. }
         | DecodedInstruction::LoadVectorPair128 { base, .. }
         | DecodedInstruction::SveLoadBytes { base, .. } => register_mask(&[base]),

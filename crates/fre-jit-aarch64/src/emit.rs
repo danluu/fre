@@ -49,6 +49,7 @@ const SEARCH_CANDIDATE_POLICY_SVE2_FIXED16_V2: u16 = 8;
 const SEARCH_CANDIDATE_POLICY_V5: u16 = 9;
 const SEARCH_CANDIDATE_POLICY_V6: u16 = 10;
 const SEARCH_CANDIDATE_POLICY_V7: u16 = 11;
+const SEARCH_CANDIDATE_POLICY_V8: u16 = 12;
 const SEARCH_CANDIDATE_BLOCK_WIDTH: u16 = 16;
 const SEARCH_CANDIDATE_OFFSET_NONE: u16 = u16::MAX;
 const SVE2_CLASS_TABLE_DATA_ID: u32 = 2;
@@ -82,6 +83,9 @@ pub enum SearchBackendPolicy {
     /// Search V11 candidate: V9 plus five ASIMD columns that reserve both
     /// literal endpoints before frequency-ranked columns.
     AsimdV11,
+    /// Search V12 candidate: V11 screening plus length-specialized loop-free
+    /// exact confirmation for the complete 1..=32-byte envelope.
+    AsimdV12,
     /// SVE screening with exactly sixteen active byte lanes.
     Sve16,
     /// SVE2 `MATCH` screening with exactly sixteen active byte lanes,
@@ -106,6 +110,7 @@ impl SearchBackendPolicy {
             Self::AsimdV9 => BackendVersion::SEARCH_V9,
             Self::AsimdV10 => BackendVersion::SEARCH_V10,
             Self::AsimdV11 => BackendVersion::SEARCH_V11,
+            Self::AsimdV12 => BackendVersion::SEARCH_V12,
             Self::Sve16 => BackendVersion::SEARCH_SVE16_V1,
             Self::Sve2Fixed16 => BackendVersion::SEARCH_SVE2_16_V1,
             Self::Sve16V6 => BackendVersion::SEARCH_SVE16_V6,
@@ -318,6 +323,7 @@ fn emit_search_image<O: Operation>(
             | BackendVersion::SEARCH_V9
             | BackendVersion::SEARCH_V10
             | BackendVersion::SEARCH_V11
+            | BackendVersion::SEARCH_V12
             | BackendVersion::SEARCH_SVE16_V1
             | BackendVersion::SEARCH_SVE2_16_V1
             | BackendVersion::SEARCH_SVE16_V6
@@ -378,7 +384,10 @@ fn emit_search_image<O: Operation>(
     }
     if matches!(
         backend_version,
-        BackendVersion::SEARCH_V9 | BackendVersion::SEARCH_V10 | BackendVersion::SEARCH_V11
+        BackendVersion::SEARCH_V9
+            | BackendVersion::SEARCH_V10
+            | BackendVersion::SEARCH_V11
+            | BackendVersion::SEARCH_V12
     ) && !plan.is_v9_policy_shape()
     {
         return Err(EmitError::Unsupported {
@@ -505,6 +514,7 @@ fn emit_search_image<O: Operation>(
                 | BackendVersion::SEARCH_V9
                 | BackendVersion::SEARCH_V10
                 | BackendVersion::SEARCH_V11
+                | BackendVersion::SEARCH_V12
                 | BackendVersion::SEARCH_SVE16_V1
                 | BackendVersion::SEARCH_SVE2_16_V1
                 | BackendVersion::SEARCH_SVE16_V6
@@ -1563,6 +1573,7 @@ impl<'a> Plan<'a> {
                         | BackendVersion::SEARCH_V9
                         | BackendVersion::SEARCH_V10
                         | BackendVersion::SEARCH_V11
+                        | BackendVersion::SEARCH_V12
                         | BackendVersion::SEARCH_SVE16_V6
                         | BackendVersion::SEARCH_SVE2_FIXED16_V2
                 ) =>
@@ -1613,6 +1624,7 @@ impl<'a> Plan<'a> {
                 | BackendVersion::SEARCH_V9
                 | BackendVersion::SEARCH_V10
                 | BackendVersion::SEARCH_V11
+                | BackendVersion::SEARCH_V12
                 | BackendVersion::SEARCH_SVE16_V1
                 | BackendVersion::SEARCH_SVE2_16_V1
                 | BackendVersion::SEARCH_SVE16_V6
@@ -1656,22 +1668,28 @@ impl<'a> Plan<'a> {
                         | BackendVersion::SEARCH_V9
                         | BackendVersion::SEARCH_V10
                         | BackendVersion::SEARCH_V11
+                        | BackendVersion::SEARCH_V12
                         | BackendVersion::SEARCH_SVE16_V1
                         | BackendVersion::SEARCH_SVE2_16_V1
                         | BackendVersion::SEARCH_SVE16_V6
                         | BackendVersion::SEARCH_SVE2_FIXED16_V2
                 ) {
                     let admission = v7_policy_scan_admission.ok_or(EmitError::InternalInvariant)?;
-                    Some(if backend_version == BackendVersion::SEARCH_V11 {
-                        admission.select_offsets_v3()
-                    } else if matches!(
-                        backend_version,
-                        BackendVersion::SEARCH_SVE2_FIXED16_V2 | BackendVersion::SEARCH_V10
-                    ) {
-                        admission.select_offsets_v2()
-                    } else {
-                        admission.select_offsets()
-                    })
+                    Some(
+                        if matches!(
+                            backend_version,
+                            BackendVersion::SEARCH_V11 | BackendVersion::SEARCH_V12
+                        ) {
+                            admission.select_offsets_v3()
+                        } else if matches!(
+                            backend_version,
+                            BackendVersion::SEARCH_SVE2_FIXED16_V2 | BackendVersion::SEARCH_V10
+                        ) {
+                            admission.select_offsets_v2()
+                        } else {
+                            admission.select_offsets()
+                        },
+                    )
                 } else {
                     if v7_policy_scan_admission.is_some() {
                         return Err(EmitError::InternalInvariant);
@@ -1761,6 +1779,10 @@ impl<'a> Plan<'a> {
                         && shape == SearchShape::ExactLiteral
                     {
                         SEARCH_CANDIDATE_POLICY_V7
+                    } else if backend_version == BackendVersion::SEARCH_V12
+                        && shape == SearchShape::ExactLiteral
+                    {
+                        SEARCH_CANDIDATE_POLICY_V8
                     } else if backend_version == BackendVersion::SEARCH_V9
                         && shape == SearchShape::ExactLiteral
                     {
@@ -2028,6 +2050,19 @@ fn emit_exact(
         }
         BackendVersion::SEARCH_V11 => {
             emit_vector_candidate_skip_v10(
+                assembler,
+                literal,
+                primary_offset,
+                secondary_offset,
+                verification_offset,
+                quaternary_offset,
+                quinary_offset,
+                none,
+                found,
+            )?;
+        }
+        BackendVersion::SEARCH_V12 => {
+            emit_vector_candidate_skip_v12(
                 assembler,
                 literal,
                 primary_offset,
@@ -2968,6 +3003,54 @@ fn emit_vector_candidate_skip_v10(
 
 #[allow(
     clippy::too_many_arguments,
+    reason = "the V12 prefix is explicit before its length-specialized extension of the frozen V11 screen"
+)]
+fn emit_vector_candidate_skip_v12(
+    assembler: &mut Assembler,
+    literal: &[u8],
+    primary_offset: u16,
+    secondary_offset: Option<u16>,
+    verification_offset: Option<u16>,
+    quaternary_offset: Option<u16>,
+    quinary_offset: Option<u16>,
+    none: Label,
+    found: Label,
+) -> Result<(), EmitError> {
+    let first_candidate_miss = assembler.new_label(LabelKind::Internal)?;
+    let selected = literal
+        .get(usize::from(primary_offset))
+        .copied()
+        .ok_or(EmitError::InternalInvariant)?;
+
+    assembler.add_reg(X15, X9, X5)?;
+    assembler.load_byte(X10, X15, primary_offset)?;
+    assembler.cmp_imm32(X10, u16::from(selected))?;
+    assembler.branch_cond(Condition::NotEqual, first_candidate_miss)?;
+    if literal.len() > 1 {
+        emit_literal_equality_specialized(assembler, X15, X8, literal.len(), first_candidate_miss)?;
+    }
+    assembler.mov_reg(X13, X5)?;
+    assembler.add_reg(X14, X5, X12)?;
+    assembler.branch(found)?;
+
+    assembler.bind(first_candidate_miss)?;
+    assembler.add_imm(X5, X5, 1)?;
+    emit_vector_candidate_skip_v8(
+        assembler,
+        literal,
+        primary_offset,
+        secondary_offset,
+        verification_offset,
+        quaternary_offset,
+        quinary_offset,
+        BackendVersion::SEARCH_V12,
+        none,
+        found,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
     clippy::too_many_lines,
     reason = "the versioned v8 graph keeps its paired 64-candidate screen and authenticated staged recovery explicit"
 )]
@@ -3302,6 +3385,8 @@ fn emit_vector_candidate_skip_v8(
                 X13,
             )?;
         }
+    } else if backend_version == BackendVersion::SEARCH_V12 {
+        emit_literal_equality_specialized(assembler, X15, X8, literal.len(), candidate_miss)?;
     } else if literal.len() == 16 {
         emit_literal_equality_16_with_vectors(assembler, X15, X8, candidate_miss, 16, 17)?;
     } else {
@@ -4121,6 +4206,96 @@ fn emit_literal_equality_16_with_vectors(
     assembler.move_vector_byte_to32(X10, left_vector)?;
     assembler.cmp_imm32(X10, 255)?;
     assembler.branch_cond(Condition::NotEqual, mismatch)
+}
+
+fn emit_literal_equality_specialized(
+    assembler: &mut Assembler,
+    hay_pointer: u8,
+    needle_pointer: u8,
+    length: usize,
+    mismatch: Label,
+) -> Result<(), EmitError> {
+    match length {
+        0 => return Err(EmitError::InternalInvariant),
+        1 => {
+            assembler.load_byte(X10, hay_pointer, 0)?;
+            assembler.load_byte(X13, needle_pointer, 0)?;
+            assembler.cmp_reg32(X10, X13)?;
+            assembler.branch_cond(Condition::NotEqual, mismatch)?;
+        }
+        2..=3 => {
+            assembler.load16(X10, hay_pointer, 0)?;
+            assembler.load16(X13, needle_pointer, 0)?;
+            assembler.cmp_reg32(X10, X13)?;
+            assembler.branch_cond(Condition::NotEqual, mismatch)?;
+            if length == 3 {
+                assembler.add_imm(X16, hay_pointer, 1)?;
+                assembler.add_imm(X17, needle_pointer, 1)?;
+                assembler.load16(X10, X16, 0)?;
+                assembler.load16(X13, X17, 0)?;
+                assembler.cmp_reg32(X10, X13)?;
+                assembler.branch_cond(Condition::NotEqual, mismatch)?;
+            }
+        }
+        4..=7 => {
+            assembler.load32(X10, hay_pointer, 0)?;
+            assembler.load32(X13, needle_pointer, 0)?;
+            assembler.cmp_reg32(X10, X13)?;
+            assembler.branch_cond(Condition::NotEqual, mismatch)?;
+            if length > 4 {
+                let tail = u16::try_from(length - 4).map_err(|_| EmitError::InternalInvariant)?;
+                assembler.add_imm(X16, hay_pointer, tail)?;
+                assembler.add_imm(X17, needle_pointer, tail)?;
+                assembler.load32(X10, X16, 0)?;
+                assembler.load32(X13, X17, 0)?;
+                assembler.cmp_reg32(X10, X13)?;
+                assembler.branch_cond(Condition::NotEqual, mismatch)?;
+            }
+        }
+        8..=15 => {
+            assembler.load64(X10, hay_pointer, 0)?;
+            assembler.load64(X13, needle_pointer, 0)?;
+            assembler.cmp_reg64(X10, X13)?;
+            assembler.branch_cond(Condition::NotEqual, mismatch)?;
+            if length > 8 {
+                let tail = u16::try_from(length - 8).map_err(|_| EmitError::InternalInvariant)?;
+                assembler.add_imm(X16, hay_pointer, tail)?;
+                assembler.add_imm(X17, needle_pointer, tail)?;
+                assembler.load64(X10, X16, 0)?;
+                assembler.load64(X13, X17, 0)?;
+                assembler.cmp_reg64(X10, X13)?;
+                assembler.branch_cond(Condition::NotEqual, mismatch)?;
+            }
+        }
+        16 => {
+            emit_literal_equality_16_with_vectors(
+                assembler,
+                hay_pointer,
+                needle_pointer,
+                mismatch,
+                16,
+                17,
+            )?;
+        }
+        17..=MAX_REPEATED_CONFIRM_BYTES => {
+            let tail = u16::try_from(length - 16).map_err(|_| EmitError::InternalInvariant)?;
+            assembler.load_vector128(16, hay_pointer, 0)?;
+            assembler.load_vector128(17, needle_pointer, 0)?;
+            assembler.compare_equal_bytes16(16, 16, 17)?;
+            assembler.add_imm(X16, hay_pointer, tail)?;
+            assembler.add_imm(X17, needle_pointer, tail)?;
+            assembler.load_vector128(18, X16, 0)?;
+            assembler.load_vector128(19, X17, 0)?;
+            assembler.compare_equal_bytes16(18, 18, 19)?;
+            assembler.and_bytes16(16, 16, 18)?;
+            assembler.unsigned_min_bytes16(16, 16)?;
+            assembler.move_vector_byte_to32(X10, 16)?;
+            assembler.cmp_imm32(X10, 255)?;
+            assembler.branch_cond(Condition::NotEqual, mismatch)?;
+        }
+        _ => return Err(EmitError::InternalInvariant),
+    }
+    Ok(())
 }
 
 fn emit_class_suffix(
@@ -5130,6 +5305,28 @@ impl Assembler {
         )
     }
 
+    fn load16(&mut self, destination: u8, base: u8, offset: u16) -> Result<(), EmitError> {
+        debug_assert!(offset.is_multiple_of(2) && offset / 2 <= 0xfff);
+        self.emit_word(
+            0x7940_0000
+                | (u32::from(offset / 2) << 10)
+                | reg_field(base, 5)
+                | u32::from(destination),
+            false,
+        )
+    }
+
+    fn load32(&mut self, destination: u8, base: u8, offset: u16) -> Result<(), EmitError> {
+        debug_assert!(offset.is_multiple_of(4) && offset / 4 <= 0xfff);
+        self.emit_word(
+            0xb940_0000
+                | (u32::from(offset / 4) << 10)
+                | reg_field(base, 5)
+                | u32::from(destination),
+            false,
+        )
+    }
+
     fn load_byte_reg(&mut self, destination: u8, base: u8, index: u8) -> Result<(), EmitError> {
         self.emit_word(
             0x3860_6800 | reg_field(index, 16) | reg_field(base, 5) | u32::from(destination),
@@ -5140,6 +5337,17 @@ impl Assembler {
     fn load64_reg_scaled(&mut self, destination: u8, base: u8, index: u8) -> Result<(), EmitError> {
         self.emit_word(
             0xf860_7800 | reg_field(index, 16) | reg_field(base, 5) | u32::from(destination),
+            false,
+        )
+    }
+
+    fn load64(&mut self, destination: u8, base: u8, offset: u16) -> Result<(), EmitError> {
+        debug_assert!(offset.is_multiple_of(8) && offset / 8 <= 0xfff);
+        self.emit_word(
+            0xf940_0000
+                | (u32::from(offset / 8) << 10)
+                | reg_field(base, 5)
+                | u32::from(destination),
             false,
         )
     }

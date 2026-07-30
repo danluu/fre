@@ -72,6 +72,7 @@ const fn qualification_for_backend_with_atoms(
         | QualifiedExactSearchBackendPolicy::AsimdV9
         | QualifiedExactSearchBackendPolicy::AsimdV10
         | QualifiedExactSearchBackendPolicy::AsimdV11
+        | QualifiedExactSearchBackendPolicy::AsimdV12
         | QualifiedExactSearchBackendPolicy::Sve16 => QualifiedExactSearchQualification::Candidate,
     }
 }
@@ -876,6 +877,7 @@ const fn selected_end_register_backend_v2(
         | QualifiedExactSearchBackendPolicy::AsimdV9
         | QualifiedExactSearchBackendPolicy::AsimdV10
         | QualifiedExactSearchBackendPolicy::AsimdV11
+        | QualifiedExactSearchBackendPolicy::AsimdV12
         | QualifiedExactSearchBackendPolicy::Sve16
         | QualifiedExactSearchBackendPolicy::Sve2Fixed16 => None,
     }
@@ -2667,6 +2669,7 @@ mod tests {
             QualifiedExactSearchBackendPolicy::AsimdV9,
             QualifiedExactSearchBackendPolicy::AsimdV10,
             QualifiedExactSearchBackendPolicy::AsimdV11,
+            QualifiedExactSearchBackendPolicy::AsimdV12,
             QualifiedExactSearchBackendPolicy::Sve16,
         ] {
             assert_eq!(selected_end_register_backend_v2(policy), None);

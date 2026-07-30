@@ -200,6 +200,22 @@ impl Template {
         });
     }
 
+    fn load16(&mut self, destination: u8, base: u8, offset: u16) {
+        self.push(DecodedInstruction::Load16 {
+            destination,
+            base,
+            offset,
+        });
+    }
+
+    fn load32(&mut self, destination: u8, base: u8, offset: u16) {
+        self.push(DecodedInstruction::Load32 {
+            destination,
+            base,
+            offset,
+        });
+    }
+
     fn load_byte_reg(&mut self, destination: u8, base: u8, index: u8) {
         self.push(DecodedInstruction::LoadByteRegister {
             destination,
@@ -213,6 +229,14 @@ impl Template {
             destination,
             base,
             index,
+        });
+    }
+
+    fn load64(&mut self, destination: u8, base: u8, offset: u16) {
+        self.push(DecodedInstruction::Load64 {
+            destination,
+            base,
+            offset,
         });
     }
 
@@ -804,6 +828,9 @@ fn emit_exact(
         BackendVersion::SEARCH_V10 | BackendVersion::SEARCH_V11 => {
             emit_exact_candidates_v10(template, manifest, literal, none, found)
         }
+        BackendVersion::SEARCH_V12 => {
+            emit_exact_candidates_v12(template, manifest, literal, none, found)
+        }
         BackendVersion::SEARCH_SVE2_FIXED16_V2 => {
             emit_exact_candidates_sve2_fixed16_v2(template, manifest, literal, none, found)
         }
@@ -1274,6 +1301,35 @@ fn emit_exact_candidates_v10(
     template.branch_cond(Condition::NotEqual, first_candidate_miss);
     if literal.len() > 1 {
         emit_literal_equality(template, 15, 8, literal.len(), first_candidate_miss)?;
+    }
+    template.mov_reg(13, 5);
+    template.add_reg(14, 5, 12);
+    template.branch(found);
+
+    template.bind(first_candidate_miss)?;
+    template.add_imm(5, 5, 1);
+    emit_exact_candidates_v8(template, manifest, literal, none, found)
+}
+
+fn emit_exact_candidates_v12(
+    template: &mut Template,
+    manifest: SearchManifest,
+    literal: &[u8],
+    none: Label,
+    found: Label,
+) -> Result<(), AuditError> {
+    let first_candidate_miss = template.new_label(LabelKind::Internal);
+    let selected = literal
+        .get(usize::from(manifest.primary_offset))
+        .copied()
+        .ok_or(AuditError::InvalidSearchManifest)?;
+
+    template.add_reg(15, 9, 5);
+    template.load_byte(10, 15, manifest.primary_offset);
+    template.cmp_imm32(10, u16::from(selected));
+    template.branch_cond(Condition::NotEqual, first_candidate_miss);
+    if literal.len() > 1 {
+        emit_literal_equality_specialized(template, 15, 8, literal.len(), first_candidate_miss)?;
     }
     template.mov_reg(13, 5);
     template.add_reg(14, 5, 12);
@@ -2045,6 +2101,8 @@ fn emit_exact_candidates_v8(
                 13,
             )?;
         }
+    } else if manifest.backend_version == BackendVersion::SEARCH_V12 {
+        emit_literal_equality_specialized(template, 15, 8, literal.len(), candidate_miss)?;
     } else if literal.len() == 16 {
         emit_literal_equality_16_with_vectors(template, 15, 8, candidate_miss, 16, 17);
     } else {
@@ -2574,6 +2632,96 @@ fn emit_literal_equality_16_with_vectors(
     template.move_vector_byte_to32(10, left_vector);
     template.cmp_imm32(10, 255);
     template.branch_cond(Condition::NotEqual, mismatch);
+}
+
+fn emit_literal_equality_specialized(
+    template: &mut Template,
+    hay_pointer: u8,
+    needle_pointer: u8,
+    length: usize,
+    mismatch: Label,
+) -> Result<(), AuditError> {
+    match length {
+        0 => return Err(AuditError::InvalidSearchManifest),
+        1 => {
+            template.load_byte(10, hay_pointer, 0);
+            template.load_byte(13, needle_pointer, 0);
+            template.cmp_reg32(10, 13);
+            template.branch_cond(Condition::NotEqual, mismatch);
+        }
+        2..=3 => {
+            template.load16(10, hay_pointer, 0);
+            template.load16(13, needle_pointer, 0);
+            template.cmp_reg32(10, 13);
+            template.branch_cond(Condition::NotEqual, mismatch);
+            if length == 3 {
+                template.add_imm(16, hay_pointer, 1);
+                template.add_imm(17, needle_pointer, 1);
+                template.load16(10, 16, 0);
+                template.load16(13, 17, 0);
+                template.cmp_reg32(10, 13);
+                template.branch_cond(Condition::NotEqual, mismatch);
+            }
+        }
+        4..=7 => {
+            template.load32(10, hay_pointer, 0);
+            template.load32(13, needle_pointer, 0);
+            template.cmp_reg32(10, 13);
+            template.branch_cond(Condition::NotEqual, mismatch);
+            if length > 4 {
+                let tail = u16::try_from(length - 4).map_err(|_| AuditError::ArithmeticOverflow)?;
+                template.add_imm(16, hay_pointer, tail);
+                template.add_imm(17, needle_pointer, tail);
+                template.load32(10, 16, 0);
+                template.load32(13, 17, 0);
+                template.cmp_reg32(10, 13);
+                template.branch_cond(Condition::NotEqual, mismatch);
+            }
+        }
+        8..=15 => {
+            template.load64(10, hay_pointer, 0);
+            template.load64(13, needle_pointer, 0);
+            template.cmp_reg64(10, 13);
+            template.branch_cond(Condition::NotEqual, mismatch);
+            if length > 8 {
+                let tail = u16::try_from(length - 8).map_err(|_| AuditError::ArithmeticOverflow)?;
+                template.add_imm(16, hay_pointer, tail);
+                template.add_imm(17, needle_pointer, tail);
+                template.load64(10, 16, 0);
+                template.load64(13, 17, 0);
+                template.cmp_reg64(10, 13);
+                template.branch_cond(Condition::NotEqual, mismatch);
+            }
+        }
+        16 => {
+            emit_literal_equality_16_with_vectors(
+                template,
+                hay_pointer,
+                needle_pointer,
+                mismatch,
+                16,
+                17,
+            );
+        }
+        17..=crate::MAX_REPEATED_CONFIRM_BYTES => {
+            let tail = u16::try_from(length - 16).map_err(|_| AuditError::ArithmeticOverflow)?;
+            template.load_vector128(16, hay_pointer, 0);
+            template.load_vector128(17, needle_pointer, 0);
+            template.compare_equal_bytes16(16, 16, 17);
+            template.add_imm(16, hay_pointer, tail);
+            template.add_imm(17, needle_pointer, tail);
+            template.load_vector128(18, 16, 0);
+            template.load_vector128(19, 17, 0);
+            template.compare_equal_bytes16(18, 18, 19);
+            template.and_bytes16(16, 16, 18);
+            template.unsigned_min_bytes16(16, 16);
+            template.move_vector_byte_to32(10, 16);
+            template.cmp_imm32(10, 255);
+            template.branch_cond(Condition::NotEqual, mismatch);
+        }
+        _ => return Err(AuditError::InvalidSearchManifest),
+    }
+    Ok(())
 }
 
 #[allow(

@@ -111,6 +111,16 @@ pub enum DecodedInstruction {
         base: u8,
         offset: u16,
     },
+    Load16 {
+        destination: u8,
+        base: u8,
+        offset: u16,
+    },
+    Load32 {
+        destination: u8,
+        base: u8,
+        offset: u16,
+    },
     LoadByteRegister {
         destination: u8,
         base: u8,
@@ -120,6 +130,11 @@ pub enum DecodedInstruction {
         destination: u8,
         base: u8,
         index: u8,
+    },
+    Load64 {
+        destination: u8,
+        base: u8,
+        offset: u16,
     },
     Store64 {
         source: u8,
@@ -392,8 +407,11 @@ impl DecodedInstruction {
             | Self::LogicalShiftRightImmediate64 { destination, .. }
             | Self::LogicalShiftLeftImmediate64 { destination, .. }
             | Self::LoadByte { destination, .. }
+            | Self::Load16 { destination, .. }
+            | Self::Load32 { destination, .. }
             | Self::LoadByteRegister { destination, .. }
             | Self::Load64RegisterScaled { destination, .. }
+            | Self::Load64 { destination, .. }
             | Self::MoveVectorByteTo32 { destination, .. }
             | Self::MoveVectorDoubleTo64 { destination, .. }
             | Self::SveCountPredicateBytes { destination, .. }
@@ -524,6 +542,15 @@ impl DecodedInstruction {
                 source,
             } => [destination, source].contains(&register),
             Self::LoadByte {
+                destination, base, ..
+            }
+            | Self::Load16 {
+                destination, base, ..
+            }
+            | Self::Load32 {
+                destination, base, ..
+            }
+            | Self::Load64 {
                 destination, base, ..
             } => [destination, base].contains(&register),
             Self::LoadVector128 { base, .. }
@@ -696,6 +723,18 @@ pub fn decode_one(word: u32, offset: u32) -> Result<DecodedInstruction, DecodeEr
             base: rn,
             offset: imm12(word),
         }
+    } else if word & 0xffc0_0000 == 0x7940_0000 {
+        DecodedInstruction::Load16 {
+            destination: rd,
+            base: rn,
+            offset: imm12(word).checked_mul(2).expect("scaled imm12 fits u16"),
+        }
+    } else if word & 0xffc0_0000 == 0xb940_0000 {
+        DecodedInstruction::Load32 {
+            destination: rd,
+            base: rn,
+            offset: imm12(word).checked_mul(4).expect("scaled imm12 fits u16"),
+        }
     } else if word & 0xffe0_fc00 == 0x3860_6800 {
         DecodedInstruction::LoadByteRegister {
             destination: rd,
@@ -707,6 +746,12 @@ pub fn decode_one(word: u32, offset: u32) -> Result<DecodedInstruction, DecodeEr
             destination: rd,
             base: rn,
             index: rm,
+        }
+    } else if word & 0xffc0_0000 == 0xf940_0000 {
+        DecodedInstruction::Load64 {
+            destination: rd,
+            base: rn,
+            offset: imm12(word).checked_mul(8).expect("scaled imm12 fits u16"),
         }
     } else if word & 0xffc0_0000 == 0xf900_0000 {
         DecodedInstruction::Store64 {
@@ -1036,6 +1081,32 @@ pub(crate) fn canonical_word(instruction: DecodedInstruction) -> Option<u32> {
                 | field(base, 5)?
                 | field(destination, 0)?
         }
+        DecodedInstruction::Load16 {
+            destination,
+            base,
+            offset,
+        } => {
+            if !offset.is_multiple_of(2) {
+                return None;
+            }
+            0x7940_0000
+                | immediate_field(offset / 2, 12, 10)?
+                | field(base, 5)?
+                | field(destination, 0)?
+        }
+        DecodedInstruction::Load32 {
+            destination,
+            base,
+            offset,
+        } => {
+            if !offset.is_multiple_of(4) {
+                return None;
+            }
+            0xb940_0000
+                | immediate_field(offset / 4, 12, 10)?
+                | field(base, 5)?
+                | field(destination, 0)?
+        }
         DecodedInstruction::LoadByteRegister {
             destination,
             base,
@@ -1046,6 +1117,19 @@ pub(crate) fn canonical_word(instruction: DecodedInstruction) -> Option<u32> {
             base,
             index,
         } => 0xf860_7800 | field(index, 16)? | field(base, 5)? | field(destination, 0)?,
+        DecodedInstruction::Load64 {
+            destination,
+            base,
+            offset,
+        } => {
+            if !offset.is_multiple_of(8) {
+                return None;
+            }
+            0xf940_0000
+                | immediate_field(offset / 8, 12, 10)?
+                | field(base, 5)?
+                | field(destination, 0)?
+        }
         DecodedInstruction::Store64 {
             source,
             base,
