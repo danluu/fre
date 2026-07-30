@@ -120,3 +120,9 @@ python3 research/aot/search-ripgrep-application-tag30-v1/analyze_qualification_r
   /sealed/campaign-binding.json EXPECTED_BINDING_FILE_SHA256 \
   /sealed/exact-64-fragment-result-directory
 ```
+
+`run_shards.py` runs one host/mode phase with one serialized queue per frozen
+CPU. It publishes only complete read-only fragments into the result directory;
+attempt logs and partial files stay in a separate control directory. Repeating
+an interrupted phase validates and skips completed fragments, so a client or
+rate-limit interruption does not discard finished work.
