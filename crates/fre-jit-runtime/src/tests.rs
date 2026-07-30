@@ -3152,6 +3152,66 @@ fn v14_learned_column_respects_guarded_empty_hit_disable_and_tail_transitions() 
 }
 
 #[test]
+fn v15_phase_unique_images_publish_and_respect_guarded_width_tail_boundaries() {
+    let _lock = native_test_lock();
+    let mut comparisons = 0_u64;
+    for width in [6_usize, 7, 8, 15, 16, 23, 24, 32] {
+        let literal = (0..width)
+            .map(|offset| {
+                u8::try_from(offset)
+                    .expect("bounded V15 width")
+                    .wrapping_mul(61)
+                    .wrapping_add(7)
+            })
+            .collect::<Vec<_>>();
+        let program = build_exact_literal::<Span>(
+            &literal,
+            AnchorFlags::default(),
+            ValidateLimits::default(),
+        )
+        .expect("V15 exact program");
+        let image = emit_audited_with_backend(
+            &program,
+            SearchBackendPolicy::AsimdV15,
+            EmitLimits::default(),
+        )
+        .expect("audited phase-unique V15 image");
+        assert_eq!(
+            image.as_image().backend_version(),
+            BackendVersion::SEARCH_V15
+        );
+        let kernel =
+            publish_audited::<Span>(&image, PublicationLimits::default()).expect("publish V15");
+        let avoid = (0_u16..=255)
+            .map(|value| u8::try_from(value).expect("bounded byte"))
+            .find(|byte| !literal.contains(byte))
+            .expect("V15 literal leaves one avoiding byte");
+
+        for mutation_offset in 0..width {
+            let mut near_miss = literal.clone();
+            near_miss[mutation_offset] = avoid;
+            let mut bytes = vec![avoid; 4_093];
+            for chunk in bytes.chunks_exact_mut(width) {
+                chunk.copy_from_slice(&near_miss);
+            }
+            let match_start = bytes.len() - width;
+            install_literal(&mut bytes, match_start, &literal);
+            platform::with_guarded_haystack(&bytes, true, |guarded| {
+                assert_native_matches(
+                    &program,
+                    &kernel,
+                    guarded,
+                    SearchWindow::new(0, guarded.len()),
+                );
+            })
+            .expect("guarded V15 phase-unique tail stream");
+            comparisons = comparisons.checked_add(1).expect("bounded comparisons");
+        }
+    }
+    assert_eq!(comparisons, 131);
+}
+
+#[test]
 fn v8_adaptive_secondary_screen_rechecks_primary_before_fallback() {
     const WIDE_CANDIDATES: usize = 64;
     const PRIMARY_OFFSET: usize = 7;

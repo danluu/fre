@@ -837,6 +837,9 @@ fn emit_exact(
         BackendVersion::SEARCH_V14 => {
             emit_exact_candidates_v14(template, manifest, literal, none, found)
         }
+        BackendVersion::SEARCH_V15 => {
+            emit_exact_candidates_v15(template, manifest, literal, none, found)
+        }
         BackendVersion::SEARCH_SVE2_FIXED16_V2 => {
             emit_exact_candidates_sve2_fixed16_v2(template, manifest, literal, none, found)
         }
@@ -1404,6 +1407,36 @@ fn emit_exact_candidates_v14(
     emit_exact_candidates_v8(template, manifest, literal, none, found)
 }
 
+fn emit_exact_candidates_v15(
+    template: &mut Template,
+    manifest: SearchManifest,
+    literal: &[u8],
+    none: Label,
+    found: Label,
+) -> Result<(), AuditError> {
+    let first_candidate_miss = template.new_label(LabelKind::Internal);
+    let selected = literal
+        .get(usize::from(manifest.primary_offset))
+        .copied()
+        .ok_or(AuditError::InvalidSearchManifest)?;
+
+    template.add_reg(15, 9, 5);
+    template.load_byte(10, 15, manifest.primary_offset);
+    template.cmp_imm32(10, u16::from(selected));
+    template.branch_cond(Condition::NotEqual, first_candidate_miss);
+    if literal.len() > 1 {
+        emit_literal_equality_specialized(template, 15, 8, literal.len(), first_candidate_miss)?;
+    }
+    template.mov_reg(13, 5);
+    template.add_reg(14, 5, 12);
+    template.branch(found);
+
+    template.bind(first_candidate_miss)?;
+    template.add_imm(5, 5, 1);
+    template.mov_reg(10, 10);
+    emit_exact_candidates_v8(template, manifest, literal, none, found)
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the complete v4 mask-guided control-flow template remains independent and reviewable"
@@ -1892,26 +1925,44 @@ fn emit_exact_candidates_v8(
     let candidate_miss = template.new_label(LabelKind::Internal);
     let recovery_exhausted = matches!(
         manifest.backend_version,
-        BackendVersion::SEARCH_V13 | BackendVersion::SEARCH_V14
+        BackendVersion::SEARCH_V13 | BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
     )
     .then(|| template.new_label(LabelKind::Internal));
     let adaptive_recovery = matches!(
         manifest.backend_version,
-        BackendVersion::SEARCH_V13 | BackendVersion::SEARCH_V14
+        BackendVersion::SEARCH_V13 | BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
     )
     .then(|| template.new_label(LabelKind::SlowPath));
-    let learned_discover = (manifest.backend_version == BackendVersion::SEARCH_V14)
-        .then(|| template.new_label(LabelKind::Loop));
-    let learned_column_ready = (manifest.backend_version == BackendVersion::SEARCH_V14)
-        .then(|| template.new_label(LabelKind::SlowPath));
-    let learned_advance = (manifest.backend_version == BackendVersion::SEARCH_V14)
-        .then(|| template.new_label(LabelKind::Internal));
-    let learned_scan = (manifest.backend_version == BackendVersion::SEARCH_V14)
-        .then(|| template.new_label(LabelKind::Loop));
-    let learned_disabled = (manifest.backend_version == BackendVersion::SEARCH_V14)
-        .then(|| template.new_label(LabelKind::SlowPath));
-    let learned_tail = (manifest.backend_version == BackendVersion::SEARCH_V14)
-        .then(|| template.new_label(LabelKind::SlowPath));
+    let learned_discover = matches!(
+        manifest.backend_version,
+        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
+    )
+    .then(|| template.new_label(LabelKind::Loop));
+    let learned_column_ready = matches!(
+        manifest.backend_version,
+        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
+    )
+    .then(|| template.new_label(LabelKind::SlowPath));
+    let learned_advance = matches!(
+        manifest.backend_version,
+        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
+    )
+    .then(|| template.new_label(LabelKind::Internal));
+    let learned_scan = matches!(
+        manifest.backend_version,
+        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
+    )
+    .then(|| template.new_label(LabelKind::Loop));
+    let learned_disabled = matches!(
+        manifest.backend_version,
+        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
+    )
+    .then(|| template.new_label(LabelKind::SlowPath));
+    let learned_tail = matches!(
+        manifest.backend_version,
+        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
+    )
+    .then(|| template.new_label(LabelKind::SlowPath));
     let tail_setup = template.new_label(LabelKind::SlowPath);
     let wide_second_filter = secondary_offset.map(|_| template.new_label(LabelKind::SlowPath));
     let second_filter = secondary_offset.map(|_| template.new_label(LabelKind::SlowPath));
@@ -1948,7 +1999,10 @@ fn emit_exact_candidates_v8(
         template.sve_ptrue_bytes_vl16(0);
         template.sve_load_bytes(31, 0, 8);
     }
-    if manifest.backend_version == BackendVersion::SEARCH_V14 {
+    if matches!(
+        manifest.backend_version,
+        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
+    ) {
         if !filters_cover_zero {
             return Err(AuditError::InvalidSearchManifest);
         }
@@ -2194,7 +2248,10 @@ fn emit_exact_candidates_v8(
         }
     } else if matches!(
         manifest.backend_version,
-        BackendVersion::SEARCH_V12 | BackendVersion::SEARCH_V13 | BackendVersion::SEARCH_V14
+        BackendVersion::SEARCH_V12
+            | BackendVersion::SEARCH_V13
+            | BackendVersion::SEARCH_V14
+            | BackendVersion::SEARCH_V15
     ) {
         emit_literal_equality_specialized(template, 15, 8, literal.len(), candidate_miss)?;
     } else if literal.len() == 16 {
@@ -2256,7 +2313,10 @@ fn emit_exact_candidates_v8(
         }
         template.branch(lane_loop);
         template.bind(exhausted)?;
-    } else if manifest.backend_version == BackendVersion::SEARCH_V14 {
+    } else if matches!(
+        manifest.backend_version,
+        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
+    ) {
         let discover = learned_discover.ok_or(AuditError::InvalidSearchManifest)?;
         let column_ready = learned_column_ready.ok_or(AuditError::InvalidSearchManifest)?;
         let learned_next = learned_advance.ok_or(AuditError::InvalidSearchManifest)?;

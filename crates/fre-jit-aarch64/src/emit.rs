@@ -52,6 +52,7 @@ const SEARCH_CANDIDATE_POLICY_V7: u16 = 11;
 const SEARCH_CANDIDATE_POLICY_V8: u16 = 12;
 const SEARCH_CANDIDATE_POLICY_V9: u16 = 13;
 const SEARCH_CANDIDATE_POLICY_V10: u16 = 14;
+const SEARCH_CANDIDATE_POLICY_V11: u16 = 15;
 const SEARCH_CANDIDATE_BLOCK_WIDTH: u16 = 16;
 const SEARCH_CANDIDATE_OFFSET_NONE: u16 = u16::MAX;
 const SVE2_CLASS_TABLE_DATA_ID: u32 = 2;
@@ -94,6 +95,9 @@ pub enum SearchBackendPolicy {
     /// Search V14 candidate: V12 plus a persistent mismatch-directed learned
     /// column after any recovered candidate misses.
     AsimdV14,
+    /// Search V15 candidate: the V14 learned-column graph admitted only when
+    /// its authenticated five-byte signature is cyclic-phase unique.
+    AsimdV15,
     /// SVE screening with exactly sixteen active byte lanes.
     Sve16,
     /// SVE2 `MATCH` screening with exactly sixteen active byte lanes,
@@ -121,6 +125,7 @@ impl SearchBackendPolicy {
             Self::AsimdV12 => BackendVersion::SEARCH_V12,
             Self::AsimdV13 => BackendVersion::SEARCH_V13,
             Self::AsimdV14 => BackendVersion::SEARCH_V14,
+            Self::AsimdV15 => BackendVersion::SEARCH_V15,
             Self::Sve16 => BackendVersion::SEARCH_SVE16_V1,
             Self::Sve2Fixed16 => BackendVersion::SEARCH_SVE2_16_V1,
             Self::Sve16V6 => BackendVersion::SEARCH_SVE16_V6,
@@ -336,6 +341,7 @@ fn emit_search_image<O: Operation>(
             | BackendVersion::SEARCH_V12
             | BackendVersion::SEARCH_V13
             | BackendVersion::SEARCH_V14
+            | BackendVersion::SEARCH_V15
             | BackendVersion::SEARCH_SVE16_V1
             | BackendVersion::SEARCH_SVE2_16_V1
             | BackendVersion::SEARCH_SVE16_V6
@@ -402,6 +408,7 @@ fn emit_search_image<O: Operation>(
             | BackendVersion::SEARCH_V12
             | BackendVersion::SEARCH_V13
             | BackendVersion::SEARCH_V14
+            | BackendVersion::SEARCH_V15
     ) && !plan.is_v9_policy_shape()
     {
         return Err(EmitError::Unsupported {
@@ -531,6 +538,7 @@ fn emit_search_image<O: Operation>(
                 | BackendVersion::SEARCH_V12
                 | BackendVersion::SEARCH_V13
                 | BackendVersion::SEARCH_V14
+                | BackendVersion::SEARCH_V15
                 | BackendVersion::SEARCH_SVE16_V1
                 | BackendVersion::SEARCH_SVE2_16_V1
                 | BackendVersion::SEARCH_SVE16_V6
@@ -1368,6 +1376,50 @@ struct CandidateOffsets {
     quinary: Option<u16>,
 }
 
+fn candidate_signature_is_cyclic_phase_unique(literal: &[u8], offsets: CandidateOffsets) -> bool {
+    if !(6..=MAX_REPEATED_CONFIRM_BYTES).contains(&literal.len()) {
+        return false;
+    }
+    let Some(selected) = offsets
+        .secondary
+        .zip(offsets.verification)
+        .zip(offsets.quaternary)
+        .zip(offsets.quinary)
+        .map(|(((secondary, verification), quaternary), quinary)| {
+            [
+                offsets.primary,
+                secondary,
+                verification,
+                quaternary,
+                quinary,
+            ]
+        })
+    else {
+        return false;
+    };
+    let selected = selected.map(usize::from);
+    if selected.iter().any(|&offset| offset >= literal.len()) {
+        return false;
+    }
+    for (index, &offset) in selected.iter().enumerate() {
+        if selected[..index].contains(&offset) {
+            return false;
+        }
+    }
+    if literal.len() <= selected.len() {
+        return false;
+    }
+    (1..literal.len()).all(|shift| {
+        selected.iter().any(|&offset| {
+            let shifted = offset
+                .checked_add(shift)
+                .expect("bounded Search V15 cyclic offset")
+                % literal.len();
+            literal[offset] != literal[shifted]
+        })
+    })
+}
+
 mod v7_policy_scan_admission {
     use super::{
         ArithmeticSite, CandidateOffsets, EmitError, WorkMeter, candidate_byte_pair,
@@ -1592,6 +1644,7 @@ impl<'a> Plan<'a> {
                         | BackendVersion::SEARCH_V12
                         | BackendVersion::SEARCH_V13
                         | BackendVersion::SEARCH_V14
+                        | BackendVersion::SEARCH_V15
                         | BackendVersion::SEARCH_SVE16_V6
                         | BackendVersion::SEARCH_SVE2_FIXED16_V2
                 ) =>
@@ -1645,6 +1698,7 @@ impl<'a> Plan<'a> {
                 | BackendVersion::SEARCH_V12
                 | BackendVersion::SEARCH_V13
                 | BackendVersion::SEARCH_V14
+                | BackendVersion::SEARCH_V15
                 | BackendVersion::SEARCH_SVE16_V1
                 | BackendVersion::SEARCH_SVE2_16_V1
                 | BackendVersion::SEARCH_SVE16_V6
@@ -1691,6 +1745,7 @@ impl<'a> Plan<'a> {
                         | BackendVersion::SEARCH_V12
                         | BackendVersion::SEARCH_V13
                         | BackendVersion::SEARCH_V14
+                        | BackendVersion::SEARCH_V15
                         | BackendVersion::SEARCH_SVE16_V1
                         | BackendVersion::SEARCH_SVE2_16_V1
                         | BackendVersion::SEARCH_SVE16_V6
@@ -1704,6 +1759,7 @@ impl<'a> Plan<'a> {
                                 | BackendVersion::SEARCH_V12
                                 | BackendVersion::SEARCH_V13
                                 | BackendVersion::SEARCH_V14
+                                | BackendVersion::SEARCH_V15
                         ) {
                             admission.select_offsets_v3()
                         } else if matches!(
@@ -1780,84 +1836,100 @@ impl<'a> Plan<'a> {
             verification_offset,
             quaternary_offset,
             quinary_offset,
-        ) = candidate_policy.map_or(
-            (
-                SEARCH_CANDIDATE_POLICY_NONE,
-                0,
-                SEARCH_CANDIDATE_OFFSET_NONE,
-                SEARCH_CANDIDATE_OFFSET_NONE,
-                SEARCH_CANDIDATE_OFFSET_NONE,
-                SEARCH_CANDIDATE_OFFSET_NONE,
-                SEARCH_CANDIDATE_OFFSET_NONE,
-            ),
-            |offsets| {
+        ) = {
+            if backend_version == BackendVersion::SEARCH_V15
+                && (shape != SearchShape::ExactLiteral
+                    || candidate_policy.is_none_or(|offsets| {
+                        !candidate_signature_is_cyclic_phase_unique(literal, offsets)
+                    }))
+            {
+                return Err(EmitError::Unsupported {
+                    reason: UnsupportedReason::KernelShape,
+                });
+            }
+            candidate_policy.map_or(
                 (
-                    if backend_version == BackendVersion::SEARCH_SVE2_FIXED16_V2
-                        && shape == SearchShape::ExactLiteral
-                    {
-                        SEARCH_CANDIDATE_POLICY_SVE2_FIXED16_V2
-                    } else if backend_version == BackendVersion::SEARCH_V10
-                        && shape == SearchShape::ExactLiteral
-                    {
-                        SEARCH_CANDIDATE_POLICY_V6
-                    } else if backend_version == BackendVersion::SEARCH_V11
-                        && shape == SearchShape::ExactLiteral
-                    {
-                        SEARCH_CANDIDATE_POLICY_V7
-                    } else if backend_version == BackendVersion::SEARCH_V12
-                        && shape == SearchShape::ExactLiteral
-                    {
-                        SEARCH_CANDIDATE_POLICY_V8
-                    } else if backend_version == BackendVersion::SEARCH_V13
-                        && shape == SearchShape::ExactLiteral
-                    {
-                        SEARCH_CANDIDATE_POLICY_V9
-                    } else if backend_version == BackendVersion::SEARCH_V14
-                        && shape == SearchShape::ExactLiteral
-                    {
-                        SEARCH_CANDIDATE_POLICY_V10
-                    } else if backend_version == BackendVersion::SEARCH_V9
-                        && shape == SearchShape::ExactLiteral
-                    {
-                        SEARCH_CANDIDATE_POLICY_V5
-                    } else if backend_version == BackendVersion::SEARCH_V8
-                        && shape == SearchShape::ExactLiteral
-                    {
-                        SEARCH_CANDIDATE_POLICY_V4
-                    } else if backend_version == BackendVersion::SEARCH_SVE2_16_V1
-                        && matches!(shape, SearchShape::ExactLiteral | SearchShape::ClassSuffix)
-                    {
-                        SEARCH_CANDIDATE_POLICY_SVE2_16_V1
-                    } else if matches!(
-                        backend_version,
-                        BackendVersion::SEARCH_SVE16_V1 | BackendVersion::SEARCH_SVE16_V6
-                    ) && matches!(
-                        shape,
-                        SearchShape::ExactLiteral | SearchShape::ClassSuffix
-                    ) {
-                        SEARCH_CANDIDATE_POLICY_SVE16_V1
-                    } else if backend_version == BackendVersion::SEARCH_V7
-                        && shape == SearchShape::ExactLiteral
-                    {
-                        SEARCH_CANDIDATE_POLICY_V3
-                    } else if matches!(
-                        backend_version,
-                        BackendVersion::SEARCH_V5 | BackendVersion::SEARCH_V6
-                    ) && shape == SearchShape::ExactLiteral
-                    {
-                        SEARCH_CANDIDATE_POLICY_V2
-                    } else {
-                        SEARCH_CANDIDATE_POLICY_V1
-                    },
-                    SEARCH_CANDIDATE_BLOCK_WIDTH,
-                    offsets.primary,
-                    offsets.secondary.unwrap_or(SEARCH_CANDIDATE_OFFSET_NONE),
-                    offsets.verification.unwrap_or(SEARCH_CANDIDATE_OFFSET_NONE),
-                    offsets.quaternary.unwrap_or(SEARCH_CANDIDATE_OFFSET_NONE),
-                    offsets.quinary.unwrap_or(SEARCH_CANDIDATE_OFFSET_NONE),
-                )
-            },
-        );
+                    SEARCH_CANDIDATE_POLICY_NONE,
+                    0,
+                    SEARCH_CANDIDATE_OFFSET_NONE,
+                    SEARCH_CANDIDATE_OFFSET_NONE,
+                    SEARCH_CANDIDATE_OFFSET_NONE,
+                    SEARCH_CANDIDATE_OFFSET_NONE,
+                    SEARCH_CANDIDATE_OFFSET_NONE,
+                ),
+                |offsets| {
+                    (
+                        if backend_version == BackendVersion::SEARCH_SVE2_FIXED16_V2
+                            && shape == SearchShape::ExactLiteral
+                        {
+                            SEARCH_CANDIDATE_POLICY_SVE2_FIXED16_V2
+                        } else if backend_version == BackendVersion::SEARCH_V10
+                            && shape == SearchShape::ExactLiteral
+                        {
+                            SEARCH_CANDIDATE_POLICY_V6
+                        } else if backend_version == BackendVersion::SEARCH_V11
+                            && shape == SearchShape::ExactLiteral
+                        {
+                            SEARCH_CANDIDATE_POLICY_V7
+                        } else if backend_version == BackendVersion::SEARCH_V12
+                            && shape == SearchShape::ExactLiteral
+                        {
+                            SEARCH_CANDIDATE_POLICY_V8
+                        } else if backend_version == BackendVersion::SEARCH_V13
+                            && shape == SearchShape::ExactLiteral
+                        {
+                            SEARCH_CANDIDATE_POLICY_V9
+                        } else if backend_version == BackendVersion::SEARCH_V14
+                            && shape == SearchShape::ExactLiteral
+                        {
+                            SEARCH_CANDIDATE_POLICY_V10
+                        } else if backend_version == BackendVersion::SEARCH_V15
+                            && shape == SearchShape::ExactLiteral
+                        {
+                            SEARCH_CANDIDATE_POLICY_V11
+                        } else if backend_version == BackendVersion::SEARCH_V9
+                            && shape == SearchShape::ExactLiteral
+                        {
+                            SEARCH_CANDIDATE_POLICY_V5
+                        } else if backend_version == BackendVersion::SEARCH_V8
+                            && shape == SearchShape::ExactLiteral
+                        {
+                            SEARCH_CANDIDATE_POLICY_V4
+                        } else if backend_version == BackendVersion::SEARCH_SVE2_16_V1
+                            && matches!(shape, SearchShape::ExactLiteral | SearchShape::ClassSuffix)
+                        {
+                            SEARCH_CANDIDATE_POLICY_SVE2_16_V1
+                        } else if matches!(
+                            backend_version,
+                            BackendVersion::SEARCH_SVE16_V1 | BackendVersion::SEARCH_SVE16_V6
+                        ) && matches!(
+                            shape,
+                            SearchShape::ExactLiteral | SearchShape::ClassSuffix
+                        ) {
+                            SEARCH_CANDIDATE_POLICY_SVE16_V1
+                        } else if backend_version == BackendVersion::SEARCH_V7
+                            && shape == SearchShape::ExactLiteral
+                        {
+                            SEARCH_CANDIDATE_POLICY_V3
+                        } else if matches!(
+                            backend_version,
+                            BackendVersion::SEARCH_V5 | BackendVersion::SEARCH_V6
+                        ) && shape == SearchShape::ExactLiteral
+                        {
+                            SEARCH_CANDIDATE_POLICY_V2
+                        } else {
+                            SEARCH_CANDIDATE_POLICY_V1
+                        },
+                        SEARCH_CANDIDATE_BLOCK_WIDTH,
+                        offsets.primary,
+                        offsets.secondary.unwrap_or(SEARCH_CANDIDATE_OFFSET_NONE),
+                        offsets.verification.unwrap_or(SEARCH_CANDIDATE_OFFSET_NONE),
+                        offsets.quaternary.unwrap_or(SEARCH_CANDIDATE_OFFSET_NONE),
+                        offsets.quinary.unwrap_or(SEARCH_CANDIDATE_OFFSET_NONE),
+                    )
+                },
+            )
+        };
         Ok(SearchManifest {
             backend_version,
             shape,
@@ -2122,6 +2194,19 @@ fn emit_exact(
         }
         BackendVersion::SEARCH_V14 => {
             emit_vector_candidate_skip_v14(
+                assembler,
+                literal,
+                primary_offset,
+                secondary_offset,
+                verification_offset,
+                quaternary_offset,
+                quinary_offset,
+                none,
+                found,
+            )?;
+        }
+        BackendVersion::SEARCH_V15 => {
+            emit_vector_candidate_skip_v15(
                 assembler,
                 literal,
                 primary_offset,
@@ -3206,6 +3291,57 @@ fn emit_vector_candidate_skip_v14(
 
 #[allow(
     clippy::too_many_arguments,
+    reason = "the V15 wire keeps the frozen V14 graph behind an independently authenticated phase-unique selector"
+)]
+fn emit_vector_candidate_skip_v15(
+    assembler: &mut Assembler,
+    literal: &[u8],
+    primary_offset: u16,
+    secondary_offset: Option<u16>,
+    verification_offset: Option<u16>,
+    quaternary_offset: Option<u16>,
+    quinary_offset: Option<u16>,
+    none: Label,
+    found: Label,
+) -> Result<(), EmitError> {
+    let first_candidate_miss = assembler.new_label(LabelKind::Internal)?;
+    let selected = literal
+        .get(usize::from(primary_offset))
+        .copied()
+        .ok_or(EmitError::InternalInvariant)?;
+
+    assembler.add_reg(X15, X9, X5)?;
+    assembler.load_byte(X10, X15, primary_offset)?;
+    assembler.cmp_imm32(X10, u16::from(selected))?;
+    assembler.branch_cond(Condition::NotEqual, first_candidate_miss)?;
+    if literal.len() > 1 {
+        emit_literal_equality_specialized(assembler, X15, X8, literal.len(), first_candidate_miss)?;
+    }
+    assembler.mov_reg(X13, X5)?;
+    assembler.add_reg(X14, X5, X12)?;
+    assembler.branch(found)?;
+
+    assembler.bind(first_candidate_miss)?;
+    assembler.add_imm(X5, X5, 1)?;
+    // Tag 28 retains a distinct machine-code template even though its
+    // eligible runtime graph is the frozen tag 27 graph.
+    assembler.mov_reg(X10, X10)?;
+    emit_vector_candidate_skip_v8(
+        assembler,
+        literal,
+        primary_offset,
+        secondary_offset,
+        verification_offset,
+        quaternary_offset,
+        quinary_offset,
+        BackendVersion::SEARCH_V15,
+        none,
+        found,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
     clippy::too_many_lines,
     reason = "the versioned v8 graph keeps its paired 64-candidate screen and authenticated staged recovery explicit"
 )]
@@ -3237,34 +3373,52 @@ fn emit_vector_candidate_skip_v8(
     let candidate_miss = assembler.new_label(LabelKind::Internal)?;
     let recovery_exhausted = matches!(
         backend_version,
-        BackendVersion::SEARCH_V13 | BackendVersion::SEARCH_V14
+        BackendVersion::SEARCH_V13 | BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
     )
     .then(|| assembler.new_label(LabelKind::Internal))
     .transpose()?;
     let adaptive_recovery = matches!(
         backend_version,
-        BackendVersion::SEARCH_V13 | BackendVersion::SEARCH_V14
+        BackendVersion::SEARCH_V13 | BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
     )
     .then(|| assembler.new_label(LabelKind::SlowPath))
     .transpose()?;
-    let learned_discover = (backend_version == BackendVersion::SEARCH_V14)
-        .then(|| assembler.new_label(LabelKind::Loop))
-        .transpose()?;
-    let learned_column_ready = (backend_version == BackendVersion::SEARCH_V14)
-        .then(|| assembler.new_label(LabelKind::SlowPath))
-        .transpose()?;
-    let learned_advance = (backend_version == BackendVersion::SEARCH_V14)
-        .then(|| assembler.new_label(LabelKind::Internal))
-        .transpose()?;
-    let learned_scan = (backend_version == BackendVersion::SEARCH_V14)
-        .then(|| assembler.new_label(LabelKind::Loop))
-        .transpose()?;
-    let learned_disabled = (backend_version == BackendVersion::SEARCH_V14)
-        .then(|| assembler.new_label(LabelKind::SlowPath))
-        .transpose()?;
-    let learned_tail = (backend_version == BackendVersion::SEARCH_V14)
-        .then(|| assembler.new_label(LabelKind::SlowPath))
-        .transpose()?;
+    let learned_discover = matches!(
+        backend_version,
+        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
+    )
+    .then(|| assembler.new_label(LabelKind::Loop))
+    .transpose()?;
+    let learned_column_ready = matches!(
+        backend_version,
+        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
+    )
+    .then(|| assembler.new_label(LabelKind::SlowPath))
+    .transpose()?;
+    let learned_advance = matches!(
+        backend_version,
+        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
+    )
+    .then(|| assembler.new_label(LabelKind::Internal))
+    .transpose()?;
+    let learned_scan = matches!(
+        backend_version,
+        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
+    )
+    .then(|| assembler.new_label(LabelKind::Loop))
+    .transpose()?;
+    let learned_disabled = matches!(
+        backend_version,
+        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
+    )
+    .then(|| assembler.new_label(LabelKind::SlowPath))
+    .transpose()?;
+    let learned_tail = matches!(
+        backend_version,
+        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
+    )
+    .then(|| assembler.new_label(LabelKind::SlowPath))
+    .transpose()?;
     let tail_setup = assembler.new_label(LabelKind::SlowPath)?;
     let wide_second_filter = secondary_offset
         .map(|_| assembler.new_label(LabelKind::SlowPath))
@@ -3313,7 +3467,10 @@ fn emit_vector_candidate_skip_v8(
         assembler.sve_ptrue_bytes_vl16(0)?;
         assembler.sve_load_bytes(31, 0, X8)?;
     }
-    if backend_version == BackendVersion::SEARCH_V14 {
+    if matches!(
+        backend_version,
+        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
+    ) {
         if !filters_cover_zero {
             return Err(EmitError::InternalInvariant);
         }
@@ -3580,7 +3737,10 @@ fn emit_vector_candidate_skip_v8(
         }
     } else if matches!(
         backend_version,
-        BackendVersion::SEARCH_V12 | BackendVersion::SEARCH_V13 | BackendVersion::SEARCH_V14
+        BackendVersion::SEARCH_V12
+            | BackendVersion::SEARCH_V13
+            | BackendVersion::SEARCH_V14
+            | BackendVersion::SEARCH_V15
     ) {
         emit_literal_equality_specialized(assembler, X15, X8, literal.len(), candidate_miss)?;
     } else if literal.len() == 16 {
@@ -3642,7 +3802,10 @@ fn emit_vector_candidate_skip_v8(
         }
         assembler.branch(lane_loop)?;
         assembler.bind(exhausted)?;
-    } else if backend_version == BackendVersion::SEARCH_V14 {
+    } else if matches!(
+        backend_version,
+        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15
+    ) {
         let discover = learned_discover.ok_or(EmitError::InternalInvariant)?;
         let column_ready = learned_column_ready.ok_or(EmitError::InternalInvariant)?;
         let learned_next = learned_advance.ok_or(EmitError::InternalInvariant)?;

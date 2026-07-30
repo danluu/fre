@@ -309,6 +309,7 @@ fn validate_search_backend_version(image: &NativeImage) -> Result<BackendVersion
         | BackendVersion::SEARCH_V12
         | BackendVersion::SEARCH_V13
         | BackendVersion::SEARCH_V14
+        | BackendVersion::SEARCH_V15
         | BackendVersion::SEARCH_SVE16_V1
         | BackendVersion::SEARCH_SVE2_16_V1
         | BackendVersion::SEARCH_SVE16_V6
@@ -347,6 +348,7 @@ fn authenticate_search_envelope<'image>(
             | BackendVersion::SEARCH_V12
             | BackendVersion::SEARCH_V13
             | BackendVersion::SEARCH_V14
+            | BackendVersion::SEARCH_V15
             | BackendVersion::SEARCH_SVE16_V1
             | BackendVersion::SEARCH_SVE2_16_V1
             | BackendVersion::SEARCH_SVE16_V6
@@ -589,6 +591,7 @@ fn authenticate_search_manifest<'image>(
                     | BackendVersion::SEARCH_V12
                     | BackendVersion::SEARCH_V13
                     | BackendVersion::SEARCH_V14
+                    | BackendVersion::SEARCH_V15
             ) && (manifest.anchors != AnchorFlags::default() || literal_len == 0)
             {
                 return Err(AuditError::InvalidSearchManifest);
@@ -637,6 +640,7 @@ fn authenticate_class_suffix_manifest(
             | BackendVersion::SEARCH_V12
             | BackendVersion::SEARCH_V13
             | BackendVersion::SEARCH_V14
+            | BackendVersion::SEARCH_V15
     ) {
         return Err(AuditError::InvalidSearchManifest);
     }
@@ -727,10 +731,61 @@ const SEARCH_CANDIDATE_POLICY_V7: u16 = 11;
 const SEARCH_CANDIDATE_POLICY_V8: u16 = 12;
 const SEARCH_CANDIDATE_POLICY_V9: u16 = 13;
 const SEARCH_CANDIDATE_POLICY_V10: u16 = 14;
+const SEARCH_CANDIDATE_POLICY_V11: u16 = 15;
 const SEARCH_CANDIDATE_BLOCK_WIDTH: u16 = 16;
 const SEARCH_CANDIDATE_OFFSET_NONE: u16 = u16::MAX;
 const SVE2_CLASS_TABLE_DATA_ID: u32 = 2;
 const SVE2_CLASS_TABLE_BYTES: usize = 16;
+
+fn independently_authenticate_v15_phase_unique(
+    literal: &[u8],
+    selected: (u16, Option<u16>, Option<u16>, Option<u16>, Option<u16>),
+) -> bool {
+    if !(6..=32).contains(&literal.len()) {
+        return false;
+    }
+    let (primary, secondary, verification, quaternary, quinary) = selected;
+    let Some(selected) = secondary
+        .zip(verification)
+        .zip(quaternary)
+        .zip(quinary)
+        .map(|(((secondary, verification), quaternary), quinary)| {
+            [primary, secondary, verification, quaternary, quinary]
+        })
+    else {
+        return false;
+    };
+    let mut selected_mask = 0_u64;
+    for offset in selected.map(usize::from) {
+        if offset >= literal.len() {
+            return false;
+        }
+        let bit = 1_u64
+            .checked_shl(u32::try_from(offset).expect("bounded V15 offset"))
+            .expect("V15 offset is below 64");
+        if selected_mask & bit != 0 {
+            return false;
+        }
+        selected_mask |= bit;
+    }
+    if selected_mask.count_ones() != 5 || literal.len() <= 5 {
+        return false;
+    }
+    for phase in 1..literal.len() {
+        let mut differs = false;
+        for offset in selected.map(usize::from) {
+            let shifted = offset
+                .checked_add(phase)
+                .and_then(|sum| sum.checked_rem(literal.len()))
+                .expect("bounded nonempty V15 cyclic phase");
+            differs |= literal[offset] != literal[shifted];
+        }
+        if !differs {
+            return false;
+        }
+    }
+    true
+}
 
 #[allow(
     clippy::too_many_lines,
@@ -776,6 +831,7 @@ fn authenticate_search_candidate_policy(
                         | BackendVersion::SEARCH_V12
                         | BackendVersion::SEARCH_V13
                         | BackendVersion::SEARCH_V14
+                        | BackendVersion::SEARCH_V15
                 ) {
                     independent_ranked_verification_offsets_v3(literal, primary, secondary)
                 } else if matches!(
@@ -838,6 +894,12 @@ fn authenticate_search_candidate_policy(
         }
         _ => None,
     };
+    if manifest.backend_version == BackendVersion::SEARCH_V15 {
+        let selected = selected.ok_or(AuditError::InvalidSearchManifest)?;
+        if !independently_authenticate_v15_phase_unique(literal, selected) {
+            return Err(AuditError::InvalidSearchManifest);
+        }
+    }
     let expected = selected.map_or(
         (
             SEARCH_CANDIDATE_POLICY_NONE,
@@ -874,6 +936,10 @@ fn authenticate_search_candidate_policy(
                     && manifest.shape == SearchShape::ExactLiteral
                 {
                     SEARCH_CANDIDATE_POLICY_V10
+                } else if manifest.backend_version == BackendVersion::SEARCH_V15
+                    && manifest.shape == SearchShape::ExactLiteral
+                {
+                    SEARCH_CANDIDATE_POLICY_V11
                 } else if manifest.backend_version == BackendVersion::SEARCH_V9
                     && manifest.shape == SearchShape::ExactLiteral
                 {
@@ -4790,6 +4856,7 @@ fn first_forbidden_search_vector_register(
                 | BackendVersion::SEARCH_V12
                 | BackendVersion::SEARCH_V13
                 | BackendVersion::SEARCH_V14
+                | BackendVersion::SEARCH_V15
                 | BackendVersion::SEARCH_SVE16_V6
                 | BackendVersion::SEARCH_SVE2_FIXED16_V2 => register >= 16,
                 _ => false,

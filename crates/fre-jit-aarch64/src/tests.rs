@@ -4,6 +4,7 @@
 )]
 
 use core::mem::{align_of, size_of};
+use std::collections::BTreeSet;
 
 use fre_kernel_ir::{
     AggregateExecutionLimits, AggregateOutput, AnchorFlags, BlockId, ByteClass, Count,
@@ -18,12 +19,14 @@ use crate::{
     EmitLimits, LabelKind, MAX_REPEATED_CONFIRM_BYTES, NativeAggregateImage, NativeAggregateResult,
     NativeImage, NativeResult, RelocationKind, RelocationTarget, ResourceKind, ResultLayout,
     SearchBackendPolicy, UnsupportedReason, audit, audit_aggregate, decode, decode_one, emit,
-    emit::emit_search_version_for_test, emit_audited_with_backend, emit_exact_aggregate,
+    emit::emit_search_version_for_test,
+    emit_audited_with_backend, emit_exact_aggregate,
     emit_exact_aggregate_sve2_fixed16_count_experimental,
     emit_exact_aggregate_sve2_fixed16_pair_count_experimental,
     emit_exact_aggregate_sve2_fixed16_pair_span_sum_experimental,
     emit_exact_aggregate_sve2_fixed16_span_sum_experimental, emit_sve2_16, emit_sve2_fixed16_v2,
-    emit_sve16, emit_sve16_v6, emit_with_backend, image::SearchShape,
+    emit_sve16, emit_sve16_v6, emit_with_backend,
+    image::{SearchManifest, SearchShape},
 };
 
 const HAYSTACK_BASE: u64 = 0x0010_0000;
@@ -4552,6 +4555,7 @@ fn explicit_search_backend_policy_selects_distinct_artifact_identities() {
         (SearchBackendPolicy::AsimdV12, BackendVersion::SEARCH_V12),
         (SearchBackendPolicy::AsimdV13, BackendVersion::SEARCH_V13),
         (SearchBackendPolicy::AsimdV14, BackendVersion::SEARCH_V14),
+        (SearchBackendPolicy::AsimdV15, BackendVersion::SEARCH_V15),
         (SearchBackendPolicy::Sve16, BackendVersion::SEARCH_SVE16_V1),
         (
             SearchBackendPolicy::Sve2Fixed16,
@@ -7200,6 +7204,269 @@ fn v14_persistent_learned_column_is_audited_and_matches_every_offset() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the V15 contract exhausts its complete small binary selector space, every phase and width boundary, independent audit, semantics, and wire relabel resistance"
+)]
+fn v15_phase_unique_selector_is_exhaustive_audited_and_semantic() {
+    let phase_unique = |literal: &[u8], manifest: SearchManifest| {
+        let selected = [
+            manifest.primary_offset,
+            manifest.secondary_offset,
+            manifest.verification_offset,
+            manifest.quaternary_offset,
+            manifest.quinary_offset,
+        ]
+        .map(usize::from);
+        assert_eq!(
+            selected.iter().copied().collect::<BTreeSet<_>>().len(),
+            5,
+            "the endpoint-preserving V3 ranker authenticates five distinct columns"
+        );
+        assert!(selected.iter().all(|&offset| offset < literal.len()));
+        assert!(literal.len() > selected.len());
+        (1..literal.len()).all(|phase| {
+            selected
+                .iter()
+                .any(|&offset| literal[offset] != literal[(offset + phase) % literal.len()])
+        })
+    };
+
+    let mut eligible = 0_u64;
+    let mut refused = 0_u64;
+    let mut audited = 0_u64;
+    for width in 6_usize..=10 {
+        for bits in 0_u64..(1_u64 << width) {
+            let literal = (0..width)
+                .map(|offset| {
+                    if bits & (1_u64 << offset) == 0 {
+                        3
+                    } else {
+                        197
+                    }
+                })
+                .collect::<Vec<_>>();
+            let program = build_exact_literal::<Span>(
+                &literal,
+                AnchorFlags::default(),
+                ValidateLimits::default(),
+            )
+            .expect("V15 exhaustive binary IR");
+            let v14 = emit_with_backend(
+                &program,
+                SearchBackendPolicy::AsimdV14,
+                EmitLimits::default(),
+            )
+            .expect("frozen V14 exposes the authenticated V3 offsets");
+            let expected = phase_unique(
+                &literal,
+                v14.search_manifest().expect("V14 search manifest"),
+            );
+            match emit_with_backend(
+                &program,
+                SearchBackendPolicy::AsimdV15,
+                EmitLimits::default(),
+            ) {
+                Ok(image) => {
+                    assert!(expected, "V15 admitted an ambiguous cyclic signature");
+                    assert_eq!(image.backend_version(), BackendVersion::SEARCH_V15);
+                    assert_eq!(
+                        image
+                            .search_manifest()
+                            .expect("V15 manifest")
+                            .candidate_policy_version,
+                        15
+                    );
+                    audit(&image).expect("independent V15 selector and template audit");
+                    assert_eq!(
+                        &image
+                            .to_aot(AotLimits::default())
+                            .expect("bounded V15 AOT")
+                            .as_bytes()[..8],
+                        b"FREA64\0\x1c"
+                    );
+                    eligible = eligible.checked_add(1).expect("bounded selector count");
+                    audited = audited.checked_add(1).expect("bounded audit count");
+                }
+                Err(error) => {
+                    assert!(!expected, "V15 refused a phase-unique signature");
+                    assert_eq!(
+                        error,
+                        EmitError::Unsupported {
+                            reason: UnsupportedReason::KernelShape,
+                        }
+                    );
+                    refused = refused.checked_add(1).expect("bounded selector count");
+                }
+            }
+        }
+    }
+    assert_eq!(eligible + refused, 1_984);
+    assert_eq!(audited, eligible);
+    assert!(eligible > 0 && refused > 0);
+
+    let mut semantic_comparisons = 0_u64;
+    for width in 6_usize..=MAX_REPEATED_CONFIRM_BYTES {
+        let literal = (0..width)
+            .map(|offset| {
+                u8::try_from(offset)
+                    .expect("bounded V15 width")
+                    .wrapping_mul(61)
+                    .wrapping_add(7)
+            })
+            .collect::<Vec<_>>();
+        let program = build_exact_literal::<Span>(
+            &literal,
+            AnchorFlags::default(),
+            ValidateLimits::default(),
+        )
+        .expect("V15 width-boundary IR");
+        let image = emit_with_backend(
+            &program,
+            SearchBackendPolicy::AsimdV15,
+            EmitLimits::default(),
+        )
+        .expect("phase-unique V15 width-boundary image");
+        let manifest = image.search_manifest().expect("V15 manifest");
+        assert!(phase_unique(&literal, manifest));
+        assert_eq!(
+            [
+                manifest.primary_offset,
+                manifest.secondary_offset,
+                manifest.verification_offset,
+                manifest.quaternary_offset,
+                manifest.quinary_offset,
+            ]
+            .into_iter()
+            .map(usize::from)
+            .filter(|offset| *offset < width)
+            .count(),
+            5
+        );
+        assert!(width > 5, "at least one column remains unselected");
+        audit(&image).expect("V15 width-boundary audit");
+
+        let avoid = (0_u16..=255)
+            .map(|value| u8::try_from(value).expect("bounded byte"))
+            .find(|byte| !literal.contains(byte))
+            .expect("V15 literal leaves an avoiding byte");
+        for mutation_offset in 0..width {
+            let mut near_miss = literal.clone();
+            near_miss[mutation_offset] = avoid;
+            let mut haystack = Vec::new();
+            for _ in 0..17 {
+                haystack.extend_from_slice(&near_miss);
+            }
+            haystack.extend_from_slice(&literal);
+            let expected = program
+                .execute(
+                    &haystack,
+                    SearchWindow::new(0, haystack.len()),
+                    ExecutionLimits::unlimited(),
+                )
+                .expect("V15 semantic oracle")
+                .output()
+                .map(|span| (span.start(), span.end()));
+            let actual =
+                simulate(&image, &haystack, 0, haystack.len()).expect("V15 safe ISA simulation");
+            assert_eq!(
+                span_output(actual),
+                expected,
+                "width={width} mutation={mutation_offset}"
+            );
+            semantic_comparisons = semantic_comparisons
+                .checked_add(1)
+                .expect("bounded semantic comparisons");
+        }
+    }
+    assert_eq!(semantic_comparisons, 513);
+
+    for literal in [
+        vec![b'a'; 16],
+        b"abababababababab".to_vec(),
+        b"0123456701234567".to_vec(),
+    ] {
+        let program = build_exact_literal::<Span>(
+            &literal,
+            AnchorFlags::default(),
+            ValidateLimits::default(),
+        )
+        .expect("V15 ambiguous IR");
+        assert_eq!(
+            emit_with_backend(
+                &program,
+                SearchBackendPolicy::AsimdV15,
+                EmitLimits::default(),
+            ),
+            Err(EmitError::Unsupported {
+                reason: UnsupportedReason::KernelShape,
+            })
+        );
+    }
+    for width in 1_usize..6 {
+        let literal = (0..width)
+            .map(|offset| u8::try_from(offset).expect("small width"))
+            .collect::<Vec<_>>();
+        let program = build_exact_literal::<Span>(
+            &literal,
+            AnchorFlags::default(),
+            ValidateLimits::default(),
+        )
+        .expect("V15 below-boundary IR");
+        assert_eq!(
+            emit_with_backend(
+                &program,
+                SearchBackendPolicy::AsimdV15,
+                EmitLimits::default(),
+            ),
+            Err(EmitError::Unsupported {
+                reason: UnsupportedReason::KernelShape,
+            })
+        );
+    }
+
+    let literal = b"phase-unique-15!";
+    let program =
+        build_exact_literal::<Span>(literal, AnchorFlags::default(), ValidateLimits::default())
+            .expect("V15 wire IR");
+    let canonical_v14 = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV14,
+        EmitLimits::default(),
+    )
+    .expect("canonical V14");
+    let canonical_v15 = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV15,
+        EmitLimits::default(),
+    )
+    .expect("canonical V15");
+    assert_ne!(canonical_v15.code(), canonical_v14.code());
+    assert_ne!(
+        canonical_v15.artifact_identity(),
+        canonical_v14.artifact_identity()
+    );
+
+    let mut v15_as_v14 = canonical_v15;
+    v15_as_v14.backend_version = BackendVersion::SEARCH_V14;
+    {
+        let manifest = v15_as_v14.search.as_mut().expect("V15 manifest");
+        manifest.backend_version = BackendVersion::SEARCH_V14;
+        manifest.candidate_policy_version = 14;
+    }
+    assert_resealed_search_rejected(v15_as_v14, "V15 code resealed as V14");
+
+    let mut v14_as_v15 = canonical_v14;
+    v14_as_v15.backend_version = BackendVersion::SEARCH_V15;
+    {
+        let manifest = v14_as_v15.search.as_mut().expect("V14 manifest");
+        manifest.backend_version = BackendVersion::SEARCH_V15;
+        manifest.candidate_policy_version = 15;
+    }
+    assert_resealed_search_rejected(v14_as_v15, "V14 code resealed as V15");
+}
+
+#[test]
 fn v13_adaptive_recovery_decoded_edges_cover_zero_one_and_max_remaining_columns() {
     for (width, expected_columns) in [(5_usize, 0_usize), (6, 1), (32, 27)] {
         let literal = vec![b'a'; width];
@@ -7388,7 +7655,7 @@ fn v13_adaptive_recovery_decoded_edges_cover_zero_one_and_max_remaining_columns(
 }
 
 #[test]
-fn v9_through_v14_reject_shapes_without_one_nonempty_unanchored_exact_candidate() {
+fn v9_through_v15_reject_shapes_without_one_nonempty_unanchored_exact_candidate() {
     for backend in [
         SearchBackendPolicy::AsimdV9,
         SearchBackendPolicy::AsimdV10,
@@ -7396,6 +7663,7 @@ fn v9_through_v14_reject_shapes_without_one_nonempty_unanchored_exact_candidate(
         SearchBackendPolicy::AsimdV12,
         SearchBackendPolicy::AsimdV13,
         SearchBackendPolicy::AsimdV14,
+        SearchBackendPolicy::AsimdV15,
     ] {
         for anchors in [
             AnchorFlags {
