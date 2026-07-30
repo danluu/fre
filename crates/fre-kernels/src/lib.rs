@@ -497,10 +497,13 @@ pub use required_internal_anchor::{
 pub use required_literal::ByteClass as RequiredInternalAnchorByteClass;
 pub use required_literal::{
     ASCII_BACKWARD_RUN_PLAN_ID as REQUIRED_LITERAL_ASCII_BACKWARD_RUN_PLAN_ID,
-    Anchors as RequiredLiteralAnchors, BuildAccounting as RequiredLiteralBuildAccounting,
-    BuildError as RequiredLiteralBuildError, BuildLimits as RequiredLiteralBuildLimits,
-    ByteClass as RequiredLiteralByteClass, DispatchedRequiredLiteralPlan,
-    PLAN_ID as REQUIRED_LITERAL_PLAN_ID, RequiredLiteralPlan,
+    Anchors as RequiredLiteralAnchors,
+    BOUNDED_ASCII_BACKWARD_RUN_PLAN_ID as REQUIRED_LITERAL_BOUNDED_ASCII_BACKWARD_RUN_PLAN_ID,
+    BOUNDED_PLAN_ID as REQUIRED_LITERAL_BOUNDED_PLAN_ID, BoundedRequiredLiteralPlan,
+    BuildAccounting as RequiredLiteralBuildAccounting, BuildError as RequiredLiteralBuildError,
+    BuildLimits as RequiredLiteralBuildLimits, ByteClass as RequiredLiteralByteClass,
+    ClassRepeat as RequiredLiteralClassRepeat, DispatchedBoundedRequiredLiteralPlan,
+    DispatchedRequiredLiteralPlan, PLAN_ID as REQUIRED_LITERAL_PLAN_ID, RequiredLiteralPlan,
     SearchAccounting as RequiredLiteralSearchAccounting, SearchError as RequiredLiteralSearchError,
     SearchLimits as RequiredLiteralSearchLimits,
 };

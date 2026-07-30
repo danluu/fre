@@ -1,6 +1,6 @@
 //! Exact HIR shape proof for the required-literal production kernel.
 
-use fre_kernels::{RequiredLiteralAnchors, RequiredLiteralByteClass};
+use fre_kernels::{RequiredLiteralAnchors, RequiredLiteralByteClass, RequiredLiteralClassRepeat};
 use regex_syntax::hir::{Class, Hir, HirKind, Look};
 
 use crate::{BuildError, charge_planner, reserve_planner};
@@ -12,11 +12,13 @@ pub(crate) struct Extraction {
 
 pub(crate) struct Shape {
     pub(crate) class: RequiredLiteralByteClass,
+    pub(crate) repeat: RequiredLiteralClassRepeat,
     pub(crate) suffix: Vec<u8>,
     pub(crate) anchors: RequiredLiteralAnchors,
 }
 
-/// Recognize exactly `[absolute-start]? BYTE_CLASS+ LITERAL [absolute-end]?`.
+/// Recognize exactly
+/// `[absolute-start]? BYTE_CLASS{positive greedy bounds} LITERAL [absolute-end]?`.
 ///
 /// Capture nodes may be erased because every public operation on
 /// `PortableRegex` is capture-free. No alternation, surrounding concatenation,
@@ -105,9 +107,26 @@ pub(crate) fn extract(
         return Ok(Extraction { shape: None, work });
     };
     charge_planner(&mut work, 1, work_limit)?;
-    if repetition.min != 1 || repetition.max.is_some() || !repetition.greedy {
+    if repetition.min == 0 || !repetition.greedy {
         return Ok(Extraction { shape: None, work });
     }
+    let repeat_min = usize::try_from(repetition.min).map_err(|_| {
+        BuildError::InternalInvariant("required-literal repetition minimum does not fit usize")
+    })?;
+    let repeat_max = repetition
+        .max
+        .map(usize::try_from)
+        .transpose()
+        .map_err(|_| {
+            BuildError::InternalInvariant("required-literal repetition maximum does not fit usize")
+        })?;
+    if repeat_max.is_some_and(|max| max < repeat_min) {
+        return Ok(Extraction { shape: None, work });
+    }
+    let repeat = RequiredLiteralClassRepeat {
+        min: repeat_min,
+        max: repeat_max,
+    };
     let class_node = strip_captures(&repetition.sub, &mut work, work_limit)?;
     let Some(class) = extract_byte_class(class_node, &mut work, work_limit)? else {
         return Ok(Extraction { shape: None, work });
@@ -154,6 +173,7 @@ pub(crate) fn extract(
     Ok(Extraction {
         shape: Some(Shape {
             class,
+            repeat,
             suffix,
             anchors,
         }),
@@ -231,7 +251,13 @@ mod tests {
 
     #[test]
     fn admits_only_the_exact_capture_free_shape() {
-        for pattern in [r"[ab]+Z", r"\A([ab]+Z)\z", r"(?:a)+END"] {
+        for pattern in [
+            r"[ab]+Z",
+            r"[ab]{2,5}Z",
+            r"[ab]{3,}Z",
+            r"\A([ab]+Z)\z",
+            r"(?:a)+END",
+        ] {
             assert!(
                 extract(&hir(pattern), 0, u64::MAX).unwrap().shape.is_some(),
                 "pattern={pattern:?}"
@@ -239,7 +265,9 @@ mod tests {
         }
         for pattern in [
             r"[ab]*Z",
+            r"[ab]{0,5}Z",
             r"[ab]+?Z",
+            r"[ab]{2,5}?Z",
             r"(?m:^[ab]+Z$)",
             r"x[ab]+Z",
             r"[ab]+Zx[cd]",
