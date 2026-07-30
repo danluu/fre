@@ -1,0 +1,120 @@
+{
+  "schema": "fre.aot.search-tag29-topology-freeze.v1",
+  "status": {
+    "frozen_before_results": true,
+    "timing_results_observed": false,
+    "production_authority_granted": false
+  },
+  "generator": {
+    "path": "research/aot/search-tag29-topology-generalization-v1/generate_projection.py",
+    "sha256": "1b359b321c90536c634ff5643efc127cc030d59f6897dc7cda6ce9aa254c9fa3"
+  },
+  "selector": {
+    "contract_path": "research/aot/search-phase-unique-selector-v1/selector-contract-v1.json",
+    "contract_sha256": "38ca5ebc1b239b541afcf9eeb679bf8b156c8690e7422a96f69a9457a155daf0",
+    "payload_sha256": "b0241b15760f441e7f4eb410611ce1a83b1a17f4858da91ce7eacba4f5a75353",
+    "candidate_backend_tag": 29,
+    "candidate_policy": 15,
+    "candidate_backend_name": "AsimdV16",
+    "aot_magic_hex": "465245413634001d",
+    "llvm_codegen": false
+  },
+  "inputs": {
+    "corpus_files": [],
+    "benchmark_results": [],
+    "rebar_files": [],
+    "network": false,
+    "result_derived_selection": false,
+    "result_derived_exclusions": false
+  },
+  "full_projection": {
+    "rows": 123424,
+    "sha256": "82d053d2a579794c88d6220ebe756845ff4e6077ad6f9f773923020906ea03dc",
+    "literal_inventory_rows": 1015,
+    "literal_inventory_sha256": "2286c399f5e0bb3129c98dc7c7d9a9b1f9951f9bf90addc3262ca30c228224ae",
+    "portable_only_rows": 74176,
+    "tag29_static_tail_rows": 49248,
+    "required_hosts": [
+      "local-apple-aarch64-asimd",
+      "zstd-eval-ec2-aarch64-asimd-sve2-vl16"
+    ],
+    "gate": "every row must reproduce the exact compiler admission/refusal, automatic route, scalar span, portable result, static result where admitted, and guarded-boundary result on both hosts"
+  },
+  "timed_projection": {
+    "rows": 3078,
+    "sha256": "2032c24b452838f770a6864f54832e8981f4d400ec5581ac490a86e2469f0936",
+    "selection": "one frozen long geometry for every eligible width/topology/mutation-class cell",
+    "eligible_widths": {
+      "minimum": 6,
+      "maximum": 32,
+      "count": 27,
+      "rows_each": 114
+    },
+    "eligible_topologies": [
+      "high-entropy-distinct",
+      "binary-aperiodic",
+      "ternary-aperiodic",
+      "rare-markers-common-fill",
+      "common-markers-rare-fill",
+      "terminal-repeated-high-entropy"
+    ],
+    "rows_each_topology": 513,
+    "mutation_classes": 19,
+    "selector_phase_placements": 5,
+    "alignments": 16,
+    "window_bytes": [
+      4093,
+      4096,
+      8192,
+      16384,
+      32768,
+      65536,
+      131072,
+      262144,
+      524288,
+      1048576
+    ],
+    "repetitions": 6,
+    "minimum_elapsed_ns_each_variant": 400000000,
+    "pairing": "same fixture and logical CPU with alternating portable/static order",
+    "cell_gate": "on each host, every timed fixture's six-pair median candidate/portable ratio must be strictly less than 0.80",
+    "aggregate_gates": [
+      "every width-topology cell",
+      "every width",
+      "every topology",
+      "every learned-source kind",
+      "every learned-source relation",
+      "each host independently",
+      "combined hosts"
+    ],
+    "failed_cell_disposition": "the broad tag29 family is not authorized; no result-derived exclusion is permitted"
+  },
+  "dimensions": {
+    "widths": "every integer 4 through 32",
+    "topologies": 7,
+    "mutation_classes": 19,
+    "geometries": "16 alignments crossed with short and long window strata",
+    "selector_phase_placements": 5,
+    "outcomes": [
+      "absent",
+      "tail-hit"
+    ],
+    "guarding": [
+      "right-guarded",
+      "right-padded"
+    ],
+    "ineligible_guards": [
+      "width 4",
+      "width 5",
+      "periodic or uniform literals at widths 6 through 32",
+      "windows below 4093 bytes"
+    ]
+  },
+  "rebar": {
+    "read_during_generation": false,
+    "affects_membership": false,
+    "affects_gates": false,
+    "affects_promotion": false,
+    "permitted_use": "post-freeze, post-promotion corroboration only"
+  }
+}
