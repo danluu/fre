@@ -2271,6 +2271,7 @@ impl PortableBuilder {
                         static_captures_len,
                         minimum_match_bytes,
                         required_literal: None,
+                        literal_class_run_literal: None,
                         forward_anchored: None,
                     }
                     .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
