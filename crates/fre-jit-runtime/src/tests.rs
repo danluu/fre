@@ -408,9 +408,12 @@ fn selected_end_register_v2_source_boundaries_are_sealed() {
         runtime,
         "pub struct PublishedSelectedEndRegisterPlanThreadSessionV2<'kernel> {",
     );
-    let clone_start = position(runtime, "impl Clone for PublishedSelectedEndRegisterV2 {");
+    let debug_impl_start = position(
+        runtime,
+        "impl fmt::Debug for PublishedSelectedEndRegisterV2 {",
+    );
     let general_struct = &runtime[general_struct_start..plan_struct_start];
-    let plan_struct = &runtime[plan_struct_start..clone_start];
+    let plan_struct = &runtime[plan_struct_start..debug_impl_start];
     assert!(!general_struct.contains("literal_plan"));
     assert!(plan_struct.contains("literal_plan: &'kernel LiteralPlan"));
     assert!(plan_struct.contains("literal_bytes: usize"));
