@@ -112,8 +112,9 @@ pub use search_glue::{
     SearchSpanFinalImageGlueErrorV1, SearchSpanFinalImageGlueInspectionV1,
     SearchSpanFinalImageGlueLimitsV1, SearchSpanFinalImageGlueObjectV1,
     UNSIGNED_SEARCH_SPAN_FINAL_IMAGE_RECEIPT_BYTES_V1, UnsignedSearchSpanFinalImageReceiptV1,
-    inspect_search_span_final_image_glue_v1, publish_search_span_final_image_glue_v1,
-    publish_search_span_qualification_final_image_glue_v1,
+    inspect_search_span_final_image_glue_v1,
+    publish_search_span_family_qualification_final_image_glue_v1,
+    publish_search_span_final_image_glue_v1, publish_search_span_qualification_final_image_glue_v1,
 };
 pub use search_linux::{
     AOT_LINUX_SEARCH_COMPILE_RECEIPT_SCHEMA_VERSION_V1, AOT_LINUX_SEARCH_COMPILER_VERSION_V1,
@@ -140,7 +141,9 @@ pub use search_linux_glue::{
     LinuxSearchSpanFinalImageSymbolNameV1, LinuxSearchSpanFinalImageSymbolsV1,
     LinuxSearchSpanGlueCodeIdentityV1, LinuxSearchSpanGlueObjectIdentityV1,
     LinuxUnsignedSearchSpanFinalImageReceiptV1, PublishedLinuxSearchSpanFinalImageGlueV1,
-    inspect_linux_search_span_final_image_glue_v1, publish_linux_search_span_final_image_glue_v1,
+    inspect_linux_search_span_final_image_glue_v1,
+    publish_linux_search_span_family_qualification_final_image_glue_v1,
+    publish_linux_search_span_final_image_glue_v1,
     publish_linux_search_span_qualification_final_image_glue_v1,
 };
 pub use search_selected_end_bundle_v2::{

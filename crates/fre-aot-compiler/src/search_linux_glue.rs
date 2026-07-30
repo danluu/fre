@@ -47,6 +47,8 @@ const EXPECTATION_SYMBOL_PREFIX_V1: &str = "fre_aot_search_span_expectation_v1_"
 const RUNTIME_ADOPT_SYMBOL_V1: &str = "fre_aot_static_search_span_adopt_raw_v1";
 const QUALIFICATION_RUNTIME_ADOPT_SYMBOL_V1: &str =
     "fre_aot_static_search_span_adopt_qualification_raw_v1";
+const FAMILY_QUALIFICATION_RUNTIME_ADOPT_SYMBOL_V1: &str =
+    "fre_aot_static_search_span_family_adopt_qualification_raw_v1";
 
 const ELF_HEADER_BYTES: usize = 64;
 const SECTION_HEADER_BYTES: usize = 64;
@@ -611,6 +613,21 @@ pub fn publish_linux_search_span_qualification_final_image_glue_v1(
     )
 }
 
+pub fn publish_linux_search_span_family_qualification_final_image_glue_v1(
+    compiled: &LinuxSearchCompiledObjectV1<Span>,
+    expectation: &LinuxStaticSearchSpanExpectationV1,
+    family_selector: u16,
+    limits: LinuxSearchSpanFinalImageGlueLimitsV1,
+) -> Result<PublishedLinuxSearchSpanFinalImageGlueV1, LinuxSearchSpanFinalImageGlueErrorV1> {
+    publish_for_adopter(
+        compiled,
+        expectation,
+        family_selector,
+        SearchSpanFinalImageAdopterV1::FamilyQualificationPrivate,
+        limits,
+    )
+}
+
 fn publish_for_adopter(
     compiled: &LinuxSearchCompiledObjectV1<Span>,
     expectation: &LinuxStaticSearchSpanExpectationV1,
@@ -692,10 +709,21 @@ pub fn inspect_linux_search_span_final_image_glue_v1(
             SearchSpanFinalImageAdopterV1::QualificationPrivate,
             limits,
         )?;
-        if bytes != qualification.as_slice() {
-            return Err(glue_error("canonical whole ELF glue"));
+        if bytes == qualification.as_slice() {
+            SearchSpanFinalImageAdopterV1::QualificationPrivate
+        } else {
+            let family_qualification = emit_glue_bytes(
+                expectation,
+                &compile_identity,
+                row_selector,
+                SearchSpanFinalImageAdopterV1::FamilyQualificationPrivate,
+                limits,
+            )?;
+            if bytes != family_qualification.as_slice() {
+                return Err(glue_error("canonical whole ELF glue"));
+            }
+            SearchSpanFinalImageAdopterV1::FamilyQualificationPrivate
         }
-        SearchSpanFinalImageAdopterV1::QualificationPrivate
     };
     Ok(LinuxSearchSpanFinalImageGlueInspectionV1 {
         object_bytes: bytes.len(),
@@ -831,6 +859,7 @@ const fn adopter_from_code(code: u16) -> Option<SearchSpanFinalImageAdopterV1> {
     match code {
         0 => Some(SearchSpanFinalImageAdopterV1::Production),
         1 => Some(SearchSpanFinalImageAdopterV1::QualificationPrivate),
+        2 => Some(SearchSpanFinalImageAdopterV1::FamilyQualificationPrivate),
         _ => None,
     }
 }
@@ -839,6 +868,7 @@ const fn adopter_code(adopter: SearchSpanFinalImageAdopterV1) -> u16 {
     match adopter {
         SearchSpanFinalImageAdopterV1::Production => 0,
         SearchSpanFinalImageAdopterV1::QualificationPrivate => 1,
+        SearchSpanFinalImageAdopterV1::FamilyQualificationPrivate => 2,
     }
 }
 
@@ -847,6 +877,9 @@ const fn adopter_symbol(adopter: SearchSpanFinalImageAdopterV1) -> &'static str 
         SearchSpanFinalImageAdopterV1::Production => RUNTIME_ADOPT_SYMBOL_V1,
         SearchSpanFinalImageAdopterV1::QualificationPrivate => {
             QUALIFICATION_RUNTIME_ADOPT_SYMBOL_V1
+        }
+        SearchSpanFinalImageAdopterV1::FamilyQualificationPrivate => {
+            FAMILY_QUALIFICATION_RUNTIME_ADOPT_SYMBOL_V1
         }
     }
 }
@@ -1826,9 +1859,9 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one end-to-end test compares the complete tag21 object and both adopter variants"
+        reason = "one end-to-end test compares the complete tag21 object and all adopter variants"
     )]
-    fn tag21_implementation_and_both_adopter_glues_are_deterministic_and_disjoint() {
+    fn tag21_implementation_and_all_adopter_glues_are_deterministic_and_disjoint() {
         let manifest = LinuxAarch64ExactSearchManifestV1::<Span>::tag21_candidate(
             LinuxAarch64SearchCompilePolicyV1::default(),
         )
@@ -1855,6 +1888,14 @@ mod tests {
             limits,
         )
         .expect("qualification glue");
+        let family_qualification =
+            publish_linux_search_span_family_qualification_final_image_glue_v1(
+                &compiled,
+                &expectation,
+                7,
+                limits,
+            )
+            .expect("family-qualification glue");
 
         assert_eq!(
             production.object().as_bytes(),
@@ -1868,6 +1909,22 @@ mod tests {
         assert_ne!(
             production.receipt().receipt_identity(),
             qualification.receipt().receipt_identity()
+        );
+        assert_ne!(
+            production.object().object_identity(),
+            family_qualification.object().object_identity()
+        );
+        assert_ne!(
+            qualification.object().object_identity(),
+            family_qualification.object().object_identity()
+        );
+        assert_eq!(
+            family_qualification.object().adopter(),
+            SearchSpanFinalImageAdopterV1::FamilyQualificationPrivate
+        );
+        assert_eq!(
+            family_qualification.receipt().adopter(),
+            Some(SearchSpanFinalImageAdopterV1::FamilyQualificationPrivate)
         );
         assert_eq!(
             production.runtime_authority(),
@@ -1920,11 +1977,28 @@ mod tests {
             .receipt()
             .exported_symbols()
             .expect("qualification symbols");
+        let family_qualification_symbols = family_qualification
+            .receipt()
+            .exported_symbols()
+            .expect("family-qualification symbols");
         assert_eq!(symbols.glue(), qualification_symbols.glue());
         assert_eq!(symbols.expectation(), qualification_symbols.expectation());
+        assert_eq!(symbols.glue(), family_qualification_symbols.glue());
+        assert_eq!(
+            symbols.expectation(),
+            family_qualification_symbols.expectation()
+        );
         assert_ne!(
             symbols.adopter_symbol(),
             qualification_symbols.adopter_symbol()
+        );
+        assert_ne!(
+            qualification_symbols.adopter_symbol(),
+            family_qualification_symbols.adopter_symbol()
+        );
+        assert_eq!(
+            family_qualification_symbols.adopter_symbol().as_str(),
+            FAMILY_QUALIFICATION_RUNTIME_ADOPT_SYMBOL_V1
         );
         let identity_hex = hex(symbols.compile_identity());
         for symbol in [

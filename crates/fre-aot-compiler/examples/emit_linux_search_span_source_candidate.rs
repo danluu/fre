@@ -344,6 +344,12 @@ fn build_candidate(route: CandidateRoute) -> Result<Candidate, DynError> {
                 LinuxSearchSpanFinalImageGlueLimitsV1::default(),
             )?
         }
+        SearchSpanFinalImageAdopterV1::FamilyQualificationPrivate => {
+            return Err(invalid(
+                "the exact-row proposal example cannot propose private family authority",
+            )
+            .into());
+        }
     };
     require(
         glue.runtime_authority() == SearchAotRuntimeAuthorityV1::Absent
@@ -747,6 +753,9 @@ fn render_source_row_proposal(
                 SearchSpanFinalImageAdopterV1::QualificationPrivate => {
                     "private-qualification-input"
                 }
+                SearchSpanFinalImageAdopterV1::FamilyQualificationPrivate => {
+                    "private-family-qualification-corroboration-only"
+                }
             }
             .to_owned(),
         ),
@@ -1044,6 +1053,7 @@ const fn adopter_name(adopter: SearchSpanFinalImageAdopterV1) -> &'static str {
     match adopter {
         SearchSpanFinalImageAdopterV1::Production => "production",
         SearchSpanFinalImageAdopterV1::QualificationPrivate => "qualification-private",
+        SearchSpanFinalImageAdopterV1::FamilyQualificationPrivate => "family-qualification-private",
     }
 }
 

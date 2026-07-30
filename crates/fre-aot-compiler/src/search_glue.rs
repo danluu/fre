@@ -51,6 +51,8 @@ const EXPECTATION_SYMBOL_PREFIX_V1: &str = "fre_aot_search_span_expectation_v1_"
 const RUNTIME_ADOPT_SYMBOL_V1: &str = "fre_aot_static_search_span_adopt_raw_v1";
 const QUALIFICATION_RUNTIME_ADOPT_SYMBOL_V1: &str =
     "fre_aot_static_search_span_adopt_qualification_raw_v1";
+const FAMILY_QUALIFICATION_RUNTIME_ADOPT_SYMBOL_V1: &str =
+    "fre_aot_static_search_span_family_adopt_qualification_raw_v1";
 
 const CONTENT_OFFSET: usize = 400;
 const EXPECTATION_FILE_OFFSET: usize = CONTENT_OFFSET + SEARCH_SPAN_FINAL_IMAGE_GLUE_CODE_BYTES_V1;
@@ -145,8 +147,10 @@ pub enum SearchSpanFinalImageAdopterV1 {
     /// Ordinary production adoption. The runtime production row table remains
     /// empty until a separate reviewed promotion transaction changes it.
     Production,
-    /// Separately named private qualification adoption.
+    /// Separately named exact-row private qualification adoption.
     QualificationPrivate,
+    /// Separately named artifact-independent family qualification adoption.
+    FamilyQualificationPrivate,
 }
 
 impl SearchSpanFinalImageAdopterV1 {
@@ -154,6 +158,7 @@ impl SearchSpanFinalImageAdopterV1 {
         match self {
             Self::Production => RUNTIME_ADOPT_SYMBOL_V1,
             Self::QualificationPrivate => QUALIFICATION_RUNTIME_ADOPT_SYMBOL_V1,
+            Self::FamilyQualificationPrivate => FAMILY_QUALIFICATION_RUNTIME_ADOPT_SYMBOL_V1,
         }
     }
 
@@ -161,6 +166,7 @@ impl SearchSpanFinalImageAdopterV1 {
         match self {
             Self::Production => 0,
             Self::QualificationPrivate => 1,
+            Self::FamilyQualificationPrivate => 2,
         }
     }
 
@@ -168,6 +174,7 @@ impl SearchSpanFinalImageAdopterV1 {
         match code {
             0 => Some(Self::Production),
             1 => Some(Self::QualificationPrivate),
+            2 => Some(Self::FamilyQualificationPrivate),
             _ => None,
         }
     }
@@ -560,6 +567,26 @@ pub fn publish_search_span_qualification_final_image_glue_v1(
     )
 }
 
+/// Emit glue for the separately named artifact-independent private family
+/// qualification adopter.
+///
+/// This only changes the undefined adopter symbol and its receipt binding. It
+/// neither enables the runtime feature nor inserts a qualification family.
+pub fn publish_search_span_family_qualification_final_image_glue_v1(
+    compiled: &SearchCompiledObjectV1<Span>,
+    expectation: &StaticSearchSpanExpectationV1,
+    family_selector: u16,
+    limits: SearchSpanFinalImageGlueLimitsV1,
+) -> Result<PublishedSearchSpanFinalImageGlueV1, SearchSpanFinalImageGlueErrorV1> {
+    publish_search_span_final_image_glue_for_adopter_v1(
+        compiled,
+        expectation,
+        family_selector,
+        SearchSpanFinalImageAdopterV1::FamilyQualificationPrivate,
+        limits,
+    )
+}
+
 fn publish_search_span_final_image_glue_for_adopter_v1(
     compiled: &SearchCompiledObjectV1<Span>,
     expectation: &StaticSearchSpanExpectationV1,
@@ -662,10 +689,21 @@ pub fn inspect_search_span_final_image_glue_v1(
             row_selector,
             SearchSpanFinalImageAdopterV1::QualificationPrivate,
         )?;
-        if bytes != &canonical[..qualification_layout.object_bytes] {
-            return Err(glue_error("canonical Search glue object"));
+        if bytes == &canonical[..qualification_layout.object_bytes] {
+            SearchSpanFinalImageAdopterV1::QualificationPrivate
+        } else {
+            let family_qualification_layout = emit_glue_bytes_into(
+                &mut canonical,
+                expectation,
+                compile_identity,
+                row_selector,
+                SearchSpanFinalImageAdopterV1::FamilyQualificationPrivate,
+            )?;
+            if bytes != &canonical[..family_qualification_layout.object_bytes] {
+                return Err(glue_error("canonical Search glue object"));
+            }
+            SearchSpanFinalImageAdopterV1::FamilyQualificationPrivate
         }
-        SearchSpanFinalImageAdopterV1::QualificationPrivate
     };
 
     Ok(SearchSpanFinalImageGlueInspectionV1 {
@@ -1781,7 +1819,7 @@ mod tests {
     }
 
     #[test]
-    fn production_and_private_adopters_are_canonical_and_disjoint() {
+    fn production_exact_private_and_family_private_adopters_are_canonical_and_disjoint() {
         let (compiled, expectation) = compile_span(b"needle");
         let production = publish_search_span_final_image_glue_v1(
             &compiled,
@@ -1797,17 +1835,40 @@ mod tests {
             SearchSpanFinalImageGlueLimitsV1::default(),
         )
         .expect("private qualification Search glue");
+        let family_qualification = publish_search_span_family_qualification_final_image_glue_v1(
+            &compiled,
+            &expectation,
+            11,
+            SearchSpanFinalImageGlueLimitsV1::default(),
+        )
+        .expect("private family-qualification Search glue");
         assert_ne!(
             production.object().as_bytes(),
             qualification.object().as_bytes()
         );
         assert_ne!(
+            production.object().as_bytes(),
+            family_qualification.object().as_bytes()
+        );
+        assert_ne!(
+            qualification.object().as_bytes(),
+            family_qualification.object().as_bytes()
+        );
+        assert_ne!(
             production.object().glue_object_identity(),
             qualification.object().glue_object_identity()
+        );
+        assert_ne!(
+            qualification.object().glue_object_identity(),
+            family_qualification.object().glue_object_identity()
         );
         assert_eq!(
             production.object().glue_code_identity(),
             qualification.object().glue_code_identity()
+        );
+        assert_eq!(
+            production.object().glue_code_identity(),
+            family_qualification.object().glue_code_identity()
         );
         assert_eq!(
             production.object().adopter(),
@@ -1818,12 +1879,20 @@ mod tests {
             SearchSpanFinalImageAdopterV1::QualificationPrivate
         );
         assert_eq!(
+            family_qualification.object().adopter(),
+            SearchSpanFinalImageAdopterV1::FamilyQualificationPrivate
+        );
+        assert_eq!(
             production.receipt().adopter(),
             Some(SearchSpanFinalImageAdopterV1::Production)
         );
         assert_eq!(
             qualification.receipt().adopter(),
             Some(SearchSpanFinalImageAdopterV1::QualificationPrivate)
+        );
+        assert_eq!(
+            family_qualification.receipt().adopter(),
+            Some(SearchSpanFinalImageAdopterV1::FamilyQualificationPrivate)
         );
         assert!(contains(
             production.object().as_bytes(),
@@ -1841,6 +1910,14 @@ mod tests {
             qualification.object().as_bytes(),
             format!("_{RUNTIME_ADOPT_SYMBOL_V1}\0").as_bytes()
         ));
+        assert!(contains(
+            family_qualification.object().as_bytes(),
+            FAMILY_QUALIFICATION_RUNTIME_ADOPT_SYMBOL_V1.as_bytes()
+        ));
+        assert!(!contains(
+            family_qualification.object().as_bytes(),
+            QUALIFICATION_RUNTIME_ADOPT_SYMBOL_V1.as_bytes()
+        ));
         let inspected = inspect_search_span_final_image_glue_v1(
             qualification.object().as_bytes(),
             SearchSpanFinalImageGlueLimitsV1::default(),
@@ -1849,6 +1926,15 @@ mod tests {
         assert_eq!(
             inspected.adopter(),
             SearchSpanFinalImageAdopterV1::QualificationPrivate
+        );
+        let family_inspected = inspect_search_span_final_image_glue_v1(
+            family_qualification.object().as_bytes(),
+            SearchSpanFinalImageGlueLimitsV1::default(),
+        )
+        .expect("canonical family-qualification inspection");
+        assert_eq!(
+            family_inspected.adopter(),
+            SearchSpanFinalImageAdopterV1::FamilyQualificationPrivate
         );
     }
 
