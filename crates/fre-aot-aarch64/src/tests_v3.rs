@@ -501,13 +501,13 @@ fn direct_masks_and_periodic_absence_batching_have_distinct_graphs() {
         CountEmitLimitsV3::default(),
     )
     .unwrap();
-    assert_eq!(
+    assert!(
         periodic
             .labels()
             .iter()
             .filter(|label| label.kind == LabelKindV3::VectorLoop)
-            .count(),
-        1
+            .count()
+            >= 2
     );
     assert_eq!(
         periodic

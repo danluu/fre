@@ -157,7 +157,7 @@ fn nonperiodic_sve_costs_follow_the_shared_lowering_instead_of_strategy_labels()
 }
 
 #[test]
-fn periodic_portfolio_uses_the_complete_bounded_filter() {
+fn periodic_portfolio_uses_the_minimal_period_boundary_filter() {
     let literal = b"abababab";
     let mut work = Work::default();
     let analysis = analyze_literal(literal, &mut work).expect("periodic literal analysis");
@@ -185,7 +185,7 @@ fn periodic_portfolio_uses_the_complete_bounded_filter() {
         .filter(|candidate| candidate.strategy == CountV3Strategy::PeriodicRun)
         .map(|candidate| candidate.filter_count)
         .collect::<Vec<_>>();
-    assert_eq!(periodic_filter_counts, vec![4]);
+    assert_eq!(periodic_filter_counts, vec![2]);
 }
 
 #[test]

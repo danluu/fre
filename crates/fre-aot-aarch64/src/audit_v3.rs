@@ -211,6 +211,10 @@ pub enum DecodedInstructionV3 {
         base: u8,
         offset: u16,
     },
+    LoadVectors4x128 {
+        first_destination: u8,
+        base: u8,
+    },
     LoadVectorDouble {
         destination: u8,
         base: u8,
@@ -364,6 +368,7 @@ impl DecodedInstructionV3 {
         matches!(
             self,
             Self::LoadVector128 { .. }
+                | Self::LoadVectors4x128 { .. }
                 | Self::LoadVectorDouble { .. }
                 | Self::DuplicateByte16 { .. }
                 | Self::CompareEqualBytes16 { .. }
@@ -454,6 +459,10 @@ impl DecodedInstructionV3 {
     pub(crate) const fn written_simd_register(self) -> Option<u8> {
         match self {
             Self::LoadVector128 { destination, .. }
+            | Self::LoadVectors4x128 {
+                first_destination: destination,
+                ..
+            }
             | Self::LoadVectorDouble { destination, .. }
             | Self::DuplicateByte16 { destination, .. }
             | Self::CompareEqualBytes16 { destination, .. }
@@ -1096,6 +1105,14 @@ fn audit_impl_v3(
         let offset = u32::try_from(index.checked_mul(4).ok_or(audit_arithmetic_v3())?)
             .map_err(|_| audit_arithmetic_v3())?;
         let instruction = decode_word_v3(word, offset)?;
+        if let DecodedInstructionV3::LoadVectors4x128 {
+            first_destination, ..
+        } = instruction
+            && (first_destination..first_destination + 4)
+                .any(|destination| (8..=15).contains(&destination))
+        {
+            return Err(invalid_v3("v3 forbidden callee-saved SIMD write"));
+        }
         if let Some(destination) = instruction.written_simd_register()
             && (8..=15).contains(&destination)
         {
@@ -1241,9 +1258,6 @@ fn audit_impl_v3(
                 ),
             )
         } else if audit_recipe.strategy == AuditLoweringStrategyV3::PeriodicRun {
-            // PeriodicRun closes every selected column before its only empty
-            // test, so it has one candidate block and lane-recovery loop but
-            // deliberately no staged one-column absence proof.
             (1, 1, 0)
         } else {
             // The non-periodic specialized graph contains the ordinary
@@ -4976,9 +4990,11 @@ fn policy_periodic_neon_v3(
     periodic_stride: u8,
     done: PolicyLabelV3,
 ) -> Result<(), CountAotError> {
-    if periodic_stride == 0 || usize::from(periodic_stride) >= literal.len() {
+    if periodic_stride == 0 || usize::from(periodic_stride) >= literal.len() || filter.len != 2 {
         return Err(invalid_v3("invalid periodic NEON policy stride"));
     }
+    let wide = policy.new_label(LabelKindV3::VectorLoop)?;
+    let wide_hit = policy.new_label(LabelKindV3::Internal)?;
     let vector = policy.new_label(LabelKindV3::VectorLoop)?;
     let candidate = policy.new_label(LabelKindV3::CandidateLoop)?;
     let candidate_miss = policy.new_label(LabelKindV3::Miss)?;
@@ -4989,7 +5005,7 @@ fn policy_periodic_neon_v3(
     let scalar_miss = policy.new_label(LabelKindV3::Miss)?;
     let width = u16::try_from(literal.len()).expect("bounded width");
     let value_registers = [X10, X11, X12, X14];
-    let vector_registers = [2_u8, 3, 16, 17];
+    let vector_registers = [18_u8, 19, 16, 17];
 
     policy_mov_minimal_v3(policy, X13, 0)?;
     compare_immediate64_v3(policy, X1, width)?;
@@ -5060,6 +5076,162 @@ fn policy_periodic_neon_v3(
             },
         )?;
     }
+
+    policy.bind(wide)?;
+    compare_register64_v3(policy, X3, X4)?;
+    condition_v3(policy, ConditionV3::Higher, done)?;
+    subtract_register64_v3(policy, X5, X4, X3)?;
+    compare_immediate64_v3(policy, X5, SPARSE_SCAN_STARTS_V3 - 1)?;
+    condition_v3(policy, ConditionV3::CarryClear, vector)?;
+    add_register64_v3(policy, X15, X0, X3)?;
+    add_immediate64_v3(policy, X8, X15, u16::from(filter.offsets[0]))?;
+    add_immediate64_v3(policy, X9, X15, u16::from(filter.offsets[1]))?;
+    for (group, (first_base, second_base)) in [(X8, X9), (X16, X5)].into_iter().enumerate() {
+        if group != 0 {
+            add_immediate64_v3(policy, first_base, X8, 64)?;
+            add_immediate64_v3(policy, second_base, X9, 64)?;
+        }
+        let mask_base =
+            SPARSE_BLOCK_MASK_BASE_V3 + u8::try_from(group * 4).expect("two four-vector groups");
+        exact_v3(
+            policy,
+            DecodedInstructionV3::LoadVectors4x128 {
+                first_destination: 0,
+                base: first_base,
+            },
+        )?;
+        for lane in 0_u8..4 {
+            exact_v3(
+                policy,
+                DecodedInstructionV3::CompareEqualBytes16 {
+                    destination: mask_base + lane,
+                    left: lane,
+                    right: vector_registers[0],
+                },
+            )?;
+        }
+        exact_v3(
+            policy,
+            DecodedInstructionV3::LoadVectors4x128 {
+                first_destination: 0,
+                base: second_base,
+            },
+        )?;
+        for lane in 0_u8..4 {
+            exact_v3(
+                policy,
+                DecodedInstructionV3::CompareEqualBytes16 {
+                    destination: lane,
+                    left: lane,
+                    right: vector_registers[1],
+                },
+            )?;
+            exact_v3(
+                policy,
+                DecodedInstructionV3::AndBytes16 {
+                    destination: mask_base + lane,
+                    left: mask_base + lane,
+                    right: lane,
+                },
+            )?;
+        }
+    }
+    exact_v3(
+        policy,
+        DecodedInstructionV3::OrBytes16 {
+            destination: SPARSE_PAIR_01_MASK_V3,
+            left: SPARSE_BLOCK_MASK_BASE_V3,
+            right: SPARSE_BLOCK_MASK_BASE_V3 + 1,
+        },
+    )?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::OrBytes16 {
+            destination: SPARSE_PAIR_23_MASK_V3,
+            left: SPARSE_BLOCK_MASK_BASE_V3 + 2,
+            right: SPARSE_BLOCK_MASK_BASE_V3 + 3,
+        },
+    )?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::OrBytes16 {
+            destination: SPARSE_PAIR_45_MASK_V3,
+            left: SPARSE_BLOCK_MASK_BASE_V3 + 4,
+            right: SPARSE_BLOCK_MASK_BASE_V3 + 5,
+        },
+    )?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::OrBytes16 {
+            destination: SPARSE_PAIR_67_MASK_V3,
+            left: SPARSE_BLOCK_MASK_BASE_V3 + 6,
+            right: SPARSE_BLOCK_MASK_BASE_V3 + 7,
+        },
+    )?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::OrBytes16 {
+            destination: 1,
+            left: SPARSE_PAIR_01_MASK_V3,
+            right: SPARSE_PAIR_23_MASK_V3,
+        },
+    )?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::OrBytes16 {
+            destination: 0,
+            left: SPARSE_PAIR_45_MASK_V3,
+            right: SPARSE_PAIR_67_MASK_V3,
+        },
+    )?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::OrBytes16 {
+            destination: 1,
+            left: 1,
+            right: 0,
+        },
+    )?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::UnsignedMaxAcrossBytes16 {
+            destination: 1,
+            source: 1,
+        },
+    )?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::MoveVectorByteTo32 {
+            destination: X8,
+            source: 1,
+        },
+    )?;
+    compare_immediate64_v3(policy, X8, 0)?;
+    condition_v3(policy, ConditionV3::NotEqual, wide_hit)?;
+    add_immediate64_v3(policy, X3, X3, SPARSE_SCAN_STARTS_V3)?;
+    branch_v3(policy, wide)?;
+
+    policy.bind(wide_hit)?;
+    for mask in SPARSE_BLOCK_MASK_BASE_V3..SPARSE_BLOCK_MASK_BASE_V3 + 7 {
+        exact_v3(
+            policy,
+            DecodedInstructionV3::UnsignedMaxAcrossBytes16 {
+                destination: 1,
+                source: mask,
+            },
+        )?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::MoveVectorByteTo32 {
+                destination: X8,
+                source: 1,
+            },
+        )?;
+        compare_immediate64_v3(policy, X8, 0)?;
+        condition_v3(policy, ConditionV3::NotEqual, vector)?;
+        add_immediate64_v3(policy, X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
+    }
+    branch_v3(policy, vector)?;
 
     policy.bind(vector)?;
     compare_register64_v3(policy, X3, X4)?;
@@ -5175,7 +5347,7 @@ fn policy_periodic_neon_v3(
     condition_v3(policy, ConditionV3::NotEqual, candidate)?;
     policy.bind(advance)?;
     add_immediate64_v3(policy, X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
-    branch_v3(policy, vector)?;
+    branch_v3(policy, wide)?;
 
     policy.bind(match_run)?;
     compare_register64_v3(policy, X3, X4)?;
@@ -5194,7 +5366,7 @@ fn policy_periodic_neon_v3(
     branch_v3(policy, match_run)?;
     policy.bind(match_run_miss)?;
     add_immediate64_v3(policy, X3, X3, 1)?;
-    branch_v3(policy, vector)?;
+    branch_v3(policy, wide)?;
 
     policy.bind(scalar)?;
     compare_register64_v3(policy, X3, X4)?;
@@ -5931,6 +6103,14 @@ pub(crate) fn decode_word_v3(
             offset: immediate12_v3(word)
                 .checked_mul(8)
                 .expect("scaled store offset"),
+        })
+    } else if word & 0xffff_fc00 == 0x4c40_2000 {
+        if rd > 28 {
+            return Err(invalid_v3("v3 four-vector load register wrap"));
+        }
+        Ok(DecodedInstructionV3::LoadVectors4x128 {
+            first_destination: rd,
+            base: rn,
         })
     } else if word & 0xffc0_0000 == 0x3dc0_0000 {
         Ok(DecodedInstructionV3::LoadVector128 {

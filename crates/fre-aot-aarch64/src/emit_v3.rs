@@ -3113,11 +3113,13 @@ fn emit_periodic_neon_v3(
     periodic_stride: u8,
     done: LabelV3,
 ) -> Result<(), CountAotError> {
-    if periodic_stride == 0 || usize::from(periodic_stride) >= literal.len() {
+    if periodic_stride == 0 || usize::from(periodic_stride) >= literal.len() || filter.len != 2 {
         return Err(CountAotError::InternalInvariant {
             at: "invalid periodic NEON stride",
         });
     }
+    let wide = assembler.new_label(LabelKindV3::VectorLoop)?;
+    let wide_hit = assembler.new_label(LabelKindV3::Internal)?;
     let vector = assembler.new_label(LabelKindV3::VectorLoop)?;
     let candidate = assembler.new_label(LabelKindV3::CandidateLoop)?;
     let candidate_miss = assembler.new_label(LabelKindV3::Miss)?;
@@ -3130,7 +3132,9 @@ fn emit_periodic_neon_v3(
         site: CountAotArithmeticSite::CodeOffset,
     })?;
     let value_registers = [X10, X11, X12, X14];
-    let vector_registers = [2_u8, 3, 16, 17];
+    // V0-V3 are the four-register load window in the wide loop. Keep the
+    // filter splats above it so each 64-byte group needs only two LD1s.
+    let vector_registers = [18_u8, 19, 16, 17];
 
     assembler.mov_imm64_minimal(X13, 0)?;
     assembler.cmp_imm64(X1, width)?;
@@ -3173,6 +3177,77 @@ fn emit_periodic_neon_v3(
         assembler.mov_imm64_minimal(X8, u64::from_le_bytes(bytes))?;
         assembler.move_x_to_vector_double(OVERLAPPING_SUFFIX_VECTOR_V3, X8)?;
     }
+
+    // Scan eight blocks using the two sealed period-boundary columns. This
+    // retains their close structural relationship; semantic endpoints are
+    // paid only by confirmation after a surviving block.
+    assembler.bind(wide)?;
+    assembler.cmp_reg64(X3, X4)?;
+    assembler.branch_cond(ConditionV3::Higher, done)?;
+    assembler.sub_reg(X5, X4, X3)?;
+    assembler.cmp_imm64(X5, SPARSE_SCAN_STARTS_V3 - 1)?;
+    assembler.branch_cond(ConditionV3::CarryClear, vector)?;
+    assembler.add_reg(X15, X0, X3)?;
+    assembler.add_imm(X8, X15, u16::from(filter.offsets[0]))?;
+    assembler.add_imm(X9, X15, u16::from(filter.offsets[1]))?;
+    for (group, (first_base, second_base)) in [(X8, X9), (X16, X5)].into_iter().enumerate() {
+        if group != 0 {
+            assembler.add_imm(first_base, X8, 64)?;
+            assembler.add_imm(second_base, X9, 64)?;
+        }
+        let mask_base =
+            SPARSE_BLOCK_MASK_BASE_V3 + u8::try_from(group * 4).expect("two four-vector groups");
+        assembler.load_vectors4x128(0, first_base)?;
+        for lane in 0_u8..4 {
+            assembler.compare_equal_bytes16(mask_base + lane, lane, vector_registers[0])?;
+        }
+        assembler.load_vectors4x128(0, second_base)?;
+        for lane in 0_u8..4 {
+            assembler.compare_equal_bytes16(lane, lane, vector_registers[1])?;
+            assembler.and_bytes16(mask_base + lane, mask_base + lane, lane)?;
+        }
+    }
+    assembler.or_bytes16(
+        SPARSE_PAIR_01_MASK_V3,
+        SPARSE_BLOCK_MASK_BASE_V3,
+        SPARSE_BLOCK_MASK_BASE_V3 + 1,
+    )?;
+    assembler.or_bytes16(
+        SPARSE_PAIR_23_MASK_V3,
+        SPARSE_BLOCK_MASK_BASE_V3 + 2,
+        SPARSE_BLOCK_MASK_BASE_V3 + 3,
+    )?;
+    assembler.or_bytes16(
+        SPARSE_PAIR_45_MASK_V3,
+        SPARSE_BLOCK_MASK_BASE_V3 + 4,
+        SPARSE_BLOCK_MASK_BASE_V3 + 5,
+    )?;
+    assembler.or_bytes16(
+        SPARSE_PAIR_67_MASK_V3,
+        SPARSE_BLOCK_MASK_BASE_V3 + 6,
+        SPARSE_BLOCK_MASK_BASE_V3 + 7,
+    )?;
+    assembler.or_bytes16(1, SPARSE_PAIR_01_MASK_V3, SPARSE_PAIR_23_MASK_V3)?;
+    assembler.or_bytes16(0, SPARSE_PAIR_45_MASK_V3, SPARSE_PAIR_67_MASK_V3)?;
+    assembler.or_bytes16(1, 1, 0)?;
+    assembler.unsigned_max_across_bytes16(1, 1)?;
+    assembler.move_vector_byte_to32(X8, 1)?;
+    assembler.cmp_imm64(X8, 0)?;
+    assembler.branch_cond(ConditionV3::NotEqual, wide_hit)?;
+    assembler.add_imm(X3, X3, SPARSE_SCAN_STARTS_V3)?;
+    assembler.branch(wide)?;
+
+    // A hit-bearing batch is rare. Locate its exact earliest 16-start block
+    // from the retained masks, avoiding a second 128-start scan.
+    assembler.bind(wide_hit)?;
+    for mask in SPARSE_BLOCK_MASK_BASE_V3..SPARSE_BLOCK_MASK_BASE_V3 + 7 {
+        assembler.unsigned_max_across_bytes16(1, mask)?;
+        assembler.move_vector_byte_to32(X8, 1)?;
+        assembler.cmp_imm64(X8, 0)?;
+        assembler.branch_cond(ConditionV3::NotEqual, vector)?;
+        assembler.add_imm(X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
+    }
+    assembler.branch(vector)?;
 
     assembler.bind(vector)?;
     assembler.cmp_reg64(X3, X4)?;
@@ -3221,7 +3296,7 @@ fn emit_periodic_neon_v3(
     assembler.branch_cond(ConditionV3::NotEqual, candidate)?;
     assembler.bind(advance)?;
     assembler.add_imm(X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
-    assembler.branch(vector)?;
+    assembler.branch(wide)?;
 
     assembler.bind(match_run)?;
     assembler.cmp_reg64(X3, X4)?;
@@ -3240,7 +3315,7 @@ fn emit_periodic_neon_v3(
     assembler.branch(match_run)?;
     assembler.bind(match_run_miss)?;
     assembler.add_imm(X3, X3, 1)?;
-    assembler.branch(vector)?;
+    assembler.branch(wide)?;
 
     assembler.bind(scalar)?;
     assembler.cmp_reg64(X3, X4)?;
@@ -3884,6 +3959,18 @@ impl AssemblerV3 {
                 | (u32::from(offset / 16) << 10)
                 | register_field_v3(base, 5)
                 | u32::from(destination),
+            true,
+        )
+    }
+
+    fn load_vectors4x128(&mut self, first_destination: u8, base: u8) -> Result<(), CountAotError> {
+        if first_destination > 28 {
+            return Err(CountAotError::InternalInvariant {
+                at: "v3 four-vector load register wrap",
+            });
+        }
+        self.emit_word(
+            0x4c40_2000 | register_field_v3(base, 5) | u32::from(first_destination),
             true,
         )
     }

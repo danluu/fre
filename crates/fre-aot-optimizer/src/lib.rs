@@ -1411,7 +1411,7 @@ fn build_portfolio(
         }
     }
     if usize::from(facts.minimum_period) < literal.len() {
-        let (filters, filter_count) = periodic_filters(literal, facts, multiplicity)?;
+        let (filters, _) = periodic_filters(literal, facts, multiplicity)?;
         push_candidate(
             &mut candidates,
             literal,
@@ -1420,7 +1420,7 @@ fn build_portfolio(
             required_isa,
             CountV3Strategy::PeriodicRun,
             CountV3ScheduleId::PeriodicRunV1,
-            &filters[..filter_count],
+            &filters[..2],
             facts.minimum_period,
             work,
         )?;

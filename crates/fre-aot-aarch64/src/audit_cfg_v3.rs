@@ -784,6 +784,9 @@ fn execute_v3(
         DecodedInstructionV3::LoadVector128 { base, offset, .. } => {
             prove_load_v3(state, state.value(base), offset, 16, literal_width)?;
         }
+        DecodedInstructionV3::LoadVectors4x128 { base, .. } => {
+            prove_load_v3(state, state.value(base), 0, 64, literal_width)?;
+        }
         DecodedInstructionV3::LoadVectorDouble { base, offset, .. } => {
             prove_load_v3(state, state.value(base), offset, 8, literal_width)?;
         }
@@ -1206,6 +1209,7 @@ const fn is_haystack_load_v3(instruction: DecodedInstructionV3) -> bool {
         DecodedInstructionV3::LoadByte { .. }
             | DecodedInstructionV3::LoadByteRegister { .. }
             | DecodedInstructionV3::LoadVector128 { .. }
+            | DecodedInstructionV3::LoadVectors4x128 { .. }
             | DecodedInstructionV3::LoadVectorDouble { .. }
             | DecodedInstructionV3::SveLoadBytes { .. }
             | DecodedInstructionV3::SveLoadBytesMulVl { .. }
