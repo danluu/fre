@@ -1,3 +1,4 @@
+use fre_aot_search_contract::search_backend_literal_width_is_valid_v1;
 use fre_jit_aarch64::{BackendVersion, CpuFeatures, NativeImage};
 use sha2::{Digest, Sha256};
 
@@ -312,12 +313,21 @@ impl MetadataV1 {
                     || version == BackendVersion::SEARCH_V13.0
                     || version == BackendVersion::SEARCH_V15.0
                     || version == BackendVersion::SEARCH_V16.0
-                    || version == BackendVersion::SEARCH_V17.0 =>
+                    || version == BackendVersion::SEARCH_V17.0
+                    || version == BackendVersion::SEARCH_V24.0 =>
             {
                 self.features == CpuFeatures::ASIMD.bits()
+                    && search_backend_literal_width_is_valid_v1(
+                        self.backend_version,
+                        self.rodata_bytes,
+                    )
             }
             version if version == BackendVersion::SEARCH_SVE2_FIXED16_V2.0 => {
-                self.features == CpuFeatures::ASIMD_SVE2.bits() && self.rodata_bytes == 16
+                self.features == CpuFeatures::ASIMD_SVE2.bits()
+                    && search_backend_literal_width_is_valid_v1(
+                        self.backend_version,
+                        self.rodata_bytes,
+                    )
             }
             _ => false,
         };
@@ -524,5 +534,50 @@ impl<'a> Reader<'a> {
 
     fn u64(&mut self, at: &'static str) -> Result<u64, ElfObjectError> {
         Ok(u64::from_le_bytes(self.array(at)?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tag37_metadata(width: u32) -> MetadataV1 {
+        MetadataV1 {
+            backend_version: BackendVersion::SEARCH_V24.0,
+            output_kind: 3,
+            architecture: 1,
+            little_endian: 1,
+            pointer_width: 64,
+            target_abi: 1,
+            features: CpuFeatures::ASIMD.bits(),
+            payload_bytes: 240_u32.checked_add(width).expect("small test width"),
+            code_bytes: 240,
+            rodata_offset: 240,
+            rodata_bytes: width,
+            source_identity: [0x11; 32],
+            artifact_identity: [0x22; 32],
+            binding_identity: [0x33; 32],
+            payload_sha256: [0x44; 32],
+            compile_identity: [0; 32],
+        }
+    }
+
+    #[test]
+    fn tag37_metadata_decoder_enforces_the_central_width_envelope() {
+        for width in [6, 32] {
+            let mut metadata = tag37_metadata(width);
+            metadata.compile_identity = compute_compile_identity_v1(metadata).0;
+            let encoded = metadata.encode().expect("canonical tag37 metadata");
+            assert_eq!(
+                MetadataV1::decode(&encoded).expect("decode tag37 metadata"),
+                metadata
+            );
+        }
+        for width in [0, 1, 5, 33] {
+            assert!(
+                tag37_metadata(width).validate_shape().is_err(),
+                "ELF metadata admitted tag37 width {width}"
+            );
+        }
     }
 }

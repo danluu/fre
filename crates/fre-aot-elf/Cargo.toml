@@ -8,6 +8,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+fre-aot-search-contract = { path = "../fre-aot-search-contract" }
 fre-jit-aarch64 = { path = "../fre-jit-aarch64" }
 fre-kernel-ir = { path = "../fre-kernel-ir" }
 sha2 = "=0.10.9"

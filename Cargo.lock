@@ -183,6 +183,7 @@ dependencies = [
 name = "fre-aot-elf"
 version = "0.1.0"
 dependencies = [
+ "fre-aot-search-contract",
  "fre-jit-aarch64",
  "fre-kernel-ir",
  "sha2",
@@ -193,6 +194,7 @@ name = "fre-aot-macho"
 version = "0.1.0"
 dependencies = [
  "fre-aot-aarch64",
+ "fre-aot-search-contract",
  "fre-exact-alloc",
  "fre-jit-aarch64",
  "fre-kernel-ir",

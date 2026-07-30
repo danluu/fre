@@ -87,6 +87,23 @@ pub const SEARCH_BACKEND_ASIMD_TAG29_V1: u16 = 29;
 /// frozen broad qualification family grants execution authority. Tag29
 /// remains frozen and unchanged.
 pub const SEARCH_BACKEND_ASIMD_TAG30_V1: u16 = 30;
+/// Advanced SIMD Search V24/tag37 with one deterministic sixth static
+/// screening column derived from, but deliberately absent from, the exact
+/// five-field authenticated search manifest.
+///
+/// This remains an inert compiler/static-link identity until a separately
+/// frozen broad qualification family grants execution authority. Tag36 is
+/// intentionally absent because Search V23 was rejected.
+pub const SEARCH_BACKEND_ASIMD_TAG37_V1: u16 = 37;
+/// Minimum exact-literal width admitted by the Search V24/tag37 backend.
+pub const SEARCH_BACKEND_ASIMD_TAG37_MIN_LITERAL_BYTES_V1: u32 = 6;
+/// Maximum exact-literal width admitted by the Search V24/tag37 backend.
+pub const SEARCH_BACKEND_ASIMD_TAG37_MAX_LITERAL_BYTES_V1: u32 = 32;
+/// Number of authenticated static filter offsets carried by the V24 manifest.
+///
+/// The sixth offset is deterministically derived from the literal and these
+/// five fields by the audited emitter; it is not a sixth manifest field.
+pub const SEARCH_BACKEND_ASIMD_TAG37_MANIFEST_FILTER_FIELDS_V1: u8 = 5;
 /// Explicit fixed-VL16 SVE2 candidate backend. This never changes the V8
 /// default or grants qualification authority.
 pub const SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1: u16 = 21;
@@ -120,6 +137,29 @@ pub const SEARCH_DEFAULT_END_ANCHOR_V1: u8 = 0;
 pub const MIN_STATIC_SEARCH_SPAN_LITERAL_BYTES_V1: u32 = 1;
 /// Maximum live exact-literal width admitted by this static Span slice.
 pub const MAX_STATIC_SEARCH_SPAN_LITERAL_BYTES_V1: u32 = 32;
+
+/// Return whether a live literal width is canonical for a Search backend.
+///
+/// This single neutral predicate is used at every persisted-contract boundary
+/// so tag-specific width rules cannot drift between compiler, object, and
+/// static-runtime decoders.
+#[must_use]
+pub const fn search_backend_literal_width_is_valid_v1(
+    backend: u16,
+    live_literal_bytes: u32,
+) -> bool {
+    match backend {
+        SEARCH_BACKEND_ASIMD_TAG37_V1 => {
+            live_literal_bytes >= SEARCH_BACKEND_ASIMD_TAG37_MIN_LITERAL_BYTES_V1
+                && live_literal_bytes <= SEARCH_BACKEND_ASIMD_TAG37_MAX_LITERAL_BYTES_V1
+        }
+        SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1 => live_literal_bytes == 16,
+        _ => {
+            live_literal_bytes >= MIN_STATIC_SEARCH_SPAN_LITERAL_BYTES_V1
+                && live_literal_bytes <= MAX_STATIC_SEARCH_SPAN_LITERAL_BYTES_V1
+        }
+    }
+}
 
 /// Source-first Search compiler version admitted by the expectation.
 pub const AOT_SEARCH_COMPILER_VERSION_V1: u16 = 1;
@@ -406,8 +446,10 @@ fn validate_metadata_shape(metadata: ClaimedSearchMetadataV1) -> Result<(), Sear
         )
         || metadata.entry_offset != SEARCH_ENTRY_OFFSET_V1
         || metadata.literal_bytes != 0
-        || (metadata.backend_version == SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1
-            && metadata.rodata_bytes != 16)
+        || !search_backend_literal_width_is_valid_v1(
+            metadata.backend_version,
+            metadata.rodata_bytes,
+        )
         || metadata.binding_identity == [0; 32]
     {
         return Err(metadata_error("metadata contract"));
@@ -542,6 +584,7 @@ const fn valid_metadata_target_profile(backend: u16, platform: u8, features: u64
             | SEARCH_BACKEND_ASIMD_TAG28_V1
             | SEARCH_BACKEND_ASIMD_TAG29_V1
             | SEARCH_BACKEND_ASIMD_TAG30_V1
+            | SEARCH_BACKEND_ASIMD_TAG37_V1
     ) && (platform == SEARCH_PLATFORM_MACOS_V1 || platform == SEARCH_PLATFORM_LINUX_V1)
         && features == SEARCH_REQUIRED_ASIMD_FEATURES_V1;
     let tag21 = backend == SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1
@@ -566,7 +609,8 @@ const fn valid_expectation_target_profile(
                 | SEARCH_BACKEND_ASIMD_TAG26_V1
                 | SEARCH_BACKEND_ASIMD_TAG28_V1
                 | SEARCH_BACKEND_ASIMD_TAG29_V1
-                | SEARCH_BACKEND_ASIMD_TAG30_V1,
+                | SEARCH_BACKEND_ASIMD_TAG30_V1
+                | SEARCH_BACKEND_ASIMD_TAG37_V1,
             SEARCH_PLATFORM_MACOS_V1,
             SEARCH_REQUIRED_ASIMD_FEATURES_V1,
             SEARCH_EXPORTED_SYMBOL_N_TYPE_V1,
@@ -578,7 +622,8 @@ const fn valid_expectation_target_profile(
                 | SEARCH_BACKEND_ASIMD_TAG26_V1
                 | SEARCH_BACKEND_ASIMD_TAG28_V1
                 | SEARCH_BACKEND_ASIMD_TAG29_V1
-                | SEARCH_BACKEND_ASIMD_TAG30_V1,
+                | SEARCH_BACKEND_ASIMD_TAG30_V1
+                | SEARCH_BACKEND_ASIMD_TAG37_V1,
             SEARCH_PLATFORM_LINUX_V1,
             SEARCH_REQUIRED_ASIMD_FEATURES_V1,
             SEARCH_EXPORTED_SYMBOL_INFO_ELF_FUNCTION_V1,
@@ -769,9 +814,7 @@ pub fn inspect_static_search_span_expectation_v1(
             required_features,
             exported_symbol_n_type,
         )
-        || (backend_version == SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1 && live_literal_bytes != 16)
-        || !(MIN_STATIC_SEARCH_SPAN_LITERAL_BYTES_V1..=MAX_STATIC_SEARCH_SPAN_LITERAL_BYTES_V1)
-            .contains(&live_literal_bytes)
+        || !search_backend_literal_width_is_valid_v1(backend_version, live_literal_bytes)
         || reader.position() != EXPECTATION_HEADER_BYTES_V1
     {
         return Err(expectation_error("expectation header"));
@@ -1241,8 +1284,12 @@ mod tests {
         fixture_expectation_with_literal_bytes(16)
     }
 
-    fn linux_fixture_expectation(backend: u16, features: u64) -> StaticSearchSpanExpectationV1 {
-        let mut metadata = fixture_metadata_claim();
+    fn linux_fixture_expectation_with_literal_bytes(
+        backend: u16,
+        features: u64,
+        live_literal_bytes: u32,
+    ) -> StaticSearchSpanExpectationV1 {
+        let mut metadata = fixture_metadata_claim_with_literal_bytes(live_literal_bytes);
         metadata.backend_version = backend;
         metadata.platform = SEARCH_PLATFORM_LINUX_V1;
         metadata.features = features;
@@ -1258,6 +1305,9 @@ mod tests {
         expectation[EXPECTATION_REQUIRED_FEATURES_OFFSET..EXPECTATION_LIVE_LITERAL_BYTES_OFFSET]
             .copy_from_slice(&features.to_le_bytes());
         expectation
+            [EXPECTATION_LIVE_LITERAL_BYTES_OFFSET..EXPECTATION_LIVE_LITERAL_BYTES_OFFSET + 4]
+            .copy_from_slice(&live_literal_bytes.to_le_bytes());
+        expectation
             [EXPECTATION_COMPILE_IDENTITY_OFFSET_V1..EXPECTATION_COMPILE_IDENTITY_OFFSET_V1 + 32]
             .copy_from_slice(&metadata.compile_identity);
         expectation[STATIC_SEARCH_SPAN_EXPECTATION_METADATA_OFFSET_V1
@@ -1265,6 +1315,10 @@ mod tests {
             .copy_from_slice(&metadata_bytes);
         refresh_expectation_identity(&mut expectation);
         expectation
+    }
+
+    fn linux_fixture_expectation(backend: u16, features: u64) -> StaticSearchSpanExpectationV1 {
+        linux_fixture_expectation_with_literal_bytes(backend, features, 16)
     }
 
     fn refresh_expectation_identity(expectation: &mut StaticSearchSpanExpectationV1) {
@@ -1287,6 +1341,10 @@ mod tests {
         assert_eq!(SEARCH_BACKEND_ASIMD_TAG28_V1, 28);
         assert_eq!(SEARCH_BACKEND_ASIMD_TAG29_V1, 29);
         assert_eq!(SEARCH_BACKEND_ASIMD_TAG30_V1, 30);
+        assert_eq!(SEARCH_BACKEND_ASIMD_TAG37_V1, 37);
+        assert_eq!(SEARCH_BACKEND_ASIMD_TAG37_MIN_LITERAL_BYTES_V1, 6);
+        assert_eq!(SEARCH_BACKEND_ASIMD_TAG37_MAX_LITERAL_BYTES_V1, 32);
+        assert_eq!(SEARCH_BACKEND_ASIMD_TAG37_MANIFEST_FILTER_FIELDS_V1, 5);
         assert_eq!(SEARCH_SPAN_OUTPUT_KIND_V1, 3);
         assert_eq!(SEARCH_REQUIRED_ASIMD_FEATURES_V1, 1);
         assert_eq!(MIN_STATIC_SEARCH_SPAN_LITERAL_BYTES_V1, 1);
@@ -1305,7 +1363,7 @@ mod tests {
     }
 
     #[test]
-    fn linux_v8_through_v17_candidates_and_explicit_tag21_are_structurally_admitted() {
+    fn linux_v8_through_v24_candidates_and_explicit_tag21_are_structurally_admitted() {
         for (backend, features) in [
             (SEARCH_BACKEND_VERSION_V1, SEARCH_REQUIRED_ASIMD_FEATURES_V1),
             (
@@ -1334,6 +1392,10 @@ mod tests {
             ),
             (
                 SEARCH_BACKEND_ASIMD_TAG30_V1,
+                SEARCH_REQUIRED_ASIMD_FEATURES_V1,
+            ),
+            (
+                SEARCH_BACKEND_ASIMD_TAG37_V1,
                 SEARCH_REQUIRED_ASIMD_FEATURES_V1,
             ),
             (
@@ -1461,6 +1523,43 @@ mod tests {
             assert!(
                 inspect_static_search_span_expectation_v1(&expectation).is_err(),
                 "out-of-range live literal width {width} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn tag37_width_envelope_is_enforced_by_both_neutral_decoders() {
+        for width in [
+            SEARCH_BACKEND_ASIMD_TAG37_MIN_LITERAL_BYTES_V1,
+            SEARCH_BACKEND_ASIMD_TAG37_MAX_LITERAL_BYTES_V1,
+        ] {
+            let expectation = linux_fixture_expectation_with_literal_bytes(
+                SEARCH_BACKEND_ASIMD_TAG37_V1,
+                SEARCH_REQUIRED_ASIMD_FEATURES_V1,
+                width,
+            );
+            let claim = inspect_static_search_span_expectation_v1(&expectation)
+                .expect("inclusive tag37 width boundary");
+            assert_eq!(claim.live_literal_bytes(), width);
+            assert_eq!(claim.metadata().rodata_bytes(), width);
+        }
+        for width in [0, 1, 5, 33] {
+            let expectation = linux_fixture_expectation_with_literal_bytes(
+                SEARCH_BACKEND_ASIMD_TAG37_V1,
+                SEARCH_REQUIRED_ASIMD_FEATURES_V1,
+                width,
+            );
+            assert!(
+                inspect_static_search_span_expectation_v1(&expectation).is_err(),
+                "out-of-envelope tag37 width {width} was accepted"
+            );
+            let metadata = expectation[STATIC_SEARCH_SPAN_EXPECTATION_METADATA_OFFSET_V1
+                ..STATIC_SEARCH_SPAN_EXPECTATION_IDENTITY_OFFSET_V1]
+                .try_into()
+                .expect("fixed metadata bytes");
+            assert!(
+                inspect_search_metadata_v1(metadata).is_err(),
+                "metadata decoder accepted tag37 width {width}"
             );
         }
     }

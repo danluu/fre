@@ -582,6 +582,103 @@ int main(void) {
 }
 
 #[test]
+fn apple_tools_link_and_execute_inert_search_v24_object() {
+    let program = build_exact_literal::<Span>(
+        b"phase-unique-24!",
+        AnchorFlags::default(),
+        ValidateLimits::default(),
+    )
+    .expect("Search V24 program");
+    let image = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV24,
+        EmitLimits::default(),
+    )
+    .expect("Search V24 image");
+    let object = emit_search_object(
+        &image,
+        BindingIdentity::new([0x37; 32]).expect("nonzero test binding"),
+        ObjectLimits::default(),
+    )
+    .expect("Search V24 Mach-O object");
+    let inspection =
+        inspect_object(object.as_bytes(), ObjectLimits::default()).expect("inspect V24 object");
+    assert_eq!(
+        inspection.metadata().backend_version(),
+        BackendVersion::SEARCH_V24.0
+    );
+
+    let directory = PrivateDirectory::new();
+    let object_path = directory.path().join("search_v24.o");
+    let header_path = directory.path().join("fre_aot_search_v24.h");
+    let driver_path = directory.path().join("search_v24_driver.c");
+    let driver_object_path = directory.path().join("search_v24_driver.o");
+    let executable_path = directory.path().join("search_v24_driver");
+    write_new(&object_path, object.as_bytes());
+    write_new(&header_path, generated_header(&object).as_bytes());
+    write_new(
+        &driver_path,
+        br#"#include "fre_aot_search_v24.h"
+
+int main(void) {
+    static const uint8_t haystack[] = "xxphase-unique-24!yy";
+    struct fre_aot_search_result_v1 result = {UINT64_MAX, UINT64_MAX};
+    uint64_t status = FRE_AOT_SELECTED_ENTRY(
+        haystack, sizeof(haystack) - 1u, 0u, sizeof(haystack) - 1u, &result);
+    if (status != 1u || result.start != 2u || result.end != 18u) {
+        return 62;
+    }
+    if (FRE_AOT_SELECTED_METADATA.backend_version != UINT16_C(37) ||
+        FRE_AOT_SELECTED_METADATA.abi_kind != FRE_AOT_ABI_SEARCH_V1) {
+        return 63;
+    }
+    return 0;
+}
+"#,
+    );
+    let compile = Command::new("/usr/bin/clang")
+        .args(["-arch", "arm64", "-std=c11", "-Wall", "-Wextra", "-Werror"])
+        .arg("-I")
+        .arg(directory.path())
+        .arg(&driver_path)
+        .arg("-c")
+        .arg("-o")
+        .arg(&driver_object_path)
+        .output()
+        .expect("compile Search V24 driver");
+    assert!(
+        compile.status.success(),
+        "clang rejected Search V24 driver: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let link = Command::new("/usr/bin/clang")
+        .args(["-arch", "arm64"])
+        .arg(&driver_object_path)
+        .arg(&object_path)
+        .arg("-Wl,-fatal_warnings")
+        .arg("-Wl,-segprot,__TEXT,rx,rx")
+        .arg("-Wl,-segprot,__FRE_CONST,r,r")
+        .arg("-o")
+        .arg(&executable_path)
+        .output()
+        .expect("link Search V24 driver");
+    assert!(
+        link.status.success(),
+        "clang rejected Search V24 object: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+    let execution = Command::new(&executable_path)
+        .output()
+        .expect("execute linked Search V24 object");
+    assert!(
+        execution.status.success(),
+        "linked Search V24 failed: status={:?} stderr={}",
+        execution.status.code(),
+        String::from_utf8_lossy(&execution.stderr)
+    );
+}
+
+#[test]
 #[allow(
     clippy::too_many_lines,
     reason = "one native integration transaction proves object, link-map, protection, and ABI invariants"

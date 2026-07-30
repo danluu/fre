@@ -4,6 +4,7 @@ use fre_aot_aarch64::{
     AOT_COUNT_BACKEND_VERSION_V2, AotCountCpuFeatures, AotCountImageV2, CountAuditReportV2,
     audit_count_image_v2, is_supported_aot_count_backend_tuple_v2, prospective_count_v2,
 };
+use fre_aot_search_contract::search_backend_literal_width_is_valid_v1;
 use fre_jit_aarch64::{
     AuditReport, BackendVersion, CpuFeatures, DecodedInstruction, ImageLayout,
     NativeAggregateImage, NativeImage, TargetSpec, audit, audit_aggregate,
@@ -718,9 +719,15 @@ impl MetadataV1 {
                     || version == BackendVersion::SEARCH_V13.0
                     || version == BackendVersion::SEARCH_V15.0
                     || version == BackendVersion::SEARCH_V16.0
-                    || version == BackendVersion::SEARCH_V17.0 =>
+                    || version == BackendVersion::SEARCH_V17.0
+                    || version == BackendVersion::SEARCH_V24.0 =>
             {
-                (1..=3).contains(&self.output_kind) && self.literal_bytes == 0
+                (1..=3).contains(&self.output_kind)
+                    && self.literal_bytes == 0
+                    && search_backend_literal_width_is_valid_v1(
+                        self.backend_version,
+                        self.rodata_bytes,
+                    )
             }
             (AbiKind::Aggregate, version) if version == BackendVersion::AGGREGATE_CURRENT.0 => {
                 (1..=2).contains(&self.output_kind)

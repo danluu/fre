@@ -4,6 +4,8 @@ use fre_aot_search_contract::{
     SEARCH_ARCHITECTURE_AARCH64_V1, SEARCH_BACKEND_ASIMD_TAG22_V1, SEARCH_BACKEND_ASIMD_TAG23_V1,
     SEARCH_BACKEND_ASIMD_TAG25_V1, SEARCH_BACKEND_ASIMD_TAG26_V1, SEARCH_BACKEND_ASIMD_TAG28_V1,
     SEARCH_BACKEND_ASIMD_TAG29_V1, SEARCH_BACKEND_ASIMD_TAG30_V1,
+    SEARCH_BACKEND_ASIMD_TAG37_MAX_LITERAL_BYTES_V1,
+    SEARCH_BACKEND_ASIMD_TAG37_MIN_LITERAL_BYTES_V1, SEARCH_BACKEND_ASIMD_TAG37_V1,
     SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1, SEARCH_BACKEND_VERSION_V1, SEARCH_CALL_ABI_SCHEMA_V1,
     SEARCH_EXPORTED_SYMBOL_INFO_ELF_FUNCTION_V1, SEARCH_EXPORTED_SYMBOL_N_TYPE_V1,
     SEARCH_EXPORTED_SYMBOL_SCHEMA_VERSION_V1, SEARCH_METADATA_VERSION_V1, SEARCH_PLATFORM_LINUX_V1,
@@ -722,6 +724,21 @@ const fn production_family_profile_is_canonical(
             SEARCH_EXPORTED_SYMBOL_INFO_ELF_FUNCTION_V1,
         ) => true,
         (
+            SEARCH_PLATFORM_MACOS_V1,
+            SEARCH_BACKEND_ASIMD_TAG37_V1,
+            SEARCH_REQUIRED_ASIMD_FEATURES_V1,
+            SEARCH_EXPORTED_SYMBOL_N_TYPE_V1,
+        )
+        | (
+            SEARCH_PLATFORM_LINUX_V1,
+            SEARCH_BACKEND_ASIMD_TAG37_V1,
+            SEARCH_REQUIRED_ASIMD_FEATURES_V1,
+            SEARCH_EXPORTED_SYMBOL_INFO_ELF_FUNCTION_V1,
+        ) => {
+            family.minimum_literal_bytes >= SEARCH_BACKEND_ASIMD_TAG37_MIN_LITERAL_BYTES_V1
+                && family.maximum_literal_bytes <= SEARCH_BACKEND_ASIMD_TAG37_MAX_LITERAL_BYTES_V1
+        }
+        (
             SEARCH_PLATFORM_LINUX_V1,
             SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1,
             SEARCH_REQUIRED_SVE2_FIXED16_FEATURES_V1,
@@ -779,8 +796,31 @@ const fn identity_is_zero(identity: &[u8; 32]) -> bool {
     true
 }
 
+/// Production remains closed to candidate-only backend identities even when
+/// the common family validator must understand them for private qualification.
+const fn production_search_span_families_are_canonical(
+    rows: &[SourceQualifiedStaticSearchSpanFamilyV1],
+) -> bool {
+    if !search_span_families_are_canonical(rows) {
+        return false;
+    }
+    let mut index = 0_usize;
+    while index < rows.len() {
+        if rows[index].backend_version == SEARCH_BACKEND_ASIMD_TAG37_V1 {
+            return false;
+        }
+        let Some(next) = index.checked_add(1) else {
+            return false;
+        };
+        index = next;
+    }
+    true
+}
+
 fn production_authority_tables_are_canonical() -> bool {
-    authority_tables_are_canonical_for(
+    production_search_span_families_are_canonical(
+        PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SPAN_FAMILIES_V1,
+    ) && authority_tables_are_canonical_for(
         PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SPAN_ROWS_V1,
         PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SPAN_FAMILIES_V1,
     )
@@ -840,7 +880,7 @@ pub(crate) fn require_production_search_span_family_v1(
     if PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SPAN_FAMILIES_V1.is_empty() {
         return Err(StaticSearchSpanVerifyErrorV1::NoQualifiedStaticSearchSpanRowV1);
     }
-    if !search_span_families_are_canonical(
+    if !production_search_span_families_are_canonical(
         PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SPAN_FAMILIES_V1,
     ) {
         return Err(StaticSearchSpanVerifyErrorV1::MalformedStaticSearchSpanQualificationTableV1);
@@ -995,6 +1035,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the table test keeps every production-family canonicality and tag-specific width refusal in one ordered audit"
+    )]
     fn production_family_state_is_canonical_bounded_and_fails_closed() {
         assert!(search_span_families_are_canonical(
             PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SPAN_FAMILIES_V1
@@ -1052,6 +1096,21 @@ mod tests {
         let mut v10 = valid[0];
         v10.backend_version = SEARCH_BACKEND_ASIMD_TAG23_V1;
         assert!(search_span_families_are_canonical(&[v10]));
+        let mut v24_below_width_envelope = valid[0];
+        v24_below_width_envelope.backend_version = SEARCH_BACKEND_ASIMD_TAG37_V1;
+        assert!(!search_span_families_are_canonical(&[
+            v24_below_width_envelope
+        ]));
+        let mut v24 = v24_below_width_envelope;
+        v24.minimum_literal_bytes = SEARCH_BACKEND_ASIMD_TAG37_MIN_LITERAL_BYTES_V1;
+        assert!(search_span_families_are_canonical(&[v24]));
+        assert!(
+            !production_search_span_families_are_canonical(&[v24]),
+            "candidate-only tag37 must not acquire production-table authority"
+        );
+        let mut v24_too_wide = v24;
+        v24_too_wide.maximum_literal_bytes = SEARCH_BACKEND_ASIMD_TAG37_MAX_LITERAL_BYTES_V1 + 1;
+        assert!(!search_span_families_are_canonical(&[v24_too_wide]));
         let mut zero_floor = valid[0];
         zero_floor.minimum_window_bytes = 0;
         assert!(!search_span_families_are_canonical(&[zero_floor]));

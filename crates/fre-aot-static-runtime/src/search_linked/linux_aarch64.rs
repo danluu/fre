@@ -4,9 +4,11 @@ use std::io::{ErrorKind, Read};
 use fre_aot_search_contract::{
     SEARCH_BACKEND_ASIMD_TAG22_V1, SEARCH_BACKEND_ASIMD_TAG23_V1, SEARCH_BACKEND_ASIMD_TAG25_V1,
     SEARCH_BACKEND_ASIMD_TAG26_V1, SEARCH_BACKEND_ASIMD_TAG28_V1, SEARCH_BACKEND_ASIMD_TAG29_V1,
-    SEARCH_BACKEND_ASIMD_TAG30_V1, SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1, SEARCH_BACKEND_VERSION_V1,
-    SEARCH_METADATA_BYTES_V1, SEARCH_PLATFORM_LINUX_V1, SEARCH_REQUIRED_ASIMD_FEATURES_V1,
+    SEARCH_BACKEND_ASIMD_TAG30_V1, SEARCH_BACKEND_ASIMD_TAG37_V1,
+    SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1, SEARCH_BACKEND_VERSION_V1, SEARCH_METADATA_BYTES_V1,
+    SEARCH_PLATFORM_LINUX_V1, SEARCH_REQUIRED_ASIMD_FEATURES_V1,
     SEARCH_REQUIRED_SVE2_FIXED16_FEATURES_V1, STATIC_SEARCH_SPAN_EXPECTATION_BYTES_V1,
+    search_backend_literal_width_is_valid_v1,
 };
 use fre_kernel_ir::SearchWindow;
 use fre_target_features::TuningClass;
@@ -184,7 +186,8 @@ fn require_mapped_metadata_correlations(
         | SEARCH_BACKEND_ASIMD_TAG26_V1
         | SEARCH_BACKEND_ASIMD_TAG28_V1
         | SEARCH_BACKEND_ASIMD_TAG29_V1
-        | SEARCH_BACKEND_ASIMD_TAG30_V1 => actual.features() == SEARCH_REQUIRED_ASIMD_FEATURES_V1,
+        | SEARCH_BACKEND_ASIMD_TAG30_V1
+        | SEARCH_BACKEND_ASIMD_TAG37_V1 => actual.features() == SEARCH_REQUIRED_ASIMD_FEATURES_V1,
         SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1 => {
             actual.features() == SEARCH_REQUIRED_SVE2_FIXED16_FEATURES_V1
                 && expected.live_literal_bytes() == 16
@@ -192,7 +195,12 @@ fn require_mapped_metadata_correlations(
         _ => false,
     };
     require_search_span_v1(
-        actual.platform() == SEARCH_PLATFORM_LINUX_V1 && valid_profile,
+        actual.platform() == SEARCH_PLATFORM_LINUX_V1
+            && valid_profile
+            && search_backend_literal_width_is_valid_v1(
+                actual.backend_version(),
+                expected.live_literal_bytes(),
+            ),
         StaticSearchSpanContractFieldV1::Metadata,
     )?;
     require_search_span_v1(

@@ -13,7 +13,7 @@ use std::{
 use fre_aot_search_contract::{
     ClaimedSearchMetadataV1, SEARCH_BACKEND_ASIMD_TAG22_V1, SEARCH_BACKEND_ASIMD_TAG23_V1,
     SEARCH_BACKEND_ASIMD_TAG25_V1, SEARCH_BACKEND_ASIMD_TAG26_V1, SEARCH_BACKEND_ASIMD_TAG28_V1,
-    SEARCH_BACKEND_ASIMD_TAG29_V1, SEARCH_BACKEND_ASIMD_TAG30_V1,
+    SEARCH_BACKEND_ASIMD_TAG29_V1, SEARCH_BACKEND_ASIMD_TAG30_V1, SEARCH_BACKEND_ASIMD_TAG37_V1,
     SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1, SEARCH_BACKEND_VERSION_V1, SEARCH_METADATA_BYTES_V1,
     SEARCH_PLATFORM_LINUX_V1, SEARCH_PLATFORM_MACOS_V1, STATIC_SEARCH_SPAN_EXPECTATION_BYTES_V1,
     inspect_search_metadata_v1,
@@ -1572,6 +1572,7 @@ pub(super) fn require_semantic_payload_reconstruction_v1(
         SEARCH_BACKEND_ASIMD_TAG28_V1 => SearchBackendPolicy::AsimdV15,
         SEARCH_BACKEND_ASIMD_TAG29_V1 => SearchBackendPolicy::AsimdV16,
         SEARCH_BACKEND_ASIMD_TAG30_V1 => SearchBackendPolicy::AsimdV17,
+        SEARCH_BACKEND_ASIMD_TAG37_V1 => SearchBackendPolicy::AsimdV24,
         SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1 => SearchBackendPolicy::Sve2Fixed16V2,
         _ => return Err(StaticSearchSpanVerifyErrorV1::SemanticPayloadReconstruction),
     };
@@ -1902,6 +1903,7 @@ mod tests {
         V15,
         V16,
         V17,
+        V24,
     }
 
     fn macos_family_compiler_fixture_with_backend(
@@ -1931,6 +1933,10 @@ mod tests {
                 SearchCompilePolicyV1::default(),
             )
             .expect("macOS V17 manifest"),
+            FamilyTestBackend::V24 => MacosAarch64ExactSearchManifestV1::<Span>::v24_candidate(
+                SearchCompilePolicyV1::default(),
+            )
+            .expect("macOS V24 manifest"),
         };
         let compiled =
             plan_and_compile_macos_aarch64_exact_search_v1(manifest, literal.to_vec(), profile)
@@ -1946,7 +1952,18 @@ mod tests {
         let expectation = *expectation.as_bytes();
         let claim =
             inspect_static_search_span_expectation_v1(&expectation).expect("macOS neutral claim");
-        let family = SourceQualifiedStaticSearchSpanFamilyV1::from_test_claim(41, claim, 1, 32);
+        let minimum_literal_bytes = match backend {
+            FamilyTestBackend::V24 => {
+                fre_aot_search_contract::SEARCH_BACKEND_ASIMD_TAG37_MIN_LITERAL_BYTES_V1
+            }
+            _ => 1,
+        };
+        let family = SourceQualifiedStaticSearchSpanFamilyV1::from_test_claim(
+            41,
+            claim,
+            minimum_literal_bytes,
+            32,
+        );
         let expected =
             ExpectedStaticSearchSpanV1::from_source_qualified_family_bytes(&expectation, &family)
                 .expect("macOS family expectation");
@@ -1990,6 +2007,10 @@ mod tests {
                 LinuxAarch64SearchCompilePolicyV1::default(),
             )
             .expect("Linux V17 manifest"),
+            FamilyTestBackend::V24 => LinuxAarch64ExactSearchManifestV1::<Span>::v24_candidate(
+                LinuxAarch64SearchCompilePolicyV1::default(),
+            )
+            .expect("Linux V24 manifest"),
         };
         let compiled =
             plan_and_compile_linux_aarch64_exact_search_v1(manifest, literal.to_vec(), profile)
@@ -2007,7 +2028,18 @@ mod tests {
         let expectation = *expectation.as_bytes();
         let claim =
             inspect_static_search_span_expectation_v1(&expectation).expect("Linux neutral claim");
-        let family = SourceQualifiedStaticSearchSpanFamilyV1::from_test_claim(43, claim, 1, 32);
+        let minimum_literal_bytes = match backend {
+            FamilyTestBackend::V24 => {
+                fre_aot_search_contract::SEARCH_BACKEND_ASIMD_TAG37_MIN_LITERAL_BYTES_V1
+            }
+            _ => 1,
+        };
+        let family = SourceQualifiedStaticSearchSpanFamilyV1::from_test_claim(
+            43,
+            claim,
+            minimum_literal_bytes,
+            32,
+        );
         let expected =
             ExpectedStaticSearchSpanV1::from_source_qualified_family_bytes(&expectation, &family)
                 .expect("Linux family expectation");
@@ -2076,8 +2108,8 @@ mod tests {
     }
 
     #[test]
-    fn broad_v9_v10_v15_v16_v17_families_reconstruct_on_both_object_platforms() {
-        for fixture in [
+    fn broad_v9_v10_v15_v16_v17_v24_families_reconstruct_on_both_object_platforms() {
+        for fixture in vec![
             macos_family_compiler_fixture(b"mac-family-lit16"),
             linux_family_compiler_fixture(b"lin-family-lit16"),
             macos_family_compiler_fixture_with_backend(b"mac-v10-family16", FamilyTestBackend::V10),
@@ -2088,6 +2120,14 @@ mod tests {
             linux_family_compiler_fixture_with_backend(b"phase-unique-16!", FamilyTestBackend::V16),
             macos_family_compiler_fixture_with_backend(b"phase-unique-17!", FamilyTestBackend::V17),
             linux_family_compiler_fixture_with_backend(b"phase-unique-17!", FamilyTestBackend::V17),
+            macos_family_compiler_fixture_with_backend(
+                b"phase-unique-24!x",
+                FamilyTestBackend::V24,
+            ),
+            linux_family_compiler_fixture_with_backend(
+                b"phase-unique-24!x",
+                FamilyTestBackend::V24,
+            ),
         ] {
             assert_family_payload_mutations_refused(&fixture);
             let handle = VerifiedStaticSearchSpanV1 {

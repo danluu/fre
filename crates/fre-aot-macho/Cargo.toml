@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 fre-aot-aarch64 = { path = "../fre-aot-aarch64" }
+fre-aot-search-contract = { path = "../fre-aot-search-contract" }
 fre-exact-alloc = { path = "../fre-exact-alloc" }
 fre-jit-aarch64 = { path = "../fre-jit-aarch64" }
 fre-kernel-ir = { path = "../fre-kernel-ir" }
