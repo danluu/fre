@@ -11889,7 +11889,7 @@ fn v23_rejects_resealed_bound_advance_compare_and_both_reconstruction_mutations(
 }
 
 #[test]
-fn v23_frozen_v22_aot_matrix_bytes_are_exact() {
+fn v23_frozen_all_prior_search_aot_matrix_bytes_are_exact() {
     fn gate_literal(topology: u8, width: usize) -> Vec<u8> {
         match topology {
             0 => (0..width)
@@ -11927,41 +11927,77 @@ fn v23_frozen_v22_aot_matrix_bytes_are_exact() {
         }
     }
 
+    let backends = [
+        BackendVersion::SEARCH_V1,
+        BackendVersion::SEARCH_V2,
+        BackendVersion::SEARCH_V3,
+        BackendVersion::SEARCH_V4,
+        BackendVersion::SEARCH_V5,
+        BackendVersion::SEARCH_V6,
+        BackendVersion::SEARCH_V7,
+        BackendVersion::SEARCH_V8,
+        BackendVersion::SEARCH_V9,
+        BackendVersion::SEARCH_V10,
+        BackendVersion::SEARCH_V11,
+        BackendVersion::SEARCH_V12,
+        BackendVersion::SEARCH_V13,
+        BackendVersion::SEARCH_V14,
+        BackendVersion::SEARCH_V15,
+        BackendVersion::SEARCH_V16,
+        BackendVersion::SEARCH_V17,
+        BackendVersion::SEARCH_V18,
+        BackendVersion::SEARCH_V19,
+        BackendVersion::SEARCH_V20,
+        BackendVersion::SEARCH_V21,
+        BackendVersion::SEARCH_V22,
+        BackendVersion::SEARCH_SVE16_V1,
+        BackendVersion::SEARCH_SVE2_16_V1,
+        BackendVersion::SEARCH_SVE16_V6,
+        BackendVersion::SEARCH_SVE2_FIXED16_V2,
+    ];
     let mut digest = Sha256::new();
-    digest.update(b"FRE-V21-FROZEN-OLD-BACKEND-MATRIX-V1\0");
-    digest.update(BackendVersion::SEARCH_V22.0.to_le_bytes());
-    for width in 6_usize..=MAX_REPEATED_CONFIRM_BYTES {
-        for topology in 0_u8..4 {
-            let literal = gate_literal(topology, width);
-            let program = build_exact_literal::<Span>(
-                &literal,
-                AnchorFlags::default(),
-                ValidateLimits::default(),
-            )
-            .expect("frozen V22 byte-identity IR");
-            let image = emit_with_backend(
-                &program,
-                SearchBackendPolicy::AsimdV22,
-                EmitLimits::default(),
-            )
-            .expect("frozen V22 byte-identity image");
-            audit(&image).expect("frozen V22 byte-identity audit");
-            let aot = image
-                .to_aot(AotLimits::default())
-                .expect("frozen V22 bounded AOT");
-            digest.update([topology]);
-            digest.update(u64::try_from(width).expect("width").to_le_bytes());
-            digest.update(
-                u64::try_from(aot.as_bytes().len())
-                    .expect("AOT length")
-                    .to_le_bytes(),
-            );
-            digest.update(aot.as_bytes());
+    digest.update(b"FRE-V23-FROZEN-ALL-PRIOR-BACKEND-MATRIX-V1\0");
+    digest.update(
+        u64::try_from(backends.len())
+            .expect("backend count")
+            .to_le_bytes(),
+    );
+    for backend in backends {
+        digest.update(backend.0.to_le_bytes());
+        for width in 6_usize..=MAX_REPEATED_CONFIRM_BYTES {
+            if (backend == BackendVersion::SEARCH_SVE16_V6 && width < 16)
+                || (backend == BackendVersion::SEARCH_SVE2_FIXED16_V2 && width != 16)
+            {
+                continue;
+            }
+            for topology in 0_u8..4 {
+                let literal = gate_literal(topology, width);
+                let program = build_exact_literal::<Span>(
+                    &literal,
+                    AnchorFlags::default(),
+                    ValidateLimits::default(),
+                )
+                .expect("frozen prior-backend byte-identity IR");
+                let image = emit_search_version_for_test(&program, EmitLimits::default(), backend)
+                    .expect("frozen prior-backend byte-identity image");
+                audit(&image).expect("frozen prior-backend byte-identity audit");
+                let aot = image
+                    .to_aot(AotLimits::default())
+                    .expect("frozen prior-backend bounded AOT");
+                digest.update([topology]);
+                digest.update(u64::try_from(width).expect("width").to_le_bytes());
+                digest.update(
+                    u64::try_from(aot.as_bytes().len())
+                        .expect("AOT length")
+                        .to_le_bytes(),
+                );
+                digest.update(aot.as_bytes());
+            }
         }
     }
     assert_eq!(
         format!("{:x}", digest.finalize()),
-        "54788961fbffa9c91b7fae92b91787b342ae8becebc65d579b521bcbba1fce67"
+        "b3d24177ac88eb4c855248b84a1c910e4bcc4d2e45d9eee8bb2fea65a4f40502"
     );
 }
 
