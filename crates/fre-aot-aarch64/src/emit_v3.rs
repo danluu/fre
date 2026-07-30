@@ -3357,8 +3357,31 @@ fn emit_multi_specialized_v3(
         for index in 0..usize::from(filter.len).min(2) {
             assembler.dup_byte16(vector_registers[index], value_registers[index])?;
         }
+        // The fused scan retained exact primary+endpoint masks for the
+        // current 128 starts. Consume its current 16-start block through the
+        // shared forward candidate loop instead of entering the sparse
+        // scanner, whose normal entry has already consumed that block. An
+        // empty or exhausted mask advances 16 starts before returning to the
+        // vector loop; a match resumes at its non-overlapping successor.
         assembler.mov_imm64_minimal(X16, 0)?;
-        assembler.branch(sparse_scan)?;
+        assembler.add_reg(X15, X0, X3)?;
+        for index in 1..usize::from(filter.len) {
+            if filter.offsets[index] == semantic_secondary_offset {
+                continue;
+            }
+            assembler.add_imm(X8, X15, u16::from(filter.offsets[index]))?;
+            assembler.load_vector128(0, X8)?;
+            assembler.compare_equal_bytes16(0, 0, vector_registers[index])?;
+            assembler.and_bytes16(SPARSE_BLOCK_MASK_BASE_V3, SPARSE_BLOCK_MASK_BASE_V3, 0)?;
+        }
+        assembler.or_bytes16(0, SPARSE_BLOCK_MASK_BASE_V3, SPARSE_BLOCK_MASK_BASE_V3)?;
+        assembler.shrink_narrow_bytes_from_halfwords(0, 0, 4)?;
+        assembler.move_vector_double_to64(X6, 0)?;
+        assembler.and_reg(X6, X6, X17)?;
+        assembler.cmp_imm64(X6, 0)?;
+        assembler.branch_cond(ConditionV3::NotEqual, candidate)?;
+        assembler.add_imm(X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
+        assembler.branch(vector)?;
 
         assembler.bind(wide_batch_empty)?;
         assembler.add_imm(X3, X3, SPARSE_SCAN_STARTS_V3)?;

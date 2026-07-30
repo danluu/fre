@@ -1391,10 +1391,12 @@ fn audit_impl_v3(
             (1, 1, 0)
         } else {
             // The non-periodic specialized graph contains the ordinary
-            // 16-start pack/recovery plus eight statically separate retained
-            // block packs/recoveries. Only the ordinary primary proof reduces
-            // v0 directly; retained masks are reduced in their own registers.
-            (9, 9, 1)
+            // 16-start pack/recovery, eight statically separate retained
+            // block packs/recoveries, and one forward fused-hit pack that
+            // shares the ordinary lane-recovery loop. Only the ordinary
+            // primary proof reduces v0 directly; retained masks are reduced
+            // in their own registers.
+            (10, 9, 1)
         };
     if relocation_index != image.relocations.len()
         || direct_branches != image.stats.relocations
@@ -5273,7 +5275,72 @@ fn policy_multi_specialized_v3(
             )?;
         }
         policy_mov_minimal_v3(policy, X16, 0)?;
-        branch_v3(policy, sparse_scan)?;
+        add_register64_v3(policy, X15, X0, X3)?;
+        for index in 1..usize::from(filter.len) {
+            if filter.offsets[index] == semantic_secondary_offset {
+                continue;
+            }
+            add_immediate64_v3(policy, X8, X15, u16::from(filter.offsets[index]))?;
+            exact_v3(
+                policy,
+                DecodedInstructionV3::LoadVector128 {
+                    destination: 0,
+                    base: X8,
+                    offset: 0,
+                },
+            )?;
+            exact_v3(
+                policy,
+                DecodedInstructionV3::CompareEqualBytes16 {
+                    destination: 0,
+                    left: 0,
+                    right: vector_registers[index],
+                },
+            )?;
+            exact_v3(
+                policy,
+                DecodedInstructionV3::AndBytes16 {
+                    destination: SPARSE_BLOCK_MASK_BASE_V3,
+                    left: SPARSE_BLOCK_MASK_BASE_V3,
+                    right: 0,
+                },
+            )?;
+        }
+        exact_v3(
+            policy,
+            DecodedInstructionV3::OrBytes16 {
+                destination: 0,
+                left: SPARSE_BLOCK_MASK_BASE_V3,
+                right: SPARSE_BLOCK_MASK_BASE_V3,
+            },
+        )?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::ShrinkNarrowBytesFromHalfwords {
+                destination: 0,
+                source: 0,
+                shift: 4,
+            },
+        )?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::MoveVectorDoubleTo64 {
+                destination: X6,
+                source: 0,
+            },
+        )?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::AndRegister64 {
+                destination: X6,
+                left: X6,
+                right: X17,
+            },
+        )?;
+        compare_immediate64_v3(policy, X6, 0)?;
+        condition_v3(policy, ConditionV3::NotEqual, candidate)?;
+        add_immediate64_v3(policy, X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
+        branch_v3(policy, vector)?;
 
         policy.bind(wide_batch_empty)?;
         add_immediate64_v3(policy, X3, X3, SPARSE_SCAN_STARTS_V3)?;

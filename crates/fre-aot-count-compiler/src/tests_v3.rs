@@ -10,7 +10,7 @@ use fre_aot_count_contract::v3::{
 };
 use fre_aot_optimizer::{
     COUNT_V3_OPTIMIZER_VERSION, COUNT_V3_RECIPE_SCHEMA_VERSION, CountV3RegisterPlanId,
-    CountV3RequiredIsa, CountV3TuningClass, encode_count_recipe_v3,
+    CountV3RequiredIsa, CountV3Strategy, CountV3TuningClass, encode_count_recipe_v3,
     inspect_count_v3_optimizer_receipt,
 };
 use fre_kernel_ir::{Count, ValidateLimits, build_exact_aggregate};
@@ -268,4 +268,215 @@ fn local_v2_control_wrapper_is_raw_and_self_inspecting() {
     .expect("strict v2 Mach-O inspection");
     assert_eq!(view.metadata_bytes(), object.metadata_bytes());
     assert_eq!(&view.payload()[..image.code().len()], image.code());
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one native differential transaction covers promotion state, block-zero recovery, alignments, widths, and randomized suffixes"
+)]
+fn fused_pair_promotion_preserves_current_block_and_nonoverlap() {
+    use std::{
+        fmt::Write as _,
+        fs,
+        process::Command,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    const CASES: usize = 24;
+    const PROMOTION_BATCHES: usize = 8;
+    const BATCH_STARTS: usize = 128;
+    const PROMOTED_START: usize = PROMOTION_BATCHES * BATCH_STARTS;
+
+    fn reference_count(haystack: &[u8], literal: &[u8]) -> u64 {
+        let mut count = 0_u64;
+        let mut cursor = 0_usize;
+        while cursor
+            .checked_add(literal.len())
+            .is_some_and(|end| end <= haystack.len())
+        {
+            if haystack[cursor..].starts_with(literal) {
+                count += 1;
+                cursor += literal.len();
+            } else {
+                cursor += 1;
+            }
+        }
+        count
+    }
+
+    fn next_random(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    fn identity_hex(identity: &[u8; 32]) -> String {
+        identity.iter().fold(String::new(), |mut encoded, byte| {
+            write!(encoded, "{byte:02x}").expect("write identity hex");
+            encoded
+        })
+    }
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("wall clock after Unix epoch")
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "fre-aot-count-v3-pair-reentry-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir(&directory).expect("create native differential directory");
+
+    let mut driver =
+        String::from("#include <stddef.h>\n#include <stdint.h>\n#include <stdio.h>\n\n");
+    let mut calls = String::from("int main(void) {\n");
+    let mut object_paths = Vec::with_capacity(CASES);
+
+    for case_index in 0..CASES {
+        let width = 9 + case_index;
+        let literal: Vec<u8> = (0..width)
+            .map(|index| {
+                let value = (index * 37 + case_index * 53) % 251;
+                u8::try_from(value + 1).expect("literal byte")
+            })
+            .collect();
+        let compiled = compile_count_v3(
+            CountCompileRequestV3 {
+                literal: &literal,
+                semantic_candidate: candidate(),
+                target: CountCompileTargetV3 {
+                    object_format: CountObjectFormatV3::MachOArm64,
+                    tuning_class: CountV3TuningClass::AppleMSeries,
+                    required_isa: CountV3RequiredIsa::Aarch64Neon128,
+                },
+            },
+            CountCompileLimitsV3::default(),
+        )
+        .expect("compile native pair-reentry fixture");
+        assert!(
+            matches!(
+                compiled.recipe().strategy(),
+                CountV3Strategy::SparseRareColumns | CountV3Strategy::EndpointDense
+            ),
+            "fixture must exercise the promoted pair graph"
+        );
+        let primary_offset = usize::from(compiled.recipe().filter_offsets()[0]);
+        let secondary_offset = if primary_offset == width - 1 {
+            0
+        } else {
+            width - 1
+        };
+        assert_ne!(literal[primary_offset], literal[secondary_offset]);
+
+        let haystack_bytes = 6_144 + case_index * 31;
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64
+            ^ u64::try_from(case_index).expect("case index")
+            ^ (u64::try_from(width).expect("literal width") << 32);
+        let mut haystack = vec![0_u8; haystack_bytes];
+        for byte in &mut haystack {
+            *byte = next_random(&mut state).to_le_bytes()[0];
+        }
+        let filler = (0_u8..=u8::MAX)
+            .find(|byte| !literal.contains(byte))
+            .expect("literal leaves a filler byte");
+        haystack[..PROMOTED_START + width + 32].fill(filler);
+
+        // Eight primary-positive, endpoint-empty batches force the general
+        // sustained-signal promotion without depending on the stricter
+        // all-eight-block shortcut. Keeping the sole primary in each batch's
+        // first block also avoids any look-ahead overlap with the next batch.
+        for batch in 0..PROMOTION_BATCHES {
+            let start = batch * BATCH_STARTS;
+            haystack[start + primary_offset] = literal[primary_offset];
+        }
+
+        // The first match is deliberately in block zero of the first fused
+        // batch. The adjacent match proves that recovery resumes at the exact
+        // non-overlapping successor instead of rescanning or skipping.
+        let first_match = PROMOTED_START + case_index % 16;
+        haystack[first_match..first_match + width].copy_from_slice(&literal);
+        haystack[first_match + width..first_match + width * 2].copy_from_slice(&literal);
+
+        // Exercise the repaired graph against deterministic randomized
+        // suffixes, injected matches, overlaps, and the exact scalar tail.
+        for _ in 0..12 {
+            let span = haystack.len() - 2_048 - width;
+            let start = 2_048
+                + usize::try_from(next_random(&mut state)).expect("host-sized random fixture")
+                    % span;
+            haystack[start..start + width].copy_from_slice(&literal);
+        }
+        let tail = haystack.len() - width;
+        haystack[tail..].copy_from_slice(&literal);
+        let expected = reference_count(&haystack, &literal);
+
+        let compile_identity = identity_hex(compiled.implementation_object().compile_identity());
+        let symbol = format!("fre_aot_count_entry_v3_{compile_identity}");
+        writeln!(
+            driver,
+            "extern uint64_t {symbol}(const uint8_t *, size_t, uint64_t *);"
+        )
+        .expect("write entry declaration");
+
+        let alignment = case_index % 16;
+        write!(driver, "static const uint8_t haystack_{case_index}[] = {{")
+            .expect("write fixture header");
+        for byte in std::iter::repeat_n(0xa5_u8, alignment).chain(haystack.iter().copied()) {
+            write!(driver, "0x{byte:02x},").expect("write fixture byte");
+        }
+        writeln!(driver, "}};").expect("write fixture footer");
+        writeln!(
+            calls,
+            "  uint64_t out_{case_index} = UINT64_MAX;\n  \
+             uint64_t status_{case_index} = {symbol}(haystack_{case_index} + {alignment}, \
+             sizeof(haystack_{case_index}) - {alignment}, &out_{case_index});\n  \
+             if (status_{case_index} != 0 || out_{case_index} != UINT64_C({expected})) {{ \
+             fprintf(stderr, \"case {case_index}: status=%llu expected={expected} actual=%llu\\n\", \
+             (unsigned long long)status_{case_index}, (unsigned long long)out_{case_index}); \
+             return 1; }}"
+        )
+        .expect("write differential call");
+
+        let object_path = directory.join(format!("case-{case_index}.o"));
+        fs::write(&object_path, compiled.implementation_object().as_bytes())
+            .expect("write Count-v3 object");
+        object_paths.push(object_path);
+    }
+    calls.push_str("  return 0;\n}\n");
+    driver.push('\n');
+    driver.push_str(&calls);
+
+    let driver_path = directory.join("driver.c");
+    fs::write(&driver_path, driver).expect("write native differential driver");
+    let executable_path = directory.join("pair-reentry-differential");
+    let mut link = Command::new("/usr/bin/clang");
+    link.args(["-arch", "arm64"])
+        .arg(&driver_path)
+        .args(&object_paths)
+        .arg("-o")
+        .arg(&executable_path);
+    let link = link.output().expect("link native differential");
+    assert!(
+        link.status.success(),
+        "native differential link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+    let execution = Command::new(&executable_path)
+        .output()
+        .expect("execute native differential");
+    assert!(
+        execution.status.success(),
+        "native differential failed: {}",
+        String::from_utf8_lossy(&execution.stderr)
+    );
+
+    fs::remove_file(&executable_path).expect("remove differential executable");
+    fs::remove_file(&driver_path).expect("remove differential driver");
+    for object_path in object_paths {
+        fs::remove_file(object_path).expect("remove differential object");
+    }
+    fs::remove_dir(&directory).expect("remove differential directory");
 }
