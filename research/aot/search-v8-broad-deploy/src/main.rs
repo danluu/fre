@@ -14,8 +14,8 @@ use fre_kernel_ir::{
     ValidateLimits, build_exact_literal,
 };
 use fre_kernels::{
-    LiteralBuildLimits, LiteralPlan, LiteralSearchLimits, Window as PortableWindow,
-    preflight_checked_literal_window,
+    LiteralBuildLimits, LiteralPlan, LiteralSearchLimits, LiteralSearchPrefixSplit,
+    Window as PortableWindow, preflight_checked_literal_window,
 };
 
 type DynError = Box<dyn Error>;
@@ -590,21 +590,32 @@ fn invoke_hybrid(
     window: NativeWindow,
     literal_bytes: usize,
 ) -> Result<u64, DynError> {
+    let searched_bytes = window
+        .end()
+        .checked_sub(window.start())
+        .ok_or_else(|| invalid("hybrid window inverted"))?;
+    if literal_bytes < HYBRID_MIN_LITERAL_BYTES || searched_bytes < HYBRID_MIN_WINDOW_BYTES {
+        return invoke_portable(
+            portable,
+            haystack,
+            PortableWindow::new(window.start(), window.end()),
+        );
+    }
     let checked = CheckedSearchWindow::new(black_box(haystack), window)
         .ok_or_else(|| invalid("hybrid window rejected"))?;
-    let full = portable.preflight_checked_window(checked, LiteralSearchLimits::unlimited())?;
-    if literal_bytes < HYBRID_MIN_LITERAL_BYTES || full.searched_bytes() < HYBRID_MIN_WINDOW_BYTES {
-        return Ok(encode_portable(full.find()?));
+    match portable.preflight_checked_window_prefix(
+        checked,
+        LiteralSearchLimits::unlimited(),
+        HYBRID_PREFIX_CANDIDATE_STARTS,
+    )? {
+        LiteralSearchPrefixSplit::Match { start, end, .. } => {
+            Ok(encode_portable(Some((start, end))))
+        }
+        LiteralSearchPrefixSplit::Exhausted { .. } => Ok(encode_portable(None)),
+        LiteralSearchPrefixSplit::Tail(tail) => Ok(encode_native(
+            native_tail.search_checked(tail.checked_window())?,
+        )),
     }
-    if let Some(matched) = full.find_prefix_candidate_starts(HYBRID_PREFIX_CANDIDATE_STARTS)? {
-        return Ok(encode_portable(Some(matched)));
-    }
-    let Some(tail) = full.after_prefix_candidate_starts(HYBRID_PREFIX_CANDIDATE_STARTS)? else {
-        return Ok(encode_portable(None));
-    };
-    Ok(encode_native(
-        native_tail.search_checked(tail.checked_window())?,
-    ))
 }
 
 fn encode_native(matched: Option<MatchSpan>) -> u64 {
