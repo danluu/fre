@@ -354,6 +354,33 @@ def absent_byte(literal: bytes) -> int:
     return next(value for value in range(256) if value not in literal)
 
 
+def validate_near_miss_tile(
+    literal: bytes, near_miss: bytes, sentinel: int
+) -> None:
+    require(sentinel not in literal, "fixture sentinel occurs in literal")
+    require(
+        len(near_miss) == len(literal)
+        and near_miss != literal
+        and sum(
+            left != right
+            for left, right in zip(near_miss, literal, strict=True)
+        )
+        == 1,
+        "fixture near miss is not exactly one byte",
+    )
+    tile = near_miss + bytes([sentinel])
+    # Any width-byte substring in the infinite periodic tile begins in the
+    # first tile and is fully present in two concatenated tiles.
+    doubled = tile + tile
+    require(
+        all(
+            doubled[start : start + len(literal)] != literal
+            for start in range(len(tile))
+        ),
+        "near-miss tile creates an accidental literal",
+    )
+
+
 def mutation(
     literal: bytes, offsets: Sequence[int], mutation_class: int
 ) -> tuple[int, int, str, bytes]:
@@ -444,6 +471,7 @@ def projection_row(
         else alignment + window_bytes - width
     )
     sentinel = absent_byte(literal)
+    validate_near_miss_tile(literal, near_miss, sentinel)
     literal_sha256 = sha256(literal)
     row_key = {
         "width": width,
@@ -484,11 +512,18 @@ def projection_row(
         "expected_static_invoked": expected_route == "tag29-static-tail",
         "right_guarded": (geometry_index + mutation_class) % 2 == 0,
         "fixture_recipe": {
+            "construction_version": "near-miss-sentinel-tile-tail-v1",
             "background_byte": sentinel,
             "near_miss_tile_hex": near_miss.hex() + f"{sentinel:02x}",
             "window_start": alignment,
             "window_end": alignment + window_bytes,
             "true_literal_guard_bytes": width - 1,
+            "steps": [
+                "fill the checked window with the near-miss tile, truncating at window end",
+                "for tail-hit, overwrite the width-1 bytes before the final candidate with the sentinel",
+                "for tail-hit, install the exact literal at the final candidate start",
+                "keep every byte outside the checked window equal to the sentinel",
+            ],
             "scalar_oracle_required": True,
         },
     }
