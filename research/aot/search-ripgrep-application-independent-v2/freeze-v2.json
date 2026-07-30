@@ -1,0 +1,200 @@
+{
+  "schema": "fre.aot.search-ripgrep-application-freeze.v2",
+  "payload_sha256": "3359ab7c620482d67d67d09903981c8b322c5268cfe0640e273de0f778192822",
+  "payload": {
+    "freeze_date": "2026-07-30",
+    "freeze_boundary": "source, fixture, selector, route, and gates frozen before any result from this application campaign",
+    "independence": {
+      "source": "authenticated ripgrep application source only",
+      "external_classification_inputs": [],
+      "corpus_overlap_inputs": [],
+      "rebar_inputs": [],
+      "benchmark_result_inputs": [],
+      "network_access": false,
+      "timing_feedback_permitted": false,
+      "result_derived_exclusions": false,
+      "rebar_authority": false,
+      "rebar_affects_membership": false,
+      "rebar_affects_gates": false,
+      "rebar_affects_promotion": false,
+      "membership": "all 11 source-derived candidates and all 154 fixtures gate"
+    },
+    "source": {
+      "repository": "https://github.com/BurntSushi/ripgrep",
+      "commit": "f9c05a949d1a0dc8e16dee28ca9605d38611faeb",
+      "tree": "ce81df4f8cad2dbfd1afb6b3ba53fd19846a5794",
+      "projection_scope": "lexical direct-call examples across tracked Rust source, including test and documentation contexts; not an execution-frequency distribution",
+      "inventory_path": "research/aot/search-ripgrep-application-independent-v2/inventory-v2.json",
+      "inventory_sha256": "2aec7b83cfcafbd0f8a9cab2e08941882b34d39786d26f26837c671378f1275b",
+      "inventory_payload_sha256": "68af2c6dd547935d3c4dd095f18958035104d153b355ff416c46c78a922b0979",
+      "inventory_validator_path": "research/aot/search-ripgrep-application-independent-v2/validate_inventory.py",
+      "inventory_validator_sha256": "ad9c2f4bd52417fde282057a6b5e25c4020e4468723587c350a63247ee59378d",
+      "candidate_count": 11,
+      "candidate_widths": [
+        1,
+        1,
+        3,
+        5,
+        6,
+        8,
+        8,
+        8,
+        9,
+        14,
+        14
+      ]
+    },
+    "fixtures": {
+      "algorithm_path": "research/aot/search-ripgrep-application-independent-v2/fixture-algorithm-v2.json",
+      "algorithm_sha256": "613e75b929421091353879ffeff21dc1783d70056ce0d3c37edff7d7018d8ab3",
+      "materializer_path": "research/aot/search-ripgrep-application-independent-v2/materialize_fixtures.py",
+      "materializer_sha256": "485cbefa32dbcfe245c373b723709089d7d1fb1936cd1ca5de06b0ab63deab72",
+      "validator_path": "research/aot/search-ripgrep-application-independent-v2/validate_fixtures.py",
+      "validator_sha256": "0fd644e813968f1e229e2af40719ec8911098b5c5018942bb058eda5a9c28456",
+      "manifest_sha256": "b20181470c604d01d2ec236259293cfcb6e5eff145bcd3e4daa91554c8cebcca",
+      "manifest_payload_sha256": "1cbda700087f5506daa91b0657070cbf39fac68222ff84e273d1d83c09f6ebfd",
+      "fixture_count": 154,
+      "fixture_bytes_each": 1048576,
+      "scalar_oracle": "overlapping leftmost span and nonoverlapping count",
+      "alignment_realization": "allocate fixture_bytes+63 readable bytes, fill padding with the candidate absent sentinel, choose checked_start=16+((alignment_offset-((base_address+16) mod 16)) mod 16), copy the exact logical fixture there, require checked_start pointer mod16 equals alignment_offset, and time only the exact fixture_bytes checked range",
+      "every_fixture_gates": true
+    },
+    "selector": {
+      "contract_path": "research/aot/search-phase-unique-selector-v1/selector-contract-v1.json",
+      "contract_sha256": "38ca5ebc1b239b541afcf9eeb679bf8b156c8690e7422a96f69a9457a155daf0",
+      "payload_sha256": "b0241b15760f441e7f4eb410611ce1a83b1a17f4858da91ce7eacba4f5a75353",
+      "independent_implementation_path": "research/aot/search-tag29-topology-generalization-v1/generate_projection.py",
+      "independent_implementation_sha256": "35aacbca100dde74a2ead493ceab1197c813d37c17d5f4a9d3e62938c3a2b610",
+      "eligible_candidate_count": 5,
+      "eligible_fixture_count": 85,
+      "ineligible_candidate_count": 6,
+      "ineligible_fixture_count": 69,
+      "eligible": [
+        {
+          "semantic_candidate_sha256": "318652f53f30fb6804f3478ca685f043cb2fa09599d8af33fbaceb301c399aa6",
+          "literal_bytes": 6,
+          "selected_offsets": [
+            0,
+            3,
+            4,
+            1,
+            5
+          ]
+        },
+        {
+          "semantic_candidate_sha256": "7f5e6116655e1086c60eee78d8ba7a4347ab9f56c279dc021ad17bd18cee8ebb",
+          "literal_bytes": 8,
+          "selected_offsets": [
+            7,
+            1,
+            3,
+            5,
+            0
+          ]
+        },
+        {
+          "semantic_candidate_sha256": "564cca5b2eda6665b9060fc2f07df62ab08c6c79bffd409651fc9ac48bc01d0d",
+          "literal_bytes": 8,
+          "selected_offsets": [
+            7,
+            0,
+            1,
+            6,
+            4
+          ]
+        },
+        {
+          "semantic_candidate_sha256": "8bc3147714127e3ead175f8568d9f319f596e5335e46b6db898648735d8c2b33",
+          "literal_bytes": 14,
+          "selected_offsets": [
+            13,
+            1,
+            6,
+            9,
+            0
+          ]
+        },
+        {
+          "semantic_candidate_sha256": "aa4cd0b585b75f35a3414f3a2145dcdef4434730bdff308cc0fed11791a37039",
+          "literal_bytes": 14,
+          "selected_offsets": [
+            7,
+            0,
+            2,
+            10,
+            13
+          ]
+        }
+      ],
+      "ineligible": [
+        {
+          "semantic_candidate_sha256": "18ff2accb07dc6513df61152d1e4f8d74f86dbb73a0a6770208e0d6f1102615e",
+          "reason": "width-below-six"
+        },
+        {
+          "semantic_candidate_sha256": "1bb9f4d5182be1ec5fea466a129320288f09b9516401267e37bf6b0c9e0eda72",
+          "reason": "width-below-six"
+        },
+        {
+          "semantic_candidate_sha256": "79303b64853d50353fbdef9de5f57cb147a8c61a57de546dfd0cf1c92f60d310",
+          "reason": "width-below-six"
+        },
+        {
+          "semantic_candidate_sha256": "aae72a5bfe9b551686e88b72bb37a7616c3db27ef8d1316f27f3f41b5d7e04d9",
+          "reason": "width-below-six"
+        },
+        {
+          "semantic_candidate_sha256": "72c7c3b62288887f35da1ad017d01801ae3ba811dec70cf15f67535177f98517",
+          "reason": "cyclic-phase-signature-not-unique"
+        },
+        {
+          "semantic_candidate_sha256": "5e9d9320d25a87ed89f6b8673414072b86dfe3a7e8a3559536cde465add4e8a1",
+          "reason": "cyclic-phase-signature-not-unique"
+        }
+      ]
+    },
+    "backend": {
+      "architecture": "aarch64",
+      "required_isa": "OS-usable ASIMD",
+      "backend_tag": 29,
+      "backend_version": "SEARCH_V16",
+      "candidate_policy": 15,
+      "policy_name": "AsimdV16",
+      "aot_magic_hex": "465245413634001d",
+      "llvm": false,
+      "abi": "AAPCS64-SelectedEndRegisterV2",
+      "output": "Span",
+      "minimum_checked_window_bytes": 4093,
+      "portable_prefix_candidate_starts": 256,
+      "eligible_route": "authoritative portable prefix then disjoint tag29 static tail",
+      "ineligible_route": "full portable search",
+      "construction_and_link_adoption_timed": false
+    },
+    "qualification": {
+      "hosts": [
+        "apple-aarch64-asimd",
+        "c9g-aarch64-asimd-sve2"
+      ],
+      "baseline": "same compiled exact literal through full portable search",
+      "candidate": "ordinary production auto-route with a prelinked tag29 object when structurally eligible",
+      "paired_order": "alternating",
+      "repetitions": 6,
+      "target_elapsed_ns_each_variant": 500000000,
+      "minimum_elapsed_ns_each_variant": 400000000,
+      "calibration": "both variants; iteration count derived from the faster pilot",
+      "completeness": "154 fixtures times 2 hosts times 6 paired repetitions; no omissions, exclusions, substitutions, or reruns after inspection",
+      "pair_validity": "both variants in every pair must use an identical iteration count and independently reach minimum_elapsed_ns_each_variant",
+      "fixture_ratio": "for one fixture and host, sort the six order-paired static_auto_aot_elapsed_ns_i / portable_elapsed_ns_i ratios and compute (ratio[2]+ratio[3])/2 without pre-rounding",
+      "correctness_gate": "every scalar oracle must match both variants on both hosts before timing is accepted",
+      "compile_disposition_gate": "all 11 candidates must reproduce the frozen five tag29 object admissions and six exact structural refusals",
+      "eligible_route_gate": "eligible early and dense fixtures must return from the authoritative portable prefix with zero static invocation; each other eligible fixture must miss the prefix and invoke the tag29 static tail exactly once",
+      "ineligible_route_gate": "every ineligible fixture must use full portable search with zero static invocation",
+      "eligible_route_counts": "10 portable-prefix returns and 75 exact tag29 static-tail invocations per host",
+      "eligible_static_tail_fixture_gate": "every one of the 75 eligible fixtures that invokes the tag29 static tail must have a ratio strictly less than 0.80 on each host",
+      "eligible_prefix_return_fixture_gate": "every one of the 10 eligible fixtures that returns from the portable prefix without static invocation must have a ratio at most 1.05 on each host",
+      "ineligible_fixture_gate": "every one of the 69 ineligible fixture ratios must be at most 1.05 on each host and must report the exact full-portable fallback route",
+      "candidate_and_aggregate_results": "diagnostic only; no aggregate can rescue a failing fixture",
+      "failed_cell_disposition": "the broad tag29 family is not authorized; no candidate or fixture may be removed after results"
+    }
+  }
+}
