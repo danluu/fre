@@ -36,6 +36,7 @@ mod anchored_line_capture;
 mod anchored_word_capture;
 mod blocking_delimiter;
 mod bounded_literal_pair;
+mod bounded_word_class;
 mod capture_absolute_full;
 mod capture_count_seal;
 mod capture_iteration_seal;
@@ -871,7 +872,7 @@ pub enum PlanKind {
     K0,
     /// Ordered Unicode simple-fold scalar sequences backed by a sparse trie.
     UnicodeFoldedLiteral,
-    /// Linear canonical ASCII or Unicode `\b\w{m,}\b` word-run scan.
+    /// Linear ASCII or Unicode word-boundary class-run scan.
     UnicodeWordRun,
 }
 
@@ -2129,6 +2130,67 @@ impl PortableBuilder {
                 .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
             });
         }
+        if self.selection == PlanSelection::Auto {
+            let inspection = bounded_word_class::inspect(&rust.hir, self.limits.max_planner_work)
+                .map_err(|error| match error {
+                bounded_word_class::InspectionError::WorkLimit { needed, limit } => {
+                    BuildError::PlannerWorkLimit { needed, limit }
+                }
+                bounded_word_class::InspectionError::ArithmeticOverflow(detail) => {
+                    BuildError::InternalInvariant(detail)
+                }
+            })?;
+            if let Some(inspection) = inspection {
+                let plan_storage_bytes = inspection.storage_bytes();
+                let charged_persistent_bytes = source_storage_bytes
+                    .checked_add(capture_name_storage_bytes)
+                    .and_then(|bytes| bytes.checked_add(plan_storage_bytes))
+                    .ok_or(BuildError::PersistentBytesOverflow)?;
+                if charged_persistent_bytes > self.limits.max_persistent_bytes {
+                    return Err(BuildError::PersistentBytesLimit {
+                        needed: charged_persistent_bytes,
+                        limit: self.limits.max_persistent_bytes,
+                    });
+                }
+                let planner_work = inspection.planner_work();
+                let plan = inspection.build()?;
+                if plan.storage_bytes() != plan_storage_bytes {
+                    return Err(BuildError::InternalInvariant(
+                        "bounded word-class retained storage differs from inspection",
+                    ));
+                }
+                return Ok(PortableRegex {
+                    source,
+                    capture_names,
+                    line_total_grep_plan,
+                    plan: PortablePlan::BoundedWordClass(plan),
+                    profile: profile.clone(),
+                    limits: self.limits,
+                    selection: self.selection,
+                    report: BuildReport {
+                        profile: profile.clone(),
+                        admission,
+                        syntax,
+                        plan: PlanKind::UnicodeWordRun,
+                        planner_work,
+                        lowering: None,
+                        states: 0,
+                        edges: 0,
+                        plan_storage_bytes,
+                        source_storage_bytes,
+                        capture_name_storage_bytes,
+                        charged_persistent_bytes: 0,
+                        persistent_byte_limit: 0,
+                        captures_len,
+                        static_captures_len,
+                        minimum_match_bytes,
+                        required_literal: None,
+                        forward_anchored: None,
+                    }
+                    .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
+                });
+            }
+        }
         let mut planner_work = 0_u64;
         if matches!(
             self.selection,
@@ -2811,6 +2873,7 @@ enum PortablePlan {
     UnicodeFoldedLiteral(Box<unicode_folded_literal::UnicodeFoldedLiteralSearchPlan>),
     UnicodeWordRun(unicode_word_run::Plan),
     AsciiWordRun(unicode_word_run::AsciiPlan),
+    BoundedWordClass(bounded_word_class::Plan),
 }
 
 impl PortablePlan {
@@ -2828,6 +2891,7 @@ impl PortablePlan {
             Self::UnicodeFoldedLiteral(plan) => plan.plan_id(),
             Self::UnicodeWordRun(plan) => plan.plan_id(),
             Self::AsciiWordRun(_) => unicode_word_run::ASCII_PLAN_ID,
+            Self::BoundedWordClass(plan) => plan.plan_id(),
         }
     }
 }
@@ -3293,6 +3357,13 @@ impl PortableRegex {
                     SearchAccounting::UnicodeWordRun(accounting),
                 ))
             }
+            PortablePlan::BoundedWordClass(plan) => {
+                let (matched, accounting) = plan.find_window(haystack, window, limits)?;
+                Ok((
+                    matched.is_some(),
+                    SearchAccounting::UnicodeWordRun(accounting),
+                ))
+            }
         }
     }
 
@@ -3394,6 +3465,10 @@ impl PortableRegex {
                 .map(|(matched, _)| matched.is_some())
                 .map_err(SearchError::from),
             PortablePlan::AsciiWordRun(plan) => plan
+                .find_window(haystack, window, limits)
+                .map(|(matched, _)| matched.is_some())
+                .map_err(SearchError::from),
+            PortablePlan::BoundedWordClass(plan) => plan
                 .find_window(haystack, window, limits)
                 .map(|(matched, _)| matched.is_some())
                 .map_err(SearchError::from),
@@ -3569,6 +3644,10 @@ impl PortableRegex {
                     SearchAccounting::UnicodeWordRun(accounting),
                 ))
             }
+            PortablePlan::BoundedWordClass(plan) => {
+                let (end, accounting) = plan.shortest_window(haystack, window, limits)?;
+                Ok((end, SearchAccounting::UnicodeWordRun(accounting)))
+            }
         }
     }
 
@@ -3577,6 +3656,10 @@ impl PortableRegex {
     /// # Errors
     ///
     /// Returns [`SearchError`] if scratch/work limits refuse the operation.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "each native owner projects its selected endpoint and concrete accounting explicitly"
+    )]
     pub fn selected_end(
         &self,
         haystack: &[u8],
@@ -3673,6 +3756,14 @@ impl PortableRegex {
                 ))
             }
             PortablePlan::AsciiWordRun(plan) => {
+                let (matched, accounting) =
+                    plan.find_window(haystack, SearchWindow::full(haystack), limits)?;
+                Ok((
+                    matched.map(Match::end),
+                    SearchAccounting::UnicodeWordRun(accounting),
+                ))
+            }
+            PortablePlan::BoundedWordClass(plan) => {
                 let (matched, accounting) =
                     plan.find_window(haystack, SearchWindow::full(haystack), limits)?;
                 Ok((
@@ -3955,6 +4046,10 @@ impl PortableRegex {
                 Ok((matched, SearchAccounting::UnicodeWordRun(accounting)))
             }
             PortablePlan::AsciiWordRun(plan) => {
+                let (matched, accounting) = plan.find_window(haystack, window, limits)?;
+                Ok((matched, SearchAccounting::UnicodeWordRun(accounting)))
+            }
+            PortablePlan::BoundedWordClass(plan) => {
                 let (matched, accounting) = plan.find_window(haystack, window, limits)?;
                 Ok((matched, SearchAccounting::UnicodeWordRun(accounting)))
             }
