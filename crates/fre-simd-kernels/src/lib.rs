@@ -2,6 +2,8 @@
 //!
 //! [`AsciiByteSetClassifier`] turns one 128-bit ASCII byte set into nibble
 //! lookup tables and chooses its 16-byte and 32-byte implementations once.
+//! [`ByteSetClassifier`] provides the corresponding compact exact 16-byte
+//! operation for an arbitrary 256-bit byte set.
 //! [`AsciiByteSetRunScanner`] retains a separate operation-specific choice and
 //! finds maximal member prefixes or suffixes without materializing positional
 //! lane masks. Calls do not detect CPU features or make dispatch decisions from
@@ -38,6 +40,7 @@ mod aarch64;
 #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
 mod aarch64_sve2;
 mod byte_bucket;
+mod byte_set;
 #[cfg_attr(
     feature = "static-dispatch",
     allow(
@@ -62,6 +65,10 @@ mod tests;
 pub use byte_bucket::{
     BYTE_BUCKET_BLOCK_BYTES, BYTE_BUCKET_COUNT, BYTE_BUCKET_MAX_COLUMNS, ByteBucketClassifier,
     ByteBucketMasks16, ByteBucketTableError, ByteBucketTables,
+};
+pub use byte_set::{
+    BYTE_SET_BLOCK_BYTES, BYTE_SET_CLASSIFIER_BUILD_WORK, ByteSet256, ByteSetClassifier,
+    ByteSetMask16,
 };
 
 /// Number of bytes consumed by the narrow classifier operation.
@@ -193,6 +200,20 @@ impl SimdDispatchContext {
             return Ok(ByteBucketClassifier::from_static_profile(tables));
         }
         ByteBucketClassifier::with_capabilities(tables, self.capabilities, policy)
+    }
+
+    /// Build an exact arbitrary 256-bit byte-set classifier from this captured
+    /// snapshot.
+    pub fn byte_set_classifier(
+        self,
+        set: ByteSet256,
+        policy: DispatchPolicy,
+    ) -> Result<ByteSetClassifier, UnsupportedRequiredFeatures> {
+        #[cfg(feature = "static-dispatch")]
+        if policy == DispatchPolicy::Auto {
+            return Ok(ByteSetClassifier::from_static_profile(set));
+        }
+        ByteSetClassifier::with_capabilities(set, self.capabilities, policy)
     }
 }
 

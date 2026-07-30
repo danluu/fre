@@ -91,6 +91,7 @@ fn compiler_fixed_handles_do_not_retain_receipts_or_entries() {
     assert_eq!(core::mem::size_of::<AsciiByteSetClassifier>(), 32);
     assert_eq!(core::mem::size_of::<AsciiByteSetRunScanner>(), 56);
     assert_eq!(core::mem::size_of::<AsciiWordSpaceClassifier>(), 32);
+    assert_eq!(core::mem::size_of::<ByteSetClassifier>(), 64);
 }
 
 #[cfg(feature = "static-dispatch")]

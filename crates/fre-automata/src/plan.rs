@@ -5,7 +5,8 @@ use std::sync::{
 };
 
 use fre_simd_kernels::{
-    AsciiByteSet, AsciiByteSetClassifier, AsciiSelection, ASCII_CLASSIFIER_BUILD_WORK,
+    AsciiByteSet, AsciiByteSetClassifier, AsciiSelection, ByteSetClassifier,
+    ASCII_CLASSIFIER_BUILD_WORK,
 };
 
 use crate::{CompileError, MalformedPlan, Operation, ResourceKind, TypedPlan, WorkspaceLayout};
@@ -34,8 +35,13 @@ pub(crate) const BYTE_START_BITMAP_POPULATION_WORK: usize = 4;
 pub(crate) const BYTE_START_MEMBER_EXTRACTION_WORK: usize = 1;
 /// Largest cardinality represented by direct `memchr` scanners.
 pub(crate) const BYTE_START_SMALL_MAX_MEMBERS: usize = 3;
-/// Exact abstract work to retain a broad bitmap scanner.
-pub(crate) const BYTE_START_SET_SCANNER_SELECTION_WORK: usize = 1;
+/// Exact abstract work to compile a broad full-byte bitmap classifier.
+///
+/// Construction visits the complete 256-byte domain once while populating two
+/// exact 16-byte nibble tables. Host capture and immutable leaf selection
+/// happen once after that fixed pass.
+pub(crate) const BYTE_START_SET_CLASSIFIER_BUILD_WORK: usize =
+    fre_simd_kernels::BYTE_SET_CLASSIFIER_BUILD_WORK;
 /// Exact abstract work to compile a broad all-ASCII bitmap scanner.
 pub(crate) const BYTE_START_ASCII_CLASSIFIER_SELECTION_WORK: usize = ASCII_CLASSIFIER_BUILD_WORK;
 /// Exact abstract work to compare one position with the incumbent scanner.
@@ -52,7 +58,7 @@ pub(crate) const START_FILTER_GUARD_MAX_CARDINALITY: u32 = 64;
 pub(crate) const START_FILTER_MAX_SELECTION_WORK: usize = START_FILTER_POSITION_COUNT
     * (BYTE_START_BITMAP_POPULATION_WORK + START_FILTER_SCANNER_SELECTION_WORK)
     + START_FILTER_MAX_OFFSET * START_FILTER_GUARD_SELECTION_WORK
-    + BYTE_START_ASCII_CLASSIFIER_SELECTION_WORK;
+    + BYTE_START_SET_CLASSIFIER_BUILD_WORK;
 
 /// The structural role of a Thompson state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -463,6 +469,38 @@ impl PartialEq for StartAsciiClassifier {
 
 impl Eq for StartAsciiClassifier {}
 
+/// Immutable full-byte classifier retained for one non-ASCII start set.
+///
+/// This is the compact one-column specialization of the reusable byte-bucket
+/// classifier: two 16-byte tables represent all sixteen high nibbles in one
+/// fixed-width invocation.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StartByteSetClassifier {
+    inner: ByteSetClassifier,
+}
+
+impl StartByteSetClassifier {
+    pub(crate) const fn new(inner: ByteSetClassifier) -> Self {
+        Self { inner }
+    }
+
+    pub(crate) const fn set(&self) -> ByteSet {
+        ByteSet::from_words(self.inner.set().words())
+    }
+
+    pub(crate) const fn classifier(&self) -> &ByteSetClassifier {
+        &self.inner
+    }
+}
+
+impl PartialEq for StartByteSetClassifier {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner.set() == other.inner.set() && self.inner.selection() == other.inner.selection()
+    }
+}
+
+impl Eq for StartByteSetClassifier {}
+
 /// Immutable scanner selected from one proved exact-position byte set.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StartScanner {
@@ -474,7 +512,7 @@ pub(crate) enum StartScanner {
         set: ByteSet,
         classifier: StartAsciiClassifier,
     },
-    Set(ByteSet),
+    Set(StartByteSetClassifier),
 }
 
 /// One sound byte class at an exact consumed-byte offset after match start.
