@@ -83,6 +83,12 @@ pub const ASCII_WIDE_BYTES: usize = 32;
 /// and wide leaves, regardless of the selected scalar or vector variants.
 pub const ASCII_CLASSIFIER_BUILD_WORK: usize = 128 + 2 + 2;
 
+/// Exact abstract work used to compile one ASCII run scanner.
+///
+/// Construction traverses the complete ASCII domain and selects the shared
+/// forward/backward leaf once.
+pub const ASCII_RUN_SCANNER_BUILD_WORK: usize = 128 + 1 + 1;
+
 const ASCII_WORD_SET: AsciiByteSet =
     AsciiByteSet::from_words([0x03ff_0000_0000_0000, 0x07ff_fffe_87ff_fffe]);
 const ASCII_SPACE_VALUES: [u8; ASCII_NARROW_BYTES] = [

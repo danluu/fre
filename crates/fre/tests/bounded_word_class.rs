@@ -7,7 +7,7 @@ use fre::{
 };
 use regex_automata::{Input, meta::Regex as MetaRegex, util::syntax};
 
-const PLAN_ID: &str = "bounded-word-class-linear-candidate32-v2";
+const PLAN_ID: &str = "bounded-word-class-linear-bulk-skip-v3";
 
 fn fre_regex(pattern: &str, unicode: bool) -> fre::PortableRegex {
     PortableBuilder::new(pattern)
@@ -164,18 +164,18 @@ fn generated_small_classes_lengths_windows_and_malformed_bytes_match_k0_and_pinn
 
 #[test]
 fn bounded_ascii_and_unicode_classes_match_every_window() {
-    let cases: &[(&str, bool)] = &[
-        (r"(?-u:\b[A-Za-z]{3,9}\b)", false),
-        (r"(?-u:\b[A-F]{2,5}\b)", false),
-        (r"(?-u:\b[A/_-]{2,5}\b)", false),
-        (r"(?-u:\b[^A-Za-z]{1,4}\b)", false),
-        (r"(?-u:\b[\x80-\xFFQ]{1,3}\b)", false),
-        (r"(?-u:\b[A-Z]{2,}\b)", false),
-        (r"\b\p{L}{2,8}\b", true),
-        (r"\b[\p{Greek}_-]{1,4}\b", true),
-        (r"\b[^\p{L}]{1,3}\b", true),
-        (r"\b[\p{L}\p{N}_-]{2,}\b", true),
-        (r"\b\w{2,8}\b", true),
+    let cases: &[(&str, bool, bool)] = &[
+        (r"(?-u:\b[A-Za-z]{3,9}\b)", false, true),
+        (r"(?-u:\b[A-F]{2,5}\b)", false, true),
+        (r"(?-u:\b[A/_-]{2,5}\b)", false, true),
+        (r"(?-u:\b[^A-Za-z]{1,4}\b)", false, false),
+        (r"(?-u:\b[\x80-\xFFQ]{1,3}\b)", false, false),
+        (r"(?-u:\b[A-Z]{2,}\b)", false, true),
+        (r"\b\p{L}{2,8}\b", true, true),
+        (r"\b[\p{Greek}_-]{1,4}\b", true, true),
+        (r"\b[^\p{L}]{1,3}\b", true, true),
+        (r"\b[\p{L}\p{N}_-]{2,}\b", true, true),
+        (r"\b\w{2,8}\b", true, true),
     ];
     let haystacks: &[&[u8]] = &[
         b"",
@@ -190,7 +190,7 @@ fn bounded_ascii_and_unicode_classes_match_every_window() {
         &[0xF0, 0x9F, 0x98, 0x80, b'A', b'B', 0xED, 0xA0, 0x80],
     ];
 
-    for &(pattern, unicode) in cases {
+    for &(pattern, unicode, native) in cases {
         let fre = fre_regex(pattern, unicode);
         let oracle = meta_regex(pattern, unicode);
         let k0 = PortableBuilder::new(pattern)
@@ -199,12 +199,20 @@ fn bounded_ascii_and_unicode_classes_match_every_window() {
             .plan_selection(PlanSelection::ForceK0)
             .build()
             .expect("forced K0 comparison");
-        assert_eq!(fre.build_report().plan, PlanKind::UnicodeWordRun);
-        assert_eq!(fre.runtime_implementation_id(), PLAN_ID);
+        if native {
+            assert_eq!(fre.build_report().plan, PlanKind::UnicodeWordRun);
+            assert_eq!(fre.runtime_implementation_id(), PLAN_ID);
+        } else {
+            assert_ne!(fre.runtime_implementation_id(), PLAN_ID);
+        }
         let mut session = fre
             .search_session(SearchSessionLimits::unlimited())
             .expect("native session");
-        assert_eq!(session.workspace_setup_accounting(), None);
+        if native {
+            assert_eq!(session.workspace_setup_accounting(), None);
+        } else {
+            assert!(session.workspace_setup_accounting().is_some());
+        }
 
         for &haystack in haystacks {
             for start in 0..=haystack.len() {
@@ -220,7 +228,7 @@ fn bounded_ascii_and_unicode_classes_match_every_window() {
                                 "FRE search failed for {pattern:?}/{haystack:?}/{start}..{end}: {error}"
                             )
                         });
-                    assert_eq!(accounting.plan(), PlanKind::UnicodeWordRun);
+                    assert_eq!(accounting.plan(), fre.build_report().plan);
                     assert_eq!(
                         actual.map(|matched| (matched.start(), matched.end())),
                         expected,
@@ -230,7 +238,11 @@ fn bounded_ascii_and_unicode_classes_match_every_window() {
                         .find_window(haystack, window, SearchLimits::unlimited())
                         .expect("native session search");
                     assert_eq!(reused.0, actual);
-                    assert_eq!(reused.1, accounting);
+                    if native {
+                        assert_eq!(reused.1, accounting);
+                    } else {
+                        assert_eq!(reused.1.plan(), accounting.plan());
+                    }
                 }
                 assert_eq!(
                     fre.shortest_match_at(haystack, start, SearchLimits::unlimited())
@@ -408,6 +420,71 @@ fn bounded_mixed_runs_stop_after_lookahead_and_iterate_in_linear_work() {
                 .checked_mul(8)
                 .unwrap(),
         "bounded mixed-run iteration must remain linear: {accounting:?}"
+    );
+}
+
+#[test]
+fn selected_ascii_word_long_absent_sparse_and_short_dense_match_without_extra_work() {
+    let pattern = r"(?-u:\b[A-Za-z]{3,9}\b)";
+    let fre = fre_regex(pattern, false);
+    let oracle = upstream_regex(pattern, false);
+    assert_eq!(fre.runtime_implementation_id(), PLAN_ID);
+
+    let length = 128_usize
+        .checked_mul(1_024)
+        .and_then(|length| length.checked_add(17))
+        .unwrap();
+    let absent = vec![b'-'; length];
+    let (matched, accounting) = fre
+        .find(&absent, SearchLimits::unlimited())
+        .expect("long absent selected-word scan");
+    assert_eq!(matched, None);
+    assert_eq!(
+        accounting.work_or_linear_terms(),
+        u64::try_from(length).unwrap()
+    );
+
+    let start = 37;
+    let (matched, accounting) = fre
+        .find_at(&absent, start, SearchLimits::unlimited())
+        .expect("long absent selected-word find_at");
+    assert_eq!(matched, None);
+    assert_eq!(
+        accounting.work_or_linear_terms(),
+        u64::try_from(length - start).unwrap()
+    );
+
+    let mut sparse = absent;
+    let planted = length * 3 / 4;
+    sparse[planted..planted + 8].copy_from_slice(b"Alphabet");
+    let expected = oracle
+        .find(&sparse)
+        .map(|matched| (matched.start(), matched.end()));
+    let (actual, _) = fre
+        .find(&sparse, SearchLimits::unlimited())
+        .expect("long sparse selected-word scan");
+    assert_eq!(
+        actual.map(|matched| (matched.start(), matched.end())),
+        expected
+    );
+    assert_eq!(
+        actual.expect("planted sparse match").range(),
+        planted..planted + 8
+    );
+
+    let short_dense = b"---Alpha---Beta---Gamma---";
+    assert_eq!(
+        spans(
+            fre.find_iter(short_dense, PortableFindIterLimits::unlimited())
+                .expect("short dense iterator")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("short dense item")
+                .into_iter()
+        ),
+        oracle
+            .find_iter(short_dense)
+            .map(|matched| (matched.start(), matched.end()))
+            .collect::<Vec<_>>()
     );
 }
 

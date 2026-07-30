@@ -7,10 +7,11 @@
 //! property: boundaries are evaluated against the complete original
 //! haystack, independently of class membership.
 
-use fre_exact_alloc::{CopyError, ExactVec};
+use fre_exact_alloc::{CopyError, ExactBoxOrUsize, ExactVec};
 use fre_kernels::{
-    ASCII_CLASSIFIER_BUILD_WORK, ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, AsciiByteSet,
-    AsciiByteSetClassifier, DispatchPolicy, SimdDispatchContext,
+    ASCII_CLASSIFIER_BUILD_WORK, ASCII_NARROW_BYTES, ASCII_RUN_SCANNER_BUILD_WORK,
+    ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier, AsciiByteSetRunScanner, DispatchPolicy,
+    SimdDispatchContext,
 };
 use regex_syntax::hir::{Class, Hir, HirKind, Look};
 
@@ -19,12 +20,17 @@ use crate::{
     unicode_word_run::{Accounting, Error},
 };
 
-pub(crate) const PLAN_ID: &str = "bounded-word-class-linear-candidate32-v2";
+pub(crate) const PLAN_ID: &str = "bounded-word-class-linear-bulk-skip-v3";
 
 /// Pointwise checks stay cheaper than entering a fixed-width classifier when
 /// a candidate is close to the current cursor. This constant is independent
 /// of the regex and haystack.
 const CANDIDATE_SCALAR_PREFIX_BYTES: usize = 8;
+
+/// A run-scanner call must be able to replace at least two wide classifier
+/// iterations. This keeps short and dense searches on their existing path
+/// while amortizing one bulk call over genuinely reusable rejection work.
+const BULK_SKIP_MIN_BYTES: usize = ASCII_WIDE_BYTES * 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BoundaryMode {
@@ -58,6 +64,10 @@ enum CandidateMode {
 #[derive(Debug)]
 struct CandidateScanner {
     classifier: AsciiByteSetClassifier,
+    /// Exact ASCII byte classes can scan their ASCII nonmember complement as
+    /// one maximal run. Unicode keeps the classifier path because every high
+    /// byte is a semantic decode candidate.
+    nonmember_scanner: ExactBoxOrUsize<AsciiByteSetRunScanner>,
     mode: CandidateMode,
 }
 
@@ -254,6 +264,10 @@ enum ScannedCandidate {
 }
 
 impl CandidateScanner {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the scalar, bulk-run, fixed-width, and tail paths keep their exact shared ledger adjacent"
+    )]
     fn next(
         &self,
         haystack: &[u8],
@@ -279,7 +293,58 @@ impl CandidateScanner {
                 .ok_or_else(|| accounting_overflow(limits))?;
         }
 
+        // Preserve the established fixed classifier for the first post-prefix
+        // block. Nearby sparse candidates and dense iteration therefore keep
+        // their old path even when the untouched suffix is large.
+        let mut fixed_block_proved = false;
         while end.saturating_sub(position) >= ASCII_WIDE_BYTES {
+            if fixed_block_proved
+                && let Some(scanner) = self.nonmember_scanner.boxed()
+                && end.saturating_sub(position) >= BULK_SKIP_MIN_BYTES
+            {
+                let available = limits.max_work.saturating_sub(accounting.work);
+                let bulk_len = end
+                    .saturating_sub(position)
+                    .min(usize::try_from(available).unwrap_or(usize::MAX));
+                if bulk_len >= BULK_SKIP_MIN_BYTES {
+                    let bulk_end = position
+                        .checked_add(bulk_len)
+                        .ok_or_else(|| accounting_overflow(limits))?;
+                    // This ledger is logical, matching the established ASCII
+                    // word-run scanner contract: every skipped source byte is
+                    // charged once, while failed-block recovery remains a
+                    // private implementation detail of the retained scanner.
+                    let skipped = scanner
+                        .scan_forward(&haystack[position..bulk_end])
+                        .member_run_len();
+                    charge_many(accounting, skipped, limits)?;
+                    record_source(accounting, skipped, skipped, limits)?;
+                    position = position
+                        .checked_add(skipped)
+                        .ok_or_else(|| accounting_overflow(limits))?;
+                    if position == bulk_end {
+                        if position == end {
+                            return Ok(None);
+                        }
+                        continue;
+                    }
+                    let byte = haystack[position];
+                    if byte.is_ascii() {
+                        debug_assert!(self.classifier.set().contains(byte));
+                        charge(accounting, limits)?;
+                        record_source(accounting, 1, 1, limits)?;
+                        return Ok(Some(ScannedCandidate::AsciiMember { position, byte }));
+                    }
+                    // The ASCII run scanner deliberately stops at a high byte.
+                    // Exact byte classes reject it, so retain the fixed
+                    // classifier for arbitrary-byte blocks and resume bulk
+                    // scanning afterward.
+                    if end.saturating_sub(position) < ASCII_WIDE_BYTES {
+                        break;
+                    }
+                }
+            }
+
             charge_many(accounting, ASCII_WIDE_BYTES, limits)?;
             let block_end = position
                 .checked_add(ASCII_WIDE_BYTES)
@@ -324,6 +389,7 @@ impl CandidateScanner {
                 }));
             }
             position = block_end;
+            fixed_block_proved = true;
         }
 
         if end.saturating_sub(position) >= ASCII_NARROW_BYTES {
@@ -463,6 +529,10 @@ impl Inspection<'_> {
         self.storage_bytes
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one transactional build keeps class ownership, dispatch, and exact optional allocation together"
+    )]
     pub(crate) fn build(self) -> Result<Plan, crate::BuildError> {
         let class = match self.class {
             InspectedClass::Bytes(class) => {
@@ -512,15 +582,32 @@ impl Inspection<'_> {
                         "exact-ASCII candidate scanner retained a high-byte class member",
                     ));
                 }
+                let members = AsciiByteSet::from_words([words[0], words[1]]);
                 let classifier = self
                     .dispatch
-                    .ascii_byte_set_classifier(
-                        AsciiByteSet::from_words([words[0], words[1]]),
+                    .ascii_byte_set_classifier(members, DispatchPolicy::Auto)
+                    .expect("automatic ASCII classifier dispatch retains a scalar fallback");
+                let member_words = members.words();
+                let nonmember_scanner = self
+                    .dispatch
+                    .ascii_byte_set_run_scanner(
+                        AsciiByteSet::from_words([!member_words[0], !member_words[1]]),
                         DispatchPolicy::Auto,
                     )
-                    .expect("automatic ASCII classifier dispatch retains a scalar fallback");
+                    .expect("automatic ASCII run dispatch retains a scalar fallback");
+                let nonmember_scanner = ExactBoxOrUsize::try_from_boxed(nonmember_scanner)
+                    .map_err(|error| match error {
+                        CopyError::LayoutOverflow => crate::BuildError::InternalInvariant(
+                            "bounded word-class run-scanner owner layout overflowed",
+                        ),
+                        CopyError::AllocationFailed => crate::BuildError::AllocationFailed {
+                            structure: "bounded word-class run-scanner owner",
+                            additional: 1,
+                        },
+                    })?;
                 Some(CandidateScanner {
                     classifier,
+                    nonmember_scanner,
                     mode: CandidateMode::ExactAsciiMembers,
                 })
             }
@@ -537,6 +624,8 @@ impl Inspection<'_> {
                     .expect("automatic ASCII classifier dispatch retains a scalar fallback");
                 Some(CandidateScanner {
                     classifier,
+                    nonmember_scanner: ExactBoxOrUsize::try_from_usize(0)
+                        .expect("zero is an exactly representable inline scanner tag"),
                     mode: CandidateMode::UnicodeAsciiMemberOrNonAscii,
                 })
             }
@@ -1036,9 +1125,12 @@ pub(crate) fn inspect(
                 )?;
                 charge_build(&mut work, range_count, max_planner_work)?;
                 charge_build(&mut work, members, max_planner_work)?;
+                if !ascii_only {
+                    return Ok(InspectionOutcome::Ineligible { planner_work: work });
+                }
                 (
                     InspectedClass::Bytes(class),
-                    ascii_only.then_some(CandidateMode::ExactAsciiMembers),
+                    Some(CandidateMode::ExactAsciiMembers),
                 )
             }
             (BoundaryMode::Unicode, HirKind::Class(Class::Unicode(class))) => {
@@ -1087,6 +1179,14 @@ pub(crate) fn inspect(
             max_planner_work,
         )?;
     }
+    if candidate_mode == Some(CandidateMode::ExactAsciiMembers) {
+        charge_build(
+            &mut work,
+            u64::try_from(ASCII_RUN_SCANNER_BUILD_WORK)
+                .map_err(|_| InspectionError::ArithmeticOverflow("ASCII run-scanner work"))?,
+            max_planner_work,
+        )?;
+    }
     let range_bytes = match inspected {
         InspectedClass::Bytes(_) => 0,
         InspectedClass::Unicode(class) => class
@@ -1097,8 +1197,14 @@ pub(crate) fn inspect(
                 "Unicode class retained bytes",
             ))?,
     };
+    let run_scanner_bytes = usize::from(candidate_mode == Some(CandidateMode::ExactAsciiMembers))
+        .checked_mul(core::mem::size_of::<AsciiByteSetRunScanner>())
+        .ok_or(InspectionError::ArithmeticOverflow(
+            "bounded word-class run-scanner storage",
+        ))?;
     let storage_bytes = core::mem::size_of::<Plan>()
         .checked_add(range_bytes)
+        .and_then(|bytes| bytes.checked_add(run_scanner_bytes))
         .ok_or(InspectionError::ArithmeticOverflow(
             "bounded word-class plan storage",
         ))?;
@@ -1307,8 +1413,8 @@ mod tests {
     use regex_syntax::ParserBuilder;
 
     use super::{
-        ASCII_CLASSIFIER_BUILD_WORK, CandidateMode, InspectionError, InspectionOutcome, PLAN_ID,
-        inspect,
+        ASCII_CLASSIFIER_BUILD_WORK, ASCII_RUN_SCANNER_BUILD_WORK, BULK_SKIP_MIN_BYTES,
+        CandidateMode, InspectionError, InspectionOutcome, PLAN_ID, inspect,
     };
     use crate::{
         BuildError, BuildLimits, PlanSelection, PortableBuilder, SearchLimits, SearchWindow,
@@ -1374,7 +1480,7 @@ mod tests {
     }
 
     #[test]
-    fn classifier_admission_build_work_and_fallback_are_exact() {
+    fn classifier_admission_build_work_and_high_byte_refusal_are_exact() {
         let parse = |pattern: &str| {
             ParserBuilder::new()
                 .unicode(false)
@@ -1391,27 +1497,32 @@ mod tests {
         else {
             panic!("ASCII class should be eligible");
         };
-        let InspectionOutcome::Eligible(high) =
-            inspect(&high_hir, SimdDispatchContext::capture(), 0, u64::MAX)
-                .expect("high-byte inspection")
-        else {
-            panic!("high-byte class should be eligible");
-        };
+        let high = inspect(&high_hir, SimdDispatchContext::capture(), 0, u64::MAX)
+            .expect("high-byte inspection");
+        assert!(matches!(high, InspectionOutcome::Ineligible { .. }));
         assert_eq!(ascii.candidate_mode, Some(CandidateMode::ExactAsciiMembers));
-        assert_eq!(high.candidate_mode, None);
         assert_eq!(
             ascii.planner_work(),
             high.planner_work()
                 .checked_add(u64::try_from(ASCII_CLASSIFIER_BUILD_WORK).unwrap())
                 .unwrap()
+                .checked_add(u64::try_from(ASCII_RUN_SCANNER_BUILD_WORK).unwrap())
+                .unwrap()
         );
-        assert_eq!(ascii.storage_bytes(), high.storage_bytes());
 
         let ascii = ascii.build().expect("ASCII plan");
-        let high = high.build().expect("high-byte plan");
-        assert!(ascii.candidate_scanner.is_some());
-        assert!(high.candidate_scanner.is_none());
-        assert_eq!(ascii.storage_bytes(), high.storage_bytes());
+        assert!(
+            ascii
+                .candidate_scanner
+                .as_ref()
+                .is_some_and(|scanner| scanner.nonmember_scanner.boxed().is_some())
+        );
+        let high = PortableBuilder::new(r"(?-u:\b[\x80-\x81]{1,3}\b)")
+            .unicode(false)
+            .plan_selection(PlanSelection::Auto)
+            .build()
+            .expect("high-byte fallback plan");
+        assert_ne!(high.runtime_implementation_id(), PLAN_ID);
     }
 
     #[test]
@@ -1557,6 +1668,92 @@ mod tests {
                 limit: 46,
             })
         ));
+    }
+
+    #[test]
+    fn long_ascii_rejections_use_one_logical_bulk_span_and_resume_after_high_bytes() {
+        let plan = plan(r"(?-u:\b[A-B]{1,3}\b)", false);
+        let length = BULK_SKIP_MIN_BYTES
+            .checked_mul(64)
+            .and_then(|length| length.checked_add(3))
+            .unwrap();
+
+        let absent = vec![b'-'; length];
+        let (matched, accounting) = plan
+            .find_window(
+                &absent,
+                SearchWindow::full(&absent),
+                SearchLimits::unlimited(),
+            )
+            .expect("long absent bulk scan");
+        assert_eq!(matched, None);
+        assert_eq!(accounting.work(), u64::try_from(length).unwrap());
+        assert_eq!(accounting.bytes_examined(), length);
+        assert_eq!(accounting.scalars_decoded(), length);
+        assert!(matches!(
+            plan.find_window(
+                &absent,
+                SearchWindow::full(&absent),
+                SearchLimits {
+                    max_work: accounting.work() - 1,
+                    max_scratch_bytes: 0,
+                },
+            ),
+            Err(crate::UnicodeWordRunError::WorkLimitExceeded {
+                needed,
+                limit,
+            }) if needed == u64::try_from(length).unwrap()
+                && limit == u64::try_from(length - 1).unwrap()
+        ));
+
+        let candidate = length - 17;
+        let mut sparse = absent;
+        sparse[candidate] = b'A';
+        let (matched, accounting) = plan
+            .find_window(
+                &sparse,
+                SearchWindow::full(&sparse),
+                SearchLimits::unlimited(),
+            )
+            .expect("long sparse bulk scan");
+        assert_eq!(
+            matched.expect("long sparse candidate").range(),
+            candidate..candidate + 1
+        );
+        assert_eq!(
+            accounting.work(),
+            u64::try_from(candidate.checked_add(7).unwrap()).unwrap()
+        );
+        assert_eq!(
+            accounting.bytes_examined(),
+            candidate.checked_add(4).unwrap()
+        );
+        assert_eq!(
+            accounting.scalars_decoded(),
+            candidate.checked_add(4).unwrap()
+        );
+
+        sparse[128..160].fill(0xFF);
+        let (matched, high_accounting) = plan
+            .find_window(
+                &sparse,
+                SearchWindow::full(&sparse),
+                SearchLimits::unlimited(),
+            )
+            .expect("bulk scan around arbitrary bytes");
+        assert_eq!(
+            matched.expect("candidate after arbitrary bytes").range(),
+            candidate..candidate + 1
+        );
+        assert_eq!(high_accounting.work(), accounting.work());
+        assert_eq!(
+            high_accounting.bytes_examined(),
+            accounting.bytes_examined()
+        );
+        assert_eq!(
+            high_accounting.scalars_decoded(),
+            accounting.scalars_decoded()
+        );
     }
 
     #[test]
