@@ -2358,54 +2358,16 @@ fn execute_lazy_loop(
         return Ok(None);
     }
 
-    match workspace.lazy.initial_kind {
-        LazyInitialKind::NullablePrefix | LazyInitialKind::NullableTerminal => {
-            execute_prepared_lazy_loop::<true>(
-                automaton,
-                haystack,
-                window,
-                workspace,
-                meter,
-                contract,
-                core_reserve,
-                scanner,
-                guard,
-            )
+    let (initial_pending, initial_terminal) = match workspace.lazy.initial_kind {
+        LazyInitialKind::Positive => (false, false),
+        LazyInitialKind::NullablePrefix => (true, false),
+        LazyInitialKind::NullableTerminal => (true, true),
+        LazyInitialKind::Uninitialized => {
+            return Err(SearchError::InternalInvariant {
+                detail: "initialized lazy DFA has no cached initial kind",
+            });
         }
-        LazyInitialKind::Positive => execute_prepared_lazy_loop::<false>(
-            automaton,
-            haystack,
-            window,
-            workspace,
-            meter,
-            contract,
-            core_reserve,
-            scanner,
-            guard,
-        ),
-        LazyInitialKind::Uninitialized => Err(SearchError::InternalInvariant {
-            detail: "initialized lazy DFA has no cached initial kind",
-        }),
-    }
-}
-
-#[allow(
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    reason = "separate positive and nullable instantiations keep the positive hot loop compact"
-)]
-#[inline(never)]
-fn execute_prepared_lazy_loop<const INITIAL_NULLABLE: bool>(
-    automaton: &Automaton,
-    haystack: &[u8],
-    window: SearchWindow,
-    workspace: &mut K0Workspace,
-    meter: &mut WorkMeter,
-    contract: OutputContract,
-    core_reserve: u64,
-    scanner: Option<&StartPositionScanner>,
-    guard: Option<&StartPositionClass>,
-) -> Result<Option<(Option<MatchSpan>, usize)>, SearchError> {
+    };
     let earliest = matches!(
         contract,
         OutputContract::Exists | OutputContract::EarliestEnd
@@ -2416,30 +2378,18 @@ fn execute_prepared_lazy_loop<const INITIAL_NULLABLE: bool>(
             detail: "initialized lazy DFA has no initial state",
         });
     }
-    if INITIAL_NULLABLE {
-        if !matches!(
-            workspace.lazy.initial_kind,
-            LazyInitialKind::NullablePrefix | LazyInitialKind::NullableTerminal
-        ) {
-            return Err(SearchError::InternalInvariant {
-                detail: "nullable lazy DFA initial state lost its pending match",
-            });
-        }
-        if earliest || workspace.lazy.initial_kind == LazyInitialKind::NullableTerminal {
-            return Ok(Some((
-                Some(MatchSpan::new(window.start(), window.start())),
-                1,
-            )));
-        }
-    } else {
-        debug_assert_eq!(workspace.lazy.initial_kind, LazyInitialKind::Positive);
+    if initial_pending && (earliest || initial_terminal) {
+        return Ok(Some((
+            Some(MatchSpan::new(window.start(), window.start())),
+            1,
+        )));
     }
     // Even a physically full cache retains useful prefix rows. Start from the
     // cached initial state and hand off only when an unfilled edge is reached.
     let mut state = LazyState::Cached(initial);
     let mut position = window.start();
     let mut boundaries = 0usize;
-    let mut pending_end = INITIAL_NULLABLE.then_some(window.start());
+    let mut pending_end = initial_pending.then_some(window.start());
     let mut entered = false;
 
     loop {
