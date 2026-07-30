@@ -348,7 +348,7 @@ pub use fre_kernels::{
     AnchoredLineCaptureRunError, AnchoredLineCaptureRunLimits, AnchoredLineCaptureRunUpperBounds,
     FoldedLiteralTrieBuildError, FoldedLiteralTrieBuildLimits, FoldedLiteralTrieScanAttemptError,
     FoldedLiteralTrieScanError, FoldedLiteralTrieScanLimits,
-    PACKED_ORDERED_LITERAL_CERTIFIED_MAX_PATTERNS,
+    PACKED_ORDERED_LITERAL_CERTIFIED_MAX_PATTERNS, RequiredLiteralClassRepeat,
 };
 pub use fre_kernels::{
     AsciiSelection as SimdAsciiSelection, DispatchPolicy as SimdDispatchPolicy,
@@ -549,17 +549,17 @@ pub use text_set::{
 
 use fre_automata::{Automaton, EarliestEnd, Exists, K0SearchSession, SelectedEnd, Span};
 use fre_kernels::{
-    AbsoluteEndFixedPlan, DispatchedForwardAnchoredPlan, DispatchedRequiredLiteralPlan,
-    ForwardAnchoredBuildAccounting, ForwardAnchoredBuildError, ForwardAnchoredBuildLimits,
-    ForwardAnchoredPlan, ForwardAnchoredSearchAccounting, ForwardAnchoredSearchError,
-    ForwardAnchoredSearchLimits, LiteralAccounting, LiteralBuildLimits, LiteralClassRunLiteralPlan,
-    LiteralClassRunSearchPlan, LiteralError, LiteralPlan, LiteralSearchLimits,
-    LiteralSetAccounting, LiteralSetBuildLimits, LiteralSetError, LiteralSetPlan,
-    LiteralSetSearchLimits, PackedLiteralSetAccounting, PackedLiteralSetBuildLimits,
-    PackedLiteralSetError, PackedLiteralSetPlan, PackedLiteralSetSearchLimits,
-    RequiredLiteralBuildAccounting, RequiredLiteralBuildError, RequiredLiteralBuildLimits,
-    RequiredLiteralPlan, RequiredLiteralSearchAccounting, RequiredLiteralSearchError,
-    RequiredLiteralSearchLimits, Window as LiteralWindow,
+    AbsoluteEndFixedPlan, BoundedRequiredLiteralPlan, DispatchedBoundedRequiredLiteralPlan,
+    DispatchedForwardAnchoredPlan, DispatchedRequiredLiteralPlan, ForwardAnchoredBuildAccounting,
+    ForwardAnchoredBuildError, ForwardAnchoredBuildLimits, ForwardAnchoredPlan,
+    ForwardAnchoredSearchAccounting, ForwardAnchoredSearchError, ForwardAnchoredSearchLimits,
+    LiteralAccounting, LiteralBuildLimits, LiteralClassRunLiteralPlan, LiteralClassRunSearchPlan,
+    LiteralError, LiteralPlan, LiteralSearchLimits, LiteralSetAccounting, LiteralSetBuildLimits,
+    LiteralSetError, LiteralSetPlan, LiteralSetSearchLimits, PackedLiteralSetAccounting,
+    PackedLiteralSetBuildLimits, PackedLiteralSetError, PackedLiteralSetPlan,
+    PackedLiteralSetSearchLimits, RequiredLiteralBuildAccounting, RequiredLiteralBuildError,
+    RequiredLiteralBuildLimits, RequiredLiteralPlan, RequiredLiteralSearchAccounting,
+    RequiredLiteralSearchError, RequiredLiteralSearchLimits, Window as LiteralWindow,
 };
 use fre_lower::{LowerLimits, LowerStats, OperationSemantics};
 use fre_syntax::{
@@ -605,7 +605,7 @@ pub use unicode_word_run::{
 };
 
 /// Stable schema for facade-level explanation records.
-pub const EXPLAIN_SCHEMA_VERSION: u32 = 7;
+pub const EXPLAIN_SCHEMA_VERSION: u32 = 8;
 
 /// Escapes all regular-expression meta characters in `pattern`.
 ///
@@ -633,7 +633,7 @@ pub struct BuildLimits {
     pub literal_set: LiteralSetBuildLimits,
     /// SIMD packed plan limits for an exactly enumerated finite language.
     pub packed_literal_set: PackedLiteralSetBuildLimits,
-    /// Proof-restricted `CLASS+ SUFFIX` construction limits.
+    /// Proof-restricted positive greedy `CLASS{min,max} SUFFIX` construction limits.
     pub required_literal: RequiredLiteralBuildLimits,
     /// Canonical `LITERAL? BYTE_CLASS+ LITERAL?` construction limits.
     pub literal_class_run_literal: LiteralClassRunLiteralBuildLimits,
@@ -875,7 +875,7 @@ pub enum PlanKind {
     PackedLiteralSet,
     /// Bounded ordered finite-literal DFA used when packed search is ineligible.
     LiteralSetDfa,
-    /// Proof-restricted SIMD-aware `CLASS+ SUFFIX` kernel. This is not JIT.
+    /// Proof-restricted SIMD-aware `CLASS{min,max} SUFFIX` kernel. This is not JIT.
     RequiredLiteral,
     /// Canonical literal/class-run search backed by one native literal anchor.
     LiteralClassRunLiteral,
@@ -1809,6 +1809,7 @@ pub struct RequiredLiteralCacheIdentity {
     pub operation: CaptureFreeOperation,
     pub anchors: fre_kernels::RequiredLiteralAnchors,
     pub class_words: [u64; 4],
+    pub repeat: RequiredLiteralClassRepeat,
     pub suffix: Vec<u8>,
     pub build_limits: BuildLimits,
     pub search_limits: SearchLimits,
@@ -2403,8 +2404,10 @@ impl PortableBuilder {
             let default_allowed = !(shape.anchors.start && shape.anchors.end);
             if self.selection == PlanSelection::ForceRequiredLiteral || default_allowed {
                 let dispatch = SimdDispatchContext::capture();
-                let required_plan =
-                    if RequiredLiteralPlan::run_scanner_eligible(dispatch, shape.class) {
+                let scanner_eligible =
+                    RequiredLiteralPlan::run_scanner_eligible(dispatch, shape.class);
+                let required_plan = if shape.repeat == RequiredLiteralClassRepeat::one_or_more() {
+                    if scanner_eligible {
                         RequiredLiteralPlan::build_with_dispatch(
                             dispatch,
                             shape.class,
@@ -2421,12 +2424,36 @@ impl PortableBuilder {
                             self.limits.required_literal,
                         )
                         .map(PortablePlan::RequiredLiteral)
-                    };
+                    }
+                } else if scanner_eligible {
+                    BoundedRequiredLiteralPlan::build_with_dispatch(
+                        dispatch,
+                        shape.class,
+                        shape.repeat,
+                        &shape.suffix,
+                        shape.anchors,
+                        self.limits.required_literal,
+                    )
+                    .map(PortablePlan::DispatchedBoundedRequiredLiteral)
+                } else {
+                    BoundedRequiredLiteralPlan::build(
+                        shape.class,
+                        shape.repeat,
+                        &shape.suffix,
+                        shape.anchors,
+                        self.limits.required_literal,
+                    )
+                    .map(PortablePlan::BoundedRequiredLiteral)
+                };
                 match required_plan {
                     Ok(plan) => {
                         let build = match &plan {
                             PortablePlan::RequiredLiteral(plan) => plan.build_accounting(),
                             PortablePlan::DispatchedRequiredLiteral(plan) => {
+                                plan.build_accounting()
+                            }
+                            PortablePlan::BoundedRequiredLiteral(plan) => plan.build_accounting(),
+                            PortablePlan::DispatchedBoundedRequiredLiteral(plan) => {
                                 plan.build_accounting()
                             }
                             _ => unreachable!(
@@ -3096,6 +3123,8 @@ enum PortablePlan {
     LiteralSetDfa(LiteralSetPlan),
     RequiredLiteral(RequiredLiteralPlan),
     DispatchedRequiredLiteral(DispatchedRequiredLiteralPlan),
+    BoundedRequiredLiteral(BoundedRequiredLiteralPlan),
+    DispatchedBoundedRequiredLiteral(DispatchedBoundedRequiredLiteralPlan),
     LiteralClassRunLiteral(LiteralClassRunLiteralPlan),
     LiteralClassRunSearch(LiteralClassRunSearchPlan),
     ForwardAnchored(ForwardAnchoredPlan),
@@ -3116,6 +3145,8 @@ impl PortablePlan {
             Self::LiteralSetDfa(_) => "literal-set-dfa",
             Self::RequiredLiteral(required) => required.plan_id(),
             Self::DispatchedRequiredLiteral(required) => required.plan_id(),
+            Self::BoundedRequiredLiteral(required) => required.plan_id(),
+            Self::DispatchedBoundedRequiredLiteral(required) => required.plan_id(),
             Self::LiteralClassRunLiteral(_) => fre_kernels::LITERAL_CLASS_RUN_LITERAL_PLAN_ID,
             Self::LiteralClassRunSearch(plan) => plan.plan_id(),
             Self::ForwardAnchored(forward) => forward.plan_id(),
@@ -3526,6 +3557,30 @@ impl PortableRegex {
                     SearchAccounting::RequiredLiteral(accounting),
                 ))
             }
+            PortablePlan::BoundedRequiredLiteral(required) => {
+                let literal_window = LiteralWindow::new(window.start(), window.end());
+                let (matched, accounting) = required.find_window(
+                    haystack,
+                    literal_window,
+                    required_literal_limits(limits),
+                )?;
+                Ok((
+                    matched.is_some(),
+                    SearchAccounting::RequiredLiteral(accounting),
+                ))
+            }
+            PortablePlan::DispatchedBoundedRequiredLiteral(required) => {
+                let literal_window = LiteralWindow::new(window.start(), window.end());
+                let (matched, accounting) = required.find_window(
+                    haystack,
+                    literal_window,
+                    required_literal_limits(limits),
+                )?;
+                Ok((
+                    matched.is_some(),
+                    SearchAccounting::RequiredLiteral(accounting),
+                ))
+            }
             PortablePlan::LiteralClassRunLiteral(plan) => {
                 let (matched, accounting) = plan.shortest_window(
                     haystack,
@@ -3672,6 +3727,22 @@ impl PortableRegex {
                 .map(|(matched, _)| matched.is_some())
                 .map_err(SearchError::from),
             PortablePlan::DispatchedRequiredLiteral(required) => required
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    required_literal_limits(limits),
+                )
+                .map(|(matched, _)| matched.is_some())
+                .map_err(SearchError::from),
+            PortablePlan::BoundedRequiredLiteral(required) => required
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    required_literal_limits(limits),
+                )
+                .map(|(matched, _)| matched.is_some())
+                .map_err(SearchError::from),
+            PortablePlan::DispatchedBoundedRequiredLiteral(required) => required
                 .find_window(
                     haystack,
                     LiteralWindow::new(window.start(), window.end()),
@@ -3851,6 +3922,30 @@ impl PortableRegex {
                     SearchAccounting::RequiredLiteral(accounting),
                 ))
             }
+            PortablePlan::BoundedRequiredLiteral(required) => {
+                let literal_window = LiteralWindow::new(window.start(), window.end());
+                let (matched, accounting) = required.find_window(
+                    haystack,
+                    literal_window,
+                    required_literal_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|(_, end)| end),
+                    SearchAccounting::RequiredLiteral(accounting),
+                ))
+            }
+            PortablePlan::DispatchedBoundedRequiredLiteral(required) => {
+                let literal_window = LiteralWindow::new(window.start(), window.end());
+                let (matched, accounting) = required.find_window(
+                    haystack,
+                    literal_window,
+                    required_literal_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|(_, end)| end),
+                    SearchAccounting::RequiredLiteral(accounting),
+                ))
+            }
             PortablePlan::LiteralClassRunLiteral(plan) => {
                 let (end, accounting) = plan.shortest_window(
                     haystack,
@@ -3986,6 +4081,22 @@ impl PortableRegex {
                 ))
             }
             PortablePlan::DispatchedRequiredLiteral(required) => {
+                let (matched, accounting) =
+                    required.find(haystack, required_literal_limits(limits))?;
+                Ok((
+                    matched.map(|(_, end)| end),
+                    SearchAccounting::RequiredLiteral(accounting),
+                ))
+            }
+            PortablePlan::BoundedRequiredLiteral(required) => {
+                let (matched, accounting) =
+                    required.find(haystack, required_literal_limits(limits))?;
+                Ok((
+                    matched.map(|(_, end)| end),
+                    SearchAccounting::RequiredLiteral(accounting),
+                ))
+            }
+            PortablePlan::DispatchedBoundedRequiredLiteral(required) => {
                 let (matched, accounting) =
                     required.find(haystack, required_literal_limits(limits))?;
                 Ok((
@@ -4287,6 +4398,30 @@ impl PortableRegex {
                     SearchAccounting::RequiredLiteral(accounting),
                 ))
             }
+            PortablePlan::BoundedRequiredLiteral(required) => {
+                let literal_window = LiteralWindow::new(window.start(), window.end());
+                let (matched, accounting) = required.find_window(
+                    haystack,
+                    literal_window,
+                    required_literal_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    SearchAccounting::RequiredLiteral(accounting),
+                ))
+            }
+            PortablePlan::DispatchedBoundedRequiredLiteral(required) => {
+                let literal_window = LiteralWindow::new(window.start(), window.end());
+                let (matched, accounting) = required.find_window(
+                    haystack,
+                    literal_window,
+                    required_literal_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    SearchAccounting::RequiredLiteral(accounting),
+                ))
+            }
             PortablePlan::LiteralClassRunLiteral(plan) => {
                 let (matched, accounting) = plan.find_window(
                     haystack,
@@ -4401,6 +4536,7 @@ impl PortableRegex {
                 operation,
                 anchors: required.anchors(),
                 class_words: required.class().words(),
+                repeat: RequiredLiteralClassRepeat::one_or_more(),
                 suffix: required.suffix().to_vec(),
                 build_limits: self.limits,
                 search_limits,
@@ -4413,6 +4549,33 @@ impl PortableRegex {
                     operation,
                     anchors: required.anchors(),
                     class_words: required.class().words(),
+                    repeat: RequiredLiteralClassRepeat::one_or_more(),
+                    suffix: required.suffix().to_vec(),
+                    build_limits: self.limits,
+                    search_limits,
+                })
+            }
+            PortablePlan::BoundedRequiredLiteral(required) => Some(RequiredLiteralCacheIdentity {
+                schema_version: EXPLAIN_SCHEMA_VERSION,
+                plan_id: required.plan_id(),
+                profile: self.profile.clone(),
+                operation,
+                anchors: required.anchors(),
+                class_words: required.class().words(),
+                repeat: required.repeat(),
+                suffix: required.suffix().to_vec(),
+                build_limits: self.limits,
+                search_limits,
+            }),
+            PortablePlan::DispatchedBoundedRequiredLiteral(required) => {
+                Some(RequiredLiteralCacheIdentity {
+                    schema_version: EXPLAIN_SCHEMA_VERSION,
+                    plan_id: required.plan_id(),
+                    profile: self.profile.clone(),
+                    operation,
+                    anchors: required.anchors(),
+                    class_words: required.class().words(),
+                    repeat: required.repeat(),
                     suffix: required.suffix().to_vec(),
                     build_limits: self.limits,
                     search_limits,
@@ -5662,6 +5825,27 @@ mod tests {
         assert_eq!(selected.build_report().minimum_match_bytes, Some(2));
         assert!(selected.build_report().required_literal.is_some());
 
+        for (pattern, minimum_match_bytes) in [
+            ("[a-z]{3,6}TRAILER", Some(10)),
+            ("[a-z]{3,}TRAILER", Some(10)),
+        ] {
+            let bounded = PortableBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            assert_eq!(
+                bounded.build_report().plan,
+                PlanKind::RequiredLiteral,
+                "pattern={pattern:?}"
+            );
+            assert_eq!(
+                bounded.build_report().minimum_match_bytes,
+                minimum_match_bytes,
+                "pattern={pattern:?}"
+            );
+            assert!(bounded.build_report().required_literal.is_some());
+        }
+
         let anchored_start = PortableBuilder::new(r"\A[a-z]+Z")
             .unicode(false)
             .build()
@@ -5947,6 +6131,10 @@ mod tests {
             .required_literal_cache_identity(CaptureFreeOperation::Span, limits)
             .unwrap();
         assert_eq!(span.plan_id, regex.runtime_implementation_id());
+        assert_eq!(
+            span.repeat,
+            fre_kernels::RequiredLiteralClassRepeat::one_or_more()
+        );
         assert_eq!(span.build_limits, BuildLimits::default());
         assert_eq!(span.search_limits, limits);
         assert_eq!(
@@ -5970,6 +6158,26 @@ mod tests {
                 )
                 .unwrap()
         );
+        let bounded = PortableBuilder::new("[ab]{2,3}Z")
+            .unicode(false)
+            .build()
+            .unwrap()
+            .required_literal_cache_identity(CaptureFreeOperation::Span, limits)
+            .unwrap();
+        let other_bound = PortableBuilder::new("[ab]{2,4}Z")
+            .unicode(false)
+            .build()
+            .unwrap()
+            .required_literal_cache_identity(CaptureFreeOperation::Span, limits)
+            .unwrap();
+        assert_eq!(
+            bounded.repeat,
+            fre_kernels::RequiredLiteralClassRepeat {
+                min: 2,
+                max: Some(3)
+            }
+        );
+        assert_ne!(bounded, other_bound);
     }
 
     #[test]
@@ -6067,6 +6275,162 @@ mod tests {
         }
         assert_eq!(span_comparisons, 196_740);
         assert_eq!(operation_comparisons, 590_220);
+    }
+
+    #[test]
+    fn bounded_required_literal_matches_upstream_across_steady_operations() {
+        let haystacks = byte_words(&[b'a', b'b', b'Z', b'!'], 6);
+        let mut comparisons = 0_usize;
+        for quantifier in ["{1,2}", "{2}", "{2,4}", "{3,}"] {
+            for start_anchor in [false, true] {
+                for end_anchor in [false, true] {
+                    let pattern = required_repeated_pattern(
+                        b"ab",
+                        quantifier,
+                        b"Z",
+                        start_anchor,
+                        end_anchor,
+                    );
+                    let fre = PortableBuilder::new(&pattern)
+                        .unicode(false)
+                        .plan_selection(PlanSelection::ForceRequiredLiteral)
+                        .build()
+                        .unwrap();
+                    assert_eq!(
+                        fre.build_report().plan,
+                        PlanKind::RequiredLiteral,
+                        "pattern={pattern:?}"
+                    );
+                    let upstream = regex::bytes::RegexBuilder::new(&pattern)
+                        .unicode(false)
+                        .build()
+                        .unwrap();
+                    for haystack in &haystacks {
+                        let expected = upstream
+                            .find(haystack)
+                            .map(|matched| (matched.start(), matched.end()));
+                        let actual = fre
+                            .find(haystack, SearchLimits::unlimited())
+                            .unwrap()
+                            .0
+                            .map(|matched| (matched.start(), matched.end()));
+                        assert_eq!(
+                            actual, expected,
+                            "pattern={pattern:?} haystack={haystack:?}"
+                        );
+                        assert_eq!(
+                            fre.is_match(haystack, SearchLimits::unlimited()).unwrap().0,
+                            expected.is_some(),
+                            "pattern={pattern:?} haystack={haystack:?}"
+                        );
+                        assert_eq!(
+                            fre.selected_end(haystack, SearchLimits::unlimited())
+                                .unwrap()
+                                .0,
+                            expected.map(|(_, end)| end),
+                            "pattern={pattern:?} haystack={haystack:?}"
+                        );
+                        assert_eq!(
+                            fre.shortest_match(haystack, SearchLimits::unlimited())
+                                .unwrap()
+                                .0,
+                            upstream.shortest_match(haystack),
+                            "pattern={pattern:?} haystack={haystack:?}"
+                        );
+                        let expected_iter: Vec<_> = upstream
+                            .find_iter(haystack)
+                            .map(|matched| (matched.start(), matched.end()))
+                            .collect();
+                        let actual_iter: Vec<_> = fre
+                            .find_iter(haystack, PortableFindIterLimits::unlimited())
+                            .unwrap()
+                            .map(|matched| {
+                                let matched = matched.unwrap();
+                                (matched.start(), matched.end())
+                            })
+                            .collect();
+                        assert_eq!(
+                            actual_iter, expected_iter,
+                            "pattern={pattern:?} haystack={haystack:?}"
+                        );
+                        for offset in 0..=haystack.len() {
+                            let expected_at = upstream
+                                .find_at(haystack, offset)
+                                .map(|matched| (matched.start(), matched.end()));
+                            let actual_at = fre
+                                .find_at(haystack, offset, SearchLimits::unlimited())
+                                .unwrap()
+                                .0
+                                .map(|matched| (matched.start(), matched.end()));
+                            assert_eq!(
+                                actual_at, expected_at,
+                                "pattern={pattern:?} haystack={haystack:?} offset={offset}"
+                            );
+                            assert_eq!(
+                                fre.shortest_match_at(haystack, offset, SearchLimits::unlimited(),)
+                                    .unwrap()
+                                    .0,
+                                upstream.shortest_match_at(haystack, offset),
+                                "pattern={pattern:?} haystack={haystack:?} offset={offset}"
+                            );
+                            comparisons = comparisons.saturating_add(1);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(comparisons > 500_000);
+    }
+
+    #[test]
+    fn bounded_required_literal_accepts_unbordered_suffix_ending_in_class_bytes() {
+        let pattern = r"(?-u:[ab]{2,4}Zab)";
+        let haystack = b"__ababaZab__abZab";
+        let fre = PortableBuilder::new(pattern)
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceRequiredLiteral)
+            .build()
+            .unwrap();
+        let upstream = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+
+        assert_eq!(fre.build_report().plan, PlanKind::RequiredLiteral);
+        assert_eq!(
+            fre.find(haystack, SearchLimits::unlimited())
+                .unwrap()
+                .0
+                .map(|matched| (matched.start(), matched.end())),
+            upstream
+                .find(haystack)
+                .map(|matched| (matched.start(), matched.end()))
+        );
+        assert_eq!(
+            fre.shortest_match(haystack, SearchLimits::unlimited())
+                .unwrap()
+                .0,
+            upstream.shortest_match(haystack)
+        );
+        for start in 0..=haystack.len() {
+            assert_eq!(
+                fre.find_at(haystack, start, SearchLimits::unlimited())
+                    .unwrap()
+                    .0
+                    .map(|matched| (matched.start(), matched.end())),
+                upstream
+                    .find_at(haystack, start)
+                    .map(|matched| (matched.start(), matched.end())),
+                "start={start}"
+            );
+            assert_eq!(
+                fre.shortest_match_at(haystack, start, SearchLimits::unlimited())
+                    .unwrap()
+                    .0,
+                upstream.shortest_match_at(haystack, start),
+                "start={start}"
+            );
+        }
     }
 
     #[test]
@@ -6937,6 +7301,33 @@ mod tests {
             write!(pattern, r"\x{byte:02X}").unwrap();
         }
         pattern.push_str("]+");
+        for &byte in suffix {
+            write!(pattern, r"\x{byte:02X}").unwrap();
+        }
+        if end {
+            pattern.push_str(r"\z");
+        }
+        pattern.push(')');
+        pattern
+    }
+
+    fn required_repeated_pattern(
+        class: &[u8],
+        quantifier: &str,
+        suffix: &[u8],
+        start: bool,
+        end: bool,
+    ) -> String {
+        let mut pattern = String::from("(?-u:");
+        if start {
+            pattern.push_str(r"\A");
+        }
+        pattern.push('[');
+        for &byte in class {
+            write!(pattern, r"\x{byte:02X}").unwrap();
+        }
+        pattern.push(']');
+        pattern.push_str(quantifier);
         for &byte in suffix {
             write!(pattern, r"\x{byte:02X}").unwrap();
         }
