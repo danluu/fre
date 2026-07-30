@@ -16,7 +16,7 @@ fn image(literal: &[u8], backend: SearchBackendPolicy) -> fre_jit_aarch64::Nativ
 }
 
 #[test]
-fn v8_v12_v13_and_explicit_tag21_emit_deterministic_strict_elf_objects() {
+fn v8_v12_v13_v15_and_explicit_tag21_emit_deterministic_strict_elf_objects() {
     for (literal, backend, version) in [
         (
             b"needle".as_slice(),
@@ -37,6 +37,11 @@ fn v8_v12_v13_and_explicit_tag21_emit_deterministic_strict_elf_objects() {
             b"needle".as_slice(),
             SearchBackendPolicy::AsimdV13,
             BackendVersion::SEARCH_V13,
+        ),
+        (
+            b"phase-unique-15!".as_slice(),
+            SearchBackendPolicy::AsimdV15,
+            BackendVersion::SEARCH_V15,
         ),
     ] {
         let image = image(literal, backend);

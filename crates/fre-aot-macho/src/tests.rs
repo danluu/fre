@@ -628,12 +628,25 @@ fn search_object_has_the_distinct_five_argument_contract() {
 }
 
 #[test]
-fn search_v12_v13_objects_are_deterministic_inspectable_and_inert() {
-    for (policy, version) in [
-        (SearchBackendPolicy::AsimdV12, BackendVersion::SEARCH_V12.0),
-        (SearchBackendPolicy::AsimdV13, BackendVersion::SEARCH_V13.0),
+fn search_v12_v13_v15_objects_are_deterministic_inspectable_and_inert() {
+    for (literal, policy, version) in [
+        (
+            b"needle".as_slice(),
+            SearchBackendPolicy::AsimdV12,
+            BackendVersion::SEARCH_V12.0,
+        ),
+        (
+            b"needle".as_slice(),
+            SearchBackendPolicy::AsimdV13,
+            BackendVersion::SEARCH_V13.0,
+        ),
+        (
+            b"phase-unique-15!".as_slice(),
+            SearchBackendPolicy::AsimdV15,
+            BackendVersion::SEARCH_V15.0,
+        ),
     ] {
-        let image = search_image_with_backend(b"needle", policy);
+        let image = search_image_with_backend(literal, policy);
         let binding = BindingIdentity::new([0x6b; 32]).expect("nonzero test binding");
         let first = emit_search_object(&image, binding, ObjectLimits::default())
             .expect("first candidate Mach-O object");

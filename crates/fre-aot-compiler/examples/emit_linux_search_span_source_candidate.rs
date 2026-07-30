@@ -233,7 +233,7 @@ fn main() -> Result<(), DynError> {
 
 fn parse_request() -> Result<Request, DynError> {
     const USAGE: &str = "usage: emit_linux_search_span_source_candidate \
-        OUTPUT_DIRECTORY v8|v9|v10|tag21 qualification|production ROW_SELECTOR";
+        OUTPUT_DIRECTORY v8|v9|v10|v12|v13|v15|tag21 qualification|production ROW_SELECTOR";
 
     let mut arguments = std::env::args_os();
     let _program = arguments.next();
@@ -246,6 +246,9 @@ fn parse_request() -> Result<Request, DynError> {
         Some("v8") => LinuxAarch64SearchBackendV1::AsimdV8,
         Some("v9") => LinuxAarch64SearchBackendV1::AsimdV9,
         Some("v10") => LinuxAarch64SearchBackendV1::AsimdV10,
+        Some("v12") => LinuxAarch64SearchBackendV1::AsimdV12,
+        Some("v13") => LinuxAarch64SearchBackendV1::AsimdV13,
+        Some("v15") => LinuxAarch64SearchBackendV1::AsimdV15,
         Some("tag21") => LinuxAarch64SearchBackendV1::Sve2Fixed16Tag21Vl16,
         _ => return Err(invalid(USAGE).into()),
     };
@@ -1045,6 +1048,9 @@ const fn backend_name(backend: LinuxAarch64SearchBackendV1) -> &'static str {
         LinuxAarch64SearchBackendV1::AsimdV8 => "v8-asimd",
         LinuxAarch64SearchBackendV1::AsimdV9 => "v9-asimd",
         LinuxAarch64SearchBackendV1::AsimdV10 => "v10-asimd",
+        LinuxAarch64SearchBackendV1::AsimdV12 => "v12-asimd",
+        LinuxAarch64SearchBackendV1::AsimdV13 => "v13-asimd",
+        LinuxAarch64SearchBackendV1::AsimdV15 => "v15-asimd-phase-unique",
         LinuxAarch64SearchBackendV1::Sve2Fixed16Tag21Vl16 => "tag21-sve2-fixed16",
     }
 }

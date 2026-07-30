@@ -291,50 +291,53 @@ fn assert_linked_bytes(section: LinkedSection, address: u64, expected: &[u8], li
 }
 
 #[test]
-fn apple_tools_link_and_execute_inert_search_v13_object() {
-    let program =
-        build_exact_literal::<Span>(b"needle", AnchorFlags::default(), ValidateLimits::default())
-            .expect("Search V13 program");
+fn apple_tools_link_and_execute_inert_search_v15_object() {
+    let program = build_exact_literal::<Span>(
+        b"phase-unique-15!",
+        AnchorFlags::default(),
+        ValidateLimits::default(),
+    )
+    .expect("Search V15 program");
     let image = emit_with_backend(
         &program,
-        SearchBackendPolicy::AsimdV13,
+        SearchBackendPolicy::AsimdV15,
         EmitLimits::default(),
     )
-    .expect("Search V13 image");
+    .expect("Search V15 image");
     let object = emit_search_object(
         &image,
         BindingIdentity::new([0x26; 32]).expect("nonzero test binding"),
         ObjectLimits::default(),
     )
-    .expect("Search V13 Mach-O object");
+    .expect("Search V15 Mach-O object");
     let inspection =
-        inspect_object(object.as_bytes(), ObjectLimits::default()).expect("inspect V13 object");
+        inspect_object(object.as_bytes(), ObjectLimits::default()).expect("inspect V15 object");
     assert_eq!(
         inspection.metadata().backend_version(),
-        BackendVersion::SEARCH_V13.0
+        BackendVersion::SEARCH_V15.0
     );
 
     let directory = PrivateDirectory::new();
-    let object_path = directory.path().join("search_v13.o");
-    let header_path = directory.path().join("fre_aot_search_v13.h");
-    let driver_path = directory.path().join("search_v13_driver.c");
-    let driver_object_path = directory.path().join("search_v13_driver.o");
-    let executable_path = directory.path().join("search_v13_driver");
+    let object_path = directory.path().join("search_v15.o");
+    let header_path = directory.path().join("fre_aot_search_v15.h");
+    let driver_path = directory.path().join("search_v15_driver.c");
+    let driver_object_path = directory.path().join("search_v15_driver.o");
+    let executable_path = directory.path().join("search_v15_driver");
     write_new(&object_path, object.as_bytes());
     write_new(&header_path, generated_header(&object).as_bytes());
     write_new(
         &driver_path,
-        br#"#include "fre_aot_search_v13.h"
+        br#"#include "fre_aot_search_v15.h"
 
 int main(void) {
-    static const uint8_t haystack[] = "xxneedleyy";
+    static const uint8_t haystack[] = "xxphase-unique-15!yy";
     struct fre_aot_search_result_v1 result = {UINT64_MAX, UINT64_MAX};
     uint64_t status = FRE_AOT_SELECTED_ENTRY(
         haystack, sizeof(haystack) - 1u, 0u, sizeof(haystack) - 1u, &result);
-    if (status != 1u || result.start != 2u || result.end != 8u) {
+    if (status != 1u || result.start != 2u || result.end != 18u) {
         return 40;
     }
-    if (FRE_AOT_SELECTED_METADATA.backend_version != UINT16_C(26) ||
+    if (FRE_AOT_SELECTED_METADATA.backend_version != UINT16_C(28) ||
         FRE_AOT_SELECTED_METADATA.abi_kind != FRE_AOT_ABI_SEARCH_V1) {
         return 41;
     }
@@ -351,10 +354,10 @@ int main(void) {
         .arg("-o")
         .arg(&driver_object_path)
         .output()
-        .expect("compile Search V13 driver");
+        .expect("compile Search V15 driver");
     assert!(
         compile.status.success(),
-        "clang rejected Search V13 driver: {}",
+        "clang rejected Search V15 driver: {}",
         String::from_utf8_lossy(&compile.stderr)
     );
     let link = Command::new("/usr/bin/clang")
@@ -367,18 +370,18 @@ int main(void) {
         .arg("-o")
         .arg(&executable_path)
         .output()
-        .expect("link Search V13 driver");
+        .expect("link Search V15 driver");
     assert!(
         link.status.success(),
-        "clang rejected Search V13 object: {}",
+        "clang rejected Search V15 object: {}",
         String::from_utf8_lossy(&link.stderr)
     );
     let execution = Command::new(&executable_path)
         .output()
-        .expect("execute linked Search V13 object");
+        .expect("execute linked Search V15 object");
     assert!(
         execution.status.success(),
-        "linked Search V13 failed: status={:?} stderr={}",
+        "linked Search V15 failed: status={:?} stderr={}",
         execution.status.code(),
         String::from_utf8_lossy(&execution.stderr)
     );
