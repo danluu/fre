@@ -37,6 +37,33 @@ TIMED_ROWS = 3_078
 UNIQUE_LITERALS = 922
 ELIGIBLE_LITERALS = 808
 INELIGIBLE_LITERALS = 114
+PLAN_SHA256 = (
+    "84230b412df4572a8d010ee93dc219e9d9db707f7782909d5efee70d9a1d929f"
+)
+PLAN_PAYLOAD_SHA256 = (
+    "e569e9079c81511c3c9707a83fe9bbe9b9ce2d4362ae436e2587d3c32ec7e2d7"
+)
+FULL_FILE_SHA256 = (
+    "cf20fffc3cf3edea3994a627e6c254dba5b14aea8be2ab2017306c4d4c40ffa7"
+)
+TIMED_FILE_SHA256 = (
+    "0844b3c566959142fc32a8232bee0660b3c675a04622d3b79ee39e395756994f"
+)
+SUMMARY_FILE_SHA256 = (
+    "5fa4bb549489b69ce8de989f3919b8e73d47b295e804d9449d1e9f54e6da347e"
+)
+OBJECT_FILE_SHA256 = (
+    "90b9eb70dff30e36901b86ecff34ba91938f27afa155ebb17f6daa33d3baca2c"
+)
+OBJECT_PAYLOAD_SHA256 = (
+    "772d7e03b9c2f1d2ef7ccf40ef248e10f46c66153d08ba686351bf580c49c6cd"
+)
+DISPOSITION_FILE_SHA256 = (
+    "a6204205fcfd87faf8bf8d6c2a5c53859ad68e81979ba8e47626afbabdd4ee4d"
+)
+DISPOSITION_PAYLOAD_SHA256 = (
+    "b4855d3d4cfa53cc60164c8f9adc5e70511c986831a84d401043ee121b3bef88"
+)
 PROJECTION_DOMAIN = b"FRE-SEARCH-TAG29-TOPOLOGY-PROJECTION\0\x01"
 ROW_DOMAIN = b"FRE-SEARCH-TAG29-TOPOLOGY-ROW\0\x01"
 CANDIDATE_DOMAIN = b"FRE-SEARCH-TAG29-TOPOLOGY-CANDIDATE\0\x01"
@@ -390,19 +417,43 @@ def main() -> None:
         len(sys.argv) == 2,
         "usage: validate_qualification_plan.py QUALIFICATION_DIRECTORY",
     )
-    root = Path(sys.argv[1]).resolve(strict=True)
+    supplied_root = Path(sys.argv[1])
+    supplied_status = supplied_root.lstat()
+    require(
+        stat.S_ISDIR(supplied_status.st_mode) and not supplied_root.is_symlink(),
+        "qualification root must be one real directory",
+    )
+    root = supplied_root.resolve(strict=True)
     plan_path = root / "qualification-plan.json"
-    plan = json.loads(regular_file(plan_path))
+    plan_bytes = regular_file(plan_path)
+    plan = json.loads(plan_bytes)
     require(
         isinstance(plan, dict)
         and set(plan) == {"schema", "payload_sha256", "payload"}
         and plan["schema"] == PLAN_SCHEMA
+        and sha256(plan_bytes) == PLAN_SHA256
+        and plan["payload_sha256"] == PLAN_PAYLOAD_SHA256
         and canonical_sha(plan["payload"]) == plan["payload_sha256"],
         "qualification plan envelope changed",
     )
     payload = plan["payload"]
     require(
-        payload["freeze_sha256"] == FREEZE_SHA256
+        set(payload)
+        == {
+            "freeze_sha256",
+            "generator_sha256",
+            "selector_contract_sha256",
+            "inputs",
+            "backend",
+            "hosts",
+            "full_projection",
+            "timed_projection",
+            "projection_summary",
+            "object_candidates",
+            "literal_dispositions",
+            "execution",
+        }
+        and payload["freeze_sha256"] == FREEZE_SHA256
         and payload["generator_sha256"] == GENERATOR_SHA256
         and payload["selector_contract_sha256"] == SELECTOR_SHA256
         and payload["inputs"]
@@ -459,30 +510,62 @@ def main() -> None:
     )
     full_receipt = payload["full_projection"]
     timed_receipt = payload["timed_projection"]
-    full_path = root / full_receipt["path"]
-    timed_path = root / timed_receipt["path"]
     require(
-        canonical_relative(full_receipt["path"])
-        and canonical_relative(timed_receipt["path"])
-        and full_receipt["rows"] == FULL_ROWS
-        and full_receipt["projection_digest"] == FULL_PROJECTION_DIGEST
-        and file_sha(full_path) == full_receipt["file_sha256"]
-        and timed_receipt["rows"] == TIMED_ROWS
-        and timed_receipt["projection_digest"] == TIMED_PROJECTION_DIGEST
-        and file_sha(timed_path) == timed_receipt["file_sha256"],
+        full_receipt
+        == {
+            "path": "full-projection.ndjson",
+            "rows": FULL_ROWS,
+            "projection_digest": FULL_PROJECTION_DIGEST,
+            "file_sha256": FULL_FILE_SHA256,
+        }
+        and timed_receipt
+        == {
+            "path": "timed-projection.ndjson",
+            "rows": TIMED_ROWS,
+            "projection_digest": TIMED_PROJECTION_DIGEST,
+            "file_sha256": TIMED_FILE_SHA256,
+        },
         "projection file receipt changed",
+    )
+    full_path = root / "full-projection.ndjson"
+    timed_path = root / "timed-projection.ndjson"
+    require(
+        file_sha(full_path) == FULL_FILE_SHA256
+        and file_sha(timed_path) == TIMED_FILE_SHA256,
+        "projection file bytes changed",
     )
     object_receipt = payload["object_candidates"]
     disposition_receipt = payload["literal_dispositions"]
+    require(
+        object_receipt
+        == {
+            "path": "object-candidates.json",
+            "schema": OBJECT_SCHEMA,
+            "file_sha256": OBJECT_FILE_SHA256,
+            "payload_sha256": OBJECT_PAYLOAD_SHA256,
+            "candidate_count": ELIGIBLE_LITERALS,
+        }
+        and disposition_receipt
+        == {
+            "path": "literal-dispositions.json",
+            "schema": DISPOSITION_SCHEMA,
+            "file_sha256": DISPOSITION_FILE_SHA256,
+            "payload_sha256": DISPOSITION_PAYLOAD_SHA256,
+            "literal_count": UNIQUE_LITERALS,
+            "eligible_literal_count": ELIGIBLE_LITERALS,
+            "ineligible_literal_count": INELIGIBLE_LITERALS,
+        },
+        "object or disposition receipt fields changed",
+    )
     object_manifest = parse_envelope(
-        root / object_receipt["path"],
+        root / "object-candidates.json",
         OBJECT_SCHEMA,
-        object_receipt["file_sha256"],
+        OBJECT_FILE_SHA256,
     )
     dispositions = parse_envelope(
-        root / disposition_receipt["path"],
+        root / "literal-dispositions.json",
         DISPOSITION_SCHEMA,
-        disposition_receipt["file_sha256"],
+        DISPOSITION_FILE_SHA256,
     )
     require(
         object_manifest["payload_sha256"]
@@ -623,17 +706,33 @@ def main() -> None:
         if row["selector_eligible"]
     }
     require(
-        derived_objects == expected_objects,
+        derived_objects == expected_objects
+        and list(seen_literals.values()) == disposition_rows
+        and [
+            {
+                "semantic_candidate_sha256": identity,
+                "literal_hex": row["literal_hex"],
+                "literal_sha256": row["literal_sha256"],
+                "literal_bytes": row["literal_bytes"],
+            }
+            for identity, row in seen_literals.items()
+            if row["selector_eligible"]
+        ]
+        == object_candidates,
         "object candidate set differs from eligible literal set",
     )
     summary_receipt = payload["projection_summary"]
     require(
-        canonical_relative(summary_receipt["path"])
-        and file_sha(root / summary_receipt["path"])
-        == summary_receipt["file_sha256"],
+        summary_receipt
+        == {
+            "path": "projection-summary.json",
+            "file_sha256": SUMMARY_FILE_SHA256,
+        }
+        and file_sha(root / "projection-summary.json")
+        == SUMMARY_FILE_SHA256,
         "projection summary file receipt changed",
     )
-    summary = json.loads(regular_file(root / summary_receipt["path"]))
+    summary = json.loads(regular_file(root / "projection-summary.json"))
     require(
         summary["schema"]
         == "fre.aot.search-tag29-topology-freeze-summary.v1"
