@@ -7100,11 +7100,12 @@ const fn condition_code(condition: Condition) -> u32 {
 #[cfg(test)]
 mod encoding_tests {
     use super::{
-        BranchKind, EmitError, MAX_REPEATED_CONFIRM_BYTES, RelocationKind, candidate_byte_pair,
-        candidate_ranked_verification_offsets, candidate_ranked_verification_offsets_v2,
-        candidate_ranked_verification_offsets_v3, candidate_verification_offset, resolve_word,
-        signed_range,
+        Assembler, BranchKind, Capacities, EmitError, MAX_REPEATED_CONFIRM_BYTES, RelocationKind,
+        WorkMeter, candidate_byte_pair, candidate_ranked_verification_offsets,
+        candidate_ranked_verification_offsets_v2, candidate_ranked_verification_offsets_v3,
+        candidate_verification_offset, emit_sparse_lane_mask_to, resolve_word, signed_range,
     };
+    use crate::{DecodedInstruction, EmitLimits, decode};
 
     #[test]
     fn candidate_byte_pair_matches_the_pinned_frequency_ranker() {
@@ -7166,6 +7167,161 @@ mod encoding_tests {
         assert_eq!(signed_range(19), (-262_144, 262_143));
         assert_eq!(signed_range(21), (-1_048_576, 1_048_575));
         assert_eq!(signed_range(26), (-33_554_432, 33_554_431));
+    }
+
+    #[test]
+    fn saved_mask_sparse_conversion_is_exhaustive_and_exactly_twelve_instructions() {
+        for boolean_mask in 0_u32..=u32::from(u16::MAX) {
+            let boolean_mask = u16::try_from(boolean_mask).expect("bounded mask");
+            assert_eq!(
+                model_sparse_mask_conversion(boolean_mask),
+                reference_sparse_mask(boolean_mask),
+                "boolean mask {boolean_mask:#06x}"
+            );
+        }
+
+        let mut assembler = Assembler::new(
+            EmitLimits::default(),
+            Capacities {
+                code: 12 * 4,
+                labels: 0,
+                relocations: 0,
+            },
+            WorkMeter::new(u64::MAX),
+        )
+        .expect("bounded primitive assembler");
+        for (source, destination) in [(0, 0), (2, 1), (4, 2), (6, 3)] {
+            emit_sparse_lane_mask_to(&mut assembler, source, 16, destination)
+                .expect("saved-mask sparse conversion");
+        }
+        let code = assembler.finalize(0).expect("primitive finalization").code;
+        let decoded = decode(&code).expect("primitive decode");
+        assert_eq!(decoded.len(), 12);
+        for (block, (source, destination)) in
+            [(0, 0), (2, 1), (4, 2), (6, 3)].into_iter().enumerate()
+        {
+            assert_eq!(
+                &decoded[block * 3..block * 3 + 3],
+                &[
+                    DecodedInstruction::ShiftRightNarrowHalfwordsToBytes8 {
+                        destination: 16,
+                        source,
+                    },
+                    DecodedInstruction::MoveVectorDoubleTo64 {
+                        destination,
+                        source: 16,
+                    },
+                    DecodedInstruction::AndRegister64 {
+                        destination,
+                        left: destination,
+                        right: 14,
+                    },
+                ]
+            );
+        }
+
+        // A conventional compact u16x4 movemask needs, per source, one
+        // weight AND, three widening pairwise adds, and three narrows, then
+        // three lane inserts and one FMOV: 4*7 + 4 = 32 instructions.
+        const COMPACT_U16X4_INSTRUCTIONS: usize = 32;
+        assert!(decoded.len() < COMPACT_U16X4_INSTRUCTIONS);
+    }
+
+    #[test]
+    fn saved_mask_destructive_queue_matches_four_ordered_blocks() {
+        let cases = [
+            [0_u16; 4],
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1],
+            [1 << 15, 0, 0, 0],
+            [0, 1 << 15, 0, 0],
+            [0, 0, 1 << 15, 0],
+            [0, 0, 0, 1 << 15],
+            [u16::MAX; 4],
+            [0x8001, 0, 0x8421, 0x0180],
+        ];
+        for masks in cases {
+            assert_saved_mask_queue(masks);
+        }
+
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        for _ in 0..65_536 {
+            let mut masks = [0_u16; 4];
+            for mask in &mut masks {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                *mask = u16::try_from(state & u64::from(u16::MAX)).expect("masked to u16");
+            }
+            assert_saved_mask_queue(masks);
+        }
+    }
+
+    fn model_sparse_mask_conversion(boolean_mask: u16) -> u64 {
+        let mut source = [0_u8; 16];
+        for (lane, byte) in source.iter_mut().enumerate() {
+            if boolean_mask & (1_u16 << lane) != 0 {
+                *byte = u8::MAX;
+            }
+        }
+        let mut narrowed = [0_u8; 8];
+        for (lane_pair, byte) in narrowed.iter_mut().enumerate() {
+            let halfword = u16::from_le_bytes([source[lane_pair * 2], source[lane_pair * 2 + 1]]);
+            *byte = u8::try_from((halfword >> 4) & 0xff).expect("narrow byte");
+        }
+        u64::from_le_bytes(narrowed) & 0x1111_1111_1111_1111
+    }
+
+    fn reference_sparse_mask(boolean_mask: u16) -> u64 {
+        (0..16).fold(0_u64, |sparse, lane| {
+            if boolean_mask & (1_u16 << lane) == 0 {
+                sparse
+            } else {
+                sparse | (1_u64 << (lane * 4))
+            }
+        })
+    }
+
+    fn assert_saved_mask_queue(boolean_masks: [u16; 4]) {
+        let mut queue = boolean_masks.map(reference_sparse_mask);
+        let mut current = queue[0];
+        let mut block_base = 0_u8;
+        let mut blocks_remaining = 4_u8;
+        let mut actual = [0_u8; 64];
+        let mut actual_len = 0_usize;
+        loop {
+            while current != 0 {
+                let sparse_lane = u8::try_from(current.trailing_zeros()).expect("u64 bit index");
+                assert_eq!(sparse_lane % 4, 0);
+                actual[actual_len] = block_base + sparse_lane / 4;
+                actual_len += 1;
+                current &= current - 1;
+            }
+            blocks_remaining -= 1;
+            if blocks_remaining == 0 {
+                break;
+            }
+            block_base += 16;
+            current = queue[1];
+            queue[1] = queue[2];
+            queue[2] = queue[3];
+        }
+
+        let mut expected = [0_u8; 64];
+        let mut expected_len = 0_usize;
+        for (block, mask) in boolean_masks.into_iter().enumerate() {
+            for lane in 0..16 {
+                if mask & (1_u16 << lane) != 0 {
+                    expected[expected_len] =
+                        u8::try_from(block * 16 + lane).expect("bounded candidate");
+                    expected_len += 1;
+                }
+            }
+        }
+        assert_eq!(actual_len, expected_len);
+        assert_eq!(actual[..actual_len], expected[..expected_len]);
     }
 
     #[test]

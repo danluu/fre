@@ -8185,6 +8185,45 @@ fn v18_bounded_deterministic_fuzz_matches_the_kir_oracle() {
 }
 
 #[test]
+fn v17_post_window_setup_leaves_x1_x2_x3_available_for_saved_masks() {
+    let literal = b"0123456789abcdef";
+    let program =
+        build_exact_literal::<Span>(literal, AnchorFlags::default(), ValidateLimits::default())
+            .expect("V17 liveness IR");
+    let image = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV17,
+        EmitLimits::default(),
+    )
+    .expect("V17 liveness image");
+    let decoded = decode(image.code()).expect("V17 liveness decode");
+    let window_setup = decoded
+        .iter()
+        .position(|instruction| {
+            *instruction
+                == DecodedInstruction::MoveRegister64 {
+                    destination: 5,
+                    source: 2,
+                }
+        })
+        .expect("unanchored candidate cursor setup");
+    for register in [1, 2, 3] {
+        assert!(
+            decoded[window_setup + 1..]
+                .iter()
+                .all(|instruction| !instruction.uses_gpr(register)),
+            "X{register} must be dead after X5/X6 capture for V19 saved masks"
+        );
+    }
+    assert!(
+        decoded
+            .iter()
+            .all(|instruction| instruction.written_gpr() != Some(4)),
+        "the search result pointer remains immutable"
+    );
+}
+
+#[test]
 fn v13_adaptive_recovery_decoded_edges_cover_zero_one_and_max_remaining_columns() {
     for (width, expected_columns) in [(5_usize, 0_usize), (6, 1), (32, 27)] {
         let literal = vec![b'a'; width];
