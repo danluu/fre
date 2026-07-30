@@ -643,7 +643,7 @@ fn execute_v3(
             {
                 state.set_max_start();
             } else {
-                let result = if destination == X16
+                let result = if matches!(destination, X9 | X16)
                     && immediate == 1
                     && matches!(source_value, AbstractValueV3::CandidateMask { .. })
                 {
@@ -667,7 +667,7 @@ fn execute_v3(
                 (
                     X6,
                     X6,
-                    X16,
+                    X9 | X16,
                     AbstractValueV3::CandidateMask { nonempty: true, .. },
                     AbstractValueV3::CandidateMaskMinusOne {
                         source_register: X6,
