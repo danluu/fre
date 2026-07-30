@@ -5461,12 +5461,11 @@ fn next_small_start_candidate(
         })
         .transpose()?
         .unwrap_or(admitted);
-    meter.charge(
+    let scanned_work =
         u64::try_from(scanned).map_err(|_| SearchError::ArithmeticOverflow {
             computation: "small start-scanner work",
-        })?,
-        position,
-    )?;
+        })?;
+    meter.charge_admitted(scanned_work);
 
     if let Some(relative) = relative {
         return position
@@ -5523,7 +5522,7 @@ fn next_range_start_candidate(
     // full-byte classifier it replaces.
     let block_work = u64::try_from(BYTE_SET_BLOCK_BYTES).expect("range block width fits in u64");
     while end.saturating_sub(position) >= BYTE_SET_BLOCK_BYTES && meter.remaining() >= block_work {
-        meter.charge(block_work, position)?;
+        meter.charge_admitted(block_work);
         let block_end =
             position
                 .checked_add(BYTE_SET_BLOCK_BYTES)
@@ -5595,7 +5594,7 @@ fn next_set_start_candidate(
     let block_work =
         u64::try_from(BYTE_SET_BLOCK_BYTES).expect("classifier block width fits in u64");
     while end.saturating_sub(position) >= BYTE_SET_BLOCK_BYTES && meter.remaining() >= block_work {
-        meter.charge(block_work, position)?;
+        meter.charge_admitted(block_work);
         let block_end =
             position
                 .checked_add(BYTE_SET_BLOCK_BYTES)
@@ -5647,10 +5646,9 @@ fn next_ascii_start_candidate(
     while end.saturating_sub(position) >= ASCII_WIDE_BYTES
         && meter.remaining() >= u64::try_from(ASCII_WIDE_BYTES).expect("classifier width fits u64")
     {
-        meter.charge(
+        meter.charge_admitted(
             u64::try_from(ASCII_WIDE_BYTES).expect("classifier width fits u64"),
-            position,
-        )?;
+        );
         let block_end =
             position
                 .checked_add(ASCII_WIDE_BYTES)
@@ -5676,10 +5674,9 @@ fn next_ascii_start_candidate(
         && meter.remaining()
             >= u64::try_from(ASCII_NARROW_BYTES).expect("classifier width fits u64")
     {
-        meter.charge(
+        meter.charge_admitted(
             u64::try_from(ASCII_NARROW_BYTES).expect("classifier width fits u64"),
-            position,
-        )?;
+        );
         let block_end =
             position
                 .checked_add(ASCII_NARROW_BYTES)
