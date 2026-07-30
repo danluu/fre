@@ -28,6 +28,19 @@ type DynError = Box<dyn Error>;
 const FIXTURE_MANIFEST_SHA256: &str =
     "b979ed327db7e9623bccba1ef775d1957b7323c8b30edb44f40593176f52b44a";
 const FIXTURE_SCHEMA: &str = "fre.aot.external-regex-1.12.4-development-fixtures.v2";
+const APPLICATION_FIXTURE_SCHEMA_V2: &str = "fre.aot.search-ripgrep-application-fixtures.v2";
+const APPLICATION_FIXTURE_MANIFEST_SHA256_V2: &str =
+    "b20181470c604d01d2ec236259293cfcb6e5eff145bcd3e4daa91554c8cebcca";
+const APPLICATION_OBJECT_MANIFEST_SCHEMA_V1: &str =
+    "fre.aot.search-tag29-application-object-candidates.v1";
+const APPLICATION_OBJECT_MANIFEST_SHA256_V1: &str =
+    "2e6612dc25e1186e0dd78597f045a4ece6ecc8dafcc2270cacc445be8753aff4";
+const UNRESOLVED_BACKEND_PROVENANCE: &str = "required-unresolved-input";
+const TAG29_BACKEND_PROVENANCE: &str = "required-tag29-frozen-input";
+const TAG29_BACKEND_TAG: u16 = 29;
+const TAG29_BACKEND_NAME: &str = "AsimdV16";
+const TAG29_MINIMUM_WINDOW_BYTES: usize = 4_093;
+const TAG29_PORTABLE_PREFIX_CANDIDATE_STARTS: usize = 256;
 const RESULT_SCHEMA: &str = "fre.aot.external-regex-1.12.4-static-search-results.v1";
 const TARGET_NS: u64 = 500_000_000;
 const MINIMUM_NS: u64 = 400_000_000;
@@ -79,6 +92,25 @@ struct AlignedFixture {
     storage: Vec<u8>,
     start: usize,
     row: FixtureRow,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FixtureBackendAuthority<'a> {
+    linked: bool,
+    fixture_manifest_schema: &'a str,
+    fixture_manifest_sha256: &'a str,
+    backend_tag: u16,
+    backend_name: &'a str,
+    family_selector: u16,
+    minimum_window_bytes: usize,
+    portable_prefix_candidate_starts: usize,
+    identity_sha256: &'a str,
+    runner_source_sha256: &'a str,
+    object_manifest_schema: &'a str,
+    object_manifest_sha256: &'a str,
+    plan_identity: &'a str,
+    analyzer_identity: &'a str,
+    evidence_identity: &'a str,
 }
 
 impl AlignedFixture {
@@ -591,9 +623,29 @@ fn load_manifest(root: &Path) -> Result<FixtureManifest, DynError> {
         manifest.payload_sha256.len() == 64,
         "fixture payload identity is malformed",
     )?;
+    let backend_authority = FixtureBackendAuthority {
+        linked: generated::LINKED,
+        fixture_manifest_schema: expected_schema,
+        fixture_manifest_sha256: expected_sha256,
+        backend_tag: generated::BACKEND_TAG,
+        backend_name: generated::BACKEND_NAME,
+        family_selector: generated::FAMILY_SELECTOR,
+        minimum_window_bytes: generated::MINIMUM_WINDOW_BYTES,
+        portable_prefix_candidate_starts: generated::PORTABLE_PREFIX_CANDIDATE_STARTS,
+        identity_sha256: generated::IDENTITY_SHA256,
+        runner_source_sha256: generated::RUNNER_SOURCE_SHA256,
+        object_manifest_schema: generated::OBJECT_CANDIDATE_MANIFEST_SCHEMA,
+        object_manifest_sha256: generated::OBJECT_CANDIDATE_MANIFEST_SHA256,
+        plan_identity: generated::PLAN_IDENTITY,
+        analyzer_identity: generated::ANALYZER_IDENTITY,
+        evidence_identity: generated::EVIDENCE_IDENTITY,
+    };
     require(
-        manifest.payload.backend_identity == "required-unresolved-input"
-            && !manifest.payload.timing_permitted,
+        fixture_backend_contract_is_admissible(
+            &manifest.payload.backend_identity,
+            manifest.payload.timing_permitted,
+            backend_authority,
+        ),
         "immutable fixture generator improperly granted backend/timing authority",
     )?;
     require(
@@ -625,6 +677,43 @@ fn load_manifest(root: &Path) -> Result<FixtureManifest, DynError> {
         "fixture row or linked-object cardinality differs",
     )?;
     Ok(manifest)
+}
+
+fn fixture_backend_contract_is_admissible(
+    fixture_backend_provenance: &str,
+    fixture_timing_permitted: bool,
+    authority: FixtureBackendAuthority<'_>,
+) -> bool {
+    if fixture_timing_permitted {
+        return false;
+    }
+    if fixture_backend_provenance == UNRESOLVED_BACKEND_PROVENANCE {
+        return true;
+    }
+    fixture_backend_provenance == TAG29_BACKEND_PROVENANCE
+        && authority.linked
+        && authority.fixture_manifest_schema == APPLICATION_FIXTURE_SCHEMA_V2
+        && authority.fixture_manifest_sha256 == APPLICATION_FIXTURE_MANIFEST_SHA256_V2
+        && authority.backend_tag == TAG29_BACKEND_TAG
+        && authority.backend_name == TAG29_BACKEND_NAME
+        && authority.family_selector > 0
+        && authority.minimum_window_bytes == TAG29_MINIMUM_WINDOW_BYTES
+        && authority.portable_prefix_candidate_starts == TAG29_PORTABLE_PREFIX_CANDIDATE_STARTS
+        && authority.object_manifest_schema == APPLICATION_OBJECT_MANIFEST_SCHEMA_V1
+        && authority.object_manifest_sha256 == APPLICATION_OBJECT_MANIFEST_SHA256_V1
+        && pinned_sha256(authority.identity_sha256)
+        && pinned_sha256(authority.runner_source_sha256)
+        && pinned_sha256(authority.plan_identity)
+        && pinned_sha256(authority.analyzer_identity)
+        && pinned_sha256(authority.evidence_identity)
+}
+
+fn pinned_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value != "0000000000000000000000000000000000000000000000000000000000000000"
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn load_fixture(root: &Path, row: &FixtureRow) -> Result<AlignedFixture, DynError> {
@@ -808,4 +897,118 @@ fn require(condition: bool, message: &str) -> Result<(), io::Error> {
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        APPLICATION_FIXTURE_MANIFEST_SHA256_V2, APPLICATION_FIXTURE_SCHEMA_V2,
+        APPLICATION_OBJECT_MANIFEST_SCHEMA_V1, APPLICATION_OBJECT_MANIFEST_SHA256_V1,
+        FixtureBackendAuthority, TAG29_BACKEND_PROVENANCE, UNRESOLVED_BACKEND_PROVENANCE,
+        fixture_backend_contract_is_admissible,
+    };
+
+    const PIN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn tag29_authority() -> FixtureBackendAuthority<'static> {
+        FixtureBackendAuthority {
+            linked: true,
+            fixture_manifest_schema: APPLICATION_FIXTURE_SCHEMA_V2,
+            fixture_manifest_sha256: APPLICATION_FIXTURE_MANIFEST_SHA256_V2,
+            backend_tag: 29,
+            backend_name: "AsimdV16",
+            family_selector: 17,
+            minimum_window_bytes: 4_093,
+            portable_prefix_candidate_starts: 256,
+            identity_sha256: PIN,
+            runner_source_sha256: PIN,
+            object_manifest_schema: APPLICATION_OBJECT_MANIFEST_SCHEMA_V1,
+            object_manifest_sha256: APPLICATION_OBJECT_MANIFEST_SHA256_V1,
+            plan_identity: PIN,
+            analyzer_identity: PIN,
+            evidence_identity: PIN,
+        }
+    }
+
+    #[test]
+    fn exact_application_provenance_requires_independent_tag29_authority() {
+        assert!(fixture_backend_contract_is_admissible(
+            TAG29_BACKEND_PROVENANCE,
+            false,
+            tag29_authority(),
+        ));
+    }
+
+    #[test]
+    fn application_fixture_label_cannot_select_or_authorize_a_backend() {
+        let mut authority = tag29_authority();
+        authority.backend_tag = 28;
+        assert!(!fixture_backend_contract_is_admissible(
+            TAG29_BACKEND_PROVENANCE,
+            false,
+            authority,
+        ));
+
+        authority = tag29_authority();
+        authority.backend_name = "unresolved";
+        assert!(!fixture_backend_contract_is_admissible(
+            TAG29_BACKEND_PROVENANCE,
+            false,
+            authority,
+        ));
+
+        authority = tag29_authority();
+        authority.identity_sha256 = "unresolved";
+        assert!(!fixture_backend_contract_is_admissible(
+            TAG29_BACKEND_PROVENANCE,
+            false,
+            authority,
+        ));
+
+        authority = tag29_authority();
+        authority.object_manifest_sha256 = PIN;
+        assert!(!fixture_backend_contract_is_admissible(
+            TAG29_BACKEND_PROVENANCE,
+            false,
+            authority,
+        ));
+
+        authority = tag29_authority();
+        authority.fixture_manifest_sha256 = PIN;
+        assert!(!fixture_backend_contract_is_admissible(
+            TAG29_BACKEND_PROVENANCE,
+            false,
+            authority,
+        ));
+
+        assert!(!fixture_backend_contract_is_admissible(
+            TAG29_BACKEND_PROVENANCE,
+            true,
+            tag29_authority(),
+        ));
+    }
+
+    #[test]
+    fn unresolved_fixture_provenance_remains_backend_neutral() {
+        let mut authority = tag29_authority();
+        authority.linked = false;
+        authority.backend_tag = 0;
+        authority.backend_name = "unresolved";
+        authority.identity_sha256 = "unresolved";
+        assert!(fixture_backend_contract_is_admissible(
+            UNRESOLVED_BACKEND_PROVENANCE,
+            false,
+            authority,
+        ));
+        assert!(!fixture_backend_contract_is_admissible(
+            "fixture-selected-backend",
+            false,
+            authority,
+        ));
+        assert!(!fixture_backend_contract_is_admissible(
+            UNRESOLVED_BACKEND_PROVENANCE,
+            true,
+            authority,
+        ));
+    }
 }

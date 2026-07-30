@@ -54,6 +54,17 @@ already authenticated four-candidate fixture manifest and retains its prior
 raw-UTF-8/Unicode source construction. The source-construction mode is emitted
 into the build receipt and generated bindings.
 
+Application fixture manifests retain their frozen
+`required-tag29-frozen-input` backend provenance label, but that label has no
+backend-selection authority. At runtime the exact v2 application fixture
+manifest is admissible only when the separately generated, linked controller
+bindings prove the exact five-object application manifest, backend tag 29 /
+`AsimdV16`, the frozen 4,093-byte window and 256-start portable prefix, a
+nonzero private family selector, and nonzero whole-identity, runner-source,
+plan, analyzer, and evidence SHA-256 identities. A wrong or unresolved backend
+with the same fixture label is refused. `required-unresolved-input` remains
+backend-neutral fixture provenance; neither provenance value can grant timing.
+
 `build.rs` emits and passes two exact object paths per manifest candidate to
 the final link: one implementation object and one receipt-bound family-glue
 object. Mach-O links with immutable text/constant segment protections and
