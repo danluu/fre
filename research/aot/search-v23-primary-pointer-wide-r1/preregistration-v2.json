@@ -1,0 +1,52 @@
+{
+  "schema": "fre-search-aot-candidate-preregistration-amendment-v1",
+  "candidate": {
+    "name": "v23-primary-pointer-wide-r1",
+    "planned_backend_version": 36,
+    "planned_backend_policy": "AsimdV23",
+    "planned_wire_magic": "FREA64\\u0000\\u0024"
+  },
+  "supersedes_before_measurement": {
+    "path": "research/aot/search-v23-primary-pointer-wide-r1/preregistration-v1.json",
+    "sha256": "5a25918eb54c085b2beebbe15d5429f8bf78e224dcf8fd71d521669591c2c12e",
+    "scope": "Only fresh_performance_gate.strict_acceptance is replaced. Every workload, artifact, topology, scenario, window, width, repetition, execution order, correctness requirement, implementation constraint, held-out rule, and terminal one-shot rule remains frozen by v1.",
+    "timing_status_at_amendment": "NO_V23_BUILD_EXECUTION_OR_TIMING_HAS_OCCURRED"
+  },
+  "authority": {
+    "source": "explicit user direction in the active development session",
+    "direction": "Relax the zero-tolerance broad-slice performance gate somewhat.",
+    "recorded_before_candidate_timing": true,
+    "reason": "A 1.0000 point-estimate ceiling is tighter than the measurement precision and rejects noise-sized tradeoffs despite a large general speedup."
+  },
+  "replacement_strict_acceptance": {
+    "overall_candidate_over_v17_geomean_lte": 0.8,
+    "every_broad_stratum_candidate_over_v17_geomean_lte": 1.01,
+    "broad_strata": [
+      "scenario",
+      "topology",
+      "outcome",
+      "window",
+      "width"
+    ],
+    "every_individual_candidate_over_v17_ratio_lte": 1.05,
+    "semantics": "all equal",
+    "artifact_pairs": "one frozen V17/V23 pair per topology and width"
+  },
+  "interpretation": {
+    "required_general_win": "The overall gate still requires at least a 20 percent runtime reduction versus V17.",
+    "broad_tradeoff_budget": "A predefined broad slice may be at most 1 percent slower, separating a material regression from sub-percent measurement noise.",
+    "cell_guard": "No individual cell may exceed the existing 5 percent regression ceiling.",
+    "no_post_hoc_membership": "The exact 1,944-cell lattice and all aggregation memberships remain unchanged."
+  },
+  "immutable_predecessor_status": {
+    "v22_refusal_remains_terminal_under_its_original_gate": true,
+    "v22_is_not_reclassified_or_retested": true,
+    "v22_backend_tag_is_not_reused": true
+  },
+  "decision_rules": {
+    "runs": 1,
+    "on_failure": "Seal immutable refusal; do not retest or tune this identity.",
+    "on_success": "Require independent review and a fresh formal qualification identity before selection or deployment.",
+    "rebar_as_design_membership_threshold_or_gate_input": false
+  }
+}
