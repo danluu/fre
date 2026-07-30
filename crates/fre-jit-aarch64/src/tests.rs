@@ -4561,6 +4561,7 @@ fn explicit_search_backend_policy_selects_distinct_artifact_identities() {
         (SearchBackendPolicy::AsimdV18, BackendVersion::SEARCH_V18),
         (SearchBackendPolicy::AsimdV19, BackendVersion::SEARCH_V19),
         (SearchBackendPolicy::AsimdV20, BackendVersion::SEARCH_V20),
+        (SearchBackendPolicy::AsimdV21, BackendVersion::SEARCH_V21),
         (SearchBackendPolicy::Sve16, BackendVersion::SEARCH_SVE16_V1),
         (
             SearchBackendPolicy::Sve2Fixed16,
@@ -9251,6 +9252,463 @@ fn v20_every_width_and_window_shape_matches_the_kir_oracle() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the V21 contract keeps wire identity, decoded learned-column structure, relabel resistance, and mutation rejection in one reviewable gate"
+)]
+fn v21_current_group_learning_is_distinct_bounded_and_independently_audited() {
+    let literal = b"0123456789abcdef";
+    let program =
+        build_exact_literal::<Span>(literal, AnchorFlags::default(), ValidateLimits::default())
+            .expect("V21 structural IR");
+    let v20 = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV20,
+        EmitLimits::default(),
+    )
+    .expect("frozen V20 structural image");
+    let v21 = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV21,
+        EmitLimits::default(),
+    )
+    .expect("V21 structural image");
+    let report = audit(&v21).expect("independent V21 structural template");
+    assert_eq!(
+        (report.decode_passes, report.source_identity_rebuilds),
+        (1, 1)
+    );
+    assert_eq!(v21.backend_version(), BackendVersion::SEARCH_V21);
+    assert_eq!(
+        &v21.to_aot(AotLimits::default())
+            .expect("bounded V21 AOT")
+            .as_bytes()[..8],
+        b"FREA64\0\x22"
+    );
+    assert!(v21.code().len() <= 2_304);
+    assert_ne!(v21.artifact_identity(), v20.artifact_identity());
+
+    let v20_manifest = v20.search_manifest().expect("V20 structural manifest");
+    let v21_manifest = v21.search_manifest().expect("V21 structural manifest");
+    assert_eq!(
+        (
+            v21_manifest.primary_offset,
+            v21_manifest.secondary_offset,
+            v21_manifest.verification_offset,
+            v21_manifest.quaternary_offset,
+            v21_manifest.quinary_offset,
+        ),
+        (
+            v20_manifest.primary_offset,
+            v20_manifest.secondary_offset,
+            v20_manifest.verification_offset,
+            v20_manifest.quaternary_offset,
+            v20_manifest.quinary_offset,
+        ),
+        "V21 changes only current-group recovery after frozen V20 screening"
+    );
+
+    let decoded = decode(v21.code()).expect("V21 structural decode");
+    let learned_dup = decoded
+        .iter()
+        .position(|instruction| {
+            *instruction
+                == DecodedInstruction::DuplicateByte16 {
+                    destination: 24,
+                    source: 13,
+                }
+        })
+        .expect("V21 learned literal byte");
+    assert_eq!(
+        decoded[learned_dup + 1],
+        DecodedInstruction::AddRegister64 {
+            destination: 15,
+            left: 9,
+            right: 7,
+        }
+    );
+    assert_eq!(
+        decoded[learned_dup + 2],
+        DecodedInstruction::AddRegister64 {
+            destination: 15,
+            left: 15,
+            right: 11,
+        }
+    );
+    assert_eq!(
+        decoded[learned_dup + 3..learned_dup + 5],
+        [
+            DecodedInstruction::LoadVectorPair128 {
+                first_destination: 18,
+                second_destination: 19,
+                base: 15,
+                offset: 0,
+            },
+            DecodedInstruction::LoadVectorPair128 {
+                first_destination: 20,
+                second_destination: 21,
+                base: 15,
+                offset: 32,
+            },
+        ]
+    );
+    assert_eq!(
+        decoded[learned_dup + 5..learned_dup + 13]
+            .iter()
+            .filter(|instruction| {
+                matches!(
+                    instruction,
+                    DecodedInstruction::CompareEqualBytes16 { right: 24, .. }
+                )
+            })
+            .count(),
+        4
+    );
+    assert_eq!(
+        decoded[learned_dup + 5..learned_dup + 13]
+            .iter()
+            .filter(|instruction| matches!(instruction, DecodedInstruction::AndBytes16 { .. }))
+            .count(),
+        4
+    );
+
+    let mut bypassed_learned_column = v21.clone();
+    replace_test_decoded_at(
+        &mut bypassed_learned_column,
+        learned_dup,
+        DecodedInstruction::DuplicateByte16 {
+            destination: 24,
+            source: 11,
+        },
+    );
+    assert_resealed_search_rejected(
+        bypassed_learned_column,
+        "V21 learned literal source substitution",
+    );
+
+    let mut v21_as_v20 = v21.clone();
+    v21_as_v20.backend_version = BackendVersion::SEARCH_V20;
+    v21_as_v20
+        .search
+        .as_mut()
+        .expect("V21 manifest")
+        .backend_version = BackendVersion::SEARCH_V20;
+    assert_resealed_search_rejected(v21_as_v20, "V21 code resealed as V20");
+
+    let mut v20_as_v21 = v20;
+    v20_as_v21.backend_version = BackendVersion::SEARCH_V21;
+    v20_as_v21
+        .search
+        .as_mut()
+        .expect("V20 manifest")
+        .backend_version = BackendVersion::SEARCH_V21;
+    assert_resealed_search_rejected(v20_as_v21, "V20 code resealed as V21");
+}
+
+#[test]
+fn v21_first_survivor_and_learned_empty_restore_every_block_and_lane() {
+    let literal = [11_u8, 37, 63, 89, 115, 141, 167, 193, 219, 245, 17, 43, 69];
+    let program =
+        build_exact_literal::<Span>(&literal, AnchorFlags::default(), ValidateLimits::default())
+            .expect("V21 block/lane IR");
+    let image = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV21,
+        EmitLimits::default(),
+    )
+    .expect("V21 block/lane image");
+    audit(&image).expect("V21 block/lane audit");
+    let manifest = image.search_manifest().expect("V21 block/lane manifest");
+    let selected = [
+        manifest.primary_offset,
+        manifest.secondary_offset,
+        manifest.verification_offset,
+        manifest.quaternary_offset,
+        manifest.quinary_offset,
+    ]
+    .map(usize::from);
+    let mismatch = (0..literal.len())
+        .find(|offset| !selected.contains(offset))
+        .expect("V21 leaves one learnable offset");
+    let avoid = (0_u16..=255)
+        .map(|value| u8::try_from(value).expect("bounded byte"))
+        .find(|byte| !literal.contains(byte))
+        .expect("V21 literal leaves an avoiding byte");
+    let window_start = 3_usize;
+    let wide_base = window_start + 1;
+
+    for block in 0..4_usize {
+        for lane in 0..16_usize {
+            let candidate = wide_base + block * 16 + lane;
+
+            let mut direct = vec![avoid; 224];
+            direct[candidate..candidate + literal.len()].copy_from_slice(&literal);
+            assert_eq!(
+                span_output(
+                    simulate(&image, &direct, window_start, direct.len())
+                        .expect("V21 direct first-survivor simulation")
+                ),
+                Some((candidate, candidate + literal.len())),
+                "direct block={block} lane={lane}"
+            );
+
+            let mut learned_empty = vec![avoid; 224];
+            for &offset in &selected {
+                learned_empty[candidate + offset] = literal[offset];
+            }
+            assert_eq!(learned_empty[candidate + mismatch], avoid);
+            let exact = wide_base + 96;
+            learned_empty[exact..exact + literal.len()].copy_from_slice(&literal);
+            let expected = program
+                .execute(
+                    &learned_empty,
+                    SearchWindow::new(window_start, learned_empty.len()),
+                    ExecutionLimits::unlimited(),
+                )
+                .expect("V21 learned-empty oracle")
+                .output()
+                .map(|span| (span.start(), span.end()));
+            let actual = simulate(&image, &learned_empty, window_start, learned_empty.len())
+                .expect("V21 learned-empty simulation");
+            assert_eq!(
+                span_output(actual),
+                expected,
+                "learned-empty block={block} lane={lane}"
+            );
+            assert_eq!(expected, Some((exact, exact + literal.len())));
+        }
+    }
+}
+
+#[test]
+fn v21_learns_every_unselected_source_offset_across_every_gate_width() {
+    let mut comparisons = 0_u64;
+    for width in 6_usize..=MAX_REPEATED_CONFIRM_BYTES {
+        let literal = (0..width)
+            .map(|offset| {
+                u8::try_from(offset)
+                    .expect("bounded V21 width")
+                    .wrapping_mul(61)
+                    .wrapping_add(7)
+            })
+            .collect::<Vec<_>>();
+        let program = build_exact_literal::<Span>(
+            &literal,
+            AnchorFlags::default(),
+            ValidateLimits::default(),
+        )
+        .expect("V21 every-mismatch IR");
+        let image = emit_with_backend(
+            &program,
+            SearchBackendPolicy::AsimdV21,
+            EmitLimits::default(),
+        )
+        .expect("V21 every-mismatch image");
+        audit(&image).expect("V21 every-mismatch audit");
+        let manifest = image
+            .search_manifest()
+            .expect("V21 every-mismatch manifest");
+        let selected = [
+            manifest.primary_offset,
+            manifest.secondary_offset,
+            manifest.verification_offset,
+            manifest.quaternary_offset,
+            manifest.quinary_offset,
+        ]
+        .map(usize::from);
+        let avoid = (0_u16..=255)
+            .map(|value| u8::try_from(value).expect("bounded byte"))
+            .find(|byte| !literal.contains(byte))
+            .expect("V21 literal leaves an avoiding byte");
+        let window_start = 3_usize;
+        let wide_base = window_start + 1;
+        let false_candidate = wide_base + 7;
+        let exact = wide_base + 96;
+
+        for mismatch in (0..width).filter(|offset| !selected.contains(offset)) {
+            let mut haystack = vec![avoid; 256];
+            for &offset in &selected {
+                haystack[false_candidate + offset] = literal[offset];
+            }
+            assert_eq!(haystack[false_candidate + mismatch], avoid);
+            haystack[exact..exact + width].copy_from_slice(&literal);
+            let expected = program
+                .execute(
+                    &haystack,
+                    SearchWindow::new(window_start, haystack.len()),
+                    ExecutionLimits::unlimited(),
+                )
+                .expect("V21 every-mismatch oracle")
+                .output()
+                .map(|span| (span.start(), span.end()));
+            let actual = simulate(&image, &haystack, window_start, haystack.len())
+                .expect("V21 every-mismatch simulation");
+            assert_eq!(
+                span_output(actual),
+                expected,
+                "width={width} mismatch={mismatch}"
+            );
+            assert_eq!(expected, Some((exact, exact + width)));
+            comparisons = comparisons
+                .checked_add(1)
+                .expect("bounded V21 mismatch matrix");
+        }
+    }
+    assert_eq!(comparisons, 513 - 27 * 5);
+}
+
+#[test]
+fn v21_learned_nonempty_mask_preserves_source_order_before_exact_match() {
+    let literal = [11_u8, 37, 63, 89, 115, 141, 167, 193, 219, 245, 17, 43, 69];
+    let program =
+        build_exact_literal::<Span>(&literal, AnchorFlags::default(), ValidateLimits::default())
+            .expect("V21 learned-nonempty IR");
+    let image = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV21,
+        EmitLimits::default(),
+    )
+    .expect("V21 learned-nonempty image");
+    let manifest = image
+        .search_manifest()
+        .expect("V21 learned-nonempty manifest");
+    let selected = [
+        manifest.primary_offset,
+        manifest.secondary_offset,
+        manifest.verification_offset,
+        manifest.quaternary_offset,
+        manifest.quinary_offset,
+    ]
+    .map(usize::from);
+    let unselected = (0..literal.len())
+        .filter(|offset| !selected.contains(offset))
+        .collect::<Vec<_>>();
+    assert!(unselected.len() >= 2);
+    let avoid = (0_u16..=255)
+        .map(|value| u8::try_from(value).expect("bounded byte"))
+        .find(|byte| !literal.contains(byte))
+        .expect("V21 literal leaves an avoiding byte");
+    let window_start = 3_usize;
+    let wide_base = window_start + 1;
+    let first_false = wide_base + 2;
+    let second_false = wide_base + 21;
+    let exact = wide_base + 43;
+    let mut haystack = vec![avoid; 192];
+    for &offset in &selected {
+        haystack[first_false + offset] = literal[offset];
+        haystack[second_false + offset] = literal[offset];
+    }
+    // The first false survivor teaches this source-order column. The second
+    // false survivor passes it, then misses at the next unselected byte.
+    haystack[second_false + unselected[0]] = literal[unselected[0]];
+    assert_eq!(haystack[second_false + unselected[1]], avoid);
+    haystack[exact..exact + literal.len()].copy_from_slice(&literal);
+
+    let expected = program
+        .execute(
+            &haystack,
+            SearchWindow::new(window_start, haystack.len()),
+            ExecutionLimits::unlimited(),
+        )
+        .expect("V21 learned-nonempty oracle")
+        .output()
+        .map(|span| (span.start(), span.end()));
+    let actual = simulate(&image, &haystack, window_start, haystack.len())
+        .expect("V21 learned-nonempty simulation");
+    assert_eq!(span_output(actual), expected);
+    assert_eq!(expected, Some((exact, exact + literal.len())));
+}
+
+#[test]
+fn v21_every_width_and_window_shape_matches_the_kir_oracle() {
+    let mut state = 0x4d8e_a711_93c2_6bf5_u64;
+    let mut comparisons = 0_u64;
+    for width in 6_usize..=MAX_REPEATED_CONFIRM_BYTES {
+        let literal = (0..width)
+            .map(|offset| {
+                u8::try_from(offset)
+                    .expect("bounded V21 width")
+                    .wrapping_mul(61)
+                    .wrapping_add(7)
+            })
+            .collect::<Vec<_>>();
+        let program = build_exact_literal::<Span>(
+            &literal,
+            AnchorFlags::default(),
+            ValidateLimits::default(),
+        )
+        .expect("V21 every-width IR");
+        let image = emit_with_backend(
+            &program,
+            SearchBackendPolicy::AsimdV21,
+            EmitLimits::default(),
+        )
+        .expect("V21 every-width image");
+        audit(&image).expect("V21 every-width audit");
+
+        for case in 0..8_usize {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let hay_len = 112 + usize::try_from(state >> 24).expect("host usize") % 97;
+            let mut haystack = Vec::with_capacity(hay_len);
+            for _ in 0..hay_len {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                haystack.push(state.to_le_bytes()[0]);
+            }
+
+            let exact = (case & 1 == 0).then(|| {
+                5 + (usize::try_from(state >> 8).expect("host usize")
+                    % (haystack.len() - width - 5))
+            });
+            if let Some(candidate) = exact {
+                haystack[candidate..candidate + width].copy_from_slice(&literal);
+            }
+
+            let random_start =
+                usize::try_from(state >> 16).expect("host usize") % (haystack.len() + 1);
+            let random_end = random_start
+                + (usize::try_from(state >> 32).expect("host usize")
+                    % (haystack.len() - random_start + 1));
+            let short_end = width.saturating_sub(1).min(haystack.len());
+            let exact_window = exact.map_or((random_start, random_end), |candidate| {
+                (candidate, candidate + width)
+            });
+            let windows = [
+                (0, 0),
+                (0, short_end),
+                (0, haystack.len()),
+                (random_start, haystack.len()),
+                (random_start, random_end),
+                exact_window,
+            ];
+            for (start, end) in windows {
+                let expected = program
+                    .execute(
+                        &haystack,
+                        SearchWindow::new(start, end),
+                        ExecutionLimits::unlimited(),
+                    )
+                    .expect("V21 every-width oracle")
+                    .output()
+                    .map(|span| (span.start(), span.end()));
+                let actual = simulate(&image, &haystack, start, end)
+                    .expect("V21 every-width safe ISA simulation");
+                assert_eq!(
+                    span_output(actual),
+                    expected,
+                    "width={width} case={case} window={start}..{end}"
+                );
+                comparisons = comparisons.checked_add(1).expect("bounded V21 matrix");
+            }
+        }
+    }
+    assert_eq!(comparisons, 1_296);
+}
+
+#[test]
 fn v17_post_window_setup_leaves_x1_x2_x3_available_for_saved_masks() {
     let literal = b"0123456789abcdef";
     let program =
@@ -9478,7 +9936,7 @@ fn v13_adaptive_recovery_decoded_edges_cover_zero_one_and_max_remaining_columns(
 }
 
 #[test]
-fn v9_through_v20_reject_shapes_without_one_nonempty_unanchored_exact_candidate() {
+fn v9_through_v21_reject_shapes_without_one_nonempty_unanchored_exact_candidate() {
     for backend in [
         SearchBackendPolicy::AsimdV9,
         SearchBackendPolicy::AsimdV10,
@@ -9492,6 +9950,7 @@ fn v9_through_v20_reject_shapes_without_one_nonempty_unanchored_exact_candidate(
         SearchBackendPolicy::AsimdV18,
         SearchBackendPolicy::AsimdV19,
         SearchBackendPolicy::AsimdV20,
+        SearchBackendPolicy::AsimdV21,
     ] {
         for anchors in [
             AnchorFlags {

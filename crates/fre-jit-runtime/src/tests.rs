@@ -3598,6 +3598,125 @@ fn v20_refined_saved_mask_queue_executes_natively_across_blocks_widths_and_guard
 }
 
 #[test]
+fn v21_current_group_learning_executes_natively_across_blocks_misses_and_guards() {
+    let _lock = native_test_lock();
+    let mut comparisons = 0_u64;
+    for width in [6_usize, 13, 32] {
+        let literal = (0..width)
+            .map(|offset| {
+                u8::try_from(offset)
+                    .expect("bounded V21 width")
+                    .wrapping_mul(61)
+                    .wrapping_add(7)
+            })
+            .collect::<Vec<_>>();
+        let program = build_exact_literal::<Span>(
+            &literal,
+            AnchorFlags::default(),
+            ValidateLimits::default(),
+        )
+        .expect("V21 native program");
+        let image = emit_audited_with_backend(
+            &program,
+            SearchBackendPolicy::AsimdV21,
+            EmitLimits::default(),
+        )
+        .expect("audited V21 native image");
+        assert_eq!(
+            image.as_image().backend_version(),
+            BackendVersion::SEARCH_V21
+        );
+        let selected = decode(image.as_image().code())
+            .expect("V21 native decode")
+            .into_iter()
+            .filter_map(|instruction| match instruction {
+                DecodedInstruction::LoadByte {
+                    destination: 11,
+                    base: 8,
+                    offset,
+                } => Some(usize::from(offset)),
+                _ => None,
+            })
+            .take(5)
+            .collect::<Vec<_>>();
+        assert_eq!(selected.len(), 5);
+        let unselected = (0..width)
+            .filter(|offset| !selected.contains(offset))
+            .collect::<Vec<_>>();
+        assert!(!unselected.is_empty());
+        let avoid = (0_u16..=255)
+            .map(|value| u8::try_from(value).expect("bounded byte"))
+            .find(|byte| !literal.contains(byte))
+            .expect("V21 literal leaves one avoiding byte");
+        let kernel =
+            publish_audited::<Span>(&image, PublicationLimits::default()).expect("publish V21");
+        let window_start = 3_usize;
+        let wide_base = window_start + 1;
+        let lanes = if width == 13 {
+            (0..16).collect::<Vec<_>>()
+        } else {
+            vec![0, 7, 15]
+        };
+
+        // One five-column false survivor in each block/lane teaches a column
+        // that empties the current group. The next group's exact match proves
+        // cursor, primary pointer, and wide-bound restoration.
+        for block in 0..4_usize {
+            for &lane in &lanes {
+                let false_candidate = wide_base + block * 16 + lane;
+                let exact = wide_base + 96;
+                let mut bytes = vec![avoid; 256];
+                for &offset in &selected {
+                    bytes[false_candidate + offset] = literal[offset];
+                }
+                install_literal(&mut bytes, exact, &literal);
+                for right_boundary in [false, true] {
+                    platform::with_guarded_haystack(&bytes, right_boundary, |guarded| {
+                        assert_native_matches(
+                            &program,
+                            &kernel,
+                            guarded,
+                            SearchWindow::new(window_start, guarded.len()),
+                        );
+                    })
+                    .expect("guarded V21 learned-empty execution");
+                    comparisons = comparisons.checked_add(1).expect("bounded comparisons");
+                }
+            }
+        }
+
+        // The learned mask remains nonempty: a second false candidate passes
+        // the learned byte, then ordered saved-mask recovery reaches the exact
+        // candidate later in the same four-block group.
+        if unselected.len() >= 2 {
+            let first_false = wide_base + 2;
+            let second_false = wide_base + 21;
+            let exact = wide_base + 43;
+            let mut bytes = vec![avoid; 192];
+            for &offset in &selected {
+                bytes[first_false + offset] = literal[offset];
+                bytes[second_false + offset] = literal[offset];
+            }
+            bytes[second_false + unselected[0]] = literal[unselected[0]];
+            install_literal(&mut bytes, exact, &literal);
+            for right_boundary in [false, true] {
+                platform::with_guarded_haystack(&bytes, right_boundary, |guarded| {
+                    assert_native_matches(
+                        &program,
+                        &kernel,
+                        guarded,
+                        SearchWindow::new(window_start, guarded.len()),
+                    );
+                })
+                .expect("guarded V21 learned-nonempty execution");
+                comparisons = comparisons.checked_add(1).expect("bounded comparisons");
+            }
+        }
+    }
+    assert_eq!(comparisons, 180);
+}
+
+#[test]
 #[allow(
     clippy::too_many_lines,
     reason = "the width/topology matrix keeps learned-mode, vector-tail, one-candidate, and clipped-window guard cases explicit"
