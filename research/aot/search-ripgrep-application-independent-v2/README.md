@@ -1,4 +1,4 @@
-# Rebar-blind ripgrep application qualification v2
+# Rebar-blind ripgrep application qualification v3
 
 This directory freezes a real application workload for Search tag 29 before
 tag-29 timing. Its only membership authority is authenticated ripgrep source
@@ -53,6 +53,34 @@ tail exactly once. All 69 ineligible rows must invoke static code zero times.
 The desired `alignment_offset` is realized as the actual checked-window pointer
 modulo 16 using readable sentinel padding; it is not merely reported.
 
+The application object set is not borrowed from the 922-literal topology
+inventory. `prepare_link_manifests.py` mechanically derives the separate
+five-object/six-refusal application manifests from the unchanged v2
+freeze/inventory and the frozen selector. `validate_link_manifests.py`
+reconstructs them and authenticates the derivation program, both exact output
+files, and the application link-proof contract. The common direct-object
+verifier accepts that contract only as one byte-exact built-in profile; its
+Mach-O/ELF, relocation, link-map, and final-image proof and its evidence schema
+are the same as the topology profile.
+
+The fixture manifest's unchanged
+`required-tag29-frozen-input` backend label is inert provenance, not backend
+selection authority. The pre-result campaign authority separately pins the
+controller/source set, backend tag 29, `SEARCH_V16`, policy 15, non-LLVM
+selection, timed function, object/disposition manifests, validators, and
+per-host direct-link evidence. It also states
+`fixture_backend_authority=false`. The exact whole campaign-authority file
+SHA-256 must be supplied out of band to the analyzer. A result manifest can
+only reference that file identity and cannot carry or replace authority.
+
+Each host result is split into an exact 154-row correctness bundle and an exact
+154-cell timing bundle. Both hosts' correctness, routes, compiler
+dispositions, linked-object evidence, physical mappings, and case-bound
+receipts are completely authenticated before either timing bundle is opened.
+All integers reject booleans, result files are bounded unshared regular files
+opened relative to held directories without following links, and the two
+hosts are matched to their frozen identities and allowed logical CPUs.
+
 This application layer complements the much larger procedural topology matrix.
 It does not authorize removal of a source candidate or fixture after
 measurement. A failed cell refuses the broad tag-29 family under this freeze.
@@ -77,9 +105,30 @@ python3 research/aot/search-ripgrep-application-independent-v2/validate_freeze.p
   . \
   /path/to/ripgrep \
   /new/fixture-directory
+
+python3 research/aot/search-ripgrep-application-independent-v2/validate_link_manifests.py \
+  .
 ```
 
 The committed freeze expects fixture-manifest SHA-256
 `b20181470c604d01d2ec236259293cfcb6e5eff145bcd3e4daa91554c8cebcca`
 and manifest-payload SHA-256
 `1cbda700087f5506daa91b0657070cbf39fac68222ff84e273d1d83c09f6ebfd`.
+
+Analyze an already sealed campaign with:
+
+```sh
+python3 research/aot/search-ripgrep-application-independent-v2/analyze_qualification_results.py \
+  . /path/to/ripgrep /frozen/fixture-directory \
+  /sealed/authority/campaign-authority.json \
+  EXPECTED_PRE_RESULT_AUTHORITY_FILE_SHA256 \
+  /sealed/results/result-manifest.json
+```
+
+Run the synthetic v3 contract, exact gate boundaries, and adversarial
+authority/evidence tests with:
+
+```sh
+python3 research/aot/search-ripgrep-application-independent-v2/test_qualification_results.py \
+  . /path/to/ripgrep /frozen/fixture-directory
+```
