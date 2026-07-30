@@ -778,6 +778,15 @@ fn primary_empty_scan_and_semantic_endpoint_fallback_are_disjoint() {
     } else {
         last_offset
     };
+    let low_offset = filter_offsets[0].min(semantic_secondary);
+    let delta = filter_offsets[0].abs_diff(semantic_secondary);
+    let lookahead_vectors = if delta <= 16 { 1_u16 } else { 2 };
+    let sliding_required_remaining = u16::from(low_offset)
+        .checked_add(128)
+        .and_then(|extent| extent.checked_add(lookahead_vectors * 16))
+        .and_then(|extent| extent.checked_sub(u16::try_from(program.literal().len()).unwrap()))
+        .unwrap()
+        .max(127);
     let has_prefix_escalation = filter_offsets[0] != 0 && filter_offsets[0] != last_offset;
     let composite_probe = decoded
         .windows(2)
@@ -806,62 +815,62 @@ fn primary_empty_scan_and_semantic_endpoint_fallback_are_disjoint() {
         decoded[endpoint_scan + 4],
         DecodedInstructionV3::CompareImmediate64 {
             register: 5,
-            immediate: 127,
+            immediate: sliding_required_remaining,
         }
     );
     assert_eq!(
-        decoded[endpoint_scan + 8],
+        decoded[endpoint_scan + 7],
         DecodedInstructionV3::AddImmediate64 {
-            destination: 9,
+            destination: 8,
             source: 15,
-            immediate: u16::from(semantic_secondary),
+            immediate: u16::from(low_offset),
         }
     );
 
-    let mut cursor = endpoint_scan + 9;
-    for block in 0_u16..8 {
-        let mask = u8::try_from(24 + block).unwrap();
-        assert_eq!(
-            decoded[cursor],
-            DecodedInstructionV3::LoadVector128 {
-                destination: 0,
-                base: 8,
-                offset: block * 16,
-            }
-        );
-        assert_eq!(
-            decoded[cursor + 1],
-            DecodedInstructionV3::LoadVector128 {
-                destination: 1,
-                base: 9,
-                offset: block * 16,
-            }
-        );
-        assert_eq!(
-            decoded[cursor + 2],
-            DecodedInstructionV3::CompareEqualBytes16 {
-                destination: 0,
-                left: 0,
-                right: 2,
-            }
-        );
-        assert_eq!(
-            decoded[cursor + 3],
-            DecodedInstructionV3::CompareEqualBytes16 {
-                destination: 1,
-                left: 1,
-                right: 18,
-            }
-        );
-        assert_eq!(
-            decoded[cursor + 4],
-            DecodedInstructionV3::AndBytes16 {
-                destination: mask,
-                left: 0,
-                right: 1,
-            }
-        );
-        cursor += 5;
+    let pair_body = endpoint_scan + 8;
+    let mut cursor = decoded
+        .iter()
+        .enumerate()
+        .skip(pair_body)
+        .find(|(_, instruction)| {
+            matches!(
+                instruction,
+                DecodedInstructionV3::OrBytes16 {
+                    left: 24,
+                    right: 25,
+                    ..
+                }
+            )
+        })
+        .map(|(index, _)| index)
+        .expect("sliding pair-mask reduction");
+    let sliding = &decoded[pair_body..cursor];
+    assert_eq!(
+        sliding
+            .iter()
+            .filter(|instruction| matches!(
+                instruction,
+                DecodedInstructionV3::LoadVector128 { base: 8, .. }
+            ))
+            .count(),
+        usize::from(8 + lookahead_vectors)
+    );
+    assert_eq!(
+        sliding
+            .iter()
+            .filter(|instruction| matches!(
+                instruction,
+                DecodedInstructionV3::ExtractBytes16 { .. }
+            ))
+            .count(),
+        usize::from(u8::from(delta != 16)) * 8
+    );
+    for mask in 24_u8..32 {
+        assert!(sliding.iter().any(|instruction| matches!(
+            instruction,
+            DecodedInstructionV3::AndBytes16 { destination, .. }
+                if *destination == mask
+        )));
     }
     if has_prefix_escalation {
         // Seven scratch ORs preserve v24..v31. A surviving batch branches to
@@ -923,6 +932,54 @@ fn primary_empty_scan_and_semantic_endpoint_fallback_are_disjoint() {
         image.build_receipt().audit
     );
     assert_eq!(image.build_receipt().audit.staged_filter_checks, 1);
+}
+
+#[test]
+fn neon_ext_decode_and_both_sliding_pair_rings_are_exact() {
+    assert_eq!(
+        decode_word_v3(0x6e01_4018, 0).unwrap(),
+        DecodedInstructionV3::ExtractBytes16 {
+            destination: 24,
+            left: 0,
+            right: 1,
+            byte_offset: 8,
+        }
+    );
+    assert!(
+        decode_word_v3(0x2e01_4018, 0).is_err(),
+        "Q=0 EXT must not enter the admitted 16-byte subset"
+    );
+
+    for literal in [&b"not-periodic"[..], &b"ABCDEFGHIJKLMNOPQRSTUVWXYZ"[..]] {
+        let (program, optimized) = optimized(literal);
+        assert!(matches!(
+            optimized.recipe().strategy(),
+            CountV3Strategy::SparseRareColumns | CountV3Strategy::EndpointDense
+        ));
+        let image =
+            emit_count_v3(&program, optimized.recipe(), CountEmitLimitsV3::default()).unwrap();
+        let decoded = decoded_v3(&image);
+        let primary = optimized.recipe().filter_offsets()[0];
+        let last = u8::try_from(literal.len() - 1).unwrap();
+        let semantic_secondary = if primary == last { 0 } else { last };
+        let delta = primary.abs_diff(semantic_secondary);
+        assert_ne!(delta, 16);
+        assert_eq!(
+            decoded
+                .iter()
+                .filter(|instruction| matches!(
+                    instruction,
+                    DecodedInstructionV3::ExtractBytes16 { byte_offset, .. }
+                        if *byte_offset == delta % 16
+                ))
+                .count(),
+            8
+        );
+        assert_eq!(
+            audit_count_image_v3(&program, optimized.recipe(), &image).unwrap(),
+            image.build_receipt().audit
+        );
+    }
 }
 
 #[test]

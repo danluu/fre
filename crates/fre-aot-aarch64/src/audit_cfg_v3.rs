@@ -945,6 +945,7 @@ fn execute_v3(
         | DecodedInstructionV3::AndBytes16 { .. }
         | DecodedInstructionV3::AddBytes16 { .. }
         | DecodedInstructionV3::OrBytes16 { .. }
+        | DecodedInstructionV3::ExtractBytes16 { .. }
         | DecodedInstructionV3::ShrinkNarrowBytesFromHalfwords { .. }
         | DecodedInstructionV3::AddAcrossBytes16 { .. }
         | DecodedInstructionV3::UnsignedMaxAcrossBytes16 { .. }

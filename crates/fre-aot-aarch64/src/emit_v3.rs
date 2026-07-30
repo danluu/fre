@@ -2584,6 +2584,95 @@ fn emit_multi_incumbent_v3(
     assembler.branch(scalar)
 }
 
+/// Return the max-cursor slack required for an aligned sliding-window pair
+/// scan. The lookahead load deliberately rounds the higher column up to a
+/// whole Q register, so the ordinary 128-start guard alone is not always
+/// enough near the haystack boundary.
+fn sliding_pair_required_remaining_v3(
+    width: u16,
+    low_offset: u8,
+    delta: u8,
+) -> Result<u16, CountAotError> {
+    if delta == 0 || delta > 31 {
+        return Err(CountAotError::InternalInvariant {
+            at: "v3 sliding pair delta",
+        });
+    }
+    let lookahead_vectors = if delta <= 16 { 1_u16 } else { 2 };
+    let loaded_extent = u16::from(low_offset)
+        .checked_add(SPARSE_SCAN_STARTS_V3)
+        .and_then(|extent| extent.checked_add(lookahead_vectors * 16))
+        .ok_or(CountAotError::ArithmeticOverflow {
+            site: CountAotArithmeticSite::CodeOffset,
+        })?;
+    Ok(loaded_extent
+        .checked_sub(width)
+        .ok_or(CountAotError::InternalInvariant {
+            at: "v3 sliding pair extent",
+        })?
+        .max(SPARSE_SCAN_STARTS_V3 - 1))
+}
+
+/// Form eight complete two-column masks from one contiguous byte stream.
+///
+/// For deltas through 16, two vector registers form a sliding ring and nine
+/// Q loads cover 128 starts. Deltas 17 through 31 use a three-register ring
+/// and ten Q loads. `EXT` derives the unaligned higher column entirely in
+/// registers; delta 16 is the exact adjacent-register case and needs no EXT.
+fn emit_sliding_pair_masks_v3(
+    assembler: &mut AssemblerV3,
+    stream_base: u8,
+    delta: u8,
+    low_constant: u8,
+    high_constant: u8,
+) -> Result<(), CountAotError> {
+    if delta == 0 || delta > 31 {
+        return Err(CountAotError::InternalInvariant {
+            at: "v3 sliding pair delta",
+        });
+    }
+    let stream_registers = [0_u8, 1, 20];
+    let ring_len = if delta <= 16 { 2_usize } else { 3 };
+    for (index, register) in stream_registers[..ring_len].iter().copied().enumerate() {
+        assembler.load_vector128_offset(
+            register,
+            stream_base,
+            u16::try_from(index * 16).expect("three sliding preload vectors"),
+        )?;
+    }
+    for block in 0_usize..8 {
+        let low = stream_registers[block % ring_len];
+        let high_left = stream_registers[(block + 1) % ring_len];
+        let mask =
+            SPARSE_BLOCK_MASK_BASE_V3 + u8::try_from(block).expect("eight sliding pair masks");
+        match delta.cmp(&16) {
+            core::cmp::Ordering::Less => {
+                assembler.extract_bytes16(mask, low, high_left, delta)?;
+            }
+            core::cmp::Ordering::Equal => {
+                assembler.compare_equal_bytes16(mask, high_left, high_constant)?;
+            }
+            core::cmp::Ordering::Greater => {
+                let high_right = stream_registers[(block + 2) % ring_len];
+                assembler.extract_bytes16(mask, high_left, high_right, delta - 16)?;
+            }
+        }
+        if delta != 16 {
+            assembler.compare_equal_bytes16(mask, mask, high_constant)?;
+        }
+        assembler.compare_equal_bytes16(low, low, low_constant)?;
+        assembler.and_bytes16(mask, mask, low)?;
+        if block != 7 {
+            assembler.load_vector128_offset(
+                low,
+                stream_base,
+                u16::try_from((block + ring_len) * 16).expect("ten sliding stream vectors"),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Lower one of the three recipe-specialized Count kernels.
 ///
 /// Unlike the incumbent-compatible template, this loop does not retain the
@@ -2694,6 +2783,17 @@ fn emit_multi_specialized_v3(
     } else {
         last_offset
     };
+    let (sliding_low_offset, sliding_low_constant, sliding_high_constant) =
+        if filter.offsets[0] < semantic_secondary_offset {
+            (filter.offsets[0], 2_u8, SEMANTIC_SECONDARY_VECTOR_V3)
+        } else {
+            (
+                semantic_secondary_offset,
+                SEMANTIC_SECONDARY_VECTOR_V3,
+                2_u8,
+            )
+        };
+    let sliding_delta = filter.offsets[0].abs_diff(semantic_secondary_offset);
     let sparse_prefix_escalation = if filter.offsets[0] != 0 && filter.offsets[0] != last_offset {
         Some(assembler.new_label(LabelKindV3::Internal)?)
     } else {
@@ -2714,6 +2814,8 @@ fn emit_multi_specialized_v3(
     let width = u16::try_from(literal.len()).map_err(|_| CountAotError::ArithmeticOverflow {
         site: CountAotArithmeticSite::CodeOffset,
     })?;
+    let sliding_required_remaining =
+        sliding_pair_required_remaining_v3(width, sliding_low_offset, sliding_delta)?;
     let value_registers = [X10, X11, X12, X14];
     let vector_registers = [2_u8, 3, 16, 17];
 
@@ -3132,25 +3234,17 @@ fn emit_multi_specialized_v3(
     assembler.cmp_reg64(X3, X4)?;
     assembler.branch_cond(ConditionV3::Higher, done)?;
     assembler.sub_reg(X5, X4, X3)?;
-    assembler.cmp_imm64(X5, SPARSE_SCAN_STARTS_V3 - 1)?;
+    assembler.cmp_imm64(X5, sliding_required_remaining)?;
     assembler.branch_cond(ConditionV3::CarryClear, vector)?;
     assembler.add_reg(X15, X0, X3)?;
-    assembler.add_imm(X8, X15, u16::from(filter.offsets[0]))?;
-    assembler.add_imm(X9, X15, u16::from(semantic_secondary_offset))?;
-    for block in 0..SPARSE_SCAN_BLOCKS_V3 {
-        let offset = block.checked_mul(SIMD_CANDIDATE_STARTS_V3).ok_or(
-            CountAotError::ArithmeticOverflow {
-                site: CountAotArithmeticSite::CodeOffset,
-            },
-        )?;
-        let mask =
-            u8::try_from(u16::from(SPARSE_BLOCK_MASK_BASE_V3) + block).expect("eight sparse masks");
-        assembler.load_vector128_offset(0, X8, offset)?;
-        assembler.load_vector128_offset(1, X9, offset)?;
-        assembler.compare_equal_bytes16(0, 0, vector_registers[0])?;
-        assembler.compare_equal_bytes16(1, 1, SEMANTIC_SECONDARY_VECTOR_V3)?;
-        assembler.and_bytes16(mask, 0, 1)?;
-    }
+    assembler.add_imm(X8, X15, u16::from(sliding_low_offset))?;
+    emit_sliding_pair_masks_v3(
+        assembler,
+        X8,
+        sliding_delta,
+        sliding_low_constant,
+        sliding_high_constant,
+    )?;
     if sparse_prefix_escalation.is_some() {
         // Preserve all eight pair masks until the survivor branch so a dense
         // internal+suffix stream can be refined by the prefix without
@@ -4462,6 +4556,28 @@ impl AssemblerV3 {
         self.emit_word(
             0x4ea0_1c00
                 | register_field_v3(right, 16)
+                | register_field_v3(left, 5)
+                | u32::from(destination),
+            true,
+        )
+    }
+
+    fn extract_bytes16(
+        &mut self,
+        destination: u8,
+        left: u8,
+        right: u8,
+        byte_offset: u8,
+    ) -> Result<(), CountAotError> {
+        if byte_offset >= 16 {
+            return Err(CountAotError::InternalInvariant {
+                at: "v3 EXT byte offset",
+            });
+        }
+        self.emit_word(
+            0x6e00_0000
+                | register_field_v3(right, 16)
+                | (u32::from(byte_offset) << 11)
                 | register_field_v3(left, 5)
                 | u32::from(destination),
             true,

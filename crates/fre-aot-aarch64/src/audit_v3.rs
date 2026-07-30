@@ -249,6 +249,12 @@ pub enum DecodedInstructionV3 {
         left: u8,
         right: u8,
     },
+    ExtractBytes16 {
+        destination: u8,
+        left: u8,
+        right: u8,
+        byte_offset: u8,
+    },
     ShrinkNarrowBytesFromHalfwords {
         destination: u8,
         source: u8,
@@ -376,6 +382,7 @@ impl DecodedInstructionV3 {
                 | Self::AndBytes16 { .. }
                 | Self::AddBytes16 { .. }
                 | Self::OrBytes16 { .. }
+                | Self::ExtractBytes16 { .. }
                 | Self::ShrinkNarrowBytesFromHalfwords { .. }
                 | Self::AddAcrossBytes16 { .. }
                 | Self::UnsignedMaxAcrossBytes16 { .. }
@@ -470,6 +477,7 @@ impl DecodedInstructionV3 {
             | Self::AndBytes16 { destination, .. }
             | Self::AddBytes16 { destination, .. }
             | Self::OrBytes16 { destination, .. }
+            | Self::ExtractBytes16 { destination, .. }
             | Self::ShrinkNarrowBytesFromHalfwords { destination, .. }
             | Self::AddAcrossBytes16 { destination, .. }
             | Self::UnsignedMaxAcrossBytes16 { destination, .. }
@@ -563,6 +571,128 @@ pub(crate) fn independent_recipe_work_envelope_v3(
         fixed_manifest,
         total,
     })
+}
+
+fn policy_sliding_pair_required_remaining_v3(
+    width: u16,
+    low_offset: u8,
+    delta: u8,
+) -> Result<u16, CountAotError> {
+    if delta == 0 || delta > 31 {
+        return Err(invalid_v3("v3 policy sliding pair delta"));
+    }
+    let lookahead_vectors = if delta <= 16 { 1_u16 } else { 2 };
+    let loaded_extent = u16::from(low_offset)
+        .checked_add(SPARSE_SCAN_STARTS_V3)
+        .and_then(|extent| extent.checked_add(lookahead_vectors * 16))
+        .ok_or_else(audit_arithmetic_v3)?;
+    Ok(loaded_extent
+        .checked_sub(width)
+        .ok_or_else(|| invalid_v3("v3 policy sliding pair extent"))?
+        .max(SPARSE_SCAN_STARTS_V3 - 1))
+}
+
+fn policy_sliding_pair_masks_v3(
+    policy: &mut PolicySinkV3,
+    stream_base: u8,
+    delta: u8,
+    low_constant: u8,
+    high_constant: u8,
+) -> Result<(), CountAotError> {
+    if delta == 0 || delta > 31 {
+        return Err(invalid_v3("v3 policy sliding pair delta"));
+    }
+    let stream_registers = [0_u8, 1, 20];
+    let ring_len = if delta <= 16 { 2_usize } else { 3 };
+    for (index, register) in stream_registers[..ring_len].iter().copied().enumerate() {
+        exact_v3(
+            policy,
+            DecodedInstructionV3::LoadVector128 {
+                destination: register,
+                base: stream_base,
+                offset: u16::try_from(index * 16).expect("three policy sliding preloads"),
+            },
+        )?;
+    }
+    for block in 0_usize..8 {
+        let low = stream_registers[block % ring_len];
+        let high_left = stream_registers[(block + 1) % ring_len];
+        let mask =
+            SPARSE_BLOCK_MASK_BASE_V3 + u8::try_from(block).expect("eight policy sliding masks");
+        match delta.cmp(&16) {
+            core::cmp::Ordering::Less => {
+                exact_v3(
+                    policy,
+                    DecodedInstructionV3::ExtractBytes16 {
+                        destination: mask,
+                        left: low,
+                        right: high_left,
+                        byte_offset: delta,
+                    },
+                )?;
+            }
+            core::cmp::Ordering::Equal => {
+                exact_v3(
+                    policy,
+                    DecodedInstructionV3::CompareEqualBytes16 {
+                        destination: mask,
+                        left: high_left,
+                        right: high_constant,
+                    },
+                )?;
+            }
+            core::cmp::Ordering::Greater => {
+                let high_right = stream_registers[(block + 2) % ring_len];
+                exact_v3(
+                    policy,
+                    DecodedInstructionV3::ExtractBytes16 {
+                        destination: mask,
+                        left: high_left,
+                        right: high_right,
+                        byte_offset: delta - 16,
+                    },
+                )?;
+            }
+        }
+        if delta != 16 {
+            exact_v3(
+                policy,
+                DecodedInstructionV3::CompareEqualBytes16 {
+                    destination: mask,
+                    left: mask,
+                    right: high_constant,
+                },
+            )?;
+        }
+        exact_v3(
+            policy,
+            DecodedInstructionV3::CompareEqualBytes16 {
+                destination: low,
+                left: low,
+                right: low_constant,
+            },
+        )?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::AndBytes16 {
+                destination: mask,
+                left: mask,
+                right: low,
+            },
+        )?;
+        if block != 7 {
+            exact_v3(
+                policy,
+                DecodedInstructionV3::LoadVector128 {
+                    destination: low,
+                    base: stream_base,
+                    offset: u16::try_from((block + ring_len) * 16)
+                        .expect("ten policy sliding vectors"),
+                },
+            )?;
+        }
+    }
+    Ok(())
 }
 
 #[allow(
@@ -4121,6 +4251,17 @@ fn policy_multi_specialized_v3(
     } else {
         last_offset
     };
+    let (sliding_low_offset, sliding_low_constant, sliding_high_constant) =
+        if filter.offsets[0] < semantic_secondary_offset {
+            (filter.offsets[0], 2_u8, SEMANTIC_SECONDARY_VECTOR_V3)
+        } else {
+            (
+                semantic_secondary_offset,
+                SEMANTIC_SECONDARY_VECTOR_V3,
+                2_u8,
+            )
+        };
+    let sliding_delta = filter.offsets[0].abs_diff(semantic_secondary_offset);
     let sparse_prefix_escalation = if filter.offsets[0] != 0 && filter.offsets[0] != last_offset {
         Some(policy.new_label(LabelKindV3::Internal)?)
     } else {
@@ -4139,6 +4280,8 @@ fn policy_multi_specialized_v3(
     let scalar = policy.new_label(LabelKindV3::ScalarTail)?;
     let scalar_miss = policy.new_label(LabelKindV3::Miss)?;
     let width = u16::try_from(literal.len()).expect("bounded width");
+    let sliding_required_remaining =
+        policy_sliding_pair_required_remaining_v3(width, sliding_low_offset, sliding_delta)?;
     let value_registers = [X10, X11, X12, X14];
     let vector_registers = [2_u8, 3, 16, 17];
 
@@ -5067,56 +5210,17 @@ fn policy_multi_specialized_v3(
     compare_register64_v3(policy, X3, X4)?;
     condition_v3(policy, ConditionV3::Higher, done)?;
     subtract_register64_v3(policy, X5, X4, X3)?;
-    compare_immediate64_v3(policy, X5, SPARSE_SCAN_STARTS_V3 - 1)?;
+    compare_immediate64_v3(policy, X5, sliding_required_remaining)?;
     condition_v3(policy, ConditionV3::CarryClear, vector)?;
     add_register64_v3(policy, X15, X0, X3)?;
-    add_immediate64_v3(policy, X8, X15, u16::from(filter.offsets[0]))?;
-    add_immediate64_v3(policy, X9, X15, u16::from(semantic_secondary_offset))?;
-    for block in 0..SPARSE_SCAN_BLOCKS_V3 {
-        let offset = block * SIMD_CANDIDATE_STARTS_V3;
-        let mask =
-            u8::try_from(u16::from(SPARSE_BLOCK_MASK_BASE_V3) + block).expect("eight sparse masks");
-        exact_v3(
-            policy,
-            DecodedInstructionV3::LoadVector128 {
-                destination: 0,
-                base: X8,
-                offset,
-            },
-        )?;
-        exact_v3(
-            policy,
-            DecodedInstructionV3::LoadVector128 {
-                destination: 1,
-                base: X9,
-                offset,
-            },
-        )?;
-        exact_v3(
-            policy,
-            DecodedInstructionV3::CompareEqualBytes16 {
-                destination: 0,
-                left: 0,
-                right: vector_registers[0],
-            },
-        )?;
-        exact_v3(
-            policy,
-            DecodedInstructionV3::CompareEqualBytes16 {
-                destination: 1,
-                left: 1,
-                right: SEMANTIC_SECONDARY_VECTOR_V3,
-            },
-        )?;
-        exact_v3(
-            policy,
-            DecodedInstructionV3::AndBytes16 {
-                destination: mask,
-                left: 0,
-                right: 1,
-            },
-        )?;
-    }
+    add_immediate64_v3(policy, X8, X15, u16::from(sliding_low_offset))?;
+    policy_sliding_pair_masks_v3(
+        policy,
+        X8,
+        sliding_delta,
+        sliding_low_constant,
+        sliding_high_constant,
+    )?;
     if sparse_prefix_escalation.is_some() {
         exact_v3(
             policy,
@@ -6670,6 +6774,13 @@ pub(crate) fn decode_word_v3(
             destination: rd,
             left: rn,
             right: rm,
+        })
+    } else if word & 0xffe0_8400 == 0x6e00_0000 {
+        Ok(DecodedInstructionV3::ExtractBytes16 {
+            destination: rd,
+            left: rn,
+            right: rm,
+            byte_offset: u8::try_from((word >> 11) & 0xf).expect("four-bit EXT immediate"),
         })
     } else if word & 0xffff_fc00 == 0x0f0c_8400 {
         Ok(DecodedInstructionV3::ShrinkNarrowBytesFromHalfwords {
