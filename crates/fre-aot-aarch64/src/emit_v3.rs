@@ -31,10 +31,10 @@ use crate::{
 
 const CODE_ALIGNMENT_V3: usize = 16;
 const MAX_CODE_BYTES_V3: u64 = 16 << 10;
-const MAX_LABELS_V3: u64 = 18;
-const MAX_RELOCATIONS_V3: u64 = 96;
+const MAX_LABELS_V3: u64 = 48;
+const MAX_RELOCATIONS_V3: u64 = 256;
 const MAX_WORK_V3: u64 = 2 << 20;
-const MAX_SCRATCH_BYTES_V3: u64 = 128 << 10;
+const MAX_SCRATCH_BYTES_V3: u64 = 256 << 10;
 const MAX_PERSISTENT_BYTES_V3: u64 = 128 << 10;
 pub(crate) const IDENTITY_DOMAIN_V3: &[u8] = b"FRE-AOT-AARCH64-COUNT-IMAGE\0\x03";
 const SIMD_CANDIDATE_STARTS_V3: u16 = 16;
@@ -795,18 +795,19 @@ pub(crate) fn prospective_v3(literal_len: usize) -> Result<ProspectiveV3, CountA
                 .ok_or(arithmetic_prospective_v3())?;
             (
                 // The non-periodic specialized template contains a sealed
-                // 128-start primary/composite batch. Its worst case emits
-                // three additional column-major filter refinements plus the
-                // bounded earliest-block classifier.
-                512_usize
+                // 128-start primary batch. Its worst case spells out eight
+                // block-local staged refinements and candidate recoveries so
+                // every false-positive block continues without overlapping
+                // any already-proved start.
+                1_024_usize
                     .checked_add(
                         literal_len
                             .checked_mul(8)
                             .ok_or(arithmetic_prospective_v3())?,
                     )
                     .ok_or(arithmetic_prospective_v3())?,
-                18,
-                64_usize
+                48,
+                160_usize
                     .checked_add(
                         confirmation_units
                             .checked_mul(3)
@@ -2365,18 +2366,45 @@ fn emit_multi_specialized_v3(
     } else {
         None
     };
-    let wide_first_half = if wide_batch.is_some() {
-        Some(assembler.new_label(LabelKindV3::Internal)?)
+    let wide_candidates = if wide_batch.is_some() {
+        Some([
+            assembler.new_label(LabelKindV3::CandidateLoop)?,
+            assembler.new_label(LabelKindV3::CandidateLoop)?,
+            assembler.new_label(LabelKindV3::CandidateLoop)?,
+            assembler.new_label(LabelKindV3::CandidateLoop)?,
+            assembler.new_label(LabelKindV3::CandidateLoop)?,
+            assembler.new_label(LabelKindV3::CandidateLoop)?,
+            assembler.new_label(LabelKindV3::CandidateLoop)?,
+            assembler.new_label(LabelKindV3::CandidateLoop)?,
+        ])
     } else {
         None
     };
-    let wide_first_pair = if wide_batch.is_some() {
-        Some(assembler.new_label(LabelKindV3::Internal)?)
+    let wide_candidate_misses = if wide_batch.is_some() {
+        Some([
+            assembler.new_label(LabelKindV3::Miss)?,
+            assembler.new_label(LabelKindV3::Miss)?,
+            assembler.new_label(LabelKindV3::Miss)?,
+            assembler.new_label(LabelKindV3::Miss)?,
+            assembler.new_label(LabelKindV3::Miss)?,
+            assembler.new_label(LabelKindV3::Miss)?,
+            assembler.new_label(LabelKindV3::Miss)?,
+            assembler.new_label(LabelKindV3::Miss)?,
+        ])
     } else {
         None
     };
-    let wide_first_block = if wide_batch.is_some() {
-        Some(assembler.new_label(LabelKindV3::Internal)?)
+    let wide_advances = if wide_batch.is_some() {
+        Some([
+            assembler.new_label(LabelKindV3::Internal)?,
+            assembler.new_label(LabelKindV3::Internal)?,
+            assembler.new_label(LabelKindV3::Internal)?,
+            assembler.new_label(LabelKindV3::Internal)?,
+            assembler.new_label(LabelKindV3::Internal)?,
+            assembler.new_label(LabelKindV3::Internal)?,
+            assembler.new_label(LabelKindV3::Internal)?,
+            assembler.new_label(LabelKindV3::Internal)?,
+        ])
     } else {
         None
     };
@@ -2498,20 +2526,22 @@ fn emit_multi_specialized_v3(
     if let (
         Some(wide_batch),
         Some(wide_batch_empty),
-        Some(wide_first_half),
-        Some(wide_first_pair),
-        Some(wide_first_block),
+        Some(wide_candidates),
+        Some(wide_candidate_misses),
+        Some(wide_advances),
     ) = (
         wide_batch,
         wide_batch_empty,
-        wide_first_half,
-        wide_first_pair,
-        wide_first_block,
+        wide_candidates,
+        wide_candidate_misses,
+        wide_advances,
     ) {
         // Start every long non-periodic iteration with eight primary masks.
         // An empty union skips all 128 candidate starts after one reduction.
-        // A nonempty union retains the exact masks so the other pattern-only
-        // filter columns can refine them without rescanning the primary.
+        // Nonempty masks are consumed in order. Each block pays for the
+        // remaining columns only until one rejects every surviving lane.
+        // Candidate exhaustion continues with the next retained mask instead
+        // of restarting a 128-start scan that overlaps the prior batch.
         assembler.bind(wide_batch)?;
         assembler.add_reg(X15, X0, X3)?;
         assembler.add_imm(X8, X15, u16::from(filter.offsets[0]))?;
@@ -2550,121 +2580,66 @@ fn emit_multi_specialized_v3(
         assembler.cmp_imm64(X8, 0)?;
         assembler.branch_cond(ConditionV3::Equal, wide_batch_empty)?;
 
-        // Refine column-major only after the primary union proves useful.
-        // The final union is reduced once, independently of filter count.
-        for index in 1..usize::from(filter.len) {
-            assembler.add_imm(X8, X15, u16::from(filter.offsets[index]))?;
-            for block in 0..SPARSE_SCAN_BLOCKS_V3 {
-                let offset = block.checked_mul(SIMD_CANDIDATE_STARTS_V3).ok_or(
-                    CountAotError::ArithmeticOverflow {
-                        site: CountAotArithmeticSite::CodeOffset,
-                    },
-                )?;
-                let mask = u8::try_from(u16::from(SPARSE_BLOCK_MASK_BASE_V3) + block)
-                    .expect("eight wide composite masks");
-                assembler.load_vector128_offset(0, X8, offset)?;
+        for block in 0..usize::from(SPARSE_SCAN_BLOCKS_V3) {
+            let mask = u8::try_from(usize::from(SPARSE_BLOCK_MASK_BASE_V3) + block)
+                .expect("eight wide primary masks");
+            let wide_candidate = wide_candidates[block];
+            let wide_candidate_miss = wide_candidate_misses[block];
+            let wide_advance = wide_advances[block];
+
+            // ADDV distinguishes an empty mask from one with live lanes.
+            // Refinement is block-local and stops at the first rejecting
+            // column, so even dense batches never force work on later blocks.
+            assembler.add_across_bytes16(1, mask)?;
+            assembler.move_vector_byte_to32(X8, 1)?;
+            assembler.cmp_imm64(X8, 0)?;
+            assembler.branch_cond(ConditionV3::Equal, wide_advance)?;
+
+            assembler.add_reg(X15, X0, X3)?;
+            for index in 1..usize::from(filter.len) {
+                assembler.add_imm(X8, X15, u16::from(filter.offsets[index]))?;
+                assembler.load_vector128(0, X8)?;
                 assembler.compare_equal_bytes16(0, 0, vector_registers[index])?;
                 assembler.and_bytes16(mask, mask, 0)?;
+                assembler.unsigned_max_across_bytes16(1, mask)?;
+                assembler.move_vector_byte_to32(X8, 1)?;
+                assembler.cmp_imm64(X8, 0)?;
+                assembler.branch_cond(ConditionV3::Equal, wide_advance)?;
             }
+            assembler.or_bytes16(0, mask, mask)?;
+            assembler.shrink_narrow_bytes_from_halfwords(0, 0, 4)?;
+            assembler.move_vector_double_to64(X6, 0)?;
+            assembler.and_reg(X6, X6, X17)?;
+            assembler.cmp_imm64(X6, 0)?;
+            assembler.branch_cond(ConditionV3::Equal, wide_advance)?;
+
+            assembler.bind(wide_candidate)?;
+            assembler.reverse_bits(X7, X6)?;
+            assembler.count_leading_zeros(X7, X7)?;
+            assembler.sub_imm(X16, X6, 1)?;
+            assembler.and_reg(X6, X6, X16)?;
+            assembler.lsr_imm(X7, X7, 2)?;
+            assembler.add_reg(X5, X3, X7)?;
+            assembler.add_reg(X15, X0, X5)?;
+            emit_confirmation_ordered_v3(
+                assembler,
+                literal,
+                confirmation_order,
+                filter.offsets(),
+                X15,
+                wide_candidate_miss,
+            )?;
+            assembler.add_imm(X13, X13, 1)?;
+            assembler.add_imm(X3, X5, width)?;
+            assembler.branch(vector)?;
+
+            assembler.bind(wide_candidate_miss)?;
+            assembler.cmp_imm64(X6, 0)?;
+            assembler.branch_cond(ConditionV3::NotEqual, wide_candidate)?;
+            assembler.bind(wide_advance)?;
+            assembler.add_imm(X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
         }
-        assembler.or_bytes16(0, SPARSE_BLOCK_MASK_BASE_V3, SPARSE_BLOCK_MASK_BASE_V3 + 1)?;
-        assembler.or_bytes16(
-            1,
-            SPARSE_BLOCK_MASK_BASE_V3 + 2,
-            SPARSE_BLOCK_MASK_BASE_V3 + 3,
-        )?;
-        assembler.or_bytes16(0, 0, 1)?;
-        assembler.or_bytes16(
-            1,
-            SPARSE_BLOCK_MASK_BASE_V3 + 4,
-            SPARSE_BLOCK_MASK_BASE_V3 + 5,
-        )?;
-        assembler.or_bytes16(0, 0, 1)?;
-        assembler.or_bytes16(
-            1,
-            SPARSE_BLOCK_MASK_BASE_V3 + 6,
-            SPARSE_BLOCK_MASK_BASE_V3 + 7,
-        )?;
-        assembler.or_bytes16(1, 0, 1)?;
-        assembler.unsigned_max_across_bytes16(1, 1)?;
-        assembler.move_vector_byte_to32(X8, 1)?;
-        assembler.cmp_imm64(X8, 0)?;
-        assembler.branch_cond(ConditionV3::Equal, wide_batch_empty)?;
-
-        // Recover the earliest exact 16-start mask with a three-level binary
-        // classifier. Second-half masks are copied into the first-half slots
-        // only on that branch, so the final pack is shared.
-        assembler.or_bytes16(0, SPARSE_BLOCK_MASK_BASE_V3, SPARSE_BLOCK_MASK_BASE_V3 + 1)?;
-        assembler.or_bytes16(
-            1,
-            SPARSE_BLOCK_MASK_BASE_V3 + 2,
-            SPARSE_BLOCK_MASK_BASE_V3 + 3,
-        )?;
-        assembler.or_bytes16(0, 0, 1)?;
-        assembler.unsigned_max_across_bytes16(1, 0)?;
-        assembler.move_vector_byte_to32(X8, 1)?;
-        assembler.cmp_imm64(X8, 0)?;
-        assembler.branch_cond(ConditionV3::NotEqual, wide_first_half)?;
-        assembler.add_imm(X3, X3, SIMD_CANDIDATE_STARTS_V3 * 4)?;
-        assembler.or_bytes16(
-            SPARSE_BLOCK_MASK_BASE_V3,
-            SPARSE_BLOCK_MASK_BASE_V3 + 4,
-            SPARSE_BLOCK_MASK_BASE_V3 + 4,
-        )?;
-        assembler.or_bytes16(
-            SPARSE_BLOCK_MASK_BASE_V3 + 1,
-            SPARSE_BLOCK_MASK_BASE_V3 + 5,
-            SPARSE_BLOCK_MASK_BASE_V3 + 5,
-        )?;
-        assembler.or_bytes16(
-            SPARSE_BLOCK_MASK_BASE_V3 + 2,
-            SPARSE_BLOCK_MASK_BASE_V3 + 6,
-            SPARSE_BLOCK_MASK_BASE_V3 + 6,
-        )?;
-        assembler.or_bytes16(
-            SPARSE_BLOCK_MASK_BASE_V3 + 3,
-            SPARSE_BLOCK_MASK_BASE_V3 + 7,
-            SPARSE_BLOCK_MASK_BASE_V3 + 7,
-        )?;
-
-        assembler.bind(wide_first_half)?;
-        assembler.or_bytes16(0, SPARSE_BLOCK_MASK_BASE_V3, SPARSE_BLOCK_MASK_BASE_V3 + 1)?;
-        assembler.unsigned_max_across_bytes16(1, 0)?;
-        assembler.move_vector_byte_to32(X8, 1)?;
-        assembler.cmp_imm64(X8, 0)?;
-        assembler.branch_cond(ConditionV3::NotEqual, wide_first_pair)?;
-        assembler.add_imm(X3, X3, SIMD_CANDIDATE_STARTS_V3 * 2)?;
-        assembler.or_bytes16(
-            SPARSE_BLOCK_MASK_BASE_V3,
-            SPARSE_BLOCK_MASK_BASE_V3 + 2,
-            SPARSE_BLOCK_MASK_BASE_V3 + 2,
-        )?;
-        assembler.or_bytes16(
-            SPARSE_BLOCK_MASK_BASE_V3 + 1,
-            SPARSE_BLOCK_MASK_BASE_V3 + 3,
-            SPARSE_BLOCK_MASK_BASE_V3 + 3,
-        )?;
-
-        assembler.bind(wide_first_pair)?;
-        assembler.unsigned_max_across_bytes16(1, SPARSE_BLOCK_MASK_BASE_V3)?;
-        assembler.move_vector_byte_to32(X8, 1)?;
-        assembler.cmp_imm64(X8, 0)?;
-        assembler.branch_cond(ConditionV3::NotEqual, wide_first_block)?;
-        assembler.add_imm(X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
-        assembler.or_bytes16(
-            SPARSE_BLOCK_MASK_BASE_V3,
-            SPARSE_BLOCK_MASK_BASE_V3 + 1,
-            SPARSE_BLOCK_MASK_BASE_V3 + 1,
-        )?;
-
-        assembler.bind(wide_first_block)?;
-        assembler.or_bytes16(0, SPARSE_BLOCK_MASK_BASE_V3, SPARSE_BLOCK_MASK_BASE_V3)?;
-        assembler.shrink_narrow_bytes_from_halfwords(0, 0, 4)?;
-        assembler.move_vector_double_to64(X6, 0)?;
-        assembler.and_reg(X6, X6, X17)?;
-        assembler.cmp_imm64(X6, 0)?;
-        assembler.branch_cond(ConditionV3::NotEqual, candidate)?;
-        assembler.branch(wide_batch_empty)?;
+        assembler.branch(vector)?;
 
         assembler.bind(wide_batch_empty)?;
         assembler.add_imm(X3, X3, SPARSE_SCAN_STARTS_V3)?;
