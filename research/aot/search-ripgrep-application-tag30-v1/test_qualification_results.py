@@ -131,8 +131,8 @@ def header(
         "host_id": host["host_id"],
         "logical_cpu": host["allowed_logical_cpus"][0],
         "cpu_residence_method": (
-            "macos-user-interactive-qos-affinity-hint-super-class-"
-            "cpu-only-retry"
+            "macos-user-interactive-qos-affinity-hint-bounded-super-"
+            "wait-cpu-only-retry"
             if macos
             else "linux-sched-setaffinity-plus-samples"
         ),
@@ -147,6 +147,11 @@ def header(
         ),
         "macos_performance_levels": (
             analyzer.MACOS_PERFORMANCE_LEVEL_RECEIPT
+            if macos
+            else None
+        ),
+        "macos_super_class_wait_timeout_ns": (
+            analyzer.MACOS_SUPER_CLASS_WAIT_TIMEOUT_NS
             if macos
             else None
         ),
@@ -706,10 +711,28 @@ def run(repo: Path, ripgrep_root: Path, fixture_root: Path) -> None:
                 binding,
             ),
         )
+        wrong_super_wait = header(
+            analyzer,
+            binding,
+            binding["hosts"][0],
+            "timing",
+            0,
+        )
+        wrong_super_wait["macos_super_class_wait_timeout_ns"] -= 1
+        expect_refusal(
+            "changed bounded Super wait",
+            lambda: analyzer.validate_header(
+                wrong_super_wait,
+                "timing",
+                0,
+                binding["hosts"][0],
+                binding,
+            ),
+        )
 
     print(
         "search-tag30-application-tests: PASS "
-        "baseline=1 adversarial=15 cpu_retry=1 candidates=11 fixtures=154 "
+        "baseline=1 adversarial=16 cpu_retry=1 candidates=11 fixtures=154 "
         "rebar_inputs=0 heldout_materialized=false"
     )
 

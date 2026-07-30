@@ -54,8 +54,9 @@ analysis and pre-registers Apple Super-cluster worker labels 12–17 and
 disjoint C9g CPUs 64–79. On the authenticated M5 Max, Mach affinity status
 zero or `KERN_NOT_SUPPORTED` is accepted only after the exact machine and
 performance-level topology is authenticated. Every measured variant records
-bounded CPU-only retries and is accepted only when both sampled endpoints are
-in the Super class. Linux retains exact requested-CPU residence.
+a five-second bounded wall-time Super-class wait followed by bounded CPU-only
+retries, and is accepted only when both sampled endpoints are in the Super
+class. Linux retains exact requested-CPU residence.
 
 The two pending campaign values are deliberately distinct. The private-family
 authorization identity is the raw discovery-authorization file SHA-256. The

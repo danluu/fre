@@ -17,7 +17,7 @@ from typing import Any, Sequence
 
 
 CONTRACT_SHA256 = (
-    "121c44149d1b758fa5ac750aa524621669c92d23c4c095bab7f36bc767faa34b"
+    "db2faa1308d3a103a2b5fc5ebb2c26c0461fadddffc3f214cfcd23e25a8dbfc7"
 )
 CONTRACT_SCHEMA = "fre.aot.search-tag30-ripgrep-application-contract.v1"
 SHARDS = 16

@@ -21,7 +21,7 @@ CONTRACT_RELATIVE = (
     "campaign-contract-v1.json"
 )
 CONTRACT_SHA256 = (
-    "121c44149d1b758fa5ac750aa524621669c92d23c4c095bab7f36bc767faa34b"
+    "db2faa1308d3a103a2b5fc5ebb2c26c0461fadddffc3f214cfcd23e25a8dbfc7"
 )
 PROJECTION_RELATIVE = (
     "research/aot/search-ripgrep-application-tag30-v1/"
@@ -91,6 +91,7 @@ MAXIMUM_ITERATIONS = 1 << 30
 STATIC_GATE = Fraction(4, 5)
 NONTARGET_GATE = Fraction(21, 20)
 MAXIMUM_CPU_ONLY_RETRIES = 64
+MACOS_SUPER_CLASS_WAIT_TIMEOUT_NS = 5_000_000_000
 MACOS_SUPER_CPUS = tuple(range(12, 18))
 MACOS_PERFORMANCE_CPUS = tuple(range(12))
 MACOS_PERFORMANCE_LEVEL_RECEIPT = {
@@ -162,6 +163,7 @@ HEADER_FIELDS = {
     "accepted_cpu_class",
     "accepted_cpu_ids",
     "macos_performance_levels",
+    "macos_super_class_wait_timeout_ns",
     "maximum_cpu_only_retries_per_variant",
     "runner_binary_sha256",
     "runner_source_sha256",
@@ -629,8 +631,8 @@ def validate_header(
             host_id == "local-apple-aarch64-asimd"
             and header.get("cpu_residence_method")
             == (
-                "macos-user-interactive-qos-affinity-hint-super-class-"
-                "cpu-only-retry"
+                "macos-user-interactive-qos-affinity-hint-bounded-super-"
+                "wait-cpu-only-retry"
             )
             and header.get("affinity_request_status") in {0, 46}
             and header.get("qos_class") == 0x21
@@ -639,6 +641,8 @@ def validate_header(
             and header.get("accepted_cpu_ids") == list(MACOS_SUPER_CPUS)
             and header.get("macos_performance_levels")
             == MACOS_PERFORMANCE_LEVEL_RECEIPT
+            and header.get("macos_super_class_wait_timeout_ns")
+            == MACOS_SUPER_CLASS_WAIT_TIMEOUT_NS
             and header.get("logical_cpu") in MACOS_SUPER_CPUS
             and header.get("maximum_cpu_only_retries_per_variant")
             == MAXIMUM_CPU_ONLY_RETRIES
@@ -654,6 +658,7 @@ def validate_header(
             and header.get("accepted_cpu_ids")
             == [header.get("logical_cpu")]
             and header.get("macos_performance_levels") is None
+            and header.get("macos_super_class_wait_timeout_ns") is None
             and header.get("maximum_cpu_only_retries_per_variant") == 0
         )
     )

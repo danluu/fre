@@ -35,10 +35,10 @@ IDENTITY_TEMPLATE = f"{DIRECTORY}/qualification-identity-template-v1.json"
 BINDING_TEMPLATE = f"{DIRECTORY}/campaign-binding-template-v1.json"
 CONTRACT = f"{DIRECTORY}/campaign-contract-v1.json"
 CONTRACT_SHA256 = (
-    "121c44149d1b758fa5ac750aa524621669c92d23c4c095bab7f36bc767faa34b"
+    "db2faa1308d3a103a2b5fc5ebb2c26c0461fadddffc3f214cfcd23e25a8dbfc7"
 )
 CAMPAIGN_PLAN_IDENTITY = (
-    "f5a3319b1178ea97766b735bc39b589a6a1a33e8cc9257a947ea9feff7c5f702"
+    "d39dc02c741a13adc8e0c7c3cc818ffa69e96132af89caf0fef6b5dad6d14333"
 )
 CAMPAIGN_ANALYZER_IDENTITY = (
     "0a32b5a20c03077b856f51741216289aa8399f213261d07e5c8874bf2d3fe6ec"
