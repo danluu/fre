@@ -748,6 +748,32 @@ pub unsafe fn adopt_linked_static_search_span_qualification_v1(
     )
 }
 
+/// Invoke separately named private family-qualification glue.
+///
+/// The private qualification family table begins empty. It can contain only a
+/// reviewed compiler/backend family and its complete execution-policy tuple;
+/// the feature alone cannot populate it. Exact private rows use
+/// [`adopt_linked_static_search_span_qualification_v1`] instead.
+///
+/// # Safety
+///
+/// `invoke_glue` must invoke only the retained glue for
+/// `fre_aot_static_search_span_family_adopt_qualification_raw_v1`.
+#[cfg(feature = "search-span-qualification-private-v1")]
+#[doc(hidden)]
+#[allow(
+    unsafe_code,
+    reason = "this explicitly unsafe adapter is the only Rust entry to the disjoint private Search family-qualification registry"
+)]
+pub unsafe fn adopt_linked_static_search_span_family_qualification_v1(
+    invoke_glue: impl FnOnce(*mut RawStaticSearchSpanAdoptionOutputV1) -> u32,
+) -> Result<&'static VerifiedStaticSearchSpanV1, StaticSearchSpanAdoptionErrorV1> {
+    invoke_and_resolve_search_span_adoption(
+        &PRIVATE_QUALIFICATION_STATIC_SEARCH_SPAN_REGISTRY_V1,
+        invoke_glue,
+    )
+}
+
 impl VerifiedStaticSearchSpanV1 {
     /// Search one checked window with the exact live literal embedded in the
     /// authenticated payload.
@@ -1281,6 +1307,62 @@ pub unsafe extern "C" fn fre_aot_static_search_span_adopt_qualification_raw_v1(
             payload,
             metadata,
             row,
+        )
+    }
+}
+
+/// Separately named private family-qualification raw adoption boundary.
+///
+/// Its family table, symbol, and registry access are disjoint from production.
+/// The table begins empty and the feature alone grants no authority. Family
+/// lookup always completes before any pointer is inspected. After selection,
+/// the existing family verifier reconstructs the expectation, mapped payload,
+/// and exact live-literal binding before publishing a callable.
+///
+/// # Safety
+///
+/// If a future source revision selects `family_selector`, `output` must be
+/// writable and all four addresses must name immutable process-lifetime
+/// symbols whose compiler/backend family and execution-policy tuple exactly
+/// match that reviewed private family.
+#[cfg(feature = "search-span-qualification-private-v1")]
+#[doc(hidden)]
+#[unsafe(no_mangle)]
+#[allow(
+    unsafe_code,
+    reason = "this separately named C boundary is reachable only from explicit private family-qualification glue"
+)]
+pub unsafe extern "C" fn fre_aot_static_search_span_family_adopt_qualification_raw_v1(
+    output: *mut RawStaticSearchSpanAdoptionOutputV1,
+    family_selector: u32,
+    expectation: *const u8,
+    entry: *const u8,
+    payload: *const u8,
+    metadata: *const u8,
+) -> u32 {
+    let family = match search_support::require_private_qualification_search_span_family_v1(
+        family_selector,
+    ) {
+        Ok(family) => family,
+        Err(StaticSearchSpanVerifyErrorV1::NoQualifiedStaticSearchSpanRowV1) => {
+            return STATIC_SEARCH_SPAN_ADOPT_STATUS_NO_QUALIFIED_ROW_V1;
+        }
+        Err(StaticSearchSpanVerifyErrorV1::UnqualifiedStaticSearchSpanSelectorV1) => {
+            return STATIC_SEARCH_SPAN_ADOPT_STATUS_UNQUALIFIED_SELECTOR_V1;
+        }
+        Err(_) => return STATIC_SEARCH_SPAN_ADOPT_STATUS_REFUSED_V1,
+    };
+    // SAFETY: the private source-qualified family was selected before pointer
+    // use and the caller owns the retained raw-symbol contract.
+    unsafe {
+        adopt_selected_static_search_span_family_v1(
+            &PRIVATE_QUALIFICATION_STATIC_SEARCH_SPAN_REGISTRY_V1,
+            output,
+            expectation,
+            entry,
+            payload,
+            metadata,
+            family,
         )
     }
 }
@@ -2079,6 +2161,61 @@ mod tests {
         assert!(!ptr::eq(
             &raw const PRODUCTION_STATIC_SEARCH_SPAN_REGISTRY_V1,
             &raw const PRIVATE_QUALIFICATION_STATIC_SEARCH_SPAN_REGISTRY_V1,
+        ));
+    }
+
+    #[cfg(feature = "search-span-qualification-private-v1")]
+    #[test]
+    #[allow(
+        unsafe_code,
+        reason = "the test proves every unqualified private family selector returns before invalid pointers"
+    )]
+    fn private_source_families_refuse_unqualified_before_pointers() {
+        let conversions_before = implementation::verified_entry_conversion_count();
+        let unrepresentable_selector = u32::from(u16::MAX) + 1;
+        let expected_status =
+            if search_support::private_qualification_families_are_empty_for_test_v1() {
+                STATIC_SEARCH_SPAN_ADOPT_STATUS_NO_QUALIFIED_ROW_V1
+            } else {
+                STATIC_SEARCH_SPAN_ADOPT_STATUS_UNQUALIFIED_SELECTOR_V1
+            };
+        // SAFETY: no source family can have this out-of-u16 selector. Both
+        // empty and nonempty private-table paths return before pointer use.
+        let private = unsafe {
+            fre_aot_static_search_span_family_adopt_qualification_raw_v1(
+                ptr::without_provenance_mut::<RawStaticSearchSpanAdoptionOutputV1>(1),
+                unrepresentable_selector,
+                ptr::without_provenance::<u8>(3),
+                ptr::without_provenance::<u8>(5),
+                ptr::without_provenance::<u8>(7),
+                ptr::without_provenance::<u8>(9),
+            )
+        };
+        assert_eq!(private, expected_status);
+        assert_eq!(
+            implementation::verified_entry_conversion_count(),
+            conversions_before
+        );
+    }
+
+    #[cfg(feature = "search-span-qualification-private-v1")]
+    #[test]
+    #[allow(
+        unsafe_code,
+        reason = "the test exercises the explicitly unsafe private family adapter without granting source authority"
+    )]
+    fn private_family_adapter_preserves_no_qualified_row_status() {
+        // SAFETY: the closure returns the fail-closed status without touching
+        // its nonnull output slot or invoking arbitrary glue.
+        let result = unsafe {
+            adopt_linked_static_search_span_family_qualification_v1(|output| {
+                assert!(!output.is_null());
+                STATIC_SEARCH_SPAN_ADOPT_STATUS_NO_QUALIFIED_ROW_V1
+            })
+        };
+        assert!(matches!(
+            result,
+            Err(StaticSearchSpanAdoptionErrorV1::NoQualifiedStaticSearchSpanRow)
         ));
     }
 

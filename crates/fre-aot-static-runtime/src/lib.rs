@@ -25,8 +25,11 @@
 //! created inside a registry-owned safe handle.
 //!
 //! The isolated Search production and private qualification tables begin empty
-//! and can gain rows only through their separate reviewed source-promotion
-//! transactions; neither a feature nor compiler output can populate them.
+//! and can gain exact rows or artifact-independent families only through their
+//! separate reviewed source-promotion transactions; neither a feature nor
+//! compiler output can populate them. Private exact and family adoption use
+//! separately named raw symbols but share the disjoint private registry only
+//! after their respective source authority is selected.
 //! Compiler `RuntimeAuthority::Absent` remains conceptually separate from this
 //! runtime's source-qualified private or production authority.
 //!
@@ -118,9 +121,11 @@ pub use search_linked::{
 #[cfg(feature = "search-span-qualification-private-v1")]
 #[doc(hidden)]
 pub use search_linked::{
+    adopt_linked_static_search_span_family_qualification_v1,
     adopt_linked_static_search_span_qualification_v1,
     configure_current_thread_sve_vl16_for_search_qualification_v1,
     fre_aot_static_search_span_adopt_qualification_raw_v1,
+    fre_aot_static_search_span_family_adopt_qualification_raw_v1,
 };
 #[cfg(feature = "selected-end-qualification-private-v2")]
 #[doc(hidden)]

@@ -29,7 +29,10 @@ use production_families::PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SPAN_FAMILIES
 #[cfg(feature = "search-span-qualification-private-v1")]
 mod private_rows;
 #[cfg(feature = "search-span-qualification-private-v1")]
-use private_rows::PRIVATE_QUALIFICATION_STATIC_SEARCH_SPAN_ROWS_V1;
+use private_rows::{
+    PRIVATE_QUALIFICATION_STATIC_SEARCH_SPAN_FAMILIES_V1,
+    PRIVATE_QUALIFICATION_STATIC_SEARCH_SPAN_ROWS_V1,
+};
 
 macro_rules! source_qualified_identity_v1 {
     ($name:ident) => {
@@ -153,6 +156,70 @@ impl SourceQualifiedStaticSearchSpanFamilyV1 {
             analyzer_identity: SourceQualifiedAnalyzerIdentityV1(analyzer_identity),
             evidence_identity: SourceQualifiedEvidenceIdentityV1(evidence_identity),
         }
+    }
+
+    /// Construct one compiler-family row in the feature-gated private source
+    /// module.
+    ///
+    /// The qualification family remains artifact independent. Every concrete
+    /// linked object must still pass expectation, mapped-image, live-literal
+    /// KIR, and regenerated-payload verification before adoption.
+    #[cfg(feature = "search-span-qualification-private-v1")]
+    #[allow(
+        dead_code,
+        clippy::too_many_arguments,
+        reason = "the private atom retains this solely for canonical reviewed family construction"
+    )]
+    const fn private_qualification(
+        selector: u16,
+        compiler_version: u16,
+        metadata_version: u16,
+        backend_version: u16,
+        call_abi_schema: u16,
+        exported_symbol_schema: u16,
+        output_kind: u8,
+        architecture: u8,
+        little_endian: bool,
+        pointer_width: u8,
+        target_abi: u8,
+        platform: u8,
+        status_bits: u8,
+        exported_symbol_n_type: u8,
+        required_features: u64,
+        minimum_literal_bytes: u32,
+        maximum_literal_bytes: u32,
+        minimum_window_bytes: u32,
+        portable_prefix_candidate_starts: u32,
+        manifest_identity: [u8; 32],
+        plan_identity: [u8; 32],
+        analyzer_identity: [u8; 32],
+        evidence_identity: [u8; 32],
+    ) -> Self {
+        Self::production(
+            selector,
+            compiler_version,
+            metadata_version,
+            backend_version,
+            call_abi_schema,
+            exported_symbol_schema,
+            output_kind,
+            architecture,
+            little_endian,
+            pointer_width,
+            target_abi,
+            platform,
+            status_bits,
+            exported_symbol_n_type,
+            required_features,
+            minimum_literal_bytes,
+            maximum_literal_bytes,
+            minimum_window_bytes,
+            portable_prefix_candidate_starts,
+            manifest_identity,
+            plan_identity,
+            analyzer_identity,
+            evidence_identity,
+        )
     }
 
     #[cfg(test)]
@@ -476,7 +543,7 @@ const fn qualification_rows_are_canonical(rows: &[SourceQualifiedStaticSearchSpa
     true
 }
 
-const fn production_families_are_canonical(
+const fn search_span_families_are_canonical(
     rows: &[SourceQualifiedStaticSearchSpanFamilyV1],
 ) -> bool {
     if rows.len() > HARD_MAX_STATIC_SEARCH_SPAN_PRODUCTION_FAMILIES_V1 {
@@ -651,17 +718,25 @@ const fn identity_is_zero(identity: &[u8; 32]) -> bool {
 }
 
 fn production_authority_tables_are_canonical() -> bool {
-    production_authority_tables_are_canonical_for(
+    authority_tables_are_canonical_for(
         PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SPAN_ROWS_V1,
         PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SPAN_FAMILIES_V1,
     )
 }
 
-fn production_authority_tables_are_canonical_for(
+#[cfg(feature = "search-span-qualification-private-v1")]
+fn private_qualification_authority_tables_are_canonical() -> bool {
+    authority_tables_are_canonical_for(
+        PRIVATE_QUALIFICATION_STATIC_SEARCH_SPAN_ROWS_V1,
+        PRIVATE_QUALIFICATION_STATIC_SEARCH_SPAN_FAMILIES_V1,
+    )
+}
+
+fn authority_tables_are_canonical_for(
     rows: &[SourceQualifiedStaticSearchSpanRowV1],
     families: &[SourceQualifiedStaticSearchSpanFamilyV1],
 ) -> bool {
-    if !qualification_rows_are_canonical(rows) || !production_families_are_canonical(families) {
+    if !qualification_rows_are_canonical(rows) || !search_span_families_are_canonical(families) {
         return false;
     }
     for row in rows {
@@ -703,7 +778,7 @@ pub(crate) fn require_production_search_span_family_v1(
     if PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SPAN_FAMILIES_V1.is_empty() {
         return Err(StaticSearchSpanVerifyErrorV1::NoQualifiedStaticSearchSpanRowV1);
     }
-    if !production_families_are_canonical(
+    if !search_span_families_are_canonical(
         PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SPAN_FAMILIES_V1,
     ) {
         return Err(StaticSearchSpanVerifyErrorV1::MalformedStaticSearchSpanQualificationTableV1);
@@ -735,7 +810,28 @@ pub(crate) fn require_private_qualification_search_span_row_v1(
     if PRIVATE_QUALIFICATION_STATIC_SEARCH_SPAN_ROWS_V1.is_empty() {
         return Err(StaticSearchSpanVerifyErrorV1::NoQualifiedStaticSearchSpanRowV1);
     }
+    if !private_qualification_authority_tables_are_canonical() {
+        return Err(StaticSearchSpanVerifyErrorV1::MalformedStaticSearchSpanQualificationTableV1);
+    }
     find_row(PRIVATE_QUALIFICATION_STATIC_SEARCH_SPAN_ROWS_V1, selector)
+}
+
+#[cfg(feature = "search-span-qualification-private-v1")]
+pub(crate) fn require_private_qualification_search_span_family_v1(
+    selector: u32,
+) -> Result<&'static SourceQualifiedStaticSearchSpanFamilyV1, StaticSearchSpanVerifyErrorV1> {
+    if PRIVATE_QUALIFICATION_STATIC_SEARCH_SPAN_FAMILIES_V1.is_empty() {
+        return Err(StaticSearchSpanVerifyErrorV1::NoQualifiedStaticSearchSpanRowV1);
+    }
+    if !private_qualification_authority_tables_are_canonical() {
+        return Err(StaticSearchSpanVerifyErrorV1::MalformedStaticSearchSpanQualificationTableV1);
+    }
+    let selector = u16::try_from(selector)
+        .map_err(|_| StaticSearchSpanVerifyErrorV1::UnqualifiedStaticSearchSpanSelectorV1)?;
+    PRIVATE_QUALIFICATION_STATIC_SEARCH_SPAN_FAMILIES_V1
+        .iter()
+        .find(|family| family.selector == selector)
+        .ok_or(StaticSearchSpanVerifyErrorV1::UnqualifiedStaticSearchSpanSelectorV1)
 }
 
 #[cfg(test)]
@@ -747,6 +843,11 @@ pub(crate) const fn production_authorities_are_empty_for_test_v1() -> bool {
 #[cfg(all(test, feature = "search-span-qualification-private-v1"))]
 pub(crate) const fn private_qualification_rows_are_empty_for_test_v1() -> bool {
     PRIVATE_QUALIFICATION_STATIC_SEARCH_SPAN_ROWS_V1.is_empty()
+}
+
+#[cfg(all(test, feature = "search-span-qualification-private-v1"))]
+pub(crate) const fn private_qualification_families_are_empty_for_test_v1() -> bool {
+    PRIVATE_QUALIFICATION_STATIC_SEARCH_SPAN_FAMILIES_V1.is_empty()
 }
 
 fn find_row(
@@ -833,7 +934,7 @@ mod tests {
 
     #[test]
     fn production_family_state_is_canonical_bounded_and_fails_closed() {
-        assert!(production_families_are_canonical(
+        assert!(search_span_families_are_canonical(
             PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SPAN_FAMILIES_V1
         ));
         assert!(
@@ -850,63 +951,63 @@ mod tests {
             SourceQualifiedStaticSearchSpanFamilyV1::test_only(3, 2, 8),
             SourceQualifiedStaticSearchSpanFamilyV1::test_only(9, 16, 32),
         ];
-        assert!(production_families_are_canonical(&valid));
+        assert!(search_span_families_are_canonical(&valid));
         let reversed = [valid[1], valid[0]];
-        assert!(!production_families_are_canonical(&reversed));
+        assert!(!search_span_families_are_canonical(&reversed));
         let empty_width = [SourceQualifiedStaticSearchSpanFamilyV1::test_only(3, 0, 8)];
-        assert!(!production_families_are_canonical(&empty_width));
+        assert!(!search_span_families_are_canonical(&empty_width));
         let inverted = [SourceQualifiedStaticSearchSpanFamilyV1::test_only(3, 9, 8)];
-        assert!(!production_families_are_canonical(&inverted));
+        assert!(!search_span_families_are_canonical(&inverted));
         let overlapping = [
             SourceQualifiedStaticSearchSpanFamilyV1::test_only(3, 2, 16),
             SourceQualifiedStaticSearchSpanFamilyV1::test_only(9, 8, 32),
         ];
-        assert!(!production_families_are_canonical(&overlapping));
+        assert!(!search_span_families_are_canonical(&overlapping));
         let mut overlapping_different_manifest = overlapping;
         overlapping_different_manifest[1].manifest_identity =
             SourceQualifiedManifestIdentityV1([0xa5; 32]);
-        assert!(!production_families_are_canonical(
+        assert!(!search_span_families_are_canonical(
             &overlapping_different_manifest
         ));
         let mut overlapping_different_floor = overlapping;
         overlapping_different_floor[1].minimum_window_bytes = 8_192;
-        assert!(!production_families_are_canonical(
+        assert!(!search_span_families_are_canonical(
             &overlapping_different_floor
         ));
 
         let mut wrong_backend = valid[0];
         wrong_backend.backend_version = 7;
-        assert!(!production_families_are_canonical(&[wrong_backend]));
+        assert!(!search_span_families_are_canonical(&[wrong_backend]));
         let mut wrong_platform = valid[0];
         wrong_platform.platform = 9;
-        assert!(!production_families_are_canonical(&[wrong_platform]));
+        assert!(!search_span_families_are_canonical(&[wrong_platform]));
         let mut wrong_features = valid[0];
         wrong_features.required_features = SEARCH_REQUIRED_SVE2_FIXED16_FEATURES_V1;
-        assert!(!production_families_are_canonical(&[wrong_features]));
+        assert!(!search_span_families_are_canonical(&[wrong_features]));
         let mut v9 = valid[0];
         v9.backend_version = SEARCH_BACKEND_ASIMD_TAG22_V1;
-        assert!(production_families_are_canonical(&[v9]));
+        assert!(search_span_families_are_canonical(&[v9]));
         let mut v10 = valid[0];
         v10.backend_version = SEARCH_BACKEND_ASIMD_TAG23_V1;
-        assert!(production_families_are_canonical(&[v10]));
+        assert!(search_span_families_are_canonical(&[v10]));
         let mut zero_floor = valid[0];
         zero_floor.minimum_window_bytes = 0;
-        assert!(!production_families_are_canonical(&[zero_floor]));
+        assert!(!search_span_families_are_canonical(&[zero_floor]));
         let mut zero_prefix = valid[0];
         zero_prefix.portable_prefix_candidate_starts = 0;
-        assert!(!production_families_are_canonical(&[zero_prefix]));
+        assert!(!search_span_families_are_canonical(&[zero_prefix]));
         let mut prefix_exceeds_floor = valid[0];
         prefix_exceeds_floor.minimum_window_bytes = 262;
-        assert!(!production_families_are_canonical(&[prefix_exceeds_floor]));
+        assert!(!search_span_families_are_canonical(&[prefix_exceeds_floor]));
         let mut zero_plan = valid[0];
         zero_plan.plan_identity = SourceQualifiedPlanIdentityV1([0; 32]);
-        assert!(!production_families_are_canonical(&[zero_plan]));
+        assert!(!search_span_families_are_canonical(&[zero_plan]));
         let mut zero_analyzer = valid[0];
         zero_analyzer.analyzer_identity = SourceQualifiedAnalyzerIdentityV1([0; 32]);
-        assert!(!production_families_are_canonical(&[zero_analyzer]));
+        assert!(!search_span_families_are_canonical(&[zero_analyzer]));
         let mut zero_evidence = valid[0];
         zero_evidence.evidence_identity = SourceQualifiedEvidenceIdentityV1([0; 32]);
-        assert!(!production_families_are_canonical(&[zero_evidence]));
+        assert!(!search_span_families_are_canonical(&[zero_evidence]));
 
         let fixture = crate::search_test_fixture::static_search_span_fixture_v1();
         let ambiguous = [SourceQualifiedStaticSearchSpanFamilyV1::test_only(
@@ -914,7 +1015,7 @@ mod tests {
             1,
             32,
         )];
-        assert!(!production_authority_tables_are_canonical_for(
+        assert!(!authority_tables_are_canonical_for(
             &[fixture.row],
             &ambiguous,
         ));
@@ -923,7 +1024,7 @@ mod tests {
             1,
             32,
         )];
-        assert!(production_authority_tables_are_canonical_for(
+        assert!(authority_tables_are_canonical_for(
             &[fixture.row],
             &disjoint,
         ));
@@ -932,6 +1033,9 @@ mod tests {
     #[cfg(feature = "search-span-qualification-private-v1")]
     #[test]
     fn private_qualification_state_fails_closed_for_unqualified_selectors() {
+        assert!(qualification_rows_are_canonical(
+            PRIVATE_QUALIFICATION_STATIC_SEARCH_SPAN_ROWS_V1
+        ));
         if PRIVATE_QUALIFICATION_STATIC_SEARCH_SPAN_ROWS_V1.is_empty() {
             assert_eq!(
                 require_private_qualification_search_span_row_v1(0),
@@ -945,6 +1049,34 @@ mod tests {
         };
         assert_eq!(
             require_private_qualification_search_span_row_v1(u32::from(u16::MAX) + 1),
+            Err(expected)
+        );
+    }
+
+    #[cfg(feature = "search-span-qualification-private-v1")]
+    #[test]
+    fn private_qualification_family_state_is_canonical_bounded_and_fails_closed() {
+        assert!(search_span_families_are_canonical(
+            PRIVATE_QUALIFICATION_STATIC_SEARCH_SPAN_FAMILIES_V1
+        ));
+        assert!(private_qualification_authority_tables_are_canonical());
+        assert!(
+            PRIVATE_QUALIFICATION_STATIC_SEARCH_SPAN_FAMILIES_V1.len()
+                <= HARD_MAX_STATIC_SEARCH_SPAN_PRODUCTION_FAMILIES_V1
+        );
+        if PRIVATE_QUALIFICATION_STATIC_SEARCH_SPAN_FAMILIES_V1.is_empty() {
+            assert_eq!(
+                require_private_qualification_search_span_family_v1(0),
+                Err(StaticSearchSpanVerifyErrorV1::NoQualifiedStaticSearchSpanRowV1)
+            );
+        }
+        let expected = if PRIVATE_QUALIFICATION_STATIC_SEARCH_SPAN_FAMILIES_V1.is_empty() {
+            StaticSearchSpanVerifyErrorV1::NoQualifiedStaticSearchSpanRowV1
+        } else {
+            StaticSearchSpanVerifyErrorV1::UnqualifiedStaticSearchSpanSelectorV1
+        };
+        assert_eq!(
+            require_private_qualification_search_span_family_v1(u32::from(u16::MAX) + 1),
             Err(expected)
         );
     }
