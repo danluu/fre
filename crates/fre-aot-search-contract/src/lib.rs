@@ -119,6 +119,30 @@ pub const SEARCH_BACKEND_ASIMD_TAG38_MAX_LITERAL_BYTES_V1: u32 = 32;
 /// As in V24, the sixth offset is derived rather than persisted as a sixth
 /// manifest field.
 pub const SEARCH_BACKEND_ASIMD_TAG38_MANIFEST_FILTER_FIELDS_V1: u8 = 5;
+/// Prospectively frozen V26 compiler/candidate lower literal bound.
+///
+/// This is routing policy only. It grants no runtime authority. V26/tag39
+/// internally selects its frozen short graph for widths 6..=8, but those
+/// widths remain outside the V26 production family.
+pub const SEARCH_V26_MIN_LITERAL_BYTES_V1: u32 = 6;
+/// Prospectively frozen V26 inclusive upper bound of the short-width class.
+///
+/// The qualification contract calls this `portable_max_literal_bytes`.
+/// Production retains the existing non-V26 route for this class; it does not
+/// create a V17/tag30 authority row.
+pub const SEARCH_V26_PORTABLE_MAX_LITERAL_BYTES_V1: u32 = 8;
+/// Prospectively frozen V26 production-family lower literal bound.
+pub const SEARCH_V26_PRODUCTION_MIN_LITERAL_BYTES_V1: u32 = 9;
+/// Prospectively frozen V26 compiler and production upper literal bound.
+pub const SEARCH_V26_MAX_LITERAL_BYTES_V1: u32 = 32;
+
+const _: () = assert!(
+    SEARCH_V26_PORTABLE_MAX_LITERAL_BYTES_V1 + 1 == SEARCH_V26_PRODUCTION_MIN_LITERAL_BYTES_V1
+);
+const _: () = assert!(SEARCH_V26_MIN_LITERAL_BYTES_V1 <= SEARCH_V26_PORTABLE_MAX_LITERAL_BYTES_V1);
+const _: () = assert!(
+    SEARCH_V26_PRODUCTION_MIN_LITERAL_BYTES_V1 <= SEARCH_V26_MAX_LITERAL_BYTES_V1
+);
 /// Explicit fixed-VL16 SVE2 candidate backend. This never changes the V8
 /// default or grants qualification authority.
 pub const SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1: u16 = 21;
@@ -178,6 +202,20 @@ pub const fn search_backend_literal_width_is_valid_v1(
                 && live_literal_bytes <= MAX_STATIC_SEARCH_SPAN_LITERAL_BYTES_V1
         }
     }
+}
+
+/// Return whether the prospectively frozen V26 production family owns a
+/// literal width.
+///
+/// The V26 compiler may admit widths 6..=8 under its tag39 wire identity, but
+/// this production predicate deliberately refuses them. Returning `true`
+/// still grants no runtime authority.
+#[must_use]
+pub const fn search_v26_production_literal_width_is_valid_v1(
+    live_literal_bytes: u32,
+) -> bool {
+    live_literal_bytes >= SEARCH_V26_PRODUCTION_MIN_LITERAL_BYTES_V1
+        && live_literal_bytes <= SEARCH_V26_MAX_LITERAL_BYTES_V1
 }
 
 /// Source-first Search compiler version admitted by the expectation.
@@ -1371,6 +1409,10 @@ mod tests {
         assert_eq!(SEARCH_BACKEND_ASIMD_TAG38_MIN_LITERAL_BYTES_V1, 6);
         assert_eq!(SEARCH_BACKEND_ASIMD_TAG38_MAX_LITERAL_BYTES_V1, 32);
         assert_eq!(SEARCH_BACKEND_ASIMD_TAG38_MANIFEST_FILTER_FIELDS_V1, 5);
+        assert_eq!(SEARCH_V26_MIN_LITERAL_BYTES_V1, 6);
+        assert_eq!(SEARCH_V26_PORTABLE_MAX_LITERAL_BYTES_V1, 8);
+        assert_eq!(SEARCH_V26_PRODUCTION_MIN_LITERAL_BYTES_V1, 9);
+        assert_eq!(SEARCH_V26_MAX_LITERAL_BYTES_V1, 32);
         assert_eq!(SEARCH_SPAN_OUTPUT_KIND_V1, 3);
         assert_eq!(SEARCH_REQUIRED_ASIMD_FEATURES_V1, 1);
         assert_eq!(MIN_STATIC_SEARCH_SPAN_LITERAL_BYTES_V1, 1);
@@ -1487,6 +1529,20 @@ mod tests {
         assert_eq!(
             claim.expectation_identity(),
             &bytes[STATIC_SEARCH_SPAN_EXPECTATION_IDENTITY_OFFSET_V1..]
+        );
+    }
+
+    #[test]
+    fn v26_production_width_policy_excludes_the_frozen_short_class() {
+        for bytes in 0..=40 {
+            assert_eq!(
+                search_v26_production_literal_width_is_valid_v1(bytes),
+                (9..=32).contains(&bytes)
+            );
+        }
+        assert_eq!(
+            SEARCH_V26_PORTABLE_MAX_LITERAL_BYTES_V1 + 1,
+            SEARCH_V26_PRODUCTION_MIN_LITERAL_BYTES_V1
         );
     }
 

@@ -1,0 +1,64 @@
+{
+  "schema": "fre.aot.search-v26-production-authorization.v1",
+  "state": "unactivated-template",
+  "production_authority": false,
+  "predecessor": {
+    "v25_terminal_decision": "FAIL",
+    "v25_terminal_analysis_sha256": null
+  },
+  "source": {
+    "commit": null,
+    "tree": null
+  },
+  "compiler_architecture": {
+    "backend_tag": 39,
+    "image_magic": 39,
+    "regex_codegen": "self-contained-fre-aarch64-search-v26",
+    "regex_codegen_uses_llvm": false,
+    "architecture_review_sha256": null
+  },
+  "qualification": {
+    "campaign_is_fresh_and_disjoint_from_v25": true,
+    "campaign_contract_sha256": null,
+    "development_decision": "PASS",
+    "development_pass_sha256": null,
+    "correctness_decision": "PASS",
+    "two_host_correctness_gate_sha256": null,
+    "heldout_decision": "PASS",
+    "heldout_pass_sha256": null,
+    "heldout_analysis_sha256": null
+  },
+  "review": {
+    "production_review_sha256": null,
+    "authorization_sha256": null,
+    "source_inventory_review_sha256": null
+  },
+  "routing": {
+    "candidate_minimum_literal_bytes": 6,
+    "portable_max_literal_bytes": 8,
+    "production_minimum_literal_bytes": 9,
+    "maximum_literal_bytes": 32,
+    "short_width_route": "existing-non-v26",
+    "short_width_production_authority": false
+  },
+  "family": {
+    "selector": null,
+    "minimum_window_bytes": null,
+    "portable_prefix_candidate_starts": null,
+    "plan_identity": null,
+    "analyzer_identity": null,
+    "evidence_identity": null
+  },
+  "targets": {
+    "macos_aarch64": {
+      "manifest_identity": null,
+      "build_receipt_sha256": null,
+      "final_image_review_sha256": null
+    },
+    "linux_aarch64": {
+      "manifest_identity": null,
+      "build_receipt_sha256": null,
+      "final_image_review_sha256": null
+    }
+  }
+}
