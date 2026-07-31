@@ -12,7 +12,11 @@ use super::SourceQualifiedStaticSearchSpanFamilyV1;
 /// identifies an evidence-backed minimum input size and literal-width set.
 /// A tag38 row additionally requires the disjoint V25 authorization atom and
 /// the default-off `linked-search-v25-production-v1` feature; neither the row
-/// nor the feature can substitute for that authority chain.
+/// nor the feature can substitute for that authority chain. Tag39 has the
+/// same two-key shape through the separate, default-off
+/// `linked-search-v26-production-v1` feature and V26 authorization atom. The
+/// V26 atom is compile-time absent in this seam, including in all-features
+/// builds.
 pub(super) const PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SPAN_FAMILIES_V1:
     &[SourceQualifiedStaticSearchSpanFamilyV1] = &[];
 

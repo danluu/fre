@@ -59,6 +59,7 @@ mod search_selected_end_expectation_v2;
 mod search_selected_end_v2;
 mod search_static_expectation;
 mod search_v25_production;
+mod search_v26_production;
 mod static_expectation;
 mod static_expectation_v2;
 
@@ -202,6 +203,11 @@ pub use search_v25_production::{
     LinuxAarch64SearchV25ProductionSourceV1, MacosAarch64SearchV25ProductionSourceV1,
     SearchV25ProductionSourceErrorV1, build_linux_aarch64_search_v25_production_source_v1,
     build_macos_aarch64_search_v25_production_source_v1,
+};
+pub use search_v26_production::{
+    LinuxAarch64SearchV26ProductionSourceV1, MacosAarch64SearchV26ProductionSourceV1,
+    SearchV26ProductionSourceErrorV1, build_linux_aarch64_search_v26_production_source_v1,
+    build_macos_aarch64_search_v26_production_source_v1,
 };
 pub use search_static_expectation::{
     STATIC_SEARCH_SPAN_EXPECTATION_BUILD_ALLOCATIONS_V1,

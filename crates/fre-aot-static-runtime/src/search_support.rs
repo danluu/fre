@@ -34,6 +34,7 @@ use production_rows::PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SPAN_ROWS_V1;
 mod production_families;
 use production_families::PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SPAN_FAMILIES_V1;
 mod production_v25_authorization;
+mod production_v26_authorization;
 
 #[cfg(feature = "search-span-qualification-private-v1")]
 mod private_rows;
@@ -858,7 +859,10 @@ const fn production_search_span_families_are_canonical(
         {
             return false;
         }
-        if rows[index].backend_version == SEARCH_BACKEND_ASIMD_TAG39_V1 {
+        if rows[index].backend_version == SEARCH_BACKEND_ASIMD_TAG39_V1
+            && (!cfg!(feature = "linked-search-v26-production-v1")
+                || !production_v26_authorization::authorizes(&rows[index]))
+        {
             return false;
         }
         let Some(next) = index.checked_add(1) else {
@@ -1195,7 +1199,11 @@ mod tests {
             fre_aot_search_contract::SEARCH_V26_PRODUCTION_MIN_LITERAL_BYTES_V1;
         assert!(
             !production_search_span_families_are_canonical(&[v26_future_route_width]),
-            "future-only V26 production width must not grant authority"
+            "feature selection cannot substitute for the absent V26 authorization atom"
+        );
+        assert!(
+            !production_v26_authorization::authorizes(&v26_future_route_width),
+            "the checked-in V26 authorization atom must remain absent"
         );
         let mut v26_too_wide = v26;
         v26_too_wide.maximum_literal_bytes = SEARCH_BACKEND_ASIMD_TAG39_MAX_LITERAL_BYTES_V1 + 1;

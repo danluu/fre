@@ -1,9 +1,13 @@
 # Inert Search V26/tag39 production contract
 
 This directory freezes source-only production-readiness policy for a future
-Search V26/tag39 qualification. It grants no runtime authority, adds no
-production-family row, enables no Cargo feature, links no object, and changes
-no default route.
+Search V26/tag39 qualification. The repository now contains an inert,
+default-off prequalification seam: `linked-search-v26-production-v1`, the
+`compiled-search-v26-aot` owning facade, per-target source-pair builders, and a
+private V26 authorization module whose value is compile-time fixed to `None`.
+It grants no runtime authority, adds no production-family row, links no
+object, and changes no default route. Enabling every Cargo feature still
+cannot create a tag39 callable.
 
 V25 is terminal and cannot be promoted. Its development transaction failed
 its frozen maximum-cell gate. A V26 authorization must bind that terminal
@@ -39,6 +43,13 @@ The neutral constants and predicate live in `fre-aot-search-contract`:
 
 These constants are routing facts, not authority.
 
+The public macOS and Linux V26 source-pair builders compile the exact source
+first, then check the decoded/live literal width sealed in the compiler
+receipt. Widths outside 9..=32 fail before expectation or production-glue
+publication. The owning facade applies the same production envelope before
+calling a supplied glue entry and caches every missing-authority, backend, or
+binding refusal as a portable route.
+
 ## Locks required before a future promotion
 
 A future source revision may add a V26 production atom only if every lock
@@ -64,6 +75,14 @@ below is closed in one independently reviewed transaction:
    width outside 9..=32 remain unchanged; and
 8. automatic binding repeats the authenticated family literal-envelope check
    before publishing a static route.
+
+The family row is intentionally artifact-independent: it describes the
+reviewed compiler/backend/ABI/ISA/routing envelope rather than enumerating
+literal identities at runtime. The reviewed source inventory is therefore a
+consumer-deployment and final-image obligation, not a runtime family-membership
+table. Each deployed consumer must validate every linked source against its
+own reviewed inventory; runtime adoption still reconstructs and compares each
+concrete mapped tag39 payload before it can become callable.
 
 Any missing, malformed, zero, stale, cross-target-copied, or mismatched field
 must leave the V26 authority atom absent and the production family table
@@ -92,9 +111,10 @@ This sequence is intentionally blocked today at step 1.
    and publish the authorization-file and inventory-file SHA-256 digests out
    of band. The files bind the review decisions rather than each other's file
    digests, avoiding a cyclic self-hash contract.
-4. In a clean isolated worktree rooted at the reviewed candidate, add only
-   the separate V26 authorization atom and target-conditional tag39 family
-   rows. Keep both changes behind a new default-off V26 production feature.
+4. In a clean isolated worktree rooted at the reviewed candidate, replace the
+   V26 authorization atom's fixed `None` with the reviewed value and add only
+   the target-conditional tag39 family rows. Keep both gates behind the
+   existing default-off V26 production feature.
 5. Require the authorization atom to match the complete tag39 family tuple
    and both independently supplied file digests. Require each supported target
    to contain exactly one width-9..=32 V26 row and every other target to
@@ -112,5 +132,5 @@ This sequence is intentionally blocked today at step 1.
    enable the V26 feature only in consumers that link the exact reviewed
    source-specific glue.
 
-No step permits activation from the V25 authorization template or the
-default-off V25 feature.
+No step permits activation from the inert facade/feature alone, the V25
+authorization template, or the default-off V25 feature.

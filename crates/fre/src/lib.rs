@@ -16,6 +16,11 @@
 //! owning bind-once facade and forwards the tag38 static-link boundary. A
 //! missing or mismatched source-authority row is cached as a portable route;
 //! the feature, facade, and linked objects cannot create tag38 authority.
+//! The separate default-off `compiled-search-v26-aot` facade does the same for
+//! tag39, but prequalifies only decoded exact literals of width 9..=32 before
+//! calling glue. Its private authorization atom is fixed to absent, so even an
+//! all-features build remains portable. It does not change JIT `CURRENT`,
+//! ordinary [`PortableRegex`] behavior, or any default feature.
 //! The separate default-off `explicit-count-v3-aot` feature binds an
 //! already-adopted optimizing Count-v3 handle only to the live fixed-policy
 //! exact-literal Count owner whose literal, semantic identity, and planning
@@ -522,6 +527,11 @@ pub use search_aot_facade::{
 pub use search_aot_facade::{
     SearchExactLiteralCompiledAotV25, SearchExactLiteralCompiledAotV25Error,
     SearchExactLiteralCompiledAotV25Fallback, SearchExactLiteralCompiledAotV25Route,
+};
+#[cfg(feature = "compiled-search-v26-aot")]
+pub use search_aot_facade::{
+    SearchExactLiteralCompiledAotV26, SearchExactLiteralCompiledAotV26Error,
+    SearchExactLiteralCompiledAotV26Fallback, SearchExactLiteralCompiledAotV26Route,
 };
 pub use set::{
     PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION, PortableRegexSet, PortableRegexSetBuildError,
