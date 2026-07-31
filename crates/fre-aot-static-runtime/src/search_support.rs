@@ -37,6 +37,7 @@ mod production_families;
 use production_families::PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SPAN_FAMILIES_V1;
 mod production_v25_authorization;
 mod production_v26_authorization;
+mod production_v27_authorization;
 
 #[cfg(feature = "search-span-qualification-private-v1")]
 mod private_rows;
