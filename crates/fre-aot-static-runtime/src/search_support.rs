@@ -10,6 +10,8 @@ use fre_aot_search_contract::{
     SEARCH_BACKEND_ASIMD_TAG38_MIN_LITERAL_BYTES_V1, SEARCH_BACKEND_ASIMD_TAG38_V1,
     SEARCH_BACKEND_ASIMD_TAG39_MAX_LITERAL_BYTES_V1,
     SEARCH_BACKEND_ASIMD_TAG39_MIN_LITERAL_BYTES_V1, SEARCH_BACKEND_ASIMD_TAG39_V1,
+    SEARCH_BACKEND_ASIMD_TAG40_MAX_LITERAL_BYTES_V1,
+    SEARCH_BACKEND_ASIMD_TAG40_MIN_LITERAL_BYTES_V1, SEARCH_BACKEND_ASIMD_TAG40_V1,
     SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1, SEARCH_BACKEND_VERSION_V1, SEARCH_CALL_ABI_SCHEMA_V1,
     SEARCH_EXPORTED_SYMBOL_INFO_ELF_FUNCTION_V1, SEARCH_EXPORTED_SYMBOL_N_TYPE_V1,
     SEARCH_EXPORTED_SYMBOL_SCHEMA_VERSION_V1, SEARCH_METADATA_VERSION_V1, SEARCH_PLATFORM_LINUX_V1,
@@ -783,6 +785,21 @@ const fn production_family_profile_is_canonical(
                 && family.maximum_literal_bytes <= SEARCH_BACKEND_ASIMD_TAG39_MAX_LITERAL_BYTES_V1
         }
         (
+            SEARCH_PLATFORM_MACOS_V1,
+            SEARCH_BACKEND_ASIMD_TAG40_V1,
+            SEARCH_REQUIRED_ASIMD_FEATURES_V1,
+            SEARCH_EXPORTED_SYMBOL_N_TYPE_V1,
+        )
+        | (
+            SEARCH_PLATFORM_LINUX_V1,
+            SEARCH_BACKEND_ASIMD_TAG40_V1,
+            SEARCH_REQUIRED_ASIMD_FEATURES_V1,
+            SEARCH_EXPORTED_SYMBOL_INFO_ELF_FUNCTION_V1,
+        ) => {
+            family.minimum_literal_bytes >= SEARCH_BACKEND_ASIMD_TAG40_MIN_LITERAL_BYTES_V1
+                && family.maximum_literal_bytes <= SEARCH_BACKEND_ASIMD_TAG40_MAX_LITERAL_BYTES_V1
+        }
+        (
             SEARCH_PLATFORM_LINUX_V1,
             SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1,
             SEARCH_REQUIRED_SVE2_FIXED16_FEATURES_V1,
@@ -863,6 +880,9 @@ const fn production_search_span_families_are_canonical(
             && (!cfg!(feature = "linked-search-v26-production-v1")
                 || !production_v26_authorization::authorizes(&rows[index]))
         {
+            return false;
+        }
+        if rows[index].backend_version == SEARCH_BACKEND_ASIMD_TAG40_V1 {
             return false;
         }
         let Some(next) = index.checked_add(1) else {
@@ -1208,6 +1228,18 @@ mod tests {
         let mut v26_too_wide = v26;
         v26_too_wide.maximum_literal_bytes = SEARCH_BACKEND_ASIMD_TAG39_MAX_LITERAL_BYTES_V1 + 1;
         assert!(!search_span_families_are_canonical(&[v26_too_wide]));
+        let mut v27 = valid[0];
+        v27.backend_version = SEARCH_BACKEND_ASIMD_TAG40_V1;
+        v27.minimum_literal_bytes = SEARCH_BACKEND_ASIMD_TAG40_MIN_LITERAL_BYTES_V1;
+        v27.maximum_literal_bytes = SEARCH_BACKEND_ASIMD_TAG40_MAX_LITERAL_BYTES_V1;
+        assert!(search_span_families_are_canonical(&[v27]));
+        assert!(
+            !production_search_span_families_are_canonical(&[v27]),
+            "candidate-only tag40 must not acquire production-table authority"
+        );
+        let mut v27_too_wide = v27;
+        v27_too_wide.maximum_literal_bytes = SEARCH_BACKEND_ASIMD_TAG40_MAX_LITERAL_BYTES_V1 + 1;
+        assert!(!search_span_families_are_canonical(&[v27_too_wide]));
         let mut zero_floor = valid[0];
         zero_floor.minimum_window_bytes = 0;
         assert!(!search_span_families_are_canonical(&[zero_floor]));

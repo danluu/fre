@@ -14,7 +14,7 @@ use fre_aot_search_contract::{
     ClaimedSearchMetadataV1, SEARCH_BACKEND_ASIMD_TAG22_V1, SEARCH_BACKEND_ASIMD_TAG23_V1,
     SEARCH_BACKEND_ASIMD_TAG25_V1, SEARCH_BACKEND_ASIMD_TAG26_V1, SEARCH_BACKEND_ASIMD_TAG28_V1,
     SEARCH_BACKEND_ASIMD_TAG29_V1, SEARCH_BACKEND_ASIMD_TAG30_V1, SEARCH_BACKEND_ASIMD_TAG37_V1,
-    SEARCH_BACKEND_ASIMD_TAG38_V1, SEARCH_BACKEND_ASIMD_TAG39_V1,
+    SEARCH_BACKEND_ASIMD_TAG38_V1, SEARCH_BACKEND_ASIMD_TAG39_V1, SEARCH_BACKEND_ASIMD_TAG40_V1,
     SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1, SEARCH_BACKEND_VERSION_V1, SEARCH_METADATA_BYTES_V1,
     SEARCH_PLATFORM_LINUX_V1, SEARCH_PLATFORM_MACOS_V1, STATIC_SEARCH_SPAN_EXPECTATION_BYTES_V1,
     inspect_search_metadata_v1,
@@ -1594,6 +1594,7 @@ pub(super) fn require_semantic_payload_reconstruction_v1(
         SEARCH_BACKEND_ASIMD_TAG37_V1 => SearchBackendPolicy::AsimdV24,
         SEARCH_BACKEND_ASIMD_TAG38_V1 => SearchBackendPolicy::AsimdV25,
         SEARCH_BACKEND_ASIMD_TAG39_V1 => SearchBackendPolicy::AsimdV26,
+        SEARCH_BACKEND_ASIMD_TAG40_V1 => SearchBackendPolicy::AsimdV27,
         SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1 => SearchBackendPolicy::Sve2Fixed16V2,
         _ => return Err(StaticSearchSpanVerifyErrorV1::SemanticPayloadReconstruction),
     };
@@ -1927,6 +1928,7 @@ mod tests {
         V24,
         V25,
         V26,
+        V27,
     }
 
     fn macos_family_compiler_fixture_with_backend(
@@ -1968,6 +1970,10 @@ mod tests {
                 SearchCompilePolicyV1::default(),
             )
             .expect("macOS V26 manifest"),
+            FamilyTestBackend::V27 => MacosAarch64ExactSearchManifestV1::<Span>::v27_candidate(
+                SearchCompilePolicyV1::default(),
+            )
+            .expect("macOS V27 manifest"),
         };
         let compiled =
             plan_and_compile_macos_aarch64_exact_search_v1(manifest, literal.to_vec(), profile)
@@ -1992,6 +1998,9 @@ mod tests {
             }
             FamilyTestBackend::V26 => {
                 fre_aot_search_contract::SEARCH_BACKEND_ASIMD_TAG39_MIN_LITERAL_BYTES_V1
+            }
+            FamilyTestBackend::V27 => {
+                fre_aot_search_contract::SEARCH_BACKEND_ASIMD_TAG40_MIN_LITERAL_BYTES_V1
             }
             _ => 1,
         };
@@ -2056,6 +2065,10 @@ mod tests {
                 LinuxAarch64SearchCompilePolicyV1::default(),
             )
             .expect("Linux V26 manifest"),
+            FamilyTestBackend::V27 => LinuxAarch64ExactSearchManifestV1::<Span>::v27_candidate(
+                LinuxAarch64SearchCompilePolicyV1::default(),
+            )
+            .expect("Linux V27 manifest"),
         };
         let compiled =
             plan_and_compile_linux_aarch64_exact_search_v1(manifest, literal.to_vec(), profile)
@@ -2082,6 +2095,9 @@ mod tests {
             }
             FamilyTestBackend::V26 => {
                 fre_aot_search_contract::SEARCH_BACKEND_ASIMD_TAG39_MIN_LITERAL_BYTES_V1
+            }
+            FamilyTestBackend::V27 => {
+                fre_aot_search_contract::SEARCH_BACKEND_ASIMD_TAG40_MIN_LITERAL_BYTES_V1
             }
             _ => 1,
         };
@@ -2159,7 +2175,7 @@ mod tests {
     }
 
     #[test]
-    fn broad_v9_v10_v15_v16_v17_v24_v25_v26_families_reconstruct_on_both_object_platforms() {
+    fn broad_v9_v10_v15_v16_v17_v24_v25_v26_v27_families_reconstruct_on_both_object_platforms() {
         for fixture in vec![
             macos_family_compiler_fixture(b"mac-family-lit16"),
             linux_family_compiler_fixture(b"lin-family-lit16"),
@@ -2195,6 +2211,8 @@ mod tests {
                 b"policy-receipt-26",
                 FamilyTestBackend::V26,
             ),
+            macos_family_compiler_fixture_with_backend(b"aaaaaaaaa", FamilyTestBackend::V27),
+            linux_family_compiler_fixture_with_backend(b"ababababa", FamilyTestBackend::V27),
         ] {
             assert_family_payload_mutations_refused(&fixture);
             let handle = VerifiedStaticSearchSpanV1 {
