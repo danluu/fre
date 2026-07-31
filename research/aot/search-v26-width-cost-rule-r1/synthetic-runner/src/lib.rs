@@ -28,6 +28,7 @@ pub const MAX_WIDTH: u16 = 32;
 pub const ACCEPTED_ORDINALS_PER_CELL: u16 = 16;
 pub const OUTPUT_KINDS: usize = 3;
 pub const EXPECTED_LITERAL_COUNT: usize = 27 * OUTPUT_KINDS * 16;
+pub const NATIVE_CORRECTNESS_SCHEMA: &str = "fre.aot.search-v26-native-correctness.v2";
 
 /// Stable output ordering named by the preregistration.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -893,19 +894,93 @@ pub const fn selected_source_policy(width: u16) -> Option<SearchBackendPolicy> {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct NativeCorrectnessReport {
     pub schema: &'static str,
+    pub lane: CorrectnessLane,
     pub population_sha256: String,
     pub backend: u16,
     pub literals: usize,
     pub window_shapes: usize,
     pub comparisons: usize,
     pub mismatches: usize,
+    pub target: NativeTargetReport,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CorrectnessLane {
+    Local,
+    C9g,
+}
+
+impl CorrectnessLane {
+    pub fn parse(value: &str) -> Result<Self, PopulationError> {
+        match value {
+            "local" => Ok(Self::Local),
+            "c9g" => Ok(Self::C9g),
+            _ => Err(PopulationError::new(
+                "correctness lane must be local or c9g",
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct NativeTargetReport {
+    pub architecture: &'static str,
+    pub operating_system: &'static str,
+    pub pointer_width: u32,
+    pub little_endian: bool,
+    pub features: NativeFeatureReport,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct NativeFeatureReport {
+    pub asimd: bool,
+    pub sve: bool,
+    pub sve2: bool,
+    pub sve_vector_bytes: Option<u16>,
 }
 
 /// Differentially execute one backend against the safe KIR oracle.
 pub fn native_correctness(
     population: &SyntheticPopulation,
     backend: SearchBackendPolicy,
+    lane: CorrectnessLane,
 ) -> Result<NativeCorrectnessReport, PopulationError> {
+    let capabilities = fre_jit_runtime::native_host_capabilities().map_err(|error| {
+        PopulationError::new(format!("native target discovery failed: {error}"))
+    })?;
+    let target = NativeTargetReport {
+        architecture: std::env::consts::ARCH,
+        operating_system: std::env::consts::OS,
+        pointer_width: usize::BITS,
+        little_endian: cfg!(target_endian = "little"),
+        features: NativeFeatureReport {
+            asimd: capabilities.has_asimd(),
+            sve: capabilities.has_sve(),
+            sve2: capabilities.has_sve2(),
+            sve_vector_bytes: capabilities.sve_vector_bytes(),
+        },
+    };
+    if target.architecture != "aarch64"
+        || target.pointer_width != 64
+        || !target.little_endian
+        || !target.features.asimd
+    {
+        return Err(PopulationError::new(format!(
+            "correctness lane requires little-endian AArch64 ASIMD, observed {target:?}"
+        )));
+    }
+    match lane {
+        CorrectnessLane::Local if target.operating_system != "macos" => {
+            return Err(PopulationError::new(
+                "local correctness lane requires macOS",
+            ));
+        }
+        CorrectnessLane::C9g if target.operating_system != "linux" => {
+            return Err(PopulationError::new("c9g correctness lane requires Linux"));
+        }
+        CorrectnessLane::Local | CorrectnessLane::C9g => {}
+    }
     let mut comparisons = 0_usize;
     for literal in population.literals() {
         let checked = match literal.output {
@@ -922,13 +997,15 @@ pub fn native_correctness(
             .ok_or_else(|| PopulationError::new("native correctness count overflow"))?;
     }
     Ok(NativeCorrectnessReport {
-        schema: "fre.aot.search-v26-local-native-correctness.v1",
+        schema: NATIVE_CORRECTNESS_SCHEMA,
+        lane,
         population_sha256: population.population_sha256_hex(),
         backend: backend.backend_version().0,
         literals: population.literals().len(),
         window_shapes: WindowShape::ALL.len(),
         comparisons,
         mismatches: 0,
+        target,
     })
 }
 
@@ -1486,5 +1563,22 @@ mod tests {
         );
         assert!(arithmetic_median_11(&[1; 10]).is_err());
         assert!(arithmetic_median_11(&[1; 12]).is_err());
+    }
+
+    #[test]
+    fn correctness_lane_schema_is_neutral_and_lane_parse_is_closed() {
+        assert_eq!(
+            NATIVE_CORRECTNESS_SCHEMA,
+            "fre.aot.search-v26-native-correctness.v2"
+        );
+        assert_eq!(
+            CorrectnessLane::parse("local").expect("local lane"),
+            CorrectnessLane::Local
+        );
+        assert_eq!(
+            CorrectnessLane::parse("c9g").expect("c9g lane"),
+            CorrectnessLane::C9g
+        );
+        assert!(CorrectnessLane::parse("other").is_err());
     }
 }

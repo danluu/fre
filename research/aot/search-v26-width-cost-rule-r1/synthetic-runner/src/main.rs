@@ -2,8 +2,8 @@ use std::{env, error::Error, io};
 
 use fre_jit_aarch64::SearchBackendPolicy;
 use fre_search_v26_synthetic_runner::{
-    EXPECTED_LITERAL_COUNT, MAX_WIDTH, MIN_WIDTH, SYNTHETIC_DOMAIN, generate_population, hex,
-    native_correctness, report_only_emission_timing, static_parity,
+    CorrectnessLane, EXPECTED_LITERAL_COUNT, MAX_WIDTH, MIN_WIDTH, SYNTHETIC_DOMAIN,
+    generate_population, hex, native_correctness, report_only_emission_timing, static_parity,
 };
 use serde::Serialize;
 
@@ -26,10 +26,18 @@ struct PopulationSummary<'a> {
 fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args().skip(1);
     let command = arguments.next().unwrap_or_else(|| "summary".to_owned());
+    let detail = arguments.next();
     if arguments.next().is_some() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: fre-search-v26-synthetic-runner [summary|population|static|correctness|emission-timing]",
+            "usage: fre-search-v26-synthetic-runner [summary|population|static|emission-timing|correctness local|correctness c9g]",
+        )
+        .into());
+    }
+    if command != "correctness" && detail.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "only correctness accepts a lane argument",
         )
         .into());
     }
@@ -41,7 +49,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
     if command == "correctness" {
-        let report = native_correctness(&population, SearchBackendPolicy::AsimdV26)?;
+        let lane = detail
+            .as_deref()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "correctness requires lane local or c9g",
+                )
+            })
+            .and_then(|value| {
+                CorrectnessLane::parse(value)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+            })?;
+        let report = native_correctness(&population, SearchBackendPolicy::AsimdV26, lane)?;
         serde_json::to_writer(io::stdout().lock(), &report)?;
         println!();
         return Ok(());

@@ -18,8 +18,9 @@ cargo run --manifest-path \
 Use `population` instead of `summary` to include all 1,296 literal records.
 `static` enforces exact V17 graph parity at widths 6 through 8, exact V25
 graph parity at widths 9 through 32, tag-39/AOT-magic distinction, and routing
-boundaries. `correctness` publishes V26 locally and differentially checks all
-7,776 literal/window/output cases against the safe Kernel IR oracle. Unit
+boundaries. `correctness local` and `correctness c9g` publish V26 on their
+explicit macOS/Linux AArch64 lanes, record target features, and differentially
+check all 7,776 literal/window/output cases against the safe Kernel IR oracle. Unit
 tests pin the byte derivation, population identity, uniqueness, determinism,
 per-cell counts, geometry, and public-emitter admission.
 
