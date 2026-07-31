@@ -3,7 +3,8 @@ use std::{env, error::Error, io};
 use fre_jit_aarch64::SearchBackendPolicy;
 use fre_search_v26_synthetic_runner::{
     CorrectnessLane, EXPECTED_LITERAL_COUNT, MAX_WIDTH, MIN_WIDTH, SYNTHETIC_DOMAIN,
-    generate_population, hex, native_correctness, report_only_emission_timing, static_parity,
+    evidence_build_identity, generate_population, hex, native_correctness,
+    report_only_emission_timing, static_parity,
 };
 use serde::Serialize;
 
@@ -30,7 +31,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     if arguments.next().is_some() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: fre-search-v26-synthetic-runner [summary|population|static|emission-timing|correctness local|correctness c9g]",
+            "usage: fre-search-v26-synthetic-runner [evidence-build-identity|summary|population|static|emission-timing|correctness local|correctness c9g]",
         )
         .into());
     }
@@ -40,6 +41,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             "only correctness accepts a lane argument",
         )
         .into());
+    }
+    if command == "evidence-build-identity" {
+        let report = evidence_build_identity()?;
+        serde_json::to_writer(io::stdout().lock(), &report)?;
+        println!();
+        return Ok(());
     }
     let population = generate_population()?;
     if command == "static" {
@@ -78,7 +85,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "command must be summary, population, static, correctness, or emission-timing",
+                "command must be evidence-build-identity, summary, population, static, correctness, or emission-timing",
             )
             .into());
         }

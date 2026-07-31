@@ -12,9 +12,11 @@ import hashlib
 import os
 import platform
 import selectors
+import stat
 import subprocess
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -70,16 +72,32 @@ def terminate(process: subprocess.Popen[bytes]) -> None:
         pass
 
 
-def run_bounded(argv: list[str]) -> tuple[bytes, bytes]:
+def run_bounded(
+    argv: list[str],
+    *,
+    executable_fd: int | None = None,
+    working_directory: Path | None = None,
+) -> tuple[bytes, bytes]:
     receipt.require(bool(argv) and Path(argv[0]).is_absolute(), "runner argv is not absolute")
+    pass_fds: tuple[int, ...] = ()
+    if executable_fd is not None:
+        metadata = os.fstat(executable_fd)
+        receipt.require(
+            stat.S_ISREG(metadata.st_mode)
+            and metadata.st_mode & 0o111 != 0,
+            "runner executable FD is not a regular executable",
+        )
+        os.lseek(executable_fd, 0, os.SEEK_SET)
+        pass_fds = (executable_fd,)
     process = subprocess.Popen(
         argv,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        cwd=str(Path(argv[0]).parent),
+        cwd=str(working_directory or Path(argv[0]).parent),
         env=dict(receipt.EXECUTION_ENVIRONMENT),
         close_fds=True,
+        pass_fds=pass_fds,
         start_new_session=True,
     )
     receipt.require(
@@ -152,7 +170,67 @@ def validate_report_bytes(raw: bytes, name: str) -> dict[str, Any]:
     return receipt.strict_json_bytes(raw, name)
 
 
-def stage_runner(parent: Path, raw: bytes) -> tuple[tempfile.TemporaryDirectory[str], Path]:
+@dataclass(frozen=True)
+class StagedRunner:
+    temporary: tempfile.TemporaryDirectory[str]
+    descriptor: int
+    directory: Path
+    executable_path: Path | None
+    identity: tuple[int, int, int, int, int, int]
+    raw: bytes
+    mechanism: str
+
+
+def executable_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+        stat.S_IMODE(metadata.st_mode),
+    )
+
+
+def read_descriptor(descriptor: int, expected_bytes: int) -> bytes:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    observed = bytearray()
+    while len(observed) < expected_bytes:
+        chunk = os.read(descriptor, min(1 << 20, expected_bytes - len(observed)))
+        receipt.require(bool(chunk), "staged runner executable ended early")
+        observed.extend(chunk)
+    receipt.require(
+        not os.read(descriptor, 1),
+        "staged runner executable grew",
+    )
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    return bytes(observed)
+
+
+def verify_staged_runner(staged: StagedRunner) -> None:
+    metadata = os.fstat(staged.descriptor)
+    receipt.require(
+        executable_identity(metadata) == staged.identity
+        and stat.S_ISREG(metadata.st_mode)
+        and metadata.st_mode & 0o111 != 0
+        and read_descriptor(staged.descriptor, len(staged.raw)) == staged.raw,
+        "staged runner executable FD identity changed",
+    )
+    if staged.executable_path is not None:
+        path_metadata = staged.executable_path.lstat()
+        receipt.require(
+            not staged.executable_path.is_symlink()
+            and executable_identity(path_metadata) == staged.identity,
+            "closed Darwin runner pathname no longer names the validated inode",
+        )
+        directory_metadata = staged.directory.stat()
+        receipt.require(
+            stat.S_IMODE(directory_metadata.st_mode) == 0o500,
+            "closed Darwin runner directory permissions changed",
+        )
+
+
+def stage_runner(parent: Path, raw: bytes) -> StagedRunner:
     temporary = tempfile.TemporaryDirectory(prefix=".fre-v26-runner-", dir=parent)
     staged = Path(temporary.name) / receipt.RUNNER_BASENAME
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -169,7 +247,82 @@ def stage_runner(parent: Path, raw: bytes) -> tuple[tempfile.TemporaryDirectory[
         os.fchmod(descriptor, 0o500)
     finally:
         os.close(descriptor)
-    return temporary, staged.resolve()
+    read_flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        read_flags |= os.O_NOFOLLOW
+    executable_fd = os.open(staged, read_flags)
+    try:
+        metadata = os.fstat(executable_fd)
+        receipt.require(
+            stat.S_ISREG(metadata.st_mode)
+            and metadata.st_size == len(raw)
+            and metadata.st_mode & 0o111 != 0,
+            "staged runner executable identity changed",
+        )
+        receipt.require(
+            read_descriptor(executable_fd, len(raw)) == raw,
+            "staged runner executable bytes changed",
+        )
+        observed_system = platform.system().lower()
+        if observed_system == "linux":
+            staged.unlink()
+            executable_path: Path | None = None
+            mechanism = "validated-open-fd"
+        elif observed_system == "darwin":
+            executable_path = staged
+            mechanism = "closed-private-inode"
+        else:
+            raise receipt.Refusal("runner staging requires Linux or macOS")
+        os.chmod(temporary.name, 0o500)
+        directory = os.open(temporary.name, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except BaseException:
+        os.close(executable_fd)
+        os.chmod(temporary.name, 0o700)
+        temporary.cleanup()
+        raise
+    staged_runner = StagedRunner(
+        temporary=temporary,
+        descriptor=executable_fd,
+        directory=Path(temporary.name),
+        executable_path=executable_path,
+        identity=executable_identity(os.fstat(executable_fd)),
+        raw=raw,
+        mechanism=mechanism,
+    )
+    verify_staged_runner(staged_runner)
+    return staged_runner
+
+
+def run_staged(staged: StagedRunner, arguments: list[str]) -> tuple[bytes, bytes]:
+    verify_staged_runner(staged)
+    if staged.mechanism == "validated-open-fd":
+        executable = f"/proc/self/fd/{staged.descriptor}"
+        descriptor: int | None = staged.descriptor
+    else:
+        receipt.require(
+            staged.executable_path is not None,
+            "closed Darwin runner pathname is missing",
+        )
+        executable = str(staged.executable_path)
+        descriptor = None
+    try:
+        return run_bounded(
+            [executable, *arguments],
+            executable_fd=descriptor,
+            working_directory=staged.directory,
+        )
+    finally:
+        verify_staged_runner(staged)
+
+
+def close_staged(staged: StagedRunner) -> None:
+    os.close(staged.descriptor)
+    os.chmod(staged.directory, 0o700)
+    staged.temporary.cleanup()
 
 
 def run_lane(arguments: argparse.Namespace) -> dict[str, Any]:
@@ -225,6 +378,9 @@ def run_lane(arguments: argparse.Namespace) -> dict[str, Any]:
         source_archive,
         arguments.source_archive_sha256,
     )
+    source_set_sha = receipt.git_source_set_sha256(
+        source_root, arguments.source_commit
+    )
     runner_raw, runner_sha, runner_bytes = receipt.validate_runner_artifact(
         runner_binary, arguments.runner_binary_sha256, lane
     )
@@ -240,23 +396,59 @@ def run_lane(arguments: argparse.Namespace) -> dict[str, Any]:
     )
     execution_tool_sha = hashlib.sha256(execution_tool_raw).hexdigest()
     validation_tool_sha = hashlib.sha256(validation_tool_raw).hexdigest()
+    receipt.validate_tracked_tool_bytes(
+        source_root,
+        arguments.source_commit,
+        receipt.EXECUTION_TOOL_REPOSITORY_PATH,
+        execution_tool_raw,
+        "lane execution tool",
+    )
+    receipt.validate_tracked_tool_bytes(
+        source_root,
+        arguments.source_commit,
+        receipt.VALIDATION_TOOL_REPOSITORY_PATH,
+        validation_tool_raw,
+        "lane validation tool",
+    )
 
-    temporary, staged_runner = stage_runner(manifest_output.parent, runner_raw)
+    staged_runner = stage_runner(manifest_output.parent, runner_raw)
     try:
+        receipt.require(
+            staged_runner.mechanism
+            == ("closed-private-inode" if lane == "local" else "validated-open-fd"),
+            f"{lane} runner execution mechanism changed",
+        )
+        build_identity_raw, _ = run_staged(
+            staged_runner, ["evidence-build-identity"]
+        )
+        build_identity_report = validate_report_bytes(
+            build_identity_raw, f"{lane} runner build identity"
+        )
+        receipt.require(
+            build_identity_raw
+            == receipt.canonical_bytes(build_identity_report) + b"\n",
+            f"{lane} runner build identity is not canonical JSON",
+        )
+        receipt.validate_build_identity(
+            build_identity_report,
+            lane,
+            arguments.source_commit,
+            arguments.source_tree,
+            archive_sha,
+            source_set_sha,
+        )
         static_raw: bytes | None = None
         if lane == "local":
-            static_raw, _ = run_bounded([str(staged_runner), "static"])
+            static_raw, _ = run_staged(staged_runner, ["static"])
             static_report = validate_report_bytes(static_raw, "static report")
             receipt.validate_static(static_report)
-        correctness_raw, _ = run_bounded(
-            [str(staged_runner), "correctness", lane]
-        )
+        correctness_raw, _ = run_staged(staged_runner, ["correctness", lane])
         correctness_report = validate_report_bytes(
             correctness_raw, f"{lane} correctness report"
         )
         receipt.validate_correctness(correctness_report, lane)
     finally:
-        temporary.cleanup()
+        close_staged(staged_runner)
 
     receipt.validate_source(
         source_root, arguments.source_commit, arguments.source_tree
@@ -305,12 +497,15 @@ def run_lane(arguments: argparse.Namespace) -> dict[str, Any]:
         source_tree=arguments.source_tree,
         archive_sha256=archive_sha,
         archive_bytes=archive_bytes,
+        source_set_sha256=source_set_sha,
         runner_sha256=runner_sha,
         runner_bytes=runner_bytes,
         execution_tool_sha256=execution_tool_sha,
         execution_tool_bytes=len(execution_tool_raw),
         validation_tool_sha256=validation_tool_sha,
         validation_tool_bytes=len(validation_tool_raw),
+        build_identity_raw=build_identity_raw,
+        build_identity_report=build_identity_report,
         correctness_raw=correctness_raw,
         correctness_report=correctness_report,
         static_raw=static_raw,

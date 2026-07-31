@@ -57,6 +57,8 @@ class ReceiptFixture(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.source = self.root / "source"
         self.source.mkdir()
+        self.execution_tool = Path(lane_runner.__file__).resolve()
+        self.validation_tool = Path(seal.__file__).resolve()
         subprocess.run(["git", "init", "-q", str(self.source)], check=True)
         subprocess.run(
             ["git", "-C", str(self.source), "config", "user.name", "V26 Test"],
@@ -74,13 +76,23 @@ class ReceiptFixture(unittest.TestCase):
             check=True,
         )
         (self.source / "source.txt").write_text("exact source\n", encoding="utf-8")
-        subprocess.run(["git", "-C", str(self.source), "add", "source.txt"], check=True)
+        for repository_path, source_path in (
+            (seal.EXECUTION_TOOL_REPOSITORY_PATH, self.execution_tool),
+            (seal.VALIDATION_TOOL_REPOSITORY_PATH, self.validation_tool),
+        ):
+            destination = self.source / repository_path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(source_path.read_bytes())
+        subprocess.run(["git", "-C", str(self.source), "add", "."], check=True)
         subprocess.run(
             ["git", "-C", str(self.source), "commit", "-q", "-m", "source"],
             check=True,
         )
         self.commit = self.git("rev-parse", "HEAD")
         self.tree = self.git("rev-parse", "HEAD^{tree}")
+        self.source_set_sha256 = seal.git_source_set_sha256(
+            self.source, self.commit
+        )
         self.archive = self.root / "source.tar"
         with self.archive.open("wb") as output:
             subprocess.run(
@@ -104,9 +116,6 @@ class ReceiptFixture(unittest.TestCase):
         self.c9g_binary.write_bytes(c9g_elf())
         self.local_binary.chmod(0o755)
         self.c9g_binary.chmod(0o755)
-        self.execution_tool = Path(lane_runner.__file__).resolve()
-        self.validation_tool = Path(seal.__file__).resolve()
-
         self.static = self.root / "static.json"
         self.local = self.root / "local.json"
         self.c9g = self.root / "c9g.json"
@@ -171,6 +180,25 @@ class ReceiptFixture(unittest.TestCase):
             },
         }
 
+    def build_identity_report(self, lane: str) -> dict[str, object]:
+        return {
+            "candidate_backend": 39,
+            "debug_assertions": False,
+            "performance_gate_authority": False,
+            "population_sha256": seal.POPULATION_SHA256,
+            "production_or_deployment_authority": False,
+            "schema": seal.BUILD_IDENTITY_SCHEMA,
+            "search_performance_timing_present": False,
+            "source_archive_sha256": digest(self.archive),
+            "source_commit": self.commit,
+            "source_set_sha256": self.source_set_sha256,
+            "source_tree": self.tree,
+            "target_architecture": "aarch64",
+            "target_little_endian": True,
+            "target_operating_system": "macos" if lane == "local" else "linux",
+            "target_pointer_width": 64,
+        }
+
     def execution_payload(
         self,
         *,
@@ -182,6 +210,8 @@ class ReceiptFixture(unittest.TestCase):
         correctness_raw = correctness_path.read_bytes()
         correctness_report = json.loads(correctness_raw)
         runner = self.local_binary if local else self.c9g_binary
+        build_identity_report = self.build_identity_report(lane)
+        build_identity_raw = seal.canonical_bytes(build_identity_report) + b"\n"
         return seal.execution_payload(
             lane=lane,
             created_utc=created_utc,
@@ -190,12 +220,15 @@ class ReceiptFixture(unittest.TestCase):
             source_tree=self.tree,
             archive_sha256=digest(self.archive),
             archive_bytes=self.archive.stat().st_size,
+            source_set_sha256=self.source_set_sha256,
             runner_sha256=digest(runner),
             runner_bytes=runner.stat().st_size,
             execution_tool_sha256=digest(self.execution_tool),
             execution_tool_bytes=self.execution_tool.stat().st_size,
             validation_tool_sha256=digest(self.validation_tool),
             validation_tool_bytes=self.validation_tool.stat().st_size,
+            build_identity_raw=build_identity_raw,
+            build_identity_report=build_identity_report,
             correctness_raw=correctness_raw,
             correctness_report=correctness_report,
             static_raw=self.static.read_bytes() if local else None,
@@ -275,6 +308,50 @@ class SealCorrectnessReceiptTests(ReceiptFixture):
         with self.assertRaisesRegex(seal.Refusal, "byte-for-byte"):
             seal.seal(arguments)
 
+    def test_source_and_archive_validation_ignore_git_replace_objects(self) -> None:
+        source_file = self.source / "source.txt"
+        source_file.write_text("replacement source\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(self.source), "add", "source.txt"], check=True
+        )
+        replacement_tree = self.git("write-tree")
+        replacement_commit = subprocess.check_output(
+            [
+                "git",
+                "-C",
+                str(self.source),
+                "commit-tree",
+                replacement_tree,
+                "-m",
+                "replacement",
+            ],
+            text=True,
+        ).strip()
+        subprocess.run(
+            ["git", "-C", str(self.source), "reset", "-q", "HEAD", "--", "."],
+            check=True,
+        )
+        source_file.write_text("exact source\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(self.source), "replace", self.commit, replacement_commit],
+            check=True,
+        )
+        self.assertEqual(self.git("rev-parse", "HEAD^{tree}"), replacement_tree)
+        seal.validate_source(self.source, self.commit, self.tree)
+        self.assertEqual(
+            seal.verify_git_archive(
+                self.source,
+                self.commit,
+                self.archive,
+                digest(self.archive),
+            ),
+            (digest(self.archive), self.archive.stat().st_size),
+        )
+        self.assertEqual(
+            seal.git_source_set_sha256(self.source, self.commit),
+            self.source_set_sha256,
+        )
+
     def test_rejects_same_binary_for_both_platforms(self) -> None:
         arguments = self.arguments("same-binary.json")
         arguments.c9g_runner_binary = arguments.local_runner_binary
@@ -282,11 +359,83 @@ class SealCorrectnessReceiptTests(ReceiptFixture):
         with self.assertRaises(seal.Refusal):
             seal.seal(arguments)
 
+    def test_rejects_stale_runner_embedded_source_even_when_envelope_is_rehashed(self) -> None:
+        manifest = json.loads(self.local_manifest.read_bytes())
+        identity = manifest["payload"]["runner"]["build_identity"]
+        identity["source_commit"] = "a" * 40
+        identity_raw = seal.canonical_bytes(identity) + b"\n"
+        binding = manifest["payload"]["reports"]["build_identity"]
+        binding["report_sha256"] = hashlib.sha256(identity_raw).hexdigest()
+        binding["report_bytes"] = len(identity_raw)
+        manifest["payload_sha256"] = hashlib.sha256(
+            seal.canonical_bytes(manifest["payload"])
+        ).hexdigest()
+        write_json(self.local_manifest, manifest)
+        arguments = self.arguments("stale-runner-source.json")
+        with self.assertRaisesRegex(seal.Refusal, "embedded source_commit mismatch"):
+            seal.seal(arguments)
+
+    def test_rejects_relabelled_compiled_source_set_with_rehashed_envelope(self) -> None:
+        manifest = json.loads(self.local_manifest.read_bytes())
+        identity = manifest["payload"]["runner"]["build_identity"]
+        identity["source_set_sha256"] = "b" * 64
+        identity_raw = seal.canonical_bytes(identity) + b"\n"
+        binding = manifest["payload"]["reports"]["build_identity"]
+        binding["report_sha256"] = hashlib.sha256(identity_raw).hexdigest()
+        binding["report_bytes"] = len(identity_raw)
+        manifest["payload_sha256"] = hashlib.sha256(
+            seal.canonical_bytes(manifest["payload"])
+        ).hexdigest()
+        write_json(self.local_manifest, manifest)
+        arguments = self.arguments("relabelled-source-set.json")
+        with self.assertRaisesRegex(seal.Refusal, "embedded source_set_sha256 mismatch"):
+            seal.seal(arguments)
+
+    def test_rejects_debug_or_wrong_target_embedded_identity(self) -> None:
+        for field, value in (
+            ("debug_assertions", True),
+            ("target_operating_system", "linux"),
+        ):
+            with self.subTest(field=field):
+                manifest = json.loads(self.local_manifest.read_bytes())
+                identity = manifest["payload"]["runner"]["build_identity"]
+                identity[field] = value
+                identity_raw = seal.canonical_bytes(identity) + b"\n"
+                binding = manifest["payload"]["reports"]["build_identity"]
+                binding["report_sha256"] = hashlib.sha256(identity_raw).hexdigest()
+                binding["report_bytes"] = len(identity_raw)
+                manifest["payload_sha256"] = hashlib.sha256(
+                    seal.canonical_bytes(manifest["payload"])
+                ).hexdigest()
+                write_json(self.local_manifest, manifest)
+                arguments = self.arguments(f"bad-build-{field}.json")
+                with self.assertRaises(seal.Refusal):
+                    seal.seal(arguments)
+                self.write_manifests()
+
+    def test_exact_correctness_numeric_types_reject_bool_zero_alias(self) -> None:
+        report = self.correctness_report("local")
+        report["mismatches"] = False
+        with self.assertRaisesRegex(seal.Refusal, "exact integer 0"):
+            seal.validate_correctness(report, "local")
+
     def test_rejects_wrong_platform_binary_format(self) -> None:
         self.c9g_binary.write_bytes(local_macho() + b"different")
         self.c9g_binary.chmod(0o755)
         arguments = self.arguments("wrong-format.json")
         with self.assertRaisesRegex(seal.Refusal, "AArch64 ELF"):
+            seal.seal(arguments)
+
+    def test_rejects_execution_tool_not_equal_to_bound_source_blob(self) -> None:
+        stale_directory = self.root / "stale-tool"
+        stale_directory.mkdir()
+        stale_tool = stale_directory / seal.EXECUTION_TOOL_BASENAME
+        stale_tool.write_bytes(self.execution_tool.read_bytes() + b"\n# stale copy\n")
+        stale_tool.chmod(0o755)
+        arguments = self.arguments("stale-tool.json")
+        arguments.execution_tool = str(stale_tool)
+        arguments.execution_tool_sha256 = digest(stale_tool)
+        with self.assertRaisesRegex(seal.Refusal, "bound source-commit blob"):
             seal.seal(arguments)
 
     def test_rejects_manifest_report_hash_mismatch(self) -> None:
@@ -334,6 +483,33 @@ class SealCorrectnessReceiptTests(ReceiptFixture):
                     seal.seal(arguments)
                 self.local.write_bytes(original_local)
                 self.local_manifest.write_bytes(original_manifest)
+
+    def test_strict_json_rejects_float_aliases_and_exponent_overflow(self) -> None:
+        for raw in (b'{"value":1.0}\n', b'{"value":1e9999}\n'):
+            with self.subTest(raw=raw):
+                with self.assertRaises(seal.Refusal):
+                    seal.strict_json_bytes(raw, "noninteger numeric mutation")
+
+    def test_strict_file_json_requires_one_lf_terminated_line(self) -> None:
+        for index, raw in enumerate((b"{}", b"{}\r\n", b"\n{}\n")):
+            with self.subTest(raw=raw):
+                value = self.root / f"noncanonical-json-{index}"
+                value.write_bytes(raw)
+                with self.assertRaisesRegex(seal.Refusal, "one LF-terminated"):
+                    seal.strict_json(
+                        value, hashlib.sha256(raw).hexdigest(), "noncanonical JSON"
+                    )
+
+    def test_rejects_bool_integer_alias_inside_rehashed_execution_payload(self) -> None:
+        manifest = json.loads(self.local_manifest.read_bytes())
+        manifest["payload"]["result_policy"]["performance_gate_authority"] = 0
+        manifest["payload_sha256"] = hashlib.sha256(
+            seal.canonical_bytes(manifest["payload"])
+        ).hexdigest()
+        write_json(self.local_manifest, manifest)
+        arguments = self.arguments("bool-integer-alias.json")
+        with self.assertRaisesRegex(seal.Refusal, "execution bindings changed"):
+            seal.seal(arguments)
 
     def test_rejects_mutated_static_coverage_even_with_matching_hash(self) -> None:
         report = self.static_report()
@@ -387,11 +563,16 @@ class RunCorrectnessLaneTests(ReceiptFixture):
         local_json = seal.canonical_bytes(
             self.correctness_report("local")
         ).decode("ascii")
+        identity_json = seal.canonical_bytes(
+            self.build_identity_report("local")
+        ).decode("ascii")
         stderr_line = "printf '%s\\n' 'unexpected stderr' >&2\n" if stderr else ""
         runner.write_text(
             "#!/bin/sh\n"
             + stderr_line
-            + "if [ \"$1\" = \"static\" ]; then\n"
+            + "if [ \"$1\" = \"evidence-build-identity\" ]; then\n"
+            + f"  printf '%s\\n' '{identity_json}'\n"
+            + "elif [ \"$1\" = \"static\" ]; then\n"
             + f"  printf '%s\\n' '{static_json}'\n"
             + "elif [ \"$1\" = \"correctness\" ] && [ \"$2\" = \"local\" ]; then\n"
             + f"  printf '%s\\n' '{local_json}'\n"
@@ -467,6 +648,14 @@ class RunCorrectnessLaneTests(ReceiptFixture):
             manifest["payload"]["reports"]["correctness"]["argv"],
             [seal.RUNNER_BASENAME, "correctness", "local"],
         )
+        self.assertEqual(
+            manifest["payload"]["reports"]["build_identity"]["argv"],
+            [seal.RUNNER_BASENAME, "evidence-build-identity"],
+        )
+        self.assertEqual(
+            manifest["payload"]["runner"]["build_identity"]["source_commit"],
+            self.commit,
+        )
         self.assertFalse(
             manifest["payload"]["result_policy"]["performance_gate_authority"]
         )
@@ -493,6 +682,24 @@ class RunCorrectnessLaneTests(ReceiptFixture):
             lane_runner.run_lane(arguments)
         for field in ("static_output", "correctness_output", "manifest_output"):
             self.assertFalse(os.path.lexists(getattr(arguments, field)))
+
+    def test_staged_runner_detects_inode_or_mode_replacement(self) -> None:
+        runner = self.mock_runner()
+        staged = lane_runner.stage_runner(self.root, runner.read_bytes())
+        try:
+            if staged.executable_path is not None:
+                os.chmod(staged.directory, 0o700)
+                displaced = staged.directory / "displaced-runner"
+                staged.executable_path.rename(displaced)
+                staged.executable_path.write_bytes(b"#!/bin/sh\nexit 0\n")
+                staged.executable_path.chmod(0o500)
+                os.chmod(staged.directory, 0o500)
+            else:
+                os.fchmod(staged.descriptor, 0o700)
+            with self.assertRaises(seal.Refusal):
+                lane_runner.verify_staged_runner(staged)
+        finally:
+            lane_runner.close_staged(staged)
 
     def test_controller_refuses_output_inside_source_worktree(self) -> None:
         runner = self.mock_runner()

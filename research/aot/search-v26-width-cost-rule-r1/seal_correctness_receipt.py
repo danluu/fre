@@ -23,9 +23,16 @@ RECEIPT_SCHEMA = "fre.aot.search-v26-correctness-receipt.v2"
 EXECUTION_SCHEMA = "fre.aot.search-v26-platform-execution-manifest.v1"
 STATIC_SCHEMA = "fre.aot.search-v26-local-static-parity.v1"
 CORRECTNESS_SCHEMA = "fre.aot.search-v26-native-correctness.v2"
+BUILD_IDENTITY_SCHEMA = "fre.aot.search-v26-evidence-build-identity.v1"
 RUNNER_BASENAME = "fre-search-v26-synthetic-runner"
 EXECUTION_TOOL_BASENAME = "run_correctness_lane.py"
 VALIDATION_TOOL_BASENAME = "seal_correctness_receipt.py"
+EXECUTION_TOOL_REPOSITORY_PATH = (
+    "research/aot/search-v26-width-cost-rule-r1/run_correctness_lane.py"
+)
+VALIDATION_TOOL_REPOSITORY_PATH = (
+    "research/aot/search-v26-width-cost-rule-r1/seal_correctness_receipt.py"
+)
 EXECUTION_ENVIRONMENT = {
     "LANG": "C",
     "LC_ALL": "C",
@@ -33,6 +40,7 @@ EXECUTION_ENVIRONMENT = {
     "TZ": "UTC",
 }
 POPULATION_SHA256 = "a682375f2e6e051f97322396bafc46974df47baa3518bc17f5d6b71b56407b73"
+SOURCE_SET_DOMAIN = b"FRE-V26-EVIDENCE-FULL-REPOSITORY-SOURCE-SET\0\x01"
 EXPECTED_TOTALS = {
     "objects": 1296,
     "code_bytes": 3112416,
@@ -72,6 +80,13 @@ def require(condition: bool, message: str) -> None:
 def require_exact_keys(value: dict[str, Any], expected: Iterable[str], name: str) -> None:
     expected_set = set(expected)
     require(set(value) == expected_set, f"{name} keys changed")
+
+
+def require_exact_integer(value: Any, expected: int, name: str) -> None:
+    require(
+        type(value) is int and value == expected,
+        f"{name} is not exact integer {expected}",
+    )
 
 
 def require_hex(value: str, width: int, name: str) -> str:
@@ -210,11 +225,19 @@ def reject_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return value
 
 
+def reject_json_float(token: str) -> None:
+    raise Refusal(f"floating JSON number {token!r} is forbidden")
+
+
 def strict_json(path: Path, expected_sha256: str, name: str) -> tuple[bytes, dict[str, Any]]:
     expected_sha256 = require_hex(expected_sha256, 64, f"{name} expected sha256")
     raw = stable_bytes(path, MAX_REPORT_BYTES, name)
     observed = hashlib.sha256(raw).hexdigest()
     require(observed == expected_sha256, f"{name} sha256 mismatch")
+    require(
+        raw.endswith(b"\n") and raw.count(b"\n") == 1 and b"\r" not in raw,
+        f"{name} is not exactly one LF-terminated JSON line",
+    )
     return raw, strict_json_bytes(raw, name)
 
 
@@ -226,6 +249,7 @@ def strict_json_bytes(raw: bytes, name: str) -> dict[str, Any]:
             parse_constant=lambda token: (_ for _ in ()).throw(
                 Refusal(f"non-finite JSON token {token}")
             ),
+            parse_float=reject_json_float,
         )
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise Refusal(f"{name} is not strict UTF-8 JSON: {error}") from error
@@ -261,17 +285,99 @@ def validate_static(report: dict[str, Any]) -> None:
         and report["wide_source_backend"] == 38,
         "static backend identities changed",
     )
-    require(
-        report["literals"] == 1296
-        and report["exact_machine_object_parities"] == 1296
-        and report["distinct_aot_identities"] == 1296
-        and report["routing_boundary_checks"] == 24,
-        "static coverage is incomplete",
-    )
+    for field, expected in (
+        ("candidate_backend", 39),
+        ("short_source_backend", 30),
+        ("wide_source_backend", 38),
+        ("literals", 1296),
+        ("exact_machine_object_parities", 1296),
+        ("distinct_aot_identities", 1296),
+        ("routing_boundary_checks", 24),
+    ):
+        require_exact_integer(report[field], expected, f"static {field}")
     require(report["candidate_aot_magic_hex"] == "4652454136340027", "V26 AOT magic changed")
     require(report["timing"] == "not-run", "static report contains timing")
-    require(report["candidate"] == EXPECTED_TOTALS, "candidate static totals changed")
-    require(report["selected_source"] == EXPECTED_TOTALS, "source static totals changed")
+    require(
+        canonical_bytes(report["candidate"]) == canonical_bytes(EXPECTED_TOTALS),
+        "candidate static totals changed",
+    )
+    require(
+        canonical_bytes(report["selected_source"]) == canonical_bytes(EXPECTED_TOTALS),
+        "source static totals changed",
+    )
+
+
+def validate_build_identity(
+    report: dict[str, Any],
+    lane: str,
+    source_commit: str,
+    source_tree: str,
+    source_archive_sha256: str,
+    source_set_sha256: str,
+) -> None:
+    require(lane in {"local", "c9g"}, "runner build-identity lane is invalid")
+    require_exact_keys(
+        report,
+        {
+            "candidate_backend",
+            "debug_assertions",
+            "performance_gate_authority",
+            "population_sha256",
+            "production_or_deployment_authority",
+            "schema",
+            "search_performance_timing_present",
+            "source_archive_sha256",
+            "source_commit",
+            "source_set_sha256",
+            "source_tree",
+            "target_architecture",
+            "target_little_endian",
+            "target_operating_system",
+            "target_pointer_width",
+        },
+        "runner build identity",
+    )
+    require(
+        report["schema"] == BUILD_IDENTITY_SCHEMA,
+        "runner build-identity schema changed",
+    )
+    require_exact_integer(
+        report["candidate_backend"], 39, "runner build candidate backend"
+    )
+    require(
+        report["population_sha256"] == POPULATION_SHA256,
+        "runner build identity has the wrong population",
+    )
+    require(
+        report["debug_assertions"] is False
+        and report["performance_gate_authority"] is False
+        and report["production_or_deployment_authority"] is False
+        and report["search_performance_timing_present"] is False,
+        "runner build identity is debug or acquired forbidden authority",
+    )
+    require_exact_integer(
+        report["target_pointer_width"], 64, f"{lane} runner target pointer width"
+    )
+    require(
+        report["target_architecture"] == "aarch64"
+        and report["target_little_endian"] is True
+        and report["target_operating_system"]
+        == ("macos" if lane == "local" else "linux"),
+        f"{lane} runner embedded target identity changed",
+    )
+    expected = {
+        "source_commit": require_hex(source_commit, 40, "expected source commit"),
+        "source_tree": require_hex(source_tree, 40, "expected source tree"),
+        "source_archive_sha256": require_hex(
+            source_archive_sha256, 64, "expected source archive sha256"
+        ),
+        "source_set_sha256": require_hex(
+            source_set_sha256, 64, "expected source-set sha256"
+        ),
+    }
+    for field, value in expected.items():
+        require(report[field] == value, f"runner embedded {field} mismatch")
+        require_hex(report[field], len(value), f"runner embedded {field}")
 
 
 def validate_target(target: dict[str, Any], lane: str) -> None:
@@ -280,10 +386,9 @@ def validate_target(target: dict[str, Any], lane: str) -> None:
         {"architecture", "operating_system", "pointer_width", "little_endian", "features"},
         f"{lane} target",
     )
+    require_exact_integer(target["pointer_width"], 64, f"{lane} target pointer width")
     require(
-        target["architecture"] == "aarch64"
-        and target["pointer_width"] == 64
-        and target["little_endian"] is True,
+        target["architecture"] == "aarch64" and target["little_endian"] is True,
         f"{lane} target is not little-endian AArch64",
     )
     expected_os = "macos" if lane == "local" else "linux"
@@ -327,13 +432,16 @@ def validate_correctness(report: dict[str, Any], lane: str) -> None:
     require(report["lane"] == lane, f"{lane} lane binding changed")
     require(report["population_sha256"] == POPULATION_SHA256, f"{lane} population changed")
     require(report["backend"] == 39, f"{lane} backend changed")
-    require(
-        report["literals"] == 1296
-        and report["window_shapes"] == 6
-        and report["comparisons"] == 7776
-        and report["mismatches"] == 0,
-        f"{lane} correctness is incomplete",
-    )
+    require_exact_integer(report["backend"], 39, f"{lane} correctness backend")
+    for field, expected in (
+        ("literals", 1296),
+        ("window_shapes", 6),
+        ("comparisons", 7776),
+        ("mismatches", 0),
+    ):
+        require_exact_integer(
+            report[field], expected, f"{lane} correctness {field}"
+        )
     require(isinstance(report["target"], dict), f"{lane} target is not an object")
     validate_target(report["target"], lane)
 
@@ -347,6 +455,7 @@ def git_environment() -> dict[str, str]:
         "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_CONFIG_SYSTEM": os.devnull,
         "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
     }
 
 
@@ -377,6 +486,143 @@ def validate_source(source_root: Path, expected_commit: str, expected_tree: str)
         git_output(source_root, ["status", "--porcelain=v1", "--untracked-files=all"]) == "",
         "source worktree is dirty",
     )
+
+
+def validate_tracked_tool_bytes(
+    source_root: Path,
+    expected_commit: str,
+    repository_path: str,
+    observed: bytes,
+    name: str,
+) -> None:
+    require(
+        repository_path
+        in {EXECUTION_TOOL_REPOSITORY_PATH, VALIDATION_TOOL_REPOSITORY_PATH},
+        f"{name} repository path is not frozen",
+    )
+    completed = subprocess.run(
+        [
+            GIT_EXECUTABLE,
+            "-C",
+            str(source_root),
+            "show",
+            f"{expected_commit}:{repository_path}",
+        ],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=git_environment(),
+    )
+    require(
+        completed.returncode == 0,
+        f"cannot read bound {name} blob: "
+        f"{completed.stderr.decode('utf-8', 'replace').strip()}",
+    )
+    require(
+        0 < len(completed.stdout) <= MAX_EXECUTION_TOOL_BYTES,
+        f"bound {name} blob has an invalid size",
+    )
+    require(
+        completed.stdout == observed,
+        f"{name} differs from the exact bound source-commit blob",
+    )
+
+
+def git_source_set_sha256(source_root: Path, expected_commit: str) -> str:
+    expected_commit = require_hex(expected_commit, 40, "source-set commit")
+    listing = subprocess.run(
+        [
+            GIT_EXECUTABLE,
+            "-C",
+            str(source_root),
+            "ls-tree",
+            "-r",
+            "-z",
+            "--full-tree",
+            expected_commit,
+        ],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=git_environment(),
+    )
+    require(
+        listing.returncode == 0,
+        "cannot enumerate bound source tree: "
+        f"{listing.stderr.decode('utf-8', 'replace').strip()}",
+    )
+    entries: list[tuple[bytes, bytes, bytes]] = []
+    for record in listing.stdout.split(b"\0"):
+        if not record:
+            continue
+        try:
+            metadata, repository_path = record.split(b"\t", 1)
+            mode, object_type, object_id = metadata.split(b" ", 2)
+        except ValueError as error:
+            raise Refusal("bound source-tree listing is malformed") from error
+        require(
+            object_type == b"blob" and mode in {b"100644", b"100755", b"120000"},
+            "bound source tree contains an unsupported entry",
+        )
+        require(
+            repository_path
+            and not repository_path.startswith(b"/")
+            and b"\0" not in repository_path,
+            "bound source-tree path is not canonical",
+        )
+        entries.append((repository_path, mode, object_id))
+    entries.sort(key=lambda item: item[0])
+    require(bool(entries), "bound source set is empty")
+    batch = subprocess.run(
+        [GIT_EXECUTABLE, "-C", str(source_root), "cat-file", "--batch"],
+        input=b"".join(object_id + b"\n" for _, _, object_id in entries),
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=git_environment(),
+    )
+    require(
+        batch.returncode == 0,
+        "cannot read bound source blobs: "
+        f"{batch.stderr.decode('utf-8', 'replace').strip()}",
+    )
+    cursor = 0
+    hasher = hashlib.sha256(SOURCE_SET_DOMAIN)
+    for repository_path, mode, expected_object_id in entries:
+        header_end = batch.stdout.find(b"\n", cursor)
+        require(header_end >= 0, "source blob batch header is truncated")
+        header = batch.stdout[cursor:header_end]
+        cursor = header_end + 1
+        try:
+            object_id, object_type, encoded_size = header.split(b" ", 2)
+            blob_size = int(encoded_size)
+        except ValueError as error:
+            raise Refusal("source blob batch header is malformed") from error
+        require(
+            object_id == expected_object_id
+            and object_type == b"blob"
+            and 0 <= blob_size <= MAX_ARCHIVE_BYTES,
+            "source blob batch identity changed",
+        )
+        blob_end = cursor + blob_size
+        require(
+            blob_end < len(batch.stdout)
+            and batch.stdout[blob_end : blob_end + 1] == b"\n",
+            "source blob batch body is truncated",
+        )
+        content = batch.stdout[cursor:blob_end]
+        cursor = blob_end + 1
+        require(
+            len(repository_path) <= (1 << 32) - 1,
+            "source-set path exceeds u32",
+        )
+        hasher.update(mode)
+        hasher.update(len(repository_path).to_bytes(4, "little"))
+        hasher.update(repository_path)
+        hasher.update(len(content).to_bytes(8, "little"))
+        hasher.update(content)
+    require(cursor == len(batch.stdout), "source blob batch has trailing data")
+    return hasher.hexdigest()
 
 
 def verify_git_archive(
@@ -418,7 +664,13 @@ def verify_git_archive(
 
 
 def canonical_bytes(value: Any) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("ascii")
 
 
 def validate_created_utc(value: str) -> str:
@@ -453,18 +705,27 @@ def execution_payload(
     source_tree: str,
     archive_sha256: str,
     archive_bytes: int,
+    source_set_sha256: str,
     runner_sha256: str,
     runner_bytes: int,
     execution_tool_sha256: str,
     execution_tool_bytes: int,
     validation_tool_sha256: str,
     validation_tool_bytes: int,
+    build_identity_raw: bytes,
+    build_identity_report: dict[str, Any],
     correctness_raw: bytes,
     correctness_report: dict[str, Any],
     static_raw: bytes | None,
 ) -> dict[str, Any]:
     require(lane in {"local", "c9g"}, "execution lane is invalid")
-    reports: dict[str, Any] = {}
+    reports: dict[str, Any] = {
+        "build_identity": expected_report_binding(
+            build_identity_raw,
+            BUILD_IDENTITY_SCHEMA,
+            [RUNNER_BASENAME, "evidence-build-identity"],
+        )
+    }
     if static_raw is not None:
         reports["static"] = expected_report_binding(
             static_raw, STATIC_SCHEMA, [RUNNER_BASENAME, "static"]
@@ -493,6 +754,9 @@ def execution_payload(
             "archive_bytes": archive_bytes,
             "archive_format": "git-archive-tar",
             "deterministic_byte_match": True,
+            "source_set_sha256": require_hex(
+                source_set_sha256, 64, "execution source-set sha256"
+            ),
         },
         "runner": {
             "binary_sha256": require_hex(
@@ -500,6 +764,12 @@ def execution_payload(
             ),
             "binary_bytes": runner_bytes,
             "basename": RUNNER_BASENAME,
+            "build_identity": build_identity_report,
+            "execution_mechanism": (
+                "closed-private-inode"
+                if lane == "local"
+                else "validated-open-fd"
+            ),
             "format": "macho64-aarch64" if lane == "local" else "elf64-aarch64",
         },
         "execution_tool": {
@@ -570,7 +840,7 @@ def validate_execution_manifest(
     )
     validate_execution_envelope(manifest, lane)
     require(
-        manifest["payload"] == expected_payload,
+        canonical_bytes(manifest["payload"]) == canonical_bytes(expected_payload),
         f"{lane} execution bindings changed",
     )
 
@@ -638,6 +908,9 @@ def seal(arguments: argparse.Namespace) -> dict[str, Any]:
         source_archive,
         arguments.source_archive_sha256,
     )
+    source_set_sha = git_source_set_sha256(
+        source_root, arguments.source_commit
+    )
     require(
         local_runner_binary.resolve() != c9g_runner_binary.resolve(),
         "local and c9g runners must use distinct platform artifact paths",
@@ -667,6 +940,22 @@ def seal(arguments: argparse.Namespace) -> dict[str, Any]:
     )
     validation_tool_sha = hashlib.sha256(validation_tool_raw).hexdigest()
     validation_tool_bytes = len(validation_tool_raw)
+    validate_tracked_tool_bytes(
+        source_root,
+        arguments.source_commit,
+        EXECUTION_TOOL_REPOSITORY_PATH,
+        stable_bytes(
+            execution_tool, MAX_EXECUTION_TOOL_BYTES, "platform execution tool"
+        ),
+        "platform execution tool",
+    )
+    validate_tracked_tool_bytes(
+        source_root,
+        arguments.source_commit,
+        VALIDATION_TOOL_REPOSITORY_PATH,
+        validation_tool_raw,
+        "receipt validation tool",
+    )
     require(
         execution_tool.resolve() != Path(__file__).resolve()
         and execution_tool_sha != validation_tool_sha,
@@ -696,6 +985,50 @@ def seal(arguments: argparse.Namespace) -> dict[str, Any]:
     validate_correctness(c9g_report, "c9g")
     local_manifest_payload = validate_execution_envelope(local_manifest, "local")
     c9g_manifest_payload = validate_execution_envelope(c9g_manifest, "c9g")
+    local_manifest_runner = local_manifest_payload.get("runner")
+    c9g_manifest_runner = c9g_manifest_payload.get("runner")
+    require(
+        isinstance(local_manifest_runner, dict)
+        and isinstance(c9g_manifest_runner, dict),
+        "platform execution runner bindings are missing",
+    )
+    local_build_identity = local_manifest_runner.get("build_identity")
+    c9g_build_identity = c9g_manifest_runner.get("build_identity")
+    require(
+        isinstance(local_build_identity, dict)
+        and isinstance(c9g_build_identity, dict),
+        "platform runner build identities are missing",
+    )
+    validate_build_identity(
+        local_build_identity,
+        "local",
+        arguments.source_commit,
+        arguments.source_tree,
+        archive_sha,
+        source_set_sha,
+    )
+    validate_build_identity(
+        c9g_build_identity,
+        "c9g",
+        arguments.source_commit,
+        arguments.source_tree,
+        archive_sha,
+        source_set_sha,
+    )
+    require(
+        all(
+            local_build_identity[field] == c9g_build_identity[field]
+            for field in (
+                "source_commit",
+                "source_tree",
+                "source_archive_sha256",
+                "source_set_sha256",
+            )
+        ),
+        "local and c9g runner embedded source identities differ",
+    )
+    local_build_identity_raw = canonical_bytes(local_build_identity) + b"\n"
+    c9g_build_identity_raw = canonical_bytes(c9g_build_identity) + b"\n"
     local_host_identity = require_host_identity(
         arguments.local_host_identity, "local host identity"
     )
@@ -712,12 +1045,15 @@ def seal(arguments: argparse.Namespace) -> dict[str, Any]:
         source_tree=arguments.source_tree,
         archive_sha256=archive_sha,
         archive_bytes=archive_bytes,
+        source_set_sha256=source_set_sha,
         runner_sha256=local_runner_sha,
         runner_bytes=local_runner_bytes,
         execution_tool_sha256=execution_tool_sha,
         execution_tool_bytes=execution_tool_bytes,
         validation_tool_sha256=validation_tool_sha,
         validation_tool_bytes=validation_tool_bytes,
+        build_identity_raw=local_build_identity_raw,
+        build_identity_report=local_build_identity,
         correctness_raw=local_raw,
         correctness_report=local_report,
         static_raw=static_raw,
@@ -730,12 +1066,15 @@ def seal(arguments: argparse.Namespace) -> dict[str, Any]:
         source_tree=arguments.source_tree,
         archive_sha256=archive_sha,
         archive_bytes=archive_bytes,
+        source_set_sha256=source_set_sha,
         runner_sha256=c9g_runner_sha,
         runner_bytes=c9g_runner_bytes,
         execution_tool_sha256=execution_tool_sha,
         execution_tool_bytes=execution_tool_bytes,
         validation_tool_sha256=validation_tool_sha,
         validation_tool_bytes=validation_tool_bytes,
+        build_identity_raw=c9g_build_identity_raw,
+        build_identity_report=c9g_build_identity,
         correctness_raw=c9g_raw,
         correctness_report=c9g_report,
         static_raw=None,
@@ -783,17 +1122,22 @@ def seal(arguments: argparse.Namespace) -> dict[str, Any]:
             "archive_bytes": archive_bytes,
             "archive_format": "git-archive-tar",
             "deterministic_byte_match": True,
+            "source_set_sha256": source_set_sha,
             "worktree_clean": True,
         },
         "runners": {
             "local": {
                 "binary_sha256": local_runner_sha,
                 "binary_bytes": local_runner_bytes,
+                "embedded_source_identity_match": True,
+                "execution_mechanism": "closed-private-inode",
                 "format": "macho64-aarch64",
             },
             "c9g": {
                 "binary_sha256": c9g_runner_sha,
                 "binary_bytes": c9g_runner_bytes,
+                "embedded_source_identity_match": True,
+                "execution_mechanism": "validated-open-fd",
                 "format": "elf64-aarch64",
             },
         },

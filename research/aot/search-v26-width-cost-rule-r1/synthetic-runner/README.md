@@ -44,6 +44,37 @@ host OS/architecture, requires an operator-supplied host fingerprint, and
 requires a thin AArch64 Mach-O artifact locally or an AArch64 ELF artifact on
 C9g.
 
+Each evidence runner must be compiled with
+`FRE_V26_EVIDENCE_SOURCE_COMMIT`,
+`FRE_V26_EVIDENCE_SOURCE_TREE`, and
+`FRE_V26_EVIDENCE_SOURCE_ARCHIVE_SHA256` set to the final identities already
+verified by the controller. These labels are not trusted as source proof:
+`build.rs` independently hashes the complete actual in-repository source set
+(sorted paths, Git-compatible modes, and bytes, excluding only `.git`), while
+the controller derives the same domain hash
+from every blob in the exact bound Git tree. A dirty or stale build therefore
+cannot be relabeled with fresh environment values. `build.rs` tracks every
+source-set file and all three label variables so a change invalidates Cargo's
+cached crate build. An evidence build must set `CARGO_TARGET_DIR` to an
+absolute directory outside the source tree, so generated Cargo outputs cannot
+be mistaken for inputs and a tracked path named `target` is never excluded.
+The controller first invokes the
+no-timing `evidence-build-identity` command from the privately staged binary.
+It refuses an unset/sentinel identity, debug-assertions build, wrong target
+OS/architecture/pointer width/endianness, source mismatch, backend/population
+mismatch, noncanonical output, or any timing/performance/production authority.
+Both platform manifests bind that exact identity report, and the top-level
+sealer requires the two distinct native binaries to name the same final
+commit/tree/archive.
+
+On Linux the private staged pathname is unlinked and the held, byte-validated
+executable descriptor is launched through `/proc/self/fd` with explicit FD
+inheritance. macOS cannot execute a Mach-O image from `/dev/fd`, so its lane
+uses a freshly created private directory closed to mutation, a held descriptor
+whose bytes and vnode identity are checked before and after every command, and
+the sole staged pathname whose vnode must remain identical. The manifests bind
+these mechanisms as `validated-open-fd` and `closed-private-inode`.
+
 Before execution, the controller copies the already-hashed artifact to a
 private directory and executes that exact byte sequence with a fixed
 environment, isolated working directory, bounded output, and a bounded

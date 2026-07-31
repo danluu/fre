@@ -28,7 +28,35 @@ pub const MAX_WIDTH: u16 = 32;
 pub const ACCEPTED_ORDINALS_PER_CELL: u16 = 16;
 pub const OUTPUT_KINDS: usize = 3;
 pub const EXPECTED_LITERAL_COUNT: usize = 27 * OUTPUT_KINDS * 16;
+pub const EVIDENCE_BUILD_IDENTITY_SCHEMA: &str = "fre.aot.search-v26-evidence-build-identity.v1";
 pub const NATIVE_CORRECTNESS_SCHEMA: &str = "fre.aot.search-v26-native-correctness.v2";
+
+/// Compile-time source identity required by the external correctness controller.
+///
+/// The field order is deliberately lexicographic so the serialized report is
+/// also the controller's canonical JSON representation.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "the signed-off evidence schema uses explicit independent facts"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct EvidenceBuildIdentityReport {
+    pub candidate_backend: u16,
+    pub debug_assertions: bool,
+    pub performance_gate_authority: bool,
+    pub population_sha256: &'static str,
+    pub production_or_deployment_authority: bool,
+    pub schema: &'static str,
+    pub search_performance_timing_present: bool,
+    pub source_archive_sha256: &'static str,
+    pub source_commit: &'static str,
+    pub source_set_sha256: &'static str,
+    pub source_tree: &'static str,
+    pub target_architecture: &'static str,
+    pub target_little_endian: bool,
+    pub target_operating_system: &'static str,
+    pub target_pointer_width: u32,
+}
 
 /// Stable output ordering named by the preregistration.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -154,6 +182,85 @@ impl fmt::Display for PopulationError {
 }
 
 impl Error for PopulationError {}
+
+fn embedded_source_hex(
+    name: &str,
+    value: Option<&'static str>,
+    expected_len: usize,
+) -> Result<&'static str, PopulationError> {
+    let value = value.ok_or_else(|| {
+        PopulationError::new(format!(
+            "{name} was not embedded; rebuild with the frozen V26 evidence environment"
+        ))
+    })?;
+    if value.len() != expected_len
+        || !value
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+        || value.bytes().all(|byte| byte == b'0')
+        || value.bytes().all(|byte| byte == b'f')
+    {
+        return Err(PopulationError::new(format!(
+            "{name} is not a non-placeholder lowercase hex{expected_len} identity"
+        )));
+    }
+    Ok(value)
+}
+
+/// Return the source identity embedded when this exact runner was compiled.
+///
+/// Ordinary developer builds remain possible, but this command fails closed
+/// unless all three evidence variables were supplied to `rustc`.
+pub fn evidence_build_identity() -> Result<EvidenceBuildIdentityReport, PopulationError> {
+    if cfg!(debug_assertions) {
+        return Err(PopulationError::new(
+            "correctness evidence refuses a debug-assertions runner",
+        ));
+    }
+    if std::env::consts::ARCH != "aarch64"
+        || usize::BITS != 64
+        || !cfg!(target_endian = "little")
+        || !matches!(std::env::consts::OS, "macos" | "linux")
+    {
+        return Err(PopulationError::new(
+            "correctness evidence requires a little-endian AArch64 macOS/Linux runner",
+        ));
+    }
+    Ok(EvidenceBuildIdentityReport {
+        candidate_backend: 39,
+        debug_assertions: false,
+        performance_gate_authority: false,
+        population_sha256: "a682375f2e6e051f97322396bafc46974df47baa3518bc17f5d6b71b56407b73",
+        production_or_deployment_authority: false,
+        schema: EVIDENCE_BUILD_IDENTITY_SCHEMA,
+        search_performance_timing_present: false,
+        source_archive_sha256: embedded_source_hex(
+            "source archive SHA-256",
+            option_env!("FRE_V26_EVIDENCE_SOURCE_ARCHIVE_SHA256"),
+            64,
+        )?,
+        source_commit: embedded_source_hex(
+            "source commit",
+            option_env!("FRE_V26_EVIDENCE_SOURCE_COMMIT"),
+            40,
+        )?,
+        source_set_sha256: embedded_source_hex(
+            "compiled source-set SHA-256",
+            option_env!("FRE_V26_COMPILED_SOURCE_SET_SHA256"),
+            64,
+        )?,
+        source_tree: embedded_source_hex(
+            "source tree",
+            option_env!("FRE_V26_EVIDENCE_SOURCE_TREE"),
+            40,
+        )?,
+        target_architecture: std::env::consts::ARCH,
+        target_little_endian: cfg!(target_endian = "little"),
+        target_operating_system: std::env::consts::OS,
+        target_pointer_width: usize::BITS,
+    })
+}
 
 /// Generate the complete frozen population in width/output/accepted order.
 pub fn generate_population() -> Result<SyntheticPopulation, PopulationError> {
