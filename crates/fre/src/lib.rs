@@ -12,6 +12,10 @@
 //! separately typed automatic wrapper is available only when the adopted
 //! broad production family carries a source-qualified window/prefix/evidence
 //! policy; no default [`PortableRegex`] call selects AOT code.
+//! The still-default-off `compiled-search-v25-aot` feature only prepares an
+//! owning bind-once facade and forwards the tag38 static-link boundary. A
+//! missing or mismatched source-authority row is cached as a portable route;
+//! the feature, facade, and linked objects cannot create tag38 authority.
 //! The separate default-off `explicit-count-v3-aot` feature binds an
 //! already-adopted optimizing Count-v3 handle only to the live fixed-policy
 //! exact-literal Count owner whose literal, semantic identity, and planning
@@ -513,6 +517,11 @@ pub use search_aot::{
 pub use search_aot_facade::{
     SearchExactLiteralAotBindErrorV1, SearchExactLiteralAotThreadSessionV1,
     SearchExactLiteralAotV1, SearchExactLiteralAutoAotV1,
+};
+#[cfg(feature = "compiled-search-v25-aot")]
+pub use search_aot_facade::{
+    SearchExactLiteralCompiledAotV25, SearchExactLiteralCompiledAotV25Error,
+    SearchExactLiteralCompiledAotV25Fallback, SearchExactLiteralCompiledAotV25Route,
 };
 pub use set::{
     PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION, PortableRegexSet, PortableRegexSetBuildError,

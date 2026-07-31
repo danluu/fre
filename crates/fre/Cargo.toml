@@ -15,6 +15,11 @@ qualified-exact-search-jit = [
     "dep:fre-jit-runtime",
 ]
 explicit-search-span-aot = ["dep:fre-aot-static-runtime"]
+compiled-search-v25-aot = [
+    "explicit-search-span-aot",
+    "dep:fre-aot-search-contract",
+    "fre-aot-static-runtime/linked-search-v25-production-v1",
+]
 explicit-count-v3-aot = [
     "dep:fre-aot-static-runtime",
     "fre-aot-static-runtime/linked-count-v3",
@@ -32,6 +37,7 @@ static-dispatch-arm-41-d84 = [
 [dependencies]
 fre-aggregate = { path = "../fre-aggregate" }
 fre-aot-static-runtime = { path = "../fre-aot-static-runtime", optional = true, default-features = false }
+fre-aot-search-contract = { path = "../fre-aot-search-contract", optional = true }
 fre-automata = { path = "../fre-automata" }
 fre-capture-lab = { path = "../fre-capture-lab" }
 fre-exact-alloc = { path = "../fre-exact-alloc" }

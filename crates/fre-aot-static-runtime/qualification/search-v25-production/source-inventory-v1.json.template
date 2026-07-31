@@ -1,0 +1,22 @@
+{
+  "schema": "fre.aot.search-v25-production-source-inventory.v1",
+  "state": "unactivated-template",
+  "authorization_sha256": null,
+  "backend_tag": 38,
+  "family_selector": null,
+  "canonical_order": "semantic_binding_identity_then_source_sha256",
+  "sources": [],
+  "each_source_requires": [
+    "source_sha256",
+    "semantic_binding_identity",
+    "literal_identity",
+    "compile_identity",
+    "compile_receipt_sha256",
+    "implementation_object_sha256",
+    "expectation_identity",
+    "production_glue_object_sha256",
+    "production_glue_receipt_sha256",
+    "identity_suffixed_glue_symbol"
+  ],
+  "production_authority": false
+}

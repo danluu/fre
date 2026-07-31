@@ -31,6 +31,7 @@ mod production_rows;
 use production_rows::PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SPAN_ROWS_V1;
 mod production_families;
 use production_families::PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SPAN_FAMILIES_V1;
+mod production_v25_authorization;
 
 #[cfg(feature = "search-span-qualification-private-v1")]
 mod private_rows;
@@ -823,10 +824,13 @@ const fn production_search_span_families_are_canonical(
     }
     let mut index = 0_usize;
     while index < rows.len() {
-        if matches!(
-            rows[index].backend_version,
-            SEARCH_BACKEND_ASIMD_TAG37_V1 | SEARCH_BACKEND_ASIMD_TAG38_V1
-        ) {
+        if rows[index].backend_version == SEARCH_BACKEND_ASIMD_TAG37_V1 {
+            return false;
+        }
+        if rows[index].backend_version == SEARCH_BACKEND_ASIMD_TAG38_V1
+            && (!cfg!(feature = "linked-search-v25-production-v1")
+                || !production_v25_authorization::authorizes(&rows[index]))
+        {
             return false;
         }
         let Some(next) = index.checked_add(1) else {

@@ -10,6 +10,9 @@ use super::SourceQualifiedStaticSearchSpanFamilyV1;
 ///
 /// This table remains empty until the broad held-out performance transaction
 /// identifies an evidence-backed minimum input size and literal-width set.
+/// A tag38 row additionally requires the disjoint V25 authorization atom and
+/// the default-off `linked-search-v25-production-v1` feature; neither the row
+/// nor the feature can substitute for that authority chain.
 pub(super) const PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SPAN_FAMILIES_V1:
     &[SourceQualifiedStaticSearchSpanFamilyV1] = &[];
 

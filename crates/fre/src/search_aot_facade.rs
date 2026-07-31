@@ -1,11 +1,12 @@
 //! Explicit facade binding for an already-adopted static Search-v1 Span handle.
 //!
-//! This module owns no adoption path. It receives a
-//! [`VerifiedStaticSearchSpanV1`] that the static runtime has already admitted,
-//! then binds that handle to the immutable [`PortableRegex`] which still owns
-//! the exact-literal semantics. Binding checks both the complete facade
-//! semantic identity and the live literal width before a native call can be
-//! reached.
+//! The original borrowed wrappers receive a [`VerifiedStaticSearchSpanV1`]
+//! that the static runtime has already admitted, then bind that handle to the
+//! immutable [`PortableRegex`] which still owns the exact-literal semantics.
+//! The default-off tag38 wrapper additionally invokes one caller-supplied
+//! linked-glue entry through the production adopter once and owns the portable
+//! fallback. Binding checks both the complete facade semantic identity and the
+//! live literal width before a native call can be reached.
 //!
 //! [`SearchExactLiteralAotV1`] never falls back and delegates exactly once to
 //! the static runtime's checked call boundary. The separately typed
@@ -22,6 +23,13 @@ use fre_aot_static_runtime::{
     StaticSearchSpanThreadContractErrorV1, StaticSearchSpanThreadSessionV1,
     VerifiedStaticSearchSpanV1,
 };
+#[cfg(feature = "compiled-search-v25-aot")]
+use fre_aot_static_runtime::{
+    RawStaticSearchSpanAdoptionOutputV1, StaticSearchSpanAdoptionErrorV1,
+    adopt_linked_static_search_span_v1,
+};
+#[cfg(feature = "compiled-search-v25-aot")]
+use fre_aot_search_contract::SEARCH_BACKEND_ASIMD_TAG38_V1;
 use fre_kernel_ir::{CheckedSearchWindow, MatchSpan, SearchWindow as NativeSearchWindow};
 use fre_kernels::{
     LiteralAccounting, LiteralPlan, LiteralSearchPrefixSplit, LiteralSearchPreflight,
@@ -32,6 +40,8 @@ use crate::{
     Match, PortablePlan, PortableRegex, SearchAccounting, SearchExactLiteralAotCandidate,
     SearchExactLiteralAotSemanticBindingIdentity, SearchLimits, SearchWindow, literal_limits,
 };
+#[cfg(feature = "compiled-search-v25-aot")]
+use crate::SearchError;
 
 /// Failure to bind an already-adopted static Search handle to its semantic
 /// owner.
@@ -402,6 +412,283 @@ impl<'binding> SearchExactLiteralAutoAotV1<'binding> {
     #[must_use]
     pub const fn family_execution_policy(&self) -> StaticSearchSpanFamilyExecutionPolicyV1 {
         self.policy.source
+    }
+}
+
+/// Why the default-off V25 compiled facade cached its portable route.
+///
+/// Binding refusals are construction-time facts. They are retained for
+/// inspection and are never retried by a search call.
+#[cfg(feature = "compiled-search-v25-aot")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum SearchExactLiteralCompiledAotV25Fallback {
+    /// The portable owner is not an exact literal under the fixed default
+    /// construction policy. The supplied glue entry was not called.
+    PortableOwnerIneligible,
+    /// Production glue could not resolve one source-authorized handle.
+    Adoption(StaticSearchSpanAdoptionErrorV1),
+    /// A source-authorized handle named a backend other than tag38.
+    BackendMismatch { actual: u16 },
+    /// The adopted object did not bind to this exact portable source/literal
+    /// owner and broad-family execution policy.
+    Binding(SearchExactLiteralAotBindErrorV1),
+}
+
+/// Which executor one compiled-facade search actually used.
+#[cfg(feature = "compiled-search-v25-aot")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SearchExactLiteralCompiledAotV25Route {
+    Portable,
+    StaticAot,
+}
+
+/// Search failure from the owning V25 compiled facade.
+#[cfg(feature = "compiled-search-v25-aot")]
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum SearchExactLiteralCompiledAotV25Error {
+    Portable(SearchError),
+    Static(StaticSearchSpanCallErrorV1),
+}
+
+#[cfg(feature = "compiled-search-v25-aot")]
+impl fmt::Display for SearchExactLiteralCompiledAotV25Error {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "FRE exact-literal compiled V25 AOT search failed: {self:?}"
+        )
+    }
+}
+
+#[cfg(feature = "compiled-search-v25-aot")]
+impl std::error::Error for SearchExactLiteralCompiledAotV25Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Portable(error) => Some(error),
+            Self::Static(error) => Some(error),
+        }
+    }
+}
+
+#[cfg(feature = "compiled-search-v25-aot")]
+impl From<SearchError> for SearchExactLiteralCompiledAotV25Error {
+    fn from(error: SearchError) -> Self {
+        Self::Portable(error)
+    }
+}
+
+#[cfg(feature = "compiled-search-v25-aot")]
+impl From<StaticSearchSpanCallErrorV1> for SearchExactLiteralCompiledAotV25Error {
+    fn from(error: StaticSearchSpanCallErrorV1) -> Self {
+        Self::Static(error)
+    }
+}
+
+#[cfg(feature = "compiled-search-v25-aot")]
+#[derive(Clone, Copy, Debug)]
+enum SearchExactLiteralCompiledAotV25State {
+    Portable(SearchExactLiteralCompiledAotV25Fallback),
+    Static {
+        verified: &'static VerifiedStaticSearchSpanV1,
+        policy: CheckedAutomaticPolicyV1,
+    },
+}
+
+/// Owning, bind-once exact-literal facade for an explicitly linked tag38
+/// source object.
+///
+/// This type is available only through the default-off
+/// `compiled-search-v25-aot` feature. Construction first proves that the
+/// portable owner is eligible, then invokes the supplied source-specific
+/// production adopter at most once. Missing authority, an unqualified
+/// selector, a backend mismatch, or any semantic-binding refusal is cached as
+/// a portable route. Searches never repeat adoption or binding. Because this
+/// facade itself calls the production adopter, a private-qualification handle
+/// cannot be substituted by the caller.
+///
+/// The adopter cannot manufacture authority: its successful handle can come
+/// only from the static runtime's source-reviewed production registry. In the
+/// unactivated scaffold that registry has no V25 authorization or family row,
+/// so every real tag38 glue call resolves to the portable state.
+#[cfg(feature = "compiled-search-v25-aot")]
+pub struct SearchExactLiteralCompiledAotV25 {
+    portable_owner: PortableRegex,
+    state: SearchExactLiteralCompiledAotV25State,
+}
+
+#[cfg(feature = "compiled-search-v25-aot")]
+impl fmt::Debug for SearchExactLiteralCompiledAotV25 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SearchExactLiteralCompiledAotV25")
+            .field("portable_owner", &self.portable_owner)
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "compiled-search-v25-aot")]
+impl SearchExactLiteralCompiledAotV25 {
+    /// Bind one generated source-specific production glue entry once.
+    ///
+    /// `invoke_glue` is not called for a non-exact or non-default-policy
+    /// portable owner. The static runtime resolves its result only in the
+    /// production registry. All adopter and binding refusals produce a usable
+    /// portable facade instead of a partially initialized native value.
+    #[must_use]
+    pub fn bind_once(
+        portable_owner: PortableRegex,
+        invoke_glue: impl FnOnce(*mut RawStaticSearchSpanAdoptionOutputV1) -> u32,
+    ) -> Self {
+        let state = match portable_owner.exact_literal_search_aot_candidate() {
+            None => SearchExactLiteralCompiledAotV25State::Portable(
+                SearchExactLiteralCompiledAotV25Fallback::PortableOwnerIneligible,
+            ),
+            Some(candidate) => match adopt_linked_static_search_span_v1(invoke_glue) {
+                Err(error) => SearchExactLiteralCompiledAotV25State::Portable(
+                    SearchExactLiteralCompiledAotV25Fallback::Adoption(error),
+                ),
+                Ok(verified) if verified.backend_version() != SEARCH_BACKEND_ASIMD_TAG38_V1 => {
+                    SearchExactLiteralCompiledAotV25State::Portable(
+                        SearchExactLiteralCompiledAotV25Fallback::BackendMismatch {
+                            actual: verified.backend_version(),
+                        },
+                    )
+                }
+                Ok(verified) => {
+                    let checked = check_binding_v1(
+                        Some(candidate),
+                        verified.semantic_binding_identity(),
+                        verified.live_literal_bytes(),
+                        |literal| verified.authenticates_literal(literal),
+                    );
+                    match checked.and_then(|_| {
+                        checked_automatic_policy_v1(
+                            verified.family_execution_policy().ok_or(
+                                SearchExactLiteralAotBindErrorV1::
+                                    ProductionFamilyExecutionPolicyRequired,
+                            )?,
+                        )
+                    }) {
+                        Ok(policy) => {
+                            SearchExactLiteralCompiledAotV25State::Static { verified, policy }
+                        }
+                        Err(error) => SearchExactLiteralCompiledAotV25State::Portable(
+                            SearchExactLiteralCompiledAotV25Fallback::Binding(error),
+                        ),
+                    }
+                }
+            },
+        };
+        Self {
+            portable_owner,
+            state,
+        }
+    }
+
+    /// Search a complete haystack through the cached route.
+    ///
+    /// A construction-time portable decision stays portable. A successfully
+    /// bound native route applies the authenticated window-floor and
+    /// portable-prefix policy. Native call failures are reported and are not
+    /// hidden by a second portable search.
+    pub fn find(
+        &self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<
+        (
+            Option<Match>,
+            SearchAccounting,
+            SearchExactLiteralCompiledAotV25Route,
+        ),
+        SearchExactLiteralCompiledAotV25Error,
+    > {
+        self.find_window(
+            haystack,
+            SearchWindow::new(0, haystack.len()),
+            limits,
+        )
+    }
+
+    /// Search one half-open window through the cached route.
+    pub fn find_window(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<
+        (
+            Option<Match>,
+            SearchAccounting,
+            SearchExactLiteralCompiledAotV25Route,
+        ),
+        SearchExactLiteralCompiledAotV25Error,
+    > {
+        match self.state {
+            SearchExactLiteralCompiledAotV25State::Portable(_) => {
+                let (matched, accounting) =
+                    self.portable_owner.find_window(haystack, window, limits)?;
+                Ok((
+                    matched,
+                    accounting,
+                    SearchExactLiteralCompiledAotV25Route::Portable,
+                ))
+            }
+            SearchExactLiteralCompiledAotV25State::Static { verified, policy } => {
+                let PortablePlan::ExactLiteral(portable_plan) = &self.portable_owner.plan else {
+                    unreachable!("a static V25 state is created only for an exact portable owner");
+                };
+                let mut static_invoked = false;
+                let (matched, accounting) = find_window_automatically_v1(
+                    portable_plan,
+                    haystack,
+                    window,
+                    limits,
+                    policy.minimum_window_bytes,
+                    policy.portable_prefix_candidate_starts,
+                    |tail| {
+                        static_invoked = true;
+                        verified.search_preflighted(tail)
+                    },
+                )?;
+                Ok((
+                    matched,
+                    accounting,
+                    if static_invoked {
+                        SearchExactLiteralCompiledAotV25Route::StaticAot
+                    } else {
+                        SearchExactLiteralCompiledAotV25Route::Portable
+                    },
+                ))
+            }
+        }
+    }
+
+    /// Portable semantic owner retained for every route.
+    #[must_use]
+    pub const fn portable_owner(&self) -> &PortableRegex {
+        &self.portable_owner
+    }
+
+    /// Cached construction-time fallback, or `None` after a successful bind.
+    #[must_use]
+    pub const fn fallback_reason(&self) -> Option<SearchExactLiteralCompiledAotV25Fallback> {
+        match self.state {
+            SearchExactLiteralCompiledAotV25State::Portable(reason) => Some(reason),
+            SearchExactLiteralCompiledAotV25State::Static { .. } => None,
+        }
+    }
+
+    /// Source-authorized tag38 handle retained after successful binding.
+    #[must_use]
+    pub const fn verified_handle(&self) -> Option<&'static VerifiedStaticSearchSpanV1> {
+        match self.state {
+            SearchExactLiteralCompiledAotV25State::Portable(_) => None,
+            SearchExactLiteralCompiledAotV25State::Static { verified, .. } => Some(verified),
+        }
     }
 }
 

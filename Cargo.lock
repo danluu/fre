@@ -98,6 +98,7 @@ name = "fre"
 version = "0.1.0"
 dependencies = [
  "fre-aggregate",
+ "fre-aot-search-contract",
  "fre-aot-static-runtime",
  "fre-automata",
  "fre-capture-lab",
