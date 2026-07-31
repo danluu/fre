@@ -667,30 +667,21 @@ where
     }
 }
 
-enum BuiltinCandidateSink<'a> {
-    Leftmost {
-        selected: &'a mut Option<LiteralCandidate>,
-        multiple_starts: &'a mut bool,
-    },
-    IsMatch(&'a mut bool),
+struct LeftmostFirstSink<'a> {
+    selected: &'a mut Option<LiteralCandidate>,
+    multiple_starts: &'a mut bool,
 }
 
-impl LiteralCandidateSink for BuiltinCandidateSink<'_> {
+impl LiteralCandidateSink for LeftmostFirstSink<'_> {
     fn emit_candidate(&mut self, candidate: LiteralCandidate) {
-        match self {
-            Self::Leftmost {
-                selected,
-                multiple_starts,
-            } => match **selected {
-                None => **selected = Some(candidate),
-                Some(best) if candidate.start() == best.start() => {
-                    if candidate.pattern_index() < best.pattern_index() {
-                        **selected = Some(candidate);
-                    }
+        match *self.selected {
+            None => *self.selected = Some(candidate),
+            Some(best) if candidate.start() == best.start() => {
+                if candidate.pattern_index() < best.pattern_index() {
+                    *self.selected = Some(candidate);
                 }
-                Some(_) => **multiple_starts = true,
-            },
-            Self::IsMatch(matched) => **matched = true,
+            }
+            Some(_) => *self.multiple_starts = true,
         }
     }
 }
@@ -997,7 +988,7 @@ impl FoldedLiteralTriePlan {
             window,
             limits,
             ScanStop::AfterMatchingStart,
-            BuiltinCandidateSink::Leftmost {
+            LeftmostFirstSink {
                 selected: &mut selected,
                 multiple_starts: &mut order_violation,
             },
@@ -1086,15 +1077,19 @@ impl FoldedLiteralTriePlan {
         window: Window,
         limits: ScanLimits,
     ) -> Result<(bool, ScanReceipt), ScanAttemptError> {
-        let mut matched = false;
+        let mut selected = None;
+        let mut multiple_starts = false;
         let receipt = self.scan_window_mode(
             haystack,
             window,
             limits,
             ScanStop::AfterFirstEvent,
-            BuiltinCandidateSink::IsMatch(&mut matched),
+            LeftmostFirstSink {
+                selected: &mut selected,
+                multiple_starts: &mut multiple_starts,
+            },
         )?;
-        Ok((matched, receipt))
+        Ok((selected.is_some(), receipt))
     }
 
     fn scan_window_mode<F>(
@@ -1307,7 +1302,7 @@ impl AdaptiveHitState<'_, '_> {
         )?;
         let mut selected = None::<LiteralCandidate>;
         let mut multiple_starts = false;
-        let mut sink = BuiltinCandidateSink::Leftmost {
+        let mut sink = LeftmostFirstSink {
             selected: &mut selected,
             multiple_starts: &mut multiple_starts,
         };
@@ -1425,7 +1420,7 @@ fn execute_adaptive_find(
         outcome: AdaptiveFindOutcome::NoMatch,
     };
     let completed_source_reads = {
-        let mut hit_state: RootPrefilterHitState<'_, '_, '_, '_, BuiltinCandidateSink<'_>> =
+        let mut hit_state: RootPrefilterHitState<'_, '_, '_, '_, LeftmostFirstSink<'_>> =
             RootPrefilterHitState::Adaptive(&mut state, PhantomData);
         prefilter.scan(source, invalid_actual, &mut hit_state)?
     };
