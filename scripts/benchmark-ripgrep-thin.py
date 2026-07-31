@@ -703,7 +703,7 @@ def main():
     if existing_document is None:
         document = {"metadata": metadata, "results": []}
     else:
-        existing_scan_mode = document["metadata"].get(
+        existing_scan_mode = existing_document["metadata"].get(
             "scan_mode", "line-is-match"
         )
         if existing_scan_mode != scan_mode:
