@@ -31,3 +31,52 @@ emission batches with alternating order. It never publishes or invokes
 machine code, refuses non-release builds, and its result is not an acceptance
 gate. Search performance execution belongs to a separately sealed one-shot
 runner and receipt.
+
+## Correctness receipt
+
+`../run_correctness_lane.py` directly executes one bound release artifact on
+each evidence host. The local invocation emits static and native-correctness
+reports plus a platform execution manifest; the C9g invocation emits native
+correctness plus its own manifest. It accepts no timing command. It verifies a
+clean source commit/tree and requires the supplied archive to be byte-for-byte
+identical to `git archive --format=tar COMMIT`. It independently checks the
+host OS/architecture, requires an operator-supplied host fingerprint, and
+requires a thin AArch64 Mach-O artifact locally or an AArch64 ELF artifact on
+C9g.
+
+Before execution, the controller copies the already-hashed artifact to a
+private directory and executes that exact byte sequence with a fixed
+environment, isolated working directory, bounded output, and a bounded
+deadline. It accepts exactly one LF-terminated JSON line and empty stderr.
+Only after every lane command and semantic check passes does it create
+read-only reports and a canonical manifest at previously nonexistent paths.
+The manifest binds the logical argv, report hashes and sizes, source
+commit/tree/archive, runner hash and size, host fingerprint and target,
+environment, and exact controller and validation-tool hashes.
+
+After both platform invocations, `../seal_correctness_receipt.py` creates the
+top-level read-only receipt at a new path. It independently repeats source,
+archive, artifact-format, report, and manifest validation. The local and C9g
+artifacts must have different paths and hashes, and their operator-supplied
+host fingerprints must differ. A Linux/AArch64 self-report alone is therefore
+not treated as C9g provenance; the operator remains responsible for supplying
+the reviewed C9g host fingerprint.
+
+Both tools strictly reject duplicate JSON keys, duplicate evidence, incomplete
+coverage, nonzero mismatches, changed static totals, mutated commands or
+hashes, placeholder identities, dirty source, input mutation during reads,
+and existing output paths. Their manifests and receipt explicitly carry no
+performance, promotion, or deployment authority.
+
+Run its isolated tests without writing bytecode:
+
+```sh
+cd research/aot/search-v26-width-cost-rule-r1
+python3 -B -m unittest -v test_seal_correctness_receipt.py
+```
+
+Use `python3 -B seal_correctness_receipt.py --help` for the exact create-new
+top-level sealing arguments. Use
+`python3 -B run_correctness_lane.py --help` for the per-host execution
+arguments. The same final source commit/tree and deterministic archive must be
+used for both lanes, while each lane uses its own native release artifact.
