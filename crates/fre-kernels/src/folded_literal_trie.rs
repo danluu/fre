@@ -7,7 +7,7 @@
 //! strict UTF-8 and reports original byte offsets. Invalid UTF-8 never matches
 //! and advances one byte.
 
-use core::{fmt, mem};
+use core::{fmt, marker::PhantomData, mem};
 
 use fre_exact_alloc::{CopyError, ExactVec};
 use fre_simd_kernels::{
@@ -493,14 +493,15 @@ impl RootPrefilter {
         clippy::too_many_lines,
         reason = "the three memchr widths and retained full-byte classifier share one checked callback/error contract"
     )]
-    fn scan<F>(
+    #[inline(never)]
+    fn scan<S>(
         &self,
         source: &[u8],
         invalid_actual: ScanActual,
-        mut hit: F,
+        hit: &mut RootPrefilterHitState<'_, '_, '_, '_, S>,
     ) -> Result<usize, ScanAttemptError>
     where
-        F: FnMut(usize, usize) -> Result<bool, ScanAttemptError>,
+        S: LiteralCandidateSink + ?Sized,
     {
         if usize::from(self.guard_needle_count) > ROOT_PREFILTER_BYTE_VALUES {
             return Err(ScanAttemptError {
@@ -519,7 +520,7 @@ impl RootPrefilter {
                         },
                         actual: invalid_actual,
                     })?;
-                    if !hit(position, scanned_through)? {
+                    if !hit.on_hit(position, scanned_through)? {
                         return Ok(scanned_through);
                     }
                 }
@@ -532,7 +533,7 @@ impl RootPrefilter {
                         },
                         actual: invalid_actual,
                     })?;
-                    if !hit(position, scanned_through)? {
+                    if !hit.on_hit(position, scanned_through)? {
                         return Ok(scanned_through);
                     }
                 }
@@ -547,7 +548,7 @@ impl RootPrefilter {
                         },
                         actual: invalid_actual,
                     })?;
-                    if !hit(position, scanned_through)? {
+                    if !hit.on_hit(position, scanned_through)? {
                         return Ok(scanned_through);
                     }
                 }
@@ -583,7 +584,7 @@ impl RootPrefilter {
                                     },
                                     actual: invalid_actual,
                                 })?;
-                            if !hit(position, scanned_through)? {
+                            if !hit.on_hit(position, scanned_through)? {
                                 return Ok(scanned_through);
                             }
                             let shift = lane.checked_mul(8).ok_or(ScanAttemptError {
@@ -634,7 +635,7 @@ impl RootPrefilter {
                             },
                             actual: invalid_actual,
                         })?;
-                        if !hit(position, scanned_through)? {
+                        if !hit.on_hit(position, scanned_through)? {
                             return Ok(scanned_through);
                         }
                     }
@@ -1411,10 +1412,11 @@ fn execute_adaptive_find(
         previous_candidate_scanned_through: 0,
         outcome: AdaptiveFindOutcome::NoMatch,
     };
-    let completed_source_reads =
-        prefilter.scan(source, invalid_actual, |hit, scanned_through| {
-            state.on_hit(hit, scanned_through)
-        })?;
+    let completed_source_reads = {
+        let mut hit_state: RootPrefilterHitState<'_, '_, '_, '_, LeftmostFirstSink<'_>> =
+            RootPrefilterHitState::Adaptive(&mut state, PhantomData);
+        prefilter.scan(source, invalid_actual, &mut hit_state)?
+    };
     let remaining_prefilter_reads = completed_source_reads
         .checked_sub(state.prefilter_source_reads)
         .ok_or(ScanAttemptError {
@@ -1450,6 +1452,113 @@ impl ScanStop {
     }
 }
 
+struct IncumbentHitState<'plan, 'source, 'emit, S>
+where
+    S: LiteralCandidateSink + ?Sized,
+{
+    plan: &'plan FoldedLiteralTriePlan,
+    source: &'source [u8],
+    absolute_base: usize,
+    upper: ScanUpperBounds,
+    offset: usize,
+    prefilter: &'plan RootPrefilter,
+    actual: ScanActual,
+    prefilter_source_reads: usize,
+    stop: ScanStop,
+    emit: &'emit mut S,
+}
+
+impl<S> IncumbentHitState<'_, '_, '_, S>
+where
+    S: LiteralCandidateSink + ?Sized,
+{
+    #[inline(never)]
+    fn on_hit(&mut self, hit: usize, scanned_through: usize) -> Result<bool, ScanAttemptError> {
+        let additional_reads = scanned_through
+            .checked_sub(self.prefilter_source_reads)
+            .ok_or(ScanAttemptError {
+                source: ScanError::Invariant {
+                    detail: "folded root prefilter scanned prefix moved backwards",
+                },
+                actual: self.actual,
+            })?;
+        self.actual.source_byte_reads = checked_actual_add(
+            self.actual.source_byte_reads,
+            additional_reads,
+            self.upper,
+            self.actual,
+            "folded root-prefilter source reads",
+        )?;
+        self.prefilter_source_reads = scanned_through;
+        let Some(relative_start) = hit.checked_sub(self.offset) else {
+            return Ok(true);
+        };
+        if self.prefilter.has_guard() {
+            let Some(guard_position) =
+                relative_start.checked_add(usize::from(self.prefilter.guard_offset))
+            else {
+                return Ok(true);
+            };
+            let Some(&guard_byte) = self.source.get(guard_position) else {
+                return Ok(true);
+            };
+            self.actual.source_byte_reads = checked_actual_add(
+                self.actual.source_byte_reads,
+                1,
+                self.upper,
+                self.actual,
+                "folded root-prefilter guard reads",
+            )?;
+            if !self.prefilter.guard_matches(guard_byte) {
+                return Ok(true);
+            }
+        }
+        self.actual.candidate_starts = checked_actual_add(
+            self.actual.candidate_starts,
+            1,
+            self.upper,
+            self.actual,
+            "folded root-prefilter candidate starts",
+        )?;
+        let events_before = self.actual.candidate_events;
+        let _ = scan_folded_start(
+            self.plan,
+            self.source,
+            self.absolute_base,
+            relative_start,
+            self.upper,
+            &mut self.actual,
+            self.stop.after_first_event(),
+            self.emit,
+        )?;
+        Ok(!self.stop.after_matching_start() || self.actual.candidate_events == events_before)
+    }
+}
+
+enum RootPrefilterHitState<'state, 'plan, 'source, 'emit, S>
+where
+    S: LiteralCandidateSink + ?Sized,
+{
+    Incumbent(&'state mut IncumbentHitState<'plan, 'source, 'emit, S>),
+    Adaptive(
+        &'state mut AdaptiveHitState<'plan, 'source>,
+        PhantomData<&'emit mut S>,
+    ),
+}
+
+impl<S> RootPrefilterHitState<'_, '_, '_, '_, S>
+where
+    S: LiteralCandidateSink + ?Sized,
+{
+    #[inline(always)]
+    fn on_hit(&mut self, hit: usize, scanned_through: usize) -> Result<bool, ScanAttemptError> {
+        match self {
+            Self::Incumbent(state) => state.on_hit(hit, scanned_through),
+            Self::Adaptive(state, _) => state.on_hit(hit, scanned_through),
+        }
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the scalar and prefetched paths share one exact early-stop accounting transaction"
@@ -1471,86 +1580,39 @@ where
         ..ScanActual::default()
     };
     if let Some(prefilter) = root_prefilter {
-        let offset = usize::from(prefilter.offset);
         let invalid_actual = actual;
-        let mut prefilter_source_reads = 0_usize;
-        let completed_source_reads =
-            prefilter.scan(source, invalid_actual, |hit, scanned_through| {
-                let additional_reads = scanned_through.checked_sub(prefilter_source_reads).ok_or(
-                    ScanAttemptError {
-                        source: ScanError::Invariant {
-                            detail: "folded root prefilter scanned prefix moved backwards",
-                        },
-                        actual,
-                    },
-                )?;
-                actual.source_byte_reads = checked_actual_add(
-                    actual.source_byte_reads,
-                    additional_reads,
-                    upper,
-                    actual,
-                    "folded root-prefilter source reads",
-                )?;
-                prefilter_source_reads = scanned_through;
-                let Some(relative_start) = hit.checked_sub(offset) else {
-                    return Ok(true);
-                };
-                if prefilter.has_guard() {
-                    let Some(guard_position) =
-                        relative_start.checked_add(usize::from(prefilter.guard_offset))
-                    else {
-                        return Ok(true);
-                    };
-                    let Some(&guard_byte) = source.get(guard_position) else {
-                        return Ok(true);
-                    };
-                    actual.source_byte_reads = checked_actual_add(
-                        actual.source_byte_reads,
-                        1,
-                        upper,
-                        actual,
-                        "folded root-prefilter guard reads",
-                    )?;
-                    if !prefilter.guard_matches(guard_byte) {
-                        return Ok(true);
-                    }
-                }
-                actual.candidate_starts = checked_actual_add(
-                    actual.candidate_starts,
-                    1,
-                    upper,
-                    actual,
-                    "folded root-prefilter candidate starts",
-                )?;
-                let events_before = actual.candidate_events;
-                let _ = scan_folded_start(
-                    plan,
-                    source,
-                    absolute_base,
-                    relative_start,
-                    upper,
-                    &mut actual,
-                    stop.after_first_event(),
-                    emit,
-                )?;
-                Ok(!stop.after_matching_start() || actual.candidate_events == events_before)
-            })?;
+        let mut state = IncumbentHitState {
+            plan,
+            source,
+            absolute_base,
+            upper,
+            offset: usize::from(prefilter.offset),
+            prefilter,
+            actual,
+            prefilter_source_reads: 0,
+            stop,
+            emit,
+        };
+        let completed_source_reads = {
+            let mut hit_state = RootPrefilterHitState::Incumbent(&mut state);
+            prefilter.scan(source, invalid_actual, &mut hit_state)?
+        };
         let remaining_prefilter_reads = completed_source_reads
-            .checked_sub(prefilter_source_reads)
+            .checked_sub(state.prefilter_source_reads)
             .ok_or(ScanAttemptError {
                 source: ScanError::Invariant {
                     detail: "folded root prefilter completion moved backwards",
                 },
-                actual,
+                actual: state.actual,
             })?;
-        actual.source_byte_reads = checked_actual_add(
-            actual.source_byte_reads,
+        state.actual.source_byte_reads = checked_actual_add(
+            state.actual.source_byte_reads,
             remaining_prefilter_reads,
             upper,
-            actual,
+            state.actual,
             "folded root-prefilter completion source reads",
         )?;
-        return Ok(actual);
+        return Ok(state.actual);
     }
     let mut relative_start = 0_usize;
     while relative_start < source.len() {
