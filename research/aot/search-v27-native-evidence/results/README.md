@@ -48,3 +48,62 @@ The result identities are:
 The C9g host exposed ASIMD, SVE, and SVE2. V27/tag40 itself requires ASIMD;
 the additional feature exposure is recorded to establish that the same
 evidence host can be used for later SVE/SVE2 AOT comparisons.
+
+## Exact production composition
+
+The hybrid result files measure the production-shaped composition rather than
+inferring it from the direct-call outcome split:
+
+1. the portable engine owns exactly the first 256 candidate starts;
+2. its prefix window includes only the `width - 1` bytes needed to finish the
+   final prefix candidate;
+3. the linked V27 entry starts at candidate 256, making the two candidate-start
+   domains disjoint; and
+4. only width 17–32 families whose emitted graph is authenticated as
+   `V25-fast` enter timing.
+
+That compile-time class contains 43 literal families and 774 timing cells.
+Uniform literals are absent by construction because V27 selects the V8
+fallback for every uniform topology; this is an explicit structural exclusion,
+not a dropped benchmark row. Periodic, clustered, and phase-unique families
+that actually select V25-fast are all retained.
+
+| Host | Hybrid geomean | 64 KiB geomean | 1 MiB geomean | no-match geomean / p05 | late-match geomean / p05 | early-match geomean |
+|---|---:|---:|---:|---:|---:|---:|
+| Apple M5 Max | 2.268x | 2.326x | 2.210x | 3.994x / 1.263x | 3.455x / 1.455x | 0.845x |
+| AWS C9g | 2.320x | 2.386x | 2.256x | 4.076x / 1.521x | 3.607x / 1.533x | 0.850x |
+
+Both hybrid runs passed 774 deterministic cells and 1,548 independently
+seeded untimed cases with zero mismatches across all three output contracts.
+The approximately 15% early-match cost is the small portable-prefix wrapper
+cost on a call that returns after only a few dozen bytes; it is not an AOT
+tail regression because the tail is not invoked. It should remain visible in
+the activation policy rather than being averaged away. Across the complete
+equal-weight long-window matrix, the exact composition still exceeds 2.2x on
+both hosts.
+
+The hybrid result identities are:
+
+- `apple-t6050-hybrid-v1.json`:
+  `30f53b01893c8d9305288c2fa66f45d1d51a4d158ae1db71b394c53bc13a9cad`
+- `c9g-neoverse-v3-hybrid-v1.json`:
+  `f1257698ca7843f2b05639e30a0f59cb0a1bc6071f1ffa185c7c0b7f2be50915`
+
+## V27 versus V25 identity
+
+The build fails unless every V27 family classified as V25-fast is byte-for-byte
+equal to a separately emitted direct V25 image for every output. The exhaustive
+evidence-corpus proof covers 192 images (64 families times three outputs) and
+compares output, target, source identity, layout, code, rodata, labels, symbols,
+relocations, and complete image statistics. Artifact identities are required
+to remain different.
+
+This mirrors the emitter's source-level invariant: the V27
+`AsimdV25` selection calls the frozen V25 graph emitter directly. V27/tag40 is
+the safer production identity even though the executed bytes are identical:
+tag40 binds the authenticated topology decision and policy version 17 into the
+artifact and auditor contract. Activating direct V25 would move that topology
+decision outside the artifact and create a classifier-drift/relabeling risk.
+Production should therefore activate V27/tag40 only when its authenticated
+selection is V25-fast, not relabel the same bytes as V25 and not extend that
+authority to V27's fallback graph.
