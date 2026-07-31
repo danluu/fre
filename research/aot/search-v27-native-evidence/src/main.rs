@@ -179,10 +179,21 @@ struct Evidence {
     corpus_sha256: &'static str,
     host: Host,
     configuration: Configuration,
+    selected_v25_graph_equality: GraphEqualityProof,
     semantics: Semantics,
     overall: GroupSummary,
     summaries: Vec<GroupSummary>,
     rows: Vec<TimingRow>,
+}
+
+#[derive(Debug, Serialize)]
+struct GraphEqualityProof {
+    images: usize,
+    outputs: usize,
+    compared_fields: Vec<&'static str>,
+    machine_payload_equal: bool,
+    artifact_identity_distinct: bool,
+    production_identity_recommendation: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -202,7 +213,10 @@ struct Configuration {
     samples: usize,
     target_bytes_per_sample: usize,
     comparator: &'static str,
-    candidate: &'static str,
+    candidate: String,
+    portable_prefix_candidate_starts: Option<usize>,
+    timing_minimum_width: usize,
+    timing_graph: Option<Graph>,
 }
 
 #[derive(Debug, Serialize)]
@@ -219,6 +233,9 @@ struct Options {
     samples: usize,
     sample_bytes: usize,
     windows: Vec<usize>,
+    portable_prefix_candidate_starts: Option<usize>,
+    timing_minimum_width: usize,
+    timing_graph: Option<Graph>,
 }
 
 fn main() -> Result<(), DynError> {
@@ -229,6 +246,13 @@ fn main() -> Result<(), DynError> {
 
     let mut randomized_checked = 0;
     for (ordinal, family) in families.iter().enumerate() {
+        if family.width < options.timing_minimum_width
+            || options
+                .timing_graph
+                .is_some_and(|graph| family.graph != graph)
+        {
+            continue;
+        }
         let portable = portable_for(family.literal)?;
         for case in 0..RANDOM_SEMANTIC_CASES_PER_FAMILY {
             let seed = splitmix64(
@@ -246,7 +270,14 @@ fn main() -> Result<(), DynError> {
             let outcome = Outcome::ALL[usize::try_from((seed >> 32) % 3)?];
             let fixture = make_fixture(family.literal, span, outcome, seed)?;
             for output in Output::ALL {
-                verify(family.entries[output.index()], output, &portable, &fixture)?;
+                verify_candidate(
+                    family.entries[output.index()],
+                    output,
+                    &portable,
+                    family.literal,
+                    &fixture,
+                    options.portable_prefix_candidate_starts,
+                )?;
                 randomized_checked += 1;
             }
         }
@@ -257,6 +288,13 @@ fn main() -> Result<(), DynError> {
     );
     let mut deterministic_checked = 0;
     for (ordinal, family) in families.iter().enumerate() {
+        if family.width < options.timing_minimum_width
+            || options
+                .timing_graph
+                .is_some_and(|graph| family.graph != graph)
+        {
+            continue;
+        }
         let portable = portable_for(family.literal)?;
         for &window_bytes in &options.windows {
             for outcome in Outcome::ALL {
@@ -269,7 +307,14 @@ fn main() -> Result<(), DynError> {
                 let fixture = make_fixture(family.literal, window_bytes, outcome, seed)?;
                 for output in Output::ALL {
                     let entry = family.entries[output.index()];
-                    verify(entry, output, &portable, &fixture)?;
+                    verify_candidate(
+                        entry,
+                        output,
+                        &portable,
+                        family.literal,
+                        &fixture,
+                        options.portable_prefix_candidate_starts,
+                    )?;
                     deterministic_checked += 1;
                     rows.push(measure_cell(
                         family,
@@ -280,6 +325,7 @@ fn main() -> Result<(), DynError> {
                         &fixture,
                         options.samples,
                         options.sample_bytes,
+                        options.portable_prefix_candidate_starts,
                     )?);
                 }
             }
@@ -307,7 +353,33 @@ fn main() -> Result<(), DynError> {
             samples: options.samples,
             target_bytes_per_sample: options.sample_bytes,
             comparator: "current PortableRegex value API built from identical source",
-            candidate: "statically linked V27/tag40 AAPCS64 machine image",
+            candidate: if options.portable_prefix_candidate_starts.is_some() {
+                "portable prefix plus statically linked V27/tag40 AAPCS64 tail".to_owned()
+            } else {
+                "statically linked V27/tag40 AAPCS64 machine image".to_owned()
+            },
+            portable_prefix_candidate_starts: options.portable_prefix_candidate_starts,
+            timing_minimum_width: options.timing_minimum_width,
+            timing_graph: options.timing_graph,
+        },
+        selected_v25_graph_equality: GraphEqualityProof {
+            images: V25_GRAPH_EQUALITY_IMAGES,
+            outputs: Output::ALL.len(),
+            compared_fields: vec![
+                "output",
+                "target",
+                "source_identity",
+                "layout",
+                "code",
+                "rodata",
+                "labels",
+                "symbols",
+                "relocations",
+                "stats",
+            ],
+            machine_payload_equal: true,
+            artifact_identity_distinct: true,
+            production_identity_recommendation: "activate V27/tag40 with V25-fast qualification; it binds the authenticated topology selection while preserving exact V25 machine bytes",
         },
         semantics: Semantics {
             deterministic_cells_checked: deterministic_checked,
@@ -444,18 +516,28 @@ fn scalar_find(
         })
 }
 
-fn verify(
+fn verify_candidate(
     entry: EntryFunction,
     output: Output,
     portable: &PortableRegex,
+    literal: &[u8],
     fixture: &Fixture,
+    portable_prefix_candidate_starts: Option<usize>,
 ) -> Result<(), DynError> {
     let expected = project_expected(output, fixture.expected);
-    let native = call_native(entry, output, &fixture.haystack, fixture.window);
+    let candidate = call_candidate(
+        entry,
+        output,
+        portable,
+        literal,
+        &fixture.haystack,
+        fixture.window,
+        portable_prefix_candidate_starts,
+    )?;
     let portable = call_portable(portable, output, &fixture.haystack, fixture.window)?;
-    if native != expected {
+    if candidate != expected {
         return Err(format!(
-            "native result disagrees with scalar oracle: output={output:?} window={}..{} expected={expected:#x} actual={native:#x} scalar={:?}",
+            "composed candidate disagrees with scalar oracle: output={output:?} window={}..{} expected={expected:#x} actual={candidate:#x} scalar={:?}",
             fixture.window.start(),
             fixture.window.end(),
             fixture.expected
@@ -539,6 +621,57 @@ fn call_portable(
 
 #[allow(
     clippy::too_many_arguments,
+    reason = "the composed route keeps its authenticated entry, source literal, and complete window explicit"
+)]
+#[inline]
+fn call_candidate(
+    entry: EntryFunction,
+    output: Output,
+    portable: &PortableRegex,
+    literal: &[u8],
+    haystack: &[u8],
+    window: SearchWindow,
+    portable_prefix_candidate_starts: Option<usize>,
+) -> Result<u64, DynError> {
+    let Some(prefix_starts) = portable_prefix_candidate_starts else {
+        return Ok(call_native(entry, output, haystack, window));
+    };
+    let tail_start = window
+        .start()
+        .checked_add(prefix_starts)
+        .unwrap_or(window.end())
+        .min(window.end());
+    let overlap = literal.len().saturating_sub(1);
+    let prefix_end = tail_start
+        .checked_add(overlap)
+        .unwrap_or(window.end())
+        .min(window.end());
+    let prefix = call_portable(
+        portable,
+        output,
+        haystack,
+        SearchWindow::new(window.start(), prefix_end),
+    )?;
+    if projected_output_is_match(output, prefix) {
+        return Ok(prefix);
+    }
+    Ok(call_native(
+        entry,
+        output,
+        haystack,
+        SearchWindow::new(tail_start, window.end()),
+    ))
+}
+
+const fn projected_output_is_match(output: Output, projected: u64) -> bool {
+    match output {
+        Output::Exists => projected == 1,
+        Output::SelectedEnd | Output::Span => projected != u64::MAX,
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
     reason = "each timing coordinate is carried explicitly into its evidence row"
 )]
 fn measure_cell(
@@ -550,6 +683,7 @@ fn measure_cell(
     fixture: &Fixture,
     samples: usize,
     sample_bytes: usize,
+    portable_prefix_candidate_starts: Option<usize>,
 ) -> Result<TimingRow, DynError> {
     let window_bytes = fixture
         .window
@@ -565,12 +699,15 @@ fn measure_cell(
         sample_bytes.checked_div(window_bytes).unwrap_or(1).max(4)
     };
     for _ in 0..3 {
-        black_box(call_native(
+        black_box(call_candidate(
             entry,
             output,
+            portable,
+            family.literal,
             &fixture.haystack,
             fixture.window,
-        ));
+            portable_prefix_candidate_starts,
+        )?);
         black_box(call_portable(
             portable,
             output,
@@ -584,7 +721,15 @@ fn measure_cell(
     let mut checksum = CHECKSUM_SEED;
     for sample in 0..samples {
         if sample % 2 == 0 {
-            let (native, native_checksum) = time_native(entry, output, fixture, iterations);
+            let (native, native_checksum) = time_candidate(
+                entry,
+                output,
+                portable,
+                family.literal,
+                fixture,
+                iterations,
+                portable_prefix_candidate_starts,
+            )?;
             let (portable_elapsed, portable_checksum) =
                 time_portable(portable, output, fixture, iterations)?;
             native_samples.push(native);
@@ -593,7 +738,15 @@ fn measure_cell(
         } else {
             let (portable_elapsed, portable_checksum) =
                 time_portable(portable, output, fixture, iterations)?;
-            let (native, native_checksum) = time_native(entry, output, fixture, iterations);
+            let (native, native_checksum) = time_candidate(
+                entry,
+                output,
+                portable,
+                family.literal,
+                fixture,
+                iterations,
+                portable_prefix_candidate_starts,
+            )?;
             portable_samples.push(portable_elapsed);
             native_samples.push(native);
             checksum ^= native_checksum.rotate_left(11) ^ portable_checksum.rotate_left(31);
@@ -621,26 +774,36 @@ fn measure_cell(
     })
 }
 
-fn time_native(
+#[allow(
+    clippy::too_many_arguments,
+    reason = "timing retains the complete composed-route contract without hidden globals"
+)]
+fn time_candidate(
     entry: EntryFunction,
     output: Output,
+    portable: &PortableRegex,
+    literal: &[u8],
     fixture: &Fixture,
     iterations: usize,
-) -> (Duration, u64) {
+    portable_prefix_candidate_starts: Option<usize>,
+) -> Result<(Duration, u64), DynError> {
     let mut checksum = CHECKSUM_SEED;
     let started = Instant::now();
     for iteration in 0..iterations {
-        let value = call_native(
+        let value = call_candidate(
             black_box(entry),
             output,
+            black_box(portable),
+            black_box(literal),
             black_box(&fixture.haystack),
             black_box(fixture.window),
-        );
+            portable_prefix_candidate_starts,
+        )?;
         checksum = checksum.rotate_left(5) ^ value ^ u64::try_from(iteration).unwrap_or(u64::MAX);
     }
     let elapsed = started.elapsed();
     black_box(checksum);
-    (elapsed, checksum)
+    Ok((elapsed, checksum))
 }
 
 fn time_portable(
@@ -677,7 +840,7 @@ fn add_group_summaries(summaries: &mut Vec<GroupSummary>, rows: &[TimingRow]) {
             .filter(|row| row.output == output)
             .cloned()
             .collect::<Vec<_>>();
-        summaries.push(summarize(format!("output={}", output.name()), &selected));
+        push_summary(summaries, format!("output={}", output.name()), &selected);
     }
     for topology in [
         Topology::Uniform,
@@ -690,10 +853,11 @@ fn add_group_summaries(summaries: &mut Vec<GroupSummary>, rows: &[TimingRow]) {
             .filter(|row| row.topology == topology)
             .cloned()
             .collect::<Vec<_>>();
-        summaries.push(summarize(
+        push_summary(
+            summaries,
             format!("topology={}", topology.name()),
             &selected,
-        ));
+        );
     }
     for graph in [Graph::V8Fallback, Graph::V17Fast, Graph::V25Fast] {
         let selected = rows
@@ -701,7 +865,7 @@ fn add_group_summaries(summaries: &mut Vec<GroupSummary>, rows: &[TimingRow]) {
             .filter(|row| row.graph == graph)
             .cloned()
             .collect::<Vec<_>>();
-        summaries.push(summarize(format!("graph={}", graph.name()), &selected));
+        push_summary(summaries, format!("graph={}", graph.name()), &selected);
     }
     for outcome in Outcome::ALL {
         let selected = rows
@@ -709,7 +873,7 @@ fn add_group_summaries(summaries: &mut Vec<GroupSummary>, rows: &[TimingRow]) {
             .filter(|row| row.outcome == outcome)
             .cloned()
             .collect::<Vec<_>>();
-        summaries.push(summarize(format!("outcome={}", outcome.name()), &selected));
+        push_summary(summaries, format!("outcome={}", outcome.name()), &selected);
     }
     let width_bands = [(1, 5), (6, 8), (9, 16), (17, 32)];
     for (minimum, maximum) in width_bands {
@@ -718,7 +882,7 @@ fn add_group_summaries(summaries: &mut Vec<GroupSummary>, rows: &[TimingRow]) {
             .filter(|row| (minimum..=maximum).contains(&row.width))
             .cloned()
             .collect::<Vec<_>>();
-        summaries.push(summarize(format!("width={minimum}..={maximum}"), &selected));
+        push_summary(summaries, format!("width={minimum}..={maximum}"), &selected);
     }
     let mut windows = rows.iter().map(|row| row.window_bytes).collect::<Vec<_>>();
     windows.sort_unstable();
@@ -729,7 +893,13 @@ fn add_group_summaries(summaries: &mut Vec<GroupSummary>, rows: &[TimingRow]) {
             .filter(|row| row.window_bytes == window)
             .cloned()
             .collect::<Vec<_>>();
-        summaries.push(summarize(format!("window={window}"), &selected));
+        push_summary(summaries, format!("window={window}"), &selected);
+    }
+}
+
+fn push_summary(summaries: &mut Vec<GroupSummary>, group: String, rows: &[TimingRow]) {
+    if !rows.is_empty() {
+        summaries.push(summarize(group, rows));
     }
 }
 
@@ -803,6 +973,9 @@ fn options() -> Result<Options, DynError> {
     let mut samples = DEFAULT_SAMPLES;
     let mut sample_bytes = DEFAULT_SAMPLE_BYTES;
     let mut windows = DEFAULT_WINDOW_BYTES.to_vec();
+    let mut portable_prefix_candidate_starts = None;
+    let mut timing_minimum_width = 1;
+    let mut timing_graph = None;
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -825,6 +998,32 @@ fn options() -> Result<Options, DynError> {
                     .map(str::parse)
                     .collect::<Result<Vec<_>, _>>()?;
             }
+            "--portable-prefix-candidates" => {
+                portable_prefix_candidate_starts = Some(
+                    arguments
+                        .next()
+                        .ok_or("missing --portable-prefix-candidates value")?
+                        .parse()?,
+                );
+            }
+            "--minimum-width" => {
+                timing_minimum_width = arguments
+                    .next()
+                    .ok_or("missing --minimum-width value")?
+                    .parse()?;
+            }
+            "--graph" => {
+                timing_graph = Some(
+                    match arguments.next().ok_or("missing --graph value")?.as_str() {
+                        "v8-fallback" => Graph::V8Fallback,
+                        "v17-fast" => Graph::V17Fast,
+                        "v25-fast" => Graph::V25Fast,
+                        _ => {
+                            return Err("--graph must be v8-fallback, v17-fast, or v25-fast".into());
+                        }
+                    },
+                );
+            }
             _ => return Err(format!("unknown argument: {argument}").into()),
         }
     }
@@ -840,12 +1039,23 @@ fn options() -> Result<Options, DynError> {
         !windows.is_empty() && windows.iter().all(|window| *window >= 65_536),
         "all timing windows must be at least 64 KiB",
     )?;
+    require(
+        (1..=32).contains(&timing_minimum_width),
+        "minimum width must be in 1..=32",
+    )?;
+    require(
+        portable_prefix_candidate_starts.is_none_or(|starts| starts > 0),
+        "portable prefix must contain at least one candidate start",
+    )?;
     Ok(Options {
         output: output.ok_or("--output PATH is required")?,
         host: host.unwrap_or_else(|| "unspecified-aarch64-host".to_owned()),
         samples,
         sample_bytes,
         windows,
+        portable_prefix_candidate_starts,
+        timing_minimum_width,
+        timing_graph,
     })
 }
 

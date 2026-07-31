@@ -45,6 +45,7 @@ fn main() {
     let mut generated = String::with_capacity(512 * 1024);
     let mut corpus_digest = Sha256::new();
     corpus_digest.update(b"FRE-SEARCH-V27-NATIVE-EVIDENCE-CORPUS-V1\0");
+    let mut v25_graph_equality_images = 0_usize;
 
     if target_os == "macos" {
         assembly.push_str(".section __TEXT,__text,regular,pure_instructions\n");
@@ -89,6 +90,34 @@ fn main() {
             let selected_end = emit_selected_end(&literal);
             let span = emit_span(&literal);
             let graph = selected_v27_graph(&literal, &span);
+            if graph == "v25-fast" {
+                for (output, v27, v25) in [
+                    (
+                        "exists",
+                        &exists,
+                        emit_exists_with_policy(&literal, SearchBackendPolicy::AsimdV25),
+                    ),
+                    (
+                        "selected-end",
+                        &selected_end,
+                        emit_selected_end_with_policy(&literal, SearchBackendPolicy::AsimdV25),
+                    ),
+                    (
+                        "span",
+                        &span,
+                        emit_span_with_policy(&literal, SearchBackendPolicy::AsimdV25),
+                    ),
+                ] {
+                    assert_selected_v25_graph_equal(
+                        v27,
+                        &v25,
+                        &format!("width={width} topology={topology} output={output}"),
+                    );
+                    v25_graph_equality_images = v25_graph_equality_images
+                        .checked_add(1)
+                        .expect("bounded equality matrix");
+                }
+            }
             let family_id = format!("w{width:02}_{}", topology.replace('-', "_"));
             let symbols = [
                 format!("fre_v27_{family_id}_exists"),
@@ -123,6 +152,11 @@ fn main() {
         hex(&digest)
     )
     .expect("generated digest");
+    writeln!(
+        generated,
+        "const V25_GRAPH_EQUALITY_IMAGES: usize = {v25_graph_equality_images};"
+    )
+    .expect("generated equality count");
     generated.push_str("fn candidate_families() -> Vec<CandidateFamily> {\n\tvec![\n");
     for row in family_rows {
         writeln!(generated, "\t\t{row},").expect("generated family");
@@ -138,40 +172,80 @@ fn main() {
 }
 
 fn emit_exists(literal: &[u8]) -> NativeImage {
+    emit_exists_with_policy(literal, SearchBackendPolicy::AsimdV27)
+}
+
+fn emit_exists_with_policy(literal: &[u8], policy: SearchBackendPolicy) -> NativeImage {
     let program =
         build_exact_literal::<Exists>(literal, AnchorFlags::default(), ValidateLimits::default())
             .expect("Exists Kernel IR");
-    emit_v27(&program)
+    emit_policy(&program, policy)
 }
 
 fn emit_selected_end(literal: &[u8]) -> NativeImage {
+    emit_selected_end_with_policy(literal, SearchBackendPolicy::AsimdV27)
+}
+
+fn emit_selected_end_with_policy(literal: &[u8], policy: SearchBackendPolicy) -> NativeImage {
     let program = build_exact_literal::<SelectedEnd>(
         literal,
         AnchorFlags::default(),
         ValidateLimits::default(),
     )
     .expect("SelectedEnd Kernel IR");
-    emit_v27(&program)
+    emit_policy(&program, policy)
 }
 
 fn emit_span(literal: &[u8]) -> NativeImage {
+    emit_span_with_policy(literal, SearchBackendPolicy::AsimdV27)
+}
+
+fn emit_span_with_policy(literal: &[u8], policy: SearchBackendPolicy) -> NativeImage {
     let program =
         build_exact_literal::<Span>(literal, AnchorFlags::default(), ValidateLimits::default())
             .expect("Span Kernel IR");
-    emit_v27(&program)
+    emit_policy(&program, policy)
 }
 
-fn emit_v27<O: fre_kernel_ir::Operation>(
+fn emit_policy<O: fre_kernel_ir::Operation>(
     program: &fre_kernel_ir::ValidatedProgram<O>,
+    policy: SearchBackendPolicy,
 ) -> NativeImage {
-    let image = emit_with_backend(
-        program,
-        SearchBackendPolicy::AsimdV27,
-        EmitLimits::default(),
-    )
-    .expect("V27 native image");
-    audit(&image).expect("independent V27 image audit");
+    let image =
+        emit_with_backend(program, policy, EmitLimits::default()).expect("native search image");
+    audit(&image).expect("independent image audit");
     image
+}
+
+fn assert_selected_v25_graph_equal(v27: &NativeImage, v25: &NativeImage, context: &str) {
+    assert_eq!(v27.output(), v25.output(), "{context}: output");
+    assert_eq!(v27.target(), v25.target(), "{context}: target");
+    assert_eq!(
+        v27.source_identity(),
+        v25.source_identity(),
+        "{context}: source identity"
+    );
+    assert_eq!(v27.layout(), v25.layout(), "{context}: layout");
+    assert_eq!(v27.code(), v25.code(), "{context}: code");
+    assert_eq!(v27.rodata(), v25.rodata(), "{context}: rodata");
+    assert_eq!(v27.labels(), v25.labels(), "{context}: labels");
+    assert_eq!(v27.symbols(), v25.symbols(), "{context}: symbols");
+    assert_eq!(
+        v27.relocations(),
+        v25.relocations(),
+        "{context}: relocations"
+    );
+    assert_eq!(v27.stats(), v25.stats(), "{context}: stats");
+    assert_ne!(
+        v27.backend_version(),
+        v25.backend_version(),
+        "{context}: backend identity"
+    );
+    assert_ne!(
+        v27.artifact_identity(),
+        v25.artifact_identity(),
+        "{context}: artifact identity"
+    );
 }
 
 fn selected_v27_graph(literal: &[u8], v27: &NativeImage) -> &'static str {
