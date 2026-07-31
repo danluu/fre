@@ -304,6 +304,14 @@ impl SourceQualifiedStaticSearchSpanFamilyV1 {
         self.manifest_identity.as_bytes()
     }
 
+    pub(crate) const fn minimum_literal_bytes(&self) -> u32 {
+        self.minimum_literal_bytes
+    }
+
+    pub(crate) const fn maximum_literal_bytes(&self) -> u32 {
+        self.maximum_literal_bytes
+    }
+
     pub(crate) const fn minimum_window_bytes(&self) -> u32 {
         self.minimum_window_bytes
     }

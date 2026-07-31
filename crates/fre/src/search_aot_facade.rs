@@ -80,6 +80,14 @@ pub enum SearchExactLiteralAotBindErrorV1 {
     /// The authenticated portable-prefix size cannot be represented on this
     /// target.
     PortablePrefixCandidateStartsNotRepresentable { starts: u32 },
+    /// The live literal is outside the authenticated broad-family routing
+    /// envelope. The static runtime already enforces this at adoption; the
+    /// facade repeats it before publishing an automatic route.
+    LiteralWidthOutsideProductionFamily {
+        literal_bytes: u32,
+        minimum_bytes: u32,
+        maximum_bytes: u32,
+    },
 }
 
 impl fmt::Display for SearchExactLiteralAotBindErrorV1 {
@@ -322,10 +330,12 @@ impl<'binding> SearchExactLiteralAutoAotV1<'binding> {
             verified.live_literal_bytes(),
             |literal| verified.authenticates_literal(literal),
         )?;
-        let policy =
-            checked_automatic_policy_v1(verified.family_execution_policy().ok_or(
-                SearchExactLiteralAotBindErrorV1::ProductionFamilyExecutionPolicyRequired,
-            )?)?;
+        let policy = checked_automatic_policy_v1(
+            verified
+                .family_execution_policy()
+                .ok_or(SearchExactLiteralAotBindErrorV1::ProductionFamilyExecutionPolicyRequired)?,
+            checked.literal_bytes,
+        )?;
         let PortablePlan::ExactLiteral(portable_plan) = &portable_owner.plan else {
             return Err(SearchExactLiteralAotBindErrorV1::PortableOwnerIsNotExactLiteralCandidate);
         };
@@ -586,12 +596,13 @@ impl SearchExactLiteralCompiledAotV25 {
                         verified.live_literal_bytes(),
                         |literal| verified.authenticates_literal(literal),
                     );
-                    match checked.and_then(|_| {
+                    match checked.and_then(|checked| {
                         checked_automatic_policy_v1(
                             verified.family_execution_policy().ok_or(
                                 SearchExactLiteralAotBindErrorV1::
                                     ProductionFamilyExecutionPolicyRequired,
                             )?,
+                            checked.literal_bytes,
                         )
                     }) {
                         Ok(policy) => {
@@ -831,7 +842,19 @@ impl SearchExactLiteralAotThreadSessionV1<'_> {
 
 fn checked_automatic_policy_v1(
     source: StaticSearchSpanFamilyExecutionPolicyV1,
+    literal_bytes: u32,
 ) -> Result<CheckedAutomaticPolicyV1, SearchExactLiteralAotBindErrorV1> {
+    let minimum_bytes = source.minimum_literal_bytes();
+    let maximum_bytes = source.maximum_literal_bytes();
+    if !literal_is_in_production_family_v1(literal_bytes, minimum_bytes, maximum_bytes) {
+        return Err(
+            SearchExactLiteralAotBindErrorV1::LiteralWidthOutsideProductionFamily {
+                literal_bytes,
+                minimum_bytes,
+                maximum_bytes,
+            },
+        );
+    }
     let minimum_window_bytes = usize::try_from(source.minimum_window_bytes()).map_err(|_| {
         SearchExactLiteralAotBindErrorV1::MinimumWindowBytesNotRepresentable {
             bytes: source.minimum_window_bytes(),
@@ -848,6 +871,17 @@ fn checked_automatic_policy_v1(
         minimum_window_bytes,
         portable_prefix_candidate_starts,
     })
+}
+
+const fn literal_is_in_production_family_v1(
+    literal_bytes: u32,
+    minimum_bytes: u32,
+    maximum_bytes: u32,
+) -> bool {
+    minimum_bytes != 0
+        && minimum_bytes <= maximum_bytes
+        && literal_bytes >= minimum_bytes
+        && literal_bytes <= maximum_bytes
 }
 
 #[inline]
@@ -1118,6 +1152,16 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn automatic_family_policy_rechecks_the_inclusive_literal_envelope() {
+        assert!(!literal_is_in_production_family_v1(8, 9, 32));
+        assert!(literal_is_in_production_family_v1(9, 9, 32));
+        assert!(literal_is_in_production_family_v1(32, 9, 32));
+        assert!(!literal_is_in_production_family_v1(33, 9, 32));
+        assert!(!literal_is_in_production_family_v1(9, 0, 32));
+        assert!(!literal_is_in_production_family_v1(9, 32, 9));
     }
 
     #[test]

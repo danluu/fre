@@ -649,6 +649,8 @@ pub(super) struct CopiedSearchSpanExpectationV1 {
 /// Process-lifetime proof of one source-qualified linked Search-v1 Span tuple.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StaticSearchSpanFamilyExecutionPolicyV1 {
+    minimum_literal_bytes: u32,
+    maximum_literal_bytes: u32,
     minimum_window_bytes: u32,
     portable_prefix_candidate_starts: u32,
     plan_identity: [u8; 32],
@@ -657,6 +659,20 @@ pub struct StaticSearchSpanFamilyExecutionPolicyV1 {
 }
 
 impl StaticSearchSpanFamilyExecutionPolicyV1 {
+    /// Inclusive lower bound of the authenticated production-family literal
+    /// envelope.
+    #[must_use]
+    pub const fn minimum_literal_bytes(self) -> u32 {
+        self.minimum_literal_bytes
+    }
+
+    /// Inclusive upper bound of the authenticated production-family literal
+    /// envelope.
+    #[must_use]
+    pub const fn maximum_literal_bytes(self) -> u32 {
+        self.maximum_literal_bytes
+    }
+
     #[must_use]
     pub const fn minimum_window_bytes(self) -> u32 {
         self.minimum_window_bytes
@@ -1490,6 +1506,8 @@ unsafe fn adopt_source_qualified_static_search_span_family_v1(
             entry,
             row_selector: family.selector(),
             family_execution_policy: Some(StaticSearchSpanFamilyExecutionPolicyV1 {
+                minimum_literal_bytes: family.minimum_literal_bytes(),
+                maximum_literal_bytes: family.maximum_literal_bytes(),
                 minimum_window_bytes: family.minimum_window_bytes(),
                 portable_prefix_candidate_starts: family.portable_prefix_candidate_starts(),
                 plan_identity: *family.plan_identity(),
@@ -2159,6 +2177,8 @@ mod tests {
                 entry: dummy_entry,
                 row_selector: fixture.family.selector(),
                 family_execution_policy: Some(StaticSearchSpanFamilyExecutionPolicyV1 {
+                    minimum_literal_bytes: fixture.family.minimum_literal_bytes(),
+                    maximum_literal_bytes: fixture.family.maximum_literal_bytes(),
                     minimum_window_bytes: fixture.family.minimum_window_bytes(),
                     portable_prefix_candidate_starts: fixture
                         .family
@@ -2174,6 +2194,17 @@ mod tests {
                 .expect("test inspection accounting"),
             };
             assert!(handle.authenticates_literal(&fixture.literal));
+            let policy = handle
+                .family_execution_policy()
+                .expect("family handle retains its authenticated route policy");
+            assert_eq!(
+                policy.minimum_literal_bytes(),
+                fixture.family.minimum_literal_bytes()
+            );
+            assert_eq!(
+                policy.maximum_literal_bytes(),
+                fixture.family.maximum_literal_bytes()
+            );
             let mut substituted = fixture.literal.clone();
             substituted[0] ^= 1;
             assert!(!handle.authenticates_literal(&substituted));
@@ -2808,6 +2839,8 @@ mod tests {
             entry: session_test_entry,
             row_selector: fixture.family.selector(),
             family_execution_policy: Some(StaticSearchSpanFamilyExecutionPolicyV1 {
+                minimum_literal_bytes: fixture.family.minimum_literal_bytes(),
+                maximum_literal_bytes: fixture.family.maximum_literal_bytes(),
                 minimum_window_bytes: fixture.family.minimum_window_bytes(),
                 portable_prefix_candidate_starts: fixture.family.portable_prefix_candidate_starts(),
                 plan_identity: *fixture.family.plan_identity(),
