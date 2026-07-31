@@ -7,8 +7,9 @@
 use std::{collections::BTreeMap, error::Error, fmt};
 
 use fre_jit_aarch64::{
-    AotLimits, AuditReport, EmitError, EmitLimits, ImageStats, NativeImage, SearchBackendPolicy,
-    UnsupportedReason,
+    AotLimits, AuditReport, BackendVersion, ConfirmationKind, EmitError, EmitLimits, ImageStats,
+    NativeImage, SearchBackendPolicy, SearchV26Codegen, UnsupportedReason,
+    search_v26_codegen_for_literal_width,
 };
 use fre_jit_runtime::{PublicationLimits, RuntimeOperation};
 use fre_kernel_ir::{
@@ -621,6 +622,8 @@ pub struct StaticParityReport {
     pub literals: usize,
     pub exact_machine_object_parities: usize,
     pub distinct_aot_identities: usize,
+    pub routing_boundary_checks: usize,
+    pub candidate_aot_magic_hex: &'static str,
     pub candidate: StaticTotals,
     pub selected_source: StaticTotals,
     pub timing: &'static str,
@@ -633,6 +636,14 @@ pub fn static_parity(
     population: &SyntheticPopulation,
     candidate: SearchBackendPolicy,
 ) -> Result<StaticParityReport, PopulationError> {
+    if candidate != SearchBackendPolicy::AsimdV26
+        || candidate.backend_version() != BackendVersion::SEARCH_V26
+    {
+        return Err(PopulationError::new(
+            "V26 static evidence requires exact AsimdV26/backend 39",
+        ));
+    }
+    let routing_boundary_checks = validate_v26_routing_boundaries(population)?;
     let mut candidate_totals = StaticTotals::default();
     let mut source_totals = StaticTotals::default();
     let mut exact_machine_object_parities = 0_usize;
@@ -673,6 +684,8 @@ pub fn static_parity(
         literals: population.literals().len(),
         exact_machine_object_parities,
         distinct_aot_identities,
+        routing_boundary_checks,
+        candidate_aot_magic_hex: "4652454136340027",
         candidate: candidate_totals,
         selected_source: source_totals,
         timing: "not-run",
@@ -710,7 +723,11 @@ fn static_parity_typed<O: Operation>(
     let source_aot = source
         .to_aot(AotLimits::default())
         .map_err(|error| PopulationError::new(format!("source AOT encoding failed: {error}")))?;
-    if candidate.backend_version() == source.backend_version()
+    if candidate.backend_version() != BackendVersion::SEARCH_V26
+        || candidate_aot.as_bytes().get(..8) != Some(b"FREA64\0\x27")
+        || candidate_aot.identity() != candidate.artifact_identity()
+        || source_aot.identity() != source.artifact_identity()
+        || candidate.backend_version() == source.backend_version()
         || candidate.artifact_identity() == source.artifact_identity()
         || candidate_aot == source_aot
         || candidate_aot.identity() == source_aot.identity()
@@ -725,6 +742,118 @@ fn static_parity_typed<O: Operation>(
         candidate_audit,
         source_audit,
     })
+}
+
+fn validate_v26_routing_boundaries(
+    population: &SyntheticPopulation,
+) -> Result<usize, PopulationError> {
+    let routes = [
+        (5_usize, None),
+        (6, Some(SearchV26Codegen::AsimdV17)),
+        (8, Some(SearchV26Codegen::AsimdV17)),
+        (9, Some(SearchV26Codegen::AsimdV25)),
+        (32, Some(SearchV26Codegen::AsimdV25)),
+        (33, None),
+    ];
+    for (width, expected) in routes {
+        if search_v26_codegen_for_literal_width(width) != expected {
+            return Err(PopulationError::new(format!(
+                "public V26 width route for {width} is not {expected:?}"
+            )));
+        }
+    }
+    let mut checks = routes.len();
+    for width in [6_u16, 8, 9, 32] {
+        for output in SyntheticOutput::ALL {
+            let literal = population
+                .literals()
+                .iter()
+                .find(|literal| {
+                    literal.width == width
+                        && literal.output == output
+                        && literal.accepted_ordinal == 0
+                })
+                .ok_or_else(|| {
+                    PopulationError::new(format!(
+                        "missing V26 boundary literal for width {width}/{output:?}"
+                    ))
+                })?;
+            expect_v26_admitted(output, literal.literal())?;
+            checks = checks
+                .checked_add(1)
+                .ok_or_else(|| PopulationError::new("V26 routing check count overflow"))?;
+        }
+    }
+    for width in [5_u16, 33] {
+        for output in SyntheticOutput::ALL {
+            let literal = derive_literal(width, output.tag(), 0);
+            expect_v26_rejected(output, &literal)?;
+            checks = checks
+                .checked_add(1)
+                .ok_or_else(|| PopulationError::new("V26 routing check count overflow"))?;
+        }
+    }
+    Ok(checks)
+}
+
+fn expect_v26_admitted(output: SyntheticOutput, literal: &[u8]) -> Result<(), PopulationError> {
+    match output {
+        SyntheticOutput::Exists => expect_v26_admitted_typed::<Exists>(literal),
+        SyntheticOutput::Span => expect_v26_admitted_typed::<Span>(literal),
+        SyntheticOutput::SelectedEnd => expect_v26_admitted_typed::<SelectedEnd>(literal),
+    }
+}
+
+fn expect_v26_admitted_typed<O: Operation>(literal: &[u8]) -> Result<(), PopulationError> {
+    let program =
+        build_exact_literal::<O>(literal, AnchorFlags::default(), ValidateLimits::default())
+            .map_err(|error| PopulationError::new(format!("V26 boundary KIR failed: {error}")))?;
+    let image = fre_jit_aarch64::emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV26,
+        EmitLimits::default(),
+    )
+    .map_err(|error| PopulationError::new(format!("V26 boundary emission failed: {error}")))?;
+    if image.backend_version() != BackendVersion::SEARCH_V26 {
+        return Err(PopulationError::new(
+            "V26 boundary emission did not stamp backend 39",
+        ));
+    }
+    Ok(())
+}
+
+fn expect_v26_rejected(output: SyntheticOutput, literal: &[u8]) -> Result<(), PopulationError> {
+    match output {
+        SyntheticOutput::Exists => expect_v26_rejected_typed::<Exists>(literal),
+        SyntheticOutput::Span => expect_v26_rejected_typed::<Span>(literal),
+        SyntheticOutput::SelectedEnd => expect_v26_rejected_typed::<SelectedEnd>(literal),
+    }
+}
+
+fn expect_v26_rejected_typed<O: Operation>(literal: &[u8]) -> Result<(), PopulationError> {
+    let program =
+        build_exact_literal::<O>(literal, AnchorFlags::default(), ValidateLimits::default())
+            .map_err(|error| PopulationError::new(format!("V26 refusal KIR failed: {error}")))?;
+    match fre_jit_aarch64::emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV26,
+        EmitLimits::default(),
+    ) {
+        Err(EmitError::ConfirmationLengthLimit {
+            kind: ConfirmationKind::ExactLiteral,
+            limit: 32,
+            required: 33,
+        }) if literal.len() == 33 => Ok(()),
+        Err(EmitError::Unsupported {
+            reason: UnsupportedReason::KernelShape,
+        }) if literal.len() == 5 => Ok(()),
+        Err(error) => Err(PopulationError::new(format!(
+            "V26 outside-width refusal returned unexpected error: {error}"
+        ))),
+        Ok(_) => Err(PopulationError::new(
+            "V26 admitted a literal outside width 6..32",
+        )),
+    }
 }
 
 fn require_machine_object_parity(
@@ -1031,5 +1160,23 @@ mod tests {
             Some(SearchBackendPolicy::AsimdV25)
         );
         assert_eq!(selected_source_policy(33), None);
+        assert_eq!(search_v26_codegen_for_literal_width(5), None);
+        assert_eq!(
+            search_v26_codegen_for_literal_width(6),
+            Some(SearchV26Codegen::AsimdV17)
+        );
+        assert_eq!(
+            search_v26_codegen_for_literal_width(8),
+            Some(SearchV26Codegen::AsimdV17)
+        );
+        assert_eq!(
+            search_v26_codegen_for_literal_width(9),
+            Some(SearchV26Codegen::AsimdV25)
+        );
+        assert_eq!(
+            search_v26_codegen_for_literal_width(32),
+            Some(SearchV26Codegen::AsimdV25)
+        );
+        assert_eq!(search_v26_codegen_for_literal_width(33), None);
     }
 }

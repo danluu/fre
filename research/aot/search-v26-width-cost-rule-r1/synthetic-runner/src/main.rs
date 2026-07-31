@@ -1,7 +1,9 @@
 use std::{env, error::Error, io};
 
+use fre_jit_aarch64::SearchBackendPolicy;
 use fre_search_v26_synthetic_runner::{
     EXPECTED_LITERAL_COUNT, MAX_WIDTH, MIN_WIDTH, SYNTHETIC_DOMAIN, generate_population, hex,
+    native_correctness, static_parity,
 };
 use serde::Serialize;
 
@@ -27,18 +29,30 @@ fn main() -> Result<(), Box<dyn Error>> {
     if arguments.next().is_some() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: fre-search-v26-synthetic-runner [summary|population]",
+            "usage: fre-search-v26-synthetic-runner [summary|population|static|correctness]",
         )
         .into());
     }
     let population = generate_population()?;
+    if command == "static" {
+        let report = static_parity(&population, SearchBackendPolicy::AsimdV26)?;
+        serde_json::to_writer(io::stdout().lock(), &report)?;
+        println!();
+        return Ok(());
+    }
+    if command == "correctness" {
+        let report = native_correctness(&population, SearchBackendPolicy::AsimdV26)?;
+        serde_json::to_writer(io::stdout().lock(), &report)?;
+        println!();
+        return Ok(());
+    }
     let literals = match command.as_str() {
         "summary" => None,
         "population" => Some(population.literals()),
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "command must be summary or population",
+                "command must be summary, population, static, or correctness",
             )
             .into());
         }

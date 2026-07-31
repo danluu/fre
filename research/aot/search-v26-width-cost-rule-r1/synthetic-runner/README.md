@@ -16,10 +16,13 @@ cargo run --manifest-path \
 ```
 
 Use `population` instead of `summary` to include all 1,296 literal records.
-Unit tests pin the byte derivation, population identity, uniqueness,
-determinism, per-cell counts, and public-emitter admission.
+`static` enforces exact V17 graph parity at widths 6 through 8, exact V25
+graph parity at widths 9 through 32, tag-39/AOT-magic distinction, and routing
+boundaries. `correctness` publishes V26 locally and differentially checks all
+7,776 literal/window/output cases against the safe Kernel IR oracle. Unit
+tests pin the byte derivation, population identity, uniqueness, determinism,
+per-cell counts, geometry, and public-emitter admission.
 
-Candidate/source static parity, KIR/native correctness, and the explicitly
-report-only local emission timing command are added only after the separately
-implemented `AsimdV26` public backend is available. This scaffold does not run
-or infer any V26 timing.
+Neither command measures wall time. Performance execution belongs to a
+separately sealed one-shot runner and receipt; this correctness/static tool
+does not run or infer V26 timing.
