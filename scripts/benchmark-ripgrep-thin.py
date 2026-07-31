@@ -82,6 +82,14 @@ def parse_args():
             "absent; this is a source-tree-only deviation from the suite."
         ),
     )
+    parser.add_argument(
+        "--whole-file",
+        action="store_true",
+        help=(
+            "Pass each file as one haystack and exhaust non-overlapping "
+            "match iteration instead of matching one line at a time."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -148,8 +156,12 @@ def fingerprint(data):
     }
 
 
-def command_for(wrapper, engine, canonical, describe_only=False):
+def command_for(
+    wrapper, engine, canonical, whole_file=False, describe_only=False
+):
     command = [str(wrapper), "--engine", engine]
+    if whole_file:
+        command.append("--whole-file")
     if describe_only:
         command.append("--describe-only")
     command.extend(canonical.cmd[1:])
@@ -195,8 +207,14 @@ def run_process(command, canonical, timeout_seconds):
     }
 
 
-def describe(wrapper, engine, canonical):
-    command = command_for(wrapper, engine, canonical, describe_only=True)
+def describe(wrapper, engine, canonical, whole_file):
+    command = command_for(
+        wrapper,
+        engine,
+        canonical,
+        whole_file=whole_file,
+        describe_only=True,
+    )
     started = time.perf_counter_ns()
     try:
         completed = subprocess.run(
@@ -370,8 +388,10 @@ def aggregate_results(results):
 
 def benchmark_one(args, benchmark, wrapper):
     canonical = canonical_rg_command(benchmark)
+    scan_mode = "whole-file-find-iter" if args.whole_file else "line-is-match"
     row = {
         "benchmark": benchmark.name,
+        "scan_mode": scan_mode,
         "pattern": benchmark.pattern,
         "rg_name": canonical.name,
         "rg_argv": canonical.cmd,
@@ -388,7 +408,9 @@ def benchmark_one(args, benchmark, wrapper):
 
     describe_results = {}
     for engine in ("rust-regex", "fre"):
-        result, description = describe(wrapper, engine, canonical)
+        result, description = describe(
+            wrapper, engine, canonical, args.whole_file
+        )
         row[f"{engine.replace('-', '_')}_description"] = description
         describe_results[engine] = result
     if describe_results["rust-regex"]["exit_status"] != 0:
@@ -404,7 +426,12 @@ def benchmark_one(args, benchmark, wrapper):
     # filesystem-cache warmup. Run in the opposite order from pair zero.
     for engine in ("rust-regex", "fre"):
         result = run_process(
-            command_for(wrapper, engine, canonical),
+            command_for(
+                wrapper,
+                engine,
+                canonical,
+                whole_file=args.whole_file,
+            ),
             canonical,
             timeout_seconds=args.timeout_seconds,
         )
@@ -430,7 +457,12 @@ def benchmark_one(args, benchmark, wrapper):
         order = ENGINES if pair % 2 == 0 else tuple(reversed(ENGINES))
         for position, engine in enumerate(order):
             result = run_process(
-                command_for(wrapper, engine, canonical),
+                command_for(
+                    wrapper,
+                    engine,
+                    canonical,
+                    whole_file=args.whole_file,
+                ),
                 canonical,
                 timeout_seconds=args.timeout_seconds,
             )
@@ -545,6 +577,7 @@ def write_outputs(output_dir, document):
 
 def main():
     args = parse_args()
+    scan_mode = "whole-file-find-iter" if args.whole_file else "line-is-match"
     if args.pairs <= 0:
         raise SystemExit("--pairs must be positive")
     if args.timeout_seconds <= 0:
@@ -618,18 +651,30 @@ def main():
         "rustc": command_value("rustc", "--version", "--verbose"),
         "cargo": command_value("cargo", "--version", "--verbose"),
         "pairs": args.pairs,
+        "scan_mode": scan_mode,
         "sampling_runs": [
             {
                 "started_utc": timestamp,
                 "pairs": args.pairs,
                 "arm_timeout_seconds": args.timeout_seconds,
+                "scan_mode": scan_mode,
             }
         ],
         "arm_timeout_seconds": args.timeout_seconds,
         "schedule": "adjacent fresh-process pairs, alternating FRE/Rust order",
         "timing_boundary": "spawn through exit with stdout/stderr drained",
         "clock": "time.perf_counter_ns",
-        "semantic_check": "exit status plus SHA-256/byte/newline fingerprint",
+        "semantic_check": (
+            "exit status plus exhaustive ordered whole-file match-span "
+            "digest fingerprint"
+            if args.whole_file
+            else "exit status plus SHA-256/byte/newline fingerprint"
+        ),
+        "matcher_operation": (
+            "non-overlapping find iteration over each complete file"
+            if args.whole_file
+            else "is_match independently on each line"
+        ),
         "variant_policy": "one canonical suite command named rg per workload",
         "linux_corpus_policy": (
             "source tree without required kernel build"
@@ -658,6 +703,14 @@ def main():
     if existing_document is None:
         document = {"metadata": metadata, "results": []}
     else:
+        existing_scan_mode = document["metadata"].get(
+            "scan_mode", "line-is-match"
+        )
+        if existing_scan_mode != scan_mode:
+            raise SystemExit(
+                "cannot resume across scan modes: "
+                f"existing={existing_scan_mode}, requested={scan_mode}"
+            )
         document = existing_document
         document["metadata"]["arm_timeout_seconds"] = args.timeout_seconds
         document["metadata"]["runner_source_sha256"] = metadata[
@@ -672,6 +725,7 @@ def main():
                     "arm_timeout_seconds": document["metadata"].get(
                         "arm_timeout_seconds"
                     ),
+                    "scan_mode": existing_scan_mode,
                 }
             ]
         document["metadata"]["sampling_runs"].append(
@@ -679,6 +733,7 @@ def main():
                 "started_utc": timestamp,
                 "pairs": args.pairs,
                 "arm_timeout_seconds": args.timeout_seconds,
+                "scan_mode": scan_mode,
             }
         )
         document["metadata"].pop("finished_utc", None)
