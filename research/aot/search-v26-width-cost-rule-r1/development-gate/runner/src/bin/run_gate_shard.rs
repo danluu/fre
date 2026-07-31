@@ -37,6 +37,7 @@ const BUILD_HOST: &str = env!("FRE_V26_BUILD_HOST");
 const BUILD_PROFILE: &str = env!("FRE_V26_BUILD_PROFILE");
 const BUILD_OPT_LEVEL: &str = env!("FRE_V26_BUILD_OPT_LEVEL");
 const BUILD_DEBUG: &str = env!("FRE_V26_BUILD_DEBUG");
+const BUILD_CRT_STATIC: &str = env!("FRE_V26_BUILD_CRT_STATIC");
 const RUSTC_IDENTITY_SHA256: &str = env!("FRE_V26_RUSTC_IDENTITY_SHA256");
 const CARGO_IDENTITY_SHA256: &str = env!("FRE_V26_CARGO_IDENTITY_SHA256");
 const RUNNER_SOURCE_SET_SHA256: &str = env!("FRE_V26_RUNNER_SOURCE_SET_SHA256");
@@ -52,6 +53,8 @@ const BUILD_IDENTITY_MARKER: &str = concat!(
     env!("FRE_V26_BUILD_TARGET"),
     "|",
     env!("FRE_V26_BUILD_PROFILE"),
+    "|",
+    env!("FRE_V26_BUILD_CRT_STATIC"),
     "|",
     env!("FRE_V26_RUNNER_SOURCE_SET_SHA256"),
     "|",
@@ -75,6 +78,7 @@ struct BuildIdentity {
     profile: &'static str,
     opt_level: &'static str,
     debug: &'static str,
+    crt_static: &'static str,
     rustc_identity_sha256: &'static str,
     cargo_identity_sha256: &'static str,
     runner_source_set_sha256: &'static str,
@@ -96,6 +100,7 @@ fn build_identity() -> BuildIdentity {
         profile: BUILD_PROFILE,
         opt_level: BUILD_OPT_LEVEL,
         debug: BUILD_DEBUG,
+        crt_static: BUILD_CRT_STATIC,
         rustc_identity_sha256: RUSTC_IDENTITY_SHA256,
         cargo_identity_sha256: CARGO_IDENTITY_SHA256,
         runner_source_set_sha256: RUNNER_SOURCE_SET_SHA256,
@@ -962,6 +967,7 @@ enum Phase {
 }
 
 struct Arguments {
+    supervision_ready_fd: i32,
     phase: Phase,
     shard_id: u8,
     seal: PathBuf,
@@ -976,6 +982,7 @@ struct Arguments {
 
 fn parse_args() -> GateResult<Arguments> {
     let mut arguments = env::args_os().skip(1);
+    let mut supervision_ready_fd = None;
     let mut phase = None;
     let mut shard_id = None;
     let mut seal = None;
@@ -991,6 +998,16 @@ fn parse_args() -> GateResult<Arguments> {
             .next()
             .ok_or_else(|| invalid("every runner option requires one value"))?;
         match argument.to_str() {
+            Some("--supervision-ready-fd") => {
+                let parsed = value
+                    .to_str()
+                    .ok_or_else(|| invalid("supervision-ready FD is not UTF-8"))?
+                    .parse::<i32>()?;
+                if parsed < 0 {
+                    return Err(invalid("supervision-ready FD must be nonnegative").into());
+                }
+                supervision_ready_fd = Some(parsed);
+            }
             Some("--phase") => {
                 phase = Some(match value.to_str() {
                     Some("preflight") => Phase::Preflight,
@@ -1040,6 +1057,8 @@ fn parse_args() -> GateResult<Arguments> {
         _ => {}
     }
     Ok(Arguments {
+        supervision_ready_fd: supervision_ready_fd
+            .ok_or_else(|| invalid("--supervision-ready-fd is required"))?,
         phase,
         shard_id: shard_id.ok_or_else(|| invalid("--shard-id is required"))?,
         seal: seal.ok_or_else(|| invalid("--seal is required"))?,
@@ -1051,6 +1070,21 @@ fn parse_args() -> GateResult<Arguments> {
         preflight_proofs,
         output: output.ok_or_else(|| invalid("--output is required"))?,
     })
+}
+
+fn await_pidfd_supervision(descriptor: i32) -> GateResult<()> {
+    // Opening the inherited pipe through procfs duplicates it without unsafe
+    // ownership conversion. This is the first action after argument parsing.
+    let mut readiness = File::open(format!("/proc/self/fd/{descriptor}"))?;
+    let mut marker = [0_u8; 2];
+    let observed = readiness.read(&mut marker)?;
+    if observed != 1 || marker[0] != 1 {
+        return Err(invalid("launcher did not establish pidfd supervision").into());
+    }
+    if readiness.read(&mut marker[..1])? != 0 {
+        return Err(invalid("supervision readiness pipe has trailing bytes").into());
+    }
+    Ok(())
 }
 
 #[allow(
@@ -1194,6 +1228,7 @@ fn validate_authority(arguments: &Arguments) -> GateResult<Authority> {
         || identity.profile != "release"
         || identity.opt_level != "3"
         || identity.debug != "false"
+        || identity.crt_static != "true"
         || identity.crate_version != "0.1.0"
         || identity.candidate_backend != 39
         || identity.reference_backend != 30
@@ -1579,6 +1614,7 @@ fn main() -> GateResult<()> {
         return Ok(());
     }
     let arguments = parse_args()?;
+    await_pidfd_supervision(arguments.supervision_ready_fd)?;
     run(&arguments)
 }
 

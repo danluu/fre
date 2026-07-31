@@ -202,6 +202,7 @@ RUNNER_BUILD_IDENTITY_KEYS = frozenset(
         "profile",
         "opt_level",
         "debug",
+        "crt_static",
         "rustc_identity_sha256",
         "cargo_identity_sha256",
         "runner_source_set_sha256",
@@ -492,7 +493,9 @@ def open_verified_fd(source: StableFile) -> int:
         raise
 
 
-def require_elf64_aarch64(source: StableFile, name: str) -> None:
+def require_elf64_aarch64(
+    source: StableFile, name: str, *, require_static: bool = False
+) -> None:
     """Reject scripts and non-AArch64 binaries before executable handshakes."""
     data = source.data
     if len(data) < 64 or data[:4] != b"\x7fELF":
@@ -513,6 +516,12 @@ def require_elf64_aarch64(source: StableFile, name: str) -> None:
         or program_offset + program_entry_bytes * program_entries > len(data)
     ):
         raise GateError(f"{name} has an invalid ELF64 program-header table")
+    if require_static:
+        for index in range(program_entries):
+            offset = program_offset + index * program_entry_bytes
+            program_type = struct.unpack_from("<I", data, offset)[0]
+            if program_type == 3:
+                raise GateError(f"{name} has a dynamic PT_INTERP loader")
 
 
 def archive_runner_source_set_sha256(archive_file: StableFile) -> str:
@@ -717,7 +726,7 @@ def read_jsonl(path: Path) -> Iterator[dict[str, Any]]:
 def runner_build_identity(
     runner_file: StableFile,
 ) -> tuple[dict[str, Any], str]:
-    require_elf64_aarch64(runner_file, "runner binary")
+    require_elf64_aarch64(runner_file, "runner binary", require_static=True)
     descriptor = open_verified_fd(runner_file)
     try:
         completed = subprocess.run(
@@ -774,6 +783,7 @@ def runner_build_identity(
         or value.get("profile") != "release"
         or value.get("opt_level") != "3"
         or value.get("debug") != "false"
+        or value.get("crt_static") != "true"
         or value.get("crate_version") != "0.1.0"
     ):
         raise GateError(
@@ -789,7 +799,7 @@ def runner_build_identity(
     marker = (
         "FRE-V26-RUNNER-BUILD-IDENTITY-V1|"
         f"{source_commit}|{source_tree}|{source_archive}|"
-        f"{value['target_triple']}|{value['profile']}|"
+        f"{value['target_triple']}|{value['profile']}|{value['crt_static']}|"
         f"{value['runner_source_set_sha256']}|"
         f"{value['build_configuration_sha256']}|"
         f"{value['rustc_identity_sha256']}|{value['cargo_identity_sha256']}"
@@ -2109,6 +2119,7 @@ def analyze_paths(
     runner_path: Path,
     taskset_path: Path,
     launcher_path: Path,
+    analyzer_path: Path,
     shard_paths: Sequence[Path],
 ) -> dict[str, Any]:
     if len(shard_paths) != 3:
@@ -2130,7 +2141,12 @@ def analyze_paths(
     runner_file = stable_read(runner_path, MAX_SHARD_BYTES)
     taskset_file = stable_read(taskset_path, MAX_SHARD_BYTES)
     launcher_file = stable_read(launcher_path, MAX_CONTRACT_BYTES)
-    analyzer_file = stable_read(Path(__file__), MAX_CONTRACT_BYTES)
+    # The sealed launcher executes this module through an already-authenticated
+    # /proc/self/fd descriptor.  Consequently __file__ is the proc-fd magic
+    # symlink, which stable_read deliberately refuses via O_NOFOLLOW.  Validate
+    # the separately supplied sealed canonical path instead; the launcher
+    # binds that path to the executed descriptor before spawning us.
+    analyzer_file = stable_read(analyzer_path, MAX_CONTRACT_BYTES)
     seal = read_json_file(seal_file)
     contract = read_json_file(contract_file)
     require_exact_contract(contract, contract_file, cells_file)
@@ -2257,6 +2273,7 @@ def analyze_paths(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--supervision-ready-fd", required=True, type=int)
     parser.add_argument("--expected-seal-sha256", required=True)
     parser.add_argument("seal", type=Path)
     parser.add_argument("contract", type=Path)
@@ -2269,13 +2286,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("runner", type=Path)
     parser.add_argument("taskset", type=Path)
     parser.add_argument("launcher", type=Path)
+    parser.add_argument("analyzer", type=Path)
     parser.add_argument("shards", nargs=3, type=Path)
     return parser.parse_args()
+
+
+def await_pidfd_supervision(descriptor: int) -> None:
+    if descriptor < 0:
+        raise GateError("supervision-ready FD must be nonnegative")
+    try:
+        marker = os.read(descriptor, 1)
+        trailing = os.read(descriptor, 1)
+    except OSError as error:
+        raise GateError(f"cannot read supervision readiness pipe: {error}") from error
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+    if marker != b"\x01" or trailing:
+        raise GateError("launcher did not establish pidfd supervision")
 
 
 def main() -> int:
     args = parse_args()
     try:
+        await_pidfd_supervision(args.supervision_ready_fd)
         report = analyze_paths(
             args.expected_seal_sha256,
             args.seal,
@@ -2289,6 +2325,7 @@ def main() -> int:
             args.runner,
             args.taskset,
             args.launcher,
+            args.analyzer,
             args.shards,
         )
     except GateError as error:

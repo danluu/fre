@@ -202,6 +202,18 @@ fn main() {
         &env::var("OPT_LEVEL").expect("OPT_LEVEL"),
     );
     export("FRE_V26_BUILD_DEBUG", &env::var("DEBUG").expect("DEBUG"));
+    let target_features = env::var("CARGO_CFG_TARGET_FEATURE").unwrap_or_default();
+    export(
+        "FRE_V26_BUILD_CRT_STATIC",
+        if target_features
+            .split(',')
+            .any(|feature| feature == "crt-static")
+        {
+            "true"
+        } else {
+            "false"
+        },
+    );
     export(
         "FRE_V26_RUSTC_IDENTITY_SHA256",
         &command_identity(&rustc, "-vV"),

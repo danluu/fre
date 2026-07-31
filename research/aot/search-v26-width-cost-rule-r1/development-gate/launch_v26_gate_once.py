@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Run the sealed Search V26 gate exactly once on three explicit Linux CPUs.
 
-There is deliberately no load/headroom coordinator, wait-for-GO path, or
-process-kill path. The launcher first completes and validates all three
-untimed semantic preflights, consumes one-shot authority only after that
-global barrier, pins the three timing shards concurrently with sealed
-`/usr/bin/taskset`, waits for every shard naturally, and analyzes the outputs.
+There is deliberately no load/headroom coordinator or wait-for-GO path. The
+launcher first completes and validates all three untimed semantic preflights,
+consumes one-shot authority only after that global barrier, pins the three
+timing shards concurrently with sealed `/usr/bin/taskset`, and analyzes the
+outputs. Sealed multi-hour phase deadlines use Linux pidfds to escalate only
+the exact launcher-created children; unrelated processes are never targeted.
 """
 
 from __future__ import annotations
@@ -16,15 +17,193 @@ import json
 import os
 import platform
 import secrets
+import signal
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
 import analyze_v26_gate as gate
 
 SEALED_RUNNER_ENVIRONMENT = {"LANG": "C", "LC_ALL": "C", "TZ": "UTC"}
+PREFLIGHT_DEADLINE_SECONDS = 2 * 60 * 60
+TIMING_DEADLINE_SECONDS = 8 * 60 * 60
+ANALYZER_DEADLINE_SECONDS = 2 * 60 * 60
+OWN_CHILD_TERM_GRACE_SECONDS = 30
+OWN_CHILD_KILL_GRACE_SECONDS = 30
+
+
+def require_pidfd_supervision() -> None:
+    """Fail before launch unless this Linux Python/kernel can bind exact children."""
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        raise gate.GateError("Linux pidfd child supervision is unavailable")
+    try:
+        descriptor = os.pidfd_open(os.getpid(), 0)
+    except OSError as error:
+        raise gate.GateError(f"Linux pidfd child supervision is unusable: {error}") from error
+    os.close(descriptor)
+
+
+def reserve_pidfd_slots(count: int) -> list[int]:
+    """Reserve descriptor capacity before any child is created."""
+    descriptors: list[int] = []
+    try:
+        for _ in range(count):
+            descriptors.append(
+                os.open(
+                    "/dev/null",
+                    os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
+                )
+            )
+        return descriptors
+    except OSError as error:
+        for descriptor in descriptors:
+            os.close(descriptor)
+        raise gate.GateError(f"cannot reserve pidfd supervision slots: {error}") from error
+
+
+def open_child_pidfd(
+    process: subprocess.Popen[bytes],
+    reserved_descriptor: int,
+) -> int:
+    """Replace one reserved descriptor with a pidfd for an unreaped child."""
+    os.close(reserved_descriptor)
+    try:
+        return os.pidfd_open(process.pid, 0)
+    except OSError as error:
+        # The caller still holds every per-child startup-barrier writer. It
+        # closes those writers on this path, causing every unreleased child to
+        # exit before any authority/input/timer access. No raw-PID fallback
+        # exists.
+        raise gate.GateError(
+            f"cannot bind launcher-created child to a pidfd: {error}"
+        ) from error
+
+
+def release_startup_barrier(readiness_writer: int) -> None:
+    marker = memoryview(b"\x01")
+    try:
+        while marker:
+            written = os.write(readiness_writer, marker)
+            if written <= 0:
+                raise gate.GateError("short write to supervision startup barrier")
+            marker = marker[written:]
+    except OSError as error:
+        raise gate.GateError(
+            f"cannot release pidfd-supervised children: {error}"
+        ) from error
+    finally:
+        os.close(readiness_writer)
+
+
+def reap_unbound_barrier_child(
+    process: subprocess.Popen[bytes] | None,
+    label: str,
+) -> None:
+    if process is None:
+        return
+    try:
+        process.wait(timeout=OWN_CHILD_TERM_GRACE_SECONDS)
+    except subprocess.TimeoutExpired as error:
+        raise gate.GateError(
+            f"{label} remained unreaped behind its closed startup barrier"
+        ) from error
+
+
+def supervision_pipe() -> tuple[int, int]:
+    try:
+        # Python creates non-inheritable descriptors; Popen pass_fds exposes
+        # only the read end to the intended direct child.
+        return os.pipe()
+    except OSError as error:
+        raise gate.GateError(f"cannot create supervision readiness pipe: {error}") from error
+
+
+def wait_until(
+    process: subprocess.Popen[bytes],
+    deadline: float,
+) -> int | None:
+    return_code = process.poll()
+    if return_code is not None:
+        return return_code
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+    try:
+        return process.wait(timeout=remaining)
+    except subprocess.TimeoutExpired:
+        return None
+
+
+def signal_live_pidfd(pidfd: int, process: subprocess.Popen[bytes], signum: int) -> None:
+    """Signal only the still-live child identity captured by this pidfd."""
+    if process.poll() is not None:
+        return
+    try:
+        signal.pidfd_send_signal(pidfd, signum, None, 0)
+    except ProcessLookupError:
+        return
+    except OSError as error:
+        raise gate.GateError(f"cannot signal launcher-created child pidfd: {error}") from error
+
+
+def supervise_children(
+    label: str,
+    children: list[tuple[int, subprocess.Popen[bytes], int]],
+    deadline: float,
+    *,
+    consumed_attempt: bool,
+) -> list[tuple[int, int]]:
+    """Wait naturally, then escalate only exact pidfd-bound children at expiry."""
+    try:
+        return_codes: list[tuple[int, int]] = []
+        timed_out = False
+        for child_id, process, _pidfd in children:
+            return_code = wait_until(process, deadline)
+            if return_code is None:
+                timed_out = True
+                break
+            return_codes.append((child_id, return_code))
+        if not timed_out:
+            return return_codes
+
+        signal_errors: list[str] = []
+        for child_id, process, pidfd in children:
+            try:
+                signal_live_pidfd(pidfd, process, signal.SIGTERM)
+            except gate.GateError as error:
+                signal_errors.append(f"child {child_id} SIGTERM: {error}")
+        term_deadline = time.monotonic() + OWN_CHILD_TERM_GRACE_SECONDS
+        for _child_id, process, _pidfd in children:
+            wait_until(process, term_deadline)
+
+        for child_id, process, pidfd in children:
+            try:
+                signal_live_pidfd(pidfd, process, signal.SIGKILL)
+            except gate.GateError as error:
+                signal_errors.append(f"child {child_id} SIGKILL: {error}")
+        kill_deadline = time.monotonic() + OWN_CHILD_KILL_GRACE_SECONDS
+        unreaped: list[int] = []
+        for child_id, process, _pidfd in children:
+            if wait_until(process, kill_deadline) is None:
+                unreaped.append(child_id)
+
+        terminal = (
+            "; one-shot authority remains consumed and this attempt is terminal"
+            if consumed_attempt
+            else ""
+        )
+        suffix = f"; unreaped child IDs after SIGKILL: {unreaped}" if unreaped else ""
+        if signal_errors:
+            suffix += f"; pidfd signaling errors: {signal_errors}"
+        raise gate.GateError(
+            f"{label} exceeded its sealed phase deadline{terminal}{suffix}"
+        )
+    finally:
+        for _child_id, _process, pidfd in children:
+            os.close(pidfd)
 
 
 def canonical_json_bytes(value: dict[str, Any]) -> bytes:
@@ -187,31 +366,78 @@ def publish_analyzer_output(
         0o600,
     )
     try:
+        reservations = reserve_pidfd_slots(1)
+    except Exception:
+        os.close(descriptor)
+        os.unlink(temporary)
+        raise
+    try:
         with os.fdopen(descriptor, "wb", closefd=True) as output:
-            completed = subprocess.run(
-                command,
-                check=False,
-                stdout=output,
-                pass_fds=pass_fds,
-                env=environment,
+            deadline = time.monotonic() + ANALYZER_DEADLINE_SECONDS
+            readiness_reader, readiness_writer = supervision_pipe()
+            supervised_command = [
+                *command[:4],
+                "--supervision-ready-fd",
+                str(readiness_reader),
+                *command[4:],
+            ]
+            try:
+                process = subprocess.Popen(
+                    supervised_command,
+                    stdout=output,
+                    stdin=subprocess.DEVNULL,
+                    close_fds=True,
+                    pass_fds=(*pass_fds, readiness_reader),
+                    env=environment,
+                )
+            except (OSError, ValueError) as error:
+                os.close(readiness_reader)
+                os.close(readiness_writer)
+                raise gate.GateError(f"cannot start sealed analyzer: {error}") from error
+            os.close(readiness_reader)
+            try:
+                pidfd = open_child_pidfd(process, reservations.pop())
+            except gate.GateError:
+                os.close(readiness_writer)
+                reap_unbound_barrier_child(process, "analyzer")
+                raise
+            try:
+                release_startup_barrier(readiness_writer)
+            except gate.GateError:
+                supervise_children(
+                    "analyzer startup abort",
+                    [(0, process, pidfd)],
+                    time.monotonic() + OWN_CHILD_TERM_GRACE_SECONDS,
+                    consumed_attempt=True,
+                )
+                raise
+            completed = supervise_children(
+                "analyzer",
+                [(0, process, pidfd)],
+                deadline,
+                consumed_attempt=True,
             )
             output.flush()
             os.fsync(output.fileno())
             os.fchmod(output.fileno(), 0o444)
-        if completed.returncode not in (0, 1):
+        return_code = completed[0][1]
+        if return_code not in (0, 1):
             raise gate.GateError(
-                f"analyzer rejected evidence with exit {completed.returncode}"
+                f"analyzer rejected evidence with exit {return_code}"
             )
         os.link(temporary, output_path)
         os.unlink(temporary)
         sync_parent(output_path)
-        return completed.returncode
+        return return_code
     except Exception:
         try:
             os.unlink(temporary)
         except FileNotFoundError:
             pass
         raise
+    finally:
+        for reserved_descriptor in reservations:
+            os.close(reserved_descriptor)
 
 
 def run_shard_phase(
@@ -227,58 +453,147 @@ def run_shard_phase(
     output_paths: list[Path],
     timing_arguments: list[str] | None = None,
 ) -> None:
-    if phase not in {"preflight", "timing"} or len(output_paths) != 3:
+    if (
+        phase not in {"preflight", "timing"}
+        or len(cpu_ids) != 3
+        or len(output_paths) != 3
+    ):
         raise gate.GateError("invalid three-shard phase request")
     taskset_executable = f"/proc/self/fd/{taskset_descriptor}"
     runner_executable = f"/proc/self/fd/{runner_descriptor}"
-    processes: list[tuple[int, subprocess.Popen[bytes]]] = []
-    launch_error: OSError | None = None
-    for shard_id, cpu_id in enumerate(cpu_ids):
-        command = [
-            taskset_executable,
-            "--cpu-list",
-            str(cpu_id),
-            runner_executable,
-            "--phase",
-            phase,
-            "--shard-id",
-            str(shard_id),
-            "--seal",
-            str(seal_path),
-            "--contract",
-            str(contract_path),
-            "--cells",
-            str(cells_path),
-            "--run-manifest",
-            str(run_manifest_path),
-            *(timing_arguments or []),
-            "--output",
-            str(output_paths[shard_id]),
-        ]
-        try:
-            processes.append(
-                (
-                    shard_id,
-                    subprocess.Popen(
-                        command,
-                        executable=taskset_executable,
-                        stdin=subprocess.DEVNULL,
-                        close_fds=True,
-                        pass_fds=(taskset_descriptor, runner_descriptor),
-                        env=SEALED_RUNNER_ENVIRONMENT,
-                        start_new_session=True,
+    deadline_seconds = (
+        PREFLIGHT_DEADLINE_SECONDS
+        if phase == "preflight"
+        else TIMING_DEADLINE_SECONDS
+    )
+    deadline = time.monotonic() + deadline_seconds
+    pending_children: list[tuple[int, subprocess.Popen[bytes], int, int]] = []
+    reservations = reserve_pidfd_slots(3)
+    launch_error: OSError | ValueError | gate.GateError | None = None
+    unbound_process: subprocess.Popen[bytes] | None = None
+    try:
+        for shard_id, cpu_id in enumerate(cpu_ids):
+            try:
+                readiness_reader, readiness_writer = supervision_pipe()
+            except gate.GateError as error:
+                launch_error = error
+                break
+            spawned_process: subprocess.Popen[bytes] | None = None
+            command = [
+                taskset_executable,
+                "--cpu-list",
+                str(cpu_id),
+                runner_executable,
+                "--supervision-ready-fd",
+                str(readiness_reader),
+                "--phase",
+                phase,
+                "--shard-id",
+                str(shard_id),
+                "--seal",
+                str(seal_path),
+                "--contract",
+                str(contract_path),
+                "--cells",
+                str(cells_path),
+                "--run-manifest",
+                str(run_manifest_path),
+                *(timing_arguments or []),
+                "--output",
+                str(output_paths[shard_id]),
+            ]
+            try:
+                spawned_process = subprocess.Popen(
+                    command,
+                    executable=taskset_executable,
+                    stdin=subprocess.DEVNULL,
+                    close_fds=True,
+                    pass_fds=(
+                        taskset_descriptor,
+                        runner_descriptor,
+                        readiness_reader,
                     ),
+                    env=SEALED_RUNNER_ENVIRONMENT,
                 )
+                os.close(readiness_reader)
+                readiness_reader = -1
+                pidfd = open_child_pidfd(spawned_process, reservations.pop())
+                pending_children.append(
+                    (shard_id, spawned_process, pidfd, readiness_writer)
+                )
+                readiness_writer = -1
+            except (OSError, ValueError, gate.GateError) as error:
+                if readiness_reader >= 0:
+                    os.close(readiness_reader)
+                if readiness_writer >= 0:
+                    os.close(readiness_writer)
+                if spawned_process is not None and all(
+                    spawned_process is not pending[1] for pending in pending_children
+                ):
+                    unbound_process = spawned_process
+                launch_error = error
+                break
+        children = [
+            (shard_id, process, pidfd)
+            for shard_id, process, pidfd, _writer in pending_children
+        ]
+        if launch_error is not None:
+            for _shard_id, _process, _pidfd, readiness_writer in pending_children:
+                os.close(readiness_writer)
+            abort_errors: list[str] = []
+            try:
+                reap_unbound_barrier_child(unbound_process, f"{phase} shard")
+            except gate.GateError as error:
+                abort_errors.append(str(error))
+            try:
+                supervise_children(
+                    f"{phase} startup abort",
+                    children,
+                    time.monotonic() + OWN_CHILD_TERM_GRACE_SECONDS,
+                    consumed_attempt=phase == "timing",
+                )
+            except gate.GateError as error:
+                abort_errors.append(str(error))
+            suffix = (
+                f"; startup-abort errors: {abort_errors}" if abort_errors else ""
             )
-        except OSError as error:
-            launch_error = error
-            break
-    return_codes = [(shard_id, process.wait()) for shard_id, process in processes]
-    if launch_error is not None:
-        raise gate.GateError(
-            f"could not start every {phase} shard; started shards finished naturally: "
-            f"{launch_error}"
+            raise gate.GateError(
+                f"could not bind all three {phase} shards before global release: "
+                f"{launch_error}{suffix}"
+            )
+
+        release_error: gate.GateError | None = None
+        for _shard_id, _process, _pidfd, readiness_writer in pending_children:
+            if release_error is None:
+                try:
+                    release_startup_barrier(readiness_writer)
+                except gate.GateError as error:
+                    release_error = error
+            else:
+                os.close(readiness_writer)
+        if release_error is not None:
+            try:
+                supervise_children(
+                    f"{phase} startup release failure",
+                    children,
+                    time.monotonic() + OWN_CHILD_TERM_GRACE_SECONDS,
+                    consumed_attempt=phase == "timing",
+                )
+            except gate.GateError as error:
+                raise gate.GateError(
+                    f"{release_error}; startup cleanup failed: {error}"
+                ) from error
+            raise release_error
+
+        return_codes = supervise_children(
+            f"{phase} shards",
+            children,
+            deadline,
+            consumed_attempt=phase == "timing",
         )
+    finally:
+        for reserved_descriptor in reservations:
+            os.close(reserved_descriptor)
     failures = [
         (shard_id, return_code)
         for shard_id, return_code in return_codes
@@ -312,6 +627,7 @@ def main() -> int:
             raise gate.GateError("one-shot timing launcher requires Linux taskset")
         if args.taskset != Path("/usr/bin/taskset"):
             raise gate.GateError("frozen launcher requires absolute /usr/bin/taskset")
+        require_pidfd_supervision()
         cpu_ids = require_cpu_ids(args.cpu)
         if not hasattr(os, "sched_getaffinity"):
             raise gate.GateError("Linux CPU affinity introspection is unavailable")
@@ -321,7 +637,11 @@ def main() -> int:
             raise gate.GateError(
                 f"explicit CPU IDs are outside launcher affinity: {unavailable}"
             )
-        if Path(gate.__file__).resolve(strict=True) != args.analyzer.resolve(strict=True):
+        try:
+            analyzer_path = args.analyzer.resolve(strict=True)
+        except OSError as error:
+            raise gate.GateError(f"cannot resolve sealed analyzer path: {error}") from error
+        if Path(gate.__file__).resolve(strict=True) != analyzer_path:
             raise gate.GateError(
                 "loaded analyzer module differs from the sealed analyzer path"
             )
@@ -333,7 +653,7 @@ def main() -> int:
         runner_file = gate.stable_read(args.runner, gate.MAX_SHARD_BYTES)
         taskset_file = gate.stable_read(args.taskset, gate.MAX_SHARD_BYTES)
         launcher_file = gate.stable_read(Path(__file__), gate.MAX_CONTRACT_BYTES)
-        analyzer_file = gate.stable_read(args.analyzer, gate.MAX_CONTRACT_BYTES)
+        analyzer_file = gate.stable_read(analyzer_path, gate.MAX_CONTRACT_BYTES)
         seal = gate.read_json_file(seal_file)
         contract = gate.read_json_file(contract_file)
         gate.require_exact_contract(contract, contract_file, cells_file)
@@ -573,6 +893,7 @@ def main() -> int:
                 str(args.runner),
                 str(args.taskset),
                 str(Path(__file__)),
+                str(analyzer_path),
                 *(str(path) for path in shard_paths),
             ]
             return publish_analyzer_output(

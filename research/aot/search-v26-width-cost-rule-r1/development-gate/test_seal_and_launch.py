@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 
+import errno
 import json
 import os
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import analyze_v26_gate as gate
 import launch_v26_gate_once as launch
@@ -204,7 +207,248 @@ class SealAndLaunchTests(unittest.TestCase):
         self.assertNotIn("loadavg", source)
         self.assertNotIn(".kill(", source)
         self.assertNotIn(".terminate(", source)
+        self.assertNotIn("os.kill(", source)
+        self.assertNotIn("os.killpg(", source)
         self.assertNotIn("resource-coordinator", source)
+        self.assertIn("pidfd_send_signal", source)
+
+    def test_partial_launch_failure_supervises_started_child_and_closes_slots(
+        self,
+    ) -> None:
+        first_process = mock.Mock()
+        with (
+            mock.patch.object(
+                launch, "reserve_pidfd_slots", return_value=[71, 72, 73]
+            ),
+            mock.patch.object(
+                launch,
+                "supervision_pipe",
+                side_effect=[(81, 82), (83, 84)],
+            ),
+            mock.patch.object(
+                launch.subprocess,
+                "Popen",
+                side_effect=[first_process, OSError("synthetic launch failure")],
+            ),
+            mock.patch.object(launch, "open_child_pidfd", return_value=91),
+            mock.patch.object(
+                launch, "supervise_children", return_value=[(0, 0)]
+            ) as supervise,
+            mock.patch.object(launch.os, "close") as close,
+        ):
+            with self.assertRaises(gate.GateError):
+                launch.run_shard_phase(
+                    "preflight",
+                    taskset_descriptor=10,
+                    runner_descriptor=11,
+                    cpu_ids=[120, 130, 140],
+                    seal_path=Path("/seal"),
+                    contract_path=Path("/contract"),
+                    cells_path=Path("/cells"),
+                    run_manifest_path=Path("/manifest"),
+                    output_paths=[
+                        Path("/output-0"),
+                        Path("/output-1"),
+                        Path("/output-2"),
+                    ],
+                )
+        self.assertEqual(
+            supervise.call_args.args[1],
+            [(0, first_process, 91)],
+        )
+        close.assert_any_call(71)
+        close.assert_any_call(72)
+        close.assert_any_call(82)
+        close.assert_any_call(83)
+        close.assert_any_call(84)
+
+    def test_pidfd_open_failure_closes_barrier_and_reaps_unreleased_child(
+        self,
+    ) -> None:
+        process = mock.Mock()
+        process.wait.return_value = 2
+        with (
+            mock.patch.object(
+                launch, "reserve_pidfd_slots", return_value=[71, 72, 73]
+            ),
+            mock.patch.object(launch, "supervision_pipe", return_value=(81, 82)),
+            mock.patch.object(launch.subprocess, "Popen", return_value=process),
+            mock.patch.object(
+                launch,
+                "open_child_pidfd",
+                side_effect=gate.GateError("synthetic pidfd failure"),
+            ),
+            mock.patch.object(
+                launch, "supervise_children", return_value=[]
+            ) as supervise,
+            mock.patch.object(launch.os, "close") as close,
+        ):
+            with self.assertRaises(gate.GateError):
+                launch.run_shard_phase(
+                    "preflight",
+                    taskset_descriptor=10,
+                    runner_descriptor=11,
+                    cpu_ids=[120, 130, 140],
+                    seal_path=Path("/seal"),
+                    contract_path=Path("/contract"),
+                    cells_path=Path("/cells"),
+                    run_manifest_path=Path("/manifest"),
+                    output_paths=[
+                        Path("/output-0"),
+                        Path("/output-1"),
+                        Path("/output-2"),
+                    ],
+                )
+        close.assert_any_call(81)
+        close.assert_any_call(82)
+        process.wait.assert_called_once_with(
+            timeout=launch.OWN_CHILD_TERM_GRACE_SECONDS
+        )
+        self.assertEqual(supervise.call_args.args[1], [])
+
+    def test_all_three_pidfds_bind_before_any_shard_is_released(self) -> None:
+        processes = [mock.Mock(), mock.Mock(), mock.Mock()]
+        events: list[str] = []
+
+        def popen(*_args: object, **_kwargs: object) -> mock.Mock:
+            ordinal = len([event for event in events if event.startswith("spawn")])
+            events.append(f"spawn-{ordinal}")
+            return processes[ordinal]
+
+        def release(writer: int) -> None:
+            events.append(f"release-{writer}")
+
+        with (
+            mock.patch.object(
+                launch, "reserve_pidfd_slots", return_value=[71, 72, 73]
+            ),
+            mock.patch.object(
+                launch,
+                "supervision_pipe",
+                side_effect=[(81, 82), (83, 84), (85, 86)],
+            ),
+            mock.patch.object(launch.subprocess, "Popen", side_effect=popen),
+            mock.patch.object(
+                launch, "open_child_pidfd", side_effect=[91, 92, 93]
+            ),
+            mock.patch.object(
+                launch, "release_startup_barrier", side_effect=release
+            ),
+            mock.patch.object(
+                launch,
+                "supervise_children",
+                return_value=[(0, 0), (1, 0), (2, 0)],
+            ) as supervise,
+            mock.patch.object(launch.os, "close"),
+        ):
+            launch.run_shard_phase(
+                "preflight",
+                taskset_descriptor=10,
+                runner_descriptor=11,
+                cpu_ids=[120, 130, 140],
+                seal_path=Path("/seal"),
+                contract_path=Path("/contract"),
+                cells_path=Path("/cells"),
+                run_manifest_path=Path("/manifest"),
+                output_paths=[
+                    Path("/output-0"),
+                    Path("/output-1"),
+                    Path("/output-2"),
+                ],
+            )
+        self.assertEqual(
+            events,
+            [
+                "spawn-0",
+                "spawn-1",
+                "spawn-2",
+                "release-82",
+                "release-84",
+                "release-86",
+            ],
+        )
+        self.assertEqual(
+            supervise.call_args.args[1],
+            [
+                (0, processes[0], 91),
+                (1, processes[1], 92),
+                (2, processes[2], 93),
+            ],
+        )
+
+    def test_deadline_escalation_uses_only_captured_pidfd(self) -> None:
+        process = mock.Mock()
+        process.poll.return_value = None
+        with (
+            mock.patch.object(
+                launch,
+                "wait_until",
+                side_effect=[None, 0, 0],
+            ),
+            mock.patch.object(
+                launch.signal,
+                "pidfd_send_signal",
+                create=True,
+            ) as send_signal,
+            mock.patch.object(launch.os, "close") as close,
+        ):
+            with self.assertRaisesRegex(
+                gate.GateError,
+                "one-shot authority remains consumed",
+            ):
+                launch.supervise_children(
+                    "timing shards",
+                    [(0, process, 444)],
+                    1.0,
+                    consumed_attempt=True,
+                )
+        self.assertEqual(
+            send_signal.call_args_list,
+            [
+                mock.call(444, launch.signal.SIGTERM, None, 0),
+                mock.call(444, launch.signal.SIGKILL, None, 0),
+            ],
+        )
+        close.assert_called_once_with(444)
+
+    def test_analyzer_uses_explicit_sealed_path_not_magic_file(self) -> None:
+        source = Path(gate.__file__).read_text(encoding="utf-8")
+        analyze_body = source.split("def analyze_paths(", 1)[1].split(
+            "\ndef parse_args()", 1
+        )[0]
+        self.assertIn(
+            "analyzer_file = stable_read(analyzer_path, MAX_CONTRACT_BYTES)",
+            analyze_body,
+        )
+        self.assertNotIn("stable_read(Path(__file__)", analyze_body)
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux") and Path("/proc/self/fd").is_dir(),
+        "Linux proc-fd semantics",
+    )
+    def test_procfd_magic_link_is_rejected_by_stable_read_flags(self) -> None:
+        descriptor = os.open(gate.__file__, os.O_RDONLY)
+        try:
+            procfd_path = f"/proc/self/fd/{descriptor}"
+            with self.assertRaises(OSError) as raised:
+                os.open(
+                    procfd_path,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                )
+            self.assertEqual(raised.exception.errno, errno.ELOOP)
+        finally:
+            os.close(descriptor)
+
+    def test_analyzer_supervision_barrier_accepts_only_one_marker_byte(self) -> None:
+        reader, writer = os.pipe()
+        os.write(writer, b"\x01")
+        os.close(writer)
+        gate.await_pidfd_supervision(reader)
+
+        reader, writer = os.pipe()
+        os.close(writer)
+        with self.assertRaises(gate.GateError):
+            gate.await_pidfd_supervision(reader)
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import os
+import struct
 import tempfile
 import unittest
 from fractions import Fraction
@@ -305,6 +306,32 @@ class AnalyzerTests(unittest.TestCase):
         for value in ("0" * 64, "f" * 64):
             with self.assertRaises(gate.GateError):
                 gate.nonce_hex(value, "nonce")
+
+    def test_runner_elf_identity_requires_aarch64_and_static_loader(self) -> None:
+        def elf(program_type: int) -> gate.StableFile:
+            data = bytearray(120)
+            data[:7] = b"\x7fELF\x02\x01\x01"
+            struct.pack_into("<HHI", data, 16, 3, 183, 1)
+            struct.pack_into("<Q", data, 32, 64)
+            struct.pack_into("<H", data, 52, 64)
+            struct.pack_into("<HH", data, 54, 56, 1)
+            struct.pack_into("<I", data, 64, program_type)
+            payload = bytes(data)
+            return gate.StableFile(
+                Path("/sealed/runner"),
+                payload,
+                hashlib.sha256(payload).hexdigest(),
+                0o100555,
+            )
+
+        gate.require_elf64_aarch64(elf(1), "runner", require_static=True)
+        with self.assertRaises(gate.GateError):
+            gate.require_elf64_aarch64(elf(3), "runner", require_static=True)
+        with self.assertRaises(gate.GateError):
+            gate.require_elf64_aarch64(
+                gate.StableFile(Path("/script"), b"#!/bin/sh\n", "0" * 64, 0o100555),
+                "runner",
+            )
 
     def test_nonce_roles_reject_sentinels_and_aliases(self) -> None:
         for sentinel in ("0" * 64, "f" * 64):
