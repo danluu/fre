@@ -123,6 +123,13 @@ process-group kill, raw-PID signal, or unrelated-process target. A timing or
 analyzer timeout occurs after the create-new consumption marker and therefore
 leaves a terminal consumed attempt, never retry authority.
 
+That pidfd-only statement is scoped to the long-running shard and analyzer
+phase supervisor. The analyzer/sealer also performs a non-payload
+`--build-identity` handshake using CPython's 30-second direct-child timeout.
+CPython may signal that exact child by PID on timeout, but the child remains
+unreaped, so its PID cannot be reused to target unrelated work. This handshake
+never enters a measured interval or grants timing authority.
+
 The artifact hashes do not turn the host into a hermetic operating system.
 The Linux kernel, the Python runtime and standard library used by the sealed
 launcher/analyzer, and the dynamic loader/libc used by sealed `taskset` are
