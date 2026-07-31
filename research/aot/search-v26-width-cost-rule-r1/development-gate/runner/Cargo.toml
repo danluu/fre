@@ -1,0 +1,32 @@
+[workspace]
+
+[package]
+name = "fre-search-v26-development-gate"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+license = "Apache-2.0 OR MIT"
+publish = false
+
+[dependencies]
+fre-search-v26-synthetic-runner = { path = "../../synthetic-runner" }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.150"
+sha2 = "=0.10.9"
+
+[[bin]]
+name = "fre-search-v26-materialize-cells"
+path = "src/bin/materialize_cells.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+rust_2018_idioms = { level = "deny", priority = -1 }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+arithmetic_side_effects = "warn"
+as_conversions = "warn"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"

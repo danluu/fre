@@ -181,9 +181,13 @@ def require_exact_contract(contract: Mapping[str, Any], contract_path: Path, cel
         },
         "window_start": "32 + accepted_ordinal, covering every modulo-16 start alignment once per width/output",
         "haystack_suffix_padding_bytes": 64,
-        "middle_match_offset": 1_048_581,
-        "overlap_match_offset": 1_048_581,
-        "dense_exact_match": "last legal position",
+        "filler_byte": "lowest u8 value absent from the literal",
+        "middle_match_offset_from_window_start": 1_048_581,
+        "overlap_match_offset_from_window_start": 1_048_581,
+        "overlap_near_miss": "start at exact_match_start - (literal_width - 1), copy the literal, replace the near-miss first byte with filler, then install the exact match",
+        "dense_false_candidates": "from window_start, advance by literal_width + 3 while the candidate ends before the last legal position; candidate i contains filler except literal[i mod literal_width] at that same column",
+        "dense_exact_match": "last legal position after all false candidates",
+        "identity": "SHA-256 over fre-search-v26-long-scan-fixture-v1 binary domain, literal coordinate and bytes, shape tag, geometry, expected match, and complete haystack bytes",
         "allocation": "construct and release exactly one fixture/cell at a time; retaining the 7,776 long haystacks is forbidden",
     }:
         raise GateError("fixture geometry contract drifted")
