@@ -25,6 +25,11 @@ compiled-search-v26-aot = [
     "dep:fre-aot-search-contract",
     "fre-aot-static-runtime/linked-search-v26-production-v1",
 ]
+compiled-search-v27-aot = [
+    "explicit-search-span-aot",
+    "dep:fre-aot-search-contract",
+    "fre-aot-static-runtime/linked-search-v27-production-v1",
+]
 explicit-count-v3-aot = [
     "dep:fre-aot-static-runtime",
     "fre-aot-static-runtime/linked-count-v3",

@@ -87,6 +87,7 @@ const fn qualification_for_backend_with_atoms(
         | QualifiedExactSearchBackendPolicy::AsimdV24
         | QualifiedExactSearchBackendPolicy::AsimdV25
         | QualifiedExactSearchBackendPolicy::AsimdV26
+        | QualifiedExactSearchBackendPolicy::AsimdV27
         | QualifiedExactSearchBackendPolicy::Sve16 => QualifiedExactSearchQualification::Candidate,
     }
 }
@@ -906,6 +907,7 @@ const fn selected_end_register_backend_v2(
         | QualifiedExactSearchBackendPolicy::AsimdV24
         | QualifiedExactSearchBackendPolicy::AsimdV25
         | QualifiedExactSearchBackendPolicy::AsimdV26
+        | QualifiedExactSearchBackendPolicy::AsimdV27
         | QualifiedExactSearchBackendPolicy::Sve16
         | QualifiedExactSearchBackendPolicy::Sve2Fixed16 => None,
     }

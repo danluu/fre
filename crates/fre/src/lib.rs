@@ -21,6 +21,10 @@
 //! calling glue. Its private authorization atom is fixed to absent, so even an
 //! all-features build remains portable. It does not change JIT `CURRENT`,
 //! ordinary [`PortableRegex`] behavior, or any default feature.
+//! The default-off `compiled-search-v27-aot` facade extends this fail-closed
+//! bind-once surface to topology-total tag40 exact literals of width 1..=32.
+//! A linked object and Cargo feature still cannot create production authority;
+//! absent or mismatched source authority is cached as a portable route.
 //! The separate default-off `explicit-count-v3-aot` feature binds an
 //! already-adopted optimizing Count-v3 handle only to the live fixed-policy
 //! exact-literal Count owner whose literal, semantic identity, and planning
@@ -624,6 +628,11 @@ pub use search_aot_facade::{
 pub use search_aot_facade::{
     SearchExactLiteralCompiledAotV26, SearchExactLiteralCompiledAotV26Error,
     SearchExactLiteralCompiledAotV26Fallback, SearchExactLiteralCompiledAotV26Route,
+};
+#[cfg(feature = "compiled-search-v27-aot")]
+pub use search_aot_facade::{
+    SearchExactLiteralCompiledAotV27, SearchExactLiteralCompiledAotV27Error,
+    SearchExactLiteralCompiledAotV27Fallback, SearchExactLiteralCompiledAotV27Route,
 };
 pub use set::{
     PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION, PortableRegexSet, PortableRegexSetBuildError,

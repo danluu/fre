@@ -3,7 +3,7 @@
 //! The original borrowed wrappers receive a [`VerifiedStaticSearchSpanV1`]
 //! that the static runtime has already admitted, then bind that handle to the
 //! immutable [`PortableRegex`] which still owns the exact-literal semantics.
-//! The default-off tag38 and tag39 wrappers additionally invoke one
+//! The default-off tag38, tag39, and tag40 wrappers additionally invoke one
 //! caller-supplied linked-glue entry through the production adopter once and
 //! own the portable fallback. Binding checks both the complete facade semantic
 //! identity and the live literal width before a native call can be reached.
@@ -19,16 +19,22 @@
 use core::fmt;
 
 #[cfg(feature = "compiled-search-v25-aot")]
-use fre_aot_search_contract::{
-    SEARCH_BACKEND_ASIMD_TAG38_V1, search_backend_literal_width_is_valid_v1,
-};
+use fre_aot_search_contract::SEARCH_BACKEND_ASIMD_TAG38_V1;
+#[cfg(feature = "compiled-search-v27-aot")]
+use fre_aot_search_contract::SEARCH_BACKEND_ASIMD_TAG40_V1;
+#[cfg(any(
+    feature = "compiled-search-v25-aot",
+    feature = "compiled-search-v27-aot"
+))]
+use fre_aot_search_contract::search_backend_literal_width_is_valid_v1;
 #[cfg(feature = "compiled-search-v26-aot")]
 use fre_aot_search_contract::{
     SEARCH_BACKEND_ASIMD_TAG39_V1, search_v26_production_literal_width_is_valid_v1,
 };
 #[cfg(any(
     feature = "compiled-search-v25-aot",
-    feature = "compiled-search-v26-aot"
+    feature = "compiled-search-v26-aot",
+    feature = "compiled-search-v27-aot"
 ))]
 use fre_aot_static_runtime::{
     RawStaticSearchSpanAdoptionOutputV1, StaticSearchSpanAdoptionErrorV1,
@@ -47,7 +53,8 @@ use fre_kernels::{
 
 #[cfg(any(
     feature = "compiled-search-v25-aot",
-    feature = "compiled-search-v26-aot"
+    feature = "compiled-search-v26-aot",
+    feature = "compiled-search-v27-aot"
 ))]
 use crate::SearchError;
 use crate::{
@@ -439,7 +446,8 @@ impl<'binding> SearchExactLiteralAutoAotV1<'binding> {
 
 #[cfg(any(
     feature = "compiled-search-v25-aot",
-    feature = "compiled-search-v26-aot"
+    feature = "compiled-search-v26-aot",
+    feature = "compiled-search-v27-aot"
 ))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SearchExactLiteralCompiledAotFallbackV1 {
@@ -452,7 +460,8 @@ enum SearchExactLiteralCompiledAotFallbackV1 {
 
 #[cfg(any(
     feature = "compiled-search-v25-aot",
-    feature = "compiled-search-v26-aot"
+    feature = "compiled-search-v26-aot",
+    feature = "compiled-search-v27-aot"
 ))]
 #[derive(Clone, Copy, Debug)]
 enum SearchExactLiteralCompiledAotStateV1 {
@@ -465,7 +474,8 @@ enum SearchExactLiteralCompiledAotStateV1 {
 
 #[cfg(any(
     feature = "compiled-search-v25-aot",
-    feature = "compiled-search-v26-aot"
+    feature = "compiled-search-v26-aot",
+    feature = "compiled-search-v27-aot"
 ))]
 fn bind_compiled_aot_state_v1(
     portable_owner: &PortableRegex,
@@ -520,7 +530,8 @@ fn bind_compiled_aot_state_v1(
 
 #[cfg(any(
     feature = "compiled-search-v25-aot",
-    feature = "compiled-search-v26-aot"
+    feature = "compiled-search-v26-aot",
+    feature = "compiled-search-v27-aot"
 ))]
 const fn check_compiled_aot_backend_v1(
     actual: u16,
@@ -1087,6 +1098,257 @@ fn v26_literal_width_is_valid(bytes: usize) -> bool {
     u32::try_from(bytes).is_ok_and(search_v26_production_literal_width_is_valid_v1)
 }
 
+/// Why the default-off V27 compiled facade cached its portable route.
+#[cfg(feature = "compiled-search-v27-aot")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum SearchExactLiteralCompiledAotV27Fallback {
+    /// The portable owner is not an exact literal under the fixed default
+    /// construction policy. The supplied glue entry was not called.
+    PortableOwnerIneligible,
+    /// The exact literal is outside tag40's immutable 1..=32-byte envelope.
+    /// The supplied glue entry was not called.
+    LiteralWidthOutsideBackendEnvelope { bytes: usize },
+    /// Production glue could not resolve one source-authorized handle.
+    Adoption(StaticSearchSpanAdoptionErrorV1),
+    /// A source-authorized handle named a backend other than tag40.
+    BackendMismatch { actual: u16 },
+    /// The adopted object did not bind to this exact portable source/literal
+    /// owner and broad-family execution policy.
+    Binding(SearchExactLiteralAotBindErrorV1),
+}
+
+/// Which executor one V27 compiled-facade search actually used.
+#[cfg(feature = "compiled-search-v27-aot")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SearchExactLiteralCompiledAotV27Route {
+    Portable,
+    StaticAot,
+}
+
+/// Search failure from the owning V27 compiled facade.
+#[cfg(feature = "compiled-search-v27-aot")]
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum SearchExactLiteralCompiledAotV27Error {
+    Portable(SearchError),
+    Static(StaticSearchSpanCallErrorV1),
+}
+
+#[cfg(feature = "compiled-search-v27-aot")]
+impl fmt::Display for SearchExactLiteralCompiledAotV27Error {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "FRE exact-literal compiled V27 AOT search failed: {self:?}"
+        )
+    }
+}
+
+#[cfg(feature = "compiled-search-v27-aot")]
+impl std::error::Error for SearchExactLiteralCompiledAotV27Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Portable(error) => Some(error),
+            Self::Static(error) => Some(error),
+        }
+    }
+}
+
+#[cfg(feature = "compiled-search-v27-aot")]
+impl From<SearchError> for SearchExactLiteralCompiledAotV27Error {
+    fn from(error: SearchError) -> Self {
+        Self::Portable(error)
+    }
+}
+
+#[cfg(feature = "compiled-search-v27-aot")]
+impl From<StaticSearchSpanCallErrorV1> for SearchExactLiteralCompiledAotV27Error {
+    fn from(error: StaticSearchSpanCallErrorV1) -> Self {
+        Self::Static(error)
+    }
+}
+
+/// Owning, bind-once exact-literal facade for an explicitly linked tag40
+/// source object.
+///
+/// This type is available only through the default-off
+/// `compiled-search-v27-aot` feature. It admits every nonempty exact literal
+/// through 32 bytes before invoking the source-specific production adopter at
+/// most once. Missing authority, an unqualified selector, a backend mismatch,
+/// or any semantic-binding refusal is cached as a portable route.
+///
+/// The adopter resolves only the static runtime's source-reviewed production
+/// registry. The feature and linked object cannot create a family row or
+/// production authority, and no ordinary [`PortableRegex`] method is changed.
+#[cfg(feature = "compiled-search-v27-aot")]
+pub struct SearchExactLiteralCompiledAotV27 {
+    portable_owner: PortableRegex,
+    state: SearchExactLiteralCompiledAotStateV1,
+}
+
+#[cfg(feature = "compiled-search-v27-aot")]
+impl fmt::Debug for SearchExactLiteralCompiledAotV27 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SearchExactLiteralCompiledAotV27")
+            .field("portable_owner", &self.portable_owner)
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "compiled-search-v27-aot")]
+impl SearchExactLiteralCompiledAotV27 {
+    /// Bind one generated source-specific tag40 production glue entry once.
+    ///
+    /// `invoke_glue` is not called for a non-exact, non-default-policy, empty,
+    /// or wider-than-32-byte portable owner. All adopter and binding refusals
+    /// produce a usable portable facade.
+    #[must_use]
+    pub fn bind_once(
+        portable_owner: PortableRegex,
+        invoke_glue: impl FnOnce(*mut RawStaticSearchSpanAdoptionOutputV1) -> u32,
+    ) -> Self {
+        let state = bind_compiled_aot_state_v1(
+            &portable_owner,
+            SEARCH_BACKEND_ASIMD_TAG40_V1,
+            v27_literal_width_is_valid,
+            invoke_glue,
+        );
+        Self {
+            portable_owner,
+            state,
+        }
+    }
+
+    /// Search a complete haystack through the cached route.
+    pub fn find(
+        &self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<
+        (
+            Option<Match>,
+            SearchAccounting,
+            SearchExactLiteralCompiledAotV27Route,
+        ),
+        SearchExactLiteralCompiledAotV27Error,
+    > {
+        self.find_window(haystack, SearchWindow::new(0, haystack.len()), limits)
+    }
+
+    /// Search one half-open window through the cached route.
+    pub fn find_window(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<
+        (
+            Option<Match>,
+            SearchAccounting,
+            SearchExactLiteralCompiledAotV27Route,
+        ),
+        SearchExactLiteralCompiledAotV27Error,
+    > {
+        match self.state {
+            SearchExactLiteralCompiledAotStateV1::Portable(_) => {
+                let (matched, accounting) =
+                    self.portable_owner.find_window(haystack, window, limits)?;
+                Ok((
+                    matched,
+                    accounting,
+                    SearchExactLiteralCompiledAotV27Route::Portable,
+                ))
+            }
+            SearchExactLiteralCompiledAotStateV1::Static { verified, policy } => {
+                let PortablePlan::ExactLiteral(portable_plan) = &self.portable_owner.plan else {
+                    unreachable!("a static V27 state is created only for an exact portable owner");
+                };
+                let mut static_invoked = false;
+                let (matched, accounting) = find_window_automatically_v1(
+                    portable_plan,
+                    haystack,
+                    window,
+                    limits,
+                    policy.minimum_window_bytes,
+                    policy.portable_prefix_candidate_starts,
+                    |tail| {
+                        static_invoked = true;
+                        verified.search_preflighted(tail)
+                    },
+                )?;
+                Ok((
+                    matched,
+                    accounting,
+                    if static_invoked {
+                        SearchExactLiteralCompiledAotV27Route::StaticAot
+                    } else {
+                        SearchExactLiteralCompiledAotV27Route::Portable
+                    },
+                ))
+            }
+        }
+    }
+
+    /// Portable semantic owner retained for every route.
+    #[must_use]
+    pub const fn portable_owner(&self) -> &PortableRegex {
+        &self.portable_owner
+    }
+
+    /// Cached construction-time fallback, or `None` after a successful bind.
+    #[must_use]
+    pub const fn fallback_reason(&self) -> Option<SearchExactLiteralCompiledAotV27Fallback> {
+        match self.state {
+            SearchExactLiteralCompiledAotStateV1::Portable(reason) => {
+                Some(v27_fallback_reason(reason))
+            }
+            SearchExactLiteralCompiledAotStateV1::Static { .. } => None,
+        }
+    }
+
+    /// Source-authorized tag40 handle retained after successful binding.
+    #[must_use]
+    pub const fn verified_handle(&self) -> Option<&'static VerifiedStaticSearchSpanV1> {
+        match self.state {
+            SearchExactLiteralCompiledAotStateV1::Portable(_) => None,
+            SearchExactLiteralCompiledAotStateV1::Static { verified, .. } => Some(verified),
+        }
+    }
+}
+
+#[cfg(feature = "compiled-search-v27-aot")]
+const fn v27_fallback_reason(
+    reason: SearchExactLiteralCompiledAotFallbackV1,
+) -> SearchExactLiteralCompiledAotV27Fallback {
+    match reason {
+        SearchExactLiteralCompiledAotFallbackV1::PortableOwnerIneligible => {
+            SearchExactLiteralCompiledAotV27Fallback::PortableOwnerIneligible
+        }
+        SearchExactLiteralCompiledAotFallbackV1::LiteralWidthOutsideProductionEnvelope {
+            bytes,
+        } => SearchExactLiteralCompiledAotV27Fallback::LiteralWidthOutsideBackendEnvelope { bytes },
+        SearchExactLiteralCompiledAotFallbackV1::Adoption(error) => {
+            SearchExactLiteralCompiledAotV27Fallback::Adoption(error)
+        }
+        SearchExactLiteralCompiledAotFallbackV1::BackendMismatch { actual } => {
+            SearchExactLiteralCompiledAotV27Fallback::BackendMismatch { actual }
+        }
+        SearchExactLiteralCompiledAotFallbackV1::Binding(error) => {
+            SearchExactLiteralCompiledAotV27Fallback::Binding(error)
+        }
+    }
+}
+
+#[cfg(feature = "compiled-search-v27-aot")]
+fn v27_literal_width_is_valid(bytes: usize) -> bool {
+    u32::try_from(bytes).is_ok_and(|bytes| {
+        search_backend_literal_width_is_valid_v1(SEARCH_BACKEND_ASIMD_TAG40_V1, bytes)
+    })
+}
+
 /// Same-thread invocation token for a bound static Search-v1 Span handle.
 ///
 /// The embedded static-runtime token makes this value neither `Send` nor
@@ -1486,6 +1748,86 @@ mod tests {
             check_compiled_aot_backend_v1(
                 SEARCH_BACKEND_ASIMD_TAG39_V1,
                 SEARCH_BACKEND_ASIMD_TAG39_V1,
+            ),
+            Ok(())
+        );
+    }
+
+    #[cfg(feature = "compiled-search-v27-aot")]
+    #[test]
+    fn compiled_v27_refuses_only_outside_widths_before_glue() {
+        let source = "abcdefghijklmnopqrstuvwxyz1234567";
+        let glue_called = Cell::new(false);
+        let compiled = SearchExactLiteralCompiledAotV27::bind_once(
+            PortableBuilder::new(source).build().unwrap(),
+            |_| {
+                glue_called.set(true);
+                unreachable!("an out-of-envelope literal must not invoke tag40 glue")
+            },
+        );
+
+        assert!(!glue_called.get());
+        assert_eq!(
+            compiled.fallback_reason(),
+            Some(
+                SearchExactLiteralCompiledAotV27Fallback::LiteralWidthOutsideBackendEnvelope {
+                    bytes: source.len(),
+                }
+            )
+        );
+    }
+
+    #[cfg(feature = "compiled-search-v27-aot")]
+    #[test]
+    fn compiled_v27_all_topologies_call_glue_once_then_cache_portable_without_authority() {
+        for source in [
+            "x",
+            "aaaaaaaaa",
+            "ababababa",
+            "phase-unique-17!",
+            "topology-total-width-thirty-two!",
+        ] {
+            let glue_calls = Cell::new(0_u32);
+            let compiled = SearchExactLiteralCompiledAotV27::bind_once(
+                PortableBuilder::new(source).build().unwrap(),
+                |_| {
+                    glue_calls.set(glue_calls.get() + 1);
+                    fre_aot_static_runtime::STATIC_SEARCH_SPAN_ADOPT_STATUS_NO_QUALIFIED_ROW_V1
+                },
+            );
+
+            assert_eq!(glue_calls.get(), 1);
+            assert!(matches!(
+                compiled.fallback_reason(),
+                Some(SearchExactLiteralCompiledAotV27Fallback::Adoption(_))
+            ));
+            assert!(compiled.verified_handle().is_none());
+            let haystack = format!("##{source}!!");
+            let (matched, _, route) = compiled
+                .find(haystack.as_bytes(), SearchLimits::unlimited())
+                .unwrap();
+            assert_eq!(
+                matched.map(|matched| (matched.start(), matched.end())),
+                Some((2, 2 + source.len()))
+            );
+            assert_eq!(route, SearchExactLiteralCompiledAotV27Route::Portable);
+            assert_eq!(glue_calls.get(), 1, "searches must not retry adoption");
+        }
+    }
+
+    #[cfg(feature = "compiled-search-v27-aot")]
+    #[test]
+    fn compiled_v27_backend_check_refuses_every_non_tag40_handle() {
+        let reason = check_compiled_aot_backend_v1(39, SEARCH_BACKEND_ASIMD_TAG40_V1)
+            .expect_err("tag39 must not be accepted through the tag40 facade");
+        assert_eq!(
+            v27_fallback_reason(reason),
+            SearchExactLiteralCompiledAotV27Fallback::BackendMismatch { actual: 39 }
+        );
+        assert_eq!(
+            check_compiled_aot_backend_v1(
+                SEARCH_BACKEND_ASIMD_TAG40_V1,
+                SEARCH_BACKEND_ASIMD_TAG40_V1,
             ),
             Ok(())
         );
