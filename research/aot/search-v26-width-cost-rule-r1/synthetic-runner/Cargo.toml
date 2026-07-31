@@ -10,6 +10,7 @@ publish = false
 
 [dependencies]
 fre-jit-aarch64 = { path = "../../../../crates/fre-jit-aarch64" }
+fre-jit-runtime = { path = "../../../../crates/fre-jit-runtime" }
 fre-kernel-ir = { path = "../../../../crates/fre-kernel-ir" }
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.150"

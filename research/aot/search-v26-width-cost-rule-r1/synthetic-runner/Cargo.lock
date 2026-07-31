@@ -3,6 +3,15 @@
 version = 4
 
 [[package]]
+name = "aho-corasick"
+version = "1.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ddd31a130427c27518df266943a5308ed92d4b226cc639f5a8f1002816174301"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -47,12 +56,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "fre-exact-alloc"
+version = "0.1.0"
+
+[[package]]
 name = "fre-jit-aarch64"
 version = "0.1.0"
 dependencies = [
  "fre-kernel-ir",
  "memchr",
  "sha2",
+]
+
+[[package]]
+name = "fre-jit-runtime"
+version = "0.1.0"
+dependencies = [
+ "fre-jit-aarch64",
+ "fre-kernel-ir",
+ "fre-kernels",
+ "fre-target-features",
+ "libc",
 ]
 
 [[package]]
@@ -63,14 +87,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "fre-kernels"
+version = "0.1.0"
+dependencies = [
+ "aho-corasick",
+ "fre-exact-alloc",
+ "fre-kernel-ir",
+ "fre-simd-kernels",
+ "memchr",
+]
+
+[[package]]
 name = "fre-search-v26-synthetic-runner"
 version = "0.1.0"
 dependencies = [
  "fre-jit-aarch64",
+ "fre-jit-runtime",
  "fre-kernel-ir",
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "fre-simd-kernels"
+version = "0.1.0"
+dependencies = [
+ "fre-target-features",
+]
+
+[[package]]
+name = "fre-target-features"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -91,9 +141,9 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "libc"
-version = "0.2.189"
+version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "memchr"
