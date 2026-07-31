@@ -721,7 +721,8 @@ impl MetadataV1 {
                     || version == BackendVersion::SEARCH_V16.0
                     || version == BackendVersion::SEARCH_V17.0
                     || version == BackendVersion::SEARCH_V24.0
-                    || version == BackendVersion::SEARCH_V25.0 =>
+                    || version == BackendVersion::SEARCH_V25.0
+                    || version == BackendVersion::SEARCH_V26.0 =>
             {
                 (1..=3).contains(&self.output_kind)
                     && self.literal_bytes == 0

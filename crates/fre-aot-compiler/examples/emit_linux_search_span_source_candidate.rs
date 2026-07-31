@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! emit_linux_search_span_source_candidate OUTPUT_DIRECTORY \
-//!     v8|v9|v10|v12|v13|v15|v16|v17|v24|v25|tag21 \
+//!     v8|v9|v10|v12|v13|v15|v16|v17|v24|v25|v26|tag21 \
 //!     qualification|production ROW_SELECTOR
 //! ```
 //!
@@ -234,7 +234,7 @@ fn main() -> Result<(), DynError> {
 
 fn parse_request() -> Result<Request, DynError> {
     const USAGE: &str = "usage: emit_linux_search_span_source_candidate \
-        OUTPUT_DIRECTORY v8|v9|v10|v12|v13|v15|v16|v17|v24|v25|tag21 qualification|production ROW_SELECTOR";
+        OUTPUT_DIRECTORY v8|v9|v10|v12|v13|v15|v16|v17|v24|v25|v26|tag21 qualification|production ROW_SELECTOR";
 
     let mut arguments = std::env::args_os();
     let _program = arguments.next();
@@ -254,6 +254,7 @@ fn parse_request() -> Result<Request, DynError> {
         Some("v17") => LinuxAarch64SearchBackendV1::AsimdV17,
         Some("v24") => LinuxAarch64SearchBackendV1::AsimdV24,
         Some("v25") => LinuxAarch64SearchBackendV1::AsimdV25,
+        Some("v26") => LinuxAarch64SearchBackendV1::AsimdV26,
         Some("tag21") => LinuxAarch64SearchBackendV1::Sve2Fixed16Tag21Vl16,
         _ => return Err(invalid(USAGE).into()),
     };
@@ -1060,6 +1061,7 @@ const fn backend_name(backend: LinuxAarch64SearchBackendV1) -> &'static str {
         LinuxAarch64SearchBackendV1::AsimdV17 => "v17-asimd-learned-continuation",
         LinuxAarch64SearchBackendV1::AsimdV24 => "v24-asimd-sixth-static",
         LinuxAarch64SearchBackendV1::AsimdV25 => "v25-asimd-sixth-empty-promote",
+        LinuxAarch64SearchBackendV1::AsimdV26 => "v26-asimd-policy-authenticated",
         LinuxAarch64SearchBackendV1::Sve2Fixed16Tag21Vl16 => "tag21-sve2-fixed16",
     }
 }

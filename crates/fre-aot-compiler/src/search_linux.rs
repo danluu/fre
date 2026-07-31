@@ -28,6 +28,8 @@ use fre_aot_search_contract::{
     SEARCH_BACKEND_ASIMD_TAG37_MIN_LITERAL_BYTES_V1, SEARCH_BACKEND_ASIMD_TAG37_V1,
     SEARCH_BACKEND_ASIMD_TAG38_MAX_LITERAL_BYTES_V1,
     SEARCH_BACKEND_ASIMD_TAG38_MIN_LITERAL_BYTES_V1, SEARCH_BACKEND_ASIMD_TAG38_V1,
+    SEARCH_BACKEND_ASIMD_TAG39_MAX_LITERAL_BYTES_V1,
+    SEARCH_BACKEND_ASIMD_TAG39_MIN_LITERAL_BYTES_V1, SEARCH_BACKEND_ASIMD_TAG39_V1,
     inspect_static_search_span_expectation_v1, search_backend_literal_width_is_valid_v1,
 };
 use fre_jit_aarch64::{
@@ -146,6 +148,7 @@ pub enum LinuxAarch64SearchBackendV1 {
     AsimdV17,
     AsimdV24,
     AsimdV25,
+    AsimdV26,
     Sve2Fixed16Tag21Vl16,
 }
 
@@ -163,6 +166,7 @@ impl LinuxAarch64SearchBackendV1 {
             Self::AsimdV17 => SearchBackendPolicy::AsimdV17,
             Self::AsimdV24 => SearchBackendPolicy::AsimdV24,
             Self::AsimdV25 => SearchBackendPolicy::AsimdV25,
+            Self::AsimdV26 => SearchBackendPolicy::AsimdV26,
             Self::Sve2Fixed16Tag21Vl16 => SearchBackendPolicy::Sve2Fixed16V2,
         }
     }
@@ -184,7 +188,8 @@ impl LinuxAarch64SearchBackendV1 {
             | Self::AsimdV16
             | Self::AsimdV17
             | Self::AsimdV24
-            | Self::AsimdV25 => CpuFeatures::ASIMD,
+            | Self::AsimdV25
+            | Self::AsimdV26 => CpuFeatures::ASIMD,
             Self::Sve2Fixed16Tag21Vl16 => CpuFeatures::ASIMD_SVE2,
         }
     }
@@ -201,7 +206,8 @@ impl LinuxAarch64SearchBackendV1 {
             | Self::AsimdV16
             | Self::AsimdV17
             | Self::AsimdV24
-            | Self::AsimdV25 => 0,
+            | Self::AsimdV25
+            | Self::AsimdV26 => 0,
             Self::Sve2Fixed16Tag21Vl16 => 16,
         }
     }
@@ -218,6 +224,7 @@ impl LinuxAarch64SearchBackendV1 {
             Self::AsimdV17 => 9,
             Self::AsimdV24 => 10,
             Self::AsimdV25 => 11,
+            Self::AsimdV26 => 12,
             Self::Sve2Fixed16Tag21Vl16 => 2,
         }
     }
@@ -390,6 +397,14 @@ impl<O: Operation> LinuxAarch64ExactSearchManifestV1<O> {
         Self::new(policy, LinuxAarch64SearchBackendV1::AsimdV25)
     }
 
+    /// Construct an explicit ASIMD V26/tag39 policy-authenticated candidate.
+    /// This does not grant runtime or automatic-routing authority.
+    pub fn v26_candidate(
+        policy: LinuxAarch64SearchCompilePolicyV1,
+    ) -> Result<Self, LinuxSearchManifestErrorV1> {
+        Self::new(policy, LinuxAarch64SearchBackendV1::AsimdV26)
+    }
+
     /// Construct a named candidate by its static-contract backend tag.
     ///
     /// The external evidence runner can therefore carry the backend as sealed
@@ -408,6 +423,7 @@ impl<O: Operation> LinuxAarch64ExactSearchManifestV1<O> {
             SEARCH_BACKEND_ASIMD_TAG30_V1 => Self::v17_candidate(policy),
             SEARCH_BACKEND_ASIMD_TAG37_V1 => Self::v24_candidate(policy),
             SEARCH_BACKEND_ASIMD_TAG38_V1 => Self::v25_candidate(policy),
+            SEARCH_BACKEND_ASIMD_TAG39_V1 => Self::v26_candidate(policy),
             requested => {
                 Err(LinuxSearchManifestErrorV1::UnsupportedCandidateBackendTag { requested })
             }
@@ -1027,6 +1043,11 @@ pub fn plan_and_compile_linux_aarch64_exact_search_v1<O: Operation>(
                 ..=u64::from(SEARCH_BACKEND_ASIMD_TAG38_MAX_LITERAL_BYTES_V1))
                 .contains(&literal_bytes)
         }
+        LinuxAarch64SearchBackendV1::AsimdV26 => {
+            (u64::from(SEARCH_BACKEND_ASIMD_TAG39_MIN_LITERAL_BYTES_V1)
+                ..=u64::from(SEARCH_BACKEND_ASIMD_TAG39_MAX_LITERAL_BYTES_V1))
+                .contains(&literal_bytes)
+        }
         _ => true,
     };
     if !backend_literal_shape_is_valid {
@@ -1452,7 +1473,8 @@ const fn target_for_backend(backend: LinuxAarch64SearchBackendV1) -> TargetSpec 
         | LinuxAarch64SearchBackendV1::AsimdV16
         | LinuxAarch64SearchBackendV1::AsimdV17
         | LinuxAarch64SearchBackendV1::AsimdV24
-        | LinuxAarch64SearchBackendV1::AsimdV25 => TargetSpec::AARCH64_AAPCS64,
+        | LinuxAarch64SearchBackendV1::AsimdV25
+        | LinuxAarch64SearchBackendV1::AsimdV26 => TargetSpec::AARCH64_AAPCS64,
         LinuxAarch64SearchBackendV1::Sve2Fixed16Tag21Vl16 => TargetSpec::AARCH64_AAPCS64_SVE2_16,
     }
 }
@@ -1542,6 +1564,7 @@ fn decode_backend_profile(
         LinuxAarch64SearchBackendV1::AsimdV17,
         LinuxAarch64SearchBackendV1::AsimdV24,
         LinuxAarch64SearchBackendV1::AsimdV25,
+        LinuxAarch64SearchBackendV1::AsimdV26,
         LinuxAarch64SearchBackendV1::Sve2Fixed16Tag21Vl16,
     ] {
         if tag == backend.tag()
@@ -1719,7 +1742,7 @@ impl<'a> ReceiptReader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fre_jit_aarch64::emit_with_backend;
+    use fre_jit_aarch64::{AotLimits, emit_with_backend};
     use fre_kernel_ir::Span;
 
     #[test]
@@ -2374,6 +2397,221 @@ mod tests {
                 BackendVersion::SEARCH_V25.0
             );
         }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the inert tag39 test binds compiler, receipt, object, AOT manifest, mutations, relabeling, and width boundaries"
+    )]
+    fn explicit_v26_tag39_roundtrips_with_policy16_but_has_no_runtime_authority() {
+        let manifest = LinuxAarch64ExactSearchManifestV1::<Span>::v26_candidate(
+            LinuxAarch64SearchCompilePolicyV1::default(),
+        )
+        .expect("V26 candidate manifest");
+        let tagged = LinuxAarch64ExactSearchManifestV1::<Span>::candidate_backend_tag(
+            LinuxAarch64SearchCompilePolicyV1::default(),
+            SEARCH_BACKEND_ASIMD_TAG39_V1,
+        )
+        .expect("tag39 candidate manifest");
+        assert_eq!(manifest.backend(), LinuxAarch64SearchBackendV1::AsimdV26);
+        assert_eq!(tagged.identity(), manifest.identity());
+
+        let source = b"policy-receipt-26".to_vec();
+        let first = plan_and_compile_linux_aarch64_exact_search_v1(
+            manifest,
+            source.clone(),
+            RustProfile::default(),
+        )
+        .expect("first Linux V26 object");
+        let second = plan_and_compile_linux_aarch64_exact_search_v1(
+            manifest,
+            source.clone(),
+            RustProfile::default(),
+        )
+        .expect("second Linux V26 object");
+        assert_eq!(
+            first.receipt().backend(),
+            LinuxAarch64SearchBackendV1::AsimdV26
+        );
+        assert_eq!(
+            first.receipt().metadata().backend_version(),
+            BackendVersion::SEARCH_V26.0
+        );
+        assert_eq!(first.object().as_bytes(), second.object().as_bytes());
+        assert_eq!(first.receipt(), second.receipt());
+        assert_eq!(
+            first.runtime_authority(),
+            SearchAotRuntimeAuthorityV1::Absent
+        );
+        assert_eq!(
+            first.receipt().runtime_authority(),
+            SearchAotRuntimeAuthorityV1::Absent
+        );
+
+        let receipt_bytes = first
+            .receipt()
+            .canonical_receipt_bytes()
+            .expect("canonical V26 receipt");
+        let reopened = first
+            .receipt()
+            .validate_canonical_receipt_bytes(&receipt_bytes)
+            .expect("strict V26 receipt reopen");
+        reopened
+            .validate_object(first.object().as_bytes(), ObjectLimitsV1::default())
+            .expect("tag39 receipt reopens its inert object");
+        for index in 0..receipt_bytes.len() {
+            let mut changed = receipt_bytes;
+            changed[index] ^= 1;
+            assert!(
+                first
+                    .receipt()
+                    .validate_canonical_receipt_bytes(&changed)
+                    .is_err(),
+                "typed tag39 receipt accepted byte mutation {index}"
+            );
+        }
+
+        let expectation = crate::build_linux_static_search_span_expectation_v1(&first)
+            .expect("Linux V26 neutral expectation");
+        let claim = inspect_static_search_span_expectation_v1(expectation.as_bytes())
+            .expect("Linux V26 expectation inspection");
+        assert_eq!(claim.backend_version(), SEARCH_BACKEND_ASIMD_TAG39_V1);
+        reopened
+            .validate_span_expectation(expectation.as_bytes())
+            .expect("V26 receipt/expectation binding");
+
+        let program =
+            build_exact_literal::<Span>(&source, AnchorFlags::default(), ValidateLimits::default())
+                .expect("V26 exact program");
+        let image = emit_with_backend(
+            &program,
+            SearchBackendPolicy::AsimdV26,
+            EmitLimits::default(),
+        )
+        .expect("V26 native image");
+        reopened
+            .validate_reconstructed_image_object(
+                &image,
+                first.object().as_bytes(),
+                ObjectLimitsV1::default(),
+            )
+            .expect("V26 source reconstruction binds the inert ELF object");
+        let aot = image.to_aot(AotLimits::default()).expect("V26 core AOT");
+        assert_eq!(&aot.as_bytes()[..8], b"FREA64\0\x27");
+        assert_eq!(&aot.as_bytes()[8..10], &39_u16.to_le_bytes());
+        assert_eq!(&aot.as_bytes()[66..68], &16_u16.to_le_bytes());
+
+        let v25 = plan_and_compile_linux_aarch64_exact_search_v1(
+            LinuxAarch64ExactSearchManifestV1::<Span>::v25_candidate(
+                LinuxAarch64SearchCompilePolicyV1::default(),
+            )
+            .expect("V25 relabel-control manifest"),
+            source,
+            RustProfile::default(),
+        )
+        .expect("V25 relabel-control object");
+        assert!(
+            reopened
+                .validate_object(v25.object().as_bytes(), ObjectLimitsV1::default())
+                .is_err(),
+            "tag38 object must not relabel as tag39"
+        );
+        assert!(
+            v25.receipt()
+                .validate_object(first.object().as_bytes(), ObjectLimitsV1::default())
+                .is_err(),
+            "tag39 object must not relabel as tag38"
+        );
+        for index in 0..first.object().as_bytes().len() {
+            let mut changed = first.object().as_bytes().to_vec();
+            changed[index] ^= 1;
+            assert!(
+                reopened
+                    .validate_object(&changed, ObjectLimitsV1::default())
+                    .is_err(),
+                "decoded tag39 receipt accepted object mutation {index}"
+            );
+        }
+
+        for width in 1..SEARCH_BACKEND_ASIMD_TAG39_MIN_LITERAL_BYTES_V1 {
+            let error = plan_and_compile_linux_aarch64_exact_search_v1(
+                manifest,
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+                    [..usize::try_from(width).expect("small width")]
+                    .to_vec(),
+                RustProfile::default(),
+            )
+            .expect_err("V26 must reject a sub-six width");
+            assert!(matches!(
+                error,
+                LinuxSearchCompileErrorV1::BackendLiteralShape {
+                    backend: LinuxAarch64SearchBackendV1::AsimdV26,
+                    literal_bytes,
+                } if literal_bytes == u64::from(width)
+            ));
+        }
+        for width in [
+            SEARCH_BACKEND_ASIMD_TAG39_MIN_LITERAL_BYTES_V1,
+            SEARCH_BACKEND_ASIMD_TAG39_MAX_LITERAL_BYTES_V1,
+        ] {
+            let compiled = plan_and_compile_linux_aarch64_exact_search_v1(
+                manifest,
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+                    [..usize::try_from(width).expect("small width")]
+                    .to_vec(),
+                RustProfile::default(),
+            )
+            .expect("V26 admitted envelope boundary");
+            assert_eq!(
+                compiled.receipt().metadata().backend_version(),
+                BackendVersion::SEARCH_V26.0
+            );
+        }
+        assert!(
+            plan_and_compile_linux_aarch64_exact_search_v1(
+                manifest,
+                vec![
+                    b'x';
+                    usize::try_from(SEARCH_BACKEND_ASIMD_TAG39_MAX_LITERAL_BYTES_V1 + 1)
+                        .expect("small width")
+                ],
+                RustProfile::default(),
+            )
+            .is_err(),
+            "V26 must reject width 33"
+        );
+    }
+
+    #[test]
+    fn v25_linux_object_and_receipt_bytes_remain_frozen_after_tag39_extension() {
+        let compiled = plan_and_compile_linux_aarch64_exact_search_v1(
+            LinuxAarch64ExactSearchManifestV1::<Span>::v25_candidate(
+                LinuxAarch64SearchCompilePolicyV1::default(),
+            )
+            .expect("frozen V25 manifest"),
+            b"sixth-promote-25!".to_vec(),
+            RustProfile::default(),
+        )
+        .expect("frozen V25 compile");
+        let mut hasher = Sha256::new();
+        hasher.update(b"FRE-AOT-LINUX-V25-OLD-BYTES-V1\0");
+        hasher.update(compiled.object().as_bytes());
+        hasher.update(
+            compiled
+                .receipt()
+                .canonical_receipt_bytes()
+                .expect("frozen V25 receipt"),
+        );
+        let digest: [u8; 32] = hasher.finalize().into();
+        assert_eq!(
+            digest,
+            [
+                0x6a, 0x06, 0x54, 0x62, 0xa8, 0x96, 0xc6, 0xd6, 0x52, 0x76, 0x68, 0x96, 0xe6, 0xe8,
+                0x95, 0x90, 0x93, 0x73, 0x11, 0x28, 0xb5, 0xb4, 0xc8, 0xba, 0xd7, 0x89, 0xc7, 0x43,
+                0x83, 0x71, 0x12, 0x39,
+            ]
+        );
     }
 
     #[test]

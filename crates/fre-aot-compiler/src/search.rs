@@ -32,6 +32,8 @@ use fre_aot_search_contract::{
     SEARCH_BACKEND_ASIMD_TAG37_MIN_LITERAL_BYTES_V1, SEARCH_BACKEND_ASIMD_TAG37_V1,
     SEARCH_BACKEND_ASIMD_TAG38_MAX_LITERAL_BYTES_V1,
     SEARCH_BACKEND_ASIMD_TAG38_MIN_LITERAL_BYTES_V1, SEARCH_BACKEND_ASIMD_TAG38_V1,
+    SEARCH_BACKEND_ASIMD_TAG39_MAX_LITERAL_BYTES_V1,
+    SEARCH_BACKEND_ASIMD_TAG39_MIN_LITERAL_BYTES_V1, SEARCH_BACKEND_ASIMD_TAG39_V1,
     search_backend_literal_width_is_valid_v1,
 };
 use fre_jit_aarch64::{
@@ -167,7 +169,7 @@ impl std::error::Error for SearchManifestErrorV1 {}
 /// Explicit macOS `AArch64` code-generation profile.
 ///
 /// The default remains V8 so all existing manifests and artifact identities
-/// remain byte-for-byte stable. V9, V10, V12, V13, V15-V17, V24, and V25 are
+/// remain byte-for-byte stable. V9, V10, V12, V13, V15-V17, and V24-V26 are
 /// reachable only through named candidate constructors until source
 /// qualification grants deployment authority.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -183,6 +185,7 @@ pub enum MacosAarch64SearchBackendV1 {
     AsimdV17,
     AsimdV24,
     AsimdV25,
+    AsimdV26,
 }
 
 impl MacosAarch64SearchBackendV1 {
@@ -199,6 +202,7 @@ impl MacosAarch64SearchBackendV1 {
             Self::AsimdV17 => SearchBackendPolicy::AsimdV17,
             Self::AsimdV24 => SearchBackendPolicy::AsimdV24,
             Self::AsimdV25 => SearchBackendPolicy::AsimdV25,
+            Self::AsimdV26 => SearchBackendPolicy::AsimdV26,
         }
     }
 
@@ -314,6 +318,12 @@ impl<O: Operation> MacosAarch64ExactSearchManifestV1<O> {
         Self::with_backend(policy, MacosAarch64SearchBackendV1::AsimdV25)
     }
 
+    /// Construct an explicit ASIMD V26/tag39 policy-authenticated candidate
+    /// manifest. This does not grant runtime or routing authority.
+    pub fn v26_candidate(policy: SearchCompilePolicyV1) -> Result<Self, SearchManifestErrorV1> {
+        Self::with_backend(policy, MacosAarch64SearchBackendV1::AsimdV26)
+    }
+
     /// Construct a named candidate by its static-contract backend tag.
     ///
     /// This keeps evidence runners independent of Rust enum variant names.
@@ -332,6 +342,7 @@ impl<O: Operation> MacosAarch64ExactSearchManifestV1<O> {
             SEARCH_BACKEND_ASIMD_TAG30_V1 => Self::v17_candidate(policy),
             SEARCH_BACKEND_ASIMD_TAG37_V1 => Self::v24_candidate(policy),
             SEARCH_BACKEND_ASIMD_TAG38_V1 => Self::v25_candidate(policy),
+            SEARCH_BACKEND_ASIMD_TAG39_V1 => Self::v26_candidate(policy),
             requested => Err(SearchManifestErrorV1::UnsupportedCandidateBackendTag { requested }),
         }
     }
@@ -755,6 +766,7 @@ impl SearchCompileReceiptV1 {
                     || value == BackendVersion::SEARCH_V17.0
                     || value == BackendVersion::SEARCH_V24.0
                     || value == BackendVersion::SEARCH_V25.0
+                    || value == BackendVersion::SEARCH_V26.0
             )
             && metadata.abi_kind() == AbiKind::Search
             && metadata.literal_bytes() == 0
@@ -975,6 +987,11 @@ pub fn plan_and_compile_macos_aarch64_exact_search_v1<O: Operation>(
         MacosAarch64SearchBackendV1::AsimdV25 => {
             (u64::from(SEARCH_BACKEND_ASIMD_TAG38_MIN_LITERAL_BYTES_V1)
                 ..=u64::from(SEARCH_BACKEND_ASIMD_TAG38_MAX_LITERAL_BYTES_V1))
+                .contains(&literal_bytes)
+        }
+        MacosAarch64SearchBackendV1::AsimdV26 => {
+            (u64::from(SEARCH_BACKEND_ASIMD_TAG39_MIN_LITERAL_BYTES_V1)
+                ..=u64::from(SEARCH_BACKEND_ASIMD_TAG39_MAX_LITERAL_BYTES_V1))
                 .contains(&literal_bytes)
         }
         _ => true,
@@ -1623,6 +1640,7 @@ const fn map_compile_canonical(_error: CanonicalError) -> SearchCompileErrorV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fre_jit_aarch64::AotLimits;
     use fre_kernel_ir::{Exists, SelectedEnd, Span};
 
     fn compile<O: Operation>() -> SearchCompiledObjectV1<O> {
@@ -2311,6 +2329,194 @@ mod tests {
                 BackendVersion::SEARCH_V25.0
             );
         }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the inert tag39 test binds compiler, object, AOT manifest, mutations, relabeling, and width boundaries"
+    )]
+    fn explicit_v26_tag39_roundtrips_with_policy16_but_has_no_runtime_authority() {
+        let manifest = MacosAarch64ExactSearchManifestV1::<Span>::v26_candidate(
+            SearchCompilePolicyV1::default(),
+        )
+        .expect("V26 candidate manifest");
+        let tagged = MacosAarch64ExactSearchManifestV1::<Span>::candidate_backend_tag(
+            SearchCompilePolicyV1::default(),
+            SEARCH_BACKEND_ASIMD_TAG39_V1,
+        )
+        .expect("tag39 candidate manifest");
+        assert_eq!(manifest.backend(), MacosAarch64SearchBackendV1::AsimdV26);
+        assert_eq!(tagged.identity(), manifest.identity());
+
+        let source = b"policy-receipt-26".to_vec();
+        let first = plan_and_compile_macos_aarch64_exact_search_v1(
+            manifest,
+            source.clone(),
+            RustProfile::default(),
+        )
+        .expect("first V26 object");
+        let second = plan_and_compile_macos_aarch64_exact_search_v1(
+            manifest,
+            source.clone(),
+            RustProfile::default(),
+        )
+        .expect("second V26 object");
+        assert_eq!(
+            first.receipt().metadata().backend_version(),
+            BackendVersion::SEARCH_V26.0
+        );
+        assert_eq!(first.object().as_bytes(), second.object().as_bytes());
+        assert_eq!(first.receipt(), second.receipt());
+        assert_eq!(
+            first.runtime_authority(),
+            SearchAotRuntimeAuthorityV1::Absent
+        );
+        assert_eq!(
+            first.receipt().runtime_authority(),
+            SearchAotRuntimeAuthorityV1::Absent
+        );
+        first
+            .receipt()
+            .validate_object(first.object().as_bytes(), ObjectLimits::default())
+            .expect("tag39 receipt reopens its inert object");
+
+        let expectation = crate::build_static_search_span_expectation_v1(&first)
+            .expect("V26 neutral expectation");
+        let claim = fre_aot_search_contract::inspect_static_search_span_expectation_v1(
+            expectation.as_bytes(),
+        )
+        .expect("V26 expectation inspection");
+        assert_eq!(claim.backend_version(), SEARCH_BACKEND_ASIMD_TAG39_V1);
+        assert!(expectation.authenticates_claim(&claim));
+
+        let program =
+            build_exact_literal::<Span>(&source, AnchorFlags::default(), ValidateLimits::default())
+                .expect("V26 exact program");
+        let image = emit_with_backend(
+            &program,
+            SearchBackendPolicy::AsimdV26,
+            EmitLimits::default(),
+        )
+        .expect("V26 native image");
+        let aot = image.to_aot(AotLimits::default()).expect("V26 core AOT");
+        assert_eq!(&aot.as_bytes()[..8], b"FREA64\0\x27");
+        assert_eq!(&aot.as_bytes()[8..10], &39_u16.to_le_bytes());
+        assert_eq!(&aot.as_bytes()[66..68], &16_u16.to_le_bytes());
+
+        let v25 = plan_and_compile_macos_aarch64_exact_search_v1(
+            MacosAarch64ExactSearchManifestV1::<Span>::v25_candidate(
+                SearchCompilePolicyV1::default(),
+            )
+            .expect("V25 relabel-control manifest"),
+            source,
+            RustProfile::default(),
+        )
+        .expect("V25 relabel-control object");
+        assert!(
+            first
+                .receipt()
+                .validate_object(v25.object().as_bytes(), ObjectLimits::default())
+                .is_err(),
+            "tag38 object must not relabel as tag39"
+        );
+        assert!(
+            v25.receipt()
+                .validate_object(first.object().as_bytes(), ObjectLimits::default())
+                .is_err(),
+            "tag39 object must not relabel as tag38"
+        );
+
+        for index in 0..first.object().as_bytes().len() {
+            let mut changed = first.object().as_bytes().to_vec();
+            changed[index] ^= 1;
+            assert!(
+                first
+                    .receipt()
+                    .validate_object(&changed, ObjectLimits::default())
+                    .is_err(),
+                "tag39 receipt accepted object mutation {index}"
+            );
+        }
+
+        for width in 1..SEARCH_BACKEND_ASIMD_TAG39_MIN_LITERAL_BYTES_V1 {
+            let error = plan_and_compile_macos_aarch64_exact_search_v1(
+                manifest,
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+                    [..usize::try_from(width).expect("small width")]
+                    .to_vec(),
+                RustProfile::default(),
+            )
+            .expect_err("V26 must reject a sub-six width");
+            assert!(matches!(
+                error,
+                SearchCompileErrorV1::BackendLiteralShape {
+                    backend: MacosAarch64SearchBackendV1::AsimdV26,
+                    literal_bytes,
+                } if literal_bytes == u64::from(width)
+            ));
+        }
+        for width in [
+            SEARCH_BACKEND_ASIMD_TAG39_MIN_LITERAL_BYTES_V1,
+            SEARCH_BACKEND_ASIMD_TAG39_MAX_LITERAL_BYTES_V1,
+        ] {
+            let compiled = plan_and_compile_macos_aarch64_exact_search_v1(
+                manifest,
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+                    [..usize::try_from(width).expect("small width")]
+                    .to_vec(),
+                RustProfile::default(),
+            )
+            .expect("V26 admitted envelope boundary");
+            assert_eq!(
+                compiled.receipt().metadata().backend_version(),
+                BackendVersion::SEARCH_V26.0
+            );
+        }
+        assert!(
+            plan_and_compile_macos_aarch64_exact_search_v1(
+                manifest,
+                vec![
+                    b'x';
+                    usize::try_from(SEARCH_BACKEND_ASIMD_TAG39_MAX_LITERAL_BYTES_V1 + 1)
+                        .expect("small width")
+                ],
+                RustProfile::default(),
+            )
+            .is_err(),
+            "V26 must reject width 33"
+        );
+    }
+
+    #[test]
+    fn v25_macos_object_and_receipt_bytes_remain_frozen_after_tag39_extension() {
+        let compiled = plan_and_compile_macos_aarch64_exact_search_v1(
+            MacosAarch64ExactSearchManifestV1::<Span>::v25_candidate(
+                SearchCompilePolicyV1::default(),
+            )
+            .expect("frozen V25 manifest"),
+            b"sixth-promote-25!".to_vec(),
+            RustProfile::default(),
+        )
+        .expect("frozen V25 compile");
+        let mut hasher = Sha256::new();
+        hasher.update(b"FRE-AOT-MACOS-V25-OLD-BYTES-V1\0");
+        hasher.update(compiled.object().as_bytes());
+        hasher.update(
+            compiled
+                .receipt()
+                .canonical_bytes()
+                .expect("frozen V25 receipt"),
+        );
+        let digest: [u8; 32] = hasher.finalize().into();
+        assert_eq!(
+            digest,
+            [
+                0x83, 0xbf, 0x4a, 0x0d, 0xcd, 0xef, 0x65, 0x5b, 0x73, 0xe8, 0x7e, 0x50, 0x5c, 0x48,
+                0x56, 0xab, 0xb1, 0x17, 0x2f, 0x2c, 0xea, 0x18, 0x45, 0xf6, 0x11, 0xc9, 0x92, 0xbf,
+                0x5b, 0xe4, 0xfa, 0x10,
+            ]
+        );
     }
 
     #[test]

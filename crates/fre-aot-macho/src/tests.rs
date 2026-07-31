@@ -628,7 +628,7 @@ fn search_object_has_the_distinct_five_argument_contract() {
 }
 
 #[test]
-fn search_v12_v13_v15_v16_v17_v24_v25_objects_are_deterministic_inspectable_and_inert() {
+fn search_v12_v13_v15_v16_v17_v24_v25_v26_objects_are_deterministic_inspectable_and_inert() {
     for (literal, policy, version) in [
         (
             b"needle".as_slice(),
@@ -664,6 +664,11 @@ fn search_v12_v13_v15_v16_v17_v24_v25_objects_are_deterministic_inspectable_and_
             b"sixth-promote-25!".as_slice(),
             SearchBackendPolicy::AsimdV25,
             BackendVersion::SEARCH_V25.0,
+        ),
+        (
+            b"policy-receipt-26".as_slice(),
+            SearchBackendPolicy::AsimdV26,
+            BackendVersion::SEARCH_V26.0,
         ),
     ] {
         let image = search_image_with_backend(literal, policy);
