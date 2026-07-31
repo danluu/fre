@@ -116,6 +116,9 @@ def sample_header(shard_id: int = 0, cpu_id: int = 120) -> dict:
         "source_archive_sha256": "3" * 64,
         "runner_binary_sha256": "4" * 64,
         "runner_binary_bytes": 1234,
+        "runner_build_identity_sha256": "c" * 64,
+        "taskset_binary_sha256": "d" * 64,
+        "taskset_binary_bytes": 5678,
         "contract_sha256": "5" * 64,
         "cell_manifest_sha256": "6" * 64,
         "host_fingerprint_sha256": "7" * 64,
@@ -123,6 +126,8 @@ def sample_header(shard_id: int = 0, cpu_id: int = 120) -> dict:
         "shard_nonce": "b" * 64,
         "run_nonce": "8" * 64,
         "one_shot_seal_sha256": "9" * 64,
+        "one_shot_consumption_sha256": "e" * 64,
+        "preflight_manifest_sha256": "f" * 64,
         "run_manifest_sha256": "a" * 64,
     }
 
@@ -154,6 +159,12 @@ class AnalyzerTests(unittest.TestCase):
         self.assertTrue(report["pass"])
         self.assertEqual(report["cells_strictly_over_1_05"], 0)
         self.assertTrue(math.isclose(report["overall_geomean"], 0.7))
+
+    def test_geomean_gate_is_exact_even_when_float_report_rounds_to_boundary(self) -> None:
+        just_over = Fraction(4, 5) + Fraction(1, 10**100)
+        report = gate.evaluate_thresholds(full_ratio_map(just_over), acceptance())
+        self.assertEqual(report["overall_geomean"], 0.8)
+        self.assertFalse(report["checks"]["overall"])
 
     def test_tail_allowance_and_exact_boundaries(self) -> None:
         ratios = full_ratio_map()
@@ -271,6 +282,29 @@ class AnalyzerTests(unittest.TestCase):
             mutated[field] = value
             with self.assertRaises(gate.GateError):
                 gate.cell_key(mutated)
+        with self.assertRaises(gate.GateError):
+            gate.positive_integer(1 << 64, "raw timing integer")
+        expected, result = sample_result()
+        result["cell_id"] = 0.0
+        with self.assertRaises(gate.GateError):
+            gate.validate_cell_result(result, expected)
+
+    def test_all_six_shapes_must_reuse_one_literal_identity(self) -> None:
+        identities: dict[tuple[int, int, int], tuple[int, str, str]] = {}
+        coordinate = (6, 1, 0)
+        identity = (0, "aa" * 6, "1" * 64)
+        gate.enforce_literal_reuse(identities, coordinate, identity, 0)
+        gate.enforce_literal_reuse(identities, coordinate, identity, 1)
+        with self.assertRaises(gate.GateError):
+            gate.enforce_literal_reuse(
+                identities, coordinate, (1, "bb" * 6, "2" * 64), 2
+            )
+
+    def test_nonces_reject_sentinels(self) -> None:
+        self.assertEqual(gate.nonce_hex("1" * 64, "nonce"), "1" * 64)
+        for value in ("0" * 64, "f" * 64):
+            with self.assertRaises(gate.GateError):
+                gate.nonce_hex(value, "nonce")
 
     def test_nonce_roles_reject_sentinels_and_aliases(self) -> None:
         for sentinel in ("0" * 64, "f" * 64):

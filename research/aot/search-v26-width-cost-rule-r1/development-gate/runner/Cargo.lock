@@ -101,6 +101,9 @@ dependencies = [
 name = "fre-search-v26-development-gate"
 version = "0.1.0"
 dependencies = [
+ "fre-jit-aarch64",
+ "fre-jit-runtime",
+ "fre-kernel-ir",
  "fre-search-v26-synthetic-runner",
  "serde",
  "serde_json",
