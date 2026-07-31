@@ -13,12 +13,13 @@
 //! Search V1 is intentionally narrower: macOS emits typed, deterministic V8
 //! objects for all three output kinds, while Linux emits authenticated `AArch64`
 //! ELF candidates for the default V8 backend and the fixed-VL16 tag21 backend.
-//! Every path grants [`SearchAotRuntimeAuthorityV1::Absent`]. V26 additionally
-//! exposes source-first, width-9..=32 implementation-object builders for
-//! `Exists` and `SelectedEnd` on macOS and Linux. A separate manual static-link
-//! seam emits output-specific C declarations and a one-instruction direct
-//! binding object for those objects; it creates no expectation, adopter,
-//! qualification row, or runtime authority. Span has deterministic
+//! Every path grants [`SearchAotRuntimeAuthorityV1::Absent`]. V26 exposes
+//! source-first, width-9..=32 implementation-object builders for `Exists` and
+//! `SelectedEnd` on macOS and Linux; V27/tag40 extends that inert surface to
+//! every nonempty width 1..=32 and every literal topology. Separate,
+//! versioned manual static-link seams emit output-specific C declarations and
+//! one-instruction direct binding objects; they create no expectation,
+//! adopter, qualification row, or runtime authority. Span has deterministic
 //! platform-specific final-image glue; each unsigned receipt binds compiler,
 //! implementation-object, compiler-receipt, expectation, glue, and code
 //! identities but still grants no runtime authority or source qualification
@@ -69,6 +70,8 @@ mod search_v25_production;
 mod search_v26_output;
 mod search_v26_production;
 mod search_v26_static_abi;
+mod search_v27_output;
+mod search_v27_static_abi;
 mod static_expectation;
 mod static_expectation_v2;
 
@@ -250,6 +253,25 @@ pub use search_v26_static_abi::{
     build_macos_aarch64_search_v26_exists_static_binding_v1,
     build_macos_aarch64_search_v26_selected_end_static_binding_v1,
     inspect_search_v26_static_glue_v1,
+};
+pub use search_v27_output::{
+    SearchV27OutputObjectErrorV1, build_linux_aarch64_search_v27_exists_object_v1,
+    build_linux_aarch64_search_v27_selected_end_object_v1,
+    build_macos_aarch64_search_v27_exists_object_v1,
+    build_macos_aarch64_search_v27_selected_end_object_v1,
+};
+pub use search_v27_static_abi::{
+    HARD_MAX_SEARCH_V27_STATIC_GLUE_OBJECT_BYTES_V1, SEARCH_V27_STATIC_ELF_RELOCATION_V1,
+    SEARCH_V27_STATIC_GLUE_CODE_V1, SEARCH_V27_STATIC_GLUE_RELOCATIONS_V1,
+    SEARCH_V27_STATIC_MACHO_RELOCATION_V1, SearchV27StaticAbiErrorV1,
+    SearchV27StaticBindingClaimsV1, SearchV27StaticBindingV1, SearchV27StaticGlueIdentityV1,
+    SearchV27StaticGlueInspectionV1, SearchV27StaticHeaderIdentityV1, SearchV27StaticPlatformV1,
+    SearchV27StaticSymbolNameV1, SearchV27StaticSymbolsV1,
+    build_linux_aarch64_search_v27_exists_static_binding_v1,
+    build_linux_aarch64_search_v27_selected_end_static_binding_v1,
+    build_macos_aarch64_search_v27_exists_static_binding_v1,
+    build_macos_aarch64_search_v27_selected_end_static_binding_v1,
+    inspect_search_v27_static_glue_v1,
 };
 pub use static_expectation::{
     ClaimedStaticCountExpectationV1, STATIC_COUNT_EXPECTATION_BYTES_V1,

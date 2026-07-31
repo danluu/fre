@@ -62,6 +62,31 @@ impl SearchV26StaticPlatformV1 {
     }
 }
 
+/// Crate-private object-format selector shared by versioned static ABI
+/// frontends. It deliberately carries no backend or authority semantics.
+#[derive(Clone, Copy)]
+pub(crate) enum SearchStaticDirectObjectPlatformV1 {
+    MacosAarch64,
+    LinuxAarch64,
+}
+
+impl From<SearchV26StaticPlatformV1> for SearchStaticDirectObjectPlatformV1 {
+    fn from(value: SearchV26StaticPlatformV1) -> Self {
+        match value {
+            SearchV26StaticPlatformV1::MacosAarch64 => Self::MacosAarch64,
+            SearchV26StaticPlatformV1::LinuxAarch64 => Self::LinuxAarch64,
+        }
+    }
+}
+
+/// Crate-private section namespace. Public versioning remains in each
+/// frontend while the binary writer stays shared.
+#[derive(Clone, Copy)]
+pub(crate) enum SearchStaticDirectObjectVersionV1 {
+    V26,
+    V27,
+}
+
 /// Failure while authenticating or emitting an output-specific static bind.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -708,9 +733,30 @@ fn emit_glue_object(
     platform: SearchV26StaticPlatformV1,
     symbols: &SearchV26StaticSymbolsV1,
 ) -> Result<Vec<u8>, SearchV26StaticAbiErrorV1> {
+    emit_search_static_direct_object_v1(
+        SearchStaticDirectObjectVersionV1::V26,
+        platform.into(),
+        symbols.wrapper.as_str(),
+        symbols.entry.as_str(),
+    )
+}
+
+/// Emit the backend-neutral one-instruction static object used by versioned
+/// Search frontends. Output and compiler identities are already closed by the
+/// caller's identity-suffixed names.
+pub(crate) fn emit_search_static_direct_object_v1(
+    version: SearchStaticDirectObjectVersionV1,
+    platform: SearchStaticDirectObjectPlatformV1,
+    wrapper: &str,
+    entry: &str,
+) -> Result<Vec<u8>, SearchV26StaticAbiErrorV1> {
     match platform {
-        SearchV26StaticPlatformV1::MacosAarch64 => emit_macho_glue(symbols),
-        SearchV26StaticPlatformV1::LinuxAarch64 => emit_elf_glue(symbols),
+        SearchStaticDirectObjectPlatformV1::MacosAarch64 => {
+            emit_macho_glue(wrapper.as_bytes(), entry.as_bytes())
+        }
+        SearchStaticDirectObjectPlatformV1::LinuxAarch64 => {
+            emit_elf_glue(version, wrapper.as_bytes(), entry.as_bytes())
+        }
     }
 }
 
@@ -736,18 +782,12 @@ const MACH_STRING_OFFSET: usize = MACH_SYMBOL_OFFSET + (2 * 16);
     clippy::too_many_lines,
     reason = "one bounded writer keeps the complete tiny Mach-O layout auditable"
 )]
-fn emit_macho_glue(
-    symbols: &SearchV26StaticSymbolsV1,
-) -> Result<Vec<u8>, SearchV26StaticAbiErrorV1> {
-    let wrapper_string_bytes = symbols
-        .wrapper
-        .as_bytes()
+fn emit_macho_glue(wrapper: &[u8], entry: &[u8]) -> Result<Vec<u8>, SearchV26StaticAbiErrorV1> {
+    let wrapper_string_bytes = wrapper
         .len()
         .checked_add(2)
         .ok_or_else(|| overflow("Mach-O wrapper string bytes"))?;
-    let entry_string_bytes = symbols
-        .entry
-        .as_bytes()
+    let entry_string_bytes = entry
         .len()
         .checked_add(2)
         .ok_or_else(|| overflow("Mach-O entry string bytes"))?;
@@ -881,9 +921,9 @@ fn emit_macho_glue(
                 .ok_or_else(|| glue_error("Mach-O strings"))?,
         );
         writer.u32(0)?;
-        for name in [symbols.wrapper, symbols.entry] {
+        for name in [wrapper, entry] {
             writer.u8(b'_')?;
-            writer.raw(name.as_bytes())?;
+            writer.raw(name)?;
             writer.u8(0)?;
         }
     }
@@ -908,18 +948,32 @@ struct ElfLayout {
     object_bytes: usize,
 }
 
-fn emit_elf_glue(symbols: &SearchV26StaticSymbolsV1) -> Result<Vec<u8>, SearchV26StaticAbiErrorV1> {
+fn emit_elf_glue(
+    version: SearchStaticDirectObjectVersionV1,
+    wrapper: &[u8],
+    entry: &[u8],
+) -> Result<Vec<u8>, SearchV26StaticAbiErrorV1> {
     let mut symbol_strings = Vec::new();
     symbol_strings
         .try_reserve_exact(512)
         .map_err(|_| SearchV26StaticAbiErrorV1::AllocationFailed)?;
     symbol_strings.push(0);
-    let wrapper_name = push_string(&mut symbol_strings, symbols.wrapper.as_bytes())?;
-    let entry_name = push_string(&mut symbol_strings, symbols.entry.as_bytes())?;
+    let wrapper_name = push_string(&mut symbol_strings, wrapper)?;
+    let entry_name = push_string(&mut symbol_strings, entry)?;
 
+    let (text_section_name, rela_section_name): (&[u8], &[u8]) = match version {
+        SearchStaticDirectObjectVersionV1::V26 => (
+            b".text.fre_aot_search_v26_static",
+            b".rela.text.fre_aot_search_v26_static",
+        ),
+        SearchStaticDirectObjectVersionV1::V27 => (
+            b".text.fre_aot_search_v27_static",
+            b".rela.text.fre_aot_search_v27_static",
+        ),
+    };
     let section_names = [
-        b".text.fre_aot_search_v26_static".as_slice(),
-        b".rela.text.fre_aot_search_v26_static".as_slice(),
+        text_section_name,
+        rela_section_name,
         b".strtab".as_slice(),
         b".symtab".as_slice(),
         b".note.GNU-stack".as_slice(),
@@ -1625,6 +1679,92 @@ mod tests {
                 )
                 .is_err(),
                 "accepted byte mutation at {offset}"
+            );
+        }
+    }
+
+    #[test]
+    fn v26_binding_bytes_remain_frozen_across_internal_emitter_refactors() {
+        let mac_exists = build_macos_aarch64_search_v26_exists_object_v1(
+            FIRST.to_vec(),
+            RustProfile::default(),
+            SearchCompilePolicyV1::default(),
+        )
+        .unwrap();
+        let mac_end = build_macos_aarch64_search_v26_selected_end_object_v1(
+            FIRST.to_vec(),
+            RustProfile::default(),
+            SearchCompilePolicyV1::default(),
+        )
+        .unwrap();
+        let linux_exists = build_linux_aarch64_search_v26_exists_object_v1(
+            FIRST.to_vec(),
+            RustProfile::default(),
+            LinuxAarch64SearchCompilePolicyV1::default(),
+        )
+        .unwrap();
+        let linux_end = build_linux_aarch64_search_v26_selected_end_object_v1(
+            FIRST.to_vec(),
+            RustProfile::default(),
+            LinuxAarch64SearchCompilePolicyV1::default(),
+        )
+        .unwrap();
+        let bindings = [
+            build_macos_aarch64_search_v26_exists_static_binding_v1(&mac_exists).unwrap(),
+            build_macos_aarch64_search_v26_selected_end_static_binding_v1(&mac_end).unwrap(),
+            build_linux_aarch64_search_v26_exists_static_binding_v1(&linux_exists).unwrap(),
+            build_linux_aarch64_search_v26_selected_end_static_binding_v1(&linux_end).unwrap(),
+        ];
+        let expected = [
+            (
+                [
+                    30, 83, 231, 224, 240, 243, 12, 113, 217, 215, 120, 21, 76, 104, 225, 243, 147,
+                    193, 131, 196, 230, 55, 107, 185, 127, 175, 182, 52, 135, 11, 66, 107,
+                ],
+                [
+                    19, 94, 216, 109, 152, 142, 172, 208, 140, 78, 118, 209, 99, 155, 144, 64, 193,
+                    158, 85, 84, 57, 223, 242, 190, 242, 233, 99, 242, 107, 222, 190, 236,
+                ],
+            ),
+            (
+                [
+                    255, 153, 174, 153, 117, 169, 195, 67, 203, 92, 248, 30, 38, 124, 54, 55, 209,
+                    111, 93, 138, 91, 5, 225, 154, 46, 55, 170, 39, 30, 73, 109, 63,
+                ],
+                [
+                    94, 94, 72, 147, 253, 228, 5, 49, 191, 210, 82, 156, 119, 93, 158, 210, 37,
+                    229, 112, 167, 24, 82, 127, 77, 94, 121, 101, 12, 73, 87, 40, 144,
+                ],
+            ),
+            (
+                [
+                    252, 40, 131, 72, 92, 127, 125, 225, 52, 61, 53, 70, 63, 45, 177, 141, 63, 113,
+                    255, 69, 28, 200, 89, 5, 171, 201, 216, 138, 61, 151, 39, 210,
+                ],
+                [
+                    10, 24, 151, 181, 196, 29, 37, 168, 186, 196, 144, 255, 104, 153, 15, 233, 245,
+                    101, 200, 208, 90, 66, 173, 104, 241, 70, 201, 202, 187, 80, 162, 218,
+                ],
+            ),
+            (
+                [
+                    37, 241, 160, 119, 92, 18, 231, 155, 83, 121, 22, 78, 249, 6, 145, 31, 163,
+                    239, 166, 218, 82, 89, 2, 145, 188, 143, 97, 48, 198, 72, 57, 129,
+                ],
+                [
+                    153, 242, 144, 35, 230, 113, 26, 226, 180, 197, 131, 216, 26, 110, 145, 26,
+                    139, 171, 200, 199, 24, 235, 85, 69, 55, 202, 139, 143, 115, 66, 167, 138,
+                ],
+            ),
+        ];
+        for (binding, (expected_glue, expected_header)) in bindings.into_iter().zip(expected) {
+            assert_eq!(
+                <[u8; 32]>::from(Sha256::digest(binding.glue_object())),
+                expected_glue
+            );
+            assert_eq!(
+                <[u8; 32]>::from(Sha256::digest(binding.c_header().as_bytes())),
+                expected_header
             );
         }
     }
