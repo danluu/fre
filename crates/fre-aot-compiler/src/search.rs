@@ -34,6 +34,8 @@ use fre_aot_search_contract::{
     SEARCH_BACKEND_ASIMD_TAG38_MIN_LITERAL_BYTES_V1, SEARCH_BACKEND_ASIMD_TAG38_V1,
     SEARCH_BACKEND_ASIMD_TAG39_MAX_LITERAL_BYTES_V1,
     SEARCH_BACKEND_ASIMD_TAG39_MIN_LITERAL_BYTES_V1, SEARCH_BACKEND_ASIMD_TAG39_V1,
+    SEARCH_BACKEND_ASIMD_TAG40_MAX_LITERAL_BYTES_V1,
+    SEARCH_BACKEND_ASIMD_TAG40_MIN_LITERAL_BYTES_V1, SEARCH_BACKEND_ASIMD_TAG40_V1,
     search_backend_literal_width_is_valid_v1,
 };
 use fre_jit_aarch64::{
@@ -169,7 +171,7 @@ impl std::error::Error for SearchManifestErrorV1 {}
 /// Explicit macOS `AArch64` code-generation profile.
 ///
 /// The default remains V8 so all existing manifests and artifact identities
-/// remain byte-for-byte stable. V9, V10, V12, V13, V15-V17, and V24-V26 are
+/// remain byte-for-byte stable. V9, V10, V12, V13, V15-V17, and V24-V27 are
 /// reachable only through named candidate constructors until source
 /// qualification grants deployment authority.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -186,6 +188,7 @@ pub enum MacosAarch64SearchBackendV1 {
     AsimdV24,
     AsimdV25,
     AsimdV26,
+    AsimdV27,
 }
 
 impl MacosAarch64SearchBackendV1 {
@@ -203,6 +206,7 @@ impl MacosAarch64SearchBackendV1 {
             Self::AsimdV24 => SearchBackendPolicy::AsimdV24,
             Self::AsimdV25 => SearchBackendPolicy::AsimdV25,
             Self::AsimdV26 => SearchBackendPolicy::AsimdV26,
+            Self::AsimdV27 => SearchBackendPolicy::AsimdV27,
         }
     }
 
@@ -324,6 +328,12 @@ impl<O: Operation> MacosAarch64ExactSearchManifestV1<O> {
         Self::with_backend(policy, MacosAarch64SearchBackendV1::AsimdV26)
     }
 
+    /// Construct an explicit ASIMD V27/tag40 topology-total candidate
+    /// manifest. This does not grant runtime or routing authority.
+    pub fn v27_candidate(policy: SearchCompilePolicyV1) -> Result<Self, SearchManifestErrorV1> {
+        Self::with_backend(policy, MacosAarch64SearchBackendV1::AsimdV27)
+    }
+
     /// Construct a named candidate by its static-contract backend tag.
     ///
     /// This keeps evidence runners independent of Rust enum variant names.
@@ -343,6 +353,7 @@ impl<O: Operation> MacosAarch64ExactSearchManifestV1<O> {
             SEARCH_BACKEND_ASIMD_TAG37_V1 => Self::v24_candidate(policy),
             SEARCH_BACKEND_ASIMD_TAG38_V1 => Self::v25_candidate(policy),
             SEARCH_BACKEND_ASIMD_TAG39_V1 => Self::v26_candidate(policy),
+            SEARCH_BACKEND_ASIMD_TAG40_V1 => Self::v27_candidate(policy),
             requested => Err(SearchManifestErrorV1::UnsupportedCandidateBackendTag { requested }),
         }
     }
@@ -767,6 +778,7 @@ impl SearchCompileReceiptV1 {
                     || value == BackendVersion::SEARCH_V24.0
                     || value == BackendVersion::SEARCH_V25.0
                     || value == BackendVersion::SEARCH_V26.0
+                    || value == BackendVersion::SEARCH_V27.0
             )
             && metadata.abi_kind() == AbiKind::Search
             && metadata.literal_bytes() == 0
@@ -992,6 +1004,11 @@ pub fn plan_and_compile_macos_aarch64_exact_search_v1<O: Operation>(
         MacosAarch64SearchBackendV1::AsimdV26 => {
             (u64::from(SEARCH_BACKEND_ASIMD_TAG39_MIN_LITERAL_BYTES_V1)
                 ..=u64::from(SEARCH_BACKEND_ASIMD_TAG39_MAX_LITERAL_BYTES_V1))
+                .contains(&literal_bytes)
+        }
+        MacosAarch64SearchBackendV1::AsimdV27 => {
+            (u64::from(SEARCH_BACKEND_ASIMD_TAG40_MIN_LITERAL_BYTES_V1)
+                ..=u64::from(SEARCH_BACKEND_ASIMD_TAG40_MAX_LITERAL_BYTES_V1))
                 .contains(&literal_bytes)
         }
         _ => true,
@@ -2486,6 +2503,86 @@ mod tests {
             .is_err(),
             "V26 must reject width 33"
         );
+    }
+
+    #[test]
+    fn explicit_v27_tag40_roundtrips_for_topology_total_width_envelope() {
+        let manifest = MacosAarch64ExactSearchManifestV1::<Span>::v27_candidate(
+            SearchCompilePolicyV1::default(),
+        )
+        .expect("V27 candidate manifest");
+        let tagged = MacosAarch64ExactSearchManifestV1::<Span>::candidate_backend_tag(
+            SearchCompilePolicyV1::default(),
+            SEARCH_BACKEND_ASIMD_TAG40_V1,
+        )
+        .expect("tag40 candidate manifest");
+        assert_eq!(manifest.backend(), MacosAarch64SearchBackendV1::AsimdV27);
+        assert_eq!(tagged.identity(), manifest.identity());
+        assert_ne!(
+            manifest.identity(),
+            MacosAarch64ExactSearchManifestV1::<Span>::v26_candidate(
+                SearchCompilePolicyV1::default(),
+            )
+            .expect("V26 control manifest")
+            .identity()
+        );
+
+        for source in [
+            b"x".as_slice(),
+            b"aaaaaaaaa".as_slice(),
+            b"ababababa".as_slice(),
+            b"topology-total-width-thirty-two!".as_slice(),
+        ] {
+            let first = plan_and_compile_macos_aarch64_exact_search_v1(
+                manifest,
+                source.to_vec(),
+                RustProfile::default(),
+            )
+            .expect("V27 inert object");
+            let second = plan_and_compile_macos_aarch64_exact_search_v1(
+                manifest,
+                source.to_vec(),
+                RustProfile::default(),
+            )
+            .expect("deterministic V27 inert object");
+            assert_eq!(
+                first.receipt().metadata().backend_version(),
+                BackendVersion::SEARCH_V27.0
+            );
+            assert_eq!(first.object().as_bytes(), second.object().as_bytes());
+            assert_eq!(
+                first.runtime_authority(),
+                SearchAotRuntimeAuthorityV1::Absent
+            );
+            first
+                .receipt()
+                .validate_object(first.object().as_bytes(), ObjectLimits::default())
+                .expect("tag40 receipt reopens its object");
+            let expectation = crate::build_static_search_span_expectation_v1(&first)
+                .expect("tag40 neutral expectation");
+            let claim = fre_aot_search_contract::inspect_static_search_span_expectation_v1(
+                expectation.as_bytes(),
+            )
+            .expect("tag40 expectation inspection");
+            assert_eq!(claim.backend_version(), SEARCH_BACKEND_ASIMD_TAG40_V1);
+        }
+
+        let too_wide = vec![
+            b'x';
+            usize::try_from(SEARCH_BACKEND_ASIMD_TAG40_MAX_LITERAL_BYTES_V1 + 1)
+                .expect("small width")
+        ];
+        assert!(matches!(
+            plan_and_compile_macos_aarch64_exact_search_v1(
+                manifest,
+                too_wide,
+                RustProfile::default(),
+            ),
+            Err(SearchCompileErrorV1::ResourceLimit {
+                resource: "literal bytes",
+                ..
+            })
+        ));
     }
 
     #[test]

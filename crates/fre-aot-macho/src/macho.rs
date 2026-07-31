@@ -722,7 +722,8 @@ impl MetadataV1 {
                     || version == BackendVersion::SEARCH_V17.0
                     || version == BackendVersion::SEARCH_V24.0
                     || version == BackendVersion::SEARCH_V25.0
-                    || version == BackendVersion::SEARCH_V26.0 =>
+                    || version == BackendVersion::SEARCH_V26.0
+                    || version == BackendVersion::SEARCH_V27.0 =>
             {
                 let exact_literal = self.literal_bytes == 0
                     && search_backend_literal_width_is_valid_v1(

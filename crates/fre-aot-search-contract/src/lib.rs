@@ -133,6 +133,21 @@ pub const SEARCH_BACKEND_ASIMD_TAG39_MAX_LITERAL_BYTES_V1: u32 = SEARCH_V26_MAX_
 pub const SEARCH_BACKEND_ASIMD_TAG39_CANDIDATE_POLICY_VERSION_V1: u16 = 16;
 /// Number of authenticated ranked filter offsets carried by the V26 manifest.
 pub const SEARCH_BACKEND_ASIMD_TAG39_MANIFEST_FILTER_FIELDS_V1: u8 = 5;
+/// Advanced SIMD Search V27/tag40 topology-total candidate.
+///
+/// The compiler retains V26's fast graphs for cyclic-phase-unique literals
+/// and falls back to the frozen V8 graph for every other nonempty exact
+/// literal through 32 bytes. This structural identity grants no runtime or
+/// production authority.
+pub const SEARCH_BACKEND_ASIMD_TAG40_V1: u16 = 40;
+/// Minimum exact-literal width admitted by the Search V27/tag40 compiler.
+pub const SEARCH_BACKEND_ASIMD_TAG40_MIN_LITERAL_BYTES_V1: u32 = 1;
+/// Maximum exact-literal width admitted by the Search V27/tag40 compiler.
+pub const SEARCH_BACKEND_ASIMD_TAG40_MAX_LITERAL_BYTES_V1: u32 = 32;
+/// Distinct sealed candidate-policy receipt carried by Search V27 images.
+pub const SEARCH_BACKEND_ASIMD_TAG40_CANDIDATE_POLICY_VERSION_V1: u16 = 17;
+/// Number of authenticated ranked filter offsets carried by the V27 manifest.
+pub const SEARCH_BACKEND_ASIMD_TAG40_MANIFEST_FILTER_FIELDS_V1: u8 = 5;
 /// Prospectively frozen V26 compiler/candidate lower literal bound.
 ///
 /// This is routing policy only. It grants no runtime authority. V26/tag39
@@ -154,9 +169,8 @@ const _: () = assert!(
     SEARCH_V26_PORTABLE_MAX_LITERAL_BYTES_V1 + 1 == SEARCH_V26_PRODUCTION_MIN_LITERAL_BYTES_V1
 );
 const _: () = assert!(SEARCH_V26_MIN_LITERAL_BYTES_V1 <= SEARCH_V26_PORTABLE_MAX_LITERAL_BYTES_V1);
-const _: () = assert!(
-    SEARCH_V26_PRODUCTION_MIN_LITERAL_BYTES_V1 <= SEARCH_V26_MAX_LITERAL_BYTES_V1
-);
+const _: () =
+    assert!(SEARCH_V26_PRODUCTION_MIN_LITERAL_BYTES_V1 <= SEARCH_V26_MAX_LITERAL_BYTES_V1);
 /// Explicit fixed-VL16 SVE2 candidate backend. This never changes the V8
 /// default or grants qualification authority.
 pub const SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1: u16 = 21;
@@ -214,6 +228,10 @@ pub const fn search_backend_literal_width_is_valid_v1(
             live_literal_bytes >= SEARCH_BACKEND_ASIMD_TAG39_MIN_LITERAL_BYTES_V1
                 && live_literal_bytes <= SEARCH_BACKEND_ASIMD_TAG39_MAX_LITERAL_BYTES_V1
         }
+        SEARCH_BACKEND_ASIMD_TAG40_V1 => {
+            live_literal_bytes >= SEARCH_BACKEND_ASIMD_TAG40_MIN_LITERAL_BYTES_V1
+                && live_literal_bytes <= SEARCH_BACKEND_ASIMD_TAG40_MAX_LITERAL_BYTES_V1
+        }
         SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1 => live_literal_bytes == 16,
         _ => {
             live_literal_bytes >= MIN_STATIC_SEARCH_SPAN_LITERAL_BYTES_V1
@@ -229,9 +247,7 @@ pub const fn search_backend_literal_width_is_valid_v1(
 /// this production predicate deliberately refuses them. Returning `true`
 /// still grants no runtime authority.
 #[must_use]
-pub const fn search_v26_production_literal_width_is_valid_v1(
-    live_literal_bytes: u32,
-) -> bool {
+pub const fn search_v26_production_literal_width_is_valid_v1(live_literal_bytes: u32) -> bool {
     live_literal_bytes >= SEARCH_V26_PRODUCTION_MIN_LITERAL_BYTES_V1
         && live_literal_bytes <= SEARCH_V26_MAX_LITERAL_BYTES_V1
 }
@@ -662,6 +678,7 @@ const fn valid_metadata_target_profile(backend: u16, platform: u8, features: u64
             | SEARCH_BACKEND_ASIMD_TAG37_V1
             | SEARCH_BACKEND_ASIMD_TAG38_V1
             | SEARCH_BACKEND_ASIMD_TAG39_V1
+            | SEARCH_BACKEND_ASIMD_TAG40_V1
     ) && (platform == SEARCH_PLATFORM_MACOS_V1 || platform == SEARCH_PLATFORM_LINUX_V1)
         && features == SEARCH_REQUIRED_ASIMD_FEATURES_V1;
     let tag21 = backend == SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1
@@ -689,7 +706,8 @@ const fn valid_expectation_target_profile(
                 | SEARCH_BACKEND_ASIMD_TAG30_V1
                 | SEARCH_BACKEND_ASIMD_TAG37_V1
                 | SEARCH_BACKEND_ASIMD_TAG38_V1
-                | SEARCH_BACKEND_ASIMD_TAG39_V1,
+                | SEARCH_BACKEND_ASIMD_TAG39_V1
+                | SEARCH_BACKEND_ASIMD_TAG40_V1,
             SEARCH_PLATFORM_MACOS_V1,
             SEARCH_REQUIRED_ASIMD_FEATURES_V1,
             SEARCH_EXPORTED_SYMBOL_N_TYPE_V1,
@@ -704,7 +722,8 @@ const fn valid_expectation_target_profile(
                 | SEARCH_BACKEND_ASIMD_TAG30_V1
                 | SEARCH_BACKEND_ASIMD_TAG37_V1
                 | SEARCH_BACKEND_ASIMD_TAG38_V1
-                | SEARCH_BACKEND_ASIMD_TAG39_V1,
+                | SEARCH_BACKEND_ASIMD_TAG39_V1
+                | SEARCH_BACKEND_ASIMD_TAG40_V1,
             SEARCH_PLATFORM_LINUX_V1,
             SEARCH_REQUIRED_ASIMD_FEATURES_V1,
             SEARCH_EXPORTED_SYMBOL_INFO_ELF_FUNCTION_V1,
@@ -1435,6 +1454,11 @@ mod tests {
         assert_eq!(SEARCH_BACKEND_ASIMD_TAG39_MAX_LITERAL_BYTES_V1, 32);
         assert_eq!(SEARCH_BACKEND_ASIMD_TAG39_CANDIDATE_POLICY_VERSION_V1, 16);
         assert_eq!(SEARCH_BACKEND_ASIMD_TAG39_MANIFEST_FILTER_FIELDS_V1, 5);
+        assert_eq!(SEARCH_BACKEND_ASIMD_TAG40_V1, 40);
+        assert_eq!(SEARCH_BACKEND_ASIMD_TAG40_MIN_LITERAL_BYTES_V1, 1);
+        assert_eq!(SEARCH_BACKEND_ASIMD_TAG40_MAX_LITERAL_BYTES_V1, 32);
+        assert_eq!(SEARCH_BACKEND_ASIMD_TAG40_CANDIDATE_POLICY_VERSION_V1, 17);
+        assert_eq!(SEARCH_BACKEND_ASIMD_TAG40_MANIFEST_FILTER_FIELDS_V1, 5);
         assert_eq!(SEARCH_V26_MIN_LITERAL_BYTES_V1, 6);
         assert_eq!(SEARCH_V26_PORTABLE_MAX_LITERAL_BYTES_V1, 8);
         assert_eq!(SEARCH_V26_PRODUCTION_MIN_LITERAL_BYTES_V1, 9);
@@ -1498,6 +1522,10 @@ mod tests {
             ),
             (
                 SEARCH_BACKEND_ASIMD_TAG39_V1,
+                SEARCH_REQUIRED_ASIMD_FEATURES_V1,
+            ),
+            (
+                SEARCH_BACKEND_ASIMD_TAG40_V1,
                 SEARCH_REQUIRED_ASIMD_FEATURES_V1,
             ),
             (
@@ -1750,6 +1778,43 @@ mod tests {
             assert!(
                 inspect_search_metadata_v1(metadata).is_err(),
                 "metadata decoder accepted tag39 width {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn tag40_width_envelope_is_enforced_by_both_neutral_decoders() {
+        for width in [
+            SEARCH_BACKEND_ASIMD_TAG40_MIN_LITERAL_BYTES_V1,
+            SEARCH_BACKEND_ASIMD_TAG40_MAX_LITERAL_BYTES_V1,
+        ] {
+            let expectation = linux_fixture_expectation_with_literal_bytes(
+                SEARCH_BACKEND_ASIMD_TAG40_V1,
+                SEARCH_REQUIRED_ASIMD_FEATURES_V1,
+                width,
+            );
+            let claim = inspect_static_search_span_expectation_v1(&expectation)
+                .expect("inclusive tag40 width boundary");
+            assert_eq!(claim.live_literal_bytes(), width);
+            assert_eq!(claim.metadata().rodata_bytes(), width);
+        }
+        for width in [0, 33] {
+            let expectation = linux_fixture_expectation_with_literal_bytes(
+                SEARCH_BACKEND_ASIMD_TAG40_V1,
+                SEARCH_REQUIRED_ASIMD_FEATURES_V1,
+                width,
+            );
+            assert!(
+                inspect_static_search_span_expectation_v1(&expectation).is_err(),
+                "out-of-envelope tag40 width {width} was accepted"
+            );
+            let metadata = expectation[STATIC_SEARCH_SPAN_EXPECTATION_METADATA_OFFSET_V1
+                ..STATIC_SEARCH_SPAN_EXPECTATION_IDENTITY_OFFSET_V1]
+                .try_into()
+                .expect("fixed metadata bytes");
+            assert!(
+                inspect_search_metadata_v1(metadata).is_err(),
+                "metadata decoder accepted tag40 width {width}"
             );
         }
     }
