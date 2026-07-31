@@ -802,11 +802,11 @@ impl<S: SessionLeafSlot> OperationSessionAttempt<'_, S> {
             ));
         }
         let receipt = self.receipt(Some(value), OperationSessionTerminal::Success);
-        if receipt.closes() {
-            Ok(receipt)
-        } else {
-            Err(OperationSessionAttemptError::ReceiptNotClosed(receipt))
-        }
+        debug_assert!(
+            receipt.closes(),
+            "successful private operation-session construction publishes a closed receipt"
+        );
+        Ok(receipt)
     }
 
     fn fail_with(
