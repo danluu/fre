@@ -1851,8 +1851,13 @@ mod tests {
         match shape {
             0 => (0..width)
                 .map(|index| {
-                    u8::try_from(1 + (index * 37) % 251)
-                        .expect("the generated distinct byte is bounded")
+                    let generated = index
+                        .checked_rem(251)
+                        .and_then(|value| value.checked_mul(37))
+                        .and_then(|value| value.checked_rem(251))
+                        .and_then(|value| value.checked_add(1))
+                        .expect("the generated distinct-byte arithmetic is bounded");
+                    u8::try_from(generated).expect("the generated distinct byte is bounded")
                 })
                 .collect(),
             1 => vec![0xa7; width],
