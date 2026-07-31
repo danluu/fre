@@ -171,6 +171,20 @@ const _: () = assert!(
 const _: () = assert!(SEARCH_V26_MIN_LITERAL_BYTES_V1 <= SEARCH_V26_PORTABLE_MAX_LITERAL_BYTES_V1);
 const _: () =
     assert!(SEARCH_V26_PRODUCTION_MIN_LITERAL_BYTES_V1 <= SEARCH_V26_MAX_LITERAL_BYTES_V1);
+/// Evidence-qualified V27 production-family lower literal bound.
+///
+/// V27 compilation remains topology-total for widths 1..=32. Production
+/// routing deliberately keeps widths 1..=16 portable: the independent Apple
+/// and Neoverse-V3 matrices found the broad, cross-host tail win at widths
+/// 17..=32. This constant grants no runtime authority.
+pub const SEARCH_V27_PRODUCTION_MIN_LITERAL_BYTES_V1: u32 = 17;
+/// Evidence-qualified V27 production-family upper literal bound.
+pub const SEARCH_V27_PRODUCTION_MAX_LITERAL_BYTES_V1: u32 =
+    SEARCH_BACKEND_ASIMD_TAG40_MAX_LITERAL_BYTES_V1;
+
+const _: () = assert!(
+    SEARCH_V27_PRODUCTION_MIN_LITERAL_BYTES_V1 <= SEARCH_V27_PRODUCTION_MAX_LITERAL_BYTES_V1
+);
 /// Explicit fixed-VL16 SVE2 candidate backend. This never changes the V8
 /// default or grants qualification authority.
 pub const SEARCH_BACKEND_SVE2_FIXED16_TAG21_V1: u16 = 21;
@@ -250,6 +264,18 @@ pub const fn search_backend_literal_width_is_valid_v1(
 pub const fn search_v26_production_literal_width_is_valid_v1(live_literal_bytes: u32) -> bool {
     live_literal_bytes >= SEARCH_V26_PRODUCTION_MIN_LITERAL_BYTES_V1
         && live_literal_bytes <= SEARCH_V26_MAX_LITERAL_BYTES_V1
+}
+
+/// Return whether the evidence-qualified V27 production family owns a literal
+/// width.
+///
+/// The topology-total tag40 compiler accepts widths 1..=32, but this
+/// production predicate deliberately retains the shorter half on the portable
+/// route. Returning `true` still grants no runtime authority.
+#[must_use]
+pub const fn search_v27_production_literal_width_is_valid_v1(live_literal_bytes: u32) -> bool {
+    live_literal_bytes >= SEARCH_V27_PRODUCTION_MIN_LITERAL_BYTES_V1
+        && live_literal_bytes <= SEARCH_V27_PRODUCTION_MAX_LITERAL_BYTES_V1
 }
 
 /// Source-first Search compiler version admitted by the expectation.
@@ -1463,6 +1489,8 @@ mod tests {
         assert_eq!(SEARCH_V26_PORTABLE_MAX_LITERAL_BYTES_V1, 8);
         assert_eq!(SEARCH_V26_PRODUCTION_MIN_LITERAL_BYTES_V1, 9);
         assert_eq!(SEARCH_V26_MAX_LITERAL_BYTES_V1, 32);
+        assert_eq!(SEARCH_V27_PRODUCTION_MIN_LITERAL_BYTES_V1, 17);
+        assert_eq!(SEARCH_V27_PRODUCTION_MAX_LITERAL_BYTES_V1, 32);
         assert_eq!(SEARCH_SPAN_OUTPUT_KIND_V1, 3);
         assert_eq!(SEARCH_REQUIRED_ASIMD_FEATURES_V1, 1);
         assert_eq!(MIN_STATIC_SEARCH_SPAN_LITERAL_BYTES_V1, 1);
@@ -1602,6 +1630,16 @@ mod tests {
             SEARCH_V26_PORTABLE_MAX_LITERAL_BYTES_V1 + 1,
             SEARCH_V26_PRODUCTION_MIN_LITERAL_BYTES_V1
         );
+    }
+
+    #[test]
+    fn v27_production_width_policy_excludes_the_shorter_half() {
+        for bytes in 0..=40 {
+            assert_eq!(
+                search_v27_production_literal_width_is_valid_v1(bytes),
+                (17..=32).contains(&bytes)
+            );
+        }
     }
 
     #[test]

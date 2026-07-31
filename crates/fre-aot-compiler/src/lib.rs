@@ -71,6 +71,7 @@ mod search_v26_output;
 mod search_v26_production;
 mod search_v26_static_abi;
 mod search_v27_output;
+mod search_v27_production;
 mod search_v27_static_abi;
 mod static_expectation;
 mod static_expectation_v2;
@@ -259,6 +260,11 @@ pub use search_v27_output::{
     build_linux_aarch64_search_v27_selected_end_object_v1,
     build_macos_aarch64_search_v27_exists_object_v1,
     build_macos_aarch64_search_v27_selected_end_object_v1,
+};
+pub use search_v27_production::{
+    LinuxAarch64SearchV27ProductionSourceV1, MacosAarch64SearchV27ProductionSourceV1,
+    SearchV27ProductionSourceErrorV1, build_linux_aarch64_search_v27_production_source_v1,
+    build_macos_aarch64_search_v27_production_source_v1,
 };
 pub use search_v27_static_abi::{
     HARD_MAX_SEARCH_V27_STATIC_GLUE_OBJECT_BYTES_V1, SEARCH_V27_STATIC_ELF_RELOCATION_V1,

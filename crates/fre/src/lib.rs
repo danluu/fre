@@ -22,9 +22,11 @@
 //! all-features build remains portable. It does not change JIT `CURRENT`,
 //! ordinary [`PortableRegex`] behavior, or any default feature.
 //! The default-off `compiled-search-v27-aot` facade extends this fail-closed
-//! bind-once surface to topology-total tag40 exact literals of width 1..=32.
-//! A linked object and Cargo feature still cannot create production authority;
-//! absent or mismatched source authority is cached as a portable route.
+//! bind-once surface to topology-total tag40 exact literals. Its
+//! evidence-qualified production envelope is width 17..=32; shorter literals
+//! remain portable. A linked object and Cargo feature still cannot create
+//! production authority; absent or mismatched source authority is cached as a
+//! portable route.
 //! The separate default-off `explicit-count-v3-aot` feature binds an
 //! already-adopted optimizing Count-v3 handle only to the live fixed-policy
 //! exact-literal Count owner whose literal, semantic identity, and planning

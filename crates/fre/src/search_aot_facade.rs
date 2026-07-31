@@ -21,11 +21,10 @@ use core::fmt;
 #[cfg(feature = "compiled-search-v25-aot")]
 use fre_aot_search_contract::SEARCH_BACKEND_ASIMD_TAG38_V1;
 #[cfg(feature = "compiled-search-v27-aot")]
-use fre_aot_search_contract::SEARCH_BACKEND_ASIMD_TAG40_V1;
-#[cfg(any(
-    feature = "compiled-search-v25-aot",
-    feature = "compiled-search-v27-aot"
-))]
+use fre_aot_search_contract::{
+    SEARCH_BACKEND_ASIMD_TAG40_V1, search_v27_production_literal_width_is_valid_v1,
+};
+#[cfg(feature = "compiled-search-v25-aot")]
 use fre_aot_search_contract::search_backend_literal_width_is_valid_v1;
 #[cfg(feature = "compiled-search-v26-aot")]
 use fre_aot_search_contract::{
@@ -1106,7 +1105,8 @@ pub enum SearchExactLiteralCompiledAotV27Fallback {
     /// The portable owner is not an exact literal under the fixed default
     /// construction policy. The supplied glue entry was not called.
     PortableOwnerIneligible,
-    /// The exact literal is outside tag40's immutable 1..=32-byte envelope.
+    /// The exact literal is outside the evidence-qualified 17..=32-byte
+    /// production envelope.
     /// The supplied glue entry was not called.
     LiteralWidthOutsideBackendEnvelope { bytes: usize },
     /// Production glue could not resolve one source-authorized handle.
@@ -1173,10 +1173,11 @@ impl From<StaticSearchSpanCallErrorV1> for SearchExactLiteralCompiledAotV27Error
 /// source object.
 ///
 /// This type is available only through the default-off
-/// `compiled-search-v27-aot` feature. It admits every nonempty exact literal
-/// through 32 bytes before invoking the source-specific production adopter at
-/// most once. Missing authority, an unqualified selector, a backend mismatch,
-/// or any semantic-binding refusal is cached as a portable route.
+/// `compiled-search-v27-aot` feature. It invokes the source-specific
+/// production adopter at most once for exact literals in the
+/// evidence-qualified 17..=32-byte envelope. Shorter and wider literals,
+/// missing authority, an unqualified selector, a backend mismatch, or any
+/// semantic-binding refusal are cached as a portable route.
 ///
 /// The adopter resolves only the static runtime's source-reviewed production
 /// registry. The feature and linked object cannot create a family row or
@@ -1202,8 +1203,8 @@ impl fmt::Debug for SearchExactLiteralCompiledAotV27 {
 impl SearchExactLiteralCompiledAotV27 {
     /// Bind one generated source-specific tag40 production glue entry once.
     ///
-    /// `invoke_glue` is not called for a non-exact, non-default-policy, empty,
-    /// or wider-than-32-byte portable owner. All adopter and binding refusals
+    /// `invoke_glue` is not called for a non-exact, non-default-policy, or
+    /// outside-17..=32-byte portable owner. All adopter and binding refusals
     /// produce a usable portable facade.
     #[must_use]
     pub fn bind_once(
@@ -1344,9 +1345,7 @@ const fn v27_fallback_reason(
 
 #[cfg(feature = "compiled-search-v27-aot")]
 fn v27_literal_width_is_valid(bytes: usize) -> bool {
-    u32::try_from(bytes).is_ok_and(|bytes| {
-        search_backend_literal_width_is_valid_v1(SEARCH_BACKEND_ASIMD_TAG40_V1, bytes)
-    })
+    u32::try_from(bytes).is_ok_and(search_v27_production_literal_width_is_valid_v1)
 }
 
 /// Same-thread invocation token for a bound static Search-v1 Span handle.
@@ -1755,37 +1754,40 @@ mod tests {
 
     #[cfg(feature = "compiled-search-v27-aot")]
     #[test]
-    fn compiled_v27_refuses_only_outside_widths_before_glue() {
-        let source = "abcdefghijklmnopqrstuvwxyz1234567";
-        let glue_called = Cell::new(false);
-        let compiled = SearchExactLiteralCompiledAotV27::bind_once(
-            PortableBuilder::new(source).build().unwrap(),
-            |_| {
-                glue_called.set(true);
-                unreachable!("an out-of-envelope literal must not invoke tag40 glue")
-            },
-        );
+    fn compiled_v27_refuses_outside_production_widths_before_glue() {
+        for source in [
+            "abcdefghijklmnop",
+            "abcdefghijklmnopqrstuvwxyz1234567",
+        ] {
+            let glue_called = Cell::new(false);
+            let compiled = SearchExactLiteralCompiledAotV27::bind_once(
+                PortableBuilder::new(source).build().unwrap(),
+                |_| {
+                    glue_called.set(true);
+                    unreachable!("an out-of-envelope literal must not invoke tag40 glue")
+                },
+            );
 
-        assert!(!glue_called.get());
-        assert_eq!(
-            compiled.fallback_reason(),
-            Some(
-                SearchExactLiteralCompiledAotV27Fallback::LiteralWidthOutsideBackendEnvelope {
-                    bytes: source.len(),
-                }
-            )
-        );
+            assert!(!glue_called.get());
+            assert_eq!(
+                compiled.fallback_reason(),
+                Some(
+                    SearchExactLiteralCompiledAotV27Fallback::LiteralWidthOutsideBackendEnvelope {
+                        bytes: source.len(),
+                    }
+                )
+            );
+        }
     }
 
     #[cfg(feature = "compiled-search-v27-aot")]
     #[test]
     fn compiled_v27_all_topologies_call_glue_once_then_cache_portable_without_authority() {
         for source in [
-            "x",
-            "aaaaaaaaa",
-            "ababababa",
-            "phase-unique-17!",
-            "topology-total-width-thirty-two!",
+            "aaaaaaaaaaaaaaaaa",
+            "abcabcabcabcabcabc",
+            "abcdefghijklmnopq",
+            "abcdefghijklmnopqrstuvwxyz012345",
         ] {
             let glue_calls = Cell::new(0_u32);
             let compiled = SearchExactLiteralCompiledAotV27::bind_once(
