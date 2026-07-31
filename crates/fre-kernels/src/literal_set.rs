@@ -4,8 +4,13 @@ use core::fmt;
 use core::mem;
 
 use aho_corasick::{AhoCorasick, AhoCorasickKind, Input, MatchKind};
+use fre_exact_alloc::try_box_preserve;
 
 use crate::Window;
+use crate::folded_literal_trie::{
+    AdaptiveFindOutcome, FoldedLiteralTriePlan, ScanAttemptError as FoldedScanAttemptError,
+    ScanError as FoldedScanError, ScanUpperBounds as FoldedScanUpperBounds,
+};
 
 const ALPHABET_LEN: usize = 256;
 const BYTES_PER_DFA_CELL_ENVELOPE: usize = 16;
@@ -67,14 +72,18 @@ pub struct LiteralSetBuildAccounting {
     pub build_work_upper_bound: usize,
     /// Conservative pinned-implementation peak-build byte envelope.
     pub build_bytes_upper_bound: usize,
-    /// Persistent bytes reported by the completed automaton.
+    /// Exact persistent bytes for the automaton and any attached accelerator.
     pub persistent_bytes: usize,
 }
 
 /// Hard limits for one finite-literal search.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LiteralSetSearchLimits {
-    /// Maximum DFA input transitions, including the initial transition.
+    /// Maximum incumbent DFA transitions or combined adaptive work units.
+    ///
+    /// The incumbent charge includes its initial transition. An attached
+    /// accelerator instead charges prefix transitions, exact trie work and
+    /// any dense-fallback transitions under the same caller-selected cap.
     pub max_transitions: usize,
 }
 
@@ -101,7 +110,7 @@ impl Default for LiteralSetSearchLimits {
 pub struct LiteralSetAccounting {
     /// Bytes in the searched window.
     pub searched_bytes: usize,
-    /// Maximum DFA transitions for the call, including initialization.
+    /// Incumbent DFA-transition bound or completed combined adaptive work.
     pub transitions_upper_bound: usize,
     /// External heap scratch required by the immutable search API.
     pub scratch_bytes: usize,
@@ -221,6 +230,20 @@ impl std::error::Error for LiteralSetError {}
 pub struct LiteralSetPlan {
     automaton: AhoCorasick,
     build: LiteralSetBuildAccounting,
+    folded_long_tail: Option<Box<FoldedLongTail>>,
+}
+
+#[derive(Clone, Debug)]
+struct FoldedLongTail {
+    trie: FoldedLiteralTriePlan,
+    max_pattern_bytes: usize,
+    dfa_prefix_bytes: usize,
+}
+
+#[derive(Clone, Copy)]
+struct FoldedLongProspective {
+    work: usize,
+    trie: FoldedScanUpperBounds,
 }
 
 /// Borrowed iterator over non-overlapping finite-literal matches.
@@ -313,13 +336,68 @@ impl LiteralSetPlan {
                 limit: limits.max_persistent_bytes,
             });
         }
-        Ok(Self { automaton, build })
+        Ok(Self {
+            automaton,
+            build,
+            folded_long_tail: None,
+        })
     }
 
     /// Construction certificate and actual persistent footprint.
     #[must_use]
     pub const fn build_accounting(&self) -> LiteralSetBuildAccounting {
         self.build
+    }
+
+    /// Additional owner bytes beyond the trie owner already in its receipt.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn folded_long_tail_additional_owner_bytes() -> usize {
+        mem::size_of::<FoldedLongTail>().saturating_sub(mem::size_of::<FoldedLiteralTriePlan>())
+    }
+
+    /// Fallibly attach a source-derived folded accelerator to this ordered
+    /// literal set. Refusal leaves the incumbent byte matcher unchanged.
+    #[doc(hidden)]
+    #[cold]
+    #[inline(never)]
+    pub fn try_attach_folded_long_tail(
+        &mut self,
+        trie: FoldedLiteralTriePlan,
+        max_pattern_bytes: usize,
+        max_persistent_bytes: usize,
+    ) -> Result<bool, LiteralSetError> {
+        if self.build.match_semantics != LiteralSetMatchSemantics::LeftmostFirst
+            || self.folded_long_tail.is_some()
+            || max_pattern_bytes == 0
+        {
+            return Err(LiteralSetError::AutomatonBuild {
+                detail: "invalid folded long-tail attachment".to_owned(),
+            });
+        }
+        let dfa_prefix_bytes = ALPHABET_LEN.max(max_pattern_bytes);
+        let retained_bytes = trie
+            .build_accounting()
+            .persistent_bytes
+            .checked_add(Self::folded_long_tail_additional_owner_bytes())
+            .and_then(|tail| self.build.persistent_bytes.checked_add(tail))
+            .ok_or(LiteralSetError::ArithmeticOverflow {
+                computation: "folded literal-set persistent bytes",
+            })?;
+        if retained_bytes > max_persistent_bytes {
+            return Ok(false);
+        }
+        let tail = FoldedLongTail {
+            trie,
+            max_pattern_bytes,
+            dfa_prefix_bytes,
+        };
+        let Ok(tail) = try_box_preserve(tail) else {
+            return Ok(false);
+        };
+        self.folded_long_tail = Some(tail);
+        self.build.persistent_bytes = retained_bytes;
+        Ok(true)
     }
 
     /// Find one match under the construction-selected semantics in a complete
@@ -428,6 +506,11 @@ impl LiteralSetPlan {
         limits: LiteralSetSearchLimits,
     ) -> Result<(Option<(usize, usize)>, LiteralSetAccounting), LiteralSetError> {
         let accounting = search_accounting(window, haystack.len(), limits)?;
+        if let Some(tail) = self.folded_long_tail.as_deref()
+            && accounting.searched_bytes > tail.dfa_prefix_bytes
+        {
+            return self.find_window_folded_long(haystack, window, limits, accounting, tail);
+        }
         let matched = self
             .automaton
             .find(&haystack[window.start()..window.end()])
@@ -446,6 +529,194 @@ impl LiteralSetPlan {
             })
             .transpose()?;
         Ok((matched, accounting))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn find_window_folded_long(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: LiteralSetSearchLimits,
+        incumbent_accounting: LiteralSetAccounting,
+        tail: &FoldedLongTail,
+    ) -> Result<(Option<(usize, usize)>, LiteralSetAccounting), LiteralSetError> {
+        let Some(prospective) = folded_long_prospective(tail, window, limits.max_transitions)
+        else {
+            return self.find_window_incumbent(haystack, window, incumbent_accounting);
+        };
+        let prefix_end = window.start().checked_add(tail.dfa_prefix_bytes).ok_or(
+            LiteralSetError::ArithmeticOverflow {
+                computation: "folded literal-set DFA prefix end",
+            },
+        )?;
+        let prefix_window = Window::new(window.start(), prefix_end);
+        let prefix_match = self
+            .automaton
+            .find(&haystack[prefix_window.start()..prefix_window.end()]);
+        let trie_start = prefix_end
+            .checked_sub(tail.max_pattern_bytes)
+            .and_then(|start| start.checked_add(1))
+            .ok_or(LiteralSetError::ArithmeticOverflow {
+                computation: "folded literal-set trie continuation",
+            })?;
+        if let Some(matched) = prefix_match {
+            let matched = absolute_match(prefix_window.start(), matched)?;
+            if matched.0 < trie_start {
+                return Ok((Some(matched), incumbent_accounting));
+            }
+        }
+        let adaptive = tail
+            .trie
+            .find_window_adaptive_precharged(
+                haystack,
+                Window::new(trie_start, window.end()),
+                prospective.trie,
+            )
+            .map_err(|error| map_folded_scan_error(&error))?;
+        let prefix_transitions =
+            tail.dfa_prefix_bytes
+                .checked_add(1)
+                .ok_or(LiteralSetError::ArithmeticOverflow {
+                    computation: "folded literal-set DFA prefix transitions",
+                })?;
+        let adaptive_work = adaptive.receipt.actual.work;
+        let partial_work = prefix_transitions.checked_add(adaptive_work).ok_or(
+            LiteralSetError::ArithmeticOverflow {
+                computation: "folded literal-set adaptive work",
+            },
+        )?;
+        match adaptive.outcome {
+            AdaptiveFindOutcome::Match(candidate) => {
+                let accounting =
+                    folded_long_accounting(incumbent_accounting, partial_work, prospective.work)?;
+                Ok((Some((candidate.start(), candidate.end())), accounting))
+            }
+            AdaptiveFindOutcome::NoMatch => {
+                let accounting =
+                    folded_long_accounting(incumbent_accounting, partial_work, prospective.work)?;
+                Ok((None, accounting))
+            }
+            AdaptiveFindOutcome::DenseFallback { resume_start } => {
+                let fallback_window = Window::new(resume_start, window.end());
+                let fallback_accounting =
+                    search_accounting(fallback_window, haystack.len(), limits)?;
+                let matched = self
+                    .automaton
+                    .find(&haystack[fallback_window.start()..fallback_window.end()])
+                    .map(|matched| absolute_match(fallback_window.start(), matched))
+                    .transpose()?;
+                let total_work = partial_work
+                    .checked_add(fallback_accounting.transitions_upper_bound)
+                    .ok_or(LiteralSetError::ArithmeticOverflow {
+                        computation: "folded literal-set fallback work",
+                    })?;
+                let accounting =
+                    folded_long_accounting(incumbent_accounting, total_work, prospective.work)?;
+                Ok((matched, accounting))
+            }
+        }
+    }
+
+    fn find_window_incumbent(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        accounting: LiteralSetAccounting,
+    ) -> Result<(Option<(usize, usize)>, LiteralSetAccounting), LiteralSetError> {
+        let matched = self
+            .automaton
+            .find(&haystack[window.start()..window.end()])
+            .map(|matched| absolute_match(window.start(), matched))
+            .transpose()?;
+        Ok((matched, accounting))
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn folded_long_prospective(
+    tail: &FoldedLongTail,
+    window: Window,
+    max_work: usize,
+) -> Option<FoldedLongProspective> {
+    let input_bytes = window.end().saturating_sub(window.start());
+    if tail.max_pattern_bytes == 0
+        || tail.max_pattern_bytes > tail.dfa_prefix_bytes
+        || input_bytes <= tail.dfa_prefix_bytes
+    {
+        return None;
+    }
+    let trie_relative_start = tail
+        .dfa_prefix_bytes
+        .checked_sub(tail.max_pattern_bytes)?
+        .checked_add(1)?;
+    let trie_input_bytes = input_bytes.checked_sub(trie_relative_start)?;
+    let trie = tail.trie.scan_upper_bounds(trie_input_bytes).ok()?;
+    let work = tail
+        .dfa_prefix_bytes
+        .checked_add(1)?
+        .checked_add(trie.work)?
+        .checked_add(trie_input_bytes)?
+        .checked_add(1)?;
+    (work <= max_work).then_some(FoldedLongProspective { work, trie })
+}
+
+fn folded_long_accounting(
+    incumbent: LiteralSetAccounting,
+    actual_work: usize,
+    prospective_work: usize,
+) -> Result<LiteralSetAccounting, LiteralSetError> {
+    if actual_work > prospective_work {
+        return Err(LiteralSetError::AutomatonBuild {
+            detail: "folded literal-set actual work exceeded its precharged prospective".to_owned(),
+        });
+    }
+    Ok(LiteralSetAccounting {
+        searched_bytes: incumbent.searched_bytes,
+        transitions_upper_bound: actual_work,
+        scratch_bytes: incumbent.scratch_bytes,
+    })
+}
+
+fn absolute_match(
+    base: usize,
+    matched: aho_corasick::Match,
+) -> Result<(usize, usize), LiteralSetError> {
+    let start = base
+        .checked_add(matched.start())
+        .ok_or(LiteralSetError::ArithmeticOverflow {
+            computation: "literal-set match start",
+        })?;
+    let end = base
+        .checked_add(matched.end())
+        .ok_or(LiteralSetError::ArithmeticOverflow {
+            computation: "literal-set match end",
+        })?;
+    Ok((start, end))
+}
+
+#[cold]
+#[inline(never)]
+fn map_folded_scan_error(error: &FoldedScanAttemptError) -> LiteralSetError {
+    match &error.source {
+        FoldedScanError::InvalidWindow {
+            start,
+            end,
+            haystack_len,
+        } => LiteralSetError::InvalidWindow {
+            start: *start,
+            end: *end,
+            haystack_len: *haystack_len,
+        },
+        FoldedScanError::ArithmeticOverflow { computation } => {
+            LiteralSetError::ArithmeticOverflow { computation }
+        }
+        FoldedScanError::Resource { .. } | FoldedScanError::Invariant { .. } => {
+            LiteralSetError::AutomatonBuild {
+                detail: "folded literal-set search invariant failed".to_owned(),
+            }
+        }
     }
 }
 
@@ -606,6 +877,203 @@ fn checked_mul(
 ) -> Result<usize, LiteralSetError> {
     left.checked_mul(right)
         .ok_or(LiteralSetError::ArithmeticOverflow { computation })
+}
+
+#[cfg(test)]
+mod folded_long_tail_tests {
+    use crate::folded_literal_trie::{
+        BuildAttempt, BuildLimits, FoldedLiteral, FoldedLiteralTriePlan, FoldedScalarClass,
+    };
+
+    use super::{
+        LiteralSetBuildLimits, LiteralSetPlan, LiteralSetSearchLimits, Window,
+        folded_long_prospective,
+    };
+
+    fn patterns() -> [&'static [u8]; 3] {
+        [b"Ka", b"ka", "\u{212A}a".as_bytes()]
+    }
+
+    fn folded_trie() -> FoldedLiteralTriePlan {
+        let root = FoldedScalarClass::new(&['K', 'k', '\u{212A}']);
+        let suffix = FoldedScalarClass::new(&['a']);
+        let classes = [root, suffix];
+        let literals = [FoldedLiteral::new(&classes)];
+        match FoldedLiteralTriePlan::build(&literals, BuildLimits::default()).unwrap() {
+            BuildAttempt::Admitted(plan) => plan,
+            BuildAttempt::DenseFallback(fallback) => {
+                panic!("synthetic folded trie declined: {fallback:?}")
+            }
+        }
+    }
+
+    fn plans() -> (LiteralSetPlan, LiteralSetPlan) {
+        let patterns = patterns();
+        let incumbent = LiteralSetPlan::new(&patterns, LiteralSetBuildLimits::default()).unwrap();
+        let mut accelerated =
+            LiteralSetPlan::new(&patterns, LiteralSetBuildLimits::default()).unwrap();
+        assert!(
+            accelerated
+                .try_attach_folded_long_tail(folded_trie(), 4, usize::MAX)
+                .unwrap()
+        );
+        (incumbent, accelerated)
+    }
+
+    #[test]
+    fn ordinary_and_short_literal_sets_retain_incumbent_path_and_accounting() {
+        let patterns = patterns();
+        let ordinary = LiteralSetPlan::new(&patterns, LiteralSetBuildLimits::default()).unwrap();
+        assert!(ordinary.folded_long_tail.is_none());
+
+        let (incumbent, accelerated) = plans();
+        let cutover = accelerated
+            .folded_long_tail
+            .as_deref()
+            .unwrap()
+            .dfa_prefix_bytes;
+        let mut haystack = vec![b'z'; cutover];
+        haystack[cutover - 2..].copy_from_slice(b"ka");
+        let expected = incumbent
+            .find(&haystack, LiteralSetSearchLimits::unlimited())
+            .unwrap();
+        let actual = accelerated
+            .find(&haystack, LiteralSetSearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(actual.1.transitions_upper_bound, haystack.len() + 1);
+    }
+
+    #[test]
+    fn folded_envelope_refusal_runs_the_incumbent_instead_of_erroring() {
+        let (incumbent, accelerated) = plans();
+        let mut haystack = vec![b'z'; 320];
+        haystack[318..].copy_from_slice(b"Ka");
+        let limits = LiteralSetSearchLimits {
+            max_transitions: haystack.len() + 1,
+        };
+        let expected = incumbent.find(&haystack, limits).unwrap();
+        let actual = accelerated.find(&haystack, limits).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn folded_long_path_matches_incumbent_across_sparse_and_dense_sources() {
+        let (incumbent, accelerated) = plans();
+        for mut haystack in [vec![b'z'; 640], vec![b'K'; 640]] {
+            haystack.extend_from_slice(b"ka");
+            let expected = incumbent
+                .find(&haystack, LiteralSetSearchLimits::unlimited())
+                .unwrap()
+                .0;
+            let (actual, accounting) = accelerated
+                .find(&haystack, LiteralSetSearchLimits::unlimited())
+                .unwrap();
+            assert_eq!(actual, expected);
+            let tail = accelerated.folded_long_tail.as_deref().unwrap();
+            let prospective =
+                folded_long_prospective(tail, Window::full(&haystack), usize::MAX).unwrap();
+            assert!(accounting.transitions_upper_bound <= prospective.work);
+        }
+    }
+
+    #[test]
+    fn prefix_overlap_preserves_earlier_start_and_source_priority() {
+        let k = ['K'];
+        let a = ['a'];
+
+        let crossing_long = [
+            FoldedScalarClass::new(&k),
+            FoldedScalarClass::new(&k),
+            FoldedScalarClass::new(&a),
+            FoldedScalarClass::new(&a),
+            FoldedScalarClass::new(&a),
+            FoldedScalarClass::new(&a),
+            FoldedScalarClass::new(&a),
+            FoldedScalarClass::new(&a),
+        ];
+        let crossing_short = [FoldedScalarClass::new(&k), FoldedScalarClass::new(&a)];
+        let crossing_literals = [
+            FoldedLiteral::new(&crossing_long),
+            FoldedLiteral::new(&crossing_short),
+        ];
+        let crossing_trie =
+            match FoldedLiteralTriePlan::build(&crossing_literals, BuildLimits::default()).unwrap()
+            {
+                BuildAttempt::Admitted(plan) => plan,
+                BuildAttempt::DenseFallback(fallback) => {
+                    panic!("synthetic crossing trie declined: {fallback:?}")
+                }
+            };
+        let crossing_patterns: [&[u8]; 2] = [b"KKaaaaaa", b"Ka"];
+        let crossing_incumbent =
+            LiteralSetPlan::new(&crossing_patterns, LiteralSetBuildLimits::default()).unwrap();
+        let mut crossing_accelerated = crossing_incumbent.clone();
+        assert!(
+            crossing_accelerated
+                .try_attach_folded_long_tail(crossing_trie, 8, usize::MAX)
+                .unwrap()
+        );
+        let mut crossing_haystack = vec![b'z'; 253];
+        crossing_haystack.extend_from_slice(b"KKaaaaaa");
+        assert_eq!(
+            crossing_accelerated
+                .find(&crossing_haystack, LiteralSetSearchLimits::unlimited())
+                .unwrap()
+                .0,
+            crossing_incumbent
+                .find(&crossing_haystack, LiteralSetSearchLimits::unlimited())
+                .unwrap()
+                .0
+        );
+
+        let preferred_long = [
+            FoldedScalarClass::new(&k),
+            FoldedScalarClass::new(&a),
+            FoldedScalarClass::new(&a),
+            FoldedScalarClass::new(&a),
+            FoldedScalarClass::new(&a),
+            FoldedScalarClass::new(&a),
+            FoldedScalarClass::new(&a),
+        ];
+        let preferred_short = [FoldedScalarClass::new(&k), FoldedScalarClass::new(&a)];
+        let preferred_literals = [
+            FoldedLiteral::new(&preferred_long),
+            FoldedLiteral::new(&preferred_short),
+        ];
+        let preferred_trie = match FoldedLiteralTriePlan::build(
+            &preferred_literals,
+            BuildLimits::default(),
+        )
+        .unwrap()
+        {
+            BuildAttempt::Admitted(plan) => plan,
+            BuildAttempt::DenseFallback(fallback) => {
+                panic!("synthetic preference trie declined: {fallback:?}")
+            }
+        };
+        let preferred_patterns: [&[u8]; 2] = [b"Kaaaaaa", b"Ka"];
+        let preferred_incumbent =
+            LiteralSetPlan::new(&preferred_patterns, LiteralSetBuildLimits::default()).unwrap();
+        let mut preferred_accelerated = preferred_incumbent.clone();
+        assert!(
+            preferred_accelerated
+                .try_attach_folded_long_tail(preferred_trie, 7, usize::MAX)
+                .unwrap()
+        );
+        let mut preferred_haystack = vec![b'z'; 254];
+        preferred_haystack.extend_from_slice(b"Kaaaaaa");
+        assert_eq!(
+            preferred_accelerated
+                .find(&preferred_haystack, LiteralSetSearchLimits::unlimited())
+                .unwrap()
+                .0,
+            preferred_incumbent
+                .find(&preferred_haystack, LiteralSetSearchLimits::unlimited())
+                .unwrap()
+                .0
+        );
+    }
 }
 
 #[cfg(test)]

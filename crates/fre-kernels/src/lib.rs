@@ -396,6 +396,7 @@ pub use ordered_literal_aggregate::{
     SpanSumResult as OrderedLiteralSpanSumResult,
 };
 pub use packed_literal_set::{
+    CERTIFIED_MAX_PATTERNS as PACKED_LITERAL_SET_CERTIFIED_MAX_PATTERNS,
     PackedLiteralSetAccounting, PackedLiteralSetBuildAccounting, PackedLiteralSetBuildLimits,
     PackedLiteralSetError, PackedLiteralSetPlan, PackedLiteralSetSearchLimits,
 };

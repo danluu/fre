@@ -555,7 +555,8 @@ use fre_kernels::{
     ForwardAnchoredSearchAccounting, ForwardAnchoredSearchError, ForwardAnchoredSearchLimits,
     LiteralAccounting, LiteralBuildLimits, LiteralClassRunLiteralPlan, LiteralClassRunSearchPlan,
     LiteralError, LiteralPlan, LiteralSearchLimits, LiteralSetAccounting, LiteralSetBuildLimits,
-    LiteralSetError, LiteralSetPlan, LiteralSetSearchLimits, PackedLiteralSetAccounting,
+    LiteralSetError, LiteralSetPlan, LiteralSetSearchLimits,
+    PACKED_LITERAL_SET_CERTIFIED_MAX_PATTERNS, PackedLiteralSetAccounting,
     PackedLiteralSetBuildLimits, PackedLiteralSetError, PackedLiteralSetPlan,
     PackedLiteralSetSearchLimits, RequiredLiteralBuildAccounting, RequiredLiteralBuildError,
     RequiredLiteralBuildLimits, RequiredLiteralPlan, RequiredLiteralSearchAccounting,
@@ -1117,6 +1118,134 @@ fn map_unicode_folded_literal_build_error(error: UnicodeFoldedLiteralBuildError)
     }
 }
 
+fn charge_unicode_folded_planner_work(
+    incumbent: u64,
+    completed: usize,
+    limit: u64,
+) -> Result<u64, BuildError> {
+    let folded = u64::try_from(completed).map_err(|_| {
+        BuildError::InternalInvariant("folded-literal planner work does not fit u64")
+    })?;
+    let needed = incumbent
+        .checked_add(folded)
+        .ok_or(BuildError::InternalInvariant(
+            "cumulative folded-literal planner work overflowed u64",
+        ))?;
+    if needed > limit {
+        return Err(BuildError::PlannerWorkLimit { needed, limit });
+    }
+    Ok(needed)
+}
+
+fn folded_tail_planner_work_upper_bound(
+    hir_nodes: u64,
+    literal_set: &LiteralSetPlan,
+) -> Option<u64> {
+    let finite = literal_set.build_accounting();
+    let pattern_bytes = u64::try_from(finite.pattern_bytes).ok()?;
+    let patterns = u64::try_from(finite.patterns).ok()?;
+    // Exhaustive finite extraction preserves every expansion and duplicate.
+    // Its aggregate bytes bound both folded scalar positions and equivalent
+    // scalar memberships, while its word count bounds source alternatives.
+    // Folded inspection plus materialization costs at most 2H + S + 2E + 2P.
+    hir_nodes
+        .checked_mul(2)?
+        .checked_add(pattern_bytes.checked_mul(3)?)?
+        .checked_add(patterns.checked_mul(2)?)
+}
+
+#[cold]
+#[inline(never)]
+fn try_attach_unicode_folded_long_tail(
+    literal_set: &mut LiteralSetPlan,
+    words: &[Vec<u8>],
+    parsed_hir: (&Hir, u64),
+    profile: &RustProfile,
+    limits: &BuildLimits,
+    retained_facade_bytes: usize,
+    incumbent_planner_work: u64,
+) -> Result<u64, BuildError> {
+    let (hir, hir_nodes) = parsed_hir;
+    let available_plan_bytes = limits
+        .max_persistent_bytes
+        .saturating_sub(retained_facade_bytes);
+    let dfa_bytes = literal_set.build_accounting().persistent_bytes;
+    let Some(available_trie_bytes) =
+        available_plan_bytes
+            .checked_sub(dfa_bytes)
+            .and_then(|bytes| {
+                bytes.checked_sub(LiteralSetPlan::folded_long_tail_additional_owner_bytes())
+            })
+    else {
+        return Ok(incumbent_planner_work);
+    };
+    let remaining_planner_work = limits
+        .max_planner_work
+        .checked_sub(incumbent_planner_work)
+        .ok_or(BuildError::InternalInvariant(
+            "incumbent planner work exceeded its enforced limit",
+        ))?;
+    let Some(folded_planner_work_upper_bound) =
+        folded_tail_planner_work_upper_bound(hir_nodes, literal_set)
+    else {
+        return Ok(incumbent_planner_work);
+    };
+    if folded_planner_work_upper_bound > remaining_planner_work {
+        return Ok(incumbent_planner_work);
+    }
+    let planner_limit = usize::try_from(remaining_planner_work).unwrap_or(usize::MAX);
+    let mut folded_limits = UnicodeFoldedLiteralBuildLimits::default();
+    folded_limits.max_planner_work = folded_limits.max_planner_work.min(planner_limit);
+    folded_limits.trie.max_work = folded_limits.trie.max_work.min(planner_limit);
+    folded_limits.trie.max_persistent_bytes = folded_limits
+        .trie
+        .max_persistent_bytes
+        .min(available_trie_bytes);
+    folded_limits.trie.max_peak_bytes = folded_limits.trie.max_peak_bytes.min(available_trie_bytes);
+
+    let attempt = unicode_folded_literal::build_search_plan(
+        SimdDispatchContext::capture(),
+        hir,
+        profile,
+        folded_limits,
+    );
+    let (plan, folded_planner) = match attempt {
+        Ok(UnicodeFoldedLiteralBuildAttempt::Admitted(plan)) => {
+            let work = plan.build_accounting().planner.work;
+            (Some(plan), work)
+        }
+        Ok(UnicodeFoldedLiteralBuildAttempt::Ineligible { planner, .. }) => (None, planner.work),
+        Err(attempt_error) => {
+            let (error, completed_planner) = attempt_error.into_parts();
+            if !unicode_folded_literal_resource_refusal(&error) {
+                return Err(map_unicode_folded_literal_build_error(error));
+            }
+            (None, completed_planner)
+        }
+    };
+    let planner_work = charge_unicode_folded_planner_work(
+        incumbent_planner_work,
+        folded_planner,
+        limits.max_planner_work,
+    )?;
+    if let Some(plan) = plan {
+        let max_pattern_bytes =
+            words
+                .iter()
+                .map(Vec::len)
+                .max()
+                .ok_or(BuildError::InternalInvariant(
+                    "nonempty folded finite language lost every pattern",
+                ))?;
+        let _attached = literal_set.try_attach_folded_long_tail(
+            plan.into_trie(),
+            max_pattern_bytes,
+            available_plan_bytes,
+        )?;
+    }
+    Ok(planner_work)
+}
+
 impl fmt::Display for BuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1426,7 +1555,7 @@ pub enum SearchAccounting {
     ExactLiteral(LiteralAccounting),
     /// Conservative SIMD packed filter-plus-verification bound.
     PackedLiteralSet(PackedLiteralSetAccounting),
-    /// Conservative ordered finite-literal DFA bound.
+    /// Ordered finite-literal DFA or combined adaptive work accounting.
     LiteralSetDfa(LiteralSetAccounting),
     /// Complete required-literal proof-bound and actual counters.
     RequiredLiteral(RequiredLiteralSearchAccounting),
@@ -2636,7 +2765,7 @@ impl PortableBuilder {
                 }
             }
         }
-        let (finite_words, finite_work) = finite::extract(
+        let (finite_words, mut finite_work) = finite::extract(
             &rust.hir,
             self.limits.literal_set.max_patterns,
             self.limits.literal_set.max_pattern_bytes,
@@ -2719,7 +2848,23 @@ impl PortableBuilder {
                         .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
                     });
                 }
-                let literal_set = LiteralSetPlan::new(&words, self.limits.literal_set)?;
+                let mut literal_set = LiteralSetPlan::new(&words, self.limits.literal_set)?;
+                if self.selection == PlanSelection::Auto
+                    && words.len() > PACKED_LITERAL_SET_CERTIFIED_MAX_PATTERNS
+                {
+                    let retained_facade_bytes = source_storage_bytes
+                        .checked_add(capture_name_storage_bytes)
+                        .ok_or(BuildError::PersistentBytesOverflow)?;
+                    finite_work = try_attach_unicode_folded_long_tail(
+                        &mut literal_set,
+                        &words,
+                        (&rust.hir, syntax.hir_nodes),
+                        &self.profile,
+                        &self.limits,
+                        retained_facade_bytes,
+                        finite_work,
+                    )?;
+                }
                 let storage = literal_set.build_accounting().persistent_bytes;
                 return Ok(PortableRegex {
                     source,
@@ -2792,23 +2937,11 @@ impl PortableBuilder {
                 ) {
                     Ok(UnicodeFoldedLiteralBuildAttempt::Admitted(plan)) => {
                         let build = plan.build_accounting();
-                        let folded_planner_work =
-                            u64::try_from(build.planner.work).map_err(|_| {
-                                BuildError::InternalInvariant(
-                                    "folded-literal planner work does not fit u64",
-                                )
-                            })?;
-                        let planner_work = finite_work.checked_add(folded_planner_work).ok_or(
-                            BuildError::InternalInvariant(
-                                "cumulative folded-literal planner work overflowed u64",
-                            ),
+                        let planner_work = charge_unicode_folded_planner_work(
+                            finite_work,
+                            build.planner.work,
+                            self.limits.max_planner_work,
                         )?;
-                        if planner_work > self.limits.max_planner_work {
-                            return Err(BuildError::PlannerWorkLimit {
-                                needed: planner_work,
-                                limit: self.limits.max_planner_work,
-                            });
-                        }
                         fallback_planner_work = planner_work;
                         if let Ok(plan) = fre_exact_alloc::try_box_preserve(plan) {
                             return Ok(PortableRegex {
@@ -2845,25 +2978,23 @@ impl PortableBuilder {
                         }
                     }
                     Ok(UnicodeFoldedLiteralBuildAttempt::Ineligible { planner, .. }) => {
-                        let folded_planner_work = u64::try_from(planner.work).map_err(|_| {
-                            BuildError::InternalInvariant(
-                                "declined folded-literal planner work does not fit u64",
-                            )
-                        })?;
-                        fallback_planner_work = finite_work
-                            .checked_add(folded_planner_work)
-                            .ok_or(BuildError::InternalInvariant(
-                                "declined folded-literal planner work overflowed u64",
-                            ))?;
-                        if fallback_planner_work > self.limits.max_planner_work {
-                            return Err(BuildError::PlannerWorkLimit {
-                                needed: fallback_planner_work,
-                                limit: self.limits.max_planner_work,
-                            });
-                        }
+                        fallback_planner_work = charge_unicode_folded_planner_work(
+                            finite_work,
+                            planner.work,
+                            self.limits.max_planner_work,
+                        )?;
                     }
-                    Err(error) if unicode_folded_literal_resource_refusal(&error) => {}
-                    Err(error) => return Err(map_unicode_folded_literal_build_error(error)),
+                    Err(attempt_error) => {
+                        let (error, completed_planner) = attempt_error.into_parts();
+                        if !unicode_folded_literal_resource_refusal(&error) {
+                            return Err(map_unicode_folded_literal_build_error(error));
+                        }
+                        fallback_planner_work = charge_unicode_folded_planner_work(
+                            finite_work,
+                            completed_planner,
+                            self.limits.max_planner_work,
+                        )?;
+                    }
                 }
             }
         }

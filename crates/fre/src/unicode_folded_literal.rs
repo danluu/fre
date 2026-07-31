@@ -178,6 +178,34 @@ pub enum UnicodeFoldedLiteralBuildError {
     },
 }
 
+#[derive(Debug)]
+pub(crate) struct UnicodeFoldedLiteralSearchBuildError {
+    source: UnicodeFoldedLiteralBuildError,
+    completed_planner_work: usize,
+}
+
+impl UnicodeFoldedLiteralSearchBuildError {
+    fn resource(source: UnicodeFoldedLiteralBuildError, completed_planner_work: usize) -> Self {
+        Self {
+            source,
+            completed_planner_work,
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (UnicodeFoldedLiteralBuildError, usize) {
+        (self.source, self.completed_planner_work)
+    }
+}
+
+impl From<UnicodeFoldedLiteralBuildError> for UnicodeFoldedLiteralSearchBuildError {
+    fn from(source: UnicodeFoldedLiteralBuildError) -> Self {
+        Self {
+            source,
+            completed_planner_work: 0,
+        }
+    }
+}
+
 impl fmt::Display for UnicodeFoldedLiteralBuildError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -313,6 +341,10 @@ pub(crate) struct UnicodeFoldedLiteralSearchPlan {
 impl UnicodeFoldedLiteralSearchPlan {
     pub(crate) const fn plan_id(&self) -> &'static str {
         UNICODE_FOLDED_LITERAL_SEARCH_ALGORITHM_ID
+    }
+
+    pub(crate) fn into_trie(self) -> FoldedLiteralTriePlan {
+        self.trie
     }
 
     pub(crate) fn build_accounting(&self) -> UnicodeFoldedLiteralSearchBuildAccounting {
@@ -559,6 +591,7 @@ struct Shape {
     folded_classes: usize,
     nonascii_fold_roots: usize,
     empty_patterns: usize,
+    materialization_work: usize,
     work: usize,
 }
 
@@ -573,6 +606,7 @@ impl Default for Shape {
             folded_classes: 0,
             nonascii_fold_roots: 0,
             empty_patterns: 0,
+            materialization_work: 0,
             work: 0,
         }
     }
@@ -610,7 +644,9 @@ fn build(
             detail: "Rust-bytes folded-literal parse produced a non-Rust pattern",
         });
     };
-    let constructed = match construct_from_hir(dispatch, &rust.hir, builder.limits)? {
+    let constructed = match construct_from_hir(dispatch, &rust.hir, builder.limits)
+        .map_err(|error| error.into_parts().0)?
+    {
         UnicodeFoldedLiteralBuildAttempt::Admitted(constructed) => constructed,
         UnicodeFoldedLiteralBuildAttempt::Ineligible { reason, planner } => {
             return Ok(UnicodeFoldedLiteralBuildAttempt::Ineligible { reason, planner });
@@ -633,6 +669,8 @@ fn build(
     ))
 }
 
+#[cold]
+#[inline(never)]
 pub(crate) fn build_search_plan(
     dispatch: SimdDispatchContext,
     hir: &Hir,
@@ -640,9 +678,9 @@ pub(crate) fn build_search_plan(
     limits: UnicodeFoldedLiteralBuildLimits,
 ) -> Result<
     UnicodeFoldedLiteralBuildAttempt<UnicodeFoldedLiteralSearchPlan>,
-    UnicodeFoldedLiteralBuildError,
+    UnicodeFoldedLiteralSearchBuildError,
 > {
-    if !eligible_profile(profile) {
+    if !eligible_search_profile(profile) {
         return Ok(UnicodeFoldedLiteralBuildAttempt::Ineligible {
             reason: UnicodeFoldedLiteralIneligibility::Profile,
             planner: UnicodeFoldedLiteralPlannerAccounting::default(),
@@ -685,43 +723,50 @@ struct ConstructedFoldedLiteral {
     clippy::too_many_lines,
     reason = "two-pass HIR materialization and exact-allocation trie publication stay in one shared transaction"
 )]
+#[cold]
+#[inline(never)]
 fn construct_from_hir(
     dispatch: SimdDispatchContext,
     hir: &Hir,
     limits: UnicodeFoldedLiteralBuildLimits,
 ) -> Result<
     UnicodeFoldedLiteralBuildAttempt<ConstructedFoldedLiteral>,
-    UnicodeFoldedLiteralBuildError,
+    UnicodeFoldedLiteralSearchBuildError,
 > {
     let shape = match inspect_hir(hir)? {
         Ok(shape) => shape,
-        Err(reason) => {
+        Err((reason, shape)) => {
             return Ok(UnicodeFoldedLiteralBuildAttempt::Ineligible {
                 reason,
-                planner: UnicodeFoldedLiteralPlannerAccounting::default(),
+                planner: inspection_planner_accounting(shape),
             });
         }
     };
     if shape.empty_patterns != 0 {
         return Ok(UnicodeFoldedLiteralBuildAttempt::Ineligible {
             reason: UnicodeFoldedLiteralIneligibility::Empty,
-            planner: planner_accounting(shape, 0, 0),
+            planner: inspection_planner_accounting(shape),
         });
     }
     if shape.nonascii_fold_roots != shape.patterns {
         return Ok(UnicodeFoldedLiteralBuildAttempt::Ineligible {
             reason: UnicodeFoldedLiteralIneligibility::RootIsNotNonAsciiFoldClass,
-            planner: planner_accounting(shape, 0, 0),
+            planner: inspection_planner_accounting(shape),
         });
     }
-    enforce_build_limits(shape, limits)?;
+    enforce_build_limits(shape, limits).map_err(|source| {
+        UnicodeFoldedLiteralSearchBuildError::resource(source, inspection_work(shape))
+    })?;
     let scratch_bytes = planner_scratch_bytes(shape)?;
     if scratch_bytes > limits.max_planner_scratch_bytes {
-        return Err(UnicodeFoldedLiteralBuildError::Resource {
-            resource: "planner scratch bytes",
-            needed: scratch_bytes,
-            limit: limits.max_planner_scratch_bytes,
-        });
+        return Err(UnicodeFoldedLiteralSearchBuildError::resource(
+            UnicodeFoldedLiteralBuildError::Resource {
+                resource: "planner scratch bytes",
+                needed: scratch_bytes,
+                limit: limits.max_planner_scratch_bytes,
+            },
+            inspection_work(shape),
+        ));
     }
     let mut classes = Vec::<Vec<char>>::new();
     classes
@@ -752,12 +797,14 @@ fn construct_from_hir(
     if classes.len() != shape.scalar_positions {
         return Err(UnicodeFoldedLiteralBuildError::Invariant {
             detail: "folded-literal inspection/materialization position mismatch",
-        });
+        }
+        .into());
     }
     if literal_ends.len() != shape.patterns {
         return Err(UnicodeFoldedLiteralBuildError::Invariant {
             detail: "folded-literal inspection/materialization pattern mismatch",
-        });
+        }
+        .into());
     }
     let mut wrappers = Vec::<FoldedScalarClass<'_>>::new();
     wrappers
@@ -792,23 +839,32 @@ fn construct_from_hir(
     if start != wrappers.len() {
         return Err(UnicodeFoldedLiteralBuildError::Invariant {
             detail: "folded literal boundaries do not consume materialized classes",
-        });
+        }
+        .into());
     }
     let planner_allocations = shape.scalar_positions.checked_add(4).ok_or(
         UnicodeFoldedLiteralBuildError::ArithmeticOverflow {
             computation: "folded planner allocation count",
         },
     )?;
-    let trie = match FoldedLiteralTriePlan::build_with_dispatch(dispatch, &literals, limits.trie)
-        .map_err(UnicodeFoldedLiteralBuildError::Trie)?
-    {
-        FoldedLiteralTrieBuildAttempt::Admitted(plan) => plan,
-        FoldedLiteralTrieBuildAttempt::DenseFallback(_) => {
-            return Ok(UnicodeFoldedLiteralBuildAttempt::Ineligible {
-                reason: UnicodeFoldedLiteralIneligibility::NonCanonicalClasses,
-                planner: planner_accounting(shape, scratch_bytes, planner_allocations),
-            });
+    let trie_attempt = FoldedLiteralTriePlan::build_with_dispatch(dispatch, &literals, limits.trie);
+    let trie = match trie_attempt {
+        Err(source @ FoldedLiteralTrieBuildError::Resource { .. }) => {
+            return Err(UnicodeFoldedLiteralSearchBuildError::resource(
+                UnicodeFoldedLiteralBuildError::Trie(source),
+                shape.work,
+            ));
         }
+        Err(source) => return Err(UnicodeFoldedLiteralBuildError::Trie(source).into()),
+        Ok(attempt) => match attempt {
+            FoldedLiteralTrieBuildAttempt::Admitted(plan) => plan,
+            FoldedLiteralTrieBuildAttempt::DenseFallback(_) => {
+                return Ok(UnicodeFoldedLiteralBuildAttempt::Ineligible {
+                    reason: UnicodeFoldedLiteralIneligibility::NonCanonicalClasses,
+                    planner: planner_accounting(shape, scratch_bytes, planner_allocations),
+                });
+            }
+        },
     };
     if trie.build_accounting().root_prefilter_needles == 0 {
         return Ok(UnicodeFoldedLiteralBuildAttempt::Ineligible {
@@ -826,6 +882,15 @@ fn construct_from_hir(
 
 fn eligible_profile(profile: &RustProfile) -> bool {
     if !profile.options.unicode || !profile.options.case_insensitive {
+        return false;
+    }
+    eligible_search_profile(profile)
+}
+
+fn eligible_search_profile(profile: &RustProfile) -> bool {
+    // Search receives canonical HIR, so an inline `i` group is sufficient
+    // even when the builder-wide case-insensitive flag is false.
+    if !profile.options.unicode {
         return false;
     }
     match profile.constructor {
@@ -853,7 +918,8 @@ fn eligible_profile(profile: &RustProfile) -> bool {
 
 fn inspect_hir(
     hir: &Hir,
-) -> Result<Result<Shape, UnicodeFoldedLiteralIneligibility>, UnicodeFoldedLiteralBuildError> {
+) -> Result<Result<Shape, (UnicodeFoldedLiteralIneligibility, Shape)>, UnicodeFoldedLiteralBuildError>
+{
     let mut shape = Shape::default();
     match hir.kind() {
         HirKind::Alternation(alternatives) => {
@@ -862,14 +928,20 @@ fn inspect_hir(
             shape.patterns = alternatives.len();
             for alternative in alternatives {
                 if !inspect_literal(alternative, &mut shape)? {
-                    return Ok(Err(UnicodeFoldedLiteralIneligibility::UnsupportedHir));
+                    return Ok(Err((
+                        UnicodeFoldedLiteralIneligibility::UnsupportedHir,
+                        shape,
+                    )));
                 }
             }
         }
         _ => {
             shape.patterns = 1;
             if !inspect_literal(hir, &mut shape)? {
-                return Ok(Err(UnicodeFoldedLiteralIneligibility::UnsupportedHir));
+                return Ok(Err((
+                    UnicodeFoldedLiteralIneligibility::UnsupportedHir,
+                    shape,
+                )));
             }
         }
     }
@@ -881,6 +953,7 @@ fn inspect_hir(
         .ok_or(UnicodeFoldedLiteralBuildError::ArithmeticOverflow {
             computation: "folded materialization work",
         })?;
+    shape.materialization_work = materialization_work;
     shape.work = checked_add(
         shape.work,
         materialization_work,
@@ -1111,6 +1184,16 @@ const fn planner_accounting(
         scratch_bytes,
         allocations,
     }
+}
+
+const fn inspection_work(shape: Shape) -> usize {
+    shape.work.saturating_sub(shape.materialization_work)
+}
+
+const fn inspection_planner_accounting(shape: Shape) -> UnicodeFoldedLiteralPlannerAccounting {
+    let mut accounting = planner_accounting(shape, 0, 0);
+    accounting.work = inspection_work(shape);
+    accounting
 }
 
 fn run_upper_bounds(

@@ -20,6 +20,8 @@ const FIXED_BUILD_ENVELOPE: usize = 1024 * 1024;
 const FULL_TEDDY_FILTER_BYTES: usize = 4;
 const TEDDY_PATTERNS_PER_SEARCHER: usize = 64;
 const MAX_FACTORED_PATTERNS: usize = TEDDY_PATTERNS_PER_SEARCHER * 2;
+/// Largest finite language that any packed literal-set engine can retain.
+pub const CERTIFIED_MAX_PATTERNS: usize = MAX_FACTORED_PATTERNS;
 const MAX_FACTORED_COLUMNS: usize = 16;
 const MAX_FACTORED_ANCHOR_BYTES: usize = 3;
 const FACTORED_SIMD_MINIMUM_HAYSTACK_BYTES: usize = 32;

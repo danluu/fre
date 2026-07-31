@@ -148,6 +148,7 @@ impl<T> Drop for ExactBoxOrUsize<T> {
 /// Capacity is exactly the requested element count. `try_push` refuses rather
 /// than reallocating, so callers may charge the complete allocation before it
 /// occurs and retain the storage without a conversion copy.
+#[derive(Clone)]
 pub struct ExactVec<T> {
     inner: Vec<T>,
 }
