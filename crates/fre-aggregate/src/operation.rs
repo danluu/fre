@@ -3,10 +3,10 @@ use core::ops::Range;
 
 use fre_exact_alloc::{CopyError, ExactVec, zeroed_exact};
 use fre_kernels::{
-    RequiredInternalAnchorCountActual, RequiredInternalAnchorCountError,
+    BytePairBarrierScanner, RequiredInternalAnchorCountActual, RequiredInternalAnchorCountError,
     RequiredInternalAnchorCountLimits, RequiredInternalAnchorCountUpperBounds,
     RequiredInternalAnchorPlan, UrlAggregatePlan, UrlAggregateReduceAccounting,
-    UrlAggregateReduceError, UrlAggregateReduceLimits, UrlAggregateReduceUpperBounds,
+    UrlAggregateReduceError, UrlAggregateReduceLimits, UrlAggregateReduceUpperBounds, VectorKind,
 };
 use sha2::{Digest, Sha256};
 
@@ -2903,12 +2903,7 @@ impl CompiledRegex {
                 reduce_disjoint_internal_runs(plan, local, envelope.work_bound, &mut accounting)?
             }
             StateByteSpanSumTopology::RepeatedLazyDelimiterSuffix => {
-                reduce_repeated_lazy_delimiter_suffix(
-                    plan,
-                    local,
-                    envelope.work_bound,
-                    &mut accounting,
-                )?
+                reduce_repeated_lazy_delimiter_suffix_value(plan, local)?
             }
             StateByteSpanSumTopology::BoundedLiteralPair
             | StateByteSpanSumTopology::AsciiGuardedBoundedLiteralPair => {
@@ -5546,6 +5541,345 @@ impl StateByteClassRunCursor {
         }
         Ok(upper)
     }
+}
+
+/// Value-only reduction for the compile-proved `(C*? D){N} L` topology.
+///
+/// The complete incumbent resource envelope is admitted before this function
+/// runs. A full-byte scanner counts ordinary delimiters in bulk, absorbs
+/// barriers into the exact last-barrier state, and returns only adjacent
+/// delimiter/suffix-head candidates. A source-ordered bootstrap retains the
+/// direct native stream for sparse events and candidate-heavy prefixes; after
+/// promotion, bounded chunks can retire back to that stream when delimiter
+/// density falls. Decisions inspect consecutive source prefixes rather than
+/// disjoint samples, and retirement never revisits a completed chunk.
+/// Unsupported scalar dispatches and overlapping signal bytes keep the direct
+/// stream for the complete input.
+/// Receipt-producing callers retain the fully accounted reducer below.
+fn reduce_repeated_lazy_delimiter_suffix_value(
+    plan: &StateByteSpanSumPlan,
+    haystack: &[u8],
+) -> Result<(usize, usize), Error> {
+    let [delimiter, suffix @ ..] = plan.literal() else {
+        return Err(Error::InternalInvariant(
+            "state-byte repeated delimiter plan lost its literal suffix",
+        ));
+    };
+    if suffix.is_empty() || plan.repeat_count() == 0 {
+        return Err(Error::InternalInvariant(
+            "state-byte repeated delimiter plan lost its nonempty proof",
+        ));
+    }
+    let barrier = plan.barrier();
+    if !plan.second().contains(barrier) {
+        return Err(Error::InternalInvariant(
+            "state-byte repeated delimiter lost its barrier",
+        ));
+    }
+
+    if haystack.len() < STATE_BYTE_REPEATED_BLOCK_MIN_INPUT_BYTES
+        || *delimiter == barrier
+        || suffix[0] == *delimiter
+        || suffix[0] == barrier
+    {
+        return reduce_repeated_lazy_delimiter_suffix_value_from(
+            plan,
+            haystack,
+            0,
+            StateByteRepeatedValueState::default(),
+        );
+    }
+
+    let scanner = BytePairBarrierScanner::new(*delimiter, suffix[0], barrier);
+    if matches!(scanner.selection().vector, VectorKind::Scalar) {
+        return reduce_repeated_lazy_delimiter_suffix_value_from(
+            plan,
+            haystack,
+            0,
+            StateByteRepeatedValueState::default(),
+        );
+    }
+    match reduce_repeated_lazy_delimiter_suffix_value_bootstrap(plan, haystack)? {
+        StateByteRepeatedBootstrap::Complete(result) => Ok(result),
+        StateByteRepeatedBootstrap::Promote { cursor, state } => {
+            reduce_repeated_lazy_delimiter_suffix_value_scan(
+                plan, haystack, &scanner, cursor, state,
+            )
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct StateByteRepeatedValueState {
+    run_start: usize,
+    delimiters: usize,
+    matches: usize,
+    span_sum: usize,
+}
+
+const STATE_BYTE_REPEATED_BLOCK_MIN_INPUT_BYTES: usize = 64 * 1024;
+const STATE_BYTE_REPEATED_BOOTSTRAP_EVENTS: usize = 512;
+const STATE_BYTE_REPEATED_BOOTSTRAP_MAX_BYTES: usize = 32 * 1024;
+const STATE_BYTE_REPEATED_SCAN_CHUNK_BYTES: usize = 64 * 1024;
+const STATE_BYTE_REPEATED_SCAN_MIN_CHUNK_DELIMITERS: usize = 192;
+
+enum StateByteRepeatedBootstrap {
+    Complete((usize, usize)),
+    Promote {
+        cursor: usize,
+        state: StateByteRepeatedValueState,
+    },
+}
+
+fn reduce_repeated_lazy_delimiter_suffix_value_bootstrap(
+    plan: &StateByteSpanSumPlan,
+    haystack: &[u8],
+) -> Result<StateByteRepeatedBootstrap, Error> {
+    let [delimiter, suffix @ ..] = plan.literal() else {
+        return Err(Error::InternalInvariant(
+            "state-byte repeated delimiter plan lost its literal suffix",
+        ));
+    };
+    let barrier = plan.barrier();
+    let mut state = StateByteRepeatedValueState::default();
+    let mut nonoverlap_floor = 0_usize;
+    let mut events = 0_usize;
+    let mut saw_candidate = false;
+    for index in memchr::memchr2_iter(*delimiter, barrier, haystack) {
+        if index < nonoverlap_floor {
+            continue;
+        }
+        saw_candidate |= haystack.get(index) == Some(delimiter)
+            && haystack.get(index.saturating_add(1)) == suffix.first();
+        nonoverlap_floor = state_byte_repeated_value_event(plan, haystack, index, &mut state)?;
+        events = add(events, 1, Resource::Boundaries)?;
+        if events == STATE_BYTE_REPEATED_BOOTSTRAP_EVENTS
+            && nonoverlap_floor <= STATE_BYTE_REPEATED_BOOTSTRAP_MAX_BYTES
+            && !saw_candidate
+        {
+            return Ok(StateByteRepeatedBootstrap::Promote {
+                cursor: nonoverlap_floor,
+                state,
+            });
+        }
+    }
+    Ok(StateByteRepeatedBootstrap::Complete((
+        state.matches,
+        state.span_sum,
+    )))
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the source-ordered promotion, chunk retirement, boundary pair, and match transitions stay together so their no-rescan invariant is auditable"
+)]
+fn reduce_repeated_lazy_delimiter_suffix_value_scan(
+    plan: &StateByteSpanSumPlan,
+    haystack: &[u8],
+    scanner: &BytePairBarrierScanner,
+    mut cursor: usize,
+    mut state: StateByteRepeatedValueState,
+) -> Result<(usize, usize), Error> {
+    let [delimiter, suffix @ ..] = plan.literal() else {
+        return Err(Error::InternalInvariant(
+            "state-byte repeated delimiter plan lost its literal suffix",
+        ));
+    };
+    let repeat_count = plan.repeat_count();
+    let barrier = plan.barrier();
+    while cursor < haystack.len() {
+        let chunk_end = cursor
+            .checked_add(STATE_BYTE_REPEATED_SCAN_CHUNK_BYTES)
+            .map_or(haystack.len(), |end| end.min(haystack.len()));
+        let source = haystack
+            .get(cursor..chunk_end)
+            .ok_or(Error::InternalInvariant(
+                "state-byte repeated scan chunk exceeds admitted source",
+            ))?;
+        let Some(relative_event) = memchr::memchr2(*delimiter, barrier, source) else {
+            return reduce_repeated_lazy_delimiter_suffix_value_from(
+                plan, haystack, chunk_end, state,
+            );
+        };
+        let event_index = add(cursor, relative_event, Resource::Boundaries)?;
+        let event_byte = *haystack.get(event_index).ok_or(Error::InternalInvariant(
+            "state-byte repeated chunk event exceeds admitted source",
+        ))?;
+        let event_is_delimiter = event_byte == *delimiter;
+        let event_is_pair =
+            event_is_delimiter && haystack.get(event_index.saturating_add(1)) == suffix.first();
+        let scan_start = state_byte_repeated_value_event(plan, haystack, event_index, &mut state)?;
+        if event_is_pair {
+            return reduce_repeated_lazy_delimiter_suffix_value_from(
+                plan, haystack, scan_start, state,
+            );
+        }
+        let source = haystack
+            .get(scan_start..chunk_end)
+            .ok_or(Error::InternalInvariant(
+                "state-byte repeated consumed event exceeds its scan chunk",
+            ))?;
+        let scan_result = scanner.scan(source);
+        if let Some(relative_barrier) = scan_result.last_barrier {
+            let barrier = add(scan_start, relative_barrier, Resource::Boundaries)?;
+            state.run_start = add(barrier, 1, Resource::Boundaries)?;
+            state.delimiters = 0;
+        }
+        state.delimiters = add(
+            state.delimiters,
+            scan_result.delimiter_count,
+            Resource::Boundaries,
+        )?
+        .min(repeat_count);
+
+        let boundary_pair = (scan_result.pair_index.is_none()
+            && chunk_end < haystack.len()
+            && source.last() == Some(delimiter)
+            && haystack.get(chunk_end) == suffix.first())
+        .then(|| {
+            source
+                .len()
+                .checked_sub(1)
+                .expect("a cross-chunk pair has a delimiter byte")
+        });
+        let Some(relative_delimiter) = scan_result.pair_index.or(boundary_pair) else {
+            if chunk_end == haystack.len() {
+                break;
+            }
+            let chunk_delimiters = add(
+                usize::from(event_is_delimiter),
+                scan_result.total_delimiter_count,
+                Resource::Boundaries,
+            )?;
+            if chunk_delimiters < STATE_BYTE_REPEATED_SCAN_MIN_CHUNK_DELIMITERS {
+                return reduce_repeated_lazy_delimiter_suffix_value_from(
+                    plan, haystack, chunk_end, state,
+                );
+            }
+            cursor = chunk_end;
+            continue;
+        };
+        let delimiter = add(scan_start, relative_delimiter, Resource::Boundaries)?;
+        let suffix_start = add(delimiter, 1, Resource::Boundaries)?;
+        if state.delimiters < repeat_count {
+            return reduce_repeated_lazy_delimiter_suffix_value_from(
+                plan,
+                haystack,
+                suffix_start,
+                state,
+            );
+        }
+        let candidate = haystack
+            .get(suffix_start..)
+            .and_then(|remaining| remaining.get(..suffix.len()));
+        if candidate != Some(suffix) {
+            return reduce_repeated_lazy_delimiter_suffix_value_from(
+                plan,
+                haystack,
+                suffix_start,
+                state,
+            );
+        }
+        let end = add(suffix_start, suffix.len(), Resource::Boundaries)?;
+        state.matches = add(state.matches, 1, Resource::OutputMatches)?;
+        state.span_sum = add(
+            state.span_sum,
+            end.checked_sub(state.run_start)
+                .ok_or(Error::InternalInvariant(
+                    "state-byte repeated scan selected a reversed span",
+                ))?,
+            Resource::SpanSum,
+        )?;
+        state.run_start = end;
+        state.delimiters = 0;
+        return reduce_repeated_lazy_delimiter_suffix_value_from(plan, haystack, end, state);
+    }
+    Ok((state.matches, state.span_sum))
+}
+
+fn reduce_repeated_lazy_delimiter_suffix_value_from(
+    plan: &StateByteSpanSumPlan,
+    haystack: &[u8],
+    search_start: usize,
+    mut state: StateByteRepeatedValueState,
+) -> Result<(usize, usize), Error> {
+    let [delimiter, ..] = plan.literal() else {
+        return Err(Error::InternalInvariant(
+            "state-byte repeated delimiter plan lost its literal suffix",
+        ));
+    };
+    let barrier = plan.barrier();
+    let tail = haystack
+        .get(search_start..)
+        .ok_or(Error::InternalInvariant(
+            "state-byte repeated value cursor exceeds admitted source",
+        ))?;
+    let mut nonoverlap_floor = search_start;
+    for relative in memchr::memchr2_iter(*delimiter, barrier, tail) {
+        let index = add(search_start, relative, Resource::Boundaries)?;
+        if index < nonoverlap_floor {
+            continue;
+        }
+        nonoverlap_floor = state_byte_repeated_value_event(plan, haystack, index, &mut state)?;
+    }
+    Ok((state.matches, state.span_sum))
+}
+
+#[inline]
+fn state_byte_repeated_value_event(
+    plan: &StateByteSpanSumPlan,
+    haystack: &[u8],
+    index: usize,
+    state: &mut StateByteRepeatedValueState,
+) -> Result<usize, Error> {
+    let [delimiter, suffix @ ..] = plan.literal() else {
+        return Err(Error::InternalInvariant(
+            "state-byte repeated delimiter plan lost its literal suffix",
+        ));
+    };
+    let barrier = plan.barrier();
+    let search = add(index, 1, Resource::Boundaries)?;
+    let byte = *haystack.get(index).ok_or(Error::InternalInvariant(
+        "state-byte native event exceeds admitted source",
+    ))?;
+    if byte != *delimiter {
+        if byte != barrier {
+            return Err(Error::InternalInvariant(
+                "state-byte native search returned an unrequested byte",
+            ));
+        }
+        state.run_start = search;
+        state.delimiters = 0;
+        return Ok(search);
+    }
+    if state.delimiters < plan.repeat_count() {
+        state.delimiters = add(state.delimiters, 1, Resource::Boundaries)?;
+    }
+    if state.delimiters < plan.repeat_count() {
+        return Ok(search);
+    }
+    let Some(candidate_suffix) = haystack
+        .get(search..)
+        .and_then(|remaining| remaining.get(..suffix.len()))
+    else {
+        return Ok(search);
+    };
+    if candidate_suffix != suffix {
+        return Ok(search);
+    }
+    let end = add(search, suffix.len(), Resource::Boundaries)?;
+    state.matches = add(state.matches, 1, Resource::OutputMatches)?;
+    state.span_sum = add(
+        state.span_sum,
+        end.checked_sub(state.run_start)
+            .ok_or(Error::InternalInvariant(
+                "state-byte repeated delimiter selected a reversed span",
+            ))?,
+        Resource::SpanSum,
+    )?;
+    state.run_start = end;
+    state.delimiters = 0;
+    Ok(end)
 }
 
 fn reduce_repeated_lazy_delimiter_suffix(
@@ -17771,6 +18105,342 @@ mod tests {
 
         let near_miss = state_byte_span_sum_fixture(r"[ab]*[bc]*a[abc]*");
         assert!(near_miss.state_byte_span_sum.is_none());
+    }
+
+    #[test]
+    fn state_byte_greedy_boundary_classifier_matches_scalar() {
+        let excluded_cases: &[&[u8]] = &[&[], &[0], &[0, 127], &[0, 127, 255], &[0, 64, 128, 255]];
+        let source = (u8::MIN..=u8::MAX)
+            .rev()
+            .chain(u8::MIN..=u8::MAX)
+            .collect::<Vec<_>>();
+        for &excluded in excluded_cases {
+            let mut class = crate::program::ByteSet([u64::MAX; 4]);
+            for &byte in excluded {
+                let word = usize::from(byte) / 64;
+                let bit = usize::from(byte) % 64;
+                class.0[word] &= !(1_u64 << bit);
+            }
+            let classifier = StateByteClassBoundary::new(class);
+            assert_eq!(
+                matches!(classifier, StateByteClassBoundary::Native { .. }),
+                excluded.len() <= 3,
+                "excluded={excluded:?}"
+            );
+            for start in 0..=source.len() {
+                let suffix = &source[start..];
+                let expected_first = suffix
+                    .iter()
+                    .position(|&byte| !class.contains(byte))
+                    .unwrap_or(suffix.len());
+                let expected_last = suffix
+                    .iter()
+                    .rposition(|&byte| !class.contains(byte))
+                    .map_or(0, |index| index + 1);
+                assert_eq!(
+                    classifier.first_nonmember_or_len(suffix),
+                    expected_first,
+                    "forward excluded={excluded:?}, start={start}"
+                );
+                assert_eq!(
+                    classifier.start_after_last_nonmember(suffix),
+                    expected_last,
+                    "reverse excluded={excluded:?}, start={start}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn state_byte_greedy_value_boundaries_match_adversarial_runs() {
+        let mut haystack = vec![b'x'; 32 * 1024];
+        for index in (31..haystack.len()).step_by(251) {
+            haystack[index] = b'\n';
+        }
+        for index in (47..haystack.len()).step_by(379) {
+            haystack[index] = if index % 2 == 0 { 0 } else { 0xff };
+        }
+        for index in (73..haystack.len() - 6).step_by(521) {
+            haystack[index..index + 6].copy_from_slice(b"ababab");
+        }
+        for index in (101..haystack.len()).step_by(613) {
+            haystack[index] = b'c';
+        }
+        for index in (149..haystack.len() - 4).step_by(887) {
+            haystack[index..index + 4].copy_from_slice(b"efgh");
+        }
+        for index in (181..haystack.len()).step_by(997) {
+            haystack[index] = b'd';
+        }
+
+        for pattern in [
+            r".*.*abab.*",
+            r"[^ab]*[^ab]*c[^a]*",
+            r"[^abcd]*[^abcd]*efgh[^abc]*",
+        ] {
+            let compiled = state_byte_span_sum_fixture(pattern);
+            assert_eq!(
+                compiled
+                    .state_byte_span_sum
+                    .as_ref()
+                    .map(StateByteSpanSumPlan::topology),
+                Some(StateByteSpanSumTopology::GreedyPrefixLiteralSuffix),
+                "{pattern:?}"
+            );
+            let oracle = RegexBuilder::new(pattern).unicode(false).build().unwrap();
+            for range in [
+                0..haystack.len(),
+                13..haystack.len() - 17,
+                250..8_193,
+                8_191..16_385,
+            ] {
+                let local = &haystack[range.clone()];
+                let expected_sum = oracle
+                    .find_iter(local)
+                    .map(|matched| matched.end() - matched.start())
+                    .sum::<usize>();
+                let expected_count = oracle.find_iter(local).count();
+                let compact_sum = compiled
+                    .span_sum_value(
+                        &haystack,
+                        range.clone(),
+                        Strategy::ReverseSequentialRows,
+                        OperationLimits::default(),
+                    )
+                    .unwrap();
+                let metered_sum = compiled
+                    .span_sum_value_with_counters(
+                        &haystack,
+                        range.clone(),
+                        Strategy::ReverseSequentialRows,
+                        OperationLimits::default(),
+                    )
+                    .unwrap()
+                    .value;
+                assert_eq!(
+                    (compact_sum, metered_sum),
+                    (expected_sum, expected_sum),
+                    "{pattern:?}, range={range:?}"
+                );
+                let count_limits = OperationLimits {
+                    max_span_sum: 0,
+                    ..OperationLimits::default()
+                };
+                let compact_count = compiled
+                    .count_value(
+                        &haystack,
+                        range.clone(),
+                        Strategy::ReverseSequentialRows,
+                        count_limits,
+                    )
+                    .unwrap();
+                let metered_count = compiled
+                    .count_value_with_counters(
+                        &haystack,
+                        range.clone(),
+                        Strategy::ReverseSequentialRows,
+                        count_limits,
+                    )
+                    .unwrap()
+                    .value;
+                assert_eq!(
+                    (compact_count, metered_count),
+                    (expected_count, expected_count),
+                    "{pattern:?}, count range={range:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn state_byte_repeated_delimiter_value_stream_matches_metered_path() {
+        for pattern in [
+            r"(?:.*?,){2}z",
+            r"(?:.*?,){13}z",
+            r"(?:.*?;){3}q",
+            r"(?:.*?,){2},x",
+            r"(?:.*?,){2}\nz",
+        ] {
+            let compiled = state_byte_span_sum_fixture(pattern);
+            assert_eq!(
+                compiled
+                    .state_byte_span_sum
+                    .as_ref()
+                    .map(StateByteSpanSumPlan::topology),
+                Some(StateByteSpanSumTopology::RepeatedLazyDelimiterSuffix),
+                "{pattern:?}"
+            );
+            let oracle = RegexBuilder::new(pattern).unicode(false).build().unwrap();
+            let mut seed = 0x243f_6a88_u32;
+            let mut haystack = Vec::new();
+            for case in 0..192_usize {
+                haystack.clear();
+                let length = 256 + (case * 67 + 31) % 320;
+                for index in 0..length {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    let byte = match (seed ^ u32::try_from(index).unwrap()) % 16 {
+                        0..=5 => b',',
+                        6..=7 => b';',
+                        8 => b'\n',
+                        9 => b'z',
+                        10 => b'x',
+                        11 => b'q',
+                        _ => b'a' + u8::try_from(seed % 26).unwrap(),
+                    };
+                    haystack.push(byte);
+                }
+                let range_start = case % 33;
+                let range_end = haystack.len() - (case % 29);
+                for range in [0..haystack.len(), range_start..range_end] {
+                    let local = &haystack[range.clone()];
+                    let expected_sum = oracle
+                        .find_iter(local)
+                        .map(|matched| matched.end() - matched.start())
+                        .sum::<usize>();
+                    let expected_count = oracle.find_iter(local).count();
+                    let compact_sum = compiled
+                        .span_sum_value(
+                            &haystack,
+                            range.clone(),
+                            Strategy::ReverseSequentialRows,
+                            OperationLimits::default(),
+                        )
+                        .unwrap();
+                    let metered_sum = compiled
+                        .span_sum_value_with_counters(
+                            &haystack,
+                            range.clone(),
+                            Strategy::ReverseSequentialRows,
+                            OperationLimits::default(),
+                        )
+                        .unwrap()
+                        .value;
+                    assert_eq!(
+                        (compact_sum, metered_sum),
+                        (expected_sum, expected_sum),
+                        "{pattern:?}, case={case}, range={range:?}"
+                    );
+                    let count_limits = OperationLimits {
+                        max_span_sum: 0,
+                        ..OperationLimits::default()
+                    };
+                    let compact_count = compiled
+                        .count_value(
+                            &haystack,
+                            range.clone(),
+                            Strategy::ReverseSequentialRows,
+                            count_limits,
+                        )
+                        .unwrap();
+                    let metered_count = compiled
+                        .count_value_with_counters(
+                            &haystack,
+                            range.clone(),
+                            Strategy::ReverseSequentialRows,
+                            count_limits,
+                        )
+                        .unwrap()
+                        .value;
+                    assert_eq!(
+                        (compact_count, metered_count),
+                        (expected_count, expected_count),
+                        "{pattern:?}, count case={case}, range={range:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn state_byte_repeated_delimiter_long_dense_absent_and_late_positive_match_upstream() {
+        for (pattern, delimiter, literal) in [
+            (r"(?:.*?,){13}z", b',', b",z".as_slice()),
+            (r"(?:.*?,){2},x", b',', b",,x".as_slice()),
+            (r"(?:.*?,){2}\nz", b',', b",\nz".as_slice()),
+            (r"(?:.*?;){3}q", b';', b";q".as_slice()),
+        ] {
+            let compiled = state_byte_span_sum_fixture(pattern);
+            let oracle = RegexBuilder::new(pattern).unicode(false).build().unwrap();
+            let mut absent = vec![b'x'; 128 * 1024];
+            for index in (0..absent.len()).step_by(32) {
+                absent[index] = delimiter;
+            }
+            let mut late_positive = absent.clone();
+            let final_literal = late_positive.len().checked_sub(literal.len()).unwrap();
+            late_positive[final_literal..].copy_from_slice(literal);
+            let mut early_then_late = late_positive.clone();
+            early_then_late[..literal.len()].copy_from_slice(literal);
+
+            let plan = compiled.state_byte_span_sum.as_ref().unwrap();
+            assert_eq!(plan.literal(), literal, "{pattern:?}");
+            assert_eq!(
+                plan.literal_failure().last().copied(),
+                Some(0),
+                "{pattern:?}"
+            );
+
+            for (name, haystack) in [
+                ("absent", absent),
+                ("early-then-late-positive", early_then_late),
+                ("late-positive", late_positive),
+            ] {
+                let expected_sum = oracle
+                    .find_iter(&haystack)
+                    .map(|matched| matched.end() - matched.start())
+                    .sum::<usize>();
+                let expected_count = oracle.find_iter(&haystack).count();
+                let compact_sum = compiled
+                    .span_sum_value(
+                        &haystack,
+                        0..haystack.len(),
+                        Strategy::ReverseSequentialRows,
+                        OperationLimits::default(),
+                    )
+                    .unwrap();
+                let metered_sum = compiled
+                    .span_sum_value_with_counters(
+                        &haystack,
+                        0..haystack.len(),
+                        Strategy::ReverseSequentialRows,
+                        OperationLimits::default(),
+                    )
+                    .unwrap()
+                    .value;
+                assert_eq!(
+                    (compact_sum, metered_sum),
+                    (expected_sum, expected_sum),
+                    "{pattern:?}, {name}"
+                );
+                let count_limits = OperationLimits {
+                    max_span_sum: 0,
+                    ..OperationLimits::default()
+                };
+                let compact_count = compiled
+                    .count_value(
+                        &haystack,
+                        0..haystack.len(),
+                        Strategy::ReverseSequentialRows,
+                        count_limits,
+                    )
+                    .unwrap();
+                let metered_count = compiled
+                    .count_value_with_counters(
+                        &haystack,
+                        0..haystack.len(),
+                        Strategy::ReverseSequentialRows,
+                        count_limits,
+                    )
+                    .unwrap()
+                    .value;
+                assert_eq!(
+                    (compact_count, metered_count),
+                    (expected_count, expected_count),
+                    "{pattern:?}, {name}, count"
+                );
+            }
+        }
     }
 
     #[test]

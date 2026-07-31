@@ -27,12 +27,11 @@ use core::fmt;
 #[cfg(feature = "static-dispatch")]
 use fre_target_features::DISPATCH_POLICY_VERSION;
 use fre_target_features::{
-    Architecture, ArchitectureRequirement, KernelVariant, SelectedKernel, VectorKind, host,
-    select_kernel,
+    Architecture, ArchitectureRequirement, KernelVariant, SelectedKernel, host, select_kernel,
 };
 pub use fre_target_features::{
     CpuCapabilities, DispatchPolicy, DispatchProfile, Feature, FeatureSet, SelectionReceipt,
-    TuningClass, UnsupportedRequiredFeatures, dispatch_profile,
+    TuningClass, UnsupportedRequiredFeatures, VectorKind, dispatch_profile,
 };
 
 #[cfg(target_arch = "aarch64")]
@@ -40,6 +39,7 @@ mod aarch64;
 #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
 mod aarch64_sve2;
 mod byte_bucket;
+mod byte_pair_barrier;
 mod byte_range;
 mod byte_set;
 #[cfg_attr(
@@ -66,6 +66,9 @@ mod tests;
 pub use byte_bucket::{
     BYTE_BUCKET_BLOCK_BYTES, BYTE_BUCKET_COUNT, BYTE_BUCKET_MAX_COLUMNS, ByteBucketClassifier,
     ByteBucketMasks16, ByteBucketTableError, ByteBucketTables,
+};
+pub use byte_pair_barrier::{
+    BYTE_PAIR_BARRIER_GROUP_BYTES, BytePairBarrierScan, BytePairBarrierScanner,
 };
 pub use byte_range::classify_byte_delta_16;
 pub use byte_set::{
@@ -222,6 +225,22 @@ impl SimdDispatchContext {
             return Ok(ByteSetClassifier::from_static_profile(set));
         }
         ByteSetClassifier::with_capabilities(set, self.capabilities, policy)
+    }
+
+    /// Build a delimiter/pair/barrier scanner from this captured snapshot.
+    pub fn byte_pair_barrier_scanner(
+        self,
+        delimiter: u8,
+        suffix_head: u8,
+        barrier: u8,
+        policy: DispatchPolicy,
+    ) -> Result<BytePairBarrierScanner, UnsupportedRequiredFeatures> {
+        let signals = [delimiter, suffix_head, barrier];
+        #[cfg(feature = "static-dispatch")]
+        if policy == DispatchPolicy::Auto {
+            return Ok(BytePairBarrierScanner::from_static_profile(signals));
+        }
+        BytePairBarrierScanner::with_capabilities(signals, self.capabilities, policy)
     }
 }
 
