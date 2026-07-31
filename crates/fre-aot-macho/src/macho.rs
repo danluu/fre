@@ -724,12 +724,15 @@ impl MetadataV1 {
                     || version == BackendVersion::SEARCH_V25.0
                     || version == BackendVersion::SEARCH_V26.0 =>
             {
-                (1..=3).contains(&self.output_kind)
-                    && self.literal_bytes == 0
+                let exact_literal = self.literal_bytes == 0
                     && search_backend_literal_width_is_valid_v1(
                         self.backend_version,
                         self.rodata_bytes,
-                    )
+                    );
+                let class_suffix = self.backend_version == BackendVersion::SEARCH_V8.0
+                    && (1..=32).contains(&self.literal_bytes)
+                    && 32_u32.checked_add(self.literal_bytes) == Some(self.rodata_bytes);
+                (1..=3).contains(&self.output_kind) && (exact_literal || class_suffix)
             }
             (AbiKind::Aggregate, version) if version == BackendVersion::AGGREGATE_CURRENT.0 => {
                 (1..=2).contains(&self.output_kind)
@@ -963,7 +966,7 @@ impl<'a> ImageView<'a> {
             layout: image.layout(),
             code: image.code(),
             rodata: image.rodata(),
-            literal_bytes: 0,
+            literal_bytes: image.search_suffix_bytes(),
             labels: image.labels().len(),
             data_symbols: image.symbols().len(),
             relocations: image.relocations().len(),

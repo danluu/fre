@@ -52,6 +52,7 @@ mod manifest_v2;
 mod receipt;
 mod receipt_v2;
 mod search;
+mod search_class_suffix;
 mod search_glue;
 mod search_linux;
 mod search_linux_expectation;
@@ -110,6 +111,14 @@ pub use search::{
     SearchLiteralIdentityV1, SearchManifestErrorV1, SearchManifestIdentityV1,
     SearchReceiptMismatchV1, SearchReceiptValidationErrorV1,
     plan_and_compile_macos_aarch64_exact_search_v1,
+};
+pub use search_class_suffix::{
+    AOT_CLASS_SUFFIX_COMPILER_VERSION_V1, CLASS_SUFFIX_MAX_CLASS_RANGES_V1,
+    CLASS_SUFFIX_MAX_HIR_NODES_V1, CLASS_SUFFIX_MAX_SOURCE_BYTES_V1,
+    CLASS_SUFFIX_MAX_SUFFIX_BYTES_V1, ClassSuffixAotCompileErrorV1, ClassSuffixAotCompiledObjectV1,
+    ClassSuffixAotObjectV1, ClassSuffixAotReceiptV1, ClassSuffixAotTargetV1,
+    ClassSuffixAotValidationV1, ClassSuffixShapeRefusalV1,
+    compile_linux_aarch64_class_suffix_span_v1, compile_macos_aarch64_class_suffix_span_v1,
 };
 pub use search_glue::{
     PublishedSearchSpanFinalImageGlueV1, SEARCH_SPAN_FINAL_IMAGE_GLUE_CODE_BYTES_V1,

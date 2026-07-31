@@ -52,7 +52,7 @@ pub use image::{
     AotArtifact, AotLimits, ArtifactIdentity, ArtifactIdentityReceipt, AuditedNativeImage,
     BackendVersion, CodeLabel, CpuFeatures, DataSymbol, DataSymbolKind, ImageLayout, ImageStats,
     LabelKind, NativeAggregateImage, NativeImage, Relocation, RelocationKind, RelocationTarget,
-    TargetSpec,
+    SearchImageShape, TargetSpec,
 };
 pub use selected_end_v2::{
     AuditedSelectedEndRegisterImageV2, SELECTED_END_REGISTER_CALL_ABI_SCHEMA_V2,

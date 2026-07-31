@@ -154,6 +154,8 @@ dependencies = [
  "fre-aot-search-contract",
  "fre-jit-aarch64",
  "fre-kernel-ir",
+ "fre-syntax",
+ "regex-syntax",
  "sha2",
 ]
 

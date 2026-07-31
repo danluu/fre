@@ -41,6 +41,9 @@ pub struct MetadataV1 {
     code_bytes: u32,
     rodata_offset: u32,
     rodata_bytes: u32,
+    /// Zero for byte-stable exact-literal objects; otherwise the suffix width
+    /// of the inert V8 class-suffix extension.
+    literal_bytes: u32,
     source_identity: [u8; 32],
     artifact_identity: [u8; 32],
     binding_identity: [u8; 32],
@@ -67,6 +70,7 @@ impl MetadataV1 {
             code_bytes: to_u32(image.code().len(), "metadata code bytes")?,
             rodata_offset: image.layout().rodata_from_code_start,
             rodata_bytes: to_u32(image.rodata().len(), "metadata rodata bytes")?,
+            literal_bytes: image.search_suffix_bytes(),
             source_identity: *image.source_identity().as_bytes(),
             artifact_identity: *image.artifact_identity().as_bytes(),
             binding_identity: *binding.as_bytes(),
@@ -170,7 +174,7 @@ impl MetadataV1 {
 
     #[must_use]
     pub const fn literal_bytes(&self) -> u32 {
-        0
+        self.literal_bytes
     }
 
     #[must_use]
@@ -225,7 +229,7 @@ impl MetadataV1 {
         writer.u32(self.code_bytes)?;
         writer.u32(self.rodata_offset)?;
         writer.u32(self.rodata_bytes)?;
-        writer.u32(0)?;
+        writer.u32(self.literal_bytes)?;
         writer.raw(&self.source_identity)?;
         writer.raw(&self.artifact_identity)?;
         writer.raw(&self.binding_identity)?;
@@ -278,12 +282,8 @@ impl MetadataV1 {
             },
             rodata_offset: reader.u32("rodata offset")?,
             rodata_bytes: reader.u32("rodata bytes")?,
-            source_identity: {
-                if reader.u32("literal bytes")? != 0 {
-                    return Err(invalid("literal bytes"));
-                }
-                reader.array("source identity")?
-            },
+            literal_bytes: reader.u32("literal bytes")?,
+            source_identity: reader.array("source identity")?,
             artifact_identity: reader.array("artifact identity")?,
             binding_identity: reader.array("binding identity")?,
             payload_sha256: reader.array("payload digest")?,
@@ -318,11 +318,17 @@ impl MetadataV1 {
                     || version == BackendVersion::SEARCH_V25.0
                     || version == BackendVersion::SEARCH_V26.0 =>
             {
-                self.features == CpuFeatures::ASIMD.bits()
+                let exact_literal = self.literal_bytes == 0
                     && search_backend_literal_width_is_valid_v1(
                         self.backend_version,
                         self.rodata_bytes,
-                    )
+                    );
+                let class_suffix = self.backend_version == BackendVersion::SEARCH_V8.0
+                    && (1..=32).contains(&self.literal_bytes)
+                    && 32_u32.checked_add(self.literal_bytes) == Some(self.rodata_bytes)
+                    && (self.features == CpuFeatures::NONE.bits()
+                        || self.features == CpuFeatures::ASIMD.bits());
+                (self.features == CpuFeatures::ASIMD.bits() && exact_literal) || class_suffix
             }
             version if version == BackendVersion::SEARCH_SVE2_FIXED16_V2.0 => {
                 self.features == CpuFeatures::ASIMD_SVE2.bits()
@@ -411,7 +417,7 @@ pub(crate) fn compute_compile_identity_v1(metadata: MetadataV1) -> CompileIdenti
     hasher.update(metadata.code_bytes.to_le_bytes());
     hasher.update(metadata.rodata_offset.to_le_bytes());
     hasher.update(metadata.rodata_bytes.to_le_bytes());
-    hasher.update(0_u32.to_le_bytes());
+    hasher.update(metadata.literal_bytes.to_le_bytes());
     CompileIdentity(hasher.finalize().into())
 }
 
@@ -556,6 +562,7 @@ mod tests {
             code_bytes: 240,
             rodata_offset: 240,
             rodata_bytes: width,
+            literal_bytes: 0,
             source_identity: [0x11; 32],
             artifact_identity: [0x22; 32],
             binding_identity: [0x33; 32],

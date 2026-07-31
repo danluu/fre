@@ -376,6 +376,17 @@ impl SearchCallAbi {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuditedNativeImage(NativeImage);
 
+/// Audited semantic shape carried by one Search image.
+///
+/// This projection is intentionally narrower than the private manifest. It
+/// lets persistent object writers encode a closed shape discriminator without
+/// exposing mutable manifest construction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SearchImageShape {
+    ExactLiteral,
+    ClassSuffix,
+}
+
 /// Sealed semantic and backend envelope for one search image.
 ///
 /// This is deliberately distinct from instruction-shape inference. The
@@ -452,6 +463,43 @@ impl NativeImage {
     #[must_use]
     pub const fn source_identity(&self) -> CacheIdentity {
         self.source_identity
+    }
+
+    /// Audited Search shape, or `None` for an aggregate image.
+    #[must_use]
+    pub const fn search_shape(&self) -> Option<SearchImageShape> {
+        match self.search {
+            Some(SearchManifest {
+                shape: SearchShape::ExactLiteral,
+                ..
+            }) => Some(SearchImageShape::ExactLiteral),
+            Some(SearchManifest {
+                shape: SearchShape::ClassSuffix,
+                ..
+            }) => Some(SearchImageShape::ClassSuffix),
+            None => None,
+        }
+    }
+
+    /// Suffix width for a class-suffix Search image.
+    ///
+    /// Exact-literal and aggregate images return zero. Existing exact Search
+    /// object bytes therefore remain unchanged when this value occupies the
+    /// previously-zero metadata field.
+    #[must_use]
+    pub const fn search_suffix_bytes(&self) -> u32 {
+        match self.search {
+            Some(SearchManifest {
+                shape: SearchShape::ClassSuffix,
+                literal_bytes,
+                ..
+            }) => literal_bytes,
+            Some(SearchManifest {
+                shape: SearchShape::ExactLiteral,
+                ..
+            })
+            | None => 0,
+        }
     }
 
     #[must_use]

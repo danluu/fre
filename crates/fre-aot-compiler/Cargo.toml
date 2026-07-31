@@ -24,6 +24,8 @@ fre-aot-macho = { path = "../fre-aot-macho" }
 fre-aot-search-contract = { path = "../fre-aot-search-contract" }
 fre-jit-aarch64 = { path = "../fre-jit-aarch64" }
 fre-kernel-ir = { path = "../fre-kernel-ir" }
+fre-syntax = { path = "../fre-syntax" }
+regex-syntax = { version = "=0.8.11", default-features = false, features = ["std", "unicode"] }
 sha2 = "=0.10.9"
 
 [lints]

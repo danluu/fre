@@ -1,7 +1,9 @@
 use core::mem::size_of;
 
 use fre_aot_search_contract::search_backend_literal_width_is_valid_v1;
-use fre_jit_aarch64::{AuditReport, BackendVersion, CpuFeatures, NativeImage, TargetSpec, audit};
+use fre_jit_aarch64::{
+    AuditReport, BackendVersion, CpuFeatures, NativeImage, SearchImageShape, TargetSpec, audit,
+};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -329,8 +331,10 @@ fn validate_image_shape(image: &NativeImage) -> Result<(), ElfObjectError> {
     let target = image.target();
     let baseline = TargetSpec::AARCH64_AAPCS64;
     let supported = match image.backend_version() {
-        BackendVersion::SEARCH_V8
-        | BackendVersion::SEARCH_V9
+        BackendVersion::SEARCH_V8 => {
+            target.features == CpuFeatures::NONE || target.features == CpuFeatures::ASIMD
+        }
+        BackendVersion::SEARCH_V9
         | BackendVersion::SEARCH_V10
         | BackendVersion::SEARCH_V12
         | BackendVersion::SEARCH_V13
@@ -361,8 +365,20 @@ fn validate_image_shape(image: &NativeImage) -> Result<(), ElfObjectError> {
         .ok_or(ElfObjectError::ArithmeticOverflow {
             at: "image layout end",
         })?;
+    let data_shape_supported = match image.search_shape() {
+        Some(SearchImageShape::ExactLiteral) => {
+            image.search_suffix_bytes() == 0
+                && search_backend_literal_width_is_valid_v1(image.backend_version().0, rodata_bytes)
+        }
+        Some(SearchImageShape::ClassSuffix) => {
+            image.backend_version() == BackendVersion::SEARCH_V8
+                && (1..=32).contains(&image.search_suffix_bytes())
+                && 32_u32.checked_add(image.search_suffix_bytes()) == Some(rodata_bytes)
+        }
+        None => false,
+    };
     if !supported
-        || !search_backend_literal_width_is_valid_v1(image.backend_version().0, rodata_bytes)
+        || !data_shape_supported
         || target.architecture != baseline.architecture
         || target.little_endian != baseline.little_endian
         || target.pointer_width != baseline.pointer_width
@@ -440,6 +456,7 @@ fn validate_image_binding(
         || metadata.code_bytes() != code_bytes
         || metadata.rodata_offset() != image.layout().rodata_from_code_start
         || metadata.rodata_bytes() != rodata_bytes
+        || metadata.literal_bytes() != image.search_suffix_bytes()
         || metadata.source_identity() != image.source_identity().as_bytes()
         || metadata.artifact_identity() != image.artifact_identity().as_bytes()
         || !binding.matches_claim(metadata.claimed_binding_identity())
