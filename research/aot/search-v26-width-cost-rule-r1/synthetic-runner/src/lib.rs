@@ -638,7 +638,12 @@ pub fn static_parity(
     let mut exact_machine_object_parities = 0_usize;
     let mut distinct_aot_identities = 0_usize;
     for literal in population.literals() {
-        let source = selected_source_policy(literal.width);
+        let source = selected_source_policy(literal.width).ok_or_else(|| {
+            PopulationError::new(format!(
+                "literal width {} is outside the frozen 6..32 envelope",
+                literal.width
+            ))
+        })?;
         let evidence = match literal.output {
             SyntheticOutput::Exists => {
                 static_parity_typed::<Exists>(literal.literal(), candidate, source)?
@@ -748,11 +753,11 @@ fn require_machine_object_parity(
 }
 
 #[must_use]
-pub const fn selected_source_policy(width: u16) -> SearchBackendPolicy {
-    if width <= 8 {
-        SearchBackendPolicy::AsimdV17
-    } else {
-        SearchBackendPolicy::AsimdV25
+pub const fn selected_source_policy(width: u16) -> Option<SearchBackendPolicy> {
+    match width {
+        6..=8 => Some(SearchBackendPolicy::AsimdV17),
+        9..=32 => Some(SearchBackendPolicy::AsimdV25),
+        _ => None,
     }
 }
 
@@ -1008,9 +1013,23 @@ mod tests {
 
     #[test]
     fn width_rule_selects_only_frozen_source_graphs() {
-        assert_eq!(selected_source_policy(6), SearchBackendPolicy::AsimdV17);
-        assert_eq!(selected_source_policy(8), SearchBackendPolicy::AsimdV17);
-        assert_eq!(selected_source_policy(9), SearchBackendPolicy::AsimdV25);
-        assert_eq!(selected_source_policy(32), SearchBackendPolicy::AsimdV25);
+        assert_eq!(selected_source_policy(5), None);
+        assert_eq!(
+            selected_source_policy(6),
+            Some(SearchBackendPolicy::AsimdV17)
+        );
+        assert_eq!(
+            selected_source_policy(8),
+            Some(SearchBackendPolicy::AsimdV17)
+        );
+        assert_eq!(
+            selected_source_policy(9),
+            Some(SearchBackendPolicy::AsimdV25)
+        );
+        assert_eq!(
+            selected_source_policy(32),
+            Some(SearchBackendPolicy::AsimdV25)
+        );
+        assert_eq!(selected_source_policy(33), None);
     }
 }
