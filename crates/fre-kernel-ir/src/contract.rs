@@ -1,4 +1,4 @@
-use core::fmt::Debug;
+use core::fmt::{self, Debug};
 
 /// Stable output-contract tag encoded into a kernel cache key.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36,7 +36,11 @@ impl MatchSpan {
     }
 }
 
-/// A checked half-open search window in the original haystack.
+/// A half-open search-window request in the original haystack.
+///
+/// Safe executor boundaries validate this request before reading the
+/// haystack. [`CheckedSearchWindow`] retains that proof for composed callers
+/// that must cross more than one such boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SearchWindow {
     start: usize,
@@ -61,6 +65,67 @@ impl SearchWindow {
 
     pub(crate) fn validate(self, haystack_len: usize) -> bool {
         self.start <= self.end && self.end <= haystack_len
+    }
+}
+
+/// A half-open search window proven to belong to one borrowed haystack.
+///
+/// Private fields make the bounds proof non-forgeable in safe code. Keeping
+/// the haystack borrow in the token also prevents a checked range from being
+/// paired with a different or shorter slice at an executor boundary.
+#[derive(Clone, Copy)]
+pub struct CheckedSearchWindow<'haystack> {
+    haystack: &'haystack [u8],
+    window: SearchWindow,
+    searched_bytes: usize,
+}
+
+impl<'haystack> CheckedSearchWindow<'haystack> {
+    /// Validate one window and bind it to the exact borrowed haystack.
+    #[must_use]
+    #[inline]
+    pub fn new(haystack: &'haystack [u8], window: SearchWindow) -> Option<Self> {
+        let searched_bytes = window.end.checked_sub(window.start)?;
+        if window.end > haystack.len() {
+            return None;
+        }
+        Some(Self {
+            haystack,
+            window,
+            searched_bytes,
+        })
+    }
+
+    /// The haystack whose bounds were checked at construction.
+    #[must_use]
+    #[inline]
+    pub const fn haystack(self) -> &'haystack [u8] {
+        self.haystack
+    }
+
+    /// The validated half-open byte window.
+    #[must_use]
+    #[inline]
+    pub const fn window(self) -> SearchWindow {
+        self.window
+    }
+
+    /// Exact byte length of the validated window.
+    #[must_use]
+    #[inline]
+    pub const fn searched_bytes(self) -> usize {
+        self.searched_bytes
+    }
+}
+
+impl fmt::Debug for CheckedSearchWindow<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CheckedSearchWindow")
+            .field("haystack_len", &self.haystack.len())
+            .field("window", &self.window)
+            .field("searched_bytes", &self.searched_bytes)
+            .finish()
     }
 }
 

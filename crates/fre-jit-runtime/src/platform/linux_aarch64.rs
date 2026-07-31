@@ -16,6 +16,9 @@ const CTR_EL0_DIC: usize = 1 << 29;
 // supported toolchain.
 const AT_HWCAP2: libc::c_ulong = 26;
 const HWCAP2_SVE2: libc::c_ulong = 1 << 1;
+const PR_SVE_GET_VL: libc::c_int = 51;
+const PR_SVE_VL_LEN_MASK: libc::c_int = 0xffff;
+const MINIMUM_SVE_VECTOR_BYTES: u16 = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct HostFeatures {
@@ -53,6 +56,25 @@ pub(super) fn has_sve() -> bool {
 
 pub(super) fn has_sve2() -> bool {
     host_features().sve2
+}
+
+pub(super) fn sve_vector_bytes() -> Option<u16> {
+    if !has_sve() {
+        return None;
+    }
+    // SAFETY: `PR_SVE_GET_VL` reads the calling thread's SVE control state
+    // and ignores all remaining variadic arguments. The retained low-level
+    // Search-v1 tag-19 path treats a denied or malformed query as fail-closed
+    // construction/publication refusal. The qualified ABI2 tag-19 path makes
+    // this query only while opening its current-thread session. Neither path
+    // repeats the syscall inside generated-code calls.
+    let raw = unsafe { libc::prctl(PR_SVE_GET_VL, 0, 0, 0, 0) };
+    if raw < 0 {
+        return None;
+    }
+    let bytes = u16::try_from(raw & PR_SVE_VL_LEN_MASK).ok()?;
+    (bytes >= MINIMUM_SVE_VECTOR_BYTES && bytes.is_multiple_of(MINIMUM_SVE_VECTOR_BYTES))
+        .then_some(bytes)
 }
 
 /// Synchronize one initialized code range before its entry becomes callable.

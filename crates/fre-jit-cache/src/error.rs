@@ -2,7 +2,9 @@
 
 use core::fmt;
 
+use fre_jit_aarch64::EmitError;
 use fre_jit_runtime::{PublishError, RuntimeIdentity};
+use fre_kernel_ir::BuildError;
 
 /// A resource controlled by the cache policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -39,8 +41,14 @@ pub enum CacheCreateError {
 
 /// Failure of one cache lookup/build request.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CacheError {
+pub enum CacheError<I = RuntimeIdentity> {
+    KernelIr(BuildError),
+    Emit(EmitError),
     Publish(PublishError),
+    RequestLiteralBytes {
+        max: usize,
+        actual: usize,
+    },
     Refused {
         resource: CacheResource,
         limit: u64,
@@ -49,14 +57,17 @@ pub enum CacheError {
     },
     BuildPanicked,
     ReentrantBuild {
-        identity: RuntimeIdentity,
+        identity: I,
     },
     BuilderIdentityMismatch {
-        expected: RuntimeIdentity,
-        actual: RuntimeIdentity,
+        expected: I,
+        actual: I,
     },
     BuilderSharedMapping {
-        identity: RuntimeIdentity,
+        identity: I,
+    },
+    BuilderContractMismatch {
+        identity: I,
     },
     BuilderPublicationLimit {
         resource: CacheResource,
@@ -79,15 +90,17 @@ impl fmt::Display for CacheCreateError {
 
 impl std::error::Error for CacheCreateError {}
 
-impl fmt::Display for CacheError {
+impl<I: fmt::Debug> fmt::Display for CacheError<I> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "native kernel cache request failed: {self:?}")
     }
 }
 
-impl std::error::Error for CacheError {
+impl<I: fmt::Debug + 'static> std::error::Error for CacheError<I> {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::KernelIr(error) => Some(error),
+            Self::Emit(error) => Some(error),
             Self::Publish(error) => Some(error),
             _ => None,
         }

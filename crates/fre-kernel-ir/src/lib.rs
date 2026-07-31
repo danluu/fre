@@ -24,7 +24,9 @@ pub use aggregate::{
     ExactAggregateProgram, MAX_EXACT_AGGREGATE_LITERAL_BYTES, SpanSum, build_exact_aggregate,
     exact_aggregate_upper_bounds, preflight_exact_aggregate,
 };
-pub use contract::{Exists, MatchSpan, Operation, OutputKind, SearchWindow, SelectedEnd, Span};
+pub use contract::{
+    CheckedSearchWindow, Exists, MatchSpan, Operation, OutputKind, SearchWindow, SelectedEnd, Span,
+};
 pub use error::{
     ArithmeticSite, BuildError, ExecuteError, InvalidProgram, ResourceKind, ValidateError,
 };
@@ -35,7 +37,7 @@ pub use ir::{
 };
 pub use lower::{build_class_suffix, build_exact_literal};
 pub use serialize::{CacheIdentity, SerializedProgram};
-pub use validate::{ProgramStats, ValidateLimits, ValidatedProgram};
+pub use validate::{ProgramStats, ResourceAccounting, ValidateLimits, ValidatedProgram};
 
 #[cfg(test)]
 mod tests;

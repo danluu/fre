@@ -42,6 +42,10 @@ pub(super) const fn has_sve2() -> bool {
     false
 }
 
+pub(super) const fn sve_vector_bytes() -> Option<u16> {
+    None
+}
+
 /// Synchronize one initialized code range before its entry becomes callable.
 ///
 /// # Safety

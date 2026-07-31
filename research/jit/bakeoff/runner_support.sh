@@ -9,6 +9,107 @@ fre_bakeoff_sha256() {
     shasum -a 256 "$1" | awk '{print $1}'
 }
 
+fre_bakeoff_abi2_identity_from_inspect() {
+    fre_bakeoff_inspect=$1
+    if [ ! -f "$fre_bakeoff_inspect" ] || [ -L "$fre_bakeoff_inspect" ]; then
+        fre_bakeoff_error "ABI2 witness must be a regular non-symlink inspect sidecar"
+        return $?
+    fi
+    fre_bakeoff_abi2_identity=$(
+        awk -F= '
+            $1 == "abi2_witness_schema" {
+                schema = $2
+                schema_count++
+            }
+            $1 == "abi2_backend_policy" {
+                backend_policy = $2
+                backend_policy_count++
+            }
+            $1 == "abi2_target" {
+                target = $2
+                target_count++
+            }
+            $1 == "abi2_backend" {
+                backend = $2
+                backend_count++
+            }
+            $1 == "abi2_native_output" {
+                native_output = $2
+                native_output_count++
+            }
+            $1 == "abi2_native_abi" {
+                native_abi = $2
+                native_abi_count++
+            }
+            $1 == "abi2_sve_vector_bytes_at_publication" {
+                sve_vector_bytes_at_publication = $2
+                sve_vector_bytes_at_publication_count++
+            }
+            $1 == "abi2_required_thread_sve_vector_bytes" {
+                required_thread_sve_vector_bytes = $2
+                required_thread_sve_vector_bytes_count++
+            }
+            $1 == "abi2_identity" {
+                identity = $2
+                identity_count++
+            }
+            END {
+                if (schema_count != 1 ||
+                    schema != "fre-jit-bakeoff-v3-asimd-v8-selected-end-register-v2-witness-v1" ||
+                    backend_policy_count != 1 ||
+                    backend_policy != "asimd-v8" ||
+                    target_count != 1 ||
+                    target != "aarch64-aapcs64-asimd" ||
+                    backend_count != 1 ||
+                    backend != "8" ||
+                    native_output_count != 1 ||
+                    native_output != "selected-end" ||
+                    native_abi_count != 1 ||
+                    native_abi != "selected-end-register-v2" ||
+                    sve_vector_bytes_at_publication_count != 1 ||
+                    sve_vector_bytes_at_publication != "none" ||
+                    required_thread_sve_vector_bytes_count != 1 ||
+                    required_thread_sve_vector_bytes != "none" ||
+                    identity_count != 1) exit 2
+                print identity
+            }
+        ' "$fre_bakeoff_inspect"
+    ) || {
+        fre_bakeoff_error "inspect sidecar does not carry the exact ASIMD V8 ABI2 witness"
+        return $?
+    }
+    case "$fre_bakeoff_abi2_identity" in
+        *[!0-9a-f]*|"")
+            fre_bakeoff_error "malformed ABI2 artifact identity"
+            return $?
+            ;;
+    esac
+    if [ "${#fre_bakeoff_abi2_identity}" != 64 ]; then
+        fre_bakeoff_error "ABI2 artifact identity must contain 64 lowercase hex digits"
+        return $?
+    fi
+    printf '%s\n' "$fre_bakeoff_abi2_identity"
+}
+
+fre_bakeoff_row_schema() {
+    fre_bakeoff_raw=$1
+    awk -F, '
+        NR == 1 {
+            if ($1 != "schema") exit 2
+            next
+        }
+        !found {
+            schema = $1
+            found = 1
+        }
+        $1 != schema { exit 2 }
+        END {
+            if (!found) exit 2
+            print schema
+        }
+    ' "$fre_bakeoff_raw"
+}
+
 fre_bakeoff_validate_exact_clean_commit() {
     fre_bakeoff_repository=$1
     fre_bakeoff_revision=$2
@@ -121,6 +222,14 @@ fre_bakeoff_validate_process_output() {
 
 fre_bakeoff_require_holder() {
     fre_bakeoff_expected_holder=$1
+    case "$fre_bakeoff_expected_holder" in
+        build|timing|target-cpu-timing) ;;
+        *)
+            fre_bakeoff_error \
+                "unsupported resource coordinator holder kind"
+            return $?
+            ;;
+    esac
     fre_bakeoff_holder_command="run-$fre_bakeoff_expected_holder"
     if [ "$fre_bakeoff_expected_holder" = timing ]; then
         fre_bakeoff_holder_command=run-timing-wave
@@ -142,6 +251,64 @@ fre_bakeoff_require_holder() {
             return $?
             ;;
     esac
+    if [ "$fre_bakeoff_expected_holder" = target-cpu-timing ]; then
+        fre_bakeoff_target_cpu=${FRE_RESOURCE_TARGET_CPU:-}
+        fre_bakeoff_session_id=${FRE_RESOURCE_TIMING_SESSION_ID:-}
+        fre_bakeoff_session_holder_id=\
+${FRE_RESOURCE_TIMING_SESSION_HOLDER_ID:-}
+        fre_bakeoff_owner_sha256=\
+${FRE_RESOURCE_TIMING_SESSION_OWNER_SHA256:-}
+        fre_bakeoff_admission=\
+${FRE_RESOURCE_TIMING_ADMISSION_RECEIPT:-}
+        fre_bakeoff_admission_sha256=\
+${FRE_RESOURCE_TIMING_ADMISSION_RECEIPT_SHA256:-}
+        fre_bakeoff_coordinator=${FRE_RESOURCE_COORDINATOR_PATH:-}
+        fre_bakeoff_coordinator_sha256=\
+${FRE_RESOURCE_COORDINATOR_SHA256:-}
+        case "$fre_bakeoff_target_cpu" in
+            0|[1-9]|[1-9][0-9]|[1-9][0-9][0-9]|\
+[1-3][0-9][0-9][0-9]|4[0][0-8][0-9]|409[0-5]) ;;
+            *)
+                fre_bakeoff_error "malformed target CPU"
+                return $?
+                ;;
+        esac
+        if [ "$fre_bakeoff_session_holder_id" != \
+            "${fre_bakeoff_holder_dir##*/}" ] ||
+            [ "$fre_bakeoff_admission" != \
+            "$fre_bakeoff_holder_dir/admission.tsv" ] ||
+            [ ! -f "$fre_bakeoff_admission" ] ||
+            [ -L "$fre_bakeoff_admission" ] ||
+            [ "${fre_bakeoff_coordinator#/}" = \
+            "$fre_bakeoff_coordinator" ] ||
+            [ ! -f "$fre_bakeoff_coordinator" ] ||
+            [ -L "$fre_bakeoff_coordinator" ]
+        then
+            fre_bakeoff_error \
+                "target-CPU session paths do not match the inherited holder"
+            return $?
+        fi
+        for fre_bakeoff_target_digest in \
+            "$fre_bakeoff_session_id" \
+            "$fre_bakeoff_owner_sha256" \
+            "$fre_bakeoff_admission_sha256" \
+            "$fre_bakeoff_coordinator_sha256"
+        do
+            if [ "${#fre_bakeoff_target_digest}" != 64 ]; then
+                fre_bakeoff_error \
+                    "malformed target-CPU authority digest"
+                return $?
+            fi
+            case "$fre_bakeoff_target_digest" in
+                *[!0-9a-f]*|\
+0000000000000000000000000000000000000000000000000000000000000000)
+                    fre_bakeoff_error \
+                        "malformed target-CPU authority digest"
+                    return $?
+                    ;;
+            esac
+        done
+    fi
 }
 
 fre_bakeoff_canonical_new_external_directory() {

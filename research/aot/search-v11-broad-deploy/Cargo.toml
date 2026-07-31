@@ -1,0 +1,23 @@
+[workspace]
+
+[package]
+name = "fre-search-v11-broad-deploy"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+license = "Apache-2.0 OR MIT"
+publish = false
+
+[dependencies]
+fre-jit-aarch64 = { path = "../../../crates/fre-jit-aarch64" }
+fre-jit-runtime = { path = "../../../crates/fre-jit-runtime" }
+fre-kernel-ir = { path = "../../../crates/fre-kernel-ir" }
+fre-kernels = { path = "../../../crates/fre-kernels" }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+
+[lints.rust]
+unsafe_code = "forbid"

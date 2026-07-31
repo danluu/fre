@@ -2,7 +2,12 @@ use core::{fmt, marker::PhantomData};
 
 use sha2::{Digest, Sha256};
 
-use crate::{AnchorFlags, BuildError, Span, ValidateLimits, ValidatedProgram, build_exact_literal};
+use crate::{
+    AnchorFlags, BuildError, Span, ValidateLimits, ValidatedProgram,
+    lower::build_exact_literal_accounted,
+};
+
+const AGGREGATE_IDENTITY_DOMAIN: &[u8] = b"FREKAGG\0\x01";
 
 /// Absolute width of this globally capped exact-literal aggregate leaf.
 ///
@@ -138,6 +143,13 @@ impl<A: AggregateOperation> ExactAggregateProgram<A> {
         self.search.cache_identity()
     }
 
+    /// Composite construction receipt, including the aggregate identity hash
+    /// and the retained aggregate wrapper.
+    #[must_use]
+    pub const fn construction_resources(&self) -> crate::ResourceAccounting {
+        self.search.stats().resources()
+    }
+
     /// Exact checked upper bounds for one whole-haystack invocation.
     pub fn upper_bounds(
         &self,
@@ -247,9 +259,36 @@ pub fn build_exact_aggregate<A: AggregateOperation>(
             required: literal.len(),
         });
     }
-    let search = build_exact_literal::<Span>(literal, AnchorFlags::default(), limits)?;
+    let search_serialized_bytes =
+        literal
+            .len()
+            .checked_add(53)
+            .ok_or(AggregateBuildError::Search(BuildError::Validate(
+                crate::ValidateError::ArithmeticOverflow {
+                    site: crate::ArithmeticSite::SerializedBytes,
+                },
+            )))?;
+    let additional_hash_work = search_serialized_bytes
+        .checked_add(AGGREGATE_IDENTITY_DOMAIN.len())
+        .and_then(|work| work.checked_add(1))
+        .and_then(|work| u64::try_from(work).ok())
+        .ok_or(AggregateBuildError::Search(BuildError::Validate(
+            crate::ValidateError::ArithmeticOverflow {
+                site: crate::ArithmeticSite::ConstructionWork,
+            },
+        )))?;
+    let additional_retained_bytes = core::mem::size_of::<ExactAggregateProgram<A>>()
+        .saturating_sub(core::mem::size_of::<ValidatedProgram<Span>>());
+    let search = build_exact_literal_accounted::<Span>(
+        literal,
+        AnchorFlags::default(),
+        limits,
+        1,
+        additional_hash_work,
+        additional_retained_bytes,
+    )?;
     let mut hasher = Sha256::new();
-    hasher.update(b"FREKAGG\0\x01");
+    hasher.update(AGGREGATE_IDENTITY_DOMAIN);
     hasher.update([aggregate_output_tag(A::OUTPUT)]);
     hasher.update(search.serialized().as_bytes());
     let digest = hasher.finalize();
@@ -414,6 +453,7 @@ impl fmt::Display for AggregateExecuteError {
 impl std::error::Error for AggregateExecuteError {}
 
 /// Compute the exact preflight envelope shared by the oracle and native ABI.
+#[inline]
 pub fn exact_aggregate_upper_bounds(
     haystack_len: usize,
     literal_len: usize,
@@ -518,6 +558,7 @@ pub fn exact_aggregate_upper_bounds(
 
 /// Check every caller-selected ceiling before one aggregate traversal or
 /// native entry and return the complete admitted envelope.
+#[inline]
 pub fn preflight_exact_aggregate(
     haystack_len: usize,
     literal_len: usize,
@@ -529,6 +570,7 @@ pub fn preflight_exact_aggregate(
     Ok(upper)
 }
 
+#[inline]
 fn check_limits(
     upper: AggregateUpperBounds,
     output: AggregateOutput,

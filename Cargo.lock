@@ -98,10 +98,13 @@ name = "fre"
 version = "0.1.0"
 dependencies = [
  "fre-aggregate",
+ "fre-aot-search-contract",
+ "fre-aot-static-runtime",
  "fre-automata",
  "fre-capture-lab",
  "fre-exact-alloc",
  "fre-jit-aarch64",
+ "fre-jit-cache",
  "fre-jit-runtime",
  "fre-kernel-ir",
  "fre-kernels",
@@ -111,6 +114,7 @@ dependencies = [
  "regex",
  "regex-automata",
  "regex-syntax",
+ "sha2",
  "stats_alloc",
 ]
 
@@ -126,6 +130,124 @@ dependencies = [
  "regex",
  "regex-automata",
  "regex-syntax",
+ "sha2",
+]
+
+[[package]]
+name = "fre-aot-aarch64"
+version = "0.1.0"
+dependencies = [
+ "fre-aot-optimizer",
+ "fre-exact-alloc",
+ "fre-kernel-ir",
+ "sha2",
+]
+
+[[package]]
+name = "fre-aot-compiler"
+version = "0.1.0"
+dependencies = [
+ "fre",
+ "fre-aot-aarch64",
+ "fre-aot-elf",
+ "fre-aot-macho",
+ "fre-aot-search-contract",
+ "fre-jit-aarch64",
+ "fre-kernel-ir",
+ "sha2",
+]
+
+[[package]]
+name = "fre-aot-count-compiler"
+version = "0.1.0"
+dependencies = [
+ "fre",
+ "fre-aot-aarch64",
+ "fre-aot-compiler",
+ "fre-aot-count-contract",
+ "fre-aot-macho",
+ "fre-aot-optimizer",
+ "fre-exact-alloc",
+ "fre-kernel-ir",
+ "sha2",
+]
+
+[[package]]
+name = "fre-aot-count-contract"
+version = "0.1.0"
+dependencies = [
+ "fre-aot-aarch64",
+ "fre-aot-optimizer",
+ "sha2",
+]
+
+[[package]]
+name = "fre-aot-elf"
+version = "0.1.0"
+dependencies = [
+ "fre-aot-search-contract",
+ "fre-jit-aarch64",
+ "fre-kernel-ir",
+ "sha2",
+]
+
+[[package]]
+name = "fre-aot-macho"
+version = "0.1.0"
+dependencies = [
+ "fre-aot-aarch64",
+ "fre-aot-search-contract",
+ "fre-exact-alloc",
+ "fre-jit-aarch64",
+ "fre-kernel-ir",
+ "sha2",
+]
+
+[[package]]
+name = "fre-aot-optimizer"
+version = "0.1.0"
+dependencies = [
+ "fre-exact-alloc",
+ "fre-kernel-ir",
+ "sha2",
+]
+
+[[package]]
+name = "fre-aot-search-contract"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
+name = "fre-aot-static-prelink"
+version = "0.1.0"
+dependencies = [
+ "fre",
+ "fre-aot-aarch64",
+ "fre-aot-compiler",
+ "fre-aot-count-contract",
+ "fre-aot-macho",
+]
+
+[[package]]
+name = "fre-aot-static-runtime"
+version = "0.1.0"
+dependencies = [
+ "fre",
+ "fre-aot-aarch64",
+ "fre-aot-compiler",
+ "fre-aot-count-compiler",
+ "fre-aot-count-contract",
+ "fre-aot-elf",
+ "fre-aot-macho",
+ "fre-aot-optimizer",
+ "fre-aot-search-contract",
+ "fre-jit-aarch64",
+ "fre-kernel-ir",
+ "fre-kernels",
+ "fre-target-features",
+ "libc",
  "sha2",
 ]
 
@@ -208,15 +330,20 @@ dependencies = [
  "fre-jit-aarch64",
  "fre-jit-runtime",
  "fre-kernel-ir",
+ "sha2",
 ]
 
 [[package]]
 name = "fre-jit-runtime"
 version = "0.1.0"
 dependencies = [
+ "fre",
  "fre-jit-aarch64",
  "fre-kernel-ir",
+ "fre-kernels",
+ "fre-target-features",
  "libc",
+ "sha2",
 ]
 
 [[package]]
@@ -243,6 +370,7 @@ version = "0.1.0"
 dependencies = [
  "aho-corasick",
  "fre-exact-alloc",
+ "fre-kernel-ir",
  "fre-simd-kernels",
  "memchr",
  "regex",
@@ -478,6 +606,19 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
+name = "search-production-family-promotion"
+version = "0.1.0"
+dependencies = [
+ "fre-aot-compiler",
+ "fre-aot-search-contract",
+ "fre-kernel-ir",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+]
 
 [[package]]
 name = "serde"

@@ -12,9 +12,14 @@ mod error;
 mod policy;
 mod stats;
 
-pub use cache::{KernelCache, KernelLease};
+pub use cache::{
+    KernelCache, KernelLease, SelectedEndRegisterCacheErrorV2, SelectedEndRegisterCacheV2,
+    SelectedEndRegisterCompileIdentityV2, SelectedEndRegisterLeaseV2,
+};
 pub use error::{CacheCreateError, CacheError, CacheResource};
-pub use policy::{CacheLimits, CachePolicyIdentity, EvictionPolicy};
+pub use policy::{
+    CacheLimits, CachePolicyIdentity, EvictionPolicy, SelectedEndRegisterCachePolicyIdentityV2,
+};
 pub use stats::{CacheSnapshot, CacheTotals, CacheUsage};
 
 #[cfg(test)]

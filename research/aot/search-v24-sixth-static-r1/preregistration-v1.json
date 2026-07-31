@@ -1,0 +1,165 @@
+{
+  "schema": "fre-search-aot-candidate-preregistration-v1",
+  "candidate": {
+    "name": "v24-sixth-static-r1",
+    "planned_backend_version": 37,
+    "planned_backend_policy": "AsimdV24",
+    "planned_wire_magic": "FREA64\\u0000\\u0025",
+    "implementation_base_commit": "8fc126b78a14c7b4d4298fc465accbce891194fb",
+    "implementation_base_tree": "a16e86e3f14646e68c9673272f43457d189e2ee1",
+    "reference_backend": {
+      "policy": "AsimdV17",
+      "version": 30,
+      "frozen_base_commit": "38288c5d495a90e48de4cb619f949f90ee9304af"
+    },
+    "status": "PREREGISTERED_NOT_IMPLEMENTED_NOT_BUILT_NOT_TIMED",
+    "timing_status_at_preregistration": "NO_V24_BUILD_EXECUTION_OR_TIMING_HAS_OCCURRED"
+  },
+  "predecessor_evidence": {
+    "candidate": "v23-primary-pointer-wide-r1",
+    "implementation_commit": "8fc126b78a14c7b4d4298fc465accbce891194fb",
+    "implementation_tree": "a16e86e3f14646e68c9673272f43457d189e2ee1",
+    "preregistration_v1_sha256": "5a25918eb54c085b2beebbe15d5429f8bf78e224dcf8fd71d521669591c2c12e",
+    "preregistration_v2_sha256": "0d6c14b4254b41f37daf16959643502a65017e956b716ef180d6b6c1fbb9e3c9",
+    "correctness_receipt_sha256": "c09c9d781f577d819a75980d4c920b9a76d82195565ff3d22a7b9f5b06d52006",
+    "performance_analysis_sha256": "d68588e438e2bf57a2167ac0dbddacf9aee32995cd2fc0b896ee5f611588f44f",
+    "terminal_refusal_sha256": "948f23162cff97a83ce0f3ae9d1ce5f14fb132d48bc9536d8ab38aff08815c27",
+    "status": "TERMINAL_PERFORMANCE_GATE_FAIL_NOT_DEPLOYABLE",
+    "immutable_observations": {
+      "overall_candidate_over_v17_geomean": 0.6680679137971335,
+      "strict_wins": 1596,
+      "cells": 1944,
+      "broad_strata_over_1_01": 0,
+      "cells_over_1_05": 1,
+      "maximum_candidate_over_v17": 1.061966,
+      "sole_failed_cell": {
+        "topology": "seeded-mixed",
+        "width": 21,
+        "scenario": "random-absent",
+        "window": "full",
+        "outcome": "absent"
+      }
+    },
+    "interpretation": "V23 proves that the persistent learned graph plus primary-pointer wide loop is broadly valuable. Its sole gate failure occurs on a path where five compile-time filters can still admit false survivors and therefore pay mismatch discovery before learned screening becomes useful. V24 adds one source-general cold-path filter after the same five-filter survival condition; it does not remove, route around, rename, or retime the failed case."
+  },
+  "declared_design": {
+    "summary": "Retain the complete V23 control-flow and register contract. Only after all five authenticated static columns leave a nonempty candidate mask, lazily apply one sixth compile-time literal column before entering V23 mismatch discovery. An empty sixth-column intersection returns to the existing wide advance. A nonempty intersection enters the unchanged V23 learned-selection graph.",
+    "scope": "Every V23-admitted unanchored exact byte literal with width 6 through 32 and a cyclic-phase-unique five-column signature on AArch64 ASIMD.",
+    "membership_change_from_v23_gate": false,
+    "no_fixture_dispatch": true,
+    "no_width_specific_dispatch": true,
+    "no_corpus_dispatch": true,
+    "no_outcome_dispatch": true,
+    "no_runtime_density_threshold": true,
+    "no_invocation_count_threshold": true,
+    "v23_backend_tag_reuse": false
+  },
+  "sixth_column_selection": {
+    "algorithm": "Use the first remaining offset from the existing candidate_adaptive_offsets_v13 ordering after excluding the five manifest-authenticated offsets.",
+    "ordering": "Ascending frozen V7_BYTE_FREQUENCY_RANK for the literal byte, then ascending source offset.",
+    "requirements": [
+      "The selected offset is in bounds.",
+      "The selected offset differs from primary, secondary, verification, quaternary, and quinary.",
+      "Every admitted width has at least one remaining offset because admission requires width at least 6 and five distinct authenticated offsets.",
+      "Selection depends only on immutable literal bytes and the existing authenticated offsets.",
+      "The failed width, topology, corpus row, observed timing, and runtime data are not inputs."
+    ],
+    "wire_contract": "The sixth offset is deterministically rebuilt from the literal and existing five-offset manifest. No prior wire field changes and no prior image changes."
+  },
+  "frozen_control_flow": {
+    "unchanged_entry_and_hot_prefix": [
+      "V23 first-candidate scalar confirmation",
+      "V23 literal broadcasts for the existing five static columns",
+      "V23 window checks and pointer-authoritative primary-wide loop",
+      "V23 primary-empty advance and both X5 reconstruction sites",
+      "V23 secondary-only transition and existing five-column refinement"
+    ],
+    "new_cold_path": [
+      "Reachable only after the existing five-column Q0/Q2/Q4/Q6 masks are nonempty.",
+      "Obtain the deterministic sixth offset during emission.",
+      "Load and broadcast the sixth literal byte lazily into Q24.",
+      "Load the four 16-byte sixth-column blocks into the existing Q18-Q21 scratch registers.",
+      "Intersect Q0/Q2/Q4/Q6 with the sixth-column equality masks.",
+      "If all four refined masks are empty, branch to the existing pointer-wide advance.",
+      "Otherwise branch to the unchanged V23 wide_learn_select label."
+    ],
+    "unchanged_learning_and_suffix": [
+      "V23 mismatch candidate selection and exact confirmation",
+      "V23 learned byte Q24, learned offset Q25, and X11 state",
+      "V23 persistent learned-wide screening",
+      "V23 saved-mask recovery, narrow, scalar tail, and output ABI"
+    ],
+    "q24_liveness": [
+      "Q24 is dead before V23 mismatch discovery.",
+      "The sixth static broadcast is consumed before wide_learn_select.",
+      "V23 wide_learn_select overwrites Q24 with the discovered learned byte before any learned consumer.",
+      "No sixth-static edge reaches a learned consumer without that overwrite."
+    ]
+  },
+  "static_budget": {
+    "maximum_candidate_code_bytes": 3072,
+    "requirements": [
+      "V24 adds no instruction or byte to emitted V1 through V23 images or any SVE/SVE2 image.",
+      "V24 adds no instruction to the primary-empty, pair-empty, or any earlier-static-empty steady-state path.",
+      "The sixth literal broadcast is lazy and occurs only after five-column survival.",
+      "No memory spill, new architectural register, runtime counter, or data-dependent dispatch is introduced.",
+      "All direct branches and relocations remain within authenticated AArch64 encodings."
+    ]
+  },
+  "correctness_before_timing": {
+    "required": [
+      "Emitter/template byte-for-byte agreement and whole-image audit acceptance.",
+      "Version 37, magic 0x25, AOT, audit, runtime allowlist, mutation, and reseal rejection coverage.",
+      "Mechanical byte identity for every previously supported backend/image, including V23, against implementation commit 8fc126b78a14c7b4d4298fc465accbce891194fb.",
+      "Decoded proof that the sixth offset is the first remaining adaptive-ranked offset and is distinct/in-bounds for every frozen width/topology.",
+      "Decoded proof that the sixth filter is dominated by five-column survival and that sixth-empty reaches the unchanged wide advance.",
+      "Decoded liveness proof that Q24 is dead at sixth-static entry and overwritten with the learned byte before every learned consumer.",
+      "Mutation rejection for the sixth literal load offset, sixth column address, broadcast register, all four comparisons/intersections, and sixth-empty branch.",
+      "Semantic tests for sixth-empty, sixth-nonempty false survivor, exact match, later group, narrow, tail, and no-match exits.",
+      "Widths 6 through 32, zero and nonzero primary offsets, every unselected mismatch offset, modulo-16 boundaries, deterministic randomized windows, and left/right guard pages.",
+      "Independent local and EC2 C9g correctness receipts before any timing."
+    ],
+    "timing_forbidden_until_complete": true
+  },
+  "fresh_performance_gate": {
+    "runs": 1,
+    "same_identity_retest": false,
+    "host": "AWS EC2 c9g",
+    "reference": "AsimdV17",
+    "fixture_bytes": 2097152,
+    "method": "Paired portable/V17/V24; 12 repetitions; all 6 execution orders; approximately 4 ms target per measurement; semantic equality checked before and during timing.",
+    "membership": "Exactly the frozen V23 lattice: widths 6..32, four topologies, six scenarios, three windows, 1,944 cells and 108 artifact pairs.",
+    "strict_acceptance": {
+      "overall_candidate_over_v17_geomean_lte": 0.8,
+      "every_broad_stratum_candidate_over_v17_geomean_lte": 1.01,
+      "broad_strata": [
+        "scenario",
+        "topology",
+        "outcome",
+        "window",
+        "width"
+      ],
+      "every_individual_candidate_over_v17_ratio_lte": 1.05,
+      "semantics": "all equal"
+    },
+    "on_failure": "Seal immutable refusal; do not retest, retune, reclassify, or deploy this identity.",
+    "on_success": "Require independent review, a fresh formal qualification identity, held-out external corroboration, and production routing tests before deployment."
+  },
+  "held_out_after_gate": {
+    "design_input": false,
+    "membership_input": false,
+    "threshold_input": false,
+    "required_only_after_formal_success": [
+      "Rebar-blind ripgrep/external literal workload families frozen independently of V24",
+      "long-running compiled Rebar corroboration only after production qualification"
+    ]
+  },
+  "forbidden_adaptation": {
+    "remove_v23_failure_cell": false,
+    "post_timing_membership_change": false,
+    "post_timing_threshold_change": false,
+    "post_timing_retune_of_same_identity": false,
+    "reuse_backend_tag_after_source_change": false,
+    "rebar_as_design_or_gate_input": false
+  }
+}

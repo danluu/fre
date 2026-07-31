@@ -1,0 +1,12 @@
+Cargo.lock
+Cargo.toml
+analyze_fragments.py
+build.rs
+campaign-contract-v1.json
+identity-template-v1.json
+prepare_discovery_authorization.py
+prepare_inputs.py
+render_identity.py
+run_shards.py
+runner-source-files.txt
+src/main.rs

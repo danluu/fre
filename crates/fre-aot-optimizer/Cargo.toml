@@ -1,0 +1,16 @@
+[package]
+name = "fre-aot-optimizer"
+version.workspace = true
+description = "Deterministic bounded recipe optimizer for FRE Count-v3 AOT"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+fre-exact-alloc = { path = "../fre-exact-alloc" }
+fre-kernel-ir = { path = "../fre-kernel-ir" }
+sha2 = "=0.10.9"
+
+[lints]
+workspace = true

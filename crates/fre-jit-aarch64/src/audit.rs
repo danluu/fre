@@ -1,10 +1,11 @@
 use core::fmt;
 
 use crate::{
-    BackendVersion, Condition, CpuFeatures, DataSymbolKind, DecodeError, DecodedInstruction,
-    LabelKind, NativeAggregateImage, NativeImage, RelocationKind, RelocationTarget,
+    AuditedSelectedEndRegisterImageV2, BackendVersion, Condition, CpuFeatures, DataSymbolKind,
+    DecodeError, DecodedInstruction, LabelKind, NativeAggregateImage, NativeImage, RelocationKind,
+    RelocationTarget,
     decode::{canonical_word, decode},
-    image::{SearchManifest, SearchShape},
+    image::{SearchCallAbi, SearchManifest, SearchShape},
 };
 use fre_kernel_ir::{
     AggregateOutput, AnchorFlags, ByteClass, CacheIdentity, Count, Exists,
@@ -63,6 +64,10 @@ pub enum AuditError {
         displacement: u16,
     },
     ResultPointerClobber {
+        offset: u32,
+        register: u8,
+    },
+    ForbiddenSelectedEndRegisterUse {
         offset: u32,
         register: u8,
     },
@@ -171,7 +176,7 @@ impl AuditWork {
     reason = "keeping the independent linear audit in one pass makes relocation completeness auditable"
 )]
 pub fn audit(image: &NativeImage) -> Result<AuditReport, AuditError> {
-    if image.aggregate_manifest().is_some() {
+    if image.aggregate_manifest().is_some() || image.search_call_abi() != SearchCallAbi::OutSlotV1 {
         return Err(AuditError::InvalidImageContract);
     }
     // Version and sealed-container checks intentionally precede instruction
@@ -200,8 +205,70 @@ pub fn audit(image: &NativeImage) -> Result<AuditReport, AuditError> {
     Ok(report)
 }
 
+/// Independently authenticate one sealed register-return `SelectedEnd` image.
+///
+/// This is a separate entry point from [`audit`]. It admits no result stores
+/// and rejects every explicit use of the removed Search-v1 `x4` result
+/// pointer, in addition to matching the complete backend-specific template.
+pub fn audit_selected_end_register_v2(
+    image: &AuditedSelectedEndRegisterImageV2,
+) -> Result<AuditReport, AuditError> {
+    audit_selected_end_register_image_v2(image.inner())
+}
+
+#[cfg(test)]
+pub(crate) fn audit_selected_end_register_image_for_test_v2(
+    image: &NativeImage,
+) -> Result<AuditReport, AuditError> {
+    audit_selected_end_register_image_v2(image)
+}
+
+fn audit_selected_end_register_image_v2(image: &NativeImage) -> Result<AuditReport, AuditError> {
+    if image.aggregate_manifest().is_some()
+        || image.search_call_abi() != SearchCallAbi::SelectedEndRegisterV2
+        || image.output() != OutputKind::SelectedEnd
+        || !matches!(
+            image.backend_version(),
+            BackendVersion::SEARCH_V8
+                | BackendVersion::SEARCH_SVE16_V6
+                | BackendVersion::SEARCH_SVE2_FIXED16_V2
+        )
+    {
+        return Err(AuditError::InvalidImageContract);
+    }
+    let mut work = AuditWork::default();
+    let envelope = authenticate_search_envelope(image, &mut work)?;
+    if envelope.manifest.shape != SearchShape::ExactLiteral
+        || envelope.manifest.output != OutputKind::SelectedEnd
+        || envelope.literal.is_empty()
+    {
+        return Err(AuditError::InvalidSearchManifest);
+    }
+    let instructions = work.decode(image.code())?;
+    let report = audit_impl(
+        image,
+        StoreContract::SelectedEndRegisterV2,
+        &instructions,
+        &work,
+    )?;
+    crate::search_template::validate_selected_end_register_whole_template_v2(
+        image,
+        envelope.manifest,
+        envelope.literal,
+        &instructions,
+    )?;
+    if report.stores != 0 {
+        return Err(AuditError::InvalidImageContract);
+    }
+    validate_artifact_identity(image)?;
+    Ok(report)
+}
+
 /// Independently re-decode a whole-haystack aggregate image.
 pub fn audit_aggregate(image: &NativeAggregateImage) -> Result<AuditReport, AuditError> {
+    if image.inner().search_call_abi() != SearchCallAbi::OutSlotV1 {
+        return Err(AuditError::InvalidImageContract);
+    }
     let mut work = AuditWork::default();
     let envelope = authenticate_aggregate_envelope(image.inner(), &mut work)?;
     let instructions = work.decode(image.code())?;
@@ -235,8 +302,29 @@ fn validate_search_backend_version(image: &NativeImage) -> Result<BackendVersion
         | BackendVersion::SEARCH_V5
         | BackendVersion::SEARCH_V6
         | BackendVersion::SEARCH_V7
+        | BackendVersion::SEARCH_V8
+        | BackendVersion::SEARCH_V9
+        | BackendVersion::SEARCH_V10
+        | BackendVersion::SEARCH_V11
+        | BackendVersion::SEARCH_V12
+        | BackendVersion::SEARCH_V13
+        | BackendVersion::SEARCH_V14
+        | BackendVersion::SEARCH_V15
+        | BackendVersion::SEARCH_V16
+        | BackendVersion::SEARCH_V17
+        | BackendVersion::SEARCH_V18
+        | BackendVersion::SEARCH_V19
+        | BackendVersion::SEARCH_V20
+        | BackendVersion::SEARCH_V21
+        | BackendVersion::SEARCH_V22
+        | BackendVersion::SEARCH_V23
+        | BackendVersion::SEARCH_V24
+        | BackendVersion::SEARCH_V25
+        | BackendVersion::SEARCH_V26
         | BackendVersion::SEARCH_SVE16_V1
-        | BackendVersion::SEARCH_SVE2_16_V1 => Ok(image.backend_version),
+        | BackendVersion::SEARCH_SVE2_16_V1
+        | BackendVersion::SEARCH_SVE16_V6
+        | BackendVersion::SEARCH_SVE2_FIXED16_V2 => Ok(image.backend_version),
         actual => Err(AuditError::SearchBackendVersionMismatch {
             expected: BackendVersion::SEARCH_CURRENT.0,
             actual: actual.0,
@@ -264,8 +352,29 @@ fn authenticate_search_envelope<'image>(
             | BackendVersion::SEARCH_V5
             | BackendVersion::SEARCH_V6
             | BackendVersion::SEARCH_V7
+            | BackendVersion::SEARCH_V8
+            | BackendVersion::SEARCH_V9
+            | BackendVersion::SEARCH_V10
+            | BackendVersion::SEARCH_V11
+            | BackendVersion::SEARCH_V12
+            | BackendVersion::SEARCH_V13
+            | BackendVersion::SEARCH_V14
+            | BackendVersion::SEARCH_V15
+            | BackendVersion::SEARCH_V16
+            | BackendVersion::SEARCH_V17
+            | BackendVersion::SEARCH_V18
+            | BackendVersion::SEARCH_V19
+            | BackendVersion::SEARCH_V20
+            | BackendVersion::SEARCH_V21
+            | BackendVersion::SEARCH_V22
+            | BackendVersion::SEARCH_V23
+            | BackendVersion::SEARCH_V24
+            | BackendVersion::SEARCH_V25
+            | BackendVersion::SEARCH_V26
             | BackendVersion::SEARCH_SVE16_V1
             | BackendVersion::SEARCH_SVE2_16_V1
+            | BackendVersion::SEARCH_SVE16_V6
+            | BackendVersion::SEARCH_SVE2_FIXED16_V2
     ) {
         let manifest = validate_sealed_search_manifest(image)?;
         let literal = authenticate_search_manifest(image, manifest, work)?;
@@ -446,6 +555,7 @@ fn authenticate_legacy_search_semantics(
         secondary_offset,
         verification_offset,
         quaternary_offset: SEARCH_CANDIDATE_OFFSET_NONE,
+        quinary_offset: SEARCH_CANDIDATE_OFFSET_NONE,
     })
 }
 
@@ -485,6 +595,40 @@ fn authenticate_search_manifest<'image>(
             {
                 return Err(AuditError::InvalidSearchManifest);
             }
+            if manifest.backend_version == BackendVersion::SEARCH_SVE16_V6
+                && (manifest.anchors != AnchorFlags::default() || literal_len < 16)
+            {
+                return Err(AuditError::InvalidSearchManifest);
+            }
+            if manifest.backend_version == BackendVersion::SEARCH_SVE2_FIXED16_V2
+                && (manifest.anchors != AnchorFlags::default() || literal_len != 16)
+            {
+                return Err(AuditError::InvalidSearchManifest);
+            }
+            if matches!(
+                manifest.backend_version,
+                BackendVersion::SEARCH_V9
+                    | BackendVersion::SEARCH_V10
+                    | BackendVersion::SEARCH_V11
+                    | BackendVersion::SEARCH_V12
+                    | BackendVersion::SEARCH_V13
+                    | BackendVersion::SEARCH_V14
+                    | BackendVersion::SEARCH_V15
+                    | BackendVersion::SEARCH_V16
+                    | BackendVersion::SEARCH_V17
+                    | BackendVersion::SEARCH_V18
+                    | BackendVersion::SEARCH_V19
+                    | BackendVersion::SEARCH_V20
+                    | BackendVersion::SEARCH_V21
+                    | BackendVersion::SEARCH_V22
+                    | BackendVersion::SEARCH_V23
+                    | BackendVersion::SEARCH_V24
+                    | BackendVersion::SEARCH_V25
+                    | BackendVersion::SEARCH_V26
+            ) && (manifest.anchors != AnchorFlags::default() || literal_len == 0)
+            {
+                return Err(AuditError::InvalidSearchManifest);
+            }
             let [symbol] = image.symbols.as_ref() else {
                 return Err(AuditError::InvalidSearchManifest);
             };
@@ -519,6 +663,31 @@ fn authenticate_class_suffix_manifest(
     literal_len: usize,
     limits: ValidateLimits,
 ) -> Result<CacheIdentity, AuditError> {
+    if matches!(
+        manifest.backend_version,
+        BackendVersion::SEARCH_SVE16_V6
+            | BackendVersion::SEARCH_SVE2_FIXED16_V2
+            | BackendVersion::SEARCH_V9
+            | BackendVersion::SEARCH_V10
+            | BackendVersion::SEARCH_V11
+            | BackendVersion::SEARCH_V12
+            | BackendVersion::SEARCH_V13
+            | BackendVersion::SEARCH_V14
+            | BackendVersion::SEARCH_V15
+            | BackendVersion::SEARCH_V16
+            | BackendVersion::SEARCH_V17
+            | BackendVersion::SEARCH_V18
+            | BackendVersion::SEARCH_V19
+            | BackendVersion::SEARCH_V20
+            | BackendVersion::SEARCH_V21
+            | BackendVersion::SEARCH_V22
+            | BackendVersion::SEARCH_V23
+            | BackendVersion::SEARCH_V24
+            | BackendVersion::SEARCH_V25
+            | BackendVersion::SEARCH_V26
+    ) {
+        return Err(AuditError::InvalidSearchManifest);
+    }
     if !manifest.anchors.start && literal_len > MAX_EXACT_AGGREGATE_LITERAL_BYTES {
         return Err(AuditError::InvalidSearchManifest);
     }
@@ -596,12 +765,73 @@ const SEARCH_CANDIDATE_POLICY_NONE: u16 = 0;
 const SEARCH_CANDIDATE_POLICY_V1: u16 = 1;
 const SEARCH_CANDIDATE_POLICY_V2: u16 = 2;
 const SEARCH_CANDIDATE_POLICY_V3: u16 = 3;
+const SEARCH_CANDIDATE_POLICY_V4: u16 = 4;
 const SEARCH_CANDIDATE_POLICY_SVE16_V1: u16 = 5;
 const SEARCH_CANDIDATE_POLICY_SVE2_16_V1: u16 = 6;
+const SEARCH_CANDIDATE_POLICY_SVE2_FIXED16_V2: u16 = 8;
+const SEARCH_CANDIDATE_POLICY_V5: u16 = 9;
+const SEARCH_CANDIDATE_POLICY_V6: u16 = 10;
+const SEARCH_CANDIDATE_POLICY_V7: u16 = 11;
+const SEARCH_CANDIDATE_POLICY_V8: u16 = 12;
+const SEARCH_CANDIDATE_POLICY_V9: u16 = 13;
+const SEARCH_CANDIDATE_POLICY_V10: u16 = 14;
+const SEARCH_CANDIDATE_POLICY_V11: u16 = 15;
+// Independently pinned Search V26 width-cost selector receipt.
+const SEARCH_CANDIDATE_POLICY_V12: u16 = 16;
 const SEARCH_CANDIDATE_BLOCK_WIDTH: u16 = 16;
 const SEARCH_CANDIDATE_OFFSET_NONE: u16 = u16::MAX;
 const SVE2_CLASS_TABLE_DATA_ID: u32 = 2;
 const SVE2_CLASS_TABLE_BYTES: usize = 16;
+
+fn independently_authenticate_v15_phase_unique(
+    literal: &[u8],
+    selected: (u16, Option<u16>, Option<u16>, Option<u16>, Option<u16>),
+) -> bool {
+    if !(6..=32).contains(&literal.len()) {
+        return false;
+    }
+    let (primary, secondary, verification, quaternary, quinary) = selected;
+    let Some(selected) = secondary
+        .zip(verification)
+        .zip(quaternary)
+        .zip(quinary)
+        .map(|(((secondary, verification), quaternary), quinary)| {
+            [primary, secondary, verification, quaternary, quinary]
+        })
+    else {
+        return false;
+    };
+    let mut selected_mask = 0_u64;
+    for offset in selected.map(usize::from) {
+        if offset >= literal.len() {
+            return false;
+        }
+        let bit = 1_u64
+            .checked_shl(u32::try_from(offset).expect("bounded V15 offset"))
+            .expect("V15 offset is below 64");
+        if selected_mask & bit != 0 {
+            return false;
+        }
+        selected_mask |= bit;
+    }
+    if selected_mask.count_ones() != 5 || literal.len() <= 5 {
+        return false;
+    }
+    for phase in 1..literal.len() {
+        let mut differs = false;
+        for offset in selected.map(usize::from) {
+            let shifted = offset
+                .checked_add(phase)
+                .and_then(|sum| sum.checked_rem(literal.len()))
+                .expect("bounded nonempty V15 cyclic phase");
+            differs |= literal[offset] != literal[shifted];
+        }
+        if !differs {
+            return false;
+        }
+    }
+    true
+}
 
 #[allow(
     clippy::too_many_lines,
@@ -637,16 +867,47 @@ fn authenticate_search_candidate_policy(
                     }),
                     None,
                     None,
+                    None,
                 )
             } else {
                 let (primary, secondary) = independent_exact_candidate_pair(literal);
-                let (verification, quaternary) = if matches!(
+                let (verification, quaternary, quinary) = if matches!(
+                    manifest.backend_version,
+                    BackendVersion::SEARCH_V11
+                        | BackendVersion::SEARCH_V12
+                        | BackendVersion::SEARCH_V13
+                        | BackendVersion::SEARCH_V14
+                        | BackendVersion::SEARCH_V15
+                        | BackendVersion::SEARCH_V16
+                        | BackendVersion::SEARCH_V17
+                        | BackendVersion::SEARCH_V18
+                        | BackendVersion::SEARCH_V19
+                        | BackendVersion::SEARCH_V20
+                        | BackendVersion::SEARCH_V21
+                        | BackendVersion::SEARCH_V22
+                        | BackendVersion::SEARCH_V23
+                        | BackendVersion::SEARCH_V24
+                        | BackendVersion::SEARCH_V25
+                        | BackendVersion::SEARCH_V26
+                ) {
+                    independent_ranked_verification_offsets_v3(literal, primary, secondary)
+                } else if matches!(
+                    manifest.backend_version,
+                    BackendVersion::SEARCH_SVE2_FIXED16_V2 | BackendVersion::SEARCH_V10
+                ) {
+                    independent_ranked_verification_offsets_v2(literal, primary, secondary)
+                } else if matches!(
                     manifest.backend_version,
                     BackendVersion::SEARCH_V7
+                        | BackendVersion::SEARCH_V8
+                        | BackendVersion::SEARCH_V9
                         | BackendVersion::SEARCH_SVE16_V1
                         | BackendVersion::SEARCH_SVE2_16_V1
+                        | BackendVersion::SEARCH_SVE16_V6
                 ) {
-                    independent_ranked_verification_offsets(literal, primary, secondary)
+                    let (verification, quaternary) =
+                        independent_ranked_verification_offsets(literal, primary, secondary);
+                    (verification, quaternary, None)
                 } else {
                     (
                         matches!(
@@ -656,9 +917,10 @@ fn authenticate_search_candidate_policy(
                         .then(|| independent_exact_verification_offset(literal, primary, secondary))
                         .flatten(),
                         None,
+                        None,
                     )
                 };
-                (primary, secondary, verification, quaternary)
+                (primary, secondary, verification, quaternary, quinary)
             })
         }
         SearchShape::ClassSuffix if !manifest.anchors.start && !literal.is_empty() => {
@@ -683,11 +945,32 @@ fn authenticate_search_candidate_policy(
                     }),
                     None,
                     None,
+                    None,
                 )
             })
         }
         _ => None,
     };
+    if matches!(
+        manifest.backend_version,
+        BackendVersion::SEARCH_V15
+            | BackendVersion::SEARCH_V16
+            | BackendVersion::SEARCH_V17
+            | BackendVersion::SEARCH_V18
+            | BackendVersion::SEARCH_V19
+            | BackendVersion::SEARCH_V20
+            | BackendVersion::SEARCH_V21
+            | BackendVersion::SEARCH_V22
+            | BackendVersion::SEARCH_V23
+            | BackendVersion::SEARCH_V24
+            | BackendVersion::SEARCH_V25
+            | BackendVersion::SEARCH_V26
+    ) {
+        let selected = selected.ok_or(AuditError::InvalidSearchManifest)?;
+        if !independently_authenticate_v15_phase_unique(literal, selected) {
+            return Err(AuditError::InvalidSearchManifest);
+        }
+    }
     let expected = selected.map_or(
         (
             SEARCH_CANDIDATE_POLICY_NONE,
@@ -696,22 +979,76 @@ fn authenticate_search_candidate_policy(
             SEARCH_CANDIDATE_OFFSET_NONE,
             SEARCH_CANDIDATE_OFFSET_NONE,
             SEARCH_CANDIDATE_OFFSET_NONE,
+            SEARCH_CANDIDATE_OFFSET_NONE,
         ),
-        |(primary, secondary, verification, quaternary)| {
+        |(primary, secondary, verification, quaternary, quinary)| {
             (
-                if manifest.backend_version == BackendVersion::SEARCH_SVE2_16_V1
+                if manifest.backend_version == BackendVersion::SEARCH_SVE2_FIXED16_V2
+                    && manifest.shape == SearchShape::ExactLiteral
+                {
+                    SEARCH_CANDIDATE_POLICY_SVE2_FIXED16_V2
+                } else if manifest.backend_version == BackendVersion::SEARCH_V10
+                    && manifest.shape == SearchShape::ExactLiteral
+                {
+                    SEARCH_CANDIDATE_POLICY_V6
+                } else if manifest.backend_version == BackendVersion::SEARCH_V11
+                    && manifest.shape == SearchShape::ExactLiteral
+                {
+                    SEARCH_CANDIDATE_POLICY_V7
+                } else if manifest.backend_version == BackendVersion::SEARCH_V12
+                    && manifest.shape == SearchShape::ExactLiteral
+                {
+                    SEARCH_CANDIDATE_POLICY_V8
+                } else if manifest.backend_version == BackendVersion::SEARCH_V13
+                    && manifest.shape == SearchShape::ExactLiteral
+                {
+                    SEARCH_CANDIDATE_POLICY_V9
+                } else if manifest.backend_version == BackendVersion::SEARCH_V14
+                    && manifest.shape == SearchShape::ExactLiteral
+                {
+                    SEARCH_CANDIDATE_POLICY_V10
+                } else if manifest.backend_version == BackendVersion::SEARCH_V26
+                    && manifest.shape == SearchShape::ExactLiteral
+                {
+                    SEARCH_CANDIDATE_POLICY_V12
+                } else if matches!(
+                    manifest.backend_version,
+                    BackendVersion::SEARCH_V15
+                        | BackendVersion::SEARCH_V16
+                        | BackendVersion::SEARCH_V17
+                        | BackendVersion::SEARCH_V18
+                        | BackendVersion::SEARCH_V19
+                        | BackendVersion::SEARCH_V20
+                        | BackendVersion::SEARCH_V21
+                        | BackendVersion::SEARCH_V22
+                        | BackendVersion::SEARCH_V23
+                        | BackendVersion::SEARCH_V24
+                        | BackendVersion::SEARCH_V25
+                ) && manifest.shape == SearchShape::ExactLiteral
+                {
+                    SEARCH_CANDIDATE_POLICY_V11
+                } else if manifest.backend_version == BackendVersion::SEARCH_V9
+                    && manifest.shape == SearchShape::ExactLiteral
+                {
+                    SEARCH_CANDIDATE_POLICY_V5
+                } else if manifest.backend_version == BackendVersion::SEARCH_V8
+                    && manifest.shape == SearchShape::ExactLiteral
+                {
+                    SEARCH_CANDIDATE_POLICY_V4
+                } else if manifest.backend_version == BackendVersion::SEARCH_SVE2_16_V1
                     && matches!(
                         manifest.shape,
                         SearchShape::ExactLiteral | SearchShape::ClassSuffix
                     )
                 {
                     SEARCH_CANDIDATE_POLICY_SVE2_16_V1
-                } else if manifest.backend_version == BackendVersion::SEARCH_SVE16_V1
-                    && matches!(
-                        manifest.shape,
-                        SearchShape::ExactLiteral | SearchShape::ClassSuffix
-                    )
-                {
+                } else if matches!(
+                    manifest.backend_version,
+                    BackendVersion::SEARCH_SVE16_V1 | BackendVersion::SEARCH_SVE16_V6
+                ) && matches!(
+                    manifest.shape,
+                    SearchShape::ExactLiteral | SearchShape::ClassSuffix
+                ) {
                     SEARCH_CANDIDATE_POLICY_SVE16_V1
                 } else if manifest.backend_version == BackendVersion::SEARCH_V7
                     && manifest.shape == SearchShape::ExactLiteral
@@ -731,6 +1068,7 @@ fn authenticate_search_candidate_policy(
                 secondary.unwrap_or(SEARCH_CANDIDATE_OFFSET_NONE),
                 verification.unwrap_or(SEARCH_CANDIDATE_OFFSET_NONE),
                 quaternary.unwrap_or(SEARCH_CANDIDATE_OFFSET_NONE),
+                quinary.unwrap_or(SEARCH_CANDIDATE_OFFSET_NONE),
             )
         },
     );
@@ -741,6 +1079,7 @@ fn authenticate_search_candidate_policy(
         manifest.secondary_offset,
         manifest.verification_offset,
         manifest.quaternary_offset,
+        manifest.quinary_offset,
     );
     if actual != expected {
         return Err(AuditError::InvalidSearchManifest);
@@ -758,7 +1097,13 @@ fn authenticate_search_candidate_policy(
                 && (usize::from(manifest.quaternary_offset) >= literal.len()
                     || manifest.quaternary_offset == manifest.primary_offset
                     || manifest.quaternary_offset == manifest.secondary_offset
-                    || manifest.quaternary_offset == manifest.verification_offset)))
+                    || manifest.quaternary_offset == manifest.verification_offset))
+            || (manifest.quinary_offset != SEARCH_CANDIDATE_OFFSET_NONE
+                && (usize::from(manifest.quinary_offset) >= literal.len()
+                    || manifest.quinary_offset == manifest.primary_offset
+                    || manifest.quinary_offset == manifest.secondary_offset
+                    || manifest.quinary_offset == manifest.verification_offset
+                    || manifest.quinary_offset == manifest.quaternary_offset)))
     {
         return Err(AuditError::InvalidSearchManifest);
     }
@@ -911,6 +1256,115 @@ fn independent_ranked_verification_offsets(
         first.map(|(_, offset)| offset),
         second.map(|(_, offset)| offset),
     )
+}
+
+fn independent_ranked_verification_offsets_v2(
+    literal: &[u8],
+    primary_offset: u16,
+    secondary_offset: Option<u16>,
+) -> (Option<u16>, Option<u16>, Option<u16>) {
+    // Independently reconstruct the terminal-column reservation. When the
+    // packed pair already includes the terminal byte, preserve three ranked
+    // verification columns instead.
+    let terminal_offset = literal
+        .len()
+        .checked_sub(1)
+        .and_then(|offset| u16::try_from(offset).ok());
+    let force_terminal = terminal_offset
+        .is_some_and(|offset| offset != primary_offset && Some(offset) != secondary_offset);
+    let ranked = literal
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(offset, byte)| {
+            let offset = u16::try_from(offset).ok()?;
+            (offset != primary_offset
+                && Some(offset) != secondary_offset
+                && (!force_terminal || Some(offset) != terminal_offset))
+                .then_some((INDEPENDENT_BYTE_FREQUENCY_RANK[usize::from(byte)], offset))
+        });
+    let mut selected = [None; 3];
+    for candidate in ranked {
+        if selected[0].is_none_or(|current| candidate < current) {
+            selected[2] = selected[1];
+            selected[1] = selected[0];
+            selected[0] = Some(candidate);
+        } else if selected[1].is_none_or(|current| candidate < current) {
+            selected[2] = selected[1];
+            selected[1] = Some(candidate);
+        } else if selected[2].is_none_or(|current| candidate < current) {
+            selected[2] = Some(candidate);
+        }
+    }
+    (
+        selected[0].map(|(_, offset)| offset),
+        selected[1].map(|(_, offset)| offset),
+        if force_terminal {
+            terminal_offset
+        } else {
+            selected[2].map(|(_, offset)| offset)
+        },
+    )
+}
+
+fn independent_ranked_verification_offsets_v3(
+    literal: &[u8],
+    primary_offset: u16,
+    secondary_offset: Option<u16>,
+) -> (Option<u16>, Option<u16>, Option<u16>) {
+    // Independently reconstruct tag 24's fixed five-column schema. Missing
+    // endpoints are appended in head/terminal order after the number of
+    // frequency-ranked columns that remain available.
+    let head = (!literal.is_empty()).then_some(0_u16);
+    let terminal = literal
+        .len()
+        .checked_sub(1)
+        .and_then(|offset| u16::try_from(offset).ok());
+    let reserve_head =
+        head.is_some_and(|offset| offset != primary_offset && Some(offset) != secondary_offset);
+    let reserve_terminal = terminal.is_some_and(|offset| {
+        Some(offset) != head && offset != primary_offset && Some(offset) != secondary_offset
+    });
+    let ranked_limit = 3 - usize::from(reserve_head) - usize::from(reserve_terminal);
+    let mut ranked = [None; 3];
+    for candidate in literal
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(offset, byte)| {
+            let offset = u16::try_from(offset).ok()?;
+            (offset != primary_offset
+                && Some(offset) != secondary_offset
+                && (!reserve_head || Some(offset) != head)
+                && (!reserve_terminal || Some(offset) != terminal))
+                .then_some((INDEPENDENT_BYTE_FREQUENCY_RANK[usize::from(byte)], offset))
+        })
+    {
+        if ranked[0].is_none_or(|current| candidate < current) {
+            ranked[2] = ranked[1];
+            ranked[1] = ranked[0];
+            ranked[0] = Some(candidate);
+        } else if ranked[1].is_none_or(|current| candidate < current) {
+            ranked[2] = ranked[1];
+            ranked[1] = Some(candidate);
+        } else if ranked[2].is_none_or(|current| candidate < current) {
+            ranked[2] = Some(candidate);
+        }
+    }
+
+    let mut offsets = [None; 3];
+    for index in 0..ranked_limit {
+        offsets[index] = ranked[index].map(|(_, offset)| offset);
+    }
+    let mut next = ranked_limit;
+    if reserve_head {
+        offsets[next] = head;
+        next += 1;
+    }
+    if reserve_terminal {
+        offsets[next] = terminal;
+    }
+    (offsets[0], offsets[1], offsets[2])
 }
 
 // Frozen copy of memchr 2.8.3's default packed-pair frequency policy. The
@@ -2174,9 +2628,10 @@ fn invalid_search_instruction(index: usize) -> AuditError {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum StoreContract {
     Search,
+    SelectedEndRegisterV2,
     Aggregate,
 }
 
@@ -2221,11 +2676,19 @@ fn audit_impl(
         if let Some(register) = first_forbidden_explicit_gpr(instruction) {
             return Err(AuditError::ForbiddenAggregateRegister { offset, register });
         }
-        if matches!(store_contract, StoreContract::Search)
-            && let Some(register) =
-                first_forbidden_search_vector_register(instruction, image.backend_version)
+        if matches!(
+            store_contract,
+            StoreContract::Search | StoreContract::SelectedEndRegisterV2
+        ) && let Some(register) =
+            first_forbidden_search_vector_register(instruction, image.backend_version)
         {
             return Err(AuditError::ForbiddenSearchVectorRegister { offset, register });
+        }
+        if store_contract == StoreContract::SelectedEndRegisterV2 && instruction.uses_gpr(4) {
+            return Err(AuditError::ForbiddenSelectedEndRegisterUse {
+                offset,
+                register: 4,
+            });
         }
         report.instructions = report
             .instructions
@@ -2247,13 +2710,16 @@ fn audit_impl(
             required_features = required_features.union(CpuFeatures::SVE2);
         }
         let result_pointer = match store_contract {
-            StoreContract::Search => 4,
-            StoreContract::Aggregate => 2,
+            StoreContract::Search => Some(4),
+            StoreContract::Aggregate => Some(2),
+            StoreContract::SelectedEndRegisterV2 => None,
         };
-        if instruction.written_gpr() == Some(result_pointer) {
+        if result_pointer
+            .is_some_and(|result_pointer| instruction.written_gpr() == Some(result_pointer))
+        {
             return Err(AuditError::ResultPointerClobber {
                 offset,
-                register: result_pointer,
+                register: result_pointer.expect("checked as some"),
             });
         }
         let relocation = image
@@ -2350,6 +2816,7 @@ fn audit_impl(
                 let permitted = match store_contract {
                     StoreContract::Search => base == 4 && matches!(store_offset, 0 | 8),
                     StoreContract::Aggregate => base == 2 && store_offset == 0,
+                    StoreContract::SelectedEndRegisterV2 => false,
                 };
                 if !permitted {
                     return Err(AuditError::ForbiddenStore {
@@ -4305,8 +4772,18 @@ pub(crate) fn first_forbidden_explicit_gpr(instruction: DecodedInstruction) -> O
         } => forbidden(&[destination, source]),
         DecodedInstruction::LoadByte {
             destination, base, ..
+        }
+        | DecodedInstruction::Load16 {
+            destination, base, ..
+        }
+        | DecodedInstruction::Load32 {
+            destination, base, ..
+        }
+        | DecodedInstruction::Load64 {
+            destination, base, ..
         } => forbidden(&[destination, base]),
         DecodedInstruction::LoadVector128 { base, .. }
+        | DecodedInstruction::LoadVectorPair128 { base, .. }
         | DecodedInstruction::SveLoadBytes { base, .. } => forbidden(&[base]),
         DecodedInstruction::LoadByteRegister {
             destination,
@@ -4337,8 +4814,12 @@ pub(crate) fn first_forbidden_explicit_gpr(instruction: DecodedInstruction) -> O
         | DecodedInstruction::SveCompareEqualBytes { .. }
         | DecodedInstruction::Sve2MatchBytes { .. }
         | DecodedInstruction::SveAndPredicateBytes { .. }
+        | DecodedInstruction::SveAndPredicateBytesSetFlags { .. }
+        | DecodedInstruction::SveBitClearPredicateBytesSetFlags { .. }
+        | DecodedInstruction::SveBitClearPredicateBytes { .. }
         | DecodedInstruction::SveTestPredicateBytes { .. }
         | DecodedInstruction::SveBreakBeforeBytes { .. }
+        | DecodedInstruction::SveBreakAfterBytes { .. }
         | DecodedInstruction::Branch { .. }
         | DecodedInstruction::BranchCondition { .. }
         | DecodedInstruction::Return => None,
@@ -4350,6 +4831,7 @@ fn first_forbidden_aggregate_vector_register(instruction: DecodedInstruction) ->
         registers.iter().copied().find(|&register| register > 5)
     }
     match instruction {
+        DecodedInstruction::LoadVectorPair128 { .. } => Some(u8::MAX),
         DecodedInstruction::LoadVector128 { destination, .. }
         | DecodedInstruction::DuplicateByte16 { destination, .. }
         | DecodedInstruction::SveDuplicateByte { destination, .. }
@@ -4385,11 +4867,34 @@ fn first_forbidden_aggregate_vector_register(instruction: DecodedInstruction) ->
             predicate,
             left,
             right,
+        }
+        | DecodedInstruction::SveAndPredicateBytesSetFlags {
+            destination,
+            predicate,
+            left,
+            right,
+        }
+        | DecodedInstruction::SveBitClearPredicateBytesSetFlags {
+            destination,
+            predicate,
+            left,
+            right,
+        }
+        | DecodedInstruction::SveBitClearPredicateBytes {
+            destination,
+            predicate,
+            left,
+            right,
         } => forbidden(&[destination, predicate, left, right]),
         DecodedInstruction::SveTestPredicateBytes { predicate, tested } => {
             forbidden(&[predicate, tested])
         }
         DecodedInstruction::SveBreakBeforeBytes {
+            destination,
+            predicate,
+            source,
+        }
+        | DecodedInstruction::SveBreakAfterBytes {
             destination,
             predicate,
             source,
@@ -4429,8 +4934,32 @@ fn first_forbidden_search_vector_register(
 ) -> Option<u8> {
     fn forbidden(registers: &[u8], backend_version: BackendVersion) -> Option<u8> {
         registers.iter().copied().find(|&register| {
-            register > 7
-                && !(backend_version == BackendVersion::SEARCH_V7 && matches!(register, 16 | 17))
+            let versioned_caller_saved = match backend_version {
+                BackendVersion::SEARCH_V7 => matches!(register, 16 | 17),
+                BackendVersion::SEARCH_V8
+                | BackendVersion::SEARCH_V9
+                | BackendVersion::SEARCH_V10
+                | BackendVersion::SEARCH_V11
+                | BackendVersion::SEARCH_V12
+                | BackendVersion::SEARCH_V13
+                | BackendVersion::SEARCH_V14
+                | BackendVersion::SEARCH_V15
+                | BackendVersion::SEARCH_V16
+                | BackendVersion::SEARCH_V17
+                | BackendVersion::SEARCH_V18
+                | BackendVersion::SEARCH_V19
+                | BackendVersion::SEARCH_V20
+                | BackendVersion::SEARCH_V21
+                | BackendVersion::SEARCH_V22
+                | BackendVersion::SEARCH_V23
+                | BackendVersion::SEARCH_V24
+                | BackendVersion::SEARCH_V25
+                | BackendVersion::SEARCH_V26
+                | BackendVersion::SEARCH_SVE16_V6
+                | BackendVersion::SEARCH_SVE2_FIXED16_V2 => register >= 16,
+                _ => false,
+            };
+            register > 7 && !versioned_caller_saved
         })
     }
     fn forbidden_predicates(registers: &[u8]) -> Option<u8> {
@@ -4439,7 +4968,10 @@ fn first_forbidden_search_vector_register(
     if instruction.is_sve()
         && !matches!(
             backend_version,
-            BackendVersion::SEARCH_SVE16_V1 | BackendVersion::SEARCH_SVE2_16_V1
+            BackendVersion::SEARCH_SVE16_V1
+                | BackendVersion::SEARCH_SVE2_16_V1
+                | BackendVersion::SEARCH_SVE16_V6
+                | BackendVersion::SEARCH_SVE2_FIXED16_V2
         )
     {
         return Some(0);
@@ -4450,6 +4982,11 @@ fn first_forbidden_search_vector_register(
         | DecodedInstruction::SveDuplicateByte { destination, .. } => {
             forbidden(&[destination], backend_version)
         }
+        DecodedInstruction::LoadVectorPair128 {
+            first_destination,
+            second_destination,
+            ..
+        } => forbidden(&[first_destination, second_destination], backend_version),
         DecodedInstruction::CompareEqualBytes16 {
             destination,
             left,
@@ -4512,11 +5049,34 @@ fn first_forbidden_search_vector_register(
             predicate,
             left,
             right,
+        }
+        | DecodedInstruction::SveAndPredicateBytesSetFlags {
+            destination,
+            predicate,
+            left,
+            right,
+        }
+        | DecodedInstruction::SveBitClearPredicateBytesSetFlags {
+            destination,
+            predicate,
+            left,
+            right,
+        }
+        | DecodedInstruction::SveBitClearPredicateBytes {
+            destination,
+            predicate,
+            left,
+            right,
         } => forbidden_predicates(&[destination, predicate, left, right]),
         DecodedInstruction::SveTestPredicateBytes { predicate, tested } => {
             forbidden_predicates(&[predicate, tested])
         }
         DecodedInstruction::SveBreakBeforeBytes {
+            destination,
+            predicate,
+            source,
+        }
+        | DecodedInstruction::SveBreakAfterBytes {
             destination,
             predicate,
             source,
@@ -5363,9 +5923,7 @@ fn validate_aggregate_definite_initialization(
         if let Some(destination) = instruction.written_gpr() {
             output.gpr |= register_mask(&[destination]);
         }
-        if let Some(destination) = aggregate_vector_write(instruction) {
-            output.vector |= register_mask(&[destination]);
-        }
+        output.vector |= aggregate_vector_writes(instruction);
         if let Some(destination) = aggregate_predicate_write(instruction) {
             output.predicate |= predicate_mask(&[destination]);
         }
@@ -5432,7 +5990,11 @@ fn aggregate_gpr_reads(instruction: DecodedInstruction) -> u32 {
         DecodedInstruction::ReverseBits64 { source, .. }
         | DecodedInstruction::CountLeadingZeros64 { source, .. } => register_mask(&[source]),
         DecodedInstruction::LoadByte { base, .. }
+        | DecodedInstruction::Load16 { base, .. }
+        | DecodedInstruction::Load32 { base, .. }
+        | DecodedInstruction::Load64 { base, .. }
         | DecodedInstruction::LoadVector128 { base, .. }
+        | DecodedInstruction::LoadVectorPair128 { base, .. }
         | DecodedInstruction::SveLoadBytes { base, .. } => register_mask(&[base]),
         DecodedInstruction::LoadByteRegister { base, index, .. }
         | DecodedInstruction::Load64RegisterScaled { base, index, .. } => {
@@ -5458,8 +6020,12 @@ fn aggregate_gpr_reads(instruction: DecodedInstruction) -> u32 {
         | DecodedInstruction::SveCompareEqualBytes { .. }
         | DecodedInstruction::Sve2MatchBytes { .. }
         | DecodedInstruction::SveAndPredicateBytes { .. }
+        | DecodedInstruction::SveAndPredicateBytesSetFlags { .. }
+        | DecodedInstruction::SveBitClearPredicateBytesSetFlags { .. }
+        | DecodedInstruction::SveBitClearPredicateBytes { .. }
         | DecodedInstruction::SveTestPredicateBytes { .. }
         | DecodedInstruction::SveBreakBeforeBytes { .. }
+        | DecodedInstruction::SveBreakAfterBytes { .. }
         | DecodedInstruction::SveCountPredicateBytes { .. }
         | DecodedInstruction::Address { .. }
         | DecodedInstruction::Branch { .. }
@@ -5484,8 +6050,13 @@ fn aggregate_vector_reads(instruction: DecodedInstruction) -> u32 {
     }
 }
 
-const fn aggregate_vector_write(instruction: DecodedInstruction) -> Option<u8> {
+fn aggregate_vector_writes(instruction: DecodedInstruction) -> u32 {
     match instruction {
+        DecodedInstruction::LoadVectorPair128 {
+            first_destination,
+            second_destination,
+            ..
+        } => register_mask(&[first_destination, second_destination]),
         DecodedInstruction::LoadVector128 { destination, .. }
         | DecodedInstruction::DuplicateByte16 { destination, .. }
         | DecodedInstruction::CompareEqualBytes16 { destination, .. }
@@ -5496,8 +6067,8 @@ const fn aggregate_vector_write(instruction: DecodedInstruction) -> Option<u8> {
         | DecodedInstruction::ShiftRightNarrowHalfwordsToBytes8 { destination, .. }
         | DecodedInstruction::AddAcrossBytes16 { destination, .. }
         | DecodedInstruction::SveDuplicateByte { destination, .. }
-        | DecodedInstruction::SveLoadBytes { destination, .. } => Some(destination),
-        _ => None,
+        | DecodedInstruction::SveLoadBytes { destination, .. } => register_mask(&[destination]),
+        _ => 0,
     }
 }
 
@@ -5510,11 +6081,32 @@ fn aggregate_predicate_reads(instruction: DecodedInstruction) -> u16 {
             left,
             right,
             ..
+        }
+        | DecodedInstruction::SveAndPredicateBytesSetFlags {
+            predicate,
+            left,
+            right,
+            ..
+        }
+        | DecodedInstruction::SveBitClearPredicateBytesSetFlags {
+            predicate,
+            left,
+            right,
+            ..
+        }
+        | DecodedInstruction::SveBitClearPredicateBytes {
+            predicate,
+            left,
+            right,
+            ..
         } => predicate_mask(&[predicate, left, right]),
         DecodedInstruction::SveTestPredicateBytes { predicate, tested } => {
             predicate_mask(&[predicate, tested])
         }
         DecodedInstruction::SveBreakBeforeBytes {
+            predicate, source, ..
+        }
+        | DecodedInstruction::SveBreakAfterBytes {
             predicate, source, ..
         }
         | DecodedInstruction::SveCountPredicateBytes {
@@ -5529,7 +6121,11 @@ const fn aggregate_predicate_write(instruction: DecodedInstruction) -> Option<u8
         DecodedInstruction::SvePtrueBytesVl16 { destination }
         | DecodedInstruction::Sve2MatchBytes { destination, .. }
         | DecodedInstruction::SveAndPredicateBytes { destination, .. }
-        | DecodedInstruction::SveBreakBeforeBytes { destination, .. } => Some(destination),
+        | DecodedInstruction::SveAndPredicateBytesSetFlags { destination, .. }
+        | DecodedInstruction::SveBitClearPredicateBytesSetFlags { destination, .. }
+        | DecodedInstruction::SveBitClearPredicateBytes { destination, .. }
+        | DecodedInstruction::SveBreakBeforeBytes { destination, .. }
+        | DecodedInstruction::SveBreakAfterBytes { destination, .. } => Some(destination),
         _ => None,
     }
 }

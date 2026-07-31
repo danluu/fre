@@ -1,0 +1,19 @@
+[package]
+name = "fre-aot-macho"
+version.workspace = true
+description = "Bounded deterministic macOS AArch64 Mach-O objects for audited FRE images"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+fre-aot-aarch64 = { path = "../fre-aot-aarch64" }
+fre-aot-search-contract = { path = "../fre-aot-search-contract" }
+fre-exact-alloc = { path = "../fre-exact-alloc" }
+fre-jit-aarch64 = { path = "../fre-jit-aarch64" }
+fre-kernel-ir = { path = "../fre-kernel-ir" }
+sha2 = "=0.10.9"
+
+[lints]
+workspace = true

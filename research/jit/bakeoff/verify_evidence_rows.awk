@@ -28,6 +28,7 @@ NR == 1 {
     required[16] = "declared_min_qualifying_calls"
     required[17] = "measured_calls"
     required[18] = "measured_qualifying_calls"
+    required[19] = "timing_scope"
     for (item in required) {
         if (!(required[item] in index_of)) {
             print "missing CSV column " required[item] > "/dev/stderr"
@@ -45,9 +46,18 @@ NR == 1 {
         next
     }
     schema = $(index_of["schema"])
-    if (schema != "fre-jit-bakeoff-v2") {
+    if (schema != "fre-jit-bakeoff-v2" &&
+        schema != "fre-jit-bakeoff-v3") {
         print "row " NR " has the wrong row schema" > "/dev/stderr"
         bad = 1
+    }
+    if (schema == "fre-jit-bakeoff-v3" && !checked_abi2_identity) {
+        checked_abi2_identity = 1
+        if (length(abi2_identity) != 64 ||
+            abi2_identity ~ /[^0-9a-f]/) {
+            print "V3 verification requires an external ABI2 artifact identity" > "/dev/stderr"
+            bad = 1
+        }
     }
     engine = $(index_of["engine"])
     if (engine != "fre-qualified-exact" &&
@@ -59,6 +69,7 @@ NR == 1 {
     iterations = $(index_of["iterations"]) + 0
     haystack = $(index_of["haystack_bytes"]) + 0
     stage = $(index_of["stage"])
+    timing_scope = $(index_of["timing_scope"])
     output = $(index_of["output_kind"])
     backend = $(index_of["backend"])
     route = $(index_of["route"])
@@ -95,16 +106,54 @@ NR == 1 {
         bad = 1
     }
     if (route == "native-jit") {
-        if (backend != "aarch64-search-v7" ||
-            artifact != span_identity ||
-            artifact_binding != "facade-reported-identity+deterministic-native-span-image" ||
+        if (schema == "fre-jit-bakeoff-v2") {
+            expected_backend = "aarch64-search-v7"
+            expected_artifact_binding = \
+                "facade-reported-identity+deterministic-native-span-image"
+            identity_matches = artifact == span_identity
+        } else {
+            expected_backend = \
+                "aarch64-search-v8-selected-end-register-v2"
+            expected_artifact_binding = \
+                "facade-reported-abi2-identity+deterministic-selected-end-register-v2-image"
+            identity_matches = artifact == abi2_identity
+        }
+        if (backend != expected_backend ||
+            !identity_matches ||
+            artifact_binding != expected_artifact_binding ||
             length(artifact) != 64 || artifact ~ /[^0-9a-f]/) {
             print "qualified native artifact binding mismatch at row " NR > "/dev/stderr"
             bad = 1
         }
-        for (field = 20; field <= 29; field++) {
-            if ($(field) + 0 <= 0) {
-                print "qualified native row " NR " has empty native accounting" > "/dev/stderr"
+        if (schema == "fre-jit-bakeoff-v2") {
+            for (field = 20; field <= 29; field++) {
+                if ($(field) + 0 <= 0) {
+                    print "qualified native row " NR " has empty native accounting" > "/dev/stderr"
+                    bad = 1
+                }
+            }
+        } else {
+            required_positive[1] = "code_bytes"
+            required_positive[2] = "data_bytes"
+            required_positive[3] = "payload_used_bytes"
+            required_positive[4] = "total_mapped_bytes"
+            required_positive[5] = "total_pages"
+            required_positive[6] = "instructions"
+            required_positive[7] = "vector_instructions"
+            required_positive[8] = "loads"
+            required_positive[9] = "branches"
+            for (item in required_positive) {
+                field = index_of[required_positive[item]]
+                if ($(field) + 0 <= 0) {
+                    print "qualified ABI2 native row " NR " has empty " required_positive[item] > "/dev/stderr"
+                    bad = 1
+                }
+            }
+            if ($(index_of["stores"]) + 0 != 0 ||
+                $(index_of["identity_bytes_hashed"]) + 0 != 0 ||
+                $(index_of["identity_scratch_bytes"]) + 0 != 0 ||
+                $(index_of["identity_heap_allocations"]) + 0 != 0) {
+                print "qualified ABI2 native row " NR " violates register-return/hot-identity accounting" > "/dev/stderr"
                 bad = 1
             }
         }
@@ -125,15 +174,62 @@ NR == 1 {
         bad = 1
     }
 
-    expected_binding = \
-        "fre-qualified-exact-evidence-v2|output=" output \
-        "|backend=" backend \
-        "|route=" route \
-        "|artifact=" artifact \
-        "|qualification_state=" qualification_state \
-        "|qualification_bundle=" qualification_bundle \
-        "|minimum_window_bytes=" min_window \
-        "|minimum_qualifying_calls=" min_calls
+    if (schema == "fre-jit-bakeoff-v2") {
+        expected_binding = \
+            "fre-qualified-exact-evidence-v2|output=" output \
+            "|backend=" backend \
+            "|route=" route \
+            "|artifact=" artifact \
+            "|qualification_state=" qualification_state \
+            "|qualification_bundle=" qualification_bundle \
+            "|minimum_window_bytes=" min_window \
+            "|minimum_qualifying_calls=" min_calls
+    } else {
+        native_output = route == "native-jit" ? "selected-end" : "none"
+        native_abi = route == "native-jit" ? \
+            "selected-end-register-v2" : "none"
+        target = route == "native-jit" ? \
+            "aarch64-aapcs64-asimd" : "none"
+        expected_binding = \
+            "fre-qualified-exact-evidence-v3|public_output=" output \
+            "|native_output=" native_output \
+            "|native_abi=" native_abi \
+            "|backend_policy=asimd-v8" \
+            "|target=" target \
+            "|backend=" backend \
+            "|route=" route \
+            "|artifact=" artifact \
+            "|sve_vector_bytes_at_publication=none" \
+            "|required_thread_sve_vector_bytes=none" \
+            "|qualification_state=" qualification_state \
+            "|qualification_bundle=" qualification_bundle \
+            "|minimum_window_bytes=" min_window \
+            "|minimum_qualifying_calls=" min_calls
+    }
+    if (schema == "fre-jit-bakeoff-v3") {
+        if (engine == "fre-qualified-exact" && stage == "search") {
+            expected_scope = \
+                "session_value_search_declared_workload_build_and_session_excluded"
+        } else if (engine == "fre-qualified-exact" &&
+                   stage == "build_full_workload") {
+            expected_scope = \
+                "build_plus_session_plus_declared_workload_amortized_per_value_search"
+        } else if (engine == "fre-qualified-exact-under-threshold" &&
+                   stage == "search") {
+            expected_scope = \
+                "session_value_search_forced_portable_build_and_session_excluded"
+        } else if (engine == "fre-qualified-exact-under-threshold" &&
+                   stage == "build_full_workload") {
+            expected_scope = \
+                "portable_build_plus_session_plus_declared_workload_amortized_per_value_search"
+        } else {
+            expected_scope = ""
+        }
+        if (expected_scope == "" || timing_scope != expected_scope) {
+            print "qualified V3 timing boundary mismatch at row " NR > "/dev/stderr"
+            bad = 1
+        }
+    }
     if (binding != expected_binding) {
         print "qualified evidence binding mismatch at row " NR > "/dev/stderr"
         bad = 1

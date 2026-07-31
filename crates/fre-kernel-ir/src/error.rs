@@ -8,9 +8,17 @@ pub enum ResourceKind {
     DataBlobs,
     DataBytes,
     SerializedBytes,
+    SerializedCapacityBytes,
+    ConstructionAllocationBytes,
+    RawProgramCapacityBytes,
     EstimatedCodeBytes,
     ValidationWork,
+    ConstructionWork,
     ValidationScratchBytes,
+    ValidationPhaseBytes,
+    SerializationPhaseBytes,
+    IdentityPhaseBytes,
+    RetainedProgramBytes,
     WorkFactor,
 }
 
@@ -19,8 +27,11 @@ pub enum ResourceKind {
 pub enum ArithmeticSite {
     DataBytes,
     SerializedBytes,
+    ConstructionAllocationBytes,
     EstimatedCodeBytes,
     ValidationWork,
+    ConstructionWork,
+    PhasePeakBytes,
     WorkFactor,
     SearchWorkBound,
     SearchPosition,
@@ -62,6 +73,15 @@ pub enum ValidateError {
     },
     ArithmeticOverflow {
         site: ArithmeticSite,
+    },
+    SerializationLengthMismatch {
+        expected: usize,
+        attempted: usize,
+    },
+    ConstructionLengthMismatch {
+        resource: ResourceKind,
+        expected: usize,
+        attempted: usize,
     },
     AllocationFailed {
         resource: ResourceKind,

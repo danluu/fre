@@ -21,8 +21,11 @@ const TARGET_FEATURES_PACKAGE: &str = "fre-target-features";
 const TARGET_FEATURES_LIBRARY: &str = "fre_target_features";
 const SIMD_KERNELS_PACKAGE: &str = "fre-simd-kernels";
 const SIMD_KERNELS_LIBRARY: &str = "fre_simd_kernels";
+const STATIC_RUNTIME_PACKAGE: &str = "fre-aot-static-runtime";
+const STATIC_RUNTIME_LIBRARY: &str = "fre_aot_static_runtime";
 const FORBID_ATTRIBUTE: &str = "#![forbid(unsafe_code)]";
 const DENY_ATTRIBUTE: &str = "#![deny(unsafe_code)]";
+const STATIC_RUNTIME_DENY_ATTRIBUTE: &str = "#![deny(unsafe_code, unsafe_op_in_unsafe_fn)]";
 const EXACT_ALLOC_SOURCE_SHA256: [u8; 32] = [
     0x29, 0xdf, 0x6f, 0x2e, 0x56, 0x96, 0xf9, 0x70, 0x5e, 0x5b, 0x48, 0x88, 0x7f, 0x52, 0x18, 0xfa,
     0xf7, 0x6b, 0xc5, 0x97, 0xdc, 0x56, 0x50, 0xca, 0x39, 0xb1, 0x51, 0xdd, 0x01, 0xb5, 0xf7, 0x26,
@@ -450,6 +453,173 @@ missing_panics_doc = "allow"
 module_name_repetitions = "allow"
 "#;
 
+const STATIC_RUNTIME_LINTS: &str = r#"
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "deny", priority = -1 }
+unreachable_pub = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+allow_attributes_without_reason = "warn"
+arithmetic_side_effects = "warn"
+as_conversions = "warn"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+"#;
+
+#[derive(Clone, Copy, Debug)]
+struct ReviewedUnsafeSource {
+    relative: &'static str,
+    sha256: [u8; 32],
+    unsafe_code: usize,
+    unsafe_blocks: usize,
+    unsafe_functions: usize,
+    unsafe_externs: usize,
+    unsafe_impls: usize,
+    unsafe_traits: usize,
+}
+
+const STATIC_RUNTIME_REVIEWED_UNSAFE_SOURCES: [ReviewedUnsafeSource; 7] = [
+    ReviewedUnsafeSource {
+        relative: "src/linked/macos_aarch64.rs",
+        sha256: [
+            0xc1, 0x06, 0xbc, 0xb7, 0xe6, 0xc5, 0xaf, 0xc4, 0x72, 0xc6, 0xf3, 0x08, 0x83, 0xd6,
+            0xb6, 0x3d, 0x32, 0xb7, 0xe7, 0x7d, 0xbe, 0x59, 0xb6, 0xd5, 0x06, 0xd2, 0xd8, 0x4a,
+            0x04, 0xc4, 0x7f, 0x59,
+        ],
+        unsafe_code: 6,
+        unsafe_blocks: 8,
+        unsafe_functions: 1,
+        unsafe_externs: 1,
+        unsafe_impls: 0,
+        unsafe_traits: 0,
+    },
+    ReviewedUnsafeSource {
+        relative: "src/linked/mod.rs",
+        sha256: [
+            0x2c, 0xfe, 0x13, 0xa9, 0x60, 0x8d, 0x62, 0x5d, 0xa0, 0xc1, 0x50, 0xa2, 0xef, 0xfe,
+            0xb1, 0xbc, 0xbd, 0xf5, 0xd4, 0x8f, 0x92, 0x97, 0xbd, 0x49, 0x83, 0x6e, 0x7a, 0xd6,
+            0xc5, 0x4e, 0x61, 0x48,
+        ],
+        unsafe_code: 12,
+        unsafe_blocks: 10,
+        unsafe_functions: 4,
+        unsafe_externs: 4,
+        unsafe_impls: 0,
+        unsafe_traits: 0,
+    },
+    ReviewedUnsafeSource {
+        relative: "src/linked/unavailable.rs",
+        sha256: [
+            0xc9, 0xa3, 0x94, 0xb3, 0x74, 0x60, 0xcc, 0xef, 0x57, 0xae, 0x4e, 0xf0, 0xf1, 0x3e,
+            0xd7, 0xb2, 0x02, 0x13, 0xd9, 0x70, 0x3d, 0x67, 0xf2, 0x0f, 0xcb, 0x4b, 0x1e, 0x9a,
+            0x77, 0xd0, 0x70, 0x80,
+        ],
+        unsafe_code: 1,
+        unsafe_blocks: 0,
+        unsafe_functions: 1,
+        unsafe_externs: 0,
+        unsafe_impls: 0,
+        unsafe_traits: 0,
+    },
+    ReviewedUnsafeSource {
+        relative: "src/search_linked/linux_aarch64.rs",
+        sha256: [
+            0x35, 0xe8, 0xc4, 0xb0, 0x39, 0xfa, 0x9d, 0xe5, 0xe4, 0x34, 0x4a, 0x50, 0x45, 0x3c,
+            0x76, 0x32, 0x73, 0x09, 0x2e, 0x89, 0xa2, 0xb1, 0x60, 0x7f, 0xe2, 0x5c, 0x8b, 0x53,
+            0x5e, 0x1d, 0xf7, 0x5f,
+        ],
+        unsafe_code: 8,
+        unsafe_blocks: 12,
+        unsafe_functions: 1,
+        unsafe_externs: 1,
+        unsafe_impls: 0,
+        unsafe_traits: 0,
+    },
+    ReviewedUnsafeSource {
+        relative: "src/search_linked/macos_aarch64.rs",
+        sha256: [
+            0x00, 0x8a, 0x21, 0xc8, 0x9a, 0xb5, 0x40, 0xf0, 0xc8, 0x4b, 0x63, 0x0b, 0x61, 0x7f,
+            0xb2, 0x99, 0x48, 0x7b, 0x41, 0xb7, 0xf3, 0xbf, 0xa0, 0x32, 0x7e, 0xb7, 0x9c, 0x84,
+            0xb8, 0x10, 0x3a, 0x51,
+        ],
+        unsafe_code: 6,
+        unsafe_blocks: 8,
+        unsafe_functions: 1,
+        unsafe_externs: 1,
+        unsafe_impls: 0,
+        unsafe_traits: 0,
+    },
+    ReviewedUnsafeSource {
+        relative: "src/search_linked/mod.rs",
+        sha256: [
+            0xa9, 0x7e, 0x72, 0xe6, 0x82, 0x64, 0x31, 0x18, 0x5e, 0xe3, 0x68, 0x4c, 0x9b, 0x2c,
+            0x03, 0xa3, 0xab, 0x1f, 0xe5, 0xd8, 0xab, 0xe8, 0x25, 0x1a, 0x85, 0x79, 0x77, 0x41,
+            0x5c, 0x8b, 0xfb, 0xcf,
+        ],
+        unsafe_code: 13,
+        unsafe_blocks: 12,
+        unsafe_functions: 3,
+        unsafe_externs: 6,
+        unsafe_impls: 0,
+        unsafe_traits: 0,
+    },
+    ReviewedUnsafeSource {
+        relative: "src/search_linked/unavailable.rs",
+        sha256: [
+            0xea, 0xd1, 0x33, 0xb8, 0xa9, 0xdf, 0xe1, 0x82, 0x9f, 0xbc, 0xcd, 0x57, 0x40, 0xe6,
+            0xb3, 0xaa, 0xef, 0x8e, 0x18, 0xe0, 0x8f, 0xc8, 0xaa, 0x55, 0xac, 0xbf, 0x38, 0x85,
+            0xc2, 0x3b, 0x1d, 0xa3,
+        ],
+        unsafe_code: 4,
+        unsafe_blocks: 1,
+        unsafe_functions: 1,
+        unsafe_externs: 1,
+        unsafe_impls: 0,
+        unsafe_traits: 0,
+    },
+];
+
+const STATIC_RUNTIME_FILES: [&str; 32] = [
+    "Cargo.toml",
+    "qualification/linux-search-private-rows/README.md",
+    "qualification/linux-search-private-rows/source_row_tool.py",
+    "qualification/linux-search-private-rows/test_promotion_delta.sh",
+    "qualification/linux-search-private-rows/test_source_row_tool.py",
+    "qualification/linux-search-private-rows/verify-promotion-delta.sh",
+    "qualification/linux-search-production-rows/README.md",
+    "qualification/linux-search-production-rows/production_row_tool.py",
+    "qualification/linux-search-production-rows/templates/production-authorization-v1.tsv.template",
+    "qualification/linux-search-production-rows/templates/promotion-inputs-v1.txt.template",
+    "qualification/linux-search-production-rows/test_production_row_tool.py",
+    "qualification/linux-search-production-rows/test_promotion_delta.sh",
+    "qualification/linux-search-production-rows/verify-promotion-delta.sh",
+    "src/call.rs",
+    "src/error.rs",
+    "src/expected.rs",
+    "src/lib.rs",
+    "src/linked/macos_aarch64.rs",
+    "src/linked/mod.rs",
+    "src/linked/unavailable.rs",
+    "src/search_call.rs",
+    "src/search_expected.rs",
+    "src/search_linked/linux_aarch64.rs",
+    "src/search_linked/macos_aarch64.rs",
+    "src/search_linked/mod.rs",
+    "src/search_linked/unavailable.rs",
+    "src/search_support.rs",
+    "src/search_support/private_rows.rs",
+    "src/search_support/production_rows.rs",
+    "src/search_test_fixture.rs",
+    "src/support.rs",
+    "src/test_fixture.rs",
+];
+
 #[derive(Debug, Deserialize)]
 struct Metadata {
     workspace_root: PathBuf,
@@ -480,7 +650,7 @@ struct LocalException {
     expected_lints: &'static str,
 }
 
-const LOCAL_EXCEPTIONS: [LocalException; 5] = [
+const LOCAL_EXCEPTIONS: [LocalException; 6] = [
     LocalException {
         package: "fre-capi",
         manifest: "crates/fre-capi/Cargo.toml",
@@ -495,6 +665,11 @@ const LOCAL_EXCEPTIONS: [LocalException; 5] = [
         package: EXACT_ALLOC_PACKAGE,
         manifest: "crates/fre-exact-alloc/Cargo.toml",
         expected_lints: EXACT_ALLOC_LINTS,
+    },
+    LocalException {
+        package: STATIC_RUNTIME_PACKAGE,
+        manifest: "crates/fre-aot-static-runtime/Cargo.toml",
+        expected_lints: STATIC_RUNTIME_LINTS,
     },
     LocalException {
         package: TARGET_FEATURES_PACKAGE,
@@ -597,6 +772,7 @@ fn audit(metadata: &Metadata) -> Result<AuditSummary, String> {
     audit_exact_allocator(&packages_by_name, &workspace_root)?;
     audit_target_features(&packages_by_name, &workspace_root)?;
     audit_simd_kernels(&packages_by_name, &workspace_root)?;
+    audit_static_runtime(&packages_by_name, &workspace_root)?;
 
     Ok(AuditSummary {
         workspace_packages: members.len(),
@@ -916,6 +1092,231 @@ fn audit_exact_allocator_source_text(source: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn audit_static_runtime(
+    packages: &BTreeMap<&str, &Package>,
+    workspace_root: &Path,
+) -> Result<(), String> {
+    let package = packages
+        .get(STATIC_RUNTIME_PACKAGE)
+        .ok_or_else(|| format!("missing {STATIC_RUNTIME_PACKAGE} workspace package"))?;
+    if package.targets.len() != 1 {
+        return Err(format!(
+            "{STATIC_RUNTIME_PACKAGE} must have exactly one target, observed {}",
+            package.targets.len()
+        ));
+    }
+    for dependency in &package.dependencies {
+        let name = dependency
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                format!("{STATIC_RUNTIME_PACKAGE} dependency lacks an exact package name")
+            })?;
+        if matches!(
+            name,
+            "fre" | "fre-aot-compiler" | "fre-aot-macho" | "fre-jit-aarch64" | "fre-jit-runtime"
+        ) {
+            return Err(format!(
+                "{STATIC_RUNTIME_PACKAGE} has forbidden compiler/JIT dependency {name}"
+            ));
+        }
+    }
+
+    let package_root = canonical(
+        &workspace_root.join("crates/fre-aot-static-runtime"),
+        "fre-aot-static-runtime package root",
+    )?;
+    let expected_manifest = canonical(
+        &package_root.join("Cargo.toml"),
+        "fre-aot-static-runtime manifest",
+    )?;
+    if canonical(
+        &package.manifest_path,
+        "fre-aot-static-runtime package manifest",
+    )? != expected_manifest
+    {
+        return Err("fre-aot-static-runtime manifest path drifted".to_owned());
+    }
+    let expected_source = canonical(
+        &package_root.join("src/lib.rs"),
+        "fre-aot-static-runtime library source",
+    )?;
+    let target = &package.targets[0];
+    if target.name != STATIC_RUNTIME_LIBRARY
+        || target.kind.as_slice() != ["lib"]
+        || canonical(&target.src_path, "fre-aot-static-runtime target source")? != expected_source
+    {
+        return Err(format!(
+            "unexpected fre-aot-static-runtime target {} kind {:?} source {}",
+            target.name,
+            target.kind,
+            target.src_path.display()
+        ));
+    }
+
+    let mut files = BTreeSet::new();
+    collect_regular_files(&package_root, &package_root, &mut files)?;
+    require_static_runtime_file_inventory(&files)?;
+
+    let reviewed: BTreeMap<_, _> = STATIC_RUNTIME_REVIEWED_UNSAFE_SOURCES
+        .iter()
+        .map(|source| (PathBuf::from(source.relative), source))
+        .collect();
+    if reviewed.len() != STATIC_RUNTIME_REVIEWED_UNSAFE_SOURCES.len() {
+        return Err("duplicate fre-aot-static-runtime reviewed unsafe source".to_owned());
+    }
+    let mut observed_reviewed = BTreeSet::new();
+    for relative in files
+        .iter()
+        .filter(|relative| relative.extension().and_then(|value| value.to_str()) == Some("rs"))
+    {
+        let path = package_root.join(relative);
+        let source_bytes = fs::read(&path)
+            .map_err(|error| format!("read static runtime source {}: {error}", path.display()))?;
+        if let Some(specification) = reviewed.get(relative) {
+            observed_reviewed.insert(relative.clone());
+            audit_static_runtime_unsafe_source(&source_bytes, specification)?;
+        } else {
+            audit_static_runtime_safe_source(relative, &source_bytes)?;
+        }
+    }
+    let expected_reviewed: BTreeSet<_> = reviewed.keys().cloned().collect();
+    if observed_reviewed != expected_reviewed {
+        return Err(format!(
+            "fre-aot-static-runtime unsafe source inventory drifted: observed={observed_reviewed:?} expected={expected_reviewed:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn require_static_runtime_file_inventory(files: &BTreeSet<PathBuf>) -> Result<(), String> {
+    let expected: BTreeSet<_> = STATIC_RUNTIME_FILES
+        .iter()
+        .map(|relative| PathBuf::from(*relative))
+        .collect();
+    if files != &expected {
+        return Err(format!(
+            "fre-aot-static-runtime file inventory drifted: actual={files:?} expected={expected:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn audit_static_runtime_unsafe_source(
+    source_bytes: &[u8],
+    specification: &ReviewedUnsafeSource,
+) -> Result<(), String> {
+    if Sha256::digest(source_bytes)[..] != specification.sha256 {
+        return Err(format!(
+            "fre-aot-static-runtime complete source digest drifted for {}",
+            specification.relative
+        ));
+    }
+    let source = std::str::from_utf8(source_bytes).map_err(|error| {
+        format!(
+            "fre-aot-static-runtime source {} is not UTF-8: {error}",
+            specification.relative
+        )
+    })?;
+    if source.contains("#![allow") {
+        return Err(format!(
+            "fre-aot-static-runtime source {} contains a crate/module-wide allow",
+            specification.relative
+        ));
+    }
+    let observed = [
+        ("unsafe_code", source.matches("unsafe_code").count()),
+        ("unsafe {", source.matches("unsafe {").count()),
+        ("unsafe fn", source.matches("unsafe fn").count()),
+        ("unsafe extern", source.matches("unsafe extern").count()),
+        ("unsafe impl", source.matches("unsafe impl").count()),
+        ("unsafe trait", source.matches("unsafe trait").count()),
+    ];
+    let expected = [
+        ("unsafe_code", specification.unsafe_code),
+        ("unsafe {", specification.unsafe_blocks),
+        ("unsafe fn", specification.unsafe_functions),
+        ("unsafe extern", specification.unsafe_externs),
+        ("unsafe impl", specification.unsafe_impls),
+        ("unsafe trait", specification.unsafe_traits),
+    ];
+    if observed != expected {
+        return Err(format!(
+            "fre-aot-static-runtime unsafe token inventory drifted for {}: observed={observed:?} expected={expected:?}",
+            specification.relative
+        ));
+    }
+    let item_allow_lines = source
+        .lines()
+        .filter(|line| line.trim() == "unsafe_code,")
+        .count();
+    if item_allow_lines != specification.unsafe_code {
+        return Err(format!(
+            "fre-aot-static-runtime item-scoped unsafe allowance inventory drifted for {}",
+            specification.relative
+        ));
+    }
+    reject_static_runtime_expansion_paths(specification.relative, source)
+}
+
+fn audit_static_runtime_safe_source(relative: &Path, source_bytes: &[u8]) -> Result<(), String> {
+    let source = std::str::from_utf8(source_bytes).map_err(|error| {
+        format!(
+            "fre-aot-static-runtime source {} is not UTF-8: {error}",
+            relative.display()
+        )
+    })?;
+    let is_library = relative == Path::new("src/lib.rs");
+    let expected_unsafe_code = usize::from(is_library);
+    if source.matches("unsafe_code").count() != expected_unsafe_code
+        || (is_library
+            && (source.matches(STATIC_RUNTIME_DENY_ATTRIBUTE).count() != 1
+                || !source
+                    .lines()
+                    .any(|line| line == STATIC_RUNTIME_DENY_ATTRIBUTE)))
+    {
+        return Err(format!(
+            "fre-aot-static-runtime safe source {} unsafe-lint boundary drifted",
+            relative.display()
+        ));
+    }
+    for forbidden in [
+        "#![allow",
+        "unsafe {",
+        "unsafe fn",
+        "unsafe extern",
+        "unsafe impl",
+        "unsafe trait",
+    ] {
+        if source.contains(forbidden) {
+            return Err(format!(
+                "fre-aot-static-runtime safe source {} contains forbidden token {forbidden:?}",
+                relative.display()
+            ));
+        }
+    }
+    reject_static_runtime_expansion_paths(&relative.to_string_lossy(), source)
+}
+
+fn reject_static_runtime_expansion_paths(relative: &str, source: &str) -> Result<(), String> {
+    for forbidden in [
+        "include!",
+        "include_bytes!",
+        "include_str!",
+        "#[path",
+        "proc_macro",
+        "env!",
+        "option_env!",
+    ] {
+        if source.contains(forbidden) {
+            return Err(format!(
+                "fre-aot-static-runtime source {relative} contains forbidden expansion path {forbidden:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn audit_target_features(
     packages: &BTreeMap<&str, &Package>,
     workspace_root: &Path,
@@ -1210,13 +1611,17 @@ fn canonical(path: &Path, description: &str) -> Result<PathBuf, String> {
 mod tests {
     use super::{
         DENY_ATTRIBUTE, EXACT_ALLOC_LINTS, EXACT_ALLOC_REVIEWED_BLOCKS, EXACT_VEC_REVIEWED_BLOCK,
-        Package, TARGET_FEATURES_MACOS_REVIEWED_BLOCK, TARGET_FEATURES_X86_REVIEWED_BLOCK, Target,
-        WARN_UNSAFE_LINTS, ZEROED_EXACT_REVIEWED_BLOCK, audit_exact_allocator,
-        audit_exact_allocator_source, audit_exact_allocator_source_text, audit_kernel_targets,
+        Package, ReviewedUnsafeSource, STATIC_RUNTIME_FILES, STATIC_RUNTIME_LINTS,
+        STATIC_RUNTIME_REVIEWED_UNSAFE_SOURCES, TARGET_FEATURES_MACOS_REVIEWED_BLOCK,
+        TARGET_FEATURES_X86_REVIEWED_BLOCK, Target, WARN_UNSAFE_LINTS, ZEROED_EXACT_REVIEWED_BLOCK,
+        audit_exact_allocator, audit_exact_allocator_source, audit_exact_allocator_source_text,
+        audit_kernel_targets, audit_static_runtime_safe_source, audit_static_runtime_unsafe_source,
         audit_target_feature_source_text, require_exact_lints,
+        require_static_runtime_file_inventory,
     };
+    use sha2::{Digest as _, Sha256};
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, BTreeSet},
         fs,
         path::{Path, PathBuf},
         sync::atomic::{AtomicU64, Ordering},
@@ -1309,6 +1714,39 @@ mod tests {
 
     fn canonical_target_feature_source() -> &'static str {
         include_str!("../../../crates/fre-target-features/src/lib.rs")
+    }
+
+    fn canonical_static_runtime_unsafe_source(relative: &str) -> &'static [u8] {
+        match relative {
+            "src/linked/macos_aarch64.rs" => {
+                include_bytes!("../../../crates/fre-aot-static-runtime/src/linked/macos_aarch64.rs")
+            }
+            "src/linked/mod.rs" => {
+                include_bytes!("../../../crates/fre-aot-static-runtime/src/linked/mod.rs")
+            }
+            "src/linked/unavailable.rs" => {
+                include_bytes!("../../../crates/fre-aot-static-runtime/src/linked/unavailable.rs")
+            }
+            "src/search_linked/linux_aarch64.rs" => {
+                include_bytes!(
+                    "../../../crates/fre-aot-static-runtime/src/search_linked/linux_aarch64.rs"
+                )
+            }
+            "src/search_linked/macos_aarch64.rs" => {
+                include_bytes!(
+                    "../../../crates/fre-aot-static-runtime/src/search_linked/macos_aarch64.rs"
+                )
+            }
+            "src/search_linked/mod.rs" => {
+                include_bytes!("../../../crates/fre-aot-static-runtime/src/search_linked/mod.rs")
+            }
+            "src/search_linked/unavailable.rs" => {
+                include_bytes!(
+                    "../../../crates/fre-aot-static-runtime/src/search_linked/unavailable.rs"
+                )
+            }
+            _ => panic!("unknown reviewed static runtime source"),
+        }
     }
 
     fn assert_exact_source_rejected(source: &str) {
@@ -1422,7 +1860,7 @@ mod tests {
     }
 
     #[test]
-    fn exactly_six_reviewed_unsafe_blocks_in_order_are_accepted() {
+    fn exactly_seven_reviewed_unsafe_blocks_in_order_are_accepted() {
         assert_eq!(audit_exact_allocator_source_text(&exact_source()), Ok(()));
     }
 
@@ -1511,6 +1949,10 @@ mod tests {
     fn every_reviewed_function_name_and_reason_is_exact() {
         for (original, replacement) in [
             ("pub fn boxed(&self)", "pub fn renamed_boxed(&self)"),
+            (
+                "pub fn boxed_mut(&mut self)",
+                "pub fn renamed_boxed_mut(&mut self)",
+            ),
             ("fn drop(&mut self)", "fn renamed_drop(&mut self)"),
             (
                 "fn exact_box_or_usize_with<T>(",
@@ -1522,6 +1964,10 @@ mod tests {
             (
                 "the tagged word recovers only the exposed provenance of its live owned allocation",
                 "changed tagged borrow boundary",
+            ),
+            (
+                "the exclusive handle borrow recovers only the exposed provenance of its live exclusively owned allocation",
+                "changed tagged mutable-borrow boundary",
             ),
             (
                 "the tagged word reconstructs its uniquely owned exact allocation for one drop",
@@ -1556,6 +2002,10 @@ mod tests {
             (
                 "ptr::with_exposed_provenance::<T>(address).as_ref()",
                 "ptr::without_provenance::<T>(address).as_ref()",
+            ),
+            (
+                "ptr::with_exposed_provenance_mut::<T>(address).as_mut()",
+                "ptr::without_provenance_mut::<T>(address).as_mut()",
             ),
             (
                 "Box::from_raw(ptr::with_exposed_provenance_mut::<T>(\n                address,\n            ))",
@@ -1600,6 +2050,93 @@ mod tests {
         assert_exact_source_rejected(
             &exact_source().replace(DENY_ATTRIBUTE, &format!("// {DENY_ATTRIBUTE}")),
         );
+    }
+
+    #[test]
+    fn static_runtime_reviewed_sources_match_hash_and_token_inventory() {
+        for specification in &STATIC_RUNTIME_REVIEWED_UNSAFE_SOURCES {
+            assert_eq!(
+                audit_static_runtime_unsafe_source(
+                    canonical_static_runtime_unsafe_source(specification.relative),
+                    specification,
+                ),
+                Ok(())
+            );
+        }
+    }
+
+    #[test]
+    fn static_runtime_source_hash_and_unsafe_token_drift_are_rejected() {
+        let specification = STATIC_RUNTIME_REVIEWED_UNSAFE_SOURCES[2];
+        let canonical = canonical_static_runtime_unsafe_source(specification.relative);
+
+        let mut hash_drift = canonical.to_vec();
+        hash_drift.push(b'\n');
+        assert!(
+            audit_static_runtime_unsafe_source(&hash_drift, &specification)
+                .unwrap_err()
+                .contains("complete source digest")
+        );
+
+        let mut token_drift = canonical.to_vec();
+        token_drift.extend_from_slice(b"// unsafe {\n");
+        let mut token_specification = ReviewedUnsafeSource {
+            sha256: Sha256::digest(&token_drift).into(),
+            ..specification
+        };
+        assert!(
+            audit_static_runtime_unsafe_source(&token_drift, &token_specification)
+                .unwrap_err()
+                .contains("unsafe token inventory")
+        );
+        token_specification.unsafe_blocks = token_specification
+            .unsafe_blocks
+            .checked_add(1)
+            .expect("fixture token count");
+        assert_eq!(
+            audit_static_runtime_unsafe_source(&token_drift, &token_specification),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn static_runtime_missing_or_extra_file_is_rejected() {
+        let mut files: BTreeSet<_> = STATIC_RUNTIME_FILES
+            .iter()
+            .map(|relative| PathBuf::from(*relative))
+            .collect();
+        assert_eq!(require_static_runtime_file_inventory(&files), Ok(()));
+        files.remove(Path::new("src/linked/unavailable.rs"));
+        assert!(
+            require_static_runtime_file_inventory(&files)
+                .unwrap_err()
+                .contains("file inventory")
+        );
+        files.insert(PathBuf::from("src/linked/unavailable.rs"));
+        files.insert(PathBuf::from("src/linked/unsafe_escape.rs"));
+        assert!(
+            require_static_runtime_file_inventory(&files)
+                .unwrap_err()
+                .contains("file inventory")
+        );
+    }
+
+    #[test]
+    fn static_runtime_safe_source_cannot_lower_or_contain_unsafe() {
+        assert_eq!(
+            audit_static_runtime_safe_source(
+                Path::new("src/lib.rs"),
+                b"#![deny(unsafe_code, unsafe_op_in_unsafe_fn)]\npub fn safe() {}\n",
+            ),
+            Ok(())
+        );
+        for source in [
+            b"#![allow(unsafe_code)]\n".as_slice(),
+            b"unsafe fn escape() {}\n".as_slice(),
+            b"fn escape() { unsafe {} }\n".as_slice(),
+        ] {
+            assert!(audit_static_runtime_safe_source(Path::new("src/escape.rs"), source).is_err());
+        }
     }
 
     #[test]
@@ -1658,6 +2195,31 @@ mod tests {
             );
         let error = require_exact_lints("fre-capi", &actual, WARN_UNSAFE_LINTS).unwrap_err();
         assert!(error.contains("drifted"));
+    }
+
+    #[test]
+    fn static_runtime_has_exact_deny_lint_exception() {
+        let document: toml::Value = toml::from_str(STATIC_RUNTIME_LINTS).unwrap();
+        let actual = document.get("lints").unwrap().as_table().unwrap();
+        assert_eq!(
+            require_exact_lints("fre-aot-static-runtime", actual, STATIC_RUNTIME_LINTS,),
+            Ok(())
+        );
+        let mut drifted = actual.clone();
+        drifted
+            .get_mut("rust")
+            .unwrap()
+            .as_table_mut()
+            .unwrap()
+            .insert(
+                "unsafe_code".to_owned(),
+                toml::Value::String("warn".to_owned()),
+            );
+        assert!(
+            require_exact_lints("fre-aot-static-runtime", &drifted, STATIC_RUNTIME_LINTS,)
+                .unwrap_err()
+                .contains("drifted")
+        );
     }
 
     #[test]

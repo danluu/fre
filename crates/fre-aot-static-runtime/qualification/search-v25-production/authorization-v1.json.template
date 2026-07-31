@@ -1,0 +1,46 @@
+{
+  "schema": "fre.aot.search-v25-production-authorization.v1",
+  "state": "unactivated-template",
+  "production_authority": false,
+  "source": {
+    "commit": null,
+    "tree": null
+  },
+  "compiler_architecture": {
+    "regex_codegen": "self-contained-fre-aarch64-search-v25",
+    "regex_codegen_uses_llvm": false,
+    "architecture_review_sha256": null
+  },
+  "qualification": {
+    "development_pass_sha256": null,
+    "campaign_contract_sha256": null,
+    "correctness_binding_sha256": null,
+    "two_host_correctness_gate_sha256": null,
+    "heldout_analysis_sha256": null
+  },
+  "review": {
+    "production_review_sha256": null,
+    "authorization_sha256": null
+  },
+  "family": {
+    "backend_tag": 38,
+    "selector": null,
+    "minimum_literal_bytes": null,
+    "maximum_literal_bytes": null,
+    "minimum_window_bytes": null,
+    "portable_prefix_candidate_starts": null,
+    "plan_identity": null,
+    "analyzer_identity": null,
+    "evidence_identity": null
+  },
+  "targets": {
+    "macos_aarch64": {
+      "manifest_identity": null,
+      "build_receipt_sha256": null
+    },
+    "linux_aarch64": {
+      "manifest_identity": null,
+      "build_receipt_sha256": null
+    }
+  }
+}

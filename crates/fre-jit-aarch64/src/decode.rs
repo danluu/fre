@@ -111,6 +111,16 @@ pub enum DecodedInstruction {
         base: u8,
         offset: u16,
     },
+    Load16 {
+        destination: u8,
+        base: u8,
+        offset: u16,
+    },
+    Load32 {
+        destination: u8,
+        base: u8,
+        offset: u16,
+    },
     LoadByteRegister {
         destination: u8,
         base: u8,
@@ -121,6 +131,11 @@ pub enum DecodedInstruction {
         base: u8,
         index: u8,
     },
+    Load64 {
+        destination: u8,
+        base: u8,
+        offset: u16,
+    },
     Store64 {
         source: u8,
         base: u8,
@@ -128,6 +143,12 @@ pub enum DecodedInstruction {
     },
     LoadVector128 {
         destination: u8,
+        base: u8,
+        offset: u16,
+    },
+    LoadVectorPair128 {
+        first_destination: u8,
+        second_destination: u8,
         base: u8,
         offset: u16,
     },
@@ -204,11 +225,34 @@ pub enum DecodedInstruction {
         left: u8,
         right: u8,
     },
+    SveAndPredicateBytesSetFlags {
+        destination: u8,
+        predicate: u8,
+        left: u8,
+        right: u8,
+    },
+    SveBitClearPredicateBytesSetFlags {
+        destination: u8,
+        predicate: u8,
+        left: u8,
+        right: u8,
+    },
+    SveBitClearPredicateBytes {
+        destination: u8,
+        predicate: u8,
+        left: u8,
+        right: u8,
+    },
     SveTestPredicateBytes {
         predicate: u8,
         tested: u8,
     },
     SveBreakBeforeBytes {
+        destination: u8,
+        predicate: u8,
+        source: u8,
+    },
+    SveBreakAfterBytes {
         destination: u8,
         predicate: u8,
         source: u8,
@@ -257,6 +301,7 @@ impl DecodedInstruction {
         matches!(
             self,
             Self::LoadVector128 { .. }
+                | Self::LoadVectorPair128 { .. }
                 | Self::DuplicateByte16 { .. }
                 | Self::CompareEqualBytes16 { .. }
                 | Self::AndBytes16 { .. }
@@ -273,8 +318,12 @@ impl DecodedInstruction {
                 | Self::SveCompareEqualBytes { .. }
                 | Self::Sve2MatchBytes { .. }
                 | Self::SveAndPredicateBytes { .. }
+                | Self::SveAndPredicateBytesSetFlags { .. }
+                | Self::SveBitClearPredicateBytesSetFlags { .. }
+                | Self::SveBitClearPredicateBytes { .. }
                 | Self::SveTestPredicateBytes { .. }
                 | Self::SveBreakBeforeBytes { .. }
+                | Self::SveBreakAfterBytes { .. }
                 | Self::SveCountPredicateBytes { .. }
         )
     }
@@ -285,6 +334,7 @@ impl DecodedInstruction {
         matches!(
             self,
             Self::LoadVector128 { .. }
+                | Self::LoadVectorPair128 { .. }
                 | Self::DuplicateByte16 { .. }
                 | Self::CompareEqualBytes16 { .. }
                 | Self::AndBytes16 { .. }
@@ -309,8 +359,12 @@ impl DecodedInstruction {
                 | Self::SveCompareEqualBytes { .. }
                 | Self::Sve2MatchBytes { .. }
                 | Self::SveAndPredicateBytes { .. }
+                | Self::SveAndPredicateBytesSetFlags { .. }
+                | Self::SveBitClearPredicateBytesSetFlags { .. }
+                | Self::SveBitClearPredicateBytes { .. }
                 | Self::SveTestPredicateBytes { .. }
                 | Self::SveBreakBeforeBytes { .. }
+                | Self::SveBreakAfterBytes { .. }
                 | Self::SveCountPredicateBytes { .. }
         )
     }
@@ -353,8 +407,11 @@ impl DecodedInstruction {
             | Self::LogicalShiftRightImmediate64 { destination, .. }
             | Self::LogicalShiftLeftImmediate64 { destination, .. }
             | Self::LoadByte { destination, .. }
+            | Self::Load16 { destination, .. }
+            | Self::Load32 { destination, .. }
             | Self::LoadByteRegister { destination, .. }
             | Self::Load64RegisterScaled { destination, .. }
+            | Self::Load64 { destination, .. }
             | Self::MoveVectorByteTo32 { destination, .. }
             | Self::MoveVectorDoubleTo64 { destination, .. }
             | Self::SveCountPredicateBytes { destination, .. }
@@ -368,6 +425,7 @@ impl DecodedInstruction {
             | Self::CompareImmediate32 { .. }
             | Self::Store64 { .. }
             | Self::LoadVector128 { .. }
+            | Self::LoadVectorPair128 { .. }
             | Self::DuplicateByte16 { .. }
             | Self::CompareEqualBytes16 { .. }
             | Self::AndBytes16 { .. }
@@ -382,12 +440,161 @@ impl DecodedInstruction {
             | Self::SveCompareEqualBytes { .. }
             | Self::Sve2MatchBytes { .. }
             | Self::SveAndPredicateBytes { .. }
+            | Self::SveAndPredicateBytesSetFlags { .. }
+            | Self::SveBitClearPredicateBytesSetFlags { .. }
+            | Self::SveBitClearPredicateBytes { .. }
             | Self::SveTestPredicateBytes { .. }
             | Self::SveBreakBeforeBytes { .. }
+            | Self::SveBreakAfterBytes { .. }
             | Self::Branch { .. }
             | Self::BranchCondition { .. }
             | Self::CompareBranchZero64 { .. }
             | Self::Return => None,
+        }
+    }
+
+    /// Whether this instruction explicitly names one general-purpose
+    /// register.
+    ///
+    /// Implicit architectural operands such as `RET`'s link register and all
+    /// vector or predicate register numbers are excluded. The register-return
+    /// Search-v2 auditor uses this complete operand projection to prove that
+    /// the removed Search-v1 result-pointer register `x4` is neither read nor
+    /// written.
+    #[allow(
+        clippy::match_same_arms,
+        clippy::too_many_lines,
+        reason = "operand arities remain grouped by decoded ISA form for security review"
+    )]
+    pub(crate) fn uses_gpr(self, register: u8) -> bool {
+        match self {
+            Self::MoveRegister64 {
+                destination,
+                source,
+            } => [destination, source].contains(&register),
+            Self::MoveZero64 { destination, .. }
+            | Self::MoveKeep64 { destination, .. }
+            | Self::CompareImmediate64 {
+                register: destination,
+                ..
+            }
+            | Self::CompareImmediate32 {
+                register: destination,
+                ..
+            }
+            | Self::MoveVectorByteTo32 { destination, .. }
+            | Self::MoveVectorDoubleTo64 { destination, .. }
+            | Self::SveCountPredicateBytes { destination, .. }
+            | Self::Address { destination, .. }
+            | Self::CompareBranchZero64 {
+                register: destination,
+                ..
+            } => destination == register,
+            Self::CompareRegister64 { left, right } | Self::CompareRegister32 { left, right } => {
+                [left, right].contains(&register)
+            }
+            Self::AddRegister64 {
+                destination,
+                left,
+                right,
+            }
+            | Self::SubtractRegister64 {
+                destination,
+                left,
+                right,
+            }
+            | Self::AndRegister64 {
+                destination,
+                left,
+                right,
+            } => [destination, left, right].contains(&register),
+            Self::AddImmediate64 {
+                destination,
+                source,
+                ..
+            }
+            | Self::SubtractImmediate64 {
+                destination,
+                source,
+                ..
+            }
+            | Self::AndLowBits64 {
+                destination,
+                source,
+                ..
+            }
+            | Self::LogicalShiftRightImmediate64 {
+                destination,
+                source,
+                ..
+            }
+            | Self::LogicalShiftLeftImmediate64 {
+                destination,
+                source,
+                ..
+            }
+            | Self::ReverseBits64 {
+                destination,
+                source,
+            }
+            | Self::CountLeadingZeros64 {
+                destination,
+                source,
+            } => [destination, source].contains(&register),
+            Self::LoadByte {
+                destination, base, ..
+            }
+            | Self::Load16 {
+                destination, base, ..
+            }
+            | Self::Load32 {
+                destination, base, ..
+            }
+            | Self::Load64 {
+                destination, base, ..
+            } => [destination, base].contains(&register),
+            Self::LoadVector128 { base, .. }
+            | Self::LoadVectorPair128 { base, .. }
+            | Self::SveLoadBytes { base, .. } => base == register,
+            Self::LoadByteRegister {
+                destination,
+                base,
+                index,
+            }
+            | Self::Load64RegisterScaled {
+                destination,
+                base,
+                index,
+            } => [destination, base, index].contains(&register),
+            Self::Store64 { source, base, .. } => [source, base].contains(&register),
+            Self::DuplicateByte16 { source, .. } | Self::SveDuplicateByte { source, .. } => {
+                source == register
+            }
+            Self::LogicalShiftRightVariable64 {
+                destination,
+                source,
+                shift,
+            } => [destination, source, shift].contains(&register),
+            Self::CompareEqualBytes16 { .. }
+            | Self::AndBytes16 { .. }
+            | Self::ShiftRightNarrowHalfwordsToBytes8 { .. }
+            | Self::UnsignedMinBytes16 { .. }
+            | Self::UnsignedMaxBytes16 { .. }
+            | Self::UnsignedMaxPairwiseBytes16 { .. }
+            | Self::AddAcrossBytes16 { .. }
+            | Self::SvePtrueBytesVl16 { .. }
+            | Self::SveCompareEqualBytes { .. }
+            | Self::Sve2MatchBytes { .. }
+            | Self::SveAndPredicateBytes { .. }
+            | Self::SveAndPredicateBytesSetFlags { .. }
+            | Self::SveBitClearPredicateBytesSetFlags { .. }
+            | Self::SveBitClearPredicateBytes { .. }
+            | Self::SveTestPredicateBytes { .. }
+            | Self::SveBreakBeforeBytes { .. }
+            | Self::SveBreakAfterBytes { .. }
+            | Self::Branch { .. }
+            | Self::BranchCondition { .. }
+            | Self::Return => false,
         }
     }
 }
@@ -516,6 +723,18 @@ pub fn decode_one(word: u32, offset: u32) -> Result<DecodedInstruction, DecodeEr
             base: rn,
             offset: imm12(word),
         }
+    } else if word & 0xffc0_0000 == 0x7940_0000 {
+        DecodedInstruction::Load16 {
+            destination: rd,
+            base: rn,
+            offset: imm12(word).checked_mul(2).expect("scaled imm12 fits u16"),
+        }
+    } else if word & 0xffc0_0000 == 0xb940_0000 {
+        DecodedInstruction::Load32 {
+            destination: rd,
+            base: rn,
+            offset: imm12(word).checked_mul(4).expect("scaled imm12 fits u16"),
+        }
     } else if word & 0xffe0_fc00 == 0x3860_6800 {
         DecodedInstruction::LoadByteRegister {
             destination: rd,
@@ -527,6 +746,12 @@ pub fn decode_one(word: u32, offset: u32) -> Result<DecodedInstruction, DecodeEr
             destination: rd,
             base: rn,
             index: rm,
+        }
+    } else if word & 0xffc0_0000 == 0xf940_0000 {
+        DecodedInstruction::Load64 {
+            destination: rd,
+            base: rn,
+            offset: imm12(word).checked_mul(8).expect("scaled imm12 fits u16"),
         }
     } else if word & 0xffc0_0000 == 0xf900_0000 {
         DecodedInstruction::Store64 {
@@ -541,6 +766,18 @@ pub fn decode_one(word: u32, offset: u32) -> Result<DecodedInstruction, DecodeEr
             offset: imm12(word)
                 .checked_mul(16)
                 .expect("scaled vector imm12 fits u16"),
+        }
+    } else if word & 0xffe0_0000 == 0xad40_0000 {
+        // LDP Q has a signed imm7. Pinning bit 21 to zero admits only its
+        // nonnegative half while leaving the low six immediate bits available.
+        DecodedInstruction::LoadVectorPair128 {
+            first_destination: rd,
+            second_destination: reg(word >> 10),
+            base: rn,
+            offset: u16::try_from((word >> 15) & 0x3f)
+                .expect("six-bit pair offset")
+                .checked_mul(16)
+                .expect("scaled vector-pair offset fits u16"),
         }
     } else if word & 0xffff_fc00 == 0x4e01_0c00 {
         DecodedInstruction::DuplicateByte16 {
@@ -624,8 +861,29 @@ pub fn decode_one(word: u32, offset: u32) -> Result<DecodedInstruction, DecodeEr
             left: rn,
             right: rm,
         }
+    } else if word & 0xfff0_e210 == 0x2540_4000 {
+        DecodedInstruction::SveAndPredicateBytesSetFlags {
+            destination: predicate(word),
+            predicate: governing_predicate(word),
+            left: predicate(word >> 5),
+            right: predicate(word >> 16),
+        }
     } else if word & 0xfff0_e210 == 0x2500_4000 {
         DecodedInstruction::SveAndPredicateBytes {
+            destination: predicate(word),
+            predicate: governing_predicate(word),
+            left: predicate(word >> 5),
+            right: predicate(word >> 16),
+        }
+    } else if word & 0xfff0_e210 == 0x2540_4010 {
+        DecodedInstruction::SveBitClearPredicateBytesSetFlags {
+            destination: predicate(word),
+            predicate: governing_predicate(word),
+            left: predicate(word >> 5),
+            right: predicate(word >> 16),
+        }
+    } else if word & 0xfff0_e210 == 0x2500_4010 {
+        DecodedInstruction::SveBitClearPredicateBytes {
             destination: predicate(word),
             predicate: governing_predicate(word),
             left: predicate(word >> 5),
@@ -638,6 +896,12 @@ pub fn decode_one(word: u32, offset: u32) -> Result<DecodedInstruction, DecodeEr
         }
     } else if word & 0xffff_e210 == 0x2590_4000 {
         DecodedInstruction::SveBreakBeforeBytes {
+            destination: predicate(word),
+            predicate: governing_predicate(word),
+            source: predicate(word >> 5),
+        }
+    } else if word & 0xffff_e210 == 0x2510_4000 {
+        DecodedInstruction::SveBreakAfterBytes {
             destination: predicate(word),
             predicate: governing_predicate(word),
             source: predicate(word >> 5),
@@ -817,6 +1081,32 @@ pub(crate) fn canonical_word(instruction: DecodedInstruction) -> Option<u32> {
                 | field(base, 5)?
                 | field(destination, 0)?
         }
+        DecodedInstruction::Load16 {
+            destination,
+            base,
+            offset,
+        } => {
+            if !offset.is_multiple_of(2) {
+                return None;
+            }
+            0x7940_0000
+                | immediate_field(offset / 2, 12, 10)?
+                | field(base, 5)?
+                | field(destination, 0)?
+        }
+        DecodedInstruction::Load32 {
+            destination,
+            base,
+            offset,
+        } => {
+            if !offset.is_multiple_of(4) {
+                return None;
+            }
+            0xb940_0000
+                | immediate_field(offset / 4, 12, 10)?
+                | field(base, 5)?
+                | field(destination, 0)?
+        }
         DecodedInstruction::LoadByteRegister {
             destination,
             base,
@@ -827,6 +1117,19 @@ pub(crate) fn canonical_word(instruction: DecodedInstruction) -> Option<u32> {
             base,
             index,
         } => 0xf860_7800 | field(index, 16)? | field(base, 5)? | field(destination, 0)?,
+        DecodedInstruction::Load64 {
+            destination,
+            base,
+            offset,
+        } => {
+            if !offset.is_multiple_of(8) {
+                return None;
+            }
+            0xf940_0000
+                | immediate_field(offset / 8, 12, 10)?
+                | field(base, 5)?
+                | field(destination, 0)?
+        }
         DecodedInstruction::Store64 {
             source,
             base,
@@ -849,6 +1152,24 @@ pub(crate) fn canonical_word(instruction: DecodedInstruction) -> Option<u32> {
                 | immediate_field(offset / 16, 12, 10)?
                 | field(base, 5)?
                 | field(destination, 0)?
+        }
+        DecodedInstruction::LoadVectorPair128 {
+            first_destination,
+            second_destination,
+            base,
+            offset,
+        } => {
+            if first_destination == second_destination
+                || !offset.is_multiple_of(16)
+                || offset / 16 >= 64
+            {
+                return None;
+            }
+            0xad40_0000
+                | (u32::from(offset / 16) << 15)
+                | field(second_destination, 10)?
+                | field(base, 5)?
+                | field(first_destination, 0)?
         }
         DecodedInstruction::DuplicateByte16 {
             destination,
@@ -946,6 +1267,42 @@ pub(crate) fn canonical_word(instruction: DecodedInstruction) -> Option<u32> {
                 | predicate_field(left, 5)?
                 | predicate_field(destination, 0)?
         }
+        DecodedInstruction::SveAndPredicateBytesSetFlags {
+            destination,
+            predicate,
+            left,
+            right,
+        } => {
+            0x2540_4000
+                | predicate_field(right, 16)?
+                | governing_predicate_field(predicate)?
+                | predicate_field(left, 5)?
+                | predicate_field(destination, 0)?
+        }
+        DecodedInstruction::SveBitClearPredicateBytesSetFlags {
+            destination,
+            predicate,
+            left,
+            right,
+        } => {
+            0x2540_4010
+                | predicate_field(right, 16)?
+                | governing_predicate_field(predicate)?
+                | predicate_field(left, 5)?
+                | predicate_field(destination, 0)?
+        }
+        DecodedInstruction::SveBitClearPredicateBytes {
+            destination,
+            predicate,
+            left,
+            right,
+        } => {
+            0x2500_4010
+                | predicate_field(right, 16)?
+                | governing_predicate_field(predicate)?
+                | predicate_field(left, 5)?
+                | predicate_field(destination, 0)?
+        }
         DecodedInstruction::SveTestPredicateBytes { predicate, tested } => {
             0x2550_c000 | governing_predicate_field(predicate)? | predicate_field(tested, 5)?
         }
@@ -955,6 +1312,16 @@ pub(crate) fn canonical_word(instruction: DecodedInstruction) -> Option<u32> {
             source,
         } => {
             0x2590_4000
+                | governing_predicate_field(predicate)?
+                | predicate_field(source, 5)?
+                | predicate_field(destination, 0)?
+        }
+        DecodedInstruction::SveBreakAfterBytes {
+            destination,
+            predicate,
+            source,
+        } => {
+            0x2510_4000
                 | governing_predicate_field(predicate)?
                 | predicate_field(source, 5)?
                 | predicate_field(destination, 0)?

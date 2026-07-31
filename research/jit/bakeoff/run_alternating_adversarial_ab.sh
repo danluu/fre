@@ -201,8 +201,24 @@ for variant in baseline candidate; do
         awk -F= '$1 == "identity" { if (found++) exit 2; print $2 } END { if (!found) exit 2 }' \
             "$output/$variant.exact-span.instructions.txt"
     )
+    row_schema=$(fre_bakeoff_row_schema "$raw")
+    abi2_identity=
+    case "$row_schema" in
+        fre-jit-bakeoff-v2) ;;
+        fre-jit-bakeoff-v3)
+            abi2_identity=$(
+                fre_bakeoff_abi2_identity_from_inspect \
+                    "$output/$variant.exact-span.instructions.txt"
+            )
+            ;;
+        *)
+            echo "unsupported $variant evidence schema: $row_schema" >&2
+            exit 2
+            ;;
+    esac
     if [ "$variant" = candidate ]; then
         awk -v span_identity="$identity" \
+            -v abi2_identity="$abi2_identity" \
             -f "$script_dir/verify_evidence_rows.awk" "$raw"
         "$script_dir/verify_evidence_identity.sh" "$raw"
     else
@@ -212,6 +228,7 @@ for variant in baseline candidate; do
         test "$(fre_bakeoff_sha256 "$baseline_verifier/verify_evidence_identity.sh")" = \
             "$baseline_identity_sha"
         awk -v span_identity="$identity" \
+            -v abi2_identity="$abi2_identity" \
             -f "$baseline_verifier/verify_evidence_rows.awk" "$raw"
         sh "$baseline_verifier/verify_evidence_identity.sh" "$raw"
     fi

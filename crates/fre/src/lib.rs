@@ -1,10 +1,32 @@
 //! Honest operation-specific facade for the currently certified FRE subsets.
 //!
 //! [`PortableRegex`] provides bounded single-search operations for the HIR
-//! subset that `fre-lower` can prove exact. [`QualifiedExactSearch`] exposes
-//! an experimental, explicit opt-in 16-byte exact-literal JIT leaf with
-//! portable fallback outside its evidence-gated large-window envelope. No
-//! default facade selects that native route.
+//! subset that `fre-lower` can prove exact. With the default
+//! `qualified-exact-search-jit` feature, [`QualifiedExactSearch`] exposes an
+//! experimental, explicit opt-in 16-byte exact-literal JIT leaf with portable
+//! fallback outside its evidence-gated large-window envelope. No default
+//! facade selects that native route.
+//! The default-off `explicit-search-span-aot` feature adds safe binders from
+//! an already-adopted static Search Span handle to the authenticated portable
+//! exact-literal owner. Exact legacy rows remain explicit AOT-only calls. A
+//! separately typed automatic wrapper is available only when the adopted
+//! broad production family carries a source-qualified window/prefix/evidence
+//! policy; no default [`PortableRegex`] call selects AOT code.
+//! The still-default-off `compiled-search-v25-aot` feature only prepares an
+//! owning bind-once facade and forwards the tag38 static-link boundary. A
+//! missing or mismatched source-authority row is cached as a portable route;
+//! the feature, facade, and linked objects cannot create tag38 authority.
+//! The separate default-off `compiled-search-v26-aot` facade does the same for
+//! tag39, but prequalifies only decoded exact literals of width 9..=32 before
+//! calling glue. Its private authorization atom is fixed to absent, so even an
+//! all-features build remains portable. It does not change JIT `CURRENT`,
+//! ordinary [`PortableRegex`] behavior, or any default feature.
+//! The separate default-off `explicit-count-v3-aot` feature binds an
+//! already-adopted optimizing Count-v3 handle only to the live fixed-policy
+//! exact-literal Count owner whose literal, semantic identity, and planning
+//! receipt all match. A bind refusal leaves that owner as the construction-time
+//! portable fallback; successful calls contain no artifact lookup or target
+//! dispatch.
 //! [`PortableRegexSetBuilder`] and
 //! [`PortableTextRegexSetBuilder`] compose independently admitted matchers
 //! with exact ascending pattern-ID semantics. [`AggregateBuilder`] constructs
@@ -31,6 +53,8 @@ use regex_syntax::hir::{Hir, HirKind};
 
 mod aggregate;
 mod aggregate_construction;
+#[cfg(feature = "explicit-count-v3-aot")]
+mod aggregate_count_aot_v3;
 mod aggregate_many;
 mod anchored_line_capture;
 mod anchored_word_capture;
@@ -58,13 +82,18 @@ mod literal_assertions;
 mod literal_class_run_literal;
 pub mod operation_session;
 mod pure_byte_class_repeat;
+#[cfg(feature = "qualified-exact-search-jit")]
 mod qualified_exact_search;
 mod replacement;
 mod required_literal;
 mod reverse_inner;
+mod search_aot;
+#[cfg(feature = "explicit-search-span-aot")]
+mod search_aot_facade;
 mod set;
 mod split;
 #[cfg(all(
+    feature = "qualified-exact-search-jit",
     test,
     target_arch = "aarch64",
     target_os = "linux",
@@ -97,6 +126,13 @@ pub use unicode_folded_literal::{
 
 pub use aggregate::PortableGrepLineTotalError;
 pub use aggregate::{
+    AGGREGATE_COUNT_EXACT_LITERAL_AOT_CANDIDATE_IDENTITY_WORK_UPPER_BOUND_V1,
+    AGGREGATE_COUNT_EXACT_LITERAL_AOT_MAX_LITERAL_BYTES_V1,
+    AGGREGATE_COUNT_EXACT_LITERAL_AOT_MAX_SOURCE_BYTES_V1,
+    AGGREGATE_COUNT_EXACT_LITERAL_AOT_PLANNING_POLICY_VERSION,
+    AGGREGATE_COUNT_EXACT_LITERAL_AOT_PLANNING_RECEIPT_SCHEMA_VERSION,
+    AGGREGATE_COUNT_EXACT_LITERAL_AOT_PLANNING_WORK_UPPER_BOUND_V1,
+    AGGREGATE_COUNT_EXACT_LITERAL_AOT_SEMANTIC_BINDING_SCHEMA_VERSION,
     AGGREGATE_DIRECT_OWNER_ACCOUNTING_VERSION, AGGREGATE_DIRECT_OWNER_ALGORITHM_VERSION,
     AGGREGATE_EXPLAIN_SCHEMA_VERSION, AggregateBlockingDelimiterIdentity,
     AggregateBlockingDelimiterSemantics, AggregateBoundedContextIdentity,
@@ -104,7 +140,12 @@ pub use aggregate::{
     AggregateBuildAccounting, AggregateBuildError, AggregateBuildLimits, AggregateBuildReport,
     AggregateBuilder, AggregateCacheIdentity, AggregateCaptureSemantics, AggregateCompileRegex,
     AggregateConstructionAttemptError, AggregateConstructionReceipt, AggregateConstructionRequest,
-    AggregateContinuationIdentity, AggregateContinuationSemantics, AggregateCountRegex,
+    AggregateContinuationIdentity, AggregateContinuationSemantics,
+    AggregateCountExactLiteralAotCandidate,
+    AggregateCountExactLiteralAotIdentityProjectionAccounting,
+    AggregateCountExactLiteralAotPlannedCandidate, AggregateCountExactLiteralAotPlanningAccounting,
+    AggregateCountExactLiteralAotPlanningReceiptIdentity,
+    AggregateCountExactLiteralAotSemanticBindingIdentity, AggregateCountRegex,
     AggregateCountResult, AggregateCountWorkspace, AggregateDirectAttemptIdentity,
     AggregateDirectAttemptReceipt, AggregateDirectAttemptTerminal, AggregateDirectDeclaredFallback,
     AggregateDirectInvocation, AggregateDirectOwnerSeal, AggregateDirectRoute,
@@ -193,6 +234,21 @@ pub use aggregate_construction::{
     AggregateConstructionSelectedPlanOwnerSeal, AggregateConstructionStage,
     AggregateConstructionStageDisposition, AggregateConstructionStateError,
     AggregateConstructionTerminal, AggregateConstructionTransition,
+};
+#[cfg(feature = "explicit-count-v3-aot")]
+pub use aggregate_count_aot_v3::{
+    AGGREGATE_COUNT_EXACT_LITERAL_AOT_MIN_HAYSTACK_BYTES_V3,
+    AggregateCountExactLiteralAotBindErrorV3, AggregateCountExactLiteralAotExecutionErrorV3,
+    AggregateCountExactLiteralAotOutcomeV3, AggregateCountExactLiteralAotRouteV3,
+    AggregateCountExactLiteralAotSveSessionV3, AggregateCountExactLiteralAotSveV3,
+    AggregateCountExactLiteralAotV3,
+};
+#[cfg(feature = "count-v3-aot-qualification-private")]
+#[doc(hidden)]
+pub use aggregate_count_aot_v3::{
+    AggregateCountExactLiteralAotQualificationV3,
+    AggregateCountExactLiteralAotSveQualificationSessionV3,
+    AggregateCountExactLiteralAotSveQualificationV3,
 };
 pub use aggregate_many::{
     AGGREGATE_MANY_BYTE_UNIT_COVER_PROOF_ALGORITHM_ID, AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION,
@@ -327,6 +383,11 @@ pub use fre_aggregate::{
     Resource as AggregateResource, RowStorage as AggregateRowStorage, Span as AggregateSpan,
     Unsupported as AggregateUnsupported, continuation_sweep_run_upper_bounds,
     continuation_sweep_upper_bounds,
+};
+#[cfg(feature = "explicit-search-span-aot")]
+pub use fre_aot_static_runtime::{
+    StaticSearchSpanCallErrorV1, StaticSearchSpanFamilyExecutionPolicyV1,
+    StaticSearchSpanThreadContractErrorV1, VerifiedStaticSearchSpanV1,
 };
 pub use fre_capture_lab::{
     AggregateLimits as CaptureAggregateLimits, BuildError as CaptureEngineBuildError,
@@ -516,14 +577,24 @@ pub use operation_session::{
     OperationSessionReducer, OperationSessionResetLimits, OperationSessionRunLimits,
     OperationSessionValue,
 };
+#[cfg(feature = "qualified-exact-search-jit")]
 pub use qualified_exact_search::{
-    QUALIFIED_EXACT_SEARCH_LARGE_MIN_SEARCHES, QUALIFIED_EXACT_SEARCH_LARGE_WINDOW_BYTES,
-    QUALIFIED_EXACT_SEARCH_LITERAL_BYTES, QUALIFIED_EXACT_SEARCH_MIN_SEARCHES,
-    QUALIFIED_EXACT_SEARCH_MIN_WINDOW_BYTES, QUALIFIED_EXACT_SEARCH_QUALIFICATION,
-    QualifiedExactSearch, QualifiedExactSearchBackendPolicy, QualifiedExactSearchBuildError,
-    QualifiedExactSearchBuildReport, QualifiedExactSearchError, QualifiedExactSearchExecution,
-    QualifiedExactSearchNativeIdentity, QualifiedExactSearchNativeStatus,
-    QualifiedExactSearchQualification, QualifiedExactSearchRoute, QualifiedExactSearchWorkload,
+    QUALIFIED_EXACT_SEARCH_ASIMD_V8_QUALIFICATION, QUALIFIED_EXACT_SEARCH_LARGE_MIN_SEARCHES,
+    QUALIFIED_EXACT_SEARCH_LARGE_WINDOW_BYTES, QUALIFIED_EXACT_SEARCH_LITERAL_BYTES,
+    QUALIFIED_EXACT_SEARCH_MIN_SEARCHES, QUALIFIED_EXACT_SEARCH_MIN_WINDOW_BYTES,
+    QUALIFIED_EXACT_SEARCH_QUALIFICATION, QUALIFIED_EXACT_SEARCH_SVE2_FIXED16_QUALIFICATION,
+    QUALIFIED_EXACT_SEARCH_SVE2_FIXED16_V2_QUALIFICATION,
+    QUALIFIED_EXACT_SEARCH_SVE16_V6_QUALIFICATION, QualifiedExactSearch,
+    QualifiedExactSearchBackendPolicy, QualifiedExactSearchBuildError,
+    QualifiedExactSearchBuildReport, QualifiedExactSearchCacheUnavailable,
+    QualifiedExactSearchError, QualifiedExactSearchExecution, QualifiedExactSearchFacade,
+    QualifiedExactSearchFacadeBuildError, QualifiedExactSearchFacadeError,
+    QualifiedExactSearchFacadeExecution, QualifiedExactSearchFacadeRoute,
+    QualifiedExactSearchFacadeSelection, QualifiedExactSearchFacadeThreadSession,
+    QualifiedExactSearchNativeAbi, QualifiedExactSearchNativeIdentity,
+    QualifiedExactSearchNativeStatus, QualifiedExactSearchQualification, QualifiedExactSearchRoute,
+    QualifiedExactSearchThreadContractError, QualifiedExactSearchThreadSession,
+    QualifiedExactSearchWorkload,
 };
 pub use replacement::{
     CaptureExpansionAccounting, CaptureExpansionError, CaptureExpansionLimits,
@@ -533,6 +604,26 @@ pub use replacement::{
     LiteralReplacementAccounting, LiteralReplacementError, LiteralReplacementErrorSource,
     LiteralReplacementIdentity, LiteralReplacementLimits, LiteralReplacementReport,
     LiteralReplacementResult, LiteralReplacer, NoExpand,
+};
+pub use search_aot::{
+    SEARCH_EXACT_LITERAL_AOT_FIXED_BUILD_POLICY_VERSION,
+    SEARCH_EXACT_LITERAL_AOT_SEMANTIC_BINDING_SCHEMA_VERSION, SearchExactLiteralAotCandidate,
+    SearchExactLiteralAotSemanticBindingIdentity,
+};
+#[cfg(feature = "explicit-search-span-aot")]
+pub use search_aot_facade::{
+    SearchExactLiteralAotBindErrorV1, SearchExactLiteralAotThreadSessionV1,
+    SearchExactLiteralAotV1, SearchExactLiteralAutoAotV1,
+};
+#[cfg(feature = "compiled-search-v25-aot")]
+pub use search_aot_facade::{
+    SearchExactLiteralCompiledAotV25, SearchExactLiteralCompiledAotV25Error,
+    SearchExactLiteralCompiledAotV25Fallback, SearchExactLiteralCompiledAotV25Route,
+};
+#[cfg(feature = "compiled-search-v26-aot")]
+pub use search_aot_facade::{
+    SearchExactLiteralCompiledAotV26, SearchExactLiteralCompiledAotV26Error,
+    SearchExactLiteralCompiledAotV26Fallback, SearchExactLiteralCompiledAotV26Route,
 };
 pub use set::{
     PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION, PortableRegexSet, PortableRegexSetBuildError,

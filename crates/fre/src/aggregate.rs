@@ -1,4 +1,7 @@
-use core::{fmt, ops::Range};
+use core::{
+    fmt,
+    ops::{Deref, Range},
+};
 use std::sync::{Arc, Weak};
 
 use fre_aggregate::{
@@ -66,17 +69,18 @@ use fre_kernels::{
     GraphemeScalarDfaReduceAccounting, GraphemeScalarDfaReduceError, GraphemeScalarDfaReduceLimits,
     GraphemeScalarDfaRole, LITERAL_ASSERTIONS_COUNT_OPERATION_ID,
     LITERAL_ASSERTIONS_SPAN_SUM_OPERATION_ID, LITERAL_CLASS_RUN_LITERAL_COUNT_OPERATION_ID,
-    LITERAL_CLASS_RUN_LITERAL_SPAN_SUM_OPERATION_ID, LiteralAggregateBuildAccounting,
-    LiteralAggregateBuildError, LiteralAggregateBuildLimits, LiteralAggregateCountAttempt,
-    LiteralAggregateOperation, LiteralAggregateOperationIdentity, LiteralAggregatePlan,
-    LiteralAggregatePlanOrigin, LiteralAggregateReduceAccounting,
-    LiteralAggregateReduceAttemptError, LiteralAggregateReduceAttemptReceipt,
-    LiteralAggregateReduceError, LiteralAggregateReduceInvocation, LiteralAggregateReduceLimits,
-    LiteralAggregateSpanSumAttempt, LiteralAssertionsBuildAccounting, LiteralAssertionsBuildError,
-    LiteralAssertionsBuildLimits, LiteralAssertionsCountResult, LiteralAssertionsOperationIdentity,
-    LiteralAssertionsPlan, LiteralAssertionsReduceAccounting, LiteralAssertionsReduceError,
-    LiteralAssertionsReduceLimits, LiteralAssertionsSpanSumResult,
-    LiteralClassRunLiteralBoundarySemantics, LiteralClassRunLiteralBuildAccounting,
+    LITERAL_CLASS_RUN_LITERAL_SPAN_SUM_OPERATION_ID, LiteralAggregateBoundarySemantics,
+    LiteralAggregateBuildAccounting, LiteralAggregateBuildError, LiteralAggregateBuildLimits,
+    LiteralAggregateCountAttempt, LiteralAggregateDeclaredFallback, LiteralAggregateOperation,
+    LiteralAggregateOperationIdentity, LiteralAggregatePlan, LiteralAggregatePlanOrigin,
+    LiteralAggregateReduceAccounting, LiteralAggregateReduceAttemptError,
+    LiteralAggregateReduceAttemptReceipt, LiteralAggregateReduceError,
+    LiteralAggregateReduceInvocation, LiteralAggregateReduceLimits, LiteralAggregateSpanSumAttempt,
+    LiteralAssertionsBuildAccounting, LiteralAssertionsBuildError, LiteralAssertionsBuildLimits,
+    LiteralAssertionsCountResult, LiteralAssertionsOperationIdentity, LiteralAssertionsPlan,
+    LiteralAssertionsReduceAccounting, LiteralAssertionsReduceError, LiteralAssertionsReduceLimits,
+    LiteralAssertionsSpanSumResult, LiteralClassRunLiteralBoundarySemantics,
+    LiteralClassRunLiteralBuildAccounting,
     LiteralClassRunLiteralBuildError, LiteralClassRunLiteralBuildLimits,
     LiteralClassRunLiteralCountResult, LiteralClassRunLiteralOperationIdentity,
     LiteralClassRunLiteralPlan, LiteralClassRunLiteralReduceAccounting,
@@ -130,20 +134,25 @@ use fre_kernels::{
 };
 use fre_syntax::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile,
-    ParseSummary, RustProfile, SafetyEnvelope,
+    PackageIdentity, ParseAttemptActual, ParseAttemptProspective, ParseAttemptTerminal,
+    ParseSummary, QuotaBounded, RustConstructor, RustMatchKind, RustProfile, RustUnicodeFeatures,
+    SafetyEnvelope, SyntaxQuotas, UnicodeVersion, UpstreamRevision,
 };
 use regex_syntax::hir::{
     Class, ClassBytes, ClassBytesRange, ClassUnicode, ClassUnicodeRange, Hir, HirKind, Look,
 };
+use sha2::{Digest, Sha256};
 
 use crate::{
     AggregateCompileAccounting, AggregateCompileAttemptError, AggregateCompileLimits,
-    AggregateConstructionAbandonment, AggregateConstructionAttempt,
+    AggregateConstructionAbandonment, AggregateConstructionActual, AggregateConstructionAttempt,
     AggregateConstructionAttemptIdentity, AggregateConstructionAttemptReceipt,
-    AggregateConstructionEffect, AggregateConstructionPrepublicationFallback,
-    AggregateConstructionProspective, AggregateConstructionRequestInputs,
-    AggregateConstructionRequestOwnerSeal, AggregateConstructionSelectedPlanOwnerSeal,
-    AggregateConstructionStage, AggregateEngineError, AggregateExecutionAccounting,
+    AggregateConstructionDeclaredFallbackPolicy, AggregateConstructionEffect,
+    AggregateConstructionPrepublicationFallback, AggregateConstructionProspective,
+    AggregateConstructionRequestInputs, AggregateConstructionRequestOwnerSeal,
+    AggregateConstructionSelectedPlanOwnerSeal, AggregateConstructionStage,
+    AggregateConstructionStageDisposition, AggregateConstructionTerminal,
+    AggregateConstructionTransition, AggregateEngineError, AggregateExecutionAccounting,
     AggregateOperationCertificate, AggregateOperationLimits, AggregatePlanId, AggregateResource,
     BuildError, Match, aggregate_construction::AggregateInspectionAttemptError, blocking_delimiter,
     bounded_literal_pair, finite, finite_root, fixed_absolute, grapheme_scalar, guarded_ascii_word,
@@ -218,6 +227,38 @@ pub const AGGREGATE_DIRECT_OWNER_ALGORITHM_VERSION: u32 = 2;
 
 /// Version of the lossless direct terminal-attempt envelope.
 pub const AGGREGATE_DIRECT_OWNER_ACCOUNTING_VERSION: u32 = 1;
+
+/// Canonical schema for the facade-authenticated exact-literal count AOT
+/// semantic binding.
+pub const AGGREGATE_COUNT_EXACT_LITERAL_AOT_SEMANTIC_BINDING_SCHEMA_VERSION: u32 = 1;
+
+/// Canonical schema for the facade-owned, fixed-policy AOT planning receipt.
+pub const AGGREGATE_COUNT_EXACT_LITERAL_AOT_PLANNING_RECEIPT_SCHEMA_VERSION: u32 = 1;
+
+/// Exact facade construction policy admitted by the v1 AOT compiler.
+///
+/// This version means `AggregateBuildLimits::aot_count_exact_literal_v1()`,
+/// `ForceExactLiteral`, and `ReverseSequentialRows`. The planned-candidate
+/// projection verifies every effective value before assigning this tag.
+pub const AGGREGATE_COUNT_EXACT_LITERAL_AOT_PLANNING_POLICY_VERSION: u32 = 1;
+
+/// Fixed source and retained-literal ceilings checked before AOT identity
+/// hashing.
+pub const AGGREGATE_COUNT_EXACT_LITERAL_AOT_MAX_SOURCE_BYTES_V1: u64 = 64 << 10;
+pub const AGGREGATE_COUNT_EXACT_LITERAL_AOT_MAX_LITERAL_BYTES_V1: usize = 32;
+
+/// Prospective work ceiling published before any fixed-policy v1 facade
+/// effect: quota-bounded syntax work, exact-literal inspection/build, report
+/// publication, and both construction-cached AOT identity projections.
+pub const AGGREGATE_COUNT_EXACT_LITERAL_AOT_PLANNING_WORK_UPPER_BOUND_V1: u64 = (1 << 20)
+    + 4_096
+    + 33
+    + 1
+    + AGGREGATE_COUNT_EXACT_LITERAL_AOT_CANDIDATE_IDENTITY_WORK_UPPER_BOUND_V1;
+
+/// Construction-charged ceiling for both canonical SHA-256 projections under
+/// the fixed 64-KiB source/policy/ledger envelope.
+pub const AGGREGATE_COUNT_EXACT_LITERAL_AOT_CANDIDATE_IDENTITY_WORK_UPPER_BOUND_V1: u64 = 1 << 20;
 
 /// Whole-match operation fixed before an aggregate plan is constructed.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -764,6 +805,410 @@ pub struct AggregateExactLiteralIdentity {
     pub semantics: AggregateExactLiteralSemantics,
     /// Native kernel and operation identity.
     pub kernel: LiteralAggregateOperationIdentity,
+}
+
+/// Stable canonical digest binding the semantic compiler inputs of one
+/// authenticated facade-selected exact-literal count candidate.
+///
+/// The digest is SHA-256 over a domain-separated, versioned binary encoding of
+/// the original pattern bytes, retained literal bytes, complete Rust-byte
+/// profile, count operation, selection, exact plan identity, and exact build
+/// accounting. It deliberately excludes address-space construction provenance,
+/// so equal authenticated constructions produce equal bytes across processes.
+///
+/// This is not a complete construction/resource-policy receipt and is not
+/// independently authoritative when detached from its candidate. A compiler
+/// must accept [`AggregateCountExactLiteralAotCandidate`] as one opaque value;
+/// its separate sealed compile receipt binds target, manifest, limits, and
+/// emitted artifact.
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct AggregateCountExactLiteralAotSemanticBindingIdentity([u8; 32]);
+
+impl AggregateCountExactLiteralAotSemanticBindingIdentity {
+    /// Read-only canonical digest bytes for object metadata.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for AggregateCountExactLiteralAotSemanticBindingIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AggregateCountExactLiteralAotSemanticBindingIdentity(")?;
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        formatter.write_str(")")
+    }
+}
+
+/// Cross-process identity of the complete authenticated facade planning
+/// projection admitted by the fixed v1 AOT policy.
+///
+/// The projection includes the semantic binding, fixed policy tag, syntax
+/// prospective/actual receipt, every public report counter, construction
+/// prospective/actual accounting, every typed ledger entry, publication, and
+/// terminal state. Address-local owner pointers are authenticated before this
+/// digest is made but are intentionally not serialized.
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct AggregateCountExactLiteralAotPlanningReceiptIdentity([u8; 32]);
+
+impl AggregateCountExactLiteralAotPlanningReceiptIdentity {
+    /// Read-only canonical digest bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for AggregateCountExactLiteralAotPlanningReceiptIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AggregateCountExactLiteralAotPlanningReceiptIdentity(")?;
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        formatter.write_str(")")
+    }
+}
+
+/// Resource/accounting projection paired with the full planning identity.
+///
+/// The digest binds the individual report and ledger fields. This compact
+/// copy retains the complete syntax and construction P/A envelopes plus the
+/// exact ledger length and digest work needed by downstream pipeline
+/// accounting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregateCountExactLiteralAotPlanningAccounting {
+    source_bytes: u64,
+    source_capacity_bytes: usize,
+    syntax_prospective: ParseAttemptProspective,
+    syntax_actual: ParseAttemptActual,
+    construction_prospective: AggregateConstructionProspective,
+    construction_actual: AggregateConstructionActual,
+    construction_ledger_entries: u8,
+    report_planner_work: u64,
+    report_retained_capacity_bytes: usize,
+    identity_bytes_hashed: u64,
+}
+
+impl AggregateCountExactLiteralAotPlanningAccounting {
+    #[must_use]
+    pub const fn source_bytes(&self) -> u64 {
+        self.source_bytes
+    }
+
+    #[must_use]
+    pub const fn source_capacity_bytes(&self) -> usize {
+        self.source_capacity_bytes
+    }
+
+    #[must_use]
+    pub const fn syntax_prospective(&self) -> ParseAttemptProspective {
+        self.syntax_prospective
+    }
+
+    #[must_use]
+    pub const fn syntax_actual(&self) -> ParseAttemptActual {
+        self.syntax_actual
+    }
+
+    #[must_use]
+    pub const fn construction_prospective(&self) -> AggregateConstructionProspective {
+        self.construction_prospective
+    }
+
+    #[must_use]
+    pub const fn construction_actual(&self) -> AggregateConstructionActual {
+        self.construction_actual
+    }
+
+    #[must_use]
+    pub const fn construction_ledger_entries(&self) -> u8 {
+        self.construction_ledger_entries
+    }
+
+    #[must_use]
+    pub const fn report_planner_work(&self) -> u64 {
+        self.report_planner_work
+    }
+
+    #[must_use]
+    pub const fn report_retained_capacity_bytes(&self) -> usize {
+        self.report_retained_capacity_bytes
+    }
+
+    #[must_use]
+    pub const fn identity_bytes_hashed(&self) -> u64 {
+        self.identity_bytes_hashed
+    }
+}
+
+/// Allocation-free accounting for the two construction-owned candidate
+/// identity projections.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregateCountExactLiteralAotIdentityProjectionAccounting {
+    semantic_identity_bytes_hashed: u64,
+    planning_identity_bytes_hashed: u64,
+    projection_work_upper_bound: u64,
+    scratch_bytes_upper_bound: u64,
+    allocations: u8,
+}
+
+impl AggregateCountExactLiteralAotIdentityProjectionAccounting {
+    #[must_use]
+    pub const fn semantic_identity_bytes_hashed(&self) -> u64 {
+        self.semantic_identity_bytes_hashed
+    }
+
+    #[must_use]
+    pub const fn planning_identity_bytes_hashed(&self) -> u64 {
+        self.planning_identity_bytes_hashed
+    }
+
+    #[must_use]
+    pub const fn projection_work_upper_bound(&self) -> u64 {
+        self.projection_work_upper_bound
+    }
+
+    #[must_use]
+    pub const fn scratch_bytes_upper_bound(&self) -> u64 {
+        self.scratch_bytes_upper_bound
+    }
+
+    #[must_use]
+    pub const fn allocations(&self) -> u8 {
+        self.allocations
+    }
+}
+
+/// Construction-owned, once-computed AOT projection retained inside the
+/// selected exact-literal engine.
+///
+/// This value is never exposed independently. Public candidate handles copy
+/// these fixed-size fields and borrow the already-retained literal/profile;
+/// they never rescan source, re-encode a receipt, or invoke SHA-256.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AggregateCountExactLiteralAotCachedProjection {
+    semantic_binding_identity: AggregateCountExactLiteralAotSemanticBindingIdentity,
+    semantic_projection_accounting: AggregateCountExactLiteralAotIdentityProjectionAccounting,
+    planning: Option<(
+        AggregateCountExactLiteralAotPlanningReceiptIdentity,
+        AggregateCountExactLiteralAotPlanningAccounting,
+        AggregateCountExactLiteralAotIdentityProjectionAccounting,
+    )>,
+}
+
+/// Immutable AOT input proven to be the live exact-literal engine selected for
+/// one compiled count facade.
+///
+/// Every field is private so callers cannot assemble or alter a candidate.
+/// The borrowed literal is the already-retained kernel needle; it is never
+/// reconstructed by reparsing source.
+pub struct AggregateCountExactLiteralAotCandidate<'a> {
+    literal: &'a [u8],
+    operation: AggregateOperation,
+    semantics: AggregateExactLiteralSemantics,
+    profile: &'a RustProfile,
+    plan_identity: AggregateExactLiteralIdentity,
+    build_accounting: LiteralAggregateBuildAccounting,
+    semantic_binding_identity: AggregateCountExactLiteralAotSemanticBindingIdentity,
+    semantic_projection_accounting: AggregateCountExactLiteralAotIdentityProjectionAccounting,
+    planning: Option<(
+        AggregateCountExactLiteralAotPlanningReceiptIdentity,
+        AggregateCountExactLiteralAotPlanningAccounting,
+        AggregateCountExactLiteralAotIdentityProjectionAccounting,
+    )>,
+    _construction: AggregateExactLiteralConstructionSeal,
+}
+
+impl fmt::Debug for AggregateCountExactLiteralAotCandidate<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AggregateCountExactLiteralAotCandidate")
+            .field("literal", &self.literal)
+            .field("operation", &self.operation)
+            .field("semantics", &self.semantics)
+            .field("profile", &self.profile)
+            .field("plan_identity", &self.plan_identity)
+            .field("build_accounting", &self.build_accounting)
+            .field("semantic_binding_identity", &self.semantic_binding_identity)
+            .field(
+                "semantic_projection_accounting",
+                &self.semantic_projection_accounting,
+            )
+            .field("planning", &self.planning)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> AggregateCountExactLiteralAotCandidate<'a> {
+    /// Already-retained literal bytes consumed by exact aggregate KIR
+    /// construction.
+    #[must_use]
+    pub const fn literal(&self) -> &'a [u8] {
+        self.literal
+    }
+
+    /// Operation authenticated by the selected facade.
+    #[must_use]
+    pub const fn operation(&self) -> AggregateOperation {
+        self.operation
+    }
+
+    /// Profile-specific exact-literal semantic proof.
+    #[must_use]
+    pub const fn semantics(&self) -> AggregateExactLiteralSemantics {
+        self.semantics
+    }
+
+    /// Complete Rust-byte compatibility profile retained by syntax identity.
+    #[must_use]
+    pub const fn profile(&self) -> &'a RustProfile {
+        self.profile
+    }
+
+    /// Existing facade plan identity authenticated against the live engine.
+    #[must_use]
+    pub const fn plan_identity(&self) -> AggregateExactLiteralIdentity {
+        self.plan_identity
+    }
+
+    /// Existing exact-literal construction accounting authenticated against
+    /// the live engine.
+    #[must_use]
+    pub const fn build_accounting(&self) -> LiteralAggregateBuildAccounting {
+        self.build_accounting
+    }
+
+    /// Canonical source/literal/profile/operation/plan/build semantic binding.
+    #[must_use]
+    pub const fn semantic_binding_identity(
+        &self,
+    ) -> AggregateCountExactLiteralAotSemanticBindingIdentity {
+        self.semantic_binding_identity
+    }
+
+    /// Facade-owned identity of the complete fixed-policy planning receipt.
+    #[must_use]
+    pub const fn planning_receipt_identity(
+        &self,
+    ) -> Option<AggregateCountExactLiteralAotPlanningReceiptIdentity> {
+        match self.planning {
+            Some((identity, _, _)) => Some(identity),
+            None => None,
+        }
+    }
+
+    /// Complete syntax/construction P/A projection and planning digest work.
+    #[must_use]
+    pub const fn planning_accounting(
+        &self,
+    ) -> Option<AggregateCountExactLiteralAotPlanningAccounting> {
+        match self.planning {
+            Some((_, accounting, _)) => Some(accounting),
+            None => None,
+        }
+    }
+
+    /// Semantic digest bytes hashed even when the construction did not use
+    /// the fixed v1 AOT planning policy.
+    #[must_use]
+    pub const fn semantic_identity_bytes_hashed(&self) -> u64 {
+        self.semantic_projection_accounting
+            .semantic_identity_bytes_hashed
+    }
+
+    /// Accounting for the semantic candidate digest on every construction.
+    #[must_use]
+    pub const fn semantic_projection_accounting(
+        &self,
+    ) -> AggregateCountExactLiteralAotIdentityProjectionAccounting {
+        self.semantic_projection_accounting
+    }
+}
+
+/// Opaque fixed-policy facade candidate required by the complete AOT compiler.
+///
+/// Unlike the broader semantic candidate, this type proves the complete
+/// authenticated v1 syntax/construction planning projection.
+pub struct AggregateCountExactLiteralAotPlannedCandidate<'a>(
+    AggregateCountExactLiteralAotCandidate<'a>,
+);
+
+impl fmt::Debug for AggregateCountExactLiteralAotPlannedCandidate<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("AggregateCountExactLiteralAotPlannedCandidate")
+            .field(&self.0)
+            .finish()
+    }
+}
+
+impl<'a> AggregateCountExactLiteralAotPlannedCandidate<'a> {
+    #[must_use]
+    pub const fn literal(&self) -> &'a [u8] {
+        self.0.literal()
+    }
+
+    #[must_use]
+    pub const fn operation(&self) -> AggregateOperation {
+        self.0.operation()
+    }
+
+    #[must_use]
+    pub const fn semantics(&self) -> AggregateExactLiteralSemantics {
+        self.0.semantics()
+    }
+
+    #[must_use]
+    pub const fn profile(&self) -> &'a RustProfile {
+        self.0.profile()
+    }
+
+    #[must_use]
+    pub const fn plan_identity(&self) -> AggregateExactLiteralIdentity {
+        self.0.plan_identity()
+    }
+
+    #[must_use]
+    pub const fn build_accounting(&self) -> LiteralAggregateBuildAccounting {
+        self.0.build_accounting()
+    }
+
+    #[must_use]
+    pub const fn semantic_binding_identity(
+        &self,
+    ) -> AggregateCountExactLiteralAotSemanticBindingIdentity {
+        self.0.semantic_binding_identity()
+    }
+
+    #[must_use]
+    pub const fn planning_receipt_identity(
+        &self,
+    ) -> AggregateCountExactLiteralAotPlanningReceiptIdentity {
+        match self.0.planning {
+            Some((identity, _, _)) => identity,
+            None => unreachable!(),
+        }
+    }
+
+    #[must_use]
+    pub const fn planning_accounting(&self) -> AggregateCountExactLiteralAotPlanningAccounting {
+        match self.0.planning {
+            Some((_, accounting, _)) => accounting,
+            None => unreachable!(),
+        }
+    }
+
+    #[must_use]
+    pub const fn identity_projection_accounting(
+        &self,
+    ) -> AggregateCountExactLiteralAotIdentityProjectionAccounting {
+        match self.0.planning {
+            Some((_, _, accounting)) => accounting,
+            None => unreachable!(),
+        }
+    }
 }
 
 /// Profile and HIR-shape proof attached to the direct scalar reducer.
@@ -1633,8 +2078,51 @@ pub struct AggregateBuildLimits {
     pub continuation: AggregateCompileLimits,
 }
 
-impl Default for AggregateBuildLimits {
-    fn default() -> Self {
+impl AggregateBuildLimits {
+    /// Complete facade construction policy frozen for AOT planning policy v1.
+    ///
+    /// Only the syntax and forced exact-literal fields initialized below are
+    /// part of the effective v1 contract. Other selector defaults are
+    /// unreachable under `ForceExactLiteral` and are excluded from the
+    /// planning-policy identity.
+    #[must_use]
+    pub fn aot_count_exact_literal_v1() -> Self {
+        let max_needle_bytes = AGGREGATE_COUNT_EXACT_LITERAL_AOT_MAX_LITERAL_BYTES_V1;
+        let max_persistent_bytes = core::mem::size_of::<LiteralAggregatePlan>()
+            .checked_add(max_needle_bytes)
+            .expect("fixed AOT persistent envelope fits usize");
+        let max_peak_bytes = max_persistent_bytes
+            .checked_add(max_needle_bytes)
+            .expect("fixed AOT peak envelope fits usize");
+        let mut limits = Self::ordinary_default();
+        limits.admission = AdmissionPolicy::Quota(QuotaBounded {
+            syntax: SyntaxQuotas {
+                max_pattern_bytes: AGGREGATE_COUNT_EXACT_LITERAL_AOT_MAX_SOURCE_BYTES_V1,
+                max_nesting: 1_024,
+                max_hir_nodes: 128 << 10,
+                max_parse_work: 1 << 20,
+                max_traversal_stack: 128 << 10,
+            },
+        });
+        limits.syntax_safety = SafetyEnvelope {
+            max_pattern_bytes: 32 << 20,
+            max_nesting: 1_000_000,
+            max_hir_nodes: 4_000_000,
+            max_parse_work: 64_000_000,
+            max_traversal_stack: 1_000_000,
+        };
+        limits.max_literal_planner_work = 4_096;
+        limits.exact_literal = LiteralAggregateBuildLimits {
+            max_needle_bytes,
+            max_build_work: 33,
+            max_scratch_bytes: max_needle_bytes,
+            max_persistent_bytes,
+            max_peak_bytes,
+        };
+        limits
+    }
+
+    fn ordinary_default() -> Self {
         Self {
             admission: AdmissionPolicy::default(),
             syntax_safety: SafetyEnvelope::default(),
@@ -1676,6 +2164,28 @@ impl Default for AggregateBuildLimits {
             continuation: AggregateCompileLimits::default(),
         }
     }
+}
+
+impl Default for AggregateBuildLimits {
+    fn default() -> Self {
+        Self::ordinary_default()
+    }
+}
+
+/// Compare the complete policy surface reachable by forced exact-literal AOT
+/// planning.
+///
+/// Other selector limits are deliberately excluded: the forced selector
+/// records those stages as policy-skipped without reading their limits. This
+/// projection prevents an unrelated ordinary-default change from silently
+/// changing AOT policy identity while still authenticating every value that
+/// can affect syntax admission, exact inspection, or exact construction.
+fn matches_aot_count_exact_literal_v1_policy(limits: &AggregateBuildLimits) -> bool {
+    let expected = AggregateBuildLimits::aot_count_exact_literal_v1();
+    limits.admission == expected.admission
+        && limits.syntax_safety == expected.syntax_safety
+        && limits.max_literal_planner_work == expected.max_literal_planner_work
+        && limits.exact_literal == expected.exact_literal
 }
 
 /// Composite construction ceilings for the scalar fixed-domain route. These
@@ -1841,8 +2351,13 @@ fn logical_arc_allocation_bytes<T>() -> Option<usize> {
 fn aggregate_construction_prospective(
     request: &fre_syntax::ParseRequest,
     limits: &AggregateBuildLimits,
+    selection: AggregatePlanSelection,
+    operation: AggregateOperation,
 ) -> Result<AggregateConstructionProspective, &'static str> {
     let syntax = request.attempt_prospective();
+    if selection == AggregatePlanSelection::ForceExactLiteral {
+        return exact_literal_construction_prospective(syntax, limits, operation);
+    }
     let sparse = sparse_finite_build_limits(limits.finite_literal);
     let packed = packed_finite_build_limits(limits.finite_literal);
     let guarded = guarded_finite_build_limits(limits.finite_literal);
@@ -1924,6 +2439,9 @@ fn aggregate_construction_prospective(
     // A successful transaction creates one construction-unique immutable
     // report seal. Its allocation is itself one charged publication action.
     add_work(1)?;
+    if operation == AggregateOperation::Count {
+        add_work(AGGREGATE_COUNT_EXACT_LITERAL_AOT_CANDIDATE_IDENTITY_WORK_UPPER_BOUND_V1)?;
+    }
 
     let key_owner_bytes = logical_arc_allocation_bytes::<CacheKey>()
         .ok_or("syntax cache owner byte envelope overflow")?;
@@ -1959,11 +2477,29 @@ fn aggregate_construction_prospective(
             .checked_add(report_seal_owner_bytes)
             .ok_or("aggregate publication persistent-byte envelope overflow")?,
     );
+    let exact_aot_inline_bytes = if operation == AggregateOperation::Count {
+        core::mem::size_of::<AggregateCountRegex>()
+    } else {
+        0
+    };
+    let exact_aot_scratch_bytes = if operation == AggregateOperation::Count {
+        core::mem::size_of::<Sha256>()
+    } else {
+        0
+    };
+    let exact_route_peak = limits
+        .exact_literal
+        .max_peak_bytes
+        .checked_add(exact_aot_inline_bytes)
+        .and_then(|bytes| bytes.checked_add(exact_aot_scratch_bytes))
+        .ok_or("exact-literal AOT peak envelope overflow")?;
+    let exact_route_persistent = limits
+        .exact_literal
+        .max_persistent_bytes
+        .checked_add(exact_aot_inline_bytes)
+        .ok_or("exact-literal AOT persistent envelope overflow")?;
     for (route_peak, route_persistent) in [
-        (
-            limits.exact_literal.max_peak_bytes,
-            limits.exact_literal.max_persistent_bytes,
-        ),
+        (exact_route_peak, exact_route_persistent),
         (
             limits.unicode_scalar.max_peak_bytes,
             limits.unicode_scalar.max_persistent_bytes,
@@ -2081,6 +2617,106 @@ fn aggregate_construction_prospective(
         .ok_or("aggregate construction live-byte envelope overflow")?;
     if live_persistent_bytes > byte_envelope {
         return Err("aggregate construction live bytes exceed byte envelope");
+    }
+    Ok(AggregateConstructionProspective {
+        work,
+        allocations,
+        allocated_bytes: byte_envelope,
+        copied_bytes: byte_envelope,
+        initialized_bytes: byte_envelope,
+        abandoned_work: work,
+        abandoned_allocations: allocations,
+        abandoned_bytes: byte_envelope,
+        live_persistent_bytes,
+        high_water_bytes: byte_envelope,
+    })
+}
+
+fn exact_literal_construction_prospective(
+    syntax: ParseAttemptProspective,
+    limits: &AggregateBuildLimits,
+    operation: AggregateOperation,
+) -> Result<AggregateConstructionProspective, &'static str> {
+    let identity_work = if operation == AggregateOperation::Count {
+        AGGREGATE_COUNT_EXACT_LITERAL_AOT_CANDIDATE_IDENTITY_WORK_UPPER_BOUND_V1
+    } else {
+        0
+    };
+    let work = syntax
+        .max_observed_work
+        .checked_add(
+            u64::try_from(limits.max_literal_planner_work)
+                .map_err(|_| "exact-literal planner work does not fit u64")?,
+        )
+        .and_then(|work| work.checked_add(limits.exact_literal.max_build_work))
+        .and_then(|work| work.checked_add(1))
+        .and_then(|work| work.checked_add(identity_work))
+        .ok_or("exact-literal construction prospective work overflow")?;
+    let key_owner_bytes = logical_arc_allocation_bytes::<CacheKey>()
+        .ok_or("exact-literal cache owner byte envelope overflow")?;
+    let source_owner_bytes = fre_syntax::ParseRequest::attempt_source_owner_allocation_bytes();
+    let source_owner_handle_bytes = fre_syntax::ParseRequest::attempt_source_owner_handle_bytes();
+    let key_owner_handle_bytes = core::mem::size_of::<Arc<CacheKey>>();
+    let plan_owner_bytes = core::mem::size_of::<AggregatePlanIdentity>();
+    let report_seal_bytes = logical_arc_allocation_bytes::<AggregatePublishedReportSeal>()
+        .ok_or("exact-literal report seal byte envelope overflow")?;
+    let report_seal_owner_bytes = core::mem::size_of::<Arc<AggregatePublishedReportSeal>>()
+        .checked_mul(2)
+        .and_then(|owners| report_seal_bytes.checked_add(owners))
+        .ok_or("exact-literal report seal owner byte envelope overflow")?;
+    let fixed_owner_handle_bytes = core::mem::size_of::<AggregateExecutionIdentity>();
+    let preterminal_owner_handle_bytes = source_owner_handle_bytes
+        .checked_mul(2)
+        .and_then(|bytes| {
+            key_owner_handle_bytes
+                .checked_mul(2)
+                .and_then(|key_handles| bytes.checked_add(key_handles))
+        })
+        .and_then(|bytes| bytes.checked_add(fixed_owner_handle_bytes))
+        .ok_or("exact-literal preterminal owner-handle envelope overflow")?;
+    let base_live_bytes = source_owner_bytes
+        .checked_add(key_owner_bytes)
+        .and_then(|bytes| bytes.checked_add(preterminal_owner_handle_bytes))
+        .and_then(|bytes| bytes.checked_add(plan_owner_bytes))
+        .and_then(|bytes| bytes.checked_add(report_seal_owner_bytes))
+        .ok_or("exact-literal construction base live-byte envelope overflow")?;
+    let result_inline_bytes = if operation == AggregateOperation::Count {
+        core::mem::size_of::<AggregateCountRegex>()
+    } else {
+        0
+    };
+    let identity_scratch_bytes = if operation == AggregateOperation::Count {
+        core::mem::size_of::<Sha256>()
+    } else {
+        0
+    };
+    let peak = base_live_bytes
+        .checked_add(limits.exact_literal.max_peak_bytes)
+        .and_then(|bytes| bytes.checked_add(result_inline_bytes))
+        .and_then(|bytes| bytes.checked_add(identity_scratch_bytes))
+        .ok_or("exact-literal construction peak envelope overflow")?;
+    let allocations = usize::try_from(work)
+        .map_err(|_| "exact-literal allocation envelope does not fit usize")?
+        .checked_add(2)
+        .ok_or("exact-literal allocation envelope overflow")?;
+    let byte_envelope = allocations
+        .checked_mul(peak.max(1))
+        .ok_or("exact-literal byte envelope overflow")?;
+    let final_owner_handle_bytes = source_owner_handle_bytes
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(key_owner_handle_bytes))
+        .and_then(|bytes| bytes.checked_add(fixed_owner_handle_bytes))
+        .ok_or("exact-literal terminal owner-handle envelope overflow")?;
+    let live_persistent_bytes = source_owner_bytes
+        .checked_add(key_owner_bytes)
+        .and_then(|bytes| bytes.checked_add(final_owner_handle_bytes))
+        .and_then(|bytes| bytes.checked_add(limits.exact_literal.max_persistent_bytes))
+        .and_then(|bytes| bytes.checked_add(result_inline_bytes))
+        .and_then(|bytes| bytes.checked_add(plan_owner_bytes))
+        .and_then(|bytes| bytes.checked_add(report_seal_owner_bytes))
+        .ok_or("exact-literal construction live-byte envelope overflow")?;
+    if live_persistent_bytes > byte_envelope {
+        return Err("exact-literal live bytes exceed byte envelope");
     }
     Ok(AggregateConstructionProspective {
         work,
@@ -2427,6 +3063,37 @@ fn include_published_report_seal_effect(
         retained_persistent_bytes: retained_with_seal,
         released_persistent_bytes,
         co_live_bytes: effect.co_live_bytes.max(post_release_seal_phase),
+    })
+}
+
+fn include_count_exact_literal_aot_cache_effect(
+    effect: AggregateConstructionEffect,
+) -> Option<AggregateConstructionEffect> {
+    let inline_owner_bytes = core::mem::size_of::<AggregateCountRegex>();
+    let identity_scratch_bytes = core::mem::size_of::<Sha256>();
+    let retained_persistent_bytes = effect
+        .retained_persistent_bytes
+        .checked_add(inline_owner_bytes)?;
+    let post_release_persistent =
+        retained_persistent_bytes.saturating_sub(effect.released_persistent_bytes);
+    let prior_peak_with_cache = effect
+        .co_live_bytes
+        .checked_add(inline_owner_bytes)?
+        .checked_add(identity_scratch_bytes)?;
+    let identity_peak = post_release_persistent.checked_add(identity_scratch_bytes)?;
+    Some(AggregateConstructionEffect {
+        work: effect.work.checked_add(
+            AGGREGATE_COUNT_EXACT_LITERAL_AOT_CANDIDATE_IDENTITY_WORK_UPPER_BOUND_V1,
+        )?,
+        allocations: effect.allocations,
+        allocated_bytes: effect.allocated_bytes,
+        copied_bytes: effect.copied_bytes.checked_add(core::mem::size_of::<
+            AggregateCountExactLiteralAotCachedProjection,
+        >())?,
+        initialized_bytes: effect.initialized_bytes.checked_add(inline_owner_bytes)?,
+        retained_persistent_bytes,
+        released_persistent_bytes: effect.released_persistent_bytes,
+        co_live_bytes: prior_peak_with_cache.max(identity_peak),
     })
 }
 
@@ -4870,6 +5537,945 @@ pub enum AggregateDirectAttemptTerminal {
     Success,
     /// The selected direct route refused or faulted without fallback.
     Failure,
+}
+
+struct AggregateAotBindingEncoder {
+    digest: Sha256,
+    bytes_hashed: u64,
+    byte_count_overflowed: bool,
+}
+
+impl AggregateAotBindingEncoder {
+    fn new() -> Self {
+        Self {
+            digest: Sha256::new(),
+            bytes_hashed: 0,
+            byte_count_overflowed: false,
+        }
+    }
+
+    fn raw(&mut self, bytes: &[u8]) {
+        match u64::try_from(bytes.len())
+            .ok()
+            .and_then(|additional| self.bytes_hashed.checked_add(additional))
+        {
+            Some(total) => self.bytes_hashed = total,
+            None => self.byte_count_overflowed = true,
+        }
+        self.digest.update(bytes);
+    }
+
+    fn bytes(&mut self, bytes: &[u8]) -> Option<()> {
+        self.u64(u64::try_from(bytes.len()).ok()?);
+        self.raw(bytes);
+        Some(())
+    }
+
+    fn string(&mut self, value: &str) -> Option<()> {
+        self.bytes(value.as_bytes())
+    }
+
+    fn boolean(&mut self, value: bool) {
+        self.u8(u8::from(value));
+    }
+
+    fn u8(&mut self, value: u8) {
+        self.raw(&[value]);
+    }
+
+    fn u16(&mut self, value: u16) {
+        self.raw(&value.to_le_bytes());
+    }
+
+    fn u32(&mut self, value: u32) {
+        self.raw(&value.to_le_bytes());
+    }
+
+    fn u64(&mut self, value: u64) {
+        self.raw(&value.to_le_bytes());
+    }
+
+    fn usize(&mut self, value: usize) -> Option<()> {
+        self.u64(u64::try_from(value).ok()?);
+        Some(())
+    }
+
+    fn finish(self) -> Option<([u8; 32], u64)> {
+        if self.byte_count_overflowed {
+            None
+        } else {
+            Some((self.digest.finalize().into(), self.bytes_hashed))
+        }
+    }
+}
+
+struct AggregateAotPlanningEncoder {
+    digest: Sha256,
+    bytes_hashed: u64,
+}
+
+impl AggregateAotPlanningEncoder {
+    fn new() -> Self {
+        Self {
+            digest: Sha256::new(),
+            bytes_hashed: 0,
+        }
+    }
+
+    fn raw(&mut self, bytes: &[u8]) -> Option<()> {
+        self.bytes_hashed = self
+            .bytes_hashed
+            .checked_add(u64::try_from(bytes.len()).ok()?)?;
+        self.digest.update(bytes);
+        Some(())
+    }
+
+    fn u8(&mut self, value: u8) -> Option<()> {
+        self.raw(&[value])
+    }
+
+    fn bytes(&mut self, value: &[u8]) -> Option<()> {
+        self.u64(u64::try_from(value.len()).ok()?)?;
+        self.raw(value)
+    }
+
+    fn u32(&mut self, value: u32) -> Option<()> {
+        self.raw(&value.to_le_bytes())
+    }
+
+    fn u64(&mut self, value: u64) -> Option<()> {
+        self.raw(&value.to_le_bytes())
+    }
+
+    fn usize(&mut self, value: usize) -> Option<()> {
+        self.u64(u64::try_from(value).ok()?)
+    }
+
+    fn boolean(&mut self, value: bool) -> Option<()> {
+        self.u8(u8::from(value))
+    }
+
+    fn finish(self) -> ([u8; 32], u64) {
+        (self.digest.finalize().into(), self.bytes_hashed)
+    }
+}
+
+fn encode_aot_upstream_revision(
+    encoder: &mut AggregateAotBindingEncoder,
+    revision: UpstreamRevision,
+) -> Option<()> {
+    let tag = match revision {
+        UpstreamRevision::RustRegex1_12_4_7b96fdc => 0,
+        UpstreamRevision::RustRegexAutomata0_4_14_5e195de => 1,
+        UpstreamRevision::RustRegexSyntax0_8_11_1401679 => 2,
+        UpstreamRevision::Rebar463d00f => 3,
+        UpstreamRevision::Re2_972a15c => 4,
+    };
+    encoder.u8(tag);
+    encoder.string(revision.commit())
+}
+
+fn encode_aot_package_identity(
+    encoder: &mut AggregateAotBindingEncoder,
+    identity: PackageIdentity,
+) -> Option<()> {
+    encoder.u16(identity.version.major);
+    encoder.u16(identity.version.minor);
+    encoder.u16(identity.version.patch);
+    encoder.string(identity.checksum)?;
+    encode_aot_upstream_revision(encoder, identity.vcs_revision)
+}
+
+fn encode_aot_unicode_version(encoder: &mut AggregateAotBindingEncoder, version: UnicodeVersion) {
+    encoder.u16(version.major);
+    encoder.u16(version.minor);
+    encoder.u16(version.patch);
+}
+
+fn encode_aot_unicode_features(
+    encoder: &mut AggregateAotBindingEncoder,
+    features: RustUnicodeFeatures,
+) -> Option<()> {
+    let tag = if features == RustUnicodeFeatures::NONE {
+        0
+    } else if features == RustUnicodeFeatures::ALL {
+        1
+    } else if features == RustUnicodeFeatures::AGE {
+        2
+    } else if features == RustUnicodeFeatures::BOOL {
+        3
+    } else if features == RustUnicodeFeatures::CASE {
+        4
+    } else if features == RustUnicodeFeatures::GENCAT {
+        5
+    } else if features == RustUnicodeFeatures::PERL {
+        6
+    } else if features == RustUnicodeFeatures::SCRIPT {
+        7
+    } else if features == RustUnicodeFeatures::SEGMENT {
+        8
+    } else {
+        return None;
+    };
+    encoder.u8(tag);
+    Some(())
+}
+
+fn encode_aot_match_kind(encoder: &mut AggregateAotBindingEncoder, match_kind: RustMatchKind) {
+    match match_kind {
+        RustMatchKind::LeftmostFirst => encoder.u8(0),
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools,
+    reason = "the fields exactly mirror one authenticated Rust constructor identity variant"
+)]
+fn encode_aot_rust_constructor_common(
+    encoder: &mut AggregateAotBindingEncoder,
+    size_limit: u64,
+    dfa_size_limit: u64,
+    text_syntax_utf8: bool,
+    bytes_syntax_utf8: bool,
+    text_utf8_empty: bool,
+    bytes_utf8_empty: bool,
+    match_kind: RustMatchKind,
+) {
+    encoder.u64(size_limit);
+    encoder.u64(dfa_size_limit);
+    encoder.boolean(text_syntax_utf8);
+    encoder.boolean(bytes_syntax_utf8);
+    encoder.boolean(text_utf8_empty);
+    encoder.boolean(bytes_utf8_empty);
+    encode_aot_match_kind(encoder, match_kind);
+}
+
+fn encode_aot_rust_constructor(
+    encoder: &mut AggregateAotBindingEncoder,
+    constructor: &RustConstructor,
+) -> Option<()> {
+    match constructor {
+        RustConstructor::RegexBuilder {
+            size_limit,
+            dfa_size_limit,
+            text_syntax_utf8,
+            bytes_syntax_utf8,
+            text_utf8_empty,
+            bytes_utf8_empty,
+            match_kind,
+        } => {
+            encoder.u8(0);
+            encode_aot_rust_constructor_common(
+                encoder,
+                *size_limit,
+                *dfa_size_limit,
+                *text_syntax_utf8,
+                *bytes_syntax_utf8,
+                *text_utf8_empty,
+                *bytes_utf8_empty,
+                *match_kind,
+            );
+            Some(())
+        }
+        RustConstructor::RegexSetBuilder {
+            size_limit,
+            dfa_size_limit,
+            text_syntax_utf8,
+            bytes_syntax_utf8,
+            text_utf8_empty,
+            bytes_utf8_empty,
+            match_kind,
+        } => {
+            encoder.u8(1);
+            encode_aot_rust_constructor_common(
+                encoder,
+                *size_limit,
+                *dfa_size_limit,
+                *text_syntax_utf8,
+                *bytes_syntax_utf8,
+                *text_utf8_empty,
+                *bytes_utf8_empty,
+                *match_kind,
+            );
+            Some(())
+        }
+        RustConstructor::RebarMeta {
+            rebar_revision,
+            regex_default_features,
+            regex_logging,
+            regex_perf_dfa_full,
+            regex_automata_default_features,
+            syntax_utf8,
+            utf8_empty,
+            match_kind,
+            build_many_ordered,
+            thompson_nfa_size_limit,
+            admission_status,
+        } => {
+            encoder.u8(2);
+            encode_aot_upstream_revision(encoder, *rebar_revision)?;
+            encoder.boolean(*regex_default_features);
+            encoder.boolean(*regex_logging);
+            encoder.boolean(*regex_perf_dfa_full);
+            encoder.boolean(*regex_automata_default_features);
+            encoder.boolean(*syntax_utf8);
+            encoder.boolean(*utf8_empty);
+            encode_aot_match_kind(encoder, *match_kind);
+            encoder.boolean(*build_many_ordered);
+            encoder.u64(*thompson_nfa_size_limit);
+            encoder.u8(match *admission_status {
+                AdmissionStatus::UpstreamOraclePending => 0,
+                AdmissionStatus::QuotaChecked => 1,
+            });
+            Some(())
+        }
+    }
+}
+
+fn encode_aot_rust_profile(
+    encoder: &mut AggregateAotBindingEncoder,
+    profile: &RustProfile,
+) -> Option<()> {
+    encode_aot_package_identity(encoder, profile.regex)?;
+    encode_aot_package_identity(encoder, profile.regex_automata)?;
+    encode_aot_package_identity(encoder, profile.regex_syntax)?;
+    encode_aot_unicode_version(encoder, profile.unicode);
+    encode_aot_unicode_features(encoder, profile.unicode_features)?;
+    encode_aot_rust_constructor(encoder, &profile.constructor)?;
+    encoder.boolean(profile.options.case_insensitive);
+    encoder.boolean(profile.options.multi_line);
+    encoder.boolean(profile.options.dot_matches_new_line);
+    encoder.boolean(profile.options.crlf);
+    encoder.u8(profile.options.line_terminator);
+    encoder.boolean(profile.options.swap_greed);
+    encoder.boolean(profile.options.ignore_whitespace);
+    encoder.boolean(profile.options.unicode);
+    encoder.boolean(profile.options.octal);
+    encoder.u32(profile.options.nest_limit);
+    Some(())
+}
+
+fn encode_aot_aggregate_operation(
+    encoder: &mut AggregateAotBindingEncoder,
+    operation: AggregateOperation,
+) {
+    encoder.u8(match operation {
+        AggregateOperation::Compile => 0,
+        AggregateOperation::Spans => 1,
+        AggregateOperation::Count => 2,
+        AggregateOperation::SpanSum => 3,
+    });
+}
+
+fn encode_aot_plan_selection(
+    encoder: &mut AggregateAotBindingEncoder,
+    selection: AggregatePlanSelection,
+) {
+    encoder.u8(match selection {
+        AggregatePlanSelection::Auto => 0,
+        AggregatePlanSelection::ForceExactLiteral => 1,
+        AggregatePlanSelection::ForceContinuation => 2,
+    });
+}
+
+fn encode_aot_exact_literal_identity(
+    encoder: &mut AggregateAotBindingEncoder,
+    identity: AggregateExactLiteralIdentity,
+) -> Option<()> {
+    encoder.u8(match identity.semantics {
+        AggregateExactLiteralSemantics::UnicodeOffByteBoundaries => 0,
+        AggregateExactLiteralSemantics::UnicodeOnNonemptyUtf8Literal => 1,
+    });
+    encoder.string(identity.kernel.plan_id)?;
+    encoder.string(identity.kernel.operation_id)?;
+    encoder.u8(match identity.kernel.operation {
+        LiteralAggregateOperation::Count => 0,
+        LiteralAggregateOperation::SpanSum => 1,
+    });
+    encoder.u8(match identity.kernel.boundary_semantics {
+        LiteralAggregateBoundarySemantics::EveryByteBoundaryUnicodeOff => 0,
+    });
+    encoder.boolean(identity.kernel.non_overlapping);
+    encoder.u32(identity.kernel.algorithm_version);
+    encoder.u32(identity.kernel.accounting_version);
+    encoder.u8(match identity.kernel.declared_fallback {
+        LiteralAggregateDeclaredFallback::None => 0,
+    });
+    Some(())
+}
+
+fn encode_aot_exact_literal_build(
+    encoder: &mut AggregateAotBindingEncoder,
+    build: LiteralAggregateBuildAccounting,
+) -> Option<()> {
+    encoder.usize(build.needle_bytes)?;
+    encoder.usize(build.temporary_capacity_bytes)?;
+    encoder.u64(build.work_upper_bound);
+    encoder.usize(build.scratch_bytes)?;
+    encoder.usize(build.persistent_bytes)?;
+    encoder.usize(build.peak_bytes)
+}
+
+fn aggregate_count_exact_literal_aot_semantic_binding_identity(
+    report: &AggregateBuildReport,
+    literal: &[u8],
+    profile: &RustProfile,
+    plan_identity: AggregateExactLiteralIdentity,
+    build: LiteralAggregateBuildAccounting,
+) -> Option<(AggregateCountExactLiteralAotSemanticBindingIdentity, u64)> {
+    if report.operation != AggregateOperation::Count
+        || report.plan != AggregatePlanKind::ExactLiteral
+        || report.plan_identity != AggregatePlanIdentity::ExactLiteral(plan_identity)
+        || report.build != AggregateBuildAccounting::ExactLiteral(build)
+        || build.needle_bytes != literal.len()
+        || !matches!(
+            &report.syntax_key.profile,
+            CompatibilityProfile::RustBytes(retained) if retained == profile
+        )
+    {
+        return None;
+    }
+
+    let mut encoder = AggregateAotBindingEncoder::new();
+    encoder.raw(b"fre.aggregate.count-exact-literal-aot-semantic-binding.v1\0");
+    encoder.u32(AGGREGATE_COUNT_EXACT_LITERAL_AOT_SEMANTIC_BINDING_SCHEMA_VERSION);
+    encoder.u32(report.schema_version);
+    encoder.u32(report.syntax_key.schema_version);
+    encoder.bytes(report.syntax_key.pattern.as_bytes())?;
+    encoder.bytes(literal)?;
+    encoder.u8(0); // CompatibilityProfile::RustBytes.
+    encode_aot_rust_profile(&mut encoder, profile)?;
+    encode_aot_aggregate_operation(&mut encoder, report.operation);
+    encode_aot_plan_selection(&mut encoder, report.selection);
+    encoder.u8(0); // AggregatePlanKind::ExactLiteral.
+    encode_aot_exact_literal_identity(&mut encoder, plan_identity)?;
+    encode_aot_exact_literal_build(&mut encoder, build)?;
+    let (digest, bytes_hashed) = encoder.finish()?;
+    Some((
+        AggregateCountExactLiteralAotSemanticBindingIdentity(digest),
+        bytes_hashed,
+    ))
+}
+
+fn encode_aot_planning_parse_prospective(
+    encoder: &mut AggregateAotPlanningEncoder,
+    prospective: ParseAttemptProspective,
+) -> Option<()> {
+    encoder.u64(prospective.source_bytes)?;
+    encoder.u64(prospective.max_observed_work)?;
+    encoder.u64(prospective.max_hir_nodes)?;
+    encoder.u64(prospective.max_nesting)?;
+    encoder.u64(prospective.max_traversal_stack_items)?;
+    encoder.u8(prospective.max_source_admission_checks)?;
+    encoder.u8(prospective.max_configuration_checks)?;
+    encoder.u8(prospective.max_opaque_parser_invocations)
+}
+
+fn encode_aot_planning_parse_actual(
+    encoder: &mut AggregateAotPlanningEncoder,
+    actual: ParseAttemptActual,
+) -> Option<()> {
+    encoder.u8(actual.source_admission_checks)?;
+    encoder.u8(actual.configuration_checks)?;
+    encoder.u8(actual.opaque_parser_invocations)?;
+    encoder.u64(actual.availability_work)?;
+    encoder.u64(actual.hir_summary_work)?;
+    encoder.u64(actual.observed_work)?;
+    encoder.u64(actual.hir_nodes)?;
+    encoder.u64(actual.literal_bytes)?;
+    encoder.u64(actual.class_ranges)?;
+    encoder.u64(actual.captures)?;
+    encoder.u64(actual.repetitions)?;
+    encoder.u64(actual.max_depth)?;
+    encoder.u64(actual.traversal_stack_peak)
+}
+
+fn encode_aot_planning_construction_prospective(
+    encoder: &mut AggregateAotPlanningEncoder,
+    prospective: AggregateConstructionProspective,
+) -> Option<()> {
+    encoder.u64(prospective.work)?;
+    encoder.usize(prospective.allocations)?;
+    encoder.usize(prospective.allocated_bytes)?;
+    encoder.usize(prospective.copied_bytes)?;
+    encoder.usize(prospective.initialized_bytes)?;
+    encoder.u64(prospective.abandoned_work)?;
+    encoder.usize(prospective.abandoned_allocations)?;
+    encoder.usize(prospective.abandoned_bytes)?;
+    encoder.usize(prospective.live_persistent_bytes)?;
+    encoder.usize(prospective.high_water_bytes)
+}
+
+fn encode_aot_planning_construction_actual(
+    encoder: &mut AggregateAotPlanningEncoder,
+    actual: AggregateConstructionActual,
+) -> Option<()> {
+    encoder.u64(actual.work)?;
+    encoder.usize(actual.allocations)?;
+    encoder.usize(actual.allocated_bytes)?;
+    encoder.usize(actual.copied_bytes)?;
+    encoder.usize(actual.initialized_bytes)?;
+    encoder.u64(actual.abandoned_work)?;
+    encoder.usize(actual.abandoned_allocations)?;
+    encoder.usize(actual.abandoned_bytes)?;
+    encoder.usize(actual.live_persistent_bytes)?;
+    encoder.usize(actual.high_water_bytes)
+}
+
+fn encode_aot_planning_effect(
+    encoder: &mut AggregateAotPlanningEncoder,
+    effect: AggregateConstructionEffect,
+) -> Option<()> {
+    encoder.u64(effect.work)?;
+    encoder.usize(effect.allocations)?;
+    encoder.usize(effect.allocated_bytes)?;
+    encoder.usize(effect.copied_bytes)?;
+    encoder.usize(effect.initialized_bytes)?;
+    encoder.usize(effect.retained_persistent_bytes)?;
+    encoder.usize(effect.released_persistent_bytes)?;
+    encoder.usize(effect.co_live_bytes)
+}
+
+fn encode_aot_planning_abandonment(
+    encoder: &mut AggregateAotPlanningEncoder,
+    abandonment: AggregateConstructionAbandonment,
+) -> Option<()> {
+    encoder.u64(abandonment.work)?;
+    encoder.usize(abandonment.allocations)?;
+    encoder.usize(abandonment.bytes)?;
+    encoder.usize(abandonment.released_persistent_bytes)
+}
+
+fn encode_aot_planning_fallback(
+    encoder: &mut AggregateAotPlanningEncoder,
+    fallback: AggregateConstructionPrepublicationFallback,
+) -> Option<()> {
+    encoder.u8(match fallback {
+        AggregateConstructionPrepublicationFallback::None => 0,
+        AggregateConstructionPrepublicationFallback::FixedAbsoluteOptionalInspectionResource => 1,
+        AggregateConstructionPrepublicationFallback::FixedAbsoluteOptionalResidualResource => 2,
+        AggregateConstructionPrepublicationFallback::FixedAbsoluteOptionalGuardResource => 3,
+        AggregateConstructionPrepublicationFallback::FixedAbsoluteOptionalBuildResource => 4,
+        AggregateConstructionPrepublicationFallback::SparseFiniteMaterializationScratch => 5,
+        AggregateConstructionPrepublicationFallback::SparseFiniteMaterializationPeak => 6,
+        AggregateConstructionPrepublicationFallback::SparseFiniteBuildResource => 7,
+        AggregateConstructionPrepublicationFallback::GuardedFiniteDictionaryResource => 8,
+        AggregateConstructionPrepublicationFallback::GuardedFiniteConstructionResource => 9,
+        AggregateConstructionPrepublicationFallback::DenseFiniteBuildResourceToFixedPredicateWord64 => 10,
+        AggregateConstructionPrepublicationFallback::DenseFiniteBuildResourceToContinuation => 11,
+        AggregateConstructionPrepublicationFallback::TooLargeFixedSequenceToFixedPredicateWord64 => 12,
+        AggregateConstructionPrepublicationFallback::FixedPredicateWord64BuildResource => 13,
+        AggregateConstructionPrepublicationFallback::PackedFiniteBuildResourceToDenseFinite => 14,
+    })
+}
+
+fn encode_aot_planning_transition(
+    encoder: &mut AggregateAotPlanningEncoder,
+    transition: AggregateConstructionTransition,
+) -> Option<()> {
+    match transition {
+        AggregateConstructionTransition::Advance(stage) => {
+            encoder.u8(0)?;
+            encoder.usize(stage.ordinal())
+        }
+        AggregateConstructionTransition::Selected => encoder.u8(1),
+        AggregateConstructionTransition::FixedAbsoluteToSparseFiniteRoot => encoder.u8(2),
+        AggregateConstructionTransition::SparseFiniteToContinuation => encoder.u8(3),
+        AggregateConstructionTransition::GuardedFiniteToContinuation => encoder.u8(4),
+        AggregateConstructionTransition::DenseFiniteToFixedPredicateWord64 => encoder.u8(5),
+        AggregateConstructionTransition::DenseFiniteToContinuation => encoder.u8(6),
+        AggregateConstructionTransition::TooLargeFixedSequenceToFixedPredicateWord64 => {
+            encoder.u8(7)
+        }
+        AggregateConstructionTransition::FixedPredicateWord64ToContinuation => encoder.u8(8),
+        AggregateConstructionTransition::HardTerminal => encoder.u8(9),
+        AggregateConstructionTransition::Published => encoder.u8(10),
+        AggregateConstructionTransition::PackedFiniteToDenseFinite => encoder.u8(11),
+    }
+}
+
+fn encode_aot_planning_ledger_entry(
+    encoder: &mut AggregateAotPlanningEncoder,
+    entry: &crate::AggregateConstructionLedgerEntry,
+) -> Option<()> {
+    encoder.usize(entry.stage.ordinal())?;
+    encoder.u8(match entry.disposition {
+        AggregateConstructionStageDisposition::PolicySkipped => 0,
+        AggregateConstructionStageDisposition::SemanticIneligible => 1,
+        AggregateConstructionStageDisposition::Completed => 2,
+        AggregateConstructionStageDisposition::Selected => 3,
+        AggregateConstructionStageDisposition::SoftResourceRefused => 4,
+        AggregateConstructionStageDisposition::HardTerminal => 5,
+        AggregateConstructionStageDisposition::Published => 6,
+    })?;
+    encode_aot_planning_fallback(encoder, entry.fallback)?;
+    encode_aot_planning_transition(encoder, entry.transition)?;
+    encode_aot_planning_effect(encoder, entry.effect)?;
+    encode_aot_planning_abandonment(encoder, entry.abandonment)?;
+    encode_aot_planning_construction_actual(encoder, entry.actual)
+}
+
+fn aggregate_aot_report_planner_work(report: &AggregateBuildReport) -> Option<u64> {
+    let mut total = 0_u64;
+    for work in [
+        report.planner_work,
+        report.unicode_scalar_planner_work,
+        report.word_run_planner_work,
+        report.literal_assertions_planner_work,
+        report.blocking_delimiter_planner_work,
+        report.token_phrase_planner_work,
+        report.fixed_class_sandwich_planner_work,
+        report.bounded_affix_planner_work,
+        report.grapheme_scalar_dfa_planner_work,
+        report.bounded_class_sequence_planner_work,
+        report.bounded_separated_fields_planner_work,
+        report.prefix_class_alternation_planner_work,
+        report.literal_class_run_literal_planner_work,
+        report.bounded_literal_pair_planner_work,
+        report.bounded_context_planner_work,
+        usize::try_from(report.fixed_absolute_planner_work).ok()?,
+        report.capture_erasure_work,
+    ] {
+        total = total.checked_add(u64::try_from(work).ok()?)?;
+    }
+    total.checked_add(report.finite_planner_work)
+}
+
+fn encode_aot_planning_report(
+    encoder: &mut AggregateAotPlanningEncoder,
+    report: &AggregateBuildReport,
+) -> Option<()> {
+    encoder.u32(report.schema_version)?;
+    encoder.u32(report.syntax_key.schema_version)?;
+    encoder.u8(match report.admission {
+        AdmissionStatus::UpstreamOraclePending => 0,
+        AdmissionStatus::QuotaChecked => 1,
+    })?;
+    encoder.u8(2)?; // AggregateOperation::Count.
+    encoder.u8(1)?; // AggregatePlanSelection::ForceExactLiteral.
+    encoder.u8(1)?; // AggregateStrategy::ReverseSequentialRows.
+    encoder.u8(0)?; // AggregatePlanKind::ExactLiteral.
+    encoder.u8(0)?; // continuation_strategy: None.
+    encoder.u8(0)?; // AggregateCaptureSemantics::ErasedForWholeMatchOnly.
+
+    let syntax = &report.syntax;
+    encoder.u64(syntax.hir_nodes)?;
+    encoder.u64(syntax.max_depth)?;
+    encoder.u64(syntax.parse_work)?;
+    encoder.u64(syntax.literal_bytes)?;
+    encoder.u64(syntax.class_ranges)?;
+    encoder.u64(syntax.captures)?;
+    encoder.u64(syntax.repetitions)?;
+    match syntax.largest_finite_repeat {
+        Some(repeat) => {
+            encoder.u8(1)?;
+            encoder.u32(repeat)?;
+        }
+        None => encoder.u8(0)?,
+    }
+    encoder.boolean(syntax.guarantees_valid_utf8_nonempty)?;
+
+    for work in [
+        report.planner_work,
+        report.unicode_scalar_planner_work,
+        report.word_run_planner_work,
+        report.literal_assertions_planner_work,
+        report.blocking_delimiter_planner_work,
+        report.token_phrase_planner_work,
+        report.fixed_class_sandwich_planner_work,
+        report.bounded_affix_planner_work,
+        report.grapheme_scalar_dfa_planner_work,
+        report.bounded_class_sequence_planner_work,
+        report.bounded_separated_fields_planner_work,
+        report.prefix_class_alternation_planner_work,
+        report.literal_class_run_literal_planner_work,
+        report.bounded_literal_pair_planner_work,
+        report.bounded_context_planner_work,
+        usize::try_from(report.fixed_absolute_planner_work).ok()?,
+        report.capture_erasure_work,
+        report.captures_erased,
+    ] {
+        encoder.usize(work)?;
+    }
+    encoder.u64(report.finite_planner_work)?;
+    encoder.usize(report.retained_capacity_bytes)
+}
+
+fn encode_aot_planning_effective_policy(
+    encoder: &mut AggregateAotPlanningEncoder,
+    limits: &AggregateBuildLimits,
+) -> Option<()> {
+    if !matches_aot_count_exact_literal_v1_policy(limits) {
+        return None;
+    }
+    let AdmissionPolicy::Quota(quota) = limits.admission else {
+        return None;
+    };
+    encoder.u8(1)?; // Quota admission.
+    encoder.u64(quota.syntax.max_pattern_bytes)?;
+    encoder.u64(quota.syntax.max_nesting)?;
+    encoder.u64(quota.syntax.max_hir_nodes)?;
+    encoder.u64(quota.syntax.max_parse_work)?;
+    encoder.u64(quota.syntax.max_traversal_stack)?;
+    encoder.u64(limits.syntax_safety.max_pattern_bytes)?;
+    encoder.u64(limits.syntax_safety.max_nesting)?;
+    encoder.u64(limits.syntax_safety.max_hir_nodes)?;
+    encoder.u64(limits.syntax_safety.max_parse_work)?;
+    encoder.u64(limits.syntax_safety.max_traversal_stack)?;
+    encoder.usize(limits.max_literal_planner_work)?;
+    encoder.usize(limits.exact_literal.max_needle_bytes)?;
+    encoder.u64(limits.exact_literal.max_build_work)?;
+    encoder.usize(limits.exact_literal.max_scratch_bytes)?;
+    encoder.usize(limits.exact_literal.max_persistent_bytes)?;
+    encoder.usize(limits.exact_literal.max_peak_bytes)
+}
+
+fn aggregate_count_exact_literal_aot_planning_receipt(
+    report: &AggregateBuildReport,
+    semantic_binding_identity: AggregateCountExactLiteralAotSemanticBindingIdentity,
+    plan_identity: AggregateExactLiteralIdentity,
+    build: LiteralAggregateBuildAccounting,
+    construction: &AggregateConstructionReceipt,
+    syntax: &fre_syntax::ParseAttemptReceipt,
+) -> Option<(
+    AggregateCountExactLiteralAotPlanningReceiptIdentity,
+    AggregateCountExactLiteralAotPlanningAccounting,
+)> {
+    if report.operation != AggregateOperation::Count
+        || report.selection != AggregatePlanSelection::ForceExactLiteral
+        || report.requested_strategy != AggregateStrategy::ReverseSequentialRows
+        || !matches_aot_count_exact_literal_v1_policy(&report.build_limits)
+        || report.plan != AggregatePlanKind::ExactLiteral
+        || report.continuation_strategy.is_some()
+        || report.capture_semantics != AggregateCaptureSemantics::ErasedForWholeMatchOnly
+        || report.plan_identity != AggregatePlanIdentity::ExactLiteral(plan_identity)
+        || report.build != AggregateBuildAccounting::ExactLiteral(build)
+    {
+        return None;
+    }
+    let construction_prospective = construction.prospective?;
+    let syntax_prospective = syntax.prospective?;
+    let request = construction.identity.request_owner.request();
+    let published = construction.published_plan.as_ref()?;
+    if construction.identity.declared_fallback_policy
+        != AggregateConstructionDeclaredFallbackPolicy::CurrentSelectorOrder
+        || construction.terminal != AggregateConstructionTerminal::Success
+        || construction.published_stage != Some(AggregateConstructionStage::ExactLiteral)
+        || published.stage() != AggregateConstructionStage::ExactLiteral
+        || published.plan() != &AggregatePlanIdentity::ExactLiteral(plan_identity)
+        || syntax.terminal != ParseAttemptTerminal::Success
+        || !syntax.authenticates_canonical()
+        || !syntax.identity.has_stable_source_owner()
+        || request.syntax_request != syntax.identity
+    {
+        return None;
+    }
+    let ledger_entries = u8::try_from(construction.ledger.len()).ok()?;
+    let report_planner_work = aggregate_aot_report_planner_work(report)?;
+    if construction_prospective.work
+        > AGGREGATE_COUNT_EXACT_LITERAL_AOT_PLANNING_WORK_UPPER_BOUND_V1
+        || construction.actual.work > construction_prospective.work
+    {
+        return None;
+    }
+
+    let mut encoder = AggregateAotPlanningEncoder::new();
+    encoder.raw(b"fre.aggregate.count-exact-literal-aot-planning-receipt.v1\0")?;
+    encoder.u32(AGGREGATE_COUNT_EXACT_LITERAL_AOT_PLANNING_RECEIPT_SCHEMA_VERSION)?;
+    encoder.u32(AGGREGATE_COUNT_EXACT_LITERAL_AOT_PLANNING_POLICY_VERSION)?;
+    encoder.u64(AGGREGATE_COUNT_EXACT_LITERAL_AOT_PLANNING_WORK_UPPER_BOUND_V1)?;
+    encoder.u64(AGGREGATE_COUNT_EXACT_LITERAL_AOT_CANDIDATE_IDENTITY_WORK_UPPER_BOUND_V1)?;
+    encoder.raw(semantic_binding_identity.as_bytes())?;
+    encode_aot_planning_effective_policy(&mut encoder, &report.build_limits)?;
+    encode_aot_planning_report(&mut encoder, report)?;
+    encode_aot_exact_literal_identity_for_planning(&mut encoder, plan_identity)?;
+    encode_aot_exact_literal_build_for_planning(&mut encoder, build)?;
+
+    encoder.u32(construction.identity.explain_schema_version)?;
+    encoder.u32(construction.identity.algorithm_version)?;
+    encoder.u32(construction.identity.accounting_version)?;
+    encoder.u8(0)?; // CurrentSelectorOrder.
+    encoder.u32(syntax.identity.schema_version)?;
+    encoder.u64(syntax.identity.source_bytes)?;
+    encoder.usize(syntax.identity.source_capacity_bytes())?;
+    encoder.boolean(syntax.identity.has_bound_source_origin())?;
+    encoder.boolean(syntax.identity.has_stable_source_owner())?;
+    encoder.u32(syntax.identity.algorithm_version)?;
+    encoder.u32(syntax.identity.accounting_version)?;
+    encoder.u8(0)?; // ParseAttemptDeclaredFallback::None.
+    encode_aot_planning_parse_prospective(&mut encoder, syntax_prospective)?;
+    encode_aot_planning_parse_actual(&mut encoder, syntax.actual)?;
+    encoder.u8(0)?; // ParseAttemptTerminal::Success.
+
+    encode_aot_planning_construction_prospective(&mut encoder, construction_prospective)?;
+    encode_aot_planning_construction_actual(&mut encoder, construction.actual)?;
+    encoder.u8(ledger_entries)?;
+    for entry in construction.ledger.iter() {
+        encode_aot_planning_ledger_entry(&mut encoder, entry)?;
+    }
+    encoder.usize(AggregateConstructionStage::ExactLiteral.ordinal())?;
+    encoder.u8(0)?; // AggregateConstructionTerminal::Success.
+    let (digest, identity_bytes_hashed) = encoder.finish();
+
+    Some((
+        AggregateCountExactLiteralAotPlanningReceiptIdentity(digest),
+        AggregateCountExactLiteralAotPlanningAccounting {
+            source_bytes: syntax.identity.source_bytes,
+            source_capacity_bytes: syntax.identity.source_capacity_bytes(),
+            syntax_prospective,
+            syntax_actual: syntax.actual,
+            construction_prospective,
+            construction_actual: construction.actual,
+            construction_ledger_entries: ledger_entries,
+            report_planner_work,
+            report_retained_capacity_bytes: report.retained_capacity_bytes,
+            identity_bytes_hashed,
+        },
+    ))
+}
+
+fn aggregate_count_exact_literal_aot_projection_accounting(
+    semantic_identity_bytes_hashed: u64,
+    planning: &AggregateCountExactLiteralAotPlanningAccounting,
+) -> Option<AggregateCountExactLiteralAotIdentityProjectionAccounting> {
+    let planning_identity_bytes_hashed = planning.identity_bytes_hashed();
+    let canonical_bytes =
+        semantic_identity_bytes_hashed.checked_add(planning_identity_bytes_hashed)?;
+    // One unit to encode and one unit to feed each canonical byte, plus a
+    // fixed comparison/closure allowance and one fixed allowance per typed
+    // ledger entry. Both SHA projections are sequential, so only one hasher
+    // state is co-live.
+    let fixed_work = 1_024_u64
+        .checked_add(u64::from(planning.construction_ledger_entries()).checked_mul(256)?)?;
+    let computed_projection_work_upper_bound =
+        canonical_bytes.checked_mul(2)?.checked_add(fixed_work)?;
+    let accounting = AggregateCountExactLiteralAotIdentityProjectionAccounting {
+        semantic_identity_bytes_hashed,
+        planning_identity_bytes_hashed,
+        // Construction charges this fixed ceiling before publication. The
+        // receipt can therefore include its own final work counter without a
+        // self-referential variable charge.
+        projection_work_upper_bound:
+            AGGREGATE_COUNT_EXACT_LITERAL_AOT_CANDIDATE_IDENTITY_WORK_UPPER_BOUND_V1,
+        scratch_bytes_upper_bound: u64::try_from(core::mem::size_of::<Sha256>()).ok()?,
+        allocations: 0,
+    };
+    (computed_projection_work_upper_bound
+        <= AGGREGATE_COUNT_EXACT_LITERAL_AOT_CANDIDATE_IDENTITY_WORK_UPPER_BOUND_V1)
+        .then_some(accounting)
+}
+
+fn aggregate_count_exact_literal_aot_semantic_projection_accounting(
+    semantic_identity_bytes_hashed: u64,
+) -> Option<AggregateCountExactLiteralAotIdentityProjectionAccounting> {
+    let computed_projection_work_upper_bound = semantic_identity_bytes_hashed
+        .checked_mul(2)?
+        .checked_add(1_024)?;
+    (computed_projection_work_upper_bound
+        <= AGGREGATE_COUNT_EXACT_LITERAL_AOT_CANDIDATE_IDENTITY_WORK_UPPER_BOUND_V1)
+        .then_some(AggregateCountExactLiteralAotIdentityProjectionAccounting {
+            semantic_identity_bytes_hashed,
+            planning_identity_bytes_hashed: 0,
+            projection_work_upper_bound:
+                AGGREGATE_COUNT_EXACT_LITERAL_AOT_CANDIDATE_IDENTITY_WORK_UPPER_BOUND_V1,
+            scratch_bytes_upper_bound: u64::try_from(core::mem::size_of::<Sha256>()).ok()?,
+            allocations: 0,
+        })
+}
+
+fn aggregate_count_exact_literal_aot_cached_projection(
+    report: &AggregateBuildReport,
+    engine: &AggregateExactLiteralEngine,
+    construction: &AggregateConstructionReceipt,
+    syntax: &fre_syntax::ParseAttemptReceipt,
+) -> Option<AggregateCountExactLiteralAotCachedProjection> {
+    if report.operation != AggregateOperation::Count {
+        return None;
+    }
+    let AggregatePlanIdentity::ExactLiteral(plan_identity) = report.plan_identity else {
+        return None;
+    };
+    let AggregateBuildAccounting::ExactLiteral(build_accounting) = report.build else {
+        return None;
+    };
+    let CompatibilityProfile::RustBytes(profile) = &report.syntax_key.profile else {
+        return None;
+    };
+    if build_accounting != engine.build_accounting()
+        || build_accounting.needle_bytes != engine.needle().len()
+    {
+        return None;
+    }
+    let (semantic_binding_identity, semantic_identity_bytes_hashed) =
+        aggregate_count_exact_literal_aot_semantic_binding_identity(
+            report,
+            engine.needle(),
+            profile,
+            plan_identity,
+            build_accounting,
+        )?;
+    let semantic_projection_accounting =
+        aggregate_count_exact_literal_aot_semantic_projection_accounting(
+            semantic_identity_bytes_hashed,
+        )?;
+    let planning = aggregate_count_exact_literal_aot_planning_receipt(
+        report,
+        semantic_binding_identity,
+        plan_identity,
+        build_accounting,
+        construction,
+        syntax,
+    )
+    .and_then(|(identity, accounting)| {
+        aggregate_count_exact_literal_aot_projection_accounting(
+            semantic_identity_bytes_hashed,
+            &accounting,
+        )
+        .map(|projection| (identity, accounting, projection))
+    });
+    Some(AggregateCountExactLiteralAotCachedProjection {
+        semantic_binding_identity,
+        semantic_projection_accounting,
+        planning,
+    })
+}
+
+fn encode_aot_exact_literal_identity_for_planning(
+    encoder: &mut AggregateAotPlanningEncoder,
+    identity: AggregateExactLiteralIdentity,
+) -> Option<()> {
+    encoder.u8(match identity.semantics {
+        AggregateExactLiteralSemantics::UnicodeOffByteBoundaries => 0,
+        AggregateExactLiteralSemantics::UnicodeOnNonemptyUtf8Literal => 1,
+    })?;
+    encoder.bytes(identity.kernel.plan_id.as_bytes())?;
+    encoder.bytes(identity.kernel.operation_id.as_bytes())?;
+    encoder.u8(match identity.kernel.operation {
+        LiteralAggregateOperation::Count => 0,
+        LiteralAggregateOperation::SpanSum => 1,
+    })?;
+    encoder.u8(match identity.kernel.boundary_semantics {
+        LiteralAggregateBoundarySemantics::EveryByteBoundaryUnicodeOff => 0,
+    })?;
+    encoder.boolean(identity.kernel.non_overlapping)?;
+    encoder.u32(identity.kernel.algorithm_version)?;
+    encoder.u32(identity.kernel.accounting_version)?;
+    encoder.u8(match identity.kernel.declared_fallback {
+        LiteralAggregateDeclaredFallback::None => 0,
+    })
+}
+
+fn encode_aot_exact_literal_build_for_planning(
+    encoder: &mut AggregateAotPlanningEncoder,
+    build: LiteralAggregateBuildAccounting,
+) -> Option<()> {
+    encoder.usize(build.needle_bytes)?;
+    encoder.usize(build.temporary_capacity_bytes)?;
+    encoder.u64(build.work_upper_bound)?;
+    encoder.usize(build.scratch_bytes)?;
+    encoder.usize(build.persistent_bytes)?;
+    encoder.usize(build.peak_bytes)
 }
 
 /// Lossless receipt-local source storage.
@@ -8175,7 +9781,8 @@ impl AggregateBuilder {
         let request = fre_syntax::ParseRequest::rust(core::mem::take(&mut self.pattern), profile)
             .with_admission(self.limits.admission)
             .with_safety_envelope(self.limits.syntax_safety);
-        let prospective = aggregate_construction_prospective(&request, &self.limits);
+        let prospective =
+            aggregate_construction_prospective(&request, &self.limits, selection, operation);
         let syntax_request = request.attempt_identity();
         let request_inputs = AggregateConstructionRequest {
             syntax_request: syntax_request.clone(),
@@ -8401,13 +10008,22 @@ impl AggregateBuilder {
                     plan.report.plan
                 )
             });
-        let publication_effect = include_published_report_seal_effect(unpublished_report_effect)
-            .unwrap_or_else(|| {
+        let mut publication_effect =
+            include_published_report_seal_effect(unpublished_report_effect).unwrap_or_else(|| {
                 unreachable!(
                     "selected {:?} report seal exceeded its published prospective",
                     plan.report.plan
                 )
             });
+        let caches_count_exact_literal_aot = plan.admits_count_exact_literal_aot_cache();
+        if caches_count_exact_literal_aot {
+            publication_effect = include_count_exact_literal_aot_cache_effect(publication_effect)
+                .unwrap_or_else(|| {
+                    unreachable!(
+                        "selected exact-literal AOT cache exceeded its published prospective"
+                    )
+                });
+        }
         let preflight_actual = context
             .transaction
             .actual()
@@ -8428,17 +10044,48 @@ impl AggregateBuilder {
                 plan.report.plan
             );
         }
+        let needs_fixed_preview = matches!(
+            plan.report.sealed_url_aggregate_identity.as_ref(),
+            Some(AggregateUrlOrFixedSeal::Fixed(_))
+        );
+        let publication_preview = if caches_count_exact_literal_aot || needs_fixed_preview {
+            Some(
+                context
+                    .transaction
+                    .preview_success(publication_effect, selected_plan.clone())
+                    .unwrap_or_else(|error| {
+                        unreachable!(
+                            "construction receipt preview failed before publication: {error:?}"
+                        )
+                    }),
+            )
+        } else {
+            None
+        };
+        if caches_count_exact_literal_aot {
+            let preview = publication_preview
+                .as_ref()
+                .expect("exact-literal AOT publication preview is retained");
+            let syntax_attempt = context
+                .syntax_attempt
+                .as_ref()
+                .expect("successful syntax attempt is retained before AOT publication");
+            if plan
+                .prepare_count_exact_literal_aot_cache(preview, syntax_attempt)
+                .is_none()
+            {
+                unreachable!(
+                    "selected count exact-literal plan could not cache its authenticated AOT projection"
+                );
+            }
+        }
         if let Some(AggregateUrlOrFixedSeal::Fixed(owner)) =
             plan.report.sealed_url_aggregate_identity.as_mut()
         {
-            let preview = context
-                .transaction
-                .preview_success(publication_effect, selected_plan.clone())
-                .unwrap_or_else(|error| {
-                    unreachable!(
-                        "fixed-domain construction receipt preview failed before publication: {error:?}"
-                    )
-                });
+            let preview = publication_preview
+                .as_ref()
+                .expect("fixed-domain publication preview is retained")
+                .clone();
             if owner.attach_construction_attempt(preview).is_err() {
                 unreachable!(
                     "fixed-domain construction receipt could not bind its unique owner before publication"
@@ -8468,6 +10115,12 @@ impl AggregateBuilder {
             Ok(receipt) => receipt,
             Err(_state) => unreachable!("published construction transaction did not close"),
         };
+        if publication_preview
+            .as_ref()
+            .is_some_and(|preview| preview != &receipt)
+        {
+            unreachable!("prepublication receipt preview differs from final publication");
+        }
         plan.report.syntax_attempt.set(context.syntax_attempt);
         if let Some(AggregateUrlOrFixedSeal::Fixed(owner)) =
             plan.report.sealed_url_aggregate_identity.as_ref()
@@ -8632,7 +10285,13 @@ impl AggregateBuilder {
                             }
                         })?
                         .into_parts();
-                (AggregateEngine::ExactLiteral(engine), actual)
+                (
+                    AggregateEngine::ExactLiteral(AggregateExactLiteralEngine {
+                        plan: engine,
+                        count_aot: None,
+                    }),
+                    actual,
+                )
             };
             retain_direct_build_success(construction, work, build_actual);
             let Some(plan_origin) = LiteralAggregatePlanOrigin::from_external_address(
@@ -8645,7 +10304,9 @@ impl AggregateBuilder {
                 });
             };
             let origin_bound = match &mut engine {
-                AggregateEngine::ExactLiteral(engine) => engine.bind_external_origin(plan_origin),
+                AggregateEngine::ExactLiteral(engine) => {
+                    engine.plan.bind_external_origin(plan_origin)
+                }
                 AggregateEngine::DispatchedExactLiteral(engine) => {
                     engine.bind_external_origin(plan_origin)
                 }
@@ -14377,6 +16038,20 @@ fn tagged_grapheme_ranges(
 }
 
 #[derive(Debug)]
+struct AggregateExactLiteralEngine {
+    plan: LiteralAggregatePlan,
+    count_aot: Option<AggregateCountExactLiteralAotCachedProjection>,
+}
+
+impl Deref for AggregateExactLiteralEngine {
+    type Target = LiteralAggregatePlan;
+
+    fn deref(&self) -> &Self::Target {
+        &self.plan
+    }
+}
+
+#[derive(Debug)]
 #[allow(
     clippy::large_enum_variant,
     reason = "both prefix/class owners remain allocation-accounted by their kernels; boxing the established owner would change incumbent construction effects"
@@ -14457,7 +16132,7 @@ impl AggregatePrefixClassAlternationEngine {
     reason = "selected engines retain their already-budgeted artifacts inline; boxing would add an unaccounted allocation"
 )]
 enum AggregateEngine {
-    ExactLiteral(LiteralAggregatePlan),
+    ExactLiteral(AggregateExactLiteralEngine),
     DispatchedExactLiteral(DispatchedLiteralAggregatePlan),
     UnicodeScalar(UnicodeScalarAggregatePlan),
     DispatchedUnicodeScalar(DispatchedUnicodeScalarAggregatePlan),
@@ -14755,6 +16430,88 @@ impl AggregatePlan {
             construction,
             Arc::downgrade(&self.report.syntax_key),
         ))
+    }
+
+    fn admits_count_exact_literal_aot_cache(&self) -> bool {
+        let AggregateEngine::ExactLiteral(engine) = &self.engine else {
+            return false;
+        };
+        self.operation() == AggregateOperation::Count
+            && engine.needle().len() <= AGGREGATE_COUNT_EXACT_LITERAL_AOT_MAX_LITERAL_BYTES_V1
+            && u64::try_from(self.report.syntax_key.pattern.as_bytes().len()).is_ok_and(
+                |source_bytes| {
+                    source_bytes <= AGGREGATE_COUNT_EXACT_LITERAL_AOT_MAX_SOURCE_BYTES_V1
+                },
+            )
+    }
+
+    fn prepare_count_exact_literal_aot_cache(
+        &mut self,
+        construction: &AggregateConstructionReceipt,
+        syntax: &fre_syntax::ParseAttemptReceipt,
+    ) -> Option<()> {
+        let AggregateEngine::ExactLiteral(engine) = &self.engine else {
+            return None;
+        };
+        let cache = aggregate_count_exact_literal_aot_cached_projection(
+            &self.report,
+            engine,
+            construction,
+            syntax,
+        )?;
+        let AggregateEngine::ExactLiteral(engine) = &mut self.engine else {
+            unreachable!("exact-literal AOT cache target changed during construction");
+        };
+        if engine.count_aot.replace(cache).is_some() {
+            return None;
+        }
+        Some(())
+    }
+
+    fn count_exact_literal_aot_candidate(
+        &self,
+    ) -> Option<AggregateCountExactLiteralAotCandidate<'_>> {
+        if self.operation() != AggregateOperation::Count
+            || !self.report.has_closed_construction_attempt()
+        {
+            return None;
+        }
+        let (kernel_identity, construction, syntax_provenance) =
+            self.exact_literal_construction()?;
+        let source_owner = syntax_provenance.upgrade()?;
+        if !Arc::ptr_eq(&source_owner, &self.report.syntax_key) {
+            return None;
+        }
+        let AggregateEngine::ExactLiteral(engine) = &self.engine else {
+            return None;
+        };
+        let cached = engine.count_aot?;
+        let AggregatePlanIdentity::ExactLiteral(plan_identity) = self.report.plan_identity else {
+            return None;
+        };
+        let build_accounting = construction.build_accounting()?;
+        let CompatibilityProfile::RustBytes(profile) = &self.report.syntax_key.profile else {
+            return None;
+        };
+        if kernel_identity != plan_identity.kernel
+            || kernel_identity.operation != LiteralAggregateOperation::Count
+            || build_accounting != engine.build_accounting()
+            || build_accounting.needle_bytes != engine.needle().len()
+        {
+            return None;
+        }
+        Some(AggregateCountExactLiteralAotCandidate {
+            literal: engine.needle(),
+            operation: AggregateOperation::Count,
+            semantics: plan_identity.semantics,
+            profile,
+            plan_identity,
+            build_accounting,
+            semantic_binding_identity: cached.semantic_binding_identity,
+            semantic_projection_accounting: cached.semantic_projection_accounting,
+            planning: cached.planning,
+            _construction: construction,
+        })
     }
 
     #[allow(
@@ -20862,6 +22619,37 @@ impl AggregateCountRegex {
         self.0.build_report()
     }
 
+    /// Borrow the authenticated exact-literal input for AOT compilation.
+    ///
+    /// Returns `None` unless this count facade's closed construction report,
+    /// syntax/profile owner, selected plan identity, exact build accounting,
+    /// and live retained engine all authenticate the same exact-literal plan.
+    /// The literal is borrowed directly from that engine; source is never
+    /// reparsed and no alternate plan is admitted.
+    #[must_use]
+    pub fn exact_literal_aot_candidate(
+        &self,
+    ) -> Option<AggregateCountExactLiteralAotCandidate<'_>> {
+        self.0.count_exact_literal_aot_candidate()
+    }
+
+    /// Borrow the complete fixed-policy AOT planning proof.
+    ///
+    /// This is narrower than [`Self::exact_literal_aot_candidate`]: it also
+    /// requires the versioned default-limit, forced-exact,
+    /// reverse-sequential construction policy and a complete authenticated
+    /// syntax/construction P/A ledger.
+    #[must_use]
+    pub fn exact_literal_aot_planned_candidate(
+        &self,
+    ) -> Option<AggregateCountExactLiteralAotPlannedCandidate<'_>> {
+        let candidate = self.0.count_exact_literal_aot_candidate()?;
+        candidate
+            .planning
+            .is_some()
+            .then_some(AggregateCountExactLiteralAotPlannedCandidate(candidate))
+    }
+
     /// Minimum whole-match width derived from the authenticated construction HIR.
     #[must_use]
     pub const fn minimum_match_bytes(&self) -> Option<usize> {
@@ -21198,13 +22986,14 @@ impl AggregateSpanSumResult {
 #[cfg(test)]
 mod tests {
     use super::{
-        AGGREGATE_EXPLAIN_SCHEMA_VERSION, AggregateBuildError, AggregateBuildLimits,
-        AggregateBuilder, AggregateConstructionAttemptError, AggregateConstructionEffect,
-        AggregateConstructionReceipt, AggregateConstructionStage, AggregateDirectReceiptSource,
-        AggregateExactLiteralExecutionDetails, AggregateExactLiteralReceiptSource,
-        AggregateExecutionAttemptIdentity, AggregateExecutionDetails, AggregateExecutionError,
-        AggregateExecutionIdentity, AggregateExecutionReport, AggregateExecutionSource,
-        AggregateOperation, AggregatePlanIdentity, AggregatePlanSelection, AggregateRunLimits,
+        AGGREGATE_EXPLAIN_SCHEMA_VERSION, AggregateBuildAccounting, AggregateBuildError,
+        AggregateBuildLimits, AggregateBuilder, AggregateConstructionAttemptError,
+        AggregateConstructionEffect, AggregateConstructionReceipt, AggregateConstructionStage,
+        AggregateDirectReceiptSource, AggregateExactLiteralExecutionDetails,
+        AggregateExactLiteralReceiptSource, AggregateExecutionAttemptIdentity,
+        AggregateExecutionDetails, AggregateExecutionError, AggregateExecutionIdentity,
+        AggregateExecutionReport, AggregateExecutionSource, AggregateOperation,
+        AggregatePlanIdentity, AggregatePlanSelection, AggregateRunLimits, CompatibilityProfile,
         DirectBuildAttemptActual, FixedAbsoluteDomainBuildActual,
         OrderedLiteralAggregateBuildError, RustProfile, UnicodeScalarInspectionError,
         charge_unicode_scalar_inspection_work, dense_finite_abandonment, direct_build_stage_effect,
@@ -21245,6 +23034,10 @@ mod tests {
                 count.0.engine,
                 super::AggregateEngine::DispatchedExactLiteral(_)
             ));
+            assert!(
+                count.exact_literal_aot_candidate().is_none(),
+                "a dispatched runtime SIMD owner must not be re-described as the established Count-v2 AOT candidate"
+            );
             assert!(matches!(
                 span_sum.0.engine,
                 super::AggregateEngine::DispatchedExactLiteral(_)
@@ -21266,6 +23059,10 @@ mod tests {
                 count.0.engine,
                 super::AggregateEngine::ExactLiteral(_)
             ));
+            assert!(
+                count.exact_literal_aot_candidate().is_some(),
+                "the established exact-literal Count owner retains the narrow AOT candidate"
+            );
             assert!(matches!(
                 span_sum.0.engine,
                 super::AggregateEngine::ExactLiteral(_)
@@ -21496,6 +23293,110 @@ mod tests {
                 span_route_ns / span_established_ns,
             );
         }
+    }
+
+    #[test]
+    fn exact_literal_aot_candidate_rejects_report_tampering() {
+        let mut regex = AggregateBuilder::new("needle")
+            .unicode(false)
+            .build_count()
+            .unwrap();
+        assert!(regex.exact_literal_aot_candidate().is_some());
+
+        let AggregateBuildAccounting::ExactLiteral(mut build) = regex.0.report.build else {
+            panic!("expected exact-literal build accounting");
+        };
+        build.work_upper_bound = build.work_upper_bound.checked_add(1).unwrap();
+        regex.0.report.build = AggregateBuildAccounting::ExactLiteral(build);
+
+        assert!(!regex.0.report.has_closed_construction_attempt());
+        assert!(regex.exact_literal_aot_candidate().is_none());
+    }
+
+    #[test]
+    fn exact_literal_aot_semantic_binding_is_live_literal_sensitive() {
+        let regex = AggregateBuilder::new("needle")
+            .unicode(false)
+            .build_count()
+            .unwrap();
+        let candidate = regex.exact_literal_aot_candidate().unwrap();
+        let AggregatePlanIdentity::ExactLiteral(plan_identity) = regex.build_report().plan_identity
+        else {
+            panic!("expected exact-literal plan identity");
+        };
+        let AggregateBuildAccounting::ExactLiteral(build) = regex.build_report().build else {
+            panic!("expected exact-literal build accounting");
+        };
+        let CompatibilityProfile::RustBytes(profile) = &regex.build_report().syntax_key.profile
+        else {
+            panic!("expected Rust-byte profile");
+        };
+        let altered = super::aggregate_count_exact_literal_aot_semantic_binding_identity(
+            regex.build_report(),
+            b"needlx",
+            profile,
+            plan_identity,
+            build,
+        )
+        .unwrap()
+        .0;
+
+        assert_eq!(candidate.literal().len(), b"needlx".len());
+        assert_ne!(candidate.semantic_binding_identity(), altered);
+    }
+
+    #[test]
+    fn fixed_aot_planning_identity_is_cached_and_charged_once_at_construction() {
+        let regex = AggregateBuilder::new("needle")
+            .unicode(false)
+            .limits(AggregateBuildLimits::aot_count_exact_literal_v1())
+            .plan_selection(AggregatePlanSelection::ForceExactLiteral)
+            .build_count()
+            .unwrap();
+        let report = regex.build_report();
+        let receipt = report.construction_attempt_receipt().unwrap();
+        let actual_before_getters = receipt.actual;
+
+        let first = regex.exact_literal_aot_planned_candidate().unwrap();
+        let first_semantic = first.semantic_binding_identity();
+        let first_planning = first.planning_receipt_identity();
+        let first_planning_accounting = first.planning_accounting();
+        let first_projection = first.identity_projection_accounting();
+        let second = regex.exact_literal_aot_planned_candidate().unwrap();
+
+        assert_eq!(second.semantic_binding_identity(), first_semantic);
+        assert_eq!(second.planning_receipt_identity(), first_planning);
+        assert_eq!(second.planning_accounting(), first_planning_accounting);
+        assert_eq!(second.identity_projection_accounting(), first_projection);
+        assert_eq!(
+            report.construction_attempt_receipt().unwrap().actual,
+            actual_before_getters
+        );
+
+        let AggregateBuildAccounting::ExactLiteral(build) = report.build else {
+            panic!("expected exact-literal build accounting");
+        };
+        let published = receipt.ledger.iter().last().unwrap();
+        assert_eq!(
+            published.disposition,
+            super::AggregateConstructionStageDisposition::Published
+        );
+        let expected_publication_work = u64::try_from(report.planner_work)
+            .unwrap()
+            .checked_add(build.work_upper_bound)
+            .unwrap()
+            .checked_add(1)
+            .unwrap()
+            .checked_add(
+                super::AGGREGATE_COUNT_EXACT_LITERAL_AOT_CANDIDATE_IDENTITY_WORK_UPPER_BOUND_V1,
+            )
+            .unwrap();
+        assert_eq!(published.effect.work, expected_publication_work);
+        assert_eq!(
+            first_projection.projection_work_upper_bound(),
+            super::AGGREGATE_COUNT_EXACT_LITERAL_AOT_CANDIDATE_IDENTITY_WORK_UPPER_BOUND_V1
+        );
+        assert!(receipt.prospective.unwrap().contains(receipt.actual));
     }
 
     fn pre_syntax_exact_spans_failure() -> AggregateConstructionAttemptError {

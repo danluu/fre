@@ -1,0 +1,58 @@
+[package]
+name = "fre-aot-static-runtime"
+version.workspace = true
+description = "Authenticated static-link boundaries for FRE Count-v2/v3, Search-v1 Span, and SelectedEnd-v2 AOT objects"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = []
+linked-count-v2 = []
+linked-hardware-matrix-v2 = ["linked-count-v2"]
+c5-qualification-private-v2 = ["linked-count-v2"]
+linked-count-v3 = []
+count-v3-qualification-private = ["linked-count-v3"]
+linked-search-span-v1 = []
+linked-search-v25-production-v1 = ["linked-search-span-v1"]
+linked-search-v26-production-v1 = ["linked-search-span-v1"]
+search-span-qualification-private-v1 = ["linked-search-span-v1"]
+linked-search-selected-end-v2 = []
+selected-end-qualification-private-v2 = ["linked-search-selected-end-v2"]
+
+[dependencies]
+fre-aot-aarch64 = { path = "../fre-aot-aarch64" }
+fre-aot-count-contract = { path = "../fre-aot-count-contract" }
+fre-aot-optimizer = { path = "../fre-aot-optimizer" }
+fre-aot-search-contract = { path = "../fre-aot-search-contract" }
+fre-jit-aarch64 = { path = "../fre-jit-aarch64" }
+fre-kernel-ir = { path = "../fre-kernel-ir" }
+fre-kernels = { path = "../fre-kernels" }
+fre-target-features = { path = "../fre-target-features" }
+libc = "=0.2.186"
+sha2 = "=0.10.9"
+
+[dev-dependencies]
+fre = { path = "../fre", default-features = false }
+fre-aot-compiler = { path = "../fre-aot-compiler" }
+fre-aot-count-compiler = { path = "../fre-aot-count-compiler" }
+fre-aot-elf = { path = "../fre-aot-elf" }
+fre-aot-macho = { path = "../fre-aot-macho" }
+
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "deny", priority = -1 }
+unreachable_pub = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+allow_attributes_without_reason = "warn"
+arithmetic_side_effects = "warn"
+as_conversions = "warn"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"

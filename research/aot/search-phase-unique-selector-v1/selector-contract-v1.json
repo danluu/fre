@@ -1,0 +1,68 @@
+{
+  "payload": {
+    "admission": {
+      "equivalent_statement": "the five-byte signature at cyclic phase zero is unique among all literal phases",
+      "literal_width_max": 32,
+      "literal_width_min": 6,
+      "phase_domain": "every nonzero cyclic shift s in 1..literal_width-1",
+      "predicate": "for every s, at least one selected offset o has literal[o] != literal[(o+s) mod literal_width]",
+      "selected_columns": "exactly the five authenticated offsets from the frozen endpoint-preserving v3 ranker",
+      "shape": "unanchored exact literal",
+      "timing_or_corpus_inputs": false,
+      "unselected_column_required": true
+    },
+    "candidate_identity": {
+      "backend_tag": "new-successor-required",
+      "candidate_policy": "new-successor-required",
+      "llvm_codegen": false,
+      "selector_version": 1
+    },
+    "feedback_boundary": {
+      "not_observed_before_freeze": [
+        "tag28 full candidate-independent screen",
+        "744-case source corpus timing",
+        "154-case ripgrep application timing",
+        "upstream heldout timing",
+        "Rebar corroboration timing"
+      ],
+      "observed_before_freeze": [
+        "targeted repeated/periodic/binary/entropy smokes at widths 16 and 32"
+      ],
+      "predecessor": "Search tag27 learned-column candidate",
+      "rebar_feedback_permitted": false
+    },
+    "freeze_date": "2026-07-30",
+    "production_route": {
+      "construction_and_publication_timed": false,
+      "eligible": "authoritative portable prefix of exactly 256 candidate starts, then successor native tail",
+      "ineligible": "full portable search; no V13 production route",
+      "minimum_checked_window_bytes": 4093,
+      "required_platform": "AArch64 with OS-usable ASIMD"
+    },
+    "qualification": {
+      "application": "frozen independent ripgrep application fixtures, both Apple and m9g",
+      "development": "unchanged candidate-independent synthetic/adversarial matrix, both Apple and m9g",
+      "heldout": "fresh upstream regex holdout after final source/runner freeze",
+      "rebar": "post-freeze corroboration only",
+      "required_eligible_width_bands": [
+        "6..=7",
+        "8..=15",
+        "16..=23",
+        "24..=32"
+      ],
+      "result_derived_exclusions": false,
+      "source": "frozen 744-case width2..32 source corpus, both Apple and m9g"
+    },
+    "runtime_graph": {
+      "current_block": "intersect retained five-column survivors with learned column; disable on any survivor",
+      "disable": "first six-column survivor permanently enters frozen V13 adaptive recovery for the invocation",
+      "initial_screen": "frozen V13 five-column screen and exact confirmation",
+      "later_blocks": "learned-column-first; on hit intersect all five authenticated columns",
+      "learn": "after first exact false candidate, discover first differing source offset in ascending order",
+      "relearn": false,
+      "semantic_fallback": "frozen V13 recovery inside emitted candidate only"
+    }
+  },
+  "payload_sha256": "b0241b15760f441e7f4eb410611ce1a83b1a17f4858da91ce7eacba4f5a75353",
+  "schema": "fre.aot.search-phase-unique-selector.v1"
+}

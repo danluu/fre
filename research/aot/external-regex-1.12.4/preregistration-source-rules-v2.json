@@ -1,0 +1,124 @@
+{
+  "schema": "fre.aot.external-regex-1.12.4-source-rules.v2",
+  "payload_sha256": "d0b919436165d44d9426a8fb91055a2ec70e8a2f0eb0f2041604ef91af51bc06",
+  "payload": {
+    "freeze_date": "2026-07-30",
+    "freeze_boundary": "source admission, deduplication, partition, fixtures, timing, hosts, and every-row gate frozen without reading heldout source or any result",
+    "source": {
+      "package": "regex",
+      "version": "1.12.4",
+      "upstream_repository": "https://github.com/rust-lang/regex",
+      "upstream_revision": "7b96fdc9d5fe6a0cb4efe30e6689b050493fc1e1",
+      "checked_in_inventory": "research/upstream-regex/regex-1.12.4-inventory.json",
+      "inventory_payload_sha256": "6c5150a2fc66c7262c0ca308fa164cc6fca78de97ae3dfbc948b53c41ca2a263",
+      "package_glob": "$CARGO_HOME/registry/src/*/regex-1.12.4",
+      "testdata_glob": "testdata/*.toml"
+    },
+    "selection": {
+      "membership": "rust-regex-suite",
+      "pattern_count": 1,
+      "compiles": true,
+      "anchored": false,
+      "bounded_search": false,
+      "case_insensitive": false,
+      "match_kind": "leftmost-first",
+      "search_kind": "leftmost",
+      "match_limit": null,
+      "authentication": "fre-force-exact-literal-plus-canonical-byte-escape-rebuild",
+      "canonical_byte_escape": "(?-u:\\xHH...)",
+      "search_literal_width_min": 1,
+      "search_literal_width_max": 32,
+      "count_requires_unicode_false": true,
+      "deduplicate_by": "semantic-options-sha256-plus-literal-sha256"
+    },
+    "partition": {
+      "representative": "lexicographically-smallest-case-sha256-then-case-id",
+      "domain": "fre.aot.external-regex-1.12.4.partition.v1\u0000",
+      "heldout_rule": "sha256(domain || representative_case_sha256_bytes)[0] < 64",
+      "development_rule": "complement",
+      "semantic_duplicate_groups_never_cross_partitions": true
+    },
+    "fixtures": {
+      "bytes": 1048576,
+      "scenarios": [
+        "absent",
+        "early",
+        "middle",
+        "tail",
+        "dense"
+      ],
+      "early_start": 64,
+      "middle_start": "floor((bytes - literal_width) / 2)",
+      "tail_start": "bytes - literal_width",
+      "alignment": "sha256(fixture-domain || semantic-candidate-sha256 || scenario)[0] & 15",
+      "background": "sha256-counter stream mapped to printable ASCII and deterministically repaired to contain no literal",
+      "insertion_guard": "literal_width-1 sentinel bytes on both sides where in range",
+      "dense": "nonoverlapping literal repetition followed by sentinel",
+      "fixture_domain": "fre.aot.external-regex-1.12.4.fixture.v1\u0000"
+    },
+    "timing": {
+      "repetitions": 6,
+      "target_elapsed_ns_each_variant": 500000000,
+      "minimum_elapsed_ns_each_variant": 400000000,
+      "calibration": "both variants; iterations sized from faster pilot",
+      "pairing": "same logical CPU, identical fixture, alternating order",
+      "workers": "distinct admitted CPUs with measured headroom",
+      "unrelated_cpu_work": "never stopped or killed"
+    },
+    "hosts": [
+      "local-apple-aarch64-asimd",
+      "zstd-eval-ec2-aarch64-asimd-sve2-vl16"
+    ],
+    "preserved_section_sha256": {
+      "source": "4eb7a693d22f31069020cc87ce087e9e2fe6a2eca9be9a49b819d4000768cf02",
+      "selection": "2b1a8bd9b7c076661fe2538afccab5d75e3a1c75e1a92aa1adf22579fa88c154",
+      "partition": "f2879f4c3bf7bec685364ad1bee2d90f2d3997f837d45173a8c7c82e4262e5fd",
+      "fixtures": "64616ba4a8d33b1280d713d3204afe2ce9b6b6c4a003888bfac7688979483f8f",
+      "timing": "fba2e06d860a9726ff5b9da399f5f6676537a4dc16b2250a936f66cd6eaa2f2d",
+      "hosts": "34339e86353da5e7508a6702b6a94730727a3dfdfc67900b5f7abedcfb911c4c"
+    },
+    "independence": {
+      "only_corpus_source": "authenticated published regex 1.12.4 rust-regex-suite",
+      "external_classification_inputs": [],
+      "corpus_overlap_inputs": [],
+      "rebar_inputs": [],
+      "benchmark_result_inputs": [],
+      "network": false,
+      "timing_feedback_permitted": false,
+      "result_derived_selection": false,
+      "result_derived_exclusions": false,
+      "rebar_affects_membership": false,
+      "rebar_affects_gates": false,
+      "rebar_affects_promotion": false,
+      "gate_membership": "every admitted deduplicated representative in both partitions",
+      "heldout_source_materialized": false
+    },
+    "final_engine_requirements": {
+      "architecture": "aarch64",
+      "required_isa": "OS-usable ASIMD",
+      "backend_tag": 29,
+      "backend_version": "SEARCH_V16",
+      "candidate_policy": 15,
+      "backend_name": "AsimdV16",
+      "aot_magic_hex": "465245413634001d",
+      "llvm": false,
+      "abi": "AAPCS64-SelectedEndRegisterV2",
+      "minimum_checked_window_bytes": 4093,
+      "portable_prefix_candidate_starts": 256,
+      "eligible_route": "authoritative portable prefix then disjoint tag29 static tail",
+      "ineligible_route": "full portable search",
+      "construction_link_adoption_timed": false
+    },
+    "qualification_requirements": {
+      "development_topology_freeze_sha256": "9f6ba2af9ff7e2296f65dc20b4386d68ddd5ea41837814a1b6b4c3ee2faf4856",
+      "development_topology_projection_sha256": "72d85a032a90e4347be2d537c2ff11bac15016787c055332843f143da72e487f",
+      "application_freeze_sha256": "a491f2fd1e19d01cca9a237770c8cdefa04a90e3623dadfcc4c79012eb2abd52",
+      "application_freeze_payload_sha256": "3359ab7c620482d67d67d09903981c8b322c5268cfe0640e273de0f778192822",
+      "development_and_application_must_pass_before_heldout_materialization": true,
+      "heldout_each_static_tail_case_gate": "six-pair median candidate/portable ratio strictly less than 4/5 on each host",
+      "heldout_each_prefix_or_fallback_case_gate": "six-pair median candidate/portable ratio at most 21/20 on each host",
+      "aggregate_rescue_permitted": false,
+      "failed_heldout_disposition": "no reuse; freeze a new preregistration version before any code, policy, selection, or fixture change"
+    }
+  }
+}

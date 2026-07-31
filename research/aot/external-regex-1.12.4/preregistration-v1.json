@@ -1,0 +1,114 @@
+{
+  "schema": "fre.aot.external-regex-1.12.4-preregistration.v1",
+  "source": {
+    "package": "regex",
+    "version": "1.12.4",
+    "upstream_repository": "https://github.com/rust-lang/regex",
+    "upstream_revision": "7b96fdc9d5fe6a0cb4efe30e6689b050493fc1e1",
+    "checked_in_inventory": "research/upstream-regex/regex-1.12.4-inventory.json",
+    "inventory_payload_sha256": "6c5150a2fc66c7262c0ca308fa164cc6fca78de97ae3dfbc948b53c41ca2a263",
+    "package_glob": "$CARGO_HOME/registry/src/*/regex-1.12.4",
+    "testdata_glob": "testdata/*.toml"
+  },
+  "selection": {
+    "membership": "rust-regex-suite",
+    "pattern_count": 1,
+    "compiles": true,
+    "anchored": false,
+    "bounded_search": false,
+    "case_insensitive": false,
+    "match_kind": "leftmost-first",
+    "search_kind": "leftmost",
+    "match_limit": null,
+    "authentication": "fre-force-exact-literal-plus-canonical-byte-escape-rebuild",
+    "canonical_byte_escape": "(?-u:\\xHH...)",
+    "search_literal_width_min": 1,
+    "search_literal_width_max": 32,
+    "count_requires_unicode_false": true,
+    "deduplicate_by": "semantic-options-sha256-plus-literal-sha256"
+  },
+  "partition": {
+    "representative": "lexicographically-smallest-case-sha256-then-case-id",
+    "domain": "fre.aot.external-regex-1.12.4.partition.v1\u0000",
+    "heldout_rule": "sha256(domain || representative_case_sha256_bytes)[0] < 64",
+    "development_rule": "complement",
+    "semantic_duplicate_groups_never_cross_partitions": true
+  },
+  "contamination": {
+    "required_sources": [
+      "accepted Rebar expanded manifest authenticated by research/rebar/performance/tested-source-a1a87d11-contract.json",
+      "every source-bound Rebar pattern or literal inventory used by final AOT evidence"
+    ],
+    "compare": [
+      "raw-pattern-sha256",
+      "fre-authenticated-exact-literal-sha256",
+      "declared-literal-sha256"
+    ],
+    "overlap_disposition": "corroboration-only",
+    "independent_gate_excludes_overlap": true
+  },
+  "fixtures": {
+    "bytes": 1048576,
+    "scenarios": [
+      "absent",
+      "early",
+      "middle",
+      "tail",
+      "dense"
+    ],
+    "early_start": 64,
+    "middle_start": "floor((bytes - literal_width) / 2)",
+    "tail_start": "bytes - literal_width",
+    "alignment": "sha256(fixture-domain || semantic-candidate-sha256 || scenario)[0] & 15",
+    "background": "sha256-counter stream mapped to printable ASCII and deterministically repaired to contain no literal",
+    "insertion_guard": "literal_width-1 sentinel bytes on both sides where in range",
+    "dense": "nonoverlapping literal repetition followed by sentinel",
+    "fixture_domain": "fre.aot.external-regex-1.12.4.fixture.v1\u0000"
+  },
+  "search": {
+    "source_commit": "8854592e",
+    "backend_tag": 22,
+    "candidate_policy": 9,
+    "abi": "AAPCS64-OutSlotV1",
+    "isa": "ASIMD",
+    "output": "Span",
+    "window": "full-haystack",
+    "minimum_window_bytes": 4093,
+    "prefix_candidate_starts": 256,
+    "auto_route": "portable for width<2 or short window; otherwise portable prefix then V9 suffix",
+    "construction_and_publication_timed": false
+  },
+  "count": {
+    "development_source_commit": "5a58bf03",
+    "profile": {
+      "unicode": false,
+      "case_insensitive": false,
+      "literal_mode": "ForceExactLiteral"
+    },
+    "operation": "whole-haystack-nonoverlapping-count",
+    "build_limits": "AggregateBuildLimits::aot_count_exact_literal_v1()",
+    "construction_and_publication_timed": false,
+    "final_identity_required_before_heldout_timing": true
+  },
+  "timing": {
+    "repetitions": 6,
+    "target_elapsed_ns_each_variant": 500000000,
+    "minimum_elapsed_ns_each_variant": 400000000,
+    "calibration": "both variants; iterations sized from faster pilot",
+    "pairing": "same logical CPU, identical fixture, alternating order",
+    "workers": "distinct admitted CPUs with measured headroom",
+    "unrelated_cpu_work": "never stopped or killed"
+  },
+  "gates": {
+    "correctness": "all cases, partitions, scenarios, engines, and hosts exactly match scalar references",
+    "search_independent_suffix_geomean_max": 0.8,
+    "search_independent_nontarget_geomean_max": 1.05,
+    "count_independent_aggregate_geomean_max": 0.8,
+    "count_independent_each_scenario_geomean_max": 1.05,
+    "heldout_reuse_after_failure": "forbidden; revise preregistration version"
+  },
+  "hosts": [
+    "local-apple-aarch64-asimd",
+    "zstd-eval-ec2-aarch64-asimd-sve2-vl16"
+  ]
+}

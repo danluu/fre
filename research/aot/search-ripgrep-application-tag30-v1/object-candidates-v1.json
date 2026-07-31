@@ -1,0 +1,70 @@
+{
+  "payload": {
+    "application_qualification_authority": false,
+    "backend_name": "AsimdV17",
+    "backend_tag": 30,
+    "backend_version": "SEARCH_V17",
+    "benchmark_results": [],
+    "campaign_plan_identity": null,
+    "candidate_count": 5,
+    "candidate_policy": 15,
+    "candidates": [
+      {
+        "literal_bytes": 6,
+        "literal_hex": "576174736f6e",
+        "literal_sha256": "4d7b2cc54157ab5d6d894514924ebacdea5433898fde0ba516bc9c53e5a8f8a2",
+        "semantic_candidate_sha256": "318652f53f30fb6804f3478ca685f043cb2fa09599d8af33fbaceb301c399aa6"
+      },
+      {
+        "literal_bytes": 8,
+        "literal_hex": "4e4f204d41544348",
+        "literal_sha256": "16826644e6e0e9fc2c78f01f469b98fd83cf0e82ad63a2ad04d4787271222475",
+        "semantic_candidate_sha256": "7f5e6116655e1086c60eee78d8ba7a4347ab9f56c279dc021ad17bd18cee8ebb"
+      },
+      {
+        "literal_bytes": 8,
+        "literal_hex": "536865726c6f636b",
+        "literal_sha256": "65921a4d4f3986c067fb5b12d5789ea57160621a79f514be4ceb33e6619cb51f",
+        "semantic_candidate_sha256": "564cca5b2eda6665b9060fc2f07df62ab08c6c79bffd409651fc9ac48bc01d0d"
+      },
+      {
+        "literal_bytes": 14,
+        "literal_hex": "444f4553204e4f54204d41544348",
+        "literal_sha256": "d68e0c649120a9edf84b43f752a07846d0b687f2f328e44e08935496d3672fda",
+        "semantic_candidate_sha256": "8bc3147714127e3ead175f8568d9f319f596e5335e46b6db898648735d8c2b33"
+      },
+      {
+        "literal_bytes": 14,
+        "literal_hex": "446f63746f7220576174736f6e73",
+        "literal_sha256": "95161d8a5ce1a8f4dc98bc3e9ad2847d668df4889a2771615510e054468dbf9e",
+        "semantic_candidate_sha256": "aa4cd0b585b75f35a3414f3a2145dcdef4434730bdff308cc0fed11791a37039"
+      }
+    ],
+    "external_inputs": [],
+    "family_selector": 13,
+    "fixture_manifest_payload_sha256": "1cbda700087f5506daa91b0657070cbf39fac68222ff84e273d1d83c09f6ebfd",
+    "fixture_manifest_sha256": "b20181470c604d01d2ec236259293cfcb6e5eff145bcd3e4daa91554c8cebcca",
+    "freeze_payload_sha256": "3359ab7c620482d67d67d09903981c8b322c5268cfe0640e273de0f778192822",
+    "freeze_sha256": "a491f2fd1e19d01cca9a237770c8cdefa04a90e3623dadfcc4c79012eb2abd52",
+    "inventory_payload_sha256": "68af2c6dd547935d3c4dd095f18958035104d153b355ff416c46c78a922b0979",
+    "inventory_sha256": "2aec7b83cfcafbd0f8a9cab2e08941882b34d39786d26f26837c671378f1275b",
+    "llvm": false,
+    "maximum_literal_bytes": 32,
+    "minimum_literal_bytes": 6,
+    "minimum_window_bytes": 65536,
+    "network": false,
+    "portable_prefix_candidate_starts": 256,
+    "private_family_authorization_identity": null,
+    "production_authority": false,
+    "rebar_inputs": [],
+    "selector_contract_sha256": "38ca5ebc1b239b541afcf9eeb679bf8b156c8690e7422a96f69a9457a155daf0",
+    "selector_implementation_sha256": "35aacbca100dde74a2ead493ceab1197c813d37c17d5f4a9d3e62938c3a2b610",
+    "source_construction": "canonical-byte-escaped-exact",
+    "timing_feedback_permitted": false,
+    "timing_permitted": false,
+    "upstream_commit": "f9c05a949d1a0dc8e16dee28ca9605d38611faeb",
+    "upstream_tree": "ce81df4f8cad2dbfd1afb6b3ba53fd19846a5794"
+  },
+  "payload_sha256": "43ac3f352f2b4730d20e791964d13cf9e9fe1473f38eadb9e15ad7ee7318d144",
+  "schema": "fre.aot.search-tag30-application-object-candidates.v1"
+}

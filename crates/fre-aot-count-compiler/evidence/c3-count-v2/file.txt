@@ -1,0 +1,1 @@
+./linked-count: Mach-O 64-bit executable arm64

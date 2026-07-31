@@ -1,0 +1,108 @@
+{
+  "schema": "fre-search-aot-candidate-preregistration-v1",
+  "candidate": {
+    "name": "v25-sixth-promote-r1",
+    "backend_policy": "AsimdV25",
+    "backend_version": 38,
+    "aot_magic_final_byte_hex": "26",
+    "llvm": false,
+    "parent_source_commit": "31aae593de32dc070c804768baa55db72e3857bc",
+    "parent_source_tree": "f0ba53dc71602d36e0da188e4067953df01eea6a"
+  },
+  "created_utc": "2026-07-30T22:40:23Z",
+  "status": "FROZEN_BEFORE_V25_IMPLEMENTATION_OR_TIMING",
+  "terminal_predecessor_evidence": {
+    "candidate": "v24-sixth-static-r1",
+    "terminal_receipt_commit": "1875e6f269fbc397852de6c05c7b9165992a9238",
+    "terminal_receipt_tree": "44d0834f462e7701154c164d229d8c268dd73648",
+    "terminal_receipt_sha256": "c4487f4248a128daba78402207956ae12811dd5ac622e1a47203d83152b505fd",
+    "complete_analysis_sha256": "fbb643215406d1fb866cec1e686d1c114372bb2a10a95f3555f4378b4190df53",
+    "observed_overall_candidate_over_v17_geomean": 0.7354301264224369,
+    "observed_cells_strictly_over_1_05": 144,
+    "observed_maximum_candidate_over_v17": 2.381088,
+    "observed_width_6_geomean": 1.1608341018876944,
+    "diagnosis": "When the V24 sixth static column empties a dense group, V24 advances without learning. Repeating all six static column scans for every group loses the V23 persistent learned-column behavior and creates the complete observed tail."
+  },
+  "frozen_design": {
+    "admitted_shape": "The exact V24 unanchored cyclic-phase-unique five-manifest-column width-6-through-32 shape only.",
+    "unchanged_from_v24": [
+      "the five authenticated manifest offsets and their ranking",
+      "the deterministic source-general sixth offset and byte",
+      "first-candidate exact handling",
+      "five-column wide masks",
+      "narrow, tail, output, audit, and AOT contracts",
+      "the V23 persistent learned-wide graph when a non-sixth mismatch is discovered"
+    ],
+    "single_runtime_change": [
+      "After all five manifest columns survive, apply V24's deterministic sixth column.",
+      "If the sixth-column intersection is nonempty, enter the unchanged V24/V23 recovery and learning graph.",
+      "If the sixth-column intersection is empty, treat the statically known sixth offset as the learned mismatch: retain its broadcast byte in Q24, broadcast its offset into Q25, set the persistent learned-state scalar to active, restore the exact wide bound, and advance directly into the existing V23 persistent learned-wide graph.",
+      "The empty intersection proves that no source-order candidate in the current group can match, so promotion cannot skip a valid result."
+    ],
+    "forbidden_changes": [
+      "no pattern-specific benchmark literals or topology cases",
+      "no width-specific routing",
+      "no V24 result-table lookup or benchmark identity in emitted code",
+      "no LLVM, external assembler, or system compiler in native code generation",
+      "no production routing or default change before qualification",
+      "no change to V17, V23, or V24 emitted bytes",
+      "no V24 retest or reclassification"
+    ]
+  },
+  "required_correctness": {
+    "hard_fail_on_any_mismatch": true,
+    "requirements": [
+      "audit authenticates the exact V25 promotion control-flow graph and rejects V24/V25 relabeling",
+      "all output contracts match KIR across widths 6 through 32, both primary-offset forms, randomized windows, modulo-16 boundaries, narrow and tail exits, no-match, and guard pages",
+      "sixth-empty promotion executes at the first, middle, and final complete wide group",
+      "sixth-survivor non-sixth mismatch retains exact persistent learning",
+      "exact matches before and after a promoted group remain source-order exact",
+      "V17 and V23 AOT image matrices remain byte-for-byte frozen",
+      "emission work is precharged exactly"
+    ]
+  },
+  "fresh_performance_gate": {
+    "method_identity": "Exact V24 authenticated 1,944-cell method, changing only candidate identity from AsimdV24 to AsimdV25.",
+    "reference": "AsimdV17",
+    "expected_cells": 1944,
+    "topologies": 4,
+    "widths": "6..32",
+    "scenarios": 6,
+    "windows": 3,
+    "cell_estimator": "Arithmetic median of 12 paired candidate_ns_per_search / V17_ns_per_search ratios; all six execution orders occur twice.",
+    "aggregate_estimator": "Equal-cell-weight exp(fsum(log(cell_ratio)) / cell_count).",
+    "strict_acceptance": {
+      "overall_candidate_over_v17_geomean_lte": 0.8,
+      "every_broad_stratum_candidate_over_v17_geomean_lte": 1.02,
+      "broad_strata": [
+        "scenario",
+        "topology",
+        "outcome",
+        "window",
+        "width"
+      ],
+      "cells_strictly_over_1_05_lte": 19,
+      "maximum_candidate_over_v17_ratio_lte": 1.1,
+      "p95_nearest_rank_one_indexed_1847": "report-only",
+      "all_semantics_and_artifact_bindings_exact": true
+    },
+    "runs": 1,
+    "missing_duplicate_nonfinite_unpaired_or_mutated_input": "hard failure",
+    "result_policy": {
+      "pass": "Proceed to a separately frozen, result-blind two-host external workload gate before production authority.",
+      "fail": "Terminally refuse this exact V25 identity; do not retest, tune its gate, or deploy it."
+    }
+  },
+  "heldout_and_production": {
+    "rebar_may_influence_design_or_gate": false,
+    "production_authority_before_broad_and_heldout_pass": false,
+    "heldout_source": "A successor fork of the immutable ripgrep V24 heldout population may change only candidate/tool identities and must be sealed before V25 timing.",
+    "post_promotion_rebar": "Corroboration only, after source-qualified production routing is enabled."
+  },
+  "timing_at_freeze": {
+    "v25_candidate_builds": 0,
+    "v25_candidate_executions": 0,
+    "v25_performance_samples": 0,
+    "v25_rebar_samples": 0
+  }
+}

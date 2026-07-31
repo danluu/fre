@@ -5,15 +5,20 @@ Kernel IR. It emits ordinary pattern-specialized AAPCS64 machine code, not
 regex bytecode and not a dispatch loop. The crate contains no unsafe code and
 does **not** make its output executable. `fre-jit-runtime` is the separate,
 narrowly unsafe strict-W^X publisher, and `fre-jit-cache` owns bounded
-publication caching. The only high-level route is the explicit
-`fre::QualifiedExactSearch` facade; no default planner selects native
-execution. Search V7 is qualified only for that facade's 16-byte
-large-window/reuse envelope. Its promotion is a direct child of exact measured
-commit `88e9c22c4ac382531bc1026ca0e25587905f5206` and binds external bundle
-SHA-256
-`de084ff0564acdb89889f28b9dcfddce9b6f0955a1b2aead30d75770039e0453`.
+publication caching.
 
-## Admitted kernels
+The V7 material below records an exact historical source/artifact
+qualification. Exact measured commit
+`88e9c22c4ac382531bc1026ca0e25587905f5206` had a direct-child promotion bound
+to external bundle SHA-256
+`de084ff0564acdb89889f28b9dcfddce9b6f0955a1b2aead30d75770039e0453`.
+That evidence is non-authoritative for the current composed source, which uses
+V8 as its default emitter policy, keeps the V8, tag-10, tag-19, and tag-21
+qualification atoms at `Candidate`, and keeps legacy V7 hard `Candidate`.
+Consequently, no current production facade is authorized to publish a Search
+JIT image; scoped Candidate execution remains qualification/test-only.
+
+## Historical V7 admitted kernels
 
 The search-v7 emitter recognizes only the two canonical shapes that
 `fre-kernel-ir` can currently certify:
@@ -171,10 +176,11 @@ typed reference-counted kernels. `fre-jit-cache` exposes only cache-accounted
 leases from its public builder path.
 
 The decoded-ISA differential still does not substitute for actual-hardware
-guard pages, ABI canaries, cache coherency or performance evidence. The
-qualified explicit leaf passed the full correctness/lint/docs gates, honest
-cold and amortized workload accounting, source-bound alternating A/B matrices
-including all losses and adversarial holdouts, and an independent review.
-Those results do not qualify any other width, operation, architecture, AOT
-loader, or default planner route; the rest of the native facade remains
-experimental.
+guard pages, ABI canaries, cache coherency or performance evidence. For its
+exact historical source and artifact tuple, the explicit V7 leaf passed the
+full correctness/lint/docs gates, honest cold and amortized workload
+accounting, source-bound alternating A/B matrices including all losses and
+adversarial holdouts, and an independent review. Those retained results
+authorize no execution or speed claim for the current composed source and do
+not qualify any other width, operation, architecture, AOT loader, or default
+planner route.

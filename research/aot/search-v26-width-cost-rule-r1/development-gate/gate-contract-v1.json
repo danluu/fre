@@ -1,0 +1,174 @@
+{
+  "schema": "fre-search-v26-development-gate-contract-v1",
+  "status": "RESULT_BLIND_TOOLING_DRAFT_AWAITING_SUCCESSOR_CORE_AND_SEAL",
+  "candidate": {
+    "backend_policy": "AsimdV26",
+    "backend_version": 39,
+    "source_commit": "AWAITING_COHERENT_RELABEL_FIX_SUCCESSOR",
+    "source_tree": "AWAITING_COHERENT_RELABEL_FIX_SUCCESSOR",
+    "llvm": false
+  },
+  "inputs": {
+    "preregistration_sha256": "772a23e5e6c4354fa3bdc9ad307601dbbce655a62dd5ee7ded075dbe4869a02a",
+    "synthetic_population_sha256": "a682375f2e6e051f97322396bafc46974df47baa3518bc17f5d6b71b56407b73",
+    "literal_records": 1296,
+    "cells": 7776,
+    "cell_manifest_sha256": "AWAITING_RESULT_BLIND_MATERIALIZATION",
+    "cell_key_fields": [
+      "width",
+      "output_tag",
+      "accepted_ordinal",
+      "window_shape"
+    ],
+    "cell_order": [
+      "width ascending 6..32",
+      "output order exists, span, selected_end",
+      "accepted ordinal ascending 0..15",
+      "window order no_match, first_legal_position, middle_complete_vector_group, last_legal_position, overlapping_near_miss_before_match, dense_primary_byte_false_candidates"
+    ]
+  },
+  "fixtures": {
+    "recipe": "fre-search-v26-long-scan-fixture-v1",
+    "long_window_bytes": 2097152,
+    "long_shapes": [
+      "no_match",
+      "middle_complete_vector_group",
+      "last_legal_position",
+      "overlapping_near_miss_before_match",
+      "dense_primary_byte_false_candidates"
+    ],
+    "first_legal_position": {
+      "window_bytes": "literal_width",
+      "match_offset_from_window_start": 0,
+      "purpose": "intentional call/setup stratum"
+    },
+    "window_start": "32 + accepted_ordinal, covering every modulo-16 start alignment once per width/output",
+    "haystack_suffix_padding_bytes": 64,
+    "filler_byte": "lowest u8 value absent from the literal",
+    "middle_match_offset_from_window_start": 1048581,
+    "overlap_match_offset_from_window_start": 1048581,
+    "overlap_near_miss": "start at exact_match_start - (literal_width - 1), copy the literal, replace the near-miss first byte with filler, then install the exact match",
+    "dense_false_candidates": "from window_start, advance by literal_width + 3 while the candidate ends before the last legal position; candidate i contains filler except literal[i mod literal_width] at that same column",
+    "dense_exact_match": "last legal position after all false candidates",
+    "expected_coordinates": "absolute haystack byte coordinates; an engine invoked on a sliced window must add window_start before hashing or comparing its result",
+    "identity": "SHA-256 over fre-search-v26-long-scan-fixture-v1 binary domain, literal coordinate and bytes, shape tag, geometry, expected match, and complete haystack bytes",
+    "allocation": "construct and release exactly one fixture/cell at a time; retaining the 7,776 long haystacks is forbidden"
+  },
+  "engines": {
+    "portable": "safe Kernel IR execution",
+    "reference": "AsimdV17/backend30 native Search-v1",
+    "candidate": "AsimdV26/backend39 native Search-v1",
+    "semantic_equality_before_timing": "hard failure"
+  },
+  "measurement": {
+    "calibration_target_ns": 4000000,
+    "calibration": "per cell and engine, begin at one search and double the batch until elapsed_ns >= target; fail on overflow or zero/nonfinite normalized time",
+    "calibration_evidence": "record chosen iterations and terminal elapsed_ns; for iterations > 1 also record exactly half the iterations and its elapsed_ns, which must be below target; every timed sample must use the chosen iterations",
+    "paired_repetitions": 12,
+    "orders": [
+      [
+        "portable",
+        "v17",
+        "v26"
+      ],
+      [
+        "portable",
+        "v26",
+        "v17"
+      ],
+      [
+        "v17",
+        "portable",
+        "v26"
+      ],
+      [
+        "v17",
+        "v26",
+        "portable"
+      ],
+      [
+        "v26",
+        "portable",
+        "v17"
+      ],
+      [
+        "v26",
+        "v17",
+        "portable"
+      ],
+      [
+        "portable",
+        "v17",
+        "v26"
+      ],
+      [
+        "portable",
+        "v26",
+        "v17"
+      ],
+      [
+        "v17",
+        "portable",
+        "v26"
+      ],
+      [
+        "v17",
+        "v26",
+        "portable"
+      ],
+      [
+        "v26",
+        "portable",
+        "v17"
+      ],
+      [
+        "v26",
+        "v17",
+        "portable"
+      ]
+    ],
+    "per_repetition_ratio": "(v26_elapsed_ns / v26_iterations) / (v17_elapsed_ns / v17_iterations)",
+    "cell_estimator": "arithmetic median of the 12 paired ratios; average sorted ranks 6 and 7",
+    "aggregate_estimator": "equal-cell-weight exp(fsum(log(cell_ratio)) / cell_count)"
+  },
+  "shards": [
+    {
+      "id": 0,
+      "widths": "6..14",
+      "cells": 2592
+    },
+    {
+      "id": 1,
+      "widths": "15..23",
+      "cells": 2592
+    },
+    {
+      "id": 2,
+      "widths": "24..32",
+      "cells": 2592
+    }
+  ],
+  "acceptance": {
+    "exact_semantics": true,
+    "overall_geomean_lte": 0.8,
+    "short_width_6_through_8_geomean_lte": 1.02,
+    "wide_width_9_through_32_geomean_lte": 0.8,
+    "every_output_geomean_lte": 1.02,
+    "every_window_shape_geomean_lte": 1.02,
+    "cells_strictly_over_1_05_lte": 77,
+    "cells_strictly_over_1_05_fraction_lte": 0.01,
+    "maximum_cell_ratio_lte": 1.1,
+    "p95_nearest_rank": 7388,
+    "p95": "report-only"
+  },
+  "execution": {
+    "runs": 1,
+    "launcher": "one-shot; require three explicit distinct CPU IDs and run the three disjoint shards concurrently; on Linux pin shard i to CPU i with taskset",
+    "admission": "do not wait on load, headroom, another GO, or other CPU work; do not kill other CPU work",
+    "run_manifest": "create-new and read-only before timing; seal host fingerprint, ordered CPU IDs, shard-to-CPU map, source/binary/archive/contract/cell identities, authorization nonce, three distinct shard nonces, and a distinct run nonce",
+    "missing_duplicate_nonfinite_unpaired_wrong_order_or_mutated_input": "hard failure",
+    "rebar_input": false,
+    "sealing_authority": "AWAITING_REVIEWED_RUNNER_BINARY_INPUT_MANIFEST_AND_SUCCESSOR_CORE",
+    "candidate_timing_executed": false
+  }
+}

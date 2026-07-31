@@ -26,17 +26,115 @@ impl BackendVersion {
     pub const SEARCH_V6: Self = Self(6);
     /// Exact per-lane recovery with ranked, staged four-column filtering.
     pub const SEARCH_V7: Self = Self(7);
+    /// Lazy 64-candidate screening with the V7 staged recovery fallback.
+    pub const SEARCH_V8: Self = Self(8);
     /// SVE exact-literal screening with exactly sixteen active byte lanes.
-    ///
-    /// Tag 8 remains reserved for the separately developed Search V8 wire
-    /// contract; these opt-in backends do not change [`Self::SEARCH_CURRENT`].
     pub const SEARCH_SVE16_V1: Self = Self(9);
     /// SVE2 exact-literal screening with exactly sixteen active byte lanes.
     pub const SEARCH_SVE2_16_V1: Self = Self(10);
+    /// V8 screening with SVE confirmation and V8-equivalent cold-tail layout.
+    ///
+    /// Tags 11 through 18 remain reserved for the historical experimental
+    /// sequence that led to this candidate.
+    pub const SEARCH_SVE16_V6: Self = Self(19);
+    /// Candidate fixed-VL16 SVE2 search with paired ASIMD screening and
+    /// predicate-preserving five-column recovery.
+    ///
+    /// Tag 20 remains reserved for the rejected uniform-literal experiment.
+    /// Historical tags 11 through 20 are never reused by this contract.
+    pub const SEARCH_SVE2_FIXED16_V2: Self = Self(21);
+    /// V8's paired screen with an exact first-candidate fast path.
+    ///
+    /// Tag 22 is deliberately separate from Search V8: V8's machine code,
+    /// AOT bytes, and artifact identities remain frozen.
+    pub const SEARCH_V9: Self = Self(22);
+    /// V9 first-candidate fast path plus a terminal-aware fifth ASIMD filter.
+    ///
+    /// Tag 23 remains candidate-only until independent broad qualification.
+    pub const SEARCH_V10: Self = Self(23);
+    /// V9 first-candidate path plus a five-column ASIMD filter set that
+    /// reserves both literal endpoints before filling remaining columns by
+    /// frequency rank.
+    ///
+    /// Tag 24 is a distinct candidate; Search V10/tag 23 remains frozen.
+    pub const SEARCH_V11: Self = Self(24);
+    /// V11 screening with length-specialized, loop-free exact confirmation.
+    ///
+    /// Tag 25 is a distinct candidate; tags 23 and 24 remain frozen.
+    pub const SEARCH_V12: Self = Self(25);
+    /// V12 screening plus adaptive retained-mask recovery after an exact miss.
+    ///
+    /// Tag 26 is a distinct candidate; tags 23 through 25 remain frozen.
+    pub const SEARCH_V13: Self = Self(26);
+    /// V12 screening plus a persistent, runtime-learned mismatch column after
+    /// an exact miss.
+    ///
+    /// Tag 27 is a distinct candidate; tags 23 through 26 remain frozen.
+    pub const SEARCH_V14: Self = Self(27);
+    /// Phase-unique selector successor to the rejected Search V14 diagnostic.
+    ///
+    /// Tag 28 is a distinct candidate; tag 27 remains frozen and rejected.
+    pub const SEARCH_V15: Self = Self(28);
+    /// Search V15 screening with a staged learned-byte/primary-byte recovery
+    /// discriminator.
+    ///
+    /// Tag 29 is a distinct candidate; tag 28 remains frozen and rejected.
+    pub const SEARCH_V16: Self = Self(29);
+    /// Search V16 screening with retained learned-mask continuation after
+    /// exact candidate misses.
+    ///
+    /// Tag 30 is a distinct candidate; tag 29 remains frozen.
+    pub const SEARCH_V17: Self = Self(30);
+    /// Search V17 recovery with a third authenticated wide-screen column
+    /// before entering its retained-mask continuation graph.
+    ///
+    /// Tag 31 is a distinct candidate; tag 30 remains frozen.
+    pub const SEARCH_V18: Self = Self(31);
+    /// Search V17 wide screening with saved four-block candidate masks and a
+    /// shared exact verifier before falling back to the narrow graph.
+    ///
+    /// Tag 32 is a distinct candidate; tags 30 and 31 remain frozen.
+    pub const SEARCH_V19: Self = Self(32);
+    /// Search V19 saved-mask recovery after wide refinement by every remaining
+    /// authenticated literal column.
+    ///
+    /// Tag 33 is a distinct candidate; tags 30 through 32 remain frozen.
+    pub const SEARCH_V20: Self = Self(33);
+    /// Search V20 five-column masks with one source-derived current-group
+    /// learned refinement before ordered saved-mask recovery.
+    ///
+    /// Tag 34 is a distinct candidate; tags 30 through 33 remain frozen.
+    pub const SEARCH_V21: Self = Self(34);
+    /// Search V21 learning with Q24/Q25-backed mismatch state retained across
+    /// later 64-candidate groups.
+    ///
+    /// Tag 35 is a distinct candidate; tags 30 through 34 remain frozen.
+    pub const SEARCH_V22: Self = Self(35);
+    /// Search V22 persistence with pointer-authoritative primary-empty wide
+    /// advancement and exact candidate-index reconstruction at every exit.
+    ///
+    /// Tag 36 is a distinct candidate; tags 30 through 35 remain frozen.
+    pub const SEARCH_V23: Self = Self(36);
+    /// Search V23 with one deterministic sixth static column applied only
+    /// after all five authenticated static columns leave survivors.
+    ///
+    /// Tag 37 is a distinct candidate; tags 30 through 36 remain frozen.
+    pub const SEARCH_V24: Self = Self(37);
+    /// Search V24 with a sixth-empty group promoted directly into the
+    /// persistent learned-column graph.
+    ///
+    /// Tag 38 is a distinct candidate; tags 30 through 37 remain frozen.
+    pub const SEARCH_V25: Self = Self(38);
+    /// Width-cost successor that selects the frozen V17 graph for widths 6
+    /// through 8 and the frozen V25 graph for widths 9 through 32.
+    ///
+    /// Tag 39 is a distinct candidate. The selected graph is derived only
+    /// from the authenticated literal width; tags 30 and 38 remain frozen.
+    pub const SEARCH_V26: Self = Self(39);
     /// Compatibility name for the original search backend.
     pub const SEARCH_LEGACY: Self = Self::SEARCH_V1;
     /// Current search backend and AOT wire contract.
-    pub const SEARCH_CURRENT: Self = Self::SEARCH_V7;
+    pub const SEARCH_CURRENT: Self = Self::SEARCH_V8;
     /// Explicit tag assigned to the unchanged aggregate contract by c4d.
     pub const AGGREGATE_V1: Self = Self(1);
     /// Historical pre-c4d tag for the same aggregate machine-code contract.
@@ -231,9 +329,44 @@ pub struct NativeImage {
     pub(crate) relocations: Box<[Relocation]>,
     pub(crate) stats: ImageStats,
     pub(crate) artifact_identity: ArtifactIdentity,
+    pub(crate) search_call_abi: SearchCallAbi,
     pub(crate) search: Option<SearchManifest>,
     pub(crate) aggregate: Option<AggregateManifest>,
 }
+
+/// Internal discriminator that prevents a register-return image from entering
+/// a Search-v1 publisher or auditor through the generic image representation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SearchCallAbi {
+    OutSlotV1,
+    SelectedEndRegisterV2,
+}
+
+impl SearchCallAbi {
+    pub(crate) const fn aot_tag(self) -> u8 {
+        match self {
+            Self::OutSlotV1 => 0,
+            Self::SelectedEndRegisterV2 => 2,
+        }
+    }
+}
+
+/// Immutable search image carrying the emitter's successful whole-image audit.
+///
+/// Only this crate can construct the wrapper, and construction occurs
+/// immediately after the independent final audit. The wrapper exposes no
+/// mutable access to its image, so a publisher may rely on the attestation
+/// without letting an arbitrary [`NativeImage`] bypass its normal audits.
+///
+/// ```compile_fail
+/// use fre_jit_aarch64::{AuditedNativeImage, NativeImage};
+///
+/// fn forge(image: NativeImage) -> AuditedNativeImage {
+///     AuditedNativeImage(image)
+/// }
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuditedNativeImage(NativeImage);
 
 /// Sealed semantic and backend envelope for one search image.
 ///
@@ -263,6 +396,15 @@ pub(crate) struct SearchManifest {
     pub(crate) verification_offset: u16,
     /// Selected fourth-byte verification offset, or `u16::MAX` when absent.
     pub(crate) quaternary_offset: u16,
+    /// Selected fifth-byte verification offset, or `u16::MAX` when absent.
+    ///
+    /// This field is serialized only by
+    /// [`BackendVersion::SEARCH_SVE2_FIXED16_V2`] and
+    /// [`BackendVersion::SEARCH_V10`] and
+    /// [`BackendVersion::SEARCH_V11`] and
+    /// [`BackendVersion::SEARCH_V12`]; every older search tag retains its
+    /// byte-for-byte AOT layout.
+    pub(crate) quinary_offset: u16,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -367,8 +509,16 @@ impl NativeImage {
         self.search
     }
 
+    pub(crate) const fn search_call_abi(&self) -> SearchCallAbi {
+        self.search_call_abi
+    }
+
     pub(crate) fn compute_artifact_identity(&self) -> Result<ArtifactIdentity, EmitError> {
         let mut hasher = Sha256::new();
+        if self.search_call_abi == SearchCallAbi::SelectedEndRegisterV2 {
+            hasher
+                .update(crate::selected_end_v2::SELECTED_END_REGISTER_ARTIFACT_IDENTITY_DOMAIN_V2);
+        }
         encode_aot(self, &mut |bytes| hasher.update(bytes))?;
         let digest = hasher.finalize();
         let mut bytes = [0_u8; 32];
@@ -392,9 +542,30 @@ impl NativeImage {
     }
 }
 
+impl AuditedNativeImage {
+    pub(crate) const fn from_emitter_audit(image: NativeImage) -> Self {
+        Self(image)
+    }
+
+    /// Borrow the immutable image authenticated by the emitter.
+    #[must_use]
+    pub const fn as_image(&self) -> &NativeImage {
+        &self.0
+    }
+
+    /// Discard the reusable audit attestation and recover the plain image.
+    #[must_use]
+    pub fn into_image(self) -> NativeImage {
+        self.0
+    }
+}
+
 impl NativeAggregateImage {
     pub(crate) fn try_new(inner: NativeImage) -> Result<Self, EmitError> {
-        if inner.search.is_some() || inner.aggregate.is_none() {
+        if inner.search.is_some()
+            || inner.aggregate.is_none()
+            || inner.search_call_abi != SearchCallAbi::OutSlotV1
+        {
             return Err(EmitError::InternalInvariant);
         }
         Ok(Self(inner))
@@ -566,8 +737,9 @@ impl fmt::Display for ArtifactIdentity {
 pub(crate) fn aot_size(image: &NativeImage) -> Result<usize, EmitError> {
     // Search v3 and later add an independently authenticated, source-bound
     // semantic envelope. V5 and later include the sealed verification offset;
-    // V7 and the fixed-lane SVE backends also include the sealed fourth
-    // ranked offset.
+    // V7 through V20 and the original fixed-lane SVE backends
+    // also include the sealed fourth ranked offset. Search tags 21 and 23
+    // through 25 add a fifth ranked/reserved offset.
     // Aggregate serialization retains its separate four-byte extension and
     // does not inherit the search wire contract.
     let manifest_bytes = if image.aggregate.is_some() {
@@ -575,9 +747,34 @@ pub(crate) fn aot_size(image: &NativeImage) -> Result<usize, EmitError> {
     } else if image.search.is_some() {
         if matches!(
             image.backend_version,
+            BackendVersion::SEARCH_SVE2_FIXED16_V2
+                | BackendVersion::SEARCH_V10
+                | BackendVersion::SEARCH_V11
+                | BackendVersion::SEARCH_V12
+                | BackendVersion::SEARCH_V13
+                | BackendVersion::SEARCH_V14
+                | BackendVersion::SEARCH_V15
+                | BackendVersion::SEARCH_V16
+                | BackendVersion::SEARCH_V17
+                | BackendVersion::SEARCH_V18
+                | BackendVersion::SEARCH_V19
+                | BackendVersion::SEARCH_V20
+                | BackendVersion::SEARCH_V21
+                | BackendVersion::SEARCH_V22
+                | BackendVersion::SEARCH_V23
+                | BackendVersion::SEARCH_V24
+                | BackendVersion::SEARCH_V25
+                | BackendVersion::SEARCH_V26
+        ) {
+            56
+        } else if matches!(
+            image.backend_version,
             BackendVersion::SEARCH_V7
+                | BackendVersion::SEARCH_V8
+                | BackendVersion::SEARCH_V9
                 | BackendVersion::SEARCH_SVE16_V1
                 | BackendVersion::SEARCH_SVE2_16_V1
+                | BackendVersion::SEARCH_SVE16_V6
         ) {
             54
         } else if matches!(
@@ -623,44 +820,56 @@ fn enforce(resource: ResourceKind, required: usize, limit: u64) -> Result<(), Em
 
 fn aot_magic(image: &NativeImage) -> Result<&'static [u8; 8], EmitError> {
     if image.aggregate.is_some() {
-        Ok(b"FREA64A\x01")
-    } else if image.search.is_some() {
-        match image.backend_version {
-            BackendVersion::SEARCH_V3 => Ok(b"FREA64\0\x03"),
-            BackendVersion::SEARCH_V4 => Ok(b"FREA64\0\x04"),
-            BackendVersion::SEARCH_V5 => Ok(b"FREA64\0\x05"),
-            BackendVersion::SEARCH_V6 => Ok(b"FREA64\0\x06"),
-            BackendVersion::SEARCH_V7 => Ok(b"FREA64\0\x07"),
-            BackendVersion::SEARCH_SVE16_V1 => Ok(b"FREA64\0\x09"),
-            BackendVersion::SEARCH_SVE2_16_V1 => Ok(b"FREA64\0\x0a"),
-            _ => Err(EmitError::InternalInvariant),
-        }
-    } else {
-        Ok(b"FREA64\0\x01")
+        return Ok(b"FREA64A\x01");
+    }
+    if image.search_call_abi == SearchCallAbi::SelectedEndRegisterV2 {
+        return Ok(&crate::selected_end_v2::SELECTED_END_REGISTER_AOT_MAGIC_V2);
+    }
+    if image.search.is_none() {
+        return Ok(b"FREA64\0\x01");
+    }
+    match image.backend_version {
+        BackendVersion::SEARCH_V3 => Ok(b"FREA64\0\x03"),
+        BackendVersion::SEARCH_V4 => Ok(b"FREA64\0\x04"),
+        BackendVersion::SEARCH_V5 => Ok(b"FREA64\0\x05"),
+        BackendVersion::SEARCH_V6 => Ok(b"FREA64\0\x06"),
+        BackendVersion::SEARCH_V7 => Ok(b"FREA64\0\x07"),
+        BackendVersion::SEARCH_V8 => Ok(b"FREA64\0\x08"),
+        BackendVersion::SEARCH_SVE16_V1 => Ok(b"FREA64\0\x09"),
+        BackendVersion::SEARCH_SVE2_16_V1 => Ok(b"FREA64\0\x0a"),
+        BackendVersion::SEARCH_SVE16_V6 => Ok(b"FREA64\0\x13"),
+        BackendVersion::SEARCH_SVE2_FIXED16_V2 => Ok(b"FREA64\0\x15"),
+        BackendVersion::SEARCH_V9 => Ok(b"FREA64\0\x16"),
+        BackendVersion::SEARCH_V10 => Ok(b"FREA64\0\x17"),
+        BackendVersion::SEARCH_V11 => Ok(b"FREA64\0\x18"),
+        BackendVersion::SEARCH_V12 => Ok(b"FREA64\0\x19"),
+        BackendVersion::SEARCH_V13 => Ok(b"FREA64\0\x1a"),
+        BackendVersion::SEARCH_V14 => Ok(b"FREA64\0\x1b"),
+        BackendVersion::SEARCH_V15 => Ok(b"FREA64\0\x1c"),
+        BackendVersion::SEARCH_V16 => Ok(b"FREA64\0\x1d"),
+        BackendVersion::SEARCH_V17 => Ok(b"FREA64\0\x1e"),
+        BackendVersion::SEARCH_V18 => Ok(b"FREA64\0\x1f"),
+        BackendVersion::SEARCH_V19 => Ok(b"FREA64\0\x20"),
+        BackendVersion::SEARCH_V20 => Ok(b"FREA64\0\x21"),
+        BackendVersion::SEARCH_V21 => Ok(b"FREA64\0\x22"),
+        BackendVersion::SEARCH_V22 => Ok(b"FREA64\0\x23"),
+        BackendVersion::SEARCH_V23 => Ok(b"FREA64\0\x24"),
+        BackendVersion::SEARCH_V24 => Ok(b"FREA64\0\x25"),
+        BackendVersion::SEARCH_V25 => Ok(b"FREA64\0\x26"),
+        BackendVersion::SEARCH_V26 => Ok(b"FREA64\0\x27"),
+        _ => Err(EmitError::InternalInvariant),
     }
 }
 
-fn encode_aot(image: &NativeImage, write: &mut impl FnMut(&[u8])) -> Result<(), EmitError> {
-    let aggregate = image.aggregate;
-    let search = image.search;
-    write(aot_magic(image)?);
-    write(&image.backend_version.0.to_le_bytes());
-    write(&[
-        image.target.architecture,
-        u8::from(image.target.little_endian),
-        image.target.pointer_width,
-        image.target.abi,
-        aggregate.map_or_else(
-            || output_tag(image.output),
-            |value| aggregate_tag(value.output),
-        ),
-        0,
-    ]);
-    write(&image.target.features.bits().to_le_bytes());
-    if let Some(manifest) = aggregate {
+#[allow(
+    clippy::too_many_lines,
+    reason = "the versioned AOT manifest keeps every historical field boundary explicit"
+)]
+fn encode_aot_manifest(image: &NativeImage, write: &mut impl FnMut(&[u8])) {
+    if let Some(manifest) = image.aggregate {
         write(manifest.source_identity.as_bytes());
         write(&manifest.literal_bytes.to_le_bytes());
-    } else if let Some(manifest) = search {
+    } else if let Some(manifest) = image.search {
         // Retain the legacy source field and also bind the sealed manifest's
         // copy. Audit requires equality; encoding both makes either mutation
         // change the artifact identity.
@@ -682,23 +891,107 @@ fn encode_aot(image: &NativeImage, write: &mut impl FnMut(&[u8])) -> Result<(), 
             BackendVersion::SEARCH_V5
                 | BackendVersion::SEARCH_V6
                 | BackendVersion::SEARCH_V7
+                | BackendVersion::SEARCH_V8
+                | BackendVersion::SEARCH_V9
+                | BackendVersion::SEARCH_V10
+                | BackendVersion::SEARCH_V11
+                | BackendVersion::SEARCH_V12
+                | BackendVersion::SEARCH_V13
+                | BackendVersion::SEARCH_V14
+                | BackendVersion::SEARCH_V15
+                | BackendVersion::SEARCH_V16
+                | BackendVersion::SEARCH_V17
+                | BackendVersion::SEARCH_V18
+                | BackendVersion::SEARCH_V19
+                | BackendVersion::SEARCH_V20
+                | BackendVersion::SEARCH_V21
+                | BackendVersion::SEARCH_V22
+                | BackendVersion::SEARCH_V23
+                | BackendVersion::SEARCH_V24
+                | BackendVersion::SEARCH_V25
+                | BackendVersion::SEARCH_V26
                 | BackendVersion::SEARCH_SVE16_V1
                 | BackendVersion::SEARCH_SVE2_16_V1
+                | BackendVersion::SEARCH_SVE16_V6
+                | BackendVersion::SEARCH_SVE2_FIXED16_V2
         ) {
             write(&manifest.verification_offset.to_le_bytes());
         }
         if matches!(
             image.backend_version,
             BackendVersion::SEARCH_V7
+                | BackendVersion::SEARCH_V8
+                | BackendVersion::SEARCH_V9
+                | BackendVersion::SEARCH_V10
+                | BackendVersion::SEARCH_V11
+                | BackendVersion::SEARCH_V12
+                | BackendVersion::SEARCH_V13
+                | BackendVersion::SEARCH_V14
+                | BackendVersion::SEARCH_V15
+                | BackendVersion::SEARCH_V16
+                | BackendVersion::SEARCH_V17
+                | BackendVersion::SEARCH_V18
+                | BackendVersion::SEARCH_V19
+                | BackendVersion::SEARCH_V20
+                | BackendVersion::SEARCH_V21
+                | BackendVersion::SEARCH_V22
+                | BackendVersion::SEARCH_V23
+                | BackendVersion::SEARCH_V24
+                | BackendVersion::SEARCH_V25
+                | BackendVersion::SEARCH_V26
                 | BackendVersion::SEARCH_SVE16_V1
                 | BackendVersion::SEARCH_SVE2_16_V1
+                | BackendVersion::SEARCH_SVE16_V6
+                | BackendVersion::SEARCH_SVE2_FIXED16_V2
         ) {
             write(&manifest.quaternary_offset.to_le_bytes());
+        }
+        if matches!(
+            image.backend_version,
+            BackendVersion::SEARCH_SVE2_FIXED16_V2
+                | BackendVersion::SEARCH_V10
+                | BackendVersion::SEARCH_V11
+                | BackendVersion::SEARCH_V12
+                | BackendVersion::SEARCH_V13
+                | BackendVersion::SEARCH_V14
+                | BackendVersion::SEARCH_V15
+                | BackendVersion::SEARCH_V16
+                | BackendVersion::SEARCH_V17
+                | BackendVersion::SEARCH_V18
+                | BackendVersion::SEARCH_V19
+                | BackendVersion::SEARCH_V20
+                | BackendVersion::SEARCH_V21
+                | BackendVersion::SEARCH_V22
+                | BackendVersion::SEARCH_V23
+                | BackendVersion::SEARCH_V24
+                | BackendVersion::SEARCH_V25
+                | BackendVersion::SEARCH_V26
+        ) {
+            write(&manifest.quinary_offset.to_le_bytes());
         }
         write(manifest.source_identity.as_bytes());
     } else {
         write(image.source_identity.as_bytes());
     }
+}
+
+fn encode_aot(image: &NativeImage, write: &mut impl FnMut(&[u8])) -> Result<(), EmitError> {
+    let aggregate = image.aggregate;
+    write(aot_magic(image)?);
+    write(&image.backend_version.0.to_le_bytes());
+    write(&[
+        image.target.architecture,
+        u8::from(image.target.little_endian),
+        image.target.pointer_width,
+        image.target.abi,
+        aggregate.map_or_else(
+            || output_tag(image.output),
+            |value| aggregate_tag(value.output),
+        ),
+        image.search_call_abi.aot_tag(),
+    ]);
+    write(&image.target.features.bits().to_le_bytes());
+    encode_aot_manifest(image, write);
     write(&image.layout.code_alignment.to_le_bytes());
     write(&image.layout.rodata_alignment.to_le_bytes());
     write(&image.layout.rodata_from_code_start.to_le_bytes());

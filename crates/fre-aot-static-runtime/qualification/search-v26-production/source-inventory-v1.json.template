@@ -1,0 +1,62 @@
+{
+  "schema": "fre.aot.search-v26-production-source-inventory.v1",
+  "state": "unactivated-template",
+  "production_authority": false,
+  "authorization_decision_sha256": null,
+  "backend_tag": 39,
+  "minimum_literal_bytes": 9,
+  "maximum_literal_bytes": 32,
+  "family_selector": null,
+  "canonical_order": "semantic_binding_identity_then_source_sha256",
+  "sources": [],
+  "each_source_common_requires": [
+    "source_sha256",
+    "semantic_binding_identity",
+    "literal_bytes",
+    "literal_sha256",
+    "tag39_shape_admission_receipt_sha256"
+  ],
+  "each_source_target_requires": {
+    "macos_aarch64": [
+      "manifest_identity",
+      "literal_identity",
+      "kir_identity",
+      "artifact_identity",
+      "binding_identity",
+      "compile_identity",
+      "object_identity",
+      "receipt_identity",
+      "expectation_identity",
+      "payload_identity",
+      "compile_receipt_sha256",
+      "implementation_object_sha256",
+      "expectation_sha256",
+      "production_glue_object_sha256",
+      "production_glue_receipt_sha256",
+      "identity_suffixed_glue_symbol",
+      "final_image_inspection_receipt_sha256",
+      "independent_derivation_receipt_sha256"
+    ],
+    "linux_aarch64": [
+      "manifest_identity",
+      "literal_identity",
+      "kir_identity",
+      "artifact_identity",
+      "binding_identity",
+      "compile_identity",
+      "object_identity",
+      "receipt_identity",
+      "expectation_identity",
+      "payload_identity",
+      "compile_receipt_sha256",
+      "implementation_object_sha256",
+      "expectation_sha256",
+      "production_glue_object_sha256",
+      "production_glue_receipt_sha256",
+      "identity_suffixed_glue_symbol",
+      "final_image_inspection_receipt_sha256",
+      "independent_derivation_receipt_sha256"
+    ]
+  },
+  "cross_target_equalities_require_explicit_derivation_receipt": true
+}

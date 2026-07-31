@@ -1,0 +1,216 @@
+{
+  "schema": "fre-search-aot-candidate-preregistration-v1",
+  "candidate": {
+    "name": "v23-primary-pointer-wide-r1",
+    "planned_backend_version": 36,
+    "planned_backend_policy": "AsimdV23",
+    "planned_wire_magic": "FREA64\\u0000\\u0024",
+    "implementation_base_commit": "acffd515255e94c6b9fc0163f5f9992989363e9f",
+    "implementation_base_tree": "6af899847a85277cf410fcf9d5559382f5f21fe8",
+    "reference_backend": {
+      "policy": "AsimdV17",
+      "version": 30,
+      "frozen_base_commit": "38288c5d495a90e48de4cb619f949f90ee9304af"
+    },
+    "status": "PREREGISTERED_NOT_IMPLEMENTED_NOT_TIMED"
+  },
+  "predecessor_evidence": {
+    "candidate": "v22-persistent-wide-learn-r1",
+    "implementation_commit": "acffd515255e94c6b9fc0163f5f9992989363e9f",
+    "preregistration_sha256": "34ff38196a572c6093e8590b7c986141a2002d600ddb47ce1ab68a706e1449cd",
+    "c9g_correctness_receipt_sha256": "5f355a8277f164afd658ec75f5db88f69783e13be385076e6e25b3566f612570",
+    "performance_analysis_sha256": "7fbefd9ca0dd12388cb44e12788e2cca14e7a64ff8c7d9238464684a20810a05",
+    "terminal_refusal_sha256": "b3e6caea4e7d80dd229f78c330b8969523e72a3a78e5798d474eabec6b03a03f",
+    "status": "TERMINAL_PERFORMANCE_GATE_FAIL_NOT_DEPLOYABLE",
+    "observations_used": {
+      "overall_candidate_over_v17_geomean": 0.6721439738107693,
+      "individual_cells_over_1_05": 0,
+      "maximum_candidate_over_v17": 1.035847,
+      "failed_broad_strata": {
+        "uniform_absent": 1.000016626562368,
+        "late_match": 1.0001164433730159,
+        "present": 1.0008977611992667
+      },
+      "passing_learned_work": {
+        "dense_near_miss_first_unfiltered": 0.5324005023228257,
+        "dense_near_miss_last_unfiltered": 0.5480043898301875,
+        "random_absent": 0.5925857434771448,
+        "sparse_singleton_unfiltered": 0.5332641327640946
+      }
+    },
+    "interpretation": "V22's persistent learned screen is broadly valuable, but the primary-empty loop remains instruction-identical to V17 and therefore only ties it. V23 makes one source-general loop-state improvement: keep the primary pointer authoritative and remove one integer cursor update from every primary-empty 64-candidate group. No failing row, width, topology, outcome, pattern, density threshold, or corpus member is removed or routed around."
+  },
+  "declared_design": {
+    "summary": "Retain V22's complete persistent learned-column graph. Before learning, represent the primary-only 64-candidate loop with X15 as the authoritative primary-column pointer and X13 as its inclusive final-wide pointer. Advance only X15 after a primary-empty group. Reconstruct X5 exactly from X15, the haystack base, and the sealed primary offset at every exit from pointer-only state before any existing V22 consumer executes.",
+    "scope": "All admitted exact byte literals of widths 6 through 32 on AArch64 ASIMD. No pattern, topology, width, corpus, density, outcome, runtime-result, or invocation-count dispatch is permitted.",
+    "no_pattern_or_case_dispatch": true,
+    "no_width_threshold": true,
+    "no_corpus_threshold": true,
+    "no_runtime_density_threshold": true,
+    "no_outcome_dispatch": true,
+    "no_membership_change_from_v22_gate": true,
+    "v22_backend_tag_reuse": false
+  },
+  "frozen_control_flow": {
+    "unchanged_prefix": [
+      "V22 scalar first-candidate confirmation",
+      "V22 primary literal broadcast and every static literal broadcast",
+      "V22 window validation and wide/narrow/tail eligibility checks"
+    ],
+    "pointer_wide_setup": [
+      "Retain X7 equal to end_index minus 63.",
+      "Set X13 to haystack plus X7 plus the authenticated primary offset; X13 is the inclusive primary-column pointer for the last valid 64-candidate group.",
+      "X15 remains haystack plus the current candidate base plus the authenticated primary offset.",
+      "X5 is authoritative on entry to the first primary-wide group."
+    ],
+    "primary_empty_advance": [
+      "After the four primary masks prove empty, increment X15 by 64 and do not update X5.",
+      "Compare X15 directly with X13 and continue the primary-wide loop while X15 is at most X13.",
+      "On wide exhaustion, reconstruct X5 as X15 minus haystack minus primary_offset before entering unchanged V22 narrow setup.",
+      "The optimization removes exactly one X5 add per primary-empty 64-candidate group; it adds no load, vector instruction, data-dependent threshold, or corpus-specific branch."
+    ],
+    "primary_hit_exit": [
+      "Before entering V22's secondary/static filtering graph, reconstruct X5 as X15 minus haystack minus primary_offset.",
+      "Every secondary-only, remaining-static, learned-discovery, saved-queue, result-publication, narrow, and tail consumer therefore observes the unchanged V22 X5/X15 contract.",
+      "Any pre-learning static-empty edge that returns to primary-wide advance retains X15 as the current primary pointer; the advance makes X5 stale only after incrementing X15.",
+      "X13 remains the final-wide pointer across all pre-learning paths that can return to pointer-wide advance.",
+      "The first permitted X13 clobber is at wide_learn_select, is dominated by mandatory X5 reconstruction, and has no successor edge back to pre-learning pointer-wide advance."
+    ],
+    "unchanged_v22_graph": [
+      "Secondary-only mode and its primary recheck",
+      "Five authenticated static-column refinements",
+      "First false-survivor exact confirmation and mismatch discovery",
+      "Q24 learned byte, Q25 learned offset, and X11 learned state",
+      "Persistent learned-wide screening and empty advance",
+      "Four-mask ordered exact queue and source-order behavior",
+      "Learned narrow and scalar-tail behavior",
+      "All output publication and ABI paths"
+    ],
+    "unchanged_suffix": [
+      "V17 scalar tail and exact-return ABI",
+      "V17, V19, V20, V21, and V22 emitted images",
+      "All non-V23 backend policies and wire formats"
+    ]
+  },
+  "register_contract": {
+    "pointer_only_prelearning_state": [
+      "X15 = current primary-column pointer and is authoritative",
+      "X13 = inclusive final valid primary-column pointer",
+      "X7 = end_index minus 63",
+      "X5 may lag X15 only between a primary-empty advance and the mandatory reconstruction at a pointer-loop exit",
+      "X9 = haystack base",
+      "the primary offset is sealed in the search manifest and immediate instruction stream"
+    ],
+    "reconstruction": [
+      "X5 = X15 minus X9",
+      "if primary_offset is nonzero, X5 = X5 minus primary_offset",
+      "X15 is unchanged by reconstruction",
+      "reconstruction occurs before every branch from pointer-only state to existing V22 code"
+    ],
+    "persistent_learned_state": [
+      "Identical to V22: X11 is one outside the temporary four-entry queue, Q24 is the learned literal byte, and Q25 is the learned offset",
+      "V23 pointer-only X13 state is dead once learning begins; V22 may reuse X13 normally"
+    ],
+    "scratch": "No new architectural register is introduced. X13 replaces its pre-learning scratch role only while a path can return to primary-wide advance."
+  },
+  "static_budget": {
+    "maximum_candidate_code_bytes": 3072,
+    "requirements": [
+      "V23 adds no instruction to emitted V17, V19, V20, V21, or V22 images.",
+      "The primary-empty steady-state loop has one fewer integer instruction per 64 candidates than V22.",
+      "No pointer-wide exit reaches V22 code with stale X5.",
+      "X13 is not overwritten on any pre-learning path that can return to pointer-wide advance.",
+      "V22's persistent learned graph retains the same decoded non-relocation instruction/register sequence and control-flow semantics; authenticated PC-relative branch displacements may be regenerated because V23 changes surrounding instruction positions.",
+      "No new literal column, density counter, runtime threshold, memory spill, or pattern dispatch is emitted.",
+      "All direct branches and relocations remain within authenticated AArch64 encodings."
+    ]
+  },
+  "correctness_before_timing": {
+    "required": [
+      "Emitter/template byte-for-byte agreement and whole-image audit acceptance.",
+      "Version 36, magic 0x24, AOT, audit, runtime allowlist, mutation, and reseal rejection coverage.",
+      "All supported search output contracts emit, audit, serialize, adopt, and execute or explicitly reject V23 consistently.",
+      "Mechanical byte identity for every previously supported backend/image, including all V1 through V22 ASIMD and SVE/SVE2 variants, against implementation commit acffd515255e94c6b9fc0163f5f9992989363e9f.",
+      "Decoded proof of X13 final-pointer initialization for both zero and nonzero primary offsets.",
+      "Decoded control-flow proof that every pointer-wide exit reconstructs X5 before a pre-existing V22 consumer and that every pointer-wide backedge preserves X13.",
+      "Decoded dominator proof that wide_learn_select is the first allowed X13 clobber, is reached only after X5 reconstruction, and has no successor capable of reaching pre-learning pointer-wide advance.",
+      "Decoded proof that the primary-empty steady state removes exactly the X5 add and changes its bound comparison from X5/X7 to X15/X13.",
+      "Mutation rejection for X13 initialization, pointer advance, pointer comparison, and both reconstruction operands.",
+      "Primary-empty transitions across at least three consecutive 64-candidate groups followed by narrow, tail, no-match, and exact-match exits.",
+      "Primary-hit/pair-empty secondary-only transitions and every remaining-static-empty return to pointer-wide advance.",
+      "V22 learned-empty, learned-nonempty same-block/later-block/later-group, and persistent pair-empty cases remain exact.",
+      "Widths 6 through 32 cover zero and nonzero primary offsets plus every mismatch offset outside the authenticated static offsets.",
+      "Windows cover wide-to-narrow and narrow-to-tail boundaries at every residue modulo 16.",
+      "Randomized windows and left/right guard-page native execution on the EC2 c9g host."
+    ],
+    "timing_forbidden_until_complete": true
+  },
+  "fresh_performance_gate": {
+    "runs": 1,
+    "same_identity_retest": false,
+    "host": "AWS EC2 c9g",
+    "reference": "AsimdV17",
+    "fixture_bytes": 2097152,
+    "method": "Paired portable/V17/V23; 12 repetitions; all 6 execution orders; approximately 4 ms target per measurement; semantic equality checked before and during timing.",
+    "widths": "6..32 inclusive",
+    "topologies": {
+      "unique": "byte i is 33 + ((17*i) mod 64), unique for the admitted width",
+      "clustered-repeat": "fill with '~' and replace the first five bytes with 'A3mQz'",
+      "spaced-repeat": "fill with 'x' and write M/N/O/P/R at 0, width/4, width/2, 3*width/4, and width-1 in that order",
+      "seeded-mixed": "deterministic xorshift64 stream mapped to a fixed 16-byte printable alphabet, independently seeded by width"
+    },
+    "scenarios": [
+      "uniform-absent",
+      "random-absent with seed 0x9e3779b97f4a7c15 mixed with topology and width",
+      "dense-near-miss-first-unfiltered using the first offset outside the five authenticated offsets",
+      "dense-near-miss-last-unfiltered using the last offset outside the five authenticated offsets",
+      "sparse-singleton-unfiltered injected every 257 bytes into an avoiding-byte background",
+      "late-match"
+    ],
+    "windows": {
+      "full": "0..2097152",
+      "offset-tail": "509..2097121",
+      "floor-96k": "29..98333"
+    },
+    "expected_cells": 1944,
+    "expected_pattern_artifact_pairs": 108,
+    "width_shards": [
+      "6..14",
+      "15..23",
+      "24..32"
+    ],
+    "strict_acceptance": {
+      "every_broad_stratum_candidate_over_v17_geomean_lte": 1.0,
+      "broad_strata": [
+        "overall",
+        "scenario",
+        "topology",
+        "outcome",
+        "window",
+        "width"
+      ],
+      "every_individual_candidate_over_v17_ratio_lte": 1.05,
+      "semantics": "all equal",
+      "artifact_pairs": "one frozen V17/V23 pair per topology and width"
+    },
+    "on_failure": "Seal immutable refusal; do not retest or tune this identity.",
+    "on_success": "Require independent review and a fresh formal qualification identity before selection or deployment."
+  },
+  "held_out_after_gate": {
+    "design_input": false,
+    "membership_input": false,
+    "threshold_input": false,
+    "required_only_after_formal_success": [
+      "Rebar-blind ripgrep literal workload families frozen independently of this candidate",
+      "long-running compiled Rebar corroboration only after production qualification"
+    ]
+  },
+  "forbidden_adaptation": {
+    "remove_v22_failure_classes": false,
+    "post_timing_membership_change": false,
+    "post_timing_threshold_change": false,
+    "post_timing_retune_of_same_identity": false,
+    "reuse_backend_tag_after_source_change": false,
+    "rebar_as_design_or_gate_input": false
+  }
+}

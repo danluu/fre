@@ -1,0 +1,32 @@
+{
+  "schema": "fre.aot.search-ripgrep-application-fixture-algorithm.v2",
+  "fixture_bytes": 1048576,
+  "fixture_domain_hex": "6672652e616f742e7365617263682d726970677265702d6170706c69636174696f6e2d666978747572652e763200",
+  "background": "SHA256(domain || semantic_candidate_sha256_bytes || counter_le_u64), mapped bytewise to 0x20..=0x7e, then deterministically repaired until the literal has zero overlapping occurrences",
+  "repair": "replace the final byte of the leftmost occurrence with the smallest printable ASCII byte absent from the literal, then resume at max(0, start-width+1)",
+  "alignment": "SHA256(domain || semantic_candidate_sha256_bytes || scenario_utf8)[0] & 15",
+  "common_scenarios": [
+    "absent",
+    "early",
+    "middle",
+    "tail",
+    "dense",
+    "wrong-first-dense",
+    "wrong-final-dense"
+  ],
+  "sole_match_starts": {
+    "early": 64,
+    "middle": "floor((fixture_bytes-literal_bytes)/2)",
+    "tail": "fixture_bytes-literal_bytes"
+  },
+  "sole_match_guard": "replace up to width-1 adjacent bytes on each side with the absent sentinel before inserting the literal; require exactly one overlapping occurrence",
+  "dense": "repeat the exact literal from offset zero while reserving a nonempty absent-sentinel suffix",
+  "endpoint_misses": "repeat a width-byte block differing from the literal only at the named endpoint, using the absent sentinel; width-one endpoint scenarios are intentionally byte-identical but remain distinct scenario rows",
+  "mutation_scenarios": "for every literal offset, repeat a width-byte block differing only at that offset, guard the final width-1 prefix bytes, and insert the sole exact literal at fixture_bytes-literal_bytes",
+  "oracle": "scalar overlapping leftmost span plus scalar nonoverlapping count over every complete fixture",
+  "candidate_count": 11,
+  "fixture_count": 154,
+  "every_candidate_gates": true,
+  "external_classification_inputs": [],
+  "timing_feedback_permitted": false
+}

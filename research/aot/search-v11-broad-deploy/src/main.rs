@@ -1,0 +1,1235 @@
+use std::{
+    error::Error,
+    hint::black_box,
+    io::{self, BufWriter, Write as _},
+    time::Instant,
+};
+
+use fre_jit_aarch64::{
+    DecodedInstruction, EmitLimits, SearchBackendPolicy, decode, emit_audited_with_backend,
+};
+use fre_jit_runtime::{PublicationLimits, PublishedKernelThreadSession, publish_audited};
+use fre_kernel_ir::{
+    AnchorFlags, CheckedSearchWindow, MatchSpan, SearchWindow as NativeWindow, Span,
+    ValidateLimits, build_exact_literal,
+};
+use fre_kernels::{
+    LiteralBuildLimits, LiteralPlan, LiteralSearchLimits, LiteralSearchPrefixSplit,
+    Window as PortableWindow, preflight_checked_literal_window,
+};
+
+type DynError = Box<dyn Error>;
+
+const SCREEN_SEEDS: [u64; 4] = [
+    0xa551_0001_7e23_914d,
+    0xf117_0002_3c84_d6a9,
+    0x6b47_3a9d_e120_85cf,
+    0xc2e9_5714_8ab6_3d01,
+];
+const WIDTHS: [usize; 32] = [
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
+    27, 28, 29, 30, 31, 32,
+];
+const SCREEN_SIZES: [usize; 7] = [257, 1_021, 4_093, 16_381, 65_521, 262_139, 1_048_573];
+const SCREEN_ALIGNMENTS: [u8; 4] = [0, 1, 7, 15];
+const HEADER: &str = "schema,phase,seed,width,shape,size,scenario,alignment,window_start,window_end,repetition,order,engine,iterations,total_ns,ns_per_iter,checksum,semantic";
+const SCHEMA: &str = "fre-search-v12-broad-devscreen-v1";
+const SVE2_WIDTH16_SCHEMA: &str = "fre-search-v12-width16-sve2-devscreen-v1";
+const SVE2_WIDTH16_ENV: &str = "FRE_SEARCH_V12_SVE2_WIDTH16_COMPARE";
+const CHECKSUM_SEED: u64 = 0x243f_6a88_85a3_08d3;
+const MAX_CALIBRATION_ITERATIONS: usize = 1 << 30;
+const HYBRID_MIN_LITERAL_BYTES: usize = 2;
+const HYBRID_MIN_WINDOW_BYTES: usize = 4_093;
+const HYBRID_PREFIX_CANDIDATE_STARTS: usize = 256;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Phase {
+    Screen,
+}
+
+impl Phase {
+    fn parse(value: &str) -> Result<Self, DynError> {
+        match value {
+            "screen" => Ok(Self::Screen),
+            _ => Err(invalid("this development binary accepts only PHASE=screen").into()),
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Screen => "screen",
+        }
+    }
+
+    const fn seeds(self) -> &'static [u64] {
+        match self {
+            Self::Screen => &SCREEN_SEEDS,
+        }
+    }
+
+    const fn sizes(self) -> &'static [usize] {
+        match self {
+            Self::Screen => &SCREEN_SIZES,
+        }
+    }
+
+    const fn alignments(self) -> &'static [u8] {
+        match self {
+            Self::Screen => &SCREEN_ALIGNMENTS,
+        }
+    }
+
+    const fn repetitions(self) -> usize {
+        match self {
+            Self::Screen => 3,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Shape {
+    Entropy,
+    Repeated,
+    Periodic,
+    Binary,
+}
+
+impl Shape {
+    const ALL: [Self; 4] = [Self::Entropy, Self::Repeated, Self::Periodic, Self::Binary];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Entropy => "entropy",
+            Self::Repeated => "repeated",
+            Self::Periodic => "periodic",
+            Self::Binary => "binary",
+        }
+    }
+
+    const fn tag(self) -> u64 {
+        match self {
+            Self::Entropy => 0x13,
+            Self::Repeated => 0x29,
+            Self::Periodic => 0x47,
+            Self::Binary => 0x71,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Scenario {
+    AbsentEntropy,
+    AbsentFiller,
+    Early,
+    Middle,
+    Tail,
+    Dense,
+    FirstByteDenseAbsent,
+    NearMissHead,
+    NearMissTail,
+    NearMissOffset(u8),
+    BinaryTail,
+    FirstCandidateExact,
+    SelectedByteHitThenFullMiss,
+    WindowAbsent,
+    WindowTail,
+    AlignmentTail(u8),
+}
+
+impl Scenario {
+    const BASE: [Self; 14] = [
+        Self::AbsentEntropy,
+        Self::AbsentFiller,
+        Self::Early,
+        Self::Middle,
+        Self::Tail,
+        Self::Dense,
+        Self::FirstByteDenseAbsent,
+        Self::NearMissHead,
+        Self::NearMissTail,
+        Self::BinaryTail,
+        Self::FirstCandidateExact,
+        Self::SelectedByteHitThenFullMiss,
+        Self::WindowAbsent,
+        Self::WindowTail,
+    ];
+
+    fn name(self) -> String {
+        match self {
+            Self::AbsentEntropy => "absent-entropy".to_owned(),
+            Self::AbsentFiller => "absent-filler".to_owned(),
+            Self::Early => "early".to_owned(),
+            Self::Middle => "middle".to_owned(),
+            Self::Tail => "tail".to_owned(),
+            Self::Dense => "dense".to_owned(),
+            Self::FirstByteDenseAbsent => "first-byte-dense-absent".to_owned(),
+            Self::NearMissHead => "near-miss-head".to_owned(),
+            Self::NearMissTail => "near-miss-tail".to_owned(),
+            Self::NearMissOffset(offset) => format!("near-miss-offset-{offset:02}"),
+            Self::BinaryTail => "binary-tail".to_owned(),
+            Self::FirstCandidateExact => "first_candidate_exact".to_owned(),
+            Self::SelectedByteHitThenFullMiss => "selected_byte_hit_then_full_miss".to_owned(),
+            Self::WindowAbsent => "window-absent".to_owned(),
+            Self::WindowTail => "window-tail".to_owned(),
+            Self::AlignmentTail(residue) => format!("alignment-tail-{residue}"),
+        }
+    }
+
+    const fn tag(self) -> u64 {
+        match self {
+            Self::AbsentEntropy => 0x101,
+            Self::AbsentFiller => 0x103,
+            Self::Early => 0x107,
+            Self::Middle => 0x10d,
+            Self::Tail => 0x11f,
+            Self::Dense => 0x137,
+            Self::FirstByteDenseAbsent => 0x151,
+            Self::NearMissHead => 0x163,
+            Self::NearMissTail => 0x16d,
+            Self::NearMissOffset(offset) => 0x300 + offset as u64,
+            Self::BinaryTail => 0x181,
+            Self::FirstCandidateExact => 0x197,
+            Self::SelectedByteHitThenFullMiss => 0x19d,
+            Self::WindowAbsent => 0x1a7,
+            Self::WindowTail => 0x1c3,
+            Self::AlignmentTail(residue) => 0x200 + residue as u64,
+        }
+    }
+
+    const fn alignment(self) -> u8 {
+        match self {
+            Self::AlignmentTail(residue) => residue,
+            _ => 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Engine {
+    NativeV11,
+    NativeV12,
+    HybridV12,
+    Portable,
+}
+
+impl Engine {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::NativeV11 => "native-v11-aot-code-tag24",
+            Self::NativeV12 => "native-v12-aot-code-tag25",
+            Self::HybridV12 => "hybrid-portable256-v12-tag25-floor4093-width2",
+            Self::Portable => "portable-memmem",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Sve2Width16Engine {
+    NativeV12,
+    NativeSve2Tag21,
+    HybridV12,
+    HybridSve2Tag21,
+    Portable,
+}
+
+impl Sve2Width16Engine {
+    const ALL: [Self; 5] = [
+        Self::NativeV12,
+        Self::NativeSve2Tag21,
+        Self::HybridV12,
+        Self::HybridSve2Tag21,
+        Self::Portable,
+    ];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::NativeV12 => "native-v12-aot-code-tag25",
+            Self::NativeSve2Tag21 => "native-sve2-fixed16-aot-code-tag21",
+            Self::HybridV12 => "hybrid-portable256-v12-tag25-floor4093-width2",
+            Self::HybridSve2Tag21 => "hybrid-portable256-sve2-fixed16-tag21-floor4093-width2",
+            Self::Portable => "portable-memmem",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Fixture {
+    storage: Vec<u8>,
+    start: usize,
+    len: usize,
+    window_start: usize,
+    window_end: usize,
+}
+
+impl Fixture {
+    fn bytes(&self) -> &[u8] {
+        &self.storage[self.start..self.start + self.len]
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Measurement {
+    total_ns: u64,
+    checksum: u64,
+    semantic: u64,
+}
+
+fn main() -> Result<(), DynError> {
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    let [phase, shard, shards, target_ms] = arguments.as_slice() else {
+        return Err(invalid("usage: PHASE SHARD SHARDS TARGET_MILLISECONDS").into());
+    };
+    let phase = Phase::parse(phase)?;
+    let shard = canonical_usize(shard, "SHARD")?;
+    let shards = canonical_usize(shards, "SHARDS")?;
+    let target_ms = canonical_usize(target_ms, "TARGET_MILLISECONDS")?;
+    require(
+        shards > 0 && shard < shards,
+        "SHARD must be less than nonzero SHARDS",
+    )?;
+    require(
+        (3..=1_000).contains(&target_ms),
+        "target milliseconds outside 3..=1000",
+    )?;
+    let target_ns = u64::try_from(target_ms)?
+        .checked_mul(1_000_000)
+        .ok_or_else(|| invalid("target nanoseconds overflow"))?;
+    let sve2_width16_compare = match std::env::var_os(SVE2_WIDTH16_ENV) {
+        None => false,
+        Some(value) if value == "1" => true,
+        Some(_) => {
+            return Err(
+                invalid("FRE_SEARCH_V12_SVE2_WIDTH16_COMPARE must be absent or exactly 1").into(),
+            );
+        }
+    };
+
+    let stdout = io::stdout();
+    let mut output = BufWriter::new(stdout.lock());
+    writeln!(output, "{HEADER}")?;
+    let mut ordinal = 0_usize;
+    for &seed in phase.seeds() {
+        for &width in &WIDTHS {
+            if sve2_width16_compare && width != 16 {
+                continue;
+            }
+            for shape in Shape::ALL {
+                let literal = make_literal(seed, width, shape);
+                for &size in phase.sizes() {
+                    for scenario in scenarios(phase, width) {
+                        if scenario == Scenario::SelectedByteHitThenFullMiss && width == 1 {
+                            continue;
+                        }
+                        let selected = ordinal % shards == shard;
+                        ordinal = ordinal
+                            .checked_add(1)
+                            .ok_or_else(|| invalid("case ordinal overflow"))?;
+                        if !selected {
+                            continue;
+                        }
+                        if sve2_width16_compare {
+                            run_sve2_width16_case(
+                                &mut output,
+                                phase,
+                                seed,
+                                shape,
+                                size,
+                                scenario,
+                                &literal,
+                                target_ns,
+                            )?;
+                        } else {
+                            run_case(
+                                &mut output,
+                                phase,
+                                seed,
+                                shape,
+                                size,
+                                scenario,
+                                &literal,
+                                target_ns,
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    output.flush()?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_sve2_width16_case(
+    output: &mut impl io::Write,
+    phase: Phase,
+    seed: u64,
+    shape: Shape,
+    size: usize,
+    scenario: Scenario,
+    literal: &[u8],
+    target_ns: u64,
+) -> Result<(), DynError> {
+    require(literal.len() == 16, "SVE2 comparison requires width 16")?;
+    let portable = LiteralPlan::new(literal, LiteralBuildLimits::default())?;
+    let program =
+        build_exact_literal::<Span>(literal, AnchorFlags::default(), ValidateLimits::default())?;
+    let image_v12 = emit_audited_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV12,
+        EmitLimits::default(),
+    )?;
+    let image_sve2 = emit_audited_with_backend(
+        &program,
+        SearchBackendPolicy::Sve2Fixed16V2,
+        EmitLimits::default(),
+    )?;
+    let primary_offset = first_candidate_primary_offset(image_v12.as_image().code())?;
+    let fixture = make_fixture(seed, size, scenario, literal, primary_offset)?;
+    let bytes = fixture.bytes();
+    let portable_window = PortableWindow::new(fixture.window_start, fixture.window_end);
+    let native_window = NativeWindow::new(fixture.window_start, fixture.window_end);
+    let kernel_v12 = publish_audited::<Span>(&image_v12, PublicationLimits::default())?;
+    let kernel_sve2 = publish_audited::<Span>(&image_sve2, PublicationLimits::default())?;
+    let session_v12 = kernel_v12.begin_current_thread_session()?;
+    let session_sve2 = kernel_sve2.begin_current_thread_session()?;
+
+    let expected = encode_portable(
+        portable
+            .find_window(bytes, portable_window, LiteralSearchLimits::unlimited())?
+            .0,
+    );
+    for engine in Sve2Width16Engine::ALL {
+        let actual = invoke_sve2_width16_engine(
+            engine,
+            &portable,
+            &session_v12,
+            &session_sve2,
+            bytes,
+            portable_window,
+            native_window,
+            literal.len(),
+        )?;
+        require(
+            expected == actual,
+            "V12/SVE2/hybrid/portable semantic mismatch before timing",
+        )?;
+    }
+
+    for _ in 0..3 {
+        for engine in Sve2Width16Engine::ALL {
+            black_box(invoke_sve2_width16_engine(
+                engine,
+                &portable,
+                &session_v12,
+                &session_sve2,
+                bytes,
+                portable_window,
+                native_window,
+                literal.len(),
+            )?);
+        }
+    }
+    let iterations = calibrate_sve2_width16(
+        &portable,
+        &session_v12,
+        &session_sve2,
+        bytes,
+        portable_window,
+        native_window,
+        literal.len(),
+        target_ns,
+        expected,
+    )?;
+    let scenario_name = scenario.name();
+    for repetition in 0..phase.repetitions() {
+        let mut order = Sve2Width16Engine::ALL;
+        let rotation = repetition % order.len();
+        order.rotate_left(rotation);
+        let order_name = order
+            .iter()
+            .map(|engine| engine.name())
+            .collect::<Vec<_>>()
+            .join("+");
+        for engine in order {
+            let measurement = measure(iterations, expected, || {
+                invoke_sve2_width16_engine(
+                    engine,
+                    &portable,
+                    &session_v12,
+                    &session_sve2,
+                    bytes,
+                    portable_window,
+                    native_window,
+                    literal.len(),
+                )
+            })?;
+            let ns_per_iter = measurement.total_ns as f64 / iterations as f64;
+            writeln!(
+                output,
+                "{SVE2_WIDTH16_SCHEMA},{},{seed:016x},{},{},{size},{scenario_name},{},{},{},{repetition},{order_name},{},{iterations},{},{ns_per_iter:.6},{:016x},{:016x}",
+                phase.name(),
+                literal.len(),
+                shape.name(),
+                scenario.alignment(),
+                fixture.window_start,
+                fixture.window_end,
+                engine.name(),
+                measurement.total_ns,
+                measurement.checksum,
+                measurement.semantic,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn invoke_sve2_width16_engine(
+    engine: Sve2Width16Engine,
+    portable: &LiteralPlan,
+    session_v12: &PublishedKernelThreadSession<'_, Span>,
+    session_sve2: &PublishedKernelThreadSession<'_, Span>,
+    haystack: &[u8],
+    portable_window: PortableWindow,
+    native_window: NativeWindow,
+    literal_bytes: usize,
+) -> Result<u64, DynError> {
+    match engine {
+        Sve2Width16Engine::NativeV12 => {
+            invoke_native(session_v12, haystack, native_window, literal_bytes)
+        }
+        Sve2Width16Engine::NativeSve2Tag21 => {
+            invoke_native(session_sve2, haystack, native_window, literal_bytes)
+        }
+        Sve2Width16Engine::HybridV12 => invoke_hybrid(
+            portable,
+            session_v12,
+            haystack,
+            native_window,
+            literal_bytes,
+        ),
+        Sve2Width16Engine::HybridSve2Tag21 => invoke_hybrid(
+            portable,
+            session_sve2,
+            haystack,
+            native_window,
+            literal_bytes,
+        ),
+        Sve2Width16Engine::Portable => invoke_portable(portable, haystack, portable_window),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn calibrate_sve2_width16(
+    portable: &LiteralPlan,
+    session_v12: &PublishedKernelThreadSession<'_, Span>,
+    session_sve2: &PublishedKernelThreadSession<'_, Span>,
+    haystack: &[u8],
+    portable_window: PortableWindow,
+    native_window: NativeWindow,
+    literal_bytes: usize,
+    target_ns: u64,
+    expected: u64,
+) -> Result<usize, DynError> {
+    let mut iterations = 1_usize;
+    loop {
+        let mut faster_ns = u64::MAX;
+        for engine in Sve2Width16Engine::ALL {
+            let measurement = measure(iterations, expected, || {
+                invoke_sve2_width16_engine(
+                    engine,
+                    portable,
+                    session_v12,
+                    session_sve2,
+                    haystack,
+                    portable_window,
+                    native_window,
+                    literal_bytes,
+                )
+            })?;
+            faster_ns = faster_ns.min(measurement.total_ns);
+        }
+        faster_ns = faster_ns.max(1);
+        if faster_ns >= target_ns / 4 || iterations == MAX_CALIBRATION_ITERATIONS {
+            let scale = target_ns
+                .checked_add(faster_ns - 1)
+                .ok_or_else(|| invalid("calibration rounding overflow"))?
+                / faster_ns;
+            let scale = usize::try_from(scale.max(1))?;
+            return Ok(iterations
+                .checked_mul(scale)
+                .unwrap_or(MAX_CALIBRATION_ITERATIONS)
+                .min(MAX_CALIBRATION_ITERATIONS));
+        }
+        iterations = iterations
+            .checked_mul(8)
+            .unwrap_or(MAX_CALIBRATION_ITERATIONS)
+            .min(MAX_CALIBRATION_ITERATIONS);
+    }
+}
+
+fn scenarios(phase: Phase, width: usize) -> Vec<Scenario> {
+    let mutation_offsets = if width > 1 { width } else { 0 };
+    let mut scenarios =
+        Vec::with_capacity(Scenario::BASE.len() + phase.alignments().len() + mutation_offsets);
+    scenarios.extend_from_slice(&Scenario::BASE);
+    scenarios.extend(
+        phase
+            .alignments()
+            .iter()
+            .copied()
+            .map(Scenario::AlignmentTail),
+    );
+    scenarios.extend(
+        (0..mutation_offsets)
+            .map(|offset| Scenario::NearMissOffset(u8::try_from(offset).expect("width <= 32"))),
+    );
+    scenarios
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_case(
+    output: &mut impl io::Write,
+    phase: Phase,
+    seed: u64,
+    shape: Shape,
+    size: usize,
+    scenario: Scenario,
+    literal: &[u8],
+    target_ns: u64,
+) -> Result<(), DynError> {
+    let portable = LiteralPlan::new(literal, LiteralBuildLimits::default())?;
+    let program =
+        build_exact_literal::<Span>(literal, AnchorFlags::default(), ValidateLimits::default())?;
+    let image_v11 = emit_audited_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV11,
+        EmitLimits::default(),
+    )?;
+    let image_v12 = emit_audited_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV12,
+        EmitLimits::default(),
+    )?;
+    let primary_offset = first_candidate_primary_offset(image_v12.as_image().code())?;
+    let fixture = make_fixture(seed, size, scenario, literal, primary_offset)?;
+    let bytes = fixture.bytes();
+    let portable_window = PortableWindow::new(fixture.window_start, fixture.window_end);
+    let native_window = NativeWindow::new(fixture.window_start, fixture.window_end);
+    let kernel_v11 = publish_audited::<Span>(&image_v11, PublicationLimits::default())?;
+    let kernel_v12 = publish_audited::<Span>(&image_v12, PublicationLimits::default())?;
+    let session_v11 = kernel_v11.begin_current_thread_session()?;
+    let session_v12 = kernel_v12.begin_current_thread_session()?;
+
+    let expected = encode_portable(
+        portable
+            .find_window(bytes, portable_window, LiteralSearchLimits::unlimited())?
+            .0,
+    );
+    let actual_v11 = invoke_native(&session_v11, bytes, native_window, literal.len())?;
+    let actual_v12 = invoke_native(&session_v12, bytes, native_window, literal.len())?;
+    let actual_hybrid =
+        invoke_hybrid(&portable, &session_v12, bytes, native_window, literal.len())?;
+    require(
+        expected == actual_v11 && expected == actual_v12 && expected == actual_hybrid,
+        "native V11/V12/hybrid/portable semantic mismatch before timing",
+    )?;
+
+    for _ in 0..3 {
+        black_box(invoke_portable(&portable, bytes, portable_window)?);
+        black_box(invoke_native(
+            &session_v11,
+            bytes,
+            native_window,
+            literal.len(),
+        )?);
+        black_box(invoke_native(
+            &session_v12,
+            bytes,
+            native_window,
+            literal.len(),
+        )?);
+        black_box(invoke_hybrid(
+            &portable,
+            &session_v12,
+            bytes,
+            native_window,
+            literal.len(),
+        )?);
+    }
+    let iterations = calibrate(
+        &portable,
+        &session_v11,
+        &session_v12,
+        bytes,
+        portable_window,
+        native_window,
+        literal.len(),
+        target_ns,
+        expected,
+    )?;
+    let scenario_name = scenario.name();
+    for repetition in 0..phase.repetitions() {
+        let order = match repetition % 4 {
+            0 => [
+                Engine::NativeV11,
+                Engine::NativeV12,
+                Engine::HybridV12,
+                Engine::Portable,
+            ],
+            1 => [
+                Engine::NativeV12,
+                Engine::HybridV12,
+                Engine::Portable,
+                Engine::NativeV11,
+            ],
+            2 => [
+                Engine::HybridV12,
+                Engine::Portable,
+                Engine::NativeV11,
+                Engine::NativeV12,
+            ],
+            _ => [
+                Engine::Portable,
+                Engine::NativeV11,
+                Engine::NativeV12,
+                Engine::HybridV12,
+            ],
+        };
+        let order_name = format!(
+            "{}+{}+{}+{}",
+            order[0].name(),
+            order[1].name(),
+            order[2].name(),
+            order[3].name()
+        );
+        for engine in order {
+            let measurement = match engine {
+                Engine::NativeV11 => measure(iterations, expected, || {
+                    invoke_native(&session_v11, bytes, native_window, literal.len())
+                })?,
+                Engine::NativeV12 => measure(iterations, expected, || {
+                    invoke_native(&session_v12, bytes, native_window, literal.len())
+                })?,
+                Engine::HybridV12 => measure(iterations, expected, || {
+                    invoke_hybrid(&portable, &session_v12, bytes, native_window, literal.len())
+                })?,
+                Engine::Portable => measure(iterations, expected, || {
+                    invoke_portable(&portable, bytes, portable_window)
+                })?,
+            };
+            let ns_per_iter = measurement.total_ns as f64 / iterations as f64;
+            writeln!(
+                output,
+                "{SCHEMA},{},{seed:016x},{},{},{size},{scenario_name},{},{},{},{repetition},{order_name},{},{iterations},{},{ns_per_iter:.6},{:016x},{:016x}",
+                phase.name(),
+                literal.len(),
+                shape.name(),
+                scenario.alignment(),
+                fixture.window_start,
+                fixture.window_end,
+                engine.name(),
+                measurement.total_ns,
+                measurement.checksum,
+                measurement.semantic,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn first_candidate_primary_offset(code: &[u8]) -> Result<usize, DynError> {
+    decode(code)?
+        .into_iter()
+        .find_map(|instruction| match instruction {
+            DecodedInstruction::LoadByte {
+                destination: 10,
+                base: 15,
+                offset,
+            } => Some(usize::from(offset)),
+            _ => None,
+        })
+        .ok_or_else(|| invalid("first-candidate prefix selected-byte load missing").into())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn calibrate(
+    portable: &LiteralPlan,
+    session_v11: &PublishedKernelThreadSession<'_, Span>,
+    session_v12: &PublishedKernelThreadSession<'_, Span>,
+    haystack: &[u8],
+    portable_window: PortableWindow,
+    native_window: NativeWindow,
+    literal_bytes: usize,
+    target_ns: u64,
+    expected: u64,
+) -> Result<usize, DynError> {
+    let mut iterations = 1_usize;
+    loop {
+        let native_v11 = measure(iterations, expected, || {
+            invoke_native(session_v11, haystack, native_window, literal_bytes)
+        })?;
+        let native_v12 = measure(iterations, expected, || {
+            invoke_native(session_v12, haystack, native_window, literal_bytes)
+        })?;
+        let hybrid_v12 = measure(iterations, expected, || {
+            invoke_hybrid(
+                portable,
+                session_v12,
+                haystack,
+                native_window,
+                literal_bytes,
+            )
+        })?;
+        let portable_measurement = measure(iterations, expected, || {
+            invoke_portable(portable, haystack, portable_window)
+        })?;
+        let faster_ns = native_v11
+            .total_ns
+            .min(native_v12.total_ns)
+            .min(hybrid_v12.total_ns)
+            .min(portable_measurement.total_ns)
+            .max(1);
+        if faster_ns >= target_ns / 4 || iterations == MAX_CALIBRATION_ITERATIONS {
+            let scale = target_ns
+                .checked_add(faster_ns - 1)
+                .ok_or_else(|| invalid("calibration rounding overflow"))?
+                / faster_ns;
+            let scale = usize::try_from(scale.max(1))?;
+            return Ok(iterations
+                .checked_mul(scale)
+                .unwrap_or(MAX_CALIBRATION_ITERATIONS)
+                .min(MAX_CALIBRATION_ITERATIONS));
+        }
+        iterations = iterations
+            .checked_mul(8)
+            .unwrap_or(MAX_CALIBRATION_ITERATIONS)
+            .min(MAX_CALIBRATION_ITERATIONS);
+    }
+}
+
+fn measure(
+    iterations: usize,
+    expected: u64,
+    mut invoke: impl FnMut() -> Result<u64, DynError>,
+) -> Result<Measurement, DynError> {
+    let started = Instant::now();
+    let mut checksum = CHECKSUM_SEED;
+    let mut semantic = u64::MAX;
+    for ordinal in 0..iterations {
+        semantic = black_box(invoke()?);
+        require(semantic == expected, "timed semantic mismatch")?;
+        checksum = fold_checksum(checksum, ordinal, semantic);
+    }
+    let total_ns = u64::try_from(started.elapsed().as_nanos())?;
+    Ok(Measurement {
+        total_ns,
+        checksum: black_box(checksum),
+        semantic,
+    })
+}
+
+fn invoke_native(
+    session: &PublishedKernelThreadSession<'_, Span>,
+    haystack: &[u8],
+    window: NativeWindow,
+    literal_bytes: usize,
+) -> Result<u64, DynError> {
+    let checked = CheckedSearchWindow::new(black_box(haystack), window)
+        .ok_or_else(|| invalid("native window rejected"))?;
+    preflight_checked_literal_window(literal_bytes, checked, LiteralSearchLimits::unlimited())?;
+    Ok(encode_native(session.search_checked(checked)?))
+}
+
+fn invoke_portable(
+    portable: &LiteralPlan,
+    haystack: &[u8],
+    window: PortableWindow,
+) -> Result<u64, DynError> {
+    Ok(encode_portable(
+        portable
+            .find_window(
+                black_box(haystack),
+                window,
+                LiteralSearchLimits::unlimited(),
+            )?
+            .0,
+    ))
+}
+
+fn invoke_hybrid(
+    portable: &LiteralPlan,
+    native_tail: &PublishedKernelThreadSession<'_, Span>,
+    haystack: &[u8],
+    window: NativeWindow,
+    literal_bytes: usize,
+) -> Result<u64, DynError> {
+    let searched_bytes = window
+        .end()
+        .checked_sub(window.start())
+        .ok_or_else(|| invalid("hybrid window inverted"))?;
+    if literal_bytes < HYBRID_MIN_LITERAL_BYTES || searched_bytes < HYBRID_MIN_WINDOW_BYTES {
+        return invoke_portable(
+            portable,
+            haystack,
+            PortableWindow::new(window.start(), window.end()),
+        );
+    }
+    let checked = CheckedSearchWindow::new(black_box(haystack), window)
+        .ok_or_else(|| invalid("hybrid window rejected"))?;
+    match portable.preflight_checked_window_prefix(
+        checked,
+        LiteralSearchLimits::unlimited(),
+        HYBRID_PREFIX_CANDIDATE_STARTS,
+    )? {
+        LiteralSearchPrefixSplit::Match { start, end, .. } => {
+            Ok(encode_portable(Some((start, end))))
+        }
+        LiteralSearchPrefixSplit::Exhausted { .. } => Ok(encode_portable(None)),
+        LiteralSearchPrefixSplit::Tail(tail) => Ok(encode_native(
+            native_tail.search_checked(tail.checked_window())?,
+        )),
+    }
+}
+
+fn encode_native(matched: Option<MatchSpan>) -> u64 {
+    matched.map_or(0, |span| encode_span(span.start(), span.end()))
+}
+
+fn encode_portable(matched: Option<(usize, usize)>) -> u64 {
+    matched.map_or(0, |(start, end)| encode_span(start, end))
+}
+
+fn encode_span(start: usize, end: usize) -> u64 {
+    let start = u64::try_from(start).expect("benchmark span start fits u64");
+    let end = u64::try_from(end).expect("benchmark span end fits u64");
+    start.rotate_left(17) ^ end.rotate_left(41) ^ 1
+}
+
+fn fold_checksum(checksum: u64, ordinal: usize, semantic: u64) -> u64 {
+    let ordinal = u64::try_from(ordinal).expect("benchmark ordinal fits u64");
+    (checksum ^ semantic ^ ordinal.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+        .rotate_left(13)
+        .wrapping_mul(0xbf58_476d_1ce4_e5b9)
+        .wrapping_add(0x94d0_49bb_1331_11eb)
+}
+
+fn make_literal(seed: u64, width: usize, shape: Shape) -> Vec<u8> {
+    let mut state = seed ^ shape.tag().wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let mut literal = Vec::with_capacity(width);
+    for index in 0..width {
+        let byte = match shape {
+            Shape::Entropy => splitmix64(&mut state).to_le_bytes()[index & 7],
+            Shape::Repeated => (seed ^ 0x5a).to_le_bytes()[0],
+            Shape::Periodic => {
+                let pair = [
+                    (seed ^ 0x35).to_le_bytes()[0],
+                    (seed ^ 0xc7).to_le_bytes()[1],
+                ];
+                pair[index & 1]
+            }
+            Shape::Binary => {
+                const BINARY: [u8; 8] = [0x00, 0xff, 0x80, 0x7f, 0x01, 0xfe, 0x55, 0xaa];
+                BINARY[(index + usize::from(seed.to_le_bytes()[0] & 7)) & 7]
+            }
+        };
+        literal.push(byte);
+    }
+    literal
+}
+
+fn make_fixture(
+    seed: u64,
+    len: usize,
+    scenario: Scenario,
+    literal: &[u8],
+    primary_offset: usize,
+) -> Result<Fixture, DynError> {
+    require(
+        !literal.is_empty() && literal.len() <= len,
+        "invalid fixture literal width",
+    )?;
+    require(
+        primary_offset < literal.len(),
+        "invalid native primary literal offset",
+    )?;
+    let mut storage = vec![
+        0_u8;
+        len.checked_add(64)
+            .ok_or_else(|| invalid("fixture extent"))?
+    ];
+    let base = storage.as_ptr().addr() & 15;
+    let alignment = usize::from(scenario.alignment());
+    let start = alignment.wrapping_add(16).wrapping_sub(base) & 15;
+    let haystack = &mut storage[start..start + len];
+    let avoid = (0_u16..=255)
+        .map(|value| u8::try_from(value).expect("bounded byte"))
+        .find(|byte| !literal.contains(byte))
+        .ok_or_else(|| invalid("literal unexpectedly contains every byte"))?;
+    let maximum = len - literal.len();
+    let mut window_start = 0_usize;
+    let mut window_end = len;
+    let mut state = seed
+        ^ u64::try_from(len)?
+        ^ scenario.tag().wrapping_mul(0xd6e8_feb8_6659_fd93)
+        ^ u64::try_from(literal.len())?.rotate_left(29);
+
+    match scenario {
+        Scenario::AbsentEntropy => {
+            fill_entropy(haystack, &mut state);
+            scrub_matches(haystack, 0, len, literal, avoid);
+        }
+        Scenario::AbsentFiller => haystack.fill(avoid),
+        Scenario::Early => {
+            haystack.fill(avoid);
+            install_literal(haystack, maximum.min(64), literal)?;
+        }
+        Scenario::Middle => {
+            haystack.fill(avoid);
+            install_literal(haystack, maximum / 2, literal)?;
+        }
+        Scenario::Tail | Scenario::AlignmentTail(_) => {
+            haystack.fill(avoid);
+            install_literal(haystack, maximum, literal)?;
+        }
+        Scenario::Dense => {
+            for (index, byte) in haystack.iter_mut().enumerate() {
+                *byte = literal[index % literal.len()];
+            }
+        }
+        Scenario::FirstByteDenseAbsent => {
+            if literal.iter().all(|byte| *byte == literal[0]) {
+                haystack.fill(avoid);
+            } else {
+                haystack.fill(literal[0]);
+                scrub_matches(haystack, 0, len, literal, avoid);
+            }
+        }
+        Scenario::NearMissHead | Scenario::NearMissTail | Scenario::NearMissOffset(_) => {
+            haystack.fill(avoid);
+            if literal.len() > 1 {
+                for chunk in haystack.chunks_exact_mut(literal.len()) {
+                    chunk.copy_from_slice(literal);
+                    let mutation_offset = match scenario {
+                        Scenario::NearMissHead => 0,
+                        Scenario::NearMissTail => literal.len() - 1,
+                        Scenario::NearMissOffset(offset) => usize::from(offset),
+                        _ => unreachable!("near-miss branch"),
+                    };
+                    chunk[mutation_offset] = avoid;
+                }
+            }
+            scrub_matches(haystack, 0, len, literal, avoid);
+            clear_around(haystack, maximum, literal.len(), avoid);
+            install_literal(haystack, maximum, literal)?;
+        }
+        Scenario::BinaryTail => {
+            for (index, byte) in haystack.iter_mut().enumerate() {
+                *byte = index.to_le_bytes()[0].wrapping_add(state.to_le_bytes()[0]);
+            }
+            scrub_matches(haystack, 0, len, literal, avoid);
+            clear_around(haystack, maximum, literal.len(), avoid);
+            install_literal(haystack, maximum, literal)?;
+        }
+        Scenario::FirstCandidateExact => {
+            window_start = 37.min(maximum);
+            window_end = len.saturating_sub(23).max(window_start + literal.len());
+            window_end = window_end.min(len);
+            haystack.fill(avoid);
+            install_literal(haystack, window_start, literal)?;
+        }
+        Scenario::SelectedByteHitThenFullMiss => {
+            require(
+                literal.len() > 1,
+                "selected-byte/full-miss fixture requires width > 1",
+            )?;
+            window_start = 37.min(maximum);
+            window_end = len.saturating_sub(23).max(window_start + literal.len());
+            window_end = window_end.min(len);
+            haystack.fill(avoid);
+            haystack[window_start + primary_offset] = literal[primary_offset];
+            let non_primary = usize::from(primary_offset == 0);
+            require(
+                haystack[window_start + non_primary] != literal[non_primary],
+                "selected-byte/full-miss witness is vacuous",
+            )?;
+        }
+        Scenario::WindowAbsent | Scenario::WindowTail => {
+            window_start = 37.min(maximum);
+            window_end = len.saturating_sub(23).max(window_start + literal.len());
+            window_end = window_end.min(len);
+            haystack.fill(avoid);
+            if window_start >= literal.len() {
+                install_literal(haystack, 0, literal)?;
+            }
+            if window_end + literal.len() <= len {
+                install_literal(haystack, window_end, literal)?;
+            }
+            if scenario == Scenario::WindowTail {
+                install_literal(haystack, window_end - literal.len(), literal)?;
+            }
+        }
+    }
+
+    let portable = LiteralPlan::new(literal, LiteralBuildLimits::default())?;
+    let found = portable
+        .find_window(
+            haystack,
+            PortableWindow::new(window_start, window_end),
+            LiteralSearchLimits::unlimited(),
+        )?
+        .0;
+    match scenario {
+        Scenario::AbsentEntropy
+        | Scenario::AbsentFiller
+        | Scenario::FirstByteDenseAbsent
+        | Scenario::SelectedByteHitThenFullMiss
+        | Scenario::WindowAbsent => {
+            require(found.is_none(), "intended-absent fixture contains a match")?;
+        }
+        _ => require(found.is_some(), "intended-hit fixture contains no match")?,
+    }
+    require(
+        haystack.as_ptr().addr() & 15 == alignment,
+        "fixture alignment mismatch",
+    )?;
+    Ok(Fixture {
+        storage,
+        start,
+        len,
+        window_start,
+        window_end,
+    })
+}
+
+fn fill_entropy(bytes: &mut [u8], state: &mut u64) {
+    for chunk in bytes.chunks_mut(8) {
+        let random = splitmix64(state).to_le_bytes();
+        chunk.copy_from_slice(&random[..chunk.len()]);
+    }
+}
+
+fn scrub_matches(bytes: &mut [u8], start: usize, end: usize, literal: &[u8], avoid: u8) {
+    if end - start < literal.len() {
+        return;
+    }
+    let mut candidate = start;
+    while candidate + literal.len() <= end {
+        if bytes[candidate..candidate + literal.len()] == *literal {
+            bytes[candidate + literal.len() - 1] = avoid;
+        }
+        candidate += 1;
+    }
+}
+
+fn clear_around(bytes: &mut [u8], start: usize, width: usize, value: u8) {
+    let clear_start = start.saturating_sub(width);
+    let clear_end = start
+        .checked_add(width.saturating_mul(2))
+        .unwrap_or(bytes.len())
+        .min(bytes.len());
+    bytes[clear_start..clear_end].fill(value);
+}
+
+fn install_literal(bytes: &mut [u8], start: usize, literal: &[u8]) -> Result<(), DynError> {
+    let end = start
+        .checked_add(literal.len())
+        .ok_or_else(|| invalid("literal placement overflow"))?;
+    bytes
+        .get_mut(start..end)
+        .ok_or_else(|| invalid("literal placement outside fixture"))?
+        .copy_from_slice(literal);
+    Ok(())
+}
+
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut value = *state;
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+fn canonical_usize(value: &str, label: &str) -> Result<usize, DynError> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| invalid(format!("{label} is not canonical decimal")))?;
+    require(
+        parsed.to_string() == value,
+        format!("{label} is not canonical decimal"),
+    )?;
+    Ok(parsed)
+}
+
+fn require(condition: bool, message: impl Into<String>) -> Result<(), DynError> {
+    if condition {
+        Ok(())
+    } else {
+        Err(invalid(message).into())
+    }
+}
+
+fn invalid(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mutation_inventory_is_every_offset_and_depends_only_on_width() {
+        for width in 1..=32 {
+            let observed = scenarios(Phase::Screen, width)
+                .into_iter()
+                .filter_map(|scenario| match scenario {
+                    Scenario::NearMissOffset(offset) => Some(usize::from(offset)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let expected = if width == 1 {
+                Vec::new()
+            } else {
+                (0..width).collect::<Vec<_>>()
+            };
+            assert_eq!(observed, expected, "width {width}");
+        }
+    }
+
+    #[test]
+    fn every_mutation_stream_has_only_its_exact_tail_match() {
+        for width in 2..=32 {
+            for shape in Shape::ALL {
+                let literal = make_literal(SCREEN_SEEDS[0], width, shape);
+                for offset in 0..width {
+                    let fixture = make_fixture(
+                        SCREEN_SEEDS[0],
+                        SCREEN_SIZES[2],
+                        Scenario::NearMissOffset(
+                            u8::try_from(offset).expect("bounded mutation offset"),
+                        ),
+                        &literal,
+                        0,
+                    )
+                    .expect("valid mutation fixture");
+                    let plan = LiteralPlan::new(&literal, LiteralBuildLimits::default())
+                        .expect("valid literal plan");
+                    let found = plan
+                        .find_window(
+                            fixture.bytes(),
+                            PortableWindow::new(fixture.window_start, fixture.window_end),
+                            LiteralSearchLimits::unlimited(),
+                        )
+                        .expect("search succeeds")
+                        .0;
+                    assert_eq!(
+                        found,
+                        Some((fixture.len - width, fixture.len)),
+                        "width={width} shape={shape:?} offset={offset}"
+                    );
+                }
+            }
+        }
+    }
+}

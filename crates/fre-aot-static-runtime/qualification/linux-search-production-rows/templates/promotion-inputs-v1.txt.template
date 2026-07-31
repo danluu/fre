@@ -1,0 +1,12 @@
+This file is an inert checklist, not production authority.
+
+REPOSITORY=/absolute/physical/repository
+CANDIDATE=<EXACT_PRIVATE_PROMOTION_AND_POST_PRIVATE_EVIDENCE_COMMIT>
+PROMOTED=<DIRECT_SINGLE_PARENT_PRODUCTION_PROMOTION_COMMIT>
+PRODUCTION_AUTHORIZATION=/absolute/owned/mode-0600/production-authorization.tsv
+EXPECTED_AUTHORIZATION_SHA256=<DIGEST_PUBLISHED_BY_INDEPENDENT_REVIEWER>
+
+The authorization must be populated only after the private promotion and fresh
+post-private evidence exist. The renderer and verifier reject these
+placeholders; this template supplies no current proposal, evidence, digest, or
+authority.

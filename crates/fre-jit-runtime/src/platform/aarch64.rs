@@ -6,20 +6,26 @@
 //! invalidation; and the mapping is held by an `Arc` for the complete duration
 //! of every call.
 
-use core::{ffi::c_void, mem, ptr::NonNull, slice};
+use core::{
+    ffi::c_void,
+    mem::{self, MaybeUninit},
+    ptr::NonNull,
+    slice,
+};
 use std::{io, ptr};
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use fre_jit_aarch64::{
-    BackendVersion, CpuFeatures, NativeAggregateImage, NativeAggregateResult, NativeImage,
-    NativeResult, TargetSpec, audit, audit_aggregate,
+    AuditedNativeImage, AuditedSelectedEndRegisterImageV2, BackendVersion, CpuFeatures,
+    NativeAggregateImage, NativeAggregateResult, NativeImage, NativeResult, TargetSpec, audit,
+    audit_aggregate, audit_selected_end_register_v2,
 };
 use fre_kernel_ir::{AggregateOutput, OutputKind, SearchWindow};
 
 use crate::{
-    CallError, FailureStage, PublishError, RuntimeIdentity, WxMode,
+    CallError, FailureStage, NativeHostCapabilities, PublishError, RuntimeIdentity, WxMode,
     limits::PublicationPlan,
     operation::{RawAggregateCallResult, RawCallResult},
 };
@@ -27,10 +33,12 @@ use crate::{
 use super::{FailureInjection, Mapping, host};
 
 type EntryFunction = unsafe extern "C" fn(*const u8, usize, usize, usize, *mut NativeResult) -> u64;
+type SelectedEndRegisterEntryFunctionV2 =
+    unsafe extern "C" fn(*const u8, usize, usize, usize) -> usize;
 type AggregateEntryFunction =
     unsafe extern "C" fn(*const u8, usize, *mut NativeAggregateResult) -> u64;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "sve-hardware-qualification"))]
 macro_rules! define_vector_callee_saved_canary {
     ($symbol:literal) => {
         core::arch::global_asm!(concat!(
@@ -76,13 +84,72 @@ macro_rules! define_vector_callee_saved_canary {
     };
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(any(test, feature = "sve-hardware-qualification"))]
+macro_rules! define_selected_end_register_v2_vector_callee_saved_canary {
+    ($symbol:literal) => {
+        core::arch::global_asm!(concat!(
+            r#"
+    .text
+    .p2align 2
+    .globl "#,
+            $symbol,
+            "\n",
+            $symbol,
+            r#":
+    sub sp, sp, #80
+    stp x19, x30, [sp, #0]
+    stp d8, d9, [sp, #16]
+    stp d10, d11, [sp, #32]
+    stp d12, d13, [sp, #48]
+    stp d14, d15, [sp, #64]
+    mov x16, x0
+    mov x19, x5
+    mov x5, xzr
+    mov x6, xzr
+    mov x7, xzr
+    ldp d8, d9, [x19, #0]
+    ldp d10, d11, [x19, #16]
+    ldp d12, d13, [x19, #32]
+    ldp d14, d15, [x19, #48]
+    mov x0, x1
+    mov x1, x2
+    mov x2, x3
+    mov x3, x4
+    mov x4, xzr
+    blr x16
+    stp d8, d9, [x19, #64]
+    stp d10, d11, [x19, #80]
+    stp d12, d13, [x19, #96]
+    stp d14, d15, [x19, #112]
+    ldp d8, d9, [sp, #16]
+    ldp d10, d11, [sp, #32]
+    ldp d12, d13, [sp, #48]
+    ldp d14, d15, [sp, #64]
+    ldp x19, x30, [sp, #0]
+    add sp, sp, #80
+    ret
+"#
+        ));
+    };
+}
+
+#[cfg(all(any(test, feature = "sve-hardware-qualification"), target_os = "macos"))]
 define_vector_callee_saved_canary!("_fre_jit_test_vector_callee_saved_canary");
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(any(test, feature = "sve-hardware-qualification"), target_os = "linux"))]
 define_vector_callee_saved_canary!("fre_jit_test_vector_callee_saved_canary");
 
-#[cfg(test)]
+#[cfg(all(any(test, feature = "sve-hardware-qualification"), target_os = "macos"))]
+define_selected_end_register_v2_vector_callee_saved_canary!(
+    "_fre_jit_test_selected_end_register_v2_vector_callee_saved_canary"
+);
+
+#[cfg(all(any(test, feature = "sve-hardware-qualification"), target_os = "linux"))]
+define_selected_end_register_v2_vector_callee_saved_canary!(
+    "fre_jit_test_selected_end_register_v2_vector_callee_saved_canary"
+);
+
+#[cfg(any(test, feature = "sve-hardware-qualification"))]
 unsafe extern "C" {
     fn fre_jit_test_vector_callee_saved_canary(
         entry: *const c_void,
@@ -93,12 +160,21 @@ unsafe extern "C" {
         result: *mut NativeResult,
         canaries: *mut u64,
     ) -> u64;
+
+    fn fre_jit_test_selected_end_register_v2_vector_callee_saved_canary(
+        entry: *const c_void,
+        haystack: *const u8,
+        haystack_len: usize,
+        window_start: usize,
+        window_end: usize,
+        canaries: *mut u64,
+    ) -> usize;
 }
 
 #[cfg(test)]
 static LIVE_CODE_MAPPINGS: AtomicUsize = AtomicUsize::new(0);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "sve-hardware-qualification"))]
 pub(crate) fn invoke_with_vector_callee_saved_canary(
     mapping: &ExecutableMapping,
     haystack: &[u8],
@@ -135,6 +211,34 @@ pub(crate) fn invoke_with_vector_callee_saved_canary(
     )
 }
 
+#[cfg(any(test, feature = "sve-hardware-qualification"))]
+pub(crate) fn invoke_selected_end_register_v2_with_vector_callee_saved_canary(
+    entry: SelectedEndRegisterEntryV2,
+    haystack: &[u8],
+    window: SearchWindow,
+    canaries: [u64; 8],
+) -> (usize, [u64; 8]) {
+    let mut slots = [0_u64; 16];
+    slots[..8].copy_from_slice(&canaries);
+    // SAFETY: the session-bound typed entry was decoded only from a P1-audited
+    // immutable ABI2 mapping. The wrapper forwards exactly haystack, length,
+    // start, and end in x0..x3, clears x4 instead of passing a result slot,
+    // returns the generated entry's x0 unchanged, and stores only into the
+    // live canary buffer.
+    let end_or_zero = unsafe {
+        fre_jit_test_selected_end_register_v2_vector_callee_saved_canary(
+            entry.0 as *const () as *const c_void,
+            haystack.as_ptr(),
+            haystack.len(),
+            window.start(),
+            window.end(),
+            slots.as_mut_ptr(),
+        )
+    };
+    let observed = slots[8..].try_into().expect("eight vector canary slots");
+    (end_or_zero, observed)
+}
+
 #[derive(Debug)]
 pub(crate) struct ExecutableMapping {
     reservation: Reservation,
@@ -142,8 +246,87 @@ pub(crate) struct ExecutableMapping {
     identity: RuntimeIdentity,
     output: OutputKind,
     aggregate: Option<AggregateMappingContract>,
+    selected_end_register_literal_bytes_v2: Option<u32>,
     backend_version: BackendVersion,
     target: TargetSpec,
+    sve_vector_bytes_at_publication: Option<u16>,
+}
+
+/// Typed search entry retained only while its owning RX mapping stays live.
+///
+/// `PublishedKernel` stores this value beside the `Arc<ExecutableMapping>`
+/// from which it was derived. Keeping the callable separate avoids decoding
+/// the same immutable entry address on every search without exposing it
+/// outside the runtime crate.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SearchEntry(EntryFunction);
+
+/// Exact register-return ABI2 entry retained only with its owning RX mapping.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SelectedEndRegisterEntryV2(SelectedEndRegisterEntryFunctionV2);
+
+impl SearchEntry {
+    #[inline]
+    pub(crate) fn invoke<O: crate::RuntimeOperation>(
+        self,
+        haystack: &[u8],
+        window: SearchWindow,
+    ) -> RawCallResult {
+        let mut slot = MaybeUninit::<NativeResult>::uninit();
+        // SAFETY: construction decoded the callable only from a completely
+        // audited mapping after its final RX transition. The owning
+        // `PublishedKernel` retains that mapping for this complete call. The
+        // sealed `O` is the output checked when that kernel was constructed;
+        // the result slot has the exact `NativeResult` layout and remains
+        // writable.
+        let status = unsafe {
+            (self.0)(
+                haystack.as_ptr(),
+                haystack.len(),
+                window.start(),
+                window.end(),
+                slot.as_mut_ptr(),
+            )
+        };
+        let slot = match (status, O::KIND) {
+            // SAFETY: every published search image passes the independent
+            // whole-template audit. A successful `Span` return is immediately
+            // preceded by stores to both result fields.
+            (1, OutputKind::Span) => unsafe { slot.assume_init() },
+            // SAFETY: the same audit requires a successful `SelectedEnd`
+            // return to initialize `end`. `start` deliberately retains the
+            // prior diagnostic sentinel without being read from native memory.
+            (1, OutputKind::SelectedEnd) => NativeResult {
+                start: usize::MAX,
+                end: unsafe { ptr::addr_of!((*slot.as_ptr()).end).read() },
+            },
+            // Exists never consumes the slot. Misses and backend-fault status
+            // values are decoded without consuming it for every operation.
+            _ => NativeResult {
+                start: usize::MAX,
+                end: usize::MAX,
+            },
+        };
+        RawCallResult { status, slot }
+    }
+}
+
+impl SelectedEndRegisterEntryV2 {
+    #[inline(always)]
+    pub(crate) fn invoke(self, haystack: &[u8], window: SearchWindow) -> usize {
+        // SAFETY: construction decoded this exact four-argument callable only
+        // from a P1-audited ABI2 mapping after its final RX transition. The
+        // borrowing session retains the owning mapping for this complete leaf
+        // call, and scalar preflight validated both window bounds first.
+        unsafe {
+            (self.0)(
+                haystack.as_ptr(),
+                haystack.len(),
+                window.start(),
+                window.end(),
+            )
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -168,6 +351,10 @@ impl Mapping for ExecutableMapping {
         self.output
     }
 
+    fn sve_vector_bytes_at_publication(&self) -> Option<u16> {
+        self.sve_vector_bytes_at_publication
+    }
+
     fn call_contract_valid(&self, expected_output: OutputKind) -> bool {
         let expected = TargetSpec::AARCH64_AAPCS64;
         self.reservation.state == MappingState::Executable
@@ -180,42 +367,74 @@ impl Mapping for ExecutableMapping {
                     | BackendVersion::SEARCH_V5
                     | BackendVersion::SEARCH_V6
                     | BackendVersion::SEARCH_V7
+                    | BackendVersion::SEARCH_V8
+                    | BackendVersion::SEARCH_V9
+                    | BackendVersion::SEARCH_V10
+                    | BackendVersion::SEARCH_V11
+                    | BackendVersion::SEARCH_V12
+                    | BackendVersion::SEARCH_V13
+                    | BackendVersion::SEARCH_V14
+                    | BackendVersion::SEARCH_V15
+                    | BackendVersion::SEARCH_V16
+                    | BackendVersion::SEARCH_V17
+                    | BackendVersion::SEARCH_V18
+                    | BackendVersion::SEARCH_V19
+                    | BackendVersion::SEARCH_V20
+                    | BackendVersion::SEARCH_V21
+                    | BackendVersion::SEARCH_V22
+                    | BackendVersion::SEARCH_V23
+                    | BackendVersion::SEARCH_V24
+                    | BackendVersion::SEARCH_V25
+                    | BackendVersion::SEARCH_V26
                     | BackendVersion::SEARCH_SVE16_V1
                     | BackendVersion::SEARCH_SVE2_16_V1
+                    | BackendVersion::SEARCH_SVE16_V6
+                    | BackendVersion::SEARCH_SVE2_FIXED16_V2
             )
             && self.aggregate.is_none()
+            && self.selected_end_register_literal_bytes_v2.is_none()
             && self.output == expected_output
             && self.target.architecture == expected.architecture
             && self.target.little_endian == expected.little_endian
             && self.target.pointer_width == expected.pointer_width
             && self.target.abi == expected.abi
+            && crate::search_vector_length_contract_valid(
+                self.backend_version,
+                self.sve_vector_bytes_at_publication,
+            )
             && target_features_available(self.target.features)
     }
 
-    fn invoke(&self, haystack: &[u8], window: SearchWindow) -> Result<RawCallResult, CallError> {
-        debug_assert_eq!(self.reservation.state, MappingState::Executable);
-        let mut slot = NativeResult {
-            start: usize::MAX,
-            end: usize::MAX,
-        };
-        // SAFETY: `entry` was decoded/audited before being copied at the exact
-        // image-relative offset and remains in an owned RX mapping. The ABI is
-        // AAPCS64 v1. Slice storage and the aligned stack result live across
-        // the leaf call; the checked window is within the slice. Emitted code
-        // contains no indirect calls and cannot unwind.
-        let function: EntryFunction = unsafe { mem::transmute(self.entry.as_ptr()) };
-        // SAFETY: the function-pointer conversion invariant above applies and
-        // all five arguments satisfy the audited AAPCS64 contract.
-        let status = unsafe {
-            function(
-                haystack.as_ptr(),
-                haystack.len(),
-                window.start(),
-                window.end(),
-                ptr::addr_of_mut!(slot),
+    fn selected_end_register_v2_contract_valid(&self, literal_bytes: u32) -> bool {
+        let expected = TargetSpec::AARCH64_AAPCS64;
+        self.reservation.state == MappingState::Executable
+            && matches!(
+                self.backend_version,
+                BackendVersion::SEARCH_V8
+                    | BackendVersion::SEARCH_SVE16_V6
+                    | BackendVersion::SEARCH_SVE2_FIXED16_V2
             )
-        };
-        Ok(RawCallResult { status, slot })
+            && self.aggregate.is_none()
+            && literal_bytes != 0
+            && self.selected_end_register_literal_bytes_v2 == Some(literal_bytes)
+            && self.output == OutputKind::SelectedEnd
+            && self.sve_vector_bytes_at_publication.is_none()
+            && match self.backend_version {
+                BackendVersion::SEARCH_V8 => {
+                    self.target.features == CpuFeatures::NONE
+                        || self.target.features == CpuFeatures::ASIMD
+                }
+                BackendVersion::SEARCH_SVE16_V6 => self.target.features == CpuFeatures::ASIMD_SVE,
+                BackendVersion::SEARCH_SVE2_FIXED16_V2 => {
+                    self.target.features == CpuFeatures::ASIMD_SVE2
+                }
+                _ => false,
+            }
+            && self.target.architecture == expected.architecture
+            && self.target.little_endian == expected.little_endian
+            && self.target.pointer_width == expected.pointer_width
+            && self.target.abi == expected.abi
+            && target_features_available(self.target.features)
     }
 
     fn aggregate_contract_valid(
@@ -234,6 +453,7 @@ impl Mapping for ExecutableMapping {
                     | BackendVersion::AGGREGATE_SVE2_FIXED16_PAIR_COUNT_EXPERIMENTAL_V1
                     | BackendVersion::AGGREGATE_SVE2_FIXED16_PAIR_SPAN_SUM_EXPERIMENTAL_V1
             )
+            && self.selected_end_register_literal_bytes_v2.is_none()
             && self.aggregate
                 == Some(AggregateMappingContract {
                     output: expected_output,
@@ -257,6 +477,34 @@ impl Mapping for ExecutableMapping {
         let status =
             unsafe { function(haystack.as_ptr(), haystack.len(), ptr::addr_of_mut!(slot)) };
         Ok(RawAggregateCallResult { status, slot })
+    }
+}
+
+impl ExecutableMapping {
+    /// Decode the already-audited search address once for an owning kernel.
+    pub(crate) fn search_entry(&self) -> SearchEntry {
+        debug_assert_eq!(self.reservation.state, MappingState::Executable);
+        debug_assert!(self.selected_end_register_literal_bytes_v2.is_none());
+        // SAFETY: `entry` was decoded and independently audited before being
+        // copied at the exact image-relative offset. It now names an immutable
+        // RX AAPCS64-v1 search function for the complete mapping lifetime.
+        SearchEntry(unsafe { mem::transmute::<*mut c_void, EntryFunction>(self.entry.as_ptr()) })
+    }
+
+    /// Decode the P1-audited four-argument entry once for an owning ABI2
+    /// publication.
+    pub(crate) fn selected_end_register_entry_v2(&self) -> SelectedEndRegisterEntryV2 {
+        debug_assert_eq!(self.reservation.state, MappingState::Executable);
+        debug_assert!(
+            self.selected_end_register_literal_bytes_v2
+                .is_some_and(|literal_bytes| literal_bytes != 0)
+        );
+        // SAFETY: the distinct P1 audit authenticated the exact ABI2 entry and
+        // prohibited the removed x4 result pointer before these bytes became
+        // immutable RX. The owning publication retains this mapping.
+        SelectedEndRegisterEntryV2(unsafe {
+            mem::transmute::<*mut c_void, SelectedEndRegisterEntryFunctionV2>(self.entry.as_ptr())
+        })
     }
 }
 
@@ -298,10 +546,10 @@ impl Drop for Reservation {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "sve-hardware-qualification"))]
 struct GuardedTestMapping(NonNull<c_void>, usize);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "sve-hardware-qualification"))]
 impl Drop for GuardedTestMapping {
     fn drop(&mut self) {
         // SAFETY: this helper solely owns the exact test reservation.
@@ -327,6 +575,21 @@ pub(crate) fn page_size() -> Result<usize, PublishError> {
     usize::try_from(result).map_err(|_| syscall_error(FailureStage::PageSize))
 }
 
+pub(crate) fn capabilities() -> Result<NativeHostCapabilities, PublishError> {
+    ensure_host_supported()?;
+    Ok(NativeHostCapabilities::new(
+        has_asimd(),
+        has_sve(),
+        has_sve2(),
+        host::sve_vector_bytes(),
+    ))
+}
+
+pub(crate) fn current_thread_sve_vector_bytes() -> Result<Option<u16>, PublishError> {
+    ensure_host_supported()?;
+    Ok(host::sve_vector_bytes())
+}
+
 pub(crate) fn has_asimd() -> bool {
     host::has_asimd()
 }
@@ -350,6 +613,8 @@ fn target_features_available(features: CpuFeatures) -> bool {
 #[derive(Clone, Copy)]
 enum PublicationSource<'a> {
     Search(&'a NativeImage),
+    EmitterAttested(&'a AuditedNativeImage),
+    SelectedEndRegisterV2(&'a AuditedSelectedEndRegisterImageV2),
     Aggregate(&'a NativeAggregateImage),
 }
 
@@ -357,6 +622,8 @@ impl<'a> PublicationSource<'a> {
     fn code(self) -> &'a [u8] {
         match self {
             Self::Search(image) => image.code(),
+            Self::EmitterAttested(image) => image.as_image().code(),
+            Self::SelectedEndRegisterV2(image) => image.code(),
             Self::Aggregate(image) => image.code(),
         }
     }
@@ -364,6 +631,8 @@ impl<'a> PublicationSource<'a> {
     fn rodata(self) -> &'a [u8] {
         match self {
             Self::Search(image) => image.rodata(),
+            Self::EmitterAttested(image) => image.as_image().rodata(),
+            Self::SelectedEndRegisterV2(image) => image.rodata(),
             Self::Aggregate(image) => image.rodata(),
         }
     }
@@ -371,6 +640,8 @@ impl<'a> PublicationSource<'a> {
     const fn backend_version(self) -> BackendVersion {
         match self {
             Self::Search(image) => image.backend_version(),
+            Self::EmitterAttested(image) => image.as_image().backend_version(),
+            Self::SelectedEndRegisterV2(image) => image.backend_version(),
             Self::Aggregate(image) => image.backend_version(),
         }
     }
@@ -378,19 +649,26 @@ impl<'a> PublicationSource<'a> {
     const fn target(self) -> TargetSpec {
         match self {
             Self::Search(image) => image.target(),
+            Self::EmitterAttested(image) => image.as_image().target(),
+            Self::SelectedEndRegisterV2(image) => image.target(),
             Self::Aggregate(image) => image.target(),
         }
     }
 
-    const fn contract(self) -> (OutputKind, Option<AggregateMappingContract>) {
+    const fn contract(self) -> (OutputKind, Option<AggregateMappingContract>, Option<u32>) {
         match self {
-            Self::Search(image) => (image.output(), None),
+            Self::Search(image) => (image.output(), None, None),
+            Self::EmitterAttested(image) => (image.as_image().output(), None, None),
+            Self::SelectedEndRegisterV2(image) => {
+                (image.output(), None, Some(image.literal_bytes()))
+            }
             Self::Aggregate(image) => (
                 OutputKind::Span,
                 Some(AggregateMappingContract {
                     output: image.output(),
                     literal_bytes: image.literal_bytes(),
                 }),
+                None,
             ),
         }
     }
@@ -398,6 +676,10 @@ impl<'a> PublicationSource<'a> {
     fn reaudit(self) -> Result<(), PublishError> {
         match self {
             Self::Search(image) => audit(image).map(|_| ()).map_err(PublishError::ImageAudit),
+            Self::EmitterAttested(_) => Ok(()),
+            Self::SelectedEndRegisterV2(image) => audit_selected_end_register_v2(image)
+                .map(|_| ())
+                .map_err(PublishError::ImageAudit),
             Self::Aggregate(image) => audit_aggregate(image)
                 .map(|_| ())
                 .map_err(PublishError::ImageAudit),
@@ -409,9 +691,51 @@ pub(crate) fn publish(
     image: &NativeImage,
     plan: PublicationPlan,
     identity: RuntimeIdentity,
+    sve_vector_bytes_at_publication: Option<u16>,
     failure: FailureInjection,
 ) -> Result<ExecutableMapping, PublishError> {
-    publish_source(PublicationSource::Search(image), plan, identity, failure)
+    publish_source(
+        PublicationSource::Search(image),
+        plan,
+        identity,
+        sve_vector_bytes_at_publication,
+        failure,
+    )
+}
+
+pub(crate) fn publish_audited(
+    audited: &AuditedNativeImage,
+    plan: PublicationPlan,
+    identity: RuntimeIdentity,
+    sve_vector_bytes_at_publication: Option<u16>,
+    failure: FailureInjection,
+) -> Result<ExecutableMapping, PublishError> {
+    publish_source(
+        PublicationSource::EmitterAttested(audited),
+        plan,
+        identity,
+        sve_vector_bytes_at_publication,
+        failure,
+    )
+}
+
+pub(crate) fn publish_selected_end_register_v2(
+    image: &AuditedSelectedEndRegisterImageV2,
+    plan: PublicationPlan,
+    identity: RuntimeIdentity,
+    literal_bytes: u32,
+    failure: FailureInjection,
+) -> Result<ExecutableMapping, PublishError> {
+    if literal_bytes == 0 || literal_bytes != image.literal_bytes() {
+        return Err(PublishError::PublicationIdentityMismatch);
+    }
+    publish_source(
+        PublicationSource::SelectedEndRegisterV2(image),
+        plan,
+        identity,
+        None,
+        failure,
+    )
 }
 
 pub(crate) fn publish_aggregate(
@@ -420,13 +744,20 @@ pub(crate) fn publish_aggregate(
     identity: RuntimeIdentity,
     failure: FailureInjection,
 ) -> Result<ExecutableMapping, PublishError> {
-    publish_source(PublicationSource::Aggregate(image), plan, identity, failure)
+    publish_source(
+        PublicationSource::Aggregate(image),
+        plan,
+        identity,
+        None,
+        failure,
+    )
 }
 
 fn publish_source(
     image: PublicationSource<'_>,
     plan: PublicationPlan,
     identity: RuntimeIdentity,
+    sve_vector_bytes_at_publication: Option<u16>,
     failure: FailureInjection,
 ) -> Result<ExecutableMapping, PublishError> {
     inject(failure, FailureStage::Reserve)?;
@@ -542,15 +873,17 @@ fn publish_source(
     // decoded instruction. Pointer creation itself does not execute code.
     let entry_ptr = unsafe { reservation.payload.as_ptr().add(plan.entry_offset) };
     let entry = NonNull::new(entry_ptr.cast()).ok_or(PublishError::PublicationIdentityMismatch)?;
-    let (output, aggregate) = image.contract();
+    let (output, aggregate, selected_end_register_literal_bytes_v2) = image.contract();
     Ok(ExecutableMapping {
         reservation,
         entry,
         identity,
         output,
         aggregate,
+        selected_end_register_literal_bytes_v2,
         backend_version: image.backend_version(),
         target: image.target(),
+        sve_vector_bytes_at_publication,
     })
 }
 
@@ -700,7 +1033,7 @@ fn query_protection(pointer: usize) -> Result<i32, PublishError> {
     host::query_protection(pointer)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "sve-hardware-qualification"))]
 pub(crate) fn with_guarded_haystack<T>(
     bytes: &[u8],
     at_right_boundary: bool,

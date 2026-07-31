@@ -1,0 +1,391 @@
+{
+  "schema": "fre.aot.search-tag30-qualification-campaign-contract.v1",
+  "result_blind": true,
+  "rebar_inputs": [],
+  "result_derived_selection": false,
+  "result_derived_exclusions": false,
+  "backend": {
+    "tag": 30,
+    "name": "AsimdV17",
+    "version": "SEARCH_V17",
+    "candidate_policy": 15,
+    "family_selector": 13,
+    "portable_prefix_candidate_starts": 256,
+    "aot_magic_hex": "465245413634001e",
+    "llvm": false
+  },
+  "prepared_inputs": {
+    "preparer": {
+      "path": "research/aot/search-tag30-qualification-runner/prepare_inputs.py"
+    },
+    "source_authority": {
+      "learned_freeze_sha256": "367ad3655ec2f70d4a8173f68df76013fdf32dd95e07d1ebeeedb14c580b817f",
+      "learned_generator_sha256": "63a32488f9ac108bcc6cc5b245c4bbaea59056703787c3f40244e7b62e0b203e",
+      "long_policy_freeze_sha256": "70123d2c2068d9260d3a8d3face867bc01f42dbd91e82a686bf06af11b0babbb",
+      "long_policy_derivation_sha256": "b8690387a15655da415466943ff93726b828146e7c849266aa35907203b03671",
+      "selector_contract_sha256": "38ca5ebc1b239b541afcf9eeb679bf8b156c8690e7422a96f69a9457a155daf0"
+    },
+    "candidate_domain_hex": "4652452d5345415243482d54414733302d5155414c494649434154494f4e2d43414e4449444154450001",
+    "source_construction": "canonical-byte-escaped-exact",
+    "object_candidates": {
+      "schema": "fre.aot.search-tag30-qualification-object-candidates.v1",
+      "file_sha256": "2ba3659c13c0d40da9716bcace03a6e5fd8514bf9932b99f51116da57b1d308b",
+      "payload_sha256": "7363999204f52f66ae93f0c8087fba071e2fbd51eadf84f2e08e45eec06da54e",
+      "candidate_count": 808
+    },
+    "literal_dispositions": {
+      "schema": "fre.aot.search-tag30-qualification-literal-dispositions.v1",
+      "file_sha256": "a2f2c15e38b21ab664117c2da3011a8059b7e8bf807b9f6fbc00c34ff1c6dcd1",
+      "payload_sha256": "abf60247a4a735435ac53be7c614691ae41563dbaf845f6ddb5e8e21e90fcbd0",
+      "literal_count": 922,
+      "eligible_literal_count": 808,
+      "ineligible_literal_count": 114
+    }
+  },
+  "private_family_authority": {
+    "state": "two-stage-source-promotion-required-before-sealed-execution",
+    "stage_one": "unsealed object-only discovery on both targets; execution forbidden",
+    "stage_two": "render and commit exact target-conditional selector-13 private family rows, then render sealed identities and rebuild",
+    "source_atom": "crates/fre-aot-static-runtime/src/search_support/private_rows.rs",
+    "family_selector": 13,
+    "minimum_literal_bytes": 6,
+    "maximum_literal_bytes": 32,
+    "minimum_window_bytes": 65536,
+    "portable_prefix_candidate_starts": 256,
+    "plan_identity": "exact campaign-contract file SHA-256",
+    "analyzer_identity": "exact analyzer source file SHA-256",
+    "discovery_authorization": {
+      "schema": "fre.aot.search-tag30-qualification-discovery-authorization.v1",
+      "payload_sha256_rule": "sha256 of compact canonical JSON payload bytes with sorted object keys, ASCII escaping, and no trailing newline",
+      "decision": {
+        "private_projection": true,
+        "production_projection": false,
+        "pre_result_intent": true,
+        "analyzer_not_deployment_authority": true,
+        "targets_one_class": true,
+        "rebar_permitted": false,
+        "result_derived_exclusions": false
+      },
+      "qualification": {
+        "required_fragment_count": 128,
+        "required_strata": [
+          "universal-individual-cell",
+          "universal-width-topology",
+          "universal-width",
+          "universal-topology",
+          "universal-learned-source-kind",
+          "universal-learned-source-relation",
+          "universal-combined-host-conjunction",
+          "long-policy-overall",
+          "long-policy-width",
+          "long-policy-topology",
+          "long-policy-window",
+          "long-policy-outcome",
+          "long-policy-learned-source-kind",
+          "long-policy-individual-cell",
+          "long-policy-strict-pair-win-fraction"
+        ],
+        "long_policy_gate_scope": "each exact complete 1458-cell host projection independently"
+      }
+    },
+    "evidence_identity": {
+      "algorithm": "sha256",
+      "domain_hex": "4652452d5345415243482d54414733302d5052452d524553554c542d43414d504149474e2d494e54454e540001",
+      "raw_digest_order": [
+        "domain_bytes",
+        "campaign_contract_sha256",
+        "analyzer_source_sha256",
+        "discovery_authorization_file_sha256"
+      ]
+    },
+    "production_authority": false
+  },
+  "hosts": [
+    {
+      "id": "local-apple-aarch64-asimd",
+      "target_os": "macos",
+      "target_arch": "aarch64",
+      "asimd": true
+    },
+    {
+      "id": "zstd-eval-c9g-neoverse-v3-aarch64-asimd",
+      "target_os": "linux",
+      "target_arch": "aarch64",
+      "asimd": true
+    }
+  ],
+  "sharding": {
+    "shards": 16,
+    "concurrent_workers": 16,
+    "host_worker_contract": {
+      "macos": 6,
+      "macos_worker_labels": [12, 13, 14, 15, 16, 17],
+      "linux_min": 8,
+      "linux_max": 16
+    },
+    "ordinal_interval": "zero-based-half-open",
+    "assignment": "one immutable fragment per exact interval",
+    "pair_placement": "all six timing pairs remain in one row-worker process; both variants calibrate through at least 50000000 ns and retain three same-iteration, same-semantic-checksum anchor samples, selecting the fastest observed anchor rate for a 600000000 ns target; Linux variants remain on the requested CPU and accepted macOS variants remain in the authenticated Super CPU class",
+    "cpu_residence": {
+      "linux": "hard sched_setaffinity binding plus CPU-before/after samples for every measured variant",
+      "macos": {
+        "machine_model": "Mac17,7",
+        "chip": "Apple M5 Max",
+        "performance_levels": [
+          {
+            "index": 0,
+            "name": "Super",
+            "physical_cpus": 6,
+            "logical_cpus": 6,
+            "cpus_per_l2": 6,
+            "l1_data_cache_bytes": 131072,
+            "l2_cache_bytes": 16777216,
+            "logical_cpu_ids": [12, 13, 14, 15, 16, 17]
+          },
+          {
+            "index": 1,
+            "name": "Performance",
+            "physical_cpus": 12,
+            "logical_cpus": 12,
+            "cpus_per_l2": 6,
+            "l1_data_cache_bytes": 65536,
+            "l2_cache_bytes": 8388608,
+            "logical_cpu_ids": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+          }
+        ],
+        "mapping_authority": "ioreg cluster-type and logical-cluster inventory plus exact sysctl performance-level tuple",
+        "qos_class": 33,
+        "qos_name": "QOS_CLASS_USER_INTERACTIVE",
+        "qos_relative_priority": 0,
+        "thread_affinity_policy_statuses": [0, 46],
+        "hard_binding_claimed": false,
+        "accepted_cpu_class": "Super",
+        "accepted_cpu_ids": [12, 13, 14, 15, 16, 17],
+        "super_class_wait_timeout_ns": 5000000000,
+        "super_class_wait_poll": "yield-now",
+        "maximum_cpu_only_retries_per_variant": 64,
+        "retry_rule": "discard and retry the same variant solely when either CPU endpoint is outside the Super set; elapsed time is never consulted for retry",
+        "attempt_receipt": "record every discarded and accepted CPU-before/after endpoint plus the exact retry count for calibration pilots and formal timed variants"
+      },
+      "migration": {
+        "linux": "reject the shard",
+        "macos": "accept only a Super-to-Super variant; discard by CPU endpoints alone and retry within the frozen bound"
+      }
+    },
+    "correctness_ranges": [
+      [0, 7714],
+      [7714, 15428],
+      [15428, 23142],
+      [23142, 30856],
+      [30856, 38570],
+      [38570, 46284],
+      [46284, 53998],
+      [53998, 61712],
+      [61712, 69426],
+      [69426, 77140],
+      [77140, 84854],
+      [84854, 92568],
+      [92568, 100282],
+      [100282, 107996],
+      [107996, 115710],
+      [115710, 123424]
+    ],
+    "universal_timing_ranges": [
+      [0, 193],
+      [193, 386],
+      [386, 579],
+      [579, 772],
+      [772, 965],
+      [965, 1158],
+      [1158, 1350],
+      [1350, 1542],
+      [1542, 1734],
+      [1734, 1926],
+      [1926, 2118],
+      [2118, 2310],
+      [2310, 2502],
+      [2502, 2694],
+      [2694, 2886],
+      [2886, 3078]
+    ],
+    "long_policy_timing_ranges": [
+      [0, 92],
+      [92, 184],
+      [184, 275],
+      [275, 366],
+      [366, 457],
+      [457, 548],
+      [548, 639],
+      [639, 730],
+      [730, 821],
+      [821, 912],
+      [912, 1003],
+      [1003, 1094],
+      [1094, 1185],
+      [1185, 1276],
+      [1276, 1367],
+      [1367, 1458]
+    ],
+    "diagnostic_timing_ranges": [
+      [0, 2],
+      [2, 4],
+      [4, 6],
+      [6, 8],
+      [8, 10],
+      [10, 12],
+      [12, 14],
+      [14, 16],
+      [16, 18],
+      [18, 20],
+      [20, 22],
+      [22, 24],
+      [24, 26],
+      [26, 28],
+      [28, 29],
+      [29, 30]
+    ]
+  },
+  "projections": {
+    "universal": {
+      "schema": "fre.aot.search-tag30-learned-continuation-projection.v1",
+      "digest_domain_hex": "4652452d5345415243482d54414732392d544f504f4c4f47592d50524f4a454354494f4e0001",
+      "full_rows": 123424,
+      "full_sha256": "0326944c2c95dfd10740d2ea0a72c910dd1a03df8c16e3a2180391d069841480",
+      "timed_rows": 3078,
+      "timed_sha256": "a92a59554188a82b6e7c49833dda599aa7d87014ae6815ba9fbe0f5502b31a4c",
+      "correctness_static_rows": 49248,
+      "correctness_portable_rows": 74176,
+      "timing_role": "complete immutable mechanism prerequisite with the frozen 4093-byte direct-mechanism floor; every frozen universal gate remains mandatory, while direct V17 candidate measurements grant no production-policy authority"
+    },
+    "long-policy": {
+      "schema": "fre.aot.search-tag30-long-input-policy-projection.v1",
+      "digest_domain_hex": "4652452d5345415243482d54414733302d4c4f4e472d494e5055542d504f4c4943592d50524f4a454354494f4e0001",
+      "full_rows": 123424,
+      "full_sha256": "c912b402244ff9814fe6160f9f5a117d7b253af5ff35ee69a78a6250aae94561",
+      "timed_rows": 1458,
+      "timed_sha256": "b3093f9fed70fd500852742d18994fce80d4a144cb9b9cbaac4ad0e7f84ccffd",
+      "correctness_static_rows": 23328,
+      "correctness_portable_rows": 100096,
+      "production_input_floor_bytes": 65536,
+      "timing_role": "complete production-policy authority input"
+    },
+    "diagnostic": {
+      "source_projection": "long-policy timed projection",
+      "source_rows": 1458,
+      "source_sha256": "b3093f9fed70fd500852742d18994fce80d4a144cb9b9cbaac4ad0e7f84ccffd",
+      "cells": 30,
+      "source_ordinals": [
+        0,
+        11,
+        14,
+        33,
+        73,
+        119,
+        192,
+        256,
+        315,
+        324,
+        378,
+        432,
+        486,
+        540,
+        594,
+        648,
+        702,
+        756,
+        810,
+        864,
+        918,
+        972,
+        1026,
+        1080,
+        1134,
+        1188,
+        1242,
+        1296,
+        1350,
+        1404
+      ],
+      "source_row_sha256s": [
+        "84d1523421f63d6f4b9c50d26f2a870d99b25dfc80b97282c812533da0234305",
+        "3316237484fb1fb4e514eb08d1c6e6a0f2934833409c9444961070b07b3ed23c",
+        "4b9c597da401300566c9477fca579d53ace9189cbd38a0ab127d403d489c5b0f",
+        "a6cb1550ed0c9a258a94c8f60502fa25664d3be5a250c804d313c214cda57dc1",
+        "722a3b09d53df16ae416ff7b9b0213e1a7e17921882b7a32157edffda4170bf8",
+        "dd1b71df17581aeb8d14b19e8550d9b3e9db0bd8abe962844abf4d1f3b92f999",
+        "4d7ef983ab129f2215aa7c985f3e549758b9c6f3e48ffd960d8be6b5b81a47ad",
+        "d62428276a0921ace3dbaad6afeeb995389dc899b577de5f41a9c1d0f7f57e37",
+        "fa4914a001a5e53fe8370f68e972c9a0fcdf1fa92c644c6417d9e785a24ffdb3",
+        "52f30e26f2c7277653ca63f05774916564ffef6eaf5bf39f35468aa67eadc312",
+        "257cf9e281c54cb67bb7db4c7a5aca0e3e444ea6b2c28a801c22a3f4c6fec4eb",
+        "26d9af5eb75d133b6e13f046cbbcecc598d66cefe373753b0044a11c6906979a",
+        "fff3cb95b41112e2c490868576adca5dd2db464e77430af00e1a6b9bc7ffc4e4",
+        "a264216b1b2943f7c2175fbba5ca1d84d2ccdc67e6e72248027c1b14c2268dae",
+        "05bfb296646e855b0f6ebda633afd7144eaeb4a69328e0c47eae6636e2bebb09",
+        "1e707edbf5b571f887e6e679aadff32ea4676871287c2cb13e44f1f267a572a0",
+        "8fd0625aed261660c69140bdc02237f24ec745bc500bd424e49bfbe1ec3dcd71",
+        "6a43c4825c17384bbe8242ef9d0e0a8911c14b916700d8f60868361ec5c47da0",
+        "1a63ef33ad62ac9e17ed4e21b37ed22bfef425975c11888ed600fa8058d57ad6",
+        "29361a9093d463f21b74ed3c883b87526e785ce90ac73c03092b81db844af31d",
+        "53f5d8911612336f2f6c7d49b071e755fb7ef23e4d5b597154c8813960071063",
+        "a6f54d230662adccd245cec6b93e2cf05be1b2e9dfec56a2c296be868a7b654c",
+        "14304796d0fea001b98667b3a5589b4c1478861b7bd30953ecb3dcbea8bcf163",
+        "0eabb3f09365d2b8c4ffb4e53a9900fb7bcf2558c224a0c9fa9b885d2d5ae824",
+        "9a8dbbe3a60f8a541c077d6f9c0c6e965be31d366a8978a60f74a29c4b1cb9f0",
+        "16b2a4ece1784097bd27363f9e06bca0acb6f3c332f1e4b706b95ed9671cea9b",
+        "86ff8bc8cdd8d7424f032fa47700514b716203ce046a1b5448422ab4012bf664",
+        "6b623d268cd97c2b022f13ceed65ac72cacb307f4eebce299e40225016dd1279",
+        "43a6e170e030a028a989daecb8a4d1d72a9dd3bf8bc0dc063a5113ac1d570507",
+        "7894069f2d0e8ab57a32de9136456153f01bbba95aba490a281426d6da0dd0b0"
+      ],
+      "coverage": {
+        "every_width": true,
+        "every_topology": true,
+        "every_window": true,
+        "every_outcome": true,
+        "every_learned_source_kind": true,
+        "both_mapping_kinds": true
+      },
+      "result_derived": false,
+      "promotion_use": "forbidden"
+    }
+  },
+  "universal_gates": {
+    "correctness": "every full-projection row on each host before any timing result is consumed",
+    "timing_repetitions": 6,
+    "minimum_elapsed_ns_each_variant": 400000000,
+    "cell_ratio": "median of the six exact candidate_elapsed_ns/portable_elapsed_ns rational ratios; for six values median=(sorted[2]+sorted[3])/2",
+    "individual_cell_exclusive_maximum": 0.8,
+    "aggregate_strata": [
+      "every width-topology cell",
+      "every width",
+      "every topology",
+      "every learned-source kind",
+      "every learned-source relation",
+      "each host independently",
+      "combined hosts"
+    ],
+    "aggregate_semantics": "conjunction of member cell gates; no pooled or aggregate rescue",
+    "one_failure_rejects_whole_class": true,
+    "production_policy_authority": false,
+    "result_derived_exclusions": false
+  },
+  "long_policy_gates": {
+    "correctness": "every full-projection row on each host before any timing result is consumed",
+    "timing_repetitions": 6,
+    "minimum_elapsed_ns_each_variant": 400000000,
+    "cell_ratio": "median of the six exact candidate_elapsed_ns/portable_elapsed_ns rational ratios; for six values median=(sorted[2]+sorted[3])/2",
+    "aggregate_candidate_over_portable_exclusive_maximum": 0.8,
+    "each_width_geomean_exclusive_maximum": 0.8,
+    "each_topology_geomean_exclusive_maximum": 0.8,
+    "each_window_geomean_exclusive_maximum": 0.8,
+    "each_outcome_geomean_exclusive_maximum": 0.8,
+    "each_learned_source_kind_geomean_exclusive_maximum": 0.8,
+    "individual_cell_inclusive_maximum": 1.05,
+    "strict_pair_win": "one paired repetition whose candidate_elapsed_ns is strictly less than its portable_elapsed_ns",
+    "strict_pair_win_fraction_minimum": 0.8,
+    "strict_pair_win_fraction_scope": "all 1458 cells times six pairs, separately for each complete host projection",
+    "one_failure_rejects_whole_class": true,
+    "result_derived_exclusions": false
+  }
+}

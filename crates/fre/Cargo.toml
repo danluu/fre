@@ -8,7 +8,31 @@ license.workspace = true
 publish = false
 
 [features]
-default = []
+default = ["qualified-exact-search-jit"]
+qualified-exact-search-jit = [
+    "dep:fre-jit-aarch64",
+    "dep:fre-jit-cache",
+    "dep:fre-jit-runtime",
+]
+explicit-search-span-aot = ["dep:fre-aot-static-runtime"]
+compiled-search-v25-aot = [
+    "explicit-search-span-aot",
+    "dep:fre-aot-search-contract",
+    "fre-aot-static-runtime/linked-search-v25-production-v1",
+]
+compiled-search-v26-aot = [
+    "explicit-search-span-aot",
+    "dep:fre-aot-search-contract",
+    "fre-aot-static-runtime/linked-search-v26-production-v1",
+]
+explicit-count-v3-aot = [
+    "dep:fre-aot-static-runtime",
+    "fre-aot-static-runtime/linked-count-v3",
+]
+count-v3-aot-qualification-private = [
+    "explicit-count-v3-aot",
+    "fre-aot-static-runtime/count-v3-qualification-private",
+]
 static-dispatch = [
     "fre-automata/static-dispatch",
     "fre-kernels/static-dispatch",
@@ -21,22 +45,30 @@ static-dispatch-arm-41-d84 = [
 
 [dependencies]
 fre-aggregate = { path = "../fre-aggregate" }
+fre-aot-static-runtime = { path = "../fre-aot-static-runtime", optional = true, default-features = false }
+fre-aot-search-contract = { path = "../fre-aot-search-contract", optional = true }
 fre-automata = { path = "../fre-automata" }
 fre-capture-lab = { path = "../fre-capture-lab" }
 fre-exact-alloc = { path = "../fre-exact-alloc" }
-fre-jit-aarch64 = { path = "../fre-jit-aarch64" }
-fre-jit-runtime = { path = "../fre-jit-runtime" }
+fre-jit-aarch64 = { path = "../fre-jit-aarch64", optional = true }
+fre-jit-cache = { path = "../fre-jit-cache", optional = true }
+fre-jit-runtime = { path = "../fre-jit-runtime", optional = true }
 fre-kernel-ir = { path = "../fre-kernel-ir" }
 fre-kernels = { path = "../fre-kernels" }
 fre-lower = { path = "../fre-lower" }
 fre-syntax = { path = "../fre-syntax" }
 memchr = "=2.8.3"
 regex-syntax = { version = "=0.8.11", default-features = false, features = ["std", "unicode"] }
+sha2 = "=0.10.9"
 
 [dev-dependencies]
 regex = { version = "=1.12.4", features = ["logging", "perf-dfa-full"] }
 regex-automata = "=0.4.14"
 stats_alloc = "=0.1.10"
+
+[[test]]
+name = "qualified_exact_search"
+required-features = ["qualified-exact-search-jit"]
 
 [[bench]]
 name = "portable_baseline"

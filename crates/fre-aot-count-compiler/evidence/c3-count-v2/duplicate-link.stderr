@@ -1,0 +1,11 @@
+duplicate symbol '_fre_aot_count_payload_v2_54e0fe61df0a7a21135580e950940cf1bb9917f7f209ed74a12e6728cb4b36a9' in:
+    ./implementation.o
+    ./implementation.o
+duplicate symbol '_fre_aot_count_entry_v2_54e0fe61df0a7a21135580e950940cf1bb9917f7f209ed74a12e6728cb4b36a9' in:
+    ./implementation.o
+    ./implementation.o
+duplicate symbol '_fre_aot_count_metadata_v2_54e0fe61df0a7a21135580e950940cf1bb9917f7f209ed74a12e6728cb4b36a9' in:
+    ./implementation.o
+    ./implementation.o
+ld: 3 duplicate symbols
+clang: error: linker command failed with exit code 1 (use -v to see invocation)

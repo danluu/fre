@@ -115,6 +115,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 mod canonical_case_fold;
+pub mod optimizing_count_v3;
 pub mod p128_forced_priority;
 pub mod p128_forced_registry;
 pub mod p128_foundation;

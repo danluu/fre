@@ -74,6 +74,13 @@ an open P0 row.
   confirmation tiers, typed relocations, deterministic AOT, independent audit,
   and 276,309 bounded scalar/SSE external instruction executions. AVX2 actual
   execution remains explicitly open.
+- [x] `fre-aot-compiler`: source-authenticated custom direct-machine-code
+  emission into deterministic Mach-O or ELF objects, with typed
+  source/KIR/native/object receipts and no LLVM regex-codegen dependency. The
+  Linux `SelectedEnd` P2b slice packages the same sealed tag-21 ABI2 image as
+  JIT, adds exact hidden direct-call glue/declarations/receipts, and has no
+  function-pointer API, `x4` result pointer, or result slot. Compiler output
+  remains inert: runtime authority and post-link observation are absent.
 - [x] `fre-aggregate`: production capture-free zero/progress compilation for
   arbitrary nested finite/open repetition, forced full-table and reverse-row
   whole-operation strategies, exact resource accounting, and 242,910 complete
@@ -85,15 +92,28 @@ an open P0 row.
   greediness in executable identity, charge at most `N+1` run transitions,
   use zero dynamic scratch, and preserve forced continuation and neighboring
   routes.
-- [x] `fre-jit-runtime`: audited macOS/AArch64 strict-W^X publication with
-  inaccessible guards, copy verification, rollback and concurrent-lifetime
-  tests, plus 663,084 actual-hardware/oracle comparisons. The explicit
-  16-byte `QualifiedExactSearch` large-window/reuse leaf is performance
-  qualified; default planner selection and every broader shape remain open.
+- [x] `fre-jit-runtime`: strict-W^X AArch64 publication now has a separate
+  `SelectedEnd` register-return ABI2 type used by the qualified facade for V8
+  plus SVE tag 19 and SVE2 tag 21. Publication exposes no direct call;
+  invocation is session-only. V8 opens a session without an SVE syscall, while
+  Linux facade tags 19 and 21 observe the calling thread's SVE vector length
+  once at session creation and require VL16. Versioned low-level Search-v1
+  APIs remain separate research/compatibility contracts. The explicit
+  16-byte `QualifiedExactSearch` large-window/reuse leaf remains a Candidate:
+  all four current qualification atoms are `Candidate`, legacy V7 is hard
+  `Candidate`, and no current Search JIT leaf is performance-qualified. The
+  tag-19 ABI2 correctness producer, V5 fresh-process public-facade campaign,
+  and composed-only verifier are implemented source but have no retained run
+  under the current admission fence.
 - [x] `fre-jit-cache`: bounded typed single-flight publication, deterministic
   eviction, exact live mapping/code/data accounting across leases, forced
-  retirement-race recovery, and O(1) allocation-free image identity access;
-  36 focused emitter/runtime/cache tests pass on host AArch64.
+  retirement-race recovery, and O(1) allocation-free image identity access.
+  The ABI2 cache now owns the complete pre-emission compile request and the
+  default-policy qualified facade retains its lease after all eligibility,
+  authority, and host gates. Repeated plan-bound sessions do not touch cache
+  state. The previous host-AArch64 checkpoint passed 36 focused
+  emitter/runtime/cache tests; the current cache/facade composition is
+  source-audited but remains unbuilt under the admission fence.
 - [x] `fre-capi`: versioned C11 records/symbols and a move-only nonthrowing
   C++17 wrapper for the current Rust-bytes single-search subset. Nine Rust
   tests plus debug/release exact-symbol and C/C++ compile/link/run smokes pass;
@@ -134,11 +154,24 @@ exposes typed exists, selected-end, span, and windowed operations. The standalon
 reducers without repeated suffix searches; count and span-sum are exposed by
 operation-typed facade plans and the exact Rebar semantic adapter. General
 match-sequence exposure remains separate. Pattern-specialized AArch64 code can
-be published and executed under a strict audited W^X lifecycle, but is not yet
-a facade planner choice. There is still no capture API, general Unicode execution,
-production AOT loader, or compatibility-qualified embedding surface. A small
-implemented C11/C++17 surface exists for the current portable subset and
-reports `UPSTREAM_ORACLE_PENDING` in every plan record.
+be published under a strict audited W^X lifecycle through the explicit
+qualified-search API, but every facade V8/tag-19/tag-21 ABI2 call requires a
+same-thread session and no default portable facade selects it. The qualified
+facade uses the distinct plan-bound ABI2 JIT session: literal identity is
+proved once at session construction and each successful preflighted hot call
+checks only that its certificate came from the same plan before native
+invocation. There is still no capture API, general Unicode execution, qualified
+`SelectedEnd` AOT authority, or compatibility-qualified embedding surface. The
+P2b source-first AOT compiler and deterministic object/glue/receipt bundle now
+feed a default-off qualification-private ABI2 consumer. Its generated nominal
+session owns a consumed same-thread VL16 token, borrows the external portable
+plan, stores no callable address, and retains authority `Absent`. The
+three-engine source exposes an exact hidden consumer hot-loop symbol and
+authenticates the generated binding/receipt, but no build or post-link
+observation has run. The retained Search V1 adopter/default-off binding is a
+different ABI and cannot authorize P2b. A small implemented C11/C++17 surface
+exists for the current portable subset and reports `UPSTREAM_ORACLE_PENDING`
+in every plan record.
 
 Seven-process diagnostic medians put exact literals and packed literal
 alternation at parity within noise; the retained literal-set DFA cross-check is
@@ -241,20 +274,47 @@ All 107 reference-relative losses are retained. Repeated naive confirmation
 remains capped at 32 bytes; larger shapes require a proved-linear Two-Way or
 automaton plan.
 
-Search V7 now has one deliberately narrow promotion. Exact Q commit
-`88e9c22c4ac382531bc1026ca0e25587905f5206` passed a fresh complete 90-cell
-main run, the 54-cell alternating adversarial run, the targeted 30-process
-retry, frozen semantic replay, and independent execution/evidence review.
-All 60 facade gates beat the portable kernel, with maximum ratio
-`0.939701493`; all 18 adversarial gates passed at maximum `0.152542373`, and
-the targeted gate passed at `0.971576447`. The direct-child promotion binds
+Historical Search V7 evidence from exact Q commit
+`88e9c22c4ac382531bc1026ca0e25587905f5206` retained a complete 90-cell main
+run, the 54-cell alternating adversarial run, the targeted 30-process retry,
+frozen semantic replay, and independent execution/evidence review. That
+historical source recorded 60/60 facade gates below the portable kernel
+(maximum ratio `0.939701493`), all 18 adversarial gates at maximum
+`0.152542373`, and the targeted gate at `0.971576447`. Its direct child bound
 external canonical bundle SHA-256
-`de084ff0564acdb89889f28b9dcfddce9b6f0955a1b2aead30d75770039e0453`
-and changes only the isolated qualification atom in production source. This
-authorizes only explicit 16-byte searches declaring at least 1,024 calls over
-64 KiB windows or at least 64 calls over 1 MiB windows. It does not select a
-default route or qualify class-plus-suffix, Sherlock/aggregate, other widths,
-x86-64, or AOT.
+`de084ff0564acdb89889f28b9dcfddce9b6f0955a1b2aead30d75770039e0453`.
+Those results and that historical atom are non-authoritative for this composed
+tree: legacy V7 is hard `Candidate`, all four current qualification atoms are
+`Candidate`, and no Search JIT execution or speed promotion is current.
+
+The current native tracks remain direct machine code, not LLVM regex
+compilation. FRE's typed KIR and custom AArch64 emitters produce the regex
+payloads; LLVM may only support `rustc`/host tooling, and the system linker can
+only package already-emitted bytes. The qualified facade routes V8 plus SVE
+tag 19 and SVE2 tag 21 through the `SelectedEnd` register-return ABI2 in JIT;
+the versioned low-level Search-v1 APIs remain separate, and tag-21 P2b AOT
+retains the same sealed ABI2 image in a deterministic
+ELF/direct-hidden-glue bundle. The qualified JIT facade binds each callable
+session once to the exact portable literal plan, so a successful preflighted
+hot call uses only plan identity before native invocation. Default-policy
+ABI2 construction now retains a lease from a bounded process-local
+pre-emission cache; cache lookup happens only after every eligibility,
+authority, ABI, and host gate, and never in the hot session. Custom publication
+limits retain direct mapping ownership. P2b still has
+`RuntimeAuthority::Absent`, no completed post-link observation, and no
+production authority row. Its default-off qualification-private consumer owns
+a consumed same-thread token inside the generated nominal binding without
+storing a callable address; it is not a production adopter or authority.
+
+The public JIT bakeoff source has moved to 48-column V3 session/value-call
+rows. Its evidence verifier now requires an external ABI2 artifact witness and
+binds the V8 policy, target, ABI, and no-VL facts instead of trusting a
+self-consistent row rewrite. No V3 execution result is claimed here. The
+checked-in three-engine harness now includes the exact P2b
+AOT/JIT/portable binding and an independently named consumer hot loop, but
+it remains deferred until that call is built and observed after link. No
+current correctness, lifecycle, benchmark, AOT promotion, or speed claim
+follows from this source checkpoint.
 
 ## Non-negotiable gates
 

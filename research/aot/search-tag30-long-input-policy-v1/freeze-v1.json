@@ -1,0 +1,101 @@
+{
+  "schema": "fre.aot.search-tag30-long-input-policy-freeze.v1",
+  "payload_sha256": "d6779be1b1e6694709339e48ee589c11cb4b436f831662011f3d9f9556bba0d9",
+  "payload": {
+    "status": {
+      "frozen_before_tag30_results": true,
+      "tag30_timing_results_observed": false,
+      "production_authority_granted": false,
+      "result_derived_exclusions": false
+    },
+    "derivation": {
+      "path": "research/aot/search-tag30-long-input-policy-v1/derive_projection.py",
+      "sha256": "b8690387a15655da415466943ff93726b828146e7c849266aa35907203b03671",
+      "parent_freeze_sha256": "367ad3655ec2f70d4a8173f68df76013fdf32dd95e07d1ebeeedb14c580b817f",
+      "parent_generator_sha256": "63a32488f9ac108bcc6cc5b245c4bbaea59056703787c3f40244e7b62e0b203e",
+      "expected_summary_sha256": "985fa9ddebe98a0470ea8e7fa71e4cae9c671654069274a6d6876a5e22671b4e"
+    },
+    "policy": {
+      "backend_tag": 30,
+      "backend_name": "AsimdV17",
+      "production_input_floor_bytes": 65536,
+      "floor_rationale": "workload-independent sixteen-4KiB-page native-call amortization boundary shared with Count AOT",
+      "pattern_class": "every phase-unique-selector-eligible exact byte literal of width 6 through 32",
+      "below_floor_route": "portable-only",
+      "admitted_route": "tag30-static-tail",
+      "rebar_effect": "none",
+      "llvm_codegen": false
+    },
+    "full_projection": {
+      "rows": 123424,
+      "sha256": "c912b402244ff9814fe6160f9f5a117d7b253af5ff35ee69a78a6250aae94561",
+      "portable_only_rows": 100096,
+      "tag30_static_tail_rows": 23328
+    },
+    "timed_projection": {
+      "rows": 1458,
+      "sha256": "b3093f9fed70fd500852742d18994fce80d4a144cb9b9cbaac4ad0e7f84ccffd",
+      "unique_literals": 808,
+      "unique_literal_set_sha256": "187a297e4b67448343ae5104c1ee4fdcc6096b72f4e39a5d58d51efa4c7cd3c0",
+      "eligible_widths": {
+        "minimum": 6,
+        "maximum": 32,
+        "count": 27,
+        "rows_each": 54
+      },
+      "eligible_topologies": 6,
+      "rows_each_topology": 243,
+      "mutation_classes": [
+        5,
+        6,
+        7,
+        8,
+        9,
+        13,
+        14,
+        17,
+        18
+      ],
+      "window_bytes": [
+        65536,
+        131072,
+        262144,
+        524288,
+        1048576
+      ],
+      "all_literal_phases": true,
+      "all_selector_primary_offset_classes": true,
+      "all_logical_and_physical_mod16_alignments": true,
+      "both_guarded_and_padded_mappings": true,
+      "both_absent_and_tail_hit_outcomes": true,
+      "all_learned_source_kinds": true
+    },
+    "gates": {
+      "hosts": [
+        "local-apple-aarch64-asimd",
+        "zstd-eval-c9g-neoverse-v3-aarch64-asimd"
+      ],
+      "correctness": "every full-projection row on both hosts",
+      "aggregate_candidate_over_portable_exclusive_maximum": 0.8,
+      "each_width_geomean_exclusive_maximum": 0.8,
+      "each_topology_geomean_exclusive_maximum": 0.8,
+      "each_window_geomean_exclusive_maximum": 0.8,
+      "each_outcome_geomean_exclusive_maximum": 0.8,
+      "each_learned_source_kind_geomean_exclusive_maximum": 0.8,
+      "individual_cell_inclusive_maximum": 1.05,
+      "strict_pair_win_fraction_minimum": 0.8,
+      "timing_repetitions": 6,
+      "timing_minimum_elapsed_ns_each_variant": 400000000,
+      "result_derived_exclusions": false,
+      "one_failure_rejects_whole_class": true
+    },
+    "inputs": {
+      "corpus_files": [],
+      "benchmark_results": [],
+      "rebar_files": [],
+      "network": false,
+      "result_derived_selection": false,
+      "result_derived_exclusions": false
+    }
+  }
+}

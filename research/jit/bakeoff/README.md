@@ -1,20 +1,38 @@
 # AArch64 JIT actual-hardware bakeoff
 
-This directory is reproducible evidence for deliberately narrow native
-backends, not evidence that FRE is the world's fastest regex engine.
+This directory retains reproducible historical evidence for a deliberately
+narrow V7 native backend. It is not evidence that FRE is the world's fastest
+regex engine and is not qualification authority for the current composed
+source.
 
-The current V7 exact-literal leaf is qualified only through the explicit
-opt-in `fre::QualifiedExactSearch`; no default facade selects it. Its accepted
-envelope is limited to 16-byte literals and a caller-declared amortization
-lower bound:
+The current harness source emits 48-column `fre-jit-bakeoff-v3` rows for the
+explicit V8 `SelectedEnd` register-return ABI2 policy. It establishes one
+current-thread session outside each search-only timer and uses only its
+value-returning call in the hot loop. Full-workload rows include owner and
+session construction once, followed by the declared value-only workload.
+Before serializing a native row, the generator requires the facade-reported
+V8/ABI2 target, backend, image statistics, and artifact identity to match a
+separately emitted deterministic register-return image.
+The existing exact-Span inspection sidecar retains its `identity=` field for
+historical V2 verification and additionally records an independently named
+`abi2_identity=` plus the exact ASIMD V8, register ABI2, target, and no-VL
+facts. V3 verification requires that external ABI2 identity and rejects a row
+whose artifact, canonical binding, and evidence hash were rewritten together.
+Historical V2 rows remain V2 and continue to describe only the retired
+sessionless Search-v1/Span-image harness.
+
+At the exact historical Q source below, the V7 exact-literal leaf was qualified
+only through the explicit opt-in `fre::QualifiedExactSearch`; no default
+facade selected it. Its accepted historical envelope was limited to 16-byte
+literals and a caller-declared amortization lower bound:
 
 - at least 1,024 qualifying searches with windows of at least 64 KiB; or
 - at least 64 qualifying searches with windows of at least 1 MiB.
 
-The facade retains the portable literal plan and does not emit or publish
-native code for other widths or under-qualified workloads. Calls smaller than
-the declared window also stay portable. Class-plus-suffix, aggregate, and the
-15-byte Sherlock cases remain unqualified.
+That historical facade retained the portable literal plan and did not emit or
+publish native code for other widths or under-qualified workloads. Calls
+smaller than the declared window also stayed portable. Class-plus-suffix,
+aggregate, and the 15-byte Sherlock cases were unqualified.
 
 The measured Q commit is
 `88e9c22c4ac382531bc1026ca0e25587905f5206`, tree
@@ -25,7 +43,7 @@ SHA-256 is
 `de084ff0564acdb89889f28b9dcfddce9b6f0955a1b2aead30d75770039e0453`.
 The Q execution source remains unchanged.
 
-`qualified_exact_search_promotion.tsv` binds the Q revision/tree,
+`qualified_exact_search_promotion.tsv` binds the historical Q revision/tree,
 qualification source blobs, promotion-gate receipt, independent review,
 findings, candidate binary, exact backend, and both workload tiers.
 `verify_qualified_exact_search_promotion.sh` accepts a release only when the
@@ -45,10 +63,16 @@ as falsification history.
 
 The measurements were taken on an Apple M5 Max running macOS arm64 with
 Rust 1.93.0. Exact host, compiler, binary, fixture, and Rebar revision details
-are recorded in each result directory's `environment.txt`. Current
-qualification uses a clean Git revision plus a verified source-bound binary
+are recorded in each result directory's `environment.txt`. The historical
+qualification used a clean Git revision plus a verified source-bound binary
 receipt. Older retained result directories without Git metadata record their
 workspace revision honestly as `unknown`.
+
+The current composed source uses V8 as its default emitter policy, but the V8,
+tag-10, tag-19, and tag-21 qualification atoms are all `Candidate`; legacy V7
+is also hard `Candidate`. The historical V7 bundle and results in this
+directory therefore authorize neither current production execution nor a
+current performance claim.
 
 ## Fixed matrix
 
@@ -94,18 +118,21 @@ Every synthetic process validates semantics before entering these timers:
 | Rust regex | `search` | search through an already compiled regex | compilation |
 | `fre-kernels` | `build_first_call` | plan build and first search | nothing in its plan-to-first-result path |
 | `fre-kernels` | `search` | search through an already built plan | plan build |
-| experimental facade | `search` | actual routing check and selected portable/native calls; iterations meet the declared reuse count | construction and publication |
-| experimental facade | `build_full_workload` | owner construction plus exactly the declared workload, reported amortized per search | nothing in the facade-plus-workload path |
-| under-threshold facade | `search`, `build_full_workload` | the same boundaries with a declaration one call below admission | native emission and publication, which must not occur |
+| experimental facade | `search` | value-only calls through one admitted current-thread session; iterations meet the declared reuse count | owner and session construction; route reporting |
+| experimental facade | `build_full_workload` | owner and current-thread session construction once, then exactly the declared value-only workload, reported amortized per search | untimed route reporting after the workload |
+| under-threshold facade | `search`, `build_full_workload` | the same session boundaries with a declaration one call below admission | native emission and publication, which must not occur |
 
 Iterations are fixed by haystack size, not calibrated from performance.
 `raw.csv` retains total nanoseconds, iterations, a rolling checksum, the
 single-call semantic value, image and mapping sizes, decoded instruction mix,
 identity receipt, and cache accounting. `ranges.csv` reports the five-process
 minimum, rounded mean, and maximum without discarding any raw sample.
-Both synthetic and Sherlock serializers exactly match the 48-column V2
+Both synthetic and Sherlock serializers exactly match the 48-column V3
 header. Sherlock rows explicitly report qualification state `not-applicable`
-and bundle `none`.
+and bundle `none`. `verify_evidence_rows.awk` accepts both current V3 rows and
+unaltered historical V2 rows, while applying the schema-specific backend, ABI,
+artifact, VL, and accounting rules. V2 native rows remain bound to the legacy
+exact-Span sidecar identity; V3 rows require the distinct ABI2 witness identity.
 
 ## Semantic authentication
 

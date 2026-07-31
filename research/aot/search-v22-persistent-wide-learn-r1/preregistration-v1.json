@@ -1,0 +1,209 @@
+{
+  "schema": "fre-search-aot-candidate-preregistration-v1",
+  "candidate": {
+    "name": "v22-persistent-wide-learn-r1",
+    "planned_backend_version": 35,
+    "planned_backend_policy": "AsimdV22",
+    "planned_wire_magic": "FREA64\\u0000\\u0023",
+    "implementation_base_commit": "fbba639cd21f18bbf1ac4b65964ed454cc93eecc",
+    "implementation_base_tree": "c1b267c80f73eb64ad40eeea77e8f040c6286f7b",
+    "reference_backend": {
+      "policy": "AsimdV17",
+      "version": 30,
+      "frozen_base_commit": "38288c5d495a90e48de4cb619f949f90ee9304af"
+    },
+    "status": "PREREGISTERED_NOT_IMPLEMENTED_NOT_TIMED"
+  },
+  "result_blind_origin": {
+    "created_before_any_v21_performance_output_was_opened": true,
+    "v21_performance_status_at_creation": "NOT_STARTED",
+    "v21_correctness_receipt_sha256": "bbadebcdd428257269713beaf06b9f7f3602690b4c3fe0025bdf09dadf3b63be",
+    "design_authority": "The V21 preregistration explicitly deferred learned-column persistence because X7 and X11 have shared wide-bound and saved-queue meanings. V22 resolves that predeclared structural limitation with Q25-backed offset state and explicit queue restoration; no V21 timing result is an input."
+  },
+  "prior_identity": {
+    "name": "v21-current-group-learned-mask-r1",
+    "preregistration_sha256": "c5b81b0a21708319839db3087375800e6e20eefa28f02cd08f0139656b6c9f42",
+    "implementation_commit": "fbba639cd21f18bbf1ac4b65964ed454cc93eecc",
+    "performance_observations_used": [],
+    "status": "CORRECTNESS_PASSED_PERFORMANCE_NOT_STARTED"
+  },
+  "declared_design": {
+    "summary": "Retain V21's five-column 64-candidate masks and first false-survivor mismatch discovery. Store the learned literal byte in Q24 and its offset in Q25. After refining the discovery group, keep that learned column active across every later 64-candidate group, screen it first, and enter the existing ordered exact-verification queue only for survivors of the learned byte plus every authenticated static column.",
+    "scope": "All admitted exact byte literals of widths 6 through 32 on AArch64 ASIMD. No pattern, topology, width, corpus, density, or runtime-result dispatch is permitted in this identity.",
+    "no_pattern_or_case_dispatch": true,
+    "no_width_threshold": true,
+    "no_corpus_threshold": true,
+    "no_runtime_density_threshold": true,
+    "no_v21_result_input": true
+  },
+  "frozen_control_flow": {
+    "unchanged_prefix": [
+      "V21 scalar first-candidate confirmation",
+      "V20 primary-first and secondary-only 64-candidate state machine while X11 is zero",
+      "V20 primary/secondary masks in Q0/Q2/Q4/Q6",
+      "V20 verification, quaternary, and quinary refinements",
+      "V21 non-destructive first-survivor selection and exact confirmation"
+    ],
+    "learning_transition": [
+      "A sampled exact miss discovers the first source-order mismatching byte under the same fail-closed length guard as V21.",
+      "Broadcast the learned literal byte into Q24 and the learned offset into every byte lane of Q25.",
+      "Set X11 to one only after both Q24 and Q25 are initialized.",
+      "Apply the learned column to all four retained discovery-group masks.",
+      "A nonempty refined discovery group enters the ordered four-mask exact queue; an empty refined discovery group restores the wide cursor and enters persistent learned-wide advance."
+    ],
+    "persistent_learned_wide_entry": [
+      "Entry requires X11 equal to one, Q24 equal to the learned literal byte, Q25 equal to the learned offset in every byte lane, X5 at a 64-candidate group base, X15 at that group's primary column, and X7 equal to end_index minus 63.",
+      "Extract the Q25 byte offset into a scalar scratch register; Q25 remains unchanged.",
+      "Form the learned-column address through X13 and X10 from haystack plus X5 plus the extracted offset; persistent learned/static screening never uses X15 as address scratch.",
+      "Load four 16-byte learned-column blocks with two paired loads into Q0/Q2/Q4/Q6 and compare all four against Q24.",
+      "If all four learned masks are empty, advance by 64 without loading a static column.",
+      "Intersect a nonempty learned mask with the primary column and test presence.",
+      "If present, intersect with the secondary column when one exists and test presence.",
+      "Apply verification, quaternary, and quinary columns in their existing authenticated order, retaining V20's first-remaining and final presence checkpoints.",
+      "Only masks surviving the learned byte and every available authenticated static column enter the ordered exact queue."
+    ],
+    "persistent_empty_advance": [
+      "Increment X5 and X15 by 64.",
+      "Keep X11 equal to one and Q24/Q25 live.",
+      "Continue at persistent learned-wide entry while X5 is at most X7.",
+      "Otherwise enter the inherited narrow/tail graph with learned state still active."
+    ],
+    "ordered_queue": [
+      "Convert Q0/Q2/Q4/Q6 non-destructively into the existing four scalar sparse masks.",
+      "Temporarily set X11 to four only while consuming the fixed four-entry queue.",
+      "Exact-verify candidates in block and lane order; false candidates clear only their current sparse bit.",
+      "Q24 and Q25 are immutable across sparse conversion and specialized exact verification.",
+      "When the queue is exhausted, restore X11 to one, advance to the next 64-candidate group, reconstruct X15 and X7, and resume persistent learned-wide entry.",
+      "An exact hit publishes the earliest exact match normally."
+    ],
+    "narrow_and_tail": [
+      "The existing V17 learned-column narrow and tail graph consumes X11 equal to one plus Q24/Q25 without changing their meanings.",
+      "A no-learning wide exit retains X11 equal to zero and enters the unchanged V21/V17 narrow behavior.",
+      "V22 adds no learned-column persistence across invocations."
+    ],
+    "unchanged_suffix": [
+      "V17 scalar tail and exact-return ABI",
+      "V17, V19, V20, and V21 emitted images",
+      "All non-V22 backend policies and wire formats"
+    ]
+  },
+  "register_contract": {
+    "persistent_state": [
+      "X11 = 0 before learning and 1 after learning except while the four-entry queue temporarily uses values 4 through 1",
+      "Q24 = learned literal byte broadcast to all lanes",
+      "Q25 = learned mismatch offset broadcast to all lanes"
+    ],
+    "wide_state": [
+      "X5 = current 64-candidate group base",
+      "X15 = haystack plus X5 plus primary offset",
+      "X15 remains the primary-column pointer throughout persistent learned/static screening and is reconstructed after every exact-verification queue",
+      "X7 = end_index minus 63 outside the queue",
+      "X6 = end index",
+      "X8 = literal base",
+      "X9 = haystack base",
+      "X12 = literal length",
+      "X14 = sparse-mask constant before a successful return"
+    ],
+    "queue_state": [
+      "X7 = current 16-lane queue block base",
+      "X11 = remaining queue entries including X0",
+      "X0/X1/X2/X3 = ordered sparse masks",
+      "Q24/Q25 remain live and unchanged"
+    ],
+    "scratch": [
+      "X0, X1, X2, X3, X10, X13, Q0, Q2, Q4, Q6, Q16, Q18, Q19, Q20, Q21, and condition flags may be clobbered according to the active phase",
+      "X15 may be clobbered by exact confirmation and queue verification only; every such exit reconstructs it before persistent learned-wide re-entry"
+    ],
+    "persistence": "Q24/Q25 and X11 state persist across 64-candidate groups within one invocation only."
+  },
+  "static_budget": {
+    "maximum_candidate_code_bytes": 3072,
+    "requirements": [
+      "V22 adds no instruction to emitted V17, V19, V20, or V21 images.",
+      "The discovery transition contains exactly one pre-refinement full equality and one bytewise mismatch-discovery loop.",
+      "Persistent learned-wide empty groups use exactly two paired vector loads for the learned column.",
+      "No second learned column, density counter, runtime threshold, or pattern dispatch is emitted.",
+      "Q24 and Q25 are never spilled to memory.",
+      "All direct branches and relocations remain within authenticated AArch64 encodings."
+    ]
+  },
+  "correctness_before_timing": {
+    "required": [
+      "Emitter/template byte-for-byte agreement and whole-image audit acceptance.",
+      "Version 35, magic 0x23, AOT, audit, runtime allowlist, mutation, and reseal rejection coverage.",
+      "All supported search output contracts emit, audit, serialize, adopt, and execute or explicitly reject V22 consistently.",
+      "Mechanical byte identity for frozen V17, V19, V20, and V21 paths against the implementation base commit.",
+      "Decoded liveness proof that Q24/Q25 survive sparse conversion, every specialized equality shape for widths 6 through 32, and queue restoration.",
+      "Decoded control-flow proof that every persistent entry has X11 equal to one and initialized Q24/Q25.",
+      "Exhaustive learned-wide mask algebra over each block/lane and representative four-mask relations.",
+      "Learned-empty transitions across at least three consecutive 64-candidate groups followed by an exact match.",
+      "Learned-nonempty transitions with false survivors in the same block, later blocks, and later groups preserve source order.",
+      "Primary-present/pair-empty and secondary-only transitions before learning remain exact.",
+      "Persistent learned-wide transitions bypass the pre-learning secondary-only graph without losing a possible match.",
+      "Widths 6 through 32 cover every mismatch offset outside the authenticated static offsets.",
+      "Windows cover the wide-to-narrow and narrow-to-tail boundaries at every residue modulo 16.",
+      "Randomized windows and left/right guard-page native execution on the EC2 c9g host."
+    ],
+    "timing_forbidden_until_complete": true
+  },
+  "fresh_performance_gate": {
+    "runs": 1,
+    "same_identity_retest": false,
+    "host": "AWS EC2 c9g",
+    "reference": "AsimdV17",
+    "fixture_bytes": 2097152,
+    "method": "Paired portable/V17/V22; 12 repetitions; all 6 execution orders; approximately 4 ms target per measurement; semantic equality checked before and during timing.",
+    "widths": "6..32 inclusive",
+    "topologies": {
+      "unique": "byte i is 33 + ((17*i) mod 64), unique for the admitted width",
+      "clustered-repeat": "fill with '~' and replace the first five bytes with 'A3mQz'",
+      "spaced-repeat": "fill with 'x' and write M/N/O/P/R at 0, width/4, width/2, 3*width/4, and width-1 in that order",
+      "seeded-mixed": "deterministic xorshift64 stream mapped to a fixed 16-byte printable alphabet, independently seeded by width"
+    },
+    "scenarios": [
+      "uniform-absent",
+      "random-absent with seed 0x9e3779b97f4a7c15 mixed with topology and width",
+      "dense-near-miss-first-unfiltered using the first offset outside the five authenticated offsets",
+      "dense-near-miss-last-unfiltered using the last offset outside the five authenticated offsets",
+      "sparse-singleton-unfiltered injected every 257 bytes into an avoiding-byte background",
+      "late-match"
+    ],
+    "windows": {
+      "full": "0..2097152",
+      "offset-tail": "509..2097121",
+      "floor-96k": "29..98333"
+    },
+    "expected_cells": 1944,
+    "expected_pattern_artifact_pairs": 108,
+    "width_shards": [
+      "6..14",
+      "15..23",
+      "24..32"
+    ],
+    "strict_acceptance": {
+      "every_broad_stratum_candidate_over_v17_geomean_lte": 1.0,
+      "broad_strata": [
+        "overall",
+        "scenario",
+        "topology",
+        "outcome",
+        "window",
+        "width"
+      ],
+      "every_individual_candidate_over_v17_ratio_lte": 1.05,
+      "semantics": "all equal",
+      "artifact_pairs": "one frozen V17/V22 pair per topology and width"
+    },
+    "on_failure": "Seal immutable refusal; do not retest or tune this identity.",
+    "on_success": "Require independent review and a fresh formal qualification identity before selection or deployment."
+  },
+  "forbidden_adaptation": {
+    "use_v21_timing_output_in_v22_design": false,
+    "remove_v21_or_v22_failure_classes": false,
+    "post_timing_membership_change": false,
+    "post_timing_threshold_change": false,
+    "post_timing_retune_of_same_identity": false,
+    "reuse_backend_tag_after_source_change": false,
+    "rebar_as_design_or_gate_input": false
+  }
+}

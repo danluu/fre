@@ -8,11 +8,12 @@ license.workspace = true
 publish = false
 
 [dependencies]
+fre-jit-aarch64 = { path = "../fre-jit-aarch64" }
 fre-jit-runtime = { path = "../fre-jit-runtime" }
 fre-kernel-ir = { path = "../fre-kernel-ir" }
+sha2 = "=0.10.9"
 
 [dev-dependencies]
-fre-jit-aarch64 = { path = "../fre-jit-aarch64" }
 fre-kernel-ir = { path = "../fre-kernel-ir" }
 
 [lints]

@@ -2,16 +2,20 @@
 
 use core::marker::PhantomData;
 
+use fre_jit_aarch64::SELECTED_END_REGISTER_CALL_ABI_SCHEMA_V2;
 use fre_jit_runtime::{PublicationLimits, RuntimeOperation};
 
 use crate::{CacheCreateError, CacheResource};
 
 const POLICY_VERSION: u16 = 1;
 const BOOKKEEPING_MODEL_VERSION: u16 = 1;
+const SELECTED_END_REGISTER_BOOKKEEPING_MODEL_VERSION_V2: u16 = 1;
+pub(crate) const SELECTED_END_REGISTER_COMPILE_KEY_SCHEMA_V2: u16 = 1;
 pub(crate) const BASE_BOOKKEEPING_BYTES: u64 = 1_024;
 pub(crate) const ENTRY_BOOKKEEPING_BYTES: u64 = 96;
 pub(crate) const FLIGHT_BOOKKEEPING_BYTES: u64 = 96;
 pub(crate) const LIVE_MAPPING_BOOKKEEPING_BYTES: u64 = 256;
+pub(crate) const SELECTED_END_REGISTER_LIVE_MAPPING_BOOKKEEPING_BYTES_V2: u64 = 512;
 
 /// Deterministic resident-entry eviction policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -49,6 +53,22 @@ impl Default for CacheLimits {
 impl CacheLimits {
     /// Stable conservative bookkeeping reservation required by these maxima.
     pub fn required_bookkeeping_bytes(self) -> Result<u64, CacheCreateError> {
+        self.required_bookkeeping_bytes_with_live_mapping_charge(LIVE_MAPPING_BOOKKEEPING_BYTES)
+    }
+
+    /// Stable conservative bookkeeping reservation for register-return ABI2.
+    pub fn required_selected_end_register_bookkeeping_bytes_v2(
+        self,
+    ) -> Result<u64, CacheCreateError> {
+        self.required_bookkeeping_bytes_with_live_mapping_charge(
+            SELECTED_END_REGISTER_LIVE_MAPPING_BOOKKEEPING_BYTES_V2,
+        )
+    }
+
+    fn required_bookkeeping_bytes_with_live_mapping_charge(
+        self,
+        live_mapping_bytes: u64,
+    ) -> Result<u64, CacheCreateError> {
         let entries = self
             .max_entries
             .checked_mul(ENTRY_BOOKKEEPING_BYTES)
@@ -63,7 +83,7 @@ impl CacheLimits {
             })?;
         let mappings = self
             .max_live_mappings
-            .checked_mul(LIVE_MAPPING_BOOKKEEPING_BYTES)
+            .checked_mul(live_mapping_bytes)
             .ok_or(CacheCreateError::ArithmeticOverflow {
                 resource: CacheResource::BookkeepingBytes,
             })?;
@@ -108,6 +128,40 @@ impl<O: RuntimeOperation> CachePolicyIdentity<O> {
             cache_limits,
             publication_limits,
             output: PhantomData,
+        }
+    }
+}
+
+/// Complete cache and publication policy for register-return `SelectedEnd`
+/// ABI2 images.
+///
+/// This is a distinct nominal type rather than a fabricated
+/// [`RuntimeOperation`]. The ABI schema field prevents policy receipts for
+/// Search-v1 mappings from being mistaken for ABI2 cache policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SelectedEndRegisterCachePolicyIdentityV2 {
+    pub policy_version: u16,
+    pub bookkeeping_model_version: u16,
+    pub call_abi_schema: u16,
+    pub compile_key_schema: u16,
+    pub eviction: EvictionPolicy,
+    pub cache_limits: CacheLimits,
+    pub publication_limits: PublicationLimits,
+}
+
+impl SelectedEndRegisterCachePolicyIdentityV2 {
+    pub(crate) const fn new(
+        cache_limits: CacheLimits,
+        publication_limits: PublicationLimits,
+    ) -> Self {
+        Self {
+            policy_version: POLICY_VERSION,
+            bookkeeping_model_version: SELECTED_END_REGISTER_BOOKKEEPING_MODEL_VERSION_V2,
+            call_abi_schema: SELECTED_END_REGISTER_CALL_ABI_SCHEMA_V2,
+            compile_key_schema: SELECTED_END_REGISTER_COMPILE_KEY_SCHEMA_V2,
+            eviction: EvictionPolicy::LeastRecentlyUsedV1,
+            cache_limits,
+            publication_limits,
         }
     }
 }

@@ -1,0 +1,89 @@
+{
+  "schema": "fre.aot.search-tag30-ripgrep-application-campaign-binding.v1",
+  "payload_sha256": "686545fe3666f709dcdf96b5f52e716688b1cf90278a7685a33c67073b264249",
+  "payload": {
+    "contract_sha256": "db2faa1308d3a103a2b5fc5ebb2c26c0461fadddffc3f214cfcd23e25a8dbfc7",
+    "projection_sha256": "1ea6896b7d89bb812130d6f6c4b743d9eed79169c0154f0b6bb37686576b9332",
+    "projection_file_sha256": "d53ab752f7fc7b16e14e9989a08e4780a2a6865ace451efb9d1a14019040aa77",
+    "fixture_manifest_sha256": "b20181470c604d01d2ec236259293cfcb6e5eff145bcd3e4daa91554c8cebcca",
+    "object_manifest_sha256": "ec4e1cf7bbd70f99dc0675b6e3fd47b2da9034753d4f5a1a836206c5756ed0b6",
+    "literal_dispositions_sha256": "433029525cfb74122f275f4282901fc6e7711b34aa7115b4bd53ef537dd5e1a1",
+    "application_analyzer_source_sha256": "139002fa7385729bc9d24b1e9acb470bb493546b17dde1eb173deb23cc76b50a",
+    "campaign_plan_identity": "d39dc02c741a13adc8e0c7c3cc818ffa69e96132af89caf0fef6b5dad6d14333",
+    "campaign_analyzer_identity": "01839636097d4727263d24cc9194954b883997fe0535452b230595885562c8db",
+    "campaign_evidence_identity": "90996b64e980df84292318bb0129adf1cc6eae1b18bc962f8a707af0aee9e2fa",
+    "private_family_authorization_identity": "e4c2a5e115e26dfbd903522171b8c350bfba11b17e98f2b82c4bc486c1fa975b",
+    "runner_source_commit": null,
+    "runner_source_sha256": "d9d3db672496d82d09aaa372c6da637bfd9d65b6a60fbd4dac2d40b34fc6e4b8",
+    "source_archive_sha256": null,
+    "private_family_source_sha256": "c96ade0dc836ee11bdfed8f1ded90fbb90fbf23f7f7e04cc525d2c27fe752bab",
+    "hosts": [
+      {
+        "host_id": "local-apple-aarch64-asimd",
+        "canonical_host": "apple-aarch64-asimd",
+        "target_triple": "aarch64-apple-darwin",
+        "features": {
+          "asimd": true,
+          "sve": false,
+          "sve2": false
+        },
+        "allowed_logical_cpus": [
+          12,
+          13,
+          14,
+          15,
+          16,
+          17
+        ],
+        "runner_binary_sha256": null,
+        "runner_identity_sha256": null,
+        "build_receipt_sha256": null,
+        "manifest_identity": null,
+        "compiler_identity": null
+      },
+      {
+        "host_id": "zstd-eval-c9g-neoverse-v3-aarch64-asimd",
+        "canonical_host": "c9g-aarch64-asimd-sve2",
+        "target_triple": "aarch64-unknown-linux-gnu",
+        "features": {
+          "asimd": true,
+          "sve": true,
+          "sve2": true,
+          "sve_vector_bytes": 16
+        },
+        "allowed_logical_cpus": [
+          64,
+          65,
+          66,
+          67,
+          68,
+          69,
+          70,
+          71,
+          72,
+          73,
+          74,
+          75,
+          76,
+          77,
+          78,
+          79
+        ],
+        "runner_binary_sha256": null,
+        "runner_identity_sha256": null,
+        "build_receipt_sha256": null,
+        "manifest_identity": null,
+        "compiler_identity": null
+      }
+    ],
+    "timing_sealed": false,
+    "bindings_complete": false,
+    "application_qualification_authority": false,
+    "production_authority": false,
+    "rebar_inputs": [],
+    "benchmark_results": [],
+    "external_regex_heldout_inputs": [],
+    "heldout_materialized": false,
+    "result_derived_exclusions": false
+  }
+}

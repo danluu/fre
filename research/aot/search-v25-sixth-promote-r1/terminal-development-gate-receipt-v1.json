@@ -1,0 +1,142 @@
+{
+  "schema": "fre-search-v25-terminal-development-gate-receipt-v1",
+  "created_utc": "2026-07-31T03:31:34Z",
+  "status": "TERMINAL_FAIL",
+  "candidate": {
+    "name": "v25-sixth-promote-r1",
+    "policy": "AsimdV25",
+    "backend_version": 38,
+    "wire_magic_hex": "0x26",
+    "version_label": "v25-sixth-promote-4f9913d6-r1",
+    "source_commit": "4f9913d6ebc71f2b776bb3c781fdd6a8814c7944",
+    "source_tree": "4edd5cc1369a76a40f420e6afe2da5f4137399ff",
+    "source_bundle_sha256": "aff974bc6e2ebf34b2b040cc4e8639e06e0bc9b9ab2990e9a27289e7a8fadfda",
+    "source_bundle_bytes": 10914
+  },
+  "prospective_gate": {
+    "preregistration_commit": "4da04c4076d76b5db9c2e0681767c9b7efc68dba",
+    "preregistration_sha256": "5b09e85d73670b4d66cb210a44b86399a1f056926756df5214f4af0a7083072f",
+    "preregistration_seal_receipt_sha256": "0a322f4ae94d0a5eb076a2d9a017b3e70fb572bbf5593ff2986d32c426138b9d",
+    "overall_candidate_over_v17_geomean_lte": 0.8,
+    "every_broad_stratum_candidate_over_v17_geomean_lte": 1.02,
+    "broad_strata": [
+      "scenario",
+      "topology",
+      "outcome",
+      "window",
+      "width"
+    ],
+    "cells_strictly_over_1_05_lte": 19,
+    "maximum_candidate_over_v17_ratio_lte": 1.1,
+    "p95_nearest_rank_1847": "report-only",
+    "expected_cells": 1944,
+    "paired_ratios_per_cell": 12,
+    "execution_orders": 6,
+    "each_execution_order_occurrences": 2,
+    "correctness": "unconditional hard failure"
+  },
+  "correctness": {
+    "status": "PASS",
+    "final_receipt_sha256": "bb32da922fb786ed34bc6111d127d67659499b0b5132375ed1be36279c808ff6",
+    "evidence_manifest_sha256": "07c19d9644ed9ed6e1de5f74e64e32ea53f78763459ff0c6d53cac03d91f3305",
+    "comparisons": 7776,
+    "mismatches": 0
+  },
+  "sealed_gate": {
+    "resolved_tooling_parent_commit": "0cdce0260578700ff6617a87d57a7e46106a3e86",
+    "resolved_tooling_parent_tree": "5f8ff9b1694a79544f0beb1e63f4625755264e52",
+    "final_integration_commit": "14806da9e617f57141cba21bd3b522e55460f95e",
+    "final_integration_tree": "e9c9b082c39fee785ed74a0e2e66ccbf3f08d0a9",
+    "controller_sha256": "cac43113929bbb924520cb2bdc953af597b5c0dbe9a31c16ed33bebb71767b41",
+    "controller_bytes": 112461,
+    "receipt_schema_sha256": "40b7ed5414a356079e0f441e613c86deb0f9fa6d30a5156114257214959160a2",
+    "receipt_schema_bytes": 21506,
+    "final_sealing_receipt_sha256": "65fd56774de230b7078a72ee2e01256a68f16de764b8bfae5a701aec3d208e6b",
+    "final_seal_inputs_sha256": "9629de1f2cb9553957962161a26c00f34a9db7f1c7a65297aefb4d31d1ccf479",
+    "sealed_launcher_sha256": "4b4777ebe7a024bd584f81c7ae097a597cc23a9cbc7c0ae4cd3833bfb255799c"
+  },
+  "run": {
+    "remote_qualification": "/srv/new007/fre-aot-qualification/search-v25-sixth-promote-r1/gate-development-e1.m3CZEK",
+    "started_utc": "2026-07-31T03:26:23Z",
+    "finished_utc": "2026-07-31T03:27:45Z",
+    "launcher_exit": 0,
+    "shard_exit_statuses": [
+      0,
+      0,
+      0
+    ],
+    "rows_per_shard": [
+      648,
+      648,
+      648
+    ],
+    "total_cells": 1944,
+    "launch_sha256": "a7bfa2e97bb1bce2283a726a13dba2ee1c985d26a27ccf1600db40c5c60097e8",
+    "status_sha256": "cfee162098136d4ff2e2e764c272a515304be1aa9d0e99295e2faa36e4b1b629",
+    "shards": [
+      {
+        "widths": "6..14",
+        "cpu": 120,
+        "rows": 648,
+        "tsv_sha256": "be4549e8341a8170c52fe855b1e20847c03809889f8cf53f33fc4b3ca62e2fd3",
+        "log_sha256": "c77c1e35007a4c04634935fe3b397d025d8b85c6145c1ddf531a8ad992473b55"
+      },
+      {
+        "widths": "15..23",
+        "cpu": 130,
+        "rows": 648,
+        "tsv_sha256": "404af62f79cb05c42466cb71753bdae2c15192f1c9470f1b8591d9c069546eb3",
+        "log_sha256": "5b671eea449256db833682f8975df80a0c70d12069a6d3b1f4cea3600197c26d"
+      },
+      {
+        "widths": "24..32",
+        "cpu": 140,
+        "rows": 648,
+        "tsv_sha256": "8bdddcfafbe50c0613962501cba1d5bca345b7c6ad9d161b42eda14c44a360e4",
+        "log_sha256": "9e8bb311bb67bbf47888f857b796499400a07a0150a64af8e3cf9620c0e59977"
+      }
+    ]
+  },
+  "analysis": {
+    "analyzer_exit": 0,
+    "analysis_sha256": "4483f9b72e92bf2f50910d24b155fc51e659af8ea4467f5a45f9c8b39f868fd9",
+    "analysis_bytes": 30884,
+    "analysis_stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "authentication_status": "PASS",
+    "decision": "FAIL",
+    "candidate_over_v17_geomean": 0.6688008164577856,
+    "overall_improvement_fraction": 0.3311991835422144,
+    "candidate_over_portable_geomean": 0.3888195636730907,
+    "candidate_strict_wins": 1605,
+    "candidate_ties": 0,
+    "cells_strictly_over_1_05": 6,
+    "candidate_over_v17_p95_nearest_rank": 1.006773,
+    "maximum_candidate_over_v17": 1.106932,
+    "minimum_candidate_over_v17": 0.311918,
+    "geomean_failures": [],
+    "failed_guards": [
+      {
+        "name": "maximum_candidate_over_v17_ratio_lte",
+        "observed": 1.106932,
+        "threshold": 1.1
+      }
+    ],
+    "worst_cell": {
+      "topology": "seeded-mixed",
+      "width": 7,
+      "scenario": "random-absent",
+      "window": "full",
+      "outcome": "absent",
+      "candidate_over_v17": 1.106932
+    }
+  },
+  "terminal_decision": {
+    "deploy_v25": false,
+    "run_v25_heldout": false,
+    "retest_v25": false,
+    "retune_gate_for_v25": false,
+    "reuse_v25_identity_for_modified_code": false,
+    "reason": "V25 passed the overall, every broad-stratum, tail-count, p95-reporting, and correctness checks, but its worst cell exceeded the prospectively frozen absolute maximum by 0.006932.",
+    "permitted_next_step": "A separately versioned and preregistered successor may use this terminal result to apply a general compile-time fallback for the short-width class, but must qualify on a fresh disjoint performance population before any heldout or production authority."
+  }
+}
