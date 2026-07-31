@@ -245,12 +245,19 @@ class AnalyzerTests(unittest.TestCase):
         with self.assertRaises(gate.GateError):
             gate.validate_cell_result(drift, expected)
 
+        drift = copy.deepcopy(result)
+        drift["calibrations"]["v26"]["elapsed_ns"] = gate.MAX_U64 + 1
+        with self.assertRaises(gate.GateError):
+            gate.validate_cell_result(drift, expected)
+
     def test_strict_json_rejects_duplicate_keys_and_nonfinite_numbers(self) -> None:
         with self.assertRaises(gate.GateError):
             gate.strict_json_loads(b'{"a":1,"a":2}', "duplicate")
         for spelling in (b"NaN", b"Infinity", b"-Infinity"):
             with self.assertRaises(gate.GateError):
                 gate.strict_json_loads(b'{"value":' + spelling + b"}", "nonfinite")
+        with self.assertRaises(gate.GateError):
+            gate.strict_json_loads(b'{"value":1e9999}', "overflowed float")
 
     def test_numeric_fields_reject_string_and_bool_coercion(self) -> None:
         base = {
@@ -264,6 +271,22 @@ class AnalyzerTests(unittest.TestCase):
             mutated[field] = value
             with self.assertRaises(gate.GateError):
                 gate.cell_key(mutated)
+
+    def test_nonce_roles_reject_sentinels_and_aliases(self) -> None:
+        for sentinel in ("0" * 64, "f" * 64):
+            with self.assertRaises(gate.GateError):
+                gate.nonplaceholder_hex(sentinel, 64, "nonce")
+        authorization = "1" * 64
+        run = "2" * 64
+        shards = ["3" * 64, "4" * 64, "5" * 64]
+        gate.require_distinct_nonce_roles(authorization, run, shards)
+        for duplicate in (
+            (authorization, authorization, shards),
+            (authorization, run, [authorization, *shards[1:]]),
+            (authorization, run, [shards[0], shards[0], shards[2]]),
+        ):
+            with self.assertRaises(gate.GateError):
+                gate.require_distinct_nonce_roles(*duplicate)
 
     def test_header_requires_every_exact_sealed_identity(self) -> None:
         expected = sample_header()
@@ -301,6 +324,84 @@ class AnalyzerTests(unittest.TestCase):
             contract["acceptance"]["overall_geomean_lte"] = 0.9
             with self.assertRaises(gate.GateError):
                 gate.require_exact_contract(contract, contract_file, cells_file)
+
+    def test_sealed_contract_rejects_recursive_json_scalar_type_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cells_path = root / "cells.jsonl"
+            cells_path.write_text("{}\n", encoding="utf-8")
+            cells_path.chmod(0o444)
+            cells_file = gate.stable_read(cells_path, gate.MAX_CELL_MANIFEST_BYTES)
+            mutations = (
+                (
+                    "candidate.llvm bool/int alias",
+                    lambda value: value["candidate"].__setitem__("llvm", 0),
+                ),
+                (
+                    "acceptance.exact_semantics bool/int alias",
+                    lambda value: value["acceptance"].__setitem__(
+                        "exact_semantics", 1
+                    ),
+                ),
+                (
+                    "execution.rebar_input bool/int alias",
+                    lambda value: value["execution"].__setitem__("rebar_input", 0),
+                ),
+                (
+                    "inputs.literal_records int/float alias",
+                    lambda value: value["inputs"].__setitem__(
+                        "literal_records", 1296.0
+                    ),
+                ),
+                (
+                    "fixtures.long_window_bytes int/float alias",
+                    lambda value: value["fixtures"].__setitem__(
+                        "long_window_bytes", 2_097_152.0
+                    ),
+                ),
+                (
+                    "measurement.paired_repetitions int/float alias",
+                    lambda value: value["measurement"].__setitem__(
+                        "paired_repetitions", 12.0
+                    ),
+                ),
+                (
+                    "shards.cells int/float alias",
+                    lambda value: value["shards"][0].__setitem__("cells", 2592.0),
+                ),
+                (
+                    "acceptance.tail_count int/float alias",
+                    lambda value: value["acceptance"].__setitem__(
+                        "cells_strictly_over_1_05_lte", 77.0
+                    ),
+                ),
+                (
+                    "acceptance.p95_rank int/float alias",
+                    lambda value: value["acceptance"].__setitem__(
+                        "p95_nearest_rank", 7388.0
+                    ),
+                ),
+                (
+                    "execution.runs int/float alias",
+                    lambda value: value["execution"].__setitem__("runs", 1.0),
+                ),
+            )
+            for index, (name, mutate) in enumerate(mutations):
+                with self.subTest(field=name):
+                    contract = self.sealed_contract(cells_file)
+                    mutate(contract)
+                    contract_path = root / f"contract-{index}.json"
+                    contract_path.write_text(
+                        json.dumps(contract) + "\n", encoding="utf-8"
+                    )
+                    contract_path.chmod(0o444)
+                    contract_file = gate.stable_read(
+                        contract_path, gate.MAX_CONTRACT_BYTES
+                    )
+                    with self.assertRaises(gate.GateError):
+                        gate.require_exact_contract(
+                            contract, contract_file, cells_file
+                        )
 
     @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
     def test_stable_read_rejects_symlink_inputs(self) -> None:

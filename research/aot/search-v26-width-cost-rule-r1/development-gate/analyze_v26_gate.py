@@ -48,6 +48,7 @@ MAX_SEAL_BYTES = 256 * 1024
 MAX_RUN_MANIFEST_BYTES = 256 * 1024
 MAX_CELL_MANIFEST_BYTES = 64 * 1024 * 1024
 MAX_SHARD_BYTES = 512 * 1024 * 1024
+MAX_U64 = (1 << 64) - 1
 HEX_DIGITS = frozenset("0123456789abcdef")
 EXPECTED_ACCEPTANCE = {
     "exact_semantics": True,
@@ -195,12 +196,52 @@ def lowercase_hex(value: Any, length: int, name: str) -> str:
     return value
 
 
+def nonplaceholder_hex(value: Any, length: int, name: str) -> str:
+    value = lowercase_hex(value, length, name)
+    if value in {"0" * length, "f" * length}:
+        raise GateError(f"{name} is a forbidden sentinel identity")
+    return value
+
+
+def require_distinct_nonce_roles(
+    authorization_nonce: str, run_nonce: str, shard_nonces: Sequence[str]
+) -> None:
+    if len(shard_nonces) != 3 or len(
+        {authorization_nonce, run_nonce, *shard_nonces}
+    ) != 5:
+        raise GateError(
+            "authorization, run, and shard nonces are not pairwise distinct"
+        )
+
+
 def exact_keys(value: Mapping[str, Any], expected: frozenset[str], name: str) -> None:
     observed = frozenset(value)
     if observed != expected:
         missing = sorted(expected - observed)
         extra = sorted(observed - expected)
         raise GateError(f"{name} keys drifted: missing={missing}, extra={extra}")
+
+
+def exact_json_value(observed: Any, expected: Any, name: str) -> None:
+    """Require exact JSON shape, scalar type, and value recursively."""
+    if type(observed) is not type(expected):
+        raise GateError(
+            f"{name} type drifted: observed={type(observed).__name__}, "
+            f"expected={type(expected).__name__}"
+        )
+    if isinstance(expected, dict):
+        exact_keys(observed, frozenset(expected), name)
+        for key, expected_item in expected.items():
+            exact_json_value(observed[key], expected_item, f"{name}.{key}")
+    elif isinstance(expected, list):
+        if len(observed) != len(expected):
+            raise GateError(f"{name} length drifted")
+        for index, (observed_item, expected_item) in enumerate(
+            zip(observed, expected, strict=True)
+        ):
+            exact_json_value(observed_item, expected_item, f"{name}[{index}]")
+    elif observed != expected:
+        raise GateError(f"{name} value drifted")
 
 
 def strict_integer(
@@ -307,6 +348,13 @@ def reject_nonfinite_constant(value: str) -> None:
     raise GateError(f"nonfinite JSON number {value!r} is forbidden")
 
 
+def strict_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise GateError(f"nonfinite parsed JSON number {value!r} is forbidden")
+    return parsed
+
+
 def strict_json_loads(data: bytes, context: str) -> Any:
     try:
         text = data.decode("utf-8")
@@ -314,10 +362,11 @@ def strict_json_loads(data: bytes, context: str) -> Any:
             text,
             object_pairs_hook=reject_duplicate_keys,
             parse_constant=reject_nonfinite_constant,
+            parse_float=strict_float,
         )
     except GateError:
         raise
-    except (UnicodeError, json.JSONDecodeError) as error:
+    except (UnicodeError, ValueError) as error:
         raise GateError(f"cannot decode strict JSON {context}: {error}") from error
 
 
@@ -366,16 +415,45 @@ def require_exact_contract(
     if "AWAITING_" in encoded:
         raise GateError("sealed contract contains an unresolved placeholder")
     candidate = contract.get("candidate")
-    if not isinstance(candidate, dict) or candidate != {
-        "backend_policy": "AsimdV26",
-        "backend_version": 39,
-        "source_commit": candidate.get("source_commit"),
-        "source_tree": candidate.get("source_tree"),
-        "llvm": False,
-    }:
+    if not isinstance(candidate, dict):
         raise GateError("candidate contract fields drifted")
-    lowercase_hex(candidate["source_commit"], 40, "candidate source commit")
-    lowercase_hex(candidate["source_tree"], 40, "candidate source tree")
+    exact_keys(
+        candidate,
+        frozenset(
+            (
+                "backend_policy",
+                "backend_version",
+                "source_commit",
+                "source_tree",
+                "llvm",
+            )
+        ),
+        "candidate contract",
+    )
+    if (
+        candidate.get("backend_policy") != "AsimdV26"
+        or strict_integer(
+            candidate.get("backend_version"),
+            "candidate backend version",
+            minimum=1,
+        )
+        != 39
+        or candidate.get("llvm") is not False
+    ):
+        raise GateError("candidate contract fields drifted")
+    nonplaceholder_hex(candidate["source_commit"], 40, "candidate source commit")
+    nonplaceholder_hex(candidate["source_tree"], 40, "candidate source tree")
+    exact_json_value(
+        candidate,
+        {
+            "backend_policy": "AsimdV26",
+            "backend_version": 39,
+            "source_commit": candidate["source_commit"],
+            "source_tree": candidate["source_tree"],
+            "llvm": False,
+        },
+        "candidate contract",
+    )
     inputs = contract.get("inputs")
     if not isinstance(inputs, dict):
         raise GateError("sealed input identity is missing")
@@ -416,8 +494,31 @@ def require_exact_contract(
         "window order no_match, first_legal_position, middle_complete_vector_group, last_legal_position, overlapping_near_miss_before_match, dense_primary_byte_false_candidates",
     ]:
         raise GateError("cell lattice contract drifted")
+    exact_json_value(
+        inputs,
+        {
+            "preregistration_sha256": "772a23e5e6c4354fa3bdc9ad307601dbbce655a62dd5ee7ded075dbe4869a02a",
+            "synthetic_population_sha256": "a682375f2e6e051f97322396bafc46974df47baa3518bc17f5d6b71b56407b73",
+            "literal_records": 1_296,
+            "cells": EXPECTED_CELLS,
+            "cell_manifest_sha256": cells_file.sha256,
+            "cell_key_fields": [
+                "width",
+                "output_tag",
+                "accepted_ordinal",
+                "window_shape",
+            ],
+            "cell_order": [
+                "width ascending 6..32",
+                "output order exists, span, selected_end",
+                "accepted ordinal ascending 0..15",
+                "window order no_match, first_legal_position, middle_complete_vector_group, last_legal_position, overlapping_near_miss_before_match, dense_primary_byte_false_candidates",
+            ],
+        },
+        "gate inputs",
+    )
     fixtures = contract.get("fixtures")
-    if not isinstance(fixtures, dict) or fixtures != {
+    expected_fixtures = {
         "recipe": "fre-search-v26-long-scan-fixture-v1",
         "long_window_bytes": 2_097_152,
         "long_shapes": [
@@ -443,15 +544,19 @@ def require_exact_contract(
         "expected_coordinates": "absolute haystack byte coordinates; an engine invoked on a sliced window must add window_start before hashing or comparing its result",
         "identity": "SHA-256 over fre-search-v26-long-scan-fixture-v1 binary domain, literal coordinate and bytes, shape tag, geometry, expected match, and complete haystack bytes",
         "allocation": "construct and release exactly one fixture/cell at a time; retaining the 7,776 long haystacks is forbidden",
-    }:
+    }
+    if not isinstance(fixtures, dict) or fixtures != expected_fixtures:
         raise GateError("fixture geometry contract drifted")
-    if contract.get("engines") != {
+    exact_json_value(fixtures, expected_fixtures, "fixture contract")
+    expected_engines = {
         "portable": "safe Kernel IR execution",
         "reference": "AsimdV17/backend30 native Search-v1",
         "candidate": "AsimdV26/backend39 native Search-v1",
         "semantic_equality_before_timing": "hard failure",
-    }:
+    }
+    if contract.get("engines") != expected_engines:
         raise GateError("engine identity contract drifted")
+    exact_json_value(contract["engines"], expected_engines, "engine contract")
     measurement = contract.get("measurement")
     if not isinstance(measurement, dict):
         raise GateError("measurement contract is missing")
@@ -473,14 +578,36 @@ def require_exact_contract(
         "aggregate_estimator": "equal-cell-weight exp(fsum(log(cell_ratio)) / cell_count)",
     }:
         raise GateError("measurement estimator contract drifted")
-    if contract.get("shards") != [
+    exact_json_value(
+        measurement,
+        {
+            "calibration_target_ns": 4_000_000,
+            "calibration": "per cell and engine, begin at one search and double the batch until elapsed_ns >= target; fail on overflow or zero/nonfinite normalized time",
+            "calibration_evidence": "record chosen iterations and terminal elapsed_ns; for iterations > 1 also record exactly half the iterations and its elapsed_ns, which must be below target; every timed sample must use the chosen iterations",
+            "paired_repetitions": 12,
+            "orders": [list(order) for order in EXPECTED_ORDERS],
+            "per_repetition_ratio": "(v26_elapsed_ns / v26_iterations) / (v17_elapsed_ns / v17_iterations)",
+            "cell_estimator": "arithmetic median of the 12 paired ratios; average sorted ranks 6 and 7",
+            "aggregate_estimator": "equal-cell-weight exp(fsum(log(cell_ratio)) / cell_count)",
+        },
+        "measurement contract",
+    )
+    expected_shards = [
         {"id": 0, "widths": "6..14", "cells": EXPECTED_SHARD_CELLS},
         {"id": 1, "widths": "15..23", "cells": EXPECTED_SHARD_CELLS},
         {"id": 2, "widths": "24..32", "cells": EXPECTED_SHARD_CELLS},
-    ]:
+    ]
+    if contract.get("shards") != expected_shards:
         raise GateError("shard contract drifted")
-    if contract.get("acceptance") != EXPECTED_ACCEPTANCE:
+    exact_json_value(contract["shards"], expected_shards, "shard contract")
+    acceptance = contract.get("acceptance")
+    if (
+        not isinstance(acceptance, dict)
+        or acceptance != EXPECTED_ACCEPTANCE
+        or acceptance.get("exact_semantics") is not True
+    ):
         raise GateError("acceptance thresholds drifted")
+    exact_json_value(acceptance, EXPECTED_ACCEPTANCE, "acceptance contract")
     execution = contract.get("execution")
     if not isinstance(execution, dict) or execution.get("candidate_timing_executed") is not False:
         raise GateError("frozen contract must precede candidate timing")
@@ -496,8 +623,24 @@ def require_exact_contract(
         "missing_duplicate_nonfinite_unpaired_wrong_order_or_mutated_input": "hard failure",
         "rebar_input": False,
         "candidate_timing_executed": False,
-    } or not isinstance(execution.get("sealing_authority"), str):
+    } or execution.get("rebar_input") is not False or not isinstance(
+        execution.get("sealing_authority"), str
+    ):
         raise GateError("execution contract drifted")
+    exact_json_value(
+        execution,
+        {
+            "runs": 1,
+            "launcher": "one-shot; require three explicit distinct CPU IDs and run the three disjoint shards concurrently; on Linux pin shard i to CPU i with taskset",
+            "admission": "do not wait on load, headroom, another GO, or other CPU work; do not kill other CPU work",
+            "run_manifest": "create-new and read-only before timing; seal host fingerprint, ordered CPU IDs, shard-to-CPU map, source/binary/archive/contract/cell identities, authorization nonce, three distinct shard nonces, and a distinct run nonce",
+            "missing_duplicate_nonfinite_unpaired_wrong_order_or_mutated_input": "hard failure",
+            "rebar_input": False,
+            "sealing_authority": execution["sealing_authority"],
+            "candidate_timing_executed": False,
+        },
+        "execution contract",
+    )
     if contract_file.mode & 0o222:
         raise GateError("sealed contract remains writable")
     if cells_file.mode & 0o222:
@@ -809,7 +952,7 @@ def validate_cell_manifest(
 
 
 def positive_integer(value: Any, name: str) -> int:
-    return strict_integer(value, name, minimum=1)
+    return strict_integer(value, name, minimum=1, maximum=MAX_U64)
 
 
 def validate_calibrations(value: Any) -> dict[str, int]:
@@ -1058,9 +1201,12 @@ def validate_one_shot_seal(
         "analyzer_sha256",
         "authorization_nonce",
     ):
-        lowercase_hex(seal.get(field), 64, f"seal {field}")
-    lowercase_hex(seal.get("source_commit"), 40, "seal source commit")
-    lowercase_hex(seal.get("source_tree"), 40, "seal source tree")
+        if field == "authorization_nonce":
+            nonplaceholder_hex(seal.get(field), 64, f"seal {field}")
+        else:
+            lowercase_hex(seal.get(field), 64, f"seal {field}")
+    nonplaceholder_hex(seal.get("source_commit"), 40, "seal source commit")
+    nonplaceholder_hex(seal.get("source_tree"), 40, "seal source tree")
 
 
 def validate_run_manifest(
@@ -1098,8 +1244,11 @@ def validate_run_manifest(
         or run_manifest["source_tree"] != contract["candidate"]["source_tree"]
     ):
         raise GateError("run-manifest source differs from the sealed contract")
-    run_nonce = lowercase_hex(run_manifest.get("run_nonce"), 64, "run nonce")
-    host_fingerprint = lowercase_hex(
+    authorization_nonce = nonplaceholder_hex(
+        seal.get("authorization_nonce"), 64, "authorization nonce"
+    )
+    run_nonce = nonplaceholder_hex(run_manifest.get("run_nonce"), 64, "run nonce")
+    host_fingerprint = nonplaceholder_hex(
         run_manifest.get("host_fingerprint_sha256"), 64, "host fingerprint"
     )
     cpu_value = run_manifest.get("cpu_ids")
@@ -1131,12 +1280,11 @@ def validate_run_manifest(
         ):
             raise GateError("run manifest shard/CPU mapping drifted")
         shard_nonces.append(
-            lowercase_hex(
+            nonplaceholder_hex(
                 mapping.get("shard_nonce"), 64, f"shard {shard_id} nonce"
             )
         )
-    if len(set(shard_nonces)) != 3 or run_nonce in shard_nonces:
-        raise GateError("run and shard nonces are not distinct")
+    require_distinct_nonce_roles(authorization_nonce, run_nonce, shard_nonces)
     return cpu_ids, shard_nonces, host_fingerprint, run_nonce
 
 
