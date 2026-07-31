@@ -2,8 +2,11 @@
 
 use core::fmt;
 use core::mem;
+use std::sync::Arc;
 
-use aho_corasick::{AhoCorasick, AhoCorasickKind, Input, MatchKind};
+use aho_corasick::automaton::Automaton;
+use aho_corasick::dfa::DFA;
+use aho_corasick::{AhoCorasick, Input, MatchKind};
 use fre_exact_alloc::try_box_preserve;
 
 use crate::Window;
@@ -16,6 +19,9 @@ const ALPHABET_LEN: usize = 256;
 const BYTES_PER_DFA_CELL_ENVELOPE: usize = 16;
 const BYTES_PER_TRIE_STATE_ENVELOPE: usize = 256;
 const BYTES_PER_PATTERN_ENVELOPE: usize = 128;
+// Keep the published build envelope and its exact limit decisions stable
+// after replacing the type-erased owner with a smaller `Arc<DFA>`.
+const LEGACY_AHO_OWNER_ENVELOPE_BYTES: usize = mem::size_of::<AhoCorasick>();
 
 /// Hard limits for constructing one ordered finite-literal plan.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -228,7 +234,7 @@ impl std::error::Error for LiteralSetError {}
 /// before its DFA is built.
 #[derive(Clone, Debug)]
 pub struct LiteralSetPlan {
-    automaton: AhoCorasick,
+    automaton: Arc<DFA>,
     build: LiteralSetBuildAccounting,
     folded_long_tail: Option<Box<FoldedLongTail>>,
 }
@@ -253,7 +259,7 @@ struct FoldedLongProspective {
 /// and pattern identifiers private.
 #[derive(Debug)]
 pub struct LiteralSetMatches<'plan, 'haystack> {
-    automaton: &'plan AhoCorasick,
+    automaton: &'plan DFA,
     haystack: &'haystack [u8],
     start: usize,
     done: bool,
@@ -266,9 +272,11 @@ impl Iterator for LiteralSetMatches<'_, '_> {
         if self.done {
             return None;
         }
+        let input = Input::new(self.haystack).span(self.start..self.haystack.len());
         let Some(matched) = self
             .automaton
-            .find(Input::new(self.haystack).span(self.start..self.haystack.len()))
+            .try_find(&input)
+            .expect("the literal-set DFA supports its construction-selected unanchored input")
         else {
             self.done = true;
             return None;
@@ -322,8 +330,7 @@ impl LiteralSetPlan {
             LiteralSetMatchSemantics::LeftmostFirst => MatchKind::LeftmostFirst,
             LiteralSetMatchSemantics::StreamingAny => MatchKind::Standard,
         };
-        let automaton = AhoCorasick::builder()
-            .kind(Some(AhoCorasickKind::DFA))
+        let automaton = DFA::builder()
             .match_kind(match_kind)
             .build(patterns.iter().map(AsRef::as_ref))
             .map_err(|error| LiteralSetError::AutomatonBuild {
@@ -337,7 +344,7 @@ impl LiteralSetPlan {
             });
         }
         Ok(Self {
-            automaton,
+            automaton: Arc::new(automaton),
             build,
             folded_long_tail: None,
         })
@@ -444,7 +451,7 @@ impl LiteralSetPlan {
         }
         Ok((
             LiteralSetMatches {
-                automaton: &self.automaton,
+                automaton: self.automaton.as_ref(),
                 haystack,
                 start: 0,
                 done: false,
@@ -509,9 +516,12 @@ impl LiteralSetPlan {
         {
             return self.find_window_folded_long(haystack, window, limits, accounting, tail);
         }
+        let input = Input::new(&haystack[window.start()..window.end()]);
         let matched = self
             .automaton
-            .find(&haystack[window.start()..window.end()])
+            .as_ref()
+            .try_find(&input)
+            .expect("the literal-set DFA supports its construction-selected unanchored input")
             .map(|matched| {
                 let start = window.start().checked_add(matched.start()).ok_or(
                     LiteralSetError::ArithmeticOverflow {
@@ -619,9 +629,12 @@ impl LiteralSetPlan {
         window: Window,
         accounting: LiteralSetAccounting,
     ) -> Result<(Option<(usize, usize)>, LiteralSetAccounting), LiteralSetError> {
+        let input = Input::new(&haystack[window.start()..window.end()]);
         let matched = self
             .automaton
-            .find(&haystack[window.start()..window.end()])
+            .as_ref()
+            .try_find(&input)
+            .expect("the literal-set DFA supports its construction-selected unanchored input")
             .map(|matched| absolute_match(window.start(), matched))
             .transpose()?;
         Ok((matched, accounting))
@@ -865,7 +878,7 @@ fn build_bytes_upper_bound(
         .checked_add(trie_bytes)
         .and_then(|bytes| bytes.checked_add(pattern_overhead))
         .and_then(|bytes| bytes.checked_add(pattern_bytes))
-        .and_then(|bytes| bytes.checked_add(mem::size_of::<AhoCorasick>()))
+        .and_then(|bytes| bytes.checked_add(LEGACY_AHO_OWNER_ENVELOPE_BYTES))
         .ok_or(LiteralSetError::ArithmeticOverflow {
             computation: "literal-set peak-build byte envelope",
         })
@@ -1079,8 +1092,61 @@ mod folded_long_tail_tests {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::{LiteralSetBuildLimits, LiteralSetError, LiteralSetPlan, LiteralSetSearchLimits};
     use crate::Window;
+
+    #[test]
+    fn concrete_dfa_owner_preserves_clone_accounting_priority_and_iteration() {
+        let ordered = LiteralSetPlan::new(
+            &[b"ab".as_slice(), b"a".as_slice(), b"".as_slice()],
+            LiteralSetBuildLimits::default(),
+        )
+        .unwrap();
+        let cloned = ordered.clone();
+        assert!(Arc::ptr_eq(&ordered.automaton, &cloned.automaton));
+        assert_eq!(ordered.build_accounting(), cloned.build_accounting());
+        assert_eq!(
+            cloned
+                .find_window(
+                    b"zzab",
+                    Window::new(2, 4),
+                    LiteralSetSearchLimits::unlimited(),
+                )
+                .unwrap()
+                .0,
+            Some((2, 4))
+        );
+        assert_eq!(
+            cloned
+                .find_window(
+                    b"zz",
+                    Window::new(1, 2),
+                    LiteralSetSearchLimits::unlimited(),
+                )
+                .unwrap()
+                .0,
+            Some((1, 1))
+        );
+
+        let streaming = LiteralSetPlan::new_streaming_any(
+            &[b"ab".as_slice(), b"a".as_slice(), b"xy".as_slice()],
+            LiteralSetBuildLimits::default(),
+        )
+        .unwrap();
+        let prospective = streaming.find_iter_accounting(6).unwrap();
+        let (matches, accounting) = streaming
+            .find_iter(
+                b"abaxyz",
+                LiteralSetSearchLimits {
+                    max_transitions: prospective.transitions_upper_bound,
+                },
+            )
+            .unwrap();
+        assert_eq!(matches.collect::<Vec<_>>(), [(0, 1), (2, 3), (3, 5)]);
+        assert_eq!(accounting, prospective);
+    }
 
     #[test]
     fn leftmost_first_preserves_alternative_order_and_empty_patterns() {
