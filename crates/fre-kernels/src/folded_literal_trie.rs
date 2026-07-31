@@ -1163,6 +1163,190 @@ where
     )
 }
 
+struct AdaptiveHitState<'plan, 'source> {
+    plan: &'plan FoldedLiteralTriePlan,
+    source: &'source [u8],
+    absolute_base: usize,
+    upper: ScanUpperBounds,
+    offset: usize,
+    prefilter: &'plan RootPrefilter,
+    actual: ScanActual,
+    prefilter_source_reads: usize,
+    previous_candidate_scanned_through: usize,
+    outcome: AdaptiveFindOutcome,
+}
+
+impl AdaptiveHitState<'_, '_> {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the outlined adaptive transaction preserves every accounting and fallback branch"
+    )]
+    #[inline(never)]
+    fn on_hit(&mut self, hit: usize, scanned_through: usize) -> Result<bool, ScanAttemptError> {
+        let additional_reads = scanned_through
+            .checked_sub(self.prefilter_source_reads)
+            .ok_or(ScanAttemptError {
+                source: ScanError::Invariant {
+                    detail: "adaptive folded prefilter prefix moved backwards",
+                },
+                actual: self.actual,
+            })?;
+        self.actual.source_byte_reads = checked_actual_add(
+            self.actual.source_byte_reads,
+            additional_reads,
+            self.upper,
+            self.actual,
+            "adaptive folded prefilter source reads",
+        )?;
+        self.prefilter_source_reads = scanned_through;
+        let Some(relative_start) = hit.checked_sub(self.offset) else {
+            return Ok(true);
+        };
+
+        let verification_source_reads_before = self.actual.source_byte_reads;
+        let verification_transition_probes_before = self.actual.transition_probes;
+        let verification_candidate_starts_before = self.actual.candidate_starts;
+        if self.prefilter.has_guard() {
+            let Some(guard_position) =
+                relative_start.checked_add(usize::from(self.prefilter.guard_offset))
+            else {
+                return Ok(true);
+            };
+            let Some(&guard_byte) = self.source.get(guard_position) else {
+                return Ok(true);
+            };
+            self.actual.source_byte_reads = checked_actual_add(
+                self.actual.source_byte_reads,
+                1,
+                self.upper,
+                self.actual,
+                "adaptive folded prefilter guard reads",
+            )?;
+            if !self.prefilter.guard_matches(guard_byte) {
+                let guard_work = self
+                    .actual
+                    .source_byte_reads
+                    .checked_sub(verification_source_reads_before)
+                    .ok_or_else(|| {
+                        attempt_overflow(
+                            self.upper,
+                            self.actual,
+                            "adaptive guard verification work",
+                        )
+                    })?;
+                let local_span = scanned_through
+                    .checked_sub(self.previous_candidate_scanned_through)
+                    .ok_or_else(|| {
+                        attempt_overflow(self.upper, self.actual, "adaptive guard byte distance")
+                    })?;
+                self.previous_candidate_scanned_through = scanned_through;
+                if guard_work > local_span {
+                    let resume_start = self
+                        .absolute_base
+                        .checked_add(relative_start)
+                        .and_then(|start| start.checked_add(1))
+                        .ok_or_else(|| {
+                            attempt_overflow(
+                                self.upper,
+                                self.actual,
+                                "adaptive guard DFA continuation",
+                            )
+                        })?;
+                    self.outcome = AdaptiveFindOutcome::DenseFallback { resume_start };
+                    return Ok(false);
+                }
+                return Ok(true);
+            }
+        }
+        self.actual.candidate_starts = checked_actual_add(
+            self.actual.candidate_starts,
+            1,
+            self.upper,
+            self.actual,
+            "adaptive folded candidate starts",
+        )?;
+        let mut selected = None::<LiteralCandidate>;
+        let _ = scan_folded_start(
+            self.plan,
+            self.source,
+            self.absolute_base,
+            relative_start,
+            self.upper,
+            &mut self.actual,
+            false,
+            &mut |candidate| match selected {
+                None => selected = Some(candidate),
+                Some(best) if candidate.pattern_index() < best.pattern_index() => {
+                    selected = Some(candidate);
+                }
+                Some(_) => {}
+            },
+        )?;
+        if let Some(candidate) = selected {
+            self.outcome = AdaptiveFindOutcome::Match(candidate);
+            return Ok(false);
+        }
+
+        let verification_source_reads = self
+            .actual
+            .source_byte_reads
+            .checked_sub(verification_source_reads_before)
+            .ok_or_else(|| {
+                attempt_overflow(
+                    self.upper,
+                    self.actual,
+                    "adaptive verification source reads",
+                )
+            })?;
+        let verification_transition_probes = self
+            .actual
+            .transition_probes
+            .checked_sub(verification_transition_probes_before)
+            .ok_or_else(|| {
+                attempt_overflow(
+                    self.upper,
+                    self.actual,
+                    "adaptive verification transition probes",
+                )
+            })?;
+        let verification_candidate_starts = self
+            .actual
+            .candidate_starts
+            .checked_sub(verification_candidate_starts_before)
+            .ok_or_else(|| {
+                attempt_overflow(
+                    self.upper,
+                    self.actual,
+                    "adaptive verification candidate starts",
+                )
+            })?;
+        let verification_work = verification_source_reads
+            .checked_add(verification_transition_probes)
+            .and_then(|work| work.checked_add(verification_candidate_starts))
+            .ok_or_else(|| {
+                attempt_overflow(self.upper, self.actual, "adaptive verification work")
+            })?;
+        let local_span = scanned_through
+            .checked_sub(self.previous_candidate_scanned_through)
+            .ok_or_else(|| {
+                attempt_overflow(self.upper, self.actual, "adaptive candidate byte distance")
+            })?;
+        self.previous_candidate_scanned_through = scanned_through;
+        if verification_work > local_span {
+            let resume_start = self
+                .absolute_base
+                .checked_add(relative_start)
+                .and_then(|start| start.checked_add(1))
+                .ok_or_else(|| {
+                    attempt_overflow(self.upper, self.actual, "adaptive DFA continuation")
+                })?;
+            self.outcome = AdaptiveFindOutcome::DenseFallback { resume_start };
+            return Ok(false);
+        }
+        Ok(true)
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "ordered prefilter traversal retains exact continuation and work accounting"
@@ -1183,166 +1367,44 @@ fn execute_adaptive_find(
             actual: ScanActual::default(),
         });
     };
-    let mut actual = ScanActual {
+    let actual = ScanActual {
         input_bytes: source.len(),
         ..ScanActual::default()
     };
     let offset = usize::from(prefilter.offset);
     let invalid_actual = actual;
-    let mut prefilter_source_reads = 0_usize;
-    let mut previous_candidate_scanned_through = 0_usize;
-    let mut outcome = AdaptiveFindOutcome::NoMatch;
+    let mut state = AdaptiveHitState {
+        plan,
+        source,
+        absolute_base,
+        upper,
+        offset,
+        prefilter,
+        actual,
+        prefilter_source_reads: 0,
+        previous_candidate_scanned_through: 0,
+        outcome: AdaptiveFindOutcome::NoMatch,
+    };
     let completed_source_reads =
         prefilter.scan(source, invalid_actual, |hit, scanned_through| {
-            let additional_reads =
-                scanned_through
-                    .checked_sub(prefilter_source_reads)
-                    .ok_or(ScanAttemptError {
-                        source: ScanError::Invariant {
-                            detail: "adaptive folded prefilter prefix moved backwards",
-                        },
-                        actual,
-                    })?;
-            actual.source_byte_reads = checked_actual_add(
-                actual.source_byte_reads,
-                additional_reads,
-                upper,
-                actual,
-                "adaptive folded prefilter source reads",
-            )?;
-            prefilter_source_reads = scanned_through;
-            let Some(relative_start) = hit.checked_sub(offset) else {
-                return Ok(true);
-            };
-
-            let verification_source_reads_before = actual.source_byte_reads;
-            let verification_transition_probes_before = actual.transition_probes;
-            let verification_candidate_starts_before = actual.candidate_starts;
-            if prefilter.has_guard() {
-                let Some(guard_position) =
-                    relative_start.checked_add(usize::from(prefilter.guard_offset))
-                else {
-                    return Ok(true);
-                };
-                let Some(&guard_byte) = source.get(guard_position) else {
-                    return Ok(true);
-                };
-                actual.source_byte_reads = checked_actual_add(
-                    actual.source_byte_reads,
-                    1,
-                    upper,
-                    actual,
-                    "adaptive folded prefilter guard reads",
-                )?;
-                if !prefilter.guard_matches(guard_byte) {
-                    let guard_work = actual
-                        .source_byte_reads
-                        .checked_sub(verification_source_reads_before)
-                        .ok_or_else(|| {
-                            attempt_overflow(upper, actual, "adaptive guard verification work")
-                        })?;
-                    let local_span = scanned_through
-                        .checked_sub(previous_candidate_scanned_through)
-                        .ok_or_else(|| {
-                            attempt_overflow(upper, actual, "adaptive guard byte distance")
-                        })?;
-                    previous_candidate_scanned_through = scanned_through;
-                    if guard_work > local_span {
-                        let resume_start = absolute_base
-                            .checked_add(relative_start)
-                            .and_then(|start| start.checked_add(1))
-                            .ok_or_else(|| {
-                                attempt_overflow(upper, actual, "adaptive guard DFA continuation")
-                            })?;
-                        outcome = AdaptiveFindOutcome::DenseFallback { resume_start };
-                        return Ok(false);
-                    }
-                    return Ok(true);
-                }
-            }
-            actual.candidate_starts = checked_actual_add(
-                actual.candidate_starts,
-                1,
-                upper,
-                actual,
-                "adaptive folded candidate starts",
-            )?;
-            let mut selected = None::<LiteralCandidate>;
-            let _ = scan_folded_start(
-                plan,
-                source,
-                absolute_base,
-                relative_start,
-                upper,
-                &mut actual,
-                false,
-                &mut |candidate| match selected {
-                    None => selected = Some(candidate),
-                    Some(best) if candidate.pattern_index() < best.pattern_index() => {
-                        selected = Some(candidate);
-                    }
-                    Some(_) => {}
-                },
-            )?;
-            if let Some(candidate) = selected {
-                outcome = AdaptiveFindOutcome::Match(candidate);
-                return Ok(false);
-            }
-
-            let verification_source_reads = actual
-                .source_byte_reads
-                .checked_sub(verification_source_reads_before)
-                .ok_or_else(|| {
-                    attempt_overflow(upper, actual, "adaptive verification source reads")
-                })?;
-            let verification_transition_probes = actual
-                .transition_probes
-                .checked_sub(verification_transition_probes_before)
-                .ok_or_else(|| {
-                    attempt_overflow(upper, actual, "adaptive verification transition probes")
-                })?;
-            let verification_candidate_starts = actual
-                .candidate_starts
-                .checked_sub(verification_candidate_starts_before)
-                .ok_or_else(|| {
-                    attempt_overflow(upper, actual, "adaptive verification candidate starts")
-                })?;
-            let verification_work = verification_source_reads
-                .checked_add(verification_transition_probes)
-                .and_then(|work| work.checked_add(verification_candidate_starts))
-                .ok_or_else(|| attempt_overflow(upper, actual, "adaptive verification work"))?;
-            let local_span = scanned_through
-                .checked_sub(previous_candidate_scanned_through)
-                .ok_or_else(|| {
-                    attempt_overflow(upper, actual, "adaptive candidate byte distance")
-                })?;
-            previous_candidate_scanned_through = scanned_through;
-            if verification_work > local_span {
-                let resume_start = absolute_base
-                    .checked_add(relative_start)
-                    .and_then(|start| start.checked_add(1))
-                    .ok_or_else(|| attempt_overflow(upper, actual, "adaptive DFA continuation"))?;
-                outcome = AdaptiveFindOutcome::DenseFallback { resume_start };
-                return Ok(false);
-            }
-            Ok(true)
+            state.on_hit(hit, scanned_through)
         })?;
     let remaining_prefilter_reads = completed_source_reads
-        .checked_sub(prefilter_source_reads)
+        .checked_sub(state.prefilter_source_reads)
         .ok_or(ScanAttemptError {
             source: ScanError::Invariant {
                 detail: "adaptive folded prefilter completion moved backwards",
             },
-            actual,
+            actual: state.actual,
         })?;
-    actual.source_byte_reads = checked_actual_add(
-        actual.source_byte_reads,
+    state.actual.source_byte_reads = checked_actual_add(
+        state.actual.source_byte_reads,
         remaining_prefilter_reads,
         upper,
-        actual,
+        state.actual,
         "adaptive folded prefilter completion source reads",
     )?;
-    Ok((outcome, actual))
+    Ok((state.outcome, state.actual))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -371,9 +371,7 @@ impl LiteralSetPlan {
             || self.folded_long_tail.is_some()
             || max_pattern_bytes == 0
         {
-            return Err(LiteralSetError::AutomatonBuild {
-                detail: "invalid folded long-tail attachment".to_owned(),
-            });
+            return Err(invariant_error("invalid folded long-tail attachment"));
         }
         let dfa_prefix_bytes = ALPHABET_LEN.max(max_pattern_bytes);
         let retained_bytes = trie
@@ -551,20 +549,18 @@ impl LiteralSetPlan {
             },
         )?;
         let prefix_window = Window::new(window.start(), prefix_end);
-        let prefix_match = self
-            .automaton
-            .find(&haystack[prefix_window.start()..prefix_window.end()]);
+        let (prefix_match, _) =
+            self.find_window_incumbent(haystack, prefix_window, incumbent_accounting)?;
         let trie_start = prefix_end
             .checked_sub(tail.max_pattern_bytes)
             .and_then(|start| start.checked_add(1))
             .ok_or(LiteralSetError::ArithmeticOverflow {
                 computation: "folded literal-set trie continuation",
             })?;
-        if let Some(matched) = prefix_match {
-            let matched = absolute_match(prefix_window.start(), matched)?;
-            if matched.0 < trie_start {
-                return Ok((Some(matched), incumbent_accounting));
-            }
+        if let Some(matched) = prefix_match
+            && matched.0 < trie_start
+        {
+            return Ok((Some(matched), incumbent_accounting));
         }
         let adaptive = tail
             .trie
@@ -601,11 +597,8 @@ impl LiteralSetPlan {
                 let fallback_window = Window::new(resume_start, window.end());
                 let fallback_accounting =
                     search_accounting(fallback_window, haystack.len(), limits)?;
-                let matched = self
-                    .automaton
-                    .find(&haystack[fallback_window.start()..fallback_window.end()])
-                    .map(|matched| absolute_match(fallback_window.start(), matched))
-                    .transpose()?;
+                let (matched, _) =
+                    self.find_window_incumbent(haystack, fallback_window, fallback_accounting)?;
                 let total_work = partial_work
                     .checked_add(fallback_accounting.transitions_upper_bound)
                     .ok_or(LiteralSetError::ArithmeticOverflow {
@@ -618,6 +611,8 @@ impl LiteralSetPlan {
         }
     }
 
+    #[cold]
+    #[inline(never)]
     fn find_window_incumbent(
         &self,
         haystack: &[u8],
@@ -668,9 +663,9 @@ fn folded_long_accounting(
     prospective_work: usize,
 ) -> Result<LiteralSetAccounting, LiteralSetError> {
     if actual_work > prospective_work {
-        return Err(LiteralSetError::AutomatonBuild {
-            detail: "folded literal-set actual work exceeded its precharged prospective".to_owned(),
-        });
+        return Err(invariant_error(
+            "folded literal-set actual work exceeded its precharged prospective",
+        ));
     }
     Ok(LiteralSetAccounting {
         searched_bytes: incumbent.searched_bytes,
@@ -713,10 +708,16 @@ fn map_folded_scan_error(error: &FoldedScanAttemptError) -> LiteralSetError {
             LiteralSetError::ArithmeticOverflow { computation }
         }
         FoldedScanError::Resource { .. } | FoldedScanError::Invariant { .. } => {
-            LiteralSetError::AutomatonBuild {
-                detail: "folded literal-set search invariant failed".to_owned(),
-            }
+            invariant_error("folded literal-set search invariant failed")
         }
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn invariant_error(detail: &'static str) -> LiteralSetError {
+    LiteralSetError::AutomatonBuild {
+        detail: detail.to_owned(),
     }
 }
 
