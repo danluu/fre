@@ -27,5 +27,6 @@ per-cell counts, geometry, and public-emitter admission.
 prepares KIR outside the clock, performs two untimed candidate/source warmup
 pairs, then records the arithmetic median of eleven paired full-population
 emission batches with alternating order. It never publishes or invokes
-machine code and its result is not an acceptance gate. Search performance
-execution belongs to a separately sealed one-shot runner and receipt.
+machine code, refuses non-release builds, and its result is not an acceptance
+gate. Search performance execution belongs to a separately sealed one-shot
+runner and receipt.

@@ -1039,6 +1039,7 @@ pub struct EmissionTimingReport {
     pub short_source_backend: u16,
     pub wide_source_backend: u16,
     pub objects_per_batch: usize,
+    pub rust_profile: &'static str,
     pub untimed_warmup_pairs: usize,
     pub measured_paired_batches: usize,
     pub execution_orders: Vec<&'static str>,
@@ -1061,6 +1062,11 @@ pub struct EmissionTimingReport {
 pub fn report_only_emission_timing(
     population: &SyntheticPopulation,
 ) -> Result<EmissionTimingReport, PopulationError> {
+    if cfg!(debug_assertions) {
+        return Err(PopulationError::new(
+            "report-only emission timing requires a --release build",
+        ));
+    }
     let prepared = prepare_emissions(population)?;
 
     let candidate_identity = bound_emission_batch(
@@ -1132,6 +1138,7 @@ pub fn report_only_emission_timing(
         short_source_backend: BackendVersion::SEARCH_V17.0,
         wide_source_backend: BackendVersion::SEARCH_V25.0,
         objects_per_batch: prepared.len(),
+        rust_profile: "release",
         untimed_warmup_pairs: EMISSION_WARMUP_PAIRS,
         measured_paired_batches: EMISSION_MEASURED_PAIRS,
         execution_orders,
