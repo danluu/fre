@@ -1,17 +1,18 @@
 #![allow(
     clippy::arithmetic_side_effects,
     clippy::cast_precision_loss,
+    clippy::enum_variant_names,
     clippy::too_many_lines,
     unsafe_code,
     reason = "the bounded evidence harness keeps timing arithmetic and its static AAPCS64 call boundary explicit"
 )]
 
 use std::{
-    collections::BTreeMap,
+    collections::BTreeSet,
     error::Error,
     fs,
     hint::black_box,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -112,6 +113,14 @@ impl Outcome {
             Self::NoMatch => "no-match",
             Self::EarlyMatch => "early-match",
             Self::LateMatch => "late-match",
+        }
+    }
+
+    const fn ordinal(self) -> u64 {
+        match self {
+            Self::NoMatch => 0,
+            Self::EarlyMatch => 1,
+            Self::LateMatch => 2,
         }
     }
 }
@@ -255,7 +264,7 @@ fn main() -> Result<(), DynError> {
                     u64::try_from(ordinal)?
                         .wrapping_mul(0xd6e8_feb8_6659_fd93)
                         .wrapping_add(u64::try_from(window_bytes)?)
-                        .wrapping_add(u64::try_from(outcome as u8)?),
+                        .wrapping_add(outcome.ordinal()),
                 );
                 let fixture = make_fixture(family.literal, window_bytes, outcome, seed)?;
                 for output in Output::ALL {
@@ -316,14 +325,14 @@ fn main() -> Result<(), DynError> {
 }
 
 fn validate_families(families: &[CandidateFamily]) -> Result<(), DynError> {
-    let mut seen = BTreeMap::new();
+    let mut seen = BTreeSet::new();
     for family in families {
         require(
             family.width == family.literal.len() && (1..=32).contains(&family.width),
             "candidate width changed",
         )?;
         require(
-            seen.insert((family.width, family.topology), ()).is_none(),
+            seen.insert((family.width, family.topology)),
             "duplicate candidate family",
         )?;
         if family.width < 6 {
@@ -468,9 +477,9 @@ fn verify(
 fn project_expected(output: Output, found: Option<(usize, usize)>) -> u64 {
     match output {
         Output::Exists => u64::from(found.is_some()),
-        Output::SelectedEnd => found.map_or(u64::MAX, |(_, end)| end as u64),
+        Output::SelectedEnd => found.map_or(u64::MAX, |(_, end)| usize_u64(end)),
         Output::Span => found.map_or(u64::MAX, |(start, end)| {
-            (start as u64).rotate_left(29) ^ end as u64
+            usize_u64(start).rotate_left(29) ^ usize_u64(end)
         }),
     }
 }
@@ -498,8 +507,8 @@ fn call_native(entry: EntryFunction, output: Output, haystack: &[u8], window: Se
         (0, Output::Exists) => 0,
         (0, Output::SelectedEnd | Output::Span) => u64::MAX,
         (1, Output::Exists) => 1,
-        (1, Output::SelectedEnd) => slot.end as u64,
-        (1, Output::Span) => (slot.start as u64).rotate_left(29) ^ slot.end as u64,
+        (1, Output::SelectedEnd) => usize_u64(slot.end),
+        (1, Output::Span) => usize_u64(slot.start).rotate_left(29) ^ usize_u64(slot.end),
         _ => u64::MAX - 1,
     }
 }
@@ -519,11 +528,11 @@ fn call_portable(
         )?),
         Output::SelectedEnd => portable
             .find_window_value(haystack, window, SearchLimits::unlimited())?
-            .map_or(u64::MAX, |matched| matched.end() as u64),
+            .map_or(u64::MAX, |matched| usize_u64(matched.end())),
         Output::Span => portable
             .find_window_value(haystack, window, SearchLimits::unlimited())?
             .map_or(u64::MAX, |matched| {
-                (matched.start() as u64).rotate_left(29) ^ matched.end() as u64
+                usize_u64(matched.start()).rotate_left(29) ^ usize_u64(matched.end())
             }),
     })
 }
@@ -590,10 +599,11 @@ fn measure_cell(
             checksum ^= native_checksum.rotate_left(11) ^ portable_checksum.rotate_left(31);
         }
     }
-    let native_ns = median_duration(&mut native_samples).as_secs_f64() * 1e9 / iterations as f64;
-    let portable_ns =
-        median_duration(&mut portable_samples).as_secs_f64() * 1e9 / iterations as f64;
-    let gib = window_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    let iterations_f64 = f64::from(u32::try_from(iterations).expect("bounded iterations"));
+    let native_ns = median_duration(&mut native_samples).as_secs_f64() * 1e9 / iterations_f64;
+    let portable_ns = median_duration(&mut portable_samples).as_secs_f64() * 1e9 / iterations_f64;
+    let gib = f64::from(u32::try_from(window_bytes).expect("bounded evidence window"))
+        / (1024.0 * 1024.0 * 1024.0);
     Ok(TimingRow {
         width: family.width,
         topology: family.topology,
@@ -733,7 +743,9 @@ fn summarize(group: String, rows: &[TimingRow]) -> GroupSummary {
     GroupSummary {
         group,
         cells: ratios.len(),
-        geomean_portable_over_native: (logarithmic_sum / ratios.len() as f64).exp(),
+        geomean_portable_over_native: (logarithmic_sum
+            / f64::from(u32::try_from(ratios.len()).expect("bounded evidence rows")))
+        .exp(),
         p05_portable_over_native: percentile(&ratios, 5),
         median_portable_over_native: percentile(&ratios, 50),
         p95_portable_over_native: percentile(&ratios, 95),
@@ -752,7 +764,7 @@ fn percentile(sorted: &[f64], percentile: usize) -> f64 {
     sorted[index]
 }
 
-fn print_summary(evidence: &Evidence, output: &PathBuf) {
+fn print_summary(evidence: &Evidence, output: &Path) {
     println!(
         "semantics: deterministic={} randomized={} mismatches={}",
         evidence.semantics.deterministic_cells_checked,
@@ -860,6 +872,10 @@ fn splitmix64(mut value: u64) -> u64 {
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     value ^ (value >> 31)
+}
+
+fn usize_u64(value: usize) -> u64 {
+    u64::try_from(value).expect("AArch64 usize always fits u64")
 }
 
 fn require(condition: bool, message: &str) -> Result<(), DynError> {

@@ -1,3 +1,9 @@
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::too_many_lines,
+    reason = "the bounded source corpus and its generated static-object receipt stay linear and explicit"
+)]
+
 use std::{
     env,
     fmt::Write as _,
@@ -180,12 +186,7 @@ fn selected_v27_graph(literal: &[u8], v27: &NativeImage) -> &'static str {
     } else {
         SearchBackendPolicy::AsimdV25
     };
-    let Ok(source) = emit_with_backend(
-        &program,
-        source_policy,
-        EmitLimits::default(),
-    )
-    else {
+    let Ok(source) = emit_with_backend(&program, source_policy, EmitLimits::default()) else {
         return "v8-fallback";
     };
     if v27.code() == source.code()
