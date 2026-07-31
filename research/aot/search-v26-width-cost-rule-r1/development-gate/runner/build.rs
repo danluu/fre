@@ -7,6 +7,10 @@ use std::{
 
 use sha2::{Digest as _, Sha256};
 
+mod source_set_order;
+
+use source_set_order::{canonical_relative_source_name, sort_source_paths};
+
 fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(
@@ -90,17 +94,11 @@ fn source_set_identity(root: &Path) -> String {
         println!("cargo:rerun-if-changed={}", path.display());
         files.push(path);
     }
-    files.sort();
+    sort_source_paths(root, &mut files);
     let mut hasher = Sha256::new();
     hasher.update(b"FRE-V26-RUNNER-SOURCE-SET-V2\0\x01");
     for path in files {
-        let relative = path
-            .strip_prefix(root)
-            .expect("source-set path is below manifest root");
-        let relative = relative
-            .to_str()
-            .expect("runner source-set path is UTF-8")
-            .as_bytes();
+        let relative = canonical_relative_source_name(root, &path).as_bytes();
         let bytes = fs::read(&path)
             .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
         let executable = fs::metadata(&path)

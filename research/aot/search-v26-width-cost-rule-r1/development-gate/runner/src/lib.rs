@@ -17,6 +17,10 @@ use fre_search_v26_synthetic_runner::{
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
+#[cfg(test)]
+#[path = "../source_set_order.rs"]
+mod source_set_order;
+
 pub const EXPECTED_POPULATION_SHA256: &str =
     "a682375f2e6e051f97322396bafc46974df47baa3518bc17f5d6b71b56407b73";
 pub const LONG_WINDOW_BYTES: usize = 2_097_152;

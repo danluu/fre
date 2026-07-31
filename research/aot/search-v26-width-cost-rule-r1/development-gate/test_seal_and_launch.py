@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import errno
+import hashlib
 import json
 import os
 import subprocess
@@ -94,6 +95,8 @@ class SealAndLaunchTests(unittest.TestCase):
                 "Cargo.toml": "[workspace]\n",
                 "rust-toolchain.toml": "[toolchain]\nchannel = \"stable\"\n",
                 ".cargo/config.toml": "[build]\nincremental = false\n",
+                "crates/fre-aggregate/Cargo.toml": "[package]\nname = \"aggregate\"\n",
+                "crates/fre/Cargo.toml": "[package]\nname = \"fre\"\n",
                 "crates/example/src/lib.rs": "pub fn example() {}\n",
                 (
                     "research/aot/search-v26-width-cost-rule-r1/"
@@ -128,6 +131,25 @@ class SealAndLaunchTests(unittest.TestCase):
             first = seal.publish_git_archive(repository, commit, tree, first_path)
             first_source_set = gate.archive_runner_source_set_sha256(first)
             self.assertEqual(len(first_source_set), 64)
+            canonical_names = sorted(files)
+            self.assertLess(
+                canonical_names.index("crates/fre-aggregate/Cargo.toml"),
+                canonical_names.index("crates/fre/Cargo.toml"),
+            )
+            expected_source_set = hashlib.sha256()
+            expected_source_set.update(b"FRE-V26-RUNNER-SOURCE-SET-V2\0\x01")
+            for relative in canonical_names:
+                source = repository / relative
+                relative_bytes = relative.encode("utf-8")
+                data = source.read_bytes()
+                executable = int(bool(source.stat().st_mode & 0o111))
+                expected_source_set.update(len(relative_bytes).to_bytes(8, "little"))
+                expected_source_set.update(relative_bytes)
+                expected_source_set.update(b"F")
+                expected_source_set.update(bytes([executable]))
+                expected_source_set.update(len(data).to_bytes(8, "little"))
+                expected_source_set.update(data)
+            self.assertEqual(first_source_set, expected_source_set.hexdigest())
             with tarfile.open(first_path, "r:") as archive:
                 self.assertTrue(any(member.isdir() for member in archive))
 
