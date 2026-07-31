@@ -776,6 +776,8 @@ const SEARCH_CANDIDATE_POLICY_V8: u16 = 12;
 const SEARCH_CANDIDATE_POLICY_V9: u16 = 13;
 const SEARCH_CANDIDATE_POLICY_V10: u16 = 14;
 const SEARCH_CANDIDATE_POLICY_V11: u16 = 15;
+// Independently pinned Search V26 width-cost selector receipt.
+const SEARCH_CANDIDATE_POLICY_V12: u16 = 16;
 const SEARCH_CANDIDATE_BLOCK_WIDTH: u16 = 16;
 const SEARCH_CANDIDATE_OFFSET_NONE: u16 = u16::MAX;
 const SVE2_CLASS_TABLE_DATA_ID: u32 = 2;
@@ -1005,6 +1007,10 @@ fn authenticate_search_candidate_policy(
                     && manifest.shape == SearchShape::ExactLiteral
                 {
                     SEARCH_CANDIDATE_POLICY_V10
+                } else if manifest.backend_version == BackendVersion::SEARCH_V26
+                    && manifest.shape == SearchShape::ExactLiteral
+                {
+                    SEARCH_CANDIDATE_POLICY_V12
                 } else if matches!(
                     manifest.backend_version,
                     BackendVersion::SEARCH_V15
@@ -1018,7 +1024,6 @@ fn authenticate_search_candidate_policy(
                         | BackendVersion::SEARCH_V23
                         | BackendVersion::SEARCH_V24
                         | BackendVersion::SEARCH_V25
-                        | BackendVersion::SEARCH_V26
                 ) && manifest.shape == SearchShape::ExactLiteral
                 {
                     SEARCH_CANDIDATE_POLICY_V11

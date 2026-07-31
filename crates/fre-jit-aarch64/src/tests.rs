@@ -14064,8 +14064,10 @@ fn v26_emitter_and_independent_auditor_width_rules_match_exact_frozen_boundaries
 }
 
 #[test]
-fn v26_routes_every_width_and_output_to_the_exact_frozen_source_object() {
+fn v26_routes_every_width_and_output_to_frozen_source_machine_code() {
     let mut images = 0_u64;
+    let mut frozen_source_digest = Sha256::new();
+    frozen_source_digest.update(b"FRE-V26-FROZEN-V17-V25-SOURCE-AOT-MATRIX-V1\0");
     for width in SEARCH_V26_MIN_LITERAL_BYTES..=SEARCH_V26_MAX_LITERAL_BYTES {
         let source_backend = if width <= SEARCH_V26_V17_MAX_LITERAL_BYTES {
             SearchBackendPolicy::AsimdV17
@@ -14100,11 +14102,13 @@ fn v26_routes_every_width_and_output_to_the_exact_frozen_source_object() {
 
                 let mut candidate_manifest =
                     candidate.search_manifest().expect("V26 sealed manifest");
+                let source_manifest = source.search_manifest().expect("source sealed manifest");
+                assert_eq!(candidate_manifest.candidate_policy_version, 16);
+                assert_eq!(source_manifest.candidate_policy_version, 15);
                 candidate_manifest.backend_version = source.backend_version();
-                assert_eq!(
-                    candidate_manifest,
-                    source.search_manifest().expect("source sealed manifest")
-                );
+                candidate_manifest.candidate_policy_version =
+                    source_manifest.candidate_policy_version;
+                assert_eq!(candidate_manifest, source_manifest);
                 let report = audit(&candidate).expect("independent V26 width-selected template");
                 assert_eq!(
                     (report.decode_passes, report.source_identity_rebuilds),
@@ -14127,11 +14131,28 @@ fn v26_routes_every_width_and_output_to_the_exact_frozen_source_object() {
                     source.artifact_identity(),
                     "tag39 identity must remain distinct width={width} output={output:?}"
                 );
+                frozen_source_digest.update(
+                    u64::try_from(width)
+                        .expect("bounded source width")
+                        .to_le_bytes(),
+                );
+                frozen_source_digest.update([u8::from(zero_primary)]);
+                frozen_source_digest.update([match output {
+                    OutputKind::Exists => 0,
+                    OutputKind::SelectedEnd => 1,
+                    OutputKind::Span => 2,
+                }]);
+                frozen_source_digest.update(source_aot.as_bytes());
                 images = images.checked_add(1).expect("bounded V26 image count");
             }
         }
     }
     assert_eq!(images, 27 * 2 * 3);
+    assert_eq!(
+        format!("{:x}", frozen_source_digest.finalize()),
+        "052586cef9e3ff60ee3f68403074b253f7e5b72bbf20c1fef8d9eedb7a0a7c85",
+        "V26 must not rewrite either frozen source backend"
+    );
 }
 
 #[test]
@@ -14235,7 +14256,7 @@ fn v26_rejects_bare_relabels_and_a_wrong_width_selected_graph() {
             &format!("source backend-only relabel width={width}"),
         );
 
-        let mut source_manifest_only = source;
+        let mut source_manifest_only = source.clone();
         source_manifest_only
             .search
             .as_mut()
@@ -14246,11 +14267,52 @@ fn v26_rejects_bare_relabels_and_a_wrong_width_selected_graph() {
             &format!("source manifest-only relabel width={width}"),
         );
 
+        let mut source_coherent_relabel = source;
+        source_coherent_relabel.backend_version = BackendVersion::SEARCH_V26;
+        source_coherent_relabel
+            .search
+            .as_mut()
+            .expect("source manifest")
+            .backend_version = BackendVersion::SEARCH_V26;
+        reseal_test_image(&mut source_coherent_relabel);
+        assert_eq!(
+            audit(&source_coherent_relabel),
+            Err(AuditError::InvalidSearchManifest),
+            "source coherent relabel must retain the wrong policy receipt width={width}",
+        );
+
         let mut candidate_backend_only = candidate.clone();
         candidate_backend_only.backend_version = source_backend.backend_version();
         assert_resealed_search_rejected(
             candidate_backend_only,
             &format!("V26 backend-only relabel width={width}"),
+        );
+
+        let mut candidate_coherent_relabel = candidate.clone();
+        candidate_coherent_relabel.backend_version = source_backend.backend_version();
+        candidate_coherent_relabel
+            .search
+            .as_mut()
+            .expect("V26 manifest")
+            .backend_version = source_backend.backend_version();
+        reseal_test_image(&mut candidate_coherent_relabel);
+        assert_eq!(
+            audit(&candidate_coherent_relabel),
+            Err(AuditError::InvalidSearchManifest),
+            "V26 coherent relabel must retain the wrong policy receipt width={width}",
+        );
+
+        let mut candidate_wrong_policy = candidate.clone();
+        candidate_wrong_policy
+            .search
+            .as_mut()
+            .expect("V26 manifest")
+            .candidate_policy_version = 15;
+        reseal_test_image(&mut candidate_wrong_policy);
+        assert_eq!(
+            audit(&candidate_wrong_policy),
+            Err(AuditError::InvalidSearchManifest),
+            "V26 must independently authenticate its policy receipt width={width}",
         );
 
         let mut wrong_graph = candidate;

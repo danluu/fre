@@ -53,6 +53,8 @@ const SEARCH_CANDIDATE_POLICY_V8: u16 = 12;
 const SEARCH_CANDIDATE_POLICY_V9: u16 = 13;
 const SEARCH_CANDIDATE_POLICY_V10: u16 = 14;
 const SEARCH_CANDIDATE_POLICY_V11: u16 = 15;
+// Search V26's distinct sealed receipt for its width-cost graph selection.
+const SEARCH_CANDIDATE_POLICY_V12: u16 = 16;
 const SEARCH_CANDIDATE_BLOCK_WIDTH: u16 = 16;
 const SEARCH_CANDIDATE_OFFSET_NONE: u16 = u16::MAX;
 const SVE2_CLASS_TABLE_DATA_ID: u32 = 2;
@@ -2096,6 +2098,10 @@ impl<'a> Plan<'a> {
                             && shape == SearchShape::ExactLiteral
                         {
                             SEARCH_CANDIDATE_POLICY_V10
+                        } else if backend_version == BackendVersion::SEARCH_V26
+                            && shape == SearchShape::ExactLiteral
+                        {
+                            SEARCH_CANDIDATE_POLICY_V12
                         } else if matches!(
                             backend_version,
                             BackendVersion::SEARCH_V15
@@ -2109,7 +2115,6 @@ impl<'a> Plan<'a> {
                                 | BackendVersion::SEARCH_V23
                                 | BackendVersion::SEARCH_V24
                                 | BackendVersion::SEARCH_V25
-                                | BackendVersion::SEARCH_V26
                         ) && shape == SearchShape::ExactLiteral
                         {
                             SEARCH_CANDIDATE_POLICY_V11
