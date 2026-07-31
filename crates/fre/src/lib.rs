@@ -81,10 +81,7 @@ mod unicode_word_run;
 
 pub use pure_byte_class_repeat::{
     Accounting as PureByteClassRepeatAccounting, Error as PureByteClassRepeatSearchError,
-    Operation as PureByteClassRepeatOperation,
-    OperationIdentity as PureByteClassRepeatOperationIdentity,
-    PLAN_ID as PURE_BYTE_CLASS_REPEAT_PLAN_ID, PlanIdentity as PureByteClassRepeatPlanIdentity,
-    SeekLeafIdentity as PureByteClassRepeatSeekLeafIdentity,
+    Operation as PureByteClassRepeatOperation, PLAN_ID as PURE_BYTE_CLASS_REPEAT_PLAN_ID,
 };
 pub use unicode_folded_literal::{
     UNICODE_FOLDED_LITERAL_ALGORITHM_ID, UNICODE_FOLDED_LITERAL_COUNT_OPERATION_ID,
@@ -2810,13 +2807,15 @@ impl PortableBuilder {
                 pure_byte_class_repeat::InspectionError::WorkLimit { needed, limit } => {
                     BuildError::PlannerWorkLimit { needed, limit }
                 }
-                pure_byte_class_repeat::InspectionError::ArithmeticOverflow(detail) => {
-                    BuildError::InternalInvariant(detail)
+                pure_byte_class_repeat::InspectionError::ArithmeticOverflow => {
+                    BuildError::InternalInvariant(
+                        "pure byte-class repeat planner arithmetic overflow",
+                    )
                 }
             })?;
             pure_byte_class_repeat_work = inspection.planner_work();
             if let pure_byte_class_repeat::InspectionOutcome::Eligible(inspection) = inspection {
-                let plan_storage_bytes = inspection.storage_bytes();
+                let plan_storage_bytes = pure_byte_class_repeat::Plan::storage_bytes();
                 let charged_persistent_bytes = source_storage_bytes
                     .checked_add(capture_name_storage_bytes)
                     .and_then(|bytes| bytes.checked_add(plan_storage_bytes))
@@ -2842,11 +2841,6 @@ impl PortableBuilder {
                             }
                         }
                     })?;
-                if pure_byte_class_repeat::Plan::storage_bytes() != plan_storage_bytes {
-                    return Err(BuildError::InternalInvariant(
-                        "pure byte-class repeat retained storage differs from inspection",
-                    ));
-                }
                 return Ok(PortableRegex {
                     source,
                     capture_names,
@@ -2867,16 +2861,15 @@ impl PortableBuilder {
                         plan_storage_bytes,
                         source_storage_bytes,
                         capture_name_storage_bytes,
-                        charged_persistent_bytes: 0,
-                        persistent_byte_limit: 0,
+                        charged_persistent_bytes,
+                        persistent_byte_limit: self.limits.max_persistent_bytes,
                         captures_len,
                         static_captures_len,
                         minimum_match_bytes,
                         required_literal: None,
                         literal_class_run_literal: None,
                         forward_anchored: None,
-                    }
-                    .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
+                    },
                 });
             }
         }
@@ -3362,7 +3355,6 @@ impl TryFrom<String> for PortableRegex {
     }
 }
 
-#[derive(Debug)]
 enum PortablePlan {
     ExactLiteral(LiteralPlan),
     PackedLiteralSet(PackedLiteralSetPlan),
@@ -3396,7 +3388,7 @@ impl PortablePlan {
             Self::DispatchedBoundedRequiredLiteral(required) => required.plan_id(),
             Self::LiteralClassRunLiteral(_) => fre_kernels::LITERAL_CLASS_RUN_LITERAL_PLAN_ID,
             Self::LiteralClassRunSearch(plan) => plan.plan_id(),
-            Self::PureByteClassRepeat(plan) => plan.plan_id(),
+            Self::PureByteClassRepeat(_) => pure_byte_class_repeat::PLAN_ID,
             Self::ForwardAnchored(forward) => forward.plan_id(),
             Self::DispatchedForwardAnchored(forward) => forward.plan_id(),
             Self::ForwardEndFixed(fixed) => fixed.plan_id(),
@@ -3576,29 +3568,6 @@ impl PortableRegex {
     #[must_use]
     pub const fn runtime_implementation_id(&self) -> &'static str {
         self.plan.runtime_implementation_id()
-    }
-
-    /// Stable construction-selected identity for the root byte-class repeat
-    /// specialization, or `None` for every other plan family.
-    #[must_use]
-    pub fn pure_byte_class_repeat_identity(&self) -> Option<PureByteClassRepeatPlanIdentity> {
-        match &self.plan {
-            PortablePlan::PureByteClassRepeat(plan) => Some(plan.identity()),
-            _ => None,
-        }
-    }
-
-    /// Stable identity for one operation projection of the root byte-class
-    /// repeat specialization.
-    #[must_use]
-    pub fn pure_byte_class_repeat_operation_identity(
-        &self,
-        operation: PureByteClassRepeatOperation,
-    ) -> Option<PureByteClassRepeatOperationIdentity> {
-        match &self.plan {
-            PortablePlan::PureByteClassRepeat(plan) => Some(plan.operation_identity(operation)),
-            _ => None,
-        }
     }
 
     /// Prepare allocation-free repeated searches over this immutable matcher.
