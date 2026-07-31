@@ -415,7 +415,8 @@ impl PortableTextBuilder {
             .profile(self.profile)
             .limits(self.limits)
             .plan_selection(self.selection)
-            .after_set_admission_if(self.set_admitted);
+            .after_set_admission_if(self.set_admitted)
+            .for_text_facade();
         if utf8_start_guarded {
             inner_builder = inner_builder.with_utf8_start_guard();
         }

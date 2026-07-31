@@ -57,6 +57,7 @@ mod line_total_grep;
 mod literal_assertions;
 mod literal_class_run_literal;
 pub mod operation_session;
+mod pure_byte_class_repeat;
 mod qualified_exact_search;
 mod replacement;
 mod required_literal;
@@ -78,6 +79,13 @@ mod token_phrase;
 mod unicode_folded_literal;
 mod unicode_word_run;
 
+pub use pure_byte_class_repeat::{
+    Accounting as PureByteClassRepeatAccounting, Error as PureByteClassRepeatSearchError,
+    Operation as PureByteClassRepeatOperation,
+    OperationIdentity as PureByteClassRepeatOperationIdentity,
+    PLAN_ID as PURE_BYTE_CLASS_REPEAT_PLAN_ID, PlanIdentity as PureByteClassRepeatPlanIdentity,
+    SeekLeafIdentity as PureByteClassRepeatSeekLeafIdentity,
+};
 pub use unicode_folded_literal::{
     UNICODE_FOLDED_LITERAL_ALGORITHM_ID, UNICODE_FOLDED_LITERAL_COUNT_OPERATION_ID,
     UNICODE_FOLDED_LITERAL_SEARCH_ALGORITHM_ID, UNICODE_FOLDED_LITERAL_SPAN_SUM_OPERATION_ID,
@@ -880,6 +888,8 @@ pub enum PlanKind {
     RequiredLiteral,
     /// Canonical literal/class-run search backed by one native literal anchor.
     LiteralClassRunLiteral,
+    /// Operation-specialized root byte class repeated one or more times.
+    PureByteClassRepeat,
     /// Absolute-start unique-boundary forward scan. This is not JIT.
     ForwardAnchored,
     /// Generic bounded portable prioritized automaton.
@@ -1561,6 +1571,8 @@ pub enum SearchAccounting {
     RequiredLiteral(RequiredLiteralSearchAccounting),
     /// Complete literal/class-run source-independent envelope and counters.
     LiteralClassRunLiteral(LiteralClassRunLiteralSearchAccounting),
+    /// Exact operation-specialized root byte-class repetition counters.
+    PureByteClassRepeat(PureByteClassRepeatAccounting),
     /// Complete forward-boundary proof-bound and structural counters.
     ForwardAnchored(ForwardAnchoredSearchAccounting),
     /// Exact folded-scalar trie early-stop counters.
@@ -1584,6 +1596,7 @@ impl SearchAccounting {
             Self::LiteralSetDfa(_) => PlanKind::LiteralSetDfa,
             Self::RequiredLiteral(_) => PlanKind::RequiredLiteral,
             Self::LiteralClassRunLiteral(_) => PlanKind::LiteralClassRunLiteral,
+            Self::PureByteClassRepeat(_) => PlanKind::PureByteClassRepeat,
             Self::ForwardAnchored(_) => PlanKind::ForwardAnchored,
             Self::UnicodeFoldedLiteral(_) => PlanKind::UnicodeFoldedLiteral,
             Self::UnicodeWordRun(_) => PlanKind::UnicodeWordRun,
@@ -1606,6 +1619,7 @@ impl SearchAccounting {
             }
             Self::RequiredLiteral(accounting) => accounting.work_upper_bound,
             Self::LiteralClassRunLiteral(accounting) => accounting.work_upper_bound,
+            Self::PureByteClassRepeat(accounting) => accounting.actual_work,
             Self::ForwardAnchored(accounting) => accounting.work_upper_bound,
             Self::UnicodeFoldedLiteral(accounting) => {
                 u64::try_from(accounting.work).unwrap_or(u64::MAX)
@@ -1646,6 +1660,7 @@ pub enum SearchError {
     LiteralSetDfa(LiteralSetError),
     RequiredLiteral(RequiredLiteralSearchError),
     LiteralClassRunLiteral(LiteralClassRunLiteralSearchError),
+    PureByteClassRepeat(PureByteClassRepeatSearchError),
     ForwardAnchored(ForwardAnchoredSearchError),
     UnicodeFoldedLiteral(UnicodeFoldedLiteralSearchError),
     UnicodeWordRun(UnicodeWordRunError),
@@ -1663,6 +1678,9 @@ impl fmt::Display for SearchError {
             Self::RequiredLiteral(error) => write!(f, "required-literal search failed: {error}"),
             Self::LiteralClassRunLiteral(error) => {
                 write!(f, "literal/class-run search failed: {error}")
+            }
+            Self::PureByteClassRepeat(error) => {
+                write!(f, "pure byte-class repeat search failed: {error}")
             }
             Self::ForwardAnchored(error) => {
                 write!(f, "forward-anchored search failed: {error}")
@@ -1684,6 +1702,7 @@ impl std::error::Error for SearchError {
             Self::LiteralSetDfa(error) => Some(error),
             Self::RequiredLiteral(error) => Some(error),
             Self::LiteralClassRunLiteral(error) => Some(error),
+            Self::PureByteClassRepeat(error) => Some(error),
             Self::ForwardAnchored(error) => Some(error),
             Self::UnicodeFoldedLiteral(error) => Some(error),
             Self::UnicodeWordRun(error) => Some(error),
@@ -1724,6 +1743,12 @@ impl From<RequiredLiteralSearchError> for SearchError {
 impl From<LiteralClassRunLiteralSearchError> for SearchError {
     fn from(value: LiteralClassRunLiteralSearchError) -> Self {
         Self::LiteralClassRunLiteral(value)
+    }
+}
+
+impl From<PureByteClassRepeatSearchError> for SearchError {
+    fn from(value: PureByteClassRepeatSearchError) -> Self {
+        Self::PureByteClassRepeat(value)
     }
 }
 
@@ -1968,6 +1993,7 @@ pub struct PortableBuilder {
     selection: PlanSelection,
     set_admitted: bool,
     utf8_start_guarded: bool,
+    pure_byte_class_repeat_allowed: bool,
 }
 
 impl PortableBuilder {
@@ -1983,6 +2009,7 @@ impl PortableBuilder {
             selection: PlanSelection::Auto,
             set_admitted: false,
             utf8_start_guarded: false,
+            pure_byte_class_repeat_allowed: true,
         }
     }
 
@@ -2159,6 +2186,13 @@ impl PortableBuilder {
     /// equivalence before enabling this synthesized K0 guard.
     pub(crate) const fn with_utf8_start_guard(mut self) -> Self {
         self.utf8_start_guarded = true;
+        self
+    }
+
+    /// Preserve text-facade routing while keeping byte-only native plans out
+    /// of an otherwise equivalent unguarded text HIR.
+    pub(crate) const fn for_text_facade(mut self) -> Self {
+        self.pure_byte_class_repeat_allowed = false;
         self
     }
 
@@ -2765,11 +2799,92 @@ impl PortableBuilder {
                 }
             }
         }
+        let mut pure_byte_class_repeat_work = literal_class_run_work;
+        if self.selection == PlanSelection::Auto && self.pure_byte_class_repeat_allowed {
+            let inspection = pure_byte_class_repeat::inspect(
+                &rust.hir,
+                literal_class_run_work,
+                self.limits.max_planner_work,
+            )
+            .map_err(|error| match error {
+                pure_byte_class_repeat::InspectionError::WorkLimit { needed, limit } => {
+                    BuildError::PlannerWorkLimit { needed, limit }
+                }
+                pure_byte_class_repeat::InspectionError::ArithmeticOverflow(detail) => {
+                    BuildError::InternalInvariant(detail)
+                }
+            })?;
+            pure_byte_class_repeat_work = inspection.planner_work();
+            if let pure_byte_class_repeat::InspectionOutcome::Eligible(inspection) = inspection {
+                let plan_storage_bytes = inspection.storage_bytes();
+                let charged_persistent_bytes = source_storage_bytes
+                    .checked_add(capture_name_storage_bytes)
+                    .and_then(|bytes| bytes.checked_add(plan_storage_bytes))
+                    .ok_or(BuildError::PersistentBytesOverflow)?;
+                if charged_persistent_bytes > self.limits.max_persistent_bytes {
+                    return Err(BuildError::PersistentBytesLimit {
+                        needed: charged_persistent_bytes,
+                        limit: self.limits.max_persistent_bytes,
+                    });
+                }
+                let plan = inspection
+                    .build(SimdDispatchContext::capture())
+                    .map_err(|error| match error {
+                        fre_exact_alloc::CopyError::LayoutOverflow => {
+                            BuildError::InternalInvariant(
+                                "pure byte-class repeat owner layout overflowed",
+                            )
+                        }
+                        fre_exact_alloc::CopyError::AllocationFailed => {
+                            BuildError::AllocationFailed {
+                                structure: "pure byte-class repeat owner",
+                                additional: 1,
+                            }
+                        }
+                    })?;
+                if pure_byte_class_repeat::Plan::storage_bytes() != plan_storage_bytes {
+                    return Err(BuildError::InternalInvariant(
+                        "pure byte-class repeat retained storage differs from inspection",
+                    ));
+                }
+                return Ok(PortableRegex {
+                    source,
+                    capture_names,
+                    line_total_grep_plan,
+                    plan: PortablePlan::PureByteClassRepeat(plan),
+                    profile: profile.clone(),
+                    limits: self.limits,
+                    selection: self.selection,
+                    report: BuildReport {
+                        profile: profile.clone(),
+                        admission,
+                        syntax,
+                        plan: PlanKind::PureByteClassRepeat,
+                        planner_work: pure_byte_class_repeat_work,
+                        lowering: None,
+                        states: 0,
+                        edges: 0,
+                        plan_storage_bytes,
+                        source_storage_bytes,
+                        capture_name_storage_bytes,
+                        charged_persistent_bytes: 0,
+                        persistent_byte_limit: 0,
+                        captures_len,
+                        static_captures_len,
+                        minimum_match_bytes,
+                        required_literal: None,
+                        literal_class_run_literal: None,
+                        forward_anchored: None,
+                    }
+                    .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
+                });
+            }
+        }
         let (finite_words, mut finite_work) = finite::extract(
             &rust.hir,
             self.limits.literal_set.max_patterns,
             self.limits.literal_set.max_pattern_bytes,
-            literal_class_run_work,
+            pure_byte_class_repeat_work,
             self.limits.max_planner_work,
             false,
             finite::GuardedFiniteBuildLimits::unlimited(),
@@ -3258,6 +3373,7 @@ enum PortablePlan {
     DispatchedBoundedRequiredLiteral(DispatchedBoundedRequiredLiteralPlan),
     LiteralClassRunLiteral(LiteralClassRunLiteralPlan),
     LiteralClassRunSearch(LiteralClassRunSearchPlan),
+    PureByteClassRepeat(pure_byte_class_repeat::Plan),
     ForwardAnchored(ForwardAnchoredPlan),
     DispatchedForwardAnchored(DispatchedForwardAnchoredPlan),
     ForwardEndFixed(AbsoluteEndFixedPlan),
@@ -3280,6 +3396,7 @@ impl PortablePlan {
             Self::DispatchedBoundedRequiredLiteral(required) => required.plan_id(),
             Self::LiteralClassRunLiteral(_) => fre_kernels::LITERAL_CLASS_RUN_LITERAL_PLAN_ID,
             Self::LiteralClassRunSearch(plan) => plan.plan_id(),
+            Self::PureByteClassRepeat(plan) => plan.plan_id(),
             Self::ForwardAnchored(forward) => forward.plan_id(),
             Self::DispatchedForwardAnchored(forward) => forward.plan_id(),
             Self::ForwardEndFixed(fixed) => fixed.plan_id(),
@@ -3459,6 +3576,29 @@ impl PortableRegex {
     #[must_use]
     pub const fn runtime_implementation_id(&self) -> &'static str {
         self.plan.runtime_implementation_id()
+    }
+
+    /// Stable construction-selected identity for the root byte-class repeat
+    /// specialization, or `None` for every other plan family.
+    #[must_use]
+    pub fn pure_byte_class_repeat_identity(&self) -> Option<PureByteClassRepeatPlanIdentity> {
+        match &self.plan {
+            PortablePlan::PureByteClassRepeat(plan) => Some(plan.identity()),
+            _ => None,
+        }
+    }
+
+    /// Stable identity for one operation projection of the root byte-class
+    /// repeat specialization.
+    #[must_use]
+    pub fn pure_byte_class_repeat_operation_identity(
+        &self,
+        operation: PureByteClassRepeatOperation,
+    ) -> Option<PureByteClassRepeatOperationIdentity> {
+        match &self.plan {
+            PortablePlan::PureByteClassRepeat(plan) => Some(plan.operation_identity(operation)),
+            _ => None,
+        }
     }
 
     /// Prepare allocation-free repeated searches over this immutable matcher.
@@ -3734,6 +3874,10 @@ impl PortableRegex {
                     SearchAccounting::LiteralClassRunLiteral(accounting),
                 ))
             }
+            PortablePlan::PureByteClassRepeat(plan) => {
+                let (matched, accounting) = plan.is_match_window(haystack, window, limits)?;
+                Ok((matched, SearchAccounting::PureByteClassRepeat(accounting)))
+            }
             PortablePlan::ForwardAnchored(forward) => {
                 let literal_window = LiteralWindow::new(window.start(), window.end());
                 let (matched, accounting) = forward.find_window(
@@ -3818,6 +3962,10 @@ impl PortableRegex {
     /// # Errors
     ///
     /// Returns [`SearchError`] for an invalid window or a resource refusal.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "each native owner retains its direct value-only existence projection"
+    )]
     pub fn is_match_window_value(
         &self,
         haystack: &[u8],
@@ -3896,6 +4044,10 @@ impl PortableRegex {
                     literal_class_run_literal_limits(limits),
                 )
                 .map(|(matched, _)| matched.is_some())
+                .map_err(SearchError::from),
+            PortablePlan::PureByteClassRepeat(plan) => plan
+                .is_match_window(haystack, window, limits)
+                .map(|(matched, _)| matched)
                 .map_err(SearchError::from),
             PortablePlan::ForwardAnchored(forward) => forward
                 .find_window(
@@ -4093,6 +4245,10 @@ impl PortableRegex {
                 )?;
                 Ok((end, SearchAccounting::LiteralClassRunLiteral(accounting)))
             }
+            PortablePlan::PureByteClassRepeat(plan) => {
+                let (end, accounting) = plan.earliest_end_window(haystack, window, limits)?;
+                Ok((end, SearchAccounting::PureByteClassRepeat(accounting)))
+            }
             PortablePlan::ForwardAnchored(forward) => {
                 let literal_window = LiteralWindow::new(window.start(), window.end());
                 let (matched, accounting) = forward.find_window(
@@ -4250,6 +4406,11 @@ impl PortableRegex {
                     matched.map(|(_, end)| end),
                     SearchAccounting::LiteralClassRunLiteral(accounting),
                 ))
+            }
+            PortablePlan::PureByteClassRepeat(plan) => {
+                let (end, accounting) =
+                    plan.selected_end_window(haystack, SearchWindow::full(haystack), limits)?;
+                Ok((end, SearchAccounting::PureByteClassRepeat(accounting)))
             }
             PortablePlan::ForwardAnchored(forward) => {
                 let (matched, accounting) =
@@ -4610,6 +4771,10 @@ impl PortableRegex {
                     SearchAccounting::LiteralClassRunLiteral(accounting),
                 ))
             }
+            PortablePlan::PureByteClassRepeat(plan) => {
+                let (matched, accounting) = plan.find_window(haystack, window, limits)?;
+                Ok((matched, SearchAccounting::PureByteClassRepeat(accounting)))
+            }
             PortablePlan::ForwardAnchored(forward) => {
                 let literal_window = LiteralWindow::new(window.start(), window.end());
                 let (matched, accounting) = forward.find_window(
@@ -4699,6 +4864,10 @@ impl PortableRegex {
         limits: SearchLimits,
     ) -> Result<Option<Match>, SearchError> {
         match &self.plan {
+            PortablePlan::PureByteClassRepeat(plan) => plan
+                .find_window(haystack, window, limits)
+                .map(|(matched, _)| matched)
+                .map_err(SearchError::from),
             PortablePlan::K0(automaton) => automaton
                 .prepare::<Span>()
                 .search_window(haystack, window, limits)
@@ -4715,6 +4884,10 @@ impl PortableRegex {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "each native owner projects its span and exact iterator work without facade accounting"
+    )]
     fn find_iter_at(
         &self,
         haystack: &[u8],
@@ -4813,6 +4986,11 @@ impl PortableRegex {
                     accounting.work_upper_bound,
                 ))
             }
+            PortablePlan::PureByteClassRepeat(plan) => {
+                let (matched, accounting) =
+                    plan.find_window(haystack, SearchWindow::new(start, haystack.len()), limits)?;
+                Ok((matched, accounting.actual_work))
+            }
             PortablePlan::ForwardAnchored(forward) => {
                 let (matched, accounting) =
                     forward.find_window(haystack, window, forward_anchored_limits(limits))?;
@@ -4866,7 +5044,7 @@ impl PortableRegex {
                     plan.find_window(haystack, SearchWindow::new(start, haystack.len()), limits)?;
                 Ok((matched, accounting.work()))
             }
-            _ => {
+            PortablePlan::K0(_) => {
                 let (matched, accounting) =
                     self.find_window(haystack, SearchWindow::new(start, haystack.len()), limits)?;
                 Ok((matched, accounting.work_or_linear_terms()))
