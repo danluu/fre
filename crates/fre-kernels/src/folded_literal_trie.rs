@@ -653,6 +653,38 @@ impl RootPrefilter {
     }
 }
 
+trait LiteralCandidateSink {
+    fn emit_candidate(&mut self, candidate: LiteralCandidate);
+}
+
+impl<F> LiteralCandidateSink for F
+where
+    F: FnMut(LiteralCandidate),
+{
+    fn emit_candidate(&mut self, candidate: LiteralCandidate) {
+        self(candidate);
+    }
+}
+
+struct LeftmostFirstSink<'a> {
+    selected: &'a mut Option<LiteralCandidate>,
+    multiple_starts: &'a mut bool,
+}
+
+impl LiteralCandidateSink for LeftmostFirstSink<'_> {
+    fn emit_candidate(&mut self, candidate: LiteralCandidate) {
+        match *self.selected {
+            None => *self.selected = Some(candidate),
+            Some(best) if candidate.start() == best.start() => {
+                if candidate.pattern_index() < best.pattern_index() {
+                    *self.selected = Some(candidate);
+                }
+            }
+            Some(_) => *self.multiple_starts = true,
+        }
+    }
+}
+
 /// Immutable exact-allocation sparse folded-scalar trie.
 #[derive(Clone, Debug)]
 pub struct FoldedLiteralTriePlan {
@@ -955,14 +987,9 @@ impl FoldedLiteralTriePlan {
             window,
             limits,
             ScanStop::AfterMatchingStart,
-            |candidate| match selected {
-                None => selected = Some(candidate),
-                Some(best) if candidate.start() == best.start() => {
-                    if candidate.pattern_index() < best.pattern_index() {
-                        selected = Some(candidate);
-                    }
-                }
-                Some(_) => order_violation = true,
+            LeftmostFirstSink {
+                selected: &mut selected,
+                multiple_starts: &mut order_violation,
             },
         )?;
         if order_violation {
@@ -1066,7 +1093,7 @@ impl FoldedLiteralTriePlan {
         mut emit: F,
     ) -> Result<ScanReceipt, ScanAttemptError>
     where
-        F: FnMut(LiteralCandidate),
+        F: LiteralCandidateSink,
     {
         if window.start() > window.end() || window.end() > haystack.len() {
             return Err(ScanAttemptError {
@@ -1150,7 +1177,7 @@ fn execute_folded_scan<F>(
     emit: &mut F,
 ) -> Result<ScanActual, ScanAttemptError>
 where
-    F: FnMut(LiteralCandidate),
+    F: LiteralCandidateSink + ?Sized,
 {
     execute_folded_scan_impl(
         plan,
@@ -1266,6 +1293,11 @@ impl AdaptiveHitState<'_, '_> {
             "adaptive folded candidate starts",
         )?;
         let mut selected = None::<LiteralCandidate>;
+        let mut multiple_starts = false;
+        let mut sink = LeftmostFirstSink {
+            selected: &mut selected,
+            multiple_starts: &mut multiple_starts,
+        };
         let _ = scan_folded_start(
             self.plan,
             self.source,
@@ -1274,13 +1306,7 @@ impl AdaptiveHitState<'_, '_> {
             self.upper,
             &mut self.actual,
             false,
-            &mut |candidate| match selected {
-                None => selected = Some(candidate),
-                Some(best) if candidate.pattern_index() < best.pattern_index() => {
-                    selected = Some(candidate);
-                }
-                Some(_) => {}
-            },
+            &mut sink,
         )?;
         if let Some(candidate) = selected {
             self.outcome = AdaptiveFindOutcome::Match(candidate);
@@ -1438,7 +1464,7 @@ fn execute_folded_scan_impl<F>(
     emit: &mut F,
 ) -> Result<ScanActual, ScanAttemptError>
 where
-    F: FnMut(LiteralCandidate),
+    F: LiteralCandidateSink + ?Sized,
 {
     let mut actual = ScanActual {
         input_bytes: source.len(),
@@ -1898,7 +1924,7 @@ fn root_prefilter_classifier(
     clippy::too_many_arguments,
     reason = "the early-stop bit joins the established explicit scan-accounting boundary"
 )]
-fn scan_folded_start<F>(
+fn scan_folded_start<S>(
     plan: &FoldedLiteralTriePlan,
     source: &[u8],
     absolute_base: usize,
@@ -1906,10 +1932,10 @@ fn scan_folded_start<F>(
     upper: ScanUpperBounds,
     actual: &mut ScanActual,
     stop_after_first_event: bool,
-    emit: &mut F,
+    emit: &mut S,
 ) -> Result<usize, ScanAttemptError>
 where
-    F: FnMut(LiteralCandidate),
+    S: LiteralCandidateSink + ?Sized,
 {
     let mut state = 0_usize;
     let mut cursor = relative_start;
@@ -1978,7 +2004,7 @@ where
     clippy::too_many_arguments,
     reason = "output emission retains explicit span, envelope, actual and early-stop state"
 )]
-fn emit_folded_outputs<F>(
+fn emit_folded_outputs<S>(
     plan: &FoldedLiteralTriePlan,
     state: usize,
     absolute_base: usize,
@@ -1986,10 +2012,10 @@ fn emit_folded_outputs<F>(
     upper: ScanUpperBounds,
     actual: &mut ScanActual,
     stop_after_first_event: bool,
-    emit: &mut F,
+    emit: &mut S,
 ) -> Result<bool, ScanAttemptError>
 where
-    F: FnMut(LiteralCandidate),
+    S: LiteralCandidateSink + ?Sized,
 {
     let start = absolute_base
         .checked_add(relative_span.0)
@@ -2007,7 +2033,7 @@ where
             *actual,
             "folded candidate events",
         )?;
-        emit(LiteralCandidate::new(terminal.pattern_index, start, end));
+        emit.emit_candidate(LiteralCandidate::new(terminal.pattern_index, start, end));
         if stop_after_first_event {
             return Ok(true);
         }
