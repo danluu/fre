@@ -15,6 +15,13 @@ pub(crate) enum V26TemplateCodegen {
     AsimdV25,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum V27TemplateCodegen {
+    AsimdV8Fallback,
+    AsimdV17,
+    AsimdV25,
+}
+
 /// Auditor-local reconstruction of V26's width-only selector.
 ///
 /// This deliberately shares no selector constants or function with the
@@ -27,6 +34,64 @@ pub(crate) const fn independent_v26_codegen_for_literal_width(
         6..=8 => Some(V26TemplateCodegen::AsimdV17),
         9..=32 => Some(V26TemplateCodegen::AsimdV25),
         _ => None,
+    }
+}
+
+fn independent_v27_signature_is_cyclic_phase_unique(
+    literal: &[u8],
+    manifest: SearchManifest,
+) -> bool {
+    if !(6..=32).contains(&literal.len()) {
+        return false;
+    }
+    let offsets = [
+        manifest.primary_offset,
+        manifest.secondary_offset,
+        manifest.verification_offset,
+        manifest.quaternary_offset,
+        manifest.quinary_offset,
+    ];
+    if offsets
+        .iter()
+        .any(|&offset| offset == u16::MAX || usize::from(offset) >= literal.len())
+    {
+        return false;
+    }
+    let mut selected_mask = 0_u64;
+    for offset in offsets.map(usize::from) {
+        let bit = 1_u64
+            .checked_shl(u32::try_from(offset).expect("bounded V27 offset"))
+            .expect("V27 offset is below 64");
+        if selected_mask & bit != 0 {
+            return false;
+        }
+        selected_mask |= bit;
+    }
+    (1..literal.len()).all(|phase| {
+        offsets.map(usize::from).iter().any(|&offset| {
+            let shifted = offset
+                .checked_add(phase)
+                .and_then(|sum| sum.checked_rem(literal.len()))
+                .expect("bounded nonempty V27 cyclic phase");
+            literal[offset] != literal[shifted]
+        })
+    })
+}
+
+fn independent_v27_codegen(
+    literal: &[u8],
+    manifest: SearchManifest,
+) -> Result<V27TemplateCodegen, AuditError> {
+    if literal.is_empty() || literal.len() > 32 {
+        return Err(AuditError::InvalidSearchManifest);
+    }
+    if !independent_v27_signature_is_cyclic_phase_unique(literal, manifest) {
+        return Ok(V27TemplateCodegen::AsimdV8Fallback);
+    }
+    if literal.len() <= 8 {
+        Ok(V27TemplateCodegen::AsimdV17)
+    } else {
+        Ok(V27TemplateCodegen::AsimdV25)
     }
 }
 
@@ -897,6 +962,9 @@ fn emit_exact(
         }
         BackendVersion::SEARCH_V26 => {
             emit_exact_candidates_v26(template, manifest, literal, none, found)
+        }
+        BackendVersion::SEARCH_V27 => {
+            emit_exact_candidates_v27(template, manifest, literal, none, found)
         }
         BackendVersion::SEARCH_SVE2_FIXED16_V2 => {
             emit_exact_candidates_sve2_fixed16_v2(template, manifest, literal, none, found)
@@ -1815,6 +1883,35 @@ fn emit_exact_candidates_v26(
             emit_exact_candidates_v17(template, source_manifest, literal, none, found)
         }
         V26TemplateCodegen::AsimdV25 => {
+            emit_exact_candidates_v25(template, source_manifest, literal, none, found)
+        }
+    }
+}
+
+fn emit_exact_candidates_v27(
+    template: &mut Template,
+    manifest: SearchManifest,
+    literal: &[u8],
+    none: Label,
+    found: Label,
+) -> Result<(), AuditError> {
+    let codegen = independent_v27_codegen(literal, manifest)?;
+    let source_manifest = SearchManifest {
+        backend_version: match codegen {
+            V27TemplateCodegen::AsimdV8Fallback => BackendVersion::SEARCH_V8,
+            V27TemplateCodegen::AsimdV17 => BackendVersion::SEARCH_V17,
+            V27TemplateCodegen::AsimdV25 => BackendVersion::SEARCH_V25,
+        },
+        ..manifest
+    };
+    match codegen {
+        V27TemplateCodegen::AsimdV8Fallback => {
+            emit_exact_candidates_v8(template, source_manifest, literal, none, found)
+        }
+        V27TemplateCodegen::AsimdV17 => {
+            emit_exact_candidates_v17(template, source_manifest, literal, none, found)
+        }
+        V27TemplateCodegen::AsimdV25 => {
             emit_exact_candidates_v25(template, source_manifest, literal, none, found)
         }
     }

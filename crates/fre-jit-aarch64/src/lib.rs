@@ -36,9 +36,9 @@ pub use decode::{Condition, DecodeError, DecodedInstruction, decode, decode_one}
 pub use emit::{
     EmitLimits, MAX_REPEATED_CONFIRM_BYTES, SEARCH_V26_MAX_LITERAL_BYTES,
     SEARCH_V26_MIN_LITERAL_BYTES, SEARCH_V26_V17_MAX_LITERAL_BYTES,
-    SEARCH_V26_V25_MIN_LITERAL_BYTES, SearchBackendPolicy, SearchV26Codegen, emit,
-    emit_audited_with_backend, emit_exact_aggregate,
-    emit_exact_aggregate_sve2_fixed16_count_experimental,
+    SEARCH_V26_V25_MIN_LITERAL_BYTES, SEARCH_V27_MAX_LITERAL_BYTES, SEARCH_V27_MIN_LITERAL_BYTES,
+    SearchBackendPolicy, SearchV26Codegen, SearchV27Codegen, emit, emit_audited_with_backend,
+    emit_exact_aggregate, emit_exact_aggregate_sve2_fixed16_count_experimental,
     emit_exact_aggregate_sve2_fixed16_pair_count_experimental,
     emit_exact_aggregate_sve2_fixed16_pair_span_sum_experimental,
     emit_exact_aggregate_sve2_fixed16_span_sum_experimental, emit_selected_end_register_v2,

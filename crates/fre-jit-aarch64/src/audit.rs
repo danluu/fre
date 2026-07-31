@@ -321,6 +321,7 @@ fn validate_search_backend_version(image: &NativeImage) -> Result<BackendVersion
         | BackendVersion::SEARCH_V24
         | BackendVersion::SEARCH_V25
         | BackendVersion::SEARCH_V26
+        | BackendVersion::SEARCH_V27
         | BackendVersion::SEARCH_SVE16_V1
         | BackendVersion::SEARCH_SVE2_16_V1
         | BackendVersion::SEARCH_SVE16_V6
@@ -371,6 +372,7 @@ fn authenticate_search_envelope<'image>(
             | BackendVersion::SEARCH_V24
             | BackendVersion::SEARCH_V25
             | BackendVersion::SEARCH_V26
+            | BackendVersion::SEARCH_V27
             | BackendVersion::SEARCH_SVE16_V1
             | BackendVersion::SEARCH_SVE2_16_V1
             | BackendVersion::SEARCH_SVE16_V6
@@ -625,6 +627,7 @@ fn authenticate_search_manifest<'image>(
                     | BackendVersion::SEARCH_V24
                     | BackendVersion::SEARCH_V25
                     | BackendVersion::SEARCH_V26
+                    | BackendVersion::SEARCH_V27
             ) && (manifest.anchors != AnchorFlags::default() || literal_len == 0)
             {
                 return Err(AuditError::InvalidSearchManifest);
@@ -685,6 +688,7 @@ fn authenticate_class_suffix_manifest(
             | BackendVersion::SEARCH_V24
             | BackendVersion::SEARCH_V25
             | BackendVersion::SEARCH_V26
+            | BackendVersion::SEARCH_V27
     ) {
         return Err(AuditError::InvalidSearchManifest);
     }
@@ -778,6 +782,8 @@ const SEARCH_CANDIDATE_POLICY_V10: u16 = 14;
 const SEARCH_CANDIDATE_POLICY_V11: u16 = 15;
 // Independently pinned Search V26 width-cost selector receipt.
 const SEARCH_CANDIDATE_POLICY_V12: u16 = 16;
+// Independently pinned Search V27 topology-total selector receipt.
+const SEARCH_CANDIDATE_POLICY_V13: u16 = 17;
 const SEARCH_CANDIDATE_BLOCK_WIDTH: u16 = 16;
 const SEARCH_CANDIDATE_OFFSET_NONE: u16 = u16::MAX;
 const SVE2_CLASS_TABLE_DATA_ID: u32 = 2;
@@ -889,6 +895,7 @@ fn authenticate_search_candidate_policy(
                         | BackendVersion::SEARCH_V24
                         | BackendVersion::SEARCH_V25
                         | BackendVersion::SEARCH_V26
+                        | BackendVersion::SEARCH_V27
                 ) {
                     independent_ranked_verification_offsets_v3(literal, primary, secondary)
                 } else if matches!(
@@ -1011,6 +1018,10 @@ fn authenticate_search_candidate_policy(
                     && manifest.shape == SearchShape::ExactLiteral
                 {
                     SEARCH_CANDIDATE_POLICY_V12
+                } else if manifest.backend_version == BackendVersion::SEARCH_V27
+                    && manifest.shape == SearchShape::ExactLiteral
+                {
+                    SEARCH_CANDIDATE_POLICY_V13
                 } else if matches!(
                     manifest.backend_version,
                     BackendVersion::SEARCH_V15
@@ -4955,6 +4966,7 @@ fn first_forbidden_search_vector_register(
                 | BackendVersion::SEARCH_V24
                 | BackendVersion::SEARCH_V25
                 | BackendVersion::SEARCH_V26
+                | BackendVersion::SEARCH_V27
                 | BackendVersion::SEARCH_SVE16_V6
                 | BackendVersion::SEARCH_SVE2_FIXED16_V2 => register >= 16,
                 _ => false,

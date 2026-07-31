@@ -20,8 +20,9 @@ use crate::{
     EmitLimits, LabelKind, MAX_REPEATED_CONFIRM_BYTES, NativeAggregateImage, NativeAggregateResult,
     NativeImage, NativeResult, RelocationKind, RelocationTarget, ResourceKind, ResultLayout,
     SEARCH_V26_MAX_LITERAL_BYTES, SEARCH_V26_MIN_LITERAL_BYTES, SEARCH_V26_V17_MAX_LITERAL_BYTES,
-    SEARCH_V26_V25_MIN_LITERAL_BYTES, SearchBackendPolicy, SearchV26Codegen, UnsupportedReason,
-    audit, audit_aggregate, decode, decode_one, emit,
+    SEARCH_V26_V25_MIN_LITERAL_BYTES, SEARCH_V27_MAX_LITERAL_BYTES, SEARCH_V27_MIN_LITERAL_BYTES,
+    SearchBackendPolicy, SearchV26Codegen, UnsupportedReason, audit, audit_aggregate, decode,
+    decode_one, emit,
     emit::emit_search_version_for_test,
     emit_audited_with_backend, emit_exact_aggregate,
     emit_exact_aggregate_sve2_fixed16_count_experimental,
@@ -4572,6 +4573,7 @@ fn explicit_search_backend_policy_selects_distinct_artifact_identities() {
         (SearchBackendPolicy::AsimdV24, BackendVersion::SEARCH_V24),
         (SearchBackendPolicy::AsimdV25, BackendVersion::SEARCH_V25),
         (SearchBackendPolicy::AsimdV26, BackendVersion::SEARCH_V26),
+        (SearchBackendPolicy::AsimdV27, BackendVersion::SEARCH_V27),
         (SearchBackendPolicy::Sve16, BackendVersion::SEARCH_SVE16_V1),
         (
             SearchBackendPolicy::Sve2Fixed16,
@@ -14329,6 +14331,230 @@ fn v26_rejects_bare_relabels_and_a_wrong_width_selected_graph() {
 }
 
 #[test]
+fn v27_admits_every_nonempty_width_topology_and_output_with_distinct_aot_identity() {
+    assert_eq!(SEARCH_V27_MIN_LITERAL_BYTES, 1);
+    assert_eq!(SEARCH_V27_MAX_LITERAL_BYTES, 32);
+    assert_eq!(
+        SearchBackendPolicy::AsimdV27.backend_version(),
+        BackendVersion::SEARCH_V27
+    );
+
+    for width in SEARCH_V27_MIN_LITERAL_BYTES..=SEARCH_V27_MAX_LITERAL_BYTES {
+        let literals = [
+            vec![b'x'; width],
+            (0..width)
+                .map(|offset| if offset % 2 == 0 { b'a' } else { b'b' })
+                .collect::<Vec<_>>(),
+            (0..width)
+                .map(|offset| {
+                    u8::try_from(offset)
+                        .expect("bounded width")
+                        .wrapping_mul(73)
+                        .wrapping_add(19)
+                })
+                .collect::<Vec<_>>(),
+        ];
+        for literal in literals {
+            for output in [
+                OutputKind::Exists,
+                OutputKind::SelectedEnd,
+                OutputKind::Span,
+            ] {
+                let image = exact_output_image_with_backend(
+                    &literal,
+                    output,
+                    SearchBackendPolicy::AsimdV27,
+                );
+                let repeated = exact_output_image_with_backend(
+                    &literal,
+                    output,
+                    SearchBackendPolicy::AsimdV27,
+                );
+                assert_eq!(image, repeated, "width={width} output={output:?}");
+                assert_eq!(image.backend_version(), BackendVersion::SEARCH_V27);
+                assert_eq!(
+                    image
+                        .search_manifest()
+                        .expect("V27 manifest")
+                        .candidate_policy_version,
+                    17
+                );
+                let report = audit(&image).expect("independent V27 graph audit");
+                assert_eq!(
+                    (report.decode_passes, report.source_identity_rebuilds),
+                    (1, 1)
+                );
+                let aot = image.to_aot(AotLimits::default()).expect("bounded V27 AOT");
+                assert_eq!(&aot.as_bytes()[..8], b"FREA64\0\x28");
+                assert_eq!(&aot.as_bytes()[8..10], &40_u16.to_le_bytes());
+                assert_eq!(aot.identity(), image.artifact_identity());
+            }
+        }
+    }
+}
+
+#[test]
+fn v27_keeps_v26_fast_graphs_and_falls_back_for_every_periodic_topology() {
+    for width in 6_usize..=SEARCH_V27_MAX_LITERAL_BYTES {
+        let fast_literal = v23_pointer_test_literal(width, false);
+        let source_backend = if width <= SEARCH_V26_V17_MAX_LITERAL_BYTES {
+            SearchBackendPolicy::AsimdV17
+        } else {
+            SearchBackendPolicy::AsimdV25
+        };
+        let candidate = exact_output_image_with_backend(
+            &fast_literal,
+            OutputKind::Span,
+            SearchBackendPolicy::AsimdV27,
+        );
+        let source =
+            exact_output_image_with_backend(&fast_literal, OutputKind::Span, source_backend);
+        assert_eq!(candidate.code(), source.code(), "fast width={width}");
+        assert_eq!(candidate.layout(), source.layout(), "fast width={width}");
+        assert_eq!(candidate.labels(), source.labels(), "fast width={width}");
+        assert_eq!(
+            candidate.relocations(),
+            source.relocations(),
+            "fast width={width}"
+        );
+        assert_eq!(
+            (
+                candidate.stats().code_bytes,
+                candidate.stats().data_bytes,
+                candidate.stats().relocations,
+                candidate.stats().labels,
+                candidate.stats().scratch_bytes,
+                candidate.stats().vector_instructions,
+            ),
+            (
+                source.stats().code_bytes,
+                source.stats().data_bytes,
+                source.stats().relocations,
+                source.stats().labels,
+                source.stats().scratch_bytes,
+                source.stats().vector_instructions,
+            ),
+            "fast width={width}"
+        );
+        assert_eq!(
+            candidate.stats().emission_work,
+            source
+                .stats()
+                .emission_work
+                .checked_add(if width <= SEARCH_V26_V17_MAX_LITERAL_BYTES {
+                    u64::try_from(width).expect("bounded width")
+                } else {
+                    0
+                })
+                .expect("bounded V27 work"),
+            "V27 precharges the topology decision scan at width={width}"
+        );
+
+        let periodic = vec![b'a'; width];
+        let periodic_program = build_exact_literal::<Span>(
+            &periodic,
+            AnchorFlags::default(),
+            ValidateLimits::default(),
+        )
+        .expect("periodic exact IR");
+        assert_eq!(
+            emit_with_backend(
+                &periodic_program,
+                SearchBackendPolicy::AsimdV26,
+                EmitLimits::default()
+            ),
+            Err(EmitError::Unsupported {
+                reason: UnsupportedReason::KernelShape,
+            }),
+            "V26 periodic width={width}"
+        );
+        let fallback = emit_with_backend(
+            &periodic_program,
+            SearchBackendPolicy::AsimdV27,
+            EmitLimits::default(),
+        )
+        .expect("V27 periodic fallback");
+        audit(&fallback).expect("V27 periodic fallback audit");
+    }
+}
+
+#[test]
+fn v27_periodic_fallback_matches_scalar_semantics_across_windows() {
+    let mut comparisons = 0_u64;
+    for width in SEARCH_V27_MIN_LITERAL_BYTES..=SEARCH_V27_MAX_LITERAL_BYTES {
+        let literal = (0..width)
+            .map(|offset| if offset % 2 == 0 { b'a' } else { b'b' })
+            .collect::<Vec<_>>();
+        let program = build_exact_literal::<Span>(
+            &literal,
+            AnchorFlags::default(),
+            ValidateLimits::default(),
+        )
+        .expect("periodic scalar-oracle IR");
+        let image = emit_with_backend(
+            &program,
+            SearchBackendPolicy::AsimdV27,
+            EmitLimits::default(),
+        )
+        .expect("periodic V27 image");
+        for start in [0_usize, 1, 15, 16, 17, 63] {
+            let mut haystack = vec![b'z'; 160];
+            let insertion = start
+                .checked_add(33)
+                .expect("bounded V27 fixture insertion");
+            haystack[insertion..insertion + width].copy_from_slice(&literal);
+            for window_start in [0_usize, start, insertion, insertion + 1] {
+                let expected = program
+                    .execute(
+                        &haystack,
+                        SearchWindow::new(window_start, haystack.len()),
+                        ExecutionLimits::unlimited(),
+                    )
+                    .expect("periodic scalar execution")
+                    .output()
+                    .map(|span| (span.start(), span.end()));
+                let actual = simulate(&image, &haystack, window_start, haystack.len())
+                    .expect("periodic V27 simulation");
+                assert_eq!(
+                    span_output(actual),
+                    expected,
+                    "width={width} insertion={insertion} window_start={window_start}"
+                );
+                comparisons = comparisons.checked_add(1).expect("bounded V27 matrix");
+            }
+        }
+    }
+    assert_eq!(comparisons, 32 * 6 * 4);
+}
+
+#[test]
+fn v27_policy_and_graph_identity_cannot_be_relabelled() {
+    for literal in [b"abcdefghi".as_slice(), b"ababababa".as_slice()] {
+        let candidate = exact_output_image_with_backend(
+            literal,
+            OutputKind::Span,
+            SearchBackendPolicy::AsimdV27,
+        );
+        let mut wrong_policy = candidate.clone();
+        wrong_policy
+            .search
+            .as_mut()
+            .expect("V27 manifest")
+            .candidate_policy_version = 16;
+        assert_resealed_search_rejected(wrong_policy, "V27 policy relabel");
+
+        let mut wrong_backend = candidate;
+        wrong_backend.backend_version = BackendVersion::SEARCH_V26;
+        wrong_backend
+            .search
+            .as_mut()
+            .expect("V27 manifest")
+            .backend_version = BackendVersion::SEARCH_V26;
+        assert_resealed_search_rejected(wrong_backend, "V27 backend relabel");
+    }
+}
+
+#[test]
 fn v25_frozen_v24_all_width_primary_output_aot_matrix_bytes_are_exact() {
     let mut digest = Sha256::new();
     digest.update(b"FRE-V25-FROZEN-V24-ALL-WIDTH-PRIMARY-OUTPUT-AOT-V1\0");
@@ -14847,7 +15073,7 @@ fn v13_adaptive_recovery_decoded_edges_cover_zero_one_and_max_remaining_columns(
 }
 
 #[test]
-fn v9_through_v26_reject_shapes_without_one_nonempty_unanchored_exact_candidate() {
+fn v9_through_v27_reject_shapes_without_one_nonempty_unanchored_exact_candidate() {
     for backend in [
         SearchBackendPolicy::AsimdV9,
         SearchBackendPolicy::AsimdV10,
@@ -14867,6 +15093,7 @@ fn v9_through_v26_reject_shapes_without_one_nonempty_unanchored_exact_candidate(
         SearchBackendPolicy::AsimdV24,
         SearchBackendPolicy::AsimdV25,
         SearchBackendPolicy::AsimdV26,
+        SearchBackendPolicy::AsimdV27,
     ] {
         for anchors in [
             AnchorFlags {

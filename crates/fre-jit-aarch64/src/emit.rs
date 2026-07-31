@@ -55,6 +55,8 @@ const SEARCH_CANDIDATE_POLICY_V10: u16 = 14;
 const SEARCH_CANDIDATE_POLICY_V11: u16 = 15;
 // Search V26's distinct sealed receipt for its width-cost graph selection.
 const SEARCH_CANDIDATE_POLICY_V12: u16 = 16;
+// Search V27's distinct sealed receipt for topology-total graph selection.
+const SEARCH_CANDIDATE_POLICY_V13: u16 = 17;
 const SEARCH_CANDIDATE_BLOCK_WIDTH: u16 = 16;
 const SEARCH_CANDIDATE_OFFSET_NONE: u16 = u16::MAX;
 const SVE2_CLASS_TABLE_DATA_ID: u32 = 2;
@@ -77,6 +79,10 @@ pub const SEARCH_V26_V17_MAX_LITERAL_BYTES: usize = 8;
 pub const SEARCH_V26_V25_MIN_LITERAL_BYTES: usize = 9;
 /// Largest exact-literal width admitted by the Search V26 cost rule.
 pub const SEARCH_V26_MAX_LITERAL_BYTES: usize = MAX_REPEATED_CONFIRM_BYTES;
+/// Smallest exact-literal width admitted by Search V27.
+pub const SEARCH_V27_MIN_LITERAL_BYTES: usize = 1;
+/// Largest exact-literal width admitted by Search V27.
+pub const SEARCH_V27_MAX_LITERAL_BYTES: usize = MAX_REPEATED_CONFIRM_BYTES;
 
 /// Authenticated source graph selected by the Search V26 compile-time rule.
 ///
@@ -84,6 +90,18 @@ pub const SEARCH_V26_MAX_LITERAL_BYTES: usize = MAX_REPEATED_CONFIRM_BYTES;
 /// offsets, workload identity, and runtime observations cannot affect it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SearchV26Codegen {
+    /// Frozen Search V17 learned-continuation graph.
+    AsimdV17,
+    /// Frozen Search V25 sixth-empty-promotion graph.
+    AsimdV25,
+}
+
+/// Authenticated source graph selected by Search V27.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SearchV27Codegen {
+    /// Frozen Search V8 graph, used when a fast graph cannot represent every
+    /// cyclic phase of the literal.
+    AsimdV8Fallback,
     /// Frozen Search V17 learned-continuation graph.
     AsimdV17,
     /// Frozen Search V25 sixth-empty-promotion graph.
@@ -171,6 +189,9 @@ pub enum SearchBackendPolicy {
     /// Search V26 candidate: a width-only compile-time cost rule selecting
     /// the frozen V17 graph for widths 6..=8 and V25 for widths 9..=32.
     AsimdV26,
+    /// Search V27 candidate: V26's fast width-cost rule with a frozen V8
+    /// fallback for every topology V26 structurally refuses.
+    AsimdV27,
     /// SVE screening with exactly sixteen active byte lanes.
     Sve16,
     /// SVE2 `MATCH` screening with exactly sixteen active byte lanes,
@@ -210,6 +231,7 @@ impl SearchBackendPolicy {
             Self::AsimdV24 => BackendVersion::SEARCH_V24,
             Self::AsimdV25 => BackendVersion::SEARCH_V25,
             Self::AsimdV26 => BackendVersion::SEARCH_V26,
+            Self::AsimdV27 => BackendVersion::SEARCH_V27,
             Self::Sve16 => BackendVersion::SEARCH_SVE16_V1,
             Self::Sve2Fixed16 => BackendVersion::SEARCH_SVE2_16_V1,
             Self::Sve16V6 => BackendVersion::SEARCH_SVE16_V6,
@@ -437,6 +459,7 @@ fn emit_search_image<O: Operation>(
             | BackendVersion::SEARCH_V24
             | BackendVersion::SEARCH_V25
             | BackendVersion::SEARCH_V26
+            | BackendVersion::SEARCH_V27
             | BackendVersion::SEARCH_SVE16_V1
             | BackendVersion::SEARCH_SVE2_16_V1
             | BackendVersion::SEARCH_SVE16_V6
@@ -507,6 +530,11 @@ fn emit_search_image<O: Operation>(
             reason: UnsupportedReason::KernelShape,
         });
     }
+    if backend_version == BackendVersion::SEARCH_V27 && !plan.is_v27_policy_shape() {
+        return Err(EmitError::Unsupported {
+            reason: UnsupportedReason::KernelShape,
+        });
+    }
     if matches!(
         backend_version,
         BackendVersion::SEARCH_V9
@@ -527,6 +555,7 @@ fn emit_search_image<O: Operation>(
             | BackendVersion::SEARCH_V24
             | BackendVersion::SEARCH_V25
             | BackendVersion::SEARCH_V26
+            | BackendVersion::SEARCH_V27
     ) && !plan.is_v9_policy_shape()
     {
         return Err(EmitError::Unsupported {
@@ -668,6 +697,7 @@ fn emit_search_image<O: Operation>(
                 | BackendVersion::SEARCH_V24
                 | BackendVersion::SEARCH_V25
                 | BackendVersion::SEARCH_V26
+                | BackendVersion::SEARCH_V27
                 | BackendVersion::SEARCH_SVE16_V1
                 | BackendVersion::SEARCH_SVE2_16_V1
                 | BackendVersion::SEARCH_SVE16_V6
@@ -1549,6 +1579,20 @@ fn candidate_signature_is_cyclic_phase_unique(literal: &[u8], offsets: Candidate
     })
 }
 
+fn search_v27_codegen(literal: &[u8], offsets: CandidateOffsets) -> Option<SearchV27Codegen> {
+    if !(SEARCH_V27_MIN_LITERAL_BYTES..=SEARCH_V27_MAX_LITERAL_BYTES).contains(&literal.len()) {
+        return None;
+    }
+    if !candidate_signature_is_cyclic_phase_unique(literal, offsets) {
+        return Some(SearchV27Codegen::AsimdV8Fallback);
+    }
+    if literal.len() <= SEARCH_V26_V17_MAX_LITERAL_BYTES {
+        Some(SearchV27Codegen::AsimdV17)
+    } else {
+        Some(SearchV27Codegen::AsimdV25)
+    }
+}
+
 mod v7_policy_scan_admission {
     use super::{
         ArithmeticSite, CandidateOffsets, EmitError, WorkMeter, candidate_byte_pair,
@@ -1650,6 +1694,20 @@ impl<'a> Plan<'a> {
                         end: false,
                     },
             } if literal.len() >= 6 && literal.len() <= 32
+        )
+    }
+
+    const fn is_v27_policy_shape(self) -> bool {
+        matches!(
+            self,
+            Self::Exact {
+                literal,
+                anchors:
+                    AnchorFlags {
+                        start: false,
+                        end: false,
+                    },
+            } if !literal.is_empty() && literal.len() <= SEARCH_V27_MAX_LITERAL_BYTES
         )
     }
 
@@ -1803,6 +1861,7 @@ impl<'a> Plan<'a> {
                         | BackendVersion::SEARCH_V24
                         | BackendVersion::SEARCH_V25
                         | BackendVersion::SEARCH_V26
+                        | BackendVersion::SEARCH_V27
                         | BackendVersion::SEARCH_SVE16_V6
                         | BackendVersion::SEARCH_SVE2_FIXED16_V2
                 ) =>
@@ -1868,6 +1927,7 @@ impl<'a> Plan<'a> {
                 | BackendVersion::SEARCH_V24
                 | BackendVersion::SEARCH_V25
                 | BackendVersion::SEARCH_V26
+                | BackendVersion::SEARCH_V27
                 | BackendVersion::SEARCH_SVE16_V1
                 | BackendVersion::SEARCH_SVE2_16_V1
                 | BackendVersion::SEARCH_SVE16_V6
@@ -1885,6 +1945,7 @@ impl<'a> Plan<'a> {
         // retains its historical exact two-scan receipt.
         let scan_count = match (backend_version, literal.len()) {
             (BackendVersion::SEARCH_V24 | BackendVersion::SEARCH_V25, _) => 3,
+            (BackendVersion::SEARCH_V27, _) => 3,
             (BackendVersion::SEARCH_V26, width)
                 if search_v26_codegen_for_literal_width(width)
                     == Some(SearchV26Codegen::AsimdV25) =>
@@ -1937,6 +1998,7 @@ impl<'a> Plan<'a> {
                         | BackendVersion::SEARCH_V24
                         | BackendVersion::SEARCH_V25
                         | BackendVersion::SEARCH_V26
+                        | BackendVersion::SEARCH_V27
                         | BackendVersion::SEARCH_SVE16_V1
                         | BackendVersion::SEARCH_SVE2_16_V1
                         | BackendVersion::SEARCH_SVE16_V6
@@ -1962,6 +2024,7 @@ impl<'a> Plan<'a> {
                                 | BackendVersion::SEARCH_V24
                                 | BackendVersion::SEARCH_V25
                                 | BackendVersion::SEARCH_V26
+                                | BackendVersion::SEARCH_V27
                         ) {
                             admission.select_offsets_v3()
                         } else if matches!(
@@ -2102,6 +2165,10 @@ impl<'a> Plan<'a> {
                             && shape == SearchShape::ExactLiteral
                         {
                             SEARCH_CANDIDATE_POLICY_V12
+                        } else if backend_version == BackendVersion::SEARCH_V27
+                            && shape == SearchShape::ExactLiteral
+                        {
+                            SEARCH_CANDIDATE_POLICY_V13
                         } else if matches!(
                             backend_version,
                             BackendVersion::SEARCH_V15
@@ -2581,6 +2648,19 @@ fn emit_exact(
         }
         BackendVersion::SEARCH_V26 => {
             emit_vector_candidate_skip_v26(
+                assembler,
+                literal,
+                primary_offset,
+                secondary_offset,
+                verification_offset,
+                quaternary_offset,
+                quinary_offset,
+                none,
+                found,
+            )?;
+        }
+        BackendVersion::SEARCH_V27 => {
+            emit_vector_candidate_skip_v27(
                 assembler,
                 literal,
                 primary_offset,
@@ -4222,6 +4302,66 @@ fn emit_vector_candidate_skip_v26(
             found,
         ),
         SearchV26Codegen::AsimdV25 => emit_vector_candidate_skip_v25(
+            assembler,
+            literal,
+            primary_offset,
+            secondary_offset,
+            verification_offset,
+            quaternary_offset,
+            quinary_offset,
+            none,
+            found,
+        ),
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "V27 selects one of three frozen source graphs from authenticated literal topology"
+)]
+fn emit_vector_candidate_skip_v27(
+    assembler: &mut Assembler,
+    literal: &[u8],
+    primary_offset: u16,
+    secondary_offset: Option<u16>,
+    verification_offset: Option<u16>,
+    quaternary_offset: Option<u16>,
+    quinary_offset: Option<u16>,
+    none: Label,
+    found: Label,
+) -> Result<(), EmitError> {
+    let offsets = CandidateOffsets {
+        primary: primary_offset,
+        secondary: secondary_offset,
+        verification: verification_offset,
+        quaternary: quaternary_offset,
+        quinary: quinary_offset,
+    };
+    match search_v27_codegen(literal, offsets).ok_or(EmitError::InternalInvariant)? {
+        SearchV27Codegen::AsimdV8Fallback => emit_vector_candidate_skip_v8(
+            assembler,
+            literal,
+            primary_offset,
+            secondary_offset,
+            verification_offset,
+            quaternary_offset,
+            quinary_offset,
+            BackendVersion::SEARCH_V8,
+            none,
+            found,
+        ),
+        SearchV27Codegen::AsimdV17 => emit_vector_candidate_skip_v17(
+            assembler,
+            literal,
+            primary_offset,
+            secondary_offset,
+            verification_offset,
+            quaternary_offset,
+            quinary_offset,
+            none,
+            found,
+        ),
+        SearchV27Codegen::AsimdV25 => emit_vector_candidate_skip_v25(
             assembler,
             literal,
             primary_offset,
