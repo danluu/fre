@@ -4754,6 +4754,69 @@ fn v26_width_selected_graphs_publish_and_execute_at_both_cost_boundaries() {
 }
 
 #[test]
+fn v27_topology_total_graphs_publish_and_execute_for_every_output() {
+    fn check<O: RuntimeOperation>(literal: &[u8], haystack: &[u8], windows: &[SearchWindow])
+    where
+        O::Output: Eq,
+    {
+        let program =
+            build_exact_literal::<O>(literal, AnchorFlags::default(), ValidateLimits::default())
+                .expect("V27 topology-total program");
+        let image = emit_audited_with_backend(
+            &program,
+            SearchBackendPolicy::AsimdV27,
+            EmitLimits::default(),
+        )
+        .expect("audited V27 topology-total image");
+        assert_eq!(
+            image.as_image().backend_version(),
+            BackendVersion::SEARCH_V27
+        );
+        let kernel = publish_audited::<O>(&image, PublicationLimits::default())
+            .expect("publish authenticated V27");
+        for &window in windows {
+            assert_native_matches(&program, &kernel, haystack, window);
+        }
+    }
+
+    let _lock = native_test_lock();
+    let mut comparisons = 0_u64;
+    for literal in [
+        b"x".as_slice(),
+        b"aaaaaaaaa".as_slice(),
+        b"ababababa".as_slice(),
+        b"phase-unique-17!".as_slice(),
+        b"topology-total-width-thirty-two!".as_slice(),
+    ] {
+        let mut matching = vec![0xfe; 257];
+        let exact = 173;
+        install_literal(&mut matching, exact, literal);
+        let absent = vec![0xfe; matching.len()];
+        for bytes in [&absent, &matching] {
+            let windows = [
+                SearchWindow::new(0, bytes.len()),
+                SearchWindow::new(3, bytes.len()),
+                SearchWindow::new(17, exact),
+                SearchWindow::new(exact, exact + literal.len()),
+                SearchWindow::new(exact + 1, bytes.len()),
+            ];
+            for right_boundary in [false, true] {
+                platform::with_guarded_haystack(bytes, right_boundary, |guarded| {
+                    check::<Exists>(literal, guarded, &windows);
+                    check::<SelectedEnd>(literal, guarded, &windows);
+                    check::<Span>(literal, guarded, &windows);
+                })
+                .expect("guarded V27 topology-total execution");
+                comparisons = comparisons
+                    .checked_add(u64::try_from(windows.len() * 3).expect("small comparison count"))
+                    .expect("bounded comparisons");
+            }
+        }
+    }
+    assert_eq!(comparisons, 5 * 2 * 2 * 5 * 3);
+}
+
+#[test]
 #[allow(
     clippy::too_many_lines,
     reason = "the width/topology matrix keeps learned-mode, vector-tail, one-candidate, and clipped-window guard cases explicit"
