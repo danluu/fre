@@ -13,15 +13,18 @@
 //! Search V1 is intentionally narrower: macOS emits typed, deterministic V8
 //! objects for all three output kinds, while Linux emits authenticated `AArch64`
 //! ELF candidates for the default V8 backend and the fixed-VL16 tag21 backend.
-//! Every path grants [`SearchAotRuntimeAuthorityV1::Absent`]. Span additionally
-//! has deterministic platform-specific final-image glue; each unsigned receipt
-//! binds compiler, implementation-object, compiler-receipt, expectation, glue,
-//! and code identities but still grants no runtime authority or source
-//! qualification row. The V1 C header describes Span's two-word success
-//! publication only; Exists and `SelectedEnd` have narrower store behavior and
-//! are not exposed here as a deployable C ABI. This crate consumes `fre` with
-//! its default JIT feature disabled, so portable facade authentication does not
-//! pull `fre-jit-runtime` into the standalone compiler. The direct
+//! Every path grants [`SearchAotRuntimeAuthorityV1::Absent`]. V26 additionally
+//! exposes source-first, width-9..=32 implementation-object builders for
+//! `Exists` and `SelectedEnd` on macOS and Linux without creating a C ABI,
+//! expectation, or glue object. Span has deterministic platform-specific
+//! final-image glue; each unsigned receipt binds compiler,
+//! implementation-object, compiler-receipt, expectation, glue, and code
+//! identities but still grants no runtime authority or source qualification
+//! row. The V1 C header describes Span's two-word success publication only;
+//! Exists and `SelectedEnd` have narrower store behavior and are not exposed
+//! here as a deployable C ABI. This crate consumes `fre` with its default JIT
+//! feature disabled, so portable facade authentication does not pull
+//! `fre-jit-runtime` into the standalone compiler. The direct
 //! `fre-jit-aarch64` dependency is the inert custom machine-code emitter; this
 //! crate never publishes its output as executable memory.
 //!
@@ -59,6 +62,7 @@ mod search_selected_end_expectation_v2;
 mod search_selected_end_v2;
 mod search_static_expectation;
 mod search_v25_production;
+mod search_v26_output;
 mod search_v26_production;
 mod static_expectation;
 mod static_expectation_v2;
@@ -199,21 +203,27 @@ pub use search_selected_end_v2::{
     compute_linux_selected_end_source_identity_v2, inspect_linux_selected_end_compile_receipt_v2,
     plan_and_compile_linux_aarch64_selected_end_v2,
 };
-pub use search_v25_production::{
-    LinuxAarch64SearchV25ProductionSourceV1, MacosAarch64SearchV25ProductionSourceV1,
-    SearchV25ProductionSourceErrorV1, build_linux_aarch64_search_v25_production_source_v1,
-    build_macos_aarch64_search_v25_production_source_v1,
-};
-pub use search_v26_production::{
-    LinuxAarch64SearchV26ProductionSourceV1, MacosAarch64SearchV26ProductionSourceV1,
-    SearchV26ProductionSourceErrorV1, build_linux_aarch64_search_v26_production_source_v1,
-    build_macos_aarch64_search_v26_production_source_v1,
-};
 pub use search_static_expectation::{
     STATIC_SEARCH_SPAN_EXPECTATION_BUILD_ALLOCATIONS_V1,
     STATIC_SEARCH_SPAN_EXPECTATION_RETAINED_BYTES_V1, StaticSearchSpanExpectationBuildErrorV1,
     StaticSearchSpanExpectationIdentityV1, StaticSearchSpanExpectationV1,
     build_static_search_span_expectation_v1,
+};
+pub use search_v25_production::{
+    LinuxAarch64SearchV25ProductionSourceV1, MacosAarch64SearchV25ProductionSourceV1,
+    SearchV25ProductionSourceErrorV1, build_linux_aarch64_search_v25_production_source_v1,
+    build_macos_aarch64_search_v25_production_source_v1,
+};
+pub use search_v26_output::{
+    SearchV26OutputObjectErrorV1, build_linux_aarch64_search_v26_exists_object_v1,
+    build_linux_aarch64_search_v26_selected_end_object_v1,
+    build_macos_aarch64_search_v26_exists_object_v1,
+    build_macos_aarch64_search_v26_selected_end_object_v1,
+};
+pub use search_v26_production::{
+    LinuxAarch64SearchV26ProductionSourceV1, MacosAarch64SearchV26ProductionSourceV1,
+    SearchV26ProductionSourceErrorV1, build_linux_aarch64_search_v26_production_source_v1,
+    build_macos_aarch64_search_v26_production_source_v1,
 };
 pub use static_expectation::{
     ClaimedStaticCountExpectationV1, STATIC_COUNT_EXPECTATION_BYTES_V1,
