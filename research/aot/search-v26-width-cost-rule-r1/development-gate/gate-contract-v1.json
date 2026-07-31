@@ -50,6 +50,7 @@
     "overlap_near_miss": "start at exact_match_start - (literal_width - 1), copy the literal, replace the near-miss first byte with filler, then install the exact match",
     "dense_false_candidates": "from window_start, advance by literal_width + 3 while the candidate ends before the last legal position; candidate i contains filler except literal[i mod literal_width] at that same column",
     "dense_exact_match": "last legal position after all false candidates",
+    "expected_coordinates": "absolute haystack byte coordinates; an engine invoked on a sliced window must add window_start before hashing or comparing its result",
     "identity": "SHA-256 over fre-search-v26-long-scan-fixture-v1 binary domain, literal coordinate and bytes, shape tag, geometry, expected match, and complete haystack bytes",
     "allocation": "construct and release exactly one fixture/cell at a time; retaining the 7,776 long haystacks is forbidden"
   },
@@ -62,6 +63,7 @@
   "measurement": {
     "calibration_target_ns": 4000000,
     "calibration": "per cell and engine, begin at one search and double the batch until elapsed_ns >= target; fail on overflow or zero/nonfinite normalized time",
+    "calibration_evidence": "record chosen iterations and terminal elapsed_ns; for iterations > 1 also record exactly half the iterations and its elapsed_ns, which must be below target; every timed sample must use the chosen iterations",
     "paired_repetitions": 12,
     "orders": [
       [
@@ -161,7 +163,9 @@
   },
   "execution": {
     "runs": 1,
-    "launcher": "one-shot; three disjoint shards may run concurrently",
+    "launcher": "one-shot; require three explicit distinct CPU IDs and run the three disjoint shards concurrently; on Linux pin shard i to CPU i with taskset",
+    "admission": "do not wait on load, headroom, another GO, or other CPU work; do not kill other CPU work",
+    "run_manifest": "create-new and read-only before timing; seal host fingerprint, ordered CPU IDs, shard-to-CPU map, source/binary/archive/contract/cell identities, authorization nonce, three distinct shard nonces, and a distinct run nonce",
     "missing_duplicate_nonfinite_unpaired_wrong_order_or_mutated_input": "hard failure",
     "rebar_input": false,
     "sealing_authority": "AWAITING_REVIEWED_RUNNER_BINARY_INPUT_MANIFEST_AND_SUCCESSOR_CORE",

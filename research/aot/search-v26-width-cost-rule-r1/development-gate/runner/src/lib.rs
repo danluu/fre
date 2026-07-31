@@ -96,6 +96,7 @@ pub struct GateFixture {
     pub filler_byte: u8,
     pub window_start: usize,
     pub window_end: usize,
+    /// Absolute haystack coordinates, never sliced-window-relative offsets.
     pub expected_match: Option<(usize, usize)>,
     pub haystack_sha256: String,
     pub fixture_sha256: String,
@@ -483,6 +484,15 @@ pub fn materialize_cells(destination: &Path) -> Result<(), MaterializeError> {
     fs::remove_file(&temporary).map_err(|error| {
         MaterializeError::new(format!("cannot unlink partial manifest: {error}"))
     })?;
+    let parent = destination
+        .parent()
+        .filter(|value| !value.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| {
+            MaterializeError::new(format!("cannot sync manifest parent directory: {error}"))
+        })?;
     Ok(())
 }
 
