@@ -23,6 +23,9 @@ boundaries. `correctness` publishes V26 locally and differentially checks all
 tests pin the byte derivation, population identity, uniqueness, determinism,
 per-cell counts, geometry, and public-emitter admission.
 
-Neither command measures wall time. Performance execution belongs to a
-separately sealed one-shot runner and receipt; this correctness/static tool
-does not run or infer V26 timing.
+`emission-timing` is a separate, report-only cold compiler measurement. It
+prepares KIR outside the clock, performs two untimed candidate/source warmup
+pairs, then records the arithmetic median of eleven paired full-population
+emission batches with alternating order. It never publishes or invokes
+machine code and its result is not an acceptance gate. Search performance
+execution belongs to a separately sealed one-shot runner and receipt.

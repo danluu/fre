@@ -3,7 +3,7 @@ use std::{env, error::Error, io};
 use fre_jit_aarch64::SearchBackendPolicy;
 use fre_search_v26_synthetic_runner::{
     EXPECTED_LITERAL_COUNT, MAX_WIDTH, MIN_WIDTH, SYNTHETIC_DOMAIN, generate_population, hex,
-    native_correctness, static_parity,
+    native_correctness, report_only_emission_timing, static_parity,
 };
 use serde::Serialize;
 
@@ -29,7 +29,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     if arguments.next().is_some() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: fre-search-v26-synthetic-runner [summary|population|static|correctness]",
+            "usage: fre-search-v26-synthetic-runner [summary|population|static|correctness|emission-timing]",
         )
         .into());
     }
@@ -46,13 +46,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!();
         return Ok(());
     }
+    if command == "emission-timing" {
+        let report = report_only_emission_timing(&population)?;
+        serde_json::to_writer(io::stdout().lock(), &report)?;
+        println!();
+        return Ok(());
+    }
     let literals = match command.as_str() {
         "summary" => None,
         "population" => Some(population.literals()),
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "command must be summary, population, static, or correctness",
+                "command must be summary, population, static, correctness, or emission-timing",
             )
             .into());
         }

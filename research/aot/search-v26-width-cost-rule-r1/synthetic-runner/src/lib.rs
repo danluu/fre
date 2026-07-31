@@ -4,7 +4,7 @@
 //! boundary. This tool does not duplicate or weaken the cyclic-phase-unique
 //! predicate, and it never reads a benchmark corpus or result file.
 
-use std::{collections::BTreeMap, error::Error, fmt};
+use std::{collections::BTreeMap, error::Error, fmt, hint::black_box, time::Instant};
 
 use fre_jit_aarch64::{
     AotLimits, AuditReport, BackendVersion, ConfirmationKind, EmitError, EmitLimits, ImageStats,
@@ -14,7 +14,7 @@ use fre_jit_aarch64::{
 use fre_jit_runtime::{PublicationLimits, RuntimeOperation};
 use fre_kernel_ir::{
     AnchorFlags, ExecutionLimits, Exists, MatchSpan, Operation, OutputKind, SearchWindow,
-    SelectedEnd, Span, ValidateLimits, build_exact_literal,
+    SelectedEnd, Span, ValidateLimits, ValidatedProgram, build_exact_literal,
 };
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -978,6 +978,296 @@ fn checked_sum(left: u64, right: u64, field: &str) -> Result<u64, PopulationErro
         .ok_or_else(|| PopulationError::new(format!("{field} overflow")))
 }
 
+const EMISSION_BATCH_IDENTITY_DOMAIN: &[u8] =
+    b"FRE-V26-WIDTH-COST-SYNTHETIC-R1-EMISSION-BATCH\0\x01";
+const EMISSION_WARMUP_PAIRS: usize = 2;
+const EMISSION_MEASURED_PAIRS: usize = 11;
+
+enum PreparedEmission {
+    Exists {
+        width: u16,
+        program: ValidatedProgram<Exists>,
+    },
+    Span {
+        width: u16,
+        program: ValidatedProgram<Span>,
+    },
+    SelectedEnd {
+        width: u16,
+        program: ValidatedProgram<SelectedEnd>,
+    },
+}
+
+impl PreparedEmission {
+    const fn width(&self) -> u16 {
+        match self {
+            Self::Exists { width, .. }
+            | Self::Span { width, .. }
+            | Self::SelectedEnd { width, .. } => *width,
+        }
+    }
+
+    const fn output_tag(&self) -> u8 {
+        match self {
+            Self::Exists { .. } => SyntheticOutput::Exists.tag(),
+            Self::Span { .. } => SyntheticOutput::Span.tag(),
+            Self::SelectedEnd { .. } => SyntheticOutput::SelectedEnd.tag(),
+        }
+    }
+
+    fn emit(&self, policy: SearchBackendPolicy) -> Result<NativeImage, PopulationError> {
+        match self {
+            Self::Exists { program, .. } => {
+                fre_jit_aarch64::emit_with_backend(program, policy, EmitLimits::default())
+            }
+            Self::Span { program, .. } => {
+                fre_jit_aarch64::emit_with_backend(program, policy, EmitLimits::default())
+            }
+            Self::SelectedEnd { program, .. } => {
+                fre_jit_aarch64::emit_with_backend(program, policy, EmitLimits::default())
+            }
+        }
+        .map_err(|error| PopulationError::new(format!("timed emission failed: {error}")))
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct EmissionTimingReport {
+    pub schema: &'static str,
+    pub population_sha256: String,
+    pub candidate_backend: u16,
+    pub short_source_backend: u16,
+    pub wide_source_backend: u16,
+    pub objects_per_batch: usize,
+    pub untimed_warmup_pairs: usize,
+    pub measured_paired_batches: usize,
+    pub execution_orders: Vec<&'static str>,
+    pub candidate_batch_artifact_sha256: String,
+    pub selected_source_batch_artifact_sha256: String,
+    pub candidate_emission_ns: Vec<u64>,
+    pub selected_source_emission_ns: Vec<u64>,
+    pub candidate_median_emission_ns: u64,
+    pub selected_source_median_emission_ns: u64,
+    pub candidate_over_selected_source_ppm: u64,
+    pub estimator: &'static str,
+    pub acceptance: &'static str,
+    pub machine_code_executions: u64,
+}
+
+/// Measure only full-population object emission under the frozen local method.
+///
+/// KIR construction occurs before both warmups and measurement. No image is
+/// published or called. This report is explicitly not an acceptance gate.
+pub fn report_only_emission_timing(
+    population: &SyntheticPopulation,
+) -> Result<EmissionTimingReport, PopulationError> {
+    let prepared = prepare_emissions(population)?;
+
+    let candidate_identity = bound_emission_batch(
+        &prepared,
+        EmissionSelection::Candidate,
+        population.population_sha256(),
+    )?;
+    let source_identity = bound_emission_batch(
+        &prepared,
+        EmissionSelection::SelectedSource,
+        population.population_sha256(),
+    )?;
+    let source_identity_second = bound_emission_batch(
+        &prepared,
+        EmissionSelection::SelectedSource,
+        population.population_sha256(),
+    )?;
+    let candidate_identity_second = bound_emission_batch(
+        &prepared,
+        EmissionSelection::Candidate,
+        population.population_sha256(),
+    )?;
+    if candidate_identity != candidate_identity_second || source_identity != source_identity_second
+    {
+        return Err(PopulationError::new(
+            "untimed emission warmups produced unstable artifact identities",
+        ));
+    }
+
+    let mut execution_orders = Vec::with_capacity(EMISSION_MEASURED_PAIRS);
+    let mut candidate_emission_ns = Vec::with_capacity(EMISSION_MEASURED_PAIRS);
+    let mut selected_source_emission_ns = Vec::with_capacity(EMISSION_MEASURED_PAIRS);
+    for pair in 0..EMISSION_MEASURED_PAIRS {
+        if pair.is_multiple_of(2) {
+            execution_orders.push("candidate-selected_source");
+            candidate_emission_ns.push(measure_emission_batch(
+                &prepared,
+                EmissionSelection::Candidate,
+            )?);
+            selected_source_emission_ns.push(measure_emission_batch(
+                &prepared,
+                EmissionSelection::SelectedSource,
+            )?);
+        } else {
+            execution_orders.push("selected_source-candidate");
+            selected_source_emission_ns.push(measure_emission_batch(
+                &prepared,
+                EmissionSelection::SelectedSource,
+            )?);
+            candidate_emission_ns.push(measure_emission_batch(
+                &prepared,
+                EmissionSelection::Candidate,
+            )?);
+        }
+    }
+    let candidate_median_emission_ns = arithmetic_median_11(&candidate_emission_ns)?;
+    let selected_source_median_emission_ns = arithmetic_median_11(&selected_source_emission_ns)?;
+    let ratio_scaled = u128::from(candidate_median_emission_ns)
+        .checked_mul(1_000_000)
+        .and_then(|value| value.checked_div(u128::from(selected_source_median_emission_ns)))
+        .ok_or_else(|| PopulationError::new("emission timing ratio is undefined"))?;
+    let candidate_over_selected_source_ppm = u64::try_from(ratio_scaled)
+        .map_err(|_| PopulationError::new("emission timing ratio exceeds u64"))?;
+
+    Ok(EmissionTimingReport {
+        schema: "fre.aot.search-v26-local-report-only-emission-timing.v1",
+        population_sha256: population.population_sha256_hex(),
+        candidate_backend: BackendVersion::SEARCH_V26.0,
+        short_source_backend: BackendVersion::SEARCH_V17.0,
+        wide_source_backend: BackendVersion::SEARCH_V25.0,
+        objects_per_batch: prepared.len(),
+        untimed_warmup_pairs: EMISSION_WARMUP_PAIRS,
+        measured_paired_batches: EMISSION_MEASURED_PAIRS,
+        execution_orders,
+        candidate_batch_artifact_sha256: hex(&candidate_identity),
+        selected_source_batch_artifact_sha256: hex(&source_identity),
+        candidate_emission_ns,
+        selected_source_emission_ns,
+        candidate_median_emission_ns,
+        selected_source_median_emission_ns,
+        candidate_over_selected_source_ppm,
+        estimator: "arithmetic-median-of-11-paired-batches-alternating-order",
+        acceptance: "report-only-not-an-acceptance-gate",
+        machine_code_executions: 0,
+    })
+}
+
+fn prepare_emissions(
+    population: &SyntheticPopulation,
+) -> Result<Vec<PreparedEmission>, PopulationError> {
+    let mut prepared = Vec::with_capacity(population.literals().len());
+    for literal in population.literals() {
+        let width = literal.width;
+        let item = match literal.output {
+            SyntheticOutput::Exists => PreparedEmission::Exists {
+                width,
+                program: build_exact_literal::<Exists>(
+                    literal.literal(),
+                    AnchorFlags::default(),
+                    ValidateLimits::default(),
+                )
+                .map_err(|error| {
+                    PopulationError::new(format!("emission timing KIR build failed: {error}"))
+                })?,
+            },
+            SyntheticOutput::Span => PreparedEmission::Span {
+                width,
+                program: build_exact_literal::<Span>(
+                    literal.literal(),
+                    AnchorFlags::default(),
+                    ValidateLimits::default(),
+                )
+                .map_err(|error| {
+                    PopulationError::new(format!("emission timing KIR build failed: {error}"))
+                })?,
+            },
+            SyntheticOutput::SelectedEnd => PreparedEmission::SelectedEnd {
+                width,
+                program: build_exact_literal::<SelectedEnd>(
+                    literal.literal(),
+                    AnchorFlags::default(),
+                    ValidateLimits::default(),
+                )
+                .map_err(|error| {
+                    PopulationError::new(format!("emission timing KIR build failed: {error}"))
+                })?,
+            },
+        };
+        prepared.push(item);
+    }
+    Ok(prepared)
+}
+
+#[derive(Clone, Copy)]
+enum EmissionSelection {
+    Candidate,
+    SelectedSource,
+}
+
+fn emission_policy(
+    item: &PreparedEmission,
+    selection: EmissionSelection,
+) -> Result<SearchBackendPolicy, PopulationError> {
+    match selection {
+        EmissionSelection::Candidate => Ok(SearchBackendPolicy::AsimdV26),
+        EmissionSelection::SelectedSource => {
+            selected_source_policy(item.width()).ok_or_else(|| {
+                PopulationError::new("prepared emission width is outside the frozen envelope")
+            })
+        }
+    }
+}
+
+fn for_emission_batch(
+    prepared: &[PreparedEmission],
+    selection: EmissionSelection,
+    mut consume: impl FnMut(&PreparedEmission, &NativeImage),
+) -> Result<(), PopulationError> {
+    for item in prepared {
+        let image = item.emit(emission_policy(item, selection)?)?;
+        consume(item, &image);
+    }
+    Ok(())
+}
+
+fn bound_emission_batch(
+    prepared: &[PreparedEmission],
+    selection: EmissionSelection,
+    population_identity: &[u8; 32],
+) -> Result<[u8; 32], PopulationError> {
+    let mut hasher = Sha256::new();
+    hasher.update(EMISSION_BATCH_IDENTITY_DOMAIN);
+    hasher.update(population_identity);
+    for_emission_batch(prepared, selection, |item, image| {
+        hasher.update(item.width().to_le_bytes());
+        hasher.update([item.output_tag()]);
+        hasher.update(image.backend_version().0.to_le_bytes());
+        hasher.update(image.artifact_identity().as_bytes());
+    })?;
+    let digest = hasher.finalize();
+    let mut identity = [0_u8; 32];
+    identity.copy_from_slice(&digest);
+    black_box(identity);
+    Ok(identity)
+}
+
+fn measure_emission_batch(
+    prepared: &[PreparedEmission],
+    selection: EmissionSelection,
+) -> Result<u64, PopulationError> {
+    let started = Instant::now();
+    for_emission_batch(prepared, selection, |_item, image| {
+        black_box(image.artifact_identity());
+    })?;
+    u64::try_from(started.elapsed().as_nanos())
+        .map_err(|_| PopulationError::new("emission batch duration exceeds u64 nanoseconds"))
+}
+
+fn arithmetic_median_11(samples: &[u64]) -> Result<u64, PopulationError> {
+    let samples: &[u64; EMISSION_MEASURED_PAIRS] = samples
+        .try_into()
+        .map_err(|_| PopulationError::new("emission estimator requires exactly eleven samples"))?;
+    let mut sorted = *samples;
+    sorted.sort_unstable();
+    Ok(sorted[EMISSION_MEASURED_PAIRS / 2])
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -1178,5 +1468,16 @@ mod tests {
             Some(SearchV26Codegen::AsimdV25)
         );
         assert_eq!(search_v26_codegen_for_literal_width(33), None);
+    }
+
+    #[test]
+    fn report_only_emission_estimator_requires_eleven_and_selects_median() {
+        assert_eq!(
+            arithmetic_median_11(&[11, 1, 10, 2, 9, 3, 8, 4, 7, 5, 6])
+                .expect("eleven-sample median"),
+            6
+        );
+        assert!(arithmetic_median_11(&[1; 10]).is_err());
+        assert!(arithmetic_median_11(&[1; 12]).is_err());
     }
 }
