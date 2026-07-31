@@ -1501,6 +1501,34 @@ mod tests {
     }
 
     #[test]
+    fn forced_k0_text_root_scanner_mismatches_iterate_to_completion() {
+        for (pattern, haystack) in [
+            ("a+", "aa--a--aaaa"),
+            ("[a-z]{2}", "ab--cd--ef"),
+            ("[0-9]+?", "12--3--456"),
+        ] {
+            let fre = PortableTextBuilder::new(pattern)
+                .plan_selection(PlanSelection::ForceK0)
+                .build()
+                .unwrap_or_else(|error| panic!("pattern={pattern:?}: {error}"));
+            assert_eq!(fre.build_report().portable.plan, crate::PlanKind::K0);
+            let upstream = regex::Regex::new(pattern).unwrap();
+            let expected: Vec<_> = upstream
+                .find_iter(haystack)
+                .map(|matched| (matched.start(), matched.end()))
+                .collect();
+            let actual: Result<Vec<_>, _> = fre
+                .find_iter(haystack, PortableFindIterLimits::unlimited())
+                .unwrap()
+                .map(|matched| {
+                    matched.map(|matched| (matched.start(), matched.end()))
+                })
+                .collect();
+            assert_eq!(actual.unwrap(), expected, "pattern={pattern}");
+        }
+    }
+
+    #[test]
     fn utf8_start_guarded_ascii_looks_match_pinned_text_exhaustively() {
         fn spans(regex: &PortableTextRegex, haystack: &str) -> Vec<(usize, usize)> {
             let mut spans = Vec::new();

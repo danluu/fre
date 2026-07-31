@@ -552,7 +552,9 @@ pub use text_set::{
     PortableTextRegexSetBuildError, PortableTextRegexSetBuildReport, PortableTextRegexSetBuilder,
 };
 
-use fre_automata::{Automaton, EarliestEnd, Exists, K0SearchSession, SelectedEnd, Span};
+use fre_automata::{
+    Automaton, EarliestEnd, Exists, K0SearchSession, K0SpanSourceCursor, SelectedEnd, Span,
+};
 use fre_kernels::{
     AbsoluteEndFixedPlan, BoundedRequiredLiteralPlan, DispatchedBoundedRequiredLiteralPlan,
     DispatchedForwardAnchoredPlan, DispatchedRequiredLiteralPlan, ForwardAnchoredBuildAccounting,
@@ -5557,14 +5559,16 @@ impl<'r> PortableSearchSession<'r> {
 
     fn find_iter_at(
         &mut self,
-        haystack: &[u8],
+        source: &mut K0SpanSourceCursor<'_>,
         start: usize,
         limits: SearchLimits,
     ) -> Result<(Option<Match>, u64), SearchError> {
         match &mut self.plan {
-            PortableSearchSessionPlan::Native(regex) => regex.find_iter_at(haystack, start, limits),
+            PortableSearchSessionPlan::Native(regex) => {
+                regex.find_iter_at(source.haystack(), start, limits)
+            }
             PortableSearchSessionPlan::K0 { session } => {
-                let report = session.search_span_at_cursor(haystack, start, limits)?;
+                let report = session.search_span_at_source_cursor(source, start, limits)?;
                 let work = report.accounting().work();
                 let matched = report.into_output().map(|span| Match {
                     start: span.start(),
@@ -5602,7 +5606,7 @@ pub struct PortableSessionMatches<'s, 'r, 'h> {
 
 #[derive(Debug)]
 struct PortableMatchIterState<'h> {
-    haystack: &'h [u8],
+    k0_source: K0SpanSourceCursor<'h>,
     limits: PortableFindIterRunLimits,
     empty_match_progress: EmptyMatchProgress,
     start: usize,
@@ -5625,7 +5629,7 @@ impl<'h> PortableMatchIterState<'h> {
         empty_match_progress: EmptyMatchProgress,
     ) -> Self {
         Self {
-            haystack,
+            k0_source: K0SpanSourceCursor::new(haystack),
             limits,
             empty_match_progress,
             start: 0,
@@ -5641,6 +5645,10 @@ impl<'h> PortableMatchIterState<'h> {
             },
             finished: false,
         }
+    }
+
+    const fn haystack(&self) -> &'h [u8] {
+        self.k0_source.haystack()
     }
 
     fn fail(&mut self, error: PortableFindIterError) -> Result<Match, PortableFindIterError> {
@@ -5709,7 +5717,7 @@ impl<'h> PortableMatchIterState<'h> {
                 counter: "suppressed-empty",
             },
         )?;
-        if self.start == self.haystack.len() {
+        if self.start == self.haystack().len() {
             self.finished = true;
             return Ok(true);
         }
@@ -5724,7 +5732,7 @@ impl<'h> PortableMatchIterState<'h> {
                 let mut next = self.start.saturating_add(1);
                 let mut byte_probes = 0_u64;
                 let mut progress_work = 1_u64;
-                while next < self.haystack.len() {
+                while next < self.haystack().len() {
                     byte_probes = byte_probes.checked_add(1).ok_or(
                         PortableFindIterError::AccountingOverflow {
                             counter: "utf8-progress-byte-probe",
@@ -5735,7 +5743,7 @@ impl<'h> PortableMatchIterState<'h> {
                             counter: "utf8-progress-work",
                         },
                     )?;
-                    if (self.haystack[next] & 0b1100_0000) != 0b1000_0000 {
+                    if (self.haystack()[next] & 0b1100_0000) != 0b1000_0000 {
                         break;
                     }
                     progress_work = progress_work.checked_add(1).ok_or(
@@ -5777,7 +5785,8 @@ impl<'h> PortableMatchIterState<'h> {
             if let Err(error) = self.begin_search() {
                 return Some(self.fail(error));
             }
-            let searched = session.find_iter_at(self.haystack, self.start, self.limits.search);
+            let searched =
+                session.find_iter_at(&mut self.k0_source, self.start, self.limits.search);
             let (matched, search_work) = match searched {
                 Ok(result) => result,
                 Err(error) => return Some(self.fail(PortableFindIterError::Search(error))),
@@ -5895,7 +5904,7 @@ impl<'h> Iterator for PortableByteMatches<'_, 'h> {
     type Item = Result<ByteMatch<'h>, PortableFindIterError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let haystack = self.inner.state.haystack;
+        let haystack = self.inner.state.haystack();
         self.inner
             .next()
             .map(|result| result.map(|span| ByteMatch { haystack, span }))
@@ -6001,8 +6010,9 @@ fn unicode_folded_literal_limits(limits: SearchLimits) -> FoldedLiteralTrieScanL
 mod tests {
     use super::{
         BuildError, BuildLimits, CaptureFreeOperation, PlanKind, PlanSelection, PortableBuilder,
-        PortableFindIterAccounting, PortableFindIterError, PortableFindIterLimits, PortablePlan,
-        PortableRegex, SearchAccounting, SearchError, SearchLimits, SearchWindow,
+        PortableFindIterAccounting, PortableFindIterError, PortableFindIterLimits,
+        PortableFindIterRunLimits, PortablePlan, PortableRegex, SearchAccounting, SearchError,
+        SearchLimits, SearchWindow,
     };
     use fre_lower::UnsupportedFeature;
     use std::fmt::Write as _;
@@ -6277,6 +6287,89 @@ mod tests {
             panic!("date shape should report K0 accounting");
         };
         assert!(accounting.boundaries() < 32);
+    }
+
+    #[test]
+    fn forced_k0_root_run_scanner_mismatches_fall_back_to_ordinary_iteration() {
+        let cases: [(&str, &[u8]); 5] = [
+            ("a+", b"aa--a--aaaa"),
+            ("[ab]{2,4}", b"abba--aa--bbbb"),
+            ("[abc]{2}", b"ab--ca--bc"),
+            ("[a-z]{2}", b"ab--cd--ef"),
+            ("[0-9]+?", b"12--3--456"),
+        ];
+
+        for (pattern, haystack) in cases {
+            let fre = PortableBuilder::new(pattern)
+                .unicode(false)
+                .plan_selection(PlanSelection::ForceK0)
+                .build()
+                .unwrap();
+            assert_eq!(fre.build_report().plan, PlanKind::K0);
+            let upstream = regex::bytes::RegexBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            let expected: Vec<_> = upstream
+                .find_iter(haystack)
+                .map(|matched| (matched.start(), matched.end()))
+                .collect();
+            let mut session = fre
+                .search_session(super::SearchSessionLimits::unlimited())
+                .unwrap();
+            let actual: Result<Vec<_>, _> = session
+                .find_iter(haystack, PortableFindIterRunLimits::unlimited())
+                .map(|matched| {
+                    matched.map(|matched| (matched.start(), matched.end()))
+                })
+                .collect();
+            assert_eq!(actual.unwrap(), expected, "pattern={pattern}");
+        }
+    }
+
+    #[test]
+    fn forced_k0_root_run_iterator_reuses_source_bound_masks_and_releases_them_on_drop() {
+        let fre = PortableBuilder::new("[aceg]{2}")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .unwrap();
+        assert_eq!(fre.build_report().plan, PlanKind::K0);
+        let mut session = fre
+            .search_session(super::SearchSessionLimits::unlimited())
+            .unwrap();
+        let dense = b"acegacegacegacegacegacegacegacegacegacegacegacegacegacegacegaceg";
+
+        let mut matches =
+            session.find_iter(dense, PortableFindIterRunLimits::unlimited());
+        let first = matches.next().unwrap().unwrap();
+        assert_eq!((first.start(), first.end()), (0, 2));
+        let second = matches.next().unwrap().unwrap();
+        assert_eq!((second.start(), second.end()), (2, 4));
+        let third = matches.next().unwrap().unwrap();
+        assert_eq!((third.start(), third.end()), (4, 6));
+        let activated_work = matches.accounting().work_or_linear_terms;
+        let fourth = matches.next().unwrap().unwrap();
+        assert_eq!((fourth.start(), fourth.end()), (6, 8));
+        assert_eq!(
+            matches
+                .accounting()
+                .work_or_linear_terms
+                .checked_sub(activated_work)
+                .unwrap(),
+            3,
+            "a retained qualified-start mask needs only the K0 invocation reset"
+        );
+        drop(matches);
+
+        assert_eq!(
+            session
+                .find(b"zzaceg", SearchLimits::unlimited())
+                .unwrap()
+                .0
+                .map(|matched| (matched.start(), matched.end())),
+            Some((2, 4))
+        );
     }
 
     #[test]

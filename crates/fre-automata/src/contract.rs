@@ -1,6 +1,9 @@
 use core::marker::PhantomData;
 
-use crate::{Automaton, K0SearchSession, K0Workspace, SearchError, SearchLimits, SearchWindow};
+use crate::{
+    Automaton, K0SearchSession, K0SpanSourceCursor, K0Workspace, SearchError, SearchLimits,
+    SearchWindow,
+};
 
 /// The capture-free output promised by a prepared entry point.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -453,7 +456,8 @@ impl K0SearchSession<'_> {
         ))
     }
 
-    /// Search a complete-haystack suffix with retained span cursor facts.
+    /// Search a complete-haystack suffix with retained source-independent
+    /// span cursor facts.
     ///
     /// # Errors
     ///
@@ -467,7 +471,26 @@ impl K0SearchSession<'_> {
         start: usize,
         limits: SearchLimits,
     ) -> Result<SearchReport<Option<MatchSpan>>, SearchError> {
-        let report = self.search_span_at_untyped(haystack, start, limits)?;
+        let mut source = K0SpanSourceCursor::new(haystack);
+        self.search_span_at_source_cursor(&mut source, start, limits)
+    }
+
+    /// Search one suffix while retaining masks tied to this exact source
+    /// borrow. This entry is reserved for a lifetime-bound match iterator.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same range and resource contract as
+    /// [`Self::search_window`].
+    #[doc(hidden)]
+    #[inline]
+    pub fn search_span_at_source_cursor(
+        &mut self,
+        source: &mut K0SpanSourceCursor<'_>,
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<SearchReport<Option<MatchSpan>>, SearchError> {
+        let report = self.search_span_at_untyped(source, start, limits)?;
         Ok(SearchReport::new(report.found, report.accounting))
     }
 }
