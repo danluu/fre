@@ -1,0 +1,132 @@
+{
+  "schema": "fre-search-aot-candidate-preregistration-v1",
+  "candidate": {
+    "name": "v26-width-cost-rule-r1",
+    "backend_policy": "AsimdV26",
+    "backend_version": 39,
+    "aot_magic_final_byte_hex": "27",
+    "llvm": false,
+    "parent_source_commit": "4f9913d6ebc71f2b776bb3c781fdd6a8814c7944",
+    "parent_source_tree": "4edd5cc1369a76a40f420e6afe2da5f4137399ff"
+  },
+  "created_utc": "2026-07-31T03:33:16Z",
+  "status": "FROZEN_BEFORE_V26_IMPLEMENTATION_OR_TIMING",
+  "terminal_predecessor_evidence": {
+    "candidate": "v25-sixth-promote-r1",
+    "classification": "TERMINAL_AFTER_ITS_SINGLE_FROZEN_DEVELOPMENT_GATE",
+    "policy": "V25 is immutable and will not be amended, retested, or reclassified. V26 is a fresh backend and artifact identity."
+  },
+  "frozen_design": {
+    "admitted_shape": "Unanchored exact byte literals, widths 6 through 32 inclusive, that satisfy the unchanged V17/V25 cyclic-phase-unique five-column admission rule.",
+    "compile_time_cost_rule": {
+      "inputs": [
+        "literal byte width"
+      ],
+      "short_graph": {
+        "widths": "6..8",
+        "codegen": "the authenticated Search V17 graph",
+        "reason": "the sixth-column and persistent-wide setup has fixed code and runtime cost that short confirmations do not amortize"
+      },
+      "wide_graph": {
+        "widths": "9..32",
+        "codegen": "the authenticated Search V25 graph",
+        "reason": "wider confirmations provide enough avoided exact-compare work to amortize V25's additional screening"
+      },
+      "non_inputs": [
+        "literal byte values",
+        "candidate offsets",
+        "benchmark identity",
+        "haystack topology",
+        "runtime observations"
+      ]
+    },
+    "artifact_contract": [
+      "Every admitted object is sealed as Search V26/backend 39 with AOT magic final byte 0x27.",
+      "The selected internal graph is recomputed independently from the authenticated literal width by both emitter and auditor.",
+      "Widths 6 through 8 must have instruction, label, relocation, and emission-work parity with a separately emitted authenticated V17 object for the same KIR.",
+      "Widths 9 through 32 must have instruction, label, relocation, and emission-work parity with a separately emitted authenticated V25 object for the same KIR.",
+      "V26 AOT and artifact identities remain distinct from both source backends even when machine code is equal."
+    ],
+    "forbidden_changes": [
+      "no changes to V17 or V25 emitted bytes, manifests, AOT, or artifact identities",
+      "no lookup keyed by literal bytes, topology, benchmark name, or prior result",
+      "no Rebar pattern, result, or routing input",
+      "no LLVM, external assembler, or system compiler in native code generation",
+      "no production/default routing change in this candidate commit",
+      "no V25 rerun or amended V25 gate"
+    ]
+  },
+  "fresh_synthetic_population": {
+    "domain": "FRE-V26-WIDTH-COST-SYNTHETIC-R1",
+    "generator": "For each width 6..32, output kind Exists/Span/SelectedEnd, and ordinal 0..15, derive bytes from repeated SHA-256(domain || width_le16 || output_tag_u8 || ordinal_le16 || block_counter_le32), rejecting and advancing the ordinal if the ordinary cyclic-phase-unique admission rule refuses the literal.",
+    "freshness": "The domain and generated population were frozen here before V26 implementation, compilation, execution, or timing. The generator does not read V24/V25 qualification inputs, Rebar, or result files.",
+    "literal_count": 1296,
+    "window_shapes": [
+      "no match",
+      "first legal position",
+      "middle complete-vector group",
+      "last legal position",
+      "overlapping near miss before match",
+      "dense primary-byte false candidates"
+    ]
+  },
+  "required_correctness_and_static_evidence": {
+    "hard_fail_on_any_mismatch": true,
+    "requirements": [
+      "exact V26 routing at widths 6, 8, 9, and 32 and rejection outside 6..32",
+      "emitter/auditor codegen-source agreement for every admitted width",
+      "semantic equality with KIR across all output kinds and frozen fresh synthetic window shapes",
+      "exact V17 machine-object parity at widths 6..8 and exact V25 machine-object parity at widths 9..32",
+      "V26 artifact/AOT distinction and round-trip preservation",
+      "rejection of V17/V25/V26 relabeling and width/manifest/code mutations",
+      "bounded work and resource-limit failures remain transactional",
+      "runtime publication admits authenticated V26 objects without changing the production default"
+    ]
+  },
+  "local_static_benchmark": {
+    "population": "fresh_synthetic_population",
+    "measurements": [
+      "emitted code bytes",
+      "labels",
+      "relocations",
+      "emission work",
+      "candidate and selected-source emission wall time"
+    ],
+    "estimator": "For wall time, arithmetic median of 11 alternating candidate/source batches after two untimed warmups; static object counts are exact.",
+    "acceptance": {
+      "selected_source_machine_object_parity": true,
+      "selected_source_emission_work_parity": true,
+      "all_semantics_exact": true,
+      "candidate_over_selected_source_emission_time": "report-only"
+    }
+  },
+  "future_disjoint_performance_gate": {
+    "status": "DESIGN_FROZEN_INPUTS; EXECUTION REQUIRES A SEPARATE SEALED RUNNER AND RECEIPT",
+    "population": "fresh_synthetic_population",
+    "reference": "AsimdV17",
+    "candidate": "AsimdV26",
+    "cell_estimator": "Median of 12 paired candidate/reference ratios with all six execution orders occurring twice.",
+    "aggregate_estimator": "Equal-cell-weight exp(fsum(log(cell_ratio)) / cell_count).",
+    "strict_acceptance": {
+      "overall_candidate_over_v17_geomean_lte": 0.8,
+      "short_width_6_through_8_geomean_lte": 1.02,
+      "wide_width_9_through_32_geomean_lte": 0.8,
+      "every_output_and_window_shape_geomean_lte": 1.02,
+      "cells_strictly_over_1_05_fraction_lte": 0.01,
+      "maximum_candidate_over_v17_ratio_lte": 1.1,
+      "all_semantics_and_artifact_bindings_exact": true
+    },
+    "runs": 1,
+    "missing_duplicate_nonfinite_unpaired_or_mutated_input": "hard failure",
+    "result_policy": {
+      "pass": "May proceed to a separately frozen external heldout gate; this preregistration alone grants no production authority.",
+      "fail": "Terminally refuse this exact V26 identity; do not retest, tune its gate, or deploy it."
+    }
+  },
+  "timing_at_freeze": {
+    "v26_candidate_builds": 0,
+    "v26_candidate_executions": 0,
+    "v26_performance_samples": 0,
+    "v26_rebar_samples": 0
+  }
+}
