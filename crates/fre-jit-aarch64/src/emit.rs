@@ -67,6 +67,44 @@ const SVE2_CLASS_TABLE_BYTES: usize = 16;
 /// anchored literals and start-anchored class runs do not need this cap.
 pub const MAX_REPEATED_CONFIRM_BYTES: usize = 32;
 
+/// Smallest exact-literal width admitted by the Search V26 cost rule.
+pub const SEARCH_V26_MIN_LITERAL_BYTES: usize = 6;
+/// Largest width assigned to Search V17 code generation by Search V26.
+pub const SEARCH_V26_V17_MAX_LITERAL_BYTES: usize = 8;
+/// Smallest width assigned to Search V25 code generation by Search V26.
+pub const SEARCH_V26_V25_MIN_LITERAL_BYTES: usize = 9;
+/// Largest exact-literal width admitted by the Search V26 cost rule.
+pub const SEARCH_V26_MAX_LITERAL_BYTES: usize = MAX_REPEATED_CONFIRM_BYTES;
+
+/// Authenticated source graph selected by the Search V26 compile-time rule.
+///
+/// This is intentionally a width-only decision. Literal values, ranked
+/// offsets, workload identity, and runtime observations cannot affect it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SearchV26Codegen {
+    /// Frozen Search V17 learned-continuation graph.
+    AsimdV17,
+    /// Frozen Search V25 sixth-empty-promotion graph.
+    AsimdV25,
+}
+
+/// Select the frozen source graph for one Search V26 literal width.
+///
+/// Returning `None` means the width is outside V26's conservative 6..=32
+/// exact-literal envelope.
+#[must_use]
+pub const fn search_v26_codegen_for_literal_width(width: usize) -> Option<SearchV26Codegen> {
+    match width {
+        SEARCH_V26_MIN_LITERAL_BYTES..=SEARCH_V26_V17_MAX_LITERAL_BYTES => {
+            Some(SearchV26Codegen::AsimdV17)
+        }
+        SEARCH_V26_V25_MIN_LITERAL_BYTES..=SEARCH_V26_MAX_LITERAL_BYTES => {
+            Some(SearchV26Codegen::AsimdV25)
+        }
+        _ => None,
+    }
+}
+
 /// Explicit implementation policy for one search image.
 ///
 /// The default is Advanced SIMD Search V8. Qualification remains a separate
@@ -128,6 +166,9 @@ pub enum SearchBackendPolicy {
     /// Search V25 candidate: V24 plus promotion of a sixth-empty group into
     /// the existing persistent learned-column graph.
     AsimdV25,
+    /// Search V26 candidate: a width-only compile-time cost rule selecting
+    /// the frozen V17 graph for widths 6..=8 and V25 for widths 9..=32.
+    AsimdV26,
     /// SVE screening with exactly sixteen active byte lanes.
     Sve16,
     /// SVE2 `MATCH` screening with exactly sixteen active byte lanes,
@@ -166,6 +207,7 @@ impl SearchBackendPolicy {
             Self::AsimdV23 => BackendVersion::SEARCH_V23,
             Self::AsimdV24 => BackendVersion::SEARCH_V24,
             Self::AsimdV25 => BackendVersion::SEARCH_V25,
+            Self::AsimdV26 => BackendVersion::SEARCH_V26,
             Self::Sve16 => BackendVersion::SEARCH_SVE16_V1,
             Self::Sve2Fixed16 => BackendVersion::SEARCH_SVE2_16_V1,
             Self::Sve16V6 => BackendVersion::SEARCH_SVE16_V6,
@@ -392,6 +434,7 @@ fn emit_search_image<O: Operation>(
             | BackendVersion::SEARCH_V23
             | BackendVersion::SEARCH_V24
             | BackendVersion::SEARCH_V25
+            | BackendVersion::SEARCH_V26
             | BackendVersion::SEARCH_SVE16_V1
             | BackendVersion::SEARCH_SVE2_16_V1
             | BackendVersion::SEARCH_SVE16_V6
@@ -452,7 +495,10 @@ fn emit_search_image<O: Operation>(
     }
     if matches!(
         backend_version,
-        BackendVersion::SEARCH_V23 | BackendVersion::SEARCH_V24 | BackendVersion::SEARCH_V25
+        BackendVersion::SEARCH_V23
+            | BackendVersion::SEARCH_V24
+            | BackendVersion::SEARCH_V25
+            | BackendVersion::SEARCH_V26
     ) && !plan.is_v23_policy_shape()
     {
         return Err(EmitError::Unsupported {
@@ -478,6 +524,7 @@ fn emit_search_image<O: Operation>(
             | BackendVersion::SEARCH_V23
             | BackendVersion::SEARCH_V24
             | BackendVersion::SEARCH_V25
+            | BackendVersion::SEARCH_V26
     ) && !plan.is_v9_policy_shape()
     {
         return Err(EmitError::Unsupported {
@@ -618,6 +665,7 @@ fn emit_search_image<O: Operation>(
                 | BackendVersion::SEARCH_V23
                 | BackendVersion::SEARCH_V24
                 | BackendVersion::SEARCH_V25
+                | BackendVersion::SEARCH_V26
                 | BackendVersion::SEARCH_SVE16_V1
                 | BackendVersion::SEARCH_SVE2_16_V1
                 | BackendVersion::SEARCH_SVE16_V6
@@ -1752,6 +1800,7 @@ impl<'a> Plan<'a> {
                         | BackendVersion::SEARCH_V23
                         | BackendVersion::SEARCH_V24
                         | BackendVersion::SEARCH_V25
+                        | BackendVersion::SEARCH_V26
                         | BackendVersion::SEARCH_SVE16_V6
                         | BackendVersion::SEARCH_SVE2_FIXED16_V2
                 ) =>
@@ -1816,6 +1865,7 @@ impl<'a> Plan<'a> {
                 | BackendVersion::SEARCH_V23
                 | BackendVersion::SEARCH_V24
                 | BackendVersion::SEARCH_V25
+                | BackendVersion::SEARCH_V26
                 | BackendVersion::SEARCH_SVE16_V1
                 | BackendVersion::SEARCH_SVE2_16_V1
                 | BackendVersion::SEARCH_SVE16_V6
@@ -1831,13 +1881,15 @@ impl<'a> Plan<'a> {
         // route to the ranked scans. V24 admits one additional complete scan
         // for its first remaining adaptive-ranked offset. Every older backend
         // retains its historical exact two-scan receipt.
-        let scan_count = if matches!(
-            backend_version,
-            BackendVersion::SEARCH_V24 | BackendVersion::SEARCH_V25
-        ) {
-            3
-        } else {
-            2
+        let scan_count = match (backend_version, literal.len()) {
+            (BackendVersion::SEARCH_V24 | BackendVersion::SEARCH_V25, _) => 3,
+            (BackendVersion::SEARCH_V26, width)
+                if search_v26_codegen_for_literal_width(width)
+                    == Some(SearchV26Codegen::AsimdV25) =>
+            {
+                3
+            }
+            _ => 2,
         };
         V7PolicyScanAdmission::charge(literal, scan_count, meter).map(Some)
     }
@@ -1882,6 +1934,7 @@ impl<'a> Plan<'a> {
                         | BackendVersion::SEARCH_V23
                         | BackendVersion::SEARCH_V24
                         | BackendVersion::SEARCH_V25
+                        | BackendVersion::SEARCH_V26
                         | BackendVersion::SEARCH_SVE16_V1
                         | BackendVersion::SEARCH_SVE2_16_V1
                         | BackendVersion::SEARCH_SVE16_V6
@@ -1906,6 +1959,7 @@ impl<'a> Plan<'a> {
                                 | BackendVersion::SEARCH_V23
                                 | BackendVersion::SEARCH_V24
                                 | BackendVersion::SEARCH_V25
+                                | BackendVersion::SEARCH_V26
                         ) {
                             admission.select_offsets_v3()
                         } else if matches!(
@@ -1996,6 +2050,7 @@ impl<'a> Plan<'a> {
                     | BackendVersion::SEARCH_V23
                     | BackendVersion::SEARCH_V24
                     | BackendVersion::SEARCH_V25
+                    | BackendVersion::SEARCH_V26
             ) && (shape != SearchShape::ExactLiteral
                 || candidate_policy.is_none_or(|offsets| {
                     !candidate_signature_is_cyclic_phase_unique(literal, offsets)
@@ -2054,6 +2109,7 @@ impl<'a> Plan<'a> {
                                 | BackendVersion::SEARCH_V23
                                 | BackendVersion::SEARCH_V24
                                 | BackendVersion::SEARCH_V25
+                                | BackendVersion::SEARCH_V26
                         ) && shape == SearchShape::ExactLiteral
                         {
                             SEARCH_CANDIDATE_POLICY_V11
@@ -2507,6 +2563,19 @@ fn emit_exact(
         }
         BackendVersion::SEARCH_V25 => {
             emit_vector_candidate_skip_v25(
+                assembler,
+                literal,
+                primary_offset,
+                secondary_offset,
+                verification_offset,
+                quaternary_offset,
+                quinary_offset,
+                none,
+                found,
+            )?;
+        }
+        BackendVersion::SEARCH_V26 => {
+            emit_vector_candidate_skip_v26(
                 assembler,
                 literal,
                 primary_offset,
@@ -4118,6 +4187,47 @@ fn emit_vector_candidate_skip_v25(
         none,
         found,
     )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "V26 delegates to one of two frozen source graphs under its width-only cost rule"
+)]
+fn emit_vector_candidate_skip_v26(
+    assembler: &mut Assembler,
+    literal: &[u8],
+    primary_offset: u16,
+    secondary_offset: Option<u16>,
+    verification_offset: Option<u16>,
+    quaternary_offset: Option<u16>,
+    quinary_offset: Option<u16>,
+    none: Label,
+    found: Label,
+) -> Result<(), EmitError> {
+    match search_v26_codegen_for_literal_width(literal.len()).ok_or(EmitError::InternalInvariant)? {
+        SearchV26Codegen::AsimdV17 => emit_vector_candidate_skip_v17(
+            assembler,
+            literal,
+            primary_offset,
+            secondary_offset,
+            verification_offset,
+            quaternary_offset,
+            quinary_offset,
+            none,
+            found,
+        ),
+        SearchV26Codegen::AsimdV25 => emit_vector_candidate_skip_v25(
+            assembler,
+            literal,
+            primary_offset,
+            secondary_offset,
+            verification_offset,
+            quaternary_offset,
+            quinary_offset,
+            none,
+            found,
+        ),
+    }
 }
 
 #[allow(

@@ -9,6 +9,27 @@ use crate::{
 
 type Label = usize;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum V26TemplateCodegen {
+    AsimdV17,
+    AsimdV25,
+}
+
+/// Auditor-local reconstruction of V26's width-only selector.
+///
+/// This deliberately shares no selector constants or function with the
+/// emitter. Boundary tests keep the two implementations in agreement while
+/// a drift in either implementation fails whole-image template comparison.
+pub(crate) const fn independent_v26_codegen_for_literal_width(
+    width: usize,
+) -> Option<V26TemplateCodegen> {
+    match width {
+        6..=8 => Some(V26TemplateCodegen::AsimdV17),
+        9..=32 => Some(V26TemplateCodegen::AsimdV25),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ExpectedInstruction {
     Exact(DecodedInstruction),
@@ -873,6 +894,9 @@ fn emit_exact(
         }
         BackendVersion::SEARCH_V25 => {
             emit_exact_candidates_v25(template, manifest, literal, none, found)
+        }
+        BackendVersion::SEARCH_V26 => {
+            emit_exact_candidates_v26(template, manifest, literal, none, found)
         }
         BackendVersion::SEARCH_SVE2_FIXED16_V2 => {
             emit_exact_candidates_sve2_fixed16_v2(template, manifest, literal, none, found)
@@ -1768,6 +1792,32 @@ fn emit_exact_candidates_v25(
     template.bind(first_candidate_miss)?;
     template.add_imm(5, 5, 1);
     emit_exact_candidates_v8(template, manifest, literal, none, found)
+}
+
+fn emit_exact_candidates_v26(
+    template: &mut Template,
+    manifest: SearchManifest,
+    literal: &[u8],
+    none: Label,
+    found: Label,
+) -> Result<(), AuditError> {
+    let codegen = independent_v26_codegen_for_literal_width(literal.len())
+        .ok_or(AuditError::InvalidSearchManifest)?;
+    let source_manifest = SearchManifest {
+        backend_version: match codegen {
+            V26TemplateCodegen::AsimdV17 => BackendVersion::SEARCH_V17,
+            V26TemplateCodegen::AsimdV25 => BackendVersion::SEARCH_V25,
+        },
+        ..manifest
+    };
+    match codegen {
+        V26TemplateCodegen::AsimdV17 => {
+            emit_exact_candidates_v17(template, source_manifest, literal, none, found)
+        }
+        V26TemplateCodegen::AsimdV25 => {
+            emit_exact_candidates_v25(template, source_manifest, literal, none, found)
+        }
+    }
 }
 
 #[allow(

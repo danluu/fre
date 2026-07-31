@@ -19,7 +19,9 @@ use crate::{
     CpuFeatures, DataSymbol, DataSymbolKind, DecodeError, DecodedInstruction, EmitError,
     EmitLimits, LabelKind, MAX_REPEATED_CONFIRM_BYTES, NativeAggregateImage, NativeAggregateResult,
     NativeImage, NativeResult, RelocationKind, RelocationTarget, ResourceKind, ResultLayout,
-    SearchBackendPolicy, UnsupportedReason, audit, audit_aggregate, decode, decode_one, emit,
+    SEARCH_V26_MAX_LITERAL_BYTES, SEARCH_V26_MIN_LITERAL_BYTES, SEARCH_V26_V17_MAX_LITERAL_BYTES,
+    SEARCH_V26_V25_MIN_LITERAL_BYTES, SearchBackendPolicy, SearchV26Codegen, UnsupportedReason,
+    audit, audit_aggregate, decode, decode_one, emit,
     emit::emit_search_version_for_test,
     emit_audited_with_backend, emit_exact_aggregate,
     emit_exact_aggregate_sve2_fixed16_count_experimental,
@@ -28,6 +30,8 @@ use crate::{
     emit_exact_aggregate_sve2_fixed16_span_sum_experimental, emit_sve2_16, emit_sve2_fixed16_v2,
     emit_sve16, emit_sve16_v6, emit_with_backend,
     image::{SearchManifest, SearchShape},
+    search_template::{V26TemplateCodegen, independent_v26_codegen_for_literal_width},
+    search_v26_codegen_for_literal_width,
 };
 
 const HAYSTACK_BASE: u64 = 0x0010_0000;
@@ -4567,6 +4571,7 @@ fn explicit_search_backend_policy_selects_distinct_artifact_identities() {
         (SearchBackendPolicy::AsimdV23, BackendVersion::SEARCH_V23),
         (SearchBackendPolicy::AsimdV24, BackendVersion::SEARCH_V24),
         (SearchBackendPolicy::AsimdV25, BackendVersion::SEARCH_V25),
+        (SearchBackendPolicy::AsimdV26, BackendVersion::SEARCH_V26),
         (SearchBackendPolicy::Sve16, BackendVersion::SEARCH_SVE16_V1),
         (
             SearchBackendPolicy::Sve2Fixed16,
@@ -14027,6 +14032,241 @@ fn v25_third_policy_scan_and_complete_emission_work_are_precharged_exactly() {
 }
 
 #[test]
+fn v26_emitter_and_independent_auditor_width_rules_match_exact_frozen_boundaries() {
+    assert_eq!(SEARCH_V26_MIN_LITERAL_BYTES, 6);
+    assert_eq!(SEARCH_V26_V17_MAX_LITERAL_BYTES, 8);
+    assert_eq!(SEARCH_V26_V25_MIN_LITERAL_BYTES, 9);
+    assert_eq!(SEARCH_V26_MAX_LITERAL_BYTES, 32);
+    assert_eq!(
+        SearchBackendPolicy::AsimdV26.backend_version(),
+        BackendVersion::SEARCH_V26
+    );
+
+    for width in 0_usize..=40 {
+        let emitter = match search_v26_codegen_for_literal_width(width) {
+            None => 0_u8,
+            Some(SearchV26Codegen::AsimdV17) => 17,
+            Some(SearchV26Codegen::AsimdV25) => 25,
+        };
+        let auditor = match independent_v26_codegen_for_literal_width(width) {
+            None => 0_u8,
+            Some(V26TemplateCodegen::AsimdV17) => 17,
+            Some(V26TemplateCodegen::AsimdV25) => 25,
+        };
+        let frozen = match width {
+            6..=8 => 17,
+            9..=32 => 25,
+            _ => 0,
+        };
+        assert_eq!(emitter, frozen, "emitter width={width}");
+        assert_eq!(auditor, frozen, "auditor width={width}");
+    }
+}
+
+#[test]
+fn v26_routes_every_width_and_output_to_the_exact_frozen_source_object() {
+    let mut images = 0_u64;
+    for width in SEARCH_V26_MIN_LITERAL_BYTES..=SEARCH_V26_MAX_LITERAL_BYTES {
+        let source_backend = if width <= SEARCH_V26_V17_MAX_LITERAL_BYTES {
+            SearchBackendPolicy::AsimdV17
+        } else {
+            SearchBackendPolicy::AsimdV25
+        };
+        for zero_primary in [true, false] {
+            let literal = v23_pointer_test_literal(width, zero_primary);
+            for output in [
+                OutputKind::Exists,
+                OutputKind::SelectedEnd,
+                OutputKind::Span,
+            ] {
+                let candidate = exact_output_image_with_backend(
+                    &literal,
+                    output,
+                    SearchBackendPolicy::AsimdV26,
+                );
+                let source = exact_output_image_with_backend(&literal, output, source_backend);
+
+                assert_eq!(candidate.backend_version(), BackendVersion::SEARCH_V26);
+                assert_eq!(candidate.target(), source.target());
+                assert_eq!(candidate.output(), source.output());
+                assert_eq!(candidate.source_identity(), source.source_identity());
+                assert_eq!(candidate.layout(), source.layout());
+                assert_eq!(candidate.code(), source.code());
+                assert_eq!(candidate.rodata(), source.rodata());
+                assert_eq!(candidate.labels(), source.labels());
+                assert_eq!(candidate.symbols(), source.symbols());
+                assert_eq!(candidate.relocations(), source.relocations());
+                assert_eq!(candidate.stats(), source.stats());
+
+                let mut candidate_manifest =
+                    candidate.search_manifest().expect("V26 sealed manifest");
+                candidate_manifest.backend_version = source.backend_version();
+                assert_eq!(
+                    candidate_manifest,
+                    source.search_manifest().expect("source sealed manifest")
+                );
+                let report = audit(&candidate).expect("independent V26 width-selected template");
+                assert_eq!(
+                    (report.decode_passes, report.source_identity_rebuilds),
+                    (1, 1)
+                );
+
+                let candidate_aot = candidate
+                    .to_aot(AotLimits::default())
+                    .expect("bounded V26 AOT");
+                let source_aot = source
+                    .to_aot(AotLimits::default())
+                    .expect("bounded source AOT");
+                assert_eq!(&candidate_aot.as_bytes()[..8], b"FREA64\0\x27");
+                assert_eq!(&candidate_aot.as_bytes()[8..10], &39_u16.to_le_bytes());
+                assert_eq!(candidate_aot.as_bytes().len(), source_aot.as_bytes().len());
+                assert_ne!(candidate_aot.as_bytes(), source_aot.as_bytes());
+                assert_eq!(candidate_aot.identity(), candidate.artifact_identity());
+                assert_ne!(
+                    candidate.artifact_identity(),
+                    source.artifact_identity(),
+                    "tag39 identity must remain distinct width={width} output={output:?}"
+                );
+                images = images.checked_add(1).expect("bounded V26 image count");
+            }
+        }
+    }
+    assert_eq!(images, 27 * 2 * 3);
+}
+
+#[test]
+fn v26_width_envelope_and_selected_scan_work_are_bounded_exactly() {
+    for width in 1_usize..SEARCH_V26_MIN_LITERAL_BYTES {
+        let literal = vec![b'x'; width];
+        let program = build_exact_literal::<Span>(
+            &literal,
+            AnchorFlags::default(),
+            ValidateLimits::default(),
+        )
+        .expect("valid short exact IR");
+        assert_eq!(
+            emit_with_backend(
+                &program,
+                SearchBackendPolicy::AsimdV26,
+                EmitLimits::default()
+            ),
+            Err(EmitError::Unsupported {
+                reason: UnsupportedReason::KernelShape,
+            }),
+            "width={width}"
+        );
+    }
+    let too_wide = vec![b'x'; SEARCH_V26_MAX_LITERAL_BYTES + 1];
+    let too_wide_program =
+        build_exact_literal::<Span>(&too_wide, AnchorFlags::default(), ValidateLimits::default())
+            .expect("valid width-33 IR");
+    assert_eq!(
+        emit_with_backend(
+            &too_wide_program,
+            SearchBackendPolicy::AsimdV26,
+            EmitLimits::default()
+        ),
+        Err(EmitError::ConfirmationLengthLimit {
+            kind: ConfirmationKind::ExactLiteral,
+            limit: MAX_REPEATED_CONFIRM_BYTES,
+            required: MAX_REPEATED_CONFIRM_BYTES + 1,
+        })
+    );
+
+    for (width, scans) in [(8_usize, 2_u64), (9, 3)] {
+        let literal = v23_pointer_test_literal(width, false);
+        let program = build_exact_literal::<Span>(
+            &literal,
+            AnchorFlags::default(),
+            ValidateLimits::default(),
+        )
+        .expect("V26 work IR");
+        let policy_work = u64::try_from(width)
+            .expect("bounded width")
+            .checked_mul(scans)
+            .expect("bounded scans");
+        let one_less = policy_work.checked_sub(1).expect("nonzero policy work");
+        assert_eq!(
+            emit_with_backend(
+                &program,
+                SearchBackendPolicy::AsimdV26,
+                EmitLimits {
+                    max_data_bytes: 0,
+                    max_emission_work: one_less,
+                    ..EmitLimits::default()
+                }
+            ),
+            Err(EmitError::ResourceLimit {
+                resource: ResourceKind::EmissionWork,
+                limit: one_less,
+                required: policy_work,
+            }),
+            "width={width}"
+        );
+    }
+}
+
+#[test]
+fn v26_rejects_bare_relabels_and_a_wrong_width_selected_graph() {
+    for width in [8_usize, 9] {
+        let literal = v23_pointer_test_literal(width, false);
+        let source_backend = if width == 8 {
+            SearchBackendPolicy::AsimdV17
+        } else {
+            SearchBackendPolicy::AsimdV25
+        };
+        let wrong_backend = if width == 8 {
+            SearchBackendPolicy::AsimdV25
+        } else {
+            SearchBackendPolicy::AsimdV17
+        };
+        let candidate = exact_output_image_with_backend(
+            &literal,
+            OutputKind::Span,
+            SearchBackendPolicy::AsimdV26,
+        );
+        let source = exact_output_image_with_backend(&literal, OutputKind::Span, source_backend);
+        let wrong = exact_output_image_with_backend(&literal, OutputKind::Span, wrong_backend);
+
+        let mut source_backend_only = source.clone();
+        source_backend_only.backend_version = BackendVersion::SEARCH_V26;
+        assert_resealed_search_rejected(
+            source_backend_only,
+            &format!("source backend-only relabel width={width}"),
+        );
+
+        let mut source_manifest_only = source;
+        source_manifest_only
+            .search
+            .as_mut()
+            .expect("source manifest")
+            .backend_version = BackendVersion::SEARCH_V26;
+        assert_resealed_search_rejected(
+            source_manifest_only,
+            &format!("source manifest-only relabel width={width}"),
+        );
+
+        let mut candidate_backend_only = candidate.clone();
+        candidate_backend_only.backend_version = source_backend.backend_version();
+        assert_resealed_search_rejected(
+            candidate_backend_only,
+            &format!("V26 backend-only relabel width={width}"),
+        );
+
+        let mut wrong_graph = candidate;
+        wrong_graph.layout = wrong.layout;
+        wrong_graph.code = wrong.code;
+        wrong_graph.labels = wrong.labels;
+        wrong_graph.relocations = wrong.relocations;
+        wrong_graph.stats = wrong.stats;
+        assert_resealed_search_rejected(
+            wrong_graph,
+            &format!("V26 wrong selected graph width={width}"),
+        );
+    }
+}
+
+#[test]
 fn v25_frozen_v24_all_width_primary_output_aot_matrix_bytes_are_exact() {
     let mut digest = Sha256::new();
     digest.update(b"FRE-V25-FROZEN-V24-ALL-WIDTH-PRIMARY-OUTPUT-AOT-V1\0");
@@ -14545,7 +14785,7 @@ fn v13_adaptive_recovery_decoded_edges_cover_zero_one_and_max_remaining_columns(
 }
 
 #[test]
-fn v9_through_v25_reject_shapes_without_one_nonempty_unanchored_exact_candidate() {
+fn v9_through_v26_reject_shapes_without_one_nonempty_unanchored_exact_candidate() {
     for backend in [
         SearchBackendPolicy::AsimdV9,
         SearchBackendPolicy::AsimdV10,
@@ -14564,6 +14804,7 @@ fn v9_through_v25_reject_shapes_without_one_nonempty_unanchored_exact_candidate(
         SearchBackendPolicy::AsimdV23,
         SearchBackendPolicy::AsimdV24,
         SearchBackendPolicy::AsimdV25,
+        SearchBackendPolicy::AsimdV26,
     ] {
         for anchors in [
             AnchorFlags {

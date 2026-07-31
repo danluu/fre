@@ -34,12 +34,16 @@ pub use abi::{
 pub use audit::{AuditError, AuditReport, audit, audit_aggregate, audit_selected_end_register_v2};
 pub use decode::{Condition, DecodeError, DecodedInstruction, decode, decode_one};
 pub use emit::{
-    EmitLimits, MAX_REPEATED_CONFIRM_BYTES, SearchBackendPolicy, emit, emit_audited_with_backend,
-    emit_exact_aggregate, emit_exact_aggregate_sve2_fixed16_count_experimental,
+    EmitLimits, MAX_REPEATED_CONFIRM_BYTES, SEARCH_V26_MAX_LITERAL_BYTES,
+    SEARCH_V26_MIN_LITERAL_BYTES, SEARCH_V26_V17_MAX_LITERAL_BYTES,
+    SEARCH_V26_V25_MIN_LITERAL_BYTES, SearchBackendPolicy, SearchV26Codegen, emit,
+    emit_audited_with_backend, emit_exact_aggregate,
+    emit_exact_aggregate_sve2_fixed16_count_experimental,
     emit_exact_aggregate_sve2_fixed16_pair_count_experimental,
     emit_exact_aggregate_sve2_fixed16_pair_span_sum_experimental,
     emit_exact_aggregate_sve2_fixed16_span_sum_experimental, emit_selected_end_register_v2,
     emit_sve2_16, emit_sve2_fixed16_v2, emit_sve16, emit_sve16_v6, emit_with_backend,
+    search_v26_codegen_for_literal_width,
 };
 pub use error::{
     ArithmeticSite, BranchKind, ConfirmationKind, EmitError, ResourceKind, UnsupportedReason,

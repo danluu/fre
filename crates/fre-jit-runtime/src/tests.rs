@@ -4693,6 +4693,67 @@ fn v25_all_search_output_contracts_publish_and_execute_after_promotion() {
 }
 
 #[test]
+fn v26_width_selected_graphs_publish_and_execute_at_both_cost_boundaries() {
+    let _lock = native_test_lock();
+    let mut comparisons = 0_u64;
+    for width in [6_usize, 8, 9, 32] {
+        let mut literal = vec![b'e'; width];
+        literal[0] = 0x1f;
+        literal[width - 1] = 0x1e;
+        let program = build_exact_literal::<Span>(
+            &literal,
+            AnchorFlags::default(),
+            ValidateLimits::default(),
+        )
+        .expect("V26 boundary program");
+        let candidate = emit_audited_with_backend(
+            &program,
+            SearchBackendPolicy::AsimdV26,
+            EmitLimits::default(),
+        )
+        .expect("audited V26 boundary image");
+        let source_backend = if width <= 8 {
+            SearchBackendPolicy::AsimdV17
+        } else {
+            SearchBackendPolicy::AsimdV25
+        };
+        let source = emit_with_backend(&program, source_backend, EmitLimits::default())
+            .expect("frozen source boundary image");
+        assert_eq!(
+            candidate.as_image().backend_version(),
+            BackendVersion::SEARCH_V26
+        );
+        assert_eq!(candidate.as_image().code(), source.code());
+        assert_eq!(candidate.as_image().labels(), source.labels());
+        assert_eq!(candidate.as_image().relocations(), source.relocations());
+        assert_eq!(candidate.as_image().stats(), source.stats());
+
+        let kernel = publish_audited::<Span>(&candidate, PublicationLimits::default())
+            .expect("publish authenticated V26");
+        let window_start = 3_usize;
+        let exact = window_start + 64 + 7;
+        let mut matching = vec![0xff; exact + width + 19];
+        install_literal(&mut matching, exact, &literal);
+        let absent = vec![0xff; matching.len()];
+        for bytes in [&absent, &matching] {
+            for right_boundary in [false, true] {
+                platform::with_guarded_haystack(bytes, right_boundary, |guarded| {
+                    assert_native_matches(
+                        &program,
+                        &kernel,
+                        guarded,
+                        SearchWindow::new(window_start, guarded.len()),
+                    );
+                })
+                .expect("guarded V26 boundary execution");
+                comparisons = comparisons.checked_add(1).expect("bounded comparisons");
+            }
+        }
+    }
+    assert_eq!(comparisons, 4 * 2 * 2);
+}
+
+#[test]
 #[allow(
     clippy::too_many_lines,
     reason = "the width/topology matrix keeps learned-mode, vector-tail, one-candidate, and clipped-window guard cases explicit"
