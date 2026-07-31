@@ -225,9 +225,7 @@ impl OperationSession {
             leaves,
             expected_layouts,
         );
-        if !construction.closes() {
-            return Err(OperationSessionError::ReceiptNotClosed);
-        }
+        validate_construction_receipt(&construction)?;
         Ok(Self {
             construction,
             search,
@@ -321,6 +319,16 @@ impl OperationSession {
             self.multi_capture.counters(),
             self.grep.counters(),
         ]
+    }
+}
+
+fn validate_construction_receipt(
+    construction: &OperationSessionConstructionReceipt,
+) -> Result<(), OperationSessionError> {
+    if construction.closes() {
+        Ok(())
+    } else {
+        Err(OperationSessionError::ReceiptNotClosed)
     }
 }
 
@@ -1059,8 +1067,11 @@ fn preflight_attempt<S: SessionLeafSlot>(
     request: &OperationSessionAttemptRequest,
     expected_identity: OperationSessionRouteIdentity,
 ) -> Option<AttemptPreflightFailure> {
+    debug_assert!(
+        construction.closes(),
+        "published operation sessions retain their closed construction receipt"
+    );
     if request.trusted_compiled_plan_id() == [0; 16]
-        || !construction.closes()
         || construction.leaves[S::LEAF.index()].layout_id != slot.layout_id()
         || request.identity != expected_identity
     {
@@ -1736,6 +1747,39 @@ mod tests {
         }
     }
 
+    fn run_one_count(
+        session: &mut OperationSession,
+        leaf: OperationSessionLeaf,
+        request: OperationSessionAttemptRequest,
+    ) -> Result<OperationSessionAttemptReceipt, OperationSessionAttemptError> {
+        match leaf {
+            OperationSessionLeaf::Search => {
+                let mut forced = session.forced_search();
+                let mut attempt = forced.begin_count(request)?;
+                attempt.emit_span(0, 1, None)?;
+                attempt.finish_count()
+            }
+            OperationSessionLeaf::Hot => {
+                let mut forced = session.forced_hot();
+                let mut attempt = forced.begin_count(request)?;
+                attempt.emit_span(0, 1, None)?;
+                attempt.finish_count()
+            }
+            OperationSessionLeaf::MultiCapture => {
+                let mut forced = session.forced_multi_capture();
+                let mut attempt = forced.begin_count(request)?;
+                attempt.emit_span(0, 1, Some(0))?;
+                attempt.finish_count()
+            }
+            OperationSessionLeaf::Grep => {
+                let mut forced = session.forced_grep();
+                let mut attempt = forced.begin_count(request)?;
+                attempt.emit_line_domain(0)?;
+                attempt.finish_count()
+            }
+        }
+    }
+
     fn snapshots(session: &OperationSession) -> [TestSlotSnapshot; 4] {
         [
             session.search.test_snapshot(),
@@ -2188,6 +2232,26 @@ mod tests {
             assert_eq!(p.initialized_bytes, a.initialized_bytes);
             assert_eq!(p.allocation_attempts, a.allocation_attempts);
         }
+    }
+
+    #[test]
+    fn construction_validation_rejects_tampered_receipts_before_publication() {
+        let receipt = session().construction_receipt().clone();
+        assert_eq!(validate_construction_receipt(&receipt), Ok(()));
+
+        let mut wrong_schema = receipt.clone();
+        wrong_schema.schema_version ^= 1;
+        assert_eq!(
+            validate_construction_receipt(&wrong_schema),
+            Err(OperationSessionError::ReceiptNotClosed)
+        );
+
+        let mut wrong_layout = receipt;
+        wrong_layout.leaves[OperationSessionLeaf::Hot.index()].layout_id[0] ^= 1;
+        assert_eq!(
+            validate_construction_receipt(&wrong_layout),
+            Err(OperationSessionError::ReceiptNotClosed)
+        );
     }
 
     #[test]
@@ -2767,6 +2831,67 @@ mod tests {
             assert_eq!(receipt.reset.all_leaves_after, before);
             assert_eq!(session.all_counters(), before);
             assert_eq!(snapshots(&session), before_storage);
+        }
+    }
+
+    #[test]
+    fn repeated_counts_preserve_outputs_accounting_and_limit_errors_for_every_leaf() {
+        let prospective = OperationSessionExecutionProspective {
+            line_domains: 1,
+            output_events: 1,
+            selected_span_bytes: 1,
+            ..OperationSessionExecutionProspective::default()
+        };
+        let mut session = session();
+
+        for _ in 0..3 {
+            for leaf in OperationSessionLeaf::ORDERED {
+                let before = session.all_counters();
+                let receipt = run_one_count(
+                    &mut session,
+                    leaf,
+                    request(leaf, OperationSessionReducer::Count, prospective),
+                )
+                .unwrap();
+                let expected_actual = match leaf {
+                    OperationSessionLeaf::Grep => OperationSessionExecutionActual {
+                        line_domains: 1,
+                        output_events: 1,
+                        ..OperationSessionExecutionActual::default()
+                    },
+                    OperationSessionLeaf::Search
+                    | OperationSessionLeaf::Hot
+                    | OperationSessionLeaf::MultiCapture => OperationSessionExecutionActual {
+                        output_events: 1,
+                        selected_span_bytes: 1,
+                        ..OperationSessionExecutionActual::default()
+                    },
+                };
+                assert_eq!(receipt.value, Some(OperationSessionValue::Count(1)));
+                assert_eq!(receipt.prospective, Some(prospective));
+                assert_eq!(receipt.actual, expected_actual);
+                assert_eq!(receipt.reset.all_leaves_before, before);
+                assert_eq!(receipt.reset.all_leaves_after, session.all_counters());
+                assert!(receipt.closes());
+
+                let after_success = session.all_counters();
+                let mut refused = request(leaf, OperationSessionReducer::Count, prospective);
+                refused.run_limits.max_output_events = 0;
+                let receipt =
+                    attempt_error_receipt(run_one_count(&mut session, leaf, refused).unwrap_err());
+                assert_eq!(
+                    receipt.terminal,
+                    OperationSessionTerminal::Refused(OperationSessionResource::OutputEvents)
+                );
+                assert_eq!(receipt.prospective, Some(prospective));
+                assert_eq!(receipt.actual, OperationSessionExecutionActual::default());
+                assert_eq!(receipt.value, None);
+                assert_eq!(receipt.reset.prospective, None);
+                assert_eq!(receipt.reset.all_leaves_before, after_success);
+                assert_eq!(receipt.reset.all_leaves_after, after_success);
+                assert_eq!(session.all_counters(), after_success);
+                assert!(receipt.closes());
+            }
         }
     }
 
