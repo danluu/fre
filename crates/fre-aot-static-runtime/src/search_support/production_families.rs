@@ -19,3 +19,4 @@ pub(super) const PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SPAN_FAMILIES_V1:
 const _: () = assert!(super::search_span_families_are_canonical(
     PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SPAN_FAMILIES_V1
 ));
+const _: () = assert!(PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SPAN_FAMILIES_V1.is_empty());

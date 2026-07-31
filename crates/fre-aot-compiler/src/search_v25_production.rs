@@ -6,6 +6,13 @@
 //! runtime family table, inspect a final image, or grant runtime authority.
 //! The static runtime still refuses tag38 unless the separate V25
 //! authorization atom and target family row are source-promoted.
+//!
+//! Tag38 accepts only exact byte literals of width 6..=32 whose authenticated
+//! five-column selector is cyclic-phase unique. That shape check remains in
+//! the shared V25 emitter: these helpers return a compile error and emit no
+//! glue when it refuses the source. Production adoption independently
+//! regenerates the same V25 payload from mapped literal bytes before a
+//! callable can exist.
 
 use core::fmt;
 
@@ -23,9 +30,8 @@ use crate::{
     SearchSpanFinalImageGlueErrorV1, SearchSpanFinalImageGlueLimitsV1,
     StaticSearchSpanExpectationBuildErrorV1, StaticSearchSpanExpectationV1,
     build_linux_static_search_span_expectation_v1, build_static_search_span_expectation_v1,
-    plan_and_compile_linux_aarch64_exact_search_v1,
-    plan_and_compile_macos_aarch64_exact_search_v1, publish_linux_search_span_final_image_glue_v1,
-    publish_search_span_final_image_glue_v1,
+    plan_and_compile_linux_aarch64_exact_search_v1, plan_and_compile_macos_aarch64_exact_search_v1,
+    publish_linux_search_span_final_image_glue_v1, publish_search_span_final_image_glue_v1,
 };
 
 /// Failure while materializing one inert per-source tag38 object pair.
@@ -135,7 +141,8 @@ impl LinuxAarch64SearchV25ProductionSourceV1 {
 ///
 /// The returned object pair remains inert even when linked. Its glue selector
 /// is looked up only in the separate production authority table, which this
-/// function cannot modify.
+/// function cannot modify. Sources outside tag38's width or cyclic-phase
+/// envelope fail during compilation before glue publication.
 pub fn build_macos_aarch64_search_v25_production_source_v1(
     source: Vec<u8>,
     profile: RustProfile,
@@ -152,9 +159,13 @@ pub fn build_macos_aarch64_search_v25_production_source_v1(
         .map_err(SearchV25ProductionSourceErrorV1::MacosCompile)?;
     let expectation = build_static_search_span_expectation_v1(&implementation)
         .map_err(SearchV25ProductionSourceErrorV1::MacosExpectation)?;
-    let glue =
-        publish_search_span_final_image_glue_v1(&implementation, &expectation, selector, glue_limits)
-            .map_err(SearchV25ProductionSourceErrorV1::MacosGlue)?;
+    let glue = publish_search_span_final_image_glue_v1(
+        &implementation,
+        &expectation,
+        selector,
+        glue_limits,
+    )
+    .map_err(SearchV25ProductionSourceErrorV1::MacosGlue)?;
     Ok(MacosAarch64SearchV25ProductionSourceV1 {
         implementation,
         expectation,
@@ -166,7 +177,8 @@ pub fn build_macos_aarch64_search_v25_production_source_v1(
 /// glue object from the exact source bytes.
 ///
 /// As on macOS, this performs no link, final-image inspection, family
-/// promotion, or runtime publication.
+/// promotion, or runtime publication. Sources outside tag38's width or
+/// cyclic-phase envelope fail during compilation before glue publication.
 pub fn build_linux_aarch64_search_v25_production_source_v1(
     source: Vec<u8>,
     profile: RustProfile,

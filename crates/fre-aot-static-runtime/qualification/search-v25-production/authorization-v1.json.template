@@ -6,6 +6,11 @@
     "commit": null,
     "tree": null
   },
+  "compiler_architecture": {
+    "regex_codegen": "self-contained-fre-aarch64-search-v25",
+    "regex_codegen_uses_llvm": false,
+    "architecture_review_sha256": null
+  },
   "qualification": {
     "development_pass_sha256": null,
     "campaign_contract_sha256": null,
