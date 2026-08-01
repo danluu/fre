@@ -1571,20 +1571,20 @@ fn build_native_dfa_table_for_architecture(
             ))?;
     let exact_start_filter = derive_start_filter(view)?;
     let mut selected_suffix_filter = derive_suffix_filter(view)?;
-    let coalesced_start_filter = if ENABLE_NATIVE_COALESCED_INITIAL_FILTER
-        && exact_start_filter.is_none()
-        && selected_suffix_filter.is_some_and(|suffix| suffix.retry_cost_rejected)
-    {
-        derive_coalesced_initial_start_filter(view)?
-    } else {
-        None
-    };
+    let coalesced_start_filter =
+        if ENABLE_NATIVE_COALESCED_INITIAL_FILTER && exact_start_filter.is_none() {
+            derive_coalesced_initial_start_filter(view)?
+        } else {
+            None
+        };
     let start_filter = exact_start_filter.or(coalesced_start_filter);
     // Both accelerators skip the same initial-state self-loop bytes. Once the
     // coalesced scanner is admitted, retaining a cost-rejected suffix prepass
     // would pay two moving scans before the ordinary DFA and recreate the
     // pathological overlap cost this fallback is intended to avoid.
-    if coalesced_start_filter.is_some() {
+    if coalesced_start_filter.is_some()
+        && selected_suffix_filter.is_some_and(|suffix| suffix.retry_cost_rejected)
+    {
         selected_suffix_filter = None;
     }
     let suffix_filter = selected_suffix_filter;
@@ -1756,6 +1756,20 @@ fn build_native_dfa_table_for_architecture(
             .then(|| build_native_seeded_reverse(view, suffix, seeded_limits))
             .flatten()
     });
+    if seeded_reverse_machine
+        .as_ref()
+        .is_some_and(|machine| !machine.proves_match && machine.dfa.initial_reaches_start())
+    {
+        // A root seed whose initial reverse row already reaches the search
+        // start cannot reject its aligned mandatory-factor candidate. The
+        // non-proving lowering would nevertheless retain the sidecar's
+        // global-minimum collection pass before replaying the forward DFA.
+        // Keep the independently selected suffix scanner, but decline this
+        // strictly redundant reverse proof. Accept-seeded proofs still return
+        // a complete Exists match, and root seeds whose initial row cannot
+        // reach the start can still reject false candidates.
+        seeded_reverse_machine = None;
+    }
     if seeded_reverse_machine.as_ref().is_some_and(|machine| {
         machine
             .dfa
@@ -9188,15 +9202,18 @@ mod tests {
     }
 
     #[test]
-    fn x86_initial_seeded_reverse_start_enters_table_without_decoding_stale_cell() {
+    fn initially_reaching_non_proving_seeded_reverse_is_declined() {
         let pattern = r"(?:(?:[2-4](?:6){1,2}[o-s])(?:tL|e))";
         let avx512 = FeatureSet::of(CpuFeature::X86Avx512F).with(CpuFeature::X86Avx512Bw);
+        let asimd = FeatureSet::of(CpuFeature::Aarch64Asimd);
         let targets = [
             Target::x86_64_linux(),
             Target::x86_64_linux()
                 .with_features(FeatureSet::of(CpuFeature::X86Avx2))
                 .unwrap(),
             Target::x86_64_linux().with_features(avx512).unwrap(),
+            Target::aarch64_linux(),
+            Target::aarch64_linux().with_features(asimd).unwrap(),
         ];
 
         for target in targets {
@@ -9206,31 +9223,138 @@ mod tests {
                     .output(OutputContract::Exists),
             )
             .unwrap();
-            let layout = build_native_dfa_table_for_architecture(
-                compiled.program().native_dfa_view().unwrap(),
-                Architecture::X86_64,
-            )
+            let view = compiled.program().native_dfa_view().unwrap();
+            let suffix = derive_suffix_filter(view)
+                .unwrap()
+                .expect("bounded interior factor");
+            assert!(matches!(
+                suffix.reverse_seed,
+                NativeSuffixReverseSeed::RootState(_)
+            ));
+            assert!(suffix.retry.is_none());
+            let machine = build_native_seeded_reverse(view, suffix, SeededReverseLimits::default())
+                .expect("independent reverse proof is structurally derivable");
+            assert!(machine.dfa.initial_reaches_start());
+            assert!(!machine.proves_match);
+
+            let layout = build_native_dfa_table_for_architecture(view, target.architecture)
+                .unwrap()
+                .1;
+            assert_eq!(layout.suffix_filter, Some(suffix));
+            assert!(
+                layout.seeded_reverse.is_none(),
+                "a reverse initial row that already reaches start cannot reject a factor candidate"
+            );
+        }
+
+        let terminal = compile(
+            CompileRequest::new("(?s:.+)z", Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .unwrap();
+        let terminal_layout = build_native_dfa_table(terminal.program().native_dfa_view().unwrap())
             .unwrap()
             .1;
-            let reverse = layout
+        assert!(terminal_layout.suffix_filter.is_some_and(|suffix| matches!(
+            suffix.reverse_seed,
+            NativeSuffixReverseSeed::AcceptBoundary
+        )));
+        assert!(
+            terminal_layout
                 .seeded_reverse
-                .expect("bounded interior factor must retain its reverse proof");
-            assert!(reverse.initial_reaches_start);
-            assert!(!reverse.proves_match);
+                .is_some_and(|reverse| reverse.proves_match)
+        );
 
-            let mut set_initial_row = vec![0x4d, 0x8d, 0x91];
-            set_initial_row.extend_from_slice(&reverse.initial_row_offset.to_le_bytes());
-            let code = compiled.module().sections()[TEXT_SECTION].bytes();
-            assert!(
-                code.windows(set_initial_row.len())
-                    .enumerate()
-                    .any(|(index, bytes)| {
-                        bytes == set_initial_row
-                            && code[index + set_initial_row.len()..]
-                                .starts_with(&[0x4d, 0x39, 0xef, 0x0f, 0x83])
-                    }),
-                "an initially accepting reverse row must compare and record the cursor before entering the table loop",
-            );
+        let rejecting_root = compile(
+            CompileRequest::new("(?s:.+)MAGIC(?s:.*)", Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .unwrap();
+        let rejecting_view = rejecting_root.program().native_dfa_view().unwrap();
+        let rejecting_suffix = derive_suffix_filter(rejecting_view)
+            .unwrap()
+            .expect("mandatory interior factor");
+        assert!(matches!(
+            rejecting_suffix.reverse_seed,
+            NativeSuffixReverseSeed::RootState(_)
+        ));
+        let rejecting_machine = build_native_seeded_reverse(
+            rejecting_view,
+            rejecting_suffix,
+            SeededReverseLimits::default(),
+        )
+        .expect("rejecting root reverse proof");
+        assert!(!rejecting_machine.dfa.initial_reaches_start());
+        assert!(!rejecting_machine.proves_match);
+        let rejecting_layout = build_native_dfa_table(rejecting_view).unwrap().1;
+        assert_eq!(rejecting_layout.suffix_filter, Some(rejecting_suffix));
+        assert!(
+            rejecting_layout
+                .seeded_reverse
+                .is_some_and(|reverse| !reverse.proves_match)
+        );
+    }
+
+    #[test]
+    fn generated_unbounded_concat_forms_keep_suffix_but_decline_degenerate_root_sidecar() {
+        // Independently generated/spelled witnesses of the same graph shape:
+        // an unbounded outer concat, a sparse mandatory interior factor, and
+        // a terminal wildcard. Selection below depends only on those graph
+        // facts and on the reverse machine, never on either source identity.
+        let patterns = [
+            r"(?:(?:(?:(?:(?:(?:QtJHg[I-K])){2,3}){1,3}?)+?9(?:(?:[J-M]){2,3}?){1,4}?)(?-u:[\x00-\xFF]))",
+            r"(?:(?:(?:(?:(?:(?:QtJHg[I-L])){2,3}){1,3}?)+?8(?:(?:[J-N]){2,3}?){1,4}?)(?-u:[\x00-\xFF]))",
+        ];
+        for pattern in patterns {
+            for target in [
+                Target::x86_64_linux(),
+                Target::aarch64_linux()
+                    .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                    .unwrap(),
+            ] {
+                let compiled = compile(
+                    CompileRequest::new(pattern, target)
+                        .mode(CompileMode::Optimizing)
+                        .output(OutputContract::Exists),
+                )
+                .unwrap();
+                let view = compiled.program().native_dfa_view().unwrap();
+                let suffix = derive_suffix_filter(view)
+                    .unwrap()
+                    .expect("mandatory interior factor");
+                assert!(matches!(
+                    suffix.reverse_seed,
+                    NativeSuffixReverseSeed::RootState(_)
+                ));
+                assert_eq!(suffix.restart, NativeSuffixRestart::OriginalStart);
+                assert!(suffix.retry.is_none());
+                let machine =
+                    build_native_seeded_reverse(view, suffix, SeededReverseLimits::default())
+                        .expect("root reverse proof");
+                assert!(
+                    machine.dfa.initial_reaches_start(),
+                    "reverse initial row did not reach start for {pattern:?} on {target:?}"
+                );
+                assert!(!machine.proves_match);
+
+                let layout = build_native_dfa_table_for_architecture(view, target.architecture)
+                    .unwrap()
+                    .1;
+                assert_eq!(layout.suffix_filter, Some(suffix));
+                assert!(layout.seeded_reverse.is_none());
+                assert!(
+                    layout
+                        .start_filter
+                        .is_some_and(|filter| { filter.from_anchored_prefix && filter.is_exact() })
+                );
+                assert!(
+                    layout
+                        .vector_filter
+                        .is_some_and(|columns| columns.columns().len() >= 2)
+                );
+            }
         }
     }
 
@@ -10910,12 +11034,12 @@ mod tests {
     }
 
     #[test]
-    fn coalesced_initial_fallback_requires_rejected_finite_retry_and_no_exact_filter() {
-        let layout_for = |pattern: &str| {
+    fn coalesced_initial_fallback_is_general_and_preserves_stronger_suffixes() {
+        let layout_for = |pattern: &str, output| {
             let compiled = compile(
                 CompileRequest::new(pattern, Target::x86_64_linux())
                     .mode(CompileMode::Optimizing)
-                    .output(OutputContract::Exists),
+                    .output(output),
             )
             .unwrap();
             let view = compiled.program().native_dfa_view().unwrap();
@@ -10927,7 +11051,7 @@ mod tests {
         };
 
         let fragmented = r"(?:A|C|E|G|I|K|M|O|Q).{0,8}[ ]";
-        let (exact, selected, coalesced, layout) = layout_for(fragmented);
+        let (exact, selected, coalesced, layout) = layout_for(fragmented, OutputContract::Exists);
         assert!(exact.is_none());
         assert!(
             selected.is_some_and(|suffix| { suffix.retry.is_none() && suffix.retry_cost_rejected })
@@ -10943,7 +11067,7 @@ mod tests {
         // exclusively on the DFA membership and finite retry cost facts.
         let generated =
             r"(?:(?:(?:(?:(?:(?:[o-p]SXF[C-G])|Ts|rY)){1,4}|3G2|ECb)){2,4}?(?-u:[\x00-\xFF]))";
-        let (exact, selected, coalesced, layout) = layout_for(generated);
+        let (exact, selected, coalesced, layout) = layout_for(generated, OutputContract::Exists);
         assert!(exact.is_some());
         assert!(selected.is_some_and(|suffix| suffix.retry_cost_rejected));
         assert!(
@@ -10953,7 +11077,8 @@ mod tests {
         assert_eq!(layout.start_filter, exact);
         assert!(layout.suffix_filter.is_some());
 
-        let (exact, selected, _, layout) = layout_for(r"[\x20-\x3F].{0,8}[ ]");
+        let (exact, selected, _, layout) =
+            layout_for(r"[\x20-\x3F].{0,8}[ ]", OutputContract::Exists);
         assert!(exact.is_some());
         assert!(selected.is_some_and(|suffix| suffix.retry_cost_rejected));
         assert_eq!(layout.start_filter, exact);
@@ -10962,24 +11087,57 @@ mod tests {
             "an exact start scanner must retain the independently selected suffix"
         );
 
-        let (exact, selected, coalesced, layout) =
-            layout_for(r"(?-u:(?:A|C|E|G|I|K|M|O|Q).{0,1}[ ])");
+        let (exact, selected, coalesced, layout) = layout_for(
+            r"(?-u:(?:A|C|E|G|I|K|M|O|Q).{0,1}[ ])",
+            OutputContract::Exists,
+        );
         assert!(exact.is_none());
         assert!(selected.is_some_and(|suffix| suffix.retry.is_some()));
         assert!(
             coalesced.is_some(),
             "the approximation itself is representable"
         );
-        assert!(layout.start_filter.is_none());
+        assert_eq!(layout.start_filter, coalesced);
         assert!(layout.suffix_filter.is_some());
 
         let far_apart = r"(?-u:[\x00-\x0B\x40-\x4B\x80-\x8B\xC0-\xCB\xF4-\xFF].{0,8}[ ])";
-        let (exact, selected, coalesced, layout) = layout_for(far_apart);
+        let (exact, selected, coalesced, layout) = layout_for(far_apart, OutputContract::Exists);
         assert!(exact.is_none());
         assert!(selected.is_some_and(|suffix| suffix.retry_cost_rejected));
         assert!(coalesced.is_none());
         assert!(layout.start_filter.is_none());
         assert!(layout.suffix_filter.is_some());
+
+        // This fragmented initial alphabet has no useful mandatory suffix.
+        // The cover is therefore admitted independently of suffix analysis,
+        // for every native output contract.
+        let no_suffix = r"(?:A|C|E|G|I|K|M|O|Q)+";
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let (exact, selected, coalesced, layout) = layout_for(no_suffix, output);
+            assert!(exact.is_none());
+            assert!(selected.is_none());
+            let coalesced = coalesced.expect("fragmented initial cover");
+            assert_eq!(layout.start_filter, Some(coalesced));
+            assert!(layout.suffix_filter.is_none());
+        }
+
+        // An acceptance-boundary suffix remains independently useful: the
+        // coalesced initial cover must not displace a suffix that was not a
+        // rejected finite-retry candidate.
+        let proving = r"(?:A|C|E|G|I|K|M|O|Q)+Z";
+        let (exact, selected, coalesced, layout) = layout_for(proving, OutputContract::Exists);
+        assert!(exact.is_none());
+        assert!(coalesced.is_some());
+        assert!(selected.is_some_and(|suffix| matches!(
+            suffix.reverse_seed,
+            NativeSuffixReverseSeed::AcceptBoundary
+        )));
+        assert_eq!(layout.start_filter, coalesced);
+        assert_eq!(layout.suffix_filter, selected);
     }
 
     #[test]
@@ -14712,8 +14870,8 @@ mod tests {
 
     #[cfg(all(target_arch = "x86_64", any(target_os = "linux", target_os = "macos")))]
     #[test]
-    #[ignore = "links and executes an initially accepting seeded-reverse row"]
-    fn linked_x86_initial_seeded_reverse_start_regression() {
+    #[ignore = "links and executes the fallback after declining a redundant reverse sidecar"]
+    fn linked_x86_declined_initial_seeded_reverse_regression() {
         use std::{fs, process::Command};
 
         const PATTERN: &str = r"(?:(?:[2-4](?:6){1,2}[o-s])(?:tL|e))";
@@ -14758,9 +14916,8 @@ mod tests {
             )
             .unwrap()
             .1;
-            let reverse = layout.seeded_reverse.expect("interior reverse proof");
-            assert!(reverse.initial_reaches_start);
-            assert!(!reverse.proves_match);
+            assert!(layout.suffix_filter.is_some());
+            assert!(layout.seeded_reverse.is_none());
             assert_eq!(
                 compiled
                     .search(&haystack, SearchWindow::full(&haystack))
