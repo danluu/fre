@@ -3803,4 +3803,273 @@ mod tests {
         assert_eq!(plan.build_accounting().temporary_copies, 0);
         assert_eq!(result.accounting.upper_bounds.scratch_bytes, 0);
     }
+
+    fn naive_find_window(
+        haystack: &[u8],
+        predicates: &[&[(u8, u8)]],
+        window: Window,
+    ) -> Option<(usize, usize)> {
+        if window.start() > window.end() || window.end() > haystack.len() {
+            return None;
+        }
+        let width = predicates.len();
+        let last = window.end().checked_sub(width)?;
+        for start in window.start()..=last {
+            let end = start.checked_add(width)?;
+            let candidate = haystack.get(start..end)?;
+            if candidate.iter().zip(predicates).all(|(&byte, ranges)| {
+                ranges
+                    .iter()
+                    .any(|&(range_start, range_end)| range_start <= byte && byte <= range_end)
+            }) {
+                return Some((start, end));
+            }
+        }
+        None
+    }
+
+    fn assert_search_case(
+        plan: &FixedPredicateWord64Plan,
+        predicates: &[&[(u8, u8)]],
+        haystack: &[u8],
+        window: Window,
+    ) {
+        let expected = naive_find_window(haystack, predicates, window);
+        let limits = SearchLimits::unlimited();
+
+        let (found, span_accounting) = plan.find_window(haystack, window, limits).unwrap();
+        assert_eq!(found, expected, "span haystack={haystack:?}, window={window:?}");
+        assert_eq!(
+            plan.find_window_value(haystack, window, limits).unwrap(),
+            expected,
+            "compact span haystack={haystack:?}, window={window:?}"
+        );
+        assert_eq!(span_accounting.identity.operation, SearchOperation::Span);
+
+        let (exists, exists_accounting) =
+            plan.is_match_window(haystack, window, limits).unwrap();
+        assert_eq!(exists, expected.is_some());
+        assert_eq!(
+            plan.is_match_window_value(haystack, window, limits)
+                .unwrap(),
+            expected.is_some()
+        );
+        assert_eq!(
+            exists_accounting.identity.operation,
+            SearchOperation::Exists
+        );
+
+        let (earliest_end, earliest_accounting) =
+            plan.earliest_end_window(haystack, window, limits).unwrap();
+        assert_eq!(earliest_end, expected.map(|(_, end)| end));
+        assert_eq!(
+            earliest_accounting.identity.operation,
+            SearchOperation::EarliestEnd
+        );
+
+        let (selected_end, selected_accounting) = plan
+            .selected_end_window(haystack, window, limits)
+            .unwrap();
+        assert_eq!(selected_end, expected.map(|(_, end)| end));
+        assert_eq!(
+            selected_accounting.identity.operation,
+            SearchOperation::SelectedEnd
+        );
+
+        for accounting in [
+            span_accounting,
+            exists_accounting,
+            earliest_accounting,
+            selected_accounting,
+        ] {
+            assert_eq!(accounting.identity.plan_id, SEARCH_PLAN_ID);
+            assert_eq!(accounting.identity.width, predicates.len());
+            assert_eq!(accounting.upper_bounds.scratch_bytes, 0);
+            assert_eq!(accounting.actual.scratch_bytes, 0);
+            ensure_search_actual_within(accounting.actual, accounting.upper_bounds).unwrap();
+        }
+    }
+
+    #[test]
+    fn first_match_search_matches_exhaustive_oracle_for_every_window_and_reducer() {
+        const SINGLE: &[(u8, u8)] = &[(b'a', b'a')];
+        const TWO: &[(u8, u8)] = &[(0, 0), (0x80, 0x80)];
+        const BROAD: &[(u8, u8)] = &[(0, 0), (b'a', b'a'), (0x80, 0x80), (0xFF, 0xFF)];
+        let alphabet = [0, b'a', 0x80, 0xFF];
+
+        for width in 1..=4 {
+            let mut one = vec![BROAD; width];
+            one[width / 2] = SINGLE;
+            let mut two = vec![BROAD; width];
+            two[width / 2] = TWO;
+            let shift = vec![BROAD; width];
+            for (predicates, expected_reducer) in [
+                (one.as_slice(), Reducer::OneByteAnchor),
+                (two.as_slice(), Reducer::TwoByteAnchor),
+                (shift.as_slice(), Reducer::ShiftAnd),
+            ] {
+                let plan = FixedPredicateWord64Plan::build(
+                    predicates,
+                    BuildLimits::unlimited(),
+                )
+                .unwrap();
+                assert_eq!(
+                    plan.search_operation_identity(SearchOperation::Span)
+                        .reducer,
+                    expected_reducer
+                );
+                for length in 0_usize..=7 {
+                    let cases = alphabet.len().pow(u32::try_from(length).unwrap());
+                    for mut ordinal in 0..cases {
+                        let mut haystack = vec![0_u8; length];
+                        for byte in &mut haystack {
+                            *byte = alphabet[ordinal % alphabet.len()];
+                            ordinal /= alphabet.len();
+                        }
+                        for start in 0..=length {
+                            for end in start..=length {
+                                assert_search_case(
+                                    &plan,
+                                    predicates,
+                                    &haystack,
+                                    Window::new(start, end),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn first_match_search_work_limits_and_errors_are_projection_invariant() {
+        const SINGLE: &[(u8, u8)] = &[(b'Q', b'Q')];
+        const TWO: &[(u8, u8)] = &[(b'Q', b'Q'), (0x80, 0x80)];
+        const BROAD: &[(u8, u8)] = &[(0, 2), (b'a', b'z'), (0x80, 0xFF)];
+        let cases: [(&[&[(u8, u8)]], &[u8]); 3] = [
+            (&[BROAD, SINGLE, BROAD], b"near-Q-nope-Qhit"),
+            (&[BROAD, TWO, BROAD], b"near\x80nopeQhit"),
+            (&[BROAD, BROAD, BROAD], b"---abc---"),
+        ];
+        for (predicates, haystack) in cases {
+            let plan =
+                FixedPredicateWord64Plan::build(predicates, BuildLimits::unlimited()).unwrap();
+            let window = Window::full(haystack);
+            let (_, accepted) = plan
+                .find_window(haystack, window, SearchLimits::unlimited())
+                .unwrap();
+            for max_work in 0..=accepted.upper_bounds.work.saturating_add(1) {
+                let limits = SearchLimits {
+                    max_work,
+                    max_scratch_bytes: 0,
+                };
+                let expected_success = max_work >= accepted.upper_bounds.work;
+                let reporting_span = plan.find_window(haystack, window, limits);
+                let compact_span = plan.find_window_value(haystack, window, limits);
+                let reporting_exists = plan.is_match_window(haystack, window, limits);
+                let compact_exists = plan.is_match_window_value(haystack, window, limits);
+                let earliest = plan.earliest_end_window(haystack, window, limits);
+                let selected = plan.selected_end_window(haystack, window, limits);
+                assert_eq!(reporting_span.is_ok(), expected_success);
+                assert_eq!(compact_span.is_ok(), expected_success);
+                assert_eq!(reporting_exists.is_ok(), expected_success);
+                assert_eq!(compact_exists.is_ok(), expected_success);
+                assert_eq!(earliest.is_ok(), expected_success);
+                assert_eq!(selected.is_ok(), expected_success);
+                if !expected_success {
+                    let expected = SearchError::WorkLimit {
+                        needed: accepted.upper_bounds.work,
+                        limit: max_work,
+                    };
+                    assert_eq!(reporting_span.unwrap_err(), expected);
+                    assert_eq!(compact_span.unwrap_err(), expected);
+                    assert_eq!(reporting_exists.unwrap_err(), expected);
+                    assert_eq!(compact_exists.unwrap_err(), expected);
+                    assert_eq!(earliest.unwrap_err(), expected);
+                    assert_eq!(selected.unwrap_err(), expected);
+                }
+            }
+        }
+
+        let plan = FixedPredicateWord64Plan::build(&[BROAD], BuildLimits::unlimited()).unwrap();
+        for window in [Window::new(2, 1), Window::new(0, 4)] {
+            let reporting = plan.find_window(b"abc", window, SearchLimits::unlimited());
+            let compact = plan.find_window_value(b"abc", window, SearchLimits::unlimited());
+            let reporting_error = reporting.unwrap_err();
+            let compact_error = compact.unwrap_err();
+            assert_eq!(reporting_error, compact_error);
+            assert!(matches!(compact_error, SearchError::InvalidWindow { .. }));
+        }
+    }
+
+    #[test]
+    fn first_match_search_closes_width_anchor_and_byte_domain_boundaries() {
+        const SINGLE: &[(u8, u8)] = &[(0xFF, 0xFF)];
+        const TWO: &[(u8, u8)] = &[(0, 0), (0xFF, 0xFF)];
+        const MULTI: &[(u8, u8)] = &[(0, 3), (0x40, 0x42), (0x80, 0x82), (0xFE, 0xFF)];
+
+        for width in [63, 64] {
+            let predicates = vec![MULTI; width];
+            let plan = FixedPredicateWord64Plan::build(
+                &predicates,
+                BuildLimits::unlimited(),
+            )
+            .unwrap();
+            let mut haystack = vec![0x80; width + 4];
+            haystack[2..2 + width].fill(0xFF);
+            assert_search_case(
+                &plan,
+                &predicates,
+                &haystack,
+                Window::new(1, haystack.len() - 1),
+            );
+        }
+
+        for anchor_offset in [0, 3, 7] {
+            let mut predicates = vec![MULTI; 8];
+            predicates[anchor_offset] = SINGLE;
+            let plan = FixedPredicateWord64Plan::build(
+                &predicates,
+                BuildLimits::unlimited(),
+            )
+            .unwrap();
+            let identity = plan.search_operation_identity(SearchOperation::Span);
+            assert_eq!(identity.reducer, Reducer::OneByteAnchor);
+            assert_eq!(usize::from(identity.anchor_offset), anchor_offset);
+            let mut haystack = vec![0x80; 24];
+            haystack[5 + anchor_offset] = 0xFF;
+            assert_search_case(
+                &plan,
+                &predicates,
+                &haystack,
+                Window::full(&haystack),
+            );
+        }
+
+        let two_predicates = [MULTI, MULTI, TWO, MULTI];
+        let two = FixedPredicateWord64Plan::build(
+            &two_predicates,
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        assert_eq!(
+            two.search_operation_identity(SearchOperation::Span)
+                .reducer,
+            Reducer::TwoByteAnchor
+        );
+        for haystack in [
+            &[0, 0, 0, 0][..],
+            &[0x80, 0x80, 0xFF, 0x80][..],
+            &[0x80, 0x80, 1, 0x80, 0x80, 0x80, 0, 0x80][..],
+            &[0x80, 0x80, 0x80][..],
+        ] {
+            assert_search_case(
+                &two,
+                &two_predicates,
+                haystack,
+                Window::full(haystack),
+            );
+        }
+    }
 }

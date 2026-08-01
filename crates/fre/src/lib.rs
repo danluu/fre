@@ -6691,7 +6691,7 @@ mod tests {
     }
 
     #[test]
-    fn finite_enumeration_cap_falls_back_before_cross_product_growth() {
+    fn finite_enumeration_cap_routes_fixed_product_before_k0_growth() {
         let limits = BuildLimits {
             literal_set: fre_kernels::LiteralSetBuildLimits {
                 max_patterns: 4,
@@ -6704,12 +6704,16 @@ mod tests {
             .limits(limits)
             .build()
             .unwrap();
-        assert_eq!(fre.build_report().plan, PlanKind::K0);
-        let (matched, _) = fre.find(b"xxbcf", SearchLimits::unlimited()).unwrap();
+        assert_eq!(fre.build_report().plan, PlanKind::FixedPredicateWord64);
+        let (matched, accounting) = fre.find(b"xxbcf", SearchLimits::unlimited()).unwrap();
         assert_eq!(
             matched.map(|matched| (matched.start(), matched.end())),
             Some((2, 5))
         );
+        assert!(matches!(
+            accounting,
+            SearchAccounting::FixedPredicateWord64(_)
+        ));
     }
 
     #[test]
