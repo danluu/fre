@@ -1161,7 +1161,7 @@ fn search_one(
         max_scratch_bytes: limits.pattern.max_scratch_bytes,
     };
     let (matched, accounting) = regex
-        .find_window(haystack, window, pattern_limits)
+        .is_match_window(haystack, window, pattern_limits)
         .map_err(|source| PortableRegexSetExecutionError::Pattern {
             index,
             total_work_before,
@@ -1179,7 +1179,7 @@ fn search_one(
             computation: "matcher exceeded delegated work limit",
         });
     }
-    Ok((matched.is_some(), total_work))
+    Ok((matched, total_work))
 }
 
 fn validate_start(start: usize, haystack_len: usize) -> Result<(), PortableRegexSetExecutionError> {
