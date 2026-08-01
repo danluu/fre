@@ -16,14 +16,15 @@ use super::{
     TEXT_SECTION, Target, X86Assembler, X86CandidateMask, X86StartFilterKind, aarch64_add_x_imm,
     aarch64_add_x_reg, aarch64_and_low_x, aarch64_cmp_w_imm, aarch64_cmp_w_zero, aarch64_cmp_x,
     aarch64_cmp_x_imm, aarch64_csel_x, aarch64_emit_candidate_any,
-    aarch64_emit_first_candidate_in_batch, aarch64_emit_first_candidate_lane,
-    aarch64_emit_first_lane_constants, aarch64_emit_prefix_predicate,
-    aarch64_emit_prefix_relation_vector_test, aarch64_emit_scalar_filter_membership,
-    aarch64_emit_start_filter_address, aarch64_emit_start_filter_batch_candidates,
-    aarch64_emit_start_filter_constants, aarch64_emit_start_filter_scalar_bound,
-    aarch64_emit_start_filter_vector_candidates, aarch64_emit_start_filter_vector_test,
-    aarch64_emit_vector_filter_secondary_batch, aarch64_emit_vector_filter_secondary_candidates_at,
-    aarch64_load_byte_reg, aarch64_load_halfword_reg, aarch64_load_q, aarch64_load_u32_constant,
+    aarch64_emit_candidate_batch_any, aarch64_emit_first_candidate_in_batch,
+    aarch64_emit_first_candidate_lane, aarch64_emit_first_lane_constants,
+    aarch64_emit_prefix_predicate, aarch64_emit_prefix_relation_vector_test,
+    aarch64_emit_scalar_filter_membership, aarch64_emit_start_filter_address,
+    aarch64_emit_start_filter_batch_candidates, aarch64_emit_start_filter_constants,
+    aarch64_emit_start_filter_scalar_bound, aarch64_emit_start_filter_vector_candidates,
+    aarch64_emit_start_filter_vector_test, aarch64_emit_vector_filter_secondary_batch,
+    aarch64_emit_vector_filter_secondary_candidates_at, aarch64_load_byte_reg,
+    aarch64_load_halfword_reg, aarch64_load_q, aarch64_load_u32_constant,
     aarch64_load_u64_constant, aarch64_lsr_x_imm, aarch64_mov_x, aarch64_movi_16b, aarch64_movz_w,
     aarch64_orr_16b, aarch64_prefix_relation_constant_register, aarch64_set_table_address,
     aarch64_store_x, aarch64_sub_w_imm, aarch64_sub_x_imm, aarch64_sub_x_reg,
@@ -6177,17 +6178,7 @@ fn aarch64_context_emit_prefix_prepass(
         let first_candidates =
             aarch64_emit_start_filter_batch_candidates(assembler, primary, first_register)?;
         batch_first_candidates = Some(first_candidates);
-        assembler.instruction(aarch64_orr_16b(28, first_candidates, first_candidates)?)?;
-        for lane in 1_u8..4 {
-            let candidates =
-                first_candidates
-                    .checked_add(lane)
-                    .ok_or(ObjectError::ArithmeticOverflow(
-                        "AArch64 context batch candidates",
-                    ))?;
-            assembler.instruction(aarch64_orr_16b(28, 28, candidates)?)?;
-        }
-        aarch64_emit_candidate_any(assembler, 28)?;
+        aarch64_emit_candidate_batch_any(assembler, first_candidates)?;
         if let Some(primary_hit) = batch_primary_hit {
             // The secondary vector columns decide whether this block needs
             // scalar refinement, so defer adaptive accounting until then.
@@ -6258,11 +6249,7 @@ fn aarch64_context_emit_prefix_prepass(
             )?;
         }
         aarch64_emit_vector_filter_secondary_batch(assembler, filter)?;
-        assembler.instruction(aarch64_orr_16b(28, 24, 24)?)?;
-        for candidates in 25_u8..=27 {
-            assembler.instruction(aarch64_orr_16b(28, 28, candidates)?)?;
-        }
-        aarch64_emit_candidate_any(assembler, 28)?;
+        aarch64_emit_candidate_batch_any(assembler, 24)?;
         assembler.branch_cond(AARCH64_NE, batch_hit.unwrap_or(scalar))?;
         assembler.instruction(aarch64_add_x_imm(2, 2, 64)?)?;
         assembler.branch(vector)?;
@@ -6607,28 +6594,14 @@ fn aarch64_context_emit_terminal_suffix_scanner(
     assembler.branch_cond(AARCH64_LO, labels.single_vector)?;
     let primary_candidates =
         aarch64_emit_start_filter_batch_candidates(assembler, suffix.primary, 1)?;
-    assembler.instruction(aarch64_orr_16b(28, primary_candidates, primary_candidates)?)?;
-    for lane in 1_u8..4 {
-        let candidates =
-            primary_candidates
-                .checked_add(lane)
-                .ok_or(ObjectError::ArithmeticOverflow(
-                    "AArch64 context suffix candidates",
-                ))?;
-        assembler.instruction(aarch64_orr_16b(28, 28, candidates)?)?;
-    }
-    aarch64_emit_candidate_any(assembler, 28)?;
+    aarch64_emit_candidate_batch_any(assembler, primary_candidates)?;
     assembler.branch_cond(AARCH64_NE, labels.batch_primary_hit)?;
     assembler.instruction(aarch64_add_x_imm(2, 2, 64)?)?;
     assembler.branch(labels.vector)?;
 
     assembler.bind(labels.batch_primary_hit)?;
     aarch64_emit_vector_filter_secondary_batch(assembler, suffix.vector_filter)?;
-    assembler.instruction(aarch64_orr_16b(28, 24, 24)?)?;
-    for candidates in 25_u8..=27 {
-        assembler.instruction(aarch64_orr_16b(28, 28, candidates)?)?;
-    }
-    aarch64_emit_candidate_any(assembler, 28)?;
+    aarch64_emit_candidate_batch_any(assembler, 24)?;
     assembler.branch_cond(
         AARCH64_NE,
         if use_exact_asimd_lane {

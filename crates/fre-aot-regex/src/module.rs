@@ -7522,6 +7522,27 @@ fn aarch64_emit_candidate_any(
     Ok(())
 }
 
+fn aarch64_emit_candidate_batch_any(
+    assembler: &mut Aarch64Assembler,
+    first_candidates: u8,
+) -> Result<(), ObjectError> {
+    let second = first_candidates
+        .checked_add(1)
+        .ok_or(ObjectError::ArithmeticOverflow("AArch64 batch candidates"))?;
+    let third = first_candidates
+        .checked_add(2)
+        .ok_or(ObjectError::ArithmeticOverflow("AArch64 batch candidates"))?;
+    let fourth = first_candidates
+        .checked_add(3)
+        .ok_or(ObjectError::ArithmeticOverflow("AArch64 batch candidates"))?;
+    // Pairwise reduction preserves all four exact lane masks for a rare hit
+    // while shortening the overwhelmingly hot miss path by one ORR.
+    assembler.instruction(aarch64_orr_16b(28, first_candidates, second)?)?;
+    assembler.instruction(aarch64_orr_16b(7, third, fourth)?)?;
+    assembler.instruction(aarch64_orr_16b(28, 28, 7)?)?;
+    aarch64_emit_candidate_any(assembler, 28)
+}
+
 fn aarch64_emit_first_candidate_lane(
     assembler: &mut Aarch64Assembler,
     candidates: u8,
@@ -8251,14 +8272,7 @@ fn aarch64_emit_suffix_prepass(
             let first_candidates =
                 aarch64_emit_start_filter_batch_candidates(assembler, filter, first_register)?;
             batch_first_candidates = Some(first_candidates);
-            assembler.instruction(aarch64_orr_16b(28, first_candidates, first_candidates)?)?;
-            for lane in 1_u8..4 {
-                let candidates = first_candidates
-                    .checked_add(lane)
-                    .ok_or(ObjectError::ArithmeticOverflow("AArch64 suffix candidates"))?;
-                assembler.instruction(aarch64_orr_16b(28, 28, candidates)?)?;
-            }
-            aarch64_emit_candidate_any(assembler, 28)?;
+            aarch64_emit_candidate_batch_any(assembler, first_candidates)?;
             assembler.branch_cond(
                 AARCH64_NE,
                 if suffix.vector_filter.is_some() {
@@ -8311,11 +8325,7 @@ fn aarch64_emit_suffix_prepass(
             assembler.bind(batch_primary_hit)?;
             if use_asimd_batch {
                 aarch64_emit_vector_filter_secondary_batch(assembler, vector_filter)?;
-                assembler.instruction(aarch64_orr_16b(28, 24, 24)?)?;
-                for candidates in 25_u8..=27 {
-                    assembler.instruction(aarch64_orr_16b(28, 28, candidates)?)?;
-                }
-                aarch64_emit_candidate_any(assembler, 28)?;
+                aarch64_emit_candidate_batch_any(assembler, 24)?;
                 assembler.branch_cond(
                     AARCH64_NE,
                     if use_exact_asimd_lane {
@@ -8698,18 +8708,7 @@ fn lower_aarch64_dfa_for_operating_system(
                         )?
                     };
                     filter_batch_first_candidates = Some(first_candidates);
-                    assembler.instruction(aarch64_orr_16b(
-                        28,
-                        first_candidates,
-                        first_candidates,
-                    )?)?;
-                    for lane in 1_u8..4 {
-                        let candidates = first_candidates
-                            .checked_add(lane)
-                            .ok_or(ObjectError::ArithmeticOverflow("AArch64 batch candidates"))?;
-                        assembler.instruction(aarch64_orr_16b(28, 28, candidates)?)?;
-                    }
-                    aarch64_emit_candidate_any(&mut assembler, 28)?;
+                    aarch64_emit_candidate_batch_any(&mut assembler, first_candidates)?;
                     assembler.branch_cond(
                         AARCH64_NE,
                         if vector_filter.is_some() {
@@ -8775,11 +8774,7 @@ fn lower_aarch64_dfa_for_operating_system(
                     if use_asimd_batch {
                         assembler.bind(filter_batch_primary_hit)?;
                         aarch64_emit_vector_filter_secondary_batch(&mut assembler, vector_filter)?;
-                        assembler.instruction(aarch64_orr_16b(28, 24, 24)?)?;
-                        for candidates in 25_u8..=27 {
-                            assembler.instruction(aarch64_orr_16b(28, 28, candidates)?)?;
-                        }
-                        aarch64_emit_candidate_any(&mut assembler, 28)?;
+                        aarch64_emit_candidate_batch_any(&mut assembler, 24)?;
                         assembler.branch_cond(
                             AARCH64_NE,
                             if use_exact_asimd_lane {

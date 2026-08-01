@@ -160,17 +160,7 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
             let first_candidates =
                 aarch64_emit_start_filter_batch_candidates(assembler, filter, first_register)?;
             batch_first_candidates = Some(first_candidates);
-            assembler.instruction(aarch64_orr_16b(28, first_candidates, first_candidates)?)?;
-            for block in 1_u8..4 {
-                let candidates =
-                    first_candidates
-                        .checked_add(block)
-                        .ok_or(ObjectError::ArithmeticOverflow(
-                            "AArch64 seeded reverse candidates",
-                        ))?;
-                assembler.instruction(aarch64_orr_16b(28, 28, candidates)?)?;
-            }
-            aarch64_emit_candidate_any(assembler, 28)?;
+            aarch64_emit_candidate_batch_any(assembler, first_candidates)?;
             assembler.branch_cond(
                 AARCH64_NE,
                 if lazy_vector_filter.is_some() {
@@ -228,11 +218,7 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
             assembler.bind(batch_primary_hit)?;
             if use_asimd_batch {
                 aarch64_emit_vector_filter_secondary_batch(assembler, vector_filter)?;
-                assembler.instruction(aarch64_orr_16b(28, 24, 24)?)?;
-                for candidates in 25_u8..=27 {
-                    assembler.instruction(aarch64_orr_16b(28, 28, candidates)?)?;
-                }
-                aarch64_emit_candidate_any(assembler, 28)?;
+                aarch64_emit_candidate_batch_any(assembler, 24)?;
                 assembler.branch_cond(
                     AARCH64_NE,
                     if use_exact_asimd_lane {
