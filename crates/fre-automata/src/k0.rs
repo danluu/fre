@@ -5788,17 +5788,21 @@ fn next_range_start_candidate(
     // rejects one candidate can re-enter at the following byte without
     // repeatedly classifying an overlapping fixed-width block.
     let scalar_prefix_end = position.saturating_add(BYTE_SET_BLOCK_BYTES).min(end);
-    while position < scalar_prefix_end {
-        meter.charge(1, position)?;
-        if haystack[position].wrapping_sub(start) <= width {
-            return Ok(position);
-        }
-        position = position
-            .checked_add(1)
-            .ok_or(SearchError::ArithmeticOverflow {
-                computation: "scalar start-range prefix position",
-            })?;
+    let prefix_candidate = next_small_start_candidate(
+        haystack,
+        position,
+        scalar_prefix_end,
+        meter,
+        |source| {
+            source
+                .iter()
+                .position(|&byte| byte.wrapping_sub(start) <= width)
+        },
+    )?;
+    if prefix_candidate < scalar_prefix_end {
+        return Ok(prefix_candidate);
     }
+    position = scalar_prefix_end;
 
     // Charge a complete logical block before its first source read. A match
     // in any lane therefore has the same hard-limit threshold as the broad
@@ -5833,18 +5837,11 @@ fn next_range_start_candidate(
         position = block_end;
     }
 
-    while position < end {
-        meter.charge(1, position)?;
-        if haystack[position].wrapping_sub(start) <= width {
-            return Ok(position);
-        }
-        position = position
-            .checked_add(1)
-            .ok_or(SearchError::ArithmeticOverflow {
-                computation: "scalar start-range position",
-            })?;
-    }
-    Ok(end)
+    next_small_start_candidate(haystack, position, end, meter, |source| {
+        source
+            .iter()
+            .position(|&byte| byte.wrapping_sub(start) <= width)
+    })
 }
 
 fn next_set_start_candidate(
@@ -5860,17 +5857,17 @@ fn next_set_start_candidate(
     // reserved for the long no-candidate spans that can amortize it.
     let set = classifier.set();
     let scalar_prefix_end = position.saturating_add(BYTE_SET_BLOCK_BYTES).min(end);
-    while position < scalar_prefix_end {
-        meter.charge(1, position)?;
-        if set.contains(haystack[position]) {
-            return Ok(position);
-        }
-        position = position
-            .checked_add(1)
-            .ok_or(SearchError::ArithmeticOverflow {
-                computation: "scalar start-set prefix position",
-            })?;
+    let prefix_candidate = next_small_start_candidate(
+        haystack,
+        position,
+        scalar_prefix_end,
+        meter,
+        |source| source.iter().position(|&byte| set.contains(byte)),
+    )?;
+    if prefix_candidate < scalar_prefix_end {
+        return Ok(prefix_candidate);
     }
+    position = scalar_prefix_end;
 
     // Start-filter work counts each logically examined source byte once. This
     // preserves the scalar scanner's hard-limit threshold and monotonicity.
@@ -5905,18 +5902,9 @@ fn next_set_start_candidate(
         position = block_end;
     }
 
-    while position < end {
-        meter.charge(1, position)?;
-        if set.contains(haystack[position]) {
-            return Ok(position);
-        }
-        position = position
-            .checked_add(1)
-            .ok_or(SearchError::ArithmeticOverflow {
-                computation: "scalar start-set position",
-            })?;
-    }
-    Ok(end)
+    next_small_start_candidate(haystack, position, end, meter, |source| {
+        source.iter().position(|&byte| set.contains(byte))
+    })
 }
 
 fn next_ascii_start_candidate(
@@ -7621,8 +7609,8 @@ mod tests {
 
     use super::{
         classify_byte_delta_16, scratch_bytes, ContextTransitionSlot, WorkMeter,
-        ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, CONTEXT_INITIAL_SOURCE, INVOCATION_RESET_WORK,
-        ROOT_RUN_SCANNER_SHAPE_MAX_WORK,
+        ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, BYTE_SET_BLOCK_BYTES, CONTEXT_INITIAL_SOURCE,
+        INVOCATION_RESET_WORK, ROOT_RUN_SCANNER_SHAPE_MAX_WORK,
     };
     use crate::{
         plan::{
@@ -10807,6 +10795,74 @@ mod tests {
                         assert_eq!(meter.consumed, limit);
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn full_byte_scalar_extents_preserve_exact_and_one_below_work() {
+        let range = root_scanner(scanner_for_set(byte_range_set(0x40, 0x7f)));
+        assert!(matches!(&range.scanner, StartScanner::Range { .. }));
+        let set = root_scanner(scanner_for_set(byte_set(&[0x80, 0x82, 0x84, 0x86])));
+        assert!(matches!(&set.scanner, StartScanner::Set(_)));
+
+        let start = 3_usize;
+        let length = BYTE_SET_BLOCK_BYTES
+            .checked_mul(3)
+            .and_then(|extent| extent.checked_sub(1))
+            .unwrap();
+        let end = start.checked_add(length).unwrap();
+        let first_tail = BYTE_SET_BLOCK_BYTES.checked_mul(2).unwrap();
+        let initial_work = 7_u64;
+
+        for (name, scanner, member) in [("range", range, 0x55), ("set", set, 0x84)] {
+            for candidate_offset in
+                (0..BYTE_SET_BLOCK_BYTES).chain(first_tail..length)
+            {
+                let mut haystack = vec![0x20; end.checked_add(2).unwrap()];
+                haystack[start.checked_add(candidate_offset).unwrap()] = member;
+                let required = u64::try_from(candidate_offset.checked_add(1).unwrap()).unwrap();
+                let exact_limit = initial_work.checked_add(required).unwrap();
+
+                let mut exact = WorkMeter::new(exact_limit, initial_work);
+                assert_eq!(
+                    super::next_start_candidate(
+                        &scanner,
+                        &haystack,
+                        start,
+                        end,
+                        None,
+                        &mut exact,
+                    )
+                    .unwrap(),
+                    start.checked_add(candidate_offset).unwrap(),
+                    "{name} scalar candidate at offset {candidate_offset}"
+                );
+                assert_eq!(exact.consumed, exact_limit);
+
+                let one_below_limit = exact_limit.checked_sub(1).unwrap();
+                let mut one_below = WorkMeter::new(one_below_limit, initial_work);
+                let error = super::next_start_candidate(
+                    &scanner,
+                    &haystack,
+                    start,
+                    end,
+                    None,
+                    &mut one_below,
+                )
+                .unwrap_err();
+                assert!(matches!(
+                    error,
+                    SearchError::WorkLimitExceeded {
+                        limit,
+                        consumed,
+                        requested: 1,
+                        position,
+                    } if limit == one_below_limit
+                        && consumed == one_below_limit
+                        && position == start + candidate_offset
+                ));
+                assert_eq!(one_below.consumed, one_below_limit);
             }
         }
     }
