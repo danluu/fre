@@ -4237,7 +4237,7 @@ fn x86_emit_ordered_suffix_reverse(
     let not_absolute_end = assembler.label()?;
     let no_initial_event = assembler.label()?;
     let reverse_loop = assembler.label()?;
-    let event = assembler.label()?;
+    let no_event = assembler.label()?;
     let finished = assembler.label()?;
 
     assembler.instruction(&[0x48, 0x89, 0xd6])?; // rsi = suffix base
@@ -4330,13 +4330,9 @@ fn x86_emit_ordered_suffix_reverse(
     assembler.instruction(&[0x25, 0xff, 0xff, 0xff, 0x3f])?;
     assembler.instruction(&[0x41, 0x89, 0xc2])?;
     assembler.instruction(&[0x45, 0x85, 0xdb])?;
-    // No event is the reverse loop's common edge. Keep it as fallthrough to
-    // the backedge and place the best-start update after that jump.
-    assembler.branch(&[0x0f, 0x88], event)?;
-    assembler.branch(&[0xe9], reverse_loop)?;
-
-    assembler.bind(event)?;
+    assembler.branch(&[0x0f, 0x89], no_event)?;
     x86_emit_ordered_suffix_update_best(assembler, complete)?;
+    assembler.bind(no_event)?;
     assembler.branch(&[0xe9], reverse_loop)?;
 
     assembler.bind(finished)?;
@@ -4755,8 +4751,7 @@ fn x86_emit_anchored_forward_search(
     ))?;
     let scan = assembler.label()?;
     let verify_loop = assembler.label()?;
-    let event = assembler.label()?;
-    let after_event = assembler.label()?;
+    let no_event = assembler.label()?;
     let resolved = assembler.label()?;
     let rejected = assembler.label()?;
     let resume_scan = assembler.label()?;
@@ -4803,10 +4798,9 @@ fn x86_emit_anchored_forward_search(
     )?;
     assembler.instruction(&[0x41, 0xff, 0xcd])?; // dec r13d
     assembler.instruction(&[0x45, 0x85, 0xdb])?;
-    // The verifier normally has no pending event. Its flag checks stay in the
-    // loop body while the rare result store rejoins them from the cold tail.
-    assembler.branch(&[0x0f, 0x88], event)?;
-    assembler.bind(after_event)?;
+    assembler.branch(&[0x0f, 0x89], no_event)?;
+    assembler.instruction(&[0x49, 0x89, 0x50, 0x08])?;
+    assembler.bind(no_event)?;
 
     assembler.instruction(&[0xa8, CONTEXT_STATE_TERMINAL])?;
     assembler.branch(&[0x0f, 0x85], resolved)?;
@@ -4841,10 +4835,6 @@ fn x86_emit_anchored_forward_search(
     assembler.instruction(&[0x49, 0xc7, 0x40, 0x08, 0xff, 0xff, 0xff, 0xff])?;
     assembler.instruction(&[0x45, 0x31, 0xd2])?; // clear state/tag scratch
     assembler.branch(&[0xe9], forward_entry)?;
-
-    assembler.bind(event)?;
-    assembler.instruction(&[0x49, 0x89, 0x50, 0x08])?;
-    assembler.branch(&[0xe9], after_event)?;
     Ok(())
 }
 
@@ -4891,7 +4881,7 @@ fn lower_x86_64_context(
     let forward_loop = assembler.label()?;
     let forward_scalar_step = assembler.label()?;
     let forward_finish = assembler.label()?;
-    let forward_event = assembler.label()?;
+    let forward_no_event = assembler.label()?;
     let span_not_initial = assembler.label()?;
     let reverse_before_sentinel = assembler.label()?;
     let reverse_before_ready = assembler.label()?;
@@ -4902,7 +4892,7 @@ fn lower_x86_64_context(
     let reverse_no_initial_event = assembler.label()?;
     let reverse_loop = assembler.label()?;
     let reverse_finish = assembler.label()?;
-    let reverse_event = assembler.label()?;
+    let reverse_no_event = assembler.label()?;
     let no_match = assembler.label()?;
     let matched = assembler.label()?;
     let invalid_initialized = assembler.label()?;
@@ -5149,16 +5139,13 @@ fn lower_x86_64_context(
         ENABLE_CONTEXT_TRUST_POPULATED_TRANSITIONS,
     )?;
     assembler.instruction(&[0x45, 0x85, 0xdb])?;
-    // Ordinary transitions take the loop backedge without first taking a
-    // forward no-event branch. Only a signed event enters the store block.
-    assembler.branch(&[0x0f, 0x88], forward_event)?;
-    assembler.branch(&[0xe9], forward_loop)?;
-
-    assembler.bind(forward_event)?;
+    assembler.branch(&[0x0f, 0x89], forward_no_event)?;
     assembler.instruction(&[0x49, 0x89, 0x50, 0x08])?;
-    if layout.output != OutputContract::Exists {
-        assembler.branch(&[0xe9], forward_loop)?;
+    if layout.output == OutputContract::Exists {
+        assembler.branch(&[0xe9], forward_finish)?;
     }
+    assembler.bind(forward_no_event)?;
+    assembler.branch(&[0xe9], forward_loop)?;
 
     assembler.bind(forward_finish)?;
     assembler.instruction(&[0x49, 0x83, 0x78, 0x08, 0xff])?;
@@ -5263,13 +5250,9 @@ fn lower_x86_64_context(
                 assembler.instruction(&[0x25, 0xff, 0xff, 0xff, 0x3f])?;
                 assembler.instruction(&[0x41, 0x89, 0xc2])?;
                 assembler.instruction(&[0x45, 0x85, 0xdb])?;
-                // Mirror the forward layout: no event reaches the backedge
-                // directly, while the candidate update is out of line.
-                assembler.branch(&[0x0f, 0x88], reverse_event)?;
-                assembler.branch(&[0xe9], reverse_loop)?;
-
-                assembler.bind(reverse_event)?;
+                assembler.branch(&[0x0f, 0x89], reverse_no_event)?;
                 assembler.instruction(&[0x48, 0x89, 0xd1])?;
+                assembler.bind(reverse_no_event)?;
                 assembler.branch(&[0xe9], reverse_loop)?;
                 assembler.bind(reverse_finish)?;
                 assembler.instruction(&[0x48, 0x83, 0xf9, 0xff])?;
@@ -7750,18 +7733,6 @@ mod tests {
                 OutputContract::Span,
                 b"!cat dog_ eel!",
             ),
-            // Exercise the ordinary contextual event path under every
-            // contract in the linked all-window native differential.
-            (
-                "(?-u:\\b[a-z]+\\b)",
-                OutputContract::SelectedEnd,
-                b"!cat dog_ eel!",
-            ),
-            (
-                "(?-u:\\b[a-z]+\\b)",
-                OutputContract::Exists,
-                b"!cat dog_ eel!",
-            ),
             (
                 "(?-u:\\bcat(?:s|alog)+\\b)",
                 OutputContract::Span,
@@ -8888,137 +8859,6 @@ mod tests {
             );
         }
         Ok(())
-    }
-
-    #[test]
-    fn x86_context_no_event_edges_have_exact_outlined_cfg() {
-        fn rel32_target(code: &[u8], branch: usize, opcode_bytes: usize) -> Option<usize> {
-            let displacement = branch.checked_add(opcode_bytes)?;
-            let after = displacement.checked_add(4)?;
-            let relative = i32::from_le_bytes(code.get(displacement..after)?.try_into().ok()?);
-            usize::try_from(isize::try_from(after).ok()? + isize::try_from(relative).ok()?).ok()
-        }
-
-        fn outlined_js_site(
-            code: &[u8],
-            fallthrough: &[u8],
-            event: &[u8],
-        ) -> Option<(usize, usize, usize)> {
-            code.windows(5).enumerate().find_map(|(test, bytes)| {
-                if bytes != [0x45, 0x85, 0xdb, 0x0f, 0x88] {
-                    return None;
-                }
-                let branch = test.checked_add(3)?;
-                let after = branch.checked_add(6)?;
-                let target = rel32_target(code, branch, 2)?;
-                (code.get(after..after.checked_add(fallthrough.len())?)? == fallthrough
-                    && code.get(target..target.checked_add(event.len())?)? == event)
-                    .then_some((test, after, target))
-            })
-        }
-
-        let assert_target = |target: Target| {
-            let compile_code = |pattern: &str, output| {
-                compile(
-                    CompileRequest::new(pattern, target)
-                        .mode(CompileMode::Optimizing)
-                        .output(output),
-                )
-                .unwrap()
-                .module()
-                .sections()[TEXT_SECTION]
-                    .bytes()
-                    .to_vec()
-            };
-
-            let anchored = compile_code(
-                r"(?-u:\b)[ACEGIKMO][ACEGIKMO](?s:.)+?",
-                OutputContract::Span,
-            );
-            let (_, anchored_after, anchored_event) = outlined_js_site(
-                &anchored,
-                &[0xa8, CONTEXT_STATE_TERMINAL],
-                &[0x49, 0x89, 0x50, 0x08, 0xe9],
-            )
-            .expect("anchored verifier must outline its pending-end store");
-            assert!(anchored_event > anchored_after);
-            assert_eq!(
-                rel32_target(&anchored, anchored_event + 4, 1),
-                Some(anchored_after),
-                "the rare anchored event must rejoin the flag checks",
-            );
-
-            let ordinary_pattern = r"(?-u:\b[a-z]+\b)";
-            let span = compile_code(ordinary_pattern, OutputContract::Span);
-            let (forward_test, forward_after, forward_event) =
-                outlined_js_site(&span, &[0xe9], &[0x49, 0x89, 0x50, 0x08, 0xe9])
-                    .expect("main forward loop must outline its pending-end store");
-            let forward_loop = rel32_target(&span, forward_after, 1).unwrap();
-            assert!(forward_loop < forward_test && forward_event > forward_after);
-            assert_eq!(
-                rel32_target(&span, forward_event + 4, 1),
-                Some(forward_loop)
-            );
-
-            let exists = compile_code(ordinary_pattern, OutputContract::Exists);
-            let (_, exists_after, exists_event) = outlined_js_site(
-                &exists,
-                &[0xe9],
-                &[0x49, 0x89, 0x50, 0x08, 0x49, 0x83, 0x78, 0x08, 0xff],
-            )
-            .expect("Exists event store must fall through to completion");
-            assert!(rel32_target(&exists, exists_after, 1).unwrap() < exists_after);
-            assert!(exists_event > exists_after);
-
-            let (reverse_test, reverse_after, reverse_event) =
-                outlined_js_site(&span, &[0xe9], &[0x48, 0x89, 0xd1, 0xe9])
-                    .expect("main reverse loop must outline its candidate update");
-            let reverse_loop = rel32_target(&span, reverse_after, 1).unwrap();
-            assert!(reverse_loop < reverse_test && reverse_event > reverse_after);
-            assert_eq!(
-                rel32_target(&span, reverse_event + 3, 1),
-                Some(reverse_loop)
-            );
-
-            let ordered = compile_code(r"(?-u:\B(?:A[a-z]{0,16}fpez|qfpez))", OutputContract::Span);
-            let (ordered_test, ordered_after, ordered_event) =
-                outlined_js_site(&ordered, &[0xe9], &[0x49, 0x3b, 0x50, 0x08])
-                    .expect("ordered suffix loop must outline its best-start update");
-            let ordered_loop = rel32_target(&ordered, ordered_after, 1).unwrap();
-            assert!(ordered_loop < ordered_test && ordered_event > ordered_after);
-            assert!(
-                (ordered_event..ordered.len()).any(|branch| {
-                    ordered[branch] == 0xe9
-                        && rel32_target(&ordered, branch, 1) == Some(ordered_loop)
-                }),
-                "the rare ordered event must return to the same reverse loop",
-            );
-
-            for code in [&anchored, &span, &exists, &ordered] {
-                assert!(
-                    !code
-                        .windows(5)
-                        .any(|bytes| bytes == [0x45, 0x85, 0xdb, 0x0f, 0x89]),
-                    "a hot test-r11d/JNS no-event edge remains",
-                );
-            }
-        };
-
-        let avx512 = FeatureSet::of(CpuFeature::X86Avx512F).with(CpuFeature::X86Avx512Bw);
-        for target in [
-            Target::x86_64_linux(),
-            Target::x86_64_linux()
-                .with_features(FeatureSet::of(CpuFeature::X86Avx2))
-                .unwrap(),
-            Target::x86_64_linux().with_features(avx512).unwrap(),
-            Target::x86_64_macos(),
-            Target::x86_64_macos()
-                .with_features(FeatureSet::of(CpuFeature::X86Avx2))
-                .unwrap(),
-            Target::x86_64_macos().with_features(avx512).unwrap(),
-        ] {
-            assert_target(target);
-        }
     }
 
     #[test]
