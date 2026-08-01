@@ -161,13 +161,11 @@ pub(super) fn aarch64_emit_bounded_suffix_retry(
     assembler.branch_cond(AARCH64_HS, rejected)?;
     aarch64_emit_table_lookup(assembler, layout.transitions)?;
     assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
-    assembler.instruction(aarch64_cmp_w_zero(8)?)?;
-    assembler.branch_cond(AARCH64_MI, accepted)?;
+    assembler.branch_bit_set_w(8, 31, accepted)?;
     // Mirror the ordinary forward dispatcher: both the accept and
     // accelerator tag are metadata, while the low 30 bits are the row token.
     assembler.instruction(aarch64_and_low_w(6, 8, 30)?)?;
-    assembler.instruction(aarch64_cmp_w_zero(6)?)?;
-    assembler.branch_cond(AARCH64_EQ, rejected)?;
+    assembler.branch_zero_w(6, rejected)?;
     assembler.instruction(aarch64_sub_w_imm(6, 6, 1)?)?;
     assembler.instruction(
         0x8b00_0000 | aarch64_reg(6, 16)? | aarch64_reg(5, 5)? | aarch64_reg(11, 0)?,
