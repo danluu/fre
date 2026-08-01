@@ -3166,15 +3166,22 @@ impl PortableBuilder {
                 for (slot, predicate) in positions.iter_mut().zip(normalized) {
                     *slot = predicate.ranges();
                 }
-                let attempt = FixedPredicateWord64Plan::build_attempt(
+                let attempt = match FixedPredicateWord64Plan::build_attempt(
                     &positions[..normalized.len()],
                     FixedPredicateWord64BuildLimits::unlimited(),
-                )
-                .map_err(|_| {
-                    BuildError::InternalInvariant(
-                        "inspected fixed-predicate search source failed kernel construction",
-                    )
-                })?;
+                ) {
+                    Ok(attempt) => attempt,
+                    Err(error) => {
+                        if !error.closes() {
+                            return Err(BuildError::InternalInvariant(
+                                "fixed-predicate search construction failure lost its attempt closure",
+                            ));
+                        }
+                        return Err(BuildError::InternalInvariant(
+                            "inspected fixed-predicate search source failed kernel construction",
+                        ));
+                    }
+                };
                 if !attempt.closes() {
                     return Err(BuildError::InternalInvariant(
                         "fixed-predicate search construction lost its attempt closure",
@@ -6714,6 +6721,28 @@ mod tests {
             accounting,
             SearchAccounting::FixedPredicateWord64(_)
         ));
+    }
+
+    #[test]
+    fn fixed_predicate_construction_failure_checks_receipt_closure_before_divergence() {
+        let source = include_str!("lib.rs");
+        let start = source
+            .find("let attempt = match FixedPredicateWord64Plan::build_attempt(")
+            .expect("fixed-predicate construction match remains explicit");
+        let end = source[start..]
+            .find("if !attempt.closes()")
+            .expect("successful construction closure check remains explicit");
+        let construction_match = &source[start..start + end];
+        assert!(construction_match.contains("Err(error) =>"));
+        assert!(construction_match.contains("if !error.closes()"));
+        assert!(
+            construction_match
+                .contains("fixed-predicate search construction failure lost its attempt closure")
+        );
+        assert!(
+            construction_match
+                .contains("inspected fixed-predicate search source failed kernel construction")
+        );
     }
 
     #[test]
