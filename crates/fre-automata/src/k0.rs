@@ -5969,18 +5969,11 @@ fn next_ascii_start_candidate(
         }
         position = block_end;
     }
-    while position < end {
-        meter.charge(1, position)?;
-        if classifier.set().contains(haystack[position]) {
-            return Ok(position);
-        }
-        position = position
-            .checked_add(1)
-            .ok_or(SearchError::ArithmeticOverflow {
-                computation: "scalar start-classifier position",
-            })?;
-    }
-    Ok(end)
+    next_small_start_candidate(haystack, position, end, meter, |source| {
+        source
+            .iter()
+            .position(|&byte| classifier.set().contains(byte))
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -10864,6 +10857,70 @@ mod tests {
                 ));
                 assert_eq!(one_below.consumed, one_below_limit);
             }
+        }
+    }
+
+    #[test]
+    fn ascii_scalar_tail_preserves_exact_and_one_below_work() {
+        let scanner = root_scanner(scanner_for_set(byte_set(&[0, 1, 3, 4])));
+        assert!(matches!(&scanner.scanner, StartScanner::AsciiSet { .. }));
+
+        let start = 3_usize;
+        let vector_extent = ASCII_WIDE_BYTES
+            .checked_mul(2)
+            .and_then(|extent| extent.checked_add(ASCII_NARROW_BYTES))
+            .unwrap();
+        let length = vector_extent
+            .checked_add(ASCII_NARROW_BYTES)
+            .and_then(|extent| extent.checked_sub(1))
+            .unwrap();
+        let end = start.checked_add(length).unwrap();
+        let initial_work = 7_u64;
+
+        for candidate_offset in vector_extent..length {
+            let mut haystack = vec![0x80; end.checked_add(2).unwrap()];
+            haystack[start.checked_add(candidate_offset).unwrap()] = 3;
+            let required = u64::try_from(candidate_offset.checked_add(1).unwrap()).unwrap();
+            let exact_limit = initial_work.checked_add(required).unwrap();
+
+            let mut exact = WorkMeter::new(exact_limit, initial_work);
+            assert_eq!(
+                super::next_start_candidate(
+                    &scanner,
+                    &haystack,
+                    start,
+                    end,
+                    None,
+                    &mut exact,
+                )
+                .unwrap(),
+                start.checked_add(candidate_offset).unwrap()
+            );
+            assert_eq!(exact.consumed, exact_limit);
+
+            let one_below_limit = exact_limit.checked_sub(1).unwrap();
+            let mut one_below = WorkMeter::new(one_below_limit, initial_work);
+            let error = super::next_start_candidate(
+                &scanner,
+                &haystack,
+                start,
+                end,
+                None,
+                &mut one_below,
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                SearchError::WorkLimitExceeded {
+                    limit,
+                    consumed,
+                    requested: 1,
+                    position,
+                } if limit == one_below_limit
+                    && consumed == one_below_limit
+                    && position == start + candidate_offset
+            ));
+            assert_eq!(one_below.consumed, one_below_limit);
         }
     }
 
