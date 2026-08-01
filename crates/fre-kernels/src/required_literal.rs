@@ -700,8 +700,6 @@ impl RequiredLiteralPlan {
         let mut accounting = self.preflight(window, limits, backward_scanner)?;
         let slice = &haystack[window.start()..window.end()];
         if self.suffix().len() == 1 {
-            // Keep the established single-byte finder loop intact. Its native
-            // iterator already has the least setup and dispatch overhead.
             let mut candidates = self.finder.find_iter(slice);
             loop {
                 accounting.finder_calls = accounting.finder_calls.checked_add(1).ok_or(
@@ -722,15 +720,70 @@ impl RequiredLiteralPlan {
                         computation: "absolute suffix candidate",
                     },
                 )?;
-                if let Some(matched) = self.confirm_candidate(
-                    haystack,
-                    window,
-                    candidate,
-                    backward_scanner,
-                    &mut accounting,
-                )? {
-                    return Ok((Some(matched), accounting));
+                if candidate == window.start() {
+                    continue;
                 }
+                let previous = candidate
+                    .checked_sub(1)
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "candidate predecessor",
+                    })?;
+                if !self.class.contains(haystack[previous]) {
+                    continue;
+                }
+
+                let start = if let Some(scanner) = backward_scanner {
+                    let backward =
+                        scanner.scan_backward(haystack.get(window.start()..candidate).ok_or(
+                            SearchError::ArithmeticOverflow {
+                                computation: "backward confirmation slice",
+                            },
+                        )?);
+                    accounting.backward_bytes_examined = accounting
+                        .backward_bytes_examined
+                        .checked_add(backward.examined_bytes())
+                        .ok_or(SearchError::ArithmeticOverflow {
+                            computation: "actual backward examinations",
+                        })?;
+                    candidate.checked_sub(backward.member_run_len()).ok_or(
+                        SearchError::ArithmeticOverflow {
+                            computation: "backward confirmation start",
+                        },
+                    )?
+                } else {
+                    let mut start = candidate;
+                    while start > window.start() {
+                        let previous =
+                            start
+                                .checked_sub(1)
+                                .ok_or(SearchError::ArithmeticOverflow {
+                                    computation: "backward confirmation position",
+                                })?;
+                        accounting.backward_bytes_examined = accounting
+                            .backward_bytes_examined
+                            .checked_add(1)
+                            .ok_or(SearchError::ArithmeticOverflow {
+                                computation: "actual backward examinations",
+                            })?;
+                        if !self.class.contains(haystack[previous]) {
+                            break;
+                        }
+                        start = previous;
+                    }
+                    start
+                };
+                let end = candidate.checked_add(self.suffix().len()).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "selected match end",
+                    },
+                )?;
+                if self.anchors.start && start != 0 {
+                    continue;
+                }
+                if self.anchors.end && end != haystack.len() {
+                    continue;
+                }
+                return Ok((Some((start, end)), accounting));
             }
         }
 
@@ -1146,8 +1199,6 @@ impl BoundedRequiredLiteralPlan {
         let mut accounting = self.preflight(window, limits, backward_scanner)?;
         let slice = &haystack[window.start()..window.end()];
         if self.suffix().len() == 1 {
-            // Keep the established single-byte finder loop intact. Its native
-            // iterator already has the least setup and dispatch overhead.
             let mut candidates = self.plan.finder.find_iter(slice);
             loop {
                 accounting.finder_calls = accounting.finder_calls.checked_add(1).ok_or(
@@ -1168,15 +1219,82 @@ impl BoundedRequiredLiteralPlan {
                         computation: "absolute suffix candidate",
                     },
                 )?;
-                if let Some(matched) = self.confirm_candidate(
-                    haystack,
-                    window,
-                    candidate,
-                    backward_scanner,
-                    &mut accounting,
-                )? {
-                    return Ok((Some(matched), accounting));
+                if candidate == window.start() {
+                    continue;
                 }
+                let previous = candidate
+                    .checked_sub(1)
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "candidate predecessor",
+                    })?;
+                if !self.class().contains(haystack[previous]) {
+                    continue;
+                }
+
+                let confirmation_start = self.repeat.max.map_or(window.start(), |max| {
+                    candidate.saturating_sub(max).max(window.start())
+                });
+                let run_start = if let Some(scanner) = backward_scanner {
+                    let backward =
+                        scanner.scan_backward(haystack.get(confirmation_start..candidate).ok_or(
+                            SearchError::ArithmeticOverflow {
+                                computation: "backward confirmation slice",
+                            },
+                        )?);
+                    accounting.backward_bytes_examined = accounting
+                        .backward_bytes_examined
+                        .checked_add(backward.examined_bytes())
+                        .ok_or(SearchError::ArithmeticOverflow {
+                            computation: "actual backward examinations",
+                        })?;
+                    candidate.checked_sub(backward.member_run_len()).ok_or(
+                        SearchError::ArithmeticOverflow {
+                            computation: "backward confirmation start",
+                        },
+                    )?
+                } else {
+                    let mut start = candidate;
+                    while start > confirmation_start {
+                        let previous =
+                            start
+                                .checked_sub(1)
+                                .ok_or(SearchError::ArithmeticOverflow {
+                                    computation: "backward confirmation position",
+                                })?;
+                        accounting.backward_bytes_examined = accounting
+                            .backward_bytes_examined
+                            .checked_add(1)
+                            .ok_or(SearchError::ArithmeticOverflow {
+                                computation: "actual backward examinations",
+                            })?;
+                        if !self.class().contains(haystack[previous]) {
+                            break;
+                        }
+                        start = previous;
+                    }
+                    start
+                };
+                let run_len =
+                    candidate
+                        .checked_sub(run_start)
+                        .ok_or(SearchError::ArithmeticOverflow {
+                            computation: "confirmed class run length",
+                        })?;
+                if run_len < self.repeat.min {
+                    continue;
+                }
+                let end = candidate.checked_add(self.suffix().len()).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "selected match end",
+                    },
+                )?;
+                if self.anchors().start && run_start != 0 {
+                    continue;
+                }
+                if self.anchors().end && end != haystack.len() {
+                    continue;
+                }
+                return Ok((Some((run_start, end)), accounting));
             }
         }
 
