@@ -176,6 +176,8 @@ fn emit(
         PlanKind::K0 => "k0",
         PlanKind::UnicodeFoldedLiteral => "unicode-folded-literal-first-start-v1",
         PlanKind::UnicodeWordRun => "unicode-word-run-linear-v1",
+        PlanKind::PureByteClassRepeat => "pure-byte-class-repeat-v1",
+        PlanKind::FixedPredicateWord64 => "fixed-predicate-word64-first-match-v1",
     };
     let per_iteration = elapsed_ns / u128::try_from(ITERATIONS).unwrap();
     let (start, end) = matched.map_or((String::new(), String::new()), |(start, end)| {
