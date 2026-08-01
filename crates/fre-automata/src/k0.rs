@@ -11740,6 +11740,211 @@ mod tests {
     }
 
     #[test]
+    fn accelerated_range_restarts_have_a_source_derived_exact_retained_mask_ledger() {
+        const RESTARTS: [usize; 4] = [16, 20, 24, 28];
+        const TRANSITION_POSITIONS: [usize; 8] = [16, 17, 20, 21, 24, 25, 28, 29];
+
+        let range = (0x20_u8..=0x60).collect::<Vec<_>>();
+        assert_eq!(range.len(), 65, "the root class must exceed the guard cap");
+        let plan = byte_class_then_range(&range, (0x80, 0xff), None);
+        let mut haystack = [0_u8; 32];
+        for &candidate in &RESTARTS {
+            haystack[candidate] = 0x40;
+        }
+        haystack[29] = 0x80;
+
+        let layout = plan.accelerated_workspace_layout().unwrap();
+        assert!(layout.lazy_state_capacity > 0);
+        assert!(layout.lazy_item_capacity > 0);
+        let mut accelerated =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        assert_eq!(accelerated.layout(), layout);
+        assert!(accelerated.lazy.is_allocated());
+        assert!(!accelerated.lazy.initialized);
+        assert!(!accelerated.lazy.declined);
+        let retained_bytes = accelerated.retained_bytes();
+
+        let cold = plan
+            .prepare::<SelectedEnd>()
+            .search_with_workspace(&haystack, &mut accelerated, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(cold.output(), &Some(30));
+        assert!(accelerated.lazy.initialized);
+        assert!(!accelerated.lazy.declined);
+        assert!(accelerated.lazy.state_len > 0);
+
+        let bidirectional_layout = plan.bidirectional_workspace_layout().unwrap();
+        assert!(bidirectional_layout.lazy_state_capacity > 0);
+        assert!(bidirectional_layout.lazy_item_capacity > 0);
+        assert!(bidirectional_layout.reverse_state_capacity > 0);
+        assert!(bidirectional_layout.reverse_item_capacity > 0);
+        let mut bidirectional =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        assert_eq!(bidirectional.layout(), bidirectional_layout);
+        assert!(bidirectional.lazy.is_allocated());
+        assert!(bidirectional.reverse.is_allocated());
+        assert!(!bidirectional.lazy.initialized);
+        assert!(!bidirectional.reverse.initialized);
+        let cold_span = plan
+            .prepare::<Span>()
+            .search_with_workspace(&haystack, &mut bidirectional, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(cold_span.output(), &Some(MatchSpan::new(28, 30)));
+        assert!(bidirectional.lazy.initialized);
+        assert!(bidirectional.reverse.initialized);
+        assert!(!bidirectional.lazy.declined);
+        assert!(!bidirectional.reverse.declined);
+        assert!(bidirectional.lazy.state_len > 0);
+        assert!(bidirectional.reverse.state_len > 0);
+        assert_eq!(
+            plan.prepare::<Span>()
+                .search_with_workspace(&haystack, &mut bidirectional, SearchLimits::unlimited(),)
+                .unwrap()
+                .into_output(),
+            Some(MatchSpan::new(28, 30))
+        );
+        let proof = plan
+            .start_filter_proof
+            .get()
+            .expect("the cold run publishes its exact start proof");
+        assert!(matches!(
+            proof.scanner,
+            Some(StartPositionScanner {
+                offset: 0,
+                scanner: StartScanner::Range {
+                    start: 0x20,
+                    end: 0x60,
+                },
+            })
+        ));
+        assert_eq!(proof.guard, None);
+
+        // This ledger is derived from the fixed source and the warmed loop,
+        // not copied from a candidate report: reset costs three, the first
+        // Range call scans a 16-byte scalar prefix plus one complete 16-byte
+        // classifier block, and four failed/accepted two-byte DFA attempts
+        // visit exactly the eight positions above. Retained candidates add no
+        // classifier charge.
+        let reset_work = INVOCATION_RESET_WORK;
+        let first_classifier_work = u64::try_from(BYTE_SET_BLOCK_BYTES)
+            .unwrap()
+            .checked_mul(2)
+            .unwrap();
+        let transition_work = u64::try_from(TRANSITION_POSITIONS.len()).unwrap();
+        let revised_work = reset_work
+            .checked_add(first_classifier_work)
+            .and_then(|work| work.checked_add(transition_work))
+            .unwrap();
+        assert_eq!(revised_work, 43);
+
+        // The non-retaining entry is the exact-parent scanner algorithm. It
+        // must re-scan three bytes after each of the first three DFA failures:
+        // 18..=20, 22..=24, and 26..=28. This independently closes the parent
+        // scanner ledger at 41 and its complete warmed search at 52.
+        let scanner = proof.scanner.as_ref().unwrap();
+        let mut parent_scanner = WorkMeter::new(u64::MAX, 0);
+        for (&restart, &expected) in [0_usize, 18, 22, 26].iter().zip(&RESTARTS) {
+            assert_eq!(
+                super::next_start_candidate(
+                    scanner,
+                    &haystack,
+                    restart,
+                    haystack.len(),
+                    None,
+                    &mut parent_scanner,
+                )
+                .unwrap(),
+                expected
+            );
+        }
+        let parent_scanner_work = first_classifier_work
+            .checked_add(u64::try_from((RESTARTS.len() - 1) * 3).unwrap())
+            .unwrap();
+        assert_eq!(parent_scanner.consumed, parent_scanner_work);
+        assert_eq!(parent_scanner_work, 41);
+        let exact_parent_work = reset_work
+            .checked_add(parent_scanner_work)
+            .and_then(|work| work.checked_add(transition_work))
+            .unwrap();
+        assert_eq!(exact_parent_work, 52);
+        assert_eq!(exact_parent_work - revised_work, 9);
+
+        let mut retained_scanner = WorkMeter::new(u64::MAX, 0);
+        let mut cursor = super::RetainedStartMaskCursor::default();
+        for (&restart, &expected) in [0_usize, 18, 22, 26].iter().zip(&RESTARTS) {
+            assert_eq!(
+                super::next_start_candidate_retained(
+                    scanner,
+                    &haystack,
+                    restart,
+                    haystack.len(),
+                    None,
+                    &mut retained_scanner,
+                    &mut cursor,
+                )
+                .unwrap(),
+                expected
+            );
+        }
+        assert_eq!(retained_scanner.consumed, first_classifier_work);
+
+        let measured = plan
+            .prepare::<SelectedEnd>()
+            .search_with_workspace(&haystack, &mut accelerated, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(measured.output(), &Some(30));
+        assert_eq!(measured.accounting().setup().work(), reset_work);
+        assert_eq!(measured.accounting().transition_work(), 40);
+        assert_eq!(measured.accounting().work(), revised_work);
+        assert_eq!(measured.accounting().scratch_bytes(), retained_bytes);
+
+        assert_eq!(
+            plan.prepare::<SelectedEnd>()
+                .search_with_workspace(
+                    &haystack,
+                    &mut accelerated,
+                    SearchLimits {
+                        max_work: revised_work,
+                        max_scratch_bytes: retained_bytes,
+                    },
+                )
+                .unwrap()
+                .into_output(),
+            Some(30)
+        );
+        assert!(matches!(
+            plan.prepare::<SelectedEnd>().search_with_workspace(
+                &haystack,
+                &mut accelerated,
+                SearchLimits {
+                    max_work: revised_work - 1,
+                    max_scratch_bytes: retained_bytes,
+                },
+            ),
+            Err(SearchError::WorkLimitExceeded {
+                limit,
+                consumed,
+                requested: 1,
+                position: 29,
+            }) if limit == revised_work - 1 && consumed == revised_work - 1
+        ));
+        assert_eq!(accelerated.retained_bytes(), retained_bytes);
+
+        let oracle = byte_class_then_range(&range, (0x80, 0xff), None);
+        pin_without_start_filter(&oracle);
+        let mut oracle_workspace = K0Workspace::new(&oracle, WorkspaceLimits::unlimited()).unwrap();
+        assert!(!oracle_workspace.lazy.is_allocated());
+        assert_eq!(
+            oracle
+                .prepare::<SelectedEnd>()
+                .search_with_workspace(&haystack, &mut oracle_workspace, SearchLimits::unlimited(),)
+                .unwrap()
+                .into_output(),
+            Some(30)
+        );
+    }
+
+    #[test]
     fn broad_full_byte_scanners_match_every_window_and_vector_threshold() {
         let mut sets = vec![
             byte_set(&[0x80, 0x81, 0x8e, 0x8f]),
