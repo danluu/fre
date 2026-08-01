@@ -14,17 +14,16 @@ use super::{
     NativePrefixRelationPredicate, NativePrefixRelationRectangle, NativePrefixRelationVectorPlan,
     NativeStartFilter, NativeVectorFilter, PROGRAM_SYMBOL, RelocationKind, StartAccelerator,
     TEXT_SECTION, Target, X86Assembler, X86CandidateMask, X86StartFilterKind, aarch64_add_x_imm,
-    aarch64_add_x_reg, aarch64_and_low_x, aarch64_cmp_w_imm, aarch64_cmp_w_zero, aarch64_cmp_x,
-    aarch64_cmp_x_imm, aarch64_csel_x, aarch64_emit_candidate_any,
-    aarch64_emit_candidate_batch_any, aarch64_emit_first_candidate_in_batch,
-    aarch64_emit_first_candidate_lane, aarch64_emit_first_lane_constants,
-    aarch64_emit_prefix_predicate, aarch64_emit_prefix_relation_vector_test,
-    aarch64_emit_scalar_filter_membership, aarch64_emit_start_filter_address,
-    aarch64_emit_start_filter_batch_candidates, aarch64_emit_start_filter_constants,
-    aarch64_emit_start_filter_scalar_bound, aarch64_emit_start_filter_vector_candidates,
-    aarch64_emit_start_filter_vector_test, aarch64_emit_vector_filter_secondary_batch,
-    aarch64_emit_vector_filter_secondary_candidates_at, aarch64_load_byte_reg,
-    aarch64_load_halfword_reg, aarch64_load_q, aarch64_load_u32_constant,
+    aarch64_add_x_reg, aarch64_cmp_w_imm, aarch64_cmp_x, aarch64_cmp_x_imm, aarch64_csel_x,
+    aarch64_emit_candidate_any, aarch64_emit_candidate_batch_any,
+    aarch64_emit_first_candidate_in_batch, aarch64_emit_first_candidate_lane,
+    aarch64_emit_first_lane_constants, aarch64_emit_prefix_predicate,
+    aarch64_emit_prefix_relation_vector_test, aarch64_emit_scalar_filter_membership,
+    aarch64_emit_start_filter_address, aarch64_emit_start_filter_batch_candidates,
+    aarch64_emit_start_filter_constants, aarch64_emit_start_filter_scalar_bound,
+    aarch64_emit_start_filter_vector_candidates, aarch64_emit_start_filter_vector_test,
+    aarch64_emit_vector_filter_secondary_batch, aarch64_emit_vector_filter_secondary_candidates_at,
+    aarch64_load_byte_reg, aarch64_load_halfword_reg, aarch64_load_q, aarch64_load_u32_constant,
     aarch64_load_u64_constant, aarch64_lsr_x_imm, aarch64_mov_x, aarch64_movi_16b, aarch64_movz_w,
     aarch64_orr_16b, aarch64_prefix_relation_constant_register, aarch64_set_table_address,
     aarch64_store_x, aarch64_sub_w_imm, aarch64_sub_x_imm, aarch64_sub_x_reg,
@@ -7340,8 +7339,10 @@ fn lower_aarch64_context(
 
     if let Some(plan) = prefix_fast_forward {
         let ordinary = assembler.label()?;
-        assembler.branch_bit_set_w(8, 0, ordinary)?;
-        assembler.branch_bit_set_w(8, 1, ordinary)?;
+        // Keep the masked flags live in w11 for the shared ordinary/reentry
+        // block while folding its zero compare into CBNZ.
+        assembler.instruction(aarch64_context_and_low_w(11, 8, 3)?)?;
+        assembler.branch_nonzero_w(11, ordinary)?;
         assembler.instruction(aarch64_add_x_imm(2, 2, u16::from(plan.consumed_bytes))?)?;
         aarch64_load_u32_constant(&mut assembler, 6, plan.target_state)?;
         assembler.branch(forward_loop)?;
@@ -8202,6 +8203,30 @@ mod tests {
             assert_eq!(selected, name == "word", "{name}: {plan:?}");
         }
         Ok(())
+    }
+
+    #[test]
+    fn aarch64_prefix_supertransition_preserves_masked_flag_scratch() {
+        let compiled = compile(
+            CompileRequest::new("(?m)^foo$", Target::aarch64_macos())
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::SelectedEnd),
+        )
+        .unwrap();
+        let view = compiled.program().native_context_program_view().unwrap();
+        assert!(derive_context_prefix_fast_forward(view).is_some());
+        let words = compiled.module().sections()[TEXT_SECTION]
+            .bytes()
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let masked_flags = aarch64_context_and_low_w(11, 8, 3).unwrap();
+        assert!(
+            words
+                .windows(2)
+                .any(|pair| { pair[0] == masked_flags && pair[1] & 0xff00_001f == 0x3500_000b }),
+            "the fast-forward split must retain flags in w11 and fold only its zero compare",
+        );
     }
 
     #[test]
