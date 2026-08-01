@@ -3649,6 +3649,40 @@ impl X86Assembler {
     }
 
     fn branch(&mut self, opcode: &[u8], label: X86Label) -> Result<(), ObjectError> {
+        // Once a target is bound, use the compact rel8 form whenever the
+        // displacement fits. All such edges are backward, so their size
+        // cannot move the target or invalidate an earlier fixup. Forward
+        // edges retain the fixed-width rel32 representation and are resolved
+        // transactionally by `finish`.
+        let short_opcode = match opcode {
+            [0xe9] => Some(0xeb),
+            [0x0f, condition @ 0x80..=0x8f] => condition.checked_sub(0x10),
+            _ => None,
+        };
+        if let (Some(short_opcode), Some(target)) =
+            (short_opcode, self.labels.get(label).copied().flatten())
+            && (target == self.code.len()
+                || self.instruction_offsets.binary_search(&target).is_ok())
+        {
+            let after = self
+                .code
+                .len()
+                .checked_add(2)
+                .ok_or(ObjectError::ArithmeticOverflow("x86 short branch base"))?;
+            let target = i64::try_from(target)
+                .map_err(|_| ObjectError::ArithmeticOverflow("x86 short branch target"))?;
+            let after = i64::try_from(after)
+                .map_err(|_| ObjectError::ArithmeticOverflow("x86 short branch base"))?;
+            let delta = target
+                .checked_sub(after)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "x86 short branch displacement",
+                ))?;
+            if let Ok(delta) = i8::try_from(delta) {
+                self.instruction(&[short_opcode, delta.to_le_bytes()[0]])?;
+                return Ok(());
+            }
+        }
         self.instruction(opcode)?;
         let displacement = self.code.len();
         push_bytes(&mut self.code, &[0; 4])?;
@@ -9185,6 +9219,32 @@ mod tests {
         targets
     }
 
+    fn x86_test_branch_target(code: &[u8], instruction: usize) -> Option<(usize, usize)> {
+        let opcode = *code.get(instruction)?;
+        let (length, displacement) = match opcode {
+            0xeb | 0x70..=0x7f => {
+                let displacement = i8::from_le_bytes([*code.get(instruction.checked_add(1)?)?]);
+                (2_usize, isize::from(displacement))
+            }
+            0xe9 => {
+                let start = instruction.checked_add(1)?;
+                let end = start.checked_add(4)?;
+                let displacement = i32::from_le_bytes(code.get(start..end)?.try_into().ok()?);
+                (5_usize, isize::try_from(displacement).ok()?)
+            }
+            0x0f if matches!(code.get(instruction.checked_add(1)?), Some(0x80..=0x8f)) => {
+                let start = instruction.checked_add(2)?;
+                let end = start.checked_add(4)?;
+                let displacement = i32::from_le_bytes(code.get(start..end)?.try_into().ok()?);
+                (6_usize, isize::try_from(displacement).ok()?)
+            }
+            _ => return None,
+        };
+        let after = isize::try_from(instruction.checked_add(length)?).ok()?;
+        let target = after.checked_add(displacement)?;
+        Some((usize::try_from(target).ok()?, length))
+    }
+
     #[test]
     fn target_matrix_has_the_platform_abi() {
         let cases = [
@@ -9308,6 +9368,32 @@ mod tests {
     }
 
     #[test]
+    fn x86_assembler_relaxes_only_bound_in_range_branches() {
+        let mut assembler = X86Assembler::new();
+        let near = assembler.label().unwrap();
+        assembler.bind(near).unwrap();
+        assembler.instruction(&[0x90]).unwrap();
+        assembler.branch(&[0xe9], near).unwrap();
+        assembler.branch(&[0x0f, 0x85], near).unwrap();
+
+        let far = assembler.label().unwrap();
+        assembler.bind(far).unwrap();
+        for _ in 0..128 {
+            assembler.instruction(&[0x90]).unwrap();
+        }
+        assembler.branch(&[0xe9], far).unwrap();
+
+        let forward = assembler.label().unwrap();
+        assembler.branch(&[0xe9], forward).unwrap();
+        assembler.bind(forward).unwrap();
+
+        let code = assembler.finish().unwrap();
+        assert_eq!(&code[..5], &[0x90, 0xeb, 0xfd, 0x75, 0xfb]);
+        assert_eq!(&code[133..138], &[0xe9, 0x7b, 0xff, 0xff, 0xff]);
+        assert_eq!(&code[138..], &[0xe9, 0, 0, 0, 0]);
+    }
+
+    #[test]
     fn sparse_batch_admission_uses_stable_frequency_and_instruction_cost() {
         let one_range = |start: u8, end: u8| {
             let mut filter = EMPTY_NATIVE_START_FILTER;
@@ -9405,15 +9491,6 @@ mod tests {
                 .collect()
         }
 
-        fn rel32_target(code: &[u8], instruction: usize, displacement: usize, len: usize) -> usize {
-            let start = instruction + displacement;
-            let relative = i32::from_le_bytes(code[start..start + 4].try_into().unwrap());
-            usize::try_from(
-                isize::try_from(instruction + len).unwrap() + isize::try_from(relative).unwrap(),
-            )
-            .unwrap()
-        }
-
         const PATTERNS: [&str; 2] = [
             r"(?:(?:(?:(?:(?:(?:QtJHg[I-K])){2,3}){1,3}?)+?9(?:(?:[J-M]){2,3}?){1,4}?)(?-u:[\x00-\xFF]))",
             r"(?:(?:(?:(?:(?:(?:QtJHg[I-L])){2,3}){1,3}?)+?8(?:(?:[J-N]){2,3}?){1,4}?)(?-u:[\x00-\xFF]))",
@@ -9478,7 +9555,8 @@ mod tests {
                     let primary_loop = clears[0] - 18;
                     let joint_loop = clears[1] - 18;
                     let primary_hit_branch = reductions[0] + reduce.len();
-                    let rewind_block = rel32_target(code, primary_hit_branch, 2, 6);
+                    let (rewind_block, _) =
+                        x86_test_branch_target(code, primary_hit_branch).unwrap();
                     assert!(primary_hit_branch < rewind_block);
                     assert_eq!(
                         &code[rewind_block..rewind_block + rewind.len()],
@@ -9490,10 +9568,16 @@ mod tests {
                     {
                         let hit_branch = index + reduce.len();
                         assert_eq!(&code[hit_branch..hit_branch + 2], &[0x0f, 0x85]);
-                        assert_eq!(rel32_target(code, hit_branch, 2, 6), rewind_block);
-                        let miss_branch = hit_branch + 6;
-                        assert_eq!(code[miss_branch], 0xe9);
-                        assert_eq!(rel32_target(code, miss_branch, 1, 5), loop_start);
+                        let (_, hit_length) = x86_test_branch_target(code, hit_branch).unwrap();
+                        assert_eq!(
+                            x86_test_branch_target(code, hit_branch).unwrap().0,
+                            rewind_block
+                        );
+                        let miss_branch = hit_branch + hit_length;
+                        assert_eq!(
+                            x86_test_branch_target(code, miss_branch).unwrap().0,
+                            loop_start
+                        );
                         assert!(miss_branch > loop_start);
                     }
                     assert!(reductions[1] > rewind_block);
@@ -9503,17 +9587,15 @@ mod tests {
                     // edge back to the joint loop is its secondary rejection.
                     let replay_branch = rewind_block + rewind.len();
                     assert_eq!(code[replay_branch], 0xe9);
-                    let replay = rel32_target(code, replay_branch, 1, 5);
+                    let (replay, _) = x86_test_branch_target(code, replay_branch).unwrap();
                     assert!(replay_branch < replay);
                     assert!(replay > joint_loop);
                     assert_eq!(&code[replay..replay + 4], &[0x48, 0x8d, 0x42, 0x06]);
-                    let adaptive_rejections = code
-                        .windows(8)
-                        .enumerate()
-                        .filter_map(|(offset, window)| {
-                            (window.starts_with(&[0x48, 0xff, 0xc2, 0xe9])
-                                && rel32_target(code, offset + 3, 1, 5) == joint_loop)
-                                .then_some(offset)
+                    let adaptive_rejections = (0..code.len().saturating_sub(3))
+                        .filter(|&offset| {
+                            code[offset..].starts_with(&[0x48, 0xff, 0xc2])
+                                && x86_test_branch_target(code, offset + 3)
+                                    .is_some_and(|(target, _)| target == joint_loop)
                         })
                         .collect::<Vec<_>>();
                     assert_eq!(adaptive_rejections.len(), 1, "{target:?} {output:?}");
@@ -14090,48 +14172,57 @@ mod tests {
             .windows(5)
             .position(|bytes| bytes == [0xa9, 0x00, 0x00, 0x00, 0x40])
             .unwrap();
+        let accelerated_branch = x86_dispatch + 5;
         assert_eq!(
-            &direct_x86[x86_dispatch + 5..x86_dispatch + 11],
-            &[0x0f, 0x85, 0x15, 0, 0, 0]
+            &direct_x86[accelerated_branch..accelerated_branch + 2],
+            &[0x0f, 0x85]
         );
+        let (accelerated_transition, accelerated_branch_bytes) =
+            x86_test_branch_target(&direct_x86, accelerated_branch).unwrap();
+        assert_eq!(accelerated_branch_bytes, 6);
+
+        let ordinary_mask = accelerated_branch + accelerated_branch_bytes;
         assert_eq!(
-            &direct_x86[x86_dispatch + 11..x86_dispatch + 16],
+            &direct_x86[ordinary_mask..ordinary_mask + 5],
             &[0x25, 0xff, 0xff, 0xff, 0x3f]
         );
         assert_eq!(
-            &direct_x86[x86_dispatch + 16..x86_dispatch + 18],
+            &direct_x86[ordinary_mask + 5..ordinary_mask + 7],
             &[0x0f, 0x84]
         );
+        let ordinary_row = ordinary_mask + 11;
         assert_eq!(
-            &direct_x86[x86_dispatch + 22..x86_dispatch + 27],
+            &direct_x86[ordinary_row..ordinary_row + 5],
             &[0x4d, 0x8d, 0x54, 0x01, 0xff]
         );
-        assert_eq!(direct_x86[x86_dispatch + 27], 0xe9);
-        let ordinary_displacement = i32::from_le_bytes(
-            direct_x86[x86_dispatch + 28..x86_dispatch + 32]
-                .try_into()
-                .unwrap(),
-        );
+        let ordinary_branch = ordinary_row + 5;
+        let (ordinary_target, ordinary_branch_bytes) =
+            x86_test_branch_target(&direct_x86, ordinary_branch).unwrap();
+        assert_eq!(ordinary_branch_bytes, 2, "ordinary hot edge must relax");
         assert!(
-            ordinary_displacement < 0,
+            ordinary_target < ordinary_branch,
             "ordinary edge must loop directly"
         );
         assert_eq!(
-            &direct_x86[x86_dispatch + 32..x86_dispatch + 37],
+            &direct_x86[ordinary_target..ordinary_target + 3],
+            &[0x48, 0x39, 0xca]
+        );
+
+        let accelerated_mask = ordinary_branch + ordinary_branch_bytes;
+        assert_eq!(accelerated_transition, accelerated_mask);
+        assert_eq!(
+            &direct_x86[accelerated_mask..accelerated_mask + 5],
             &[0x25, 0xff, 0xff, 0xff, 0x3f]
         );
+        let accelerated_row = accelerated_mask + 11;
         assert_eq!(
-            &direct_x86[x86_dispatch + 43..x86_dispatch + 48],
+            &direct_x86[accelerated_row..accelerated_row + 5],
             &[0x4d, 0x8d, 0x54, 0x01, 0xff]
         );
-        assert_eq!(direct_x86[x86_dispatch + 48], 0xe9);
-        let accelerated_displacement = i32::from_le_bytes(
-            direct_x86[x86_dispatch + 49..x86_dispatch + 53]
-                .try_into()
-                .unwrap(),
-        );
+        let tagged_branch = accelerated_row + 5;
+        let (tagged_target, _) = x86_test_branch_target(&direct_x86, tagged_branch).unwrap();
         assert!(
-            accelerated_displacement < 0,
+            tagged_target < tagged_branch,
             "tagged edge must re-enter dispatch"
         );
 
