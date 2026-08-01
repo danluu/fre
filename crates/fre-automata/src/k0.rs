@@ -366,6 +366,141 @@ struct EffectiveLazyMode {
 #[derive(Clone, Copy, Debug)]
 struct DirectLazyReady;
 
+// One ordinary execution loop may revisit a complete classifier block after
+// a guard or DFA restart rejects its first member. Retain only the unconsumed
+// lanes from that already charged block. This cursor is deliberately created
+// by the loop itself: it never crosses a search call, fallback, source, or
+// workspace boundary.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RetainedStartMaskCursor {
+    base: usize,
+    width: u8,
+    members: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetainedStartCandidate {
+    Unavailable,
+    Candidate(usize),
+    ResumeAt(usize),
+}
+
+impl RetainedStartMaskCursor {
+    const fn clear(&mut self) {
+        self.base = 0;
+        self.width = 0;
+        self.members = 0;
+    }
+
+    fn take(&mut self, position: usize, end: usize) -> Result<RetainedStartCandidate, SearchError> {
+        if self.width == 0 {
+            return Ok(RetainedStartCandidate::Unavailable);
+        }
+        let width = usize::from(self.width);
+        let block_end = self
+            .base
+            .checked_add(width)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "retained start-mask block end",
+            })?;
+        if position < self.base || position >= block_end {
+            self.clear();
+            return Ok(RetainedStartCandidate::Unavailable);
+        }
+        if block_end > end {
+            return Err(SearchError::InternalInvariant {
+                detail: "retained start-mask block exceeded the validated search window",
+            });
+        }
+
+        let relative = position
+            .checked_sub(self.base)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "retained start-mask position preceded its block",
+            })?;
+        self.members &= u64::MAX
+            .checked_shl(u32::try_from(relative).expect("classifier lane fits u32"))
+            .unwrap_or(0);
+        if self.members == 0 {
+            self.clear();
+            return Ok(RetainedStartCandidate::ResumeAt(block_end));
+        }
+
+        let lane = usize::try_from(self.members.trailing_zeros())
+            .expect("a retained classifier lane fits usize");
+        if lane >= width {
+            return Err(SearchError::InternalInvariant {
+                detail: "retained start-mask member exceeded its complete block",
+            });
+        }
+        let candidate = self
+            .base
+            .checked_add(lane)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "retained start-mask candidate",
+            })?;
+        if candidate < position || candidate >= end {
+            return Err(SearchError::InternalInvariant {
+                detail: "retained start-mask candidate escaped its monotone search window",
+            });
+        }
+        self.members &= self
+            .members
+            .checked_sub(1)
+            .expect("a selected retained start-mask member is nonzero");
+        Ok(RetainedStartCandidate::Candidate(candidate))
+    }
+
+    fn retain_complete_block(
+        &mut self,
+        base: usize,
+        width: usize,
+        members: u64,
+        end: usize,
+    ) -> Result<usize, SearchError> {
+        let maximum_width = usize::try_from(u64::BITS).expect("u64 bit width fits usize");
+        if width == 0 || width > maximum_width || members == 0 {
+            return Err(SearchError::InternalInvariant {
+                detail: "invalid complete start-mask block was retained",
+            });
+        }
+        let block_end = base
+            .checked_add(width)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "retained complete start-mask block end",
+            })?;
+        if block_end > end {
+            return Err(SearchError::InternalInvariant {
+                detail: "incomplete start-mask classifier block was retained",
+            });
+        }
+        let unused = u64::BITS
+            .checked_sub(u32::try_from(width).expect("classifier width fits u32"))
+            .ok_or(SearchError::InternalInvariant {
+                detail: "retained start-mask width exceeded its mask",
+            })?;
+        let valid = u64::MAX
+            .checked_shr(unused)
+            .unwrap_or(u64::MAX);
+        if members & !valid != 0 {
+            return Err(SearchError::InternalInvariant {
+                detail: "retained start-mask contained a lane outside its classifier block",
+            });
+        }
+        self.base = base;
+        self.width = u8::try_from(width).expect("classifier width fits u8");
+        self.members = members;
+        match self.take(base, end)? {
+            RetainedStartCandidate::Candidate(candidate) => Ok(candidate),
+            RetainedStartCandidate::Unavailable | RetainedStartCandidate::ResumeAt(_) => {
+                Err(SearchError::InternalInvariant {
+                    detail: "nonempty retained start-mask block had no first candidate",
+                })
+            }
+        }
+    }
+}
+
 // Source-independent facts that are invariant across suffix searches using
 // one workspace. Haystack bytes, the changing start, and the effective
 // forward/reverse mode remain call-local. In particular, preparing a direct
@@ -3015,12 +3150,20 @@ fn execute_lazy_loop(
     let mut boundaries = 0usize;
     let mut pending_end = initial_pending.then_some(window.start());
     let mut entered = false;
+    let mut retained_start_mask = RetainedStartMaskCursor::default();
 
     loop {
         if pending_end.is_none() && state == LazyState::Cached(initial) {
             if let Some(scanner) = scanner {
-                position =
-                    next_start_candidate(scanner, haystack, position, window.end(), guard, meter)?;
+                position = next_start_candidate_retained(
+                    scanner,
+                    haystack,
+                    position,
+                    window.end(),
+                    guard,
+                    meter,
+                    &mut retained_start_mask,
+                )?;
                 if position == window.end() {
                     return Ok(Some((None, boundaries)));
                 }
@@ -3164,14 +3307,22 @@ fn execute_context_lazy_loop(
     let mut position = window.start();
     let mut boundaries = 0usize;
     let mut initial_candidate_scanned = false;
+    let mut retained_start_mask = RetainedStartMaskCursor::default();
     if let Some(scanner) = scanner {
         // An absolute-start branch may contribute only at original haystack
         // boundary zero. Otherwise the proven scanner can establish the first
         // viable root before contextual initialization, avoiding construction
         // of an initial state that would be discarded immediately.
         if !(force_haystack_start && position == 0) {
-            position =
-                next_start_candidate(scanner, haystack, position, window.end(), guard, meter)?;
+            position = next_start_candidate_retained(
+                scanner,
+                haystack,
+                position,
+                window.end(),
+                guard,
+                meter,
+                &mut retained_start_mask,
+            )?;
             if position == window.end() {
                 return Ok(Some((None, boundaries)));
             }
@@ -3202,7 +3353,15 @@ fn execute_context_lazy_loop(
             && !(force_haystack_start && position == 0)
         {
             let candidate = if let Some(scanner) = scanner {
-                next_start_candidate(scanner, haystack, position, window.end(), guard, meter)?
+                next_start_candidate_retained(
+                    scanner,
+                    haystack,
+                    position,
+                    window.end(),
+                    guard,
+                    meter,
+                    &mut retained_start_mask,
+                )?
             } else {
                 position
             };
@@ -5000,6 +5159,7 @@ fn execute_filtered_loop(
     let mut position = window.start();
     let mut boundaries = 0usize;
     let mut pending = None;
+    let mut retained_start_mask = RetainedStartMaskCursor::default();
 
     loop {
         if pending.is_none()
@@ -5009,8 +5169,15 @@ fn execute_filtered_loop(
             // once; the scanner is a proof for later boundaries.
             && !(force_haystack_start && position == 0)
         {
-            position =
-                next_start_candidate(scanner, haystack, position, window.end(), guard, meter)?;
+            position = next_start_candidate_retained(
+                scanner,
+                haystack,
+                position,
+                window.end(),
+                guard,
+                meter,
+                &mut retained_start_mask,
+            )?;
             if position == window.end() {
                 break;
             }
@@ -5634,6 +5801,30 @@ fn next_start_candidate(
     guard: Option<&StartPositionClass>,
     meter: &mut WorkMeter,
 ) -> Result<usize, SearchError> {
+    next_start_candidate_inner(scanner, haystack, position, end, guard, meter, None)
+}
+
+fn next_start_candidate_retained(
+    scanner: &StartPositionScanner,
+    haystack: &[u8],
+    position: usize,
+    end: usize,
+    guard: Option<&StartPositionClass>,
+    meter: &mut WorkMeter,
+    cursor: &mut RetainedStartMaskCursor,
+) -> Result<usize, SearchError> {
+    next_start_candidate_inner(scanner, haystack, position, end, guard, meter, Some(cursor))
+}
+
+fn next_start_candidate_inner(
+    scanner: &StartPositionScanner,
+    haystack: &[u8],
+    position: usize,
+    end: usize,
+    guard: Option<&StartPositionClass>,
+    meter: &mut WorkMeter,
+    mut cursor: Option<&mut RetainedStartMaskCursor>,
+) -> Result<usize, SearchError> {
     let mut search = position;
     let scanner_offset = usize::from(scanner.offset);
     loop {
@@ -5644,11 +5835,23 @@ fn next_start_candidate(
                     computation: "start-filter scanner position",
                 })?;
         if scan_start >= end {
+            if let Some(cursor) = cursor.as_deref_mut() {
+                cursor.clear();
+            }
             return Ok(end);
         }
-        let scan_position =
-            next_scanner_candidate(&scanner.scanner, haystack, scan_start, end, meter)?;
+        let scan_position = next_scanner_candidate(
+            &scanner.scanner,
+            haystack,
+            scan_start,
+            end,
+            meter,
+            cursor.as_deref_mut(),
+        )?;
         if scan_position == end {
+            if let Some(cursor) = cursor.as_deref_mut() {
+                cursor.clear();
+            }
             return Ok(end);
         }
         let candidate =
@@ -5667,6 +5870,9 @@ fn next_start_candidate(
         )?;
         meter.charge(1, candidate)?;
         if guard_position >= end {
+            if let Some(cursor) = cursor.as_deref_mut() {
+                cursor.clear();
+            }
             return Ok(end);
         }
         if guard.set.contains(haystack[guard_position]) {
@@ -5686,6 +5892,7 @@ fn next_scanner_candidate(
     position: usize,
     end: usize,
     meter: &mut WorkMeter,
+    cursor: Option<&mut RetainedStartMaskCursor>,
 ) -> Result<usize, SearchError> {
     match scanner {
         StartScanner::Empty => Ok(end),
@@ -5707,12 +5914,17 @@ fn next_scanner_candidate(
         StartScanner::Range {
             start,
             end: range_end,
-        } => next_range_start_candidate(*start, *range_end, haystack, position, end, meter),
-        StartScanner::AsciiSet { classifier, .. } => {
-            next_ascii_start_candidate(classifier.classifier(), haystack, position, end, meter)
-        }
+        } => next_range_start_candidate(*start, *range_end, haystack, position, end, meter, cursor),
+        StartScanner::AsciiSet { classifier, .. } => next_ascii_start_candidate(
+            classifier.classifier(),
+            haystack,
+            position,
+            end,
+            meter,
+            cursor,
+        ),
         StartScanner::Set(classifier) => {
-            next_set_start_candidate(classifier, haystack, position, end, meter)
+            next_set_start_candidate(classifier, haystack, position, end, meter, cursor)
         }
     }
 }
@@ -5780,9 +5992,18 @@ fn next_range_start_candidate(
     mut position: usize,
     end: usize,
     meter: &mut WorkMeter,
+    mut cursor: Option<&mut RetainedStartMaskCursor>,
 ) -> Result<usize, SearchError> {
     debug_assert!(start <= range_end);
     let width = range_end.wrapping_sub(start);
+
+    if let Some(cursor) = cursor.as_deref_mut() {
+        match cursor.take(position, end)? {
+            RetainedStartCandidate::Unavailable => {}
+            RetainedStartCandidate::Candidate(candidate) => return Ok(candidate),
+            RetainedStartCandidate::ResumeAt(resume) => position = resume,
+        }
+    }
 
     // Nearby candidates are cheaper as direct comparisons, and a guard that
     // rejects one candidate can re-enter at the following byte without
@@ -5826,6 +6047,14 @@ fn next_range_start_candidate(
         let members =
             classify_byte_delta_16(start, range_end.wrapping_sub(start), block).member_mask();
         if members != 0 {
+            if let Some(cursor) = cursor.as_deref_mut() {
+                return cursor.retain_complete_block(
+                    position,
+                    BYTE_SET_BLOCK_BYTES,
+                    u64::from(members),
+                    end,
+                );
+            }
             let offset = usize::try_from(members.trailing_zeros())
                 .expect("a start-range lane fits in usize");
             return position
@@ -5850,12 +6079,20 @@ fn next_set_start_candidate(
     mut position: usize,
     end: usize,
     meter: &mut WorkMeter,
+    mut cursor: Option<&mut RetainedStartMaskCursor>,
 ) -> Result<usize, SearchError> {
     // A table classifier has a higher fixed cost than one bitmap lookup. Keep
     // the first complete classifier-width block scalar so short searches and
     // repeated nearby candidates retain the low-latency path; vector work is
     // reserved for the long no-candidate spans that can amortize it.
     let set = classifier.set();
+    if let Some(cursor) = cursor.as_deref_mut() {
+        match cursor.take(position, end)? {
+            RetainedStartCandidate::Unavailable => {}
+            RetainedStartCandidate::Candidate(candidate) => return Ok(candidate),
+            RetainedStartCandidate::ResumeAt(resume) => position = resume,
+        }
+    }
     let scalar_prefix_end = position.saturating_add(BYTE_SET_BLOCK_BYTES).min(end);
     let prefix_candidate = next_small_start_candidate(
         haystack,
@@ -5891,6 +6128,14 @@ fn next_set_start_candidate(
             .expect("checked full-byte classifier extent");
         let members = classifier.classifier().classify_16(block).member_mask();
         if members != 0 {
+            if let Some(cursor) = cursor.as_deref_mut() {
+                return cursor.retain_complete_block(
+                    position,
+                    BYTE_SET_BLOCK_BYTES,
+                    u64::from(members),
+                    end,
+                );
+            }
             let offset = usize::try_from(members.trailing_zeros())
                 .expect("a classified full-byte lane fits in usize");
             return position
@@ -5913,7 +6158,15 @@ fn next_ascii_start_candidate(
     mut position: usize,
     end: usize,
     meter: &mut WorkMeter,
+    mut cursor: Option<&mut RetainedStartMaskCursor>,
 ) -> Result<usize, SearchError> {
+    if let Some(cursor) = cursor.as_deref_mut() {
+        match cursor.take(position, end)? {
+            RetainedStartCandidate::Unavailable => {}
+            RetainedStartCandidate::Candidate(candidate) => return Ok(candidate),
+            RetainedStartCandidate::ResumeAt(resume) => position = resume,
+        }
+    }
     while end.saturating_sub(position) >= ASCII_WIDE_BYTES
         && meter.remaining() >= u64::try_from(ASCII_WIDE_BYTES).expect("classifier width fits u64")
     {
@@ -5931,6 +6184,14 @@ fn next_ascii_start_candidate(
             .expect("checked wide classifier extent");
         let members = classifier.classify_32(block).member_mask();
         if members != 0 {
+            if let Some(cursor) = cursor.as_deref_mut() {
+                return cursor.retain_complete_block(
+                    position,
+                    ASCII_WIDE_BYTES,
+                    u64::from(members),
+                    end,
+                );
+            }
             let offset =
                 usize::try_from(members.trailing_zeros()).expect("wide classifier lane fits usize");
             return position
@@ -5959,6 +6220,14 @@ fn next_ascii_start_candidate(
             .expect("checked narrow classifier extent");
         let members = classifier.classify_16(block).member_mask();
         if members != 0 {
+            if let Some(cursor) = cursor {
+                return cursor.retain_complete_block(
+                    position,
+                    ASCII_NARROW_BYTES,
+                    u64::from(members),
+                    end,
+                );
+            }
             let offset = usize::try_from(members.trailing_zeros())
                 .expect("narrow classifier lane fits usize");
             return position
@@ -7848,6 +8117,85 @@ mod tests {
         .unwrap()
     }
 
+    fn byte_class_then_range(
+        bytes: &[u8],
+        suffix: (u8, u8),
+        assertion: Option<EdgeKind>,
+    ) -> Automaton {
+        assert!(!bytes.is_empty());
+        assert!(suffix.0 <= suffix.1);
+        let class_edges = u32::try_from(bytes.len()).expect("test byte class fits u32");
+        let class_edges_plus_one = class_edges.checked_add(1).unwrap();
+        let class_edges_plus_two = class_edges.checked_add(2).unwrap();
+        let (start, roles, edge_offsets, root_target, suffix_target) = if assertion.is_some() {
+            (
+                0,
+                vec![
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                vec![
+                    0,
+                    1,
+                    class_edges_plus_one,
+                    class_edges_plus_two,
+                    class_edges_plus_two,
+                ],
+                2,
+                3,
+            )
+        } else {
+            (
+                0,
+                vec![StateRole::Consume, StateRole::Consume, StateRole::Accept],
+                vec![0, class_edges, class_edges_plus_one, class_edges_plus_one],
+                1,
+                2,
+            )
+        };
+        let capacity = bytes
+            .len()
+            .checked_add(usize::from(assertion.is_some()))
+            .and_then(|value| value.checked_add(1))
+            .unwrap();
+        let mut edge_targets = Vec::with_capacity(capacity);
+        let mut edge_kinds = Vec::with_capacity(edge_targets.capacity());
+        let mut byte_starts = Vec::with_capacity(edge_targets.capacity());
+        let mut byte_ends = Vec::with_capacity(edge_targets.capacity());
+        if let Some(assertion) = assertion {
+            edge_targets.push(1);
+            edge_kinds.push(assertion);
+            byte_starts.push(0);
+            byte_ends.push(0);
+        }
+        for &byte in bytes {
+            edge_targets.push(root_target);
+            edge_kinds.push(EdgeKind::ByteRange);
+            byte_starts.push(byte);
+            byte_ends.push(byte);
+        }
+        edge_targets.push(suffix_target);
+        edge_kinds.push(EdgeKind::ByteRange);
+        byte_starts.push(suffix.0);
+        byte_ends.push(suffix.1);
+
+        Automaton::from_raw(
+            RawPlan {
+                start,
+                roles,
+                edge_offsets,
+                edge_targets,
+                edge_kinds,
+                byte_starts,
+                byte_ends,
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
     fn zero_edge_consume() -> Automaton {
         Automaton::from_raw(
             RawPlan {
@@ -9438,6 +9786,52 @@ mod tests {
         super::byte_start_scanner(set, &mut meter, 0).unwrap()
     }
 
+    fn scanner_contains(scanner: &StartScanner, byte: u8) -> bool {
+        match scanner {
+            StartScanner::Empty => false,
+            StartScanner::One(member) => byte == *member,
+            StartScanner::Two(first, second) => byte == *first || byte == *second,
+            StartScanner::Three(first, second, third) => {
+                byte == *first || byte == *second || byte == *third
+            }
+            StartScanner::Range { start, end } => (*start..=*end).contains(&byte),
+            StartScanner::AsciiSet { set, .. } => set.contains(byte),
+            StartScanner::Set(classifier) => classifier.set().contains(byte),
+        }
+    }
+
+    fn retained_candidate_sequence(
+        scanner: &StartPositionScanner,
+        guard: Option<&StartPositionClass>,
+        haystack: &[u8],
+        start: usize,
+        end: usize,
+    ) -> (Vec<usize>, u64) {
+        let mut cursor = super::RetainedStartMaskCursor::default();
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        let mut search = start;
+        let mut candidates = Vec::new();
+        loop {
+            let candidate = super::next_start_candidate_retained(
+                scanner,
+                haystack,
+                search,
+                end,
+                guard,
+                &mut meter,
+                &mut cursor,
+            )
+            .unwrap();
+            if candidate == end {
+                break;
+            }
+            assert!(candidate >= search);
+            candidates.push(candidate);
+            search = candidate.checked_add(1).unwrap();
+        }
+        (candidates, meter.consumed)
+    }
+
     const fn positioned_scanner(offset: u8, scanner: StartScanner) -> StartPositionScanner {
         StartPositionScanner { offset, scanner }
     }
@@ -10638,6 +11032,711 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn retained_start_masks_match_scalar_sequences_for_all_eligible_scanners_and_windows() {
+        let cases: [(&str, StartScanner, &[u8]); 3] = [
+            (
+                "range",
+                scanner_for_set(byte_range_set(0x20, 0x7f)),
+                &[0x20, 0x41, 0x7f],
+            ),
+            (
+                "ascii-set",
+                scanner_for_set(byte_set(b"aceg")),
+                b"aceg",
+            ),
+            (
+                "full-set",
+                scanner_for_set(byte_set(&[0x80, 0x82, 0xfe, 0xff])),
+                &[0x80, 0x82, 0xfe, 0xff],
+            ),
+        ];
+        assert!(matches!(cases[0].1, StartScanner::Range { .. }));
+        assert!(matches!(cases[1].1, StartScanner::AsciiSet { .. }));
+        assert!(matches!(cases[2].1, StartScanner::Set(_)));
+
+        for (name, scanner, members) in cases {
+            let nonmember = (0_u8..=u8::MAX)
+                .find(|&byte| !scanner_contains(&scanner, byte))
+                .unwrap();
+            let mut haystack = vec![nonmember; 70];
+            for (position, byte) in haystack.iter_mut().enumerate() {
+                if position % 5 != 1 {
+                    *byte = members[position % members.len()];
+                }
+            }
+            let scanner = positioned_scanner(3, scanner);
+            let accepting = StartPositionClass {
+                offset: 0,
+                set: byte_set(&[members[0], members[members.len() - 1]]),
+            };
+            let rejecting = StartPositionClass {
+                offset: 0,
+                set: byte_set(&[nonmember.wrapping_add(1)]),
+            };
+
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    for guard in [None, Some(&accepting), Some(&rejecting)] {
+                        let expected = (start..end)
+                            .filter(|&candidate| {
+                                let Some(scan_position) = candidate.checked_add(3) else {
+                                    return false;
+                                };
+                                if scan_position >= end
+                                    || !scanner_contains(&scanner.scanner, haystack[scan_position])
+                                {
+                                    return false;
+                                }
+                                guard.is_none_or(|guard| {
+                                    let guard_position =
+                                        candidate.checked_add(usize::from(guard.offset)).unwrap();
+                                    guard_position < end
+                                        && guard.set.contains(haystack[guard_position])
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        let (actual, _) =
+                            retained_candidate_sequence(&scanner, guard, &haystack, start, end);
+                        assert_eq!(
+                            actual, expected,
+                            "{name} retained sequence disagreed for {start}..{end} guard={guard:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one accounting matrix covers each eligible classifier and every uncached edge"
+    )]
+    fn retained_start_masks_charge_complete_blocks_once_and_keep_scalar_edges_uncached() {
+        let ascii = root_scanner(scanner_for_set(byte_set(b"aceg")));
+        assert!(matches!(&ascii.scanner, StartScanner::AsciiSet { .. }));
+        let dense = [b'a'; ASCII_WIDE_BYTES];
+
+        let mut legacy = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            super::next_start_candidate(&ascii, &dense, 0, dense.len(), None, &mut legacy).unwrap(),
+            0
+        );
+        assert_eq!(legacy.consumed, u64::try_from(ASCII_WIDE_BYTES).unwrap());
+
+        let mut cursor = super::RetainedStartMaskCursor::default();
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        let mut previous_work = 0;
+        for position in 0..dense.len() {
+            assert_eq!(
+                super::next_start_candidate_retained(
+                    &ascii,
+                    &dense,
+                    position,
+                    dense.len(),
+                    None,
+                    &mut meter,
+                    &mut cursor,
+                )
+                .unwrap(),
+                position
+            );
+            assert!(meter.consumed >= previous_work);
+            assert_eq!(meter.consumed, u64::try_from(ASCII_WIDE_BYTES).unwrap());
+            previous_work = meter.consumed;
+        }
+        assert_eq!(
+            super::next_start_candidate_retained(
+                &ascii,
+                &dense,
+                dense.len(),
+                dense.len(),
+                None,
+                &mut meter,
+                &mut cursor,
+            )
+            .unwrap(),
+            dense.len()
+        );
+        assert_eq!(cursor, super::RetainedStartMaskCursor::default());
+
+        for (name, scanner) in [
+            (
+                "range",
+                root_scanner(scanner_for_set(byte_range_set(0x20, 0x7f))),
+            ),
+            (
+                "full-set",
+                root_scanner(scanner_for_set(byte_set(&[0x80, 0x82, 0xfe, 0xff]))),
+            ),
+        ] {
+            let member = if name == "range" { 0x41 } else { 0x82 };
+            let nonmember = if name == "range" { 0xff } else { 0x00 };
+
+            let mut classified = vec![nonmember; BYTE_SET_BLOCK_BYTES * 2];
+            classified[BYTE_SET_BLOCK_BYTES..].fill(member);
+            let mut classified_cursor = super::RetainedStartMaskCursor::default();
+            let mut classified_meter = WorkMeter::new(u64::MAX, 0);
+            assert_eq!(
+                super::next_start_candidate_retained(
+                    &scanner,
+                    &classified,
+                    0,
+                    classified.len(),
+                    None,
+                    &mut classified_meter,
+                    &mut classified_cursor,
+                )
+                .unwrap(),
+                BYTE_SET_BLOCK_BYTES,
+                "{name} first classified member"
+            );
+            assert_eq!(
+                classified_meter.consumed,
+                u64::try_from(BYTE_SET_BLOCK_BYTES * 2).unwrap()
+            );
+            assert_eq!(
+                usize::from(classified_cursor.width),
+                BYTE_SET_BLOCK_BYTES,
+                "{name} complete classifier width"
+            );
+            let before = classified_meter.consumed;
+            assert_eq!(
+                super::next_start_candidate_retained(
+                    &scanner,
+                    &classified,
+                    BYTE_SET_BLOCK_BYTES + 1,
+                    classified.len(),
+                    None,
+                    &mut classified_meter,
+                    &mut classified_cursor,
+                )
+                .unwrap(),
+                BYTE_SET_BLOCK_BYTES + 1
+            );
+            assert_eq!(classified_meter.consumed, before);
+
+            let mut incomplete = vec![nonmember; BYTE_SET_BLOCK_BYTES * 2 - 1];
+            *incomplete.last_mut().unwrap() = member;
+            let mut incomplete_cursor = super::RetainedStartMaskCursor::default();
+            let mut incomplete_meter = WorkMeter::new(u64::MAX, 0);
+            assert_eq!(
+                super::next_start_candidate_retained(
+                    &scanner,
+                    &incomplete,
+                    0,
+                    incomplete.len(),
+                    None,
+                    &mut incomplete_meter,
+                    &mut incomplete_cursor,
+                )
+                .unwrap(),
+                incomplete.len() - 1
+            );
+            assert_eq!(
+                incomplete_cursor,
+                super::RetainedStartMaskCursor::default(),
+                "{name} scalar tail must not be retained"
+            );
+        }
+
+        for length in [15_usize, 16, 17, 31, 32, 33] {
+            let source = vec![b'a'; length];
+            let mut cursor = super::RetainedStartMaskCursor::default();
+            let mut meter = WorkMeter::new(u64::MAX, 0);
+            let _ = super::next_start_candidate_retained(
+                &ascii,
+                &source,
+                0,
+                length,
+                None,
+                &mut meter,
+                &mut cursor,
+            )
+            .unwrap();
+            assert_eq!(
+                usize::from(cursor.width),
+                if length >= ASCII_WIDE_BYTES {
+                    ASCII_WIDE_BYTES
+                } else if length >= ASCII_NARROW_BYTES {
+                    ASCII_NARROW_BYTES
+                } else {
+                    0
+                },
+                "ASCII retained width at length {length}"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one exact-limit transaction covers classification and guard rejection together"
+    )]
+    fn retained_start_mask_classification_and_guard_limits_are_exact() {
+        let scanner = root_scanner(scanner_for_set(byte_set(b"aceg")));
+        let mut last_lane = [0x80; ASCII_WIDE_BYTES];
+        last_lane[ASCII_WIDE_BYTES - 1] = b'a';
+
+        let exact_work = u64::try_from(ASCII_WIDE_BYTES).unwrap();
+        let mut exact_cursor = super::RetainedStartMaskCursor::default();
+        let mut exact = WorkMeter::new(exact_work, 0);
+        assert_eq!(
+            super::next_start_candidate_retained(
+                &scanner,
+                &last_lane,
+                0,
+                last_lane.len(),
+                None,
+                &mut exact,
+                &mut exact_cursor,
+            )
+            .unwrap(),
+            last_lane.len() - 1
+        );
+        assert_eq!(exact.consumed, exact_work);
+
+        let mut refused_cursor = super::RetainedStartMaskCursor::default();
+        let mut refused = WorkMeter::new(exact_work - 1, 0);
+        assert!(matches!(
+            super::next_start_candidate_retained(
+                &scanner,
+                &last_lane,
+                0,
+                last_lane.len(),
+                None,
+                &mut refused,
+                &mut refused_cursor,
+            ),
+            Err(SearchError::WorkLimitExceeded {
+                limit,
+                consumed,
+                requested: 1,
+                position,
+            }) if limit == exact_work - 1
+                && consumed == exact_work - 1
+                && position == ASCII_WIDE_BYTES - 1
+        ));
+
+        let dense = [b'a'; ASCII_WIDE_BYTES];
+        let accepting_first_guard = StartPositionClass {
+            offset: 1,
+            set: byte_set(b"a"),
+        };
+        let mut accepting_first_cursor = super::RetainedStartMaskCursor::default();
+        let mut accepting_first = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            super::next_start_candidate_retained(
+                &scanner,
+                &dense,
+                0,
+                dense.len(),
+                Some(&accepting_first_guard),
+                &mut accepting_first,
+                &mut accepting_first_cursor,
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(accepting_first.consumed, exact_work.checked_add(1).unwrap());
+
+        let rejecting_guard = StartPositionClass {
+            offset: 1,
+            set: byte_set(b"z"),
+        };
+        let guarded_work = exact_work.checked_mul(2).unwrap();
+        let mut guarded_cursor = super::RetainedStartMaskCursor::default();
+        let mut guarded = WorkMeter::new(guarded_work, 0);
+        assert_eq!(
+            super::next_start_candidate_retained(
+                &scanner,
+                &dense,
+                0,
+                dense.len(),
+                Some(&rejecting_guard),
+                &mut guarded,
+                &mut guarded_cursor,
+            )
+            .unwrap(),
+            dense.len()
+        );
+        assert_eq!(guarded.consumed, guarded_work);
+
+        let mut guarded_refused_cursor = super::RetainedStartMaskCursor::default();
+        let mut guarded_refused = WorkMeter::new(guarded_work - 1, 0);
+        assert!(matches!(
+            super::next_start_candidate_retained(
+                &scanner,
+                &dense,
+                0,
+                dense.len(),
+                Some(&rejecting_guard),
+                &mut guarded_refused,
+                &mut guarded_refused_cursor,
+            ),
+            Err(SearchError::WorkLimitExceeded {
+                limit,
+                consumed,
+                requested: 1,
+                position,
+            }) if limit == guarded_work - 1
+                && consumed == guarded_work - 1
+                && position == ASCII_WIDE_BYTES - 1
+        ));
+
+        let mut accepts_after_three = dense;
+        accepts_after_three[4] = b'z';
+        let accepting_guard = StartPositionClass {
+            offset: 1,
+            set: byte_set(b"z"),
+        };
+        let mut accepting_cursor = super::RetainedStartMaskCursor::default();
+        let mut accepting = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            super::next_start_candidate_retained(
+                &scanner,
+                &accepts_after_three,
+                0,
+                accepts_after_three.len(),
+                Some(&accepting_guard),
+                &mut accepting,
+                &mut accepting_cursor,
+            )
+            .unwrap(),
+            3
+        );
+        assert_eq!(accepting.consumed, exact_work + 4);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one route differential keeps every cursor-owning K0 loop on the same boundary matrix"
+    )]
+    fn retained_start_masks_match_unfiltered_k0_across_loops_contracts_sessions_and_calls() {
+        let range = (0x20_u8..=0x7f).collect::<Vec<_>>();
+        let cases: [(&str, Vec<u8>, u8, Option<EdgeKind>); 4] = [
+            ("range", range, 0x60, None),
+            ("ascii-set", b"aceg".to_vec(), b'a', None),
+            ("full-set", vec![0x80, 0x82, 0xfe, 0xff], 0x80, None),
+            (
+                "context-ascii-set",
+                b"aceg".to_vec(),
+                b'a',
+                Some(EdgeKind::AssertLineStartLf),
+            ),
+        ];
+
+        for (name, bytes, root_member, assertion) in cases {
+            let specialized = byte_class_then_range(&bytes, (0, 64), assertion);
+            let reference = byte_class_then_range(&bytes, (0, 64), assertion);
+            pin_without_start_filter(&reference);
+            let mut reference_workspace =
+                K0Workspace::new(&reference, WorkspaceLimits::unlimited()).unwrap();
+            let mut filtered =
+                K0Workspace::new(&specialized, WorkspaceLimits::unlimited()).unwrap();
+            let mut endpoint =
+                K0Workspace::new_accelerated(&specialized, WorkspaceLimits::unlimited()).unwrap();
+            let mut full =
+                K0Workspace::new_bidirectional(&specialized, WorkspaceLimits::unlimited()).unwrap();
+            let filtered_bytes = filtered.retained_bytes();
+            let endpoint_bytes = endpoint.retained_bytes();
+            let full_bytes = full.retained_bytes();
+
+            let mut sources = Vec::new();
+            for length in [15_usize, 16, 17, 31, 32, 33, 65] {
+                let mut source = vec![0xff; length];
+                if assertion.is_some() {
+                    for chunk in (0..length).step_by(3) {
+                        source[chunk] = b'\n';
+                        if chunk + 1 < length {
+                            source[chunk + 1] = root_member;
+                        }
+                    }
+                    if length >= 3 {
+                        let chunk = ((length - 3) / 3) * 3;
+                        source[chunk] = b'\n';
+                        source[chunk + 1] = root_member;
+                        source[chunk + 2] = 0x20;
+                    }
+                } else {
+                    for position in (0..length).step_by(2) {
+                        source[position] = root_member;
+                    }
+                    if length >= 2 {
+                        let candidate = ((length / 2).min(length - 2)) & !1;
+                        source[candidate] = root_member;
+                        source[candidate + 1] = 0x20;
+                    }
+                }
+                sources.push(source);
+            }
+
+            for source in &sources {
+                let mut points = vec![0, source.len()];
+                points.extend(
+                    [1_usize, 2, 14, 15, 16, 17, 30, 31, 32, 33, 64]
+                        .into_iter()
+                        .filter(|&point| point <= source.len()),
+                );
+                points.sort_unstable();
+                points.dedup();
+
+                for (start_index, &start) in points.iter().enumerate() {
+                    for &end in &points[start_index..] {
+                        let window = SearchWindow::new(start, end);
+                        macro_rules! compare_contract {
+                            ($contract:ty) => {{
+                                let expected = reference
+                                    .prepare::<$contract>()
+                                    .search_window_with_workspace(
+                                        source,
+                                        window,
+                                        &mut reference_workspace,
+                                        SearchLimits::unlimited(),
+                                    )
+                                    .unwrap()
+                                    .into_output();
+                                let filtered_output = specialized
+                                    .prepare::<$contract>()
+                                    .search_window_with_workspace(
+                                        source,
+                                        window,
+                                        &mut filtered,
+                                        SearchLimits::unlimited(),
+                                    )
+                                    .unwrap()
+                                    .into_output();
+                                let endpoint_output = specialized
+                                    .prepare::<$contract>()
+                                    .search_window_with_workspace(
+                                        source,
+                                        window,
+                                        &mut endpoint,
+                                        SearchLimits::unlimited(),
+                                    )
+                                    .unwrap()
+                                    .into_output();
+                                let full_output = specialized
+                                    .prepare::<$contract>()
+                                    .search_window_with_workspace(
+                                        source,
+                                        window,
+                                        &mut full,
+                                        SearchLimits::unlimited(),
+                                    )
+                                    .unwrap()
+                                    .into_output();
+                                assert_eq!(
+                                    filtered_output,
+                                    expected,
+                                    "{name} filtered {} source={source:?} window={window:?}",
+                                    stringify!($contract)
+                                );
+                                assert_eq!(
+                                    endpoint_output,
+                                    expected,
+                                    "{name} endpoint {} source={source:?} window={window:?}",
+                                    stringify!($contract)
+                                );
+                                assert_eq!(
+                                    full_output,
+                                    expected,
+                                    "{name} full {} source={source:?} window={window:?}",
+                                    stringify!($contract)
+                                );
+                            }};
+                        }
+                        compare_contract!(Exists);
+                        compare_contract!(EarliestEnd);
+                        compare_contract!(SelectedEnd);
+                        compare_contract!(Span);
+                    }
+                }
+
+                macro_rules! compare_direct {
+                    ($contract:ty) => {{
+                        let expected = reference
+                            .prepare::<$contract>()
+                            .search_with_workspace(
+                                source,
+                                &mut reference_workspace,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap()
+                            .into_output();
+                        let actual = specialized
+                            .prepare::<$contract>()
+                            .search(source, SearchLimits::unlimited())
+                            .unwrap()
+                            .into_output();
+                        assert_eq!(
+                            actual,
+                            expected,
+                            "{name} direct {} source={source:?}",
+                            stringify!($contract)
+                        );
+                    }};
+                }
+                compare_direct!(Exists);
+                compare_direct!(EarliestEnd);
+                compare_direct!(SelectedEnd);
+                compare_direct!(Span);
+            }
+
+            assert_eq!(filtered.retained_bytes(), filtered_bytes);
+            assert_eq!(endpoint.retained_bytes(), endpoint_bytes);
+            assert_eq!(full.retained_bytes(), full_bytes);
+            let proof = specialized
+                .start_filter_proof
+                .get()
+                .expect("route differential publishes its start proof");
+            match name {
+                "range" => assert!(matches!(
+                    proof.scanner,
+                    Some(StartPositionScanner {
+                        offset: 1,
+                        scanner: StartScanner::Range { .. },
+                    })
+                )),
+                "ascii-set" | "context-ascii-set" => assert!(matches!(
+                    proof.scanner,
+                    Some(StartPositionScanner {
+                        offset: 0,
+                        scanner: StartScanner::AsciiSet { .. },
+                    })
+                )),
+                "full-set" => assert!(matches!(
+                    proof.scanner,
+                    Some(StartPositionScanner {
+                        offset: 0,
+                        scanner: StartScanner::Set(_),
+                    })
+                )),
+                _ => unreachable!(),
+            }
+
+            let source = sources.last().unwrap();
+            let mut session = K0SearchSession::new_selected(
+                &specialized,
+                WorkspaceLimits::unlimited(),
+                true,
+                true,
+            )
+            .unwrap();
+            assert!(session.root_run.is_none(), "{name} must use ordinary K0");
+            let retained = session.construction_accounting().retained_bytes();
+            let expected = reference
+                .prepare::<Span>()
+                .search_with_workspace(source, &mut reference_workspace, SearchLimits::unlimited())
+                .unwrap()
+                .into_output();
+            let first = session
+                .search::<Span>(source, SearchLimits::unlimited())
+                .unwrap();
+            let warm = session
+                .search::<Span>(source, SearchLimits::unlimited())
+                .unwrap();
+            let repeated = session
+                .search::<Span>(source, SearchLimits::unlimited())
+                .unwrap();
+            assert_eq!(first.output(), &expected, "{name} first session call");
+            assert_eq!(warm.output(), &expected, "{name} warm session call");
+            assert_eq!(repeated.output(), &expected, "{name} repeated session call");
+            assert_eq!(warm.accounting().work(), repeated.accounting().work());
+            assert_eq!(warm.accounting().scratch_bytes(), retained);
+            assert_eq!(repeated.accounting().scratch_bytes(), retained);
+
+            let other = &sources[sources.len() - 2];
+            let other_expected = reference
+                .prepare::<Span>()
+                .search_with_workspace(other, &mut reference_workspace, SearchLimits::unlimited())
+                .unwrap()
+                .into_output();
+            assert_eq!(
+                session
+                    .search::<Span>(other, SearchLimits::unlimited())
+                    .unwrap()
+                    .into_output(),
+                other_expected,
+                "{name} changed-source session call"
+            );
+            assert_eq!(
+                session
+                    .search::<Span>(source, SearchLimits::unlimited())
+                    .unwrap()
+                    .into_output(),
+                expected,
+                "{name} cursor must not survive a changed-source call"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_start_mask_dfa_restart_work_is_exact_and_call_local() {
+        let plan = byte_class_then_range(b"aceg", (0, 64), None);
+        let mut workspace = K0Workspace::new(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let retained = workspace.retained_bytes();
+        let mut haystack = [0xff; 65];
+        for position in (0..haystack.len()).step_by(2) {
+            haystack[position] = b'a';
+        }
+        haystack[62] = b'a';
+        haystack[63] = 0x20;
+
+        let _ = plan
+            .prepare::<Span>()
+            .search_with_workspace(&haystack, &mut workspace, SearchLimits::unlimited())
+            .unwrap();
+        let measured = plan
+            .prepare::<Span>()
+            .search_with_workspace(&haystack, &mut workspace, SearchLimits::unlimited())
+            .unwrap();
+        let work = measured.accounting().work();
+        let expected = *measured.output();
+        assert_eq!(expected, Some(MatchSpan::new(62, 64)));
+
+        let exact = SearchLimits {
+            max_work: work,
+            max_scratch_bytes: retained,
+        };
+        assert_eq!(
+            plan.prepare::<Span>()
+                .search_with_workspace(&haystack, &mut workspace, exact)
+                .unwrap()
+                .into_output(),
+            expected
+        );
+        assert!(matches!(
+            plan.prepare::<Span>().search_with_workspace(
+                &haystack,
+                &mut workspace,
+                SearchLimits {
+                    max_work: work - 1,
+                    max_scratch_bytes: retained,
+                },
+            ),
+            Err(SearchError::WorkLimitExceeded { limit, .. }) if limit == work - 1
+        ));
+        assert_eq!(workspace.retained_bytes(), retained);
+        assert_eq!(
+            plan.prepare::<Span>()
+                .search_with_workspace(b"\xff\xffa\x20", &mut workspace, SearchLimits::unlimited(),)
+                .unwrap()
+                .into_output(),
+            Some(MatchSpan::new(2, 4))
+        );
+        assert_eq!(
+            plan.prepare::<Span>()
+                .search_with_workspace(&haystack, &mut workspace, SearchLimits::unlimited(),)
+                .unwrap()
+                .into_output(),
+            expected,
+            "a failed limit and changed source must not retain an invocation cursor"
+        );
     }
 
     #[test]
