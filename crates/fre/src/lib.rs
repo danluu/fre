@@ -35,6 +35,7 @@ mod aggregate_many;
 mod anchored_line_capture;
 mod anchored_word_capture;
 mod blocking_delimiter;
+mod bounded_byte_class_repeat;
 mod bounded_literal_pair;
 mod bounded_word_class;
 mod capture_absolute_full;
@@ -2875,11 +2876,88 @@ impl PortableBuilder {
                 });
             }
         }
+        let mut bounded_byte_class_repeat_work = pure_byte_class_repeat_work;
+        if self.selection == PlanSelection::Auto && self.pure_byte_class_repeat_allowed {
+            let inspection = bounded_byte_class_repeat::inspect(
+                &rust.hir,
+                pure_byte_class_repeat_work,
+                self.limits.max_planner_work,
+            )
+            .map_err(|error| match error {
+                bounded_byte_class_repeat::InspectionError::WorkLimit { needed, limit } => {
+                    BuildError::PlannerWorkLimit { needed, limit }
+                }
+                bounded_byte_class_repeat::InspectionError::ArithmeticOverflow => {
+                    BuildError::InternalInvariant(
+                        "bounded byte-class repeat planner arithmetic overflow",
+                    )
+                }
+            })?;
+            bounded_byte_class_repeat_work = inspection.planner_work();
+            if let bounded_byte_class_repeat::InspectionOutcome::Eligible(inspection) = inspection {
+                let plan_storage_bytes = bounded_byte_class_repeat::Plan::storage_bytes();
+                let charged_persistent_bytes = source_storage_bytes
+                    .checked_add(capture_name_storage_bytes)
+                    .and_then(|bytes| bytes.checked_add(plan_storage_bytes))
+                    .ok_or(BuildError::PersistentBytesOverflow)?;
+                if charged_persistent_bytes > self.limits.max_persistent_bytes {
+                    return Err(BuildError::PersistentBytesLimit {
+                        needed: charged_persistent_bytes,
+                        limit: self.limits.max_persistent_bytes,
+                    });
+                }
+                let plan = inspection
+                    .build(SimdDispatchContext::capture())
+                    .map_err(|error| match error {
+                        fre_exact_alloc::CopyError::LayoutOverflow => {
+                            BuildError::InternalInvariant(
+                                "bounded byte-class repeat owner layout overflowed",
+                            )
+                        }
+                        fre_exact_alloc::CopyError::AllocationFailed => {
+                            BuildError::AllocationFailed {
+                                structure: "bounded byte-class repeat owner",
+                                additional: 1,
+                            }
+                        }
+                    })?;
+                return Ok(PortableRegex {
+                    source,
+                    capture_names,
+                    line_total_grep_plan,
+                    plan: PortablePlan::BoundedByteClassRepeat(plan),
+                    profile: profile.clone(),
+                    limits: self.limits,
+                    selection: self.selection,
+                    report: BuildReport {
+                        profile: profile.clone(),
+                        admission,
+                        syntax,
+                        plan: PlanKind::PureByteClassRepeat,
+                        planner_work: bounded_byte_class_repeat_work,
+                        lowering: None,
+                        states: 0,
+                        edges: 0,
+                        plan_storage_bytes,
+                        source_storage_bytes,
+                        capture_name_storage_bytes,
+                        charged_persistent_bytes,
+                        persistent_byte_limit: self.limits.max_persistent_bytes,
+                        captures_len,
+                        static_captures_len,
+                        minimum_match_bytes,
+                        required_literal: None,
+                        literal_class_run_literal: None,
+                        forward_anchored: None,
+                    },
+                });
+            }
+        }
         let (finite_words, mut finite_work) = finite::extract(
             &rust.hir,
             self.limits.literal_set.max_patterns,
             self.limits.literal_set.max_pattern_bytes,
-            pure_byte_class_repeat_work,
+            bounded_byte_class_repeat_work,
             self.limits.max_planner_work,
             false,
             finite::GuardedFiniteBuildLimits::unlimited(),
@@ -3376,6 +3454,9 @@ enum PortablePlan {
     UnicodeWordRun(unicode_word_run::Plan),
     AsciiWordRun(unicode_word_run::AsciiPlan),
     BoundedWordClass(bounded_word_class::Plan),
+    // Append new runtime classes so existing implicit discriminants, including
+    // K0's, remain unchanged for code-layout containment.
+    BoundedByteClassRepeat(bounded_byte_class_repeat::Plan),
 }
 
 impl PortablePlan {
@@ -3391,6 +3472,7 @@ impl PortablePlan {
             Self::LiteralClassRunLiteral(_) => fre_kernels::LITERAL_CLASS_RUN_LITERAL_PLAN_ID,
             Self::LiteralClassRunSearch(plan) => plan.plan_id(),
             Self::PureByteClassRepeat(_) => pure_byte_class_repeat::PLAN_ID,
+            Self::BoundedByteClassRepeat(_) => bounded_byte_class_repeat::PLAN_ID,
             Self::ForwardAnchored(forward) => forward.plan_id(),
             Self::DispatchedForwardAnchored(forward) => forward.plan_id(),
             Self::ForwardEndFixed(fixed) => fixed.plan_id(),
@@ -3849,6 +3931,10 @@ impl PortableRegex {
                 let (matched, accounting) = plan.is_match_window(haystack, window, limits)?;
                 Ok((matched, SearchAccounting::PureByteClassRepeat(accounting)))
             }
+            PortablePlan::BoundedByteClassRepeat(plan) => {
+                let (matched, accounting) = plan.is_match_window(haystack, window, limits)?;
+                Ok((matched, SearchAccounting::PureByteClassRepeat(accounting)))
+            }
             PortablePlan::ForwardAnchored(forward) => {
                 let literal_window = LiteralWindow::new(window.start(), window.end());
                 let (matched, accounting) = forward.find_window(
@@ -4017,6 +4103,10 @@ impl PortableRegex {
                 .map(|(matched, _)| matched.is_some())
                 .map_err(SearchError::from),
             PortablePlan::PureByteClassRepeat(plan) => plan
+                .is_match_window(haystack, window, limits)
+                .map(|(matched, _)| matched)
+                .map_err(SearchError::from),
+            PortablePlan::BoundedByteClassRepeat(plan) => plan
                 .is_match_window(haystack, window, limits)
                 .map(|(matched, _)| matched)
                 .map_err(SearchError::from),
@@ -4220,6 +4310,10 @@ impl PortableRegex {
                 let (end, accounting) = plan.earliest_end_window(haystack, window, limits)?;
                 Ok((end, SearchAccounting::PureByteClassRepeat(accounting)))
             }
+            PortablePlan::BoundedByteClassRepeat(plan) => {
+                let (end, accounting) = plan.earliest_end_window(haystack, window, limits)?;
+                Ok((end, SearchAccounting::PureByteClassRepeat(accounting)))
+            }
             PortablePlan::ForwardAnchored(forward) => {
                 let literal_window = LiteralWindow::new(window.start(), window.end());
                 let (matched, accounting) = forward.find_window(
@@ -4379,6 +4473,11 @@ impl PortableRegex {
                 ))
             }
             PortablePlan::PureByteClassRepeat(plan) => {
+                let (end, accounting) =
+                    plan.selected_end_window(haystack, SearchWindow::full(haystack), limits)?;
+                Ok((end, SearchAccounting::PureByteClassRepeat(accounting)))
+            }
+            PortablePlan::BoundedByteClassRepeat(plan) => {
                 let (end, accounting) =
                     plan.selected_end_window(haystack, SearchWindow::full(haystack), limits)?;
                 Ok((end, SearchAccounting::PureByteClassRepeat(accounting)))
@@ -4746,6 +4845,10 @@ impl PortableRegex {
                 let (matched, accounting) = plan.find_window(haystack, window, limits)?;
                 Ok((matched, SearchAccounting::PureByteClassRepeat(accounting)))
             }
+            PortablePlan::BoundedByteClassRepeat(plan) => {
+                let (matched, accounting) = plan.find_window(haystack, window, limits)?;
+                Ok((matched, SearchAccounting::PureByteClassRepeat(accounting)))
+            }
             PortablePlan::ForwardAnchored(forward) => {
                 let literal_window = LiteralWindow::new(window.start(), window.end());
                 let (matched, accounting) = forward.find_window(
@@ -4836,6 +4939,10 @@ impl PortableRegex {
     ) -> Result<Option<Match>, SearchError> {
         match &self.plan {
             PortablePlan::PureByteClassRepeat(plan) => plan
+                .find_window(haystack, window, limits)
+                .map(|(matched, _)| matched)
+                .map_err(SearchError::from),
+            PortablePlan::BoundedByteClassRepeat(plan) => plan
                 .find_window(haystack, window, limits)
                 .map(|(matched, _)| matched)
                 .map_err(SearchError::from),
@@ -4958,6 +5065,11 @@ impl PortableRegex {
                 ))
             }
             PortablePlan::PureByteClassRepeat(plan) => {
+                let (matched, accounting) =
+                    plan.find_window(haystack, SearchWindow::new(start, haystack.len()), limits)?;
+                Ok((matched, accounting.actual_work))
+            }
+            PortablePlan::BoundedByteClassRepeat(plan) => {
                 let (matched, accounting) =
                     plan.find_window(haystack, SearchWindow::new(start, haystack.len()), limits)?;
                 Ok((matched, accounting.actual_work))
