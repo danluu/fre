@@ -1685,9 +1685,125 @@ impl FixedPredicateWord64Plan {
         window: Window,
         limits: SearchLimits,
     ) -> Result<Option<(usize, usize)>, SearchError> {
-        let upper_bounds = self.search_preflight(haystack.len(), window, limits)?;
-        self.execute_first_match(haystack, window, upper_bounds)
-            .map(|(matched, _)| matched)
+        let _ = self.search_preflight(haystack.len(), window, limits)?;
+        let slice = haystack.get(window.start()..window.end()).ok_or(
+            SearchError::InternalInvariant("admitted fixed-predicate window disappeared"),
+        )?;
+        match self.anchor {
+            Anchor::One { offset, byte } => self.first_anchor_value(
+                slice,
+                window.start(),
+                usize::from(offset),
+                |bytes| memchr(byte, bytes),
+            ),
+            Anchor::Two {
+                offset,
+                first,
+                second,
+            } => self.first_anchor_value(
+                slice,
+                window.start(),
+                usize::from(offset),
+                |bytes| memchr2(first, second, bytes),
+            ),
+            Anchor::ShiftAnd => self.first_shift_and_value(slice, window.start()),
+        }
+    }
+
+    #[inline]
+    fn first_shift_and_value(
+        &self,
+        slice: &[u8],
+        window_start: usize,
+    ) -> Result<Option<(usize, usize)>, SearchError> {
+        let mut state = 0_u64;
+        for (position, &byte) in slice.iter().enumerate() {
+            state = (state.wrapping_shl(1) | 1) & self.masks[usize::from(byte)];
+            if state & self.accepting_bit != 0 {
+                let relative_end = position.checked_add(1).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "actual Shift-And match end",
+                    },
+                )?;
+                let relative_start = relative_end.checked_sub(self.width).ok_or(
+                    SearchError::InternalInvariant(
+                        "Shift-And accepted before the fixed word width",
+                    ),
+                )?;
+                let start = window_start.checked_add(relative_start).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "absolute Shift-And match start",
+                    },
+                )?;
+                let end = window_start.checked_add(relative_end).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "absolute Shift-And match end",
+                    },
+                )?;
+                return Ok(Some((start, end)));
+            }
+        }
+        Ok(None)
+    }
+
+    #[inline]
+    fn first_anchor_value(
+        &self,
+        slice: &[u8],
+        window_start: usize,
+        anchor_offset: usize,
+        mut find: impl FnMut(&[u8]) -> Option<usize>,
+    ) -> Result<Option<(usize, usize)>, SearchError> {
+        let anchor_end = slice
+            .len()
+            .checked_sub(self.width)
+            .and_then(|last_start| last_start.checked_add(anchor_offset))
+            .and_then(|last_anchor| last_anchor.checked_add(1))
+            .unwrap_or(0);
+        let mut cursor = anchor_offset.min(anchor_end);
+        while cursor < anchor_end {
+            let search = slice.get(cursor..anchor_end).ok_or(
+                SearchError::InternalInvariant("anchor search window escaped the input"),
+            )?;
+            let Some(relative) = find(search) else {
+                break;
+            };
+            let anchor = cursor.checked_add(relative).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "actual anchor search position",
+                },
+            )?;
+            let start = anchor.checked_sub(anchor_offset).ok_or(
+                SearchError::InternalInvariant("anchor preceded its fixed offset"),
+            )?;
+            let is_match = self
+                .anchor_candidate_matches_value(slice, start, anchor_offset)
+                .ok_or(SearchError::InternalInvariant(
+                    "compact anchor verification arithmetic failed after preflight",
+                ))?;
+            if is_match {
+                let relative_end = start.checked_add(self.width).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "actual anchor match end",
+                    },
+                )?;
+                let absolute_start = window_start.checked_add(start).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "absolute anchor match start",
+                    },
+                )?;
+                let absolute_end = window_start.checked_add(relative_end).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "absolute anchor match end",
+                    },
+                )?;
+                return Ok(Some((absolute_start, absolute_end)));
+            }
+            cursor = anchor.checked_add(1).ok_or(SearchError::ArithmeticOverflow {
+                computation: "rejected anchor search restart",
+            })?;
+        }
+        Ok(None)
     }
 
     fn search_preflight(
