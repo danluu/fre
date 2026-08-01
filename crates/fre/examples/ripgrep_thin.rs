@@ -12,12 +12,14 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use fre::{PortableBuilder, PortableFindIterRunLimits, SearchLimits, SearchSessionLimits};
+use fre_ripgrep_aot_thin::{AotMatcher, AotMode, AotOutput};
 use sha2::{Digest, Sha256};
 
 #[derive(Clone, Copy, Debug)]
 enum Engine {
     Fre,
     RustRegex,
+    FreAot(AotMode),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -213,6 +215,65 @@ fn run() -> Result<bool, String> {
                 }
             }
         }
+        Engine::FreAot(mode) => run_aot(&args, &pattern, mode),
+    }
+}
+
+fn run_aot(args: &Args, pattern: &str, mode: AotMode) -> Result<bool, String> {
+    let output = match args.scan_mode {
+        ScanMode::Lines => AotOutput::Exists,
+        ScanMode::WholeFile => AotOutput::Span,
+    };
+    let mut matcher = AotMatcher::new(mode, output, pattern, args.case_insensitive)
+        .map_err(|error| format!("FRE_AOT_UNSUPPORTED build: {error}"))?;
+    let engine = match mode {
+        AotMode::Fast => "fre-aot-fast",
+        AotMode::Optimizing => "fre-aot-optimizing",
+    };
+    let plan = matcher.description();
+    if args.describe_only {
+        println!(
+            "engine={engine}\tplan={plan}\tmode={}\tpattern={pattern}",
+            args.scan_mode.name()
+        );
+        return Ok(true);
+    }
+    match args.scan_mode {
+        ScanMode::Lines => {
+            let stats = scan_lines(args, |line| {
+                matcher
+                    .is_match(line)
+                    .map_err(|error| format!("FRE_AOT_UNSUPPORTED search: {error}"))
+            })?;
+            emit_line_stats_if_requested(stats, plan);
+            Ok(stats.matching_lines != 0)
+        }
+        ScanMode::WholeFile => {
+            let stats = scan_whole_files(args, |haystack, stats| {
+                let mut start = 0;
+                loop {
+                    let Some((match_start, match_end)) = matcher
+                        .find_at(haystack, start)
+                        .map_err(|error| format!("FRE_AOT_UNSUPPORTED search: {error}"))?
+                    else {
+                        break;
+                    };
+                    stats.record_match(match_start, match_end)?;
+                    if match_start == match_end {
+                        if match_end == haystack.len() {
+                            break;
+                        }
+                        start = match_end
+                            .checked_add(1)
+                            .ok_or_else(|| "empty-match progress overflow".to_owned())?;
+                    } else {
+                        start = match_end;
+                    }
+                }
+                Ok(())
+            })?;
+            Ok(emit_whole_file_stats(stats, plan))
+        }
     }
 }
 
@@ -271,9 +332,10 @@ where
         match text.as_str() {
             "--" => options_done = true,
             "--engine" => {
-                let value = arguments
-                    .next()
-                    .ok_or_else(|| "--engine requires fre or rust-regex".to_owned())?;
+                let value = arguments.next().ok_or_else(|| {
+                    "--engine requires fre, rust-regex, fre-aot-fast, or fre-aot-optimizing"
+                        .to_owned()
+                })?;
                 engine = Some(parse_engine(&os_to_string(value, "engine")?)?);
             }
             "-i" | "--ignore-case" => case_insensitive = true,
@@ -305,7 +367,9 @@ where
         }
     }
 
-    let engine = engine.ok_or_else(|| "--engine fre|rust-regex is required".to_owned())?;
+    let engine = engine.ok_or_else(|| {
+        "--engine fre|rust-regex|fre-aot-fast|fre-aot-optimizing is required".to_owned()
+    })?;
     let pattern = pattern.ok_or_else(|| "a regex pattern is required".to_owned())?;
     if paths.is_empty() {
         paths.push(PathBuf::from("."));
@@ -326,8 +390,10 @@ fn parse_engine(value: &str) -> Result<Engine, String> {
     match value {
         "fre" => Ok(Engine::Fre),
         "rust-regex" | "rust" => Ok(Engine::RustRegex),
+        "fre-aot-fast" | "aot-fast" => Ok(Engine::FreAot(AotMode::Fast)),
+        "fre-aot-optimizing" | "aot-optimizing" => Ok(Engine::FreAot(AotMode::Optimizing)),
         _ => Err(format!(
-            "unknown engine {value:?}; expected fre or rust-regex"
+            "unknown engine {value:?}; expected fre, rust-regex, fre-aot-fast, or fre-aot-optimizing"
         )),
     }
 }

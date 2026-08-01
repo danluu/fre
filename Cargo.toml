@@ -37,6 +37,7 @@ members = [
     "tools/rebar-expand",
     "tools/rebar-compare",
     "tools/rebar-manifest",
+    "tools/ripgrep-aot-thin",
     "tools/rust-regex-conformance",
     "tools/fre-holdout",
     "tools/search-production-family-promotion",

@@ -1,0 +1,264 @@
+use std::env;
+use std::fmt::Write as _;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use fre_aot_regex::{
+    Architecture, CompileMode, CompileRequest, CpuFeature, EngineKind, EngineSelectionReason,
+    FeatureSet, OperatingSystem, OutputContract, StartAccelerator, Target, compile,
+};
+use fre_syntax::RustProfile;
+
+#[derive(Debug)]
+struct Pattern {
+    id: String,
+    case_insensitive: bool,
+    source: String,
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "artifact compilation and generated registry construction form one build transaction"
+)]
+fn main() {
+    println!("cargo:rerun-if-changed=patterns.tsv");
+    println!("cargo:rerun-if-env-changed=FRE_RIPGREP_AOT_FEATURES");
+    println!("cargo:rerun-if-env-changed=FRE_RIPGREP_AOT_PATTERN_FILTER");
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo supplies OUT_DIR"));
+    let target = target().unwrap_or_else(|error| panic!("AOT target: {error}"));
+    let mut patterns = read_patterns(Path::new("patterns.tsv"));
+    if let Some(filter) = env::var_os("FRE_RIPGREP_AOT_PATTERN_FILTER") {
+        let ids = filter.to_string_lossy();
+        let ids = ids.split(',').collect::<Vec<_>>();
+        patterns.retain(|pattern| ids.contains(&pattern.id.as_str()));
+        assert!(
+            !patterns.is_empty(),
+            "FRE_RIPGREP_AOT_PATTERN_FILTER selected no patterns"
+        );
+    }
+    let mut generated = String::from(
+        "use super::{AbiResult, AotMode, AotOutput, BackendFactory, CompiledSpec};\n\n#[allow(unsafe_code, reason = \"generated declarations for audited FRE AOT object entries\")]\nunsafe extern \"C\" {\n",
+    );
+    let mut rows = String::new();
+    let mut objects = Vec::new();
+
+    for pattern in &patterns {
+        for (mode, mode_name, mode_source) in [
+            (CompileMode::Fast, "fast", "AotMode::Fast"),
+            (CompileMode::Optimizing, "optimizing", "AotMode::Optimizing"),
+        ] {
+            for (output, output_name, output_source) in [
+                (OutputContract::Exists, "exists", "AotOutput::Exists"),
+                (OutputContract::Span, "span", "AotOutput::Span"),
+            ] {
+                let mut profile = RustProfile::default();
+                profile.options.case_insensitive = pattern.case_insensitive;
+                let compiled = compile(
+                    CompileRequest::new(pattern.source.clone(), target)
+                        .profile(profile)
+                        .mode(mode)
+                        .output(output),
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "compile {} {mode_name}/{output_name} {:?}: {error}",
+                        pattern.id, pattern.source
+                    )
+                });
+                let receipt = compiled.receipt();
+                let route = if compiled.module().required_runtime_symbol().is_none() {
+                    "direct-native"
+                } else {
+                    "prepared-runtime"
+                };
+                let description = format!(
+                    "mode={mode_name},route={route},engine={},reason={},accelerator={},target={}-{},features={:#x},states={},dfa_states={}",
+                    engine_name(receipt.engine),
+                    reason_name(receipt.engine_selection_reason),
+                    accelerator_name(receipt.start_accelerator),
+                    architecture_name(target.architecture),
+                    os_name(target.operating_system),
+                    target.features.bits(),
+                    receipt.thompson_states,
+                    receipt
+                        .dfa
+                        .map_or_else(|| "-".to_owned(), |stats| stats.forward_states.to_string()),
+                );
+                let stem = format!("{}_{}_{}", pattern.id, mode_name, output_name);
+                let backend = if route == "direct-native" {
+                    let object = out_dir.join(format!("{stem}.o"));
+                    fs::write(&object, compiled.object()).unwrap_or_else(|error| {
+                        panic!("write generated object {}: {error}", object.display())
+                    });
+                    objects.push(object);
+                    let declaration = format!("entry_{stem}");
+                    writeln!(
+                        &mut generated,
+                        "    #[link_name = {:?}] fn {declaration}(haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize, result: *mut AbiResult) -> u32;",
+                        compiled.module().entry_symbol(),
+                    )
+                    .expect("String writes cannot fail");
+                    format!("BackendFactory::Native({declaration})")
+                } else {
+                    let program = out_dir.join(format!("{stem}.program"));
+                    let bytes = compiled
+                        .program()
+                        .serialize()
+                        .unwrap_or_else(|error| panic!("serialize {stem}: {error}"));
+                    fs::write(&program, bytes).unwrap_or_else(|error| {
+                        panic!("write generated program {}: {error}", program.display())
+                    });
+                    format!(
+                        "BackendFactory::Runtime(include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{stem}.program\")))"
+                    )
+                };
+                writeln!(
+                    &mut rows,
+                    "    CompiledSpec {{ mode: {mode_source}, output: {output_source}, pattern: {:?}, case_insensitive: {}, description: {:?}, backend: {backend} }},",
+                    pattern.source,
+                    pattern.case_insensitive,
+                    description,
+                )
+                .expect("String writes cannot fail");
+            }
+        }
+    }
+    generated.push_str("}\n\npub(super) const SPECS: &[CompiledSpec] = &[\n");
+    generated.push_str(&rows);
+    generated.push_str("];\n");
+    fs::write(out_dir.join("registry.rs"), generated).expect("write generated registry");
+    if !objects.is_empty() {
+        make_archive(&out_dir, &objects);
+    }
+}
+
+fn read_patterns(path: &Path) -> Vec<Pattern> {
+    let text = fs::read_to_string(path).expect("read patterns.tsv");
+    let patterns = text
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| {
+            let mut columns = line.splitn(3, '\t');
+            let id = columns.next().expect("pattern id").to_owned();
+            assert!(
+                id.bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'),
+                "pattern id must be a Rust identifier suffix: {id:?}"
+            );
+            let case_insensitive = match columns.next() {
+                Some("0") => false,
+                Some("1") => true,
+                other => panic!("invalid case-insensitive field for {id}: {other:?}"),
+            };
+            let source = columns
+                .next()
+                .unwrap_or_else(|| panic!("missing pattern for {id}"))
+                .to_owned();
+            Pattern {
+                id,
+                case_insensitive,
+                source,
+            }
+        })
+        .collect::<Vec<_>>();
+    assert!(!patterns.is_empty(), "patterns.tsv must not be empty");
+    patterns
+}
+
+fn target() -> Result<Target, String> {
+    let architecture = env::var("CARGO_CFG_TARGET_ARCH").map_err(|error| error.to_string())?;
+    let os = env::var("CARGO_CFG_TARGET_OS").map_err(|error| error.to_string())?;
+    let base = match (architecture.as_str(), os.as_str()) {
+        ("x86_64", "linux") => Target::x86_64_linux(),
+        ("x86_64", "macos") => Target::x86_64_macos(),
+        ("aarch64", "linux") => Target::aarch64_linux(),
+        ("aarch64", "macos") => Target::aarch64_macos(),
+        _ => return Err(format!("unsupported Cargo target {architecture}-{os}")),
+    };
+    let mut features = FeatureSet::EMPTY;
+    if let Some(value) = env::var_os("FRE_RIPGREP_AOT_FEATURES") {
+        for name in value
+            .to_string_lossy()
+            .split(',')
+            .filter(|name| !name.is_empty())
+        {
+            let feature = match name {
+                "sse2" => CpuFeature::X86Sse2,
+                "avx2" => CpuFeature::X86Avx2,
+                "avx512f" => CpuFeature::X86Avx512F,
+                "avx512bw" => CpuFeature::X86Avx512Bw,
+                "avx512vl" => CpuFeature::X86Avx512Vl,
+                "asimd" => CpuFeature::Aarch64Asimd,
+                "sve" => CpuFeature::Aarch64Sve,
+                "sve2" => CpuFeature::Aarch64Sve2,
+                _ => return Err(format!("unknown FRE_RIPGREP_AOT_FEATURES value {name:?}")),
+            };
+            features = features.with(feature);
+        }
+    }
+    base.with_features(features)
+        .map_err(|error| error.to_string())
+}
+
+fn make_archive(out_dir: &Path, objects: &[PathBuf]) {
+    let archive = out_dir.join("libfre_ripgrep_aot_objects.a");
+    let archiver = env::var_os("AR").unwrap_or_else(|| "ar".into());
+    let output = Command::new(&archiver)
+        .arg("crs")
+        .arg(&archive)
+        .args(objects)
+        .output()
+        .unwrap_or_else(|error| panic!("run {}: {error}", archiver.to_string_lossy()));
+    assert!(
+        output.status.success(),
+        "archive AOT objects failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=static=fre_ripgrep_aot_objects");
+}
+
+const fn architecture_name(value: Architecture) -> &'static str {
+    match value {
+        Architecture::X86_64 => "x86_64",
+        Architecture::Aarch64 => "aarch64",
+    }
+}
+
+const fn os_name(value: OperatingSystem) -> &'static str {
+    match value {
+        OperatingSystem::Linux => "linux",
+        OperatingSystem::Macos => "macos",
+    }
+}
+
+const fn engine_name(value: EngineKind) -> &'static str {
+    match value {
+        EngineKind::OrderedNfa => "ordered-nfa",
+        EngineKind::OrderedDfa => "ordered-dfa",
+        EngineKind::OrderedContextDfa => "ordered-context-dfa",
+    }
+}
+
+const fn reason_name(value: EngineSelectionReason) -> &'static str {
+    match value {
+        EngineSelectionReason::FastMode => "fast-mode",
+        EngineSelectionReason::CompleteDfa => "complete-dfa",
+        EngineSelectionReason::CompleteContextDfa => "complete-context-dfa",
+        EngineSelectionReason::ContextAssertions => "context-assertions",
+        EngineSelectionReason::DeterminizationResourceLimit => "resource-limit",
+    }
+}
+
+const fn accelerator_name(value: StartAccelerator) -> &'static str {
+    match value {
+        StartAccelerator::None => "none",
+        StartAccelerator::Scalar => "scalar",
+        StartAccelerator::X86Sse2 => "x86-sse2",
+        StartAccelerator::X86Avx2 => "x86-avx2",
+        StartAccelerator::X86Avx512Bw => "x86-avx512bw",
+        StartAccelerator::Aarch64Asimd => "aarch64-asimd",
+    }
+}

@@ -1,0 +1,24 @@
+# id\tcase_insensitive\tfinal_pattern
+p00	0	PM_RESUME
+p01	1	PM_RESUME
+p02	0	[A-Z]+_RESUME
+p03	0	\b(?:PM_RESUME)\b
+p04	0	\p{Greek}
+p05	1	\p{Greek}
+p06	0	\wAh
+p07	0	\w{5}\s+\w{5}\s+\w{5}\s+\w{5}\s+\w{5}
+p08	0	ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT
+p09	1	ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT
+p10	0	Sherlock Holmes
+p11	1	Sherlock Holmes
+p12	0	\b(?:Sherlock Holmes)\b
+p13	0	Sherlock Holmes|John Watson|Irene Adler|Inspector Lestrade|Professor Moriarty
+p14	1	Sherlock Holmes|John Watson|Irene Adler|Inspector Lestrade|Professor Moriarty
+p15	0	\w+\s+Holmes\s+\w+
+p16	0	\w{5}\s+\w{5}\s+\w{5}\s+\w{5}\s+\w{5}\s+\w{5}\s+\w{5}
+p17	0	Шерлок Холмс
+p18	1	Шерлок Холмс
+p19	0	\b(?:Шерлок Холмс)\b
+p20	0	Шерлок Холмс|Джон Уотсон|Ирен Адлер|инспектор Лестрейд|профессор Мориарти
+p21	1	Шерлок Холмс|Джон Уотсон|Ирен Адлер|инспектор Лестрейд|профессор Мориарти
+p22	0	\w+\s+Холмс\s+\w+

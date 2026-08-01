@@ -1,0 +1,25 @@
+[package]
+name = "fre-ripgrep-aot-thin"
+version.workspace = true
+description = "Precompiled general-AOT registry for the ripgrep comparison adapter"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+build = "build.rs"
+
+[dependencies]
+fre-aot-regex = { path = "../../crates/fre-aot-regex" }
+fre-aot-regex-runtime = { path = "../../crates/fre-aot-regex-runtime" }
+
+[build-dependencies]
+fre-aot-regex = { path = "../../crates/fre-aot-regex" }
+fre-syntax = { path = "../../crates/fre-syntax" }
+
+[lints.clippy]
+pedantic = "warn"
+
+[lints.rust]
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "deny", priority = -1 }
+unreachable_pub = "warn"
