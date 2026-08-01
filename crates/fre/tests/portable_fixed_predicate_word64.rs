@@ -1,7 +1,7 @@
 use fre::{
     BuildError, BuildLimits, EXPLAIN_SCHEMA_VERSION, FixedPredicateWord64Reducer, PlanKind,
-    PlanSelection, PortableBuilder, PortableCapturesReadError, PortableFindIterLimits,
-    SearchAccounting, SearchError, SearchLimits, SearchWindow,
+    PlanSelection, PortableBuilder, PortableCapturesReadError, PortableFindIterLimits, RustProfile,
+    SearchAccounting, SearchError, SearchLimits, SearchSessionLimits, SearchWindow,
 };
 
 const ONE_ANCHOR_PATTERN: &str = r"Q[ab][cd][ef][gh][ij][kl][mn][op][rs][tu][vw][xy][01]";
@@ -154,6 +154,40 @@ fn fixed_predicate_facade_matches_forced_k0_for_all_windows_endpoints_and_iterat
 }
 
 #[test]
+fn fixed_predicate_sessions_retain_no_workspace() {
+    let regex = build_auto(ONE_ANCHOR_PATTERN);
+    assert_eq!(regex.build_report().plan, PlanKind::FixedPredicateWord64);
+    let haystack = b"miss-Qacegikmortvx1-tail";
+    let limits = SearchLimits::unlimited();
+
+    let mut full = regex
+        .search_session(SearchSessionLimits::unlimited())
+        .expect("native full session needs no setup allocation");
+    assert_eq!(full.workspace_setup_accounting(), None);
+    assert_eq!(
+        full.runtime_implementation_id(),
+        regex.runtime_implementation_id()
+    );
+    assert_eq!(
+        span(full.find_value(haystack, limits).unwrap()),
+        span(regex.find_value(haystack, limits).unwrap())
+    );
+
+    let mut endpoint = regex
+        .endpoint_search_session(SearchSessionLimits::unlimited())
+        .expect("native endpoint session needs no setup allocation");
+    assert_eq!(endpoint.workspace_setup_accounting(), None);
+    assert_eq!(
+        endpoint.runtime_implementation_id(),
+        regex.runtime_implementation_id()
+    );
+    assert_eq!(
+        endpoint.selected_end(haystack, limits).unwrap().0,
+        regex.selected_end(haystack, limits).unwrap().0
+    );
+}
+
+#[test]
 fn fixed_predicate_limits_close_at_exact_planner_persistent_and_search_bounds() {
     let baseline = build_auto(ONE_ANCHOR_PATTERN);
     let report = baseline.build_report();
@@ -261,6 +295,63 @@ fn fixed_predicate_admission_preserves_finite_incumbents_and_k0_refusals() {
         build_auto("[abc]{8,9}[def]{8,9}").build_report().plan,
         PlanKind::K0
     );
+}
+
+#[test]
+fn unicode_classes_and_profiles_remain_k0_and_match_regex_bytes() {
+    let patterns = [
+        (r"\p{Greek}Q[ab][cd][ef][gh][ij][kl][mn][op]", true),
+        (r"(?u:\p{Greek})Q[ab][cd][ef][gh][ij][kl][mn][op]", false),
+    ];
+    let haystacks: &[&[u8]] = &[
+        b"",
+        "xxαQacegikmozz".as_bytes(),
+        "βQbdfhjlnp αQacegikmo".as_bytes(),
+        b"\xffQacegikmo",
+    ];
+    for profile in [RustProfile::regex_1_12_4(), RustProfile::rebar_1_12_4()] {
+        for &(pattern, unicode) in &patterns {
+            let regex = PortableBuilder::new(pattern)
+                .profile(profile.clone())
+                .unicode(unicode)
+                .build()
+                .unwrap_or_else(|error| {
+                    panic!("Unicode fallback build failed for {pattern:?}: {error:?}")
+                });
+            assert_eq!(
+                regex.build_report().plan,
+                PlanKind::K0,
+                "pattern={pattern:?}, profile={profile:?}"
+            );
+            let upstream = regex::bytes::RegexBuilder::new(pattern)
+                .unicode(unicode)
+                .build()
+                .unwrap();
+            for &haystack in haystacks {
+                let expected = upstream
+                    .find(haystack)
+                    .map(|matched| (matched.start(), matched.end()));
+                let (actual, accounting) = regex.find(haystack, SearchLimits::unlimited()).unwrap();
+                assert_eq!(span(actual), expected, "pattern={pattern:?}");
+                assert!(matches!(accounting, SearchAccounting::K0(_)));
+                assert_eq!(
+                    regex
+                        .is_match_value(haystack, SearchLimits::unlimited())
+                        .unwrap(),
+                    expected.is_some(),
+                    "exists pattern={pattern:?}"
+                );
+                assert_eq!(
+                    regex
+                        .selected_end(haystack, SearchLimits::unlimited())
+                        .unwrap()
+                        .0,
+                    expected.map(|(_, end)| end),
+                    "selected-end pattern={pattern:?}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
