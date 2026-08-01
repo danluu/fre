@@ -471,6 +471,7 @@ mod tests {
             output: OutputContract::Exists,
             start_filter: None,
             suffix_filter: Some(suffix),
+            declined_redundant_root_reverse: false,
             seeded_reverse: Some(reverse),
             loop_skip: None,
             vector_filter: None,

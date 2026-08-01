@@ -878,6 +878,12 @@ const MAX_SPARSE_RESCAN_EXPECTED_HITS: u16 = 2;
 const MAX_ASIMD_BATCH_EXPECTED_HITS: u16 = 4;
 const AARCH64_BATCH_BYTES: u16 = 64;
 const X86_MASK_BATCH_VECTORS: u16 = 4;
+/// Keep an optional post-return cold tail from changing the cache-line
+/// placement of text sections linked after this self-contained object.
+/// The hot section starts at a 16-byte object alignment, while preserving its
+/// size modulo a 64-byte instruction-cache line also preserves every stronger
+/// 32-byte fetch/decode placement used by the supported x86 implementations.
+const X86_COLD_LINK_ALIGNMENT_BYTES: usize = 64;
 /// A suffix prepass has a fixed setup cost and is primarily useful for large
 /// windows. Smaller windows enter the ordinary prefix/forward path directly.
 const SUFFIX_PREFILTER_MIN_WINDOW_BYTES: u16 = 128;
@@ -1279,6 +1285,11 @@ struct NativeDfaLayout {
     output: OutputContract,
     start_filter: Option<NativeStartFilter>,
     suffix_filter: Option<NativeSuffixFilter>,
+    /// A complete graph-derived RootState reverse proof was omitted because
+    /// its initial row already reaches the search start and cannot reject the
+    /// aligned mandatory-factor candidate. This fact is independent of the
+    /// output contract and target lowering.
+    declined_redundant_root_reverse: bool,
     seeded_reverse: Option<NativeSeededReverseLayout>,
     loop_skip: Option<module_dfa_loop_skip::NativeDfaLoopSkip>,
     vector_filter: Option<NativeVectorFilter>,
@@ -1756,6 +1767,21 @@ fn build_native_dfa_table_for_architecture(
             .then(|| build_native_seeded_reverse(view, suffix, seeded_limits))
             .flatten()
     });
+    // Preserve the target- and output-independent graph fact even when this
+    // output contract never requested the optional native reverse sidecar.
+    let declined_redundant_root_reverse = suffix_filter.is_some_and(|suffix| {
+        let NativeSuffixReverseSeed::RootState(root) = suffix.reverse_seed else {
+            return false;
+        };
+        matches!(
+            build_seeded_reverse_exact(
+                view.raw,
+                SeededReverseSeed::RootState(root),
+                SeededReverseLimits::default(),
+            ),
+            SeededReverseBuild::Complete(dfa) if dfa.initial_reaches_start()
+        )
+    });
     if seeded_reverse_machine
         .as_ref()
         .is_some_and(|machine| !machine.proves_match && machine.dfa.initial_reaches_start())
@@ -2039,6 +2065,7 @@ fn build_native_dfa_table_for_architecture(
             output: view.output,
             start_filter,
             suffix_filter,
+            declined_redundant_root_reverse,
             seeded_reverse,
             loop_skip,
             vector_filter,
@@ -3675,6 +3702,38 @@ impl X86Assembler {
     }
 }
 
+/// Emit Intel-recommended NOP encodings into unreachable post-return space.
+/// Nine-byte chunks keep the instruction audit explicit without bloating the
+/// compiler, and the exact remainder covers every power-of-two alignment.
+fn x86_emit_unreachable_nops(
+    assembler: &mut X86Assembler,
+    mut bytes: usize,
+) -> Result<(), ObjectError> {
+    const NOP9: &[u8] = &[0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00];
+    while bytes >= NOP9.len() {
+        assembler.instruction(NOP9)?;
+        bytes = bytes
+            .checked_sub(NOP9.len())
+            .ok_or(ObjectError::ArithmeticOverflow("x86 cold padding"))?;
+    }
+    let tail = match bytes {
+        0 => &[][..],
+        1 => &[0x90][..],
+        2 => &[0x66, 0x90][..],
+        3 => &[0x0f, 0x1f, 0x00][..],
+        4 => &[0x0f, 0x1f, 0x40, 0x00][..],
+        5 => &[0x0f, 0x1f, 0x44, 0x00, 0x00][..],
+        6 => &[0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00][..],
+        7 => &[0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00][..],
+        8 => &[0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00][..],
+        _ => return Err(ObjectError::InvalidModule("x86 cold padding remainder")),
+    };
+    if !tail.is_empty() {
+        assembler.instruction(tail)?;
+    }
+    Ok(())
+}
+
 fn x86_emit_table_lookup(
     assembler: &mut X86Assembler,
     transitions: TransitionLayout,
@@ -4603,7 +4662,10 @@ fn x86_emit_start_filter_vector_test(
     Ok(mask)
 }
 
-fn x86_emit_vector_filter_secondary_test(
+/// Intersect the already-materialized primary candidates with every remaining
+/// graph-required vector column. SSE2/AVX2 leave the exact lane set in
+/// XMM/YMM7; AVX-512BW leaves all lane bits in K5.
+fn x86_emit_vector_filter_secondary_candidates(
     assembler: &mut X86Assembler,
     vector_filter: NativeVectorFilter,
     kind: X86StartFilterKind,
@@ -4659,6 +4721,13 @@ fn x86_emit_vector_filter_secondary_test(
                 "x86 vector-filter constants",
             ))?;
     }
+    Ok(())
+}
+
+fn x86_emit_vector_filter_intersection_test(
+    assembler: &mut X86Assembler,
+    kind: X86StartFilterKind,
+) -> Result<(), ObjectError> {
     match kind {
         X86StartFilterKind::Sse2 => {
             assembler.instruction(&[0x66, 0x0f, 0xd7, 0xc7])?;
@@ -4676,6 +4745,15 @@ fn x86_emit_vector_filter_secondary_test(
     Ok(())
 }
 
+fn x86_emit_vector_filter_secondary_test(
+    assembler: &mut X86Assembler,
+    vector_filter: NativeVectorFilter,
+    kind: X86StartFilterKind,
+) -> Result<(), ObjectError> {
+    x86_emit_vector_filter_secondary_candidates(assembler, vector_filter, kind)?;
+    x86_emit_vector_filter_intersection_test(assembler, kind)
+}
+
 fn x86_emit_start_filter_vector_candidate(
     assembler: &mut X86Assembler,
     filter: NativeStartFilter,
@@ -4690,16 +4768,32 @@ fn x86_emit_start_filter_vector_candidate(
     Ok(())
 }
 
-/// Test four adjacent vector blocks with one conditional branch.
-///
-/// XMM/YMM15 and K6 are caller-saved under the System V ABI used by both
-/// supported x86-64 object targets. Candidate masks are ORed by lane; their
-/// block identity is intentionally discarded because the rare hit edge
-/// rewinds the complete bounded group and enters the exact scalar scanner.
-/// R10 (the live DFA row) and R11 (the pending accept) remain untouched.
-fn x86_emit_sparse_filter_mask_batch(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum X86SparseBatchCandidate {
+    Primary(NativeStartFilter),
+    Intersection,
+}
+
+impl X86SparseBatchCandidate {
+    const fn vector_register(self) -> u8 {
+        match self {
+            Self::Primary(_) => 12,
+            Self::Intersection => 7,
+        }
+    }
+
+    fn mask(self, kind: X86StartFilterKind) -> X86CandidateMask {
+        match self {
+            Self::Primary(filter) => X86CandidateMask::for_filter(filter, kind),
+            Self::Intersection => X86CandidateMask::for_intersection(kind),
+        }
+    }
+}
+
+/// XMM/YMM15 and K6 are caller-saved and disjoint from the vector-filter
+/// constants and intersection banks. R10/R11 remain untouched.
+fn x86_emit_sparse_batch_accumulator_clear(
     assembler: &mut X86Assembler,
-    filter: NativeStartFilter,
     kind: X86StartFilterKind,
 ) -> Result<(), ObjectError> {
     match kind {
@@ -4709,26 +4803,39 @@ fn x86_emit_sparse_filter_mask_batch(
             x86_emit_k_binary(assembler, 0x47, 6, 6, 6)?; // kxorq k6, k6, k6
         }
     }
-    for _ in 0..X86_MASK_BATCH_VECTORS {
-        x86_emit_start_filter_vector_candidates(assembler, filter, kind, 1)?;
-        match kind {
-            X86StartFilterKind::Sse2 => {
-                x86_emit_sse2_binary(assembler, 0xeb, 15, 12)?; // xmm15 |= xmm12
-            }
-            X86StartFilterKind::Avx2 => {
-                x86_emit_avx2_binary(assembler, 0xeb, 15, 15, 12)?; // ymm15 |= ymm12
-            }
-            X86StartFilterKind::Avx512Bw => {
-                let source = X86CandidateMask::for_filter(filter, kind)
+    Ok(())
+}
+
+fn x86_emit_sparse_batch_accumulate(
+    assembler: &mut X86Assembler,
+    candidate: X86SparseBatchCandidate,
+    kind: X86StartFilterKind,
+) -> Result<(), ObjectError> {
+    match kind {
+        X86StartFilterKind::Sse2 => {
+            x86_emit_sse2_binary(assembler, 0xeb, 15, candidate.vector_register())?;
+        }
+        X86StartFilterKind::Avx2 => {
+            x86_emit_avx2_binary(assembler, 0xeb, 15, 15, candidate.vector_register())?;
+        }
+        X86StartFilterKind::Avx512Bw => {
+            let source =
+                candidate
+                    .mask(kind)
                     .opmask_register()
                     .ok_or(ObjectError::InvalidModule(
                         "AVX-512 sparse batch candidate has no opmask",
                     ))?;
-                x86_emit_k_binary(assembler, 0x45, 6, 6, source)?; // k6 |= source
-            }
+            x86_emit_k_binary(assembler, 0x45, 6, 6, source)?; // k6 |= source
         }
-        assembler.instruction(&[0x48, 0x83, 0xc2, kind.width()])?;
     }
+    Ok(())
+}
+
+fn x86_emit_sparse_batch_accumulator_test(
+    assembler: &mut X86Assembler,
+    kind: X86StartFilterKind,
+) -> Result<(), ObjectError> {
     match kind {
         X86StartFilterKind::Sse2 => {
             assembler.instruction(&[0x66, 0x41, 0x0f, 0xd7, 0xc7])?; // pmovmskb eax, xmm15
@@ -4743,6 +4850,49 @@ fn x86_emit_sparse_filter_mask_batch(
         }
     }
     Ok(())
+}
+
+/// Test four adjacent vector blocks with one conditional branch. Primary
+/// masks are ORed by lane; a hit rewinds the complete bounded group.
+fn x86_emit_sparse_filter_mask_batch(
+    assembler: &mut X86Assembler,
+    filter: NativeStartFilter,
+    kind: X86StartFilterKind,
+) -> Result<(), ObjectError> {
+    x86_emit_sparse_batch_accumulator_clear(assembler, kind)?;
+    for _ in 0..X86_MASK_BATCH_VECTORS {
+        x86_emit_start_filter_vector_candidates(assembler, filter, kind, 1)?;
+        x86_emit_sparse_batch_accumulate(
+            assembler,
+            X86SparseBatchCandidate::Primary(filter),
+            kind,
+        )?;
+        assembler.instruction(&[0x48, 0x83, 0xc2, kind.width()])?;
+    }
+    x86_emit_sparse_batch_accumulator_test(assembler, kind)
+}
+
+/// Test four adjacent vector blocks with the complete graph-required column
+/// intersection. The caller starts at the group base; both outcomes leave RDX
+/// just beyond the group, and a hit can rewind for exact scalar replay.
+fn x86_emit_sparse_vector_filter_mask_batch(
+    assembler: &mut X86Assembler,
+    vector_filter: NativeVectorFilter,
+    kind: X86StartFilterKind,
+) -> Result<(), ObjectError> {
+    if vector_filter.columns().len() < 2 {
+        return Err(ObjectError::InvalidModule(
+            "unsupported x86 sparse vector-filter intersection",
+        ));
+    }
+    x86_emit_sparse_batch_accumulator_clear(assembler, kind)?;
+    for _ in 0..X86_MASK_BATCH_VECTORS {
+        x86_emit_start_filter_vector_candidates(assembler, vector_filter.columns()[0], kind, 1)?;
+        x86_emit_vector_filter_secondary_candidates(assembler, vector_filter, kind)?;
+        x86_emit_sparse_batch_accumulate(assembler, X86SparseBatchCandidate::Intersection, kind)?;
+        assembler.instruction(&[0x48, 0x83, 0xc2, kind.width()])?;
+    }
+    x86_emit_sparse_batch_accumulator_test(assembler, kind)
 }
 
 fn x86_emit_rewind_sparse_filter_mask_batch(
@@ -5145,6 +5295,23 @@ fn x86_emit_seeded_reverse_prepass(
 /// loaded only in primary-hit blocks. Absence of any aligned candidate proves
 /// that no match exists. The first candidate either applies the bounded-width
 /// lower bound or restarts after a nearby all-state synchronizing byte.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct X86AdaptiveSuffixColdPlan {
+    joint_vector: X86Label,
+    adaptive_scalar: X86Label,
+    adaptive_scalar_columns: X86Label,
+    adaptive_scalar_reject: X86Label,
+    sparse_batch_hit: X86Label,
+    single_vector: X86Label,
+    apply: X86Label,
+    no_match: X86Label,
+    filter: NativeStartFilter,
+    vector_filter: NativeVectorFilter,
+    kind: X86StartFilterKind,
+    maximum_scan_offset: u8,
+    unrolled_bytes: u32,
+}
+
 #[allow(
     clippy::large_types_passed_by_value,
     clippy::too_many_lines,
@@ -5157,11 +5324,12 @@ fn x86_emit_suffix_prepass(
     layout: NativeDfaLayout,
     no_match: X86Label,
     matched: X86Label,
-) -> Result<(), ObjectError> {
+) -> Result<Option<X86AdaptiveSuffixColdPlan>, ObjectError> {
     if let Some(reverse) = layout.seeded_reverse {
-        return x86_emit_seeded_reverse_prepass(
+        x86_emit_seeded_reverse_prepass(
             assembler, suffix, reverse, kind, layout, no_match, matched,
-        );
+        )?;
+        return Ok(None);
     }
     let vector = assembler.label()?;
     let single_vector = assembler.label()?;
@@ -5171,6 +5339,10 @@ fn x86_emit_suffix_prepass(
     let primary_hit = assembler.label()?;
     let vector_hit = assembler.label()?;
     let sparse_batch_hit = assembler.label()?;
+    let joint_vector = assembler.label()?;
+    let adaptive_scalar = assembler.label()?;
+    let adaptive_scalar_columns = assembler.label()?;
+    let adaptive_scalar_reject = assembler.label()?;
     let apply = assembler.label()?;
     let done = assembler.label()?;
     let filter = suffix.filter;
@@ -5188,6 +5360,13 @@ fn x86_emit_suffix_prepass(
     let maximum_scan_offset =
         scalar_filter.map_or(filter.scan_offset, NativeVectorFilter::max_scan_offset);
     let use_sparse_batch = x86_use_sparse_filter_mask_batch(filter, kind);
+    // The initial suffix scan is exactly the baseline primary-only sparse
+    // batch. Only a witnessed scalar secondary rejection after such a hit
+    // changes CFG mode: subsequent complete groups use all retained columns.
+    // No runtime mode flag or additional live register is required.
+    let adaptive_joint_filter = (layout.declined_redundant_root_reverse && use_sparse_batch)
+        .then_some(lazy_vector_filter)
+        .flatten();
     let emit_constants = |assembler: &mut X86Assembler| -> Result<(), ObjectError> {
         if let Some(vector_filter) = lazy_vector_filter {
             let mut first_register = 1_u8;
@@ -5248,7 +5427,14 @@ fn x86_emit_suffix_prepass(
 
     assembler.bind(sparse_batch_hit)?;
     x86_emit_rewind_sparse_filter_mask_batch(assembler, kind)?;
-    assembler.branch(&[0xe9], scalar)?;
+    assembler.branch(
+        &[0xe9],
+        if adaptive_joint_filter.is_some() {
+            adaptive_scalar
+        } else {
+            scalar
+        },
+    )?;
 
     assembler.bind(single_vector)?;
     let single_vector_bytes = kind
@@ -5332,6 +5518,75 @@ fn x86_emit_suffix_prepass(
         x86_emit_suffix_restart(assembler, suffix.restart)?;
     }
     assembler.bind(done)?;
+    Ok(
+        adaptive_joint_filter.map(|vector_filter| X86AdaptiveSuffixColdPlan {
+            joint_vector,
+            adaptive_scalar,
+            adaptive_scalar_columns,
+            adaptive_scalar_reject,
+            sparse_batch_hit,
+            single_vector,
+            apply,
+            no_match,
+            filter,
+            vector_filter,
+            kind,
+            maximum_scan_offset,
+            unrolled_bytes,
+        }),
+    )
+}
+
+/// Emit the adaptive joint-group and exact-replay paths after the function's
+/// ordinary return. They are reachable only through explicit branches from
+/// the suffix prepass, so keeping them cold preserves every dormant scanner
+/// byte and offset except the one rel32 edge that enters this region.
+fn x86_emit_adaptive_suffix_cold(
+    assembler: &mut X86Assembler,
+    plan: X86AdaptiveSuffixColdPlan,
+) -> Result<(), ObjectError> {
+    assembler.bind(plan.joint_vector)?;
+    assembler.instruction(&[0x48, 0x89, 0xc8])?; // remaining = end
+    assembler.instruction(&[0x48, 0x29, 0xd0])?; // remaining -= position
+    let mut compare_unrolled = vec![0x48, 0x3d];
+    compare_unrolled.extend_from_slice(&plan.unrolled_bytes.to_le_bytes());
+    assembler.instruction(&compare_unrolled)?;
+    // Once fewer than four complete blocks remain there is no full group to
+    // optimize; the baseline single-vector/tail handles the remainder.
+    assembler.branch(&[0x0f, 0x82], plan.single_vector)?;
+    x86_emit_sparse_vector_filter_mask_batch(assembler, plan.vector_filter, plan.kind)?;
+    assembler.branch(&[0x0f, 0x85], plan.sparse_batch_hit)?;
+    assembler.branch(&[0xe9], plan.joint_vector)?;
+
+    // Exact scalar replay begins at the rewound group base. The first false
+    // secondary advances exactly one byte, then permanently resumes the joint
+    // group CFG without any runtime mode flag or extra live register.
+    assembler.bind(plan.adaptive_scalar)?;
+    x86_emit_start_filter_scalar_bound(assembler, plan.maximum_scan_offset, plan.no_match)?;
+    x86_emit_start_filter_scalar_load(assembler, plan.filter.scan_offset)?;
+    for range in plan.filter.ranges() {
+        assembler.instruction(&[0x3c, range.start])?;
+        if range.start == range.end {
+            assembler.branch(&[0x0f, 0x84], plan.adaptive_scalar_columns)?;
+        } else {
+            let next_range = assembler.label()?;
+            assembler.branch(&[0x0f, 0x82], next_range)?;
+            assembler.instruction(&[0x3c, range.end])?;
+            assembler.branch(&[0x0f, 0x86], plan.adaptive_scalar_columns)?;
+            assembler.bind(next_range)?;
+        }
+    }
+    assembler.instruction(&[0x48, 0xff, 0xc2])?;
+    assembler.branch(&[0xe9], plan.adaptive_scalar)?;
+
+    assembler.bind(plan.adaptive_scalar_columns)?;
+    for &column in &plan.vector_filter.columns()[1..] {
+        x86_emit_scalar_filter_membership(assembler, column, plan.adaptive_scalar_reject)?;
+    }
+    assembler.branch(&[0xe9], plan.apply)?;
+    assembler.bind(plan.adaptive_scalar_reject)?;
+    assembler.instruction(&[0x48, 0xff, 0xc2])?;
+    assembler.branch(&[0xe9], plan.joint_vector)?;
     Ok(())
 }
 
@@ -5740,12 +5995,14 @@ fn lower_x86_64_dfa(
         )?;
         assembler.bind(exact_start_probe_failed)?;
     }
-    if let Some(suffix) = layout.suffix_filter {
+    let adaptive_suffix_cold = if let Some(suffix) = layout.suffix_filter {
         let kind = filter_kind.ok_or(ObjectError::InvalidModule(
             "x86 suffix filter has no instruction selection",
         ))?;
-        x86_emit_suffix_prepass(&mut assembler, suffix, kind, layout, no_match, matched)?;
-    }
+        x86_emit_suffix_prepass(&mut assembler, suffix, kind, layout, no_match, matched)?
+    } else {
+        None
+    };
     if layout.output != OutputContract::Exists {
         assembler.instruction(&[0x49, 0xc7, 0xc3, 0xff, 0xff, 0xff, 0xff])?; // r11 = none
     }
@@ -6154,6 +6411,31 @@ fn lower_x86_64_dfa(
         assembler.instruction(&[0xc5, 0xf8, 0x77])?;
     }
     assembler.instruction(&[0xc3])?;
+    if let Some(plan) = adaptive_suffix_cold {
+        let cold_start = assembler.code.len();
+        x86_emit_adaptive_suffix_cold(&mut assembler, plan)?;
+        let cold_bytes =
+            assembler
+                .code
+                .len()
+                .checked_sub(cold_start)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "x86 adaptive suffix cold size",
+                ))?;
+        let aligned_cold_bytes = cold_bytes
+            .checked_add(X86_COLD_LINK_ALIGNMENT_BYTES - 1)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "x86 adaptive suffix cold alignment",
+            ))?
+            & !(X86_COLD_LINK_ALIGNMENT_BYTES - 1);
+        let padding =
+            aligned_cold_bytes
+                .checked_sub(cold_bytes)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "x86 adaptive suffix cold padding",
+                ))?;
+        x86_emit_unreachable_nops(&mut assembler, padding)?;
+    }
 
     let code = assembler.finish()?;
     Ok((
@@ -9115,6 +9397,319 @@ mod tests {
     }
 
     #[test]
+    fn x86_adaptive_suffix_cfg_has_exact_cross_isa_edges() {
+        fn offsets(code: &[u8], instruction: &[u8]) -> Vec<usize> {
+            code.windows(instruction.len())
+                .enumerate()
+                .filter_map(|(offset, window)| (window == instruction).then_some(offset))
+                .collect()
+        }
+
+        fn rel32_target(code: &[u8], instruction: usize, displacement: usize, len: usize) -> usize {
+            let start = instruction + displacement;
+            let relative = i32::from_le_bytes(code[start..start + 4].try_into().unwrap());
+            usize::try_from(
+                isize::try_from(instruction + len).unwrap() + isize::try_from(relative).unwrap(),
+            )
+            .unwrap()
+        }
+
+        const PATTERNS: [&str; 2] = [
+            r"(?:(?:(?:(?:(?:(?:QtJHg[I-K])){2,3}){1,3}?)+?9(?:(?:[J-M]){2,3}?){1,4}?)(?-u:[\x00-\xFF]))",
+            r"(?:(?:(?:(?:(?:(?:QtJHg[I-L])){2,3}){1,3}?)+?8(?:(?:[J-N]){2,3}?){1,4}?)(?-u:[\x00-\xFF]))",
+        ];
+        let avx512 = FeatureSet::of(CpuFeature::X86Avx512F).with(CpuFeature::X86Avx512Bw);
+        let cases = [
+            (
+                Target::x86_64_linux(),
+                &[0x66, 0x45, 0x0f, 0xef, 0xff][..],
+                &[0x66, 0x45, 0x0f, 0xeb, 0xfc][..],
+                &[0x66, 0x44, 0x0f, 0xeb, 0xff][..],
+                &[0x66, 0x41, 0x0f, 0xd7, 0xc7, 0x85, 0xc0][..],
+                &[0x48, 0x83, 0xea, 64][..],
+            ),
+            (
+                Target::x86_64_linux()
+                    .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                    .unwrap(),
+                &[0xc4, 0x41, 0x05, 0xef, 0xff][..],
+                &[0xc4, 0x41, 0x05, 0xeb, 0xfc][..],
+                &[0xc4, 0x61, 0x05, 0xeb, 0xff][..],
+                &[0xc4, 0xc1, 0x7d, 0xd7, 0xc7, 0x85, 0xc0][..],
+                &[0x48, 0x81, 0xea, 128, 0, 0, 0][..],
+            ),
+            (
+                Target::x86_64_linux().with_features(avx512).unwrap(),
+                &[0xc4, 0xe1, 0xcc, 0x47, 0xf6][..],
+                &[0xc4, 0xe1, 0xcc, 0x45, 0xf1][..],
+                &[0xc4, 0xe1, 0xcc, 0x45, 0xf5][..],
+                &[0xc4, 0xe1, 0xf8, 0x98, 0xf6][..],
+                &[0x48, 0x81, 0xea, 0, 1, 0, 0][..],
+            ),
+        ];
+
+        for pattern in PATTERNS {
+            for output in [
+                OutputContract::Exists,
+                OutputContract::SelectedEnd,
+                OutputContract::Span,
+            ] {
+                for (target, clear, primary_merge, joint_merge, reduce, rewind) in cases {
+                    let compiled = compile(
+                        CompileRequest::new(pattern, target)
+                            .mode(CompileMode::Optimizing)
+                            .output(output),
+                    )
+                    .unwrap();
+                    let code = compiled.module().sections()[TEXT_SECTION].bytes();
+                    let clears = offsets(code, clear);
+                    let primary_merges = offsets(code, primary_merge);
+                    let joint_merges = offsets(code, joint_merge);
+                    let reductions = offsets(code, reduce);
+                    let rewinds = offsets(code, rewind);
+                    assert_eq!(clears.len(), 2, "{target:?} {output:?}");
+                    assert_eq!(primary_merges.len(), 4, "{target:?} {output:?}");
+                    assert_eq!(joint_merges.len(), 4, "{target:?} {output:?}");
+                    assert_eq!(reductions.len(), 2, "{target:?} {output:?}");
+                    assert!(!rewinds.is_empty(), "{target:?} {output:?}");
+
+                    // Both loops have the same 18-byte remaining/bounds
+                    // prelude before their accumulator clear.
+                    let primary_loop = clears[0] - 18;
+                    let joint_loop = clears[1] - 18;
+                    let primary_hit_branch = reductions[0] + reduce.len();
+                    let rewind_block = rel32_target(code, primary_hit_branch, 2, 6);
+                    assert!(primary_hit_branch < rewind_block);
+                    assert_eq!(
+                        &code[rewind_block..rewind_block + rewind.len()],
+                        rewind,
+                        "{target:?} {output:?}"
+                    );
+                    for (index, loop_start) in
+                        [(reductions[0], primary_loop), (reductions[1], joint_loop)]
+                    {
+                        let hit_branch = index + reduce.len();
+                        assert_eq!(&code[hit_branch..hit_branch + 2], &[0x0f, 0x85]);
+                        assert_eq!(rel32_target(code, hit_branch, 2, 6), rewind_block);
+                        let miss_branch = hit_branch + 6;
+                        assert_eq!(code[miss_branch], 0xe9);
+                        assert_eq!(rel32_target(code, miss_branch, 1, 5), loop_start);
+                        assert!(miss_branch > loop_start);
+                    }
+                    assert!(reductions[1] > rewind_block);
+
+                    // The shared hit block performs exactly one rewind and
+                    // enters the duplicated scalar replay. The only inc/jmp
+                    // edge back to the joint loop is its secondary rejection.
+                    let replay_branch = rewind_block + rewind.len();
+                    assert_eq!(code[replay_branch], 0xe9);
+                    let replay = rel32_target(code, replay_branch, 1, 5);
+                    assert!(replay_branch < replay);
+                    assert!(replay > joint_loop);
+                    assert_eq!(&code[replay..replay + 4], &[0x48, 0x8d, 0x42, 0x06]);
+                    let adaptive_rejections = code
+                        .windows(8)
+                        .enumerate()
+                        .filter_map(|(offset, window)| {
+                            (window.starts_with(&[0x48, 0xff, 0xc2, 0xe9])
+                                && rel32_target(code, offset + 3, 1, 5) == joint_loop)
+                                .then_some(offset)
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(adaptive_rejections.len(), 1, "{target:?} {output:?}");
+                    assert!(adaptive_rejections[0] > joint_loop);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn x86_adaptive_suffix_cold_split_preserves_dormant_hot_layout() {
+        fn offsets(code: &[u8], instruction: &[u8]) -> Vec<usize> {
+            code.windows(instruction.len())
+                .enumerate()
+                .filter_map(|(offset, window)| (window == instruction).then_some(offset))
+                .collect()
+        }
+
+        fn rel32_target(code: &[u8], instruction: usize, displacement: usize, len: usize) -> usize {
+            let start = instruction + displacement;
+            let relative = i32::from_le_bytes(code[start..start + 4].try_into().unwrap());
+            usize::try_from(
+                isize::try_from(instruction + len).unwrap() + isize::try_from(relative).unwrap(),
+            )
+            .unwrap()
+        }
+
+        fn assert_canonical_nop_padding(mut code: &[u8]) {
+            const NOP9: &[u8] = &[0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00];
+            while code.len() >= NOP9.len() {
+                assert!(code.starts_with(NOP9));
+                code = &code[NOP9.len()..];
+            }
+            let expected = match code.len() {
+                0 => &[][..],
+                1 => &[0x90][..],
+                2 => &[0x66, 0x90][..],
+                3 => &[0x0f, 0x1f, 0x00][..],
+                4 => &[0x0f, 0x1f, 0x40, 0x00][..],
+                5 => &[0x0f, 0x1f, 0x44, 0x00, 0x00][..],
+                6 => &[0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00][..],
+                7 => &[0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00][..],
+                8 => &[0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00][..],
+                _ => unreachable!(),
+            };
+            assert_eq!(code, expected);
+        }
+
+        const PATTERNS: [&str; 2] = [
+            r"(?:(?:(?:(?:(?:(?:QtJHg[I-K])){2,3}){1,3}?)+?9(?:(?:[J-M]){2,3}?){1,4}?)(?-u:[\x00-\xFF]))",
+            r"(?:(?:(?:(?:(?:(?:QtJHg[I-L])){2,3}){1,3}?)+?8(?:(?:[J-N]){2,3}?){1,4}?)(?-u:[\x00-\xFF]))",
+        ];
+        let avx512 = FeatureSet::of(CpuFeature::X86Avx512F).with(CpuFeature::X86Avx512Bw);
+        let cases = [
+            (
+                FeatureSet::EMPTY,
+                &[0x66, 0x41, 0x0f, 0xd7, 0xc7, 0x85, 0xc0][..],
+                &[0x48, 0x83, 0xea, 64][..],
+            ),
+            (
+                FeatureSet::of(CpuFeature::X86Avx2),
+                &[0xc4, 0xc1, 0x7d, 0xd7, 0xc7, 0x85, 0xc0][..],
+                &[0x48, 0x81, 0xea, 128, 0, 0, 0][..],
+            ),
+            (
+                avx512,
+                &[0xc4, 0xe1, 0xf8, 0x98, 0xf6][..],
+                &[0x48, 0x81, 0xea, 0, 1, 0, 0][..],
+            ),
+        ];
+
+        assert!(SUFFIX_PREFILTER_MIN_WINDOW_BYTES > 64);
+        for pattern in PATTERNS {
+            for output in [
+                OutputContract::Exists,
+                OutputContract::SelectedEnd,
+                OutputContract::Span,
+            ] {
+                let compiled = compile(
+                    CompileRequest::new(pattern, Target::x86_64_linux())
+                        .mode(CompileMode::Optimizing)
+                        .output(output),
+                )
+                .unwrap();
+                let adaptive = build_native_dfa_table_for_architecture(
+                    compiled.program().native_dfa_view().expect("native DFA"),
+                    Architecture::X86_64,
+                )
+                .unwrap()
+                .1;
+                assert!(adaptive.declined_redundant_root_reverse);
+                let mut baseline = adaptive;
+                baseline.declined_redundant_root_reverse = false;
+
+                for (features, reduce, rewind) in cases {
+                    let baseline_code = lower_x86_64_dfa(baseline, features).unwrap().0;
+                    let adaptive_code = lower_x86_64_dfa(adaptive, features).unwrap().0;
+                    assert_eq!(baseline_code.last(), Some(&0xc3));
+                    assert_eq!(adaptive_code[baseline_code.len() - 1], 0xc3);
+                    assert!(adaptive_code.len() > baseline_code.len());
+                    assert_eq!(
+                        (adaptive_code.len() - baseline_code.len()) % X86_COLD_LINK_ALIGNMENT_BYTES,
+                        0,
+                        "{features:?} {output:?}"
+                    );
+
+                    let reductions = offsets(&baseline_code, reduce);
+                    assert_eq!(reductions.len(), 1, "{features:?} {output:?}");
+                    let primary_hit = reductions[0] + reduce.len();
+                    assert_eq!(&baseline_code[primary_hit..primary_hit + 2], &[0x0f, 0x85]);
+                    let rewind_block = rel32_target(&baseline_code, primary_hit, 2, 6);
+                    assert_eq!(
+                        &baseline_code[rewind_block..rewind_block + rewind.len()],
+                        rewind
+                    );
+                    let replay_branch = rewind_block + rewind.len();
+                    assert_eq!(baseline_code[replay_branch], 0xe9);
+                    assert_eq!(adaptive_code[replay_branch], 0xe9);
+                    assert!(
+                        rel32_target(&baseline_code, replay_branch, 1, 5) < baseline_code.len()
+                    );
+                    assert!(
+                        rel32_target(&adaptive_code, replay_branch, 1, 5) >= baseline_code.len()
+                    );
+
+                    // Disabling only the graph marker is the exact c29 code
+                    // shape. Once the dormant sparse-hit displacement is
+                    // restored, every byte through its final ret is identical.
+                    let mut normalized = adaptive_code[..baseline_code.len()].to_vec();
+                    normalized[replay_branch + 1..replay_branch + 5]
+                        .copy_from_slice(&baseline_code[replay_branch + 1..replay_branch + 5]);
+                    assert_eq!(normalized, baseline_code, "{features:?} {output:?}");
+
+                    let adaptive_reductions = offsets(&adaptive_code, reduce);
+                    assert_eq!(adaptive_reductions.len(), 2);
+                    let joint_hit = adaptive_reductions[1] + reduce.len();
+                    assert_eq!(&adaptive_code[joint_hit..joint_hit + 2], &[0x0f, 0x85]);
+                    let joint_miss = joint_hit + 6;
+                    assert_eq!(adaptive_code[joint_miss], 0xe9);
+                    let joint_loop = rel32_target(&adaptive_code, joint_miss, 1, 5);
+                    let rejections = adaptive_code
+                        .windows(8)
+                        .enumerate()
+                        .filter_map(|(offset, window)| {
+                            (window.starts_with(&[0x48, 0xff, 0xc2, 0xe9])
+                                && rel32_target(&adaptive_code, offset + 3, 1, 5) == joint_loop)
+                                .then_some(offset)
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(rejections.len(), 1);
+                    let padding = &adaptive_code[rejections[0] + 8..];
+                    assert!(padding.len() < X86_COLD_LINK_ALIGNMENT_BYTES);
+                    assert_canonical_nop_padding(padding);
+                }
+            }
+        }
+
+        // The alignment rule is scoped to a genuinely emitted adaptive cold
+        // plan. Forcing the marker on unrelated sparse-start and seeded-
+        // reverse layouts must remain byte-identical on every x86 tier.
+        for pattern in [
+            r"(?-u:\x01)",
+            r"(?:(?:(?:(?:(?:(?:[R-U])+?){1,4}?)+?|sYZ|[j-l])){2,3}?(?-u:[\x00-\xFF]))",
+        ] {
+            for output in [
+                OutputContract::Exists,
+                OutputContract::SelectedEnd,
+                OutputContract::Span,
+            ] {
+                let compiled = compile(
+                    CompileRequest::new(pattern, Target::x86_64_linux())
+                        .mode(CompileMode::Optimizing)
+                        .output(output),
+                )
+                .unwrap();
+                let layout = build_native_dfa_table_for_architecture(
+                    compiled.program().native_dfa_view().expect("native DFA"),
+                    Architecture::X86_64,
+                )
+                .unwrap()
+                .1;
+                assert!(!layout.declined_redundant_root_reverse);
+                let mut forced_marker = layout;
+                forced_marker.declined_redundant_root_reverse = true;
+                for (features, _, _) in cases {
+                    assert_eq!(
+                        lower_x86_64_dfa(layout, features).unwrap().0,
+                        lower_x86_64_dfa(forced_marker, features).unwrap().0,
+                        "{pattern:?} {features:?} {output:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn x86_sparse_mask_batch_is_graph_selected_and_emitted_on_every_simd_tier() {
         let pattern = r"(?-u:\x01)";
         let avx512 = FeatureSet::of(CpuFeature::X86Avx512F).with(CpuFeature::X86Avx512Bw);
@@ -9354,6 +9949,90 @@ mod tests {
                         .vector_filter
                         .is_some_and(|columns| columns.columns().len() >= 2)
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn declined_root_marker_is_output_target_and_spelling_independent_and_scoped() {
+        const EQUIVALENT: [&str; 2] = [
+            r"(?:(?:(?:(?:(?:(?:QtJHg[I-K])){2,3}){1,3}?)+?9(?:(?:[J-M]){2,3}?){1,4}?)(?-u:[\x00-\xFF]))",
+            r"(?:(?:(?:(?:(?:(?:QtJHg[I-L])){2,3}){1,3}?)+?8(?:(?:[J-N]){2,3}?){1,4}?)(?-u:[\x00-\xFF]))",
+        ];
+        const BOUNDED_ACCEPT_SEED: &str =
+            r"(?:(?:(?:(?:(?:(?:[R-U])+?){1,4}?)+?|sYZ|[j-l])){2,3}?(?-u:[\x00-\xFF]))";
+        const NO_SUFFIX: &str =
+            r"(?:(?:(?:(?:(?:(?:vK)+|P|[2-4])|Ww|k5E)){2,5})+(?-u:[\x00-\xFF]))";
+        let outputs = [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ];
+        let targets = [Target::x86_64_linux(), Target::aarch64_linux()];
+
+        for pattern in EQUIVALENT {
+            for target in targets {
+                for output in outputs {
+                    let compiled = compile(
+                        CompileRequest::new(pattern, target)
+                            .mode(CompileMode::Optimizing)
+                            .output(output),
+                    )
+                    .unwrap();
+                    let layout = build_native_dfa_table_for_architecture(
+                        compiled.program().native_dfa_view().expect("native DFA"),
+                        target.architecture,
+                    )
+                    .unwrap()
+                    .1;
+                    assert!(
+                        layout.declined_redundant_root_reverse,
+                        "graph marker changed for {target:?} {output:?}"
+                    );
+                    assert!(layout.seeded_reverse.is_none());
+                    let suffix = layout.suffix_filter.expect("mandatory interior factor");
+                    assert_eq!(suffix.restart, NativeSuffixRestart::OriginalStart);
+                    assert!(suffix.retry.is_none());
+                    assert!(matches!(
+                        suffix.reverse_seed,
+                        NativeSuffixReverseSeed::RootState(_)
+                    ));
+                    let columns = suffix.vector_filter.expect("joint suffix columns");
+                    assert!(columns.columns().len() >= 2);
+                    for kind in [
+                        X86StartFilterKind::Sse2,
+                        X86StartFilterKind::Avx2,
+                        X86StartFilterKind::Avx512Bw,
+                    ] {
+                        assert!(x86_use_sparse_filter_mask_batch(suffix.filter, kind));
+                    }
+                }
+            }
+        }
+
+        for (pattern, has_suffix) in [(BOUNDED_ACCEPT_SEED, true), (NO_SUFFIX, false)] {
+            for output in outputs {
+                let compiled = compile(
+                    CompileRequest::new(pattern, Target::x86_64_linux())
+                        .mode(CompileMode::Optimizing)
+                        .output(output),
+                )
+                .unwrap();
+                let layout = build_native_dfa_table_for_architecture(
+                    compiled.program().native_dfa_view().expect("native DFA"),
+                    Architecture::X86_64,
+                )
+                .unwrap()
+                .1;
+                assert!(!layout.declined_redundant_root_reverse);
+                assert_eq!(layout.suffix_filter.is_some(), has_suffix);
+                if let Some(suffix) = layout.suffix_filter {
+                    assert!(matches!(
+                        suffix.reverse_seed,
+                        NativeSuffixReverseSeed::AcceptBoundary
+                    ));
+                    assert!(suffix.vector_filter.is_none());
+                }
             }
         }
     }
@@ -13054,6 +13733,7 @@ mod tests {
             output: OutputContract::SelectedEnd,
             start_filter: None,
             suffix_filter: None,
+            declined_redundant_root_reverse: false,
             seeded_reverse: None,
             loop_skip: None,
             vector_filter: None,
@@ -13649,6 +14329,7 @@ mod tests {
             output: OutputContract::Span,
             start_filter: None,
             suffix_filter: None,
+            declined_redundant_root_reverse: false,
             seeded_reverse: None,
             loop_skip: None,
             vector_filter: None,
@@ -13757,6 +14438,7 @@ mod tests {
             output: OutputContract::Exists,
             start_filter: Some(start_filter),
             suffix_filter: None,
+            declined_redundant_root_reverse: false,
             seeded_reverse: None,
             loop_skip: None,
             vector_filter: None,
