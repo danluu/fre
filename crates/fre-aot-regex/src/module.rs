@@ -6553,8 +6553,6 @@ type Aarch64Label = usize;
 enum Aarch64FixupKind {
     Branch26,
     Conditional19,
-    CompareBranch19,
-    TestBit14,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -6623,58 +6621,6 @@ impl Aarch64Assembler {
         )
     }
 
-    fn branch_zero_w(&mut self, register: u8, label: Aarch64Label) -> Result<(), ObjectError> {
-        self.branch_placeholder(
-            0x3400_0000 | aarch64_reg(register, 0)?,
-            label,
-            Aarch64FixupKind::CompareBranch19,
-        )
-    }
-
-    fn branch_nonzero_w(&mut self, register: u8, label: Aarch64Label) -> Result<(), ObjectError> {
-        self.branch_placeholder(
-            0x3500_0000 | aarch64_reg(register, 0)?,
-            label,
-            Aarch64FixupKind::CompareBranch19,
-        )
-    }
-
-    fn branch_bit_set_w(
-        &mut self,
-        register: u8,
-        bit: u8,
-        label: Aarch64Label,
-    ) -> Result<(), ObjectError> {
-        if bit > 31 {
-            return Err(ObjectError::InvalidModule(
-                "AArch64 W-register test bit is invalid",
-            ));
-        }
-        self.branch_placeholder(
-            0x3700_0000 | (u32::from(bit) << 19) | aarch64_reg(register, 0)?,
-            label,
-            Aarch64FixupKind::TestBit14,
-        )
-    }
-
-    fn branch_bit_clear_w(
-        &mut self,
-        register: u8,
-        bit: u8,
-        label: Aarch64Label,
-    ) -> Result<(), ObjectError> {
-        if bit > 31 {
-            return Err(ObjectError::InvalidModule(
-                "AArch64 W-register test bit is invalid",
-            ));
-        }
-        self.branch_placeholder(
-            0x3600_0000 | (u32::from(bit) << 19) | aarch64_reg(register, 0)?,
-            label,
-            Aarch64FixupKind::TestBit14,
-        )
-    }
-
     fn branch_placeholder(
         &mut self,
         instruction: u32,
@@ -6729,8 +6675,6 @@ impl Aarch64Assembler {
             let (bits, shift, opcode_mask) = match fixup.kind {
                 Aarch64FixupKind::Branch26 => (26_u8, 0_u8, 0xfc00_0000_u32),
                 Aarch64FixupKind::Conditional19 => (19, 5, 0xff00_001f),
-                Aarch64FixupKind::CompareBranch19 => (19, 5, 0xff00_001f),
-                Aarch64FixupKind::TestBit14 => (14, 5, 0xfff8_001f),
             };
             let sign_bit = bits
                 .checked_sub(1)
@@ -7217,6 +7161,12 @@ fn aarch64_and_low_w(destination: u8, source: u8, bits: u8) -> Result<u32, Objec
 
 fn aarch64_and_low_31(destination: u8, source: u8) -> Result<u32, ObjectError> {
     aarch64_and_low_w(destination, source, 31)
+}
+
+fn aarch64_test_accelerated(source: u8) -> Result<u32, ObjectError> {
+    // `tst Wsource, #1<<30`, the ANDS-immediate alias. A single logical
+    // immediate avoids dedicating a general register to the dispatch bit.
+    Ok(0x7202_001f | aarch64_reg(source, 5)?)
 }
 
 fn aarch64_and_low_x(destination: u8, source: u8, bits: u8) -> Result<u32, ObjectError> {
@@ -9022,11 +8972,14 @@ fn lower_aarch64_dfa_for_operating_system(
     assembler.branch_cond(AARCH64_HS, finish)?;
     aarch64_emit_table_lookup(&mut assembler, layout.transitions)?;
     assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
-    assembler.branch_bit_set_w(8, 31, accept)?;
+    assembler.instruction(aarch64_cmp_w_zero(8)?)?;
+    assembler.branch_cond(AARCH64_MI, accept)?;
     assembler.bind(after_accept)?;
-    assembler.branch_bit_set_w(8, 30, accelerated_transition)?;
+    assembler.instruction(aarch64_test_accelerated(8)?)?;
+    assembler.branch_cond(AARCH64_NE, accelerated_transition)?;
     assembler.instruction(aarch64_and_low_w(6, 8, 30)?)?;
-    assembler.branch_zero_w(6, finish)?;
+    assembler.instruction(aarch64_cmp_w_zero(6)?)?;
+    assembler.branch_cond(AARCH64_EQ, finish)?;
     assembler.instruction(aarch64_sub_w_imm(6, 6, 1)?)?;
     assembler.instruction(
         0x8b00_0000 | aarch64_reg(6, 16)? | aarch64_reg(5, 5)? | aarch64_reg(11, 0)?,
@@ -9035,7 +8988,8 @@ fn lower_aarch64_dfa_for_operating_system(
 
     assembler.bind(accelerated_transition)?;
     assembler.instruction(aarch64_and_low_w(6, 8, 30)?)?;
-    assembler.branch_zero_w(6, finish)?;
+    assembler.instruction(aarch64_cmp_w_zero(6)?)?;
+    assembler.branch_cond(AARCH64_EQ, finish)?;
     assembler.instruction(aarch64_sub_w_imm(6, 6, 1)?)?;
     assembler.instruction(
         0x8b00_0000 | aarch64_reg(6, 16)? | aarch64_reg(5, 5)? | aarch64_reg(11, 0)?,
@@ -9094,10 +9048,12 @@ fn lower_aarch64_dfa_for_operating_system(
             assembler.branch_cond(AARCH64_LS, reverse_finish)?;
             assembler.instruction(aarch64_sub_x_imm(2, 2, 1)?)?;
             aarch64_emit_table_lookup(&mut assembler, layout.transitions)?;
-            assembler.branch_bit_set_w(8, 31, record_reverse_start)?;
+            assembler.instruction(aarch64_cmp_w_zero(8)?)?;
+            assembler.branch_cond(AARCH64_MI, record_reverse_start)?;
             assembler.bind(reverse_continue)?;
             assembler.instruction(aarch64_and_low_31(6, 8)?)?;
-            assembler.branch_zero_w(6, reverse_finish)?;
+            assembler.instruction(aarch64_cmp_w_zero(6)?)?;
+            assembler.branch_cond(AARCH64_EQ, reverse_finish)?;
             assembler.instruction(aarch64_sub_w_imm(6, 6, 1)?)?;
             assembler.instruction(
                 0x8b00_0000 | aarch64_reg(6, 16)? | aarch64_reg(5, 5)? | aarch64_reg(11, 0)?,
@@ -9323,28 +9279,6 @@ mod tests {
             assert_eq!(target.abi, abi);
             assert_eq!(target.validate(), Ok(()));
         }
-    }
-
-    #[test]
-    fn aarch64_compare_and_test_branch_fixups_have_exact_encodings() {
-        let mut assembler = Aarch64Assembler::new();
-        let target = assembler.label().unwrap();
-        assembler.branch_bit_set_w(8, 31, target).unwrap();
-        assembler.branch_zero_w(6, target).unwrap();
-        assembler.instruction(0xd503_201f).unwrap(); // nop
-        assembler.bind(target).unwrap();
-        let words = assembler
-            .finish()
-            .unwrap()
-            .chunks_exact(4)
-            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
-            .collect::<Vec<_>>();
-        assert_eq!(words, [0x37f8_0068, 0x3400_0046, 0xd503_201f]);
-
-        let mut invalid = Aarch64Assembler::new();
-        let label = invalid.label().unwrap();
-        assert!(invalid.branch_bit_set_w(8, 32, label).is_err());
-        assert!(invalid.branch_bit_clear_w(8, 32, label).is_err());
     }
 
     #[test]
@@ -14328,43 +14262,41 @@ mod tests {
                 .windows(direct_lookup.len())
                 .any(|window| window == direct_lookup)
         );
+        assert!(direct_words.contains(&aarch64_test_accelerated(8).unwrap()));
         assert!(direct_words.contains(&aarch64_and_low_w(6, 8, 30).unwrap()));
         let aarch64_dispatch = direct_words
             .iter()
-            .position(|&word| word & 0xfff8_001f == 0x37f0_0008)
+            .position(|&word| word == aarch64_test_accelerated(8).unwrap())
             .unwrap();
+        assert_eq!(direct_words[aarch64_dispatch + 1], 0x5400_00e1); // b.ne +7
         assert_eq!(
-            direct_words[aarch64_dispatch + 1],
+            direct_words[aarch64_dispatch + 2],
             aarch64_and_low_w(6, 8, 30).unwrap()
-        );
-        assert_eq!(
-            direct_words[aarch64_dispatch + 2] & 0xff00_001f,
-            0x3400_0006
         );
         assert_eq!(
             direct_words[aarch64_dispatch + 3],
+            aarch64_cmp_w_zero(6).unwrap()
+        );
+        assert_eq!(
+            direct_words[aarch64_dispatch + 5],
             aarch64_sub_w_imm(6, 6, 1).unwrap()
         );
-        assert_eq!(direct_words[aarch64_dispatch + 4], 0x8b06_00ab);
+        assert_eq!(direct_words[aarch64_dispatch + 6], 0x8b06_00ab);
         assert_eq!(
-            direct_words[aarch64_dispatch + 5] & 0xfc00_0000,
+            direct_words[aarch64_dispatch + 7] & 0xfc00_0000,
             0x1400_0000
         );
-        assert_ne!(direct_words[aarch64_dispatch + 5] & 0x0200_0000, 0);
+        assert_ne!(direct_words[aarch64_dispatch + 7] & 0x0200_0000, 0);
         assert_eq!(
-            direct_words[aarch64_dispatch + 6],
+            direct_words[aarch64_dispatch + 8],
             aarch64_and_low_w(6, 8, 30).unwrap()
         );
+        assert_eq!(direct_words[aarch64_dispatch + 12], 0x8b06_00ab);
         assert_eq!(
-            direct_words[aarch64_dispatch + 7] & 0xff00_001f,
-            0x3400_0006
-        );
-        assert_eq!(direct_words[aarch64_dispatch + 9], 0x8b06_00ab);
-        assert_eq!(
-            direct_words[aarch64_dispatch + 10] & 0xfc00_0000,
+            direct_words[aarch64_dispatch + 13] & 0xfc00_0000,
             0x1400_0000
         );
-        assert_ne!(direct_words[aarch64_dispatch + 10] & 0x0200_0000, 0);
+        assert_ne!(direct_words[aarch64_dispatch + 13] & 0x0200_0000, 0);
 
         let class_aarch64 = lower_aarch64_dfa(class_mapped, FeatureSet::EMPTY)
             .unwrap()
@@ -14383,11 +14315,7 @@ mod tests {
                 .windows(class_lookup.len())
                 .any(|window| window == class_lookup)
         );
-        assert!(
-            class_words
-                .iter()
-                .any(|&word| word & 0xfff8_001f == 0x37f0_0008)
-        );
+        assert!(class_words.contains(&aarch64_test_accelerated(8).unwrap()));
         assert!(class_words.contains(&aarch64_and_low_w(6, 8, 30).unwrap()));
 
         let direct_reverse_x86 = lower_x86_64_dfa(direct_reverse, FeatureSet::EMPTY)
@@ -14554,11 +14482,17 @@ mod tests {
             .chunks_exact(4)
             .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
             .collect::<Vec<_>>();
-        let accept_branches = words
-            .iter()
-            .filter(|&&word| word & 0xfff8_001f == 0x37f8_0008)
-            .count();
-        assert_eq!(accept_branches, 2); // forward and reverse
+        let accept_conditions = words
+            .windows(2)
+            .filter(|pair| pair[0] == aarch64_cmp_w_zero(8).unwrap())
+            .map(|pair| pair[1] & 0xff00_001f)
+            .collect::<Vec<_>>();
+        assert_eq!(accept_conditions.len(), 2); // forward and reverse
+        assert!(
+            accept_conditions
+                .iter()
+                .all(|condition| *condition == 0x5400_0000 | u32::from(AARCH64_MI))
+        );
     }
 
     #[test]
