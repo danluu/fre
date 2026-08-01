@@ -8,6 +8,60 @@ const ONE_ANCHOR_PATTERN: &str = r"Q[ab][cd][ef][gh][ij][kl][mn][op][rs][tu][vw]
 const TWO_ANCHOR_PATTERN: &str = r"[ab][cd][ef][gh][ij][kl][mn][op][rs][tu][vw][xy][01]";
 const SHIFT_AND_PATTERN: &str = r"[abc][def][ghi][jkl][mno][pqr][stu][vwx]";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MatrixReducer {
+    One,
+    Two,
+    ShiftAnd,
+}
+
+fn matrix_pattern(width: usize, reducer: MatrixReducer, anchor_offset: Option<usize>) -> String {
+    let mut pattern = String::new();
+    for position in 0..width {
+        if Some(position) == anchor_offset {
+            let anchor = match (reducer, position) {
+                (MatrixReducer::One, 0) => "e",
+                (MatrixReducer::One, _) if position + 1 == width => "/",
+                (MatrixReducer::One, _) => r"\x01",
+                (MatrixReducer::Two, 0) => "[e0]",
+                (MatrixReducer::Two, _) if position + 1 == width => "[/0]",
+                (MatrixReducer::Two, _) => r"[\x01\x02]",
+                (MatrixReducer::ShiftAnd, _) => panic!("ShiftAnd has no anchor offset"),
+            };
+            pattern.push_str(anchor);
+        } else {
+            pattern.push_str(match position % 3 {
+                0 => "[abc]",
+                1 => "[d-g]",
+                _ => "[h-l]",
+            });
+        }
+    }
+    pattern
+}
+
+fn matrix_word(width: usize, reducer: MatrixReducer, anchor_offset: Option<usize>) -> Vec<u8> {
+    (0..width)
+        .map(|position| {
+            if Some(position) == anchor_offset {
+                match (reducer, position) {
+                    (MatrixReducer::One, 0) | (MatrixReducer::Two, 0) => b'e',
+                    (MatrixReducer::One, _) if position + 1 == width => b'/',
+                    (MatrixReducer::Two, _) if position + 1 == width => b'/',
+                    (MatrixReducer::One | MatrixReducer::Two, _) => 1,
+                    (MatrixReducer::ShiftAnd, _) => panic!("ShiftAnd has no anchor offset"),
+                }
+            } else {
+                match position % 3 {
+                    0 => b'a',
+                    1 => b'd',
+                    _ => b'h',
+                }
+            }
+        })
+        .collect()
+}
+
 fn build_auto(pattern: &str) -> fre::PortableRegex {
     PortableBuilder::new(pattern)
         .unicode(false)
@@ -28,47 +82,300 @@ fn span(matched: Option<fre::Match>) -> Option<(usize, usize)> {
 }
 
 #[test]
-fn default_large_cartesian_languages_select_each_fixed_predicate_reducer() {
-    let cases: [(&str, &[u8], FixedPredicateWord64Reducer); 3] = [
+fn default_large_cartesian_languages_select_only_certified_anchor_reducers() {
+    let cases: [(&str, &[u8], Option<FixedPredicateWord64Reducer>); 3] = [
         (
             ONE_ANCHOR_PATTERN,
             b"--Qacegikmortvx0--",
-            FixedPredicateWord64Reducer::OneByteAnchor,
+            Some(FixedPredicateWord64Reducer::OneByteAnchor),
         ),
         (
             TWO_ANCHOR_PATTERN,
             b"--acegikmortvx0--",
-            FixedPredicateWord64Reducer::TwoByteAnchor,
+            Some(FixedPredicateWord64Reducer::TwoByteAnchor),
         ),
-        (
-            SHIFT_AND_PATTERN,
-            b"--adgjmpsv--",
-            FixedPredicateWord64Reducer::ShiftAnd,
-        ),
+        (SHIFT_AND_PATTERN, b"--adgjmpsv--", None),
     ];
     for (pattern, haystack, reducer) in cases {
         let regex = build_auto(pattern);
-        assert_eq!(regex.build_report().plan, PlanKind::FixedPredicateWord64);
-        assert!(regex.build_report().lowering.is_none());
-        assert_eq!(regex.build_report().states, 0);
-        assert_eq!(regex.build_report().edges, 0);
-        assert_eq!(
-            regex.build_report().charged_persistent_bytes,
-            regex
-                .build_report()
-                .source_storage_bytes
-                .checked_add(regex.build_report().capture_name_storage_bytes)
-                .and_then(|bytes| bytes.checked_add(regex.build_report().plan_storage_bytes))
-                .unwrap()
-        );
         let (matched, accounting) = regex.find(haystack, SearchLimits::unlimited()).unwrap();
         assert!(matched.is_some(), "pattern={pattern:?}");
-        let SearchAccounting::FixedPredicateWord64(accounting) = accounting else {
-            panic!("fixed-predicate route published another accounting family");
-        };
-        assert_eq!(accounting.identity.reducer, reducer);
-        assert_eq!(accounting.upper_bounds.scratch_bytes, 0);
-        assert_eq!(accounting.actual.scratch_bytes, 0);
+        if let Some(reducer) = reducer {
+            assert_eq!(regex.build_report().plan, PlanKind::FixedPredicateWord64);
+            assert!(regex.build_report().lowering.is_none());
+            assert_eq!(regex.build_report().states, 0);
+            assert_eq!(regex.build_report().edges, 0);
+            assert_eq!(
+                regex.build_report().charged_persistent_bytes,
+                regex
+                    .build_report()
+                    .source_storage_bytes
+                    .checked_add(regex.build_report().capture_name_storage_bytes)
+                    .and_then(|bytes| bytes.checked_add(regex.build_report().plan_storage_bytes))
+                    .unwrap()
+            );
+            let SearchAccounting::FixedPredicateWord64(accounting) = accounting else {
+                panic!("fixed-predicate route published another accounting family");
+            };
+            assert_eq!(accounting.identity.reducer, reducer);
+            assert_eq!(accounting.upper_bounds.scratch_bytes, 0);
+            assert_eq!(accounting.actual.scratch_bytes, 0);
+        } else {
+            assert_eq!(regex.build_report().plan, PlanKind::K0);
+            assert!(matches!(accounting, SearchAccounting::K0(_)));
+        }
+    }
+}
+
+#[test]
+fn fixed_predicate_v2_auto_route_matrix_is_exact_at_width_16() {
+    for width in [12, 15, 16] {
+        for reducer in [
+            MatrixReducer::One,
+            MatrixReducer::Two,
+            MatrixReducer::ShiftAnd,
+        ] {
+            let offsets = match reducer {
+                MatrixReducer::One | MatrixReducer::Two => {
+                    vec![Some(0), Some(width / 2), Some(width - 1)]
+                }
+                MatrixReducer::ShiftAnd => vec![None],
+            };
+            for anchor_offset in offsets {
+                let pattern = matrix_pattern(width, reducer, anchor_offset);
+                let regex = build_auto(&pattern);
+                let word = matrix_word(width, reducer, anchor_offset);
+                let (matched, accounting) = regex
+                    .find(&word, SearchLimits::unlimited())
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "matrix search failed width={width} reducer={reducer:?} offset={anchor_offset:?}: {error:?}"
+                        )
+                    });
+                assert_eq!(span(matched), Some((0, width)));
+                match reducer {
+                    MatrixReducer::One | MatrixReducer::Two => {
+                        assert_eq!(
+                            regex.build_report().plan,
+                            PlanKind::FixedPredicateWord64,
+                            "width={width} reducer={reducer:?} offset={anchor_offset:?}"
+                        );
+                        let SearchAccounting::FixedPredicateWord64(accounting) = accounting else {
+                            panic!(
+                                "admitted matrix route lost fixed accounting width={width} reducer={reducer:?} offset={anchor_offset:?}"
+                            );
+                        };
+                        let expected = match reducer {
+                            MatrixReducer::One => FixedPredicateWord64Reducer::OneByteAnchor,
+                            MatrixReducer::Two => FixedPredicateWord64Reducer::TwoByteAnchor,
+                            MatrixReducer::ShiftAnd => unreachable!(),
+                        };
+                        assert_eq!(accounting.identity.reducer, expected);
+                        let session = regex
+                            .search_session(SearchSessionLimits::unlimited())
+                            .unwrap();
+                        assert_eq!(session.workspace_setup_accounting(), None);
+                    }
+                    MatrixReducer::ShiftAnd => {
+                        assert_eq!(regex.build_report().plan, PlanKind::K0);
+                        assert!(matches!(accounting, SearchAccounting::K0(_)));
+                        let session = regex
+                            .search_session(SearchSessionLimits::unlimited())
+                            .unwrap();
+                        assert!(session.workspace_setup_accounting().is_some());
+                    }
+                }
+            }
+        }
+    }
+
+    for width in [17, 24] {
+        for reducer in [
+            MatrixReducer::One,
+            MatrixReducer::Two,
+            MatrixReducer::ShiftAnd,
+        ] {
+            let anchor_offset = match reducer {
+                MatrixReducer::One | MatrixReducer::Two => Some(width / 2),
+                MatrixReducer::ShiftAnd => None,
+            };
+            let pattern = matrix_pattern(width, reducer, anchor_offset);
+            let regex = build_auto(&pattern);
+            assert_eq!(
+                regex.build_report().plan,
+                PlanKind::K0,
+                "width={width} reducer={reducer:?}"
+            );
+            assert_eq!(regex.runtime_implementation_id(), "k0");
+            let word = matrix_word(width, reducer, anchor_offset);
+            let (matched, accounting) = regex.find(&word, SearchLimits::unlimited()).unwrap();
+            assert_eq!(span(matched), Some((0, width)));
+            assert!(matches!(accounting, SearchAccounting::K0(_)));
+            let session = regex
+                .search_session(SearchSessionLimits::unlimited())
+                .unwrap();
+            assert!(session.workspace_setup_accounting().is_some());
+        }
+    }
+
+    let folded_16 = format!("(?i:{})", "a".repeat(16));
+    assert_eq!(
+        build_auto(&folded_16).build_report().plan,
+        PlanKind::FixedPredicateWord64
+    );
+    let folded_17 = format!("(?i:{})", "a".repeat(17));
+    assert_eq!(
+        build_auto(&folded_17).build_report().plan,
+        PlanKind::K0,
+        "a declined fixed-width proof must not select another Auto specialization"
+    );
+}
+
+fn matrix_haystacks(
+    width: usize,
+    reducer: MatrixReducer,
+    anchor_offset: Option<usize>,
+) -> Vec<Vec<u8>> {
+    let word = matrix_word(width, reducer, anchor_offset);
+    let mut early = word.clone();
+    early.extend_from_slice(&[0x7f; 19]);
+
+    let mut late = vec![0x7f; width * 3 + 17];
+    late.extend_from_slice(&word);
+
+    let absent = vec![0x7f; width * 4 + 31];
+
+    let mut rejected = vec![0x7f; width * 4 + 31];
+    if let Some(offset) = anchor_offset {
+        for start in (1..rejected.len().saturating_sub(width)).step_by(5) {
+            rejected[start + offset] = word[offset];
+        }
+    }
+
+    let mut dense = Vec::new();
+    for _ in 0..4 {
+        dense.extend_from_slice(&word);
+        dense.push(0x7f);
+    }
+    vec![early, late, absent, rejected, dense]
+}
+
+#[test]
+fn fixed_predicate_v2_routes_match_k0_across_search_session_and_window_apis() {
+    let cases = [
+        (12, MatrixReducer::One, Some(0)),
+        (15, MatrixReducer::Two, Some(15 / 2)),
+        (16, MatrixReducer::One, Some(15)),
+        (16, MatrixReducer::ShiftAnd, None),
+        (17, MatrixReducer::One, Some(17 / 2)),
+        (24, MatrixReducer::Two, Some(24 / 2)),
+    ];
+    for (width, reducer, anchor_offset) in cases {
+        let pattern = matrix_pattern(width, reducer, anchor_offset);
+        let auto = build_auto(&pattern);
+        let k0 = build_k0(&pattern);
+        let admitted = width <= 16 && reducer != MatrixReducer::ShiftAnd;
+        assert_eq!(
+            auto.build_report().plan,
+            if admitted {
+                PlanKind::FixedPredicateWord64
+            } else {
+                PlanKind::K0
+            }
+        );
+        for haystack in matrix_haystacks(width, reducer, anchor_offset) {
+            let limits = SearchLimits::unlimited();
+            assert_eq!(
+                span(auto.find(&haystack, limits).unwrap().0),
+                span(k0.find(&haystack, limits).unwrap().0)
+            );
+            assert_eq!(
+                span(auto.find_value(&haystack, limits).unwrap()),
+                span(k0.find_value(&haystack, limits).unwrap())
+            );
+            assert_eq!(
+                auto.is_match_value(&haystack, limits).unwrap(),
+                k0.is_match_value(&haystack, limits).unwrap()
+            );
+            assert_eq!(
+                auto.shortest_match(&haystack, limits).unwrap().0,
+                k0.shortest_match(&haystack, limits).unwrap().0
+            );
+            assert_eq!(
+                auto.selected_end(&haystack, limits).unwrap().0,
+                k0.selected_end(&haystack, limits).unwrap().0
+            );
+
+            let auto_matches: Result<Vec<_>, _> = auto
+                .find_iter(&haystack, PortableFindIterLimits::unlimited())
+                .unwrap()
+                .map(|matched| matched.map(|matched| (matched.start(), matched.end())))
+                .collect();
+            let k0_matches: Result<Vec<_>, _> = k0
+                .find_iter(&haystack, PortableFindIterLimits::unlimited())
+                .unwrap()
+                .map(|matched| matched.map(|matched| (matched.start(), matched.end())))
+                .collect();
+            assert_eq!(auto_matches.unwrap(), k0_matches.unwrap());
+
+            let mut auto_session = auto
+                .search_session(SearchSessionLimits::unlimited())
+                .unwrap();
+            let mut k0_session = k0.search_session(SearchSessionLimits::unlimited()).unwrap();
+            assert_eq!(
+                auto_session.workspace_setup_accounting().is_none(),
+                admitted
+            );
+            assert_eq!(
+                span(auto_session.find_value(&haystack, limits).unwrap()),
+                span(k0_session.find_value(&haystack, limits).unwrap())
+            );
+
+            let mut auto_endpoint = auto
+                .endpoint_search_session(SearchSessionLimits::unlimited())
+                .unwrap();
+            let mut k0_endpoint = k0
+                .endpoint_search_session(SearchSessionLimits::unlimited())
+                .unwrap();
+            assert_eq!(
+                auto_endpoint.selected_end(&haystack, limits).unwrap().0,
+                k0_endpoint.selected_end(&haystack, limits).unwrap().0
+            );
+        }
+
+        let word = matrix_word(width, reducer, anchor_offset);
+        let mut guarded = word.clone();
+        guarded.extend_from_slice(&[0x7f; 7]);
+        let window_start = guarded.len();
+        guarded.extend_from_slice(&word);
+        let window_end = guarded.len();
+        guarded.extend_from_slice(&[0x7f; 7]);
+        guarded.extend_from_slice(&word);
+        let window = SearchWindow::new(window_start, window_end);
+        assert_eq!(
+            span(
+                auto.find_window(&guarded, window, SearchLimits::unlimited())
+                    .unwrap()
+                    .0
+            ),
+            span(
+                k0.find_window(&guarded, window, SearchLimits::unlimited())
+                    .unwrap()
+                    .0
+            )
+        );
+        assert!(
+            auto.find_window(&guarded, SearchWindow::new(1, 0), SearchLimits::unlimited())
+                .is_err()
+        );
+        assert!(
+            auto.find_window(
+                &guarded,
+                SearchWindow::new(0, guarded.len() + 1),
+                SearchLimits::unlimited()
+            )
+            .is_err()
+        );
     }
 }
 
@@ -256,6 +563,41 @@ fn fixed_predicate_limits_close_at_exact_planner_persistent_and_search_bounds() 
             fre::FixedPredicateWord64SearchError::WorkLimit { .. }
         ))
     ));
+}
+
+#[test]
+fn declined_fixed_predicate_inspections_preserve_exact_cumulative_planner_work() {
+    let cases = [
+        matrix_pattern(16, MatrixReducer::ShiftAnd, None),
+        matrix_pattern(17, MatrixReducer::One, Some(17 / 2)),
+        matrix_pattern(24, MatrixReducer::Two, Some(24 / 2)),
+    ];
+    for pattern in cases {
+        let baseline = build_auto(&pattern);
+        let report = baseline.build_report();
+        assert_eq!(report.plan, PlanKind::K0);
+        assert!(report.planner_work > 0);
+
+        let mut exact_limits = BuildLimits::default();
+        exact_limits.max_planner_work = report.planner_work;
+        let exact = PortableBuilder::new(&pattern)
+            .unicode(false)
+            .limits(exact_limits)
+            .build()
+            .unwrap();
+        assert_eq!(exact.build_report().plan, PlanKind::K0);
+        assert_eq!(exact.build_report().planner_work, report.planner_work);
+
+        let mut below_limits = exact_limits;
+        below_limits.max_planner_work = report.planner_work - 1;
+        assert!(matches!(
+            PortableBuilder::new(&pattern)
+                .unicode(false)
+                .limits(below_limits)
+                .build(),
+            Err(BuildError::PlannerWorkLimit { .. })
+        ));
+    }
 }
 
 #[test]

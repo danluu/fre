@@ -621,6 +621,11 @@ pub use unicode_word_run::{
 /// Stable schema for facade-level explanation records.
 pub const EXPLAIN_SCHEMA_VERSION: u32 = 9;
 
+/// Largest fixed-predicate word whose scalar anchor verification is certified
+/// for automatic ordinary-search selection. Direct kernel APIs retain their
+/// complete width-64 contract.
+const FIXED_PREDICATE_SEARCH_AUTO_MAX_WIDTH: usize = 16;
+
 /// Escapes all regular-expression meta characters in `pattern`.
 ///
 /// The returned string is safe to use as a literal in a Rust-compatible
@@ -3129,7 +3134,7 @@ impl PortableBuilder {
             ));
         }
         finite_work = fixed_predicate_receipt.actual().work;
-        match fixed_predicate_inspection {
+        let fixed_predicate_declined = match fixed_predicate_inspection {
             finite::FixedPredicateInspectionAttempt::Succeeded { source: fixed, .. } => {
                 let expected_hir_nodes = usize::try_from(syntax.hir_nodes).map_err(|_| {
                     BuildError::InternalInvariant("syntax HIR-node count does not fit usize")
@@ -3188,64 +3193,83 @@ impl PortableBuilder {
                     ));
                 }
                 let (plan, _) = attempt.into_parts();
-                let plan_storage_bytes = plan.build_accounting().persistent_bytes;
-                let charged_persistent_bytes = source_storage_bytes
-                    .checked_add(capture_name_storage_bytes)
-                    .and_then(|bytes| bytes.checked_add(plan_storage_bytes))
-                    .ok_or(BuildError::PersistentBytesOverflow)?;
-                if charged_persistent_bytes > self.limits.max_persistent_bytes {
-                    return Err(BuildError::PersistentBytesLimit {
-                        needed: charged_persistent_bytes,
-                        limit: self.limits.max_persistent_bytes,
+                let reducer = plan
+                    .search_operation_identity(FixedPredicateWord64SearchOperation::Exists)
+                    .reducer;
+                let auto_admitted = fixed.width() <= FIXED_PREDICATE_SEARCH_AUTO_MAX_WIDTH
+                    && matches!(
+                        reducer,
+                        FixedPredicateWord64Reducer::OneByteAnchor
+                            | FixedPredicateWord64Reducer::TwoByteAnchor
+                    );
+                if auto_admitted {
+                    let plan_storage_bytes = plan.build_accounting().persistent_bytes;
+                    let charged_persistent_bytes = source_storage_bytes
+                        .checked_add(capture_name_storage_bytes)
+                        .and_then(|bytes| bytes.checked_add(plan_storage_bytes))
+                        .ok_or(BuildError::PersistentBytesOverflow)?;
+                    if charged_persistent_bytes > self.limits.max_persistent_bytes {
+                        return Err(BuildError::PersistentBytesLimit {
+                            needed: charged_persistent_bytes,
+                            limit: self.limits.max_persistent_bytes,
+                        });
+                    }
+                    let plan =
+                        fre_exact_alloc::try_box_preserve(plan).map_err(
+                            |(error, _)| match error {
+                                fre_exact_alloc::CopyError::LayoutOverflow => {
+                                    BuildError::InternalInvariant(
+                                        "fixed-predicate search owner layout overflowed",
+                                    )
+                                }
+                                fre_exact_alloc::CopyError::AllocationFailed => {
+                                    BuildError::AllocationFailed {
+                                        structure: "fixed-predicate search owner",
+                                        additional: 1,
+                                    }
+                                }
+                            },
+                        )?;
+                    return Ok(PortableRegex {
+                        source,
+                        capture_names,
+                        line_total_grep_plan,
+                        plan: PortablePlan::FixedPredicateWord64(plan),
+                        profile: profile.clone(),
+                        limits: self.limits,
+                        selection: self.selection,
+                        report: BuildReport {
+                            profile: profile.clone(),
+                            admission,
+                            syntax,
+                            plan: PlanKind::FixedPredicateWord64,
+                            planner_work: finite_work,
+                            lowering: None,
+                            states: 0,
+                            edges: 0,
+                            plan_storage_bytes,
+                            source_storage_bytes,
+                            capture_name_storage_bytes,
+                            charged_persistent_bytes,
+                            persistent_byte_limit: self.limits.max_persistent_bytes,
+                            captures_len,
+                            static_captures_len,
+                            minimum_match_bytes,
+                            required_literal: None,
+                            literal_class_run_literal: None,
+                            forward_anchored: None,
+                        },
                     });
                 }
-                let plan = fre_exact_alloc::try_box_preserve(plan).map_err(|(error, _)| match error {
-                    fre_exact_alloc::CopyError::LayoutOverflow => BuildError::InternalInvariant(
-                        "fixed-predicate search owner layout overflowed",
-                    ),
-                    fre_exact_alloc::CopyError::AllocationFailed => BuildError::AllocationFailed {
-                        structure: "fixed-predicate search owner",
-                        additional: 1,
-                    },
-                })?;
-                return Ok(PortableRegex {
-                    source,
-                    capture_names,
-                    line_total_grep_plan,
-                    plan: PortablePlan::FixedPredicateWord64(plan),
-                    profile: profile.clone(),
-                    limits: self.limits,
-                    selection: self.selection,
-                    report: BuildReport {
-                        profile: profile.clone(),
-                        admission,
-                        syntax,
-                        plan: PlanKind::FixedPredicateWord64,
-                        planner_work: finite_work,
-                        lowering: None,
-                        states: 0,
-                        edges: 0,
-                        plan_storage_bytes,
-                        source_storage_bytes,
-                        capture_name_storage_bytes,
-                        charged_persistent_bytes,
-                        persistent_byte_limit: self.limits.max_persistent_bytes,
-                        captures_len,
-                        static_captures_len,
-                        minimum_match_bytes,
-                        required_literal: None,
-                        literal_class_run_literal: None,
-                        forward_anchored: None,
-                    },
-                });
+                true
             }
-            finite::FixedPredicateInspectionAttempt::Refused { .. } => {}
+            finite::FixedPredicateInspectionAttempt::Refused { .. } => false,
             finite::FixedPredicateInspectionAttempt::ResourceFailure { error, .. } => {
                 return Err(error);
             }
-        }
+        };
         let mut fallback_planner_work = finite_work;
-        if self.selection == PlanSelection::Auto {
+        if self.selection == PlanSelection::Auto && !fixed_predicate_declined {
             let retained_facade_bytes = source_storage_bytes
                 .checked_add(capture_name_storage_bytes)
                 .ok_or(BuildError::PersistentBytesOverflow)?;
