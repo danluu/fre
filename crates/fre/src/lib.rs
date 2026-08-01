@@ -4931,6 +4931,10 @@ impl PortableRegex {
     /// # Errors
     ///
     /// Returns [`SearchError`] for an invalid window or a resource refusal.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "each native owner retains its direct value-only span projection"
+    )]
     pub fn find_window_value(
         &self,
         haystack: &[u8],
@@ -4938,13 +4942,105 @@ impl PortableRegex {
         limits: SearchLimits,
     ) -> Result<Option<Match>, SearchError> {
         match &self.plan {
+            PortablePlan::ExactLiteral(literal) => literal
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    literal_limits(limits),
+                )
+                .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
+            PortablePlan::PackedLiteralSet(literal_set) => literal_set
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    packed_literal_set_limits(limits),
+                )
+                .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
+            PortablePlan::LiteralSetDfa(literal_set) => literal_set
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    literal_set_limits(limits),
+                )
+                .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
+            PortablePlan::RequiredLiteral(required) => required
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    required_literal_limits(limits),
+                )
+                .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
+            PortablePlan::DispatchedRequiredLiteral(required) => required
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    required_literal_limits(limits),
+                )
+                .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
+            PortablePlan::BoundedRequiredLiteral(required) => required
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    required_literal_limits(limits),
+                )
+                .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
+            PortablePlan::DispatchedBoundedRequiredLiteral(required) => required
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    required_literal_limits(limits),
+                )
+                .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
+            PortablePlan::LiteralClassRunLiteral(plan) => plan
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    literal_class_run_literal_limits(limits),
+                )
+                .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
+            PortablePlan::LiteralClassRunSearch(plan) => plan
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    literal_class_run_literal_limits(limits),
+                )
+                .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
             PortablePlan::PureByteClassRepeat(plan) => plan
                 .find_window(haystack, window, limits)
                 .map(|(matched, _)| matched)
                 .map_err(SearchError::from),
-            PortablePlan::BoundedByteClassRepeat(plan) => plan
-                .find_window(haystack, window, limits)
-                .map(|(matched, _)| matched)
+            PortablePlan::ForwardAnchored(forward) => forward
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    forward_anchored_limits(limits),
+                )
+                .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
+            PortablePlan::DispatchedForwardAnchored(forward) => forward
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    forward_anchored_limits(limits),
+                )
+                .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
+            PortablePlan::ForwardEndFixed(fixed) => fixed
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    forward_anchored_limits(limits),
+                )
+                .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
                 .map_err(SearchError::from),
             PortablePlan::K0(automaton) => automaton
                 .prepare::<Span>()
@@ -4956,9 +5052,35 @@ impl PortableRegex {
                     })
                 })
                 .map_err(SearchError::from),
-            _ => self
+            PortablePlan::UnicodeFoldedLiteral(plan) => plan
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    unicode_folded_literal_limits(limits),
+                )
+                .map(|(matched, _)| {
+                    matched.map(|candidate| Match {
+                        start: candidate.start(),
+                        end: candidate.end(),
+                    })
+                })
+                .map_err(SearchError::from),
+            PortablePlan::UnicodeWordRun(plan) => plan
                 .find_window(haystack, window, limits)
-                .map(|(matched, _)| matched),
+                .map(|(matched, _)| matched)
+                .map_err(SearchError::from),
+            PortablePlan::AsciiWordRun(plan) => plan
+                .find_window(haystack, window, limits)
+                .map(|(matched, _)| matched)
+                .map_err(SearchError::from),
+            PortablePlan::BoundedWordClass(plan) => plan
+                .find_window(haystack, window, limits)
+                .map(|(matched, _)| matched)
+                .map_err(SearchError::from),
+            PortablePlan::BoundedByteClassRepeat(plan) => plan
+                .find_window(haystack, window, limits)
+                .map(|(matched, _)| matched)
+                .map_err(SearchError::from),
         }
     }
 
@@ -5612,9 +5734,9 @@ impl<'r> PortableSearchSession<'r> {
         limits: SearchLimits,
     ) -> Result<Option<Match>, SearchError> {
         match &mut self.plan {
-            PortableSearchSessionPlan::Native(regex) => regex
-                .find_window(haystack, window, limits)
-                .map(|(matched, _)| matched),
+            PortableSearchSessionPlan::Native(regex) => {
+                regex.find_window_value(haystack, window, limits)
+            }
             PortableSearchSessionPlan::K0 { session } => session
                 .search_window::<Span>(haystack, window, limits)
                 .map(|report| {
