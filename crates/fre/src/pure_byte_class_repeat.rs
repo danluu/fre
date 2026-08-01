@@ -255,6 +255,26 @@ impl Plan {
         Ok((matched, accounting))
     }
 
+    pub(crate) fn is_match_window_value(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<bool, SearchError> {
+        validate_window(haystack, window)?;
+        let mut meter = WorkMeter::new(limits.max_work);
+        self.owner()
+            .member_seek
+            .seek(
+                haystack,
+                window.start(),
+                window.end(),
+                &mut meter,
+                self.owner().classifier.as_ref(),
+            )
+            .map(|matched| matched.is_some())
+    }
+
     pub(crate) fn earliest_end_window(
         &self,
         haystack: &[u8],

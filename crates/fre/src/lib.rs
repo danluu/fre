@@ -4103,8 +4103,7 @@ impl PortableRegex {
                 .map(|(matched, _)| matched.is_some())
                 .map_err(SearchError::from),
             PortablePlan::PureByteClassRepeat(plan) => plan
-                .is_match_window(haystack, window, limits)
-                .map(|(matched, _)| matched)
+                .is_match_window_value(haystack, window, limits)
                 .map_err(SearchError::from),
             PortablePlan::BoundedByteClassRepeat(plan) => plan
                 .is_match_window(haystack, window, limits)
