@@ -220,8 +220,8 @@ def parse_result(path: Path) -> ResultFile:
     ):
         if key not in metadata:
             raise ValidationError(f"{path}: missing environment metadata {key}")
-    if metadata["regex_version"] != "1.12.4":
-        raise ValidationError(f"{path}: Rust regex version is not the pinned 1.12.4")
+    if metadata["regex_version"] != "1.13.1":
+        raise ValidationError(f"{path}: Rust regex version is not the pinned 1.13.1")
     if metadata["regex_features"] != "default,perf-dfa-full (logging disabled)":
         raise ValidationError(f"{path}: Rust regex feature receipt is unexpected")
     mode = metadata["benchmark_mode"]
@@ -1172,7 +1172,7 @@ def self_test() -> None:
             output.write("environment\tfeature_bits\t0x1\n")
             output.write("environment\trequested_features\tsynthetic\n")
             output.write(f"environment\tseeds\t{seed}\n")
-            output.write("environment\tregex_version\t1.12.4\n")
+            output.write("environment\tregex_version\t1.13.1\n")
             output.write(
                 "environment\tregex_features\tdefault,perf-dfa-full (logging disabled)\n"
             )

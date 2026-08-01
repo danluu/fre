@@ -94,6 +94,7 @@ const ITERATION_MIX: u64 = 0xbf58_476d_1ce4_e5b9;
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 const PATTERN_SEEDS: [u64; 2] = [0x243f_6a88_85a3_08d2, 0x1319_8a2e_0370_7345];
+const UPSTREAM_REGEX_VERSION: &str = "1.13.1";
 
 fn usage() -> &'static str {
     "generated_aot_upstream_comparison - generated general-AOT comparison
@@ -3287,7 +3288,7 @@ fn print_environment(config: &Config, shapes: &[CompiledShape], scenario_count: 
         );
         println!("environment\tcandidate_densities\tzero,1_per_32,near_miss_1_per_32,dense");
         println!(
-            "environment\tsemantic_validation\tregex_1.12.4_oracle_vs_portable_fre_then_linked_native"
+            "environment\tsemantic_validation\tregex_{UPSTREAM_REGEX_VERSION}_oracle_vs_portable_fre_then_linked_native"
         );
         println!(
             "environment\taggregation_scope\tself_contained_compiled_primary_only;natural_resource_fallbacks_reported_as_runtime_resilience"
@@ -3307,7 +3308,7 @@ fn print_environment(config: &Config, shapes: &[CompiledShape], scenario_count: 
         config.target.features.bits()
     );
     println!("environment\thost_feature_validation\tpassed");
-    println!("environment\tregex_version\t1.12.4");
+    println!("environment\tregex_version\t{UPSTREAM_REGEX_VERSION}");
     println!("environment\tregex_features\tdefault,perf-dfa-full (logging disabled)");
     println!(
         "environment\trustc\t{}",
@@ -3682,5 +3683,41 @@ mod tests {
             assert!(entries.insert(compiled.module().entry_symbol().to_owned()));
         }
         assert_eq!(entries.len(), OutputKind::MATRIX.len());
+    }
+
+    #[test]
+    fn upstream_oracle_and_fre_choose_the_true_leftmost_nested_match() {
+        // regex 1.12.4's reverse suffix/inner optimization incorrectly skipped
+        // this first match. Keep the structural regression here so benchmark
+        // qualification cannot silently use that broken offset oracle again.
+        let pattern = r"(?:(?:(?:(?:(?:(?:(?:dR)*4Q))+?)+Gy))+(?-u:[\x00-\xFF]))";
+        let haystack = b"&~+@:dR4QdR4QGydR4QdR4QGydR4QdR4!dR4QdR4QGydR4QdR4QGydR4QdR4QGya";
+        let expected = AbiResult {
+            status: 1,
+            start: 5,
+            end: 26,
+        };
+        let oracle = Regex::new(pattern).unwrap();
+        assert_eq!(
+            upstream_search(&oracle, OutputKind::Span, haystack),
+            expected
+        );
+
+        let compiled = compile(
+            CompileRequest::new(pattern, Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span),
+        )
+        .unwrap();
+        assert_eq!(
+            AbiResult::from_aot(
+                compiled
+                    .search(haystack, SearchWindow::full(haystack))
+                    .unwrap(),
+                OutputKind::Span,
+            )
+            .unwrap(),
+            expected
+        );
     }
 }

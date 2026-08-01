@@ -112,9 +112,9 @@ dependencies = [
  "fre-ripgrep-aot-thin",
  "fre-syntax",
  "memchr",
- "regex",
- "regex-automata",
- "regex-syntax",
+ "regex 1.12.4",
+ "regex-automata 0.4.14",
+ "regex-syntax 0.8.11 (registry+https://github.com/rust-lang/crates.io-index)",
  "sha2",
  "stats_alloc",
 ]
@@ -128,9 +128,9 @@ dependencies = [
  "fre-kernels",
  "fre-reference",
  "memchr",
- "regex",
- "regex-automata",
- "regex-syntax",
+ "regex 1.12.4",
+ "regex-automata 0.4.14",
+ "regex-syntax 0.8.11 (registry+https://github.com/rust-lang/crates.io-index)",
  "sha2",
 ]
 
@@ -157,7 +157,7 @@ dependencies = [
  "fre-jit-aarch64",
  "fre-kernel-ir",
  "fre-syntax",
- "regex-syntax",
+ "regex-syntax 0.8.11 (registry+https://github.com/rust-lang/crates.io-index)",
  "sha2",
 ]
 
@@ -223,7 +223,7 @@ dependencies = [
  "fre-automata",
  "fre-lower",
  "fre-syntax",
- "regex",
+ "regex 1.13.1",
  "sha2",
 ]
 
@@ -279,7 +279,7 @@ version = "0.1.0"
 dependencies = [
  "fre-simd-kernels",
  "memchr",
- "regex-syntax",
+ "regex-syntax 0.8.11 (registry+https://github.com/rust-lang/crates.io-index)",
  "stats_alloc",
 ]
 
@@ -295,9 +295,9 @@ name = "fre-capture-lab"
 version = "0.1.0"
 dependencies = [
  "fre-exact-alloc",
- "regex",
- "regex-automata",
- "regex-syntax",
+ "regex 1.12.4",
+ "regex-automata 0.4.14",
+ "regex-syntax 0.8.11 (registry+https://github.com/rust-lang/crates.io-index)",
  "stats_alloc",
 ]
 
@@ -307,7 +307,7 @@ version = "0.1.0"
 dependencies = [
  "fre-automata",
  "fre-reference",
- "regex",
+ "regex 1.12.4",
 ]
 
 [[package]]
@@ -323,7 +323,7 @@ dependencies = [
  "fre-kernels",
  "fre-lower",
  "fre-syntax",
- "regex",
+ "regex 1.12.4",
  "serde",
  "serde_json",
  "sha2",
@@ -333,7 +333,7 @@ dependencies = [
 name = "fre-iterator-lab"
 version = "0.1.0"
 dependencies = [
- "regex",
+ "regex 1.12.4",
 ]
 
 [[package]]
@@ -382,7 +382,7 @@ version = "0.1.0"
 dependencies = [
  "fre-automata",
  "fre-lower",
- "regex-syntax",
+ "regex-syntax 0.8.11 (registry+https://github.com/rust-lang/crates.io-index)",
  "sha2",
 ]
 
@@ -395,8 +395,8 @@ dependencies = [
  "fre-kernel-ir",
  "fre-simd-kernels",
  "memchr",
- "regex",
- "regex-automata",
+ "regex 1.12.4",
+ "regex-automata 0.4.14",
 ]
 
 [[package]]
@@ -405,8 +405,8 @@ version = "0.1.0"
 dependencies = [
  "fre-automata",
  "fre-syntax",
- "regex",
- "regex-syntax",
+ "regex 1.12.4",
+ "regex-syntax 0.8.11 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -422,7 +422,7 @@ name = "fre-required-literal-lab"
 version = "0.1.0"
 dependencies = [
  "memchr",
- "regex",
+ "regex 1.12.4",
 ]
 
 [[package]]
@@ -446,8 +446,8 @@ name = "fre-syntax"
 version = "0.1.0"
 dependencies = [
  "fre-re2-syntax",
- "regex-automata",
- "regex-syntax",
+ "regex-automata 0.4.14",
+ "regex-syntax 0.8.11 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -549,10 +549,10 @@ dependencies = [
  "fre-lower",
  "libc",
  "rebar-expand",
- "regex",
- "regex-automata",
+ "regex 1.12.4",
+ "regex-automata 0.4.14",
  "regex-lite",
- "regex-syntax",
+ "regex-syntax 0.8.11 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde",
  "serde_json",
  "sha2",
@@ -588,8 +588,19 @@ checksum = "f1292b7759ae1cb9ec195452d1390a074f0cd8541ab7a5a8c31cd6db45d4a6ba"
 dependencies = [
  "aho-corasick",
  "memchr",
- "regex-automata",
- "regex-syntax",
+ "regex-automata 0.4.14",
+ "regex-syntax 0.8.11 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
+name = "regex"
+version = "1.13.1"
+source = "git+https://github.com/rust-lang/regex.git?rev=7c28ee4dc4aef53571c96757f4825c51ac0c3d44#2b527599eb9eea0dcc288c704584f242f26a5c61"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "regex-automata 0.4.16",
+ "regex-syntax 0.8.11 (git+https://github.com/rust-lang/regex.git?rev=7c28ee4dc4aef53571c96757f4825c51ac0c3d44)",
 ]
 
 [[package]]
@@ -601,7 +612,17 @@ dependencies = [
  "aho-corasick",
  "log",
  "memchr",
- "regex-syntax",
+ "regex-syntax 0.8.11 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
+name = "regex-automata"
+version = "0.4.16"
+source = "git+https://github.com/rust-lang/regex.git?rev=7c28ee4dc4aef53571c96757f4825c51ac0c3d44#2b527599eb9eea0dcc288c704584f242f26a5c61"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "regex-syntax 0.8.11 (git+https://github.com/rust-lang/regex.git?rev=7c28ee4dc4aef53571c96757f4825c51ac0c3d44)",
 ]
 
 [[package]]
@@ -617,6 +638,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "regex-syntax"
+version = "0.8.11"
+source = "git+https://github.com/rust-lang/regex.git?rev=7c28ee4dc4aef53571c96757f4825c51ac0c3d44#2b527599eb9eea0dcc288c704584f242f26a5c61"
+
+[[package]]
 name = "rust-regex-conformance"
 version = "0.1.0"
 dependencies = [
@@ -624,8 +650,8 @@ dependencies = [
  "fre",
  "fre-kernels",
  "fre-syntax",
- "regex-automata",
- "regex-syntax",
+ "regex-automata 0.4.14",
+ "regex-syntax 0.8.11 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde",
  "serde_json",
  "sha2",
