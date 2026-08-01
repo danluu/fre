@@ -13,6 +13,7 @@ use core::{fmt, mem::size_of};
 
 use memchr::{memchr, memchr2};
 
+use crate::Window;
 use crate::packed_ordered_literal_aggregate::byte_frequency_rank;
 
 /// Stable identity for the fixed-predicate anchor-or-Shift-And strategy.
@@ -22,6 +23,18 @@ pub const PLAN_ID: &str =
 pub const COUNT_OPERATION_ID: &str = "fixed-predicate-word64.count.v4";
 /// Stable identity for the matched-byte-sum reducer.
 pub const SPAN_SUM_OPERATION_ID: &str = "fixed-predicate-word64.span-sum.v4";
+/// Stable identity for the ordinary first-match search projection.
+pub const SEARCH_PLAN_ID: &str = "fixed-predicate-word64.first-match.v1";
+/// Stable identity for existence search.
+const EXISTS_SEARCH_OPERATION_ID: &str = "fixed-predicate-word64.search.exists.v1";
+/// Stable identity for the first accepting end projection.
+const EARLIEST_END_SEARCH_OPERATION_ID: &str =
+    "fixed-predicate-word64.search.earliest-end.v1";
+/// Stable identity for the selected match end projection.
+const SELECTED_END_SEARCH_OPERATION_ID: &str =
+    "fixed-predicate-word64.search.selected-end.v1";
+/// Stable identity for the selected span projection.
+const SPAN_SEARCH_OPERATION_ID: &str = "fixed-predicate-word64.search.span.v1";
 /// Version of the receipt-bearing fixed-predicate construction protocol.
 pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 5;
 /// Version of the partial-actual fixed-predicate construction ledger.
@@ -346,6 +359,174 @@ pub struct SpanSumResult {
     /// Complete resource certificate.
     pub accounting: ReduceAccounting,
 }
+
+/// First-match result projection selected for one ordinary search.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SearchOperation {
+    /// Whether any selected match exists.
+    Exists,
+    /// End of the first accepting match.
+    EarliestEnd,
+    /// End of the leftmost-first selected match.
+    SelectedEnd,
+    /// Complete leftmost-first selected span.
+    Span,
+}
+
+/// Immutable semantic and implementation identity for ordinary search.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SearchOperationIdentity {
+    /// Stable search-plan identifier, separate from aggregate reduction.
+    pub plan_id: &'static str,
+    /// Stable operation identifier.
+    pub operation_id: &'static str,
+    /// Requested result projection.
+    pub operation: SearchOperation,
+    /// Authenticated language class.
+    pub semantics: MatchSemantics,
+    /// Match selection rule.
+    pub selection: MatchSelection,
+    /// Exact fixed word width.
+    pub width: usize,
+    /// Authenticated reducer representation.
+    pub reducer: Reducer,
+    /// Fixed position used by an anchor reducer, or zero for Shift-And.
+    pub anchor_offset: u8,
+    /// Exact anchor bytes. The second slot is zero for a one-byte anchor.
+    pub anchor_bytes: [u8; 2],
+}
+
+/// Per-search limits checked before any byte in the requested window is read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SearchLimits {
+    /// Maximum prospectively charged first-match work.
+    pub max_work: u64,
+    /// Maximum dynamic operation scratch; ordinary search requires zero.
+    pub max_scratch_bytes: usize,
+}
+
+impl SearchLimits {
+    /// Disable caller-selected caps while retaining checked arithmetic.
+    #[must_use]
+    pub const fn unlimited() -> Self {
+        Self {
+            max_work: u64::MAX,
+            max_scratch_bytes: usize::MAX,
+        }
+    }
+}
+
+impl Default for SearchLimits {
+    fn default() -> Self {
+        Self {
+            max_work: 100_000_000,
+            max_scratch_bytes: 0,
+        }
+    }
+}
+
+/// Source-independent bounds admitted for one first-match search.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SearchUpperBounds {
+    /// Bytes in the requested window.
+    pub window_bytes: usize,
+    /// Shift-And transitions or logical anchor-finder service bytes.
+    pub transitions: usize,
+    /// Maximum fixed-anchor finder invocations.
+    pub finder_calls: usize,
+    /// Maximum anchor candidates visited.
+    pub candidate_events: usize,
+    /// Maximum per-position predicate checks.
+    pub predicate_checks: usize,
+    /// Maximum selected match events; never more than one.
+    pub match_events: usize,
+    /// Complete prospectively charged work.
+    pub work: u64,
+    /// Dynamic operation scratch; always zero.
+    pub scratch_bytes: usize,
+}
+
+/// Exact counters through the first match or complete window exhaustion.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SearchActualCounters {
+    /// Bytes in the requested window.
+    pub window_bytes: usize,
+    /// Shift-And transitions or logical anchor-finder service bytes.
+    pub transitions: usize,
+    /// Fixed-anchor finder invocations.
+    pub finder_calls: usize,
+    /// Anchor candidates visited.
+    pub candidate_events: usize,
+    /// Per-position predicate checks.
+    pub predicate_checks: usize,
+    /// Selected match events; zero or one.
+    pub match_events: usize,
+    /// Exact charged work.
+    pub work: u64,
+    /// Dynamic operation scratch; always zero.
+    pub scratch_bytes: usize,
+}
+
+/// Complete first-match search certificate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SearchAccounting {
+    /// Stable operation and semantic identity.
+    pub identity: SearchOperationIdentity,
+    /// Bounds admitted before reading the requested window.
+    pub upper_bounds: SearchUpperBounds,
+    /// Counters published after complete success.
+    pub actual: SearchActualCounters,
+}
+
+/// Checked first-match search failure. No fallback is attempted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum SearchError {
+    /// The half-open request does not fit the original haystack.
+    InvalidWindow {
+        start: usize,
+        end: usize,
+        haystack_len: usize,
+    },
+    /// Prospective search work exceeds the caller cap.
+    WorkLimit { needed: u64, limit: u64 },
+    /// Dynamic operation scratch exceeds the caller cap.
+    ScratchLimit { needed: usize, limit: usize },
+    /// Checked arithmetic failed.
+    ArithmeticOverflow { computation: &'static str },
+    /// A post-preflight invariant failed closed.
+    InternalInvariant(&'static str),
+}
+
+impl fmt::Display for SearchError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidWindow {
+                start,
+                end,
+                haystack_len,
+            } => write!(
+                formatter,
+                "fixed-predicate search window {start}..{end} is invalid for {haystack_len} bytes"
+            ),
+            Self::WorkLimit { needed, limit } => write!(
+                formatter,
+                "fixed-predicate search needs {needed} work units, exceeding {limit}"
+            ),
+            Self::ScratchLimit { needed, limit } => write!(
+                formatter,
+                "fixed-predicate search needs {needed} scratch bytes, exceeding {limit}"
+            ),
+            Self::ArithmeticOverflow { computation } => write!(
+                formatter,
+                "arithmetic overflow while computing {computation}"
+            ),
+            Self::InternalInvariant(detail) => write!(formatter, "internal invariant: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for SearchError {}
 
 /// Checked construction failure. No plan is published on error.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1360,6 +1541,467 @@ impl FixedPredicateWord64Plan {
         self.build
     }
 
+    /// Stable identity for one ordinary first-match search projection.
+    #[must_use]
+    pub const fn search_operation_identity(
+        &self,
+        operation: SearchOperation,
+    ) -> SearchOperationIdentity {
+        let operation_id = match operation {
+            SearchOperation::Exists => EXISTS_SEARCH_OPERATION_ID,
+            SearchOperation::EarliestEnd => EARLIEST_END_SEARCH_OPERATION_ID,
+            SearchOperation::SelectedEnd => SELECTED_END_SEARCH_OPERATION_ID,
+            SearchOperation::Span => SPAN_SEARCH_OPERATION_ID,
+        };
+        let (reducer, anchor_offset, anchor_bytes) = self.anchor.identity();
+        SearchOperationIdentity {
+            plan_id: SEARCH_PLAN_ID,
+            operation_id,
+            operation,
+            semantics: MatchSemantics::FixedBytePredicates,
+            selection: MatchSelection::LeftmostFirstNonOverlapping,
+            width: self.width,
+            reducer,
+            anchor_offset,
+            anchor_bytes,
+        }
+    }
+
+    /// Whether a selected match exists wholly inside `window`.
+    pub fn is_match_window(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<(bool, SearchAccounting), SearchError> {
+        let (matched, accounting) =
+            self.search_window(haystack, window, limits, SearchOperation::Exists)?;
+        Ok((matched.is_some(), accounting))
+    }
+
+    /// Return only whether a selected match exists wholly inside `window`.
+    ///
+    /// The compact success projection deliberately omits diagnostic accounting
+    /// while retaining the reporting operation's exact preflight and error
+    /// contract.
+    pub fn is_match_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<bool, SearchError> {
+        self.search_window_value(haystack, window, limits)
+            .map(|matched| matched.is_some())
+    }
+
+    /// Return the first accepting end wholly inside `window`.
+    pub fn earliest_end_window(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<(Option<usize>, SearchAccounting), SearchError> {
+        let (matched, accounting) =
+            self.search_window(haystack, window, limits, SearchOperation::EarliestEnd)?;
+        Ok((matched.map(|(_, end)| end), accounting))
+    }
+
+    /// Return the selected leftmost-first end in the complete haystack.
+    pub fn selected_end(
+        &self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<(Option<usize>, SearchAccounting), SearchError> {
+        self.selected_end_window(haystack, Window::full(haystack), limits)
+    }
+
+    /// Return the selected leftmost-first end wholly inside `window`.
+    pub fn selected_end_window(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<(Option<usize>, SearchAccounting), SearchError> {
+        let (matched, accounting) =
+            self.search_window(haystack, window, limits, SearchOperation::SelectedEnd)?;
+        Ok((matched.map(|(_, end)| end), accounting))
+    }
+
+    /// Find the selected leftmost-first span in the complete haystack.
+    pub fn find(
+        &self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
+        self.find_window(haystack, Window::full(haystack), limits)
+    }
+
+    /// Find the selected leftmost-first span wholly inside `window`.
+    pub fn find_window(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
+        self.search_window(haystack, window, limits, SearchOperation::Span)
+    }
+
+    /// Return only the selected span wholly inside `window`.
+    ///
+    /// The compact success projection deliberately omits diagnostic accounting
+    /// while retaining the reporting operation's exact preflight and error
+    /// contract.
+    pub fn find_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<Option<(usize, usize)>, SearchError> {
+        self.search_window_value(haystack, window, limits)
+    }
+
+    fn search_window(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+        operation: SearchOperation,
+    ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
+        let upper_bounds = self.search_preflight(haystack.len(), window, limits)?;
+        let (matched, actual) = self.execute_first_match(haystack, window, upper_bounds)?;
+        Ok((
+            matched,
+            SearchAccounting {
+                identity: self.search_operation_identity(operation),
+                upper_bounds,
+                actual,
+            },
+        ))
+    }
+
+    fn search_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<Option<(usize, usize)>, SearchError> {
+        let upper_bounds = self.search_preflight(haystack.len(), window, limits)?;
+        self.execute_first_match(haystack, window, upper_bounds)
+            .map(|(matched, _)| matched)
+    }
+
+    fn search_preflight(
+        &self,
+        haystack_len: usize,
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<SearchUpperBounds, SearchError> {
+        if window.start() > window.end() || window.end() > haystack_len {
+            return Err(SearchError::InvalidWindow {
+                start: window.start(),
+                end: window.end(),
+                haystack_len,
+            });
+        }
+        let window_bytes = window.end().checked_sub(window.start()).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "search window width",
+            },
+        )?;
+        let candidate_events = window_bytes
+            .checked_sub(self.width)
+            .and_then(|last| last.checked_add(1))
+            .unwrap_or(0);
+        let match_events = usize::from(candidate_events != 0);
+        let scratch_bytes = 0;
+        if scratch_bytes > limits.max_scratch_bytes {
+            return Err(SearchError::ScratchLimit {
+                needed: scratch_bytes,
+                limit: limits.max_scratch_bytes,
+            });
+        }
+        let (transitions, finder_calls, candidate_events, predicate_checks, work) =
+            match self.anchor {
+                Anchor::ShiftAnd => {
+                    let work = window_bytes
+                        .checked_mul(TRANSITION_WORK)
+                        .and_then(|work| {
+                            work.checked_add(match_events.checked_mul(MATCH_WORK)?)
+                        })
+                        .and_then(|work| work.checked_add(REDUCE_FINAL_WORK))
+                        .ok_or(SearchError::ArithmeticOverflow {
+                            computation: "Shift-And search work upper bound",
+                        })?;
+                    (window_bytes, 0, 0, 0, work)
+                }
+                Anchor::One { .. } | Anchor::Two { .. } => {
+                    let finder_calls = candidate_events.checked_add(1).ok_or(
+                        SearchError::ArithmeticOverflow {
+                            computation: "anchor search finder-call upper bound",
+                        },
+                    )?;
+                    let predicate_checks = candidate_events
+                        .checked_mul(self.width.checked_sub(1).ok_or(
+                            SearchError::InternalInvariant(
+                                "fixed-predicate search retained an empty width",
+                            ),
+                        )?)
+                        .ok_or(SearchError::ArithmeticOverflow {
+                            computation: "anchor search predicate-check upper bound",
+                        })?;
+                    let work = window_bytes
+                        .checked_mul(FINDER_SCAN_BYTE_WORK)
+                        .and_then(|work| {
+                            work.checked_add(finder_calls.checked_mul(FINDER_CALL_WORK)?)
+                        })
+                        .and_then(|work| {
+                            work.checked_add(
+                                candidate_events.checked_mul(ANCHOR_CANDIDATE_WORK)?,
+                            )
+                        })
+                        .and_then(|work| {
+                            work.checked_add(
+                                predicate_checks.checked_mul(PREDICATE_CHECK_WORK)?,
+                            )
+                        })
+                        .and_then(|work| {
+                            work.checked_add(match_events.checked_mul(MATCH_WORK)?)
+                        })
+                        .and_then(|work| work.checked_add(REDUCE_FINAL_WORK))
+                        .ok_or(SearchError::ArithmeticOverflow {
+                            computation: "anchor search work upper bound",
+                        })?;
+                    (
+                        window_bytes,
+                        finder_calls,
+                        candidate_events,
+                        predicate_checks,
+                        work,
+                    )
+                }
+            };
+        let work = u64::try_from(work).map_err(|_| SearchError::ArithmeticOverflow {
+            computation: "search work upper-bound conversion",
+        })?;
+        if work > limits.max_work {
+            return Err(SearchError::WorkLimit {
+                needed: work,
+                limit: limits.max_work,
+            });
+        }
+        Ok(SearchUpperBounds {
+            window_bytes,
+            transitions,
+            finder_calls,
+            candidate_events,
+            predicate_checks,
+            match_events,
+            work,
+            scratch_bytes,
+        })
+    }
+
+    fn execute_first_match(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        upper: SearchUpperBounds,
+    ) -> Result<(Option<(usize, usize)>, SearchActualCounters), SearchError> {
+        let slice = haystack.get(window.start()..window.end()).ok_or(
+            SearchError::InternalInvariant("admitted fixed-predicate window disappeared"),
+        )?;
+        match self.anchor {
+            Anchor::One { offset, byte } => self.execute_first_anchor(
+                slice,
+                window.start(),
+                upper,
+                usize::from(offset),
+                |bytes| memchr(byte, bytes),
+            ),
+            Anchor::Two {
+                offset,
+                first,
+                second,
+            } => self.execute_first_anchor(
+                slice,
+                window.start(),
+                upper,
+                usize::from(offset),
+                |bytes| memchr2(first, second, bytes),
+            ),
+            Anchor::ShiftAnd => self.execute_first_shift_and(slice, window.start(), upper),
+        }
+    }
+
+    fn execute_first_shift_and(
+        &self,
+        slice: &[u8],
+        window_start: usize,
+        upper: SearchUpperBounds,
+    ) -> Result<(Option<(usize, usize)>, SearchActualCounters), SearchError> {
+        let mut state = 0_u64;
+        let mut transitions = 0_usize;
+        let mut matched = None;
+        for (position, &byte) in slice.iter().enumerate() {
+            transitions = transitions.checked_add(1).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "actual Shift-And search transitions",
+                },
+            )?;
+            state = (state.wrapping_shl(1) | 1) & self.masks[usize::from(byte)];
+            if state & self.accepting_bit != 0 {
+                let relative_end = position.checked_add(1).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "actual Shift-And match end",
+                    },
+                )?;
+                let relative_start = relative_end.checked_sub(self.width).ok_or(
+                    SearchError::InternalInvariant(
+                        "Shift-And accepted before the fixed word width",
+                    ),
+                )?;
+                let start = window_start.checked_add(relative_start).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "absolute Shift-And match start",
+                    },
+                )?;
+                let end = window_start.checked_add(relative_end).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "absolute Shift-And match end",
+                    },
+                )?;
+                matched = Some((start, end));
+                break;
+            }
+        }
+        let actual = SearchActualCounters {
+            window_bytes: slice.len(),
+            transitions,
+            finder_calls: 0,
+            candidate_events: 0,
+            predicate_checks: 0,
+            match_events: usize::from(matched.is_some()),
+            work: search_work(
+                transitions,
+                0,
+                0,
+                0,
+                usize::from(matched.is_some()),
+                true,
+            )?,
+            scratch_bytes: 0,
+        };
+        ensure_search_actual_within(actual, upper)?;
+        Ok((matched, actual))
+    }
+
+    fn execute_first_anchor(
+        &self,
+        slice: &[u8],
+        window_start: usize,
+        upper: SearchUpperBounds,
+        anchor_offset: usize,
+        mut find: impl FnMut(&[u8]) -> Option<usize>,
+    ) -> Result<(Option<(usize, usize)>, SearchActualCounters), SearchError> {
+        let anchor_end = slice
+            .len()
+            .checked_sub(self.width)
+            .and_then(|last_start| last_start.checked_add(anchor_offset))
+            .and_then(|last_anchor| last_anchor.checked_add(1))
+            .unwrap_or(0);
+        let mut cursor = anchor_offset.min(anchor_end);
+        let mut finder_scanned_bytes = 0_usize;
+        let mut finder_calls = 0_usize;
+        let mut candidate_events = 0_usize;
+        let mut predicate_checks = 0_usize;
+        let mut matched = None;
+        while cursor < anchor_end {
+            let search = slice.get(cursor..anchor_end).ok_or(
+                SearchError::InternalInvariant("anchor search window escaped the input"),
+            )?;
+            finder_calls = finder_calls.checked_add(1).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "actual anchor search finder calls",
+                },
+            )?;
+            let Some(relative) = find(search) else {
+                finder_scanned_bytes = finder_scanned_bytes.checked_add(search.len()).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "actual unsuccessful anchor search service bytes",
+                    },
+                )?;
+                break;
+            };
+            finder_scanned_bytes = finder_scanned_bytes
+                .checked_add(relative.checked_add(1).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "actual successful anchor search service",
+                    },
+                )?)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "actual anchor search service bytes",
+                })?;
+            let anchor = cursor.checked_add(relative).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "actual anchor search position",
+                },
+            )?;
+            let start = anchor.checked_sub(anchor_offset).ok_or(
+                SearchError::InternalInvariant("anchor preceded its fixed offset"),
+            )?;
+            candidate_events = candidate_events.checked_add(1).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "actual anchor search candidates",
+                },
+            )?;
+            let is_match = self
+                .anchor_candidate_matches(slice, start, anchor_offset, &mut predicate_checks)
+                .map_err(search_error_from_reduce)?;
+            if is_match {
+                let relative_end = start.checked_add(self.width).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "actual anchor match end",
+                    },
+                )?;
+                let absolute_start = window_start.checked_add(start).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "absolute anchor match start",
+                    },
+                )?;
+                let absolute_end = window_start.checked_add(relative_end).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "absolute anchor match end",
+                    },
+                )?;
+                matched = Some((absolute_start, absolute_end));
+                break;
+            }
+            cursor = anchor.checked_add(1).ok_or(SearchError::ArithmeticOverflow {
+                computation: "rejected anchor search restart",
+            })?;
+        }
+        let match_events = usize::from(matched.is_some());
+        let actual = SearchActualCounters {
+            window_bytes: slice.len(),
+            transitions: finder_scanned_bytes,
+            finder_calls,
+            candidate_events,
+            predicate_checks,
+            match_events,
+            work: search_work(
+                finder_scanned_bytes,
+                finder_calls,
+                candidate_events,
+                predicate_checks,
+                match_events,
+                false,
+            )?,
+            scratch_bytes: 0,
+        };
+        ensure_search_actual_within(actual, upper)?;
+        Ok((matched, actual))
+    }
+
     /// Stable identity for one operation.
     #[must_use]
     pub const fn operation_identity(&self, operation: Operation) -> OperationIdentity {
@@ -2209,6 +2851,71 @@ fn actual_within_upper(actual: ReduceActualCounters, upper: ReduceUpperBounds) -
         && actual.scratch_bytes <= upper.scratch_bytes
         && actual.persistent_bytes <= upper.persistent_bytes
         && actual.peak_bytes <= upper.peak_bytes
+}
+
+fn search_work(
+    transitions: usize,
+    finder_calls: usize,
+    candidate_events: usize,
+    predicate_checks: usize,
+    match_events: usize,
+    shift_and: bool,
+) -> Result<u64, SearchError> {
+    let transition_weight = if shift_and {
+        TRANSITION_WORK
+    } else {
+        FINDER_SCAN_BYTE_WORK
+    };
+    let work = transitions
+        .checked_mul(transition_weight)
+        .and_then(|work| work.checked_add(finder_calls.checked_mul(FINDER_CALL_WORK)?))
+        .and_then(|work| {
+            work.checked_add(candidate_events.checked_mul(ANCHOR_CANDIDATE_WORK)?)
+        })
+        .and_then(|work| {
+            work.checked_add(predicate_checks.checked_mul(PREDICATE_CHECK_WORK)?)
+        })
+        .and_then(|work| work.checked_add(match_events.checked_mul(MATCH_WORK)?))
+        .and_then(|work| work.checked_add(REDUCE_FINAL_WORK))
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "actual fixed-predicate search work",
+        })?;
+    u64::try_from(work).map_err(|_| SearchError::ArithmeticOverflow {
+        computation: "actual fixed-predicate search work conversion",
+    })
+}
+
+fn ensure_search_actual_within(
+    actual: SearchActualCounters,
+    upper: SearchUpperBounds,
+) -> Result<(), SearchError> {
+    if actual.window_bytes == upper.window_bytes
+        && actual.transitions <= upper.transitions
+        && actual.finder_calls <= upper.finder_calls
+        && actual.candidate_events <= upper.candidate_events
+        && actual.predicate_checks <= upper.predicate_checks
+        && actual.match_events <= upper.match_events
+        && actual.work <= upper.work
+        && actual.scratch_bytes <= upper.scratch_bytes
+    {
+        Ok(())
+    } else {
+        Err(SearchError::InternalInvariant(
+            "actual fixed-predicate search counters exceeded prospective bounds",
+        ))
+    }
+}
+
+fn search_error_from_reduce(error: ReduceError) -> SearchError {
+    match error {
+        ReduceError::ArithmeticOverflow { computation } => {
+            SearchError::ArithmeticOverflow { computation }
+        }
+        ReduceError::InternalInvariant(detail) => SearchError::InternalInvariant(detail),
+        _ => SearchError::InternalInvariant(
+            "fixed-predicate candidate verification returned a reduction-only resource error",
+        ),
+    }
 }
 
 #[derive(Clone, Copy)]
