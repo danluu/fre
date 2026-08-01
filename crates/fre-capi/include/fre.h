@@ -74,6 +74,8 @@ typedef uint32_t fre_v1_status;
 #define FRE_V1_PLAN_UNICODE_WORD_RUN UINT32_C(7)
 #define FRE_V1_PLAN_UNICODE_FOLDED_LITERAL UINT32_C(8)
 #define FRE_V1_PLAN_LITERAL_CLASS_RUN_LITERAL UINT32_C(9)
+#define FRE_V1_PLAN_PURE_BYTE_CLASS_REPEAT UINT32_C(10)
+#define FRE_V1_PLAN_FIXED_PREDICATE_WORD64 UINT32_C(11)
 
 #define FRE_V1_ADMISSION_UPSTREAM_ORACLE_PENDING UINT32_C(1)
 
@@ -253,6 +255,10 @@ FRE_V1_STATIC_ASSERT(sizeof(fre_v1_config) == 40u, "config size");
 FRE_V1_STATIC_ASSERT(sizeof(fre_v1_diagnostic) == 280u, "diagnostic size");
 FRE_V1_STATIC_ASSERT(sizeof(fre_v1_plan_info) == 64u, "plan info size");
 FRE_V1_STATIC_ASSERT(sizeof(fre_v1_exists_result) == 16u, "exists size");
+FRE_V1_STATIC_ASSERT(FRE_V1_PLAN_PURE_BYTE_CLASS_REPEAT == 10u,
+                     "pure byte-class plan tag");
+FRE_V1_STATIC_ASSERT(FRE_V1_PLAN_FIXED_PREDICATE_WORD64 == 11u,
+                     "fixed-predicate plan tag");
 
 #if SIZE_MAX == UINT64_MAX
 FRE_V1_STATIC_ASSERT(sizeof(fre_v1_selected_end_result) == 24u, "end size");
