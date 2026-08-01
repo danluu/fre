@@ -5411,10 +5411,7 @@ fn aarch64_context_emit_valid(
     assembler: &mut Aarch64Assembler,
     invalid: usize,
 ) -> Result<(), ObjectError> {
-    assembler.instruction(aarch64_lsr_x_imm(11, 8, 30)?)?;
-    assembler.instruction(aarch64_and_low_x(11, 11, 1)?)?;
-    assembler.instruction(aarch64_cmp_w_zero(11)?)?;
-    assembler.branch_cond(AARCH64_EQ, invalid)?;
+    assembler.branch_bit_clear_w(8, 30, invalid)?;
     Ok(())
 }
 
@@ -5483,10 +5480,7 @@ fn aarch64_context_emit_raw_forward_valid(
     assembler: &mut Aarch64Assembler,
     invalid: usize,
 ) -> Result<(), ObjectError> {
-    assembler.instruction(aarch64_lsr_x_imm(11, 8, 14)?)?;
-    assembler.instruction(aarch64_and_low_x(11, 11, 1)?)?;
-    assembler.instruction(aarch64_cmp_w_zero(11)?)?;
-    assembler.branch_cond(AARCH64_EQ, invalid)?;
+    assembler.branch_bit_clear_w(8, 14, invalid)?;
     Ok(())
 }
 
@@ -5494,10 +5488,7 @@ fn aarch64_context_emit_raw_reverse_valid(
     assembler: &mut Aarch64Assembler,
     invalid: usize,
 ) -> Result<(), ObjectError> {
-    assembler.instruction(aarch64_lsr_x_imm(11, 8, 14)?)?;
-    assembler.instruction(aarch64_and_low_x(11, 11, 1)?)?;
-    assembler.instruction(aarch64_cmp_w_zero(11)?)?;
-    assembler.branch_cond(AARCH64_EQ, invalid)?;
+    assembler.branch_bit_clear_w(8, 14, invalid)?;
     Ok(())
 }
 
@@ -5506,8 +5497,7 @@ fn aarch64_context_emit_decode_raw_forward(
     invalid: usize,
 ) -> Result<(), ObjectError> {
     assembler.instruction(aarch64_context_and_low_w(6, 8, 14)?)?;
-    assembler.instruction(aarch64_cmp_w_zero(6)?)?;
-    assembler.branch_cond(AARCH64_EQ, invalid)?;
+    assembler.branch_zero_w(6, invalid)?;
     assembler.instruction(aarch64_sub_w_imm(6, 6, 1)?)?;
     Ok(())
 }
@@ -5626,8 +5616,7 @@ fn aarch64_context_emit_decode_forward_checked(
     invalid: usize,
 ) -> Result<(), ObjectError> {
     assembler.instruction(aarch64_context_and_low_w(6, 8, 30)?)?;
-    assembler.instruction(aarch64_cmp_w_zero(6)?)?;
-    assembler.branch_cond(AARCH64_EQ, invalid)?;
+    assembler.branch_zero_w(6, invalid)?;
     assembler.instruction(aarch64_sub_w_imm(6, 6, 1)?)?;
     Ok(())
 }
@@ -5652,8 +5641,7 @@ fn aarch64_context_emit_decode_populated_forward_transition_mode(
     assembler.instruction(aarch64_mov_x(12, 8)?)?; // preserve event bit
     assembler.instruction(aarch64_context_and_low_w(6, 8, 28)?)?;
     if !trust {
-        assembler.instruction(aarch64_cmp_w_zero(6)?)?;
-        assembler.branch_cond(AARCH64_EQ, invalid)?;
+        assembler.branch_zero_w(6, invalid)?;
     }
     assembler.instruction(aarch64_sub_w_imm(6, 6, 1)?)?;
     assembler.instruction(aarch64_lsr_x_imm(8, 8, CONTEXT_FORWARD_CELL_FLAGS_SHIFT)?)?;
@@ -5722,10 +5710,7 @@ fn aarch64_context_emit_reject_empty_prefix_candidate(
         aarch64_context_emit_raw_initial_lookup(assembler, raw.forward_start_offset)?;
         assembler.bind(loaded)?;
         aarch64_context_emit_raw_forward_valid(assembler, invalid)?;
-        assembler.instruction(aarch64_lsr_x_imm(11, 8, 15)?)?;
-        assembler.instruction(aarch64_and_low_x(11, 11, 1)?)?;
-        assembler.instruction(aarch64_cmp_w_zero(11)?)?;
-        assembler.branch_cond(AARCH64_NE, rejected)?;
+        assembler.branch_bit_set_w(8, 15, rejected)?;
         aarch64_context_emit_decode_raw_forward(assembler, invalid)?;
         aarch64_context_emit_forward_flags(assembler, layout)?;
         return Ok(());
@@ -5753,14 +5738,10 @@ fn aarch64_context_emit_reject_empty_prefix_candidate(
 
     aarch64_context_emit_dispatch(assembler, layout.forward_initial_offset)?;
     aarch64_context_emit_valid(assembler, invalid)?;
-    assembler.instruction(aarch64_cmp_w_zero(8)?)?;
-    assembler.branch_cond(AARCH64_MI, invalid)?;
+    assembler.branch_bit_set_w(8, 31, invalid)?;
     aarch64_context_emit_decode_forward_checked(assembler, invalid)?;
     aarch64_context_emit_forward_flags(assembler, layout)?;
-    assembler.instruction(aarch64_lsr_x_imm(11, 8, 2)?)?;
-    assembler.instruction(aarch64_and_low_x(11, 11, 1)?)?;
-    assembler.instruction(aarch64_cmp_w_zero(11)?)?;
-    assembler.branch_cond(AARCH64_NE, rejected)?;
+    assembler.branch_bit_set_w(8, 2, rejected)?;
     Ok(())
 }
 
@@ -5850,8 +5831,7 @@ fn aarch64_context_emit_anchored_transition_reserve(
     assembler.instruction(aarch64_movz_w(10, u16::from(search.max_verify_bytes))?)?;
     assembler.instruction(aarch64_cmp_x(12, 10)?)?;
     assembler.instruction(aarch64_csel_x(10, 12, 10, AARCH64_LO)?)?;
-    assembler.instruction(aarch64_cmp_w_zero(10)?)?;
-    assembler.branch_cond(AARCH64_EQ, fallback)?;
+    assembler.branch_zero_w(10, fallback)?;
     assembler.instruction(aarch64_context_add_x_lsl(17, 17, 10, shift)?)?;
     Ok(())
 }
@@ -6340,10 +6320,7 @@ fn aarch64_context_emit_exists_suffix_reverse(
     assembler.instruction(aarch64_add_x_imm(2, 2, u16::from(minimum_width))?)?;
     if let Some(raw) = layout.raw_pair_reverse_initial {
         aarch64_context_emit_raw_reverse_initial(assembler, layout, raw, invalid)?;
-        assembler.instruction(aarch64_lsr_x_imm(11, 8, 15)?)?;
-        assembler.instruction(aarch64_and_low_x(11, 11, 1)?)?;
-        assembler.instruction(aarch64_cmp_w_zero(11)?)?;
-        assembler.branch_cond(AARCH64_NE, matched)?;
+        assembler.branch_bit_set_w(8, 15, matched)?;
         aarch64_context_emit_decode_raw_reverse_payload(assembler)?;
     } else {
         assembler.instruction(aarch64_cmp_x_imm(2, 0)?)?;
@@ -6374,8 +6351,7 @@ fn aarch64_context_emit_exists_suffix_reverse(
         assembler.bind(not_absolute_end)?;
         aarch64_context_emit_dispatch(assembler, reverse_initial)?;
         aarch64_context_emit_valid(assembler, invalid)?;
-        assembler.instruction(aarch64_cmp_w_zero(8)?)?;
-        assembler.branch_cond(AARCH64_MI, matched)?;
+        assembler.branch_bit_set_w(8, 31, matched)?;
         assembler.instruction(aarch64_context_and_low_w(6, 8, 30)?)?;
     }
 
@@ -6383,8 +6359,7 @@ fn aarch64_context_emit_exists_suffix_reverse(
     assembler.bind(reverse_loop)?;
     assembler.instruction(aarch64_cmp_x(2, 9)?)?;
     assembler.branch_cond(AARCH64_LS, failed)?;
-    assembler.instruction(aarch64_cmp_w_zero(6)?)?;
-    assembler.branch_cond(AARCH64_EQ, failed)?;
+    assembler.branch_zero_w(6, failed)?;
     assembler.instruction(aarch64_sub_x_imm(2, 2, 1)?)?;
     aarch64_context_emit_reverse_transition_cell(assembler, layout)?;
     aarch64_context_emit_populated_transition_valid_mode(
@@ -6393,8 +6368,7 @@ fn aarch64_context_emit_exists_suffix_reverse(
         ENABLE_CONTEXT_TRUST_POPULATED_TRANSITIONS,
     )?;
     assembler.instruction(aarch64_context_and_low_w(6, 8, 30)?)?;
-    assembler.instruction(aarch64_cmp_w_zero(8)?)?;
-    assembler.branch_cond(AARCH64_MI, matched)?;
+    assembler.branch_bit_set_w(8, 31, matched)?;
     assembler.branch(reverse_loop)?;
 
     assembler.bind(failed)?;
@@ -6451,10 +6425,7 @@ fn aarch64_context_emit_ordered_suffix_reverse(
     if let Some(raw) = layout.raw_pair_reverse_initial {
         aarch64_context_emit_raw_reverse_initial(assembler, layout, raw, invalid)?;
         let no_raw_initial_event = assembler.label()?;
-        assembler.instruction(aarch64_lsr_x_imm(11, 8, 15)?)?;
-        assembler.instruction(aarch64_and_low_x(11, 11, 1)?)?;
-        assembler.instruction(aarch64_cmp_w_zero(11)?)?;
-        assembler.branch_cond(AARCH64_EQ, no_raw_initial_event)?;
+        assembler.branch_bit_clear_w(8, 15, no_raw_initial_event)?;
         aarch64_context_emit_ordered_suffix_update_best(assembler, complete)?;
         assembler.bind(no_raw_initial_event)?;
         aarch64_context_emit_decode_raw_reverse_payload(assembler)?;
@@ -6487,8 +6458,7 @@ fn aarch64_context_emit_ordered_suffix_reverse(
         assembler.bind(not_absolute_end)?;
         aarch64_context_emit_dispatch(assembler, reverse_initial)?;
         aarch64_context_emit_valid(assembler, invalid)?;
-        assembler.instruction(aarch64_cmp_w_zero(8)?)?;
-        assembler.branch_cond(AARCH64_MI, initial_event)?;
+        assembler.branch_bit_set_w(8, 31, initial_event)?;
         assembler.branch(no_initial_event)?;
         assembler.bind(initial_event)?;
         aarch64_context_emit_ordered_suffix_update_best(assembler, complete)?;
@@ -6500,8 +6470,7 @@ fn aarch64_context_emit_ordered_suffix_reverse(
     assembler.bind(reverse_loop)?;
     assembler.instruction(aarch64_cmp_x(2, 9)?)?;
     assembler.branch_cond(AARCH64_LS, finished)?;
-    assembler.instruction(aarch64_cmp_w_zero(6)?)?;
-    assembler.branch_cond(AARCH64_EQ, finished)?;
+    assembler.branch_zero_w(6, finished)?;
     assembler.instruction(aarch64_sub_x_imm(2, 2, 1)?)?;
     aarch64_context_emit_reverse_transition_cell(assembler, layout)?;
     aarch64_context_emit_populated_transition_valid_mode(
@@ -6510,8 +6479,7 @@ fn aarch64_context_emit_ordered_suffix_reverse(
         ENABLE_CONTEXT_TRUST_POPULATED_TRANSITIONS,
     )?;
     assembler.instruction(aarch64_context_and_low_w(6, 8, 30)?)?;
-    assembler.instruction(aarch64_cmp_w_zero(8)?)?;
-    assembler.branch_cond(AARCH64_MI, event)?;
+    assembler.branch_bit_set_w(8, 31, event)?;
     assembler.branch(reverse_loop)?;
 
     assembler.bind(event)?;
@@ -7077,13 +7045,8 @@ fn aarch64_context_emit_anchored_forward_search(
     // The exact main initial dispatch is already in x6; translate it to the
     // restart-free sidecar and reject impossible nullable/empty initials.
     aarch64_context_emit_anchored_initial_map(assembler, anchored, invalid)?;
-    assembler.instruction(aarch64_context_and_low_w(11, 8, 1)?)?;
-    assembler.instruction(aarch64_cmp_w_zero(11)?)?;
-    assembler.branch_cond(AARCH64_NE, invalid)?;
-    assembler.instruction(aarch64_lsr_x_imm(11, 8, 2)?)?;
-    assembler.instruction(aarch64_and_low_x(11, 11, 1)?)?;
-    assembler.instruction(aarch64_cmp_w_zero(11)?)?;
-    assembler.branch_cond(AARCH64_NE, resume_scan)?;
+    assembler.branch_bit_set_w(8, 0, invalid)?;
+    assembler.branch_bit_set_w(8, 2, resume_scan)?;
     assembler.instruction(aarch64_store_x(7, 4, 8)?)?;
 
     // Reserve every whole verifier transition currently affordable, up to the
@@ -7100,25 +7063,17 @@ fn aarch64_context_emit_anchored_forward_search(
         ENABLE_CONTEXT_TRUST_POPULATED_TRANSITIONS,
     )?;
     assembler.instruction(aarch64_sub_w_imm(10, 10, 1)?)?;
-    assembler.instruction(aarch64_cmp_w_zero(12)?)?;
-    assembler.branch_cond(AARCH64_MI, event)?;
+    assembler.branch_bit_set_w(12, 31, event)?;
     assembler.branch(no_event)?;
     assembler.bind(event)?;
     assembler.instruction(aarch64_store_x(2, 4, 8)?)?;
     assembler.bind(no_event)?;
 
-    assembler.instruction(aarch64_lsr_x_imm(11, 8, 1)?)?;
-    assembler.instruction(aarch64_and_low_x(11, 11, 1)?)?;
-    assembler.instruction(aarch64_cmp_w_zero(11)?)?;
-    assembler.branch_cond(AARCH64_NE, resolved)?;
-    assembler.instruction(aarch64_lsr_x_imm(11, 8, 2)?)?;
-    assembler.instruction(aarch64_and_low_x(11, 11, 1)?)?;
-    assembler.instruction(aarch64_cmp_w_zero(11)?)?;
-    assembler.branch_cond(AARCH64_NE, rejected)?;
+    assembler.branch_bit_set_w(8, 1, resolved)?;
+    assembler.branch_bit_set_w(8, 2, rejected)?;
     assembler.instruction(aarch64_cmp_x(2, 3)?)?;
     assembler.branch_cond(AARCH64_HS, resolved)?;
-    assembler.instruction(aarch64_cmp_w_zero(10)?)?;
-    assembler.branch_cond(AARCH64_EQ, fallback)?;
+    assembler.branch_zero_w(10, fallback)?;
     assembler.branch(verify_loop)?;
 
     assembler.bind(resolved)?;
@@ -7224,8 +7179,7 @@ fn lower_aarch64_context(
     assembler.instruction(aarch64_cmp_x_imm(4, 0)?)?;
     assembler.branch_cond(AARCH64_EQ, invalid_input)?;
     assembler.instruction(aarch64_context_and_low_w(8, 4, 3)?)?;
-    assembler.instruction(aarch64_cmp_w_zero(8)?)?;
-    assembler.branch_cond(AARCH64_NE, invalid_input)?;
+    assembler.branch_nonzero_w(8, invalid_input)?;
     assembler.instruction(aarch64_cmp_x_imm(0, 0)?)?;
     assembler.branch_cond(AARCH64_EQ, invalid_input)?;
 
@@ -7368,33 +7322,26 @@ fn lower_aarch64_context(
         assembler.bind(not_absolute_end)?;
         aarch64_context_emit_dispatch(&mut assembler, layout.forward_initial_offset)?;
         aarch64_context_emit_valid(&mut assembler, invalid_initialized)?;
-        assembler.instruction(aarch64_cmp_w_zero(8)?)?;
-        assembler.branch_cond(AARCH64_MI, invalid_initialized)?;
+        assembler.branch_bit_set_w(8, 31, invalid_initialized)?;
         aarch64_context_emit_decode_forward_checked(&mut assembler, invalid_initialized)?;
         aarch64_context_emit_forward_flags(&mut assembler, layout)?;
     }
     assembler.bind(forward_initialized)?;
-    assembler.instruction(aarch64_context_and_low_w(11, 8, 1)?)?;
-    assembler.instruction(aarch64_cmp_w_zero(11)?)?;
-    assembler.branch_cond(AARCH64_EQ, initial_not_pending)?;
+    assembler.branch_bit_clear_w(8, 0, initial_not_pending)?;
     assembler.instruction(aarch64_store_x(2, 4, 8)?)?;
     assembler.instruction(aarch64_movz_w(10, 1)?)?;
     if layout.output == OutputContract::Exists {
         assembler.branch(forward_finish)?;
     } else {
-        assembler.instruction(aarch64_lsr_x_imm(11, 8, 1)?)?;
-        assembler.instruction(aarch64_and_low_x(11, 11, 1)?)?;
-        assembler.instruction(aarch64_cmp_w_zero(11)?)?;
-        assembler.branch_cond(AARCH64_NE, forward_finish)?;
+        assembler.branch_bit_set_w(8, 1, forward_finish)?;
     }
     assembler.bind(initial_not_pending)?;
     aarch64_context_pin_forward_direct_tables(&mut assembler, layout)?;
 
     if let Some(plan) = prefix_fast_forward {
         let ordinary = assembler.label()?;
-        assembler.instruction(aarch64_context_and_low_w(11, 8, 3)?)?;
-        assembler.instruction(aarch64_cmp_w_zero(11)?)?;
-        assembler.branch_cond(AARCH64_NE, ordinary)?;
+        assembler.branch_bit_set_w(8, 0, ordinary)?;
+        assembler.branch_bit_set_w(8, 1, ordinary)?;
         assembler.instruction(aarch64_add_x_imm(2, 2, u16::from(plan.consumed_bytes))?)?;
         aarch64_load_u32_constant(&mut assembler, 6, plan.target_state)?;
         assembler.branch(forward_loop)?;
@@ -7404,16 +7351,10 @@ fn lower_aarch64_context(
     assembler.bind(forward_loop)?;
     assembler.instruction(aarch64_cmp_x(2, 3)?)?;
     assembler.branch_cond(AARCH64_HS, forward_finish)?;
-    assembler.instruction(aarch64_lsr_x_imm(11, 8, 1)?)?;
-    assembler.instruction(aarch64_and_low_x(11, 11, 1)?)?;
-    assembler.instruction(aarch64_cmp_w_zero(11)?)?;
-    assembler.branch_cond(AARCH64_NE, forward_finish)?;
+    assembler.branch_bit_set_w(8, 1, forward_finish)?;
     if let Some(prefix_scan) = anchored_prefix_scan {
         let active = assembler.label()?;
-        assembler.instruction(aarch64_lsr_x_imm(11, 8, 2)?)?;
-        assembler.instruction(aarch64_and_low_x(11, 11, 1)?)?;
-        assembler.instruction(aarch64_cmp_w_zero(11)?)?;
-        assembler.branch_cond(AARCH64_EQ, active)?;
+        assembler.branch_bit_clear_w(8, 2, active)?;
         assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
         assembler.branch(prefix_scan)?;
         assembler.bind(active)?;
@@ -7428,8 +7369,7 @@ fn lower_aarch64_context(
             ContextStateMembership::Table { offset } => {
                 aarch64_set_table_address(&mut assembler, 12, offset)?;
                 assembler.instruction(aarch64_load_byte_reg(11, 12, 6)?)?;
-                assembler.instruction(aarch64_cmp_w_zero(11)?)?;
-                assembler.branch_cond(AARCH64_EQ, forward_scalar_step)?;
+                assembler.branch_zero_w(11, forward_scalar_step)?;
             }
         }
         aarch64_context_emit_state_skip(
@@ -7447,8 +7387,7 @@ fn lower_aarch64_context(
         invalid_initialized,
         ENABLE_CONTEXT_TRUST_POPULATED_TRANSITIONS,
     )?;
-    assembler.instruction(aarch64_cmp_w_zero(12)?)?;
-    assembler.branch_cond(AARCH64_MI, forward_no_event)?;
+    assembler.branch_bit_set_w(12, 31, forward_no_event)?;
     assembler.branch(forward_loop)?;
     assembler.bind(forward_no_event)?;
     assembler.instruction(aarch64_store_x(2, 4, 8)?)?;
@@ -7504,10 +7443,7 @@ fn lower_aarch64_context(
                         invalid_initialized,
                     )?;
                     let no_raw_initial_event = assembler.label()?;
-                    assembler.instruction(aarch64_lsr_x_imm(11, 8, 15)?)?;
-                    assembler.instruction(aarch64_and_low_x(11, 11, 1)?)?;
-                    assembler.instruction(aarch64_cmp_w_zero(11)?)?;
-                    assembler.branch_cond(AARCH64_EQ, no_raw_initial_event)?;
+                    assembler.branch_bit_clear_w(8, 15, no_raw_initial_event)?;
                     assembler.instruction(aarch64_mov_x(17, 2)?)?;
                     assembler.bind(no_raw_initial_event)?;
                     aarch64_context_emit_decode_raw_reverse_payload(&mut assembler)?;
@@ -7541,8 +7477,7 @@ fn lower_aarch64_context(
                     aarch64_context_emit_dispatch(&mut assembler, reverse_initial)?;
                     aarch64_context_emit_valid(&mut assembler, invalid_initialized)?;
                     let reverse_initial_decoded = assembler.label()?;
-                    assembler.instruction(aarch64_cmp_w_zero(8)?)?;
-                    assembler.branch_cond(AARCH64_MI, reverse_no_initial_event)?;
+                    assembler.branch_bit_set_w(8, 31, reverse_no_initial_event)?;
                     assembler.branch(reverse_initial_decoded)?;
                     assembler.bind(reverse_no_initial_event)?;
                     assembler.instruction(aarch64_mov_x(17, 2)?)?;
@@ -7553,8 +7488,7 @@ fn lower_aarch64_context(
                 assembler.bind(reverse_loop)?;
                 assembler.instruction(aarch64_cmp_x(2, 9)?)?;
                 assembler.branch_cond(AARCH64_LS, reverse_finish)?;
-                assembler.instruction(aarch64_cmp_w_zero(6)?)?;
-                assembler.branch_cond(AARCH64_EQ, reverse_finish)?;
+                assembler.branch_zero_w(6, reverse_finish)?;
                 assembler.instruction(aarch64_sub_x_imm(2, 2, 1)?)?;
                 aarch64_context_emit_reverse_transition_cell(&mut assembler, layout)?;
                 aarch64_context_emit_populated_transition_valid_mode(
@@ -7563,8 +7497,7 @@ fn lower_aarch64_context(
                     ENABLE_CONTEXT_TRUST_POPULATED_TRANSITIONS,
                 )?;
                 assembler.instruction(aarch64_context_and_low_w(6, 8, 30)?)?;
-                assembler.instruction(aarch64_cmp_w_zero(8)?)?;
-                assembler.branch_cond(AARCH64_MI, reverse_no_event)?;
+                assembler.branch_bit_set_w(8, 31, reverse_no_event)?;
                 assembler.branch(reverse_loop)?;
                 assembler.bind(reverse_no_event)?;
                 assembler.instruction(aarch64_mov_x(17, 2)?)?;
@@ -9234,20 +9167,22 @@ mod tests {
                             "adaptive ASIMD code must charge vector refinement"
                         );
                     }
-                    let reserve_sequence = [
+                    let reserve_prefix = [
                         aarch64_add_x_imm(12, 2, guard.initial_credit).unwrap(),
                         aarch64_sub_x_reg(12, 12, 17).unwrap(),
                         aarch64_lsr_x_imm(12, 12, shift).unwrap(),
                         aarch64_movz_w(10, u16::from(search.max_verify_bytes)).unwrap(),
                         aarch64_cmp_x(12, 10).unwrap(),
                         aarch64_csel_x(10, 12, 10, AARCH64_LO).unwrap(),
-                        aarch64_cmp_w_zero(10).unwrap(),
                     ];
-                    assert!(
-                        words
-                            .windows(reserve_sequence.len())
-                            .any(|actual| actual == reserve_sequence),
-                        "AArch64 candidate verifier must clamp an affordable reservation",
+                    let reserve = words
+                        .windows(reserve_prefix.len() + 1)
+                        .find(|actual| actual.starts_with(&reserve_prefix))
+                        .expect("AArch64 candidate verifier must clamp an affordable reservation");
+                    assert_eq!(
+                        reserve[reserve_prefix.len()] & 0xff00_001f,
+                        0x3400_000a,
+                        "AArch64 empty reservation must use CBZ",
                     );
                     assert!(words.contains(&aarch64_context_add_x_lsl(17, 17, 10, shift).unwrap()));
                     assert!(words.contains(&aarch64_sub_w_imm(10, 10, 1).unwrap()));
@@ -10084,7 +10019,12 @@ mod tests {
                 >= 2,
             "AArch64 Span must use scaled halfword lookup in both directions",
         );
-        assert!(span_words.contains(&aarch64_lsr_x_imm(11, 8, 15).unwrap()));
+        assert!(
+            span_words
+                .iter()
+                .any(|&word| word & 0xfff8_001f == 0x3778_0008),
+            "AArch64 raw reverse dispatch must test bit 15 directly",
+        );
     }
 
     #[test]
@@ -10207,7 +10147,7 @@ mod tests {
         .unwrap();
         aarch64_checked.bind(aarch64_checked_invalid).unwrap();
         let aarch64_checked = aarch64_checked.finish().unwrap();
-        assert_eq!(aarch64_checked.len(), 6 * 4);
+        assert_eq!(aarch64_checked.len(), 5 * 4);
         let checked_words = aarch64_checked
             .chunks_exact(4)
             .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
@@ -10217,10 +10157,10 @@ mod tests {
             checked_words[1],
             aarch64_context_and_low_w(6, 8, 28).unwrap()
         );
-        assert_eq!(checked_words[2], aarch64_cmp_w_zero(6).unwrap());
-        assert_eq!(checked_words[4], aarch64_sub_w_imm(6, 6, 1).unwrap());
+        assert_eq!(checked_words[2] & 0xff00_001f, 0x3400_0006);
+        assert_eq!(checked_words[3], aarch64_sub_w_imm(6, 6, 1).unwrap());
         assert_eq!(
-            checked_words[5],
+            checked_words[4],
             aarch64_lsr_x_imm(8, 8, CONTEXT_FORWARD_CELL_FLAGS_SHIFT).unwrap()
         );
 
@@ -10258,7 +10198,7 @@ mod tests {
         aarch64_reverse_checked
             .bind(aarch64_reverse_invalid)
             .unwrap();
-        assert_eq!(aarch64_reverse_checked.finish().unwrap().len(), 4 * 4);
+        assert_eq!(aarch64_reverse_checked.finish().unwrap().len(), 4);
         let mut aarch64_reverse_trusted = Aarch64Assembler::new();
         let aarch64_reverse_trusted_invalid = aarch64_reverse_trusted.label().unwrap();
         aarch64_context_emit_populated_transition_valid_mode(

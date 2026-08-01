@@ -365,15 +365,13 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
     assembler.instruction(aarch64_load_byte_reg(8, 0, REVERSE_CURSOR)?)?;
     assembler.instruction(aarch64_load_byte_reg(8, REVERSE_CLASS_MAP, 8)?)?;
     assembler.instruction(aarch64_load_w_uxtw(8, 11, 8)?)?;
-    assembler.instruction(aarch64_cmp_w_zero(8)?)?;
-    assembler.branch_cond(AARCH64_MI, record_start)?;
+    assembler.branch_bit_set_w(8, 31, record_start)?;
 
     assembler.bind(reverse_continue)?;
     // Seeded-reverse rows never carry the forward accelerator tag, so their
     // absolute next-row token occupies all low 31 bits.
     assembler.instruction(aarch64_and_low_31(6, 8)?)?;
-    assembler.instruction(aarch64_cmp_w_zero(6)?)?;
-    assembler.branch_cond(AARCH64_EQ, reverse_done)?;
+    assembler.branch_zero_w(6, reverse_done)?;
     assembler.instruction(aarch64_sub_w_imm(6, 6, 1)?)?;
     assembler.instruction(aarch64_add_x_reg(11, 5, 6)?)?;
     assembler.branch(reverse_loop)?;
