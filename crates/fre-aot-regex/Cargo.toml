@@ -1,0 +1,23 @@
+[package]
+name = "fre-aot-regex"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "General self-contained optimizing AOT compiler for FRE automata"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+fre-automata = { path = "../fre-automata" }
+fre-lower = { path = "../fre-lower" }
+fre-syntax = { path = "../fre-syntax" }
+sha2 = "0.10.9"
+
+[dev-dependencies]
+regex = { version = "=1.12.4", features = ["perf-dfa-full"] }
+
+[lints]
+workspace = true

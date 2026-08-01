@@ -151,6 +151,7 @@ dependencies = [
  "fre-aot-aarch64",
  "fre-aot-elf",
  "fre-aot-macho",
+ "fre-aot-regex",
  "fre-aot-search-contract",
  "fre-jit-aarch64",
  "fre-kernel-ir",
@@ -212,6 +213,24 @@ dependencies = [
  "fre-exact-alloc",
  "fre-kernel-ir",
  "sha2",
+]
+
+[[package]]
+name = "fre-aot-regex"
+version = "0.1.0"
+dependencies = [
+ "fre-automata",
+ "fre-lower",
+ "fre-syntax",
+ "regex",
+ "sha2",
+]
+
+[[package]]
+name = "fre-aot-regex-runtime"
+version = "0.1.0"
+dependencies = [
+ "fre-aot-regex",
 ]
 
 [[package]]

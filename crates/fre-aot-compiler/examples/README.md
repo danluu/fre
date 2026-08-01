@@ -1,4 +1,26 @@
-# Search Span source-candidate emitter
+# General AOT compiler
+
+`compile_general_aot.rs` is the explicit general compiler CLI:
+
+```sh
+cargo run -p fre-aot-compiler --example compile_general_aot -- \
+  '(?:[A-Za-z_][A-Za-z0-9_]*::)+item' \
+  linux-x86_64 item.o optimizing span avx2
+```
+
+The final feature argument is optional and comma-separated. Accepted facts are
+`sse2`, `avx2`, `avx512f`, `avx512bw`, `avx512vl`, `asimd`, `sve`, and `sve2`;
+the target validator rejects cross-architecture or incomplete feature sets.
+Current x86-64 instruction selection uses the SSE2 baseline, AVX2, or
+AVX-512 when both `avx512f` and `avx512bw` are present. Current `AArch64`
+selection uses scalar code or `asimd`. `avx512vl`, `sve`, and `sve2` are
+accepted target facts but do not yet select distinct lowering. Empty features
+therefore mean SSE2 on x86-64 and scalar code on `AArch64`; the compiler does
+not inspect the build host. The command prints the identity-suffixed entry, any
+required runtime helper and exported program alias, and the complete receipt.
+It does not invoke an assembler or linker.
+
+## Legacy Search Span source-candidate emitter
 
 `emit_search_span_source_candidate.rs` is the source-only first step toward a
 real static Search qualification. It compiles the fixed non-Unicode

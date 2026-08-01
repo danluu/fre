@@ -43,8 +43,20 @@
 //! Rust consumer module can retain the exact direct symbol call behind the
 //! default-off static-runtime same-thread session; this qualification-private
 //! candidate likewise grants no production authority.
+//!
+//! The separately versioned [`general`] API is the replacement general
+//! compiler. It admits every capture-free pattern lowered to FRE's prioritized
+//! automaton, runs source-independent ordered-DFA/TNFA optimization, and emits
+//! relocatable objects for x86-64 or `AArch64` on Linux or macOS. The legacy
+//! exact-literal entry points below remain available as the cheap template
+//! compiler; they do not gate the general pipeline.
 
 #![forbid(unsafe_code)]
+
+/// General self-contained optimizing regex AOT compiler.
+pub mod general {
+    pub use fre_aot_regex::*;
+}
 
 mod canonical;
 mod compiler;

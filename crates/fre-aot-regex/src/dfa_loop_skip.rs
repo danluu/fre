@@ -1,0 +1,579 @@
+//! Target-neutral selection for SIMD skipping inside completed DFA states.
+//!
+//! The determinizer exposes exact per-state self-loop masks derived from the
+//! finalized transition table. This pass selects at most one non-initial loop
+//! whose *exit* bytes have a compact SIMD representation.
+//! Keeping one plan bounds the dispatch tax on every ordinary DFA iteration;
+//! target lowering may scan a run of loop bytes with SSE2, AVX2, AVX-512BW,
+//! or ASIMD and resume the ordinary transition loop at the first exit byte.
+
+#![allow(
+    dead_code,
+    reason = "the target-neutral loop plan is staged for native lowering"
+)]
+
+use crate::{
+    dfa::{NativeDfaView, NativeSelfLoopAcceptance},
+    program::OutputContract,
+};
+
+/// The existing byte-comparison lowerings reserve at most eight vector
+/// constants. Four intervals fit that budget even when every interval needs
+/// an inclusive-low and inclusive-high constant.
+pub(crate) const MAX_DFA_LOOP_EXIT_RANGES: usize = 4;
+/// Constants one loop probe may reserve without overlapping the x86 shared
+/// candidate aggregate (`xmm/ymm5`) and range scratch (`xmm/ymm10..11`).
+pub(crate) const MAX_DFA_LOOP_VECTOR_CONSTANTS: u8 = 4;
+
+/// Exit sets broader than this have a uniform expected run shorter than four
+/// bytes. Paying a state dispatch and vector probe for such a loop is not a
+/// target-independent win. The limit is deliberately shared with native
+/// start filtering and is based only on the completed transition graph.
+const MAX_DFA_LOOP_EXIT_BYTES: u16 = 64;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DfaLoopExitRange {
+    pub(crate) start: u8,
+    pub(crate) end: u8,
+}
+
+/// One exact, graph-derived interior-loop optimization.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DfaLoopSkipPlan {
+    /// Semantic DFA state whose table row owns the self-loop.
+    pub(crate) state: u32,
+    /// Whether every skipped transition accepts at its consumed end.
+    pub(crate) accepting: bool,
+    exit_ranges: [DfaLoopExitRange; MAX_DFA_LOOP_EXIT_RANGES],
+    exit_range_count: u8,
+    /// Number of bytes that leave the selected self-loop.
+    pub(crate) exit_byte_count: u16,
+    /// Number of vector constants required by a compare-based lowering.
+    pub(crate) vector_constant_count: u8,
+}
+
+impl DfaLoopSkipPlan {
+    #[must_use]
+    pub(crate) fn ranges(&self) -> &[DfaLoopExitRange] {
+        &self.exit_ranges[..usize::from(self.exit_range_count)]
+    }
+
+    #[must_use]
+    pub(crate) fn exits_on(&self, byte: u8) -> bool {
+        self.ranges()
+            .iter()
+            .any(|range| range.start <= byte && byte <= range.end)
+    }
+
+    #[must_use]
+    pub(crate) fn is_exact(&self) -> bool {
+        self.ranges().iter().all(|range| range.start == range.end)
+    }
+}
+
+/// Select one profitable interior self-loop from the complete forward table.
+///
+/// Soundness comes entirely from [`NativeDfaView::self_loop_skip_plans`]. The
+/// selected membership contains all and only bytes whose transition returns
+/// to the same state with one uniform acceptance behavior. The encoded
+/// complement therefore identifies the exact byte at which target code must
+/// re-enter the ordinary transition loop. Accepting loops are useful for
+/// end-selecting contracts, where lowering updates the pending end after a
+/// skipped run. `Exists` declines them because its ordinary first accepting
+/// transition already returns. A non-accepting initial loop remains the
+/// responsibility of native start-state acceleration unless the DFA is
+/// initially nullable (which disables that optimization); accepting initial
+/// loops are not equivalent to start filtering and remain eligible.
+#[must_use]
+pub(crate) fn select_dfa_loop_skip(
+    view: &NativeDfaView<'_>,
+    output: OutputContract,
+) -> Option<DfaLoopSkipPlan> {
+    let candidates = view.self_loop_skip_plans()?;
+    let mut selected: Option<DfaLoopSkipPlan> = None;
+    for candidate in candidates.as_slice() {
+        if (candidate.state == view.initial_state
+            && candidate.acceptance == NativeSelfLoopAcceptance::NonAccepting
+            && !view.initial_pending)
+            || (candidate.acceptance == NativeSelfLoopAcceptance::Accepting
+                && output == OutputContract::Exists)
+            || candidate.complement_cardinality == 0
+            || candidate.complement_cardinality > MAX_DFA_LOOP_EXIT_BYTES
+        {
+            continue;
+        }
+        let Some(plan) = encode_exit_ranges(
+            candidate.state,
+            candidate.acceptance == NativeSelfLoopAcceptance::Accepting,
+            candidate.complement.words,
+            candidate.complement_cardinality,
+        ) else {
+            continue;
+        };
+        if plan.vector_constant_count > MAX_DFA_LOOP_VECTOR_CONSTANTS {
+            continue;
+        }
+        let replace = selected.is_none_or(|current| selection_key(plan) < selection_key(current));
+        if replace {
+            selected = Some(plan);
+        }
+    }
+    selected
+}
+
+/// Rank by an architecture-neutral estimate of work left in the vector loop.
+/// Fewer exits give longer runs. On a tie, fewer constants reduce setup and
+/// probe cost, then stable state numbering makes object output deterministic.
+const fn selection_key(plan: DfaLoopSkipPlan) -> (u16, bool, u8, u32) {
+    (
+        plan.exit_byte_count,
+        plan.accepting,
+        plan.vector_constant_count,
+        plan.state,
+    )
+}
+
+fn encode_exit_ranges(
+    state: u32,
+    accepting: bool,
+    words: [u64; 4],
+    exit_byte_count: u16,
+) -> Option<DfaLoopSkipPlan> {
+    let mut ranges = [DfaLoopExitRange::default(); MAX_DFA_LOOP_EXIT_RANGES];
+    let mut range_count = 0_usize;
+    for byte in u8::MIN..=u8::MAX {
+        if !mask_contains(words, byte) {
+            continue;
+        }
+        if let Some(last) = range_count
+            .checked_sub(1)
+            .and_then(|index| ranges.get_mut(index))
+            && last.end.checked_add(1) == Some(byte)
+        {
+            last.end = byte;
+            continue;
+        }
+        if range_count == MAX_DFA_LOOP_EXIT_RANGES {
+            return None;
+        }
+        ranges[range_count] = DfaLoopExitRange {
+            start: byte,
+            end: byte,
+        };
+        range_count = range_count.checked_add(1)?;
+    }
+    if range_count == 0 {
+        return None;
+    }
+    let exact = ranges[..range_count]
+        .iter()
+        .all(|range| range.start == range.end);
+    let constant_count = if exact {
+        range_count
+    } else {
+        range_count.checked_mul(2)?
+    };
+    Some(DfaLoopSkipPlan {
+        state,
+        accepting,
+        exit_ranges: ranges,
+        exit_range_count: u8::try_from(range_count).ok()?,
+        exit_byte_count,
+        vector_constant_count: u8::try_from(constant_count).ok()?,
+    })
+}
+
+fn mask_contains(words: [u64; 4], byte: u8) -> bool {
+    let byte = usize::from(byte);
+    words[byte / 64] & (1_u64 << (byte % 64)) != 0
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bounded independent model and bitmap-oracle arithmetic"
+)]
+mod tests {
+    use super::{
+        DfaLoopSkipPlan, MAX_DFA_LOOP_EXIT_RANGES, MAX_DFA_LOOP_VECTOR_CONSTANTS,
+        encode_exit_ranges, mask_contains, select_dfa_loop_skip,
+    };
+    use crate::dfa::{ForwardCell, NativeDfaView};
+    use crate::{CompileMode, CompileRequest, OutputContract, Target, compile};
+
+    const NO_STATE: u32 = u32::MAX;
+
+    fn two_state_view<'a>(
+        byte_classes: &'a [u8; 256],
+        representatives: &'a [u8],
+        cells: &'a [ForwardCell],
+    ) -> NativeDfaView<'a> {
+        NativeDfaView {
+            initial_state: 0,
+            initial_pending: false,
+            initial_terminal: false,
+            byte_classes,
+            class_count: representatives.len(),
+            class_representatives: representatives,
+            forward_cells: cells,
+            reverse_initial: None,
+            reverse_cells: &[],
+        }
+    }
+
+    fn semantic_cell(view: &NativeDfaView<'_>, state: u32, byte: u8) -> ForwardCell {
+        let class = usize::from(view.byte_classes[usize::from(byte)]);
+        let state = usize::try_from(state).expect("test state");
+        view.forward_cells[state * view.class_count + class]
+    }
+
+    fn assert_plan_exact(view: &NativeDfaView<'_>, plan: &DfaLoopSkipPlan) {
+        for byte in u8::MIN..=u8::MAX {
+            let cell = semantic_cell(view, plan.state, byte);
+            let semantic_exit = cell.next != plan.state || cell.accepted != plan.accepting;
+            assert_eq!(
+                plan.exits_on(byte),
+                semantic_exit,
+                "byte {byte} disagrees with the completed DFA row"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_nonaccepting_interior_loop_is_selected_exactly() {
+        let mut classes = [0_u8; 256];
+        classes[usize::from(b'Q')] = 1;
+        classes[usize::from(b'Z')] = 2;
+        let representatives = [0, b'Q', b'Z'];
+        let cells = [
+            ForwardCell {
+                next: 0,
+                accepted: false,
+            },
+            ForwardCell {
+                next: 1,
+                accepted: false,
+            },
+            ForwardCell {
+                next: NO_STATE,
+                accepted: false,
+            },
+            ForwardCell {
+                next: 1,
+                accepted: false,
+            },
+            ForwardCell {
+                next: NO_STATE,
+                accepted: false,
+            },
+            ForwardCell {
+                next: NO_STATE,
+                accepted: true,
+            },
+        ];
+        let view = two_state_view(&classes, &representatives, &cells);
+        let plan =
+            select_dfa_loop_skip(&view, OutputContract::Exists).expect("interior 254-byte loop");
+        assert_eq!(plan.state, 1);
+        assert_eq!(plan.exit_byte_count, 2);
+        assert_eq!(plan.vector_constant_count, 2);
+        assert!(plan.is_exact());
+        assert_eq!(
+            plan.ranges()
+                .iter()
+                .map(|range| (range.start, range.end))
+                .collect::<Vec<_>>(),
+            vec![(b'Q', b'Q'), (b'Z', b'Z')]
+        );
+        assert_plan_exact(&view, &plan);
+    }
+
+    #[test]
+    fn completed_general_compilation_exposes_interior_loop_plan() {
+        let compiled = compile(
+            CompileRequest::new("A(?-u:[^Z])*Z", Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .expect("general optimizing compilation");
+        let view = compiled
+            .program()
+            .native_dfa_view()
+            .expect("completed ordered DFA");
+        let plan = select_dfa_loop_skip(&view.dfa, OutputContract::Exists)
+            .expect("graph-derived interior loop");
+        assert_eq!(plan.exit_byte_count, 1);
+        assert_eq!(plan.ranges()[0].start, b'Z');
+        assert_eq!(plan.ranges()[0].end, b'Z');
+        assert_plan_exact(&view.dfa, &plan);
+
+        let nullable = compile(
+            CompileRequest::new("(?-u:[^Z]*)", Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span),
+        )
+        .expect("nullable general optimizing compilation");
+        let nullable_view = nullable
+            .program()
+            .native_dfa_view()
+            .expect("nullable completed ordered DFA");
+        let nullable_plan = select_dfa_loop_skip(&nullable_view.dfa, OutputContract::Span)
+            .expect("accepting initial loop");
+        assert!(nullable_plan.accepting);
+        assert_eq!(nullable_plan.state, nullable_view.dfa.initial_state);
+        assert_plan_exact(&nullable_view.dfa, &nullable_plan);
+    }
+
+    #[test]
+    fn accepting_self_loop_is_selected_only_for_end_contracts() {
+        let mut classes = [0_u8; 256];
+        classes[usize::from(b'X')] = 1;
+        let representatives = [0, b'X'];
+        let cells = [
+            ForwardCell {
+                next: 0,
+                accepted: false,
+            },
+            ForwardCell {
+                next: 1,
+                accepted: false,
+            },
+            ForwardCell {
+                next: 1,
+                accepted: true,
+            },
+            ForwardCell {
+                next: NO_STATE,
+                accepted: false,
+            },
+        ];
+        let view = two_state_view(&classes, &representatives, &cells);
+        assert!(select_dfa_loop_skip(&view, OutputContract::Exists).is_none());
+        let selected = select_dfa_loop_skip(&view, OutputContract::SelectedEnd)
+            .expect("selected-end accepting loop");
+        assert!(selected.accepting);
+        assert_plan_exact(&view, &selected);
+        for bits in 0_u16..=255 {
+            let mut haystack = [0_u8; 8];
+            for (index, byte) in haystack.iter_mut().enumerate() {
+                if bits & (1_u16 << index) != 0 {
+                    *byte = b'X';
+                }
+            }
+            assert_eq!(
+                skipped_trace(&view, &selected, &haystack),
+                baseline_trace(&view, &haystack)
+            );
+        }
+    }
+
+    #[test]
+    fn fragmented_or_dense_exit_sets_decline() {
+        let mut fragmented = [0_u64; 4];
+        for byte in [1_u8, 3, 5, 7, 9] {
+            fragmented[usize::from(byte) / 64] |= 1_u64 << (usize::from(byte) % 64);
+        }
+        assert!(encode_exit_ranges(1, false, fragmented, 5).is_none());
+
+        let dense = [u64::MAX; 4];
+        // Range encoding itself is exact; density is a separate selection
+        // policy applied before it reaches target lowering.
+        let encoded = encode_exit_ranges(1, false, dense, 256).expect("one dense interval");
+        assert_eq!(encoded.ranges().len(), 1);
+        assert_eq!(encoded.ranges()[0].start, 0);
+        assert_eq!(encoded.ranges()[0].end, 255);
+        assert_eq!(MAX_DFA_LOOP_EXIT_RANGES, 4);
+        assert_eq!(MAX_DFA_LOOP_VECTOR_CONSTANTS, 4);
+
+        let mut classes = [0_u8; 256];
+        classes[1..=2].fill(1);
+        classes[4..=5].fill(2);
+        classes[7..=8].fill(3);
+        let representatives = [0, 1, 4, 7];
+        let cells = [
+            ForwardCell {
+                next: 0,
+                accepted: false,
+            },
+            ForwardCell {
+                next: 1,
+                accepted: false,
+            },
+            ForwardCell {
+                next: 0,
+                accepted: false,
+            },
+            ForwardCell {
+                next: 0,
+                accepted: false,
+            },
+            ForwardCell {
+                next: 1,
+                accepted: false,
+            },
+            ForwardCell {
+                next: NO_STATE,
+                accepted: false,
+            },
+            ForwardCell {
+                next: NO_STATE,
+                accepted: false,
+            },
+            ForwardCell {
+                next: NO_STATE,
+                accepted: false,
+            },
+        ];
+        let view = two_state_view(&classes, &representatives, &cells);
+        assert!(
+            select_dfa_loop_skip(&view, OutputContract::SelectedEnd).is_none(),
+            "three range intervals need six constants and alias x86 scratch registers"
+        );
+    }
+
+    #[test]
+    fn range_encoding_matches_independent_bitmap_oracle_for_all_lanes() {
+        let mut state = 0x243f_6a88_85a3_08d3_u64;
+        for _ in 0..512 {
+            let mut words = [0_u64; 4];
+            for _ in 0..4 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let start = u8::try_from(state & 255).expect("reduced byte");
+                let width = u8::try_from((state >> 8) & 15).expect("reduced width");
+                let end = start.saturating_add(width);
+                for byte in start..=end {
+                    words[usize::from(byte) / 64] |= 1_u64 << (usize::from(byte) % 64);
+                }
+            }
+            let count = words
+                .iter()
+                .map(|word| word.count_ones())
+                .sum::<u32>()
+                .try_into()
+                .expect("bitmap cardinality");
+            let Some(plan) = encode_exit_ranges(7, false, words, count) else {
+                continue;
+            };
+            for byte in u8::MIN..=u8::MAX {
+                assert_eq!(plan.exits_on(byte), mask_contains(words, byte));
+            }
+        }
+    }
+
+    fn baseline_trace(view: &NativeDfaView<'_>, haystack: &[u8]) -> (u32, Option<usize>) {
+        let mut state = view.initial_state;
+        let mut accepted = None;
+        for (position, &byte) in haystack.iter().enumerate() {
+            let cell = semantic_cell(view, state, byte);
+            if cell.accepted {
+                accepted = position.checked_add(1);
+            }
+            if cell.next == NO_STATE {
+                break;
+            }
+            state = cell.next;
+        }
+        (state, accepted)
+    }
+
+    fn skipped_trace(
+        view: &NativeDfaView<'_>,
+        plan: &DfaLoopSkipPlan,
+        haystack: &[u8],
+    ) -> (u32, Option<usize>) {
+        let mut state = view.initial_state;
+        let mut accepted = None;
+        let mut position = 0_usize;
+        while position < haystack.len() {
+            if state == plan.state {
+                while position < haystack.len() && !plan.exits_on(haystack[position]) {
+                    // This is the independent optimized transformation: it
+                    // does not consult a transition cell for a skipped byte.
+                    position = position.checked_add(1).expect("small trace");
+                    if plan.accepting {
+                        accepted = Some(position);
+                    }
+                }
+                if position == haystack.len() {
+                    break;
+                }
+            }
+            let cell = semantic_cell(view, state, haystack[position]);
+            position = position.checked_add(1).expect("small trace");
+            if cell.accepted {
+                accepted = Some(position);
+            }
+            if cell.next == NO_STATE {
+                break;
+            }
+            state = cell.next;
+        }
+        (state, accepted)
+    }
+
+    #[test]
+    fn randomized_skip_trace_matches_scalar_dfa_trace() {
+        let mut classes = [0_u8; 256];
+        classes[usize::from(b'A')] = 1;
+        classes[usize::from(b'Q')] = 2;
+        classes[usize::from(b'Z')] = 3;
+        let representatives = [0, b'A', b'Q', b'Z'];
+        let cells = [
+            ForwardCell {
+                next: 0,
+                accepted: false,
+            },
+            ForwardCell {
+                next: 1,
+                accepted: false,
+            },
+            ForwardCell {
+                next: 0,
+                accepted: false,
+            },
+            ForwardCell {
+                next: 0,
+                accepted: false,
+            },
+            ForwardCell {
+                next: 1,
+                accepted: false,
+            },
+            ForwardCell {
+                next: 1,
+                accepted: false,
+            },
+            ForwardCell {
+                next: 0,
+                accepted: false,
+            },
+            ForwardCell {
+                next: NO_STATE,
+                accepted: true,
+            },
+        ];
+        let view = two_state_view(&classes, &representatives, &cells);
+        let plan =
+            select_dfa_loop_skip(&view, OutputContract::SelectedEnd).expect("broad state-one loop");
+        assert_plan_exact(&view, &plan);
+
+        let mut random = 0x1319_8a2e_0370_7345_u64;
+        for length in 0..=257 {
+            for _ in 0..32 {
+                let mut haystack = vec![0_u8; length];
+                for byte in &mut haystack {
+                    random ^= random << 13;
+                    random ^= random >> 7;
+                    random ^= random << 17;
+                    *byte = u8::try_from(random & 255).expect("reduced byte");
+                }
+                assert_eq!(
+                    skipped_trace(&view, &plan, &haystack),
+                    baseline_trace(&view, &haystack)
+                );
+            }
+        }
+    }
+}

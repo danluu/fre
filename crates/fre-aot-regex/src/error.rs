@@ -1,0 +1,153 @@
+use core::fmt;
+
+/// Bounded compiler resource.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompileResource {
+    DfaStates,
+    DfaTransitions,
+    ProgramBytes,
+    CodeBytes,
+    ObjectBytes,
+    Work,
+}
+
+/// Deterministic object-production failure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ObjectError {
+    UnsupportedTarget,
+    ArithmeticOverflow(&'static str),
+    InvalidModule(&'static str),
+    Resource {
+        resource: CompileResource,
+        limit: usize,
+        required: usize,
+    },
+}
+
+impl fmt::Display for ObjectError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedTarget => formatter.write_str("unsupported AOT object target"),
+            Self::ArithmeticOverflow(site) => {
+                write!(formatter, "object arithmetic overflow at {site}")
+            }
+            Self::InvalidModule(detail) => write!(formatter, "invalid compiled module: {detail}"),
+            Self::Resource {
+                resource,
+                limit,
+                required,
+            } => write!(
+                formatter,
+                "object resource {resource:?} requires {required}, limit is {limit}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ObjectError {}
+
+/// General compiler failure.
+#[derive(Debug)]
+pub enum CompileError {
+    Syntax(fre_syntax::ParseError),
+    Lower(fre_lower::LowerError),
+    Automaton(fre_automata::CompileError),
+    Search(fre_automata::SearchError),
+    Object(ObjectError),
+    Resource {
+        resource: CompileResource,
+        limit: usize,
+        required: usize,
+    },
+    StateExplosion {
+        limit: usize,
+        discovered: usize,
+    },
+    InvalidWindow {
+        start: usize,
+        end: usize,
+        haystack_len: usize,
+    },
+    InternalInvariant(&'static str),
+}
+
+impl fmt::Display for CompileError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Syntax(error) => write!(formatter, "syntax error: {error}"),
+            Self::Lower(error) => write!(formatter, "lowering error: {error}"),
+            Self::Automaton(error) => write!(formatter, "automaton error: {error}"),
+            Self::Search(error) => write!(formatter, "portable search error: {error}"),
+            Self::Object(error) => write!(formatter, "object error: {error}"),
+            Self::Resource {
+                resource,
+                limit,
+                required,
+            } => write!(
+                formatter,
+                "compiler resource {resource:?} requires {required}, limit is {limit}"
+            ),
+            Self::StateExplosion { limit, discovered } => write!(
+                formatter,
+                "ordered determinization discovered {discovered} states, limit is {limit}"
+            ),
+            Self::InvalidWindow {
+                start,
+                end,
+                haystack_len,
+            } => write!(
+                formatter,
+                "invalid search window {start}..{end} for haystack length {haystack_len}"
+            ),
+            Self::InternalInvariant(detail) => {
+                write!(formatter, "compiler internal invariant failed: {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CompileError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Syntax(error) => Some(error),
+            Self::Lower(error) => Some(error),
+            Self::Automaton(error) => Some(error),
+            Self::Search(error) => Some(error),
+            Self::Object(error) => Some(error),
+            Self::Resource { .. }
+            | Self::StateExplosion { .. }
+            | Self::InvalidWindow { .. }
+            | Self::InternalInvariant(_) => None,
+        }
+    }
+}
+
+impl From<fre_syntax::ParseError> for CompileError {
+    fn from(value: fre_syntax::ParseError) -> Self {
+        Self::Syntax(value)
+    }
+}
+
+impl From<fre_lower::LowerError> for CompileError {
+    fn from(value: fre_lower::LowerError) -> Self {
+        Self::Lower(value)
+    }
+}
+
+impl From<fre_automata::CompileError> for CompileError {
+    fn from(value: fre_automata::CompileError) -> Self {
+        Self::Automaton(value)
+    }
+}
+
+impl From<fre_automata::SearchError> for CompileError {
+    fn from(value: fre_automata::SearchError) -> Self {
+        Self::Search(value)
+    }
+}
+
+impl From<ObjectError> for CompileError {
+    fn from(value: ObjectError) -> Self {
+        Self::Object(value)
+    }
+}
