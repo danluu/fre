@@ -3,7 +3,7 @@ use fre_automata::{
 };
 use fre_lower::{
     LowerError, LowerLimits, LowerResource, OperationSemantics, UnsupportedFeature, lower,
-    lower_hir_raw, lower_raw, lower_utf8_start_guarded,
+    lower_general, lower_hir_raw, lower_raw, lower_utf8_start_guarded,
 };
 use fre_syntax::{
     CanonicalPattern, CompatibilityProfile, ParseRequest, RustParsed, RustProfile, parse,
@@ -426,6 +426,59 @@ fn nullable_unbounded_cycles_require_a_capture_free_normalization_proof() {
             UnsupportedFeature::UncertifiedUnboundedRepetition
         ))
     ));
+}
+
+#[test]
+fn general_nullable_repetition_lowering_needs_no_source_recipe() {
+    let patterns = [
+        "(?:a*?)*?",
+        "(?:a?){3,}?",
+        "(?:a*){2,}?",
+        "(?:b|a*)*",
+        "(?:a??|aa)*?",
+        "(?:a*?|b)*?",
+        "(?:(?:a?)|(?:b?))+",
+        "(?:(?:a*?)|(?:b))*?c",
+    ];
+    let haystacks = words(4);
+    for pattern in patterns {
+        let parsed = parsed(pattern, false);
+        let lowered = lower_general(
+            &parsed,
+            OperationSemantics::CaptureFree,
+            LowerLimits::default(),
+        )
+        .unwrap_or_else(|error| panic!("general lowering rejected {pattern:?}: {error}"));
+        assert_eq!(lowered.stats().normalized_nullable_repetitions(), 0);
+        let oracle = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        for haystack in &haystacks {
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let actual = lowered
+                        .automaton()
+                        .prepare::<Span>()
+                        .search_window(
+                            haystack,
+                            SearchWindow::new(start, end),
+                            SearchLimits::unlimited(),
+                        )
+                        .unwrap()
+                        .into_output();
+                    let expected = oracle
+                        .find_at(&haystack[..end], start)
+                        .map(|matched| (matched.start(), matched.end()));
+                    assert_eq!(
+                        tuple(actual),
+                        expected,
+                        "pattern={pattern:?}, haystack={haystack:?}, window={start}..{end}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[test]

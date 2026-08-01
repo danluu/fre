@@ -195,6 +195,30 @@ pub fn lower_raw(
     lower_hir_raw(&parsed.hir, operation, limits)
 }
 
+/// Lower a parsed Rust pattern with the general leftmost-first Thompson
+/// construction.
+///
+/// Unlike [`lower_raw`], this route does not require a source-shape
+/// normalization certificate for an unbounded nullable repetition. It
+/// structurally compiles nullable `x*` as `(x+)?`, which is the general
+/// leftmost-first construction. This route may therefore contain finite
+/// epsilon cycles; executors must use a per-position visited set.
+///
+/// This is the lowering entry used by the general AOT compiler. The legacy
+/// route remains separate so existing facade plan identities do not change.
+///
+/// # Errors
+///
+/// Returns [`LowerError`] for an unsupported semantic feature, a hard limit,
+/// checked arithmetic failure, allocation failure, or internal invariant.
+pub fn lower_raw_general(
+    parsed: &RustParsed,
+    operation: OperationSemantics,
+    limits: LowerLimits,
+) -> Result<LoweredRaw, LowerError> {
+    lower_hir_raw_general(&parsed.hir, operation, limits)
+}
+
 /// Lower HIR directly into mutable interchange tables.
 ///
 /// This is useful for isolated lowering tests. Production integration should
@@ -209,6 +233,23 @@ pub fn lower_hir_raw(
     limits: LowerLimits,
 ) -> Result<LoweredRaw, LowerError> {
     let (plan, stats) = compiler::compile(hir, operation, limits, false)?;
+    Ok(LoweredRaw { plan, stats })
+}
+
+/// Lower HIR directly through the general nullable-repetition construction.
+///
+/// This is the HIR-level counterpart of [`lower_raw_general`].
+///
+/// # Errors
+///
+/// Returns [`LowerError`] under the same checked limits as
+/// [`lower_raw_general`].
+pub fn lower_hir_raw_general(
+    hir: &Hir,
+    operation: OperationSemantics,
+    limits: LowerLimits,
+) -> Result<LoweredRaw, LowerError> {
+    let (plan, stats) = compiler::compile_general(hir, operation, limits, false)?;
     Ok(LoweredRaw { plan, stats })
 }
 
@@ -253,6 +294,22 @@ pub fn lower(
     lower_hir(&parsed.hir, operation, limits)
 }
 
+/// Lower and independently validate a parsed Rust pattern through the general
+/// nullable-repetition construction.
+///
+/// This is the validated counterpart of [`lower_raw_general`].
+///
+/// # Errors
+///
+/// Returns [`LowerError`] under the same checked limits as [`lower`].
+pub fn lower_general(
+    parsed: &RustParsed,
+    operation: OperationSemantics,
+    limits: LowerLimits,
+) -> Result<LoweredAutomaton, LowerError> {
+    lower_hir_general(&parsed.hir, operation, limits)
+}
+
 /// Lower and independently validate HIR directly.
 ///
 /// # Errors
@@ -264,6 +321,23 @@ pub fn lower_hir(
     limits: LowerLimits,
 ) -> Result<LoweredAutomaton, LowerError> {
     let lowered = lower_hir_raw(hir, operation, limits)?;
+    let stats = lowered.stats;
+    let automaton = Automaton::from_raw(lowered.plan, limits.automata)?;
+    Ok(LoweredAutomaton { automaton, stats })
+}
+
+/// Lower and independently validate HIR through the general
+/// nullable-repetition construction.
+///
+/// # Errors
+///
+/// Returns [`LowerError`] under the same checked limits as [`lower_general`].
+pub fn lower_hir_general(
+    hir: &Hir,
+    operation: OperationSemantics,
+    limits: LowerLimits,
+) -> Result<LoweredAutomaton, LowerError> {
+    let lowered = lower_hir_raw_general(hir, operation, limits)?;
     let stats = lowered.stats;
     let automaton = Automaton::from_raw(lowered.plan, limits.automata)?;
     Ok(LoweredAutomaton { automaton, stats })

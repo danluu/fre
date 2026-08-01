@@ -115,6 +115,7 @@ enum Task<'h> {
         max: Option<u32>,
         greedy: bool,
         copies: usize,
+        nullable: bool,
     },
     FinishOrderedWordLookAlternationPlus {
         look: Look,
@@ -137,6 +138,33 @@ pub(crate) fn compile(
     limits: LowerLimits,
     utf8_start_guarded: bool,
 ) -> Result<(RawPlan, LowerStats), LowerError> {
+    compile_with_nullable_policy(hir, operation, limits, utf8_start_guarded, false)
+}
+
+/// Compile with the general Thompson construction for unbounded nullable
+/// repetitions.
+///
+/// The legacy lowering route retains its cycle-free normalization certificates
+/// for facade plan stability. The general AOT compiler instead uses the
+/// standard leftmost-first construction `x* == (x+)?` when `x` is nullable.
+/// Ordered closure's per-position seen set makes the resulting epsilon cycle
+/// finite without recognizing source recipes.
+pub(crate) fn compile_general(
+    hir: &Hir,
+    operation: OperationSemantics,
+    limits: LowerLimits,
+    utf8_start_guarded: bool,
+) -> Result<(RawPlan, LowerStats), LowerError> {
+    compile_with_nullable_policy(hir, operation, limits, utf8_start_guarded, true)
+}
+
+fn compile_with_nullable_policy(
+    hir: &Hir,
+    operation: OperationSemantics,
+    limits: LowerLimits,
+    utf8_start_guarded: bool,
+    general_nullable_repetitions: bool,
+) -> Result<(RawPlan, LowerStats), LowerError> {
     if operation == OperationSemantics::CaptureSensitive {
         return Err(LowerError::Unsupported(
             UnsupportedFeature::CaptureSensitiveOperation,
@@ -146,6 +174,7 @@ pub(crate) fn compile(
         limits,
         hir.properties().explicit_captures_len(),
         utf8_start_guarded,
+        general_nullable_repetitions,
     )
     .run(hir)
 }
@@ -161,6 +190,7 @@ struct Compiler<'h> {
     erased_captures: usize,
     normalized_nullable_repetitions: usize,
     utf8_start_guarded: bool,
+    general_nullable_repetitions: bool,
 }
 
 impl<'h> Compiler<'h> {
@@ -169,7 +199,12 @@ impl<'h> Compiler<'h> {
     // yielded sequence and all emitted graph work are charged separately.
     const UTF8_SCALAR_RANGE_PARTITION_WORK: u64 = 64;
 
-    const fn new(limits: LowerLimits, erased_captures: usize, utf8_start_guarded: bool) -> Self {
+    const fn new(
+        limits: LowerLimits,
+        erased_captures: usize,
+        utf8_start_guarded: bool,
+        general_nullable_repetitions: bool,
+    ) -> Self {
         Self {
             limits,
             tasks: Vec::new(),
@@ -181,11 +216,13 @@ impl<'h> Compiler<'h> {
             erased_captures,
             normalized_nullable_repetitions: 0,
             utf8_start_guarded,
+            general_nullable_repetitions,
         }
     }
 
     fn run(mut self, hir: &'h Hir) -> Result<(RawPlan, LowerStats), LowerError> {
-        let root = if let HirKind::Repetition(repetition) = hir.kind()
+        let root = if !self.general_nullable_repetitions
+            && let HirKind::Repetition(repetition) = hir.kind()
             && let Some(empty) =
                 self.normalized_root_ordered_empty_alternation_repetition(repetition)?
         {
@@ -206,7 +243,8 @@ impl<'h> Compiler<'h> {
                     max,
                     greedy,
                     copies,
-                } => self.finish_repetition(min, max, greedy, copies)?,
+                    nullable,
+                } => self.finish_repetition(min, max, greedy, copies, nullable)?,
                 Task::FinishOrderedWordLookAlternationPlus { look } => {
                     self.finish_ordered_word_look_alternation_plus(look)?;
                 }
@@ -310,9 +348,9 @@ impl<'h> Compiler<'h> {
         &mut self,
         repetition: &'h regex_syntax::hir::Repetition,
     ) -> Result<(), LowerError> {
-        if repetition.max.is_none()
-            && !matches!(repetition.sub.properties().minimum_len(), Some(min) if min > 0)
-        {
+        let nullable = repetition.max.is_none()
+            && !matches!(repetition.sub.properties().minimum_len(), Some(min) if min > 0);
+        if nullable && !self.general_nullable_repetitions {
             if let Some((look, consuming)) =
                 self.normalized_ordered_start_look_alternation_repetition(repetition)?
             {
@@ -371,6 +409,7 @@ impl<'h> Compiler<'h> {
             max: repetition.max,
             greedy: repetition.greedy,
             copies,
+            nullable,
         })?;
         for _ in 0..copies {
             self.push_task(Task::Visit(&repetition.sub))?;
@@ -659,6 +698,7 @@ impl<'h> Compiler<'h> {
                     max: None,
                     greedy,
                     copies: 1,
+                    nullable: false,
                 })?;
             }
             NullableRepetitionNormalization::LazyOptionalGreedyPlus => {
@@ -924,6 +964,7 @@ impl<'h> Compiler<'h> {
         max: Option<u32>,
         greedy: bool,
         copies: usize,
+        nullable: bool,
     ) -> Result<(), LowerError> {
         let fragments = self.take_fragments(copies)?;
         let required = usize::try_from(min).map_err(|_| LowerError::ArithmeticOverflow {
@@ -966,7 +1007,15 @@ impl<'h> Compiler<'h> {
                     detail: "extra unbounded-repetition fragments",
                 });
             }
-            pieces.push(if required == 0 {
+            pieces.push(if required == 0 && nullable {
+                // A direct nullable `x*` has the wrong leftmost-first closure
+                // priority. The general Thompson construction is `(x+)?`:
+                // the inner loop retains repetition priority and the outer
+                // optional retains the zero-iteration path. Per-position
+                // closure visitation terminates any zero-width cycle.
+                let plus = self.plus_fragment(&loop_body, greedy)?;
+                self.optional_fragment(plus, greedy)?
+            } else if required == 0 {
                 self.star_fragment(&loop_body, greedy)?
             } else {
                 self.plus_fragment(&loop_body, greedy)?
