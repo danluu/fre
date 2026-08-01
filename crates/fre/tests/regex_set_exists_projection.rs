@@ -209,6 +209,114 @@ fn cumulative_exists_work_limits_are_exact_and_one_below_for_every_set_path() {
 }
 
 #[test]
+fn per_pattern_exists_work_limits_are_exact_with_the_total_budget_unlimited() {
+    let cases: &[(&str, &[u8], PlanKind)] = &[
+        ("!", b"prefix!suffix", PlanKind::ExactLiteral),
+        ("[a-z]+", b"\xFFabc", PlanKind::K0),
+        (
+            r"(?-u:[0-9]+)",
+            b"prefix123suffix",
+            PlanKind::PureByteClassRepeat,
+        ),
+    ];
+
+    for &(pattern, haystack, expected_plan) in cases {
+        let regex = PortableRegex::new(pattern).expect("constituent regex");
+        let set = PortableRegexSet::new([pattern]).expect("single-pattern regex set");
+        assert_eq!(regex.build_report().plan, expected_plan, "{pattern:?}");
+        assert_eq!(
+            set.pattern_build_report(0)
+                .expect("set pattern report")
+                .plan,
+            expected_plan,
+            "{pattern:?}",
+        );
+
+        let _ = regex
+            .is_match(b"", SearchLimits::unlimited())
+            .expect("direct warm-up search");
+        let _ = set
+            .matches(b"", PortableRegexSetRunLimits::unlimited())
+            .expect("set warm-up search");
+        let (matched, accounting) = regex
+            .is_match(haystack, SearchLimits::unlimited())
+            .expect("direct existence work probe");
+        assert!(matched, "{pattern:?}");
+        let exact_work = accounting.work_or_linear_terms();
+        assert!(exact_work > 0, "{pattern:?}");
+
+        let exact = PortableRegexSetRunLimits {
+            pattern: SearchLimits {
+                max_work: exact_work,
+                ..SearchLimits::unlimited()
+            },
+            max_total_work: u64::MAX,
+            ..PortableRegexSetRunLimits::unlimited()
+        };
+        let below = PortableRegexSetRunLimits {
+            pattern: SearchLimits {
+                max_work: exact_work - 1,
+                ..SearchLimits::unlimited()
+            },
+            max_total_work: u64::MAX,
+            ..PortableRegexSetRunLimits::unlimited()
+        };
+
+        let (any, any_report) = set
+            .is_match(haystack, exact)
+            .expect("exact per-pattern is_match work");
+        assert!(any, "{pattern:?}");
+        assert_eq!(any_report.work, exact_work, "{pattern:?}");
+
+        let matches = set
+            .matches(haystack, exact)
+            .expect("exact per-pattern matches work");
+        assert_eq!(matches.iter().collect::<Vec<_>>(), vec![0], "{pattern:?}");
+        assert_eq!(matches.report().work, exact_work, "{pattern:?}");
+
+        let mut read = [false];
+        let (read_any, read_report) = set
+            .matches_read_at(&mut read, haystack, 0, exact)
+            .expect("exact per-pattern caller-buffer work");
+        assert!(read_any, "{pattern:?}");
+        assert_eq!(read, [true], "{pattern:?}");
+        assert_eq!(read_report.work, exact_work, "{pattern:?}");
+
+        let mut alias = [false];
+        let (alias_any, alias_report) = set
+            .read_matches_at(&mut alias, haystack, 0, exact)
+            .expect("exact per-pattern caller-buffer alias work");
+        assert!(alias_any, "{pattern:?}");
+        assert_eq!(alias, [true], "{pattern:?}");
+        assert_eq!(alias_report.work, exact_work, "{pattern:?}");
+
+        for error in [
+            set.is_match(haystack, below)
+                .expect_err("one-below per-pattern is_match work"),
+            set.matches(haystack, below)
+                .expect_err("one-below per-pattern matches work"),
+            set.matches_read_at(&mut [false], haystack, 0, below)
+                .expect_err("one-below per-pattern caller-buffer work"),
+            set.read_matches_at(&mut [false], haystack, 0, below)
+                .expect_err("one-below per-pattern caller-buffer alias work"),
+        ] {
+            assert!(
+                matches!(
+                    error,
+                    PortableRegexSetExecutionError::Pattern {
+                        index: 0,
+                        total_work_before: 0,
+                        remaining_total_work: u64::MAX,
+                        ..
+                    }
+                ),
+                "{pattern:?}: {error:?}",
+            );
+        }
+    }
+}
+
+#[test]
 fn range_and_output_preflight_contracts_are_unchanged() {
     let set = PortableRegexSet::new(PATTERNS).expect("mixed-plan regex set");
     let haystack = b"!abc123";
