@@ -16,7 +16,7 @@ use fre_simd_kernels::{
     ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD, AsciiByteSet, AsciiByteSetRunScanner, DispatchPolicy,
     Feature, SelectionReceipt, SimdDispatchContext,
 };
-use memchr::memmem::{Finder, FinderBuilder};
+use memchr::memmem::{FindIter, Finder, FinderBuilder};
 
 use crate::Window;
 
@@ -421,6 +421,84 @@ pub struct DispatchedBoundedRequiredLiteralPlan {
     backward_scanner: Option<AsciiByteSetRunScanner>,
 }
 
+/// The exact non-overlapping occurrence stream used by required-literal plans.
+///
+/// The first probe calls [`Finder::find`] directly. A continuation iterator is
+/// constructed only if the caller rejects that occurrence and asks again. The
+/// iterator starts at the first match end, exactly matching `FindIter`'s
+/// non-overlapping advance after a non-empty needle. Separately,
+/// required-literal admission proves the needle unbordered, so this stream is
+/// complete: an occurrence starting strictly inside the first match would
+/// create a non-empty needle border.
+#[derive(Debug)]
+struct RequiredLiteralOccurrences<'h, 'f> {
+    finder: &'f Finder<'static>,
+    haystack: &'h [u8],
+    first_pending: bool,
+    continuation_start: Option<usize>,
+    continuation: Option<FindIter<'h, 'f>>,
+}
+
+impl<'h, 'f> RequiredLiteralOccurrences<'h, 'f> {
+    #[inline(always)]
+    fn new(finder: &'f Finder<'static>, haystack: &'h [u8]) -> Self {
+        debug_assert!(!finder.needle().is_empty());
+        Self {
+            finder,
+            haystack,
+            first_pending: true,
+            continuation_start: None,
+            continuation: None,
+        }
+    }
+
+    #[inline(always)]
+    fn next(&mut self) -> Result<Option<usize>, SearchError> {
+        if self.first_pending {
+            self.first_pending = false;
+            let Some(relative) = self.finder.find(self.haystack) else {
+                return Ok(None);
+            };
+            let continuation_start = relative.checked_add(self.finder.needle().len()).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "required-literal continuation start",
+                },
+            )?;
+            debug_assert!(continuation_start <= self.haystack.len());
+            self.continuation_start = Some(continuation_start);
+            return Ok(Some(relative));
+        }
+
+        if self.continuation.is_none() {
+            let Some(continuation_start) = self.continuation_start else {
+                return Ok(None);
+            };
+            let continuation_haystack = self.haystack.get(continuation_start..).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "required-literal continuation slice",
+                },
+            )?;
+            self.continuation = Some(self.finder.find_iter(continuation_haystack));
+        }
+        let Some(relative) = self
+            .continuation
+            .as_mut()
+            .expect("the continuation iterator was initialized above")
+            .next()
+        else {
+            return Ok(None);
+        };
+        let continuation_start = self
+            .continuation_start
+            .expect("an initialized continuation retains its absolute offset");
+        relative.checked_add(continuation_start).map(Some).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "required-literal continuation occurrence",
+            },
+        )
+    }
+}
+
 impl RequiredLiteralPlan {
     /// Whether this host and class select the opt-in backward run scanner.
     ///
@@ -699,7 +777,7 @@ impl RequiredLiteralPlan {
 
         let mut accounting = self.preflight(window, limits, backward_scanner)?;
         let slice = &haystack[window.start()..window.end()];
-        let mut candidates = self.finder.find_iter(slice);
+        let mut candidates = RequiredLiteralOccurrences::new(&self.finder, slice);
         loop {
             accounting.finder_calls =
                 accounting
@@ -708,7 +786,7 @@ impl RequiredLiteralPlan {
                     .ok_or(SearchError::ArithmeticOverflow {
                         computation: "actual finder calls",
                     })?;
-            let Some(relative) = candidates.next() else {
+            let Some(relative) = candidates.next()? else {
                 return Ok((None, accounting));
             };
             accounting.candidate_visits = accounting.candidate_visits.checked_add(1).ok_or(
@@ -1040,7 +1118,7 @@ impl BoundedRequiredLiteralPlan {
 
         let mut accounting = self.preflight(window, limits, backward_scanner)?;
         let slice = &haystack[window.start()..window.end()];
-        let mut candidates = self.plan.finder.find_iter(slice);
+        let mut candidates = RequiredLiteralOccurrences::new(&self.plan.finder, slice);
         loop {
             accounting.finder_calls =
                 accounting
@@ -1049,7 +1127,7 @@ impl BoundedRequiredLiteralPlan {
                     .ok_or(SearchError::ArithmeticOverflow {
                         computation: "actual finder calls",
                     })?;
-            let Some(relative) = candidates.next() else {
+            let Some(relative) = candidates.next()? else {
                 return Ok((None, accounting));
             };
             accounting.candidate_visits = accounting.candidate_visits.checked_add(1).ok_or(
@@ -1476,14 +1554,14 @@ mod tests {
         ASCII_BACKWARD_RUN_PLAN_ID, ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD, Anchors,
         BOUNDED_ASCII_BACKWARD_RUN_PLAN_ID, BOUNDED_PLAN_ID, BoundedRequiredLiteralPlan,
         BuildError, BuildLimits, ByteClass, ClassRepeat, DispatchedBoundedRequiredLiteralPlan,
-        DispatchedRequiredLiteralPlan, PLAN_ID, RequiredLiteralPlan, SIMD_RUN_SCANNER_BUILD_WORK,
-        SearchError, SearchLimits,
+        DispatchedRequiredLiteralPlan, PLAN_ID, RequiredLiteralOccurrences, RequiredLiteralPlan,
+        SIMD_RUN_SCANNER_BUILD_WORK, SearchAccounting, SearchError, SearchLimits,
     };
     use crate::Window;
     use core::mem::size_of;
     #[cfg(not(feature = "static-dispatch"))]
     use fre_simd_kernels::DispatchPolicy;
-    use fre_simd_kernels::{Feature, SimdDispatchContext};
+    use fre_simd_kernels::{AsciiByteSetRunScanner, Feature, SimdDispatchContext};
 
     const ASCII_MEMBERS: &[u8] = b"0_aceg";
 
@@ -1534,6 +1612,618 @@ mod tests {
             }
         }
         None
+    }
+
+    fn unbordered_suffix(len: usize) -> Vec<u8> {
+        assert!(len > 0);
+        let mut suffix = vec![b'Q'; len];
+        suffix[0] = b'Z';
+        suffix
+    }
+
+    fn first_probe_cases(suffix: &[u8]) -> Vec<(&'static str, Vec<u8>, usize, usize)> {
+        let absent = vec![b'a'; suffix.len().saturating_add(5)];
+
+        let offset_zero_exact_end = suffix.to_vec();
+
+        let mut adjacent_occurrences = suffix.to_vec();
+        adjacent_occurrences.extend_from_slice(suffix);
+
+        let mut first_success = b"aa".to_vec();
+        first_success.extend_from_slice(suffix);
+
+        let mut first_reject_then_success = b"!".to_vec();
+        first_reject_then_success.extend_from_slice(suffix);
+        first_reject_then_success.extend_from_slice(b"!aa");
+        first_reject_then_success.extend_from_slice(suffix);
+
+        let mut many_decoys_then_success = Vec::new();
+        for _ in 0..12 {
+            many_decoys_then_success.push(b'!');
+            many_decoys_then_success.extend_from_slice(suffix);
+        }
+        many_decoys_then_success.extend_from_slice(b"!aa");
+        many_decoys_then_success.extend_from_slice(suffix);
+
+        let mut many_decoys_terminal = Vec::new();
+        for _ in 0..12 {
+            many_decoys_terminal.push(b'!');
+            many_decoys_terminal.extend_from_slice(suffix);
+        }
+
+        vec![
+            ("absent", absent, 0, 1),
+            ("offset-zero-exact-end", offset_zero_exact_end, 1, 2),
+            ("adjacent-occurrences", adjacent_occurrences, 2, 3),
+            ("first-success", first_success, 1, 1),
+            (
+                "first-reject-then-success",
+                first_reject_then_success,
+                2,
+                2,
+            ),
+            (
+                "many-decoys-then-success",
+                many_decoys_then_success,
+                13,
+                13,
+            ),
+            ("many-decoys-terminal", many_decoys_terminal, 12, 13),
+        ]
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the test oracle receives every authenticated search input explicitly"
+    )]
+    fn legacy_find_iter_oracle(
+        plan: &RequiredLiteralPlan,
+        repeat: ClassRepeat,
+        haystack: &[u8],
+        window: Window,
+        backward_scanner: Option<&AsciiByteSetRunScanner>,
+        mut accounting: SearchAccounting,
+    ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
+        let slice = &haystack[window.start()..window.end()];
+        let mut candidates = plan.finder.find_iter(slice);
+        loop {
+            accounting.finder_calls = accounting.finder_calls.checked_add(1).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "legacy oracle finder calls",
+                },
+            )?;
+            let Some(relative) = candidates.next() else {
+                return Ok((None, accounting));
+            };
+            accounting.candidate_visits = accounting.candidate_visits.checked_add(1).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "legacy oracle candidate visits",
+                },
+            )?;
+            let candidate = window.start().checked_add(relative).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "legacy oracle absolute candidate",
+                },
+            )?;
+            if candidate == window.start() {
+                continue;
+            }
+            let previous = candidate.checked_sub(1).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "legacy oracle predecessor",
+                },
+            )?;
+            if !plan.class.contains(haystack[previous]) {
+                continue;
+            }
+
+            let confirmation_start = repeat
+                .max
+                .map_or(window.start(), |max| candidate.saturating_sub(max).max(window.start()));
+            let run_start = if let Some(scanner) = backward_scanner {
+                let backward = scanner.scan_backward(
+                    haystack.get(confirmation_start..candidate).ok_or(
+                        SearchError::ArithmeticOverflow {
+                            computation: "legacy oracle backward slice",
+                        },
+                    )?,
+                );
+                accounting.backward_bytes_examined = accounting
+                    .backward_bytes_examined
+                    .checked_add(backward.examined_bytes())
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "legacy oracle backward examinations",
+                    })?;
+                candidate.checked_sub(backward.member_run_len()).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "legacy oracle backward start",
+                    },
+                )?
+            } else {
+                let mut start = candidate;
+                while start > confirmation_start {
+                    let previous = start.checked_sub(1).ok_or(
+                        SearchError::ArithmeticOverflow {
+                            computation: "legacy oracle backward position",
+                        },
+                    )?;
+                    accounting.backward_bytes_examined = accounting
+                        .backward_bytes_examined
+                        .checked_add(1)
+                        .ok_or(SearchError::ArithmeticOverflow {
+                            computation: "legacy oracle backward examinations",
+                        })?;
+                    if !plan.class.contains(haystack[previous]) {
+                        break;
+                    }
+                    start = previous;
+                }
+                start
+            };
+            let run_len = candidate.checked_sub(run_start).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "legacy oracle run length",
+                },
+            )?;
+            if run_len < repeat.min {
+                continue;
+            }
+            let end = candidate.checked_add(plan.suffix().len()).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "legacy oracle match end",
+                },
+            )?;
+            if plan.anchors.start && run_start != 0 {
+                continue;
+            }
+            if plan.anchors.end && end != haystack.len() {
+                continue;
+            }
+            return Ok((Some((run_start, end)), accounting));
+        }
+    }
+
+    #[test]
+    fn first_probe_cursor_preserves_the_exact_nonoverlapping_stream() {
+        for suffix_len in [1_usize, 2, 3, 8, 17] {
+            let suffix = unbordered_suffix(suffix_len);
+            for (case, haystack, _, _) in first_probe_cases(&suffix) {
+                let finder = memchr::memmem::FinderBuilder::new()
+                    .build_forward_owned(suffix.clone());
+                let expected: Vec<_> = finder.find_iter(&haystack).collect();
+                let mut cursor = RequiredLiteralOccurrences::new(&finder, &haystack);
+                let mut actual = Vec::new();
+
+                let first = cursor.next().unwrap();
+                assert!(cursor.continuation.is_none(), "case={case} len={suffix_len}");
+                if let Some(relative) = first {
+                    actual.push(relative);
+                    while let Some(relative) = cursor.next().unwrap() {
+                        actual.push(relative);
+                    }
+                    assert!(
+                        cursor.continuation.is_some(),
+                        "case={case} len={suffix_len}"
+                    );
+                }
+                assert_eq!(actual, expected, "case={case} len={suffix_len}");
+            }
+        }
+    }
+
+    #[test]
+    fn first_probe_paths_match_the_legacy_find_iter_result_and_full_accounting() {
+        let class = ByteClass::from_bytes(b"a");
+        let suffix = b"ZQQ";
+        let repeat = ClassRepeat {
+            min: 2,
+            max: Some(3),
+        };
+        let dispatch = SimdDispatchContext::capture();
+
+        let mut windowed = b"<>!ZQQ!aaZQQ".to_vec();
+        let window = Window::new(2, windowed.len());
+        windowed.extend_from_slice(b"[]");
+        let cases = vec![
+            ("window", Anchors::default(), windowed, window),
+            (
+                "start-anchor",
+                Anchors {
+                    start: true,
+                    end: false,
+                },
+                b"aaZQQ!tail".to_vec(),
+                Window::new(0, 10),
+            ),
+            (
+                "end-anchor",
+                Anchors {
+                    start: false,
+                    end: true,
+                },
+                b"!ZQQ!aaZQQ".to_vec(),
+                Window::new(0, 10),
+            ),
+            (
+                "both-anchors",
+                Anchors {
+                    start: true,
+                    end: true,
+                },
+                b"aaZQQ".to_vec(),
+                Window::new(0, 5),
+            ),
+            (
+                "rejected-start-anchor",
+                Anchors {
+                    start: true,
+                    end: false,
+                },
+                b"!ZQQ!aaZQQ".to_vec(),
+                Window::new(0, 10),
+            ),
+        ];
+
+        for (case, anchors, haystack, window) in cases {
+            let scalar = RequiredLiteralPlan::build(
+                class,
+                suffix,
+                anchors,
+                BuildLimits::default(),
+            )
+            .unwrap();
+            let scalar_legacy = legacy_find_iter_oracle(
+                &scalar,
+                ClassRepeat::one_or_more(),
+                &haystack,
+                window,
+                None,
+                scalar
+                    .preflight(window, SearchLimits::unlimited(), None)
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                scalar.find_window(&haystack, window, SearchLimits::unlimited()),
+                Ok(scalar_legacy),
+                "scalar unbounded case={case}"
+            );
+
+            let dispatched = RequiredLiteralPlan::build_with_dispatch(
+                dispatch,
+                class,
+                suffix,
+                anchors,
+                BuildLimits::default(),
+            )
+            .unwrap();
+            let dispatched_legacy = legacy_find_iter_oracle(
+                &dispatched.plan,
+                ClassRepeat::one_or_more(),
+                &haystack,
+                window,
+                dispatched.backward_scanner.as_ref(),
+                dispatched
+                    .plan
+                    .preflight(
+                        window,
+                        SearchLimits::unlimited(),
+                        dispatched.backward_scanner.as_ref(),
+                    )
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                dispatched.find_window(&haystack, window, SearchLimits::unlimited()),
+                Ok(dispatched_legacy),
+                "dispatched unbounded case={case}"
+            );
+
+            let bounded = BoundedRequiredLiteralPlan::build(
+                class,
+                repeat,
+                suffix,
+                anchors,
+                BuildLimits::default(),
+            )
+            .unwrap();
+            let bounded_legacy = legacy_find_iter_oracle(
+                &bounded.plan,
+                repeat,
+                &haystack,
+                window,
+                None,
+                bounded
+                    .preflight(window, SearchLimits::unlimited(), None)
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                bounded.find_window(&haystack, window, SearchLimits::unlimited()),
+                Ok(bounded_legacy),
+                "scalar bounded case={case}"
+            );
+
+            let dispatched_bounded = BoundedRequiredLiteralPlan::build_with_dispatch(
+                dispatch,
+                class,
+                repeat,
+                suffix,
+                anchors,
+                BuildLimits::default(),
+            )
+            .unwrap();
+            let dispatched_bounded_legacy = legacy_find_iter_oracle(
+                &dispatched_bounded.plan.plan,
+                repeat,
+                &haystack,
+                window,
+                dispatched_bounded.backward_scanner.as_ref(),
+                dispatched_bounded
+                    .plan
+                    .preflight(
+                        window,
+                        SearchLimits::unlimited(),
+                        dispatched_bounded.backward_scanner.as_ref(),
+                    )
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                dispatched_bounded.find_window(
+                    &haystack,
+                    window,
+                    SearchLimits::unlimited(),
+                ),
+                Ok(dispatched_bounded_legacy),
+                "dispatched bounded case={case}"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the matrix keeps first-probe cases, both owners, public entry points, anchors, windows, counters, and exact limits together"
+    )]
+    fn first_probe_search_matrix_preserves_results_accounting_and_limits() {
+        let class = ByteClass::from_bytes(b"a");
+        let bounded_repeat = ClassRepeat {
+            min: 2,
+            max: Some(3),
+        };
+        let dispatch = SimdDispatchContext::capture();
+        for suffix_len in [1_usize, 2, 3, 8, 17] {
+            let suffix = unbordered_suffix(suffix_len);
+            for (case, body, expected_candidates, expected_finder_calls) in
+                first_probe_cases(&suffix)
+            {
+                for anchors in [
+                    Anchors::default(),
+                    Anchors {
+                        start: true,
+                        end: false,
+                    },
+                    Anchors {
+                        start: false,
+                        end: true,
+                    },
+                    Anchors {
+                        start: true,
+                        end: true,
+                    },
+                ] {
+                    let unbounded = RequiredLiteralPlan::build(
+                        class,
+                        &suffix,
+                        anchors,
+                        BuildLimits::default(),
+                    )
+                    .unwrap();
+                    let dispatched_unbounded = RequiredLiteralPlan::build_with_dispatch(
+                        dispatch,
+                        class,
+                        &suffix,
+                        anchors,
+                        BuildLimits::default(),
+                    )
+                    .unwrap();
+                    let bounded = BoundedRequiredLiteralPlan::build(
+                        class,
+                        bounded_repeat,
+                        &suffix,
+                        anchors,
+                        BuildLimits::default(),
+                    )
+                    .unwrap();
+                    let dispatched_bounded = BoundedRequiredLiteralPlan::build_with_dispatch(
+                        dispatch,
+                        class,
+                        bounded_repeat,
+                        &suffix,
+                        anchors,
+                        BuildLimits::default(),
+                    )
+                    .unwrap();
+
+                    let expected_unbounded = reference_repeated_find(
+                        &body,
+                        Window::full(&body),
+                        class,
+                        ClassRepeat::one_or_more(),
+                        &suffix,
+                        anchors,
+                    );
+                    let expected_bounded = reference_repeated_find(
+                        &body,
+                        Window::full(&body),
+                        class,
+                        bounded_repeat,
+                        &suffix,
+                        anchors,
+                    );
+                    let unbounded_full = unbounded
+                        .find(&body, SearchLimits::unlimited())
+                        .unwrap();
+                    let bounded_full = bounded.find(&body, SearchLimits::unlimited()).unwrap();
+                    assert_eq!(
+                        unbounded_full.0, expected_unbounded,
+                        "unbounded case={case} len={suffix_len} anchors={anchors:?}"
+                    );
+                    assert_eq!(
+                        bounded_full.0, expected_bounded,
+                        "bounded case={case} len={suffix_len} anchors={anchors:?}"
+                    );
+                    let dispatched_unbounded_full = dispatched_unbounded
+                        .find(&body, SearchLimits::unlimited())
+                        .unwrap();
+                    let dispatched_bounded_full = dispatched_bounded
+                        .find(&body, SearchLimits::unlimited())
+                        .unwrap();
+                    assert_eq!(dispatched_unbounded_full.0, unbounded_full.0);
+                    assert_eq!(dispatched_bounded_full.0, bounded_full.0);
+                    assert_eq!(
+                        dispatched_unbounded_full.1.candidate_visits,
+                        unbounded_full.1.candidate_visits
+                    );
+                    assert_eq!(
+                        dispatched_unbounded_full.1.finder_calls,
+                        unbounded_full.1.finder_calls
+                    );
+                    assert_eq!(
+                        dispatched_bounded_full.1.candidate_visits,
+                        bounded_full.1.candidate_visits
+                    );
+                    assert_eq!(
+                        dispatched_bounded_full.1.finder_calls,
+                        bounded_full.1.finder_calls
+                    );
+
+                    if anchors == Anchors::default() {
+                        assert_eq!(unbounded_full.1.candidate_visits, expected_candidates);
+                        assert_eq!(unbounded_full.1.finder_calls, expected_finder_calls);
+                        assert_eq!(bounded_full.1.candidate_visits, expected_candidates);
+                        assert_eq!(bounded_full.1.finder_calls, expected_finder_calls);
+                    }
+
+                    let mut wrapped = b"<>".to_vec();
+                    let window_start = wrapped.len();
+                    wrapped.extend_from_slice(&body);
+                    let window_end = wrapped.len();
+                    wrapped.extend_from_slice(b"[]");
+                    let window = Window::new(window_start, window_end);
+                    let expected_window_unbounded = reference_repeated_find(
+                        &wrapped,
+                        window,
+                        class,
+                        ClassRepeat::one_or_more(),
+                        &suffix,
+                        anchors,
+                    );
+                    let expected_window_bounded = reference_repeated_find(
+                        &wrapped,
+                        window,
+                        class,
+                        bounded_repeat,
+                        &suffix,
+                        anchors,
+                    );
+                    let unbounded_window = unbounded
+                        .find_window(&wrapped, window, SearchLimits::unlimited())
+                        .unwrap();
+                    let bounded_window = bounded
+                        .find_window(&wrapped, window, SearchLimits::unlimited())
+                        .unwrap();
+                    assert_eq!(unbounded_window.0, expected_window_unbounded);
+                    assert_eq!(bounded_window.0, expected_window_bounded);
+                    assert_eq!(
+                        dispatched_unbounded
+                            .find_window(&wrapped, window, SearchLimits::unlimited())
+                            .unwrap()
+                            .0,
+                        unbounded_window.0
+                    );
+                    assert_eq!(
+                        dispatched_bounded
+                            .find_window(&wrapped, window, SearchLimits::unlimited())
+                            .unwrap()
+                            .0,
+                        bounded_window.0
+                    );
+
+                    let exact_unbounded = SearchLimits {
+                        max_work_upper_bound: unbounded_window.1.work_upper_bound,
+                        max_candidate_visits: unbounded_window.1.candidate_visits_upper_bound,
+                        max_scratch_bytes: unbounded_window.1.scratch_bytes,
+                    };
+                    let exact_bounded = SearchLimits {
+                        max_work_upper_bound: bounded_window.1.work_upper_bound,
+                        max_candidate_visits: bounded_window.1.candidate_visits_upper_bound,
+                        max_scratch_bytes: bounded_window.1.scratch_bytes,
+                    };
+                    assert_eq!(
+                        unbounded.find_window(&wrapped, window, exact_unbounded),
+                        Ok(unbounded_window)
+                    );
+                    assert_eq!(
+                        bounded.find_window(&wrapped, window, exact_bounded),
+                        Ok(bounded_window)
+                    );
+                    if exact_unbounded.max_work_upper_bound != 0 {
+                        assert!(matches!(
+                            unbounded.find_window(
+                                &wrapped,
+                                window,
+                                SearchLimits {
+                                    max_work_upper_bound: exact_unbounded.max_work_upper_bound - 1,
+                                    ..exact_unbounded
+                                }
+                            ),
+                            Err(SearchError::WorkLimit { .. })
+                        ));
+                    }
+                    if exact_bounded.max_work_upper_bound != 0 {
+                        assert!(matches!(
+                            bounded.find_window(
+                                &wrapped,
+                                window,
+                                SearchLimits {
+                                    max_work_upper_bound: exact_bounded.max_work_upper_bound - 1,
+                                    ..exact_bounded
+                                }
+                            ),
+                            Err(SearchError::WorkLimit { .. })
+                        ));
+                    }
+                    if exact_unbounded.max_candidate_visits != 0 {
+                        assert!(matches!(
+                            unbounded.find_window(
+                                &wrapped,
+                                window,
+                                SearchLimits {
+                                    max_candidate_visits: exact_unbounded.max_candidate_visits - 1,
+                                    ..exact_unbounded
+                                }
+                            ),
+                            Err(SearchError::CandidateLimit { .. })
+                        ));
+                    }
+                    if exact_bounded.max_candidate_visits != 0 {
+                        assert!(matches!(
+                            bounded.find_window(
+                                &wrapped,
+                                window,
+                                SearchLimits {
+                                    max_candidate_visits: exact_bounded.max_candidate_visits - 1,
+                                    ..exact_bounded
+                                }
+                            ),
+                            Err(SearchError::CandidateLimit { .. })
+                        ));
+                    }
+                }
+            }
+        }
     }
 
     #[test]
