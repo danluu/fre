@@ -16,7 +16,7 @@ use fre_simd_kernels::{
     ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD, AsciiByteSet, AsciiByteSetRunScanner, DispatchPolicy,
     Feature, SelectionReceipt, SimdDispatchContext,
 };
-use memchr::memmem::{FindIter, Finder, FinderBuilder};
+use memchr::memmem::{Finder, FinderBuilder};
 
 use crate::Window;
 
@@ -421,84 +421,6 @@ pub struct DispatchedBoundedRequiredLiteralPlan {
     backward_scanner: Option<AsciiByteSetRunScanner>,
 }
 
-/// The exact non-overlapping occurrence stream used by required-literal plans.
-///
-/// The first probe calls [`Finder::find`] directly. A continuation iterator is
-/// constructed only if the caller rejects that occurrence and asks again. The
-/// iterator starts at the first match end, exactly matching `FindIter`'s
-/// non-overlapping advance after a non-empty needle. Separately,
-/// required-literal admission proves the needle unbordered, so this stream is
-/// complete: an occurrence starting strictly inside the first match would
-/// create a non-empty needle border.
-#[derive(Debug)]
-struct RequiredLiteralOccurrences<'h, 'f> {
-    finder: &'f Finder<'static>,
-    haystack: &'h [u8],
-    first_pending: bool,
-    continuation_start: Option<usize>,
-    continuation: Option<FindIter<'h, 'f>>,
-}
-
-impl<'h, 'f> RequiredLiteralOccurrences<'h, 'f> {
-    #[inline(always)]
-    fn new(finder: &'f Finder<'static>, haystack: &'h [u8]) -> Self {
-        debug_assert!(!finder.needle().is_empty());
-        Self {
-            finder,
-            haystack,
-            first_pending: true,
-            continuation_start: None,
-            continuation: None,
-        }
-    }
-
-    #[inline(always)]
-    fn next(&mut self) -> Result<Option<usize>, SearchError> {
-        if self.first_pending {
-            self.first_pending = false;
-            let Some(relative) = self.finder.find(self.haystack) else {
-                return Ok(None);
-            };
-            let continuation_start = relative.checked_add(self.finder.needle().len()).ok_or(
-                SearchError::ArithmeticOverflow {
-                    computation: "required-literal continuation start",
-                },
-            )?;
-            debug_assert!(continuation_start <= self.haystack.len());
-            self.continuation_start = Some(continuation_start);
-            return Ok(Some(relative));
-        }
-
-        if self.continuation.is_none() {
-            let Some(continuation_start) = self.continuation_start else {
-                return Ok(None);
-            };
-            let continuation_haystack = self.haystack.get(continuation_start..).ok_or(
-                SearchError::ArithmeticOverflow {
-                    computation: "required-literal continuation slice",
-                },
-            )?;
-            self.continuation = Some(self.finder.find_iter(continuation_haystack));
-        }
-        let Some(relative) = self
-            .continuation
-            .as_mut()
-            .expect("the continuation iterator was initialized above")
-            .next()
-        else {
-            return Ok(None);
-        };
-        let continuation_start = self
-            .continuation_start
-            .expect("an initialized continuation retains its absolute offset");
-        relative.checked_add(continuation_start).map(Some).ok_or(
-            SearchError::ArithmeticOverflow {
-                computation: "required-literal continuation occurrence",
-            },
-        )
-    }
-}
-
 impl RequiredLiteralPlan {
     /// Whether this host and class select the opt-in backward run scanner.
     ///
@@ -746,7 +668,7 @@ impl RequiredLiteralPlan {
 
     #[allow(
         clippy::too_many_lines,
-        reason = "the scalar and scanner confirmations stay adjacent so their candidate and anchor control remains visibly identical"
+        reason = "the one-byte, direct-first, and continuation paths stay explicit around one shared candidate confirmation"
     )]
     fn find_window_with_run_scanner(
         &self,
@@ -777,7 +699,90 @@ impl RequiredLiteralPlan {
 
         let mut accounting = self.preflight(window, limits, backward_scanner)?;
         let slice = &haystack[window.start()..window.end()];
-        let mut candidates = RequiredLiteralOccurrences::new(&self.finder, slice);
+        if self.suffix().len() == 1 {
+            // Keep the established single-byte finder loop intact. Its native
+            // iterator already has the least setup and dispatch overhead.
+            let mut candidates = self.finder.find_iter(slice);
+            loop {
+                accounting.finder_calls = accounting.finder_calls.checked_add(1).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "actual finder calls",
+                    },
+                )?;
+                let Some(relative) = candidates.next() else {
+                    return Ok((None, accounting));
+                };
+                accounting.candidate_visits = accounting.candidate_visits.checked_add(1).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "actual candidate visits",
+                    },
+                )?;
+                let candidate = window.start().checked_add(relative).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "absolute suffix candidate",
+                    },
+                )?;
+                if let Some(matched) = self.confirm_candidate(
+                    haystack,
+                    window,
+                    candidate,
+                    backward_scanner,
+                    &mut accounting,
+                )? {
+                    return Ok((Some(matched), accounting));
+                }
+            }
+        }
+
+        accounting.finder_calls =
+            accounting
+                .finder_calls
+                .checked_add(1)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "actual finder calls",
+                })?;
+        let Some(first_relative) = self.finder.find(slice) else {
+            return Ok((None, accounting));
+        };
+        accounting.candidate_visits =
+            accounting
+                .candidate_visits
+                .checked_add(1)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "actual candidate visits",
+                })?;
+        let first_candidate =
+            window
+                .start()
+                .checked_add(first_relative)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "absolute suffix candidate",
+                })?;
+        if let Some(matched) = self.confirm_candidate(
+            haystack,
+            window,
+            first_candidate,
+            backward_scanner,
+            &mut accounting,
+        )? {
+            return Ok((Some(matched), accounting));
+        }
+
+        // A non-empty FindIter resumes at the prior occurrence's end. Start
+        // the continuation there to preserve that exact legacy stream. The
+        // admission proof also rejects bordered suffixes, so no overlapping
+        // occurrence omitted by this non-overlapping stream can be a candidate.
+        let continuation_start = first_candidate.checked_add(self.suffix().len()).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "required-literal continuation start",
+            },
+        )?;
+        let continuation_slice = haystack.get(continuation_start..window.end()).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "required-literal continuation slice",
+            },
+        )?;
+        let mut candidates = self.finder.find_iter(continuation_slice);
         loop {
             accounting.finder_calls =
                 accounting
@@ -786,7 +791,7 @@ impl RequiredLiteralPlan {
                     .ok_or(SearchError::ArithmeticOverflow {
                         computation: "actual finder calls",
                     })?;
-            let Some(relative) = candidates.next()? else {
+            let Some(relative) = candidates.next() else {
                 return Ok((None, accounting));
             };
             accounting.candidate_visits = accounting.candidate_visits.checked_add(1).ok_or(
@@ -794,77 +799,99 @@ impl RequiredLiteralPlan {
                     computation: "actual candidate visits",
                 },
             )?;
-            let candidate =
-                window
-                    .start()
-                    .checked_add(relative)
-                    .ok_or(SearchError::ArithmeticOverflow {
-                        computation: "absolute suffix candidate",
-                    })?;
-            if candidate == window.start() {
-                continue;
+            let candidate = continuation_start.checked_add(relative).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "absolute suffix candidate",
+                },
+            )?;
+            if let Some(matched) = self.confirm_candidate(
+                haystack,
+                window,
+                candidate,
+                backward_scanner,
+                &mut accounting,
+            )? {
+                return Ok((Some(matched), accounting));
             }
-            let previous = candidate
-                .checked_sub(1)
-                .ok_or(SearchError::ArithmeticOverflow {
-                    computation: "candidate predecessor",
-                })?;
-            if !self.class.contains(haystack[previous]) {
-                continue;
-            }
+        }
+    }
 
-            let start = if let Some(scanner) = backward_scanner {
-                let backward =
-                    scanner.scan_backward(haystack.get(window.start()..candidate).ok_or(
-                        SearchError::ArithmeticOverflow {
-                            computation: "backward confirmation slice",
-                        },
-                    )?);
+    #[allow(
+        clippy::inline_always,
+        reason = "candidate confirmation must fold into both the legacy iterator and split first-probe loops"
+    )]
+    #[inline(always)]
+    fn confirm_candidate(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        candidate: usize,
+        backward_scanner: Option<&AsciiByteSetRunScanner>,
+        accounting: &mut SearchAccounting,
+    ) -> Result<Option<(usize, usize)>, SearchError> {
+        if candidate == window.start() {
+            return Ok(None);
+        }
+        let previous = candidate
+            .checked_sub(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "candidate predecessor",
+            })?;
+        if !self.class.contains(haystack[previous]) {
+            return Ok(None);
+        }
+
+        let start = if let Some(scanner) = backward_scanner {
+            let backward = scanner.scan_backward(haystack.get(window.start()..candidate).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "backward confirmation slice",
+                },
+            )?);
+            accounting.backward_bytes_examined = accounting
+                .backward_bytes_examined
+                .checked_add(backward.examined_bytes())
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "actual backward examinations",
+                })?;
+            candidate.checked_sub(backward.member_run_len()).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "backward confirmation start",
+                },
+            )?
+        } else {
+            let mut start = candidate;
+            while start > window.start() {
+                let previous = start
+                    .checked_sub(1)
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "backward confirmation position",
+                    })?;
                 accounting.backward_bytes_examined = accounting
                     .backward_bytes_examined
-                    .checked_add(backward.examined_bytes())
+                    .checked_add(1)
                     .ok_or(SearchError::ArithmeticOverflow {
                         computation: "actual backward examinations",
                     })?;
-                candidate.checked_sub(backward.member_run_len()).ok_or(
-                    SearchError::ArithmeticOverflow {
-                        computation: "backward confirmation start",
-                    },
-                )?
-            } else {
-                let mut start = candidate;
-                while start > window.start() {
-                    let previous = start
-                        .checked_sub(1)
-                        .ok_or(SearchError::ArithmeticOverflow {
-                            computation: "backward confirmation position",
-                        })?;
-                    accounting.backward_bytes_examined = accounting
-                        .backward_bytes_examined
-                        .checked_add(1)
-                        .ok_or(SearchError::ArithmeticOverflow {
-                            computation: "actual backward examinations",
-                        })?;
-                    if !self.class.contains(haystack[previous]) {
-                        break;
-                    }
-                    start = previous;
+                if !self.class.contains(haystack[previous]) {
+                    break;
                 }
-                start
-            };
-            let end = candidate.checked_add(self.suffix().len()).ok_or(
-                SearchError::ArithmeticOverflow {
+                start = previous;
+            }
+            start
+        };
+        let end =
+            candidate
+                .checked_add(self.suffix().len())
+                .ok_or(SearchError::ArithmeticOverflow {
                     computation: "selected match end",
-                },
-            )?;
-            if self.anchors.start && start != 0 {
-                continue;
-            }
-            if self.anchors.end && end != haystack.len() {
-                continue;
-            }
-            return Ok((Some((start, end)), accounting));
+                })?;
+        if self.anchors.start && start != 0 {
+            return Ok(None);
         }
+        if self.anchors.end && end != haystack.len() {
+            return Ok(None);
+        }
+        Ok(Some((start, end)))
     }
 
     fn preflight(
@@ -1087,7 +1114,7 @@ impl BoundedRequiredLiteralPlan {
 
     #[allow(
         clippy::too_many_lines,
-        reason = "the bounded owner stays separate so the legacy CLASS+ hot loop remains byte-for-byte stable"
+        reason = "the bounded one-byte, direct-first, and continuation paths stay explicit around one shared candidate confirmation"
     )]
     fn find_window_with_run_scanner(
         &self,
@@ -1118,7 +1145,89 @@ impl BoundedRequiredLiteralPlan {
 
         let mut accounting = self.preflight(window, limits, backward_scanner)?;
         let slice = &haystack[window.start()..window.end()];
-        let mut candidates = RequiredLiteralOccurrences::new(&self.plan.finder, slice);
+        if self.suffix().len() == 1 {
+            // Keep the established single-byte finder loop intact. Its native
+            // iterator already has the least setup and dispatch overhead.
+            let mut candidates = self.plan.finder.find_iter(slice);
+            loop {
+                accounting.finder_calls = accounting.finder_calls.checked_add(1).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "actual finder calls",
+                    },
+                )?;
+                let Some(relative) = candidates.next() else {
+                    return Ok((None, accounting));
+                };
+                accounting.candidate_visits = accounting.candidate_visits.checked_add(1).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "actual candidate visits",
+                    },
+                )?;
+                let candidate = window.start().checked_add(relative).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "absolute suffix candidate",
+                    },
+                )?;
+                if let Some(matched) = self.confirm_candidate(
+                    haystack,
+                    window,
+                    candidate,
+                    backward_scanner,
+                    &mut accounting,
+                )? {
+                    return Ok((Some(matched), accounting));
+                }
+            }
+        }
+
+        accounting.finder_calls =
+            accounting
+                .finder_calls
+                .checked_add(1)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "actual finder calls",
+                })?;
+        let Some(first_relative) = self.plan.finder.find(slice) else {
+            return Ok((None, accounting));
+        };
+        accounting.candidate_visits =
+            accounting
+                .candidate_visits
+                .checked_add(1)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "actual candidate visits",
+                })?;
+        let first_candidate =
+            window
+                .start()
+                .checked_add(first_relative)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "absolute suffix candidate",
+                })?;
+        if let Some(matched) = self.confirm_candidate(
+            haystack,
+            window,
+            first_candidate,
+            backward_scanner,
+            &mut accounting,
+        )? {
+            return Ok((Some(matched), accounting));
+        }
+
+        // Continue from the first occurrence's absolute end, matching the
+        // non-overlapping advance of the legacy FindIter without retaining a
+        // per-step first/continuation state machine.
+        let continuation_start = first_candidate.checked_add(self.suffix().len()).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "required-literal continuation start",
+            },
+        )?;
+        let continuation_slice = haystack.get(continuation_start..window.end()).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "required-literal continuation slice",
+            },
+        )?;
+        let mut candidates = self.plan.finder.find_iter(continuation_slice);
         loop {
             accounting.finder_calls =
                 accounting
@@ -1127,7 +1236,7 @@ impl BoundedRequiredLiteralPlan {
                     .ok_or(SearchError::ArithmeticOverflow {
                         computation: "actual finder calls",
                     })?;
-            let Some(relative) = candidates.next()? else {
+            let Some(relative) = candidates.next() else {
                 return Ok((None, accounting));
             };
             accounting.candidate_visits = accounting.candidate_visits.checked_add(1).ok_or(
@@ -1135,89 +1244,111 @@ impl BoundedRequiredLiteralPlan {
                     computation: "actual candidate visits",
                 },
             )?;
-            let candidate =
-                window
-                    .start()
-                    .checked_add(relative)
-                    .ok_or(SearchError::ArithmeticOverflow {
-                        computation: "absolute suffix candidate",
-                    })?;
-            if candidate == window.start() {
-                continue;
+            let candidate = continuation_start.checked_add(relative).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "absolute suffix candidate",
+                },
+            )?;
+            if let Some(matched) = self.confirm_candidate(
+                haystack,
+                window,
+                candidate,
+                backward_scanner,
+                &mut accounting,
+            )? {
+                return Ok((Some(matched), accounting));
             }
-            let previous = candidate
-                .checked_sub(1)
-                .ok_or(SearchError::ArithmeticOverflow {
-                    computation: "candidate predecessor",
-                })?;
-            if !self.class().contains(haystack[previous]) {
-                continue;
-            }
+        }
+    }
 
-            let confirmation_start = self.repeat.max.map_or(window.start(), |max| {
-                candidate.saturating_sub(max).max(window.start())
-            });
-            let run_start = if let Some(scanner) = backward_scanner {
-                let backward =
-                    scanner.scan_backward(haystack.get(confirmation_start..candidate).ok_or(
-                        SearchError::ArithmeticOverflow {
-                            computation: "backward confirmation slice",
-                        },
-                    )?);
+    #[allow(
+        clippy::inline_always,
+        reason = "candidate confirmation must fold into both the legacy iterator and split first-probe loops"
+    )]
+    #[inline(always)]
+    fn confirm_candidate(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        candidate: usize,
+        backward_scanner: Option<&AsciiByteSetRunScanner>,
+        accounting: &mut SearchAccounting,
+    ) -> Result<Option<(usize, usize)>, SearchError> {
+        if candidate == window.start() {
+            return Ok(None);
+        }
+        let previous = candidate
+            .checked_sub(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "candidate predecessor",
+            })?;
+        if !self.class().contains(haystack[previous]) {
+            return Ok(None);
+        }
+
+        let confirmation_start = self.repeat.max.map_or(window.start(), |max| {
+            candidate.saturating_sub(max).max(window.start())
+        });
+        let run_start = if let Some(scanner) = backward_scanner {
+            let backward =
+                scanner.scan_backward(haystack.get(confirmation_start..candidate).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "backward confirmation slice",
+                    },
+                )?);
+            accounting.backward_bytes_examined = accounting
+                .backward_bytes_examined
+                .checked_add(backward.examined_bytes())
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "actual backward examinations",
+                })?;
+            candidate.checked_sub(backward.member_run_len()).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "backward confirmation start",
+                },
+            )?
+        } else {
+            let mut start = candidate;
+            while start > confirmation_start {
+                let previous = start
+                    .checked_sub(1)
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "backward confirmation position",
+                    })?;
                 accounting.backward_bytes_examined = accounting
                     .backward_bytes_examined
-                    .checked_add(backward.examined_bytes())
+                    .checked_add(1)
                     .ok_or(SearchError::ArithmeticOverflow {
                         computation: "actual backward examinations",
                     })?;
-                candidate.checked_sub(backward.member_run_len()).ok_or(
-                    SearchError::ArithmeticOverflow {
-                        computation: "backward confirmation start",
-                    },
-                )?
-            } else {
-                let mut start = candidate;
-                while start > confirmation_start {
-                    let previous = start
-                        .checked_sub(1)
-                        .ok_or(SearchError::ArithmeticOverflow {
-                            computation: "backward confirmation position",
-                        })?;
-                    accounting.backward_bytes_examined = accounting
-                        .backward_bytes_examined
-                        .checked_add(1)
-                        .ok_or(SearchError::ArithmeticOverflow {
-                            computation: "actual backward examinations",
-                        })?;
-                    if !self.class().contains(haystack[previous]) {
-                        break;
-                    }
-                    start = previous;
+                if !self.class().contains(haystack[previous]) {
+                    break;
                 }
-                start
-            };
-            let run_len =
-                candidate
-                    .checked_sub(run_start)
-                    .ok_or(SearchError::ArithmeticOverflow {
-                        computation: "confirmed class run length",
-                    })?;
-            if run_len < self.repeat.min {
-                continue;
+                start = previous;
             }
-            let end = candidate.checked_add(self.suffix().len()).ok_or(
-                SearchError::ArithmeticOverflow {
-                    computation: "selected match end",
-                },
-            )?;
-            if self.anchors().start && run_start != 0 {
-                continue;
-            }
-            if self.anchors().end && end != haystack.len() {
-                continue;
-            }
-            return Ok((Some((run_start, end)), accounting));
+            start
+        };
+        let run_len = candidate
+            .checked_sub(run_start)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "confirmed class run length",
+            })?;
+        if run_len < self.repeat.min {
+            return Ok(None);
         }
+        let end =
+            candidate
+                .checked_add(self.suffix().len())
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "selected match end",
+                })?;
+        if self.anchors().start && run_start != 0 {
+            return Ok(None);
+        }
+        if self.anchors().end && end != haystack.len() {
+            return Ok(None);
+        }
+        Ok(Some((run_start, end)))
     }
 
     fn preflight(
@@ -1554,8 +1685,8 @@ mod tests {
         ASCII_BACKWARD_RUN_PLAN_ID, ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD, Anchors,
         BOUNDED_ASCII_BACKWARD_RUN_PLAN_ID, BOUNDED_PLAN_ID, BoundedRequiredLiteralPlan,
         BuildError, BuildLimits, ByteClass, ClassRepeat, DispatchedBoundedRequiredLiteralPlan,
-        DispatchedRequiredLiteralPlan, PLAN_ID, RequiredLiteralOccurrences, RequiredLiteralPlan,
-        SIMD_RUN_SCANNER_BUILD_WORK, SearchAccounting, SearchError, SearchLimits,
+        DispatchedRequiredLiteralPlan, PLAN_ID, RequiredLiteralPlan, SIMD_RUN_SCANNER_BUILD_WORK,
+        SearchAccounting, SearchError, SearchLimits,
     };
     use crate::Window;
     use core::mem::size_of;
@@ -1656,18 +1787,8 @@ mod tests {
             ("offset-zero-exact-end", offset_zero_exact_end, 1, 2),
             ("adjacent-occurrences", adjacent_occurrences, 2, 3),
             ("first-success", first_success, 1, 1),
-            (
-                "first-reject-then-success",
-                first_reject_then_success,
-                2,
-                2,
-            ),
-            (
-                "many-decoys-then-success",
-                many_decoys_then_success,
-                13,
-                13,
-            ),
+            ("first-reject-then-success", first_reject_then_success, 2, 2),
+            ("many-decoys-then-success", many_decoys_then_success, 13, 13),
             ("many-decoys-terminal", many_decoys_terminal, 12, 13),
         ]
     }
@@ -1687,11 +1808,13 @@ mod tests {
         let slice = &haystack[window.start()..window.end()];
         let mut candidates = plan.finder.find_iter(slice);
         loop {
-            accounting.finder_calls = accounting.finder_calls.checked_add(1).ok_or(
-                SearchError::ArithmeticOverflow {
-                    computation: "legacy oracle finder calls",
-                },
-            )?;
+            accounting.finder_calls =
+                accounting
+                    .finder_calls
+                    .checked_add(1)
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "legacy oracle finder calls",
+                    })?;
             let Some(relative) = candidates.next() else {
                 return Ok((None, accounting));
             };
@@ -1700,34 +1823,35 @@ mod tests {
                     computation: "legacy oracle candidate visits",
                 },
             )?;
-            let candidate = window.start().checked_add(relative).ok_or(
-                SearchError::ArithmeticOverflow {
-                    computation: "legacy oracle absolute candidate",
-                },
-            )?;
+            let candidate =
+                window
+                    .start()
+                    .checked_add(relative)
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "legacy oracle absolute candidate",
+                    })?;
             if candidate == window.start() {
                 continue;
             }
-            let previous = candidate.checked_sub(1).ok_or(
-                SearchError::ArithmeticOverflow {
+            let previous = candidate
+                .checked_sub(1)
+                .ok_or(SearchError::ArithmeticOverflow {
                     computation: "legacy oracle predecessor",
-                },
-            )?;
+                })?;
             if !plan.class.contains(haystack[previous]) {
                 continue;
             }
 
-            let confirmation_start = repeat
-                .max
-                .map_or(window.start(), |max| candidate.saturating_sub(max).max(window.start()));
+            let confirmation_start = repeat.max.map_or(window.start(), |max| {
+                candidate.saturating_sub(max).max(window.start())
+            });
             let run_start = if let Some(scanner) = backward_scanner {
-                let backward = scanner.scan_backward(
-                    haystack.get(confirmation_start..candidate).ok_or(
+                let backward =
+                    scanner.scan_backward(haystack.get(confirmation_start..candidate).ok_or(
                         SearchError::ArithmeticOverflow {
                             computation: "legacy oracle backward slice",
                         },
-                    )?,
-                );
+                    )?);
                 accounting.backward_bytes_examined = accounting
                     .backward_bytes_examined
                     .checked_add(backward.examined_bytes())
@@ -1742,11 +1866,11 @@ mod tests {
             } else {
                 let mut start = candidate;
                 while start > confirmation_start {
-                    let previous = start.checked_sub(1).ok_or(
-                        SearchError::ArithmeticOverflow {
+                    let previous = start
+                        .checked_sub(1)
+                        .ok_or(SearchError::ArithmeticOverflow {
                             computation: "legacy oracle backward position",
-                        },
-                    )?;
+                        })?;
                     accounting.backward_bytes_examined = accounting
                         .backward_bytes_examined
                         .checked_add(1)
@@ -1760,11 +1884,12 @@ mod tests {
                 }
                 start
             };
-            let run_len = candidate.checked_sub(run_start).ok_or(
-                SearchError::ArithmeticOverflow {
-                    computation: "legacy oracle run length",
-                },
-            )?;
+            let run_len =
+                candidate
+                    .checked_sub(run_start)
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "legacy oracle run length",
+                    })?;
             if run_len < repeat.min {
                 continue;
             }
@@ -1784,37 +1909,12 @@ mod tests {
     }
 
     #[test]
-    fn first_probe_cursor_preserves_the_exact_nonoverlapping_stream() {
-        for suffix_len in [1_usize, 2, 3, 8, 17] {
-            let suffix = unbordered_suffix(suffix_len);
-            for (case, haystack, _, _) in first_probe_cases(&suffix) {
-                let finder = memchr::memmem::FinderBuilder::new()
-                    .build_forward_owned(suffix.clone());
-                let expected: Vec<_> = finder.find_iter(&haystack).collect();
-                let mut cursor = RequiredLiteralOccurrences::new(&finder, &haystack);
-                let mut actual = Vec::new();
-
-                let first = cursor.next().unwrap();
-                assert!(cursor.continuation.is_none(), "case={case} len={suffix_len}");
-                if let Some(relative) = first {
-                    actual.push(relative);
-                    while let Some(relative) = cursor.next().unwrap() {
-                        actual.push(relative);
-                    }
-                    assert!(
-                        cursor.continuation.is_some(),
-                        "case={case} len={suffix_len}"
-                    );
-                }
-                assert_eq!(actual, expected, "case={case} len={suffix_len}");
-            }
-        }
-    }
-
-    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one differential keeps scalar/dispatched and bounded/unbounded full accounting aligned across every split-path edge"
+    )]
     fn first_probe_paths_match_the_legacy_find_iter_result_and_full_accounting() {
         let class = ByteClass::from_bytes(b"a");
-        let suffix = b"ZQQ";
         let repeat = ClassRepeat {
             min: 2,
             max: Some(3),
@@ -1825,9 +1925,37 @@ mod tests {
         let window = Window::new(2, windowed.len());
         windowed.extend_from_slice(b"[]");
         let cases = vec![
-            ("window", Anchors::default(), windowed, window),
+            (
+                "window",
+                b"ZQQ".as_slice(),
+                Anchors::default(),
+                windowed,
+                window,
+            ),
+            (
+                "offset-zero-exact-end",
+                b"ZQQ".as_slice(),
+                Anchors::default(),
+                b"ZQQ".to_vec(),
+                Window::new(0, 3),
+            ),
+            (
+                "adjacent-occurrences",
+                b"ZQQ".as_slice(),
+                Anchors::default(),
+                b"ZQQZQQ".to_vec(),
+                Window::new(0, 6),
+            ),
+            (
+                "single-byte-continuation",
+                b"Z".as_slice(),
+                Anchors::default(),
+                b"!Z!aaZ".to_vec(),
+                Window::new(0, 6),
+            ),
             (
                 "start-anchor",
+                b"ZQQ".as_slice(),
                 Anchors {
                     start: true,
                     end: false,
@@ -1837,6 +1965,7 @@ mod tests {
             ),
             (
                 "end-anchor",
+                b"ZQQ".as_slice(),
                 Anchors {
                     start: false,
                     end: true,
@@ -1846,6 +1975,7 @@ mod tests {
             ),
             (
                 "both-anchors",
+                b"ZQQ".as_slice(),
                 Anchors {
                     start: true,
                     end: true,
@@ -1855,6 +1985,7 @@ mod tests {
             ),
             (
                 "rejected-start-anchor",
+                b"ZQQ".as_slice(),
                 Anchors {
                     start: true,
                     end: false,
@@ -1864,14 +1995,9 @@ mod tests {
             ),
         ];
 
-        for (case, anchors, haystack, window) in cases {
-            let scalar = RequiredLiteralPlan::build(
-                class,
-                suffix,
-                anchors,
-                BuildLimits::default(),
-            )
-            .unwrap();
+        for (case, suffix, anchors, haystack, window) in cases {
+            let scalar =
+                RequiredLiteralPlan::build(class, suffix, anchors, BuildLimits::default()).unwrap();
             let scalar_legacy = legacy_find_iter_oracle(
                 &scalar,
                 ClassRepeat::one_or_more(),
@@ -1970,11 +2096,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                dispatched_bounded.find_window(
-                    &haystack,
-                    window,
-                    SearchLimits::unlimited(),
-                ),
+                dispatched_bounded.find_window(&haystack, window, SearchLimits::unlimited(),),
                 Ok(dispatched_bounded_legacy),
                 "dispatched bounded case={case}"
             );
@@ -2013,13 +2135,9 @@ mod tests {
                         end: true,
                     },
                 ] {
-                    let unbounded = RequiredLiteralPlan::build(
-                        class,
-                        &suffix,
-                        anchors,
-                        BuildLimits::default(),
-                    )
-                    .unwrap();
+                    let unbounded =
+                        RequiredLiteralPlan::build(class, &suffix, anchors, BuildLimits::default())
+                            .unwrap();
                     let dispatched_unbounded = RequiredLiteralPlan::build_with_dispatch(
                         dispatch,
                         class,
@@ -2062,9 +2180,7 @@ mod tests {
                         &suffix,
                         anchors,
                     );
-                    let unbounded_full = unbounded
-                        .find(&body, SearchLimits::unlimited())
-                        .unwrap();
+                    let unbounded_full = unbounded.find(&body, SearchLimits::unlimited()).unwrap();
                     let bounded_full = bounded.find(&body, SearchLimits::unlimited()).unwrap();
                     assert_eq!(
                         unbounded_full.0, expected_unbounded,
