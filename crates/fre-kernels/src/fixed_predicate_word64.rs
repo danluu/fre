@@ -1806,6 +1806,10 @@ impl FixedPredicateWord64Plan {
         Ok(None)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the source-free preflight keeps every checked search bound adjacent"
+    )]
     fn search_preflight(
         &self,
         haystack_len: usize,
@@ -2072,7 +2076,7 @@ impl FixedPredicateWord64Plan {
             )?;
             let is_match = self
                 .anchor_candidate_matches(slice, start, anchor_offset, &mut predicate_checks)
-                .map_err(search_error_from_reduce)?;
+                .map_err(|error| search_error_from_reduce(&error))?;
             if is_match {
                 let relative_end = start.checked_add(self.width).ok_or(
                     SearchError::ArithmeticOverflow {
@@ -3022,7 +3026,7 @@ fn ensure_search_actual_within(
     }
 }
 
-fn search_error_from_reduce(error: ReduceError) -> SearchError {
+fn search_error_from_reduce(error: &ReduceError) -> SearchError {
     match error {
         ReduceError::ArithmeticOverflow { computation } => {
             SearchError::ArithmeticOverflow { computation }
