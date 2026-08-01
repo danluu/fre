@@ -4460,7 +4460,7 @@ fn x86_emit_terminal_suffix_scanner(
 
     assembler.bind(labels.vector_hit)?;
     if lazy_vector_filter.is_some() {
-        assembler.instruction(&[0x0f, 0xbc, 0xc0])?;
+        x86_emit_first_candidate_lane(assembler, X86CandidateMask::for_intersection(kind))?;
         assembler.instruction(&[0x48, 0x01, 0xc2])?;
         assembler.branch(&[0xe9], labels.verify)?;
     } else {
@@ -8855,6 +8855,74 @@ mod tests {
                 selected(pattern, OutputContract::SelectedEnd)?,
                 selected(pattern, OutputContract::Span)?,
                 "SelectedEnd and Span must share ordered-output profitability for {pattern:?}",
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_suffix_vector_hit_extracts_the_isa_mask_carrier() -> Result<(), ObjectError> {
+        // AVX-512 currently scalar-refines primary hits by policy. Exercise
+        // the shared lazy-intersection CFG directly so a future profitability
+        // change cannot silently route its K5 mask through the EAX-only path.
+        let compiled = compile(
+            CompileRequest::new(
+                r"(?-u:\B(?:A[a-z]{0,16}fpez|qfpez))",
+                Target::x86_64_linux(),
+            )
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span),
+        )
+        .unwrap();
+        let view = compiled.program().native_context_program_view().unwrap();
+        let layout =
+            build_context_native_layout_with_reverse(view, ContextNativeLimits::default(), true)?;
+        let suffix = derive_context_terminal_suffix_search(view)?.unwrap();
+        let required_offset = suffix
+            .vector_filter
+            .max_scan_offset()
+            .max(suffix.minimum_width.saturating_sub(1));
+
+        for (kind, extraction) in [
+            (
+                X86StartFilterKind::Sse2,
+                &[0x0f, 0xbc, 0xc0, 0x48, 0x01, 0xc2][..],
+            ),
+            (
+                X86StartFilterKind::Avx2,
+                &[0x0f, 0xbc, 0xc0, 0x48, 0x01, 0xc2][..],
+            ),
+            (
+                X86StartFilterKind::Avx512Bw,
+                &[
+                    0xc4, 0xe1, 0xfb, 0x93, 0xc5, // kmovq rax, k5
+                    0x48, 0x0f, 0xbc, 0xc0, // bsfq rax, rax
+                    0x48, 0x01, 0xc2, // candidate += first lane
+                ][..],
+            ),
+        ] {
+            let mut assembler = X86Assembler::new();
+            let labels = x86_terminal_suffix_scanner_labels(&mut assembler)?;
+            let exhausted = assembler.label()?;
+            x86_emit_terminal_suffix_scanner(
+                &mut assembler,
+                kind,
+                &layout,
+                suffix,
+                Some(suffix.vector_filter),
+                required_offset,
+                labels,
+                exhausted,
+            )?;
+            assembler.bind(labels.verify)?;
+            assembler.instruction(&[0xc3])?;
+            assembler.bind(exhausted)?;
+            assembler.instruction(&[0xc3])?;
+            let code = assembler.finish()?;
+            assert!(
+                code.windows(extraction.len())
+                    .any(|bytes| bytes == extraction),
+                "terminal suffix selected the wrong candidate-mask carrier for {kind:?}",
             );
         }
         Ok(())
