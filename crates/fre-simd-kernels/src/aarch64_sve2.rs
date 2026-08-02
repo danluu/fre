@@ -33,6 +33,38 @@ mod reviewed_assembly {
 
     global_asm!(
         r#"
+    // One fixed-width full-byte four-value classifier. DUP repeats the four
+    // construction-time bytes in every 32-bit lane, so each architectural
+    // 128-bit MATCH segment contains the same complete set. Only the first
+    // sixteen source lanes are active. A predicate store serializes their
+    // membership bits in increasing lane order.
+    .pushsection .text.fre_byte_set4_mask16_sve2_asm, "ax", %progbits
+    .arch armv8-a+sve2
+    .p2align 2
+    .hidden fre_byte_set4_mask16_sve2_asm
+    .global fre_byte_set4_mask16_sve2_asm
+    .type fre_byte_set4_mask16_sve2_asm, %function
+fre_byte_set4_mask16_sve2_asm:
+    .cfi_startproc
+    sub sp, sp, #32
+    .cfi_def_cfa_offset 32
+    ptrue p0.b, vl16
+    dup z0.s, w0
+    ld1b z1.b, p0/z, [x1]
+    match p1.b, p0/z, z1.b, z0.b
+    str p1, [sp]
+    ldrh w0, [sp]
+    add sp, sp, #32
+    .cfi_def_cfa_offset 0
+    ret
+    .cfi_endproc
+    .size fre_byte_set4_mask16_sve2_asm, .-fre_byte_set4_mask16_sve2_asm
+    .popsection
+"#
+    );
+
+    global_asm!(
+        r#"
     .pushsection .text.fre_ascii_mask32_sve2_asm, "ax", %progbits
     .arch armv8-a+sve2
     .p2align 2
@@ -479,6 +511,7 @@ fre_ascii_run_backward_sve2_asm:
     reason = "these private declarations are implemented by the reviewed base-SVE and SVE2 global assembly above"
 )]
 unsafe extern "C" {
+    fn fre_byte_set4_mask16_sve2_asm(members: u32, bytes: *const u8) -> u16;
     fn fre_ascii_mask32_sve2_asm(columns: *const u8, bytes: *const u8) -> u64;
     fn fre_ascii_word_space_mask16_sve2_asm(
         word_columns: *const u8,
@@ -524,6 +557,24 @@ unsafe extern "C" {
         bytes: *const u8,
         len: usize,
     ) -> AsciiRunResult;
+}
+
+#[allow(
+    unsafe_code,
+    reason = "this private leaf calls reviewed fixed-16 SVE2 assembly after compiler target features prove SVE plus SVE2 usable"
+)]
+#[inline]
+pub(super) unsafe fn classify_byte_set4_16_sve2(
+    members: [u8; 4],
+    bytes: &[u8; crate::BYTE_SET_BLOCK_BYTES],
+) -> crate::ByteSetMask16 {
+    let packed_members = u32::from_ne_bytes(members);
+    // SAFETY: the compiler-selected caller proves SVE plus SVE2 globally. The
+    // fixed array supplies all sixteen source bytes read by reviewed assembly;
+    // the packed value contains the complete unordered four-byte set.
+    crate::ByteSetMask16::new(unsafe {
+        fre_byte_set4_mask16_sve2_asm(packed_members, bytes.as_ptr())
+    })
 }
 
 #[allow(

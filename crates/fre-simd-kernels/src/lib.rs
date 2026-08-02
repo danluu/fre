@@ -42,6 +42,7 @@ mod aarch64_sve2;
 mod byte_bucket;
 mod byte_range;
 mod byte_set;
+mod byte_set4;
 #[cfg_attr(
     feature = "static-dispatch",
     allow(
@@ -72,6 +73,7 @@ pub use byte_set::{
     BYTE_SET_BLOCK_BYTES, BYTE_SET_CLASSIFIER_BUILD_WORK, ByteSet256, ByteSetClassifier,
     ByteSetMask16,
 };
+pub use byte_set4::classify_byte_set4_16;
 
 /// Number of bytes consumed by the narrow classifier operation.
 pub const ASCII_NARROW_BYTES: usize = 16;
