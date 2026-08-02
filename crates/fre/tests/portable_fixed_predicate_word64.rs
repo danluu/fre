@@ -128,7 +128,7 @@ fn default_large_cartesian_languages_select_only_certified_anchor_reducers() {
 }
 
 #[test]
-fn fixed_predicate_v2_auto_route_matrix_is_exact_at_width_16() {
+fn fixed_predicate_auto_route_matrix_is_exact_at_width_16() {
     for width in [12, 15, 16] {
         for reducer in [
             MatrixReducer::One,
@@ -258,6 +258,239 @@ fn matrix_haystacks(
         dense.push(0x7f);
     }
     vec![early, late, absent, rejected, dense]
+}
+
+fn structural_wide_case(
+    width: usize,
+    verification_positions: usize,
+    anchor_pattern: &str,
+) -> (String, Vec<u8>) {
+    assert!(width > 16);
+    assert!(verification_positions < width);
+    let anchor_offset = width / 2;
+    let verification_offsets: Vec<_> = (0..width)
+        .filter(|&position| position != anchor_offset)
+        .take(verification_positions)
+        .collect();
+    assert_eq!(verification_offsets.len(), verification_positions);
+
+    let mut pattern = String::new();
+    let mut word = vec![0x80; width];
+    for position in 0..width {
+        if position == anchor_offset {
+            pattern.push_str(anchor_pattern);
+            word[position] = b'Q';
+        } else if verification_offsets.contains(&position) {
+            pattern.push_str("[a-c]");
+            word[position] = b'b';
+        } else {
+            pattern.push_str(r"[\x00-\xFF]");
+        }
+    }
+    (pattern, word)
+}
+
+fn structural_wide_haystacks(word: &[u8]) -> Vec<Vec<u8>> {
+    let width = word.len();
+    let anchor_offset = width / 2;
+    let mut early = word.to_vec();
+    early.extend_from_slice(&[0xFF; 19]);
+
+    let mut late = vec![0xFF; width * 3 + 17];
+    late.extend_from_slice(word);
+
+    let absent = vec![0xFF; width * 4 + 31];
+
+    let mut rejected = absent.clone();
+    for start in (1..rejected.len().saturating_sub(width)).step_by(5) {
+        rejected[start + anchor_offset] = b'Q';
+    }
+
+    let mut dense = Vec::new();
+    for _ in 0..4 {
+        dense.extend_from_slice(word);
+        dense.push(0xFF);
+    }
+    vec![early, late, absent, rejected, dense]
+}
+
+fn assert_structural_wide_parity(
+    width: usize,
+    verification_positions: usize,
+    expected_plan: PlanKind,
+) {
+    assert_structural_wide_parity_with_anchor(
+        width,
+        verification_positions,
+        "Q",
+        expected_plan,
+    );
+}
+
+fn assert_structural_wide_parity_with_anchor(
+    width: usize,
+    verification_positions: usize,
+    anchor_pattern: &str,
+    expected_plan: PlanKind,
+) {
+    let (pattern, word) = structural_wide_case(width, verification_positions, anchor_pattern);
+    let auto = build_auto(&pattern);
+    let k0 = build_k0(&pattern);
+    assert_eq!(
+        auto.build_report().plan,
+        expected_plan,
+        "width={width} verification_positions={verification_positions}"
+    );
+    assert_eq!(k0.build_report().plan, PlanKind::K0);
+
+    for haystack in structural_wide_haystacks(&word) {
+        let limits = SearchLimits::unlimited();
+        let (auto_match, accounting) = auto.find(&haystack, limits).unwrap();
+        assert_eq!(span(auto_match), span(k0.find(&haystack, limits).unwrap().0));
+        assert_eq!(
+            matches!(accounting, SearchAccounting::FixedPredicateWord64(_)),
+            expected_plan == PlanKind::FixedPredicateWord64
+        );
+        assert_eq!(
+            span(auto.find_value(&haystack, limits).unwrap()),
+            span(k0.find_value(&haystack, limits).unwrap())
+        );
+        assert_eq!(
+            auto.is_match_value(&haystack, limits).unwrap(),
+            k0.is_match_value(&haystack, limits).unwrap()
+        );
+        assert_eq!(
+            auto.shortest_match(&haystack, limits).unwrap().0,
+            k0.shortest_match(&haystack, limits).unwrap().0
+        );
+        assert_eq!(
+            auto.selected_end(&haystack, limits).unwrap().0,
+            k0.selected_end(&haystack, limits).unwrap().0
+        );
+
+        let auto_matches: Result<Vec<_>, _> = auto
+            .find_iter(&haystack, PortableFindIterLimits::unlimited())
+            .unwrap()
+            .map(|matched| matched.map(|matched| (matched.start(), matched.end())))
+            .collect();
+        let k0_matches: Result<Vec<_>, _> = k0
+            .find_iter(&haystack, PortableFindIterLimits::unlimited())
+            .unwrap()
+            .map(|matched| matched.map(|matched| (matched.start(), matched.end())))
+            .collect();
+        assert_eq!(auto_matches.unwrap(), k0_matches.unwrap());
+
+        let mut auto_session = auto
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        let mut k0_session = k0.search_session(SearchSessionLimits::unlimited()).unwrap();
+        assert_eq!(
+            auto_session.workspace_setup_accounting().is_none(),
+            expected_plan == PlanKind::FixedPredicateWord64
+        );
+        assert_eq!(
+            span(auto_session.find_value(&haystack, limits).unwrap()),
+            span(k0_session.find_value(&haystack, limits).unwrap())
+        );
+    }
+
+    let mut guarded = vec![0xFF; 7];
+    let window_start = guarded.len();
+    guarded.extend_from_slice(&word);
+    let window_end = guarded.len();
+    guarded.extend_from_slice(&[0xFF; 7]);
+    guarded.extend_from_slice(&word);
+    let window = SearchWindow::new(window_start, window_end);
+    assert_eq!(
+        span(
+            auto.find_window(&guarded, window, SearchLimits::unlimited())
+                .unwrap()
+                .0
+        ),
+        span(
+            k0.find_window(&guarded, window, SearchLimits::unlimited())
+                .unwrap()
+                .0
+        )
+    );
+}
+
+#[test]
+fn wide_auto_admission_counts_only_nonuniversal_verification_positions() {
+    for (width, verification_positions) in [
+        (64, 0),
+        (17, 1),
+        (24, 4),
+        (32, 8),
+        (48, 15),
+        (64, 15),
+    ] {
+        assert_structural_wide_parity(
+            width,
+            verification_positions,
+            PlanKind::FixedPredicateWord64,
+        );
+    }
+
+    for width in [17, 32, 64] {
+        assert_structural_wide_parity(width, 16, PlanKind::K0);
+    }
+
+    assert_structural_wide_parity_with_anchor(64, 15, "[QR]", PlanKind::FixedPredicateWord64);
+    assert_structural_wide_parity_with_anchor(64, 16, "[QR]", PlanKind::K0);
+}
+
+#[test]
+fn wide_universal_positions_charge_no_verification_work() {
+    let (pattern, _) = structural_wide_case(64, 0, "Q");
+    let regex = build_auto(&pattern);
+    let haystack = vec![0xFF; 1024];
+    let (matched, accounting) = regex
+        .find(&haystack, SearchLimits::unlimited())
+        .unwrap();
+    assert_eq!(matched, None);
+    let SearchAccounting::FixedPredicateWord64(accounting) = accounting else {
+        panic!("wide V=0 route lost fixed-predicate accounting");
+    };
+    assert_eq!(accounting.upper_bounds.predicate_checks, 0);
+    assert_eq!(accounting.actual.predicate_checks, 0);
+    assert_eq!(accounting.actual.shift_and_transitions, 0);
+}
+
+#[test]
+fn wide_set_fallback_can_handoff_to_shift_and() {
+    let width = 48;
+    let anchor_offset = width / 2;
+    let mut pattern = String::new();
+    for position in 0..width {
+        if position == anchor_offset {
+            pattern.push('Q');
+        } else if position == 0 {
+            pattern.push_str("[BDFH]");
+        } else if position == 1 {
+            pattern.push_str("[0-2X-Z]");
+        } else if position < 15 {
+            pattern.push_str("[A-Z]");
+        } else {
+            pattern.push_str(r"[\x00-\xFF]");
+        }
+    }
+    let regex = build_auto(&pattern);
+    assert_eq!(regex.build_report().plan, PlanKind::FixedPredicateWord64);
+
+    let mut haystack = vec![b'B'; 512];
+    for start in 0..=haystack.len() - width {
+        haystack[start + anchor_offset] = b'Q';
+    }
+    let (_, accounting) = regex
+        .find(&haystack, SearchLimits::unlimited())
+        .unwrap();
+    let SearchAccounting::FixedPredicateWord64(accounting) = accounting else {
+        panic!("wide set-fallback route lost fixed-predicate accounting");
+    };
+    assert!(accounting.actual.finder_scanned_bytes > 0);
+    assert!(accounting.actual.shift_and_transitions > 0);
+    assert!(accounting.actual.predicate_checks > 0);
 }
 
 #[test]
@@ -716,6 +949,6 @@ fn fixed_predicate_capture_metadata_and_explicit_capture_refusal_are_preserved()
 }
 
 #[test]
-fn fixed_predicate_schema_is_pinned_to_nine() {
-    assert_eq!(EXPLAIN_SCHEMA_VERSION, 9);
+fn fixed_predicate_schema_is_pinned_to_ten() {
+    assert_eq!(EXPLAIN_SCHEMA_VERSION, 10);
 }

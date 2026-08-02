@@ -619,12 +619,18 @@ pub use unicode_word_run::{
 };
 
 /// Stable schema for facade-level explanation records.
-pub const EXPLAIN_SCHEMA_VERSION: u32 = 9;
+pub const EXPLAIN_SCHEMA_VERSION: u32 = 10;
 
-/// Largest fixed-predicate word whose scalar anchor verification is certified
-/// for automatic ordinary-search selection. Direct kernel APIs retain their
-/// complete width-64 contract.
-const FIXED_PREDICATE_SEARCH_AUTO_MAX_WIDTH: usize = 16;
+/// Largest per-candidate scalar verification envelope certified for automatic
+/// ordinary-search selection. This is independent of fixed-word width: wider
+/// words with universal positions do not pay to verify those positions.
+///
+/// Every formerly admitted anchored word of width at most 16 has `V <= 15`.
+/// For a wider word, the number of legal starts is no greater than for width
+/// 16, so admitting the same `V` envelope does not expand either the pure
+/// finder bound `C * (V + 3) + 1` or the adaptive bound
+/// `6 * N + C * max(V - 3, 0)` beyond that previously certified class.
+const FIXED_PREDICATE_SEARCH_AUTO_MAX_VERIFICATION_PREDICATES: usize = 15;
 
 /// Escapes all regular-expression meta characters in `pattern`.
 ///
@@ -3196,12 +3202,14 @@ impl PortableBuilder {
                 let reducer = plan
                     .search_operation_identity(FixedPredicateWord64SearchOperation::Exists)
                     .reducer;
-                let auto_admitted = fixed.width() <= FIXED_PREDICATE_SEARCH_AUTO_MAX_WIDTH
-                    && matches!(
-                        reducer,
-                        FixedPredicateWord64Reducer::OneByteAnchor
-                            | FixedPredicateWord64Reducer::TwoByteAnchor
-                    );
+                let anchored = matches!(
+                    reducer,
+                    FixedPredicateWord64Reducer::OneByteAnchor
+                        | FixedPredicateWord64Reducer::TwoByteAnchor
+                );
+                let auto_admitted = anchored
+                    && plan.max_verification_predicates()
+                        <= FIXED_PREDICATE_SEARCH_AUTO_MAX_VERIFICATION_PREDICATES;
                 if auto_admitted {
                     let plan_storage_bytes = plan.build_accounting().persistent_bytes;
                     let charged_persistent_bytes = source_storage_bytes
