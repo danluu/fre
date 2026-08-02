@@ -19,12 +19,14 @@ The code generator currently selects instruction sets as follows:
   `X86Avx512F` and `X86Avx512Bw` are present.
 - On AArch64, an empty feature set uses scalar lowering and `Aarch64Asimd`
   selects ASIMD lowering. On Linux, an `Aarch64Sve` request without ASIMD
-  selects a
-  vector-length-agnostic scanner for graph-derived primary byte filters;
-  `Aarch64Sve2` additionally uses `MATCH` for exact byte sets. If ASIMD is
-  also requested, the compiler deliberately emits the established pure-ASIMD
-  lowering, including identical code and data, without SVE routing or tables.
-  Other accelerators in an SVE-only object retain their scalar fallback.
+  selects a vector-length-agnostic scanner for graph-derived primary byte
+  filters; `Aarch64Sve2` additionally uses `MATCH` for exact byte sets. If
+  ASIMD and SVE are both requested, supported primary scanners contain both
+  graph-equivalent lowerings: a runtime `CNTB` dispatch selects ASIMD at a
+  16-byte vector length and scalable SVE above it. Shapes without an SVE
+  lowering retain ASIMD, while other accelerators make their independent
+  graph-derived choices. Other accelerators in an SVE-only object retain their
+  scalar fallback.
 
 `X86Avx512Vl` remains an accepted target fact reserved for future lowering.
 Feature-set validation enforces dependencies: AVX512BW and AVX512VL require

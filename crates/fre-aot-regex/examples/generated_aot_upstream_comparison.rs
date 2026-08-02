@@ -3797,7 +3797,10 @@ mod tests {
             .output(OutputContract::Span),
         )
         .unwrap();
-        assert_eq!(aarch64_sve_code_profile(&asimd_mixed), "none");
+        assert_eq!(
+            aarch64_sve_code_profile(&asimd_mixed),
+            "mixed_sve2_exact_base_sve_range"
+        );
         assert_eq!(
             aarch64_sve_code_profile(
                 &compile(
