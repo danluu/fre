@@ -8,13 +8,14 @@
 use super::{
     AARCH64_EQ, AARCH64_FIRST_LANE_INDEX, AARCH64_HI, AARCH64_HS, AARCH64_LO, AARCH64_LS,
     AARCH64_MI, AARCH64_NE, AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
-    AARCH64_VECTOR_FILTER_FIRST_CONSTANT, Aarch64Assembler, Aarch64SveFilterKind, Architecture,
-    BYTE_FREQUENCY_DENOMINATOR, CpuFeature, EMPTY_NATIVE_PREFIX_RELATION_RECTANGLE, FeatureSet,
-    MAX_NATIVE_PREFIX_RELATION_RECTANGLES, ModuleRelocation, NativeLowering, NativePrefixFilter,
-    NativePrefixRelationPredicate, NativePrefixRelationRectangle, NativePrefixRelationVectorPlan,
-    NativeStartFilter, NativeVectorFilter, PROGRAM_SYMBOL, RelocationKind, StartAccelerator,
-    TEXT_SECTION, Target, X86Assembler, X86CandidateMask, X86StartFilterKind, aarch64_add_x_imm,
-    aarch64_add_x_reg, aarch64_cmp_w_imm, aarch64_cmp_x, aarch64_cmp_x_imm, aarch64_csel_x,
+    AARCH64_VECTOR_FILTER_FIRST_CONSTANT, Aarch64Assembler, Aarch64PrimaryScannerIsa,
+    Aarch64SveFilterKind, Architecture, BYTE_FREQUENCY_DENOMINATOR, CpuFeature,
+    EMPTY_NATIVE_PREFIX_RELATION_RECTANGLE, FeatureSet, MAX_NATIVE_PREFIX_RELATION_RECTANGLES,
+    ModuleRelocation, NativeLowering, NativePrefixFilter, NativePrefixRelationPredicate,
+    NativePrefixRelationRectangle, NativePrefixRelationVectorPlan, NativeStartFilter,
+    NativeVectorFilter, PROGRAM_SYMBOL, RelocationKind, StartAccelerator, TEXT_SECTION, Target,
+    X86Assembler, X86CandidateMask, X86StartFilterKind, aarch64_add_x_imm, aarch64_add_x_reg,
+    aarch64_cmp_w_imm, aarch64_cmp_x, aarch64_cmp_x_imm, aarch64_csel_x,
     aarch64_emit_candidate_any, aarch64_emit_candidate_batch_any,
     aarch64_emit_first_candidate_in_batch, aarch64_emit_first_candidate_lane,
     aarch64_emit_first_lane_constants, aarch64_emit_prefix_predicate,
@@ -27,8 +28,10 @@ use super::{
     aarch64_load_halfword_reg, aarch64_load_q, aarch64_load_u32_constant,
     aarch64_load_u64_constant, aarch64_lsr_x_imm, aarch64_mov_x, aarch64_movi_16b, aarch64_movz_w,
     aarch64_orr_16b, aarch64_prefix_relation_constant_register, aarch64_set_table_address,
-    aarch64_store_x, aarch64_sub_w_imm, aarch64_sub_x_imm, aarch64_sub_x_reg,
-    aarch64_use_exact_first_lane, append_native_prefix_filter,
+    aarch64_primary_scanner_isa, aarch64_primary_scanner_uses_sve, aarch64_store_x,
+    aarch64_sub_w_imm, aarch64_sub_x_imm,
+    aarch64_sub_x_reg, aarch64_sve_cntb, aarch64_use_exact_first_lane,
+    append_native_prefix_filter,
     coalesced_filter_from_membership_words, derive_anchored_prefix_start_filter,
     derive_vector_filter, estimated_byte_frequency_units, estimated_filter_frequency_units,
     filter_from_membership_words, filter_selection_key, native_prefix_relation_predicate,
@@ -2542,9 +2545,11 @@ fn install_context_sve2_match_table(
     filter: Option<NativeStartFilter>,
 ) -> Result<Option<u32>, ObjectError> {
     if target.architecture != Architecture::Aarch64
-        || target.operating_system != super::OperatingSystem::Linux
-        || target.features.has(CpuFeature::Aarch64Asimd)
-        || !target.features.has(CpuFeature::Aarch64Sve)
+        || !aarch64_primary_scanner_uses_sve(aarch64_primary_scanner_isa(
+            target.operating_system,
+            target.features,
+            true,
+        ))
         || !target.features.has(CpuFeature::Aarch64Sve2)
     {
         return Ok(None);
@@ -2606,22 +2611,22 @@ fn aarch64_context_prefix_accelerator(
     if primary.ranges().is_empty() {
         return None;
     }
-    if target.operating_system == super::OperatingSystem::Linux
-        && !target.features.has(CpuFeature::Aarch64Asimd)
-        && target.features.has(CpuFeature::Aarch64Sve)
-        && vector_filter.is_none()
-        && boundary_pair.is_none()
-    {
-        return Some(if sve2_match_table.is_some() {
+    let sve_route_supported = vector_filter.is_none() && boundary_pair.is_none();
+    Some(match aarch64_primary_scanner_isa(
+        target.operating_system,
+        target.features,
+        sve_route_supported,
+    ) {
+        Aarch64PrimaryScannerIsa::Sve | Aarch64PrimaryScannerIsa::SveWithAsimdVl16
+            if sve2_match_table.is_some() =>
+        {
             StartAccelerator::Aarch64Sve2
-        } else {
+        }
+        Aarch64PrimaryScannerIsa::Sve | Aarch64PrimaryScannerIsa::SveWithAsimdVl16 => {
             StartAccelerator::Aarch64Sve
-        });
-    }
-    Some(if target.features.has(CpuFeature::Aarch64Asimd) {
-        StartAccelerator::Aarch64Asimd
-    } else {
-        StartAccelerator::Scalar
+        }
+        Aarch64PrimaryScannerIsa::Asimd => StartAccelerator::Aarch64Asimd,
+        Aarch64PrimaryScannerIsa::Scalar => StartAccelerator::Scalar,
     })
 }
 
@@ -6304,10 +6309,71 @@ fn aarch64_context_emit_prefix_prepass(
     invalid: usize,
     vector_entry: Option<usize>,
 ) -> Result<(), ObjectError> {
-    let vector_candidate = assembler.label()?;
-    if let Some(sve_filter_kind) = sve_filter_kind.filter(|_| {
+    let selected_sve = sve_filter_kind.filter(|_| {
         vector_filter.is_none() && boundary_pair.is_none() && !primary.ranges().is_empty()
-    }) {
+    });
+    if let Some(selected_sve) = selected_sve
+        && use_asimd
+    {
+        // A mixed-capability module keeps both graph-equivalent lowerings.
+        // Re-enter through this width dispatch after external context routes;
+        // route-private retries stay on the already selected invariant path.
+        let dispatch = match vector_entry {
+            Some(label) => label,
+            None => assembler.label()?,
+        };
+        let sve_entry = assembler.label()?;
+        let asimd_setup = assembler.label()?;
+        let joined = assembler.label()?;
+        assembler.bind(dispatch)?;
+        assembler.instruction(aarch64_sve_cntb(6)?)?;
+        assembler.instruction(aarch64_cmp_x_imm(6, 16)?)?;
+        assembler.branch_cond(AARCH64_LS, asimd_setup)?;
+        aarch64_context_emit_prefix_prepass(
+            assembler,
+            primary,
+            vector_filter,
+            boundary_pair,
+            prefix_filter,
+            guarded_bytes,
+            known_span_start,
+            restart,
+            reject_empty_with,
+            anchored_guard,
+            Some(selected_sve),
+            false,
+            use_exact_asimd_lane,
+            no_match,
+            invalid,
+            Some(sve_entry),
+        )?;
+        assembler.branch(joined)?;
+        assembler.bind(asimd_setup)?;
+        // No external entry is passed here: the ASIMD core must materialize
+        // its constants by fallthrough before binding its route-private loop.
+        aarch64_context_emit_prefix_prepass(
+            assembler,
+            primary,
+            vector_filter,
+            boundary_pair,
+            prefix_filter,
+            guarded_bytes,
+            known_span_start,
+            restart,
+            reject_empty_with,
+            anchored_guard,
+            None,
+            true,
+            use_exact_asimd_lane,
+            no_match,
+            invalid,
+            None,
+        )?;
+        assembler.bind(joined)?;
+        return Ok(());
+    }
+    let vector_candidate = assembler.label()?;
+    if let Some(sve_filter_kind) = selected_sve {
         let vector = match vector_entry {
             Some(label) => label,
             None => assembler.label()?,
@@ -7454,10 +7520,15 @@ fn lower_aarch64_context(
     let table_page_offset = assembler.instruction(0x9100_00a5)?;
     aarch64_load_u32_constant(&mut assembler, 14, u32::from(layout.class_count))?;
 
+    // ASIMD remains available for route shapes that SVE cannot lower and for
+    // independent suffix kernels. The explicit mixed policy chooses SVE only
+    // inside each supported primary prepass.
     let use_asimd = features.has(CpuFeature::Aarch64Asimd);
-    let use_sve = operating_system == super::OperatingSystem::Linux
-        && !use_asimd
-        && features.has(CpuFeature::Aarch64Sve);
+    let use_sve = aarch64_primary_scanner_uses_sve(aarch64_primary_scanner_isa(
+        operating_system,
+        features,
+        true,
+    ));
     let sve_filter_kind = |match_table_offset: Option<u32>| {
         use_sve.then(|| match match_table_offset {
             Some(match_table_offset) => Aarch64SveFilterKind::Sve2 { match_table_offset },
@@ -11047,6 +11118,32 @@ mod tests {
         build_context_differential_bundle(
             Target::aarch64_linux()
                 .with_features(FeatureSet::of(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2))
+                .unwrap(),
+            directory,
+            false,
+        );
+    }
+
+    #[test]
+    #[ignore = "generates a mixed ASIMD+SVE2 AArch64 Linux context differential bundle"]
+    fn generate_aarch64_linux_mixed_sve2_context_differential_bundle() {
+        let directory =
+            std::env::var_os("FRE_AOT_AARCH64_MIXED_SVE2_CONTEXT_BUNDLE").map_or_else(
+                || {
+                    std::env::temp_dir().join(format!(
+                        "fre-aot-aarch64-mixed-sve2-context-bundle-{}",
+                        std::process::id()
+                    ))
+                },
+                std::path::PathBuf::from,
+            );
+        build_context_differential_bundle(
+            Target::aarch64_linux()
+                .with_features(
+                    FeatureSet::of(CpuFeature::Aarch64Asimd)
+                        .with(CpuFeature::Aarch64Sve)
+                        .with(CpuFeature::Aarch64Sve2),
+                )
                 .unwrap(),
             directory,
             false,
