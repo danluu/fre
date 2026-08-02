@@ -4183,7 +4183,11 @@ impl X86Assembler {
                 .code
                 .get(instruction..end)
                 .ok_or(ObjectError::InvalidModule("x86 instruction outside code"))?;
-            let terminates = bytes == [0xc3] || (bytes.len() == 5 && bytes[0] == 0xe9);
+            // Raw bytes do not carry enough information to distinguish an
+            // internal `jmp rel32` from a relocated external tail jump. The
+            // fixups above are the only branch targets this pass can resolve,
+            // while a RET is unambiguously a local terminator.
+            let terminates = bytes == [0xc3];
             if !terminates {
                 enqueue(next, &mut reachable, &mut worklist);
             }
@@ -4205,6 +4209,9 @@ impl X86Assembler {
     }
 
     fn finish_with_label_offsets(mut self) -> Result<X86Finished, ObjectError> {
+        self.instruction_offsets.try_reserve(1).map_err(|_| {
+            ObjectError::InvalidModule("x86 instruction sentinel allocation failed")
+        })?;
         self.instruction_offsets.push(self.code.len());
         for fixup in &self.fixups {
             let target = self
@@ -11596,6 +11603,32 @@ mod tests {
     }
 
     #[test]
+    fn x86_assembler_keeps_cfg_reached_by_a_raw_internal_jump() {
+        let mut assembler = X86Assembler::new();
+        let taken = assembler.label().unwrap();
+        let done = assembler.label().unwrap();
+
+        // This raw rel32 jump targets the next instruction. Unlike a RET, its
+        // bytes alone do not prove that the destination leaves this CFG.
+        assembler.instruction(&[0xe9]).unwrap();
+        push_bytes(&mut assembler.code, &[0; 4]).unwrap();
+        assembler.branch(&[0x0f, 0x84], taken).unwrap();
+        assembler.instruction(&[0xb8, 1, 0, 0, 0]).unwrap();
+        assembler.branch(&[0xe9], done).unwrap();
+        assembler.bind(taken).unwrap();
+        assembler.instruction(&[0xb8, 2, 0, 0, 0]).unwrap();
+        assembler.bind(done).unwrap();
+        assembler.instruction(&[0xc3]).unwrap();
+
+        assert_eq!(
+            assembler.finish().unwrap(),
+            [
+                0xe9, 0, 0, 0, 0, 0x74, 0x07, 0xb8, 1, 0, 0, 0, 0xeb, 0x05, 0xb8, 2, 0, 0, 0, 0xc3,
+            ]
+        );
+    }
+
+    #[test]
     fn sparse_batch_admission_uses_stable_frequency_and_instruction_cost() {
         let one_range = |start: u8, end: u8| {
             let mut filter = EMPTY_NATIVE_START_FILTER;
@@ -12536,11 +12569,29 @@ mod tests {
                 .any(|window| window == tail_adapter)
         );
         assert_eq!(&code[code.len() - 6..], &[0xb8, 2, 0, 0, 0, 0xc3]);
+        let invalid = code.len() - 6;
+        for guard in [
+            &[0x48, 0x85, 0xf6][..],
+            &[0x48, 0x39, 0xf1],
+            &[0x48, 0x39, 0xca],
+            &[0x4d, 0x85, 0xc0],
+            &[0x41, 0xf6, 0xc0, 0x07],
+            &[0x48, 0x85, 0xff],
+        ] {
+            let branch = code
+                .windows(guard.len())
+                .position(|window| window == guard)
+                .unwrap()
+                + guard.len();
+            assert_eq!(x86_test_branch_target(&code, branch).unwrap().0, invalid);
+        }
         assert_eq!(relocations.len(), 2);
         let program = usize::try_from(relocations[0].offset).unwrap();
         let runtime = usize::try_from(relocations[1].offset).unwrap();
         assert_eq!(&code[program - 3..program], &[0x48, 0x8d, 0x3d]);
         assert_eq!(code[runtime - 1], 0xe9);
+        assert_eq!(relocations[1].kind, RelocationKind::X86PltRelative32);
+        assert_eq!(relocations[1].symbol, RUNTIME_SYMBOL);
         assert_eq!(relocations[0].addend, -4);
         assert_eq!(relocations[1].addend, -4);
     }
