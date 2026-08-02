@@ -1769,6 +1769,14 @@ fn selected_start_accelerator(
                     Some(Aarch64SveFilterKind::Sve2 { .. }) => StartAccelerator::Aarch64Sve2,
                     None => StartAccelerator::Scalar,
                 }
+            } else if selected_aarch64_sve_suffix_kind(
+                layout,
+                target.features,
+                target.operating_system,
+            )
+            .is_some()
+            {
+                StartAccelerator::Aarch64Sve
             } else if target.features.has(CpuFeature::Aarch64Asimd) {
                 StartAccelerator::Aarch64Asimd
             } else {
@@ -1803,6 +1811,21 @@ fn selected_aarch64_sve_filter(
         return Some(Aarch64SveFilterKind::Sve2 { match_table_offset });
     }
     Some(Aarch64SveFilterKind::Sve)
+}
+
+fn selected_aarch64_sve_suffix_kind(
+    layout: NativeDfaLayout,
+    features: FeatureSet,
+    operating_system: OperatingSystem,
+) -> Option<Aarch64SveFilterKind> {
+    (operating_system == OperatingSystem::Linux
+        && features.has(CpuFeature::Aarch64Sve)
+        && !features.has(CpuFeature::Aarch64Asimd)
+        && layout.seeded_reverse.is_none()
+        && layout
+            .suffix_filter
+            .is_some_and(|suffix| aarch64_base_sve_filter_supported(suffix.filter)))
+    .then_some(Aarch64SveFilterKind::Sve)
 }
 
 fn install_aarch64_sve2_match_table(
@@ -11330,14 +11353,7 @@ fn lower_aarch64_dfa_for_operating_system(
         && layout
             .start_filter
             .is_some_and(|filter| !filter.ranges().is_empty());
-    let sve_suffix_kind = (operating_system == OperatingSystem::Linux
-        && features.has(CpuFeature::Aarch64Sve)
-        && !features.has(CpuFeature::Aarch64Asimd)
-        && layout.seeded_reverse.is_none()
-        && layout
-            .suffix_filter
-            .is_some_and(|suffix| aarch64_base_sve_filter_supported(suffix.filter)))
-    .then_some(Aarch64SveFilterKind::Sve);
+    let sve_suffix_kind = selected_aarch64_sve_suffix_kind(layout, features, operating_system);
     let use_asimd_suffix = features.has(CpuFeature::Aarch64Asimd)
         && layout
             .suffix_filter
@@ -15230,6 +15246,60 @@ mod tests {
                 .any(|bytes| bytes == [0x48, 0x8d, 0x42, 1, 0x49, 0x89, 0x00]),
             "bounded retry must retain the next mandatory base"
         );
+    }
+
+    #[test]
+    fn pure_sve_suffix_only_receipt_names_the_emitted_scanner() {
+        let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
+        for features in [sve, sve.with(CpuFeature::Aarch64Sve2)] {
+            let target = Target::aarch64_linux().with_features(features).unwrap();
+            let compiled = compile(
+                CompileRequest::new("(?s:.+?)z", target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span),
+            )
+            .unwrap();
+            let layout = build_native_dfa_table(compiled.program().native_dfa_view().unwrap())
+                .unwrap()
+                .1;
+            assert!(layout.start_filter.is_none());
+            assert!(layout.suffix_filter.is_some());
+            assert!(layout.seeded_reverse.is_none());
+            assert_eq!(
+                selected_aarch64_sve_suffix_kind(
+                    layout,
+                    target.features,
+                    target.operating_system,
+                ),
+                Some(Aarch64SveFilterKind::Sve)
+            );
+            assert_eq!(
+                compiled.module().start_accelerator(),
+                StartAccelerator::Aarch64Sve,
+                "the receipt must report the strongest scanner actually emitted"
+            );
+            let words = compiled.module().sections()[TEXT_SECTION]
+                .bytes()
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                words
+                    .iter()
+                    .filter(|&&word| word == aarch64_sve_ptrue_b())
+                    .count(),
+                1,
+                "the suffix-only route must contain exactly one SVE scanner"
+            );
+            assert_eq!(
+                words
+                    .iter()
+                    .filter(|&&word| word == aarch64_sve_cntb(6).unwrap())
+                    .count(),
+                1,
+                "the suffix scanner must hoist exactly one runtime-VL query"
+            );
+        }
     }
 
     #[test]
