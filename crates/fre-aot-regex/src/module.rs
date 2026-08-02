@@ -10125,33 +10125,27 @@ fn aarch64_emit_sve_start_filter_scanner(
         }
         assembler.instruction(aarch64_cmp_x_lsl(12, 6, 2)?)?;
         assembler.branch_cond(AARCH64_LO, single)?;
-        aarch64_emit_start_filter_address(assembler, filter.scan_offset)?;
-        for block in 0_u8..batch_vectors {
-            aarch64_emit_sve_legacy_filter_load_candidates(assembler, filter, kind, block)?;
-            assembler.instruction(if block == 0 {
-                aarch64_sve_orr_b(4, 1, 1)?
-            } else {
-                aarch64_sve_orr_b(4, 4, 1)?
-            })?;
-        }
-        assembler.instruction(aarch64_sve_ptest_p0(4)?)?;
+        // Keep each block's primary predicate live. This saves the complete
+        // load-and-compare replay on a hit and replaces the rolling union with
+        // a balanced reduction.
+        aarch64_emit_sve_filter_batch_primary_candidates(assembler, filter, kind)?;
+        assembler.instruction(aarch64_sve_orr_b(8, 1, 2)?)?;
+        assembler.instruction(aarch64_sve_orr_b(9, 3, 4)?)?;
+        assembler.instruction(aarch64_sve_orr_b(8, 8, 9)?)?;
+        assembler.instruction(aarch64_sve_ptest_p0(8)?)?;
         assembler.branch_cond(AARCH64_NE, batch_hit)?;
         assembler.instruction(aarch64_sve_addvl(2, 2, batch_vectors)?)?;
         assembler.branch(batch)?;
 
-        // Recompute only the rare hit batch. Ordered probes keep the leftmost
-        // candidate exact without retaining four live predicate masks.
+        // Ordered probes over the retained masks keep the leftmost candidate
+        // exact without reloading or recomputing the hit batch.
         assembler.bind(batch_hit)?;
-        aarch64_emit_start_filter_address(assembler, filter.scan_offset)?;
         for (block, &hit) in batch_hits.iter().enumerate() {
-            aarch64_emit_sve_legacy_filter_load_candidates(
-                assembler,
-                filter,
-                kind,
-                u8::try_from(block)
-                    .map_err(|_| ObjectError::ArithmeticOverflow("SVE hit block"))?,
-            )?;
-            assembler.instruction(aarch64_sve_ptest_p0(1)?)?;
+            let predicate = u8::try_from(block)
+                .ok()
+                .and_then(|block| block.checked_add(1))
+                .ok_or(ObjectError::ArithmeticOverflow("SVE hit predicate"))?;
+            assembler.instruction(aarch64_sve_ptest_p0(predicate)?)?;
             assembler.branch_cond(AARCH64_NE, hit)?;
         }
         assembler.branch(scalar)?;
@@ -10164,6 +10158,13 @@ fn aarch64_emit_sve_start_filter_scanner(
                     u8::try_from(block)
                         .map_err(|_| ObjectError::ArithmeticOverflow("SVE hit block"))?,
                 )?)?;
+            }
+            let predicate = u8::try_from(block)
+                .ok()
+                .and_then(|block| block.checked_add(1))
+                .ok_or(ObjectError::ArithmeticOverflow("SVE hit predicate"))?;
+            if predicate != 1 {
+                assembler.instruction(aarch64_sve_orr_b(1, predicate, predicate)?)?;
             }
             aarch64_emit_sve_first_candidate(assembler, 1, candidate)?;
         }
@@ -15539,12 +15540,13 @@ mod tests {
             aarch64_sve_cntb(6).unwrap(),
             aarch64_cmp_x_imm(6, 128).unwrap(),
             aarch64_sve_ld1b_vl(0, 12, 0).unwrap(),
-            aarch64_sve_ld1b_vl(0, 12, 1).unwrap(),
-            aarch64_sve_ld1b_vl(0, 12, 2).unwrap(),
-            aarch64_sve_ld1b_vl(0, 12, 3).unwrap(),
+            aarch64_sve_ld1b_vl(24, 12, 0).unwrap(),
+            aarch64_sve_ld1b_vl(25, 12, 1).unwrap(),
+            aarch64_sve_ld1b_vl(26, 12, 2).unwrap(),
+            aarch64_sve_ld1b_vl(27, 12, 3).unwrap(),
             aarch64_sve_cmpeq_b(1, 0, 16).unwrap(),
             aarch64_sve_ptest_p0(1).unwrap(),
-            aarch64_sve_ptest_p0(4).unwrap(),
+            aarch64_sve_ptest_p0(8).unwrap(),
             aarch64_sve_addvl(2, 2, 4).unwrap(),
             aarch64_sve_addvl(2, 2, 1).unwrap(),
             aarch64_sve_whilelo_b(0, 2, 3).unwrap(),
@@ -15996,7 +15998,7 @@ mod tests {
     }
 
     #[test]
-    fn aarch64_direct_sve_sparse_batch_uses_primary_only_hit_predicate() {
+    fn aarch64_direct_sve_sparse_batch_retains_ordered_primary_predicates() {
         let target = Target::aarch64_linux()
             .with_features(FeatureSet::of(CpuFeature::Aarch64Sve))
             .unwrap();
@@ -16012,11 +16014,14 @@ mod tests {
             .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
             .collect::<Vec<_>>();
         assert!(words.contains(&aarch64_sve_addvl(2, 2, 4).unwrap()));
-        assert!(words.contains(&aarch64_sve_ptest_p0(4).unwrap()));
-        assert!(
-            !words.contains(&aarch64_sve_ptest_p0(8).unwrap()),
-            "direct DFA retains the primary-only scanner rather than the contextual multicolumn predicate bank"
-        );
+        assert!(words.contains(&aarch64_sve_ptest_p0(8).unwrap()));
+        for block in 0_u8..4 {
+            let source = 24 + block;
+            let predicate = 1 + block;
+            assert!(words.contains(&aarch64_sve_ld1b_vl(source, 12, block).unwrap()));
+            assert!(words.contains(&aarch64_sve_cmpeq_b(predicate, source, 16).unwrap()));
+            assert!(words.contains(&aarch64_sve_ptest_p0(predicate).unwrap()));
+        }
     }
 
     #[test]
@@ -21326,7 +21331,7 @@ mod tests {
                             .collect::<Vec<_>>();
                         if target.features.has(CpuFeature::Aarch64Sve) {
                             assert!(words.contains(&aarch64_sve_addvl(2, 2, 4).unwrap()));
-                            assert!(words.contains(&aarch64_sve_ptest_p0(4).unwrap()));
+                            assert!(words.contains(&aarch64_sve_ptest_p0(8).unwrap()));
                         } else if target.features.has(CpuFeature::Aarch64Asimd) {
                             assert!(use_aarch64_filter_batch(filter));
                             assert!(
