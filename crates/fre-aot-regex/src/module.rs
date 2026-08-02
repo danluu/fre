@@ -3781,8 +3781,26 @@ type X86Label = usize;
 
 #[derive(Clone, Copy, Debug)]
 struct X86Fixup {
+    instruction: usize,
     displacement: usize,
     label: X86Label,
+    short_opcode: Option<u8>,
+    long_bytes: usize,
+}
+
+struct X86Finished {
+    code: Vec<u8>,
+    label_offsets: Vec<Option<usize>>,
+}
+
+impl X86Finished {
+    fn label_offset(&self, label: X86Label) -> Result<usize, ObjectError> {
+        self.label_offsets
+            .get(label)
+            .copied()
+            .flatten()
+            .ok_or(ObjectError::InvalidModule("unbound x86 offset label"))
+    }
 }
 
 struct X86Assembler {
@@ -3834,54 +3852,70 @@ impl X86Assembler {
     }
 
     fn branch(&mut self, opcode: &[u8], label: X86Label) -> Result<(), ObjectError> {
-        // Once a target is bound, use the compact rel8 form whenever the
-        // displacement fits. All such edges are backward, so their size
-        // cannot move the target or invalidate an earlier fixup. Forward
-        // edges retain the fixed-width rel32 representation and are resolved
-        // transactionally by `finish`.
+        if self.labels.get(label).is_none() {
+            return Err(ObjectError::InvalidModule("x86 branch label index"));
+        }
+        // Record one stable rel32 representation while lowering. `finish`
+        // relaxes every eligible edge together after all labels are bound;
+        // doing that transactionally lets forward and backward branches both
+        // use rel8 without invalidating labels, fixups, or relocation fields.
         let short_opcode = match opcode {
             [0xe9] => Some(0xeb),
             [0x0f, condition @ 0x80..=0x8f] => condition.checked_sub(0x10),
             _ => None,
         };
-        if let (Some(short_opcode), Some(target)) =
-            (short_opcode, self.labels.get(label).copied().flatten())
-            && (target == self.code.len()
-                || self.instruction_offsets.binary_search(&target).is_ok())
-        {
-            let after = self
-                .code
-                .len()
-                .checked_add(2)
-                .ok_or(ObjectError::ArithmeticOverflow("x86 short branch base"))?;
-            let target = i64::try_from(target)
-                .map_err(|_| ObjectError::ArithmeticOverflow("x86 short branch target"))?;
-            let after = i64::try_from(after)
-                .map_err(|_| ObjectError::ArithmeticOverflow("x86 short branch base"))?;
-            let delta = target
-                .checked_sub(after)
-                .ok_or(ObjectError::ArithmeticOverflow(
-                    "x86 short branch displacement",
-                ))?;
-            if let Ok(delta) = i8::try_from(delta) {
-                self.instruction(&[short_opcode, delta.to_le_bytes()[0]])?;
-                return Ok(());
-            }
-        }
-        self.instruction(opcode)?;
+        let instruction = self.instruction(opcode)?;
         let displacement = self.code.len();
         push_bytes(&mut self.code, &[0; 4])?;
         self.fixups
             .try_reserve(1)
             .map_err(|_| ObjectError::InvalidModule("x86 fixup allocation failed"))?;
         self.fixups.push(X86Fixup {
+            instruction,
             displacement,
             label,
+            short_opcode,
+            long_bytes: opcode
+                .len()
+                .checked_add(4)
+                .ok_or(ObjectError::ArithmeticOverflow("x86 branch size"))?,
         });
         Ok(())
     }
 
-    fn finish(mut self) -> Result<Vec<u8>, ObjectError> {
+    fn remap_offset(&self, offset: usize, shortened: &[bool]) -> Result<usize, ObjectError> {
+        let mut removed = 0_usize;
+        for (fixup, &is_short) in self.fixups.iter().zip(shortened) {
+            if !is_short {
+                continue;
+            }
+            let end = fixup
+                .instruction
+                .checked_add(fixup.long_bytes)
+                .ok_or(ObjectError::ArithmeticOverflow("x86 relaxed branch extent"))?;
+            if end <= offset {
+                removed = removed
+                    .checked_add(
+                        fixup
+                            .long_bytes
+                            .checked_sub(2)
+                            .ok_or(ObjectError::InvalidModule("x86 relaxed branch size"))?,
+                    )
+                    .ok_or(ObjectError::ArithmeticOverflow(
+                        "x86 relaxed offset removal",
+                    ))?;
+            } else if fixup.instruction < offset {
+                return Err(ObjectError::InvalidModule(
+                    "x86 offset falls inside a relaxed branch",
+                ));
+            }
+        }
+        offset
+            .checked_sub(removed)
+            .ok_or(ObjectError::ArithmeticOverflow("x86 relaxed offset"))
+    }
+
+    fn finish_with_label_offsets(mut self) -> Result<X86Finished, ObjectError> {
         self.instruction_offsets.push(self.code.len());
         for fixup in &self.fixups {
             let target = self
@@ -3895,29 +3929,177 @@ impl X86Assembler {
                     "x86 branch target is not an instruction boundary",
                 ));
             }
-            let after = fixup
-                .displacement
-                .checked_add(4)
-                .ok_or(ObjectError::ArithmeticOverflow("x86 branch base"))?;
-            let target = i64::try_from(target)
-                .map_err(|_| ObjectError::ArithmeticOverflow("x86 branch target"))?;
-            let after = i64::try_from(after)
-                .map_err(|_| ObjectError::ArithmeticOverflow("x86 branch base"))?;
-            let delta = target
-                .checked_sub(after)
-                .ok_or(ObjectError::ArithmeticOverflow("x86 branch displacement"))?;
-            let delta = i32::try_from(delta)
-                .map_err(|_| ObjectError::InvalidModule("x86 branch is out of range"))?;
-            let end = fixup
-                .displacement
-                .checked_add(4)
-                .ok_or(ObjectError::ArithmeticOverflow("x86 fixup extent"))?;
-            self.code
-                .get_mut(fixup.displacement..end)
-                .ok_or(ObjectError::InvalidModule("x86 fixup outside code"))?
-                .copy_from_slice(&delta.to_le_bytes());
         }
-        Ok(self.code)
+
+        // Branch relaxation is monotone: shortening an intervening edge can
+        // only bring a target closer. Iterate to a fixed point so an edge
+        // made rel8-reachable by another shrink is also selected.
+        let mut shortened = Vec::new();
+        shortened
+            .try_reserve_exact(self.fixups.len())
+            .map_err(|_| ObjectError::InvalidModule("x86 relaxation allocation failed"))?;
+        shortened.resize(self.fixups.len(), false);
+        loop {
+            let mut changed = false;
+            for (index, fixup) in self.fixups.iter().enumerate() {
+                if shortened[index] || fixup.short_opcode.is_none() {
+                    continue;
+                }
+                let raw_target = self.labels[fixup.label]
+                    .ok_or(ObjectError::InvalidModule("unbound x86 branch label"))?;
+                let instruction = self.remap_offset(fixup.instruction, &shortened)?;
+                let mut target = self.remap_offset(raw_target, &shortened)?;
+                let raw_end = fixup
+                    .instruction
+                    .checked_add(fixup.long_bytes)
+                    .ok_or(ObjectError::ArithmeticOverflow("x86 branch extent"))?;
+                if raw_end <= raw_target {
+                    target = target
+                        .checked_sub(
+                            fixup
+                                .long_bytes
+                                .checked_sub(2)
+                                .ok_or(ObjectError::InvalidModule("x86 relaxed branch size"))?,
+                        )
+                        .ok_or(ObjectError::ArithmeticOverflow(
+                            "x86 hypothetical relaxed target",
+                        ))?;
+                }
+                let after = instruction
+                    .checked_add(2)
+                    .ok_or(ObjectError::ArithmeticOverflow("x86 short branch base"))?;
+                let delta =
+                    i64::try_from(target)
+                        .map_err(|_| ObjectError::ArithmeticOverflow("x86 short branch target"))?
+                        .checked_sub(i64::try_from(after).map_err(|_| {
+                            ObjectError::ArithmeticOverflow("x86 short branch base")
+                        })?)
+                        .ok_or(ObjectError::ArithmeticOverflow(
+                            "x86 short branch displacement",
+                        ))?;
+                if i8::try_from(delta).is_ok() {
+                    shortened[index] = true;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        let mut code = Vec::new();
+        code.try_reserve_exact(self.remap_offset(self.code.len(), &shortened)?)
+            .map_err(|_| ObjectError::InvalidModule("x86 relaxed code allocation failed"))?;
+        let mut cursor = 0_usize;
+        for (index, fixup) in self.fixups.iter().enumerate() {
+            push_bytes(
+                &mut code,
+                self.code
+                    .get(cursor..fixup.instruction)
+                    .ok_or(ObjectError::InvalidModule("x86 fixup order"))?,
+            )?;
+            let end = fixup
+                .instruction
+                .checked_add(fixup.long_bytes)
+                .ok_or(ObjectError::ArithmeticOverflow("x86 branch extent"))?;
+            if shortened[index] {
+                push_bytes(
+                    &mut code,
+                    &[
+                        fixup.short_opcode.ok_or(ObjectError::InvalidModule(
+                            "x86 relaxed branch has no short opcode",
+                        ))?,
+                        0,
+                    ],
+                )?;
+            } else {
+                push_bytes(
+                    &mut code,
+                    self.code
+                        .get(fixup.instruction..end)
+                        .ok_or(ObjectError::InvalidModule("x86 fixup outside code"))?,
+                )?;
+            }
+            cursor = end;
+        }
+        push_bytes(
+            &mut code,
+            self.code
+                .get(cursor..)
+                .ok_or(ObjectError::InvalidModule("x86 relaxed code tail"))?,
+        )?;
+
+        let mut label_offsets = Vec::new();
+        label_offsets
+            .try_reserve_exact(self.labels.len())
+            .map_err(|_| ObjectError::InvalidModule("x86 label remap allocation failed"))?;
+        for &offset in &self.labels {
+            label_offsets.push(
+                offset
+                    .map(|offset| self.remap_offset(offset, &shortened))
+                    .transpose()?,
+            );
+        }
+        for (index, fixup) in self.fixups.iter().enumerate() {
+            let instruction = self.remap_offset(fixup.instruction, &shortened)?;
+            let target = label_offsets[fixup.label]
+                .ok_or(ObjectError::InvalidModule("unbound x86 branch label"))?;
+            if shortened[index] {
+                let after = instruction
+                    .checked_add(2)
+                    .ok_or(ObjectError::ArithmeticOverflow("x86 short branch base"))?;
+                let delta =
+                    i64::try_from(target)
+                        .map_err(|_| ObjectError::ArithmeticOverflow("x86 short branch target"))?
+                        .checked_sub(i64::try_from(after).map_err(|_| {
+                            ObjectError::ArithmeticOverflow("x86 short branch base")
+                        })?)
+                        .ok_or(ObjectError::ArithmeticOverflow(
+                            "x86 short branch displacement",
+                        ))?;
+                let delta = i8::try_from(delta)
+                    .map_err(|_| ObjectError::InvalidModule("x86 short branch is out of range"))?;
+                *code
+                    .get_mut(instruction + 1)
+                    .ok_or(ObjectError::InvalidModule("x86 short fixup outside code"))? =
+                    delta.to_le_bytes()[0];
+            } else {
+                let opcode_bytes = fixup
+                    .displacement
+                    .checked_sub(fixup.instruction)
+                    .ok_or(ObjectError::InvalidModule("x86 branch opcode extent"))?;
+                let displacement = instruction
+                    .checked_add(opcode_bytes)
+                    .ok_or(ObjectError::ArithmeticOverflow("x86 branch displacement"))?;
+                let after = displacement
+                    .checked_add(4)
+                    .ok_or(ObjectError::ArithmeticOverflow("x86 branch base"))?;
+                let delta = i64::try_from(target)
+                    .map_err(|_| ObjectError::ArithmeticOverflow("x86 branch target"))?
+                    .checked_sub(
+                        i64::try_from(after)
+                            .map_err(|_| ObjectError::ArithmeticOverflow("x86 branch base"))?,
+                    )
+                    .ok_or(ObjectError::ArithmeticOverflow("x86 branch displacement"))?;
+                let delta = i32::try_from(delta)
+                    .map_err(|_| ObjectError::InvalidModule("x86 branch is out of range"))?;
+                let end = displacement
+                    .checked_add(4)
+                    .ok_or(ObjectError::ArithmeticOverflow("x86 fixup extent"))?;
+                code.get_mut(displacement..end)
+                    .ok_or(ObjectError::InvalidModule("x86 fixup outside code"))?
+                    .copy_from_slice(&delta.to_le_bytes());
+            }
+        }
+        Ok(X86Finished {
+            code,
+            label_offsets,
+        })
+    }
+
+    #[cfg(test)]
+    fn finish(self) -> Result<Vec<u8>, ObjectError> {
+        Ok(self.finish_with_label_offsets()?.code)
     }
 }
 
@@ -6199,7 +6381,8 @@ fn lower_x86_64_dfa(
 
     // lea table(%rip), r9
     assembler.instruction(&[0x4c, 0x8d, 0x0d])?;
-    let table_displacement = assembler.code.len();
+    let table_displacement_label = assembler.label()?;
+    assembler.bind(table_displacement_label)?;
     push_bytes(&mut assembler.code, &[0; 4])?;
     if layout.suffix_filter.is_some() && layout.exact_prefix_match_width.is_some() {
         let kind = filter_kind.ok_or(ObjectError::InvalidModule(
@@ -6630,11 +6813,21 @@ fn lower_x86_64_dfa(
         assembler.instruction(&[0xc5, 0xf8, 0x77])?;
     }
     assembler.instruction(&[0xc3])?;
-    if let Some(plan) = adaptive_suffix_cold {
-        let cold_start = assembler.code.len();
+    let adaptive_cold_start = if let Some(plan) = adaptive_suffix_cold {
+        let cold_start = assembler.label()?;
+        assembler.bind(cold_start)?;
         x86_emit_adaptive_suffix_cold(&mut assembler, plan)?;
+        Some(cold_start)
+    } else {
+        None
+    };
+
+    let mut finished = assembler.finish_with_label_offsets()?;
+    let table_displacement = finished.label_offset(table_displacement_label)?;
+    if let Some(cold_start_label) = adaptive_cold_start {
+        let cold_start = finished.label_offset(cold_start_label)?;
         let cold_bytes =
-            assembler
+            finished
                 .code
                 .len()
                 .checked_sub(cold_start)
@@ -6653,10 +6846,13 @@ fn lower_x86_64_dfa(
                 .ok_or(ObjectError::ArithmeticOverflow(
                     "x86 adaptive suffix cold padding",
                 ))?;
-        x86_emit_unreachable_nops(&mut assembler, padding)?;
+        let mut padding_assembler = X86Assembler::new();
+        x86_emit_unreachable_nops(&mut padding_assembler, padding)?;
+        let padding = padding_assembler.finish_with_label_offsets()?.code;
+        push_bytes(&mut finished.code, &padding)?;
     }
 
-    let code = assembler.finish()?;
+    let code = finished.code;
     Ok((
         code,
         vec![ModuleRelocation {
@@ -6696,18 +6892,23 @@ fn lower_x86_64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), Ob
 
     // lea program(%rip), %rdi
     assembler.instruction(&[0x48, 0x8d, 0x3d])?;
-    let program_displacement = assembler.code.len();
+    let program_displacement_label = assembler.label()?;
+    assembler.bind(program_displacement_label)?;
     push_bytes(&mut assembler.code, &[0; 4])?;
 
     // jmp runtime@PLT -- a tail call preserves the caller's return address.
     assembler.instruction(&[0xe9])?;
-    let runtime_displacement = assembler.code.len();
+    let runtime_displacement_label = assembler.label()?;
+    assembler.bind(runtime_displacement_label)?;
     push_bytes(&mut assembler.code, &[0; 4])?;
 
     assembler.bind(invalid)?;
     assembler.instruction(&[0xb8, 0x02, 0, 0, 0])?;
     assembler.instruction(&[0xc3])?;
-    let code = assembler.finish()?;
+    let finished = assembler.finish_with_label_offsets()?;
+    let program_displacement = finished.label_offset(program_displacement_label)?;
+    let runtime_displacement = finished.label_offset(runtime_displacement_label)?;
+    let code = finished.code;
 
     Ok((
         code,
@@ -9967,6 +10168,18 @@ mod tests {
         Some((usize::try_from(target).ok()?, length))
     }
 
+    fn x86_test_normalized_branch_opcode(code: &[u8], instruction: usize) -> Option<u8> {
+        match *code.get(instruction)? {
+            0xeb | 0xe9 => Some(0xe9),
+            opcode @ 0x70..=0x7f => opcode.checked_add(0x10),
+            0x0f => match *code.get(instruction.checked_add(1)?)? {
+                opcode @ 0x80..=0x8f => Some(opcode),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     #[test]
     fn target_matrix_has_the_platform_abi() {
         let cases = [
@@ -10112,7 +10325,7 @@ mod tests {
     }
 
     #[test]
-    fn x86_assembler_relaxes_only_bound_in_range_branches() {
+    fn x86_assembler_relaxes_all_in_range_branches_transactionally() {
         let mut assembler = X86Assembler::new();
         let near = assembler.label().unwrap();
         assembler.bind(near).unwrap();
@@ -10134,7 +10347,42 @@ mod tests {
         let code = assembler.finish().unwrap();
         assert_eq!(&code[..5], &[0x90, 0xeb, 0xfd, 0x75, 0xfb]);
         assert_eq!(&code[133..138], &[0xe9, 0x7b, 0xff, 0xff, 0xff]);
-        assert_eq!(&code[138..], &[0xe9, 0, 0, 0, 0]);
+        assert_eq!(&code[138..], &[0xeb, 0]);
+    }
+
+    #[test]
+    fn x86_assembler_relaxation_reaches_a_fixed_point_and_remaps_offset_labels() {
+        let mut assembler = X86Assembler::new();
+        let target = assembler.label().unwrap();
+        let near = assembler.label().unwrap();
+        assembler.branch(&[0x0f, 0x84], target).unwrap();
+        assembler.branch(&[0x0f, 0x85], near).unwrap();
+        assembler.bind(near).unwrap();
+        for _ in 0..124 {
+            assembler.instruction(&[0x90]).unwrap();
+        }
+        assembler.bind(target).unwrap();
+        let finished = assembler.finish_with_label_offsets().unwrap();
+        assert_eq!(&finished.code[..4], &[0x74, 0x7e, 0x75, 0]);
+        assert_eq!(finished.label_offset(near).unwrap(), 4);
+        assert_eq!(finished.label_offset(target).unwrap(), 128);
+
+        let mut assembler = X86Assembler::new();
+        let target = assembler.label().unwrap();
+        let relocation_field = assembler.label().unwrap();
+        assembler.branch(&[0xe9], target).unwrap();
+        assembler.bind(target).unwrap();
+        assembler.instruction(&[0x48, 0x8d, 0x0d]).unwrap();
+        assembler.bind(relocation_field).unwrap();
+        push_bytes(&mut assembler.code, &[0; 4]).unwrap();
+        let finished = assembler.finish_with_label_offsets().unwrap();
+        assert_eq!(&finished.code[..2], &[0xeb, 0]);
+        assert_eq!(finished.label_offset(target).unwrap(), 2);
+        assert_eq!(finished.label_offset(relocation_field).unwrap(), 5);
+
+        let mut assembler = X86Assembler::new();
+        assert!(assembler.branch(&[0xe9], usize::MAX).is_err());
+        assert!(assembler.code.is_empty());
     }
 
     #[test]
@@ -10560,10 +10808,20 @@ mod tests {
                     assert_eq!(reductions.len(), 2, "{target:?} {output:?}");
                     assert!(!rewinds.is_empty(), "{target:?} {output:?}");
 
-                    // Both loops have the same 18-byte remaining/bounds
-                    // prelude before their accumulator clear.
-                    let primary_loop = clears[0] - 18;
-                    let joint_loop = clears[1] - 18;
+                    // Both accumulator clears are immediately preceded by a
+                    // remaining/bounds prelude. Find its stable materialization
+                    // instead of depending on the relaxed guard width.
+                    let remaining_materialization = [
+                        0x48, 0x89, 0xc8, // mov rax, rcx
+                        0x48, 0x29, 0xd0, // sub rax, rdx
+                    ];
+                    let materialized_loop = |clear: usize| {
+                        (clear.saturating_sub(24)..clear)
+                            .rfind(|&offset| code[offset..].starts_with(&remaining_materialization))
+                            .expect("suffix remaining/bounds loop prelude")
+                    };
+                    let primary_loop = materialized_loop(clears[0]);
+                    let joint_loop = materialized_loop(clears[1]);
                     let primary_hit_branch = reductions[0] + reduce.len();
                     let (rewind_block, _) =
                         x86_test_branch_target(code, primary_hit_branch).unwrap();
@@ -10577,7 +10835,10 @@ mod tests {
                         [(reductions[0], primary_loop), (reductions[1], joint_loop)]
                     {
                         let hit_branch = index + reduce.len();
-                        assert_eq!(&code[hit_branch..hit_branch + 2], &[0x0f, 0x85]);
+                        assert_eq!(
+                            x86_test_normalized_branch_opcode(code, hit_branch),
+                            Some(0x85)
+                        );
                         let (_, hit_length) = x86_test_branch_target(code, hit_branch).unwrap();
                         assert_eq!(
                             x86_test_branch_target(code, hit_branch).unwrap().0,
@@ -10596,7 +10857,10 @@ mod tests {
                     // enters the duplicated scalar replay. The only inc/jmp
                     // edge back to the joint loop is its secondary rejection.
                     let replay_branch = rewind_block + rewind.len();
-                    assert_eq!(code[replay_branch], 0xe9);
+                    assert_eq!(
+                        x86_test_normalized_branch_opcode(code, replay_branch),
+                        Some(0xe9)
+                    );
                     let (replay, _) = x86_test_branch_target(code, replay_branch).unwrap();
                     assert!(replay_branch < replay);
                     assert!(replay > joint_loop);
@@ -10622,15 +10886,6 @@ mod tests {
                 .enumerate()
                 .filter_map(|(offset, window)| (window == instruction).then_some(offset))
                 .collect()
-        }
-
-        fn rel32_target(code: &[u8], instruction: usize, displacement: usize, len: usize) -> usize {
-            let start = instruction + displacement;
-            let relative = i32::from_le_bytes(code[start..start + 4].try_into().unwrap());
-            usize::try_from(
-                isize::try_from(instruction + len).unwrap() + isize::try_from(relative).unwrap(),
-            )
-            .unwrap()
         }
 
         fn assert_canonical_nop_padding(mut code: &[u8]) {
@@ -10704,59 +10959,103 @@ mod tests {
                     let baseline_code = lower_x86_64_dfa(baseline, features).unwrap().0;
                     let adaptive_code = lower_x86_64_dfa(adaptive, features).unwrap().0;
                     assert_eq!(baseline_code.last(), Some(&0xc3));
-                    assert_eq!(adaptive_code[baseline_code.len() - 1], 0xc3);
                     assert!(adaptive_code.len() > baseline_code.len());
-                    assert_eq!(
-                        (adaptive_code.len() - baseline_code.len()) % X86_COLD_LINK_ALIGNMENT_BYTES,
-                        0,
-                        "{features:?} {output:?}"
-                    );
 
                     let reductions = offsets(&baseline_code, reduce);
                     assert_eq!(reductions.len(), 1, "{features:?} {output:?}");
                     let primary_hit = reductions[0] + reduce.len();
-                    assert_eq!(&baseline_code[primary_hit..primary_hit + 2], &[0x0f, 0x85]);
-                    let rewind_block = rel32_target(&baseline_code, primary_hit, 2, 6);
+                    assert_eq!(
+                        x86_test_normalized_branch_opcode(&baseline_code, primary_hit),
+                        Some(0x85)
+                    );
+                    let rewind_block = x86_test_branch_target(&baseline_code, primary_hit)
+                        .unwrap()
+                        .0;
                     assert_eq!(
                         &baseline_code[rewind_block..rewind_block + rewind.len()],
                         rewind
                     );
                     let replay_branch = rewind_block + rewind.len();
-                    assert_eq!(baseline_code[replay_branch], 0xe9);
-                    assert_eq!(adaptive_code[replay_branch], 0xe9);
-                    assert!(
-                        rel32_target(&baseline_code, replay_branch, 1, 5) < baseline_code.len()
+                    assert_eq!(
+                        x86_test_normalized_branch_opcode(&baseline_code, replay_branch),
+                        Some(0xe9)
                     );
                     assert!(
-                        rel32_target(&adaptive_code, replay_branch, 1, 5) >= baseline_code.len()
+                        x86_test_branch_target(&baseline_code, replay_branch)
+                            .unwrap()
+                            .0
+                            < baseline_code.len()
                     );
-
-                    // Disabling only the graph marker is the exact c29 code
-                    // shape. Once the dormant sparse-hit displacement is
-                    // restored, every byte through its final ret is identical.
-                    let mut normalized = adaptive_code[..baseline_code.len()].to_vec();
-                    normalized[replay_branch + 1..replay_branch + 5]
-                        .copy_from_slice(&baseline_code[replay_branch + 1..replay_branch + 5]);
-                    assert_eq!(normalized, baseline_code, "{features:?} {output:?}");
 
                     let adaptive_reductions = offsets(&adaptive_code, reduce);
                     assert_eq!(adaptive_reductions.len(), 2);
+                    let adaptive_primary_hit = adaptive_reductions[0] + reduce.len();
+                    assert_eq!(
+                        x86_test_normalized_branch_opcode(&adaptive_code, adaptive_primary_hit),
+                        Some(0x85)
+                    );
+                    let adaptive_rewind =
+                        x86_test_branch_target(&adaptive_code, adaptive_primary_hit)
+                            .unwrap()
+                            .0;
+                    assert_eq!(
+                        &adaptive_code[adaptive_rewind..adaptive_rewind + rewind.len()],
+                        rewind
+                    );
+                    let adaptive_replay = adaptive_rewind + rewind.len();
+                    assert_eq!(
+                        x86_test_normalized_branch_opcode(&adaptive_code, adaptive_replay),
+                        Some(0xe9)
+                    );
+                    let adaptive_scalar = x86_test_branch_target(&adaptive_code, adaptive_replay)
+                        .unwrap()
+                        .0;
+
+                    let remaining_materialization = [
+                        0x48, 0x89, 0xc8, // mov rax, rcx
+                        0x48, 0x29, 0xd0, // sub rax, rdx
+                    ];
+                    let cold_start = adaptive_code[..adaptive_scalar]
+                        .windows(remaining_materialization.len())
+                        .rposition(|window| window == remaining_materialization)
+                        .expect("adaptive cold joint entry");
+                    assert_eq!(
+                        adaptive_code[cold_start - 1],
+                        0xc3,
+                        "hot region ends in RET"
+                    );
+                    assert_eq!(
+                        (adaptive_code.len() - cold_start) % X86_COLD_LINK_ALIGNMENT_BYTES,
+                        0,
+                        "{features:?} {output:?}"
+                    );
+
                     let joint_hit = adaptive_reductions[1] + reduce.len();
-                    assert_eq!(&adaptive_code[joint_hit..joint_hit + 2], &[0x0f, 0x85]);
-                    let joint_miss = joint_hit + 6;
-                    assert_eq!(adaptive_code[joint_miss], 0xe9);
-                    let joint_loop = rel32_target(&adaptive_code, joint_miss, 1, 5);
-                    let rejections = adaptive_code
-                        .windows(8)
-                        .enumerate()
-                        .filter_map(|(offset, window)| {
-                            (window.starts_with(&[0x48, 0xff, 0xc2, 0xe9])
-                                && rel32_target(&adaptive_code, offset + 3, 1, 5) == joint_loop)
-                                .then_some(offset)
+                    assert_eq!(
+                        x86_test_normalized_branch_opcode(&adaptive_code, joint_hit),
+                        Some(0x85)
+                    );
+                    let joint_miss =
+                        joint_hit + x86_test_branch_target(&adaptive_code, joint_hit).unwrap().1;
+                    assert_eq!(
+                        x86_test_normalized_branch_opcode(&adaptive_code, joint_miss),
+                        Some(0xe9)
+                    );
+                    let joint_loop = x86_test_branch_target(&adaptive_code, joint_miss)
+                        .unwrap()
+                        .0;
+                    let rejections = (0..adaptive_code.len().saturating_sub(3))
+                        .filter_map(|offset| {
+                            if !adaptive_code[offset..].starts_with(&[0x48, 0xff, 0xc2]) {
+                                return None;
+                            }
+                            let branch = offset + 3;
+                            let (target, length) = x86_test_branch_target(&adaptive_code, branch)?;
+                            (target == joint_loop).then_some((offset, branch + length))
                         })
                         .collect::<Vec<_>>();
                     assert_eq!(rejections.len(), 1);
-                    let padding = &adaptive_code[rejections[0] + 8..];
+                    let padding = &adaptive_code[rejections[0].1..];
                     assert!(padding.len() < X86_COLD_LINK_ALIGNMENT_BYTES);
                     assert_canonical_nop_padding(padding);
                 }
@@ -12225,9 +12524,15 @@ mod tests {
                 .expect("loop mask KMOVQ");
             assert_eq!(&code[offset + 5..offset + 9], &[0x48, 0x0f, 0xbc, 0xc0]);
             assert_eq!(&code[offset + 9..offset + 12], &[0x48, 0x85, 0xc0]);
-            assert_eq!(&code[offset + 12..offset + 14], &[0x0f, 0x84]);
-            assert_eq!(&code[offset + 18..offset + 21], &[0x48, 0x01, 0xc2]);
-            assert_eq!(&code[offset + 21..offset + 24], &[0x49, 0x89, 0xd3]);
+            let empty_branch = offset + 12;
+            assert_eq!(
+                x86_test_normalized_branch_opcode(code, empty_branch),
+                Some(0x84)
+            );
+            let empty_branch_bytes = x86_test_branch_target(code, empty_branch).unwrap().1;
+            let record = empty_branch + empty_branch_bytes;
+            assert_eq!(&code[record..record + 3], &[0x48, 0x01, 0xc2]);
+            assert_eq!(&code[record + 3..record + 6], &[0x49, 0x89, 0xd3]);
         }
     }
 
@@ -13578,8 +13883,8 @@ mod tests {
             0x49, 0x89, 0xd2, // cursor = suffix base
             0x41, 0xbb, 64, 0, 0, 0, // exactly 64 candidate bytes
             0x49, 0x39, 0xf2, // compare before decrement: base is excluded
-            0x0f, 0x86,
         ]));
+        assert_eq!(x86_test_normalized_branch_opcode(&x86, 12), Some(0x86));
         assert!(x86.windows(5).any(|bytes| {
             bytes == [0x42, 0x0f, 0xb6, 0x04, 0x17] // haystack[--cursor]
         }));
@@ -15476,23 +15781,27 @@ mod tests {
             .unwrap();
         let accelerated_branch = x86_dispatch + 5;
         assert_eq!(
-            &direct_x86[accelerated_branch..accelerated_branch + 2],
-            &[0x0f, 0x85]
+            x86_test_normalized_branch_opcode(&direct_x86, accelerated_branch),
+            Some(0x85)
         );
         let (accelerated_transition, accelerated_branch_bytes) =
             x86_test_branch_target(&direct_x86, accelerated_branch).unwrap();
-        assert_eq!(accelerated_branch_bytes, 6);
+        assert!(matches!(accelerated_branch_bytes, 2 | 6));
 
         let ordinary_mask = accelerated_branch + accelerated_branch_bytes;
         assert_eq!(
             &direct_x86[ordinary_mask..ordinary_mask + 5],
             &[0x25, 0xff, 0xff, 0xff, 0x3f]
         );
+        let ordinary_dead_branch = ordinary_mask + 5;
         assert_eq!(
-            &direct_x86[ordinary_mask + 5..ordinary_mask + 7],
-            &[0x0f, 0x84]
+            x86_test_normalized_branch_opcode(&direct_x86, ordinary_dead_branch),
+            Some(0x84)
         );
-        let ordinary_row = ordinary_mask + 11;
+        let ordinary_row = ordinary_dead_branch
+            + x86_test_branch_target(&direct_x86, ordinary_dead_branch)
+                .unwrap()
+                .1;
         assert_eq!(
             &direct_x86[ordinary_row..ordinary_row + 5],
             &[0x4d, 0x8d, 0x54, 0x01, 0xff]
@@ -15516,7 +15825,15 @@ mod tests {
             &direct_x86[accelerated_mask..accelerated_mask + 5],
             &[0x25, 0xff, 0xff, 0xff, 0x3f]
         );
-        let accelerated_row = accelerated_mask + 11;
+        let accelerated_dead_branch = accelerated_mask + 5;
+        assert_eq!(
+            x86_test_normalized_branch_opcode(&direct_x86, accelerated_dead_branch),
+            Some(0x84)
+        );
+        let accelerated_row = accelerated_dead_branch
+            + x86_test_branch_target(&direct_x86, accelerated_dead_branch)
+                .unwrap()
+                .1;
         assert_eq!(
             &direct_x86[accelerated_row..accelerated_row + 5],
             &[0x4d, 0x8d, 0x54, 0x01, 0xff]
@@ -15740,12 +16057,18 @@ mod tests {
         let (x86_span, _) = lower_x86_64_dfa(span_layout, FeatureSet::EMPTY).unwrap();
         let accept_test = [0xa9, 0, 0, 0, 0x80];
         let accept_branches = x86_span
-            .windows(accept_test.len() + 2)
-            .filter(|window| window.starts_with(&accept_test))
-            .map(|window| &window[accept_test.len()..])
+            .windows(accept_test.len())
+            .enumerate()
+            .filter_map(|(offset, window)| {
+                (window == accept_test).then_some(offset + accept_test.len())
+            })
             .collect::<Vec<_>>();
         assert_eq!(accept_branches.len(), 2); // forward and reverse
-        assert!(accept_branches.iter().all(|branch| *branch == [0x0f, 0x88])); // js rare accept
+        assert!(
+            accept_branches.iter().all(|&branch| {
+                x86_test_normalized_branch_opcode(&x86_span, branch) == Some(0x88)
+            })
+        ); // js rare accept
 
         let filter_layout = NativeDfaLayout {
             has_reverse: false,
@@ -15772,16 +16095,23 @@ mod tests {
             ..span_layout
         };
         let (x86_filter, _) = lower_x86_64_dfa(filter_layout, FeatureSet::EMPTY).unwrap();
+        let mask_test = [0x66, 0x41, 0x0f, 0xd7, 0xc4, 0x85, 0xc0];
         assert!(
             x86_filter
-                .windows(9)
-                .any(|bytes| bytes == [0x66, 0x41, 0x0f, 0xd7, 0xc4, 0x85, 0xc0, 0x0f, 0x85]),
+                .windows(mask_test.len())
+                .enumerate()
+                .any(|(offset, bytes)| bytes == mask_test
+                    && x86_test_normalized_branch_opcode(&x86_filter, offset + mask_test.len(),)
+                        == Some(0x85)),
             "SSE2 candidate masks must branch only on the rare hit"
         );
         assert!(
             !x86_filter
-                .windows(9)
-                .any(|bytes| bytes == [0x66, 0x41, 0x0f, 0xd7, 0xc4, 0x85, 0xc0, 0x0f, 0x84]),
+                .windows(mask_test.len())
+                .enumerate()
+                .any(|(offset, bytes)| bytes == mask_test
+                    && x86_test_normalized_branch_opcode(&x86_filter, offset + mask_test.len(),)
+                        == Some(0x84)),
             "SSE2 no-hit must remain the fallthrough"
         );
 

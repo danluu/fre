@@ -5167,7 +5167,8 @@ fn lower_x86_64_context(
     assembler.instruction(&[0x49, 0x89, 0x40, 0x08])?; // pending = none
 
     assembler.instruction(&[0x4c, 0x8d, 0x0d])?; // data(%rip), r9
-    let table_displacement = assembler.code.len();
+    let table_displacement_label = assembler.label()?;
+    assembler.bind(table_displacement_label)?;
     push_bytes(&mut assembler.code, &[0; 4])?;
 
     if let Some(suffix) = terminal_suffix_search {
@@ -5507,7 +5508,9 @@ fn lower_x86_64_context(
     }
     assembler.instruction(&[0xc3])?;
 
-    let code = assembler.finish()?;
+    let finished = assembler.finish_with_label_offsets()?;
+    let table_displacement = finished.label_offset(table_displacement_label)?;
+    let code = finished.code;
     Ok((
         code,
         vec![ModuleRelocation {
@@ -10579,7 +10582,7 @@ mod tests {
                 0x41, 0x89, 0xc3, // preserve event bit
                 0x25, 0xff, 0xff, 0xff, 0x0f, // forward payload
                 0x85, 0xc0, // test nonzero payload
-                0x0f, 0x84, 0x0b, 0x00, 0x00, 0x00, // jz invalid
+                0x74, 0x0b, // jz invalid
                 0xff, 0xc8, // state + 1 -> state
                 0x41, 0x89, 0xc2, // r10d = state
                 0x44, 0x89, 0xd8, // eax = packed cell
@@ -10617,7 +10620,7 @@ mod tests {
         x86_reverse_checked.bind(x86_reverse_invalid).unwrap();
         assert_eq!(
             x86_reverse_checked.finish().unwrap(),
-            [0xa9, 0x00, 0x00, 0x00, 0x40, 0x0f, 0x84, 0, 0, 0, 0]
+            [0xa9, 0x00, 0x00, 0x00, 0x40, 0x74, 0]
         );
         let mut x86_reverse_trusted = X86Assembler::new();
         let x86_reverse_trusted_invalid = x86_reverse_trusted.label().unwrap();
