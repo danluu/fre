@@ -3445,12 +3445,33 @@ impl FixedPredicateWord64Plan {
         let candidate = haystack.get(start..end)?;
         let skipped_shift = u32::try_from(skipped_offset).ok()?;
         let mut remaining = self.nonuniversal_mask & !1_u64.checked_shl(skipped_shift)?;
+        let primary_offset = usize::from(self.anchor.offset()?);
+        if primary_offset == skipped_offset {
+            return None;
+        }
+        if !self.anchor.matches(*candidate.get(primary_offset)?)? {
+            return Some(false);
+        }
+        let primary_shift = u32::try_from(primary_offset).ok()?;
+        remaining &= !1_u64.checked_shl(primary_shift)?;
+        if let Some(secondary) = self.secondary_anchor {
+            let secondary_offset = usize::from(secondary.offset()?);
+            if secondary_offset != skipped_offset {
+                if secondary_offset == primary_offset {
+                    return None;
+                }
+                if !secondary.matches(*candidate.get(secondary_offset)?)? {
+                    return Some(false);
+                }
+                let secondary_shift = u32::try_from(secondary_offset).ok()?;
+                remaining &= !1_u64.checked_shl(secondary_shift)?;
+            }
+        }
         while remaining != 0 {
+            let bit = remaining & remaining.wrapping_neg();
             let position = usize::try_from(remaining.trailing_zeros()).ok()?;
             remaining &= remaining - 1;
             let byte = *candidate.get(position)?;
-            let shift = u32::try_from(position).ok()?;
-            let bit = 1_u64.checked_shl(shift)?;
             if self.masks[usize::from(byte)] & bit == 0 {
                 return Some(false);
             }
@@ -3484,12 +3505,25 @@ impl FixedPredicateWord64Plan {
             let shift = u32::try_from(position).ok()?;
             remaining &= !1_u64.checked_shl(shift)?;
         }
+        if let Some(fallback) = self.adaptive_fallback.as_ref() {
+            let position = usize::from(fallback.offset);
+            if position != anchor_offset && Some(position) != secondary_offset {
+                let shift = u32::try_from(position).ok()?;
+                let bit = 1_u64.checked_shl(shift)?;
+                if remaining & bit == 0 {
+                    return None;
+                }
+                if self.masks[usize::from(*candidate.get(position)?)] & bit == 0 {
+                    return Some(false);
+                }
+                remaining &= !bit;
+            }
+        }
         while remaining != 0 {
+            let bit = remaining & remaining.wrapping_neg();
             let position = usize::try_from(remaining.trailing_zeros()).ok()?;
             remaining &= remaining - 1;
             let byte = *candidate.get(position)?;
-            let shift = u32::try_from(position).ok()?;
-            let bit = 1_u64.checked_shl(shift)?;
             if self.masks[usize::from(byte)] & bit == 0 {
                 return Some(false);
             }
@@ -3944,14 +3978,49 @@ impl FixedPredicateWord64Plan {
                 },
             )?;
         }
+        if let Some(fallback) = self.adaptive_fallback.as_ref() {
+            let position = usize::from(fallback.offset);
+            if position != anchor_offset && Some(position) != secondary_offset {
+                let shift = u32::try_from(position).map_err(|_| {
+                    ReduceError::ArithmeticOverflow {
+                        computation: "adaptive fallback verification shift",
+                    }
+                })?;
+                let bit = 1_u64.checked_shl(shift).ok_or(
+                    ReduceError::ArithmeticOverflow {
+                        computation: "adaptive fallback verification bit",
+                    },
+                )?;
+                if remaining & bit == 0 {
+                    return Err(ReduceError::InternalInvariant(
+                        "adaptive fallback was not a remaining predicate",
+                    ));
+                }
+                if !self.anchor_candidate_position_matches_bit(
+                    candidate,
+                    position,
+                    bit,
+                    predicate_checks,
+                )? {
+                    return Ok(false);
+                }
+                remaining &= !bit;
+            }
+        }
         while remaining != 0 {
+            let bit = remaining & remaining.wrapping_neg();
             let position = usize::try_from(remaining.trailing_zeros()).map_err(|_| {
                 ReduceError::ArithmeticOverflow {
                     computation: "predicate verification position",
                 }
             })?;
             remaining &= remaining - 1;
-            if !self.anchor_candidate_position_matches(candidate, position, predicate_checks)? {
+            if !self.anchor_candidate_position_matches_bit(
+                candidate,
+                position,
+                bit,
+                predicate_checks,
+            )? {
                 return Ok(false);
             }
         }
@@ -3985,24 +4054,104 @@ impl FixedPredicateWord64Plan {
                 computation: "adaptive fallback verification bit",
             },
         )?;
+        let primary_offset = usize::from(self.anchor.offset().ok_or(
+            ReduceError::InternalInvariant("adaptive fallback lost its primary anchor"),
+        )?);
+        if primary_offset == skipped_offset {
+            return Err(ReduceError::InternalInvariant(
+                "adaptive fallback duplicated the primary anchor",
+            ));
+        }
+        *predicate_checks = predicate_checks.checked_add(1).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "actual predicate checks",
+            },
+        )?;
+        if !self
+            .anchor
+            .matches(*candidate.get(primary_offset).ok_or(
+                ReduceError::InternalInvariant("adaptive primary escaped the candidate"),
+            )?)
+            .ok_or(ReduceError::InternalInvariant(
+                "adaptive primary selected Shift-And",
+            ))?
+        {
+            return Ok(false);
+        }
+        let primary_shift = u32::try_from(primary_offset).map_err(|_| {
+            ReduceError::ArithmeticOverflow {
+                computation: "adaptive primary verification shift",
+            }
+        })?;
+        remaining &= !1_u64.checked_shl(primary_shift).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "adaptive primary verification bit",
+            },
+        )?;
+        if let Some(secondary) = self.secondary_anchor {
+            let secondary_offset = usize::from(secondary.offset().ok_or(
+                ReduceError::InternalInvariant("adaptive secondary selected Shift-And"),
+            )?);
+            if secondary_offset != skipped_offset {
+                if secondary_offset == primary_offset {
+                    return Err(ReduceError::InternalInvariant(
+                        "adaptive secondary duplicated the primary anchor",
+                    ));
+                }
+                *predicate_checks = predicate_checks.checked_add(1).ok_or(
+                    ReduceError::ArithmeticOverflow {
+                        computation: "actual predicate checks",
+                    },
+                )?;
+                if !secondary
+                    .matches(*candidate.get(secondary_offset).ok_or(
+                        ReduceError::InternalInvariant(
+                            "adaptive secondary escaped the candidate",
+                        ),
+                    )?)
+                    .ok_or(ReduceError::InternalInvariant(
+                        "adaptive secondary selected Shift-And",
+                    ))?
+                {
+                    return Ok(false);
+                }
+                let secondary_shift = u32::try_from(secondary_offset).map_err(|_| {
+                    ReduceError::ArithmeticOverflow {
+                        computation: "adaptive secondary verification shift",
+                    }
+                })?;
+                remaining &= !1_u64.checked_shl(secondary_shift).ok_or(
+                    ReduceError::ArithmeticOverflow {
+                        computation: "adaptive secondary verification bit",
+                    },
+                )?;
+            }
+        }
         while remaining != 0 {
+            let bit = remaining & remaining.wrapping_neg();
             let position = usize::try_from(remaining.trailing_zeros()).map_err(|_| {
                 ReduceError::ArithmeticOverflow {
                     computation: "adaptive predicate verification position",
                 }
             })?;
             remaining &= remaining - 1;
-            if !self.anchor_candidate_position_matches(candidate, position, predicate_checks)? {
+            if !self.anchor_candidate_position_matches_bit(
+                candidate,
+                position,
+                bit,
+                predicate_checks,
+            )? {
                 return Ok(false);
             }
         }
         Ok(true)
     }
 
-    fn anchor_candidate_position_matches(
+    fn anchor_candidate_position_matches_bit(
         &self,
         candidate: &[u8],
         position: usize,
+        bit: u64,
         predicate_checks: &mut usize,
     ) -> Result<bool, ReduceError> {
         *predicate_checks =
@@ -4016,14 +4165,6 @@ impl FixedPredicateWord64Plan {
             .ok_or(ReduceError::InternalInvariant(
                 "fixed predicate candidate escaped the input",
             ))?;
-        let shift = u32::try_from(position).map_err(|_| ReduceError::ArithmeticOverflow {
-            computation: "actual predicate bit shift",
-        })?;
-        let bit = 1_u64
-            .checked_shl(shift)
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "actual predicate bit",
-            })?;
         Ok(self.masks[usize::from(byte)] & bit != 0)
     }
 
