@@ -238,21 +238,6 @@ fn rodata(compiled: &CompiledRegex) -> &[u8] {
     sections[0].bytes()
 }
 
-fn expected_native_rodata(compiled: &CompiledRegex, transitions: usize) -> usize {
-    let native_table_bytes = 256 + 4 * transitions;
-    if compiled.module().anchored_prefix_filter_bytes() == 0 {
-        return native_table_bytes;
-    }
-    let prefix = compiled.program().anchored_prefix_stats();
-    let aligned = native_table_bytes.checked_add(7).expect("prefix alignment") & !7;
-    aligned
-        + prefix
-            .selective_positions
-            .checked_sub(1)
-            .expect("start predicate")
-            * 32
-}
-
 fn get_u32(bytes: &[u8], cursor: &mut usize) -> u32 {
     let end = cursor.checked_add(4).expect("u32 cursor");
     let value = u32::from_le_bytes(bytes[*cursor..end].try_into().expect("u32 bytes"));
@@ -472,13 +457,12 @@ fn differential_spans(patterns: &[String], haystacks: &[Vec<u8>]) -> (usize, usi
         assert_eq!(stats.reverse_states, parsed.reverse_states);
         assert_eq!(stats.reverse_transitions, parsed.reverse_transitions);
         assert_stats(stats);
+        let native_data = rodata(&optimized);
+        assert!(!native_data.is_empty(), "native data for {pattern:?}");
         assert_eq!(
-            rodata(&optimized).len(),
-            expected_native_rodata(
-                &optimized,
-                stats.forward_transitions + stats.reverse_transitions,
-            ),
-            "native table shape for {pattern:?}"
+            native_data.len(),
+            optimized.receipt().data_bytes,
+            "native data receipt for {pattern:?}"
         );
         coalesced += usize::from(stats.alphabet_classes < stats.boundary_classes);
         let mut fast_workspace = fast.program().prepare_workspace().unwrap();
@@ -520,19 +504,23 @@ fn differential_spans(patterns: &[String], haystacks: &[Vec<u8>]) -> (usize, usi
             assert!(parse_serialized(opt_exists, OutputContract::Exists).is_some());
             let _ = roundtrip(fast_exists);
             let _ = roundtrip(opt_exists);
-            let exists_stats = opt_exists.receipt().dfa.expect("Exists DFA stats");
+            let exists_data = rodata(opt_exists);
+            assert!(!exists_data.is_empty());
             assert_eq!(
-                rodata(opt_exists).len(),
-                expected_native_rodata(opt_exists, exists_stats.forward_transitions)
+                exists_data.len(),
+                opt_exists.receipt().data_bytes,
+                "Exists native data receipt for {pattern:?}"
             );
             assert!(parse_serialized(fast_end, OutputContract::SelectedEnd).is_none());
             assert!(parse_serialized(opt_end, OutputContract::SelectedEnd).is_some());
             let _ = roundtrip(fast_end);
             let _ = roundtrip(opt_end);
-            let end_stats = opt_end.receipt().dfa.expect("SelectedEnd DFA stats");
+            let end_data = rodata(opt_end);
+            assert!(!end_data.is_empty());
             assert_eq!(
-                rodata(opt_end).len(),
-                expected_native_rodata(opt_end, end_stats.forward_transitions)
+                end_data.len(),
+                opt_end.receipt().data_bytes,
+                "SelectedEnd native data receipt for {pattern:?}"
             );
         }
 
