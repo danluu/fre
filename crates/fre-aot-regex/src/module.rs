@@ -831,10 +831,6 @@ const CELL_ACCEPTS: u32 = 1_u32 << 31;
 /// accelerator dispatcher. Reverse cells deliberately leave it clear.
 const CELL_ACCELERATED: u32 = 1_u32 << 30;
 const CELL_NEXT_MASK: u32 = CELL_ACCELERATED - 1;
-/// Subtracting the live-token bias turns every ordinary transition into its
-/// absolute row offset. This upper bound is derived entirely from the packed
-/// cell layout: dead and either flagged form lie outside the inclusive range.
-const CELL_ORDINARY_DECODED_MAX: u32 = CELL_NEXT_MASK - 1;
 const NO_DFA_STATE: u32 = u32::MAX;
 /// Optional reverse sidecars remain a bounded optimization artifact. The
 /// portable constructor accounts for eight-byte logical cells, while native
@@ -3790,23 +3786,6 @@ fn x86_emit_table_lookup(
     Ok(())
 }
 
-/// Classify the packed cell and materialize its next row on the ordinary-live
-/// path. `packed - 1 <= CELL_NEXT_MASK - 1` exactly describes an unflagged,
-/// non-dead cell, so the common path needs only one conditional branch. EAX
-/// holds the decoded absolute row offset after the subtraction.
-fn x86_emit_ordinary_live_row(
-    assembler: &mut X86Assembler,
-    exceptional: X86Label,
-) -> Result<(), ObjectError> {
-    assembler.instruction(&[0xff, 0xc8])?; // dec eax (remove the live-token bias)
-    let mut compare = vec![0x3d]; // cmp eax, maximum ordinary decoded row
-    compare.extend_from_slice(&CELL_ORDINARY_DECODED_MAX.to_le_bytes());
-    assembler.instruction(&compare)?;
-    assembler.branch(&[0x0f, 0x87], exceptional)?; // ja
-    assembler.instruction(&[0x4d, 0x8d, 0x14, 0x01])?; // lea (r9, rax), r10
-    Ok(())
-}
-
 fn x86_set_row(assembler: &mut X86Assembler, table_offset: u32) -> Result<(), ObjectError> {
     let mut instruction = vec![0x4d, 0x8d, 0x91];
     instruction.extend_from_slice(&table_offset.to_le_bytes());
@@ -5929,7 +5908,6 @@ fn lower_x86_64_dfa(
     let scan = assembler.label()?;
     let scalar_scan = assembler.label()?;
     let scalar_transition = assembler.label()?;
-    let exceptional_transition = assembler.label()?;
     let accelerated_transition = assembler.label()?;
     let prefix_check = assembler.label()?;
     let prefix_vector_check = assembler.label()?;
@@ -5955,7 +5933,6 @@ fn lower_x86_64_dfa(
     let invalid = assembler.label()?;
     let done = assembler.label()?;
     let reverse_loop = assembler.label()?;
-    let reverse_exceptional_transition = assembler.label()?;
     let record_reverse_start = assembler.label()?;
     let reverse_continue = assembler.label()?;
     let reverse_finish = assembler.label()?;
@@ -6354,12 +6331,6 @@ fn lower_x86_64_dfa(
     assembler.branch(&[0x0f, 0x83], finish)?; // position >= end
     x86_emit_table_lookup(&mut assembler, layout.transitions)?;
     assembler.instruction(&[0x48, 0xff, 0xc2])?; // position += 1
-    x86_emit_ordinary_live_row(&mut assembler, exceptional_transition)?;
-    // The overwhelmingly common live edge resumes table execution directly.
-    assembler.branch(&[0xe9], scalar_transition)?;
-
-    assembler.bind(exceptional_transition)?;
-    assembler.instruction(&[0xff, 0xc0])?; // restore the packed cell in eax
     assembler.instruction(&[0xa9, 0x00, 0x00, 0x00, 0x80])?;
     assembler.branch(&[0x0f, 0x88], accept)?;
     assembler.bind(after_accept)?;
@@ -6368,6 +6339,7 @@ fn lower_x86_64_dfa(
     assembler.instruction(&[0x25, 0xff, 0xff, 0xff, 0x3f])?;
     assembler.branch(&[0x0f, 0x84], finish)?;
     assembler.instruction(&[0x4d, 0x8d, 0x54, 0x01, 0xff])?;
+    // The overwhelmingly common live edge resumes table execution directly.
     assembler.branch(&[0xe9], scalar_transition)?;
 
     assembler.bind(accelerated_transition)?;
@@ -6432,17 +6404,10 @@ fn lower_x86_64_dfa(
             assembler.branch(&[0x0f, 0x86], reverse_finish)?; // cursor <= window_start
             assembler.instruction(&[0x48, 0xff, 0xca])?;
             x86_emit_table_lookup(&mut assembler, layout.transitions)?;
-            x86_emit_ordinary_live_row(&mut assembler, reverse_exceptional_transition)?;
-            assembler.branch(&[0xe9], reverse_loop)?;
-
-            assembler.bind(reverse_exceptional_transition)?;
-            assembler.instruction(&[0xff, 0xc0])?; // restore the packed cell in eax
             assembler.instruction(&[0xa9, 0x00, 0x00, 0x00, 0x80])?;
             assembler.branch(&[0x0f, 0x88], record_reverse_start)?;
             assembler.bind(reverse_continue)?;
-            // Reverse cells never set acceleration, but their canonical
-            // absolute-row payload still occupies only the low 30 bits.
-            assembler.instruction(&[0x25, 0xff, 0xff, 0xff, 0x3f])?;
+            assembler.instruction(&[0x25, 0xff, 0xff, 0xff, 0x7f])?;
             assembler.branch(&[0x0f, 0x84], reverse_finish)?;
             assembler.instruction(&[0x4d, 0x8d, 0x54, 0x01, 0xff])?;
             assembler.branch(&[0xe9], reverse_loop)?;
@@ -7250,6 +7215,10 @@ fn aarch64_and_low_w(destination: u8, source: u8, bits: u8) -> Result<u32, Objec
         | aarch64_reg(destination, 0)?)
 }
 
+fn aarch64_and_low_31(destination: u8, source: u8) -> Result<u32, ObjectError> {
+    aarch64_and_low_w(destination, source, 31)
+}
+
 fn aarch64_and_low_x(destination: u8, source: u8, bits: u8) -> Result<u32, ObjectError> {
     let mask_end = bits
         .checked_sub(1)
@@ -7396,25 +7365,6 @@ fn aarch64_emit_table_lookup(
             assembler.instruction(aarch64_load_w_uxtw(8, 11, 8)?)?;
         }
     }
-    Ok(())
-}
-
-/// Decode an ordinary live packed cell and materialize its absolute next row.
-/// After subtracting the live-token bias, every packable exceptional cell has
-/// a nonzero value above the payload bits. The sole excluded bit pattern is an
-/// accelerated dead cell, which packing rejects before native data is emitted.
-fn aarch64_emit_ordinary_live_row(
-    assembler: &mut Aarch64Assembler,
-    exceptional: Aarch64Label,
-) -> Result<(), ObjectError> {
-    let flag_shift = u8::try_from(CELL_ACCELERATED.trailing_zeros())
-        .map_err(|_| ObjectError::ArithmeticOverflow("packed-cell flag shift"))?;
-    // The W-form subtraction deliberately zero-extends decoded into X6 for
-    // both the following X-form shift and the 64-bit table-base addition.
-    assembler.instruction(aarch64_sub_w_imm(6, 8, 1)?)?;
-    assembler.instruction(aarch64_lsr_x_imm(12, 6, flag_shift)?)?;
-    assembler.branch_nonzero_w(12, exceptional)?;
-    assembler.instruction(aarch64_add_x_reg(11, 5, 6)?)?;
     Ok(())
 }
 
@@ -8578,7 +8528,6 @@ fn lower_aarch64_dfa_for_operating_system(
     let scan = assembler.label()?;
     let scalar_scan = assembler.label()?;
     let scalar_transition = assembler.label()?;
-    let exceptional_transition = assembler.label()?;
     let accelerated_transition = assembler.label()?;
     let prefix_check = assembler.label()?;
     let prefix_vector_check = assembler.label()?;
@@ -8605,7 +8554,6 @@ fn lower_aarch64_dfa_for_operating_system(
     let invalid = assembler.label()?;
     let done = assembler.label()?;
     let reverse_scan = assembler.label()?;
-    let reverse_exceptional_transition = assembler.label()?;
     let record_reverse_start = assembler.label()?;
     let reverse_continue = assembler.label()?;
     let reverse_finish = assembler.label()?;
@@ -9069,10 +9017,6 @@ fn lower_aarch64_dfa_for_operating_system(
     assembler.branch_cond(AARCH64_HS, finish)?;
     aarch64_emit_table_lookup(&mut assembler, layout.transitions)?;
     assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
-    aarch64_emit_ordinary_live_row(&mut assembler, exceptional_transition)?;
-    assembler.branch(scalar_transition)?;
-
-    assembler.bind(exceptional_transition)?;
     assembler.branch_bit_set_w(8, 31, accept)?;
     assembler.bind(after_accept)?;
     assembler.branch_bit_set_w(8, 30, accelerated_transition)?;
@@ -9145,15 +9089,9 @@ fn lower_aarch64_dfa_for_operating_system(
             assembler.branch_cond(AARCH64_LS, reverse_finish)?;
             assembler.instruction(aarch64_sub_x_imm(2, 2, 1)?)?;
             aarch64_emit_table_lookup(&mut assembler, layout.transitions)?;
-            aarch64_emit_ordinary_live_row(&mut assembler, reverse_exceptional_transition)?;
-            assembler.branch(reverse_scan)?;
-
-            assembler.bind(reverse_exceptional_transition)?;
             assembler.branch_bit_set_w(8, 31, record_reverse_start)?;
             assembler.bind(reverse_continue)?;
-            // Keep the same low-30-bit payload contract as forward cells;
-            // reverse packing proves the acceleration flag is clear.
-            assembler.instruction(aarch64_and_low_w(6, 8, 30)?)?;
+            assembler.instruction(aarch64_and_low_31(6, 8)?)?;
             assembler.branch_zero_w(6, reverse_finish)?;
             assembler.instruction(aarch64_sub_w_imm(6, 6, 1)?)?;
             assembler.instruction(
@@ -9344,20 +9282,6 @@ mod tests {
         let after = isize::try_from(instruction.checked_add(length)?).ok()?;
         let target = after.checked_add(displacement)?;
         Some((usize::try_from(target).ok()?, length))
-    }
-
-    fn aarch64_test_branch_target(instructions: &[u32], instruction: usize) -> Option<usize> {
-        let word = *instructions.get(instruction)?;
-        let (raw_immediate, bits) = if word & 0x7e00_0000 == 0x3400_0000 {
-            ((word >> 5) & 0x7_ffff, 19_u32) // CBZ/CBNZ
-        } else if word & 0xfc00_0000 == 0x1400_0000 {
-            (word & 0x03ff_ffff, 26_u32) // B/BL
-        } else {
-            return None;
-        };
-        let signed = (i64::from(raw_immediate) << (64 - bits)) >> (64 - bits);
-        let source = i64::try_from(instruction).ok()?;
-        usize::try_from(source.checked_add(signed)?).ok()
     }
 
     #[test]
@@ -14000,63 +13924,6 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_live_cell_classifier_is_exhaustive_over_packable_layouts() {
-        // Exhaust every value in reduced packed layouts, not merely selected
-        // regex tables. The same algebra scales to the production 30-bit
-        // payload because neither classifier depends on a state or pattern.
-        for payload_bits in 1_u32..=16 {
-            let payload_mask = (1_u32 << payload_bits) - 1;
-            let decoded_maximum = payload_mask - 1;
-            for packed in 0_u32..(4_u32 << payload_bits) {
-                let payload = packed & payload_mask;
-                let flags = packed >> payload_bits;
-                let accelerated = flags & 1 != 0;
-                let packable = !(accelerated && payload == 0);
-                if !packable {
-                    continue;
-                }
-
-                let expected_ordinary = flags == 0 && payload != 0;
-                let decoded = packed.wrapping_sub(1);
-                let x86_classification = decoded <= decoded_maximum;
-                let aarch64_classification = decoded >> payload_bits == 0;
-                assert_eq!(x86_classification, expected_ordinary);
-                assert_eq!(aarch64_classification, expected_ordinary);
-            }
-        }
-
-        assert_eq!(CELL_ORDINARY_DECODED_MAX, CELL_NEXT_MASK - 1);
-        for flags in [
-            0,
-            CELL_ACCELERATED,
-            CELL_ACCEPTS,
-            CELL_ACCELERATED | CELL_ACCEPTS,
-        ] {
-            for payload in [0, 1, 2, CELL_NEXT_MASK - 1, CELL_NEXT_MASK] {
-                if flags & CELL_ACCELERATED != 0 && payload == 0 {
-                    continue;
-                }
-                let packed = flags | payload;
-                let decoded = packed.wrapping_sub(1);
-                let expected_ordinary = flags == 0 && payload != 0;
-                assert_eq!(decoded <= CELL_ORDINARY_DECODED_MAX, expected_ordinary);
-                assert_eq!(
-                    decoded >> CELL_ACCELERATED.trailing_zeros() == 0,
-                    expected_ordinary
-                );
-            }
-        }
-
-        // Accelerator-only dead is the sole subtract-and-shift alias. Packing
-        // rejects it, and consistently rejects its accepting-tagged variant.
-        for accepts in [false, true] {
-            assert!(
-                pack_native_cell_with_acceleration(NO_DFA_STATE, accepts, 0, 4, 1, true).is_err()
-            );
-        }
-    }
-
-    #[test]
     fn packed_native_cell_model_exhaustively_preserves_flags_and_absolute_tokens() {
         let machine_offsets = [0_usize, CLASS_MAP_BYTES, 4096];
         let row_widths = [4_usize, 20, DIRECT_BYTE_ROW_BYTES];
@@ -14541,182 +14408,6 @@ mod tests {
                 .filter(|&&word| word == aarch64_load_w_uxtw(8, 11, 8).unwrap())
                 .count(),
             2 + usize::from(direct_reverse.seeded_reverse.is_some())
-        );
-    }
-
-    #[test]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the exact forward/reverse instruction audit covers both native ISAs"
-    )]
-    fn ordinary_live_cells_have_one_branch_hot_paths_and_ordered_cold_paths() {
-        let layout = NativeDfaLayout {
-            transitions: TransitionLayout::ClassMapped,
-            forward_offset: 256,
-            reverse_offset: 512,
-            asimd_lane_index_offset: None,
-            initial_pending: false,
-            initial_terminal: false,
-            has_reverse: true,
-            exact_span_width: None,
-            exact_prefix_match_width: None,
-            output: OutputContract::Span,
-            start_filter: None,
-            suffix_filter: None,
-            declined_redundant_root_reverse: false,
-            seeded_reverse: None,
-            loop_skip: None,
-            vector_filter: None,
-            prefix_filter: None,
-            prefix_relation: None,
-            prefix_block: None,
-            prefix_fast_forward: None,
-        };
-
-        let x86 = lower_x86_64_dfa(layout, FeatureSet::EMPTY).unwrap().0;
-        let mut x86_classifier_prefix = vec![0xff, 0xc8, 0x3d];
-        x86_classifier_prefix.extend_from_slice(&CELL_ORDINARY_DECODED_MAX.to_le_bytes());
-        x86_classifier_prefix.extend_from_slice(&[0x0f, 0x87]);
-        let x86_classifiers = x86
-            .windows(x86_classifier_prefix.len())
-            .enumerate()
-            .filter_map(|(offset, bytes)| {
-                (bytes == x86_classifier_prefix.as_slice()).then_some(offset)
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(x86_classifiers.len(), 2, "forward and span-reverse");
-
-        let mut x86_exceptional = Vec::new();
-        for (index, &classifier) in x86_classifiers.iter().enumerate() {
-            let exceptional_branch = classifier + 7;
-            let (exceptional, exceptional_branch_bytes) =
-                x86_test_branch_target(&x86, exceptional_branch).unwrap();
-            assert_eq!(exceptional_branch_bytes, 6);
-            x86_exceptional.push(exceptional);
-
-            let hot_row = exceptional_branch + exceptional_branch_bytes;
-            assert_eq!(&x86[hot_row..hot_row + 4], &[0x4d, 0x8d, 0x14, 0x01]);
-            let (loop_target, loop_branch_bytes) =
-                x86_test_branch_target(&x86, hot_row + 4).unwrap();
-            assert_eq!(loop_branch_bytes, 2, "hot backedge must relax");
-            let expected_loop_head = if index == 0 {
-                &[0x48, 0x39, 0xca][..]
-            } else {
-                &[0x48, 0x39, 0xf2][..]
-            };
-            assert_eq!(
-                &x86[loop_target..loop_target + expected_loop_head.len()],
-                expected_loop_head
-            );
-            assert_eq!(exceptional, hot_row + 4 + loop_branch_bytes);
-            assert_eq!(
-                &x86[exceptional..exceptional + 9],
-                &[0xff, 0xc0, 0xa9, 0, 0, 0, 0x80, 0x0f, 0x88]
-            );
-        }
-
-        let forward_exceptional = x86_exceptional[0];
-        let forward_after_accept = forward_exceptional + 13;
-        assert_eq!(
-            &x86[forward_after_accept..forward_after_accept + 7],
-            &[0xa9, 0, 0, 0, 0x40, 0x0f, 0x85],
-            "forward exceptional order must be accept then accelerator"
-        );
-        let (_, accelerator_branch_bytes) =
-            x86_test_branch_target(&x86, forward_after_accept + 5).unwrap();
-        let forward_dead = forward_after_accept + 5 + accelerator_branch_bytes;
-        assert_eq!(
-            &x86[forward_dead..forward_dead + 7],
-            &[0x25, 0xff, 0xff, 0xff, 0x3f, 0x0f, 0x84],
-            "dead handling must follow both flag handlers"
-        );
-
-        let reverse_exceptional = x86_exceptional[1];
-        let reverse_after_accept = reverse_exceptional + 13;
-        assert_eq!(
-            &x86[reverse_after_accept..reverse_after_accept + 7],
-            &[0x25, 0xff, 0xff, 0xff, 0x3f, 0x0f, 0x84],
-            "span-reverse dead handling must follow acceptance"
-        );
-
-        let aarch64 = lower_aarch64_dfa(layout, FeatureSet::EMPTY).unwrap().0;
-        let aarch64 = aarch64
-            .chunks_exact(4)
-            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
-            .collect::<Vec<_>>();
-        let flag_shift = u8::try_from(CELL_ACCELERATED.trailing_zeros()).unwrap();
-        let subtract_bias = aarch64_sub_w_imm(6, 8, 1).unwrap();
-        let classify_flags = aarch64_lsr_x_imm(12, 6, flag_shift).unwrap();
-        let hot_row = aarch64_add_x_reg(11, 5, 6).unwrap();
-        assert_eq!(subtract_bias, 0x5100_0506); // sub w6, w8, #1; zero-extends x6
-        assert_eq!(classify_flags, 0xd35e_fccc); // lsr x12, x6, #30
-        assert_eq!(hot_row, 0x8b06_00ab); // add x11, x5, x6
-        assert_eq!(aarch64_and_low_w(6, 8, 30).unwrap(), 0x1200_7506);
-        let aarch64_classifiers = aarch64
-            .windows(5)
-            .enumerate()
-            .filter_map(|(offset, words)| {
-                (words[0] == subtract_bias
-                    && words[1] == classify_flags
-                    && words[2] & 0xff00_001f == 0x3500_000c
-                    && words[3] == hot_row
-                    && words[4] & 0xfc00_0000 == 0x1400_0000)
-                    .then_some(offset)
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(aarch64_classifiers.len(), 2, "forward and span-reverse");
-
-        let mut aarch64_exceptional = Vec::new();
-        for (index, &classifier) in aarch64_classifiers.iter().enumerate() {
-            assert_eq!(
-                aarch64[classifier + 2],
-                0x3500_006c,
-                "cbnz w12 must skip ADD and B to the adjacent cold path"
-            );
-            let exceptional = aarch64_test_branch_target(&aarch64, classifier + 2).unwrap();
-            let loop_target = aarch64_test_branch_target(&aarch64, classifier + 4).unwrap();
-            aarch64_exceptional.push(exceptional);
-            assert_eq!(
-                aarch64[loop_target],
-                if index == 0 {
-                    aarch64_cmp_x(2, 3).unwrap()
-                } else {
-                    aarch64_cmp_x(2, 9).unwrap()
-                }
-            );
-            assert_eq!(exceptional, classifier + 5);
-            assert_eq!(
-                aarch64[exceptional] & 0xfff8_001f,
-                0x37f8_0008,
-                "acceptance must be the first exceptional test"
-            );
-        }
-
-        let forward_exceptional = aarch64_exceptional[0];
-        assert_eq!(
-            aarch64[forward_exceptional + 1] & 0xfff8_001f,
-            0x37f0_0008,
-            "accelerator handling must follow acceptance"
-        );
-        assert_eq!(
-            aarch64[forward_exceptional + 2],
-            aarch64_and_low_w(6, 8, 30).unwrap()
-        );
-        assert_eq!(
-            aarch64[forward_exceptional + 3] & 0xff00_001f,
-            0x3400_0006,
-            "dead handling must follow both flag handlers"
-        );
-
-        let reverse_exceptional = aarch64_exceptional[1];
-        assert_eq!(
-            aarch64[reverse_exceptional + 1],
-            aarch64_and_low_w(6, 8, 30).unwrap()
-        );
-        assert_eq!(
-            aarch64[reverse_exceptional + 2] & 0xff00_001f,
-            0x3400_0006,
-            "span-reverse dead handling must follow acceptance"
         );
     }
 
