@@ -4115,6 +4115,95 @@ impl X86Assembler {
         Ok(())
     }
 
+    fn remove_unreachable_branches(&self, removed: &mut [bool]) -> Result<(), ObjectError> {
+        if removed.len() != self.fixups.len() {
+            return Err(ObjectError::InvalidModule("x86 reachability bitmap extent"));
+        }
+        let instruction_count = self
+            .instruction_offsets
+            .len()
+            .checked_sub(1)
+            .ok_or(ObjectError::InvalidModule("x86 instruction sentinel"))?;
+        if instruction_count == 0 {
+            return Ok(());
+        }
+
+        let mut reachable = Vec::new();
+        reachable
+            .try_reserve_exact(instruction_count)
+            .map_err(|_| ObjectError::InvalidModule("x86 reachability allocation failed"))?;
+        reachable.resize(instruction_count, false);
+        let mut worklist = Vec::new();
+        worklist
+            .try_reserve_exact(instruction_count)
+            .map_err(|_| ObjectError::InvalidModule("x86 reachability allocation failed"))?;
+        reachable[0] = true;
+        worklist.push(0_usize);
+
+        while let Some(index) = worklist.pop() {
+            let instruction = self.instruction_offsets[index];
+            let next = index.checked_add(1).ok_or(ObjectError::ArithmeticOverflow(
+                "x86 reachability successor",
+            ))?;
+            let enqueue = |successor: usize, reachable: &mut [bool], worklist: &mut Vec<usize>| {
+                if successor < instruction_count && !reachable[successor] {
+                    reachable[successor] = true;
+                    worklist.push(successor);
+                }
+            };
+
+            if let Ok(fixup_index) = self
+                .fixups
+                .binary_search_by_key(&instruction, |candidate| candidate.instruction)
+            {
+                if removed[fixup_index] {
+                    enqueue(next, &mut reachable, &mut worklist);
+                    continue;
+                }
+                let fixup = self.fixups[fixup_index];
+                let target = self.labels[fixup.label]
+                    .ok_or(ObjectError::InvalidModule("unbound x86 branch label"))?;
+                let target = self
+                    .instruction_offsets
+                    .binary_search(&target)
+                    .map_err(|_| {
+                        ObjectError::InvalidModule(
+                            "x86 branch target is not an instruction boundary",
+                        )
+                    })?;
+                enqueue(target, &mut reachable, &mut worklist);
+                if fixup.short_opcode != Some(0xeb) {
+                    enqueue(next, &mut reachable, &mut worklist);
+                }
+                continue;
+            }
+
+            let end = self.instruction_offsets[next];
+            let bytes = self
+                .code
+                .get(instruction..end)
+                .ok_or(ObjectError::InvalidModule("x86 instruction outside code"))?;
+            let terminates = bytes == [0xc3] || (bytes.len() == 5 && bytes[0] == 0xe9);
+            if !terminates {
+                enqueue(next, &mut reachable, &mut worklist);
+            }
+        }
+
+        for (index, fixup) in self.fixups.iter().enumerate() {
+            let instruction = self
+                .instruction_offsets
+                .binary_search(&fixup.instruction)
+                .map_err(|_| ObjectError::InvalidModule("x86 fixup instruction boundary"))?;
+            if instruction >= instruction_count {
+                return Err(ObjectError::InvalidModule("x86 fixup after code"));
+            }
+            if !reachable[instruction] {
+                removed[index] = true;
+            }
+        }
+        Ok(())
+    }
+
     fn finish_with_label_offsets(mut self) -> Result<X86Finished, ObjectError> {
         self.instruction_offsets.push(self.code.len());
         for fixup in &self.fixups {
@@ -4140,6 +4229,7 @@ impl X86Assembler {
         removed.resize(self.fixups.len(), false);
         self.invert_branch_fallthroughs(&mut removed)?;
         self.thread_branch_targets(&removed)?;
+        self.remove_unreachable_branches(&mut removed)?;
         let mut shortened = Vec::new();
         shortened
             .try_reserve_exact(self.fixups.len())
@@ -11155,24 +11245,25 @@ mod tests {
         let near = assembler.label().unwrap();
         assembler.bind(near).unwrap();
         assembler.instruction(&[0x90]).unwrap();
-        assembler.branch(&[0xe9], near).unwrap();
         assembler.branch(&[0x0f, 0x85], near).unwrap();
+        assembler.branch(&[0xe9], near).unwrap();
+        assert_eq!(assembler.finish().unwrap(), [0x90, 0x75, 0xfd, 0xeb, 0xfb]);
 
+        let mut assembler = X86Assembler::new();
         let far = assembler.label().unwrap();
         assembler.bind(far).unwrap();
         for _ in 0..128 {
             assembler.instruction(&[0x90]).unwrap();
         }
         assembler.branch(&[0xe9], far).unwrap();
+        let code = assembler.finish().unwrap();
+        assert_eq!(&code[128..], &[0xe9, 0x7b, 0xff, 0xff, 0xff]);
 
+        let mut assembler = X86Assembler::new();
         let forward = assembler.label().unwrap();
         assembler.branch(&[0xe9], forward).unwrap();
         assembler.bind(forward).unwrap();
-
-        let code = assembler.finish().unwrap();
-        assert_eq!(&code[..5], &[0x90, 0xeb, 0xfd, 0x75, 0xfb]);
-        assert_eq!(&code[133..138], &[0xe9, 0x7b, 0xff, 0xff, 0xff]);
-        assert_eq!(&code[138..], &[]);
+        assert!(assembler.finish().unwrap().is_empty());
     }
 
     #[test]
@@ -11480,6 +11571,28 @@ mod tests {
         assembler.branch(&[0xe9], looping).unwrap();
         assembler.bind(taken).unwrap();
         assert_eq!(assembler.finish().unwrap(), [0x74, 0x02, 0xeb, 0xfe]);
+    }
+
+    #[test]
+    fn x86_assembler_removes_unreachable_branches_after_terminators() {
+        let mut assembler = X86Assembler::new();
+        let first = assembler.label().unwrap();
+        let second = assembler.label().unwrap();
+        assembler.instruction(&[0xc3]).unwrap();
+        assembler.bind(first).unwrap();
+        assembler.branch(&[0xe9], second).unwrap();
+        assembler.bind(second).unwrap();
+        assembler.branch(&[0xe9], first).unwrap();
+        assert_eq!(assembler.finish().unwrap(), [0xc3]);
+
+        let mut assembler = X86Assembler::new();
+        let dead = assembler.label().unwrap();
+        assembler.instruction(&[0xe9]).unwrap();
+        push_bytes(&mut assembler.code, &[0; 4]).unwrap();
+        assembler.branch(&[0x0f, 0x84], dead).unwrap();
+        assembler.bind(dead).unwrap();
+        assembler.instruction(&[0x90]).unwrap();
+        assert_eq!(assembler.finish().unwrap(), [0xe9, 0, 0, 0, 0, 0x90]);
     }
 
     #[test]
