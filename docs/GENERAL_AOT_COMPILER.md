@@ -195,11 +195,13 @@ reads beyond the requested search window. No source spelling participates.
 
 The feature model is a set rather than a "highest tier": SSE2, AVX2,
 AVX-512F, AVX-512BW, and AVX-512VL are independent x86 facts; ASIMD, SVE, and
-SVE2 are independent Arm facts. The emitted object executes selected feature
-instructions unconditionally. A loader must dispatch only after checking CPU
-support and required OS extended-state support. The current 64-byte scanner
-needs AVX-512F+BW, not VL. AVX-512 is static-disassembly validated only because
-no available host exposes it; there is no AVX-512 performance claim.
+SVE2 are independent Arm facts. Validation still enforces architectural
+dependencies: AVX-512BW and AVX-512VL require AVX-512F, and SVE2 requires SVE.
+The emitted object executes selected feature instructions unconditionally. A
+loader must dispatch only after checking CPU support and required OS
+extended-state support. The current 64-byte scanner needs AVX-512F+BW, not VL.
+AVX-512 is static-disassembly validated only because no available host exposes
+it; there is no AVX-512 performance claim.
 
 Each object keeps code and immutable program data in separate sections,
 exports an identity-suffixed entry symbol, and carries only target-defined
