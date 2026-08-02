@@ -4762,6 +4762,14 @@ fn x86_emit_and_eax_mask(assembler: &mut X86Assembler, mask: u32) -> Result<(), 
     assembler.instruction(&instruction).map(|_| ())
 }
 
+fn x86_emit_clear_eax_bit(assembler: &mut X86Assembler, bit: u8) -> Result<(), ObjectError> {
+    if bit >= 32 {
+        return Err(ObjectError::InvalidModule("x86 packed-cell flag bit"));
+    }
+    assembler.instruction(&[0x0f, 0xba, 0xf0, bit])?; // btr eax, bit
+    Ok(())
+}
+
 fn x86_emit_set_row_from_cell(
     assembler: &mut X86Assembler,
     cells: NativeCellEncoding,
@@ -4776,6 +4784,14 @@ fn x86_emit_set_row_from_cell(
             assembler.instruction(&[0x4d, 0x8d, 0x54, 0x01, 0xff])?;
         }
     }
+    Ok(())
+}
+
+fn x86_emit_set_row_from_compact_zero_based_cell(
+    assembler: &mut X86Assembler,
+) -> Result<(), ObjectError> {
+    // r10 = table + zero_based_token * 2
+    assembler.instruction(&[0x4d, 0x8d, 0x14, 0x41])?;
     Ok(())
 }
 
@@ -6076,6 +6092,7 @@ fn x86_emit_seeded_reverse_prepass(
     let reverse_loop = assembler.label()?;
     let record_start = assembler.label()?;
     let reverse_continue = assembler.label()?;
+    let reverse_live = assembler.label()?;
     let reverse_done = assembler.label()?;
     let finalize = assembler.label()?;
     let global_minimum = assembler.label()?;
@@ -6279,12 +6296,10 @@ fn x86_emit_seeded_reverse_prepass(
     assembler.instruction(&[0x42, 0x0f, 0xb6, 0x04, 0x3f])?; // byte [haystack+cursor]
     assembler.instruction(&[0x41, 0x0f, 0xb6, 0x04, 0x03])?; // exact raw class
     assembler.instruction(&[0x41, 0x8b, 0x04, 0x82])?; // packed reverse cell
-    assembler.instruction(&[0xa9, 0x00, 0x00, 0x00, 0x80])?;
+    assembler.instruction(&[0x85, 0xc0])?; // accept sign and dead zero
     assembler.branch(&[0x0f, 0x88], record_start)?;
-
-    assembler.bind(reverse_continue)?;
-    assembler.instruction(&[0x25, 0xff, 0xff, 0xff, 0x7f])?;
     assembler.branch(&[0x0f, 0x84], reverse_done)?;
+    assembler.bind(reverse_live)?;
     assembler.instruction(&[0x4d, 0x8d, 0x54, 0x01, 0xff])?;
     assembler.branch(&[0xe9], reverse_loop)?;
 
@@ -6292,6 +6307,9 @@ fn x86_emit_seeded_reverse_prepass(
     if reverse.proves_match && layout.output == OutputContract::Exists {
         assembler.branch(&[0xe9], matched)?;
     } else {
+        // This sidecar is independently wide. Clear its sole metadata bit on
+        // the cold accepting edge so the live rejoin carries a raw byte token.
+        x86_emit_clear_eax_bit(assembler, 31)?;
         assembler.instruction(&[0x4d, 0x39, 0xef])?; // cursor >= minimum
         assembler.branch(&[0x0f, 0x83], reverse_continue)?;
         assembler.instruction(&[0x4d, 0x89, 0xfd])?; // minimum = cursor
@@ -6299,6 +6317,11 @@ fn x86_emit_seeded_reverse_prepass(
         assembler.branch(&[0x0f, 0x84], global_minimum)?;
         assembler.branch(&[0xe9], reverse_continue)?;
     }
+
+    assembler.bind(reverse_continue)?;
+    assembler.instruction(&[0x85, 0xc0])?; // accepted dead transition?
+    assembler.branch(&[0x0f, 0x84], reverse_done)?;
+    assembler.branch(&[0xe9], reverse_live)?;
 
     assembler.bind(reverse_done)?;
     assembler.instruction(&[0x4c, 0x89, 0xf2])?; // position = next base
@@ -6902,7 +6925,9 @@ fn lower_x86_64_dfa(
     let scalar_scan = assembler.label()?;
     let scalar_transition = assembler.label()?;
     let scalar_body = assembler.label()?;
+    let scalar_backedge = assembler.label()?;
     let accelerated_transition = assembler.label()?;
+    let compact_exception = assembler.label()?;
     let prefix_check = assembler.label()?;
     let prefix_vector_check = assembler.label()?;
     let prefix_verified = assembler.label()?;
@@ -6927,6 +6952,7 @@ fn lower_x86_64_dfa(
     let invalid = assembler.label()?;
     let done = assembler.label()?;
     let reverse_loop = assembler.label()?;
+    let reverse_exception = assembler.label()?;
     let record_reverse_start = assembler.label()?;
     let reverse_continue = assembler.label()?;
     let reverse_finish = assembler.label()?;
@@ -7327,14 +7353,34 @@ fn lower_x86_64_dfa(
     assembler.bind(scalar_body)?;
     x86_emit_table_lookup(&mut assembler, layout.transitions, layout.cells)?;
     assembler.instruction(&[0x48, 0xff, 0xc2])?; // position += 1
-    x86_emit_test_eax_mask(&mut assembler, layout.cells.accepts())?;
-    assembler.branch(&[0x0f, layout.cells.x86_accept_branch()], accept)?;
+    match layout.cells {
+        NativeCellEncoding::Compact16 => {
+            // After decrement, every ordinary live token is in 0..=0x3ffe.
+            // Dead underflows and either metadata bit moves the value above
+            // that range, so one unsigned branch classifies every exception.
+            assembler.instruction(&[0xff, 0xc8])?; // dec eax
+            assembler.instruction(&[0x3d, 0xfe, 0x3f, 0x00, 0x00])?;
+            assembler.branch(&[0x0f, 0x87], compact_exception)?; // ja
+            x86_emit_set_row_from_compact_zero_based_cell(&mut assembler)?;
+            assembler.branch(&[0xe9], scalar_backedge)?;
+        }
+        NativeCellEncoding::Wide32 => {
+            // A wide cell's sign bit is accept, while literal zero is the
+            // non-accepting dead edge. One TEST establishes both facts.
+            assembler.instruction(&[0x85, 0xc0])?; // test eax, eax
+            assembler.branch(&[0x0f, 0x88], accept)?; // js
+            assembler.branch(&[0x0f, 0x84], finish)?; // jz
+        }
+    }
     assembler.bind(after_accept)?;
-    x86_emit_test_eax_mask(&mut assembler, layout.cells.accelerated())?;
-    assembler.branch(&[0x0f, 0x85], accelerated_transition)?;
-    x86_emit_and_eax_mask(&mut assembler, layout.cells.next_mask())?;
-    assembler.branch(&[0x0f, 0x84], finish)?;
-    x86_emit_set_row_from_cell(&mut assembler, layout.cells)?;
+    if layout.cells == NativeCellEncoding::Wide32 {
+        x86_emit_test_eax_mask(&mut assembler, layout.cells.accelerated())?;
+        assembler.branch(&[0x0f, 0x85], accelerated_transition)?;
+        // TEST/JS/JZ plus the accelerator branch prove EAX is a raw nonzero
+        // byte token on this common edge.
+        x86_emit_set_row_from_cell(&mut assembler, layout.cells)?;
+    }
+    assembler.bind(scalar_backedge)?;
     // Rotate the steady-state loop around its bounds check. Scanner and
     // accelerator entries still use `scalar_transition`, while ordinary live
     // cells consume one fused compare/backedge instead of a guard plus an
@@ -7351,12 +7397,39 @@ fn lower_x86_64_dfa(
     // then falls through the selected interior-loop row guard otherwise.
     assembler.branch(&[0xe9], scan)?;
 
+    assembler.bind(compact_exception)?;
+    if layout.cells == NativeCellEncoding::Compact16 {
+        assembler.instruction(&[0xff, 0xc0])?; // restore packed cell
+        x86_emit_test_eax_mask(&mut assembler, layout.cells.accepts())?;
+        assembler.branch(&[0x0f, 0x85], accept)?;
+        assembler.instruction(&[0x85, 0xc0])?;
+        assembler.branch(&[0x0f, 0x84], finish)?;
+        // A live compact exception with no accept bit is accelerator-tagged.
+        assembler.branch(&[0xe9], accelerated_transition)?;
+    }
+
     assembler.bind(accept)?;
     if layout.output == OutputContract::Exists {
         assembler.branch(&[0xe9], matched)?;
     } else {
         assembler.instruction(&[0x49, 0x89, 0xd3])?;
-        assembler.branch(&[0xe9], after_accept)?;
+        // Normalize only the cold accepting edge. This makes an accepted-live
+        // cell identical to a raw token and exposes accepted-dead as zero.
+        x86_emit_clear_eax_bit(&mut assembler, layout.cells.accepts_bit())?;
+        assembler.instruction(&[0x85, 0xc0])?;
+        assembler.branch(&[0x0f, 0x84], finish)?;
+        match layout.cells {
+            NativeCellEncoding::Compact16 => {
+                x86_emit_test_eax_mask(&mut assembler, layout.cells.accelerated())?;
+                assembler.branch(&[0x0f, 0x85], accelerated_transition)?;
+                // With both metadata bits disproved, EAX is an encoded token.
+                x86_emit_set_row_from_cell(&mut assembler, layout.cells)?;
+                assembler.branch(&[0xe9], scalar_backedge)?;
+            }
+            NativeCellEncoding::Wide32 => {
+                assembler.branch(&[0xe9], after_accept)?;
+            }
+        }
     }
 
     assembler.bind(finish)?;
@@ -7405,19 +7478,38 @@ fn lower_x86_64_dfa(
             assembler.branch(&[0x0f, 0x86], reverse_finish)?; // cursor <= window_start
             assembler.instruction(&[0x48, 0xff, 0xca])?;
             x86_emit_table_lookup(&mut assembler, layout.transitions, layout.cells)?;
-            x86_emit_test_eax_mask(&mut assembler, layout.cells.accepts())?;
-            assembler.branch(
-                &[0x0f, layout.cells.x86_accept_branch()],
-                record_reverse_start,
-            )?;
+            match layout.cells {
+                NativeCellEncoding::Compact16 => {
+                    assembler.instruction(&[0xff, 0xc8])?; // zero-based token
+                    assembler.instruction(&[0x3d, 0xfe, 0x3f, 0x00, 0x00])?;
+                    assembler.branch(&[0x0f, 0x87], reverse_exception)?;
+                    x86_emit_set_row_from_compact_zero_based_cell(&mut assembler)?;
+                    assembler.branch(&[0xe9], reverse_loop)?;
+                }
+                NativeCellEncoding::Wide32 => {
+                    assembler.instruction(&[0x85, 0xc0])?;
+                    assembler.branch(&[0x0f, 0x88], record_reverse_start)?;
+                    assembler.branch(&[0x0f, 0x84], reverse_finish)?;
+                }
+            }
             assembler.bind(reverse_continue)?;
-            x86_emit_and_eax_mask(&mut assembler, layout.cells.accepts().wrapping_sub(1))?;
-            assembler.branch(&[0x0f, 0x84], reverse_finish)?;
             x86_emit_set_row_from_cell(&mut assembler, layout.cells)?;
             assembler.branch(&[0xe9], reverse_loop)?;
 
+            assembler.bind(reverse_exception)?;
+            if layout.cells == NativeCellEncoding::Compact16 {
+                assembler.instruction(&[0xff, 0xc0])?; // restore packed cell
+                x86_emit_test_eax_mask(&mut assembler, layout.cells.accepts())?;
+                assembler.branch(&[0x0f, 0x85], record_reverse_start)?;
+                // The only non-accepting compact exception is dead.
+                assembler.branch(&[0xe9], reverse_finish)?;
+            }
+
             assembler.bind(record_reverse_start)?;
             assembler.instruction(&[0x48, 0x89, 0xd1])?;
+            x86_emit_clear_eax_bit(&mut assembler, layout.cells.accepts_bit())?;
+            assembler.instruction(&[0x85, 0xc0])?;
+            assembler.branch(&[0x0f, 0x84], reverse_finish)?;
             assembler.branch(&[0xe9], reverse_continue)?;
 
             assembler.bind(reverse_finish)?;
@@ -8594,6 +8686,16 @@ fn aarch64_lsr_x_imm(destination: u8, source: u8, shift: u8) -> Result<u32, Obje
         return Err(ObjectError::InvalidModule("AArch64 LSR immediate"));
     }
     Ok(0xd340_fc00
+        | (u32::from(shift) << 16)
+        | aarch64_reg(source, 5)?
+        | aarch64_reg(destination, 0)?)
+}
+
+fn aarch64_lsr_w_imm(destination: u8, source: u8, shift: u8) -> Result<u32, ObjectError> {
+    if shift > 31 {
+        return Err(ObjectError::InvalidModule("AArch64 LSR immediate"));
+    }
+    Ok(0x5300_7c00
         | (u32::from(shift) << 16)
         | aarch64_reg(source, 5)?
         | aarch64_reg(destination, 0)?)
@@ -10680,7 +10782,9 @@ fn lower_aarch64_dfa_for_operating_system(
     let scalar_scan = assembler.label()?;
     let scalar_transition = assembler.label()?;
     let scalar_body = assembler.label()?;
+    let scalar_backedge = assembler.label()?;
     let accelerated_transition = assembler.label()?;
+    let compact_exception = assembler.label()?;
     let prefix_check = assembler.label()?;
     let prefix_vector_check = assembler.label()?;
     let prefix_verified = assembler.label()?;
@@ -10709,6 +10813,7 @@ fn lower_aarch64_dfa_for_operating_system(
     let invalid = assembler.label()?;
     let done = assembler.label()?;
     let reverse_scan = assembler.label()?;
+    let reverse_exception = assembler.label()?;
     let record_reverse_start = assembler.label()?;
     let reverse_continue = assembler.label()?;
     let reverse_finish = assembler.label()?;
@@ -11215,13 +11320,29 @@ fn lower_aarch64_dfa_for_operating_system(
     assembler.bind(scalar_body)?;
     aarch64_emit_table_lookup(&mut assembler, layout.transitions, layout.cells)?;
     assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
-    assembler.branch_bit_set_w(8, layout.cells.accepts_bit(), accept)?;
+    match layout.cells {
+        NativeCellEncoding::Compact16 => {
+            // W6 becomes the zero-based row token. Bits 14 and above are all
+            // zero exactly for ordinary live compact cells; dead underflows.
+            assembler.instruction(aarch64_sub_w_imm(6, 8, 1)?)?;
+            assembler.instruction(aarch64_lsr_w_imm(12, 6, 14)?)?;
+            assembler.branch_nonzero_w(12, compact_exception)?;
+            aarch64_set_row_from_cell(&mut assembler, layout.cells)?;
+            assembler.branch(scalar_backedge)?;
+        }
+        NativeCellEncoding::Wide32 => {
+            assembler.branch_bit_set_w(8, layout.cells.accepts_bit(), accept)?;
+        }
+    }
     assembler.bind(after_accept)?;
-    assembler.branch_bit_set_w(8, layout.cells.accelerated_bit(), accelerated_transition)?;
-    assembler.instruction(aarch64_and_low_w(6, 8, layout.cells.next_bits())?)?;
-    assembler.branch_zero_w(6, finish)?;
-    assembler.instruction(aarch64_sub_w_imm(6, 6, 1)?)?;
-    aarch64_set_row_from_cell(&mut assembler, layout.cells)?;
+    if layout.cells == NativeCellEncoding::Wide32 {
+        assembler.branch_bit_set_w(8, layout.cells.accelerated_bit(), accelerated_transition)?;
+        // The accept and accelerator branches prove W8 is a raw token.
+        assembler.branch_zero_w(8, finish)?;
+        assembler.instruction(aarch64_sub_w_imm(6, 8, 1)?)?;
+        aarch64_set_row_from_cell(&mut assembler, layout.cells)?;
+    }
+    assembler.bind(scalar_backedge)?;
     assembler.instruction(aarch64_cmp_x(2, 3)?)?;
     assembler.branch_cond(AARCH64_LO, scalar_body)?;
     assembler.branch(finish)?;
@@ -11233,12 +11354,36 @@ fn lower_aarch64_dfa_for_operating_system(
     aarch64_set_row_from_cell(&mut assembler, layout.cells)?;
     assembler.branch(scan)?;
 
+    assembler.bind(compact_exception)?;
+    if layout.cells == NativeCellEncoding::Compact16 {
+        assembler.branch_bit_set_w(8, layout.cells.accepts_bit(), accept)?;
+        assembler.branch_zero_w(8, finish)?;
+        // A live compact exception without the accept bit is accelerated.
+        assembler.branch(accelerated_transition)?;
+    }
+
     assembler.bind(accept)?;
     if layout.output == OutputContract::Exists {
         assembler.branch(matched)?;
     } else {
         assembler.instruction(aarch64_mov_x(7, 2)?)?;
-        assembler.branch(after_accept)?;
+        // Clear only the layout-specific accept bit on this cold edge. Any
+        // accelerator bit remains available to the shared classifier.
+        assembler.instruction(aarch64_and_low_w(8, 8, layout.cells.accepts_bit())?)?;
+        assembler.branch_zero_w(8, finish)?;
+        match layout.cells {
+            NativeCellEncoding::Compact16 => {
+                assembler.branch_bit_set_w(
+                    8,
+                    layout.cells.accelerated_bit(),
+                    accelerated_transition,
+                )?;
+                assembler.instruction(aarch64_sub_w_imm(6, 8, 1)?)?;
+                aarch64_set_row_from_cell(&mut assembler, layout.cells)?;
+                assembler.branch(scalar_backedge)?;
+            }
+            NativeCellEncoding::Wide32 => assembler.branch(after_accept)?,
+        }
     }
 
     assembler.bind(finish)?;
@@ -11285,16 +11430,41 @@ fn lower_aarch64_dfa_for_operating_system(
             assembler.branch_cond(AARCH64_LS, reverse_finish)?;
             assembler.instruction(aarch64_sub_x_imm(2, 2, 1)?)?;
             aarch64_emit_table_lookup(&mut assembler, layout.transitions, layout.cells)?;
-            assembler.branch_bit_set_w(8, layout.cells.accepts_bit(), record_reverse_start)?;
+            match layout.cells {
+                NativeCellEncoding::Compact16 => {
+                    assembler.instruction(aarch64_sub_w_imm(6, 8, 1)?)?;
+                    assembler.instruction(aarch64_lsr_w_imm(12, 6, 14)?)?;
+                    assembler.branch_nonzero_w(12, reverse_exception)?;
+                    aarch64_set_row_from_cell(&mut assembler, layout.cells)?;
+                    assembler.branch(reverse_scan)?;
+                }
+                NativeCellEncoding::Wide32 => {
+                    assembler.branch_bit_set_w(
+                        8,
+                        layout.cells.accepts_bit(),
+                        record_reverse_start,
+                    )?;
+                    // Reverse cells never carry accelerator metadata. A
+                    // non-accepting wide cell is zero or a raw token.
+                    assembler.branch_zero_w(8, reverse_finish)?;
+                }
+            }
             assembler.bind(reverse_continue)?;
-            assembler.instruction(aarch64_and_low_w(6, 8, layout.cells.accepts_bit())?)?;
-            assembler.branch_zero_w(6, reverse_finish)?;
-            assembler.instruction(aarch64_sub_w_imm(6, 6, 1)?)?;
+            assembler.instruction(aarch64_sub_w_imm(6, 8, 1)?)?;
             aarch64_set_row_from_cell(&mut assembler, layout.cells)?;
             assembler.branch(reverse_scan)?;
 
+            assembler.bind(reverse_exception)?;
+            if layout.cells == NativeCellEncoding::Compact16 {
+                assembler.branch_bit_set_w(8, layout.cells.accepts_bit(), record_reverse_start)?;
+                // The only non-accepting compact exception is dead.
+                assembler.branch(reverse_finish)?;
+            }
+
             assembler.bind(record_reverse_start)?;
             assembler.instruction(aarch64_mov_x(10, 2)?)?;
+            assembler.instruction(aarch64_and_low_w(8, 8, layout.cells.accepts_bit())?)?;
+            assembler.branch_zero_w(8, reverse_finish)?;
             assembler.branch(reverse_continue)?;
 
             assembler.bind(reverse_finish)?;
@@ -17684,6 +17854,120 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the state-fact inventory crosses every output contract and both native ISAs"
+    )]
+    fn accepting_cell_state_facts_cover_contracts_and_both_native_isas() {
+        #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+        struct ForwardCoverage {
+            dead: bool,
+            live: bool,
+            accelerated: bool,
+        }
+
+        #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+        struct ReverseCoverage {
+            dead: bool,
+            live: bool,
+        }
+
+        let patterns = [
+            "a",
+            "a+",
+            "A(?-u:[^Z]*)",
+            "(?:ab|a)+z",
+            "(?:a|aa)+?b",
+            "[A-Za-z_][A-Za-z0-9_]*",
+            "(?:foo|bar){2,4}",
+            "a?b?",
+            "x*abc+d",
+        ];
+        let outputs = [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ];
+        for target in [Target::x86_64_macos(), Target::aarch64_macos()] {
+            let mut forward = [ForwardCoverage::default(); 3];
+            let mut reverse = ReverseCoverage::default();
+            for (output_index, output) in outputs.into_iter().enumerate() {
+                for pattern in patterns {
+                    let compiled = compile(
+                        CompileRequest::new(pattern, target)
+                            .mode(CompileMode::Optimizing)
+                            .output(output),
+                    )
+                    .unwrap();
+                    let view = compiled.program().native_dfa_view().unwrap();
+                    let layout = build_native_dfa_table_for_architecture(view, target.architecture)
+                        .unwrap()
+                        .1;
+                    let loop_state = layout.loop_skip.map(|plan| plan.state);
+                    for cell in view.dfa.forward_cells {
+                        if !cell.accepted {
+                            continue;
+                        }
+                        if cell.next == NO_DFA_STATE {
+                            forward[output_index].dead = true;
+                        } else {
+                            forward[output_index].live = true;
+                            if (layout.start_filter.is_some() && cell.next == 0)
+                                || loop_state == Some(cell.next)
+                            {
+                                forward[output_index].accelerated = true;
+                            }
+                        }
+                    }
+                    if layout.has_reverse {
+                        for cell in view.dfa.reverse_cells {
+                            if !cell.reaches_start {
+                                continue;
+                            }
+                            if cell.next == NO_DFA_STATE {
+                                reverse.dead = true;
+                            } else {
+                                reverse.live = true;
+                            }
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                forward,
+                [
+                    ForwardCoverage {
+                        dead: true,
+                        live: true,
+                        // Exists returns on the accept edge, so an accepting
+                        // accelerator continuation is deliberately not built.
+                        accelerated: false,
+                    },
+                    ForwardCoverage {
+                        dead: true,
+                        live: true,
+                        accelerated: true,
+                    },
+                    ForwardCoverage {
+                        dead: true,
+                        live: true,
+                        accelerated: true,
+                    },
+                ],
+                "target={target:?}",
+            );
+            assert_eq!(
+                reverse,
+                ReverseCoverage {
+                    dead: true,
+                    live: true,
+                },
+                "target={target:?}",
+            );
+        }
+    }
+
+    #[test]
     fn transition_layout_and_cell_selection_are_cache_bounded_and_graph_only() {
         assert_eq!(
             select_native_table_encoding(1, 24, 0),
@@ -17908,59 +18192,29 @@ mod tests {
                 .windows(direct_lookup.len())
                 .any(|window| window == direct_lookup)
         );
-        let compact_accept = direct_x86
-            .windows(5)
-            .position(|bytes| bytes == [0xa9, 0x00, 0x80, 0x00, 0x00])
+        let direct_lookup_offset = direct_x86
+            .windows(direct_lookup.len())
+            .position(|window| window == direct_lookup)
             .unwrap();
+        let compact_classifier = direct_lookup_offset + direct_lookup.len() + 3;
         assert_eq!(
-            x86_test_normalized_branch_opcode(&direct_x86, compact_accept + 5),
-            Some(0x85),
-            "compact acceptance must branch on the nonzero 32-bit test",
+            &direct_x86[compact_classifier..compact_classifier + 7],
+            &[0xff, 0xc8, 0x3d, 0xfe, 0x3f, 0x00, 0x00],
+            "compact hot dispatch must decrement into a zero-based token and range-check it"
         );
-        assert!(
-            direct_x86
-                .windows(5)
-                .any(|bytes| bytes == [0xa9, 0x00, 0x40, 0x00, 0x00]),
-            "direct dispatch must test the accelerator bit"
-        );
-        assert!(
-            direct_x86
-                .windows(5)
-                .any(|bytes| bytes == [0x25, 0xff, 0x3f, 0x00, 0x00]),
-            "direct cells must clear both flag bits before row addressing"
-        );
-        let x86_dispatch = direct_x86
-            .windows(5)
-            .position(|bytes| bytes == [0xa9, 0x00, 0x40, 0x00, 0x00])
-            .unwrap();
-        let accelerated_branch = x86_dispatch + 5;
+        let exceptional_branch = compact_classifier + 7;
         assert_eq!(
-            x86_test_normalized_branch_opcode(&direct_x86, accelerated_branch),
-            Some(0x85)
+            x86_test_normalized_branch_opcode(&direct_x86, exceptional_branch),
+            Some(0x87),
         );
-        let (accelerated_transition, accelerated_branch_bytes) =
-            x86_test_branch_target(&direct_x86, accelerated_branch).unwrap();
-        assert!(matches!(accelerated_branch_bytes, 2 | 6));
-
-        let ordinary_mask = accelerated_branch + accelerated_branch_bytes;
+        let (_, exceptional_branch_bytes) =
+            x86_test_branch_target(&direct_x86, exceptional_branch).unwrap();
+        let ordinary_row = exceptional_branch + exceptional_branch_bytes;
         assert_eq!(
-            &direct_x86[ordinary_mask..ordinary_mask + 5],
-            &[0x25, 0xff, 0x3f, 0x00, 0x00]
+            &direct_x86[ordinary_row..ordinary_row + 4],
+            &[0x4d, 0x8d, 0x14, 0x41]
         );
-        let ordinary_dead_branch = ordinary_mask + 5;
-        assert_eq!(
-            x86_test_normalized_branch_opcode(&direct_x86, ordinary_dead_branch),
-            Some(0x84)
-        );
-        let ordinary_row = ordinary_dead_branch
-            + x86_test_branch_target(&direct_x86, ordinary_dead_branch)
-                .unwrap()
-                .1;
-        assert_eq!(
-            &direct_x86[ordinary_row..ordinary_row + 5],
-            &[0x4d, 0x8d, 0x54, 0x41, 0xfe]
-        );
-        let ordinary_compare = ordinary_row + 5;
+        let ordinary_compare = ordinary_row + 4;
         assert_eq!(
             &direct_x86[ordinary_compare..ordinary_compare + 3],
             &[0x48, 0x39, 0xca]
@@ -17982,7 +18236,6 @@ mod tests {
             &direct_x86[ordinary_target..ordinary_target + 4],
             &[0x0f, 0xb6, 0x04, 0x17]
         );
-
         let ordinary_exit = ordinary_branch + ordinary_branch_bytes;
         let (_, ordinary_exit_bytes) = x86_test_branch_target(&direct_x86, ordinary_exit).unwrap();
         assert_eq!(
@@ -17990,7 +18243,6 @@ mod tests {
             Some(0xe9)
         );
         let accelerated_mask = ordinary_exit + ordinary_exit_bytes;
-        assert_eq!(accelerated_transition, accelerated_mask);
         assert_eq!(
             &direct_x86[accelerated_mask..accelerated_mask + 5],
             &[0x25, 0xff, 0x3f, 0x00, 0x00]
@@ -18014,6 +18266,11 @@ mod tests {
             tagged_target < tagged_branch,
             "tagged edge must re-enter dispatch"
         );
+        assert!(
+            direct_x86
+                .windows(4)
+                .any(|bytes| { bytes == [0x0f, 0xba, 0xf0, 15] })
+        );
 
         let class_x86 = lower_x86_64_dfa(class_mapped, FeatureSet::EMPTY).unwrap().0;
         let class_lookup = [
@@ -18028,13 +18285,8 @@ mod tests {
         );
         assert!(
             class_x86
-                .windows(5)
-                .any(|bytes| bytes == [0xa9, 0x00, 0x40, 0x00, 0x00])
-        );
-        assert!(
-            class_x86
-                .windows(5)
-                .any(|bytes| bytes == [0x25, 0xff, 0x3f, 0x00, 0x00])
+                .windows(7)
+                .any(|bytes| { bytes == [0xff, 0xc8, 0x3d, 0xfe, 0x3f, 0x00, 0x00] })
         );
 
         let direct_aarch64 = lower_aarch64_dfa(direct, FeatureSet::EMPTY).unwrap().0;
@@ -18051,38 +18303,38 @@ mod tests {
                 .windows(direct_lookup.len())
                 .any(|window| window == direct_lookup)
         );
-        assert!(direct_words.contains(&aarch64_and_low_w(6, 8, 14).unwrap()));
-        let aarch64_dispatch = direct_words
-            .iter()
-            .position(|&word| word & 0xfff8_001f == 0x3770_0008)
+        let aarch64_lookup = direct_words
+            .windows(direct_lookup.len())
+            .position(|window| window == direct_lookup)
             .unwrap();
+        let aarch64_dispatch = aarch64_lookup + direct_lookup.len() + 1;
+        assert_eq!(
+            direct_words[aarch64_dispatch],
+            aarch64_sub_w_imm(6, 8, 1).unwrap()
+        );
         assert_eq!(
             direct_words[aarch64_dispatch + 1],
-            aarch64_and_low_w(6, 8, 14).unwrap()
+            aarch64_lsr_w_imm(12, 6, 14).unwrap()
         );
         assert_eq!(
             direct_words[aarch64_dispatch + 2] & 0xff00_001f,
-            0x3400_0006
+            0x3500_000c
         );
+        assert_eq!(direct_words[aarch64_dispatch + 3], 0x8b06_04ab);
         assert_eq!(
-            direct_words[aarch64_dispatch + 3],
-            aarch64_sub_w_imm(6, 6, 1).unwrap()
-        );
-        assert_eq!(direct_words[aarch64_dispatch + 4], 0x8b06_04ab);
-        assert_eq!(
-            direct_words[aarch64_dispatch + 5],
+            direct_words[aarch64_dispatch + 4],
             aarch64_cmp_x(2, 3).unwrap()
         );
         assert_eq!(
-            direct_words[aarch64_dispatch + 6] & 0xff00_001f,
+            direct_words[aarch64_dispatch + 5] & 0xff00_001f,
             0x5400_0003,
             "the rotated AArch64 hot edge must be B.LO"
         );
         let ordinary_displacement = {
-            let immediate = (direct_words[aarch64_dispatch + 6] >> 5) & 0x7_ffff;
+            let immediate = (direct_words[aarch64_dispatch + 5] >> 5) & 0x7_ffff;
             i32::try_from(immediate).unwrap().wrapping_shl(13) >> 13
         };
-        let ordinary_target = i32::try_from(aarch64_dispatch + 6)
+        let ordinary_target = i32::try_from(aarch64_dispatch + 5)
             .unwrap()
             .checked_add(ordinary_displacement)
             .and_then(|target| usize::try_from(target).ok())
@@ -18093,23 +18345,24 @@ mod tests {
             .unwrap();
         assert_eq!(ordinary_target, direct_body);
         assert_eq!(
-            direct_words[aarch64_dispatch + 7] & 0xfc00_0000,
+            direct_words[aarch64_dispatch + 6] & 0xfc00_0000,
             0x1400_0000
         );
         assert_eq!(
-            direct_words[aarch64_dispatch + 8],
+            direct_words[aarch64_dispatch + 7],
             aarch64_and_low_w(6, 8, 14).unwrap()
         );
         assert_eq!(
-            direct_words[aarch64_dispatch + 9] & 0xff00_001f,
+            direct_words[aarch64_dispatch + 8] & 0xff00_001f,
             0x3400_0006
         );
-        assert_eq!(direct_words[aarch64_dispatch + 11], 0x8b06_04ab);
+        assert_eq!(direct_words[aarch64_dispatch + 10], 0x8b06_04ab);
         assert_eq!(
-            direct_words[aarch64_dispatch + 12] & 0xfc00_0000,
+            direct_words[aarch64_dispatch + 11] & 0xfc00_0000,
             0x1400_0000
         );
-        assert_ne!(direct_words[aarch64_dispatch + 12] & 0x0200_0000, 0);
+        assert_ne!(direct_words[aarch64_dispatch + 11] & 0x0200_0000, 0);
+        assert!(direct_words.contains(&aarch64_and_low_w(8, 8, 15).unwrap()));
 
         let class_aarch64 = lower_aarch64_dfa(class_mapped, FeatureSet::EMPTY)
             .unwrap()
@@ -18128,12 +18381,7 @@ mod tests {
                 .windows(class_lookup.len())
                 .any(|window| window == class_lookup)
         );
-        assert!(
-            class_words
-                .iter()
-                .any(|&word| word & 0xfff8_001f == 0x3770_0008)
-        );
-        assert!(class_words.contains(&aarch64_and_low_w(6, 8, 14).unwrap()));
+        assert!(class_words.contains(&aarch64_lsr_w_imm(12, 6, 14).unwrap()));
 
         let direct_reverse_x86 = lower_x86_64_dfa(direct_reverse, FeatureSet::EMPTY)
             .unwrap()
@@ -18239,6 +18487,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the exact hot-path audit covers both cell widths and both native ISAs"
+    )]
     fn hot_native_miss_and_nonaccept_paths_have_exact_fallthrough_encodings() {
         let span_layout = NativeDfaLayout {
             transitions: TransitionLayout::ClassMapped,
@@ -18264,20 +18516,36 @@ mod tests {
             prefix_fast_forward: None,
         };
         let (x86_span, _) = lower_x86_64_dfa(span_layout, FeatureSet::EMPTY).unwrap();
-        let accept_test = [0xa9, 0, 0, 0, 0x80];
-        let accept_branches = x86_span
-            .windows(accept_test.len())
+        let wide_load = [0x41, 0x8b, 0x04, 0x82];
+        let loads = x86_span
+            .windows(wide_load.len())
             .enumerate()
-            .filter_map(|(offset, window)| {
-                (window == accept_test).then_some(offset + accept_test.len())
-            })
+            .filter_map(|(offset, window)| (window == wide_load).then_some(offset))
             .collect::<Vec<_>>();
-        assert_eq!(accept_branches.len(), 2); // forward and reverse
-        assert!(
-            accept_branches.iter().all(|&branch| {
-                x86_test_normalized_branch_opcode(&x86_span, branch) == Some(0x88)
-            })
-        ); // js rare accept
+        assert_eq!(loads.len(), 2); // ordinary forward and retained reverse
+        for (index, load) in loads.into_iter().enumerate() {
+            let test = load + wide_load.len() + if index == 0 { 3 } else { 0 };
+            assert_eq!(&x86_span[test..test + 2], &[0x85, 0xc0]);
+            let accept_branch = test + 2;
+            assert_eq!(
+                x86_test_normalized_branch_opcode(&x86_span, accept_branch),
+                Some(0x88),
+            );
+            let dead_branch =
+                accept_branch + x86_test_branch_target(&x86_span, accept_branch).unwrap().1;
+            assert_eq!(
+                x86_test_normalized_branch_opcode(&x86_span, dead_branch),
+                Some(0x84),
+            );
+        }
+        assert_eq!(
+            x86_span
+                .windows(4)
+                .filter(|bytes| *bytes == [0x0f, 0xba, 0xf0, 31])
+                .count(),
+            2,
+            "wide forward and reverse accepting edges clear only bit 31"
+        );
 
         let filter_layout = NativeDfaLayout {
             has_reverse: false,
@@ -18334,6 +18602,14 @@ mod tests {
             .filter(|&&word| word & 0xfff8_001f == 0x37f8_0008)
             .count();
         assert_eq!(accept_branches, 2); // forward and reverse
+        assert_eq!(
+            words
+                .iter()
+                .filter(|&&word| word == aarch64_and_low_w(8, 8, 31).unwrap())
+                .count(),
+            2,
+        );
+        assert!(words.contains(&aarch64_sub_w_imm(6, 8, 1).unwrap()));
     }
 
     #[test]
@@ -20225,6 +20501,20 @@ mod tests {
                 loop_accepting.len(),
             ),
             (
+                "A(?-u:[^Z]*)",
+                OutputContract::SelectedEnd,
+                b"AxxxZ".as_slice(),
+                0,
+                5,
+            ),
+            (
+                "A(?-u:[^Z]*)",
+                OutputContract::Span,
+                b"AxxxZ".as_slice(),
+                0,
+                5,
+            ),
+            (
                 "(?s:.+)z",
                 OutputContract::Exists,
                 seeded_accept.as_slice(),
@@ -20269,6 +20559,11 @@ mod tests {
         let mut saw_exact_prefix_match = false;
         let mut saw_correlated_prefix_decline = false;
         let mut saw_prefix_block = false;
+        let mut saw_forward_accept_dead = [false; 3];
+        let mut saw_forward_accept_live = [false; 3];
+        let mut saw_forward_accept_accelerated = [false; 3];
+        let mut saw_reverse_accept_dead = false;
+        let mut saw_reverse_accept_live = false;
         for (index, (pattern, output, haystack, _start, _end)) in cases.iter().enumerate() {
             let failure_code = index.checked_add(10).unwrap();
             let compiled = compile(
@@ -20280,6 +20575,39 @@ mod tests {
             assert_eq!(compiled.receipt().engine, EngineKind::OrderedDfa);
             let native_view = compiled.program().native_dfa_view().unwrap();
             let (_, native_layout) = build_native_dfa_table(native_view).unwrap();
+            let output_index = match output {
+                OutputContract::Exists => 0,
+                OutputContract::SelectedEnd => 1,
+                OutputContract::Span => 2,
+            };
+            let loop_state = native_layout.loop_skip.map(|plan| plan.state);
+            for cell in native_view.dfa.forward_cells {
+                if !cell.accepted {
+                    continue;
+                }
+                if cell.next == NO_DFA_STATE {
+                    saw_forward_accept_dead[output_index] = true;
+                } else {
+                    saw_forward_accept_live[output_index] = true;
+                    if (native_layout.start_filter.is_some() && cell.next == 0)
+                        || loop_state == Some(cell.next)
+                    {
+                        saw_forward_accept_accelerated[output_index] = true;
+                    }
+                }
+            }
+            if native_layout.has_reverse {
+                for cell in native_view.dfa.reverse_cells {
+                    if !cell.reaches_start {
+                        continue;
+                    }
+                    if cell.next == NO_DFA_STATE {
+                        saw_reverse_accept_dead = true;
+                    } else {
+                        saw_reverse_accept_live = true;
+                    }
+                }
+            }
             if *pattern == "(?s:.+)z" && *output == OutputContract::Exists {
                 assert!(
                     native_layout
@@ -20482,6 +20810,22 @@ mod tests {
         assert!(
             saw_prefix_block,
             "differential bundle must cover a graph-derived 16-byte prefix block"
+        );
+        assert_eq!(
+            saw_forward_accept_dead, [true; 3],
+            "native differential must cover accepted-dead for every output contract",
+        );
+        assert_eq!(
+            saw_forward_accept_live, [true; 3],
+            "native differential must cover accepted-live for every output contract",
+        );
+        assert!(
+            saw_forward_accept_accelerated[1] && saw_forward_accept_accelerated[2],
+            "native differential must cover constructible accepted+accelerated continuations",
+        );
+        assert!(
+            saw_reverse_accept_dead && saw_reverse_accept_live,
+            "native differential must cover accepted-dead and accepted-live reverse cells",
         );
         let first_symbol = first_symbol.unwrap();
         writeln!(

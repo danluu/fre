@@ -369,10 +369,10 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
 
     assembler.bind(reverse_continue)?;
     // Seeded-reverse rows never carry the forward accelerator tag, so their
-    // absolute next-row token occupies all low 31 bits.
-    assembler.instruction(aarch64_and_low_31(6, 8)?)?;
-    assembler.branch_zero_w(6, reverse_done)?;
-    assembler.instruction(aarch64_sub_w_imm(6, 6, 1)?)?;
+    // absolute next-row token occupies all low 31 bits. The accepting edge
+    // clears its sole flag before rejoining, so W8 is raw on both inputs.
+    assembler.branch_zero_w(8, reverse_done)?;
+    assembler.instruction(aarch64_sub_w_imm(6, 8, 1)?)?;
     assembler.instruction(aarch64_add_x_reg(11, 5, 6)?)?;
     assembler.branch(reverse_loop)?;
 
@@ -380,6 +380,7 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
     if reverse.proves_match && layout.output == OutputContract::Exists {
         assembler.branch(matched)?;
     } else {
+        assembler.instruction(aarch64_and_low_31(8, 8)?)?;
         assembler.instruction(aarch64_cmp_x(REVERSE_CURSOR, REVERSE_MINIMUM)?)?;
         assembler.branch_cond(AARCH64_HS, reverse_continue)?;
         assembler.instruction(aarch64_mov_x(REVERSE_MINIMUM, REVERSE_CURSOR)?)?;
@@ -511,7 +512,9 @@ mod tests {
         assert!(words.contains(&aarch64_load_byte_reg(8, 0, REVERSE_CURSOR).unwrap()));
         assert!(words.contains(&aarch64_load_byte_reg(8, REVERSE_CLASS_MAP, 8).unwrap()));
         assert!(words.contains(&aarch64_load_w_uxtw(8, 11, 8).unwrap()));
-        assert!(words.contains(&aarch64_and_low_31(6, 8).unwrap()));
+        assert!(words.contains(&aarch64_and_low_31(8, 8).unwrap()));
+        assert!(!words.contains(&aarch64_and_low_31(6, 8).unwrap()));
+        assert!(words.contains(&aarch64_sub_w_imm(6, 8, 1).unwrap()));
         assert!(words.contains(&aarch64_mov_x(2, 9).unwrap()));
     }
 
