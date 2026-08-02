@@ -4363,8 +4363,12 @@ fn x86_emit_splat_byte(
             "x86 start-filter constant register",
         ));
     }
+    // Seed all four scalar bytes at once. SSE2 can then fill the complete
+    // register with one dword shuffle instead of a byte unpack followed by
+    // word and dword shuffles. AVX2/AVX-512 keep their single broadcast and
+    // observe the same low byte.
     let mut load_immediate = vec![0xb8];
-    load_immediate.extend_from_slice(&u32::from(byte).to_le_bytes());
+    load_immediate.extend_from_slice(&u32::from_le_bytes([byte; 4]).to_le_bytes());
     assembler.instruction(&load_immediate)?;
     let low_register = register & 7;
     let self_modrm = 0xc0 | (low_register << 3) | low_register;
@@ -4387,13 +4391,9 @@ fn x86_emit_splat_byte(
     }
     match kind {
         X86StartFilterKind::Sse2 if register < 8 => {
-            assembler.instruction(&[0x66, 0x0f, 0x60, self_modrm])?;
-            assembler.instruction(&[0xf2, 0x0f, 0x70, self_modrm, 0])?;
             assembler.instruction(&[0x66, 0x0f, 0x70, self_modrm, 0])?;
         }
         X86StartFilterKind::Sse2 => {
-            assembler.instruction(&[0x66, 0x45, 0x0f, 0x60, self_modrm])?;
-            assembler.instruction(&[0xf2, 0x45, 0x0f, 0x70, self_modrm, 0])?;
             assembler.instruction(&[0x66, 0x45, 0x0f, 0x70, self_modrm, 0])?;
         }
         X86StartFilterKind::Avx2 if register < 8 => {
@@ -10619,7 +10619,7 @@ mod tests {
     }
 
     #[test]
-    fn x86_splat_setup_uses_family_exact_movd_for_low_and_extended_registers() {
+    fn x86_splat_setup_uses_repeated_immediates_and_family_exact_movd() {
         let emit = |kind| {
             let mut assembler = X86Assembler::new();
             x86_emit_splat_byte(&mut assembler, 1, b'a', kind).unwrap();
@@ -10634,6 +10634,19 @@ mod tests {
         };
 
         let sse2 = emit(X86StartFilterKind::Sse2);
+        assert_eq!(
+            sse2,
+            [
+                &[0xb8, b'a', b'a', b'a', b'a'][..],
+                &[0x66, 0x0f, 0x6e, 0xc8],
+                &[0x66, 0x0f, 0x70, 0xc9, 0x00],
+                &[0xb8, b'z', b'z', b'z', b'z'],
+                &[0x66, 0x44, 0x0f, 0x6e, 0xc0],
+                &[0x66, 0x45, 0x0f, 0x70, 0xc0, 0x00],
+            ]
+            .concat(),
+            "SSE2 needs only MOVD plus one dword shuffle per splat"
+        );
         assert!(
             sse2.windows(4)
                 .any(|bytes| bytes == [0x66, 0x0f, 0x6e, 0xc8])
@@ -10645,6 +10658,11 @@ mod tests {
 
         for kind in [X86StartFilterKind::Avx2, X86StartFilterKind::Avx512Bw] {
             let code = emit(kind);
+            assert!(code.starts_with(&[0xb8, b'a', b'a', b'a', b'a']));
+            assert!(
+                code.windows(5)
+                    .any(|bytes| bytes == [0xb8, b'z', b'z', b'z', b'z'])
+            );
             assert!(
                 code.windows(4)
                     .any(|bytes| bytes == [0xc5, 0xf9, 0x6e, 0xc8])
@@ -10654,6 +10672,15 @@ mod tests {
                     .any(|bytes| bytes == [0xc5, 0x79, 0x6e, 0xc0])
             );
             assert!(!has_legacy_movd(&code));
+        }
+
+        for byte in u8::MIN..=u8::MAX {
+            let mut assembler = X86Assembler::new();
+            x86_emit_splat_byte(&mut assembler, 1, byte, X86StartFilterKind::Sse2).unwrap();
+            let code = assembler.finish().unwrap();
+            assert_eq!(code.len(), 14);
+            assert_eq!(&code[..5], &[0xb8, byte, byte, byte, byte]);
+            assert_eq!(&code[9..], &[0x66, 0x0f, 0x70, 0xc9, 0x00]);
         }
     }
 
