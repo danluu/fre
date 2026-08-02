@@ -6901,6 +6901,7 @@ fn lower_x86_64_dfa(
     let scan = assembler.label()?;
     let scalar_scan = assembler.label()?;
     let scalar_transition = assembler.label()?;
+    let scalar_body = assembler.label()?;
     let accelerated_transition = assembler.label()?;
     let prefix_check = assembler.label()?;
     let prefix_vector_check = assembler.label()?;
@@ -7323,6 +7324,7 @@ fn lower_x86_64_dfa(
     assembler.bind(scalar_transition)?;
     assembler.instruction(&[0x48, 0x39, 0xca])?;
     assembler.branch(&[0x0f, 0x83], finish)?; // position >= end
+    assembler.bind(scalar_body)?;
     x86_emit_table_lookup(&mut assembler, layout.transitions, layout.cells)?;
     assembler.instruction(&[0x48, 0xff, 0xc2])?; // position += 1
     x86_emit_test_eax_mask(&mut assembler, layout.cells.accepts())?;
@@ -7333,8 +7335,13 @@ fn lower_x86_64_dfa(
     x86_emit_and_eax_mask(&mut assembler, layout.cells.next_mask())?;
     assembler.branch(&[0x0f, 0x84], finish)?;
     x86_emit_set_row_from_cell(&mut assembler, layout.cells)?;
-    // The overwhelmingly common live edge resumes table execution directly.
-    assembler.branch(&[0xe9], scalar_transition)?;
+    // Rotate the steady-state loop around its bounds check. Scanner and
+    // accelerator entries still use `scalar_transition`, while ordinary live
+    // cells consume one fused compare/backedge instead of a guard plus an
+    // unconditional backedge on every byte.
+    assembler.instruction(&[0x48, 0x39, 0xca])?;
+    assembler.branch(&[0x0f, 0x82], scalar_body)?; // position < end
+    assembler.branch(&[0xe9], finish)?;
 
     assembler.bind(accelerated_transition)?;
     x86_emit_and_eax_mask(&mut assembler, layout.cells.next_mask())?;
@@ -10672,6 +10679,7 @@ fn lower_aarch64_dfa_for_operating_system(
     let scan = assembler.label()?;
     let scalar_scan = assembler.label()?;
     let scalar_transition = assembler.label()?;
+    let scalar_body = assembler.label()?;
     let accelerated_transition = assembler.label()?;
     let prefix_check = assembler.label()?;
     let prefix_vector_check = assembler.label()?;
@@ -11204,6 +11212,7 @@ fn lower_aarch64_dfa_for_operating_system(
     assembler.bind(scalar_transition)?;
     assembler.instruction(aarch64_cmp_x(2, 3)?)?;
     assembler.branch_cond(AARCH64_HS, finish)?;
+    assembler.bind(scalar_body)?;
     aarch64_emit_table_lookup(&mut assembler, layout.transitions, layout.cells)?;
     assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
     assembler.branch_bit_set_w(8, layout.cells.accepts_bit(), accept)?;
@@ -11213,7 +11222,9 @@ fn lower_aarch64_dfa_for_operating_system(
     assembler.branch_zero_w(6, finish)?;
     assembler.instruction(aarch64_sub_w_imm(6, 6, 1)?)?;
     aarch64_set_row_from_cell(&mut assembler, layout.cells)?;
-    assembler.branch(scalar_transition)?;
+    assembler.instruction(aarch64_cmp_x(2, 3)?)?;
+    assembler.branch_cond(AARCH64_LO, scalar_body)?;
+    assembler.branch(finish)?;
 
     assembler.bind(accelerated_transition)?;
     assembler.instruction(aarch64_and_low_w(6, 8, layout.cells.next_bits())?)?;
@@ -17949,20 +17960,36 @@ mod tests {
             &direct_x86[ordinary_row..ordinary_row + 5],
             &[0x4d, 0x8d, 0x54, 0x41, 0xfe]
         );
-        let ordinary_branch = ordinary_row + 5;
+        let ordinary_compare = ordinary_row + 5;
+        assert_eq!(
+            &direct_x86[ordinary_compare..ordinary_compare + 3],
+            &[0x48, 0x39, 0xca]
+        );
+        let ordinary_branch = ordinary_compare + 3;
         let (ordinary_target, ordinary_branch_bytes) =
             x86_test_branch_target(&direct_x86, ordinary_branch).unwrap();
         assert_eq!(ordinary_branch_bytes, 2, "ordinary hot edge must relax");
+        assert_eq!(
+            x86_test_normalized_branch_opcode(&direct_x86, ordinary_branch),
+            Some(0x82),
+            "the rotated hot edge continues only while position is below end"
+        );
         assert!(
             ordinary_target < ordinary_branch,
             "ordinary edge must loop directly"
         );
         assert_eq!(
-            &direct_x86[ordinary_target..ordinary_target + 3],
-            &[0x48, 0x39, 0xca]
+            &direct_x86[ordinary_target..ordinary_target + 4],
+            &[0x0f, 0xb6, 0x04, 0x17]
         );
 
-        let accelerated_mask = ordinary_branch + ordinary_branch_bytes;
+        let ordinary_exit = ordinary_branch + ordinary_branch_bytes;
+        let (_, ordinary_exit_bytes) = x86_test_branch_target(&direct_x86, ordinary_exit).unwrap();
+        assert_eq!(
+            x86_test_normalized_branch_opcode(&direct_x86, ordinary_exit),
+            Some(0xe9)
+        );
+        let accelerated_mask = ordinary_exit + ordinary_exit_bytes;
         assert_eq!(accelerated_transition, accelerated_mask);
         assert_eq!(
             &direct_x86[accelerated_mask..accelerated_mask + 5],
@@ -18043,24 +18070,46 @@ mod tests {
         );
         assert_eq!(direct_words[aarch64_dispatch + 4], 0x8b06_04ab);
         assert_eq!(
-            direct_words[aarch64_dispatch + 5] & 0xfc00_0000,
+            direct_words[aarch64_dispatch + 5],
+            aarch64_cmp_x(2, 3).unwrap()
+        );
+        assert_eq!(
+            direct_words[aarch64_dispatch + 6] & 0xff00_001f,
+            0x5400_0003,
+            "the rotated AArch64 hot edge must be B.LO"
+        );
+        let ordinary_displacement = {
+            let immediate = (direct_words[aarch64_dispatch + 6] >> 5) & 0x7_ffff;
+            i32::try_from(immediate).unwrap().wrapping_shl(13) >> 13
+        };
+        let ordinary_target = i32::try_from(aarch64_dispatch + 6)
+            .unwrap()
+            .checked_add(ordinary_displacement)
+            .and_then(|target| usize::try_from(target).ok())
+            .unwrap();
+        let direct_body = direct_words
+            .windows(direct_lookup.len())
+            .position(|window| window == direct_lookup)
+            .unwrap();
+        assert_eq!(ordinary_target, direct_body);
+        assert_eq!(
+            direct_words[aarch64_dispatch + 7] & 0xfc00_0000,
             0x1400_0000
         );
-        assert_ne!(direct_words[aarch64_dispatch + 5] & 0x0200_0000, 0);
         assert_eq!(
-            direct_words[aarch64_dispatch + 6],
+            direct_words[aarch64_dispatch + 8],
             aarch64_and_low_w(6, 8, 14).unwrap()
         );
         assert_eq!(
-            direct_words[aarch64_dispatch + 7] & 0xff00_001f,
+            direct_words[aarch64_dispatch + 9] & 0xff00_001f,
             0x3400_0006
         );
-        assert_eq!(direct_words[aarch64_dispatch + 9], 0x8b06_04ab);
+        assert_eq!(direct_words[aarch64_dispatch + 11], 0x8b06_04ab);
         assert_eq!(
-            direct_words[aarch64_dispatch + 10] & 0xfc00_0000,
+            direct_words[aarch64_dispatch + 12] & 0xfc00_0000,
             0x1400_0000
         );
-        assert_ne!(direct_words[aarch64_dispatch + 10] & 0x0200_0000, 0);
+        assert_ne!(direct_words[aarch64_dispatch + 12] & 0x0200_0000, 0);
 
         let class_aarch64 = lower_aarch64_dfa(class_mapped, FeatureSet::EMPTY)
             .unwrap()
