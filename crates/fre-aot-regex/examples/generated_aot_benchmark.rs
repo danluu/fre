@@ -629,6 +629,8 @@ fn start_accelerator_name(accelerator: StartAccelerator) -> &'static str {
         StartAccelerator::X86Avx2 => "x86_avx2",
         StartAccelerator::X86Avx512Bw => "x86_avx512bw",
         StartAccelerator::Aarch64Asimd => "aarch64_asimd",
+        StartAccelerator::Aarch64Sve => "aarch64_sve",
+        StartAccelerator::Aarch64Sve2 => "aarch64_sve2",
     }
 }
 

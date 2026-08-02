@@ -350,6 +350,8 @@ pub enum StartAccelerator {
     X86Avx2,
     X86Avx512Bw,
     Aarch64Asimd,
+    Aarch64Sve,
+    Aarch64Sve2,
 }
 
 /// One independent section before object-format layout.
@@ -785,6 +787,8 @@ const fn start_accelerator_tag(accelerator: StartAccelerator) -> u8 {
         StartAccelerator::X86Avx2 => 3,
         StartAccelerator::X86Avx512Bw => 4,
         StartAccelerator::Aarch64Asimd => 5,
+        StartAccelerator::Aarch64Sve => 6,
+        StartAccelerator::Aarch64Sve2 => 7,
     }
 }
 
@@ -1427,13 +1431,16 @@ fn lower_native_dfa(
     view: NativeProgramView<'_>,
     target: Target,
 ) -> Result<NativeLowering, ObjectError> {
-    let (data, layout) = build_native_dfa_table_for_architecture(view, target.architecture)?;
+    let (mut data, layout) = build_native_dfa_table_for_architecture(view, target.architecture)?;
+    let sve2_match_table_offset = install_aarch64_sve2_match_table(&mut data, layout, target)?;
+    let sve_filter_kind = selected_aarch64_sve_filter(layout, target, sve2_match_table_offset);
     let (code, relocations) = match target.architecture {
         Architecture::X86_64 => lower_x86_64_dfa(layout, target.features)?,
         Architecture::Aarch64 => lower_aarch64_dfa_for_operating_system(
             layout,
             target.features,
             target.operating_system,
+            sve_filter_kind,
         )?,
     };
     Ok(NativeLowering {
@@ -1441,7 +1448,7 @@ fn lower_native_dfa(
         data,
         relocations,
         needs_runtime: false,
-        start_accelerator: selected_start_accelerator(layout, target),
+        start_accelerator: selected_start_accelerator(layout, target, sve_filter_kind),
         anchored_prefix_filter_bytes: layout
             .prefix_filter
             .map_or(0, |filter| filter.guaranteed_bytes),
@@ -1452,7 +1459,11 @@ fn lower_native_dfa(
     clippy::large_types_passed_by_value,
     reason = "the copyable lowering layout is already consumed by the adjacent target selectors"
 )]
-const fn selected_start_accelerator(layout: NativeDfaLayout, target: Target) -> StartAccelerator {
+fn selected_start_accelerator(
+    layout: NativeDfaLayout,
+    target: Target,
+    sve_filter_kind: Option<Aarch64SveFilterKind>,
+) -> StartAccelerator {
     let filter = match layout.start_filter {
         Some(filter) => Some(filter),
         None => match layout.suffix_filter {
@@ -1479,13 +1490,98 @@ const fn selected_start_accelerator(layout: NativeDfaLayout, target: Target) -> 
             }
         }
         Architecture::Aarch64 => {
-            if target.features.has(CpuFeature::Aarch64Asimd) {
+            if layout.start_filter.is_some() && sve_filter_kind.is_some() {
+                match sve_filter_kind {
+                    Some(Aarch64SveFilterKind::Sve) => StartAccelerator::Aarch64Sve,
+                    Some(Aarch64SveFilterKind::Sve2 { .. }) => StartAccelerator::Aarch64Sve2,
+                    None => StartAccelerator::Scalar,
+                }
+            } else if target.features.has(CpuFeature::Aarch64Asimd) {
                 StartAccelerator::Aarch64Asimd
             } else {
                 StartAccelerator::Scalar
             }
         }
     }
+}
+
+fn selected_aarch64_sve_filter(
+    layout: NativeDfaLayout,
+    target: Target,
+    sve2_match_table_offset: Option<u32>,
+) -> Option<Aarch64SveFilterKind> {
+    if target.architecture != Architecture::Aarch64
+        || target.operating_system != OperatingSystem::Linux
+        || target.features.has(CpuFeature::Aarch64Asimd)
+        || !target.features.has(CpuFeature::Aarch64Sve)
+    {
+        return None;
+    }
+    let filter = layout
+        .start_filter
+        .filter(|filter| !filter.ranges().is_empty())?;
+    if target.features.has(CpuFeature::Aarch64Sve2)
+        && filter.is_exact()
+        && let Some(match_table_offset) = sve2_match_table_offset
+    {
+        return Some(Aarch64SveFilterKind::Sve2 { match_table_offset });
+    }
+    Some(Aarch64SveFilterKind::Sve)
+}
+
+fn install_aarch64_sve2_match_table(
+    data: &mut Vec<u8>,
+    layout: NativeDfaLayout,
+    target: Target,
+) -> Result<Option<u32>, ObjectError> {
+    if target.architecture != Architecture::Aarch64
+        || target.operating_system != OperatingSystem::Linux
+        || target.features.has(CpuFeature::Aarch64Asimd)
+        || !target.features.has(CpuFeature::Aarch64Sve)
+        || !target.features.has(CpuFeature::Aarch64Sve2)
+    {
+        return Ok(None);
+    }
+    let Some(filter) = layout
+        .start_filter
+        .filter(|filter| filter.is_exact() && !filter.ranges().is_empty())
+    else {
+        return Ok(None);
+    };
+    let alignment = 16_usize;
+    let aligned = data
+        .len()
+        .checked_add(alignment - 1)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "SVE2 match-table alignment",
+        ))?
+        & !(alignment - 1);
+    let total = aligned
+        .checked_add(16)
+        .ok_or(ObjectError::ArithmeticOverflow("SVE2 match-table bytes"))?;
+    if total
+        > usize::try_from(i32::MAX)
+            .map_err(|_| ObjectError::ArithmeticOverflow("SVE2 table address limit"))?
+    {
+        return Ok(None);
+    }
+    let additional = total
+        .checked_sub(data.len())
+        .ok_or(ObjectError::ArithmeticOverflow("SVE2 table reservation"))?;
+    if data.try_reserve_exact(additional).is_err() {
+        return Ok(None);
+    }
+    data.resize(aligned, 0);
+    for index in 0..16_usize {
+        let range = filter
+            .ranges()
+            .get(index % filter.ranges().len())
+            .ok_or(ObjectError::InvalidModule("empty SVE2 match table"))?;
+        data.push(range.start);
+    }
+    Ok(Some(u32::try_from(aligned).map_err(|_| {
+        ObjectError::ArithmeticOverflow("SVE2 match-table offset")
+    })?))
 }
 
 #[allow(
@@ -7379,6 +7475,90 @@ fn aarch64_dup_16b_from_w(destination: u8, source: u8) -> Result<u32, ObjectErro
     Ok(0x4e01_0c00 | aarch64_reg(source, 5)? | aarch64_reg(destination, 0)?)
 }
 
+fn aarch64_sve_ptrue_b() -> u32 {
+    0x2518_e3e0 // ptrue p0.b
+}
+
+fn aarch64_sve_cntb(destination: u8) -> Result<u32, ObjectError> {
+    Ok(0x0420_e3e0 | aarch64_reg(destination, 0)?)
+}
+
+fn aarch64_sve_incb(destination: u8) -> Result<u32, ObjectError> {
+    Ok(0x0430_e3e0 | aarch64_reg(destination, 0)?)
+}
+
+fn aarch64_sve_ld1b(destination: u8, base: u8) -> Result<u32, ObjectError> {
+    // The scanner deliberately reserves P0 as its all-byte predicate.
+    Ok(0xa400_a000 | aarch64_reg(base, 5)? | aarch64_reg(destination, 0)?)
+}
+
+fn aarch64_sve_ld1rqb(destination: u8, base: u8) -> Result<u32, ObjectError> {
+    // LD1RQB repeats one exact 16-byte set in every architectural segment.
+    Ok(0xa400_2000 | aarch64_reg(base, 5)? | aarch64_reg(destination, 0)?)
+}
+
+fn aarch64_sve_dup_b_from_w(destination: u8, source: u8) -> Result<u32, ObjectError> {
+    Ok(0x0520_3800 | aarch64_reg(source, 5)? | aarch64_reg(destination, 0)?)
+}
+
+fn aarch64_sve_cmpeq_b(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
+    // P0 is the governing predicate; inactive lanes are cleared.
+    Ok(
+        0x2400_a000
+            | aarch64_reg(right, 16)?
+            | aarch64_reg(left, 5)?
+            | aarch64_reg(destination, 0)?,
+    )
+}
+
+fn aarch64_sve_cmphs_b(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
+    Ok(
+        0x2400_0000
+            | aarch64_reg(right, 16)?
+            | aarch64_reg(left, 5)?
+            | aarch64_reg(destination, 0)?,
+    )
+}
+
+fn aarch64_sve_and_b(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
+    Ok(
+        0x2500_4000
+            | aarch64_reg(right, 16)?
+            | aarch64_reg(left, 5)?
+            | aarch64_reg(destination, 0)?,
+    )
+}
+
+fn aarch64_sve_orr_b(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
+    Ok(
+        0x2580_4000
+            | aarch64_reg(right, 16)?
+            | aarch64_reg(left, 5)?
+            | aarch64_reg(destination, 0)?,
+    )
+}
+
+fn aarch64_sve_ptest_p0_p1() -> u32 {
+    0x2550_c020
+}
+
+fn aarch64_sve_brkb_p2_p0_p1() -> u32 {
+    0x2590_4022
+}
+
+fn aarch64_sve_cntp_p0_p2(destination: u8) -> Result<u32, ObjectError> {
+    Ok(0x2520_8040 | aarch64_reg(destination, 0)?)
+}
+
+fn aarch64_sve2_match_b(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
+    Ok(
+        0x4520_8000
+            | aarch64_reg(right, 16)?
+            | aarch64_reg(left, 5)?
+            | aarch64_reg(destination, 0)?,
+    )
+}
+
 fn aarch64_cmeq_16b(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
     Ok(
         0x6e20_8c00
@@ -7702,6 +7882,163 @@ fn aarch64_emit_start_filter_constants(
             assembler.instruction(aarch64_movi_16b(high_register, range.end)?)?;
         }
     }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Aarch64SveFilterKind {
+    Sve,
+    Sve2 { match_table_offset: u32 },
+}
+
+fn aarch64_sve_filter_constant_register(index: usize) -> Result<u8, ObjectError> {
+    // These exported matchers have the ordinary C AAPCS64 interface: every
+    // argument and result is a scalar, never a scalable vector or predicate.
+    // AAPCS64 6.1.3 therefore makes Z16..Z31 caller-saved (only low 64-bit
+    // V8..V15 state is preserved), so Z16..Z23 are scratch without a scalable
+    // save frame and cannot disturb the callee-saved V8..V15 bank.
+    let register = index
+        .checked_add(16)
+        .and_then(|value| u8::try_from(value).ok())
+        .filter(|&value| value <= 23)
+        .ok_or(ObjectError::InvalidModule(
+            "SVE filter constant escaped Z16..Z23",
+        ))?;
+    Ok(register)
+}
+
+fn aarch64_emit_sve_filter_setup(
+    assembler: &mut Aarch64Assembler,
+    filter: NativeStartFilter,
+    kind: Aarch64SveFilterKind,
+) -> Result<(), ObjectError> {
+    if filter.ranges().is_empty() {
+        return Err(ObjectError::InvalidModule("empty SVE start filter"));
+    }
+    // AAPCS64 6.1.4 makes every predicate register caller-saved for this
+    // ordinary scalar interface. The scanner still confines itself to P0..P3,
+    // which are caller-saved even for a scalable-vector PCS interface.
+    assembler.instruction(aarch64_sve_ptrue_b())?;
+    match kind {
+        Aarch64SveFilterKind::Sve => {
+            for (index, range) in filter.ranges().iter().enumerate() {
+                if filter.is_exact() {
+                    let register = aarch64_sve_filter_constant_register(index)?;
+                    assembler.instruction(aarch64_movz_w(12, u16::from(range.start))?)?;
+                    assembler.instruction(aarch64_sve_dup_b_from_w(register, 12)?)?;
+                } else {
+                    let low_index = index.checked_mul(2).ok_or(ObjectError::ArithmeticOverflow(
+                        "SVE range-filter low constant",
+                    ))?;
+                    let high_index =
+                        low_index
+                            .checked_add(1)
+                            .ok_or(ObjectError::ArithmeticOverflow(
+                                "SVE range-filter high constant",
+                            ))?;
+                    let low = aarch64_sve_filter_constant_register(low_index)?;
+                    let high = aarch64_sve_filter_constant_register(high_index)?;
+                    assembler.instruction(aarch64_movz_w(12, u16::from(range.start))?)?;
+                    assembler.instruction(aarch64_sve_dup_b_from_w(low, 12)?)?;
+                    assembler.instruction(aarch64_movz_w(12, u16::from(range.end))?)?;
+                    assembler.instruction(aarch64_sve_dup_b_from_w(high, 12)?)?;
+                }
+            }
+        }
+        Aarch64SveFilterKind::Sve2 { match_table_offset } => {
+            if !filter.is_exact() || filter.ranges().len() > 16 {
+                return Err(ObjectError::InvalidModule("invalid SVE2 MATCH filter"));
+            }
+            aarch64_set_table_address(assembler, 12, match_table_offset)?;
+            assembler.instruction(aarch64_sve_ld1rqb(16, 12)?)?;
+        }
+    }
+    Ok(())
+}
+
+fn aarch64_emit_sve_filter_candidates(
+    assembler: &mut Aarch64Assembler,
+    filter: NativeStartFilter,
+    kind: Aarch64SveFilterKind,
+) -> Result<(), ObjectError> {
+    match kind {
+        Aarch64SveFilterKind::Sve2 { .. } => {
+            assembler.instruction(aarch64_sve2_match_b(1, 0, 16)?)?;
+        }
+        Aarch64SveFilterKind::Sve if filter.is_exact() => {
+            for (index, _) in filter.ranges().iter().enumerate() {
+                let constant = aarch64_sve_filter_constant_register(index)?;
+                let destination = if index == 0 { 1 } else { 2 };
+                assembler.instruction(aarch64_sve_cmpeq_b(destination, 0, constant)?)?;
+                if index != 0 {
+                    assembler.instruction(aarch64_sve_orr_b(1, 1, 2)?)?;
+                }
+            }
+        }
+        Aarch64SveFilterKind::Sve => {
+            for (index, _) in filter.ranges().iter().enumerate() {
+                let low = aarch64_sve_filter_constant_register(index.checked_mul(2).ok_or(
+                    ObjectError::ArithmeticOverflow("SVE range-filter candidate low"),
+                )?)?;
+                let high = aarch64_sve_filter_constant_register(
+                    index
+                        .checked_mul(2)
+                        .and_then(|value| value.checked_add(1))
+                        .ok_or(ObjectError::ArithmeticOverflow(
+                            "SVE range-filter candidate high",
+                        ))?,
+                )?;
+                let destination = if index == 0 { 1 } else { 2 };
+                assembler.instruction(aarch64_sve_cmphs_b(destination, 0, low)?)?;
+                // CMPLS(data, high) is the CMPhs(high, data) alias.
+                assembler.instruction(aarch64_sve_cmphs_b(3, high, 0)?)?;
+                assembler.instruction(aarch64_sve_and_b(destination, destination, 3)?)?;
+                if index != 0 {
+                    assembler.instruction(aarch64_sve_orr_b(1, 1, 2)?)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Emit one vector-length-agnostic scanner over a graph-derived byte filter.
+///
+/// Every full block consumes the runtime `CNTB` width. A hit is refined to
+/// its exact first lane entirely in predicates, so callers may continue at
+/// `candidate` without rescanning the block. The bounded tail is delegated to
+/// the existing scalar path.
+fn aarch64_emit_sve_start_filter_scanner(
+    assembler: &mut Aarch64Assembler,
+    filter: NativeStartFilter,
+    maximum_scan_offset: u8,
+    kind: Aarch64SveFilterKind,
+    vector: Aarch64Label,
+    scalar: Aarch64Label,
+    candidate: Aarch64Label,
+) -> Result<(), ObjectError> {
+    let hit = assembler.label()?;
+    aarch64_emit_sve_filter_setup(assembler, filter, kind)?;
+    assembler.bind(vector)?;
+    assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+    assembler.instruction(aarch64_sve_cntb(6)?)?;
+    if maximum_scan_offset != 0 {
+        assembler.instruction(aarch64_add_x_imm(6, 6, u16::from(maximum_scan_offset))?)?;
+    }
+    assembler.instruction(aarch64_cmp_x(12, 6)?)?;
+    assembler.branch_cond(AARCH64_LO, scalar)?;
+    aarch64_emit_start_filter_address(assembler, filter.scan_offset)?;
+    assembler.instruction(aarch64_sve_ld1b(0, 12)?)?;
+    aarch64_emit_sve_filter_candidates(assembler, filter, kind)?;
+    assembler.instruction(aarch64_sve_ptest_p0_p1())?;
+    assembler.branch_cond(AARCH64_NE, hit)?;
+    assembler.instruction(aarch64_sve_incb(2)?)?;
+    assembler.branch(vector)?;
+    assembler.bind(hit)?;
+    assembler.instruction(aarch64_sve_brkb_p2_p0_p1())?;
+    assembler.instruction(aarch64_sve_cntp_p0_p2(12)?)?;
+    assembler.instruction(aarch64_add_x_reg(2, 2, 12)?)?;
+    assembler.branch(candidate)?;
     Ok(())
 }
 
@@ -8507,7 +8844,7 @@ fn lower_aarch64_dfa(
     layout: NativeDfaLayout,
     features: FeatureSet,
 ) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
-    lower_aarch64_dfa_for_operating_system(layout, features, OperatingSystem::Linux)
+    lower_aarch64_dfa_for_operating_system(layout, features, OperatingSystem::Linux, None)
 }
 
 const fn aarch64_use_exact_first_lane(_operating_system: OperatingSystem) -> bool {
@@ -8523,6 +8860,7 @@ fn lower_aarch64_dfa_for_operating_system(
     layout: NativeDfaLayout,
     features: FeatureSet,
     operating_system: OperatingSystem,
+    sve_filter_kind: Option<Aarch64SveFilterKind>,
 ) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
     let mut assembler = Aarch64Assembler::new();
     let scan = assembler.label()?;
@@ -8536,6 +8874,9 @@ fn lower_aarch64_dfa_for_operating_system(
     let prefix_fail = assembler.label()?;
     let prefix_retained_fail = assembler.label()?;
     let prefix_terminal = assembler.label()?;
+    let filter_sve = assembler.label()?;
+    let filter_sve_candidate = assembler.label()?;
+    let filter_sve_reject = assembler.label()?;
     let filter_vector = assembler.label()?;
     let filter_single_vector = assembler.label()?;
     let filter_batch_primary_hit = assembler.label()?;
@@ -8578,7 +8919,12 @@ fn lower_aarch64_dfa_for_operating_system(
 
     let table_page = assembler.instruction(0x9000_0005)?;
     let table_page_offset = assembler.instruction(aarch64_add_x_imm(5, 5, 0)?)?;
-    let use_asimd_filter = features.has(CpuFeature::Aarch64Asimd)
+    let use_sve_filter = sve_filter_kind.is_some()
+        && layout
+            .start_filter
+            .is_some_and(|filter| !filter.ranges().is_empty());
+    let use_asimd_filter = !use_sve_filter
+        && features.has(CpuFeature::Aarch64Asimd)
         && layout
             .start_filter
             .is_some_and(|filter| !filter.ranges().is_empty());
@@ -8727,7 +9073,31 @@ fn lower_aarch64_dfa_for_operating_system(
                 || vector_filter.map_or(filter.scan_offset, NativeVectorFilter::max_scan_offset),
                 |_| 1,
             );
-            if use_asimd_filter {
+            if let Some(sve_filter_kind) = sve_filter_kind.filter(|_| use_sve_filter) {
+                aarch64_emit_sve_start_filter_scanner(
+                    &mut assembler,
+                    filter,
+                    maximum_scan_offset,
+                    sve_filter_kind,
+                    filter_sve,
+                    filter_scalar,
+                    filter_sve_candidate,
+                )?;
+                assembler.bind(filter_sve_candidate)?;
+                if let Some(vector_filter) = vector_filter {
+                    for &column in &vector_filter.columns()[1..] {
+                        aarch64_emit_scalar_filter_membership(
+                            &mut assembler,
+                            column,
+                            filter_sve_reject,
+                        )?;
+                    }
+                }
+                assembler.branch(candidate)?;
+                assembler.bind(filter_sve_reject)?;
+                assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+                assembler.branch(filter_sve)?;
+            } else if use_asimd_filter {
                 assembler.bind(filter_vector)?;
                 assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
                 if use_asimd_batch {
@@ -9452,6 +9822,37 @@ mod tests {
         assert_eq!(&code[..5], &[0x90, 0xeb, 0xfd, 0x75, 0xfb]);
         assert_eq!(&code[133..138], &[0xe9, 0x7b, 0xff, 0xff, 0xff]);
         assert_eq!(&code[138..], &[0xe9, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn aarch64_sve_scanner_instructions_have_exact_encodings() {
+        assert_eq!(aarch64_sve_ptrue_b(), 0x2518_e3e0);
+        assert_eq!(aarch64_sve_cntb(13).unwrap(), 0x0420_e3ed);
+        assert_eq!(aarch64_sve_incb(2).unwrap(), 0x0430_e3e2);
+        assert_eq!(aarch64_sve_ld1b(0, 12).unwrap(), 0xa400_a180);
+        assert_eq!(aarch64_sve_ld1rqb(16, 12).unwrap(), 0xa400_2190);
+        assert_eq!(aarch64_sve_dup_b_from_w(16, 12).unwrap(), 0x0520_3990);
+        assert_eq!(aarch64_sve_cmpeq_b(1, 0, 16).unwrap(), 0x2410_a001);
+        assert_eq!(aarch64_sve_cmphs_b(1, 0, 16).unwrap(), 0x2410_0001);
+        assert_eq!(aarch64_sve_cmphs_b(3, 17, 0).unwrap(), 0x2400_0223);
+        assert_eq!(aarch64_sve_and_b(1, 1, 3).unwrap(), 0x2503_4021);
+        assert_eq!(aarch64_sve_orr_b(1, 1, 2).unwrap(), 0x2582_4021);
+        assert_eq!(aarch64_sve_ptest_p0_p1(), 0x2550_c020);
+        assert_eq!(aarch64_sve_brkb_p2_p0_p1(), 0x2590_4022);
+        assert_eq!(aarch64_sve_cntp_p0_p2(12).unwrap(), 0x2520_804c);
+        assert_eq!(aarch64_sve2_match_b(1, 0, 16).unwrap(), 0x4530_8001);
+    }
+
+    #[test]
+    fn aarch64_sve_constants_use_ordinary_aapcs64_scratch_registers() {
+        // The public entry has no scalable arguments/results. AAPCS64 6.1.3
+        // therefore classifies Z16..Z31 as caller-saved; 6.1.4 classifies all
+        // predicates as caller-saved. Keep constants out of Z8..Z15 so their
+        // callee-saved low V-register halves never need a preservation frame.
+        let registers = (0..MAX_START_FILTER_RANGES)
+            .map(|index| aarch64_sve_filter_constant_register(index).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(registers, (16_u8..=23).collect::<Vec<_>>());
     }
 
     #[test]
@@ -11537,6 +11938,69 @@ mod tests {
         assert!(linux_asimd_words.contains(&aarch64_movi_16b(30, 16).unwrap()));
         assert!(linux_asimd_words.contains(&aarch64_movi_16b(31, 64).unwrap()));
 
+        let sve_features = FeatureSet::of(CpuFeature::Aarch64Sve);
+        let sve_target = Target::aarch64_linux().with_features(sve_features).unwrap();
+        let sve = compile_for("[3-7]", sve_target);
+        assert_eq!(
+            sve.module().start_accelerator(),
+            StartAccelerator::Aarch64Sve
+        );
+        let sve_words = sve.module().sections()[TEXT_SECTION]
+            .bytes()
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        for word in [
+            aarch64_sve_ptrue_b(),
+            aarch64_sve_cntb(6).unwrap(),
+            aarch64_sve_ld1b(0, 12).unwrap(),
+            aarch64_sve_cmphs_b(1, 0, 16).unwrap(),
+            aarch64_sve_cmphs_b(3, 17, 0).unwrap(),
+            aarch64_sve_ptest_p0_p1(),
+            aarch64_sve_incb(2).unwrap(),
+            aarch64_sve_brkb_p2_p0_p1(),
+            aarch64_sve_cntp_p0_p2(12).unwrap(),
+        ] {
+            assert!(sve_words.contains(&word), "missing SVE word {word:#010x}");
+        }
+
+        let sve2_features = sve_features.with(CpuFeature::Aarch64Sve2);
+        let sve2 = compile_for(
+            "[ACEGIKMO]",
+            Target::aarch64_linux()
+                .with_features(sve2_features)
+                .unwrap(),
+        );
+        assert_eq!(
+            sve2.module().start_accelerator(),
+            StartAccelerator::Aarch64Sve2
+        );
+        let sve2_words = sve2.module().sections()[TEXT_SECTION]
+            .bytes()
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(sve2_words.contains(&aarch64_sve_ld1rqb(16, 12).unwrap()));
+        assert!(sve2_words.contains(&aarch64_sve2_match_b(1, 0, 16).unwrap()));
+        assert_ne!(sve.object(), sve2.object());
+
+        let mac_sve = compile_for(
+            "[3-7]",
+            Target::aarch64_macos().with_features(sve_features).unwrap(),
+        );
+        assert_eq!(
+            mac_sve.module().start_accelerator(),
+            StartAccelerator::Scalar,
+            "unsupported macOS SVE requests must fall back deterministically"
+        );
+        assert!(
+            !mac_sve.module().sections()[TEXT_SECTION]
+                .bytes()
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .any(|word| word == aarch64_sve_ptrue_b())
+        );
+
         let broad_asimd = compile_for("[A-F0-9_]", asimd_target);
         assert_eq!(
             broad_asimd.module().start_accelerator(),
@@ -11685,6 +12149,91 @@ mod tests {
                 compile_for("a*", target).module().start_accelerator(),
                 StartAccelerator::None
             );
+        }
+    }
+
+    #[test]
+    fn aarch64_asimd_lowering_is_unchanged_by_sve_feature_facts() {
+        let asimd = FeatureSet::of(CpuFeature::Aarch64Asimd);
+        let mixed_feature_sets = [
+            asimd.with(CpuFeature::Aarch64Sve),
+            asimd
+                .with(CpuFeature::Aarch64Sve)
+                .with(CpuFeature::Aarch64Sve2),
+        ];
+        let cases = [
+            ("[3-7]", OutputContract::SelectedEnd, EngineKind::OrderedDfa),
+            (
+                "[ACEGIKMO]",
+                OutputContract::SelectedEnd,
+                EngineKind::OrderedDfa,
+            ),
+            (
+                "[acegik][02468]QZ",
+                OutputContract::Span,
+                EngineKind::OrderedDfa,
+            ),
+            ("(?:ab|cd)", OutputContract::Span, EngineKind::OrderedDfa),
+            (
+                "A(?-u:[^Z])*Z",
+                OutputContract::Exists,
+                EngineKind::OrderedDfa,
+            ),
+            ("(?-u:[^Z]*)", OutputContract::Span, EngineKind::OrderedDfa),
+            (
+                r"(?-u:\b)z(?s:.)*?",
+                OutputContract::Span,
+                EngineKind::OrderedContextDfa,
+            ),
+            (
+                r"(?-u:\b)[a-z]+Z(?s:.)*?",
+                OutputContract::Span,
+                EngineKind::OrderedContextDfa,
+            ),
+        ];
+
+        for base_target in [Target::aarch64_linux(), Target::aarch64_macos()] {
+            for (pattern, output, expected_engine) in cases {
+                let compile_for = |features| {
+                    compile(
+                        CompileRequest::new(pattern, base_target.with_features(features).unwrap())
+                            .mode(CompileMode::Optimizing)
+                            .output(output),
+                    )
+                    .unwrap()
+                };
+                let baseline = compile_for(asimd);
+                assert_eq!(
+                    baseline.program().engine_kind(),
+                    expected_engine,
+                    "{pattern}"
+                );
+
+                for mixed_features in mixed_feature_sets {
+                    let mixed = compile_for(mixed_features);
+                    assert_eq!(mixed.program().engine_kind(), expected_engine, "{pattern}");
+                    assert_eq!(
+                        mixed.module().sections(),
+                        baseline.module().sections(),
+                        "ASIMD code/data changed for {pattern:?} on {base_target:?}"
+                    );
+                    assert_eq!(
+                        mixed.module().relocations(),
+                        baseline.module().relocations(),
+                        "ASIMD relocations changed for {pattern:?} on {base_target:?}"
+                    );
+                    assert_eq!(
+                        mixed.module().start_accelerator(),
+                        baseline.module().start_accelerator(),
+                        "ASIMD accelerator changed for {pattern:?} on {base_target:?}"
+                    );
+                    assert_eq!(
+                        mixed.module().anchored_prefix_filter_bytes(),
+                        baseline.module().anchored_prefix_filter_bytes(),
+                        "ASIMD receipt changed for {pattern:?} on {base_target:?}"
+                    );
+                }
+            }
         }
     }
 
@@ -16598,14 +17147,20 @@ mod tests {
                         assert!(code.windows(clear.len()).any(|window| window == clear));
                     }
                     Architecture::Aarch64 => {
-                        assert!(use_aarch64_filter_batch(filter));
                         let words = code
                             .chunks_exact(4)
                             .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
                             .collect::<Vec<_>>();
-                        assert!(
-                            words.contains(&aarch64_add_x_imm(2, 2, AARCH64_BATCH_BYTES).unwrap())
-                        );
+                        if target.features.has(CpuFeature::Aarch64Sve) {
+                            assert!(words.contains(&aarch64_sve_incb(2).unwrap()));
+                        } else {
+                            assert!(use_aarch64_filter_batch(filter));
+                            assert!(
+                                words.contains(
+                                    &aarch64_add_x_imm(2, 2, AARCH64_BATCH_BYTES).unwrap()
+                                )
+                            );
+                        }
                     }
                 }
             }
@@ -16826,6 +17381,32 @@ mod tests {
             "FRE_AOT_AARCH64_ASIMD_BUNDLE",
             "fre-aot-aarch64-asimd-bundle",
             "native-aarch64-linux-asimd-differential-ok",
+        );
+    }
+
+    #[test]
+    #[ignore = "generates a base-SVE AArch64 Linux linker/execution bundle"]
+    fn generate_aarch64_linux_sve_differential_bundle() {
+        generate_differential_bundle(
+            Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Sve))
+                .unwrap(),
+            "FRE_AOT_AARCH64_SVE_BUNDLE",
+            "fre-aot-aarch64-sve-bundle",
+            "native-aarch64-linux-sve-differential-ok",
+        );
+    }
+
+    #[test]
+    #[ignore = "generates an SVE2 AArch64 Linux linker/execution bundle"]
+    fn generate_aarch64_linux_sve2_differential_bundle() {
+        generate_differential_bundle(
+            Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2))
+                .unwrap(),
+            "FRE_AOT_AARCH64_SVE2_BUNDLE",
+            "fre-aot-aarch64-sve2-bundle",
+            "native-aarch64-linux-sve2-differential-ok",
         );
     }
 

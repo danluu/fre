@@ -8,7 +8,7 @@
 use super::{
     AARCH64_EQ, AARCH64_FIRST_LANE_INDEX, AARCH64_HI, AARCH64_HS, AARCH64_LO, AARCH64_LS,
     AARCH64_MI, AARCH64_NE, AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
-    AARCH64_VECTOR_FILTER_FIRST_CONSTANT, Aarch64Assembler, Architecture,
+    AARCH64_VECTOR_FILTER_FIRST_CONSTANT, Aarch64Assembler, Aarch64SveFilterKind, Architecture,
     BYTE_FREQUENCY_DENOMINATOR, CpuFeature, EMPTY_NATIVE_PREFIX_RELATION_RECTANGLE, FeatureSet,
     MAX_NATIVE_PREFIX_RELATION_RECTANGLES, ModuleRelocation, NativeLowering, NativePrefixFilter,
     NativePrefixRelationPredicate, NativePrefixRelationRectangle, NativePrefixRelationVectorPlan,
@@ -22,8 +22,9 @@ use super::{
     aarch64_emit_start_filter_address, aarch64_emit_start_filter_batch_candidates,
     aarch64_emit_start_filter_constants, aarch64_emit_start_filter_scalar_bound,
     aarch64_emit_start_filter_vector_candidates, aarch64_emit_start_filter_vector_test,
-    aarch64_emit_vector_filter_secondary_batch, aarch64_emit_vector_filter_secondary_candidates_at,
-    aarch64_load_byte_reg, aarch64_load_halfword_reg, aarch64_load_q, aarch64_load_u32_constant,
+    aarch64_emit_sve_start_filter_scanner, aarch64_emit_vector_filter_secondary_batch,
+    aarch64_emit_vector_filter_secondary_candidates_at, aarch64_load_byte_reg,
+    aarch64_load_halfword_reg, aarch64_load_q, aarch64_load_u32_constant,
     aarch64_load_u64_constant, aarch64_lsr_x_imm, aarch64_mov_x, aarch64_movi_16b, aarch64_movz_w,
     aarch64_orr_16b, aarch64_prefix_relation_constant_register, aarch64_set_table_address,
     aarch64_store_x, aarch64_sub_w_imm, aarch64_sub_x_imm, aarch64_sub_x_reg,
@@ -74,6 +75,13 @@ struct ContextInteriorGuard {
     primary: NativeStartFilter,
     vector_filter: Option<NativeVectorFilter>,
     restart: ContextPrepassRestart,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ContextSve2MatchTables {
+    interior: Option<u32>,
+    anchored: Option<u32>,
+    ordinary: Option<u32>,
 }
 
 /// Candidate scanner selected for the exact-start contextual verifier.
@@ -2528,6 +2536,197 @@ fn install_context_asimd_lane_index(
     })?))
 }
 
+fn install_context_sve2_match_table(
+    layout: &mut ContextNativeLayout,
+    target: Target,
+    filter: Option<NativeStartFilter>,
+) -> Result<Option<u32>, ObjectError> {
+    if target.architecture != Architecture::Aarch64
+        || target.operating_system != super::OperatingSystem::Linux
+        || target.features.has(CpuFeature::Aarch64Asimd)
+        || !target.features.has(CpuFeature::Aarch64Sve)
+        || !target.features.has(CpuFeature::Aarch64Sve2)
+    {
+        return Ok(None);
+    }
+    let Some(filter) = filter.filter(|filter| filter.is_exact() && !filter.ranges().is_empty())
+    else {
+        return Ok(None);
+    };
+    let alignment = 16_usize;
+    let aligned =
+        layout
+            .data
+            .len()
+            .checked_add(alignment - 1)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "context SVE2 match-table alignment",
+            ))?
+            & !(alignment - 1);
+    let total = aligned
+        .checked_add(16)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "context SVE2 match-table bytes",
+        ))?;
+    let maximum_table_bytes = usize::try_from(i32::MAX)
+        .map_err(|_| ObjectError::ArithmeticOverflow("context SVE2 table address limit"))?
+        .min(MAX_CONTEXT_NATIVE_DATA_BYTES);
+    if total > maximum_table_bytes {
+        return Ok(None);
+    }
+    let additional =
+        total
+            .checked_sub(layout.data.len())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "context SVE2 table reservation",
+            ))?;
+    if layout.data.try_reserve_exact(additional).is_err() {
+        return Ok(None);
+    }
+    layout.data.resize(aligned, 0);
+    for index in 0..16_usize {
+        let range = filter
+            .ranges()
+            .get(index % filter.ranges().len())
+            .ok_or(ObjectError::InvalidModule("empty context SVE2 match table"))?;
+        layout.data.push(range.start);
+    }
+    Ok(Some(u32::try_from(aligned).map_err(|_| {
+        ObjectError::ArithmeticOverflow("context SVE2 match-table offset")
+    })?))
+}
+
+fn aarch64_context_prefix_accelerator(
+    target: Target,
+    primary: NativeStartFilter,
+    vector_filter: Option<NativeVectorFilter>,
+    boundary_pair: Option<ContextBoundaryPairExpression>,
+    sve2_match_table: Option<u32>,
+) -> Option<StartAccelerator> {
+    if primary.ranges().is_empty() {
+        return None;
+    }
+    if target.operating_system == super::OperatingSystem::Linux
+        && !target.features.has(CpuFeature::Aarch64Asimd)
+        && target.features.has(CpuFeature::Aarch64Sve)
+        && vector_filter.is_none()
+        && boundary_pair.is_none()
+    {
+        return Some(if sve2_match_table.is_some() {
+            StartAccelerator::Aarch64Sve2
+        } else {
+            StartAccelerator::Aarch64Sve
+        });
+    }
+    Some(if target.features.has(CpuFeature::Aarch64Asimd) {
+        StartAccelerator::Aarch64Asimd
+    } else {
+        StartAccelerator::Scalar
+    })
+}
+
+const fn aarch64_context_accelerator_rank(accelerator: StartAccelerator) -> u8 {
+    match accelerator {
+        StartAccelerator::None => 0,
+        StartAccelerator::Scalar => 1,
+        StartAccelerator::Aarch64Asimd => 2,
+        StartAccelerator::Aarch64Sve => 3,
+        StartAccelerator::Aarch64Sve2 => 4,
+        StartAccelerator::X86Sse2 | StartAccelerator::X86Avx2 | StartAccelerator::X86Avx512Bw => 0,
+    }
+}
+
+fn strongest_aarch64_context_accelerator(
+    current: &mut StartAccelerator,
+    candidate: Option<StartAccelerator>,
+) {
+    if let Some(candidate) = candidate
+        && aarch64_context_accelerator_rank(candidate) > aarch64_context_accelerator_rank(*current)
+    {
+        *current = candidate;
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the receipt must mirror every independently emitted context scanner route"
+)]
+fn selected_context_start_accelerator(
+    target: Target,
+    terminal_suffix_search: Option<ContextTerminalSuffixSearch>,
+    anchored_forward_search: Option<ContextAnchoredForwardSearch>,
+    anchored_boundary_pair: Option<ContextBoundaryPairExpression>,
+    start_filter: Option<NativeStartFilter>,
+    vector_filter: Option<NativeVectorFilter>,
+    ordinary_boundary_pair: Option<ContextBoundaryPairExpression>,
+    interior_guard: Option<ContextInteriorGuard>,
+    sve2_match_tables: ContextSve2MatchTables,
+) -> StartAccelerator {
+    let has_prefix_scanner = interior_guard.is_some_and(|guard| !guard.primary.ranges().is_empty())
+        || anchored_forward_search.is_some_and(|search| !search.primary.ranges().is_empty())
+        || start_filter.is_some_and(|filter| !filter.ranges().is_empty());
+    match target.architecture {
+        Architecture::X86_64 => {
+            if !has_prefix_scanner && terminal_suffix_search.is_none() {
+                return StartAccelerator::None;
+            }
+            match context_x86_start_filter_kind(target.features) {
+                X86StartFilterKind::Sse2 => StartAccelerator::X86Sse2,
+                X86StartFilterKind::Avx2 => StartAccelerator::X86Avx2,
+                X86StartFilterKind::Avx512Bw => StartAccelerator::X86Avx512Bw,
+            }
+        }
+        Architecture::Aarch64 => {
+            let mut selected = StartAccelerator::None;
+            if let Some(guard) = interior_guard {
+                strongest_aarch64_context_accelerator(
+                    &mut selected,
+                    aarch64_context_prefix_accelerator(
+                        target,
+                        guard.primary,
+                        guard.vector_filter,
+                        None,
+                        sve2_match_tables.interior,
+                    ),
+                );
+            }
+            if let Some(search) = anchored_forward_search {
+                strongest_aarch64_context_accelerator(
+                    &mut selected,
+                    aarch64_context_prefix_accelerator(
+                        target,
+                        search.primary,
+                        search.vector_filter,
+                        anchored_boundary_pair,
+                        sve2_match_tables.anchored,
+                    ),
+                );
+            }
+            if let Some(primary) = start_filter {
+                strongest_aarch64_context_accelerator(
+                    &mut selected,
+                    aarch64_context_prefix_accelerator(
+                        target,
+                        primary,
+                        vector_filter,
+                        ordinary_boundary_pair,
+                        sve2_match_tables.ordinary,
+                    ),
+                );
+            }
+            // The existing terminal-suffix implementation is an ASIMD
+            // scanner on AArch64 independently of the primary prepasses.
+            if terminal_suffix_search.is_some() {
+                strongest_aarch64_context_accelerator(
+                    &mut selected,
+                    Some(StartAccelerator::Aarch64Asimd),
+                );
+            }
+            selected
+        }
+    }
+}
+
 /// Lower a complete contextual DFA without retaining a runtime dependency.
 #[allow(
     clippy::too_many_lines,
@@ -2753,6 +2952,27 @@ pub(super) fn lower_native_context(
         || terminal_suffix_search.is_some();
     let asimd_lane_index_offset =
         install_context_asimd_lane_index(&mut layout, target, has_vector_prepass)?;
+    let sve2_match_tables = ContextSve2MatchTables {
+        interior: install_context_sve2_match_table(
+            &mut layout,
+            target,
+            interior_guard
+                .filter(|guard| guard.vector_filter.is_none())
+                .map(|guard| guard.primary),
+        )?,
+        anchored: install_context_sve2_match_table(
+            &mut layout,
+            target,
+            anchored_forward_search
+                .filter(|search| search.vector_filter.is_none() && anchored_boundary_pair.is_none())
+                .map(|search| search.primary),
+        )?,
+        ordinary: install_context_sve2_match_table(
+            &mut layout,
+            target,
+            start_filter.filter(|_| vector_filter.is_none() && ordinary_boundary_pair.is_none()),
+        )?,
+    };
     let (code, relocations) = match target.architecture {
         Architecture::X86_64 => lower_x86_64_context(
             &layout,
@@ -2789,24 +3009,22 @@ pub(super) fn lower_native_context(
             state_skip,
             empty_prefix_restart,
             target.features,
+            target.operating_system,
             asimd_lane_index_offset,
+            sve2_match_tables,
         )?,
     };
-    let start_accelerator = anchored_forward_search
-        .map(|search| search.primary)
-        .or(start_filter)
-        .or(terminal_suffix_search.map(|suffix| suffix.primary))
-        .map_or(StartAccelerator::None, |_| match target.architecture {
-            Architecture::X86_64 => match context_x86_start_filter_kind(target.features) {
-                X86StartFilterKind::Sse2 => StartAccelerator::X86Sse2,
-                X86StartFilterKind::Avx2 => StartAccelerator::X86Avx2,
-                X86StartFilterKind::Avx512Bw => StartAccelerator::X86Avx512Bw,
-            },
-            Architecture::Aarch64 if target.features.has(CpuFeature::Aarch64Asimd) => {
-                StartAccelerator::Aarch64Asimd
-            }
-            Architecture::Aarch64 => StartAccelerator::Scalar,
-        });
+    let start_accelerator = selected_context_start_accelerator(
+        target,
+        terminal_suffix_search,
+        anchored_forward_search,
+        anchored_boundary_pair,
+        start_filter,
+        vector_filter,
+        ordinary_boundary_pair,
+        interior_guard,
+        sve2_match_tables,
+    );
     Ok(NativeLowering {
         code,
         data: layout.data,
@@ -6079,6 +6297,7 @@ fn aarch64_context_emit_prefix_prepass(
     restart: ContextPrepassRestart,
     reject_empty_with: Option<(&ContextNativeLayout, Option<usize>)>,
     anchored_guard: Option<(ContextAnchoredAdaptiveGuard, usize)>,
+    sve_filter_kind: Option<Aarch64SveFilterKind>,
     use_asimd: bool,
     use_exact_asimd_lane: bool,
     no_match: usize,
@@ -6086,6 +6305,41 @@ fn aarch64_context_emit_prefix_prepass(
     vector_entry: Option<usize>,
 ) -> Result<(), ObjectError> {
     let vector_candidate = assembler.label()?;
+    if let Some(sve_filter_kind) = sve_filter_kind.filter(|_| {
+        vector_filter.is_none() && boundary_pair.is_none() && !primary.ranges().is_empty()
+    }) {
+        let vector = match vector_entry {
+            Some(label) => label,
+            None => assembler.label()?,
+        };
+        let scalar = assembler.label()?;
+        aarch64_emit_sve_start_filter_scanner(
+            assembler,
+            primary,
+            primary.scan_offset,
+            sve_filter_kind,
+            vector,
+            scalar,
+            vector_candidate,
+        )?;
+        assembler.bind(scalar)?;
+        return aarch64_context_emit_scalar_prefix_prepass(
+            assembler,
+            primary,
+            vector_filter,
+            prefix_filter,
+            guarded_bytes,
+            known_span_start,
+            restart,
+            reject_empty_with,
+            anchored_guard,
+            no_match,
+            invalid,
+            Some(vector),
+            None,
+            vector_candidate,
+        );
+    }
     if !use_asimd || primary.ranges().is_empty() {
         if let Some(entry) = vector_entry {
             assembler.bind(entry)?;
@@ -7004,6 +7258,7 @@ fn aarch64_context_emit_anchored_forward_search(
     adaptive_guard: ContextAnchoredAdaptiveGuard,
     prefix_filter: Option<NativePrefixFilter>,
     boundary_pair: Option<ContextBoundaryPairExpression>,
+    sve_filter_kind: Option<Aarch64SveFilterKind>,
     use_asimd: bool,
     use_exact_asimd_lane: bool,
     no_match: usize,
@@ -7034,6 +7289,7 @@ fn aarch64_context_emit_anchored_forward_search(
         ContextPrepassRestart::CandidateBase,
         Some((layout, None)),
         Some((adaptive_guard, fallback)),
+        sve_filter_kind,
         use_asimd,
         use_exact_asimd_lane,
         no_match,
@@ -7124,7 +7380,9 @@ fn lower_aarch64_context(
     state_skip: Option<ContextStateSkip>,
     empty_prefix_restart: bool,
     features: FeatureSet,
+    operating_system: super::OperatingSystem,
     asimd_lane_index_offset: Option<u32>,
+    sve2_match_tables: ContextSve2MatchTables,
 ) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
     let mut assembler = Aarch64Assembler::new();
     let current_sentinel = assembler.label()?;
@@ -7197,6 +7455,15 @@ fn lower_aarch64_context(
     aarch64_load_u32_constant(&mut assembler, 14, u32::from(layout.class_count))?;
 
     let use_asimd = features.has(CpuFeature::Aarch64Asimd);
+    let use_sve = operating_system == super::OperatingSystem::Linux
+        && !use_asimd
+        && features.has(CpuFeature::Aarch64Sve);
+    let sve_filter_kind = |match_table_offset: Option<u32>| {
+        use_sve.then(|| match match_table_offset {
+            Some(match_table_offset) => Aarch64SveFilterKind::Sve2 { match_table_offset },
+            None => Aarch64SveFilterKind::Sve,
+        })
+    };
     let use_exact_asimd_lane = asimd_lane_index_offset.is_some();
     if let Some(offset) = asimd_lane_index_offset {
         aarch64_emit_first_lane_constants(&mut assembler, offset)?;
@@ -7227,6 +7494,7 @@ fn lower_aarch64_context(
             guard.restart,
             None,
             None,
+            sve_filter_kind(sve2_match_tables.interior),
             use_asimd,
             use_exact_asimd_lane,
             no_match,
@@ -7245,6 +7513,7 @@ fn lower_aarch64_context(
             adaptive_guard,
             anchored_prefix_filter,
             anchored_boundary_pair,
+            sve_filter_kind(sve2_match_tables.anchored),
             use_asimd,
             use_exact_asimd_lane,
             no_match,
@@ -7276,6 +7545,7 @@ fn lower_aarch64_context(
                 ENABLE_CONTEXT_PREFIX_DISPATCH_REUSE.then_some(forward_initialized),
             )),
             None,
+            sve_filter_kind(sve2_match_tables.ordinary),
             use_asimd,
             use_exact_asimd_lane,
             no_match,
@@ -9553,6 +9823,119 @@ mod tests {
     }
 
     #[test]
+    fn contextual_primary_filter_uses_variable_length_sve_when_supported() {
+        let target = Target::aarch64_linux()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Sve))
+            .unwrap();
+        let compiled = compile(
+            CompileRequest::new(r"(?-u:\b)z(?s:.)*?", target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span),
+        )
+        .unwrap();
+        assert_eq!(
+            compiled.module().start_accelerator(),
+            StartAccelerator::Aarch64Sve
+        );
+        let words = compiled.module().sections()[TEXT_SECTION]
+            .bytes()
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        for word in [
+            super::super::aarch64_sve_ptrue_b(),
+            super::super::aarch64_sve_cntb(6).unwrap(),
+            super::super::aarch64_sve_ld1b(0, 12).unwrap(),
+            super::super::aarch64_sve_brkb_p2_p0_p1(),
+            super::super::aarch64_sve_cntp_p0_p2(12).unwrap(),
+        ] {
+            assert!(
+                words.contains(&word),
+                "missing contextual SVE word {word:#010x}"
+            );
+        }
+
+        let sve2 = compile(
+            CompileRequest::new(
+                r"(?-u:\b)z(?s:.)*?",
+                Target::aarch64_linux()
+                    .with_features(
+                        FeatureSet::of(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2),
+                    )
+                    .unwrap(),
+            )
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span),
+        )
+        .unwrap();
+        assert_eq!(
+            sve2.module().start_accelerator(),
+            StartAccelerator::Aarch64Sve2
+        );
+        let sve2_words = sve2.module().sections()[TEXT_SECTION]
+            .bytes()
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(sve2_words.contains(&super::super::aarch64_sve_ld1rqb(16, 12).unwrap()));
+        assert!(sve2_words.contains(&super::super::aarch64_sve2_match_b(1, 0, 16).unwrap()));
+        assert_ne!(compiled.object(), sve2.object());
+    }
+
+    #[test]
+    fn contextual_sve_receipt_aggregates_every_emitted_prepass() {
+        let target = Target::aarch64_linux()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2))
+            .unwrap();
+        let compile_span = |pattern| {
+            compile(
+                CompileRequest::new(pattern, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span),
+            )
+            .unwrap()
+        };
+
+        // The mandatory Z is an interior-only exact scanner: there is no
+        // ordinary selective start before the unbounded wildcard.
+        let interior_only = compile_span(r"(?-u:\b)(?s:.)*Z");
+        assert_eq!(
+            interior_only.module().start_accelerator(),
+            StartAccelerator::Aarch64Sve2
+        );
+        let interior_words = interior_only.module().sections()[TEXT_SECTION]
+            .bytes()
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(interior_words.contains(&super::super::aarch64_sve_ptrue_b()));
+        assert!(interior_words.contains(&super::super::aarch64_sve2_match_b(1, 0, 16).unwrap()));
+
+        // This graph has an exact mandatory interior Z (SVE2 MATCH) and a
+        // non-exact ordinary [a-z] primary (base-SVE range compares). The
+        // receipt reports the strongest tier among both emitted routes.
+        let mixed = compile_span(r"(?-u:\b)[a-z]+Z(?s:.)*?");
+        assert_eq!(
+            mixed.module().start_accelerator(),
+            StartAccelerator::Aarch64Sve2
+        );
+        let mixed_words = mixed.module().sections()[TEXT_SECTION]
+            .bytes()
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mixed_words
+                .iter()
+                .filter(|&&word| word == super::super::aarch64_sve_ptrue_b())
+                .count(),
+            2
+        );
+        assert!(mixed_words.contains(&super::super::aarch64_sve2_match_b(1, 0, 16).unwrap()));
+        assert!(mixed_words.contains(&super::super::aarch64_sve_cmphs_b(1, 0, 16).unwrap()));
+    }
+
+    #[test]
     #[ignore = "links and executes ordinary/context ASIMD entries through an ABI sentinel wrapper"]
     #[allow(
         clippy::too_many_lines,
@@ -10612,6 +10995,48 @@ mod tests {
         }
     }
 
+    #[test]
+    #[ignore = "generates a base-SVE AArch64 Linux context differential bundle"]
+    fn generate_aarch64_linux_sve_context_differential_bundle() {
+        let directory = std::env::var_os("FRE_AOT_AARCH64_SVE_CONTEXT_BUNDLE").map_or_else(
+            || {
+                std::env::temp_dir().join(format!(
+                    "fre-aot-aarch64-sve-context-bundle-{}",
+                    std::process::id()
+                ))
+            },
+            std::path::PathBuf::from,
+        );
+        build_context_differential_bundle(
+            Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Sve))
+                .unwrap(),
+            directory,
+            false,
+        );
+    }
+
+    #[test]
+    #[ignore = "generates an SVE2 AArch64 Linux context differential bundle"]
+    fn generate_aarch64_linux_sve2_context_differential_bundle() {
+        let directory = std::env::var_os("FRE_AOT_AARCH64_SVE2_CONTEXT_BUNDLE").map_or_else(
+            || {
+                std::env::temp_dir().join(format!(
+                    "fre-aot-aarch64-sve2-context-bundle-{}",
+                    std::process::id()
+                ))
+            },
+            std::path::PathBuf::from,
+        );
+        build_context_differential_bundle(
+            Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2))
+                .unwrap(),
+            directory,
+            false,
+        );
+    }
+
     #[allow(
         clippy::arithmetic_side_effects,
         clippy::too_many_lines,
@@ -10627,6 +11052,19 @@ mod tests {
                 "x86_64"
             }
         ));
+        build_context_differential_bundle(target, directory, true);
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::too_many_lines,
+        reason = "native bundle construction and exact all-window expectations remain one audit unit"
+    )]
+    fn build_context_differential_bundle(
+        target: Target,
+        directory: std::path::PathBuf,
+        execute: bool,
+    ) {
         fs::create_dir_all(&directory).unwrap();
         let mut source = String::from(
             "#include <stdint.h>\n#include <stddef.h>\n#include <stdio.h>\n\
@@ -10636,6 +11074,7 @@ mod tests {
         let mut objects = Vec::new();
         let mut first_symbol = None;
         let mut first_length = 0;
+        let mut saw_sve = false;
         for (index, (pattern, output, haystack)) in cases().into_iter().enumerate() {
             let compiled = compile(
                 CompileRequest::new(pattern, target)
@@ -10645,6 +11084,10 @@ mod tests {
             .unwrap();
             assert!(compiled.program().native_context_program_view().is_some());
             assert_eq!(compiled.module().required_runtime_program(), None);
+            saw_sve |= matches!(
+                compiled.module().start_accelerator(),
+                StartAccelerator::Aarch64Sve | StartAccelerator::Aarch64Sve2
+            );
             let symbol = compiled.module().entry_symbol();
             first_symbol.get_or_insert_with(|| symbol.to_owned());
             if index == 0 {
@@ -10707,6 +11150,9 @@ mod tests {
             }
         }
         let symbol = first_symbol.unwrap();
+        if target.features.has(CpuFeature::Aarch64Sve) {
+            assert!(saw_sve, "context differential bundle did not exercise SVE");
+        }
         writeln!(
             body,
             "r[0]=99;r[1]=99;s={symbol}(h0,{first_length},2,1,r);if(s!=2||r[0]!=99||r[1]!=99)return 90;"
@@ -10747,6 +11193,10 @@ mod tests {
         source.push_str(&body);
         let harness = directory.join("harness.c");
         fs::write(&harness, source).unwrap();
+        if !execute {
+            println!("{}", directory.display());
+            return;
+        }
         let executable = directory.join("harness");
         let compiler = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
         let output = Command::new(compiler)

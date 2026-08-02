@@ -17,13 +17,23 @@ The code generator currently selects instruction sets as follows:
 - On x86-64, an empty feature set (or just `X86Sse2`) uses the SSE2 baseline.
   `X86Avx2` selects AVX2. AVX-512 lowering is selected only when both
   `X86Avx512F` and `X86Avx512Bw` are present.
-- On AArch64, an empty feature set uses scalar lowering. `Aarch64Asimd`
-  selects ASIMD lowering.
+- On AArch64, an empty feature set uses scalar lowering and `Aarch64Asimd`
+  selects ASIMD lowering. On Linux, an `Aarch64Sve` request without ASIMD
+  selects a
+  vector-length-agnostic scanner for graph-derived primary byte filters;
+  `Aarch64Sve2` additionally uses `MATCH` for exact byte sets. If ASIMD is
+  also requested, the compiler deliberately emits the established pure-ASIMD
+  lowering, including identical code and data, without SVE routing or tables.
+  Other accelerators in an SVE-only object retain their scalar fallback.
 
-`X86Avx512Vl`, `Aarch64Sve`, and `Aarch64Sve2` are accepted target facts but
-are reserved for future lowering and do not currently select different code.
-Feature-set validation still enforces dependencies: AVX512BW and AVX512VL
-require AVX512F, and SVE2 requires SVE.
+`X86Avx512Vl` remains an accepted target fact reserved for future lowering.
+Feature-set validation enforces dependencies: AVX512BW and AVX512VL require
+AVX512F, and SVE2 requires SVE. Unsupported SVE target/plan combinations
+fall back deterministically, and the compilation receipt reports the
+accelerator actually emitted. In particular, an SVE feature fact does not
+legalize SVE on macOS: there is no supported macOS SVE execution contract in
+this backend, so macOS keeps its ASIMD or scalar lowering instead of risking
+an illegal instruction.
 
 ## Stable semantic programs
 
