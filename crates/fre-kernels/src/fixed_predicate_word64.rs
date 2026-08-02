@@ -1189,58 +1189,12 @@ enum AdaptiveFinder {
 
 impl AdaptiveFallback {
     #[inline]
-    fn find(&self, bytes: &[u8]) -> Option<usize> {
-        match self.finder {
-            AdaptiveFinder::One(byte) => return memchr(byte, bytes),
-            AdaptiveFinder::Two(first, second) => return memchr2(first, second, bytes),
-            AdaptiveFinder::Three(first, second, third) => {
-                return memchr3(first, second, third, bytes);
-            }
-            AdaptiveFinder::Range { .. } | AdaptiveFinder::Set(_) => {}
-        }
-        let mut offset = 0_usize;
-        while let Some(end) = offset
-            .checked_add(BYTE_SET_BLOCK_BYTES)
-            .filter(|&end| end <= bytes.len())
-        {
-            let block = <&[u8; BYTE_SET_BLOCK_BYTES]>::try_from(bytes.get(offset..end)?).ok()?;
-            let members = match self.finder {
-                AdaptiveFinder::Range {
-                    origin,
-                    maximum_delta,
-                } => classify_byte_delta_16(origin, maximum_delta, block).member_mask(),
-                AdaptiveFinder::Set(classifier) => classifier.classify_16(block).member_mask(),
-                AdaptiveFinder::One(_)
-                | AdaptiveFinder::Two(_, _)
-                | AdaptiveFinder::Three(_, _, _) => return None,
-            };
-            if members != 0 {
-                let lane = usize::try_from(members.trailing_zeros()).ok()?;
-                return offset.checked_add(lane);
-            }
-            offset = end;
-        }
-        bytes
-            .get(offset..)?
-            .iter()
-            .position(|&byte| self.contains(byte))
-            .and_then(|relative| offset.checked_add(relative))
-    }
-
-    #[inline]
-    fn contains(&self, byte: u8) -> bool {
-        match self.finder {
-            AdaptiveFinder::One(first) => byte == first,
-            AdaptiveFinder::Two(first, second) => byte == first || byte == second,
-            AdaptiveFinder::Three(first, second, third) => {
-                byte == first || byte == second || byte == third
-            }
-            AdaptiveFinder::Range {
-                origin,
-                maximum_delta,
-            } => byte.wrapping_sub(origin) <= maximum_delta,
-            AdaptiveFinder::Set(classifier) => classifier.set().contains(byte),
-        }
+    fn cursor<'a>(
+        &'a self,
+        bytes: &'a [u8],
+        anchor_end: usize,
+    ) -> AdaptiveFinderCursor<'a> {
+        AdaptiveFinderCursor::new(&self.finder, bytes, anchor_end)
     }
 
     #[inline]
@@ -1252,6 +1206,134 @@ impl AdaptiveFallback {
             | AdaptiveFinder::Three(_, _, _)
             | AdaptiveFinder::Range { .. } => 0,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct AdaptiveFinderBlock {
+    // Absolute coordinates let one classified block survive every monotone
+    // restart within that block, including a jump after an accepted match.
+    start: usize,
+    end: usize,
+    members: u16,
+}
+
+struct AdaptiveFinderCursor<'a> {
+    finder: &'a AdaptiveFinder,
+    bytes: &'a [u8],
+    anchor_end: usize,
+    block: AdaptiveFinderBlock,
+    #[cfg(test)]
+    classified_chunks: usize,
+}
+
+impl<'a> AdaptiveFinderCursor<'a> {
+    fn new(finder: &'a AdaptiveFinder, bytes: &'a [u8], anchor_end: usize) -> Self {
+        Self {
+            finder,
+            bytes,
+            anchor_end,
+            block: AdaptiveFinderBlock::default(),
+            #[cfg(test)]
+            classified_chunks: 0,
+        }
+    }
+
+    #[inline]
+    fn find(&mut self, cursor: usize) -> Option<usize> {
+        let finder = self.finder;
+        match finder {
+            AdaptiveFinder::One(byte) => self
+                .bytes
+                .get(cursor..self.anchor_end)
+                .and_then(|bytes| memchr(*byte, bytes))
+                .and_then(|relative| cursor.checked_add(relative)),
+            AdaptiveFinder::Two(first, second) => self
+                .bytes
+                .get(cursor..self.anchor_end)
+                .and_then(|bytes| memchr2(*first, *second, bytes))
+                .and_then(|relative| cursor.checked_add(relative)),
+            AdaptiveFinder::Three(first, second, third) => self
+                .bytes
+                .get(cursor..self.anchor_end)
+                .and_then(|bytes| memchr3(*first, *second, *third, bytes))
+                .and_then(|relative| cursor.checked_add(relative)),
+            AdaptiveFinder::Range {
+                origin,
+                maximum_delta,
+            } => {
+                let origin = *origin;
+                let maximum_delta = *maximum_delta;
+                self.find_classified(
+                    cursor,
+                    |block| {
+                        classify_byte_delta_16(origin, maximum_delta, block).member_mask()
+                    },
+                    |byte| byte.wrapping_sub(origin) <= maximum_delta,
+                )
+            }
+            AdaptiveFinder::Set(classifier) => self.find_classified(
+                cursor,
+                |block| classifier.classify_16(block).member_mask(),
+                |byte| classifier.set().contains(byte),
+            ),
+        }
+    }
+
+    #[inline]
+    fn find_classified(
+        &mut self,
+        mut cursor: usize,
+        mut classify_16: impl FnMut(&[u8; BYTE_SET_BLOCK_BYTES]) -> u16,
+        mut contains: impl FnMut(u8) -> bool,
+    ) -> Option<usize> {
+        while cursor < self.anchor_end {
+            // Phase cursors only move forward. Masking already-serviced lanes
+            // therefore preserves the cached classification for later calls.
+            if self.block.start <= cursor && cursor < self.block.end {
+                let skipped = cursor.checked_sub(self.block.start)?;
+                let members = self.block.members & (u16::MAX << skipped);
+                if members != 0 {
+                    let lane = usize::try_from(members.trailing_zeros()).ok()?;
+                    return self.block.start.checked_add(lane);
+                }
+                cursor = self.block.end;
+                continue;
+            }
+
+            let chunk_len = self
+                .anchor_end
+                .checked_sub(cursor)?
+                .min(BYTE_SET_BLOCK_BYTES);
+            let chunk_end = cursor.checked_add(chunk_len)?;
+            let chunk = self.bytes.get(cursor..chunk_end)?;
+            let members = if chunk_len == BYTE_SET_BLOCK_BYTES {
+                let block = <&[u8; BYTE_SET_BLOCK_BYTES]>::try_from(chunk).ok()?;
+                classify_16(block)
+            } else {
+                chunk
+                    .iter()
+                    .enumerate()
+                    .fold(0_u16, |members, (lane, &byte)| {
+                        members | (u16::from(contains(byte)) << lane)
+                    })
+            };
+            self.block = AdaptiveFinderBlock {
+                start: cursor,
+                end: chunk_end,
+                members,
+            };
+            #[cfg(test)]
+            {
+                self.classified_chunks = self.classified_chunks.checked_add(1)?;
+            }
+        }
+        None
+    }
+
+    #[cfg(test)]
+    const fn classified_chunks(&self) -> usize {
+        self.classified_chunks
     }
 }
 
@@ -2164,7 +2246,7 @@ impl FixedPredicateWord64Plan {
         if !has_legal_start(slice.len(), self.width, first_untested_start) {
             return Ok(None);
         }
-        let Some(fallback) = self.adaptive_fallback else {
+        let Some(fallback) = self.adaptive_fallback.as_ref() else {
             let remaining = slice.get(first_untested_start..).ok_or(
                 SearchError::InternalInvariant("adaptive Shift-And fallback escaped the input"),
             )?;
@@ -2188,20 +2270,13 @@ impl FixedPredicateWord64Plan {
                 computation: "adaptive byte-set fallback cursor",
             })?
             .min(anchor_end);
+        let mut finder = fallback.cursor(slice, anchor_end);
         let mut burst_start = 0_usize;
         let mut burst_rejections = 0_usize;
         while cursor < anchor_end {
-            let search = slice.get(cursor..anchor_end).ok_or(
-                SearchError::InternalInvariant("adaptive byte-set fallback escaped the input"),
-            )?;
-            let Some(relative) = fallback.find(search) else {
+            let Some(anchor) = finder.find(cursor) else {
                 break;
             };
-            let anchor = cursor.checked_add(relative).ok_or(
-                SearchError::ArithmeticOverflow {
-                    computation: "adaptive byte-set fallback position",
-                },
-            )?;
             let start = anchor.checked_sub(fallback_offset).ok_or(
                 SearchError::InternalInvariant("adaptive byte-set fallback preceded its offset"),
             )?;
@@ -2691,7 +2766,7 @@ impl FixedPredicateWord64Plan {
         if !has_legal_start(slice.len(), self.width, first_untested_start) {
             return Ok(None);
         }
-        let Some(fallback) = self.adaptive_fallback else {
+        let Some(fallback) = self.adaptive_fallback.as_ref() else {
             return self.execute_first_shift_and_reporting(
                 slice,
                 window_start,
@@ -2712,40 +2787,38 @@ impl FixedPredicateWord64Plan {
                 computation: "adaptive reporting byte-set cursor",
             })?
             .min(anchor_end);
+        let mut finder = fallback.cursor(slice, anchor_end);
         let mut burst_start = 0_usize;
         let mut burst_rejections = 0_usize;
         while cursor < anchor_end {
-            let search = slice.get(cursor..anchor_end).ok_or(
-                SearchError::InternalInvariant(
-                    "adaptive reporting byte-set search escaped input",
-                ),
-            )?;
             *finder_calls = finder_calls.checked_add(1).ok_or(
                 SearchError::ArithmeticOverflow {
                     computation: "adaptive reporting byte-set finder calls",
                 },
             )?;
-            let Some(relative) = fallback.find(search) else {
-                *finder_scanned_bytes = finder_scanned_bytes.checked_add(search.len()).ok_or(
+            let service_start = cursor;
+            let Some(anchor) = finder.find(cursor) else {
+                let terminal_service = anchor_end.checked_sub(service_start).ok_or(
+                    SearchError::InternalInvariant(
+                        "adaptive reporting finder service reversed",
+                    ),
+                )?;
+                *finder_scanned_bytes = finder_scanned_bytes.checked_add(terminal_service).ok_or(
                     SearchError::ArithmeticOverflow {
                         computation: "adaptive reporting byte-set terminal service",
                     },
                 )?;
                 break;
             };
-            let service = relative.checked_add(1).ok_or(
-                SearchError::ArithmeticOverflow {
-                    computation: "adaptive reporting byte-set service",
-                },
-            )?;
+            let service = anchor
+                .checked_sub(service_start)
+                .and_then(|relative| relative.checked_add(1))
+                .ok_or(SearchError::InternalInvariant(
+                    "adaptive reporting finder service reversed",
+                ))?;
             *finder_scanned_bytes = finder_scanned_bytes.checked_add(service).ok_or(
                 SearchError::ArithmeticOverflow {
                     computation: "adaptive reporting byte-set service bytes",
-                },
-            )?;
-            let anchor = cursor.checked_add(relative).ok_or(
-                SearchError::ArithmeticOverflow {
-                    computation: "adaptive reporting byte-set anchor",
                 },
             )?;
             let start = anchor.checked_sub(fallback_offset).ok_or(
@@ -3386,7 +3459,7 @@ impl FixedPredicateWord64Plan {
         if !has_legal_start(haystack.len(), self.width, first_untested_start) {
             return Some(0);
         }
-        let Some(fallback) = self.adaptive_fallback else {
+        let Some(fallback) = self.adaptive_fallback.as_ref() else {
             return self.scan_shift_and_value(haystack.get(first_untested_start..)?);
         };
         let fallback_offset = usize::from(fallback.offset);
@@ -3399,15 +3472,14 @@ impl FixedPredicateWord64Plan {
         let mut cursor = first_untested_start
             .checked_add(fallback_offset)?
             .min(anchor_end);
+        let mut finder = fallback.cursor(haystack, anchor_end);
         let mut count = 0_u64;
         let mut burst_start = 0_usize;
         let mut burst_rejections = 0_usize;
         while cursor < anchor_end {
-            let search = haystack.get(cursor..anchor_end)?;
-            let Some(relative) = fallback.find(search) else {
+            let Some(anchor) = finder.find(cursor) else {
                 break;
             };
-            let anchor = cursor.checked_add(relative)?;
             let start = anchor.checked_sub(fallback_offset)?;
             if self.candidate_matches_value_skipping(haystack, start, fallback_offset)? {
                 count = count.checked_add(1)?;
@@ -3755,7 +3827,7 @@ impl FixedPredicateWord64Plan {
         if !has_legal_start(haystack.len(), self.width, first_untested_start) {
             return Ok(());
         }
-        let Some(fallback) = self.adaptive_fallback else {
+        let Some(fallback) = self.adaptive_fallback.as_ref() else {
             return self.scan_shift_and_reporting_suffix(
                 haystack,
                 first_untested_start,
@@ -3775,43 +3847,41 @@ impl FixedPredicateWord64Plan {
                 computation: "adaptive reducer byte-set cursor",
             })?
             .min(anchor_end);
+        let mut finder = fallback.cursor(haystack, anchor_end);
         let mut burst_start = 0_usize;
         let mut burst_rejections = 0_usize;
         while cursor < anchor_end {
-            let search = haystack
-                .get(cursor..anchor_end)
-                .ok_or(ReduceError::InternalInvariant(
-                    "adaptive reducer byte-set search escaped input",
-                ))?;
             actual.finder_calls = actual.finder_calls.checked_add(1).ok_or(
                 ReduceError::ArithmeticOverflow {
                     computation: "adaptive reducer byte-set finder calls",
                 },
             )?;
-            let Some(relative) = fallback.find(search) else {
+            let service_start = cursor;
+            let Some(anchor) = finder.find(cursor) else {
+                let terminal_service = anchor_end.checked_sub(service_start).ok_or(
+                    ReduceError::InternalInvariant(
+                        "adaptive reducer finder service reversed",
+                    ),
+                )?;
                 actual.finder_scanned_bytes = actual
                     .finder_scanned_bytes
-                    .checked_add(search.len())
+                    .checked_add(terminal_service)
                     .ok_or(ReduceError::ArithmeticOverflow {
                         computation: "adaptive reducer byte-set terminal service",
                     })?;
                 break;
             };
-            let service = relative
-                .checked_add(1)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "adaptive reducer byte-set service",
-                })?;
+            let service = anchor
+                .checked_sub(service_start)
+                .and_then(|relative| relative.checked_add(1))
+                .ok_or(ReduceError::InternalInvariant(
+                    "adaptive reducer finder service reversed",
+                ))?;
             actual.finder_scanned_bytes = actual
                 .finder_scanned_bytes
                 .checked_add(service)
                 .ok_or(ReduceError::ArithmeticOverflow {
                     computation: "adaptive reducer byte-set service bytes",
-                })?;
-            let anchor = cursor
-                .checked_add(relative)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "adaptive reducer byte-set anchor",
                 })?;
             let start = anchor
                 .checked_sub(fallback_offset)
@@ -4464,6 +4534,56 @@ mod tests {
             }
         }
         count
+    }
+
+    fn adaptive_finder_contains(finder: &AdaptiveFinder, byte: u8) -> bool {
+        match finder {
+            AdaptiveFinder::One(first) => byte == *first,
+            AdaptiveFinder::Two(first, second) => byte == *first || byte == *second,
+            AdaptiveFinder::Three(first, second, third) => {
+                byte == *first || byte == *second || byte == *third
+            }
+            AdaptiveFinder::Range {
+                origin,
+                maximum_delta,
+            } => byte.wrapping_sub(*origin) <= *maximum_delta,
+            AdaptiveFinder::Set(classifier) => classifier.set().contains(byte),
+        }
+    }
+
+    fn reference_adaptive_find(
+        finder: &AdaptiveFinder,
+        bytes: &[u8],
+        cursor: usize,
+        end: usize,
+    ) -> Option<usize> {
+        bytes
+            .get(cursor..end)?
+            .iter()
+            .position(|&byte| adaptive_finder_contains(finder, byte))
+            .and_then(|relative| cursor.checked_add(relative))
+    }
+
+    fn assert_resumable_finder_sequence(
+        finder: &AdaptiveFinder,
+        bytes: &[u8],
+        end: usize,
+        jump_seed: usize,
+    ) {
+        let mut finder_cursor = AdaptiveFinderCursor::new(finder, bytes, end);
+        let mut cursor = 0_usize;
+        let mut step = 0_usize;
+        loop {
+            let expected = reference_adaptive_find(finder, bytes, cursor, end);
+            let actual = finder_cursor.find(cursor);
+            assert_eq!(actual, expected, "cursor={cursor}, end={end}, bytes={bytes:?}");
+            let Some(found) = actual else {
+                break;
+            };
+            let jump = (jump_seed.wrapping_add(step) % 7).checked_add(1).unwrap();
+            cursor = found.saturating_add(jump).min(end);
+            step = step.checked_add(1).unwrap();
+        }
     }
 
     #[test]
@@ -5644,9 +5764,236 @@ mod tests {
             for position in [0_usize, 15, 16, 31, 32, 39] {
                 let mut bytes = [0x55_u8; 40];
                 bytes[position] = member;
-                assert_eq!(fallback.find(&bytes), Some(position));
+                let mut cursor = fallback.cursor(&bytes, bytes.len());
+                assert_eq!(cursor.find(0), Some(position));
             }
-            assert_eq!(fallback.find(&[0x55; 40]), None);
+            let bytes = [0x55; 40];
+            let mut cursor = fallback.cursor(&bytes, bytes.len());
+            assert_eq!(cursor.find(0), None);
+        }
+    }
+
+    #[test]
+    fn classified_adaptive_finder_reuses_member_lanes_across_monotone_restarts() {
+        let mut set_words = [0_u64; 4];
+        for byte in [b'A', b'C', 0xFF] {
+            set_words[usize::from(byte >> 6)] |= 1_u64 << u32::from(byte & 63);
+        }
+        let finders = [
+            AdaptiveFinder::Range {
+                origin: b'A',
+                maximum_delta: 3,
+            },
+            AdaptiveFinder::Set(ByteSetClassifier::new(ByteSet256::from_words(
+                set_words,
+            ))),
+        ];
+        let bytes = [b'A'; 40];
+
+        for finder in &finders {
+            let mut cursor = AdaptiveFinderCursor::new(finder, &bytes, bytes.len());
+            for position in 0..bytes.len() {
+                assert_eq!(cursor.find(position), Some(position));
+                assert_eq!(cursor.classified_chunks(), position / BYTE_SET_BLOCK_BYTES + 1);
+            }
+            assert_eq!(cursor.find(bytes.len()), None);
+            assert_eq!(cursor.classified_chunks(), 3);
+
+            let mut cursor = AdaptiveFinderCursor::new(finder, &bytes, bytes.len());
+            for (position, expected_chunks) in [(0, 1), (7, 1), (15, 1), (23, 2), (39, 3)] {
+                assert_eq!(cursor.find(position), Some(position));
+                assert_eq!(cursor.classified_chunks(), expected_chunks);
+            }
+        }
+    }
+
+    #[test]
+    fn resumable_adaptive_finder_matches_exhaustive_small_reference() {
+        let mut set_words = [0_u64; 4];
+        for byte in [4_u8, 129, 255] {
+            set_words[usize::from(byte >> 6)] |= 1_u64 << u32::from(byte & 63);
+        }
+        let finders = [
+            AdaptiveFinder::One(0),
+            AdaptiveFinder::Two(0, 2),
+            AdaptiveFinder::Three(0, 2, 255),
+            AdaptiveFinder::Range {
+                origin: b'A',
+                maximum_delta: 3,
+            },
+            AdaptiveFinder::Set(ByteSetClassifier::new(ByteSet256::from_words(
+                set_words,
+            ))),
+        ];
+        let alphabet = [0_u8, 2, 4, b'A', 255];
+
+        for length in 0..=6 {
+            let cases = alphabet.len().pow(u32::try_from(length).unwrap());
+            for case in 0..cases {
+                let mut ordinal = case;
+                let mut bytes = vec![0_u8; length];
+                for byte in &mut bytes {
+                    *byte = alphabet[ordinal % alphabet.len()];
+                    ordinal /= alphabet.len();
+                }
+                for finder in &finders {
+                    assert_resumable_finder_sequence(finder, &bytes, bytes.len(), case);
+                    assert_resumable_finder_sequence(
+                        finder,
+                        &bytes,
+                        bytes.len(),
+                        case.wrapping_add(3),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resumable_adaptive_finder_matches_random_monotone_reference() {
+        let mut set_words = [0_u64; 4];
+        for byte in [4_u8, 17, 64, 129, 200, 255] {
+            set_words[usize::from(byte >> 6)] |= 1_u64 << u32::from(byte & 63);
+        }
+        let finders = [
+            AdaptiveFinder::One(0),
+            AdaptiveFinder::Two(0, 255),
+            AdaptiveFinder::Three(1, 127, 254),
+            AdaptiveFinder::Range {
+                origin: 73,
+                maximum_delta: 31,
+            },
+            AdaptiveFinder::Set(ByteSetClassifier::new(ByteSet256::from_words(
+                set_words,
+            ))),
+        ];
+        let mut random = 0xA076_1D64_78BD_642F_u64;
+
+        for case in 0..512_usize {
+            random = random
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let length = usize::try_from(random % 129).unwrap();
+            let mut bytes = vec![0_u8; length];
+            for byte in &mut bytes {
+                random = random
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                *byte = random.to_le_bytes()[0];
+            }
+            random = random
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let end = usize::try_from(random % u64::try_from(length + 1).unwrap()).unwrap();
+            for finder in &finders {
+                assert_resumable_finder_sequence(finder, &bytes, end, case);
+            }
+        }
+    }
+
+    #[test]
+    fn resumable_range_and_set_phases_preserve_random_plan_accounting() {
+        const ASCII: &[(u8, u8)] = &[(0, 0x7F)];
+        const RANGE: &[(u8, u8)] = &[(b'A', b'D')];
+        const SET: &[(u8, u8)] = &[
+            (b'a', b'a'),
+            (b'c', b'c'),
+            (b'e', b'e'),
+            (0x80, 0x80),
+            (0xFF, 0xFF),
+        ];
+        const PRIMARY: &[(u8, u8)] = &[(0xFF, 0xFF)];
+        const FULL: &[(u8, u8)] = &[(0, 0xFF)];
+        let range_positions = [ASCII, RANGE, ASCII, ASCII, PRIMARY, FULL];
+        let set_positions = [ASCII, SET, ASCII, ASCII, PRIMARY, FULL];
+        let mut random = 0xE703_7ED1_A0B4_28DB_u64;
+
+        for (predicates, expected_finder) in [
+            (range_positions.as_slice(), "range"),
+            (set_positions.as_slice(), "set"),
+        ] {
+            let plan =
+                FixedPredicateWord64Plan::build(predicates, BuildLimits::unlimited()).unwrap();
+            let fallback = plan.adaptive_fallback.as_ref().unwrap();
+            assert!(matches!(
+                (&fallback.finder, expected_finder),
+                (AdaptiveFinder::Range { .. }, "range") | (AdaptiveFinder::Set(_), "set")
+            ));
+            for case in 0..256_usize {
+                random = random
+                    .wrapping_mul(2_862_933_555_777_941_757)
+                    .wrapping_add(3_037_000_493);
+                let length = usize::try_from(random % 129).unwrap();
+                let mut haystack = vec![0_u8; length];
+                if case % 4 == 0 {
+                    haystack.fill(0xFF);
+                } else {
+                    for byte in &mut haystack {
+                        random = random
+                            .wrapping_mul(2_862_933_555_777_941_757)
+                            .wrapping_add(3_037_000_493);
+                        *byte = random.to_le_bytes()[0];
+                    }
+                }
+
+                let expected = naive_count(&haystack, predicates);
+                assert_eq!(
+                    plan.count_value_success(&haystack, ReduceLimits::unlimited()),
+                    Some(expected)
+                );
+                assert_eq!(
+                    plan.span_sum_value_success(&haystack, ReduceLimits::unlimited()),
+                    expected.checked_mul(u64::try_from(plan.width()).unwrap())
+                );
+                let count = plan.count(&haystack, ReduceLimits::unlimited()).unwrap();
+                let span = plan
+                    .span_sum(&haystack, ReduceLimits::unlimited())
+                    .unwrap();
+                assert_eq!(count.count, expected);
+                assert_eq!(span.span_sum, expected * u64::try_from(plan.width()).unwrap());
+                assert_eq!(
+                    count.accounting.actual.transitions,
+                    count
+                        .accounting
+                        .actual
+                        .finder_scanned_bytes
+                        .checked_add(count.accounting.actual.shift_and_transitions)
+                        .unwrap()
+                );
+                assert!(actual_within_upper(
+                    count.accounting.actual,
+                    count.accounting.upper_bounds
+                ));
+                assert!(actual_within_upper(
+                    span.accounting.actual,
+                    span.accounting.upper_bounds
+                ));
+                assert_search_case(
+                    &plan,
+                    predicates,
+                    &haystack,
+                    Window::full(&haystack),
+                );
+
+                random = random
+                    .wrapping_mul(2_862_933_555_777_941_757)
+                    .wrapping_add(3_037_000_493);
+                let start = usize::try_from(random % u64::try_from(length + 1).unwrap()).unwrap();
+                random = random
+                    .wrapping_mul(2_862_933_555_777_941_757)
+                    .wrapping_add(3_037_000_493);
+                let end = start
+                    + usize::try_from(
+                        random % u64::try_from(length.checked_sub(start).unwrap() + 1).unwrap(),
+                    )
+                    .unwrap();
+                assert_search_case(
+                    &plan,
+                    predicates,
+                    &haystack,
+                    Window::new(start, end),
+                );
+            }
         }
     }
 
