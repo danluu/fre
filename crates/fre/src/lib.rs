@@ -622,18 +622,15 @@ pub use unicode_word_run::{
 };
 
 /// Stable schema for facade-level explanation records.
-pub const EXPLAIN_SCHEMA_VERSION: u32 = 11;
+pub const EXPLAIN_SCHEMA_VERSION: u32 = 12;
 
-/// Largest per-candidate scalar verification envelope certified for automatic
-/// ordinary-search selection. This is independent of fixed-word width: wider
-/// words with universal positions do not pay to verify those positions.
-///
-/// Every formerly admitted anchored word of width at most 16 has `V <= 15`.
-/// For a wider word, the number of legal starts is no greater than for width
-/// 16, so admitting the same `V` envelope does not expand either the pure
-/// finder bound `C * (V + 3) + 1` or the adaptive bound
-/// `6 * N + C * max(V - 3, 0)` beyond that previously certified class.
-const FIXED_PREDICATE_SEARCH_AUTO_MAX_VERIFICATION_PREDICATES: usize = 15;
+// Automatic ordinary search admits every fixed-width plan with an exact
+// one- or two-byte anchor. Construction already proves a word width of at
+// most 64, so one primary anchor leaves at most 63 non-universal verification
+// predicates. The retained adaptive finder and final Shift-And handoff keep
+// dense rejection streams inside the kernel's closed linear bound.
+const FIXED_PREDICATE_SEARCH_AUTO_MAX_VERIFICATION_PREDICATES: usize =
+    FIXED_PREDICATE_WORD64_MAX_WIDTH - 1;
 
 /// Escapes all regular-expression meta characters in `pattern`.
 ///

@@ -344,6 +344,10 @@ fn appended_native_plans_have_stable_public_plan_tags() {
             br"Q[ab][cd][ef][gh][ij][kl][mn][op][rs][tu][vw][xy][01]",
             FRE_V1_PLAN_FIXED_PREDICATE_WORD64,
         ),
+        (
+            br"Q[ab][cd][ef][gh][ij][kl][mn][op][rs][tu][vw][xy][01][23][45][67]",
+            FRE_V1_PLAN_FIXED_PREDICATE_WORD64,
+        ),
     ];
     for &(pattern, expected) in cases {
         let (regex, _) = compile(pattern, byte_config);

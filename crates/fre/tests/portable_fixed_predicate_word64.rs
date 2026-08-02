@@ -128,8 +128,8 @@ fn default_large_cartesian_languages_select_only_certified_anchor_reducers() {
 }
 
 #[test]
-fn fixed_predicate_auto_route_matrix_is_exact_at_width_16() {
-    for width in [12, 15, 16] {
+fn fixed_predicate_auto_route_matrix_admits_anchored_words_through_width_64() {
+    for width in [12, 15, 16, 17, 24, 32, 48, 64] {
         for reducer in [
             MatrixReducer::One,
             MatrixReducer::Two,
@@ -189,35 +189,6 @@ fn fixed_predicate_auto_route_matrix_is_exact_at_width_16() {
         }
     }
 
-    for width in [17, 24] {
-        for reducer in [
-            MatrixReducer::One,
-            MatrixReducer::Two,
-            MatrixReducer::ShiftAnd,
-        ] {
-            let anchor_offset = match reducer {
-                MatrixReducer::One | MatrixReducer::Two => Some(width / 2),
-                MatrixReducer::ShiftAnd => None,
-            };
-            let pattern = matrix_pattern(width, reducer, anchor_offset);
-            let regex = build_auto(&pattern);
-            assert_eq!(
-                regex.build_report().plan,
-                PlanKind::K0,
-                "width={width} reducer={reducer:?}"
-            );
-            assert_eq!(regex.runtime_implementation_id(), "k0");
-            let word = matrix_word(width, reducer, anchor_offset);
-            let (matched, accounting) = regex.find(&word, SearchLimits::unlimited()).unwrap();
-            assert_eq!(span(matched), Some((0, width)));
-            assert!(matches!(accounting, SearchAccounting::K0(_)));
-            let session = regex
-                .search_session(SearchSessionLimits::unlimited())
-                .unwrap();
-            assert!(session.workspace_setup_accounting().is_some());
-        }
-    }
-
     let folded_16 = format!("(?i:{})", "a".repeat(16));
     assert_eq!(
         build_auto(&folded_16).build_report().plan,
@@ -226,8 +197,8 @@ fn fixed_predicate_auto_route_matrix_is_exact_at_width_16() {
     let folded_17 = format!("(?i:{})", "a".repeat(17));
     assert_eq!(
         build_auto(&folded_17).build_report().plan,
-        PlanKind::K0,
-        "a declined fixed-width proof must not select another Auto specialization"
+        PlanKind::FixedPredicateWord64,
+        "an anchored fixed-width proof must stay on the fixed engine"
     );
 }
 
@@ -424,6 +395,12 @@ fn wide_auto_admission_counts_only_nonuniversal_verification_positions() {
         (32, 8),
         (48, 15),
         (64, 15),
+        (17, 16),
+        (24, 17),
+        (32, 24),
+        (48, 31),
+        (48, 47),
+        (64, 63),
     ] {
         assert_structural_wide_parity(
             width,
@@ -432,12 +409,8 @@ fn wide_auto_admission_counts_only_nonuniversal_verification_positions() {
         );
     }
 
-    for width in [17, 32, 64] {
-        assert_structural_wide_parity(width, 16, PlanKind::K0);
-    }
-
     assert_structural_wide_parity_with_anchor(64, 15, "[QR]", PlanKind::FixedPredicateWord64);
-    assert_structural_wide_parity_with_anchor(64, 16, "[QR]", PlanKind::K0);
+    assert_structural_wide_parity_with_anchor(64, 63, "[QR]", PlanKind::FixedPredicateWord64);
 }
 
 #[test]
@@ -507,7 +480,7 @@ fn fixed_predicate_v2_routes_match_k0_across_search_session_and_window_apis() {
         let pattern = matrix_pattern(width, reducer, anchor_offset);
         let auto = build_auto(&pattern);
         let k0 = build_k0(&pattern);
-        let admitted = width <= 16 && reducer != MatrixReducer::ShiftAnd;
+        let admitted = reducer != MatrixReducer::ShiftAnd;
         assert_eq!(
             auto.build_report().plan,
             if admitted {
@@ -802,8 +775,8 @@ fn fixed_predicate_limits_close_at_exact_planner_persistent_and_search_bounds() 
 fn declined_fixed_predicate_inspections_preserve_exact_cumulative_planner_work() {
     let cases = [
         matrix_pattern(16, MatrixReducer::ShiftAnd, None),
-        matrix_pattern(17, MatrixReducer::One, Some(17 / 2)),
-        matrix_pattern(24, MatrixReducer::Two, Some(24 / 2)),
+        matrix_pattern(17, MatrixReducer::ShiftAnd, None),
+        matrix_pattern(24, MatrixReducer::ShiftAnd, None),
     ];
     for pattern in cases {
         let baseline = build_auto(&pattern);
@@ -949,6 +922,6 @@ fn fixed_predicate_capture_metadata_and_explicit_capture_refusal_are_preserved()
 }
 
 #[test]
-fn fixed_predicate_schema_is_pinned_to_eleven() {
-    assert_eq!(EXPLAIN_SCHEMA_VERSION, 11);
+fn fixed_predicate_schema_is_pinned_to_twelve() {
+    assert_eq!(EXPLAIN_SCHEMA_VERSION, 12);
 }
