@@ -20687,12 +20687,17 @@ mod tests {
                         if target.features.has(CpuFeature::Aarch64Sve) {
                             assert!(words.contains(&aarch64_sve_addvl(2, 2, 4).unwrap()));
                             assert!(words.contains(&aarch64_sve_ptest_p0(4).unwrap()));
-                        } else {
+                        } else if target.features.has(CpuFeature::Aarch64Asimd) {
                             assert!(use_aarch64_filter_batch(filter));
                             assert!(
                                 words.contains(
                                     &aarch64_add_x_imm(2, 2, AARCH64_BATCH_BYTES).unwrap()
                                 )
+                            );
+                        } else {
+                            assert_eq!(
+                                compiled.module().start_accelerator(),
+                                StartAccelerator::Scalar
                             );
                         }
                     }
