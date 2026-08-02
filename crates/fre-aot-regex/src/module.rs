@@ -3883,10 +3883,17 @@ impl X86Assembler {
         Ok(())
     }
 
-    fn remap_offset(&self, offset: usize, shortened: &[bool]) -> Result<usize, ObjectError> {
-        let mut removed = 0_usize;
-        for (fixup, &is_short) in self.fixups.iter().zip(shortened) {
-            if !is_short {
+    fn remap_offset(
+        &self,
+        offset: usize,
+        removed_branches: &[bool],
+        shortened: &[bool],
+    ) -> Result<usize, ObjectError> {
+        let mut removed_bytes = 0_usize;
+        for ((fixup, &is_removed), &is_short) in
+            self.fixups.iter().zip(removed_branches).zip(shortened)
+        {
+            if !is_removed && !is_short {
                 continue;
             }
             let end = fixup
@@ -3894,11 +3901,11 @@ impl X86Assembler {
                 .checked_add(fixup.long_bytes)
                 .ok_or(ObjectError::ArithmeticOverflow("x86 relaxed branch extent"))?;
             if end <= offset {
-                removed = removed
+                removed_bytes = removed_bytes
                     .checked_add(
                         fixup
                             .long_bytes
-                            .checked_sub(2)
+                            .checked_sub(if is_removed { 0 } else { 2 })
                             .ok_or(ObjectError::InvalidModule("x86 relaxed branch size"))?,
                     )
                     .ok_or(ObjectError::ArithmeticOverflow(
@@ -3911,7 +3918,7 @@ impl X86Assembler {
             }
         }
         offset
-            .checked_sub(removed)
+            .checked_sub(removed_bytes)
             .ok_or(ObjectError::ArithmeticOverflow("x86 relaxed offset"))
     }
 
@@ -3931,24 +3938,67 @@ impl X86Assembler {
             }
         }
 
-        // Branch relaxation is monotone: shortening an intervening edge can
-        // only bring a target closer. Iterate to a fixed point so an edge
-        // made rel8-reachable by another shrink is also selected.
+        // A direct branch to its own fallthrough has no observable effect,
+        // conditional or unconditional. Remove these edges before sizing the
+        // remaining branches so their bytes can also make more rel8 forms fit.
+        let mut removed = Vec::new();
+        removed
+            .try_reserve_exact(self.fixups.len())
+            .map_err(|_| ObjectError::InvalidModule("x86 dead branch allocation failed"))?;
+        removed.resize(self.fixups.len(), false);
         let mut shortened = Vec::new();
         shortened
             .try_reserve_exact(self.fixups.len())
             .map_err(|_| ObjectError::InvalidModule("x86 relaxation allocation failed"))?;
         shortened.resize(self.fixups.len(), false);
+
+        // Deletion is monotone too: removing one fallthrough edge can expose
+        // another branch whose entire intervening path has disappeared.
         loop {
             let mut changed = false;
             for (index, fixup) in self.fixups.iter().enumerate() {
-                if shortened[index] || fixup.short_opcode.is_none() {
+                if removed[index] || fixup.short_opcode.is_none() {
                     continue;
                 }
                 let raw_target = self.labels[fixup.label]
                     .ok_or(ObjectError::InvalidModule("unbound x86 branch label"))?;
-                let instruction = self.remap_offset(fixup.instruction, &shortened)?;
-                let mut target = self.remap_offset(raw_target, &shortened)?;
+                let raw_end = fixup
+                    .instruction
+                    .checked_add(fixup.long_bytes)
+                    .ok_or(ObjectError::ArithmeticOverflow("x86 branch extent"))?;
+                if raw_end > raw_target {
+                    continue;
+                }
+                let instruction = self.remap_offset(fixup.instruction, &removed, &shortened)?;
+                let target = self
+                    .remap_offset(raw_target, &removed, &shortened)?
+                    .checked_sub(fixup.long_bytes)
+                    .ok_or(ObjectError::ArithmeticOverflow(
+                        "x86 hypothetical dead branch target",
+                    ))?;
+                if target == instruction {
+                    removed[index] = true;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        // Branch relaxation is monotone: shortening an intervening edge can
+        // only bring a target closer. Iterate to a fixed point so an edge
+        // made rel8-reachable by another shrink is also selected.
+        loop {
+            let mut changed = false;
+            for (index, fixup) in self.fixups.iter().enumerate() {
+                if removed[index] || shortened[index] || fixup.short_opcode.is_none() {
+                    continue;
+                }
+                let raw_target = self.labels[fixup.label]
+                    .ok_or(ObjectError::InvalidModule("unbound x86 branch label"))?;
+                let instruction = self.remap_offset(fixup.instruction, &removed, &shortened)?;
+                let mut target = self.remap_offset(raw_target, &removed, &shortened)?;
                 let raw_end = fixup
                     .instruction
                     .checked_add(fixup.long_bytes)
@@ -3988,7 +4038,7 @@ impl X86Assembler {
         }
 
         let mut code = Vec::new();
-        code.try_reserve_exact(self.remap_offset(self.code.len(), &shortened)?)
+        code.try_reserve_exact(self.remap_offset(self.code.len(), &removed, &shortened)?)
             .map_err(|_| ObjectError::InvalidModule("x86 relaxed code allocation failed"))?;
         let mut cursor = 0_usize;
         for (index, fixup) in self.fixups.iter().enumerate() {
@@ -4002,7 +4052,9 @@ impl X86Assembler {
                 .instruction
                 .checked_add(fixup.long_bytes)
                 .ok_or(ObjectError::ArithmeticOverflow("x86 branch extent"))?;
-            if shortened[index] {
+            if removed[index] {
+                // The branch targets the instruction that now follows it.
+            } else if shortened[index] {
                 push_bytes(
                     &mut code,
                     &[
@@ -4036,12 +4088,15 @@ impl X86Assembler {
         for &offset in &self.labels {
             label_offsets.push(
                 offset
-                    .map(|offset| self.remap_offset(offset, &shortened))
+                    .map(|offset| self.remap_offset(offset, &removed, &shortened))
                     .transpose()?,
             );
         }
         for (index, fixup) in self.fixups.iter().enumerate() {
-            let instruction = self.remap_offset(fixup.instruction, &shortened)?;
+            if removed[index] {
+                continue;
+            }
+            let instruction = self.remap_offset(fixup.instruction, &removed, &shortened)?;
             let target = label_offsets[fixup.label]
                 .ok_or(ObjectError::InvalidModule("unbound x86 branch label"))?;
             if shortened[index] {
@@ -10325,7 +10380,7 @@ mod tests {
     }
 
     #[test]
-    fn x86_assembler_relaxes_all_in_range_branches_transactionally() {
+    fn x86_assembler_relaxes_and_removes_all_in_range_branches_transactionally() {
         let mut assembler = X86Assembler::new();
         let near = assembler.label().unwrap();
         assembler.bind(near).unwrap();
@@ -10347,7 +10402,7 @@ mod tests {
         let code = assembler.finish().unwrap();
         assert_eq!(&code[..5], &[0x90, 0xeb, 0xfd, 0x75, 0xfb]);
         assert_eq!(&code[133..138], &[0xe9, 0x7b, 0xff, 0xff, 0xff]);
-        assert_eq!(&code[138..], &[0xeb, 0]);
+        assert_eq!(&code[138..], &[]);
     }
 
     #[test]
@@ -10363,9 +10418,9 @@ mod tests {
         }
         assembler.bind(target).unwrap();
         let finished = assembler.finish_with_label_offsets().unwrap();
-        assert_eq!(&finished.code[..4], &[0x74, 0x7e, 0x75, 0]);
-        assert_eq!(finished.label_offset(near).unwrap(), 4);
-        assert_eq!(finished.label_offset(target).unwrap(), 128);
+        assert_eq!(&finished.code[..4], &[0x74, 0x7c, 0x90, 0x90]);
+        assert_eq!(finished.label_offset(near).unwrap(), 2);
+        assert_eq!(finished.label_offset(target).unwrap(), 126);
 
         let mut assembler = X86Assembler::new();
         let target = assembler.label().unwrap();
@@ -10376,9 +10431,23 @@ mod tests {
         assembler.bind(relocation_field).unwrap();
         push_bytes(&mut assembler.code, &[0; 4]).unwrap();
         let finished = assembler.finish_with_label_offsets().unwrap();
-        assert_eq!(&finished.code[..2], &[0xeb, 0]);
-        assert_eq!(finished.label_offset(target).unwrap(), 2);
-        assert_eq!(finished.label_offset(relocation_field).unwrap(), 5);
+        assert_eq!(&finished.code[..3], &[0x48, 0x8d, 0x0d]);
+        assert_eq!(finished.label_offset(target).unwrap(), 0);
+        assert_eq!(finished.label_offset(relocation_field).unwrap(), 3);
+
+        let mut assembler = X86Assembler::new();
+        let fallthrough = assembler.label().unwrap();
+        assembler.branch(&[0x0f, 0x84], fallthrough).unwrap();
+        assembler.bind(fallthrough).unwrap();
+        assembler.instruction(&[0x90]).unwrap();
+        assert_eq!(assembler.finish().unwrap(), [0x90]);
+
+        let mut assembler = X86Assembler::new();
+        let fallthrough = assembler.label().unwrap();
+        assembler.branch(&[0xe9], fallthrough).unwrap();
+        assembler.branch(&[0xe9], fallthrough).unwrap();
+        assembler.bind(fallthrough).unwrap();
+        assert!(assembler.finish().unwrap().is_empty());
 
         let mut assembler = X86Assembler::new();
         assert!(assembler.branch(&[0xe9], usize::MAX).is_err());

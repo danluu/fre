@@ -10620,7 +10620,7 @@ mod tests {
         x86_reverse_checked.bind(x86_reverse_invalid).unwrap();
         assert_eq!(
             x86_reverse_checked.finish().unwrap(),
-            [0xa9, 0x00, 0x00, 0x00, 0x40, 0x74, 0]
+            [0xa9, 0x00, 0x00, 0x00, 0x40]
         );
         let mut x86_reverse_trusted = X86Assembler::new();
         let x86_reverse_trusted_invalid = x86_reverse_trusted.label().unwrap();
