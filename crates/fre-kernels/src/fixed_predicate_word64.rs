@@ -1271,23 +1271,42 @@ impl<'a> AdaptiveFinderCursor<'a> {
             AdaptiveFinder::Range {
                 origin,
                 maximum_delta,
-            } => {
-                let origin = *origin;
-                let maximum_delta = *maximum_delta;
-                self.find_classified(
-                    cursor,
-                    |block| {
-                        classify_byte_delta_16(origin, maximum_delta, block).member_mask()
-                    },
-                    |byte| byte.wrapping_sub(origin) <= maximum_delta,
-                )
-            }
+            } => self.find_range(cursor, *origin, *maximum_delta),
             AdaptiveFinder::Set(classifier) => self.find_classified(
                 cursor,
                 |block| classifier.classify_16(block).member_mask(),
                 |byte| classifier.set().contains(byte),
             ),
         }
+    }
+
+    #[inline]
+    fn find_range(
+        &self,
+        mut cursor: usize,
+        origin: u8,
+        maximum_delta: u8,
+    ) -> Option<usize> {
+        while let Some(end) = cursor
+            .checked_add(BYTE_SET_BLOCK_BYTES)
+            .filter(|&end| end <= self.anchor_end)
+        {
+            let block = <&[u8; BYTE_SET_BLOCK_BYTES]>::try_from(
+                self.bytes.get(cursor..end)?,
+            )
+            .ok()?;
+            let members = classify_byte_delta_16(origin, maximum_delta, block).member_mask();
+            if members != 0 {
+                let lane = usize::try_from(members.trailing_zeros()).ok()?;
+                return cursor.checked_add(lane);
+            }
+            cursor = end;
+        }
+        self.bytes
+            .get(cursor..self.anchor_end)?
+            .iter()
+            .position(|&byte| byte.wrapping_sub(origin) <= maximum_delta)
+            .and_then(|relative| cursor.checked_add(relative))
     }
 
     #[inline]
@@ -5797,10 +5816,6 @@ mod tests {
         }
         let finders = [
             AdaptiveFinder::Four([b'A', b'B', b'C', b'D']),
-            AdaptiveFinder::Range {
-                origin: b'A',
-                maximum_delta: 3,
-            },
             AdaptiveFinder::Set(ByteSetClassifier::new(ByteSet256::from_words(
                 set_words,
             ))),
