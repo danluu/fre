@@ -24,27 +24,27 @@ use crate::packed_ordered_literal_aggregate::byte_frequency_rank;
 
 /// Stable identity for the fixed-predicate anchor-or-Shift-And strategy.
 pub const PLAN_ID: &str =
-    "fixed-predicate-word64.adaptive-fixed-anchor-or-shift-and.nonoverlap.v9";
+    "fixed-predicate-word64.adaptive-fixed-anchor-or-shift-and.nonoverlap.v10";
 /// Stable identity for the count reducer.
-pub const COUNT_OPERATION_ID: &str = "fixed-predicate-word64.count.v8";
+pub const COUNT_OPERATION_ID: &str = "fixed-predicate-word64.count.v9";
 /// Stable identity for the matched-byte-sum reducer.
-pub const SPAN_SUM_OPERATION_ID: &str = "fixed-predicate-word64.span-sum.v8";
+pub const SPAN_SUM_OPERATION_ID: &str = "fixed-predicate-word64.span-sum.v9";
 /// Stable identity for the ordinary first-match search projection.
-pub const SEARCH_PLAN_ID: &str = "fixed-predicate-word64.first-match.v5";
+pub const SEARCH_PLAN_ID: &str = "fixed-predicate-word64.first-match.v6";
 /// Stable identity for existence search.
-const EXISTS_SEARCH_OPERATION_ID: &str = "fixed-predicate-word64.search.exists.v5";
+const EXISTS_SEARCH_OPERATION_ID: &str = "fixed-predicate-word64.search.exists.v6";
 /// Stable identity for the first accepting end projection.
 const EARLIEST_END_SEARCH_OPERATION_ID: &str =
-    "fixed-predicate-word64.search.earliest-end.v5";
+    "fixed-predicate-word64.search.earliest-end.v6";
 /// Stable identity for the selected match end projection.
 const SELECTED_END_SEARCH_OPERATION_ID: &str =
-    "fixed-predicate-word64.search.selected-end.v5";
+    "fixed-predicate-word64.search.selected-end.v6";
 /// Stable identity for the selected span projection.
-const SPAN_SEARCH_OPERATION_ID: &str = "fixed-predicate-word64.search.span.v5";
+const SPAN_SEARCH_OPERATION_ID: &str = "fixed-predicate-word64.search.span.v6";
 /// Version of the receipt-bearing fixed-predicate construction protocol.
-pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 9;
+pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 10;
 /// Version of the partial-actual fixed-predicate construction ledger.
-pub const BUILD_ATTEMPT_ACCOUNTING_VERSION: u32 = 9;
+pub const BUILD_ATTEMPT_ACCOUNTING_VERSION: u32 = 10;
 /// Minimum fixed word width accepted by this closed kernel.
 pub const MIN_WIDTH: usize = 1;
 /// Maximum fixed word width representable by one Shift-And state.
@@ -143,6 +143,61 @@ pub enum Reducer {
     ShiftAnd,
 }
 
+/// One exact one-or-two-byte anchor retained for ordered verification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExactAnchorIdentity {
+    /// Concrete exact-anchor representation.
+    pub reducer: Reducer,
+    /// Fixed byte-predicate position.
+    pub offset: u8,
+    /// Exact member bytes. The second slot is zero for a one-byte anchor.
+    pub bytes: [u8; 2],
+}
+
+/// Concrete finder representation retained for an adaptive handoff.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdaptiveFinderKind {
+    /// One exact byte, implemented by `memchr`.
+    One,
+    /// Two exact bytes, implemented by `memchr2`.
+    Two,
+    /// Three exact bytes, implemented by `memchr3`.
+    Three,
+    /// Four exact bytes, implemented by one fixed-width classifier.
+    Four,
+    /// One contiguous inclusive byte range.
+    Range,
+    /// One arbitrary compiled byte set.
+    Set,
+}
+
+/// Complete retained identity for one adaptive predicate finder.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdaptiveFinderIdentity {
+    /// Concrete finder representation.
+    pub kind: AdaptiveFinderKind,
+    /// Fixed byte-predicate position serviced by the finder.
+    pub offset: u8,
+    /// Exact number of bytes admitted by the predicate.
+    pub cardinality: u16,
+}
+
+/// Adaptive phase sequence retained by one anchored plan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdaptiveHandoffIdentity {
+    /// No adaptive phase is reachable.
+    Disabled,
+    /// Dense primary rejection moves directly to Shift-And.
+    DirectShiftAnd,
+    /// Dense primary rejection moves to a retained predicate finder.
+    Finder {
+        /// Exact retained finder.
+        finder: AdaptiveFinderIdentity,
+        /// Whether a second dense rejection burst moves on to Shift-And.
+        final_shift_and: bool,
+    },
+}
+
 /// Immutable semantic and implementation identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OperationIdentity {
@@ -164,6 +219,12 @@ pub struct OperationIdentity {
     pub anchor_offset: u8,
     /// Exact anchor bytes. The second slot is zero for a one-byte anchor.
     pub anchor_bytes: [u8; 2],
+    /// Secondary exact anchor checked before broader predicates.
+    pub secondary_anchor: Option<ExactAnchorIdentity>,
+    /// Maximum non-universal predicates checked per anchored candidate.
+    pub verification_predicates: u32,
+    /// Complete adaptive phase sequence retained by the plan.
+    pub adaptive_handoff: AdaptiveHandoffIdentity,
 }
 
 /// Limits checked before any supplied range value is inspected.
@@ -460,6 +521,12 @@ pub struct SearchOperationIdentity {
     pub anchor_offset: u8,
     /// Exact anchor bytes. The second slot is zero for a one-byte anchor.
     pub anchor_bytes: [u8; 2],
+    /// Secondary exact anchor checked before broader predicates.
+    pub secondary_anchor: Option<ExactAnchorIdentity>,
+    /// Maximum non-universal predicates checked per anchored candidate.
+    pub verification_predicates: u32,
+    /// Complete adaptive phase sequence retained by the plan.
+    pub adaptive_handoff: AdaptiveHandoffIdentity,
 }
 
 /// Per-search limits checked before any byte in the requested window is read.
@@ -1175,6 +1242,7 @@ pub struct FixedPredicateWord64Plan {
 #[derive(Clone, Copy, Debug)]
 struct AdaptiveFallback {
     offset: u8,
+    cardinality: u16,
     finder: AdaptiveFinder,
 }
 
@@ -1207,6 +1275,22 @@ impl AdaptiveFallback {
             | AdaptiveFinder::Three(_, _, _)
             | AdaptiveFinder::Four(_)
             | AdaptiveFinder::Range { .. } => 0,
+        }
+    }
+
+    const fn identity(self) -> AdaptiveFinderIdentity {
+        let kind = match self.finder {
+            AdaptiveFinder::One(_) => AdaptiveFinderKind::One,
+            AdaptiveFinder::Two(_, _) => AdaptiveFinderKind::Two,
+            AdaptiveFinder::Three(_, _, _) => AdaptiveFinderKind::Three,
+            AdaptiveFinder::Four(_) => AdaptiveFinderKind::Four,
+            AdaptiveFinder::Range { .. } => AdaptiveFinderKind::Range,
+            AdaptiveFinder::Set(_) => AdaptiveFinderKind::Set,
+        };
+        AdaptiveFinderIdentity {
+            kind,
+            offset: self.offset,
+            cardinality: self.cardinality,
         }
     }
 }
@@ -1431,6 +1515,18 @@ impl Anchor {
     const fn offset(self) -> Option<u8> {
         match self {
             Self::One { offset, .. } | Self::Two { offset, .. } => Some(offset),
+            Self::ShiftAnd => None,
+        }
+    }
+
+    const fn exact_identity(self) -> Option<ExactAnchorIdentity> {
+        let (reducer, offset, bytes) = self.identity();
+        match self {
+            Self::One { .. } | Self::Two { .. } => Some(ExactAnchorIdentity {
+                reducer,
+                offset,
+                bytes,
+            }),
             Self::ShiftAnd => None,
         }
     }
@@ -1742,6 +1838,9 @@ fn select_anchor(
             let offset = u8::try_from(candidate.score.2).map_err(|_| {
                 BuildError::InternalInvariant("adaptive fallback offset exceeded one byte")
             })?;
+            let cardinality = u16::try_from(candidate.score.0).map_err(|_| {
+                BuildError::InternalInvariant("adaptive fallback cardinality exceeded identity")
+            })?;
             let finder = match candidate.score.0 {
                 1 => AdaptiveFinder::One(candidate.bytes[0]),
                 2 => AdaptiveFinder::Two(candidate.bytes[0], candidate.bytes[1]),
@@ -1764,6 +1863,7 @@ fn select_anchor(
             };
             Some(AdaptiveFallback {
                 offset,
+                cardinality,
                 finder,
             })
         }
@@ -1951,6 +2051,32 @@ impl FixedPredicateWord64Plan {
         usize::try_from((self.nonuniversal_mask & !primary).count_ones()).ok()
     }
 
+    const fn verification_predicate_identity_count(&self) -> u32 {
+        match self.anchor {
+            Anchor::One { .. } | Anchor::Two { .. } => {
+                self.nonuniversal_mask.count_ones().saturating_sub(1)
+            }
+            Anchor::ShiftAnd => 0,
+        }
+    }
+
+    const fn secondary_anchor_identity(&self) -> Option<ExactAnchorIdentity> {
+        match self.secondary_anchor {
+            Some(anchor) => anchor.exact_identity(),
+            None => None,
+        }
+    }
+
+    const fn adaptive_handoff_identity(&self) -> AdaptiveHandoffIdentity {
+        match self.adaptive_fallback {
+            Some(fallback) => AdaptiveHandoffIdentity::Finder {
+                finder: fallback.identity(),
+                final_shift_and: true,
+            },
+            None => AdaptiveHandoffIdentity::Disabled,
+        }
+    }
+
     /// Maximum non-universal predicates checked for one anchored candidate.
     /// Full-domain predicates are excluded. Every retained finder is itself
     /// non-universal, so primary and fallback phases have the same maximum.
@@ -1989,6 +2115,9 @@ impl FixedPredicateWord64Plan {
             reducer,
             anchor_offset,
             anchor_bytes,
+            secondary_anchor: self.secondary_anchor_identity(),
+            verification_predicates: self.verification_predicate_identity_count(),
+            adaptive_handoff: self.adaptive_handoff_identity(),
         }
     }
 
@@ -2987,6 +3116,9 @@ impl FixedPredicateWord64Plan {
             reducer,
             anchor_offset,
             anchor_bytes,
+            secondary_anchor: self.secondary_anchor_identity(),
+            verification_predicates: self.verification_predicate_identity_count(),
+            adaptive_handoff: self.adaptive_handoff_identity(),
         }
     }
 
@@ -4807,6 +4939,15 @@ mod tests {
         assert_eq!(identity.anchor_offset, 5);
         assert_eq!(identity.anchor_bytes, [b'g', 0]);
         assert_eq!(
+            identity.secondary_anchor,
+            Some(ExactAnchorIdentity {
+                reducer: Reducer::OneByteAnchor,
+                offset: 2,
+                bytes: [b'h', 0],
+            })
+        );
+        assert_eq!(identity.verification_predicates, 5);
+        assert_eq!(
             plan.secondary_anchor,
             Some(Anchor::One {
                 offset: 2,
@@ -5776,26 +5917,32 @@ mod tests {
             set_words[usize::from(byte >> 6)] |= 1_u64 << u32::from(byte & 63);
         }
         let finders = [
-            (AdaptiveFinder::One(0), 0_u8),
-            (AdaptiveFinder::Two(0, 1), 1),
-            (AdaptiveFinder::Three(0, 1, 2), 2),
-            (AdaptiveFinder::Four([0, 1, 2, 3]), 3),
+            (AdaptiveFinder::One(0), 0_u8, 1_u16),
+            (AdaptiveFinder::Two(0, 1), 1, 2),
+            (AdaptiveFinder::Three(0, 1, 2), 2, 3),
+            (AdaptiveFinder::Four([0, 1, 2, 3]), 3, 4),
             (
                 AdaptiveFinder::Range {
                     origin: b'A',
                     maximum_delta: 3,
                 },
                 b'D',
+                4,
             ),
             (
                 AdaptiveFinder::Set(ByteSetClassifier::new(ByteSet256::from_words(
                     set_words,
                 ))),
                 255,
+                3,
             ),
         ];
-        for (finder, member) in finders {
-            let fallback = AdaptiveFallback { offset: 0, finder };
+        for (finder, member, cardinality) in finders {
+            let fallback = AdaptiveFallback {
+                offset: 0,
+                cardinality,
+                finder,
+            };
             for position in [0_usize, 15, 16, 31, 32, 39] {
                 let mut bytes = [0x55_u8; 40];
                 bytes[position] = member;
@@ -5806,6 +5953,91 @@ mod tests {
             let mut cursor = fallback.cursor(&bytes, bytes.len());
             assert_eq!(cursor.find(0), None);
         }
+    }
+
+    #[test]
+    fn identities_distinguish_complete_adaptive_strategy() {
+        const PRIMARY: &[(u8, u8)] = &[(0x7F, 0x7F)];
+        const BROAD: &[(u8, u8)] = &[(0, 0x7E)];
+        const FOUR: &[(u8, u8)] = &[(0, 0), (2, 2), (4, 4), (6, 6)];
+        const RANGE: &[(u8, u8)] = &[(0, 3)];
+        const SET: &[(u8, u8)] = &[(0, 0), (2, 2), (4, 4), (6, 6), (8, 8)];
+        let build = |fallback| {
+            FixedPredicateWord64Plan::build(
+                &[BROAD, fallback, BROAD, BROAD, PRIMARY],
+                BuildLimits::unlimited(),
+            )
+            .unwrap()
+        };
+        let four = build(FOUR);
+        let range = build(RANGE);
+        let set = build(SET);
+        let four_identity = four.operation_identity(Operation::Count);
+        let range_identity = range.operation_identity(Operation::Count);
+        let set_identity = set.operation_identity(Operation::Count);
+
+        for identity in [four_identity, range_identity, set_identity] {
+            assert_eq!(identity.reducer, Reducer::OneByteAnchor);
+            assert_eq!(identity.anchor_offset, 4);
+            assert_eq!(identity.anchor_bytes, [0x7F, 0]);
+            assert_eq!(identity.secondary_anchor, None);
+            assert_eq!(identity.verification_predicates, 4);
+        }
+        let adaptive_finder = |identity: OperationIdentity| match identity.adaptive_handoff {
+            AdaptiveHandoffIdentity::Finder {
+                finder,
+                final_shift_and: true,
+            } => finder,
+            other => panic!("expected finder-to-Shift-And identity, got {other:?}"),
+        };
+        assert_eq!(
+            adaptive_finder(four_identity),
+            AdaptiveFinderIdentity {
+                kind: AdaptiveFinderKind::Four,
+                offset: 1,
+                cardinality: 4,
+            }
+        );
+        assert_eq!(
+            adaptive_finder(range_identity),
+            AdaptiveFinderIdentity {
+                kind: AdaptiveFinderKind::Range,
+                offset: 1,
+                cardinality: 4,
+            }
+        );
+        let set_finder = adaptive_finder(set_identity);
+        assert_eq!(set_finder.kind, AdaptiveFinderKind::Set);
+        assert_eq!(set_finder.offset, 1);
+        assert_eq!(set_finder.cardinality, 5);
+        assert_ne!(four_identity, range_identity);
+        assert_ne!(four_identity, set_identity);
+        assert_ne!(range_identity, set_identity);
+        assert_eq!(
+            four
+                .search_operation_identity(SearchOperation::Span)
+                .adaptive_handoff,
+            four_identity.adaptive_handoff
+        );
+    }
+
+    #[test]
+    fn identity_disables_adaptation_without_verification_predicates() {
+        const PRIMARY: &[(u8, u8)] = &[(b'Q', b'Q')];
+        const FULL: &[(u8, u8)] = &[(0, 0xFF)];
+        let plan = FixedPredicateWord64Plan::build(
+            &[FULL, PRIMARY, FULL, FULL],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let aggregate = plan.operation_identity(Operation::Count);
+        let search = plan.search_operation_identity(SearchOperation::Span);
+        assert_eq!(aggregate.verification_predicates, 0);
+        assert_eq!(aggregate.secondary_anchor, None);
+        assert_eq!(aggregate.adaptive_handoff, AdaptiveHandoffIdentity::Disabled);
+        assert_eq!(search.verification_predicates, 0);
+        assert_eq!(search.secondary_anchor, None);
+        assert_eq!(search.adaptive_handoff, AdaptiveHandoffIdentity::Disabled);
     }
 
     #[test]

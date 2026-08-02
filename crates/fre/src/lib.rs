@@ -419,8 +419,11 @@ pub use fre_kernels::{
     FixedClassSandwichOperationIdentity, FixedClassSandwichReduceAccounting,
     FixedClassSandwichReduceError, FixedClassSandwichReduceLimits, FixedClassSandwichSemantics,
     FixedClassSandwichUpperBounds, FixedPredicateWord64ActualCounters,
+    FixedPredicateWord64AdaptiveFinderIdentity, FixedPredicateWord64AdaptiveFinderKind,
+    FixedPredicateWord64AdaptiveHandoffIdentity,
     FixedPredicateWord64BuildAccounting, FixedPredicateWord64BuildError,
     FixedPredicateWord64BuildLimits, FixedPredicateWord64CountResult,
+    FixedPredicateWord64ExactAnchorIdentity,
     FixedPredicateWord64MatchSelection, FixedPredicateWord64MatchSemantics,
     FixedPredicateWord64Operation, FixedPredicateWord64OperationIdentity, FixedPredicateWord64Plan,
     FixedPredicateWord64ReduceAccounting, FixedPredicateWord64ReduceError,
@@ -619,7 +622,7 @@ pub use unicode_word_run::{
 };
 
 /// Stable schema for facade-level explanation records.
-pub const EXPLAIN_SCHEMA_VERSION: u32 = 10;
+pub const EXPLAIN_SCHEMA_VERSION: u32 = 11;
 
 /// Largest per-candidate scalar verification envelope certified for automatic
 /// ordinary-search selection. This is independent of fixed-word width: wider

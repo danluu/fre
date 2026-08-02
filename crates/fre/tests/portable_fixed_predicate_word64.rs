@@ -949,6 +949,6 @@ fn fixed_predicate_capture_metadata_and_explicit_capture_refusal_are_preserved()
 }
 
 #[test]
-fn fixed_predicate_schema_is_pinned_to_ten() {
-    assert_eq!(EXPLAIN_SCHEMA_VERSION, 10);
+fn fixed_predicate_schema_is_pinned_to_eleven() {
+    assert_eq!(EXPLAIN_SCHEMA_VERSION, 11);
 }
