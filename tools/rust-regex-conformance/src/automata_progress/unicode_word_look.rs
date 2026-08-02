@@ -647,15 +647,20 @@ fn execute_case(
         UnicodeWordLookKind::WordStartHalf => Look::WordStartHalfUnicode,
         UnicodeWordLookKind::WordEndHalf => Look::WordEndHalfUnicode,
     };
-    let fre = PortableBuilder::new(authority.pattern)
-        .profile(RustProfile::rebar_1_12_4())
-        .unicode(true)
-        .plan_selection(PlanSelection::ForceK0)
-        .build()
-        .map_err(|error| InventoryError::new(format!("Unicode word-look FRE build: {error}")))?;
-    validate_look_fre_plan(&fre).map_err(InventoryError::new)?;
     let mut assertion_executions = Vec::with_capacity(case.vectors.len());
     for vector in &case.vectors {
+        // Each assertion authenticates its own cold proof publication before
+        // the exact warm and one-below calls. Reusing one plan across vectors
+        // would make accounting depend on fixture order.
+        let fre = PortableBuilder::new(authority.pattern)
+            .profile(RustProfile::rebar_1_12_4())
+            .unicode(true)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .map_err(|error| {
+                InventoryError::new(format!("Unicode word-look FRE build: {error}"))
+            })?;
+        validate_look_fre_plan(&fre).map_err(InventoryError::new)?;
         assertion_executions.push(execute_vector(&fre, look, vector)?);
     }
     if assertion_executions.len() != case.source.assertions.len()
@@ -691,6 +696,15 @@ fn execute_vector(
     let one_below_work = expected_work
         .checked_sub(1)
         .ok_or_else(|| InventoryError::new("Unicode word-look work bound underflow"))?;
+    let (cold_matched, cold_accounting) = fre
+        .find_window(
+            &vector.haystack,
+            SearchWindow::new(vector.at, vector.at),
+            SearchLimits::unlimited(),
+        )
+        .map_err(|error| {
+            InventoryError::new(format!("Unicode word-look FRE cold search: {error}"))
+        })?;
     let (matched, accounting) = fre
         .find_window(
             &vector.haystack,
@@ -705,6 +719,34 @@ fn execute_vector(
     let expected_span = vector.expected.then_some((vector.at, vector.at));
     let expected_transition_work = if vector.expected { 4 } else { 3 };
     let expected_initialized_bytes = if usize::BITS == 64 { 96 } else { 56 };
+    let exact_cold_accounting = match (&cold_accounting, &accounting) {
+        (SearchAccounting::K0(cold), SearchAccounting::K0(warm)) => {
+            let proof_bytes = cold
+                .setup()
+                .allocated_bytes()
+                .checked_sub(warm.setup().allocated_bytes());
+            let transition_delta = cold.transition_work().checked_sub(warm.transition_work());
+            proof_bytes
+                .zip(transition_delta)
+                .is_some_and(|(proof_bytes, transition_delta)| {
+                    proof_bytes > 0
+                        && cold.setup_work() == warm.setup_work() + 1
+                        && cold.work().checked_sub(warm.work())
+                            == 1_u64.checked_add(transition_delta)
+                        && cold.boundaries() == warm.boundaries()
+                        && !cold.setup().reused()
+                        && cold.setup().retained_bytes() == warm.setup().retained_bytes()
+                        && cold
+                            .setup()
+                            .initialized_bytes()
+                            .checked_sub(warm.setup().initialized_bytes())
+                            == Some(proof_bytes)
+                        && cold.scratch_bytes().checked_sub(warm.scratch_bytes())
+                            == Some(proof_bytes)
+                })
+        }
+        _ => false,
+    };
     let exact_accounting = matches!(
         &accounting,
         SearchAccounting::K0(accounting)
@@ -753,7 +795,9 @@ fn execute_vector(
             InventoryError::new(format!("Unicode word-look exact-limit search: {error}"))
         })?;
     if upstream != vector.expected
+        || cold_matched != matched
         || observed_span != expected_span
+        || !exact_cold_accounting
         || !exact_accounting
         || !exact_one_below_refusal
         || exact_match != matched
@@ -873,14 +917,14 @@ mod tests {
                 UnicodeWordLookKind::WordStartHalf => Look::WordStartHalfUnicode,
                 UnicodeWordLookKind::WordEndHalf => Look::WordEndHalfUnicode,
             };
-            let fre = PortableBuilder::new(authority.pattern)
-                .profile(RustProfile::rebar_1_12_4())
-                .unicode(true)
-                .plan_selection(PlanSelection::ForceK0)
-                .build()
-                .unwrap();
             for haystack in &haystacks {
                 for at in 0..=haystack.len() {
+                    let fre = PortableBuilder::new(authority.pattern)
+                        .profile(RustProfile::rebar_1_12_4())
+                        .unicode(true)
+                        .plan_selection(PlanSelection::ForceK0)
+                        .build()
+                        .unwrap();
                     let expected = LookMatcher::default().matches(look, haystack, at);
                     let vector = AssertionVector {
                         assertion_id: "supplemental-byte-boundary".to_owned(),

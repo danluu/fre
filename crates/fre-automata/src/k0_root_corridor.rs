@@ -251,13 +251,9 @@ pub(crate) fn qualifying_start_mask(members: u64, minimum: u32) -> u32 {
     while level < powers.len() {
         let preceding_level = level.checked_sub(1).expect("positive level");
         let preceding_span = 1_u32
-            .checked_shl(
-                u32::try_from(preceding_level)
-                    .expect("the fixed level fits u32"),
-            )
+            .checked_shl(u32::try_from(preceding_level).expect("the fixed level fits u32"))
             .expect("the fixed power-of-two span fits u32");
-        powers[level] =
-            powers[preceding_level] & (powers[preceding_level] >> preceding_span);
+        powers[level] = powers[preceding_level] & (powers[preceding_level] >> preceding_span);
         level = level.checked_add(1).expect("the fixed level count fits");
     }
 
@@ -339,11 +335,7 @@ struct SplitChoice {
     greedy: bool,
 }
 
-fn state_role(
-    automaton: &Automaton,
-    state: u32,
-    meter: &mut InspectionMeter,
-) -> Option<StateRole> {
+fn state_role(automaton: &Automaton, state: u32, meter: &mut InspectionMeter) -> Option<StateRole> {
     meter.charge(1);
     automaton.roles.get(usize::try_from(state).ok()?).copied()
 }

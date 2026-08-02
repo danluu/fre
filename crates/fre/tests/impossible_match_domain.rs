@@ -261,6 +261,39 @@ fn empty_language_terminates_without_source_access_body() {
     );
 }
 
+fn one_impossible_alternative_does_not_authenticate_the_whole_language_body() {
+    let haystack = b"abaaa--xy7";
+    for pattern in [
+        r"ab[a&&[^a]]+|xy[0-9]+",
+        r"xy[0-9]+|ab[a&&[^a]]+",
+        r"(?P<dead>ab[a&&[^a]]+)|(?P<live>xy[0-9]+)",
+    ] {
+        let expected = oracle(pattern, false, haystack);
+        assert_eq!(expected, (1, 3), "pattern={pattern:?}");
+        let count = builder(pattern, false).build_count().unwrap();
+        let span_sum = builder(pattern, false).build_span_sum().unwrap();
+        let limits = AggregateRunLimits::default();
+
+        let counted = count.count(haystack, limits).unwrap();
+        let summed = span_sum.span_sum(haystack, limits).unwrap();
+        assert_eq!(counted.value(), expected.0, "count pattern={pattern:?}");
+        assert_eq!(summed.value(), expected.1, "sum pattern={pattern:?}");
+        assert!(
+            counted.report().impossible_match_domain_receipt().is_none(),
+            "count accepted a partial-alternative empty-language proof for {pattern:?}"
+        );
+        assert!(
+            summed.report().impossible_match_domain_receipt().is_none(),
+            "span sum accepted a partial-alternative empty-language proof for {pattern:?}"
+        );
+        assert_eq!(count.count_value(haystack, limits).unwrap(), expected.0);
+        assert_eq!(
+            span_sum.span_sum_value(haystack, limits).unwrap(),
+            expected.1
+        );
+    }
+}
+
 fn terminal_preflight_is_independent_of_selected_engine_limits_body() {
     let pattern = r"^a{2,5}$";
     let haystack = &[b'a'; 100];
@@ -421,6 +454,14 @@ fn empty_language_terminates_without_source_access() {
     run_on_large_stack(
         "empty-language-domain",
         empty_language_terminates_without_source_access_body,
+    );
+}
+
+#[test]
+fn one_impossible_alternative_does_not_authenticate_the_whole_language() {
+    run_on_large_stack(
+        "partial-empty-language-alternative",
+        one_impossible_alternative_does_not_authenticate_the_whole_language_body,
     );
 }
 

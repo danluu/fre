@@ -1520,9 +1520,7 @@ mod tests {
             let actual: Result<Vec<_>, _> = fre
                 .find_iter(haystack, PortableFindIterLimits::unlimited())
                 .unwrap()
-                .map(|matched| {
-                    matched.map(|matched| (matched.start(), matched.end()))
-                })
+                .map(|matched| matched.map(|matched| (matched.start(), matched.end())))
                 .collect();
             assert_eq!(actual.unwrap(), expected, "pattern={pattern}");
         }

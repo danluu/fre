@@ -38,7 +38,9 @@ fn direct_terminal_packaging_has_a_zero_allocation_census() {
     // receipt, owner receipt, composed selector accounting, inline fused-
     // stream terminal, and the two expanded aggregate construction receipts
     // remain bounded without restoring an error-path Box.
-    assert_eq!(size_of::<CaptureExecutionError>(), 7_720);
+    // Complete adaptive fixed-predicate strategy authentication adds one
+    // inline 32-byte identity component to the terminal error envelope.
+    assert_eq!(size_of::<CaptureExecutionError>(), 7_752);
 
     let pattern = r"fn is_(\w+)|fn as_(\w+)";
     let haystack = b"fn is_alpha fn as_beta";

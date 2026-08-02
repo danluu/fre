@@ -1763,7 +1763,7 @@ mod tests {
 
     fn capture_expectations(boundary: &str, expected: u64) -> Expectations {
         Expectations {
-            plan: Some("capture-linear-selector-participation-quotient-v1".to_string()),
+            plan: Some(rebar_compare::CURRENT_FRE_CAPTURE_STREAM_PARTICIPATION_PLAN.to_string()),
             count: Some(expected),
             job_id: Some("fixture/capture@rust/regex".to_string()),
             contract_id: Some("fixture-contract-v1".to_string()),
@@ -2408,7 +2408,7 @@ mod tests {
         let count_benchmark = capture_benchmark("count-captures", r"(a)(b)?", b"a ab");
         let first_expectations = performance_expectations(
             "first-public-operation",
-            "capture-linear-selector-participation-quotient-v1",
+            rebar_compare::CURRENT_FRE_CAPTURE_STREAM_PARTICIPATION_PLAN,
             5,
         );
         require_performance_raw_metadata("count-captures", &first_expectations)
@@ -2439,7 +2439,7 @@ mod tests {
         );
         let steady_expectations = performance_expectations(
             "steady-public-operation",
-            rebar_compare::CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN,
+            rebar_compare::CURRENT_FRE_CAPTURE_LINE_BATCH_PLAN,
             12,
         );
         let steady = model_capture_performance_raw_with_measurement(
@@ -2619,7 +2619,7 @@ mod tests {
         let mut k0_session = current_fre_rebar_grep_session(&k0, k0_source.len())
             .expect("retained per-line K0 search session");
         assert!(k0_session.has_reusable_k0_workspace());
-        assert!(!k0_session.has_required_literal_prefilter());
+        assert!(k0_session.has_required_literal_prefilter());
         assert_eq!(
             execute_grep_session(&mut k0_session, k0_source, limits).expect("per-line K0 count"),
             2
@@ -2974,7 +2974,7 @@ mod tests {
         );
         let mut grep_expectations = capture_expectations("steady-public-operation", 12);
         grep_expectations.plan =
-            Some(rebar_compare::CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN.to_string());
+            Some(rebar_compare::CURRENT_FRE_CAPTURE_LINE_BATCH_PLAN.to_string());
         let grep = model_captures_with_measurement(
             &grep_benchmark,
             &grep_expectations,

@@ -94,10 +94,22 @@ fn ascii_half_word_text_cases_match_pinned_upstream_iteration() {
                 .find_at(haystack, start, SearchLimits::unlimited())
                 .unwrap_or_else(|error| panic!("{id}: FRE ranged search: {error}"));
             assert_eq!(matched, windowed, "{id}: ranged/windowed span");
+            let (repeated_windowed, repeated_windowed_accounting) = fre
+                .find_window(
+                    haystack,
+                    SearchWindow::new(start, haystack.len()),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap_or_else(|error| panic!("{id}: repeated FRE search: {error}"));
+            assert_eq!(repeated_windowed, windowed, "{id}: repeated windowed span");
+            // The first windowed call retains cold semantic coverage. Compare
+            // accounting only between calls made after optional K0 plan-side
+            // specialization has been published.
             assert_eq!(
-                ranged_accounting, windowed_accounting,
+                ranged_accounting, repeated_windowed_accounting,
                 "{id}: ranged/windowed accounting"
             );
+            assert_eq!(windowed_accounting.plan(), ranged_accounting.plan());
             let Some(matched) = matched else {
                 break;
             };

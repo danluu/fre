@@ -480,9 +480,7 @@ impl RetainedStartMaskCursor {
             .ok_or(SearchError::InternalInvariant {
                 detail: "retained start-mask width exceeded its mask",
             })?;
-        let valid = u64::MAX
-            .checked_shr(unused)
-            .unwrap_or(u64::MAX);
+        let valid = u64::MAX.checked_shr(unused).unwrap_or(u64::MAX);
         if members & !valid != 0 {
             return Err(SearchError::InternalInvariant {
                 detail: "retained start-mask contained a lane outside its classifier block",
@@ -2193,7 +2191,10 @@ impl<'a> K0SearchSession<'a> {
     /// This is an internal facade bridge. `endpoint_eligible` and
     /// `bidirectional` are source-independent planner facts. Optional cache
     /// tiers that do not fit fall back to the next smaller tier; the ordinary
-    /// Pike tier remains mandatory and reports its setup refusal.
+    /// Pike tier remains mandatory and reports its setup refusal. After one
+    /// workspace tier is selected, the root-run descriptor is admitted from
+    /// the remaining setup-work budget independently. Descriptor refusal keeps
+    /// the already admitted workspace instead of forcing a smaller tier.
     #[doc(hidden)]
     pub fn new_selected(
         automaton: &'a Automaton,
@@ -2544,15 +2545,13 @@ pub(crate) fn search_span_with_workspace_cursor(
         SpanCursorStartProof::Ordinary => {
             InvocationStartProof::Published(&ORDINARY_START_FILTER_PROOF)
         }
-        SpanCursorStartProof::Unprepared => {
-            prepare_start_filter(
-                automaton,
-                workspace,
-                &mut meter,
-                window.start(),
-                window.end(),
-            )?
-        }
+        SpanCursorStartProof::Unprepared => prepare_start_filter(
+            automaton,
+            workspace,
+            &mut meter,
+            window.start(),
+            window.end(),
+        )?,
     };
     let report = execute_prepared(
         automaton,
@@ -2609,15 +2608,13 @@ fn search_span_with_bound_cursor(
         SpanCursorStartProof::Ordinary => {
             InvocationStartProof::Published(&ORDINARY_START_FILTER_PROOF)
         }
-        SpanCursorStartProof::Unprepared => {
-            prepare_start_filter(
-                automaton,
-                workspace,
-                &mut meter,
-                window.start(),
-                window.end(),
-            )?
-        }
+        SpanCursorStartProof::Unprepared => prepare_start_filter(
+            automaton,
+            workspace,
+            &mut meter,
+            window.start(),
+            window.end(),
+        )?,
     };
     let report = execute_prepared(
         automaton,
@@ -6229,10 +6226,9 @@ fn next_small_start_candidate(
         })
         .transpose()?
         .unwrap_or(admitted);
-    let scanned_work =
-        u64::try_from(scanned).map_err(|_| SearchError::ArithmeticOverflow {
-            computation: "small start-scanner work",
-        })?;
+    let scanned_work = u64::try_from(scanned).map_err(|_| SearchError::ArithmeticOverflow {
+        computation: "small start-scanner work",
+    })?;
     meter.charge_admitted(scanned_work);
 
     if let Some(relative) = relative {
@@ -6282,17 +6278,12 @@ fn next_range_start_candidate(
     // rejects one candidate can re-enter at the following byte without
     // repeatedly classifying an overlapping fixed-width block.
     let scalar_prefix_end = position.saturating_add(BYTE_SET_BLOCK_BYTES).min(end);
-    let prefix_candidate = next_small_start_candidate(
-        haystack,
-        position,
-        scalar_prefix_end,
-        meter,
-        |source| {
+    let prefix_candidate =
+        next_small_start_candidate(haystack, position, scalar_prefix_end, meter, |source| {
             source
                 .iter()
                 .position(|&byte| byte.wrapping_sub(start) <= width)
-        },
-    )?;
+        })?;
     if prefix_candidate < scalar_prefix_end {
         return Ok(prefix_candidate);
     }
@@ -6367,13 +6358,10 @@ fn next_set_start_candidate(
         }
     }
     let scalar_prefix_end = position.saturating_add(BYTE_SET_BLOCK_BYTES).min(end);
-    let prefix_candidate = next_small_start_candidate(
-        haystack,
-        position,
-        scalar_prefix_end,
-        meter,
-        |source| source.iter().position(|&byte| set.contains(byte)),
-    )?;
+    let prefix_candidate =
+        next_small_start_candidate(haystack, position, scalar_prefix_end, meter, |source| {
+            source.iter().position(|&byte| set.contains(byte))
+        })?;
     if prefix_candidate < scalar_prefix_end {
         return Ok(prefix_candidate);
     }
@@ -6443,9 +6431,7 @@ fn next_ascii_start_candidate(
     while end.saturating_sub(position) >= ASCII_WIDE_BYTES
         && meter.remaining() >= u64::try_from(ASCII_WIDE_BYTES).expect("classifier width fits u64")
     {
-        meter.charge_admitted(
-            u64::try_from(ASCII_WIDE_BYTES).expect("classifier width fits u64"),
-        );
+        meter.charge_admitted(u64::try_from(ASCII_WIDE_BYTES).expect("classifier width fits u64"));
         let block_end =
             position
                 .checked_add(ASCII_WIDE_BYTES)
@@ -6479,9 +6465,8 @@ fn next_ascii_start_candidate(
         && meter.remaining()
             >= u64::try_from(ASCII_NARROW_BYTES).expect("classifier width fits u64")
     {
-        meter.charge_admitted(
-            u64::try_from(ASCII_NARROW_BYTES).expect("classifier width fits u64"),
-        );
+        meter
+            .charge_admitted(u64::try_from(ASCII_NARROW_BYTES).expect("classifier width fits u64"));
         let block_end =
             position
                 .checked_add(ASCII_NARROW_BYTES)
@@ -6619,8 +6604,7 @@ fn try_initialize_root_run_block(
     let membership = classify_root_run_members(classifier, haystack, base, available, meter)?;
     let current = u32::try_from(membership & u64::from(u32::MAX))
         .expect("the current root-run half is explicitly masked");
-    let lookahead =
-        u32::try_from(membership >> 32).expect("the root-run lookahead half fits u32");
+    let lookahead = u32::try_from(membership >> 32).expect("the root-run lookahead half fits u32");
     let members = root_corridor_member_window(current, lookahead);
     *cursor = RootRunBlockCursor {
         automaton_identity,
@@ -6650,9 +6634,7 @@ fn try_advance_root_run_block(
                 computation: "root-run residual block base",
             })?;
     let retained = usize::from(cursor.valid_bytes).saturating_sub(ASCII_WIDE_BYTES);
-    let available = end
-        .saturating_sub(new_base)
-        .min(ROOT_RUN_WINDOW_BYTES);
+    let available = end.saturating_sub(new_base).min(ROOT_RUN_WINDOW_BYTES);
     if available == 0 {
         cursor.clear();
         return Ok(true);
@@ -11368,14 +11350,9 @@ mod tests {
         let exact = byte_chain(&ranges);
         let mut exact_workspace = K0Workspace::new(&exact, WorkspaceLimits::unlimited()).unwrap();
         let mut exact_meter = WorkMeter::new(u64::MAX, 0);
-        let exact_proof = super::prepare_start_filter(
-            &exact,
-            &mut exact_workspace,
-            &mut exact_meter,
-            0,
-            0,
-        )
-        .unwrap();
+        let exact_proof =
+            super::prepare_start_filter(&exact, &mut exact_workspace, &mut exact_meter, 0, 0)
+                .unwrap();
         assert_eq!(exact_meter.consumed, before_optional + optional_work);
         match exact_proof {
             super::InvocationStartProof::Pending { proof, publish } => {
@@ -11402,10 +11379,8 @@ mod tests {
         let runtime_reserve = public_constrained
             .conservative_post_start_filter_work_bound(source.len())
             .unwrap();
-        let completion_reserve = super::start_probe_completion_reserve(
-            &public_constrained,
-            source.len(),
-        );
+        let completion_reserve =
+            super::start_probe_completion_reserve(&public_constrained, source.len());
         assert_eq!(
             completion_reserve,
             runtime_reserve
@@ -11761,11 +11736,7 @@ mod tests {
                 scanner_for_set(byte_range_set(0x20, 0x7f)),
                 &[0x20, 0x41, 0x7f],
             ),
-            (
-                "ascii-set",
-                scanner_for_set(byte_set(b"aceg")),
-                b"aceg",
-            ),
+            ("ascii-set", scanner_for_set(byte_set(b"aceg")), b"aceg"),
             (
                 "full-set",
                 scanner_for_set(byte_set(&[0x80, 0x82, 0xfe, 0xff])),
@@ -13041,9 +13012,7 @@ mod tests {
         let initial_work = 7_u64;
 
         for (name, scanner, member) in [("range", range, 0x55), ("set", set, 0x84)] {
-            for candidate_offset in
-                (0..BYTE_SET_BLOCK_BYTES).chain(first_tail..length)
-            {
+            for candidate_offset in (0..BYTE_SET_BLOCK_BYTES).chain(first_tail..length) {
                 let mut haystack = vec![0x20; end.checked_add(2).unwrap()];
                 haystack[start.checked_add(candidate_offset).unwrap()] = member;
                 let required = u64::try_from(candidate_offset.checked_add(1).unwrap()).unwrap();
@@ -13051,15 +13020,8 @@ mod tests {
 
                 let mut exact = WorkMeter::new(exact_limit, initial_work);
                 assert_eq!(
-                    super::next_start_candidate(
-                        &scanner,
-                        &haystack,
-                        start,
-                        end,
-                        None,
-                        &mut exact,
-                    )
-                    .unwrap(),
+                    super::next_start_candidate(&scanner, &haystack, start, end, None, &mut exact,)
+                        .unwrap(),
                     start.checked_add(candidate_offset).unwrap(),
                     "{name} scalar candidate at offset {candidate_offset}"
                 );
@@ -13117,30 +13079,17 @@ mod tests {
 
             let mut exact = WorkMeter::new(exact_limit, initial_work);
             assert_eq!(
-                super::next_start_candidate(
-                    &scanner,
-                    &haystack,
-                    start,
-                    end,
-                    None,
-                    &mut exact,
-                )
-                .unwrap(),
+                super::next_start_candidate(&scanner, &haystack, start, end, None, &mut exact,)
+                    .unwrap(),
                 start.checked_add(candidate_offset).unwrap()
             );
             assert_eq!(exact.consumed, exact_limit);
 
             let one_below_limit = exact_limit.checked_sub(1).unwrap();
             let mut one_below = WorkMeter::new(one_below_limit, initial_work);
-            let error = super::next_start_candidate(
-                &scanner,
-                &haystack,
-                start,
-                end,
-                None,
-                &mut one_below,
-            )
-            .unwrap_err();
+            let error =
+                super::next_start_candidate(&scanner, &haystack, start, end, None, &mut one_below)
+                    .unwrap_err();
             assert!(matches!(
                 error,
                 SearchError::WorkLimitExceeded {
@@ -14035,14 +13984,9 @@ mod tests {
             .get()
             .expect("successful cold search publishes the proof");
         let mut cache_meter = WorkMeter::new(u64::MAX, 0);
-        let cached = super::prepare_start_filter(
-            &automaton,
-            &mut workspace,
-            &mut cache_meter,
-            0,
-            0,
-        )
-        .unwrap();
+        let cached =
+            super::prepare_start_filter(&automaton, &mut workspace, &mut cache_meter, 0, 0)
+                .unwrap();
         match cached {
             super::InvocationStartProof::Published(borrowed) => {
                 assert!(
@@ -17664,6 +17608,101 @@ mod tests {
     }
 
     #[test]
+    fn selected_session_admission_separates_root_run_descriptor_and_workspace_tiers() {
+        let plan = root_run_exact_two();
+        let full =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true).unwrap();
+        assert!(full.root_run.is_some());
+        assert!(full.capabilities.reverse);
+        let full_setup = full.construction_accounting();
+
+        // One unit below the fully observed setup cannot admit the prospective
+        // descriptor envelope, but the already selected bidirectional layout
+        // remains the best workspace admitted by the caller.
+        let layout_only_full = K0SearchSession::new_selected(
+            &plan,
+            WorkspaceLimits {
+                max_setup_work: full_setup.work() - 1,
+                max_scratch_bytes: usize::MAX,
+            },
+            true,
+            true,
+        )
+        .unwrap();
+        assert!(layout_only_full.root_run.is_none());
+        assert!(layout_only_full.capabilities.reverse);
+        assert_eq!(layout_only_full.workspace.layout, full.workspace.layout);
+        let layout_only_full_setup = layout_only_full.construction_accounting();
+        assert!(layout_only_full_setup.work() < full_setup.work());
+        assert_eq!(
+            layout_only_full_setup.allocated_bytes(),
+            full_setup.allocated_bytes()
+        );
+        assert_eq!(
+            layout_only_full_setup.initialized_bytes(),
+            full_setup.initialized_bytes()
+        );
+        assert_eq!(
+            layout_only_full_setup.retained_bytes(),
+            full_setup.retained_bytes()
+        );
+
+        let endpoint =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, false)
+                .unwrap();
+        assert!(endpoint.root_run.is_none());
+        assert!(!endpoint.capabilities.reverse);
+        let endpoint_setup = endpoint.construction_accounting();
+        assert!(endpoint_setup.work() < layout_only_full_setup.work());
+        let exact_endpoint = K0SearchSession::new_selected(
+            &plan,
+            WorkspaceLimits {
+                max_setup_work: endpoint_setup.work(),
+                max_scratch_bytes: usize::MAX,
+            },
+            true,
+            true,
+        )
+        .unwrap();
+        assert!(exact_endpoint.root_run.is_none());
+        assert!(!exact_endpoint.capabilities.reverse);
+        assert_eq!(exact_endpoint.workspace.layout, endpoint.workspace.layout);
+        assert_eq!(exact_endpoint.construction_accounting(), endpoint_setup);
+
+        let pike = K0Workspace::new(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let pike_setup = pike.construction_accounting();
+        assert!(pike_setup.work() < endpoint_setup.work());
+        let exact_pike = K0SearchSession::new_selected(
+            &plan,
+            WorkspaceLimits {
+                max_setup_work: pike_setup.work(),
+                max_scratch_bytes: usize::MAX,
+            },
+            true,
+            true,
+        )
+        .unwrap();
+        assert!(exact_pike.root_run.is_none());
+        assert!(!exact_pike.capabilities.lazy);
+        assert!(!exact_pike.capabilities.reverse);
+        assert_eq!(exact_pike.workspace.layout, pike.layout);
+        assert_eq!(exact_pike.construction_accounting(), pike_setup);
+        assert!(matches!(
+            K0SearchSession::new_selected(
+                &plan,
+                WorkspaceLimits {
+                    max_setup_work: pike_setup.work() - 1,
+                    max_scratch_bytes: usize::MAX,
+                },
+                true,
+                true,
+            ),
+            Err(SearchError::WorkspaceSetupWorkLimitExceeded { limit, needed })
+                if limit == pike_setup.work() - 1 && needed == pike_setup.work()
+        ));
+    }
+
+    #[test]
     fn root_run_corridor_matches_ordinary_k0_for_exact_finite_and_unbounded_runs() {
         let plans = [
             root_run_exact_two(),
@@ -17703,11 +17742,7 @@ mod tests {
                         .into_output();
                     let mut source = K0SpanSourceCursor::new(haystack);
                     let actual = session
-                        .search_span_at_source_cursor(
-                            &mut source,
-                            start,
-                            SearchLimits::unlimited(),
-                        )
+                        .search_span_at_source_cursor(&mut source, start, SearchLimits::unlimited())
                         .unwrap()
                         .into_output();
                     assert_eq!(
@@ -17751,11 +17786,7 @@ mod tests {
                         .unwrap()
                         .into_output();
                     let actual = session
-                        .search_span_at_source_cursor(
-                            &mut source,
-                            start,
-                            SearchLimits::unlimited(),
-                        )
+                        .search_span_at_source_cursor(&mut source, start, SearchLimits::unlimited())
                         .unwrap()
                         .into_output();
                     assert_eq!(
@@ -17777,7 +17808,13 @@ mod tests {
             for length in 0..=8usize {
                 for bits in 0..(1usize << length) {
                     let haystack: Vec<u8> = (0..length)
-                        .map(|lane| if bits & (1usize << lane) == 0 { b'z' } else { b'a' })
+                        .map(|lane| {
+                            if bits & (1usize << lane) == 0 {
+                                b'z'
+                            } else {
+                                b'a'
+                            }
+                        })
                         .collect();
                     check(&haystack);
                 }
@@ -17794,9 +17831,7 @@ mod tests {
                     .collect();
                 check(&alternating);
 
-                let mixed: Vec<u8> = (0..length)
-                    .map(|lane| b"acegzz"[lane % 6])
-                    .collect();
+                let mixed: Vec<u8> = (0..length).map(|lane| b"acegzz"[lane % 6]).collect();
                 check(&mixed);
             }
         }
@@ -17836,9 +17871,8 @@ mod tests {
                         .start_filter_proof
                         .get()
                         .expect("warm start-filter proof");
-                    let (scanner, classifier) =
-                        super::root_run_ascii_scanner(descriptor, proof)
-                            .expect("test set owns an ASCII classifier");
+                    let (scanner, classifier) = super::root_run_ascii_scanner(descriptor, proof)
+                        .expect("test set owns an ASCII classifier");
                     let mut cursor = super::RootRunBlockCursor::default();
                     let mut meter = WorkMeter::new(u64::MAX, 0);
                     let actual = super::execute_root_run_corridor(
@@ -17990,11 +18024,7 @@ mod tests {
         let alternating = [b'a', b'z'].repeat(128);
         let mut alternating_source = K0SpanSourceCursor::new(&alternating);
         let alternating_report = session
-            .search_span_at_source_cursor(
-                &mut alternating_source,
-                0,
-                SearchLimits::unlimited(),
-            )
+            .search_span_at_source_cursor(&mut alternating_source, 0, SearchLimits::unlimited())
             .unwrap();
         assert_eq!(alternating_report.output(), &None);
         assert!(

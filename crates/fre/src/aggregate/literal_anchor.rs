@@ -1675,6 +1675,10 @@ fn execute_candidate(
     if verifier_work > admission.verifier_work_upper_bound {
         return Err(LiteralAnchorAggregateRunError::CandidateRecoveryInvariant);
     }
+    let verifier_limits = SearchLimits {
+        max_work: limits.verifier.max_work,
+        max_scratch_bytes: workspace_scratch_limit,
+    };
     let mut recovery_failure = false;
     let scan = plan
         .stream
@@ -1764,7 +1768,7 @@ fn execute_candidate(
                     haystack,
                     SearchWindow::new(start, latest_end),
                     &mut workspace,
-                    limits.verifier,
+                    verifier_limits,
                 )
                 .map_err(LiteralAnchorAggregateRunError::Verifier)?;
             verifier_calls = verifier_calls.checked_add(1).ok_or(
@@ -1926,6 +1930,11 @@ fn add_search_accounting(
     accounting: SearchAccounting,
     total: &mut VerifierInvocationAccounting,
 ) -> Result<(), LiteralAnchorAggregateRunError> {
+    let setup = accounting.setup();
+    let scratch_clear_bytes = setup
+        .initialized_bytes()
+        .checked_sub(setup.allocated_bytes())
+        .ok_or(LiteralAnchorAggregateRunError::CandidateRecoveryInvariant)?;
     total.work = total.work.checked_add(accounting.work()).ok_or(
         LiteralAnchorAggregateRunError::CandidateArithmeticOverflow {
             computation: "literal-anchor verifier work",
@@ -1949,7 +1958,7 @@ fn add_search_accounting(
         )?;
     total.scratch_clear_bytes = total
         .scratch_clear_bytes
-        .checked_add(accounting.setup().initialized_bytes())
+        .checked_add(scratch_clear_bytes)
         .ok_or(
             LiteralAnchorAggregateRunError::CandidateArithmeticOverflow {
                 computation: "literal-anchor verifier scratch clear bytes",
@@ -2283,6 +2292,37 @@ mod tests {
             regex.span_sum(source, exact),
             Err(LiteralAnchorAggregateRunError::Common(_))
         ));
+    }
+
+    #[test]
+    fn plan_owner_initialization_is_not_reused_workspace_clearing() {
+        let source = b"aaaa";
+        let baseline = LiteralAnchorAggregateBuilder::new("a")
+            .build_count()
+            .expect("baseline build")
+            .count(source, LiteralAnchorAggregateRunLimits::unlimited())
+            .expect("baseline count");
+        let baseline_candidate = baseline.candidate().expect("baseline candidate receipt");
+        assert_eq!(baseline_candidate.verifier_scratch_clear_bytes(), 0);
+        assert!(baseline.closes());
+
+        // A fresh plan may try to publish its immutable start-filter owner on
+        // the first verifier call. The exact aggregate scratch envelope admits
+        // only the mandatory queue and workspace, so K0 must decline that
+        // optional owner without misreporting its initialization as a clear.
+        let fresh = LiteralAnchorAggregateBuilder::new("a")
+            .build_count()
+            .expect("fresh build");
+        let mut exact = LiteralAnchorAggregateRunLimits::unlimited();
+        exact.max_total_scratch_bytes = baseline_candidate.total_scratch_bytes();
+        let receipt = fresh.count(source, exact).expect("exact scratch count");
+        let candidate = receipt.candidate().expect("fresh candidate receipt");
+        assert_eq!(
+            candidate.total_scratch_bytes(),
+            exact.max_total_scratch_bytes
+        );
+        assert_eq!(candidate.verifier_scratch_clear_bytes(), 0);
+        assert!(receipt.closes());
     }
 
     #[test]

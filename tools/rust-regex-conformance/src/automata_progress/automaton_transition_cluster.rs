@@ -546,14 +546,58 @@ fn fre_transition_result(haystack: &[u8]) -> Result<bool, InventoryError> {
             "FRE transition witness did not select the K0 automaton",
         ));
     }
-    let (observed, accounting) = regex
+    let (cold_observed, cold_accounting) = regex
         .is_match(haystack, SearchLimits::unlimited())
         .map_err(|error| InventoryError::new(format!("run FRE transition regex: {error}")))?;
-    let SearchAccounting::K0(accounting) = accounting else {
+    let (observed, accounting) = regex
+        .is_match(haystack, SearchLimits::unlimited())
+        .map_err(|error| InventoryError::new(format!("warm FRE transition regex: {error}")))?;
+    let (SearchAccounting::K0(cold_accounting), SearchAccounting::K0(accounting)) =
+        (cold_accounting, accounting)
+    else {
         return Err(InventoryError::new(
             "FRE transition witness returned non-K0 accounting",
         ));
     };
+    let proof_bytes = cold_accounting
+        .setup()
+        .allocated_bytes()
+        .checked_sub(accounting.setup().allocated_bytes());
+    let transition_work_delta = cold_accounting
+        .transition_work()
+        .checked_sub(accounting.transition_work());
+    let exact_cold_warm_accounting = proof_bytes.zip(transition_work_delta).is_some_and(
+        |(proof_bytes, transition_work_delta)| {
+            proof_bytes > 0
+                && cold_observed == observed
+                && cold_accounting
+                    .setup_work()
+                    .checked_sub(accounting.setup_work())
+                    == Some(1)
+                && cold_accounting.work().checked_sub(accounting.work())
+                    == 1_u64.checked_add(transition_work_delta)
+                && cold_accounting.boundaries() == accounting.boundaries()
+                && !cold_accounting.setup().reused()
+                && !accounting.setup().reused()
+                && cold_accounting.setup().retained_bytes() == accounting.setup().retained_bytes()
+                && accounting.setup().allocated_bytes() == accounting.setup().retained_bytes()
+                && accounting.setup().retained_bytes() == accounting.scratch_bytes()
+                && cold_accounting
+                    .setup()
+                    .initialized_bytes()
+                    .checked_sub(accounting.setup().initialized_bytes())
+                    == Some(proof_bytes)
+                && cold_accounting
+                    .scratch_bytes()
+                    .checked_sub(accounting.scratch_bytes())
+                    == Some(proof_bytes)
+        },
+    );
+    if !exact_cold_warm_accounting {
+        return Err(InventoryError::new(
+            "FRE transition cold proof publication accounting mismatch",
+        ));
+    }
     let work = accounting.work();
     let scratch = accounting.scratch_bytes();
     let exact_limits = SearchLimits {

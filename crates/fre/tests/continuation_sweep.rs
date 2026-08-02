@@ -1,6 +1,8 @@
 use fre::{
-    AggregateBuilder, AggregateCountWorkspace, AggregatePlanKind, AggregatePlanSelection,
-    AggregateRunLimits, AggregateSpanSumWorkspace, RustProfile,
+    AggregateBuilder, AggregateCountWorkspace, AggregateEngineError,
+    AggregateExecutionAttemptIdentity, AggregateExecutionSource, AggregatePlanKind,
+    AggregatePlanSelection, AggregateResource, AggregateRunLimits, AggregateSpanSumWorkspace,
+    RustProfile,
 };
 
 fn builder(pattern: &str) -> AggregateBuilder {
@@ -406,7 +408,7 @@ fn incumbent_valid_work_limit_remains_valid_with_cold_or_warm_workspace_body() {
 }
 
 #[test]
-fn late_priority_quadratic_sweep_refuses_before_an_incumbent_valid_source_read() {
+fn late_priority_quadratic_sweep_reports_observed_limit_without_incumbent_replay() {
     std::thread::Builder::new()
         .name("continuation-sweep-sequential-monotone".to_owned())
         .stack_size(16 * 1024 * 1024)
@@ -441,13 +443,24 @@ fn late_priority_quadratic_sweep_refuses_before_an_incumbent_valid_source_read_b
         expected
     );
     let mut workspace = AggregateCountWorkspace::new();
-    assert_eq!(
-        count
-            .count_value_with_workspace(&haystack, incumbent_exact, &mut workspace)
-            .unwrap(),
-        expected
-    );
-    assert_eq!(workspace.retained_continuation_bytes(), None);
+    let error = count
+        .count_value_with_workspace(&haystack, incumbent_exact, &mut workspace)
+        .expect_err("observed sweep limit must remain visible after source access");
+    assert!(matches!(
+        &error.identity,
+        AggregateExecutionAttemptIdentity::Incumbent(_)
+    ));
+    assert!(error.continuation_receipt().is_none());
+    assert!(!error.has_closed_continuation_attempt());
+    assert!(workspace.retained_continuation_bytes().is_some());
+    assert!(matches!(
+        error.source,
+        AggregateExecutionSource::Continuation(AggregateEngineError::ResourceLimit {
+            resource: AggregateResource::SequentialBytes,
+            required,
+            limit,
+        }) if required > limit && limit == lower
+    ));
 }
 
 #[test]

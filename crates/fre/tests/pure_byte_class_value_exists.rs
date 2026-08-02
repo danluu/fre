@@ -121,9 +121,7 @@ fn value_exists_is_exhaustive_across_leaf_cardinality_boundaries() {
                             haystack,
                             window,
                             limits,
-                            &format!(
-                                "case={case}, haystack={haystack:?}, window={start}..{end}"
-                            ),
+                            &format!("case={case}, haystack={haystack:?}, window={start}..{end}"),
                         );
                     }
                 }

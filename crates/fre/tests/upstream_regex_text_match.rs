@@ -13,7 +13,14 @@ fn borrowed_text_match_preserves_pinned_value_semantics_and_accounting() {
     let (borrowed, borrowed_accounting) = regex
         .find_borrowed(haystack, SearchLimits::unlimited())
         .expect("borrowed search");
-    assert_eq!(offset_accounting, borrowed_accounting);
+    let (repeated_offset, repeated_offset_accounting) = regex
+        .find(haystack, SearchLimits::unlimited())
+        .expect("repeated offset search");
+    assert_eq!(repeated_offset, offset);
+    // Preserve the first cold call above, but compare wrappers only after the
+    // shared K0 plan has published its optional immutable start proof.
+    assert_eq!(repeated_offset_accounting, borrowed_accounting);
+    assert_eq!(offset_accounting.plan(), borrowed_accounting.plan());
 
     let offset = offset.expect("offset match");
     let borrowed = borrowed.expect("borrowed match");
@@ -46,7 +53,14 @@ fn borrowed_text_find_at_preserves_scalar_normalization_and_original_context() {
     let (borrowed, borrowed_accounting) = scalar
         .find_at_borrowed(haystack, 1, SearchLimits::unlimited())
         .expect("borrowed ranged search");
-    assert_eq!(offset_accounting, borrowed_accounting);
+    let (repeated_offset, repeated_offset_accounting) = scalar
+        .find_at(haystack, 1, SearchLimits::unlimited())
+        .expect("repeated offset ranged search");
+    assert_eq!(repeated_offset, offset);
+    // The borrowed projection adds no work; first-use plan specialization does.
+    // Compare the two warm invocations without discarding cold output coverage.
+    assert_eq!(repeated_offset_accounting, borrowed_accounting);
+    assert_eq!(offset_accounting.plan(), borrowed_accounting.plan());
     assert_eq!(offset.expect("offset match").range(), 3..4);
     let borrowed = borrowed.expect("borrowed match");
     assert_eq!(borrowed.range(), 3..4);

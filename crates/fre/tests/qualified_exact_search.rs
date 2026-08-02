@@ -4,9 +4,35 @@ use fre::{
     QualifiedExactSearchError, QualifiedExactSearchNativeStatus, QualifiedExactSearchQualification,
     QualifiedExactSearchRoute, QualifiedExactSearchWorkload, SearchLimits, SearchWindow,
 };
-use fre_jit_aarch64::{BackendVersion, EmitLimits, TargetSpec};
-use fre_jit_runtime::{CallError, PublicationLimits, PublishError};
+#[cfg(not(all(
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_pointer_width = "64",
+    target_endian = "little"
+)))]
+use fre_jit_aarch64::EmitLimits;
+use fre_jit_aarch64::{BackendVersion, TargetSpec};
+use fre_jit_runtime::CallError;
+#[cfg(not(all(
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_pointer_width = "64",
+    target_endian = "little"
+)))]
+use fre_jit_runtime::{PublicationLimits, PublishError};
+#[cfg(not(all(
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_pointer_width = "64",
+    target_endian = "little"
+)))]
 use fre_kernel_ir::ValidateLimits;
+#[cfg(not(all(
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_pointer_width = "64",
+    target_endian = "little"
+)))]
 use fre_kernels::LiteralBuildLimits;
 
 const QUALIFIED_WORKLOAD: QualifiedExactSearchWorkload = QualifiedExactSearchWorkload::new(
@@ -326,7 +352,7 @@ fn publication_refusal_is_reported_and_preserves_the_portable_route() {
 
 #[cfg(not(all(
     target_arch = "aarch64",
-    target_os = "macos",
+    any(target_os = "linux", target_os = "macos"),
     target_pointer_width = "64",
     target_endian = "little"
 )))]
