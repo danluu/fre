@@ -2177,12 +2177,15 @@ fn generated_insertion_is_valid(
     intended: AbiResult,
 ) -> bool {
     upstream == intended
-        || (position != MatchPosition::None
-            && upstream.status != 0
-            && (nested_grammar
-                || (output_matrix
-                    && upstream.start <= intended.start
-                    && upstream.end >= intended.end)))
+        || if nested_grammar {
+            position == MatchPosition::None || upstream.status != 0
+        } else {
+            output_matrix
+                && position != MatchPosition::None
+                && upstream.status != 0
+                && upstream.start <= intended.start
+                && upstream.end >= intended.end
+        }
 }
 
 fn build_scenarios(config: &Config, shapes: &[CompiledShape]) -> Result<Vec<Scenario>, String> {
@@ -3757,6 +3760,13 @@ mod tests {
                 end: 16,
             },
             nested_intended,
+        ));
+        assert!(generated_insertion_is_valid(
+            true,
+            true,
+            MatchPosition::None,
+            fixed_extension,
+            NO_MATCH,
         ));
         assert!(!generated_insertion_is_valid(
             false,
