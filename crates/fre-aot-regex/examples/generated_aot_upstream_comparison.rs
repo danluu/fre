@@ -3068,6 +3068,59 @@ const fn accelerator_name(accelerator: StartAccelerator) -> &'static str {
         StartAccelerator::X86Avx2 => "x86_avx2",
         StartAccelerator::X86Avx512Bw => "x86_avx512bw",
         StartAccelerator::Aarch64Asimd => "aarch64_asimd",
+        StartAccelerator::Aarch64Sve => "aarch64_sve",
+        StartAccelerator::Aarch64Sve2 => "aarch64_sve2",
+    }
+}
+
+/// Classify the actual SVE scanner mix in the emitted object rather than the
+/// maximum `StartAccelerator` receipt. Contextual objects can contain an SVE2
+/// exact-set scanner and a base-SVE range scanner on independent paths, while
+/// the receipt intentionally reports only the strongest accelerator present.
+fn aarch64_sve_code_profile(compiled: &CompiledRegex) -> &'static str {
+    if compiled.module().target().architecture != Architecture::Aarch64 {
+        return "not_aarch64";
+    }
+
+    // These instruction families differ outside their three register fields.
+    // Masking those fields recognizes every allocation without consulting the
+    // regex source or benchmark family.
+    const REGISTER_FIELDS: u32 = (0x1f << 16) | (0x1f << 5) | 0x1f;
+    const OPCODE_MASK: u32 = !REGISTER_FIELDS;
+    const SVE_CMPEQ_B: u32 = 0x2400_a000;
+    const SVE_CMPHS_B: u32 = 0x2400_0000;
+    const SVE2_MATCH_B: u32 = 0x4520_8000;
+
+    let mut base_exact = false;
+    let mut base_range = false;
+    let mut sve2_exact = false;
+    for section in compiled
+        .module()
+        .sections()
+        .iter()
+        .filter(|section| section.name == ".text")
+    {
+        for instruction in section.bytes().chunks_exact(4) {
+            let word = u32::from_le_bytes(
+                instruction
+                    .try_into()
+                    .expect("four-byte AArch64 instruction chunk"),
+            );
+            let opcode = word & OPCODE_MASK;
+            base_exact |= opcode == SVE_CMPEQ_B;
+            base_range |= opcode == SVE_CMPHS_B;
+            sve2_exact |= opcode == SVE2_MATCH_B;
+        }
+    }
+    match (base_exact, base_range, sve2_exact) {
+        (false, false, false) => "none",
+        (true, false, false) => "base_sve_exact_only",
+        (false, true, false) => "base_sve_range_only",
+        (false, false, true) => "sve2_exact_only",
+        (false, true, true) => "mixed_sve2_exact_base_sve_range",
+        (true, false, true) => "mixed_sve2_exact_base_sve_exact",
+        (true, true, false) => "mixed_base_sve_exact_range",
+        (true, true, true) => "mixed_sve2_exact_base_sve_exact_range",
     }
 }
 
@@ -3079,7 +3132,7 @@ fn print_joined_rows(
     native: &BTreeMap<String, Measurement>,
 ) -> Result<(), String> {
     println!(
-        "comparison\tcase\tpattern_name\tfamily\tseed\tsource_kind\tpattern\toutput\tupstream_operation\tnative_route\tengine\tselection_reason\ttarget\tfeature_bits\tstart_accelerator\tprefix_graph_bytes\tprefix_selective_positions\tprefix_filter_bytes\twindow_bytes\tmatch_position\tcandidate_density\trotations\tinitial_searches\tmin_trial_ns\ttrials\twarmup_rounds\tupstream_searches_per_trial\tupstream_min_elapsed_ns\tupstream_median_elapsed_ns\tupstream_min_ns_per_search\tupstream_median_ns_per_search\tnative_searches_per_trial\tnative_min_elapsed_ns\tnative_median_elapsed_ns\tnative_min_ns_per_search\tnative_median_ns_per_search\tspeedup_at_min\tspeedup_at_median\tupstream_checksum\tnative_checksum\tstatus"
+        "comparison\tcase\tpattern_name\tfamily\tseed\tsource_kind\tpattern\toutput\tupstream_operation\tnative_route\tengine\tselection_reason\ttarget\tfeature_bits\tstart_accelerator\taarch64_sve_code_profile\tprefix_graph_bytes\tprefix_selective_positions\tprefix_filter_bytes\twindow_bytes\tmatch_position\tcandidate_density\trotations\tinitial_searches\tmin_trial_ns\ttrials\twarmup_rounds\tupstream_searches_per_trial\tupstream_min_elapsed_ns\tupstream_median_elapsed_ns\tupstream_min_ns_per_search\tupstream_median_ns_per_search\tnative_searches_per_trial\tnative_min_elapsed_ns\tnative_median_elapsed_ns\tnative_min_ns_per_search\tnative_median_ns_per_search\tspeedup_at_min\tspeedup_at_median\tupstream_checksum\tnative_checksum\tstatus"
     );
     let mut aggregates: BTreeMap<(String, String), Vec<f64>> = BTreeMap::new();
     let mut family_regimes: BTreeMap<(String, String), Vec<f64>> = BTreeMap::new();
@@ -3155,7 +3208,7 @@ fn print_joined_rows(
             }
         }
         println!(
-            "comparison\t{}\t{}\t{}\t0x{:016x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t0x{:x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{:.6}\t{:.6}\t{}\t{:.1}\t{:.1}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{}\t{}\tok",
+            "comparison\t{}\t{}\t{}\t0x{:016x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t0x{:x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{:.6}\t{:.6}\t{}\t{:.1}\t{:.1}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{}\t{}\tok",
             scenario.case_name,
             shape.spec.base_name,
             shape.spec.family,
@@ -3170,6 +3223,7 @@ fn print_joined_rows(
             config.target_name,
             config.target.features.bits(),
             accelerator_name(receipt.start_accelerator),
+            aarch64_sve_code_profile(&shape.aot),
             receipt.anchored_prefix.guaranteed_bytes,
             receipt.anchored_prefix.selective_positions,
             receipt.anchored_prefix_filter_bytes,
@@ -3705,6 +3759,56 @@ mod tests {
             assert!(entries.insert(compiled.module().entry_symbol().to_owned()));
         }
         assert_eq!(entries.len(), OutputKind::MATRIX.len());
+    }
+
+    #[test]
+    fn sve_code_profile_distinguishes_exact_range_and_mixed_objects() {
+        let target = Target::aarch64_linux()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2))
+            .unwrap();
+        let profile = |pattern| {
+            let compiled = compile(
+                CompileRequest::new(pattern, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span),
+            )
+            .unwrap();
+            aarch64_sve_code_profile(&compiled)
+        };
+
+        assert_eq!(profile(r"(?-u:\b)(?s:.)*Z"), "sve2_exact_only");
+        assert_eq!(profile(r"[a-z]+"), "base_sve_range_only");
+        assert_eq!(
+            profile(r"(?-u:\b)[a-z]+Z(?s:.)*?"),
+            "mixed_sve2_exact_base_sve_range"
+        );
+        let asimd_mixed = compile(
+            CompileRequest::new(
+                r"(?-u:\b)[a-z]+Z(?s:.)*?",
+                Target::aarch64_linux()
+                    .with_features(
+                        FeatureSet::of(CpuFeature::Aarch64Asimd)
+                            .with(CpuFeature::Aarch64Sve)
+                            .with(CpuFeature::Aarch64Sve2),
+                    )
+                    .unwrap(),
+            )
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span),
+        )
+        .unwrap();
+        assert_eq!(aarch64_sve_code_profile(&asimd_mixed), "none");
+        assert_eq!(
+            aarch64_sve_code_profile(
+                &compile(
+                    CompileRequest::new("z", Target::x86_64_linux())
+                        .mode(CompileMode::Optimizing)
+                        .output(OutputContract::Span),
+                )
+                .unwrap()
+            ),
+            "not_aarch64"
+        );
     }
 
     #[test]
