@@ -6893,6 +6893,13 @@ fn aarch64_cmp_x(left: u8, right: u8) -> Result<u32, ObjectError> {
     Ok(0xeb00_001f | aarch64_reg(right, 16)? | aarch64_reg(left, 5)?)
 }
 
+fn aarch64_cmp_x_lsl(left: u8, right: u8, shift: u8) -> Result<u32, ObjectError> {
+    if shift > 63 {
+        return Err(ObjectError::InvalidModule("AArch64 CMP X shift"));
+    }
+    Ok(0xeb00_001f | aarch64_reg(right, 16)? | (u32::from(shift) << 10) | aarch64_reg(left, 5)?)
+}
+
 fn aarch64_cmp_w_zero(register: u8) -> Result<u32, ObjectError> {
     Ok(0x7100_001f | aarch64_reg(register, 5)?)
 }
@@ -7483,13 +7490,15 @@ fn aarch64_sve_cntb(destination: u8) -> Result<u32, ObjectError> {
     Ok(0x0420_e3e0 | aarch64_reg(destination, 0)?)
 }
 
-fn aarch64_sve_incb(destination: u8) -> Result<u32, ObjectError> {
-    Ok(0x0430_e3e0 | aarch64_reg(destination, 0)?)
-}
-
-fn aarch64_sve_ld1b(destination: u8, base: u8) -> Result<u32, ObjectError> {
+fn aarch64_sve_ld1b_vl(destination: u8, base: u8, vector_offset: u8) -> Result<u32, ObjectError> {
+    if vector_offset > 7 {
+        return Err(ObjectError::InvalidModule("SVE LD1B vector offset"));
+    }
     // The scanner deliberately reserves P0 as its all-byte predicate.
-    Ok(0xa400_a000 | aarch64_reg(base, 5)? | aarch64_reg(destination, 0)?)
+    Ok(0xa400_a000
+        | (u32::from(vector_offset) << 16)
+        | aarch64_reg(base, 5)?
+        | aarch64_reg(destination, 0)?)
 }
 
 fn aarch64_sve_ld1rqb(destination: u8, base: u8) -> Result<u32, ObjectError> {
@@ -7538,16 +7547,44 @@ fn aarch64_sve_orr_b(destination: u8, left: u8, right: u8) -> Result<u32, Object
     )
 }
 
-fn aarch64_sve_ptest_p0_p1() -> u32 {
-    0x2550_c020
+fn aarch64_sve_ptest_p0(predicate: u8) -> Result<u32, ObjectError> {
+    if predicate > 15 {
+        return Err(ObjectError::InvalidModule("SVE PTEST predicate"));
+    }
+    Ok(0x2550_c000 | aarch64_reg(predicate, 5)?)
 }
 
-fn aarch64_sve_brkb_p2_p0_p1() -> u32 {
-    0x2590_4022
+fn aarch64_sve_brkb_p0(destination: u8, candidates: u8) -> Result<u32, ObjectError> {
+    if destination > 15 || candidates > 15 {
+        return Err(ObjectError::InvalidModule("SVE BRKB predicate"));
+    }
+    Ok(0x2590_4000 | aarch64_reg(candidates, 5)? | aarch64_reg(destination, 0)?)
 }
 
 fn aarch64_sve_cntp_p0_p2(destination: u8) -> Result<u32, ObjectError> {
     Ok(0x2520_8040 | aarch64_reg(destination, 0)?)
+}
+
+fn aarch64_sve_whilelo_b(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
+    if destination > 15 {
+        return Err(ObjectError::InvalidModule("SVE WHILELO predicate"));
+    }
+    Ok(
+        0x2520_1c00
+            | aarch64_reg(right, 16)?
+            | aarch64_reg(left, 5)?
+            | aarch64_reg(destination, 0)?,
+    )
+}
+
+fn aarch64_sve_addvl(destination: u8, source: u8, vector_count: u8) -> Result<u32, ObjectError> {
+    if vector_count > 31 {
+        return Err(ObjectError::InvalidModule("SVE ADDVL vector count"));
+    }
+    Ok(0x0420_5000
+        | aarch64_reg(source, 16)?
+        | (u32::from(vector_count) << 5)
+        | aarch64_reg(destination, 0)?)
 }
 
 fn aarch64_sve2_match_b(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
@@ -7916,9 +7953,8 @@ fn aarch64_emit_sve_filter_setup(
         return Err(ObjectError::InvalidModule("empty SVE start filter"));
     }
     // AAPCS64 6.1.4 makes every predicate register caller-saved for this
-    // ordinary scalar interface. The scanner still confines itself to P0..P3,
+    // ordinary scalar interface. The scanner still confines itself to P0..P4,
     // which are caller-saved even for a scalable-vector PCS interface.
-    assembler.instruction(aarch64_sve_ptrue_b())?;
     match kind {
         Aarch64SveFilterKind::Sve => {
             for (index, range) in filter.ranges().iter().enumerate() {
@@ -7949,6 +7985,9 @@ fn aarch64_emit_sve_filter_setup(
             if !filter.is_exact() || filter.ranges().len() > 16 {
                 return Err(ObjectError::InvalidModule("invalid SVE2 MATCH filter"));
             }
+            // LD1RQB is predicated; the public scanner entry establishes P0
+            // after setup, so this one setup-only PTRUE is required here.
+            assembler.instruction(aarch64_sve_ptrue_b())?;
             aarch64_set_table_address(assembler, 12, match_table_offset)?;
             assembler.instruction(aarch64_sve_ld1rqb(16, 12)?)?;
         }
@@ -8002,12 +8041,34 @@ fn aarch64_emit_sve_filter_candidates(
     Ok(())
 }
 
+fn aarch64_emit_sve_filter_load_candidates(
+    assembler: &mut Aarch64Assembler,
+    filter: NativeStartFilter,
+    kind: Aarch64SveFilterKind,
+    vector_offset: u8,
+) -> Result<(), ObjectError> {
+    assembler.instruction(aarch64_sve_ld1b_vl(0, 12, vector_offset)?)?;
+    aarch64_emit_sve_filter_candidates(assembler, filter, kind)
+}
+
+fn aarch64_emit_sve_first_candidate(
+    assembler: &mut Aarch64Assembler,
+    candidates: u8,
+    candidate: Aarch64Label,
+) -> Result<(), ObjectError> {
+    assembler.instruction(aarch64_sve_brkb_p0(2, candidates)?)?;
+    assembler.instruction(aarch64_sve_cntp_p0_p2(12)?)?;
+    assembler.instruction(aarch64_add_x_reg(2, 2, 12)?)?;
+    assembler.branch(candidate)?;
+    Ok(())
+}
+
 /// Emit one vector-length-agnostic scanner over a graph-derived byte filter.
 ///
-/// Every full block consumes the runtime `CNTB` width. A hit is refined to
-/// its exact first lane entirely in predicates, so callers may continue at
-/// `candidate` without rescanning the block. The bounded tail is delegated to
-/// the existing scalar path.
+/// `CNTB` is loop invariant. The no-hit path checks one four-vector batch at a
+/// time, retaining only their union; the rare hit path replays those four
+/// predicate probes in source order. One-vector and predicated partial tails
+/// preserve the same exact first-lane rule without reading past the window.
 fn aarch64_emit_sve_start_filter_scanner(
     assembler: &mut Aarch64Assembler,
     filter: NativeStartFilter,
@@ -8017,28 +8078,115 @@ fn aarch64_emit_sve_start_filter_scanner(
     scalar: Aarch64Label,
     candidate: Aarch64Label,
 ) -> Result<(), ObjectError> {
-    let hit = assembler.label()?;
+    let batch = assembler.label()?;
+    let batch_hit = assembler.label()?;
+    let batch_hits = [
+        assembler.label()?,
+        assembler.label()?,
+        assembler.label()?,
+        assembler.label()?,
+    ];
+    let single = assembler.label()?;
+    let partial = assembler.label()?;
+    let single_hit = assembler.label()?;
     aarch64_emit_sve_filter_setup(assembler, filter, kind)?;
     assembler.bind(vector)?;
-    assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+    // A rejected candidate may re-enter here after a predicated tail probe.
+    // Restore the all-lanes predicate before any full-vector load.
+    assembler.instruction(aarch64_sve_ptrue_b())?;
     assembler.instruction(aarch64_sve_cntb(6)?)?;
+
+    assembler.bind(batch)?;
+    assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
     if maximum_scan_offset != 0 {
-        assembler.instruction(aarch64_add_x_imm(6, 6, u16::from(maximum_scan_offset))?)?;
+        assembler.instruction(aarch64_cmp_x_imm(12, u16::from(maximum_scan_offset))?)?;
+        assembler.branch_cond(AARCH64_LS, scalar)?;
+        assembler.instruction(aarch64_sub_x_imm(12, 12, u16::from(maximum_scan_offset))?)?;
+    }
+    assembler.instruction(aarch64_cmp_x_lsl(12, 6, 2)?)?;
+    assembler.branch_cond(AARCH64_LO, single)?;
+    aarch64_emit_start_filter_address(assembler, filter.scan_offset)?;
+    for block in 0_u8..4 {
+        aarch64_emit_sve_filter_load_candidates(assembler, filter, kind, block)?;
+        assembler.instruction(if block == 0 {
+            aarch64_sve_orr_b(4, 1, 1)?
+        } else {
+            aarch64_sve_orr_b(4, 4, 1)?
+        })?;
+    }
+    assembler.instruction(aarch64_sve_ptest_p0(4)?)?;
+    assembler.branch_cond(AARCH64_NE, batch_hit)?;
+    assembler.instruction(aarch64_sve_addvl(2, 2, 4)?)?;
+    assembler.branch(batch)?;
+
+    // Recompute only the rare hit batch. Ordered probes keep the leftmost
+    // candidate exact without retaining four live predicate masks hot-side.
+    assembler.bind(batch_hit)?;
+    aarch64_emit_start_filter_address(assembler, filter.scan_offset)?;
+    for (block, &hit) in batch_hits.iter().enumerate() {
+        aarch64_emit_sve_filter_load_candidates(
+            assembler,
+            filter,
+            kind,
+            u8::try_from(block).map_err(|_| ObjectError::ArithmeticOverflow("SVE hit block"))?,
+        )?;
+        assembler.instruction(aarch64_sve_ptest_p0(1)?)?;
+        assembler.branch_cond(AARCH64_NE, hit)?;
+    }
+    // The batch union proved that one ordered probe must succeed. Preserve a
+    // correct scalar fallback if future instruction selection violates that
+    // invariant instead of manufacturing a candidate.
+    assembler.branch(scalar)?;
+    for (block, &hit) in batch_hits.iter().enumerate() {
+        assembler.bind(hit)?;
+        if block != 0 {
+            assembler.instruction(aarch64_sve_addvl(
+                2,
+                2,
+                u8::try_from(block)
+                    .map_err(|_| ObjectError::ArithmeticOverflow("SVE hit block"))?,
+            )?)?;
+        }
+        aarch64_emit_sve_first_candidate(assembler, 1, candidate)?;
+    }
+
+    assembler.bind(single)?;
+    assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+    if maximum_scan_offset != 0 {
+        assembler.instruction(aarch64_cmp_x_imm(12, u16::from(maximum_scan_offset))?)?;
+        assembler.branch_cond(AARCH64_LS, scalar)?;
+        assembler.instruction(aarch64_sub_x_imm(12, 12, u16::from(maximum_scan_offset))?)?;
     }
     assembler.instruction(aarch64_cmp_x(12, 6)?)?;
-    assembler.branch_cond(AARCH64_LO, scalar)?;
+    assembler.branch_cond(AARCH64_LO, partial)?;
     aarch64_emit_start_filter_address(assembler, filter.scan_offset)?;
-    assembler.instruction(aarch64_sve_ld1b(0, 12)?)?;
-    aarch64_emit_sve_filter_candidates(assembler, filter, kind)?;
-    assembler.instruction(aarch64_sve_ptest_p0_p1())?;
-    assembler.branch_cond(AARCH64_NE, hit)?;
-    assembler.instruction(aarch64_sve_incb(2)?)?;
-    assembler.branch(vector)?;
-    assembler.bind(hit)?;
-    assembler.instruction(aarch64_sve_brkb_p2_p0_p1())?;
-    assembler.instruction(aarch64_sve_cntp_p0_p2(12)?)?;
-    assembler.instruction(aarch64_add_x_reg(2, 2, 12)?)?;
-    assembler.branch(candidate)?;
+    aarch64_emit_sve_filter_load_candidates(assembler, filter, kind, 0)?;
+    assembler.instruction(aarch64_sve_ptest_p0(1)?)?;
+    assembler.branch_cond(AARCH64_NE, single_hit)?;
+    assembler.instruction(aarch64_sve_addvl(2, 2, 1)?)?;
+    assembler.branch(single)?;
+
+    assembler.bind(partial)?;
+    let partial_end = if maximum_scan_offset == 0 {
+        3
+    } else {
+        assembler.instruction(aarch64_sub_x_imm(12, 3, u16::from(maximum_scan_offset))?)?;
+        12
+    };
+    assembler.instruction(aarch64_sve_whilelo_b(0, 2, partial_end)?)?;
+    aarch64_emit_start_filter_address(assembler, filter.scan_offset)?;
+    aarch64_emit_sve_filter_load_candidates(assembler, filter, kind, 0)?;
+    assembler.instruction(aarch64_sve_ptest_p0(1)?)?;
+    assembler.branch_cond(AARCH64_NE, single_hit)?;
+    if maximum_scan_offset == 0 {
+        assembler.instruction(aarch64_mov_x(2, 3)?)?;
+    } else {
+        assembler.instruction(aarch64_sub_x_imm(2, 3, u16::from(maximum_scan_offset))?)?;
+    }
+    assembler.branch(scalar)?;
+
+    assembler.bind(single_hit)?;
+    aarch64_emit_sve_first_candidate(assembler, 1, candidate)?;
     Ok(())
 }
 
@@ -9826,10 +9974,12 @@ mod tests {
 
     #[test]
     fn aarch64_sve_scanner_instructions_have_exact_encodings() {
+        assert_eq!(aarch64_cmp_x_lsl(12, 6, 2).unwrap(), 0xeb06_099f);
         assert_eq!(aarch64_sve_ptrue_b(), 0x2518_e3e0);
         assert_eq!(aarch64_sve_cntb(13).unwrap(), 0x0420_e3ed);
-        assert_eq!(aarch64_sve_incb(2).unwrap(), 0x0430_e3e2);
-        assert_eq!(aarch64_sve_ld1b(0, 12).unwrap(), 0xa400_a180);
+        assert_eq!(aarch64_sve_ld1b_vl(0, 12, 0).unwrap(), 0xa400_a180);
+        assert_eq!(aarch64_sve_ld1b_vl(1, 12, 1).unwrap(), 0xa401_a181);
+        assert_eq!(aarch64_sve_ld1b_vl(7, 12, 3).unwrap(), 0xa403_a187);
         assert_eq!(aarch64_sve_ld1rqb(16, 12).unwrap(), 0xa400_2190);
         assert_eq!(aarch64_sve_dup_b_from_w(16, 12).unwrap(), 0x0520_3990);
         assert_eq!(aarch64_sve_cmpeq_b(1, 0, 16).unwrap(), 0x2410_a001);
@@ -9837,10 +9987,22 @@ mod tests {
         assert_eq!(aarch64_sve_cmphs_b(3, 17, 0).unwrap(), 0x2400_0223);
         assert_eq!(aarch64_sve_and_b(1, 1, 3).unwrap(), 0x2503_4021);
         assert_eq!(aarch64_sve_orr_b(1, 1, 2).unwrap(), 0x2582_4021);
-        assert_eq!(aarch64_sve_ptest_p0_p1(), 0x2550_c020);
-        assert_eq!(aarch64_sve_brkb_p2_p0_p1(), 0x2590_4022);
+        assert_eq!(aarch64_sve_ptest_p0(1).unwrap(), 0x2550_c020);
+        assert_eq!(aarch64_sve_ptest_p0(4).unwrap(), 0x2550_c080);
+        assert_eq!(aarch64_sve_brkb_p0(2, 1).unwrap(), 0x2590_4022);
+        assert_eq!(aarch64_sve_brkb_p0(3, 4).unwrap(), 0x2590_4083);
         assert_eq!(aarch64_sve_cntp_p0_p2(12).unwrap(), 0x2520_804c);
+        assert_eq!(aarch64_sve_whilelo_b(0, 2, 3).unwrap(), 0x2523_1c40);
+        assert_eq!(aarch64_sve_addvl(2, 2, 1).unwrap(), 0x0422_5022);
+        assert_eq!(aarch64_sve_addvl(3, 4, 4).unwrap(), 0x0424_5083);
         assert_eq!(aarch64_sve2_match_b(1, 0, 16).unwrap(), 0x4530_8001);
+
+        assert!(aarch64_cmp_x_lsl(0, 0, 64).is_err());
+        assert!(aarch64_sve_ld1b_vl(0, 0, 8).is_err());
+        assert!(aarch64_sve_ptest_p0(16).is_err());
+        assert!(aarch64_sve_brkb_p0(16, 0).is_err());
+        assert!(aarch64_sve_whilelo_b(16, 0, 0).is_err());
+        assert!(aarch64_sve_addvl(0, 0, 32).is_err());
     }
 
     #[test]
@@ -9853,6 +10015,97 @@ mod tests {
             .map(|index| aarch64_sve_filter_constant_register(index).unwrap())
             .collect::<Vec<_>>();
         assert_eq!(registers, (16_u8..=23).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn aarch64_sve_batched_and_predicated_tail_model_matches_scalar_for_all_vls() {
+        fn scalar_first(
+            haystack: &[u8],
+            start: usize,
+            end: usize,
+            scan_offset: usize,
+            maximum_scan_offset: usize,
+        ) -> Option<usize> {
+            (start..end)
+                .take_while(|&candidate| candidate + maximum_scan_offset < end)
+                .find(|&candidate| haystack[candidate + scan_offset] == b'Z')
+        }
+
+        fn sve_first(
+            haystack: &[u8],
+            mut position: usize,
+            end: usize,
+            scan_offset: usize,
+            maximum_scan_offset: usize,
+            vector_length: usize,
+        ) -> Option<usize> {
+            let safe_end = end.saturating_sub(maximum_scan_offset);
+            if position >= safe_end {
+                return None;
+            }
+            while safe_end - position >= 4 * vector_length {
+                if let Some(candidate) = (position..position + 4 * vector_length)
+                    .find(|&candidate| haystack[candidate + scan_offset] == b'Z')
+                {
+                    return Some(candidate);
+                }
+                position += 4 * vector_length;
+            }
+            while safe_end - position >= vector_length {
+                if let Some(candidate) = (position..position + vector_length)
+                    .find(|&candidate| haystack[candidate + scan_offset] == b'Z')
+                {
+                    return Some(candidate);
+                }
+                position += vector_length;
+            }
+            (position..safe_end).find(|&candidate| haystack[candidate + scan_offset] == b'Z')
+        }
+
+        for vector_length in [16_usize, 32, 64] {
+            for (scan_offset, maximum_scan_offset) in [(0_usize, 0_usize), (0, 1), (1, 1), (1, 3)] {
+                for start in [0_usize, 3] {
+                    for length in 0..=5 * vector_length + maximum_scan_offset + 2 {
+                        let end = start + length;
+                        let mut haystack = vec![b'x'; end];
+                        assert_eq!(
+                            sve_first(
+                                &haystack,
+                                start,
+                                end,
+                                scan_offset,
+                                maximum_scan_offset,
+                                vector_length,
+                            ),
+                            scalar_first(&haystack, start, end, scan_offset, maximum_scan_offset,)
+                        );
+                        let safe_end = end.saturating_sub(maximum_scan_offset);
+                        for candidate in start..safe_end {
+                            haystack[candidate + scan_offset] = b'Z';
+                            assert_eq!(
+                                sve_first(
+                                    &haystack,
+                                    start,
+                                    end,
+                                    scan_offset,
+                                    maximum_scan_offset,
+                                    vector_length,
+                                ),
+                                scalar_first(
+                                    &haystack,
+                                    start,
+                                    end,
+                                    scan_offset,
+                                    maximum_scan_offset,
+                                ),
+                                "vl={vector_length}, scan={scan_offset}, max={maximum_scan_offset}, start={start}, end={end}, candidate={candidate}"
+                            );
+                            haystack[candidate + scan_offset] = b'x';
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -11953,16 +12206,30 @@ mod tests {
         for word in [
             aarch64_sve_ptrue_b(),
             aarch64_sve_cntb(6).unwrap(),
-            aarch64_sve_ld1b(0, 12).unwrap(),
+            aarch64_sve_ld1b_vl(0, 12, 0).unwrap(),
+            aarch64_sve_ld1b_vl(0, 12, 1).unwrap(),
+            aarch64_sve_ld1b_vl(0, 12, 2).unwrap(),
+            aarch64_sve_ld1b_vl(0, 12, 3).unwrap(),
             aarch64_sve_cmphs_b(1, 0, 16).unwrap(),
             aarch64_sve_cmphs_b(3, 17, 0).unwrap(),
-            aarch64_sve_ptest_p0_p1(),
-            aarch64_sve_incb(2).unwrap(),
-            aarch64_sve_brkb_p2_p0_p1(),
+            aarch64_sve_ptest_p0(1).unwrap(),
+            aarch64_sve_ptest_p0(4).unwrap(),
+            aarch64_sve_addvl(2, 2, 4).unwrap(),
+            aarch64_sve_addvl(2, 2, 1).unwrap(),
+            aarch64_sve_whilelo_b(0, 2, 3).unwrap(),
+            aarch64_sve_brkb_p0(2, 1).unwrap(),
             aarch64_sve_cntp_p0_p2(12).unwrap(),
         ] {
             assert!(sve_words.contains(&word), "missing SVE word {word:#010x}");
         }
+        assert_eq!(
+            sve_words
+                .iter()
+                .filter(|&&word| word == aarch64_sve_cntb(6).unwrap())
+                .count(),
+            1,
+            "CNTB must be invariant across every internal batch and tail loop"
+        );
 
         let sve2_features = sve_features.with(CpuFeature::Aarch64Sve2);
         let sve2 = compile_for(
@@ -17152,7 +17419,8 @@ mod tests {
                             .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
                             .collect::<Vec<_>>();
                         if target.features.has(CpuFeature::Aarch64Sve) {
-                            assert!(words.contains(&aarch64_sve_incb(2).unwrap()));
+                            assert!(words.contains(&aarch64_sve_addvl(2, 2, 4).unwrap()));
+                            assert!(words.contains(&aarch64_sve_ptest_p0(4).unwrap()));
                         } else {
                             assert!(use_aarch64_filter_batch(filter));
                             assert!(

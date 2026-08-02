@@ -9845,8 +9845,15 @@ mod tests {
         for word in [
             super::super::aarch64_sve_ptrue_b(),
             super::super::aarch64_sve_cntb(6).unwrap(),
-            super::super::aarch64_sve_ld1b(0, 12).unwrap(),
-            super::super::aarch64_sve_brkb_p2_p0_p1(),
+            super::super::aarch64_sve_ld1b_vl(0, 12, 0).unwrap(),
+            super::super::aarch64_sve_ld1b_vl(0, 12, 1).unwrap(),
+            super::super::aarch64_sve_ld1b_vl(0, 12, 2).unwrap(),
+            super::super::aarch64_sve_ld1b_vl(0, 12, 3).unwrap(),
+            super::super::aarch64_sve_ptest_p0(4).unwrap(),
+            super::super::aarch64_sve_addvl(2, 2, 4).unwrap(),
+            super::super::aarch64_sve_addvl(2, 2, 1).unwrap(),
+            super::super::aarch64_sve_whilelo_b(0, 2, 3).unwrap(),
+            super::super::aarch64_sve_brkb_p0(2, 1).unwrap(),
             super::super::aarch64_sve_cntp_p0_p2(12).unwrap(),
         ] {
             assert!(
@@ -9929,7 +9936,16 @@ mod tests {
                 .iter()
                 .filter(|&&word| word == super::super::aarch64_sve_ptrue_b())
                 .count(),
-            2
+            3,
+            "both prepasses have predicate-restoring entries and only SVE2 needs a setup predicate for LD1RQB"
+        );
+        assert_eq!(
+            mixed_words
+                .iter()
+                .filter(|&&word| word == super::super::aarch64_sve_cntb(6).unwrap())
+                .count(),
+            2,
+            "CNTB must remain invariant inside each of the two emitted prepasses"
         );
         assert!(mixed_words.contains(&super::super::aarch64_sve2_match_b(1, 0, 16).unwrap()));
         assert!(mixed_words.contains(&super::super::aarch64_sve_cmphs_b(1, 0, 16).unwrap()));
