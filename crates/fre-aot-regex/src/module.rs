@@ -3922,6 +3922,199 @@ impl X86Assembler {
             .ok_or(ObjectError::ArithmeticOverflow("x86 relaxed offset"))
     }
 
+    fn invert_branch_fallthroughs(&mut self, removed: &mut [bool]) -> Result<(), ObjectError> {
+        let mut shortened = Vec::new();
+        shortened
+            .try_reserve_exact(self.fixups.len())
+            .map_err(|_| ObjectError::InvalidModule("x86 inversion allocation failed"))?;
+        shortened.resize(self.fixups.len(), false);
+        loop {
+            let mut changed = false;
+            for conditional_index in 0..self.fixups.len() {
+                if removed[conditional_index] {
+                    continue;
+                }
+                let conditional = self.fixups[conditional_index];
+                if !matches!(conditional.short_opcode, Some(0x70..=0x7f)) {
+                    continue;
+                }
+                let Some(jump_index) =
+                    (conditional_index + 1..self.fixups.len()).find(|&index| !removed[index])
+                else {
+                    continue;
+                };
+                let jump = self.fixups[jump_index];
+                if jump.short_opcode != Some(0xeb) {
+                    continue;
+                }
+                let conditional_end = self.remap_offset(
+                    conditional
+                        .instruction
+                        .checked_add(conditional.long_bytes)
+                        .ok_or(ObjectError::ArithmeticOverflow("x86 branch extent"))?,
+                    removed,
+                    &shortened,
+                )?;
+                let jump_instruction = self.remap_offset(jump.instruction, removed, &shortened)?;
+                if conditional_end != jump_instruction {
+                    continue;
+                }
+                let target = self.labels[conditional.label]
+                    .ok_or(ObjectError::InvalidModule("unbound x86 branch label"))?;
+                let target = self.remap_offset(target, removed, &shortened)?;
+                let jump_end = self.remap_offset(
+                    jump.instruction
+                        .checked_add(jump.long_bytes)
+                        .ok_or(ObjectError::ArithmeticOverflow("x86 branch extent"))?,
+                    removed,
+                    &shortened,
+                )?;
+                if target != jump_end {
+                    continue;
+                }
+                let jump_target = self.labels[jump.label]
+                    .ok_or(ObjectError::InvalidModule("unbound x86 branch label"))?;
+                if jump_target == jump.instruction
+                    || self
+                        .fixups
+                        .binary_search_by_key(&jump_target, |candidate| candidate.instruction)
+                        .is_ok_and(|index| removed[index])
+                {
+                    continue;
+                }
+
+                let opcode = self.code.get_mut(conditional.instruction + 1).ok_or(
+                    ObjectError::InvalidModule("x86 conditional branch outside code"),
+                )?;
+                if *opcode & 0xf0 != 0x80 {
+                    return Err(ObjectError::InvalidModule(
+                        "x86 conditional branch opcode mismatch",
+                    ));
+                }
+                *opcode ^= 1;
+                self.fixups[conditional_index].short_opcode =
+                    conditional.short_opcode.map(|v| v ^ 1);
+                self.fixups[conditional_index].label = jump.label;
+                removed[jump_index] = true;
+                changed = true;
+            }
+            if !changed {
+                return Ok(());
+            }
+        }
+    }
+
+    fn thread_branch_targets(&mut self, removed: &[bool]) -> Result<(), ObjectError> {
+        let mut labels = Vec::new();
+        labels
+            .try_reserve_exact(self.fixups.len())
+            .map_err(|_| ObjectError::InvalidModule("x86 threading allocation failed"))?;
+        let mut shortened = Vec::new();
+        shortened
+            .try_reserve_exact(self.fixups.len())
+            .map_err(|_| ObjectError::InvalidModule("x86 threading allocation failed"))?;
+        shortened.resize(self.fixups.len(), false);
+
+        for (index, fixup) in self.fixups.iter().enumerate() {
+            let original = fixup.label;
+            let mut label = original;
+            let mut resolved = None;
+            let mut retained_cycle_label = None;
+            let mut direct_target_removed = false;
+
+            // There can be at most one direct branch at an instruction
+            // boundary and at most `fixups.len()` distinct trampoline
+            // instructions. One additional lookup therefore distinguishes a
+            // finite chain from a cycle without allocating a visited set.
+            for _ in 0..=self.fixups.len() {
+                let target = self
+                    .labels
+                    .get(label)
+                    .copied()
+                    .flatten()
+                    .ok_or(ObjectError::InvalidModule("unbound x86 branch label"))?;
+                let Ok(index) = self
+                    .fixups
+                    .binary_search_by_key(&target, |candidate| candidate.instruction)
+                else {
+                    resolved = Some(label);
+                    break;
+                };
+                let trampoline = self.fixups[index];
+                if trampoline.short_opcode != Some(0xeb) {
+                    resolved = Some(label);
+                    break;
+                }
+                if removed[index] {
+                    direct_target_removed |= label == original;
+                } else {
+                    retained_cycle_label = Some(label);
+                }
+                label = trampoline.label;
+            }
+
+            // Retaining the original edge for a jump cycle preserves the
+            // exact looping CFG. Thread a finite chain only when its resolved
+            // edge can use rel8 before any other shortening; later monotone
+            // compaction can only bring the destination closer. This avoids
+            // trading a nearby trampoline for a larger source branch.
+            let label = if let Some(label) = resolved {
+                label
+            } else if direct_target_removed {
+                retained_cycle_label
+                    .ok_or(ObjectError::InvalidModule("x86 removed trampoline cycle"))?
+            } else {
+                original
+            };
+            let raw_target =
+                self.labels[label].ok_or(ObjectError::InvalidModule("unbound x86 branch label"))?;
+            let instruction = self.remap_offset(fixup.instruction, removed, &shortened)?;
+            let mut target = self.remap_offset(raw_target, removed, &shortened)?;
+            let raw_end = fixup
+                .instruction
+                .checked_add(fixup.long_bytes)
+                .ok_or(ObjectError::ArithmeticOverflow("x86 branch extent"))?;
+            if raw_end <= raw_target {
+                target = target
+                    .checked_sub(
+                        fixup
+                            .long_bytes
+                            .checked_sub(2)
+                            .ok_or(ObjectError::InvalidModule("x86 relaxed branch size"))?,
+                    )
+                    .ok_or(ObjectError::ArithmeticOverflow(
+                        "x86 hypothetical threaded target",
+                    ))?;
+            }
+            let after = instruction
+                .checked_add(2)
+                .ok_or(ObjectError::ArithmeticOverflow("x86 short branch base"))?;
+            let delta = i64::try_from(target)
+                .map_err(|_| ObjectError::ArithmeticOverflow("x86 threaded branch target"))?
+                .checked_sub(
+                    i64::try_from(after)
+                        .map_err(|_| ObjectError::ArithmeticOverflow("x86 short branch base"))?,
+                )
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "x86 threaded branch displacement",
+                ))?;
+            labels.push(
+                if !removed[index]
+                    && (direct_target_removed
+                        || fixup.short_opcode.is_some() && i8::try_from(delta).is_ok())
+                {
+                    label
+                } else {
+                    original
+                },
+            );
+        }
+        for (fixup, label) in self.fixups.iter_mut().zip(labels) {
+            fixup.label = label;
+        }
+        Ok(())
+    }
+
     fn finish_with_label_offsets(mut self) -> Result<X86Finished, ObjectError> {
         self.instruction_offsets.push(self.code.len());
         for fixup in &self.fixups {
@@ -3937,7 +4130,6 @@ impl X86Assembler {
                 ));
             }
         }
-
         // A direct branch to its own fallthrough has no observable effect,
         // conditional or unconditional. Remove these edges before sizing the
         // remaining branches so their bytes can also make more rel8 forms fit.
@@ -3946,6 +4138,8 @@ impl X86Assembler {
             .try_reserve_exact(self.fixups.len())
             .map_err(|_| ObjectError::InvalidModule("x86 dead branch allocation failed"))?;
         removed.resize(self.fixups.len(), false);
+        self.invert_branch_fallthroughs(&mut removed)?;
+        self.thread_branch_targets(&removed)?;
         let mut shortened = Vec::new();
         shortened
             .try_reserve_exact(self.fixups.len())
@@ -10610,6 +10804,109 @@ mod tests {
     }
 
     #[test]
+    fn x86_assembler_threads_finite_jump_chains_but_preserves_cycles() {
+        let mut assembler = X86Assembler::new();
+        let trampoline = assembler.label().unwrap();
+        let target = assembler.label().unwrap();
+        assembler.branch(&[0x0f, 0x84], trampoline).unwrap();
+        assembler.instruction(&[0x90]).unwrap();
+        assembler.bind(trampoline).unwrap();
+        assembler.branch(&[0xe9], target).unwrap();
+        assembler.instruction(&[0x90]).unwrap();
+        assembler.bind(target).unwrap();
+        assembler.instruction(&[0x90]).unwrap();
+        assert_eq!(
+            assembler.finish().unwrap(),
+            [0x74, 0x04, 0x90, 0xeb, 0x01, 0x90, 0x90]
+        );
+
+        let mut assembler = X86Assembler::new();
+        let first = assembler.label().unwrap();
+        let second = assembler.label().unwrap();
+        assembler.branch(&[0x0f, 0x84], first).unwrap();
+        assembler.instruction(&[0x90]).unwrap();
+        assembler.bind(first).unwrap();
+        assembler.branch(&[0xe9], second).unwrap();
+        assembler.instruction(&[0x90]).unwrap();
+        assembler.bind(second).unwrap();
+        assembler.branch(&[0xe9], first).unwrap();
+        assembler.instruction(&[0x90]).unwrap();
+        assert_eq!(
+            assembler.finish().unwrap(),
+            [0x74, 0x01, 0x90, 0xeb, 0x01, 0x90, 0xeb, 0xfb, 0x90]
+        );
+
+        let mut assembler = X86Assembler::new();
+        let trampoline = assembler.label().unwrap();
+        let target = assembler.label().unwrap();
+        assembler.branch(&[0x0f, 0x84], trampoline).unwrap();
+        assembler.instruction(&[0x90]).unwrap();
+        assembler.bind(trampoline).unwrap();
+        assembler.branch(&[0xe9], target).unwrap();
+        for _ in 0..200 {
+            assembler.instruction(&[0x90]).unwrap();
+        }
+        assembler.bind(target).unwrap();
+        assembler.instruction(&[0x90]).unwrap();
+        assert_eq!(&assembler.finish().unwrap()[..3], &[0x74, 0x01, 0x90]);
+    }
+
+    #[test]
+    fn x86_assembler_inverts_conditional_jump_diamonds_before_relaxation() {
+        let mut assembler = X86Assembler::new();
+        let taken = assembler.label().unwrap();
+        let failed = assembler.label().unwrap();
+        assembler.branch(&[0x0f, 0x84], taken).unwrap();
+        assembler.branch(&[0xe9], failed).unwrap();
+        assembler.bind(taken).unwrap();
+        assembler.instruction(&[0x90]).unwrap();
+        assembler.bind(failed).unwrap();
+        assembler.instruction(&[0x90]).unwrap();
+        assert_eq!(assembler.finish().unwrap(), [0x75, 0x01, 0x90, 0x90]);
+
+        let mut assembler = X86Assembler::new();
+        let taken = assembler.label().unwrap();
+        let failed = assembler.label().unwrap();
+        assembler.branch(&[0x0f, 0x84], taken).unwrap();
+        assembler.branch(&[0xe9], failed).unwrap();
+        assembler.bind(taken).unwrap();
+        for _ in 0..200 {
+            assembler.instruction(&[0x90]).unwrap();
+        }
+        assembler.bind(failed).unwrap();
+        assembler.instruction(&[0x90]).unwrap();
+        let code = assembler.finish().unwrap();
+        assert_eq!(&code[..6], &[0x0f, 0x85, 0xc8, 0, 0, 0]);
+        assert_eq!(code.len(), 207);
+
+        let mut assembler = X86Assembler::new();
+        let trampoline = assembler.label().unwrap();
+        let taken = assembler.label().unwrap();
+        let failed = assembler.label().unwrap();
+        assembler.branch(&[0x0f, 0x85], trampoline).unwrap();
+        assembler.instruction(&[0x90]).unwrap();
+        assembler.branch(&[0x0f, 0x84], taken).unwrap();
+        assembler.bind(trampoline).unwrap();
+        assembler.branch(&[0xe9], failed).unwrap();
+        assembler.bind(taken).unwrap();
+        assembler.instruction(&[0x90]).unwrap();
+        assembler.bind(failed).unwrap();
+        assembler.instruction(&[0x90]).unwrap();
+        let finished = assembler.finish_with_label_offsets().unwrap();
+        let incoming_target = x86_test_branch_target(&finished.code, 0).unwrap().0;
+        assert_eq!(incoming_target, finished.label_offset(failed).unwrap());
+
+        let mut assembler = X86Assembler::new();
+        let taken = assembler.label().unwrap();
+        let looping = assembler.label().unwrap();
+        assembler.branch(&[0x0f, 0x84], taken).unwrap();
+        assembler.bind(looping).unwrap();
+        assembler.branch(&[0xe9], looping).unwrap();
+        assembler.bind(taken).unwrap();
+        assert_eq!(assembler.finish().unwrap(), [0x74, 0x02, 0xeb, 0xfe]);
+    }
+
+    #[test]
     fn sparse_batch_admission_uses_stable_frequency_and_instruction_cost() {
         let one_range = |start: u8, end: u8| {
             let mut filter = EMPTY_NATIVE_START_FILTER;
@@ -10891,10 +11188,35 @@ mod tests {
                     };
                     let primary_loop = materialized_loop(clears[0]);
                     let joint_loop = materialized_loop(clears[1]);
+                    let reduction_rewind = |branch: usize, loop_start: usize| {
+                        let opcode = x86_test_normalized_branch_opcode(code, branch);
+                        let (target, length) = x86_test_branch_target(code, branch).unwrap();
+                        match opcode {
+                            Some(0x84) => {
+                                // Canonical inversion: no-hit branches back to
+                                // the scan and a hit falls through to rewind.
+                                assert_eq!(target, loop_start);
+                                branch + length
+                            }
+                            Some(0x85) => {
+                                // A non-adjacent rewind retains the original
+                                // hit edge plus its explicit miss backedge.
+                                let miss_branch = branch + length;
+                                assert_eq!(
+                                    x86_test_normalized_branch_opcode(code, miss_branch),
+                                    Some(0xe9)
+                                );
+                                assert_eq!(
+                                    x86_test_branch_target(code, miss_branch).unwrap().0,
+                                    loop_start
+                                );
+                                target
+                            }
+                            opcode => panic!("unexpected adaptive reduction edge {opcode:?}"),
+                        }
+                    };
                     let primary_hit_branch = reductions[0] + reduce.len();
-                    let (rewind_block, _) =
-                        x86_test_branch_target(code, primary_hit_branch).unwrap();
-                    assert!(primary_hit_branch < rewind_block);
+                    let rewind_block = reduction_rewind(primary_hit_branch, primary_loop);
                     assert_eq!(
                         &code[rewind_block..rewind_block + rewind.len()],
                         rewind,
@@ -10904,21 +11226,8 @@ mod tests {
                         [(reductions[0], primary_loop), (reductions[1], joint_loop)]
                     {
                         let hit_branch = index + reduce.len();
-                        assert_eq!(
-                            x86_test_normalized_branch_opcode(code, hit_branch),
-                            Some(0x85)
-                        );
-                        let (_, hit_length) = x86_test_branch_target(code, hit_branch).unwrap();
-                        assert_eq!(
-                            x86_test_branch_target(code, hit_branch).unwrap().0,
-                            rewind_block
-                        );
-                        let miss_branch = hit_branch + hit_length;
-                        assert_eq!(
-                            x86_test_branch_target(code, miss_branch).unwrap().0,
-                            loop_start
-                        );
-                        assert!(miss_branch > loop_start);
+                        assert_eq!(reduction_rewind(hit_branch, loop_start), rewind_block);
+                        assert!(hit_branch > loop_start);
                     }
                     assert!(reductions[1] > rewind_block);
 
@@ -11033,13 +11342,19 @@ mod tests {
                     let reductions = offsets(&baseline_code, reduce);
                     assert_eq!(reductions.len(), 1, "{features:?} {output:?}");
                     let primary_hit = reductions[0] + reduce.len();
-                    assert_eq!(
-                        x86_test_normalized_branch_opcode(&baseline_code, primary_hit),
-                        Some(0x85)
-                    );
-                    let rewind_block = x86_test_branch_target(&baseline_code, primary_hit)
-                        .unwrap()
-                        .0;
+                    let primary_rewind = |code: &[u8], branch: usize| {
+                        let opcode = x86_test_normalized_branch_opcode(code, branch);
+                        let (target, length) = x86_test_branch_target(code, branch).unwrap();
+                        match opcode {
+                            Some(0x84) => {
+                                assert!(target < branch, "inverted no-hit edge must be a backedge");
+                                branch + length
+                            }
+                            Some(0x85) => target,
+                            opcode => panic!("unexpected primary reduction edge {opcode:?}"),
+                        }
+                    };
+                    let rewind_block = primary_rewind(&baseline_code, primary_hit);
                     assert_eq!(
                         &baseline_code[rewind_block..rewind_block + rewind.len()],
                         rewind
@@ -11059,14 +11374,7 @@ mod tests {
                     let adaptive_reductions = offsets(&adaptive_code, reduce);
                     assert_eq!(adaptive_reductions.len(), 2);
                     let adaptive_primary_hit = adaptive_reductions[0] + reduce.len();
-                    assert_eq!(
-                        x86_test_normalized_branch_opcode(&adaptive_code, adaptive_primary_hit),
-                        Some(0x85)
-                    );
-                    let adaptive_rewind =
-                        x86_test_branch_target(&adaptive_code, adaptive_primary_hit)
-                            .unwrap()
-                            .0;
+                    let adaptive_rewind = primary_rewind(&adaptive_code, adaptive_primary_hit);
                     assert_eq!(
                         &adaptive_code[adaptive_rewind..adaptive_rewind + rewind.len()],
                         rewind
