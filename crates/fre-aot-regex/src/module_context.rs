@@ -9963,7 +9963,7 @@ mod tests {
             super::super::aarch64_sve_addvl(2, 2, 1).unwrap(),
             super::super::aarch64_sve_whilelo_b(0, 2, 3).unwrap(),
             super::super::aarch64_sve_brkb_p0(2, 1).unwrap(),
-            super::super::aarch64_sve_cntp_p0_p2(12).unwrap(),
+            super::super::aarch64_sve_incp_b(2, 2).unwrap(),
         ] {
             assert!(
                 words.contains(&word),

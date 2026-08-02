@@ -9242,8 +9242,10 @@ fn aarch64_sve_ld1rqb(destination: u8, base: u8) -> Result<u32, ObjectError> {
     Ok(0xa400_2000 | aarch64_reg(base, 5)? | aarch64_reg(destination, 0)?)
 }
 
-fn aarch64_sve_dup_b_from_w(destination: u8, source: u8) -> Result<u32, ObjectError> {
-    Ok(0x0520_3800 | aarch64_reg(source, 5)? | aarch64_reg(destination, 0)?)
+fn aarch64_sve_dup_b_imm(destination: u8, immediate: u8) -> Result<u32, ObjectError> {
+    // DUP (immediate), also disassembled as MOV, encodes one signed imm8.
+    // For byte elements every imm8 bit pattern is therefore representable.
+    Ok(0x2538_c000 | (u32::from(immediate) << 5) | aarch64_reg(destination, 0)?)
 }
 
 fn aarch64_sve_cmpeq_b(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
@@ -9297,8 +9299,11 @@ fn aarch64_sve_brkb_p0(destination: u8, candidates: u8) -> Result<u32, ObjectErr
     Ok(0x2590_4000 | aarch64_reg(candidates, 5)? | aarch64_reg(destination, 0)?)
 }
 
-fn aarch64_sve_cntp_p0_p2(destination: u8) -> Result<u32, ObjectError> {
-    Ok(0x2520_8040 | aarch64_reg(destination, 0)?)
+fn aarch64_sve_incp_b(destination: u8, predicate: u8) -> Result<u32, ObjectError> {
+    if predicate > 15 {
+        return Err(ObjectError::InvalidModule("SVE INCP predicate"));
+    }
+    Ok(0x252c_8800 | aarch64_reg(predicate, 5)? | aarch64_reg(destination, 0)?)
 }
 
 fn aarch64_sve_whilelo_b(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
@@ -9765,8 +9770,7 @@ fn aarch64_emit_sve_filter_setup(
                 if filter.is_exact() {
                     let register =
                         aarch64_sve_filter_constant_register_from(first_constant, index)?;
-                    assembler.instruction(aarch64_movz_w(12, u16::from(range.start))?)?;
-                    assembler.instruction(aarch64_sve_dup_b_from_w(register, 12)?)?;
+                    assembler.instruction(aarch64_sve_dup_b_imm(register, range.start)?)?;
                 } else {
                     let low_index = index.checked_mul(2).ok_or(ObjectError::ArithmeticOverflow(
                         "SVE range-filter low constant",
@@ -9781,10 +9785,8 @@ fn aarch64_emit_sve_filter_setup(
                         aarch64_sve_filter_constant_register_from(first_constant, low_index)?;
                     let high =
                         aarch64_sve_filter_constant_register_from(first_constant, high_index)?;
-                    assembler.instruction(aarch64_movz_w(12, u16::from(range.start))?)?;
-                    assembler.instruction(aarch64_sve_dup_b_from_w(low, 12)?)?;
-                    assembler.instruction(aarch64_movz_w(12, u16::from(range.end))?)?;
-                    assembler.instruction(aarch64_sve_dup_b_from_w(high, 12)?)?;
+                    assembler.instruction(aarch64_sve_dup_b_imm(low, range.start)?)?;
+                    assembler.instruction(aarch64_sve_dup_b_imm(high, range.end)?)?;
                 }
             }
         }
@@ -10036,8 +10038,9 @@ fn aarch64_emit_sve_first_candidate(
     candidate: Aarch64Label,
 ) -> Result<(), ObjectError> {
     assembler.instruction(aarch64_sve_brkb_p0(2, candidates)?)?;
-    assembler.instruction(aarch64_sve_cntp_p0_p2(12)?)?;
-    assembler.instruction(aarch64_add_x_reg(2, 2, 12)?)?;
+    // BRKB clears every inactive P0 lane, so INCP's ungoverned count of P2
+    // exactly matches the former CNTP(P0, P2) followed by ADD.
+    assembler.instruction(aarch64_sve_incp_b(2, 2)?)?;
     assembler.branch(candidate)?;
     Ok(())
 }
@@ -12892,7 +12895,10 @@ mod tests {
         assert_eq!(aarch64_sve_ld1b_vl(1, 12, 1).unwrap(), 0xa401_a181);
         assert_eq!(aarch64_sve_ld1b_vl(7, 12, 3).unwrap(), 0xa403_a187);
         assert_eq!(aarch64_sve_ld1rqb(16, 12).unwrap(), 0xa400_2190);
-        assert_eq!(aarch64_sve_dup_b_from_w(16, 12).unwrap(), 0x0520_3990);
+        assert_eq!(aarch64_sve_dup_b_imm(16, 0x00).unwrap(), 0x2538_c010);
+        assert_eq!(aarch64_sve_dup_b_imm(17, 0x7f).unwrap(), 0x2538_cff1);
+        assert_eq!(aarch64_sve_dup_b_imm(18, 0x80).unwrap(), 0x2538_d012);
+        assert_eq!(aarch64_sve_dup_b_imm(19, 0xff).unwrap(), 0x2538_dff3);
         assert_eq!(aarch64_sve_cmpeq_b(1, 0, 16).unwrap(), 0x2410_a001);
         assert_eq!(aarch64_sve_cmphs_b(1, 0, 16).unwrap(), 0x2410_0001);
         assert_eq!(aarch64_sve_cmphs_b(3, 17, 0).unwrap(), 0x2400_0223);
@@ -12902,7 +12908,7 @@ mod tests {
         assert_eq!(aarch64_sve_ptest_p0(4).unwrap(), 0x2550_c080);
         assert_eq!(aarch64_sve_brkb_p0(2, 1).unwrap(), 0x2590_4022);
         assert_eq!(aarch64_sve_brkb_p0(3, 4).unwrap(), 0x2590_4083);
-        assert_eq!(aarch64_sve_cntp_p0_p2(12).unwrap(), 0x2520_804c);
+        assert_eq!(aarch64_sve_incp_b(2, 2).unwrap(), 0x252c_8842);
         assert_eq!(aarch64_sve_whilelo_b(0, 2, 3).unwrap(), 0x2523_1c40);
         assert_eq!(aarch64_sve_addvl(2, 2, 1).unwrap(), 0x0422_5022);
         assert_eq!(aarch64_sve_addvl(3, 4, 4).unwrap(), 0x0424_5083);
@@ -12910,10 +12916,93 @@ mod tests {
 
         assert!(aarch64_cmp_x_lsl(0, 0, 64).is_err());
         assert!(aarch64_sve_ld1b_vl(0, 0, 8).is_err());
+        assert!(aarch64_sve_dup_b_imm(32, 0).is_err());
         assert!(aarch64_sve_ptest_p0(16).is_err());
         assert!(aarch64_sve_brkb_p0(16, 0).is_err());
+        assert!(aarch64_sve_incp_b(32, 0).is_err());
+        assert!(aarch64_sve_incp_b(0, 16).is_err());
         assert!(aarch64_sve_whilelo_b(16, 0, 0).is_err());
         assert!(aarch64_sve_addvl(0, 0, 32).is_err());
+    }
+
+    #[test]
+    fn aarch64_sve_immediate_dup_setup_covers_every_byte_in_one_instruction() {
+        for immediate in u8::MIN..=u8::MAX {
+            for destination in 0_u8..=31 {
+                let word = aarch64_sve_dup_b_imm(destination, immediate).unwrap();
+                assert_eq!(word & 0x1f, u32::from(destination));
+                assert_eq!((word >> 5) & 0xff, u32::from(immediate));
+                assert_eq!(word & 0xffff_e000, 0x2538_c000);
+            }
+
+            let mut filter = EMPTY_NATIVE_START_FILTER;
+            filter.ranges[0] = NativeByteRange {
+                start: immediate,
+                end: immediate,
+            };
+            filter.range_count = 1;
+            filter.candidate_bytes = 1;
+            let mut assembler = Aarch64Assembler::new();
+            aarch64_emit_sve_filter_setup(
+                &mut assembler,
+                filter,
+                Aarch64SveFilterKind::Sve,
+                0,
+            )
+            .unwrap();
+            assert_eq!(
+                assembler.finish().unwrap(),
+                aarch64_sve_dup_b_imm(16, immediate)
+                    .unwrap()
+                    .to_le_bytes()
+            );
+        }
+
+        let mut range = EMPTY_NATIVE_START_FILTER;
+        range.ranges[0] = NativeByteRange {
+            start: 0x00,
+            end: 0xff,
+        };
+        range.range_count = 1;
+        range.candidate_bytes = 256;
+        let mut assembler = Aarch64Assembler::new();
+        aarch64_emit_sve_filter_setup(
+            &mut assembler,
+            range,
+            Aarch64SveFilterKind::Sve,
+            0,
+        )
+        .unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&aarch64_sve_dup_b_imm(16, 0x00).unwrap().to_le_bytes());
+        expected.extend_from_slice(&aarch64_sve_dup_b_imm(17, 0xff).unwrap().to_le_bytes());
+        assert_eq!(assembler.finish().unwrap(), expected);
+    }
+
+    #[test]
+    fn aarch64_sve_brkb_incp_model_matches_every_active_first_lane() {
+        for destination in 0_u8..=31 {
+            for predicate in 0_u8..=15 {
+                let word = aarch64_sve_incp_b(destination, predicate).unwrap();
+                assert_eq!(word & 0x1f, u32::from(destination));
+                assert_eq!((word >> 5) & 0x0f, u32::from(predicate));
+                assert_eq!(word & 0xffff_fc00, 0x252c_8800);
+            }
+        }
+
+        for vector_length in (16_usize..=256).step_by(16) {
+            for active_lanes in 1_usize..=vector_length {
+                for first_candidate in 0_usize..active_lanes {
+                    // BRKB P2.B, P0/Z, Pc.B leaves exactly the active P0
+                    // lanes preceding the first active candidate in P2.
+                    let p2_count = (0..vector_length)
+                        .filter(|&lane| lane < active_lanes && lane < first_candidate)
+                        .count();
+                    let candidate_base = 17_usize;
+                    assert_eq!(candidate_base + p2_count, candidate_base + first_candidate);
+                }
+            }
+        }
     }
 
     #[test]
@@ -15551,7 +15640,7 @@ mod tests {
             aarch64_sve_addvl(2, 2, 1).unwrap(),
             aarch64_sve_whilelo_b(0, 2, 3).unwrap(),
             aarch64_sve_brkb_p0(2, 1).unwrap(),
-            aarch64_sve_cntp_p0_p2(12).unwrap(),
+            aarch64_sve_incp_b(2, 2).unwrap(),
         ] {
             assert!(sve_words.contains(&word), "missing SVE word {word:#010x}");
         }
