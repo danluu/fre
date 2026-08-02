@@ -7473,6 +7473,18 @@ impl Aarch64Assembler {
         }
     }
 
+    fn fixup_inversion_mask(kind: Aarch64FixupKind, encoded: u32) -> Option<u32> {
+        match kind {
+            // AL and NV do not form an invertible predicate pair. All other
+            // AArch64 condition codes invert by toggling their low bit.
+            Aarch64FixupKind::Conditional19 if encoded & 0x0f <= 0x0d => Some(1),
+            Aarch64FixupKind::Branch26 | Aarch64FixupKind::Conditional19 => None,
+            // CBZ/CBNZ and TBZ/TBNZ select their complementary operation with
+            // opcode bit 24, independent of their register and bit fields.
+            Aarch64FixupKind::CompareBranch19 | Aarch64FixupKind::TestBit14 => Some(1 << 24),
+        }
+    }
+
     fn fixup_words(source: usize, target: usize) -> Result<i64, ObjectError> {
         let target = i64::try_from(target)
             .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 branch target"))?;
@@ -7507,6 +7519,76 @@ impl Aarch64Assembler {
         Ok((minimum..=maximum).contains(&words))
     }
 
+    fn remove_fallthrough_branches(
+        labels: &[Option<usize>],
+        fixups: &[Aarch64Fixup],
+        relocation_anchors: &[bool],
+        removed: &mut [bool],
+        remove_this_round: &mut [bool],
+    ) -> Result<(), ObjectError> {
+        let instruction_count = removed.len();
+        loop {
+            remove_this_round.fill(false);
+            let mut changed = false;
+            for fixup in fixups {
+                if fixup.kind != Aarch64FixupKind::Branch26 {
+                    continue;
+                }
+                let source = fixup.instruction / 4;
+                if removed.get(source).copied().unwrap_or(true)
+                    || relocation_anchors.get(source).copied().unwrap_or(true)
+                {
+                    continue;
+                }
+                let target = labels
+                    .get(fixup.label)
+                    .copied()
+                    .flatten()
+                    .ok_or(ObjectError::InvalidModule("unbound AArch64 branch label"))?;
+                let mut target_instruction = target / 4;
+                while target_instruction < instruction_count
+                    && removed.get(target_instruction).copied().unwrap_or(false)
+                {
+                    target_instruction = target_instruction.checked_add(1).ok_or(
+                        ObjectError::ArithmeticOverflow("AArch64 branch target compaction"),
+                    )?;
+                }
+                let mut fallthrough =
+                    source
+                        .checked_add(1)
+                        .ok_or(ObjectError::ArithmeticOverflow(
+                            "AArch64 branch fallthrough",
+                        ))?;
+                while fallthrough < instruction_count
+                    && removed.get(fallthrough).copied().unwrap_or(false)
+                {
+                    fallthrough =
+                        fallthrough
+                            .checked_add(1)
+                            .ok_or(ObjectError::ArithmeticOverflow(
+                                "AArch64 branch fallthrough compaction",
+                            ))?;
+                }
+                if target_instruction == fallthrough {
+                    let remove =
+                        remove_this_round
+                            .get_mut(source)
+                            .ok_or(ObjectError::InvalidModule(
+                                "AArch64 branch removal outside native code",
+                            ))?;
+                    *remove = true;
+                    changed = true;
+                }
+            }
+            if !changed {
+                return Ok(());
+            }
+            for (removed, &remove) in removed.iter_mut().zip(remove_this_round.iter()) {
+                *removed |= remove;
+            }
+        }
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "transactional validation, CFG rewriting, and relocation remapping form one audit unit"
@@ -7529,6 +7611,11 @@ impl Aarch64Assembler {
                 ObjectError::InvalidModule("AArch64 branch target map allocation failed")
             })?;
         unconditional_targets.resize(instruction_count, None);
+        let mut fixup_indices = Vec::new();
+        fixup_indices
+            .try_reserve_exact(instruction_count)
+            .map_err(|_| ObjectError::InvalidModule("AArch64 fixup map allocation failed"))?;
+        fixup_indices.resize(instruction_count, None);
 
         let mut relocation_anchors = Vec::new();
         relocation_anchors
@@ -7555,7 +7642,7 @@ impl Aarch64Assembler {
             }
         }
 
-        for fixup in &self.fixups {
+        for (fixup_index, fixup) in self.fixups.iter().enumerate() {
             let target = self
                 .labels
                 .get(fixup.label)
@@ -7581,14 +7668,21 @@ impl Aarch64Assembler {
                     "AArch64 fixup outside native code",
                 ));
             }
+            let instruction = fixup.instruction / 4;
+            let index_slot =
+                fixup_indices
+                    .get_mut(instruction)
+                    .ok_or(ObjectError::InvalidModule(
+                        "AArch64 branch fixup outside native code",
+                    ))?;
+            if index_slot.replace(fixup_index).is_some() {
+                return Err(ObjectError::InvalidModule("duplicate AArch64 branch fixup"));
+            }
             if fixup.kind == Aarch64FixupKind::Branch26 {
-                let instruction = fixup.instruction / 4;
                 let slot = unconditional_targets.get_mut(instruction).ok_or(
                     ObjectError::InvalidModule("AArch64 unconditional branch outside native code"),
                 )?;
-                if slot.replace(fixup.label).is_some() {
-                    return Err(ObjectError::InvalidModule("duplicate AArch64 branch fixup"));
-                }
+                *slot = Some(fixup.label);
             }
         }
         for (target, &is_relocated) in unconditional_targets.iter_mut().zip(&relocation_anchors) {
@@ -7626,6 +7720,10 @@ impl Aarch64Assembler {
         for thread_targets in [false, true] {
             if thread_targets {
                 for fixup in &mut fixups {
+                    let source = fixup.instruction / 4;
+                    if relocation_anchors.get(source).copied().unwrap_or(true) {
+                        continue;
+                    }
                     let threaded = self.threaded_label(fixup.label, &unconditional_targets);
                     let target = self
                         .labels
@@ -7641,67 +7739,27 @@ impl Aarch64Assembler {
                 }
             }
 
-            loop {
-                remove_this_round.fill(false);
-                let mut changed = false;
-                for fixup in &fixups {
-                    if fixup.kind != Aarch64FixupKind::Branch26 {
-                        continue;
-                    }
-                    let source = fixup.instruction / 4;
-                    if removed.get(source).copied().unwrap_or(true)
-                        || relocation_anchors.get(source).copied().unwrap_or(true)
-                    {
-                        continue;
-                    }
-                    let target = self
-                        .labels
-                        .get(fixup.label)
-                        .copied()
-                        .flatten()
-                        .ok_or(ObjectError::InvalidModule("unbound AArch64 branch label"))?;
-                    let mut target_instruction = target / 4;
-                    while target_instruction < instruction_count
-                        && removed.get(target_instruction).copied().unwrap_or(false)
-                    {
-                        target_instruction = target_instruction.checked_add(1).ok_or(
-                            ObjectError::ArithmeticOverflow("AArch64 branch target compaction"),
-                        )?;
-                    }
-                    let mut fallthrough =
-                        source
-                            .checked_add(1)
-                            .ok_or(ObjectError::ArithmeticOverflow(
-                                "AArch64 branch fallthrough",
-                            ))?;
-                    while fallthrough < instruction_count
-                        && removed.get(fallthrough).copied().unwrap_or(false)
-                    {
-                        fallthrough = fallthrough.checked_add(1).ok_or(
-                            ObjectError::ArithmeticOverflow(
-                                "AArch64 branch fallthrough compaction",
-                            ),
-                        )?;
-                    }
-                    if target_instruction == fallthrough {
-                        let remove = remove_this_round.get_mut(source).ok_or(
-                            ObjectError::InvalidModule(
-                                "AArch64 branch removal outside native code",
-                            ),
-                        )?;
-                        *remove = true;
-                        changed = true;
-                    }
-                }
-                if !changed {
-                    break;
-                }
-                for (removed, &remove) in removed.iter_mut().zip(&remove_this_round) {
-                    *removed |= remove;
-                }
-            }
+            Self::remove_fallthrough_branches(
+                &self.labels,
+                &fixups,
+                &relocation_anchors,
+                &mut removed,
+                &mut remove_this_round,
+            )?;
         }
 
+        let mut inversion_masks = Vec::new();
+        inversion_masks
+            .try_reserve_exact(instruction_count)
+            .map_err(|_| ObjectError::InvalidModule("AArch64 inversion map allocation failed"))?;
+        inversion_masks.resize(instruction_count, 0_u32);
+        let mut targeted_instructions = Vec::new();
+        targeted_instructions
+            .try_reserve_exact(instruction_count)
+            .map_err(|_| {
+                ObjectError::InvalidModule("AArch64 branch entry map allocation failed")
+            })?;
+        targeted_instructions.resize(instruction_count, false);
         let mut removed_prefix = Vec::new();
         let prefix_entries =
             instruction_count
@@ -7712,17 +7770,228 @@ impl Aarch64Assembler {
         removed_prefix
             .try_reserve_exact(prefix_entries)
             .map_err(|_| ObjectError::InvalidModule("AArch64 branch prefix allocation failed"))?;
-        removed_prefix.push(0_usize);
-        for &is_removed in &removed {
-            let previous = removed_prefix
-                .last()
-                .copied()
-                .ok_or(ObjectError::InvalidModule(
-                    "AArch64 branch prefix is unexpectedly empty",
-                ))?;
-            removed_prefix.push(previous.checked_add(usize::from(is_removed)).ok_or(
-                ObjectError::ArithmeticOverflow("AArch64 removed branch count"),
-            )?);
+
+        // Canonicalize every single-entry conditional diamond. Work one
+        // diamond at a time so each decision sees exact current entry counts
+        // and exact post-deletion distances. Later deletions can only shorten
+        // a surviving branch, so a range-safe decision remains range-safe.
+        'diamonds: loop {
+            Self::remove_fallthrough_branches(
+                &self.labels,
+                &fixups,
+                &relocation_anchors,
+                &mut removed,
+                &mut remove_this_round,
+            )?;
+
+            removed_prefix.clear();
+            removed_prefix.push(0_usize);
+            for &is_removed in &removed {
+                let previous = removed_prefix
+                    .last()
+                    .copied()
+                    .ok_or(ObjectError::InvalidModule(
+                        "AArch64 branch prefix is unexpectedly empty",
+                    ))?;
+                removed_prefix.push(previous.checked_add(usize::from(is_removed)).ok_or(
+                    ObjectError::ArithmeticOverflow("AArch64 removed branch count"),
+                )?);
+            }
+
+            targeted_instructions.fill(false);
+            for fixup in &fixups {
+                let source = fixup.instruction / 4;
+                if removed.get(source).copied().unwrap_or(true)
+                    || relocation_anchors.get(source).copied().unwrap_or(true)
+                {
+                    continue;
+                }
+                let target = self
+                    .labels
+                    .get(fixup.label)
+                    .copied()
+                    .flatten()
+                    .ok_or(ObjectError::InvalidModule("unbound AArch64 branch label"))?;
+                let mut target_instruction = target / 4;
+                while target_instruction < instruction_count
+                    && removed.get(target_instruction).copied().unwrap_or(false)
+                {
+                    target_instruction = target_instruction.checked_add(1).ok_or(
+                        ObjectError::ArithmeticOverflow("AArch64 branch entry compaction"),
+                    )?;
+                }
+                if let Some(targeted) = targeted_instructions.get_mut(target_instruction) {
+                    *targeted = true;
+                }
+            }
+
+            for conditional_index in 0..fixups.len() {
+                let conditional = fixups[conditional_index];
+                if conditional.kind == Aarch64FixupKind::Branch26 {
+                    continue;
+                }
+                let source = conditional.instruction / 4;
+                if removed.get(source).copied().unwrap_or(true)
+                    || relocation_anchors.get(source).copied().unwrap_or(true)
+                    || inversion_masks.get(source).copied().unwrap_or(1) != 0
+                {
+                    continue;
+                }
+                let encoded_end = conditional.instruction.checked_add(4).ok_or(
+                    ObjectError::ArithmeticOverflow("AArch64 conditional branch extent"),
+                )?;
+                let encoded = self
+                    .code
+                    .get(conditional.instruction..encoded_end)
+                    .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+                    .map(u32::from_le_bytes)
+                    .ok_or(ObjectError::InvalidModule(
+                        "AArch64 conditional branch outside native code",
+                    ))?;
+                let Some(inversion_mask) = Self::fixup_inversion_mask(conditional.kind, encoded)
+                else {
+                    continue;
+                };
+
+                let mut false_branch_instruction =
+                    source
+                        .checked_add(1)
+                        .ok_or(ObjectError::ArithmeticOverflow(
+                            "AArch64 diamond fallthrough",
+                        ))?;
+                while false_branch_instruction < instruction_count
+                    && removed
+                        .get(false_branch_instruction)
+                        .copied()
+                        .unwrap_or(false)
+                {
+                    false_branch_instruction = false_branch_instruction.checked_add(1).ok_or(
+                        ObjectError::ArithmeticOverflow("AArch64 diamond compaction"),
+                    )?;
+                }
+                let Some(false_fixup_index) = fixup_indices
+                    .get(false_branch_instruction)
+                    .copied()
+                    .flatten()
+                else {
+                    continue;
+                };
+                let false_branch = fixups[false_fixup_index];
+                if false_branch.kind != Aarch64FixupKind::Branch26
+                    || relocation_anchors
+                        .get(false_branch_instruction)
+                        .copied()
+                        .unwrap_or(true)
+                    || targeted_instructions
+                        .get(false_branch_instruction)
+                        .copied()
+                        .unwrap_or(true)
+                {
+                    continue;
+                }
+
+                let mut true_instruction = self
+                    .labels
+                    .get(conditional.label)
+                    .copied()
+                    .flatten()
+                    .ok_or(ObjectError::InvalidModule("unbound AArch64 branch label"))?
+                    / 4;
+                while true_instruction < instruction_count
+                    && removed.get(true_instruction).copied().unwrap_or(false)
+                {
+                    true_instruction =
+                        true_instruction
+                            .checked_add(1)
+                            .ok_or(ObjectError::ArithmeticOverflow(
+                                "AArch64 diamond true compaction",
+                            ))?;
+                }
+                let mut true_fallthrough = false_branch_instruction.checked_add(1).ok_or(
+                    ObjectError::ArithmeticOverflow("AArch64 diamond true fallthrough"),
+                )?;
+                while true_fallthrough < instruction_count
+                    && removed.get(true_fallthrough).copied().unwrap_or(false)
+                {
+                    true_fallthrough =
+                        true_fallthrough
+                            .checked_add(1)
+                            .ok_or(ObjectError::ArithmeticOverflow(
+                                "AArch64 diamond true compaction",
+                            ))?;
+                }
+                if true_instruction != true_fallthrough {
+                    continue;
+                }
+
+                let false_target_instruction = self
+                    .labels
+                    .get(false_branch.label)
+                    .copied()
+                    .flatten()
+                    .ok_or(ObjectError::InvalidModule("unbound AArch64 branch label"))?
+                    / 4;
+                let source_removed =
+                    removed_prefix
+                        .get(source)
+                        .copied()
+                        .ok_or(ObjectError::InvalidModule(
+                            "AArch64 diamond source outside native code",
+                        ))?;
+                let compacted_source =
+                    source
+                        .checked_sub(source_removed)
+                        .ok_or(ObjectError::ArithmeticOverflow(
+                            "AArch64 compacted diamond source",
+                        ))?;
+                let false_target_removed = removed_prefix
+                    .get(false_target_instruction)
+                    .copied()
+                    .and_then(|count| {
+                        count.checked_add(usize::from(
+                            false_branch_instruction < false_target_instruction,
+                        ))
+                    })
+                    .ok_or(ObjectError::ArithmeticOverflow(
+                        "AArch64 compacted diamond target count",
+                    ))?;
+                let compacted_false_target = false_target_instruction
+                    .checked_sub(false_target_removed)
+                    .ok_or(ObjectError::ArithmeticOverflow(
+                        "AArch64 compacted diamond target",
+                    ))?;
+                let source_offset =
+                    compacted_source
+                        .checked_mul(4)
+                        .ok_or(ObjectError::ArithmeticOverflow(
+                            "AArch64 compacted diamond source offset",
+                        ))?;
+                let target_offset = compacted_false_target.checked_mul(4).ok_or(
+                    ObjectError::ArithmeticOverflow("AArch64 compacted diamond target offset"),
+                )?;
+                let words = Self::fixup_words(source_offset, target_offset)?;
+                let (bits, _, _) = Self::fixup_encoding(conditional.kind);
+                if !Self::fixup_words_fit(words, bits)? {
+                    continue;
+                }
+
+                fixups[conditional_index].label = false_branch.label;
+                let mask = inversion_masks
+                    .get_mut(source)
+                    .ok_or(ObjectError::InvalidModule(
+                        "AArch64 inversion outside native code",
+                    ))?;
+                *mask = inversion_mask;
+                let remove =
+                    removed
+                        .get_mut(false_branch_instruction)
+                        .ok_or(ObjectError::InvalidModule(
+                            "AArch64 diamond branch outside native code",
+                        ))?;
+                *remove = true;
+                continue 'diamonds;
+            }
+            break;
         }
 
         let remap = |offset: usize| -> Result<usize, ObjectError> {
@@ -7765,7 +8034,21 @@ impl Aarch64Assembler {
             .map_err(|_| ObjectError::InvalidModule("AArch64 code compaction allocation failed"))?;
         for (instruction, bytes) in self.code.chunks_exact(4).enumerate() {
             if !removed.get(instruction).copied().unwrap_or(true) {
-                code.extend_from_slice(bytes);
+                let inversion_mask = inversion_masks.get(instruction).copied().unwrap_or(0);
+                if inversion_mask == 0 {
+                    code.extend_from_slice(bytes);
+                } else {
+                    let encoded =
+                        <[u8; 4]>::try_from(bytes)
+                            .map(u32::from_le_bytes)
+                            .map_err(|_| {
+                                ObjectError::InvalidModule(
+                                    "AArch64 inverted branch is not an instruction",
+                                )
+                            })?
+                            ^ inversion_mask;
+                    code.extend_from_slice(&encoded.to_le_bytes());
+                }
             }
         }
 
@@ -10947,6 +11230,289 @@ mod tests {
     }
 
     #[test]
+    fn aarch64_conditional_diamonds_invert_every_branch_family() {
+        type EmitConditional = fn(&mut Aarch64Assembler, Aarch64Label) -> Result<(), ObjectError>;
+
+        fn branch_eq(
+            assembler: &mut Aarch64Assembler,
+            target: Aarch64Label,
+        ) -> Result<(), ObjectError> {
+            assembler.branch_cond(AARCH64_EQ, target)
+        }
+
+        fn branch_zero(
+            assembler: &mut Aarch64Assembler,
+            target: Aarch64Label,
+        ) -> Result<(), ObjectError> {
+            assembler.branch_zero_w(6, target)
+        }
+
+        fn branch_nonzero(
+            assembler: &mut Aarch64Assembler,
+            target: Aarch64Label,
+        ) -> Result<(), ObjectError> {
+            assembler.branch_nonzero_w(7, target)
+        }
+
+        fn branch_bit_clear(
+            assembler: &mut Aarch64Assembler,
+            target: Aarch64Label,
+        ) -> Result<(), ObjectError> {
+            assembler.branch_bit_clear_w(8, 0, target)
+        }
+
+        fn branch_bit_set(
+            assembler: &mut Aarch64Assembler,
+            target: Aarch64Label,
+        ) -> Result<(), ObjectError> {
+            assembler.branch_bit_set_w(9, 0, target)
+        }
+
+        let cases: [(EmitConditional, u32); 5] = [
+            (branch_eq, 0x5400_0041),        // b.ne false
+            (branch_zero, 0x3500_0046),      // cbnz w6, false
+            (branch_nonzero, 0x3400_0047),   // cbz w7, false
+            (branch_bit_clear, 0x3700_0048), // tbnz w8, #0, false
+            (branch_bit_set, 0x3600_0049),   // tbz w9, #0, false
+        ];
+        for (emit_conditional, expected) in cases {
+            let mut assembler = Aarch64Assembler::new();
+            let true_target = assembler.label().unwrap();
+            let false_target = assembler.label().unwrap();
+            emit_conditional(&mut assembler, true_target).unwrap();
+            assembler.branch(false_target).unwrap();
+            assembler.bind(true_target).unwrap();
+            assembler.instruction(0xd503_201f).unwrap(); // nop
+            assembler.bind(false_target).unwrap();
+            assembler.instruction(0xd65f_03c0).unwrap(); // ret
+
+            let words = assembler
+                .finish()
+                .unwrap()
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            assert_eq!(words, [expected, 0xd503_201f, 0xd65f_03c0]);
+        }
+
+        for condition in 0_u8..=0x0d {
+            let mut assembler = Aarch64Assembler::new();
+            let true_target = assembler.label().unwrap();
+            let false_target = assembler.label().unwrap();
+            assembler.branch_cond(condition, true_target).unwrap();
+            assembler.branch(false_target).unwrap();
+            assembler.bind(true_target).unwrap();
+            assembler.instruction(0xd503_201f).unwrap(); // nop
+            assembler.bind(false_target).unwrap();
+            assembler.instruction(0xd65f_03c0).unwrap(); // ret
+
+            let words = assembler
+                .finish()
+                .unwrap()
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            assert_eq!(words[0], 0x5400_0040 | u32::from(condition ^ 1));
+            assert_eq!(words.len(), 3);
+        }
+    }
+
+    #[test]
+    fn aarch64_al_and_nv_diamonds_remain_unmodified() {
+        for (condition, expected) in [(0x0e, 0x5400_004e), (0x0f, 0x5400_004f)] {
+            let mut assembler = Aarch64Assembler::new();
+            let true_target = assembler.label().unwrap();
+            let false_target = assembler.label().unwrap();
+            assembler.branch_cond(condition, true_target).unwrap();
+            assembler.branch(false_target).unwrap();
+            assembler.bind(true_target).unwrap();
+            assembler.instruction(0xd503_201f).unwrap(); // nop
+            assembler.bind(false_target).unwrap();
+            assembler.instruction(0xd65f_03c0).unwrap(); // ret
+
+            let words = assembler
+                .finish()
+                .unwrap()
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            assert_eq!(words, [expected, 0x1400_0002, 0xd503_201f, 0xd65f_03c0]);
+        }
+    }
+
+    #[test]
+    fn aarch64_test_bit_diamond_uses_exact_final_positive_range() {
+        let mut fits_after_deletion = Aarch64Assembler::new();
+        let true_target = fits_after_deletion.label().unwrap();
+        let false_target = fits_after_deletion.label().unwrap();
+        fits_after_deletion
+            .branch_bit_clear_w(0, 0, true_target)
+            .unwrap();
+        fits_after_deletion.branch(false_target).unwrap();
+        fits_after_deletion.bind(true_target).unwrap();
+        for _ in 0..8_190 {
+            fits_after_deletion.instruction(0xd503_201f).unwrap(); // nop
+        }
+        fits_after_deletion.bind(false_target).unwrap();
+        fits_after_deletion.instruction(0xd65f_03c0).unwrap(); // ret
+        let words = fits_after_deletion
+            .finish()
+            .unwrap()
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(words.len(), 8_192);
+        assert_eq!(words[0], 0x3703_ffe0); // tbnz false at +8191 words
+
+        let mut remains_out_of_range = Aarch64Assembler::new();
+        let true_target = remains_out_of_range.label().unwrap();
+        let false_target = remains_out_of_range.label().unwrap();
+        remains_out_of_range
+            .branch_bit_clear_w(0, 0, true_target)
+            .unwrap();
+        remains_out_of_range.branch(false_target).unwrap();
+        remains_out_of_range.bind(true_target).unwrap();
+        for _ in 0..8_191 {
+            remains_out_of_range.instruction(0xd503_201f).unwrap(); // nop
+        }
+        remains_out_of_range.bind(false_target).unwrap();
+        remains_out_of_range.instruction(0xd65f_03c0).unwrap(); // ret
+        let words = remains_out_of_range
+            .finish()
+            .unwrap()
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(words.len(), 8_194);
+        assert_eq!(words[0], 0x3600_0040); // tbz true remains
+        assert_eq!(words[1], 0x1400_2000); // b false remains
+    }
+
+    #[test]
+    fn aarch64_test_bit_diamond_accepts_exact_negative_range() {
+        let mut assembler = Aarch64Assembler::new();
+        let false_target = assembler.label().unwrap();
+        assembler.bind(false_target).unwrap();
+        assembler.instruction(0xd503_201f).unwrap(); // nop
+        for _ in 0..8_191 {
+            assembler.instruction(0xd503_201f).unwrap(); // nop
+        }
+        let true_target = assembler.label().unwrap();
+        assembler.branch_bit_clear_w(0, 0, true_target).unwrap();
+        assembler.branch(false_target).unwrap();
+        assembler.bind(true_target).unwrap();
+        assembler.instruction(0xd65f_03c0).unwrap(); // ret
+
+        let words = assembler
+            .finish()
+            .unwrap()
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(words.len(), 8_194);
+        assert_eq!(words[8_192], 0x3704_0000); // tbnz false at -8192 words
+    }
+
+    #[test]
+    fn aarch64_diamond_keeps_unconditional_branch_with_narrow_inbound_edge() {
+        let mut assembler = Aarch64Assembler::new();
+        let false_branch = assembler.label().unwrap();
+        let true_target = assembler.label().unwrap();
+        let false_target = assembler.label().unwrap();
+        assembler.branch_bit_clear_w(0, 0, false_branch).unwrap();
+        assembler.instruction(0xd503_201f).unwrap(); // nop
+        assembler.branch_cond(AARCH64_EQ, true_target).unwrap();
+        assembler.bind(false_branch).unwrap();
+        assembler.branch(false_target).unwrap();
+        assembler.bind(true_target).unwrap();
+        for _ in 0..8_190 {
+            assembler.instruction(0xd503_201f).unwrap(); // nop
+        }
+        assembler.bind(false_target).unwrap();
+        assembler.instruction(0xd65f_03c0).unwrap(); // ret
+
+        let words = assembler
+            .finish()
+            .unwrap()
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(words.len(), 8_195);
+        assert_eq!(words[0], 0x3600_0060); // narrow inbound edge remains at false branch
+        assert_eq!(words[2], 0x5400_0040); // diamond is not inverted
+        assert_eq!(words[3], 0x1400_1fff); // shared false branch is retained
+    }
+
+    #[test]
+    fn aarch64_diamond_inversion_remaps_and_respects_relocations() {
+        fn diamond_with_relocations(
+            anchor_conditional: bool,
+            anchor_unconditional: bool,
+        ) -> (Vec<u32>, Vec<usize>) {
+            let mut assembler = Aarch64Assembler::new();
+            let true_target = assembler.label().unwrap();
+            let false_target = assembler.label().unwrap();
+            let conditional = assembler.code.len();
+            assembler.branch_cond(AARCH64_EQ, true_target).unwrap();
+            let unconditional = assembler.code.len();
+            assembler.branch(false_target).unwrap();
+            assembler.bind(true_target).unwrap();
+            assembler.instruction(0xd503_201f).unwrap(); // nop
+            assembler.bind(false_target).unwrap();
+            let adrp = assembler.instruction(0x9000_0005).unwrap();
+            assembler.instruction(0xd65f_03c0).unwrap(); // ret
+
+            let mut relocations = vec![adrp];
+            if anchor_conditional {
+                relocations.push(conditional);
+            }
+            if anchor_unconditional {
+                relocations.push(unconditional);
+            }
+            let words = assembler
+                .finish_with_offsets(&mut relocations)
+                .unwrap()
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            (words, relocations)
+        }
+
+        let (optimized, relocations) = diamond_with_relocations(false, false);
+        assert_eq!(
+            optimized,
+            [0x5400_0041, 0xd503_201f, 0x9000_0005, 0xd65f_03c0]
+        );
+        assert_eq!(relocations, [8]);
+
+        let (conditional_anchor, relocations) = diamond_with_relocations(true, false);
+        assert_eq!(
+            conditional_anchor,
+            [
+                0x5400_0040,
+                0x1400_0002,
+                0xd503_201f,
+                0x9000_0005,
+                0xd65f_03c0,
+            ]
+        );
+        assert_eq!(relocations, [12, 0]);
+
+        let (unconditional_anchor, relocations) = diamond_with_relocations(false, true);
+        assert_eq!(
+            unconditional_anchor,
+            [
+                0x5400_0040,
+                0x1400_0002,
+                0xd503_201f,
+                0x9000_0005,
+                0xd65f_03c0,
+            ]
+        );
+        assert_eq!(relocations, [12, 4]);
+    }
+
+    #[test]
     fn aarch64_branch_targets_thread_through_unconditional_trampolines() {
         let mut assembler = Aarch64Assembler::new();
         let trampoline = assembler.label().unwrap();
@@ -11005,7 +11571,7 @@ mod tests {
     }
 
     #[test]
-    fn aarch64_threading_preserves_in_range_trampoline_for_narrow_branch() {
+    fn aarch64_diamond_inversion_avoids_out_of_range_narrow_threading() {
         let mut assembler = Aarch64Assembler::new();
         let trampoline = assembler.label().unwrap();
         let after_trampoline = assembler.label().unwrap();
@@ -11027,8 +11593,8 @@ mod tests {
             .chunks_exact(4)
             .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
             .collect::<Vec<_>>();
-        assert_eq!(words[0], 0x3600_0040); // tbz trampoline remains in TestBit14 range
-        assert_eq!(words[1], 0x1400_0002); // skip the retained trampoline
+        assert_eq!(words[0], 0x3700_0040); // tbnz takes the nearby false edge
+        assert_eq!(words[1], 0x1400_2001); // true fallthrough retains the far trampoline
     }
 
     #[test]
@@ -11109,12 +11675,11 @@ mod tests {
             .chunks_exact(4)
             .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
             .collect::<Vec<_>>();
-        assert_eq!(relocation_offsets, [8]);
+        assert_eq!(relocation_offsets, [4]);
         assert_eq!(
             words,
             [
-                0x5400_0040, // b.eq still reaches the link-owned trampoline
-                0x1400_0002,
+                0x5400_0041, // b.ne skips the link-owned true trampoline
                 0x1400_0002, // relocated branch is retained
                 0xd503_201f,
                 0xd65f_03c0,
