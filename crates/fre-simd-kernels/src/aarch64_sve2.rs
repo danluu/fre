@@ -10,11 +10,13 @@ use super::{
     ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, AsciiMasks32, AsciiRunResult, AsciiRunTables,
     AsciiWordSpaceMasks16, AsciiWordSpaceMasks32, AsciiWordSpaceTables, aarch64, scalar,
 };
+use crate::byte_set::ByteSetTables;
+use crate::{BYTE_SET_WIDE_BLOCK_BYTES, ByteSetMask32};
 
 // This is a leaf AAPCS64 function. Its two pointer arguments arrive in x0/x1
 // and its packed u64 result returns in x0: member lanes occupy bits 0..31 and
 // ASCII lanes occupy bits 32..63. It clobbers only caller-saved x8..x15,
-// z0..z6 and p0..p3.
+// z0..z7 and p0..p3.
 //
 // The input is processed in `cntb`-sized chunks under `whilelo`, so both the
 // architectural minimum VL=16 and every larger legal VL consume exactly 32
@@ -30,6 +32,275 @@ use super::{
 )]
 mod reviewed_assembly {
     use core::arch::global_asm;
+
+    global_asm!(
+        r#"
+    .pushsection .text.fre_byte_set1_mask16_sve2_asm, "ax", %progbits
+    .arch armv8-a+sve2
+    .p2align 2
+    .hidden fre_byte_set1_mask16_sve2_asm
+    .global fre_byte_set1_mask16_sve2_asm
+    .type fre_byte_set1_mask16_sve2_asm, %function
+fre_byte_set1_mask16_sve2_asm:
+    .cfi_startproc
+    sub sp, sp, #32
+    .cfi_def_cfa_offset 32
+    ptrue p0.b, vl16
+    dup z0.b, w0
+    ld1b z1.b, p0/z, [x1]
+    cmpeq p1.b, p0/z, z1.b, z0.b
+    str p1, [sp]
+    ldrh w0, [sp]
+    add sp, sp, #32
+    .cfi_def_cfa_offset 0
+    ret
+    .cfi_endproc
+    .size fre_byte_set1_mask16_sve2_asm, .-fre_byte_set1_mask16_sve2_asm
+    .popsection
+
+    .pushsection .text.fre_byte_set2_mask16_sve2_asm, "ax", %progbits
+    .arch armv8-a+sve2
+    .p2align 2
+    .hidden fre_byte_set2_mask16_sve2_asm
+    .global fre_byte_set2_mask16_sve2_asm
+    .type fre_byte_set2_mask16_sve2_asm, %function
+fre_byte_set2_mask16_sve2_asm:
+    .cfi_startproc
+    sub sp, sp, #32
+    .cfi_def_cfa_offset 32
+    ptrue p0.b, vl16
+    dup z0.h, w0
+    ld1b z1.b, p0/z, [x1]
+    match p1.b, p0/z, z1.b, z0.b
+    str p1, [sp]
+    ldrh w0, [sp]
+    add sp, sp, #32
+    .cfi_def_cfa_offset 0
+    ret
+    .cfi_endproc
+    .size fre_byte_set2_mask16_sve2_asm, .-fre_byte_set2_mask16_sve2_asm
+    .popsection
+
+    // One fixed-width full-byte four-value classifier. DUP repeats the four
+    // construction-time bytes in every 32-bit lane, so each architectural
+    // 128-bit MATCH segment contains the same complete set. Only the first
+    // sixteen source lanes are active. A predicate store serializes their
+    // membership bits in increasing lane order.
+    .pushsection .text.fre_byte_set4_mask16_sve2_asm, "ax", %progbits
+    .arch armv8-a+sve2
+    .p2align 2
+    .hidden fre_byte_set4_mask16_sve2_asm
+    .global fre_byte_set4_mask16_sve2_asm
+    .type fre_byte_set4_mask16_sve2_asm, %function
+fre_byte_set4_mask16_sve2_asm:
+    .cfi_startproc
+    sub sp, sp, #32
+    .cfi_def_cfa_offset 32
+    ptrue p0.b, vl16
+    dup z0.s, w0
+    ld1b z1.b, p0/z, [x1]
+    match p1.b, p0/z, z1.b, z0.b
+    str p1, [sp]
+    ldrh w0, [sp]
+    add sp, sp, #32
+    .cfi_def_cfa_offset 0
+    ret
+    .cfi_endproc
+    .size fre_byte_set4_mask16_sve2_asm, .-fre_byte_set4_mask16_sve2_asm
+    .popsection
+"#
+    );
+
+    global_asm!(
+        r#"
+    .pushsection .text.fre_byte_set1_mask32_sve2_asm, "ax", %progbits
+    .arch armv8-a+sve2
+    .p2align 2
+    .hidden fre_byte_set1_mask32_sve2_asm
+    .global fre_byte_set1_mask32_sve2_asm
+    .type fre_byte_set1_mask32_sve2_asm, %function
+fre_byte_set1_mask32_sve2_asm:
+    .cfi_startproc
+    sub sp, sp, #32
+    .cfi_def_cfa_offset 32
+    dup z0.b, w0
+    mov x8, #0
+    mov x9, #32
+    mov x12, #0
+    cntb x11
+1:
+    whilelo p0.b, x8, x9
+    ld1b z1.b, p0/z, [x1, x8]
+    cmpeq p1.b, p0/z, z1.b, z0.b
+    str p1, [sp]
+    cmp x11, #32
+    b.lo 2f
+    ldr w14, [sp]
+    b 3f
+2:
+    ldrh w14, [sp]
+3:
+    lsl x14, x14, x8
+    orr x12, x12, x14
+    incb x8
+    cmp x8, #32
+    b.lo 1b
+    mov w0, w12
+    add sp, sp, #32
+    .cfi_def_cfa_offset 0
+    ret
+    .cfi_endproc
+    .size fre_byte_set1_mask32_sve2_asm, .-fre_byte_set1_mask32_sve2_asm
+    .popsection
+
+    .pushsection .text.fre_byte_set2_mask32_sve2_asm, "ax", %progbits
+    .arch armv8-a+sve2
+    .p2align 2
+    .hidden fre_byte_set2_mask32_sve2_asm
+    .global fre_byte_set2_mask32_sve2_asm
+    .type fre_byte_set2_mask32_sve2_asm, %function
+fre_byte_set2_mask32_sve2_asm:
+    .cfi_startproc
+    sub sp, sp, #32
+    .cfi_def_cfa_offset 32
+    dup z0.h, w0
+    mov x8, #0
+    mov x9, #32
+    mov x12, #0
+    cntb x11
+1:
+    whilelo p0.b, x8, x9
+    ld1b z1.b, p0/z, [x1, x8]
+    match p1.b, p0/z, z1.b, z0.b
+    str p1, [sp]
+    cmp x11, #32
+    b.lo 2f
+    ldr w14, [sp]
+    b 3f
+2:
+    ldrh w14, [sp]
+3:
+    lsl x14, x14, x8
+    orr x12, x12, x14
+    incb x8
+    cmp x8, #32
+    b.lo 1b
+    mov w0, w12
+    add sp, sp, #32
+    .cfi_def_cfa_offset 0
+    ret
+    .cfi_endproc
+    .size fre_byte_set2_mask32_sve2_asm, .-fre_byte_set2_mask32_sve2_asm
+    .popsection
+
+    // Wide exact four-value classification for authenticated static profiles.
+    // The loop handles both the architectural minimum VL=16 and every larger
+    // legal VL while consuming exactly 32 source lanes.
+    .pushsection .text.fre_byte_set4_mask32_sve2_asm, "ax", %progbits
+    .arch armv8-a+sve2
+    .p2align 2
+    .hidden fre_byte_set4_mask32_sve2_asm
+    .global fre_byte_set4_mask32_sve2_asm
+    .type fre_byte_set4_mask32_sve2_asm, %function
+fre_byte_set4_mask32_sve2_asm:
+    .cfi_startproc
+    sub sp, sp, #32
+    .cfi_def_cfa_offset 32
+    dup z0.s, w0
+    mov x8, #0
+    mov x9, #32
+    mov x12, #0
+    cntb x11
+1:
+    whilelo p0.b, x8, x9
+    ld1b z1.b, p0/z, [x1, x8]
+    match p1.b, p0/z, z1.b, z0.b
+    str p1, [sp]
+    cmp x11, #32
+    b.lo 2f
+    ldr w14, [sp]
+    b 3f
+2:
+    ldrh w14, [sp]
+3:
+    lsl x14, x14, x8
+    orr x12, x12, x14
+    incb x8
+    cmp x8, #32
+    b.lo 1b
+    mov w0, w12
+    add sp, sp, #32
+    .cfi_def_cfa_offset 0
+    ret
+    .cfi_endproc
+    .size fre_byte_set4_mask32_sve2_asm, .-fre_byte_set4_mask32_sve2_asm
+    .popsection
+
+    // Wide arbitrary full-byte-set classification. The two nibble tables
+    // together represent all 256 byte values. SVE2 MATCH selects the lower or
+    // upper high-nibble table without any input-dependent dispatch.
+    .pushsection .text.fre_byte_set_mask32_sve2_asm, "ax", %progbits
+    .arch armv8-a+sve2
+    .p2align 2
+    .hidden fre_byte_set_mask32_sve2_asm
+    .global fre_byte_set_mask32_sve2_asm
+    .type fre_byte_set_mask32_sve2_asm, %function
+fre_byte_set_mask32_sve2_asm:
+    .cfi_startproc
+    sub sp, sp, #32
+    .cfi_def_cfa_offset 32
+    mov x8, #0
+    mov x9, #32
+    mov x10, #16
+    mov x12, #0
+    whilelo p3.b, xzr, x10
+    ld1b z0.b, p3/z, [x0]
+    ld1b z1.b, p3/z, [x1]
+    cntb x11
+1:
+    whilelo p0.b, x8, x9
+    ld1b z2.b, p0/z, [x2, x8]
+    mov z3.d, z2.d
+    and z3.b, z3.b, #0x0f
+    mov z4.d, z2.d
+    lsr z4.b, z4.b, #4
+    tbl z5.b, {{z0.b}}, z3.b
+    tbl z6.b, {{z1.b}}, z3.b
+
+    // Every architectural 128-bit segment of z7 contains 0..7 twice, so
+    // MATCH identifies precisely the lower high-nibble half.
+    index z7.b, #0, #1
+    and z7.b, z7.b, #7
+    match p2.b, p0/z, z4.b, z7.b
+    sel z5.b, p2, z5.b, z6.b
+    and z4.b, z4.b, #7
+    mov z7.b, #1
+    lsl z7.b, p0/m, z7.b, z4.b
+    and z5.d, z5.d, z7.d
+    cmpne p1.b, p0/z, z5.b, #0
+
+    str p1, [sp]
+    cmp x11, #32
+    b.lo 2f
+    ldr w14, [sp]
+    b 3f
+2:
+    ldrh w14, [sp]
+3:
+    lsl x14, x14, x8
+    orr x12, x12, x14
+    incb x8
+    cmp x8, #32
+    b.lo 1b
+    mov w0, w12
+    add sp, sp, #32
+    .cfi_def_cfa_offset 0
+    ret
+    .cfi_endproc
+    .size fre_byte_set_mask32_sve2_asm, .-fre_byte_set_mask32_sve2_asm
+    .popsection
+"#
+    );
 
     global_asm!(
         r#"
@@ -479,6 +750,17 @@ fre_ascii_run_backward_sve2_asm:
     reason = "these private declarations are implemented by the reviewed base-SVE and SVE2 global assembly above"
 )]
 unsafe extern "C" {
+    fn fre_byte_set1_mask16_sve2_asm(member: u8, bytes: *const u8) -> u16;
+    fn fre_byte_set2_mask16_sve2_asm(members: u16, bytes: *const u8) -> u16;
+    fn fre_byte_set4_mask16_sve2_asm(members: u32, bytes: *const u8) -> u16;
+    fn fre_byte_set1_mask32_sve2_asm(member: u8, bytes: *const u8) -> u32;
+    fn fre_byte_set2_mask32_sve2_asm(members: u16, bytes: *const u8) -> u32;
+    fn fre_byte_set4_mask32_sve2_asm(members: u32, bytes: *const u8) -> u32;
+    fn fre_byte_set_mask32_sve2_asm(
+        lower_columns: *const u8,
+        upper_columns: *const u8,
+        bytes: *const u8,
+    ) -> u32;
     fn fre_ascii_mask32_sve2_asm(columns: *const u8, bytes: *const u8) -> u64;
     fn fre_ascii_word_space_mask16_sve2_asm(
         word_columns: *const u8,
@@ -524,6 +806,133 @@ unsafe extern "C" {
         bytes: *const u8,
         len: usize,
     ) -> AsciiRunResult;
+}
+
+#[allow(
+    unsafe_code,
+    reason = "this private leaf calls reviewed fixed-16 SVE2 assembly after compiler target features prove SVE plus SVE2 usable"
+)]
+#[inline]
+pub(super) unsafe fn classify_byte_set1_16_sve2(
+    member: u8,
+    bytes: &[u8; crate::BYTE_SET_BLOCK_BYTES],
+) -> crate::ByteSetMask16 {
+    crate::ByteSetMask16::new(unsafe { fre_byte_set1_mask16_sve2_asm(member, bytes.as_ptr()) })
+}
+
+#[allow(
+    unsafe_code,
+    reason = "this private leaf calls reviewed fixed-16 SVE2 assembly after compiler target features prove SVE plus SVE2 usable"
+)]
+#[inline]
+pub(super) unsafe fn classify_byte_set2_16_sve2(
+    members: [u8; 2],
+    bytes: &[u8; crate::BYTE_SET_BLOCK_BYTES],
+) -> crate::ByteSetMask16 {
+    crate::ByteSetMask16::new(unsafe {
+        fre_byte_set2_mask16_sve2_asm(u16::from_ne_bytes(members), bytes.as_ptr())
+    })
+}
+
+#[allow(
+    unsafe_code,
+    reason = "SVE2 MATCH consumes an unordered segment-local set in one instruction, so repeating one of three members adds no comparison"
+)]
+#[inline]
+pub(super) unsafe fn classify_byte_set3_16_sve2(
+    members: [u8; 3],
+    bytes: &[u8; crate::BYTE_SET_BLOCK_BYTES],
+) -> crate::ByteSetMask16 {
+    unsafe { classify_byte_set4_16_sve2([members[0], members[1], members[2], members[0]], bytes) }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "this private leaf calls reviewed fixed-16 SVE2 assembly after compiler target features prove SVE plus SVE2 usable"
+)]
+#[inline]
+pub(super) unsafe fn classify_byte_set4_16_sve2(
+    members: [u8; 4],
+    bytes: &[u8; crate::BYTE_SET_BLOCK_BYTES],
+) -> crate::ByteSetMask16 {
+    let packed_members = u32::from_ne_bytes(members);
+    // SAFETY: the compiler-selected caller proves SVE plus SVE2 globally. The
+    // fixed array supplies all sixteen source bytes read by reviewed assembly;
+    // the packed value contains the complete unordered four-byte set.
+    crate::ByteSetMask16::new(unsafe {
+        fre_byte_set4_mask16_sve2_asm(packed_members, bytes.as_ptr())
+    })
+}
+
+#[allow(
+    unsafe_code,
+    reason = "this private leaf calls reviewed fixed-32 SVE2 assembly after the authenticated compiler-static profile proves SVE plus SVE2 usable"
+)]
+#[inline]
+pub(super) unsafe fn classify_byte_set1_32_sve2(
+    member: u8,
+    bytes: &[u8; BYTE_SET_WIDE_BLOCK_BYTES],
+) -> ByteSetMask32 {
+    ByteSetMask32::new(unsafe { fre_byte_set1_mask32_sve2_asm(member, bytes.as_ptr()) })
+}
+
+#[allow(
+    unsafe_code,
+    reason = "this private leaf calls reviewed fixed-32 SVE2 assembly after the authenticated compiler-static profile proves SVE plus SVE2 usable"
+)]
+#[inline]
+pub(super) unsafe fn classify_byte_set2_32_sve2(
+    members: [u8; 2],
+    bytes: &[u8; BYTE_SET_WIDE_BLOCK_BYTES],
+) -> ByteSetMask32 {
+    ByteSetMask32::new(unsafe {
+        fre_byte_set2_mask32_sve2_asm(u16::from_ne_bytes(members), bytes.as_ptr())
+    })
+}
+
+#[allow(
+    unsafe_code,
+    reason = "SVE2 MATCH consumes an unordered segment-local set in one instruction, so repeating one of three members adds no comparison"
+)]
+#[inline]
+pub(super) unsafe fn classify_byte_set3_32_sve2(
+    members: [u8; 3],
+    bytes: &[u8; BYTE_SET_WIDE_BLOCK_BYTES],
+) -> ByteSetMask32 {
+    unsafe { classify_byte_set4_32_sve2([members[0], members[1], members[2], members[0]], bytes) }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "this private leaf calls reviewed fixed-32 SVE2 assembly after the authenticated compiler-static profile proves SVE plus SVE2 usable"
+)]
+#[inline]
+pub(super) unsafe fn classify_byte_set4_32_sve2(
+    members: [u8; 4],
+    bytes: &[u8; BYTE_SET_WIDE_BLOCK_BYTES],
+) -> ByteSetMask32 {
+    let packed_members = u32::from_ne_bytes(members);
+    // SAFETY: the compiler-static caller proves SVE plus SVE2. The fixed array
+    // supplies all 32 source bytes and the packed value contains the complete
+    // unordered four-byte set.
+    ByteSetMask32::new(unsafe { fre_byte_set4_mask32_sve2_asm(packed_members, bytes.as_ptr()) })
+}
+
+#[allow(
+    unsafe_code,
+    reason = "this private leaf calls reviewed fixed-32 SVE2 assembly after the authenticated compiler-static profile proves SVE plus SVE2 usable"
+)]
+#[inline]
+pub(super) unsafe fn classify_byte_set_32_sve2(
+    tables: &ByteSetTables,
+    bytes: &[u8; BYTE_SET_WIDE_BLOCK_BYTES],
+) -> ByteSetMask32 {
+    // SAFETY: each table has exactly 16 initialized bytes, the source has
+    // exactly 32 initialized bytes, and the compiler-static caller proves SVE
+    // plus SVE2 for the reviewed leaf.
+    ByteSetMask32::new(unsafe {
+        fre_byte_set_mask32_sve2_asm(tables.lower.as_ptr(), tables.upper.as_ptr(), bytes.as_ptr())
+    })
 }
 
 #[allow(

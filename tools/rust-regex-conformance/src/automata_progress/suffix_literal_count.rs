@@ -67,12 +67,13 @@ const PATTERN: &str = r"[a-zA-Z]+ing";
 const HAYSTACK: &[u8] = b"tingling";
 const EXPECTED_SPANS: [(usize, usize); 1] = [(0, 8)];
 const MAX_SEARCH_CALLS: usize = 2;
-const MAX_SEARCH_WORK: u64 = 167;
+const MAX_SEARCH_WORK: u64 = 349;
 const MAX_SCRATCH_BYTES: usize = 8 * 1024 * 1024;
 // Fixed after direct execution and checked by the observer test.
-const EXPECTED_FIRST_WORK: u64 = 167;
-const EXPECTED_TAIL_WORK: u64 = 43;
-const EXPECTED_ITER_WORK: u64 = 142;
+const EXPECTED_FIRST_WORK: u64 = 349;
+const EXPECTED_TAIL_WORK: u64 = 29;
+const EXPECTED_MINIMUM_FIRST_WORK: u64 = 348;
+const EXPECTED_ITER_WORK: u64 = 102;
 
 /// Extend the exact 145-pass report with one independently executed unit
 /// membership.
@@ -503,11 +504,44 @@ fn validate_direct_search(fre: &PortableRegex) -> Result<(), InventoryError> {
             "suffix-literal direct search mismatch: first={first_work} tail={tail_work}",
         )));
     }
-    let one_below = EXPECTED_FIRST_WORK
+    // A fresh plan can admit the smaller workspace tier at this exact bound,
+    // while the unlimited search above chooses the more capable cold tier.
+    // Authenticate both adaptive outcomes instead of comparing cold and warm
+    // accounting from the same plan owner.
+    let exact_fre = PortableBuilder::new(PATTERN)
+        .profile(RustProfile::regex_1_12_4())
+        .plan_selection(PlanSelection::ForceK0)
+        .build()
+        .map_err(|error| InventoryError::new(format!("suffix-literal exact build: {error}")))?;
+    let (exact_match, exact_accounting) = exact_fre
+        .find(
+            HAYSTACK,
+            SearchLimits {
+                max_work: EXPECTED_MINIMUM_FIRST_WORK,
+                max_scratch_bytes: MAX_SCRATCH_BYTES,
+            },
+        )
+        .map_err(|error| InventoryError::new(format!("suffix-literal exact search: {error}")))?;
+    let SearchAccounting::K0(exact_accounting) = exact_accounting else {
+        return Err(InventoryError::new("suffix-literal exact search is not K0"));
+    };
+    if exact_match.map(|matched| (matched.start(), matched.end())) != Some(EXPECTED_SPANS[0])
+        || exact_accounting.work() != EXPECTED_MINIMUM_FIRST_WORK
+    {
+        return Err(InventoryError::new(format!(
+            "suffix-literal exact-bound mismatch: accounting={exact_accounting:?}",
+        )));
+    }
+    let one_below = EXPECTED_MINIMUM_FIRST_WORK
         .checked_sub(1)
         .ok_or_else(|| InventoryError::new("suffix-literal first work underflow"))?;
+    let one_below_fre = PortableBuilder::new(PATTERN)
+        .profile(RustProfile::regex_1_12_4())
+        .plan_selection(PlanSelection::ForceK0)
+        .build()
+        .map_err(|error| InventoryError::new(format!("suffix-literal one-below build: {error}")))?;
     if !matches!(
-        fre.find(
+        one_below_fre.find(
             HAYSTACK,
             SearchLimits {
                 max_work: one_below,

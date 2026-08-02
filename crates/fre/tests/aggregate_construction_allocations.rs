@@ -69,7 +69,9 @@ fn whole_construction_has_an_exact_controlled_allocation_census() {
             // owner to the next allocator size class, adding 56 bytes without
             // adding an allocation. The bounded participation cache adds 272
             // bytes of authenticated fixed-envelope storage for this shape.
-            bytes_allocated: 4_508,
+            // Complete adaptive fixed-predicate strategy authentication adds
+            // another 80 inline bytes to the shared plan-identity owner.
+            bytes_allocated: 4_588,
             bytes_deallocated: 1_894,
             bytes_reallocated: 149,
         }
@@ -165,8 +167,9 @@ fn whole_construction_has_an_exact_controlled_allocation_census() {
             reallocations: 5,
             // The same composed continuation owner reaches publication after
             // the optional fixed-route refusal. Its fused-capture alternative
-            // now includes the bounded participation-cache envelope.
-            bytes_allocated: 7_802,
+            // includes the bounded participation-cache envelope and complete
+            // adaptive fixed-predicate strategy identity.
+            bytes_allocated: 7_882,
             bytes_deallocated: 4_393,
             bytes_reallocated: 912,
         }

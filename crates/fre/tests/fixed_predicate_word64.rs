@@ -355,6 +355,15 @@ fn success_owner_rejects_every_mutable_cache_discriminator_and_splice() {
         |identity: &mut fre::FixedPredicateWord64OperationIdentity| {
             identity.width = identity.width.wrapping_add(1);
         },
+        |identity: &mut fre::FixedPredicateWord64OperationIdentity| {
+            identity.secondary_anchor = None;
+        },
+        |identity: &mut fre::FixedPredicateWord64OperationIdentity| {
+            identity.verification_predicates = identity.verification_predicates.wrapping_add(1);
+        },
+        |identity: &mut fre::FixedPredicateWord64OperationIdentity| {
+            identity.adaptive_handoff = fre::FixedPredicateWord64AdaptiveHandoffIdentity::Disabled;
+        },
     ] {
         reject!(|cache: &mut fre::AggregateCacheIdentity| {
             let AggregatePlanIdentity::FixedPredicateWord64(identity) = &mut cache.plan_identity

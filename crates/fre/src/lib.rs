@@ -55,6 +55,7 @@
 
 use core::fmt;
 
+use fre_kernels::FixedPredicateWord64SearchCursor;
 use regex_syntax::hir::{Hir, HirKind};
 
 mod aggregate;
@@ -65,6 +66,7 @@ mod aggregate_many;
 mod anchored_line_capture;
 mod anchored_word_capture;
 mod blocking_delimiter;
+mod bounded_byte_class_repeat;
 mod bounded_literal_pair;
 mod bounded_word_class;
 mod capture_absolute_full;
@@ -467,8 +469,8 @@ pub use fre_kernels::{
     FIXED_CLASS_SANDWICH_SPAN_SUM_OPERATION_ID, FIXED_PREDICATE_WORD64_COUNT_OPERATION_ID,
     FIXED_PREDICATE_WORD64_MASK_SLOTS, FIXED_PREDICATE_WORD64_MAX_WIDTH,
     FIXED_PREDICATE_WORD64_MIN_WIDTH, FIXED_PREDICATE_WORD64_PLAN_ID,
-    FIXED_PREDICATE_WORD64_SPAN_SUM_OPERATION_ID, FixedAbsoluteDomainActual,
-    FixedAbsoluteDomainBuildAccounting, FixedAbsoluteDomainBuildActual,
+    FIXED_PREDICATE_WORD64_SEARCH_PLAN_ID, FIXED_PREDICATE_WORD64_SPAN_SUM_OPERATION_ID,
+    FixedAbsoluteDomainActual, FixedAbsoluteDomainBuildAccounting, FixedAbsoluteDomainBuildActual,
     FixedAbsoluteDomainBuildError, FixedAbsoluteDomainBuildErrorKind,
     FixedAbsoluteDomainBuildLimits, FixedAbsoluteDomainBuildProspective,
     FixedAbsoluteDomainBuildResource, FixedAbsoluteDomainContentDigest,
@@ -484,15 +486,21 @@ pub use fre_kernels::{
     FixedClassSandwichOperationIdentity, FixedClassSandwichReduceAccounting,
     FixedClassSandwichReduceError, FixedClassSandwichReduceLimits, FixedClassSandwichSemantics,
     FixedClassSandwichUpperBounds, FixedPredicateWord64ActualCounters,
-    FixedPredicateWord64BuildAccounting, FixedPredicateWord64BuildError,
-    FixedPredicateWord64BuildLimits, FixedPredicateWord64CountResult,
+    FixedPredicateWord64AdaptiveFinderIdentity, FixedPredicateWord64AdaptiveFinderKind,
+    FixedPredicateWord64AdaptiveHandoffIdentity, FixedPredicateWord64BuildAccounting,
+    FixedPredicateWord64BuildError, FixedPredicateWord64BuildLimits,
+    FixedPredicateWord64CountResult, FixedPredicateWord64ExactAnchorIdentity,
     FixedPredicateWord64MatchSelection, FixedPredicateWord64MatchSemantics,
     FixedPredicateWord64Operation, FixedPredicateWord64OperationIdentity, FixedPredicateWord64Plan,
     FixedPredicateWord64ReduceAccounting, FixedPredicateWord64ReduceError,
     FixedPredicateWord64ReduceLimits, FixedPredicateWord64Reducer,
-    FixedPredicateWord64SpanSumResult, FixedPredicateWord64UpperBounds,
-    GraphemeScalarDfaActualCounters, GraphemeScalarDfaBuildAccounting, GraphemeScalarDfaBuildError,
-    GraphemeScalarDfaBuildLimits, GraphemeScalarDfaOperation, GraphemeScalarDfaOperationIdentity,
+    FixedPredicateWord64SearchAccounting, FixedPredicateWord64SearchActualCounters,
+    FixedPredicateWord64SearchError, FixedPredicateWord64SearchLimits,
+    FixedPredicateWord64SearchOperation, FixedPredicateWord64SearchOperationIdentity,
+    FixedPredicateWord64SearchUpperBounds, FixedPredicateWord64SpanSumResult,
+    FixedPredicateWord64UpperBounds, GraphemeScalarDfaActualCounters,
+    GraphemeScalarDfaBuildAccounting, GraphemeScalarDfaBuildError, GraphemeScalarDfaBuildLimits,
+    GraphemeScalarDfaOperation, GraphemeScalarDfaOperationIdentity,
     GraphemeScalarDfaReduceAccounting, GraphemeScalarDfaReduceError, GraphemeScalarDfaReduceLimits,
     GraphemeScalarDfaRole, GraphemeScalarDfaSemantics, GraphemeScalarDfaUpperBounds,
     LITERAL_AGGREGATE_ACCOUNTING_VERSION, LITERAL_AGGREGATE_ALGORITHM_VERSION,
@@ -654,7 +662,9 @@ pub use text_set::{
     PortableTextRegexSetBuildError, PortableTextRegexSetBuildReport, PortableTextRegexSetBuilder,
 };
 
-use fre_automata::{Automaton, EarliestEnd, Exists, K0SearchSession, SelectedEnd, Span};
+use fre_automata::{
+    Automaton, EarliestEnd, Exists, K0SearchSession, K0SpanSourceCursor, SelectedEnd, Span,
+};
 use fre_kernels::{
     AbsoluteEndFixedPlan, BoundedRequiredLiteralPlan, DispatchedBoundedRequiredLiteralPlan,
     DispatchedForwardAnchoredPlan, DispatchedRequiredLiteralPlan, ForwardAnchoredBuildAccounting,
@@ -713,7 +723,15 @@ pub use unicode_word_run::{
 };
 
 /// Stable schema for facade-level explanation records.
-pub const EXPLAIN_SCHEMA_VERSION: u32 = 8;
+pub const EXPLAIN_SCHEMA_VERSION: u32 = 12;
+
+// Automatic ordinary search admits every fixed-width plan with an exact
+// one- or two-byte anchor. Construction already proves a word width of at
+// most 64, so one primary anchor leaves at most 63 non-universal verification
+// predicates. The retained adaptive finder and final Shift-And handoff keep
+// dense rejection streams inside the kernel's closed linear bound.
+const FIXED_PREDICATE_SEARCH_AUTO_MAX_VERIFICATION_PREDICATES: usize =
+    FIXED_PREDICATE_WORD64_MAX_WIDTH - 1;
 
 /// Escapes all regular-expression meta characters in `pattern`.
 ///
@@ -997,6 +1015,8 @@ pub enum PlanKind {
     UnicodeFoldedLiteral,
     /// Linear ASCII or Unicode word-boundary class-run scan.
     UnicodeWordRun,
+    /// Fixed-width Cartesian byte predicates backed by one 64-bit Shift-And state.
+    FixedPredicateWord64,
 }
 
 /// Construction failure without semantic fallback.
@@ -1682,6 +1702,8 @@ pub enum SearchAccounting {
     UnicodeFoldedLiteral(fre_kernels::FoldedLiteralTrieScanActual),
     /// Exact linear Unicode word-run counters.
     UnicodeWordRun(UnicodeWordRunAccounting),
+    /// Exact fixed-predicate first-match counters.
+    FixedPredicateWord64(FixedPredicateWord64SearchAccounting),
 }
 
 impl SearchAccounting {
@@ -1699,6 +1721,7 @@ impl SearchAccounting {
             Self::ForwardAnchored(_) => PlanKind::ForwardAnchored,
             Self::UnicodeFoldedLiteral(_) => PlanKind::UnicodeFoldedLiteral,
             Self::UnicodeWordRun(_) => PlanKind::UnicodeWordRun,
+            Self::FixedPredicateWord64(_) => PlanKind::FixedPredicateWord64,
         }
     }
 
@@ -1724,6 +1747,7 @@ impl SearchAccounting {
                 u64::try_from(accounting.work).unwrap_or(u64::MAX)
             }
             Self::UnicodeWordRun(accounting) => accounting.work(),
+            Self::FixedPredicateWord64(accounting) => accounting.actual.work,
         }
     }
 }
@@ -1763,6 +1787,7 @@ pub enum SearchError {
     ForwardAnchored(ForwardAnchoredSearchError),
     UnicodeFoldedLiteral(UnicodeFoldedLiteralSearchError),
     UnicodeWordRun(UnicodeWordRunError),
+    FixedPredicateWord64(FixedPredicateWord64SearchError),
 }
 
 impl fmt::Display for SearchError {
@@ -1788,6 +1813,9 @@ impl fmt::Display for SearchError {
                 write!(f, "Unicode folded-literal search failed: {error}")
             }
             Self::UnicodeWordRun(error) => write!(f, "Unicode word-run search failed: {error}"),
+            Self::FixedPredicateWord64(error) => {
+                write!(f, "fixed-predicate search failed: {error}")
+            }
         }
     }
 }
@@ -1805,6 +1833,7 @@ impl std::error::Error for SearchError {
             Self::ForwardAnchored(error) => Some(error),
             Self::UnicodeFoldedLiteral(error) => Some(error),
             Self::UnicodeWordRun(error) => Some(error),
+            Self::FixedPredicateWord64(error) => Some(error),
         }
     }
 }
@@ -1870,6 +1899,12 @@ impl From<fre_kernels::FoldedLiteralTrieScanAttemptError> for SearchError {
 impl From<UnicodeWordRunError> for SearchError {
     fn from(value: UnicodeWordRunError) -> Self {
         Self::UnicodeWordRun(value)
+    }
+}
+
+impl From<FixedPredicateWord64SearchError> for SearchError {
+    fn from(value: FixedPredicateWord64SearchError) -> Self {
+        Self::FixedPredicateWord64(value)
     }
 }
 
@@ -2975,11 +3010,88 @@ impl PortableBuilder {
                 });
             }
         }
+        let mut bounded_byte_class_repeat_work = pure_byte_class_repeat_work;
+        if self.selection == PlanSelection::Auto && self.pure_byte_class_repeat_allowed {
+            let inspection = bounded_byte_class_repeat::inspect(
+                &rust.hir,
+                pure_byte_class_repeat_work,
+                self.limits.max_planner_work,
+            )
+            .map_err(|error| match error {
+                bounded_byte_class_repeat::InspectionError::WorkLimit { needed, limit } => {
+                    BuildError::PlannerWorkLimit { needed, limit }
+                }
+                bounded_byte_class_repeat::InspectionError::ArithmeticOverflow => {
+                    BuildError::InternalInvariant(
+                        "bounded byte-class repeat planner arithmetic overflow",
+                    )
+                }
+            })?;
+            bounded_byte_class_repeat_work = inspection.planner_work();
+            if let bounded_byte_class_repeat::InspectionOutcome::Eligible(inspection) = inspection {
+                let plan_storage_bytes = bounded_byte_class_repeat::Plan::storage_bytes();
+                let charged_persistent_bytes = source_storage_bytes
+                    .checked_add(capture_name_storage_bytes)
+                    .and_then(|bytes| bytes.checked_add(plan_storage_bytes))
+                    .ok_or(BuildError::PersistentBytesOverflow)?;
+                if charged_persistent_bytes > self.limits.max_persistent_bytes {
+                    return Err(BuildError::PersistentBytesLimit {
+                        needed: charged_persistent_bytes,
+                        limit: self.limits.max_persistent_bytes,
+                    });
+                }
+                let plan = inspection
+                    .build(SimdDispatchContext::capture())
+                    .map_err(|error| match error {
+                        fre_exact_alloc::CopyError::LayoutOverflow => {
+                            BuildError::InternalInvariant(
+                                "bounded byte-class repeat owner layout overflowed",
+                            )
+                        }
+                        fre_exact_alloc::CopyError::AllocationFailed => {
+                            BuildError::AllocationFailed {
+                                structure: "bounded byte-class repeat owner",
+                                additional: 1,
+                            }
+                        }
+                    })?;
+                return Ok(PortableRegex {
+                    source,
+                    capture_names,
+                    line_total_grep_plan,
+                    plan: PortablePlan::BoundedByteClassRepeat(plan),
+                    profile: profile.clone(),
+                    limits: self.limits,
+                    selection: self.selection,
+                    report: BuildReport {
+                        profile: profile.clone(),
+                        admission,
+                        syntax,
+                        plan: PlanKind::PureByteClassRepeat,
+                        planner_work: bounded_byte_class_repeat_work,
+                        lowering: None,
+                        states: 0,
+                        edges: 0,
+                        plan_storage_bytes,
+                        source_storage_bytes,
+                        capture_name_storage_bytes,
+                        charged_persistent_bytes,
+                        persistent_byte_limit: self.limits.max_persistent_bytes,
+                        captures_len,
+                        static_captures_len,
+                        minimum_match_bytes,
+                        required_literal: None,
+                        literal_class_run_literal: None,
+                        forward_anchored: None,
+                    },
+                });
+            }
+        }
         let (finite_words, mut finite_work) = finite::extract(
             &rust.hir,
             self.limits.literal_set.max_patterns,
             self.limits.literal_set.max_pattern_bytes,
-            pure_byte_class_repeat_work,
+            bounded_byte_class_repeat_work,
             self.limits.max_planner_work,
             false,
             finite::GuardedFiniteBuildLimits::unlimited(),
@@ -3109,8 +3221,163 @@ impl PortableBuilder {
                 });
             }
         }
+        let fixed_predicate_inspection =
+            finite::inspect_fixed_predicate_word64_after_finite_refusal_attempt(
+                &rust.hir,
+                finite_work,
+                self.limits.max_planner_work,
+            );
+        if !fixed_predicate_inspection.has_closed_receipt() {
+            return Err(BuildError::InternalInvariant(
+                "fixed-predicate search inspection lost its attempt closure",
+            ));
+        }
+        let fixed_predicate_receipt = fixed_predicate_inspection.receipt();
+        if fixed_predicate_receipt.initial_work() != finite_work
+            || fixed_predicate_receipt.work_limit() != self.limits.max_planner_work
+        {
+            return Err(BuildError::InternalInvariant(
+                "fixed-predicate search inspection lost its cumulative planner envelope",
+            ));
+        }
+        finite_work = fixed_predicate_receipt.actual().work;
+        let fixed_predicate_declined = match fixed_predicate_inspection {
+            finite::FixedPredicateInspectionAttempt::Succeeded { source: fixed, .. } => {
+                let expected_hir_nodes = usize::try_from(syntax.hir_nodes).map_err(|_| {
+                    BuildError::InternalInvariant("syntax HIR-node count does not fit usize")
+                })?;
+                if fixed.hir_nodes() != expected_hir_nodes || fixed.captures() != explicit_captures
+                {
+                    return Err(BuildError::InternalInvariant(
+                        "syntax summary differs from fixed-predicate search inspection",
+                    ));
+                }
+                if fixed.variable_predicates() == 0 {
+                    return Err(BuildError::InternalInvariant(
+                        "fixed-predicate search source lost its variable predicate proof",
+                    ));
+                }
+                let mut normalized =
+                    [finite::FixedPredicateRanges::EMPTY; FIXED_PREDICATE_WORD64_MAX_WIDTH];
+                for (index, ranges) in fixed.positions().enumerate() {
+                    let Some(slot) = normalized.get_mut(index) else {
+                        return Err(BuildError::InternalInvariant(
+                            "fixed-predicate search source exceeded its inline width",
+                        ));
+                    };
+                    *slot = ranges;
+                }
+                let Some(normalized) = normalized.get(..fixed.width()) else {
+                    return Err(BuildError::InternalInvariant(
+                        "fixed-predicate search source width exceeded its inline storage",
+                    ));
+                };
+                let mut positions: [&[(u8, u8)]; FIXED_PREDICATE_WORD64_MAX_WIDTH] =
+                    [&[]; FIXED_PREDICATE_WORD64_MAX_WIDTH];
+                for (slot, predicate) in positions.iter_mut().zip(normalized) {
+                    *slot = predicate.ranges();
+                }
+                let attempt = match FixedPredicateWord64Plan::build_attempt(
+                    &positions[..normalized.len()],
+                    FixedPredicateWord64BuildLimits::unlimited(),
+                ) {
+                    Ok(attempt) => attempt,
+                    Err(error) => {
+                        if !error.closes() {
+                            return Err(BuildError::InternalInvariant(
+                                "fixed-predicate search construction failure lost its attempt closure",
+                            ));
+                        }
+                        return Err(BuildError::InternalInvariant(
+                            "inspected fixed-predicate search source failed kernel construction",
+                        ));
+                    }
+                };
+                if !attempt.closes() {
+                    return Err(BuildError::InternalInvariant(
+                        "fixed-predicate search construction lost its attempt closure",
+                    ));
+                }
+                let (plan, _) = attempt.into_parts();
+                let reducer = plan
+                    .search_operation_identity(FixedPredicateWord64SearchOperation::Exists)
+                    .reducer;
+                let anchored = matches!(
+                    reducer,
+                    FixedPredicateWord64Reducer::OneByteAnchor
+                        | FixedPredicateWord64Reducer::TwoByteAnchor
+                );
+                let auto_admitted = anchored
+                    && plan.max_verification_predicates()
+                        <= FIXED_PREDICATE_SEARCH_AUTO_MAX_VERIFICATION_PREDICATES;
+                if auto_admitted {
+                    let plan_storage_bytes = plan.build_accounting().persistent_bytes;
+                    let charged_persistent_bytes = source_storage_bytes
+                        .checked_add(capture_name_storage_bytes)
+                        .and_then(|bytes| bytes.checked_add(plan_storage_bytes))
+                        .ok_or(BuildError::PersistentBytesOverflow)?;
+                    if charged_persistent_bytes > self.limits.max_persistent_bytes {
+                        return Err(BuildError::PersistentBytesLimit {
+                            needed: charged_persistent_bytes,
+                            limit: self.limits.max_persistent_bytes,
+                        });
+                    }
+                    let plan =
+                        fre_exact_alloc::try_box_preserve(plan).map_err(
+                            |(error, _)| match error {
+                                fre_exact_alloc::CopyError::LayoutOverflow => {
+                                    BuildError::InternalInvariant(
+                                        "fixed-predicate search owner layout overflowed",
+                                    )
+                                }
+                                fre_exact_alloc::CopyError::AllocationFailed => {
+                                    BuildError::AllocationFailed {
+                                        structure: "fixed-predicate search owner",
+                                        additional: 1,
+                                    }
+                                }
+                            },
+                        )?;
+                    return Ok(PortableRegex {
+                        source,
+                        capture_names,
+                        line_total_grep_plan,
+                        plan: PortablePlan::FixedPredicateWord64(plan),
+                        profile: profile.clone(),
+                        limits: self.limits,
+                        selection: self.selection,
+                        report: BuildReport {
+                            profile: profile.clone(),
+                            admission,
+                            syntax,
+                            plan: PlanKind::FixedPredicateWord64,
+                            planner_work: finite_work,
+                            lowering: None,
+                            states: 0,
+                            edges: 0,
+                            plan_storage_bytes,
+                            source_storage_bytes,
+                            capture_name_storage_bytes,
+                            charged_persistent_bytes,
+                            persistent_byte_limit: self.limits.max_persistent_bytes,
+                            captures_len,
+                            static_captures_len,
+                            minimum_match_bytes,
+                            required_literal: None,
+                            literal_class_run_literal: None,
+                            forward_anchored: None,
+                        },
+                    });
+                }
+                true
+            }
+            finite::FixedPredicateInspectionAttempt::Refused { .. } => false,
+            finite::FixedPredicateInspectionAttempt::ResourceFailure { error, .. } => {
+                return Err(error);
+            }
+        };
         let mut fallback_planner_work = finite_work;
-        if self.selection == PlanSelection::Auto {
+        if self.selection == PlanSelection::Auto && !fixed_predicate_declined {
             let retained_facade_bytes = source_storage_bytes
                 .checked_add(capture_name_storage_bytes)
                 .ok_or(BuildError::PersistentBytesOverflow)?;
@@ -3476,6 +3743,10 @@ enum PortablePlan {
     UnicodeWordRun(unicode_word_run::Plan),
     AsciiWordRun(unicode_word_run::AsciiPlan),
     BoundedWordClass(bounded_word_class::Plan),
+    // Append new runtime classes so existing implicit discriminants, including
+    // K0's, remain unchanged for code-layout containment.
+    BoundedByteClassRepeat(bounded_byte_class_repeat::Plan),
+    FixedPredicateWord64(Box<FixedPredicateWord64Plan>),
 }
 
 impl PortablePlan {
@@ -3491,6 +3762,7 @@ impl PortablePlan {
             Self::LiteralClassRunLiteral(_) => fre_kernels::LITERAL_CLASS_RUN_LITERAL_PLAN_ID,
             Self::LiteralClassRunSearch(plan) => plan.plan_id(),
             Self::PureByteClassRepeat(_) => pure_byte_class_repeat::PLAN_ID,
+            Self::BoundedByteClassRepeat(_) => bounded_byte_class_repeat::PLAN_ID,
             Self::ForwardAnchored(forward) => forward.plan_id(),
             Self::DispatchedForwardAnchored(forward) => forward.plan_id(),
             Self::ForwardEndFixed(fixed) => fixed.plan_id(),
@@ -3499,6 +3771,7 @@ impl PortablePlan {
             Self::UnicodeWordRun(plan) => plan.plan_id(),
             Self::AsciiWordRun(_) => unicode_word_run::ASCII_PLAN_ID,
             Self::BoundedWordClass(plan) => plan.plan_id(),
+            Self::FixedPredicateWord64(_) => FIXED_PREDICATE_WORD64_SEARCH_PLAN_ID,
         }
     }
 }
@@ -3949,6 +4222,10 @@ impl PortableRegex {
                 let (matched, accounting) = plan.is_match_window(haystack, window, limits)?;
                 Ok((matched, SearchAccounting::PureByteClassRepeat(accounting)))
             }
+            PortablePlan::BoundedByteClassRepeat(plan) => {
+                let (matched, accounting) = plan.is_match_window(haystack, window, limits)?;
+                Ok((matched, SearchAccounting::PureByteClassRepeat(accounting)))
+            }
             PortablePlan::ForwardAnchored(forward) => {
                 let literal_window = LiteralWindow::new(window.start(), window.end());
                 let (matched, accounting) = forward.find_window(
@@ -4020,6 +4297,14 @@ impl PortableRegex {
                     matched.is_some(),
                     SearchAccounting::UnicodeWordRun(accounting),
                 ))
+            }
+            PortablePlan::FixedPredicateWord64(plan) => {
+                let (matched, accounting) = plan.is_match_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    fixed_predicate_word64_search_limits(limits),
+                )?;
+                Ok((matched, SearchAccounting::FixedPredicateWord64(accounting)))
             }
         }
     }
@@ -4117,6 +4402,9 @@ impl PortableRegex {
                 .map(|(matched, _)| matched.is_some())
                 .map_err(SearchError::from),
             PortablePlan::PureByteClassRepeat(plan) => plan
+                .is_match_window_value(haystack, window, limits)
+                .map_err(SearchError::from),
+            PortablePlan::BoundedByteClassRepeat(plan) => plan
                 .is_match_window(haystack, window, limits)
                 .map(|(matched, _)| matched)
                 .map_err(SearchError::from),
@@ -4168,6 +4456,13 @@ impl PortableRegex {
             PortablePlan::BoundedWordClass(plan) => plan
                 .find_window(haystack, window, limits)
                 .map(|(matched, _)| matched.is_some())
+                .map_err(SearchError::from),
+            PortablePlan::FixedPredicateWord64(plan) => plan
+                .is_match_window_value(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    fixed_predicate_word64_search_limits(limits),
+                )
                 .map_err(SearchError::from),
         }
     }
@@ -4320,6 +4615,10 @@ impl PortableRegex {
                 let (end, accounting) = plan.earliest_end_window(haystack, window, limits)?;
                 Ok((end, SearchAccounting::PureByteClassRepeat(accounting)))
             }
+            PortablePlan::BoundedByteClassRepeat(plan) => {
+                let (end, accounting) = plan.earliest_end_window(haystack, window, limits)?;
+                Ok((end, SearchAccounting::PureByteClassRepeat(accounting)))
+            }
             PortablePlan::ForwardAnchored(forward) => {
                 let literal_window = LiteralWindow::new(window.start(), window.end());
                 let (matched, accounting) = forward.find_window(
@@ -4388,6 +4687,14 @@ impl PortableRegex {
             PortablePlan::BoundedWordClass(plan) => {
                 let (end, accounting) = plan.shortest_window(haystack, window, limits)?;
                 Ok((end, SearchAccounting::UnicodeWordRun(accounting)))
+            }
+            PortablePlan::FixedPredicateWord64(plan) => {
+                let (end, accounting) = plan.earliest_end_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    fixed_predicate_word64_search_limits(limits),
+                )?;
+                Ok((end, SearchAccounting::FixedPredicateWord64(accounting)))
             }
         }
     }
@@ -4483,6 +4790,11 @@ impl PortableRegex {
                     plan.selected_end_window(haystack, SearchWindow::full(haystack), limits)?;
                 Ok((end, SearchAccounting::PureByteClassRepeat(accounting)))
             }
+            PortablePlan::BoundedByteClassRepeat(plan) => {
+                let (end, accounting) =
+                    plan.selected_end_window(haystack, SearchWindow::full(haystack), limits)?;
+                Ok((end, SearchAccounting::PureByteClassRepeat(accounting)))
+            }
             PortablePlan::ForwardAnchored(forward) => {
                 let (matched, accounting) =
                     forward.find(haystack, forward_anchored_limits(limits))?;
@@ -4548,6 +4860,11 @@ impl PortableRegex {
                     matched.map(Match::end),
                     SearchAccounting::UnicodeWordRun(accounting),
                 ))
+            }
+            PortablePlan::FixedPredicateWord64(plan) => {
+                let (end, accounting) =
+                    plan.selected_end(haystack, fixed_predicate_word64_search_limits(limits))?;
+                Ok((end, SearchAccounting::FixedPredicateWord64(accounting)))
             }
         }
     }
@@ -4637,10 +4954,16 @@ impl PortableRegex {
         limits: PortableFindIterLimits,
         empty_match_progress: EmptyMatchProgress,
     ) -> Result<PortableMatches<'r, 'h>, SearchError> {
+        let fixed_predicate_cursor = self.fixed_predicate_search_cursor(haystack);
         let session = self.search_session(limits.session)?;
         Ok(PortableMatches {
             session,
-            state: PortableMatchIterState::new(haystack, limits.run(), empty_match_progress),
+            state: PortableMatchIterState::new(
+                haystack,
+                limits.run(),
+                empty_match_progress,
+                fixed_predicate_cursor,
+            ),
         })
     }
 
@@ -4846,6 +5169,10 @@ impl PortableRegex {
                 let (matched, accounting) = plan.find_window(haystack, window, limits)?;
                 Ok((matched, SearchAccounting::PureByteClassRepeat(accounting)))
             }
+            PortablePlan::BoundedByteClassRepeat(plan) => {
+                let (matched, accounting) = plan.find_window(haystack, window, limits)?;
+                Ok((matched, SearchAccounting::PureByteClassRepeat(accounting)))
+            }
             PortablePlan::ForwardAnchored(forward) => {
                 let literal_window = LiteralWindow::new(window.start(), window.end());
                 let (matched, accounting) = forward.find_window(
@@ -4916,6 +5243,17 @@ impl PortableRegex {
                 let (matched, accounting) = plan.find_window(haystack, window, limits)?;
                 Ok((matched, SearchAccounting::UnicodeWordRun(accounting)))
             }
+            PortablePlan::FixedPredicateWord64(plan) => {
+                let (matched, accounting) = plan.find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    fixed_predicate_word64_search_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    SearchAccounting::FixedPredicateWord64(accounting),
+                ))
+            }
         }
     }
 
@@ -4928,6 +5266,10 @@ impl PortableRegex {
     /// # Errors
     ///
     /// Returns [`SearchError`] for an invalid window or a resource refusal.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "each native owner retains its direct value-only span projection"
+    )]
     pub fn find_window_value(
         &self,
         haystack: &[u8],
@@ -4935,9 +5277,105 @@ impl PortableRegex {
         limits: SearchLimits,
     ) -> Result<Option<Match>, SearchError> {
         match &self.plan {
+            PortablePlan::ExactLiteral(literal) => literal
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    literal_limits(limits),
+                )
+                .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
+            PortablePlan::PackedLiteralSet(literal_set) => literal_set
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    packed_literal_set_limits(limits),
+                )
+                .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
+            PortablePlan::LiteralSetDfa(literal_set) => literal_set
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    literal_set_limits(limits),
+                )
+                .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
+            PortablePlan::RequiredLiteral(required) => required
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    required_literal_limits(limits),
+                )
+                .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
+            PortablePlan::DispatchedRequiredLiteral(required) => required
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    required_literal_limits(limits),
+                )
+                .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
+            PortablePlan::BoundedRequiredLiteral(required) => required
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    required_literal_limits(limits),
+                )
+                .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
+            PortablePlan::DispatchedBoundedRequiredLiteral(required) => required
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    required_literal_limits(limits),
+                )
+                .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
+            PortablePlan::LiteralClassRunLiteral(plan) => plan
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    literal_class_run_literal_limits(limits),
+                )
+                .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
+            PortablePlan::LiteralClassRunSearch(plan) => plan
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    literal_class_run_literal_limits(limits),
+                )
+                .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
             PortablePlan::PureByteClassRepeat(plan) => plan
                 .find_window(haystack, window, limits)
                 .map(|(matched, _)| matched)
+                .map_err(SearchError::from),
+            PortablePlan::ForwardAnchored(forward) => forward
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    forward_anchored_limits(limits),
+                )
+                .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
+            PortablePlan::DispatchedForwardAnchored(forward) => forward
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    forward_anchored_limits(limits),
+                )
+                .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
+            PortablePlan::ForwardEndFixed(fixed) => fixed
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    forward_anchored_limits(limits),
+                )
+                .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
                 .map_err(SearchError::from),
             PortablePlan::K0(automaton) => automaton
                 .prepare::<Span>()
@@ -4949,9 +5387,53 @@ impl PortableRegex {
                     })
                 })
                 .map_err(SearchError::from),
-            _ => self
+            PortablePlan::UnicodeFoldedLiteral(plan) => plan
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    unicode_folded_literal_limits(limits),
+                )
+                .map(|(matched, _)| {
+                    matched.map(|candidate| Match {
+                        start: candidate.start(),
+                        end: candidate.end(),
+                    })
+                })
+                .map_err(SearchError::from),
+            PortablePlan::UnicodeWordRun(plan) => plan
                 .find_window(haystack, window, limits)
-                .map(|(matched, _)| matched),
+                .map(|(matched, _)| matched)
+                .map_err(SearchError::from),
+            PortablePlan::AsciiWordRun(plan) => plan
+                .find_window(haystack, window, limits)
+                .map(|(matched, _)| matched)
+                .map_err(SearchError::from),
+            PortablePlan::BoundedWordClass(plan) => plan
+                .find_window(haystack, window, limits)
+                .map(|(matched, _)| matched)
+                .map_err(SearchError::from),
+            PortablePlan::BoundedByteClassRepeat(plan) => plan
+                .find_window(haystack, window, limits)
+                .map(|(matched, _)| matched)
+                .map_err(SearchError::from),
+            PortablePlan::FixedPredicateWord64(plan) => plan
+                .find_window_value(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    fixed_predicate_word64_search_limits(limits),
+                )
+                .map(|matched| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
+        }
+    }
+
+    fn fixed_predicate_search_cursor<'r, 'h>(
+        &'r self,
+        haystack: &'h [u8],
+    ) -> Option<FixedPredicateWord64SearchCursor<'r, 'h>> {
+        match &self.plan {
+            PortablePlan::FixedPredicateWord64(plan) => Some(plan.search_cursor(haystack)),
+            _ => None,
         }
     }
 
@@ -4992,72 +5474,59 @@ impl PortableRegex {
                 ))
             }
             PortablePlan::RequiredLiteral(required) => {
-                let (matched, accounting) = required.find_window(
-                    haystack,
-                    window,
-                    required_literal_limits(limits),
-                )?;
+                let (matched, accounting) =
+                    required.find_window(haystack, window, required_literal_limits(limits))?;
                 Ok((
                     matched.map(|(start, end)| Match { start, end }),
                     accounting.work_upper_bound,
                 ))
             }
             PortablePlan::DispatchedRequiredLiteral(required) => {
-                let (matched, accounting) = required.find_window(
-                    haystack,
-                    window,
-                    required_literal_limits(limits),
-                )?;
+                let (matched, accounting) =
+                    required.find_window(haystack, window, required_literal_limits(limits))?;
                 Ok((
                     matched.map(|(start, end)| Match { start, end }),
                     accounting.work_upper_bound,
                 ))
             }
             PortablePlan::BoundedRequiredLiteral(required) => {
-                let (matched, accounting) = required.find_window(
-                    haystack,
-                    window,
-                    required_literal_limits(limits),
-                )?;
+                let (matched, accounting) =
+                    required.find_window(haystack, window, required_literal_limits(limits))?;
                 Ok((
                     matched.map(|(start, end)| Match { start, end }),
                     accounting.work_upper_bound,
                 ))
             }
             PortablePlan::DispatchedBoundedRequiredLiteral(required) => {
-                let (matched, accounting) = required.find_window(
-                    haystack,
-                    window,
-                    required_literal_limits(limits),
-                )?;
+                let (matched, accounting) =
+                    required.find_window(haystack, window, required_literal_limits(limits))?;
                 Ok((
                     matched.map(|(start, end)| Match { start, end }),
                     accounting.work_upper_bound,
                 ))
             }
             PortablePlan::LiteralClassRunLiteral(plan) => {
-                let (matched, accounting) = plan.find_window(
-                    haystack,
-                    window,
-                    literal_class_run_literal_limits(limits),
-                )?;
+                let (matched, accounting) =
+                    plan.find_window(haystack, window, literal_class_run_literal_limits(limits))?;
                 Ok((
                     matched.map(|(start, end)| Match { start, end }),
                     accounting.work_upper_bound,
                 ))
             }
             PortablePlan::LiteralClassRunSearch(plan) => {
-                let (matched, accounting) = plan.find_window(
-                    haystack,
-                    window,
-                    literal_class_run_literal_limits(limits),
-                )?;
+                let (matched, accounting) =
+                    plan.find_window(haystack, window, literal_class_run_literal_limits(limits))?;
                 Ok((
                     matched.map(|(start, end)| Match { start, end }),
                     accounting.work_upper_bound,
                 ))
             }
             PortablePlan::PureByteClassRepeat(plan) => {
+                let (matched, accounting) =
+                    plan.find_window(haystack, SearchWindow::new(start, haystack.len()), limits)?;
+                Ok((matched, accounting.actual_work))
+            }
+            PortablePlan::BoundedByteClassRepeat(plan) => {
                 let (matched, accounting) =
                     plan.find_window(haystack, SearchWindow::new(start, haystack.len()), limits)?;
                 Ok((matched, accounting.actual_work))
@@ -5087,11 +5556,8 @@ impl PortableRegex {
                 ))
             }
             PortablePlan::UnicodeFoldedLiteral(plan) => {
-                let (matched, accounting) = plan.find_window(
-                    haystack,
-                    window,
-                    unicode_folded_literal_limits(limits),
-                )?;
+                let (matched, accounting) =
+                    plan.find_window(haystack, window, unicode_folded_literal_limits(limits))?;
                 Ok((
                     matched.map(|candidate| Match {
                         start: candidate.start(),
@@ -5114,6 +5580,17 @@ impl PortableRegex {
                 let (matched, accounting) =
                     plan.find_window(haystack, SearchWindow::new(start, haystack.len()), limits)?;
                 Ok((matched, accounting.work()))
+            }
+            PortablePlan::FixedPredicateWord64(plan) => {
+                let (matched, accounting) = plan.find_window(
+                    haystack,
+                    LiteralWindow::new(start, haystack.len()),
+                    fixed_predicate_word64_search_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    accounting.actual.work,
+                ))
             }
             PortablePlan::K0(_) => {
                 let (matched, accounting) =
@@ -5600,9 +6077,9 @@ impl<'r> PortableSearchSession<'r> {
         limits: SearchLimits,
     ) -> Result<Option<Match>, SearchError> {
         match &mut self.plan {
-            PortableSearchSessionPlan::Native(regex) => regex
-                .find_window(haystack, window, limits)
-                .map(|(matched, _)| matched),
+            PortableSearchSessionPlan::Native(regex) => {
+                regex.find_window_value(haystack, window, limits)
+            }
             PortableSearchSessionPlan::K0 { session } => session
                 .search_window::<Span>(haystack, window, limits)
                 .map(|report| {
@@ -5651,22 +6128,42 @@ impl<'r> PortableSearchSession<'r> {
         limits: PortableFindIterRunLimits,
         empty_match_progress: EmptyMatchProgress,
     ) -> PortableSessionMatches<'s, 'r, 'h> {
+        let fixed_predicate_cursor = self.fixed_predicate_search_cursor(haystack);
         PortableSessionMatches {
             session: self,
-            state: PortableMatchIterState::new(haystack, limits, empty_match_progress),
+            state: PortableMatchIterState::new(
+                haystack,
+                limits,
+                empty_match_progress,
+                fixed_predicate_cursor,
+            ),
+        }
+    }
+
+    fn fixed_predicate_search_cursor<'h>(
+        &self,
+        haystack: &'h [u8],
+    ) -> Option<FixedPredicateWord64SearchCursor<'r, 'h>> {
+        match &self.plan {
+            PortableSearchSessionPlan::Native(regex) => {
+                regex.fixed_predicate_search_cursor(haystack)
+            }
+            PortableSearchSessionPlan::K0 { .. } => None,
         }
     }
 
     fn find_iter_at(
         &mut self,
-        haystack: &[u8],
+        source: &mut K0SpanSourceCursor<'_>,
         start: usize,
         limits: SearchLimits,
     ) -> Result<(Option<Match>, u64), SearchError> {
         match &mut self.plan {
-            PortableSearchSessionPlan::Native(regex) => regex.find_iter_at(haystack, start, limits),
+            PortableSearchSessionPlan::Native(regex) => {
+                regex.find_iter_at(source.haystack(), start, limits)
+            }
             PortableSearchSessionPlan::K0 { session } => {
-                let report = session.search_span_at_cursor(haystack, start, limits)?;
+                let report = session.search_span_at_source_cursor(source, start, limits)?;
                 let work = report.accounting().work();
                 let matched = report.into_output().map(|span| Match {
                     start: span.start(),
@@ -5687,7 +6184,7 @@ impl<'r> PortableSearchSession<'r> {
 #[derive(Debug)]
 pub struct PortableMatches<'r, 'h> {
     session: PortableSearchSession<'r>,
-    state: PortableMatchIterState<'h>,
+    state: PortableMatchIterState<'r, 'h>,
 }
 
 /// Fallible byte-match iterator borrowing an existing search session.
@@ -5699,12 +6196,21 @@ pub struct PortableMatches<'r, 'h> {
 #[derive(Debug)]
 pub struct PortableSessionMatches<'s, 'r, 'h> {
     session: &'s mut PortableSearchSession<'r>,
-    state: PortableMatchIterState<'h>,
+    state: PortableMatchIterState<'r, 'h>,
 }
 
 #[derive(Debug)]
-struct PortableMatchIterState<'h> {
-    haystack: &'h [u8],
+enum PortableMatchIterState<'r, 'h> {
+    General(PortableMatchIterCore<'h>),
+    FixedPredicate {
+        core: PortableMatchIterCore<'h>,
+        cursor: FixedPredicateWord64SearchCursor<'r, 'h>,
+    },
+}
+
+#[derive(Debug)]
+struct PortableMatchIterCore<'h> {
+    k0_source: K0SpanSourceCursor<'h>,
     limits: PortableFindIterRunLimits,
     empty_match_progress: EmptyMatchProgress,
     start: usize,
@@ -5720,14 +6226,14 @@ enum EmptyMatchProgress {
     Utf8Scalar,
 }
 
-impl<'h> PortableMatchIterState<'h> {
+impl<'h> PortableMatchIterCore<'h> {
     const fn new(
         haystack: &'h [u8],
         limits: PortableFindIterRunLimits,
         empty_match_progress: EmptyMatchProgress,
     ) -> Self {
         Self {
-            haystack,
+            k0_source: K0SpanSourceCursor::new(haystack),
             limits,
             empty_match_progress,
             start: 0,
@@ -5743,6 +6249,10 @@ impl<'h> PortableMatchIterState<'h> {
             },
             finished: false,
         }
+    }
+
+    const fn haystack(&self) -> &'h [u8] {
+        self.k0_source.haystack()
     }
 
     fn fail(&mut self, error: PortableFindIterError) -> Result<Match, PortableFindIterError> {
@@ -5811,7 +6321,7 @@ impl<'h> PortableMatchIterState<'h> {
                 counter: "suppressed-empty",
             },
         )?;
-        if self.start == self.haystack.len() {
+        if self.start == self.haystack().len() {
             self.finished = true;
             return Ok(true);
         }
@@ -5826,7 +6336,7 @@ impl<'h> PortableMatchIterState<'h> {
                 let mut next = self.start.saturating_add(1);
                 let mut byte_probes = 0_u64;
                 let mut progress_work = 1_u64;
-                while next < self.haystack.len() {
+                while next < self.haystack().len() {
                     byte_probes = byte_probes.checked_add(1).ok_or(
                         PortableFindIterError::AccountingOverflow {
                             counter: "utf8-progress-byte-probe",
@@ -5837,7 +6347,7 @@ impl<'h> PortableMatchIterState<'h> {
                             counter: "utf8-progress-work",
                         },
                     )?;
-                    if (self.haystack[next] & 0b1100_0000) != 0b1000_0000 {
+                    if (self.haystack()[next] & 0b1100_0000) != 0b1000_0000 {
                         break;
                     }
                     progress_work = progress_work.checked_add(1).ok_or(
@@ -5866,9 +6376,13 @@ impl<'h> PortableMatchIterState<'h> {
         self.advance_past_repeated_empty()
     }
 
-    fn next_match(
+    fn next_match_with(
         &mut self,
-        session: &mut PortableSearchSession<'_>,
+        mut search: impl FnMut(
+            &mut K0SpanSourceCursor<'h>,
+            usize,
+            SearchLimits,
+        ) -> Result<(Option<Match>, u64), SearchError>,
     ) -> Option<Result<Match, PortableFindIterError>> {
         while !self.finished {
             match self.advance_pending_empty() {
@@ -5879,7 +6393,7 @@ impl<'h> PortableMatchIterState<'h> {
             if let Err(error) = self.begin_search() {
                 return Some(self.fail(error));
             }
-            let searched = session.find_iter_at(self.haystack, self.start, self.limits.search);
+            let searched = search(&mut self.k0_source, self.start, self.limits.search);
             let (matched, search_work) = match searched {
                 Ok(result) => result,
                 Err(error) => return Some(self.fail(PortableFindIterError::Search(error))),
@@ -5915,11 +6429,74 @@ impl<'h> PortableMatchIterState<'h> {
     }
 }
 
+impl<'r, 'h> PortableMatchIterState<'r, 'h> {
+    const fn new(
+        haystack: &'h [u8],
+        limits: PortableFindIterRunLimits,
+        empty_match_progress: EmptyMatchProgress,
+        fixed_predicate_cursor: Option<FixedPredicateWord64SearchCursor<'r, 'h>>,
+    ) -> Self {
+        let core = PortableMatchIterCore::new(haystack, limits, empty_match_progress);
+        match fixed_predicate_cursor {
+            Some(cursor) => Self::FixedPredicate { core, cursor },
+            None => Self::General(core),
+        }
+    }
+
+    const fn core(&self) -> &PortableMatchIterCore<'h> {
+        match self {
+            Self::General(core) | Self::FixedPredicate { core, .. } => core,
+        }
+    }
+
+    #[cfg(test)]
+    fn core_mut(&mut self) -> &mut PortableMatchIterCore<'h> {
+        match self {
+            Self::General(core) | Self::FixedPredicate { core, .. } => core,
+        }
+    }
+
+    const fn haystack(&self) -> &'h [u8] {
+        self.core().haystack()
+    }
+
+    const fn accounting(&self) -> PortableFindIterAccounting {
+        self.core().accounting
+    }
+
+    #[cfg(test)]
+    const fn is_fixed_predicate(&self) -> bool {
+        matches!(self, Self::FixedPredicate { .. })
+    }
+
+    fn next_match(
+        &mut self,
+        session: &mut PortableSearchSession<'r>,
+    ) -> Option<Result<Match, PortableFindIterError>> {
+        match self {
+            Self::General(core) => core.next_match_with(|source, start, limits| {
+                session.find_iter_at(source, start, limits)
+            }),
+            Self::FixedPredicate { core, cursor } => {
+                core.next_match_with(|_source, start, limits| {
+                    let (matched, accounting) = cursor
+                        .find_at(start, fixed_predicate_word64_search_limits(limits))
+                        .map_err(SearchError::from)?;
+                    Ok((
+                        matched.map(|(start, end)| Match { start, end }),
+                        accounting.actual.work,
+                    ))
+                })
+            }
+        }
+    }
+}
+
 impl PortableMatches<'_, '_> {
     /// Exact counters accumulated through the most recent iterator action.
     #[must_use]
     pub const fn accounting(&self) -> PortableFindIterAccounting {
-        self.state.accounting
+        self.state.accounting()
     }
 
     /// One-time K0 workspace setup facts, or `None` for native plans.
@@ -5946,7 +6523,7 @@ impl PortableSessionMatches<'_, '_, '_> {
     /// already searched other haystacks.
     #[must_use]
     pub const fn accounting(&self) -> PortableFindIterAccounting {
-        self.state.accounting
+        self.state.accounting()
     }
 
     /// The reused session's one-time K0 setup facts.
@@ -5997,7 +6574,7 @@ impl<'h> Iterator for PortableByteMatches<'_, 'h> {
     type Item = Result<ByteMatch<'h>, PortableFindIterError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let haystack = self.inner.state.haystack;
+        let haystack = self.inner.state.haystack();
         self.inner
             .next()
             .map(|result| result.map(|span| ByteMatch { haystack, span }))
@@ -6099,13 +6676,22 @@ fn unicode_folded_literal_limits(limits: SearchLimits) -> FoldedLiteralTrieScanL
     }
 }
 
+fn fixed_predicate_word64_search_limits(limits: SearchLimits) -> FixedPredicateWord64SearchLimits {
+    FixedPredicateWord64SearchLimits {
+        max_work: limits.max_work,
+        max_scratch_bytes: limits.max_scratch_bytes,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        BuildError, BuildLimits, CaptureFreeOperation, PlanKind, PlanSelection, PortableBuilder,
-        PortableFindIterAccounting, PortableFindIterError, PortableFindIterLimits, PortablePlan,
-        PortableRegex, SearchAccounting, SearchError, SearchLimits, SearchWindow,
+        BuildError, BuildLimits, CaptureFreeOperation, Match, PlanKind, PlanSelection,
+        PortableBuilder, PortableFindIterAccounting, PortableFindIterError, PortableFindIterLimits,
+        PortableFindIterRunLimits, PortablePlan, PortableRegex, SearchAccounting, SearchError,
+        SearchLimits, SearchSessionLimits, SearchWindow,
     };
+    use fre_kernels::FixedPredicateWord64SearchCursor;
     use fre_lower::UnsupportedFeature;
     use std::fmt::Write as _;
 
@@ -6116,44 +6702,44 @@ mod tests {
             .find_iter_utf8("é", PortableFindIterLimits::unlimited())
             .unwrap();
 
-        iterator.state.accounting = PortableFindIterAccounting {
+        iterator.state.core_mut().accounting = PortableFindIterAccounting {
             work_or_linear_terms: u64::MAX,
             ..PortableFindIterAccounting::default()
         };
-        let before = iterator.state.accounting;
+        let before = iterator.state.accounting();
         assert_eq!(
-            iterator.state.record_utf8_progress(1, 1),
+            iterator.state.core_mut().record_utf8_progress(1, 1),
             Err(PortableFindIterError::AccountingOverflow {
                 counter: "utf8-progress-work",
             })
         );
-        assert_eq!(iterator.state.accounting, before);
+        assert_eq!(iterator.state.accounting(), before);
 
-        iterator.state.accounting = PortableFindIterAccounting {
+        iterator.state.core_mut().accounting = PortableFindIterAccounting {
             utf8_progress_work: u64::MAX,
             ..PortableFindIterAccounting::default()
         };
-        let before = iterator.state.accounting;
+        let before = iterator.state.accounting();
         assert_eq!(
-            iterator.state.record_utf8_progress(1, 1),
+            iterator.state.core_mut().record_utf8_progress(1, 1),
             Err(PortableFindIterError::AccountingOverflow {
                 counter: "utf8-progress-work",
             })
         );
-        assert_eq!(iterator.state.accounting, before);
+        assert_eq!(iterator.state.accounting(), before);
 
-        iterator.state.accounting = PortableFindIterAccounting {
+        iterator.state.core_mut().accounting = PortableFindIterAccounting {
             utf8_progress_byte_probes: u64::MAX,
             ..PortableFindIterAccounting::default()
         };
-        let before = iterator.state.accounting;
+        let before = iterator.state.accounting();
         assert_eq!(
-            iterator.state.record_utf8_progress(1, 1),
+            iterator.state.core_mut().record_utf8_progress(1, 1),
             Err(PortableFindIterError::AccountingOverflow {
                 counter: "utf8-progress-byte-probe",
             })
         );
-        assert_eq!(iterator.state.accounting, before);
+        assert_eq!(iterator.state.accounting(), before);
     }
 
     #[test]
@@ -6305,6 +6891,33 @@ mod tests {
     }
 
     #[test]
+    fn fixed_predicate_iterator_cursor_has_a_bounded_inline_layout() {
+        let word = core::mem::size_of::<usize>();
+        let cursor = core::mem::size_of::<FixedPredicateWord64SearchCursor<'static, 'static>>();
+        let state = core::mem::size_of::<super::PortableMatchIterState<'static, 'static>>();
+        let general = core::mem::size_of::<super::PortableMatchIterCore<'static>>();
+        let source_cursor = core::mem::size_of::<fre_automata::K0SpanSourceCursor<'static>>();
+
+        assert_eq!(
+            core::mem::align_of::<FixedPredicateWord64SearchCursor<'static, 'static>>(),
+            core::mem::align_of::<usize>()
+        );
+        assert!(cursor <= 10 * word, "cursor grew to {cursor} bytes");
+        assert!(
+            state >= cursor + source_cursor,
+            "fixed iterator variant lost one of its two independent source cursors"
+        );
+        assert!(
+            general < state,
+            "general iterator payload retained the fixed cursor"
+        );
+        assert!(
+            state <= 32 * word,
+            "iterator state grew beyond its inline 32-word envelope: {state} bytes"
+        );
+    }
+
+    #[test]
     fn packed_ineligibility_is_resolved_before_selecting_the_dfa() {
         let limits = BuildLimits {
             packed_literal_set: fre_kernels::PackedLiteralSetBuildLimits {
@@ -6328,7 +6941,7 @@ mod tests {
     }
 
     #[test]
-    fn finite_enumeration_cap_falls_back_before_cross_product_growth() {
+    fn finite_enumeration_cap_routes_fixed_product_before_k0_growth() {
         let limits = BuildLimits {
             literal_set: fre_kernels::LiteralSetBuildLimits {
                 max_patterns: 4,
@@ -6341,11 +6954,104 @@ mod tests {
             .limits(limits)
             .build()
             .unwrap();
-        assert_eq!(fre.build_report().plan, PlanKind::K0);
-        let (matched, _) = fre.find(b"xxbcf", SearchLimits::unlimited()).unwrap();
+        assert_eq!(fre.build_report().plan, PlanKind::FixedPredicateWord64);
+        let (matched, accounting) = fre.find(b"xxbcf", SearchLimits::unlimited()).unwrap();
         assert_eq!(
             matched.map(|matched| (matched.start(), matched.end())),
             Some((2, 5))
+        );
+        assert!(matches!(
+            accounting,
+            SearchAccounting::FixedPredicateWord64(_)
+        ));
+    }
+
+    #[test]
+    fn fixed_predicate_iterators_retain_candidates_and_reset_after_early_drop() {
+        let limits = BuildLimits {
+            literal_set: fre_kernels::LiteralSetBuildLimits {
+                max_patterns: 4,
+                ..fre_kernels::LiteralSetBuildLimits::default()
+            },
+            ..BuildLimits::default()
+        };
+        let regex = PortableBuilder::new(r"[A-D][\x00-\x7F]Q")
+            .unicode(false)
+            .limits(limits)
+            .build()
+            .unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::FixedPredicateWord64);
+
+        let mut haystack = Vec::new();
+        for _ in 0..8 {
+            haystack.extend_from_slice(&[b'A', 0xff, b'Q']);
+        }
+        for _ in 0..64 {
+            haystack.extend_from_slice(b"A!Q");
+        }
+        let expected_first = Match { start: 24, end: 27 };
+
+        let mut early = regex
+            .find_iter(&haystack, PortableFindIterLimits::unlimited())
+            .unwrap();
+        assert!(early.state.is_fixed_predicate());
+        assert_eq!(early.next().unwrap().unwrap(), expected_first);
+        drop(early);
+        let mut restarted = regex
+            .find_iter(&haystack, PortableFindIterLimits::unlimited())
+            .unwrap();
+        assert!(restarted.state.is_fixed_predicate());
+        assert_eq!(restarted.next().unwrap().unwrap(), expected_first);
+        assert_eq!(restarted.count(), 63);
+
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        let mut session_matches =
+            session.find_iter(&haystack, PortableFindIterRunLimits::unlimited());
+        assert!(session_matches.state.is_fixed_predicate());
+        let matches = session_matches
+            .by_ref()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        drop(session_matches);
+        assert_eq!(matches.len(), 64);
+        assert_eq!(matches[0], expected_first);
+        assert!(
+            matches
+                .windows(2)
+                .all(|pair| pair[0].end() == pair[1].start())
+        );
+
+        let exact = PortableBuilder::new("literal")
+            .unicode(false)
+            .build()
+            .unwrap();
+        let exact_iter = exact
+            .find_iter(b"literal", PortableFindIterLimits::unlimited())
+            .unwrap();
+        assert!(!exact_iter.state.is_fixed_predicate());
+    }
+
+    #[test]
+    fn fixed_predicate_construction_failure_checks_receipt_closure_before_divergence() {
+        let source = include_str!("lib.rs");
+        let start = source
+            .find("let attempt = match FixedPredicateWord64Plan::build_attempt(")
+            .expect("fixed-predicate construction match remains explicit");
+        let end = source[start..]
+            .find("if !attempt.closes()")
+            .expect("successful construction closure check remains explicit");
+        let construction_match = &source[start..start + end];
+        assert!(construction_match.contains("Err(error) =>"));
+        assert!(construction_match.contains("if !error.closes()"));
+        assert!(
+            construction_match
+                .contains("fixed-predicate search construction failure lost its attempt closure")
+        );
+        assert!(
+            construction_match
+                .contains("inspected fixed-predicate search source failed kernel construction")
         );
     }
 
@@ -6379,6 +7085,110 @@ mod tests {
             panic!("date shape should report K0 accounting");
         };
         assert!(accounting.boundaries() < 32);
+    }
+
+    #[test]
+    fn forced_k0_root_run_scanner_mismatches_fall_back_to_ordinary_iteration() {
+        let cases: [(&str, &[u8]); 5] = [
+            ("a+", b"aa--a--aaaa"),
+            ("[ab]{2,4}", b"abba--aa--bbbb"),
+            ("[abc]{2}", b"ab--ca--bc"),
+            ("[a-z]{2}", b"ab--cd--ef"),
+            ("[0-9]+?", b"12--3--456"),
+        ];
+
+        for (pattern, haystack) in cases {
+            let fre = PortableBuilder::new(pattern)
+                .unicode(false)
+                .plan_selection(PlanSelection::ForceK0)
+                .build()
+                .unwrap();
+            assert_eq!(fre.build_report().plan, PlanKind::K0);
+            let upstream = regex::bytes::RegexBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            let expected: Vec<_> = upstream
+                .find_iter(haystack)
+                .map(|matched| (matched.start(), matched.end()))
+                .collect();
+            let mut session = fre
+                .search_session(super::SearchSessionLimits::unlimited())
+                .unwrap();
+            let actual: Result<Vec<_>, _> = session
+                .find_iter(haystack, PortableFindIterRunLimits::unlimited())
+                .map(|matched| matched.map(|matched| (matched.start(), matched.end())))
+                .collect();
+            assert_eq!(actual.unwrap(), expected, "pattern={pattern}");
+        }
+    }
+
+    #[test]
+    fn forced_k0_root_run_iterator_reuses_source_bound_masks_and_releases_them_on_drop() {
+        let fre = PortableBuilder::new("[aceg]{2}")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .unwrap();
+        assert_eq!(fre.build_report().plan, PlanKind::K0);
+        let mut session = fre
+            .search_session(super::SearchSessionLimits::unlimited())
+            .unwrap();
+        let dense = b"acegacegacegacegacegacegacegacegacegacegacegacegacegacegacegaceg";
+        let expected: Vec<_> = (0..dense.len())
+            .step_by(2)
+            .map(|start| (start, start.checked_add(2).unwrap()))
+            .collect();
+
+        let fresh: Result<Vec<_>, _> = fre
+            .find_iter(dense, PortableFindIterLimits::unlimited())
+            .unwrap()
+            .map(|matched| matched.map(|matched| (matched.start(), matched.end())))
+            .collect();
+        assert_eq!(fresh.unwrap(), expected);
+
+        {
+            let mut matches = session.find_iter(dense, PortableFindIterRunLimits::unlimited());
+            let first = matches.next().unwrap().unwrap();
+            assert_eq!((first.start(), first.end()), (0, 2));
+            let second = matches.next().unwrap().unwrap();
+            assert_eq!((second.start(), second.end()), (2, 4));
+            let third = matches.next().unwrap().unwrap();
+            assert_eq!((third.start(), third.end()), (4, 6));
+            let activated_work = matches.accounting().work_or_linear_terms;
+            let fourth = matches.next().unwrap().unwrap();
+            assert_eq!((fourth.start(), fourth.end()), (6, 8));
+            assert_eq!(
+                matches
+                    .accounting()
+                    .work_or_linear_terms
+                    .checked_sub(activated_work)
+                    .unwrap(),
+                3,
+                "a retained qualified-start mask needs only the K0 invocation reset"
+            );
+            // End the iterator borrow early; the next block must start with
+            // fresh source-bound cursors while retaining the session itself.
+        }
+
+        let restarted: Result<Vec<_>, _> = session
+            .find_iter(dense, PortableFindIterRunLimits::unlimited())
+            .map(|matched| matched.map(|matched| (matched.start(), matched.end())))
+            .collect();
+        assert_eq!(
+            restarted.unwrap(),
+            expected,
+            "a new non-fixed K0 iterator must start with fresh source cursors after early drop"
+        );
+
+        assert_eq!(
+            session
+                .find(b"zzaceg", SearchLimits::unlimited())
+                .unwrap()
+                .0
+                .map(|matched| (matched.start(), matched.end())),
+            Some((2, 4))
+        );
     }
 
     #[test]

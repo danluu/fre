@@ -2160,7 +2160,6 @@ fn run_look_case_observer_inner(
     case: LookCaseSpec,
     execute_local_upstream: bool,
 ) -> Result<Vec<RegexAutomataAssertionExecution>, String> {
-    const MAX_WORK: u64 = 18;
     const MAX_SCRATCH_BYTES: usize = 8 * 1024 * 1024;
 
     validate_look_case_spec(case).map_err(|error| format!("look-case-contract:{error}"))?;
@@ -2170,16 +2169,19 @@ fn run_look_case_observer_inner(
         LookKind::StartText => Look::Start,
         LookKind::EndText => Look::End,
     };
-    let fre = PortableBuilder::new(case.pattern)
-        .profile(RustProfile::rebar_1_12_4())
-        .unicode(false)
-        .plan_selection(PlanSelection::ForceK0)
-        .build()
-        .map_err(|error| format!("look-fre-build:{error}"))?;
-    validate_look_fre_plan(&fre)?;
-
     let mut executions = Vec::with_capacity(case.vectors.len());
     for vector in case.vectors {
+        // Keep every vector's cold publication independent. A K0 plan owns
+        // one immutable start proof after its first successful search, so
+        // sharing the plan across vectors would silently mix cold and warm
+        // accounting according to vector order.
+        let fre = PortableBuilder::new(case.pattern)
+            .profile(RustProfile::rebar_1_12_4())
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .map_err(|error| format!("look-fre-build:{error}"))?;
+        validate_look_fre_plan(&fre)?;
         let haystack = vector.haystack.as_bytes();
         // The package-default registry executes its in-process upstream
         // matcher. For another Cargo mode, the separately authenticated exact
@@ -2190,42 +2192,93 @@ fn run_look_case_observer_inner(
         } else {
             vector.expected
         };
+        let (cold_matched, cold_accounting) = fre
+            .find_window(
+                haystack,
+                SearchWindow::new(vector.at, vector.at),
+                SearchLimits {
+                    max_work: u64::MAX,
+                    max_scratch_bytes: MAX_SCRATCH_BYTES,
+                },
+            )
+            .map_err(|error| format!("look-fre-cold-search:{error}"))?;
         let (matched, accounting) = fre
             .find_window(
                 haystack,
                 SearchWindow::new(vector.at, vector.at),
                 SearchLimits {
-                    max_work: MAX_WORK,
+                    max_work: if vector.expected { 18 } else { 17 },
                     max_scratch_bytes: MAX_SCRATCH_BYTES,
                 },
             )
-            .map_err(|error| format!("look-fre-search:{error}"))?;
+            .map_err(|error| format!("look-fre-warm-search:{error}"))?;
+        let cold_span = cold_matched.map(|matched| (matched.start(), matched.end()));
         let observed_span = matched.map(|matched| (matched.start(), matched.end()));
         let expected_span = vector.expected.then_some((vector.at, vector.at));
         let observed = observed_span.is_some();
-        let (expected_work, expected_transition_work) =
-            if vector.expected { (18, 4) } else { (17, 3) };
         let expected_initialized_bytes = if usize::BITS == 64 { 96 } else { 56 };
-        let exact_accounting = matches!(
-            accounting,
-            SearchAccounting::K0(accounting)
-                if accounting.work() == expected_work
-                    && accounting.setup_work() == 14
-                    && accounting.transition_work() == expected_transition_work
-                    && accounting.scratch_bytes() <= MAX_SCRATCH_BYTES
-                    && accounting.boundaries() == 1
-                    && !accounting.setup().reused()
-                    && accounting.setup().allocated_bytes()
+        let (SearchAccounting::K0(cold_accounting), SearchAccounting::K0(accounting)) =
+            (cold_accounting, accounting)
+        else {
+            return Err("look-non-k0-accounting".to_owned());
+        };
+        let proof_bytes = cold_accounting
+            .setup()
+            .allocated_bytes()
+            .checked_sub(accounting.setup().allocated_bytes());
+        let transition_work_delta = cold_accounting
+            .transition_work()
+            .checked_sub(accounting.transition_work());
+        let exact_cold_accounting = proof_bytes.zip(transition_work_delta).is_some_and(
+            |(proof_bytes, transition_work_delta)| {
+                proof_bytes > 0
+                    && cold_accounting.setup_work() == accounting.setup_work() + 1
+                    && cold_accounting.work().checked_sub(accounting.work())
+                        == 1_u64.checked_add(transition_work_delta)
+                    && cold_accounting.boundaries() == accounting.boundaries()
+                    && !cold_accounting.setup().reused()
+                    && cold_accounting.setup().retained_bytes()
                         == accounting.setup().retained_bytes()
-                    && accounting.setup().retained_bytes() == accounting.scratch_bytes()
-                    && accounting.setup().initialized_bytes() == expected_initialized_bytes
+                    && cold_accounting
+                        .setup()
+                        .initialized_bytes()
+                        .checked_sub(accounting.setup().initialized_bytes())
+                        == Some(proof_bytes)
+                    && cold_accounting
+                        .scratch_bytes()
+                        .checked_sub(accounting.scratch_bytes())
+                        == Some(proof_bytes)
+                    && cold_accounting.scratch_bytes() <= MAX_SCRATCH_BYTES
+            },
         );
-        if !exact_accounting
+        let expected_transition_work = match (accounting.boundaries(), vector.expected) {
+            (0, _) => 0,
+            (1, true) => 4,
+            (1, false) => 3,
+            _ => u64::MAX,
+        };
+        let expected_work = 14_u64
+            .checked_add(expected_transition_work)
+            .unwrap_or(u64::MAX);
+        let exact_warm_accounting = accounting.work() == expected_work
+            && accounting.setup_work() == 14
+            && accounting.transition_work() == expected_transition_work
+            && accounting.scratch_bytes() <= MAX_SCRATCH_BYTES
+            && !accounting.setup().reused()
+            && accounting.setup().allocated_bytes() == accounting.setup().retained_bytes()
+            && accounting.setup().retained_bytes() == accounting.scratch_bytes()
+            && accounting.setup().initialized_bytes() == expected_initialized_bytes;
+        if !exact_cold_accounting
+            || !exact_warm_accounting
             || upstream != vector.expected
+            || cold_span != expected_span
             || observed_span != expected_span
             || observed != vector.expected
         {
-            return Err("look-triple-agreement-mismatch".to_owned());
+            return Err(format!(
+                "look-triple-agreement-mismatch:{}:cold={cold_accounting:?}:warm={accounting:?}",
+                vector.assertion_id
+            ));
         }
         executions.push(RegexAutomataAssertionExecution {
             assertion_id: vector.assertion_id.to_owned(),
@@ -4889,6 +4942,7 @@ fn gain_vectors(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fre::{K0SearchError, SearchError};
 
     fn candidate(revision: char, tree: char) -> CandidateIdentity {
         CandidateIdentity {
@@ -6095,33 +6149,97 @@ mod tests {
 
     #[test]
     fn look_k0_true_boundary_requires_the_exact_finite_work_limit() {
-        let fre = PortableBuilder::new(LOOK_START_TEXT.pattern)
-            .profile(RustProfile::rebar_1_12_4())
-            .unicode(false)
-            .plan_selection(PlanSelection::ForceK0)
-            .build()
-            .unwrap();
-        validate_look_fre_plan(&fre).unwrap();
+        const EXPECTED_MINIMUM_COLD_WORK: u64 = 25;
+        let fresh_plan = || {
+            let fre = PortableBuilder::new(LOOK_START_TEXT.pattern)
+                .profile(RustProfile::rebar_1_12_4())
+                .unicode(false)
+                .plan_selection(PlanSelection::ForceK0)
+                .build()
+                .unwrap();
+            validate_look_fre_plan(&fre).unwrap();
+            fre
+        };
         let vector = LOOK_START_TEXT_VECTORS[0];
         assert!(vector.expected);
-        assert!(
-            fre.find_window(
+        let probe = fresh_plan();
+        let (cold_matched, cold_accounting) = probe
+            .find_window(
                 vector.haystack.as_bytes(),
                 SearchWindow::new(vector.at, vector.at),
-                SearchLimits {
-                    max_work: 17,
-                    max_scratch_bytes: 8 * 1024 * 1024,
-                },
+                SearchLimits::unlimited(),
             )
-            .is_err(),
+            .unwrap();
+        let (warm_matched, warm_accounting) = probe
+            .find_window(
+                vector.haystack.as_bytes(),
+                SearchWindow::new(vector.at, vector.at),
+                SearchLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(cold_matched, warm_matched);
+        let (SearchAccounting::K0(cold_accounting), SearchAccounting::K0(warm_accounting)) =
+            (cold_accounting, warm_accounting)
+        else {
+            panic!("forced look plan did not return K0 accounting")
+        };
+        let proof_bytes = cold_accounting
+            .setup()
+            .allocated_bytes()
+            .checked_sub(warm_accounting.setup().allocated_bytes())
+            .expect("cold plan must retain its start proof");
+        assert!(proof_bytes > 0);
+        assert_eq!(
+            cold_accounting.setup_work(),
+            warm_accounting.setup_work() + 1
         );
-        let (matched, accounting) = fre
+        assert_eq!(
+            cold_accounting
+                .setup()
+                .initialized_bytes()
+                .checked_sub(warm_accounting.setup().initialized_bytes()),
+            Some(proof_bytes),
+        );
+        assert_eq!(
+            cold_accounting
+                .scratch_bytes()
+                .checked_sub(warm_accounting.scratch_bytes()),
+            Some(proof_bytes),
+        );
+        let work = EXPECTED_MINIMUM_COLD_WORK;
+        let scratch = warm_accounting.scratch_bytes();
+        let one_below_work = work.checked_sub(1).expect("look work must be positive");
+        let one_below_scratch = scratch
+            .checked_sub(1)
+            .expect("look scratch must be positive");
+        let one_below_work_result = fresh_plan().find_window(
+            vector.haystack.as_bytes(),
+            SearchWindow::new(vector.at, vector.at),
+            SearchLimits {
+                max_work: one_below_work,
+                max_scratch_bytes: scratch,
+            },
+        );
+        assert!(
+            matches!(
+                &one_below_work_result,
+                Err(SearchError::K0(K0SearchError::WorkLimitExceeded {
+                    limit,
+                    consumed,
+                    requested,
+                    ..
+                })) if *limit == one_below_work
+                    && consumed.checked_add(*requested).is_some_and(|needed| needed > *limit)
+            ),
+            "unexpected one-below work result: {one_below_work_result:?}"
+        );
+        let (matched, accounting) = fresh_plan()
             .find_window(
                 vector.haystack.as_bytes(),
                 SearchWindow::new(vector.at, vector.at),
                 SearchLimits {
-                    max_work: 18,
-                    max_scratch_bytes: 8 * 1024 * 1024,
+                    max_work: work,
+                    max_scratch_bytes: scratch,
                 },
             )
             .unwrap();
@@ -6130,22 +6248,25 @@ mod tests {
             Some((0, 0))
         );
         let SearchAccounting::K0(accounting) = accounting else {
-            panic!("forced look plan did not return K0 accounting")
+            panic!("forced look exact-bound search did not return K0 accounting")
         };
-        assert_eq!(accounting.work(), 18);
-        let retained = accounting.scratch_bytes();
-        assert!(retained > 0);
-        assert!(
-            fre.find_window(
+        assert_eq!(accounting.work(), work);
+        assert_eq!(accounting.scratch_bytes(), scratch);
+        assert!(matches!(
+            fresh_plan().find_window(
                 vector.haystack.as_bytes(),
                 SearchWindow::new(vector.at, vector.at),
                 SearchLimits {
-                    max_work: 18,
-                    max_scratch_bytes: retained - 1,
+                    max_work: work,
+                    max_scratch_bytes: one_below_scratch,
                 },
-            )
-            .is_err(),
-        );
+            ),
+            Err(SearchError::K0(K0SearchError::ResourceLimit {
+                needed,
+                limit,
+                ..
+            })) if needed == scratch && limit == one_below_scratch
+        ));
     }
 
     #[test]

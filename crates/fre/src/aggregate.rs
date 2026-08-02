@@ -220,7 +220,7 @@ pub use p16_grep_stream::{
 pub use fre_aggregate::Strategy as AggregateStrategy;
 
 /// Stable schema for aggregate facade reports and cache identities.
-pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 45;
+pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 47;
 
 /// Version of the construction-owned direct-route protocol.
 pub const AGGREGATE_DIRECT_OWNER_ALGORITHM_VERSION: u32 = 2;
@@ -320,6 +320,17 @@ const ABSOLUTE_WHOLE_INPUT_FLAG: usize = 1;
 impl AggregateMatchDomainProof {
     fn from_hir(hir: &Hir, unicode: bool) -> Self {
         let properties = hir.properties();
+        // In regex-syntax 1.12.4, an alternation that contains an
+        // empty-language arm can itself report no cached minimum even when a
+        // different arm is viable. Therefore `None` alone cannot authenticate
+        // the whole empty language. A directly observed empty root class is
+        // sufficient; every uncertain compound shape conservatively retains a
+        // zero minimum and reaches ordinary execution.
+        let minimum_match_bytes = match properties.minimum_len() {
+            Some(minimum) => Some(minimum),
+            None if matches!(hir.kind(), HirKind::Class(class) if class.is_empty()) => None,
+            None => Some(0),
+        };
         let absolute_whole_input = properties.look_set_prefix().contains(Look::Start)
             && properties.look_set_suffix().contains(Look::End);
         let empty_alternative_minimum = if unicode {
@@ -331,7 +342,7 @@ impl AggregateMatchDomainProof {
             .and_then(|minimum| minimum.checked_mul(2))
             .unwrap_or(0);
         Self {
-            minimum_match_bytes: properties.minimum_len(),
+            minimum_match_bytes,
             maximum_match_bytes: properties.maximum_len(),
             domain_flags: encoded_empty_alternative_minimum | usize::from(absolute_whole_input),
         }

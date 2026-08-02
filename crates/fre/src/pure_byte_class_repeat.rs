@@ -36,9 +36,10 @@ pub enum Operation {
 ///
 /// `source_reads` and `actual_work` count the same admitted abstract byte
 /// classifications. Fixed-width leaves charge a complete block before its
-/// first source read. A greedy selected operation may classify the suffix of
-/// the member-seek block again while locating the run end, so its independent
-/// upper bound includes at most one less than a classifier block of overlap.
+/// first source read. The unbounded owner permits at most one classifier-block
+/// overlap between member and run-end seeks. The bounded sibling can restart
+/// after multiple short runs, so its separate source-independent envelope
+/// permits one complete classifier block per advancing input position.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Accounting {
     pub plan_id: &'static str,
@@ -115,7 +116,7 @@ impl InspectionOutcome {
 }
 
 #[derive(Clone, Copy)]
-enum SetSeek {
+pub(super) enum SetSeek {
     Constant(bool),
     One(u8),
     Two(u8, u8),
@@ -129,7 +130,7 @@ impl SetSeek {
         reason = "the one-to-three-member branch bounds the output index"
     )]
     #[cold]
-    fn build(words: [u64; 4], cardinality: u32, classified_inverted: bool) -> Self {
+    pub(super) fn build(words: [u64; 4], cardinality: u32, classified_inverted: bool) -> Self {
         match cardinality {
             0 => Self::Constant(false),
             256 => Self::Constant(true),
@@ -159,7 +160,7 @@ impl SetSeek {
         }
     }
 
-    fn seek(
+    pub(super) fn seek(
         self,
         haystack: &[u8],
         position: usize,
@@ -252,6 +253,26 @@ impl Plan {
         let accounting =
             self.finish_accounting(Operation::Exists, window, meter, 1, 0, usize::from(matched));
         Ok((matched, accounting))
+    }
+
+    pub(crate) fn is_match_window_value(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<bool, SearchError> {
+        validate_window(haystack, window)?;
+        let mut meter = WorkMeter::new(limits.max_work);
+        self.owner()
+            .member_seek
+            .seek(
+                haystack,
+                window.start(),
+                window.end(),
+                &mut meter,
+                self.owner().classifier.as_ref(),
+            )
+            .map(|matched| matched.is_some())
     }
 
     pub(crate) fn earliest_end_window(
@@ -425,14 +446,18 @@ impl Inspection {
 }
 
 #[derive(Clone, Copy)]
-struct WorkMeter {
+pub(super) struct WorkMeter {
     limit: u64,
     consumed: u64,
 }
 
 impl WorkMeter {
-    const fn new(limit: u64) -> Self {
+    pub(super) const fn new(limit: u64) -> Self {
         Self { limit, consumed: 0 }
+    }
+
+    pub(super) const fn consumed(self) -> u64 {
+        self.consumed
     }
 
     fn remaining(self) -> u64 {
@@ -549,7 +574,7 @@ fn seek_classified(
     Ok(None)
 }
 
-fn validate_window(haystack: &[u8], window: SearchWindow) -> Result<(), SearchError> {
+pub(super) fn validate_window(haystack: &[u8], window: SearchWindow) -> Result<(), SearchError> {
     if window.start() > window.end() || window.end() > haystack.len() {
         return Err(SearchError::InvalidWindow);
     }
@@ -710,15 +735,14 @@ mod tests {
             assert_eq!(regex.build_report().edges, 0);
         }
 
-        for pattern in [
-            "(?-u:[a-d])*",
-            "(?-u:[a-d]){1,3}",
-            "x(?-u:[a-d])+",
-            "(?-u:[a-d])+(?-u:x)",
-        ] {
+        for pattern in ["(?-u:[a-d])*", "x(?-u:[a-d])+", "(?-u:[a-d])+(?-u:x)"] {
             let regex = build(pattern);
             assert_ne!(regex.build_report().plan, PlanKind::PureByteClassRepeat);
         }
+
+        let bounded = build("(?-u:[a-d]){1,3}");
+        assert_eq!(bounded.build_report().plan, PlanKind::PureByteClassRepeat);
+        assert_ne!(bounded.runtime_implementation_id(), PLAN_ID);
 
         let forced = PortableBuilder::new("a+")
             .unicode(false)

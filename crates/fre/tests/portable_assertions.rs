@@ -306,12 +306,34 @@ fn portable_search_session_has_tight_k0_setup_limits_and_preserves_native_dispat
     assert!(full_setup.work() > endpoint_setup.work());
     assert!(full_setup.retained_bytes() > endpoint_setup.retained_bytes());
 
-    let work_endpoint = k0
+    let layout_only_full = k0
         .search_session(SearchSessionLimits {
             max_setup_work: full_setup.work() - 1,
             max_scratch_bytes: usize::MAX,
         })
-        .expect("reverse work refusal must retain contextual endpoint acceleration");
+        .expect("descriptor refusal must retain the bidirectional workspace");
+    let layout_only_full_setup = layout_only_full.workspace_setup_accounting().unwrap();
+    assert!(layout_only_full_setup.work() < full_setup.work());
+    assert!(layout_only_full_setup.work() > endpoint_setup.work());
+    assert_eq!(
+        layout_only_full_setup.allocated_bytes(),
+        full_setup.allocated_bytes()
+    );
+    assert_eq!(
+        layout_only_full_setup.initialized_bytes(),
+        full_setup.initialized_bytes()
+    );
+    assert_eq!(
+        layout_only_full_setup.retained_bytes(),
+        full_setup.retained_bytes()
+    );
+
+    let work_endpoint = k0
+        .search_session(SearchSessionLimits {
+            max_setup_work: endpoint_setup.work(),
+            max_scratch_bytes: usize::MAX,
+        })
+        .expect("exact endpoint work must decline bidirectional storage and inspection");
     assert_eq!(
         work_endpoint.workspace_setup_accounting(),
         Some(endpoint_setup)
@@ -325,24 +347,32 @@ fn portable_search_session_has_tight_k0_setup_limits_and_preserves_native_dispat
     let ordinary_setup = ordinary.workspace_setup_accounting().unwrap();
     assert!(ordinary_setup.work() < endpoint_setup.work());
 
-    k0.search_session(SearchSessionLimits {
-        max_setup_work: ordinary_setup.work(),
-        max_scratch_bytes: ordinary_setup.retained_bytes(),
-    })
-    .expect("exact ordinary setup boundary must succeed");
+    let exact_ordinary = k0
+        .search_session(SearchSessionLimits {
+            max_setup_work: ordinary_setup.work(),
+            max_scratch_bytes: ordinary_setup.retained_bytes(),
+        })
+        .expect("exact ordinary setup boundary must succeed");
+    let exact_ordinary_setup = exact_ordinary.workspace_setup_accounting().unwrap();
+    assert!(exact_ordinary_setup.work() <= ordinary_setup.work());
+    assert_eq!(
+        exact_ordinary_setup.retained_bytes(),
+        ordinary_setup.retained_bytes()
+    );
     assert!(matches!(
         k0.search_session(SearchSessionLimits {
-            max_setup_work: ordinary_setup.work() - 1,
+            max_setup_work: exact_ordinary_setup.work() - 1,
             max_scratch_bytes: usize::MAX,
         }),
         Err(fre::SearchError::K0(
             K0SearchError::WorkspaceSetupWorkLimitExceeded { limit, needed }
-        )) if limit == ordinary_setup.work() - 1 && needed == ordinary_setup.work()
+        )) if limit == exact_ordinary_setup.work() - 1
+            && needed == exact_ordinary_setup.work()
     ));
 
     let scratch_endpoint = k0
         .search_session(SearchSessionLimits {
-            max_setup_work: u64::MAX,
+            max_setup_work: endpoint_setup.work(),
             max_scratch_bytes: full_setup.retained_bytes() - 1,
         })
         .expect("reverse scratch refusal must retain contextual endpoint acceleration");
@@ -352,26 +382,26 @@ fn portable_search_session_has_tight_k0_setup_limits_and_preserves_native_dispat
     );
     let scratch_ordinary = k0
         .search_session(SearchSessionLimits {
-            max_setup_work: u64::MAX,
+            max_setup_work: exact_ordinary_setup.work(),
             max_scratch_bytes: endpoint_setup.retained_bytes() - 1,
         })
         .expect("endpoint scratch refusal must retain Pike admission");
     assert_eq!(
         scratch_ordinary.workspace_setup_accounting(),
-        Some(ordinary_setup)
+        Some(exact_ordinary_setup)
     );
     assert!(matches!(
         k0.search_session(SearchSessionLimits {
             max_setup_work: u64::MAX,
-            max_scratch_bytes: ordinary_setup.retained_bytes() - 1,
+            max_scratch_bytes: exact_ordinary_setup.retained_bytes() - 1,
         }),
         Err(fre::SearchError::K0(K0SearchError::ResourceLimit {
             needed,
             limit,
             ..
         }))
-            if needed == ordinary_setup.retained_bytes()
-                && limit == ordinary_setup.retained_bytes() - 1
+            if needed == exact_ordinary_setup.retained_bytes()
+                && limit == exact_ordinary_setup.retained_bytes() - 1
     ));
 
     let literal = portable("Sherlock", PlanSelection::Auto);
@@ -497,12 +527,34 @@ fn optional_lazy_cache_preserves_the_ordinary_session_admission_boundary() {
         expected
     );
 
-    let work_endpoint = k0
+    let layout_only_full = k0
         .search_session(SearchSessionLimits {
             max_setup_work: full_setup.work() - 1,
             max_scratch_bytes: usize::MAX,
         })
-        .expect("reverse work refusal must retain endpoint acceleration");
+        .expect("descriptor refusal must retain the bidirectional workspace");
+    let layout_only_full_setup = layout_only_full.workspace_setup_accounting().unwrap();
+    assert!(layout_only_full_setup.work() < full_setup.work());
+    assert!(layout_only_full_setup.work() > endpoint_setup.work());
+    assert_eq!(
+        layout_only_full_setup.allocated_bytes(),
+        full_setup.allocated_bytes()
+    );
+    assert_eq!(
+        layout_only_full_setup.initialized_bytes(),
+        full_setup.initialized_bytes()
+    );
+    assert_eq!(
+        layout_only_full_setup.retained_bytes(),
+        full_setup.retained_bytes()
+    );
+
+    let work_endpoint = k0
+        .search_session(SearchSessionLimits {
+            max_setup_work: endpoint_setup.work(),
+            max_scratch_bytes: usize::MAX,
+        })
+        .expect("exact endpoint work must decline bidirectional storage and inspection");
     assert_eq!(
         work_endpoint.workspace_setup_accounting(),
         Some(endpoint_setup)
@@ -516,24 +568,32 @@ fn optional_lazy_cache_preserves_the_ordinary_session_admission_boundary() {
     let ordinary_setup = ordinary.workspace_setup_accounting().unwrap();
     assert!(ordinary_setup.work() < endpoint_setup.work());
 
-    k0.search_session(SearchSessionLimits {
-        max_setup_work: ordinary_setup.work(),
-        max_scratch_bytes: ordinary_setup.retained_bytes(),
-    })
-    .expect("exact ordinary setup boundary must succeed");
+    let exact_ordinary = k0
+        .search_session(SearchSessionLimits {
+            max_setup_work: ordinary_setup.work(),
+            max_scratch_bytes: ordinary_setup.retained_bytes(),
+        })
+        .expect("exact ordinary setup boundary must succeed");
+    let exact_ordinary_setup = exact_ordinary.workspace_setup_accounting().unwrap();
+    assert!(exact_ordinary_setup.work() <= ordinary_setup.work());
+    assert_eq!(
+        exact_ordinary_setup.retained_bytes(),
+        ordinary_setup.retained_bytes()
+    );
     assert!(matches!(
         k0.search_session(SearchSessionLimits {
-            max_setup_work: ordinary_setup.work() - 1,
+            max_setup_work: exact_ordinary_setup.work() - 1,
             max_scratch_bytes: usize::MAX,
         }),
         Err(fre::SearchError::K0(
             K0SearchError::WorkspaceSetupWorkLimitExceeded { limit, needed }
-        )) if limit == ordinary_setup.work() - 1 && needed == ordinary_setup.work()
+        )) if limit == exact_ordinary_setup.work() - 1
+            && needed == exact_ordinary_setup.work()
     ));
 
     let scratch_endpoint = k0
         .search_session(SearchSessionLimits {
-            max_setup_work: u64::MAX,
+            max_setup_work: endpoint_setup.work(),
             max_scratch_bytes: full_setup.retained_bytes() - 1,
         })
         .expect("reverse scratch refusal must retain endpoint acceleration");
@@ -543,30 +603,30 @@ fn optional_lazy_cache_preserves_the_ordinary_session_admission_boundary() {
     );
     let scratch_ordinary = k0
         .search_session(SearchSessionLimits {
-            max_setup_work: u64::MAX,
+            max_setup_work: exact_ordinary_setup.work(),
             max_scratch_bytes: endpoint_setup.retained_bytes() - 1,
         })
         .expect("endpoint scratch refusal must retain Pike admission");
     assert_eq!(
         scratch_ordinary.workspace_setup_accounting(),
-        Some(ordinary_setup)
+        Some(exact_ordinary_setup)
     );
     k0.search_session(SearchSessionLimits {
-        max_setup_work: ordinary_setup.work(),
-        max_scratch_bytes: ordinary_setup.retained_bytes(),
+        max_setup_work: exact_ordinary_setup.work(),
+        max_scratch_bytes: exact_ordinary_setup.retained_bytes(),
     })
     .expect("exact ordinary scratch boundary must succeed");
     assert!(matches!(
         k0.search_session(SearchSessionLimits {
             max_setup_work: u64::MAX,
-            max_scratch_bytes: ordinary_setup.retained_bytes() - 1,
+            max_scratch_bytes: exact_ordinary_setup.retained_bytes() - 1,
         }),
         Err(fre::SearchError::K0(K0SearchError::ResourceLimit {
             needed,
             limit,
             ..
-        })) if needed == ordinary_setup.retained_bytes()
-            && limit == ordinary_setup.retained_bytes() - 1
+        })) if needed == exact_ordinary_setup.retained_bytes()
+            && limit == exact_ordinary_setup.retained_bytes() - 1
     ));
 }
 

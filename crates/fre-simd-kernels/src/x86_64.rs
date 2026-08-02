@@ -6,7 +6,7 @@ use core::arch::x86_64::{
 };
 
 use super::{ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, AsciiMasks16, AsciiMasks32, HIGH_NIBBLE_BITS};
-use crate::{BYTE_SET_BLOCK_BYTES, ByteSetMask16};
+use crate::{BYTE_SET_BLOCK_BYTES, BYTE_SET_WIDE_BLOCK_BYTES, ByteSetMask16, ByteSetMask32};
 
 #[allow(
     unsafe_code,
@@ -36,6 +36,219 @@ pub(super) unsafe fn classify_byte_delta_16_sse2(
     ByteSetMask16::new(
         u16::try_from(_mm_movemask_epi8(member_lanes))
             .expect("a sixteen-lane movemask fits in u16"),
+    )
+}
+
+#[allow(
+    unsafe_code,
+    reason = "this private target-feature leaf loads one exact block after the compiler target proved SSE2 usable"
+)]
+#[allow(
+    clippy::cast_ptr_alignment,
+    reason = "_mm_loadu_si128 explicitly accepts an unaligned byte-backed address"
+)]
+#[target_feature(enable = "sse2")]
+#[inline]
+pub(super) unsafe fn classify_byte_set1_16_sse2(
+    member: u8,
+    bytes: &[u8; BYTE_SET_BLOCK_BYTES],
+) -> ByteSetMask16 {
+    let input = unsafe { _mm_loadu_si128(bytes.as_ptr().cast::<__m128i>()) };
+    let lanes = _mm_cmpeq_epi8(input, _mm_set1_epi8(i8::from_ne_bytes([member])));
+    ByteSetMask16::new(
+        u16::try_from(_mm_movemask_epi8(lanes)).expect("a sixteen-lane movemask fits in u16"),
+    )
+}
+
+#[allow(
+    unsafe_code,
+    reason = "this private target-feature leaf loads one exact block after the compiler target proved SSE2 usable"
+)]
+#[allow(
+    clippy::cast_ptr_alignment,
+    reason = "_mm_loadu_si128 explicitly accepts an unaligned byte-backed address"
+)]
+#[target_feature(enable = "sse2")]
+#[inline]
+pub(super) unsafe fn classify_byte_set2_16_sse2(
+    members: [u8; 2],
+    bytes: &[u8; BYTE_SET_BLOCK_BYTES],
+) -> ByteSetMask16 {
+    use core::arch::x86_64::_mm_or_si128;
+
+    let input = unsafe { _mm_loadu_si128(bytes.as_ptr().cast::<__m128i>()) };
+    let lanes = _mm_or_si128(
+        _mm_cmpeq_epi8(input, _mm_set1_epi8(i8::from_ne_bytes([members[0]]))),
+        _mm_cmpeq_epi8(input, _mm_set1_epi8(i8::from_ne_bytes([members[1]]))),
+    );
+    ByteSetMask16::new(
+        u16::try_from(_mm_movemask_epi8(lanes)).expect("a sixteen-lane movemask fits in u16"),
+    )
+}
+
+#[allow(
+    unsafe_code,
+    reason = "this private target-feature leaf loads one exact block after the compiler target proved SSE2 usable"
+)]
+#[allow(
+    clippy::cast_ptr_alignment,
+    reason = "_mm_loadu_si128 explicitly accepts an unaligned byte-backed address"
+)]
+#[target_feature(enable = "sse2")]
+#[inline]
+pub(super) unsafe fn classify_byte_set3_16_sse2(
+    members: [u8; 3],
+    bytes: &[u8; BYTE_SET_BLOCK_BYTES],
+) -> ByteSetMask16 {
+    use core::arch::x86_64::_mm_or_si128;
+
+    let input = unsafe { _mm_loadu_si128(bytes.as_ptr().cast::<__m128i>()) };
+    let lanes = _mm_or_si128(
+        _mm_or_si128(
+            _mm_cmpeq_epi8(input, _mm_set1_epi8(i8::from_ne_bytes([members[0]]))),
+            _mm_cmpeq_epi8(input, _mm_set1_epi8(i8::from_ne_bytes([members[1]]))),
+        ),
+        _mm_cmpeq_epi8(input, _mm_set1_epi8(i8::from_ne_bytes([members[2]]))),
+    );
+    ByteSetMask16::new(
+        u16::try_from(_mm_movemask_epi8(lanes)).expect("a sixteen-lane movemask fits in u16"),
+    )
+}
+
+#[allow(
+    unsafe_code,
+    reason = "this private target-feature leaf loads one exact block after the compiler target proved SSE2 usable"
+)]
+#[allow(
+    clippy::cast_ptr_alignment,
+    reason = "_mm_loadu_si128 explicitly accepts an unaligned byte-backed address"
+)]
+#[target_feature(enable = "sse2")]
+#[inline]
+pub(super) unsafe fn classify_byte_set4_16_sse2(
+    members: [u8; 4],
+    bytes: &[u8; BYTE_SET_BLOCK_BYTES],
+) -> ByteSetMask16 {
+    use core::arch::x86_64::_mm_or_si128;
+
+    // SAFETY: `bytes` is an initialized `[u8; 16]`; the unaligned load reads
+    // exactly that object, and the compiler target proves SSE2.
+    let input = unsafe { _mm_loadu_si128(bytes.as_ptr().cast::<__m128i>()) };
+    let first_or_second = _mm_or_si128(
+        _mm_cmpeq_epi8(input, _mm_set1_epi8(i8::from_ne_bytes([members[0]]))),
+        _mm_cmpeq_epi8(input, _mm_set1_epi8(i8::from_ne_bytes([members[1]]))),
+    );
+    let third_or_fourth = _mm_or_si128(
+        _mm_cmpeq_epi8(input, _mm_set1_epi8(i8::from_ne_bytes([members[2]]))),
+        _mm_cmpeq_epi8(input, _mm_set1_epi8(i8::from_ne_bytes([members[3]]))),
+    );
+    let member_lanes = _mm_or_si128(first_or_second, third_or_fourth);
+    ByteSetMask16::new(
+        u16::try_from(_mm_movemask_epi8(member_lanes))
+            .expect("a sixteen-lane movemask fits in u16"),
+    )
+}
+
+#[allow(
+    unsafe_code,
+    reason = "this private target-feature leaf loads one exact block after the authenticated compiler-static profile proved AVX2 usable"
+)]
+#[allow(
+    clippy::cast_ptr_alignment,
+    reason = "_mm256_loadu_si256 explicitly accepts an unaligned byte-backed address"
+)]
+#[target_feature(enable = "avx2")]
+#[inline]
+pub(super) unsafe fn classify_byte_set1_32_avx2(
+    member: u8,
+    bytes: &[u8; BYTE_SET_WIDE_BLOCK_BYTES],
+) -> ByteSetMask32 {
+    let input = unsafe { _mm256_loadu_si256(bytes.as_ptr().cast::<__m256i>()) };
+    let lanes = _mm256_cmpeq_epi8(input, _mm256_set1_epi8(i8::from_ne_bytes([member])));
+    ByteSetMask32::new(_mm256_movemask_epi8(lanes).cast_unsigned())
+}
+
+#[allow(
+    unsafe_code,
+    reason = "this private target-feature leaf loads one exact block after the authenticated compiler-static profile proved AVX2 usable"
+)]
+#[allow(
+    clippy::cast_ptr_alignment,
+    reason = "_mm256_loadu_si256 explicitly accepts an unaligned byte-backed address"
+)]
+#[target_feature(enable = "avx2")]
+#[inline]
+pub(super) unsafe fn classify_byte_set2_32_avx2(
+    members: [u8; 2],
+    bytes: &[u8; BYTE_SET_WIDE_BLOCK_BYTES],
+) -> ByteSetMask32 {
+    use core::arch::x86_64::_mm256_or_si256;
+
+    let input = unsafe { _mm256_loadu_si256(bytes.as_ptr().cast::<__m256i>()) };
+    let lanes = _mm256_or_si256(
+        _mm256_cmpeq_epi8(input, _mm256_set1_epi8(i8::from_ne_bytes([members[0]]))),
+        _mm256_cmpeq_epi8(input, _mm256_set1_epi8(i8::from_ne_bytes([members[1]]))),
+    );
+    ByteSetMask32::new(_mm256_movemask_epi8(lanes).cast_unsigned())
+}
+
+#[allow(
+    unsafe_code,
+    reason = "this private target-feature leaf loads one exact block after the authenticated compiler-static profile proved AVX2 usable"
+)]
+#[allow(
+    clippy::cast_ptr_alignment,
+    reason = "_mm256_loadu_si256 explicitly accepts an unaligned byte-backed address"
+)]
+#[target_feature(enable = "avx2")]
+#[inline]
+pub(super) unsafe fn classify_byte_set3_32_avx2(
+    members: [u8; 3],
+    bytes: &[u8; BYTE_SET_WIDE_BLOCK_BYTES],
+) -> ByteSetMask32 {
+    use core::arch::x86_64::_mm256_or_si256;
+
+    let input = unsafe { _mm256_loadu_si256(bytes.as_ptr().cast::<__m256i>()) };
+    let lanes = _mm256_or_si256(
+        _mm256_or_si256(
+            _mm256_cmpeq_epi8(input, _mm256_set1_epi8(i8::from_ne_bytes([members[0]]))),
+            _mm256_cmpeq_epi8(input, _mm256_set1_epi8(i8::from_ne_bytes([members[1]]))),
+        ),
+        _mm256_cmpeq_epi8(input, _mm256_set1_epi8(i8::from_ne_bytes([members[2]]))),
+    );
+    ByteSetMask32::new(_mm256_movemask_epi8(lanes).cast_unsigned())
+}
+
+#[allow(
+    unsafe_code,
+    reason = "this private target-feature leaf loads one exact block after the authenticated compiler-static profile proved AVX2 usable"
+)]
+#[allow(
+    clippy::cast_ptr_alignment,
+    reason = "_mm256_loadu_si256 explicitly accepts an unaligned byte-backed address"
+)]
+#[target_feature(enable = "avx2")]
+#[inline]
+pub(super) unsafe fn classify_byte_set4_32_avx2(
+    members: [u8; 4],
+    bytes: &[u8; BYTE_SET_WIDE_BLOCK_BYTES],
+) -> ByteSetMask32 {
+    use core::arch::x86_64::_mm256_or_si256;
+
+    // SAFETY: `bytes` is an initialized `[u8; 32]`; the unaligned load reads
+    // exactly that object, and the authenticated compiler profile proves
+    // AVX2.
+    let input = unsafe { _mm256_loadu_si256(bytes.as_ptr().cast::<__m256i>()) };
+    let first_or_second = _mm256_or_si256(
+        _mm256_cmpeq_epi8(input, _mm256_set1_epi8(i8::from_ne_bytes([members[0]]))),
+        _mm256_cmpeq_epi8(input, _mm256_set1_epi8(i8::from_ne_bytes([members[1]]))),
+    );
+    let third_or_fourth = _mm256_or_si256(
+        _mm256_cmpeq_epi8(input, _mm256_set1_epi8(i8::from_ne_bytes([members[2]]))),
+        _mm256_cmpeq_epi8(input, _mm256_set1_epi8(i8::from_ne_bytes([members[3]]))),
+    );
+    ByteSetMask32::new(
+        _mm256_movemask_epi8(_mm256_or_si256(first_or_second, third_or_fourth)).cast_unsigned(),
     )
 }
 
