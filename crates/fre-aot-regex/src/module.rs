@@ -15996,6 +15996,30 @@ mod tests {
     }
 
     #[test]
+    fn aarch64_direct_sve_sparse_batch_uses_primary_only_hit_predicate() {
+        let target = Target::aarch64_linux()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Sve))
+            .unwrap();
+        let compiled = compile(
+            CompileRequest::new(r"(?-u:\x01[3-7])", target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span),
+        )
+        .unwrap();
+        let words = compiled.module().sections()[TEXT_SECTION]
+            .bytes()
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(words.contains(&aarch64_sve_addvl(2, 2, 4).unwrap()));
+        assert!(words.contains(&aarch64_sve_ptest_p0(4).unwrap()));
+        assert!(
+            !words.contains(&aarch64_sve_ptest_p0(8).unwrap()),
+            "direct DFA retains the primary-only scanner rather than the contextual multicolumn predicate bank"
+        );
+    }
+
+    #[test]
     fn vector_filter_cost_model_is_frequency_ranked_and_lazy_for_sparse_primaries() {
         let layout_for = |pattern: &str| {
             let compiled = compile(
@@ -21302,7 +21326,7 @@ mod tests {
                             .collect::<Vec<_>>();
                         if target.features.has(CpuFeature::Aarch64Sve) {
                             assert!(words.contains(&aarch64_sve_addvl(2, 2, 4).unwrap()));
-                            assert!(words.contains(&aarch64_sve_ptest_p0(8).unwrap()));
+                            assert!(words.contains(&aarch64_sve_ptest_p0(4).unwrap()));
                         } else if target.features.has(CpuFeature::Aarch64Asimd) {
                             assert!(use_aarch64_filter_batch(filter));
                             assert!(
