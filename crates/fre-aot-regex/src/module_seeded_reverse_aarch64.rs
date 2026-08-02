@@ -444,6 +444,7 @@ mod tests {
         };
         let layout = NativeDfaLayout {
             transitions: TransitionLayout::DirectByte,
+            cells: NativeCellEncoding::Wide32,
             forward_offset: 0,
             reverse_offset: 0,
             asimd_lane_index_offset: None,

@@ -80,18 +80,16 @@ pub(super) fn x86_emit_bounded_suffix_retry(
     assembler.bind(verifier)?;
     assembler.instruction(&[0x4c, 0x39, 0xda])?; // position >= verifier end?
     assembler.branch(&[0x0f, 0x83], rejected)?;
-    x86_emit_table_lookup(assembler, layout.transitions)?;
+    x86_emit_table_lookup(assembler, layout.transitions, layout.cells)?;
     assembler.instruction(&[0x48, 0xff, 0xc2])?;
-    assembler.instruction(&[0xa9, 0x00, 0x00, 0x00, 0x80])?;
-    assembler.branch(&[0x0f, 0x88], accepted)?;
-    // Forward cells reserve bit 31 for acceptance and bit 30 for accelerator
+    x86_emit_test_eax_mask(assembler, layout.cells.accepts())?;
+    assembler.branch(&[0x0f, layout.cells.x86_accept_branch()], accepted)?;
+    // Forward cells reserve their top two bits for acceptance and accelerator
     // dispatch. A retry verifier follows the semantic transition directly,
-    // so neither flag may participate in the absolute next-row token.
-    let mut next_mask = vec![0x25]; // and eax, imm32
-    next_mask.extend_from_slice(&CELL_NEXT_MASK.to_le_bytes());
-    assembler.instruction(&next_mask)?;
+    // so neither flag may participate in the next-row token.
+    x86_emit_and_eax_mask(assembler, layout.cells.next_mask())?;
     assembler.branch(&[0x0f, 0x84], rejected)?;
-    assembler.instruction(&[0x4d, 0x8d, 0x54, 0x01, 0xff])?;
+    x86_emit_set_row_from_cell(assembler, layout.cells)?;
     assembler.branch(&[0xe9], verifier)?;
 
     assembler.bind(rejected)?;
@@ -159,17 +157,16 @@ pub(super) fn aarch64_emit_bounded_suffix_retry(
     assembler.bind(verifier)?;
     assembler.instruction(aarch64_cmp_x(2, 10)?)?;
     assembler.branch_cond(AARCH64_HS, rejected)?;
-    aarch64_emit_table_lookup(assembler, layout.transitions)?;
+    aarch64_emit_table_lookup(assembler, layout.transitions, layout.cells)?;
     assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
-    assembler.branch_bit_set_w(8, 31, accepted)?;
+    assembler.branch_bit_set_w(8, layout.cells.accepts_bit(), accepted)?;
     // Mirror the ordinary forward dispatcher: both the accept and
-    // accelerator tag are metadata, while the low 30 bits are the row token.
-    assembler.instruction(aarch64_and_low_w(6, 8, 30)?)?;
+    // accelerator tag are metadata, while the remaining low bits are the row
+    // token.
+    assembler.instruction(aarch64_and_low_w(6, 8, layout.cells.next_bits())?)?;
     assembler.branch_zero_w(6, rejected)?;
     assembler.instruction(aarch64_sub_w_imm(6, 6, 1)?)?;
-    assembler.instruction(
-        0x8b00_0000 | aarch64_reg(6, 16)? | aarch64_reg(5, 5)? | aarch64_reg(11, 0)?,
-    )?;
+    aarch64_set_row_from_cell(assembler, layout.cells)?;
     assembler.branch(verifier)?;
 
     assembler.bind(rejected)?;
@@ -221,17 +218,18 @@ mod tests {
     fn interior_forward_end_clamps_on_both_isas_and_x86_128_is_not_disp8() {
         let layout = exists_layout();
         assert_eq!(layout.transitions, TransitionLayout::DirectByte);
+        assert_eq!(layout.cells, NativeCellEncoding::Compact16);
         let plan =
             select_bounded_interior_retry(OutputContract::Exists, false, 1, 2, 3, 1).unwrap();
         let x86 = finish_x86_retry(&layout, plan).unwrap();
         assert!(
-            x86.windows(4)
-                .any(|bytes| bytes == [0x41, 0x8b, 0x04, 0x82]),
-            "bounded direct-table retry must load a dword cell"
+            x86.windows(5)
+                .any(|bytes| bytes == [0x41, 0x0f, 0xb7, 0x04, 0x42]),
+            "bounded direct-table retry must zero-extend a compact cell"
         );
         assert!(
             x86.windows(5)
-                .any(|bytes| bytes == [0x25, 0xff, 0xff, 0xff, 0x3f]),
+                .any(|bytes| bytes == [0x25, 0xff, 0x3f, 0x00, 0x00]),
             "bounded retry must clear the accept and accelerator bits"
         );
         assert!(
@@ -260,8 +258,8 @@ mod tests {
             .chunks_exact(4)
             .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
             .collect::<Vec<_>>();
-        assert!(words.contains(&aarch64_load_w_uxtw(8, 11, 8).unwrap()));
-        assert!(words.contains(&aarch64_and_low_w(6, 8, 30).unwrap()));
+        assert!(words.contains(&aarch64_load_h_uxtw(8, 11, 8).unwrap()));
+        assert!(words.contains(&aarch64_and_low_w(6, 8, 14).unwrap()));
         assert!(!words.contains(&aarch64_and_low_31(6, 8).unwrap()));
         assert!(words.contains(&aarch64_mov_x(10, 3).unwrap()));
 
