@@ -1,0 +1,353 @@
+# General optimizing AOT regex compiler
+
+`fre-aot-compiler::general` is FRE's source-independent AOT entry point. A
+pattern reaches this compiler when, and only when, the pinned Rust syntax
+frontend can lower its capture-free semantics to a validated prioritized
+Thompson automaton within the caller's resource limits.
+
+Invocation is currently explicit. Calling ordinary `fre::Regex` construction
+does not silently run this slower compiler. A caller chooses the general API
+below or the `compile_general_aot` example, and may therefore choose Fast or
+Optimizing compilation as a policy decision.
+
+There is no literal-width table, benchmark-name test, corpus identifier,
+pattern hash allowlist, or source-string comparison in admission or plan
+selection. Exact literals and class runs can still receive specialized code,
+but only as graph-derived optimization outcomes after general admission.
+
+## Invocation
+
+```rust
+use fre_aot_compiler::general::{
+    compile, CompileMode, CompileRequest, OutputContract, Target,
+};
+
+let compiled = compile(
+    CompileRequest::new(r"(?:[A-Za-z_][A-Za-z0-9_]*::)+item", Target::x86_64_linux())
+        .output(OutputContract::Span)
+        .mode(CompileMode::Optimizing),
+)?;
+std::fs::write("item.o", compiled.object())?;
+```
+
+`CompileMode::Fast` performs syntax lowering, validation, canonicalization, and
+ordered-TNFA freezing. `CompileMode::Optimizing` may spend substantially more
+time on complete ordered determinization, reverse-machine construction,
+alphabet reduction, machine lowering, and object layout. Both modes accept the
+same language and must return identical results. A resource limit can change
+the selected engine or produce a typed refusal; it cannot make compiler
+eligibility depend on a regex recipe.
+
+Every source request enters the same parser, general nullable-repetition
+lowerer, automaton validator, and artifact pipeline. The target-neutral engine
+choice is:
+
+| Request/graph condition | Engine | Receipt reason | Native object path |
+|---|---|---|---|
+| Fast mode | ordered TNFA | `FastMode` | runtime adapter |
+| Optimizing, assertion-free, determinization completes | ordered DFA | `CompleteDfa` | direct native loop |
+| Optimizing, supported byte-local context assertions, contextual determinization completes | ordered contextual DFA | `CompleteContextDfa` | direct native loop |
+| Optimizing, contextual determinization is unsupported or reaches a limit | ordered TNFA | `ContextAssertions` | runtime adapter |
+| Optimizing, state/transition/work/allocation limit reached | ordered TNFA | `DeterminizationResourceLimit` | runtime adapter |
+
+Syntax errors, hard lowering limits, and program/object byte limits are typed
+compilation errors. Capture outputs are outside this capture-free API's
+contract; grouping itself is erased and does not prevent compilation. These
+conditions are not silent non-invocations. A determinization report retains
+the requested and effective limits, attempted and completed stages, work and
+machine dimensions reached, and the exact state, transition, work, or
+allocation decline at the stage where it occurred.
+
+The receipt records the semantic automaton digest, exact serialized-program
+and object SHA-256 digests, target and feature facts, mode, output, selected
+engine and reason, the ordinary and contextual determinization reports,
+Thompson and DFA dimensions, executed passes, required runtime dependency,
+configured line terminator, selected start accelerator, bounded graph-derived
+prefix facts, actual emitted prefix-filter depth, and
+program/code/data/object sizes. A contextual report contains either the
+completed forward/reverse machine dimensions or the exact unsupported
+assertion, state, transition, work, or allocation decline.
+Digests provide integrity only when compared with a trusted receipt. These
+fields support a future owner that compiles on another thread and atomically
+cuts matching over after validation. Background compilation and cutover policy
+are runtime work, not compiler eligibility.
+
+## Semantic pipeline
+
+```text
+pinned Rust byte syntax
+  -> capture-free HIR
+  -> general nullable-repetition Thompson construction
+  -> validated prioritized Thompson automaton
+  -> canonical automaton digest
+  -> bounded required-prefix analysis over the graph
+  -> fast ordered-TNFA plan
+       or
+     optimizing ordered forward DFA + all-matches reverse DFA
+       -> deterministic forward/reverse state minimization
+       -> whole-machine alphabet-column coalescing
+       or
+     optimizing context-parameterized forward + reverse DFA
+  -> target module
+  -> ELF64LE or Mach-O 64 relocatable object
+```
+
+The forward DFA preserves Rust leftmost-first semantics. Ordered epsilon
+closure stops at the first accept, thereby discarding lower-priority threads.
+The accept becomes part of the DFA state as a pending-result mode; while it is
+pending, lower-priority start states are not injected. Execution follows all
+higher-priority survivors until they die, then commits the pending end.
+
+Exact span recovery is deliberately a different construction. The reverse
+machine ignores priority, starts from every accept, and scans backward from the
+selected end. It retains the earliest start that can reach the original
+forward start state. Reusing forward priority in the reverse machine is
+incorrect and is covered by differential tests.
+
+Alphabet classes are derived from all byte-range endpoints in the automaton.
+They reduce every transition row without inspecting the source pattern.
+Complete determinization is bounded by explicit state, transition, and work
+limits. Program and object byte limits are enforced at their later artifact
+stages. A determinization limit or fallible-storage decline selects the
+universal ordered-TNFA engine rather than a pattern-specific portable escape.
+
+`DeterminizeLimits::unlimited()` means the maximum supported by the stable,
+canonically replayable artifact contract, not unbounded process work. Its
+public ceiling is `MAX_STABLE_DFA_BUILD_WORK` (500,000,000 charged
+operations); requested values above the stable state, transition, or work
+ceilings remain visible in the receipt alongside the effective values.
+Graph-sized optimizer storage uses fallible reservations, so allocation
+failure is another recorded optimization decline rather than a process abort.
+
+The optimizer performs deterministic partition refinement over complete
+forward and reverse machines, including observable result flags and the dead
+transition sentinel. It canonically renumbers the quotient from initial state
+zero, then coalesces columns that are equivalent across the entire minimized
+machine. Output specialization removes the reverse machine unless exact spans
+need it. Native lowering strength-reduces row addressing to retained absolute
+row offsets, specializes constants and outputs, assigns a fixed ABI-aware
+register plan, resolves checked branch fixups, and lays out
+position-independent code and immutable tables. These are implemented
+self-contained passes; the compiler invokes no LLVM, assembler, C compiler,
+linker, or subprocess.
+
+The required-prefix analysis explores bounded epsilon closures from the
+Thompson start and unions the byte ranges every surviving path can consume at
+each of up to eight positions. The position sets are conservative necessary
+conditions, not a reconstructed literal: correlations between alternatives
+are intentionally discarded. Native lowering deterministically chooses the
+most selective representable position by byte cardinality, interval cost, and
+then offset. It scans that offset while retaining the semantic candidate-start
+cursor, checks the remaining selective positions with compact membership
+predicates, and enters the DFA only after those necessary conditions hold. A
+failed candidate advances exactly one semantic start byte and returns to the
+initial DFA state. Early acceptance, unknown graph structures, or the fixed
+work ceiling disable this optional filter without changing semantics or
+compiler eligibility. Context assertions are traversed conservatively; the
+contextual lowering reuses only facts that remain valid at every boundary.
+
+Context-sensitive patterns take a separate graph-general determinization
+route. Boundary context (the adjacent byte classes plus absolute-haystack
+edge facts) is part of each deterministic state key. Whole-haystack,
+configured-line, CRLF-line, and ASCII word/start/end/half assertions can
+therefore lower to a self-contained native contextual DFA. Unicode word
+assertions currently produce a typed `UnsupportedAssertion` decline and keep
+the universal ordered-TNFA runtime path. Contextual state/transition/work or
+allocation limits behave the same way. Neither case skips general
+compilation.
+
+The contextual machine and its construction report are fresh-compilation
+sidecars. Stable V2 program serialization intentionally remains unchanged and
+stores the universal ordered-TNFA form. Deserializing and re-lowering such a
+program therefore produces the runtime adapter; it cannot claim or recreate
+the omitted contextual optimizer. A fresh receipt reports
+`OrderedContextDfa`/`CompleteContextDfa`, while the restored artifact reports
+only the ordered-NFA facts actually present on the wire.
+
+## Targets and features
+
+The target is an explicit pair, never inferred from the compiler host:
+
+| Architecture | Linux | macOS |
+|---|---:|---:|
+| x86-64 | ELF64 | Mach-O 64 |
+| AArch64 | ELF64 | Mach-O 64 |
+
+The scalar ordered-DFA loop is the universal baseline. A graph-derived start
+scanner uses the most selective representable required-prefix column when one
+is available; otherwise it can use bytes whose initial transition is not a
+nonaccepting self-loop. It skips only while execution remains in the initial
+row with no pending result, and nullable patterns are excluded. A cost model
+selects scalar, x86 SSE2, explicit AVX2, explicit AVX-512F+BW, Arm ASIMD, or
+Linux Arm SVE/SVE2 lowering. Compact 256-bit membership predicates reject
+false candidates against every other selective required-prefix position
+before the full DFA. SSE2 and AVX2 retain their lane masks, select the first
+hit directly, and unroll four no-hit vectors. ASIMD candidate sets of at most
+four bytes batch four vectors into one 64-byte no-hit reduction; broader sets
+retain the 16-byte loop. Base SVE scans graph-derived primary filters with a
+vector-length-agnostic four-vector loop; SVE2 uses `MATCH` for exact byte
+sets. A Linux object requesting both ASIMD and SVE contains graph-equivalent
+primary scanners and uses `CNTB` to select ASIMD at a 16-byte runtime vector
+length and scalable SVE above it. Unsupported SVE route shapes retain their
+ASIMD or scalar fallback, and macOS never selects SVE because this backend has
+no macOS SVE execution contract. Offset-aware vector and scalar bounds prevent
+reads beyond the requested search window. No source spelling participates.
+
+The feature model is a set rather than a "highest tier": SSE2, AVX2,
+AVX-512F, AVX-512BW, and AVX-512VL are independent x86 facts; ASIMD, SVE, and
+SVE2 are independent Arm facts. The emitted object executes selected feature
+instructions unconditionally. A loader must dispatch only after checking CPU
+support and required OS extended-state support. The current 64-byte scanner
+needs AVX-512F+BW, not VL. AVX-512 is static-disassembly validated only because
+no available host exposes it; there is no AVX-512 performance claim.
+
+Each object keeps code and immutable program data in separate sections,
+exports an identity-suffixed entry symbol, and carries only target-defined
+position-independent relocations (x86 PC-relative or AArch64 page-relative
+plus page-offset pairs). Entry identity binds the semantic program, complete
+target/feature tuple, lowering version, code, data, relocations, and runtime
+dependency. The object serializers consume a generic compiled module and
+never inspect regex shapes.
+
+## Runtime-backed programs
+
+Direct byte-local and contextual DFA objects implement the five-argument C
+search ABI entirely in native code and have no runtime-helper relocation.
+Fast programs, unsupported or resource-declined assertion programs, and
+ordinary determinization-resource fallbacks retain the universal ordered-TNFA
+artifact and tail-call `fre_aot_regex_runtime_search_v1`.
+
+The raw compatibility helper validates and owns the serialized program on each
+call because a raw address is not a safe lifetime identity. Repeated callers
+should instead use the stable prepared lifecycle:
+
+```text
+fre_aot_regex_runtime_prepare_v1
+fre_aot_regex_runtime_search_prepared_v1
+fre_aot_regex_runtime_destroy_prepared_v1
+```
+
+Preparation canonical-validates and owns the program and allocates its
+workspace once. The source bytes may then be released. Opaque `u64` handles
+reject stale and double-destroy use; searches are exclusive per handle and
+different handles can execute concurrently. The checked-in
+[`fre_aot_regex_runtime_v1.h`](../crates/fre-aot-regex-runtime/include/fre_aot_regex_runtime_v1.h)
+and the identical `C_API_V1_HEADER` constant contain the C and C++
+declarations. Runtime-backed objects export a target/code-bound global alias
+over the exact serialized bytes. `CompiledModule::required_runtime_program`
+returns that symbol and its length, so a linked consumer can pass the object
+data directly to `prepare_v1`. Direct DFA modules return `None`.
+
+## Scope
+
+The general language is the complete capture-free Rust-byte subset implemented
+by `fre-lower`: empty expressions, byte literals and classes, Unicode scalar
+classes lowered to UTF-8 paths, concatenation, ordered alternation, greedy and
+lazy repetition, whole-haystack and line assertions, and ASCII/Unicode word
+assertions.
+
+This is not yet a capture compiler or a complete RE2 frontend. Those are typed
+frontend/semantic gaps. They are not special-case failures in the AOT backend.
+
+Current optimization gaps are direct native TNFA lowering, native Unicode-word
+assertion handling, stable contextual-sidecar serialization, broader
+required-substring analysis, correlated/vectorized prefix predicates,
+compressed cache-aware DFA tables, and automatic multiversion CPU dispatch.
+These are performance or integration gaps; they do not change which
+capture-free patterns enter the general compiler.
+
+## Generated evidence
+
+The broad generated semantic audit currently covers 673 assertion-free
+patterns and 1,098 generated byte haystacks. All 673 patterns compile, all 673
+select the default optimizing DFA, and 5,060,960 valid windows agree across
+Fast, Optimizing, reusable workspaces, serialized round trips, and the pinned
+Rust regex oracle. The nullable-repetition refusal count is zero. A forced
+limit matrix adds 37,660 fallback comparisons (20 DFA and 50 NFA compilation
+variants). Malformed artifacts and inconsistent raw/DFA payloads are rejected.
+The exact generator and cardinality assertions are checked in as
+[`generated_semantic_audit.rs`](../crates/fre-aot-regex/tests/generated_semantic_audit.rs)
+and run with:
+
+```sh
+cargo test -p fre-aot-regex --test generated_semantic_audit \
+  --release -- --ignored --nocapture --test-threads=1
+```
+
+The checked-in deterministic benchmark generates 10 structural strata:
+literal, class, concatenation, alternation, greedy and lazy repetition,
+nullable repetition, Unicode, line assertions, and word assertions. It
+publishes Fast/Optimizing compile time, engine route, machine dimensions,
+required-prefix facts, program/code/data/object size, reusable portable
+execution, and checked native execution. Assertion strata remain in the
+denominator: supported byte-local assertions may select the direct contextual
+DFA route, while Unicode-word or bounded construction declines remain on the
+prepared ordered-NFA route.
+
+The broader
+[`generated_aot_performance_matrix`](../crates/fre-aot-regex/examples/generated_aot_performance_matrix.rs)
+is distribution-oriented evidence rather than one-case-per-stratum evidence.
+It crosses six graph shapes, three window sizes, four match positions, five
+candidate densities, producing 360 paired cells, each validated over four
+independently rotated generated haystacks. Fast and native results are
+validated before timing; warmed trials report minimum and median absolute
+latency and throughput, alongside a non-inlined C-ABI no-op floor. The raw
+harness deliberately reports per-cell measurements rather than an aggregate.
+
+A matched generated-only before/after run on one Apple M5 AArch64 macOS host
+used ASIMD objects, 32-, 4,096-, and 65,536-byte windows, the four match
+positions `none`, `start`, `middle`, and `end`, the five candidate densities
+`zero`, `1_per_256`, `1_per_32`, `1_per_4`, and `dense`, and the six graph
+shapes `literal_depth_3`, `literal_depth_6`, `small_class`, `range_pair`,
+`sparse_pair`, and `branching_pair`. Each configuration used four rotations,
+five timed trials after eight warm-up rounds, a 262,144-byte nominal trial
+budget, and at least 1,024 searches. All 360 Fast/native pairs validated in
+both runs.
+
+The table summarizes the per-cell median ratio
+`Fast ns/search / native ns/search`; a ratio above 1 means native is faster.
+Percentiles use the lower ranked observation.
+
+| Statistic across 360 paired cells | Initial-column scanner | Selective necessary-prefix-column scanner |
+|---|---:|---:|
+| Native regressions (ratio below 1) | 144 | 46 |
+| Ratio below 0.75 | 125 | 8 |
+| Ratio below 0.50 | 108 | 1 |
+| Ratio below 0.25 | 97 | 0 |
+| Minimum | 0.0052 | 0.4819 |
+| p10 | 0.0157 | 0.9455 |
+| p25 | 0.1000 | 1.2385 |
+| Median | 2.1812 | 3.9488 |
+| p75 | 9.6304 | 10.5229 |
+| p90 | 13.8161 | 12.9106 |
+| Geometric mean | 1.0012 | 3.6396 |
+
+The remaining worst generated cell is `literal_depth_6` on a 65,536-byte
+window with the match at the end and `1_per_256` candidate density: its ratio
+is 0.4819, so native is about 2.1 times slower there. This distribution
+supports the graph-derived column-selection change on that Apple ASIMD host;
+it is not a performance claim for the other operating-system, architecture,
+or feature combinations.
+
+The same final source and exact matrix flags also ran on remote benchmark host x86-64
+Linux with AVX2 and Graviton5 AArch64 Linux with ASIMD. Every host produced 360
+valid Fast/native pairs with identical paired checksums. These figures remain
+host-specific measurements, not hard compiler admission gates.
+
+| Final generated matrix host | Minimum | Median | Geometric mean | Regressions | Below 0.75 | Below 0.50 |
+|---|---:|---:|---:|---:|---:|---:|
+| Apple M5, macOS AArch64, ASIMD | 0.482 | 3.949 | 3.640 | 46 | 8 | 1 |
+| AMD EPYC Milan, x86-64 Linux, AVX2 | 0.555 | 3.548 | 3.999 | 76 | 38 | 0 |
+| AWS Graviton5/Neoverse V3, AArch64 Linux, ASIMD | 0.533 | 4.458 | 3.827 | 69 | 8 | 0 |
+
+Native all-window differential bundles execute on:
+
+- Apple AArch64 macOS, scalar and ASIMD;
+- x86-64 macOS under Rosetta, SSE2;
+- remote benchmark host x86-64 Linux, scalar/SSE2 and AVX2;
+- Graviton5 AArch64 Linux, scalar and ASIMD.
+
+AVX-512F+BW one- and four-candidate objects are generated and disassembled to
+their ZMM/k-mask loops, but are not executed. All development measurements use
+generated inputs. The separate ripgrep workload is a sealed holdout and is not
+consulted for optimization or for the evidence above.

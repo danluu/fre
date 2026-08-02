@@ -1,6 +1,13 @@
 # Self-contained optimizing AOT compiler
 
-Status: source-design Candidate
+Status: legacy Count-v3 design; superseded as the general compiler contract
+
+The recipe portfolio described below is retained as the cheap legacy/template
+compiler. It is not the admission boundary for general AOT compilation. The
+implemented general entry point lives in `fre-aot-compiler::general` and takes
+every capture-free pattern accepted by `fre-lower` through the same prioritized
+automaton pipeline. Its current contract and invocation are documented in
+`GENERAL_AOT_COMPILER.md`.
 
 This document defines the optimization, safety, evidence, and production-routing
 contract for FRE's slower, optimization-focused AOT compiler. It does not grant
