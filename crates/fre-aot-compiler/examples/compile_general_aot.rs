@@ -13,7 +13,10 @@ fn usage() -> &'static str {
      x86-64 codegen: empty/sse2 => SSE2; avx2 => AVX2; \
      avx512f+avx512bw => AVX-512\n\
      AArch64 codegen: empty => scalar; asimd => ASIMD\n\
-     accepted but currently non-selecting: avx512vl,sve,sve2\n\
+     Linux AArch64: sve => SVE; sve+sve2 => SVE2; mixed facts use \
+     explicit runtime-VL policy\n\
+     macOS AArch64 accepts SVE facts but keeps scalar/ASIMD lowering\n\
+     accepted but currently non-selecting: avx512vl\n\
      CPU features are explicit deployment facts; there is no host autodetection"
 }
 
