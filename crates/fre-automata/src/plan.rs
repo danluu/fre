@@ -23,11 +23,11 @@ fn next_automaton_identity() -> u64 {
 
 /// Number of exact consumed-byte positions retained by the bounded start
 /// filter. Any of offsets zero through fifteen may supply the primary
-/// scanner; at most one other position may supply a candidate guard.
+/// scanner; at most one other position may supply a secondary Guard or Probe.
 pub(crate) const START_FILTER_POSITION_COUNT: usize = 16;
 /// Largest consumed-byte offset inspected by the bounded start filter.
 pub(crate) const START_FILTER_MAX_OFFSET: usize = START_FILTER_POSITION_COUNT - 1;
-/// Maximum candidate guards retained by one immutable start-filter proof.
+/// Maximum secondary exact-position filters retained by one immutable proof.
 pub(crate) const START_FILTER_MAX_GUARDS: usize = 1;
 /// Exact abstract work to count the members in all four byte-bitmap words.
 pub(crate) const BYTE_START_BITMAP_POPULATION_WORK: usize = 4;
@@ -50,19 +50,23 @@ pub(crate) const BYTE_START_ASCII_CLASSIFIER_SELECTION_WORK: usize = ASCII_CLASS
 /// Exact abstract work to compare one position with the incumbent scanner.
 pub(crate) const START_FILTER_SCANNER_SELECTION_WORK: usize = 1;
 /// Exact abstract work to compare one non-scanner position with the incumbent
-/// guard.
+/// secondary filter.
 pub(crate) const START_FILTER_GUARD_SELECTION_WORK: usize = 1;
+/// Optional work to retain one already-compared broad exact-position class as
+/// an adaptive Probe after the primary scanner has been fully constructed.
+pub(crate) const START_FILTER_PROBE_SELECTION_WORK: usize = 1;
 /// Largest non-scanner byte class selective enough to retain as a guard.
 /// Sixty-four members are one quarter of the complete 256-byte domain.
 pub(crate) const START_FILTER_GUARD_MAX_CARDINALITY: u32 = 64;
 /// Conservative selection bound: count and compare every exact-position set,
-/// compare every non-scanner set for the optional guard, then compile the
-/// costliest retained scanner.
+/// compare every non-scanner set for the optional secondary filter, compile
+/// the costliest retained scanner, then retain a broad Probe when eligible.
 pub(crate) const START_FILTER_MAX_SELECTION_WORK: usize = START_FILTER_POSITION_COUNT
     * (BYTE_START_BITMAP_POPULATION_WORK + START_FILTER_SCANNER_SELECTION_WORK)
     + START_FILTER_MAX_OFFSET * START_FILTER_GUARD_SELECTION_WORK
     + BYTE_START_RANGE_DETECTION_WORK
-    + BYTE_START_SET_CLASSIFIER_BUILD_WORK;
+    + BYTE_START_SET_CLASSIFIER_BUILD_WORK
+    + START_FILTER_PROBE_SELECTION_WORK;
 
 /// The structural role of a Thompson state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -379,11 +383,12 @@ impl SearchWindow {
 /// cold workspace construction, while a reusable call charges only logical
 /// reset (and, extremely rarely, generation-table clearing) before transitions.
 /// The first successful search on an immutable [`Automaton`] also charges its
-/// bounded full-byte start-filter proof and scanner/guard selection. The
-/// automaton fallibly retains that result in one cold heap owner, so later
-/// calls do not repeat or charge that work. Owner publication requires one
-/// additional work unit and enough scratch allowance for its exact payload;
-/// refusal preserves ordinary K0 and leaves publication retryable.
+/// bounded full-byte start-filter proof and scanner/secondary-filter
+/// selection. The automaton fallibly retains that result in one cold heap
+/// owner, so later calls do not repeat or charge that work. Owner publication
+/// requires one additional work unit and enough scratch allowance for its
+/// exact payload; refusal preserves ordinary K0 and leaves publication
+/// retryable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SearchLimits {
     pub max_work: u64,
@@ -530,6 +535,34 @@ pub(crate) struct StartPositionClass {
     pub(crate) set: ByteSet,
 }
 
+/// Execution policy for the one retained non-scanner exact-position class.
+///
+/// A guard is checked for every primary candidate. A probe starts inactive
+/// and is enabled only by invocation-local evidence from rejected primary
+/// candidates. Keeping the policy in the immutable proof makes the two routes
+/// auditable without retaining any source-dependent state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StartPositionFilter {
+    Guard(StartPositionClass),
+    Probe(StartPositionClass),
+}
+
+impl StartPositionFilter {
+    pub(crate) const fn guard(&self) -> Option<&StartPositionClass> {
+        match self {
+            Self::Guard(class) => Some(class),
+            Self::Probe(_) => None,
+        }
+    }
+
+    pub(crate) const fn probe(&self) -> Option<&StartPositionClass> {
+        match self {
+            Self::Guard(_) => None,
+            Self::Probe(class) => Some(class),
+        }
+    }
+}
+
 /// Scanner and exact consumed-byte offset used to recover candidate starts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct StartPositionScanner {
@@ -541,9 +574,25 @@ pub(crate) struct StartPositionScanner {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct StartFilterProof {
     pub(crate) scanner: Option<StartPositionScanner>,
-    pub(crate) guard: Option<StartPositionClass>,
+    pub(crate) filter: Option<StartPositionFilter>,
     pub(crate) force_haystack_start: bool,
     pub(crate) relaxed_nullable: bool,
+}
+
+impl StartFilterProof {
+    pub(crate) const fn guard(&self) -> Option<&StartPositionClass> {
+        match &self.filter {
+            Some(filter) => filter.guard(),
+            None => None,
+        }
+    }
+
+    pub(crate) const fn probe(&self) -> Option<&StartPositionClass> {
+        match &self.filter {
+            Some(filter) => filter.probe(),
+            None => None,
+        }
+    }
 }
 
 /// Cold, fallibly allocated owner for one published start-filter proof.
@@ -829,10 +878,33 @@ impl Automaton {
             })?;
         // The first successful invocation on an immutable automaton derives
         // up to sixteen exact-position byte classes and selects a scanner plus
-        // one guard. Each depth may inspect a state twice and a consuming edge
-        // twice while building the next frontier, in addition to the ordinary
-        // edge inspection. Later invocations read the automaton-owned result.
-        let start_proof_per_position = u64::try_from(self.stats.states)
+        // one secondary Guard or Probe. Each depth may inspect a state twice
+        // and a consuming edge twice while building the next frontier, in
+        // addition to the ordinary edge inspection. Later invocations read
+        // the automaton-owned result.
+        let start_proof = self.conservative_start_filter_proof_work_bound()?;
+        // The mutually exclusive retained Guard or adaptive Probe can add at
+        // most one membership check per candidate/source position on top of
+        // the full all-boundaries automaton bound.
+        let secondary_filter = input
+            .checked_mul(u64::try_from(START_FILTER_MAX_GUARDS).map_err(|_| {
+                SearchError::ArithmeticOverflow {
+                    computation: "start-filter guard count conversion",
+                }
+            })?)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "start-filter guard work bound",
+            })?;
+        automaton
+            .checked_add(start_proof)
+            .and_then(|work| work.checked_add(secondary_filter))
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "transition work with start-filter proof",
+            })
+    }
+
+    fn conservative_start_filter_proof_work_bound(&self) -> Result<u64, SearchError> {
+        let per_position = u64::try_from(self.stats.states)
             .ok()
             .and_then(|states| states.checked_mul(2))
             .and_then(|states| {
@@ -844,7 +916,7 @@ impl Automaton {
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "start-filter per-position proof work bound",
             })?;
-        let start_proof = start_proof_per_position
+        per_position
             .checked_mul(u64::try_from(START_FILTER_POSITION_COUNT).map_err(|_| {
                 SearchError::ArithmeticOverflow {
                     computation: "start-filter position count conversion",
@@ -857,23 +929,20 @@ impl Automaton {
             })
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "start-filter proof work bound",
-            })?;
-        // A retained guard can pass at every candidate and therefore add work
-        // on top of the full all-boundaries automaton bound.
-        let guard = input
-            .checked_mul(u64::try_from(START_FILTER_MAX_GUARDS).map_err(|_| {
-                SearchError::ArithmeticOverflow {
-                    computation: "start-filter guard count conversion",
-                }
-            })?)
-            .ok_or(SearchError::ArithmeticOverflow {
-                computation: "start-filter guard work bound",
-            })?;
-        automaton
-            .checked_add(start_proof)
-            .and_then(|work| work.checked_add(guard))
-            .ok_or(SearchError::ArithmeticOverflow {
-                computation: "transition work with start-filter proof",
+            })
+    }
+
+    /// Conservative completion allowance after cold start-filter derivation
+    /// and selection have already been charged.
+    pub(crate) fn conservative_post_start_filter_work_bound(
+        &self,
+        input_bytes: usize,
+    ) -> Result<u64, SearchError> {
+        let full = self.conservative_transition_work_bound(input_bytes)?;
+        let proof = self.conservative_start_filter_proof_work_bound()?;
+        full.checked_sub(proof)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "post-start-filter work bound underflowed",
             })
     }
 
