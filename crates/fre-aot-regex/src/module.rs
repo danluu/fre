@@ -7184,7 +7184,7 @@ fn lower_x86_64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), Ob
 
 type Aarch64Label = usize;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Aarch64FixupKind {
     Branch26,
     Conditional19,
@@ -7192,17 +7192,25 @@ enum Aarch64FixupKind {
     TestBit14,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Aarch64Fixup {
     instruction: usize,
     label: Aarch64Label,
     kind: Aarch64FixupKind,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct Aarch64Assembler {
     code: Vec<u8>,
     labels: Vec<Option<usize>>,
     fixups: Vec<Aarch64Fixup>,
+}
+
+struct Aarch64OptimizedAssembly {
+    code: Vec<u8>,
+    labels: Vec<Option<usize>>,
+    fixups: Vec<Aarch64Fixup>,
+    relocation_offsets: Vec<usize>,
 }
 
 impl Aarch64Assembler {
@@ -7328,12 +7336,128 @@ impl Aarch64Assembler {
         Ok(())
     }
 
-    fn finish(mut self) -> Result<Vec<u8>, ObjectError> {
+    fn threaded_label(
+        &self,
+        label: Aarch64Label,
+        unconditional_targets: &[Option<Aarch64Label>],
+    ) -> Aarch64Label {
+        let original = label;
+        let mut current = label;
+        let mut traversed = 0_usize;
+        loop {
+            let Some(target) = self.labels.get(current).copied().flatten() else {
+                return original;
+            };
+            let instruction = target / 4;
+            let Some(next) = unconditional_targets.get(instruction).copied().flatten() else {
+                return current;
+            };
+            let Some(next_traversed) = traversed.checked_add(1) else {
+                return original;
+            };
+            traversed = next_traversed;
+            if traversed > self.labels.len() {
+                // A cycle of unconditional branches is a valid (non-returning)
+                // CFG. Preserve its original edge instead of attempting to
+                // choose an arbitrary representative.
+                return original;
+            }
+            current = next;
+        }
+    }
+
+    fn fixup_encoding(kind: Aarch64FixupKind) -> (u8, u8, u32) {
+        match kind {
+            Aarch64FixupKind::Branch26 => (26_u8, 0_u8, 0xfc00_0000_u32),
+            Aarch64FixupKind::Conditional19 | Aarch64FixupKind::CompareBranch19 => {
+                (19, 5, 0xff00_001f)
+            }
+            Aarch64FixupKind::TestBit14 => (14, 5, 0xfff8_001f),
+        }
+    }
+
+    fn fixup_words(source: usize, target: usize) -> Result<i64, ObjectError> {
+        let target = i64::try_from(target)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 branch target"))?;
+        let source = i64::try_from(source)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 branch source"))?;
+        let delta = target
+            .checked_sub(source)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "AArch64 branch displacement",
+            ))?;
+        if delta % 4 != 0 {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 branch displacement is unaligned",
+            ));
+        }
+        Ok(delta / 4)
+    }
+
+    fn fixup_words_fit(words: i64, bits: u8) -> Result<bool, ObjectError> {
+        let sign_bit = bits
+            .checked_sub(1)
+            .ok_or(ObjectError::InvalidModule("AArch64 branch bit width"))?;
+        let magnitude = 1_i64
+            .checked_shl(u32::from(sign_bit))
+            .ok_or(ObjectError::ArithmeticOverflow("AArch64 branch range"))?;
+        let minimum = magnitude
+            .checked_neg()
+            .ok_or(ObjectError::ArithmeticOverflow("AArch64 branch minimum"))?;
+        let maximum = magnitude
+            .checked_sub(1)
+            .ok_or(ObjectError::ArithmeticOverflow("AArch64 branch maximum"))?;
+        Ok((minimum..=maximum).contains(&words))
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "transactional validation, CFG rewriting, and relocation remapping form one audit unit"
+    )]
+    fn control_flow_optimized(
+        &self,
+        relocation_offsets: &[usize],
+    ) -> Result<Aarch64OptimizedAssembly, ObjectError> {
         if !self.code.len().is_multiple_of(4) {
             return Err(ObjectError::InvalidModule(
                 "AArch64 code is not instruction aligned",
             ));
         }
+
+        let instruction_count = self.code.len() / 4;
+        let mut unconditional_targets = Vec::new();
+        unconditional_targets
+            .try_reserve_exact(instruction_count)
+            .map_err(|_| {
+                ObjectError::InvalidModule("AArch64 branch target map allocation failed")
+            })?;
+        unconditional_targets.resize(instruction_count, None);
+
+        let mut relocation_anchors = Vec::new();
+        relocation_anchors
+            .try_reserve_exact(instruction_count)
+            .map_err(|_| {
+                ObjectError::InvalidModule("AArch64 relocation anchor allocation failed")
+            })?;
+        relocation_anchors.resize(instruction_count, false);
+        for &offset in relocation_offsets {
+            if !offset.is_multiple_of(4) || offset > self.code.len() {
+                return Err(ObjectError::InvalidModule(
+                    "AArch64 relocation is not an instruction boundary",
+                ));
+            }
+            if offset < self.code.len() {
+                let instruction = offset / 4;
+                let anchor =
+                    relocation_anchors
+                        .get_mut(instruction)
+                        .ok_or(ObjectError::InvalidModule(
+                            "AArch64 relocation anchor outside native code",
+                        ))?;
+                *anchor = true;
+            }
+        }
+
         for fixup in &self.fixups {
             let target = self
                 .labels
@@ -7346,40 +7470,275 @@ impl Aarch64Assembler {
                     "AArch64 branch target is not an instruction boundary",
                 ));
             }
-            let target = i64::try_from(target)
-                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 branch target"))?;
-            let source = i64::try_from(fixup.instruction)
-                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 branch source"))?;
-            let delta = target
-                .checked_sub(source)
-                .ok_or(ObjectError::ArithmeticOverflow(
-                    "AArch64 branch displacement",
-                ))?;
-            if delta % 4 != 0 {
+            if !fixup.instruction.is_multiple_of(4) {
                 return Err(ObjectError::InvalidModule(
-                    "AArch64 branch displacement is unaligned",
+                    "AArch64 branch source is not an instruction boundary",
                 ));
             }
-            let words = delta / 4;
-            let (bits, shift, opcode_mask) = match fixup.kind {
-                Aarch64FixupKind::Branch26 => (26_u8, 0_u8, 0xfc00_0000_u32),
-                Aarch64FixupKind::Conditional19 => (19, 5, 0xff00_001f),
-                Aarch64FixupKind::CompareBranch19 => (19, 5, 0xff00_001f),
-                Aarch64FixupKind::TestBit14 => (14, 5, 0xfff8_001f),
-            };
-            let sign_bit = bits
-                .checked_sub(1)
-                .ok_or(ObjectError::InvalidModule("AArch64 branch bit width"))?;
-            let magnitude = 1_i64
-                .checked_shl(u32::from(sign_bit))
-                .ok_or(ObjectError::ArithmeticOverflow("AArch64 branch range"))?;
-            let minimum = magnitude
-                .checked_neg()
-                .ok_or(ObjectError::ArithmeticOverflow("AArch64 branch minimum"))?;
-            let maximum = magnitude
-                .checked_sub(1)
-                .ok_or(ObjectError::ArithmeticOverflow("AArch64 branch maximum"))?;
-            if words < minimum || words > maximum {
+            let end = fixup
+                .instruction
+                .checked_add(4)
+                .ok_or(ObjectError::ArithmeticOverflow("AArch64 fixup extent"))?;
+            if end > self.code.len() {
+                return Err(ObjectError::InvalidModule(
+                    "AArch64 fixup outside native code",
+                ));
+            }
+            if fixup.kind == Aarch64FixupKind::Branch26 {
+                let instruction = fixup.instruction / 4;
+                let slot = unconditional_targets.get_mut(instruction).ok_or(
+                    ObjectError::InvalidModule("AArch64 unconditional branch outside native code"),
+                )?;
+                if slot.replace(fixup.label).is_some() {
+                    return Err(ObjectError::InvalidModule("duplicate AArch64 branch fixup"));
+                }
+            }
+        }
+        for (target, &is_relocated) in unconditional_targets.iter_mut().zip(&relocation_anchors) {
+            if is_relocated {
+                // The linker owns the final target of a relocated instruction,
+                // so it cannot serve as a symbolic internal trampoline.
+                *target = None;
+            }
+        }
+
+        let mut fixups = Vec::new();
+        fixups
+            .try_reserve_exact(self.fixups.len())
+            .map_err(|_| ObjectError::InvalidModule("AArch64 fixup copy allocation failed"))?;
+        fixups.extend_from_slice(&self.fixups);
+
+        let mut removed = Vec::new();
+        removed
+            .try_reserve_exact(instruction_count)
+            .map_err(|_| ObjectError::InvalidModule("AArch64 branch removal allocation failed"))?;
+        removed.resize(instruction_count, false);
+        let mut remove_this_round = Vec::new();
+        remove_this_round
+            .try_reserve_exact(instruction_count)
+            .map_err(|_| {
+                ObjectError::InvalidModule("AArch64 branch relaxation allocation failed")
+            })?;
+        remove_this_round.resize(instruction_count, false);
+
+        // Preserve direct fallthrough information in the first phase: if its
+        // next instruction is itself a trampoline, threading first would turn
+        // a removable branch into a non-fallthrough direct edge. Thread every
+        // surviving target before the second phase, which then exposes any
+        // additional fallthroughs created by the first compaction.
+        for thread_targets in [false, true] {
+            if thread_targets {
+                for fixup in &mut fixups {
+                    let threaded = self.threaded_label(fixup.label, &unconditional_targets);
+                    let target = self
+                        .labels
+                        .get(threaded)
+                        .copied()
+                        .flatten()
+                        .ok_or(ObjectError::InvalidModule("unbound AArch64 branch label"))?;
+                    let words = Self::fixup_words(fixup.instruction, target)?;
+                    let (bits, _, _) = Self::fixup_encoding(fixup.kind);
+                    if Self::fixup_words_fit(words, bits)? {
+                        fixup.label = threaded;
+                    }
+                }
+            }
+
+            loop {
+                remove_this_round.fill(false);
+                let mut changed = false;
+                for fixup in &fixups {
+                    if fixup.kind != Aarch64FixupKind::Branch26 {
+                        continue;
+                    }
+                    let source = fixup.instruction / 4;
+                    if removed.get(source).copied().unwrap_or(true)
+                        || relocation_anchors.get(source).copied().unwrap_or(true)
+                    {
+                        continue;
+                    }
+                    let target = self
+                        .labels
+                        .get(fixup.label)
+                        .copied()
+                        .flatten()
+                        .ok_or(ObjectError::InvalidModule("unbound AArch64 branch label"))?;
+                    let mut target_instruction = target / 4;
+                    while target_instruction < instruction_count
+                        && removed.get(target_instruction).copied().unwrap_or(false)
+                    {
+                        target_instruction = target_instruction.checked_add(1).ok_or(
+                            ObjectError::ArithmeticOverflow("AArch64 branch target compaction"),
+                        )?;
+                    }
+                    let mut fallthrough =
+                        source
+                            .checked_add(1)
+                            .ok_or(ObjectError::ArithmeticOverflow(
+                                "AArch64 branch fallthrough",
+                            ))?;
+                    while fallthrough < instruction_count
+                        && removed.get(fallthrough).copied().unwrap_or(false)
+                    {
+                        fallthrough = fallthrough.checked_add(1).ok_or(
+                            ObjectError::ArithmeticOverflow(
+                                "AArch64 branch fallthrough compaction",
+                            ),
+                        )?;
+                    }
+                    if target_instruction == fallthrough {
+                        let remove = remove_this_round.get_mut(source).ok_or(
+                            ObjectError::InvalidModule(
+                                "AArch64 branch removal outside native code",
+                            ),
+                        )?;
+                        *remove = true;
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+                for (removed, &remove) in removed.iter_mut().zip(&remove_this_round) {
+                    *removed |= remove;
+                }
+            }
+        }
+
+        let mut removed_prefix = Vec::new();
+        let prefix_entries =
+            instruction_count
+                .checked_add(1)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "AArch64 branch prefix entries",
+                ))?;
+        removed_prefix
+            .try_reserve_exact(prefix_entries)
+            .map_err(|_| ObjectError::InvalidModule("AArch64 branch prefix allocation failed"))?;
+        removed_prefix.push(0_usize);
+        for &is_removed in &removed {
+            let previous = removed_prefix
+                .last()
+                .copied()
+                .ok_or(ObjectError::InvalidModule(
+                    "AArch64 branch prefix is unexpectedly empty",
+                ))?;
+            removed_prefix.push(previous.checked_add(usize::from(is_removed)).ok_or(
+                ObjectError::ArithmeticOverflow("AArch64 removed branch count"),
+            )?);
+        }
+
+        let remap = |offset: usize| -> Result<usize, ObjectError> {
+            if !offset.is_multiple_of(4) || offset > self.code.len() {
+                return Err(ObjectError::InvalidModule(
+                    "AArch64 compacted offset is not an instruction boundary",
+                ));
+            }
+            let instruction = offset / 4;
+            let removed_before =
+                removed_prefix
+                    .get(instruction)
+                    .copied()
+                    .ok_or(ObjectError::InvalidModule(
+                        "AArch64 compacted offset outside native code",
+                    ))?;
+            offset
+                .checked_sub(removed_before.checked_mul(4).ok_or(
+                    ObjectError::ArithmeticOverflow("AArch64 compacted byte count"),
+                )?)
+                .ok_or(ObjectError::ArithmeticOverflow("AArch64 compacted offset"))
+        };
+
+        let removed_bytes = removed_prefix
+            .last()
+            .copied()
+            .and_then(|count| count.checked_mul(4))
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "AArch64 removed branch bytes",
+            ))?;
+        let compacted_len =
+            self.code
+                .len()
+                .checked_sub(removed_bytes)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "AArch64 compacted code length",
+                ))?;
+        let mut code = Vec::new();
+        code.try_reserve_exact(compacted_len)
+            .map_err(|_| ObjectError::InvalidModule("AArch64 code compaction allocation failed"))?;
+        for (instruction, bytes) in self.code.chunks_exact(4).enumerate() {
+            if !removed.get(instruction).copied().unwrap_or(true) {
+                code.extend_from_slice(bytes);
+            }
+        }
+
+        let mut labels = Vec::new();
+        labels
+            .try_reserve_exact(self.labels.len())
+            .map_err(|_| ObjectError::InvalidModule("AArch64 label remap allocation failed"))?;
+        for &label in &self.labels {
+            labels.push(label.map(&remap).transpose()?);
+        }
+
+        let mut compacted_fixups = Vec::new();
+        compacted_fixups
+            .try_reserve_exact(fixups.len())
+            .map_err(|_| ObjectError::InvalidModule("AArch64 fixup remap allocation failed"))?;
+        for mut fixup in fixups {
+            let instruction = fixup.instruction / 4;
+            if removed.get(instruction).copied().unwrap_or(true) {
+                continue;
+            }
+            fixup.instruction = remap(fixup.instruction)?;
+            compacted_fixups.push(fixup);
+        }
+
+        let mut compacted_relocations = Vec::new();
+        compacted_relocations
+            .try_reserve_exact(relocation_offsets.len())
+            .map_err(|_| {
+                ObjectError::InvalidModule("AArch64 relocation remap allocation failed")
+            })?;
+        for &offset in relocation_offsets {
+            if offset < self.code.len() && removed.get(offset / 4).copied().unwrap_or(true) {
+                return Err(ObjectError::InvalidModule(
+                    "AArch64 optimizer removed a relocation anchor",
+                ));
+            }
+            compacted_relocations.push(remap(offset)?);
+        }
+
+        Ok(Aarch64OptimizedAssembly {
+            code,
+            labels,
+            fixups: compacted_fixups,
+            relocation_offsets: compacted_relocations,
+        })
+    }
+
+    #[cfg(test)]
+    fn finish(self) -> Result<Vec<u8>, ObjectError> {
+        self.finish_with_offsets(&mut [])
+    }
+
+    fn finish_with_offsets(
+        mut self,
+        relocation_offsets: &mut [usize],
+    ) -> Result<Vec<u8>, ObjectError> {
+        let optimized = self.control_flow_optimized(relocation_offsets)?;
+        self.code = optimized.code;
+        self.labels = optimized.labels;
+        self.fixups = optimized.fixups;
+        for fixup in &self.fixups {
+            let target = self
+                .labels
+                .get(fixup.label)
+                .copied()
+                .flatten()
+                .ok_or(ObjectError::InvalidModule("unbound AArch64 branch label"))?;
+            let words = Self::fixup_words(fixup.instruction, target)?;
+            let (bits, shift, opcode_mask) = Self::fixup_encoding(fixup.kind);
+            if !Self::fixup_words_fit(words, bits)? {
                 return Err(ObjectError::InvalidModule("AArch64 branch is out of range"));
             }
             let end = fixup
@@ -7405,6 +7764,7 @@ impl Aarch64Assembler {
             let patched = (encoded & opcode_mask) | (immediate << shift);
             self.code[fixup.instruction..end].copy_from_slice(&patched.to_le_bytes());
         }
+        relocation_offsets.copy_from_slice(&optimized.relocation_offsets);
         Ok(self.code)
     }
 }
@@ -10255,20 +10615,21 @@ fn lower_aarch64_dfa_for_operating_system(
     assembler.bind(done)?;
     assembler.instruction(0xd65f_03c0)?;
 
-    let code = assembler.finish()?;
+    let mut relocation_offsets = [table_page, table_page_offset];
+    let code = assembler.finish_with_offsets(&mut relocation_offsets)?;
     Ok((
         code,
         vec![
             ModuleRelocation {
                 section: TEXT_SECTION,
-                offset: offset_u64(table_page, "AArch64 DFA ADRP relocation offset")?,
+                offset: offset_u64(relocation_offsets[0], "AArch64 DFA ADRP relocation offset")?,
                 kind: RelocationKind::Aarch64Page21,
                 symbol: PROGRAM_SYMBOL,
                 addend: 0,
             },
             ModuleRelocation {
                 section: TEXT_SECTION,
-                offset: offset_u64(table_page_offset, "AArch64 DFA ADD relocation offset")?,
+                offset: offset_u64(relocation_offsets[1], "AArch64 DFA ADD relocation offset")?,
                 kind: RelocationKind::Aarch64PageOff12,
                 symbol: PROGRAM_SYMBOL,
                 addend: 0,
@@ -10321,28 +10682,29 @@ fn lower_aarch64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), O
     assembler.bind(invalid)?;
     assembler.instruction(aarch64_movz_w(0, 2)?)?;
     assembler.instruction(0xd65f_03c0)?;
-    let code = assembler.finish()?;
+    let mut relocation_offsets = [program_page, program_page_offset, runtime_branch];
+    let code = assembler.finish_with_offsets(&mut relocation_offsets)?;
 
     Ok((
         code,
         vec![
             ModuleRelocation {
                 section: TEXT_SECTION,
-                offset: offset_u64(program_page, "AArch64 ADRP relocation offset")?,
+                offset: offset_u64(relocation_offsets[0], "AArch64 ADRP relocation offset")?,
                 kind: RelocationKind::Aarch64Page21,
                 symbol: PROGRAM_SYMBOL,
                 addend: 0,
             },
             ModuleRelocation {
                 section: TEXT_SECTION,
-                offset: offset_u64(program_page_offset, "AArch64 ADD relocation offset")?,
+                offset: offset_u64(relocation_offsets[1], "AArch64 ADD relocation offset")?,
                 kind: RelocationKind::Aarch64PageOff12,
                 symbol: PROGRAM_SYMBOL,
                 addend: 0,
             },
             ModuleRelocation {
                 section: TEXT_SECTION,
-                offset: offset_u64(runtime_branch, "AArch64 branch relocation offset")?,
+                offset: offset_u64(relocation_offsets[2], "AArch64 branch relocation offset")?,
                 kind: RelocationKind::Aarch64Branch26,
                 symbol: RUNTIME_SYMBOL,
                 addend: 0,
@@ -10485,6 +10847,220 @@ mod tests {
         let label = invalid.label().unwrap();
         assert!(invalid.branch_bit_set_w(8, 32, label).is_err());
         assert!(invalid.branch_bit_clear_w(8, 32, label).is_err());
+    }
+
+    #[test]
+    fn aarch64_branch_targets_thread_through_unconditional_trampolines() {
+        let mut assembler = Aarch64Assembler::new();
+        let trampoline = assembler.label().unwrap();
+        let after_trampoline = assembler.label().unwrap();
+        let done = assembler.label().unwrap();
+
+        assembler.branch_cond(AARCH64_EQ, trampoline).unwrap();
+        assembler.instruction(0xd503_201f).unwrap(); // nop
+        assembler.branch(after_trampoline).unwrap();
+        assembler.bind(trampoline).unwrap();
+        assembler.branch(done).unwrap();
+        assembler.bind(after_trampoline).unwrap();
+        assembler.instruction(0xd503_201f).unwrap(); // nop
+        assembler.bind(done).unwrap();
+        assembler.instruction(0xd65f_03c0).unwrap(); // ret
+
+        let words = assembler
+            .finish()
+            .unwrap()
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            words,
+            [
+                0x5400_00a0, // b.eq done, bypassing trampoline
+                0xd503_201f,
+                0x1400_0002, // b after_trampoline
+                0x1400_0002, // retained fallthrough entry still reaches done
+                0xd503_201f,
+                0xd65f_03c0,
+            ]
+        );
+    }
+
+    #[test]
+    fn aarch64_direct_fallthrough_is_deleted_before_target_threading() {
+        let mut assembler = Aarch64Assembler::new();
+        let trampoline = assembler.label().unwrap();
+        let done = assembler.label().unwrap();
+
+        assembler.branch(trampoline).unwrap();
+        assembler.bind(trampoline).unwrap();
+        assembler.branch(done).unwrap();
+        assembler.instruction(0xd503_201f).unwrap(); // nop
+        assembler.bind(done).unwrap();
+        assembler.instruction(0xd65f_03c0).unwrap(); // ret
+
+        let words = assembler
+            .finish()
+            .unwrap()
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(words, [0x1400_0002, 0xd503_201f, 0xd65f_03c0]);
+    }
+
+    #[test]
+    fn aarch64_threading_preserves_in_range_trampoline_for_narrow_branch() {
+        let mut assembler = Aarch64Assembler::new();
+        let trampoline = assembler.label().unwrap();
+        let after_trampoline = assembler.label().unwrap();
+        let done = assembler.label().unwrap();
+
+        assembler.branch_bit_clear_w(0, 0, trampoline).unwrap();
+        assembler.branch(after_trampoline).unwrap();
+        assembler.bind(trampoline).unwrap();
+        assembler.branch(done).unwrap();
+        assembler.bind(after_trampoline).unwrap();
+        for _ in 0..8_192 {
+            assembler.instruction(0xd503_201f).unwrap(); // nop
+        }
+        assembler.bind(done).unwrap();
+        assembler.instruction(0xd65f_03c0).unwrap(); // ret
+
+        let code = assembler.finish().unwrap();
+        let words = code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(words[0], 0x3600_0040); // tbz trampoline remains in TestBit14 range
+        assert_eq!(words[1], 0x1400_0002); // skip the retained trampoline
+    }
+
+    #[test]
+    fn aarch64_fallthrough_branches_are_deleted_to_a_fixed_point() {
+        let mut assembler = Aarch64Assembler::new();
+        let mut trampolines = Vec::new();
+        trampolines.try_reserve_exact(6).unwrap();
+        for _ in 0..6 {
+            trampolines.push(assembler.label().unwrap());
+        }
+        let done = assembler.label().unwrap();
+
+        assembler.branch_cond(AARCH64_EQ, trampolines[0]).unwrap();
+        assembler.instruction(0xd503_201f).unwrap(); // nop
+        for trampoline in trampolines {
+            assembler.bind(trampoline).unwrap();
+            assembler.branch(done).unwrap();
+        }
+        assembler.bind(done).unwrap();
+        assembler.instruction(0xd65f_03c0).unwrap(); // ret
+
+        let words = assembler
+            .finish()
+            .unwrap()
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            words,
+            [
+                0x5400_0040, // all six trampolines compacted away
+                0xd503_201f,
+                0xd65f_03c0,
+            ]
+        );
+    }
+
+    #[test]
+    fn aarch64_unconditional_branch_cycles_terminate_and_preserve_the_loop() {
+        let mut assembler = Aarch64Assembler::new();
+        let first = assembler.label().unwrap();
+        let second = assembler.label().unwrap();
+        assembler.bind(first).unwrap();
+        assembler.branch(second).unwrap();
+        assembler.bind(second).unwrap();
+        assembler.branch(first).unwrap();
+
+        let words = assembler
+            .finish()
+            .unwrap()
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(words, [0x1400_0000]); // compacted canonical self-loop
+    }
+
+    #[test]
+    fn aarch64_relocated_branches_are_opaque_to_control_flow_rewrites() {
+        let mut assembler = Aarch64Assembler::new();
+        let trampoline = assembler.label().unwrap();
+        let after_trampoline = assembler.label().unwrap();
+        let done = assembler.label().unwrap();
+
+        assembler.branch_cond(AARCH64_EQ, trampoline).unwrap();
+        assembler.branch(after_trampoline).unwrap();
+        assembler.bind(trampoline).unwrap();
+        let link_owned_branch = assembler.code.len();
+        assembler.branch(done).unwrap();
+        assembler.bind(after_trampoline).unwrap();
+        assembler.instruction(0xd503_201f).unwrap(); // nop
+        assembler.bind(done).unwrap();
+        assembler.instruction(0xd65f_03c0).unwrap(); // ret
+
+        let mut relocation_offsets = [link_owned_branch];
+        let words = assembler
+            .finish_with_offsets(&mut relocation_offsets)
+            .unwrap()
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(relocation_offsets, [8]);
+        assert_eq!(
+            words,
+            [
+                0x5400_0040, // b.eq still reaches the link-owned trampoline
+                0x1400_0002,
+                0x1400_0002, // relocated branch is retained
+                0xd503_201f,
+                0xd65f_03c0,
+            ]
+        );
+    }
+
+    #[test]
+    fn aarch64_branch_compaction_remaps_relocations_transactionally() {
+        let mut assembler = Aarch64Assembler::new();
+        let relocated = assembler.label().unwrap();
+        assembler.branch(relocated).unwrap();
+        assembler.bind(relocated).unwrap();
+        let adrp = assembler.instruction(0x9000_0005).unwrap();
+        assembler.instruction(0xd65f_03c0).unwrap(); // ret
+        let old_end = assembler.code.len();
+        let mut relocation_offsets = [adrp, old_end];
+        let code = assembler
+            .finish_with_offsets(&mut relocation_offsets)
+            .unwrap();
+        assert_eq!(relocation_offsets, [0, 8]);
+        assert_eq!(
+            code.chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>(),
+            [0x9000_0005, 0xd65f_03c0]
+        );
+
+        let mut invalid = Aarch64Assembler::new();
+        let unbound = invalid.label().unwrap();
+        invalid.branch(unbound).unwrap();
+        let original = invalid.clone();
+        let mut unchanged_offsets = [0_usize];
+        assert!(invalid.control_flow_optimized(&unchanged_offsets).is_err());
+        assert_eq!(invalid, original);
+        assert!(
+            invalid
+                .clone()
+                .finish_with_offsets(&mut unchanged_offsets)
+                .is_err()
+        );
+        assert_eq!(unchanged_offsets, [0]);
+        assert_eq!(invalid, original);
     }
 
     #[test]

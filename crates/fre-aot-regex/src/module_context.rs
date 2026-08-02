@@ -7869,20 +7869,27 @@ fn lower_aarch64_context(
     assembler.instruction(aarch64_movz_w(0, 2)?)?;
     assembler.bind(done)?;
     assembler.instruction(0xd65f_03c0)?;
-    let code = assembler.finish()?;
+    let mut relocation_offsets = [table_page, table_page_offset];
+    let code = assembler.finish_with_offsets(&mut relocation_offsets)?;
     Ok((
         code,
         vec![
             ModuleRelocation {
                 section: TEXT_SECTION,
-                offset: offset_u64(table_page, "AArch64 context ADRP relocation offset")?,
+                offset: offset_u64(
+                    relocation_offsets[0],
+                    "AArch64 context ADRP relocation offset",
+                )?,
                 kind: RelocationKind::Aarch64Page21,
                 symbol: PROGRAM_SYMBOL,
                 addend: 0,
             },
             ModuleRelocation {
                 section: TEXT_SECTION,
-                offset: offset_u64(table_page_offset, "AArch64 context ADD relocation offset")?,
+                offset: offset_u64(
+                    relocation_offsets[1],
+                    "AArch64 context ADD relocation offset",
+                )?,
                 kind: RelocationKind::Aarch64PageOff12,
                 symbol: PROGRAM_SYMBOL,
                 addend: 0,
