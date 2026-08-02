@@ -15,7 +15,7 @@ use core::{fmt, mem::size_of};
 
 use fre_simd_kernels::{
     BYTE_SET_BLOCK_BYTES, BYTE_SET_CLASSIFIER_BUILD_WORK, ByteSet256, ByteSetClassifier,
-    classify_byte_delta_16,
+    classify_byte_delta_16, classify_byte_set4_16,
 };
 use memchr::{memchr, memchr2, memchr3};
 
@@ -1183,6 +1183,7 @@ enum AdaptiveFinder {
     One(u8),
     Two(u8, u8),
     Three(u8, u8, u8),
+    Four([u8; 4]),
     Range { origin: u8, maximum_delta: u8 },
     Set(ByteSetClassifier),
 }
@@ -1204,6 +1205,7 @@ impl AdaptiveFallback {
             AdaptiveFinder::One(_)
             | AdaptiveFinder::Two(_, _)
             | AdaptiveFinder::Three(_, _, _)
+            | AdaptiveFinder::Four(_)
             | AdaptiveFinder::Range { .. } => 0,
         }
     }
@@ -1258,6 +1260,14 @@ impl<'a> AdaptiveFinderCursor<'a> {
                 .get(cursor..self.anchor_end)
                 .and_then(|bytes| memchr3(*first, *second, *third, bytes))
                 .and_then(|relative| cursor.checked_add(relative)),
+            AdaptiveFinder::Four(members) => {
+                let members = *members;
+                self.find_classified(
+                    cursor,
+                    |block| classify_byte_set4_16(members, block).member_mask(),
+                    |byte| members.contains(&byte),
+                )
+            }
             AdaptiveFinder::Range {
                 origin,
                 maximum_delta,
@@ -1340,7 +1350,7 @@ impl<'a> AdaptiveFinderCursor<'a> {
 #[derive(Clone, Copy, Debug)]
 struct FallbackCandidate {
     score: (usize, u8, usize),
-    bytes: [u8; 3],
+    bytes: [u8; 4],
     set: ByteSet256,
     contiguous_range: Option<(u8, u8)>,
 }
@@ -1610,7 +1620,7 @@ fn select_anchor(
             .ok_or(BuildError::ArithmeticOverflow {
                 computation: "anchor position mask",
             })?;
-        let mut bytes = [0_u8; 3];
+        let mut bytes = [0_u8; 4];
         let mut members = 0_usize;
         let mut rank = 0_u8;
         let mut set_words = [0_u64; 4];
@@ -1726,6 +1736,7 @@ fn select_anchor(
                         origin,
                         maximum_delta,
                     },
+                    None if candidate.score.0 == 4 => AdaptiveFinder::Four(candidate.bytes),
                     None => {
                         tracker.build_adaptive_classifier()?;
                         AdaptiveFinder::Set(ByteSetClassifier::new(candidate.set))
@@ -4543,6 +4554,7 @@ mod tests {
             AdaptiveFinder::Three(first, second, third) => {
                 byte == *first || byte == *second || byte == *third
             }
+            AdaptiveFinder::Four(members) => members.contains(&byte),
             AdaptiveFinder::Range {
                 origin,
                 maximum_delta,
@@ -5597,7 +5609,8 @@ mod tests {
                 }
                 AdaptiveFinder::One(_)
                 | AdaptiveFinder::Two(_, _)
-                | AdaptiveFinder::Three(_, _, _) => {
+                | AdaptiveFinder::Three(_, _, _)
+                | AdaptiveFinder::Four(_) => {
                     panic!("five-member fallback used a tiny finder")
                 }
             }
@@ -5719,9 +5732,10 @@ mod tests {
         const ONE: &[(u8, u8)] = &[(0, 0)];
         const TWO: &[(u8, u8)] = &[(0, 1)];
         const THREE: &[(u8, u8)] = &[(0, 2)];
+        const FOUR: &[(u8, u8)] = &[(0, 0), (2, 2), (4, 4), (6, 6)];
         const BROAD: &[(u8, u8)] = &[(0, 0x7E)];
 
-        for (predicate, expected_members) in [(ONE, 1), (TWO, 2), (THREE, 3)] {
+        for (predicate, expected_members) in [(ONE, 1), (TWO, 2), (THREE, 3), (FOUR, 4)] {
             let positions = [BROAD, predicate, BROAD, BROAD, PRIMARY];
             let plan =
                 FixedPredicateWord64Plan::build(&positions, BuildLimits::unlimited()).unwrap();
@@ -5732,6 +5746,7 @@ mod tests {
                 (AdaptiveFinder::One(0), 1)
                     | (AdaptiveFinder::Two(0, 1), 2)
                     | (AdaptiveFinder::Three(0, 1, 2), 3)
+                    | (AdaptiveFinder::Four([0, 2, 4, 6]), 4)
             ));
             assert_eq!(plan.max_verification_predicates(), 4);
             assert_eq!(plan.build.adaptive_classifier_build_work, 0);
@@ -5745,6 +5760,7 @@ mod tests {
             (AdaptiveFinder::One(0), 0_u8),
             (AdaptiveFinder::Two(0, 1), 1),
             (AdaptiveFinder::Three(0, 1, 2), 2),
+            (AdaptiveFinder::Four([0, 1, 2, 3]), 3),
             (
                 AdaptiveFinder::Range {
                     origin: b'A',
@@ -5780,6 +5796,7 @@ mod tests {
             set_words[usize::from(byte >> 6)] |= 1_u64 << u32::from(byte & 63);
         }
         let finders = [
+            AdaptiveFinder::Four([b'A', b'B', b'C', b'D']),
             AdaptiveFinder::Range {
                 origin: b'A',
                 maximum_delta: 3,
@@ -5817,6 +5834,7 @@ mod tests {
             AdaptiveFinder::One(0),
             AdaptiveFinder::Two(0, 2),
             AdaptiveFinder::Three(0, 2, 255),
+            AdaptiveFinder::Four([0, 2, 4, 255]),
             AdaptiveFinder::Range {
                 origin: b'A',
                 maximum_delta: 3,
@@ -5859,6 +5877,7 @@ mod tests {
             AdaptiveFinder::One(0),
             AdaptiveFinder::Two(0, 255),
             AdaptiveFinder::Three(1, 127, 254),
+            AdaptiveFinder::Four([1, 64, 127, 254]),
             AdaptiveFinder::Range {
                 origin: 73,
                 maximum_delta: 31,
@@ -5895,6 +5914,12 @@ mod tests {
     fn resumable_range_and_set_phases_preserve_random_plan_accounting() {
         const ASCII: &[(u8, u8)] = &[(0, 0x7F)];
         const RANGE: &[(u8, u8)] = &[(b'A', b'D')];
+        const FOUR: &[(u8, u8)] = &[
+            (b'a', b'a'),
+            (b'c', b'c'),
+            (b'e', b'e'),
+            (0xFF, 0xFF),
+        ];
         const SET: &[(u8, u8)] = &[
             (b'a', b'a'),
             (b'c', b'c'),
@@ -5905,11 +5930,13 @@ mod tests {
         const PRIMARY: &[(u8, u8)] = &[(0xFF, 0xFF)];
         const FULL: &[(u8, u8)] = &[(0, 0xFF)];
         let range_positions = [ASCII, RANGE, ASCII, ASCII, PRIMARY, FULL];
+        let four_positions = [ASCII, FOUR, ASCII, ASCII, PRIMARY, FULL];
         let set_positions = [ASCII, SET, ASCII, ASCII, PRIMARY, FULL];
         let mut random = 0xE703_7ED1_A0B4_28DB_u64;
 
         for (predicates, expected_finder) in [
             (range_positions.as_slice(), "range"),
+            (four_positions.as_slice(), "four"),
             (set_positions.as_slice(), "set"),
         ] {
             let plan =
@@ -5917,7 +5944,9 @@ mod tests {
             let fallback = plan.adaptive_fallback.as_ref().unwrap();
             assert!(matches!(
                 (&fallback.finder, expected_finder),
-                (AdaptiveFinder::Range { .. }, "range") | (AdaptiveFinder::Set(_), "set")
+                (AdaptiveFinder::Four(_), "four")
+                    | (AdaptiveFinder::Range { .. }, "range")
+                    | (AdaptiveFinder::Set(_), "set")
             ));
             for case in 0..256_usize {
                 random = random
