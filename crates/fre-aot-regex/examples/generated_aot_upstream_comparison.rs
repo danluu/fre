@@ -2169,6 +2169,22 @@ fn generator_expected(spec: &SeededPatternSpec, size: usize, position: MatchPosi
         })
 }
 
+fn generated_insertion_is_valid(
+    nested_grammar: bool,
+    output_matrix: bool,
+    position: MatchPosition,
+    upstream: AbiResult,
+    intended: AbiResult,
+) -> bool {
+    upstream == intended
+        || (position != MatchPosition::None
+            && upstream.status != 0
+            && (nested_grammar
+                || (output_matrix
+                    && upstream.start <= intended.start
+                    && upstream.end >= intended.end)))
+}
+
 fn build_scenarios(config: &Config, shapes: &[CompiledShape]) -> Result<Vec<Scenario>, String> {
     let mut scenarios = Vec::new();
     for (shape_index, shape) in shapes.iter().enumerate() {
@@ -2203,10 +2219,13 @@ fn build_scenarios(config: &Config, shapes: &[CompiledShape]) -> Result<Vec<Scen
                             shape.spec.output,
                         )?;
                         if upstream != aot
-                            || (!config.nested_grammar && upstream != intended)
-                            || (config.nested_grammar
-                                && position != MatchPosition::None
-                                && upstream.status == 0)
+                            || !generated_insertion_is_valid(
+                                config.nested_grammar,
+                                config.output_matrix,
+                                position,
+                                upstream,
+                                intended,
+                            )
                         {
                             return Err(format!(
                                 "{} validation failed for {size}/{}/{}/rotation {rotation}: upstream oracle {upstream:?}, AOT {aot:?}, generated insertion {intended:?}",
@@ -3683,6 +3702,76 @@ mod tests {
             assert!(entries.insert(compiled.module().entry_symbol().to_owned()));
         }
         assert_eq!(entries.len(), OutputKind::MATRIX.len());
+    }
+
+    #[test]
+    fn generated_insertion_validation_separates_nested_and_output_matrix_semantics() {
+        let fixed_intended = AbiResult {
+            status: 1,
+            start: 30,
+            end: 34,
+        };
+        let fixed_extension = AbiResult {
+            status: 1,
+            start: 29,
+            end: 34,
+        };
+        assert!(generated_insertion_is_valid(
+            false,
+            false,
+            MatchPosition::Middle,
+            fixed_intended,
+            fixed_intended,
+        ));
+        assert!(generated_insertion_is_valid(
+            false,
+            true,
+            MatchPosition::Middle,
+            fixed_extension,
+            fixed_intended,
+        ));
+        assert!(!generated_insertion_is_valid(
+            false,
+            true,
+            MatchPosition::Middle,
+            AbiResult {
+                status: 1,
+                start: 5,
+                end: 10,
+            },
+            fixed_intended,
+        ));
+
+        let nested_intended = AbiResult {
+            status: 1,
+            start: 0,
+            end: 20,
+        };
+        assert!(generated_insertion_is_valid(
+            true,
+            true,
+            MatchPosition::Start,
+            AbiResult {
+                status: 1,
+                start: 0,
+                end: 16,
+            },
+            nested_intended,
+        ));
+        assert!(!generated_insertion_is_valid(
+            false,
+            true,
+            MatchPosition::Middle,
+            NO_MATCH,
+            fixed_intended,
+        ));
+        assert!(!generated_insertion_is_valid(
+            false,
+            true,
+            MatchPosition::None,
+            fixed_extension,
+            NO_MATCH,
+        ));
     }
 
     #[test]
