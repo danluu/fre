@@ -70,10 +70,13 @@ pub use byte_bucket::{
 };
 pub use byte_range::classify_byte_delta_16;
 pub use byte_set::{
-    BYTE_SET_BLOCK_BYTES, BYTE_SET_CLASSIFIER_BUILD_WORK, ByteSet256, ByteSetClassifier,
-    ByteSetMask16,
+    BYTE_SET_BLOCK_BYTES, BYTE_SET_CANDIDATE_BLOCK_BYTES, BYTE_SET_CLASSIFIER_BUILD_WORK,
+    BYTE_SET_WIDE_BLOCK_BYTES, ByteSet256, ByteSetClassifier, ByteSetMask16, ByteSetMask32,
 };
-pub use byte_set4::classify_byte_set4_16;
+pub use byte_set4::{
+    classify_byte_set1_16, classify_byte_set1_32, classify_byte_set2_16, classify_byte_set2_32,
+    classify_byte_set3_16, classify_byte_set3_32, classify_byte_set4_16, classify_byte_set4_32,
+};
 
 /// Number of bytes consumed by the narrow classifier operation.
 pub const ASCII_NARROW_BYTES: usize = 16;
