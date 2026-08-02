@@ -222,6 +222,8 @@ pub use fixed_class_sandwich::{
     SPAN_SUM_OPERATION_ID as FIXED_CLASS_SANDWICH_SPAN_SUM_OPERATION_ID,
     Semantics as FixedClassSandwichSemantics, SpanSumResult as FixedClassSandwichSpanSumResult,
 };
+#[doc(hidden)]
+pub use fixed_predicate_word64::FixedPredicateWord64SearchCursor;
 pub use fixed_predicate_word64::{
     AdaptiveFinderIdentity as FixedPredicateWord64AdaptiveFinderIdentity,
     AdaptiveFinderKind as FixedPredicateWord64AdaptiveFinderKind,
@@ -238,8 +240,8 @@ pub use fixed_predicate_word64::{
     COUNT_OPERATION_ID as FIXED_PREDICATE_WORD64_COUNT_OPERATION_ID,
     CountResult as FixedPredicateWord64CountResult,
     ExactAnchorIdentity as FixedPredicateWord64ExactAnchorIdentity, FixedPredicateWord64Plan,
-    FixedPredicateWord64SearchCursor, MASK_SLOTS as FIXED_PREDICATE_WORD64_MASK_SLOTS,
-    MAX_WIDTH as FIXED_PREDICATE_WORD64_MAX_WIDTH, MIN_WIDTH as FIXED_PREDICATE_WORD64_MIN_WIDTH,
+    MASK_SLOTS as FIXED_PREDICATE_WORD64_MASK_SLOTS, MAX_WIDTH as FIXED_PREDICATE_WORD64_MAX_WIDTH,
+    MIN_WIDTH as FIXED_PREDICATE_WORD64_MIN_WIDTH,
     MatchSelection as FixedPredicateWord64MatchSelection,
     MatchSemantics as FixedPredicateWord64MatchSemantics,
     Operation as FixedPredicateWord64Operation,

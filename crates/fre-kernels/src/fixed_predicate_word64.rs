@@ -28,21 +28,21 @@ use crate::packed_ordered_literal_aggregate::byte_frequency_rank;
 
 /// Stable identity for the fixed-predicate anchor-or-Shift-And strategy.
 pub const PLAN_ID: &str =
-    "fixed-predicate-word64.adaptive-fixed-anchor-or-shift-and.nonoverlap.v11";
+    "fixed-predicate-word64.adaptive-fixed-anchor-or-shift-and.nonoverlap.v10";
 /// Stable identity for the count reducer.
-pub const COUNT_OPERATION_ID: &str = "fixed-predicate-word64.count.v10";
+pub const COUNT_OPERATION_ID: &str = "fixed-predicate-word64.count.v9";
 /// Stable identity for the matched-byte-sum reducer.
-pub const SPAN_SUM_OPERATION_ID: &str = "fixed-predicate-word64.span-sum.v10";
+pub const SPAN_SUM_OPERATION_ID: &str = "fixed-predicate-word64.span-sum.v9";
 /// Stable identity for the ordinary first-match search projection.
-pub const SEARCH_PLAN_ID: &str = "fixed-predicate-word64.first-match.v7";
+pub const SEARCH_PLAN_ID: &str = "fixed-predicate-word64.first-match.v6";
 /// Stable identity for existence search.
-const EXISTS_SEARCH_OPERATION_ID: &str = "fixed-predicate-word64.search.exists.v7";
+const EXISTS_SEARCH_OPERATION_ID: &str = "fixed-predicate-word64.search.exists.v6";
 /// Stable identity for the first accepting end projection.
-const EARLIEST_END_SEARCH_OPERATION_ID: &str = "fixed-predicate-word64.search.earliest-end.v7";
+const EARLIEST_END_SEARCH_OPERATION_ID: &str = "fixed-predicate-word64.search.earliest-end.v6";
 /// Stable identity for the selected match end projection.
-const SELECTED_END_SEARCH_OPERATION_ID: &str = "fixed-predicate-word64.search.selected-end.v7";
+const SELECTED_END_SEARCH_OPERATION_ID: &str = "fixed-predicate-word64.search.selected-end.v6";
 /// Stable identity for the selected span projection.
-const SPAN_SEARCH_OPERATION_ID: &str = "fixed-predicate-word64.search.span.v7";
+const SPAN_SEARCH_OPERATION_ID: &str = "fixed-predicate-word64.search.span.v6";
 /// Version of the receipt-bearing fixed-predicate construction protocol.
 pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 10;
 /// Version of the partial-actual fixed-predicate construction ledger.
@@ -60,8 +60,6 @@ const RANGE_FIXED_WORK: usize = 2;
 const ANCHOR_MASK_DOMAIN: usize = 256;
 const TRANSITION_WORK: usize = 6;
 const FINDER_SCAN_BYTE_WORK: usize = 1;
-const CANDIDATE_STREAM_PREDICATES: usize = 2;
-const CANDIDATE_CLASSIFIED_BYTE_WORK: usize = 1;
 const FINDER_CALL_WORK: usize = 1;
 const ANCHOR_CANDIDATE_WORK: usize = 1;
 const PREDICATE_CHECK_WORK: usize = 1;
@@ -102,21 +100,17 @@ fn hybrid_anchor_work_upper(
     // positions have been serviced before the Shift-And suffix, finder bytes,
     // calls and candidates are each at most `p`, and checks are at most
     // `p * verification_positions`. The prefix therefore costs at most
-    // `p * (verification_positions + 3)`. The retained intersection also
-    // classifies two predicate-byte lanes per candidate start. Search protocol
-    // v7 and reduction protocol v10 charge those physical lanes explicitly;
-    // earlier certificates omitted this real work. Consequently a finite
-    // `max_work` between the legacy and current bounds now refuses before
-    // source access instead of admitting unmetered classification.
-    // the suffix costs at most `6 * (input_bytes - p)`. Maximizing over
+    // `p * (verification_positions + 3)`. In the retained intersection, the
+    // fallback classifier remains logical finder service and the additional
+    // primary-classifier lanes are predicate checks. Because the pair is
+    // skipped during candidate verification, those lanes plus the remaining
+    // checks stay within `p * verification_positions`. The suffix costs at
+    // most `6 * (input_bytes - p)`. Maximizing over
     // `p <= candidate_positions` gives the closed expression below. The
     // caller separately charges match events and finalization.
     input_bytes
         .checked_mul(TRANSITION_WORK)?
         .checked_add(candidate_positions.checked_mul(verification_positions.saturating_sub(3))?)
-        .and_then(|work| {
-            work.checked_add(candidate_positions.checked_mul(CANDIDATE_STREAM_PREDICATES)?)
-        })
 }
 
 /// Complete aggregate selected for one invocation.
@@ -394,9 +388,6 @@ pub struct ReduceUpperBounds {
     /// plans this is an independent component maximum; it shares the joint
     /// `transitions` cap with `shift_and_transitions`.
     pub finder_scanned_bytes: usize,
-    /// Maximum predicate-byte lanes physically classified by the retained
-    /// candidate stream. Each candidate lane charges both retained predicates.
-    pub candidate_stream_classified_bytes: usize,
     /// Maximum Shift-And transitions after any adaptive handoff. For adaptive
     /// plans this is an independent component maximum; it shares the joint
     /// `transitions` cap with `finder_scanned_bytes`.
@@ -440,9 +431,6 @@ pub struct ReduceActualCounters {
     pub transitions: usize,
     /// Logical bytes serviced by fixed-anchor finders.
     pub finder_scanned_bytes: usize,
-    /// Predicate-byte lanes physically classified by the retained candidate
-    /// stream. This is distinct from logical finder service distance.
-    pub candidate_stream_classified_bytes: usize,
     /// Shift-And transitions after any adaptive handoff.
     pub shift_and_transitions: usize,
     /// Fixed-anchor finder invocations.
@@ -586,9 +574,6 @@ pub struct SearchUpperBounds {
     /// plans this is an independent component maximum; it shares the joint
     /// `transitions` cap with `shift_and_transitions`.
     pub finder_scanned_bytes: usize,
-    /// Maximum predicate-byte lanes physically classified by the retained
-    /// candidate stream. Each candidate lane charges both retained predicates.
-    pub candidate_stream_classified_bytes: usize,
     /// Maximum Shift-And transitions after any adaptive handoff. For adaptive
     /// plans this is an independent component maximum; it shares the joint
     /// `transitions` cap with `finder_scanned_bytes`.
@@ -616,9 +601,6 @@ pub struct SearchActualCounters {
     pub transitions: usize,
     /// Logical bytes serviced by fixed-anchor finders.
     pub finder_scanned_bytes: usize,
-    /// Predicate-byte lanes physically classified by the retained candidate
-    /// stream. This is distinct from logical finder service distance.
-    pub candidate_stream_classified_bytes: usize,
     /// Shift-And transitions after any adaptive handoff.
     pub shift_and_transitions: usize,
     /// Fixed-anchor finder invocations.
@@ -1549,30 +1531,37 @@ enum RetainedSearchPhase {
     #[default]
     Primary,
     CandidateStream,
+    CandidateStreamDrain,
     ShiftAnd,
     Exhausted,
 }
 
-/// Operation-owned continuation for monotone fixed-predicate iteration.
+/// Plan-and-source-bound continuation for monotone fixed-predicate iteration.
 ///
-/// The state retains candidate masks across accepted-word restarts. It resets
-/// automatically when the source identity, terminal window boundary, or next
-/// requested start differs from the preceding result.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct FixedPredicateWord64SearchCursor {
+/// The state retains candidate masks across accepted-word restarts. Both the
+/// exact plan instance and the immutable source are borrowed for the complete
+/// continuation lifetime, so safe callers cannot reuse classified bytes after
+/// changing either input. A terminal-window or expected-start change resets
+/// only the retained search phase.
+///
+/// This capability is public only because the facade lives in another crate;
+/// ordinary independent searches should use [`FixedPredicateWord64Plan::find_window`].
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct FixedPredicateWord64SearchCursor<'p, 'h> {
+    plan: &'p FixedPredicateWord64Plan,
+    haystack: &'h [u8],
     phase: RetainedSearchPhase,
     block: CandidateStreamBlock,
-    source_address: usize,
-    source_len: usize,
     window_end: usize,
     next_start: Option<usize>,
 }
 
-impl FixedPredicateWord64SearchCursor {
-    /// Construct empty operation-local continuation state.
-    #[must_use]
-    pub const fn new() -> Self {
+impl<'p, 'h> FixedPredicateWord64SearchCursor<'p, 'h> {
+    const fn new(plan: &'p FixedPredicateWord64Plan, haystack: &'h [u8]) -> Self {
         Self {
+            plan,
+            haystack,
             phase: RetainedSearchPhase::Primary,
             block: CandidateStreamBlock {
                 start: 0,
@@ -1580,28 +1569,21 @@ impl FixedPredicateWord64SearchCursor {
                 primary_members: 0,
                 fallback_members: 0,
             },
-            source_address: 0,
-            source_len: 0,
             window_end: 0,
             next_start: None,
         }
     }
 
-    /// Forget all retained operation state.
-    pub fn reset(&mut self) {
-        *self = Self::new();
+    fn reset(&mut self) {
+        self.phase = RetainedSearchPhase::Primary;
+        self.block = CandidateStreamBlock::default();
+        self.window_end = 0;
+        self.next_start = None;
     }
 
-    fn prepare(&mut self, haystack: &[u8], window: Window) {
-        let source_address = haystack.as_ptr().addr();
-        if self.next_start != Some(window.start())
-            || self.source_address != source_address
-            || self.source_len != haystack.len()
-            || self.window_end != window.end()
-        {
+    fn prepare(&mut self, window: Window) {
+        if self.next_start != Some(window.start()) || self.window_end != window.end() {
             self.reset();
-            self.source_address = source_address;
-            self.source_len = haystack.len();
             self.window_end = window.end();
             self.next_start = Some(window.start());
         }
@@ -1615,6 +1597,71 @@ impl FixedPredicateWord64SearchCursor {
         self.phase = RetainedSearchPhase::Exhausted;
         self.next_start = Some(self.window_end);
         self.block = CandidateStreamBlock::default();
+    }
+
+    /// Find one span while retaining monotone candidate-stream state across
+    /// successive non-overlapping windows of this bound plan and source.
+    ///
+    /// A terminal-window or expected-start change resets the continuation to
+    /// the ordinary cold primary phase. The plan and source cannot be replaced
+    /// because they were borrowed when this capability was constructed.
+    pub fn find_window(
+        &mut self,
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
+        self.find_window_transaction(window, limits, false)
+    }
+
+    /// Search at or after `start` in the complete bound source.
+    pub fn find_at(
+        &mut self,
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
+        self.find_window(Window::new(start, self.haystack.len()), limits)
+    }
+
+    /// The immutable source bound to this capability.
+    #[must_use]
+    pub const fn haystack(&self) -> &'h [u8] {
+        self.haystack
+    }
+
+    fn find_window_transaction(
+        &mut self,
+        window: Window,
+        limits: SearchLimits,
+        inject_late_failure: bool,
+    ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
+        let plan = self.plan;
+        let haystack = self.haystack;
+        let upper_bounds = plan.search_preflight(haystack.len(), window, limits)?;
+        let mut next = *self;
+        next.prepare(window);
+        let (matched, actual) =
+            plan.execute_first_match_with_cursor(haystack, window, upper_bounds, &mut next)?;
+        let accounting = SearchAccounting {
+            identity: plan.search_operation_identity(SearchOperation::Span),
+            upper_bounds,
+            actual,
+        };
+        if inject_late_failure {
+            return Err(SearchError::InternalInvariant(
+                "injected retained-cursor precommit failure",
+            ));
+        }
+        *self = next;
+        Ok((matched, accounting))
+    }
+
+    #[cfg(test)]
+    fn find_window_with_late_failure(
+        &mut self,
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
+        self.find_window_transaction(window, limits, true)
     }
 }
 
@@ -1675,13 +1722,8 @@ impl<'a> CandidateStreamCursor<'a> {
     fn find(&mut self, mut cursor: usize) -> Option<usize> {
         while cursor < self.legal_start_end {
             if self.block.start <= cursor && cursor < self.block.end {
-                let skipped = cursor.checked_sub(self.block.start)?;
-                let unserviced = u32::MAX.checked_shl(u32::try_from(skipped).ok()?)?;
-                let candidates =
-                    self.block.primary_members & self.block.fallback_members & unserviced;
-                if candidates != 0 {
-                    let lane = usize::try_from(candidates.trailing_zeros()).ok()?;
-                    return self.block.start.checked_add(lane);
+                if let Some(candidate) = self.find_retained_before(cursor, self.block.end) {
+                    return Some(candidate);
                 }
                 cursor = self.block.end;
                 continue;
@@ -1711,6 +1753,32 @@ impl<'a> CandidateStreamCursor<'a> {
             }
         }
         None
+    }
+
+    #[inline]
+    fn find_retained_before(&self, cursor: usize, end: usize) -> Option<usize> {
+        let terminal = end.min(self.block.end);
+        if cursor < self.block.start || cursor >= terminal {
+            return None;
+        }
+        let skipped = cursor.checked_sub(self.block.start)?;
+        let retained = terminal.checked_sub(self.block.start)?;
+        let unserviced = u32::MAX.checked_shl(u32::try_from(skipped).ok()?)?;
+        let mask_bits = usize::try_from(u32::BITS).ok()?;
+        let before_terminal = if retained == mask_bits {
+            u32::MAX
+        } else {
+            1_u32
+                .checked_shl(u32::try_from(retained).ok()?)?
+                .wrapping_sub(1)
+        };
+        let candidates =
+            self.block.primary_members & self.block.fallback_members & unserviced & before_terminal;
+        if candidates == 0 {
+            return None;
+        }
+        let lane = usize::try_from(candidates.trailing_zeros()).ok()?;
+        self.block.start.checked_add(lane)
     }
 
     #[inline]
@@ -1809,7 +1877,6 @@ enum Anchor {
 struct ReducerUpper {
     transitions: usize,
     finder_scanned_bytes: usize,
-    candidate_stream_classified_bytes: usize,
     shift_and_transitions: usize,
     finder_calls: usize,
     anchor_candidates: usize,
@@ -1827,7 +1894,6 @@ struct SemanticUpper {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct AnchorActual {
     finder_scanned_bytes: usize,
-    candidate_stream_classified_bytes: usize,
     shift_and_transitions: usize,
     finder_calls: usize,
     anchor_candidates: usize,
@@ -2566,32 +2632,74 @@ impl FixedPredicateWord64Plan {
         self.search_window(haystack, window, limits, SearchOperation::Span)
     }
 
-    /// Find one span while retaining monotone candidate-stream state across
-    /// successive non-overlapping windows of the same operation.
+    /// Bind operation-local continuation state to this exact plan and one
+    /// immutable source.
     ///
-    /// A source, terminal-window, or expected-start change resets `cursor` to
-    /// the ordinary cold primary phase. This is intended for iterator/session
-    /// owners; independent search calls should use [`Self::find_window`].
+    /// The returned capability exposes no plan or source substitution point.
+    /// This is intended for cross-crate iterator/session owners; independent
+    /// search calls should use [`Self::find_window`].
+    ///
+    /// Safe code cannot mutate the source in place while the continuation is
+    /// live:
+    ///
+    /// ```compile_fail
+    /// use fre_kernels::{
+    ///     FixedPredicateWord64BuildLimits, FixedPredicateWord64Plan,
+    ///     FixedPredicateWord64SearchLimits, Window,
+    /// };
+    ///
+    /// let literal = [(b'a', b'a')];
+    /// let predicates: [&[(u8, u8)]; 1] = [&literal];
+    /// let plan = FixedPredicateWord64Plan::build(
+    ///     &predicates,
+    ///     FixedPredicateWord64BuildLimits::unlimited(),
+    /// ).unwrap();
+    /// let mut source = b"aa".to_vec();
+    /// let mut cursor = plan.search_cursor(&source);
+    /// source[1] = b'b';
+    /// let _ = cursor.find_window(
+    ///     Window::full(&source),
+    ///     FixedPredicateWord64SearchLimits::unlimited(),
+    /// );
+    /// ```
+    ///
+    /// The former free cursor method is deliberately absent, so a cursor
+    /// cannot be supplied to a second plan:
+    ///
+    /// ```compile_fail
+    /// use fre_kernels::{
+    ///     FixedPredicateWord64BuildLimits, FixedPredicateWord64Plan,
+    ///     FixedPredicateWord64SearchLimits, Window,
+    /// };
+    ///
+    /// let a = [(b'a', b'a')];
+    /// let b = [(b'b', b'b')];
+    /// let pa: [&[(u8, u8)]; 1] = [&a];
+    /// let pb: [&[(u8, u8)]; 1] = [&b];
+    /// let first = FixedPredicateWord64Plan::build(
+    ///     &pa,
+    ///     FixedPredicateWord64BuildLimits::unlimited(),
+    /// ).unwrap();
+    /// let second = FixedPredicateWord64Plan::build(
+    ///     &pb,
+    ///     FixedPredicateWord64BuildLimits::unlimited(),
+    /// ).unwrap();
+    /// let source = b"ab";
+    /// let mut cursor = first.search_cursor(source);
+    /// let _ = second.find_window_with_cursor(
+    ///     source,
+    ///     Window::full(source),
+    ///     FixedPredicateWord64SearchLimits::unlimited(),
+    ///     &mut cursor,
+    /// );
+    /// ```
     #[doc(hidden)]
-    pub fn find_window_with_cursor(
-        &self,
-        haystack: &[u8],
-        window: Window,
-        limits: SearchLimits,
-        cursor: &mut FixedPredicateWord64SearchCursor,
-    ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
-        let upper_bounds = self.search_preflight(haystack.len(), window, limits)?;
-        cursor.prepare(haystack, window);
-        let (matched, actual) =
-            self.execute_first_match_with_cursor(haystack, window, upper_bounds, cursor)?;
-        Ok((
-            matched,
-            SearchAccounting {
-                identity: self.search_operation_identity(SearchOperation::Span),
-                upper_bounds,
-                actual,
-            },
-        ))
+    #[must_use]
+    pub const fn search_cursor<'p, 'h>(
+        &'p self,
+        haystack: &'h [u8],
+    ) -> FixedPredicateWord64SearchCursor<'p, 'h> {
+        FixedPredicateWord64SearchCursor::new(self, haystack)
     }
 
     /// Return only the selected span wholly inside `window`.
@@ -2954,7 +3062,6 @@ impl FixedPredicateWord64Plan {
         let (
             transitions,
             finder_scanned_bytes,
-            candidate_stream_classified_bytes,
             shift_and_transitions,
             finder_calls,
             candidate_events,
@@ -2969,7 +3076,7 @@ impl FixedPredicateWord64Plan {
                     .ok_or(SearchError::ArithmeticOverflow {
                         computation: "Shift-And search work upper bound",
                     })?;
-                (window_bytes, 0, 0, window_bytes, 0, 0, 0, work)
+                (window_bytes, 0, window_bytes, 0, 0, 0, work)
             }
             Anchor::One { .. } | Anchor::Two { .. } => {
                 let finder_calls = if candidate_events == 0 {
@@ -3028,15 +3135,6 @@ impl FixedPredicateWord64Plan {
                     },
                     candidate_events,
                     if self.adaptive_fallback.is_some() {
-                        candidate_events
-                            .checked_mul(CANDIDATE_STREAM_PREDICATES)
-                            .ok_or(SearchError::ArithmeticOverflow {
-                                computation: "candidate-stream classification bound",
-                            })?
-                    } else {
-                        0
-                    },
-                    if self.adaptive_fallback.is_some() {
                         window_bytes
                     } else {
                         0
@@ -3061,7 +3159,6 @@ impl FixedPredicateWord64Plan {
             window_bytes,
             transitions,
             finder_scanned_bytes,
-            candidate_stream_classified_bytes,
             shift_and_transitions,
             finder_calls,
             candidate_events,
@@ -3112,7 +3209,7 @@ impl FixedPredicateWord64Plan {
         haystack: &[u8],
         window: Window,
         upper: SearchUpperBounds,
-        cursor: &mut FixedPredicateWord64SearchCursor,
+        cursor: &mut FixedPredicateWord64SearchCursor<'_, '_>,
     ) -> Result<(Option<(usize, usize)>, SearchActualCounters), SearchError> {
         let mut actual = AnchorActual::default();
         if matches!(self.anchor, Anchor::ShiftAnd) {
@@ -3122,7 +3219,7 @@ impl FixedPredicateWord64Plan {
             RetainedSearchPhase::Primary => {
                 self.execute_retained_primary(haystack, window, cursor, &mut actual)?
             }
-            RetainedSearchPhase::CandidateStream => {
+            RetainedSearchPhase::CandidateStream | RetainedSearchPhase::CandidateStreamDrain => {
                 self.execute_retained_candidate_stream(haystack, window, cursor, &mut actual)?
             }
             RetainedSearchPhase::ShiftAnd => {
@@ -3140,7 +3237,6 @@ impl FixedPredicateWord64Plan {
             window_bytes: upper.window_bytes,
             transitions,
             finder_scanned_bytes: actual.finder_scanned_bytes,
-            candidate_stream_classified_bytes: actual.candidate_stream_classified_bytes,
             shift_and_transitions: actual.shift_and_transitions,
             finder_calls: actual.finder_calls,
             candidate_events: actual.anchor_candidates,
@@ -3148,7 +3244,6 @@ impl FixedPredicateWord64Plan {
             match_events: actual.match_events,
             work: search_work(
                 actual.finder_scanned_bytes,
-                actual.candidate_stream_classified_bytes,
                 actual.shift_and_transitions,
                 actual.finder_calls,
                 actual.anchor_candidates,
@@ -3169,7 +3264,7 @@ impl FixedPredicateWord64Plan {
         &self,
         haystack: &[u8],
         window: Window,
-        retained: &mut FixedPredicateWord64SearchCursor,
+        retained: &mut FixedPredicateWord64SearchCursor<'_, '_>,
         actual: &mut AnchorActual,
     ) -> Result<Option<(usize, usize)>, SearchError> {
         let anchor_offset = usize::from(self.anchor.offset().ok_or(
@@ -3328,7 +3423,7 @@ impl FixedPredicateWord64Plan {
         &self,
         haystack: &[u8],
         window: Window,
-        retained: &mut FixedPredicateWord64SearchCursor,
+        retained: &mut FixedPredicateWord64SearchCursor<'_, '_>,
         actual: &mut AnchorActual,
     ) -> Result<Option<(usize, usize)>, SearchError> {
         self.execute_retained_candidate_stream_from(
@@ -3349,7 +3444,7 @@ impl FixedPredicateWord64Plan {
         haystack: &[u8],
         window: Window,
         first_untested_start: usize,
-        retained: &mut FixedPredicateWord64SearchCursor,
+        retained: &mut FixedPredicateWord64SearchCursor<'_, '_>,
         actual: &mut AnchorActual,
     ) -> Result<Option<(usize, usize)>, SearchError> {
         let Some(fallback) = self.adaptive_fallback.as_ref() else {
@@ -3382,6 +3477,18 @@ impl FixedPredicateWord64Plan {
         let mut burst_start = 0_usize;
         let mut burst_rejections = 0_usize;
         while scan < legal_start_end {
+            let drain_end = if matches!(retained.phase, RetainedSearchPhase::CandidateStreamDrain) {
+                let end = retained.block.end.min(legal_start_end);
+                if scan >= end {
+                    retained.phase = RetainedSearchPhase::ShiftAnd;
+                    retained.block = CandidateStreamBlock::default();
+                    return self
+                        .execute_retained_shift_and_from(haystack, window, scan, retained, actual);
+                }
+                Some(end)
+            } else {
+                None
+            };
             actual.finder_calls =
                 actual
                     .finder_calls
@@ -3391,46 +3498,44 @@ impl FixedPredicateWord64Plan {
                     })?;
             let service_start = scan;
             let classified_before = finder.classified_candidate_bytes();
-            let found = finder.find(scan);
+            let found = match drain_end {
+                Some(end) => finder.find_retained_before(scan, end),
+                None => finder.find(scan),
+            };
             let newly_classified = finder
                 .classified_candidate_bytes()
                 .checked_sub(classified_before)
-                .and_then(|bytes| bytes.checked_mul(CANDIDATE_STREAM_PREDICATES))
                 .ok_or(SearchError::ArithmeticOverflow {
                     computation: "retained candidate-stream classification",
                 })?;
-            actual.candidate_stream_classified_bytes = actual
-                .candidate_stream_classified_bytes
+            actual.finder_scanned_bytes = actual
+                .finder_scanned_bytes
                 .checked_add(newly_classified)
                 .ok_or(SearchError::ArithmeticOverflow {
-                    computation: "retained classified predicate bytes",
+                    computation: "retained fallback-classifier service",
+                })?;
+            actual.predicate_checks = actual
+                .predicate_checks
+                .checked_add(newly_classified)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "retained primary-classifier checks",
                 })?;
             retained.block = finder.retained_block();
             let Some(start) = found else {
-                actual.finder_scanned_bytes = actual
-                    .finder_scanned_bytes
-                    .checked_add(legal_start_end.checked_sub(service_start).ok_or(
-                        SearchError::InternalInvariant(
-                            "retained candidate-stream service reversed",
-                        ),
-                    )?)
-                    .ok_or(SearchError::ArithmeticOverflow {
-                        computation: "retained candidate-stream terminal service",
-                    })?;
+                if let Some(end) = drain_end {
+                    retained.phase = RetainedSearchPhase::ShiftAnd;
+                    retained.block = CandidateStreamBlock::default();
+                    return self
+                        .execute_retained_shift_and_from(haystack, window, end, retained, actual);
+                }
                 retained.exhaust();
                 return Ok(None);
             };
-            let service = start
-                .checked_sub(service_start)
-                .and_then(|relative| relative.checked_add(1))
-                .ok_or(SearchError::InternalInvariant(
+            if start < service_start {
+                return Err(SearchError::InternalInvariant(
                     "retained candidate-stream service reversed",
-                ))?;
-            actual.finder_scanned_bytes = actual.finder_scanned_bytes.checked_add(service).ok_or(
-                SearchError::ArithmeticOverflow {
-                    computation: "retained candidate-stream service bytes",
-                },
-            )?;
+                ));
+            }
             actual.anchor_candidates =
                 actual
                     .anchor_candidates
@@ -3460,7 +3565,6 @@ impl FixedPredicateWord64Plan {
                         .ok_or(SearchError::ArithmeticOverflow {
                             computation: "retained candidate-stream match events",
                         })?;
-                retained.phase = RetainedSearchPhase::CandidateStream;
                 retained.retain_match(end);
                 return Ok(Some((start, end)));
             }
@@ -3485,10 +3589,9 @@ impl FixedPredicateWord64Plan {
                     },
                 )?
             {
-                retained.phase = RetainedSearchPhase::ShiftAnd;
-                retained.block = CandidateStreamBlock::default();
-                return self
-                    .execute_retained_shift_and_from(haystack, window, scan, retained, actual);
+                retained.phase = RetainedSearchPhase::CandidateStreamDrain;
+                burst_rejections = 0;
+                continue;
             }
             if burst_rejections == ADAPTIVE_FALLBACK_REJECTIONS {
                 burst_rejections = 0;
@@ -3502,7 +3605,7 @@ impl FixedPredicateWord64Plan {
         &self,
         haystack: &[u8],
         window: Window,
-        retained: &mut FixedPredicateWord64SearchCursor,
+        retained: &mut FixedPredicateWord64SearchCursor<'_, '_>,
         actual: &mut AnchorActual,
     ) -> Result<Option<(usize, usize)>, SearchError> {
         self.execute_retained_shift_and_from(haystack, window, window.start(), retained, actual)
@@ -3513,7 +3616,7 @@ impl FixedPredicateWord64Plan {
         haystack: &[u8],
         window: Window,
         first_untested_start: usize,
-        retained: &mut FixedPredicateWord64SearchCursor,
+        retained: &mut FixedPredicateWord64SearchCursor<'_, '_>,
         actual: &mut AnchorActual,
     ) -> Result<Option<(usize, usize)>, SearchError> {
         let remaining = haystack.get(first_untested_start..window.end()).ok_or(
@@ -3607,13 +3710,12 @@ impl FixedPredicateWord64Plan {
             window_bytes: slice.len(),
             transitions,
             finder_scanned_bytes: 0,
-            candidate_stream_classified_bytes: 0,
             shift_and_transitions: transitions,
             finder_calls: 0,
             candidate_events: 0,
             predicate_checks: 0,
             match_events: usize::from(matched.is_some()),
-            work: search_work(0, 0, transitions, 0, 0, 0, usize::from(matched.is_some()))?,
+            work: search_work(0, transitions, 0, 0, 0, usize::from(matched.is_some()))?,
             scratch_bytes: 0,
         };
         ensure_search_actual_within(actual, upper)?;
@@ -3636,7 +3738,6 @@ impl FixedPredicateWord64Plan {
             .unwrap_or(0);
         let mut cursor = anchor_offset.min(anchor_end);
         let mut finder_scanned_bytes = 0_usize;
-        let mut candidate_stream_classified_bytes = 0_usize;
         let mut shift_and_transitions = 0_usize;
         let mut finder_calls = 0_usize;
         let mut candidate_events = 0_usize;
@@ -3746,7 +3847,6 @@ impl FixedPredicateWord64Plan {
                     window_start,
                     first_untested_start,
                     &mut finder_scanned_bytes,
-                    &mut candidate_stream_classified_bytes,
                     &mut shift_and_transitions,
                     &mut finder_calls,
                     &mut candidate_events,
@@ -3768,7 +3868,6 @@ impl FixedPredicateWord64Plan {
             window_bytes: slice.len(),
             transitions,
             finder_scanned_bytes,
-            candidate_stream_classified_bytes,
             shift_and_transitions,
             finder_calls,
             candidate_events,
@@ -3776,7 +3875,6 @@ impl FixedPredicateWord64Plan {
             match_events,
             work: search_work(
                 finder_scanned_bytes,
-                candidate_stream_classified_bytes,
                 shift_and_transitions,
                 finder_calls,
                 candidate_events,
@@ -3799,7 +3897,6 @@ impl FixedPredicateWord64Plan {
         window_start: usize,
         first_untested_start: usize,
         finder_scanned_bytes: &mut usize,
-        candidate_stream_classified_bytes: &mut usize,
         shift_and_transitions: &mut usize,
         finder_calls: &mut usize,
         candidate_events: &mut usize,
@@ -3835,7 +3932,16 @@ impl FixedPredicateWord64Plan {
         let mut finder = CandidateStreamCursor::new(self.anchor, fallback, slice, legal_start_end);
         let mut burst_start = 0_usize;
         let mut burst_rejections = 0_usize;
+        let mut drain_end = None;
         while cursor < legal_start_end {
+            if drain_end.is_some_and(|end| cursor >= end) {
+                return self.execute_first_shift_and_reporting(
+                    slice,
+                    window_start,
+                    cursor,
+                    shift_and_transitions,
+                );
+            }
             *finder_calls = finder_calls
                 .checked_add(1)
                 .ok_or(SearchError::ArithmeticOverflow {
@@ -3843,43 +3949,42 @@ impl FixedPredicateWord64Plan {
                 })?;
             let service_start = cursor;
             let classified_before = finder.classified_candidate_bytes();
-            let found = finder.find(cursor);
+            let found = match drain_end {
+                Some(end) => finder.find_retained_before(cursor, end),
+                None => finder.find(cursor),
+            };
             let newly_classified = finder
                 .classified_candidate_bytes()
                 .checked_sub(classified_before)
-                .and_then(|bytes| bytes.checked_mul(CANDIDATE_STREAM_PREDICATES))
                 .ok_or(SearchError::ArithmeticOverflow {
                     computation: "adaptive reporting candidate-stream classification",
                 })?;
-            *candidate_stream_classified_bytes = candidate_stream_classified_bytes
-                .checked_add(newly_classified)
-                .ok_or(SearchError::ArithmeticOverflow {
-                    computation: "adaptive reporting classified predicate bytes",
-                })?;
-            let Some(start) = found else {
-                let terminal_service = legal_start_end.checked_sub(service_start).ok_or(
-                    SearchError::InternalInvariant(
-                        "adaptive reporting candidate-stream service reversed",
-                    ),
-                )?;
-                *finder_scanned_bytes = finder_scanned_bytes.checked_add(terminal_service).ok_or(
-                    SearchError::ArithmeticOverflow {
-                        computation: "adaptive reporting candidate-stream terminal service",
-                    },
-                )?;
-                break;
-            };
-            let service = start
-                .checked_sub(service_start)
-                .and_then(|relative| relative.checked_add(1))
-                .ok_or(SearchError::InternalInvariant(
-                    "adaptive reporting candidate-stream service reversed",
-                ))?;
-            *finder_scanned_bytes = finder_scanned_bytes.checked_add(service).ok_or(
+            *finder_scanned_bytes = finder_scanned_bytes.checked_add(newly_classified).ok_or(
                 SearchError::ArithmeticOverflow {
-                    computation: "adaptive reporting candidate-stream service bytes",
+                    computation: "adaptive reporting fallback-classifier service",
                 },
             )?;
+            *predicate_checks = predicate_checks.checked_add(newly_classified).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "adaptive reporting primary-classifier checks",
+                },
+            )?;
+            let Some(start) = found else {
+                if let Some(end) = drain_end {
+                    return self.execute_first_shift_and_reporting(
+                        slice,
+                        window_start,
+                        end,
+                        shift_and_transitions,
+                    );
+                }
+                break;
+            };
+            if start < service_start {
+                return Err(SearchError::InternalInvariant(
+                    "adaptive reporting candidate-stream service reversed",
+                ));
+            }
             *candidate_events =
                 candidate_events
                     .checked_add(1)
@@ -3936,12 +4041,9 @@ impl FixedPredicateWord64Plan {
                     },
                 )?
             {
-                return self.execute_first_shift_and_reporting(
-                    slice,
-                    window_start,
-                    cursor,
-                    shift_and_transitions,
-                );
+                drain_end = Some(finder.retained_block().end.min(legal_start_end));
+                burst_rejections = 0;
+                continue;
             }
             if burst_rejections == ADAPTIVE_FALLBACK_REJECTIONS {
                 burst_rejections = 0;
@@ -4236,7 +4338,6 @@ impl FixedPredicateWord64Plan {
             input_bytes,
             transitions: reducer.transitions,
             finder_scanned_bytes: reducer.finder_scanned_bytes,
-            candidate_stream_classified_bytes: reducer.candidate_stream_classified_bytes,
             shift_and_transitions: reducer.shift_and_transitions,
             finder_calls: reducer.finder_calls,
             anchor_candidates: reducer.anchor_candidates,
@@ -4257,7 +4358,7 @@ impl FixedPredicateWord64Plan {
 
     #[allow(
         clippy::too_many_lines,
-        reason = "the source-free bound keeps anchor, two-mask classification, and Shift-And component maxima adjacent"
+        reason = "the source-free bound keeps anchor, classified-finder service, and Shift-And component maxima adjacent"
     )]
     fn reducer_upper(&self, input_bytes: usize) -> Result<ReducerUpper, ReduceError> {
         match self.anchor {
@@ -4329,15 +4430,6 @@ impl FixedPredicateWord64Plan {
                         candidate_positions
                     },
                     finder_scanned_bytes: candidate_positions,
-                    candidate_stream_classified_bytes: if self.adaptive_fallback.is_some() {
-                        candidate_positions
-                            .checked_mul(CANDIDATE_STREAM_PREDICATES)
-                            .ok_or(ReduceError::ArithmeticOverflow {
-                                computation: "candidate-stream classification bound",
-                            })?
-                    } else {
-                        0
-                    },
                     shift_and_transitions: if self.adaptive_fallback.is_some() {
                         input_bytes
                     } else {
@@ -4352,7 +4444,6 @@ impl FixedPredicateWord64Plan {
             Anchor::ShiftAnd => Ok(ReducerUpper {
                 transitions: input_bytes,
                 finder_scanned_bytes: 0,
-                candidate_stream_classified_bytes: 0,
                 shift_and_transitions: input_bytes,
                 finder_calls: 0,
                 anchor_candidates: 0,
@@ -4743,7 +4834,6 @@ impl FixedPredicateWord64Plan {
             input_bytes: haystack.len(),
             transitions,
             finder_scanned_bytes: 0,
-            candidate_stream_classified_bytes: 0,
             shift_and_transitions: transitions,
             finder_calls: 0,
             anchor_candidates: 0,
@@ -4936,7 +5026,11 @@ impl FixedPredicateWord64Plan {
             CandidateStreamCursor::new(self.anchor, fallback, haystack, legal_start_end);
         let mut burst_start = 0_usize;
         let mut burst_rejections = 0_usize;
+        let mut drain_end = None;
         while cursor < legal_start_end {
+            if drain_end.is_some_and(|end| cursor >= end) {
+                return self.scan_shift_and_reporting_suffix(haystack, cursor, actual);
+            }
             actual.finder_calls =
                 actual
                     .finder_calls
@@ -4946,45 +5040,39 @@ impl FixedPredicateWord64Plan {
                     })?;
             let service_start = cursor;
             let classified_before = finder.classified_candidate_bytes();
-            let found = finder.find(cursor);
+            let found = match drain_end {
+                Some(end) => finder.find_retained_before(cursor, end),
+                None => finder.find(cursor),
+            };
             let newly_classified = finder
                 .classified_candidate_bytes()
                 .checked_sub(classified_before)
-                .and_then(|bytes| bytes.checked_mul(CANDIDATE_STREAM_PREDICATES))
                 .ok_or(ReduceError::ArithmeticOverflow {
                     computation: "adaptive reducer candidate-stream classification",
                 })?;
-            actual.candidate_stream_classified_bytes = actual
-                .candidate_stream_classified_bytes
+            actual.finder_scanned_bytes = actual
+                .finder_scanned_bytes
                 .checked_add(newly_classified)
                 .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "adaptive reducer classified predicate bytes",
+                    computation: "adaptive reducer fallback-classifier service",
+                })?;
+            actual.predicate_checks = actual
+                .predicate_checks
+                .checked_add(newly_classified)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "adaptive reducer primary-classifier checks",
                 })?;
             let Some(start) = found else {
-                let terminal_service = legal_start_end.checked_sub(service_start).ok_or(
-                    ReduceError::InternalInvariant(
-                        "adaptive reducer candidate-stream service reversed",
-                    ),
-                )?;
-                actual.finder_scanned_bytes = actual
-                    .finder_scanned_bytes
-                    .checked_add(terminal_service)
-                    .ok_or(ReduceError::ArithmeticOverflow {
-                        computation: "adaptive reducer candidate-stream terminal service",
-                    })?;
+                if let Some(end) = drain_end {
+                    return self.scan_shift_and_reporting_suffix(haystack, end, actual);
+                }
                 break;
             };
-            let service = start
-                .checked_sub(service_start)
-                .and_then(|relative| relative.checked_add(1))
-                .ok_or(ReduceError::InternalInvariant(
+            if start < service_start {
+                return Err(ReduceError::InternalInvariant(
                     "adaptive reducer candidate-stream service reversed",
-                ))?;
-            actual.finder_scanned_bytes = actual.finder_scanned_bytes.checked_add(service).ok_or(
-                ReduceError::ArithmeticOverflow {
-                    computation: "adaptive reducer candidate-stream service bytes",
-                },
-            )?;
+                ));
+            }
             actual.anchor_candidates =
                 actual
                     .anchor_candidates
@@ -5034,7 +5122,9 @@ impl FixedPredicateWord64Plan {
                         },
                     )?
                 {
-                    return self.scan_shift_and_reporting_suffix(haystack, cursor, actual);
+                    drain_end = Some(finder.retained_block().end.min(legal_start_end));
+                    burst_rejections = 0;
+                    continue;
                 }
                 if burst_rejections == ADAPTIVE_FALLBACK_REJECTIONS {
                     burst_rejections = 0;
@@ -5360,13 +5450,6 @@ impl FixedPredicateWord64Plan {
             .finder_scanned_bytes
             .checked_mul(FINDER_SCAN_BYTE_WORK)
             .and_then(|work| {
-                work.checked_add(
-                    actual
-                        .candidate_stream_classified_bytes
-                        .checked_mul(CANDIDATE_CLASSIFIED_BYTE_WORK)?,
-                )
-            })
-            .and_then(|work| {
                 work.checked_add(actual.shift_and_transitions.checked_mul(TRANSITION_WORK)?)
             })
             .and_then(|work| work.checked_add(actual.finder_calls.checked_mul(FINDER_CALL_WORK)?))
@@ -5393,7 +5476,6 @@ impl FixedPredicateWord64Plan {
             input_bytes,
             transitions,
             finder_scanned_bytes: actual.finder_scanned_bytes,
-            candidate_stream_classified_bytes: actual.candidate_stream_classified_bytes,
             shift_and_transitions: actual.shift_and_transitions,
             finder_calls: actual.finder_calls,
             anchor_candidates: actual.anchor_candidates,
@@ -5428,13 +5510,6 @@ fn actual_within_upper(actual: ReduceActualCounters, upper: ReduceUpperBounds) -
         .finder_scanned_bytes
         .checked_mul(FINDER_SCAN_BYTE_WORK)
         .and_then(|work| {
-            work.checked_add(
-                actual
-                    .candidate_stream_classified_bytes
-                    .checked_mul(CANDIDATE_CLASSIFIED_BYTE_WORK)?,
-            )
-        })
-        .and_then(|work| {
             work.checked_add(actual.shift_and_transitions.checked_mul(TRANSITION_WORK)?)
         })
         .and_then(|work| work.checked_add(actual.finder_calls.checked_mul(FINDER_CALL_WORK)?))
@@ -5456,7 +5531,6 @@ fn actual_within_upper(actual: ReduceActualCounters, upper: ReduceUpperBounds) -
         && actual.input_bytes <= upper.input_bytes
         && actual.transitions <= upper.transitions
         && actual.finder_scanned_bytes <= upper.finder_scanned_bytes
-        && actual.candidate_stream_classified_bytes <= upper.candidate_stream_classified_bytes
         && actual.shift_and_transitions <= upper.shift_and_transitions
         && actual.finder_calls <= upper.finder_calls
         && actual.anchor_candidates <= upper.anchor_candidates
@@ -5476,7 +5550,6 @@ fn actual_within_upper(actual: ReduceActualCounters, upper: ReduceUpperBounds) -
 
 fn search_work(
     finder_scanned_bytes: usize,
-    candidate_stream_classified_bytes: usize,
     shift_and_transitions: usize,
     finder_calls: usize,
     candidate_events: usize,
@@ -5485,11 +5558,6 @@ fn search_work(
 ) -> Result<u64, SearchError> {
     let work = finder_scanned_bytes
         .checked_mul(FINDER_SCAN_BYTE_WORK)
-        .and_then(|work| {
-            work.checked_add(
-                candidate_stream_classified_bytes.checked_mul(CANDIDATE_CLASSIFIED_BYTE_WORK)?,
-            )
-        })
         .and_then(|work| work.checked_add(shift_and_transitions.checked_mul(TRANSITION_WORK)?))
         .and_then(|work| work.checked_add(finder_calls.checked_mul(FINDER_CALL_WORK)?))
         .and_then(|work| work.checked_add(candidate_events.checked_mul(ANCHOR_CANDIDATE_WORK)?))
@@ -5514,7 +5582,6 @@ fn ensure_search_actual_within(
         == Some(actual.transitions);
     let work_closes = search_work(
         actual.finder_scanned_bytes,
-        actual.candidate_stream_classified_bytes,
         actual.shift_and_transitions,
         actual.finder_calls,
         actual.candidate_events,
@@ -5526,7 +5593,6 @@ fn ensure_search_actual_within(
         && actual.window_bytes == upper.window_bytes
         && actual.transitions <= upper.transitions
         && actual.finder_scanned_bytes <= upper.finder_scanned_bytes
-        && actual.candidate_stream_classified_bytes <= upper.candidate_stream_classified_bytes
         && actual.shift_and_transitions <= upper.shift_and_transitions
         && actual.finder_calls <= upper.finder_calls
         && actual.candidate_events <= upper.candidate_events
@@ -6373,14 +6439,13 @@ mod tests {
         // activates that suffix.
         assert_eq!(upper.transitions, 12);
         assert_eq!(upper.finder_scanned_bytes, 11);
-        assert_eq!(upper.candidate_stream_classified_bytes, 22);
         assert_eq!(upper.shift_and_transitions, 12);
         assert_eq!(upper.anchor_candidates, 11);
         assert_eq!(upper.predicate_checks, 11);
         assert_eq!(upper.match_events, 6);
         assert_eq!(upper.span_sum, 12);
         assert_eq!(upper.reducer_steps, 13);
-        assert_eq!(upper.work, 113);
+        assert_eq!(upper.work, 91);
         assert_eq!(exact_result.accounting.actual.match_events, 3);
         assert_eq!(exact_result.accounting.actual.matched_bytes, 6);
         assert_eq!(exact_result.accounting.actual.work_charged, 28);
@@ -7168,33 +7233,28 @@ mod tests {
         );
         let result = plan.count(&haystack, ReduceLimits::unlimited()).unwrap();
         assert_eq!(result.count, expected);
-        assert!(result.accounting.actual.candidate_stream_classified_bytes > 0);
+        assert!(result.accounting.actual.finder_scanned_bytes > 0);
         assert!(
-            result.accounting.actual.candidate_stream_classified_bytes
-                <= result
-                    .accounting
-                    .upper_bounds
-                    .candidate_stream_classified_bytes
+            result.accounting.actual.finder_scanned_bytes
+                <= result.accounting.upper_bounds.finder_scanned_bytes
         );
 
-        let mut retained = FixedPredicateWord64SearchCursor::new();
+        let mut retained = plan.search_cursor(&haystack);
         let mut start = 0_usize;
         let mut spans = Vec::new();
         let mut second_classification = None;
         loop {
-            let (matched, accounting) = plan
-                .find_window_with_cursor(
-                    &haystack,
+            let (matched, accounting) = retained
+                .find_window(
                     Window::new(start, haystack.len()),
                     SearchLimits::unlimited(),
-                    &mut retained,
                 )
                 .unwrap();
             let Some(span) = matched else {
                 break;
             };
             if spans.len() == 1 {
-                second_classification = Some(accounting.actual.candidate_stream_classified_bytes);
+                second_classification = Some(accounting.actual.finder_scanned_bytes);
             }
             spans.push(span);
             start = span.1;
@@ -7203,14 +7263,9 @@ mod tests {
         assert_eq!(second_classification, Some(0));
         assert!(spans.windows(2).all(|pair| pair[0].1 == pair[1].0));
 
-        let mut noncontiguous = FixedPredicateWord64SearchCursor::new();
-        let first = plan
-            .find_window_with_cursor(
-                &haystack,
-                Window::full(&haystack),
-                SearchLimits::unlimited(),
-                &mut noncontiguous,
-            )
+        let mut noncontiguous = plan.search_cursor(&haystack);
+        let first = noncontiguous
+            .find_window(Window::full(&haystack), SearchLimits::unlimited())
             .unwrap()
             .0
             .unwrap();
@@ -7223,20 +7278,134 @@ mod tests {
             )
             .unwrap()
             .0;
-        let actual = plan
-            .find_window_with_cursor(
-                &haystack,
+        let actual = noncontiguous
+            .find_window(
                 Window::new(skipped_start, haystack.len()),
                 SearchLimits::unlimited(),
-                &mut noncontiguous,
             )
             .unwrap()
             .0;
         assert_eq!(actual, expected);
 
-        retained.prepare(b"A!Q", Window::new(0, 3));
-        assert_eq!(retained.phase, RetainedSearchPhase::Primary);
-        assert_eq!(retained.block, CandidateStreamBlock::default());
+        let other_source = plan.search_cursor(b"A!Q");
+        assert_eq!(other_source.phase, RetainedSearchPhase::Primary);
+        assert_eq!(other_source.block, CandidateStreamBlock::default());
+    }
+
+    #[test]
+    fn candidate_stream_capabilities_keep_distinct_plans_independent() {
+        const FALLBACK_A: &[(u8, u8)] = &[(b'A', b'D')];
+        const FALLBACK_E: &[(u8, u8)] = &[(b'E', b'H')];
+        const VERIFY: &[(u8, u8)] = &[(0, 0x7f)];
+        const PRIMARY: &[(u8, u8)] = &[(b'Q', b'Q')];
+        let predicates_a = [FALLBACK_A, VERIFY, PRIMARY];
+        let predicates_e = [FALLBACK_E, VERIFY, PRIMARY];
+        let plan_a =
+            FixedPredicateWord64Plan::build(&predicates_a, BuildLimits::unlimited()).unwrap();
+        let plan_e =
+            FixedPredicateWord64Plan::build(&predicates_e, BuildLimits::unlimited()).unwrap();
+
+        let mut haystack = Vec::new();
+        for _ in 0..ADAPTIVE_FALLBACK_REJECTIONS {
+            haystack.extend_from_slice(&[b'Z', 0xff, b'Q']);
+        }
+        haystack.extend_from_slice(b"A!QE!QA!QE!Q");
+
+        let mut cursor_a = plan_a.search_cursor(&haystack);
+        let mut cursor_e = plan_e.search_cursor(&haystack);
+        assert_eq!(cursor_a.haystack.as_ptr(), cursor_e.haystack.as_ptr());
+
+        let full = Window::full(&haystack);
+        let (first_a, accounting_a) = cursor_a
+            .find_window(full, SearchLimits::unlimited())
+            .unwrap();
+        let (first_e, accounting_e) = cursor_e
+            .find_window(full, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(first_a, Some((24, 27)));
+        assert_eq!(first_e, Some((27, 30)));
+        assert!(accounting_a.actual.finder_scanned_bytes > 0);
+        assert!(accounting_e.actual.finder_scanned_bytes > 0);
+
+        let (second_a, _) = cursor_a
+            .find_window(
+                Window::new(first_a.unwrap().1, haystack.len()),
+                SearchLimits::unlimited(),
+            )
+            .unwrap();
+        let (second_e, _) = cursor_e
+            .find_window(
+                Window::new(first_e.unwrap().1, haystack.len()),
+                SearchLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(second_a, Some((30, 33)));
+        assert_eq!(second_e, Some((33, 36)));
+    }
+
+    #[test]
+    fn candidate_stream_drain_covers_before_at_and_after_handoff_boundary() {
+        const FALLBACK: &[(u8, u8)] = &[(b'A', b'Z')];
+        const VERIFY: &[(u8, u8)] = &[(0, 0x7f)];
+        const PRIMARY: &[(u8, u8)] = &[(b'Q', b'Q')];
+        const DRAIN_BOUNDARY: usize = 54;
+        let predicates = [FALLBACK, VERIFY, PRIMARY];
+        let plan = FixedPredicateWord64Plan::build(&predicates, BuildLimits::unlimited()).unwrap();
+
+        for target in [DRAIN_BOUNDARY - 1, DRAIN_BOUNDARY, DRAIN_BOUNDARY + 1] {
+            let mut haystack = Vec::new();
+            for _ in 0..2 * ADAPTIVE_FALLBACK_REJECTIONS {
+                haystack.extend_from_slice(&[b'A', 0xff, b'Q']);
+            }
+            haystack.resize(96, b'z');
+            haystack[target..target + 3].copy_from_slice(b"A!Q");
+
+            let mut cursor = plan.search_cursor(&haystack);
+            let (matched, accounting) = cursor
+                .find_window(Window::full(&haystack), SearchLimits::unlimited())
+                .unwrap();
+            assert_eq!(matched, Some((target, target + 3)), "target={target}");
+            assert!(accounting.actual.finder_scanned_bytes > 0);
+            assert!(accounting.actual.transitions <= accounting.upper_bounds.transitions);
+            assert!(accounting.actual.predicate_checks <= accounting.upper_bounds.predicate_checks);
+
+            if target == DRAIN_BOUNDARY - 1 {
+                assert_eq!(cursor.phase, RetainedSearchPhase::CandidateStreamDrain);
+                assert_eq!(cursor.block.end, DRAIN_BOUNDARY);
+                let crossing_end = target + 3;
+                assert!(crossing_end > DRAIN_BOUNDARY);
+                assert_eq!(
+                    cursor
+                        .find_window(
+                            Window::new(crossing_end, haystack.len()),
+                            SearchLimits::unlimited(),
+                        )
+                        .unwrap()
+                        .0,
+                    None,
+                    "a match crossing the drain boundary must not duplicate covered starts"
+                );
+            }
+
+            assert_eq!(naive_count(&haystack, &predicates), 1, "target={target}");
+            assert_eq!(
+                plan.count(&haystack, ReduceLimits::unlimited())
+                    .unwrap()
+                    .count,
+                1,
+                "target={target}"
+            );
+
+            let mut rebound = plan.search_cursor(&haystack);
+            assert_eq!(
+                rebound
+                    .find_window(Window::full(&haystack), SearchLimits::unlimited())
+                    .unwrap()
+                    .0,
+                Some((target, target + 3)),
+                "a fresh binding after early drop must restart cold"
+            );
+        }
     }
 
     #[test]
@@ -7264,34 +7433,12 @@ mod tests {
             .unwrap();
         let expected_first = expected_first.unwrap();
         assert_eq!(expected_first, (24, 27));
-        assert!(search_baseline.actual.candidate_stream_classified_bytes > 0);
+        assert!(search_baseline.actual.finder_scanned_bytes > 0);
         let search_upper = search_baseline.upper_bounds;
         let exact_search = SearchLimits {
             max_work: search_upper.work,
             max_scratch_bytes: search_upper.scratch_bytes,
         };
-        let legacy_search_work = search_upper
-            .work
-            .checked_sub(u64::try_from(search_upper.candidate_stream_classified_bytes).unwrap())
-            .unwrap();
-        assert_eq!(
-            legacy_search_work
-                .checked_add(u64::try_from(search_upper.candidate_stream_classified_bytes).unwrap())
-                .unwrap(),
-            search_upper.work
-        );
-        assert!(matches!(
-            plan.find_window(
-                &haystack,
-                full,
-                SearchLimits {
-                    max_work: legacy_search_work,
-                    ..exact_search
-                }
-            ),
-            Err(SearchError::WorkLimit { needed, limit })
-                if needed == search_upper.work && limit == legacy_search_work
-        ));
         let one_below_search_work = search_upper.work.checked_sub(1).unwrap();
         assert!(matches!(
             plan.find_window(
@@ -7306,12 +7453,32 @@ mod tests {
                 if needed == search_upper.work && limit == one_below_search_work
         ));
 
-        let mut retained = FixedPredicateWord64SearchCursor::new();
-        let (first, first_accounting) = plan
-            .find_window_with_cursor(&haystack, full, exact_search, &mut retained)
-            .unwrap();
+        let mut retained = plan.search_cursor(&haystack);
+        let cold_before_failure = (
+            retained.phase,
+            retained.block,
+            retained.window_end,
+            retained.next_start,
+        );
+        assert_eq!(
+            retained.find_window_with_late_failure(full, exact_search),
+            Err(SearchError::InternalInvariant(
+                "injected retained-cursor precommit failure"
+            ))
+        );
+        assert_eq!(
+            (
+                retained.phase,
+                retained.block,
+                retained.window_end,
+                retained.next_start,
+            ),
+            cold_before_failure,
+            "a late failure must not publish partially advanced cold state"
+        );
+        let (first, first_accounting) = retained.find_window(full, exact_search).unwrap();
         assert_eq!(first, Some(expected_first));
-        assert!(first_accounting.actual.candidate_stream_classified_bytes > 0);
+        assert!(first_accounting.actual.finder_scanned_bytes > 0);
         assert_eq!(retained.phase, RetainedSearchPhase::CandidateStream);
 
         let next_window = Window::new(expected_first.1, haystack.len());
@@ -7327,21 +7494,17 @@ mod tests {
         let before_refusal = (
             retained.phase,
             retained.block,
-            retained.source_address,
-            retained.source_len,
             retained.window_end,
             retained.next_start,
         );
         let one_below_next_work = next_upper.work.checked_sub(1).unwrap();
         assert!(matches!(
-            plan.find_window_with_cursor(
-                &haystack,
+            retained.find_window(
                 next_window,
                 SearchLimits {
                     max_work: one_below_next_work,
                     ..exact_next
-                },
-                &mut retained
+                }
             ),
             Err(SearchError::WorkLimit { .. })
         ));
@@ -7349,20 +7512,32 @@ mod tests {
             (
                 retained.phase,
                 retained.block,
-                retained.source_address,
-                retained.source_len,
                 retained.window_end,
                 retained.next_start,
             ),
             before_refusal,
             "preflight refusal must not consume or reset retained candidate masks"
         );
-        let (second, second_accounting) = plan
-            .find_window_with_cursor(&haystack, next_window, exact_next, &mut retained)
-            .unwrap();
+        assert_eq!(
+            retained.find_window_with_late_failure(next_window, exact_next),
+            Err(SearchError::InternalInvariant(
+                "injected retained-cursor precommit failure"
+            ))
+        );
+        assert_eq!(
+            (
+                retained.phase,
+                retained.block,
+                retained.window_end,
+                retained.next_start,
+            ),
+            before_refusal,
+            "a late failure must not consume a live retained block"
+        );
+        let (second, second_accounting) = retained.find_window(next_window, exact_next).unwrap();
         assert_eq!(second, Some((27, 30)));
         assert_eq!(
-            second_accounting.actual.candidate_stream_classified_bytes, 0,
+            second_accounting.actual.finder_scanned_bytes, 0,
             "recovery after refusal must reuse the still-live two-mask block"
         );
 
@@ -7381,31 +7556,9 @@ mod tests {
 
         let count_baseline = plan.count(&haystack, ReduceLimits::unlimited()).unwrap();
         assert_eq!(count_baseline.count, 64);
-        assert!(
-            count_baseline
-                .accounting
-                .actual
-                .candidate_stream_classified_bytes
-                > 0
-        );
+        assert!(count_baseline.accounting.actual.finder_scanned_bytes > 0);
         let count_upper = count_baseline.accounting.upper_bounds;
         let exact_count = exact_reduce_limits(count_upper);
-        let legacy_count_work = count_upper
-            .work
-            .checked_sub(u64::try_from(count_upper.candidate_stream_classified_bytes).unwrap())
-            .unwrap();
-        assert!(legacy_count_work < count_upper.work);
-        assert!(matches!(
-            plan.count(
-                &haystack,
-                ReduceLimits {
-                    max_work: legacy_count_work,
-                    ..exact_count
-                }
-            ),
-            Err(ReduceError::WorkLimit { needed, limit })
-                if needed == count_upper.work && limit == legacy_count_work
-        ));
         let one_below_count = ReduceLimits {
             max_work: count_upper.work.checked_sub(1).unwrap(),
             ..exact_count
@@ -7417,23 +7570,11 @@ mod tests {
         ));
         let recovered_count = plan.count(&haystack, exact_count).unwrap();
         assert_eq!(recovered_count.count, 64);
-        assert!(
-            recovered_count
-                .accounting
-                .actual
-                .candidate_stream_classified_bytes
-                > 0
-        );
+        assert!(recovered_count.accounting.actual.finder_scanned_bytes > 0);
 
         let span_baseline = plan.span_sum(&haystack, ReduceLimits::unlimited()).unwrap();
         assert_eq!(span_baseline.span_sum, 192);
-        assert!(
-            span_baseline
-                .accounting
-                .actual
-                .candidate_stream_classified_bytes
-                > 0
-        );
+        assert!(span_baseline.accounting.actual.finder_scanned_bytes > 0);
         let span_upper = span_baseline.accounting.upper_bounds;
         let exact_span = exact_reduce_limits(span_upper);
         let one_below_span = ReduceLimits {
@@ -7447,13 +7588,7 @@ mod tests {
         ));
         let recovered_span = plan.span_sum(&haystack, exact_span).unwrap();
         assert_eq!(recovered_span.span_sum, 192);
-        assert!(
-            recovered_span
-                .accounting
-                .actual
-                .candidate_stream_classified_bytes
-                > 0
-        );
+        assert!(recovered_span.accounting.actual.finder_scanned_bytes > 0);
     }
 
     #[test]
@@ -7707,7 +7842,10 @@ mod tests {
             (8_usize, 8_usize, 0_usize),
             (9, 9, 0),
             (16, 16, 0),
-            (17, 16, 6),
+            // The final candidate-stream block already classified start 16.
+            // Drain it before Shift-And so the two phases never charge the
+            // same source suffix; its accepted word needs no trailing scan.
+            (17, 17, 0),
         ] {
             let input_bytes = candidate_positions + plan.width() - 1;
             let mut haystack = vec![0x7F; input_bytes];

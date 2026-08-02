@@ -327,15 +327,24 @@ impl ByteSetClassifier {
         automatic_selection()
     }
 
-    /// Stable receipt for the candidate-stream block operation.
+    /// Stable receipt for the actual candidate-stream loop operation.
     ///
-    /// Runtime-dispatched and portable classifiers use two calls to the
-    /// authenticated narrow leaf. Static profiles may instead name one native
-    /// wide leaf, making the loop width part of immutable construction-time
-    /// identity rather than a hot-path feature probe.
+    /// Portable and runtime-dispatched loops retain the authenticated 16-byte
+    /// leaf. Only compiler-static profiles with a reviewed native wide leaf
+    /// report 32 bytes.
+    #[must_use]
+    pub const fn candidate_selection(&self) -> SelectionReceipt {
+        if BYTE_SET_CANDIDATE_BLOCK_BYTES == BYTE_SET_WIDE_BLOCK_BYTES {
+            self.wide_selection()
+        } else {
+            self.selection()
+        }
+    }
+
+    /// Stable receipt for the explicit 32-byte classification operation.
     #[must_use]
     #[cfg(not(feature = "static-dispatch"))]
-    pub const fn candidate_selection(&self) -> SelectionReceipt {
+    pub const fn wide_selection(&self) -> SelectionReceipt {
         SelectionReceipt {
             variant_id: SPLIT_MASK32_VARIANT_ID,
             delegate_variant_id: Some(self.selection.variant_id),
@@ -345,11 +354,11 @@ impl ByteSetClassifier {
         }
     }
 
-    /// Compiler-fixed candidate-stream block receipt.
+    /// Compiler-fixed receipt for the explicit 32-byte operation.
     #[must_use]
     #[cfg(feature = "static-dispatch")]
-    pub const fn candidate_selection(&self) -> SelectionReceipt {
-        automatic_candidate_selection(automatic_selection())
+    pub const fn wide_selection(&self) -> SelectionReceipt {
+        automatic_wide_selection(automatic_selection())
     }
 
     /// Classify exactly sixteen bytes.
@@ -645,7 +654,7 @@ const fn automatic_selection() -> SelectionReceipt {
 }
 
 #[cfg(feature = "static-dispatch")]
-const fn automatic_candidate_selection(_narrow: SelectionReceipt) -> SelectionReceipt {
+const fn automatic_wide_selection(_narrow: SelectionReceipt) -> SelectionReceipt {
     #[cfg(all(
         feature = "static-dispatch-arm-41-d84",
         target_arch = "aarch64",
@@ -844,8 +853,8 @@ unsafe fn static_classify(
 #[cfg(test)]
 mod tests {
     use super::{
-        BYTE_SET_BLOCK_BYTES, BYTE_SET_WIDE_BLOCK_BYTES, ByteSet256, ByteSetClassifier,
-        classify_scalar,
+        BYTE_SET_BLOCK_BYTES, BYTE_SET_CANDIDATE_BLOCK_BYTES, BYTE_SET_WIDE_BLOCK_BYTES,
+        ByteSet256, ByteSetClassifier, classify_scalar,
     };
     use crate::{DispatchPolicy, SimdDispatchContext};
 
@@ -935,9 +944,18 @@ mod tests {
                 });
                 assert_eq!(classifier.classify_32(block).member_mask(), expected);
             }
-            let receipt = classifier.candidate_selection();
+            let receipt = classifier.wide_selection();
             assert_eq!(receipt.selection_input_bytes, BYTE_SET_WIDE_BLOCK_BYTES);
             assert_eq!(receipt.minimum_input_bytes, BYTE_SET_WIDE_BLOCK_BYTES);
+            let candidate = classifier.candidate_selection();
+            assert_eq!(
+                candidate.selection_input_bytes,
+                BYTE_SET_CANDIDATE_BLOCK_BYTES
+            );
+            assert_eq!(
+                candidate.minimum_input_bytes,
+                BYTE_SET_CANDIDATE_BLOCK_BYTES
+            );
         }
     }
 
