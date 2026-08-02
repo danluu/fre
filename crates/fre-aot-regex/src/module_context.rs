@@ -9,7 +9,8 @@ use super::{
     AARCH64_EQ, AARCH64_FIRST_LANE_INDEX, AARCH64_HI, AARCH64_HS, AARCH64_LO, AARCH64_LS,
     AARCH64_MI, AARCH64_NE, AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
     AARCH64_VECTOR_FILTER_FIRST_CONSTANT, Aarch64Assembler, Aarch64PrimaryScannerIsa,
-    Aarch64SveFilterKind, Architecture, BYTE_FREQUENCY_DENOMINATOR, CpuFeature,
+    Aarch64SveFilterKind, Aarch64SvePrimaryHitCharge, Architecture,
+    BYTE_FREQUENCY_DENOMINATOR, CpuFeature,
     EMPTY_NATIVE_PREFIX_RELATION_RECTANGLE, FeatureSet, MAX_NATIVE_PREFIX_RELATION_RECTANGLES,
     ModuleRelocation, NativeLowering, NativePrefixFilter, NativePrefixRelationPredicate,
     NativePrefixRelationRectangle, NativePrefixRelationVectorPlan, NativeStartFilter,
@@ -23,7 +24,8 @@ use super::{
     aarch64_emit_start_filter_address, aarch64_emit_start_filter_batch_candidates,
     aarch64_emit_start_filter_constants, aarch64_emit_start_filter_scalar_bound,
     aarch64_emit_start_filter_vector_candidates, aarch64_emit_start_filter_vector_test,
-    aarch64_emit_sve_start_filter_scanner, aarch64_emit_vector_filter_secondary_batch,
+    aarch64_emit_sve_multicol_start_filter_scanner, aarch64_emit_sve_start_filter_scanner,
+    aarch64_emit_vector_filter_secondary_batch,
     aarch64_emit_vector_filter_secondary_candidates_at, aarch64_load_byte_reg,
     aarch64_load_halfword_reg, aarch64_load_q, aarch64_load_u32_constant,
     aarch64_load_u64_constant, aarch64_lsr_x_imm, aarch64_mov_x, aarch64_movi_16b, aarch64_movz_w,
@@ -2604,14 +2606,14 @@ fn install_context_sve2_match_table(
 fn aarch64_context_prefix_accelerator(
     target: Target,
     primary: NativeStartFilter,
-    vector_filter: Option<NativeVectorFilter>,
+    _vector_filter: Option<NativeVectorFilter>,
     boundary_pair: Option<ContextBoundaryPairExpression>,
     sve2_match_table: Option<u32>,
 ) -> Option<StartAccelerator> {
     if primary.ranges().is_empty() {
         return None;
     }
-    let sve_route_supported = vector_filter.is_none() && boundary_pair.is_none();
+    let sve_route_supported = boundary_pair.is_none();
     Some(match aarch64_primary_scanner_isa(
         target.operating_system,
         target.features,
@@ -2961,21 +2963,19 @@ pub(super) fn lower_native_context(
         interior: install_context_sve2_match_table(
             &mut layout,
             target,
-            interior_guard
-                .filter(|guard| guard.vector_filter.is_none())
-                .map(|guard| guard.primary),
+            interior_guard.map(|guard| guard.primary),
         )?,
         anchored: install_context_sve2_match_table(
             &mut layout,
             target,
             anchored_forward_search
-                .filter(|search| search.vector_filter.is_none() && anchored_boundary_pair.is_none())
+                .filter(|_| anchored_boundary_pair.is_none())
                 .map(|search| search.primary),
         )?,
         ordinary: install_context_sve2_match_table(
             &mut layout,
             target,
-            start_filter.filter(|_| vector_filter.is_none() && ordinary_boundary_pair.is_none()),
+            start_filter.filter(|_| ordinary_boundary_pair.is_none()),
         )?,
     };
     let (code, relocations) = match target.architecture {
@@ -6312,9 +6312,8 @@ fn aarch64_context_emit_prefix_prepass(
     invalid: usize,
     vector_entry: Option<usize>,
 ) -> Result<(), ObjectError> {
-    let selected_sve = sve_filter_kind.filter(|_| {
-        vector_filter.is_none() && boundary_pair.is_none() && !primary.ranges().is_empty()
-    });
+    let selected_sve =
+        sve_filter_kind.filter(|_| boundary_pair.is_none() && !primary.ranges().is_empty());
     if let Some(selected_sve) = selected_sve
         && use_asimd
     {
@@ -6382,15 +6381,33 @@ fn aarch64_context_emit_prefix_prepass(
             None => assembler.label()?,
         };
         let scalar = assembler.label()?;
-        aarch64_emit_sve_start_filter_scanner(
-            assembler,
-            primary,
-            primary.scan_offset,
-            sve_filter_kind,
-            vector,
-            scalar,
-            vector_candidate,
-        )?;
+        if let Some(vector_filter) = vector_filter {
+            aarch64_emit_sve_multicol_start_filter_scanner(
+                assembler,
+                primary,
+                Some(vector_filter),
+                anchored_guard.map(|(guard, fallback)| Aarch64SvePrimaryHitCharge {
+                    debt: guard.vector_debt,
+                    initial_credit: guard.initial_credit,
+                    fallback,
+                }),
+                vector_filter.max_scan_offset(),
+                sve_filter_kind,
+                vector,
+                scalar,
+                vector_candidate,
+            )?;
+        } else {
+            aarch64_emit_sve_start_filter_scanner(
+                assembler,
+                primary,
+                primary.scan_offset,
+                sve_filter_kind,
+                vector,
+                scalar,
+                vector_candidate,
+            )?;
+        }
         assembler.bind(scalar)?;
         return aarch64_context_emit_scalar_prefix_prepass(
             assembler,
@@ -8138,6 +8155,16 @@ mod tests {
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     "!aaaabbbb!"
+                )
+                .as_bytes(),
+            ),
+            (
+                "(?-u:\\b)qeee(?s:.)*?",
+                OutputContract::Span,
+                concat!(
+                    "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+                    "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx!",
+                    "qeeq!qeee?"
                 )
                 .as_bytes(),
             ),
@@ -9968,6 +9995,74 @@ mod tests {
         assert!(sve2_words.contains(&super::super::aarch64_sve_ld1rqb(16, 12).unwrap()));
         assert!(sve2_words.contains(&super::super::aarch64_sve2_match_b(1, 0, 16).unwrap()));
         assert_ne!(compiled.object(), sve2.object());
+    }
+
+    #[test]
+    fn contextual_sve_intersects_nonzero_offset_graph_columns() -> Result<(), ObjectError> {
+        let pattern = r"(?-u:\b)qeee(?s:.)*?";
+        let target = Target::aarch64_linux()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2))
+            .unwrap();
+        let compiled = compile(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span),
+        )
+        .unwrap();
+        let view = compiled.program().native_context_program_view().unwrap();
+        let primary = derive_anchored_prefix_start_filter(view.anchored_prefix.sets())?
+            .expect("context primary");
+        let vector_filter = derive_vector_filter(Some(primary), view.anchored_prefix.sets())?
+            .expect("context vector filter");
+        assert_eq!(
+            vector_filter
+                .columns()
+                .iter()
+                .map(|column| column.scan_offset)
+                .collect::<Vec<_>>(),
+            [0, 3, 2]
+        );
+        assert_eq!(
+            compiled.module().start_accelerator(),
+            StartAccelerator::Aarch64Sve2
+        );
+        let words = compiled.module().sections()[TEXT_SECTION]
+            .bytes()
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        for word in [
+            super::super::aarch64_sve2_match_b(1, 0, 16).unwrap(),
+            super::super::aarch64_sve_cmpeq_b(2, 0, 17).unwrap(),
+            super::super::aarch64_sve_cmpeq_b(2, 0, 18).unwrap(),
+            super::super::aarch64_sve_and_b(1, 1, 2).unwrap(),
+        ] {
+            assert!(
+                words.contains(&word),
+                "missing contextual multicolumn SVE word {word:#010x}"
+            );
+        }
+        let (_, guard, _) = anchored_guard_for(pattern, target);
+        assert_ne!(guard.vector_debt, guard.candidate_debt);
+        let vector_charge = super::super::aarch64_add_x_imm(17, 17, guard.vector_debt).unwrap();
+        let allowance =
+            super::super::aarch64_add_x_imm(12, 2, guard.initial_credit).unwrap();
+        let debt_compare = super::super::aarch64_cmp_x(17, 12).unwrap();
+        assert!(
+            words.windows(3).any(|window| {
+                window[0] == vector_charge
+                    && window[1] == allowance
+                    && window[2] == debt_compare
+            }),
+            "SVE primary-hit secondary refinement must charge adaptive vector debt"
+        );
+        assert!(
+            words.contains(
+                &super::super::aarch64_add_x_imm(17, 17, guard.candidate_debt).unwrap()
+            ),
+            "the existing exact-candidate debt charge must remain present"
+        );
+        Ok(())
     }
 
     #[test]

@@ -9641,6 +9641,13 @@ enum Aarch64SveFilterKind {
     Sve2 { match_table_offset: u32 },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Aarch64SvePrimaryHitCharge {
+    debt: u16,
+    initial_credit: u16,
+    fallback: Aarch64Label,
+}
+
 /// Largest runtime SVE vector length admitted to the four-vector scanner.
 ///
 /// The graph-derived byte frequency uses 256 denominator units. A replay is
@@ -9697,22 +9704,44 @@ fn aarch64_sve_filter_constant_register(index: usize) -> Result<u8, ObjectError>
     Ok(register)
 }
 
+fn aarch64_sve_filter_constant_register_from(
+    first_constant: usize,
+    index: usize,
+) -> Result<u8, ObjectError> {
+    let logical = first_constant
+        .checked_add(index)
+        .ok_or(ObjectError::ArithmeticOverflow("SVE filter constant"))?;
+    aarch64_sve_filter_constant_register(logical)
+}
+
+fn aarch64_sve_filter_constant_count(
+    filter: NativeStartFilter,
+    kind: Aarch64SveFilterKind,
+) -> usize {
+    match kind {
+        Aarch64SveFilterKind::Sve => filter.constant_count(),
+        Aarch64SveFilterKind::Sve2 { .. } => 1,
+    }
+}
+
 fn aarch64_emit_sve_filter_setup(
     assembler: &mut Aarch64Assembler,
     filter: NativeStartFilter,
     kind: Aarch64SveFilterKind,
+    first_constant: usize,
 ) -> Result<(), ObjectError> {
     if filter.ranges().is_empty() {
         return Err(ObjectError::InvalidModule("empty SVE start filter"));
     }
-    // AAPCS64 6.1.4 makes every predicate register caller-saved for this
-    // ordinary scalar interface. The scanner still confines itself to P0..P4,
-    // which are caller-saved even for a scalable-vector PCS interface.
+    // AAPCS64 makes every predicate register caller-saved under the ordinary
+    // base PCS used by this scalar interface. The scalable-vector PCS instead
+    // preserves P4..P15, but these exported entries never use that PCS.
     match kind {
         Aarch64SveFilterKind::Sve => {
             for (index, range) in filter.ranges().iter().enumerate() {
                 if filter.is_exact() {
-                    let register = aarch64_sve_filter_constant_register(index)?;
+                    let register =
+                        aarch64_sve_filter_constant_register_from(first_constant, index)?;
                     assembler.instruction(aarch64_movz_w(12, u16::from(range.start))?)?;
                     assembler.instruction(aarch64_sve_dup_b_from_w(register, 12)?)?;
                 } else {
@@ -9725,8 +9754,10 @@ fn aarch64_emit_sve_filter_setup(
                             .ok_or(ObjectError::ArithmeticOverflow(
                                 "SVE range-filter high constant",
                             ))?;
-                    let low = aarch64_sve_filter_constant_register(low_index)?;
-                    let high = aarch64_sve_filter_constant_register(high_index)?;
+                    let low =
+                        aarch64_sve_filter_constant_register_from(first_constant, low_index)?;
+                    let high =
+                        aarch64_sve_filter_constant_register_from(first_constant, high_index)?;
                     assembler.instruction(aarch64_movz_w(12, u16::from(range.start))?)?;
                     assembler.instruction(aarch64_sve_dup_b_from_w(low, 12)?)?;
                     assembler.instruction(aarch64_movz_w(12, u16::from(range.end))?)?;
@@ -9742,7 +9773,8 @@ fn aarch64_emit_sve_filter_setup(
             // after setup, so this one setup-only PTRUE is required here.
             assembler.instruction(aarch64_sve_ptrue_b())?;
             aarch64_set_table_address(assembler, 12, match_table_offset)?;
-            assembler.instruction(aarch64_sve_ld1rqb(16, 12)?)?;
+            let table = aarch64_sve_filter_constant_register(first_constant)?;
+            assembler.instruction(aarch64_sve_ld1rqb(table, 12)?)?;
         }
     }
     Ok(())
@@ -9752,41 +9784,59 @@ fn aarch64_emit_sve_filter_candidates(
     assembler: &mut Aarch64Assembler,
     filter: NativeStartFilter,
     kind: Aarch64SveFilterKind,
+    first_constant: usize,
+    source: u8,
+    destination: u8,
+    scratch: u8,
+    range_scratch: u8,
 ) -> Result<(), ObjectError> {
     match kind {
         Aarch64SveFilterKind::Sve2 { .. } => {
-            assembler.instruction(aarch64_sve2_match_b(1, 0, 16)?)?;
+            let table = aarch64_sve_filter_constant_register(first_constant)?;
+            assembler.instruction(aarch64_sve2_match_b(destination, source, table)?)?;
         }
         Aarch64SveFilterKind::Sve if filter.is_exact() => {
             for (index, _) in filter.ranges().iter().enumerate() {
-                let constant = aarch64_sve_filter_constant_register(index)?;
-                let destination = if index == 0 { 1 } else { 2 };
-                assembler.instruction(aarch64_sve_cmpeq_b(destination, 0, constant)?)?;
+                let constant =
+                    aarch64_sve_filter_constant_register_from(first_constant, index)?;
+                let comparison = if index == 0 { destination } else { scratch };
+                assembler.instruction(aarch64_sve_cmpeq_b(comparison, source, constant)?)?;
                 if index != 0 {
-                    assembler.instruction(aarch64_sve_orr_b(1, 1, 2)?)?;
+                    assembler.instruction(aarch64_sve_orr_b(
+                        destination,
+                        destination,
+                        scratch,
+                    )?)?;
                 }
             }
         }
         Aarch64SveFilterKind::Sve => {
             for (index, _) in filter.ranges().iter().enumerate() {
-                let low = aarch64_sve_filter_constant_register(index.checked_mul(2).ok_or(
+                let low_index = index.checked_mul(2).ok_or(
                     ObjectError::ArithmeticOverflow("SVE range-filter candidate low"),
-                )?)?;
-                let high = aarch64_sve_filter_constant_register(
-                    index
-                        .checked_mul(2)
-                        .and_then(|value| value.checked_add(1))
-                        .ok_or(ObjectError::ArithmeticOverflow(
-                            "SVE range-filter candidate high",
-                        ))?,
                 )?;
-                let destination = if index == 0 { 1 } else { 2 };
-                assembler.instruction(aarch64_sve_cmphs_b(destination, 0, low)?)?;
+                let high_index = low_index.checked_add(1).ok_or(
+                    ObjectError::ArithmeticOverflow("SVE range-filter candidate high"),
+                )?;
+                let low =
+                    aarch64_sve_filter_constant_register_from(first_constant, low_index)?;
+                let high =
+                    aarch64_sve_filter_constant_register_from(first_constant, high_index)?;
+                let comparison = if index == 0 { destination } else { scratch };
+                assembler.instruction(aarch64_sve_cmphs_b(comparison, source, low)?)?;
                 // CMPLS(data, high) is the CMPhs(high, data) alias.
-                assembler.instruction(aarch64_sve_cmphs_b(3, high, 0)?)?;
-                assembler.instruction(aarch64_sve_and_b(destination, destination, 3)?)?;
+                assembler.instruction(aarch64_sve_cmphs_b(range_scratch, high, source)?)?;
+                assembler.instruction(aarch64_sve_and_b(
+                    comparison,
+                    comparison,
+                    range_scratch,
+                )?)?;
                 if index != 0 {
-                    assembler.instruction(aarch64_sve_orr_b(1, 1, 2)?)?;
+                    assembler.instruction(aarch64_sve_orr_b(
+                        destination,
+                        destination,
+                        scratch,
+                    )?)?;
                 }
             }
         }
@@ -9794,14 +9844,167 @@ fn aarch64_emit_sve_filter_candidates(
     Ok(())
 }
 
-fn aarch64_emit_sve_filter_load_candidates(
+fn aarch64_emit_sve_filter_setups(
+    assembler: &mut Aarch64Assembler,
+    filter: NativeStartFilter,
+    vector_filter: Option<NativeVectorFilter>,
+    kind: Aarch64SveFilterKind,
+) -> Result<(), ObjectError> {
+    if vector_filter.is_some_and(|vector_filter| {
+        vector_filter.columns().first().copied() != Some(filter)
+    }) {
+        return Err(ObjectError::InvalidModule(
+            "SVE vector-filter primary mismatch",
+        ));
+    }
+    aarch64_emit_sve_filter_setup(assembler, filter, kind, 0)?;
+    let mut first_constant = aarch64_sve_filter_constant_count(filter, kind);
+    if let Some(vector_filter) = vector_filter {
+        for &column in &vector_filter.columns()[1..] {
+            aarch64_emit_sve_filter_setup(
+                assembler,
+                column,
+                Aarch64SveFilterKind::Sve,
+                first_constant,
+            )?;
+            first_constant = first_constant.checked_add(column.constant_count()).ok_or(
+                ObjectError::ArithmeticOverflow("SVE vector-filter constants"),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn aarch64_emit_sve_filter_load_primary_candidates(
     assembler: &mut Aarch64Assembler,
     filter: NativeStartFilter,
     kind: Aarch64SveFilterKind,
     vector_offset: u8,
 ) -> Result<(), ObjectError> {
+    aarch64_emit_start_filter_address(assembler, filter.scan_offset)?;
     assembler.instruction(aarch64_sve_ld1b_vl(0, 12, vector_offset)?)?;
-    aarch64_emit_sve_filter_candidates(assembler, filter, kind)
+    aarch64_emit_sve_filter_candidates(assembler, filter, kind, 0, 0, 1, 2, 3)
+}
+
+fn aarch64_emit_sve_filter_load_secondary_candidates(
+    assembler: &mut Aarch64Assembler,
+    filter: NativeStartFilter,
+    vector_filter: NativeVectorFilter,
+    kind: Aarch64SveFilterKind,
+    vector_offset: u8,
+) -> Result<(), ObjectError> {
+    if vector_filter.columns().first().copied() != Some(filter)
+        || vector_filter.columns().len() < 2
+    {
+        return Err(ObjectError::InvalidModule(
+            "SVE vector-filter primary mismatch",
+        ));
+    }
+    let mut first_constant = aarch64_sve_filter_constant_count(filter, kind);
+    for &column in &vector_filter.columns()[1..] {
+        aarch64_emit_start_filter_address(assembler, column.scan_offset)?;
+        assembler.instruction(aarch64_sve_ld1b_vl(0, 12, vector_offset)?)?;
+        aarch64_emit_sve_filter_candidates(
+            assembler,
+            column,
+            Aarch64SveFilterKind::Sve,
+            first_constant,
+            0,
+            2,
+            3,
+            4,
+        )?;
+        assembler.instruction(aarch64_sve_and_b(1, 1, 2)?)?;
+        first_constant = first_constant.checked_add(column.constant_count()).ok_or(
+            ObjectError::ArithmeticOverflow("SVE vector-filter constants"),
+        )?;
+    }
+    Ok(())
+}
+
+fn aarch64_emit_sve_filter_batch_primary_candidates(
+    assembler: &mut Aarch64Assembler,
+    filter: NativeStartFilter,
+    kind: Aarch64SveFilterKind,
+) -> Result<(), ObjectError> {
+    let batch_vectors = u8::try_from(AARCH64_SVE_BATCH_VECTORS)
+        .map_err(|_| ObjectError::ArithmeticOverflow("SVE batch vectors"))?;
+    aarch64_emit_start_filter_address(assembler, filter.scan_offset)?;
+    for block in 0_u8..batch_vectors {
+        let source = 24_u8
+            .checked_add(block)
+            .ok_or(ObjectError::ArithmeticOverflow("SVE batch source"))?;
+        assembler.instruction(aarch64_sve_ld1b_vl(source, 12, block)?)?;
+    }
+    for block in 0_u8..batch_vectors {
+        let source = 24_u8
+            .checked_add(block)
+            .ok_or(ObjectError::ArithmeticOverflow("SVE batch source"))?;
+        let destination = 1_u8.checked_add(block).ok_or(
+            ObjectError::ArithmeticOverflow("SVE batch candidate predicate"),
+        )?;
+        aarch64_emit_sve_filter_candidates(
+            assembler,
+            filter,
+            kind,
+            0,
+            source,
+            destination,
+            5,
+            6,
+        )?;
+    }
+    Ok(())
+}
+
+fn aarch64_emit_sve_filter_batch_secondary_candidates(
+    assembler: &mut Aarch64Assembler,
+    filter: NativeStartFilter,
+    vector_filter: NativeVectorFilter,
+    kind: Aarch64SveFilterKind,
+) -> Result<(), ObjectError> {
+    if vector_filter.columns().first().copied() != Some(filter)
+        || vector_filter.columns().len() < 2
+    {
+        return Err(ObjectError::InvalidModule(
+            "SVE vector-filter primary mismatch",
+        ));
+    }
+    let batch_vectors = u8::try_from(AARCH64_SVE_BATCH_VECTORS)
+        .map_err(|_| ObjectError::ArithmeticOverflow("SVE batch vectors"))?;
+    let mut first_constant = aarch64_sve_filter_constant_count(filter, kind);
+    for &column in &vector_filter.columns()[1..] {
+        aarch64_emit_start_filter_address(assembler, column.scan_offset)?;
+        for block in 0_u8..batch_vectors {
+            let source = 24_u8
+                .checked_add(block)
+                .ok_or(ObjectError::ArithmeticOverflow("SVE batch source"))?;
+            assembler.instruction(aarch64_sve_ld1b_vl(source, 12, block)?)?;
+        }
+        for block in 0_u8..batch_vectors {
+            let source = 24_u8
+                .checked_add(block)
+                .ok_or(ObjectError::ArithmeticOverflow("SVE batch source"))?;
+            let primary = 1_u8.checked_add(block).ok_or(
+                ObjectError::ArithmeticOverflow("SVE batch candidate predicate"),
+            )?;
+            aarch64_emit_sve_filter_candidates(
+                assembler,
+                column,
+                Aarch64SveFilterKind::Sve,
+                first_constant,
+                source,
+                5,
+                6,
+                7,
+            )?;
+            assembler.instruction(aarch64_sve_and_b(primary, primary, 5)?)?;
+        }
+        first_constant = first_constant.checked_add(column.constant_count()).ok_or(
+            ObjectError::ArithmeticOverflow("SVE vector-filter constants"),
+        )?;
+    }
+    Ok(())
 }
 
 fn aarch64_emit_sve_first_candidate(
@@ -9816,15 +10019,38 @@ fn aarch64_emit_sve_first_candidate(
     Ok(())
 }
 
-/// Emit one vector-length-agnostic scanner over a graph-derived byte filter.
-///
-/// `CNTB` is loop invariant. A stable graph/frequency gate admits the
-/// four-vector path only for runtime vector lengths whose expected replay
-/// budget is sparse; other filters and wider process VLs enter the direct
-/// one-vector loop. The batch no-hit path retains only its union and the rare
-/// hit path replays probes in source order. One-vector and predicated partial
-/// tails preserve the same exact first-lane rule without reading past the
-/// window.
+fn aarch64_emit_sve_primary_hit_charge(
+    assembler: &mut Aarch64Assembler,
+    charge: Aarch64SvePrimaryHitCharge,
+) -> Result<(), ObjectError> {
+    // Context anchored-forward search keeps fixed-point work debt in x17.
+    // Charge a primary-hit block before any graph-secondary refinement and
+    // resume the one-shot fallback from that block's semantic base on excess.
+    assembler.instruction(aarch64_add_x_imm(17, 17, charge.debt)?)?;
+    assembler.instruction(aarch64_add_x_imm(12, 2, charge.initial_credit)?)?;
+    assembler.instruction(aarch64_cmp_x(17, 12)?)?;
+    let admitted = assembler.label()?;
+    assembler.branch_cond(AARCH64_LS, admitted)?;
+    assembler.instruction(aarch64_store_x(2, 4, 0)?)?;
+    assembler.branch(charge.fallback)?;
+    assembler.bind(admitted)?;
+    Ok(())
+}
+
+fn aarch64_emit_sve_legacy_filter_load_candidates(
+    assembler: &mut Aarch64Assembler,
+    filter: NativeStartFilter,
+    kind: Aarch64SveFilterKind,
+    vector_offset: u8,
+) -> Result<(), ObjectError> {
+    assembler.instruction(aarch64_sve_ld1b_vl(0, 12, vector_offset)?)?;
+    aarch64_emit_sve_filter_candidates(assembler, filter, kind, 0, 0, 1, 2, 3)
+}
+
+/// Emit the established direct-DFA SVE scanner over one graph-derived byte
+/// filter. Direct lowering already prices and performs later graph columns at
+/// candidate refinement. Retaining that split avoids paying scalable loads
+/// for every primary-hit block and preserves the lower-cost replay schedule.
 fn aarch64_emit_sve_start_filter_scanner(
     assembler: &mut Aarch64Assembler,
     filter: NativeStartFilter,
@@ -9855,13 +10081,10 @@ fn aarch64_emit_sve_start_filter_scanner(
         None
     };
     assembler.bind(vector)?;
-    // This label is externally reachable after candidate rejection and from
-    // contextual restart routes. In a mixed-capability module, intervening
-    // ASIMD work may alias V16..V23 with the SVE Z16..Z23 constant bank.
-    // Rematerialize setup after binding the entry so every re-entry is safe.
-    aarch64_emit_sve_filter_setup(assembler, filter, kind)?;
-    // A rejected candidate may also re-enter after a predicated tail probe.
-    // Restore the all-lanes predicate before any full-vector load.
+    // This label is externally reachable after candidate rejection. In a
+    // mixed-capability module, intervening ASIMD work may alias V16..V23 with
+    // the SVE Z16..Z23 constant bank, so every re-entry rematerializes setup.
+    aarch64_emit_sve_filter_setup(assembler, filter, kind, 0)?;
     assembler.instruction(aarch64_sve_ptrue_b())?;
     assembler.instruction(aarch64_sve_cntb(6)?)?;
 
@@ -9877,12 +10100,11 @@ fn aarch64_emit_sve_start_filter_scanner(
             assembler.branch_cond(AARCH64_LS, scalar)?;
             assembler.instruction(aarch64_sub_x_imm(12, 12, u16::from(maximum_scan_offset))?)?;
         }
-        // Four runtime vectors are 4 * CNTB, encoded as the checked LSL #2.
         assembler.instruction(aarch64_cmp_x_lsl(12, 6, 2)?)?;
         assembler.branch_cond(AARCH64_LO, single)?;
         aarch64_emit_start_filter_address(assembler, filter.scan_offset)?;
         for block in 0_u8..batch_vectors {
-            aarch64_emit_sve_filter_load_candidates(assembler, filter, kind, block)?;
+            aarch64_emit_sve_legacy_filter_load_candidates(assembler, filter, kind, block)?;
             assembler.instruction(if block == 0 {
                 aarch64_sve_orr_b(4, 1, 1)?
             } else {
@@ -9899,7 +10121,7 @@ fn aarch64_emit_sve_start_filter_scanner(
         assembler.bind(batch_hit)?;
         aarch64_emit_start_filter_address(assembler, filter.scan_offset)?;
         for (block, &hit) in batch_hits.iter().enumerate() {
-            aarch64_emit_sve_filter_load_candidates(
+            aarch64_emit_sve_legacy_filter_load_candidates(
                 assembler,
                 filter,
                 kind,
@@ -9909,8 +10131,6 @@ fn aarch64_emit_sve_start_filter_scanner(
             assembler.instruction(aarch64_sve_ptest_p0(1)?)?;
             assembler.branch_cond(AARCH64_NE, hit)?;
         }
-        // The batch union proved that one ordered probe must succeed. Preserve
-        // a correct scalar fallback if future selection violates the invariant.
         assembler.branch(scalar)?;
         for (block, &hit) in batch_hits.iter().enumerate() {
             assembler.bind(hit)?;
@@ -9936,7 +10156,7 @@ fn aarch64_emit_sve_start_filter_scanner(
     assembler.instruction(aarch64_cmp_x(12, 6)?)?;
     assembler.branch_cond(AARCH64_LO, partial)?;
     aarch64_emit_start_filter_address(assembler, filter.scan_offset)?;
-    aarch64_emit_sve_filter_load_candidates(assembler, filter, kind, 0)?;
+    aarch64_emit_sve_legacy_filter_load_candidates(assembler, filter, kind, 0)?;
     assembler.instruction(aarch64_sve_ptest_p0(1)?)?;
     assembler.branch_cond(AARCH64_NE, single_hit)?;
     assembler.instruction(aarch64_sve_addvl(2, 2, 1)?)?;
@@ -9951,9 +10171,216 @@ fn aarch64_emit_sve_start_filter_scanner(
     };
     assembler.instruction(aarch64_sve_whilelo_b(0, 2, partial_end)?)?;
     aarch64_emit_start_filter_address(assembler, filter.scan_offset)?;
-    aarch64_emit_sve_filter_load_candidates(assembler, filter, kind, 0)?;
+    aarch64_emit_sve_legacy_filter_load_candidates(assembler, filter, kind, 0)?;
     assembler.instruction(aarch64_sve_ptest_p0(1)?)?;
     assembler.branch_cond(AARCH64_NE, single_hit)?;
+    if maximum_scan_offset == 0 {
+        assembler.instruction(aarch64_mov_x(2, 3)?)?;
+    } else {
+        assembler.instruction(aarch64_sub_x_imm(2, 3, u16::from(maximum_scan_offset))?)?;
+    }
+    assembler.branch(scalar)?;
+
+    assembler.bind(single_hit)?;
+    aarch64_emit_sve_first_candidate(assembler, 1, candidate)?;
+    Ok(())
+}
+
+/// Emit one vector-length-agnostic scanner over a graph-derived byte filter.
+///
+/// `CNTB` is loop invariant. A stable graph/frequency gate admits the
+/// four-vector path only for runtime vector lengths whose expected replay
+/// budget is sparse; other filters and wider process VLs enter the direct
+/// one-vector loop. The batch retains four independent lane masks, intersects
+/// every graph-derived column in place, and probes a rare hit in source order.
+/// One-vector and predicated partial tails preserve the same exact first-lane
+/// rule without reading past the window.
+fn aarch64_emit_sve_multicol_start_filter_scanner(
+    assembler: &mut Aarch64Assembler,
+    filter: NativeStartFilter,
+    vector_filter: Option<NativeVectorFilter>,
+    primary_hit_charge: Option<Aarch64SvePrimaryHitCharge>,
+    maximum_scan_offset: u8,
+    kind: Aarch64SveFilterKind,
+    vector: Aarch64Label,
+    scalar: Aarch64Label,
+    candidate: Aarch64Label,
+) -> Result<(), ObjectError> {
+    if primary_hit_charge.is_some() && vector_filter.is_none() {
+        return Err(ObjectError::InvalidModule(
+            "SVE primary-hit charge has no secondary columns",
+        ));
+    }
+    let single = assembler.label()?;
+    let single_advance = assembler.label()?;
+    let partial = assembler.label()?;
+    let partial_exhausted = assembler.label()?;
+    let single_hit = assembler.label()?;
+    let batch_plan = if let Some(maximum_vector_bytes) =
+        aarch64_sve_batch_max_vector_bytes(filter, kind)
+    {
+        Some((
+            maximum_vector_bytes,
+            assembler.label()?,
+            assembler.label()?,
+            assembler.label()?,
+            [
+                assembler.label()?,
+                assembler.label()?,
+                assembler.label()?,
+                assembler.label()?,
+            ],
+        ))
+    } else {
+        None
+    };
+    assembler.bind(vector)?;
+    // This label is externally reachable after candidate rejection and from
+    // contextual restart routes. In a mixed-capability module, intervening
+    // ASIMD work may alias V16..V23 with the SVE Z16..Z23 constant bank.
+    // Rematerialize setup after binding the entry so every re-entry is safe.
+    aarch64_emit_sve_filter_setups(assembler, filter, vector_filter, kind)?;
+    // A rejected candidate may also re-enter after a predicated tail probe.
+    // Restore the all-lanes predicate before any full-vector load.
+    assembler.instruction(aarch64_sve_ptrue_b())?;
+    assembler.instruction(aarch64_sve_cntb(6)?)?;
+
+    if let Some((maximum_vector_bytes, batch, batch_advance, batch_hit, batch_hits)) = batch_plan {
+        let batch_vectors = u8::try_from(AARCH64_SVE_BATCH_VECTORS)
+            .map_err(|_| ObjectError::ArithmeticOverflow("SVE batch vectors"))?;
+        assembler.instruction(aarch64_cmp_x_imm(6, maximum_vector_bytes)?)?;
+        assembler.branch_cond(AARCH64_HI, single)?;
+        assembler.bind(batch)?;
+        assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+        if maximum_scan_offset != 0 {
+            assembler.instruction(aarch64_cmp_x_imm(12, u16::from(maximum_scan_offset))?)?;
+            assembler.branch_cond(AARCH64_LS, scalar)?;
+            assembler.instruction(aarch64_sub_x_imm(12, 12, u16::from(maximum_scan_offset))?)?;
+        }
+        // Four runtime vectors are 4 * CNTB, encoded as the checked LSL #2.
+        assembler.instruction(aarch64_cmp_x_lsl(12, 6, 2)?)?;
+        assembler.branch_cond(AARCH64_LO, single)?;
+        aarch64_emit_sve_filter_batch_primary_candidates(assembler, filter, kind)?;
+        assembler.instruction(aarch64_sve_orr_b(8, 1, 2)?)?;
+        assembler.instruction(aarch64_sve_orr_b(9, 3, 4)?)?;
+        assembler.instruction(aarch64_sve_orr_b(8, 8, 9)?)?;
+        assembler.instruction(aarch64_sve_ptest_p0(8)?)?;
+        if let Some(vector_filter) = vector_filter {
+            // The graph selector prices secondary columns as lazy work. Do
+            // not touch them until this four-vector batch contains a primary
+            // lane, then intersect every retained lane before hit ordering.
+            assembler.branch_cond(AARCH64_EQ, batch_advance)?;
+            if let Some(charge) = primary_hit_charge {
+                aarch64_emit_sve_primary_hit_charge(assembler, charge)?;
+            }
+            aarch64_emit_sve_filter_batch_secondary_candidates(
+                assembler,
+                filter,
+                vector_filter,
+                kind,
+            )?;
+            assembler.instruction(aarch64_sve_orr_b(8, 1, 2)?)?;
+            assembler.instruction(aarch64_sve_orr_b(9, 3, 4)?)?;
+            assembler.instruction(aarch64_sve_orr_b(8, 8, 9)?)?;
+            assembler.instruction(aarch64_sve_ptest_p0(8)?)?;
+        }
+        assembler.branch_cond(AARCH64_NE, batch_hit)?;
+        assembler.bind(batch_advance)?;
+        assembler.instruction(aarch64_sve_addvl(2, 2, batch_vectors)?)?;
+        assembler.branch(batch)?;
+
+        // The column-outer schedule retains all four intersected masks.
+        // Ordered probes keep the leftmost candidate exact without reloading
+        // either primary or secondary columns on the hit path.
+        assembler.bind(batch_hit)?;
+        for (block, &hit) in batch_hits.iter().enumerate() {
+            let predicate = u8::try_from(block)
+                .ok()
+                .and_then(|block| block.checked_add(1))
+                .ok_or(ObjectError::ArithmeticOverflow("SVE hit predicate"))?;
+            assembler.instruction(aarch64_sve_ptest_p0(predicate)?)?;
+            assembler.branch_cond(AARCH64_NE, hit)?;
+        }
+        // The batch union proved that one ordered probe must succeed. Preserve
+        // a correct scalar fallback if future selection violates the invariant.
+        assembler.branch(scalar)?;
+        for (block, &hit) in batch_hits.iter().enumerate() {
+            assembler.bind(hit)?;
+            if block != 0 {
+                assembler.instruction(aarch64_sve_addvl(
+                    2,
+                    2,
+                    u8::try_from(block)
+                        .map_err(|_| ObjectError::ArithmeticOverflow("SVE hit block"))?,
+                )?)?;
+            }
+            let predicate = u8::try_from(block)
+                .ok()
+                .and_then(|block| block.checked_add(1))
+                .ok_or(ObjectError::ArithmeticOverflow("SVE hit predicate"))?;
+            if predicate != 1 {
+                assembler.instruction(aarch64_sve_orr_b(1, predicate, predicate)?)?;
+            }
+            aarch64_emit_sve_first_candidate(assembler, 1, candidate)?;
+        }
+    }
+
+    assembler.bind(single)?;
+    assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+    if maximum_scan_offset != 0 {
+        assembler.instruction(aarch64_cmp_x_imm(12, u16::from(maximum_scan_offset))?)?;
+        assembler.branch_cond(AARCH64_LS, scalar)?;
+        assembler.instruction(aarch64_sub_x_imm(12, 12, u16::from(maximum_scan_offset))?)?;
+    }
+    assembler.instruction(aarch64_cmp_x(12, 6)?)?;
+    assembler.branch_cond(AARCH64_LO, partial)?;
+    aarch64_emit_sve_filter_load_primary_candidates(assembler, filter, kind, 0)?;
+    assembler.instruction(aarch64_sve_ptest_p0(1)?)?;
+    if let Some(vector_filter) = vector_filter {
+        assembler.branch_cond(AARCH64_EQ, single_advance)?;
+        if let Some(charge) = primary_hit_charge {
+            aarch64_emit_sve_primary_hit_charge(assembler, charge)?;
+        }
+        aarch64_emit_sve_filter_load_secondary_candidates(
+            assembler,
+            filter,
+            vector_filter,
+            kind,
+            0,
+        )?;
+        assembler.instruction(aarch64_sve_ptest_p0(1)?)?;
+    }
+    assembler.branch_cond(AARCH64_NE, single_hit)?;
+    assembler.bind(single_advance)?;
+    assembler.instruction(aarch64_sve_addvl(2, 2, 1)?)?;
+    assembler.branch(single)?;
+
+    assembler.bind(partial)?;
+    let partial_end = if maximum_scan_offset == 0 {
+        3
+    } else {
+        assembler.instruction(aarch64_sub_x_imm(12, 3, u16::from(maximum_scan_offset))?)?;
+        12
+    };
+    assembler.instruction(aarch64_sve_whilelo_b(0, 2, partial_end)?)?;
+    aarch64_emit_sve_filter_load_primary_candidates(assembler, filter, kind, 0)?;
+    assembler.instruction(aarch64_sve_ptest_p0(1)?)?;
+    if let Some(vector_filter) = vector_filter {
+        assembler.branch_cond(AARCH64_EQ, partial_exhausted)?;
+        if let Some(charge) = primary_hit_charge {
+            aarch64_emit_sve_primary_hit_charge(assembler, charge)?;
+        }
+        aarch64_emit_sve_filter_load_secondary_candidates(
+            assembler,
+            filter,
+            vector_filter,
+            kind,
+            0,
+        )?;
+        assembler.instruction(aarch64_sve_ptest_p0(1)?)?;
+    }
+    assembler.branch_cond(AARCH64_NE, single_hit)?;
+    assembler.bind(partial_exhausted)?;
     if maximum_scan_offset == 0 {
         assembler.instruction(aarch64_mov_x(2, 3)?)?;
     } else {
@@ -15091,10 +15518,11 @@ mod tests {
             );
         }
         for batch_only in [
-            aarch64_sve_ld1b_vl(0, 12, 1).unwrap(),
-            aarch64_sve_ld1b_vl(0, 12, 2).unwrap(),
-            aarch64_sve_ld1b_vl(0, 12, 3).unwrap(),
-            aarch64_sve_ptest_p0(4).unwrap(),
+            aarch64_sve_ld1b_vl(24, 12, 0).unwrap(),
+            aarch64_sve_ld1b_vl(25, 12, 1).unwrap(),
+            aarch64_sve_ld1b_vl(26, 12, 2).unwrap(),
+            aarch64_sve_ld1b_vl(27, 12, 3).unwrap(),
+            aarch64_sve_ptest_p0(8).unwrap(),
             aarch64_sve_addvl(2, 2, 4).unwrap(),
         ] {
             assert!(
@@ -15438,6 +15866,62 @@ mod tests {
         assert_eq!(
             mac_mixed.module().relocations(),
             mac_asimd.module().relocations()
+        );
+    }
+
+    #[test]
+    fn aarch64_sve_direct_route_keeps_scalar_graph_refinement() {
+        let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
+        let compile_for = |features| {
+            compile(
+                CompileRequest::new(
+                    "qeee",
+                    Target::aarch64_linux().with_features(features).unwrap(),
+                )
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+            )
+            .unwrap()
+        };
+
+        let base = compile_for(sve);
+        let layout = build_native_dfa_table(base.program().native_dfa_view().unwrap())
+            .unwrap()
+            .1;
+        let vector_filter = layout.vector_filter.expect("graph vector filter");
+        assert_eq!(
+            vector_filter
+                .columns()
+                .iter()
+                .map(|column| column.scan_offset)
+                .collect::<Vec<_>>(),
+            [0, 3, 2]
+        );
+        let base_words = base.module().sections()[TEXT_SECTION]
+            .bytes()
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(base_words.contains(&aarch64_sve_cmpeq_b(1, 0, 16).unwrap()));
+        assert!(
+            !base_words.contains(&aarch64_sve_and_b(1, 1, 2).unwrap()),
+            "direct DFA must retain scalar refinement after its SVE primary scan"
+        );
+
+        let sve2 = compile_for(sve.with(CpuFeature::Aarch64Sve2));
+        assert_eq!(
+            sve2.module().start_accelerator(),
+            StartAccelerator::Aarch64Sve2
+        );
+        let sve2_words = sve2.module().sections()[TEXT_SECTION]
+            .bytes()
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(sve2_words.contains(&aarch64_sve2_match_b(1, 0, 16).unwrap()));
+        assert!(
+            !sve2_words.contains(&aarch64_sve_and_b(1, 1, 2).unwrap()),
+            "direct DFA SVE2 primary must retain scalar graph refinement"
         );
     }
 
@@ -20748,7 +21232,7 @@ mod tests {
                             .collect::<Vec<_>>();
                         if target.features.has(CpuFeature::Aarch64Sve) {
                             assert!(words.contains(&aarch64_sve_addvl(2, 2, 4).unwrap()));
-                            assert!(words.contains(&aarch64_sve_ptest_p0(4).unwrap()));
+                            assert!(words.contains(&aarch64_sve_ptest_p0(8).unwrap()));
                         } else if target.features.has(CpuFeature::Aarch64Asimd) {
                             assert!(use_aarch64_filter_batch(filter));
                             assert!(
