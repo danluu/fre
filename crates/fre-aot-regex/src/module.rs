@@ -3355,6 +3355,15 @@ fn use_aarch64_filter_batch(filter: NativeStartFilter) -> bool {
     filter_fits_expected_hit_budget(filter, AARCH64_BATCH_BYTES, MAX_ASIMD_BATCH_EXPECTED_HITS)
 }
 
+/// Return whether base SVE can represent one graph-derived membership filter
+/// in its audited Z16..Z23 constant bank. This is a lowering-shape decision;
+/// it does not depend on a regex identity or runtime input.
+fn aarch64_base_sve_filter_supported(filter: NativeStartFilter) -> bool {
+    !filter.ranges().is_empty()
+        && filter.constant_count() <= 8
+        && vector_filter_instruction_units(filter) <= MAX_VECTOR_FILTER_INSTRUCTION_UNITS
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "selection, register budgeting and probability accounting form one auditable cost decision"
@@ -10483,6 +10492,7 @@ fn aarch64_emit_suffix_restart(
 fn aarch64_emit_suffix_prepass(
     assembler: &mut Aarch64Assembler,
     suffix: NativeSuffixFilter,
+    sve_kind: Option<Aarch64SveFilterKind>,
     use_asimd: bool,
     use_asimd_batch: bool,
     use_exact_asimd_lane: bool,
@@ -10490,6 +10500,12 @@ fn aarch64_emit_suffix_prepass(
     no_match: Aarch64Label,
     matched: Aarch64Label,
 ) -> Result<(), ObjectError> {
+    let use_sve = sve_kind.is_some();
+    if use_sve && use_asimd {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 suffix filter selected both SVE and ASIMD",
+        ));
+    }
     if let Some(reverse) = layout.seeded_reverse {
         return module_seeded_reverse_aarch64::aarch64_emit_seeded_reverse_prepass(
             assembler,
@@ -10514,6 +10530,11 @@ fn aarch64_emit_suffix_prepass(
     let single_hit = assembler.label()?;
     let apply = assembler.label()?;
     let done = assembler.label()?;
+    let sve_vector = if use_sve {
+        Some(assembler.label()?)
+    } else {
+        None
+    };
     let filter = suffix.filter;
     let scalar_filter = suffix.vector_filter.or(suffix.scalar_filter);
     let maximum_scan_offset =
@@ -10553,6 +10574,32 @@ fn aarch64_emit_suffix_prepass(
     assembler.branch_cond(AARCH64_LO, done)?;
     if ENABLE_DEFERRED_SUFFIX_FILTER_CONSTANTS {
         emit_constants(assembler)?;
+    }
+
+    if let Some(sve_vector) = sve_vector {
+        let sve_candidate = assembler.label()?;
+        let sve_reject = assembler.label()?;
+        aarch64_emit_sve_start_filter_scanner(
+            assembler,
+            filter,
+            maximum_scan_offset,
+            sve_kind.ok_or(ObjectError::InvalidModule(
+                "AArch64 SVE suffix scanner has no filter kind",
+            ))?,
+            sve_vector,
+            scalar,
+            sve_candidate,
+        )?;
+        assembler.bind(sve_candidate)?;
+        if let Some(vector_filter) = scalar_filter {
+            for &column in &vector_filter.columns()[1..] {
+                aarch64_emit_scalar_filter_membership(assembler, column, sve_reject)?;
+            }
+        }
+        assembler.branch(apply)?;
+        assembler.bind(sve_reject)?;
+        assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+        assembler.branch(sve_vector)?;
     }
 
     if use_asimd {
@@ -10729,7 +10776,7 @@ fn aarch64_emit_suffix_prepass(
         assembler.branch(apply)?;
         assembler.bind(scalar_reject)?;
         assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
-        assembler.branch(vector)?;
+        assembler.branch(sve_vector.unwrap_or(vector))?;
     } else {
         assembler.bind(scalar_columns)?;
         assembler.branch(apply)?;
@@ -10740,7 +10787,12 @@ fn aarch64_emit_suffix_prepass(
     assembler.bind(apply)?;
     if let Some(retry) = suffix.retry {
         module_suffix_retry::aarch64_emit_bounded_suffix_retry(
-            assembler, layout, retry, vector, no_match, matched,
+            assembler,
+            layout,
+            retry,
+            sve_vector.unwrap_or(vector),
+            no_match,
+            matched,
         )?;
     } else {
         aarch64_emit_suffix_restart(assembler, suffix.restart)?;
@@ -10851,6 +10903,14 @@ fn lower_aarch64_dfa_for_operating_system(
         && layout
             .start_filter
             .is_some_and(|filter| !filter.ranges().is_empty());
+    let sve_suffix_kind = (operating_system == OperatingSystem::Linux
+        && features.has(CpuFeature::Aarch64Sve)
+        && !features.has(CpuFeature::Aarch64Asimd)
+        && layout.seeded_reverse.is_none()
+        && layout
+            .suffix_filter
+            .is_some_and(|suffix| aarch64_base_sve_filter_supported(suffix.filter)))
+    .then_some(Aarch64SveFilterKind::Sve);
     let use_asimd_suffix = features.has(CpuFeature::Aarch64Asimd)
         && layout
             .suffix_filter
@@ -10929,6 +10989,7 @@ fn lower_aarch64_dfa_for_operating_system(
         aarch64_emit_suffix_prepass(
             &mut assembler,
             suffix,
+            sve_suffix_kind,
             use_asimd_suffix,
             use_asimd_suffix_batch,
             use_exact_asimd_lane,
@@ -15000,8 +15061,8 @@ mod tests {
                 .iter()
                 .filter(|&&word| word == aarch64_sve_cntb(6).unwrap())
                 .count(),
-            1,
-            "CNTB must be invariant across every internal batch and tail loop"
+            2,
+            "each independently entered start and suffix scanner must hoist CNTB out of its loops"
         );
 
         let sve_common = compile_for("[3-7]", sve_target);
@@ -15896,6 +15957,7 @@ mod tests {
         aarch64_emit_suffix_prepass(
             &mut aarch64,
             aarch64_suffix,
+            None,
             true,
             true,
             false,
