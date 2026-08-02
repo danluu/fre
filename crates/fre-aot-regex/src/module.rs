@@ -1704,16 +1704,22 @@ fn lower_native_dfa(
     view: NativeProgramView<'_>,
     target: Target,
 ) -> Result<NativeLowering, ObjectError> {
-    let (mut data, layout) = build_native_dfa_table_for_architecture(view, target.architecture)?;
-    let sve2_match_table_offset = install_aarch64_sve2_match_table(&mut data, layout, target)?;
-    let sve_filter_kind = selected_aarch64_sve_filter(layout, target, sve2_match_table_offset);
+    let vector_cost_model = native_vector_filter_cost_model_for_target(target, true);
+    let relation_vector_owns_route = direct_relation_vector_owns_route(target);
+    let (mut data, layout) = build_native_dfa_table_with_cost_model(
+        view,
+        target.architecture,
+        vector_cost_model,
+        relation_vector_owns_route,
+    )?;
+    let sve_filter_plan = install_aarch64_sve_filter_plan(&mut data, layout, target)?;
     let (code, relocations) = match target.architecture {
         Architecture::X86_64 => lower_x86_64_dfa(layout, target.features)?,
         Architecture::Aarch64 => lower_aarch64_dfa_for_operating_system(
             layout,
             target.features,
             target.operating_system,
-            sve_filter_kind,
+            sve_filter_plan,
         )?,
     };
     Ok(NativeLowering {
@@ -1721,7 +1727,7 @@ fn lower_native_dfa(
         data,
         relocations,
         needs_runtime: false,
-        start_accelerator: selected_start_accelerator(layout, target, sve_filter_kind),
+        start_accelerator: selected_start_accelerator(layout, target, sve_filter_plan),
         anchored_prefix_filter_bytes: layout
             .prefix_filter
             .map_or(0, |filter| filter.guaranteed_bytes),
@@ -1735,7 +1741,7 @@ fn lower_native_dfa(
 fn selected_start_accelerator(
     layout: NativeDfaLayout,
     target: Target,
-    sve_filter_kind: Option<Aarch64SveFilterKind>,
+    sve_filter_plan: Option<Aarch64SveFilterPlan>,
 ) -> StartAccelerator {
     let filter = match layout.start_filter {
         Some(filter) => Some(filter),
@@ -1763,11 +1769,11 @@ fn selected_start_accelerator(
             }
         }
         Architecture::Aarch64 => {
-            if layout.start_filter.is_some() && sve_filter_kind.is_some() {
-                match sve_filter_kind {
-                    Some(Aarch64SveFilterKind::Sve) => StartAccelerator::Aarch64Sve,
-                    Some(Aarch64SveFilterKind::Sve2 { .. }) => StartAccelerator::Aarch64Sve2,
-                    None => StartAccelerator::Scalar,
+            if layout.start_filter.is_some() && sve_filter_plan.is_some() {
+                if sve_filter_plan.is_some_and(Aarch64SveFilterPlan::uses_sve2) {
+                    StartAccelerator::Aarch64Sve2
+                } else {
+                    StartAccelerator::Aarch64Sve
                 }
             } else if selected_aarch64_sve_suffix_kind(
                 layout,
@@ -1786,33 +1792,6 @@ fn selected_start_accelerator(
     }
 }
 
-fn selected_aarch64_sve_filter(
-    layout: NativeDfaLayout,
-    target: Target,
-    sve2_match_table_offset: Option<u32>,
-) -> Option<Aarch64SveFilterKind> {
-    if target.architecture != Architecture::Aarch64 {
-        return None;
-    }
-    let filter = layout
-        .start_filter
-        .filter(|filter| !filter.ranges().is_empty())?;
-    if !aarch64_primary_scanner_uses_sve(aarch64_primary_scanner_isa(
-        target.operating_system,
-        target.features,
-        true,
-    )) {
-        return None;
-    }
-    if target.features.has(CpuFeature::Aarch64Sve2)
-        && filter.is_exact()
-        && let Some(match_table_offset) = sve2_match_table_offset
-    {
-        return Some(Aarch64SveFilterKind::Sve2 { match_table_offset });
-    }
-    Some(Aarch64SveFilterKind::Sve)
-}
-
 fn selected_aarch64_sve_suffix_kind(
     layout: NativeDfaLayout,
     features: FeatureSet,
@@ -1828,61 +1807,131 @@ fn selected_aarch64_sve_suffix_kind(
     .then_some(Aarch64SveFilterKind::Sve)
 }
 
-fn install_aarch64_sve2_match_table(
+fn install_aarch64_sve_filter_plan(
     data: &mut Vec<u8>,
     layout: NativeDfaLayout,
     target: Target,
-) -> Result<Option<u32>, ObjectError> {
+) -> Result<Option<Aarch64SveFilterPlan>, ObjectError> {
+    let maximum_table_bytes = usize::try_from(i32::MAX)
+        .map_err(|_| ObjectError::ArithmeticOverflow("SVE2 table address limit"))?;
+    install_aarch64_sve_filter_plan_with_limit(data, layout, target, maximum_table_bytes)
+}
+
+fn install_aarch64_sve_filter_plan_with_limit(
+    data: &mut Vec<u8>,
+    layout: NativeDfaLayout,
+    target: Target,
+    maximum_table_bytes: usize,
+) -> Result<Option<Aarch64SveFilterPlan>, ObjectError> {
     if target.architecture != Architecture::Aarch64
         || !aarch64_primary_scanner_uses_sve(aarch64_primary_scanner_isa(
             target.operating_system,
             target.features,
             true,
         ))
-        || !target.features.has(CpuFeature::Aarch64Sve2)
     {
         return Ok(None);
     }
-    let Some(filter) = layout
+    let Some(primary) = layout
         .start_filter
-        .filter(|filter| filter.is_exact() && !filter.ranges().is_empty())
+        .filter(|filter| !filter.ranges().is_empty())
     else {
         return Ok(None);
     };
+
+    // A vectorized two-byte relation owns the exact guard when present, so
+    // the direct SVE scanner consumes only its primary column on that route.
+    let relation_vector_owns_route = direct_relation_vector_owns_route(target)
+        && layout
+            .prefix_relation
+            .and_then(|relation| relation.vector_plan)
+            .is_some();
+    let vector_filter = (!relation_vector_owns_route)
+        .then_some(layout.vector_filter)
+        .flatten();
+    let mut columns = [primary; MAX_VECTOR_FILTER_COLUMNS];
+    let column_count = if let Some(vector_filter) = vector_filter {
+        if vector_filter.columns().first().copied() != Some(primary) {
+            return Err(ObjectError::InvalidModule(
+                "direct SVE vector-filter primary mismatch",
+            ));
+        }
+        let selected = vector_filter.columns();
+        columns[..selected.len()].copy_from_slice(selected);
+        selected.len()
+    } else {
+        1
+    };
+    let match_column_count = if target.features.has(CpuFeature::Aarch64Sve2) {
+        if native_vector_filter_cost_model_for_target(target, true)
+            == NativeVectorFilterCostModel::Aarch64Sve2Match
+        {
+            column_count
+        } else {
+            // Mixed SVE2/ASIMD shares its established graph plan with the
+            // VL16 route and historically table-lowered only the primary.
+            1
+        }
+    } else {
+        0
+    };
     let alignment = 16_usize;
-    let aligned = data
-        .len()
-        .checked_add(alignment - 1)
-        .ok_or(ObjectError::ArithmeticOverflow(
-            "SVE2 match-table alignment",
-        ))?
-        & !(alignment - 1);
-    let total = aligned
-        .checked_add(16)
-        .ok_or(ObjectError::ArithmeticOverflow("SVE2 match-table bytes"))?;
-    if total
-        > usize::try_from(i32::MAX)
-            .map_err(|_| ObjectError::ArithmeticOverflow("SVE2 table address limit"))?
-    {
-        return Ok(None);
+    let mut total = data.len();
+    let mut match_table_offsets = [None; MAX_VECTOR_FILTER_COLUMNS];
+    for (column, filter) in columns[..match_column_count].iter().enumerate() {
+        if !filter.is_exact() {
+            continue;
+        }
+        let aligned = total
+            .checked_add(alignment - 1)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "SVE2 match-table alignment",
+            ))?
+            & !(alignment - 1);
+        match_table_offsets[column] = Some(u32::try_from(aligned).map_err(|_| {
+            ObjectError::ArithmeticOverflow("SVE2 match-table offset")
+        })?);
+        total = aligned
+            .checked_add(16)
+            .ok_or(ObjectError::ArithmeticOverflow("SVE2 match-table bytes"))?;
+    }
+    let fallback = || {
+        aarch64_sve_filter_plan(
+            primary,
+            vector_filter,
+            [None; MAX_VECTOR_FILTER_COLUMNS],
+        )
+    };
+    let Some(plan) = aarch64_sve_filter_plan(primary, vector_filter, match_table_offsets)? else {
+        return fallback();
+    };
+    if total > maximum_table_bytes {
+        return fallback();
     }
     let additional = total
         .checked_sub(data.len())
         .ok_or(ObjectError::ArithmeticOverflow("SVE2 table reservation"))?;
     if data.try_reserve_exact(additional).is_err() {
-        return Ok(None);
+        return fallback();
     }
-    data.resize(aligned, 0);
-    for index in 0..16_usize {
-        let range = filter
-            .ranges()
-            .get(index % filter.ranges().len())
-            .ok_or(ObjectError::InvalidModule("empty SVE2 match table"))?;
-        data.push(range.start);
+    for (column, filter) in columns[..match_column_count].iter().enumerate() {
+        let Some(offset) = match_table_offsets[column] else {
+            continue;
+        };
+        data.resize(
+            usize::try_from(offset)
+                .map_err(|_| ObjectError::ArithmeticOverflow("SVE2 match-table offset"))?,
+            0,
+        );
+        for index in 0..16_usize {
+            let range = filter
+                .ranges()
+                .get(index % filter.ranges().len())
+                .ok_or(ObjectError::InvalidModule("empty SVE2 match table"))?;
+            data.push(range.start);
+        }
     }
-    Ok(Some(u32::try_from(aligned).map_err(|_| {
-        ObjectError::ArithmeticOverflow("SVE2 match-table offset")
-    })?))
+    Ok(Some(plan))
 }
 
 #[allow(
@@ -1896,14 +1945,29 @@ fn build_native_dfa_table(
     build_native_dfa_table_for_architecture(view, Architecture::X86_64)
 }
 
+#[cfg(test)]
+fn build_native_dfa_table_for_architecture(
+    view: NativeProgramView<'_>,
+    architecture: Architecture,
+) -> Result<(Vec<u8>, NativeDfaLayout), ObjectError> {
+    build_native_dfa_table_with_cost_model(
+        view,
+        architecture,
+        NativeVectorFilterCostModel::Established,
+        true,
+    )
+}
+
 #[allow(
     clippy::arithmetic_side_effects,
     clippy::too_many_lines,
     reason = "checked table layout and fixed power-of-two alignment stay contiguous for auditability"
 )]
-fn build_native_dfa_table_for_architecture(
+fn build_native_dfa_table_with_cost_model(
     view: NativeProgramView<'_>,
     architecture: Architecture,
+    vector_cost_model: NativeVectorFilterCostModel,
+    relation_vector_owns_route: bool,
 ) -> Result<(Vec<u8>, NativeDfaLayout), ObjectError> {
     let dfa = view.dfa;
     if dfa.initial_state != 0 || dfa.class_count == 0 || dfa.class_count > 256 {
@@ -2017,7 +2081,6 @@ fn build_native_dfa_table_for_architecture(
     let machine_bytes = reverse_offset
         .checked_add(reverse_bytes)
         .ok_or(ObjectError::ArithmeticOverflow("native DFA data bytes"))?;
-    let vector_filter = derive_vector_filter(start_filter, view.anchored_prefix.sets())?;
     let filtered_prefix_position = start_filter
         .filter(|filter| filter.from_anchored_prefix)
         .map(|filter| usize::from(filter.scan_offset));
@@ -2030,6 +2093,18 @@ fn build_native_dfa_table_for_architecture(
     let prefix_relation_vector = prefix_relation
         .as_ref()
         .and_then(|relation| derive_native_prefix_relation_vector(relation, architecture));
+    // A vectorized relation supersedes multicolumn scanning in both native
+    // backends. Retain established planning when the cheaper SVE2 column
+    // model would not be consumed by the emitted direct scanner.
+    let vector_filter = derive_vector_filter_with_cost_model(
+        start_filter,
+        view.anchored_prefix.sets(),
+        if relation_vector_owns_route && prefix_relation_vector.is_some() {
+            NativeVectorFilterCostModel::Established
+        } else {
+            vector_cost_model
+        },
+    )?;
     let selective_prefix_positions = view
         .anchored_prefix
         .sets()
@@ -3357,6 +3432,75 @@ fn vector_filter_instruction_units(filter: NativeStartFilter) -> u16 {
     }
 }
 
+/// Target-lowering resource model used by the target-neutral graph selector.
+///
+/// The model contains no source or benchmark identity. `Aarch64Sve2Match` is
+/// selected only when every emitted vector route for the scanner can use SVE2
+/// `MATCH`; a mixed SVE/ASIMD width dispatch must retain `Established` because
+/// its VL16 branch consumes the ordinary constant and instruction budget.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeVectorFilterCostModel {
+    Established,
+    Aarch64Sve2Match,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeVectorFilterColumnCost {
+    constants: usize,
+    instruction_units: u16,
+}
+
+impl NativeVectorFilterCostModel {
+    fn column_cost(self, filter: NativeStartFilter) -> NativeVectorFilterColumnCost {
+        if self == Self::Aarch64Sve2Match && filter.is_exact() {
+            NativeVectorFilterColumnCost {
+                constants: 1,
+                instruction_units: 1,
+            }
+        } else {
+            NativeVectorFilterColumnCost {
+                constants: filter.constant_count(),
+                instruction_units: vector_filter_instruction_units(filter),
+            }
+        }
+    }
+}
+
+/// Select the widened SVE2 planner only for a pure scalable-vector route.
+///
+/// Linux is currently the sole supported SVE object/runtime policy. ASIMD is
+/// deliberately excluded: mixed objects dispatch VL16 to the ASIMD lowering,
+/// so their shared graph plan must remain representable by both branches.
+fn native_vector_filter_cost_model_for_target(
+    target: Target,
+    sve_route_supported: bool,
+) -> NativeVectorFilterCostModel {
+    if sve_route_supported
+        && target.architecture == Architecture::Aarch64
+        && target.operating_system == OperatingSystem::Linux
+        && target.features.has(CpuFeature::Aarch64Sve)
+        && target.features.has(CpuFeature::Aarch64Sve2)
+        && !target.features.has(CpuFeature::Aarch64Asimd)
+    {
+        NativeVectorFilterCostModel::Aarch64Sve2Match
+    } else {
+        NativeVectorFilterCostModel::Established
+    }
+}
+
+/// Whether a target's direct scanner emits the analyzed two-byte relation
+/// vector instead of graph-derived multicolumn filters.
+///
+/// Every x86-64 tier has the relation lowering. AArch64 currently implements
+/// it only with ASIMD; pure SVE retains Cartesian graph columns and verifies a
+/// selected candidate with the unchanged scalar exact-relation bitmap.
+fn direct_relation_vector_owns_route(target: Target) -> bool {
+    match target.architecture {
+        Architecture::X86_64 => true,
+        Architecture::Aarch64 => target.features.has(CpuFeature::Aarch64Asimd),
+    }
+}
+
 /// Decide a SIMD batching policy from graph-derived membership and a stable
 /// offline byte-frequency model. This deliberately does not inspect regex
 /// source identity, benchmark identity or runtime samples.
@@ -3395,10 +3539,27 @@ fn derive_vector_filter(
     primary: Option<NativeStartFilter>,
     sets: &[AnchoredByteSet],
 ) -> Result<Option<NativeVectorFilter>, ObjectError> {
+    derive_vector_filter_with_cost_model(
+        primary,
+        sets,
+        NativeVectorFilterCostModel::Established,
+    )
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "selection, lowering-resource budgeting and probability accounting form one auditable cost decision"
+)]
+fn derive_vector_filter_with_cost_model(
+    primary: Option<NativeStartFilter>,
+    sets: &[AnchoredByteSet],
+    cost_model: NativeVectorFilterCostModel,
+) -> Result<Option<NativeVectorFilter>, ObjectError> {
     let Some(primary) = primary.filter(|filter| {
+        let cost = cost_model.column_cost(*filter);
         !filter.ranges().is_empty()
-            && filter.constant_count() <= MAX_VECTOR_FILTER_CONSTANTS
-            && vector_filter_instruction_units(*filter) <= MAX_VECTOR_FILTER_INSTRUCTION_UNITS
+            && cost.constants <= MAX_VECTOR_FILTER_CONSTANTS
+            && cost.instruction_units <= MAX_VECTOR_FILTER_INSTRUCTION_UNITS
     }) else {
         return Ok(None);
     };
@@ -3427,15 +3588,16 @@ fn derive_vector_filter(
     candidates[..candidate_count].sort_unstable_by_key(|candidate| {
         (
             filter_selection_key(*candidate),
-            vector_filter_instruction_units(*candidate),
+            cost_model.column_cost(*candidate).instruction_units,
         )
     });
 
     let mut columns = [EMPTY_NATIVE_START_FILTER; MAX_VECTOR_FILTER_COLUMNS];
     columns[0] = primary;
     let mut column_count = 1_usize;
-    let mut constants = primary.constant_count();
-    let mut instruction_units = vector_filter_instruction_units(primary);
+    let primary_cost = cost_model.column_cost(primary);
+    let mut constants = primary_cost.constants;
+    let mut instruction_units = primary_cost.instruction_units;
     let mut probability_numerator = u64::from(estimated_filter_frequency_units(primary));
     let mut probability_denominator = u64::from(BYTE_FREQUENCY_DENOMINATOR);
     let sparse_primary = probability_numerator
@@ -3458,13 +3620,14 @@ fn derive_vector_filter(
         {
             break;
         }
-        let Some(next_constants) = constants.checked_add(candidate.constant_count()) else {
+        let candidate_cost = cost_model.column_cost(candidate);
+        let Some(next_constants) = constants.checked_add(candidate_cost.constants) else {
             continue;
         };
         if next_constants > MAX_VECTOR_FILTER_CONSTANTS {
             continue;
         }
-        let candidate_instruction_units = vector_filter_instruction_units(candidate);
+        let candidate_instruction_units = candidate_cost.instruction_units;
         let Some(next_instruction_units) =
             instruction_units.checked_add(candidate_instruction_units)
         else {
@@ -9285,6 +9448,20 @@ fn aarch64_sve_orr_b(destination: u8, left: u8, right: u8) -> Result<u32, Object
     )
 }
 
+fn aarch64_sve_orrs_p0_b(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
+    if destination > 15 || left > 15 || right > 15 {
+        return Err(ObjectError::InvalidModule("SVE ORRS predicate"));
+    }
+    // P0 governs the result and ORRS publishes the same predicate-test flags
+    // that the scanner formerly obtained from a separate PTEST P0, Pn.
+    Ok(
+        0x25c0_4000
+            | aarch64_reg(right, 16)?
+            | aarch64_reg(left, 5)?
+            | aarch64_reg(destination, 0)?,
+    )
+}
+
 fn aarch64_sve_ptest_p0(predicate: u8) -> Result<u32, ObjectError> {
     if predicate > 15 {
         return Err(ObjectError::InvalidModule("SVE PTEST predicate"));
@@ -9669,6 +9846,63 @@ enum Aarch64SveFilterKind {
     Sve2 { match_table_offset: u32 },
 }
 
+/// Per-column lowering selected for one scalable multicolumn scanner.
+///
+/// Keeping this distinct from [`NativeVectorFilterCostModel`] makes the
+/// planning/lowering contract explicit: the former predicts resources, while
+/// this receipt records the concrete table-backed implementation of every
+/// selected column. A future direct-DFA multicolumn scanner can consume the
+/// same plan without changing graph selection again.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Aarch64SveFilterPlan {
+    kinds: [Aarch64SveFilterKind; MAX_VECTOR_FILTER_COLUMNS],
+    column_count: u8,
+}
+
+impl Aarch64SveFilterPlan {
+    fn primary(self) -> Aarch64SveFilterKind {
+        self.kinds[0]
+    }
+
+    fn kind(self, column: usize) -> Result<Aarch64SveFilterKind, ObjectError> {
+        self.kinds
+            .get(column)
+            .copied()
+            .filter(|_| column < usize::from(self.column_count))
+            .ok_or(ObjectError::InvalidModule(
+                "SVE filter plan column is absent",
+            ))
+    }
+
+    fn validate_for(
+        self,
+        primary: NativeStartFilter,
+        vector_filter: Option<NativeVectorFilter>,
+    ) -> Result<(), ObjectError> {
+        if vector_filter.is_some_and(|vector_filter| {
+            vector_filter.columns().first().copied() != Some(primary)
+        }) {
+            return Err(ObjectError::InvalidModule(
+                "SVE vector-filter primary mismatch",
+            ));
+        }
+        let expected_columns = vector_filter.map_or(1, |filter| filter.columns().len());
+        if usize::from(self.column_count) != expected_columns {
+            return Err(ObjectError::InvalidModule(
+                "SVE filter plan column count mismatch",
+            ));
+        }
+        Ok(())
+    }
+
+    fn uses_sve2(self) -> bool {
+        self.kinds
+            .iter()
+            .take(usize::from(self.column_count))
+            .any(|kind| matches!(kind, Aarch64SveFilterKind::Sve2 { .. }))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Aarch64SvePrimaryHitCharge {
     debt: u16,
@@ -9750,6 +9984,85 @@ fn aarch64_sve_filter_constant_count(
         Aarch64SveFilterKind::Sve => filter.constant_count(),
         Aarch64SveFilterKind::Sve2 { .. } => 1,
     }
+}
+
+/// Materialize the per-column lowering contract after optional SVE2 tables
+/// have been installed. A missing table conservatively prices that exact set
+/// as base SVE. If a widened graph plan can no longer fit the audited
+/// Z16..Z23/hot-operation budgets, the caller must use a scalar (or another
+/// independently valid) route instead of partially lowering the plan.
+fn aarch64_sve_filter_plan(
+    primary: NativeStartFilter,
+    vector_filter: Option<NativeVectorFilter>,
+    match_table_offsets: [Option<u32>; MAX_VECTOR_FILTER_COLUMNS],
+) -> Result<Option<Aarch64SveFilterPlan>, ObjectError> {
+    if vector_filter.is_some_and(|vector_filter| {
+        vector_filter.columns().first().copied() != Some(primary)
+    }) {
+        return Err(ObjectError::InvalidModule(
+            "SVE vector-filter primary mismatch",
+        ));
+    }
+    let mut columns = [primary; MAX_VECTOR_FILTER_COLUMNS];
+    let column_count = if let Some(vector_filter) = vector_filter {
+        let selected = vector_filter.columns();
+        columns[..selected.len()].copy_from_slice(selected);
+        selected.len()
+    } else {
+        1
+    };
+    if match_table_offsets[column_count..]
+        .iter()
+        .any(Option::is_some)
+    {
+        return Err(ObjectError::InvalidModule(
+            "SVE match table has no filter column",
+        ));
+    }
+
+    let mut kinds = [Aarch64SveFilterKind::Sve; MAX_VECTOR_FILTER_COLUMNS];
+    let mut constants = 0_usize;
+    let mut instruction_units = 0_u16;
+    for (column, (&filter, match_table_offset)) in columns[..column_count]
+        .iter()
+        .zip(match_table_offsets)
+        .enumerate()
+    {
+        if match_table_offset.is_some() && !filter.is_exact() {
+            return Err(ObjectError::InvalidModule(
+                "SVE2 match table belongs to a range filter",
+            ));
+        }
+        let kind = match match_table_offset {
+            Some(match_table_offset) => Aarch64SveFilterKind::Sve2 { match_table_offset },
+            None => Aarch64SveFilterKind::Sve,
+        };
+        kinds[column] = kind;
+        constants = constants
+            .checked_add(aarch64_sve_filter_constant_count(filter, kind))
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "SVE vector-filter constants",
+            ))?;
+        instruction_units = instruction_units
+            .checked_add(match kind {
+                Aarch64SveFilterKind::Sve => vector_filter_instruction_units(filter),
+                Aarch64SveFilterKind::Sve2 { .. } => 1,
+            })
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "SVE vector-filter instruction units",
+            ))?;
+    }
+    if constants > 8
+        || (vector_filter.is_some()
+            && instruction_units > MAX_VECTOR_FILTER_INSTRUCTION_UNITS)
+    {
+        return Ok(None);
+    }
+    Ok(Some(Aarch64SveFilterPlan {
+        kinds,
+        column_count: u8::try_from(column_count)
+            .map_err(|_| ObjectError::ArithmeticOverflow("SVE filter-plan columns"))?,
+    }))
 }
 
 fn aarch64_emit_sve_filter_setup(
@@ -9873,28 +10186,24 @@ fn aarch64_emit_sve_filter_setups(
     assembler: &mut Aarch64Assembler,
     filter: NativeStartFilter,
     vector_filter: Option<NativeVectorFilter>,
-    kind: Aarch64SveFilterKind,
+    plan: Aarch64SveFilterPlan,
 ) -> Result<(), ObjectError> {
-    if vector_filter.is_some_and(|vector_filter| {
-        vector_filter.columns().first().copied() != Some(filter)
-    }) {
-        return Err(ObjectError::InvalidModule(
-            "SVE vector-filter primary mismatch",
-        ));
-    }
-    aarch64_emit_sve_filter_setup(assembler, filter, kind, 0)?;
-    let mut first_constant = aarch64_sve_filter_constant_count(filter, kind);
+    plan.validate_for(filter, vector_filter)?;
+    let primary_kind = plan.kind(0)?;
+    aarch64_emit_sve_filter_setup(assembler, filter, primary_kind, 0)?;
+    let mut first_constant = aarch64_sve_filter_constant_count(filter, primary_kind);
     if let Some(vector_filter) = vector_filter {
-        for &column in &vector_filter.columns()[1..] {
-            aarch64_emit_sve_filter_setup(
-                assembler,
-                column,
-                Aarch64SveFilterKind::Sve,
-                first_constant,
-            )?;
-            first_constant = first_constant.checked_add(column.constant_count()).ok_or(
-                ObjectError::ArithmeticOverflow("SVE vector-filter constants"),
-            )?;
+        for (index, &column) in vector_filter.columns()[1..].iter().enumerate() {
+            let plan_index = index
+                .checked_add(1)
+                .ok_or(ObjectError::ArithmeticOverflow("SVE filter-plan column"))?;
+            let kind = plan.kind(plan_index)?;
+            aarch64_emit_sve_filter_setup(assembler, column, kind, first_constant)?;
+            first_constant = first_constant
+                .checked_add(aarch64_sve_filter_constant_count(column, kind))
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "SVE vector-filter constants",
+                ))?;
         }
     }
     Ok(())
@@ -9915,24 +10224,28 @@ fn aarch64_emit_sve_filter_load_secondary_candidates(
     assembler: &mut Aarch64Assembler,
     filter: NativeStartFilter,
     vector_filter: NativeVectorFilter,
-    kind: Aarch64SveFilterKind,
+    plan: Aarch64SveFilterPlan,
     vector_offset: u8,
 ) -> Result<(), ObjectError> {
-    if vector_filter.columns().first().copied() != Some(filter)
-        || vector_filter.columns().len() < 2
-    {
+    plan.validate_for(filter, Some(vector_filter))?;
+    if vector_filter.columns().len() < 2 {
         return Err(ObjectError::InvalidModule(
-            "SVE vector-filter primary mismatch",
+            "SVE vector-filter has no secondary columns",
         ));
     }
-    let mut first_constant = aarch64_sve_filter_constant_count(filter, kind);
-    for &column in &vector_filter.columns()[1..] {
+    let mut first_constant =
+        aarch64_sve_filter_constant_count(filter, plan.kind(0)?);
+    for (index, &column) in vector_filter.columns()[1..].iter().enumerate() {
+        let plan_index = index
+            .checked_add(1)
+            .ok_or(ObjectError::ArithmeticOverflow("SVE filter-plan column"))?;
+        let kind = plan.kind(plan_index)?;
         aarch64_emit_start_filter_address(assembler, column.scan_offset)?;
         assembler.instruction(aarch64_sve_ld1b_vl(0, 12, vector_offset)?)?;
         aarch64_emit_sve_filter_candidates(
             assembler,
             column,
-            Aarch64SveFilterKind::Sve,
+            kind,
             first_constant,
             0,
             2,
@@ -9940,9 +10253,11 @@ fn aarch64_emit_sve_filter_load_secondary_candidates(
             4,
         )?;
         assembler.instruction(aarch64_sve_and_b(1, 1, 2)?)?;
-        first_constant = first_constant.checked_add(column.constant_count()).ok_or(
-            ObjectError::ArithmeticOverflow("SVE vector-filter constants"),
-        )?;
+        first_constant = first_constant
+            .checked_add(aarch64_sve_filter_constant_count(column, kind))
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "SVE vector-filter constants",
+            ))?;
     }
     Ok(())
 }
@@ -9986,19 +10301,23 @@ fn aarch64_emit_sve_filter_batch_secondary_candidates(
     assembler: &mut Aarch64Assembler,
     filter: NativeStartFilter,
     vector_filter: NativeVectorFilter,
-    kind: Aarch64SveFilterKind,
+    plan: Aarch64SveFilterPlan,
 ) -> Result<(), ObjectError> {
-    if vector_filter.columns().first().copied() != Some(filter)
-        || vector_filter.columns().len() < 2
-    {
+    plan.validate_for(filter, Some(vector_filter))?;
+    if vector_filter.columns().len() < 2 {
         return Err(ObjectError::InvalidModule(
-            "SVE vector-filter primary mismatch",
+            "SVE vector-filter has no secondary columns",
         ));
     }
     let batch_vectors = u8::try_from(AARCH64_SVE_BATCH_VECTORS)
         .map_err(|_| ObjectError::ArithmeticOverflow("SVE batch vectors"))?;
-    let mut first_constant = aarch64_sve_filter_constant_count(filter, kind);
-    for &column in &vector_filter.columns()[1..] {
+    let mut first_constant =
+        aarch64_sve_filter_constant_count(filter, plan.kind(0)?);
+    for (index, &column) in vector_filter.columns()[1..].iter().enumerate() {
+        let plan_index = index
+            .checked_add(1)
+            .ok_or(ObjectError::ArithmeticOverflow("SVE filter-plan column"))?;
+        let kind = plan.kind(plan_index)?;
         aarch64_emit_start_filter_address(assembler, column.scan_offset)?;
         for block in 0_u8..batch_vectors {
             let source = 24_u8
@@ -10016,7 +10335,7 @@ fn aarch64_emit_sve_filter_batch_secondary_candidates(
             aarch64_emit_sve_filter_candidates(
                 assembler,
                 column,
-                Aarch64SveFilterKind::Sve,
+                kind,
                 first_constant,
                 source,
                 5,
@@ -10025,9 +10344,11 @@ fn aarch64_emit_sve_filter_batch_secondary_candidates(
             )?;
             assembler.instruction(aarch64_sve_and_b(primary, primary, 5)?)?;
         }
-        first_constant = first_constant.checked_add(column.constant_count()).ok_or(
-            ObjectError::ArithmeticOverflow("SVE vector-filter constants"),
-        )?;
+        first_constant = first_constant
+            .checked_add(aarch64_sve_filter_constant_count(column, kind))
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "SVE vector-filter constants",
+            ))?;
     }
     Ok(())
 }
@@ -10073,15 +10394,20 @@ fn aarch64_emit_sve_legacy_filter_load_candidates(
     aarch64_emit_sve_filter_candidates(assembler, filter, kind, 0, 0, 1, 2, 3)
 }
 
-/// Emit the established direct-DFA SVE scanner over one graph-derived byte
-/// filter. Direct lowering already prices and performs later graph columns at
-/// candidate refinement. Retaining that split avoids paying scalable loads
-/// for every primary-hit block and preserves the lower-cost replay schedule.
+/// Emit the direct-DFA SVE scanner for a single graph-derived byte column.
+/// Multicolumn plans use the shared lazy-intersection scanner below, while
+/// retaining this smaller lowering avoids secondary-column machinery when the
+/// graph selector chose only one column.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "setup lifetime and the three CFG exits are explicit lowering invariants"
+)]
 fn aarch64_emit_sve_start_filter_scanner(
     assembler: &mut Aarch64Assembler,
     filter: NativeStartFilter,
     maximum_scan_offset: u8,
     kind: Aarch64SveFilterKind,
+    rematerialize_filter_setup: bool,
     vector: Aarch64Label,
     scalar: Aarch64Label,
     candidate: Aarch64Label,
@@ -10107,10 +10433,13 @@ fn aarch64_emit_sve_start_filter_scanner(
         None
     };
     assembler.bind(vector)?;
-    // This label is externally reachable after candidate rejection. In a
-    // mixed-capability module, intervening ASIMD work may alias V16..V23 with
-    // the SVE Z16..Z23 constant bank, so every re-entry rematerializes setup.
-    aarch64_emit_sve_filter_setup(assembler, filter, kind, 0)?;
+    // Mixed-capability entries rematerialize because intervening ASIMD work
+    // may alias V16..V23 with the SVE Z16..Z23 constant bank. Pure-SVE
+    // callers instead establish the immutable constants before this retry
+    // label and retain them across scalar candidate validation.
+    if rematerialize_filter_setup {
+        aarch64_emit_sve_filter_setup(assembler, filter, kind, 0)?;
+    }
     assembler.instruction(aarch64_sve_ptrue_b())?;
     assembler.instruction(aarch64_sve_cntb(6)?)?;
 
@@ -10134,8 +10463,7 @@ fn aarch64_emit_sve_start_filter_scanner(
         aarch64_emit_sve_filter_batch_primary_candidates(assembler, filter, kind)?;
         assembler.instruction(aarch64_sve_orr_b(8, 1, 2)?)?;
         assembler.instruction(aarch64_sve_orr_b(9, 3, 4)?)?;
-        assembler.instruction(aarch64_sve_orr_b(8, 8, 9)?)?;
-        assembler.instruction(aarch64_sve_ptest_p0(8)?)?;
+        assembler.instruction(aarch64_sve_orrs_p0_b(8, 8, 9)?)?;
         assembler.branch_cond(AARCH64_NE, batch_hit)?;
         assembler.instruction(aarch64_sve_addvl(2, 2, batch_vectors)?)?;
         assembler.branch(batch)?;
@@ -10228,11 +10556,13 @@ fn aarch64_emit_sve_multicol_start_filter_scanner(
     vector_filter: Option<NativeVectorFilter>,
     primary_hit_charge: Option<Aarch64SvePrimaryHitCharge>,
     maximum_scan_offset: u8,
-    kind: Aarch64SveFilterKind,
+    plan: Aarch64SveFilterPlan,
+    rematerialize_filter_setup: bool,
     vector: Aarch64Label,
     scalar: Aarch64Label,
     candidate: Aarch64Label,
 ) -> Result<(), ObjectError> {
+    plan.validate_for(filter, vector_filter)?;
     if primary_hit_charge.is_some() && vector_filter.is_none() {
         return Err(ObjectError::InvalidModule(
             "SVE primary-hit charge has no secondary columns",
@@ -10243,8 +10573,9 @@ fn aarch64_emit_sve_multicol_start_filter_scanner(
     let partial = assembler.label()?;
     let partial_exhausted = assembler.label()?;
     let single_hit = assembler.label()?;
+    let primary_kind = plan.primary();
     let batch_plan = if let Some(maximum_vector_bytes) =
-        aarch64_sve_batch_max_vector_bytes(filter, kind)
+        aarch64_sve_batch_max_vector_bytes(filter, primary_kind)
     {
         Some((
             maximum_vector_bytes,
@@ -10262,11 +10593,12 @@ fn aarch64_emit_sve_multicol_start_filter_scanner(
         None
     };
     assembler.bind(vector)?;
-    // This label is externally reachable after candidate rejection and from
-    // contextual restart routes. In a mixed-capability module, intervening
-    // ASIMD work may alias V16..V23 with the SVE Z16..Z23 constant bank.
-    // Rematerialize setup after binding the entry so every re-entry is safe.
-    aarch64_emit_sve_filter_setups(assembler, filter, vector_filter, kind)?;
+    // Mixed-capability entries rematerialize because intervening ASIMD work
+    // may alias V16..V23 with the SVE Z16..Z23 constant bank. Pure-SVE
+    // callers establish the complete immutable bank before this retry label.
+    if rematerialize_filter_setup {
+        aarch64_emit_sve_filter_setups(assembler, filter, vector_filter, plan)?;
+    }
     // A rejected candidate may also re-enter after a predicated tail probe.
     // Restore the all-lanes predicate before any full-vector load.
     assembler.instruction(aarch64_sve_ptrue_b())?;
@@ -10287,11 +10619,10 @@ fn aarch64_emit_sve_multicol_start_filter_scanner(
         // Four runtime vectors are 4 * CNTB, encoded as the checked LSL #2.
         assembler.instruction(aarch64_cmp_x_lsl(12, 6, 2)?)?;
         assembler.branch_cond(AARCH64_LO, single)?;
-        aarch64_emit_sve_filter_batch_primary_candidates(assembler, filter, kind)?;
+        aarch64_emit_sve_filter_batch_primary_candidates(assembler, filter, primary_kind)?;
         assembler.instruction(aarch64_sve_orr_b(8, 1, 2)?)?;
         assembler.instruction(aarch64_sve_orr_b(9, 3, 4)?)?;
-        assembler.instruction(aarch64_sve_orr_b(8, 8, 9)?)?;
-        assembler.instruction(aarch64_sve_ptest_p0(8)?)?;
+        assembler.instruction(aarch64_sve_orrs_p0_b(8, 8, 9)?)?;
         if let Some(vector_filter) = vector_filter {
             // The graph selector prices secondary columns as lazy work. Do
             // not touch them until this four-vector batch contains a primary
@@ -10304,12 +10635,11 @@ fn aarch64_emit_sve_multicol_start_filter_scanner(
                 assembler,
                 filter,
                 vector_filter,
-                kind,
+                plan,
             )?;
             assembler.instruction(aarch64_sve_orr_b(8, 1, 2)?)?;
             assembler.instruction(aarch64_sve_orr_b(9, 3, 4)?)?;
-            assembler.instruction(aarch64_sve_orr_b(8, 8, 9)?)?;
-            assembler.instruction(aarch64_sve_ptest_p0(8)?)?;
+            assembler.instruction(aarch64_sve_orrs_p0_b(8, 8, 9)?)?;
         }
         assembler.branch_cond(AARCH64_NE, batch_hit)?;
         assembler.bind(batch_advance)?;
@@ -10361,7 +10691,7 @@ fn aarch64_emit_sve_multicol_start_filter_scanner(
     }
     assembler.instruction(aarch64_cmp_x(12, 6)?)?;
     assembler.branch_cond(AARCH64_LO, partial)?;
-    aarch64_emit_sve_filter_load_primary_candidates(assembler, filter, kind, 0)?;
+    aarch64_emit_sve_filter_load_primary_candidates(assembler, filter, primary_kind, 0)?;
     assembler.instruction(aarch64_sve_ptest_p0(1)?)?;
     if let Some(vector_filter) = vector_filter {
         assembler.branch_cond(AARCH64_EQ, single_advance)?;
@@ -10372,7 +10702,7 @@ fn aarch64_emit_sve_multicol_start_filter_scanner(
             assembler,
             filter,
             vector_filter,
-            kind,
+            plan,
             0,
         )?;
         assembler.instruction(aarch64_sve_ptest_p0(1)?)?;
@@ -10390,7 +10720,7 @@ fn aarch64_emit_sve_multicol_start_filter_scanner(
         12
     };
     assembler.instruction(aarch64_sve_whilelo_b(0, 2, partial_end)?)?;
-    aarch64_emit_sve_filter_load_primary_candidates(assembler, filter, kind, 0)?;
+    aarch64_emit_sve_filter_load_primary_candidates(assembler, filter, primary_kind, 0)?;
     assembler.instruction(aarch64_sve_ptest_p0(1)?)?;
     if let Some(vector_filter) = vector_filter {
         assembler.branch_cond(AARCH64_EQ, partial_exhausted)?;
@@ -10401,7 +10731,7 @@ fn aarch64_emit_sve_multicol_start_filter_scanner(
             assembler,
             filter,
             vector_filter,
-            kind,
+            plan,
             0,
         )?;
         assembler.instruction(aarch64_sve_ptest_p0(1)?)?;
@@ -11033,13 +11363,19 @@ fn aarch64_emit_suffix_prepass(
     if let Some(sve_vector) = sve_vector {
         let sve_candidate = assembler.label()?;
         let sve_reject = assembler.label()?;
+        let sve_kind = sve_kind.ok_or(ObjectError::InvalidModule(
+            "AArch64 SVE suffix scanner has no filter kind",
+        ))?;
+        // SVE and ASIMD suffix scanners are mutually exclusive above. The
+        // scalar verifier cannot clobber Z16..Z23, so materialize this stable
+        // primary filter once and let retry edges skip the setup.
+        aarch64_emit_sve_filter_setup(assembler, filter, sve_kind, 0)?;
         aarch64_emit_sve_start_filter_scanner(
             assembler,
             filter,
             maximum_scan_offset,
-            sve_kind.ok_or(ObjectError::InvalidModule(
-                "AArch64 SVE suffix scanner has no filter kind",
-            ))?,
+            sve_kind,
+            false,
             sve_vector,
             scalar,
             sve_candidate,
@@ -11281,7 +11617,7 @@ fn lower_aarch64_dfa_for_operating_system(
     layout: NativeDfaLayout,
     features: FeatureSet,
     operating_system: OperatingSystem,
-    sve_filter_kind: Option<Aarch64SveFilterKind>,
+    sve_filter_plan: Option<Aarch64SveFilterPlan>,
 ) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
     let mut assembler = Aarch64Assembler::new();
     let scan = assembler.label()?;
@@ -11346,7 +11682,7 @@ fn lower_aarch64_dfa_for_operating_system(
     let table_page_offset = assembler.instruction(aarch64_add_x_imm(5, 5, 0)?)?;
     let primary_scanner_isa =
         aarch64_primary_scanner_isa(operating_system, features, true);
-    let use_sve_filter = sve_filter_kind.is_some()
+    let use_sve_filter = sve_filter_plan.is_some()
         && layout
             .start_filter
             .is_some_and(|filter| !filter.ranges().is_empty());
@@ -11367,9 +11703,16 @@ fn lower_aarch64_dfa_for_operating_system(
             .suffix_filter
             .is_some_and(|suffix| use_aarch64_filter_batch(suffix.filter));
     let use_asimd_loop = features.has(CpuFeature::Aarch64Asimd) && layout.loop_skip.is_some();
+    let pure_sve_filter = use_sve_filter && !features.has(CpuFeature::Aarch64Asimd);
     let prefix_relation_vector = layout
         .prefix_relation
-        .and_then(|relation| relation.vector_plan);
+        .and_then(|relation| relation.vector_plan)
+        // The exact relation vector has an ASIMD lowering but no SVE
+        // lowering. In the pure-SVE tier its mere layout presence must not
+        // suppress the graph-derived Cartesian columns: those columns remain
+        // a necessary filter, and the unchanged scalar pair bitmap verifies
+        // every selected candidate exactly.
+        .filter(|_| !pure_sve_filter);
     // Exact lane extraction wins on Apple Silicon, while generic Linux
     // AArch64 retains SIMD block rejection and refines a hit scalarly. This
     // target cost policy applies to every graph-derived filter uniformly.
@@ -11379,6 +11722,12 @@ fn lower_aarch64_dfa_for_operating_system(
     } else {
         layout.vector_filter
     };
+    if let Some(plan) = sve_filter_plan {
+        let primary = layout.start_filter.ok_or(ObjectError::InvalidModule(
+            "direct SVE filter plan has no graph primary",
+        ))?;
+        plan.validate_for(primary, vector_filter)?;
+    }
     let vector_coverage = use_asimd_filter
         .then(|| {
             derive_native_vector_guard_coverage(
@@ -11486,6 +11835,20 @@ fn lower_aarch64_dfa_for_operating_system(
         }
     }
 
+    let retain_sve_filter_setup = pure_sve_filter;
+    if retain_sve_filter_setup {
+        let filter = layout.start_filter.ok_or(ObjectError::InvalidModule(
+            "pure-SVE start filter has no graph filter",
+        ))?;
+        let sve_filter_plan = sve_filter_plan.ok_or(ObjectError::InvalidModule(
+            "pure-SVE start filter has no lowering plan",
+        ))?;
+        // No ASIMD instruction is emitted in this capability tier. Candidate
+        // validation is scalar, so the caller-saved Z16..Z23 constant bank is
+        // immutable until return and need not be rebuilt on each retry.
+        aarch64_emit_sve_filter_setups(&mut assembler, filter, vector_filter, sve_filter_plan)?;
+    }
+
     assembler.bind(scan)?;
     if let Some(filter) = layout.start_filter {
         if layout.output != OutputContract::Exists {
@@ -11504,7 +11867,7 @@ fn lower_aarch64_dfa_for_operating_system(
                 || vector_filter.map_or(filter.scan_offset, NativeVectorFilter::max_scan_offset),
                 |_| 1,
             );
-            if let Some(sve_filter_kind) = sve_filter_kind.filter(|_| use_sve_filter) {
+            if let Some(sve_filter_plan) = sve_filter_plan.filter(|_| use_sve_filter) {
                 if use_runtime_vl_dispatch {
                     // ASIMD's four-vector scanner is the lower-cost VL16
                     // implementation. Wider process vector lengths retain
@@ -11513,29 +11876,42 @@ fn lower_aarch64_dfa_for_operating_system(
                     assembler.instruction(aarch64_cmp_x_imm(6, 16)?)?;
                     assembler.branch_cond(AARCH64_LS, filter_vector)?;
                 }
-                aarch64_emit_sve_start_filter_scanner(
-                    &mut assembler,
-                    filter,
-                    maximum_scan_offset,
-                    sve_filter_kind,
-                    filter_sve,
-                    filter_scalar,
-                    filter_sve_candidate,
-                )?;
-                assembler.bind(filter_sve_candidate)?;
                 if let Some(vector_filter) = vector_filter {
-                    for &column in &vector_filter.columns()[1..] {
-                        aarch64_emit_scalar_filter_membership(
-                            &mut assembler,
-                            column,
-                            filter_sve_reject,
-                        )?;
-                    }
+                    // Intersect the complete graph filter before selecting a
+                    // lane. Scalar tails retain the common scalar-column path.
+                    aarch64_emit_sve_multicol_start_filter_scanner(
+                        &mut assembler,
+                        filter,
+                        Some(vector_filter),
+                        None,
+                        maximum_scan_offset,
+                        sve_filter_plan,
+                        !retain_sve_filter_setup,
+                        filter_sve,
+                        filter_scalar,
+                        filter_sve_candidate,
+                    )?;
+                } else {
+                    aarch64_emit_sve_start_filter_scanner(
+                        &mut assembler,
+                        filter,
+                        maximum_scan_offset,
+                        sve_filter_plan.primary(),
+                        !retain_sve_filter_setup,
+                        filter_sve,
+                        filter_scalar,
+                        filter_sve_candidate,
+                    )?;
                 }
+                assembler.bind(filter_sve_candidate)?;
                 assembler.branch(candidate)?;
-                assembler.bind(filter_sve_reject)?;
-                assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
-                assembler.branch(filter_sve)?;
+                if vector_filter.is_none() {
+                    // Preserve byte-identical single-column artifacts. This
+                    // legacy reject block is unreachable without secondaries.
+                    assembler.bind(filter_sve_reject)?;
+                    assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+                    assembler.branch(filter_sve)?;
+                }
             }
             if use_asimd_filter {
                 assembler.bind(filter_vector)?;
@@ -12904,6 +13280,8 @@ mod tests {
         assert_eq!(aarch64_sve_cmphs_b(3, 17, 0).unwrap(), 0x2400_0223);
         assert_eq!(aarch64_sve_and_b(1, 1, 3).unwrap(), 0x2503_4021);
         assert_eq!(aarch64_sve_orr_b(1, 1, 2).unwrap(), 0x2582_4021);
+        assert_eq!(aarch64_sve_orrs_p0_b(1, 1, 2).unwrap(), 0x25c2_4021);
+        assert_eq!(aarch64_sve_orrs_p0_b(8, 8, 9).unwrap(), 0x25c9_4108);
         assert_eq!(aarch64_sve_ptest_p0(1).unwrap(), 0x2550_c020);
         assert_eq!(aarch64_sve_ptest_p0(4).unwrap(), 0x2550_c080);
         assert_eq!(aarch64_sve_brkb_p0(2, 1).unwrap(), 0x2590_4022);
@@ -12917,6 +13295,9 @@ mod tests {
         assert!(aarch64_cmp_x_lsl(0, 0, 64).is_err());
         assert!(aarch64_sve_ld1b_vl(0, 0, 8).is_err());
         assert!(aarch64_sve_dup_b_imm(32, 0).is_err());
+        assert!(aarch64_sve_orrs_p0_b(16, 0, 0).is_err());
+        assert!(aarch64_sve_orrs_p0_b(0, 16, 0).is_err());
+        assert!(aarch64_sve_orrs_p0_b(0, 0, 16).is_err());
         assert!(aarch64_sve_ptest_p0(16).is_err());
         assert!(aarch64_sve_brkb_p0(16, 0).is_err());
         assert!(aarch64_sve_incp_b(32, 0).is_err());
@@ -13119,6 +13500,196 @@ mod tests {
                                     "vl={vector_length}, batch_max={maximum_batch_vector_length:?}, scan={scan_offset}, max={maximum_scan_offset}, start={start}, end={end}, candidate={candidate}"
                                 );
                                 haystack[candidate + scan_offset] = b'x';
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn aarch64_sve_multicol_batched_and_tail_model_matches_scalar_for_all_vls() {
+        const MAXIMUM_SCAN_OFFSET: usize = 3;
+
+        fn is_filter_candidate(
+            haystack: &[u8],
+            candidate: usize,
+            secondary_offsets: [usize; 2],
+        ) -> bool {
+            haystack[candidate] == b'q'
+                && secondary_offsets
+                    .into_iter()
+                    .all(|offset| haystack[candidate + offset] == b'e')
+        }
+
+        fn scalar_filter_first(
+            haystack: &[u8],
+            start: usize,
+            end: usize,
+            secondary_offsets: [usize; 2],
+        ) -> Option<usize> {
+            (start..end.saturating_sub(MAXIMUM_SCAN_OFFSET))
+                .find(|&candidate| is_filter_candidate(haystack, candidate, secondary_offsets))
+        }
+
+        fn scalar_match(haystack: &[u8], start: usize, end: usize) -> Option<usize> {
+            (start..end.saturating_sub(MAXIMUM_SCAN_OFFSET))
+                .find(|&candidate| &haystack[candidate..candidate + 4] == b"qeee")
+        }
+
+        fn sve_filter_first(
+            haystack: &[u8],
+            mut position: usize,
+            end: usize,
+            vector_length: usize,
+            maximum_batch_vector_length: Option<usize>,
+            secondary_offsets: [usize; 2],
+        ) -> Option<usize> {
+            let safe_end = end.saturating_sub(MAXIMUM_SCAN_OFFSET);
+            if position >= safe_end {
+                return None;
+            }
+            if maximum_batch_vector_length.is_some_and(|maximum| vector_length <= maximum) {
+                while safe_end - position >= 4 * vector_length {
+                    if let Some(candidate) = (position..position + 4 * vector_length)
+                        .find(|&candidate| {
+                            is_filter_candidate(haystack, candidate, secondary_offsets)
+                        })
+                    {
+                        return Some(candidate);
+                    }
+                    position += 4 * vector_length;
+                }
+            }
+            while safe_end - position >= vector_length {
+                if let Some(candidate) = (position..position + vector_length)
+                    .find(|&candidate| {
+                        is_filter_candidate(haystack, candidate, secondary_offsets)
+                    })
+                {
+                    return Some(candidate);
+                }
+                position += vector_length;
+            }
+            (position..safe_end)
+                .find(|&candidate| is_filter_candidate(haystack, candidate, secondary_offsets))
+        }
+
+        fn sve_match(
+            haystack: &[u8],
+            mut position: usize,
+            end: usize,
+            vector_length: usize,
+            maximum_batch_vector_length: Option<usize>,
+            secondary_offsets: [usize; 2],
+        ) -> Option<usize> {
+            while let Some(candidate) = sve_filter_first(
+                haystack,
+                position,
+                end,
+                vector_length,
+                maximum_batch_vector_length,
+                secondary_offsets,
+            ) {
+                if &haystack[candidate..candidate + 4] == b"qeee" {
+                    return Some(candidate);
+                }
+                position = candidate + 1;
+            }
+            None
+        }
+
+        for secondary_offsets in [[3_usize, 2_usize], [2, 3]] {
+            for vector_length in (16_usize..=256).step_by(16) {
+                for start in [0_usize, 3] {
+                    let mut lengths =
+                        vec![0, 1, MAXIMUM_SCAN_OFFSET, MAXIMUM_SCAN_OFFSET + 1];
+                    for vectors in [1_usize, 4, 5] {
+                        let boundary = vectors * vector_length + MAXIMUM_SCAN_OFFSET;
+                        lengths.extend([
+                            boundary.saturating_sub(1),
+                            boundary,
+                            boundary + 1,
+                            boundary + 2,
+                        ]);
+                    }
+                    lengths.sort_unstable();
+                    lengths.dedup();
+                    for maximum_batch_vector_length in [None, Some(16_usize), Some(128)] {
+                        for &length in &lengths {
+                            let end = start + length;
+                            let mut haystack = vec![b'x'; end];
+                            let safe_end = end.saturating_sub(MAXIMUM_SCAN_OFFSET);
+                            // Exercise rejected primary lanes before and between
+                            // complete graph-column intersections.
+                            for candidate in (start..safe_end).step_by(5) {
+                                haystack[candidate] = b'q';
+                            }
+                            assert_eq!(
+                                sve_filter_first(
+                                    &haystack,
+                                    start,
+                                    end,
+                                    vector_length,
+                                    maximum_batch_vector_length,
+                                    secondary_offsets,
+                                ),
+                                scalar_filter_first(&haystack, start, end, secondary_offsets)
+                            );
+                            assert_eq!(
+                                sve_match(
+                                    &haystack,
+                                    start,
+                                    end,
+                                    vector_length,
+                                    maximum_batch_vector_length,
+                                    secondary_offsets,
+                                ),
+                                scalar_match(&haystack, start, end)
+                            );
+                            // Seed complete graph-filter hits that the DFA
+                            // rejects at offset one, then verify scanner re-entry.
+                            for candidate in (start..safe_end).step_by(7) {
+                                haystack[candidate] = b'q';
+                                haystack[candidate + 2] = b'e';
+                                haystack[candidate + 3] = b'e';
+                            }
+                            assert_eq!(
+                                sve_match(
+                                    &haystack,
+                                    start,
+                                    end,
+                                    vector_length,
+                                    maximum_batch_vector_length,
+                                    secondary_offsets,
+                                ),
+                                scalar_match(&haystack, start, end)
+                            );
+                            for candidate in start..safe_end {
+                                let positions = [
+                                    candidate,
+                                    candidate + 1,
+                                    candidate + 2,
+                                    candidate + 3,
+                                ];
+                                let previous = positions.map(|position| haystack[position]);
+                                haystack[candidate..candidate + 4].copy_from_slice(b"qeee");
+                                assert_eq!(
+                                    sve_match(
+                                        &haystack,
+                                        start,
+                                        end,
+                                        vector_length,
+                                        maximum_batch_vector_length,
+                                        secondary_offsets,
+                                    ),
+                                    scalar_match(&haystack, start, end),
+                                    "columns={secondary_offsets:?}, vl={vector_length}, batch_max={maximum_batch_vector_length:?}, start={start}, end={end}, candidate={candidate}"
+                                );
+                                for (position, byte) in positions.into_iter().zip(previous) {
+                                    haystack[position] = byte;
+                                }
                             }
                         }
                     }
@@ -15635,7 +16206,7 @@ mod tests {
             aarch64_sve_ld1b_vl(27, 12, 3).unwrap(),
             aarch64_sve_cmpeq_b(1, 0, 16).unwrap(),
             aarch64_sve_ptest_p0(1).unwrap(),
-            aarch64_sve_ptest_p0(8).unwrap(),
+            aarch64_sve_orrs_p0_b(8, 8, 9).unwrap(),
             aarch64_sve_addvl(2, 2, 4).unwrap(),
             aarch64_sve_addvl(2, 2, 1).unwrap(),
             aarch64_sve_whilelo_b(0, 2, 3).unwrap(),
@@ -15683,7 +16254,7 @@ mod tests {
             aarch64_sve_ld1b_vl(25, 12, 1).unwrap(),
             aarch64_sve_ld1b_vl(26, 12, 2).unwrap(),
             aarch64_sve_ld1b_vl(27, 12, 3).unwrap(),
-            aarch64_sve_ptest_p0(8).unwrap(),
+            aarch64_sve_orrs_p0_b(8, 8, 9).unwrap(),
             aarch64_sve_addvl(2, 2, 4).unwrap(),
         ] {
             assert!(
@@ -16031,7 +16602,79 @@ mod tests {
     }
 
     #[test]
-    fn aarch64_sve_direct_route_keeps_scalar_graph_refinement() {
+    fn aarch64_pure_sve_retries_retain_filter_constants_but_mixed_rebuilds_them() {
+        fn unconditional_branch_targets(words: &[u32]) -> Vec<usize> {
+            let mut targets = Vec::new();
+            for (index, word) in words.iter().copied().enumerate() {
+                if word & 0xfc00_0000 != 0x1400_0000 {
+                    continue;
+                }
+                let immediate = ((word & 0x03ff_ffff) << 6).cast_signed() >> 6;
+                let index = isize::try_from(index).expect("AArch64 text index");
+                let immediate = isize::try_from(immediate).expect("AArch64 branch displacement");
+                let target = index
+                    .checked_add(immediate)
+                    .and_then(|target| usize::try_from(target).ok())
+                    .expect("in-section AArch64 branch target");
+                targets.push(target);
+            }
+            targets
+        }
+
+        let compile_words = |features| {
+            compile(
+                CompileRequest::new(
+                    "[3-7]",
+                    Target::aarch64_linux().with_features(features).unwrap(),
+                )
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::SelectedEnd),
+            )
+            .unwrap()
+            .module()
+            .sections()[TEXT_SECTION]
+                .bytes()
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let setup = [
+            aarch64_sve_dup_b_imm(16, b'3').unwrap(),
+            aarch64_sve_dup_b_imm(17, b'7').unwrap(),
+            aarch64_sve_ptrue_b(),
+            aarch64_sve_cntb(6).unwrap(),
+        ];
+
+        let pure_words = compile_words(FeatureSet::of(CpuFeature::Aarch64Sve));
+        let pure_setup = pure_words
+            .windows(setup.len())
+            .position(|window| window == setup)
+            .expect("pure-SVE filter setup");
+        let pure_targets = unconditional_branch_targets(&pure_words);
+        assert!(
+            pure_targets.contains(&(pure_setup + 2)),
+            "pure-SVE retry must target PTRUE after immutable DUP constants"
+        );
+        assert!(
+            !pure_targets.contains(&pure_setup),
+            "pure-SVE retry must not rebuild immutable DUP constants"
+        );
+
+        let mixed_words = compile_words(
+            FeatureSet::of(CpuFeature::Aarch64Asimd).with(CpuFeature::Aarch64Sve),
+        );
+        let mixed_setup = mixed_words
+            .windows(setup.len())
+            .position(|window| window == setup)
+            .expect("mixed SVE filter setup");
+        assert!(
+            unconditional_branch_targets(&mixed_words).contains(&mixed_setup),
+            "mixed retry must rebuild Z16..Z23 after possible ASIMD aliasing"
+        );
+    }
+
+    #[test]
+    fn aarch64_sve_direct_route_intersects_nonzero_offset_graph_columns() {
         let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
         let compile_for = |features| {
             compile(
@@ -16064,10 +16707,16 @@ mod tests {
             .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
             .collect::<Vec<_>>();
         assert!(base_words.contains(&aarch64_sve_cmpeq_b(1, 0, 16).unwrap()));
-        assert!(
-            !base_words.contains(&aarch64_sve_and_b(1, 1, 2).unwrap()),
-            "direct DFA must retain scalar refinement after its SVE primary scan"
-        );
+        for word in [
+            aarch64_sve_cmpeq_b(2, 0, 17).unwrap(),
+            aarch64_sve_cmpeq_b(2, 0, 18).unwrap(),
+            aarch64_sve_and_b(1, 1, 2).unwrap(),
+        ] {
+            assert!(
+                base_words.contains(&word),
+                "missing direct-DFA multicolumn SVE word {word:#010x}"
+            );
+        }
 
         let sve2 = compile_for(sve.with(CpuFeature::Aarch64Sve2));
         assert_eq!(
@@ -16079,10 +16728,432 @@ mod tests {
             .chunks_exact(4)
             .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
             .collect::<Vec<_>>();
-        assert!(sve2_words.contains(&aarch64_sve2_match_b(1, 0, 16).unwrap()));
+        for word in [
+            aarch64_sve_ld1rqb(16, 12).unwrap(),
+            aarch64_sve_ld1rqb(17, 12).unwrap(),
+            aarch64_sve_ld1rqb(18, 12).unwrap(),
+            aarch64_sve2_match_b(1, 0, 16).unwrap(),
+            aarch64_sve2_match_b(2, 0, 17).unwrap(),
+            aarch64_sve2_match_b(2, 0, 18).unwrap(),
+        ] {
+            assert!(
+                sve2_words.contains(&word),
+                "missing direct-DFA per-column SVE2 word {word:#010x}"
+            );
+        }
+        for word in [
+            aarch64_sve_and_b(1, 1, 2).unwrap(),
+        ] {
+            assert!(
+                sve2_words.contains(&word),
+                "missing direct-DFA multicolumn SVE2 word {word:#010x}"
+            );
+        }
+        assert_ne!(base.object(), sve2.object());
+    }
+
+    #[test]
+    fn pure_sve_prefix_relation_uses_graph_columns_and_keeps_exact_pair_guard() {
+        const PATTERN: &str = r"(?-u:(?:\x01a|\x03b)[\x05-\x08])";
+        let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
+        let compile_for = |features| {
+            compile(
+                CompileRequest::new(
+                    PATTERN,
+                    Target::aarch64_linux().with_features(features).unwrap(),
+                )
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+            )
+            .unwrap()
+        };
+
+        let compiled = compile_for(sve);
+        let (data, layout) = build_native_dfa_table_for_architecture(
+            compiled.program().native_dfa_view().unwrap(),
+            Architecture::Aarch64,
+        )
+        .unwrap();
+        let relation = layout.prefix_relation.expect("exact prefix relation");
+        assert!(relation.vector_plan.is_some());
+        let vector_filter = layout.vector_filter.expect("Cartesian graph columns");
+        assert_eq!(
+            vector_filter
+                .columns()
+                .iter()
+                .map(|column| column.scan_offset)
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([0, 2])
+        );
+
+        let filter_contains = |filter: NativeStartFilter, byte: u8| {
+            filter
+                .ranges()
+                .iter()
+                .any(|range| range.start <= byte && byte <= range.end)
+        };
+        let relation_start = usize::try_from(relation.bitmap_offset).unwrap();
+        let mut saw_cartesian_false_positive = false;
+        for first in u8::MIN..=u8::MAX {
+            for second in u8::MIN..=u8::MAX {
+                let bytes = [first, second, 5];
+                let cartesian = vector_filter.columns().iter().all(|column| {
+                    filter_contains(*column, bytes[usize::from(column.scan_offset)])
+                });
+                let pair = usize::from(first) | (usize::from(second) << 8);
+                let exact = data[relation_start + pair / 8] & (1_u8 << (pair % 8)) != 0;
+                assert!(
+                    !exact || cartesian,
+                    "graph columns rejected an exact relation pair {first:#04x}/{second:#04x}"
+                );
+                saw_cartesian_false_positive |= cartesian && !exact;
+            }
+        }
         assert!(
-            !sve2_words.contains(&aarch64_sve_and_b(1, 1, 2).unwrap()),
-            "direct DFA SVE2 primary must retain scalar graph refinement"
+            saw_cartesian_false_positive,
+            "the witness must require the scalar exact-pair verification"
+        );
+
+        for features in [sve, sve.with(CpuFeature::Aarch64Sve2)] {
+            let words = compile_for(features).module().sections()[TEXT_SECTION]
+                .bytes()
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            assert!(words.contains(&aarch64_sve_and_b(1, 1, 2).unwrap()));
+            assert!(
+                words.contains(&aarch64_load_halfword_reg(8, 0, 2).unwrap()),
+                "SVE Cartesian candidates must retain the exact scalar relation bitmap"
+            );
+        }
+    }
+
+    #[test]
+    fn pure_sve_relation_change_is_lowering_tier_exact() {
+        let compiled = compile(
+            CompileRequest::new(
+                r"(?-u:(?:\x01a|\x03b)[\x05-\x08])",
+                Target::aarch64_linux(),
+            )
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Exists),
+        )
+        .unwrap();
+        let (_, layout) = build_native_dfa_table_for_architecture(
+            compiled.program().native_dfa_view().unwrap(),
+            Architecture::Aarch64,
+        )
+        .unwrap();
+        assert!(layout.prefix_relation.and_then(|relation| relation.vector_plan).is_some());
+        assert!(layout.vector_filter.is_some());
+        let suppressed = NativeDfaLayout {
+            vector_filter: None,
+            ..layout
+        };
+        let asimd = FeatureSet::of(CpuFeature::Aarch64Asimd);
+        let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
+        let sve2 = sve.with(CpuFeature::Aarch64Sve2);
+        let mixed_sve = asimd.with(CpuFeature::Aarch64Sve);
+        let mixed_sve2 = mixed_sve.with(CpuFeature::Aarch64Sve2);
+        let lower = |layout: NativeDfaLayout,
+                     features: FeatureSet,
+                     operating_system,
+                     primary_kind: Option<Aarch64SveFilterKind>| {
+            let pure_sve = primary_kind.is_some() && !features.has(CpuFeature::Aarch64Asimd);
+            let vector_filter = pure_sve.then_some(layout.vector_filter).flatten();
+            let mut columns = [layout.start_filter.unwrap(); MAX_VECTOR_FILTER_COLUMNS];
+            let column_count = if let Some(vector_filter) = vector_filter {
+                let selected = vector_filter.columns();
+                columns[..selected.len()].copy_from_slice(selected);
+                selected.len()
+            } else {
+                1
+            };
+            let plan = primary_kind.map(|primary_kind| {
+                let mut kinds = [Aarch64SveFilterKind::Sve; MAX_VECTOR_FILTER_COLUMNS];
+                for (kind, column) in kinds[..column_count]
+                    .iter_mut()
+                    .zip(columns)
+                {
+                    *kind = match primary_kind {
+                        Aarch64SveFilterKind::Sve2 { match_table_offset }
+                            if column.is_exact() =>
+                        {
+                            Aarch64SveFilterKind::Sve2 { match_table_offset }
+                        }
+                        _ => Aarch64SveFilterKind::Sve,
+                    };
+                }
+                Aarch64SveFilterPlan {
+                    kinds,
+                    column_count: u8::try_from(column_count).unwrap(),
+                }
+            });
+            lower_aarch64_dfa_for_operating_system(
+                layout,
+                features,
+                operating_system,
+                plan,
+            )
+            .unwrap()
+        };
+
+        for (features, operating_system, kind) in [
+            (FeatureSet::EMPTY, OperatingSystem::Linux, None),
+            (asimd, OperatingSystem::Linux, None),
+            (FeatureSet::EMPTY, OperatingSystem::Macos, None),
+            (asimd, OperatingSystem::Macos, None),
+            (
+                mixed_sve,
+                OperatingSystem::Linux,
+                Some(Aarch64SveFilterKind::Sve),
+            ),
+            (
+                mixed_sve2,
+                OperatingSystem::Linux,
+                Some(Aarch64SveFilterKind::Sve2 {
+                    match_table_offset: 0,
+                }),
+            ),
+        ] {
+            assert_eq!(
+                lower(layout, features, operating_system, kind),
+                lower(suppressed, features, operating_system, kind),
+                "non-pure-SVE lowering bytes changed for {features:?}/{operating_system:?}"
+            );
+        }
+        for (features, kind) in [
+            (sve, Aarch64SveFilterKind::Sve),
+            (
+                sve2,
+                Aarch64SveFilterKind::Sve2 {
+                    match_table_offset: 0,
+                },
+            ),
+        ] {
+            assert_ne!(
+                lower(layout, features, OperatingSystem::Linux, Some(kind)),
+                lower(suppressed, features, OperatingSystem::Linux, Some(kind)),
+                "pure-SVE lowering must consume the retained graph columns"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one direct-route invariant covers planning, transactionality, setup, instructions, data and receipts"
+    )]
+    fn aarch64_direct_pure_sve2_cost_admits_complete_exact_columns() {
+        let pattern = r"[ACEGI][KMOQW]";
+        let features =
+            FeatureSet::of(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2);
+        let target = Target::aarch64_linux().with_features(features).unwrap();
+        let compiled = compile(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .unwrap();
+        assert_eq!(compiled.program().engine_kind(), EngineKind::OrderedDfa);
+        let view = compiled.program().native_dfa_view().unwrap();
+        let established =
+            build_native_dfa_table_for_architecture(view, Architecture::Aarch64)
+                .unwrap()
+                .1;
+        assert!(
+            established
+                .prefix_relation
+                .and_then(|relation| relation.vector_plan)
+                .is_none(),
+            "a relation route would supersede direct multicolumn scanning"
+        );
+        assert!(established.vector_filter.is_none());
+
+        let (base_data, widened_layout) = build_native_dfa_table_with_cost_model(
+            view,
+            Architecture::Aarch64,
+            NativeVectorFilterCostModel::Aarch64Sve2Match,
+            false,
+        )
+        .unwrap();
+        let widened = widened_layout
+            .vector_filter
+            .expect("pure-SVE2 direct multicolumn plan");
+        assert_eq!(widened.columns().len(), 2);
+        assert!(widened.columns().iter().all(|column| column.is_exact()));
+
+        let mut installed_data = base_data.clone();
+        let installed = install_aarch64_sve_filter_plan(
+            &mut installed_data,
+            widened_layout,
+            target,
+        )
+        .unwrap()
+        .expect("complete direct SVE2 lowering plan");
+        for column in 0..widened.columns().len() {
+            assert!(matches!(
+                installed.kind(column).unwrap(),
+                Aarch64SveFilterKind::Sve2 { .. }
+            ));
+        }
+        assert!(installed_data.len() > base_data.len());
+        let mut constrained_data = base_data.clone();
+        assert!(
+            install_aarch64_sve_filter_plan_with_limit(
+                &mut constrained_data,
+                widened_layout,
+                target,
+                installed_data.len() - 1,
+            )
+            .unwrap()
+            .is_none(),
+            "one byte below the complete bundle must decline widened base-SVE lowering"
+        );
+        assert_eq!(
+            constrained_data, base_data,
+            "capacity decline must not append a partial SVE2 table bundle"
+        );
+
+        assert_eq!(
+            compiled.module().start_accelerator(),
+            StartAccelerator::Aarch64Sve2
+        );
+        let words = compiled.module().sections()[TEXT_SECTION]
+            .bytes()
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        for word in [
+            aarch64_sve_ld1rqb(16, 12).unwrap(),
+            aarch64_sve_ld1rqb(17, 12).unwrap(),
+            aarch64_sve2_match_b(1, 0, 16).unwrap(),
+            aarch64_sve2_match_b(2, 0, 17).unwrap(),
+            aarch64_sve_and_b(1, 1, 2).unwrap(),
+        ] {
+            assert!(words.contains(&word), "missing direct SVE2 word {word:#010x}");
+        }
+        for setup in [
+            aarch64_sve_ld1rqb(16, 12).unwrap(),
+            aarch64_sve_ld1rqb(17, 12).unwrap(),
+        ] {
+            assert_eq!(
+                words.iter().filter(|&&word| word == setup).count(),
+                1,
+                "pure-SVE2 retry must retain each immutable table setup"
+            );
+        }
+        let data = compiled.module().sections()[PROGRAM_SECTION].bytes();
+        for bytes in [b"ACEGI".as_slice(), b"KMOQW".as_slice()] {
+            let expected = (0..16)
+                .map(|index| bytes[index % bytes.len()])
+                .collect::<Vec<_>>();
+            assert!(
+                data.windows(16).any(|window| window == expected),
+                "missing exact direct SVE2 table for {bytes:?}"
+            );
+        }
+
+        // Other policies retain the established graph plan. Mixed SVE2 keeps
+        // its primary MATCH receipt but never table-lowers secondary columns.
+        let established_targets = [
+            (Target::x86_64_linux(), StartAccelerator::X86Sse2),
+            (
+                Target::aarch64_linux()
+                    .with_features(FeatureSet::of(CpuFeature::Aarch64Sve))
+                    .unwrap(),
+                StartAccelerator::Aarch64Sve,
+            ),
+            (
+                Target::aarch64_linux()
+                    .with_features(features.with(CpuFeature::Aarch64Asimd))
+                    .unwrap(),
+                StartAccelerator::Aarch64Sve2,
+            ),
+            (
+                Target::aarch64_macos().with_features(features).unwrap(),
+                StartAccelerator::Scalar,
+            ),
+        ];
+        for (other_target, expected_accelerator) in established_targets {
+            assert_eq!(
+                native_vector_filter_cost_model_for_target(other_target, true),
+                NativeVectorFilterCostModel::Established
+            );
+            let other = compile(
+                CompileRequest::new(pattern, other_target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Exists),
+            )
+            .unwrap();
+            assert_eq!(
+                other.module().start_accelerator(),
+                expected_accelerator,
+                "inexact direct receipt for {other_target:?}"
+            );
+        }
+
+        let secondary_only = compile(
+            CompileRequest::new("[A-C][KMOQW]", target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .unwrap();
+        assert_eq!(
+            secondary_only.module().start_accelerator(),
+            StartAccelerator::Aarch64Sve2,
+            "a secondary MATCH must determine the strongest emitted receipt"
+        );
+        let secondary_words = secondary_only.module().sections()[TEXT_SECTION]
+            .bytes()
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(secondary_words.contains(&aarch64_sve_cmphs_b(1, 0, 16).unwrap()));
+        assert!(secondary_words.contains(&aarch64_sve_ld1rqb(18, 12).unwrap()));
+        assert!(secondary_words.contains(&aarch64_sve2_match_b(2, 0, 18).unwrap()));
+
+        let relation_pattern = r"(?-u:(?:\x01a|\x03b)[\x05-\x08])";
+        let relation_compiled = compile(
+            CompileRequest::new(relation_pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .unwrap();
+        let relation_view = relation_compiled.program().native_dfa_view().unwrap();
+        let relation_established =
+            build_native_dfa_table_for_architecture(relation_view, Architecture::Aarch64)
+                .unwrap()
+                .1;
+        let relation_costed = build_native_dfa_table_with_cost_model(
+            relation_view,
+            Architecture::Aarch64,
+            NativeVectorFilterCostModel::Aarch64Sve2Match,
+            false,
+        )
+        .unwrap()
+        .1;
+        assert!(
+            relation_established
+                .prefix_relation
+                .and_then(|relation| relation.vector_plan)
+                .is_some()
+        );
+        assert!(
+            relation_costed.vector_filter.is_some(),
+            "pure SVE2 must retain graph columns beside the scalar exact relation guard"
+        );
+        let relation_owned = build_native_dfa_table_with_cost_model(
+            relation_view,
+            Architecture::Aarch64,
+            NativeVectorFilterCostModel::Aarch64Sve2Match,
+            true,
+        )
+        .unwrap()
+        .1;
+        assert_eq!(
+            relation_owned.vector_filter, relation_established.vector_filter,
+            "an emitted relation vector must retain established multicolumn planning"
         );
     }
 
@@ -16103,7 +17174,7 @@ mod tests {
             .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
             .collect::<Vec<_>>();
         assert!(words.contains(&aarch64_sve_addvl(2, 2, 4).unwrap()));
-        assert!(words.contains(&aarch64_sve_ptest_p0(8).unwrap()));
+        assert!(words.contains(&aarch64_sve_orrs_p0_b(8, 8, 9).unwrap()));
         for block in 0_u8..4 {
             let source = 24 + block;
             let predicate = 1 + block;
@@ -16452,6 +17523,150 @@ mod tests {
             .unwrap();
             assert_eq!(secondary, exact);
         }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one invariant test covers target policy, planner resources and every byte membership"
+    )]
+    fn sve2_vector_filter_cost_model_is_target_scoped_and_membership_exact() {
+        let words_for = |bytes: &[u8]| {
+            let mut words = [0_u64; 4];
+            for &byte in bytes {
+                let index = usize::from(byte);
+                words[index / 64] |= 1_u64 << (index % 64);
+            }
+            words
+        };
+        // Eight separated bytes exercise the complete established exact-set
+        // representation. Base SIMD needs eight constants and fifteen hot
+        // operations per column; SVE2 MATCH needs one of each without changing
+        // the graph membership represented by the filter.
+        let first = [1_u8, 3, 5, 7, 9, 11, 13, 15];
+        let second = [17_u8, 19, 21, 23, 25, 27, 29, 31];
+        let sets = [
+            AnchoredByteSet::from_words(words_for(&first)),
+            AnchoredByteSet::from_words(words_for(&second)),
+        ];
+        let primary = start_filter_from_anchored_set(sets[0], 0)
+            .unwrap()
+            .expect("eight exact primary alternatives");
+        assert_eq!(primary.ranges().len(), 8);
+        assert!(primary.is_exact());
+        assert!(derive_vector_filter(Some(primary), &sets).unwrap().is_none());
+        let widened = derive_vector_filter_with_cost_model(
+            Some(primary),
+            &sets,
+            NativeVectorFilterCostModel::Aarch64Sve2Match,
+        )
+        .unwrap()
+        .expect("SVE2 one-op exact columns");
+        assert_eq!(widened.columns().len(), 2);
+        for &column in widened.columns() {
+            let expected = sets[usize::from(column.scan_offset)].words();
+            let table = std::array::from_fn::<_, 16, _>(|index| {
+                column.ranges()[index % column.ranges().len()].start
+            });
+            for byte in u8::MIN..=u8::MAX {
+                let index = usize::from(byte);
+                let graph_member = expected[index / 64] & (1_u64 << (index % 64)) != 0;
+                let filter_member = column
+                    .ranges()
+                    .iter()
+                    .any(|range| range.start <= byte && byte <= range.end);
+                assert_eq!(filter_member, graph_member, "column byte {byte}");
+                assert_eq!(
+                    table.contains(&byte),
+                    graph_member,
+                    "SVE2 table column byte {byte}"
+                );
+            }
+            assert_eq!(
+                NativeVectorFilterCostModel::Aarch64Sve2Match.column_cost(column),
+                NativeVectorFilterColumnCost {
+                    constants: 1,
+                    instruction_units: 1,
+                }
+            );
+        }
+        let complete_plan = aarch64_sve_filter_plan(
+            primary,
+            Some(widened),
+            [Some(16), Some(32), None],
+        )
+        .unwrap()
+        .expect("complete SVE2 table bundle");
+        assert_eq!(
+            complete_plan.kind(0).unwrap(),
+            Aarch64SveFilterKind::Sve2 {
+                match_table_offset: 16
+            }
+        );
+        assert_eq!(
+            complete_plan.kind(1).unwrap(),
+            Aarch64SveFilterKind::Sve2 {
+                match_table_offset: 32
+            }
+        );
+        assert!(complete_plan.uses_sve2());
+        assert!(complete_plan.validate_for(primary, Some(widened)).is_ok());
+        let mut extra_column_plan = complete_plan;
+        extra_column_plan.column_count = 3;
+        assert!(
+            extra_column_plan
+                .validate_for(primary, Some(widened))
+                .is_err(),
+            "lowering must reject plan kinds without graph columns"
+        );
+        assert!(
+            aarch64_sve_filter_plan(primary, Some(widened), [Some(16), None, None])
+                .unwrap()
+                .is_none(),
+            "a partial table bundle must not lower a widened column as expensive base SVE"
+        );
+
+        let range = filter_from_membership_words(words_for(&[40, 41, 42]), 0, true)
+            .unwrap()
+            .unwrap();
+        assert!(!range.is_exact());
+        assert_eq!(
+            NativeVectorFilterCostModel::Aarch64Sve2Match.column_cost(range),
+            NativeVectorFilterCostModel::Established.column_cost(range),
+            "SVE2 MATCH must not discount inclusive-range lowering"
+        );
+
+        let sve2 = FeatureSet::of(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2);
+        let pure_sve2 = Target::aarch64_linux().with_features(sve2).unwrap();
+        assert_eq!(
+            native_vector_filter_cost_model_for_target(pure_sve2, true),
+            NativeVectorFilterCostModel::Aarch64Sve2Match
+        );
+        let established_targets = [
+            Target::x86_64_linux(),
+            Target::x86_64_macos(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos(),
+            Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Sve))
+                .unwrap(),
+            Target::aarch64_linux()
+                .with_features(sve2.with(CpuFeature::Aarch64Asimd))
+                .unwrap(),
+            Target::aarch64_macos().with_features(sve2).unwrap(),
+        ];
+        for target in established_targets {
+            assert_eq!(
+                native_vector_filter_cost_model_for_target(target, true),
+                NativeVectorFilterCostModel::Established,
+                "unexpected widened target {target:?}"
+            );
+        }
+        assert_eq!(
+            native_vector_filter_cost_model_for_target(pure_sve2, false),
+            NativeVectorFilterCostModel::Established,
+            "an unsupported SVE scanner route must retain established costs"
+        );
     }
 
     #[test]
@@ -20891,6 +22106,13 @@ mod tests {
         sparse_batch_boundaries[256] = b'5';
         sparse_batch_boundaries[286] = 1;
         sparse_batch_boundaries[287] = b'4';
+        let mut relation_multicol = vec![0x40_u8; 288];
+        relation_multicol[0..3].copy_from_slice(&[1, b'b', 5]);
+        relation_multicol[63..66].copy_from_slice(&[1, b'a', 0x40]);
+        relation_multicol[127..130].copy_from_slice(&[3, b'a', 6]);
+        relation_multicol[191..194].copy_from_slice(&[3, b'b', 0x40]);
+        relation_multicol[255..258].copy_from_slice(&[3, b'b', 8]);
+        relation_multicol[285..288].copy_from_slice(&[1, b'a', 5]);
         let cases = [
             (
                 "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-",
@@ -21276,6 +22498,27 @@ mod tests {
                 0,
                 sparse_batch_boundaries.len(),
             ),
+            (
+                r"(?-u:(?:\x01a|\x03b)[\x05-\x08])",
+                OutputContract::Exists,
+                relation_multicol.as_slice(),
+                0,
+                relation_multicol.len(),
+            ),
+            (
+                r"(?-u:(?:\x01a|\x03b)[\x05-\x08])",
+                OutputContract::SelectedEnd,
+                relation_multicol.as_slice(),
+                0,
+                relation_multicol.len(),
+            ),
+            (
+                r"(?-u:(?:\x01a|\x03b)[\x05-\x08])",
+                OutputContract::Span,
+                relation_multicol.as_slice(),
+                0,
+                relation_multicol.len(),
+            ),
         ];
         let directory = std::env::var_os(environment).map_or_else(
             || std::env::temp_dir().join(format!("{fallback}-{}", std::process::id())),
@@ -21420,7 +22663,9 @@ mod tests {
                             .collect::<Vec<_>>();
                         if target.features.has(CpuFeature::Aarch64Sve) {
                             assert!(words.contains(&aarch64_sve_addvl(2, 2, 4).unwrap()));
-                            assert!(words.contains(&aarch64_sve_ptest_p0(8).unwrap()));
+                            assert!(
+                                words.contains(&aarch64_sve_orrs_p0_b(8, 8, 9).unwrap())
+                            );
                         } else if target.features.has(CpuFeature::Aarch64Asimd) {
                             assert!(use_aarch64_filter_batch(filter));
                             assert!(
@@ -21435,6 +22680,41 @@ mod tests {
                             );
                         }
                     }
+                }
+            }
+            if *pattern == r"(?-u:(?:\x01a|\x03b)[\x05-\x08])" {
+                let layout =
+                    build_native_dfa_table_for_architecture(native_view, target.architecture)
+                        .unwrap()
+                        .1;
+                assert!(
+                    layout
+                        .prefix_relation
+                        .and_then(|relation| relation.vector_plan)
+                        .is_some()
+                );
+                assert_eq!(
+                    layout
+                        .vector_filter
+                        .unwrap()
+                        .columns()
+                        .iter()
+                        .map(|column| column.scan_offset)
+                        .collect::<std::collections::BTreeSet<_>>(),
+                    std::collections::BTreeSet::from([0, 2])
+                );
+                if target.architecture == Architecture::Aarch64
+                    && target.operating_system == OperatingSystem::Linux
+                    && target.features.has(CpuFeature::Aarch64Sve)
+                    && !target.features.has(CpuFeature::Aarch64Asimd)
+                {
+                    let words = compiled.module().sections()[TEXT_SECTION]
+                        .bytes()
+                        .chunks_exact(4)
+                        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                        .collect::<Vec<_>>();
+                    assert!(words.contains(&aarch64_sve_and_b(1, 1, 2).unwrap()));
+                    assert!(words.contains(&aarch64_load_halfword_reg(8, 0, 2).unwrap()));
                 }
             }
             match native_layout.transitions {

@@ -9,12 +9,14 @@ use super::{
     AARCH64_EQ, AARCH64_FIRST_LANE_INDEX, AARCH64_HI, AARCH64_HS, AARCH64_LO, AARCH64_LS,
     AARCH64_MI, AARCH64_NE, AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
     AARCH64_VECTOR_FILTER_FIRST_CONSTANT, Aarch64Assembler, Aarch64PrimaryScannerIsa,
-    Aarch64SveFilterKind, Aarch64SvePrimaryHitCharge, Architecture,
+    Aarch64SveFilterPlan, Aarch64SvePrimaryHitCharge, Architecture,
     BYTE_FREQUENCY_DENOMINATOR, CpuFeature,
     EMPTY_NATIVE_PREFIX_RELATION_RECTANGLE, FeatureSet, MAX_NATIVE_PREFIX_RELATION_RECTANGLES,
+    MAX_VECTOR_FILTER_COLUMNS,
     ModuleRelocation, NativeLowering, NativePrefixFilter, NativePrefixRelationPredicate,
     NativePrefixRelationRectangle, NativePrefixRelationVectorPlan, NativeStartFilter,
-    NativeVectorFilter, PROGRAM_SYMBOL, RelocationKind, StartAccelerator, TEXT_SECTION, Target,
+    NativeVectorFilter, NativeVectorFilterCostModel, PROGRAM_SYMBOL, RelocationKind,
+    StartAccelerator, TEXT_SECTION, Target,
     X86Assembler, X86CandidateMask, X86StartFilterKind, aarch64_add_x_imm, aarch64_add_x_reg,
     aarch64_cmp_w_imm, aarch64_cmp_x, aarch64_cmp_x_imm, aarch64_csel_x,
     aarch64_emit_candidate_any, aarch64_emit_candidate_batch_any,
@@ -24,8 +26,8 @@ use super::{
     aarch64_emit_start_filter_address, aarch64_emit_start_filter_batch_candidates,
     aarch64_emit_start_filter_constants, aarch64_emit_start_filter_scalar_bound,
     aarch64_emit_start_filter_vector_candidates, aarch64_emit_start_filter_vector_test,
-    aarch64_emit_sve_multicol_start_filter_scanner, aarch64_emit_sve_start_filter_scanner,
-    aarch64_emit_vector_filter_secondary_batch,
+    aarch64_emit_sve_filter_setups, aarch64_emit_sve_multicol_start_filter_scanner,
+    aarch64_emit_sve_start_filter_scanner, aarch64_emit_vector_filter_secondary_batch,
     aarch64_emit_vector_filter_secondary_candidates_at, aarch64_load_byte_reg,
     aarch64_load_halfword_reg, aarch64_load_q, aarch64_load_u32_constant,
     aarch64_load_u64_constant, aarch64_lsr_x_imm, aarch64_mov_x, aarch64_movi_16b, aarch64_movz_w,
@@ -34,10 +36,12 @@ use super::{
     aarch64_sub_w_imm, aarch64_sub_x_imm,
     aarch64_sub_x_reg, aarch64_sve_cntb, aarch64_use_exact_first_lane,
     append_native_prefix_filter,
-    coalesced_filter_from_membership_words, derive_anchored_prefix_start_filter,
-    derive_vector_filter, estimated_byte_frequency_units, estimated_filter_frequency_units,
+    aarch64_sve_filter_plan, coalesced_filter_from_membership_words,
+    derive_anchored_prefix_start_filter, derive_vector_filter, derive_vector_filter_with_cost_model,
+    estimated_byte_frequency_units, estimated_filter_frequency_units,
     filter_from_membership_words, filter_selection_key, native_prefix_relation_predicate,
-    native_prefix_relation_vector_contains, offset_u64, push_bytes,
+    native_prefix_relation_vector_contains, native_vector_filter_cost_model_for_target, offset_u64,
+    push_bytes,
     vector_filter_instruction_units, x86_emit_first_candidate_lane, x86_emit_prefix_predicate,
     x86_emit_prefix_relation_vector_test, x86_emit_scalar_filter_membership,
     x86_emit_start_filter_constants, x86_emit_start_filter_scalar_bound,
@@ -83,10 +87,10 @@ struct ContextInteriorGuard {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct ContextSve2MatchTables {
-    interior: Option<u32>,
-    anchored: Option<u32>,
-    ordinary: Option<u32>,
+struct ContextSveFilterPlans {
+    interior: Option<Aarch64SveFilterPlan>,
+    anchored: Option<Aarch64SveFilterPlan>,
+    ordinary: Option<Aarch64SveFilterPlan>,
 }
 
 /// Candidate scanner selected for the exact-start contextual verifier.
@@ -1037,21 +1041,45 @@ fn context_anchored_overlap_work(guarded_bytes: u8, period: Option<u8>) -> u16 {
     })
 }
 
+#[cfg(test)]
 fn context_anchored_scanner_work(search: ContextAnchoredForwardSearch) -> Option<u16> {
+    context_anchored_scanner_work_with_cost_model(
+        search,
+        NativeVectorFilterCostModel::Established,
+    )
+}
+
+fn context_anchored_scanner_work_with_cost_model(
+    search: ContextAnchoredForwardSearch,
+    cost_model: NativeVectorFilterCostModel,
+) -> Option<u16> {
     if let Some(filter) = search.vector_filter {
         filter.columns().iter().try_fold(0_u16, |work, &column| {
-            work.checked_add(vector_filter_instruction_units(column))
+            work.checked_add(cost_model.column_cost(column).instruction_units)
         })
     } else {
-        Some(vector_filter_instruction_units(search.primary))
+        Some(cost_model.column_cost(search.primary).instruction_units)
     }
 }
 
+#[cfg(test)]
 fn derive_context_anchored_adaptive_guard(
     search: ContextAnchoredForwardSearch,
     prefix_filter: Option<NativePrefixFilter>,
 ) -> Result<ContextAnchoredAdaptiveGuard, ObjectError> {
-    let scanner_work = context_anchored_scanner_work(search).ok_or(
+    derive_context_anchored_adaptive_guard_with_cost_model(
+        search,
+        prefix_filter,
+        NativeVectorFilterCostModel::Established,
+    )
+}
+
+fn derive_context_anchored_adaptive_guard_with_cost_model(
+    search: ContextAnchoredForwardSearch,
+    prefix_filter: Option<NativePrefixFilter>,
+    cost_model: NativeVectorFilterCostModel,
+) -> Result<ContextAnchoredAdaptiveGuard, ObjectError> {
+    let scanner_work = context_anchored_scanner_work_with_cost_model(search, cost_model).ok_or(
         ObjectError::ArithmeticOverflow("context anchored scanner guard work"),
     )?;
     let predicate_work = prefix_filter.map_or(0, |filter| {
@@ -1095,8 +1123,23 @@ fn derive_context_anchored_adaptive_guard(
     clippy::large_types_passed_by_value,
     reason = "the copyable native view is the lowering module's established analysis interface"
 )]
+#[cfg(test)]
 fn derive_context_anchored_forward_search(
     view: NativeContextProgramView<'_>,
+) -> Result<Option<ContextAnchoredForwardSearch>, ObjectError> {
+    derive_context_anchored_forward_search_with_cost_model(
+        view,
+        NativeVectorFilterCostModel::Established,
+    )
+}
+
+#[allow(
+    clippy::large_types_passed_by_value,
+    reason = "the copyable native view is the lowering module's established analysis interface"
+)]
+fn derive_context_anchored_forward_search_with_cost_model(
+    view: NativeContextProgramView<'_>,
+    cost_model: NativeVectorFilterCostModel,
 ) -> Result<Option<ContextAnchoredForwardSearch>, ObjectError> {
     if !matches!(
         view.output,
@@ -1195,7 +1238,11 @@ fn derive_context_anchored_forward_search(
 
     Ok(Some(ContextAnchoredForwardSearch {
         primary: candidate.primary,
-        vector_filter: derive_vector_filter(Some(candidate.primary), sets)?,
+        vector_filter: derive_vector_filter_with_cost_model(
+            Some(candidate.primary),
+            sets,
+            cost_model,
+        )?,
         guarded_bytes,
         max_verify_bytes,
         cover_inflation: candidate.cover_inflation,
@@ -2046,8 +2093,16 @@ fn context_suffix_filter_is_stricter(
         < prefix_numerator.saturating_mul(suffix_denominator)
 }
 
+#[cfg(test)]
 fn derive_context_interior_guard(
     view: NativeContextProgramView<'_>,
+) -> Result<Option<ContextInteriorGuard>, ObjectError> {
+    derive_context_interior_guard_with_cost_model(view, NativeVectorFilterCostModel::Established)
+}
+
+fn derive_context_interior_guard_with_cost_model(
+    view: NativeContextProgramView<'_>,
+    cost_model: NativeVectorFilterCostModel,
 ) -> Result<Option<ContextInteriorGuard>, ObjectError> {
     let mut selected = None;
     let mut selected_key = None;
@@ -2077,7 +2132,8 @@ fn derive_context_interior_guard(
         let Some(primary) = derive_anchored_prefix_start_filter(&sets[..depth])? else {
             continue;
         };
-        let vector_filter = derive_vector_filter(Some(primary), &sets[..depth])?;
+        let vector_filter =
+            derive_vector_filter_with_cost_model(Some(primary), &sets[..depth], cost_model)?;
         let key =
             (
                 filter_selection_key(primary),
@@ -2541,74 +2597,113 @@ fn install_context_asimd_lane_index(
     })?))
 }
 
-fn install_context_sve2_match_table(
+fn install_context_sve_filter_plan(
     layout: &mut ContextNativeLayout,
     target: Target,
-    filter: Option<NativeStartFilter>,
-) -> Result<Option<u32>, ObjectError> {
+    primary: Option<NativeStartFilter>,
+    vector_filter: Option<NativeVectorFilter>,
+    sve_route_supported: bool,
+) -> Result<Option<Aarch64SveFilterPlan>, ObjectError> {
     if target.architecture != Architecture::Aarch64
         || !aarch64_primary_scanner_uses_sve(aarch64_primary_scanner_isa(
             target.operating_system,
             target.features,
-            true,
+            sve_route_supported,
         ))
-        || !target.features.has(CpuFeature::Aarch64Sve2)
     {
         return Ok(None);
     }
-    let Some(filter) = filter.filter(|filter| filter.is_exact() && !filter.ranges().is_empty())
-    else {
+    let Some(primary) = primary.filter(|filter| !filter.ranges().is_empty()) else {
         return Ok(None);
     };
-    let alignment = 16_usize;
-    let aligned =
-        layout
-            .data
-            .len()
-            .checked_add(alignment - 1)
-            .ok_or(ObjectError::ArithmeticOverflow(
-                "context SVE2 match-table alignment",
-            ))?
-            & !(alignment - 1);
-    let total = aligned
-        .checked_add(16)
-        .ok_or(ObjectError::ArithmeticOverflow(
-            "context SVE2 match-table bytes",
-        ))?;
-    let maximum_table_bytes = usize::try_from(i32::MAX)
-        .map_err(|_| ObjectError::ArithmeticOverflow("context SVE2 table address limit"))?
-        .min(MAX_CONTEXT_NATIVE_DATA_BYTES);
-    if total > maximum_table_bytes {
-        return Ok(None);
+    let mut columns = [primary; MAX_VECTOR_FILTER_COLUMNS];
+    let column_count = if let Some(vector_filter) = vector_filter {
+        if vector_filter.columns().first().copied() != Some(primary) {
+            return Err(ObjectError::InvalidModule(
+                "context SVE vector-filter primary mismatch",
+            ));
+        }
+        let selected = vector_filter.columns();
+        columns[..selected.len()].copy_from_slice(selected);
+        selected.len()
+    } else {
+        1
+    };
+    let mut match_table_offsets = [None; MAX_VECTOR_FILTER_COLUMNS];
+    if target.features.has(CpuFeature::Aarch64Sve2) {
+        let match_column_count = if native_vector_filter_cost_model_for_target(
+            target,
+            sve_route_supported,
+        ) == NativeVectorFilterCostModel::Aarch64Sve2Match
+        {
+            column_count
+        } else {
+            // Preserve the established mixed-capability object byte-for-byte:
+            // it already used MATCH for the primary, while its ASIMD VL16
+            // branch requires ordinary secondary constants and planning.
+            1
+        };
+        // Reserve the complete per-scanner bundle transactionally. Planning
+        // may have charged each exact set as one SVE2 resource, so installing
+        // only a prefix of the tables could make the remaining base-SVE plan
+        // exceed its audited register or hot-operation budget.
+        let alignment = 16_usize;
+        let mut total = layout.data.len();
+        for (column, filter) in columns[..match_column_count].iter().enumerate() {
+            if !filter.is_exact() {
+                continue;
+            }
+            let aligned = total
+                .checked_add(alignment - 1)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "context SVE2 match-table alignment",
+                ))?
+                & !(alignment - 1);
+            match_table_offsets[column] = Some(u32::try_from(aligned).map_err(|_| {
+                ObjectError::ArithmeticOverflow("context SVE2 match-table offset")
+            })?);
+            total = aligned
+                .checked_add(16)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "context SVE2 match-table bytes",
+                ))?;
+        }
+        let maximum_table_bytes = usize::try_from(i32::MAX)
+            .map_err(|_| ObjectError::ArithmeticOverflow("context SVE2 table address limit"))?
+            .min(MAX_CONTEXT_NATIVE_DATA_BYTES);
+        let additional = total.checked_sub(layout.data.len()).ok_or(
+            ObjectError::ArithmeticOverflow("context SVE2 table reservation"),
+        )?;
+        if total <= maximum_table_bytes && layout.data.try_reserve_exact(additional).is_ok() {
+            for (column, filter) in columns[..match_column_count].iter().enumerate() {
+                let Some(offset) = match_table_offsets[column] else {
+                    continue;
+                };
+                layout.data.resize(
+                    usize::try_from(offset).map_err(|_| {
+                        ObjectError::ArithmeticOverflow("context SVE2 match-table offset")
+                    })?,
+                    0,
+                );
+                for index in 0..16_usize {
+                    let range = filter.ranges().get(index % filter.ranges().len()).ok_or(
+                        ObjectError::InvalidModule("empty context SVE2 match table"),
+                    )?;
+                    layout.data.push(range.start);
+                }
+            }
+        } else {
+            match_table_offsets.fill(None);
+        }
     }
-    let additional =
-        total
-            .checked_sub(layout.data.len())
-            .ok_or(ObjectError::ArithmeticOverflow(
-                "context SVE2 table reservation",
-            ))?;
-    if layout.data.try_reserve_exact(additional).is_err() {
-        return Ok(None);
-    }
-    layout.data.resize(aligned, 0);
-    for index in 0..16_usize {
-        let range = filter
-            .ranges()
-            .get(index % filter.ranges().len())
-            .ok_or(ObjectError::InvalidModule("empty context SVE2 match table"))?;
-        layout.data.push(range.start);
-    }
-    Ok(Some(u32::try_from(aligned).map_err(|_| {
-        ObjectError::ArithmeticOverflow("context SVE2 match-table offset")
-    })?))
+    aarch64_sve_filter_plan(primary, vector_filter, match_table_offsets)
 }
 
 fn aarch64_context_prefix_accelerator(
     target: Target,
     primary: NativeStartFilter,
-    _vector_filter: Option<NativeVectorFilter>,
     boundary_pair: Option<ContextBoundaryPairExpression>,
-    sve2_match_table: Option<u32>,
+    sve_filter_plan: Option<Aarch64SveFilterPlan>,
 ) -> Option<StartAccelerator> {
     if primary.ranges().is_empty() {
         return None;
@@ -2620,13 +2715,17 @@ fn aarch64_context_prefix_accelerator(
         sve_route_supported,
     ) {
         Aarch64PrimaryScannerIsa::Sve | Aarch64PrimaryScannerIsa::SveWithAsimdVl16
-            if sve2_match_table.is_some() =>
+            if sve_filter_plan.is_some_and(Aarch64SveFilterPlan::uses_sve2) =>
         {
             StartAccelerator::Aarch64Sve2
         }
-        Aarch64PrimaryScannerIsa::Sve | Aarch64PrimaryScannerIsa::SveWithAsimdVl16 => {
+        Aarch64PrimaryScannerIsa::Sve | Aarch64PrimaryScannerIsa::SveWithAsimdVl16
+            if sve_filter_plan.is_some() =>
+        {
             StartAccelerator::Aarch64Sve
         }
+        Aarch64PrimaryScannerIsa::Sve => StartAccelerator::Scalar,
+        Aarch64PrimaryScannerIsa::SveWithAsimdVl16 => StartAccelerator::Aarch64Asimd,
         Aarch64PrimaryScannerIsa::Asimd => StartAccelerator::Aarch64Asimd,
         Aarch64PrimaryScannerIsa::Scalar => StartAccelerator::Scalar,
     })
@@ -2664,10 +2763,9 @@ fn selected_context_start_accelerator(
     anchored_forward_search: Option<ContextAnchoredForwardSearch>,
     anchored_boundary_pair: Option<ContextBoundaryPairExpression>,
     start_filter: Option<NativeStartFilter>,
-    vector_filter: Option<NativeVectorFilter>,
     ordinary_boundary_pair: Option<ContextBoundaryPairExpression>,
     interior_guard: Option<ContextInteriorGuard>,
-    sve2_match_tables: ContextSve2MatchTables,
+    sve_filter_plans: ContextSveFilterPlans,
 ) -> StartAccelerator {
     let has_prefix_scanner = interior_guard.is_some_and(|guard| !guard.primary.ranges().is_empty())
         || anchored_forward_search.is_some_and(|search| !search.primary.ranges().is_empty())
@@ -2691,9 +2789,8 @@ fn selected_context_start_accelerator(
                     aarch64_context_prefix_accelerator(
                         target,
                         guard.primary,
-                        guard.vector_filter,
                         None,
-                        sve2_match_tables.interior,
+                        sve_filter_plans.interior,
                     ),
                 );
             }
@@ -2703,9 +2800,8 @@ fn selected_context_start_accelerator(
                     aarch64_context_prefix_accelerator(
                         target,
                         search.primary,
-                        search.vector_filter,
                         anchored_boundary_pair,
-                        sve2_match_tables.anchored,
+                        sve_filter_plans.anchored,
                     ),
                 );
             }
@@ -2715,9 +2811,8 @@ fn selected_context_start_accelerator(
                     aarch64_context_prefix_accelerator(
                         target,
                         primary,
-                        vector_filter,
                         ordinary_boundary_pair,
-                        sve2_match_tables.ordinary,
+                        sve_filter_plans.ordinary,
                     ),
                 );
             }
@@ -2744,12 +2839,33 @@ pub(super) fn lower_native_context(
     target: Target,
 ) -> Result<NativeLowering, ObjectError> {
     let boundary_pair_relation = derive_context_boundary_pair_relation(view)?;
+    // Only scanners whose complete runtime route is pure SVE2 may price an
+    // exact set as one table/one MATCH. The explicit seam is shared with a
+    // future direct multicolumn scanner; today's direct DFA intentionally
+    // retains established scalar secondary refinement.
+    let ordinary_vector_cost = native_vector_filter_cost_model_for_target(
+        target,
+        boundary_pair_relation.is_none(),
+    );
+    let interior_vector_cost = native_vector_filter_cost_model_for_target(target, true);
+    let anchored_vector_cost = native_vector_filter_cost_model_for_target(
+        target,
+        boundary_pair_relation.is_none(),
+    );
     let start_filter = derive_anchored_prefix_start_filter(view.anchored_prefix.sets())?;
-    let vector_filter = derive_vector_filter(start_filter, view.anchored_prefix.sets())?;
-    let interior_guard = derive_context_interior_guard(view)?.filter(|guard| {
-        start_filter
-            .is_none_or(|prefix| filter_selection_key(guard.primary) < filter_selection_key(prefix))
-    });
+    let vector_filter = derive_vector_filter_with_cost_model(
+        start_filter,
+        view.anchored_prefix.sets(),
+        ordinary_vector_cost,
+    )?;
+    let interior_guard =
+        derive_context_interior_guard_with_cost_model(view, interior_vector_cost)?.filter(
+            |guard| {
+                start_filter.is_none_or(|prefix| {
+                    filter_selection_key(guard.primary) < filter_selection_key(prefix)
+                })
+            },
+        );
     let terminal_suffix_search = ENABLE_CONTEXT_TERMINAL_SUFFIX_SEARCH
         .then(|| derive_context_terminal_suffix_search(view))
         .transpose()?
@@ -2775,7 +2891,7 @@ pub(super) fn lower_native_context(
     // ordinary prefix proofs.
     let mut anchored_forward_search =
         if ENABLE_CONTEXT_ANCHORED_FORWARD_SEARCH && terminal_suffix_search.is_none() {
-            derive_context_anchored_forward_search(view)?
+            derive_context_anchored_forward_search_with_cost_model(view, anchored_vector_cost)?
         } else {
             None
         };
@@ -2867,8 +2983,11 @@ pub(super) fn lower_native_context(
                 anchored_forward_search = None;
                 continue;
             }
-            let Ok(adaptive_guard) = derive_context_anchored_adaptive_guard(search, installed)
-            else {
+            let Ok(adaptive_guard) = derive_context_anchored_adaptive_guard_with_cost_model(
+                search,
+                installed,
+                anchored_vector_cost,
+            ) else {
                 anchored_forward_search = None;
                 continue;
             };
@@ -2959,23 +3078,27 @@ pub(super) fn lower_native_context(
         || terminal_suffix_search.is_some();
     let asimd_lane_index_offset =
         install_context_asimd_lane_index(&mut layout, target, has_vector_prepass)?;
-    let sve2_match_tables = ContextSve2MatchTables {
-        interior: install_context_sve2_match_table(
+    let sve_filter_plans = ContextSveFilterPlans {
+        interior: install_context_sve_filter_plan(
             &mut layout,
             target,
             interior_guard.map(|guard| guard.primary),
+            interior_guard.and_then(|guard| guard.vector_filter),
+            true,
         )?,
-        anchored: install_context_sve2_match_table(
+        anchored: install_context_sve_filter_plan(
             &mut layout,
             target,
-            anchored_forward_search
-                .filter(|_| anchored_boundary_pair.is_none())
-                .map(|search| search.primary),
+            anchored_forward_search.map(|search| search.primary),
+            anchored_forward_search.and_then(|search| search.vector_filter),
+            anchored_boundary_pair.is_none(),
         )?,
-        ordinary: install_context_sve2_match_table(
+        ordinary: install_context_sve_filter_plan(
             &mut layout,
             target,
-            start_filter.filter(|_| ordinary_boundary_pair.is_none()),
+            start_filter,
+            vector_filter,
+            ordinary_boundary_pair.is_none(),
         )?,
     };
     let (code, relocations) = match target.architecture {
@@ -3014,9 +3137,8 @@ pub(super) fn lower_native_context(
             state_skip,
             empty_prefix_restart,
             target.features,
-            target.operating_system,
             asimd_lane_index_offset,
-            sve2_match_tables,
+            sve_filter_plans,
         )?,
     };
     let start_accelerator = selected_context_start_accelerator(
@@ -3025,10 +3147,9 @@ pub(super) fn lower_native_context(
         anchored_forward_search,
         anchored_boundary_pair,
         start_filter,
-        vector_filter,
         ordinary_boundary_pair,
         interior_guard,
-        sve2_match_tables,
+        sve_filter_plans,
     );
     Ok(NativeLowering {
         code,
@@ -6305,15 +6426,18 @@ fn aarch64_context_emit_prefix_prepass(
     restart: ContextPrepassRestart,
     reject_empty_with: Option<(&ContextNativeLayout, Option<usize>)>,
     anchored_guard: Option<(ContextAnchoredAdaptiveGuard, usize)>,
-    sve_filter_kind: Option<Aarch64SveFilterKind>,
+    sve_filter_plan: Option<Aarch64SveFilterPlan>,
     use_asimd: bool,
     use_exact_asimd_lane: bool,
     no_match: usize,
     invalid: usize,
     vector_entry: Option<usize>,
 ) -> Result<(), ObjectError> {
+    if let Some(plan) = sve_filter_plan {
+        plan.validate_for(primary, vector_filter)?;
+    }
     let selected_sve =
-        sve_filter_kind.filter(|_| boundary_pair.is_none() && !primary.ranges().is_empty());
+        sve_filter_plan.filter(|_| boundary_pair.is_none() && !primary.ranges().is_empty());
     if let Some(selected_sve) = selected_sve
         && use_asimd
     {
@@ -6375,12 +6499,25 @@ fn aarch64_context_emit_prefix_prepass(
         return Ok(());
     }
     let vector_candidate = assembler.label()?;
-    if let Some(sve_filter_kind) = selected_sve {
+    if let Some(sve_filter_plan) = selected_sve {
+        let rematerialize_filter_setup = vector_entry.is_some();
         let vector = match vector_entry {
             Some(label) => label,
             None => assembler.label()?,
         };
         let scalar = assembler.label()?;
+        if !rematerialize_filter_setup {
+            // The mixed dispatcher always supplies an external entry and
+            // therefore retains per-entry setup. With no ASIMD route, scalar
+            // contextual verification cannot alias Z16..Z23, so keep the
+            // graph-derived constants live across retry edges.
+            aarch64_emit_sve_filter_setups(
+                assembler,
+                primary,
+                vector_filter,
+                sve_filter_plan,
+            )?;
+        }
         if let Some(vector_filter) = vector_filter {
             aarch64_emit_sve_multicol_start_filter_scanner(
                 assembler,
@@ -6392,7 +6529,8 @@ fn aarch64_context_emit_prefix_prepass(
                     fallback,
                 }),
                 vector_filter.max_scan_offset(),
-                sve_filter_kind,
+                sve_filter_plan,
+                rematerialize_filter_setup,
                 vector,
                 scalar,
                 vector_candidate,
@@ -6402,7 +6540,8 @@ fn aarch64_context_emit_prefix_prepass(
                 assembler,
                 primary,
                 primary.scan_offset,
-                sve_filter_kind,
+                sve_filter_plan.primary(),
+                rematerialize_filter_setup,
                 vector,
                 scalar,
                 vector_candidate,
@@ -7344,7 +7483,7 @@ fn aarch64_context_emit_anchored_forward_search(
     adaptive_guard: ContextAnchoredAdaptiveGuard,
     prefix_filter: Option<NativePrefixFilter>,
     boundary_pair: Option<ContextBoundaryPairExpression>,
-    sve_filter_kind: Option<Aarch64SveFilterKind>,
+    sve_filter_plan: Option<Aarch64SveFilterPlan>,
     use_asimd: bool,
     use_exact_asimd_lane: bool,
     no_match: usize,
@@ -7375,7 +7514,7 @@ fn aarch64_context_emit_anchored_forward_search(
         ContextPrepassRestart::CandidateBase,
         Some((layout, None)),
         Some((adaptive_guard, fallback)),
-        sve_filter_kind,
+        sve_filter_plan,
         use_asimd,
         use_exact_asimd_lane,
         no_match,
@@ -7466,9 +7605,8 @@ fn lower_aarch64_context(
     state_skip: Option<ContextStateSkip>,
     empty_prefix_restart: bool,
     features: FeatureSet,
-    operating_system: super::OperatingSystem,
     asimd_lane_index_offset: Option<u32>,
-    sve2_match_tables: ContextSve2MatchTables,
+    sve_filter_plans: ContextSveFilterPlans,
 ) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
     let mut assembler = Aarch64Assembler::new();
     let current_sentinel = assembler.label()?;
@@ -7544,17 +7682,6 @@ fn lower_aarch64_context(
     // independent suffix kernels. The explicit mixed policy chooses SVE only
     // inside each supported primary prepass.
     let use_asimd = features.has(CpuFeature::Aarch64Asimd);
-    let use_sve = aarch64_primary_scanner_uses_sve(aarch64_primary_scanner_isa(
-        operating_system,
-        features,
-        true,
-    ));
-    let sve_filter_kind = |match_table_offset: Option<u32>| {
-        use_sve.then(|| match match_table_offset {
-            Some(match_table_offset) => Aarch64SveFilterKind::Sve2 { match_table_offset },
-            None => Aarch64SveFilterKind::Sve,
-        })
-    };
     let use_exact_asimd_lane = asimd_lane_index_offset.is_some();
     if let Some(offset) = asimd_lane_index_offset {
         aarch64_emit_first_lane_constants(&mut assembler, offset)?;
@@ -7585,7 +7712,7 @@ fn lower_aarch64_context(
             guard.restart,
             None,
             None,
-            sve_filter_kind(sve2_match_tables.interior),
+            sve_filter_plans.interior,
             use_asimd,
             use_exact_asimd_lane,
             no_match,
@@ -7604,7 +7731,7 @@ fn lower_aarch64_context(
             adaptive_guard,
             anchored_prefix_filter,
             anchored_boundary_pair,
-            sve_filter_kind(sve2_match_tables.anchored),
+            sve_filter_plans.anchored,
             use_asimd,
             use_exact_asimd_lane,
             no_match,
@@ -7636,7 +7763,7 @@ fn lower_aarch64_context(
                 ENABLE_CONTEXT_PREFIX_DISPATCH_REUSE.then_some(forward_initialized),
             )),
             None,
-            sve_filter_kind(sve2_match_tables.ordinary),
+            sve_filter_plans.ordinary,
             use_asimd,
             use_exact_asimd_lane,
             no_match,
@@ -7922,7 +8049,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        CompileMode, CompileRequest, MatchResult, ObjectFormat, SearchWindow, compile, emit_object,
+        CompileMode, CompileRequest, EngineKind, MatchResult, ObjectFormat, SearchWindow, compile,
+        emit_object,
     };
 
     fn singleton_set(byte: u8) -> AnchoredByteSet {
@@ -9958,7 +10086,7 @@ mod tests {
             super::super::aarch64_sve_ld1b_vl(25, 12, 1).unwrap(),
             super::super::aarch64_sve_ld1b_vl(26, 12, 2).unwrap(),
             super::super::aarch64_sve_ld1b_vl(27, 12, 3).unwrap(),
-            super::super::aarch64_sve_ptest_p0(8).unwrap(),
+            super::super::aarch64_sve_orrs_p0_b(8, 8, 9).unwrap(),
             super::super::aarch64_sve_addvl(2, 2, 4).unwrap(),
             super::super::aarch64_sve_addvl(2, 2, 1).unwrap(),
             super::super::aarch64_sve_whilelo_b(0, 2, 3).unwrap(),
@@ -10034,8 +10162,8 @@ mod tests {
             .collect::<Vec<_>>();
         for word in [
             super::super::aarch64_sve2_match_b(1, 0, 16).unwrap(),
-            super::super::aarch64_sve_cmpeq_b(2, 0, 17).unwrap(),
-            super::super::aarch64_sve_cmpeq_b(2, 0, 18).unwrap(),
+            super::super::aarch64_sve2_match_b(2, 0, 17).unwrap(),
+            super::super::aarch64_sve2_match_b(2, 0, 18).unwrap(),
             super::super::aarch64_sve_and_b(1, 1, 2).unwrap(),
         ] {
             assert!(
@@ -10063,6 +10191,133 @@ mod tests {
             ),
             "the existing exact-candidate debt charge must remain present"
         );
+        Ok(())
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one cross-target test covers planning, tables, instructions and acceleration receipts"
+    )]
+    fn contextual_pure_sve2_match_cost_admits_broader_exact_columns() -> Result<(), ObjectError> {
+        // The assertion forces contextual compilation and the unbounded
+        // prefix makes the two exact sets a mandatory interior scanner. That
+        // route has no boundary-pair or ASIMD branch, so its complete vector
+        // implementation can consume the SVE2-specific cost model.
+        let pattern = r"(?-u:\b)(?s:.)*[ACEGI][KMOQW]";
+        let sve2 = FeatureSet::of(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2);
+        let pure_target = Target::aarch64_linux().with_features(sve2).unwrap();
+        let compiled = compile(
+            CompileRequest::new(pattern, pure_target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span),
+        )
+        .unwrap();
+        assert_eq!(
+            compiled.program().engine_kind(),
+            EngineKind::OrderedContextDfa
+        );
+        let view = compiled.program().native_context_program_view().unwrap();
+        let established = derive_context_interior_guard(view)?.expect("mandatory interior guard");
+        let primary = established.primary;
+        assert_eq!(primary.ranges().len(), 5);
+        assert!(established.vector_filter.is_none());
+        let widened = derive_context_interior_guard_with_cost_model(
+            view,
+            NativeVectorFilterCostModel::Aarch64Sve2Match,
+        )?
+        .expect("SVE2 widened interior guard")
+        .vector_filter
+        .expect("SVE2 widened contextual columns");
+        assert_eq!(widened.columns().len(), 2);
+
+        assert_eq!(
+            compiled.module().start_accelerator(),
+            StartAccelerator::Aarch64Sve2
+        );
+        let words = compiled.module().sections()[TEXT_SECTION]
+            .bytes()
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        for word in [
+            super::super::aarch64_sve_ld1rqb(16, 12).unwrap(),
+            super::super::aarch64_sve_ld1rqb(17, 12).unwrap(),
+            super::super::aarch64_sve2_match_b(1, 0, 16).unwrap(),
+            super::super::aarch64_sve2_match_b(2, 0, 17).unwrap(),
+            super::super::aarch64_sve_and_b(1, 1, 2).unwrap(),
+        ] {
+            assert!(
+                words.contains(&word),
+                "missing widened SVE2 word {word:#010x}"
+            );
+        }
+
+        // Each exact table repeats only its graph set. Check the physical
+        // object tables as well as the planner's exhaustive membership test.
+        let data = compiled.module().sections()[super::super::PROGRAM_SECTION].bytes();
+        for bytes in [b"ACEGI".as_slice(), b"KMOQW".as_slice()] {
+            let expected = (0..16)
+                .map(|index| bytes[index % bytes.len()])
+                .collect::<Vec<_>>();
+            assert!(
+                data.windows(16).any(|window| window == expected),
+                "missing exact SVE2 table for {bytes:?}"
+            );
+        }
+
+        // Every other current target policy retains the established planner.
+        // In particular, mixed SVE2+ASIMD must keep its VL16-compatible plan.
+        let established_targets = [
+            (Target::x86_64_linux(), StartAccelerator::X86Sse2),
+            (
+                Target::aarch64_linux()
+                    .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                    .unwrap(),
+                StartAccelerator::Aarch64Asimd,
+            ),
+            (
+                Target::aarch64_linux()
+                    .with_features(FeatureSet::of(CpuFeature::Aarch64Sve))
+                    .unwrap(),
+                StartAccelerator::Aarch64Sve,
+            ),
+            (
+                Target::aarch64_linux()
+                    .with_features(sve2.with(CpuFeature::Aarch64Asimd))
+                    .unwrap(),
+                StartAccelerator::Aarch64Sve2,
+            ),
+            (
+                Target::aarch64_macos().with_features(sve2).unwrap(),
+                StartAccelerator::Scalar,
+            ),
+        ];
+        for (target, expected_accelerator) in established_targets {
+            assert_eq!(
+                native_vector_filter_cost_model_for_target(target, true),
+                NativeVectorFilterCostModel::Established
+            );
+            assert!(
+                derive_context_interior_guard_with_cost_model(
+                    view,
+                    native_vector_filter_cost_model_for_target(target, true),
+                )?
+                .is_some_and(|guard| guard.vector_filter.is_none()),
+                "non-pure target widened its graph plan: {target:?}"
+            );
+            let other = compile(
+                CompileRequest::new(pattern, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span),
+            )
+            .unwrap();
+            assert_eq!(
+                other.module().start_accelerator(),
+                expected_accelerator,
+                "inexact target receipt for {target:?}"
+            );
+        }
         Ok(())
     }
 
