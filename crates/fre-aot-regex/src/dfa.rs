@@ -5163,6 +5163,260 @@ mod tests {
             accepted: false,
         };
         assert!(PackedForwardCell::from_cell(outside_stable_range, 0, 1).is_none());
+
+        let complete = ForwardCell {
+            next: 1,
+            accepted: false,
+        };
+        assert!(PackedForwardCell::from_cell(complete, 2, 0).is_none());
+        assert_eq!(
+            PackedForwardCell::from_cell(
+                complete,
+                2,
+                PARTIAL_CELL_HOLE_BASE as usize - 1,
+            )
+            .expect("largest complete row below the hole tag")
+            .0,
+            PARTIAL_CELL_HOLE_BASE - 1,
+        );
+        assert!(
+            PackedForwardCell::from_cell(complete, 2, PARTIAL_CELL_HOLE_BASE as usize)
+                .is_none()
+        );
+
+        let last_hole_state = PARTIAL_CELL_DEAD - PARTIAL_CELL_HOLE_BASE - 1;
+        assert_eq!(
+            PackedForwardCell::from_cell(
+                ForwardCell {
+                    next: last_hole_state,
+                    accepted: false,
+                },
+                0,
+                1,
+            )
+            .expect("largest hole below the dead tag")
+            .0,
+            PARTIAL_CELL_DEAD - 1,
+        );
+        assert!(
+            PackedForwardCell::from_cell(
+                ForwardCell {
+                    next: last_hole_state + 1,
+                    accepted: false,
+                },
+                0,
+                1,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn packed_publication_allocation_replaces_numeric_decline_receipt() {
+        let mut budget = BuildBudget::new(DeterminizeLimits::default());
+        budget.begin_stage(DeterminizationStage::ReverseSubsetConstruction);
+        assert!(budget.reserve_state(3));
+        assert!(budget.charge(5));
+        budget.decline(DeterminizationResource::Transitions {
+            limit: 3,
+            required: 4,
+        });
+        budget.replace_decline_with_allocation::<PackedForwardCell>(17);
+
+        let report = budget.into_report();
+        let decline = report.decline.expect("packed publication declined");
+        assert_eq!(
+            decline.stage,
+            DeterminizationStage::ReverseSubsetConstruction
+        );
+        assert_eq!(decline.work_completed, 6);
+        assert_eq!(decline.states_completed, 1);
+        assert_eq!(decline.transitions_completed, 3);
+        assert_eq!(
+            decline.resource,
+            DeterminizationResource::Allocation {
+                requested_elements: 17,
+                element_size: core::mem::size_of::<PackedForwardCell>(),
+            }
+        );
+    }
+
+    fn synthetic_partial(
+        transitions: Vec<ForwardCell>,
+        start_actions: Vec<ForwardStartAction>,
+        complete_rows: usize,
+        discovered_states: usize,
+        resume_keys: Vec<ForwardKey>,
+    ) -> PartialDfa {
+        let mut packed_transitions = Vec::with_capacity(transitions.len());
+        for &cell in &transitions {
+            packed_transitions.push(
+                PackedForwardCell::from_cell(cell, complete_rows, 1)
+                    .expect("synthetic transition fits the packed table"),
+            );
+        }
+        PartialDfa {
+            alphabet: Alphabet {
+                byte_to_class: [0; 256],
+                representatives: vec![0].into_boxed_slice(),
+            },
+            forward: PartialForwardDfa {
+                initial_pending: false,
+                initial_terminal: false,
+                transitions,
+                packed_transitions: Some(packed_transitions),
+                start_actions,
+                discovered_states,
+                complete_rows,
+                resume_keys,
+            },
+            effective_limits: DeterminizeLimits::default(),
+        }
+    }
+
+    fn one_row_hole(accepted: bool) -> PartialDfa {
+        synthetic_partial(
+            vec![ForwardCell { next: 1, accepted }],
+            vec![ForwardStartAction::Propagate],
+            1,
+            2,
+            vec![ForwardKey {
+                items: vec![0],
+                pending: accepted,
+            }],
+        )
+    }
+
+    #[test]
+    fn final_byte_hole_commits_outputs_without_resuming() {
+        let source = b"x";
+        for accepted in [false, true] {
+            let partial = one_row_hole(accepted);
+            let expected_end = accepted.then_some(1);
+            assert_eq!(
+                partial.exists(source, 0, 1, &[], None).unwrap(),
+                PartialDfaResult::Complete(accepted),
+            );
+            assert_eq!(
+                partial.selected_end(source, 0, 1, &[], None).unwrap(),
+                PartialDfaResult::Complete(expected_end),
+            );
+            assert_eq!(
+                partial
+                    .selected_span_end(source, 0, 1, &[], None)
+                    .unwrap(),
+                PartialDfaResult::Complete(PartialDfaSelection {
+                    end: expected_end,
+                    start: accepted.then_some(0),
+                }),
+            );
+        }
+
+        let accepted_dead = synthetic_partial(
+            vec![ForwardCell {
+                next: NO_STATE,
+                accepted: true,
+            }],
+            vec![ForwardStartAction::Propagate],
+            1,
+            1,
+            Vec::new(),
+        );
+        assert_eq!(
+            accepted_dead
+                .selected_span_end(source, 0, 1, &[], None)
+                .unwrap(),
+            PartialDfaResult::Complete(PartialDfaSelection {
+                end: Some(1),
+                start: Some(0),
+            }),
+        );
+    }
+
+    #[test]
+    fn nonfinal_hole_resumes_unless_earliest_acceptance_is_complete() {
+        let source = b"xx";
+        let rejected = one_row_hole(false);
+        let rejected_resume = PartialDfaResume {
+            state: 0,
+            position: 1,
+            pending_end: None,
+        };
+        assert_eq!(
+            rejected.exists(source, 0, 2, &[], None).unwrap(),
+            PartialDfaResult::Resume(rejected_resume),
+        );
+        assert_eq!(
+            rejected.selected_end(source, 0, 2, &[], None).unwrap(),
+            PartialDfaResult::Resume(rejected_resume),
+        );
+        assert_eq!(
+            rejected
+                .selected_span_end(source, 0, 2, &[], None)
+                .unwrap(),
+            PartialDfaResult::Resume(rejected_resume),
+        );
+
+        let accepted = one_row_hole(true);
+        assert_eq!(
+            accepted.exists(source, 0, 2, &[], None).unwrap(),
+            PartialDfaResult::Complete(true),
+        );
+        let accepted_resume = PartialDfaResume {
+            state: 0,
+            position: 1,
+            pending_end: Some(1),
+        };
+        assert_eq!(
+            accepted.selected_end(source, 0, 2, &[], None).unwrap(),
+            PartialDfaResult::Resume(accepted_resume),
+        );
+        assert_eq!(
+            accepted
+                .selected_span_end(source, 0, 2, &[], None)
+                .unwrap(),
+            PartialDfaResult::Resume(accepted_resume),
+        );
+    }
+
+    #[test]
+    fn final_byte_hole_preserves_parallel_start_actions() {
+        let source = b"xx";
+        for (action, expected_start) in [
+            (ForwardStartAction::Drop, None),
+            (ForwardStartAction::Propagate, Some(0)),
+            (ForwardStartAction::Reset, Some(1)),
+        ] {
+            let partial = synthetic_partial(
+                vec![
+                    ForwardCell {
+                        next: 1,
+                        accepted: false,
+                    },
+                    ForwardCell {
+                        next: 2,
+                        accepted: true,
+                    },
+                ],
+                vec![action, ForwardStartAction::Propagate],
+                2,
+                3,
+                vec![ForwardKey {
+                    items: vec![0],
+                    pending: true,
+                }],
+            );
+            assert_eq!(
+                partial
+                    .selected_span_end(source, 0, 2, &[], None)
+                    .unwrap(),
+                PartialDfaResult::Complete(PartialDfaSelection {
+                    end: Some(2),
+                    start: expected_start,
+                }),
+                "{action:?}",
+            );
+        }
     }
 
     #[test]
