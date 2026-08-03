@@ -1816,7 +1816,7 @@ impl CompiledProgram {
                 let found = self
                     .automaton
                     .prepare::<Exists>()
-                    .search_window_with_authenticated_workspace(
+                    .search_prevalidated_window_with_authenticated_workspace(
                         haystack, window, workspace, limits,
                     )?
                     .into_output();
@@ -1826,7 +1826,7 @@ impl CompiledProgram {
                 let found = self
                     .automaton
                     .prepare::<SelectedEnd>()
-                    .search_window_with_authenticated_workspace(
+                    .search_prevalidated_window_with_authenticated_workspace(
                         haystack, window, workspace, limits,
                     )?
                     .into_output();
@@ -1836,7 +1836,7 @@ impl CompiledProgram {
                 let found = if let Some(width) = self.exact_match_width {
                     self.automaton
                         .prepare::<SelectedEnd>()
-                        .search_window_with_authenticated_workspace(
+                        .search_prevalidated_window_with_authenticated_workspace(
                             haystack, window, workspace, limits,
                         )?
                         .into_output()
@@ -1851,7 +1851,7 @@ impl CompiledProgram {
                 } else {
                     self.automaton
                         .prepare::<Span>()
-                        .search_window_with_authenticated_workspace(
+                        .search_prevalidated_window_with_authenticated_workspace(
                             haystack, window, workspace, limits,
                         )?
                         .into_output()

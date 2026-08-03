@@ -417,6 +417,42 @@ impl<O: Operation> TypedPlan<'_, O> {
             report.accounting,
         ))
     }
+
+    /// Search through an authenticated workspace after the facade has already
+    /// validated the supplied window against `haystack`.
+    ///
+    /// This is the same identity-preserving bridge as
+    /// [`Self::search_window_with_authenticated_workspace`], except that an
+    /// exact automaton/workspace pair reuses the caller's range proof. A
+    /// workspace from an independently constructed semantic clone still takes
+    /// the ordinary fully validated workspace path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] for an incompatible workspace shape,
+    /// insufficient hard limits, or an execution failure. Supplying an invalid
+    /// window violates this facade-only entry's precondition.
+    #[doc(hidden)]
+    pub fn search_prevalidated_window_with_authenticated_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut K0Workspace,
+        limits: SearchLimits,
+    ) -> Result<SearchReport<O::Output>, SearchError> {
+        let report = crate::k0::search_prevalidated_window_with_authenticated_workspace(
+            self.automaton,
+            haystack,
+            window,
+            workspace,
+            limits,
+            O::CONTRACT,
+        )?;
+        Ok(SearchReport::new(
+            O::project(report.found),
+            report.accounting,
+        ))
+    }
 }
 
 impl TypedPlan<'_, Span> {

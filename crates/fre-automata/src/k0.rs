@@ -1969,7 +1969,7 @@ impl ReverseWorkspace {
 #[derive(Debug)]
 pub struct K0Workspace {
     bound_automaton_identity: u64,
-    bound_contextual: bool,
+    bound_capabilities: LazyCapabilities,
     layout: WorkspaceLayout,
     seen_at: Vec<u64>,
     generation: u64,
@@ -2094,6 +2094,11 @@ impl K0Workspace {
         )?;
         let lazy = LazyWorkspace::new(automaton, layout, layout.logical_bytes)?;
         let reverse = ReverseWorkspace::new(automaton, layout, layout.logical_bytes, &mut seen_at)?;
+        let bound_capabilities = LazyCapabilities {
+            lazy: lazy.is_allocated(),
+            reverse: reverse.is_allocated(),
+            contextual: automaton.stats().assertion_edges() != 0,
+        };
         let retained_bytes = retained_bytes(&seen_at, &current, &roots, &stack, &lazy, &reverse)?;
         if retained_bytes > limits.max_scratch_bytes {
             return Err(SearchError::ResourceLimit {
@@ -2112,7 +2117,7 @@ impl K0Workspace {
         };
         Ok(Self {
             bound_automaton_identity: automaton.identity(),
-            bound_contextual: automaton.stats().assertion_edges() != 0,
+            bound_capabilities,
             layout,
             seen_at,
             generation: 0,
@@ -2554,11 +2559,6 @@ pub(crate) fn search_with_authenticated_workspace(
         // authenticated path below.
         return search_with_workspace(automaton, haystack, window, workspace, limits, contract);
     }
-    let capabilities = LazyCapabilities {
-        lazy: workspace.lazy.is_allocated(),
-        reverse: workspace.reverse.is_allocated(),
-        contextual: workspace.bound_contextual,
-    };
     execute_bound_prevalidated(
         automaton,
         haystack,
@@ -2566,7 +2566,33 @@ pub(crate) fn search_with_authenticated_workspace(
         workspace,
         limits,
         contract,
-        capabilities,
+        workspace.bound_capabilities,
+    )
+}
+
+pub(crate) fn search_prevalidated_window_with_authenticated_workspace(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    limits: SearchLimits,
+    contract: OutputContract,
+) -> Result<UntypedReport, SearchError> {
+    if workspace.bound_automaton_identity != automaton.identity() {
+        // A semantic clone does not share the facade's exact-automaton proof.
+        // Re-enter the complete public workspace path, including range and
+        // layout validation, before touching its workspace.
+        return search_with_workspace(automaton, haystack, window, workspace, limits, contract);
+    }
+    debug_assert!(validate_window(haystack, window).is_ok());
+    execute_bound_prevalidated(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        limits,
+        contract,
+        workspace.bound_capabilities,
     )
 }
 
@@ -2683,7 +2709,7 @@ pub(crate) fn search_span_with_workspace_cursor(
         cursor.capabilities.contextual,
         meter,
         setup_work,
-        start_proof,
+        start_proof.borrowed(),
     )?;
     workspace.span_cursor.start_proof = retained_span_cursor_start_proof(automaton);
     Ok(report)
@@ -2746,7 +2772,7 @@ fn search_span_with_bound_cursor(
         capabilities.contextual,
         meter,
         setup_work,
-        start_proof,
+        start_proof.borrowed(),
     )?;
     *retained_start_proof = retained_span_cursor_start_proof(automaton);
     Ok(report)
@@ -2889,7 +2915,7 @@ fn execute(
         contextual,
         meter,
         setup_work,
-        start_proof,
+        start_proof.borrowed(),
     )
 }
 
@@ -2943,7 +2969,7 @@ fn execute_bound_prevalidated(
         }
     };
     let mut setup = SetupAccounting::empty(workspace.retained_bytes, true);
-    let (mut meter, setup_work) = prepare_bound_invocation(
+    let (meter, setup_work) = prepare_bound_invocation(
         automaton,
         workspace,
         window,
@@ -2952,6 +2978,60 @@ fn execute_bound_prevalidated(
         mode.lazy,
         mode.reverse,
     )?;
+    let start_proof = if let Some(proof) = automaton.start_filter_proof.get() {
+        ExecutionStartProof::Published(proof)
+    } else if automaton.start_filter_proof.allocation_failed() {
+        ExecutionStartProof::Published(&ORDINARY_START_FILTER_PROOF)
+    } else {
+        return execute_bound_with_unprepared_start_filter(
+            automaton,
+            haystack,
+            window,
+            workspace,
+            limits,
+            setup,
+            contract,
+            mode,
+            capabilities.contextual,
+            meter,
+            setup_work,
+        );
+    };
+    execute_prepared(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        limits,
+        setup,
+        contract,
+        mode.lazy,
+        mode.reverse,
+        capabilities.contextual,
+        meter,
+        setup_work,
+        start_proof,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the cold proof path preserves the complete prepared invocation transaction"
+)]
+#[inline(never)]
+fn execute_bound_with_unprepared_start_filter(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    limits: SearchLimits,
+    setup: SetupAccounting,
+    contract: OutputContract,
+    mode: EffectiveLazyMode,
+    contextual: bool,
+    mut meter: WorkMeter,
+    setup_work: u64,
+) -> Result<UntypedReport, SearchError> {
     let start_proof = prepare_start_filter(
         automaton,
         workspace,
@@ -2969,10 +3049,10 @@ fn execute_bound_prevalidated(
         contract,
         mode.lazy,
         mode.reverse,
-        capabilities.contextual,
+        contextual,
         meter,
         setup_work,
-        start_proof,
+        start_proof.borrowed(),
     )
 }
 
@@ -2994,7 +3074,7 @@ fn execute_prepared(
     contextual: bool,
     mut meter: WorkMeter,
     mut setup_work: u64,
-    start_proof: InvocationStartProof<'_>,
+    start_proof: ExecutionStartProof<'_>,
 ) -> Result<UntypedReport, SearchError> {
     let wants_span = matches!(contract, OutputContract::Span);
     let supported_contract = matches!(
@@ -5695,10 +5775,38 @@ enum InvocationStartProof<'a> {
 }
 
 impl InvocationStartProof<'_> {
+    #[cfg(test)]
     const fn proof(&self) -> &StartFilterProof {
         match self {
             Self::Published(proof) => proof,
             Self::Pending { proof, .. } => proof,
+        }
+    }
+
+    const fn borrowed(&self) -> ExecutionStartProof<'_> {
+        match self {
+            Self::Published(proof) => ExecutionStartProof::Published(proof),
+            Self::Pending { proof, publish } => ExecutionStartProof::Pending {
+                proof,
+                publish: *publish,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ExecutionStartProof<'a> {
+    Published(&'a StartFilterProof),
+    Pending {
+        proof: &'a StartFilterProof,
+        publish: bool,
+    },
+}
+
+impl<'a> ExecutionStartProof<'a> {
+    const fn proof(self) -> &'a StartFilterProof {
+        match self {
+            Self::Published(proof) | Self::Pending { proof, .. } => proof,
         }
     }
 
@@ -5748,7 +5856,7 @@ impl InvocationStartProof<'_> {
             return 0;
         };
 
-        match automaton.start_filter_proof.publish(&proof) {
+        match automaton.start_filter_proof.publish(proof) {
             StartFilterPublication::AlreadyInitialized => 0,
             StartFilterPublication::AllocationFailed => {
                 meter.charge_admitted(START_FILTER_OWNER_ALLOCATION_WORK);
