@@ -1062,6 +1062,7 @@ const fn backend_name(backend: LinuxAarch64SearchBackendV1) -> &'static str {
         LinuxAarch64SearchBackendV1::AsimdV24 => "v24-asimd-sixth-static",
         LinuxAarch64SearchBackendV1::AsimdV25 => "v25-asimd-sixth-empty-promote",
         LinuxAarch64SearchBackendV1::AsimdV26 => "v26-asimd-policy-authenticated",
+        LinuxAarch64SearchBackendV1::AsimdV27 => "v27-asimd-topology-total",
         LinuxAarch64SearchBackendV1::Sve2Fixed16Tag21Vl16 => "tag21-sve2-fixed16",
     }
 }

@@ -260,5 +260,7 @@ const fn accelerator_name(value: StartAccelerator) -> &'static str {
         StartAccelerator::X86Avx2 => "x86-avx2",
         StartAccelerator::X86Avx512Bw => "x86-avx512bw",
         StartAccelerator::Aarch64Asimd => "aarch64-asimd",
+        StartAccelerator::Aarch64Sve => "aarch64-sve",
+        StartAccelerator::Aarch64Sve2 => "aarch64-sve2",
     }
 }
