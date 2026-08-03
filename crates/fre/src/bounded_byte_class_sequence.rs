@@ -787,11 +787,11 @@ mod tests {
                                 .map(|matched| (start + matched.start(), start + matched.end()));
                             let expected_shortest =
                                 oracle.shortest_match(source).map(|finish| start + finish);
-                            let (exists, accounting) = fre
+                            let (exists, search_accounting) = fre
                                 .is_match_window(&haystack, window, SearchLimits::unlimited())
                                 .unwrap();
                             assert_eq!(exists, expected.is_some());
-                            let accounting = accounting(accounting);
+                            let accounting = accounting(search_accounting);
                             assert_eq!(accounting.plan_id, PLAN_ID);
                             assert!(accounting.actual_work <= accounting.work_upper_bound);
                             assert_eq!(
