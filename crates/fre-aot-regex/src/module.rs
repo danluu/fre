@@ -14511,6 +14511,7 @@ mod tests {
         let avx512 = FeatureSet::of(CpuFeature::X86Avx512F)
             .with(CpuFeature::X86Avx512Bw)
             .with(CpuFeature::X86Avx512Vl);
+        let avx512_with_avx2 = avx512.with(CpuFeature::X86Avx2);
         let sve2 = FeatureSet::of(CpuFeature::Aarch64Sve)
             .with(CpuFeature::Aarch64Sve2);
         let cases = [
@@ -14530,6 +14531,15 @@ mod tests {
                 Target::x86_64_linux().with_features(avx512).unwrap(),
                 range_pattern,
                 Some(StartAccelerator::X86Avx512Bw),
+            ),
+            (
+                Target::x86_64_linux()
+                    .with_features(avx512_with_avx2)
+                    .unwrap(),
+                exact_pattern,
+                // Arbitrary fragmented membership uses its authenticated
+                // AVX2 nibble classifier and remains valid on AVX-512 CPUs.
+                Some(StartAccelerator::X86Avx2),
             ),
             (
                 Target::aarch64_linux(),
