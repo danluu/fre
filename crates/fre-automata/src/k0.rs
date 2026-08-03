@@ -61,7 +61,13 @@ const LAZY_MAX_ITEMS: usize = 16_384;
 const EXACT_LAZY_CAPACITY_MAX_ITEMS: usize = 3;
 const LAZY_CELL_ACCEPT: u32 = 1 << 31;
 const LAZY_CELL_RESTART: u32 = 1 << 30;
-const LAZY_CELL_STATE_MASK: u32 = LAZY_CELL_RESTART - 1;
+// Direct non-context cells use the two bits below as a three-way provenance
+// action. Contextual cells retain `LAZY_CELL_RESTART` with its existing
+// meaning and leave `LAZY_CELL_START_PROPAGATE` clear; reverse cells leave
+// both clear. Even after reserving the extra bit, the encoded direct-row
+// ceiling is orders of magnitude below the remaining state field.
+const LAZY_CELL_START_PROPAGATE: u32 = 1 << 29;
+const LAZY_CELL_STATE_MASK: u32 = LAZY_CELL_START_PROPAGATE - 1;
 const LAZY_CELL_UNFILLED: u32 = u32::MAX;
 const LAZY_NO_STATE: u32 = u32::MAX;
 #[cfg(test)]
@@ -1002,6 +1008,39 @@ enum LazyTransition {
     Inline { accepted: bool, pending: bool },
 }
 
+/// Source-independent effect of one non-context direct transition on a
+/// runtime proof that every active thread has the same match start.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LazyStartAction {
+    /// Source and injected-root provenance coexist, or no live provenance is
+    /// available. A scalar start cannot be authenticated.
+    Drop,
+    /// Every retained thread and any acceptance came from the source
+    /// frontier, so an authenticated scalar remains exact.
+    Propagate,
+    /// The source frontier became empty before the unanchored root was
+    /// injected. Every retained thread starts at the new boundary.
+    Reset,
+}
+
+impl LazyStartAction {
+    const fn cell_bits(self) -> u32 {
+        match self {
+            Self::Drop => 0,
+            Self::Propagate => LAZY_CELL_START_PROPAGATE,
+            Self::Reset => LAZY_CELL_RESTART,
+        }
+    }
+
+    const fn from_direct_cell(cell: u32) -> Self {
+        match cell & (LAZY_CELL_START_PROPAGATE | LAZY_CELL_RESTART) {
+            LAZY_CELL_START_PROPAGATE => Self::Propagate,
+            LAZY_CELL_RESTART => Self::Reset,
+            _ => Self::Drop,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LazyState {
     Cached(u32),
@@ -1034,6 +1073,7 @@ enum ReverseState {
 enum LazyInitialKind {
     Uninitialized,
     Positive,
+    PositiveSingle,
     NullablePrefix,
     NullableTerminal,
 }
@@ -1063,6 +1103,7 @@ struct LazyWorkspace {
     item_len: usize,
     initial: u32,
     initial_kind: LazyInitialKind,
+    inline_start_action: LazyStartAction,
     initialized: bool,
     declined: bool,
     saturated: bool,
@@ -1105,6 +1146,7 @@ impl LazyWorkspace {
             item_len: 0,
             initial: LAZY_NO_STATE,
             initial_kind: LazyInitialKind::Uninitialized,
+            inline_start_action: LazyStartAction::Drop,
             initialized: false,
             declined: false,
             saturated: false,
@@ -1129,6 +1171,7 @@ impl LazyWorkspace {
             item_len: 0,
             initial: LAZY_NO_STATE,
             initial_kind: LazyInitialKind::Uninitialized,
+            inline_start_action: LazyStartAction::Drop,
             initialized: false,
             declined: true,
             saturated: false,
@@ -2862,6 +2905,211 @@ fn search_span_with_root_run_cursor(
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
+    reason = "the forward loop keeps endpoint commitment and cache handoff together"
+)]
+fn execute_lazy_loop(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    contract: OutputContract,
+    core_reserve: u64,
+    scanner: Option<&StartPositionScanner>,
+    guard: Option<&StartPositionClass>,
+    probe: Option<&StartPositionClass>,
+    adaptive_probe: &mut AdaptiveStartProbe,
+    _ready: DirectLazyReady,
+) -> Result<Option<(Option<MatchSpan>, usize)>, SearchError> {
+    debug_assert!(matches!(
+        contract,
+        OutputContract::Exists
+            | OutputContract::EarliestEnd
+            | OutputContract::SelectedEnd
+            | OutputContract::Span
+    ));
+    debug_assert!(workspace.lazy.is_allocated());
+    debug_assert!(workspace.lazy.is_bound_to(automaton));
+    debug_assert!(workspace.lazy.initialized);
+    debug_assert!(!workspace.lazy.declined);
+
+    let haystack = haystack
+        .get(..window.end())
+        .ok_or(SearchError::InternalInvariant {
+            detail: "lazy DFA window exceeds the validated haystack",
+        })?;
+
+    let (initial_pending, initial_terminal) = match workspace.lazy.initial_kind {
+        LazyInitialKind::Positive | LazyInitialKind::PositiveSingle => (false, false),
+        LazyInitialKind::NullablePrefix => (true, false),
+        LazyInitialKind::NullableTerminal => (true, true),
+        LazyInitialKind::Uninitialized => {
+            return Err(SearchError::InternalInvariant {
+                detail: "initialized lazy DFA has no cached initial kind",
+            });
+        }
+    };
+    let earliest = matches!(
+        contract,
+        OutputContract::Exists | OutputContract::EarliestEnd
+    );
+    let initial = workspace.lazy.initial;
+    if initial == LAZY_NO_STATE {
+        return Err(SearchError::InternalInvariant {
+            detail: "initialized lazy DFA has no initial state",
+        });
+    }
+    if initial_pending && (earliest || initial_terminal) {
+        return Ok(Some((
+            Some(MatchSpan::new(window.start(), window.start())),
+            1,
+        )));
+    }
+    let initial_row = direct_row_offset(initial)?;
+    let mut state = LazyState::Cached(initial_row);
+    let mut position = window.start();
+    let mut boundaries = 0usize;
+    let mut pending_end = initial_pending.then_some(window.start());
+    let mut entered = false;
+    let mut retained_start_mask = RetainedStartMaskCursor::default();
+    let mut engine_candidate = None;
+
+    loop {
+        if pending_end.is_none() && state == LazyState::Cached(initial_row) {
+            if let Some(scanner) = scanner {
+                if position < window.end() {
+                    if let (Some(probe), Some(candidate)) = (probe, engine_candidate.take()) {
+                        adaptive_probe.observe_restartable_rejection(
+                            probe,
+                            haystack,
+                            candidate,
+                            window.end(),
+                            meter,
+                        )?;
+                    }
+                } else {
+                    engine_candidate = None;
+                }
+                position = next_start_candidate_adaptive(
+                    scanner,
+                    haystack,
+                    position,
+                    window.end(),
+                    guard,
+                    probe,
+                    meter,
+                    &mut retained_start_mask,
+                    adaptive_probe,
+                )?;
+                if position == window.end() {
+                    return Ok(Some((None, boundaries)));
+                }
+                if probe.is_some() && adaptive_probe.samples_rejections() {
+                    engine_candidate = Some(position);
+                }
+            }
+        }
+        if !entered {
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "the validated window proves the initial boundary increment fits"
+            )]
+            {
+                boundaries += 1;
+            }
+            entered = true;
+        }
+        if position >= haystack.len() {
+            if position == haystack.len() {
+                return Ok(Some((
+                    pending_end.map(|end| MatchSpan::new(window.start(), end)),
+                    boundaries,
+                )));
+            }
+            return Err(SearchError::InternalInvariant {
+                detail: "lazy DFA source position exceeded the validated window",
+            });
+        }
+
+        meter.charge(1, position)?;
+        #[allow(
+            clippy::indexing_slicing,
+            reason = "the immediately dominating window-ceiling check proves this source index"
+        )]
+        let byte = haystack[position];
+        let transition = match state {
+            LazyState::Cached(cached) => {
+                let cell = workspace.lazy.direct_cell(cached, byte)?;
+                if cell == LAZY_CELL_UNFILLED {
+                    build_lazy_cached_transition(
+                        automaton,
+                        direct_row_state(cached),
+                        byte,
+                        workspace,
+                        meter,
+                        core_reserve,
+                        position,
+                    )?
+                } else {
+                    LazyTransition::Ready(cell)
+                }
+            }
+            LazyState::Inline { pending } => {
+                build_lazy_inline_transition(automaton, byte, pending, workspace, meter, position)?
+            }
+        };
+        debug_assert!(position < window.end());
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "the validated window proves hot-loop position and boundary increments fit"
+        )]
+        {
+            position += 1;
+            boundaries += 1;
+        }
+
+        let (accepted, next) = match transition {
+            LazyTransition::Ready(cell) => {
+                let encoded = cell & LAZY_CELL_STATE_MASK;
+                (
+                    cell & LAZY_CELL_ACCEPT != 0,
+                    if encoded == 0 {
+                        None
+                    } else {
+                        Some(LazyState::Cached(encoded.checked_sub(1).ok_or(
+                            SearchError::InternalInvariant {
+                                detail: "lazy DFA encoded state underflowed",
+                            },
+                        )?))
+                    },
+                )
+            }
+            LazyTransition::Inline { accepted, pending } => {
+                (accepted, Some(LazyState::Inline { pending }))
+            }
+        };
+        if accepted {
+            pending_end = Some(position);
+            if earliest {
+                return Ok(Some((
+                    Some(MatchSpan::new(window.start(), position)),
+                    boundaries,
+                )));
+            }
+        }
+        let Some(next) = next else {
+            return Ok(Some((
+                pending_end.map(|end| MatchSpan::new(window.start(), end)),
+                boundaries,
+            )));
+        };
+        state = next;
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "the shared Pike/lazy entry authenticates one complete invocation"
 )]
 fn execute(
@@ -3230,6 +3478,7 @@ fn execute_prepared(
                 start_proof.proof().relaxed_nullable,
                 &mut adaptive_probe,
             )?
+            .map(|(found, boundaries)| (found, boundaries, false))
         } else {
             let ready = if let Some(ready) = direct_ready {
                 Some(ready)
@@ -3244,20 +3493,38 @@ fn execute_prepared(
                 .then_some(DirectLazyReady)
             };
             if let Some(ready) = ready {
-                execute_lazy_loop(
-                    automaton,
-                    haystack,
-                    window,
-                    workspace,
-                    &mut meter,
-                    contract,
-                    lazy_core_reserve,
-                    start_proof.proof().scanner.as_ref(),
-                    start_proof.proof().guard(),
-                    start_proof.proof().probe(),
-                    &mut adaptive_probe,
-                    ready,
-                )?
+                if wants_span {
+                    execute_lazy_span_loop::<true>(
+                        automaton,
+                        haystack,
+                        window,
+                        workspace,
+                        &mut meter,
+                        contract,
+                        lazy_core_reserve,
+                        start_proof.proof().scanner.as_ref(),
+                        start_proof.proof().guard(),
+                        start_proof.proof().probe(),
+                        &mut adaptive_probe,
+                        ready,
+                    )?
+                } else {
+                    execute_lazy_loop(
+                        automaton,
+                        haystack,
+                        window,
+                        workspace,
+                        &mut meter,
+                        contract,
+                        lazy_core_reserve,
+                        start_proof.proof().scanner.as_ref(),
+                        start_proof.proof().guard(),
+                        start_proof.proof().probe(),
+                        &mut adaptive_probe,
+                        ready,
+                    )?
+                    .map(|(found, boundaries)| (found, boundaries, false))
+                }
             } else {
                 None
             }
@@ -3266,10 +3533,10 @@ fn execute_prepared(
         None
     };
     let used_lazy = lazy.is_some();
-    let (mut pending, mut boundaries) = if let Some(result) = lazy {
+    let (mut pending, mut boundaries, direct_start_known) = if let Some(result) = lazy {
         result
     } else if let Some(scanner) = start_proof.proof().scanner.as_ref() {
-        execute_filtered_loop(
+        let (found, boundaries) = execute_filtered_loop(
             automaton,
             haystack,
             window,
@@ -3281,18 +3548,20 @@ fn execute_prepared(
             start_proof.proof().probe(),
             start_proof.proof().force_haystack_start,
             &mut adaptive_probe,
-        )?
+        )?;
+        (found, boundaries, false)
     } else {
         // Keep the common nullable/all-byte decline path free of scanner and
         // secondary-filter option tests at every examined boundary.
         debug_assert!(start_proof.proof().filter.is_none());
         debug_assert!(!start_proof.proof().force_haystack_start);
-        execute_unfiltered_loop(automaton, haystack, window, workspace, &mut meter, earliest)?
+        let (found, boundaries) =
+            execute_unfiltered_loop(automaton, haystack, window, workspace, &mut meter, earliest)?;
+        (found, boundaries, false)
     };
     if wants_span && used_lazy {
-        let start_known = !contextual && lazy_initial_has_pending(workspace)?;
         if let Some(selected) = pending {
-            if !start_known {
+            if !direct_start_known {
                 let end = selected.end();
                 let (start, reverse_boundaries) = if contextual {
                     execute_context_reverse_lazy_loop(
@@ -3364,7 +3633,7 @@ fn execute_prepared(
     clippy::too_many_lines,
     reason = "the forward loop keeps endpoint commitment and cache handoff together"
 )]
-fn execute_lazy_loop(
+fn execute_lazy_span_loop<const TRACK_START: bool>(
     automaton: &Automaton,
     haystack: &[u8],
     window: SearchWindow,
@@ -3377,7 +3646,7 @@ fn execute_lazy_loop(
     probe: Option<&StartPositionClass>,
     adaptive_probe: &mut AdaptiveStartProbe,
     _ready: DirectLazyReady,
-) -> Result<Option<(Option<MatchSpan>, usize)>, SearchError> {
+) -> Result<Option<(Option<MatchSpan>, usize, bool)>, SearchError> {
     debug_assert!(matches!(
         contract,
         OutputContract::Exists
@@ -3402,7 +3671,7 @@ fn execute_lazy_loop(
         })?;
 
     let (initial_pending, initial_terminal) = match workspace.lazy.initial_kind {
-        LazyInitialKind::Positive => (false, false),
+        LazyInitialKind::Positive | LazyInitialKind::PositiveSingle => (false, false),
         LazyInitialKind::NullablePrefix => (true, false),
         LazyInitialKind::NullableTerminal => (true, true),
         LazyInitialKind::Uninitialized => {
@@ -3425,6 +3694,7 @@ fn execute_lazy_loop(
         return Ok(Some((
             Some(MatchSpan::new(window.start(), window.start())),
             1,
+            TRACK_START,
         )));
     }
     // Even a physically full cache retains useful prefix rows. Start from the
@@ -3434,6 +3704,10 @@ fn execute_lazy_loop(
     let mut position = window.start();
     let mut boundaries = 0usize;
     let mut pending_end = initial_pending.then_some(window.start());
+    let mut active_start = (TRACK_START
+        && (initial_pending || workspace.lazy.initial_kind == LazyInitialKind::PositiveSingle))
+        .then_some(window.start());
+    let mut pending_start = (TRACK_START && initial_pending).then_some(window.start());
     let mut entered = false;
     let mut retained_start_mask = RetainedStartMaskCursor::default();
     let mut engine_candidate = None;
@@ -3468,7 +3742,11 @@ fn execute_lazy_loop(
                     adaptive_probe,
                 )?;
                 if position == window.end() {
-                    return Ok(Some((None, boundaries)));
+                    return Ok(Some((None, boundaries, false)));
+                }
+                if TRACK_START {
+                    active_start = (workspace.lazy.initial_kind == LazyInitialKind::PositiveSingle)
+                        .then_some(position);
                 }
                 if probe.is_some() && adaptive_probe.samples_rejections() {
                     engine_candidate = Some(position);
@@ -3489,9 +3767,12 @@ fn execute_lazy_loop(
         }
         if position >= haystack.len() {
             if position == haystack.len() {
+                let start_known = TRACK_START && pending_end.is_some() && pending_start.is_some();
                 return Ok(Some((
-                    pending_end.map(|end| MatchSpan::new(window.start(), end)),
+                    pending_end
+                        .map(|end| MatchSpan::new(pending_start.unwrap_or(window.start()), end)),
                     boundaries,
+                    start_known,
                 )));
             }
             return Err(SearchError::InternalInvariant {
@@ -3543,7 +3824,7 @@ fn execute_lazy_loop(
             boundaries += 1;
         }
 
-        let (accepted, next) = match transition {
+        let (accepted, next, start_action) = match transition {
             LazyTransition::Ready(cell) => {
                 let encoded = cell & LAZY_CELL_STATE_MASK;
                 (
@@ -3557,28 +3838,56 @@ fn execute_lazy_loop(
                             },
                         )?))
                     },
+                    if TRACK_START {
+                        LazyStartAction::from_direct_cell(cell)
+                    } else {
+                        LazyStartAction::Drop
+                    },
                 )
             }
-            LazyTransition::Inline { accepted, pending } => {
-                (accepted, Some(LazyState::Inline { pending }))
+            LazyTransition::Inline { accepted, pending } => (
+                accepted,
+                Some(LazyState::Inline { pending }),
+                if TRACK_START {
+                    workspace.lazy.inline_start_action
+                } else {
+                    LazyStartAction::Drop
+                },
+            ),
+        };
+        let next_start = if TRACK_START {
+            match start_action {
+                LazyStartAction::Drop => None,
+                LazyStartAction::Propagate => active_start,
+                LazyStartAction::Reset => Some(position),
             }
+        } else {
+            None
         };
         if accepted {
             pending_end = Some(position);
+            pending_start = next_start;
             if earliest {
                 return Ok(Some((
-                    Some(MatchSpan::new(window.start(), position)),
+                    Some(MatchSpan::new(
+                        pending_start.unwrap_or(window.start()),
+                        position,
+                    )),
                     boundaries,
+                    TRACK_START && pending_start.is_some(),
                 )));
             }
         }
         let Some(next) = next else {
+            let start_known = TRACK_START && pending_end.is_some() && pending_start.is_some();
             return Ok(Some((
-                pending_end.map(|end| MatchSpan::new(window.start(), end)),
+                pending_end.map(|end| MatchSpan::new(pending_start.unwrap_or(window.start()), end)),
                 boundaries,
+                start_known,
             )));
         };
         state = next;
+        active_start = next_start;
     }
 }
 
@@ -4233,6 +4542,7 @@ fn prepare_lazy(
     // replace this initial empty match. The existing pending mode therefore
     // represents nullable execution without pattern-specific cases.
     let initial_kind = match (accepted, workspace.lazy.scratch_len == 0) {
+        (false, false) if workspace.lazy.scratch_len == 1 => LazyInitialKind::PositiveSingle,
         (false, false) => LazyInitialKind::Positive,
         (true, false) => LazyInitialKind::NullablePrefix,
         (true, true) => LazyInitialKind::NullableTerminal,
@@ -4351,6 +4661,30 @@ fn expand_lazy_root(
     Ok(false)
 }
 
+const fn lazy_start_action(
+    source_len: usize,
+    final_len: usize,
+    injected_root: bool,
+) -> LazyStartAction {
+    if !injected_root {
+        return LazyStartAction::Propagate;
+    }
+    if source_len == 0 {
+        return if final_len == 0 {
+            LazyStartAction::Drop
+        } else {
+            LazyStartAction::Reset
+        };
+    }
+    if final_len == source_len {
+        // The root closure added no thread. Any graph states it revisited were
+        // already owned by the earlier, higher-priority source frontier.
+        LazyStartAction::Propagate
+    } else {
+        LazyStartAction::Drop
+    }
+}
+
 fn build_lazy_cached_transition(
     automaton: &Automaton,
     state: u32,
@@ -4387,20 +4721,24 @@ fn build_lazy_cached_transition(
             }
         }
     }
-    if !accepted
-        && !pending
-        && expand_lazy_root(automaton, automaton.start, workspace, meter, position)?
-    {
-        return Err(SearchError::InternalInvariant {
-            detail: "nonnullable lazy DFA accepted an injected empty match",
-        });
+    let source_len = workspace.lazy.scratch_len;
+    let mut injected_root = false;
+    if !accepted && !pending {
+        injected_root = true;
+        if expand_lazy_root(automaton, automaton.start, workspace, meter, position)? {
+            return Err(SearchError::InternalInvariant {
+                detail: "nonnullable lazy DFA accepted an injected empty match",
+            });
+        }
     }
+    let start_action = lazy_start_action(source_len, workspace.lazy.scratch_len, injected_root);
     finish_lazy_cached_transition(
         automaton,
         state,
         byte,
         accepted,
         pending,
+        start_action,
         workspace,
         meter,
         core_reserve,
@@ -4418,6 +4756,7 @@ fn finish_lazy_cached_transition(
     byte: u8,
     accepted: bool,
     pending: bool,
+    start_action: LazyStartAction,
     workspace: &mut K0Workspace,
     meter: &mut WorkMeter,
     core_reserve: u64,
@@ -4434,6 +4773,7 @@ fn finish_lazy_cached_transition(
             LazyInterned::State(next) => direct_row_encoded_state(next)?,
             LazyInterned::BudgetDeclined => {
                 workspace.lazy.retain_scratch_as_frontier()?;
+                workspace.lazy.inline_start_action = start_action;
                 return Ok(LazyTransition::Inline {
                     accepted,
                     pending: next_pending,
@@ -4446,6 +4786,7 @@ fn finish_lazy_cached_transition(
                 )?;
                 workspace.lazy.saturated = true;
                 workspace.lazy.retain_scratch_as_frontier()?;
+                workspace.lazy.inline_start_action = start_action;
                 return Ok(LazyTransition::Inline {
                     accepted,
                     pending: next_pending,
@@ -4453,7 +4794,7 @@ fn finish_lazy_cached_transition(
             }
         }
     };
-    let cell = encoded | if accepted { LAZY_CELL_ACCEPT } else { 0 };
+    let cell = encoded | if accepted { LAZY_CELL_ACCEPT } else { 0 } | start_action.cell_bits();
     workspace.lazy.set_cell(state, byte, cell)?;
     Ok(LazyTransition::Ready(cell))
 }
@@ -4495,24 +4836,27 @@ fn build_lazy_inline_transition(
             }
         }
     }
-    if !accepted
-        && !pending
-        && expand_lazy_root(automaton, automaton.start, workspace, meter, position)?
-    {
-        return Err(SearchError::InternalInvariant {
-            detail: "nonnullable inline lazy DFA accepted an injected empty match",
-        });
+    let source_len = workspace.lazy.scratch_len;
+    let mut injected_root = false;
+    if !accepted && !pending {
+        injected_root = true;
+        if expand_lazy_root(automaton, automaton.start, workspace, meter, position)? {
+            return Err(SearchError::InternalInvariant {
+                detail: "nonnullable inline lazy DFA accepted an injected empty match",
+            });
+        }
     }
+    let start_action = lazy_start_action(source_len, workspace.lazy.scratch_len, injected_root);
     let next_pending = pending || accepted;
     if workspace.lazy.scratch_len == 0 {
         workspace.lazy.frontier_len = 0;
-        return Ok(LazyTransition::Ready(if accepted {
-            LAZY_CELL_ACCEPT
-        } else {
-            0
-        }));
+        let accepted_bit = if accepted { LAZY_CELL_ACCEPT } else { 0 };
+        return Ok(LazyTransition::Ready(
+            accepted_bit | start_action.cell_bits(),
+        ));
     }
     workspace.lazy.retain_scratch_as_frontier()?;
+    workspace.lazy.inline_start_action = start_action;
     Ok(LazyTransition::Inline {
         accepted,
         pending: next_pending,
@@ -14769,10 +15113,9 @@ mod tests {
             .into_iter()
             .map(|handle| handle.join().unwrap())
             .collect();
-        assert!(reports.iter().all(|(found, _, _, _, _)| found
-            .as_ref()
-            .map(|span| (span.start(), span.end()))
-            == Some((7, 8))));
+        assert!(reports.iter().all(|(found, _, _, _, _)| {
+            found.as_ref().map(|span| (span.start(), span.end())) == Some((7, 8))
+        }));
         assert!(
             reports
                 .iter()
@@ -15667,6 +16010,183 @@ mod tests {
             assert!(!bidirectional.reverse.declined);
         }
         assert!(checked > 10_000);
+    }
+
+    #[test]
+    fn direct_cells_certify_source_propagation_root_reset_and_mixed_drop() {
+        let propagated = a_plus(true);
+        pin_without_start_filter(&propagated);
+        let mut propagated_workspace =
+            K0Workspace::new_accelerated(&propagated, WorkspaceLimits::unlimited()).unwrap();
+        propagated
+            .prepare::<SelectedEnd>()
+            .search_with_workspace(b"ba", &mut propagated_workspace, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(
+            propagated_workspace.lazy.initial_kind,
+            super::LazyInitialKind::PositiveSingle
+        );
+        let initial = propagated_workspace.lazy.initial;
+        assert_eq!(
+            super::LazyStartAction::from_direct_cell(
+                propagated_workspace.lazy.cell(initial, b'a').unwrap()
+            ),
+            super::LazyStartAction::Propagate
+        );
+        assert_eq!(
+            super::LazyStartAction::from_direct_cell(
+                propagated_workspace.lazy.cell(initial, b'b').unwrap()
+            ),
+            super::LazyStartAction::Reset
+        );
+
+        let mixed = byte_chain(&[(b'a', b'a'), (b'b', b'b')]);
+        pin_without_start_filter(&mixed);
+        let mut mixed_workspace =
+            K0Workspace::new_accelerated(&mixed, WorkspaceLimits::unlimited()).unwrap();
+        mixed
+            .prepare::<SelectedEnd>()
+            .search_with_workspace(b"a", &mut mixed_workspace, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(
+            mixed_workspace.lazy.initial_kind,
+            super::LazyInitialKind::PositiveSingle
+        );
+        assert_eq!(
+            super::LazyStartAction::from_direct_cell(
+                mixed_workspace
+                    .lazy
+                    .cell(mixed_workspace.lazy.initial, b'a')
+                    .unwrap()
+            ),
+            super::LazyStartAction::Drop,
+            "the continuing `b` thread and newly injected `a` root have distinct starts"
+        );
+    }
+
+    #[test]
+    fn singleton_start_certificate_is_exhaustive_and_never_reads_reverse_rows() {
+        let plans = [
+            ("one-byte", byte_chain(&[(b'a', b'a')])),
+            ("greedy-plus", a_plus(true)),
+            ("lazy-plus", a_plus(false)),
+        ];
+        let haystacks = bounded_words(&[b'a', b'b', 0xff], 4);
+        let mut checked = 0usize;
+
+        for (name, plan) in &plans {
+            pin_without_start_filter(plan);
+            let mut pike = K0Workspace::new(plan, WorkspaceLimits::unlimited()).unwrap();
+            let mut direct =
+                K0Workspace::new_bidirectional(plan, WorkspaceLimits::unlimited()).unwrap();
+            for haystack in &haystacks {
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        let want = plan
+                            .prepare::<Span>()
+                            .search_window_with_workspace(
+                                haystack,
+                                window,
+                                &mut pike,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap();
+                        let got = plan
+                            .prepare::<Span>()
+                            .search_window_with_workspace(
+                                haystack,
+                                window,
+                                &mut direct,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap();
+                        assert_eq!(
+                            got.output(),
+                            want.output(),
+                            "{name}: source={haystack:?} window={window:?}"
+                        );
+                        checked = checked.checked_add(1).unwrap();
+                    }
+                }
+            }
+            assert_eq!(
+                direct.lazy.initial_kind,
+                super::LazyInitialKind::PositiveSingle,
+                "{name}"
+            );
+            assert!(direct.reverse.initialized, "{name}");
+            assert!(
+                direct
+                    .reverse
+                    .rows
+                    .iter()
+                    .all(|&cell| cell == super::LAZY_CELL_UNFILLED),
+                "{name}: a certified span must not execute reverse recovery"
+            );
+        }
+        assert!(checked > 1_000);
+    }
+
+    #[test]
+    fn certified_span_preserves_exact_finite_work_and_boundary_accounting() {
+        let plan = a_plus(true);
+        pin_without_start_filter(&plan);
+        let haystack = b"baaaa";
+        let mut workspace =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let retained = workspace.retained_bytes();
+
+        let span = plan
+            .prepare::<Span>()
+            .search_with_workspace(haystack, &mut workspace, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(span.output(), &Some(MatchSpan::new(1, haystack.len())));
+        assert!(workspace
+            .reverse
+            .rows
+            .iter()
+            .all(|&cell| cell == super::LAZY_CELL_UNFILLED));
+        let selected = plan
+            .prepare::<SelectedEnd>()
+            .search_with_workspace(haystack, &mut workspace, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(
+            span.accounting().boundaries(),
+            selected.accounting().boundaries()
+        );
+
+        let measured = plan
+            .prepare::<Span>()
+            .search_with_workspace(haystack, &mut workspace, SearchLimits::unlimited())
+            .unwrap()
+            .accounting()
+            .work();
+        assert_eq!(
+            plan.prepare::<Span>()
+                .search_with_workspace(
+                    haystack,
+                    &mut workspace,
+                    SearchLimits {
+                        max_work: measured,
+                        max_scratch_bytes: retained,
+                    },
+                )
+                .unwrap()
+                .into_output(),
+            Some(MatchSpan::new(1, haystack.len()))
+        );
+        assert!(matches!(
+            plan.prepare::<Span>().search_with_workspace(
+                haystack,
+                &mut workspace,
+                SearchLimits {
+                    max_work: measured - 1,
+                    max_scratch_bytes: retained,
+                },
+            ),
+            Err(SearchError::WorkLimitExceeded { limit, .. }) if limit == measured - 1
+        ));
     }
 
     #[test]
@@ -17117,6 +17637,7 @@ mod tests {
             super::LazyTransition::Inline {
                 accepted: false,
                 pending: true,
+                ..
             }
         ));
         assert!(!retryable.lazy.saturated);
