@@ -1468,17 +1468,32 @@ impl NativeExactByteSet {
     }
 }
 
+const MAX_AARCH64_EXACT_SVE2_MATCH_TABLES: u8 = 4;
+
+/// Optional SVE2 MATCH representation of the smaller side of one exact set.
+///
+/// Up to four replicated 16-byte tables beat the fixed nibble classifier.
+/// Dense sets store their complement and invert the resulting predicate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeExactSve2MatchStorage {
+    table_base: u32,
+    table_count: u8,
+    complement: bool,
+}
+
 /// Exact-set table addresses installed transactionally after all established
 /// DFA and prefix data. The bitmap is always present for deterministic
-/// cross-target inspection; AArch64 additionally uses the byte-indexed LUT in
-/// its scalar lowering. `nibble_base` names three logical 16-byte
-/// tables. AArch64 stores them directly, while x86 duplicates each 128-bit
-/// table into both AVX2 lanes and appends one duplicated `0x0f` index mask.
+/// cross-target inspection; `AArch64` additionally uses the byte-indexed LUT in
+/// its scalar lowering. `nibble_base` names three logical 16-byte tables.
+/// `AArch64` stores them directly, while x86 duplicates each 128-bit table into
+/// both AVX2 lanes and appends one duplicated `0x0f` index mask. Sparse SVE2
+/// sets append an independently authenticated MATCH representation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NativeExactByteSetStorage {
     bitmap_offset: u32,
     aarch64_lut_offset: Option<u32>,
     nibble_base: u32,
+    sve2_match: Option<NativeExactSve2MatchStorage>,
 }
 
 /// Exact complement of a DFA-proven all-state reset set.
@@ -3425,10 +3440,33 @@ fn append_native_exact_byte_set(
     } else {
         AARCH64_NIBBLE_BYTES
     };
-    let end = nibble_aligned
+    let nibble_end = nibble_aligned
         .checked_add(nibble_bytes)
         .ok_or(ObjectError::ArithmeticOverflow(
             "native exact-set nibble-table bytes",
+        ))?;
+    let minority_count = usize::from(set.cardinality.min(256 - set.cardinality));
+    let sve2_match_table_count = minority_count
+        .checked_add(NIBBLE_TABLE_BYTES - 1)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "native exact-set SVE2 table count",
+        ))?
+        / NIBBLE_TABLE_BYTES;
+    let install_sve2_match = architecture == Architecture::Aarch64
+        && sve2_match_table_count <= usize::from(MAX_AARCH64_EXACT_SVE2_MATCH_TABLES);
+    let sve2_match_bytes = if install_sve2_match {
+        sve2_match_table_count
+            .checked_mul(NIBBLE_TABLE_BYTES)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "native exact-set SVE2 table bytes",
+            ))?
+    } else {
+        0
+    };
+    let end = nibble_end
+        .checked_add(sve2_match_bytes)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "native exact-set SVE2 table extent",
         ))?;
     if end > maximum_table_bytes {
         return Ok(None);
@@ -3502,6 +3540,49 @@ fn append_native_exact_byte_set(
         bytes.extend_from_slice(&[0x0f; NIBBLE_TABLE_BYTES]);
         bytes.extend_from_slice(&[0x0f; NIBBLE_TABLE_BYTES]);
     }
+    if bytes.len() != nibble_end {
+        return Err(ObjectError::InvalidModule(
+            "native exact-set nibble constants changed extent",
+        ));
+    }
+    let sve2_match = if install_sve2_match {
+        let table_base = u32::try_from(nibble_end)
+            .map_err(|_| ObjectError::ArithmeticOverflow("native exact-set SVE2 table offset"))?;
+        let complement = set.cardinality > 128;
+        let mut first = None;
+        let mut emitted = 0_usize;
+        for byte in u8::MIN..=u8::MAX {
+            if set.contains(byte) != complement {
+                first.get_or_insert(byte);
+                bytes.push(byte);
+                emitted = emitted
+                    .checked_add(1)
+                    .ok_or(ObjectError::ArithmeticOverflow(
+                        "native exact-set SVE2 members",
+                    ))?;
+            }
+        }
+        let padding = first.ok_or(ObjectError::InvalidModule(
+            "native exact-set SVE2 representation is empty",
+        ))?;
+        while emitted < sve2_match_bytes {
+            bytes.push(padding);
+            emitted = emitted
+                .checked_add(1)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "native exact-set SVE2 padding",
+                ))?;
+        }
+        Some(NativeExactSve2MatchStorage {
+            table_base,
+            table_count: u8::try_from(sve2_match_table_count).map_err(|_| {
+                ObjectError::ArithmeticOverflow("native exact-set SVE2 table count")
+            })?,
+            complement,
+        })
+    } else {
+        None
+    };
     if bytes.len() != end {
         return Err(ObjectError::InvalidModule(
             "native exact-set constants changed extent",
@@ -3511,6 +3592,7 @@ fn append_native_exact_byte_set(
         bitmap_offset,
         aarch64_lut_offset,
         nibble_base,
+        sve2_match,
     }))
 }
 
@@ -10232,6 +10314,73 @@ fn aarch64_sve_dup_b_imm(destination: u8, immediate: u8) -> Result<u32, ObjectEr
     Ok(0x2538_c000 | (u32::from(immediate) << 5) | aarch64_reg(destination, 0)?)
 }
 
+fn aarch64_sve_tbl_b(destination: u8, table: u8, indices: u8) -> Result<u32, ObjectError> {
+    Ok(0x0520_3000
+        | aarch64_reg(indices, 16)?
+        | aarch64_reg(table, 5)?
+        | aarch64_reg(destination, 0)?)
+}
+
+fn aarch64_sve_lsr_b_by_4(destination: u8, source: u8) -> Result<u32, ObjectError> {
+    Ok(0x042c_9400 | aarch64_reg(source, 5)? | aarch64_reg(destination, 0)?)
+}
+
+fn aarch64_sve_and_z(
+    destination: u8,
+    left: u8,
+    right: u8,
+) -> Result<u32, ObjectError> {
+    // SVE spells the unpredicated bitwise form with D elements; the operation
+    // is bitwise and therefore preserves the byte-lane classifier exactly.
+    Ok(0x0420_3000
+        | aarch64_reg(right, 16)?
+        | aarch64_reg(left, 5)?
+        | aarch64_reg(destination, 0)?)
+}
+
+fn aarch64_sve_cmplt_zero_b(
+    destination: u8,
+    source: u8,
+) -> Result<u32, ObjectError> {
+    if destination > 15 {
+        return Err(ObjectError::InvalidModule("SVE CMPLT predicate"));
+    }
+    Ok(0x2500_2000 | aarch64_reg(source, 5)? | aarch64_reg(destination, 0)?)
+}
+
+fn aarch64_sve_sel_b(
+    destination: u8,
+    predicate: u8,
+    when_set: u8,
+    when_clear: u8,
+) -> Result<u32, ObjectError> {
+    if predicate > 15 {
+        return Err(ObjectError::InvalidModule("SVE SEL predicate"));
+    }
+    Ok(0x0520_c000
+        | aarch64_reg(when_clear, 16)?
+        | (u32::from(predicate) << 10)
+        | aarch64_reg(when_set, 5)?
+        | aarch64_reg(destination, 0)?)
+}
+
+fn aarch64_sve_cmpne_zero_b(
+    destination: u8,
+    source: u8,
+) -> Result<u32, ObjectError> {
+    if destination > 15 {
+        return Err(ObjectError::InvalidModule("SVE CMPNE predicate"));
+    }
+    Ok(0x2500_8010 | aarch64_reg(source, 5)? | aarch64_reg(destination, 0)?)
+}
+
+fn aarch64_sve_not_b(destination: u8, source: u8) -> Result<u32, ObjectError> {
+    if destination > 15 || source > 15 {
+        return Err(ObjectError::InvalidModule("SVE NOT predicate"));
+    }
+    Ok(0x2500_4200 | aarch64_reg(source, 5)? | aarch64_reg(destination, 0)?)
+}
+
 fn aarch64_sve_cmpeq_b(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
     // P0 is the governing predicate; inactive lanes are cleared.
     Ok(
@@ -12066,8 +12215,41 @@ fn aarch64_emit_exact_byte_set_lut_test(
     Ok(())
 }
 
-fn aarch64_emit_exact_asimd_constants(
-    assembler: &mut Aarch64Assembler,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Aarch64ExactSveKind {
+    Nibble,
+    Sve2Match(NativeExactSve2MatchStorage),
+}
+
+impl Aarch64ExactSveKind {
+    const fn scanner_isa(self) -> NativeScannerIsa {
+        match self {
+            Self::Nibble => NativeScannerIsa::Aarch64Sve,
+            Self::Sve2Match(_) => NativeScannerIsa::Aarch64Sve2,
+        }
+    }
+}
+
+fn selected_aarch64_exact_sve_kind(
+    operating_system: OperatingSystem,
+    features: FeatureSet,
+    storage: NativeExactByteSetStorage,
+) -> Option<Aarch64ExactSveKind> {
+    if aarch64_primary_scanner_isa(operating_system, features, true)
+        != Aarch64PrimaryScannerIsa::Sve
+    {
+        return None;
+    }
+    if features.has(CpuFeature::Aarch64Sve2)
+        && let Some(match_storage) = storage.sve2_match
+    {
+        Some(Aarch64ExactSveKind::Sve2Match(match_storage))
+    } else {
+        Some(Aarch64ExactSveKind::Nibble)
+    }
+}
+
+fn aarch64_validate_exact_nibble_storage(
     storage: NativeExactByteSetStorage,
 ) -> Result<(), ObjectError> {
     let lut_end = storage
@@ -12076,13 +12258,181 @@ fn aarch64_emit_exact_asimd_constants(
         .ok_or(ObjectError::InvalidModule(
             "AArch64 exact-set scanner has no bounded LUT",
         ))?;
-    if !storage.nibble_base.is_multiple_of(16)
-        || storage.nibble_base < lut_end
-    {
+    if !storage.nibble_base.is_multiple_of(16) || storage.nibble_base < lut_end {
         return Err(ObjectError::InvalidModule(
             "AArch64 exact-set nibble-table storage is malformed",
         ));
     }
+    Ok(())
+}
+
+fn aarch64_emit_exact_sve_constants(
+    assembler: &mut Aarch64Assembler,
+    storage: NativeExactByteSetStorage,
+    kind: Aarch64ExactSveKind,
+) -> Result<(), ObjectError> {
+    aarch64_validate_exact_nibble_storage(storage)?;
+    assembler.instruction(aarch64_sve_ptrue_b())?;
+    match kind {
+        Aarch64ExactSveKind::Nibble => {
+            aarch64_set_table_address(assembler, 12, storage.nibble_base)?;
+            for register in 16_u8..=18 {
+                assembler.instruction(aarch64_sve_ld1rqb(register, 12)?)?;
+                if register != 18 {
+                    assembler.instruction(aarch64_add_x_imm(12, 12, 16)?)?;
+                }
+            }
+            assembler.instruction(aarch64_sve_dup_b_imm(19, 0x0f)?)?;
+        }
+        Aarch64ExactSveKind::Sve2Match(match_storage) => {
+            if !(1..=MAX_AARCH64_EXACT_SVE2_MATCH_TABLES)
+                .contains(&match_storage.table_count)
+                || !match_storage.table_base.is_multiple_of(16)
+                || match_storage.table_base
+                    != storage.nibble_base.checked_add(48).ok_or(
+                        ObjectError::ArithmeticOverflow("AArch64 exact SVE2 table base"),
+                    )?
+            {
+                return Err(ObjectError::InvalidModule(
+                    "AArch64 exact SVE2 table storage is malformed",
+                ));
+            }
+            aarch64_set_table_address(assembler, 12, match_storage.table_base)?;
+            for table in 0..match_storage.table_count {
+                let register = 16_u8
+                    .checked_add(table)
+                    .ok_or(ObjectError::ArithmeticOverflow(
+                        "AArch64 exact SVE2 table register",
+                    ))?;
+                assembler.instruction(aarch64_sve_ld1rqb(register, 12)?)?;
+                if table.checked_add(1) != Some(match_storage.table_count) {
+                    assembler.instruction(aarch64_add_x_imm(12, 12, 16)?)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Produce one exact scalable candidate predicate in P1.
+///
+/// The base-SVE route is the same exact three-table nibble classifier as the
+/// fixed-width backends. SVE2 MATCH is selected only when at most four
+/// minority-side tables were installed; dense sets invert that exact union
+/// under P0, so inactive tail lanes always remain clear.
+fn aarch64_emit_exact_sve_candidates(
+    assembler: &mut Aarch64Assembler,
+    kind: Aarch64ExactSveKind,
+    scan_offset: u8,
+) -> Result<(), ObjectError> {
+    aarch64_emit_start_filter_address(assembler, scan_offset)?;
+    assembler.instruction(aarch64_sve_ld1b_vl(0, 12, 0)?)?;
+    match kind {
+        Aarch64ExactSveKind::Nibble => {
+            assembler.instruction(aarch64_sve_lsr_b_by_4(4, 0)?)?;
+            assembler.instruction(aarch64_sve_and_z(5, 0, 19)?)?;
+            assembler.instruction(aarch64_sve_tbl_b(6, 16, 5)?)?;
+            assembler.instruction(aarch64_sve_tbl_b(7, 17, 5)?)?;
+            assembler.instruction(aarch64_sve_cmplt_zero_b(2, 0)?)?;
+            assembler.instruction(aarch64_sve_sel_b(6, 2, 7, 6)?)?;
+            assembler.instruction(aarch64_sve_tbl_b(4, 18, 4)?)?;
+            assembler.instruction(aarch64_sve_and_z(6, 6, 4)?)?;
+            assembler.instruction(aarch64_sve_cmpne_zero_b(1, 6)?)?;
+        }
+        Aarch64ExactSveKind::Sve2Match(match_storage) => {
+            for table in 0..match_storage.table_count {
+                let table_register = 16_u8
+                    .checked_add(table)
+                    .ok_or(ObjectError::ArithmeticOverflow(
+                        "AArch64 exact SVE2 table register",
+                    ))?;
+                let destination = if table == 0 { 1 } else { 2 };
+                assembler.instruction(aarch64_sve2_match_b(
+                    destination,
+                    0,
+                    table_register,
+                )?)?;
+                if table != 0 {
+                    assembler.instruction(aarch64_sve_orr_b(1, 1, 2)?)?;
+                }
+            }
+            if match_storage.complement {
+                assembler.instruction(aarch64_sve_not_b(1, 1)?)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn aarch64_emit_exact_sve_scanner(
+    assembler: &mut Aarch64Assembler,
+    exact: NativeExactByteSet,
+    kind: Aarch64ExactSveKind,
+    vector: Aarch64Label,
+    scalar: Aarch64Label,
+    candidate: Aarch64Label,
+) -> Result<(), ObjectError> {
+    let single = assembler.label()?;
+    let partial = assembler.label()?;
+    let hit = assembler.label()?;
+
+    assembler.bind(vector)?;
+    assembler.instruction(aarch64_sve_ptrue_b())?;
+    assembler.instruction(aarch64_sve_cntb(6)?)?;
+    assembler.bind(single)?;
+    assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+    if exact.scan_offset != 0 {
+        assembler.instruction(aarch64_cmp_x_imm(12, u16::from(exact.scan_offset))?)?;
+        assembler.branch_cond(AARCH64_LS, scalar)?;
+        assembler.instruction(aarch64_sub_x_imm(
+            12,
+            12,
+            u16::from(exact.scan_offset),
+        )?)?;
+    }
+    assembler.instruction(aarch64_cmp_x(12, 6)?)?;
+    assembler.branch_cond(AARCH64_LO, partial)?;
+    aarch64_emit_exact_sve_candidates(assembler, kind, exact.scan_offset)?;
+    assembler.instruction(aarch64_sve_ptest_p0(1)?)?;
+    assembler.branch_cond(AARCH64_NE, hit)?;
+    assembler.instruction(aarch64_sve_addvl(2, 2, 1)?)?;
+    assembler.branch(single)?;
+
+    assembler.bind(partial)?;
+    let partial_end = if exact.scan_offset == 0 {
+        3
+    } else {
+        assembler.instruction(aarch64_sub_x_imm(
+            12,
+            3,
+            u16::from(exact.scan_offset),
+        )?)?;
+        12
+    };
+    assembler.instruction(aarch64_sve_whilelo_b(0, 2, partial_end)?)?;
+    aarch64_emit_exact_sve_candidates(assembler, kind, exact.scan_offset)?;
+    assembler.instruction(aarch64_sve_ptest_p0(1)?)?;
+    assembler.branch_cond(AARCH64_NE, hit)?;
+    if exact.scan_offset == 0 {
+        assembler.instruction(aarch64_mov_x(2, 3)?)?;
+    } else {
+        assembler.instruction(aarch64_sub_x_imm(
+            2,
+            3,
+            u16::from(exact.scan_offset),
+        )?)?;
+    }
+    assembler.branch(scalar)?;
+
+    assembler.bind(hit)?;
+    aarch64_emit_sve_first_candidate(assembler, 1, candidate)
+}
+
+fn aarch64_emit_exact_asimd_constants(
+    assembler: &mut Aarch64Assembler,
+    storage: NativeExactByteSetStorage,
+) -> Result<(), ObjectError> {
+    aarch64_validate_exact_nibble_storage(storage)?;
     aarch64_set_table_address(assembler, 6, storage.nibble_base)?;
     assembler.instruction(aarch64_ld1_three_16b(16, 6)?)?;
     assembler.instruction(aarch64_movi_16b(19, 0x0f)?)?;
@@ -12656,6 +13006,12 @@ fn lower_aarch64_dfa_for_operating_system_with_emission(
             .is_some_and(|filter| !filter.ranges().is_empty());
     let use_exact_asimd = features.has(CpuFeature::Aarch64Asimd)
         && layout.exact_start_byte_set.is_some();
+    let exact_sve_kind = layout
+        .exact_start_storage
+        .filter(|_| layout.exact_start_byte_set.is_some())
+        .and_then(|storage| {
+            selected_aarch64_exact_sve_kind(operating_system, features, storage)
+        });
     let mut scanner_emission = None;
     let sve_suffix_kind = selected_aarch64_sve_suffix_kind(layout, features, operating_system);
     let use_asimd_suffix = features.has(CpuFeature::Aarch64Asimd)
@@ -12792,6 +13148,11 @@ fn lower_aarch64_dfa_for_operating_system_with_emission(
             "AArch64 ASIMD exact scanner has no canonical storage",
         ))?;
         aarch64_emit_exact_asimd_constants(&mut assembler, storage)?;
+    } else if let Some(kind) = exact_sve_kind {
+        let storage = layout.exact_start_storage.ok_or(ObjectError::InvalidModule(
+            "AArch64 SVE exact scanner has no canonical storage",
+        ))?;
+        aarch64_emit_exact_sve_constants(&mut assembler, storage, kind)?;
     }
     let mut filter_batch_first_candidates = None;
 
@@ -13111,12 +13472,17 @@ fn lower_aarch64_dfa_for_operating_system_with_emission(
         scanner_emission = Some(NativeScannerEmission {
             scan_offset: exact.scan_offset,
             membership: exact.membership,
-            isa: if use_exact_asimd {
-                NativeScannerIsa::Aarch64Asimd
-            } else {
-                NativeScannerIsa::Aarch64ScalarLut
-            },
-            vectorized: use_exact_asimd,
+            isa: exact_sve_kind.map_or_else(
+                || {
+                    if use_exact_asimd {
+                        NativeScannerIsa::Aarch64Asimd
+                    } else {
+                        NativeScannerIsa::Aarch64ScalarLut
+                    }
+                },
+                Aarch64ExactSveKind::scanner_isa,
+            ),
+            vectorized: use_exact_asimd || exact_sve_kind.is_some(),
         });
         if layout.output != OutputContract::Exists {
             assembler.instruction(aarch64_cmp_x(7, 13)?)?;
@@ -13127,7 +13493,17 @@ fn lower_aarch64_dfa_for_operating_system_with_emission(
         assembler.branch_cond(AARCH64_NE, scalar_scan)?;
         let exact_scalar = assembler.label()?;
         let exact_scalar_loop = assembler.label()?;
-        if use_exact_asimd {
+        if let Some(kind) = exact_sve_kind {
+            let exact_vector = assembler.label()?;
+            aarch64_emit_exact_sve_scanner(
+                &mut assembler,
+                exact,
+                kind,
+                exact_vector,
+                exact_scalar,
+                candidate,
+            )?;
+        } else if use_exact_asimd {
             let exact_vector = assembler.label()?;
             let exact_vector_hit = assembler.label()?;
             assembler.bind(exact_vector)?;
@@ -13759,6 +14135,26 @@ mod tests {
 
     #[allow(
         clippy::arithmetic_side_effects,
+        reason = "validated exact-set test storage bounds every table slice"
+    )]
+    fn exact_sve2_match_contains(
+        bytes: &[u8],
+        storage: NativeExactByteSetStorage,
+        byte: u8,
+    ) -> Option<bool> {
+        let match_storage = storage.sve2_match?;
+        let start = usize::try_from(match_storage.table_base).expect("SVE2 table offset");
+        let end = start + usize::from(match_storage.table_count) * 16;
+        let minority_contains = bytes[start..end].contains(&byte);
+        Some(if match_storage.complement {
+            !minority_contains
+        } else {
+            minority_contains
+        })
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
         reason = "the exhaustive oracle bounds every test index by its allocated haystack"
     )]
     fn exact_nibble_first_candidate(
@@ -13782,6 +14178,58 @@ mod tests {
                 return Some(position);
             }
             position = position.checked_add(1)?;
+        }
+        None
+    }
+
+    fn exact_sve_model_contains(
+        bytes: &[u8],
+        storage: NativeExactByteSetStorage,
+        tables: NativeExactNibbleTables,
+        kind: Aarch64ExactSveKind,
+        byte: u8,
+    ) -> bool {
+        match kind {
+            Aarch64ExactSveKind::Nibble => tables.contains(byte),
+            Aarch64ExactSveKind::Sve2Match(_) => exact_sve2_match_contains(bytes, storage, byte)
+                .expect("SVE2 model has installed match tables"),
+        }
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::too_many_arguments,
+        reason = "the scalable-vector oracle checks every addition before slicing"
+    )]
+    fn exact_sve_first_candidate(
+        bytes: &[u8],
+        storage: NativeExactByteSetStorage,
+        tables: NativeExactNibbleTables,
+        kind: Aarch64ExactSveKind,
+        haystack: &[u8],
+        mut position: usize,
+        end: usize,
+        scan_offset: usize,
+        vector_length: usize,
+    ) -> Option<usize> {
+        assert!((16..=256).contains(&vector_length) && vector_length.is_multiple_of(16));
+        while position.checked_add(scan_offset)? < end {
+            let active = end
+                .checked_sub(position.checked_add(scan_offset)?)?
+                .min(vector_length);
+            let source = position.checked_add(scan_offset)?;
+            if let Some(lane) = (0..active).find(|&lane| {
+                exact_sve_model_contains(
+                    bytes,
+                    storage,
+                    tables,
+                    kind,
+                    haystack[source + lane],
+                )
+            }) {
+                return position.checked_add(lane);
+            }
+            position = position.checked_add(active)?;
         }
         None
     }
@@ -14063,6 +14511,7 @@ mod tests {
                 bitmap_offset: u32::try_from(i32::MAX).unwrap(),
                 aarch64_lut_offset: None,
                 nibble_base: 0,
+                sve2_match: None,
             })
             .unwrap(),
             i32::MAX
@@ -14072,6 +14521,7 @@ mod tests {
                 bitmap_offset: u32::try_from(i32::MAX).unwrap() + 1,
                 aarch64_lut_offset: None,
                 nibble_base: 0,
+                sve2_match: None,
             })
             .is_err()
         );
@@ -14080,6 +14530,7 @@ mod tests {
             bitmap_offset: 0,
             aarch64_lut_offset: None,
             nibble_base: maximum_nibble_offset,
+            sve2_match: None,
         };
         assert_eq!(
             x86_exact_nibble_displacement(maximum_nibble_storage, 3).unwrap(),
@@ -14140,6 +14591,17 @@ mod tests {
                     storage.aarch64_lut_offset.is_some(),
                     architecture == Architecture::Aarch64
                 );
+                let expected_sve2_match = architecture == Architecture::Aarch64
+                    && cardinality.min(256 - cardinality) <= 64;
+                assert_eq!(storage.sve2_match.is_some(), expected_sve2_match);
+                if let Some(match_storage) = storage.sve2_match {
+                    assert_eq!(match_storage.table_base, storage.nibble_base + 48);
+                    assert_eq!(
+                        usize::from(match_storage.table_count),
+                        usize::from(cardinality.min(256 - cardinality)).div_ceil(16)
+                    );
+                    assert_eq!(match_storage.complement, cardinality > 128);
+                }
                 let nibble_tables =
                     exact_nibble_tables_from_storage(&bytes, storage, architecture);
                 for byte in u8::MIN..=u8::MAX {
@@ -14153,18 +14615,28 @@ mod tests {
                         expected[usize::from(byte)],
                         "nibble {architecture:?}, cardinality={cardinality}, byte={byte}"
                     );
+                    if let Some(match_contains) =
+                        exact_sve2_match_contains(&bytes, storage, byte)
+                    {
+                        assert_eq!(
+                            match_contains,
+                            expected[usize::from(byte)],
+                            "SVE2 MATCH {architecture:?}, cardinality={cardinality}, byte={byte}"
+                        );
+                    }
                 }
             }
         }
 
-        let (set, _) = exact_membership_with_cardinality(129);
+        let (set, _) = exact_membership_with_cardinality(64);
         for architecture in [Architecture::X86_64, Architecture::Aarch64] {
             let mut bytes = vec![0x5a; 7];
             let original = bytes.clone();
             let required = if architecture == Architecture::Aarch64 {
                 // Bitmap 8..40, scalar LUT 40..296, 8 bytes of alignment,
-                // and three logical 16-byte nibble tables.
-                352
+                // three logical 16-byte nibble tables, and four SVE2 MATCH
+                // tables containing the exact 64-byte minority side.
+                416
             } else {
                 // Bitmap 8..40, 24 bytes of alignment, three duplicated
                 // nibble tables and one duplicated low-nibble mask.
@@ -14359,6 +14831,114 @@ mod tests {
                             Some(first),
                             "cardinality={cardinality}, width={vector_width}, offset={scan_offset}, first={first}"
                         );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::too_many_lines,
+        reason = "all scalable VL, alignment, tail, and lane indices are bounded by test allocations"
+    )]
+    fn exact_sve_models_exhaust_scalable_lengths_predicated_tails_and_first_hits() {
+        for cardinality in [64_u16, 65, 192] {
+            let (set, expected) = exact_membership_with_cardinality(cardinality);
+            let tables = NativeExactNibbleTables::from_set(set);
+            let mut bytes = Vec::new();
+            let storage = append_native_exact_byte_set(
+                &mut bytes,
+                set,
+                Architecture::Aarch64,
+                usize::MAX,
+            )
+            .unwrap()
+            .unwrap();
+            let mut kinds = vec![Aarch64ExactSveKind::Nibble];
+            if let Some(match_storage) = storage.sve2_match {
+                kinds.push(Aarch64ExactSveKind::Sve2Match(match_storage));
+            }
+            let member = (u8::MIN..=u8::MAX)
+                .find(|&byte| expected[usize::from(byte)])
+                .expect("nonempty exact set");
+            let nonmember = (u8::MIN..=u8::MAX)
+                .find(|&byte| !expected[usize::from(byte)])
+                .expect("nonuniversal exact set");
+
+            for kind in kinds {
+                for vector_length in (16_usize..=256).step_by(16) {
+                    for scan_offset in [0_usize, 255] {
+                        // Every unaligned start residue selects the same lane,
+                        // including hits after one completely rejected vector.
+                        for alignment in 0..vector_length {
+                            let lane = (usize::from(cardinality) + alignment) % vector_length;
+                            let expected_position = alignment + vector_length + lane;
+                            let mut haystack = vec![
+                                nonmember;
+                                scan_offset + expected_position + vector_length + 1
+                            ];
+                            haystack[scan_offset + expected_position] = member;
+                            assert_eq!(
+                                exact_sve_first_candidate(
+                                    &bytes,
+                                    storage,
+                                    tables,
+                                    kind,
+                                    &haystack,
+                                    alignment,
+                                    haystack.len(),
+                                    scan_offset,
+                                    vector_length,
+                                ),
+                                Some(expected_position),
+                                "cardinality={cardinality}, kind={kind:?}, VL={vector_length}, offset={scan_offset}, alignment={alignment}"
+                            );
+                        }
+
+                        // Exhaust every architectural tail length and every
+                        // possible first active hit. A second adjacent member
+                        // proves that first-lane selection remains ordered.
+                        for tail in 0..=vector_length {
+                            let empty = vec![nonmember; scan_offset + tail];
+                            assert_eq!(
+                                exact_sve_first_candidate(
+                                    &bytes,
+                                    storage,
+                                    tables,
+                                    kind,
+                                    &empty,
+                                    0,
+                                    empty.len(),
+                                    scan_offset,
+                                    vector_length,
+                                ),
+                                None
+                            );
+                            for first in 0..tail {
+                                let mut haystack = vec![nonmember; scan_offset + tail];
+                                haystack[scan_offset + first] = member;
+                                if first + 1 < tail {
+                                    haystack[scan_offset + first + 1] = member;
+                                }
+                                assert_eq!(
+                                    exact_sve_first_candidate(
+                                        &bytes,
+                                        storage,
+                                        tables,
+                                        kind,
+                                        &haystack,
+                                        0,
+                                        haystack.len(),
+                                        scan_offset,
+                                        vector_length,
+                                    ),
+                                    Some(first),
+                                    "cardinality={cardinality}, kind={kind:?}, VL={vector_length}, offset={scan_offset}, tail={tail}, first={first}"
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -14584,6 +15164,148 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one SVE test keeps base, sparse MATCH, and complement MATCH receipts auditable"
+    )]
+    fn exact_sve_and_sve2_backends_emit_authenticated_vector_receipts() {
+        let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
+        let sve2 = sve.with(CpuFeature::Aarch64Sve2);
+
+        let base = complete_forward_resource_fallback(
+            r"(?-u:[\x00-\x40])+",
+            OutputContract::Exists,
+            Target::aarch64_linux().with_features(sve).unwrap(),
+        );
+        let base_view = base
+            .program()
+            .native_dfa_view()
+            .expect("base-SVE exact native view");
+        let base_requirement = base_view
+            .retained_prefix_requirement
+            .expect("base-SVE exact retained primary");
+        let (_, base_layout) =
+            build_native_dfa_table_for_architecture(base_view, Architecture::Aarch64).unwrap();
+        assert!(
+            base_layout
+                .exact_start_storage
+                .expect("base-SVE exact storage")
+                .sve2_match
+                .is_none(),
+            "65-byte minority must use the fixed-cost nibble route"
+        );
+        let base_emission = lower_aarch64_dfa_for_operating_system_with_emission(
+            base_layout,
+            sve,
+            OperatingSystem::Linux,
+            None,
+        )
+        .unwrap();
+        let base_receipt = base_emission
+            .scanner
+            .expect("base-SVE exact scanner receipt");
+        assert_eq!(base_receipt.isa, NativeScannerIsa::Aarch64Sve);
+        assert!(base_receipt.vectorized);
+        assert!(retained_prefix_scanner_is_preserved(
+            Some(base_receipt),
+            base_requirement
+        ));
+        let base_words = base_emission
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        for instruction in [
+            aarch64_sve_ld1rqb(16, 12).unwrap(),
+            aarch64_sve_ld1rqb(17, 12).unwrap(),
+            aarch64_sve_ld1rqb(18, 12).unwrap(),
+            aarch64_sve_lsr_b_by_4(4, 0).unwrap(),
+            aarch64_sve_tbl_b(6, 16, 5).unwrap(),
+            aarch64_sve_tbl_b(7, 17, 5).unwrap(),
+            aarch64_sve_tbl_b(4, 18, 4).unwrap(),
+            aarch64_sve_cmpne_zero_b(1, 6).unwrap(),
+            aarch64_sve_whilelo_b(0, 2, 3).unwrap(),
+            aarch64_sve_addvl(2, 2, 1).unwrap(),
+        ] {
+            assert!(
+                base_words.contains(&instruction),
+                "base-SVE exact classifier is missing {instruction:#010x}"
+            );
+        }
+        assert!(!base_words.contains(&aarch64_sve2_match_b(1, 0, 16).unwrap()));
+
+        for (pattern, cardinality, table_count, complement) in [
+            (r"(?-u:[ACEGIKMOQ])+", 9_u32, 1_u8, false),
+            (r"(?-u:[ACEGIKMOQSUWYaceg])+", 17, 2, false),
+            (r"(?-u:[^ACEGIKMOQ])+", 247, 1, true),
+        ] {
+            let compiled = complete_forward_resource_fallback(
+                pattern,
+                OutputContract::SelectedEnd,
+                Target::aarch64_linux().with_features(sve2).unwrap(),
+            );
+            let view = compiled
+                .program()
+                .native_dfa_view()
+                .expect("SVE2 exact native view");
+            let requirement = view
+                .retained_prefix_requirement
+                .expect("SVE2 exact retained primary");
+            assert_eq!(
+                requirement
+                    .membership
+                    .iter()
+                    .map(|word| word.count_ones())
+                    .sum::<u32>(),
+                cardinality
+            );
+            let (_, layout) =
+                build_native_dfa_table_for_architecture(view, Architecture::Aarch64).unwrap();
+            let match_storage = layout
+                .exact_start_storage
+                .expect("SVE2 exact storage")
+                .sve2_match
+                .expect("SVE2 minority tables");
+            assert_eq!(match_storage.table_count, table_count);
+            assert_eq!(match_storage.complement, complement);
+            let emission = lower_aarch64_dfa_for_operating_system_with_emission(
+                layout,
+                sve2,
+                OperatingSystem::Linux,
+                None,
+            )
+            .unwrap();
+            let receipt = emission.scanner.expect("SVE2 exact scanner receipt");
+            assert_eq!(receipt.isa, NativeScannerIsa::Aarch64Sve2);
+            assert!(receipt.vectorized);
+            assert!(retained_prefix_scanner_is_preserved(
+                Some(receipt),
+                requirement
+            ));
+            let words = emission
+                .code
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            assert!(words.contains(&aarch64_sve_ld1rqb(16, 12).unwrap()));
+            assert!(words.contains(&aarch64_sve2_match_b(1, 0, 16).unwrap()));
+            assert_eq!(
+                words.contains(&aarch64_sve2_match_b(2, 0, 17).unwrap()),
+                table_count > 1
+            );
+            assert_eq!(
+                words.contains(&aarch64_sve_orr_b(1, 1, 2).unwrap()),
+                table_count > 1
+            );
+            assert_eq!(
+                words.contains(&aarch64_sve_not_b(1, 1).unwrap()),
+                complement
+            );
+            assert!(!words.contains(&aarch64_sve_tbl_b(6, 16, 5).unwrap()));
+        }
+    }
+
+    #[test]
     fn exact_nibble_vector_helpers_have_exact_encodings_and_displacement_boundaries() {
         let cases = [
             (0_u8, vec![0xc5, 0xfe, 0x6f, 0x04, 0x17]),
@@ -14617,9 +15339,28 @@ mod tests {
         assert_eq!(aarch64_tbl1_16b(20, 18, 20).unwrap(), 0x4e14_0254);
         assert_eq!(aarch64_cmtst_16b(24, 24, 24).unwrap(), 0x4e38_8f18);
         assert!(aarch64_ld1_three_16b(30, 6).is_err());
+
+        // Independently assembled with the base-SVE and SVE2 architectural
+        // feature sets. The arbitrary-set nibble route uses only base SVE;
+        // MATCH and predicate inversion are the authenticated SVE2 route.
+        assert_eq!(aarch64_sve_tbl_b(4, 16, 5).unwrap(), 0x0525_3204);
+        assert_eq!(aarch64_sve_lsr_b_by_4(5, 0).unwrap(), 0x042c_9405);
+        assert_eq!(aarch64_sve_and_z(6, 0, 19).unwrap(), 0x0433_3006);
+        assert_eq!(aarch64_sve_cmplt_zero_b(1, 0).unwrap(), 0x2500_2001);
+        assert_eq!(aarch64_sve_sel_b(7, 1, 17, 16).unwrap(), 0x0530_c627);
+        assert_eq!(aarch64_sve_cmpne_zero_b(2, 7).unwrap(), 0x2500_80f2);
+        assert_eq!(aarch64_sve_not_b(1, 1).unwrap(), 0x2500_4221);
+        assert!(aarch64_sve_cmplt_zero_b(16, 0).is_err());
+        assert!(aarch64_sve_sel_b(0, 16, 0, 0).is_err());
+        assert!(aarch64_sve_cmpne_zero_b(16, 0).is_err());
+        assert!(aarch64_sve_not_b(0, 16).is_err());
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one publication matrix keeps every output, target, relocation, and receipt together"
+    )]
     fn exact_vector_publication_covers_all_outputs_and_supported_operating_systems() {
         let targets = [
             (
@@ -14646,6 +15387,23 @@ mod tests {
                     .unwrap(),
                 StartAccelerator::Aarch64Asimd,
             ),
+            (
+                Target::aarch64_linux()
+                    .with_features(FeatureSet::of(CpuFeature::Aarch64Sve))
+                    .unwrap(),
+                StartAccelerator::Aarch64Sve,
+            ),
+            (
+                Target::aarch64_linux()
+                    .with_features(
+                        FeatureSet::of(CpuFeature::Aarch64Sve)
+                            .with(CpuFeature::Aarch64Sve2),
+                    )
+                    .unwrap(),
+                // This 65-byte minority exceeds the bounded MATCH cost, so
+                // an SVE2-capable target truthfully receipts base SVE.
+                StartAccelerator::Aarch64Sve,
+            ),
         ];
         for output in [
             OutputContract::Exists,
@@ -14653,7 +15411,7 @@ mod tests {
             OutputContract::Span,
         ] {
             let pattern = if output == OutputContract::Span {
-                r"(?-u:[\x00-\x40])cdefghij(?-u:.){8}"
+                r"(?-u:[\x00-\x40]){17}"
             } else {
                 r"(?-u:[\x00-\x40])+"
             };
@@ -14668,7 +15426,11 @@ mod tests {
                 );
                 assert!(compiled.module().required_runtime_symbol().is_none());
                 assert!(compiled.module().required_runtime_program().is_none());
-                assert_eq!(compiled.module().start_accelerator(), accelerator);
+                assert_eq!(
+                    compiled.module().start_accelerator(),
+                    accelerator,
+                    "{output:?}/{target:?}"
+                );
                 assert!(
                     compiled.module().relocations().iter().all(|relocation| {
                         relocation.section == TEXT_SECTION
@@ -14688,14 +15450,46 @@ mod tests {
             }
         }
 
-        // These are explicit future tiers. Neither a baseline x86 object nor a
-        // pure SVE/SVE2 object may claim that AVX2/ASIMD code was emitted.
+        let sve2_target = Target::aarch64_linux()
+            .with_features(
+                FeatureSet::of(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2),
+            )
+            .unwrap();
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let pattern = if output == OutputContract::Span {
+                r"(?-u:[ACEGIKMOQ]){17}"
+            } else {
+                r"(?-u:[ACEGIKMOQ])+"
+            };
+            let compiled = complete_forward_resource_fallback(pattern, output, sve2_target);
+            assert!(!compiled.receipt().runtime_helper_required, "{output:?}");
+            assert!(compiled.module().required_runtime_symbol().is_none());
+            assert!(compiled.module().required_runtime_program().is_none());
+            assert_eq!(
+                compiled.module().start_accelerator(),
+                StartAccelerator::Aarch64Sve2
+            );
+            assert!(compiled.module().relocations().iter().all(|relocation| {
+                relocation.section == TEXT_SECTION
+                    && relocation.symbol == PROGRAM_SYMBOL
+                    && usize::try_from(relocation.offset).is_ok_and(|offset| {
+                        offset < compiled.module().sections()[TEXT_SECTION].bytes().len()
+                    })
+            }));
+        }
+
+        // A baseline x86 object and macOS targets without ASIMD still cannot
+        // claim an exact vector scanner that their emitted code does not have.
         for target in [
             Target::x86_64_linux(),
-            Target::aarch64_linux()
+            Target::aarch64_macos()
                 .with_features(FeatureSet::of(CpuFeature::Aarch64Sve))
                 .unwrap(),
-            Target::aarch64_linux()
+            Target::aarch64_macos()
                 .with_features(
                     FeatureSet::of(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2),
                 )
