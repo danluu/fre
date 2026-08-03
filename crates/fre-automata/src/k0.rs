@@ -69,6 +69,17 @@ const _: () = assert!(BYTE_ALPHABET == 1 << 8);
 const LAZY_MAX_STATES: usize = 256;
 const _: () = assert!(LAZY_MAX_STATES <= usize::MAX / BYTE_ALPHABET);
 const LAZY_MAX_ITEMS: usize = 16_384;
+// Contiguous metadata wins for small retained sets. At sixteen identities the
+// fixed hash index crosses over safely in source-independent lookup stress.
+// Its arena is preallocated, but remains untouched until the sixteenth state
+// is published so smaller warmed caches execute the original linear path.
+const LAZY_HASH_INDEX_MIN_STATES: usize = 16;
+const _: () = assert!(LAZY_HASH_INDEX_MIN_STATES <= LAZY_MAX_STATES);
+const LAZY_HASH_INDEX_BOOTSTRAP_MAX_PROBES: usize =
+    LAZY_HASH_INDEX_MIN_STATES * (LAZY_HASH_INDEX_MIN_STATES - 1) / 2;
+const LAZY_HASH_INDEX_MAX_SLOTS: usize = LAZY_MAX_STATES * 2;
+const LAZY_HASH_INDEX_BOOTSTRAP_WORDS: usize = LAZY_HASH_INDEX_MAX_SLOTS / 64;
+const _: () = assert!(LAZY_HASH_INDEX_BOOTSTRAP_WORDS * 64 == LAZY_HASH_INDEX_MAX_SLOTS);
 const EXACT_LAZY_CAPACITY_MAX_ITEMS: usize = 3;
 const LAZY_CELL_ACCEPT: u32 = 1 << 31;
 const LAZY_CELL_RESTART: u32 = 1 << 30;
@@ -862,7 +873,10 @@ impl WorkspaceLayout {
         } else {
             // The contextual store replaces the direct-row allocation.
             7usize
-                .checked_add(usize::from(lazy_item_capacity != 0))
+                .checked_add(usize::from(
+                    lazy_state_capacity >= LAZY_HASH_INDEX_MIN_STATES,
+                ))
+                .and_then(|value| value.checked_add(usize::from(lazy_item_capacity != 0)))
                 .ok_or(SearchError::ArithmeticOverflow {
                     computation: "lazy workspace allocation count",
                 })?
@@ -998,6 +1012,12 @@ enum LazyInterned {
     CapacityFull,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LazyIndexProbe {
+    State(u32),
+    Vacant(usize),
+}
+
 fn validate_lazy_capacity_full(
     item_universe: usize,
     detail: &'static str,
@@ -1109,6 +1129,7 @@ struct LazyWorkspace {
     lengths: Vec<u32>,
     modes: Vec<u8>,
     hashes: Vec<u64>,
+    index: Vec<u32>,
     items: Vec<u32>,
     state_len: usize,
     item_len: usize,
@@ -1152,6 +1173,11 @@ impl LazyWorkspace {
             lengths: allocate_slots(state_capacity, 0_u32, total_bytes)?,
             modes: allocate_slots(state_capacity, 0_u8, total_bytes)?,
             hashes: allocate_slots(state_capacity, 0_u64, total_bytes)?,
+            index: allocate_slots(
+                lazy_index_slots(state_capacity)?,
+                LAZY_NO_STATE,
+                total_bytes,
+            )?,
             items: allocate_slots(item_capacity, 0_u32, total_bytes)?,
             state_len: 0,
             item_len: 0,
@@ -1177,6 +1203,7 @@ impl LazyWorkspace {
             lengths: Vec::new(),
             modes: Vec::new(),
             hashes: Vec::new(),
+            index: Vec::new(),
             items: Vec::new(),
             state_len: 0,
             item_len: 0,
@@ -1206,6 +1233,7 @@ impl LazyWorkspace {
         let lengths = capacity_bytes::<u32>(&self.lengths, "lazy DFA length bytes")?;
         let modes = capacity_bytes::<u8>(&self.modes, "lazy DFA mode bytes")?;
         let hashes = capacity_bytes::<u64>(&self.hashes, "lazy DFA hash bytes")?;
+        let index = capacity_bytes::<u32>(&self.index, "lazy DFA index bytes")?;
         let items = capacity_bytes::<u32>(&self.items, "lazy DFA item bytes")?;
         scratch
             .checked_add(frontier)
@@ -1215,6 +1243,7 @@ impl LazyWorkspace {
             .and_then(|value| value.checked_add(lengths))
             .and_then(|value| value.checked_add(modes))
             .and_then(|value| value.checked_add(hashes))
+            .and_then(|value| value.checked_add(index))
             .and_then(|value| value.checked_add(items))
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "retained lazy DFA bytes",
@@ -1380,57 +1409,16 @@ impl LazyWorkspace {
         Ok(0)
     }
 
-    fn intern_speculative(
-        &mut self,
+    #[inline]
+    fn probe_identity_linear(
+        &self,
+        hash: u64,
         pending: bool,
+        item_count: usize,
+        item_work: u64,
         meter: &mut WorkMeter,
-        core_reserve: u64,
         position: usize,
-    ) -> Result<LazyInterned, SearchError> {
-        let item_count = self.scratch_len;
-        let item_end =
-            self.item_len
-                .checked_add(item_count)
-                .ok_or(SearchError::ArithmeticOverflow {
-                    computation: "lazy DFA speculative item end",
-                })?;
-        let can_publish = self.state_len < self.offsets.len() && item_end <= self.items.len();
-        let publication_work = if can_publish { item_count.max(1) } else { 0 };
-
-        // Learning is optional. Require the complete worst-case comparison and
-        // publication allowance before doing any of it; otherwise continue
-        // from the already-advanced frontier inline.
-        let comparison = self
-            .state_len
-            .checked_mul(
-                item_count
-                    .checked_add(1)
-                    .ok_or(SearchError::ArithmeticOverflow {
-                        computation: "lazy DFA comparison work",
-                    })?,
-            )
-            .and_then(|work| work.checked_add(item_count))
-            .and_then(|work| work.checked_add(publication_work))
-            .ok_or(SearchError::ArithmeticOverflow {
-                computation: "lazy DFA learning work",
-            })?;
-        let comparison =
-            u64::try_from(comparison).map_err(|_| SearchError::ArithmeticOverflow {
-                computation: "lazy DFA learning work conversion",
-            })?;
-        let remaining = meter.remaining();
-        let Some(optional) = remaining.checked_sub(core_reserve) else {
-            return Ok(LazyInterned::BudgetDeclined);
-        };
-        if comparison > optional {
-            return Ok(LazyInterned::BudgetDeclined);
-        }
-
-        let item_work = u64::try_from(item_count).map_err(|_| SearchError::ArithmeticOverflow {
-            computation: "lazy DFA item work",
-        })?;
-        meter.charge(item_work, position)?;
-        let hash = lazy_hash(&self.scratch[..item_count], pending);
+    ) -> Result<Option<u32>, SearchError> {
         for state in 0..self.state_len {
             meter.charge(1, position)?;
             if self.modes[state] != u8::from(pending)
@@ -1451,18 +1439,242 @@ impl LazyWorkspace {
                 })?;
             meter.charge(item_work, position)?;
             if self.items.get(offset..end) == Some(&self.scratch[..item_count]) {
-                self.scratch_len = 0;
-                return Ok(LazyInterned::State(u32::try_from(state).map_err(|_| {
+                return Ok(Some(u32::try_from(state).map_err(|_| {
                     SearchError::InternalInvariant {
                         detail: "lazy DFA state does not fit u32",
                     }
                 })?));
             }
         }
+        Ok(None)
+    }
+
+    #[inline]
+    fn probe_identity_index(
+        &self,
+        hash: u64,
+        pending: bool,
+        item_count: usize,
+        item_work: u64,
+        meter: &mut WorkMeter,
+        position: usize,
+    ) -> Result<LazyIndexProbe, SearchError> {
+        let mut index_slot = lazy_index_start(hash, self.index.len())?;
+        for _ in 0..self.state_len {
+            let indexed = self.index[index_slot];
+            if indexed == LAZY_NO_STATE {
+                return Ok(LazyIndexProbe::Vacant(index_slot));
+            }
+            meter.charge(1, position)?;
+            let state = usize::try_from(indexed).map_err(|_| SearchError::InternalInvariant {
+                detail: "lazy DFA indexed state does not fit usize",
+            })?;
+            if state >= self.state_len {
+                return Err(SearchError::InternalInvariant {
+                    detail: "lazy DFA index points outside the retained cache",
+                });
+            }
+            index_slot = lazy_index_advance(index_slot, self.index.len())?;
+            if self.modes[state] != u8::from(pending)
+                || self.hashes[state] != hash
+                || usize::try_from(self.lengths[state]).map_err(|_| {
+                    SearchError::InternalInvariant {
+                        detail: "lazy DFA retained length does not fit usize",
+                    }
+                })? != item_count
+            {
+                continue;
+            }
+            let offset = self.offsets[state];
+            let end = offset
+                .checked_add(item_count)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "lazy DFA candidate state end",
+                })?;
+            meter.charge(item_work, position)?;
+            if self.items.get(offset..end) == Some(&self.scratch[..item_count]) {
+                return Ok(LazyIndexProbe::State(indexed));
+            }
+        }
+        if self.index.get(index_slot).copied() != Some(LAZY_NO_STATE) {
+            return Err(SearchError::InternalInvariant {
+                detail: "lazy DFA index has no publication slot",
+            });
+        }
+        Ok(LazyIndexProbe::Vacant(index_slot))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn plan_index_bootstrap(
+        &self,
+        final_hash: u64,
+        meter: &mut WorkMeter,
+        position: usize,
+    ) -> Result<[usize; LAZY_HASH_INDEX_MIN_STATES], SearchError> {
+        if self.index.is_empty()
+            || self.state_len.checked_add(1) != Some(LAZY_HASH_INDEX_MIN_STATES)
+        {
+            return Err(SearchError::InternalInvariant {
+                detail: "lazy DFA index bootstrap is outside its publication boundary",
+            });
+        }
+
+        // Plan every insertion against the earlier planned slots before
+        // publishing any index cell. The preflight reserves the triangular
+        // worst case, so a work decline leaves the sentinel-only arena intact.
+        let mut slots = [usize::MAX; LAZY_HASH_INDEX_MIN_STATES];
+        let mut occupied = [0_u64; LAZY_HASH_INDEX_BOOTSTRAP_WORDS];
+        for (state, planned_slot) in slots.iter_mut().enumerate() {
+            let hash = if state == self.state_len {
+                final_hash
+            } else {
+                self.hashes[state]
+            };
+            let mut slot = lazy_index_start(hash, self.index.len())?;
+            let mut probes = 0usize;
+            loop {
+                let word = slot / 64;
+                let bit = 1_u64 << (slot % 64);
+                let cell = occupied
+                    .get_mut(word)
+                    .ok_or(SearchError::InternalInvariant {
+                        detail: "lazy DFA index bootstrap slot exceeds its fixed bitmap",
+                    })?;
+                if *cell & bit == 0 {
+                    *cell |= bit;
+                    break;
+                }
+                if probes >= state {
+                    return Err(SearchError::InternalInvariant {
+                        detail: "lazy DFA index bootstrap exceeded its occupied prefix",
+                    });
+                }
+                meter.charge(1, position)?;
+                slot = lazy_index_advance(slot, self.index.len())?;
+                probes = probes
+                    .checked_add(1)
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "lazy DFA index bootstrap probes",
+                    })?;
+            }
+            if self.index.get(slot).copied() != Some(LAZY_NO_STATE) {
+                return Err(SearchError::InternalInvariant {
+                    detail: "lazy DFA index bootstrap arena is not untouched",
+                });
+            }
+            *planned_slot = slot;
+        }
+        Ok(slots)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one failure-atomic transaction reserves lookup, publication, and threshold bootstrap"
+    )]
+    fn intern_speculative(
+        &mut self,
+        pending: bool,
+        meter: &mut WorkMeter,
+        core_reserve: u64,
+        position: usize,
+    ) -> Result<LazyInterned, SearchError> {
+        let item_count = self.scratch_len;
+        let item_end =
+            self.item_len
+                .checked_add(item_count)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "lazy DFA speculative item end",
+                })?;
+        let can_publish = self.state_len < self.offsets.len() && item_end <= self.items.len();
+        let publication_work = if can_publish { item_count.max(1) } else { 0 };
+        let use_index = self.state_len >= LAZY_HASH_INDEX_MIN_STATES;
+        let bootstraps_index = can_publish
+            && !self.index.is_empty()
+            && self.state_len.checked_add(1) == Some(LAZY_HASH_INDEX_MIN_STATES);
+        let index_publication_work = if bootstraps_index {
+            LAZY_HASH_INDEX_BOOTSTRAP_MAX_PROBES
+        } else {
+            0
+        };
+
+        // Learning is optional. Require the complete worst-case comparison and
+        // publication allowance before doing any of it; otherwise continue
+        // from the already-advanced frontier inline.
+        let comparison = self
+            .state_len
+            .checked_mul(
+                item_count
+                    .checked_add(1)
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "lazy DFA comparison work",
+                    })?,
+            )
+            .and_then(|work| work.checked_add(item_count))
+            .and_then(|work| work.checked_add(publication_work))
+            .and_then(|work| work.checked_add(index_publication_work))
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "lazy DFA learning work",
+            })?;
+        let comparison =
+            u64::try_from(comparison).map_err(|_| SearchError::ArithmeticOverflow {
+                computation: "lazy DFA learning work conversion",
+            })?;
+        let remaining = meter.remaining();
+        let Some(optional) = remaining.checked_sub(core_reserve) else {
+            return Ok(LazyInterned::BudgetDeclined);
+        };
+        if comparison > optional {
+            return Ok(LazyInterned::BudgetDeclined);
+        }
+
+        let item_work = u64::try_from(item_count).map_err(|_| SearchError::ArithmeticOverflow {
+            computation: "lazy DFA item work",
+        })?;
+        meter.charge(item_work, position)?;
+        let hash = lazy_hash(&self.scratch[..item_count], pending);
+        let insertion_slot = if use_index {
+            match self.probe_identity_index(
+                hash, pending, item_count, item_work, meter, position,
+            )? {
+                LazyIndexProbe::State(state) => {
+                    self.scratch_len = 0;
+                    return Ok(LazyInterned::State(state));
+                }
+                LazyIndexProbe::Vacant(slot) => Some(slot),
+            }
+        } else {
+            if let Some(state) = self.probe_identity_linear(
+                hash, pending, item_count, item_work, meter, position,
+            )? {
+                self.scratch_len = 0;
+                return Ok(LazyInterned::State(state));
+            }
+            None
+        };
 
         if !can_publish {
             return Ok(LazyInterned::CapacityFull);
         }
+        let bootstrap = if bootstraps_index {
+            let slots = self.plan_index_bootstrap(hash, meter, position)?;
+            let mut states = [0_u32; LAZY_HASH_INDEX_MIN_STATES];
+            for (state, encoded) in states.iter_mut().enumerate() {
+                *encoded = u32::try_from(state).map_err(|_| {
+                    SearchError::InternalInvariant {
+                        detail: "lazy DFA bootstrap state does not fit u32",
+                    }
+                })?;
+            }
+            Some((slots, states))
+        } else {
+            None
+        };
+        let indexed_state = u32::try_from(self.state_len).map_err(|_| {
+            SearchError::InternalInvariant {
+                detail: "lazy DFA state does not fit u32",
+            }
+        })?;
         meter.charge(
             u64::try_from(publication_work).map_err(|_| SearchError::ArithmeticOverflow {
                 computation: "lazy DFA publication work conversion",
@@ -1478,6 +1690,14 @@ impl LazyWorkspace {
             })?;
         self.modes[state] = u8::from(pending);
         self.hashes[state] = hash;
+        if let Some(slot) = insertion_slot {
+            self.index[slot] = indexed_state;
+        }
+        if let Some((slots, states)) = bootstrap {
+            for (slot, indexed) in slots.into_iter().zip(states) {
+                self.index[slot] = indexed;
+            }
+        }
         self.item_len = item_end;
         self.state_len = self
             .state_len
@@ -1486,11 +1706,7 @@ impl LazyWorkspace {
                 computation: "lazy DFA state count",
             })?;
         self.scratch_len = 0;
-        Ok(LazyInterned::State(u32::try_from(state).map_err(|_| {
-            SearchError::InternalInvariant {
-                detail: "lazy DFA state does not fit u32",
-            }
-        })?))
+        Ok(LazyInterned::State(indexed_state))
     }
 
     fn retain_scratch_as_frontier(&mut self) -> Result<(), SearchError> {
@@ -10106,6 +10322,46 @@ fn lazy_capacities(automaton: &Automaton) -> Result<(usize, usize), SearchError>
     Ok((state_capacity, item_capacity))
 }
 
+fn lazy_index_slots(state_capacity: usize) -> Result<usize, SearchError> {
+    if state_capacity < LAZY_HASH_INDEX_MIN_STATES {
+        return Ok(0);
+    }
+    state_capacity
+        .checked_mul(2)
+        .and_then(usize::checked_next_power_of_two)
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "lazy DFA index slots",
+        })
+}
+
+fn lazy_index_start(hash: u64, slots: usize) -> Result<usize, SearchError> {
+    let mask = slots
+        .checked_sub(1)
+        .filter(|_| slots.is_power_of_two())
+        .ok_or(SearchError::InternalInvariant {
+            detail: "lazy DFA index does not have power-of-two capacity",
+        })?;
+    let mask = u64::try_from(mask).map_err(|_| SearchError::ArithmeticOverflow {
+        computation: "lazy DFA index mask conversion",
+    })?;
+    usize::try_from(hash & mask).map_err(|_| SearchError::InternalInvariant {
+        detail: "lazy DFA index slot does not fit usize",
+    })
+}
+
+fn lazy_index_advance(slot: usize, slots: usize) -> Result<usize, SearchError> {
+    let next = slot.checked_add(1).ok_or(SearchError::ArithmeticOverflow {
+        computation: "lazy DFA index probe",
+    })?;
+    match next.cmp(&slots) {
+        core::cmp::Ordering::Less => Ok(next),
+        core::cmp::Ordering::Equal => Ok(0),
+        core::cmp::Ordering::Greater => Err(SearchError::InternalInvariant {
+            detail: "lazy DFA index probe starts outside the table",
+        }),
+    }
+}
+
 fn reverse_capacities(automaton: &Automaton) -> Result<(usize, usize), SearchError> {
     let consuming = automaton.stats().consuming_edges();
     if consuming == 0 || consuming > LAZY_MAX_ITEMS {
@@ -10226,6 +10482,7 @@ fn lazy_initialized_slots(
     } else {
         0
     };
+    let index_slots = lazy_index_slots(state_capacity)?;
     states
         .checked_mul(2)
         .and_then(|slots| slots.checked_add(rows))
@@ -10234,6 +10491,7 @@ fn lazy_initialized_slots(
         .and_then(|slots| slots.checked_add(state_capacity))
         .and_then(|slots| slots.checked_add(state_capacity))
         .and_then(|slots| slots.checked_add(state_capacity))
+        .and_then(|slots| slots.checked_add(index_slots))
         .and_then(|slots| slots.checked_add(item_capacity))
         .ok_or(SearchError::ArithmeticOverflow {
             computation: "lazy DFA initialized slots",
@@ -10258,10 +10516,12 @@ fn lazy_scratch_bytes(
     } else {
         0
     };
+    let index_slots = lazy_index_slots(state_capacity)?;
     let state_u32s = states
         .checked_mul(2)
         .and_then(|slots| slots.checked_add(rows))
         .and_then(|slots| slots.checked_add(state_capacity))
+        .and_then(|slots| slots.checked_add(index_slots))
         .and_then(|slots| slots.checked_add(item_capacity))
         .ok_or(SearchError::ArithmeticOverflow {
             computation: "lazy DFA u32 slots",
@@ -11865,6 +12125,236 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
+        reason = "one collision test covers transactional bootstrap, both probe depths, and index integrity"
+    )]
+    fn forward_lazy_identity_lookup_bootstraps_at_threshold_and_authenticates_collisions() {
+        fn stage(workspace: &mut K0Workspace, item: u32) {
+            workspace.lazy.scratch[0] = item;
+            workspace.lazy.scratch_len = 1;
+        }
+
+        fn assert_indexed(workspace: &K0Workspace) {
+            assert_eq!(
+                workspace
+                    .lazy
+                    .index
+                    .iter()
+                    .filter(|&&state| state != super::LAZY_NO_STATE)
+                    .count(),
+                workspace.lazy.state_len
+            );
+            for expected in 0..workspace.lazy.state_len {
+                let mut slot = super::lazy_index_start(
+                    workspace.lazy.hashes[expected],
+                    workspace.lazy.index.len(),
+                )
+                .unwrap();
+                let mut found = false;
+                for _ in 0..workspace.lazy.state_len {
+                    let indexed = workspace.lazy.index[slot];
+                    assert_ne!(indexed, super::LAZY_NO_STATE);
+                    if usize::try_from(indexed).unwrap() == expected {
+                        found = true;
+                        break;
+                    }
+                    slot = super::lazy_index_advance(slot, workspace.lazy.index.len()).unwrap();
+                }
+                assert!(found, "retained state {expected} is absent from its probe chain");
+            }
+        }
+
+        assert_eq!(super::lazy_index_slots(15).unwrap(), 0);
+        assert_eq!(super::lazy_index_slots(16).unwrap(), 32);
+        assert_eq!(super::lazy_index_slots(17).unwrap(), 64);
+        assert!(matches!(
+            super::lazy_index_slots(usize::MAX),
+            Err(SearchError::ArithmeticOverflow {
+                computation: "lazy DFA index slots"
+            })
+        ));
+
+        let tiny = byte_chain(&[(b'a', b'a')]);
+        let tiny_workspace =
+            K0Workspace::new_accelerated(&tiny, WorkspaceLimits::unlimited()).unwrap();
+        assert_eq!(tiny_workspace.lazy.offsets.len(), 3);
+        assert!(tiny_workspace.lazy.index.is_empty());
+
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b'), (b'c', b'c'), (b'd', b'd')]);
+        let mut workspace =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        assert_eq!(workspace.lazy.index.len(), 512);
+
+        stage(&mut workspace, 0);
+        let mut initial = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            workspace.lazy.intern_initial(false, &mut initial, 0),
+            Ok(0)
+        );
+        assert_eq!(initial.consumed, 2);
+        assert!(workspace
+            .lazy
+            .index
+            .iter()
+            .all(|&state| state == super::LAZY_NO_STATE));
+
+        // Even with a preallocated index, small publication is the exact
+        // baseline linear transaction and leaves every index slot untouched.
+        stage(&mut workspace, 512);
+        let mut refused = WorkMeter::new(3, 0);
+        assert_eq!(
+            workspace
+                .lazy
+                .intern_speculative(false, &mut refused, 0, 0),
+            Ok(super::LazyInterned::BudgetDeclined)
+        );
+        assert_eq!(refused.consumed, 0);
+
+        let mut publish = WorkMeter::new(4, 0);
+        assert_eq!(
+            workspace
+                .lazy
+                .intern_speculative(false, &mut publish, 0, 0),
+            Ok(super::LazyInterned::State(1))
+        );
+        assert_eq!(publish.consumed, 3);
+
+        for item in 1..14_u32 {
+            stage(&mut workspace, item);
+            let mut meter = WorkMeter::new(u64::MAX, 0);
+            assert_eq!(
+                workspace
+                    .lazy
+                    .intern_speculative(false, &mut meter, 0, 0),
+                Ok(super::LazyInterned::State(item + 1))
+            );
+            assert!(workspace
+                .lazy
+                .index
+                .iter()
+                .all(|&state| state == super::LAZY_NO_STATE));
+        }
+        assert_eq!(workspace.lazy.state_len, 15);
+
+        // Fifteen retained identities still use the contiguous metadata scan.
+        stage(&mut workspace, 13);
+        let mut linear_hit = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            workspace
+                .lazy
+                .intern_speculative(false, &mut linear_hit, 0, 0),
+            Ok(super::LazyInterned::State(14))
+        );
+        assert_eq!(linear_hit.consumed, 17);
+
+        // Items zero, 512, and 1024 share their low nine hash bits. The
+        // threshold publication therefore exercises collisions while it
+        // bootstraps all prior identities. One below the triangular worst-case
+        // reservation declines without publishing any index cell.
+        let initial_hash = workspace.lazy.hashes[0];
+        let boundary_hash = super::lazy_hash(&[1024], false);
+        assert_ne!(initial_hash, boundary_hash);
+        assert_eq!(
+            super::lazy_index_start(boundary_hash, workspace.lazy.index.len()).unwrap(),
+            super::lazy_index_start(initial_hash, workspace.lazy.index.len()).unwrap()
+        );
+        stage(&mut workspace, 1024);
+        let linear_states = super::LAZY_HASH_INDEX_MIN_STATES.checked_sub(1).unwrap();
+        let bootstrap_bound = linear_states
+            .checked_mul(2)
+            .and_then(|work| work.checked_add(2))
+            .and_then(|work| {
+                work.checked_add(super::LAZY_HASH_INDEX_BOOTSTRAP_MAX_PROBES)
+            })
+            .unwrap();
+        let mut boundary_refused = WorkMeter::new(
+            u64::try_from(bootstrap_bound.checked_sub(1).unwrap()).unwrap(),
+            0,
+        );
+        assert_eq!(
+            workspace
+                .lazy
+                .intern_speculative(false, &mut boundary_refused, 0, 0),
+            Ok(super::LazyInterned::BudgetDeclined)
+        );
+        assert_eq!(boundary_refused.consumed, 0);
+        assert_eq!(workspace.lazy.state_len, 15);
+        assert!(workspace
+            .lazy
+            .index
+            .iter()
+            .all(|&state| state == super::LAZY_NO_STATE));
+
+        let mut boundary_publish =
+            WorkMeter::new(u64::try_from(bootstrap_bound).unwrap(), 0);
+        assert_eq!(
+            workspace
+                .lazy
+                .intern_speculative(false, &mut boundary_publish, 0, 0),
+            Ok(super::LazyInterned::State(15))
+        );
+        assert_eq!(boundary_publish.consumed, 20);
+        assert_eq!(workspace.lazy.state_len, super::LAZY_HASH_INDEX_MIN_STATES);
+        assert_indexed(&workspace);
+
+        // At the exact boundary, the same identity follows the three-entry
+        // collision cluster through the index rather than scanning metadata.
+        stage(&mut workspace, 1024);
+        let mut indexed_hit = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            workspace
+                .lazy
+                .intern_speculative(false, &mut indexed_hit, 0, 0),
+            Ok(super::LazyInterned::State(15))
+        );
+        assert_eq!(indexed_hit.consumed, 5);
+
+        // A fourth identity in the same bucket extends the authenticated
+        // cluster without changing the earlier bootstrap layout.
+        let collision_hash = super::lazy_hash(&[1536], false);
+        assert_ne!(initial_hash, collision_hash);
+        assert_eq!(
+            super::lazy_index_start(collision_hash, workspace.lazy.index.len()).unwrap(),
+            super::lazy_index_start(initial_hash, workspace.lazy.index.len()).unwrap()
+        );
+        stage(&mut workspace, 1536);
+        let mut clustered_publish = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            workspace
+                .lazy
+                .intern_speculative(false, &mut clustered_publish, 0, 0),
+            Ok(super::LazyInterned::State(16))
+        );
+        assert_eq!(clustered_publish.consumed, 5);
+
+        stage(&mut workspace, 1536);
+        let mut clustered_hit = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            workspace
+                .lazy
+                .intern_speculative(false, &mut clustered_hit, 0, 0),
+            Ok(super::LazyInterned::State(16))
+        );
+        assert_eq!(clustered_hit.consumed, 6);
+
+        // Model a full-width hash collision at the same bucket. Exact item
+        // authentication must reject state zero before accepting state 16.
+        workspace.lazy.hashes[0] = collision_hash;
+        stage(&mut workspace, 1536);
+        let mut full_collision = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            workspace
+                .lazy
+                .intern_speculative(false, &mut full_collision, 0, 0),
+            Ok(super::LazyInterned::State(16))
+        );
+        assert_eq!(full_collision.consumed, 7);
+        workspace.lazy.hashes[0] = initial_hash;
+        assert_indexed(&workspace);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
         reason = "the census, state proof, item arena, direct rows, contextual slots, and resource edges share one layout matrix"
     )]
     fn consuming_census_tightly_sizes_every_lazy_workspace_component() {
@@ -11973,6 +12463,11 @@ mod tests {
             )
             .unwrap()
             .checked_add(7)
+            .and_then(|work| {
+                work.checked_add(usize::from(
+                    forward_states >= super::LAZY_HASH_INDEX_MIN_STATES,
+                ))
+            })
             .and_then(|work| work.checked_add(usize::from(endpoint.lazy_item_capacity != 0)))
             .and_then(|work| u64::try_from(work).ok())
             .unwrap();
@@ -12001,6 +12496,11 @@ mod tests {
                 exact_endpoint.lazy.items.len(),
                 forward_items,
                 "{name}: forward item storage"
+            );
+            assert_eq!(
+                exact_endpoint.lazy.index.len(),
+                super::lazy_index_slots(forward_states).unwrap(),
+                "{name}: forward identity index"
             );
             assert_eq!(
                 exact_endpoint.construction_accounting().work(),
