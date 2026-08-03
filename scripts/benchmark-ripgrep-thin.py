@@ -3,7 +3,9 @@
 
 The benchmark definitions and canonical `rg` argv/cwd come from ripgrep's
 benchsuite. The original sampler is intentionally replaced: this runner checks
-output hashes and exit status, then measures adjacent fresh-process AB/BA pairs.
+output hashes, corpus identity, and exit status, then measures adjacent
+fresh-process AB/BA pairs. The default metric is an in-process scan over a
+fully preloaded corpus; process wall time is retained as a diagnostic.
 """
 
 import argparse
@@ -24,7 +26,10 @@ import time
 BASELINE_ENGINE = "rust-regex"
 CANDIDATE_ENGINES = ("fre", "fre-aot-fast", "fre-aot-optimizing")
 DEFAULT_CANDIDATE_ENGINE = "fre"
-RESULTS_SCHEMA_VERSION = 2
+TIMING_SCOPES = ("preloaded-scan", "process")
+DEFAULT_TIMING_SCOPE = "preloaded-scan"
+TIMING_PREFIX = "fre-ripgrep-thin-timing-v1"
+RESULTS_SCHEMA_VERSION = 3
 
 
 def parse_args(arguments=None):
@@ -102,6 +107,16 @@ def parse_args(arguments=None):
             "The selected wrapper must implement this --engine value."
         ),
     )
+    parser.add_argument(
+        "--timing-scope",
+        choices=TIMING_SCOPES,
+        default=DEFAULT_TIMING_SCOPE,
+        help=(
+            "Time only the in-memory scan after corpus loading and matcher "
+            "construction (default: preloaded-scan), or retain the legacy "
+            "spawn-through-exit process timing."
+        ),
+    )
     return parser.parse_args(arguments)
 
 
@@ -125,7 +140,9 @@ def order_label(order, candidate_engine):
     return "--".join(order)
 
 
-def validate_resume_identity(metadata, scan_mode, candidate_engine):
+def validate_resume_identity(
+    metadata, scan_mode, candidate_engine, timing_scope
+):
     existing_scan_mode = metadata.get("scan_mode", "line-is-match")
     if existing_scan_mode != scan_mode:
         raise SystemExit(
@@ -147,7 +164,13 @@ def validate_resume_identity(metadata, scan_mode, candidate_engine):
             "cannot resume across baseline engines: "
             f"existing={existing_baseline_engine}, requested={BASELINE_ENGINE}"
         )
-    return existing_scan_mode, existing_candidate_engine
+    existing_timing_scope = metadata.get("timing_scope", "process")
+    if existing_timing_scope != timing_scope:
+        raise SystemExit(
+            "cannot resume across timing scopes: "
+            f"existing={existing_timing_scope}, requested={timing_scope}"
+        )
+    return existing_scan_mode, existing_candidate_engine, existing_timing_scope
 
 
 def sha256_file(path):
@@ -214,13 +237,20 @@ def fingerprint(data):
 
 
 def command_for(
-    wrapper, engine, canonical, whole_file=False, describe_only=False
+    wrapper,
+    engine,
+    canonical,
+    whole_file=False,
+    describe_only=False,
+    timing_scope=None,
 ):
     command = [str(wrapper), "--engine", engine]
     if whole_file:
         command.append("--whole-file")
     if describe_only:
         command.append("--describe-only")
+    if timing_scope == "preloaded-scan":
+        command.append("--report-scan-time")
     command.extend(canonical.cmd[1:])
     return command
 
@@ -231,7 +261,51 @@ def command_environment(canonical):
     return environment
 
 
-def run_process(command, canonical, timeout_seconds):
+def scan_timing(stderr):
+    timing_lines = [
+        line
+        for line in stderr.splitlines()
+        if line.startswith(f"{TIMING_PREFIX}\t")
+    ]
+    if len(timing_lines) != 1:
+        raise ValueError(
+            f"expected exactly one {TIMING_PREFIX!r} line, "
+            f"found {len(timing_lines)}"
+        )
+    fields = {}
+    for field in timing_lines[0].split("\t")[1:]:
+        key, separator, value = field.partition("=")
+        if not separator or not key:
+            raise ValueError(f"malformed timing field: {field!r}")
+        if key in fields:
+            raise ValueError(f"duplicate timing field: {key!r}")
+        fields[key] = value
+    if fields.get("boundary") != "preloaded-corpus-scan":
+        raise ValueError(f"unexpected timing boundary: {fields.get('boundary')!r}")
+    try:
+        elapsed_ns = int(fields["scan_elapsed_ns"])
+    except (KeyError, ValueError) as error:
+        raise ValueError("invalid scan_elapsed_ns timing field") from error
+    if elapsed_ns <= 0:
+        raise ValueError("scan_elapsed_ns must be positive")
+    corpus_sha256 = fields.get("corpus_sha256", "")
+    if len(corpus_sha256) != 64 or any(
+        byte not in "0123456789abcdef" for byte in corpus_sha256
+    ):
+        raise ValueError("invalid corpus_sha256 timing field")
+    corpus = {"sha256": corpus_sha256}
+    for field in ("corpus_files", "corpus_bytes"):
+        try:
+            value = int(fields[field])
+        except (KeyError, ValueError) as error:
+            raise ValueError(f"invalid {field} timing field") from error
+        if value < 0:
+            raise ValueError(f"{field} must be non-negative")
+        corpus[field.removeprefix("corpus_")] = value
+    return {"scan_elapsed_ns": elapsed_ns, "corpus": corpus}
+
+
+def run_process(command, canonical, timeout_seconds, timing_scope):
     started = time.perf_counter_ns()
     try:
         completed = subprocess.run(
@@ -248,18 +322,39 @@ def run_process(command, canonical, timeout_seconds):
         return {
             "command": command,
             "elapsed_ns": elapsed_ns,
+            "wall_elapsed_ns": elapsed_ns,
+            "scan_elapsed_ns": None,
+            "corpus": None,
+            "timing_error": None,
             "exit_status": None,
             "timed_out": True,
             "stderr": str(error),
             "output": None,
         }
-    elapsed_ns = time.perf_counter_ns() - started
+    wall_elapsed_ns = time.perf_counter_ns() - started
+    stderr = completed.stderr.decode("utf-8", errors="replace")
+    measured_elapsed_ns = wall_elapsed_ns
+    measured_scan_elapsed_ns = None
+    corpus = None
+    timing_error = None
+    if timing_scope == "preloaded-scan":
+        try:
+            timing = scan_timing(stderr)
+            measured_scan_elapsed_ns = timing["scan_elapsed_ns"]
+            corpus = timing["corpus"]
+            measured_elapsed_ns = measured_scan_elapsed_ns
+        except ValueError as error:
+            timing_error = str(error)
     return {
         "command": command,
-        "elapsed_ns": elapsed_ns,
+        "elapsed_ns": measured_elapsed_ns,
+        "wall_elapsed_ns": wall_elapsed_ns,
+        "scan_elapsed_ns": measured_scan_elapsed_ns,
+        "corpus": corpus,
+        "timing_error": timing_error,
         "exit_status": completed.returncode,
         "timed_out": False,
-        "stderr": completed.stderr.decode("utf-8", errors="replace"),
+        "stderr": stderr,
         "output": fingerprint(completed.stdout),
     }
 
@@ -310,6 +405,10 @@ def matching_output(left, right):
         and successful_scan_status(left["exit_status"])
         and left["output"] == right["output"]
     )
+
+
+def matching_corpus(left, right):
+    return left.get("corpus") == right.get("corpus")
 
 
 def successful_scan_status(status):
@@ -525,6 +624,7 @@ def benchmark_one(args, benchmark, wrapper):
         "scan_mode": scan_mode,
         "candidate_engine": candidate_engine,
         "baseline_engine": BASELINE_ENGINE,
+        "timing_scope": args.timing_scope,
         "pattern": benchmark.pattern,
         "rg_name": canonical.name,
         "rg_argv": canonical.cmd,
@@ -570,9 +670,11 @@ def benchmark_one(args, benchmark, wrapper):
                 engine,
                 canonical,
                 whole_file=args.whole_file,
+                timing_scope=args.timing_scope,
             ),
             canonical,
             timeout_seconds=args.timeout_seconds,
+            timing_scope=args.timing_scope,
         )
         row["preflight"][engine] = result
         if result["timed_out"]:
@@ -593,6 +695,15 @@ def benchmark_one(args, benchmark, wrapper):
                     "fre-unsupported",
                 )
             return row
+        if result["timing_error"] is not None:
+            row["status"] = "timing-protocol-error"
+            return row
+    if not matching_corpus(
+        row["preflight"][candidate_engine],
+        row["preflight"][BASELINE_ENGINE],
+    ):
+        row["status"] = "corpus-mismatch"
+        return row
     if not matching_output(
         row["preflight"][candidate_engine],
         row["preflight"][BASELINE_ENGINE],
@@ -610,9 +721,11 @@ def benchmark_one(args, benchmark, wrapper):
                     engine,
                     canonical,
                     whole_file=args.whole_file,
+                    timing_scope=args.timing_scope,
                 ),
                 canonical,
                 timeout_seconds=args.timeout_seconds,
+                timing_scope=args.timing_scope,
             )
             sample = {
                 "pair": pair,
@@ -630,6 +743,12 @@ def benchmark_one(args, benchmark, wrapper):
                 return row
             if result["exit_status"] != row["preflight"][engine]["exit_status"]:
                 row["status"] = "timed-run-error"
+                return row
+            if result["timing_error"] is not None:
+                row["status"] = "timing-protocol-error"
+                return row
+            if result.get("corpus") != row["preflight"][engine].get("corpus"):
+                row["status"] = "timed-corpus-mismatch"
                 return row
             if result["output"] != expected_output:
                 row["status"] = "timed-output-mismatch"
@@ -654,6 +773,8 @@ def write_outputs(output_dir, document):
     summary_fields = [
         "benchmark",
         "scan_mode",
+        "timing_scope",
+        "measured_elapsed_field",
         "pattern",
         "status",
         "candidate_engine",
@@ -699,6 +820,16 @@ def write_outputs(output_dir, document):
                 {
                     "benchmark": result["benchmark"],
                     "scan_mode": result.get("scan_mode"),
+                    "timing_scope": result.get(
+                        "timing_scope",
+                        document["metadata"].get("timing_scope", "process"),
+                    ),
+                    "measured_elapsed_field": (
+                        "scan_elapsed_ns"
+                        if document["metadata"].get("timing_scope")
+                        == "preloaded-scan"
+                        else "wall_elapsed_ns"
+                    ),
                     "pattern": result["pattern"],
                     "status": result["status"],
                     "candidate_engine": result.get(
@@ -776,6 +907,8 @@ def write_outputs(output_dir, document):
     raw_fields = [
         "benchmark",
         "scan_mode",
+        "timing_scope",
+        "measured_elapsed_field",
         "candidate_engine",
         "baseline_engine",
         "pair",
@@ -784,6 +917,12 @@ def write_outputs(output_dir, document):
         "engine",
         "role",
         "elapsed_ns",
+        "wall_elapsed_ns",
+        "scan_elapsed_ns",
+        "timing_error",
+        "corpus_sha256",
+        "corpus_files",
+        "corpus_bytes",
         "exit_status",
         "timed_out",
         "output_sha256",
@@ -800,10 +939,18 @@ def write_outputs(output_dir, document):
         for result in document["results"]:
             for sample in result["samples"]:
                 output = sample.get("output") or {}
+                corpus = sample.get("corpus") or {}
                 writer.writerow(
                     {
                         "benchmark": result["benchmark"],
                         "scan_mode": result.get("scan_mode"),
+                        "timing_scope": result.get(
+                            "timing_scope",
+                            document["metadata"].get("timing_scope", "process"),
+                        ),
+                        "measured_elapsed_field": document["metadata"].get(
+                            "measured_elapsed_field", "wall_elapsed_ns"
+                        ),
                         "candidate_engine": result.get(
                             "candidate_engine", candidate_engine
                         ),
@@ -821,6 +968,12 @@ def write_outputs(output_dir, document):
                             else "candidate",
                         ),
                         "elapsed_ns": sample["elapsed_ns"],
+                        "wall_elapsed_ns": sample.get("wall_elapsed_ns"),
+                        "scan_elapsed_ns": sample.get("scan_elapsed_ns"),
+                        "timing_error": sample.get("timing_error"),
+                        "corpus_sha256": corpus.get("sha256"),
+                        "corpus_files": corpus.get("files"),
+                        "corpus_bytes": corpus.get("bytes"),
                         "exit_status": sample["exit_status"],
                         "timed_out": sample["timed_out"],
                         "output_sha256": output.get("sha256"),
@@ -836,6 +989,7 @@ def main(arguments=None):
     args = parse_args(arguments)
     scan_mode = "whole-file-find-iter" if args.whole_file else "line-is-match"
     candidate_engine = args.candidate_engine
+    timing_scope = args.timing_scope
     if args.pairs <= 0:
         raise SystemExit("--pairs must be positive")
     if args.timeout_seconds <= 0:
@@ -913,8 +1067,14 @@ def main(arguments=None):
         "scan_mode": scan_mode,
         "candidate_engine": candidate_engine,
         "baseline_engine": BASELINE_ENGINE,
+        "timing_scope": timing_scope,
         "engine_pair": list(engine_pair(candidate_engine)),
         "comparison_ratio": "baseline elapsed / candidate elapsed",
+        "measured_elapsed_field": (
+            "scan_elapsed_ns"
+            if timing_scope == "preloaded-scan"
+            else "wall_elapsed_ns"
+        ),
         "sampling_runs": [
             {
                 "started_utc": timestamp,
@@ -923,12 +1083,43 @@ def main(arguments=None):
                 "scan_mode": scan_mode,
                 "candidate_engine": candidate_engine,
                 "baseline_engine": BASELINE_ENGINE,
+                "timing_scope": timing_scope,
             }
         ],
         "arm_timeout_seconds": args.timeout_seconds,
         "schedule": "adjacent fresh-process pairs, alternating FRE/Rust order",
-        "timing_boundary": "spawn through exit with stdout/stderr drained",
-        "clock": "time.perf_counter_ns",
+        "timing_boundary": (
+            "in-process traversal and matching over an owned corpus snapshot; "
+            "line boundaries are precomputed and line output is deferred; "
+            "line result collection and whole-file span digest/accounting are "
+            "included; matcher construction, file discovery/read, output "
+            "formatting, and process startup/exit are excluded"
+            if timing_scope == "preloaded-scan"
+            else "spawn through exit with stdout/stderr drained"
+        ),
+        "timing_protocol": (
+            "fre-ripgrep-thin-timing-v1"
+            if timing_scope == "preloaded-scan"
+            else None
+        ),
+        "clock": (
+            "std::time::Instant in wrapper"
+            if timing_scope == "preloaded-scan"
+            else "time.perf_counter_ns in runner"
+        ),
+        "wall_clock": "time.perf_counter_ns in runner",
+        "corpus_identity": (
+            "SHA-256 over domain-separated ordered accepted path bytes, file "
+            "lengths, and complete file contents; compared across every arm"
+            if timing_scope == "preloaded-scan"
+            else None
+        ),
+        "preload_memory_policy": (
+            "owned file bytes plus precomputed line ranges and deferred "
+            "matching-line records in line mode"
+            if timing_scope == "preloaded-scan"
+            else None
+        ),
         "semantic_check": (
             "exit status plus exhaustive ordered whole-file match-span "
             "digest fingerprint"
@@ -971,8 +1162,15 @@ def main(arguments=None):
     if existing_document is None:
         document = {"metadata": metadata, "results": []}
     else:
-        existing_scan_mode, existing_candidate_engine = validate_resume_identity(
-            existing_document["metadata"], scan_mode, candidate_engine
+        (
+            existing_scan_mode,
+            existing_candidate_engine,
+            existing_timing_scope,
+        ) = validate_resume_identity(
+            existing_document["metadata"],
+            scan_mode,
+            candidate_engine,
+            timing_scope,
         )
         document = existing_document
         document["metadata"]["results_schema_version"] = RESULTS_SCHEMA_VERSION
@@ -980,6 +1178,9 @@ def main(arguments=None):
             "candidate_engine", existing_candidate_engine
         )
         document["metadata"].setdefault("baseline_engine", BASELINE_ENGINE)
+        document["metadata"].setdefault(
+            "timing_scope", existing_timing_scope
+        )
         document["metadata"].setdefault(
             "engine_pair", list(engine_pair(existing_candidate_engine))
         )
@@ -999,6 +1200,7 @@ def main(arguments=None):
                     "scan_mode": existing_scan_mode,
                     "candidate_engine": existing_candidate_engine,
                     "baseline_engine": BASELINE_ENGINE,
+                    "timing_scope": existing_timing_scope,
                 }
             ]
         document["metadata"]["sampling_runs"].append(
@@ -1009,6 +1211,7 @@ def main(arguments=None):
                 "scan_mode": scan_mode,
                 "candidate_engine": candidate_engine,
                 "baseline_engine": BASELINE_ENGINE,
+                "timing_scope": timing_scope,
             }
         )
         document["metadata"].pop("finished_utc", None)
