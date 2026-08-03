@@ -47,6 +47,7 @@ const BYTE_ALPHABET: usize = 256;
 // avoids falling back to an ordered closure on every subsequent byte once a
 // moderately branching unbounded expression crosses 64 subsets.
 const LAZY_MAX_STATES: usize = 256;
+const _: () = assert!(LAZY_MAX_STATES <= usize::MAX / BYTE_ALPHABET);
 const LAZY_MAX_ITEMS: usize = 16_384;
 const EXACT_LAZY_CAPACITY_MAX_ITEMS: usize = 3;
 const LAZY_CELL_ACCEPT: u32 = 1 << 31;
@@ -64,6 +65,23 @@ const CONTEXT_TRANSITION_MAX_BUCKETS: usize =
     CONTEXT_TRANSITION_MAX_SLOTS / CONTEXT_TRANSITION_WAYS;
 const CONTEXT_EMPTY_SOURCE: u32 = u32::MAX;
 const CONTEXT_INITIAL_SOURCE: u32 = u32::MAX - 1;
+
+/// Index one direct byte row after its source state has been authenticated.
+///
+/// Every direct lazy arena is constructed with at most `LAZY_MAX_STATES`
+/// rows, and state publication never exceeds that fixed capacity. The const
+/// assertion above therefore proves this multiply/add cannot overflow. Keeping
+/// that shape proof outside the warmed transition loop removes the remaining
+/// fallible arithmetic branch from every warmed input byte; the final slice
+/// lookup still diagnoses a broken physical layout.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the fixed lazy-state ceiling and byte alphabet prove the row index fits usize"
+)]
+fn direct_row_cell_index(state: usize, byte: u8) -> usize {
+    debug_assert!(state < LAZY_MAX_STATES);
+    state * BYTE_ALPHABET + usize::from(byte)
+}
 
 #[cfg(test)]
 const ASSERTION_KINDS: [EdgeKind; ASSERTION_KIND_COUNT] = [
@@ -1174,16 +1192,8 @@ impl LazyWorkspace {
                 detail: "lazy DFA transition state is outside the cache",
             });
         }
-        let row = state
-            .checked_mul(BYTE_ALPHABET)
-            .ok_or(SearchError::ArithmeticOverflow {
-                computation: "lazy DFA transition row",
-            })?;
-        let cell_index =
-            row.checked_add(usize::from(byte))
-                .ok_or(SearchError::ArithmeticOverflow {
-                    computation: "lazy DFA transition cell",
-                })?;
+        debug_assert!(self.state_len <= LAZY_MAX_STATES);
+        let cell_index = direct_row_cell_index(state, byte);
         self.rows
             .get(cell_index)
             .copied()
@@ -1201,16 +1211,8 @@ impl LazyWorkspace {
                 detail: "lazy DFA transition source is outside the cache",
             });
         }
-        let row = state
-            .checked_mul(BYTE_ALPHABET)
-            .ok_or(SearchError::ArithmeticOverflow {
-                computation: "lazy DFA transition row",
-            })?;
-        let cell_index =
-            row.checked_add(usize::from(byte))
-                .ok_or(SearchError::ArithmeticOverflow {
-                    computation: "lazy DFA transition cell",
-                })?;
+        debug_assert!(self.state_len <= LAZY_MAX_STATES);
+        let cell_index = direct_row_cell_index(state, byte);
         *self
             .rows
             .get_mut(cell_index)
@@ -1696,12 +1698,8 @@ impl ReverseWorkspace {
                 detail: "reverse DFA transition state is outside the cache",
             });
         }
-        let cell = state
-            .checked_mul(BYTE_ALPHABET)
-            .and_then(|row| row.checked_add(usize::from(byte)))
-            .ok_or(SearchError::ArithmeticOverflow {
-                computation: "reverse DFA transition cell",
-            })?;
+        debug_assert!(self.state_len <= LAZY_MAX_STATES);
+        let cell = direct_row_cell_index(state, byte);
         self.rows
             .get(cell)
             .copied()
@@ -1719,12 +1717,8 @@ impl ReverseWorkspace {
                 detail: "reverse DFA transition source is outside the cache",
             });
         }
-        let cell = state
-            .checked_mul(BYTE_ALPHABET)
-            .and_then(|row| row.checked_add(usize::from(byte)))
-            .ok_or(SearchError::ArithmeticOverflow {
-                computation: "reverse DFA transition cell",
-            })?;
+        debug_assert!(self.state_len <= LAZY_MAX_STATES);
+        let cell = direct_row_cell_index(state, byte);
         *self
             .rows
             .get_mut(cell)
