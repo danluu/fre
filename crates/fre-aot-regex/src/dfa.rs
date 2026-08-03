@@ -578,7 +578,9 @@ struct PartialForwardDfa {
     /// Derived hot-loop representation of `transitions`. The stable wire
     /// format and native lowering continue to use the explicit cells above;
     /// portable retained-row execution needs only one 32-bit load per byte.
-    packed_transitions: Box<[PackedForwardCell]>,
+    /// An unauthenticated decoded payload leaves this absent until canonical
+    /// regeneration returns a freshly derived machine.
+    packed_transitions: Option<Vec<PackedForwardCell>>,
     /// Source-independent effect of every completed transition on a scalar
     /// proof that all live ordered threads share one match start. This is a
     /// derived in-memory certificate: stable artifacts regenerate it while
@@ -597,6 +599,10 @@ struct PartialForwardDfa {
 const PARTIAL_CELL_ACCEPTED: u32 = 1 << 31;
 const PARTIAL_CELL_HOLE_BASE: u32 = 1 << 30;
 const PARTIAL_CELL_DEAD: u32 = PARTIAL_CELL_ACCEPTED - 1;
+const _: () = assert!(MAX_STABLE_DFA_TRANSITIONS < PARTIAL_CELL_HOLE_BASE as usize);
+const _: () = assert!(
+    MAX_STABLE_DFA_STATES <= (PARTIAL_CELL_DEAD - PARTIAL_CELL_HOLE_BASE) as usize
+);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(transparent)]
@@ -604,20 +610,28 @@ struct PackedForwardCell(u32);
 
 impl PackedForwardCell {
     fn from_cell(cell: ForwardCell, complete_rows: usize, classes: usize) -> Option<Self> {
+        if classes == 0 {
+            return None;
+        }
         let next = if cell.next == NO_STATE {
             PARTIAL_CELL_DEAD
         } else {
             let state = usize::try_from(cell.next).ok()?;
             if state < complete_rows {
-                u32::try_from(state.checked_mul(classes)?).ok()?
+                let row = u32::try_from(state.checked_mul(classes)?).ok()?;
+                if row >= PARTIAL_CELL_HOLE_BASE {
+                    return None;
+                }
+                row
             } else {
                 let resume = u32::try_from(state.checked_sub(complete_rows)?).ok()?;
-                PARTIAL_CELL_HOLE_BASE.checked_add(resume)?
+                let hole = PARTIAL_CELL_HOLE_BASE.checked_add(resume)?;
+                if hole >= PARTIAL_CELL_DEAD {
+                    return None;
+                }
+                hole
             }
         };
-        if cell.next != NO_STATE && next >= PARTIAL_CELL_DEAD {
-            return None;
-        }
         Some(Self(next | u32::from(cell.accepted) * PARTIAL_CELL_ACCEPTED))
     }
 
@@ -1318,33 +1332,54 @@ impl PartialDfa {
     fn from_complete_forward(
         alphabet: Alphabet,
         forward: ForwardDfa,
-        effective_limits: DeterminizeLimits,
-    ) -> Self {
-        let classes = alphabet.classes();
-        let packed_transitions = forward
-            .transitions
-            .iter()
-            .copied()
-            .map(|cell| {
-                PackedForwardCell::from_cell(cell, forward.states, classes)
-                    .expect("stable DFA state ceiling fits packed partial cells")
+        budget: &mut BuildBudget,
+    ) -> Result<Option<Self>, CompileError> {
+        // An allocation decline cannot publish a canonical sidecar: allocator
+        // history is deliberately absent from the stable wire provenance.
+        if matches!(
+            budget.decline.as_ref(),
+            Some(DeterminizationDecline {
+                resource: DeterminizationResource::Allocation { .. },
+                ..
             })
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        Self {
+        ) {
+            return Ok(None);
+        }
+        let classes = alphabet.classes();
+        let mut packed_transitions = Vec::new();
+        if packed_transitions
+            .try_reserve_exact(forward.transitions.len())
+            .is_err()
+        {
+            budget.replace_decline_with_allocation::<PackedForwardCell>(
+                forward.transitions.len(),
+            );
+            return Ok(None);
+        }
+        for &cell in &forward.transitions {
+            packed_transitions.push(
+                PackedForwardCell::from_cell(cell, forward.states, classes).ok_or(
+                    CompileError::InternalInvariant(
+                        "stable complete DFA cell exceeded the packed partial range",
+                    ),
+                )?,
+            );
+        }
+        let effective_limits = budget.limits;
+        Ok(Some(Self {
             alphabet,
             forward: PartialForwardDfa {
                 initial_pending: forward.initial_pending,
                 initial_terminal: forward.initial_terminal,
                 transitions: forward.transitions,
-                packed_transitions,
+                packed_transitions: Some(packed_transitions),
                 start_actions: Vec::new(),
                 discovered_states: forward.states,
                 complete_rows: forward.states,
                 resume_keys: Vec::new(),
             },
             effective_limits,
-        }
+        }))
     }
 
     fn selected_end_impl<const EARLIEST: bool, const TRACK_START: bool>(
@@ -1355,6 +1390,11 @@ impl PartialDfa {
         prefix_sets: &[AnchoredByteSet],
         prefix_plan: Option<PartialDfaPrefixPlan>,
     ) -> Result<PartialDfaResult<PartialDfaSelection>, CompileError> {
+        let packed_transitions = self.forward.packed_transitions.as_deref().ok_or(
+            CompileError::InternalInvariant(
+                "partial DFA packed transitions were not canonically regenerated",
+            ),
+        )?;
         if self.forward.initial_pending && (EARLIEST || self.forward.initial_terminal) {
             return Ok(PartialDfaResult::Complete(PartialDfaSelection {
                 end: Some(window_start),
@@ -1400,7 +1440,7 @@ impl PartialDfa {
                 .ok_or(CompileError::InternalInvariant(
                     "partial DFA transition index overflowed",
                 ))?;
-            let cell = *self.forward.packed_transitions.get(index).ok_or(
+            let cell = *packed_transitions.get(index).ok_or(
                 CompileError::InternalInvariant("partial DFA row is incomplete"),
             )?;
             position = position
@@ -1781,7 +1821,6 @@ impl PartialDfa {
             ));
         }
         let mut transitions = dfa_reserve(cell_count, "partial DFA cell")?;
-        let mut packed_transitions = dfa_reserve(cell_count, "packed partial DFA cell")?;
         for _ in 0..cell_count {
             let next = reader.u32("partial DFA cell is truncated")?;
             if next != NO_STATE
@@ -1794,11 +1833,6 @@ impl PartialDfa {
             let accepted = reader.boolean("partial DFA accepted flag is invalid")?;
             reader.zeros(3, "partial DFA cell reserved bytes are non-zero")?;
             let cell = ForwardCell { next, accepted };
-            packed_transitions.push(
-                PackedForwardCell::from_cell(cell, complete_rows, class_count).ok_or(
-                    ProgramFormatError::Malformed("partial DFA cell exceeds packed state range"),
-                )?,
-            );
             transitions.push(cell);
         }
         let mut resume_keys = dfa_reserve(resume_state_count, "partial DFA resume state")?;
@@ -1857,7 +1891,10 @@ impl PartialDfa {
                 initial_pending,
                 initial_terminal,
                 transitions,
-                packed_transitions: packed_transitions.into_boxed_slice(),
+                // Canonical regeneration derives the executable packed table.
+                // This decoded object is only a wire witness for
+                // `same_wire_payload` and is never published directly.
+                packed_transitions: None,
                 start_actions: Vec::new(),
                 discovered_states,
                 complete_rows,
@@ -2885,8 +2922,8 @@ fn determinize_impl(
     let mut reverse = if wants_span && !forward.initial_pending {
         budget.begin_stage(DeterminizationStage::ReverseSubsetConstruction);
         let Some(reverse) = build_reverse(raw, &alphabet, &mut budget)? else {
-            let partial = PartialDfa::from_complete_forward(alphabet, forward, budget.limits);
-            return Ok(DeterminizeOutcome::from_budget(None, Some(partial), budget));
+            let partial = PartialDfa::from_complete_forward(alphabet, forward, &mut budget)?;
+            return Ok(DeterminizeOutcome::from_budget(None, partial, budget));
         };
         budget.complete_stage(DeterminizationStage::ReverseSubsetConstruction)?;
         Some(reverse)
@@ -2897,14 +2934,14 @@ fn determinize_impl(
     let reverse_states_before_minimization = reverse.as_ref().map_or(0, |machine| machine.states);
     budget.begin_stage(DeterminizationStage::DfaStateMinimization);
     if !minimize_dfa_states(&mut forward, &mut reverse, alphabet.classes(), &mut budget)? {
-        let partial = PartialDfa::from_complete_forward(alphabet, forward, budget.limits);
-        return Ok(DeterminizeOutcome::from_budget(None, Some(partial), budget));
+        let partial = PartialDfa::from_complete_forward(alphabet, forward, &mut budget)?;
+        return Ok(DeterminizeOutcome::from_budget(None, partial, budget));
     }
     budget.complete_stage(DeterminizationStage::DfaStateMinimization)?;
     budget.begin_stage(DeterminizationStage::AlphabetColumnCoalescing);
     if !coalesce_alphabet_columns(&mut alphabet, &mut forward, &mut reverse, &mut budget)? {
-        let partial = PartialDfa::from_complete_forward(alphabet, forward, budget.limits);
-        return Ok(DeterminizeOutcome::from_budget(None, Some(partial), budget));
+        let partial = PartialDfa::from_complete_forward(alphabet, forward, &mut budget)?;
+        return Ok(DeterminizeOutcome::from_budget(None, partial, budget));
     }
     budget.complete_stage(DeterminizationStage::AlphabetColumnCoalescing)?;
     let forward_transitions = forward.transitions.len();
@@ -3811,7 +3848,7 @@ fn compact_partial_forward(
         initial_pending,
         initial_terminal,
         transitions: compact_transitions,
-        packed_transitions: packed_transitions.into_boxed_slice(),
+        packed_transitions: Some(packed_transitions),
         start_actions: compact_start_actions,
         discovered_states,
         complete_rows,
@@ -4714,6 +4751,31 @@ impl BuildBudget {
         self.decline(DeterminizationResource::Allocation {
             requested_elements,
             element_size: core::mem::size_of::<T>(),
+        });
+    }
+
+    /// A retained sidecar is optional, but failure to allocate its final
+    /// executable representation is the reason it cannot be published. Replace
+    /// an earlier numeric construction decline so the receipt does not imply
+    /// that the canonical partial remained available.
+    fn replace_decline_with_allocation<T>(&mut self, requested_elements: usize) {
+        let stage = self
+            .decline
+            .as_ref()
+            .map(|decline| decline.stage)
+            .or(self.current_stage)
+            .unwrap_or(DeterminizationStage::AlphabetPartition);
+        debug_assert!(self.current_stage.is_some() || self.decline.is_some());
+        self.declined = true;
+        self.decline = Some(DeterminizationDecline {
+            stage,
+            resource: DeterminizationResource::Allocation {
+                requested_elements,
+                element_size: core::mem::size_of::<T>(),
+            },
+            work_completed: self.work,
+            states_completed: self.states,
+            transitions_completed: self.transitions,
         });
     }
 
