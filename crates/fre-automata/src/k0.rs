@@ -41,7 +41,12 @@ const ORDINARY_START_FILTER_PROOF: StartFilterProof = StartFilterProof {
     relaxed_nullable: true,
 };
 const BYTE_ALPHABET: usize = 256;
-const LAZY_MAX_STATES: usize = 64;
+// Prepared compiled searches are deliberately allowed a larger bounded
+// determinization frontier than the original L1-sized cache. A direct row is
+// still only touched for the current state, while retaining more identities
+// avoids falling back to an ordered closure on every subsequent byte once a
+// moderately branching unbounded expression crosses 64 subsets.
+const LAZY_MAX_STATES: usize = 256;
 const LAZY_MAX_ITEMS: usize = 16_384;
 const EXACT_LAZY_CAPACITY_MAX_ITEMS: usize = 3;
 const LAZY_CELL_ACCEPT: u32 = 1 << 31;
@@ -7732,24 +7737,15 @@ fn reverse_lazy_state_capacity(consuming_edges: usize, contextual: bool) -> usiz
 
 /// Maximum aggregate item length of any retained set of distinct identities.
 ///
-/// For five or more items, at least 64 full-length permutations exist, so the
-/// capped cache can consist entirely of maximum-length states. Smaller domains
-/// enumerate each length exactly and retain the longest identities first.
+/// Enumerate each length exactly, retaining the longest identities first.
+/// Products are capped at the bounded state domain: once a layer supplies all
+/// remaining identities, larger factorial values cannot affect the arena.
 fn ordered_partial_permutation_item_capacity(
     items: usize,
     modes: usize,
     state_capacity: usize,
     structure: &'static str,
 ) -> Result<usize, SearchError> {
-    if items >= 5 {
-        return items
-            .checked_mul(state_capacity)
-            .map(|capacity| capacity.min(LAZY_MAX_ITEMS))
-            .ok_or(SearchError::ArithmeticOverflow {
-                computation: structure,
-            });
-    }
-
     let mut remaining_states = state_capacity;
     let mut item_capacity = 0usize;
     let mut length = items;
@@ -7761,19 +7757,9 @@ fn ordered_partial_permutation_item_capacity(
                 .ok_or(SearchError::ArithmeticOverflow {
                     computation: structure,
                 })?;
-            permutations =
-                permutations
-                    .checked_mul(factor)
-                    .ok_or(SearchError::ArithmeticOverflow {
-                        computation: structure,
-                    })?;
+            permutations = permutations.saturating_mul(factor).min(state_capacity);
         }
-        let identities =
-            permutations
-                .checked_mul(modes)
-                .ok_or(SearchError::ArithmeticOverflow {
-                    computation: structure,
-                })?;
+        let identities = permutations.saturating_mul(modes).min(state_capacity);
         let selected = identities.min(remaining_states);
         item_capacity = selected
             .checked_mul(length)
@@ -9142,7 +9128,11 @@ mod tests {
             (16, 4_096),
             (17, 8_192),
             (32, 8_192),
-            (33, super::CONTEXT_TRANSITION_MAX_SLOTS),
+            (33, 16_384),
+            (64, 16_384),
+            (65, 32_768),
+            (128, 32_768),
+            (129, super::CONTEXT_TRANSITION_MAX_SLOTS),
             (super::LAZY_MAX_STATES, super::CONTEXT_TRANSITION_MAX_SLOTS),
             (
                 super::LAZY_MAX_STATES + 1,
@@ -9294,11 +9284,11 @@ mod tests {
             reverse_items.push(got_direct_reverse_items);
             contextual_reverse.push(got_contextual_reverse);
         }
-        assert_eq!(forward, [1, 3, 9, 31, 64, 64, 64]);
-        assert_eq!(forward_items, [0, 2, 12, 66, 240, 320, 384]);
-        assert_eq!(direct_reverse, [0, 1, 4, 15, 64, 64, 64]);
-        assert_eq!(reverse_items, [0, 1, 6, 33, 196, 320, 384]);
-        assert_eq!(contextual_reverse, [0, 2, 5, 16, 64, 64, 64]);
+        assert_eq!(forward, [1, 3, 9, 31, 129, 256, 256]);
+        assert_eq!(forward_items, [0, 2, 12, 66, 392, 1_264, 1_536]);
+        assert_eq!(direct_reverse, [0, 1, 4, 15, 64, 256, 256]);
+        assert_eq!(reverse_items, [0, 1, 6, 33, 196, 1_128, 1_536]);
+        assert_eq!(contextual_reverse, [0, 2, 5, 16, 65, 256, 256]);
         assert_eq!(
             super::forward_lazy_state_capacity(usize::MAX),
             super::LAZY_MAX_STATES
@@ -9322,9 +9312,9 @@ mod tests {
             super::LAZY_MAX_ITEMS
         );
         for (items, expected) in [
-            (255, 255 * super::LAZY_MAX_STATES),
-            (256, super::LAZY_MAX_ITEMS),
-            (257, super::LAZY_MAX_ITEMS),
+            (63, 63 * super::LAZY_MAX_STATES),
+            (64, super::LAZY_MAX_ITEMS),
+            (65, super::LAZY_MAX_ITEMS),
         ] {
             assert_eq!(
                 super::ordered_partial_permutation_item_capacity(
@@ -9409,8 +9399,8 @@ mod tests {
                 byte_chain(&[(b'a', b'a'), (b'b', b'b'), (b'c', b'c'), (b'd', b'd')]),
                 4,
                 4,
-                64,
-                240,
+                129,
+                392,
                 64,
                 196,
             ),
