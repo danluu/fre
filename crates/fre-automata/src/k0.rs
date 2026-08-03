@@ -2964,6 +2964,127 @@ pub(crate) fn search_from_resume_with_workspace(
     )
 }
 
+/// Recover the exact start for one externally authenticated selected end.
+///
+/// This is the reverse-only half of bidirectional K0. The caller has already
+/// executed an exact ordered forward machine and proved that `selected_end`
+/// is the profile-selected endpoint for `window`. K0 therefore initializes
+/// (or reuses) only its fixed-capacity reverse cache and never replays the
+/// forward search.
+pub(crate) fn recover_span_from_selected_end_with_workspace(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    selected_end: usize,
+    limits: SearchLimits,
+) -> Result<UntypedReport, SearchError> {
+    validate_window(haystack, window)?;
+    if selected_end < window.start() || selected_end > window.end() {
+        return Err(SearchError::InvalidResumeState {
+            detail: "selected endpoint is outside the original search window",
+        });
+    }
+    if workspace.bound_automaton_identity != automaton.identity() {
+        return Err(SearchError::InvalidResumeState {
+            detail: "selected-end reverse recovery workspace belongs to another automaton",
+        });
+    }
+    if selected_end != window.start() {
+        if automaton.stats().assertion_edges() != 0 {
+            return Err(SearchError::InvalidResumeState {
+                detail: "selected-end reverse recovery requires an assertion-free automaton",
+            });
+        }
+        if !workspace.reverse.is_allocated() || !workspace.reverse.is_bound_to(automaton) {
+            return Err(SearchError::InvalidResumeState {
+                detail: "positive selected-end recovery requires a bound bidirectional workspace",
+            });
+        }
+    }
+
+    let reverse_window = SearchWindow::new(window.start(), selected_end);
+    let scratch_bytes = workspace.retained_bytes;
+    let mut setup = SetupAccounting::empty(scratch_bytes, true);
+    let (mut meter, setup_work) = prepare_resume_invocation(
+        automaton,
+        workspace,
+        reverse_window,
+        limits,
+        &mut setup,
+        false,
+        selected_end != window.start(),
+    )?;
+
+    let (start, boundaries) = if selected_end == window.start() {
+        // A selected match cannot begin before the authoritative window. An
+        // endpoint at its first boundary is therefore the empty span there.
+        (window.start(), 1)
+    } else {
+        let reverse_bytes =
+            selected_end
+                .checked_sub(window.start())
+                .ok_or(SearchError::InternalInvariant {
+                    detail: "validated selected endpoint precedes its window",
+                })?;
+        let reverse_reserve = if limits.max_work == u64::MAX {
+            0
+        } else {
+            conservative_reverse_work_bound(automaton, reverse_bytes).unwrap_or(u64::MAX)
+        };
+        if !prepare_reverse_lazy(
+            automaton,
+            workspace,
+            &mut meter,
+            reverse_reserve,
+            selected_end,
+        )? {
+            if workspace.reverse.declined {
+                return Err(SearchError::InternalInvariant {
+                    detail: "selected endpoint has no reverse start frontier",
+                });
+            }
+            return Err(SearchError::WorkLimitExceeded {
+                limit: limits.max_work,
+                consumed: meter.consumed,
+                requested: reverse_initial_work_upper(automaton)?,
+                position: selected_end,
+            });
+        }
+        let (start, boundaries) = execute_selected_end_reverse_lazy_loop(
+            automaton,
+            haystack,
+            window.start(),
+            selected_end,
+            workspace,
+            &mut meter,
+            reverse_reserve,
+        )?;
+        let start = start.ok_or(SearchError::InternalInvariant {
+            detail: "reverse DFA could not recover the authenticated selected endpoint",
+        })?;
+        (start, boundaries)
+    };
+
+    let transition_work =
+        meter
+            .consumed
+            .checked_sub(setup_work)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "selected-end reverse setup exceeded total search work",
+            })?;
+    Ok(UntypedReport {
+        found: Some(MatchSpan::new(start, selected_end)),
+        accounting: SearchAccounting::new(
+            meter.consumed,
+            setup,
+            transition_work,
+            scratch_bytes,
+            boundaries,
+        ),
+    })
+}
+
 fn lazy_capabilities(
     automaton: &Automaton,
     workspace: &K0Workspace,
@@ -6649,6 +6770,198 @@ fn build_resume_reverse_cached_transition(
 }
 
 fn build_resume_reverse_inline_transition(
+    automaton: &Automaton,
+    byte: u8,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    position: usize,
+) -> Result<ReverseTransition, SearchError> {
+    let length = workspace.reverse.frontier_len;
+    begin_reverse_closure(workspace, meter, position)?;
+    let mut reaches_start = false;
+    for ordinal in 0..length {
+        let incoming = usize::try_from(workspace.reverse.frontier[ordinal]).map_err(|_| {
+            SearchError::InternalInvariant {
+                detail: "reverse DFA inline item does not fit usize",
+            }
+        })?;
+        meter.charge(1, position)?;
+        let start = workspace.reverse.incoming_starts[incoming];
+        let end = workspace.reverse.incoming_ends[incoming];
+        if start <= byte && byte <= end {
+            reaches_start |= expand_reverse_root(
+                automaton,
+                workspace.reverse.incoming_sources[incoming],
+                workspace,
+                meter,
+                position,
+            )?;
+        }
+    }
+    collect_reverse_frontier(automaton, workspace, meter, position)?;
+    if workspace.reverse.scratch_len == 0 {
+        workspace.reverse.frontier_len = 0;
+        return Ok(ReverseTransition::Ready(if reaches_start {
+            LAZY_CELL_ACCEPT
+        } else {
+            0
+        }));
+    }
+    workspace.reverse.retain_scratch_as_frontier()?;
+    Ok(ReverseTransition::Inline { reaches_start })
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the selected-end copy preserves retained-resume reverse-loop codegen"
+)]
+fn execute_selected_end_reverse_lazy_loop(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window_start: usize,
+    selected_end: usize,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    core_reserve: u64,
+) -> Result<(Option<usize>, usize), SearchError> {
+    if !workspace.reverse.initialized {
+        return Err(SearchError::InternalInvariant {
+            detail: "reverse DFA executed without an initialized state",
+        });
+    }
+    let initial = workspace.reverse.initial;
+    if initial == LAZY_NO_STATE {
+        return Err(SearchError::InternalInvariant {
+            detail: "initialized reverse DFA has no initial state",
+        });
+    }
+    let mut state = ReverseState::Cached(direct_row_offset(initial)?);
+    let mut cursor = selected_end;
+    let mut candidate = None;
+    // The Accept-seeded state is the reverse automaton's selected-end
+    // boundary; every consumed byte adds one earlier boundary.
+    let mut boundaries = 1usize;
+    while cursor > window_start {
+        let source = cursor
+            .checked_sub(1)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "reverse DFA cursor underflowed",
+            })?;
+        meter.charge(1, source)?;
+        let byte = *haystack.get(source).ok_or(SearchError::InternalInvariant {
+            detail: "reverse DFA source position exceeded the validated window",
+        })?;
+        let transition = match state {
+            ReverseState::Cached(cached) => {
+                let cell = workspace.reverse.direct_cell(cached, byte)?;
+                if cell == LAZY_CELL_UNFILLED {
+                    build_selected_end_reverse_cached_transition(
+                        automaton,
+                        direct_row_state(cached),
+                        byte,
+                        workspace,
+                        meter,
+                        core_reserve,
+                        source,
+                    )?
+                } else {
+                    ReverseTransition::Ready(cell)
+                }
+            }
+            ReverseState::Inline => build_selected_end_reverse_inline_transition(
+                automaton, byte, workspace, meter, source,
+            )?,
+        };
+        cursor = source;
+        boundaries = boundaries
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "reverse DFA examined boundary count",
+            })?;
+        let (reaches_start, next) = match transition {
+            ReverseTransition::Ready(cell) => {
+                let encoded = cell & LAZY_CELL_STATE_MASK;
+                (
+                    cell & LAZY_CELL_ACCEPT != 0,
+                    if encoded == 0 {
+                        None
+                    } else {
+                        Some(ReverseState::Cached(encoded.checked_sub(1).ok_or(
+                            SearchError::InternalInvariant {
+                                detail: "reverse DFA encoded state underflowed",
+                            },
+                        )?))
+                    },
+                )
+            }
+            ReverseTransition::Inline { reaches_start } => {
+                (reaches_start, Some(ReverseState::Inline))
+            }
+        };
+        if reaches_start {
+            candidate = Some(cursor);
+        }
+        let Some(next) = next else {
+            break;
+        };
+        state = next;
+    }
+    Ok((candidate, boundaries))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the selected-end copy preserves retained-resume reverse-builder codegen"
+)]
+fn build_selected_end_reverse_cached_transition(
+    automaton: &Automaton,
+    state: u32,
+    byte: u8,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    core_reserve: u64,
+    position: usize,
+) -> Result<ReverseTransition, SearchError> {
+    let cached = workspace.reverse.cell(state, byte)?;
+    if cached != LAZY_CELL_UNFILLED {
+        return Ok(ReverseTransition::Ready(cached));
+    }
+    let (_, length) = workspace.reverse.state_bounds(state)?;
+    begin_reverse_closure(workspace, meter, position)?;
+    let mut reaches_start = false;
+    for ordinal in 0..length {
+        let incoming = usize::try_from(workspace.reverse.item(state, ordinal)?).map_err(|_| {
+            SearchError::InternalInvariant {
+                detail: "reverse DFA incoming item does not fit usize",
+            }
+        })?;
+        meter.charge(1, position)?;
+        let start = workspace.reverse.incoming_starts[incoming];
+        let end = workspace.reverse.incoming_ends[incoming];
+        if start <= byte && byte <= end {
+            reaches_start |= expand_reverse_root(
+                automaton,
+                workspace.reverse.incoming_sources[incoming],
+                workspace,
+                meter,
+                position,
+            )?;
+        }
+    }
+    collect_reverse_frontier(automaton, workspace, meter, position)?;
+    finish_reverse_cached_transition(
+        automaton,
+        state,
+        byte,
+        reaches_start,
+        workspace,
+        meter,
+        core_reserve,
+        position,
+    )
+}
+
+fn build_selected_end_reverse_inline_transition(
     automaton: &Automaton,
     byte: u8,
     workspace: &mut K0Workspace,
@@ -20920,6 +21233,308 @@ mod tests {
                 ),
             Err(SearchError::InvalidResumeState { .. })
         ));
+    }
+
+    #[test]
+    fn selected_end_reverse_recovery_matches_full_span_exhaustively() {
+        fn append_haystacks(
+            alphabet: &[u8],
+            remaining: usize,
+            current: &mut Vec<u8>,
+            haystacks: &mut Vec<Vec<u8>>,
+        ) {
+            haystacks.push(current.clone());
+            if remaining == 0 {
+                return;
+            }
+            for &byte in alphabet {
+                current.push(byte);
+                append_haystacks(alphabet, remaining - 1, current, haystacks);
+                current.pop();
+            }
+        }
+
+        let plans = [
+            a_plus(true),
+            a_plus(false),
+            a_star(true),
+            a_star(false),
+            a_question(true),
+            a_question(false),
+            empty_or_a_plus(true, true),
+            empty_or_a_plus(false, true),
+            empty_or_a_plus(false, false),
+            greedy_a_plus_or_a(),
+            greedy_a_star_b(),
+            ordered_ab_or_ac(),
+        ];
+        let mut haystacks = Vec::new();
+        append_haystacks(b"abx", 4, &mut Vec::new(), &mut haystacks);
+
+        for (plan_index, plan) in plans.into_iter().enumerate() {
+            let mut reference_workspace =
+                K0Workspace::new(&plan, WorkspaceLimits::unlimited()).unwrap();
+            let mut endpoint_workspace =
+                K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+            let mut recovery_workspace =
+                K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+            for haystack in &haystacks {
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        let expected = plan
+                            .prepare::<Span>()
+                            .search_window_with_workspace(
+                                haystack,
+                                window,
+                                &mut reference_workspace,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap()
+                            .into_output();
+                        let selected_end = plan
+                            .prepare::<SelectedEnd>()
+                            .search_window_with_workspace(
+                                haystack,
+                                window,
+                                &mut endpoint_workspace,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap()
+                            .into_output();
+                        assert_eq!(
+                            selected_end,
+                            expected.map(MatchSpan::end),
+                            "selected endpoint mismatch for plan {plan_index}, {haystack:?} in {start}..{end}",
+                        );
+                        if let Some(selected_end) = selected_end {
+                            let recovered = plan
+                                .prepare::<Span>()
+                                .recover_span_from_selected_end_with_workspace(
+                                    haystack,
+                                    window,
+                                    &mut recovery_workspace,
+                                    selected_end,
+                                    SearchLimits::unlimited(),
+                                )
+                                .unwrap()
+                                .into_output();
+                            assert_eq!(
+                                Some(recovered),
+                                expected,
+                                "reverse recovery mismatch for plan {plan_index}, {haystack:?} in {start}..{end}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "cold, warm, hard-limit, binding, and empty-endpoint cases share one recovery contract"
+    )]
+    fn selected_end_reverse_recovery_preserves_hard_limits_and_binding() {
+        let plan = greedy_a_star_b();
+        let haystack = b"xxaaabyy";
+        let window = SearchWindow::full(haystack);
+        let selected_end = 6;
+        let expected = MatchSpan::new(2, selected_end);
+        let mut workspace =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+
+        let reverse_bound =
+            super::conservative_reverse_work_bound(&plan, selected_end - window.start()).unwrap();
+        let cold_limit = INVOCATION_RESET_WORK
+            .checked_add(super::reverse_initial_work_upper(&plan).unwrap())
+            .and_then(|work| work.checked_add(reverse_bound))
+            .unwrap();
+        let mut cold_exact =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let cold_exact_scratch = cold_exact.retained_bytes();
+        assert_eq!(
+            plan.prepare::<Span>()
+                .recover_span_from_selected_end_with_workspace(
+                    haystack,
+                    window,
+                    &mut cold_exact,
+                    selected_end,
+                    SearchLimits {
+                        max_work: cold_limit,
+                        max_scratch_bytes: cold_exact_scratch,
+                    },
+                )
+                .unwrap()
+                .into_output(),
+            expected
+        );
+        let mut cold_refused =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let cold_refused_scratch = cold_refused.retained_bytes();
+        assert!(matches!(
+            plan.prepare::<Span>()
+                .recover_span_from_selected_end_with_workspace(
+                    haystack,
+                    window,
+                    &mut cold_refused,
+                    selected_end,
+                    SearchLimits {
+                        max_work: cold_limit - 1,
+                        max_scratch_bytes: cold_refused_scratch,
+                    },
+                ),
+            Err(SearchError::WorkLimitExceeded { .. })
+        ));
+
+        assert_eq!(
+            plan.prepare::<Span>()
+                .recover_span_from_selected_end_with_workspace(
+                    haystack,
+                    window,
+                    &mut workspace,
+                    selected_end,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output(),
+            expected
+        );
+        let warm = plan
+            .prepare::<Span>()
+            .recover_span_from_selected_end_with_workspace(
+                haystack,
+                window,
+                &mut workspace,
+                selected_end,
+                SearchLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(*warm.output(), expected);
+        let accounting = warm.accounting();
+        assert_eq!(accounting.scratch_bytes(), workspace.retained_bytes());
+        assert_eq!(accounting.setup().allocated_bytes(), 0);
+        assert!(accounting.setup().reused());
+
+        let exact = plan
+            .prepare::<Span>()
+            .recover_span_from_selected_end_with_workspace(
+                haystack,
+                window,
+                &mut workspace,
+                selected_end,
+                SearchLimits {
+                    max_work: accounting.work(),
+                    max_scratch_bytes: accounting.scratch_bytes(),
+                },
+            )
+            .unwrap();
+        assert_eq!(*exact.output(), expected);
+        assert_eq!(exact.accounting(), accounting);
+
+        assert!(matches!(
+            plan.prepare::<Span>()
+                .recover_span_from_selected_end_with_workspace(
+                    haystack,
+                    window,
+                    &mut workspace,
+                    selected_end,
+                    SearchLimits {
+                        max_work: accounting.work() - 1,
+                        max_scratch_bytes: accounting.scratch_bytes(),
+                    },
+                ),
+            Err(SearchError::WorkLimitExceeded { .. })
+        ));
+        assert!(matches!(
+            plan.prepare::<Span>()
+                .recover_span_from_selected_end_with_workspace(
+                    haystack,
+                    window,
+                    &mut workspace,
+                    selected_end,
+                    SearchLimits {
+                        max_work: u64::MAX,
+                        max_scratch_bytes: accounting.scratch_bytes() - 1,
+                    },
+                ),
+            Err(SearchError::ResourceLimit {
+                resource: ResourceKind::ScratchBytes,
+                ..
+            })
+        ));
+
+        let mut endpoint_only =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        assert!(matches!(
+            plan.prepare::<Span>()
+                .recover_span_from_selected_end_with_workspace(
+                    haystack,
+                    window,
+                    &mut endpoint_only,
+                    selected_end,
+                    SearchLimits::unlimited(),
+                ),
+            Err(SearchError::InvalidResumeState { .. })
+        ));
+        assert!(matches!(
+            plan.prepare::<Span>()
+                .recover_span_from_selected_end_with_workspace(
+                    haystack,
+                    SearchWindow::new(3, haystack.len()),
+                    &mut workspace,
+                    2,
+                    SearchLimits::unlimited(),
+                ),
+            Err(SearchError::InvalidResumeState { .. })
+        ));
+
+        let foreign = a_plus(true);
+        let mut foreign_workspace =
+            K0Workspace::new_bidirectional(&foreign, WorkspaceLimits::unlimited()).unwrap();
+        assert!(matches!(
+            plan.prepare::<Span>()
+                .recover_span_from_selected_end_with_workspace(
+                    haystack,
+                    window,
+                    &mut foreign_workspace,
+                    selected_end,
+                    SearchLimits::unlimited(),
+                ),
+            Err(SearchError::InvalidResumeState { .. })
+        ));
+
+        let terminal = Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![StateRole::Accept],
+                edge_offsets: vec![0, 0],
+                edge_targets: vec![],
+                edge_kinds: vec![],
+                byte_starts: vec![],
+                byte_ends: vec![],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap();
+        let mut terminal_workspace =
+            K0Workspace::new_bidirectional(&terminal, WorkspaceLimits::unlimited()).unwrap();
+        assert!(!terminal_workspace.reverse.is_allocated());
+        assert_eq!(
+            terminal
+                .prepare::<Span>()
+                .recover_span_from_selected_end_with_workspace(
+                    haystack,
+                    SearchWindow::new(3, haystack.len()),
+                    &mut terminal_workspace,
+                    3,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output(),
+            MatchSpan::new(3, 3)
+        );
     }
 
     #[test]

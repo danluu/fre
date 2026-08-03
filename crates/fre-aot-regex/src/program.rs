@@ -1835,8 +1835,8 @@ struct PartialDfaWorkspace {
 /// guard because they do not amortize the retained-table dispatch. Deep
 /// resumes remain complete partial executions. The same guard covers holes
 /// more cheaply decided by another complete accelerator, a foreign compatible
-/// workspace, and variable-width positive spans that still need ordinary
-/// start recovery.
+/// workspace, and variable-width positive spans that need reverse start
+/// recovery and may lose to another complete accelerator on repeated inputs.
 #[derive(Clone, Copy, Debug, Default)]
 struct PartialDfaRuntimeState {
     consecutive_fallbacks: u8,
@@ -1845,6 +1845,8 @@ struct PartialDfaRuntimeState {
     prefix_supported: bool,
     #[cfg(test)]
     resumed: usize,
+    #[cfg(test)]
+    reverse_recovered: usize,
 }
 
 // Retained rows have a fixed dispatch, workspace, and possible resume cost.
@@ -1895,6 +1897,17 @@ impl PartialDfaRuntimeState {
         } else {
             self.observe_complete();
         }
+    }
+
+    fn observe_reverse_recovered(&mut self, selected_bytes: usize, input_bytes: usize) {
+        #[cfg(test)]
+        {
+            self.reverse_recovered = self.reverse_recovered.saturating_add(1);
+        }
+        // Reverse recovery is exact, but unlike a forward-only completion it
+        // still invokes K0. Keep sampling retained rows so repeated searches
+        // can prefer a cheaper complete accelerator when one exists.
+        self.observe_fallback(selected_bytes, input_bytes);
     }
 
     fn observe_fallback(&mut self, consumed: usize, input_bytes: usize) {
@@ -2710,7 +2723,6 @@ impl CompiledProgram {
         if !state.admit() {
             return Ok(None);
         }
-        let input_bytes = window.end.saturating_sub(window.start);
         match self.output {
             OutputContract::Exists => match partial.exists(
                 haystack,
@@ -2759,20 +2771,37 @@ impl CompiledProgram {
                         Ok(Some(MatchResult::Span(None)))
                     }
                     PartialDfaResult::Complete(Some(end)) => {
-                        let Some(width) = self.exact_match_width else {
-                            // The retained forward rows prove the selected end,
-                            // but variable-width start recovery requires an
-                            // exact reverse machine. Until partial reverse rows
-                            // are retained, let bidirectional K0 recover it.
-                            state.observe_fallback(input_bytes, input_bytes);
-                            return Ok(None);
+                        let start = if let Some(width) = self.exact_match_width {
+                            let start =
+                                end.checked_sub(width)
+                                    .ok_or(CompileError::InternalInvariant(
+                                        "partial fixed-width match end preceded its proved width",
+                                    ))?;
+                            state.observe_complete();
+                            start
+                        } else {
+                            let recovered = self
+                                .automaton
+                                .prepare::<Span>()
+                                .recover_span_from_selected_end_with_workspace(
+                                    haystack,
+                                    K0SearchWindow::new(window.start, window.end),
+                                    workspace,
+                                    end,
+                                    SearchLimits::unlimited(),
+                                )?
+                                .into_output();
+                            if recovered.end() != end {
+                                return Err(CompileError::InternalInvariant(
+                                    "reverse K0 changed the forward-selected endpoint",
+                                ));
+                            }
+                            state.observe_reverse_recovered(
+                                end.saturating_sub(window.start),
+                                window.end.saturating_sub(window.start),
+                            );
+                            recovered.start()
                         };
-                        let start =
-                            end.checked_sub(width)
-                                .ok_or(CompileError::InternalInvariant(
-                                    "partial fixed-width match end preceded its proved width",
-                                ))?;
-                        state.observe_complete();
                         Ok(Some(MatchResult::Span(Some((start, end)))))
                     }
                 }
@@ -7367,6 +7396,28 @@ mod tests {
                 restored_workspace.partial.as_deref().unwrap().state.resumed > 0,
                 "restored {output:?} never exercised stateful K0 resume"
             );
+            if output == OutputContract::Span {
+                assert!(
+                    partial_workspace
+                        .partial
+                        .as_deref()
+                        .unwrap()
+                        .state
+                        .reverse_recovered
+                        > 0,
+                    "fresh Span never exercised selected-end reverse recovery"
+                );
+                assert!(
+                    restored_workspace
+                        .partial
+                        .as_deref()
+                        .unwrap()
+                        .state
+                        .reverse_recovered
+                        > 0,
+                    "restored Span never exercised selected-end reverse recovery"
+                );
+            }
         }
     }
 
@@ -7990,6 +8041,15 @@ mod tests {
         assert!(state.admit());
         state.observe_complete();
         assert!(state.admit());
+        assert_eq!(state.consecutive_fallbacks, 0);
+        assert_eq!(state.bypass_remaining, 0);
+
+        state.observe_reverse_recovered(1, 1_024);
+        assert!(state.admit());
+        state.observe_reverse_recovered(1, 1_024);
+        assert_eq!(state.reverse_recovered, 2);
+        assert_eq!(state.bypass_remaining, 16);
+        state.observe_complete();
         assert_eq!(state.consecutive_fallbacks, 0);
         assert_eq!(state.bypass_remaining, 0);
     }

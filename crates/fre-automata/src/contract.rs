@@ -507,6 +507,45 @@ impl<O: Operation> TypedPlan<'_, O> {
 }
 
 impl TypedPlan<'_, Span> {
+    /// Recover a span from one already authenticated selected endpoint.
+    ///
+    /// This entry runs only K0's reverse machine. `selected_end` must be the
+    /// exact leftmost-first endpoint previously produced for `window` by an
+    /// ordered forward executor over this same immutable automaton. The
+    /// caller-owned workspace must be bound to it and must retain reverse
+    /// storage whenever the endpoint follows the window start.
+    ///
+    /// This facade-only bridge exists for exact partial-DFA producers. It
+    /// retains the ordinary hard work, scratch, reset, and accounting
+    /// contracts and performs no allocation during the prepared call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] for an invalid range or endpoint, incompatible
+    /// workspace, hard-limit refusal, or reverse execution failure.
+    #[doc(hidden)]
+    pub fn recover_span_from_selected_end_with_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut K0Workspace,
+        selected_end: usize,
+        limits: SearchLimits,
+    ) -> Result<SearchReport<MatchSpan>, SearchError> {
+        let report = crate::k0::recover_span_from_selected_end_with_workspace(
+            self.automaton,
+            haystack,
+            window,
+            workspace,
+            selected_end,
+            limits,
+        )?;
+        let span = report.found.ok_or(SearchError::InternalInvariant {
+            detail: "selected-end reverse recovery returned no span",
+        })?;
+        Ok(SearchReport::new(span, report.accounting))
+    }
+
     /// Search a complete-haystack suffix in one non-overlapping traversal.
     ///
     /// The workspace retains source-independent span invocation facts after
