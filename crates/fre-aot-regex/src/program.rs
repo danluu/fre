@@ -1847,6 +1847,8 @@ struct PartialDfaRuntimeState {
     resumed: usize,
     #[cfg(test)]
     reverse_recovered: usize,
+    #[cfg(test)]
+    complete_accelerated: usize,
 }
 
 // Retained rows have a fixed dispatch, workspace, and possible resume cost.
@@ -2664,6 +2666,18 @@ impl CompiledProgram {
             .ok_or(CompileError::InternalInvariant(
                 "partial-DFA program workspace has no K0 storage",
             ))?;
+        if let Some(found) =
+            self.search_nfa_with_retained_complete_accelerators(haystack, window, nfa)?
+        {
+            #[cfg(test)]
+            if let Some(partial_workspace) = workspace.partial.as_deref_mut() {
+                partial_workspace.state.complete_accelerated = partial_workspace
+                    .state
+                    .complete_accelerated
+                    .saturating_add(1);
+            }
+            return Ok(found);
+        }
         let Some(partial_workspace) = workspace.partial.as_deref_mut() else {
             // Keep this defensive path exact without sharing the ordinary hot
             // entry. Public artifact identity normally prevents a workspace
@@ -2681,6 +2695,23 @@ impl CompiledProgram {
             return Ok(found);
         }
         self.search_nfa_unaccelerated(haystack, window, nfa)
+    }
+
+    /// Preserve every complete graph proof available to an ordinary fallback
+    /// before paying the retained-table interpreter. Keeping this wrapper
+    /// distinct from `search_nfa` avoids adding a second caller to the ordinary
+    /// hot entry while retaining the same suffix-then-cut decision order.
+    #[inline(never)]
+    fn search_nfa_with_retained_complete_accelerators(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut K0Workspace,
+    ) -> Result<Option<MatchResult>, CompileError> {
+        if let Some(found) = self.search_nfa_with_mandatory_suffix(haystack, window, workspace)? {
+            return Ok(Some(found));
+        }
+        Ok(self.search_nfa_with_mandatory_cut(haystack, window))
     }
 
     /// Try the mutually exclusive graph-proved forward sidecar. An exact
@@ -7434,7 +7465,7 @@ mod tests {
             .dfa_stats()
             .expect("complete structural probe")
             .forward_states_before_minimization;
-        let limited = program(
+        let mut limited = program(
             pattern,
             OutputContract::SelectedEnd,
             CompileMode::Optimizing,
@@ -7454,6 +7485,11 @@ mod tests {
         let (prefix_plan, supported) = PartialDfaPrefixPlan::derive(limited.anchored_prefix.sets());
         assert!(supported);
         assert!(prefix_plan.is_some());
+
+        // This test isolates the retained prefix classifier. Complete NFA
+        // sidecars are covered separately and now intentionally precede it.
+        limited.nfa_mandatory_suffix = None;
+        limited.nfa_mandatory_cut = None;
 
         let mut haystack = vec![b'x'; PARTIAL_DFA_MIN_INPUT_BYTES];
         haystack.extend_from_slice(b"beeeeeeeeeeZ");
@@ -7481,7 +7517,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_hole_resumes_without_entering_the_ordinary_suffix_tree() {
+    fn partial_entry_runs_complete_suffix_before_a_retained_hole() {
         let pattern = r"[b-c][a-b]{1,10}z";
         let limited = program(
             pattern,
@@ -7539,13 +7575,14 @@ mod tests {
             );
         }
         let state = &workspace.partial.as_deref().unwrap().state;
-        assert_eq!(state.resumed, 2);
-        assert_eq!(state.consecutive_fallbacks, 2);
-        assert_eq!(state.bypass_remaining, 16);
+        assert_eq!(state.complete_accelerated, 2);
+        assert_eq!(state.resumed, 0);
+        assert_eq!(state.consecutive_fallbacks, 0);
+        assert_eq!(state.bypass_remaining, 0);
     }
 
     #[test]
-    fn partial_hole_resumes_without_entering_the_ordinary_cut_tree() {
+    fn partial_entry_runs_complete_cut_before_a_retained_hole() {
         let pattern = r"[b-c][a-b]{1,10}7[A-Za-z]+";
         let limited = program(
             pattern,
@@ -7613,9 +7650,10 @@ mod tests {
             );
         }
         let state = &workspace.partial.as_deref().unwrap().state;
-        assert_eq!(state.resumed, 2);
-        assert_eq!(state.consecutive_fallbacks, 2);
-        assert_eq!(state.bypass_remaining, 16);
+        assert_eq!(state.complete_accelerated, 2);
+        assert_eq!(state.resumed, 0);
+        assert_eq!(state.consecutive_fallbacks, 0);
+        assert_eq!(state.bypass_remaining, 0);
     }
 
     #[test]
@@ -8019,6 +8057,44 @@ mod tests {
     }
 
     #[test]
+    fn retained_entry_preserves_complete_nfa_accelerators() {
+        let pattern = r"[b-c][a-b]{1,10}z";
+        let limits = DeterminizeLimits {
+            max_states: 32,
+            ..DeterminizeLimits::default()
+        };
+        let limited = program(
+            pattern,
+            OutputContract::SelectedEnd,
+            CompileMode::Optimizing,
+            limits,
+        );
+        assert!(limited.partial_dfa().is_some());
+        assert!(limited.nfa_mandatory_suffix.is_some() || limited.nfa_mandatory_cut.is_some());
+        let reference = program(
+            pattern,
+            OutputContract::SelectedEnd,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let haystack = vec![b'x'; 1_024];
+        let window = SearchWindow::full(&haystack);
+        let expected = reference
+            .search(&haystack, window)
+            .expect("reference search");
+        let mut workspace = limited.prepare_workspace().expect("partial workspace");
+        assert_eq!(
+            limited
+                .search_optimized_with_workspace(&haystack, window, &mut workspace)
+                .expect("complete accelerated partial search"),
+            expected
+        );
+        let state = &workspace.partial.as_deref().unwrap().state;
+        assert_eq!(state.complete_accelerated, 1);
+        assert_eq!(state.resumed, 0);
+    }
+
+    #[test]
     fn repeated_early_partial_holes_back_off_and_complete_probe_resets() {
         let mut state = PartialDfaRuntimeState {
             prefix_supported: true,
@@ -8057,7 +8133,7 @@ mod tests {
     #[test]
     fn optimized_authenticated_shallow_holes_back_off_end_to_end() {
         let pattern = r"[b-c][a-b]{1,10}z";
-        let limited = program(
+        let mut limited = program(
             pattern,
             OutputContract::SelectedEnd,
             CompileMode::Optimizing,
@@ -8096,6 +8172,11 @@ mod tests {
         };
         let consumed = resume.position.saturating_sub(window.start);
         assert!(consumed <= 16 || consumed <= haystack.len() / 8);
+
+        // Isolate the adaptive retained-hole policy from the complete suffix
+        // proof that the optimizing entry now correctly tries first.
+        limited.nfa_mandatory_suffix = None;
+        limited.nfa_mandatory_cut = None;
 
         let mut workspace = limited.prepare_workspace().expect("prepared workspace");
         assert!(
