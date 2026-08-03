@@ -876,8 +876,10 @@ impl CompiledProgram {
     /// Allocate and initialize reusable storage for this exact program.
     ///
     /// Ordered-DFA programs require no scratch allocation. Ordered-NFA
-    /// programs retain a fully initialized fixed-capacity K0 workspace, so
-    /// subsequent calls to [`Self::search_with_workspace`] do not allocate.
+    /// programs retain a fully initialized fixed-capacity K0 workspace. The
+    /// workspace includes the bounded endpoint cache for existence/end
+    /// contracts and bidirectional start recovery for spans, so repeated calls
+    /// can reuse learned rows without allocating.
     ///
     /// # Errors
     ///
@@ -885,10 +887,14 @@ impl CompiledProgram {
     /// prepared.
     pub fn prepare_workspace(&self) -> Result<ProgramWorkspace, CompileError> {
         let nfa = match self.engine {
-            ProgramEngine::OrderedNfa => Some(K0Workspace::new(
-                &self.automaton,
-                WorkspaceLimits::unlimited(),
-            )?),
+            ProgramEngine::OrderedNfa => Some(match self.output {
+                OutputContract::Exists | OutputContract::SelectedEnd => {
+                    K0Workspace::new_accelerated(&self.automaton, WorkspaceLimits::unlimited())?
+                }
+                OutputContract::Span => {
+                    K0Workspace::new_bidirectional(&self.automaton, WorkspaceLimits::unlimited())?
+                }
+            }),
             ProgramEngine::OrderedDfa(_) => None,
         };
         Ok(ProgramWorkspace {
@@ -3375,6 +3381,39 @@ mod tests {
                 .unwrap(),
             MatchResult::Span(Some((2, 9)))
         );
+    }
+
+    #[test]
+    fn ordered_nfa_workspace_uses_the_output_specific_persistent_cache() {
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let program = program(
+                "(?:ab|ac|ad)+z",
+                output,
+                CompileMode::Fast,
+                DeterminizeLimits::default(),
+            );
+            let workspace = program.prepare_workspace().expect("prepare NFA workspace");
+            let actual = workspace
+                .nfa
+                .as_ref()
+                .expect("ordered NFA retains K0 storage")
+                .layout();
+            let expected = match output {
+                OutputContract::Exists | OutputContract::SelectedEnd => program
+                    .automaton
+                    .accelerated_workspace_layout()
+                    .expect("endpoint workspace layout"),
+                OutputContract::Span => program
+                    .automaton
+                    .bidirectional_workspace_layout()
+                    .expect("bidirectional workspace layout"),
+            };
+            assert_eq!(actual, expected, "{output:?}");
+        }
     }
 
     #[test]
