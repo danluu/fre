@@ -121,6 +121,11 @@ OPTIONS:
   --output-matrix        Compile every generated regex source under Span,
                          Exists, and SelectedEnd. By default each source keeps
                          its single deterministically assigned contract.
+  --force-resource-fallback
+                         Set the ordinary DFA state budget to zero for every
+                         generated source. Contextual sources retain their
+                         separate assertion fallback route. This is a generic
+                         fallback diagnostic, not a pattern allowlist.
   --seed N               Measure one generated seed (decimal or 0x-prefixed).
                          Both grammar modes accept any new root seed.
   --grammar              Use the separate seeded grammar-generated diagnostic
@@ -155,6 +160,7 @@ struct Config {
     route_filter: Option<String>,
     measurement_order: MeasurementOrder,
     output_matrix: bool,
+    force_resource_fallback: bool,
     seed_filter: Option<u64>,
     grammar: bool,
     nested_grammar: bool,
@@ -174,6 +180,7 @@ struct PartialConfig {
     route_filter: Option<String>,
     measurement_order: Option<MeasurementOrder>,
     output_matrix: bool,
+    force_resource_fallback: bool,
     seed_filter: Option<u64>,
     grammar: bool,
     nested_grammar: bool,
@@ -188,6 +195,7 @@ impl Config {
                 Some("-h" | "--help") => return Ok(None),
                 Some("--smoke") => partial.smoke = true,
                 Some("--output-matrix") => partial.output_matrix = true,
+                Some("--force-resource-fallback") => partial.force_resource_fallback = true,
                 Some("--grammar") => partial.grammar = true,
                 Some("--nested-grammar") => partial.nested_grammar = true,
                 Some("--trials") => {
@@ -289,6 +297,7 @@ impl Config {
             route_filter: partial.route_filter,
             measurement_order: partial.measurement_order.unwrap_or_default(),
             output_matrix: partial.output_matrix,
+            force_resource_fallback: partial.force_resource_fallback,
             seed_filter: partial.seed_filter,
             grammar: partial.grammar,
             nested_grammar: partial.nested_grammar,
@@ -1806,10 +1815,21 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
                     .is_none_or(|name| spec.base_name == name || spec.name == name)
         })
         .map(|spec| {
+            let has_context_assertions = matches!(
+                spec.family,
+                "line_assertion"
+                    | "word_assertion"
+                    | "grammar_assertion"
+                    | "nested_line_assertion"
+                    | "nested_word_assertion"
+            );
+            let force_ordinary_fallback = spec.force_fallback
+                || config.force_resource_fallback && !has_context_assertions;
+            let force_runtime_fallback = spec.force_fallback || config.force_resource_fallback;
             let upstream = Regex::new(&spec.pattern)
                 .map_err(|error| format!("{} upstream compilation failed: {error}", spec.name))?;
             let mut limits = CompileLimitsV1::default();
-            if spec.force_fallback {
+            if force_runtime_fallback {
                 limits.determinize.max_states = 0;
             }
             let aot = compile(
@@ -1834,21 +1854,14 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
                 ));
             }
             let reason = aot.receipt().engine_selection_reason;
-            if spec.force_fallback && reason != EngineSelectionReason::DeterminizationResourceLimit
+            if force_ordinary_fallback
+                && reason != EngineSelectionReason::DeterminizationResourceLimit
             {
                 return Err(format!(
                     "{} did not take forced resource fallback: {reason:?}",
                     spec.name
                 ));
             }
-            let has_context_assertions = matches!(
-                spec.family,
-                "line_assertion"
-                    | "word_assertion"
-                    | "grammar_assertion"
-                    | "nested_line_assertion"
-                    | "nested_word_assertion"
-            );
             if has_context_assertions
                 && !matches!(
                     reason,
@@ -1865,7 +1878,7 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
                 .module()
                 .required_runtime_program()
                 .map(|(symbol, bytes)| (symbol.to_owned(), bytes));
-            if spec.force_fallback && runtime_program.is_none() {
+            if force_runtime_fallback && runtime_program.is_none() {
                 return Err(format!(
                     "{} forced resource fallback did not retain a runtime program",
                     spec.name
@@ -1875,6 +1888,7 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
                 && reason == EngineSelectionReason::DeterminizationResourceLimit;
             if runtime_program.is_some()
                 && !spec.force_fallback
+                && !config.force_resource_fallback
                 && !has_context_assertions
                 && !natural_resource_fallback
             {
@@ -3411,6 +3425,10 @@ fn print_environment(config: &Config, shapes: &[CompiledShape], scenario_count: 
             "assigned_v1"
         }
     );
+    println!(
+        "environment\tforce_resource_fallback\t{}",
+        config.force_resource_fallback
+    );
     println!("environment\tseeds\t{seeds}");
     println!("environment\tcompiled_patterns\t{}", shapes.len());
     println!("environment\tscenarios\t{scenario_count}");
@@ -3431,7 +3449,7 @@ fn run(config: &Config) -> Result<(), String> {
     };
     let shapes = compile_shapes(config)?;
     eprintln!(
-        "generated comparison: {architecture}-{operating_system}, patterns={}, cells={}, feature_bits={:#x}, trials={}, bytes_per_trial={}, min_searches={}, min_trial_ns={}, smoke={}, grammar={}, nested_grammar={}, output_matrix={}, family_filter={}, pattern_filter={}, route_filter={}, measurement_order={}, seed_filter={}",
+        "generated comparison: {architecture}-{operating_system}, patterns={}, cells={}, feature_bits={:#x}, trials={}, bytes_per_trial={}, min_searches={}, min_trial_ns={}, smoke={}, grammar={}, nested_grammar={}, output_matrix={}, force_resource_fallback={}, family_filter={}, pattern_filter={}, route_filter={}, measurement_order={}, seed_filter={}",
         shapes.len(),
         shapes.len() * sizes(config).len() * positions(config).len() * densities(config).len(),
         config.target.features.bits(),
@@ -3443,6 +3461,7 @@ fn run(config: &Config) -> Result<(), String> {
         config.grammar,
         config.nested_grammar,
         config.output_matrix,
+        config.force_resource_fallback,
         config.family_filter.as_deref().unwrap_or("all"),
         config.pattern_filter.as_deref().unwrap_or("all"),
         config.route_filter.as_deref().unwrap_or("all"),
@@ -3508,6 +3527,7 @@ mod tests {
             route_filter: None,
             measurement_order: MeasurementOrder::default(),
             output_matrix: false,
+            force_resource_fallback: false,
             seed_filter,
             grammar: true,
             nested_grammar: false,
