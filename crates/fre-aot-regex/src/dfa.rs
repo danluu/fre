@@ -575,6 +575,10 @@ struct PartialForwardDfa {
     initial_pending: bool,
     initial_terminal: bool,
     transitions: Vec<ForwardCell>,
+    /// Derived hot-loop representation of `transitions`. The stable wire
+    /// format and native lowering continue to use the explicit cells above;
+    /// portable retained-row execution needs only one 32-bit load per byte.
+    packed_transitions: Box<[PackedForwardCell]>,
     /// Source-independent effect of every completed transition on a scalar
     /// proof that all live ordered threads share one match start. This is a
     /// derived in-memory certificate: stable artifacts regenerate it while
@@ -588,6 +592,35 @@ struct PartialForwardDfa {
     /// only set membership. Complete source rows need no key at runtime;
     /// entering this suffix is the authenticated K0 resume boundary.
     resume_keys: Vec<ForwardKey>,
+}
+
+const PARTIAL_CELL_ACCEPTED: u32 = 1 << 31;
+const PARTIAL_CELL_NEXT_MASK: u32 = PARTIAL_CELL_ACCEPTED - 1;
+const PARTIAL_CELL_DEAD: u32 = PARTIAL_CELL_NEXT_MASK;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(transparent)]
+struct PackedForwardCell(u32);
+
+impl PackedForwardCell {
+    fn from_cell(cell: ForwardCell) -> Option<Self> {
+        let next = if cell.next == NO_STATE {
+            PARTIAL_CELL_DEAD
+        } else if cell.next < PARTIAL_CELL_DEAD {
+            cell.next
+        } else {
+            return None;
+        };
+        Some(Self(next | u32::from(cell.accepted) * PARTIAL_CELL_ACCEPTED))
+    }
+
+    const fn accepted(self) -> bool {
+        self.0 & PARTIAL_CELL_ACCEPTED != 0
+    }
+
+    const fn next(self) -> u32 {
+        self.0 & PARTIAL_CELL_NEXT_MASK
+    }
 }
 
 enum ForwardBuildOutcome {
@@ -1284,12 +1317,23 @@ impl PartialDfa {
         forward: ForwardDfa,
         effective_limits: DeterminizeLimits,
     ) -> Self {
+        let packed_transitions = forward
+            .transitions
+            .iter()
+            .copied()
+            .map(|cell| {
+                PackedForwardCell::from_cell(cell)
+                    .expect("stable DFA state ceiling fits packed partial cells")
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         Self {
             alphabet,
             forward: PartialForwardDfa {
                 initial_pending: forward.initial_pending,
                 initial_terminal: forward.initial_terminal,
                 transitions: forward.transitions,
+                packed_transitions,
                 start_actions: Vec::new(),
                 discovered_states: forward.states,
                 complete_rows: forward.states,
@@ -1377,7 +1421,7 @@ impl PartialDfa {
                 .ok_or(CompileError::InternalInvariant(
                     "partial DFA transition index overflowed",
                 ))?;
-            let cell = *self.forward.transitions.get(index).ok_or(
+            let cell = *self.forward.packed_transitions.get(index).ok_or(
                 CompileError::InternalInvariant("partial DFA row is incomplete"),
             )?;
             position = position
@@ -1398,7 +1442,7 @@ impl PartialDfa {
             } else {
                 None
             };
-            if cell.accepted {
+            if cell.accepted() {
                 pending_end = Some(position);
                 pending_start = next_start;
                 if earliest {
@@ -1408,13 +1452,14 @@ impl PartialDfa {
                     }));
                 }
             }
-            if cell.next == NO_STATE {
+            let next = cell.next();
+            if next == PARTIAL_CELL_DEAD {
                 return Ok(PartialDfaResult::Complete(PartialDfaSelection {
                     end: pending_end,
                     start: pending_start,
                 }));
             }
-            if usize::try_from(cell.next)
+            if usize::try_from(next)
                 .ok()
                 .is_none_or(|next| next >= self.forward.discovered_states)
             {
@@ -1422,7 +1467,7 @@ impl PartialDfa {
                     "partial DFA transition references an undiscovered state",
                 ));
             }
-            state = cell.next;
+            state = next;
             active_start = next_start;
         }
         Ok(PartialDfaResult::Complete(PartialDfaSelection {
@@ -1745,6 +1790,7 @@ impl PartialDfa {
             ));
         }
         let mut transitions = dfa_reserve(cell_count, "partial DFA cell")?;
+        let mut packed_transitions = dfa_reserve(cell_count, "packed partial DFA cell")?;
         for _ in 0..cell_count {
             let next = reader.u32("partial DFA cell is truncated")?;
             if next != NO_STATE
@@ -1756,7 +1802,11 @@ impl PartialDfa {
             }
             let accepted = reader.boolean("partial DFA accepted flag is invalid")?;
             reader.zeros(3, "partial DFA cell reserved bytes are non-zero")?;
-            transitions.push(ForwardCell { next, accepted });
+            let cell = ForwardCell { next, accepted };
+            packed_transitions.push(PackedForwardCell::from_cell(cell).ok_or(
+                ProgramFormatError::Malformed("partial DFA cell exceeds packed state range"),
+            )?);
+            transitions.push(cell);
         }
         let mut resume_keys = dfa_reserve(resume_state_count, "partial DFA resume state")?;
         let mut decoded_resume_items = 0usize;
@@ -1814,6 +1864,7 @@ impl PartialDfa {
                 initial_pending,
                 initial_terminal,
                 transitions,
+                packed_transitions: packed_transitions.into_boxed_slice(),
                 start_actions: Vec::new(),
                 discovered_states,
                 complete_rows,
@@ -3746,6 +3797,11 @@ fn compact_partial_forward(
         .try_reserve_exact(completed_cells)
         .ok()?;
     compact_transitions.extend_from_slice(completed);
+    let mut packed_transitions = Vec::new();
+    packed_transitions.try_reserve_exact(completed_cells).ok()?;
+    for &cell in completed {
+        packed_transitions.push(PackedForwardCell::from_cell(cell)?);
+    }
     let completed_actions = start_actions.get(..completed_cells)?;
     let mut compact_start_actions = Vec::new();
     compact_start_actions
@@ -3762,6 +3818,7 @@ fn compact_partial_forward(
         initial_pending,
         initial_terminal,
         transitions: compact_transitions,
+        packed_transitions: packed_transitions.into_boxed_slice(),
         start_actions: compact_start_actions,
         discovered_states,
         complete_rows,
@@ -5027,6 +5084,31 @@ fn put_u64(bytes: &mut Vec<u8>, value: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_partial_cells_round_trip_every_semantic_boundary() {
+        assert_eq!(core::mem::size_of::<PackedForwardCell>(), 4);
+        for next in [0, 1, MAX_STABLE_DFA_STATES as u32 - 1, NO_STATE] {
+            for accepted in [false, true] {
+                let packed = PackedForwardCell::from_cell(ForwardCell { next, accepted })
+                    .expect("stable partial state fits packed cell");
+                assert_eq!(packed.accepted(), accepted);
+                assert_eq!(
+                    packed.next(),
+                    if next == NO_STATE {
+                        PARTIAL_CELL_DEAD
+                    } else {
+                        next
+                    }
+                );
+            }
+        }
+        assert!(PackedForwardCell::from_cell(ForwardCell {
+            next: PARTIAL_CELL_DEAD,
+            accepted: false,
+        })
+        .is_none());
+    }
 
     #[test]
     fn partial_prefix_full_byte_classifier_matches_scalar_at_every_alignment() {
