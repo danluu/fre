@@ -607,6 +607,7 @@ struct NfaMandatorySuffix {
 
 /// Find the first member of an arbitrary byte set through the host-selected
 /// wide/narrow classifier and a scalar tail.
+#[cfg(test)]
 fn find_full_byte_set_member(
     set: ByteSet256,
     classifier: &ByteSetClassifier,
@@ -724,7 +725,183 @@ impl NfaExactProductPlan {
 }
 
 impl NfaExactProduct {
+    #[inline]
+    fn no_match(output: OutputContract) -> MatchResult {
+        match output {
+            OutputContract::Exists => MatchResult::Exists(false),
+            OutputContract::SelectedEnd => MatchResult::SelectedEnd(None),
+            OutputContract::Span => MatchResult::Span(None),
+        }
+    }
+
+    #[inline]
+    fn matched(start: usize, width: usize, output: OutputContract) -> MatchResult {
+        let end = start
+            .checked_add(width)
+            .expect("validated exact-product candidate width");
+        match output {
+            OutputContract::Exists => MatchResult::Exists(true),
+            OutputContract::SelectedEnd => MatchResult::SelectedEnd(Some(end)),
+            OutputContract::Span => MatchResult::Span(Some((start, end))),
+        }
+    }
+
+    #[inline(always)]
+    fn matches_at(
+        prefix: &AnchoredPrefix,
+        haystack: &[u8],
+        start: usize,
+        primary_offset: usize,
+    ) -> bool {
+        prefix
+            .sets()
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(depth, _)| *depth != primary_offset)
+            .all(|(depth, set)| {
+                start
+                    .checked_add(depth)
+                    .and_then(|position| haystack.get(position))
+                    .is_some_and(|&byte| set.contains(byte))
+            })
+    }
+
+    #[inline]
+    fn find_small_primary(bytes: [u8; 3], count: u8, haystack: &[u8]) -> Option<usize> {
+        match count {
+            1 => memchr(bytes[0], haystack),
+            2 => memchr2(bytes[0], bytes[1], haystack),
+            3 => memchr3(bytes[0], bytes[1], bytes[2], haystack),
+            _ => None,
+        }
+    }
+
     #[inline(never)]
+    fn search_small(
+        self,
+        bytes: [u8; 3],
+        count: u8,
+        prefix: &AnchoredPrefix,
+        haystack: &[u8],
+        mut scan: usize,
+        scan_end: usize,
+        output: OutputContract,
+    ) -> MatchResult {
+        let width = usize::from(self.width);
+        let offset = usize::from(self.primary_offset);
+        while scan < scan_end {
+            let Some(source) = haystack.get(scan..scan_end) else {
+                return Self::no_match(output);
+            };
+            let Some(relative) = Self::find_small_primary(bytes, count, source) else {
+                return Self::no_match(output);
+            };
+            let Some(hit) = scan.checked_add(relative) else {
+                return Self::no_match(output);
+            };
+            let Some(start) = hit.checked_sub(offset) else {
+                return Self::no_match(output);
+            };
+            if Self::matches_at(prefix, haystack, start, offset) {
+                return Self::matched(start, width, output);
+            }
+            let Some(next) = hit.checked_add(1) else {
+                return Self::no_match(output);
+            };
+            scan = next;
+        }
+        Self::no_match(output)
+    }
+
+    #[inline(never)]
+    fn search_full_blocks(
+        self,
+        set: ByteSet256,
+        classifier: &ByteSetClassifier,
+        prefix: &AnchoredPrefix,
+        haystack: &[u8],
+        mut scan: usize,
+        scan_end: usize,
+        output: OutputContract,
+    ) -> MatchResult {
+        let width = usize::from(self.width);
+        let offset = usize::from(self.primary_offset);
+        while scan_end.saturating_sub(scan) >= BYTE_SET_WIDE_BLOCK_BYTES {
+            let Some(end) = scan.checked_add(BYTE_SET_WIDE_BLOCK_BYTES) else {
+                return Self::no_match(output);
+            };
+            let Some(block) = haystack
+                .get(scan..end)
+                .and_then(|bytes| <&[u8; BYTE_SET_WIDE_BLOCK_BYTES]>::try_from(bytes).ok())
+            else {
+                return Self::no_match(output);
+            };
+            let mut mask = classifier.classify_32(block).member_mask();
+            while mask != 0 {
+                let lane = usize::try_from(mask.trailing_zeros())
+                    .expect("a 32-bit candidate lane fits usize");
+                let hit = scan
+                    .checked_add(lane)
+                    .expect("candidate lane remains inside the search window");
+                let start = hit
+                    .checked_sub(offset)
+                    .expect("primary scan begins at the anchored offset");
+                if Self::matches_at(prefix, haystack, start, offset) {
+                    return Self::matched(start, width, output);
+                }
+                mask &= mask - 1;
+            }
+            scan = end;
+        }
+        if scan_end.saturating_sub(scan) >= BYTE_SET_BLOCK_BYTES {
+            let Some(end) = scan.checked_add(BYTE_SET_BLOCK_BYTES) else {
+                return Self::no_match(output);
+            };
+            let Some(block) = haystack
+                .get(scan..end)
+                .and_then(|bytes| <&[u8; BYTE_SET_BLOCK_BYTES]>::try_from(bytes).ok())
+            else {
+                return Self::no_match(output);
+            };
+            let mut mask = classifier.classify_16(block).member_mask();
+            while mask != 0 {
+                let lane = usize::try_from(mask.trailing_zeros())
+                    .expect("a 16-bit candidate lane fits usize");
+                let hit = scan
+                    .checked_add(lane)
+                    .expect("candidate lane remains inside the search window");
+                let start = hit
+                    .checked_sub(offset)
+                    .expect("primary scan begins at the anchored offset");
+                if Self::matches_at(prefix, haystack, start, offset) {
+                    return Self::matched(start, width, output);
+                }
+                mask &= mask - 1;
+            }
+            scan = end;
+        }
+        while scan < scan_end {
+            let Some(&byte) = haystack.get(scan) else {
+                return Self::no_match(output);
+            };
+            if set.contains(byte) {
+                let start = scan
+                    .checked_sub(offset)
+                    .expect("primary scan begins at the anchored offset");
+                if Self::matches_at(prefix, haystack, start, offset) {
+                    return Self::matched(start, width, output);
+                }
+            }
+            let Some(next) = scan.checked_add(1) else {
+                return Self::no_match(output);
+            };
+            scan = next;
+        }
+        Self::no_match(output)
+    }
+
+    #[inline(always)]
     fn search(
         self,
         scanner: &NfaMandatoryCutScanner,
@@ -735,67 +912,30 @@ impl NfaExactProduct {
     ) -> MatchResult {
         let width = usize::from(self.width);
         let offset = usize::from(self.primary_offset);
-        let no_match = || match output {
-            OutputContract::Exists => MatchResult::Exists(false),
-            OutputContract::SelectedEnd => MatchResult::SelectedEnd(None),
-            OutputContract::Span => MatchResult::Span(None),
-        };
         let Some(last_start) = window.end.checked_sub(width) else {
-            return no_match();
+            return Self::no_match(output);
         };
         if last_start < window.start {
-            return no_match();
+            return Self::no_match(output);
         }
-        let Some(mut scan) = window.start.checked_add(offset) else {
-            return no_match();
+        let Some(scan) = window.start.checked_add(offset) else {
+            return Self::no_match(output);
         };
         let Some(scan_end) = last_start
             .checked_add(offset)
             .and_then(|last| last.checked_add(1))
         else {
-            return no_match();
+            return Self::no_match(output);
         };
-
-        while scan < scan_end {
-            let Some(source) = haystack.get(scan..scan_end) else {
-                return no_match();
-            };
-            let Some(relative) = scanner.find_exact_product_primary(source) else {
-                return no_match();
-            };
-            let Some(hit) = scan.checked_add(relative) else {
-                return no_match();
-            };
-            let Some(start) = hit.checked_sub(offset) else {
-                return no_match();
-            };
-            let exact = prefix
-                .sets()
-                .iter()
-                .copied()
-                .enumerate()
-                .all(|(depth, set)| {
-                    start
-                        .checked_add(depth)
-                        .and_then(|position| haystack.get(position))
-                        .is_some_and(|&byte| set.contains(byte))
-                });
-            if exact {
-                let end = start
-                    .checked_add(width)
-                    .expect("validated exact-product candidate width");
-                return match output {
-                    OutputContract::Exists => MatchResult::Exists(true),
-                    OutputContract::SelectedEnd => MatchResult::SelectedEnd(Some(end)),
-                    OutputContract::Span => MatchResult::Span(Some((start, end))),
-                };
-            }
-            let Some(next) = hit.checked_add(1) else {
-                return no_match();
-            };
-            scan = next;
+        match scanner {
+            NfaMandatoryCutScanner::Small { bytes, count } => self.search_small(
+                *bytes, *count, prefix, haystack, scan, scan_end, output,
+            ),
+            NfaMandatoryCutScanner::Full { set, classifier } => self.search_full_blocks(
+                *set, classifier, prefix, haystack, scan, scan_end, output,
+            ),
+            NfaMandatoryCutScanner::Ascii { .. } => Self::no_match(output),
         }
-        no_match()
     }
 }
 
@@ -1474,6 +1614,7 @@ enum NfaMandatoryCutScanner {
 }
 
 impl NfaMandatoryCutScanner {
+    #[cfg(test)]
     fn find_exact_product_primary(&self, haystack: &[u8]) -> Option<usize> {
         match self {
             Self::Small { bytes, count: 1 } => memchr(bytes[0], haystack),
@@ -5638,6 +5779,76 @@ mod tests {
                         bytes.iter().position(|&byte| set.contains(byte)),
                         "cardinality={cardinality}, start={start}, length={length}"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exact_product_full_scanner_batches_dense_candidates_across_block_boundaries() {
+        let fallback_limits = DeterminizeLimits {
+            max_states: 0,
+            ..DeterminizeLimits::default()
+        };
+        let mut cardinality_four = vec![b'a'; 96];
+        let mut cardinality_255 = vec![1_u8; 96];
+        for offset in [15usize, 32, 63, 88] {
+            cardinality_four[offset.saturating_sub(3)..offset].fill(b'z');
+            cardinality_four[offset..offset + 4].copy_from_slice(b"aeim");
+            cardinality_255[offset.saturating_sub(3)..offset].fill(u8::MAX);
+            cardinality_255[offset..offset + 4].fill(0);
+        }
+        for (pattern, haystack) in [
+            ("[a-d][e-h][i-l][m-p]", cardinality_four.as_slice()),
+            (
+                r"(?-u:[\x00-\xFE][^\x01][^\x02][^\x03])",
+                cardinality_255.as_slice(),
+            ),
+        ] {
+            for output in [
+                OutputContract::Exists,
+                OutputContract::SelectedEnd,
+                OutputContract::Span,
+            ] {
+                let accelerated =
+                    program(pattern, output, CompileMode::Optimizing, fallback_limits);
+                assert!(matches!(
+                    accelerated
+                        .nfa_mandatory_cut
+                        .as_ref()
+                        .expect("dense exact product")
+                        .scanner,
+                    NfaMandatoryCutScanner::Full { .. }
+                ));
+                let reference = program(
+                    pattern,
+                    output,
+                    CompileMode::Fast,
+                    DeterminizeLimits::default(),
+                );
+                let mut accelerated_workspace = accelerated.prepare_workspace().unwrap();
+                let mut reference_workspace = reference.prepare_workspace().unwrap();
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        assert_eq!(
+                            accelerated
+                                .search_with_workspace(
+                                    haystack,
+                                    window,
+                                    &mut accelerated_workspace,
+                                )
+                                .unwrap(),
+                            reference
+                                .search_with_workspace(
+                                    haystack,
+                                    window,
+                                    &mut reference_workspace,
+                                )
+                                .unwrap(),
+                            "{pattern}/{output:?}/{start}..{end}"
+                        );
+                    }
                 }
             }
         }
