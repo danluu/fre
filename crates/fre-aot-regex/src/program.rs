@@ -568,6 +568,8 @@ impl CompiledProgram {
         limits: DeterminizeLimits,
     ) -> Result<Self, CompileError> {
         let line_terminator = automaton.line_terminator();
+        let exact_match_width = derive_exact_match_width(&raw);
+        let needs_reverse_span = output == OutputContract::Span && exact_match_width.is_none();
         let contains_context_assertions = raw
             .edge_kinds
             .iter()
@@ -615,24 +617,22 @@ impl CompiledProgram {
                     Some(contextual_report),
                 )
             }
-            CompileMode::Optimizing => {
-                match dfa::determinize(&raw, output == OutputContract::Span, limits)? {
-                    DeterminizeOutcome::Complete { machine, report } => (
-                        ProgramEngine::OrderedDfa(machine),
-                        EngineSelectionReason::CompleteDfa,
-                        report,
-                        None,
-                        None,
-                    ),
-                    DeterminizeOutcome::Declined(report) => (
-                        ProgramEngine::OrderedNfa,
-                        EngineSelectionReason::DeterminizationResourceLimit,
-                        report,
-                        None,
-                        None,
-                    ),
-                }
-            }
+            CompileMode::Optimizing => match dfa::determinize(&raw, needs_reverse_span, limits)? {
+                DeterminizeOutcome::Complete { machine, report } => (
+                    ProgramEngine::OrderedDfa(machine),
+                    EngineSelectionReason::CompleteDfa,
+                    report,
+                    None,
+                    None,
+                ),
+                DeterminizeOutcome::Declined(report) => (
+                    ProgramEngine::OrderedNfa,
+                    EngineSelectionReason::DeterminizationResourceLimit,
+                    report,
+                    None,
+                    None,
+                ),
+            },
         };
         let identity = automaton_digest(&raw, line_terminator);
         let anchored_prefix = derive_anchored_prefix(&raw);
@@ -642,7 +642,6 @@ impl CompiledProgram {
         } else {
             RequiredLiterals::unavailable()
         };
-        let exact_match_width = derive_exact_match_width(&raw);
         let max_match_width = derive_max_match_width(&raw);
         Ok(Self {
             raw,
@@ -876,8 +875,10 @@ impl CompiledProgram {
     /// Allocate and initialize reusable storage for this exact program.
     ///
     /// Ordered-DFA programs require no scratch allocation. Ordered-NFA
-    /// programs retain a fully initialized fixed-capacity K0 workspace, so
-    /// subsequent calls to [`Self::search_with_workspace`] do not allocate.
+    /// programs retain a fully initialized fixed-capacity K0 workspace. The
+    /// workspace includes the bounded endpoint cache for existence/end
+    /// contracts and bidirectional start recovery for spans, so repeated calls
+    /// can reuse learned rows without allocating.
     ///
     /// # Errors
     ///
@@ -885,10 +886,17 @@ impl CompiledProgram {
     /// prepared.
     pub fn prepare_workspace(&self) -> Result<ProgramWorkspace, CompileError> {
         let nfa = match self.engine {
-            ProgramEngine::OrderedNfa => Some(K0Workspace::new(
-                &self.automaton,
-                WorkspaceLimits::unlimited(),
-            )?),
+            ProgramEngine::OrderedNfa => Some(match self.output {
+                OutputContract::Exists | OutputContract::SelectedEnd => {
+                    K0Workspace::new_accelerated(&self.automaton, WorkspaceLimits::unlimited())?
+                }
+                OutputContract::Span if self.exact_match_width.is_some() => {
+                    K0Workspace::new_accelerated(&self.automaton, WorkspaceLimits::unlimited())?
+                }
+                OutputContract::Span => {
+                    K0Workspace::new_bidirectional(&self.automaton, WorkspaceLimits::unlimited())?
+                }
+            }),
             ProgramEngine::OrderedDfa(_) => None,
         };
         Ok(ProgramWorkspace {
@@ -995,12 +1003,26 @@ impl CompiledProgram {
                 Ok(MatchResult::SelectedEnd(found))
             }
             OutputContract::Span => {
-                let found = self
-                    .automaton
-                    .prepare::<Span>()
-                    .search_window_with_workspace(haystack, window, workspace, limits)?
-                    .into_output()
-                    .map(|span| (span.start(), span.end()));
+                let found = if let Some(width) = self.exact_match_width {
+                    self.automaton
+                        .prepare::<SelectedEnd>()
+                        .search_window_with_workspace(haystack, window, workspace, limits)?
+                        .into_output()
+                        .map(|end| {
+                            end.checked_sub(width).map(|start| (start, end)).ok_or(
+                                CompileError::InternalInvariant(
+                                    "fixed-width NFA match end preceded its proved width",
+                                ),
+                            )
+                        })
+                        .transpose()?
+                } else {
+                    self.automaton
+                        .prepare::<Span>()
+                        .search_window_with_workspace(haystack, window, workspace, limits)?
+                        .into_output()
+                        .map(|span| (span.start(), span.end()))
+                };
                 Ok(MatchResult::Span(found))
             }
         }
@@ -1148,6 +1170,7 @@ impl CompiledProgram {
         );
         let raw = deserialize_raw(&mut reader)?;
         let automaton = deserialize_automaton(&raw, line_terminator)?;
+        let exact_match_width = derive_exact_match_width(&raw);
 
         let dfa_len = reader.usize_u64("DFA byte length")?;
         let dfa_bytes = reader.take(dfa_len, "DFA body is truncated")?;
@@ -1179,10 +1202,11 @@ impl CompiledProgram {
                 let machine = OrderedDfa::deserialize(
                     dfa_bytes,
                     output,
+                    exact_match_width,
                     alphabet_shape.boundary_classes,
                     &alphabet_shape.boundary_starts,
                 )?;
-                machine.validate_canonical(&raw, output)?;
+                machine.validate_canonical(&raw)?;
                 ProgramEngine::OrderedDfa(machine)
             }
         };
@@ -1199,7 +1223,6 @@ impl CompiledProgram {
         } else {
             RequiredLiterals::unavailable()
         };
-        let exact_match_width = derive_exact_match_width(&raw);
         let max_match_width = derive_max_match_width(&raw);
         let program = Self {
             raw,
@@ -2729,6 +2752,7 @@ fn put_u64(bytes: &mut Vec<u8>, value: u64) {
 
 #[cfg(test)]
 mod tests {
+    use crate::dfa::DeterminizationStage;
     use fre_automata::{Automaton, CompileLimits};
     use fre_lower::{LowerLimits, OperationSemantics};
     use fre_syntax::{CanonicalPattern, CompatibilityProfile, ParseRequest, RustProfile};
@@ -3374,6 +3398,128 @@ mod tests {
                 .search(b"xxabacadz", SearchWindow::full(b"xxabacadz"))
                 .unwrap(),
             MatchResult::Span(Some((2, 9)))
+        );
+    }
+
+    #[test]
+    fn ordered_nfa_workspace_uses_the_output_specific_persistent_cache() {
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let program = program(
+                "(?:ab|ac|ad)+z",
+                output,
+                CompileMode::Fast,
+                DeterminizeLimits::default(),
+            );
+            let workspace = program.prepare_workspace().expect("prepare NFA workspace");
+            let actual = workspace
+                .nfa
+                .as_ref()
+                .expect("ordered NFA retains K0 storage")
+                .layout();
+            let expected = match output {
+                OutputContract::Exists | OutputContract::SelectedEnd => program
+                    .automaton
+                    .accelerated_workspace_layout()
+                    .expect("endpoint workspace layout"),
+                OutputContract::Span => program
+                    .automaton
+                    .bidirectional_workspace_layout()
+                    .expect("bidirectional workspace layout"),
+            };
+            assert_eq!(actual, expected, "{output:?}");
+        }
+
+        let fixed_span = program(
+            "(?:ab|cd)",
+            OutputContract::Span,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        assert_eq!(fixed_span.exact_match_width, Some(2));
+        let workspace = fixed_span
+            .prepare_workspace()
+            .expect("prepare fixed-width span workspace");
+        assert_eq!(
+            workspace
+                .nfa
+                .as_ref()
+                .expect("ordered NFA retains K0 storage")
+                .layout(),
+            fixed_span
+                .automaton
+                .accelerated_workspace_layout()
+                .expect("fixed-width span endpoint layout")
+        );
+        assert_eq!(
+            fixed_span
+                .search(b"xxcdyy", SearchWindow::full(b"xxcdyy"))
+                .expect("fixed-width fallback search"),
+            MatchResult::Span(Some((2, 4)))
+        );
+    }
+
+    #[test]
+    fn exact_width_span_omits_reverse_dfa_and_accepts_legacy_redundancy() {
+        let optimized = program(
+            "abc",
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            DeterminizeLimits::default(),
+        );
+        let stats = optimized.dfa_stats().expect("complete exact-width DFA");
+        assert_eq!(optimized.exact_match_width, Some(3));
+        assert_eq!(stats.reverse_states, 0);
+        assert!(
+            !optimized
+                .determinization_report()
+                .expect("fresh determinization receipt")
+                .attempted_stages
+                .contains(&DeterminizationStage::ReverseSubsetConstruction)
+        );
+        assert_eq!(
+            optimized
+                .search(b"xxabcxx", SearchWindow::full(b"xxabcxx"))
+                .expect("exact-width direct search"),
+            MatchResult::Span(Some((2, 5)))
+        );
+
+        // V2 artifacts emitted before this optimization redundantly retained
+        // reverse start recovery for every nonnullable Span. Their presence
+        // remains canonical under the old construction choice and must stay
+        // readable even though new exact-width artifacts omit it.
+        let mut legacy = program(
+            "abc",
+            OutputContract::Span,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let legacy_machine = match dfa::determinize(&legacy.raw, true, DeterminizeLimits::default())
+            .expect("legacy reverse determinization")
+        {
+            DeterminizeOutcome::Complete { machine, .. } => machine,
+            DeterminizeOutcome::Declined(report) => {
+                panic!("legacy reverse determinization declined: {report:?}")
+            }
+        };
+        assert!(legacy_machine.stats().reverse_states > 0);
+        legacy.engine = ProgramEngine::OrderedDfa(legacy_machine);
+        legacy.engine_selection_reason = Some(EngineSelectionReason::CompleteDfa);
+        let restored = CompiledProgram::deserialize(
+            &legacy
+                .serialize()
+                .expect("serialize legacy exact-width DFA"),
+        )
+        .expect("deserialize legacy exact-width DFA");
+        assert!(restored.dfa_stats().unwrap().reverse_states > 0);
+        assert_eq!(
+            restored
+                .search(b"xxabcxx", SearchWindow::full(b"xxabcxx"))
+                .expect("legacy exact-width direct search"),
+            MatchResult::Span(Some((2, 5)))
         );
     }
 

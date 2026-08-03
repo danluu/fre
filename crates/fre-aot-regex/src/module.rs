@@ -1985,7 +1985,18 @@ fn build_native_dfa_table_with_cost_model(
         return Err(ObjectError::InvalidModule("invalid native DFA table shape"));
     }
     let span_needs_start = view.output == OutputContract::Span && !dfa.initial_pending;
-    if span_needs_start
+    let exact_span_width = if span_needs_start {
+        view.exact_match_width
+            .map(|width| {
+                u64::try_from(width)
+                    .map_err(|_| ObjectError::ArithmeticOverflow("native exact match width"))
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let wants_reverse = span_needs_start && exact_span_width.is_none();
+    if wants_reverse
         && (dfa.reverse_initial != Some(0)
             || dfa.reverse_cells.is_empty()
             || !dfa.reverse_cells.len().is_multiple_of(dfa.class_count))
@@ -1999,18 +2010,6 @@ fn build_native_dfa_table_with_cost_model(
             "native DFA has an unexpected reverse table",
         ));
     }
-    let exact_span_width = if span_needs_start {
-        view.exact_match_width
-            .map(|width| {
-                u64::try_from(width)
-                    .map_err(|_| ObjectError::ArithmeticOverflow("native exact match width"))
-            })
-            .transpose()?
-    } else {
-        None
-    };
-    let wants_reverse = span_needs_start && exact_span_width.is_none();
-
     let forward_states = dfa
         .forward_cells
         .len()
@@ -20646,7 +20645,7 @@ mod tests {
         .unwrap();
         let view = compiled.program().native_dfa_view().unwrap();
         assert_eq!(view.exact_match_width, Some(3));
-        assert!(!view.dfa.reverse_cells.is_empty());
+        assert!(view.dfa.reverse_cells.is_empty());
         let (data, layout) = build_native_dfa_table(view).unwrap();
         assert_eq!(layout.exact_span_width, Some(3));
         assert!(!layout.has_reverse);

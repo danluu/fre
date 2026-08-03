@@ -327,12 +327,12 @@ fn determinization_receipt_records_skips_completion_and_exact_declines() {
         &[
             DeterminizationStage::AlphabetPartition,
             DeterminizationStage::ForwardSubsetConstruction,
-            DeterminizationStage::ReverseSubsetConstruction,
             DeterminizationStage::DfaStateMinimization,
             DeterminizationStage::AlphabetColumnCoalescing,
         ]
     );
     assert!(report.decline.is_none());
+    assert_eq!(completed.receipt().dfa.unwrap().reverse_states, 0);
 
     let compile_decline = |max_states, max_transitions, max_work| {
         let mut limits = CompileLimitsV1::default();

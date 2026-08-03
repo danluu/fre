@@ -967,6 +967,7 @@ impl OrderedDfa {
     pub(crate) fn deserialize(
         bytes: &[u8],
         output: OutputContract,
+        exact_match_width: Option<usize>,
         boundary_classes: usize,
         boundary_starts: &[bool; 256],
     ) -> Result<Self, ProgramFormatError> {
@@ -1184,8 +1185,9 @@ impl OrderedDfa {
             }
             None
         };
-        let reverse_required = output == OutputContract::Span && !initial_pending;
-        if reverse_required != reverse.is_some() {
+        let reverse_allowed = output == OutputContract::Span && !initial_pending;
+        let reverse_required = reverse_allowed && exact_match_width.is_none();
+        if reverse_required && reverse.is_none() || !reverse_allowed && reverse.is_some() {
             return Err(ProgramFormatError::Malformed(
                 "reverse DFA presence does not match the output contract",
             ));
@@ -1242,11 +1244,7 @@ impl OrderedDfa {
         })
     }
 
-    pub(crate) fn validate_canonical(
-        &self,
-        raw: &RawPlan,
-        output: OutputContract,
-    ) -> Result<(), ProgramFormatError> {
+    pub(crate) fn validate_canonical(&self, raw: &RawPlan) -> Result<(), ProgramFormatError> {
         let max_states = self
             .stats
             .forward_states_before_minimization
@@ -1262,7 +1260,7 @@ impl OrderedDfa {
         )?;
         let regenerated = determinize(
             raw,
-            output == OutputContract::Span,
+            self.reverse.is_some(),
             DeterminizeLimits {
                 max_states,
                 max_transitions,

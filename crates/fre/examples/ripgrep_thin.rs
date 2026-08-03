@@ -8,8 +8,10 @@
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use fre::{PortableBuilder, PortableFindIterRunLimits, SearchLimits, SearchSessionLimits};
 use fre_ripgrep_aot_thin::{AotMatcher, AotMode, AotOutput};
@@ -47,6 +49,39 @@ struct Args {
     line_number: bool,
     word: bool,
     describe_only: bool,
+    report_scan_time: bool,
+}
+
+#[derive(Debug)]
+struct LoadedFile {
+    path: PathBuf,
+    bytes: Vec<u8>,
+    lines: Vec<Range<usize>>,
+}
+
+#[derive(Debug)]
+struct LoadedCorpus {
+    files: Vec<LoadedFile>,
+    show_path: bool,
+    file_count: u64,
+    bytes: u64,
+    sha256: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MatchedLine {
+    file: usize,
+    line: u64,
+    start: usize,
+    end: usize,
+}
+
+#[derive(Debug)]
+struct ScanTiming {
+    elapsed: Duration,
+    corpus_files: u64,
+    corpus_bytes: u64,
+    corpus_sha256: String,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -143,6 +178,11 @@ fn run() -> Result<bool, String> {
     } else {
         args.pattern.clone()
     };
+    let corpus = if args.report_scan_time && !args.describe_only {
+        Some(load_corpus(&args)?)
+    } else {
+        None
+    };
 
     match args.engine {
         Engine::Fre => {
@@ -164,24 +204,27 @@ fn run() -> Result<bool, String> {
             match args.scan_mode {
                 ScanMode::Lines => {
                     let limits = SearchLimits::default();
-                    let stats = scan_lines(&args, |line| {
+                    let (stats, timing) = scan_lines(&args, corpus.as_ref(), |line| {
                         session
                             .is_match_value(line, limits)
                             .map_err(|error| format!("FRE_UNSUPPORTED search: {error}"))
                     })?;
+                    emit_scan_timing(timing);
                     emit_line_stats_if_requested(stats, plan);
                     Ok(stats.matching_lines != 0)
                 }
                 ScanMode::WholeFile => {
                     let limits = PortableFindIterRunLimits::unlimited();
-                    let stats = scan_whole_files(&args, |haystack, stats| {
-                        for matched in session.find_iter(haystack, limits) {
-                            let matched = matched
-                                .map_err(|error| format!("FRE_UNSUPPORTED search: {error}"))?;
-                            stats.record_match(matched.start(), matched.end())?;
-                        }
-                        Ok(())
-                    })?;
+                    let (stats, timing) =
+                        scan_whole_files(&args, corpus.as_ref(), |haystack, stats| {
+                            for matched in session.find_iter(haystack, limits) {
+                                let matched = matched
+                                    .map_err(|error| format!("FRE_UNSUPPORTED search: {error}"))?;
+                                stats.record_match(matched.start(), matched.end())?;
+                            }
+                            Ok(())
+                        })?;
+                    emit_scan_timing(timing);
                     Ok(emit_whole_file_stats(stats, plan))
                 }
             }
@@ -200,26 +243,35 @@ fn run() -> Result<bool, String> {
             }
             match args.scan_mode {
                 ScanMode::Lines => {
-                    let stats = scan_lines(&args, |line| Ok(regex.is_match(line)))?;
+                    let (stats, timing) =
+                        scan_lines(&args, corpus.as_ref(), |line| Ok(regex.is_match(line)))?;
+                    emit_scan_timing(timing);
                     emit_line_stats_if_requested(stats, "regex-bytes");
                     Ok(stats.matching_lines != 0)
                 }
                 ScanMode::WholeFile => {
-                    let stats = scan_whole_files(&args, |haystack, stats| {
-                        for matched in regex.find_iter(haystack) {
-                            stats.record_match(matched.start(), matched.end())?;
-                        }
-                        Ok(())
-                    })?;
+                    let (stats, timing) =
+                        scan_whole_files(&args, corpus.as_ref(), |haystack, stats| {
+                            for matched in regex.find_iter(haystack) {
+                                stats.record_match(matched.start(), matched.end())?;
+                            }
+                            Ok(())
+                        })?;
+                    emit_scan_timing(timing);
                     Ok(emit_whole_file_stats(stats, "regex-bytes"))
                 }
             }
         }
-        Engine::FreAot(mode) => run_aot(&args, &pattern, mode),
+        Engine::FreAot(mode) => run_aot(&args, &pattern, mode, corpus.as_ref()),
     }
 }
 
-fn run_aot(args: &Args, pattern: &str, mode: AotMode) -> Result<bool, String> {
+fn run_aot(
+    args: &Args,
+    pattern: &str,
+    mode: AotMode,
+    corpus: Option<&LoadedCorpus>,
+) -> Result<bool, String> {
     let output = match args.scan_mode {
         ScanMode::Lines => AotOutput::Exists,
         ScanMode::WholeFile => AotOutput::Span,
@@ -240,16 +292,17 @@ fn run_aot(args: &Args, pattern: &str, mode: AotMode) -> Result<bool, String> {
     }
     match args.scan_mode {
         ScanMode::Lines => {
-            let stats = scan_lines(args, |line| {
+            let (stats, timing) = scan_lines(args, corpus, |line| {
                 matcher
                     .is_match(line)
                     .map_err(|error| format!("FRE_AOT_UNSUPPORTED search: {error}"))
             })?;
+            emit_scan_timing(timing);
             emit_line_stats_if_requested(stats, plan);
             Ok(stats.matching_lines != 0)
         }
         ScanMode::WholeFile => {
-            let stats = scan_whole_files(args, |haystack, stats| {
+            let (stats, timing) = scan_whole_files(args, corpus, |haystack, stats| {
                 let mut start = 0;
                 loop {
                     let Some((match_start, match_end)) = matcher
@@ -272,6 +325,7 @@ fn run_aot(args: &Args, pattern: &str, mode: AotMode) -> Result<bool, String> {
                 }
                 Ok(())
             })?;
+            emit_scan_timing(timing);
             Ok(emit_whole_file_stats(stats, plan))
         }
     }
@@ -282,6 +336,18 @@ fn emit_line_stats_if_requested(stats: ScanStats, plan: &str) {
         eprintln!(
             "plan={plan}\tfiles={}\tmatching_lines={}",
             stats.files, stats.matching_lines
+        );
+    }
+}
+
+fn emit_scan_timing(timing: Option<ScanTiming>) {
+    if let Some(timing) = timing {
+        eprintln!(
+            "fre-ripgrep-thin-timing-v1\tscan_elapsed_ns={}\tboundary=preloaded-corpus-scan\tcorpus_files={}\tcorpus_bytes={}\tcorpus_sha256={}",
+            timing.elapsed.as_nanos(),
+            timing.corpus_files,
+            timing.corpus_bytes,
+            timing.corpus_sha256
         );
     }
 }
@@ -316,6 +382,7 @@ where
     let mut line_number = false;
     let mut word = false;
     let mut describe_only = false;
+    let mut report_scan_time = false;
     let mut scan_mode = ScanMode::Lines;
     let mut options_done = false;
 
@@ -350,6 +417,7 @@ where
                 word = true;
             }
             "--describe-only" => describe_only = true,
+            "--report-scan-time" => report_scan_time = true,
             "--whole-file" => scan_mode = ScanMode::WholeFile,
             // The canonical non-mmap rg command is used by the runner, but
             // accepting these makes direct substitutions less surprising.
@@ -383,6 +451,7 @@ where
         line_number,
         word,
         describe_only,
+        report_scan_time,
     })
 }
 
@@ -404,7 +473,218 @@ fn os_to_string(value: OsString, label: &str) -> Result<String, String> {
         .map_err(|value| format!("{label} is not valid UTF-8: {value:?}"))
 }
 
-fn scan_lines<F>(args: &Args, mut is_match: F) -> Result<ScanStats, String>
+fn scan_lines<F>(
+    args: &Args,
+    corpus: Option<&LoadedCorpus>,
+    is_match: F,
+) -> Result<(ScanStats, Option<ScanTiming>), String>
+where
+    F: FnMut(&[u8]) -> Result<bool, String>,
+{
+    if let Some(corpus) = corpus {
+        let (stats, timing) = scan_lines_preloaded(args, corpus, is_match)?;
+        Ok((stats, Some(timing)))
+    } else {
+        Ok((scan_lines_streaming(args, is_match)?, None))
+    }
+}
+
+fn scan_lines_preloaded<F>(
+    args: &Args,
+    corpus: &LoadedCorpus,
+    mut is_match: F,
+) -> Result<(ScanStats, ScanTiming), String>
+where
+    F: FnMut(&[u8]) -> Result<bool, String>,
+{
+    let mut stats = ScanStats {
+        files: corpus.file_count,
+        matching_lines: 0,
+    };
+    let mut matches = Vec::new();
+    let started = Instant::now();
+    for (file_index, file) in corpus.files.iter().enumerate() {
+        for (line_index, range) in file.lines.iter().enumerate() {
+            if !is_match(&file.bytes[range.clone()])? {
+                continue;
+            }
+            stats.matching_lines = stats
+                .matching_lines
+                .checked_add(1)
+                .ok_or_else(|| "matching line count overflow".to_owned())?;
+            let line = u64::try_from(line_index)
+                .map_err(|_| format!("line count overflow in {}", file.path.display()))?
+                .checked_add(1)
+                .ok_or_else(|| format!("line count overflow in {}", file.path.display()))?;
+            matches.push(MatchedLine {
+                file: file_index,
+                line,
+                start: range.start,
+                end: range.end,
+            });
+        }
+    }
+    let elapsed = started.elapsed();
+
+    let stdout = io::stdout();
+    let mut output = BufWriter::new(stdout.lock());
+    for matched in matches {
+        let file = &corpus.files[matched.file];
+        if corpus.show_path {
+            let display_path = file.path.strip_prefix(".").unwrap_or(&file.path);
+            write!(output, "{}:", display_path.display())
+                .map_err(|error| format!("write stdout: {error}"))?;
+        }
+        if args.line_number {
+            write!(output, "{}:", matched.line)
+                .map_err(|error| format!("write stdout: {error}"))?;
+        }
+        output
+            .write_all(&file.bytes[matched.start..matched.end])
+            .and_then(|()| output.write_all(b"\n"))
+            .map_err(|error| format!("write stdout: {error}"))?;
+    }
+    output
+        .flush()
+        .map_err(|error| format!("flush stdout: {error}"))?;
+    Ok((stats, corpus.scan_timing(elapsed)))
+}
+
+fn scan_whole_files<F>(
+    args: &Args,
+    corpus: Option<&LoadedCorpus>,
+    find_matches: F,
+) -> Result<(WholeFileStats, Option<ScanTiming>), String>
+where
+    F: FnMut(&[u8], &mut WholeFileStats) -> Result<(), String>,
+{
+    if let Some(corpus) = corpus {
+        let (stats, timing) = scan_whole_files_preloaded(corpus, find_matches)?;
+        Ok((stats, Some(timing)))
+    } else {
+        Ok((scan_whole_files_streaming(args, find_matches)?, None))
+    }
+}
+
+fn scan_whole_files_preloaded<F>(
+    corpus: &LoadedCorpus,
+    mut find_matches: F,
+) -> Result<(WholeFileStats, ScanTiming), String>
+where
+    F: FnMut(&[u8], &mut WholeFileStats) -> Result<(), String>,
+{
+    let mut stats = WholeFileStats::new();
+    let started = Instant::now();
+    for file in &corpus.files {
+        stats.start_file(file.bytes.len())?;
+        find_matches(&file.bytes, &mut stats)?;
+    }
+    let elapsed = started.elapsed();
+    Ok((stats, corpus.scan_timing(elapsed)))
+}
+
+fn load_corpus(args: &Args) -> Result<LoadedCorpus, String> {
+    let paths = collect_files(&args.paths)?;
+    let show_path = args.paths.len() != 1 || args.paths[0].is_dir();
+    let mut files = Vec::with_capacity(paths.len());
+    let mut bytes_total = 0_u64;
+    let mut corpus_digest = Sha256::new();
+    corpus_digest.update(b"fre-ripgrep-thin-corpus-v1\0");
+    for path in paths {
+        let source = match File::open(&path) {
+            Ok(file) => file,
+            Err(error) => {
+                eprintln!("{}: {error}", path.display());
+                continue;
+            }
+        };
+        let bytes = match args.scan_mode {
+            ScanMode::Lines => {
+                let mut reader = BufReader::with_capacity(64 * 1024, source);
+                if reader
+                    .fill_buf()
+                    .map_err(|error| format!("read {}: {error}", path.display()))?
+                    .contains(&0)
+                {
+                    continue;
+                }
+                let mut bytes = Vec::new();
+                reader
+                    .read_to_end(&mut bytes)
+                    .map_err(|error| format!("read {}: {error}", path.display()))?;
+                bytes
+            }
+            ScanMode::WholeFile => {
+                let mut source = source;
+                let mut bytes = Vec::new();
+                source
+                    .read_to_end(&mut bytes)
+                    .map_err(|error| format!("read {}: {error}", path.display()))?;
+                if bytes[..bytes.len().min(64 * 1024)].contains(&0) {
+                    continue;
+                }
+                bytes
+            }
+        };
+        let path_bytes = path.as_os_str().as_encoded_bytes();
+        let path_length = u64::try_from(path_bytes.len())
+            .map_err(|_| format!("path length exceeds u64: {}", path.display()))?;
+        let byte_length = u64::try_from(bytes.len())
+            .map_err(|_| format!("file length exceeds u64: {}", path.display()))?;
+        corpus_digest.update([0x46]);
+        corpus_digest.update(path_length.to_le_bytes());
+        corpus_digest.update(path_bytes);
+        corpus_digest.update(byte_length.to_le_bytes());
+        corpus_digest.update(&bytes);
+        bytes_total = bytes_total
+            .checked_add(byte_length)
+            .ok_or_else(|| "corpus byte count overflow".to_owned())?;
+        let lines = if args.scan_mode == ScanMode::Lines {
+            collect_line_ranges(&bytes)
+        } else {
+            Vec::new()
+        };
+        files.push(LoadedFile { path, bytes, lines });
+    }
+    let file_count = u64::try_from(files.len()).map_err(|_| "file count exceeds u64".to_owned())?;
+    let sha256 = format!("{:x}", corpus_digest.finalize());
+    Ok(LoadedCorpus {
+        files,
+        show_path,
+        file_count,
+        bytes: bytes_total,
+        sha256,
+    })
+}
+
+impl LoadedCorpus {
+    fn scan_timing(&self, elapsed: Duration) -> ScanTiming {
+        ScanTiming {
+            elapsed,
+            corpus_files: self.file_count,
+            corpus_bytes: self.bytes,
+            corpus_sha256: self.sha256.clone(),
+        }
+    }
+}
+
+fn collect_line_ranges(bytes: &[u8]) -> Vec<Range<usize>> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    for part in bytes.split_inclusive(|byte| *byte == b'\n') {
+        let raw_end = start + part.len();
+        let end = if part.last() == Some(&b'\n') {
+            raw_end - 1
+        } else {
+            raw_end
+        };
+        lines.push(start..end);
+        start = raw_end;
+    }
+    lines
+}
+
+fn scan_lines_streaming<F>(args: &Args, mut is_match: F) -> Result<ScanStats, String>
 where
     F: FnMut(&[u8]) -> Result<bool, String>,
 {
@@ -414,7 +694,7 @@ where
     let mut output = BufWriter::new(stdout.lock());
     let mut stats = ScanStats::default();
     for file in files {
-        if scan_file(
+        if scan_file_streaming(
             &file,
             show_path,
             args.line_number,
@@ -434,7 +714,7 @@ where
     Ok(stats)
 }
 
-fn scan_whole_files<F>(args: &Args, mut find_matches: F) -> Result<WholeFileStats, String>
+fn scan_whole_files_streaming<F>(args: &Args, mut find_matches: F) -> Result<WholeFileStats, String>
 where
     F: FnMut(&[u8], &mut WholeFileStats) -> Result<(), String>,
 {
@@ -461,7 +741,7 @@ where
     Ok(stats)
 }
 
-fn scan_file<F, W>(
+fn scan_file_streaming<F, W>(
     path: &Path,
     show_path: bool,
     line_number: bool,
@@ -627,7 +907,7 @@ fn is_hidden(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ScanMode, WholeFileStats, parse_args};
+    use super::{ScanMode, WholeFileStats, collect_line_ranges, parse_args};
     use std::ffi::OsString;
 
     #[test]
@@ -639,6 +919,54 @@ mod tests {
         )
         .expect("whole-file arguments");
         assert_eq!(args.scan_mode, ScanMode::WholeFile);
+    }
+
+    #[test]
+    fn report_scan_time_flag_is_explicit() {
+        let regular = parse_args(
+            ["--engine", "rust-regex", "needle", "sample.txt"]
+                .into_iter()
+                .map(OsString::from),
+        )
+        .expect("regular arguments");
+        assert!(!regular.report_scan_time);
+
+        let timed = parse_args(
+            [
+                "--engine",
+                "rust-regex",
+                "--report-scan-time",
+                "needle",
+                "sample.txt",
+            ]
+            .into_iter()
+            .map(OsString::from),
+        )
+        .expect("timed arguments");
+        assert!(timed.report_scan_time);
+    }
+
+    #[test]
+    fn precomputed_lines_match_bufread_line_semantics() {
+        fn split(bytes: &[u8]) -> Vec<&[u8]> {
+            collect_line_ranges(bytes)
+                .into_iter()
+                .map(|range| &bytes[range])
+                .collect()
+        }
+
+        assert_eq!(split(b""), Vec::<&[u8]>::new());
+        assert_eq!(split(b"alpha"), vec![b"alpha".as_slice()]);
+        assert_eq!(split(b"alpha\n"), vec![b"alpha".as_slice()]);
+        assert_eq!(
+            split(b"\nalpha\r\n\nbeta"),
+            vec![
+                b"".as_slice(),
+                b"alpha\r".as_slice(),
+                b"".as_slice(),
+                b"beta".as_slice(),
+            ]
+        );
     }
 
     #[test]
