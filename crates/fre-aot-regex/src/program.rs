@@ -1830,10 +1830,13 @@ struct PartialDfaWorkspace {
 
 /// Per-prepared-workspace admission state for a retained partial table.
 ///
-/// Missing forward rows normally resume K0 directly and count as complete
-/// partial executions. The fallback guard remains for holes more cheaply
-/// decided by another complete accelerator, a foreign compatible workspace,
-/// and variable-width positive spans that still need ordinary start recovery.
+/// Missing forward rows normally resume K0 directly. Repeated holes reached
+/// near the beginning of a large window join the existing periodic fallback
+/// guard because they do not amortize the retained-table dispatch. Deep
+/// resumes remain complete partial executions. The same guard covers holes
+/// more cheaply decided by another complete accelerator, a foreign compatible
+/// workspace, and variable-width positive spans that still need ordinary
+/// start recovery.
 #[derive(Clone, Copy, Debug, Default)]
 struct PartialDfaRuntimeState {
     consecutive_fallbacks: u8,
@@ -1875,12 +1878,23 @@ impl PartialDfaRuntimeState {
         self.bypass_remaining = 0;
     }
 
-    fn observe_resume(&mut self) {
+    fn observe_resume(&mut self, consumed: usize, input_bytes: usize) {
         #[cfg(test)]
         {
             self.resumed = self.resumed.saturating_add(1);
         }
-        self.observe_complete();
+        // A retained prefix that reaches its first missing row near the start
+        // of a large window has paid dispatch and table-probe costs without
+        // avoiding meaningful K0 work. Treat repeated shallow continuations
+        // like the other incomplete partial exits so a prepared workspace can
+        // periodically bypass the table. A continuation reached after useful
+        // progress remains a successful partial execution and clears any
+        // prior backoff.
+        if Self::is_shallow_exit(consumed, input_bytes) {
+            self.observe_fallback(consumed, input_bytes);
+        } else {
+            self.observe_complete();
+        }
     }
 
     fn observe_fallback(&mut self, consumed: usize, input_bytes: usize) {
@@ -1888,7 +1902,7 @@ impl PartialDfaRuntimeState {
         if self.consecutive_fallbacks < 2 {
             return;
         }
-        let early = consumed <= 16 || consumed <= input_bytes / 8;
+        let early = Self::is_shallow_exit(consumed, input_bytes);
         let base_shift = if early { 4_u32 } else { 0_u32 };
         let maximum_shift = if early { 10_u32 } else { 3_u32 };
         let fallback_exponent = u32::from(self.consecutive_fallbacks.saturating_sub(2));
@@ -1896,6 +1910,10 @@ impl PartialDfaRuntimeState {
             .saturating_add(fallback_exponent)
             .min(maximum_shift);
         self.bypass_remaining = 1_u16 << shift;
+    }
+
+    const fn is_shallow_exit(consumed: usize, input_bytes: usize) -> bool {
+        consumed <= 16 || consumed <= input_bytes / 8
     }
 }
 
@@ -2782,7 +2800,7 @@ impl CompiledProgram {
         }
         let found =
             self.search_nfa_from_partial_resume(haystack, window, workspace, resume_set, resume)?;
-        state.observe_resume();
+        state.observe_resume(consumed, input_bytes);
         Ok(Some(found))
     }
 
@@ -7471,8 +7489,8 @@ mod tests {
         }
         let state = &workspace.partial.as_deref().unwrap().state;
         assert_eq!(state.resumed, 2);
-        assert_eq!(state.consecutive_fallbacks, 0);
-        assert_eq!(state.bypass_remaining, 0);
+        assert_eq!(state.consecutive_fallbacks, 2);
+        assert_eq!(state.bypass_remaining, 16);
     }
 
     #[test]
@@ -7545,8 +7563,8 @@ mod tests {
         }
         let state = &workspace.partial.as_deref().unwrap().state;
         assert_eq!(state.resumed, 2);
-        assert_eq!(state.consecutive_fallbacks, 0);
-        assert_eq!(state.bypass_remaining, 0);
+        assert_eq!(state.consecutive_fallbacks, 2);
+        assert_eq!(state.bypass_remaining, 16);
     }
 
     #[test]
@@ -7697,7 +7715,10 @@ mod tests {
                 .expect("resumed search"),
             expected
         );
-        assert_eq!(workspace.partial.as_deref().unwrap().state.resumed, 1);
+        let state = &workspace.partial.as_deref().unwrap().state;
+        assert_eq!(state.resumed, 1);
+        assert_eq!(state.consecutive_fallbacks, 0);
+        assert_eq!(state.bypass_remaining, 0);
     }
 
     #[test]
@@ -7971,6 +7992,100 @@ mod tests {
         assert!(state.admit());
         assert_eq!(state.consecutive_fallbacks, 0);
         assert_eq!(state.bypass_remaining, 0);
+    }
+
+    #[test]
+    fn optimized_authenticated_shallow_holes_back_off_end_to_end() {
+        let pattern = r"[b-c][a-b]{1,10}z";
+        let limited = program(
+            pattern,
+            OutputContract::SelectedEnd,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 32,
+                ..DeterminizeLimits::default()
+            },
+        );
+        let reference = program(
+            pattern,
+            OutputContract::SelectedEnd,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let mut haystack = b"cbbbbbbbbbbz".to_vec();
+        haystack.resize(1_024, b'x');
+        let window = SearchWindow::full(&haystack);
+        let expected = reference.search(&haystack, window).unwrap();
+        let partial = limited.partial_dfa().expect("retained partial rows");
+        let (prefix_plan, supported) = PartialDfaPrefixPlan::derive(limited.anchored_prefix.sets());
+        assert!(supported);
+        let resume = match partial
+            .selected_end(
+                &haystack,
+                window.start,
+                window.end,
+                limited.anchored_prefix.sets(),
+                prefix_plan,
+            )
+            .expect("retained partial probe")
+        {
+            PartialDfaResult::Resume(resume) => resume,
+            PartialDfaResult::Complete(found) => {
+                panic!("fixture did not reach a retained hole: {found:?}")
+            }
+        };
+        let consumed = resume.position.saturating_sub(window.start);
+        assert!(consumed <= 16 || consumed <= haystack.len() / 8);
+
+        let mut workspace = limited.prepare_workspace().expect("prepared workspace");
+        assert!(
+            workspace
+                .partial
+                .as_deref()
+                .and_then(|partial| partial.resume.as_ref())
+                .is_some_and(|resume| resume.is_bound_to(&limited.automaton))
+        );
+        for attempt in 0..2 {
+            assert_eq!(
+                limited
+                    .search_optimized_with_workspace(&haystack, window, &mut workspace)
+                    .expect("authenticated resumed search"),
+                expected,
+                "initial resume {attempt}"
+            );
+        }
+        {
+            let state = &workspace.partial.as_deref().unwrap().state;
+            assert_eq!(state.resumed, 2);
+            assert_eq!(state.consecutive_fallbacks, 2);
+            assert_eq!(state.bypass_remaining, 16);
+        }
+
+        for attempt in 0..16 {
+            assert_eq!(
+                limited
+                    .search_optimized_with_workspace(&haystack, window, &mut workspace)
+                    .expect("backed-off ordinary search"),
+                expected,
+                "bypass {attempt}"
+            );
+        }
+        {
+            let state = &workspace.partial.as_deref().unwrap().state;
+            assert_eq!(state.resumed, 2, "bypasses must not enter K0 resume");
+            assert_eq!(state.bypass_remaining, 0);
+        }
+
+        assert_eq!(
+            limited
+                .search_optimized_with_workspace(&haystack, window, &mut workspace)
+                .expect("periodic authenticated re-probe"),
+            expected
+        );
+        let state = &workspace.partial.as_deref().unwrap().state;
+        assert_eq!(state.resumed, 3);
+        assert_eq!(state.consecutive_fallbacks, 3);
+        assert_eq!(state.bypass_remaining, 32);
     }
 
     #[test]
