@@ -3704,9 +3704,15 @@ fn execute_lazy_span_loop<const TRACK_START: bool>(
     let mut position = window.start();
     let mut boundaries = 0usize;
     let mut pending_end = initial_pending.then_some(window.start());
+    // One root expansion creates every positive initial-frontier item at the
+    // same source boundary. Cardinality does not affect that provenance.
     let mut active_start = (TRACK_START
-        && (initial_pending || workspace.lazy.initial_kind == LazyInitialKind::PositiveSingle))
-        .then_some(window.start());
+        && (initial_pending
+            || matches!(
+                workspace.lazy.initial_kind,
+                LazyInitialKind::Positive | LazyInitialKind::PositiveSingle
+            )))
+    .then_some(window.start());
     let mut pending_start = (TRACK_START && initial_pending).then_some(window.start());
     let mut entered = false;
     let mut retained_start_mask = RetainedStartMaskCursor::default();
@@ -3745,8 +3751,13 @@ fn execute_lazy_span_loop<const TRACK_START: bool>(
                     return Ok(Some((None, boundaries, false)));
                 }
                 if TRACK_START {
-                    active_start = (workspace.lazy.initial_kind == LazyInitialKind::PositiveSingle)
-                        .then_some(position);
+                    // One root expansion creates every positive initial
+                    // frontier item at this exact candidate boundary.
+                    active_start = matches!(
+                        workspace.lazy.initial_kind,
+                        LazyInitialKind::Positive | LazyInitialKind::PositiveSingle
+                    )
+                    .then_some(position);
                 }
                 if probe.is_some() && adaptive_probe.samples_rejections() {
                     engine_candidate = Some(position);
@@ -9510,6 +9521,37 @@ mod tests {
                 ],
                 byte_starts: vec![0, 0, b'a', 0, 0, b'a'],
                 byte_ends: vec![0, 0, b'a', 0, 0, b'a'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn ordered_ab_or_ac() -> Automaton {
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 2, 3, 4, 4, 5, 6, 6],
+                edge_targets: vec![1, 4, 2, 3, 5, 6],
+                edge_kinds: vec![
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                ],
+                byte_starts: vec![0, 0, b'a', b'b', b'a', b'c'],
+                byte_ends: vec![0, 0, b'a', b'b', b'a', b'c'],
             },
             CompileLimits::default(),
         )
@@ -16062,6 +16104,65 @@ mod tests {
             super::LazyStartAction::Drop,
             "the continuing `b` thread and newly injected `a` root have distinct starts"
         );
+
+        let uniform_multi = greedy_a_plus_or_a();
+        pin_without_start_filter(&uniform_multi);
+        let mut uniform_multi_workspace =
+            K0Workspace::new_accelerated(&uniform_multi, WorkspaceLimits::unlimited()).unwrap();
+        uniform_multi
+            .prepare::<SelectedEnd>()
+            .search_with_workspace(
+                b"ba",
+                &mut uniform_multi_workspace,
+                SearchLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(
+            uniform_multi_workspace.lazy.initial_kind,
+            super::LazyInitialKind::Positive
+        );
+        let uniform_multi_initial = uniform_multi_workspace.lazy.initial;
+        assert_eq!(
+            super::LazyStartAction::from_direct_cell(
+                uniform_multi_workspace
+                    .lazy
+                    .cell(uniform_multi_initial, b'a')
+                    .unwrap()
+            ),
+            super::LazyStartAction::Propagate
+        );
+        assert_eq!(
+            super::LazyStartAction::from_direct_cell(
+                uniform_multi_workspace
+                    .lazy
+                    .cell(uniform_multi_initial, b'b')
+                    .unwrap()
+            ),
+            super::LazyStartAction::Reset
+        );
+
+        let mixed_multi = ordered_ab_or_ac();
+        pin_without_start_filter(&mixed_multi);
+        let mut mixed_multi_workspace =
+            K0Workspace::new_accelerated(&mixed_multi, WorkspaceLimits::unlimited()).unwrap();
+        mixed_multi
+            .prepare::<SelectedEnd>()
+            .search_with_workspace(b"a", &mut mixed_multi_workspace, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(
+            mixed_multi_workspace.lazy.initial_kind,
+            super::LazyInitialKind::Positive
+        );
+        assert_eq!(
+            super::LazyStartAction::from_direct_cell(
+                mixed_multi_workspace
+                    .lazy
+                    .cell(mixed_multi_workspace.lazy.initial, b'a')
+                    .unwrap()
+            ),
+            super::LazyStartAction::Drop,
+            "two continuing source threads and a newly injected root have distinct starts"
+        );
     }
 
     #[test]
@@ -16126,6 +16227,71 @@ mod tests {
             );
         }
         assert!(checked > 1_000);
+    }
+
+    #[test]
+    fn uniform_multi_item_start_certificate_is_exhaustive_and_drops_on_mixed_provenance() {
+        let plans = [
+            ("greedy-plus-or-a", greedy_a_plus_or_a(), true),
+            ("long-a-or-ab", ordered_a_or_ab(true), true),
+            ("ab-or-ac", ordered_ab_or_ac(), false),
+        ];
+        let haystacks = bounded_words(&[b'a', b'b', b'c', 0xff], 4);
+        let mut checked = 0usize;
+
+        for (name, plan, remains_uniform) in &plans {
+            pin_without_start_filter(plan);
+            let mut pike = K0Workspace::new(plan, WorkspaceLimits::unlimited()).unwrap();
+            let mut direct =
+                K0Workspace::new_bidirectional(plan, WorkspaceLimits::unlimited()).unwrap();
+            for haystack in &haystacks {
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        let want = plan
+                            .prepare::<Span>()
+                            .search_window_with_workspace(
+                                haystack,
+                                window,
+                                &mut pike,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap();
+                        let got = plan
+                            .prepare::<Span>()
+                            .search_window_with_workspace(
+                                haystack,
+                                window,
+                                &mut direct,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap();
+                        assert_eq!(
+                            got.output(),
+                            want.output(),
+                            "{name}: source={haystack:?} window={window:?}"
+                        );
+                        checked = checked.checked_add(1).unwrap();
+                    }
+                }
+            }
+            assert_eq!(
+                direct.lazy.initial_kind,
+                super::LazyInitialKind::Positive,
+                "{name}: the initial closure must contain multiple consuming items"
+            );
+            assert!(direct.reverse.initialized, "{name}");
+            let reverse_untouched = direct
+                .reverse
+                .rows
+                .iter()
+                .all(|&cell| cell == super::LAZY_CELL_UNFILLED);
+            assert_eq!(
+                reverse_untouched, *remains_uniform,
+                "{name}: reverse execution must follow the provenance certificate"
+            );
+        }
+        assert!(checked > 10_000);
     }
 
     #[test]
