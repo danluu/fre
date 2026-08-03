@@ -2163,6 +2163,16 @@ pub(crate) struct NativeProgramView<'a> {
     pub(crate) required_literals: &'a RequiredLiterals,
     pub(crate) exact_match_width: Option<usize>,
     pub(crate) max_match_width: Option<usize>,
+    /// Exact moving scanner owned by a complete retained fallback's portable
+    /// entry. Native lowering may publish that fallback only when the emitted
+    /// target scanner preserves both this membership and its byte offset.
+    pub(crate) retained_prefix_requirement: Option<NativeRetainedPrefixRequirement>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeRetainedPrefixRequirement {
+    pub(crate) scan_offset: u8,
+    pub(crate) membership: [u64; 4],
 }
 
 #[allow(
@@ -2613,8 +2623,8 @@ impl CompiledProgram {
 
     #[allow(dead_code, reason = "structural handoff for native code generation")]
     pub(crate) fn native_dfa_view(&self) -> Option<NativeProgramView<'_>> {
-        let dfa = match &self.engine {
-            ProgramEngine::OrderedDfa(machine) => machine.native_view(),
+        let (dfa, retained_prefix_requirement) = match &self.engine {
+            ProgramEngine::OrderedDfa(machine) => (machine.native_view(), None),
             ProgramEngine::OrderedNfa => {
                 // The retained portable entry runs these complete graph
                 // accelerators before consulting its DFA rows. Until native
@@ -2637,7 +2647,27 @@ impl CompiledProgram {
                 {
                     return None;
                 }
-                dfa
+                let (prefix_plan, prefix_supported) =
+                    PartialDfaPrefixPlan::derive(self.anchored_prefix.sets());
+                if !prefix_supported {
+                    return None;
+                }
+                // An already-pending endpoint never enters the portable root
+                // scanner. All other selective retained roots do, including
+                // byte sets too broad or fragmented for native range filters.
+                let requirement = if dfa.initial_pending {
+                    None
+                } else if let Some(plan) = prefix_plan {
+                    let depth = plan.primary_depth();
+                    let membership = self.anchored_prefix.sets().get(depth)?.words();
+                    Some(NativeRetainedPrefixRequirement {
+                        scan_offset: u8::try_from(depth).ok()?,
+                        membership,
+                    })
+                } else {
+                    None
+                };
+                (dfa, requirement)
             }
         };
         Some(NativeProgramView {
@@ -2649,6 +2679,7 @@ impl CompiledProgram {
             required_literals: &self.required_literals,
             exact_match_width: self.exact_match_width,
             max_match_width: self.max_match_width(),
+            retained_prefix_requirement,
         })
     }
 

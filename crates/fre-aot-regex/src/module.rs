@@ -1,10 +1,12 @@
 //! Target description and the object-writer-neutral compiled module.
 //!
 //! Fast semantic programs are frozen in read-only data behind a small ABI
-//! adapter to the versioned runtime. Complete optimized DFAs instead lower to
-//! self-contained PIC machine code and compact transition tables. Native
-//! optimizations are derived from DFA structure, including a start-state byte
-//! filter selected solely from non-accepting self-loop behavior.
+//! adapter to the versioned runtime. Complete optimized DFAs, including
+//! resource-fallback artifacts whose retained forward construction actually
+//! finished, can instead lower to self-contained PIC machine code and compact
+//! transition tables. Native optimizations are derived from DFA structure,
+//! including a start-state byte filter selected solely from non-accepting
+//! self-loop behavior.
 
 use core::fmt::Write as _;
 
@@ -25,7 +27,7 @@ use crate::{
     prefix_relation::{self, PrefixRelation},
     program::{
         AnchoredByteSet, CompiledProgram, MAX_ANCHORED_PREFIX_BYTES, NativeContextProgramView,
-        NativeProgramView, OutputContract,
+        NativeProgramView, NativeRetainedPrefixRequirement, OutputContract,
     },
     required_literals::{MaximumConsumedDistance, RequiredInteriorCandidate, RequiredLiteralSet},
     seeded_reverse::{
@@ -585,26 +587,20 @@ impl CompiledModule {
         let program_digest = Sha256::digest(&program_bytes);
         let program_name = identity_symbol(PROGRAM_SYMBOL_PREFIX, program_digest.as_slice())?;
         let (lowering, native_digest) = if let Some(view) = native {
-            let lowering = lower_native_dfa(view, target)?;
-            let native_digest = native_module_digest(&program_bytes, target, &lowering)?;
-            (lowering, native_digest)
+            if let Some(lowering) = lower_native_dfa(view, target)? {
+                let native_digest = native_module_digest(&program_bytes, target, &lowering)?;
+                (lowering, native_digest)
+            } else {
+                let lowering = lower_runtime_adapter(program_bytes, target.architecture)?;
+                let native_digest = native_module_digest(&lowering.data, target, &lowering)?;
+                (lowering, native_digest)
+            }
         } else if let Some(view) = native_context {
             let lowering = module_context::lower_native_context(view, target)?;
             let native_digest = native_module_digest(&program_bytes, target, &lowering)?;
             (lowering, native_digest)
         } else {
-            let (code, relocations) = match target.architecture {
-                Architecture::X86_64 => lower_x86_64_runtime_adapter()?,
-                Architecture::Aarch64 => lower_aarch64_runtime_adapter()?,
-            };
-            let lowering = NativeLowering {
-                code,
-                data: program_bytes,
-                relocations,
-                needs_runtime: true,
-                start_accelerator: StartAccelerator::None,
-                anchored_prefix_filter_bytes: 0,
-            };
+            let lowering = lower_runtime_adapter(program_bytes, target.architecture)?;
             let native_digest = native_module_digest(&lowering.data, target, &lowering)?;
             (lowering, native_digest)
         };
@@ -770,6 +766,24 @@ impl CompiledModule {
     pub const fn anchored_prefix_filter_bytes(&self) -> u8 {
         self.anchored_prefix_filter_bytes
     }
+}
+
+fn lower_runtime_adapter(
+    program_bytes: Vec<u8>,
+    architecture: Architecture,
+) -> Result<NativeLowering, ObjectError> {
+    let (code, relocations) = match architecture {
+        Architecture::X86_64 => lower_x86_64_runtime_adapter()?,
+        Architecture::Aarch64 => lower_aarch64_runtime_adapter()?,
+    };
+    Ok(NativeLowering {
+        code,
+        data: program_bytes,
+        relocations,
+        needs_runtime: true,
+        start_accelerator: StartAccelerator::None,
+        anchored_prefix_filter_bytes: 0,
+    })
 }
 
 fn native_module_digest(
@@ -1703,7 +1717,7 @@ fn derive_native_vector_guard_coverage(
 fn lower_native_dfa(
     view: NativeProgramView<'_>,
     target: Target,
-) -> Result<NativeLowering, ObjectError> {
+) -> Result<Option<NativeLowering>, ObjectError> {
     let vector_cost_model = native_vector_filter_cost_model_for_target(target, true);
     let relation_vector_owns_route = direct_relation_vector_owns_route(target);
     let (mut data, layout) = build_native_dfa_table_with_cost_model(
@@ -1713,6 +1727,28 @@ fn lower_native_dfa(
         relation_vector_owns_route,
     )?;
     let sve_filter_plan = install_aarch64_sve_filter_plan(&mut data, layout, target)?;
+    let start_accelerator = selected_start_accelerator(layout, target, sve_filter_plan);
+    let vector_start_emitted = layout.start_filter.is_some_and(|filter| {
+        filter.candidate_bytes != 0
+            && !filter.ranges().is_empty()
+            && match target.architecture {
+                // SSE2 is part of the x86-64 baseline used by this lowering.
+                Architecture::X86_64 => true,
+                Architecture::Aarch64 => {
+                    sve_filter_plan.is_some()
+                        || target.features.has(CpuFeature::Aarch64Asimd)
+                }
+            }
+    });
+    if view.retained_prefix_requirement.is_some_and(|requirement| {
+        !retained_prefix_scanner_is_preserved(
+            layout.start_filter,
+            vector_start_emitted,
+            requirement,
+        )
+    }) {
+        return Ok(None);
+    }
     let (code, relocations) = match target.architecture {
         Architecture::X86_64 => lower_x86_64_dfa(layout, target.features)?,
         Architecture::Aarch64 => lower_aarch64_dfa_for_operating_system(
@@ -1722,16 +1758,37 @@ fn lower_native_dfa(
             sve_filter_plan,
         )?,
     };
-    Ok(NativeLowering {
+    Ok(Some(NativeLowering {
         code,
         data,
         relocations,
         needs_runtime: false,
-        start_accelerator: selected_start_accelerator(layout, target, sve_filter_plan),
+        start_accelerator,
         anchored_prefix_filter_bytes: layout
             .prefix_filter
             .map_or(0, |filter| filter.guaranteed_bytes),
-    })
+    }))
+}
+
+fn retained_prefix_scanner_is_preserved(
+    start_filter: Option<NativeStartFilter>,
+    vector_start_emitted: bool,
+    requirement: NativeRetainedPrefixRequirement,
+) -> bool {
+    let Some(filter) = start_filter else {
+        return false;
+    };
+    if filter.scan_offset != requirement.scan_offset || !vector_start_emitted {
+        return false;
+    }
+    let mut membership = [0_u64; 4];
+    for range in filter.ranges() {
+        for byte in u16::from(range.start)..=u16::from(range.end) {
+            let byte = usize::from(byte);
+            membership[byte / 64] |= 1_u64 << (byte % 64);
+        }
+    }
+    membership == requirement.membership
 }
 
 #[allow(
@@ -2041,10 +2098,25 @@ fn build_native_dfa_table_with_cost_model(
             .ok_or(ObjectError::ArithmeticOverflow(
                 "native reverse table bytes",
             ))?;
-    let exact_start_filter = derive_start_filter(view)?;
+    // A complete retained table is publishable only if native lowering keeps
+    // the portable entry's exact root scanner. Prefer that same byte column
+    // over the ordinary complete-DFA cost ranking; later admission also
+    // verifies the emitted target tier and exact reconstructed membership.
+    let exact_start_filter = if let Some(requirement) = view.retained_prefix_requirement {
+        filter_from_membership_words(
+            requirement.membership,
+            usize::from(requirement.scan_offset),
+            true,
+        )?
+    } else {
+        derive_start_filter(view)?
+    };
     let mut selected_suffix_filter = derive_suffix_filter(view)?;
     let coalesced_start_filter =
-        if ENABLE_NATIVE_COALESCED_INITIAL_FILTER && exact_start_filter.is_none() {
+        if view.retained_prefix_requirement.is_none()
+            && ENABLE_NATIVE_COALESCED_INITIAL_FILTER
+            && exact_start_filter.is_none()
+        {
             derive_coalesced_initial_start_filter(view)?
         } else {
             None
@@ -12646,7 +12718,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_retained_forward_uses_existing_native_lowering_across_target_matrix() {
+    fn complete_retained_forward_uses_native_only_when_target_preserves_portable_route() {
         let cases = [
             ("[ab]+", OutputContract::Exists),
             ("[ab]+", OutputContract::SelectedEnd),
@@ -12656,31 +12728,46 @@ mod tests {
         for target in identity_target_matrix() {
             for (pattern, output) in cases {
                 let compiled = complete_forward_resource_fallback(pattern, output, target);
-                assert!(
+                let requires_prefix_scanner = compiled
+                    .program()
+                    .native_dfa_view()
+                    .and_then(|view| view.retained_prefix_requirement)
+                    .is_some();
+                let target_has_vector_start = target.architecture == Architecture::X86_64
+                    || target.features.has(CpuFeature::Aarch64Asimd)
+                    || (target.operating_system == OperatingSystem::Linux
+                        && target.features.has(CpuFeature::Aarch64Sve));
+                let expect_native = !requires_prefix_scanner || target_has_vector_start;
+                assert_eq!(
                     !compiled.receipt().runtime_helper_required,
-                    "{pattern:?}/{output:?}/{target:?} unexpectedly retained the runtime helper; exact_width={:?} exact_product={}",
+                    expect_native,
+                    "{pattern:?}/{output:?}/{target:?}; exact_width={:?} exact_product={}",
                     compiled.receipt().exact_match_width,
                     compiled.program().has_nfa_exact_product(),
                 );
-                assert!(
+                assert_eq!(
                     compiled.module().required_runtime_symbol().is_none(),
-                    "{pattern:?}/{output:?}/{target:?} published a runtime relocation"
+                    expect_native,
+                    "{pattern:?}/{output:?}/{target:?} runtime relocation"
                 );
-                assert!(
+                assert_eq!(
                     compiled.module().required_runtime_program().is_none(),
-                    "{pattern:?}/{output:?}/{target:?} published a runtime program alias"
+                    expect_native,
+                    "{pattern:?}/{output:?}/{target:?} runtime program alias"
                 );
-                assert!(
-                    !compiled
-                        .receipt()
-                        .passes
-                        .contains(&crate::OptimizationPass::RuntimeAdapterLowering)
-                );
-                assert!(
+                assert_eq!(
                     compiled
                         .receipt()
                         .passes
-                        .contains(&crate::OptimizationPass::TargetInstructionSelection)
+                        .contains(&crate::OptimizationPass::RuntimeAdapterLowering),
+                    !expect_native
+                );
+                assert_eq!(
+                    compiled
+                        .receipt()
+                        .passes
+                        .contains(&crate::OptimizationPass::TargetInstructionSelection),
+                    expect_native
                 );
 
                 let restored = crate::CompiledProgram::deserialize(
@@ -12689,9 +12776,43 @@ mod tests {
                 .expect("restore fallback");
                 let restored_module = CompiledModule::lower(&restored, target)
                     .expect("lower restored complete forward table");
-                assert!(restored_module.required_runtime_symbol().is_none());
+                assert_eq!(
+                    restored_module.required_runtime_symbol().is_none(),
+                    expect_native
+                );
+                assert_eq!(restored_module.entry_symbol(), compiled.module().entry_symbol());
+                assert_eq!(restored_module.sections(), compiled.module().sections());
+                assert_eq!(restored_module.symbols(), compiled.module().symbols());
+                assert_eq!(
+                    restored_module.relocations(),
+                    compiled.module().relocations()
+                );
             }
         }
+    }
+
+    #[test]
+    fn complete_retained_requirement_reuses_portable_nonzero_primary() {
+        let compiled = complete_forward_resource_fallback(
+            "[ab]cdefghij(?-u:.){8}",
+            OutputContract::Span,
+            Target::x86_64_linux(),
+        );
+        let requirement = compiled
+            .program()
+            .native_dfa_view()
+            .and_then(|view| view.retained_prefix_requirement)
+            .expect("portable retained-prefix requirement");
+        let mut membership = [0_u64; 4];
+        let byte = usize::from(b'c');
+        membership[byte / 64] |= 1_u64 << (byte % 64);
+        assert_eq!(requirement.scan_offset, 1);
+        assert_eq!(requirement.membership, membership);
+        assert_eq!(
+            compiled.module().start_accelerator(),
+            StartAccelerator::X86Sse2
+        );
+        assert!(compiled.module().required_runtime_symbol().is_none());
     }
 
     #[test]
@@ -12748,7 +12869,62 @@ mod tests {
     }
 
     #[test]
-    fn complete_retained_forward_keeps_unrecoverable_span_and_portable_accelerators_on_runtime() {
+    fn retained_prefix_publication_requires_exact_vector_scanner() {
+        let mut ranges = [EMPTY_NATIVE_BYTE_RANGE; MAX_START_FILTER_RANGES];
+        ranges[0] = NativeByteRange { start: 1, end: 1 };
+        ranges[1] = NativeByteRange { start: 3, end: 3 };
+        let filter = NativeStartFilter {
+            ranges,
+            range_count: 2,
+            candidate_bytes: 2,
+            scan_offset: 4,
+            from_anchored_prefix: true,
+        };
+        let requirement = NativeRetainedPrefixRequirement {
+            scan_offset: 4,
+            membership: [0b1010, 0, 0, 0],
+        };
+        assert!(retained_prefix_scanner_is_preserved(
+            Some(filter),
+            true,
+            requirement
+        ));
+        assert!(!retained_prefix_scanner_is_preserved(
+            Some(filter),
+            false,
+            requirement
+        ));
+        assert!(!retained_prefix_scanner_is_preserved(
+            None,
+            true,
+            requirement
+        ));
+        assert!(!retained_prefix_scanner_is_preserved(
+            Some(NativeStartFilter {
+                scan_offset: 3,
+                ..filter
+            }),
+            true,
+            requirement
+        ));
+        assert!(!retained_prefix_scanner_is_preserved(
+            Some(NativeStartFilter {
+                ranges: {
+                    let mut coalesced = [EMPTY_NATIVE_BYTE_RANGE; MAX_START_FILTER_RANGES];
+                    coalesced[0] = NativeByteRange { start: 1, end: 3 };
+                    coalesced
+                },
+                range_count: 1,
+                candidate_bytes: 3,
+                ..filter
+            }),
+            true,
+            requirement
+        ));
+    }
+
+    #[test]
+    fn complete_retained_forward_keeps_stronger_portable_routes_on_runtime() {
         let targets = [
             Target::x86_64_linux(),
             Target::x86_64_macos(),
@@ -12775,6 +12951,30 @@ mod tests {
             );
             assert!(suffix_accelerated.receipt().runtime_helper_required);
             assert!(suffix_accelerated.module().required_runtime_symbol().is_some());
+
+            // The portable retained path scans arbitrary exact byte sets.
+            // Native range filters deliberately have tighter hot-loop bounds,
+            // so a complete table must not replace that scanner with a scalar
+            // byte-by-byte root walk when no native moving filter is emitted.
+            for pattern in [
+                r"(?-u:[\x00-\x40])+",
+                r"(?-u:[\x00\x20\x40\x60\x80\xa0\xc0\xe0\xff])+",
+            ] {
+                let prefix_accelerated = complete_forward_resource_fallback(
+                    pattern,
+                    OutputContract::Exists,
+                    target,
+                );
+                assert!(
+                    prefix_accelerated.receipt().runtime_helper_required,
+                    "{pattern:?}/{target:?} discarded the portable byte-set scanner"
+                );
+                assert!(prefix_accelerated.module().required_runtime_symbol().is_some());
+                assert_eq!(
+                    prefix_accelerated.module().start_accelerator(),
+                    StartAccelerator::None
+                );
+            }
         }
     }
 

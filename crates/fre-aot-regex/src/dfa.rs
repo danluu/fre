@@ -1107,6 +1107,10 @@ impl PartialDfaPrefixPlan {
         )
     }
 
+    pub(crate) const fn primary_depth(self) -> usize {
+        self.primary_depth
+    }
+
     fn find_primary(&self, primary: AnchoredByteSet, bytes: &[u8]) -> Option<usize> {
         match self.scanner {
             PartialDfaPrefixScanner::Small { members, count: 1 } => memchr(members[0], bytes),
@@ -1225,7 +1229,21 @@ impl PartialDfa {
     pub(crate) fn native_complete_view(&self) -> Option<NativeDfaView<'_>> {
         let complete = self.forward.complete_rows == self.forward.discovered_states
             && self.forward.resume_keys.is_empty();
-        complete.then_some(NativeDfaView {
+        let expected_cells = self
+            .forward
+            .discovered_states
+            .checked_mul(self.alphabet.classes())?;
+        let exact_extent = self.forward.transitions.len() == expected_cells;
+        let bounded_targets = self.forward.transitions.iter().all(|cell| {
+            cell.next == NO_STATE
+                || usize::try_from(cell.next)
+                    .ok()
+                    .is_some_and(|next| next < self.forward.discovered_states)
+        });
+        if !complete || !exact_extent || !bounded_targets {
+            return None;
+        }
+        Some(NativeDfaView {
             initial_state: 0,
             initial_pending: self.forward.initial_pending,
             initial_terminal: self.forward.initial_terminal,
