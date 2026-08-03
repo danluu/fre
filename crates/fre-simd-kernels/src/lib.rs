@@ -187,9 +187,31 @@ impl SimdDispatchContext {
     ) -> Result<AsciiByteSetRunScanner, UnsupportedRequiredFeatures> {
         #[cfg(feature = "static-dispatch")]
         if policy == DispatchPolicy::Auto {
-            return Ok(AsciiByteSetRunScanner::from_static_profile(set));
+            return Ok(AsciiByteSetRunScanner::from_static_profile(set, false));
         }
         AsciiByteSetRunScanner::with_capabilities(set, self.capabilities, policy)
+    }
+
+    /// Build an ASCII run scanner that may use a small ASCII-complement table.
+    ///
+    /// This is an explicit semantic opt-in for callers that independently
+    /// prove every non-ASCII byte must terminate the ASCII scan. Ordinary run
+    /// scanners retain member-table-only selection.
+    pub fn ascii_byte_set_run_scanner_prefer_small_complement(
+        self,
+        set: AsciiByteSet,
+        policy: DispatchPolicy,
+    ) -> Result<AsciiByteSetRunScanner, UnsupportedRequiredFeatures> {
+        #[cfg(feature = "static-dispatch")]
+        if policy == DispatchPolicy::Auto {
+            return Ok(AsciiByteSetRunScanner::from_static_profile(set, true));
+        }
+        AsciiByteSetRunScanner::with_capabilities_and_table_preference(
+            set,
+            self.capabilities,
+            policy,
+            true,
+        )
     }
 
     /// Build the token-phrase three-class classifier from this snapshot.
@@ -300,40 +322,66 @@ impl AsciiByteSet {
         columns
     }
 
-    fn run_tables(self) -> (AsciiRunTables, bool) {
+    fn run_tables(self, prefer_small_complement: bool) -> (AsciiRunTables, AsciiRunTableMode) {
         let mut columns = [0_u8; ASCII_NARROW_BYTES];
-        let mut values = [0_u8; ASCII_NARROW_BYTES];
-        let mut values_len = 0_usize;
-        let mut values_overflowed = false;
+        let mut member_values = [0_u8; ASCII_NARROW_BYTES];
+        let mut complement_values = [0_u8; ASCII_NARROW_BYTES];
+        let mut member_values_len = 0_usize;
+        let mut complement_values_len = 0_usize;
+        let mut member_values_overflowed = false;
+        let mut complement_values_overflowed = false;
         for byte in 0_u8..=0x7f {
-            if !self.contains(byte) {
+            if self.contains(byte) {
+                let low_nibble = usize::from(byte & 0x0f);
+                let high_bit = HIGH_NIBBLE_BITS[usize::from(byte >> 4)];
+                columns[low_nibble] |= high_bit;
+
+                if let Some(slot) = member_values.get_mut(member_values_len) {
+                    *slot = byte;
+                    member_values_len = member_values_len
+                        .checked_add(1)
+                        .expect("an ASCII set cardinality fits in usize");
+                } else {
+                    member_values_overflowed = true;
+                }
                 continue;
             }
-            let low_nibble = usize::from(byte & 0x0f);
-            let high_bit = HIGH_NIBBLE_BITS[usize::from(byte >> 4)];
-            columns[low_nibble] |= high_bit;
 
-            if let Some(slot) = values.get_mut(values_len) {
+            if let Some(slot) = complement_values.get_mut(complement_values_len) {
                 *slot = byte;
-                values_len = values_len
+                complement_values_len = complement_values_len
                     .checked_add(1)
                     .expect("an ASCII set cardinality fits in usize");
             } else {
-                values_overflowed = true;
+                complement_values_overflowed = true;
             }
         }
-        let match_eligible = values_len != 0 && !values_overflowed;
-        if match_eligible {
-            let duplicate = values[0];
-            values[values_len..].fill(duplicate);
+        let table_mode = if member_values_len != 0 && !member_values_overflowed {
+            AsciiRunTableMode::SmallMembers
+        } else if prefer_small_complement
+            && complement_values_len != 0
+            && !complement_values_overflowed
+        {
+            AsciiRunTableMode::SmallComplement
+        } else {
+            AsciiRunTableMode::Generic
+        };
+        let (mut match_values, values_len) = match table_mode {
+            AsciiRunTableMode::Generic => ([0_u8; ASCII_NARROW_BYTES], 0),
+            AsciiRunTableMode::SmallMembers => (member_values, member_values_len),
+            AsciiRunTableMode::SmallComplement => (complement_values, complement_values_len),
+        };
+        if table_mode != AsciiRunTableMode::Generic {
+            let duplicate = match_values[0];
+            match_values[values_len..].fill(duplicate);
         }
         (
             AsciiRunTables {
                 set: self,
                 columns,
-                match_values: values,
+                match_values,
             },
-            match_eligible,
+            table_mode,
         )
     }
 }
@@ -598,6 +646,14 @@ impl AsciiSelection {
     }
 }
 
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AsciiRunTableMode {
+    Generic,
+    SmallMembers,
+    SmallComplement,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct AsciiRunTables {
     set: AsciiByteSet,
@@ -666,7 +722,12 @@ const SVE_RUN_VARIANT_ID: &str = "ascii-byte-set.run.sve.v1";
 #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
 const SVE2_MATCH16_RUN_VARIANT_ID: &str = "ascii-byte-set.run.sve2-match16.v1";
 #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+const SVE2_COMPLEMENT16_RUN_VARIANT_ID: &str = "ascii-byte-set.run.sve2-complement16.v1";
+#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
 const NEON_SVE2_ARM_41_D84_RUN_VARIANT_ID: &str = "ascii-byte-set.run.neon-sve2.arm-41-d84.v1";
+#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+const SVE2_COMPLEMENT16_ARM_41_D84_RUN_VARIANT_ID: &str =
+    "ascii-byte-set.run.sve2-complement16.arm-41-d84.v1";
 
 /// A compiled ASCII byte-set run scanner with immutable one-time dispatch.
 ///
@@ -679,7 +740,7 @@ pub struct AsciiByteSetRunScanner {
     #[cfg(not(feature = "static-dispatch"))]
     entries: AsciiRunEntries,
     #[cfg(feature = "static-dispatch")]
-    match_eligible: bool,
+    table_mode: AsciiRunTableMode,
     #[cfg(not(feature = "static-dispatch"))]
     selection: SelectionReceipt,
 }
@@ -724,38 +785,44 @@ impl AsciiByteSetRunScanner {
         capabilities: CpuCapabilities,
         policy: DispatchPolicy,
     ) -> Result<Self, UnsupportedRequiredFeatures> {
+        Self::with_capabilities_and_table_preference(set, capabilities, policy, false)
+    }
+
+    fn with_capabilities_and_table_preference(
+        set: AsciiByteSet,
+        capabilities: CpuCapabilities,
+        policy: DispatchPolicy,
+        prefer_small_complement: bool,
+    ) -> Result<Self, UnsupportedRequiredFeatures> {
         #[cfg(feature = "static-dispatch")]
         if policy == DispatchPolicy::Auto && capabilities == *host() {
-            return Ok(Self::from_static_profile(set));
+            return Ok(Self::from_static_profile(set, prefer_small_complement));
         }
         // One complete 128-byte-domain pass builds both representations so
         // resource-accounted callers can charge exactly 128 membership probes.
-        let (tables, match_eligible) = set.run_tables();
-        let selected = select_run(capabilities, policy, match_eligible)?;
+        let (tables, table_mode) = set.run_tables(prefer_small_complement);
+        let selected = select_run(capabilities, policy, table_mode)?;
         #[cfg(feature = "static-dispatch")]
         require_static_selection(
             selected.receipt(),
-            automatic_run_selection(match_eligible),
-            static_run_variant_id(match_eligible),
+            automatic_run_selection(table_mode),
+            static_run_variant_id(table_mode),
         )?;
         Ok(Self {
             tables,
             #[cfg(not(feature = "static-dispatch"))]
             entries: selected.entry(),
             #[cfg(feature = "static-dispatch")]
-            match_eligible,
+            table_mode,
             #[cfg(not(feature = "static-dispatch"))]
             selection: selected.receipt(),
         })
     }
 
     #[cfg(feature = "static-dispatch")]
-    fn from_static_profile(set: AsciiByteSet) -> Self {
-        let (tables, match_eligible) = set.run_tables();
-        Self {
-            tables,
-            match_eligible,
-        }
+    fn from_static_profile(set: AsciiByteSet, prefer_small_complement: bool) -> Self {
+        let (tables, table_mode) = set.run_tables(prefer_small_complement);
+        Self { tables, table_mode }
     }
 
     /// The byte set compiled into this scanner.
@@ -779,7 +846,7 @@ impl AsciiByteSetRunScanner {
     #[must_use]
     #[cfg(feature = "static-dispatch")]
     pub const fn selection(&self) -> SelectionReceipt {
-        automatic_run_selection(self.match_eligible)
+        automatic_run_selection(self.table_mode)
     }
 
     /// Scan the maximal member prefix.
@@ -805,7 +872,7 @@ impl AsciiByteSetRunScanner {
         {
             // SAFETY: construction rejected every snapshot or policy that
             // selected a leaf other than this compiler-fixed implementation.
-            unsafe { static_scan_run_forward(&self.tables, self.match_eligible, bytes) }
+            unsafe { static_scan_run_forward(&self.tables, self.table_mode, bytes) }
         }
     }
 
@@ -828,7 +895,7 @@ impl AsciiByteSetRunScanner {
         #[cfg(feature = "static-dispatch")]
         {
             // SAFETY: identical compiler-fixed selection proof to forward.
-            unsafe { static_scan_run_backward(&self.tables, self.match_eligible, bytes) }
+            unsafe { static_scan_run_backward(&self.tables, self.table_mode, bytes) }
         }
     }
 }
@@ -1522,11 +1589,11 @@ const fn static_word_space_variant_id() -> &'static str {
 }
 
 #[cfg(all(feature = "static-dispatch-arm-41-d84", feature = "static-dispatch"))]
-const fn static_run_variant_id(match_eligible: bool) -> &'static str {
-    if match_eligible {
-        NEON_SVE2_ARM_41_D84_RUN_VARIANT_ID
-    } else {
-        NEON_RUN_VARIANT_ID
+const fn static_run_variant_id(table_mode: AsciiRunTableMode) -> &'static str {
+    match table_mode {
+        AsciiRunTableMode::SmallMembers => NEON_SVE2_ARM_41_D84_RUN_VARIANT_ID,
+        AsciiRunTableMode::SmallComplement => SVE2_COMPLEMENT16_ARM_41_D84_RUN_VARIANT_ID,
+        AsciiRunTableMode::Generic => NEON_RUN_VARIANT_ID,
     }
 }
 
@@ -1536,7 +1603,7 @@ const fn static_run_variant_id(match_eligible: bool) -> &'static str {
     target_arch = "aarch64",
     target_feature = "neon"
 ))]
-const fn static_run_variant_id(_match_eligible: bool) -> &'static str {
+const fn static_run_variant_id(_table_mode: AsciiRunTableMode) -> &'static str {
     NEON_RUN_VARIANT_ID
 }
 
@@ -1550,11 +1617,11 @@ const fn static_run_variant_id(_match_eligible: bool) -> &'static str {
     target_feature = "sve",
     target_feature = "sve2"
 ))]
-const fn static_run_variant_id(match_eligible: bool) -> &'static str {
-    if match_eligible {
-        SVE2_MATCH16_RUN_VARIANT_ID
-    } else {
-        SVE_RUN_VARIANT_ID
+const fn static_run_variant_id(table_mode: AsciiRunTableMode) -> &'static str {
+    match table_mode {
+        AsciiRunTableMode::SmallMembers => SVE2_MATCH16_RUN_VARIANT_ID,
+        AsciiRunTableMode::SmallComplement => SVE2_COMPLEMENT16_RUN_VARIANT_ID,
+        AsciiRunTableMode::Generic => SVE_RUN_VARIANT_ID,
     }
 }
 
@@ -1568,7 +1635,7 @@ const fn static_run_variant_id(match_eligible: bool) -> &'static str {
     target_feature = "sve",
     not(target_feature = "sve2")
 ))]
-const fn static_run_variant_id(_match_eligible: bool) -> &'static str {
+const fn static_run_variant_id(_table_mode: AsciiRunTableMode) -> &'static str {
     SVE_RUN_VARIANT_ID
 }
 
@@ -1586,7 +1653,7 @@ const fn static_run_variant_id(_match_eligible: bool) -> &'static str {
         )
     ))
 ))]
-const fn static_run_variant_id(_match_eligible: bool) -> &'static str {
+const fn static_run_variant_id(_table_mode: AsciiRunTableMode) -> &'static str {
     SCALAR_RUN_VARIANT_ID
 }
 
@@ -1842,9 +1909,9 @@ const fn automatic_word_space_selection() -> SelectionReceipt {
 }
 
 #[cfg(all(feature = "static-dispatch-arm-41-d84", feature = "static-dispatch"))]
-const fn automatic_run_selection(match_eligible: bool) -> SelectionReceipt {
-    if match_eligible {
-        compiler_selection_receipt(
+const fn automatic_run_selection(table_mode: AsciiRunTableMode) -> SelectionReceipt {
+    match table_mode {
+        AsciiRunTableMode::SmallMembers => compiler_selection_receipt(
             NEON_SVE2_ARM_41_D84_RUN_VARIANT_ID,
             None,
             FeatureSet::EMPTY
@@ -1854,9 +1921,18 @@ const fn automatic_run_selection(match_eligible: bool) -> SelectionReceipt {
             VectorKind::Scalable,
             ASCII_NARROW_BYTES,
             ASCII_NARROW_BYTES,
-        )
-    } else {
-        compiler_selection_receipt(
+        ),
+        AsciiRunTableMode::SmallComplement => compiler_selection_receipt(
+            SVE2_COMPLEMENT16_ARM_41_D84_RUN_VARIANT_ID,
+            None,
+            FeatureSet::EMPTY
+                .with(Feature::ArmSve)
+                .with(Feature::ArmSve2),
+            VectorKind::Scalable,
+            ASCII_NARROW_BYTES,
+            ASCII_NARROW_BYTES,
+        ),
+        AsciiRunTableMode::Generic => compiler_selection_receipt(
             NEON_RUN_VARIANT_ID,
             None,
             FeatureSet::of(Feature::ArmNeon),
@@ -1865,7 +1941,7 @@ const fn automatic_run_selection(match_eligible: bool) -> SelectionReceipt {
             },
             ASCII_NARROW_BYTES,
             ASCII_NARROW_BYTES,
-        )
+        ),
     }
 }
 
@@ -1875,7 +1951,7 @@ const fn automatic_run_selection(match_eligible: bool) -> SelectionReceipt {
     target_arch = "aarch64",
     target_feature = "neon"
 ))]
-const fn automatic_run_selection(_match_eligible: bool) -> SelectionReceipt {
+const fn automatic_run_selection(_table_mode: AsciiRunTableMode) -> SelectionReceipt {
     compiler_selection_receipt(
         NEON_RUN_VARIANT_ID,
         None,
@@ -1898,27 +1974,33 @@ const fn automatic_run_selection(_match_eligible: bool) -> SelectionReceipt {
     target_feature = "sve",
     target_feature = "sve2"
 ))]
-const fn automatic_run_selection(match_eligible: bool) -> SelectionReceipt {
-    if match_eligible {
-        compiler_selection_receipt(
-            SVE2_MATCH16_RUN_VARIANT_ID,
-            None,
-            FeatureSet::EMPTY
-                .with(Feature::ArmSve)
-                .with(Feature::ArmSve2),
-            VectorKind::Scalable,
-            ASCII_NARROW_BYTES,
-            ASCII_NARROW_BYTES,
-        )
-    } else {
-        compiler_selection_receipt(
+const fn automatic_run_selection(table_mode: AsciiRunTableMode) -> SelectionReceipt {
+    match table_mode {
+        AsciiRunTableMode::SmallMembers | AsciiRunTableMode::SmallComplement => {
+            let variant_id = match table_mode {
+                AsciiRunTableMode::SmallMembers => SVE2_MATCH16_RUN_VARIANT_ID,
+                AsciiRunTableMode::SmallComplement => SVE2_COMPLEMENT16_RUN_VARIANT_ID,
+                AsciiRunTableMode::Generic => unreachable!(),
+            };
+            compiler_selection_receipt(
+                variant_id,
+                None,
+                FeatureSet::EMPTY
+                    .with(Feature::ArmSve)
+                    .with(Feature::ArmSve2),
+                VectorKind::Scalable,
+                ASCII_NARROW_BYTES,
+                ASCII_NARROW_BYTES,
+            )
+        }
+        AsciiRunTableMode::Generic => compiler_selection_receipt(
             SVE_RUN_VARIANT_ID,
             None,
             FeatureSet::of(Feature::ArmSve),
             VectorKind::Scalable,
             ASCII_NARROW_BYTES,
             ASCII_NARROW_BYTES,
-        )
+        ),
     }
 }
 
@@ -1932,7 +2014,7 @@ const fn automatic_run_selection(match_eligible: bool) -> SelectionReceipt {
     target_feature = "sve",
     not(target_feature = "sve2")
 ))]
-const fn automatic_run_selection(_match_eligible: bool) -> SelectionReceipt {
+const fn automatic_run_selection(_table_mode: AsciiRunTableMode) -> SelectionReceipt {
     compiler_selection_receipt(
         SVE_RUN_VARIANT_ID,
         None,
@@ -1957,7 +2039,7 @@ const fn automatic_run_selection(_match_eligible: bool) -> SelectionReceipt {
         )
     ))
 ))]
-const fn automatic_run_selection(_match_eligible: bool) -> SelectionReceipt {
+const fn automatic_run_selection(_table_mode: AsciiRunTableMode) -> SelectionReceipt {
     compiler_selection_receipt(
         SCALAR_RUN_VARIANT_ID,
         None,
@@ -2280,16 +2362,24 @@ unsafe fn static_classify_word_space_32(
 )]
 unsafe fn static_scan_run_forward(
     tables: &AsciiRunTables,
-    match_eligible: bool,
+    table_mode: AsciiRunTableMode,
     bytes: &[u8],
 ) -> AsciiRunResult {
-    if match_eligible {
-        // SAFETY: the profile and accepted receipt prove NEON, SVE, and SVE2,
-        // and construction produced an exact MATCH table for this set.
-        unsafe { aarch64_sve2::scan_run_forward_neon_sve2(tables, bytes) }
-    } else {
-        // SAFETY: the same profile independently proves NEON.
-        unsafe { aarch64::scan_run_forward_neon(tables, bytes) }
+    match table_mode {
+        AsciiRunTableMode::SmallMembers => {
+            // SAFETY: the profile and accepted receipt prove NEON, SVE, and
+            // SVE2, and construction produced an exact member MATCH table.
+            unsafe { aarch64_sve2::scan_run_forward_neon_sve2(tables, bytes) }
+        }
+        AsciiRunTableMode::SmallComplement => {
+            // SAFETY: the accepted receipt proves SVE and SVE2, and construction
+            // produced an exact ASCII-complement table for the dedicated leaf.
+            unsafe { aarch64_sve2::scan_run_forward_sve2_complement(tables, bytes) }
+        }
+        AsciiRunTableMode::Generic => {
+            // SAFETY: the same profile independently proves NEON.
+            unsafe { aarch64::scan_run_forward_neon(tables, bytes) }
+        }
     }
 }
 
@@ -2305,16 +2395,24 @@ unsafe fn static_scan_run_forward(
 )]
 unsafe fn static_scan_run_backward(
     tables: &AsciiRunTables,
-    match_eligible: bool,
+    table_mode: AsciiRunTableMode,
     bytes: &[u8],
 ) -> AsciiRunResult {
-    if match_eligible {
-        // SAFETY: the profile and accepted receipt prove NEON, SVE, and SVE2,
-        // and construction produced an exact MATCH table for this set.
-        unsafe { aarch64_sve2::scan_run_backward_neon_sve2(tables, bytes) }
-    } else {
-        // SAFETY: the same profile independently proves NEON.
-        unsafe { aarch64::scan_run_backward_neon(tables, bytes) }
+    match table_mode {
+        AsciiRunTableMode::SmallMembers => {
+            // SAFETY: the profile and accepted receipt prove NEON, SVE, and
+            // SVE2, and construction produced an exact member MATCH table.
+            unsafe { aarch64_sve2::scan_run_backward_neon_sve2(tables, bytes) }
+        }
+        AsciiRunTableMode::SmallComplement => {
+            // SAFETY: the accepted receipt proves SVE and SVE2, and construction
+            // produced an exact ASCII-complement table for the dedicated leaf.
+            unsafe { aarch64_sve2::scan_run_backward_sve2_complement(tables, bytes) }
+        }
+        AsciiRunTableMode::Generic => {
+            // SAFETY: the same profile independently proves NEON.
+            unsafe { aarch64::scan_run_backward_neon(tables, bytes) }
+        }
     }
 }
 
@@ -2330,7 +2428,7 @@ unsafe fn static_scan_run_backward(
 )]
 unsafe fn static_scan_run_forward(
     tables: &AsciiRunTables,
-    _match_eligible: bool,
+    _table_mode: AsciiRunTableMode,
     bytes: &[u8],
 ) -> AsciiRunResult {
     // SAFETY: NEON is globally enabled and required by the accepted receipt.
@@ -2349,7 +2447,7 @@ unsafe fn static_scan_run_forward(
 )]
 unsafe fn static_scan_run_backward(
     tables: &AsciiRunTables,
-    _match_eligible: bool,
+    _table_mode: AsciiRunTableMode,
     bytes: &[u8],
 ) -> AsciiRunResult {
     // SAFETY: NEON is globally enabled and required by the accepted receipt.
@@ -2372,15 +2470,22 @@ unsafe fn static_scan_run_backward(
 )]
 unsafe fn static_scan_run_forward(
     tables: &AsciiRunTables,
-    match_eligible: bool,
+    table_mode: AsciiRunTableMode,
     bytes: &[u8],
 ) -> AsciiRunResult {
-    if match_eligible {
-        // SAFETY: construction proved the MATCH representation and SVE2.
-        unsafe { aarch64_sve2::scan_run_forward_sve2(tables, bytes) }
-    } else {
-        // SAFETY: construction independently proved base SVE.
-        unsafe { aarch64_sve2::scan_run_forward_sve(tables, bytes) }
+    match table_mode {
+        AsciiRunTableMode::SmallMembers => {
+            // SAFETY: construction proved the member MATCH representation and SVE2.
+            unsafe { aarch64_sve2::scan_run_forward_sve2(tables, bytes) }
+        }
+        AsciiRunTableMode::SmallComplement => {
+            // SAFETY: construction proved the complement representation and SVE2.
+            unsafe { aarch64_sve2::scan_run_forward_sve2_complement(tables, bytes) }
+        }
+        AsciiRunTableMode::Generic => {
+            // SAFETY: construction independently proved base SVE.
+            unsafe { aarch64_sve2::scan_run_forward_sve(tables, bytes) }
+        }
     }
 }
 
@@ -2400,15 +2505,22 @@ unsafe fn static_scan_run_forward(
 )]
 unsafe fn static_scan_run_backward(
     tables: &AsciiRunTables,
-    match_eligible: bool,
+    table_mode: AsciiRunTableMode,
     bytes: &[u8],
 ) -> AsciiRunResult {
-    if match_eligible {
-        // SAFETY: construction proved the MATCH representation and SVE2.
-        unsafe { aarch64_sve2::scan_run_backward_sve2(tables, bytes) }
-    } else {
-        // SAFETY: construction independently proved base SVE.
-        unsafe { aarch64_sve2::scan_run_backward_sve(tables, bytes) }
+    match table_mode {
+        AsciiRunTableMode::SmallMembers => {
+            // SAFETY: construction proved the member MATCH representation and SVE2.
+            unsafe { aarch64_sve2::scan_run_backward_sve2(tables, bytes) }
+        }
+        AsciiRunTableMode::SmallComplement => {
+            // SAFETY: construction proved the complement representation and SVE2.
+            unsafe { aarch64_sve2::scan_run_backward_sve2_complement(tables, bytes) }
+        }
+        AsciiRunTableMode::Generic => {
+            // SAFETY: construction independently proved base SVE.
+            unsafe { aarch64_sve2::scan_run_backward_sve(tables, bytes) }
+        }
     }
 }
 
@@ -2428,7 +2540,7 @@ unsafe fn static_scan_run_backward(
 )]
 unsafe fn static_scan_run_forward(
     tables: &AsciiRunTables,
-    _match_eligible: bool,
+    _table_mode: AsciiRunTableMode,
     bytes: &[u8],
 ) -> AsciiRunResult {
     // SAFETY: SVE is globally enabled and required by the accepted receipt.
@@ -2451,7 +2563,7 @@ unsafe fn static_scan_run_forward(
 )]
 unsafe fn static_scan_run_backward(
     tables: &AsciiRunTables,
-    _match_eligible: bool,
+    _table_mode: AsciiRunTableMode,
     bytes: &[u8],
 ) -> AsciiRunResult {
     // SAFETY: SVE is globally enabled and required by the accepted receipt.
@@ -2478,7 +2590,7 @@ unsafe fn static_scan_run_backward(
 )]
 unsafe fn static_scan_run_forward(
     tables: &AsciiRunTables,
-    _match_eligible: bool,
+    _table_mode: AsciiRunTableMode,
     bytes: &[u8],
 ) -> AsciiRunResult {
     scalar::scan_run_forward(tables.set, bytes)
@@ -2504,7 +2616,7 @@ unsafe fn static_scan_run_forward(
 )]
 unsafe fn static_scan_run_backward(
     tables: &AsciiRunTables,
-    _match_eligible: bool,
+    _table_mode: AsciiRunTableMode,
     bytes: &[u8],
 ) -> AsciiRunResult {
     scalar::scan_run_backward(tables.set, bytes)
@@ -2644,6 +2756,66 @@ const RUN_MATCH_VARIANTS: [KernelVariant<AsciiRunEntries>; 5] = [
     .when_tuning(is_neoverse_v3),
 ];
 
+#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+const RUN_COMPLEMENT_VARIANTS: [KernelVariant<AsciiRunEntries>; 5] = [
+    SCALAR_RUN,
+    KernelVariant::new(
+        SVE_RUN_VARIANT_ID,
+        ArchitectureRequirement::Exact(Architecture::Aarch64),
+        FeatureSet::of(Feature::ArmSve),
+        VectorKind::Scalable,
+        ASCII_NARROW_BYTES,
+        50,
+        AsciiRunEntries {
+            forward: scan_run_entry!(aarch64_sve2::scan_run_forward_sve),
+            backward: scan_run_entry!(aarch64_sve2::scan_run_backward_sve),
+        },
+    ),
+    KernelVariant::new(
+        SVE2_COMPLEMENT16_RUN_VARIANT_ID,
+        ArchitectureRequirement::Exact(Architecture::Aarch64),
+        FeatureSet::EMPTY
+            .with(Feature::ArmSve)
+            .with(Feature::ArmSve2),
+        VectorKind::Scalable,
+        ASCII_NARROW_BYTES,
+        60,
+        AsciiRunEntries {
+            forward: scan_run_entry!(aarch64_sve2::scan_run_forward_sve2_complement),
+            backward: scan_run_entry!(aarch64_sve2::scan_run_backward_sve2_complement),
+        },
+    ),
+    KernelVariant::new(
+        NEON_RUN_VARIANT_ID,
+        ArchitectureRequirement::Exact(Architecture::Aarch64),
+        FeatureSet::of(Feature::ArmNeon),
+        VectorKind::Fixed {
+            bytes: ASCII_NARROW_VECTOR_BYTES,
+        },
+        ASCII_NARROW_BYTES,
+        100,
+        AsciiRunEntries {
+            forward: scan_run_entry!(aarch64::scan_run_forward_neon),
+            backward: scan_run_entry!(aarch64::scan_run_backward_neon),
+        },
+    ),
+    KernelVariant::new(
+        SVE2_COMPLEMENT16_ARM_41_D84_RUN_VARIANT_ID,
+        ArchitectureRequirement::Exact(Architecture::Aarch64),
+        FeatureSet::EMPTY
+            .with(Feature::ArmSve)
+            .with(Feature::ArmSve2),
+        VectorKind::Scalable,
+        ASCII_NARROW_BYTES,
+        150,
+        AsciiRunEntries {
+            forward: scan_run_entry!(aarch64_sve2::scan_run_forward_sve2_complement),
+            backward: scan_run_entry!(aarch64_sve2::scan_run_backward_sve2_complement),
+        },
+    )
+    .when_tuning(is_neoverse_v3),
+];
+
 #[cfg(all(
     target_arch = "aarch64",
     not(all(target_os = "linux", target_endian = "little"))
@@ -2672,11 +2844,20 @@ const RUN_VARIANTS: [KernelVariant<AsciiRunEntries>; 2] = [
 ))]
 const RUN_MATCH_VARIANTS: [KernelVariant<AsciiRunEntries>; 2] = RUN_VARIANTS;
 
+#[cfg(all(
+    target_arch = "aarch64",
+    not(all(target_os = "linux", target_endian = "little"))
+))]
+const RUN_COMPLEMENT_VARIANTS: [KernelVariant<AsciiRunEntries>; 2] = RUN_VARIANTS;
+
 #[cfg(not(target_arch = "aarch64"))]
 const RUN_VARIANTS: [KernelVariant<AsciiRunEntries>; 1] = [SCALAR_RUN];
 
 #[cfg(not(target_arch = "aarch64"))]
 const RUN_MATCH_VARIANTS: [KernelVariant<AsciiRunEntries>; 1] = [SCALAR_RUN];
+
+#[cfg(not(target_arch = "aarch64"))]
+const RUN_COMPLEMENT_VARIANTS: [KernelVariant<AsciiRunEntries>; 1] = [SCALAR_RUN];
 
 #[allow(
     unsafe_code,
@@ -2955,12 +3136,12 @@ fn select_word_space(
 fn select_run(
     capabilities: CpuCapabilities,
     policy: DispatchPolicy,
-    match_eligible: bool,
+    table_mode: AsciiRunTableMode,
 ) -> Result<SelectedKernel<AsciiRunEntries>, UnsupportedRequiredFeatures> {
-    let variants = if match_eligible {
-        &RUN_MATCH_VARIANTS[..]
-    } else {
-        &RUN_VARIANTS[..]
+    let variants = match table_mode {
+        AsciiRunTableMode::Generic => &RUN_VARIANTS[..],
+        AsciiRunTableMode::SmallMembers => &RUN_MATCH_VARIANTS[..],
+        AsciiRunTableMode::SmallComplement => &RUN_COMPLEMENT_VARIANTS[..],
     };
     // Sixteen bytes is the retained implementation's invariant block shape.
     // Calls may contain any number of bytes and never participate in selection.

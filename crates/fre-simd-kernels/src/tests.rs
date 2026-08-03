@@ -70,19 +70,36 @@ fn compiler_fixed_direct_leaves_match_automatic_receipts() {
     );
 
     for set in [singleton(b'x'), AsciiByteSet::ALL] {
-        let (_, match_eligible) = set.run_tables();
+        let (_, table_mode) = set.run_tables(false);
         let scanner = AsciiByteSetRunScanner::new(set);
         assert_eq!(
             scanner.selection(),
-            select_run(*host(), DispatchPolicy::Auto, match_eligible)
+            select_run(*host(), DispatchPolicy::Auto, table_mode)
                 .expect("automatic run selection")
                 .receipt()
         );
         assert_eq!(
             scanner.selection().variant_id,
-            static_run_variant_id(match_eligible)
+            static_run_variant_id(table_mode)
         );
     }
+
+    let complement_set = all_ascii_except(b"\n\r");
+    let (_, table_mode) = complement_set.run_tables(true);
+    let scanner = SimdDispatchContext::capture()
+        .ascii_byte_set_run_scanner_prefer_small_complement(complement_set, DispatchPolicy::Auto)
+        .expect("compiler-fixed complement run scanner");
+    assert_eq!(table_mode, AsciiRunTableMode::SmallComplement);
+    assert_eq!(
+        scanner.selection(),
+        select_run(*host(), DispatchPolicy::Auto, table_mode)
+            .expect("automatic complement run selection")
+            .receipt()
+    );
+    assert_eq!(
+        scanner.selection().variant_id,
+        static_run_variant_id(table_mode)
+    );
 }
 
 #[cfg(all(feature = "static-dispatch", target_pointer_width = "64"))]
@@ -128,9 +145,20 @@ fn static_profile_rejects_policies_that_would_retarget_a_direct_leaf() {
         assert!(error.usable.is_empty());
     }
 
-    if static_run_variant_id(true) != SCALAR_RUN_VARIANT_ID {
+    if static_run_variant_id(AsciiRunTableMode::SmallMembers) != SCALAR_RUN_VARIANT_ID {
         let error = AsciiByteSetRunScanner::with_policy(singleton(b'x'), DispatchPolicy::Portable)
             .expect_err("portable policy cannot retarget a compiler-fixed vector scanner");
+        assert!(!error.required.is_empty());
+        assert!(error.usable.is_empty());
+    }
+
+    if static_run_variant_id(AsciiRunTableMode::SmallComplement) != SCALAR_RUN_VARIANT_ID {
+        let error = SimdDispatchContext::capture()
+            .ascii_byte_set_run_scanner_prefer_small_complement(
+                all_ascii_except(b"\n"),
+                DispatchPolicy::Portable,
+            )
+            .expect_err("portable policy cannot retarget a compiler-fixed complement scanner");
         assert!(!error.required.is_empty());
         assert!(error.usable.is_empty());
     }
@@ -172,6 +200,29 @@ fn compiler_fixed_run_scanner_exhausts_boundaries_and_alignments() {
             }
         }
     }
+
+    let set = all_ascii_except(b"\n\r");
+    let scanner = SimdDispatchContext::capture()
+        .ascii_byte_set_run_scanner_prefer_small_complement(set, DispatchPolicy::Auto)
+        .expect("compiler-fixed complement scanner");
+    for len in 0..=ASCII_WIDE_BYTES * 3 + 1 {
+        for offset in 0..ASCII_NARROW_BYTES {
+            let mut storage = vec![b'a'; offset + len];
+            let bytes = &mut storage[offset..];
+            for barrier in [b'\n', b'\r', 0x80, 0xbf, 0xc2, 0xff] {
+                for position in 0..len {
+                    bytes.fill(b'a');
+                    bytes[position] = barrier;
+                    assert_run_result(
+                        &scanner,
+                        bytes,
+                        scanner.scan_forward(bytes),
+                        scanner.scan_backward(bytes),
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn singleton(byte: u8) -> AsciiByteSet {
@@ -179,6 +230,16 @@ fn singleton(byte: u8) -> AsciiByteSet {
     let mut words = [0_u64; 2];
     let word = usize::from(byte >> 6);
     words[word] = 1_u64 << (byte & 0x3f);
+    AsciiByteSet::from_words(words)
+}
+
+fn all_ascii_except(excluded: &[u8]) -> AsciiByteSet {
+    let mut words = [u64::MAX; 2];
+    for &byte in excluded {
+        assert!(byte.is_ascii());
+        let word = usize::from(byte >> 6);
+        words[word] &= !(1_u64 << (byte & 0x3f));
+    }
     AsciiByteSet::from_words(words)
 }
 
@@ -491,15 +552,15 @@ fn run_tables_share_one_exact_representation_pass_and_match_only_small_sets() {
     }
 
     for set in sets {
-        let (tables, match_eligible) = set.run_tables();
+        let (tables, table_mode) = set.run_tables(false);
         assert_eq!(tables.set, set);
         assert_eq!(tables.columns, set.nibble_columns());
         let members: Vec<_> = (0_u8..=0x7f).filter(|&byte| set.contains(byte)).collect();
         assert_eq!(
-            match_eligible,
+            table_mode == AsciiRunTableMode::SmallMembers,
             (1..=ASCII_NARROW_BYTES).contains(&members.len())
         );
-        if match_eligible {
+        if table_mode == AsciiRunTableMode::SmallMembers {
             assert_eq!(&tables.match_values[..members.len()], members.as_slice());
             assert!(
                 tables.match_values[members.len()..]
@@ -508,6 +569,50 @@ fn run_tables_share_one_exact_representation_pass_and_match_only_small_sets() {
             );
         }
     }
+}
+
+#[test]
+fn complement_run_tables_are_explicit_bounded_and_keep_original_membership() {
+    let cases: [&[u8]; 4] = [
+        &[],
+        &[0],
+        &[
+            0, 15, 16, 31, 32, 63, 64, 95, 96, 111, 112, 119, 120, 125, 126, 127,
+        ],
+        &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+    ];
+    for excluded in cases {
+        let set = all_ascii_except(excluded);
+        let (ordinary_tables, ordinary_mode) = set.run_tables(false);
+        let (tables, table_mode) = set.run_tables(true);
+        let expected_mode = if (1..=ASCII_NARROW_BYTES).contains(&excluded.len()) {
+            AsciiRunTableMode::SmallComplement
+        } else {
+            AsciiRunTableMode::Generic
+        };
+        assert_eq!(ordinary_mode, AsciiRunTableMode::Generic);
+        assert_eq!(table_mode, expected_mode);
+        assert_eq!(tables.set, set);
+        assert_eq!(tables.columns, set.nibble_columns());
+        assert_eq!(ordinary_tables.set, tables.set);
+        assert_eq!(ordinary_tables.columns, tables.columns);
+        if table_mode == AsciiRunTableMode::SmallComplement {
+            assert_eq!(
+                &tables.match_values[..excluded.len()],
+                excluded,
+                "the complement table preserves ascending ASCII exclusions"
+            );
+            assert!(
+                tables.match_values[excluded.len()..]
+                    .iter()
+                    .all(|&byte| byte == excluded[0])
+            );
+        }
+    }
+
+    let sparse = singleton(b'x');
+    let (_, table_mode) = sparse.run_tables(true);
+    assert_eq!(table_mode, AsciiRunTableMode::SmallMembers);
 }
 
 #[test]
@@ -660,6 +765,41 @@ fn portable_run_scanner_random_sets_and_arbitrary_bytes_match_reference() {
             backward.examined_bytes(),
             backward.member_run_len() + usize::from(backward.member_run_len() != bytes.len())
         );
+    }
+}
+
+#[test]
+#[cfg(not(feature = "static-dispatch"))]
+fn portable_complement_opt_in_preserves_scalar_semantics_and_default_selection() {
+    let set = all_ascii_except(&[0, 15, 16, 63, 64, 95, 112, 127]);
+    let context = SimdDispatchContext::capture();
+    let complement = context
+        .ascii_byte_set_run_scanner_prefer_small_complement(set, DispatchPolicy::Portable)
+        .expect("portable complement-aware scanner");
+    let ordinary = context
+        .ascii_byte_set_run_scanner(set, DispatchPolicy::Portable)
+        .expect("portable ordinary scanner");
+    for scanner in [complement, ordinary] {
+        assert_eq!(
+            scanner.selection().variant_id,
+            "ascii-byte-set.run.scalar.v1"
+        );
+        for barrier in 0_u8..=u8::MAX {
+            if set.contains(barrier) {
+                continue;
+            }
+            let mut bytes = [b'a'; ASCII_WIDE_BYTES + 1];
+            for position in [0, 1, 15, 16, 31, 32] {
+                bytes.fill(b'a');
+                bytes[position] = barrier;
+                assert_run_result(
+                    &scanner,
+                    &bytes,
+                    scanner.scan_forward(&bytes),
+                    scanner.scan_backward(&bytes),
+                );
+            }
+        }
     }
 }
 
@@ -881,6 +1021,68 @@ fn host_auto_run_selection_is_authorized_and_uses_only_qualified_tuning() {
 }
 
 #[test]
+fn host_auto_complement_selection_is_explicit_and_uses_only_qualified_tuning() {
+    let set = all_ascii_except(b"\n\r");
+    let context = SimdDispatchContext::capture();
+    let complement = context
+        .ascii_byte_set_run_scanner_prefer_small_complement(set, DispatchPolicy::Auto)
+        .expect("automatic complement-aware scanner");
+    let ordinary = context
+        .ascii_byte_set_run_scanner(set, DispatchPolicy::Auto)
+        .expect("automatic ordinary scanner");
+    assert!(!ordinary.selection().variant_id.contains("complement"));
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        let usable = host().usable();
+        if usable.contains(Feature::ArmNeon) {
+            #[cfg(all(target_os = "linux", target_endian = "little"))]
+            let expected = if is_neoverse_v3(host().tuning())
+                && usable.contains(Feature::ArmSve)
+                && usable.contains(Feature::ArmSve2)
+            {
+                "ascii-byte-set.run.sve2-complement16.arm-41-d84.v1"
+            } else {
+                "ascii-byte-set.run.neon.v1"
+            };
+            #[cfg(not(all(target_os = "linux", target_endian = "little")))]
+            let expected = "ascii-byte-set.run.neon.v1";
+            assert_eq!(complement.selection().variant_id, expected);
+            if expected == "ascii-byte-set.run.sve2-complement16.arm-41-d84.v1" {
+                assert_eq!(
+                    complement.selection().required,
+                    FeatureSet::EMPTY
+                        .with(Feature::ArmSve)
+                        .with(Feature::ArmSve2),
+                    "the tuned direct complement leaf must not claim an unused NEON requirement"
+                );
+                assert_eq!(complement.selection().vector, VectorKind::Scalable);
+                assert_eq!(complement.selection().delegate_variant_id, None);
+            }
+        } else {
+            #[cfg(all(target_os = "linux", target_endian = "little"))]
+            let expected = if usable.contains(Feature::ArmSve) && usable.contains(Feature::ArmSve2)
+            {
+                "ascii-byte-set.run.sve2-complement16.v1"
+            } else if usable.contains(Feature::ArmSve) {
+                "ascii-byte-set.run.sve.v1"
+            } else {
+                "ascii-byte-set.run.scalar.v1"
+            };
+            #[cfg(not(all(target_os = "linux", target_endian = "little")))]
+            let expected = "ascii-byte-set.run.scalar.v1";
+            assert_eq!(complement.selection().variant_id, expected);
+        }
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    assert_eq!(
+        complement.selection().variant_id,
+        "ascii-byte-set.run.scalar.v1"
+    );
+}
+
+#[test]
 fn explicit_host_snapshot_matches_the_convenience_wrapper_exactly() {
     let set = AsciiByteSet::from_words([0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210]);
     let policy = DispatchPolicy::Auto;
@@ -1081,8 +1283,8 @@ fn forced_neon_run_scanner_exhausts_boundaries_and_reports_recovery_work() {
             bytes: u16::try_from(ASCII_NARROW_BYTES).unwrap()
         }
     );
-    let (tables, match_eligible) = set.run_tables();
-    assert!(match_eligible);
+    let (tables, table_mode) = set.run_tables(false);
+    assert_eq!(table_mode, AsciiRunTableMode::SmallMembers);
 
     for len in 0..=ASCII_WIDE_BYTES * 3 + 1 {
         for offset in 0..64 {
@@ -1225,7 +1427,6 @@ fn forced_sve2_vl_agnostic_leaf_matches_scalar_and_tuned_auto_policy() {
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
-#[cfg(not(feature = "static-dispatch"))]
 fn expected_sve_forward_result(member_run_len: usize, input_len: usize) -> AsciiRunResult {
     if member_run_len == input_len {
         return AsciiRunResult::new(input_len, input_len);
@@ -1241,7 +1442,6 @@ fn expected_sve_forward_result(member_run_len: usize, input_len: usize) -> Ascii
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
-#[cfg(not(feature = "static-dispatch"))]
 fn expected_sve_backward_result(member_run_len: usize, input_len: usize) -> AsciiRunResult {
     if member_run_len == input_len {
         return AsciiRunResult::new(input_len, input_len);
@@ -1273,8 +1473,8 @@ fn forced_base_sve_run_scanner_exhausts_fixed_sixteen_lane_boundaries() {
     assert_eq!(scanner.selection().variant_id, "ascii-byte-set.run.sve.v1");
     assert_eq!(scanner.selection().required, required);
     assert_eq!(scanner.selection().vector, VectorKind::Scalable);
-    let (tables, match_eligible) = set.run_tables();
-    assert!(!match_eligible);
+    let (tables, table_mode) = set.run_tables(false);
+    assert_eq!(table_mode, AsciiRunTableMode::Generic);
 
     let member = (0_u8..=0x7f).find(|&byte| set.contains(byte)).unwrap();
     let outsider = (0_u8..=u8::MAX).find(|&byte| !set.contains(byte)).unwrap();
@@ -1345,8 +1545,8 @@ fn forced_sve2_match_run_scanner_covers_every_small_set_size_and_lane() {
         );
         assert_eq!(scanner.selection().required, required);
         assert_eq!(scanner.selection().vector, VectorKind::Scalable);
-        let (tables, match_eligible) = set.run_tables();
-        assert!(match_eligible);
+        let (tables, table_mode) = set.run_tables(false);
+        assert_eq!(table_mode, AsciiRunTableMode::SmallMembers);
         let member = tables.match_values[cardinality - 1];
         let outsider = (0_u8..=u8::MAX).find(|&byte| !set.contains(byte)).unwrap();
 
@@ -1387,8 +1587,8 @@ fn forced_sve2_match_run_scanner_covers_every_small_set_size_and_lane() {
     let aligned_scanner =
         AsciiByteSetRunScanner::with_policy(aligned_set, DispatchPolicy::AllowOnly(required))
             .unwrap();
-    let (aligned_tables, match_eligible) = aligned_set.run_tables();
-    assert!(match_eligible);
+    let (aligned_tables, table_mode) = aligned_set.run_tables(false);
+    assert_eq!(table_mode, AsciiRunTableMode::SmallMembers);
     let len = ASCII_WIDE_BYTES + 1;
     let mut storage = vec![b'a'; 64 + len];
     let mut observed_alignments = [false; 64];
@@ -1432,6 +1632,167 @@ fn forced_sve2_match_run_scanner_covers_every_small_set_size_and_lane() {
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+#[cfg(not(feature = "static-dispatch"))]
+#[test]
+#[allow(
+    unsafe_code,
+    clippy::arithmetic_side_effects,
+    clippy::too_many_lines,
+    reason = "one exhaustive test keeps the private complement SVE2 feature gate, cardinalities, barriers, tails, alignments, and accounting adjacent"
+)]
+fn forced_sve2_complement_run_scanner_covers_holes_high_bytes_and_boundaries() {
+    let required = FeatureSet::EMPTY
+        .with(Feature::ArmSve)
+        .with(Feature::ArmSve2);
+    if !host().usable().contains_all(required) {
+        return;
+    }
+    let context = SimdDispatchContext::capture();
+
+    for cardinality in 1..=ASCII_NARROW_BYTES {
+        let excluded: Vec<_> = (0..cardinality)
+            .map(|index| u8::try_from(index * 7).unwrap())
+            .collect();
+        let set = all_ascii_except(&excluded);
+        let scanner = context
+            .ascii_byte_set_run_scanner_prefer_small_complement(
+                set,
+                DispatchPolicy::AllowOnly(required),
+            )
+            .expect("forced complement SVE2 scanner");
+        let expected_variant = if is_neoverse_v3(host().tuning()) {
+            "ascii-byte-set.run.sve2-complement16.arm-41-d84.v1"
+        } else {
+            "ascii-byte-set.run.sve2-complement16.v1"
+        };
+        assert_eq!(scanner.selection().variant_id, expected_variant);
+        assert_eq!(scanner.selection().required, required);
+        assert_eq!(scanner.selection().vector, VectorKind::Scalable);
+        let (tables, table_mode) = set.run_tables(true);
+        assert_eq!(table_mode, AsciiRunTableMode::SmallComplement);
+        let member = (0_u8..=0x7f).find(|&byte| set.contains(byte)).unwrap();
+        let barrier = excluded[cardinality - 1];
+
+        for len in 0..=ASCII_WIDE_BYTES * 2 + 1 {
+            let mut bytes = vec![member; len];
+            for prefix_len in 0..=len {
+                bytes.fill(member);
+                if prefix_len < len {
+                    bytes[prefix_len] = barrier;
+                }
+                let expected = expected_sve_forward_result(prefix_len, len);
+                assert_eq!(scanner.scan_forward(&bytes), expected);
+                // SAFETY: the host gate, complement table mode, and exact
+                // source slice prove every direct-leaf precondition.
+                assert_eq!(
+                    unsafe { aarch64_sve2::scan_run_forward_sve2_complement(&tables, &bytes) },
+                    expected
+                );
+            }
+            for suffix_len in 0..=len {
+                bytes.fill(member);
+                if suffix_len < len {
+                    bytes[len - suffix_len - 1] = barrier;
+                }
+                let expected = expected_sve_backward_result(suffix_len, len);
+                assert_eq!(scanner.scan_backward(&bytes), expected);
+                // SAFETY: identical feature, table, and source proof to the
+                // direct forward assertion.
+                assert_eq!(
+                    unsafe { aarch64_sve2::scan_run_backward_sve2_complement(&tables, &bytes) },
+                    expected
+                );
+            }
+        }
+    }
+
+    let excluded = [0, 15, 16, 31, 32, 63, 64, 95, 112, 127];
+    let set = all_ascii_except(&excluded);
+    let scanner = context
+        .ascii_byte_set_run_scanner_prefer_small_complement(
+            set,
+            DispatchPolicy::AllowOnly(required),
+        )
+        .unwrap();
+    let member = b'a';
+    let len = ASCII_WIDE_BYTES + 1;
+    let mut storage = vec![member; 64 + len];
+    let mut observed_alignments = [false; 64];
+    for offset in 0..64 {
+        let bytes = &mut storage[offset..offset + len];
+        observed_alignments[bytes.as_ptr().addr() & 63] = true;
+        for barrier in 0x80_u8..=u8::MAX {
+            for position in 0..len {
+                bytes.fill(member);
+                bytes[position] = barrier;
+                assert_eq!(
+                    scanner.scan_forward(bytes),
+                    expected_sve_forward_result(position, len),
+                    "offset={offset} barrier={barrier:#04x} position={position}"
+                );
+                assert_eq!(
+                    scanner.scan_backward(bytes),
+                    expected_sve_backward_result(len - position - 1, len),
+                    "offset={offset} barrier={barrier:#04x} position={position}"
+                );
+            }
+        }
+    }
+    assert!(observed_alignments.into_iter().all(core::convert::identity));
+
+    let (tables, table_mode) = set.run_tables(true);
+    assert_eq!(table_mode, AsciiRunTableMode::SmallComplement);
+    for len in [79, 80, 81, 127, 128, 129, 143, 144, 145] {
+        for offset in [0, 1, 7, 15, 16, 31, 63] {
+            let mut storage = vec![member; offset + len];
+            let bytes = &mut storage[offset..];
+            for barrier in [excluded[0], excluded[5], 0x80, 0xbf, 0xff] {
+                for prefix_len in 0..=len {
+                    bytes.fill(member);
+                    if prefix_len < len {
+                        bytes[prefix_len] = barrier;
+                    }
+                    let expected = expected_sve_forward_result(prefix_len, len);
+                    assert_eq!(scanner.scan_forward(bytes), expected);
+                    // SAFETY: the same feature, table-mode, and slice proof as
+                    // the exhaustive short-input matrix applies here.
+                    assert_eq!(
+                        unsafe { aarch64_sve2::scan_run_forward_sve2_complement(&tables, bytes) },
+                        expected
+                    );
+                }
+                for suffix_len in 0..=len {
+                    bytes.fill(member);
+                    if suffix_len < len {
+                        bytes[len - suffix_len - 1] = barrier;
+                    }
+                    let expected = expected_sve_backward_result(suffix_len, len);
+                    assert_eq!(scanner.scan_backward(bytes), expected);
+                    // SAFETY: identical proof to the long forward assertion.
+                    assert_eq!(
+                        unsafe { aarch64_sve2::scan_run_backward_sve2_complement(&tables, bytes) },
+                        expected
+                    );
+                }
+            }
+        }
+    }
+
+    for excluded in [Vec::new(), (0_u8..=16).collect()] {
+        let set = all_ascii_except(&excluded);
+        let (_, table_mode) = set.run_tables(true);
+        assert_eq!(table_mode, AsciiRunTableMode::Generic);
+        let scanner = context
+            .ascii_byte_set_run_scanner_prefer_small_complement(
+                set,
+                DispatchPolicy::AllowOnly(required),
+            )
+            .unwrap();
+        assert_eq!(scanner.selection().variant_id, "ascii-byte-set.run.sve.v1");
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
 #[test]
 fn neoverse_v3_hybrid_run_scanner_preserves_boundaries_and_work_envelope() {
     let scanner = AsciiByteSetRunScanner::new(singleton(b'a'));
@@ -1467,6 +1828,89 @@ fn neoverse_v3_hybrid_run_scanner_preserves_boundaries_and_work_envelope() {
                     (logical..=logical + ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD)
                         .contains(&observed.examined_bytes())
                 );
+            }
+        }
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+#[test]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the bounded tuned-complement matrix uses small fixture lengths and lane indices"
+)]
+fn neoverse_v3_direct_complement_preserves_barriers_and_exact_work() {
+    let set = all_ascii_except(b"\n\r");
+    let scanner = SimdDispatchContext::capture()
+        .ascii_byte_set_run_scanner_prefer_small_complement(set, DispatchPolicy::Auto)
+        .expect("automatic complement scanner");
+    if scanner.selection().variant_id != "ascii-byte-set.run.sve2-complement16.arm-41-d84.v1" {
+        return;
+    }
+    assert_eq!(scanner.set(), set);
+    for len in 0..=ASCII_WIDE_BYTES * 3 + 1 {
+        for offset in 0..ASCII_NARROW_BYTES {
+            let mut storage = vec![0xcc; offset + len];
+            let bytes = &mut storage[offset..];
+            for (barrier_index, barrier) in [b'\n', b'\r', 0x80, 0xbf, 0xc2, 0xff]
+                .into_iter()
+                .enumerate()
+            {
+                for prefix_len in 0..=len {
+                    bytes.fill(b'a');
+                    if prefix_len < len {
+                        bytes[prefix_len] = barrier;
+                    }
+                    let observed = scanner.scan_forward(bytes);
+                    assert_eq!(
+                        observed,
+                        expected_sve_forward_result(prefix_len, len),
+                        "len={len} offset={offset} barrier_index={barrier_index}"
+                    );
+                }
+                for suffix_len in 0..=len {
+                    bytes.fill(b'a');
+                    if suffix_len < len {
+                        bytes[len - suffix_len - 1] = barrier;
+                    }
+                    let observed = scanner.scan_backward(bytes);
+                    assert_eq!(
+                        observed,
+                        expected_sve_backward_result(suffix_len, len),
+                        "len={len} offset={offset} barrier_index={barrier_index}"
+                    );
+                }
+            }
+        }
+    }
+
+    for len in [127, 128, 129, 143, 144, 145, 159, 160, 161] {
+        for offset in [0, 1, 7, 15] {
+            let mut storage = vec![0xcc; offset + len];
+            let bytes = &mut storage[offset..];
+            for barrier in [b'\n', b'\r', 0x80, 0xbf, 0xff] {
+                for prefix_len in 0..=len {
+                    bytes.fill(b'a');
+                    if prefix_len < len {
+                        bytes[prefix_len] = barrier;
+                    }
+                    assert_eq!(
+                        scanner.scan_forward(bytes),
+                        expected_sve_forward_result(prefix_len, len),
+                        "long len={len} offset={offset} barrier={barrier:#04x}"
+                    );
+                }
+                for suffix_len in 0..=len {
+                    bytes.fill(b'a');
+                    if suffix_len < len {
+                        bytes[len - suffix_len - 1] = barrier;
+                    }
+                    assert_eq!(
+                        scanner.scan_backward(bytes),
+                        expected_sve_backward_result(suffix_len, len),
+                        "long len={len} offset={offset} barrier={barrier:#04x}"
+                    );
+                }
             }
         }
     }

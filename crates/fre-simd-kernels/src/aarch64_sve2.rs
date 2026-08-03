@@ -740,6 +740,113 @@ fre_ascii_run_backward_sve2_asm:
     .cfi_endproc
     .size fre_ascii_run_backward_sve2_asm, .-fre_ascii_run_backward_sve2_asm
     .popsection
+
+    // Complement MATCH treats the 1..=16 table values as excluded ASCII.
+    // Every high-bit byte is also a barrier so Unicode-aware callers regain
+    // control to validate and decode it instead of consuming it as ASCII.
+    .pushsection .text.fre_ascii_run_forward_sve2_complement_asm, "ax", %progbits
+    .arch armv8-a+sve2
+    .p2align 2
+    .hidden fre_ascii_run_forward_sve2_complement_asm
+    .global fre_ascii_run_forward_sve2_complement_asm
+    .type fre_ascii_run_forward_sve2_complement_asm, %function
+fre_ascii_run_forward_sve2_complement_asm:
+    .cfi_startproc
+    ptrue p0.b, vl16
+    ld1rqb z0.b, p0/z, [x0]
+    mov x8, #0
+    cmp x2, #16
+    b.lo 3f
+1:
+    ld1b z2.b, p0/z, [x1, x8]
+    match p1.b, p0/z, z2.b, z0.b
+    cmplt p2.b, p0/z, z2.b, #0
+    orr p2.b, p0/z, p2.b, p1.b
+    ptest p0, p2.b
+    b.none 2f
+    b 4f
+2:
+    add x8, x8, #16
+    sub x10, x2, x8
+    cmp x10, #16
+    b.hs 1b
+3:
+    cmp x8, x2
+    b.hs 5f
+    whilelo p0.b, x8, x2
+    ld1b z2.b, p0/z, [x1, x8]
+    match p1.b, p0/z, z2.b, z0.b
+    cmplt p2.b, p0/z, z2.b, #0
+    orr p2.b, p0/z, p2.b, p1.b
+    ptest p0, p2.b
+    b.none 5f
+4:
+    brkb p3.b, p0/z, p2.b
+    cntp x10, p0, p3.b
+    add x0, x8, x10
+    cntp x11, p0, p0.b
+    add x1, x8, x11
+    ret
+5:
+    mov x0, x2
+    mov x1, x2
+    ret
+    .cfi_endproc
+    .size fre_ascii_run_forward_sve2_complement_asm, .-fre_ascii_run_forward_sve2_complement_asm
+    .popsection
+
+    .pushsection .text.fre_ascii_run_backward_sve2_complement_asm, "ax", %progbits
+    .arch armv8-a+sve2
+    .p2align 2
+    .hidden fre_ascii_run_backward_sve2_complement_asm
+    .global fre_ascii_run_backward_sve2_complement_asm
+    .type fre_ascii_run_backward_sve2_complement_asm, %function
+fre_ascii_run_backward_sve2_complement_asm:
+    .cfi_startproc
+    ptrue p0.b, vl16
+    ld1rqb z0.b, p0/z, [x0]
+    index z6.b, #0, #1
+    mov x8, x2
+    cmp x8, #16
+    b.lo 3f
+1:
+    sub x11, x8, #16
+    ld1b z2.b, p0/z, [x1, x11]
+    match p1.b, p0/z, z2.b, z0.b
+    cmplt p2.b, p0/z, z2.b, #0
+    orr p2.b, p0/z, p2.b, p1.b
+    ptest p0, p2.b
+    b.none 2f
+    b 4f
+2:
+    mov x8, x11
+    cmp x8, #16
+    b.hs 1b
+3:
+    cbz x8, 5f
+    mov x11, #0
+    whilelo p0.b, xzr, x8
+    ld1b z2.b, p0/z, [x1]
+    match p1.b, p0/z, z2.b, z0.b
+    cmplt p2.b, p0/z, z2.b, #0
+    orr p2.b, p0/z, p2.b, p1.b
+    ptest p0, p2.b
+    b.none 5f
+4:
+    lastb w12, p2, z6.b
+    uxtb x12, w12
+    add x12, x11, x12
+    add x12, x12, #1
+    sub x0, x2, x12
+    sub x1, x2, x11
+    ret
+5:
+    mov x0, x2
+    mov x1, x2
+    ret
+    .cfi_endproc
+    .size fre_ascii_run_backward_sve2_complement_asm, .-fre_ascii_run_backward_sve2_complement_asm
+    .popsection
 "#
     );
 }
@@ -802,6 +909,16 @@ unsafe extern "C" {
     ) -> AsciiRunResult;
     fn fre_ascii_run_backward_sve2_asm(
         match_values: *const u8,
+        bytes: *const u8,
+        len: usize,
+    ) -> AsciiRunResult;
+    fn fre_ascii_run_forward_sve2_complement_asm(
+        excluded_ascii: *const u8,
+        bytes: *const u8,
+        len: usize,
+    ) -> AsciiRunResult;
+    fn fre_ascii_run_backward_sve2_complement_asm(
+        excluded_ascii: *const u8,
         bytes: *const u8,
         len: usize,
     ) -> AsciiRunResult;
@@ -1075,6 +1192,48 @@ pub(super) unsafe fn scan_run_backward_sve2(
     // forward SVE2 operation.
     unsafe {
         fre_ascii_run_backward_sve2_asm(tables.match_values.as_ptr(), bytes.as_ptr(), bytes.len())
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "this private leaf calls reviewed SVE2 assembly only after retained dispatch proved SVE and SVE2 usable"
+)]
+#[inline(never)]
+pub(super) unsafe fn scan_run_forward_sve2_complement(
+    tables: &AsciiRunTables,
+    bytes: &[u8],
+) -> AsciiRunResult {
+    // SAFETY: construction selects this entry only for 1..=16 excluded ASCII
+    // values, fills every table lane with an exclusion, and retained dispatch
+    // proves SVE plus SVE2 OS-usable. The assembly also rejects every high-bit
+    // byte, and the slice proves every source extent.
+    unsafe {
+        fre_ascii_run_forward_sve2_complement_asm(
+            tables.match_values.as_ptr(),
+            bytes.as_ptr(),
+            bytes.len(),
+        )
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "this private leaf calls reviewed SVE2 assembly only after retained dispatch proved SVE and SVE2 usable"
+)]
+#[inline(never)]
+pub(super) unsafe fn scan_run_backward_sve2_complement(
+    tables: &AsciiRunTables,
+    bytes: &[u8],
+) -> AsciiRunResult {
+    // SAFETY: identical exclusion-table, high-bit-barrier, source-extent, and
+    // feature proof to the forward complement operation.
+    unsafe {
+        fre_ascii_run_backward_sve2_complement_asm(
+            tables.match_values.as_ptr(),
+            bytes.as_ptr(),
+            bytes.len(),
+        )
     }
 }
 

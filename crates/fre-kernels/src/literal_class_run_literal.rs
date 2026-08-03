@@ -1090,8 +1090,12 @@ impl LiteralClassRunLiteralPlan {
                     }
                 }
             }
-            let ascii_scanner =
-                build_ascii_scanner(dispatch.filter(|_| class.is_ascii()), class, &mut work)?;
+            let ascii_scanner = build_ascii_scanner(
+                dispatch.filter(|_| class.is_ascii()),
+                class,
+                false,
+                &mut work,
+            )?;
             let work_upper_bound = work.used;
 
             let prefix = copy_literal(prefix, "prefix")?;
@@ -2797,8 +2801,12 @@ impl LiteralClassRunSearchPlan {
                     }
                 }
             }
-            let ascii_scanner =
-                build_ascii_scanner(dispatch.filter(|_| class.is_ascii()), class, &mut work)?;
+            let ascii_scanner = build_ascii_scanner(
+                dispatch.filter(|_| class.is_ascii()),
+                class,
+                unicode_all_non_ascii,
+                &mut work,
+            )?;
             (class, class_ranges, class_members, ascii_scanner, work.used)
         };
 
@@ -4020,6 +4028,7 @@ fn derive_complete_ascii_word_run_upper_bounds(
 fn build_ascii_scanner(
     dispatch: Option<(SimdDispatchContext, DispatchPolicy)>,
     class: ByteClass,
+    prefer_small_ascii_complement: bool,
     work: &mut BuildWork<'_>,
 ) -> Result<Option<AsciiClassScanner>, BuildError> {
     let Some((dispatch, policy)) = dispatch else {
@@ -4027,11 +4036,13 @@ fn build_ascii_scanner(
     };
     if dispatch.capabilities().usable().contains(Feature::ArmSve) {
         work.charge(SIMD_RUN_SCANNER_BUILD_WORK)?;
-        return Ok(Some(AsciiClassScanner::Run(
-            dispatch
-                .ascii_byte_set_run_scanner(class.ascii_set(), policy)
-                .expect("the caller supplied an authentic compatible dispatch policy"),
-        )));
+        let scanner = if prefer_small_ascii_complement {
+            dispatch.ascii_byte_set_run_scanner_prefer_small_complement(class.ascii_set(), policy)
+        } else {
+            dispatch.ascii_byte_set_run_scanner(class.ascii_set(), policy)
+        }
+        .expect("the caller supplied an authentic compatible dispatch policy");
+        return Ok(Some(AsciiClassScanner::Run(scanner)));
     }
     work.charge(SIMD_FIXED_CLASSIFIER_BUILD_WORK)?;
     Ok(Some(AsciiClassScanner::Fixed(
@@ -4813,7 +4824,22 @@ fn scan_unicode_all_non_ascii_run_forward_value(
     scanner: Option<&AsciiClassScanner>,
     start: usize,
 ) -> Option<usize> {
-    let mut end = scan_class_run_forward_value(haystack, class, scanner, start).unwrap_or(start);
+    // Run scanners may spend a fixed-width setup cost only to recover a
+    // boundary in their first block. The accounting-free projection can
+    // instead use the same bounded scalar proof already used when an ASCII
+    // corridor resumes after Unicode decoding, then hand only a sustained
+    // corridor to the retained scanner. Fixed classifiers and scalar plans
+    // keep their ordinary initial scan.
+    let mut end = match scanner {
+        Some(AsciiClassScanner::Run(scanner)) => {
+            scan_unicode_ascii_corridor_after_scalar_proof_value(
+                haystack, class, scanner, start,
+            )
+        }
+        Some(AsciiClassScanner::Fixed(_)) | None => {
+            scan_class_run_forward_value(haystack, class, scanner, start).unwrap_or(start)
+        }
+    };
     if end == haystack.len() {
         return (end != start).then_some(end);
     }
@@ -4861,16 +4887,32 @@ fn resume_unicode_ascii_corridor_value(
             scan_class_run_forward_fixed_value(haystack, class, classifier, start).unwrap_or(start)
         }
         Some(AsciiClassScanner::Run(scanner)) => {
-            let mut end = start;
-            for _ in 0..ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD {
-                if end == haystack.len() || !class.contains(haystack[end]) {
-                    return end;
-                }
-                end += 1;
-            }
-            scan_class_run_forward_direct_value(haystack, scanner, end).unwrap_or(end)
+            scan_unicode_ascii_corridor_after_scalar_proof_value(
+                haystack, class, scanner, start,
+            )
         }
     }
+}
+
+#[inline(never)]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the scalar proof and scanner-reported continuation are disjoint ranges bounded by the source slice"
+)]
+fn scan_unicode_ascii_corridor_after_scalar_proof_value(
+    haystack: &[u8],
+    class: ByteClass,
+    scanner: &AsciiByteSetRunScanner,
+    start: usize,
+) -> usize {
+    let mut end = start;
+    for _ in 0..ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD {
+        if end == haystack.len() || !class.contains(haystack[end]) {
+            return end;
+        }
+        end += 1;
+    }
+    scan_class_run_forward_direct_value(haystack, scanner, end).unwrap_or(end)
 }
 
 fn resume_unicode_ascii_corridor(
@@ -5628,8 +5670,9 @@ mod tests {
 
     #[test]
     fn unicode_all_non_ascii_mixed_corridors_preserve_semantics_and_bounds() {
+        let dispatch = SimdDispatchContext::capture();
         let plan = LiteralClassRunSearchPlan::build_unicode_all_non_ascii_with_dispatch(
-            SimdDispatchContext::capture(),
+            dispatch,
             b"a",
             [
                 ('\0', '\u{9}'),
@@ -5644,6 +5687,35 @@ mod tests {
         )
         .unwrap();
         let oracle = RegexBuilder::new(r"a[^z\r\n]*z").build().unwrap();
+        let scalar_build = unicode_generalized_plan().build_accounting();
+        let build = plan.build_accounting();
+        let expected_scanner_work = if dispatch.capabilities().usable().contains(Feature::ArmSve) {
+            SIMD_RUN_SCANNER_BUILD_WORK
+        } else {
+            SIMD_FIXED_CLASSIFIER_BUILD_WORK
+        };
+        assert_eq!(
+            build.work_upper_bound,
+            scalar_build
+                .work_upper_bound
+                .checked_add(expected_scanner_work)
+                .unwrap()
+        );
+        assert_eq!(build.persistent_bytes, scalar_build.persistent_bytes);
+        assert_eq!(build.peak_bytes, scalar_build.peak_bytes);
+        match plan.ascii_scanner {
+            Some(AsciiClassScanner::Run(scanner)) => {
+                assert!(dispatch.capabilities().usable().contains(Feature::ArmSve));
+                assert!(!scanner.selection().variant_id.contains("match16"));
+                if scanner.selection().variant_id.contains("sve2") {
+                    assert!(scanner.selection().variant_id.contains("complement16"));
+                }
+            }
+            Some(AsciiClassScanner::Fixed(_)) => {
+                assert!(!dispatch.capabilities().usable().contains(Feature::ArmSve));
+            }
+            None => panic!("a dispatched Unicode plan retains one ASCII scanner"),
+        }
 
         let mut early_then_long_ascii = b"--a".to_vec();
         early_then_long_ascii.extend_from_slice("🦀".as_bytes());
@@ -5681,6 +5753,227 @@ mod tests {
             );
             assert!(accounting.source_reads <= accounting.source_reads_upper_bound);
             assert!(u64::try_from(accounting.work).unwrap() <= accounting.work_upper_bound);
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one matrix keeps complement barriers, UTF-8 validity, windows, and both repetition minima adjacent"
+    )]
+    fn dispatched_unicode_complement_scanner_matches_upstream_for_every_byte_barrier() {
+        let dispatch = SimdDispatchContext::capture();
+        let mut haystacks = vec![
+            b"".to_vec(),
+            b"az".to_vec(),
+            b"--abz--".to_vec(),
+            "--aé文🦀z--".as_bytes().to_vec(),
+            b"--a\xC0\xAFz--aokz--".to_vec(),
+            b"--a\xED\xA0\x80z--aokz--".to_vec(),
+            b"--a\xF4\x90\x80\x80z--aokz--".to_vec(),
+            b"--a\xF0\x9F\x92z--aokz--".to_vec(),
+        ];
+        for barrier in [b'\n', b'\r', b'z'].into_iter().chain(0x80_u8..=u8::MAX) {
+            let mut haystack = b"--aqq".to_vec();
+            haystack.push(barrier);
+            haystack.extend_from_slice(b"qqz--aokz--");
+            haystacks.push(haystack);
+        }
+
+        for (minimum, pattern) in [
+            (SearchRunMinimum::Zero, r"a[^z\r\n]*z"),
+            (SearchRunMinimum::One, r"a[^z\r\n]+z"),
+        ] {
+            let plan = LiteralClassRunSearchPlan::build_unicode_all_non_ascii_with_dispatch(
+                dispatch,
+                b"a",
+                [
+                    ('\0', '\u{9}'),
+                    ('\u{B}', '\u{C}'),
+                    ('\u{E}', 'y'),
+                    ('{', char::MAX),
+                ]
+                .into_iter(),
+                b"z",
+                minimum,
+                BuildLimits::unlimited(),
+            )
+            .unwrap();
+            let oracle = RegexBuilder::new(pattern).build().unwrap();
+
+            for haystack in &haystacks {
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = Window::new(start, end);
+                        let expected = oracle
+                            .find(&haystack[start..end])
+                            .map(|matched| (start + matched.start(), start + matched.end()));
+                        let expected_shortest = oracle
+                            .shortest_match(&haystack[start..end])
+                            .map(|matched_end| start + matched_end);
+                        assert_eq!(
+                            plan.find_window(haystack, window, SearchLimits::unlimited())
+                                .unwrap()
+                                .0,
+                            expected,
+                            "pattern={pattern:?} haystack={haystack:?} window={start}..{end}"
+                        );
+                        assert_eq!(
+                            plan.shortest_window(haystack, window, SearchLimits::unlimited())
+                                .unwrap()
+                                .0,
+                            expected_shortest,
+                            "shortest pattern={pattern:?} haystack={haystack:?} window={start}..{end}"
+                        );
+                        assert_eq!(
+                            plan.is_match_window_value(
+                                haystack,
+                                window,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap(),
+                            expected.is_some(),
+                            "exists pattern={pattern:?} haystack={haystack:?} window={start}..{end}"
+                        );
+                    }
+                }
+            }
+
+            let mut long = b"--a".to_vec();
+            long.extend(core::iter::repeat_n(b'q', 8_193));
+            long.extend_from_slice("é文🦀".as_bytes());
+            long.extend(core::iter::repeat_n(b'x', 8_191));
+            long.extend_from_slice(b"z--");
+            let expected = oracle
+                .find(&long)
+                .map(|matched| (matched.start(), matched.end()));
+            let (actual, accounting) = plan.find(&long, SearchLimits::unlimited()).unwrap();
+            assert_eq!(actual, expected);
+            let upper = plan.search_upper_bounds(long.len()).unwrap();
+            assert!(accounting.classifications <= upper.classifications);
+            assert!(accounting.source_reads <= accounting.source_reads_upper_bound);
+            assert!(u64::try_from(accounting.work).unwrap() <= accounting.work_upper_bound);
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one boundary matrix keeps the initial scalar proof, sustained scanner handoff, Unicode decoding, and window edges adjacent"
+    )]
+    fn dispatched_unicode_value_initial_proof_covers_scanner_handoff_boundaries() {
+        let dispatch = SimdDispatchContext::capture();
+        for (minimum, pattern) in [
+            (SearchRunMinimum::Zero, r"a[^z\r\n]*z"),
+            (SearchRunMinimum::One, r"a[^z\r\n]+z"),
+        ] {
+            let plan = LiteralClassRunSearchPlan::build_unicode_all_non_ascii_with_dispatch(
+                dispatch,
+                b"a",
+                [
+                    ('\0', '\u{9}'),
+                    ('\u{B}', '\u{C}'),
+                    ('\u{E}', 'y'),
+                    ('{', char::MAX),
+                ]
+                .into_iter(),
+                b"z",
+                minimum,
+                BuildLimits::unlimited(),
+            )
+            .unwrap();
+            if !matches!(plan.ascii_scanner.as_ref(), Some(AsciiClassScanner::Run(_))) {
+                return;
+            }
+            let oracle = RegexBuilder::new(pattern).build().unwrap();
+
+            for corridor_len in [14, 15, 16, 17, 31, 32, 33, 4_093] {
+                let mut ascii_success = b"--a".to_vec();
+                ascii_success.extend(core::iter::repeat_n(b'q', corridor_len));
+                ascii_success.extend_from_slice(b"z--");
+
+                let first_half = corridor_len / 2;
+                let mut unicode_success = b"--a".to_vec();
+                unicode_success.extend(core::iter::repeat_n(b'q', first_half));
+                unicode_success.extend_from_slice("é".as_bytes());
+                unicode_success.extend(core::iter::repeat_n(b'q', corridor_len - first_half));
+                unicode_success.extend_from_slice(b"z--");
+
+                let mut excluded_barrier = b"--a".to_vec();
+                excluded_barrier.extend(core::iter::repeat_n(b'q', corridor_len));
+                excluded_barrier.extend_from_slice(b"\nz--");
+
+                let mut invalid_then_later = b"--a".to_vec();
+                invalid_then_later.extend(core::iter::repeat_n(b'q', corridor_len));
+                invalid_then_later.extend_from_slice(b"\xF0\x9F\x92z--aokz--");
+
+                let mut unterminated = b"--a".to_vec();
+                unterminated.extend(core::iter::repeat_n(b'q', corridor_len));
+
+                for haystack in [
+                    &ascii_success,
+                    &unicode_success,
+                    &excluded_barrier,
+                    &invalid_then_later,
+                    &unterminated,
+                ] {
+                    let suffix_edge = haystack.len().saturating_sub(3);
+                    for window in [
+                        Window::full(haystack),
+                        Window::new(2, haystack.len()),
+                        Window::new(3, haystack.len()),
+                        Window::new(2, suffix_edge),
+                    ] {
+                        let expected = oracle.is_match(&haystack[window.start()..window.end()]);
+                        assert_eq!(
+                            plan.is_match_window_value(
+                                haystack,
+                                window,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap(),
+                            expected,
+                            "pattern={pattern:?} corridor_len={corridor_len} haystack={haystack:?} window={}..{}",
+                            window.start(),
+                            window.end()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_dense_byte_plan_does_not_opt_into_unicode_complement_dispatch() {
+        let plan = LiteralClassRunLiteralPlan::build_with_dispatch(
+            SimdDispatchContext::capture(),
+            b"A",
+            [(0, b'A' - 1), (b'A' + 1, b'Z' - 1), (b'Z' + 1, 0x7f)].into_iter(),
+            b"Z",
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        if let Some(AsciiClassScanner::Run(scanner)) = plan.ascii_scanner {
+            assert!(!scanner.selection().variant_id.contains("complement"));
+            assert!(!scanner.selection().variant_id.contains("match16"));
+        }
+        for haystack in [b"AZ".as_slice(), b"AabcZ", b"A\x80Z--AokZ"] {
+            let scalar = LiteralClassRunLiteralPlan::build(
+                b"A",
+                [(0, b'A' - 1), (b'A' + 1, b'Z' - 1), (b'Z' + 1, 0x7f)].into_iter(),
+                b"Z",
+                BuildLimits::unlimited(),
+            )
+            .unwrap();
+            assert_eq!(
+                plan.count(haystack, ReduceLimits::unlimited())
+                    .unwrap()
+                    .count,
+                scalar
+                    .count(haystack, ReduceLimits::unlimited())
+                    .unwrap()
+                    .count
+            );
         }
     }
 
@@ -5849,8 +6142,21 @@ mod tests {
             BuildLimits::unlimited(),
         )
         .unwrap();
+        let dispatched = LiteralClassRunSearchPlan::build_unicode_all_non_ascii_with_dispatch(
+            SimdDispatchContext::capture(),
+            b"a",
+            [('\u{80}', char::MAX)].into_iter(),
+            b"z",
+            SearchRunMinimum::Zero,
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
         assert_eq!(plan.build_accounting().class_ranges, 1);
         assert_eq!(plan.build_accounting().class_members, 0);
+        if let Some(AsciiClassScanner::Run(scanner)) = dispatched.ascii_scanner {
+            assert!(!scanner.selection().variant_id.contains("complement"));
+            assert!(!scanner.selection().variant_id.contains("match16"));
+        }
         for (haystack, expected) in [
             (b"az".as_slice(), Some((0, 2))),
             ("aé文🦀z".as_bytes(), Some((0, "aé文🦀z".len()))),
@@ -5861,6 +6167,14 @@ mod tests {
                 plan.find(haystack, SearchLimits::unlimited()).unwrap().0,
                 expected,
                 "haystack={haystack:?}"
+            );
+            assert_eq!(
+                dispatched
+                    .find(haystack, SearchLimits::unlimited())
+                    .unwrap()
+                    .0,
+                expected,
+                "dispatched haystack={haystack:?}"
             );
         }
     }
