@@ -298,7 +298,7 @@ fn determinization_limit_changes_engine_not_compiler_eligibility() {
 #[test]
 fn compiled_regex_facade_executes_retained_rows_on_amortized_windows() {
     let mut limits = CompileLimitsV1::default();
-    limits.determinize.max_states = 32;
+    limits.determinize.max_states = 8;
     let compiled = compile(
         CompileRequest::new(r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)", Target::aarch64_macos())
             .mode(CompileMode::Optimizing)

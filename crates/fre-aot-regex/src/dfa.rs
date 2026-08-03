@@ -31,12 +31,23 @@ pub const MAX_STABLE_DFA_TRANSITIONS: usize = 500_000_000;
 /// Every constructed state charges work and the work ceiling is lower than
 /// the `u32` state-identifier ceiling on every supported target.
 pub const MAX_STABLE_DFA_STATES: usize = 500_000_000;
+/// Endpoint rescue retains one compact ordered partial while building at most
+/// one replacement attempt. State/transition limits are per attempt; compile
+/// peak is therefore bounded by this fixed multiplier, plus the separately
+/// capped endpoint-product scratch below. Work remains one aggregate limit.
+const ENDPOINT_RESCUE_MAX_ATTEMPTS: usize = 2;
+const _: () = assert!(MAX_STABLE_DFA_STATES <= usize::MAX / ENDPOINT_RESCUE_MAX_ATTEMPTS);
+const _: () = assert!(MAX_STABLE_DFA_TRANSITIONS <= usize::MAX / ENDPOINT_RESCUE_MAX_ATTEMPTS);
 
 /// Hard limits for complete ordered determinization.
 ///
 /// The state and transition limits cover the forward and reverse machines
 /// together. Hitting any limit declines the DFA optimization and leaves the
-/// caller free to retain the universal ordered-NFA program.
+/// caller free to retain the universal ordered-NFA program. An endpoint rescue
+/// may keep that first attempt's compact partial alive while constructing one
+/// replacement under the same per-attempt state/transition limits, bounding
+/// compile peak at two logical attempts. Its exact proof scratch is
+/// independently capped; `max_work` is shared in aggregate across attempts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeterminizeLimits {
     pub max_states: usize,
@@ -146,7 +157,13 @@ pub struct DeterminizationDecline {
     pub transitions_completed: usize,
 }
 
-/// Complete deterministic trace of the target-neutral determinization route.
+/// Deterministic trace of target-neutral determinization.
+///
+/// Stage and state/transition fields describe the construction whose artifact
+/// was retained. `work_completed` is the exact aggregate compiler work: when
+/// an endpoint-sensitive ordered construction declines and a bounded
+/// dominance rescue is attempted, it includes both attempts and remains under
+/// the single effective `max_work` ceiling.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeterminizationReport {
     pub requested_limits: DeterminizeLimits,
@@ -196,6 +213,10 @@ pub struct DfaStats {
     pub reverse_states_before_minimization: usize,
     pub reverse_states: usize,
     pub reverse_transitions: usize,
+    /// Exact canonical work for constructing this retained machine. A compile
+    /// report separately includes work spent on any abandoned ordered attempt
+    /// that preceded an endpoint-dominance rescue; stable replay needs only
+    /// the work that deterministically reproduces this table.
     pub build_work: u64,
 }
 
@@ -527,6 +548,18 @@ pub(crate) fn graph_alphabet_class_count(
 struct ForwardKey {
     items: Vec<u32>,
     pending: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ForwardSemantics {
+    /// Historical priority-preserving construction used to authenticate old
+    /// stable artifacts.
+    Ordered,
+    /// Boolean membership observes neither priority nor selected endpoints.
+    Exists,
+    /// SelectedEnd and Span share the same selected-end transducer. Span start
+    /// recovery remains on the untouched reverse/raw graph.
+    EndpointPruned,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1758,13 +1791,13 @@ impl PartialDfa {
         // construction first, then the historical ordered construction so
         // pre-specialization stable artifacts remain readable.
         if output == OutputContract::Exists {
-            let regenerated = determinize_impl(raw, false, self.effective_limits, true).map_err(
-                |_| {
-                    ProgramFormatError::Malformed(
-                        "existential partial DFA canonical regeneration returned an error",
-                    )
-                },
-            )?;
+            let regenerated =
+                determinize_impl(raw, false, self.effective_limits, ForwardSemantics::Exists)
+                    .map_err(|_| {
+                        ProgramFormatError::Malformed(
+                            "existential partial DFA canonical regeneration returned an error",
+                        )
+                    })?;
             if let DeterminizeOutcome::Declined {
                 partial: Some(regenerated),
                 ..
@@ -2383,9 +2416,28 @@ impl OrderedDfa {
         // historical priority-preserving canonical table as well so the
         // stable wire format remains backwards compatible.
         if output == OutputContract::Exists {
-            let regenerated = determinize_impl(raw, false, limits, true).map_err(|_| {
+            let regenerated = determinize_impl(raw, false, limits, ForwardSemantics::Exists)
+                .map_err(|_| {
+                    ProgramFormatError::Malformed(
+                        "existential DFA canonical regeneration returned an error",
+                    )
+                })?;
+            if matches!(
+                regenerated,
+                DeterminizeOutcome::Complete { ref machine, .. } if machine == self
+            ) {
+                return Ok(());
+            }
+        } else {
+            let regenerated = determinize_impl(
+                raw,
+                self.reverse.is_some(),
+                limits,
+                ForwardSemantics::EndpointPruned,
+            )
+            .map_err(|_| {
                 ProgramFormatError::Malformed(
-                    "existential DFA canonical regeneration returned an error",
+                    "endpoint-pruned DFA canonical regeneration returned an error",
                 )
             })?;
             if matches!(
@@ -2395,8 +2447,7 @@ impl OrderedDfa {
                 return Ok(());
             }
         }
-        let regenerated = determinize(raw, self.reverse.is_some(), limits)
-        .map_err(|_| {
+        let regenerated = determinize(raw, self.reverse.is_some(), limits).map_err(|_| {
             ProgramFormatError::Malformed("DFA canonical regeneration returned an error")
         })?;
         let regenerated = match regenerated {
@@ -2640,13 +2691,76 @@ impl DeterminizeOutcome {
             None => Self::Declined { report, partial },
         }
     }
+
+    const fn work_completed(&self) -> u64 {
+        match self {
+            Self::Complete { report, .. } | Self::Declined { report, .. } => {
+                report.work_completed
+            }
+        }
+    }
+
+    fn account_prior_attempt(
+        &mut self,
+        prior_work: u64,
+        requested_limits: DeterminizeLimits,
+    ) -> Result<(), CompileError> {
+        let effective_limits = requested_limits.effective_for_stable_artifact();
+        let report = match self {
+            Self::Complete { report, .. } => report,
+            Self::Declined { report, partial } => {
+                if let Some(partial) = partial {
+                    partial.effective_limits = effective_limits;
+                }
+                report
+            }
+        };
+        report.requested_limits = requested_limits;
+        report.effective_limits = effective_limits;
+        report.work_completed = report.work_completed.checked_add(prior_work).ok_or(
+            CompileError::InternalInvariant("endpoint-rescue report work overflowed"),
+        )?;
+        if let Some(decline) = &mut report.decline {
+            decline.work_completed = decline.work_completed.checked_add(prior_work).ok_or(
+                CompileError::InternalInvariant("endpoint-rescue decline work overflowed"),
+            )?;
+            if let DeterminizationResource::Work { limit, required } = &mut decline.resource {
+                *limit = limit.checked_add(prior_work).ok_or(
+                    CompileError::InternalInvariant("endpoint-rescue work limit overflowed"),
+                )?;
+                *required = required.checked_add(prior_work).ok_or(
+                    CompileError::InternalInvariant("endpoint-rescue required work overflowed"),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn account_discarded_rescue(&mut self, rescue_work: u64) -> Result<(), CompileError> {
+        let Self::Declined { report, .. } = self else {
+            return Err(CompileError::InternalInvariant(
+                "completed ordered DFA received discarded rescue work",
+            ));
+        };
+        report.work_completed = report.work_completed.checked_add(rescue_work).ok_or(
+            CompileError::InternalInvariant("discarded endpoint-rescue work overflowed"),
+        )?;
+        if let Some(decline) = &mut report.decline {
+            decline.work_completed = decline.work_completed.checked_add(rescue_work).ok_or(
+                CompileError::InternalInvariant(
+                    "discarded endpoint-rescue decline work overflowed",
+                ),
+            )?;
+        }
+        Ok(())
+    }
 }
 
 fn determinize_impl(
     raw: &RawPlan,
     wants_span: bool,
     requested_limits: DeterminizeLimits,
-    existence_only: bool,
+    semantics: ForwardSemantics,
 ) -> Result<DeterminizeOutcome, CompileError> {
     if raw
         .edge_kinds
@@ -2670,7 +2784,7 @@ fn determinize_impl(
     } = built_alphabet;
     budget.complete_stage(DeterminizationStage::AlphabetPartition)?;
     budget.begin_stage(DeterminizationStage::ForwardSubsetConstruction);
-    let mut forward = match build_forward(raw, &alphabet, &mut budget, existence_only)? {
+    let mut forward = match build_forward(raw, &alphabet, &mut budget, semantics)? {
         ForwardBuildOutcome::Complete(forward) => forward,
         ForwardBuildOutcome::Declined(partial) => {
             let partial = partial.map(|forward| PartialDfa {
@@ -2686,11 +2800,7 @@ fn determinize_impl(
         budget.begin_stage(DeterminizationStage::ReverseSubsetConstruction);
         let Some(reverse) = build_reverse(raw, &alphabet, &mut budget)? else {
             let partial = PartialDfa::from_complete_forward(alphabet, forward, budget.limits);
-            return Ok(DeterminizeOutcome::from_budget(
-                None,
-                Some(partial),
-                budget,
-            ));
+            return Ok(DeterminizeOutcome::from_budget(None, Some(partial), budget));
         };
         budget.complete_stage(DeterminizationStage::ReverseSubsetConstruction)?;
         Some(reverse)
@@ -2702,21 +2812,13 @@ fn determinize_impl(
     budget.begin_stage(DeterminizationStage::DfaStateMinimization);
     if !minimize_dfa_states(&mut forward, &mut reverse, alphabet.classes(), &mut budget)? {
         let partial = PartialDfa::from_complete_forward(alphabet, forward, budget.limits);
-        return Ok(DeterminizeOutcome::from_budget(
-            None,
-            Some(partial),
-            budget,
-        ));
+        return Ok(DeterminizeOutcome::from_budget(None, Some(partial), budget));
     }
     budget.complete_stage(DeterminizationStage::DfaStateMinimization)?;
     budget.begin_stage(DeterminizationStage::AlphabetColumnCoalescing);
     if !coalesce_alphabet_columns(&mut alphabet, &mut forward, &mut reverse, &mut budget)? {
         let partial = PartialDfa::from_complete_forward(alphabet, forward, budget.limits);
-        return Ok(DeterminizeOutcome::from_budget(
-            None,
-            Some(partial),
-            budget,
-        ));
+        return Ok(DeterminizeOutcome::from_budget(None, Some(partial), budget));
     }
     budget.complete_stage(DeterminizationStage::AlphabetColumnCoalescing)?;
     let forward_transitions = forward.transitions.len();
@@ -2747,25 +2849,29 @@ fn determinize_impl(
 
 /// Build the historical priority-preserving machine.
 ///
-/// Partial machines use this construction because their retained prefix can
-/// resume in the ordered K0 engine. Keeping this entry point also preserves
-/// canonical validation for previously serialized programs.
+/// Keeping this entry point preserves canonical validation for previously
+/// serialized programs and supplies an unquotiented semantic oracle for
+/// differential tests.
 pub(crate) fn determinize(
     raw: &RawPlan,
     wants_span: bool,
     requested_limits: DeterminizeLimits,
 ) -> Result<DeterminizeOutcome, CompileError> {
-    determinize_impl(raw, wants_span, requested_limits, false)
+    determinize_impl(raw, wants_span, requested_limits, ForwardSemantics::Ordered)
 }
 
-/// Build the smallest semantic machine admitted by the output contract.
+/// Build an output-specialized semantic machine.
 ///
 /// An existence query observes only whether any path accepts. It cannot
 /// observe Thompson priority after an accepting transition, nor the order of
 /// a nonaccepting subset. Canonicalizing those subsets avoids distinct DFA
 /// states that differ only by priority. Its partial rows remain exact for a
 /// Boolean query: a K0 continuation observes only the set of live consuming
-/// states, never their priority order or a pending endpoint.
+/// states, never their priority order or a pending endpoint. Endpoint
+/// contracts retain priority except where a bounded graph proof establishes
+/// that an immediately lower-priority continuation reproduces every selected
+/// end of its predecessor. Their retained frontiers can therefore still
+/// resume in ordered K0 without replay.
 pub(crate) fn determinize_for_output(
     raw: &RawPlan,
     output: OutputContract,
@@ -2773,9 +2879,66 @@ pub(crate) fn determinize_for_output(
     requested_limits: DeterminizeLimits,
 ) -> Result<DeterminizeOutcome, CompileError> {
     if output == OutputContract::Exists {
-        return determinize_impl(raw, false, requested_limits, true);
+        return determinize_impl(raw, false, requested_limits, ForwardSemantics::Exists);
     }
-    determinize_impl(raw, wants_span, requested_limits, false)
+    let ordered = determinize_impl(
+        raw,
+        wants_span,
+        requested_limits,
+        ForwardSemantics::Ordered,
+    )?;
+    if matches!(ordered, DeterminizeOutcome::Complete { .. })
+        || matches!(
+            ordered,
+            DeterminizeOutcome::Declined {
+                report: DeterminizationReport {
+                    decline: Some(DeterminizationDecline {
+                        resource: DeterminizationResource::Allocation { .. },
+                        ..
+                    }),
+                    ..
+                },
+                ..
+            }
+        )
+    {
+        return Ok(ordered);
+    }
+
+    let effective_limits = requested_limits.effective_for_stable_artifact();
+    let ordered_work = ordered.work_completed();
+    let remaining_work = effective_limits.max_work.checked_sub(ordered_work).ok_or(
+        CompileError::InternalInvariant("ordered endpoint work exceeded its effective limit"),
+    )?;
+    if remaining_work == 0 {
+        return Ok(ordered);
+    }
+
+    // Endpoint dominance is a failure-atomic rescue attempt, never a tax on a
+    // construction that already fits the caller's limits. State and
+    // transition storage restart from zero, while work receives only the
+    // exact remainder of the original aggregate ceiling. A failed proof,
+    // internal proof cap, or resource refusal returns the original ordered
+    // partial prefix byte-for-byte and charges the discarded rescue work in
+    // its report. Optimizing compilation may do two attempts, but their total
+    // measured work never exceeds the caller's one hard limit.
+    let mut rescue_limits = requested_limits;
+    rescue_limits.max_work = remaining_work;
+    let mut pruned = determinize_impl(
+        raw,
+        wants_span,
+        rescue_limits,
+        ForwardSemantics::EndpointPruned,
+    )?;
+    if matches!(pruned, DeterminizeOutcome::Complete { .. }) {
+        pruned.account_prior_attempt(ordered_work, requested_limits)?;
+        Ok(pruned)
+    } else {
+        let rescue_work = pruned.work_completed();
+        let mut ordered = ordered;
+        ordered.account_discarded_rescue(rescue_work)?;
+        Ok(ordered)
+    }
 }
 
 trait RefinementCell: Copy + Eq {
@@ -3564,6 +3727,361 @@ fn compact_partial_forward(
     })
 }
 
+/// Maximum synchronized anchored-state pairs explored for one endpoint
+/// dominance proof.
+///
+/// Refusing a larger proof is conservative: the ordered item remains in its
+/// frontier. The bound keeps this optional canonicalization from replacing
+/// one subset explosion with an unbounded product construction.
+const ENDPOINT_DOMINANCE_MAX_PRODUCT_STATES: usize = 4_096;
+/// Maximum total frontier items retained by one synchronized product proof.
+/// Each item is held in both its worklist key and its stable interning key, so
+/// this independently bounds proof scratch even when graph frontiers are wide.
+const ENDPOINT_DOMINANCE_MAX_PRODUCT_ITEMS: usize = 65_536;
+/// Maximum singleton-continuation relations memoized for one determinization.
+const ENDPOINT_DOMINANCE_MAX_CACHED_PAIRS: usize = 16_384;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EndpointDominanceLimits {
+    product_states: usize,
+    product_items: usize,
+    cached_pairs: usize,
+}
+
+impl Default for EndpointDominanceLimits {
+    fn default() -> Self {
+        Self {
+            product_states: ENDPOINT_DOMINANCE_MAX_PRODUCT_STATES,
+            product_items: ENDPOINT_DOMINANCE_MAX_PRODUCT_ITEMS,
+            cached_pairs: ENDPOINT_DOMINANCE_MAX_CACHED_PAIRS,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct EndpointPair {
+    preferred: ForwardKey,
+    fallback: ForwardKey,
+}
+
+fn clone_endpoint_pair(pair: &EndpointPair, budget: &mut BuildBudget) -> Option<EndpointPair> {
+    Some(EndpointPair {
+        preferred: clone_forward_key(&pair.preferred, budget)?,
+        fallback: clone_forward_key(&pair.fallback, budget)?,
+    })
+}
+
+/// Bounded proofs that one consuming continuation can replace the immediately
+/// preceding continuation of an endpoint-producing ordered frontier.
+///
+/// For a finite suffix, let `F_s` be the selected relative end produced by an
+/// anchored ordered execution starting from consuming state `s`. If
+/// `F_preferred(w) = Some(e)` implies `F_fallback(w) = Some(e)` for every
+/// suffix `w`, then the ordered choice `preferred | fallback` has exactly the
+/// same selected end as `fallback`: failure of the preferred branch already
+/// selected the fallback, and success is reproduced at the same boundary.
+/// This relation is deliberately checked only for adjacent frontier items, so
+/// no intervening priority can become observable when the preferred item is
+/// removed.
+///
+/// The proof is a synchronized product of the two exact anchored ordered
+/// subset machines. At every reachable input boundary, once the preferred
+/// side has a pending end, both sides must have last accepted on the same
+/// transition. Therefore every possible finite-window stop observes either no
+/// preferred result or equal selected ends. Empty frontiers are absorbing,
+/// matching the early completion of anchored execution.
+struct EndpointDominance {
+    closure: ForwardClosure,
+    cache: StableMap<(u32, u32), bool>,
+    disabled: bool,
+    limits: EndpointDominanceLimits,
+}
+
+impl EndpointDominance {
+    fn new(raw: &RawPlan, budget: &mut BuildBudget) -> Option<Self> {
+        Self::new_with_limits(raw, budget, EndpointDominanceLimits::default())
+    }
+
+    fn new_with_limits(
+        raw: &RawPlan,
+        budget: &mut BuildBudget,
+        limits: EndpointDominanceLimits,
+    ) -> Option<Self> {
+        Some(Self {
+            closure: ForwardClosure::new(raw, budget)?,
+            cache: build_map(1, budget)?,
+            disabled: false,
+            limits,
+        })
+    }
+
+    fn anchored_transition(
+        &mut self,
+        raw: &RawPlan,
+        key: &ForwardKey,
+        byte: u8,
+        budget: &mut BuildBudget,
+    ) -> Result<Option<(ForwardKey, bool)>, CompileError> {
+        self.closure.begin();
+        let mut accepted = false;
+        'items: for &consuming in &key.items {
+            if !budget.charge(1) {
+                return Ok(None);
+            }
+            for edge in state_edges(raw, consuming)? {
+                if !budget.charge(1) {
+                    return Ok(None);
+                }
+                if raw.byte_starts[edge] <= byte
+                    && byte <= raw.byte_ends[edge]
+                    && self.closure.expand(raw, raw.edge_targets[edge], budget)?
+                {
+                    accepted = true;
+                    break 'items;
+                }
+                if budget.declined {
+                    return Ok(None);
+                }
+            }
+        }
+        let Some(items) = self.closure.copy_items(budget) else {
+            return Ok(None);
+        };
+        Ok(Some((
+            ForwardKey {
+                items,
+                pending: key.pending || accepted,
+            },
+            accepted,
+        )))
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the synchronized product proof remains one auditable transaction"
+    )]
+    fn proves_endpoint_inclusion(
+        &mut self,
+        raw: &RawPlan,
+        alphabet: &Alphabet,
+        preferred: u32,
+        fallback: u32,
+        budget: &mut BuildBudget,
+    ) -> Result<Option<bool>, CompileError> {
+        if !budget.charge(1) {
+            return Ok(None);
+        }
+        if let Some(&proved) = self.cache.get(&(preferred, fallback)) {
+            return Ok(Some(proved));
+        }
+        if self.disabled {
+            return Ok(Some(false));
+        }
+        if self.cache.len() >= self.limits.cached_pairs {
+            self.disabled = true;
+            return Ok(Some(false));
+        }
+        if self.limits.product_states == 0 || self.limits.product_items < 2 {
+            if !reserve_map(&mut self.cache, 1, budget) {
+                return Ok(None);
+            }
+            self.cache.insert((preferred, fallback), false);
+            return Ok(Some(false));
+        }
+
+        let Some(preferred_items) = clone_u32s(&[preferred], budget) else {
+            return Ok(None);
+        };
+        let Some(fallback_items) = clone_u32s(&[fallback], budget) else {
+            return Ok(None);
+        };
+        let initial = EndpointPair {
+            preferred: ForwardKey {
+                items: preferred_items,
+                pending: false,
+            },
+            fallback: ForwardKey {
+                items: fallback_items,
+                pending: false,
+            },
+        };
+        let Some(mut states) = build_vec(1, budget) else {
+            return Ok(None);
+        };
+        let Some(initial_for_map) = clone_endpoint_pair(&initial, budget) else {
+            return Ok(None);
+        };
+        states.push(initial);
+        let Some(mut interned) = build_map(1, budget) else {
+            return Ok(None);
+        };
+        interned.insert(initial_for_map, ());
+
+        let mut cursor = 0usize;
+        let mut retained_items = 2usize;
+        let mut proved = true;
+        'product: while cursor < states.len() {
+            let Some(pair) = clone_endpoint_pair(
+                states.get(cursor).ok_or(CompileError::InternalInvariant(
+                    "endpoint-dominance worklist cursor is outside states",
+                ))?,
+                budget,
+            ) else {
+                return Ok(None);
+            };
+            cursor = cursor
+                .checked_add(1)
+                .ok_or(CompileError::InternalInvariant(
+                    "endpoint-dominance worklist overflowed",
+                ))?;
+
+            if pair.preferred.pending && !pair.fallback.pending {
+                proved = false;
+                break;
+            }
+            // A failed, exhausted preferred continuation can never make the
+            // implication observable on this suffix or any extension.
+            if pair.preferred.items.is_empty() && !pair.preferred.pending {
+                continue;
+            }
+
+            for &byte in alphabet.representatives.as_ref() {
+                if !budget.charge(1) {
+                    return Ok(None);
+                }
+                let Some((next_preferred, accepted_preferred)) =
+                    self.anchored_transition(raw, &pair.preferred, byte, budget)?
+                else {
+                    return Ok(None);
+                };
+                let Some((next_fallback, accepted_fallback)) =
+                    self.anchored_transition(raw, &pair.fallback, byte, budget)?
+                else {
+                    return Ok(None);
+                };
+
+                // Once the preferred side has selected an end, equality of
+                // the last accepting boundary is preserved exactly when both
+                // sides update together or neither updates. Its first accept
+                // likewise has to be reproduced by the fallback now.
+                if (pair.preferred.pending && accepted_preferred != accepted_fallback)
+                    || (!pair.preferred.pending && accepted_preferred && !accepted_fallback)
+                {
+                    proved = false;
+                    break 'product;
+                }
+
+                let next = EndpointPair {
+                    preferred: next_preferred,
+                    fallback: next_fallback,
+                };
+                if interned.contains_key(&next) {
+                    continue;
+                }
+                if states.len() >= self.limits.product_states {
+                    proved = false;
+                    break 'product;
+                }
+                let next_items = next
+                    .preferred
+                    .items
+                    .len()
+                    .checked_add(next.fallback.items.len())
+                    .ok_or(CompileError::InternalInvariant(
+                        "endpoint-dominance retained item count overflowed",
+                    ))?;
+                let Some(next_retained_items) = retained_items.checked_add(next_items) else {
+                    proved = false;
+                    break 'product;
+                };
+                if next_retained_items > self.limits.product_items {
+                    proved = false;
+                    break 'product;
+                }
+                let next_len =
+                    states
+                        .len()
+                        .checked_add(1)
+                        .ok_or(CompileError::InternalInvariant(
+                            "endpoint-dominance state count overflowed",
+                        ))?;
+                if !ensure_vec_capacity(&mut states, next_len, budget)
+                    || !reserve_map(&mut interned, 1, budget)
+                {
+                    return Ok(None);
+                }
+                let Some(next_for_map) = clone_endpoint_pair(&next, budget) else {
+                    return Ok(None);
+                };
+                states.push(next);
+                interned.insert(next_for_map, ());
+                retained_items = next_retained_items;
+            }
+        }
+
+        if !reserve_map(&mut self.cache, 1, budget) {
+            return Ok(None);
+        }
+        self.cache.insert((preferred, fallback), proved);
+        Ok(Some(proved))
+    }
+
+    fn prune_items(
+        &mut self,
+        raw: &RawPlan,
+        alphabet: &Alphabet,
+        items: &mut Vec<u32>,
+        budget: &mut BuildBudget,
+    ) -> Result<Option<()>, CompileError> {
+        let mut cursor = 0usize;
+        while cursor + 1 < items.len() {
+            let preferred = items[cursor];
+            let fallback = items[cursor + 1];
+            let Some(proved) =
+                self.proves_endpoint_inclusion(raw, alphabet, preferred, fallback, budget)?
+            else {
+                return Ok(None);
+            };
+            if !proved {
+                cursor += 1;
+                continue;
+            }
+            let shifted = items.len().saturating_sub(cursor + 1);
+            let shifted = u64::try_from(shifted).unwrap_or(u64::MAX);
+            if !budget.charge(shifted) {
+                return Ok(None);
+            }
+            items.remove(cursor);
+            cursor = cursor.saturating_sub(1);
+        }
+        Ok(Some(()))
+    }
+}
+
+fn prune_endpoint_items(
+    analysis: &mut Option<EndpointDominance>,
+    raw: &RawPlan,
+    alphabet: &Alphabet,
+    items: &mut Vec<u32>,
+    budget: &mut BuildBudget,
+) -> Result<Option<()>, CompileError> {
+    if items.len() < 2 {
+        return Ok(Some(()));
+    }
+    if analysis.is_none() {
+        let Some(created) = EndpointDominance::new(raw, budget) else {
+            return Ok(None);
+        };
+        *analysis = Some(created);
+    }
+    analysis
+        .as_mut()
+        .ok_or(CompileError::InternalInvariant(
+            "endpoint-dominance analysis was not initialized",
+        ))?
+        .prune_items(raw, alphabet, items, budget)
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "complete ordered subset construction is kept in one auditable worklist"
@@ -3572,8 +4090,10 @@ fn build_forward(
     raw: &RawPlan,
     alphabet: &Alphabet,
     budget: &mut BuildBudget,
-    existence_only: bool,
+    semantics: ForwardSemantics,
 ) -> Result<ForwardBuildOutcome, CompileError> {
+    let existence_only = semantics == ForwardSemantics::Exists;
+    let mut endpoint_dominance = None;
     let Some(mut closure) = ForwardClosure::new(raw, budget) else {
         return Ok(ForwardBuildOutcome::Declined(None));
     };
@@ -3581,7 +4101,7 @@ fn build_forward(
     if budget.declined {
         return Ok(ForwardBuildOutcome::Declined(None));
     }
-    let initial_items = if existence_only {
+    let mut initial_items = if existence_only {
         if initial_accepted {
             Vec::new()
         } else {
@@ -3596,6 +4116,18 @@ fn build_forward(
         };
         items
     };
+    if semantics == ForwardSemantics::EndpointPruned
+        && prune_endpoint_items(
+            &mut endpoint_dominance,
+            raw,
+            alphabet,
+            &mut initial_items,
+            budget,
+        )?
+        .is_none()
+    {
+        return Ok(ForwardBuildOutcome::Declined(None));
+    }
     let initial_terminal = initial_accepted && initial_items.is_empty();
     let initial = ForwardKey {
         items: initial_items,
@@ -3686,11 +4218,27 @@ fn build_forward(
                     ));
                 }
             }
-            let start_action = ForwardStartAction::derive(
-                source_len,
-                closure.items.len(),
-                injected_root,
-            );
+            // Derive start provenance from the unpruned Thompson closure.
+            // Endpoint pruning can delete a priority item with a different
+            // start while preserving its end. Keeping the original action is
+            // therefore deliberately conservative: a mixed-start transition
+            // remains Drop, and Span recovers its start from the untouched
+            // reverse/raw graph. Propagate and Reset cannot be invented by
+            // the endpoint-only quotient.
+            let start_action =
+                ForwardStartAction::derive(source_len, closure.items.len(), injected_root);
+            if semantics == ForwardSemantics::EndpointPruned
+                && prune_endpoint_items(
+                    &mut endpoint_dominance,
+                    raw,
+                    alphabet,
+                    &mut closure.items,
+                    budget,
+                )?
+                .is_none()
+            {
+                decline_with_complete_rows!();
+            }
             let next_pending = !existence_only && (key.pending || accepted);
             let next_items = if existence_only {
                 if accepted {
@@ -3742,11 +4290,7 @@ fn build_forward(
                         ))?;
                     if !ensure_vec_capacity(&mut states, next_state_count, budget)
                         || !ensure_vec_capacity(&mut transitions, next_transition_count, budget)
-                        || !ensure_vec_capacity(
-                            &mut start_actions,
-                            next_transition_count,
-                            budget,
-                        )
+                        || !ensure_vec_capacity(&mut start_actions, next_transition_count, budget)
                         || !reserve_map(&mut interned, 1, budget)
                     {
                         decline_with_complete_rows!();
@@ -4526,6 +5070,145 @@ mod tests {
                     && byte <= raw.byte_ends[edge]
             })
             .collect()
+    }
+
+    fn equivalent_consume_pair_graph() -> RawPlan {
+        RawPlan {
+            start: 0,
+            roles: vec![StateRole::Consume, StateRole::Consume, StateRole::Accept],
+            edge_offsets: vec![0, 1, 2, 2],
+            edge_targets: vec![2, 2],
+            edge_kinds: vec![EdgeKind::ByteRange, EdgeKind::ByteRange],
+            byte_starts: vec![b'a', b'a'],
+            byte_ends: vec![b'a', b'a'],
+        }
+    }
+
+    fn unlimited_graph_alphabet(raw: &RawPlan) -> Alphabet {
+        let mut budget = BuildBudget::new(DeterminizeLimits::unlimited());
+        budget.begin_stage(DeterminizationStage::AlphabetPartition);
+        let built = Alphabet::build(raw, &mut budget)
+            .expect("valid graph alphabet")
+            .expect("unlimited graph alphabet");
+        budget
+            .complete_stage(DeterminizationStage::AlphabetPartition)
+            .expect("complete graph alphabet stage");
+        built.alphabet
+    }
+
+    #[test]
+    fn endpoint_dominance_product_and_cache_caps_refuse_conservatively() {
+        let raw = equivalent_consume_pair_graph();
+        let alphabet = unlimited_graph_alphabet(&raw);
+
+        let mut complete_budget = BuildBudget::new(DeterminizeLimits::unlimited());
+        let mut complete = EndpointDominance::new(&raw, &mut complete_budget)
+            .expect("complete endpoint proof scratch");
+        assert_eq!(
+            complete
+                .proves_endpoint_inclusion(&raw, &alphabet, 0, 1, &mut complete_budget)
+                .expect("complete endpoint relation"),
+            Some(true)
+        );
+        assert!(!complete_budget.declined);
+
+        let mut product_budget = BuildBudget::new(DeterminizeLimits::unlimited());
+        let mut product_capped = EndpointDominance::new_with_limits(
+            &raw,
+            &mut product_budget,
+            EndpointDominanceLimits {
+                product_states: 1,
+                ..EndpointDominanceLimits::default()
+            },
+        )
+        .expect("product-capped endpoint proof scratch");
+        assert_eq!(
+            product_capped
+                .proves_endpoint_inclusion(&raw, &alphabet, 0, 1, &mut product_budget)
+                .expect("product-capped endpoint relation"),
+            Some(false)
+        );
+        assert!(!product_budget.declined);
+
+        let mut item_budget = BuildBudget::new(DeterminizeLimits::unlimited());
+        let mut item_capped = EndpointDominance::new_with_limits(
+            &raw,
+            &mut item_budget,
+            EndpointDominanceLimits {
+                product_items: 1,
+                ..EndpointDominanceLimits::default()
+            },
+        )
+        .expect("item-capped endpoint proof scratch");
+        assert_eq!(
+            item_capped
+                .proves_endpoint_inclusion(&raw, &alphabet, 0, 1, &mut item_budget)
+                .expect("item-capped endpoint relation"),
+            Some(false)
+        );
+        assert!(!item_budget.declined);
+
+        let mut cache_budget = BuildBudget::new(DeterminizeLimits::unlimited());
+        let mut cache_capped = EndpointDominance::new_with_limits(
+            &raw,
+            &mut cache_budget,
+            EndpointDominanceLimits {
+                cached_pairs: 0,
+                ..EndpointDominanceLimits::default()
+            },
+        )
+        .expect("cache-capped endpoint proof scratch");
+        assert_eq!(
+            cache_capped
+                .proves_endpoint_inclusion(&raw, &alphabet, 0, 1, &mut cache_budget)
+                .expect("cache-capped endpoint relation"),
+            Some(false)
+        );
+        assert!(cache_capped.disabled);
+        assert!(!cache_budget.declined);
+    }
+
+    #[test]
+    fn endpoint_rescue_does_not_tax_an_exact_work_completed_baseline() {
+        let raw = lowered_assertion_free("ab");
+        let first = determinize(&raw, true, DeterminizeLimits::unlimited())
+            .expect("unlimited ordered baseline");
+        let first_work = match first {
+            DeterminizeOutcome::Complete { report, .. } => report.work_completed,
+            DeterminizeOutcome::Declined { report, .. } => {
+                panic!("unlimited ordered baseline declined: {report:?}")
+            }
+        };
+        let limits = DeterminizeLimits {
+            max_work: first_work,
+            ..DeterminizeLimits::unlimited()
+        };
+        let ordered = determinize(&raw, true, limits).expect("exact-work ordered baseline");
+        let specialized = determinize_for_output(&raw, OutputContract::Span, true, limits)
+            .expect("exact-work endpoint construction");
+        match (ordered, specialized) {
+            (
+                DeterminizeOutcome::Complete {
+                    machine: ordered_machine,
+                    report: ordered_report,
+                },
+                DeterminizeOutcome::Complete {
+                    machine: specialized_machine,
+                    report: specialized_report,
+                },
+            ) => {
+                assert_eq!(specialized_machine, ordered_machine);
+                assert_eq!(specialized_report, ordered_report);
+                assert_eq!(specialized_report.work_completed, first_work);
+            }
+            (ordered, specialized) => {
+                panic!(
+                    "exact baseline/rescue mismatch: ordered={:?}, specialized={:?}",
+                    ordered.work_completed(),
+                    specialized.work_completed()
+                )
+            }
+        }
     }
 
     #[test]

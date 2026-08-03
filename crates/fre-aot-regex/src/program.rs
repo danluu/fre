@@ -7718,49 +7718,176 @@ mod tests {
     }
 
     #[test]
-    fn default_budget_admits_ordered_subset_permutations_before_minimization() {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "resource rescue, work accounting, wire compatibility and start provenance share one fixture"
+    )]
+    fn endpoint_dominance_prunes_priority_only_subsets_before_minimization() {
         // The overlapping first two classes keep differently ordered search
-        // starts alive through the bounded repetition. Complete construction
-        // has 131,072 ordered subsets, but graph minimization proves that only
-        // 19 forward states are observably distinct. This is a structural
-        // regression for the optimizing budget, not a source-identity route.
+        // starts alive through the bounded repetition. Historical complete
+        // construction had 131,072 ordered subsets before graph minimization
+        // proved that only 19 forward states were observably distinct. The
+        // graph-general anchored-continuation proof removes only adjacent
+        // priority items that must reproduce the same selected endpoint.
         let pattern = r"[b-c][a-b]{1,16}z";
-        let optimized = program(
+        let baseline = program(
             pattern,
             OutputContract::Span,
             CompileMode::Optimizing,
             DeterminizeLimits::default(),
         );
-        assert_eq!(optimized.engine_kind(), EngineKind::OrderedDfa);
+        assert_eq!(baseline.engine_kind(), EngineKind::OrderedDfa);
         assert_eq!(
-            optimized.engine_selection_reason(),
+            baseline.engine_selection_reason(),
             Some(EngineSelectionReason::CompleteDfa)
         );
-        let stats = optimized.dfa_stats().expect("complete default DFA");
-        assert_eq!(stats.forward_states_before_minimization, 131_072);
-        assert_eq!(stats.forward_states, 19);
-        assert_eq!(stats.reverse_states, 18);
-        let report = optimized
-            .determinization_report()
-            .expect("fresh determinization receipt");
-        assert_eq!(report.effective_limits.max_states, 262_144);
-        assert_eq!(report.decline, None);
+        let baseline_stats = baseline.dfa_stats().expect("complete default DFA");
+        assert_eq!(
+            baseline_stats.forward_states_before_minimization,
+            131_072
+        );
+        let direct_baseline = match dfa::determinize(
+            &baseline.raw,
+            true,
+            DeterminizeLimits::default(),
+        )
+        .expect("direct completed ordered baseline")
+        {
+            DeterminizeOutcome::Complete { machine, .. } => machine,
+            DeterminizeOutcome::Declined { report, .. } => {
+                panic!("direct ordered baseline declined: {report:?}")
+            }
+        };
+        let ProgramEngine::OrderedDfa(baseline_machine) = &baseline.engine else {
+            panic!("baseline did not retain its ordered DFA")
+        };
+        assert_eq!(baseline_machine, &direct_baseline);
 
-        let limited = program(
+        // A completed baseline is retained unchanged. The more expensive
+        // dominance proof is a resource-rescue transaction, not an added tax
+        // on every endpoint compilation.
+        let legacy_bytes = baseline
+            .serialize()
+            .expect("serialize historical endpoint DFA");
+        let legacy_restored = CompiledProgram::deserialize(&legacy_bytes)
+            .expect("deserialize historical endpoint DFA");
+        assert_eq!(legacy_restored.serialize().unwrap(), legacy_bytes);
+
+        let rescued = program(
             pattern,
             OutputContract::Span,
             CompileMode::Optimizing,
             DeterminizeLimits {
-                max_states: 65_536,
+                max_states: 256,
                 ..DeterminizeLimits::default()
             },
         );
-        assert_eq!(limited.engine_kind(), EngineKind::OrderedNfa);
+        assert_eq!(rescued.engine_kind(), EngineKind::OrderedDfa);
+        let stats = rescued.dfa_stats().expect("complete rescued DFA");
+        assert_eq!(stats.forward_states_before_minimization, 154);
+        assert_eq!(stats.forward_states, 19);
+        assert_eq!(stats.reverse_states, 18);
+        let report = rescued
+            .determinization_report()
+            .expect("rescued determinization receipt");
+        assert_eq!(report.effective_limits.max_states, 256);
+        assert_eq!(report.decline, None);
+        assert!(report.work_completed <= report.effective_limits.max_work);
+        let ordered_rescue_probe = match dfa::determinize(
+            &rescued.raw,
+            true,
+            DeterminizeLimits {
+                max_states: 256,
+                ..DeterminizeLimits::default()
+            },
+        )
+        .expect("ordered rescue probe")
+        {
+            DeterminizeOutcome::Declined { report, .. } => report,
+            DeterminizeOutcome::Complete { .. } => {
+                panic!("ordered rescue probe unexpectedly completed")
+            }
+        };
         assert_eq!(
-            limited.engine_selection_reason(),
+            report.work_completed,
+            ordered_rescue_probe
+                .work_completed
+                .checked_add(stats.build_work)
+                .expect("aggregate rescue work")
+        );
+
+        let fresh_bytes = rescued.serialize().expect("serialize pruned DFA");
+        let fresh_restored = CompiledProgram::deserialize(&fresh_bytes)
+            .expect("deserialize canonical pruned DFA");
+        assert_eq!(fresh_restored.serialize().unwrap(), fresh_bytes);
+
+        // At the final `z`, both starts can produce the selected end. Endpoint
+        // containment is enough to quotient the forward machine, but it is
+        // not permission to report the retained lower-priority start. Span
+        // must still recover start zero from the untouched reverse graph.
+        let start_witness = b"bbz";
+        assert_eq!(
+            rescued
+                .search(start_witness, SearchWindow::full(start_witness))
+                .unwrap(),
+            MatchResult::Span(Some((0, 3)))
+        );
+        assert_eq!(
+            legacy_restored
+                .search(start_witness, SearchWindow::full(start_witness))
+                .unwrap(),
+            MatchResult::Span(Some((0, 3)))
+        );
+
+        let aggregate_work = report.work_completed;
+        let exact_work = program(
+            pattern,
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 256,
+                max_work: aggregate_work,
+                ..DeterminizeLimits::default()
+            },
+        );
+        assert_eq!(exact_work.engine_kind(), EngineKind::OrderedDfa);
+        assert_eq!(exact_work.dfa_stats(), Some(stats));
+
+        let below_work_limit = aggregate_work.checked_sub(1).expect("nonzero DFA work");
+        let below_work = program(
+            pattern,
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 256,
+                max_work: below_work_limit,
+                ..DeterminizeLimits::default()
+            },
+        );
+        assert_eq!(below_work.engine_kind(), EngineKind::OrderedNfa);
+        let below_work_report = below_work
+            .determinization_report()
+            .expect("one-below endpoint proof receipt");
+        assert!(below_work_report.decline.is_some());
+        assert_eq!(below_work_report.work_completed, below_work_limit);
+        assert!(below_work_report.work_completed <= below_work_report.effective_limits.max_work);
+
+        let below_limits = DeterminizeLimits {
+            max_states: 153,
+            ..DeterminizeLimits::default()
+        };
+        let below = program(
+            pattern,
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            below_limits,
+        );
+        assert_eq!(below.engine_kind(), EngineKind::OrderedNfa);
+        assert_eq!(
+            below.engine_selection_reason(),
             Some(EngineSelectionReason::DeterminizationResourceLimit)
         );
-        let decline = limited
+        let decline = below
             .determinization_report()
             .and_then(|report| report.decline)
             .expect("explicit lower state limit must decline");
@@ -7771,11 +7898,109 @@ mod tests {
         assert_eq!(
             decline.resource,
             dfa::DeterminizationResource::States {
-                limit: 65_536,
-                required: 65_537,
+                limit: 153,
+                required: 154,
             }
         );
-        assert_eq!(decline.states_completed, 65_536);
+        assert_eq!(decline.states_completed, 153);
+
+        let legacy_partial = match dfa::determinize(&below.raw, true, below_limits)
+            .expect("direct legacy partial construction")
+        {
+            DeterminizeOutcome::Declined {
+                partial: Some(partial),
+                ..
+            } => partial,
+            _ => panic!("direct legacy construction did not retain a partial"),
+        };
+        assert_eq!(below.partial_dfa(), Some(&legacy_partial));
+        assert!(
+            below
+                .determinization_report()
+                .expect("aggregate failed-rescue report")
+                .work_completed
+                <= below_limits.max_work
+        );
+    }
+
+    #[test]
+    fn endpoint_dominance_rescue_matches_ordered_nfa_on_generated_windows() {
+        let limits = DeterminizeLimits {
+            max_states: 256,
+            ..DeterminizeLimits::default()
+        };
+        let mut haystacks = generated_byte_strings(&[b'a', b'b', b'c', b'x', b'z'], 4);
+        haystacks.extend([
+            b"bbz".to_vec(),
+            b"bbzbbz".to_vec(),
+            b"cabababababababaz".to_vec(),
+            b"xxbbbbbbbbbbbbbbbbzxx".to_vec(),
+        ]);
+        for pattern in [
+            r"[b-c][a-b]{1,16}z",
+            r"[b-c][a-b]{1,16}?z",
+            r"[b-c][a-b]{1,16}z?",
+            r"[b-c][a-b]{1,16}z??",
+        ] {
+            for output in [OutputContract::SelectedEnd, OutputContract::Span] {
+                let optimized = program(pattern, output, CompileMode::Optimizing, limits);
+                let reference = program(
+                    pattern,
+                    output,
+                    CompileMode::Fast,
+                    DeterminizeLimits::default(),
+                );
+                if pattern.ends_with('z') {
+                    assert_eq!(optimized.engine_kind(), EngineKind::OrderedDfa);
+                }
+                for haystack in &haystacks {
+                    for start in 0..=haystack.len() {
+                        for end in start..=haystack.len() {
+                            let window = SearchWindow::new(start, end);
+                            assert_eq!(
+                                optimized.search(haystack, window).unwrap(),
+                                reference.search(haystack, window).unwrap(),
+                                "{pattern:?}/{output:?}/{haystack:?}/{start}..{end}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn default_budget_rescues_endpoint_priority_explosion() {
+        // One more bounded repetition doubles the historical ordered subset
+        // construction and exhausts the default state budget before Span can
+        // build its reverse machine. The same graph-derived proof used by the
+        // explicit low-limit test must rescue this ordinary default request.
+        let pattern = r"[b-c][a-b]{1,17}z";
+        let limits = DeterminizeLimits::default();
+        let optimized = program(
+            pattern,
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            limits,
+        );
+        assert!(matches!(
+            dfa::determinize(&optimized.raw, true, limits)
+                .expect("historical default construction"),
+            DeterminizeOutcome::Declined { .. }
+        ));
+        assert_eq!(optimized.engine_kind(), EngineKind::OrderedDfa);
+        let stats = optimized.dfa_stats().expect("default rescued DFA");
+        assert!(stats.forward_states_before_minimization < 1_024);
+        assert!(stats.forward_states < stats.forward_states_before_minimization);
+        let report = optimized
+            .determinization_report()
+            .expect("default rescue report");
+        assert_eq!(report.decline, None);
+        assert!(report.work_completed <= report.effective_limits.max_work);
+        let bytes = optimized.serialize().expect("serialize default rescue");
+        let restored = CompiledProgram::deserialize(&bytes)
+            .expect("deserialize canonical default rescue");
+        assert_eq!(restored.serialize().unwrap(), bytes);
     }
 
     #[test]
@@ -7988,14 +8213,18 @@ mod tests {
             OutputContract::SelectedEnd,
             OutputContract::Span,
         ] {
-            // Exists canonicalizes priority-only permutations and completes
-            // this graph below 32 states. A tighter limit still exercises its
-            // canonical set-valued K0-resumable prefix.
+            // Keep both endpoint attempts below their complete state count so
+            // this remains a retained-prefix test after endpoint rescue was
+            // added. Exists already needs the same tighter ceiling to retain
+            // its canonical set-valued K0-resumable prefix.
             let limits = DeterminizeLimits {
+                // Span needs enough retained rows to complete at least one
+                // selected-end probe and exercise reverse recovery. Both
+                // endpoint routes still decline below their complete size.
                 max_states: if output == OutputContract::Exists {
                     8
                 } else {
-                    32
+                    16
                 },
                 ..DeterminizeLimits::default()
             };
@@ -8334,22 +8563,16 @@ mod tests {
     #[test]
     fn general_byte_set_prefix_executes_retained_rows() {
         let pattern = r"[b-f][a-e]{1,10}Z";
-        let complete = program(
-            pattern,
-            OutputContract::SelectedEnd,
-            CompileMode::Optimizing,
-            DeterminizeLimits::default(),
-        );
-        let forward_states = complete
-            .dfa_stats()
-            .expect("complete structural probe")
-            .forward_states_before_minimization;
         let mut limited = program(
             pattern,
             OutputContract::SelectedEnd,
             CompileMode::Optimizing,
             DeterminizeLimits {
-                max_states: forward_states.checked_sub(1).expect("multiple forward states"),
+                // A limit just below the historical complete machine is no
+                // longer a guaranteed decline: endpoint rescue can finish a
+                // smaller, equivalent machine. This ceiling is below both
+                // routes while retaining useful canonical rows.
+                max_states: 8,
                 ..DeterminizeLimits::default()
             },
         );
@@ -8635,7 +8858,9 @@ mod tests {
             OutputContract::SelectedEnd,
             CompileMode::Optimizing,
             DeterminizeLimits {
-                max_states: 256,
+                // Retain the long common prefix but keep both endpoint
+                // determinization routes incomplete.
+                max_states: 128,
                 ..DeterminizeLimits::default()
             },
         );
@@ -8770,7 +8995,7 @@ mod tests {
     fn optimized_partial_workspace_is_bound_to_the_exact_artifact() {
         let pattern = r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)";
         let limits = DeterminizeLimits {
-            max_states: 32,
+            max_states: 8,
             ..DeterminizeLimits::default()
         };
         let partial = program(
@@ -8888,7 +9113,7 @@ mod tests {
             OutputContract::SelectedEnd,
             CompileMode::Optimizing,
             DeterminizeLimits {
-                max_states: 33,
+                max_states: 9,
                 ..DeterminizeLimits::default()
             },
         );
@@ -9112,7 +9337,7 @@ mod tests {
             OutputContract::SelectedEnd,
             CompileMode::Optimizing,
             DeterminizeLimits {
-                max_states: 32,
+                max_states: 8,
                 ..DeterminizeLimits::default()
             },
         );
