@@ -295,6 +295,30 @@ fn stable_dfa_work_ceiling_and_effective_limits_are_explicit() {
 }
 
 #[test]
+fn graph_alphabet_construction_width_is_receipt_closed() {
+    let compiled = compile(
+        CompileRequest::new("(?:[a-z]|mX)+(?:[D-Z]q|!)?", Target::x86_64_linux())
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Exists),
+    )
+    .unwrap();
+    let receipt = compiled.receipt();
+    let stats = receipt.dfa.expect("complete DFA");
+    assert!(stats.graph_classes < stats.boundary_classes);
+    assert!(stats.alphabet_classes <= stats.graph_classes);
+    assert_eq!(stats.reverse_states_before_minimization, 0);
+    assert_eq!(
+        receipt.determinization.transitions_completed,
+        stats
+            .forward_states_before_minimization
+            .checked_mul(stats.graph_classes)
+            .expect("small construction table")
+    );
+    assert_eq!(receipt.determinization.work_completed, stats.build_work);
+    assert_eq!(receipt.determinization.decline, None);
+}
+
+#[test]
 #[allow(
     clippy::too_many_lines,
     reason = "all route and decline variants are compared in one receipt contract test"

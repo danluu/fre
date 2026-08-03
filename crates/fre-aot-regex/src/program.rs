@@ -1203,7 +1203,7 @@ impl CompiledProgram {
                     dfa_bytes,
                     output,
                     exact_match_width,
-                    alphabet_shape.boundary_classes,
+                    alphabet_shape.construction_classes(),
                     &alphabet_shape.boundary_starts,
                 )?;
                 machine.validate_canonical(&raw)?;
@@ -2499,7 +2499,14 @@ fn clone_raw_fallible(raw: &RawPlan) -> Result<RawPlan, ProgramFormatError> {
 
 struct DfaAlphabetShape {
     boundary_classes: usize,
+    graph_classes: usize,
     boundary_starts: [bool; 256],
+}
+
+impl DfaAlphabetShape {
+    const fn construction_classes(&self) -> (usize, usize) {
+        (self.boundary_classes, self.graph_classes)
+    }
 }
 
 fn dfa_alphabet_shape(raw: &RawPlan) -> Result<DfaAlphabetShape, ProgramFormatError> {
@@ -2519,8 +2526,10 @@ fn dfa_alphabet_shape(raw: &RawPlan) -> Result<DfaAlphabetShape, ProgramFormatEr
             "DFA alphabet has no boundary classes",
         ));
     }
+    let graph_classes = crate::dfa::graph_alphabet_class_count(raw, &boundary_starts)?;
     Ok(DfaAlphabetShape {
         boundary_classes,
+        graph_classes,
         boundary_starts,
     })
 }
@@ -2752,7 +2761,7 @@ fn put_u64(bytes: &mut Vec<u8>, value: u64) {
 
 #[cfg(test)]
 mod tests {
-    use crate::dfa::DeterminizationStage;
+    use crate::dfa::{DeterminizationResource, DeterminizationStage};
     use fre_automata::{Automaton, CompileLimits};
     use fre_lower::{LowerLimits, OperationSemantics};
     use fre_syntax::{CanonicalPattern, CompatibilityProfile, ParseRequest, RustProfile};
@@ -2796,6 +2805,29 @@ mod tests {
             .expect("validate")
             .with_line_terminator(line_terminator);
         CompiledProgram::build(raw, automaton, output, mode, determinize).expect("compile")
+    }
+
+    fn generated_byte_strings(alphabet: &[u8], max_len: usize) -> Vec<Vec<u8>> {
+        fn extend(
+            strings: &mut Vec<Vec<u8>>,
+            current: &mut Vec<u8>,
+            alphabet: &[u8],
+            max_len: usize,
+        ) {
+            strings.push(current.clone());
+            if current.len() == max_len {
+                return;
+            }
+            for &byte in alphabet {
+                current.push(byte);
+                extend(strings, current, alphabet, max_len);
+                current.pop();
+            }
+        }
+
+        let mut strings = Vec::new();
+        extend(&mut strings, &mut Vec::new(), alphabet, max_len);
+        strings
     }
 
     #[test]
@@ -3824,8 +3856,12 @@ mod tests {
         );
         let stats = compiled.dfa_stats().expect("complete DFA");
         assert!(
-            stats.alphabet_classes < stats.boundary_classes,
-            "whole-machine equivalence should merge matching and nonmatching intervals"
+            stats.graph_classes < stats.boundary_classes,
+            "full edge signatures should merge recurring nonmatching intervals before construction"
+        );
+        assert!(
+            stats.alphabet_classes < stats.graph_classes,
+            "whole-machine equivalence should additionally merge matching intervals with distinct edges"
         );
 
         let reference = program(
@@ -3842,6 +3878,135 @@ mod tests {
                         compiled.search(haystack, window).unwrap(),
                         reference.search(haystack, window).unwrap()
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn graph_alphabet_transition_budget_is_exact_and_avoids_boundary_width_fallback() {
+        let pattern = "(?:[a-z]|mX)+(?:[D-Z]q|!)?";
+        let unrestricted = program(
+            pattern,
+            OutputContract::Exists,
+            CompileMode::Optimizing,
+            DeterminizeLimits::default(),
+        );
+        let stats = unrestricted.dfa_stats().expect("complete DFA");
+        assert!(stats.graph_classes < stats.boundary_classes);
+        assert_eq!(stats.reverse_states_before_minimization, 0);
+        let construction_states = stats.forward_states_before_minimization;
+        let graph_transitions = construction_states
+            .checked_mul(stats.graph_classes)
+            .expect("small graph transition count");
+        let boundary_transitions = construction_states
+            .checked_mul(stats.boundary_classes)
+            .expect("small boundary transition count");
+        assert!(graph_transitions < boundary_transitions);
+
+        let exact_limits = DeterminizeLimits {
+            max_transitions: graph_transitions,
+            ..DeterminizeLimits::default()
+        };
+        let exact = program(
+            pattern,
+            OutputContract::Exists,
+            CompileMode::Optimizing,
+            exact_limits,
+        );
+        assert_eq!(exact.engine_kind(), EngineKind::OrderedDfa);
+        assert_eq!(exact.dfa_stats(), Some(stats));
+        let exact_report = exact
+            .determinization_report()
+            .expect("fresh determinization report");
+        assert_eq!(exact_report.decline, None);
+        assert_eq!(exact_report.transitions_completed, graph_transitions);
+        let repeated = program(
+            pattern,
+            OutputContract::Exists,
+            CompileMode::Optimizing,
+            exact_limits,
+        );
+        assert_eq!(
+            repeated.determinization_report(),
+            exact.determinization_report()
+        );
+        assert_eq!(repeated.serialize().unwrap(), exact.serialize().unwrap());
+
+        let serialized = exact.serialize().unwrap();
+        let restored = CompiledProgram::deserialize(&serialized).expect("canonical replay");
+        assert_eq!(restored.dfa_stats(), Some(stats));
+        assert_eq!(restored.serialize().unwrap(), serialized);
+
+        let below = program(
+            pattern,
+            OutputContract::Exists,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_transitions: graph_transitions - 1,
+                ..DeterminizeLimits::default()
+            },
+        );
+        assert_eq!(below.engine_kind(), EngineKind::OrderedNfa);
+        assert_eq!(
+            below.engine_selection_reason(),
+            Some(EngineSelectionReason::DeterminizationResourceLimit)
+        );
+        let decline = below
+            .determinization_report()
+            .and_then(|report| report.decline)
+            .expect("transition decline");
+        assert_eq!(
+            decline.stage,
+            DeterminizationStage::ForwardSubsetConstruction
+        );
+        assert_eq!(
+            decline.resource,
+            DeterminizationResource::Transitions {
+                limit: graph_transitions - 1,
+                required: graph_transitions,
+            }
+        );
+        assert_eq!(
+            decline.transitions_completed,
+            graph_transitions - stats.graph_classes
+        );
+    }
+
+    #[test]
+    fn graph_precoalescing_matches_ordered_nfa_on_generated_windows() {
+        let pattern = "(?:[a-z]|mX)+(?:[D-Z]q|!)?";
+        let haystacks =
+            generated_byte_strings(&[0, b'!', b'A', b'D', b'X', b'Z', b'm', b'n', 255], 3);
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let optimized = program(
+                pattern,
+                output,
+                CompileMode::Optimizing,
+                DeterminizeLimits::default(),
+            );
+            let reference = program(
+                pattern,
+                output,
+                CompileMode::Fast,
+                DeterminizeLimits::default(),
+            );
+            let stats = optimized.dfa_stats().expect("complete DFA");
+            assert!(stats.graph_classes < stats.boundary_classes);
+            for haystack in &haystacks {
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        assert_eq!(
+                            optimized.search(haystack, window).unwrap(),
+                            reference.search(haystack, window).unwrap(),
+                            "{output:?}/{haystack:?}/{start}..{end}"
+                        );
+                    }
                 }
             }
         }

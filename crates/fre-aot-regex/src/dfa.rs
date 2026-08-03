@@ -175,6 +175,11 @@ impl DeterminizationReport {
 pub struct DfaStats {
     /// Classes produced directly from byte-range boundaries.
     pub boundary_classes: usize,
+    /// Graph edge-membership classes used by ordered subset construction.
+    ///
+    /// This is no greater than [`Self::boundary_classes`]. Whole-machine
+    /// column coalescing can reduce the alphabet further after construction.
+    pub graph_classes: usize,
     /// Semantically distinct columns retained after whole-DFA coalescing.
     pub alphabet_classes: usize,
     /// Forward states produced by ordered subset construction, before
@@ -227,8 +232,23 @@ struct Alphabet {
     representatives: Box<[u8]>,
 }
 
+struct BuiltAlphabet {
+    alphabet: Alphabet,
+    boundary_classes: usize,
+    graph_classes: usize,
+}
+
+#[derive(Clone, Copy)]
+struct GraphMembershipPartition {
+    boundary_to_graph: [u8; 256],
+    classes: usize,
+}
+
 impl Alphabet {
-    fn build(raw: &RawPlan, budget: &mut BuildBudget) -> Result<Option<Self>, CompileError> {
+    fn build_boundary(
+        raw: &RawPlan,
+        budget: &mut BuildBudget,
+    ) -> Result<Option<Self>, CompileError> {
         let capacity = raw
             .edge_kinds
             .len()
@@ -308,6 +328,56 @@ impl Alphabet {
         }))
     }
 
+    fn build(
+        raw: &RawPlan,
+        budget: &mut BuildBudget,
+    ) -> Result<Option<BuiltAlphabet>, CompileError> {
+        let Some(boundary_alphabet) = Self::build_boundary(raw, budget)? else {
+            return Ok(None);
+        };
+        let boundary_classes = boundary_alphabet.classes();
+        let Some(graph) =
+            graph_membership_partition(raw, &boundary_alphabet.representatives, Some(budget))?
+        else {
+            return Ok(None);
+        };
+        let Some(mut graph_representatives) = build_vec(graph.classes, budget) else {
+            return Ok(None);
+        };
+        let mut graph_byte_to_class = [0_u8; 256];
+        for byte in 0_u16..=255 {
+            if !budget.charge(1) {
+                return Ok(None);
+            }
+            let byte_index = usize::from(byte);
+            let boundary_class = usize::from(boundary_alphabet.byte_to_class[byte_index]);
+            let graph_class = *graph.boundary_to_graph.get(boundary_class).ok_or(
+                CompileError::InternalInvariant(
+                    "DFA boundary class is outside the graph partition",
+                ),
+            )?;
+            graph_byte_to_class[byte_index] = graph_class;
+            if usize::from(graph_class) == graph_representatives.len() {
+                graph_representatives.push(u8::try_from(byte).map_err(|_| {
+                    CompileError::InternalInvariant("DFA graph representative exceeded u8")
+                })?);
+            }
+        }
+        if graph_representatives.len() != graph.classes {
+            return Err(CompileError::InternalInvariant(
+                "DFA graph partition did not use every class",
+            ));
+        }
+        Ok(Some(BuiltAlphabet {
+            alphabet: Self {
+                byte_to_class: graph_byte_to_class,
+                representatives: graph_representatives.into_boxed_slice(),
+            },
+            boundary_classes,
+            graph_classes: graph.classes,
+        }))
+    }
+
     fn class(&self, byte: u8) -> usize {
         usize::from(self.byte_to_class[usize::from(byte)])
     }
@@ -315,6 +385,138 @@ impl Alphabet {
     const fn classes(&self) -> usize {
         self.representatives.len()
     }
+}
+
+fn charge_optional(budget: &mut Option<&mut BuildBudget>, amount: u64) -> bool {
+    budget
+        .as_deref_mut()
+        .is_none_or(|budget| budget.charge(amount))
+}
+
+/// Partition raw boundary intervals by the complete byte-range edge
+/// membership signature. Refinement visits boundary representatives and
+/// assigns every new class at its first byte, so numbering is canonical even
+/// when equivalent intervals are disjoint.
+fn graph_membership_partition(
+    raw: &RawPlan,
+    representatives: &[u8],
+    mut budget: Option<&mut BuildBudget>,
+) -> Result<Option<GraphMembershipPartition>, CompileError> {
+    if representatives.is_empty() || representatives.len() > 256 {
+        return Err(CompileError::InternalInvariant(
+            "DFA graph partition width is outside 1..=256",
+        ));
+    }
+    let mut current = [0_u8; 256];
+    let mut classes = 1_usize;
+    for (edge, &kind) in raw.edge_kinds.iter().enumerate() {
+        if classes == representatives.len() {
+            break;
+        }
+        if !charge_optional(&mut budget, 1) {
+            return Ok(None);
+        }
+        match kind {
+            EdgeKind::Epsilon => continue,
+            EdgeKind::ByteRange => {}
+            _ => {
+                return Err(CompileError::InternalInvariant(
+                    "assertion edge reached the assertion-free graph alphabet",
+                ));
+            }
+        }
+        let start = *raw
+            .byte_starts
+            .get(edge)
+            .ok_or(CompileError::InternalInvariant(
+                "DFA graph alphabet byte start is absent",
+            ))?;
+        let end = *raw
+            .byte_ends
+            .get(edge)
+            .ok_or(CompileError::InternalInvariant(
+                "DFA graph alphabet byte end is absent",
+            ))?;
+        let mut pair_to_new = [u16::MAX; 512];
+        let mut refined = [0_u8; 256];
+        let mut refined_classes = 0_usize;
+        for (boundary, &representative) in representatives.iter().enumerate() {
+            if !charge_optional(&mut budget, 1) {
+                return Ok(None);
+            }
+            let old = usize::from(current[boundary]);
+            if old >= classes {
+                return Err(CompileError::InternalInvariant(
+                    "DFA graph partition references an absent prior class",
+                ));
+            }
+            let member = usize::from(start <= representative && representative <= end);
+            let pair = old
+                .checked_mul(2)
+                .and_then(|value| value.checked_add(member))
+                .ok_or(CompileError::InternalInvariant(
+                    "DFA graph partition pair overflowed",
+                ))?;
+            let slot = pair_to_new
+                .get_mut(pair)
+                .ok_or(CompileError::InternalInvariant(
+                    "DFA graph partition pair is outside the table",
+                ))?;
+            let new = if *slot == u16::MAX {
+                let new = refined_classes;
+                *slot = u16::try_from(new).map_err(|_| {
+                    CompileError::InternalInvariant("DFA graph partition exceeded u16")
+                })?;
+                refined_classes =
+                    refined_classes
+                        .checked_add(1)
+                        .ok_or(CompileError::InternalInvariant(
+                            "DFA graph class count overflowed",
+                        ))?;
+                new
+            } else {
+                usize::from(*slot)
+            };
+            refined[boundary] = u8::try_from(new).map_err(|_| {
+                CompileError::InternalInvariant("DFA graph partition exceeded 256 classes")
+            })?;
+        }
+        if refined_classes < classes || refined_classes > representatives.len() {
+            return Err(CompileError::InternalInvariant(
+                "DFA graph refinement changed class count non-monotonically",
+            ));
+        }
+        current = refined;
+        classes = refined_classes;
+    }
+    Ok(Some(GraphMembershipPartition {
+        boundary_to_graph: current,
+        classes,
+    }))
+}
+
+pub(crate) fn graph_alphabet_class_count(
+    raw: &RawPlan,
+    boundary_starts: &[bool; 256],
+) -> Result<usize, ProgramFormatError> {
+    let mut representatives = [0_u8; 256];
+    let mut count = 0_usize;
+    for (byte, &is_start) in boundary_starts.iter().enumerate() {
+        if is_start {
+            representatives[count] = u8::try_from(byte).map_err(|_| {
+                ProgramFormatError::Malformed("DFA boundary representative exceeded u8")
+            })?;
+            count = count.checked_add(1).ok_or(ProgramFormatError::Malformed(
+                "DFA boundary representative count overflowed",
+            ))?;
+        }
+    }
+    let partition = graph_membership_partition(raw, &representatives[..count], None)
+        .map_err(|_| ProgramFormatError::Malformed("DFA graph alphabet is inconsistent"))?
+        .ok_or(ProgramFormatError::Malformed(
+            "DFA graph alphabet unexpectedly exhausted a budget",
+        ))?;
+    Ok(partition.classes)
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -968,9 +1170,10 @@ impl OrderedDfa {
         bytes: &[u8],
         output: OutputContract,
         exact_match_width: Option<usize>,
-        boundary_classes: usize,
+        construction_classes: (usize, usize),
         boundary_starts: &[bool; 256],
     ) -> Result<Self, ProgramFormatError> {
+        let (boundary_classes, graph_classes) = construction_classes;
         let mut reader = DfaReader::new(bytes);
         let build_work = reader.u64("DFA canonical build-work field is truncated")?;
         if build_work == 0 || build_work > MAX_STABLE_DFA_BUILD_WORK {
@@ -985,9 +1188,14 @@ impl OrderedDfa {
                 "DFA class count is outside 1..=256",
             ));
         }
-        if class_count > boundary_classes {
+        if graph_classes == 0 || graph_classes > boundary_classes {
             return Err(ProgramFormatError::Malformed(
-                "DFA has more classes than the raw byte-range partition",
+                "DFA graph alphabet width is outside the boundary partition",
+            ));
+        }
+        if class_count > graph_classes {
+            return Err(ProgramFormatError::Malformed(
+                "DFA has more classes than the graph alphabet partition",
             ));
         }
         let class_bytes = reader.take(256, "DFA byte-class map is truncated")?;
@@ -1197,9 +1405,12 @@ impl OrderedDfa {
             .ok_or(ProgramFormatError::Malformed(
                 "pre-minimization DFA state count overflowed",
             ))?;
-        let construction_transitions = construction_states.checked_mul(boundary_classes).ok_or(
-            ProgramFormatError::Malformed("pre-minimization DFA transition count overflowed"),
-        )?;
+        let construction_transitions =
+            construction_states
+                .checked_mul(graph_classes)
+                .ok_or(ProgramFormatError::Malformed(
+                    "pre-minimization DFA transition count overflowed",
+                ))?;
         let construction_states_work = u64::try_from(construction_states).map_err(|_| {
             ProgramFormatError::Malformed(
                 "pre-minimization DFA state count exceeded the work representation",
@@ -1232,6 +1443,7 @@ impl OrderedDfa {
             reverse,
             stats: DfaStats {
                 boundary_classes,
+                graph_classes,
                 alphabet_classes: class_count,
                 forward_states_before_minimization,
                 forward_states,
@@ -1252,10 +1464,9 @@ impl OrderedDfa {
             .ok_or(ProgramFormatError::Malformed(
                 "DFA canonical state bound overflowed",
             ))?;
-        // Construction reserves transition budget before whole-machine
-        // alphabet coalescing, so canonical replay needs the raw boundary
-        // class width rather than the compact serialized width.
-        let max_transitions = max_states.checked_mul(self.stats.boundary_classes).ok_or(
+        // Construction reserves transition budget after graph-signature
+        // coalescing and before whole-machine column coalescing.
+        let max_transitions = max_states.checked_mul(self.stats.graph_classes).ok_or(
             ProgramFormatError::Malformed("DFA canonical transition bound overflowed"),
         )?;
         let regenerated = determinize(
@@ -1508,11 +1719,15 @@ pub(crate) fn determinize(
 
     let mut budget = BuildBudget::new(requested_limits);
     budget.begin_stage(DeterminizationStage::AlphabetPartition);
-    let Some(mut alphabet) = Alphabet::build(raw, &mut budget)? else {
+    let Some(built_alphabet) = Alphabet::build(raw, &mut budget)? else {
         return Ok(DeterminizeOutcome::from_budget(None, budget));
     };
+    let BuiltAlphabet {
+        mut alphabet,
+        boundary_classes,
+        graph_classes,
+    } = built_alphabet;
     budget.complete_stage(DeterminizationStage::AlphabetPartition)?;
-    let boundary_classes = alphabet.classes();
     budget.begin_stage(DeterminizationStage::ForwardSubsetConstruction);
     let Some(mut forward) = build_forward(raw, &alphabet, &mut budget)? else {
         return Ok(DeterminizeOutcome::from_budget(None, budget));
@@ -1547,6 +1762,7 @@ pub(crate) fn determinize(
         .map_or(0, |machine| machine.transitions.len());
     let stats = DfaStats {
         boundary_classes,
+        graph_classes,
         alphabet_classes: alphabet.classes(),
         forward_states_before_minimization,
         forward_states: forward.states,
@@ -3090,6 +3306,132 @@ fn put_u64(bytes: &mut Vec<u8>, value: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lowered_assertion_free(pattern: &str) -> RawPlan {
+        use fre_lower::{LowerLimits, OperationSemantics};
+        use fre_syntax::{CanonicalPattern, CompatibilityProfile, ParseRequest, RustProfile};
+
+        let parsed = fre_syntax::parse(ParseRequest::rust(
+            pattern.to_owned(),
+            CompatibilityProfile::RustBytes(RustProfile::default()),
+        ))
+        .expect("parse assertion-free fixture");
+        let CanonicalPattern::Rust(parsed) = parsed.pattern else {
+            panic!("Rust request returned non-Rust pattern");
+        };
+        fre_lower::lower_raw_general(
+            &parsed,
+            OperationSemantics::CaptureFree,
+            LowerLimits::default(),
+        )
+        .expect("lower assertion-free fixture")
+        .into_plan()
+    }
+
+    fn byte_edge_signature(raw: &RawPlan, byte: u8) -> Vec<bool> {
+        raw.edge_kinds
+            .iter()
+            .enumerate()
+            .map(|(edge, &kind)| {
+                kind == EdgeKind::ByteRange
+                    && raw.byte_starts[edge] <= byte
+                    && byte <= raw.byte_ends[edge]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn graph_alphabet_is_the_canonical_full_edge_membership_partition() {
+        // The broad range is interrupted by a narrower edge, so both the
+        // nonmatching intervals and the broad-only intervals recur at
+        // disjoint byte positions.
+        let raw = lowered_assertion_free("(?:[a-z]|mX)");
+        let mut budget = BuildBudget::new(DeterminizeLimits::unlimited());
+        budget.begin_stage(DeterminizationStage::AlphabetPartition);
+        let built = Alphabet::build(&raw, &mut budget)
+            .expect("valid graph alphabet")
+            .expect("unlimited graph alphabet");
+        budget
+            .complete_stage(DeterminizationStage::AlphabetPartition)
+            .expect("complete graph alphabet stage");
+
+        assert!(built.graph_classes < built.boundary_classes);
+        assert_eq!(built.graph_classes, built.alphabet.classes());
+        for left in 0_u16..=255 {
+            let left = u8::try_from(left).expect("byte");
+            for right in 0_u16..=255 {
+                let right = u8::try_from(right).expect("byte");
+                assert_eq!(
+                    built.alphabet.class(left) == built.alphabet.class(right),
+                    byte_edge_signature(&raw, left) == byte_edge_signature(&raw, right),
+                    "{left:#04x}/{right:#04x}"
+                );
+            }
+        }
+        for (class, &representative) in built.alphabet.representatives.iter().enumerate() {
+            let first = (0_u16..=255)
+                .map(|byte| u8::try_from(byte).expect("byte"))
+                .find(|&byte| built.alphabet.class(byte) == class)
+                .expect("represented graph class");
+            assert_eq!(representative, first);
+        }
+    }
+
+    #[test]
+    fn graph_alphabet_work_limit_is_exact_and_transactional() {
+        let raw = lowered_assertion_free("(?:[a-z]|mX)");
+        let mut unrestricted = BuildBudget::new(DeterminizeLimits::unlimited());
+        unrestricted.begin_stage(DeterminizationStage::AlphabetPartition);
+        Alphabet::build(&raw, &mut unrestricted)
+            .expect("valid graph alphabet")
+            .expect("unlimited graph alphabet");
+        unrestricted
+            .complete_stage(DeterminizationStage::AlphabetPartition)
+            .expect("complete graph alphabet stage");
+        let exact_work = unrestricted.work;
+        assert!(exact_work > 0);
+
+        let mut limited = BuildBudget::new(DeterminizeLimits {
+            max_work: exact_work - 1,
+            ..DeterminizeLimits::unlimited()
+        });
+        limited.begin_stage(DeterminizationStage::AlphabetPartition);
+        assert!(
+            Alphabet::build(&raw, &mut limited)
+                .expect("valid limited graph alphabet")
+                .is_none()
+        );
+        let report = limited.into_report();
+        assert_eq!(report.completed_stages.as_ref(), &[]);
+        assert_eq!(
+            report.decline,
+            Some(DeterminizationDecline {
+                stage: DeterminizationStage::AlphabetPartition,
+                resource: DeterminizationResource::Work {
+                    limit: exact_work - 1,
+                    required: exact_work,
+                },
+                work_completed: exact_work - 1,
+                states_completed: 0,
+                transitions_completed: 0,
+            })
+        );
+
+        let mut exact = BuildBudget::new(DeterminizeLimits {
+            max_work: exact_work,
+            ..DeterminizeLimits::unlimited()
+        });
+        exact.begin_stage(DeterminizationStage::AlphabetPartition);
+        Alphabet::build(&raw, &mut exact)
+            .expect("valid exact graph alphabet")
+            .expect("exact graph alphabet budget");
+        exact
+            .complete_stage(DeterminizationStage::AlphabetPartition)
+            .expect("complete exact graph alphabet stage");
+        let report = exact.into_report();
+        assert_eq!(report.work_completed, exact_work);
+        assert_eq!(report.decline, None);
+    }
 
     #[test]
     fn structural_refinement_merges_equivalent_forward_states() {
