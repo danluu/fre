@@ -1816,7 +1816,9 @@ impl CompiledProgram {
                 let found = self
                     .automaton
                     .prepare::<Exists>()
-                    .search_window_with_workspace(haystack, window, workspace, limits)?
+                    .search_window_with_authenticated_workspace(
+                        haystack, window, workspace, limits,
+                    )?
                     .into_output();
                 Ok(MatchResult::Exists(found))
             }
@@ -1824,7 +1826,9 @@ impl CompiledProgram {
                 let found = self
                     .automaton
                     .prepare::<SelectedEnd>()
-                    .search_window_with_workspace(haystack, window, workspace, limits)?
+                    .search_window_with_authenticated_workspace(
+                        haystack, window, workspace, limits,
+                    )?
                     .into_output();
                 Ok(MatchResult::SelectedEnd(found))
             }
@@ -1832,7 +1836,9 @@ impl CompiledProgram {
                 let found = if let Some(width) = self.exact_match_width {
                     self.automaton
                         .prepare::<SelectedEnd>()
-                        .search_window_with_workspace(haystack, window, workspace, limits)?
+                        .search_window_with_authenticated_workspace(
+                            haystack, window, workspace, limits,
+                        )?
                         .into_output()
                         .map(|end| {
                             end.checked_sub(width).map(|start| (start, end)).ok_or(
@@ -1845,7 +1851,9 @@ impl CompiledProgram {
                 } else {
                     self.automaton
                         .prepare::<Span>()
-                        .search_window_with_workspace(haystack, window, workspace, limits)?
+                        .search_window_with_authenticated_workspace(
+                            haystack, window, workspace, limits,
+                        )?
                         .into_output()
                         .map(|span| (span.start(), span.end()))
                 };
@@ -5175,6 +5183,29 @@ mod tests {
                 .search(b"xxcdyy", SearchWindow::full(b"xxcdyy"))
                 .expect("fixed-width fallback search"),
             MatchResult::Span(Some((2, 4)))
+        );
+    }
+
+    #[test]
+    fn ordered_nfa_workspace_remains_usable_by_a_semantically_identical_clone() {
+        let original = program(
+            "(?:ab|ac|ad)+z",
+            OutputContract::SelectedEnd,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        assert_eq!(original.engine_kind(), EngineKind::OrderedNfa);
+        let cloned = original.clone();
+        let mut workspace = original.prepare_workspace().expect("prepare NFA workspace");
+        let haystack = b"xxacadz";
+        assert_eq!(
+            cloned
+                .search_with_workspace(haystack, SearchWindow::full(haystack), &mut workspace)
+                .expect("search cloned semantic program"),
+            MatchResult::SelectedEnd(Some(haystack.len()))
         );
     }
 

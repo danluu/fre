@@ -381,6 +381,42 @@ impl<O: Operation> TypedPlan<'_, O> {
             report.accounting,
         ))
     }
+
+    /// Search through a workspace that the caller has already bound to this
+    /// exact immutable automaton.
+    ///
+    /// This entry is reserved for facades that retain their own stronger
+    /// semantic identity check. It preserves window, resource, reset, and
+    /// accounting validation while reusing the authenticated workspace shape
+    /// and lazy capabilities. A workspace allocated for another immutable
+    /// automaton takes the ordinary fully validated path, preserving support
+    /// for independently constructed but semantically identical programs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] for an invalid range, an incompatible workspace
+    /// shape, insufficient hard limits, or an execution failure.
+    #[doc(hidden)]
+    pub fn search_window_with_authenticated_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut K0Workspace,
+        limits: SearchLimits,
+    ) -> Result<SearchReport<O::Output>, SearchError> {
+        let report = crate::k0::search_with_authenticated_workspace(
+            self.automaton,
+            haystack,
+            window,
+            workspace,
+            limits,
+            O::CONTRACT,
+        )?;
+        Ok(SearchReport::new(
+            O::project(report.found),
+            report.accounting,
+        ))
+    }
 }
 
 impl TypedPlan<'_, Span> {

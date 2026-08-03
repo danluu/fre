@@ -1968,6 +1968,8 @@ impl ReverseWorkspace {
 /// having the exact layout returned by [`Self::layout`].
 #[derive(Debug)]
 pub struct K0Workspace {
+    bound_automaton_identity: u64,
+    bound_contextual: bool,
     layout: WorkspaceLayout,
     seen_at: Vec<u64>,
     generation: u64,
@@ -2109,6 +2111,8 @@ impl K0Workspace {
             reused: false,
         };
         Ok(Self {
+            bound_automaton_identity: automaton.identity(),
+            bound_contextual: automaton.stats().assertion_edges() != 0,
             layout,
             seen_at,
             generation: 0,
@@ -2532,6 +2536,40 @@ pub(crate) fn search_with_workspace(
     )
 }
 
+pub(crate) fn search_with_authenticated_workspace(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    limits: SearchLimits,
+    contract: OutputContract,
+) -> Result<UntypedReport, SearchError> {
+    validate_window(haystack, window)?;
+    if workspace.bound_automaton_identity != automaton.identity() {
+        // A facade may accept a workspace from an independently constructed
+        // but semantically identical program. Preserve the ordinary public
+        // workspace contract in that case: validate the complete shape and
+        // decline identity-bound lazy/reverse caches. Only the exact immutable
+        // automaton that allocated this workspace may take the abbreviated
+        // authenticated path below.
+        return search_with_workspace(automaton, haystack, window, workspace, limits, contract);
+    }
+    let capabilities = LazyCapabilities {
+        lazy: workspace.lazy.is_allocated(),
+        reverse: workspace.reverse.is_allocated(),
+        contextual: workspace.bound_contextual,
+    };
+    execute_bound_prevalidated(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        limits,
+        contract,
+        capabilities,
+    )
+}
+
 fn lazy_capabilities(
     automaton: &Automaton,
     workspace: &K0Workspace,
@@ -2870,6 +2908,31 @@ fn execute_bound(
     capabilities: LazyCapabilities,
 ) -> Result<UntypedReport, SearchError> {
     validate_window(haystack, window)?;
+    execute_bound_prevalidated(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        limits,
+        contract,
+        capabilities,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the prevalidated bound entry carries one authenticated invocation"
+)]
+fn execute_bound_prevalidated(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    limits: SearchLimits,
+    contract: OutputContract,
+    capabilities: LazyCapabilities,
+) -> Result<UntypedReport, SearchError> {
     let wants_span = matches!(contract, OutputContract::Span);
     let mode = if wants_span {
         effective_bound_lazy_mode(workspace, true, capabilities)?
@@ -18284,5 +18347,41 @@ mod tests {
             ),
             Err(SearchError::WorkspaceLayoutMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn authenticated_workspace_reuses_shape_facts_and_safely_falls_back_for_another_automaton() {
+        let plan = ascii_literal(b'a');
+        let other = ascii_literal(b'b');
+        assert_eq!(
+            plan.workspace_layout().unwrap(),
+            other.workspace_layout().unwrap()
+        );
+        let mut workspace =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let report = plan
+            .prepare::<SelectedEnd>()
+            .search_window_with_authenticated_workspace(
+                b"za",
+                SearchWindow::new(0, 2),
+                &mut workspace,
+                SearchLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(report.into_output(), Some(2));
+        assert_eq!(
+            other
+                .prepare::<SelectedEnd>()
+                .search_window_with_authenticated_workspace(
+                    b"zb",
+                    SearchWindow::new(0, 2),
+                    &mut workspace,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output(),
+            Some(2)
+        );
+        assert!(workspace.lazy.is_bound_to(&plan));
     }
 }
