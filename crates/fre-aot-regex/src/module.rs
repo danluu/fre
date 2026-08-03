@@ -386,6 +386,7 @@ struct NativeDfaEmission {
     code: Vec<u8>,
     relocations: Vec<ModuleRelocation>,
     scanner: Option<NativeScannerEmission>,
+    conjunction: Option<NativeVectorConjunctionEmission>,
 }
 
 impl NativeScannerEmission {
@@ -1031,10 +1032,11 @@ const VECTOR_FILTER_COST_BLOCK_BYTES: u64 = 64;
 const MAX_SPARSE_RESCAN_EXPECTED_HITS: u16 = 2;
 const MAX_ASIMD_BATCH_EXPECTED_HITS: u16 = 4;
 const AARCH64_BATCH_BYTES: u16 = 64;
-/// A discarded four-mask exact-product batch is profitable only while the
+/// A primary-only four-mask exact-product batch is profitable only while the
 /// scalar retry guard remains smaller than the target's bounded compare bank.
-/// Wider products retain the exact 16-lane mask and continue inside it.
-const MAX_ASIMD_EXACT_PRODUCT_RESIDUAL_BATCH_PREDICATES: usize = 3;
+/// The general multicolumn path below has no scalar-predicate ceiling because
+/// it intersects the graph-selected SIMD columns before choosing a lane.
+const MAX_ASIMD_EXACT_PRODUCT_SCALAR_RESIDUAL_BATCH_PREDICATES: usize = 3;
 const AARCH64_SVE_BATCH_VECTORS: u16 = 4;
 const AARCH64_SVE_MIN_VECTOR_BYTES: u16 = 16;
 const AARCH64_SVE_MAX_VECTOR_BYTES: u16 = 256;
@@ -1834,6 +1836,19 @@ struct NativeVectorGuardCoverage {
     guaranteed_bytes: u8,
 }
 
+/// Backend-produced receipt for a vector conjunction that was actually
+/// emitted. Keeping the exact selected columns in the receipt prevents a
+/// graph plan from authorizing direct publication when a target lowering
+/// silently retained only its primary column.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeVectorConjunctionEmission {
+    filter: NativeVectorFilter,
+    coverage: NativeVectorGuardCoverage,
+    /// Largest fixed group of adjacent vectors whose complete conjunction is
+    /// present in the emitted CFG. One denotes the ordinary vector loop.
+    batch_vectors: u8,
+}
+
 impl NativeVectorGuardCoverage {
     fn covers_position(self, position: u8) -> bool {
         position < 16 && self.prefix_positions & (1_u16 << u32::from(position)) != 0
@@ -1915,6 +1930,27 @@ fn derive_native_vector_guard_coverage(
     })
 }
 
+fn exact_product_vector_conjunction_is_preserved(
+    emission: Option<NativeVectorConjunctionEmission>,
+    layout: NativeDfaLayout,
+) -> Result<bool, ObjectError> {
+    let Some(vector_filter) = layout.vector_filter else {
+        return Ok(true);
+    };
+    if layout.exact_prefix_match_width.is_none() {
+        return Ok(true);
+    }
+    let Some(expected) = derive_native_vector_guard_coverage(layout, false, Some(vector_filter))
+    else {
+        return Ok(false);
+    };
+    Ok(emission.is_some_and(|receipt| {
+        receipt.filter == vector_filter
+            && receipt.coverage == expected
+            && receipt.batch_vectors != 0
+    }))
+}
+
 fn lower_native_dfa(
     view: NativeProgramView<'_>,
     target: Target,
@@ -1954,6 +1990,16 @@ fn lower_native_dfa(
         .is_some_and(|requirement| {
             !retained_prefix_scanner_is_preserved(emission.scanner, requirement)
         })
+    {
+        return Ok(None);
+    }
+    if view.exact_product_width.is_some()
+        && !(relation_vector_owns_route
+            && layout
+                .prefix_relation
+                .and_then(|relation| relation.vector_plan)
+                .is_some())
+        && !exact_product_vector_conjunction_is_preserved(emission.conjunction, layout)?
     {
         return Ok(None);
     }
@@ -7997,11 +8043,23 @@ fn lower_x86_64_dfa_with_emission(
         .map(|coverage| coverage.has_rejectable_residual(layout))
         .transpose()?
         .unwrap_or(false);
-    let use_sparse_start_batch = !retain_vector_candidates
+    // Exact products may replay a rare hit from the bounded group base because
+    // every rejected lane resumes the same complete scanner at the next byte.
+    // Intersect every selected graph column before that replay. This removes
+    // the former dependence on a small scalar residual while retaining the
+    // ordinary one-vector mask for tails and non-sparse primaries.
+    let use_exact_product_multicolumn_batch = layout.exact_prefix_match_width.is_some()
         && prefix_relation_vector.is_none()
+        && vector_filter.is_some()
+        && vector_coverage.is_some()
         && layout.start_filter.is_some_and(|filter| {
             filter_kind.is_some_and(|kind| x86_use_sparse_filter_mask_batch(filter, kind))
         });
+    let use_sparse_start_batch = (!retain_vector_candidates
+        && prefix_relation_vector.is_none()
+        && layout.start_filter.is_some_and(|filter| {
+            filter_kind.is_some_and(|kind| x86_use_sparse_filter_mask_batch(filter, kind))
+        })) || use_exact_product_multicolumn_batch;
 
     let uses_seeded_reverse = layout.seeded_reverse.is_some();
     if retain_vector_candidates || uses_seeded_reverse {
@@ -8038,7 +8096,9 @@ fn lower_x86_64_dfa_with_emission(
     let table_displacement_label = assembler.label()?;
     assembler.bind(table_displacement_label)?;
     push_bytes(&mut assembler.code, &[0; 4])?;
-    if layout.suffix_filter.is_some() && layout.exact_prefix_match_width.is_some() {
+    if layout.exact_prefix_match_width.is_some()
+        && (layout.suffix_filter.is_some() || use_exact_product_multicolumn_batch)
+    {
         let kind = filter_kind.ok_or(ObjectError::InvalidModule(
             "x86 exact-start prefix block has no instruction selection",
         ))?;
@@ -8152,7 +8212,17 @@ fn lower_x86_64_dfa_with_emission(
             assembler.instruction(&compare_unrolled)?;
             assembler.branch(&[0x0f, 0x82], filter_single_vector)?;
             if use_sparse_start_batch {
-                x86_emit_sparse_filter_mask_batch(&mut assembler, filter, kind)?;
+                if use_exact_product_multicolumn_batch {
+                    x86_emit_sparse_vector_filter_mask_batch(
+                        &mut assembler,
+                        vector_filter.ok_or(ObjectError::InvalidModule(
+                            "x86 exact-product conjunction has no vector filter",
+                        ))?,
+                        kind,
+                    )?;
+                } else {
+                    x86_emit_sparse_filter_mask_batch(&mut assembler, filter, kind)?;
+                }
                 assembler.branch(&[0x0f, 0x85], filter_sparse_batch_hit)?;
             } else {
                 for _ in 0..X86_MASK_BATCH_VECTORS {
@@ -8709,10 +8779,24 @@ fn lower_x86_64_dfa_with_emission(
             symbol: PROGRAM_SYMBOL,
             addend: -4,
         }];
+    let conjunction_batch_vectors = if use_exact_product_multicolumn_batch {
+        u8::try_from(X86_MASK_BATCH_VECTORS)
+            .map_err(|_| ObjectError::ArithmeticOverflow("x86 conjunction batch vectors"))?
+    } else {
+        1
+    };
+    let conjunction = vector_filter
+        .zip(vector_coverage)
+        .map(|(filter, coverage)| NativeVectorConjunctionEmission {
+            filter,
+            coverage,
+            batch_vectors: conjunction_batch_vectors,
+        });
     Ok(NativeDfaEmission {
         code,
         relocations,
         scanner: scanner_emission,
+        conjunction,
     })
 }
 
@@ -13116,20 +13200,32 @@ fn lower_aarch64_dfa_for_operating_system_with_emission(
     // A 64-byte reduction pays when the graph-derived initial candidate set
     // is sparse. Ordinary residual guards retain the exact 16-lane mask so a
     // rejected candidate can continue inside that block. A complete exact
-    // product has a stronger retry proof: after selecting the first primary
-    // hit from a 64-byte batch, the ordinary prefix guard either returns the
-    // match or resumes the same complete scanner at `candidate + 1`. It may
-    // therefore batch without preserving four masks across scalar predicates.
+    // product has a stronger retry proof. Its multicolumn route intersects
+    // every graph-selected SIMD column before choosing the first lane; the
+    // ordinary prefix guard then validates any remaining scalar columns and
+    // either returns the match or resumes this scanner at `candidate + 1`.
+    // The primary-only route retains its small scalar-retry ceiling.
     // Correlated relation filters keep their established all-or-nothing batch
     // gate because the exact-product proof does not cover their language.
-    let use_asimd_exact_product_residual_batch = use_asimd_filter
+    let use_asimd_exact_product_multicolumn_batch = use_asimd_filter
         && retain_vector_candidates
         && layout.exact_prefix_match_width.is_some()
         && prefix_relation_vector.is_none()
+        && vector_filter.is_some()
+        && layout.start_filter.is_some_and(use_aarch64_filter_batch);
+    let use_asimd_exact_product_scalar_residual_batch = use_asimd_filter
+        && retain_vector_candidates
+        && layout.exact_prefix_match_width.is_some()
+        && prefix_relation_vector.is_none()
+        && vector_filter.is_none()
         && layout.prefix_filter.is_some_and(|prefix| {
-            prefix.predicates().len() <= MAX_ASIMD_EXACT_PRODUCT_RESIDUAL_BATCH_PREDICATES
+            prefix.predicates().len()
+                <= MAX_ASIMD_EXACT_PRODUCT_SCALAR_RESIDUAL_BATCH_PREDICATES
         })
         && layout.start_filter.is_some_and(use_aarch64_filter_batch);
+    let use_asimd_exact_product_residual_batch =
+        use_asimd_exact_product_multicolumn_batch
+            || use_asimd_exact_product_scalar_residual_batch;
     let use_asimd_relation_batch = use_asimd_filter
         && !retain_vector_candidates
         && prefix_relation_vector.is_some()
@@ -13139,6 +13235,7 @@ fn lower_aarch64_dfa_for_operating_system_with_emission(
         && (!retain_vector_candidates || use_asimd_exact_product_residual_batch)
         && (prefix_relation_vector.is_none() || use_asimd_relation_batch)
         && layout.start_filter.is_some_and(use_aarch64_filter_batch);
+    let use_asimd_multicolumn_batch = use_asimd_batch && vector_filter.is_some();
     let filter_single_vector_loop = use_asimd_exact_product_residual_batch
         .then(|| assembler.label())
         .transpose()?;
@@ -13472,10 +13569,11 @@ fn lower_aarch64_dfa_for_operating_system_with_emission(
                 {
                     aarch64_emit_first_candidate_in_batch(&mut assembler, first_candidates)?;
                     assembler.branch(if use_asimd_exact_product_residual_batch {
-                        // The four masks are caller-saved temporaries. Recheck
-                        // every non-primary column through the ordinary exact
-                        // prefix guard; its failure edge restarts scanning at
-                        // the next possible start.
+                        // The four masks are caller-saved temporaries. The
+                        // multicolumn route already intersected every selected
+                        // SIMD column; the ordinary exact prefix guard rechecks
+                        // them and any scalar residual, and its failure edge
+                        // restarts scanning at the next possible start.
                         candidate
                     } else if vector_coverage.is_some() {
                         prefix_vector_check
@@ -13906,10 +14004,39 @@ fn lower_aarch64_dfa_for_operating_system_with_emission(
                 addend: 0,
             },
         ];
+    let conjunction = if (use_asimd_filter || use_sve_filter)
+        && let Some(filter) = vector_filter
+        && let Some(coverage) =
+            derive_native_vector_guard_coverage(layout, false, Some(filter))
+    {
+        let sve_batch = use_sve_filter
+            && sve_filter_plan.is_some_and(|plan| {
+                aarch64_sve_batch_max_vector_bytes(
+                    layout.start_filter.unwrap_or(EMPTY_NATIVE_START_FILTER),
+                    plan.primary(),
+                )
+                .is_some()
+            });
+        let batch_vectors = if use_asimd_multicolumn_batch || sve_batch {
+            u8::try_from(AARCH64_SVE_BATCH_VECTORS).map_err(|_| {
+                ObjectError::ArithmeticOverflow("AArch64 conjunction batch vectors")
+            })?
+        } else {
+            1
+        };
+        Some(NativeVectorConjunctionEmission {
+            filter,
+            coverage,
+            batch_vectors,
+        })
+    } else {
+        None
+    };
     Ok(NativeDfaEmission {
         code,
         relocations,
         scanner: scanner_emission,
+        conjunction,
     })
 }
 
@@ -14587,7 +14714,7 @@ mod tests {
     }
 
     #[test]
-    fn no_row_exact_product_asimd_batches_a_sparse_primary_with_residual_guards() {
+    fn no_row_exact_product_asimd_batches_a_general_multicolumn_conjunction() {
         let target = Target::aarch64_macos()
             .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
             .unwrap();
@@ -14638,7 +14765,33 @@ mod tests {
                 .expect("wider residual prefix")
                 .predicates()
                 .len()
-                > MAX_ASIMD_EXACT_PRODUCT_RESIDUAL_BATCH_PREDICATES
+                > MAX_ASIMD_EXACT_PRODUCT_SCALAR_RESIDUAL_BATCH_PREDICATES
+        );
+        let wider_vector = wider_layout
+            .vector_filter
+            .expect("wider graph-selected vector conjunction");
+        assert!(wider_vector.columns().len() >= 2);
+        let wider_coverage = derive_native_vector_guard_coverage(
+            wider_layout,
+            false,
+            Some(wider_vector),
+        )
+        .expect("wider multicolumn coverage");
+        assert!(wider_coverage.has_rejectable_residual(wider_layout).unwrap());
+        let wider_emission = lower_aarch64_dfa_for_operating_system_with_emission(
+            wider_layout,
+            FeatureSet::of(CpuFeature::Aarch64Asimd),
+            OperatingSystem::Macos,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            wider_emission.conjunction,
+            Some(NativeVectorConjunctionEmission {
+                filter: wider_vector,
+                coverage: wider_coverage,
+                batch_vectors: 4,
+            })
         );
         let wider_words = wider.module().sections()[TEXT_SECTION]
             .bytes()
@@ -14646,9 +14799,213 @@ mod tests {
             .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
             .collect::<Vec<_>>();
         assert!(
-            !wider_words.contains(&aarch64_add_x_imm(2, 2, AARCH64_BATCH_BYTES).unwrap()),
-            "an expensive residual guard should retain its exact 16-lane mask"
+            wider_words.contains(&aarch64_add_x_imm(2, 2, AARCH64_BATCH_BYTES).unwrap()),
+            "the complete vector conjunction should remove the scalar residual cap"
         );
+        assert!(
+            wider_words
+                .iter()
+                .filter(|&&word| word == aarch64_ld1_four_16b(16, 12).unwrap())
+                .count()
+                >= 2,
+            "the ASIMD batch must load both primary and secondary columns"
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one matrix keeps graph coverage, target receipts, and publication gates together"
+    )]
+    fn no_row_exact_product_multicolumn_receipts_cover_every_vector_target() {
+        let pattern = r"(?-u:\x01)abcdefgh";
+        let avx512 = FeatureSet::of(CpuFeature::X86Avx512F)
+            .with(CpuFeature::X86Avx512Bw)
+            .with(CpuFeature::X86Avx512Vl);
+        let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
+        let sve2 = sve.with(CpuFeature::Aarch64Sve2);
+        let cases = [
+            (
+                Target::x86_64_linux(),
+                NativeScannerIsa::X86Sse2,
+            ),
+            (
+                Target::x86_64_macos()
+                    .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                    .unwrap(),
+                NativeScannerIsa::X86Avx2,
+            ),
+            (
+                Target::x86_64_linux().with_features(avx512).unwrap(),
+                NativeScannerIsa::X86Avx512Bw,
+            ),
+            (
+                Target::aarch64_macos()
+                    .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                    .unwrap(),
+                NativeScannerIsa::Aarch64Asimd,
+            ),
+            (
+                Target::aarch64_linux().with_features(sve).unwrap(),
+                NativeScannerIsa::Aarch64Sve,
+            ),
+            (
+                Target::aarch64_linux().with_features(sve2).unwrap(),
+                NativeScannerIsa::Aarch64Sve2,
+            ),
+            (
+                Target::aarch64_linux()
+                    .with_features(sve2.with(CpuFeature::Aarch64Asimd))
+                    .unwrap(),
+                NativeScannerIsa::Aarch64Sve2,
+            ),
+        ];
+
+        for (target, scanner_isa) in cases {
+            let compiled = no_row_exact_product_resource_fallback(
+                pattern,
+                OutputContract::Span,
+                target,
+            );
+            assert!(compiled.module().required_runtime_symbol().is_none(), "{target:?}");
+            let view = compiled
+                .program()
+                .native_exact_product_view()
+                .expect("graph-proved exact product");
+            let cost_model = native_vector_filter_cost_model_for_target(target, true);
+            let (mut data, layout) = build_native_dfa_table_with_cost_model(
+                view,
+                target.architecture,
+                cost_model,
+                direct_relation_vector_owns_route(target),
+            )
+            .unwrap();
+            let vector_filter = layout
+                .vector_filter
+                .expect("graph-selected multicolumn conjunction");
+            assert!(vector_filter.columns().len() >= 2, "{target:?}");
+            let expected_coverage = derive_native_vector_guard_coverage(
+                layout,
+                false,
+                Some(vector_filter),
+            )
+            .expect("exact vector coverage");
+            assert!(
+                expected_coverage.has_rejectable_residual(layout).unwrap(),
+                "{target:?}"
+            );
+            let emission = match target.architecture {
+                Architecture::X86_64 => {
+                    lower_x86_64_dfa_with_emission(layout, target.features).unwrap()
+                }
+                Architecture::Aarch64 => {
+                    let sve_plan = install_aarch64_sve_filter_plan(&mut data, layout, target)
+                        .unwrap();
+                    lower_aarch64_dfa_for_operating_system_with_emission(
+                        layout,
+                        target.features,
+                        target.operating_system,
+                        sve_plan,
+                    )
+                    .unwrap()
+                }
+            };
+            let scanner = emission.scanner.expect("primary scanner receipt");
+            assert_eq!(scanner.isa, scanner_isa, "{target:?}");
+            assert!(scanner.vectorized, "{target:?}");
+            let conjunction = NativeVectorConjunctionEmission {
+                filter: vector_filter,
+                coverage: expected_coverage,
+                batch_vectors: 4,
+            };
+            assert_eq!(
+                emission.conjunction,
+                Some(conjunction),
+                "{target:?}"
+            );
+            assert!(
+                exact_product_vector_conjunction_is_preserved(Some(conjunction), layout)
+                    .unwrap(),
+                "{target:?}"
+            );
+            assert!(
+                !exact_product_vector_conjunction_is_preserved(None, layout).unwrap(),
+                "{target:?} missing receipt"
+            );
+            assert!(
+                !exact_product_vector_conjunction_is_preserved(
+                    Some(NativeVectorConjunctionEmission {
+                        batch_vectors: 0,
+                        ..conjunction
+                    }),
+                    layout,
+                )
+                .unwrap(),
+                "{target:?} malformed receipt"
+            );
+
+            let has_x86_intersection = |opcode: &[u8]| {
+                emission
+                    .code
+                    .windows(opcode.len())
+                    .filter(|window| *window == opcode)
+                    .count()
+                    >= 4
+            };
+            match scanner_isa {
+                NativeScannerIsa::X86Sse2 => assert!(
+                    has_x86_intersection(&[0x66, 0x41, 0x0f, 0xdb, 0xfc]),
+                    "SSE2 batch lacks repeated column intersections"
+                ),
+                NativeScannerIsa::X86Avx2 => assert!(
+                    has_x86_intersection(&[0xc4, 0xc1, 0x45, 0xdb, 0xfc]),
+                    "AVX2 batch lacks repeated column intersections"
+                ),
+                NativeScannerIsa::X86Avx512Bw => assert!(
+                    emission
+                        .code
+                        .windows(4)
+                        .filter(|window| *window == [0xc4, 0xe1, 0xd4, 0x41])
+                        .count()
+                        >= 4,
+                    "AVX-512 batch lacks repeated K5 intersections"
+                ),
+                NativeScannerIsa::Aarch64Asimd => {
+                    let words = emission
+                        .code
+                        .chunks_exact(4)
+                        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                        .collect::<Vec<_>>();
+                    assert!(
+                        words
+                            .iter()
+                            .filter(|&&word| {
+                                word == aarch64_and_16b(24, 24, 20).unwrap()
+                            })
+                            .count()
+                            >= 1,
+                        "ASIMD batch lacks a secondary-column intersection"
+                    );
+                }
+                NativeScannerIsa::Aarch64Sve | NativeScannerIsa::Aarch64Sve2 => {
+                    let words = emission
+                        .code
+                        .chunks_exact(4)
+                        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                        .collect::<Vec<_>>();
+                    assert!(
+                        words.contains(&aarch64_sve_and_b(1, 1, 5).unwrap()),
+                        "SVE batch lacks a secondary-column predicate intersection"
+                    );
+                }
+                NativeScannerIsa::ScalarEmpty
+                | NativeScannerIsa::X86ScalarBitmap
+                | NativeScannerIsa::Aarch64ScalarRange
+                | NativeScannerIsa::Aarch64ScalarLut => {
+                    panic!("scalar scanner escaped vector receipt matrix")
+                }
+            }
+        }
     }
 
     #[test]
@@ -16351,6 +16708,19 @@ mod tests {
         deterministic[117..133].copy_from_slice(b"abcdefghijklmnop");
         width_sixteen.push(deterministic);
         cases.push(("abcdefghijklmnop", width_sixteen));
+        let mut width_nine = vec![
+            Vec::new(),
+            b"\x01abcdefgh".to_vec(),
+            b"x\x01abcdefghy".to_vec(),
+            b"\x01abcxefgh".to_vec(),
+            b"\x01abcdefg\x01abcdefgh".to_vec(),
+        ];
+        let mut sparse = vec![b'x'; 257];
+        sparse[63..72].copy_from_slice(b"\x01abcdefgh");
+        sparse[129] = 1;
+        sparse[130..138].copy_from_slice(b"abcxefgh");
+        width_nine.push(sparse);
+        cases.push((r"(?-u:\x01)abcdefgh", width_nine));
 
         let directory = std::env::temp_dir().join(format!(
             "fre-aot-no-row-exact-product-{}",
@@ -17619,6 +17989,87 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn exact_multicolumn_mask_model_is_exhaustive_over_truth_orders_and_tails() {
+        fn permutations(column_count: usize) -> Vec<Vec<usize>> {
+            fn visit(prefix: &mut Vec<usize>, remaining: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {
+                if remaining.is_empty() {
+                    out.push(prefix.clone());
+                    return;
+                }
+                for index in 0..remaining.len() {
+                    let column = remaining.remove(index);
+                    prefix.push(column);
+                    visit(prefix, remaining, out);
+                    prefix.pop();
+                    remaining.insert(index, column);
+                }
+            }
+            let mut out = Vec::new();
+            visit(
+                &mut Vec::new(),
+                &mut (0..column_count).collect(),
+                &mut out,
+            );
+            out
+        }
+
+        const LANES: usize = 4;
+        for column_count in 2_usize..=MAX_VECTOR_FILTER_COLUMNS {
+            let assignments = 1_usize << (column_count * LANES);
+            for encoded in 0..assignments {
+                let masks = (0..column_count)
+                    .map(|column| {
+                        (0..LANES).fold(0_u8, |mask, lane| {
+                            let bit = column * LANES + lane;
+                            mask | (u8::from(encoded & (1_usize << bit) != 0) << lane)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                for order in permutations(column_count) {
+                    for active_lanes in 0..=LANES {
+                        let active = if active_lanes == LANES {
+                            u8::MAX >> (8 - LANES)
+                        } else {
+                            (1_u8 << active_lanes) - 1
+                        };
+                        let vector = order
+                            .iter()
+                            .fold(active, |mask, &column| mask & masks[column]);
+                        let scalar = (0..active_lanes).fold(0_u8, |mask, lane| {
+                            let matches = (0..column_count)
+                                .all(|column| masks[column] & (1_u8 << lane) != 0);
+                            mask | (u8::from(matches) << lane)
+                        });
+                        assert_eq!(
+                            vector, scalar,
+                            "columns={column_count}, encoded={encoded:#x}, order={order:?}, active={active_lanes}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Four-vector batches must select the first matching lane in source
+        // order after every column has been intersected independently.
+        for block in 0_usize..4 {
+            for lane in 0_usize..LANES {
+                let mut masks = [[0_u8; MAX_VECTOR_FILTER_COLUMNS]; 4];
+                for column in &mut masks[block] {
+                    *column |= 1_u8 << lane;
+                }
+                let selected = masks.iter().enumerate().find_map(|(candidate_block, columns)| {
+                    let intersection = columns.iter().fold(u8::MAX, |mask, column| mask & column);
+                    (intersection != 0).then(|| {
+                        candidate_block * LANES
+                            + usize::try_from(intersection.trailing_zeros()).unwrap()
+                    })
+                });
+                assert_eq!(selected, Some(block * LANES + lane));
             }
         }
     }
