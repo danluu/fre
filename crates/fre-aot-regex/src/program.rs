@@ -92,6 +92,16 @@ const MAX_ANCHORED_SUFFIX_WORK: u64 = 1_000_000;
 const MAX_EXACT_WIDTH_WORK: u64 = 1_000_000;
 /// Hard work ceiling for the optional graph-wide maximum-width proof.
 const MAX_MATCH_WIDTH_WORK: u64 = 1_000_000;
+/// Independent ceilings for the optional exact-product NFA proof. The proof
+/// explores every byte from every distinct epsilon-closed frontier, so each
+/// kind of abstract operation is bounded separately and a frontier explosion
+/// can only decline this sidecar.
+const MAX_NFA_EXACT_PRODUCT_STATE_WORK: u64 = 4_000_000;
+const MAX_NFA_EXACT_PRODUCT_EDGE_WORK: u64 = 8_000_000;
+const MAX_NFA_EXACT_PRODUCT_BYTE_WORK: u64 = 1_000_000;
+const MAX_NFA_EXACT_PRODUCT_FRONTIER_WORK: u64 = 4_000_000;
+const MAX_NFA_EXACT_PRODUCT_FRONTIERS: usize = 1_024;
+const MAX_NFA_EXACT_PRODUCT_MEMORY_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum conservative false-candidate work admitted for the portable NFA
 /// mandatory-suffix accelerator. The product is the proved maximum match
 /// width times the primary suffix-column cardinality.
@@ -597,11 +607,12 @@ struct NfaMandatorySuffix {
 
 /// Complete scanner for an exact fixed-width Cartesian byte product.
 ///
-/// This sidecar is admitted only when a graph walk proves that every
-/// consuming edge in a byte layer reaches the same next Thompson state. The
-/// continuation is therefore independent of which member of that layer's
-/// byte set was consumed, so the anchored columns describe the complete
-/// language rather than merely necessary conditions. Scanning one selective
+/// This sidecar is admitted only when a bounded graph walk proves that every
+/// epsilon-closed frontier admits exactly the same anchored byte set at its
+/// current depth, and every member reaches an accepting frontier after the
+/// exact width. Distinct byte choices may retain distinct Thompson frontiers;
+/// this preserves equivalent duplicated continuations without confusing a
+/// correlated alternation for a Cartesian language. Scanning one selective
 /// column and checking the remaining columns can then replace ordered-NFA
 /// execution without losing alternation or greediness semantics.
 #[derive(Clone, Copy, Debug)]
@@ -626,10 +637,6 @@ impl NfaExactProduct {
         if width == 0 || width != prefix.sets().len() || width > MAX_ANCHORED_PREFIX_BYTES {
             return None;
         }
-        if !nfa_prefix_is_exact_product(raw, prefix.sets()) {
-            return None;
-        }
-
         let (primary_offset, primary) = prefix
             .sets()
             .iter()
@@ -637,6 +644,9 @@ impl NfaExactProduct {
             .enumerate()
             .filter(|(_, set)| (1..=3).contains(&usize::from(set.cardinality())))
             .min_by_key(|(offset, set)| (set.cardinality(), *offset != 0, *offset))?;
+        if !nfa_prefix_is_exact_product(raw, prefix.sets()) {
+            return None;
+        }
         let primary_count = usize::from(primary.cardinality());
         let mut primary_bytes = [0_u8; 3];
         let mut count = 0usize;
@@ -746,196 +756,432 @@ impl NfaExactProduct {
     }
 }
 
-/// Sufficient graph proof that every anchored byte column has a
-/// byte-independent continuation.
-///
-/// The Thompson closure at each depth may contain several consuming states
-/// and ranges, but all of their consuming edges must converge on one exact
-/// target. Consequently every member of the unioned anchored set reaches the
-/// same next closure. Repeating that proof through the exact width makes the
-/// per-column Cartesian product complete. More general correlated graphs
-/// simply decline this optional sidecar.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(
-    clippy::too_many_lines,
-    reason = "the bounded product proof keeps graph validation and convergence together"
+    clippy::struct_field_names,
+    reason = "uniform max_ names keep each independent proof ceiling explicit"
 )]
-fn nfa_prefix_is_exact_product(raw: &RawPlan, sets: &[AnchoredByteSet]) -> bool {
-    let states = raw.roles.len();
-    let Ok(mut current) = usize::try_from(raw.start) else {
-        return false;
-    };
-    if current >= states || raw.edge_offsets.len() != states.saturating_add(1) {
-        return false;
+struct NfaExactProductLimits {
+    max_state_work: u64,
+    max_edge_work: u64,
+    max_byte_work: u64,
+    max_frontier_work: u64,
+    max_frontiers: usize,
+    max_memory_bytes: usize,
+}
+
+impl Default for NfaExactProductLimits {
+    fn default() -> Self {
+        Self {
+            max_state_work: MAX_NFA_EXACT_PRODUCT_STATE_WORK,
+            max_edge_work: MAX_NFA_EXACT_PRODUCT_EDGE_WORK,
+            max_byte_work: MAX_NFA_EXACT_PRODUCT_BYTE_WORK,
+            max_frontier_work: MAX_NFA_EXACT_PRODUCT_FRONTIER_WORK,
+            max_frontiers: MAX_NFA_EXACT_PRODUCT_FRONTIERS,
+            max_memory_bytes: MAX_NFA_EXACT_PRODUCT_MEMORY_BYTES,
+        }
     }
-    let mut seen = Vec::new();
-    if seen.try_reserve_exact(states).is_err() {
-        return false;
-    }
-    seen.resize(states, false);
-    let mut stack = Vec::new();
-    let mut consuming = Vec::new();
-    let Some(stack_capacity) = raw.edge_targets.len().checked_add(1) else {
-        return false;
-    };
-    if stack.try_reserve_exact(stack_capacity).is_err()
-        || consuming.try_reserve_exact(states).is_err()
-    {
-        return false;
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct NfaExactProductProofStats {
+    state_work: u64,
+    edge_work: u64,
+    byte_work: u64,
+    frontier_work: u64,
+    frontiers: usize,
+    memory_bytes: usize,
+}
+
+struct NfaExactProductResources {
+    limits: NfaExactProductLimits,
+    stats: NfaExactProductProofStats,
+}
+
+impl NfaExactProductResources {
+    const fn new(limits: NfaExactProductLimits) -> Self {
+        Self {
+            limits,
+            stats: NfaExactProductProofStats {
+                state_work: 0,
+                edge_work: 0,
+                byte_work: 0,
+                frontier_work: 0,
+                frontiers: 0,
+                memory_bytes: 0,
+            },
+        }
     }
 
-    for expected in sets {
-        seen.fill(false);
-        stack.clear();
-        consuming.clear();
-        stack.push(current);
-        while let Some(state) = stack.pop() {
-            let Some(mark) = seen.get_mut(state) else {
-                return false;
-            };
-            if *mark {
-                continue;
-            }
-            *mark = true;
-            match raw.roles.get(state) {
-                Some(StateRole::Split) => {
-                    let Some(&begin) = raw.edge_offsets.get(state) else {
-                        return false;
-                    };
-                    let Some(&end) = raw.edge_offsets.get(state.saturating_add(1)) else {
-                        return false;
-                    };
-                    let (Ok(begin), Ok(end)) = (usize::try_from(begin), usize::try_from(end))
-                    else {
-                        return false;
-                    };
-                    if begin > end || end > raw.edge_kinds.len() {
-                        return false;
-                    }
-                    for edge in begin..end {
-                        if raw.edge_kinds.get(edge) != Some(&EdgeKind::Epsilon) {
-                            return false;
-                        }
-                        let Some(&target) = raw.edge_targets.get(edge) else {
-                            return false;
-                        };
-                        let Ok(target) = usize::try_from(target) else {
-                            return false;
-                        };
-                        if target >= states {
-                            return false;
-                        }
-                        stack.push(target);
-                    }
-                }
-                Some(StateRole::Consume) => consuming.push(state),
-                _ => return false,
-            }
+    fn charge(used: &mut u64, amount: u64, limit: u64) -> Option<()> {
+        let next = used.checked_add(amount)?;
+        if next > limit {
+            return None;
         }
-        if consuming.is_empty() {
-            return false;
-        }
-
-        let mut words = [0_u64; 4];
-        let mut common_target = None;
-        for &state in &consuming {
-            let Some(&begin) = raw.edge_offsets.get(state) else {
-                return false;
-            };
-            let Some(&end) = raw.edge_offsets.get(state.saturating_add(1)) else {
-                return false;
-            };
-            let (Ok(begin), Ok(end)) = (usize::try_from(begin), usize::try_from(end)) else {
-                return false;
-            };
-            if begin >= end || end > raw.edge_kinds.len() {
-                return false;
-            }
-            for edge in begin..end {
-                if raw.edge_kinds.get(edge) != Some(&EdgeKind::ByteRange) {
-                    return false;
-                }
-                let (Some(&start), Some(&end), Some(&target)) = (
-                    raw.byte_starts.get(edge),
-                    raw.byte_ends.get(edge),
-                    raw.edge_targets.get(edge),
-                ) else {
-                    return false;
-                };
-                let Ok(target) = usize::try_from(target) else {
-                    return false;
-                };
-                if start > end || target >= states {
-                    return false;
-                }
-                if common_target.is_some_and(|common| common != target) {
-                    return false;
-                }
-                common_target = Some(target);
-                for byte in start..=end {
-                    let index = usize::from(byte);
-                    words[index / 64] |= 1_u64 << (index % 64);
-                }
-            }
-        }
-        if words != expected.words() {
-            return false;
-        }
-        let Some(target) = common_target else {
-            return false;
-        };
-        current = target;
+        *used = next;
+        Some(())
     }
 
-    // Every product member reaches this same closure. At least one Accept in
-    // it proves membership; the independent exact-width analysis rules out an
-    // accepting continuation at any other byte depth.
-    seen.fill(false);
-    stack.clear();
-    stack.push(current);
+    fn charge_state(&mut self, amount: usize) -> Option<()> {
+        Self::charge(
+            &mut self.stats.state_work,
+            u64::try_from(amount).ok()?,
+            self.limits.max_state_work,
+        )
+    }
+
+    fn charge_edge(&mut self, amount: usize) -> Option<()> {
+        Self::charge(
+            &mut self.stats.edge_work,
+            u64::try_from(amount).ok()?,
+            self.limits.max_edge_work,
+        )
+    }
+
+    fn charge_byte(&mut self, amount: usize) -> Option<()> {
+        Self::charge(
+            &mut self.stats.byte_work,
+            u64::try_from(amount).ok()?,
+            self.limits.max_byte_work,
+        )
+    }
+
+    fn charge_frontier(&mut self, amount: usize) -> Option<()> {
+        Self::charge(
+            &mut self.stats.frontier_work,
+            u64::try_from(amount).ok()?,
+            self.limits.max_frontier_work,
+        )
+    }
+
+    fn retain_memory(&mut self, amount: usize) -> Option<()> {
+        let next = self.stats.memory_bytes.checked_add(amount)?;
+        if next > self.limits.max_memory_bytes {
+            return None;
+        }
+        self.stats.memory_bytes = next;
+        Some(())
+    }
+
+    fn publish_frontier(&mut self) -> Option<()> {
+        let next = self.stats.frontiers.checked_add(1)?;
+        if next > self.limits.max_frontiers || next > MAX_NFA_EXACT_PRODUCT_FRONTIERS {
+            return None;
+        }
+        self.stats.frontiers = next;
+        Some(())
+    }
+}
+
+fn nfa_exact_product_state_edges(raw: &RawPlan, state: usize) -> Option<core::ops::Range<usize>> {
+    let begin = usize::try_from(*raw.edge_offsets.get(state)?).ok()?;
+    let end = usize::try_from(*raw.edge_offsets.get(state.checked_add(1)?)?).ok()?;
+    (begin <= end
+        && end <= raw.edge_targets.len()
+        && end <= raw.edge_kinds.len()
+        && end <= raw.byte_starts.len()
+        && end <= raw.byte_ends.len())
+    .then_some(begin..end)
+}
+
+fn nfa_exact_product_clear_frontier(
+    frontier: &mut [u64],
+    resources: &mut NfaExactProductResources,
+) -> Option<()> {
+    resources.charge_frontier(frontier.len())?;
+    frontier.fill(0);
+    Some(())
+}
+
+fn nfa_exact_product_frontier_is_empty(
+    frontier: &[u64],
+    resources: &mut NfaExactProductResources,
+) -> Option<bool> {
+    resources.charge_frontier(frontier.len())?;
+    Some(frontier.iter().all(|word| *word == 0))
+}
+
+/// Complete one epsilon closure from the states already present in `stack`.
+/// Consuming states are published as a canonical bitmap and acceptance is
+/// returned separately. Stack pops, zero-width edges, and bitmap insertions
+/// are independently charged before they are performed.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "closure scratch and each independently audited resource remain explicit"
+)]
+fn nfa_exact_product_epsilon_closure(
+    raw: &RawPlan,
+    states: usize,
+    stack_limit: usize,
+    stack: &mut Vec<u32>,
+    seen_generation: &mut [u32],
+    generation: &mut u32,
+    frontier: &mut [u64],
+    resources: &mut NfaExactProductResources,
+) -> Option<bool> {
+    *generation = generation.checked_add(1)?;
+    let current_generation = *generation;
+    let mut accepting = false;
     while let Some(state) = stack.pop() {
-        let Some(mark) = seen.get_mut(state) else {
-            return false;
-        };
-        if *mark {
+        resources.charge_state(1)?;
+        let state = usize::try_from(state).ok()?;
+        let seen = seen_generation.get_mut(state)?;
+        if *seen == current_generation {
             continue;
         }
-        *mark = true;
-        match raw.roles.get(state) {
-            Some(StateRole::Accept) => return true,
-            Some(StateRole::Split) => {
-                let Some(&begin) = raw.edge_offsets.get(state) else {
-                    return false;
-                };
-                let Some(&end) = raw.edge_offsets.get(state.saturating_add(1)) else {
-                    return false;
-                };
-                let (Ok(begin), Ok(end)) = (usize::try_from(begin), usize::try_from(end)) else {
-                    return false;
-                };
-                if begin > end || end > raw.edge_kinds.len() {
-                    return false;
-                }
-                for edge in begin..end {
+        *seen = current_generation;
+        match raw.roles.get(state)? {
+            StateRole::Split => {
+                for edge in nfa_exact_product_state_edges(raw, state)? {
+                    resources.charge_edge(1)?;
                     if raw.edge_kinds.get(edge) != Some(&EdgeKind::Epsilon) {
-                        return false;
+                        return None;
                     }
-                    let Some(&target) = raw.edge_targets.get(edge) else {
-                        return false;
-                    };
-                    let Ok(target) = usize::try_from(target) else {
-                        return false;
-                    };
-                    if target >= states {
-                        return false;
+                    let target = *raw.edge_targets.get(edge)?;
+                    if usize::try_from(target).map_or(true, |target| target >= states)
+                        || stack.len() >= stack_limit
+                    {
+                        return None;
                     }
                     stack.push(target);
                 }
             }
-            Some(StateRole::Consume) => {}
-            Some(_) | None => return false,
+            StateRole::Consume => {
+                resources.charge_frontier(1)?;
+                *frontier.get_mut(state / 64)? |= 1_u64 << (state % 64);
+            }
+            StateRole::Accept => accepting = true,
+            _ => return None,
         }
     }
-    false
+    Some(accepting)
+}
+
+fn nfa_exact_product_intern_frontier(
+    arena: &mut Vec<Vec<u64>>,
+    frontier: &[u64],
+    resources: &mut NfaExactProductResources,
+) -> Option<usize> {
+    let comparison_work = arena.len().checked_mul(frontier.len())?;
+    resources.charge_frontier(comparison_work)?;
+    if let Some(index) = arena.iter().position(|known| known.as_slice() == frontier) {
+        return Some(index);
+    }
+
+    resources.publish_frontier()?;
+    resources.charge_frontier(frontier.len().checked_add(1)?)?;
+    resources.retain_memory(frontier.len().checked_mul(core::mem::size_of::<u64>())?)?;
+    let mut stored = Vec::new();
+    stored.try_reserve_exact(frontier.len()).ok()?;
+    stored.extend_from_slice(frontier);
+    arena.push(stored);
+    arena.len().checked_sub(1)
+}
+
+fn nfa_exact_product_fixed_memory_bytes(
+    states: usize,
+    stack_slots: usize,
+    frontier_words: usize,
+) -> Option<usize> {
+    states
+        .checked_mul(core::mem::size_of::<u32>())?
+        .checked_add(stack_slots.checked_mul(core::mem::size_of::<u32>())?)?
+        .checked_add(frontier_words.checked_mul(core::mem::size_of::<u64>())?)?
+        .checked_add(
+            MAX_NFA_EXACT_PRODUCT_FRONTIERS.checked_mul(core::mem::size_of::<Vec<u64>>())?,
+        )?
+        .checked_add(
+            MAX_NFA_EXACT_PRODUCT_FRONTIERS
+                .checked_mul(core::mem::size_of::<usize>())?
+                .checked_mul(2)?,
+        )?
+        .checked_add(MAX_NFA_EXACT_PRODUCT_FRONTIERS.checked_mul(core::mem::size_of::<u32>())?)
+}
+
+/// Prove that the graph language is exactly the Cartesian product of `sets`.
+///
+/// Each canonical frontier is an epsilon-closed set of consuming Thompson
+/// states. Every one of the 256 bytes is explored from every frontier. Its
+/// structural availability must equal the anchored set for that depth; each
+/// admitted byte then produces and interns its own next frontier. This keeps
+/// equivalent duplicated branches while exposing correlations as differing
+/// per-frontier byte sets. Every final transition must reach Accept.
+#[allow(
+    clippy::too_many_lines,
+    reason = "shape validation, exact resource accounting, closure, and frontier publication form one proof"
+)]
+fn nfa_prefix_exact_product_proof(
+    raw: &RawPlan,
+    sets: &[AnchoredByteSet],
+    limits: NfaExactProductLimits,
+) -> Option<NfaExactProductProofStats> {
+    if sets.is_empty() {
+        return None;
+    }
+    let states = raw.roles.len();
+    let edges = raw.edge_targets.len();
+    let start = usize::try_from(raw.start).ok()?;
+    if states == 0
+        || start >= states
+        || raw.edge_offsets.len() != states.checked_add(1)?
+        || raw.edge_kinds.len() != edges
+        || raw.byte_starts.len() != edges
+        || raw.byte_ends.len() != edges
+        || raw.edge_offsets.first().copied() != Some(0)
+        || usize::try_from(*raw.edge_offsets.last()?).ok()? != edges
+    {
+        return None;
+    }
+    let frontier_words = states.checked_add(63)?.checked_div(64)?;
+    let stack_limit = edges.checked_add(1)?;
+    let fixed_memory = nfa_exact_product_fixed_memory_bytes(states, stack_limit, frontier_words)?;
+    let mut resources = NfaExactProductResources::new(limits);
+    resources.retain_memory(fixed_memory)?;
+    resources.charge_state(states)?;
+    resources.charge_frontier(frontier_words.checked_add(MAX_NFA_EXACT_PRODUCT_FRONTIERS)?)?;
+
+    let mut seen_generation = Vec::new();
+    seen_generation.try_reserve_exact(states).ok()?;
+    seen_generation.resize(states, 0_u32);
+    let mut stack = Vec::new();
+    stack.try_reserve_exact(stack_limit).ok()?;
+    let mut scratch = Vec::new();
+    scratch.try_reserve_exact(frontier_words).ok()?;
+    scratch.resize(frontier_words, 0_u64);
+    let mut arena: Vec<Vec<u64>> = Vec::new();
+    arena
+        .try_reserve_exact(MAX_NFA_EXACT_PRODUCT_FRONTIERS)
+        .ok()?;
+    let mut current = Vec::new();
+    current
+        .try_reserve_exact(MAX_NFA_EXACT_PRODUCT_FRONTIERS)
+        .ok()?;
+    let mut next = Vec::new();
+    next.try_reserve_exact(MAX_NFA_EXACT_PRODUCT_FRONTIERS)
+        .ok()?;
+    let mut next_seen = Vec::new();
+    next_seen
+        .try_reserve_exact(MAX_NFA_EXACT_PRODUCT_FRONTIERS)
+        .ok()?;
+    next_seen.resize(MAX_NFA_EXACT_PRODUCT_FRONTIERS, 0_u32);
+    let mut generation = 0_u32;
+
+    nfa_exact_product_clear_frontier(&mut scratch, &mut resources)?;
+    stack.push(raw.start);
+    if nfa_exact_product_epsilon_closure(
+        raw,
+        states,
+        stack_limit,
+        &mut stack,
+        &mut seen_generation,
+        &mut generation,
+        &mut scratch,
+        &mut resources,
+    )? || nfa_exact_product_frontier_is_empty(&scratch, &mut resources)?
+    {
+        return None;
+    }
+    let initial = nfa_exact_product_intern_frontier(&mut arena, &scratch, &mut resources)?;
+    current.push(initial);
+
+    for (depth, expected) in sets.iter().copied().enumerate() {
+        let final_depth = depth.checked_add(1)? == sets.len();
+        let next_generation = u32::try_from(depth.checked_add(1)?).ok()?;
+        next.clear();
+        for &frontier_index in &current {
+            for byte in u8::MIN..=u8::MAX {
+                resources.charge_byte(1)?;
+                resources.charge_frontier(arena.get(frontier_index)?.len())?;
+                stack.clear();
+                {
+                    let frontier = arena.get(frontier_index)?;
+                    for (word_index, &word) in frontier.iter().enumerate() {
+                        let mut members = word;
+                        while members != 0 {
+                            resources.charge_state(1)?;
+                            let bit = usize::try_from(members.trailing_zeros()).ok()?;
+                            members &= members.checked_sub(1)?;
+                            let state = word_index.checked_mul(64)?.checked_add(bit)?;
+                            if raw.roles.get(state) != Some(&StateRole::Consume) {
+                                return None;
+                            }
+                            for edge in nfa_exact_product_state_edges(raw, state)? {
+                                resources.charge_edge(1)?;
+                                if raw.edge_kinds.get(edge) != Some(&EdgeKind::ByteRange) {
+                                    return None;
+                                }
+                                let (&range_start, &range_end, &target) = (
+                                    raw.byte_starts.get(edge)?,
+                                    raw.byte_ends.get(edge)?,
+                                    raw.edge_targets.get(edge)?,
+                                );
+                                if range_start > range_end
+                                    || usize::try_from(target)
+                                        .map_or(true, |target| target >= states)
+                                {
+                                    return None;
+                                }
+                                if range_start <= byte && byte <= range_end {
+                                    if stack.len() >= stack_limit {
+                                        return None;
+                                    }
+                                    stack.push(target);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let structural_member = !stack.is_empty();
+                if structural_member != expected.contains(byte) {
+                    return None;
+                }
+                if !structural_member {
+                    continue;
+                }
+                nfa_exact_product_clear_frontier(&mut scratch, &mut resources)?;
+                let accepting = nfa_exact_product_epsilon_closure(
+                    raw,
+                    states,
+                    stack_limit,
+                    &mut stack,
+                    &mut seen_generation,
+                    &mut generation,
+                    &mut scratch,
+                    &mut resources,
+                )?;
+                if final_depth {
+                    if !accepting {
+                        return None;
+                    }
+                    continue;
+                }
+                if accepting || nfa_exact_product_frontier_is_empty(&scratch, &mut resources)? {
+                    return None;
+                }
+                let target =
+                    nfa_exact_product_intern_frontier(&mut arena, &scratch, &mut resources)?;
+                let mark = next_seen.get_mut(target)?;
+                resources.charge_frontier(1)?;
+                if *mark != next_generation {
+                    *mark = next_generation;
+                    next.push(target);
+                }
+            }
+        }
+        if final_depth {
+            return Some(resources.stats);
+        }
+        if next.is_empty() {
+            return None;
+        }
+        core::mem::swap(&mut current, &mut next);
+    }
+    None
+}
+
+fn nfa_prefix_is_exact_product(raw: &RawPlan, sets: &[AnchoredByteSet]) -> bool {
+    nfa_prefix_exact_product_proof(raw, sets, NfaExactProductLimits::default()).is_some()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4838,6 +5084,25 @@ mod tests {
         .expect("compile")
     }
 
+    fn raw_program(
+        raw: &RawPlan,
+        output: OutputContract,
+        mode: CompileMode,
+        determinize: DeterminizeLimits,
+    ) -> CompiledProgram {
+        let automaton = Automaton::from_raw(raw.clone(), CompileLimits::default())
+            .expect("validate test graph");
+        CompiledProgram::build(
+            raw.clone(),
+            automaton,
+            output,
+            mode,
+            determinize,
+            usize::MAX,
+        )
+        .expect("compile test graph")
+    }
+
     fn generated_byte_strings(alphabet: &[u8], max_len: usize) -> Vec<Vec<u8>> {
         fn extend(
             strings: &mut Vec<Vec<u8>>,
@@ -4859,6 +5124,85 @@ mod tests {
         let mut strings = Vec::new();
         extend(&mut strings, &mut Vec::new(), alphabet, max_len);
         strings
+    }
+
+    fn assert_exact_product_matches_fast_for_every_window(
+        pattern: &str,
+        alphabet: &[u8],
+        max_len: usize,
+        expected_primary_offset: Option<u8>,
+    ) {
+        let fallback_limits = DeterminizeLimits {
+            max_states: 0,
+            ..DeterminizeLimits::default()
+        };
+        let haystacks = generated_byte_strings(alphabet, max_len);
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let accelerated = program(pattern, output, CompileMode::Optimizing, fallback_limits);
+            let product = accelerated
+                .nfa_mandatory_cut
+                .as_ref()
+                .and_then(NfaMandatoryCut::exact_product)
+                .unwrap_or_else(|| panic!("expected exact product for {pattern}/{output:?}"));
+            if let Some(expected) = expected_primary_offset {
+                assert_eq!(product.primary_offset, expected, "{pattern}/{output:?}");
+            }
+            let serialized = accelerated.serialize().expect("serialize exact product");
+            assert_eq!(serialized[15], PROGRAM_FLAG_NFA_EXACT_PRODUCT);
+            let restored = CompiledProgram::deserialize(&serialized)
+                .expect("deserialize frontier exact product");
+            assert_eq!(restored.serialize().unwrap(), serialized);
+            assert!(
+                restored
+                    .nfa_mandatory_cut
+                    .as_ref()
+                    .and_then(NfaMandatoryCut::exact_product)
+                    .is_some()
+            );
+            let reference = program(
+                pattern,
+                output,
+                CompileMode::Fast,
+                DeterminizeLimits::default(),
+            );
+            let mut accelerated_workspace = accelerated.prepare_workspace().unwrap();
+            let mut restored_workspace = restored.prepare_workspace().unwrap();
+            let mut reference_workspace = reference.prepare_workspace().unwrap();
+            assert!(accelerated_workspace.nfa.is_none());
+            assert!(restored_workspace.nfa.is_none());
+            for haystack in &haystacks {
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        let expected = reference
+                            .search_with_workspace(haystack, window, &mut reference_workspace)
+                            .unwrap();
+                        assert_eq!(
+                            accelerated
+                                .search_with_workspace(
+                                    haystack,
+                                    window,
+                                    &mut accelerated_workspace,
+                                )
+                                .unwrap(),
+                            expected,
+                            "fresh {pattern}/{output:?}/{haystack:?}/{start}..{end}"
+                        );
+                        assert_eq!(
+                            restored
+                                .search_with_workspace(haystack, window, &mut restored_workspace)
+                                .unwrap(),
+                            expected,
+                            "wire {pattern}/{output:?}/{haystack:?}/{start}..{end}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -5057,6 +5401,249 @@ mod tests {
                 .as_ref()
                 .and_then(NfaMandatoryCut::exact_product)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn frontier_exact_products_admit_equivalent_branches_and_preserve_every_contract() {
+        for (pattern, alphabet, maximum, primary_offset) in [
+            ("(?:ab|cb)", b"abcx".as_slice(), 4, Some(1_u8)),
+            ("(?:ab|ac)", b"abcx".as_slice(), 4, Some(0_u8)),
+            ("(?:ab|cb)(?:d|e)", b"abcde".as_slice(), 4, Some(1_u8)),
+            ("[ab]x", b"abxy".as_slice(), 3, Some(1_u8)),
+            ("[ab][01]Z", b"ab01Zx".as_slice(), 3, Some(2_u8)),
+        ] {
+            assert_exact_product_matches_fast_for_every_window(
+                pattern,
+                alphabet,
+                maximum,
+                primary_offset,
+            );
+        }
+
+        let fallback_limits = DeterminizeLimits {
+            max_states: 0,
+            ..DeterminizeLimits::default()
+        };
+        for pattern in ["(?:ab|cd)", "a|ab", "a[0-2]+Z"] {
+            let compiled = program(
+                pattern,
+                OutputContract::Span,
+                CompileMode::Optimizing,
+                fallback_limits,
+            );
+            assert!(
+                compiled
+                    .nfa_mandatory_cut
+                    .as_ref()
+                    .and_then(NfaMandatoryCut::exact_product)
+                    .is_none(),
+                "correlated, early-accepting, or variable graph must decline: {pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn frontier_exact_product_proof_resource_ceilings_are_exact_and_transactional() {
+        let compiled = program(
+            "(?:ab|cb)",
+            OutputContract::Span,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        assert_eq!(compiled.exact_match_width, Some(2));
+        let sets = compiled.anchored_prefix.sets();
+        let stats =
+            nfa_prefix_exact_product_proof(&compiled.raw, sets, NfaExactProductLimits::default())
+                .expect("equivalent duplicated branches form a complete product");
+        assert!(stats.state_work > 0);
+        assert!(stats.edge_work > 0);
+        assert!(stats.byte_work > 0);
+        assert!(stats.frontier_work > 0);
+        assert!(stats.frontiers > 1);
+        assert!(stats.memory_bytes > 0);
+
+        let exact = NfaExactProductLimits {
+            max_state_work: stats.state_work,
+            max_edge_work: stats.edge_work,
+            max_byte_work: stats.byte_work,
+            max_frontier_work: stats.frontier_work,
+            max_frontiers: stats.frontiers,
+            max_memory_bytes: stats.memory_bytes,
+        };
+        assert_eq!(
+            nfa_prefix_exact_product_proof(&compiled.raw, sets, exact),
+            Some(stats),
+            "every exact ceiling must admit the identical receipt"
+        );
+
+        let one_below_state = NfaExactProductLimits {
+            max_state_work: stats.state_work - 1,
+            ..exact
+        };
+        let one_below_edge = NfaExactProductLimits {
+            max_edge_work: stats.edge_work - 1,
+            ..exact
+        };
+        let one_below_byte = NfaExactProductLimits {
+            max_byte_work: stats.byte_work - 1,
+            ..exact
+        };
+        let one_below_frontier_work = NfaExactProductLimits {
+            max_frontier_work: stats.frontier_work - 1,
+            ..exact
+        };
+        let one_below_frontiers = NfaExactProductLimits {
+            max_frontiers: stats.frontiers - 1,
+            ..exact
+        };
+        let one_below_memory = NfaExactProductLimits {
+            max_memory_bytes: stats.memory_bytes - 1,
+            ..exact
+        };
+        for (name, limits) in [
+            ("state work", one_below_state),
+            ("edge work", one_below_edge),
+            ("byte work", one_below_byte),
+            ("frontier work", one_below_frontier_work),
+            ("frontiers", one_below_frontiers),
+            ("memory", one_below_memory),
+        ] {
+            assert_eq!(
+                nfa_prefix_exact_product_proof(&compiled.raw, sets, limits),
+                None,
+                "one-below {name} must decline without a partial proof"
+            );
+        }
+    }
+
+    #[test]
+    fn frontier_exact_product_handles_epsilon_cycles_without_losing_bounds() {
+        let raw = RawPlan {
+            start: 0,
+            roles: vec![StateRole::Split, StateRole::Consume, StateRole::Accept],
+            edge_offsets: vec![0, 2, 3, 3],
+            edge_targets: vec![0, 1, 2],
+            edge_kinds: vec![EdgeKind::Epsilon, EdgeKind::Epsilon, EdgeKind::ByteRange],
+            byte_starts: vec![0, 0, b'a'],
+            byte_ends: vec![0, 0, b'a'],
+        };
+        let fallback_limits = DeterminizeLimits {
+            max_states: 0,
+            ..DeterminizeLimits::default()
+        };
+        let haystacks = generated_byte_strings(b"ax", 3);
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let accelerated = raw_program(&raw, output, CompileMode::Optimizing, fallback_limits);
+            assert!(
+                accelerated
+                    .nfa_mandatory_cut
+                    .as_ref()
+                    .and_then(NfaMandatoryCut::exact_product)
+                    .is_some()
+            );
+            let serialized = accelerated.serialize().unwrap();
+            let restored = CompiledProgram::deserialize(&serialized).unwrap();
+            let reference = raw_program(
+                &raw,
+                output,
+                CompileMode::Fast,
+                DeterminizeLimits::default(),
+            );
+            let mut accelerated_workspace = accelerated.prepare_workspace().unwrap();
+            let mut restored_workspace = restored.prepare_workspace().unwrap();
+            let mut reference_workspace = reference.prepare_workspace().unwrap();
+            for haystack in &haystacks {
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        let expected = reference
+                            .search_with_workspace(haystack, window, &mut reference_workspace)
+                            .unwrap();
+                        assert_eq!(
+                            accelerated
+                                .search_with_workspace(
+                                    haystack,
+                                    window,
+                                    &mut accelerated_workspace,
+                                )
+                                .unwrap(),
+                            expected
+                        );
+                        assert_eq!(
+                            restored
+                                .search_with_workspace(haystack, window, &mut restored_workspace)
+                                .unwrap(),
+                            expected
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn frontier_exact_product_distinguishes_target_mismatch_from_correlation() {
+        let branch_graph = |right_second: u8| RawPlan {
+            start: 0,
+            roles: vec![
+                StateRole::Split,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Accept,
+            ],
+            edge_offsets: vec![0, 2, 3, 4, 5, 6, 6],
+            // The first bytes deliberately reach different raw target IDs.
+            edge_targets: vec![1, 2, 3, 4, 5, 5],
+            edge_kinds: vec![
+                EdgeKind::Epsilon,
+                EdgeKind::Epsilon,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+            ],
+            byte_starts: vec![0, 0, b'a', b'c', b'b', right_second],
+            byte_ends: vec![0, 0, b'a', b'c', b'b', right_second],
+        };
+        let fallback_limits = DeterminizeLimits {
+            max_states: 0,
+            ..DeterminizeLimits::default()
+        };
+        let equivalent = raw_program(
+            &branch_graph(b'b'),
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            fallback_limits,
+        );
+        assert!(
+            equivalent
+                .nfa_mandatory_cut
+                .as_ref()
+                .and_then(NfaMandatoryCut::exact_product)
+                .is_some(),
+            "different raw targets with the same next-byte frontier are one product"
+        );
+
+        let correlated = raw_program(
+            &branch_graph(b'd'),
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            fallback_limits,
+        );
+        assert!(
+            correlated
+                .nfa_mandatory_cut
+                .as_ref()
+                .and_then(NfaMandatoryCut::exact_product)
+                .is_none(),
+            "frontiers admitting only b or only d must not become [bd]"
         );
     }
 
