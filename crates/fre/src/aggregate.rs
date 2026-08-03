@@ -18687,6 +18687,83 @@ impl AggregatePlan {
         }
     }
 
+    #[cold]
+    #[inline(never)]
+    fn replay_ascii_word_run_count_value(
+        &self,
+        engine: &unicode_word_run::AsciiPlan,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<u64, AggregateExecutionError> {
+        match engine.aggregate_count(haystack, limits.word_run) {
+            Err(source) => Err(self.direct_execution_error(
+                haystack.len(),
+                limits,
+                AggregateExecutionSource::WordRun(source),
+            )),
+            Ok(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "compact ASCII word-run count refusal did not reproduce during authenticated replay",
+                ),
+            )),
+        }
+    }
+
+    #[inline(never)]
+    fn execute_ascii_word_run_count_value(
+        &self,
+        engine: &unicode_word_run::AsciiPlan,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<u64, AggregateExecutionError> {
+        engine
+            .aggregate_count_value_success(haystack, limits.word_run)
+            .map_or_else(
+                || self.replay_ascii_word_run_count_value(engine, haystack, limits),
+                Ok,
+            )
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn replay_fixed_chunk_word_run_count_value(
+        &self,
+        engine: &unicode_word_run::Plan,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<u64, AggregateExecutionError> {
+        match engine.aggregate_count(haystack, limits.word_run) {
+            Err(source) => Err(self.direct_execution_error(
+                haystack.len(),
+                limits,
+                AggregateExecutionSource::WordRun(source),
+            )),
+            Ok(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "compact fixed-chunk word-run count refusal did not reproduce during authenticated replay",
+                ),
+            )),
+        }
+    }
+
+    #[inline(never)]
+    fn execute_fixed_chunk_word_run_count_value(
+        &self,
+        engine: &unicode_word_run::Plan,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<u64, AggregateExecutionError> {
+        debug_assert!(engine.is_fixed_class_chunks());
+        engine
+            .aggregate_fixed_chunk_count_value_success(haystack, limits.word_run)
+            .map_or_else(
+                || self.replay_fixed_chunk_word_run_count_value(engine, haystack, limits),
+                Ok,
+            )
+    }
+
     // Keep the entry dispatcher as a small route selector. In particular,
     // direct Unicode count plans should not inherit stack probes or code
     // placement from receipt-heavy fallback routes.
@@ -18726,6 +18803,12 @@ impl AggregatePlan {
             }
             AggregateEngine::BoundedSeparatedFields(engine) => {
                 self.execute_bounded_separated_fields_count_value(engine, haystack, limits)
+            }
+            AggregateEngine::AsciiWordRun(engine) => {
+                self.execute_ascii_word_run_count_value(engine, haystack, limits)
+            }
+            AggregateEngine::WordRun(engine) if engine.is_fixed_class_chunks() => {
+                self.execute_fixed_chunk_word_run_count_value(engine, haystack, limits)
             }
             _ => self.execute_count_value_fallback(haystack, limits),
         }
@@ -18818,16 +18901,9 @@ impl AggregatePlan {
                         AggregateExecutionSource::WordRun(source),
                     )
                 }),
-            AggregateEngine::AsciiWordRun(engine) => engine
-                .aggregate_count(haystack, limits.word_run)
-                .map(|result| result.count)
-                .map_err(|source| {
-                    self.direct_execution_error(
-                        haystack.len(),
-                        limits,
-                        AggregateExecutionSource::WordRun(source),
-                    )
-                }),
+            AggregateEngine::AsciiWordRun(engine) => {
+                self.execute_ascii_word_run_count_value(engine, haystack, limits)
+            }
             AggregateEngine::LiteralAssertions(engine) => engine
                 .count(haystack, limits.literal_assertions)
                 .map(|result| result.count)
@@ -19339,6 +19415,83 @@ impl AggregatePlan {
         }
     }
 
+    #[cold]
+    #[inline(never)]
+    fn replay_ascii_word_run_span_sum_value(
+        &self,
+        engine: &unicode_word_run::AsciiPlan,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<u64, AggregateExecutionError> {
+        match engine.aggregate_span_sum(haystack, limits.word_run) {
+            Err(source) => Err(self.direct_execution_error(
+                haystack.len(),
+                limits,
+                AggregateExecutionSource::WordRun(source),
+            )),
+            Ok(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "compact ASCII word-run span-sum refusal did not reproduce during authenticated replay",
+                ),
+            )),
+        }
+    }
+
+    #[inline(never)]
+    fn execute_ascii_word_run_span_sum_value(
+        &self,
+        engine: &unicode_word_run::AsciiPlan,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<u64, AggregateExecutionError> {
+        engine
+            .aggregate_span_sum_value_success(haystack, limits.word_run)
+            .map_or_else(
+                || self.replay_ascii_word_run_span_sum_value(engine, haystack, limits),
+                Ok,
+            )
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn replay_fixed_chunk_word_run_span_sum_value(
+        &self,
+        engine: &unicode_word_run::Plan,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<u64, AggregateExecutionError> {
+        match engine.aggregate_span_sum(haystack, limits.word_run) {
+            Err(source) => Err(self.direct_execution_error(
+                haystack.len(),
+                limits,
+                AggregateExecutionSource::WordRun(source),
+            )),
+            Ok(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "compact fixed-chunk word-run span-sum refusal did not reproduce during authenticated replay",
+                ),
+            )),
+        }
+    }
+
+    #[inline(never)]
+    fn execute_fixed_chunk_word_run_span_sum_value(
+        &self,
+        engine: &unicode_word_run::Plan,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<u64, AggregateExecutionError> {
+        debug_assert!(engine.is_fixed_class_chunks());
+        engine
+            .aggregate_fixed_chunk_span_sum_value_success(haystack, limits.word_run)
+            .map_or_else(
+                || self.replay_fixed_chunk_word_run_span_sum_value(engine, haystack, limits),
+                Ok,
+            )
+    }
+
     // Keep the entry dispatcher as a small route selector. In particular,
     // direct Unicode span-sum plans should not inherit stack probes or code
     // placement from receipt-heavy fallback routes.
@@ -19375,6 +19528,12 @@ impl AggregatePlan {
             }
             AggregateEngine::FixedPredicateWord64(engine) => {
                 self.execute_fixed_predicate_span_sum_value(engine, haystack, limits)
+            }
+            AggregateEngine::AsciiWordRun(engine) => {
+                self.execute_ascii_word_run_span_sum_value(engine, haystack, limits)
+            }
+            AggregateEngine::WordRun(engine) if engine.is_fixed_class_chunks() => {
+                self.execute_fixed_chunk_word_run_span_sum_value(engine, haystack, limits)
             }
             _ => self.execute_span_sum_value_fallback(haystack, limits),
         }
@@ -19467,16 +19626,9 @@ impl AggregatePlan {
                         AggregateExecutionSource::WordRun(source),
                     )
                 }),
-            AggregateEngine::AsciiWordRun(engine) => engine
-                .aggregate_span_sum(haystack, limits.word_run)
-                .map(|result| result.span_sum)
-                .map_err(|source| {
-                    self.direct_execution_error(
-                        haystack.len(),
-                        limits,
-                        AggregateExecutionSource::WordRun(source),
-                    )
-                }),
+            AggregateEngine::AsciiWordRun(engine) => {
+                self.execute_ascii_word_run_span_sum_value(engine, haystack, limits)
+            }
             AggregateEngine::LiteralAssertions(engine) => engine
                 .span_sum(haystack, limits.literal_assertions)
                 .map(|result| result.span_sum)

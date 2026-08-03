@@ -514,6 +514,28 @@ impl AsciiPlan {
         )
     }
 
+    /// Return only a successfully admitted count without materializing exact
+    /// execution accounting.
+    ///
+    /// `None` deliberately carries no terminal error. A caller that publishes
+    /// errors must replay [`Self::aggregate_count`] with the same arguments.
+    #[must_use]
+    #[inline]
+    pub(crate) fn aggregate_count_value_success(
+        &self,
+        haystack: &[u8],
+        limits: AggregateReduceLimits,
+    ) -> Option<u64> {
+        self.owner()
+            .plan
+            .aggregate_count_value_success_with_ascii_scanner(
+                haystack,
+                limits,
+                self.run_scanner(),
+                Self::persistent_bytes(),
+            )
+    }
+
     pub(crate) fn aggregate_span_sum(
         &self,
         haystack: &[u8],
@@ -525,6 +547,28 @@ impl AsciiPlan {
             self.run_scanner(),
             Self::persistent_bytes(),
         )
+    }
+
+    /// Return only a successfully admitted span sum without materializing
+    /// exact execution accounting.
+    ///
+    /// `None` deliberately carries no terminal error. A caller that publishes
+    /// errors must replay [`Self::aggregate_span_sum`] with the same arguments.
+    #[must_use]
+    #[inline]
+    pub(crate) fn aggregate_span_sum_value_success(
+        &self,
+        haystack: &[u8],
+        limits: AggregateReduceLimits,
+    ) -> Option<u64> {
+        self.owner()
+            .plan
+            .aggregate_span_sum_value_success_with_ascii_scanner(
+                haystack,
+                limits,
+                self.run_scanner(),
+                Self::persistent_bytes(),
+            )
     }
 
     pub(crate) fn find_window(
@@ -589,6 +633,10 @@ impl Plan {
                 ..
             }
         )
+    }
+
+    pub(crate) const fn is_fixed_class_chunks(self) -> bool {
+        matches!(self, Self::FixedClassChunks { .. })
     }
 
     pub(crate) const fn portable_build_work(self) -> usize {
@@ -803,6 +851,30 @@ impl Plan {
         })
     }
 
+    /// Return only a successfully admitted fixed-width byte-class chunk count
+    /// without materializing exact execution accounting.
+    ///
+    /// `None` deliberately carries no terminal error. A caller that publishes
+    /// errors must replay [`Self::aggregate_count`] with the same arguments.
+    #[must_use]
+    #[inline]
+    pub(crate) fn aggregate_fixed_chunk_count_value_success(
+        self,
+        haystack: &[u8],
+        limits: AggregateReduceLimits,
+    ) -> Option<u64> {
+        debug_assert!(self.is_fixed_class_chunks());
+        let upper = self
+            .aggregate_preflight(
+                haystack.len(),
+                AggregateOperation::Count,
+                limits,
+                core::mem::size_of::<Self>(),
+            )
+            .ok()?;
+        self.aggregate_scan_fixed_chunk_count_value(haystack, upper)
+    }
+
     pub(crate) fn aggregate_span_sum(
         self,
         haystack: &[u8],
@@ -823,6 +895,30 @@ impl Plan {
                 actual,
             },
         })
+    }
+
+    /// Return only a successfully admitted fixed-width byte-class chunk span
+    /// sum without materializing exact execution accounting.
+    ///
+    /// `None` deliberately carries no terminal error. A caller that publishes
+    /// errors must replay [`Self::aggregate_span_sum`] with the same arguments.
+    #[must_use]
+    #[inline]
+    pub(crate) fn aggregate_fixed_chunk_span_sum_value_success(
+        self,
+        haystack: &[u8],
+        limits: AggregateReduceLimits,
+    ) -> Option<u64> {
+        debug_assert!(self.is_fixed_class_chunks());
+        let upper = self
+            .aggregate_preflight(
+                haystack.len(),
+                AggregateOperation::SpanSum,
+                limits,
+                core::mem::size_of::<Self>(),
+            )
+            .ok()?;
+        self.aggregate_scan_fixed_chunk_span_sum_value(haystack, upper)
     }
 
     fn aggregate_count_with_ascii_scanner(
@@ -850,6 +946,25 @@ impl Plan {
         })
     }
 
+    #[inline]
+    fn aggregate_count_value_success_with_ascii_scanner(
+        self,
+        haystack: &[u8],
+        limits: AggregateReduceLimits,
+        scanner: &AsciiByteSetRunScanner,
+        persistent_bytes: usize,
+    ) -> Option<u64> {
+        let upper = self
+            .aggregate_preflight(
+                haystack.len(),
+                AggregateOperation::Count,
+                limits,
+                persistent_bytes,
+            )
+            .ok()?;
+        self.aggregate_scan_ascii_count_value(haystack, upper, scanner)
+    }
+
     fn aggregate_span_sum_with_ascii_scanner(
         self,
         haystack: &[u8],
@@ -873,6 +988,25 @@ impl Plan {
                 actual,
             },
         })
+    }
+
+    #[inline]
+    fn aggregate_span_sum_value_success_with_ascii_scanner(
+        self,
+        haystack: &[u8],
+        limits: AggregateReduceLimits,
+        scanner: &AsciiByteSetRunScanner,
+        persistent_bytes: usize,
+    ) -> Option<u64> {
+        let upper = self
+            .aggregate_preflight(
+                haystack.len(),
+                AggregateOperation::SpanSum,
+                limits,
+                persistent_bytes,
+            )
+            .ok()?;
+        self.aggregate_scan_ascii_span_sum_value(haystack, upper, scanner)
     }
 
     fn aggregate_preflight(
@@ -1054,6 +1188,164 @@ impl Plan {
         }
         verify_aggregate_actual(actual, upper)?;
         Ok(actual)
+    }
+
+    #[inline]
+    fn aggregate_scan_ascii_count_value(
+        self,
+        haystack: &[u8],
+        upper: AggregateReduceUpperBounds,
+        scanner: &AsciiByteSetRunScanner,
+    ) -> Option<u64> {
+        debug_assert!(self.is_ascii_word());
+        let minimum_scalars = self.word_minimum_scalars();
+        let mut count = 0_u64;
+        let mut position = 0_usize;
+        while position < haystack.len() {
+            if !is_ascii_word(haystack[position]) {
+                position = position.checked_add(1)?;
+                continue;
+            }
+            let run = scanner.scan_forward(&haystack[position..]).member_run_len();
+            if run == 0 {
+                return None;
+            }
+            let end = position.checked_add(run)?;
+            if end > haystack.len() {
+                return None;
+            }
+            if run >= minimum_scalars {
+                count = count.checked_add(1)?;
+            }
+            position = end;
+        }
+        (count <= upper.count).then_some(count)
+    }
+
+    #[inline]
+    fn aggregate_scan_fixed_chunk_count_value(
+        self,
+        haystack: &[u8],
+        upper: AggregateReduceUpperBounds,
+    ) -> Option<u64> {
+        let Self::FixedClassChunks {
+            chunk_bytes,
+            class_words,
+        } = self
+        else {
+            return None;
+        };
+        let mut count = 0_u64;
+        let mut position = 0_usize;
+        let mut run_bytes = 0_usize;
+        while position < haystack.len() {
+            if class_contains(class_words, haystack[position]) {
+                run_bytes = run_bytes.checked_add(1)?;
+            } else if run_bytes != 0 {
+                let matches = run_bytes.checked_div(chunk_bytes)?;
+                count = count.checked_add(u64::try_from(matches).ok()?)?;
+                run_bytes = 0;
+            }
+            position = position.checked_add(1)?;
+        }
+        if run_bytes != 0 {
+            let matches = run_bytes.checked_div(chunk_bytes)?;
+            count = count.checked_add(u64::try_from(matches).ok()?)?;
+        }
+        (count <= upper.count).then_some(count)
+    }
+
+    #[inline]
+    fn aggregate_scan_ascii_span_sum_value(
+        self,
+        haystack: &[u8],
+        upper: AggregateReduceUpperBounds,
+        scanner: &AsciiByteSetRunScanner,
+    ) -> Option<u64> {
+        debug_assert!(self.is_ascii_word());
+        let minimum_scalars = self.word_minimum_scalars();
+        let mut count = 0_u64;
+        let mut span_sum = 0_u64;
+        let mut position = 0_usize;
+        while position < haystack.len() {
+            if !is_ascii_word(haystack[position]) {
+                position = position.checked_add(1)?;
+                continue;
+            }
+            let run = scanner.scan_forward(&haystack[position..]).member_run_len();
+            if run == 0 {
+                return None;
+            }
+            let end = position.checked_add(run)?;
+            if end > haystack.len() {
+                return None;
+            }
+            if run >= minimum_scalars {
+                count = count.checked_add(1)?;
+                span_sum = span_sum.checked_add(u64::try_from(run).ok()?)?;
+            }
+            position = end;
+        }
+        (count <= upper.count && span_sum <= upper.span_sum).then_some(span_sum)
+    }
+
+    #[inline]
+    fn aggregate_scan_fixed_chunk_span_sum_value(
+        self,
+        haystack: &[u8],
+        upper: AggregateReduceUpperBounds,
+    ) -> Option<u64> {
+        let Self::FixedClassChunks {
+            chunk_bytes,
+            class_words,
+        } = self
+        else {
+            return None;
+        };
+        let mut count = 0_u64;
+        let mut span_sum = 0_u64;
+        let mut position = 0_usize;
+        let mut run_bytes = 0_usize;
+        while position < haystack.len() {
+            if class_contains(class_words, haystack[position]) {
+                run_bytes = run_bytes.checked_add(1)?;
+            } else if run_bytes != 0 {
+                Self::aggregate_add_fixed_chunk_span_sum_value(
+                    chunk_bytes,
+                    run_bytes,
+                    &mut count,
+                    &mut span_sum,
+                )?;
+                run_bytes = 0;
+            }
+            position = position.checked_add(1)?;
+        }
+        if run_bytes != 0 {
+            Self::aggregate_add_fixed_chunk_span_sum_value(
+                chunk_bytes,
+                run_bytes,
+                &mut count,
+                &mut span_sum,
+            )?;
+        }
+        (count <= upper.count && span_sum <= upper.span_sum).then_some(span_sum)
+    }
+
+    #[inline]
+    fn aggregate_add_fixed_chunk_span_sum_value(
+        chunk_bytes: usize,
+        run_bytes: usize,
+        count: &mut u64,
+        span_sum: &mut u64,
+    ) -> Option<()> {
+        let matches = run_bytes.checked_div(chunk_bytes)?;
+        if matches == 0 {
+            return Some(());
+        }
+        *count = (*count).checked_add(u64::try_from(matches).ok()?)?;
+        let width = matches.checked_mul(chunk_bytes)?;
+        *span_sum = (*span_sum).checked_add(u64::try_from(width).ok()?)?;
+        Some(())
     }
 
     fn aggregate_finish_run(
@@ -2008,8 +2300,8 @@ mod tests {
     use super::{
         ASCII_RUN_SCANNER_BUILD_WORK, AggregateBuildAccounting, AggregateBuildLimits,
         AggregateInspectionError, AggregateInspectionOutcome, AggregateOperationIdentity,
-        AggregateReduceLimits, AsciiPlan, AsciiPlanOwner, FIXED_BUILD_WORK, Plan, WordMode,
-        WordRunTopology, aggregate_build_accounting_matches, ascii_word_set,
+        AggregateReduceError, AggregateReduceLimits, AsciiPlan, AsciiPlanOwner, FIXED_BUILD_WORK,
+        Plan, WordMode, WordRunTopology, aggregate_build_accounting_matches, ascii_word_set,
         inspect_aggregate_attempt,
     };
     use crate::{SearchLimits, SearchWindow};
@@ -2058,10 +2350,148 @@ mod tests {
             .aggregate_span_sum(haystack, AggregateReduceLimits::unlimited())
             .expect("span sum");
         assert_eq!((counted.count, summed.span_sum), expected, "{haystack:?}");
+        if plan.is_fixed_class_chunks() {
+            assert_eq!(
+                plan.aggregate_fixed_chunk_count_value_success(
+                    haystack,
+                    AggregateReduceLimits::unlimited(),
+                ),
+                Some(expected.0),
+                "compact fixed-chunk count {haystack:?}",
+            );
+            assert_eq!(
+                plan.aggregate_fixed_chunk_span_sum_value_success(
+                    haystack,
+                    AggregateReduceLimits::unlimited(),
+                ),
+                Some(expected.1),
+                "compact fixed-chunk span sum {haystack:?}",
+            );
+        }
         assert_eq!(counted.accounting.actual.source_reads, haystack.len());
         assert_eq!(summed.accounting.actual.source_reads, haystack.len());
         assert_eq!(counted.accounting.actual.scratch_bytes, 0);
         assert_eq!(summed.accounting.actual.scratch_bytes, 0);
+    }
+
+    fn assert_fixed_chunk_compact_count_limit_parity(plan: Plan, haystack: &[u8]) {
+        let baseline = plan
+            .aggregate_count(haystack, AggregateReduceLimits::unlimited())
+            .expect("unlimited fixed-chunk count");
+        let upper = baseline.accounting.upper_bounds;
+        let exact = AggregateReduceLimits {
+            max_input_bytes: upper.input_bytes,
+            max_source_reads: upper.source_reads,
+            max_work: upper.work,
+            max_unit_events: upper.unit_events,
+            max_run_events: upper.run_events,
+            max_match_events: upper.match_events,
+            max_count: upper.count,
+            max_span_sum: upper.span_sum,
+            max_scratch_bytes: upper.scratch_bytes,
+            max_persistent_bytes: upper.persistent_bytes,
+            max_peak_bytes: upper.peak_bytes,
+        };
+        assert_eq!(
+            plan.aggregate_fixed_chunk_count_value_success(haystack, exact),
+            Some(baseline.count),
+        );
+
+        macro_rules! one_below {
+            ($upper_field:ident, $limit_field:ident, $error:ident) => {
+                if upper.$upper_field > 0 {
+                    let mut limits = AggregateReduceLimits::unlimited();
+                    limits.$limit_field = upper.$upper_field - 1;
+                    assert_eq!(
+                        plan.aggregate_fixed_chunk_count_value_success(haystack, limits),
+                        None,
+                        "compact fixed-chunk count one-below {}",
+                        stringify!($limit_field),
+                    );
+                    assert_eq!(
+                        plan.aggregate_count(haystack, limits)
+                            .expect_err("one-below fixed-chunk count limit"),
+                        AggregateReduceError::$error {
+                            needed: upper.$upper_field,
+                            limit: upper.$upper_field - 1,
+                        },
+                        "authoritative fixed-chunk count one-below {}",
+                        stringify!($limit_field),
+                    );
+                }
+            };
+        }
+        one_below!(input_bytes, max_input_bytes, InputBytesLimit);
+        one_below!(source_reads, max_source_reads, SourceReadsLimit);
+        one_below!(work, max_work, WorkLimit);
+        one_below!(unit_events, max_unit_events, UnitEventsLimit);
+        one_below!(run_events, max_run_events, RunEventsLimit);
+        one_below!(match_events, max_match_events, MatchEventsLimit);
+        one_below!(count, max_count, CountLimit);
+        one_below!(span_sum, max_span_sum, SpanSumLimit);
+        one_below!(scratch_bytes, max_scratch_bytes, ScratchLimit);
+        one_below!(persistent_bytes, max_persistent_bytes, PersistentLimit);
+        one_below!(peak_bytes, max_peak_bytes, PeakLimit);
+    }
+
+    fn assert_fixed_chunk_compact_span_sum_limit_parity(plan: Plan, haystack: &[u8]) {
+        let baseline = plan
+            .aggregate_span_sum(haystack, AggregateReduceLimits::unlimited())
+            .expect("unlimited fixed-chunk span sum");
+        let upper = baseline.accounting.upper_bounds;
+        let exact = AggregateReduceLimits {
+            max_input_bytes: upper.input_bytes,
+            max_source_reads: upper.source_reads,
+            max_work: upper.work,
+            max_unit_events: upper.unit_events,
+            max_run_events: upper.run_events,
+            max_match_events: upper.match_events,
+            max_count: upper.count,
+            max_span_sum: upper.span_sum,
+            max_scratch_bytes: upper.scratch_bytes,
+            max_persistent_bytes: upper.persistent_bytes,
+            max_peak_bytes: upper.peak_bytes,
+        };
+        assert_eq!(
+            plan.aggregate_fixed_chunk_span_sum_value_success(haystack, exact),
+            Some(baseline.span_sum),
+        );
+
+        macro_rules! one_below {
+            ($upper_field:ident, $limit_field:ident, $error:ident) => {
+                if upper.$upper_field > 0 {
+                    let mut limits = AggregateReduceLimits::unlimited();
+                    limits.$limit_field = upper.$upper_field - 1;
+                    assert_eq!(
+                        plan.aggregate_fixed_chunk_span_sum_value_success(haystack, limits),
+                        None,
+                        "compact fixed-chunk span sum one-below {}",
+                        stringify!($limit_field),
+                    );
+                    assert_eq!(
+                        plan.aggregate_span_sum(haystack, limits)
+                            .expect_err("one-below fixed-chunk span-sum limit"),
+                        AggregateReduceError::$error {
+                            needed: upper.$upper_field,
+                            limit: upper.$upper_field - 1,
+                        },
+                        "authoritative fixed-chunk span sum one-below {}",
+                        stringify!($limit_field),
+                    );
+                }
+            };
+        }
+        one_below!(input_bytes, max_input_bytes, InputBytesLimit);
+        one_below!(source_reads, max_source_reads, SourceReadsLimit);
+        one_below!(work, max_work, WorkLimit);
+        one_below!(unit_events, max_unit_events, UnitEventsLimit);
+        one_below!(run_events, max_run_events, RunEventsLimit);
+        one_below!(match_events, max_match_events, MatchEventsLimit);
+        one_below!(count, max_count, CountLimit);
+        one_below!(span_sum, max_span_sum, SpanSumLimit);
+        one_below!(scratch_bytes, max_scratch_bytes, ScratchLimit);
+        one_below!(persistent_bytes, max_persistent_bytes, PersistentLimit);
+        one_below!(peak_bytes, max_peak_bytes, PeakLimit);
     }
 
     fn assert_build_accounting_closes_every_operation(
@@ -2151,12 +2581,29 @@ mod tests {
     }
 
     #[test]
+    fn compact_fixed_chunk_count_preserves_every_preflight_fence() {
+        assert_fixed_chunk_compact_count_limit_parity(
+            Plan::fixed_class_chunks(3, class_words(&[b'a', b'b', 0xFF])),
+            &[b'a', b'b', 0xFF, b'a', b'x', 0xFF, b'a', b'b', 0xFF],
+        );
+    }
+
+    #[test]
+    fn compact_fixed_chunk_span_sum_preserves_every_preflight_fence() {
+        assert_fixed_chunk_compact_span_sum_limit_parity(
+            Plan::fixed_class_chunks(3, class_words(&[b'a', b'b', 0xFF])),
+            &[b'a', b'b', 0xFF, b'a', b'x', 0xFF, b'a', b'b', 0xFF],
+        );
+    }
+
+    #[test]
     fn bare_ascii_word_runs_exhaust_short_malformed_sources() {
         let cases = [
             (r"\w+", Plan::bare_greedy(1, WordMode::Ascii)),
             (r"\w{2,}", Plan::bare_greedy(2, WordMode::Ascii)),
         ];
         for (pattern, plan) in cases {
+            let auto = AsciiPlan::build_auto(plan).expect("exact ASCII owner");
             for len in 0_u32..=6 {
                 for mut encoded in 0..4_usize.pow(len) {
                     let mut haystack =
@@ -2171,6 +2618,26 @@ mod tests {
                         encoded /= 4;
                     }
                     assert_plan_matches(pattern, plan, &haystack);
+                    assert_eq!(
+                        auto.aggregate_count_value_success(
+                            &haystack,
+                            AggregateReduceLimits::unlimited(),
+                        ),
+                        plan.aggregate_count(&haystack, AggregateReduceLimits::unlimited())
+                            .ok()
+                            .map(|result| result.count),
+                        "compact ASCII count {haystack:?}",
+                    );
+                    assert_eq!(
+                        auto.aggregate_span_sum_value_success(
+                            &haystack,
+                            AggregateReduceLimits::unlimited(),
+                        ),
+                        plan.aggregate_span_sum(&haystack, AggregateReduceLimits::unlimited())
+                            .ok()
+                            .map(|result| result.span_sum),
+                        "compact ASCII span sum {haystack:?}",
+                    );
                 }
             }
         }
@@ -2380,6 +2847,10 @@ mod tests {
                 .aggregate_count(haystack, AggregateReduceLimits::unlimited())
                 .expect("automatic count");
             assert_eq!(auto_count.count, scalar_count.count);
+            assert_eq!(
+                auto.aggregate_count_value_success(haystack, AggregateReduceLimits::unlimited()),
+                Some(scalar_count.count),
+            );
             assert_eq!(auto_count.accounting.actual, scalar_count.accounting.actual);
             assert_eq!(auto_count.accounting.actual.source_reads, haystack.len());
 
@@ -2390,9 +2861,131 @@ mod tests {
                 .aggregate_span_sum(haystack, AggregateReduceLimits::unlimited())
                 .expect("automatic span sum");
             assert_eq!(auto_sum.span_sum, scalar_sum.span_sum);
+            assert_eq!(
+                auto.aggregate_span_sum_value_success(
+                    haystack,
+                    AggregateReduceLimits::unlimited(),
+                ),
+                Some(scalar_sum.span_sum),
+            );
             assert_eq!(auto_sum.accounting.actual, scalar_sum.accounting.actual);
             assert_eq!(auto_sum.accounting.actual.source_reads, haystack.len());
         }
+    }
+
+    #[test]
+    fn ascii_compact_count_preserves_every_preflight_fence() {
+        let plan = AsciiPlan::build_auto(Plan::new(2, WordMode::Ascii)).expect("exact ASCII owner");
+        let haystack = b"--ab--word_7--x--block_crossing_0123456789--";
+        let baseline = plan
+            .aggregate_count(haystack, AggregateReduceLimits::unlimited())
+            .expect("unlimited count");
+        let upper = baseline.accounting.upper_bounds;
+        let exact = AggregateReduceLimits {
+            max_input_bytes: upper.input_bytes,
+            max_source_reads: upper.source_reads,
+            max_work: upper.work,
+            max_unit_events: upper.unit_events,
+            max_run_events: upper.run_events,
+            max_match_events: upper.match_events,
+            max_count: upper.count,
+            max_span_sum: upper.span_sum,
+            max_scratch_bytes: upper.scratch_bytes,
+            max_persistent_bytes: upper.persistent_bytes,
+            max_peak_bytes: upper.peak_bytes,
+        };
+        assert_eq!(
+            plan.aggregate_count_value_success(haystack, exact),
+            Some(baseline.count),
+        );
+
+        macro_rules! one_below {
+            ($upper_field:ident, $limit_field:ident, $error:ident) => {
+                if upper.$upper_field > 0 {
+                    let mut limits = AggregateReduceLimits::unlimited();
+                    limits.$limit_field = upper.$upper_field - 1;
+                    assert_eq!(plan.aggregate_count_value_success(haystack, limits), None);
+                    assert_eq!(
+                        plan.aggregate_count(haystack, limits)
+                            .expect_err("one-below ASCII count limit"),
+                        AggregateReduceError::$error {
+                            needed: upper.$upper_field,
+                            limit: upper.$upper_field - 1,
+                        },
+                    );
+                }
+            };
+        }
+        one_below!(input_bytes, max_input_bytes, InputBytesLimit);
+        one_below!(source_reads, max_source_reads, SourceReadsLimit);
+        one_below!(work, max_work, WorkLimit);
+        one_below!(unit_events, max_unit_events, UnitEventsLimit);
+        one_below!(run_events, max_run_events, RunEventsLimit);
+        one_below!(match_events, max_match_events, MatchEventsLimit);
+        one_below!(count, max_count, CountLimit);
+        one_below!(span_sum, max_span_sum, SpanSumLimit);
+        one_below!(scratch_bytes, max_scratch_bytes, ScratchLimit);
+        one_below!(persistent_bytes, max_persistent_bytes, PersistentLimit);
+        one_below!(peak_bytes, max_peak_bytes, PeakLimit);
+    }
+
+    #[test]
+    fn ascii_compact_span_sum_preserves_every_preflight_fence() {
+        let plan = AsciiPlan::build_auto(Plan::new(2, WordMode::Ascii)).expect("exact ASCII owner");
+        let haystack = b"--ab--word_7--x--block_crossing_0123456789--";
+        let baseline = plan
+            .aggregate_span_sum(haystack, AggregateReduceLimits::unlimited())
+            .expect("unlimited span sum");
+        let upper = baseline.accounting.upper_bounds;
+        let exact = AggregateReduceLimits {
+            max_input_bytes: upper.input_bytes,
+            max_source_reads: upper.source_reads,
+            max_work: upper.work,
+            max_unit_events: upper.unit_events,
+            max_run_events: upper.run_events,
+            max_match_events: upper.match_events,
+            max_count: upper.count,
+            max_span_sum: upper.span_sum,
+            max_scratch_bytes: upper.scratch_bytes,
+            max_persistent_bytes: upper.persistent_bytes,
+            max_peak_bytes: upper.peak_bytes,
+        };
+        assert_eq!(
+            plan.aggregate_span_sum_value_success(haystack, exact),
+            Some(baseline.span_sum),
+        );
+
+        macro_rules! one_below {
+            ($upper_field:ident, $limit_field:ident, $error:ident) => {
+                if upper.$upper_field > 0 {
+                    let mut limits = AggregateReduceLimits::unlimited();
+                    limits.$limit_field = upper.$upper_field - 1;
+                    assert_eq!(
+                        plan.aggregate_span_sum_value_success(haystack, limits),
+                        None,
+                    );
+                    assert_eq!(
+                        plan.aggregate_span_sum(haystack, limits)
+                            .expect_err("one-below ASCII span-sum limit"),
+                        AggregateReduceError::$error {
+                            needed: upper.$upper_field,
+                            limit: upper.$upper_field - 1,
+                        },
+                    );
+                }
+            };
+        }
+        one_below!(input_bytes, max_input_bytes, InputBytesLimit);
+        one_below!(source_reads, max_source_reads, SourceReadsLimit);
+        one_below!(work, max_work, WorkLimit);
+        one_below!(unit_events, max_unit_events, UnitEventsLimit);
+        one_below!(run_events, max_run_events, RunEventsLimit);
+        one_below!(match_events, max_match_events, MatchEventsLimit);
+        one_below!(count, max_count, CountLimit);
+        one_below!(span_sum, max_span_sum, SpanSumLimit);
+        one_below!(scratch_bytes, max_scratch_bytes, ScratchLimit);
+        one_below!(persistent_bytes, max_persistent_bytes, PersistentLimit);
+        one_below!(peak_bytes, max_peak_bytes, PeakLimit);
     }
 
     #[test]

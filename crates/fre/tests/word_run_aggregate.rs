@@ -250,6 +250,242 @@ fn execution_fences_are_exact_and_preflighted() {
     ));
 }
 
+fn assert_count_value_success_and_replay(label: &str, builder: AggregateBuilder, haystack: &[u8]) {
+    let regex = builder.build_count().unwrap();
+    let baseline = regex
+        .count(haystack, AggregateRunLimits::default())
+        .unwrap();
+    assert_eq!(
+        regex
+            .count_value(haystack, AggregateRunLimits::default())
+            .unwrap(),
+        baseline.value(),
+        "count value for {label}",
+    );
+    let AggregateExecutionDetails::WordRun(accounting) = baseline.report().details() else {
+        panic!("{label} executed another family");
+    };
+    let upper = accounting.upper_bounds;
+    let work_refusal = AggregateRunLimits {
+        word_run: WordRunReduceLimits {
+            max_work: upper.work - 1,
+            ..WordRunReduceLimits::unlimited()
+        },
+        ..AggregateRunLimits::default()
+    };
+    let error = regex.count_value(haystack, work_refusal).unwrap_err();
+    assert!(error.has_closed_direct_attempt(), "{label}");
+    assert!(matches!(
+        error.source,
+        AggregateExecutionSource::WordRun(WordRunReduceError::WorkLimit { needed, limit })
+            if needed == upper.work && limit == upper.work - 1
+    ));
+
+    let dual_refusal = AggregateRunLimits {
+        word_run: WordRunReduceLimits {
+            max_input_bytes: upper.input_bytes - 1,
+            max_work: upper.work - 1,
+            ..WordRunReduceLimits::unlimited()
+        },
+        ..AggregateRunLimits::default()
+    };
+    let error = regex.count_value(haystack, dual_refusal).unwrap_err();
+    assert!(error.has_closed_direct_attempt(), "{label}");
+    assert!(matches!(
+        error.source,
+        AggregateExecutionSource::WordRun(WordRunReduceError::InputBytesLimit { needed, limit })
+            if needed == upper.input_bytes && limit == upper.input_bytes - 1
+    ));
+}
+
+fn assert_span_sum_value_success_and_replay(
+    label: &str,
+    builder: AggregateBuilder,
+    haystack: &[u8],
+) {
+    let regex = builder.build_span_sum().unwrap();
+    let baseline = regex
+        .span_sum(haystack, AggregateRunLimits::default())
+        .unwrap();
+    assert_eq!(
+        regex
+            .span_sum_value(haystack, AggregateRunLimits::default())
+            .unwrap(),
+        baseline.value(),
+        "span-sum value for {label}",
+    );
+    let AggregateExecutionDetails::WordRun(accounting) = baseline.report().details() else {
+        panic!("{label} executed another family");
+    };
+    let upper = accounting.upper_bounds;
+    let work_refusal = AggregateRunLimits {
+        word_run: WordRunReduceLimits {
+            max_work: upper.work - 1,
+            ..WordRunReduceLimits::unlimited()
+        },
+        ..AggregateRunLimits::default()
+    };
+    let error = regex.span_sum_value(haystack, work_refusal).unwrap_err();
+    assert!(error.has_closed_direct_attempt(), "{label}");
+    assert!(matches!(
+        error.source,
+        AggregateExecutionSource::WordRun(WordRunReduceError::WorkLimit { needed, limit })
+            if needed == upper.work && limit == upper.work - 1
+    ));
+
+    let dual_refusal = AggregateRunLimits {
+        word_run: WordRunReduceLimits {
+            max_input_bytes: upper.input_bytes - 1,
+            max_work: upper.work - 1,
+            ..WordRunReduceLimits::unlimited()
+        },
+        ..AggregateRunLimits::default()
+    };
+    let error = regex.span_sum_value(haystack, dual_refusal).unwrap_err();
+    assert!(error.has_closed_direct_attempt(), "{label}");
+    assert!(matches!(
+        error.source,
+        AggregateExecutionSource::WordRun(WordRunReduceError::InputBytesLimit { needed, limit })
+            if needed == upper.input_bytes && limit == upper.input_bytes - 1
+    ));
+}
+
+#[test]
+fn fixed_chunk_compact_count_replays_word_run_fences() {
+    assert_count_value_success_and_replay(
+        "fixed-chunk target",
+        byte_builder(r"[0-9A-Za-z_]{65}"),
+        &[b'a'; 2 * 65 + 17],
+    );
+}
+
+#[test]
+fn fixed_chunk_compact_span_sum_replays_word_run_fences() {
+    assert_span_sum_value_success_and_replay(
+        "fixed-chunk target",
+        byte_builder(r"[0-9A-Za-z_]{65}"),
+        &[b'a'; 2 * 65 + 17],
+    );
+}
+
+#[test]
+fn unicode_count_remains_on_authoritative_route() {
+    assert_count_value_success_and_replay(
+        "Unicode non-target",
+        builder(WORD_RUN),
+        "abcdefghijkl--aα中_7ζηθικλμ--short".as_bytes(),
+    );
+}
+
+#[test]
+fn unicode_span_sum_remains_on_authoritative_route() {
+    assert_span_sum_value_success_and_replay(
+        "Unicode non-target",
+        builder(WORD_RUN),
+        "abcdefghijkl--aα中_7ζηθικλμ--short".as_bytes(),
+    );
+}
+
+#[test]
+fn ascii_compact_count_replays_word_run_fences() {
+    let haystack = b"abcdefghijkl--short--mnopqrstuvwx";
+    let regex = builder(ASCII_WORD_RUN).build_count().unwrap();
+    let baseline = regex
+        .count(haystack, AggregateRunLimits::default())
+        .unwrap();
+    assert_eq!(
+        regex
+            .count_value(haystack, AggregateRunLimits::default())
+            .unwrap(),
+        baseline.value(),
+    );
+    let AggregateExecutionDetails::WordRun(accounting) = baseline.report().details() else {
+        panic!("ASCII word-run executed another family");
+    };
+    let upper = accounting.upper_bounds;
+    let work_refusal = AggregateRunLimits {
+        word_run: WordRunReduceLimits {
+            max_work: upper.work - 1,
+            ..WordRunReduceLimits::unlimited()
+        },
+        ..AggregateRunLimits::default()
+    };
+    let error = regex.count_value(haystack, work_refusal).unwrap_err();
+    assert!(error.has_closed_direct_attempt());
+    assert!(matches!(
+        error.source,
+        AggregateExecutionSource::WordRun(WordRunReduceError::WorkLimit { needed, limit })
+            if needed == upper.work && limit == upper.work - 1
+    ));
+
+    let precedence_refusal = AggregateRunLimits {
+        word_run: WordRunReduceLimits {
+            max_input_bytes: upper.input_bytes - 1,
+            max_work: upper.work - 1,
+            ..WordRunReduceLimits::unlimited()
+        },
+        ..AggregateRunLimits::default()
+    };
+    let error = regex.count_value(haystack, precedence_refusal).unwrap_err();
+    assert!(error.has_closed_direct_attempt());
+    assert!(matches!(
+        error.source,
+        AggregateExecutionSource::WordRun(WordRunReduceError::InputBytesLimit { needed, limit })
+            if needed == upper.input_bytes && limit == upper.input_bytes - 1
+    ));
+}
+
+#[test]
+fn ascii_compact_span_sum_replays_word_run_fences() {
+    let haystack = b"abcdefghijkl--short--mnopqrstuvwx";
+    let regex = builder(ASCII_WORD_RUN).build_span_sum().unwrap();
+    let baseline = regex
+        .span_sum(haystack, AggregateRunLimits::default())
+        .unwrap();
+    assert_eq!(
+        regex
+            .span_sum_value(haystack, AggregateRunLimits::default())
+            .unwrap(),
+        baseline.value(),
+    );
+    let AggregateExecutionDetails::WordRun(accounting) = baseline.report().details() else {
+        panic!("ASCII word-run executed another family");
+    };
+    let upper = accounting.upper_bounds;
+    let work_refusal = AggregateRunLimits {
+        word_run: WordRunReduceLimits {
+            max_work: upper.work - 1,
+            ..WordRunReduceLimits::unlimited()
+        },
+        ..AggregateRunLimits::default()
+    };
+    let error = regex.span_sum_value(haystack, work_refusal).unwrap_err();
+    assert!(error.has_closed_direct_attempt());
+    assert!(matches!(
+        error.source,
+        AggregateExecutionSource::WordRun(WordRunReduceError::WorkLimit { needed, limit })
+            if needed == upper.work && limit == upper.work - 1
+    ));
+
+    let precedence_refusal = AggregateRunLimits {
+        word_run: WordRunReduceLimits {
+            max_input_bytes: upper.input_bytes - 1,
+            max_work: upper.work - 1,
+            ..WordRunReduceLimits::unlimited()
+        },
+        ..AggregateRunLimits::default()
+    };
+    let error = regex
+        .span_sum_value(haystack, precedence_refusal)
+        .unwrap_err();
+    assert!(error.has_closed_direct_attempt());
+    assert!(matches!(
+        error.source,
+        AggregateExecutionSource::WordRun(WordRunReduceError::InputBytesLimit { needed, limit })
+            if needed == upper.input_bytes && limit == upper.input_bytes - 1
+    ));
+}
+
 #[test]
 fn captures_compile_and_near_misses_remain_explicit() {
     let captured = builder(r"((\b)(\w{12,})(\b))").build_count().unwrap();
