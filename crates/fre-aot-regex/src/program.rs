@@ -891,6 +891,9 @@ impl CompiledProgram {
                 OutputContract::Exists | OutputContract::SelectedEnd => {
                     K0Workspace::new_accelerated(&self.automaton, WorkspaceLimits::unlimited())?
                 }
+                OutputContract::Span if self.exact_match_width.is_some() => {
+                    K0Workspace::new_accelerated(&self.automaton, WorkspaceLimits::unlimited())?
+                }
                 OutputContract::Span => {
                     K0Workspace::new_bidirectional(&self.automaton, WorkspaceLimits::unlimited())?
                 }
@@ -1001,12 +1004,26 @@ impl CompiledProgram {
                 Ok(MatchResult::SelectedEnd(found))
             }
             OutputContract::Span => {
-                let found = self
-                    .automaton
-                    .prepare::<Span>()
-                    .search_window_with_workspace(haystack, window, workspace, limits)?
-                    .into_output()
-                    .map(|span| (span.start(), span.end()));
+                let found = if let Some(width) = self.exact_match_width {
+                    self.automaton
+                        .prepare::<SelectedEnd>()
+                        .search_window_with_workspace(haystack, window, workspace, limits)?
+                        .into_output()
+                        .map(|end| {
+                            end.checked_sub(width).map(|start| (start, end)).ok_or(
+                                CompileError::InternalInvariant(
+                                    "fixed-width NFA match end preceded its proved width",
+                                ),
+                            )
+                        })
+                        .transpose()?
+                } else {
+                    self.automaton
+                        .prepare::<Span>()
+                        .search_window_with_workspace(haystack, window, workspace, limits)?
+                        .into_output()
+                        .map(|span| (span.start(), span.end()))
+                };
                 Ok(MatchResult::Span(found))
             }
         }
@@ -3414,6 +3431,34 @@ mod tests {
             };
             assert_eq!(actual, expected, "{output:?}");
         }
+
+        let fixed_span = program(
+            "(?:ab|cd)",
+            OutputContract::Span,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        assert_eq!(fixed_span.exact_match_width, Some(2));
+        let workspace = fixed_span
+            .prepare_workspace()
+            .expect("prepare fixed-width span workspace");
+        assert_eq!(
+            workspace
+                .nfa
+                .as_ref()
+                .expect("ordered NFA retains K0 storage")
+                .layout(),
+            fixed_span
+                .automaton
+                .accelerated_workspace_layout()
+                .expect("fixed-width span endpoint layout")
+        );
+        assert_eq!(
+            fixed_span
+                .search(b"xxcdyy", SearchWindow::full(b"xxcdyy"))
+                .expect("fixed-width fallback search"),
+            MatchResult::Span(Some((2, 4)))
+        );
     }
 
     #[test]
