@@ -88,6 +88,48 @@ pub(super) unsafe fn classify_byte_delta_16_neon(
 
 #[allow(
     unsafe_code,
+    reason = "this private target-feature leaf loads one exact block after the compiler target proved NEON usable"
+)]
+#[cfg_attr(
+    all(
+        target_os = "linux",
+        target_endian = "little",
+        target_feature = "sve",
+        target_feature = "sve2"
+    ),
+    allow(
+        dead_code,
+        reason = "SVE2 compiler targets select the direct MATCH leaf instead of the NEON four-byte classifier"
+    )
+)]
+#[target_feature(enable = "neon")]
+#[inline]
+pub(super) unsafe fn classify_byte_set4_16_neon(
+    members: [u8; 4],
+    bytes: &[u8; BYTE_SET_BLOCK_BYTES],
+) -> ByteSetMask16 {
+    use core::arch::aarch64::vorrq_u8;
+
+    // SAFETY: `bytes` and the fixed weights are initialized exact-width
+    // arrays, and the compiler target proves NEON before this leaf is called.
+    let (input, lane_weights) =
+        unsafe { (vld1q_u8(bytes.as_ptr()), vld1q_u8(LANE_WEIGHTS.as_ptr())) };
+    let first_or_second = vorrq_u8(
+        vceqq_u8(input, vdupq_n_u8(members[0])),
+        vceqq_u8(input, vdupq_n_u8(members[1])),
+    );
+    let third_or_fourth = vorrq_u8(
+        vceqq_u8(input, vdupq_n_u8(members[2])),
+        vceqq_u8(input, vdupq_n_u8(members[3])),
+    );
+    let member_lanes = vorrq_u8(first_or_second, third_or_fourth);
+    // SAFETY: this function itself is entered only with NEON enabled, and the
+    // helper has no memory access or additional precondition.
+    ByteSetMask16::new(unsafe { boolean_lanes_to_mask(member_lanes, lane_weights) })
+}
+
+#[allow(
+    unsafe_code,
     reason = "this private target-feature helper reads one exact 16-byte block after its retained scanner proved NEON usable"
 )]
 #[target_feature(enable = "neon")]

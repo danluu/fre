@@ -29,6 +29,9 @@ thread-safe regex handles, plan information, and the three single-search
 operations. Patterns are explicit byte views but must contain valid UTF-8
 regex syntax, as required by the Rust parser. Haystacks are arbitrary bytes;
 embedded NUL and invalid UTF-8 are not treated as terminators or rejected.
+The `fre_v1_plan_info.plan` field uses append-only public tags: existing tags
+1 through 9 remain fixed, `PURE_BYTE_CLASS_REPEAT` is 10, and
+`FIXED_PREDICATE_WORD64` is 11.
 
 `fre_v1_config` exposes only fields that map to real controls: the Rust-bytes
 profile, Unicode mode, JIT denial, search work, and search scratch bytes. JIT

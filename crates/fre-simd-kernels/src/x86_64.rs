@@ -41,6 +41,40 @@ pub(super) unsafe fn classify_byte_delta_16_sse2(
 
 #[allow(
     unsafe_code,
+    reason = "this private target-feature leaf loads one exact block after the compiler target proved SSE2 usable"
+)]
+#[allow(
+    clippy::cast_ptr_alignment,
+    reason = "_mm_loadu_si128 explicitly accepts an unaligned byte-backed address"
+)]
+#[target_feature(enable = "sse2")]
+#[inline]
+pub(super) unsafe fn classify_byte_set4_16_sse2(
+    members: [u8; 4],
+    bytes: &[u8; BYTE_SET_BLOCK_BYTES],
+) -> ByteSetMask16 {
+    use core::arch::x86_64::_mm_or_si128;
+
+    // SAFETY: `bytes` is an initialized `[u8; 16]`; the unaligned load reads
+    // exactly that object, and the compiler target proves SSE2.
+    let input = unsafe { _mm_loadu_si128(bytes.as_ptr().cast::<__m128i>()) };
+    let first_or_second = _mm_or_si128(
+        _mm_cmpeq_epi8(input, _mm_set1_epi8(i8::from_ne_bytes([members[0]]))),
+        _mm_cmpeq_epi8(input, _mm_set1_epi8(i8::from_ne_bytes([members[1]]))),
+    );
+    let third_or_fourth = _mm_or_si128(
+        _mm_cmpeq_epi8(input, _mm_set1_epi8(i8::from_ne_bytes([members[2]]))),
+        _mm_cmpeq_epi8(input, _mm_set1_epi8(i8::from_ne_bytes([members[3]]))),
+    );
+    let member_lanes = _mm_or_si128(first_or_second, third_or_fourth);
+    ByteSetMask16::new(
+        u16::try_from(_mm_movemask_epi8(member_lanes))
+            .expect("a sixteen-lane movemask fits in u16"),
+    )
+}
+
+#[allow(
+    unsafe_code,
     reason = "this private target-feature leaf loads one exact 16-byte array after its retained classifier handle proved SSE2 usable"
 )]
 #[allow(

@@ -1,31 +1,50 @@
-//! Fixed-width byte-predicate matching with an exact anchor when one
-//! exists and one 64-bit Shift-And state otherwise.
+//! Fixed-width byte-predicate matching with exact anchors, adaptive
+//! non-universal predicate finders, and a 64-bit Shift-And fallback.
 //!
 //! Construction accepts between one and 64 nonempty byte predicates. Each
 //! predicate is supplied as inclusive byte ranges and is compiled into a full
 //! byte-to-position mask table. An exact
-//! one-or-two-byte predicate drives a monotone candidate stream when available;
-//! otherwise reduction performs one Shift-And transition per haystack byte.
-//! Both reducers restart after each accepted word, allocate no operation
-//! memory, and materialize no spans.
+//! one-or-two-byte predicate drives a monotone candidate stream when available.
+//! A dense rejection burst moves monotonically to a second retained
+//! non-universal predicate and then, if needed, to Shift-And. Universal
+//! predicates are never rechecked. Plans without an exact anchor use
+//! Shift-And directly. Every phase restarts after each accepted word,
+//! allocates no operation memory, and materializes no spans.
 
 use core::{fmt, mem::size_of};
 
-use memchr::{memchr, memchr2};
+use fre_simd_kernels::{
+    BYTE_SET_BLOCK_BYTES, BYTE_SET_CLASSIFIER_BUILD_WORK, ByteSet256, ByteSetClassifier,
+    classify_byte_delta_16, classify_byte_set4_16,
+};
+use memchr::{memchr, memchr2, memchr3};
 
+use crate::Window;
 use crate::packed_ordered_literal_aggregate::byte_frequency_rank;
 
 /// Stable identity for the fixed-predicate anchor-or-Shift-And strategy.
 pub const PLAN_ID: &str =
-    "fixed-predicate-word64.fixed-anchor-selective-verification-or-shift-and.nonoverlap.v5";
+    "fixed-predicate-word64.adaptive-fixed-anchor-or-shift-and.nonoverlap.v10";
 /// Stable identity for the count reducer.
-pub const COUNT_OPERATION_ID: &str = "fixed-predicate-word64.count.v4";
+pub const COUNT_OPERATION_ID: &str = "fixed-predicate-word64.count.v9";
 /// Stable identity for the matched-byte-sum reducer.
-pub const SPAN_SUM_OPERATION_ID: &str = "fixed-predicate-word64.span-sum.v4";
+pub const SPAN_SUM_OPERATION_ID: &str = "fixed-predicate-word64.span-sum.v9";
+/// Stable identity for the ordinary first-match search projection.
+pub const SEARCH_PLAN_ID: &str = "fixed-predicate-word64.first-match.v6";
+/// Stable identity for existence search.
+const EXISTS_SEARCH_OPERATION_ID: &str = "fixed-predicate-word64.search.exists.v6";
+/// Stable identity for the first accepting end projection.
+const EARLIEST_END_SEARCH_OPERATION_ID: &str =
+    "fixed-predicate-word64.search.earliest-end.v6";
+/// Stable identity for the selected match end projection.
+const SELECTED_END_SEARCH_OPERATION_ID: &str =
+    "fixed-predicate-word64.search.selected-end.v6";
+/// Stable identity for the selected span projection.
+const SPAN_SEARCH_OPERATION_ID: &str = "fixed-predicate-word64.search.span.v6";
 /// Version of the receipt-bearing fixed-predicate construction protocol.
-pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 5;
+pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 10;
 /// Version of the partial-actual fixed-predicate construction ledger.
-pub const BUILD_ATTEMPT_ACCOUNTING_VERSION: u32 = 5;
+pub const BUILD_ATTEMPT_ACCOUNTING_VERSION: u32 = 10;
 /// Minimum fixed word width accepted by this closed kernel.
 pub const MIN_WIDTH: usize = 1;
 /// Maximum fixed word width representable by one Shift-And state.
@@ -44,6 +63,51 @@ const ANCHOR_CANDIDATE_WORK: usize = 1;
 const PREDICATE_CHECK_WORK: usize = 1;
 const MATCH_WORK: usize = 3;
 const REDUCE_FINAL_WORK: usize = 1;
+const ADAPTIVE_FALLBACK_REJECTIONS: usize = 8;
+const ADAPTIVE_FALLBACK_MAX_MEAN_SKIP: usize = BYTE_SET_BLOCK_BYTES;
+
+#[inline]
+fn dense_rejection_burst(
+    first_rejected_anchor: usize,
+    rejected_anchor: usize,
+    rejected_candidates: usize,
+) -> Option<bool> {
+    if rejected_candidates < ADAPTIVE_FALLBACK_REJECTIONS {
+        return Some(false);
+    }
+    let span = rejected_anchor.checked_sub(first_rejected_anchor)?;
+    let admitted_span = ADAPTIVE_FALLBACK_REJECTIONS
+        .checked_sub(1)?
+        .checked_mul(ADAPTIVE_FALLBACK_MAX_MEAN_SKIP)?;
+    Some(span <= admitted_span)
+}
+
+#[inline]
+fn has_legal_start(input_bytes: usize, width: usize, start: usize) -> bool {
+    input_bytes
+        .checked_sub(width)
+        .is_some_and(|last_start| start <= last_start)
+}
+
+fn hybrid_anchor_work_upper(
+    input_bytes: usize,
+    candidate_positions: usize,
+    verification_positions: usize,
+) -> Option<usize> {
+    // The primary, byte-set and Shift-And phases are one-way. If `p` start
+    // positions have been serviced before the Shift-And suffix, finder bytes,
+    // calls and candidates are each at most `p`, and checks are at most
+    // `p * verification_positions`. The prefix therefore costs at most
+    // `p * (verification_positions + 3)`;
+    // the suffix costs at most `6 * (input_bytes - p)`. Maximizing over
+    // `p <= candidate_positions` gives the closed expression below. The
+    // caller separately charges match events and finalization.
+    input_bytes
+        .checked_mul(TRANSITION_WORK)?
+        .checked_add(
+            candidate_positions.checked_mul(verification_positions.saturating_sub(3))?,
+        )
+}
 
 /// Complete aggregate selected for one invocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -79,6 +143,61 @@ pub enum Reducer {
     ShiftAnd,
 }
 
+/// One exact one-or-two-byte anchor retained for ordered verification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExactAnchorIdentity {
+    /// Concrete exact-anchor representation.
+    pub reducer: Reducer,
+    /// Fixed byte-predicate position.
+    pub offset: u8,
+    /// Exact member bytes. The second slot is zero for a one-byte anchor.
+    pub bytes: [u8; 2],
+}
+
+/// Concrete finder representation retained for an adaptive handoff.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdaptiveFinderKind {
+    /// One exact byte, implemented by `memchr`.
+    One,
+    /// Two exact bytes, implemented by `memchr2`.
+    Two,
+    /// Three exact bytes, implemented by `memchr3`.
+    Three,
+    /// Four exact bytes, implemented by one fixed-width classifier.
+    Four,
+    /// One contiguous inclusive byte range.
+    Range,
+    /// One arbitrary compiled byte set.
+    Set,
+}
+
+/// Complete retained identity for one adaptive predicate finder.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdaptiveFinderIdentity {
+    /// Concrete finder representation.
+    pub kind: AdaptiveFinderKind,
+    /// Fixed byte-predicate position serviced by the finder.
+    pub offset: u8,
+    /// Exact number of bytes admitted by the predicate.
+    pub cardinality: u16,
+}
+
+/// Adaptive phase sequence retained by one anchored plan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdaptiveHandoffIdentity {
+    /// No adaptive phase is reachable.
+    Disabled,
+    /// Dense primary rejection moves directly to Shift-And.
+    DirectShiftAnd,
+    /// Dense primary rejection moves to a retained predicate finder.
+    Finder {
+        /// Exact retained finder.
+        finder: AdaptiveFinderIdentity,
+        /// Whether a second dense rejection burst moves on to Shift-And.
+        final_shift_and: bool,
+    },
+}
+
 /// Immutable semantic and implementation identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OperationIdentity {
@@ -100,6 +219,12 @@ pub struct OperationIdentity {
     pub anchor_offset: u8,
     /// Exact anchor bytes. The second slot is zero for a one-byte anchor.
     pub anchor_bytes: [u8; 2],
+    /// Secondary exact anchor checked before broader predicates.
+    pub secondary_anchor: Option<ExactAnchorIdentity>,
+    /// Maximum non-universal predicates checked per anchored candidate.
+    pub verification_predicates: u32,
+    /// Complete adaptive phase sequence retained by the plan.
+    pub adaptive_handoff: AdaptiveHandoffIdentity,
 }
 
 /// Limits checked before any supplied range value is inspected.
@@ -165,6 +290,9 @@ pub struct BuildAccounting {
     pub member_writes: usize,
     /// Full byte-domain mask cells inspected while selecting a fixed anchor.
     pub anchor_mask_reads: usize,
+    /// Exact work used to build an arbitrary-set adaptive classifier.
+    /// Tiny and contiguous-range finders require zero classifier build work.
+    pub adaptive_classifier_build_work: usize,
     /// Bound admitted before reading source range values.
     pub work_upper_bound: u64,
     /// Exact logical work charged by successful construction.
@@ -251,6 +379,14 @@ pub struct ReduceUpperBounds {
     pub input_bytes: usize,
     /// Maximum Shift-And transitions or logical anchor-scanner service bytes.
     pub transitions: usize,
+    /// Maximum logical bytes serviced by fixed-anchor finders. For adaptive
+    /// plans this is an independent component maximum; it shares the joint
+    /// `transitions` cap with `shift_and_transitions`.
+    pub finder_scanned_bytes: usize,
+    /// Maximum Shift-And transitions after any adaptive handoff. For adaptive
+    /// plans this is an independent component maximum; it shares the joint
+    /// `transitions` cap with `finder_scanned_bytes`.
+    pub shift_and_transitions: usize,
     /// Maximum fixed-anchor finder invocations.
     pub finder_calls: usize,
     /// Maximum fixed-anchor candidates.
@@ -288,6 +424,10 @@ pub struct ReduceActualCounters {
     pub input_bytes: usize,
     /// Shift-And transitions or logical anchor-scanner service bytes.
     pub transitions: usize,
+    /// Logical bytes serviced by fixed-anchor finders.
+    pub finder_scanned_bytes: usize,
+    /// Shift-And transitions after any adaptive handoff.
+    pub shift_and_transitions: usize,
     /// Fixed-anchor finder invocations.
     pub finder_calls: usize,
     /// Fixed-anchor candidates visited.
@@ -346,6 +486,192 @@ pub struct SpanSumResult {
     /// Complete resource certificate.
     pub accounting: ReduceAccounting,
 }
+
+/// First-match result projection selected for one ordinary search.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SearchOperation {
+    /// Whether any selected match exists.
+    Exists,
+    /// End of the first accepting match.
+    EarliestEnd,
+    /// End of the leftmost-first selected match.
+    SelectedEnd,
+    /// Complete leftmost-first selected span.
+    Span,
+}
+
+/// Immutable semantic and implementation identity for ordinary search.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SearchOperationIdentity {
+    /// Stable search-plan identifier, separate from aggregate reduction.
+    pub plan_id: &'static str,
+    /// Stable operation identifier.
+    pub operation_id: &'static str,
+    /// Requested result projection.
+    pub operation: SearchOperation,
+    /// Authenticated language class.
+    pub semantics: MatchSemantics,
+    /// Match selection rule.
+    pub selection: MatchSelection,
+    /// Exact fixed word width.
+    pub width: usize,
+    /// Authenticated reducer representation.
+    pub reducer: Reducer,
+    /// Fixed position used by an anchor reducer, or zero for Shift-And.
+    pub anchor_offset: u8,
+    /// Exact anchor bytes. The second slot is zero for a one-byte anchor.
+    pub anchor_bytes: [u8; 2],
+    /// Secondary exact anchor checked before broader predicates.
+    pub secondary_anchor: Option<ExactAnchorIdentity>,
+    /// Maximum non-universal predicates checked per anchored candidate.
+    pub verification_predicates: u32,
+    /// Complete adaptive phase sequence retained by the plan.
+    pub adaptive_handoff: AdaptiveHandoffIdentity,
+}
+
+/// Per-search limits checked before any byte in the requested window is read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SearchLimits {
+    /// Maximum prospectively charged first-match work.
+    pub max_work: u64,
+    /// Maximum dynamic operation scratch; ordinary search requires zero.
+    pub max_scratch_bytes: usize,
+}
+
+impl SearchLimits {
+    /// Disable caller-selected caps while retaining checked arithmetic.
+    #[must_use]
+    pub const fn unlimited() -> Self {
+        Self {
+            max_work: u64::MAX,
+            max_scratch_bytes: usize::MAX,
+        }
+    }
+}
+
+impl Default for SearchLimits {
+    fn default() -> Self {
+        Self {
+            max_work: 100_000_000,
+            max_scratch_bytes: 0,
+        }
+    }
+}
+
+/// Source-independent bounds admitted for one first-match search.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SearchUpperBounds {
+    /// Bytes in the requested window.
+    pub window_bytes: usize,
+    /// Shift-And transitions or logical anchor-finder service bytes.
+    pub transitions: usize,
+    /// Maximum logical bytes serviced by fixed-anchor finders. For adaptive
+    /// plans this is an independent component maximum; it shares the joint
+    /// `transitions` cap with `shift_and_transitions`.
+    pub finder_scanned_bytes: usize,
+    /// Maximum Shift-And transitions after any adaptive handoff. For adaptive
+    /// plans this is an independent component maximum; it shares the joint
+    /// `transitions` cap with `finder_scanned_bytes`.
+    pub shift_and_transitions: usize,
+    /// Maximum fixed-anchor finder invocations.
+    pub finder_calls: usize,
+    /// Maximum anchor candidates visited.
+    pub candidate_events: usize,
+    /// Maximum per-position predicate checks.
+    pub predicate_checks: usize,
+    /// Maximum selected match events; never more than one.
+    pub match_events: usize,
+    /// Complete prospectively charged work.
+    pub work: u64,
+    /// Dynamic operation scratch; always zero.
+    pub scratch_bytes: usize,
+}
+
+/// Exact counters through the first match or complete window exhaustion.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SearchActualCounters {
+    /// Bytes in the requested window.
+    pub window_bytes: usize,
+    /// Shift-And transitions or logical anchor-finder service bytes.
+    pub transitions: usize,
+    /// Logical bytes serviced by fixed-anchor finders.
+    pub finder_scanned_bytes: usize,
+    /// Shift-And transitions after any adaptive handoff.
+    pub shift_and_transitions: usize,
+    /// Fixed-anchor finder invocations.
+    pub finder_calls: usize,
+    /// Anchor candidates visited.
+    pub candidate_events: usize,
+    /// Per-position predicate checks.
+    pub predicate_checks: usize,
+    /// Selected match events; zero or one.
+    pub match_events: usize,
+    /// Exact charged work.
+    pub work: u64,
+    /// Dynamic operation scratch; always zero.
+    pub scratch_bytes: usize,
+}
+
+/// Complete first-match search certificate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SearchAccounting {
+    /// Stable operation and semantic identity.
+    pub identity: SearchOperationIdentity,
+    /// Bounds admitted before reading the requested window.
+    pub upper_bounds: SearchUpperBounds,
+    /// Counters published after complete success.
+    pub actual: SearchActualCounters,
+}
+
+/// Checked first-match search failure. No fallback is attempted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum SearchError {
+    /// The half-open request does not fit the original haystack.
+    InvalidWindow {
+        start: usize,
+        end: usize,
+        haystack_len: usize,
+    },
+    /// Prospective search work exceeds the caller cap.
+    WorkLimit { needed: u64, limit: u64 },
+    /// Dynamic operation scratch exceeds the caller cap.
+    ScratchLimit { needed: usize, limit: usize },
+    /// Checked arithmetic failed.
+    ArithmeticOverflow { computation: &'static str },
+    /// A post-preflight invariant failed closed.
+    InternalInvariant(&'static str),
+}
+
+impl fmt::Display for SearchError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidWindow {
+                start,
+                end,
+                haystack_len,
+            } => write!(
+                formatter,
+                "fixed-predicate search window {start}..{end} is invalid for {haystack_len} bytes"
+            ),
+            Self::WorkLimit { needed, limit } => write!(
+                formatter,
+                "fixed-predicate search needs {needed} work units, exceeding {limit}"
+            ),
+            Self::ScratchLimit { needed, limit } => write!(
+                formatter,
+                "fixed-predicate search needs {needed} scratch bytes, exceeding {limit}"
+            ),
+            Self::ArithmeticOverflow { computation } => write!(
+                formatter,
+                "arithmetic overflow while computing {computation}"
+            ),
+            Self::InternalInvariant(detail) => write!(formatter, "internal invariant: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for SearchError {}
 
 /// Checked construction failure. No plan is published on error.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -485,6 +811,7 @@ pub struct BuildAttemptActual {
     pub range_inspections: usize,
     pub member_writes: usize,
     pub anchor_mask_reads: usize,
+    pub adaptive_classifier_build_work: usize,
     pub work: u64,
     pub allocations: usize,
     pub reserves: usize,
@@ -536,6 +863,10 @@ impl BuildAttemptReceipt {
             && self.actual.reserves == 0
             && self.actual.temporary_copies == 0
             && self.actual.copied_bytes == 0
+            && matches!(
+                self.actual.adaptive_classifier_build_work,
+                0 | BYTE_SET_CLASSIFIER_BUILD_WORK
+            )
             && self.actual.live_persistent_bytes <= self.identity.limits.max_persistent_bytes
             && self.actual.live_scratch_bytes <= self.identity.limits.max_scratch_bytes
             && self.actual.peak_bytes <= self.identity.limits.max_peak_bytes
@@ -550,6 +881,8 @@ impl BuildAttemptReceipt {
             && self.actual.range_inspections == accounting.range_inspections
             && self.actual.member_writes == accounting.member_writes
             && self.actual.anchor_mask_reads == accounting.anchor_mask_reads
+            && self.actual.adaptive_classifier_build_work
+                == accounting.adaptive_classifier_build_work
             && self.actual.work == accounting.work_charged
             && self.actual.allocations == accounting.allocations
             && self.actual.reserves == accounting.reserves
@@ -672,6 +1005,7 @@ impl BuildAttemptTracker {
                 range_inspections: 0,
                 member_writes: 0,
                 anchor_mask_reads: 0,
+                adaptive_classifier_build_work: 0,
                 work: 0,
                 allocations: 0,
                 reserves: 0,
@@ -761,6 +1095,19 @@ impl BuildAttemptTracker {
                 .ok_or(BuildError::ArithmeticOverflow {
                     computation: "anchor mask read count",
                 })?;
+        Ok(())
+    }
+
+    fn build_adaptive_classifier(&mut self) -> Result<(), BuildError> {
+        let needed = self
+            .actual
+            .adaptive_classifier_build_work
+            .checked_add(BYTE_SET_CLASSIFIER_BUILD_WORK)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "adaptive classifier build work",
+            })?;
+        self.charge(BYTE_SET_CLASSIFIER_BUILD_WORK)?;
+        self.actual.adaptive_classifier_build_work = needed;
         Ok(())
     }
 
@@ -885,9 +1232,230 @@ pub struct FixedPredicateWord64Plan {
     masks: [u64; MASK_SLOTS],
     width: usize,
     accepting_bit: u64,
+    nonuniversal_mask: u64,
     anchor: Anchor,
     secondary_anchor: Option<Anchor>,
+    adaptive_fallback: Option<AdaptiveFallback>,
     build: BuildAccounting,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AdaptiveFallback {
+    offset: u8,
+    cardinality: u16,
+    finder: AdaptiveFinder,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum AdaptiveFinder {
+    One(u8),
+    Two(u8, u8),
+    Three(u8, u8, u8),
+    Four([u8; 4]),
+    Range { origin: u8, maximum_delta: u8 },
+    Set(ByteSetClassifier),
+}
+
+impl AdaptiveFallback {
+    #[inline]
+    fn cursor<'a>(
+        &'a self,
+        bytes: &'a [u8],
+        anchor_end: usize,
+    ) -> AdaptiveFinderCursor<'a> {
+        AdaptiveFinderCursor::new(&self.finder, bytes, anchor_end)
+    }
+
+    #[inline]
+    const fn classifier_build_work(&self) -> usize {
+        match self.finder {
+            AdaptiveFinder::Set(_) => BYTE_SET_CLASSIFIER_BUILD_WORK,
+            AdaptiveFinder::One(_)
+            | AdaptiveFinder::Two(_, _)
+            | AdaptiveFinder::Three(_, _, _)
+            | AdaptiveFinder::Four(_)
+            | AdaptiveFinder::Range { .. } => 0,
+        }
+    }
+
+    const fn identity(self) -> AdaptiveFinderIdentity {
+        let kind = match self.finder {
+            AdaptiveFinder::One(_) => AdaptiveFinderKind::One,
+            AdaptiveFinder::Two(_, _) => AdaptiveFinderKind::Two,
+            AdaptiveFinder::Three(_, _, _) => AdaptiveFinderKind::Three,
+            AdaptiveFinder::Four(_) => AdaptiveFinderKind::Four,
+            AdaptiveFinder::Range { .. } => AdaptiveFinderKind::Range,
+            AdaptiveFinder::Set(_) => AdaptiveFinderKind::Set,
+        };
+        AdaptiveFinderIdentity {
+            kind,
+            offset: self.offset,
+            cardinality: self.cardinality,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct AdaptiveFinderBlock {
+    // Absolute coordinates let one classified block survive every monotone
+    // restart within that block, including a jump after an accepted match.
+    start: usize,
+    end: usize,
+    members: u16,
+}
+
+struct AdaptiveFinderCursor<'a> {
+    finder: &'a AdaptiveFinder,
+    bytes: &'a [u8],
+    anchor_end: usize,
+    block: AdaptiveFinderBlock,
+    #[cfg(test)]
+    classified_chunks: usize,
+}
+
+impl<'a> AdaptiveFinderCursor<'a> {
+    fn new(finder: &'a AdaptiveFinder, bytes: &'a [u8], anchor_end: usize) -> Self {
+        Self {
+            finder,
+            bytes,
+            anchor_end,
+            block: AdaptiveFinderBlock::default(),
+            #[cfg(test)]
+            classified_chunks: 0,
+        }
+    }
+
+    #[inline]
+    fn find(&mut self, cursor: usize) -> Option<usize> {
+        let finder = self.finder;
+        match finder {
+            AdaptiveFinder::One(byte) => self
+                .bytes
+                .get(cursor..self.anchor_end)
+                .and_then(|bytes| memchr(*byte, bytes))
+                .and_then(|relative| cursor.checked_add(relative)),
+            AdaptiveFinder::Two(first, second) => self
+                .bytes
+                .get(cursor..self.anchor_end)
+                .and_then(|bytes| memchr2(*first, *second, bytes))
+                .and_then(|relative| cursor.checked_add(relative)),
+            AdaptiveFinder::Three(first, second, third) => self
+                .bytes
+                .get(cursor..self.anchor_end)
+                .and_then(|bytes| memchr3(*first, *second, *third, bytes))
+                .and_then(|relative| cursor.checked_add(relative)),
+            AdaptiveFinder::Four(members) => {
+                let members = *members;
+                self.find_classified(
+                    cursor,
+                    |block| classify_byte_set4_16(members, block).member_mask(),
+                    |byte| members.contains(&byte),
+                )
+            }
+            AdaptiveFinder::Range {
+                origin,
+                maximum_delta,
+            } => self.find_range(cursor, *origin, *maximum_delta),
+            AdaptiveFinder::Set(classifier) => self.find_classified(
+                cursor,
+                |block| classifier.classify_16(block).member_mask(),
+                |byte| classifier.set().contains(byte),
+            ),
+        }
+    }
+
+    #[inline]
+    fn find_range(
+        &self,
+        mut cursor: usize,
+        origin: u8,
+        maximum_delta: u8,
+    ) -> Option<usize> {
+        while let Some(end) = cursor
+            .checked_add(BYTE_SET_BLOCK_BYTES)
+            .filter(|&end| end <= self.anchor_end)
+        {
+            let block = <&[u8; BYTE_SET_BLOCK_BYTES]>::try_from(
+                self.bytes.get(cursor..end)?,
+            )
+            .ok()?;
+            let members = classify_byte_delta_16(origin, maximum_delta, block).member_mask();
+            if members != 0 {
+                let lane = usize::try_from(members.trailing_zeros()).ok()?;
+                return cursor.checked_add(lane);
+            }
+            cursor = end;
+        }
+        self.bytes
+            .get(cursor..self.anchor_end)?
+            .iter()
+            .position(|&byte| byte.wrapping_sub(origin) <= maximum_delta)
+            .and_then(|relative| cursor.checked_add(relative))
+    }
+
+    #[inline]
+    fn find_classified(
+        &mut self,
+        mut cursor: usize,
+        mut classify_16: impl FnMut(&[u8; BYTE_SET_BLOCK_BYTES]) -> u16,
+        mut contains: impl FnMut(u8) -> bool,
+    ) -> Option<usize> {
+        while cursor < self.anchor_end {
+            // Phase cursors only move forward. Masking already-serviced lanes
+            // therefore preserves the cached classification for later calls.
+            if self.block.start <= cursor && cursor < self.block.end {
+                let skipped = cursor.checked_sub(self.block.start)?;
+                let members = self.block.members & (u16::MAX << skipped);
+                if members != 0 {
+                    let lane = usize::try_from(members.trailing_zeros()).ok()?;
+                    return self.block.start.checked_add(lane);
+                }
+                cursor = self.block.end;
+                continue;
+            }
+
+            let chunk_len = self
+                .anchor_end
+                .checked_sub(cursor)?
+                .min(BYTE_SET_BLOCK_BYTES);
+            let chunk_end = cursor.checked_add(chunk_len)?;
+            let chunk = self.bytes.get(cursor..chunk_end)?;
+            let members = if chunk_len == BYTE_SET_BLOCK_BYTES {
+                let block = <&[u8; BYTE_SET_BLOCK_BYTES]>::try_from(chunk).ok()?;
+                classify_16(block)
+            } else {
+                chunk
+                    .iter()
+                    .enumerate()
+                    .fold(0_u16, |members, (lane, &byte)| {
+                        members | (u16::from(contains(byte)) << lane)
+                    })
+            };
+            self.block = AdaptiveFinderBlock {
+                start: cursor,
+                end: chunk_end,
+                members,
+            };
+            #[cfg(test)]
+            {
+                self.classified_chunks = self.classified_chunks.checked_add(1)?;
+            }
+        }
+        None
+    }
+
+    #[cfg(test)]
+    const fn classified_chunks(&self) -> usize {
+        self.classified_chunks
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FallbackCandidate {
+    score: (usize, u8, usize),
+    bytes: [u8; 4],
+    set: ByteSet256,
+    contiguous_range: Option<(u8, u8)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -900,6 +1468,8 @@ enum Anchor {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ReducerUpper {
     transitions: usize,
+    finder_scanned_bytes: usize,
+    shift_and_transitions: usize,
     finder_calls: usize,
     anchor_candidates: usize,
     predicate_checks: usize,
@@ -916,6 +1486,7 @@ struct SemanticUpper {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct AnchorActual {
     finder_scanned_bytes: usize,
+    shift_and_transitions: usize,
     finder_calls: usize,
     anchor_candidates: usize,
     predicate_checks: usize,
@@ -944,6 +1515,18 @@ impl Anchor {
     const fn offset(self) -> Option<u8> {
         match self {
             Self::One { offset, .. } | Self::Two { offset, .. } => Some(offset),
+            Self::ShiftAnd => None,
+        }
+    }
+
+    const fn exact_identity(self) -> Option<ExactAnchorIdentity> {
+        let (reducer, offset, bytes) = self.identity();
+        match self {
+            Self::One { .. } | Self::Two { .. } => Some(ExactAnchorIdentity {
+                reducer,
+                offset,
+                bytes,
+            }),
             Self::ShiftAnd => None,
         }
     }
@@ -1022,6 +1605,7 @@ fn preflight_build(
     let base_work = MASK_SLOTS
         .checked_add(width)
         .and_then(|work| work.checked_add(width.checked_mul(ANCHOR_MASK_DOMAIN)?))
+        .and_then(|work| work.checked_add(BYTE_SET_CLASSIFIER_BUILD_WORK))
         .and_then(|work| work.checked_add(BUILD_FIXED_WORK))
         .ok_or(BuildError::ArithmeticOverflow {
             computation: "base build work",
@@ -1134,11 +1718,14 @@ fn select_anchor(
     masks: &[u64; MASK_SLOTS],
     width: usize,
     tracker: &mut BuildAttemptTracker,
-) -> Result<(Anchor, Option<Anchor>), BuildError> {
+) -> Result<(Anchor, Option<Anchor>, Option<AdaptiveFallback>, u64), BuildError> {
     let mut selected = Anchor::ShiftAnd;
     let mut selected_score = None;
     let mut secondary_anchor = None;
     let mut secondary_score = None;
+    let mut fallback_first: Option<FallbackCandidate> = None;
+    let mut fallback_second: Option<FallbackCandidate> = None;
+    let mut nonuniversal_mask = 0_u64;
     for position in 0..width {
         let shift = u32::try_from(position).map_err(|_| BuildError::ArithmeticOverflow {
             computation: "anchor position shift conversion",
@@ -1148,11 +1735,17 @@ fn select_anchor(
             .ok_or(BuildError::ArithmeticOverflow {
                 computation: "anchor position mask",
             })?;
-        let mut bytes = [0_u8; 2];
+        let mut bytes = [0_u8; 4];
         let mut members = 0_usize;
+        let mut rank = 0_u8;
+        let mut set_words = [0_u64; 4];
+        let mut first_member = None;
+        let mut last_member = 0_u8;
         for byte in 0_u8..=u8::MAX {
             tracker.read_anchor_mask()?;
             if masks[usize::from(byte)] & bit != 0 {
+                first_member.get_or_insert(byte);
+                last_member = byte;
                 if let Some(slot) = bytes.get_mut(members) {
                     *slot = byte;
                 }
@@ -1161,17 +1754,33 @@ fn select_anchor(
                     .ok_or(BuildError::ArithmeticOverflow {
                         computation: "anchor member count",
                     })?;
+                rank = rank.max(byte_frequency_rank(byte));
+                let word = usize::from(byte >> 6);
+                let member_bit = u32::from(byte & 63);
+                set_words[word] |= 1_u64 << member_bit;
+            }
+        }
+        let contiguous_range = first_member.and_then(|origin| {
+            let maximum_delta = last_member.checked_sub(origin)?;
+            (usize::from(maximum_delta).checked_add(1)? == members)
+                .then_some((origin, maximum_delta))
+        });
+        if members < MASK_SLOTS {
+            nonuniversal_mask |= bit;
+            let fallback = FallbackCandidate {
+                score: (members, rank, position),
+                bytes,
+                set: ByteSet256::from_words(set_words),
+                contiguous_range,
+            };
+            if fallback_first.is_none_or(|prior| fallback.score < prior.score) {
+                fallback_second = fallback_first;
+                fallback_first = Some(fallback);
+            } else if fallback_second.is_none_or(|prior| fallback.score < prior.score) {
+                fallback_second = Some(fallback);
             }
         }
         if (1..=2).contains(&members) {
-            let rank = bytes[..members]
-                .iter()
-                .copied()
-                .map(byte_frequency_rank)
-                .max()
-                .ok_or(BuildError::InternalInvariant(
-                    "nonempty anchor lost its frequency rank",
-                ))?;
             let score = (rank, members);
             let offset = u8::try_from(position)
                 .map_err(|_| BuildError::InternalInvariant("anchor offset exceeded one byte"))?;
@@ -1200,7 +1809,72 @@ fn select_anchor(
             selected = candidate;
         }
     }
-    Ok((selected, secondary_anchor))
+    let primary_offset = selected.offset().map(usize::from);
+    let fallback = [fallback_first, fallback_second]
+        .into_iter()
+        .flatten()
+        .find(|candidate| Some(candidate.score.2) != primary_offset);
+    let verification_positions = match primary_offset {
+        Some(position) => {
+            let shift = u32::try_from(position).map_err(|_| {
+                BuildError::InternalInvariant("primary anchor offset exceeded one word")
+            })?;
+            let primary = 1_u64.checked_shl(shift).ok_or(
+                BuildError::InternalInvariant("primary anchor bit exceeded one word"),
+            )?;
+            if nonuniversal_mask & primary == 0 {
+                return Err(BuildError::InternalInvariant(
+                    "primary anchor was not a non-universal predicate",
+                ));
+            }
+            usize::try_from((nonuniversal_mask & !primary).count_ones()).map_err(|_| {
+                BuildError::InternalInvariant("verification count did not fit usize")
+            })?
+        }
+        None => 0,
+    };
+    let adaptive_fallback = match (primary_offset, fallback, verification_positions != 0) {
+        (Some(_), Some(candidate), true) => {
+            let offset = u8::try_from(candidate.score.2).map_err(|_| {
+                BuildError::InternalInvariant("adaptive fallback offset exceeded one byte")
+            })?;
+            let cardinality = u16::try_from(candidate.score.0).map_err(|_| {
+                BuildError::InternalInvariant("adaptive fallback cardinality exceeded identity")
+            })?;
+            let finder = match candidate.score.0 {
+                1 => AdaptiveFinder::One(candidate.bytes[0]),
+                2 => AdaptiveFinder::Two(candidate.bytes[0], candidate.bytes[1]),
+                3 => AdaptiveFinder::Three(
+                    candidate.bytes[0],
+                    candidate.bytes[1],
+                    candidate.bytes[2],
+                ),
+                _ => match candidate.contiguous_range {
+                    Some((origin, maximum_delta)) => AdaptiveFinder::Range {
+                        origin,
+                        maximum_delta,
+                    },
+                    None if candidate.score.0 == 4 => AdaptiveFinder::Four(candidate.bytes),
+                    None => {
+                        tracker.build_adaptive_classifier()?;
+                        AdaptiveFinder::Set(ByteSetClassifier::new(candidate.set))
+                    }
+                },
+            };
+            Some(AdaptiveFallback {
+                offset,
+                cardinality,
+                finder,
+            })
+        }
+        _ => None,
+    };
+    Ok((
+        selected,
+        secondary_anchor,
+        adaptive_fallback,
+        nonuniversal_mask,
+    ))
 }
 
 fn actual_build_work(
@@ -1208,12 +1882,14 @@ fn actual_build_work(
     source_ranges: usize,
     member_writes: usize,
     anchor_mask_reads: usize,
+    adaptive_fallback_work: usize,
 ) -> Result<u64, BuildError> {
     let work = source_ranges
         .checked_mul(RANGE_FIXED_WORK)
         .and_then(|range_work| MASK_SLOTS.checked_add(width)?.checked_add(range_work))
         .and_then(|work| work.checked_add(member_writes))
         .and_then(|work| work.checked_add(anchor_mask_reads))
+        .and_then(|work| work.checked_add(adaptive_fallback_work))
         .and_then(|work| work.checked_add(BUILD_FIXED_WORK))
         .ok_or(BuildError::ArithmeticOverflow {
             computation: "actual build work",
@@ -1269,13 +1945,22 @@ impl FixedPredicateWord64Plan {
         let result = (|| {
             let preflight = preflight_build(positions, limits)?;
             let (masks, member_writes) = compile_masks(positions, &mut tracker)?;
-            let (anchor, secondary_anchor) = select_anchor(&masks, preflight.width, &mut tracker)?;
+            let (anchor, secondary_anchor, adaptive_fallback, nonuniversal_mask) =
+                select_anchor(&masks, preflight.width, &mut tracker)?;
+            if tracker.actual.adaptive_classifier_build_work
+                != adaptive_fallback.map_or(0, |fallback| fallback.classifier_build_work())
+            {
+                return Err(BuildError::InternalInvariant(
+                    "adaptive classifier build work disagreed with retained finder",
+                ));
+            }
             tracker.finish(preflight)?;
             let independently_counted_work = actual_build_work(
                 preflight.width,
                 preflight.source_ranges,
                 member_writes,
                 tracker.actual.anchor_mask_reads,
+                tracker.actual.adaptive_classifier_build_work,
             )?;
             if tracker.actual.work != independently_counted_work {
                 return Err(BuildError::InternalInvariant(
@@ -1307,6 +1992,7 @@ impl FixedPredicateWord64Plan {
                 range_inspections: tracker.actual.range_inspections,
                 member_writes: tracker.actual.member_writes,
                 anchor_mask_reads: tracker.actual.anchor_mask_reads,
+                adaptive_classifier_build_work: tracker.actual.adaptive_classifier_build_work,
                 work_upper_bound: preflight.work_upper_bound,
                 work_charged: tracker.actual.work,
                 allocations: tracker.actual.allocations,
@@ -1320,8 +2006,10 @@ impl FixedPredicateWord64Plan {
                 masks,
                 width: preflight.width,
                 accepting_bit,
+                nonuniversal_mask,
                 anchor,
                 secondary_anchor,
+                adaptive_fallback,
                 build,
             })
         })();
@@ -1354,10 +2042,1060 @@ impl FixedPredicateWord64Plan {
         self.width
     }
 
+    fn verification_positions(&self) -> Option<usize> {
+        let offset = u32::from(self.anchor.offset()?);
+        let primary = 1_u64.checked_shl(offset)?;
+        if self.nonuniversal_mask & primary == 0 {
+            return None;
+        }
+        usize::try_from((self.nonuniversal_mask & !primary).count_ones()).ok()
+    }
+
+    const fn verification_predicate_identity_count(&self) -> u32 {
+        match self.anchor {
+            Anchor::One { .. } | Anchor::Two { .. } => {
+                self.nonuniversal_mask.count_ones().saturating_sub(1)
+            }
+            Anchor::ShiftAnd => 0,
+        }
+    }
+
+    const fn secondary_anchor_identity(&self) -> Option<ExactAnchorIdentity> {
+        match self.secondary_anchor {
+            Some(anchor) => anchor.exact_identity(),
+            None => None,
+        }
+    }
+
+    const fn adaptive_handoff_identity(&self) -> AdaptiveHandoffIdentity {
+        match self.adaptive_fallback {
+            Some(fallback) => AdaptiveHandoffIdentity::Finder {
+                finder: fallback.identity(),
+                final_shift_and: true,
+            },
+            None => AdaptiveHandoffIdentity::Disabled,
+        }
+    }
+
+    /// Maximum non-universal predicates checked for one anchored candidate.
+    /// Full-domain predicates are excluded. Every retained finder is itself
+    /// non-universal, so primary and fallback phases have the same maximum.
+    /// Returns zero for a Shift-And plan, which has no anchor candidates.
+    #[must_use]
+    pub fn max_verification_predicates(&self) -> usize {
+        self.verification_positions().unwrap_or(0)
+    }
+
     /// Successful construction certificate.
     #[must_use]
     pub const fn build_accounting(&self) -> BuildAccounting {
         self.build
+    }
+
+    /// Stable identity for one ordinary first-match search projection.
+    #[must_use]
+    pub const fn search_operation_identity(
+        &self,
+        operation: SearchOperation,
+    ) -> SearchOperationIdentity {
+        let operation_id = match operation {
+            SearchOperation::Exists => EXISTS_SEARCH_OPERATION_ID,
+            SearchOperation::EarliestEnd => EARLIEST_END_SEARCH_OPERATION_ID,
+            SearchOperation::SelectedEnd => SELECTED_END_SEARCH_OPERATION_ID,
+            SearchOperation::Span => SPAN_SEARCH_OPERATION_ID,
+        };
+        let (reducer, anchor_offset, anchor_bytes) = self.anchor.identity();
+        SearchOperationIdentity {
+            plan_id: SEARCH_PLAN_ID,
+            operation_id,
+            operation,
+            semantics: MatchSemantics::FixedBytePredicates,
+            selection: MatchSelection::LeftmostFirstNonOverlapping,
+            width: self.width,
+            reducer,
+            anchor_offset,
+            anchor_bytes,
+            secondary_anchor: self.secondary_anchor_identity(),
+            verification_predicates: self.verification_predicate_identity_count(),
+            adaptive_handoff: self.adaptive_handoff_identity(),
+        }
+    }
+
+    /// Whether a selected match exists wholly inside `window`.
+    pub fn is_match_window(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<(bool, SearchAccounting), SearchError> {
+        let (matched, accounting) =
+            self.search_window(haystack, window, limits, SearchOperation::Exists)?;
+        Ok((matched.is_some(), accounting))
+    }
+
+    /// Return only whether a selected match exists wholly inside `window`.
+    ///
+    /// The compact success projection deliberately omits diagnostic accounting
+    /// while retaining the reporting operation's exact preflight and error
+    /// contract.
+    pub fn is_match_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<bool, SearchError> {
+        self.search_window_value(haystack, window, limits)
+            .map(|matched| matched.is_some())
+    }
+
+    /// Return the first accepting end wholly inside `window`.
+    pub fn earliest_end_window(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<(Option<usize>, SearchAccounting), SearchError> {
+        let (matched, accounting) =
+            self.search_window(haystack, window, limits, SearchOperation::EarliestEnd)?;
+        Ok((matched.map(|(_, end)| end), accounting))
+    }
+
+    /// Return the selected leftmost-first end in the complete haystack.
+    pub fn selected_end(
+        &self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<(Option<usize>, SearchAccounting), SearchError> {
+        self.selected_end_window(haystack, Window::full(haystack), limits)
+    }
+
+    /// Return the selected leftmost-first end wholly inside `window`.
+    pub fn selected_end_window(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<(Option<usize>, SearchAccounting), SearchError> {
+        let (matched, accounting) =
+            self.search_window(haystack, window, limits, SearchOperation::SelectedEnd)?;
+        Ok((matched.map(|(_, end)| end), accounting))
+    }
+
+    /// Find the selected leftmost-first span in the complete haystack.
+    pub fn find(
+        &self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
+        self.find_window(haystack, Window::full(haystack), limits)
+    }
+
+    /// Find the selected leftmost-first span wholly inside `window`.
+    pub fn find_window(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
+        self.search_window(haystack, window, limits, SearchOperation::Span)
+    }
+
+    /// Return only the selected span wholly inside `window`.
+    ///
+    /// The compact success projection deliberately omits diagnostic accounting
+    /// while retaining the reporting operation's exact preflight and error
+    /// contract.
+    pub fn find_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<Option<(usize, usize)>, SearchError> {
+        self.search_window_value(haystack, window, limits)
+    }
+
+    fn search_window(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+        operation: SearchOperation,
+    ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
+        let upper_bounds = self.search_preflight(haystack.len(), window, limits)?;
+        let (matched, actual) = self.execute_first_match(haystack, window, upper_bounds)?;
+        Ok((
+            matched,
+            SearchAccounting {
+                identity: self.search_operation_identity(operation),
+                upper_bounds,
+                actual,
+            },
+        ))
+    }
+
+    fn search_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<Option<(usize, usize)>, SearchError> {
+        let _ = self.search_preflight(haystack.len(), window, limits)?;
+        let slice = haystack.get(window.start()..window.end()).ok_or(
+            SearchError::InternalInvariant("admitted fixed-predicate window disappeared"),
+        )?;
+        match self.anchor {
+            Anchor::One { offset, byte } => self.first_anchor_value(
+                slice,
+                window.start(),
+                usize::from(offset),
+                |bytes| memchr(byte, bytes),
+            ),
+            Anchor::Two {
+                offset,
+                first,
+                second,
+            } => self.first_anchor_value(
+                slice,
+                window.start(),
+                usize::from(offset),
+                |bytes| memchr2(first, second, bytes),
+            ),
+            Anchor::ShiftAnd => self.first_shift_and_value(slice, window.start()),
+        }
+    }
+
+    #[inline]
+    fn first_shift_and_value(
+        &self,
+        slice: &[u8],
+        window_start: usize,
+    ) -> Result<Option<(usize, usize)>, SearchError> {
+        if slice.len() < self.width {
+            return Ok(None);
+        }
+        let mut state = 0_u64;
+        for (position, &byte) in slice.iter().enumerate() {
+            state = (state.wrapping_shl(1) | 1) & self.masks[usize::from(byte)];
+            if state & self.accepting_bit != 0 {
+                let relative_end = position.checked_add(1).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "actual Shift-And match end",
+                    },
+                )?;
+                let relative_start = relative_end.checked_sub(self.width).ok_or(
+                    SearchError::InternalInvariant(
+                        "Shift-And accepted before the fixed word width",
+                    ),
+                )?;
+                let start = window_start.checked_add(relative_start).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "absolute Shift-And match start",
+                    },
+                )?;
+                let end = window_start.checked_add(relative_end).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "absolute Shift-And match end",
+                    },
+                )?;
+                return Ok(Some((start, end)));
+            }
+        }
+        Ok(None)
+    }
+
+    #[inline]
+    fn first_anchor_value(
+        &self,
+        slice: &[u8],
+        window_start: usize,
+        anchor_offset: usize,
+        mut find: impl FnMut(&[u8]) -> Option<usize>,
+    ) -> Result<Option<(usize, usize)>, SearchError> {
+        let anchor_end = slice
+            .len()
+            .checked_sub(self.width)
+            .and_then(|last_start| last_start.checked_add(anchor_offset))
+            .and_then(|last_anchor| last_anchor.checked_add(1))
+            .unwrap_or(0);
+        let mut cursor = anchor_offset.min(anchor_end);
+        let mut burst_start = 0_usize;
+        let mut burst_rejections = 0_usize;
+        while cursor < anchor_end {
+            let search = slice.get(cursor..anchor_end).ok_or(
+                SearchError::InternalInvariant("anchor search window escaped the input"),
+            )?;
+            let Some(relative) = find(search) else {
+                break;
+            };
+            let anchor = cursor.checked_add(relative).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "actual anchor search position",
+                },
+            )?;
+            let start = anchor.checked_sub(anchor_offset).ok_or(
+                SearchError::InternalInvariant("anchor preceded its fixed offset"),
+            )?;
+            let is_match = self
+                .anchor_candidate_matches_value(slice, start, anchor_offset)
+                .ok_or(SearchError::InternalInvariant(
+                    "compact anchor verification arithmetic failed after preflight",
+                ))?;
+            if is_match {
+                let relative_end = start.checked_add(self.width).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "actual anchor match end",
+                    },
+                )?;
+                let absolute_start = window_start.checked_add(start).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "absolute anchor match start",
+                    },
+                )?;
+                let absolute_end = window_start.checked_add(relative_end).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "absolute anchor match end",
+                    },
+                )?;
+                return Ok(Some((absolute_start, absolute_end)));
+            }
+            cursor = anchor.checked_add(1).ok_or(SearchError::ArithmeticOverflow {
+                computation: "rejected anchor search restart",
+            })?;
+            if burst_rejections == 0 {
+                burst_start = anchor;
+            }
+            burst_rejections = burst_rejections.checked_add(1).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "adaptive anchor rejection burst",
+                },
+            )?;
+            if burst_rejections == ADAPTIVE_FALLBACK_REJECTIONS
+                && self.adaptive_fallback.is_some()
+                && dense_rejection_burst(burst_start, anchor, burst_rejections).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "adaptive anchor rejection density",
+                    },
+                )?
+            {
+                let fallback_start = cursor.checked_sub(anchor_offset).ok_or(
+                    SearchError::InternalInvariant(
+                        "adaptive fallback preceded the first untested start",
+                    ),
+                )?;
+                return self.first_adaptive_fallback_value(
+                    slice,
+                    window_start,
+                    fallback_start,
+                );
+            }
+            if burst_rejections == ADAPTIVE_FALLBACK_REJECTIONS {
+                burst_rejections = 0;
+            }
+        }
+        Ok(None)
+    }
+
+    #[inline]
+    fn first_adaptive_fallback_value(
+        &self,
+        slice: &[u8],
+        window_start: usize,
+        first_untested_start: usize,
+    ) -> Result<Option<(usize, usize)>, SearchError> {
+        if !has_legal_start(slice.len(), self.width, first_untested_start) {
+            return Ok(None);
+        }
+        let Some(fallback) = self.adaptive_fallback.as_ref() else {
+            let remaining = slice.get(first_untested_start..).ok_or(
+                SearchError::InternalInvariant("adaptive Shift-And fallback escaped the input"),
+            )?;
+            let absolute = window_start.checked_add(first_untested_start).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "adaptive Shift-And fallback absolute start",
+                },
+            )?;
+            return self.first_shift_and_value(remaining, absolute);
+        };
+        let fallback_offset = usize::from(fallback.offset);
+        let anchor_end = slice
+            .len()
+            .checked_sub(self.width)
+            .and_then(|last_start| last_start.checked_add(fallback_offset))
+            .and_then(|last_anchor| last_anchor.checked_add(1))
+            .unwrap_or(0);
+        let mut cursor = first_untested_start
+            .checked_add(fallback_offset)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "adaptive byte-set fallback cursor",
+            })?
+            .min(anchor_end);
+        let mut finder = fallback.cursor(slice, anchor_end);
+        let mut burst_start = 0_usize;
+        let mut burst_rejections = 0_usize;
+        while cursor < anchor_end {
+            let Some(anchor) = finder.find(cursor) else {
+                break;
+            };
+            let start = anchor.checked_sub(fallback_offset).ok_or(
+                SearchError::InternalInvariant("adaptive byte-set fallback preceded its offset"),
+            )?;
+            if self
+                .candidate_matches_value_skipping(slice, start, fallback_offset)
+                .ok_or(SearchError::InternalInvariant(
+                    "adaptive byte-set fallback verification failed",
+                ))?
+            {
+                let relative_end = start.checked_add(self.width).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "adaptive byte-set fallback match end",
+                    },
+                )?;
+                let absolute_start = window_start.checked_add(start).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "adaptive byte-set fallback absolute start",
+                    },
+                )?;
+                let absolute_end = window_start.checked_add(relative_end).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "adaptive byte-set fallback absolute end",
+                    },
+                )?;
+                return Ok(Some((absolute_start, absolute_end)));
+            }
+            cursor = anchor.checked_add(1).ok_or(SearchError::ArithmeticOverflow {
+                computation: "adaptive byte-set rejection restart",
+            })?;
+            if burst_rejections == 0 {
+                burst_start = anchor;
+            }
+            burst_rejections = burst_rejections.checked_add(1).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "adaptive byte-set rejection burst",
+                },
+            )?;
+            if burst_rejections == ADAPTIVE_FALLBACK_REJECTIONS
+                && dense_rejection_burst(burst_start, anchor, burst_rejections).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "adaptive byte-set rejection density",
+                },
+                )?
+            {
+                let shift_start = cursor.checked_sub(fallback_offset).ok_or(
+                    SearchError::InternalInvariant(
+                        "adaptive Shift-And fallback preceded the first untested start",
+                    ),
+                )?;
+                let remaining = slice.get(shift_start..).ok_or(
+                    SearchError::InternalInvariant("adaptive Shift-And fallback escaped input"),
+                )?;
+                let absolute = window_start.checked_add(shift_start).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "adaptive Shift-And fallback absolute start",
+                    },
+                )?;
+                return self.first_shift_and_value(remaining, absolute);
+            }
+            if burst_rejections == ADAPTIVE_FALLBACK_REJECTIONS {
+                burst_rejections = 0;
+            }
+        }
+        Ok(None)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the source-free preflight keeps every checked search bound adjacent"
+    )]
+    fn search_preflight(
+        &self,
+        haystack_len: usize,
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<SearchUpperBounds, SearchError> {
+        if window.start() > window.end() || window.end() > haystack_len {
+            return Err(SearchError::InvalidWindow {
+                start: window.start(),
+                end: window.end(),
+                haystack_len,
+            });
+        }
+        let window_bytes = window.end().checked_sub(window.start()).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "search window width",
+            },
+        )?;
+        let candidate_events = window_bytes
+            .checked_sub(self.width)
+            .and_then(|last| last.checked_add(1))
+            .unwrap_or(0);
+        let match_events = usize::from(candidate_events != 0);
+        let scratch_bytes = 0;
+        if scratch_bytes > limits.max_scratch_bytes {
+            return Err(SearchError::ScratchLimit {
+                needed: scratch_bytes,
+                limit: limits.max_scratch_bytes,
+            });
+        }
+        let (
+            transitions,
+            finder_scanned_bytes,
+            shift_and_transitions,
+            finder_calls,
+            candidate_events,
+            predicate_checks,
+            work,
+        ) = match self.anchor {
+                Anchor::ShiftAnd => {
+                    let work = window_bytes
+                        .checked_mul(TRANSITION_WORK)
+                        .and_then(|work| {
+                            work.checked_add(match_events.checked_mul(MATCH_WORK)?)
+                        })
+                        .and_then(|work| work.checked_add(REDUCE_FINAL_WORK))
+                        .ok_or(SearchError::ArithmeticOverflow {
+                            computation: "Shift-And search work upper bound",
+                        })?;
+                    (window_bytes, 0, window_bytes, 0, 0, 0, work)
+                }
+                Anchor::One { .. } | Anchor::Two { .. } => {
+                    let finder_calls = if candidate_events == 0 {
+                        0
+                    } else {
+                        candidate_events.checked_add(1).ok_or(
+                            SearchError::ArithmeticOverflow {
+                                computation: "anchor search finder-call upper bound",
+                            },
+                        )?
+                    };
+                    let verification_positions = self.verification_positions().ok_or(
+                        SearchError::InternalInvariant(
+                            "anchored search lost its verification-position count",
+                        ),
+                    )?;
+                    let predicate_checks = candidate_events
+                        .checked_mul(verification_positions)
+                        .ok_or(SearchError::ArithmeticOverflow {
+                            computation: "anchor search predicate-check upper bound",
+                        })?;
+                    let anchor_work = candidate_events
+                        .checked_mul(FINDER_SCAN_BYTE_WORK)
+                        .and_then(|work| {
+                            work.checked_add(finder_calls.checked_mul(FINDER_CALL_WORK)?)
+                        })
+                        .and_then(|work| {
+                            work.checked_add(
+                                candidate_events.checked_mul(ANCHOR_CANDIDATE_WORK)?,
+                            )
+                        })
+                        .and_then(|work| {
+                            work.checked_add(
+                                predicate_checks.checked_mul(PREDICATE_CHECK_WORK)?,
+                            )
+                        })
+                        .and_then(|work| {
+                            work.checked_add(match_events.checked_mul(MATCH_WORK)?)
+                        })
+                        .and_then(|work| work.checked_add(REDUCE_FINAL_WORK))
+                        .ok_or(SearchError::ArithmeticOverflow {
+                            computation: "anchor search work upper bound",
+                        })?;
+                    let work = if self.adaptive_fallback.is_some() {
+                        let hybrid_work = hybrid_anchor_work_upper(
+                            window_bytes,
+                            candidate_events,
+                            verification_positions,
+                        )
+                        .and_then(|work| {
+                            work.checked_add(match_events.checked_mul(MATCH_WORK)?)
+                        })
+                        .and_then(|work| work.checked_add(REDUCE_FINAL_WORK))
+                        .ok_or(SearchError::ArithmeticOverflow {
+                            computation: "adaptive search work upper bound",
+                        })?;
+                        anchor_work.max(hybrid_work)
+                    } else {
+                        anchor_work
+                    };
+                    (
+                        if self.adaptive_fallback.is_some() {
+                            window_bytes
+                        } else {
+                            candidate_events
+                        },
+                        candidate_events,
+                        if self.adaptive_fallback.is_some() {
+                            window_bytes
+                        } else {
+                            0
+                        },
+                        finder_calls,
+                        candidate_events,
+                        predicate_checks,
+                        work,
+                    )
+                }
+            };
+        let work = u64::try_from(work).map_err(|_| SearchError::ArithmeticOverflow {
+            computation: "search work upper-bound conversion",
+        })?;
+        if work > limits.max_work {
+            return Err(SearchError::WorkLimit {
+                needed: work,
+                limit: limits.max_work,
+            });
+        }
+        Ok(SearchUpperBounds {
+            window_bytes,
+            transitions,
+            finder_scanned_bytes,
+            shift_and_transitions,
+            finder_calls,
+            candidate_events,
+            predicate_checks,
+            match_events,
+            work,
+            scratch_bytes,
+        })
+    }
+
+    fn execute_first_match(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        upper: SearchUpperBounds,
+    ) -> Result<(Option<(usize, usize)>, SearchActualCounters), SearchError> {
+        let slice = haystack.get(window.start()..window.end()).ok_or(
+            SearchError::InternalInvariant("admitted fixed-predicate window disappeared"),
+        )?;
+        match self.anchor {
+            Anchor::One { offset, byte } => self.execute_first_anchor(
+                slice,
+                window.start(),
+                upper,
+                usize::from(offset),
+                |bytes| memchr(byte, bytes),
+            ),
+            Anchor::Two {
+                offset,
+                first,
+                second,
+            } => self.execute_first_anchor(
+                slice,
+                window.start(),
+                upper,
+                usize::from(offset),
+                |bytes| memchr2(first, second, bytes),
+            ),
+            Anchor::ShiftAnd => self.execute_first_shift_and(slice, window.start(), upper),
+        }
+    }
+
+    fn execute_first_shift_and(
+        &self,
+        slice: &[u8],
+        window_start: usize,
+        upper: SearchUpperBounds,
+    ) -> Result<(Option<(usize, usize)>, SearchActualCounters), SearchError> {
+        let mut state = 0_u64;
+        let mut transitions = 0_usize;
+        let mut matched = None;
+        for (position, &byte) in slice.iter().enumerate() {
+            transitions = transitions.checked_add(1).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "actual Shift-And search transitions",
+                },
+            )?;
+            state = (state.wrapping_shl(1) | 1) & self.masks[usize::from(byte)];
+            if state & self.accepting_bit != 0 {
+                let relative_end = position.checked_add(1).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "actual Shift-And match end",
+                    },
+                )?;
+                let relative_start = relative_end.checked_sub(self.width).ok_or(
+                    SearchError::InternalInvariant(
+                        "Shift-And accepted before the fixed word width",
+                    ),
+                )?;
+                let start = window_start.checked_add(relative_start).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "absolute Shift-And match start",
+                    },
+                )?;
+                let end = window_start.checked_add(relative_end).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "absolute Shift-And match end",
+                    },
+                )?;
+                matched = Some((start, end));
+                break;
+            }
+        }
+        let actual = SearchActualCounters {
+            window_bytes: slice.len(),
+            transitions,
+            finder_scanned_bytes: 0,
+            shift_and_transitions: transitions,
+            finder_calls: 0,
+            candidate_events: 0,
+            predicate_checks: 0,
+            match_events: usize::from(matched.is_some()),
+            work: search_work(
+                0,
+                transitions,
+                0,
+                0,
+                0,
+                usize::from(matched.is_some()),
+            )?,
+            scratch_bytes: 0,
+        };
+        ensure_search_actual_within(actual, upper)?;
+        Ok((matched, actual))
+    }
+
+    fn execute_first_anchor(
+        &self,
+        slice: &[u8],
+        window_start: usize,
+        upper: SearchUpperBounds,
+        anchor_offset: usize,
+        mut find: impl FnMut(&[u8]) -> Option<usize>,
+    ) -> Result<(Option<(usize, usize)>, SearchActualCounters), SearchError> {
+        let anchor_end = slice
+            .len()
+            .checked_sub(self.width)
+            .and_then(|last_start| last_start.checked_add(anchor_offset))
+            .and_then(|last_anchor| last_anchor.checked_add(1))
+            .unwrap_or(0);
+        let mut cursor = anchor_offset.min(anchor_end);
+        let mut finder_scanned_bytes = 0_usize;
+        let mut shift_and_transitions = 0_usize;
+        let mut finder_calls = 0_usize;
+        let mut candidate_events = 0_usize;
+        let mut predicate_checks = 0_usize;
+        let mut matched = None;
+        let mut burst_start = 0_usize;
+        let mut burst_rejections = 0_usize;
+        while cursor < anchor_end {
+            let search = slice.get(cursor..anchor_end).ok_or(
+                SearchError::InternalInvariant("anchor search window escaped the input"),
+            )?;
+            finder_calls = finder_calls.checked_add(1).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "actual anchor search finder calls",
+                },
+            )?;
+            let Some(relative) = find(search) else {
+                finder_scanned_bytes = finder_scanned_bytes.checked_add(search.len()).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "actual unsuccessful anchor search service bytes",
+                    },
+                )?;
+                break;
+            };
+            finder_scanned_bytes = finder_scanned_bytes
+                .checked_add(relative.checked_add(1).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "actual successful anchor search service",
+                    },
+                )?)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "actual anchor search service bytes",
+                })?;
+            let anchor = cursor.checked_add(relative).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "actual anchor search position",
+                },
+            )?;
+            let start = anchor.checked_sub(anchor_offset).ok_or(
+                SearchError::InternalInvariant("anchor preceded its fixed offset"),
+            )?;
+            candidate_events = candidate_events.checked_add(1).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "actual anchor search candidates",
+                },
+            )?;
+            let is_match = self
+                .anchor_candidate_matches(slice, start, anchor_offset, &mut predicate_checks)
+                .map_err(|error| search_error_from_reduce(&error))?;
+            if is_match {
+                let relative_end = start.checked_add(self.width).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "actual anchor match end",
+                    },
+                )?;
+                let absolute_start = window_start.checked_add(start).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "absolute anchor match start",
+                    },
+                )?;
+                let absolute_end = window_start.checked_add(relative_end).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "absolute anchor match end",
+                    },
+                )?;
+                matched = Some((absolute_start, absolute_end));
+                break;
+            }
+            cursor = anchor.checked_add(1).ok_or(SearchError::ArithmeticOverflow {
+                computation: "rejected anchor search restart",
+            })?;
+            if burst_rejections == 0 {
+                burst_start = anchor;
+            }
+            burst_rejections = burst_rejections.checked_add(1).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "adaptive reporting rejection burst",
+                },
+            )?;
+            if burst_rejections == ADAPTIVE_FALLBACK_REJECTIONS
+                && self.adaptive_fallback.is_some()
+                && dense_rejection_burst(burst_start, anchor, burst_rejections).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "adaptive reporting rejection density",
+                    },
+                )?
+            {
+                let first_untested_start = cursor.checked_sub(anchor_offset).ok_or(
+                    SearchError::InternalInvariant(
+                        "adaptive reporting fallback preceded the first untested start",
+                    ),
+                )?;
+                matched = self.execute_first_adaptive_reporting(
+                    slice,
+                    window_start,
+                    first_untested_start,
+                    &mut finder_scanned_bytes,
+                    &mut shift_and_transitions,
+                    &mut finder_calls,
+                    &mut candidate_events,
+                    &mut predicate_checks,
+                )?;
+                break;
+            }
+            if burst_rejections == ADAPTIVE_FALLBACK_REJECTIONS {
+                burst_rejections = 0;
+            }
+        }
+        let match_events = usize::from(matched.is_some());
+        let transitions = finder_scanned_bytes.checked_add(shift_and_transitions).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "adaptive reporting transitions",
+            },
+        )?;
+        let actual = SearchActualCounters {
+            window_bytes: slice.len(),
+            transitions,
+            finder_scanned_bytes,
+            shift_and_transitions,
+            finder_calls,
+            candidate_events,
+            predicate_checks,
+            match_events,
+            work: search_work(
+                finder_scanned_bytes,
+                shift_and_transitions,
+                finder_calls,
+                candidate_events,
+                predicate_checks,
+                match_events,
+            )?,
+            scratch_bytes: 0,
+        };
+        ensure_search_actual_within(actual, upper)?;
+        Ok((matched, actual))
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the adaptive path updates one closed first-search ledger in place"
+    )]
+    fn execute_first_adaptive_reporting(
+        &self,
+        slice: &[u8],
+        window_start: usize,
+        first_untested_start: usize,
+        finder_scanned_bytes: &mut usize,
+        shift_and_transitions: &mut usize,
+        finder_calls: &mut usize,
+        candidate_events: &mut usize,
+        predicate_checks: &mut usize,
+    ) -> Result<Option<(usize, usize)>, SearchError> {
+        if !has_legal_start(slice.len(), self.width, first_untested_start) {
+            return Ok(None);
+        }
+        let Some(fallback) = self.adaptive_fallback.as_ref() else {
+            return self.execute_first_shift_and_reporting(
+                slice,
+                window_start,
+                first_untested_start,
+                shift_and_transitions,
+            );
+        };
+        let fallback_offset = usize::from(fallback.offset);
+        let anchor_end = slice
+            .len()
+            .checked_sub(self.width)
+            .and_then(|last_start| last_start.checked_add(fallback_offset))
+            .and_then(|last_anchor| last_anchor.checked_add(1))
+            .unwrap_or(0);
+        let mut cursor = first_untested_start
+            .checked_add(fallback_offset)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "adaptive reporting byte-set cursor",
+            })?
+            .min(anchor_end);
+        let mut finder = fallback.cursor(slice, anchor_end);
+        let mut burst_start = 0_usize;
+        let mut burst_rejections = 0_usize;
+        while cursor < anchor_end {
+            *finder_calls = finder_calls.checked_add(1).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "adaptive reporting byte-set finder calls",
+                },
+            )?;
+            let service_start = cursor;
+            let Some(anchor) = finder.find(cursor) else {
+                let terminal_service = anchor_end.checked_sub(service_start).ok_or(
+                    SearchError::InternalInvariant(
+                        "adaptive reporting finder service reversed",
+                    ),
+                )?;
+                *finder_scanned_bytes = finder_scanned_bytes.checked_add(terminal_service).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "adaptive reporting byte-set terminal service",
+                    },
+                )?;
+                break;
+            };
+            let service = anchor
+                .checked_sub(service_start)
+                .and_then(|relative| relative.checked_add(1))
+                .ok_or(SearchError::InternalInvariant(
+                    "adaptive reporting finder service reversed",
+                ))?;
+            *finder_scanned_bytes = finder_scanned_bytes.checked_add(service).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "adaptive reporting byte-set service bytes",
+                },
+            )?;
+            let start = anchor.checked_sub(fallback_offset).ok_or(
+                SearchError::InternalInvariant(
+                    "adaptive reporting byte-set anchor preceded its offset",
+                ),
+            )?;
+            *candidate_events = candidate_events.checked_add(1).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "adaptive reporting byte-set candidates",
+                },
+            )?;
+            if self
+                .candidate_matches_skipping(slice, start, fallback_offset, predicate_checks)
+                .map_err(|error| search_error_from_reduce(&error))?
+            {
+                let relative_end = start.checked_add(self.width).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "adaptive reporting byte-set match end",
+                    },
+                )?;
+                let absolute_start = window_start.checked_add(start).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "adaptive reporting byte-set absolute start",
+                    },
+                )?;
+                let absolute_end = window_start.checked_add(relative_end).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "adaptive reporting byte-set absolute end",
+                    },
+                )?;
+                return Ok(Some((absolute_start, absolute_end)));
+            }
+            cursor = anchor.checked_add(1).ok_or(SearchError::ArithmeticOverflow {
+                computation: "adaptive reporting byte-set restart",
+            })?;
+            if burst_rejections == 0 {
+                burst_start = anchor;
+            }
+            burst_rejections = burst_rejections.checked_add(1).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "adaptive reporting byte-set rejection burst",
+                },
+            )?;
+            if burst_rejections == ADAPTIVE_FALLBACK_REJECTIONS
+                && dense_rejection_burst(burst_start, anchor, burst_rejections).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "adaptive reporting byte-set rejection density",
+                },
+                )?
+            {
+                let shift_start = cursor.checked_sub(fallback_offset).ok_or(
+                    SearchError::InternalInvariant(
+                        "adaptive reporting Shift-And preceded the first untested start",
+                    ),
+                )?;
+                return self.execute_first_shift_and_reporting(
+                    slice,
+                    window_start,
+                    shift_start,
+                    shift_and_transitions,
+                );
+            }
+            if burst_rejections == ADAPTIVE_FALLBACK_REJECTIONS {
+                burst_rejections = 0;
+            }
+        }
+        Ok(None)
+    }
+
+    fn execute_first_shift_and_reporting(
+        &self,
+        slice: &[u8],
+        window_start: usize,
+        first_untested_start: usize,
+        shift_and_transitions: &mut usize,
+    ) -> Result<Option<(usize, usize)>, SearchError> {
+        let remaining = slice.get(first_untested_start..).ok_or(
+            SearchError::InternalInvariant("adaptive reporting Shift-And escaped input"),
+        )?;
+        if remaining.len() < self.width {
+            return Ok(None);
+        }
+        let mut state = 0_u64;
+        for (position, &byte) in remaining.iter().enumerate() {
+            *shift_and_transitions = shift_and_transitions.checked_add(1).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "adaptive reporting Shift-And transitions",
+                },
+            )?;
+            state = (state.wrapping_shl(1) | 1) & self.masks[usize::from(byte)];
+            if state & self.accepting_bit == 0 {
+                continue;
+            }
+            let relative_end = first_untested_start
+                .checked_add(position)
+                .and_then(|end| end.checked_add(1))
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "adaptive reporting Shift-And match end",
+                })?;
+            let relative_start = relative_end.checked_sub(self.width).ok_or(
+                SearchError::InternalInvariant(
+                    "adaptive reporting Shift-And accepted before the fixed width",
+                ),
+            )?;
+            let absolute_start = window_start.checked_add(relative_start).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "adaptive reporting Shift-And absolute start",
+                },
+            )?;
+            let absolute_end = window_start.checked_add(relative_end).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "adaptive reporting Shift-And absolute end",
+                },
+            )?;
+            return Ok(Some((absolute_start, absolute_end)));
+        }
+        Ok(None)
     }
 
     /// Stable identity for one operation.
@@ -1378,6 +3116,9 @@ impl FixedPredicateWord64Plan {
             reducer,
             anchor_offset,
             anchor_bytes,
+            secondary_anchor: self.secondary_anchor_identity(),
+            verification_predicates: self.verification_predicate_identity_count(),
+            adaptive_handoff: self.adaptive_handoff_identity(),
         }
     }
 
@@ -1587,6 +3328,8 @@ impl FixedPredicateWord64Plan {
         Ok(ReduceUpperBounds {
             input_bytes,
             transitions: reducer.transitions,
+            finder_scanned_bytes: reducer.finder_scanned_bytes,
+            shift_and_transitions: reducer.shift_and_transitions,
             finder_calls: reducer.finder_calls,
             anchor_candidates: reducer.anchor_candidates,
             predicate_checks: reducer.predicate_checks,
@@ -1627,13 +3370,15 @@ impl FixedPredicateWord64Plan {
                         })?
                 };
                 let predicate_checks = candidate_positions
-                    .checked_mul(self.width.checked_sub(1).ok_or(
-                        ReduceError::InternalInvariant("validated word width became zero"),
+                    .checked_mul(self.verification_positions().ok_or(
+                        ReduceError::InternalInvariant(
+                            "anchored reducer lost its verification-position count",
+                        ),
                     )?)
                     .ok_or(ReduceError::ArithmeticOverflow {
                         computation: "anchor predicate-check bound",
                     })?;
-                let work = candidate_positions
+                let anchor_work = candidate_positions
                     .checked_mul(FINDER_SCAN_BYTE_WORK)
                     .and_then(|value| {
                         value.checked_add(finder_calls.checked_mul(FINDER_CALL_WORK)?)
@@ -1647,8 +3392,36 @@ impl FixedPredicateWord64Plan {
                     .ok_or(ReduceError::ArithmeticOverflow {
                         computation: "anchor reducer work bound",
                     })?;
+                let verification_positions = self.verification_positions().ok_or(
+                    ReduceError::InternalInvariant(
+                        "anchored reducer lost its verification-position count",
+                    ),
+                )?;
+                let work = if self.adaptive_fallback.is_some() {
+                    let hybrid_work = hybrid_anchor_work_upper(
+                        input_bytes,
+                        candidate_positions,
+                        verification_positions,
+                    )
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "adaptive reducer work bound",
+                    })?;
+                    anchor_work.max(hybrid_work)
+                } else {
+                    anchor_work
+                };
                 Ok(ReducerUpper {
-                    transitions: input_bytes,
+                    transitions: if self.adaptive_fallback.is_some() {
+                        input_bytes
+                    } else {
+                        candidate_positions
+                    },
+                    finder_scanned_bytes: candidate_positions,
+                    shift_and_transitions: if self.adaptive_fallback.is_some() {
+                        input_bytes
+                    } else {
+                        0
+                    },
                     finder_calls,
                     anchor_candidates: candidate_positions,
                     predicate_checks,
@@ -1657,6 +3430,8 @@ impl FixedPredicateWord64Plan {
             }
             Anchor::ShiftAnd => Ok(ReducerUpper {
                 transitions: input_bytes,
+                finder_scanned_bytes: 0,
+                shift_and_transitions: input_bytes,
                 finder_calls: 0,
                 anchor_candidates: 0,
                 predicate_checks: 0,
@@ -1772,6 +3547,9 @@ impl FixedPredicateWord64Plan {
 
     #[inline]
     fn scan_shift_and_value(&self, haystack: &[u8]) -> Option<u64> {
+        if haystack.len() < self.width {
+            return Some(0);
+        }
         let mut state = 0_u64;
         let mut count = 0_u64;
         for &byte in haystack {
@@ -1799,6 +3577,8 @@ impl FixedPredicateWord64Plan {
             .unwrap_or(0);
         let mut cursor = anchor_offset.min(anchor_end);
         let mut count = 0_u64;
+        let mut burst_start = 0_usize;
+        let mut burst_rejections = 0_usize;
         while cursor < anchor_end {
             let search = haystack.get(cursor..anchor_end)?;
             let Some(relative) = find(search) else {
@@ -1809,11 +3589,128 @@ impl FixedPredicateWord64Plan {
             if self.anchor_candidate_matches_value(haystack, start, anchor_offset)? {
                 count = count.checked_add(1)?;
                 cursor = anchor.checked_add(self.width)?;
+                burst_rejections = 0;
             } else {
                 cursor = anchor.checked_add(1)?;
+                if burst_rejections == 0 {
+                    burst_start = anchor;
+                }
+                burst_rejections = burst_rejections.checked_add(1)?;
+                if burst_rejections == ADAPTIVE_FALLBACK_REJECTIONS
+                    && self.adaptive_fallback.is_some()
+                    && dense_rejection_burst(burst_start, anchor, burst_rejections)?
+                {
+                    let fallback_start = cursor.checked_sub(anchor_offset)?;
+                    return count
+                        .checked_add(self.scan_adaptive_fallback_value(haystack, fallback_start)?);
+                }
+                if burst_rejections == ADAPTIVE_FALLBACK_REJECTIONS {
+                    burst_rejections = 0;
+                }
             }
         }
         Some(count)
+    }
+
+    #[inline]
+    fn scan_adaptive_fallback_value(
+        &self,
+        haystack: &[u8],
+        first_untested_start: usize,
+    ) -> Option<u64> {
+        if !has_legal_start(haystack.len(), self.width, first_untested_start) {
+            return Some(0);
+        }
+        let Some(fallback) = self.adaptive_fallback.as_ref() else {
+            return self.scan_shift_and_value(haystack.get(first_untested_start..)?);
+        };
+        let fallback_offset = usize::from(fallback.offset);
+        let anchor_end = haystack
+            .len()
+            .checked_sub(self.width)
+            .and_then(|last_start| last_start.checked_add(fallback_offset))
+            .and_then(|last_anchor| last_anchor.checked_add(1))
+            .unwrap_or(0);
+        let mut cursor = first_untested_start
+            .checked_add(fallback_offset)?
+            .min(anchor_end);
+        let mut finder = fallback.cursor(haystack, anchor_end);
+        let mut count = 0_u64;
+        let mut burst_start = 0_usize;
+        let mut burst_rejections = 0_usize;
+        while cursor < anchor_end {
+            let Some(anchor) = finder.find(cursor) else {
+                break;
+            };
+            let start = anchor.checked_sub(fallback_offset)?;
+            if self.candidate_matches_value_skipping(haystack, start, fallback_offset)? {
+                count = count.checked_add(1)?;
+                cursor = anchor.checked_add(self.width)?;
+                burst_rejections = 0;
+            } else {
+                cursor = anchor.checked_add(1)?;
+                if burst_rejections == 0 {
+                    burst_start = anchor;
+                }
+                burst_rejections = burst_rejections.checked_add(1)?;
+                if burst_rejections == ADAPTIVE_FALLBACK_REJECTIONS
+                    && dense_rejection_burst(burst_start, anchor, burst_rejections)?
+                {
+                    let shift_start = cursor.checked_sub(fallback_offset)?;
+                    return count
+                        .checked_add(self.scan_shift_and_value(haystack.get(shift_start..)?)?);
+                }
+                if burst_rejections == ADAPTIVE_FALLBACK_REJECTIONS {
+                    burst_rejections = 0;
+                }
+            }
+        }
+        Some(count)
+    }
+
+    #[inline]
+    fn candidate_matches_value_skipping(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        skipped_offset: usize,
+    ) -> Option<bool> {
+        let end = start.checked_add(self.width)?;
+        let candidate = haystack.get(start..end)?;
+        let skipped_shift = u32::try_from(skipped_offset).ok()?;
+        let mut remaining = self.nonuniversal_mask & !1_u64.checked_shl(skipped_shift)?;
+        let primary_offset = usize::from(self.anchor.offset()?);
+        if primary_offset == skipped_offset {
+            return None;
+        }
+        if !self.anchor.matches(*candidate.get(primary_offset)?)? {
+            return Some(false);
+        }
+        let primary_shift = u32::try_from(primary_offset).ok()?;
+        remaining &= !1_u64.checked_shl(primary_shift)?;
+        if let Some(secondary) = self.secondary_anchor {
+            let secondary_offset = usize::from(secondary.offset()?);
+            if secondary_offset != skipped_offset {
+                if secondary_offset == primary_offset {
+                    return None;
+                }
+                if !secondary.matches(*candidate.get(secondary_offset)?)? {
+                    return Some(false);
+                }
+                let secondary_shift = u32::try_from(secondary_offset).ok()?;
+                remaining &= !1_u64.checked_shl(secondary_shift)?;
+            }
+        }
+        while remaining != 0 {
+            let bit = remaining & remaining.wrapping_neg();
+            let position = usize::try_from(remaining.trailing_zeros()).ok()?;
+            remaining &= remaining - 1;
+            let byte = *candidate.get(position)?;
+            if self.masks[usize::from(byte)] & bit == 0 {
+                return Some(false);
+            }
+        }
+        Some(true)
     }
 
     #[inline]
@@ -1836,12 +3733,31 @@ impl FixedPredicateWord64Plan {
                 return Some(false);
             }
         }
-        for (position, &byte) in candidate.iter().enumerate() {
-            if position == anchor_offset || Some(position) == secondary_offset {
-                continue;
-            }
+        let anchor_shift = u32::try_from(anchor_offset).ok()?;
+        let mut remaining = self.nonuniversal_mask & !1_u64.checked_shl(anchor_shift)?;
+        if let Some(position) = secondary_offset {
             let shift = u32::try_from(position).ok()?;
-            let bit = 1_u64.checked_shl(shift)?;
+            remaining &= !1_u64.checked_shl(shift)?;
+        }
+        if let Some(fallback) = self.adaptive_fallback.as_ref() {
+            let position = usize::from(fallback.offset);
+            if position != anchor_offset && Some(position) != secondary_offset {
+                let shift = u32::try_from(position).ok()?;
+                let bit = 1_u64.checked_shl(shift)?;
+                if remaining & bit == 0 {
+                    return None;
+                }
+                if self.masks[usize::from(*candidate.get(position)?)] & bit == 0 {
+                    return Some(false);
+                }
+                remaining &= !bit;
+            }
+        }
+        while remaining != 0 {
+            let bit = remaining & remaining.wrapping_neg();
+            let position = usize::try_from(remaining.trailing_zeros()).ok()?;
+            remaining &= remaining - 1;
+            let byte = *candidate.get(position)?;
             if self.masks[usize::from(byte)] & bit == 0 {
                 return Some(false);
             }
@@ -1901,6 +3817,8 @@ impl FixedPredicateWord64Plan {
         let actual = ReduceActualCounters {
             input_bytes: haystack.len(),
             transitions,
+            finder_scanned_bytes: 0,
+            shift_and_transitions: transitions,
             finder_calls: 0,
             anchor_candidates: 0,
             predicate_checks: 0,
@@ -1949,6 +3867,8 @@ impl FixedPredicateWord64Plan {
             .unwrap_or(0);
         let mut cursor = anchor_offset.min(anchor_end);
         let mut actual = AnchorActual::default();
+        let mut burst_start = 0_usize;
+        let mut burst_rejections = 0_usize;
         while cursor < anchor_end {
             let search = haystack
                 .get(cursor..anchor_end)
@@ -2017,15 +3937,205 @@ impl FixedPredicateWord64Plan {
                     .ok_or(ReduceError::ArithmeticOverflow {
                         computation: "accepted anchor restart",
                     })?;
+                burst_rejections = 0;
             } else {
                 cursor = anchor
                     .checked_add(1)
                     .ok_or(ReduceError::ArithmeticOverflow {
                         computation: "rejected anchor restart",
                     })?;
+                if burst_rejections == 0 {
+                    burst_start = anchor;
+                }
+                burst_rejections = burst_rejections.checked_add(1).ok_or(
+                    ReduceError::ArithmeticOverflow {
+                        computation: "adaptive reducer rejection burst",
+                    },
+                )?;
+                if burst_rejections == ADAPTIVE_FALLBACK_REJECTIONS
+                    && self.adaptive_fallback.is_some()
+                    && dense_rejection_burst(burst_start, anchor, burst_rejections).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "adaptive reducer rejection density",
+                        },
+                    )?
+                {
+                    let first_untested_start = cursor.checked_sub(anchor_offset).ok_or(
+                        ReduceError::InternalInvariant(
+                            "adaptive reducer fallback preceded the first untested start",
+                        ),
+                    )?;
+                    self.scan_adaptive_reporting(
+                        haystack,
+                        first_untested_start,
+                        &mut actual,
+                    )?;
+                    break;
+                }
+                if burst_rejections == ADAPTIVE_FALLBACK_REJECTIONS {
+                    burst_rejections = 0;
+                }
             }
         }
         Ok(actual)
+    }
+
+    fn scan_adaptive_reporting(
+        &self,
+        haystack: &[u8],
+        first_untested_start: usize,
+        actual: &mut AnchorActual,
+    ) -> Result<(), ReduceError> {
+        if !has_legal_start(haystack.len(), self.width, first_untested_start) {
+            return Ok(());
+        }
+        let Some(fallback) = self.adaptive_fallback.as_ref() else {
+            return self.scan_shift_and_reporting_suffix(
+                haystack,
+                first_untested_start,
+                actual,
+            );
+        };
+        let fallback_offset = usize::from(fallback.offset);
+        let anchor_end = haystack
+            .len()
+            .checked_sub(self.width)
+            .and_then(|last_start| last_start.checked_add(fallback_offset))
+            .and_then(|last_anchor| last_anchor.checked_add(1))
+            .unwrap_or(0);
+        let mut cursor = first_untested_start
+            .checked_add(fallback_offset)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "adaptive reducer byte-set cursor",
+            })?
+            .min(anchor_end);
+        let mut finder = fallback.cursor(haystack, anchor_end);
+        let mut burst_start = 0_usize;
+        let mut burst_rejections = 0_usize;
+        while cursor < anchor_end {
+            actual.finder_calls = actual.finder_calls.checked_add(1).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "adaptive reducer byte-set finder calls",
+                },
+            )?;
+            let service_start = cursor;
+            let Some(anchor) = finder.find(cursor) else {
+                let terminal_service = anchor_end.checked_sub(service_start).ok_or(
+                    ReduceError::InternalInvariant(
+                        "adaptive reducer finder service reversed",
+                    ),
+                )?;
+                actual.finder_scanned_bytes = actual
+                    .finder_scanned_bytes
+                    .checked_add(terminal_service)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "adaptive reducer byte-set terminal service",
+                    })?;
+                break;
+            };
+            let service = anchor
+                .checked_sub(service_start)
+                .and_then(|relative| relative.checked_add(1))
+                .ok_or(ReduceError::InternalInvariant(
+                    "adaptive reducer finder service reversed",
+                ))?;
+            actual.finder_scanned_bytes = actual
+                .finder_scanned_bytes
+                .checked_add(service)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "adaptive reducer byte-set service bytes",
+                })?;
+            let start = anchor
+                .checked_sub(fallback_offset)
+                .ok_or(ReduceError::InternalInvariant(
+                    "adaptive reducer byte-set anchor preceded its offset",
+                ))?;
+            actual.anchor_candidates = actual.anchor_candidates.checked_add(1).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "adaptive reducer byte-set candidates",
+                },
+            )?;
+            if self.candidate_matches_skipping(
+                haystack,
+                start,
+                fallback_offset,
+                &mut actual.predicate_checks,
+            )? {
+                actual.match_events = actual.match_events.checked_add(1).ok_or(
+                    ReduceError::ArithmeticOverflow {
+                        computation: "adaptive reducer byte-set match events",
+                    },
+                )?;
+                cursor = anchor.checked_add(self.width).ok_or(
+                    ReduceError::ArithmeticOverflow {
+                        computation: "adaptive reducer byte-set accepted restart",
+                    },
+                )?;
+                burst_rejections = 0;
+            } else {
+                cursor = anchor.checked_add(1).ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "adaptive reducer byte-set rejected restart",
+                })?;
+                if burst_rejections == 0 {
+                    burst_start = anchor;
+                }
+                burst_rejections = burst_rejections.checked_add(1).ok_or(
+                    ReduceError::ArithmeticOverflow {
+                        computation: "adaptive reducer byte-set rejection burst",
+                    },
+                )?;
+                if burst_rejections == ADAPTIVE_FALLBACK_REJECTIONS
+                    && dense_rejection_burst(burst_start, anchor, burst_rejections).ok_or(
+                    ReduceError::ArithmeticOverflow {
+                        computation: "adaptive reducer byte-set rejection density",
+                    },
+                    )?
+                {
+                    let shift_start = cursor.checked_sub(fallback_offset).ok_or(
+                        ReduceError::InternalInvariant(
+                            "adaptive reducer Shift-And preceded the first untested start",
+                        ),
+                    )?;
+                    return self.scan_shift_and_reporting_suffix(haystack, shift_start, actual);
+                }
+                if burst_rejections == ADAPTIVE_FALLBACK_REJECTIONS {
+                    burst_rejections = 0;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn scan_shift_and_reporting_suffix(
+        &self,
+        haystack: &[u8],
+        first_untested_start: usize,
+        actual: &mut AnchorActual,
+    ) -> Result<(), ReduceError> {
+        let remaining = haystack.get(first_untested_start..).ok_or(
+            ReduceError::InternalInvariant("adaptive reducer Shift-And escaped input"),
+        )?;
+        if remaining.len() < self.width {
+            return Ok(());
+        }
+        let mut state = 0_u64;
+        for &byte in remaining {
+            actual.shift_and_transitions = actual.shift_and_transitions.checked_add(1).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "adaptive reducer Shift-And transitions",
+                },
+            )?;
+            state = (state.wrapping_shl(1) | 1) & self.masks[usize::from(byte)];
+            if state & self.accepting_bit != 0 {
+                actual.match_events = actual.match_events.checked_add(1).ok_or(
+                    ReduceError::ArithmeticOverflow {
+                        computation: "adaptive reducer Shift-And match events",
+                    },
+                )?;
+                state = 0;
+            }
+        }
+        Ok(())
     }
 
     #[inline]
@@ -2078,21 +4188,202 @@ impl FixedPredicateWord64Plan {
                 return Ok(false);
             }
         }
-        for position in 0..self.width {
-            if position == anchor_offset || Some(position) == secondary_offset {
-                continue;
+        let anchor_shift = u32::try_from(anchor_offset).map_err(|_| {
+            ReduceError::ArithmeticOverflow {
+                computation: "primary anchor verification shift",
             }
-            if !self.anchor_candidate_position_matches(candidate, position, predicate_checks)? {
+        })?;
+        let mut remaining = self.nonuniversal_mask & !1_u64.checked_shl(anchor_shift).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "primary anchor verification bit",
+            },
+        )?;
+        if let Some(position) = secondary_offset {
+            let shift = u32::try_from(position).map_err(|_| {
+                ReduceError::ArithmeticOverflow {
+                    computation: "secondary anchor verification shift",
+                }
+            })?;
+            remaining &= !1_u64.checked_shl(shift).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "secondary anchor verification bit",
+                },
+            )?;
+        }
+        if let Some(fallback) = self.adaptive_fallback.as_ref() {
+            let position = usize::from(fallback.offset);
+            if position != anchor_offset && Some(position) != secondary_offset {
+                let shift = u32::try_from(position).map_err(|_| {
+                    ReduceError::ArithmeticOverflow {
+                        computation: "adaptive fallback verification shift",
+                    }
+                })?;
+                let bit = 1_u64.checked_shl(shift).ok_or(
+                    ReduceError::ArithmeticOverflow {
+                        computation: "adaptive fallback verification bit",
+                    },
+                )?;
+                if remaining & bit == 0 {
+                    return Err(ReduceError::InternalInvariant(
+                        "adaptive fallback was not a remaining predicate",
+                    ));
+                }
+                if !self.anchor_candidate_position_matches_bit(
+                    candidate,
+                    position,
+                    bit,
+                    predicate_checks,
+                )? {
+                    return Ok(false);
+                }
+                remaining &= !bit;
+            }
+        }
+        while remaining != 0 {
+            let bit = remaining & remaining.wrapping_neg();
+            let position = usize::try_from(remaining.trailing_zeros()).map_err(|_| {
+                ReduceError::ArithmeticOverflow {
+                    computation: "predicate verification position",
+                }
+            })?;
+            remaining &= remaining - 1;
+            if !self.anchor_candidate_position_matches_bit(
+                candidate,
+                position,
+                bit,
+                predicate_checks,
+            )? {
                 return Ok(false);
             }
         }
         Ok(true)
     }
 
-    fn anchor_candidate_position_matches(
+    fn candidate_matches_skipping(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        skipped_offset: usize,
+        predicate_checks: &mut usize,
+    ) -> Result<bool, ReduceError> {
+        let end = start
+            .checked_add(self.width)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "adaptive predicate candidate end",
+            })?;
+        let candidate = haystack
+            .get(start..end)
+            .ok_or(ReduceError::InternalInvariant(
+                "adaptive predicate candidate escaped the input",
+            ))?;
+        let skipped_shift = u32::try_from(skipped_offset).map_err(|_| {
+            ReduceError::ArithmeticOverflow {
+                computation: "adaptive fallback verification shift",
+            }
+        })?;
+        let mut remaining = self.nonuniversal_mask & !1_u64.checked_shl(skipped_shift).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "adaptive fallback verification bit",
+            },
+        )?;
+        let primary_offset = usize::from(self.anchor.offset().ok_or(
+            ReduceError::InternalInvariant("adaptive fallback lost its primary anchor"),
+        )?);
+        if primary_offset == skipped_offset {
+            return Err(ReduceError::InternalInvariant(
+                "adaptive fallback duplicated the primary anchor",
+            ));
+        }
+        *predicate_checks = predicate_checks.checked_add(1).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "actual predicate checks",
+            },
+        )?;
+        if !self
+            .anchor
+            .matches(*candidate.get(primary_offset).ok_or(
+                ReduceError::InternalInvariant("adaptive primary escaped the candidate"),
+            )?)
+            .ok_or(ReduceError::InternalInvariant(
+                "adaptive primary selected Shift-And",
+            ))?
+        {
+            return Ok(false);
+        }
+        let primary_shift = u32::try_from(primary_offset).map_err(|_| {
+            ReduceError::ArithmeticOverflow {
+                computation: "adaptive primary verification shift",
+            }
+        })?;
+        remaining &= !1_u64.checked_shl(primary_shift).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "adaptive primary verification bit",
+            },
+        )?;
+        if let Some(secondary) = self.secondary_anchor {
+            let secondary_offset = usize::from(secondary.offset().ok_or(
+                ReduceError::InternalInvariant("adaptive secondary selected Shift-And"),
+            )?);
+            if secondary_offset != skipped_offset {
+                if secondary_offset == primary_offset {
+                    return Err(ReduceError::InternalInvariant(
+                        "adaptive secondary duplicated the primary anchor",
+                    ));
+                }
+                *predicate_checks = predicate_checks.checked_add(1).ok_or(
+                    ReduceError::ArithmeticOverflow {
+                        computation: "actual predicate checks",
+                    },
+                )?;
+                if !secondary
+                    .matches(*candidate.get(secondary_offset).ok_or(
+                        ReduceError::InternalInvariant(
+                            "adaptive secondary escaped the candidate",
+                        ),
+                    )?)
+                    .ok_or(ReduceError::InternalInvariant(
+                        "adaptive secondary selected Shift-And",
+                    ))?
+                {
+                    return Ok(false);
+                }
+                let secondary_shift = u32::try_from(secondary_offset).map_err(|_| {
+                    ReduceError::ArithmeticOverflow {
+                        computation: "adaptive secondary verification shift",
+                    }
+                })?;
+                remaining &= !1_u64.checked_shl(secondary_shift).ok_or(
+                    ReduceError::ArithmeticOverflow {
+                        computation: "adaptive secondary verification bit",
+                    },
+                )?;
+            }
+        }
+        while remaining != 0 {
+            let bit = remaining & remaining.wrapping_neg();
+            let position = usize::try_from(remaining.trailing_zeros()).map_err(|_| {
+                ReduceError::ArithmeticOverflow {
+                    computation: "adaptive predicate verification position",
+                }
+            })?;
+            remaining &= remaining - 1;
+            if !self.anchor_candidate_position_matches_bit(
+                candidate,
+                position,
+                bit,
+                predicate_checks,
+            )? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn anchor_candidate_position_matches_bit(
         &self,
         candidate: &[u8],
         position: usize,
+        bit: u64,
         predicate_checks: &mut usize,
     ) -> Result<bool, ReduceError> {
         *predicate_checks =
@@ -2106,14 +4397,6 @@ impl FixedPredicateWord64Plan {
             .ok_or(ReduceError::InternalInvariant(
                 "fixed predicate candidate escaped the input",
             ))?;
-        let shift = u32::try_from(position).map_err(|_| ReduceError::ArithmeticOverflow {
-            computation: "actual predicate bit shift",
-        })?;
-        let bit = 1_u64
-            .checked_shl(shift)
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "actual predicate bit",
-            })?;
         Ok(self.masks[usize::from(byte)] & bit != 0)
     }
 
@@ -2123,7 +4406,12 @@ impl FixedPredicateWord64Plan {
         upper_bounds: ReduceUpperBounds,
         actual: AnchorActual,
     ) -> Result<ReduceActualCounters, ReduceError> {
-        let transitions = actual.finder_scanned_bytes;
+        let transitions = actual
+            .finder_scanned_bytes
+            .checked_add(actual.shift_and_transitions)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "adaptive reducer transitions",
+            })?;
         let count =
             u64::try_from(actual.match_events).map_err(|_| ReduceError::ArithmeticOverflow {
                 computation: "actual anchor count conversion",
@@ -2145,6 +4433,13 @@ impl FixedPredicateWord64Plan {
         let work_usize = actual
             .finder_scanned_bytes
             .checked_mul(FINDER_SCAN_BYTE_WORK)
+            .and_then(|work| {
+                work.checked_add(
+                    actual
+                        .shift_and_transitions
+                        .checked_mul(TRANSITION_WORK)?,
+                )
+            })
             .and_then(|work| work.checked_add(actual.finder_calls.checked_mul(FINDER_CALL_WORK)?))
             .and_then(|work| {
                 work.checked_add(
@@ -2168,6 +4463,8 @@ impl FixedPredicateWord64Plan {
         let counters = ReduceActualCounters {
             input_bytes,
             transitions,
+            finder_scanned_bytes: actual.finder_scanned_bytes,
+            shift_and_transitions: actual.shift_and_transitions,
             finder_calls: actual.finder_calls,
             anchor_candidates: actual.anchor_candidates,
             predicate_checks: actual.predicate_checks,
@@ -2193,8 +4490,32 @@ impl FixedPredicateWord64Plan {
 }
 
 fn actual_within_upper(actual: ReduceActualCounters, upper: ReduceUpperBounds) -> bool {
-    actual.input_bytes <= upper.input_bytes
+    let transitions_close = actual
+        .finder_scanned_bytes
+        .checked_add(actual.shift_and_transitions)
+        == Some(actual.transitions);
+    let reconstructed_work = actual
+        .finder_scanned_bytes
+        .checked_mul(FINDER_SCAN_BYTE_WORK)
+        .and_then(|work| {
+            work.checked_add(actual.shift_and_transitions.checked_mul(TRANSITION_WORK)?)
+        })
+        .and_then(|work| work.checked_add(actual.finder_calls.checked_mul(FINDER_CALL_WORK)?))
+        .and_then(|work| {
+            work.checked_add(actual.anchor_candidates.checked_mul(ANCHOR_CANDIDATE_WORK)?)
+        })
+        .and_then(|work| {
+            work.checked_add(actual.predicate_checks.checked_mul(PREDICATE_CHECK_WORK)?)
+        })
+        .and_then(|work| work.checked_add(actual.match_events.checked_mul(MATCH_WORK)?))
+        .and_then(|work| work.checked_add(REDUCE_FINAL_WORK))
+        .and_then(|work| u64::try_from(work).ok());
+    transitions_close
+        && reconstructed_work == Some(actual.work_charged)
+        && actual.input_bytes <= upper.input_bytes
         && actual.transitions <= upper.transitions
+        && actual.finder_scanned_bytes <= upper.finder_scanned_bytes
+        && actual.shift_and_transitions <= upper.shift_and_transitions
         && actual.finder_calls <= upper.finder_calls
         && actual.anchor_candidates <= upper.anchor_candidates
         && actual.predicate_checks <= upper.predicate_checks
@@ -2209,6 +4530,85 @@ fn actual_within_upper(actual: ReduceActualCounters, upper: ReduceUpperBounds) -
         && actual.scratch_bytes <= upper.scratch_bytes
         && actual.persistent_bytes <= upper.persistent_bytes
         && actual.peak_bytes <= upper.peak_bytes
+}
+
+fn search_work(
+    finder_scanned_bytes: usize,
+    shift_and_transitions: usize,
+    finder_calls: usize,
+    candidate_events: usize,
+    predicate_checks: usize,
+    match_events: usize,
+) -> Result<u64, SearchError> {
+    let work = finder_scanned_bytes
+        .checked_mul(FINDER_SCAN_BYTE_WORK)
+        .and_then(|work| {
+            work.checked_add(shift_and_transitions.checked_mul(TRANSITION_WORK)?)
+        })
+        .and_then(|work| work.checked_add(finder_calls.checked_mul(FINDER_CALL_WORK)?))
+        .and_then(|work| {
+            work.checked_add(candidate_events.checked_mul(ANCHOR_CANDIDATE_WORK)?)
+        })
+        .and_then(|work| {
+            work.checked_add(predicate_checks.checked_mul(PREDICATE_CHECK_WORK)?)
+        })
+        .and_then(|work| work.checked_add(match_events.checked_mul(MATCH_WORK)?))
+        .and_then(|work| work.checked_add(REDUCE_FINAL_WORK))
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "actual fixed-predicate search work",
+        })?;
+    u64::try_from(work).map_err(|_| SearchError::ArithmeticOverflow {
+        computation: "actual fixed-predicate search work conversion",
+    })
+}
+
+fn ensure_search_actual_within(
+    actual: SearchActualCounters,
+    upper: SearchUpperBounds,
+) -> Result<(), SearchError> {
+    let transitions_close = actual
+        .finder_scanned_bytes
+        .checked_add(actual.shift_and_transitions)
+        == Some(actual.transitions);
+    let work_closes = search_work(
+        actual.finder_scanned_bytes,
+        actual.shift_and_transitions,
+        actual.finder_calls,
+        actual.candidate_events,
+        actual.predicate_checks,
+        actual.match_events,
+    )? == actual.work;
+    if transitions_close
+        && work_closes
+        && actual.window_bytes == upper.window_bytes
+        && actual.transitions <= upper.transitions
+        && actual.finder_scanned_bytes <= upper.finder_scanned_bytes
+        && actual.shift_and_transitions <= upper.shift_and_transitions
+        && actual.finder_calls <= upper.finder_calls
+        && actual.candidate_events <= upper.candidate_events
+        && actual.predicate_checks <= upper.predicate_checks
+        && actual.match_events <= upper.match_events
+        && actual.work <= upper.work
+        && actual.scratch_bytes <= upper.scratch_bytes
+    {
+        Ok(())
+    } else {
+        Err(SearchError::InternalInvariant(
+            "actual fixed-predicate search counters exceeded prospective bounds",
+        ))
+    }
+}
+
+fn search_error_from_reduce(error: &ReduceError) -> SearchError {
+    match error {
+        ReduceError::ArithmeticOverflow { computation } => {
+            SearchError::ArithmeticOverflow { computation }
+        }
+        ReduceError::InternalInvariant(detail) => SearchError::InternalInvariant(detail),
+        _ => SearchError::InternalInvariant(
+            "fixed-predicate candidate verification returned a reduction-only resource error",
+        ),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2296,6 +4696,57 @@ mod tests {
             }
         }
         count
+    }
+
+    fn adaptive_finder_contains(finder: &AdaptiveFinder, byte: u8) -> bool {
+        match finder {
+            AdaptiveFinder::One(first) => byte == *first,
+            AdaptiveFinder::Two(first, second) => byte == *first || byte == *second,
+            AdaptiveFinder::Three(first, second, third) => {
+                byte == *first || byte == *second || byte == *third
+            }
+            AdaptiveFinder::Four(members) => members.contains(&byte),
+            AdaptiveFinder::Range {
+                origin,
+                maximum_delta,
+            } => byte.wrapping_sub(*origin) <= *maximum_delta,
+            AdaptiveFinder::Set(classifier) => classifier.set().contains(byte),
+        }
+    }
+
+    fn reference_adaptive_find(
+        finder: &AdaptiveFinder,
+        bytes: &[u8],
+        cursor: usize,
+        end: usize,
+    ) -> Option<usize> {
+        bytes
+            .get(cursor..end)?
+            .iter()
+            .position(|&byte| adaptive_finder_contains(finder, byte))
+            .and_then(|relative| cursor.checked_add(relative))
+    }
+
+    fn assert_resumable_finder_sequence(
+        finder: &AdaptiveFinder,
+        bytes: &[u8],
+        end: usize,
+        jump_seed: usize,
+    ) {
+        let mut finder_cursor = AdaptiveFinderCursor::new(finder, bytes, end);
+        let mut cursor = 0_usize;
+        let mut step = 0_usize;
+        loop {
+            let expected = reference_adaptive_find(finder, bytes, cursor, end);
+            let actual = finder_cursor.find(cursor);
+            assert_eq!(actual, expected, "cursor={cursor}, end={end}, bytes={bytes:?}");
+            let Some(found) = actual else {
+                break;
+            };
+            let jump = (jump_seed.wrapping_add(step) % 7).checked_add(1).unwrap();
+            cursor = found.saturating_add(jump).min(end);
+            step = step.checked_add(1).unwrap();
+        }
     }
 
     #[test]
@@ -2487,6 +4938,15 @@ mod tests {
         assert_eq!(identity.reducer, Reducer::OneByteAnchor);
         assert_eq!(identity.anchor_offset, 5);
         assert_eq!(identity.anchor_bytes, [b'g', 0]);
+        assert_eq!(
+            identity.secondary_anchor,
+            Some(ExactAnchorIdentity {
+                reducer: Reducer::OneByteAnchor,
+                offset: 2,
+                bytes: [b'h', 0],
+            })
+        );
+        assert_eq!(identity.verification_predicates, 5);
         assert_eq!(
             plan.secondary_anchor,
             Some(Anchor::One {
@@ -2744,9 +5204,12 @@ mod tests {
         assert_eq!(accounting.scratch_bytes, 0);
         // P=2, R=4 and every range has one member. Construction additionally
         // reads all 256 byte-domain mask cells for each position to select the
-        // smallest exact anchor, without allocating.
+        // smallest exact anchor. This two-position plan needs no adaptive
+        // classifier because direct anchor verification is bounded by one
+        // predicate check per candidate.
         assert_eq!(accounting.anchor_mask_reads, 512);
-        assert_eq!(accounting.work_upper_bound, 1_806);
+        assert_eq!(accounting.work_upper_bound, 2_063);
+        assert_eq!(accounting.adaptive_classifier_build_work, 0);
         assert_eq!(accounting.work_charged, 786);
         assert!(accounting.work_charged <= accounting.work_upper_bound);
 
@@ -2914,15 +5377,18 @@ mod tests {
         assert_eq!(exact_result.accounting.actual.reserves, 0);
         assert_eq!(exact_result.accounting.actual.temporary_copies, 0);
         // The rightmost two-byte predicate is the authenticated anchor. The
-        // prospective bound admits every valid start; actual service skips
-        // past each accepted non-overlapping word.
+        // The prospective bound covers both every valid anchored start and a
+        // one-way adaptive Shift-And suffix. The actual sparse stream never
+        // activates that suffix.
         assert_eq!(upper.transitions, 12);
+        assert_eq!(upper.finder_scanned_bytes, 11);
+        assert_eq!(upper.shift_and_transitions, 12);
         assert_eq!(upper.anchor_candidates, 11);
         assert_eq!(upper.predicate_checks, 11);
         assert_eq!(upper.match_events, 6);
         assert_eq!(upper.span_sum, 12);
         assert_eq!(upper.reducer_steps, 13);
-        assert_eq!(upper.work, 64);
+        assert_eq!(upper.work, 91);
         assert_eq!(exact_result.accounting.actual.match_events, 3);
         assert_eq!(exact_result.accounting.actual.matched_bytes, 6);
         assert_eq!(exact_result.accounting.actual.work_charged, 28);
@@ -2979,5 +5445,959 @@ mod tests {
         assert_eq!(plan.build_accounting().reserves, 0);
         assert_eq!(plan.build_accounting().temporary_copies, 0);
         assert_eq!(result.accounting.upper_bounds.scratch_bytes, 0);
+    }
+
+    fn naive_find_window(
+        haystack: &[u8],
+        predicates: &[&[(u8, u8)]],
+        window: Window,
+    ) -> Option<(usize, usize)> {
+        if window.start() > window.end() || window.end() > haystack.len() {
+            return None;
+        }
+        let width = predicates.len();
+        let last = window.end().checked_sub(width)?;
+        for start in window.start()..=last {
+            let end = start.checked_add(width)?;
+            let candidate = haystack.get(start..end)?;
+            if candidate.iter().zip(predicates).all(|(&byte, ranges)| {
+                ranges
+                    .iter()
+                    .any(|&(range_start, range_end)| range_start <= byte && byte <= range_end)
+            }) {
+                return Some((start, end));
+            }
+        }
+        None
+    }
+
+    fn assert_search_case(
+        plan: &FixedPredicateWord64Plan,
+        predicates: &[&[(u8, u8)]],
+        haystack: &[u8],
+        window: Window,
+    ) {
+        let expected = naive_find_window(haystack, predicates, window);
+        let limits = SearchLimits::unlimited();
+
+        let (found, span_accounting) = plan.find_window(haystack, window, limits).unwrap();
+        assert_eq!(found, expected, "span haystack={haystack:?}, window={window:?}");
+        assert_eq!(
+            plan.find_window_value(haystack, window, limits).unwrap(),
+            expected,
+            "compact span haystack={haystack:?}, window={window:?}"
+        );
+        assert_eq!(span_accounting.identity.operation, SearchOperation::Span);
+
+        let (exists, exists_accounting) =
+            plan.is_match_window(haystack, window, limits).unwrap();
+        assert_eq!(exists, expected.is_some());
+        assert_eq!(
+            plan.is_match_window_value(haystack, window, limits)
+                .unwrap(),
+            expected.is_some()
+        );
+        assert_eq!(
+            exists_accounting.identity.operation,
+            SearchOperation::Exists
+        );
+
+        let (earliest_end, earliest_accounting) =
+            plan.earliest_end_window(haystack, window, limits).unwrap();
+        assert_eq!(earliest_end, expected.map(|(_, end)| end));
+        assert_eq!(
+            earliest_accounting.identity.operation,
+            SearchOperation::EarliestEnd
+        );
+
+        let (selected_end, selected_accounting) = plan
+            .selected_end_window(haystack, window, limits)
+            .unwrap();
+        assert_eq!(selected_end, expected.map(|(_, end)| end));
+        assert_eq!(
+            selected_accounting.identity.operation,
+            SearchOperation::SelectedEnd
+        );
+
+        for accounting in [
+            span_accounting,
+            exists_accounting,
+            earliest_accounting,
+            selected_accounting,
+        ] {
+            assert_eq!(accounting.identity.plan_id, SEARCH_PLAN_ID);
+            assert_eq!(accounting.identity.width, predicates.len());
+            assert_eq!(accounting.upper_bounds.scratch_bytes, 0);
+            assert_eq!(accounting.actual.scratch_bytes, 0);
+            ensure_search_actual_within(accounting.actual, accounting.upper_bounds).unwrap();
+        }
+    }
+
+    #[test]
+    fn first_match_search_matches_exhaustive_oracle_for_every_window_and_reducer() {
+        const SINGLE: &[(u8, u8)] = &[(b'a', b'a')];
+        const TWO: &[(u8, u8)] = &[(0, 0), (0x80, 0x80)];
+        const BROAD: &[(u8, u8)] = &[(0, 0), (b'a', b'a'), (0x80, 0x80), (0xFF, 0xFF)];
+        let alphabet = [0, b'a', 0x80, 0xFF];
+
+        for width in 1..=4 {
+            let mut one = vec![BROAD; width];
+            one[width / 2] = SINGLE;
+            let mut two = vec![BROAD; width];
+            two[width / 2] = TWO;
+            let shift = vec![BROAD; width];
+            for (predicates, expected_reducer) in [
+                (one.as_slice(), Reducer::OneByteAnchor),
+                (two.as_slice(), Reducer::TwoByteAnchor),
+                (shift.as_slice(), Reducer::ShiftAnd),
+            ] {
+                let plan = FixedPredicateWord64Plan::build(
+                    predicates,
+                    BuildLimits::unlimited(),
+                )
+                .unwrap();
+                assert_eq!(
+                    plan.search_operation_identity(SearchOperation::Span)
+                        .reducer,
+                    expected_reducer
+                );
+                for length in 0_usize..=7 {
+                    let cases = alphabet.len().pow(u32::try_from(length).unwrap());
+                    for mut ordinal in 0..cases {
+                        let mut haystack = vec![0_u8; length];
+                        for byte in &mut haystack {
+                            *byte = alphabet[ordinal % alphabet.len()];
+                            ordinal /= alphabet.len();
+                        }
+                        for start in 0..=length {
+                            for end in start..=length {
+                                assert_search_case(
+                                    &plan,
+                                    predicates,
+                                    &haystack,
+                                    Window::new(start, end),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn first_match_search_work_limits_and_errors_are_projection_invariant() {
+        const SINGLE: &[(u8, u8)] = &[(b'Q', b'Q')];
+        const TWO: &[(u8, u8)] = &[(b'Q', b'Q'), (0x80, 0x80)];
+        const BROAD: &[(u8, u8)] = &[(0, 2), (b'a', b'z'), (0x80, 0xFF)];
+        let cases: [(&[&[(u8, u8)]], &[u8]); 3] = [
+            (&[BROAD, SINGLE, BROAD], b"near-Q-nope-Qhit"),
+            (&[BROAD, TWO, BROAD], b"near\x80nopeQhit"),
+            (&[BROAD, BROAD, BROAD], b"---abc---"),
+        ];
+        for (predicates, haystack) in cases {
+            let plan =
+                FixedPredicateWord64Plan::build(predicates, BuildLimits::unlimited()).unwrap();
+            let window = Window::full(haystack);
+            let (_, accepted) = plan
+                .find_window(haystack, window, SearchLimits::unlimited())
+                .unwrap();
+            for max_work in 0..=accepted.upper_bounds.work.saturating_add(1) {
+                let limits = SearchLimits {
+                    max_work,
+                    max_scratch_bytes: 0,
+                };
+                let expected_success = max_work >= accepted.upper_bounds.work;
+                let reporting_span = plan.find_window(haystack, window, limits);
+                let compact_span = plan.find_window_value(haystack, window, limits);
+                let reporting_exists = plan.is_match_window(haystack, window, limits);
+                let compact_exists = plan.is_match_window_value(haystack, window, limits);
+                let earliest = plan.earliest_end_window(haystack, window, limits);
+                let selected = plan.selected_end_window(haystack, window, limits);
+                assert_eq!(reporting_span.is_ok(), expected_success);
+                assert_eq!(compact_span.is_ok(), expected_success);
+                assert_eq!(reporting_exists.is_ok(), expected_success);
+                assert_eq!(compact_exists.is_ok(), expected_success);
+                assert_eq!(earliest.is_ok(), expected_success);
+                assert_eq!(selected.is_ok(), expected_success);
+                if !expected_success {
+                    let expected = SearchError::WorkLimit {
+                        needed: accepted.upper_bounds.work,
+                        limit: max_work,
+                    };
+                    assert_eq!(reporting_span.unwrap_err(), expected);
+                    assert_eq!(compact_span.unwrap_err(), expected);
+                    assert_eq!(reporting_exists.unwrap_err(), expected);
+                    assert_eq!(compact_exists.unwrap_err(), expected);
+                    assert_eq!(earliest.unwrap_err(), expected);
+                    assert_eq!(selected.unwrap_err(), expected);
+                }
+            }
+        }
+
+        let plan = FixedPredicateWord64Plan::build(&[BROAD], BuildLimits::unlimited()).unwrap();
+        for window in [Window::new(2, 1), Window::new(0, 4)] {
+            let reporting = plan.find_window(b"abc", window, SearchLimits::unlimited());
+            let compact = plan.find_window_value(b"abc", window, SearchLimits::unlimited());
+            let reporting_error = reporting.unwrap_err();
+            let compact_error = compact.unwrap_err();
+            assert_eq!(reporting_error, compact_error);
+            assert!(matches!(compact_error, SearchError::InvalidWindow { .. }));
+        }
+    }
+
+    #[test]
+    fn first_match_search_closes_width_anchor_and_byte_domain_boundaries() {
+        const SINGLE: &[(u8, u8)] = &[(0xFF, 0xFF)];
+        const TWO: &[(u8, u8)] = &[(0, 0), (0xFF, 0xFF)];
+        const MULTI: &[(u8, u8)] = &[(0, 3), (0x40, 0x42), (0x80, 0x82), (0xFE, 0xFF)];
+
+        for width in [63, 64] {
+            let predicates = vec![MULTI; width];
+            let plan = FixedPredicateWord64Plan::build(
+                &predicates,
+                BuildLimits::unlimited(),
+            )
+            .unwrap();
+            let mut haystack = vec![0x80; width + 4];
+            haystack[2..2 + width].fill(0xFF);
+            assert_search_case(
+                &plan,
+                &predicates,
+                &haystack,
+                Window::new(1, haystack.len() - 1),
+            );
+        }
+
+        for anchor_offset in [0, 3, 7] {
+            let mut predicates = vec![MULTI; 8];
+            predicates[anchor_offset] = SINGLE;
+            let plan = FixedPredicateWord64Plan::build(
+                &predicates,
+                BuildLimits::unlimited(),
+            )
+            .unwrap();
+            let identity = plan.search_operation_identity(SearchOperation::Span);
+            assert_eq!(identity.reducer, Reducer::OneByteAnchor);
+            assert_eq!(usize::from(identity.anchor_offset), anchor_offset);
+            let mut haystack = vec![0x80; 24];
+            haystack[5 + anchor_offset] = 0xFF;
+            assert_search_case(
+                &plan,
+                &predicates,
+                &haystack,
+                Window::full(&haystack),
+            );
+        }
+
+        let two_predicates = [MULTI, MULTI, TWO, MULTI];
+        let two = FixedPredicateWord64Plan::build(
+            &two_predicates,
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        assert_eq!(
+            two.search_operation_identity(SearchOperation::Span)
+                .reducer,
+            Reducer::TwoByteAnchor
+        );
+        for haystack in [
+            &[0, 0, 0, 0][..],
+            &[0x80, 0x80, 0xFF, 0x80][..],
+            &[0x80, 0x80, 1, 0x80, 0x80, 0x80, 0, 0x80][..],
+            &[0x80, 0x80, 0x80][..],
+        ] {
+            assert_search_case(
+                &two,
+                &two_predicates,
+                haystack,
+                Window::full(haystack),
+            );
+        }
+    }
+
+    #[test]
+    fn adaptive_byte_set_fallback_preserves_full_domain_and_dense_semantics() {
+        const ASCII: &[(u8, u8)] = &[(0, 0x7F)];
+        const ASCII_FIVE: &[(u8, u8)] = &[
+            (b'B', b'B'),
+            (b'D', b'D'),
+            (b'F', b'F'),
+            (b'H', b'H'),
+            (b'J', b'J'),
+        ];
+        const ASCII_RANGE: &[(u8, u8)] = &[(b'A', b'D')];
+        const HIGH_FIVE: &[(u8, u8)] = &[
+            (b'a', b'a'),
+            (b'b', b'b'),
+            (b'c', b'c'),
+            (b'd', b'd'),
+            (0xFF, 0xFF),
+        ];
+        const HIGH_ANCHOR: &[(u8, u8)] = &[(0xFF, 0xFF)];
+        const FULL: &[(u8, u8)] = &[(0, 0xFF)];
+
+        for fallback_predicate in [ASCII_FIVE, HIGH_FIVE, ASCII_RANGE] {
+            let predicates = [
+                ASCII,
+                fallback_predicate,
+                ASCII,
+                ASCII,
+                HIGH_ANCHOR,
+                FULL,
+            ];
+            let plan =
+                FixedPredicateWord64Plan::build(&predicates, BuildLimits::unlimited()).unwrap();
+            let fallback = plan
+                .adaptive_fallback
+                .expect("a non-primary predicate supplies the adaptive classifier");
+            assert_eq!(fallback.offset, 1);
+            match fallback.finder {
+                AdaptiveFinder::Range {
+                    origin,
+                    maximum_delta,
+                } => {
+                    assert_eq!(fallback_predicate, ASCII_RANGE);
+                    assert_eq!((origin, maximum_delta), (b'A', 3));
+                }
+                AdaptiveFinder::Set(classifier) => {
+                    assert_ne!(fallback_predicate, ASCII_RANGE);
+                    assert_eq!(
+                        classifier.set().contains(0xFF),
+                        fallback_predicate == HIGH_FIVE
+                    );
+                }
+                AdaptiveFinder::One(_)
+                | AdaptiveFinder::Two(_, _)
+                | AdaptiveFinder::Three(_, _, _)
+                | AdaptiveFinder::Four(_) => {
+                    panic!("five-member fallback used a tiny finder")
+                }
+            }
+            assert_eq!(
+                plan.build_accounting().adaptive_classifier_build_work,
+                if fallback_predicate == ASCII_RANGE {
+                    0
+                } else {
+                    BYTE_SET_CLASSIFIER_BUILD_WORK
+                }
+            );
+
+            let no_match = vec![0xFF; 256];
+            assert_eq!(
+                plan.count_value_success(&no_match, ReduceLimits::unlimited()),
+                Some(0)
+            );
+            assert_eq!(
+                plan.find_window_value(
+                    &no_match,
+                    Window::full(&no_match),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+                None
+            );
+            let reporting_count = plan
+                .count(&no_match, ReduceLimits::unlimited())
+                .unwrap();
+            let (reporting_match, reporting_search) = plan
+                .find_window(
+                    &no_match,
+                    Window::full(&no_match),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap();
+            assert_eq!(reporting_count.count, 0);
+            assert_eq!(reporting_match, None);
+            assert_eq!(
+                reporting_count.accounting.actual.transitions,
+                reporting_count
+                    .accounting
+                    .actual
+                    .finder_scanned_bytes
+                    .checked_add(
+                        reporting_count
+                            .accounting
+                            .actual
+                            .shift_and_transitions
+                    )
+                    .unwrap()
+            );
+            assert_eq!(
+                reporting_search.actual.transitions,
+                reporting_search
+                    .actual
+                    .finder_scanned_bytes
+                    .checked_add(reporting_search.actual.shift_and_transitions)
+                    .unwrap()
+            );
+            assert_eq!(
+                reporting_count.accounting.actual.shift_and_transitions > 0,
+                fallback_predicate == HIGH_FIVE
+            );
+            assert_eq!(
+                reporting_search.actual.shift_and_transitions > 0,
+                fallback_predicate == HIGH_FIVE
+            );
+            assert!(actual_within_upper(
+                reporting_count.accounting.actual,
+                reporting_count.accounting.upper_bounds,
+            ));
+            ensure_search_actual_within(reporting_search.actual, reporting_search.upper_bounds)
+                .unwrap();
+
+            let mut haystack = no_match;
+            for start in [4_usize, 100, 196] {
+                haystack[start] = b'Q';
+                haystack[start + 1] = if fallback_predicate == HIGH_FIVE {
+                    0xFF
+                } else {
+                    b'B'
+                };
+                haystack[start + 2] = b'Q';
+                haystack[start + 3] = b'Q';
+                haystack[start + 4] = 0xFF;
+                haystack[start + 5] = 0xFF;
+            }
+            let expected = naive_count(&haystack, &predicates);
+            assert_eq!(expected, 3);
+            assert_eq!(
+                plan.count_value_success(&haystack, ReduceLimits::unlimited()),
+                Some(expected)
+            );
+            assert_eq!(
+                plan.span_sum_value_success(&haystack, ReduceLimits::unlimited()),
+                expected.checked_mul(6)
+            );
+            assert_eq!(
+                plan.count(&haystack, ReduceLimits::unlimited())
+                    .unwrap()
+                    .count,
+                expected
+            );
+            for window in [
+                Window::full(&haystack),
+                Window::new(20, haystack.len()),
+                Window::new(101, 196),
+                Window::new(195, 201),
+            ] {
+                assert_search_case(&plan, &predicates, &haystack, window);
+            }
+        }
+    }
+
+    #[test]
+    fn adaptive_finder_selects_tiny_range_and_set_representations() {
+        const PRIMARY: &[(u8, u8)] = &[(0x7F, 0x7F)];
+        const ONE: &[(u8, u8)] = &[(0, 0)];
+        const TWO: &[(u8, u8)] = &[(0, 1)];
+        const THREE: &[(u8, u8)] = &[(0, 2)];
+        const FOUR: &[(u8, u8)] = &[(0, 0), (2, 2), (4, 4), (6, 6)];
+        const BROAD: &[(u8, u8)] = &[(0, 0x7E)];
+
+        for (predicate, expected_members) in [(ONE, 1), (TWO, 2), (THREE, 3), (FOUR, 4)] {
+            let positions = [BROAD, predicate, BROAD, BROAD, PRIMARY];
+            let plan =
+                FixedPredicateWord64Plan::build(&positions, BuildLimits::unlimited()).unwrap();
+            let fallback = plan.adaptive_fallback.expect("tiny fallback was retained");
+            assert_eq!(fallback.offset, 1);
+            assert!(matches!(
+                (fallback.finder, expected_members),
+                (AdaptiveFinder::One(0), 1)
+                    | (AdaptiveFinder::Two(0, 1), 2)
+                    | (AdaptiveFinder::Three(0, 1, 2), 3)
+                    | (AdaptiveFinder::Four([0, 2, 4, 6]), 4)
+            ));
+            assert_eq!(plan.max_verification_predicates(), 4);
+            assert_eq!(plan.build.adaptive_classifier_build_work, 0);
+        }
+
+        let mut set_words = [0_u64; 4];
+        for byte in [4_u8, 129, 255] {
+            set_words[usize::from(byte >> 6)] |= 1_u64 << u32::from(byte & 63);
+        }
+        let finders = [
+            (AdaptiveFinder::One(0), 0_u8, 1_u16),
+            (AdaptiveFinder::Two(0, 1), 1, 2),
+            (AdaptiveFinder::Three(0, 1, 2), 2, 3),
+            (AdaptiveFinder::Four([0, 1, 2, 3]), 3, 4),
+            (
+                AdaptiveFinder::Range {
+                    origin: b'A',
+                    maximum_delta: 3,
+                },
+                b'D',
+                4,
+            ),
+            (
+                AdaptiveFinder::Set(ByteSetClassifier::new(ByteSet256::from_words(
+                    set_words,
+                ))),
+                255,
+                3,
+            ),
+        ];
+        for (finder, member, cardinality) in finders {
+            let fallback = AdaptiveFallback {
+                offset: 0,
+                cardinality,
+                finder,
+            };
+            for position in [0_usize, 15, 16, 31, 32, 39] {
+                let mut bytes = [0x55_u8; 40];
+                bytes[position] = member;
+                let mut cursor = fallback.cursor(&bytes, bytes.len());
+                assert_eq!(cursor.find(0), Some(position));
+            }
+            let bytes = [0x55; 40];
+            let mut cursor = fallback.cursor(&bytes, bytes.len());
+            assert_eq!(cursor.find(0), None);
+        }
+    }
+
+    #[test]
+    fn identities_distinguish_complete_adaptive_strategy() {
+        const PRIMARY: &[(u8, u8)] = &[(0x7F, 0x7F)];
+        const BROAD: &[(u8, u8)] = &[(0, 0x7E)];
+        const FOUR: &[(u8, u8)] = &[(0, 0), (2, 2), (4, 4), (6, 6)];
+        const RANGE: &[(u8, u8)] = &[(0, 3)];
+        const SET: &[(u8, u8)] = &[(0, 0), (2, 2), (4, 4), (6, 6), (8, 8)];
+        let build = |fallback| {
+            FixedPredicateWord64Plan::build(
+                &[BROAD, fallback, BROAD, BROAD, PRIMARY],
+                BuildLimits::unlimited(),
+            )
+            .unwrap()
+        };
+        let four = build(FOUR);
+        let range = build(RANGE);
+        let set = build(SET);
+        let four_identity = four.operation_identity(Operation::Count);
+        let range_identity = range.operation_identity(Operation::Count);
+        let set_identity = set.operation_identity(Operation::Count);
+
+        for identity in [four_identity, range_identity, set_identity] {
+            assert_eq!(identity.reducer, Reducer::OneByteAnchor);
+            assert_eq!(identity.anchor_offset, 4);
+            assert_eq!(identity.anchor_bytes, [0x7F, 0]);
+            assert_eq!(identity.secondary_anchor, None);
+            assert_eq!(identity.verification_predicates, 4);
+        }
+        let adaptive_finder = |identity: OperationIdentity| match identity.adaptive_handoff {
+            AdaptiveHandoffIdentity::Finder {
+                finder,
+                final_shift_and: true,
+            } => finder,
+            other => panic!("expected finder-to-Shift-And identity, got {other:?}"),
+        };
+        assert_eq!(
+            adaptive_finder(four_identity),
+            AdaptiveFinderIdentity {
+                kind: AdaptiveFinderKind::Four,
+                offset: 1,
+                cardinality: 4,
+            }
+        );
+        assert_eq!(
+            adaptive_finder(range_identity),
+            AdaptiveFinderIdentity {
+                kind: AdaptiveFinderKind::Range,
+                offset: 1,
+                cardinality: 4,
+            }
+        );
+        let set_finder = adaptive_finder(set_identity);
+        assert_eq!(set_finder.kind, AdaptiveFinderKind::Set);
+        assert_eq!(set_finder.offset, 1);
+        assert_eq!(set_finder.cardinality, 5);
+        assert_ne!(four_identity, range_identity);
+        assert_ne!(four_identity, set_identity);
+        assert_ne!(range_identity, set_identity);
+        assert_eq!(
+            four
+                .search_operation_identity(SearchOperation::Span)
+                .adaptive_handoff,
+            four_identity.adaptive_handoff
+        );
+    }
+
+    #[test]
+    fn identity_disables_adaptation_without_verification_predicates() {
+        const PRIMARY: &[(u8, u8)] = &[(b'Q', b'Q')];
+        const FULL: &[(u8, u8)] = &[(0, 0xFF)];
+        let plan = FixedPredicateWord64Plan::build(
+            &[FULL, PRIMARY, FULL, FULL],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let aggregate = plan.operation_identity(Operation::Count);
+        let search = plan.search_operation_identity(SearchOperation::Span);
+        assert_eq!(aggregate.verification_predicates, 0);
+        assert_eq!(aggregate.secondary_anchor, None);
+        assert_eq!(aggregate.adaptive_handoff, AdaptiveHandoffIdentity::Disabled);
+        assert_eq!(search.verification_predicates, 0);
+        assert_eq!(search.secondary_anchor, None);
+        assert_eq!(search.adaptive_handoff, AdaptiveHandoffIdentity::Disabled);
+    }
+
+    #[test]
+    fn classified_adaptive_finder_reuses_member_lanes_across_monotone_restarts() {
+        let mut set_words = [0_u64; 4];
+        for byte in [b'A', b'C', 0xFF] {
+            set_words[usize::from(byte >> 6)] |= 1_u64 << u32::from(byte & 63);
+        }
+        let finders = [
+            AdaptiveFinder::Four([b'A', b'B', b'C', b'D']),
+            AdaptiveFinder::Set(ByteSetClassifier::new(ByteSet256::from_words(
+                set_words,
+            ))),
+        ];
+        let bytes = [b'A'; 40];
+
+        for finder in &finders {
+            let mut cursor = AdaptiveFinderCursor::new(finder, &bytes, bytes.len());
+            for position in 0..bytes.len() {
+                assert_eq!(cursor.find(position), Some(position));
+                assert_eq!(cursor.classified_chunks(), position / BYTE_SET_BLOCK_BYTES + 1);
+            }
+            assert_eq!(cursor.find(bytes.len()), None);
+            assert_eq!(cursor.classified_chunks(), 3);
+
+            let mut cursor = AdaptiveFinderCursor::new(finder, &bytes, bytes.len());
+            for (position, expected_chunks) in [(0, 1), (7, 1), (15, 1), (23, 2), (39, 3)] {
+                assert_eq!(cursor.find(position), Some(position));
+                assert_eq!(cursor.classified_chunks(), expected_chunks);
+            }
+        }
+    }
+
+    #[test]
+    fn resumable_adaptive_finder_matches_exhaustive_small_reference() {
+        let mut set_words = [0_u64; 4];
+        for byte in [4_u8, 129, 255] {
+            set_words[usize::from(byte >> 6)] |= 1_u64 << u32::from(byte & 63);
+        }
+        let finders = [
+            AdaptiveFinder::One(0),
+            AdaptiveFinder::Two(0, 2),
+            AdaptiveFinder::Three(0, 2, 255),
+            AdaptiveFinder::Four([0, 2, 4, 255]),
+            AdaptiveFinder::Range {
+                origin: b'A',
+                maximum_delta: 3,
+            },
+            AdaptiveFinder::Set(ByteSetClassifier::new(ByteSet256::from_words(
+                set_words,
+            ))),
+        ];
+        let alphabet = [0_u8, 2, 4, b'A', 255];
+
+        for length in 0..=6 {
+            let cases = alphabet.len().pow(u32::try_from(length).unwrap());
+            for case in 0..cases {
+                let mut ordinal = case;
+                let mut bytes = vec![0_u8; length];
+                for byte in &mut bytes {
+                    *byte = alphabet[ordinal % alphabet.len()];
+                    ordinal /= alphabet.len();
+                }
+                for finder in &finders {
+                    assert_resumable_finder_sequence(finder, &bytes, bytes.len(), case);
+                    assert_resumable_finder_sequence(
+                        finder,
+                        &bytes,
+                        bytes.len(),
+                        case.wrapping_add(3),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resumable_adaptive_finder_matches_random_monotone_reference() {
+        let mut set_words = [0_u64; 4];
+        for byte in [4_u8, 17, 64, 129, 200, 255] {
+            set_words[usize::from(byte >> 6)] |= 1_u64 << u32::from(byte & 63);
+        }
+        let finders = [
+            AdaptiveFinder::One(0),
+            AdaptiveFinder::Two(0, 255),
+            AdaptiveFinder::Three(1, 127, 254),
+            AdaptiveFinder::Four([1, 64, 127, 254]),
+            AdaptiveFinder::Range {
+                origin: 73,
+                maximum_delta: 31,
+            },
+            AdaptiveFinder::Set(ByteSetClassifier::new(ByteSet256::from_words(
+                set_words,
+            ))),
+        ];
+        let mut random = 0xA076_1D64_78BD_642F_u64;
+
+        for case in 0..512_usize {
+            random = random
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let length = usize::try_from(random % 129).unwrap();
+            let mut bytes = vec![0_u8; length];
+            for byte in &mut bytes {
+                random = random
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                *byte = random.to_le_bytes()[0];
+            }
+            random = random
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let end = usize::try_from(random % u64::try_from(length + 1).unwrap()).unwrap();
+            for finder in &finders {
+                assert_resumable_finder_sequence(finder, &bytes, end, case);
+            }
+        }
+    }
+
+    #[test]
+    fn resumable_range_and_set_phases_preserve_random_plan_accounting() {
+        const ASCII: &[(u8, u8)] = &[(0, 0x7F)];
+        const RANGE: &[(u8, u8)] = &[(b'A', b'D')];
+        const FOUR: &[(u8, u8)] = &[
+            (b'a', b'a'),
+            (b'c', b'c'),
+            (b'e', b'e'),
+            (0xFF, 0xFF),
+        ];
+        const SET: &[(u8, u8)] = &[
+            (b'a', b'a'),
+            (b'c', b'c'),
+            (b'e', b'e'),
+            (0x80, 0x80),
+            (0xFF, 0xFF),
+        ];
+        const PRIMARY: &[(u8, u8)] = &[(0xFF, 0xFF)];
+        const FULL: &[(u8, u8)] = &[(0, 0xFF)];
+        let range_positions = [ASCII, RANGE, ASCII, ASCII, PRIMARY, FULL];
+        let four_positions = [ASCII, FOUR, ASCII, ASCII, PRIMARY, FULL];
+        let set_positions = [ASCII, SET, ASCII, ASCII, PRIMARY, FULL];
+        let mut random = 0xE703_7ED1_A0B4_28DB_u64;
+
+        for (predicates, expected_finder) in [
+            (range_positions.as_slice(), "range"),
+            (four_positions.as_slice(), "four"),
+            (set_positions.as_slice(), "set"),
+        ] {
+            let plan =
+                FixedPredicateWord64Plan::build(predicates, BuildLimits::unlimited()).unwrap();
+            let fallback = plan.adaptive_fallback.as_ref().unwrap();
+            assert!(matches!(
+                (&fallback.finder, expected_finder),
+                (AdaptiveFinder::Four(_), "four")
+                    | (AdaptiveFinder::Range { .. }, "range")
+                    | (AdaptiveFinder::Set(_), "set")
+            ));
+            for case in 0..256_usize {
+                random = random
+                    .wrapping_mul(2_862_933_555_777_941_757)
+                    .wrapping_add(3_037_000_493);
+                let length = usize::try_from(random % 129).unwrap();
+                let mut haystack = vec![0_u8; length];
+                if case % 4 == 0 {
+                    haystack.fill(0xFF);
+                } else {
+                    for byte in &mut haystack {
+                        random = random
+                            .wrapping_mul(2_862_933_555_777_941_757)
+                            .wrapping_add(3_037_000_493);
+                        *byte = random.to_le_bytes()[0];
+                    }
+                }
+
+                let expected = naive_count(&haystack, predicates);
+                assert_eq!(
+                    plan.count_value_success(&haystack, ReduceLimits::unlimited()),
+                    Some(expected)
+                );
+                assert_eq!(
+                    plan.span_sum_value_success(&haystack, ReduceLimits::unlimited()),
+                    expected.checked_mul(u64::try_from(plan.width()).unwrap())
+                );
+                let count = plan.count(&haystack, ReduceLimits::unlimited()).unwrap();
+                let span = plan
+                    .span_sum(&haystack, ReduceLimits::unlimited())
+                    .unwrap();
+                assert_eq!(count.count, expected);
+                assert_eq!(span.span_sum, expected * u64::try_from(plan.width()).unwrap());
+                assert_eq!(
+                    count.accounting.actual.transitions,
+                    count
+                        .accounting
+                        .actual
+                        .finder_scanned_bytes
+                        .checked_add(count.accounting.actual.shift_and_transitions)
+                        .unwrap()
+                );
+                assert!(actual_within_upper(
+                    count.accounting.actual,
+                    count.accounting.upper_bounds
+                ));
+                assert!(actual_within_upper(
+                    span.accounting.actual,
+                    span.accounting.upper_bounds
+                ));
+                assert_search_case(
+                    &plan,
+                    predicates,
+                    &haystack,
+                    Window::full(&haystack),
+                );
+
+                random = random
+                    .wrapping_mul(2_862_933_555_777_941_757)
+                    .wrapping_add(3_037_000_493);
+                let start = usize::try_from(random % u64::try_from(length + 1).unwrap()).unwrap();
+                random = random
+                    .wrapping_mul(2_862_933_555_777_941_757)
+                    .wrapping_add(3_037_000_493);
+                let end = start
+                    + usize::try_from(
+                        random % u64::try_from(length.checked_sub(start).unwrap() + 1).unwrap(),
+                    )
+                    .unwrap();
+                assert_search_case(
+                    &plan,
+                    predicates,
+                    &haystack,
+                    Window::new(start, end),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn verification_count_excludes_universal_positions_at_auto_boundary() {
+        const PRIMARY: &[(u8, u8)] = &[(0x7F, 0x7F)];
+        const VERIFY: &[(u8, u8)] = &[(b'A', b'Z')];
+        const FULL: &[(u8, u8)] = &[(0, 0xFF)];
+
+        for expected in [0_usize, 15, 16] {
+            let mut predicates = vec![FULL; 64];
+            predicates[32] = PRIMARY;
+            for position in (0..64)
+                .filter(|&position| position != 32)
+                .take(expected)
+            {
+                predicates[position] = VERIFY;
+            }
+            let plan = FixedPredicateWord64Plan::build(
+                predicates.as_slice(),
+                BuildLimits::unlimited(),
+            )
+            .unwrap();
+            assert_eq!(plan.max_verification_predicates(), expected);
+            assert_eq!(plan.adaptive_fallback.is_some(), expected != 0);
+        }
+    }
+
+    #[test]
+    fn adaptive_classifier_charge_is_structural_and_failure_atomic() {
+        let limited = BuildLimits {
+            max_build_work: u64::try_from(BYTE_SET_CLASSIFIER_BUILD_WORK - 1).unwrap(),
+            ..BuildLimits::unlimited()
+        };
+        let mut refused = BuildAttemptTracker::new(limited);
+        assert!(matches!(
+            refused.build_adaptive_classifier(),
+            Err(BuildError::WorkLimit { needed, limit })
+                if needed == u64::try_from(BYTE_SET_CLASSIFIER_BUILD_WORK).unwrap()
+                    && limit == limited.max_build_work
+        ));
+        assert_eq!(refused.actual.work, 0);
+        assert_eq!(refused.actual.adaptive_classifier_build_work, 0);
+
+        let mut accepted = BuildAttemptTracker::new(BuildLimits {
+            max_build_work: u64::try_from(BYTE_SET_CLASSIFIER_BUILD_WORK).unwrap(),
+            ..BuildLimits::unlimited()
+        });
+        accepted.build_adaptive_classifier().unwrap();
+        assert_eq!(
+            accepted.actual.work,
+            u64::try_from(BYTE_SET_CLASSIFIER_BUILD_WORK).unwrap()
+        );
+        assert_eq!(
+            accepted.actual.adaptive_classifier_build_work,
+            BYTE_SET_CLASSIFIER_BUILD_WORK
+        );
+    }
+
+    #[test]
+    fn adaptive_phase_boundaries_skip_impossible_trailing_work() {
+        const PRIMARY: &[(u8, u8)] = &[(0x7F, 0x7F)];
+        const FALLBACK: &[(u8, u8)] = &[(0x7F, 0x81)];
+        const BROAD: &[(u8, u8)] = &[(0, 0x7E)];
+        let positions = [PRIMARY, FALLBACK, BROAD, BROAD, BROAD, BROAD];
+        let plan =
+            FixedPredicateWord64Plan::build(&positions, BuildLimits::unlimited()).unwrap();
+        assert!(matches!(
+            plan.adaptive_fallback.map(|fallback| fallback.finder),
+            Some(AdaptiveFinder::Three(0x7F, 0x80, 0x81))
+        ));
+
+        for (candidate_positions, expected_finder, expected_shift) in
+            [(8_usize, 8_usize, 0_usize), (9, 9, 0), (16, 16, 0), (17, 16, 6)]
+        {
+            let input_bytes = candidate_positions + plan.width() - 1;
+            let mut haystack = vec![0x7F; input_bytes];
+            let expected_span = if candidate_positions == 17 {
+                haystack[18..22].fill(0);
+                Some((16, 22))
+            } else {
+                None
+            };
+            let expected_count = u64::from(expected_span.is_some());
+
+            assert_eq!(
+                plan.find_window_value(
+                    &haystack,
+                    Window::full(&haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+                expected_span
+            );
+            assert_eq!(
+                plan.count_value_success(&haystack, ReduceLimits::unlimited()),
+                Some(expected_count)
+            );
+
+            let (span, search) = plan
+                .find_window(
+                    &haystack,
+                    Window::full(&haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap();
+            let count = plan.count(&haystack, ReduceLimits::unlimited()).unwrap();
+            assert_eq!(span, expected_span);
+            assert_eq!(count.count, expected_count);
+            assert_eq!(
+                (
+                    search.actual.finder_scanned_bytes,
+                    search.actual.shift_and_transitions,
+                ),
+                (expected_finder, expected_shift)
+            );
+            assert_eq!(
+                (
+                    count.accounting.actual.finder_scanned_bytes,
+                    count.accounting.actual.shift_and_transitions,
+                ),
+                (expected_finder, expected_shift)
+            );
+            ensure_search_actual_within(search.actual, search.upper_bounds).unwrap();
+            assert!(actual_within_upper(
+                count.accounting.actual,
+                count.accounting.upper_bounds,
+            ));
+        }
     }
 }

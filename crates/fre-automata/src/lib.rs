@@ -19,6 +19,7 @@
 mod contract;
 mod error;
 mod k0;
+mod k0_root_corridor;
 pub mod p16_grep_stream;
 mod plan;
 mod priority;
@@ -30,7 +31,7 @@ pub use contract::{
     SelectedEnd, SetupAccounting, Span, TypedPlan,
 };
 pub use error::{CompileError, MalformedPlan, ResourceKind, SearchError};
-pub use k0::{K0SearchSession, K0Workspace, WorkspaceLayout, WorkspaceLimits};
+pub use k0::{K0SearchSession, K0SpanSourceCursor, K0Workspace, WorkspaceLayout, WorkspaceLimits};
 pub use plan::{
     Automaton, CompileLimits, EdgeKind, PlanStats, RawPlan, SearchLimits, SearchWindow, StateRole,
 };

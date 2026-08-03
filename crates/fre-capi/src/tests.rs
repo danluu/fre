@@ -8,17 +8,21 @@ use core::{
     ptr,
 };
 
+use fre::PlanKind;
+
 use crate::{
     FRE_V1_ABI_VERSION, FRE_V1_DIAGNOSTIC_ARGUMENT, FRE_V1_DIAGNOSTIC_COMPILE,
     FRE_V1_DIAGNOSTIC_NONE, FRE_V1_DIAGNOSTIC_PANIC, FRE_V1_FEATURE_EXISTS,
     FRE_V1_FEATURE_PLAN_INFO, FRE_V1_FEATURE_RUST_BYTES, FRE_V1_FEATURE_SELECTED_END,
     FRE_V1_FEATURE_SPAN, FRE_V1_FEATURE_THREAD_SAFE_REGEX, FRE_V1_FEATURES, FRE_V1_JIT_DENY,
-    FRE_V1_PLAN_EXACT_LITERAL, FRE_V1_PLAN_LITERAL_CLASS_RUN_LITERAL,
-    FRE_V1_PLAN_UNICODE_FOLDED_LITERAL, FRE_V1_PLAN_UNICODE_WORD_RUN, FRE_V1_PROFILE_RUST_BYTES,
-    FRE_V1_STATUS_ABI_MISMATCH, FRE_V1_STATUS_COMPILE_ERROR, FRE_V1_STATUS_INVALID_ARGUMENT,
-    FRE_V1_STATUS_INVALID_PATTERN_ENCODING, FRE_V1_STATUS_NULL_WITH_NONZERO_LENGTH,
-    FRE_V1_STATUS_OK, FRE_V1_STATUS_PANIC, FRE_V1_STATUS_SEARCH_ERROR,
-    FRE_V1_STATUS_STRUCT_TOO_SMALL, FRE_V1_STATUS_UNSUPPORTED_CONFIG,
+    FRE_V1_PLAN_EXACT_LITERAL, FRE_V1_PLAN_FIXED_PREDICATE_WORD64, FRE_V1_PLAN_FORWARD_ANCHORED,
+    FRE_V1_PLAN_K0, FRE_V1_PLAN_LITERAL_CLASS_RUN_LITERAL, FRE_V1_PLAN_LITERAL_SET_DFA,
+    FRE_V1_PLAN_PACKED_LITERAL_SET, FRE_V1_PLAN_PURE_BYTE_CLASS_REPEAT,
+    FRE_V1_PLAN_REQUIRED_LITERAL, FRE_V1_PLAN_UNICODE_FOLDED_LITERAL, FRE_V1_PLAN_UNICODE_WORD_RUN,
+    FRE_V1_PROFILE_RUST_BYTES, FRE_V1_STATUS_ABI_MISMATCH, FRE_V1_STATUS_COMPILE_ERROR,
+    FRE_V1_STATUS_INVALID_ARGUMENT, FRE_V1_STATUS_INVALID_PATTERN_ENCODING,
+    FRE_V1_STATUS_NULL_WITH_NONZERO_LENGTH, FRE_V1_STATUS_OK, FRE_V1_STATUS_PANIC,
+    FRE_V1_STATUS_SEARCH_ERROR, FRE_V1_STATUS_STRUCT_TOO_SMALL, FRE_V1_STATUS_UNSUPPORTED_CONFIG,
     FRE_V1_STATUS_UNSUPPORTED_PROFILE, FreV1AbiDescriptor, FreV1Config, FreV1Diagnostic,
     FreV1ExistsResult, FreV1Header, FreV1MatchResult, FreV1PlanInfo, FreV1Regex,
     FreV1SelectedEndResult, boundary,
@@ -75,8 +79,22 @@ fn abi_layouts_offsets_tags_and_features_are_stable() {
     assert_eq!(FRE_V1_STATUS_OK, 0);
     assert_eq!(FRE_V1_PROFILE_RUST_BYTES, 1);
     assert_eq!(FRE_V1_JIT_DENY, 1);
-    assert_eq!(FRE_V1_PLAN_UNICODE_FOLDED_LITERAL, 8);
-    assert_eq!(FRE_V1_PLAN_LITERAL_CLASS_RUN_LITERAL, 9);
+    assert_eq!(
+        [
+            FRE_V1_PLAN_EXACT_LITERAL,
+            FRE_V1_PLAN_PACKED_LITERAL_SET,
+            FRE_V1_PLAN_LITERAL_SET_DFA,
+            FRE_V1_PLAN_REQUIRED_LITERAL,
+            FRE_V1_PLAN_FORWARD_ANCHORED,
+            FRE_V1_PLAN_K0,
+            FRE_V1_PLAN_UNICODE_WORD_RUN,
+            FRE_V1_PLAN_UNICODE_FOLDED_LITERAL,
+            FRE_V1_PLAN_LITERAL_CLASS_RUN_LITERAL,
+            FRE_V1_PLAN_PURE_BYTE_CLASS_REPEAT,
+            FRE_V1_PLAN_FIXED_PREDICATE_WORD64,
+        ],
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    );
     assert_eq!(
         FRE_V1_FEATURES,
         FRE_V1_FEATURE_RUST_BYTES
@@ -86,6 +104,38 @@ fn abi_layouts_offsets_tags_and_features_are_stable() {
             | FRE_V1_FEATURE_PLAN_INFO
             | FRE_V1_FEATURE_THREAD_SAFE_REGEX
     );
+}
+
+#[test]
+fn every_rust_plan_kind_has_the_pinned_public_tag() {
+    let cases = [
+        (PlanKind::ExactLiteral, FRE_V1_PLAN_EXACT_LITERAL),
+        (PlanKind::PackedLiteralSet, FRE_V1_PLAN_PACKED_LITERAL_SET),
+        (PlanKind::LiteralSetDfa, FRE_V1_PLAN_LITERAL_SET_DFA),
+        (PlanKind::RequiredLiteral, FRE_V1_PLAN_REQUIRED_LITERAL),
+        (
+            PlanKind::LiteralClassRunLiteral,
+            FRE_V1_PLAN_LITERAL_CLASS_RUN_LITERAL,
+        ),
+        (
+            PlanKind::PureByteClassRepeat,
+            FRE_V1_PLAN_PURE_BYTE_CLASS_REPEAT,
+        ),
+        (PlanKind::ForwardAnchored, FRE_V1_PLAN_FORWARD_ANCHORED),
+        (PlanKind::K0, FRE_V1_PLAN_K0),
+        (
+            PlanKind::UnicodeFoldedLiteral,
+            FRE_V1_PLAN_UNICODE_FOLDED_LITERAL,
+        ),
+        (PlanKind::UnicodeWordRun, FRE_V1_PLAN_UNICODE_WORD_RUN),
+        (
+            PlanKind::FixedPredicateWord64,
+            FRE_V1_PLAN_FIXED_PREDICATE_WORD64,
+        ),
+    ];
+    for (plan, expected) in cases {
+        assert_eq!(crate::engine::plan_tag(plan), expected);
+    }
 }
 
 #[test]
@@ -282,6 +332,35 @@ fn literal_class_run_has_a_stable_public_plan_tag() {
     assert_eq!(plan.plan, FRE_V1_PLAN_LITERAL_CLASS_RUN_LITERAL);
     // SAFETY: transfers the sole live reference from compile.
     assert_eq!(unsafe { fre_v1_regex_release(regex) }, FRE_V1_STATUS_OK);
+}
+
+#[test]
+fn appended_native_plans_have_stable_public_plan_tags() {
+    let mut byte_config = FreV1Config::checked_default();
+    byte_config.unicode = 0;
+    let cases: &[(&[u8], u32)] = &[
+        (br"(?-u:[a-d])+", FRE_V1_PLAN_PURE_BYTE_CLASS_REPEAT),
+        (
+            br"Q[ab][cd][ef][gh][ij][kl][mn][op][rs][tu][vw][xy][01]",
+            FRE_V1_PLAN_FIXED_PREDICATE_WORD64,
+        ),
+        (
+            br"Q[ab][cd][ef][gh][ij][kl][mn][op][rs][tu][vw][xy][01][23][45][67]",
+            FRE_V1_PLAN_FIXED_PREDICATE_WORD64,
+        ),
+    ];
+    for &(pattern, expected) in cases {
+        let (regex, _) = compile(pattern, byte_config);
+        let mut plan = FreV1PlanInfo::caller_init();
+        // SAFETY: compile returned one live handle and plan is valid output storage.
+        assert_eq!(
+            unsafe { fre_v1_regex_plan(regex, &raw mut plan, ptr::null_mut()) },
+            FRE_V1_STATUS_OK
+        );
+        assert_eq!(plan.plan, expected, "pattern={pattern:?}");
+        // SAFETY: transfers the sole live reference from compile.
+        assert_eq!(unsafe { fre_v1_regex_release(regex) }, FRE_V1_STATUS_OK);
+    }
 }
 
 #[test]

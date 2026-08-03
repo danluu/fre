@@ -10,7 +10,7 @@ use crate::{
 };
 
 /// Stable schema for portable regex-set construction and execution reports.
-pub const PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION: u32 = 4;
+pub const PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION: u32 = 5;
 
 /// Complete construction limits for one portable Rust-byte set.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -862,6 +862,8 @@ pub struct PortableRegexSetExecutionReport {
     pub start: usize,
     pub patterns_searched: usize,
     pub matched_patterns: usize,
+    /// Checked sum of operation-specific existence work from every searched
+    /// constituent matcher.
     pub work: u64,
     pub output_capacity_bytes: usize,
 }
@@ -1161,7 +1163,7 @@ fn search_one(
         max_scratch_bytes: limits.pattern.max_scratch_bytes,
     };
     let (matched, accounting) = regex
-        .find_window(haystack, window, pattern_limits)
+        .is_match_window(haystack, window, pattern_limits)
         .map_err(|source| PortableRegexSetExecutionError::Pattern {
             index,
             total_work_before,
@@ -1179,7 +1181,7 @@ fn search_one(
             computation: "matcher exceeded delegated work limit",
         });
     }
-    Ok((matched.is_some(), total_work))
+    Ok((matched, total_work))
 }
 
 fn validate_start(start: usize, haystack_len: usize) -> Result<(), PortableRegexSetExecutionError> {

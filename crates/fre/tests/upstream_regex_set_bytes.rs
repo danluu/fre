@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use fre::{
-    BuildError, BuildLimits, PlanKind, PortableRegexSet, PortableRegexSetBuildError,
+    BuildError, BuildLimits, PlanKind, PortableRegex, PortableRegexSet, PortableRegexSetBuildError,
     PortableRegexSetBuildLimits, PortableRegexSetBuilder, PortableRegexSetExecutionError,
     PortableRegexSetRunLimits, RustProfile, SearchLimits,
 };
@@ -64,6 +64,67 @@ fn ids(set: &PortableRegexSet, haystack: &[u8]) -> Vec<usize> {
         .unwrap_or_else(|error| panic!("FRE set search failed: {error}"))
         .into_iter()
         .collect()
+}
+
+#[test]
+fn set_membership_delegates_the_exists_contract_and_its_exact_work_limit() {
+    let pattern = r"(?-u:[a-z]+)";
+    let haystack = b"0123456789abcdefghijklmnopqrstuvwxyz!";
+    let regex = PortableRegex::new(pattern).expect("pure byte-class matcher");
+    assert_eq!(
+        regex.build_report().plan,
+        PlanKind::PureByteClassRepeat,
+        "the fixture must retain distinct existence and greedy-span work"
+    );
+
+    let (exists, exists_accounting) = regex
+        .is_match(haystack, SearchLimits::unlimited())
+        .expect("direct existence search");
+    let (span, span_accounting) = regex
+        .find(haystack, SearchLimits::unlimited())
+        .expect("direct span search");
+    assert!(exists);
+    assert!(span.is_some());
+    let exists_work = exists_accounting.work_or_linear_terms();
+    let span_work = span_accounting.work_or_linear_terms();
+    assert!(
+        exists_work < span_work,
+        "the fixture must prove that span recovery is unnecessary set work"
+    );
+
+    let set = PortableRegexSet::new([pattern]).expect("one-pattern set");
+    let exact_limits = PortableRegexSetRunLimits {
+        pattern: SearchLimits {
+            max_work: exists_work,
+            max_scratch_bytes: usize::MAX,
+        },
+        max_total_work: exists_work,
+        ..PortableRegexSetRunLimits::unlimited()
+    };
+    let (matched, report) = set
+        .is_match(haystack, exact_limits)
+        .expect("the exact existence limit must admit set membership");
+    assert!(matched);
+    assert_eq!(report.work, exists_work);
+
+    let matches = set
+        .matches(haystack, exact_limits)
+        .expect("matching IDs use the same existence projection");
+    assert_eq!(matches.iter().collect::<Vec<_>>(), vec![0]);
+    assert_eq!(matches.report().work, exists_work);
+
+    let below = PortableRegexSetRunLimits {
+        pattern: SearchLimits {
+            max_work: exists_work - 1,
+            max_scratch_bytes: usize::MAX,
+        },
+        max_total_work: exists_work - 1,
+        ..PortableRegexSetRunLimits::unlimited()
+    };
+    assert!(matches!(
+        set.is_match(haystack, below),
+        Err(PortableRegexSetExecutionError::Pattern { index: 0, .. })
+    ));
 }
 
 #[test]
