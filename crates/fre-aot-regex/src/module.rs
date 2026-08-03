@@ -13058,16 +13058,31 @@ mod tests {
         clippy::too_many_lines,
         reason = "the opt-in native differential keeps object production and execution together"
     )]
-    fn linked_aarch64_complete_retained_spans_match_portable_program() {
+    fn linked_aarch64_complete_retained_contracts_match_portable_program() {
         use std::{fmt::Write as _, fs, process::Command};
 
         let target = Target::aarch64_macos()
             .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
             .expect("ASIMD target");
         let cases = [
-            ("[ab]*", b"xxabbaaxbb".as_slice()),
+            (
+                "[ab]+",
+                OutputContract::Exists,
+                b"xxabbaaxbb".as_slice(),
+            ),
+            (
+                "[ab]+",
+                OutputContract::SelectedEnd,
+                b"xxabbaaxbb".as_slice(),
+            ),
+            (
+                "[ab]*",
+                OutputContract::Span,
+                b"xxabbaaxbb".as_slice(),
+            ),
             (
                 "[ab]cdefghij(?-u:.){8}",
+                OutputContract::Span,
                 b"xxacdefghij12345678yy".as_slice(),
             ),
         ];
@@ -13080,12 +13095,8 @@ mod tests {
         let mut calls = String::from("int main(void){size_t r[2];uint32_t s;\n");
         let mut objects = Vec::new();
 
-        for (case, (pattern, haystack)) in cases.iter().enumerate() {
-            let compiled = complete_forward_resource_fallback(
-                pattern,
-                OutputContract::Span,
-                target,
-            );
+        for (case, (pattern, contract, haystack)) in cases.iter().enumerate() {
+            let compiled = complete_forward_resource_fallback(pattern, *contract, target);
             assert!(compiled.module().required_runtime_symbol().is_none());
             let bytes = haystack
                 .iter()
@@ -13116,19 +13127,31 @@ mod tests {
                     )
                     .expect("write native call");
                     match expected {
+                        MatchResult::Exists(found) => writeln!(
+                            calls,
+                            "if(s!={}||r[0]!=0||r[1]!=0)return {};",
+                            u8::from(found),
+                            case + 10
+                        )
+                        .expect("write Exists assertion"),
+                        MatchResult::SelectedEnd(Some(match_end)) => writeln!(
+                            calls,
+                            "if(s!=1||r[0]!={match_end}||r[1]!={match_end})return {};",
+                            case + 10
+                        )
+                        .expect("write SelectedEnd assertion"),
                         MatchResult::Span(Some((match_start, match_end))) => writeln!(
                             calls,
                             "if(s!=1||r[0]!={match_start}||r[1]!={match_end})return {};",
                             case + 10
                         )
                         .expect("write match assertion"),
-                        MatchResult::Span(None) => writeln!(
+                        MatchResult::SelectedEnd(None) | MatchResult::Span(None) => writeln!(
                             calls,
                             "if(s!=0||r[0]!=0||r[1]!=0)return {};",
                             case + 10
                         )
                         .expect("write no-match assertion"),
-                        other => panic!("unexpected Span result: {other:?}"),
                     }
                 }
             }
