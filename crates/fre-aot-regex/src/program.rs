@@ -27,7 +27,10 @@ use crate::{
 const PROGRAM_MAGIC: &[u8; 8] = b"FREGAOT\0";
 const PROGRAM_FORMAT_VERSION_V1: u32 = 1;
 const PROGRAM_FORMAT_VERSION_V2: u32 = 2;
-const PROGRAM_FORMAT_VERSION: u32 = PROGRAM_FORMAT_VERSION_V2;
+const PROGRAM_FORMAT_VERSION_V3: u32 = 3;
+const PROGRAM_FORMAT_VERSION: u32 = PROGRAM_FORMAT_VERSION_V3;
+const PROGRAM_FLAG_NFA_MANDATORY_SUFFIX: u8 = 1 << 0;
+const PROGRAM_KNOWN_FLAGS: u8 = PROGRAM_FLAG_NFA_MANDATORY_SUFFIX;
 const DEFAULT_LINE_TERMINATOR: u8 = b'\n';
 /// Number of bytes that a runtime must read before it can discover the exact
 /// serialized artifact extent.
@@ -712,8 +715,10 @@ fn derive_nfa_suffix(
     suffix: &AnchoredSuffix,
     maximum_width: MaxMatchWidthStats,
     engine: &ProgramEngine,
+    enabled: bool,
 ) -> Option<NfaMandatorySuffix> {
-    if !matches!(engine, ProgramEngine::OrderedNfa)
+    if !enabled
+        || !matches!(engine, ProgramEngine::OrderedNfa)
         || raw
             .edge_kinds
             .iter()
@@ -740,7 +745,7 @@ pub struct CompiledProgram {
     engine: ProgramEngine,
     engine_selection_reason: Option<EngineSelectionReason>,
     determinization_report: Option<DeterminizationReport>,
-    /// Optional in-memory assertion optimizer. Stable V2 serialization keeps
+    /// Optional in-memory assertion optimizer. Stable serialization keeps
     /// the universal ordered-NFA engine and deliberately omits this sidecar.
     context_dfa: Option<ContextDfa>,
     /// Fresh contextual construction provenance. This is omitted from the
@@ -899,6 +904,7 @@ impl CompiledProgram {
             &anchored_suffix,
             max_match_width,
             &engine,
+            mode == CompileMode::Optimizing,
         );
         Ok(Self {
             raw,
@@ -939,6 +945,14 @@ impl CompiledProgram {
         match self.engine {
             ProgramEngine::OrderedNfa => EngineKind::OrderedNfa,
             ProgramEngine::OrderedDfa(_) => EngineKind::OrderedDfa,
+        }
+    }
+
+    const fn program_flags(&self) -> u8 {
+        if self.nfa_mandatory_suffix.is_some() {
+            PROGRAM_FLAG_NFA_MANDATORY_SUFFIX
+        } else {
+            0
         }
     }
 
@@ -1437,7 +1451,7 @@ impl CompiledProgram {
         put_u32(&mut bytes, PROGRAM_FORMAT_VERSION);
         bytes.push(self.engine_kind().tag());
         bytes.push(self.output.tag());
-        bytes.extend_from_slice(&[self.line_terminator, 0]);
+        bytes.extend_from_slice(&[self.line_terminator, self.program_flags()]);
         put_u64(
             &mut bytes,
             u64::try_from(expected).map_err(|_| {
@@ -1499,6 +1513,7 @@ impl CompiledProgram {
         EngineKind::from_tag(header[12])?;
         OutputContract::from_tag(header[13])?;
         header_line_terminator(header, version)?;
+        header_program_flags(header, version)?;
         let total = usize_from_u64(read_u64_at(header, 16)?, "program total length")?;
         if !(MIN_SERIALIZED_PROGRAM_BYTES..=MAX_SERIALIZED_PROGRAM_BYTES).contains(&total) {
             return Err(ProgramFormatError::Malformed(
@@ -1538,6 +1553,14 @@ impl CompiledProgram {
         let output = OutputContract::from_tag(header[13])?;
         let version = read_u32_at(header, 8)?;
         let line_terminator = header_line_terminator(header, version)?;
+        let program_flags = header_program_flags(header, version)?;
+        if program_flags & PROGRAM_FLAG_NFA_MANDATORY_SUFFIX != 0
+            && engine_kind != EngineKind::OrderedNfa
+        {
+            return Err(ProgramFormatError::Malformed(
+                "mandatory-suffix flag requires an ordered-NFA engine",
+            ));
+        }
         let mut reader = ProgramReader::new(
             bytes
                 .get(PROGRAM_HEADER_LEN..)
@@ -1605,7 +1628,14 @@ impl CompiledProgram {
             &anchored_suffix,
             max_match_width,
             &engine,
+            program_flags & PROGRAM_FLAG_NFA_MANDATORY_SUFFIX != 0,
         );
+        if program_flags & PROGRAM_FLAG_NFA_MANDATORY_SUFFIX != 0 && nfa_mandatory_suffix.is_none()
+        {
+            return Err(ProgramFormatError::Malformed(
+                "mandatory-suffix flag is incompatible with the embedded graph",
+            ));
+        }
         let program = Self {
             raw,
             automaton,
@@ -3000,6 +3030,25 @@ fn header_line_terminator(header: &[u8], version: u32) -> Result<u8, ProgramForm
             }
             Ok(header[14])
         }
+        PROGRAM_FORMAT_VERSION_V3 => Ok(header[14]),
+        _ => Err(ProgramFormatError::Malformed(
+            "unsupported program format version",
+        )),
+    }
+}
+
+fn header_program_flags(header: &[u8], version: u32) -> Result<u8, ProgramFormatError> {
+    match version {
+        PROGRAM_FORMAT_VERSION_V1 | PROGRAM_FORMAT_VERSION_V2 => Ok(0),
+        PROGRAM_FORMAT_VERSION_V3 => {
+            let flags = header[15];
+            if flags & !PROGRAM_KNOWN_FLAGS != 0 {
+                return Err(ProgramFormatError::Malformed(
+                    "V3 program header contains unknown flags",
+                ));
+            }
+            Ok(flags)
+        }
         _ => Err(ProgramFormatError::Malformed(
             "unsupported program format version",
         )),
@@ -3847,10 +3896,30 @@ mod tests {
             assert_eq!(accelerator.maximum_width, 4);
 
             let bytes = compiled.serialize().expect("serialize fallback");
+            assert_eq!(
+                u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+                PROGRAM_FORMAT_VERSION_V3
+            );
+            assert_eq!(bytes[15], PROGRAM_FLAG_NFA_MANDATORY_SUFFIX);
             let restored = CompiledProgram::deserialize(&bytes).expect("restore fallback");
             assert_eq!(restored.engine_kind(), EngineKind::OrderedNfa);
             assert!(restored.nfa_mandatory_suffix.is_some());
             assert_eq!(restored.serialize().unwrap(), bytes);
+
+            let fast = program(
+                "(?:a|bb)q[xz]",
+                output,
+                CompileMode::Fast,
+                DeterminizeLimits::default(),
+            );
+            assert_eq!(fast.engine_kind(), EngineKind::OrderedNfa);
+            assert!(fast.nfa_mandatory_suffix.is_none());
+            let fast_bytes = fast.serialize().expect("serialize fast fallback");
+            assert_eq!(fast_bytes[15], 0);
+            let restored_fast =
+                CompiledProgram::deserialize(&fast_bytes).expect("restore fast fallback");
+            assert!(restored_fast.nfa_mandatory_suffix.is_none());
+            assert_eq!(restored_fast.serialize().unwrap(), fast_bytes);
         }
 
         let ineligible = [
@@ -4695,7 +4764,7 @@ mod tests {
             let bytes = original.serialize().unwrap();
             assert_eq!(
                 u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
-                PROGRAM_FORMAT_VERSION_V2
+                PROGRAM_FORMAT_VERSION_V3
             );
             assert_eq!(bytes[14], b'\n');
             assert_eq!(bytes[15], 0);
@@ -4717,7 +4786,37 @@ mod tests {
     }
 
     #[test]
-    fn line_terminator_is_bound_to_v2_header_identity_and_execution() {
+    fn v3_mandatory_suffix_flags_are_strict_and_engine_scoped() {
+        let fallback = program(
+            "(?:a|bb)q[xz]",
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        let bytes = fallback.serialize().unwrap();
+        assert_eq!(bytes[15], PROGRAM_FLAG_NFA_MANDATORY_SUFFIX);
+
+        let mut unknown = bytes;
+        unknown[15] |= 1 << 7;
+        assert!(CompiledProgram::deserialize(&unknown).is_err());
+
+        let dfa = program(
+            "(?:ab|ac)+",
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            DeterminizeLimits::default(),
+        );
+        assert_eq!(dfa.engine_kind(), EngineKind::OrderedDfa);
+        let mut wrong_engine = dfa.serialize().unwrap();
+        wrong_engine[15] = PROGRAM_FLAG_NFA_MANDATORY_SUFFIX;
+        assert!(CompiledProgram::deserialize(&wrong_engine).is_err());
+    }
+
+    #[test]
+    fn line_terminator_is_bound_to_v3_header_identity_and_execution() {
         let original = program_with_line_terminator(
             r"(?m:^a$)",
             b';',
@@ -4762,7 +4861,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_v1_programs_decode_as_lf_and_reserialize_as_v2() {
+    fn strict_v1_programs_decode_as_lf_and_reserialize_as_v3() {
         let original = program(
             r"(?m:^a$)",
             OutputContract::Span,
@@ -4787,13 +4886,13 @@ mod tests {
             MatchResult::Span(Some((1, 2)))
         );
 
-        let v2 = restored.serialize().unwrap();
+        let v3 = restored.serialize().unwrap();
         assert_eq!(
-            u32::from_le_bytes(v2[8..12].try_into().unwrap()),
-            PROGRAM_FORMAT_VERSION_V2
+            u32::from_le_bytes(v3[8..12].try_into().unwrap()),
+            PROGRAM_FORMAT_VERSION_V3
         );
-        assert_eq!(v2[14], b'\n');
-        assert_eq!(v2[15], 0);
+        assert_eq!(v3[14], b'\n');
+        assert_eq!(v3[15], 0);
 
         let mut noncanonical_v1 = v1.clone();
         noncanonical_v1[14] = b'\n';
@@ -4804,7 +4903,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_v1_ordered_dfa_canonical_upgrades_to_v2_with_identical_semantics() {
+    fn strict_v1_ordered_dfa_canonical_upgrades_to_v3_with_identical_semantics() {
         let original = program(
             "(?:ab|a)+?b",
             OutputContract::Span,
@@ -4812,8 +4911,8 @@ mod tests {
             DeterminizeLimits::default(),
         );
         assert_eq!(original.engine_kind(), EngineKind::OrderedDfa);
-        let canonical_v2 = original.serialize().unwrap();
-        let mut v1 = canonical_v2.clone();
+        let canonical_v3 = original.serialize().unwrap();
+        let mut v1 = canonical_v3.clone();
         v1[8..12].copy_from_slice(&PROGRAM_FORMAT_VERSION_V1.to_le_bytes());
         v1[14] = 0;
         v1[15] = 0;
@@ -4826,7 +4925,7 @@ mod tests {
         );
         assert_eq!(restored.line_terminator(), DEFAULT_LINE_TERMINATOR);
         assert_eq!(restored.dfa_stats(), original.dfa_stats());
-        assert_eq!(restored.serialize().unwrap(), canonical_v2);
+        assert_eq!(restored.serialize().unwrap(), canonical_v3);
 
         for haystack in [
             b"".as_slice(),
@@ -4869,7 +4968,7 @@ mod tests {
         malformed[0] ^= 1;
         assert!(CompiledProgram::deserialize(&malformed).is_err());
         malformed = valid.clone();
-        malformed[8..12].copy_from_slice(&3_u32.to_le_bytes());
+        malformed[8..12].copy_from_slice(&4_u32.to_le_bytes());
         assert!(CompiledProgram::deserialize(&malformed).is_err());
         malformed = valid.clone();
         malformed[12] = 9;
@@ -4878,7 +4977,7 @@ mod tests {
         malformed[13] = 9;
         assert!(CompiledProgram::deserialize(&malformed).is_err());
         malformed = valid.clone();
-        malformed[15] = 1;
+        malformed[15] = 1 << 7;
         assert!(CompiledProgram::deserialize(&malformed).is_err());
         malformed = valid.clone();
         malformed[16..24].copy_from_slice(&u64::MAX.to_le_bytes());
@@ -5044,7 +5143,9 @@ mod tests {
                 let mut candidate = seed.clone();
                 candidate[index] ^= 1_u8 << (index % 8);
                 if let Ok(decoded) = CompiledProgram::deserialize(&candidate) {
-                    assert_eq!(decoded.serialize().unwrap(), candidate);
+                    let canonical = decoded.serialize().unwrap();
+                    let reparsed = CompiledProgram::deserialize(&canonical).unwrap();
+                    assert_eq!(reparsed.serialize().unwrap(), canonical);
                 }
             }
         }
@@ -5059,7 +5160,9 @@ mod tests {
                 candidate.push(state.to_le_bytes()[0]);
             }
             if let Ok(decoded) = CompiledProgram::deserialize(&candidate) {
-                assert_eq!(decoded.serialize().unwrap(), candidate);
+                let canonical = decoded.serialize().unwrap();
+                let reparsed = CompiledProgram::deserialize(&canonical).unwrap();
+                assert_eq!(reparsed.serialize().unwrap(), canonical);
             }
         }
     }

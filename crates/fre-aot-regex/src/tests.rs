@@ -113,7 +113,7 @@ fn all_configured_line_terminators_match_rust_for_every_window() {
         assert_eq!(compiled.receipt().line_terminator, line_terminator);
         assert_eq!(compiled.program().line_terminator(), line_terminator);
         let serialized = compiled.program().serialize().unwrap();
-        assert_eq!(u32::from_le_bytes(serialized[8..12].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(serialized[8..12].try_into().unwrap()), 3);
         assert_eq!(serialized[14], line_terminator);
         assert_eq!(serialized[15], 0);
         let restored = crate::CompiledProgram::deserialize(&serialized).unwrap();
