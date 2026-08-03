@@ -11435,6 +11435,33 @@ mod tests {
         .unwrap()
     }
 
+    fn greedy_a_star_z() -> Automaton {
+        // a*z: the repeated `a` branch precedes the exit to `z`.
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 2, 3, 4, 4],
+                edge_targets: vec![1, 2, 0, 3],
+                edge_kinds: vec![
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                ],
+                byte_starts: vec![0, 0, b'a', b'z'],
+                byte_ends: vec![0, 0, b'a', b'z'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
     fn a_question(greedy: bool) -> Automaton {
         let split_targets = if greedy { [1, 2] } else { [2, 1] };
         Automaton::from_raw(
@@ -18194,6 +18221,27 @@ mod tests {
                 .unwrap()
                 .into_output(),
             MatchSpan::new(0, 2)
+        );
+    }
+
+    #[test]
+    fn greedy_star_prefix_keeps_the_absolute_ordered_start() {
+        let haystack = b"aaaz";
+        let window = SearchWindow::full(haystack);
+        let plan = greedy_a_star_z();
+        let mut workspace =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        assert_eq!(
+            plan.prepare::<Span>()
+                .search_window_with_workspace(
+                    haystack,
+                    window,
+                    &mut workspace,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output(),
+            Some(MatchSpan::new(0, 4))
         );
     }
 
