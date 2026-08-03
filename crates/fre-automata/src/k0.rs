@@ -4920,7 +4920,10 @@ fn execute_lazy_span_loop<const TRACK_START: bool>(
     let mut engine_candidate = None;
 
     loop {
-        if pending_end.is_none() && state == LazyState::Cached(initial_row) {
+        if pending_end.is_none()
+            && state == LazyState::Cached(initial_row)
+            && (!TRACK_START || active_start == Some(position))
+        {
             if let Some(scanner) = scanner {
                 if position < window.end() {
                     if let (Some(probe), Some(candidate)) = (probe, engine_candidate.take()) {
@@ -11391,6 +11394,33 @@ mod tests {
                 ],
                 edge_offsets: vec![0, 2, 3, 4, 4],
                 edge_targets: vec![1, 2, 0, 3],
+                edge_kinds: vec![
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                ],
+                byte_starts: vec![0, 0, b'a', b'b'],
+                byte_ends: vec![0, 0, b'a', b'b'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn lazy_a_star_b() -> Automaton {
+        // a*?b: the lazy empty branch precedes the repeated `a` branch.
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 2, 3, 4, 4],
+                edge_targets: vec![2, 1, 0, 3],
                 edge_kinds: vec![
                     EdgeKind::Epsilon,
                     EdgeKind::Epsilon,
@@ -18111,6 +18141,59 @@ mod tests {
             ),
             super::LazyStartAction::Drop,
             "two continuing source threads and a newly injected root have distinct starts"
+        );
+    }
+
+    #[test]
+    fn lazy_star_prefix_keeps_the_absolute_ordered_start() {
+        let haystack = b"ab";
+        let window = SearchWindow::full(haystack);
+        let expected = Some(MatchSpan::new(0, 2));
+
+        let plan = lazy_a_star_b();
+        let mut direct =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        assert_eq!(
+            plan.prepare::<Span>()
+                .search_window_with_workspace(
+                    haystack,
+                    window,
+                    &mut direct,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output(),
+            expected
+        );
+
+        let reverse_plan = lazy_a_star_b();
+        let mut reverse =
+            K0Workspace::new_bidirectional(&reverse_plan, WorkspaceLimits::unlimited()).unwrap();
+        let selected_end = reverse_plan
+            .prepare::<SelectedEnd>()
+            .search_window_with_workspace(
+                haystack,
+                window,
+                &mut reverse,
+                SearchLimits::unlimited(),
+            )
+            .unwrap()
+            .into_output()
+            .unwrap();
+        assert_eq!(selected_end, 2);
+        assert_eq!(
+            reverse_plan
+                .prepare::<Span>()
+                .recover_span_from_selected_end_with_workspace(
+                    haystack,
+                    window,
+                    &mut reverse,
+                    selected_end,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output(),
+            MatchSpan::new(0, 2)
         );
     }
 
