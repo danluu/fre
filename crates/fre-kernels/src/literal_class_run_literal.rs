@@ -61,6 +61,7 @@ use fre_simd_kernels::{
 };
 use memchr::memmem::{Finder, FinderBuilder};
 
+use crate::unicode_scalar_aggregate::{decode_scalar, decode_scalar_with};
 use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptError, Window};
 
 pub const PLAN_ID: &str = "literal-class-run-literal.maximal-byte-run.v4";
@@ -74,6 +75,12 @@ pub const GENERAL_SEARCH_OPERATION_ID: &str =
     "literal-class-run-search.generalized.search.unicode-off.v1";
 pub const GENERAL_SHORTEST_SEARCH_OPERATION_ID: &str =
     "literal-class-run-search.generalized.shortest-search.unicode-off.v1";
+pub(crate) const UNICODE_ALL_NON_ASCII_SEARCH_PLAN_ID: &str =
+    "literal-class-run-search.unicode-all-non-ascii.v1";
+pub(crate) const UNICODE_ALL_NON_ASCII_SEARCH_OPERATION_ID: &str =
+    "literal-class-run-search.unicode-all-non-ascii.search.v1";
+pub(crate) const UNICODE_ALL_NON_ASCII_SHORTEST_SEARCH_OPERATION_ID: &str =
+    "literal-class-run-search.unicode-all-non-ascii.shortest-search.v1";
 
 const FIXED_BUILD_WORK: usize = 32;
 const LITERAL_BUILD_WORK_PER_BYTE: usize = 4;
@@ -97,6 +104,7 @@ const MATCH_WORK: usize = 8;
 const SIMD_FIXED_CLASSIFIER_BUILD_WORK: usize = 128 + 2 + 2;
 const SIMD_RUN_SCANNER_BUILD_WORK: usize = 128 + 1 + 1;
 const SIMD_SCALAR_PROOF_BYTES: usize = ASCII_WIDE_BYTES;
+const UNICODE_RANGE_PROOF_WORK: usize = 4;
 const ASCII_WORD_CLASS_WORDS: [u64; 4] = [0x03ff_0000_0000_0000, 0x07ff_fffe_87ff_fffe, 0, 0];
 
 /// Boundary interpretation proved by the builder and retained by the plan.
@@ -214,7 +222,12 @@ pub struct BuildAccounting {
     pub prefix_bytes: usize,
     pub suffix_bytes: usize,
     pub literal_bytes: usize,
+    /// Canonical input ranges consumed by the builder. For the implicit-high
+    /// Unicode representation, this is the original Unicode range count.
     pub class_ranges: usize,
+    /// Members materialized in the retained byte bitmap. For the implicit-high
+    /// Unicode representation, non-ASCII scalar membership is represented by
+    /// the plan tag and this field therefore counts only ASCII members.
     pub class_members: usize,
     pub work_upper_bound: usize,
     pub scratch_bytes: usize,
@@ -553,6 +566,8 @@ pub enum BuildError {
     EmptySuffix,
     EmptyClass,
     NonCanonicalClass,
+    UnsupportedUnicodeClass,
+    NonAsciiUnicodeLiteral,
     PrefixBoundaryInClass,
     SuffixBoundaryInClass,
     InexactAsciiWordClass,
@@ -680,10 +695,19 @@ impl ByteClass {
         end: u8,
         work: &mut BuildWork<'_>,
     ) -> Result<(), BuildError> {
+        self.insert_range_with(start, end, |units| work.charge(units))
+    }
+
+    fn insert_range_with<E>(
+        &mut self,
+        start: u8,
+        end: u8,
+        mut charge: impl FnMut(usize) -> Result<(), E>,
+    ) -> Result<(), E> {
         let first = usize::from(start) >> 6;
         let last = usize::from(end) >> 6;
         for word in first..=last {
-            work.charge(RANGE_WORD_WORK)?;
+            charge(RANGE_WORD_WORK)?;
             let low = if word == first {
                 u32::from(start) & 63
             } else {
@@ -721,6 +745,14 @@ impl ByteClass {
     }
 }
 
+#[derive(Clone, Copy)]
+struct PreparedClass {
+    class: ByteClass,
+    input_ranges: usize,
+    materialized_members: usize,
+    work: usize,
+}
+
 const fn is_ascii_word(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
@@ -756,6 +788,7 @@ pub struct LiteralClassRunSearchPlan {
     class: ByteClass,
     ascii_scanner: Option<AsciiClassScanner>,
     minimum: SearchRunMinimum,
+    unicode_all_non_ascii: bool,
     build: BuildAccounting,
 }
 
@@ -2550,9 +2583,11 @@ impl LiteralClassRunSearchPlan {
             None,
             prefix,
             ranges,
+            None,
             suffix,
             minimum,
             boundary_semantics,
+            false,
             limits,
         )
     }
@@ -2574,24 +2609,85 @@ impl LiteralClassRunSearchPlan {
             Some((dispatch, DispatchPolicy::Auto)),
             prefix,
             ranges,
+            None,
             suffix,
             minimum,
             boundary_semantics,
+            false,
+            limits,
+        )
+    }
+
+    /// Build a search plan for a canonical Unicode scalar class that contains
+    /// every non-ASCII scalar. The retained byte set represents only the
+    /// class's ASCII members; execution validates non-ASCII UTF-8 before
+    /// treating those scalars as members.
+    pub fn build_unicode_all_non_ascii_with_dispatch<I>(
+        dispatch: SimdDispatchContext,
+        prefix: &[u8],
+        ranges: I,
+        suffix: &[u8],
+        minimum: SearchRunMinimum,
+        limits: BuildLimits,
+    ) -> Result<Self, BuildError>
+    where
+        I: Iterator<Item = (char, char)>,
+    {
+        let fixed_work = preflight_unicode_class_proof(prefix, suffix, limits)?;
+        let prepared = prove_unicode_all_non_ascii_class(ranges, limits, fixed_work)?;
+        Self::build_inner(
+            Some((dispatch, DispatchPolicy::Auto)),
+            prefix,
+            core::iter::empty(),
+            Some(prepared),
+            suffix,
+            minimum,
+            BoundarySemantics::Unguarded,
+            true,
+            limits,
+        )
+    }
+
+    #[cfg(test)]
+    fn build_unicode_all_non_ascii<I>(
+        prefix: &[u8],
+        ranges: I,
+        suffix: &[u8],
+        minimum: SearchRunMinimum,
+        limits: BuildLimits,
+    ) -> Result<Self, BuildError>
+    where
+        I: Iterator<Item = (char, char)>,
+    {
+        let fixed_work = preflight_unicode_class_proof(prefix, suffix, limits)?;
+        let prepared = prove_unicode_all_non_ascii_class(ranges, limits, fixed_work)?;
+        Self::build_inner(
+            None,
+            prefix,
+            core::iter::empty(),
+            Some(prepared),
+            suffix,
+            minimum,
+            BoundarySemantics::Unguarded,
+            true,
             limits,
         )
     }
 
     #[allow(
+        clippy::too_many_arguments,
         clippy::too_many_lines,
-        reason = "the search-only builder keeps structural revalidation and every exact resource charge adjacent"
+        reason = "the search-only builder keeps semantic mode, structural revalidation, and every exact resource charge adjacent"
     )]
     fn build_inner<I>(
         dispatch: Option<(SimdDispatchContext, DispatchPolicy)>,
         prefix: &[u8],
         mut ranges: I,
+        prepared_class: Option<PreparedClass>,
         suffix: &[u8],
         minimum: SearchRunMinimum,
         boundary_semantics: BoundarySemantics,
+        unicode_all_non_ascii: bool,
         limits: BuildLimits,
     ) -> Result<Self, BuildError>
     where
@@ -2611,6 +2707,9 @@ impl LiteralClassRunSearchPlan {
                 return Err(BuildError::UnsupportedSearchMinimum);
             }
             BoundarySemantics::Unguarded | BoundarySemantics::CompleteAsciiWordRun => {}
+        }
+        if unicode_all_non_ascii && suffix.is_empty() {
+            return Err(BuildError::EmptySuffix);
         }
 
         let literal_bytes =
@@ -2665,7 +2764,16 @@ impl LiteralClassRunSearchPlan {
         let (class, class_ranges, class_members, ascii_scanner, work_upper_bound) = {
             let mut work = BuildWork::new(limits.max_build_work, &mut actual);
             work.charge(literal_work)?;
-            let (class, class_ranges, class_members) = build_class(&mut ranges, limits, &mut work)?;
+            let (class, class_ranges, class_members) = if let Some(prepared) = prepared_class {
+                work.charge(prepared.work)?;
+                (
+                    prepared.class,
+                    prepared.input_ranges,
+                    prepared.materialized_members,
+                )
+            } else {
+                build_class(&mut ranges, limits, &mut work)?
+            };
             match boundary_semantics {
                 BoundarySemantics::Unguarded => {
                     work.charge(1)?;
@@ -2723,6 +2831,7 @@ impl LiteralClassRunSearchPlan {
             class,
             ascii_scanner,
             minimum,
+            unicode_all_non_ascii,
             build: BuildAccounting {
                 prefix_bytes,
                 suffix_bytes,
@@ -2744,7 +2853,11 @@ impl LiteralClassRunSearchPlan {
 
     #[must_use]
     pub const fn plan_id(&self) -> &'static str {
-        GENERAL_SEARCH_PLAN_ID
+        if self.unicode_all_non_ascii {
+            UNICODE_ALL_NON_ASCII_SEARCH_PLAN_ID
+        } else {
+            GENERAL_SEARCH_PLAN_ID
+        }
     }
 
     #[must_use]
@@ -2846,9 +2959,13 @@ impl LiteralClassRunSearchPlan {
                     Ok::<(usize, usize), ReduceError>((start, end))
                 })
                 .transpose()?;
-        let operation_id = match projection {
-            SearchProjection::Selected => GENERAL_SEARCH_OPERATION_ID,
-            SearchProjection::EarliestEnd => GENERAL_SHORTEST_SEARCH_OPERATION_ID,
+        let operation_id = match (self.unicode_all_non_ascii, projection) {
+            (true, SearchProjection::Selected) => UNICODE_ALL_NON_ASCII_SEARCH_OPERATION_ID,
+            (true, SearchProjection::EarliestEnd) => {
+                UNICODE_ALL_NON_ASCII_SHORTEST_SEARCH_OPERATION_ID
+            }
+            (false, SearchProjection::Selected) => GENERAL_SEARCH_OPERATION_ID,
+            (false, SearchProjection::EarliestEnd) => GENERAL_SHORTEST_SEARCH_OPERATION_ID,
         };
         Ok((
             matched,
@@ -2931,9 +3048,17 @@ impl LiteralClassRunSearchPlan {
                 })?;
         // Prefix candidates whose repeated runs share one end are skipped as
         // a group. Guarded suffix candidates recover at most one class run
-        // per terminal word suffix. Thus logical class traversal is linear;
-        // every retained SIMD recovery may inspect at most one extra wide
-        // block.
+        // per terminal word suffix. Thus logical class traversal is linear.
+        //
+        // For an implicit-high Unicode class, let K be the number of
+        // nonempty initial or resumed ASCII scanner calls. Their starts are
+        // strictly increasing in the post-prefix domain, including across a
+        // failed suffix restart, so K <= anchor_candidates. Scalar decoding
+        // and run intervals contribute at most 4 * input_bytes logical
+        // classifications, a scanner terminal may be decoded once more, and
+        // every scanner call may physically inspect at most one partial wide
+        // block. Therefore the retained expression covers
+        // 4N + K + K * (ASCII_WIDE_BYTES - 1).
         let logical_classifications = input_bytes
             .checked_mul(4)
             .and_then(|value| value.checked_add(anchor_candidates))
@@ -3081,14 +3206,25 @@ impl LiteralClassRunSearchPlan {
                 continue;
             }
 
-            let recovered = search_scan_class_run_forward(
-                haystack,
-                self.class,
-                self.ascii_scanner.as_ref(),
-                anchor_end,
-                &mut actual,
-                meter,
-            )?;
+            let recovered = if self.unicode_all_non_ascii {
+                search_scan_unicode_all_non_ascii_run_forward(
+                    haystack,
+                    self.class,
+                    self.ascii_scanner.as_ref(),
+                    anchor_end,
+                    &mut actual,
+                    meter,
+                )?
+            } else {
+                search_scan_class_run_forward(
+                    haystack,
+                    self.class,
+                    self.ascii_scanner.as_ref(),
+                    anchor_end,
+                    &mut actual,
+                    meter,
+                )?
+            };
             if recovered.is_some() {
                 meter.ensure_work(&actual, RUN_WORK)?;
                 actual.runs = checked_add(actual.runs, 1, "generalized run count")?;
@@ -3790,6 +3926,192 @@ fn build_ascii_scanner(
     )))
 }
 
+/// Admit all literal, storage, and fixed-work resources before consuming the
+/// Unicode range iterator. The returned fixed-work offset makes every later
+/// proof failure report its exact global work position; boundary and scanner
+/// charges remain prospective in `build_inner`.
+fn preflight_unicode_class_proof(
+    prefix: &[u8],
+    suffix: &[u8],
+    limits: BuildLimits,
+) -> Result<usize, BuildError> {
+    if prefix.is_empty() {
+        return Err(BuildError::EmptyPrefix);
+    }
+    if suffix.is_empty() {
+        return Err(BuildError::EmptySuffix);
+    }
+    let literal_bytes =
+        prefix
+            .len()
+            .checked_add(suffix.len())
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "Unicode generalized search literal byte total",
+            })?;
+    enforce_build(
+        literal_bytes,
+        limits.max_literal_bytes,
+        BuildResource::LiteralBytes,
+    )?;
+    let persistent_bytes = size_of::<LiteralClassRunSearchPlan>()
+        .checked_add(literal_bytes)
+        .ok_or(BuildError::ArithmeticOverflow {
+            computation: "Unicode generalized search persistent bytes",
+        })?;
+    enforce_build(0, limits.max_scratch_bytes, BuildResource::Scratch)?;
+    enforce_build(
+        persistent_bytes,
+        limits.max_persistent_bytes,
+        BuildResource::Persistent,
+    )?;
+    enforce_build(persistent_bytes, limits.max_peak_bytes, BuildResource::Peak)?;
+    let fixed_work = literal_bytes
+        .checked_mul(LITERAL_BUILD_WORK_PER_BYTE)
+        .and_then(|value| {
+            prefix
+                .len()
+                .checked_mul(FINDER_BUILD_WORK_PER_BYTE)
+                .and_then(|finder| value.checked_add(finder))
+        })
+        .and_then(|value| value.checked_add(FIXED_BUILD_WORK))
+        .and_then(|value| value.checked_add(ANCHOR_SELECTION_WORK))
+        .ok_or(BuildError::ArithmeticOverflow {
+            computation: "Unicode generalized search fixed build work",
+        })?;
+    if fixed_work > limits.max_build_work {
+        return Err(BuildError::WorkLimit {
+            needed: fixed_work,
+            limit: limits.max_build_work,
+        });
+    }
+    // The fixed per-byte charge above admits this single validation pass.
+    if !prefix.iter().all(u8::is_ascii) || !suffix.iter().all(u8::is_ascii) {
+        return Err(BuildError::NonAsciiUnicodeLiteral);
+    }
+    Ok(fixed_work)
+}
+
+fn prove_unicode_all_non_ascii_class<I>(
+    mut ranges: I,
+    limits: BuildLimits,
+    initial_work: usize,
+) -> Result<PreparedClass, BuildError>
+where
+    I: Iterator<Item = (char, char)>,
+{
+    let mut class = ByteClass::empty();
+    let mut range_count = 0_usize;
+    let mut class_members = 0_usize;
+    let mut total_work = initial_work;
+    let mut previous_end = None;
+    let mut next_required = u32::from('\u{80}');
+    let maximum = u32::from(char::MAX);
+    let mut complete = false;
+    loop {
+        charge_detached_build_work(&mut total_work, 1, limits.max_build_work)?;
+        let Some((start, end)) = ranges.next() else {
+            break;
+        };
+        charge_detached_build_work(
+            &mut total_work,
+            UNICODE_RANGE_PROOF_WORK,
+            limits.max_build_work,
+        )?;
+        let start = u32::from(start);
+        let end = u32::from(end);
+        if start > end || previous_end.is_some_and(|previous| previous >= start) {
+            return Err(BuildError::NonCanonicalClass);
+        }
+        previous_end = Some(end);
+        range_count = range_count
+            .checked_add(1)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "Unicode class range count",
+            })?;
+        enforce_build(
+            range_count,
+            limits.max_class_ranges,
+            BuildResource::ClassRanges,
+        )?;
+
+        if start <= 0x7F {
+            let ascii_end = end.min(0x7F);
+            let members = usize::try_from(ascii_end - start + 1).map_err(|_| {
+                BuildError::ArithmeticOverflow {
+                    computation: "Unicode class ASCII range members",
+                }
+            })?;
+            class_members =
+                class_members
+                    .checked_add(members)
+                    .ok_or(BuildError::ArithmeticOverflow {
+                        computation: "Unicode class materialized member total",
+                    })?;
+            enforce_build(
+                class_members,
+                limits.max_class_members,
+                BuildResource::ClassMembers,
+            )?;
+            charge_detached_build_work(&mut total_work, RANGE_BUILD_WORK, limits.max_build_work)?;
+            class.insert_range_with(
+                u8::try_from(start).expect("proved ASCII range start"),
+                u8::try_from(ascii_end).expect("clamped ASCII range end"),
+                |units| charge_detached_build_work(&mut total_work, units, limits.max_build_work),
+            )?;
+        }
+
+        if complete || end < next_required {
+            continue;
+        }
+        let non_ascii_start = start.max(u32::from('\u{80}'));
+        if non_ascii_start > next_required {
+            return Err(BuildError::UnsupportedUnicodeClass);
+        }
+        if end == maximum {
+            complete = true;
+            continue;
+        }
+        next_required = end.checked_add(1).ok_or(BuildError::ArithmeticOverflow {
+            computation: "next required Unicode scalar",
+        })?;
+        if (0xD800..=0xDFFF).contains(&next_required) {
+            next_required = 0xE000;
+        }
+    }
+    if !complete {
+        return Err(BuildError::UnsupportedUnicodeClass);
+    }
+    let proof_work =
+        total_work
+            .checked_sub(initial_work)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "Unicode class proof work delta",
+            })?;
+    Ok(PreparedClass {
+        class,
+        input_ranges: range_count,
+        materialized_members: class_members,
+        work: proof_work,
+    })
+}
+
+fn charge_detached_build_work(
+    used: &mut usize,
+    units: usize,
+    limit: usize,
+) -> Result<(), BuildError> {
+    let needed = used
+        .checked_add(units)
+        .ok_or(BuildError::ArithmeticOverflow {
+            computation: "Unicode class proof work",
+        })?;
+    if needed > limit {
+        return Err(BuildError::WorkLimit { needed, limit });
+    }
+    *used = needed;
+    Ok(())
+}
+
 fn build_class<I>(
     ranges: &mut I,
     limits: BuildLimits,
@@ -4230,6 +4552,129 @@ fn search_scan_class_run_forward(
     Ok(recovered)
 }
 
+fn scan_unicode_all_non_ascii_run_forward(
+    haystack: &[u8],
+    class: ByteClass,
+    scanner: Option<&AsciiClassScanner>,
+    start: usize,
+    actual: &mut ReduceActualCounters,
+) -> Result<Option<usize>, ReduceError> {
+    let mut end = scan_class_run_forward(haystack, class, scanner, start, actual)?.unwrap_or(start);
+    if end == haystack.len() {
+        return Ok((end != start).then_some(end));
+    }
+
+    // Consecutive non-ASCII scalars stay on the decoder. When an ASCII member
+    // reappears, consume it and resume the retained ASCII scanner only after
+    // its leaf-specific scalar proof. That recovers long ASCII tails without
+    // issuing a wide scan for every short Unicode/ASCII alternation.
+    loop {
+        let remaining = haystack.get(end..).ok_or(ReduceError::ArithmeticOverflow {
+            computation: "Unicode class-run decode window",
+        })?;
+        let decoded = decode_scalar(remaining);
+        charge_classifications(actual, decoded.byte_checks)?;
+        let Some(scalar) = decoded.scalar else {
+            return Ok((end != start).then_some(end));
+        };
+        let ascii_member = if scalar <= 0x7F {
+            let byte = u8::try_from(scalar).expect("ASCII scalar fits u8");
+            if !class.contains(byte) {
+                return Ok((end != start).then_some(end));
+            }
+            true
+        } else {
+            false
+        };
+        end = end
+            .checked_add(decoded.width)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "Unicode class-run scalar advance",
+            })?;
+        if end == haystack.len() {
+            return Ok(Some(end));
+        }
+        if ascii_member {
+            end = resume_unicode_ascii_corridor(haystack, class, scanner, end, actual)?;
+            if end == haystack.len() {
+                return Ok(Some(end));
+            }
+        }
+    }
+}
+
+fn resume_unicode_ascii_corridor(
+    haystack: &[u8],
+    class: ByteClass,
+    scanner: Option<&AsciiClassScanner>,
+    start: usize,
+    actual: &mut ReduceActualCounters,
+) -> Result<usize, ReduceError> {
+    match scanner {
+        None => Ok(start),
+        Some(AsciiClassScanner::Fixed(classifier)) => {
+            scan_class_run_forward_fixed(haystack, class, classifier, start, actual)
+                .map(|end| end.unwrap_or(start))
+        }
+        Some(AsciiClassScanner::Run(scanner)) => {
+            let mut end = start;
+            for _ in 0..ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD {
+                if end == haystack.len() {
+                    return Ok(end);
+                }
+                let byte = read_classified(haystack, end, actual)?;
+                if !class.contains(byte) {
+                    return Ok(end);
+                }
+                end = end.checked_add(1).ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "resumed Unicode ASCII scalar proof advance",
+                })?;
+            }
+            scan_class_run_forward_direct(haystack, scanner, end, actual)
+                .map(|recovered| recovered.unwrap_or(end))
+        }
+    }
+}
+
+fn search_scan_unicode_all_non_ascii_run_forward(
+    haystack: &[u8],
+    class: ByteClass,
+    scanner: Option<&AsciiClassScanner>,
+    start: usize,
+    actual: &mut ReduceActualCounters,
+    meter: SearchMeter,
+) -> Result<Option<usize>, SearchError> {
+    if meter.work_envelope_admitted {
+        return scan_unicode_all_non_ascii_run_forward(haystack, class, scanner, start, actual)
+            .map_err(SearchError::from);
+    }
+    // Finite-work execution remains scalar so every source dereference is
+    // preceded immediately by its prospective work admission.
+    let mut end = start;
+    while end < haystack.len() {
+        let remaining = haystack.get(end..).ok_or(ReduceError::ArithmeticOverflow {
+            computation: "metered Unicode class-run decode window",
+        })?;
+        let decoded = decode_scalar_with(remaining, || {
+            meter.ensure_work(actual, CLASSIFICATION_WORK)?;
+            charge_classifications(actual, 1)?;
+            Ok::<(), SearchError>(())
+        })?;
+        let Some(scalar) = decoded.scalar else {
+            return Ok((end != start).then_some(end));
+        };
+        if scalar <= 0x7F && !class.contains(u8::try_from(scalar).expect("ASCII scalar fits u8")) {
+            return Ok((end != start).then_some(end));
+        }
+        end = end
+            .checked_add(decoded.width)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "metered Unicode class-run scalar advance",
+            })?;
+    }
+    Ok((end != start).then_some(end))
+}
+
 fn search_scan_class_run_backward(
     haystack: &[u8],
     class: ByteClass,
@@ -4651,6 +5096,23 @@ mod tests {
         .unwrap()
     }
 
+    fn unicode_generalized_plan() -> LiteralClassRunSearchPlan {
+        LiteralClassRunSearchPlan::build_unicode_all_non_ascii(
+            b"a",
+            [
+                ('\0', '\u{9}'),
+                ('\u{B}', '\u{C}'),
+                ('\u{E}', 'y'),
+                ('{', char::MAX),
+            ]
+            .into_iter(),
+            b"z",
+            SearchRunMinimum::Zero,
+            BuildLimits::unlimited(),
+        )
+        .unwrap()
+    }
+
     fn reference(pattern: &str, haystack: &[u8]) -> (u64, u64, Vec<Range<usize>>) {
         let spans: Vec<_> = RegexBuilder::new(pattern)
             .unicode(false)
@@ -4767,6 +5229,391 @@ mod tests {
         );
         assert_eq!(selected_accounting.window_bytes, 4);
         assert_eq!(earliest_accounting.window_bytes, 4);
+    }
+
+    #[test]
+    fn unicode_all_non_ascii_search_matches_upstream_on_valid_and_invalid_utf8() {
+        let plan = unicode_generalized_plan();
+        let oracle = RegexBuilder::new(r"a[^z\r\n]*z").build().unwrap();
+        let haystacks = [
+            b"".as_slice(),
+            b"abz",
+            "--aé文z--".as_bytes(),
+            b"a\x80z--abz",
+            b"a\xC0\xAFz--aokz",
+            b"a\xED\xA0\x80z--aokz",
+            b"a\xF4\x90\x80\x80z--aokz",
+            b"a\xF0\x9F\x92z--aokz",
+            b"aaaz--a\xFFz--abz",
+        ];
+        for haystack in haystacks {
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let window = Window::new(start, end);
+                    let expected = oracle
+                        .find(&haystack[start..end])
+                        .map(|matched| (start + matched.start(), start + matched.end()));
+                    let expected_shortest = oracle
+                        .shortest_match(&haystack[start..end])
+                        .map(|matched_end| start + matched_end);
+                    assert_eq!(
+                        plan.find_window(haystack, window, SearchLimits::unlimited())
+                            .unwrap()
+                            .0,
+                        expected,
+                        "haystack={haystack:?} window={start}..{end}"
+                    );
+                    assert_eq!(
+                        plan.shortest_window(haystack, window, SearchLimits::unlimited())
+                            .unwrap()
+                            .0,
+                        expected_shortest,
+                        "shortest haystack={haystack:?} window={start}..{end}"
+                    );
+                }
+            }
+        }
+        assert_eq!(plan.plan_id(), UNICODE_ALL_NON_ASCII_SEARCH_PLAN_ID);
+    }
+
+    #[test]
+    fn unicode_all_non_ascii_mixed_corridors_preserve_semantics_and_bounds() {
+        let plan = LiteralClassRunSearchPlan::build_unicode_all_non_ascii_with_dispatch(
+            SimdDispatchContext::capture(),
+            b"a",
+            [
+                ('\0', '\u{9}'),
+                ('\u{B}', '\u{C}'),
+                ('\u{E}', 'y'),
+                ('{', char::MAX),
+            ]
+            .into_iter(),
+            b"z",
+            SearchRunMinimum::Zero,
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let oracle = RegexBuilder::new(r"a[^z\r\n]*z").build().unwrap();
+
+        let mut early_then_long_ascii = b"--a".to_vec();
+        early_then_long_ascii.extend_from_slice("🦀".as_bytes());
+        early_then_long_ascii.extend(core::iter::repeat_n(b'q', 4_093));
+        early_then_long_ascii.extend_from_slice(b"z--");
+
+        let mut alternating_short_corridors = b"--a".to_vec();
+        for _ in 0..64 {
+            alternating_short_corridors.extend_from_slice("é".as_bytes());
+            alternating_short_corridors.push(b'q');
+        }
+        alternating_short_corridors.extend_from_slice(b"z--");
+
+        let mut invalid_then_later_anchor = b"--a".to_vec();
+        invalid_then_later_anchor.extend_from_slice("€".as_bytes());
+        invalid_then_later_anchor.extend(core::iter::repeat_n(b'x', 97));
+        invalid_then_later_anchor.extend_from_slice(b"\xED\xA0\x80z--aokz--");
+
+        for haystack in [
+            early_then_long_ascii.as_slice(),
+            alternating_short_corridors.as_slice(),
+            invalid_then_later_anchor.as_slice(),
+        ] {
+            let expected = oracle
+                .find(haystack)
+                .map(|matched| (matched.start(), matched.end()));
+            let (actual, accounting) = plan.find(haystack, SearchLimits::unlimited()).unwrap();
+            let upper = plan.search_upper_bounds(haystack.len()).unwrap();
+            assert_eq!(actual, expected, "haystack={haystack:?}");
+            assert!(
+                accounting.classifications <= upper.classifications,
+                "haystack={haystack:?} actual={} upper={}",
+                accounting.classifications,
+                upper.classifications
+            );
+            assert!(accounting.source_reads <= accounting.source_reads_upper_bound);
+            assert!(u64::try_from(accounting.work).unwrap() <= accounting.work_upper_bound);
+        }
+    }
+
+    #[test]
+    fn unicode_all_non_ascii_builder_reproves_coverage_and_literals() {
+        assert!(matches!(
+            LiteralClassRunSearchPlan::build_unicode_all_non_ascii(
+                b"a",
+                [('\0', '\u{7F}'), ('\u{81}', char::MAX)].into_iter(),
+                b"z",
+                SearchRunMinimum::Zero,
+                BuildLimits::unlimited(),
+            ),
+            Err(BuildError::UnsupportedUnicodeClass)
+        ));
+        assert!(matches!(
+            LiteralClassRunSearchPlan::build_unicode_all_non_ascii(
+                "é".as_bytes(),
+                [('\0', 'y'), ('{', char::MAX)].into_iter(),
+                b"z",
+                SearchRunMinimum::Zero,
+                BuildLimits::unlimited(),
+            ),
+            Err(BuildError::NonAsciiUnicodeLiteral)
+        ));
+        assert!(matches!(
+            LiteralClassRunSearchPlan::build_unicode_all_non_ascii(
+                b"a",
+                [('a', char::MAX), ('b', 'c')].into_iter(),
+                b"z",
+                SearchRunMinimum::Zero,
+                BuildLimits::unlimited(),
+            ),
+            Err(BuildError::NonCanonicalClass)
+        ));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one table-driven test closes exact replay and every nonzero Unicode build dimension"
+    )]
+    fn unicode_all_non_ascii_build_accounting_replays_exact_source_ranges() {
+        let ranges = [('a', 'a'), ('\u{80}', char::MAX)];
+        let baseline = LiteralClassRunSearchPlan::build_unicode_all_non_ascii(
+            b"q",
+            ranges.into_iter(),
+            b"z",
+            SearchRunMinimum::Zero,
+            BuildLimits::unlimited(),
+        )
+        .unwrap()
+        .build_accounting();
+        assert_eq!(baseline.class_ranges, 2);
+        assert_eq!(baseline.class_members, 1);
+        let exact = BuildLimits {
+            max_literal_bytes: baseline.literal_bytes,
+            max_class_ranges: baseline.class_ranges,
+            max_class_members: baseline.class_members,
+            max_build_work: baseline.work_upper_bound,
+            max_scratch_bytes: baseline.scratch_bytes,
+            max_persistent_bytes: baseline.persistent_bytes,
+            max_peak_bytes: baseline.peak_bytes,
+        };
+        assert_eq!(
+            LiteralClassRunSearchPlan::build_unicode_all_non_ascii(
+                b"q",
+                ranges.into_iter(),
+                b"z",
+                SearchRunMinimum::Zero,
+                exact,
+            )
+            .unwrap()
+            .build_accounting(),
+            baseline
+        );
+
+        let mut below = exact;
+        below.max_literal_bytes -= 1;
+        assert!(matches!(
+            LiteralClassRunSearchPlan::build_unicode_all_non_ascii(
+                b"q",
+                ranges.into_iter(),
+                b"z",
+                SearchRunMinimum::Zero,
+                below,
+            ),
+            Err(BuildError::LiteralBytesLimit { .. })
+        ));
+        below = exact;
+        below.max_class_ranges -= 1;
+        assert!(matches!(
+            LiteralClassRunSearchPlan::build_unicode_all_non_ascii(
+                b"q",
+                ranges.into_iter(),
+                b"z",
+                SearchRunMinimum::Zero,
+                below,
+            ),
+            Err(BuildError::ClassRangesLimit {
+                needed: 2,
+                limit: 1
+            })
+        ));
+        below = exact;
+        below.max_class_members -= 1;
+        assert!(matches!(
+            LiteralClassRunSearchPlan::build_unicode_all_non_ascii(
+                b"q",
+                ranges.into_iter(),
+                b"z",
+                SearchRunMinimum::Zero,
+                below,
+            ),
+            Err(BuildError::ClassMembersLimit {
+                needed: 1,
+                limit: 0
+            })
+        ));
+        below = exact;
+        below.max_build_work -= 1;
+        assert!(matches!(
+            LiteralClassRunSearchPlan::build_unicode_all_non_ascii(
+                b"q",
+                ranges.into_iter(),
+                b"z",
+                SearchRunMinimum::Zero,
+                below,
+            ),
+            Err(BuildError::WorkLimit { needed, limit })
+                if needed == baseline.work_upper_bound && limit + 1 == needed
+        ));
+        below = exact;
+        below.max_persistent_bytes -= 1;
+        assert!(matches!(
+            LiteralClassRunSearchPlan::build_unicode_all_non_ascii(
+                b"q",
+                ranges.into_iter(),
+                b"z",
+                SearchRunMinimum::Zero,
+                below,
+            ),
+            Err(BuildError::PersistentLimit { .. })
+        ));
+        below = exact;
+        below.max_peak_bytes -= 1;
+        assert!(matches!(
+            LiteralClassRunSearchPlan::build_unicode_all_non_ascii(
+                b"q",
+                ranges.into_iter(),
+                b"z",
+                SearchRunMinimum::Zero,
+                below,
+            ),
+            Err(BuildError::PeakLimit { .. })
+        ));
+    }
+
+    #[test]
+    fn unicode_all_non_ascii_supports_an_empty_materialized_ascii_class() {
+        let plan = LiteralClassRunSearchPlan::build_unicode_all_non_ascii(
+            b"a",
+            [('\u{80}', char::MAX)].into_iter(),
+            b"z",
+            SearchRunMinimum::Zero,
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        assert_eq!(plan.build_accounting().class_ranges, 1);
+        assert_eq!(plan.build_accounting().class_members, 0);
+        for (haystack, expected) in [
+            (b"az".as_slice(), Some((0, 2))),
+            ("aé文🦀z".as_bytes(), Some((0, "aé文🦀z".len()))),
+            (b"abz".as_slice(), None),
+            (b"a\x80z--az".as_slice(), Some((5, 7))),
+        ] {
+            assert_eq!(
+                plan.find(haystack, SearchLimits::unlimited()).unwrap().0,
+                expected,
+                "haystack={haystack:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn finite_unicode_decode_stops_at_the_exact_work_boundary() {
+        let plan = unicode_generalized_plan();
+        let haystack = "a🦀z".as_bytes();
+        assert!(matches!(
+            plan.find(
+                haystack,
+                SearchLimits {
+                    max_work_upper_bound: 27,
+                    max_candidate_visits: usize::MAX,
+                    max_scratch_bytes: 0,
+                },
+            ),
+            Err(SearchError::WorkLimit {
+                needed: 29,
+                limit: 27
+            })
+        ));
+
+        let (_, ordinary) = plan.find(haystack, SearchLimits::unlimited()).unwrap();
+        let (_, metered) = plan
+            .find(
+                haystack,
+                SearchLimits {
+                    max_work_upper_bound: ordinary.work_upper_bound - 1,
+                    max_candidate_visits: usize::MAX,
+                    max_scratch_bytes: 0,
+                },
+            )
+            .unwrap();
+        let exact_work = u64::try_from(metered.work).unwrap();
+        assert_eq!(
+            plan.find(
+                haystack,
+                SearchLimits {
+                    max_work_upper_bound: exact_work,
+                    max_candidate_visits: usize::MAX,
+                    max_scratch_bytes: 0,
+                },
+            )
+            .unwrap()
+            .0,
+            Some((0, haystack.len()))
+        );
+        assert!(matches!(
+            plan.find(
+                haystack,
+                SearchLimits {
+                    max_work_upper_bound: exact_work - 1,
+                    max_candidate_visits: usize::MAX,
+                    max_scratch_bytes: 0,
+                },
+            ),
+            Err(SearchError::WorkLimit { needed, limit })
+                if needed == exact_work && limit + 1 == needed
+        ));
+
+        let mut mixed = b"a".to_vec();
+        mixed.extend_from_slice("é€🦀".as_bytes());
+        mixed.extend(core::iter::repeat_n(b'q', 97));
+        mixed.push(b'z');
+        let (_, ordinary) = plan.find(&mixed, SearchLimits::unlimited()).unwrap();
+        let (expected, metered) = plan
+            .find(
+                &mixed,
+                SearchLimits {
+                    max_work_upper_bound: ordinary.work_upper_bound - 1,
+                    max_candidate_visits: usize::MAX,
+                    max_scratch_bytes: 0,
+                },
+            )
+            .unwrap();
+        let exact_work = u64::try_from(metered.work).unwrap();
+        assert_eq!(expected, Some((0, mixed.len())));
+        assert_eq!(
+            plan.find(
+                &mixed,
+                SearchLimits {
+                    max_work_upper_bound: exact_work,
+                    max_candidate_visits: usize::MAX,
+                    max_scratch_bytes: 0,
+                },
+            )
+            .unwrap()
+            .0,
+            expected
+        );
+        assert!(matches!(
+            plan.find(
+                &mixed,
+                SearchLimits {
+                    max_work_upper_bound: exact_work - 1,
+                    max_candidate_visits: usize::MAX,
+                    max_scratch_bytes: 0,
+                },
+            ),
+            Err(SearchError::WorkLimit { needed, limit })
+                if needed == exact_work && limit + 1 == needed
+        ));
     }
 
     #[test]

@@ -1180,6 +1180,8 @@ fn literal_class_run_literal_failure_class(
         | LiteralClassRunLiteralBuildError::EmptySuffix
         | LiteralClassRunLiteralBuildError::EmptyClass
         | LiteralClassRunLiteralBuildError::NonCanonicalClass
+        | LiteralClassRunLiteralBuildError::UnsupportedUnicodeClass
+        | LiteralClassRunLiteralBuildError::NonAsciiUnicodeLiteral
         | LiteralClassRunLiteralBuildError::PrefixBoundaryInClass
         | LiteralClassRunLiteralBuildError::SuffixBoundaryInClass
         | LiteralClassRunLiteralBuildError::InexactAsciiWordClass
@@ -2870,15 +2872,26 @@ impl PortableBuilder {
             if let literal_class_run_literal::InspectionOutcome::Eligible(inspection) = inspection {
                 let dispatch = SimdDispatchContext::capture();
                 let built = if inspection.generalized_search {
-                    LiteralClassRunSearchPlan::build_with_dispatch(
-                        dispatch,
-                        inspection.prefix,
-                        inspection.class.ranges(),
-                        inspection.suffix,
-                        inspection.minimum,
-                        inspection.boundary_semantics,
-                        self.limits.literal_class_run_literal,
-                    )
+                    if let Some(ranges) = inspection.class.unicode_ranges() {
+                        LiteralClassRunSearchPlan::build_unicode_all_non_ascii_with_dispatch(
+                            dispatch,
+                            inspection.prefix,
+                            ranges.iter().map(|range| (range.start(), range.end())),
+                            inspection.suffix,
+                            inspection.minimum,
+                            self.limits.literal_class_run_literal,
+                        )
+                    } else {
+                        LiteralClassRunSearchPlan::build_with_dispatch(
+                            dispatch,
+                            inspection.prefix,
+                            inspection.class.ranges(),
+                            inspection.suffix,
+                            inspection.minimum,
+                            inspection.boundary_semantics,
+                            self.limits.literal_class_run_literal,
+                        )
+                    }
                     .map(PortablePlan::LiteralClassRunSearch)
                 } else {
                     match inspection.boundary_semantics {
@@ -6912,6 +6925,113 @@ mod tests {
             accounting,
             SearchAccounting::LiteralClassRunLiteral(_)
         ));
+    }
+
+    #[test]
+    fn facade_selects_unicode_all_non_ascii_class_run_and_matches_upstream() {
+        let pattern = r"a[^z\r\n]*z";
+        let regex = PortableBuilder::new(pattern).build().unwrap();
+        let upstream = regex::bytes::RegexBuilder::new(pattern).build().unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::LiteralClassRunLiteral);
+        assert_eq!(regex.build_report().lowering, None);
+        assert_eq!(regex.build_report().states, 0);
+
+        for haystack in [
+            b"".as_slice(),
+            b"--abz--aaaz--",
+            "--aé文z--aβz--".as_bytes(),
+            b"a\x80z--abz--a\xC0\xAFz--aokz",
+            b"a\xED\xA0\x80z--aokz--a\xF0\x9F\x92z--abz",
+        ] {
+            let expected = upstream
+                .find(haystack)
+                .map(|matched| (matched.start(), matched.end()));
+            let actual = regex
+                .find(haystack, SearchLimits::unlimited())
+                .unwrap()
+                .0
+                .map(|matched| (matched.start(), matched.end()));
+            assert_eq!(actual, expected, "haystack={haystack:?}");
+            assert_eq!(
+                regex
+                    .is_match(haystack, SearchLimits::unlimited())
+                    .unwrap()
+                    .0,
+                expected.is_some(),
+                "haystack={haystack:?}"
+            );
+            assert_eq!(
+                regex
+                    .shortest_match(haystack, SearchLimits::unlimited())
+                    .unwrap()
+                    .0,
+                upstream.shortest_match(haystack),
+                "haystack={haystack:?}"
+            );
+            let expected_iter: Vec<_> = upstream
+                .find_iter(haystack)
+                .map(|matched| (matched.start(), matched.end()))
+                .collect();
+            let actual_iter: Vec<_> = regex
+                .find_iter(haystack, PortableFindIterLimits::unlimited())
+                .unwrap()
+                .map(|matched| {
+                    let matched = matched.unwrap();
+                    (matched.start(), matched.end())
+                })
+                .collect();
+            assert_eq!(actual_iter, expected_iter, "haystack={haystack:?}");
+            for start in 0..=haystack.len() {
+                let expected_at = upstream
+                    .find_at(haystack, start)
+                    .map(|matched| (matched.start(), matched.end()));
+                let actual_at = regex
+                    .find_at(haystack, start, SearchLimits::unlimited())
+                    .unwrap()
+                    .0
+                    .map(|matched| (matched.start(), matched.end()));
+                assert_eq!(
+                    actual_at, expected_at,
+                    "haystack={haystack:?} start={start}"
+                );
+                assert_eq!(
+                    regex
+                        .shortest_match_at(haystack, start, SearchLimits::unlimited())
+                        .unwrap()
+                        .0,
+                    upstream.shortest_match_at(haystack, start),
+                    "shortest haystack={haystack:?} start={start}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unicode_all_non_ascii_unique_exit_admits_lazy_and_plus_repeats() {
+        let haystack = "--aéaaaz--a文z--a\nzzz--abz".as_bytes();
+        for pattern in [
+            r"a[^z\r\n]*z",
+            r"a[^z\r\n]*?z",
+            r"a[^z\r\n]+z",
+            r"a[^z\r\n]+?z",
+        ] {
+            let regex = PortableBuilder::new(pattern).build().unwrap();
+            let upstream = regex::bytes::RegexBuilder::new(pattern).build().unwrap();
+            assert_eq!(regex.build_report().plan, PlanKind::LiteralClassRunLiteral);
+            let expected: Vec<_> = upstream
+                .find_iter(haystack)
+                .map(|matched| (matched.start(), matched.end()))
+                .collect();
+            let actual: Vec<_> = regex
+                .find_iter(haystack, PortableFindIterLimits::unlimited())
+                .unwrap()
+                .map(|matched| {
+                    let matched = matched.unwrap();
+                    (matched.start(), matched.end())
+                })
+                .collect();
+            assert_eq!(actual, expected, "pattern={pattern:?}");
+        }
     }
 
     #[test]

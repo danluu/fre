@@ -2907,14 +2907,14 @@ const fn binary_search_comparison_bound(mut ranges: usize) -> usize {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct DecodedScalar {
-    scalar: Option<u32>,
-    width: usize,
-    byte_checks: usize,
+pub(crate) struct DecodedScalar {
+    pub(crate) scalar: Option<u32>,
+    pub(crate) width: usize,
+    pub(crate) byte_checks: usize,
 }
 
 #[inline(never)]
-fn decode_scalar(bytes: &[u8]) -> DecodedScalar {
+pub(crate) fn decode_scalar(bytes: &[u8]) -> DecodedScalar {
     decode_scalar_inline(bytes)
 }
 
@@ -2926,96 +2926,128 @@ fn decode_scalar(bytes: &[u8]) -> DecodedScalar {
 // continues through the out-of-line wrapper above.
 #[inline(always)]
 fn decode_scalar_inline(bytes: &[u8]) -> DecodedScalar {
-    let Some(&first) = bytes.first() else {
-        return DecodedScalar {
+    match decode_scalar_with(bytes, || Ok::<(), core::convert::Infallible>(())) {
+        Ok(decoded) => decoded,
+        Err(never) => match never {},
+    }
+}
+
+/// Decode one scalar with a prospective charge immediately before every
+/// source-byte access. The callback permits finite-work callers to stop at an
+/// exact byte boundary without duplicating or hiding a read in UTF-8 library
+/// machinery.
+#[allow(
+    clippy::too_many_lines,
+    reason = "keeping every explicit UTF-8 byte access in one decoder makes prospective charging auditable"
+)]
+pub(crate) fn decode_scalar_with<E>(
+    bytes: &[u8],
+    mut before_read: impl FnMut() -> Result<(), E>,
+) -> Result<DecodedScalar, E> {
+    if bytes.is_empty() {
+        return Ok(DecodedScalar {
             scalar: None,
             width: 1,
             byte_checks: 0,
-        };
-    };
+        });
+    }
+    before_read()?;
+    let first = bytes[0];
     if first <= 0x7F {
-        return DecodedScalar {
+        return Ok(DecodedScalar {
             scalar: Some(u32::from(first)),
             width: 1,
             byte_checks: 1,
-        };
+        });
     }
     if (0xC2..=0xDF).contains(&first) {
-        let Some(&second) = bytes.get(1) else {
-            return invalid(bytes.len().min(2));
+        let Some(second) = bytes.get(1) else {
+            return Ok(invalid(1));
         };
+        before_read()?;
+        let second = *second;
         if !is_continuation(second) {
-            return invalid(2);
+            return Ok(invalid(2));
         }
         let scalar = (u32::from(first & 0x1F) << 6) | u32::from(second & 0x3F);
-        return DecodedScalar {
+        return Ok(DecodedScalar {
             scalar: Some(scalar),
             width: 2,
             byte_checks: 2,
-        };
+        });
     }
     if (0xE0..=0xEF).contains(&first) {
-        let Some(&second) = bytes.get(1) else {
-            return invalid(bytes.len().min(3));
+        let Some(second) = bytes.get(1) else {
+            return Ok(invalid(1));
         };
+        before_read()?;
+        let second = *second;
         let second_ok = match first {
             0xE0 => (0xA0..=0xBF).contains(&second),
             0xED => (0x80..=0x9F).contains(&second),
             _ => is_continuation(second),
         };
         if !second_ok {
-            return invalid(2);
+            return Ok(invalid(2));
         }
-        let Some(&third) = bytes.get(2) else {
-            return invalid(bytes.len().min(3));
+        let Some(third) = bytes.get(2) else {
+            return Ok(invalid(2));
         };
+        before_read()?;
+        let third = *third;
         if !is_continuation(third) {
-            return invalid(3);
+            return Ok(invalid(3));
         }
         let scalar = (u32::from(first & 0x0F) << 12)
             | (u32::from(second & 0x3F) << 6)
             | u32::from(third & 0x3F);
-        return DecodedScalar {
+        return Ok(DecodedScalar {
             scalar: Some(scalar),
             width: 3,
             byte_checks: 3,
-        };
+        });
     }
     if (0xF0..=0xF4).contains(&first) {
-        let Some(&second) = bytes.get(1) else {
-            return invalid(bytes.len().min(4));
+        let Some(second) = bytes.get(1) else {
+            return Ok(invalid(1));
         };
+        before_read()?;
+        let second = *second;
         let second_ok = match first {
             0xF0 => (0x90..=0xBF).contains(&second),
             0xF4 => (0x80..=0x8F).contains(&second),
             _ => is_continuation(second),
         };
         if !second_ok {
-            return invalid(2);
+            return Ok(invalid(2));
         }
-        let Some(&third) = bytes.get(2) else {
-            return invalid(bytes.len().min(4));
+        let Some(third) = bytes.get(2) else {
+            return Ok(invalid(2));
         };
+        before_read()?;
+        let third = *third;
         if !is_continuation(third) {
-            return invalid(3);
+            return Ok(invalid(3));
         }
-        let Some(&fourth) = bytes.get(3) else {
-            return invalid(bytes.len().min(4));
+        let Some(fourth) = bytes.get(3) else {
+            return Ok(invalid(3));
         };
+        before_read()?;
+        let fourth = *fourth;
         if !is_continuation(fourth) {
-            return invalid(4);
+            return Ok(invalid(4));
         }
         let scalar = (u32::from(first & 0x07) << 18)
             | (u32::from(second & 0x3F) << 12)
             | (u32::from(third & 0x3F) << 6)
             | u32::from(fourth & 0x3F);
-        return DecodedScalar {
+        return Ok(DecodedScalar {
             scalar: Some(scalar),
             width: 4,
             byte_checks: 4,
-        };
+        });
     }
-    invalid(1)
+    Ok(invalid(1))
 }
 
 const fn invalid(byte_checks: usize) -> DecodedScalar {
@@ -3040,7 +3072,7 @@ mod tests {
         REPEATED_RUN_COUNT_OPERATION_ID, REPEATED_RUN_PLAN_ID, REPEATED_RUN_SPAN_SUM_OPERATION_ID,
         RUN_PLAN_ID, ReduceActualCounters, ReduceError, ReduceLimits, Repetition,
         SIMD_ASCII_CLASSIFIER_BUILD_WORK, UnicodeScalarAggregatePlan, ValueReduction,
-        binary_search_comparison_bound, decode_scalar, decode_scalar_inline,
+        binary_search_comparison_bound, decode_scalar, decode_scalar_inline, decode_scalar_with,
     };
     use crate::{
         ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier, DispatchPolicy, Feature,
@@ -3112,6 +3144,37 @@ mod tests {
             assert_eq!(decode_scalar(bytes), expected);
             assert_eq!(decode_scalar_inline(bytes), expected);
         }
+    }
+
+    #[test]
+    fn shared_decoder_charges_immediately_before_each_exact_byte_access() {
+        for bytes in [
+            "🦀".as_bytes(),
+            &[0xE0, 0x80, 0x80],
+            &[0xF0, 0x90, 0x80],
+            &[0xF5, 0x80, 0x80, 0x80],
+        ] {
+            let mut charged = 0_usize;
+            let decoded = decode_scalar_with(bytes, || {
+                charged += 1;
+                Ok::<(), ()>(())
+            })
+            .unwrap();
+            assert_eq!(charged, decoded.byte_checks, "bytes={bytes:?}");
+        }
+
+        let mut charged = 0_usize;
+        assert_eq!(
+            decode_scalar_with("🦀".as_bytes(), || {
+                if charged == 2 {
+                    return Err(charged);
+                }
+                charged += 1;
+                Ok(())
+            }),
+            Err(2)
+        );
+        assert_eq!(charged, 2);
     }
 
     #[test]

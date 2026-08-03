@@ -8,7 +8,7 @@ use fre_kernels::{
     LiteralClassRunLiteralBoundarySemantics as BoundarySemantics,
     LiteralClassRunSearchMinimum as SearchRunMinimum,
 };
-use regex_syntax::hir::{Class, ClassBytes, Hir, HirKind, Look};
+use regex_syntax::hir::{Class, ClassBytes, ClassUnicode, ClassUnicodeRange, Hir, HirKind, Look};
 
 use crate::aggregate_construction::AggregateInspectionAttemptError;
 
@@ -31,13 +31,30 @@ pub(super) struct Inspection<'a> {
 pub(super) enum InspectedClass<'a> {
     Bytes(&'a ClassBytes),
     Singleton(u8),
+    UnicodeAllNonAscii(&'a ClassUnicode),
 }
 
-impl InspectedClass<'_> {
+impl<'a> InspectedClass<'a> {
     pub(super) fn range_count(self) -> usize {
         match self {
             Self::Bytes(class) => class.ranges().len(),
             Self::Singleton(_) => 1,
+            Self::UnicodeAllNonAscii(class) => class
+                .ranges()
+                .iter()
+                .take_while(|range| range.start().is_ascii())
+                .count(),
+        }
+    }
+
+    pub(super) const fn is_unicode_all_non_ascii(self) -> bool {
+        matches!(self, Self::UnicodeAllNonAscii(_))
+    }
+
+    pub(super) fn unicode_ranges(self) -> Option<&'a [ClassUnicodeRange]> {
+        match self {
+            Self::UnicodeAllNonAscii(class) => Some(class.ranges()),
+            Self::Bytes(_) | Self::Singleton(_) => None,
         }
     }
 }
@@ -67,8 +84,23 @@ impl Iterator for InspectedClassRanges<'_> {
             }
             InspectedClass::Singleton(byte) if self.index == 0 => (byte, byte),
             InspectedClass::Singleton(_) => return None,
+            InspectedClass::UnicodeAllNonAscii(class) => {
+                let range = class.ranges().get(self.index)?;
+                if !range.start().is_ascii() {
+                    return None;
+                }
+                (
+                    u8::try_from(u32::from(range.start()))
+                        .expect("proved ASCII Unicode range start"),
+                    u8::try_from(u32::from(range.end().min('\u{7F}')))
+                        .expect("clamped Unicode range end is ASCII"),
+                )
+            }
         };
-        self.index += 1;
+        self.index = self
+            .index
+            .checked_add(1)
+            .expect("range index is bounded by the inspected class");
         Some(range)
     }
 
@@ -224,17 +256,34 @@ fn inspect_with_accounting<'a>(
         1 => SearchRunMinimum::One,
         _ => return Ok(accounting.ineligible()),
     };
-    if repetition.max.is_some() || !repetition.greedy {
+    if repetition.max.is_some() {
+        return Ok(accounting.ineligible());
+    }
+    let lazy = !repetition.greedy;
+    if lazy && (prefix.is_empty() || suffix.is_empty()) {
         return Ok(accounting.ineligible());
     }
     if minimum == SearchRunMinimum::Zero && prefix.is_empty() {
         return Ok(accounting.ineligible());
     }
-    let Some(class) = repeated_byte_class(&repetition.sub, limit, accounting)? else {
+    let Some(class) = repeated_class(&repetition.sub, limit, accounting)? else {
         return Ok(accounting.ineligible());
     };
 
-    let mut generalized_search = minimum == SearchRunMinimum::Zero;
+    if class.is_unicode_all_non_ascii() {
+        accounting.charge(prefix.len(), limit)?;
+        accounting.charge(suffix.len(), limit)?;
+        if prefix.is_empty()
+            || suffix.is_empty()
+            || !prefix.iter().all(u8::is_ascii)
+            || !suffix.iter().all(u8::is_ascii)
+        {
+            return Ok(accounting.ineligible());
+        }
+    }
+
+    let mut generalized_search =
+        minimum == SearchRunMinimum::Zero || class.is_unicode_all_non_ascii() || lazy;
     if let Some(&prefix_last) = prefix.last()
         && class_contains(class, prefix_last, limit, accounting)?
     {
@@ -344,7 +393,7 @@ fn greedy_unbounded_repeated_class<'a>(
     if repetition.max.is_some() || !repetition.greedy {
         return Ok(None);
     }
-    Ok(repeated_byte_class(&repetition.sub, limit, accounting)?.map(|class| (class, minimum)))
+    Ok(repeated_class(&repetition.sub, limit, accounting)?.map(|class| (class, minimum)))
 }
 
 fn exact_ascii_word_class(
@@ -390,10 +439,11 @@ fn ascii_word_subset_class(
             }
             Ok(true)
         }
+        InspectedClass::UnicodeAllNonAscii(_) => Ok(false),
     }
 }
 
-fn repeated_byte_class<'a>(
+fn repeated_class<'a>(
     hir: &'a Hir,
     limit: usize,
     accounting: &mut Accounting,
@@ -408,6 +458,11 @@ fn repeated_byte_class<'a>(
             accounting.charge(1, limit)?;
             Ok(Some(InspectedClass::Singleton(literal.0[0])))
         }
+        HirKind::Class(Class::Unicode(class))
+            if unicode_class_contains_all_non_ascii(class, limit, accounting)? =>
+        {
+            Ok(Some(InspectedClass::UnicodeAllNonAscii(class)))
+        }
         HirKind::Empty
         | HirKind::Literal(_)
         | HirKind::Class(_)
@@ -417,6 +472,34 @@ fn repeated_byte_class<'a>(
         | HirKind::Concat(_)
         | HirKind::Alternation(_) => Ok(None),
     }
+}
+
+fn unicode_class_contains_all_non_ascii(
+    class: &ClassUnicode,
+    limit: usize,
+    accounting: &mut Accounting,
+) -> Result<bool, InspectionError> {
+    let mut next_required = u32::from('\u{80}');
+    let maximum = u32::from(char::MAX);
+    for range in class.ranges() {
+        accounting.charge(2, limit)?;
+        let start = u32::from(range.start()).max(u32::from('\u{80}'));
+        let end = u32::from(range.end());
+        if end < next_required {
+            continue;
+        }
+        if start > next_required {
+            return Ok(false);
+        }
+        if end == maximum {
+            return Ok(true);
+        }
+        next_required = end.checked_add(1).ok_or(InspectionError::Overflow)?;
+        if (0xD800..=0xDFFF).contains(&next_required) {
+            next_required = 0xE000;
+        }
+    }
+    Ok(false)
 }
 
 fn peel_captures<'a>(
@@ -460,6 +543,19 @@ fn class_contains(
             }
             Ok(false)
         }
+        InspectedClass::UnicodeAllNonAscii(class) => {
+            let scalar = char::from(byte);
+            for range in class.ranges() {
+                accounting.charge(1, limit)?;
+                if scalar < range.start() {
+                    return Ok(false);
+                }
+                if scalar <= range.end() {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
     }
 }
 
@@ -476,6 +572,15 @@ mod tests {
     fn hir(pattern: &str) -> Hir {
         ParserBuilder::new()
             .unicode(false)
+            .utf8(false)
+            .build()
+            .parse(pattern)
+            .unwrap()
+    }
+
+    fn unicode_hir(pattern: &str) -> Hir {
+        ParserBuilder::new()
+            .unicode(true)
             .utf8(false)
             .build()
             .parse(pattern)
@@ -531,6 +636,8 @@ mod tests {
         for (pattern, minimum, guarded) in [
             (r"ab+c", SearchRunMinimum::One, false),
             (r"a[^z\r\n]*z", SearchRunMinimum::Zero, false),
+            (r"a[^z\r\n]*?z", SearchRunMinimum::Zero, false),
+            (r"a[^z\r\n]+?z", SearchRunMinimum::One, false),
             (r"a[ab]+c", SearchRunMinimum::One, false),
             (r"\b[A-Za-z]+TRAILER\b", SearchRunMinimum::One, true),
         ] {
@@ -552,9 +659,64 @@ mod tests {
     }
 
     #[test]
+    fn admits_owned_unicode_class_with_complete_non_ascii_coverage() {
+        let parsed = unicode_hir(r"a[^z\r\n]*z");
+        let InspectionOutcome::Eligible(inspection) = inspect(&parsed, usize::MAX).unwrap() else {
+            panic!("expected Unicode class-run eligibility");
+        };
+        assert!(inspection.class.is_unicode_all_non_ascii());
+        assert!(inspection.generalized_search);
+        assert_eq!(inspection.prefix, b"a");
+        assert_eq!(inspection.suffix, b"z");
+        assert_eq!(inspection.minimum, SearchRunMinimum::Zero);
+        let ranges: Vec<_> = inspection.class.ranges().collect();
+        assert!(
+            ranges
+                .iter()
+                .any(|&(start, end)| start <= b'a' && b'a' <= end)
+        );
+        assert!(
+            !ranges
+                .iter()
+                .any(|&(start, end)| start <= b'z' && b'z' <= end)
+        );
+        let unicode = inspection.class.unicode_ranges().unwrap();
+        assert_eq!(unicode.last().map(ClassUnicodeRange::end), Some(char::MAX));
+
+        for pattern in [r"a[^z\r\n]*?z", r"a[^z\r\n]+?z"] {
+            assert!(matches!(
+                inspect(&unicode_hir(pattern), usize::MAX).unwrap(),
+                InspectionOutcome::Eligible(Inspection {
+                    generalized_search: true,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn refuses_unicode_classes_with_semantic_or_anchor_gaps() {
+        for pattern in [
+            r"a[^z\r\n\u{80}]*z",
+            r"a[\x00-\x7F]*z",
+            r"é[^z]*z",
+            r"a[^z]*é",
+            r"[^z]+z",
+            r"a[^z]+",
+        ] {
+            assert!(
+                matches!(
+                    inspect(&unicode_hir(pattern), usize::MAX).unwrap(),
+                    InspectionOutcome::Ineligible { .. }
+                ),
+                "pattern={pattern:?}"
+            );
+        }
+    }
+
+    #[test]
     fn refuses_every_semantic_perturbation() {
         for pattern in [
-            r"ab[ ]+?cd",
             r"ab[ ]{1,3}cd",
             r"ab[ ]cd",
             r"ab[ ]+cd|xy[ ]+zz",
