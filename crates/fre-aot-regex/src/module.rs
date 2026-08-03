@@ -1031,6 +1031,10 @@ const VECTOR_FILTER_COST_BLOCK_BYTES: u64 = 64;
 const MAX_SPARSE_RESCAN_EXPECTED_HITS: u16 = 2;
 const MAX_ASIMD_BATCH_EXPECTED_HITS: u16 = 4;
 const AARCH64_BATCH_BYTES: u16 = 64;
+/// A discarded four-mask exact-product batch is profitable only while the
+/// scalar retry guard remains smaller than the target's bounded compare bank.
+/// Wider products retain the exact 16-lane mask and continue inside it.
+const MAX_ASIMD_EXACT_PRODUCT_RESIDUAL_BATCH_PREDICATES: usize = 3;
 const AARCH64_SVE_BATCH_VECTORS: u16 = 4;
 const AARCH64_SVE_MIN_VECTOR_BYTES: u16 = 16;
 const AARCH64_SVE_MAX_VECTOR_BYTES: u16 = 256;
@@ -13110,18 +13114,34 @@ fn lower_aarch64_dfa_for_operating_system_with_emission(
         .transpose()?
         .unwrap_or(false);
     // A 64-byte reduction pays when the graph-derived initial candidate set
-    // is sparse. A rejectable residual guard needs its exact 16-lane mask and
-    // therefore declines batching transactionally; fully proved masks retain
-    // the established four-vector path.
+    // is sparse. Ordinary residual guards retain the exact 16-lane mask so a
+    // rejected candidate can continue inside that block. A complete exact
+    // product has a stronger retry proof: after selecting the first primary
+    // hit from a 64-byte batch, the ordinary prefix guard either returns the
+    // match or resumes the same complete scanner at `candidate + 1`. It may
+    // therefore batch without preserving four masks across scalar predicates.
+    // Correlated relation filters keep their established all-or-nothing batch
+    // gate because the exact-product proof does not cover their language.
+    let use_asimd_exact_product_residual_batch = use_asimd_filter
+        && retain_vector_candidates
+        && layout.exact_prefix_match_width.is_some()
+        && prefix_relation_vector.is_none()
+        && layout.prefix_filter.is_some_and(|prefix| {
+            prefix.predicates().len() <= MAX_ASIMD_EXACT_PRODUCT_RESIDUAL_BATCH_PREDICATES
+        })
+        && layout.start_filter.is_some_and(use_aarch64_filter_batch);
     let use_asimd_relation_batch = use_asimd_filter
         && !retain_vector_candidates
         && prefix_relation_vector.is_some()
         && vector_coverage.is_some()
         && layout.start_filter.is_some_and(use_aarch64_filter_batch);
     let use_asimd_batch = use_asimd_filter
-        && !retain_vector_candidates
+        && (!retain_vector_candidates || use_asimd_exact_product_residual_batch)
         && (prefix_relation_vector.is_none() || use_asimd_relation_batch)
         && layout.start_filter.is_some_and(use_aarch64_filter_batch);
+    let filter_single_vector_loop = use_asimd_exact_product_residual_batch
+        .then(|| assembler.label())
+        .transpose()?;
     if use_exact_asimd_lane
         && (use_asimd_filter || use_exact_asimd || use_asimd_suffix || use_asimd_loop)
     {
@@ -13141,7 +13161,14 @@ fn lower_aarch64_dfa_for_operating_system_with_emission(
         scalar_scan
     };
     let use_prefix_block = features.has(CpuFeature::Aarch64Asimd) && layout.prefix_block.is_some();
-    if layout.suffix_filter.is_some() && layout.exact_prefix_match_width.is_some() {
+    if layout.exact_prefix_match_width.is_some()
+        && (layout.suffix_filter.is_some() || use_asimd_exact_product_residual_batch)
+    {
+        // A sparse four-vector scanner wins on long misses but should not pay
+        // four loads and a horizontal reduction for a match at the original
+        // window start. The same complete-product guard used ahead of a
+        // suffix prepass proves that start once on large windows; failure
+        // leaves X2 untouched for the moving scanner.
         aarch64_emit_exact_start_probe(
             &mut assembler,
             layout,
@@ -13350,6 +13377,10 @@ fn lower_aarch64_dfa_for_operating_system_with_emission(
                     assembler.instruction(aarch64_add_x_imm(2, 2, AARCH64_BATCH_BYTES)?)?;
                     assembler.branch(filter_vector)?;
                 }
+                if let Some(filter_single_vector_loop) = filter_single_vector_loop {
+                    assembler.bind(filter_single_vector_loop)?;
+                    assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+                }
                 assembler.bind(filter_single_vector)?;
                 let vector_bytes = u16::from(maximum_scan_offset).checked_add(16).ok_or(
                     ObjectError::ArithmeticOverflow("ASIMD start-filter vector width"),
@@ -13396,7 +13427,7 @@ fn lower_aarch64_dfa_for_operating_system_with_emission(
                     },
                 )?;
                 assembler.instruction(aarch64_add_x_imm(2, 2, 16)?)?;
-                assembler.branch(filter_vector)?;
+                assembler.branch(filter_single_vector_loop.unwrap_or(filter_vector))?;
 
                 if let Some(vector_filter) = vector_filter {
                     if use_asimd_batch {
@@ -13440,7 +13471,13 @@ fn lower_aarch64_dfa_for_operating_system_with_emission(
                     && let Some(first_candidates) = filter_batch_first_candidates
                 {
                     aarch64_emit_first_candidate_in_batch(&mut assembler, first_candidates)?;
-                    assembler.branch(if vector_coverage.is_some() {
+                    assembler.branch(if use_asimd_exact_product_residual_batch {
+                        // The four masks are caller-saved temporaries. Recheck
+                        // every non-primary column through the ordinary exact
+                        // prefix guard; its failure edge restarts scanning at
+                        // the next possible start.
+                        candidate
+                    } else if vector_coverage.is_some() {
                         prefix_vector_check
                     } else {
                         candidate
@@ -14537,6 +14574,71 @@ mod tests {
                 "{target:?}"
             );
         }
+    }
+
+    #[test]
+    fn no_row_exact_product_asimd_batches_a_sparse_primary_with_residual_guards() {
+        let target = Target::aarch64_macos()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .unwrap();
+        let compiled = no_row_exact_product_resource_fallback(
+            "[d-g][P-R]{2}X",
+            OutputContract::Span,
+            target,
+        );
+        let view = compiled
+            .program()
+            .native_exact_product_view()
+            .expect("graph-proved exact product");
+        let (_, layout) =
+            build_native_dfa_table_for_architecture(view, Architecture::Aarch64).unwrap();
+        assert_eq!(layout.exact_prefix_match_width, Some(4));
+        let filter = layout.start_filter.expect("singleton primary scanner");
+        assert!(use_aarch64_filter_batch(filter));
+        let coverage = derive_native_vector_guard_coverage(layout, false, layout.vector_filter)
+            .expect("ASIMD primary coverage");
+        assert!(coverage.has_rejectable_residual(layout).unwrap());
+
+        let words = compiled.module().sections()[TEXT_SECTION]
+            .bytes()
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(
+            words.contains(&aarch64_add_x_imm(2, 2, AARCH64_BATCH_BYTES).unwrap()),
+            "the complete product retry proof should retain the 64-byte ASIMD batch"
+        );
+
+        let wider = no_row_exact_product_resource_fallback(
+            r"(?-u:\x01)abcdefgh",
+            OutputContract::Span,
+            target,
+        );
+        let wider_view = wider
+            .program()
+            .native_exact_product_view()
+            .expect("wider graph-proved exact product");
+        let (_, wider_layout) =
+            build_native_dfa_table_for_architecture(wider_view, Architecture::Aarch64).unwrap();
+        let wider_filter = wider_layout.start_filter.expect("rare wider primary");
+        assert!(use_aarch64_filter_batch(wider_filter));
+        assert!(
+            wider_layout
+                .prefix_filter
+                .expect("wider residual prefix")
+                .predicates()
+                .len()
+                > MAX_ASIMD_EXACT_PRODUCT_RESIDUAL_BATCH_PREDICATES
+        );
+        let wider_words = wider.module().sections()[TEXT_SECTION]
+            .bytes()
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(
+            !wider_words.contains(&aarch64_add_x_imm(2, 2, AARCH64_BATCH_BYTES).unwrap()),
+            "an expensive residual guard should retain its exact 16-lane mask"
+        );
     }
 
     #[test]
