@@ -41,6 +41,8 @@ const ORDINARY_START_FILTER_PROOF: StartFilterProof = StartFilterProof {
     relaxed_nullable: true,
 };
 const BYTE_ALPHABET: usize = 256;
+const DIRECT_ROW_STRIDE: u32 = 256;
+const _: () = assert!(BYTE_ALPHABET == 1 << 8);
 // Prepared compiled searches are deliberately allowed a larger bounded
 // determinization frontier than the original L1-sized cache. A direct row is
 // still only touched for the current state, while retaining more identities
@@ -81,6 +83,44 @@ const CONTEXT_INITIAL_SOURCE: u32 = u32::MAX - 1;
 fn direct_row_cell_index(state: usize, byte: u8) -> usize {
     debug_assert!(state < LAZY_MAX_STATES);
     state * BYTE_ALPHABET + usize::from(byte)
+}
+
+/// Authenticate one direct-row source once, before entering a warmed loop.
+///
+/// Direct transition cells retain `row_offset + 1` rather than `state + 1`.
+/// The zero value therefore remains the dead transition while a warmed edge
+/// can feed its decoded value directly to [`LazyWorkspace::direct_cell`] or
+/// [`ReverseWorkspace::direct_cell`] without rebuilding `state * 256`.
+fn direct_row_offset(state: u32) -> Result<u32, SearchError> {
+    let state = usize::try_from(state).map_err(|_| SearchError::InternalInvariant {
+        detail: "direct lazy state does not fit usize",
+    })?;
+    if state >= LAZY_MAX_STATES {
+        return Err(SearchError::InternalInvariant {
+            detail: "direct lazy state is outside the cache ceiling",
+        });
+    }
+    u32::try_from(direct_row_cell_index(state, 0)).map_err(|_| SearchError::InternalInvariant {
+        detail: "direct lazy row offset does not fit u32",
+    })
+}
+
+fn direct_row_encoded_state(state: u32) -> Result<u32, SearchError> {
+    direct_row_offset(state)?
+        .checked_add(1)
+        .filter(|encoded| *encoded <= LAZY_CELL_STATE_MASK)
+        .ok_or(SearchError::InternalInvariant {
+            detail: "direct lazy row encoding exceeds its cell field",
+        })
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "authenticated direct row offsets are exact multiples of the fixed stride"
+)]
+fn direct_row_state(row_offset: u32) -> u32 {
+    debug_assert_eq!(row_offset % DIRECT_ROW_STRIDE, 0);
+    row_offset / DIRECT_ROW_STRIDE
 }
 
 #[cfg(test)]
@@ -1202,20 +1242,23 @@ impl LazyWorkspace {
             })
     }
 
-    /// Read a cell whose source was produced by this authenticated cache.
-    #[inline]
-    fn authenticated_cell(&self, state: u32, byte: u8) -> Result<u32, SearchError> {
-        let state = usize::try_from(state).map_err(|_| SearchError::InternalInvariant {
-            detail: "authenticated lazy DFA state does not fit usize",
-        })?;
-        debug_assert!(state < self.state_len);
-        debug_assert!(self.state_len <= LAZY_MAX_STATES);
-        let cell_index = direct_row_cell_index(state, byte);
+    /// Read a warmed direct transition using an already-authenticated row.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "direct row offsets are bounded by the fixed lazy-state ceiling"
+    )]
+    fn direct_cell(&self, row_offset: u32, byte: u8) -> Result<u32, SearchError> {
+        let row_offset =
+            usize::try_from(row_offset).map_err(|_| SearchError::InternalInvariant {
+                detail: "lazy DFA direct row offset does not fit usize",
+            })?;
+        debug_assert_eq!(row_offset % BYTE_ALPHABET, 0);
+        debug_assert!(row_offset / BYTE_ALPHABET < self.state_len);
         self.rows
-            .get(cell_index)
+            .get(row_offset + usize::from(byte))
             .copied()
             .ok_or(SearchError::InternalInvariant {
-                detail: "authenticated lazy DFA cell is outside the direct table",
+                detail: "lazy DFA transition cell is outside the direct table",
             })
     }
 
@@ -1725,20 +1768,23 @@ impl ReverseWorkspace {
             })
     }
 
-    /// Read a cell whose source was produced by this authenticated cache.
-    #[inline]
-    fn authenticated_cell(&self, state: u32, byte: u8) -> Result<u32, SearchError> {
-        let state = usize::try_from(state).map_err(|_| SearchError::InternalInvariant {
-            detail: "authenticated reverse DFA state does not fit usize",
-        })?;
-        debug_assert!(state < self.state_len);
-        debug_assert!(self.state_len <= LAZY_MAX_STATES);
-        let cell = direct_row_cell_index(state, byte);
+    /// Read a warmed direct transition using an already-authenticated row.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "direct row offsets are bounded by the fixed lazy-state ceiling"
+    )]
+    fn direct_cell(&self, row_offset: u32, byte: u8) -> Result<u32, SearchError> {
+        let row_offset =
+            usize::try_from(row_offset).map_err(|_| SearchError::InternalInvariant {
+                detail: "reverse DFA direct row offset does not fit usize",
+            })?;
+        debug_assert_eq!(row_offset % BYTE_ALPHABET, 0);
+        debug_assert!(row_offset / BYTE_ALPHABET < self.state_len);
         self.rows
-            .get(cell)
+            .get(row_offset + usize::from(byte))
             .copied()
             .ok_or(SearchError::InternalInvariant {
-                detail: "authenticated reverse DFA cell is outside the direct table",
+                detail: "reverse DFA transition cell is outside the direct table",
             })
     }
 
@@ -3222,7 +3268,8 @@ fn execute_lazy_loop(
     }
     // Even a physically full cache retains useful prefix rows. Start from the
     // cached initial state and hand off only when an unfilled edge is reached.
-    let mut state = LazyState::Cached(initial);
+    let initial_row = direct_row_offset(initial)?;
+    let mut state = LazyState::Cached(initial_row);
     let mut position = window.start();
     let mut boundaries = 0usize;
     let mut pending_end = initial_pending.then_some(window.start());
@@ -3231,7 +3278,7 @@ fn execute_lazy_loop(
     let mut engine_candidate = None;
 
     loop {
-        if pending_end.is_none() && state == LazyState::Cached(initial) {
+        if pending_end.is_none() && state == LazyState::Cached(initial_row) {
             if let Some(scanner) = scanner {
                 if position < window.end() {
                     if let (Some(probe), Some(candidate)) = (probe, engine_candidate.take()) {
@@ -3298,11 +3345,11 @@ fn execute_lazy_loop(
             })?;
         let transition = match state {
             LazyState::Cached(cached) => {
-                let cell = workspace.lazy.authenticated_cell(cached, byte)?;
+                let cell = workspace.lazy.direct_cell(cached, byte)?;
                 if cell == LAZY_CELL_UNFILLED {
                     build_lazy_cached_transition(
                         automaton,
-                        cached,
+                        direct_row_state(cached),
                         byte,
                         workspace,
                         meter,
@@ -4218,11 +4265,7 @@ fn finish_lazy_cached_transition(
             .lazy
             .intern_speculative(next_pending, meter, core_reserve, position)?
         {
-            LazyInterned::State(next) => {
-                next.checked_add(1).ok_or(SearchError::InternalInvariant {
-                    detail: "lazy DFA encoded state overflowed",
-                })?
-            }
+            LazyInterned::State(next) => direct_row_encoded_state(next)?,
             LazyInterned::BudgetDeclined => {
                 workspace.lazy.retain_scratch_as_frontier()?;
                 return Ok(LazyTransition::Inline {
@@ -4697,11 +4740,7 @@ fn finish_reverse_cached_transition(
             .reverse
             .intern_speculative(meter, core_reserve, position)?
         {
-            LazyInterned::State(next) => {
-                next.checked_add(1).ok_or(SearchError::InternalInvariant {
-                    detail: "reverse DFA encoded state overflowed",
-                })?
-            }
+            LazyInterned::State(next) => direct_row_encoded_state(next)?,
             LazyInterned::BudgetDeclined => {
                 workspace.reverse.retain_scratch_as_frontier()?;
                 return Ok(ReverseTransition::Inline { reaches_start });
@@ -4784,7 +4823,7 @@ fn execute_reverse_lazy_loop(
             detail: "initialized reverse DFA has no initial state",
         });
     }
-    let mut state = ReverseState::Cached(initial);
+    let mut state = ReverseState::Cached(direct_row_offset(initial)?);
     let mut cursor = selected_end;
     let mut candidate = None;
     // The Accept-seeded state is the reverse automaton's selected-end
@@ -4802,11 +4841,11 @@ fn execute_reverse_lazy_loop(
         })?;
         let transition = match state {
             ReverseState::Cached(cached) => {
-                let cell = workspace.reverse.authenticated_cell(cached, byte)?;
+                let cell = workspace.reverse.direct_cell(cached, byte)?;
                 if cell == LAZY_CELL_UNFILLED {
                     build_reverse_cached_transition(
                         automaton,
-                        cached,
+                        direct_row_state(cached),
                         byte,
                         workspace,
                         meter,
@@ -17048,7 +17087,7 @@ mod tests {
         );
         let initial = workspace.lazy.initial;
         let pending = workspace.lazy.cell(initial, b'a').unwrap() & super::LAZY_CELL_STATE_MASK;
-        let pending = pending.checked_sub(1).unwrap();
+        let pending = super::direct_row_state(pending.checked_sub(1).unwrap());
         assert_eq!(
             workspace.lazy.cell(pending, b'a').unwrap(),
             super::LAZY_CELL_UNFILLED
@@ -17118,7 +17157,7 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_direct_cells_keep_physical_bounds_checked() {
+    fn authenticated_direct_row_offsets_keep_physical_bounds_checked() {
         let plan = a_plus(true);
         let mut forward =
             K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
@@ -17134,14 +17173,12 @@ mod tests {
                 detail: "lazy DFA transition state is outside the cache",
             }
         );
+        let forward_row = super::direct_row_offset(forward_initial).unwrap();
         forward.lazy.rows.clear();
         assert_eq!(
-            forward
-                .lazy
-                .authenticated_cell(forward_initial, b'a')
-                .unwrap_err(),
+            forward.lazy.direct_cell(forward_row, b'a').unwrap_err(),
             SearchError::InternalInvariant {
-                detail: "authenticated lazy DFA cell is outside the direct table",
+                detail: "lazy DFA transition cell is outside the direct table",
             }
         );
 
@@ -17159,14 +17196,12 @@ mod tests {
                 detail: "reverse DFA transition state is outside the cache",
             }
         );
+        let reverse_row = super::direct_row_offset(reverse_initial).unwrap();
         reverse.reverse.rows.clear();
         assert_eq!(
-            reverse
-                .reverse
-                .authenticated_cell(reverse_initial, b'a')
-                .unwrap_err(),
+            reverse.reverse.direct_cell(reverse_row, b'a').unwrap_err(),
             SearchError::InternalInvariant {
-                detail: "authenticated reverse DFA cell is outside the direct table",
+                detail: "reverse DFA transition cell is outside the direct table",
             }
         );
     }
