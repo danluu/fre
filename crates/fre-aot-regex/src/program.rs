@@ -2150,7 +2150,6 @@ impl CompiledProgram {
     /// caller's determinization budget. A side exit carries the exact ordered
     /// subset and pending endpoint into K0 at the first unconsumed byte; the
     /// original prefix is never replayed.
-    #[inline(never)]
     fn search_nfa_with_partial_dfa(
         &self,
         haystack: &[u8],
@@ -2251,7 +2250,6 @@ impl CompiledProgram {
         }
     }
 
-    #[inline(never)]
     fn resolve_partial_hole(
         &self,
         haystack: &[u8],
@@ -2289,7 +2287,6 @@ impl CompiledProgram {
         Ok(Some(found))
     }
 
-    #[inline(never)]
     fn search_nfa_from_partial_resume(
         &self,
         haystack: &[u8],
