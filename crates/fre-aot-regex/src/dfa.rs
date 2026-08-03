@@ -595,31 +595,34 @@ struct PartialForwardDfa {
 }
 
 const PARTIAL_CELL_ACCEPTED: u32 = 1 << 31;
-const PARTIAL_CELL_NEXT_MASK: u32 = PARTIAL_CELL_ACCEPTED - 1;
-const PARTIAL_CELL_DEAD: u32 = PARTIAL_CELL_NEXT_MASK;
+const PARTIAL_CELL_HOLE_BASE: u32 = 1 << 30;
+const PARTIAL_CELL_DEAD: u32 = PARTIAL_CELL_ACCEPTED - 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(transparent)]
 struct PackedForwardCell(u32);
 
 impl PackedForwardCell {
-    fn from_cell(cell: ForwardCell) -> Option<Self> {
+    fn from_cell(cell: ForwardCell, complete_rows: usize, classes: usize) -> Option<Self> {
         let next = if cell.next == NO_STATE {
             PARTIAL_CELL_DEAD
-        } else if cell.next < PARTIAL_CELL_DEAD {
-            cell.next
         } else {
-            return None;
+            let state = usize::try_from(cell.next).ok()?;
+            if state < complete_rows {
+                u32::try_from(state.checked_mul(classes)?).ok()?
+            } else {
+                let resume = u32::try_from(state.checked_sub(complete_rows)?).ok()?;
+                PARTIAL_CELL_HOLE_BASE.checked_add(resume)?
+            }
         };
+        if cell.next != NO_STATE && next >= PARTIAL_CELL_DEAD {
+            return None;
+        }
         Some(Self(next | u32::from(cell.accepted) * PARTIAL_CELL_ACCEPTED))
     }
 
     const fn accepted(self) -> bool {
         self.0 & PARTIAL_CELL_ACCEPTED != 0
-    }
-
-    const fn next(self) -> u32 {
-        self.0 & PARTIAL_CELL_NEXT_MASK
     }
 }
 
@@ -1317,12 +1320,13 @@ impl PartialDfa {
         forward: ForwardDfa,
         effective_limits: DeterminizeLimits,
     ) -> Self {
+        let classes = alphabet.classes();
         let packed_transitions = forward
             .transitions
             .iter()
             .copied()
             .map(|cell| {
-                PackedForwardCell::from_cell(cell)
+                PackedForwardCell::from_cell(cell, forward.states, classes)
                     .expect("stable DFA state ceiling fits packed partial cells")
             })
             .collect::<Vec<_>>()
@@ -1360,38 +1364,16 @@ impl PartialDfa {
             }));
         }
 
-        let classes = self.alphabet.classes();
         let tracks_start = track_start
             && self.forward.start_actions.len() == self.forward.transitions.len();
-        let mut state = 0_u32;
+        let mut row = 0_usize;
         let mut position = window_start;
         let mut pending_end = self.forward.initial_pending.then_some(window_start);
         let mut active_start = tracks_start.then_some(window_start);
         let mut pending_start = (tracks_start && self.forward.initial_pending)
             .then_some(window_start);
         while position < window_end {
-            let source = usize::try_from(state).map_err(|_| {
-                CompileError::InternalInvariant("partial DFA state exceeded usize")
-            })?;
-            if source >= self.forward.complete_rows {
-                let resume_state = source.checked_sub(self.forward.complete_rows).ok_or(
-                    CompileError::InternalInvariant("partial DFA resume-state underflowed"),
-                )?;
-                let key = self.forward.resume_keys.get(resume_state).ok_or(
-                    CompileError::InternalInvariant("partial DFA resume key is absent"),
-                )?;
-                if key.pending != pending_end.is_some() {
-                    return Err(CompileError::InternalInvariant(
-                        "partial DFA resume key disagrees with its selected endpoint",
-                    ));
-                }
-                return Ok(PartialDfaResult::Resume(PartialDfaResume {
-                    state: resume_state,
-                    position,
-                    pending_end,
-                }));
-            }
-            if source == 0
+            if row == 0
                 && pending_end.is_none()
                 && (!tracks_start || active_start == Some(position))
             {
@@ -1415,9 +1397,8 @@ impl PartialDfa {
                 .ok_or(CompileError::InternalInvariant(
                     "partial DFA source position exceeded validated window",
                 ))?;
-            let index = source
-                .checked_mul(classes)
-                .and_then(|row| row.checked_add(self.alphabet.class(byte)))
+            let index = row
+                .checked_add(self.alphabet.class(byte))
                 .ok_or(CompileError::InternalInvariant(
                     "partial DFA transition index overflowed",
                 ))?;
@@ -1442,6 +1423,7 @@ impl PartialDfa {
             } else {
                 None
             };
+            let mut next = cell.0;
             if cell.accepted() {
                 pending_end = Some(position);
                 pending_start = next_start;
@@ -1451,23 +1433,40 @@ impl PartialDfa {
                         start: pending_start,
                     }));
                 }
+                next &= PARTIAL_CELL_ACCEPTED - 1;
             }
-            let next = cell.next();
             if next == PARTIAL_CELL_DEAD {
                 return Ok(PartialDfaResult::Complete(PartialDfaSelection {
                     end: pending_end,
                     start: pending_start,
                 }));
             }
-            if usize::try_from(next)
-                .ok()
-                .is_none_or(|next| next >= self.forward.discovered_states)
-            {
-                return Err(CompileError::InternalInvariant(
-                    "partial DFA transition references an undiscovered state",
-                ));
+            if next >= PARTIAL_CELL_HOLE_BASE {
+                // Entering an incomplete state after consuming the final
+                // byte needs no row and therefore no K0 continuation.
+                if position == window_end {
+                    break;
+                }
+                let resume_state = usize::try_from(next - PARTIAL_CELL_HOLE_BASE).map_err(|_| {
+                    CompileError::InternalInvariant("partial DFA resume state exceeded usize")
+                })?;
+                let key = self.forward.resume_keys.get(resume_state).ok_or(
+                    CompileError::InternalInvariant("partial DFA resume key is absent"),
+                )?;
+                if key.pending != pending_end.is_some() {
+                    return Err(CompileError::InternalInvariant(
+                        "partial DFA resume key disagrees with its selected endpoint",
+                    ));
+                }
+                return Ok(PartialDfaResult::Resume(PartialDfaResume {
+                    state: resume_state,
+                    position,
+                    pending_end,
+                }));
             }
-            state = next;
+            row = usize::try_from(next).map_err(|_| {
+                CompileError::InternalInvariant("partial DFA row offset exceeded usize")
+            })?;
             active_start = next_start;
         }
         Ok(PartialDfaResult::Complete(PartialDfaSelection {
@@ -1803,9 +1802,11 @@ impl PartialDfa {
             let accepted = reader.boolean("partial DFA accepted flag is invalid")?;
             reader.zeros(3, "partial DFA cell reserved bytes are non-zero")?;
             let cell = ForwardCell { next, accepted };
-            packed_transitions.push(PackedForwardCell::from_cell(cell).ok_or(
-                ProgramFormatError::Malformed("partial DFA cell exceeds packed state range"),
-            )?);
+            packed_transitions.push(
+                PackedForwardCell::from_cell(cell, complete_rows, class_count).ok_or(
+                    ProgramFormatError::Malformed("partial DFA cell exceeds packed state range"),
+                )?,
+            );
             transitions.push(cell);
         }
         let mut resume_keys = dfa_reserve(resume_state_count, "partial DFA resume state")?;
@@ -3800,7 +3801,7 @@ fn compact_partial_forward(
     let mut packed_transitions = Vec::new();
     packed_transitions.try_reserve_exact(completed_cells).ok()?;
     for &cell in completed {
-        packed_transitions.push(PackedForwardCell::from_cell(cell)?);
+        packed_transitions.push(PackedForwardCell::from_cell(cell, complete_rows, classes)?);
     }
     let completed_actions = start_actions.get(..completed_cells)?;
     let mut compact_start_actions = Vec::new();
@@ -5088,26 +5089,26 @@ mod tests {
     #[test]
     fn packed_partial_cells_round_trip_every_semantic_boundary() {
         assert_eq!(core::mem::size_of::<PackedForwardCell>(), 4);
-        for next in [0, 1, MAX_STABLE_DFA_STATES as u32 - 1, NO_STATE] {
+        for (next, expected) in [
+            (0, 0),
+            (1, 3),
+            (2, PARTIAL_CELL_HOLE_BASE),
+            (3, PARTIAL_CELL_HOLE_BASE + 1),
+            (NO_STATE, PARTIAL_CELL_DEAD),
+        ] {
             for accepted in [false, true] {
-                let packed = PackedForwardCell::from_cell(ForwardCell { next, accepted })
-                    .expect("stable partial state fits packed cell");
+                let packed =
+                    PackedForwardCell::from_cell(ForwardCell { next, accepted }, 2, 3)
+                        .expect("stable partial state fits packed cell");
                 assert_eq!(packed.accepted(), accepted);
-                assert_eq!(
-                    packed.next(),
-                    if next == NO_STATE {
-                        PARTIAL_CELL_DEAD
-                    } else {
-                        next
-                    }
-                );
+                assert_eq!(packed.0 & (PARTIAL_CELL_ACCEPTED - 1), expected);
             }
         }
-        assert!(PackedForwardCell::from_cell(ForwardCell {
-            next: PARTIAL_CELL_DEAD,
+        let outside_stable_range = ForwardCell {
+            next: u32::MAX - 1,
             accepted: false,
-        })
-        .is_none());
+        };
+        assert!(PackedForwardCell::from_cell(outside_stable_range, 0, 1).is_none());
     }
 
     #[test]
