@@ -464,14 +464,15 @@ impl WorkMeter {
         self.limit.saturating_sub(self.consumed)
     }
 
-    #[allow(
-        clippy::arithmetic_side_effects,
-        reason = "a scan can charge at most one validated slice plus one fixed-width overlap"
-    )]
-    fn charge(&mut self, requested: usize) -> Result<(), SearchError> {
+    pub(super) fn charge(&mut self, requested: usize) -> Result<(), SearchError> {
         let requested_u64 =
             u64::try_from(requested).expect("one slice-relative work charge fits u64");
-        let needed = self.consumed + requested_u64;
+        let Some(needed) = self.consumed.checked_add(requested_u64) else {
+            return Err(SearchError::WorkLimit {
+                needed: u64::MAX,
+                limit: self.limit,
+            });
+        };
         if needed > self.limit {
             return Err(SearchError::WorkLimit {
                 needed,
@@ -523,7 +524,7 @@ fn seek_small(
         return Ok(None);
     }
     Err(SearchError::WorkLimit {
-        needed: meter.consumed + 1,
+        needed: meter.consumed.saturating_add(1),
         limit: meter.limit,
     })
 }

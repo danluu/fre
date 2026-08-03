@@ -1586,6 +1586,7 @@ fn plan_name(plan: PlanKind) -> &'static str {
         PlanKind::RequiredLiteral => "required-literal",
         PlanKind::LiteralClassRunLiteral => "literal-class-run-literal",
         PlanKind::PureByteClassRepeat => "pure-byte-class-repeat",
+        PlanKind::BoundedByteClassSequence => "bounded-byte-class-sequence",
         PlanKind::ForwardAnchored => "forward-anchored",
         PlanKind::K0 => "k0",
         PlanKind::UnicodeFoldedLiteral => "unicode-folded-literal",

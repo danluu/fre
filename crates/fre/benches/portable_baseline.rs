@@ -125,6 +125,7 @@ fn compare_search(case: &Case) {
         PlanKind::RequiredLiteral => "fre-required-literal",
         PlanKind::LiteralClassRunLiteral => "fre-literal-class-run-literal",
         PlanKind::PureByteClassRepeat => "fre-pure-byte-class-repeat",
+        PlanKind::BoundedByteClassSequence => "fre-bounded-byte-class-sequence",
         PlanKind::ForwardAnchored => "fre-forward-anchored",
         PlanKind::K0 => "fre-k0",
         PlanKind::UnicodeFoldedLiteral => "fre-unicode-folded-literal",

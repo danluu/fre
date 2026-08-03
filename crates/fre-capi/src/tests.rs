@@ -15,8 +15,9 @@ use crate::{
     FRE_V1_DIAGNOSTIC_NONE, FRE_V1_DIAGNOSTIC_PANIC, FRE_V1_FEATURE_EXISTS,
     FRE_V1_FEATURE_PLAN_INFO, FRE_V1_FEATURE_RUST_BYTES, FRE_V1_FEATURE_SELECTED_END,
     FRE_V1_FEATURE_SPAN, FRE_V1_FEATURE_THREAD_SAFE_REGEX, FRE_V1_FEATURES, FRE_V1_JIT_DENY,
-    FRE_V1_PLAN_EXACT_LITERAL, FRE_V1_PLAN_FIXED_PREDICATE_WORD64, FRE_V1_PLAN_FORWARD_ANCHORED,
-    FRE_V1_PLAN_K0, FRE_V1_PLAN_LITERAL_CLASS_RUN_LITERAL, FRE_V1_PLAN_LITERAL_SET_DFA,
+    FRE_V1_PLAN_BOUNDED_BYTE_CLASS_SEQUENCE, FRE_V1_PLAN_EXACT_LITERAL,
+    FRE_V1_PLAN_FIXED_PREDICATE_WORD64, FRE_V1_PLAN_FORWARD_ANCHORED, FRE_V1_PLAN_K0,
+    FRE_V1_PLAN_LITERAL_CLASS_RUN_LITERAL, FRE_V1_PLAN_LITERAL_SET_DFA,
     FRE_V1_PLAN_PACKED_LITERAL_SET, FRE_V1_PLAN_PURE_BYTE_CLASS_REPEAT,
     FRE_V1_PLAN_REQUIRED_LITERAL, FRE_V1_PLAN_UNICODE_FOLDED_LITERAL, FRE_V1_PLAN_UNICODE_WORD_RUN,
     FRE_V1_PROFILE_RUST_BYTES, FRE_V1_STATUS_ABI_MISMATCH, FRE_V1_STATUS_COMPILE_ERROR,
@@ -92,8 +93,9 @@ fn abi_layouts_offsets_tags_and_features_are_stable() {
             FRE_V1_PLAN_LITERAL_CLASS_RUN_LITERAL,
             FRE_V1_PLAN_PURE_BYTE_CLASS_REPEAT,
             FRE_V1_PLAN_FIXED_PREDICATE_WORD64,
+            FRE_V1_PLAN_BOUNDED_BYTE_CLASS_SEQUENCE,
         ],
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     );
     assert_eq!(
         FRE_V1_FEATURES,
@@ -120,6 +122,10 @@ fn every_rust_plan_kind_has_the_pinned_public_tag() {
         (
             PlanKind::PureByteClassRepeat,
             FRE_V1_PLAN_PURE_BYTE_CLASS_REPEAT,
+        ),
+        (
+            PlanKind::BoundedByteClassSequence,
+            FRE_V1_PLAN_BOUNDED_BYTE_CLASS_SEQUENCE,
         ),
         (PlanKind::ForwardAnchored, FRE_V1_PLAN_FORWARD_ANCHORED),
         (PlanKind::K0, FRE_V1_PLAN_K0),
@@ -340,6 +346,10 @@ fn appended_native_plans_have_stable_public_plan_tags() {
     byte_config.unicode = 0;
     let cases: &[(&[u8], u32)] = &[
         (br"(?-u:[a-d])+", FRE_V1_PLAN_PURE_BYTE_CLASS_REPEAT),
+        (
+            br"(?-u:[a-d]){1,3}(?-u:[W-Z]){1,3}",
+            FRE_V1_PLAN_BOUNDED_BYTE_CLASS_SEQUENCE,
+        ),
         (
             br"Q[ab][cd][ef][gh][ij][kl][mn][op][rs][tu][vw][xy][01]",
             FRE_V1_PLAN_FIXED_PREDICATE_WORD64,
