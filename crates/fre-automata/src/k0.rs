@@ -2021,16 +2021,17 @@ impl ReverseWorkspace {
     }
 }
 
-/// Graph-bound ordered consuming frontiers admitted for exact K0 continuation.
+/// Graph-bound consuming frontiers admitted for exact K0 continuation.
 ///
-/// A frontier is the complete ordered list at one byte boundary after epsilon
-/// closure has stopped at the first accepting path, plus the selected-end
-/// pending bit. The list order is semantic: earlier entries have higher
-/// priority. Construction validates graph binding, consuming roles, bounds,
-/// uniqueness, and the declared flat shape. Reachability from a particular
-/// prefix is deliberately a producer proof; the AOT producer authenticates
-/// that proof by canonically regenerating its partial table before this set is
-/// constructed.
+/// A frontier is the complete consuming list at one byte boundary after
+/// epsilon closure, plus the selected-end pending bit. Endpoint-producing
+/// callers preserve Thompson order because earlier entries have higher
+/// priority. Boolean-existence callers may instead use canonical graph-state
+/// order because only set membership is observable. Construction validates
+/// graph binding, consuming roles, bounds, uniqueness, and the declared flat
+/// shape. Reachability from a particular prefix is deliberately a producer
+/// proof; the AOT producer authenticates that proof by canonically regenerating
+/// its partial table before this set is constructed.
 ///
 /// Cached lazy-state IDs are only hints. Every hint is content-checked against
 /// the paired workspace before reuse, so moving a set between compatible
@@ -2047,13 +2048,14 @@ pub struct K0ResumeSet {
 }
 
 impl K0ResumeSet {
-    /// Copy a canonical collection of ordered frontiers and bind it to one
+    /// Copy a canonical collection of semantic frontiers and bind it to one
     /// immutable automaton instance.
     ///
     /// `state_count` and `total_items` make the allocation and iteration shape
     /// explicit before any input is copied. Every yielded slice must be
-    /// non-empty and contain distinct consuming-state indices in priority
-    /// order. The boolean is the frontier's pending selected-end mode.
+    /// non-empty and contain distinct consuming-state indices in the order
+    /// required by its producer's output contract. The boolean is the
+    /// frontier's pending selected-end mode.
     ///
     /// # Errors
     ///

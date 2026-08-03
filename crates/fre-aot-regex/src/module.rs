@@ -19886,9 +19886,9 @@ mod tests {
                 [
                     ForwardCoverage {
                         dead: true,
-                        live: true,
-                        // Exists returns on the accept edge, so an accepting
-                        // accelerator continuation is deliberately not built.
+                        // Exists returns on the accept edge, so every
+                        // accepting successor is deliberately terminal.
+                        live: false,
                         accelerated: false,
                     },
                     ForwardCoverage {

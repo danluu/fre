@@ -2255,7 +2255,12 @@ impl CompiledProgram {
                     None,
                 )
             }
-            CompileMode::Optimizing => match dfa::determinize(&raw, needs_reverse_span, limits)? {
+            CompileMode::Optimizing => match dfa::determinize_for_output(
+                &raw,
+                output,
+                needs_reverse_span,
+                limits,
+            )? {
                 DeterminizeOutcome::Complete { machine, report } => (
                     ProgramEngine::OrderedDfa(machine),
                     EngineSelectionReason::CompleteDfa,
@@ -3703,6 +3708,7 @@ impl CompiledProgram {
                     let partial = partial.validate_canonical(
                         &raw,
                         output == OutputContract::Span && exact_match_width.is_none(),
+                        output,
                     )?;
                     Some(Box::new(partial))
                 } else {
@@ -3738,7 +3744,7 @@ impl CompiledProgram {
                     alphabet_shape.construction_classes(),
                     &alphabet_shape.boundary_starts,
                 )?;
-                machine.validate_canonical(&raw)?;
+                machine.validate_canonical(&raw, output)?;
                 (ProgramEngine::OrderedDfa(machine), None)
             }
         };
@@ -7773,15 +7779,197 @@ mod tests {
     }
 
     #[test]
+    fn exists_canonical_subsets_avoid_priority_only_resource_fallback() {
+        // Every alternative is semantically just another way to keep a
+        // Boolean match alive, but the ordered construction retains their
+        // Thompson-priority permutations. The Exists construction must stay
+        // bounded by language subsets rather than that unobservable order.
+        let pattern = r"(?:a|ab|ba|b){12}z";
+        let limits = DeterminizeLimits {
+            max_states: 64,
+            ..DeterminizeLimits::default()
+        };
+        let optimized = program(
+            pattern,
+            OutputContract::Exists,
+            CompileMode::Optimizing,
+            limits,
+        );
+        assert_eq!(optimized.engine_kind(), EngineKind::OrderedDfa);
+        let stats = optimized.dfa_stats().expect("complete existential DFA");
+        assert!(stats.forward_states_before_minimization <= limits.max_states);
+
+        assert!(matches!(
+            dfa::determinize(&optimized.raw, false, limits).expect("ordered determinization"),
+            DeterminizeOutcome::Declined { .. }
+        ));
+
+        let serialized = optimized.serialize().expect("serialize existential DFA");
+        let restored = CompiledProgram::deserialize(&serialized)
+            .expect("deserialize canonical existential DFA");
+        assert_eq!(restored.serialize().unwrap(), serialized);
+        let ProgramEngine::OrderedDfa(existential_machine) = &optimized.engine else {
+            panic!("existential compilation did not retain its complete machine");
+        };
+        assert!(
+            existential_machine
+                .validate_canonical(&optimized.raw, OutputContract::SelectedEnd)
+                .is_err(),
+            "existential terminal edges are not canonical for endpoint selection"
+        );
+
+        // Artifacts emitted before Exists subset canonicalization remain
+        // readable through the legacy ordered canonical-validation path.
+        let mut legacy = program(
+            pattern,
+            OutputContract::Exists,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let legacy_machine = match dfa::determinize(
+            &legacy.raw,
+            false,
+            DeterminizeLimits::default(),
+        )
+        .expect("legacy ordered determinization")
+        {
+            DeterminizeOutcome::Complete { machine, .. } => machine,
+            DeterminizeOutcome::Declined { report, .. } => {
+                panic!("legacy ordered determinization declined: {report:?}")
+            }
+        };
+        assert!(
+            legacy_machine.stats().forward_states_before_minimization
+                > stats.forward_states_before_minimization
+        );
+        legacy.engine = ProgramEngine::OrderedDfa(legacy_machine);
+        legacy.engine_selection_reason = Some(EngineSelectionReason::CompleteDfa);
+        let legacy_bytes = legacy.serialize().expect("serialize legacy Exists DFA");
+        let legacy_restored = CompiledProgram::deserialize(&legacy_bytes)
+            .expect("deserialize legacy ordered Exists DFA");
+        assert_eq!(legacy_restored.serialize().unwrap(), legacy_bytes);
+
+        let small = r"(?:a|ab|ba|b){4}z";
+        let existential = program(
+            small,
+            OutputContract::Exists,
+            CompileMode::Optimizing,
+            DeterminizeLimits::default(),
+        );
+        let reference = program(
+            small,
+            OutputContract::Exists,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        for haystack in generated_byte_strings(b"abz", 5) {
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let window = SearchWindow::new(start, end);
+                    assert_eq!(
+                        existential.search(&haystack, window).unwrap(),
+                        reference.search(&haystack, window).unwrap(),
+                        "{haystack:?}/{start}..{end}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exists_partial_wire_accepts_semantic_and_legacy_frontier_orders() {
+        let pattern = r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)";
+        let limits = DeterminizeLimits {
+            max_states: 8,
+            ..DeterminizeLimits::default()
+        };
+        let semantic = program(
+            pattern,
+            OutputContract::Exists,
+            CompileMode::Optimizing,
+            limits,
+        );
+        assert!(semantic.partial_dfa().is_some());
+        let semantic_bytes = semantic.serialize().expect("serialize semantic partial");
+        let semantic_restored = CompiledProgram::deserialize(&semantic_bytes)
+            .expect("deserialize semantic partial");
+
+        let mut legacy = program(
+            pattern,
+            OutputContract::Exists,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let (legacy_partial, legacy_report) =
+            match dfa::determinize(&legacy.raw, false, limits).expect("legacy partial build") {
+                DeterminizeOutcome::Declined {
+                    report,
+                    partial: Some(partial),
+                } => (partial, report),
+                DeterminizeOutcome::Complete { .. } => {
+                    panic!("legacy limits unexpectedly completed")
+                }
+                DeterminizeOutcome::Declined { partial: None, .. } => {
+                    panic!("legacy limits retained no completed row")
+                }
+            };
+        legacy.optimization_sidecar =
+            ProgramOptimizationSidecar::Partial(Box::new(legacy_partial));
+        legacy.engine_selection_reason = Some(EngineSelectionReason::DeterminizationResourceLimit);
+        legacy.determinization_report = Some(legacy_report);
+        let legacy_bytes = legacy.serialize().expect("serialize legacy partial");
+        assert_ne!(legacy_bytes, semantic_bytes);
+        let legacy_restored = CompiledProgram::deserialize(&legacy_bytes)
+            .expect("deserialize legacy ordered partial");
+
+        let reference = program(
+            pattern,
+            OutputContract::Exists,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let mut semantic_workspace = semantic_restored.prepare_workspace().unwrap();
+        let mut legacy_workspace = legacy_restored.prepare_workspace().unwrap();
+        for haystack in [
+            b"".as_slice(),
+            b"xxcbbbbxyy",
+            b"bbbbbbbbbbbb",
+            b"xxbaaaayyy",
+            b"aaaQ",
+        ] {
+            let window = SearchWindow::full(haystack);
+            let expected = reference.search(haystack, window).unwrap();
+            assert_eq!(
+                semantic_restored
+                    .search_with_retained_partial_workspace(
+                        haystack,
+                        window,
+                        &mut semantic_workspace,
+                    )
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(
+                legacy_restored
+                    .search_with_retained_partial_workspace(
+                        haystack,
+                        window,
+                        &mut legacy_workspace,
+                    )
+                    .unwrap(),
+                expected
+            );
+        }
+        assert!(semantic_workspace.partial.as_deref().unwrap().state.resumed > 0);
+        assert!(legacy_workspace.partial.as_deref().unwrap().state.resumed > 0);
+    }
+
+    #[test]
     fn resource_decline_retains_canonical_partial_rows_for_every_contract() {
         // The disjoint terminal alternatives deliberately leave no suffix
         // sidecar eligible, so every missing retained row exercises the
         // authenticated K0 continuation rather than another accelerator.
         let pattern = r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)";
-        let limits = DeterminizeLimits {
-            max_states: 32,
-            ..DeterminizeLimits::default()
-        };
         let mut haystacks = generated_byte_strings(&[0, b'a', b'b', b'c', b'x', b'z', 255], 5);
         haystacks.extend([
             b"xxcbbbbxyy".to_vec(),
@@ -7800,6 +7988,17 @@ mod tests {
             OutputContract::SelectedEnd,
             OutputContract::Span,
         ] {
+            // Exists canonicalizes priority-only permutations and completes
+            // this graph below 32 states. A tighter limit still exercises its
+            // canonical set-valued K0-resumable prefix.
+            let limits = DeterminizeLimits {
+                max_states: if output == OutputContract::Exists {
+                    8
+                } else {
+                    32
+                },
+                ..DeterminizeLimits::default()
+            };
             let partial = program(pattern, output, CompileMode::Optimizing, limits);
             assert_eq!(partial.engine_kind(), EngineKind::OrderedNfa);
             let retained = partial
@@ -8511,11 +8710,10 @@ mod tests {
             b"aaaQ".to_vec(),
         ]);
         for pattern in patterns {
-            for output in [
-                OutputContract::Exists,
-                OutputContract::SelectedEnd,
-                OutputContract::Span,
-            ] {
+            // Pending endpoint priority is observable only for endpoint
+            // contracts. Exists uses a canonical unordered complete machine
+            // for these shapes and has separate retained-retry coverage.
+            for output in [OutputContract::SelectedEnd, OutputContract::Span] {
                 let partial = program(pattern, output, CompileMode::Optimizing, limits);
                 let retained = partial
                     .partial_dfa()

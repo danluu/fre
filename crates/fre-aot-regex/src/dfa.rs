@@ -549,9 +549,11 @@ struct PartialForwardDfa {
     start_actions: Vec<ForwardStartAction>,
     discovered_states: usize,
     complete_rows: usize,
-    /// Ordered subset keys for exactly the incomplete suffix
-    /// `complete_rows..discovered_states`. Complete source rows need no key at
-    /// runtime; entering this suffix is the authenticated K0 resume boundary.
+    /// Semantic subset keys for exactly the incomplete suffix
+    /// `complete_rows..discovered_states`. Endpoint contracts preserve
+    /// Thompson priority; Exists stores graph-state order because K0 observes
+    /// only set membership. Complete source rows need no key at runtime;
+    /// entering this suffix is the authenticated K0 resume boundary.
     resume_keys: Vec<ForwardKey>,
 }
 
@@ -585,7 +587,8 @@ impl ReverseDfa {
     }
 }
 
-/// A complete, alphabet-reduced ordered DFA plus optional reverse machine.
+/// A complete, alphabet-reduced, output-specialized DFA plus optional reverse
+/// machine.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct OrderedDfa {
     alphabet: Alphabet,
@@ -594,14 +597,15 @@ pub(crate) struct OrderedDfa {
     stats: DfaStats,
 }
 
-/// Canonical prefix of ordered subset construction retained when bounded
-/// determinization declines.
+/// Canonical prefix of output-specialized subset construction retained when
+/// bounded determinization declines.
 ///
 /// Every stored row is complete for every graph alphabet class. A transition
 /// may name a discovered state whose own row was not completed; execution
 /// treats entry into that state as a side exit to the exact ordered-NFA
-/// engine. The compact incomplete-state suffix retains the canonical ordered
-/// consuming frontier and pending mode, so K0 continues at the first
+/// engine. The compact incomplete-state suffix retains either the canonical
+/// ordered frontier and pending mode needed by endpoint contracts, or the
+/// canonical set-valued frontier needed by Exists. K0 continues at the first
 /// unconsumed byte without replaying the prefix.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PartialDfa {
@@ -1748,7 +1752,28 @@ impl PartialDfa {
         &self,
         raw: &RawPlan,
         wants_span: bool,
+        output: OutputContract,
     ) -> Result<Self, ProgramFormatError> {
+        // Exists partials may use canonical unordered frontiers. Try that
+        // construction first, then the historical ordered construction so
+        // pre-specialization stable artifacts remain readable.
+        if output == OutputContract::Exists {
+            let regenerated = determinize_impl(raw, false, self.effective_limits, true).map_err(
+                |_| {
+                    ProgramFormatError::Malformed(
+                        "existential partial DFA canonical regeneration returned an error",
+                    )
+                },
+            )?;
+            if let DeterminizeOutcome::Declined {
+                partial: Some(regenerated),
+                ..
+            } = regenerated
+                && regenerated.same_wire_payload(self)
+            {
+                return Ok(regenerated);
+            }
+        }
         let regenerated = determinize(raw, wants_span, self.effective_limits).map_err(|_| {
             ProgramFormatError::Malformed("partial DFA canonical regeneration returned an error")
         })?;
@@ -1775,20 +1800,23 @@ impl PartialDfa {
                 ))?
             }
         };
-        let same_wire_payload = regenerated.alphabet == self.alphabet
-            && regenerated.effective_limits == self.effective_limits
-            && regenerated.forward.initial_pending == self.forward.initial_pending
-            && regenerated.forward.initial_terminal == self.forward.initial_terminal
-            && regenerated.forward.transitions == self.forward.transitions
-            && regenerated.forward.discovered_states == self.forward.discovered_states
-            && regenerated.forward.complete_rows == self.forward.complete_rows
-            && regenerated.forward.resume_keys == self.forward.resume_keys;
-        if !same_wire_payload {
+        if !regenerated.same_wire_payload(self) {
             return Err(ProgramFormatError::Malformed(
                 "partial DFA payload is not the canonical retained prefix",
             ));
         }
         Ok(regenerated)
+    }
+
+    fn same_wire_payload(&self, other: &Self) -> bool {
+        self.alphabet == other.alphabet
+            && self.effective_limits == other.effective_limits
+            && self.forward.initial_pending == other.forward.initial_pending
+            && self.forward.initial_terminal == other.forward.initial_terminal
+            && self.forward.transitions == other.forward.transitions
+            && self.forward.discovered_states == other.forward.discovered_states
+            && self.forward.complete_rows == other.forward.complete_rows
+            && self.forward.resume_keys == other.forward.resume_keys
     }
 }
 
@@ -2329,7 +2357,11 @@ impl OrderedDfa {
         })
     }
 
-    pub(crate) fn validate_canonical(&self, raw: &RawPlan) -> Result<(), ProgramFormatError> {
+    pub(crate) fn validate_canonical(
+        &self,
+        raw: &RawPlan,
+        output: OutputContract,
+    ) -> Result<(), ProgramFormatError> {
         let max_states = self
             .stats
             .forward_states_before_minimization
@@ -2342,15 +2374,28 @@ impl OrderedDfa {
         let max_transitions = max_states.checked_mul(self.stats.graph_classes).ok_or(
             ProgramFormatError::Malformed("DFA canonical transition bound overflowed"),
         )?;
-        let regenerated = determinize(
-            raw,
-            self.reverse.is_some(),
-            DeterminizeLimits {
-                max_states,
-                max_transitions,
-                max_work: self.stats.build_work,
-            },
-        )
+        let limits = DeterminizeLimits {
+            max_states,
+            max_transitions,
+            max_work: self.stats.build_work,
+        };
+        // New Exists artifacts use unordered semantic subsets. Accept the
+        // historical priority-preserving canonical table as well so the
+        // stable wire format remains backwards compatible.
+        if output == OutputContract::Exists {
+            let regenerated = determinize_impl(raw, false, limits, true).map_err(|_| {
+                ProgramFormatError::Malformed(
+                    "existential DFA canonical regeneration returned an error",
+                )
+            })?;
+            if matches!(
+                regenerated,
+                DeterminizeOutcome::Complete { ref machine, .. } if machine == self
+            ) {
+                return Ok(());
+            }
+        }
+        let regenerated = determinize(raw, self.reverse.is_some(), limits)
         .map_err(|_| {
             ProgramFormatError::Malformed("DFA canonical regeneration returned an error")
         })?;
@@ -2597,10 +2642,11 @@ impl DeterminizeOutcome {
     }
 }
 
-pub(crate) fn determinize(
+fn determinize_impl(
     raw: &RawPlan,
     wants_span: bool,
     requested_limits: DeterminizeLimits,
+    existence_only: bool,
 ) -> Result<DeterminizeOutcome, CompileError> {
     if raw
         .edge_kinds
@@ -2624,7 +2670,7 @@ pub(crate) fn determinize(
     } = built_alphabet;
     budget.complete_stage(DeterminizationStage::AlphabetPartition)?;
     budget.begin_stage(DeterminizationStage::ForwardSubsetConstruction);
-    let mut forward = match build_forward(raw, &alphabet, &mut budget)? {
+    let mut forward = match build_forward(raw, &alphabet, &mut budget, existence_only)? {
         ForwardBuildOutcome::Complete(forward) => forward,
         ForwardBuildOutcome::Declined(partial) => {
             let partial = partial.map(|forward| PartialDfa {
@@ -2697,6 +2743,39 @@ pub(crate) fn determinize(
         stats,
     };
     Ok(DeterminizeOutcome::from_budget(Some(machine), None, budget))
+}
+
+/// Build the historical priority-preserving machine.
+///
+/// Partial machines use this construction because their retained prefix can
+/// resume in the ordered K0 engine. Keeping this entry point also preserves
+/// canonical validation for previously serialized programs.
+pub(crate) fn determinize(
+    raw: &RawPlan,
+    wants_span: bool,
+    requested_limits: DeterminizeLimits,
+) -> Result<DeterminizeOutcome, CompileError> {
+    determinize_impl(raw, wants_span, requested_limits, false)
+}
+
+/// Build the smallest semantic machine admitted by the output contract.
+///
+/// An existence query observes only whether any path accepts. It cannot
+/// observe Thompson priority after an accepting transition, nor the order of
+/// a nonaccepting subset. Canonicalizing those subsets avoids distinct DFA
+/// states that differ only by priority. Its partial rows remain exact for a
+/// Boolean query: a K0 continuation observes only the set of live consuming
+/// states, never their priority order or a pending endpoint.
+pub(crate) fn determinize_for_output(
+    raw: &RawPlan,
+    output: OutputContract,
+    wants_span: bool,
+    requested_limits: DeterminizeLimits,
+) -> Result<DeterminizeOutcome, CompileError> {
+    if output == OutputContract::Exists {
+        return determinize_impl(raw, false, requested_limits, true);
+    }
+    determinize_impl(raw, wants_span, requested_limits, false)
 }
 
 trait RefinementCell: Copy + Eq {
@@ -3493,6 +3572,7 @@ fn build_forward(
     raw: &RawPlan,
     alphabet: &Alphabet,
     budget: &mut BuildBudget,
+    existence_only: bool,
 ) -> Result<ForwardBuildOutcome, CompileError> {
     let Some(mut closure) = ForwardClosure::new(raw, budget) else {
         return Ok(ForwardBuildOutcome::Declined(None));
@@ -3501,8 +3581,20 @@ fn build_forward(
     if budget.declined {
         return Ok(ForwardBuildOutcome::Declined(None));
     }
-    let Some(initial_items) = closure.copy_items(budget) else {
-        return Ok(ForwardBuildOutcome::Declined(None));
+    let initial_items = if existence_only {
+        if initial_accepted {
+            Vec::new()
+        } else {
+            let Some(items) = closure.copy_items_canonical(raw, budget)? else {
+                return Ok(ForwardBuildOutcome::Declined(None));
+            };
+            items
+        }
+    } else {
+        let Some(items) = closure.copy_items(budget) else {
+            return Ok(ForwardBuildOutcome::Declined(None));
+        };
+        items
     };
     let initial_terminal = initial_accepted && initial_items.is_empty();
     let initial = ForwardKey {
@@ -3599,9 +3691,23 @@ fn build_forward(
                 closure.items.len(),
                 injected_root,
             );
-            let next_pending = key.pending || accepted;
-            let Some(next_items) = closure.copy_items(budget) else {
-                decline_with_complete_rows!();
+            let next_pending = !existence_only && (key.pending || accepted);
+            let next_items = if existence_only {
+                if accepted {
+                    // Exists returns on this transition, so its successor is
+                    // unobservable and must not create another subset state.
+                    Vec::new()
+                } else {
+                    let Some(items) = closure.copy_items_canonical(raw, budget)? else {
+                        decline_with_complete_rows!();
+                    };
+                    items
+                }
+            } else {
+                let Some(items) = closure.copy_items(budget) else {
+                    decline_with_complete_rows!();
+                };
+                items
             };
             let next = if next_items.is_empty() {
                 NO_STATE
@@ -4076,6 +4182,37 @@ impl ForwardClosure {
 
     fn copy_items(&self, budget: &mut BuildBudget) -> Option<Vec<u32>> {
         clone_u32s(&self.items, budget)
+    }
+
+    /// Copy the consuming frontier in graph-state order.
+    ///
+    /// A complete nonaccepting closure has marked every reachable state in
+    /// `seen`. Scanning that bitmap makes set canonicalization linear and its
+    /// work receipt independent of a library sorting implementation.
+    fn copy_items_canonical(
+        &self,
+        raw: &RawPlan,
+        budget: &mut BuildBudget,
+    ) -> Result<Option<Vec<u32>>, CompileError> {
+        let Some(mut items) = build_vec(self.items.len(), budget) else {
+            return Ok(None);
+        };
+        for (state, (&seen, &role)) in self.seen.iter().zip(&raw.roles).enumerate() {
+            if !budget.charge(1) {
+                return Ok(None);
+            }
+            if seen && role == StateRole::Consume {
+                items.push(u32::try_from(state).map_err(|_| {
+                    CompileError::InternalInvariant("forward closure state exceeded u32")
+                })?);
+            }
+        }
+        if items.len() != self.items.len() {
+            return Err(CompileError::InternalInvariant(
+                "canonical forward closure changed its consuming frontier",
+            ));
+        }
+        Ok(Some(items))
     }
 }
 
