@@ -503,38 +503,25 @@ fn selected_passes(program: &CompiledProgram, module: &CompiledModule) -> Vec<Op
         }
     }
     match program.engine_kind() {
-        EngineKind::OrderedNfa => passes.extend_from_slice(&[
-            OptimizationPass::UniversalOrderedTnfa,
-            OptimizationPass::RuntimeAdapterLowering,
-        ]),
+        EngineKind::OrderedNfa if module.required_runtime_symbol().is_some() => passes
+            .extend_from_slice(&[
+                OptimizationPass::UniversalOrderedTnfa,
+                OptimizationPass::RuntimeAdapterLowering,
+            ]),
+        EngineKind::OrderedNfa => {
+            // A resource decline can leave a complete retained forward
+            // transducer even though the stable semantic engine remains the
+            // universal ordered TNFA. When that table is lowered directly,
+            // report the native passes actually present in the object rather
+            // than claiming that a runtime adapter was emitted.
+            passes.push(OptimizationPass::UniversalOrderedTnfa);
+            append_native_dfa_passes(&mut passes, program, module, true);
+        }
         EngineKind::OrderedDfa => {
-            if program
+            let reverse_unused = program
                 .dfa_stats()
-                .is_some_and(|stats| stats.reverse_states == 0)
-            {
-                passes.push(OptimizationPass::RemoveUnusedReverseMachine);
-            }
-            if program.output_contract() == OutputContract::Span
-                && program.exact_match_width().is_some()
-            {
-                passes.push(OptimizationPass::ExactWidthStartRecovery);
-            }
-            passes.extend_from_slice(&[
-                OptimizationPass::OutputContractSpecialization,
-                OptimizationPass::ConstantFold,
-                OptimizationPass::StrengthReduceRowAddressing,
-            ]);
-            if module.start_accelerator() != StartAccelerator::None {
-                passes.push(OptimizationPass::StartStateScanAcceleration);
-            }
-            if module.anchored_prefix_filter_bytes() != 0 {
-                passes.push(OptimizationPass::AnchoredPrefixCandidateFilter);
-            }
-            passes.extend_from_slice(&[
-                OptimizationPass::TargetInstructionSelection,
-                OptimizationPass::FixedRegisterAssignment,
-                OptimizationPass::CheckedBranchFixup,
-            ]);
+                .is_some_and(|stats| stats.reverse_states == 0);
+            append_native_dfa_passes(&mut passes, program, module, reverse_unused);
         }
         EngineKind::OrderedContextDfa => {
             passes.extend_from_slice(&[
@@ -564,6 +551,36 @@ fn selected_passes(program: &CompiledProgram, module: &CompiledModule) -> Vec<Op
         OptimizationPass::RelocatableObjectSerialization,
     ]);
     passes
+}
+
+fn append_native_dfa_passes(
+    passes: &mut Vec<OptimizationPass>,
+    program: &CompiledProgram,
+    module: &CompiledModule,
+    reverse_unused: bool,
+) {
+    if reverse_unused {
+        passes.push(OptimizationPass::RemoveUnusedReverseMachine);
+    }
+    if program.output_contract() == OutputContract::Span && program.exact_match_width().is_some() {
+        passes.push(OptimizationPass::ExactWidthStartRecovery);
+    }
+    passes.extend_from_slice(&[
+        OptimizationPass::OutputContractSpecialization,
+        OptimizationPass::ConstantFold,
+        OptimizationPass::StrengthReduceRowAddressing,
+    ]);
+    if module.start_accelerator() != StartAccelerator::None {
+        passes.push(OptimizationPass::StartStateScanAcceleration);
+    }
+    if module.anchored_prefix_filter_bytes() != 0 {
+        passes.push(OptimizationPass::AnchoredPrefixCandidateFilter);
+    }
+    passes.extend_from_slice(&[
+        OptimizationPass::TargetInstructionSelection,
+        OptimizationPass::FixedRegisterAssignment,
+        OptimizationPass::CheckedBranchFixup,
+    ]);
 }
 
 #[cfg(test)]

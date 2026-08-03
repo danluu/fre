@@ -1214,6 +1214,30 @@ impl PartialDfa {
         self.effective_limits
     }
 
+    /// Expose a resource-fallback table to the ordinary native DFA lowering
+    /// only when every discovered state has a completed row.
+    ///
+    /// Such an artifact is "partial" only in compiler provenance: a later
+    /// optimization stage (or Span reverse construction) exhausted its
+    /// budget after forward subset construction had already completed. With
+    /// no retained frontier left to resume, the forward table is a complete
+    /// endpoint transducer and needs no runtime helper.
+    pub(crate) fn native_complete_view(&self) -> Option<NativeDfaView<'_>> {
+        let complete = self.forward.complete_rows == self.forward.discovered_states
+            && self.forward.resume_keys.is_empty();
+        complete.then_some(NativeDfaView {
+            initial_state: 0,
+            initial_pending: self.forward.initial_pending,
+            initial_terminal: self.forward.initial_terminal,
+            byte_classes: &self.alphabet.byte_to_class,
+            class_count: self.alphabet.classes(),
+            class_representatives: &self.alphabet.representatives,
+            forward_cells: &self.forward.transitions,
+            reverse_initial: None,
+            reverse_cells: &[],
+        })
+    }
+
     pub(crate) fn resume_frontier_count(&self) -> usize {
         self.forward.resume_keys.len()
     }

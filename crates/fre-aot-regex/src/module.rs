@@ -12471,8 +12471,8 @@ fn lower_aarch64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), O
 mod tests {
     use super::*;
     use crate::{
-        CompileMode, CompileRequest, EngineKind, MatchResult, ObjectFormat, SearchWindow, compile,
-        emit_object,
+        CompileLimitsV1, CompileMode, CompileRequest, CompiledRegex, DeterminizeLimits, EngineKind,
+        MatchResult, ObjectFormat, SearchWindow, compile, emit_object,
     };
 
     fn identity_target_matrix() -> Vec<Target> {
@@ -12505,6 +12505,70 @@ mod tests {
             }
         }
         targets
+    }
+
+    fn complete_forward_resource_fallback(
+        pattern: &str,
+        output: OutputContract,
+        target: Target,
+    ) -> CompiledRegex {
+        let complete = compile(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(output),
+        )
+        .expect("complete-DFA resource probe");
+        let dfa = complete.receipt().dfa.unwrap_or_else(|| {
+            panic!(
+                "complete DFA probe declined for {pattern:?}/{output:?}: {:?}",
+                complete.receipt().engine_selection_reason
+            )
+        });
+        let limits = CompileLimitsV1 {
+            determinize: DeterminizeLimits {
+                max_work: dfa
+                    .build_work
+                    .checked_sub(1)
+                    .expect("nonzero complete-DFA build work"),
+                ..DeterminizeLimits::default()
+            },
+            ..CompileLimitsV1::default()
+        };
+        let fallback = compile(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(output)
+                .limits(limits),
+        )
+        .expect("complete-forward resource fallback");
+        assert_eq!(fallback.receipt().engine, EngineKind::OrderedNfa);
+        let partial = fallback
+            .program()
+            .partial_dfa_stats()
+            .expect("partial-DFA statistics")
+            .expect("retained forward table");
+        assert_eq!(partial.complete_rows, partial.discovered_states);
+        assert_eq!(partial.resume_frontiers, 0);
+        assert_eq!(partial.resume_items, 0);
+        fallback
+    }
+
+    fn generated_byte_strings(alphabet: &[u8], maximum_length: usize) -> Vec<Vec<u8>> {
+        let mut strings = vec![Vec::new()];
+        let mut frontier = vec![Vec::new()];
+        for _ in 0..maximum_length {
+            let mut next = Vec::new();
+            for prefix in &frontier {
+                for &byte in alphabet {
+                    let mut value = prefix.clone();
+                    value.push(byte);
+                    strings.push(value.clone());
+                    next.push(value);
+                }
+            }
+            frontier = next;
+        }
+        strings
     }
 
     fn x86_test_branch_target(code: &[u8], instruction: usize) -> Option<(usize, usize)> {
@@ -12578,6 +12642,355 @@ mod tests {
             assert_eq!(target.operating_system, operating_system);
             assert_eq!(target.abi, abi);
             assert_eq!(target.validate(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn complete_retained_forward_uses_existing_native_lowering_across_target_matrix() {
+        let cases = [
+            ("[ab]+", OutputContract::Exists),
+            ("[ab]+", OutputContract::SelectedEnd),
+            ("[ab]*", OutputContract::Span),
+            ("[ab]cdefghij(?-u:.){8}", OutputContract::Span),
+        ];
+        for target in identity_target_matrix() {
+            for (pattern, output) in cases {
+                let compiled = complete_forward_resource_fallback(pattern, output, target);
+                assert!(
+                    !compiled.receipt().runtime_helper_required,
+                    "{pattern:?}/{output:?}/{target:?} unexpectedly retained the runtime helper; exact_width={:?} exact_product={}",
+                    compiled.receipt().exact_match_width,
+                    compiled.program().has_nfa_exact_product(),
+                );
+                assert!(
+                    compiled.module().required_runtime_symbol().is_none(),
+                    "{pattern:?}/{output:?}/{target:?} published a runtime relocation"
+                );
+                assert!(
+                    compiled.module().required_runtime_program().is_none(),
+                    "{pattern:?}/{output:?}/{target:?} published a runtime program alias"
+                );
+                assert!(
+                    !compiled
+                        .receipt()
+                        .passes
+                        .contains(&crate::OptimizationPass::RuntimeAdapterLowering)
+                );
+                assert!(
+                    compiled
+                        .receipt()
+                        .passes
+                        .contains(&crate::OptimizationPass::TargetInstructionSelection)
+                );
+
+                let restored = crate::CompiledProgram::deserialize(
+                    &compiled.program().serialize().expect("serialize fallback"),
+                )
+                .expect("restore fallback");
+                let restored_module = CompiledModule::lower(&restored, target)
+                    .expect("lower restored complete forward table");
+                assert!(restored_module.required_runtime_symbol().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn complete_retained_forward_reuses_feature_selected_start_scanners() {
+        let avx512 = FeatureSet::of(CpuFeature::X86Avx512F)
+            .with(CpuFeature::X86Avx512Bw)
+            .with(CpuFeature::X86Avx512Vl);
+        let cases = [
+            (
+                Target::x86_64_linux()
+                    .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                    .unwrap(),
+                "[ab]+",
+                StartAccelerator::X86Avx2,
+            ),
+            (
+                Target::x86_64_macos().with_features(avx512).unwrap(),
+                "[ab]+",
+                StartAccelerator::X86Avx512Bw,
+            ),
+            (
+                Target::aarch64_linux()
+                    .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                    .unwrap(),
+                "[ab]+",
+                StartAccelerator::Aarch64Asimd,
+            ),
+            (
+                Target::aarch64_linux()
+                    .with_features(FeatureSet::of(CpuFeature::Aarch64Sve))
+                    .unwrap(),
+                "[ab]+",
+                StartAccelerator::Aarch64Sve,
+            ),
+            (
+                Target::aarch64_linux()
+                    .with_features(
+                        FeatureSet::of(CpuFeature::Aarch64Sve)
+                            .with(CpuFeature::Aarch64Sve2),
+                    )
+                    .unwrap(),
+                "[ACEGIKMO]+",
+                StartAccelerator::Aarch64Sve2,
+            ),
+        ];
+        for (target, pattern, expected) in cases {
+            let compiled = complete_forward_resource_fallback(
+                pattern,
+                OutputContract::Exists,
+                target,
+            );
+            assert_eq!(compiled.module().start_accelerator(), expected, "{target:?}");
+        }
+    }
+
+    #[test]
+    fn complete_retained_forward_keeps_unrecoverable_span_and_portable_accelerators_on_runtime() {
+        let targets = [
+            Target::x86_64_linux(),
+            Target::x86_64_macos(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos(),
+        ];
+        for target in targets {
+            let variable_span = complete_forward_resource_fallback(
+                "[ab]+",
+                OutputContract::Span,
+                target,
+            );
+            assert!(variable_span.receipt().runtime_helper_required);
+            assert!(variable_span.module().required_runtime_symbol().is_some());
+
+            // The selective terminal column admits the complete portable
+            // mandatory-suffix proof. Even though the retained forward table
+            // has no holes, native publication must not bypass that
+            // accelerator.
+            let suffix_accelerated = complete_forward_resource_fallback(
+                "[b-c][a-b]{1,10}z",
+                OutputContract::SelectedEnd,
+                target,
+            );
+            assert!(suffix_accelerated.receipt().runtime_helper_required);
+            assert!(suffix_accelerated.module().required_runtime_symbol().is_some());
+        }
+    }
+
+    #[test]
+    fn complete_retained_nullable_and_fixed_width_spans_match_universal_reference() {
+        let target = Target::aarch64_macos();
+        let mut cases = vec![(
+            "[ab]*",
+            generated_byte_strings(b"abx", 5),
+        )];
+        let fixed_pattern = "[ab]cdefghij(?-u:.){8}";
+        let fixed_match = b"acdefghij12345678";
+        let mut fixed_sources = vec![
+            Vec::new(),
+            fixed_match.to_vec(),
+            [b"xx".as_slice(), fixed_match, b"yy".as_slice()].concat(),
+            b"acdefghij1234567".to_vec(),
+            b"xcdefghij12345678".to_vec(),
+        ];
+        let mut alternate = fixed_match.to_vec();
+        alternate[0] = b'b';
+        let last = alternate.len() - 1;
+        alternate[last] = 0xff;
+        fixed_sources.push(alternate);
+        cases.push((fixed_pattern, fixed_sources));
+
+        for (pattern, sources) in cases {
+            let retained = complete_forward_resource_fallback(
+                pattern,
+                OutputContract::Span,
+                target,
+            );
+            let reference = compile(
+                CompileRequest::new(pattern, target)
+                    .mode(CompileMode::Fast)
+                    .output(OutputContract::Span),
+            )
+            .expect("universal reference");
+            let mut retained_workspace = retained
+                .program()
+                .prepare_workspace()
+                .expect("retained workspace");
+            let mut reference_workspace = reference
+                .program()
+                .prepare_workspace()
+                .expect("reference workspace");
+            for source in sources {
+                for start in 0..=source.len() {
+                    for end in start..=source.len() {
+                        let window = SearchWindow::new(start, end);
+                        let expected = reference
+                            .program()
+                            .search_with_workspace(
+                                &source,
+                                window,
+                                &mut reference_workspace,
+                            )
+                            .expect("reference search");
+                        let actual = retained
+                            .program()
+                            .search_with_retained_partial_workspace(
+                                &source,
+                                window,
+                                &mut retained_workspace,
+                            )
+                            .expect("retained complete-forward search");
+                        assert_eq!(
+                            actual, expected,
+                            "{pattern:?} mismatch for {source:?} in {start}..{end}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    #[ignore = "links and executes complete retained-forward objects natively"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the opt-in native differential keeps object production and execution together"
+    )]
+    fn linked_aarch64_complete_retained_spans_match_portable_program() {
+        use std::{fmt::Write as _, fs, process::Command};
+
+        let target = Target::aarch64_macos()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .expect("ASIMD target");
+        let cases = [
+            ("[ab]*", b"xxabbaaxbb".as_slice()),
+            (
+                "[ab]cdefghij(?-u:.){8}",
+                b"xxacdefghij12345678yy".as_slice(),
+            ),
+        ];
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-complete-retained-forward-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("create linker fixture directory");
+        let mut source = String::from("#include <stdint.h>\n#include <stddef.h>\n");
+        let mut calls = String::from("int main(void){size_t r[2];uint32_t s;\n");
+        let mut objects = Vec::new();
+
+        for (case, (pattern, haystack)) in cases.iter().enumerate() {
+            let compiled = complete_forward_resource_fallback(
+                pattern,
+                OutputContract::Span,
+                target,
+            );
+            assert!(compiled.module().required_runtime_symbol().is_none());
+            let bytes = haystack
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            writeln!(source, "static const unsigned char h{case}[]={{{bytes}}};")
+                .expect("write fixture");
+            let symbol = compiled.module().entry_symbol();
+            writeln!(
+                source,
+                "extern uint32_t {symbol}(const unsigned char*,size_t,size_t,size_t,size_t*);"
+            )
+            .expect("write declaration");
+            let object = directory.join(format!("case{case}.o"));
+            fs::write(&object, compiled.object()).expect("write native object");
+            objects.push(object);
+
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let expected = compiled
+                        .search(haystack, SearchWindow::new(start, end))
+                        .expect("portable expected result");
+                    writeln!(
+                        calls,
+                        "r[0]=99;r[1]=99;s={symbol}(h{case},{},{start},{end},r);",
+                        haystack.len()
+                    )
+                    .expect("write native call");
+                    match expected {
+                        MatchResult::Span(Some((match_start, match_end))) => writeln!(
+                            calls,
+                            "if(s!=1||r[0]!={match_start}||r[1]!={match_end})return {};",
+                            case + 10
+                        )
+                        .expect("write match assertion"),
+                        MatchResult::Span(None) => writeln!(
+                            calls,
+                            "if(s!=0||r[0]!=0||r[1]!=0)return {};",
+                            case + 10
+                        )
+                        .expect("write no-match assertion"),
+                        other => panic!("unexpected Span result: {other:?}"),
+                    }
+                }
+            }
+        }
+        calls.push_str("return 0;}\n");
+        source.push_str(&calls);
+        let c_path = directory.join("complete_retained.c");
+        let executable = directory.join("complete_retained");
+        fs::write(&c_path, source).expect("write linker harness");
+        let status = Command::new("clang")
+            .arg("-O0")
+            .arg(&c_path)
+            .args(&objects)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .expect("invoke clang");
+        assert!(status.success());
+        let output = Command::new(&executable)
+            .output()
+            .expect("execute linked native harness");
+        assert!(
+            output.status.success(),
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn incomplete_retained_forward_remains_runtime_backed() {
+        let targets = [
+            Target::x86_64_linux(),
+            Target::x86_64_macos(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos(),
+        ];
+        for target in targets {
+            let limits = CompileLimitsV1 {
+                determinize: DeterminizeLimits {
+                    max_states: 8,
+                    ..DeterminizeLimits::default()
+                },
+                ..CompileLimitsV1::default()
+            };
+            let compiled = compile(
+                CompileRequest::new("a+Q|[b-c][a-b]{1,5}(?:x+|y+)", target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::SelectedEnd)
+                    .limits(limits),
+            )
+            .expect("incomplete retained fallback");
+            let partial = compiled
+                .program()
+                .partial_dfa_stats()
+                .expect("partial-DFA statistics")
+                .expect("incomplete retained table");
+            assert!(partial.complete_rows < partial.discovered_states);
+            assert!(partial.resume_frontiers > 0);
+            assert!(compiled.receipt().runtime_helper_required);
+            assert!(compiled.module().required_runtime_symbol().is_some());
         }
     }
 

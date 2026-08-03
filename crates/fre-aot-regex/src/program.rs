@@ -2613,19 +2613,43 @@ impl CompiledProgram {
 
     #[allow(dead_code, reason = "structural handoff for native code generation")]
     pub(crate) fn native_dfa_view(&self) -> Option<NativeProgramView<'_>> {
-        match &self.engine {
-            ProgramEngine::OrderedNfa => None,
-            ProgramEngine::OrderedDfa(machine) => Some(NativeProgramView {
-                output: self.output,
-                raw: &self.raw,
-                dfa: machine.native_view(),
-                anchored_prefix: &self.anchored_prefix,
-                anchored_suffix: &self.anchored_suffix,
-                required_literals: &self.required_literals,
-                exact_match_width: self.exact_match_width,
-                max_match_width: self.max_match_width(),
-            }),
-        }
+        let dfa = match &self.engine {
+            ProgramEngine::OrderedDfa(machine) => machine.native_view(),
+            ProgramEngine::OrderedNfa => {
+                // The retained portable entry runs these complete graph
+                // accelerators before consulting its DFA rows. Until native
+                // lowering carries the same proofs explicitly, keep this
+                // program on the runtime adapter rather than silently
+                // replacing a stronger route with a full-table scan.
+                if self.nfa_mandatory_suffix.is_some() || self.nfa_mandatory_cut.is_some() {
+                    return None;
+                }
+                let partial = self.partial_dfa()?;
+                let dfa = partial.native_complete_view()?;
+                // A complete retained forward table selects the exact Span
+                // endpoint, but it intentionally has no reverse table. Native
+                // lowering can recover the start without one only for the two
+                // existing complete proofs: an initial nullable selection or
+                // a graph-proved exact match width.
+                if self.output == OutputContract::Span
+                    && !dfa.initial_pending
+                    && self.exact_match_width.is_none()
+                {
+                    return None;
+                }
+                dfa
+            }
+        };
+        Some(NativeProgramView {
+            output: self.output,
+            raw: &self.raw,
+            dfa,
+            anchored_prefix: &self.anchored_prefix,
+            anchored_suffix: &self.anchored_suffix,
+            required_literals: &self.required_literals,
+            exact_match_width: self.exact_match_width,
+            max_match_width: self.max_match_width(),
+        })
     }
 
     /// Execute the complete target-neutral semantic program.
