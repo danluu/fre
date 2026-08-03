@@ -2,6 +2,10 @@ use fre_automata::{
     Automaton, CompileLimits as AutomatonCompileLimits, EdgeKind, Exists, K0Workspace, RawPlan,
     SearchLimits, SearchWindow as K0SearchWindow, SelectedEnd, Span, StateRole, WorkspaceLimits,
 };
+use fre_simd_kernels::{
+    ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier,
+    BYTE_SET_BLOCK_BYTES, BYTE_SET_WIDE_BLOCK_BYTES, ByteSet256, ByteSetClassifier,
+};
 use memchr::{memchr, memchr2, memchr3};
 use sha2::{Digest, Sha256};
 use std::fmt;
@@ -30,7 +34,8 @@ const PROGRAM_FORMAT_VERSION_V2: u32 = 2;
 const PROGRAM_FORMAT_VERSION_V3: u32 = 3;
 const PROGRAM_FORMAT_VERSION: u32 = PROGRAM_FORMAT_VERSION_V3;
 const PROGRAM_FLAG_NFA_MANDATORY_SUFFIX: u8 = 1 << 0;
-const PROGRAM_KNOWN_FLAGS: u8 = PROGRAM_FLAG_NFA_MANDATORY_SUFFIX;
+const PROGRAM_FLAG_NFA_MANDATORY_CUT: u8 = 1 << 1;
+const PROGRAM_KNOWN_FLAGS: u8 = PROGRAM_FLAG_NFA_MANDATORY_SUFFIX | PROGRAM_FLAG_NFA_MANDATORY_CUT;
 const DEFAULT_LINE_TERMINATOR: u8 = b'\n';
 /// Number of bytes that a runtime must read before it can discover the exact
 /// serialized artifact extent.
@@ -81,6 +86,20 @@ const NFA_SUFFIX_PRIMARY_HIT_DENOMINATOR: usize = 64;
 /// the ordinary executor without weakening the asymptotic bound.
 const NFA_SUFFIX_SCAN_ONLY_REVERSE_WORK_CREDIT: usize = 1_024;
 const NFA_SUFFIX_SCAN_ONLY_REVERSE_WORK_MULTIPLIER: usize = 2;
+/// A graph-wide byte cut must be substantially selective before its probe is
+/// placed in front of the ordinary ordered-NFA executor. For a uniformly
+/// distributed source, 64 members imply one hit every four bytes; broader
+/// sets cannot amortize even their short scalar admission probe. Real sources
+/// can still benefit from any narrower class that is absent from a window.
+const MAX_NFA_MANDATORY_CUT_CARDINALITY: u16 = 64;
+/// Because the cut is an extra pass, it must halve the strongest existing
+/// forward column's uniform expected hit rate. This prevents a marginally
+/// narrower interior class from displacing K0's already-vectorized filter.
+const NFA_MANDATORY_CUT_MIN_SELECTIVITY_GAIN: u16 = 2;
+/// Keep a common positive search out of vector setup. A miss through this
+/// short prefix earns the target-dispatched block classifier for the rest of
+/// the window.
+const NFA_MANDATORY_CUT_SCALAR_PREFIX_BYTES: usize = 8;
 
 /// Checked failure while reconstructing a stable AOT semantic program.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -737,6 +756,222 @@ impl NfaMandatorySuffix {
     }
 }
 
+/// Optional whole-window rejection filter proved by one mandatory consuming
+/// dominator in the productive Thompson graph.
+///
+/// Every Start-to-Accept graph path visits `root_state`. Its productive
+/// outgoing byte ranges therefore form a necessary set for every match. The
+/// retained required-literal layer is correlated and complete, so taking the
+/// first byte of every alternative reconstructs that necessary set even when
+/// later paths branch or cycle. Absence of every set member from a semantic
+/// search window is a complete no-match proof for every output contract. A
+/// hit proves nothing and immediately hands the original window to K0.
+#[derive(Clone, Debug)]
+struct NfaMandatoryCut {
+    root_state: u32,
+    cardinality: u16,
+    scanner: NfaMandatoryCutScanner,
+}
+
+#[derive(Clone, Debug)]
+enum NfaMandatoryCutScanner {
+    Small {
+        bytes: [u8; 3],
+        count: u8,
+    },
+    Ascii {
+        set: AsciiByteSet,
+        classifier: AsciiByteSetClassifier,
+    },
+    Full {
+        set: ByteSet256,
+        classifier: ByteSetClassifier,
+    },
+}
+
+impl NfaMandatoryCut {
+    fn from_candidate(candidate: &required_literals::RequiredInteriorCandidate) -> Option<Self> {
+        if candidate.depth() == 0 || candidate.literals().is_empty() {
+            return None;
+        }
+        let mut words = [0_u64; 4];
+        for literal in candidate.literals() {
+            let &byte = literal.as_bytes().first()?;
+            let index = usize::from(byte);
+            words[index / 64] |= 1_u64 << (index % 64);
+        }
+        let cardinality = words.iter().try_fold(0_u16, |total, word| {
+            total.checked_add(u16::try_from(word.count_ones()).ok()?)
+        })?;
+        if cardinality == 0 || cardinality > MAX_NFA_MANDATORY_CUT_CARDINALITY {
+            return None;
+        }
+
+        let scanner = if cardinality <= 3 {
+            let mut bytes = [0_u8; 3];
+            let mut count = 0usize;
+            for byte in 0_u16..=u16::from(u8::MAX) {
+                let byte = u8::try_from(byte).ok()?;
+                let index = usize::from(byte);
+                if words[index / 64] & (1_u64 << (index % 64)) == 0 {
+                    continue;
+                }
+                *bytes.get_mut(count)? = byte;
+                count = count.checked_add(1)?;
+            }
+            if count != usize::from(cardinality) {
+                return None;
+            }
+            NfaMandatoryCutScanner::Small {
+                bytes,
+                count: u8::try_from(count).ok()?,
+            }
+        } else if words[2] == 0 && words[3] == 0 {
+            let set = AsciiByteSet::from_words([words[0], words[1]]);
+            NfaMandatoryCutScanner::Ascii {
+                set,
+                classifier: AsciiByteSetClassifier::new(set),
+            }
+        } else {
+            let set = ByteSet256::from_words(words);
+            NfaMandatoryCutScanner::Full {
+                set,
+                classifier: ByteSetClassifier::new(set),
+            }
+        };
+        Some(Self {
+            root_state: candidate.root_state(),
+            cardinality,
+            scanner,
+        })
+    }
+
+    /// Stable target-neutral cost order. Smaller necessary sets dominate;
+    /// equal-cardinality sets prefer the lower-overhead scanner, then the
+    /// canonical state number and bitmap. No observed haystack or pattern
+    /// identity participates in this choice.
+    fn cost_key(&self) -> (u16, u8, u32, [u64; 4]) {
+        let (tier, words) = match &self.scanner {
+            NfaMandatoryCutScanner::Small { bytes, count } => {
+                let mut words = [0_u64; 4];
+                for &byte in &bytes[..usize::from(*count)] {
+                    let index = usize::from(byte);
+                    words[index / 64] |= 1_u64 << (index % 64);
+                }
+                (0, words)
+            }
+            NfaMandatoryCutScanner::Ascii { set, .. } => {
+                let ascii = set.words();
+                (1, [ascii[0], ascii[1], 0, 0])
+            }
+            NfaMandatoryCutScanner::Full { set, .. } => (2, set.words()),
+        };
+        (self.cardinality, tier, self.root_state, words)
+    }
+
+    fn has_member(&self, haystack: &[u8]) -> bool {
+        match &self.scanner {
+            NfaMandatoryCutScanner::Small { bytes, count: 1 } => {
+                memchr(bytes[0], haystack).is_some()
+            }
+            NfaMandatoryCutScanner::Small { bytes, count: 2 } => {
+                memchr2(bytes[0], bytes[1], haystack).is_some()
+            }
+            NfaMandatoryCutScanner::Small { bytes, count: 3 } => {
+                memchr3(bytes[0], bytes[1], bytes[2], haystack).is_some()
+            }
+            // A malformed internal count must fail open to the ordered NFA.
+            NfaMandatoryCutScanner::Small { .. } => true,
+            NfaMandatoryCutScanner::Ascii { set, classifier } => {
+                scan_ascii_cut(*set, classifier, haystack)
+            }
+            NfaMandatoryCutScanner::Full { set, classifier } => {
+                scan_full_cut(*set, classifier, haystack)
+            }
+        }
+    }
+}
+
+fn scan_ascii_cut(set: AsciiByteSet, classifier: &AsciiByteSetClassifier, haystack: &[u8]) -> bool {
+    let prefix_end = haystack.len().min(NFA_MANDATORY_CUT_SCALAR_PREFIX_BYTES);
+    if haystack[..prefix_end]
+        .iter()
+        .copied()
+        .any(|byte| set.contains(byte))
+    {
+        return true;
+    }
+    let mut position = prefix_end;
+    while haystack.len().saturating_sub(position) >= ASCII_WIDE_BYTES {
+        let end = position
+            .checked_add(ASCII_WIDE_BYTES)
+            .expect("remaining source proves the wide ASCII cut extent");
+        let block: &[u8; ASCII_WIDE_BYTES] = haystack[position..end]
+            .try_into()
+            .expect("checked ASCII cut block width");
+        if classifier.classify_32(block).member_mask() != 0 {
+            return true;
+        }
+        position = end;
+    }
+    if haystack.len().saturating_sub(position) >= ASCII_NARROW_BYTES {
+        let end = position
+            .checked_add(ASCII_NARROW_BYTES)
+            .expect("remaining source proves the narrow ASCII cut extent");
+        let block: &[u8; ASCII_NARROW_BYTES] = haystack[position..end]
+            .try_into()
+            .expect("checked narrow ASCII cut block width");
+        if classifier.classify_16(block).member_mask() != 0 {
+            return true;
+        }
+        position = end;
+    }
+    haystack[position..]
+        .iter()
+        .copied()
+        .any(|byte| set.contains(byte))
+}
+
+fn scan_full_cut(set: ByteSet256, classifier: &ByteSetClassifier, haystack: &[u8]) -> bool {
+    let prefix_end = haystack.len().min(NFA_MANDATORY_CUT_SCALAR_PREFIX_BYTES);
+    if haystack[..prefix_end]
+        .iter()
+        .copied()
+        .any(|byte| set.contains(byte))
+    {
+        return true;
+    }
+    let mut position = prefix_end;
+    while haystack.len().saturating_sub(position) >= BYTE_SET_WIDE_BLOCK_BYTES {
+        let end = position
+            .checked_add(BYTE_SET_WIDE_BLOCK_BYTES)
+            .expect("remaining source proves the wide full-byte cut extent");
+        let block: &[u8; BYTE_SET_WIDE_BLOCK_BYTES] = haystack[position..end]
+            .try_into()
+            .expect("checked full-byte cut block width");
+        if classifier.classify_32(block).member_mask() != 0 {
+            return true;
+        }
+        position = end;
+    }
+    if haystack.len().saturating_sub(position) >= BYTE_SET_BLOCK_BYTES {
+        let end = position
+            .checked_add(BYTE_SET_BLOCK_BYTES)
+            .expect("remaining source proves the narrow full-byte cut extent");
+        let block: &[u8; BYTE_SET_BLOCK_BYTES] = haystack[position..end]
+            .try_into()
+            .expect("checked narrow full-byte cut block width");
+        if classifier.classify_16(block).member_mask() != 0 {
+            return true;
+        }
+        position = end;
+    }
+    haystack[position..]
+        .iter()
+        .copied()
+        .any(|byte| set.contains(byte))
+}
+
 #[derive(Clone, Debug)]
 #[allow(
     clippy::large_enum_variant,
@@ -767,6 +1002,44 @@ fn derive_nfa_suffix(
     NfaMandatorySuffix::derive(raw, prefix, suffix, maximum_width.width)
 }
 
+fn derive_nfa_mandatory_cut(
+    prefix: &AnchoredPrefix,
+    required_literals: &RequiredLiterals,
+    engine: &ProgramEngine,
+    mandatory_suffix_present: bool,
+    enabled: bool,
+) -> Option<NfaMandatoryCut> {
+    if !enabled || mandatory_suffix_present || !matches!(engine, ProgramEngine::OrderedNfa) {
+        return None;
+    }
+
+    // K0 already scans its strongest graph-proved forward column. The
+    // whole-window cut is admitted only when it is strictly more selective,
+    // so positive/dense sources do not pay for a redundant pre-pass. A
+    // mandatory suffix is an effective existing reverse filter and excludes
+    // this sidecar above; an unmaterialized suffix is not treated as free.
+    let best_forward_cardinality = prefix
+        .sets()
+        .iter()
+        .copied()
+        .map(AnchoredByteSet::cardinality)
+        .min()
+        .unwrap_or(256);
+
+    required_literals
+        .interior()
+        .candidates()
+        .iter()
+        .filter_map(NfaMandatoryCut::from_candidate)
+        .filter(|candidate| {
+            candidate
+                .cardinality
+                .saturating_mul(NFA_MANDATORY_CUT_MIN_SELECTIVITY_GAIN)
+                <= best_forward_cardinality
+        })
+        .min_by_key(NfaMandatoryCut::cost_key)
+}
+
 /// General capture-free AOT semantic program.
 ///
 /// The validated automaton is deliberately retained for every route. In fast
@@ -795,6 +1068,7 @@ pub struct CompiledProgram {
     exact_match_width: Option<usize>,
     max_match_width: MaxMatchWidthStats,
     nfa_mandatory_suffix: Option<NfaMandatorySuffix>,
+    nfa_mandatory_cut: Option<NfaMandatoryCut>,
 }
 
 /// Reusable, allocation-free execution storage for one semantic program.
@@ -944,6 +1218,13 @@ impl CompiledProgram {
             &engine,
             mode == CompileMode::Optimizing,
         );
+        let nfa_mandatory_cut = derive_nfa_mandatory_cut(
+            &anchored_prefix,
+            &required_literals,
+            &engine,
+            nfa_mandatory_suffix.is_some(),
+            mode == CompileMode::Optimizing && context_dfa.is_none(),
+        );
         Ok(Self {
             raw,
             automaton,
@@ -961,6 +1242,7 @@ impl CompiledProgram {
             exact_match_width,
             max_match_width,
             nfa_mandatory_suffix,
+            nfa_mandatory_cut,
         })
     }
 
@@ -987,11 +1269,14 @@ impl CompiledProgram {
     }
 
     const fn program_flags(&self) -> u8 {
+        let mut flags = 0;
         if self.nfa_mandatory_suffix.is_some() {
-            PROGRAM_FLAG_NFA_MANDATORY_SUFFIX
-        } else {
-            0
+            flags |= PROGRAM_FLAG_NFA_MANDATORY_SUFFIX;
         }
+        if self.nfa_mandatory_cut.is_some() {
+            flags |= PROGRAM_FLAG_NFA_MANDATORY_CUT;
+        }
+        flags
     }
 
     /// Return the structural reason for the selected engine when provenance is
@@ -1296,7 +1581,30 @@ impl CompiledProgram {
         if let Some(found) = self.search_nfa_with_mandatory_suffix(haystack, window, workspace)? {
             return Ok(found);
         }
+        if let Some(found) = self.search_nfa_with_mandatory_cut(haystack, window) {
+            return Ok(found);
+        }
         self.search_nfa_unaccelerated(haystack, window, workspace)
+    }
+
+    /// Try a whole-window rejection through one graph-proved mandatory
+    /// consuming cut. A member hit is deliberately inconclusive and leaves
+    /// the original window untouched for the ordered executor.
+    fn search_nfa_with_mandatory_cut(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+    ) -> Option<MatchResult> {
+        let accelerator = self.nfa_mandatory_cut.as_ref()?;
+        let source = haystack.get(window.start..window.end)?;
+        if accelerator.has_member(source) {
+            return None;
+        }
+        Some(match self.output {
+            OutputContract::Exists => MatchResult::Exists(false),
+            OutputContract::SelectedEnd => MatchResult::SelectedEnd(None),
+            OutputContract::Span => MatchResult::Span(None),
+        })
     }
 
     /// Try the graph-derived mandatory-suffix route. `None` means this program
@@ -1688,9 +1996,17 @@ impl CompiledProgram {
         let line_terminator = header_line_terminator(header, version)?;
         let program_flags = header_program_flags(header, version)?;
         let mandatory_suffix_enabled = program_flags & PROGRAM_FLAG_NFA_MANDATORY_SUFFIX != 0;
-        if mandatory_suffix_enabled && engine_kind != EngineKind::OrderedNfa {
+        let mandatory_cut_enabled = program_flags & PROGRAM_FLAG_NFA_MANDATORY_CUT != 0;
+        if (mandatory_suffix_enabled || mandatory_cut_enabled)
+            && engine_kind != EngineKind::OrderedNfa
+        {
             return Err(ProgramFormatError::Malformed(
-                "mandatory-suffix flag requires an ordered-NFA engine",
+                "mandatory NFA sidecar flag requires an ordered-NFA engine",
+            ));
+        }
+        if mandatory_suffix_enabled && mandatory_cut_enabled {
+            return Err(ProgramFormatError::Malformed(
+                "mandatory suffix and cut flags are mutually exclusive",
             ));
         }
         let mut reader = ProgramReader::new(
@@ -1748,7 +2064,7 @@ impl CompiledProgram {
         let identity = automaton_digest(&raw, line_terminator);
         let anchored_prefix = derive_anchored_prefix(&raw);
         let anchored_suffix = derive_anchored_suffix(&raw);
-        let required_literals = if engine_kind == EngineKind::OrderedDfa {
+        let required_literals = if engine_kind == EngineKind::OrderedDfa || mandatory_cut_enabled {
             required_literals::derive(&raw)
         } else {
             RequiredLiterals::unavailable()
@@ -1765,6 +2081,18 @@ impl CompiledProgram {
         if mandatory_suffix_enabled != nfa_mandatory_suffix.is_some() {
             return Err(ProgramFormatError::Malformed(
                 "mandatory-suffix flag is incompatible with the embedded graph",
+            ));
+        }
+        let nfa_mandatory_cut = derive_nfa_mandatory_cut(
+            &anchored_prefix,
+            &required_literals,
+            &engine,
+            nfa_mandatory_suffix.is_some(),
+            mandatory_cut_enabled,
+        );
+        if mandatory_cut_enabled != nfa_mandatory_cut.is_some() {
+            return Err(ProgramFormatError::Malformed(
+                "mandatory-cut flag is incompatible with the embedded graph",
             ));
         }
         let program = Self {
@@ -1784,6 +2112,7 @@ impl CompiledProgram {
             exact_match_width,
             max_match_width,
             nfa_mandatory_suffix,
+            nfa_mandatory_cut,
         };
         if program
             .serialized_len()
@@ -4113,6 +4442,332 @@ mod tests {
     }
 
     #[test]
+    fn resource_fallback_mandatory_cut_is_structural_and_round_trips() {
+        let fallback_limits = DeterminizeLimits {
+            max_states: 0,
+            ..DeterminizeLimits::default()
+        };
+        let pattern = "(?:x|yz)7[A-Za-z]+";
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let compiled = program(pattern, output, CompileMode::Optimizing, fallback_limits);
+            assert_eq!(compiled.engine_kind(), EngineKind::OrderedNfa);
+            assert!(compiled.nfa_mandatory_suffix.is_none());
+            let cut = compiled
+                .nfa_mandatory_cut
+                .as_ref()
+                .expect("selective mandatory interior root should construct a cut");
+            assert_eq!(cut.cardinality, 1);
+            assert!(cut.has_member(b"no 7 here"));
+            assert!(!cut.has_member(b"cut-free window"));
+
+            let bytes = compiled.serialize().expect("serialize cut fallback");
+            assert_eq!(bytes[15], PROGRAM_FLAG_NFA_MANDATORY_CUT);
+            let restored = CompiledProgram::deserialize(&bytes).expect("restore cut fallback");
+            assert!(restored.nfa_mandatory_suffix.is_none());
+            assert!(restored.nfa_mandatory_cut.is_some());
+            assert_eq!(restored.serialize().unwrap(), bytes);
+
+            let fast = program(
+                pattern,
+                output,
+                CompileMode::Fast,
+                DeterminizeLimits::default(),
+            );
+            assert!(fast.nfa_mandatory_cut.is_none());
+            assert_eq!(fast.serialize().unwrap()[15], 0);
+        }
+
+        let nullable = program(
+            "(?:|(?:x|yz)7[A-Za-z]+)",
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            fallback_limits,
+        );
+        assert!(nullable.nfa_mandatory_cut.is_none());
+
+        let marginal = program(
+            "[ABC]+[QR][0-9]+",
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            fallback_limits,
+        );
+        assert!(
+            marginal.nfa_mandatory_cut.is_none(),
+            "an extra pass requires at least a twofold selectivity gain"
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "small generated sources, every window, all contracts, wire reconstruction, cycles, assertions, and scanner tiers form one differential proof"
+    )]
+    fn mandatory_cut_matches_ordered_nfa_for_every_generated_window() {
+        let ordinary_fallback = DeterminizeLimits {
+            max_states: 0,
+            ..DeterminizeLimits::default()
+        };
+        let context_fallback = DeterminizeLimits {
+            max_states: 0,
+            ..DeterminizeLimits::default()
+        };
+        let cases: &[(&str, &[u8], DeterminizeLimits, u16)] = &[
+            ("[A-Za-z]+7[0-9]+", b"Aa70!", ordinary_fallback, 1),
+            ("[A-Za-z]+[QWER][0-9]+", b"AaQW0!", ordinary_fallback, 4),
+            (
+                r"(?-u:[A-Za-z]+[\x80-\x83][0-9]+)",
+                &[b'A', b'a', 0x80, 0x83, b'0', b'!'],
+                ordinary_fallback,
+                4,
+            ),
+            ("(?:x|yz)7[A-Za-z]+", b"xyz7A!", ordinary_fallback, 1),
+            ("[ab]*(?:x|yz)7[A-Za-z]+", b"abxyz7A", ordinary_fallback, 1),
+            (
+                "(?:[A-Z]|[a-z][0-9])[QWER][0-9]+",
+                b"Aa0QW9!",
+                ordinary_fallback,
+                4,
+            ),
+            (
+                r"(?-u:(?:[A-Z]|[a-z][0-9])[\x80-\x83][0-9]+)",
+                &[b'A', b'a', b'0', 0x80, 0x83, b'9', 0xff],
+                ordinary_fallback,
+                4,
+            ),
+            (
+                r"(?m:(?:^[A-Z]|[a-z][0-9]))7[A-Za-z]+",
+                b"Aa07Z\n!",
+                context_fallback,
+                1,
+            ),
+        ];
+
+        for &(pattern, alphabet, limits, expected_cardinality) in cases {
+            let haystacks = generated_byte_strings(alphabet, 3);
+            for output in [
+                OutputContract::Exists,
+                OutputContract::SelectedEnd,
+                OutputContract::Span,
+            ] {
+                let accelerated = program(pattern, output, CompileMode::Optimizing, limits);
+                assert_eq!(
+                    accelerated.engine_kind(),
+                    EngineKind::OrderedNfa,
+                    "{pattern:?}"
+                );
+                assert!(accelerated.nfa_mandatory_suffix.is_none(), "{pattern:?}");
+                assert_eq!(
+                    accelerated
+                        .nfa_mandatory_cut
+                        .as_ref()
+                        .unwrap_or_else(|| panic!("missing cut for {pattern:?}"))
+                        .cardinality,
+                    expected_cardinality,
+                    "{pattern:?}"
+                );
+                let restored = CompiledProgram::deserialize(
+                    &accelerated.serialize().expect("serialize generated cut"),
+                )
+                .expect("restore generated cut");
+                let mut reference = accelerated.clone();
+                reference.nfa_mandatory_cut = None;
+                let mut accelerated_workspace = accelerated.prepare_workspace().unwrap();
+                let mut restored_workspace = restored.prepare_workspace().unwrap();
+                let mut reference_workspace = reference.prepare_workspace().unwrap();
+
+                for haystack in &haystacks {
+                    for start in 0..=haystack.len() {
+                        for end in start..=haystack.len() {
+                            let window = SearchWindow::new(start, end);
+                            let expected = reference
+                                .search_with_workspace(haystack, window, &mut reference_workspace)
+                                .unwrap();
+                            assert_eq!(
+                                accelerated
+                                    .search_with_workspace(
+                                        haystack,
+                                        window,
+                                        &mut accelerated_workspace,
+                                    )
+                                    .unwrap(),
+                                expected,
+                                "fresh {pattern:?}/{output:?}/{haystack:?}/{start}..{end}"
+                            );
+                            assert_eq!(
+                                restored
+                                    .search_with_workspace(
+                                        haystack,
+                                        window,
+                                        &mut restored_workspace,
+                                    )
+                                    .unwrap(),
+                                expected,
+                                "wire {pattern:?}/{output:?}/{haystack:?}/{start}..{end}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the explicit adversarial graph and every-window differential form one proof"
+    )]
+    fn mandatory_cut_handles_consuming_cycles_and_multiple_accepts() {
+        type TestEdge = (u32, EdgeKind, u8, u8);
+        let epsilon = |target| (target, EdgeKind::Epsilon, 0, 0);
+        let byte = |target, start, end| (target, EdgeKind::ByteRange, start, end);
+        let rows: Vec<Vec<TestEdge>> = vec![
+            vec![epsilon(1), epsilon(2), epsilon(7)],
+            vec![byte(4, b'x', b'x')],
+            vec![byte(3, b'y', b'y')],
+            vec![byte(4, b'z', b'z')],
+            vec![byte(5, b'7', b'7')],
+            vec![
+                byte(5, b'A', b'Z'),
+                byte(6, b'A', b'Z'),
+                byte(5, b'a', b'z'),
+                byte(8, b'a', b'z'),
+            ],
+            vec![],
+            vec![byte(0, b'p', b'p')],
+            vec![],
+        ];
+        let roles = vec![
+            StateRole::Split,
+            StateRole::Consume,
+            StateRole::Consume,
+            StateRole::Consume,
+            StateRole::Consume,
+            StateRole::Consume,
+            StateRole::Accept,
+            StateRole::Consume,
+            StateRole::Accept,
+        ];
+        let mut edge_offsets = Vec::with_capacity(rows.len().saturating_add(1));
+        let mut edge_targets = Vec::new();
+        let mut edge_kinds = Vec::new();
+        let mut byte_starts = Vec::new();
+        let mut byte_ends = Vec::new();
+        edge_offsets.push(0);
+        for row in rows {
+            for (target, kind, start, end) in row {
+                edge_targets.push(target);
+                edge_kinds.push(kind);
+                byte_starts.push(start);
+                byte_ends.push(end);
+            }
+            edge_offsets.push(u32::try_from(edge_targets.len()).expect("test edge count"));
+        }
+        let raw = RawPlan {
+            start: 0,
+            roles,
+            edge_offsets,
+            edge_targets,
+            edge_kinds,
+            byte_starts,
+            byte_ends,
+        };
+        let automaton = Automaton::from_raw(raw.clone(), CompileLimits::default())
+            .expect("cyclic multi-accept graph validates");
+        let accelerated = CompiledProgram::build(
+            raw,
+            automaton,
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        )
+        .expect("compile cyclic multi-accept fallback");
+        assert!(accelerated.nfa_mandatory_suffix.is_none());
+        assert_eq!(
+            accelerated
+                .nfa_mandatory_cut
+                .as_ref()
+                .expect("common consuming dominator")
+                .cardinality,
+            1
+        );
+        let restored = CompiledProgram::deserialize(&accelerated.serialize().unwrap()).unwrap();
+        let mut reference = accelerated.clone();
+        reference.nfa_mandatory_cut = None;
+        let mut accelerated_workspace = accelerated.prepare_workspace().unwrap();
+        let mut restored_workspace = restored.prepare_workspace().unwrap();
+        let mut reference_workspace = reference.prepare_workspace().unwrap();
+        for haystack in generated_byte_strings(b"pxyz7Aa", 4) {
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let window = SearchWindow::new(start, end);
+                    let expected = reference
+                        .search_with_workspace(&haystack, window, &mut reference_workspace)
+                        .unwrap();
+                    assert_eq!(
+                        accelerated
+                            .search_with_workspace(&haystack, window, &mut accelerated_workspace,)
+                            .unwrap(),
+                        expected
+                    );
+                    assert_eq!(
+                        restored
+                            .search_with_workspace(&haystack, window, &mut restored_workspace)
+                            .unwrap(),
+                        expected
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mandatory_cut_classifiers_cover_every_block_boundary() {
+        let limits = DeterminizeLimits {
+            max_states: 0,
+            ..DeterminizeLimits::default()
+        };
+        for (pattern, member, ascii) in [
+            ("(?:[A-Z]|[a-z][0-9])[QWER][0-9]+", b'Q', true),
+            (r"(?-u:(?:[A-Z]|[a-z][0-9])[\x80-\x83][0-9]+)", 0x80, false),
+        ] {
+            let compiled = program(
+                pattern,
+                OutputContract::Exists,
+                CompileMode::Optimizing,
+                limits,
+            );
+            let cut = compiled.nfa_mandatory_cut.as_ref().unwrap();
+            assert_eq!(
+                matches!(cut.scanner, NfaMandatoryCutScanner::Ascii { .. }),
+                ascii
+            );
+            assert_eq!(
+                matches!(cut.scanner, NfaMandatoryCutScanner::Full { .. }),
+                !ascii
+            );
+            for length in 0..=96 {
+                let miss = vec![b'!'; length];
+                assert!(!cut.has_member(&miss), "{pattern:?}/{length}");
+                for position in 0..length {
+                    let mut hit = miss.clone();
+                    hit[position] = member;
+                    assert!(
+                        cut.has_member(&hit),
+                        "{pattern:?}/{length}/hit-at-{position}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn mandatory_suffix_acceleration_matches_ordered_nfa_for_every_small_window() {
         fn extend_haystacks(
             haystacks: &mut Vec<Vec<u8>>,
@@ -5177,7 +5832,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_mandatory_suffix_flags_are_strict_and_engine_scoped() {
+    fn v3_mandatory_nfa_sidecar_flags_are_strict_and_engine_scoped() {
         let fallback = program(
             "(?:a|bb)q[xz]",
             OutputContract::Span,
@@ -5190,9 +5845,37 @@ mod tests {
         let bytes = fallback.serialize().unwrap();
         assert_eq!(bytes[15], PROGRAM_FLAG_NFA_MANDATORY_SUFFIX);
 
-        let mut unknown = bytes;
+        let mut unknown = bytes.clone();
         unknown[15] |= 1 << 7;
         assert!(CompiledProgram::deserialize(&unknown).is_err());
+
+        let cut = program(
+            "(?:x|yz)7[A-Za-z]+",
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        let cut_bytes = cut.serialize().unwrap();
+        assert_eq!(cut_bytes[15], PROGRAM_FLAG_NFA_MANDATORY_CUT);
+        assert!(CompiledProgram::deserialize(&cut_bytes).is_ok());
+
+        let mut contradictory = cut_bytes.clone();
+        contradictory[15] = PROGRAM_FLAG_NFA_MANDATORY_SUFFIX | PROGRAM_FLAG_NFA_MANDATORY_CUT;
+        assert!(CompiledProgram::deserialize(&contradictory).is_err());
+
+        let mut incompatible = program(
+            "a*",
+            OutputContract::Span,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        )
+        .serialize()
+        .unwrap();
+        incompatible[15] = PROGRAM_FLAG_NFA_MANDATORY_CUT;
+        assert!(CompiledProgram::deserialize(&incompatible).is_err());
 
         let unbounded = program(
             "(?:ab|c)*q[xz]",
@@ -5216,6 +5899,8 @@ mod tests {
         assert_eq!(dfa.engine_kind(), EngineKind::OrderedDfa);
         let mut wrong_engine = dfa.serialize().unwrap();
         wrong_engine[15] = PROGRAM_FLAG_NFA_MANDATORY_SUFFIX;
+        assert!(CompiledProgram::deserialize(&wrong_engine).is_err());
+        wrong_engine[15] = PROGRAM_FLAG_NFA_MANDATORY_CUT;
         assert!(CompiledProgram::deserialize(&wrong_engine).is_err());
     }
 

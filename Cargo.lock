@@ -222,6 +222,7 @@ version = "0.1.0"
 dependencies = [
  "fre-automata",
  "fre-lower",
+ "fre-simd-kernels",
  "fre-syntax",
  "memchr",
  "regex 1.13.1",
