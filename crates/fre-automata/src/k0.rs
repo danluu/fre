@@ -3303,6 +3303,17 @@ fn execute_lazy_loop(
     debug_assert!(workspace.lazy.initialized);
     debug_assert!(!workspace.lazy.declined);
 
+    // Bind the direct executor to the already-validated window ceiling once.
+    // Subsequent source positions are monotone and tested against that same
+    // ceiling before indexing, so release code can share the loop-end and
+    // slice-bounds proof instead of retaining the full-haystack bound as a
+    // second per-byte comparison.
+    let haystack = haystack
+        .get(..window.end())
+        .ok_or(SearchError::InternalInvariant {
+            detail: "lazy DFA window exceeds the validated haystack",
+        })?;
+
     let (initial_pending, initial_terminal) = match workspace.lazy.initial_kind {
         LazyInitialKind::Positive => (false, false),
         LazyInitialKind::NullablePrefix => (true, false),
@@ -3389,11 +3400,16 @@ fn execute_lazy_loop(
             }
             entered = true;
         }
-        if position == window.end() {
-            return Ok(Some((
-                pending_end.map(|end| MatchSpan::new(window.start(), end)),
-                boundaries,
-            )));
+        if position >= haystack.len() {
+            if position == haystack.len() {
+                return Ok(Some((
+                    pending_end.map(|end| MatchSpan::new(window.start(), end)),
+                    boundaries,
+                )));
+            }
+            return Err(SearchError::InternalInvariant {
+                detail: "lazy DFA source position exceeded the validated window",
+            });
         }
 
         // Charge the source step before indexing the validated window. A
@@ -3401,11 +3417,11 @@ fn execute_lazy_loop(
         // row lookup; a cold transition additionally charges its closure and
         // optional learning work.
         meter.charge(1, position)?;
-        let byte = *haystack
-            .get(position)
-            .ok_or(SearchError::InternalInvariant {
-                detail: "lazy DFA source position exceeded the validated window",
-            })?;
+        #[allow(
+            clippy::indexing_slicing,
+            reason = "the immediately dominating window-ceiling check proves this source index"
+        )]
+        let byte = haystack[position];
         let transition = match state {
             LazyState::Cached(cached) => {
                 let cell = workspace.lazy.direct_cell(cached, byte)?;
