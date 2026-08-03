@@ -113,6 +113,7 @@ OPTIONS:
   --family NAME          Measure only this structural family.
   --pattern-name NAME    Measure only this generated pattern name.
   --route NAME           Measure only direct_dfa, direct_context_dfa,
+                         direct_resource_fallback,
                          prepared_runtime_assertion, or
                          prepared_runtime_resource_fallback.
   --measurement-order O  Timed engine order: upstream-native (default) or
@@ -286,6 +287,7 @@ impl Config {
                 route,
                 "direct_dfa"
                     | "direct_context_dfa"
+                    | "direct_resource_fallback"
                     | "prepared_runtime_assertion"
                     | "prepared_runtime_resource_fallback"
             )
@@ -1782,7 +1784,11 @@ impl CompiledShape {
             EngineSelectionReason::CompleteContextDfa => "direct_context_dfa",
             EngineSelectionReason::ContextAssertions => "prepared_runtime_assertion",
             EngineSelectionReason::DeterminizationResourceLimit => {
-                "prepared_runtime_resource_fallback"
+                if self.runtime_program.is_none() {
+                    "direct_resource_fallback"
+                } else {
+                    "prepared_runtime_resource_fallback"
+                }
             }
             EngineSelectionReason::FastMode => "unexpected_fast_mode",
         }
@@ -1957,7 +1963,8 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
                 .module()
                 .required_runtime_program()
                 .map(|(symbol, bytes)| (symbol.to_owned(), bytes));
-            if force_runtime_fallback && runtime_program.is_none() {
+            let exact_product = aot.program().has_nfa_exact_product();
+            if force_ordinary_fallback && runtime_program.is_none() && !exact_product {
                 return Err(format!(
                     "{} forced resource fallback did not retain a runtime program",
                     spec.name
@@ -1977,22 +1984,22 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
                     spec.name
                 ));
             }
+            let self_contained_engine = matches!(
+                aot.receipt().engine,
+                EngineKind::OrderedDfa | EngineKind::OrderedContextDfa
+            ) || exact_product && aot.receipt().engine == EngineKind::OrderedNfa;
             if runtime_program.is_none()
-                && (aot.module().required_runtime_symbol().is_some()
-                    || !matches!(
-                        aot.receipt().engine,
-                        EngineKind::OrderedDfa | EngineKind::OrderedContextDfa
-                    ))
+                && (aot.module().required_runtime_symbol().is_some() || !self_contained_engine)
             {
                 return Err(format!(
-                    "{} did not compile to a self-contained ordered DFA",
+                    "{} did not compile to a self-contained native engine",
                     spec.name
                 ));
             }
             let partial_dfa = retained_partial_stats(&aot)?;
             let fallback_artifact_kind = if partial_dfa.is_some() {
                 "retained_partial"
-            } else if aot.program().has_nfa_exact_product() {
+            } else if exact_product {
                 "exact_product"
             } else if has_context_assertions {
                 "contextual"
@@ -3818,6 +3825,38 @@ mod tests {
             .find("measure_one(&scenarios[index])")
             .expect("native timed phase");
         assert!(prepare < ready && ready < wait && wait < measure);
+    }
+
+    #[test]
+    fn direct_resource_fallback_is_classified_from_the_emitted_object_abi() {
+        let target = Target::x86_64_linux();
+        let mut limits = CompileLimitsV1::default();
+        limits.determinize.max_states = 0;
+        let aot = compile(
+            CompileRequest::new("[ab]x", target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span)
+                .limits(limits),
+        )
+        .expect("compile exact-product resource fallback");
+        assert_eq!(aot.receipt().engine, EngineKind::OrderedNfa);
+        assert!(aot.program().has_nfa_exact_product());
+        assert!(aot.module().required_runtime_program().is_none());
+        assert!(aot.module().required_runtime_symbol().is_none());
+
+        let shape = CompiledShape {
+            spec: grammar_patterns(&flat_grammar_config(Some(UNSEEN_TEST_SEED)))
+                .into_iter()
+                .next()
+                .expect("grammar shape"),
+            upstream: Regex::new("[ab]x").unwrap(),
+            aot,
+            runtime_program: None,
+            partial_dfa: None,
+            fallback_artifact_kind: "exact_product",
+            retained_limit_derivation: "legacy_zero_state",
+        };
+        assert_eq!(shape.route(), "direct_resource_fallback");
     }
 
     #[test]
