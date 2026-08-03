@@ -637,14 +637,29 @@ fn seek_range(
         position = block_end;
     }
 
-    while position < end {
-        meter.charge(1)?;
-        if (haystack[position].wrapping_sub(origin) <= maximum_delta) != inverted {
-            return Ok(Some(position));
-        }
-        position += 1;
+    let source = &haystack[position..end];
+    let admitted = source
+        .len()
+        .min(usize::try_from(meter.remaining()).unwrap_or(usize::MAX));
+    let relative = source[..admitted]
+        .iter()
+        .position(|&byte| (byte.wrapping_sub(origin) <= maximum_delta) != inverted);
+    let scanned = relative.map_or(admitted, |offset| {
+        offset
+            .checked_add(1)
+            .expect("a hit in the admitted range tail advances once")
+    });
+    meter.charge_admitted(scanned);
+    if let Some(relative) = relative {
+        return Ok(Some(position + relative));
     }
-    Ok(None)
+    if admitted == source.len() {
+        return Ok(None);
+    }
+    Err(SearchError::WorkLimit {
+        needed: meter.consumed.saturating_add(1),
+        limit: meter.limit,
+    })
 }
 
 fn seek_classified(
@@ -683,14 +698,30 @@ fn seek_classified(
         position = block_end;
     }
 
-    while position < end {
-        meter.charge(1)?;
-        if classifier.set().contains(haystack[position]) != inverted {
-            return Ok(Some(position));
-        }
-        position += 1;
+    let source = &haystack[position..end];
+    let admitted = source
+        .len()
+        .min(usize::try_from(meter.remaining()).unwrap_or(usize::MAX));
+    let set = classifier.set();
+    let relative = source[..admitted]
+        .iter()
+        .position(|&byte| set.contains(byte) != inverted);
+    let scanned = relative.map_or(admitted, |offset| {
+        offset
+            .checked_add(1)
+            .expect("a hit in the admitted classified tail advances once")
+    });
+    meter.charge_admitted(scanned);
+    if let Some(relative) = relative {
+        return Ok(Some(position + relative));
     }
-    Ok(None)
+    if admitted == source.len() {
+        return Ok(None);
+    }
+    Err(SearchError::WorkLimit {
+        needed: meter.consumed.saturating_add(1),
+        limit: meter.limit,
+    })
 }
 
 pub(super) fn validate_window(haystack: &[u8], window: SearchWindow) -> Result<(), SearchError> {
@@ -818,6 +849,7 @@ mod tests {
         PortablePlan, PortableTextBuilder, SearchAccounting, SearchError as FacadeSearchError,
         SearchLimits, SearchWindow,
     };
+    use fre_kernels::{ByteSet256, ByteSetClassifier};
 
     fn build(pattern: &str) -> crate::PortableRegex {
         PortableBuilder::new(pattern)
@@ -978,6 +1010,101 @@ mod tests {
             Ok(None)
         );
         assert_eq!(absent.consumed(), 40);
+    }
+
+    #[test]
+    fn scalar_set_seek_tails_batch_accounting_without_changing_limits() {
+        fn assert_contract(
+            leaf: SetSeek,
+            classifier: Option<&ByteSetClassifier>,
+            haystack: &[u8],
+            absent_byte: u8,
+        ) {
+            let mut exact = WorkMeter::new(13);
+            assert_eq!(
+                leaf.seek(haystack, 0, haystack.len(), &mut exact, classifier),
+                Ok(Some(12))
+            );
+            assert_eq!(exact.consumed(), 13);
+
+            let mut one_below = WorkMeter::new(12);
+            assert_eq!(
+                leaf.seek(haystack, 0, haystack.len(), &mut one_below, classifier),
+                Err(Error::WorkLimit {
+                    needed: 13,
+                    limit: 12,
+                })
+            );
+            assert_eq!(one_below.consumed(), 12);
+
+            let mut absent_haystack = haystack.to_vec();
+            absent_haystack[12] = absent_byte;
+            let mut absent = WorkMeter::new(15);
+            assert_eq!(
+                leaf.seek(
+                    &absent_haystack,
+                    0,
+                    absent_haystack.len(),
+                    &mut absent,
+                    classifier,
+                ),
+                Ok(None)
+            );
+            assert_eq!(absent.consumed(), 15);
+
+            let mut absent_one_below = WorkMeter::new(14);
+            assert_eq!(
+                leaf.seek(
+                    &absent_haystack,
+                    0,
+                    absent_haystack.len(),
+                    &mut absent_one_below,
+                    classifier,
+                ),
+                Err(Error::WorkLimit {
+                    needed: 15,
+                    limit: 14,
+                })
+            );
+            assert_eq!(absent_one_below.consumed(), 14);
+        }
+
+        let range = SetSeek::build(inclusive_words(b'A', b'F'), 6, false);
+        let mut range_haystack = [b'.'; 15];
+        range_haystack[12] = b'C';
+        assert_contract(range, None, &range_haystack, b'.');
+
+        let inverted_range = SetSeek::build(
+            inclusive_words(b'A', b'F').map(|word| !word),
+            250,
+            false,
+        );
+        let mut inverted_range_haystack = [b'A'; 15];
+        inverted_range_haystack[12] = b'.';
+        assert_contract(inverted_range, None, &inverted_range_haystack, b'A');
+
+        let classified_words = member_words(&[b'A', b'C', b'E', b'G']);
+        let classified = ByteSetClassifier::new(ByteSet256::from_words(classified_words));
+        let classified_leaf = SetSeek::build(classified_words, 4, false);
+        let mut classified_haystack = [b'.'; 15];
+        classified_haystack[12] = b'E';
+        assert_contract(
+            classified_leaf,
+            Some(&classified),
+            &classified_haystack,
+            b'.',
+        );
+
+        let inverted_classified_leaf =
+            SetSeek::build(classified_words.map(|word| !word), 252, true);
+        let mut inverted_classified_haystack = [b'A'; 15];
+        inverted_classified_haystack[12] = b'.';
+        assert_contract(
+            inverted_classified_leaf,
+            Some(&classified),
+            &inverted_classified_haystack,
+            b'A',
+        );
     }
 
     #[test]
