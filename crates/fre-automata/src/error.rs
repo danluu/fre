@@ -250,6 +250,11 @@ pub enum SearchError {
     ScratchAllocationFailed {
         requested: usize,
     },
+    /// A caller-provided ordered-frontier continuation did not describe a
+    /// valid state for the immutable automaton it was paired with.
+    InvalidResumeState {
+        detail: &'static str,
+    },
     InternalInvariant {
         detail: &'static str,
     },
@@ -307,6 +312,9 @@ impl fmt::Display for SearchError {
             }
             Self::ScratchAllocationFailed { requested } => {
                 write!(f, "failed to allocate {requested} bytes of search scratch")
+            }
+            Self::InvalidResumeState { detail } => {
+                write!(f, "invalid ordered-frontier resume state: {detail}")
             }
             Self::InternalInvariant { detail } => {
                 write!(

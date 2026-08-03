@@ -541,6 +541,10 @@ struct PartialForwardDfa {
     transitions: Vec<ForwardCell>,
     discovered_states: usize,
     complete_rows: usize,
+    /// Ordered subset keys for exactly the incomplete suffix
+    /// `complete_rows..discovered_states`. Complete source rows need no key at
+    /// runtime; entering this suffix is the authenticated K0 resume boundary.
+    resume_keys: Vec<ForwardKey>,
 }
 
 enum ForwardBuildOutcome {
@@ -588,8 +592,9 @@ pub(crate) struct OrderedDfa {
 /// Every stored row is complete for every graph alphabet class. A transition
 /// may name a discovered state whose own row was not completed; execution
 /// treats entry into that state as a side exit to the exact ordered-NFA
-/// engine. The side exit restarts the original search window, so no NFA
-/// continuation state or priority proof crosses the engine boundary.
+/// engine. The compact incomplete-state suffix retains the canonical ordered
+/// consuming frontier and pending mode, so K0 continues at the first
+/// unconsumed byte without replaying the prefix.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PartialDfa {
     alphabet: Alphabet,
@@ -600,7 +605,17 @@ pub(crate) struct PartialDfa {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PartialDfaResult<T> {
     Complete(T),
-    Fallback { consumed: usize },
+    Resume(PartialDfaResume),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PartialDfaResume {
+    /// Index in the compact incomplete-suffix resume-key array.
+    pub(crate) state: usize,
+    /// First byte not consumed by the retained table.
+    pub(crate) position: usize,
+    /// Most recent selected endpoint in the already-consumed prefix.
+    pub(crate) pending_end: Option<usize>,
 }
 
 #[allow(dead_code, reason = "structural handoff for native code generation")]
@@ -1064,6 +1079,29 @@ impl PartialDfa {
         )
     }
 
+    pub(crate) fn resume_frontier_count(&self) -> usize {
+        self.forward.resume_keys.len()
+    }
+
+    pub(crate) fn resume_item_count(&self) -> Result<usize, CompileError> {
+        self.forward
+            .resume_keys
+            .iter()
+            .try_fold(0usize, |total, key| total.checked_add(key.items.len()))
+            .ok_or(CompileError::InternalInvariant(
+                "partial DFA resume item count overflowed",
+            ))
+    }
+
+    pub(crate) fn resume_frontiers(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (&[u32], bool)> {
+        self.forward
+            .resume_keys
+            .iter()
+            .map(|key| (key.items.as_slice(), key.pending))
+    }
+
     fn from_complete_forward(
         alphabet: Alphabet,
         forward: ForwardDfa,
@@ -1077,6 +1115,7 @@ impl PartialDfa {
                 transitions: forward.transitions,
                 discovered_states: forward.states,
                 complete_rows: forward.states,
+                resume_keys: Vec::new(),
             },
             effective_limits,
         }
@@ -1098,16 +1137,28 @@ impl PartialDfa {
         let classes = self.alphabet.classes();
         let mut state = 0_u32;
         let mut position = window_start;
-        let mut examined = 0usize;
         let mut pending_end = self.forward.initial_pending.then_some(window_start);
         while position < window_end {
             let source = usize::try_from(state).map_err(|_| {
                 CompileError::InternalInvariant("partial DFA state exceeded usize")
             })?;
             if source >= self.forward.complete_rows {
-                return Ok(PartialDfaResult::Fallback {
-                    consumed: examined,
-                });
+                let resume_state = source.checked_sub(self.forward.complete_rows).ok_or(
+                    CompileError::InternalInvariant("partial DFA resume-state underflowed"),
+                )?;
+                let key = self.forward.resume_keys.get(resume_state).ok_or(
+                    CompileError::InternalInvariant("partial DFA resume key is absent"),
+                )?;
+                if key.pending != pending_end.is_some() {
+                    return Err(CompileError::InternalInvariant(
+                        "partial DFA resume key disagrees with its selected endpoint",
+                    ));
+                }
+                return Ok(PartialDfaResult::Resume(PartialDfaResume {
+                    state: resume_state,
+                    position,
+                    pending_end,
+                }));
             }
             if source == 0 && pending_end.is_none() {
                 if let Some(filter) = prefix_plan {
@@ -1133,11 +1184,6 @@ impl PartialDfa {
             let cell = *self.forward.transitions.get(index).ok_or(
                 CompileError::InternalInvariant("partial DFA row is incomplete"),
             )?;
-            examined = examined
-                .checked_add(1)
-                .ok_or(CompileError::InternalInvariant(
-                    "partial DFA examined-step count overflowed",
-                ))?;
             position = position
                 .checked_add(1)
                 .ok_or(CompileError::InternalInvariant(
@@ -1183,9 +1229,7 @@ impl PartialDfa {
                 prefix_plan,
             )? {
                 PartialDfaResult::Complete(end) => PartialDfaResult::Complete(end.is_some()),
-                PartialDfaResult::Fallback { consumed } => {
-                    PartialDfaResult::Fallback { consumed }
-                }
+                PartialDfaResult::Resume(resume) => PartialDfaResult::Resume(resume),
             },
         )
     }
@@ -1212,9 +1256,29 @@ impl PartialDfa {
         let cells = self.forward.transitions.len().checked_mul(8).ok_or(
             CompileError::InternalInvariant("partial DFA serialization length overflowed"),
         )?;
-        308_usize
+        let expected_resume = self
+            .forward
+            .discovered_states
+            .checked_sub(self.forward.complete_rows)
+            .ok_or(CompileError::InternalInvariant(
+                "partial DFA resume-state count underflowed",
+            ))?;
+        if self.forward.resume_keys.len() != expected_resume {
+            return Err(CompileError::InternalInvariant(
+                "partial DFA resume keys do not cover its incomplete suffix",
+            ));
+        }
+        let resume_descriptors = expected_resume.checked_mul(4).ok_or(
+            CompileError::InternalInvariant("partial DFA resume descriptor bytes overflowed"),
+        )?;
+        let resume_items = self.resume_item_count()?.checked_mul(4).ok_or(
+            CompileError::InternalInvariant("partial DFA resume item bytes overflowed"),
+        )?;
+        316_usize
             .checked_add(self.alphabet.representatives.len())
             .and_then(|value| value.checked_add(cells))
+            .and_then(|value| value.checked_add(resume_descriptors))
+            .and_then(|value| value.checked_add(resume_items))
             .ok_or(CompileError::InternalInvariant(
                 "partial DFA serialization length overflowed",
             ))
@@ -1251,10 +1315,21 @@ impl PartialDfa {
         bytes.push(u8::from(self.forward.initial_pending));
         bytes.push(u8::from(self.forward.initial_terminal));
         bytes.extend_from_slice(&[0; 6]);
+        put_u64(
+            bytes,
+            u64::try_from(self.resume_item_count().unwrap_or(usize::MAX)).unwrap_or(u64::MAX),
+        );
         for cell in &self.forward.transitions {
             put_u32(bytes, cell.next);
             bytes.push(u8::from(cell.accepted));
             bytes.extend_from_slice(&[0; 3]);
+        }
+        for key in &self.forward.resume_keys {
+            let length = u32::try_from(key.items.len()).unwrap_or(u32::MAX) & 0x7fff_ffff;
+            put_u32(bytes, length | (u32::from(key.pending) << 31));
+            for &item in &key.items {
+                put_u32(bytes, item);
+            }
         }
     }
 
@@ -1266,6 +1341,7 @@ impl PartialDfa {
         bytes: &[u8],
         construction_classes: (usize, usize),
         boundary_starts: &[bool; 256],
+        roles: &[StateRole],
     ) -> Result<Self, ProgramFormatError> {
         let (boundary_classes, graph_classes) = construction_classes;
         let mut reader = DfaReader::new(bytes);
@@ -1386,12 +1462,38 @@ impl PartialDfa {
                 "terminal partial DFA initial state is not pending",
             ));
         }
+        let resume_item_count = reader.usize_u64("partial DFA resume item count is truncated")?;
+        let resume_state_count = discovered_states.checked_sub(complete_rows).ok_or(
+            ProgramFormatError::Malformed("partial DFA resume-state count underflowed"),
+        )?;
+        let maximum_resume_items = resume_state_count.checked_mul(roles.len()).ok_or(
+            ProgramFormatError::Malformed("partial DFA resume item bound overflowed"),
+        )?;
+        if resume_item_count > maximum_resume_items
+            || (resume_state_count == 0) != (resume_item_count == 0)
+        {
+            return Err(ProgramFormatError::Malformed(
+                "partial DFA resume item count is outside its state bound",
+            ));
+        }
         let cell_bytes = cell_count
             .checked_mul(8)
             .ok_or(ProgramFormatError::Malformed("partial DFA cell bytes overflowed"))?;
-        if cell_bytes > reader.remaining() {
+        let resume_descriptor_bytes = resume_state_count.checked_mul(4).ok_or(
+            ProgramFormatError::Malformed("partial DFA resume descriptors overflowed"),
+        )?;
+        let resume_item_bytes = resume_item_count.checked_mul(4).ok_or(
+            ProgramFormatError::Malformed("partial DFA resume item bytes overflowed"),
+        )?;
+        let required_bytes = cell_bytes
+            .checked_add(resume_descriptor_bytes)
+            .and_then(|value| value.checked_add(resume_item_bytes))
+            .ok_or(ProgramFormatError::Malformed(
+                "partial DFA trailing payload bytes overflowed",
+            ))?;
+        if required_bytes > reader.remaining() {
             return Err(ProgramFormatError::Malformed(
-                "partial DFA cells exceed the payload extent",
+                "partial DFA cells or resume states exceed the payload extent",
             ));
         }
         let mut transitions = dfa_reserve(cell_count, "partial DFA cell")?;
@@ -1408,6 +1510,52 @@ impl PartialDfa {
             reader.zeros(3, "partial DFA cell reserved bytes are non-zero")?;
             transitions.push(ForwardCell { next, accepted });
         }
+        let mut resume_keys = dfa_reserve(resume_state_count, "partial DFA resume state")?;
+        let mut decoded_resume_items = 0usize;
+        for _ in 0..resume_state_count {
+            let encoded = reader.u32("partial DFA resume descriptor is truncated")?;
+            let pending = encoded & (1 << 31) != 0;
+            let length = usize::try_from(encoded & 0x7fff_ffff).map_err(|_| {
+                ProgramFormatError::Malformed("partial DFA resume length exceeded usize")
+            })?;
+            if length == 0 {
+                return Err(ProgramFormatError::Malformed(
+                    "partial DFA resume frontier is empty",
+                ));
+            }
+            decoded_resume_items = decoded_resume_items.checked_add(length).ok_or(
+                ProgramFormatError::Malformed("partial DFA resume item count overflowed"),
+            )?;
+            if decoded_resume_items > resume_item_count {
+                return Err(ProgramFormatError::Malformed(
+                    "partial DFA resume frontiers exceed their item count",
+                ));
+            }
+            let mut items = dfa_reserve(length, "partial DFA resume item")?;
+            for _ in 0..length {
+                let item = reader.u32("partial DFA resume item is truncated")?;
+                let state = usize::try_from(item).map_err(|_| {
+                    ProgramFormatError::Malformed("partial DFA resume item exceeded usize")
+                })?;
+                if roles.get(state) != Some(&StateRole::Consume) {
+                    return Err(ProgramFormatError::Malformed(
+                        "partial DFA resume item is not a consuming state",
+                    ));
+                }
+                if items.contains(&item) {
+                    return Err(ProgramFormatError::Malformed(
+                        "partial DFA resume frontier contains a duplicate state",
+                    ));
+                }
+                items.push(item);
+            }
+            resume_keys.push(ForwardKey { items, pending });
+        }
+        if decoded_resume_items != resume_item_count {
+            return Err(ProgramFormatError::Malformed(
+                "partial DFA resume frontiers do not fill their item count",
+            ));
+        }
         reader.finish()?;
         Ok(Self {
             alphabet: Alphabet {
@@ -1420,6 +1568,7 @@ impl PartialDfa {
                 transitions,
                 discovered_states,
                 complete_rows,
+                resume_keys,
             },
             effective_limits,
         })
@@ -3158,12 +3307,16 @@ fn build_forward(
                 CompileError::InternalInvariant("partial DFA table shape overflowed"),
             )?;
             transitions.truncate(completed_cells);
+            let discovered_states = states.len();
+            states.drain(..cursor);
+            let resume_keys = states;
             let partial = (cursor != 0).then_some(PartialForwardDfa {
                 initial_pending: initial_accepted,
                 initial_terminal,
                 transitions,
-                discovered_states: states.len(),
+                discovered_states,
                 complete_rows: cursor,
+                resume_keys,
             });
             return Ok(ForwardBuildOutcome::Declined(partial));
         }};

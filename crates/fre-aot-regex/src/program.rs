@@ -1,6 +1,7 @@
 use fre_automata::{
-    Automaton, CompileLimits as AutomatonCompileLimits, EdgeKind, Exists, K0Workspace, RawPlan,
-    SearchLimits, SearchWindow as K0SearchWindow, SelectedEnd, Span, StateRole, WorkspaceLimits,
+    Automaton, CompileLimits as AutomatonCompileLimits, EdgeKind, Exists, K0ResumeSet, K0Workspace,
+    RawPlan, SearchLimits, SearchWindow as K0SearchWindow, SelectedEnd, Span, StateRole,
+    WorkspaceLimits,
 };
 use fre_simd_kernels::{
     ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier,
@@ -19,6 +20,7 @@ use crate::{
     dfa::{
         self, DeterminizationReport, DeterminizeLimits, DeterminizeOutcome, DfaStats,
         NativeDfaView, OrderedDfa, PartialDfa, PartialDfaPrefixPlan, PartialDfaResult,
+        PartialDfaResume,
     },
     error::CompileError,
     required_literals::{self, RequiredLiterals},
@@ -1458,8 +1460,8 @@ pub struct CompiledProgram {
     exact_match_width: Option<usize>,
     max_match_width: MaxMatchWidthStats,
     /// Canonical compile-time subset rows retained after a bounded complete
-    /// determinization attempt declines. Execution side-exits to the exact
-    /// ordered NFA on the first absent row.
+    /// determinization attempt declines. Execution side-exits with the exact
+    /// ordered frontier into K0 on the first absent row.
     partial_dfa: Option<PartialDfa>,
     nfa_mandatory_suffix: Option<NfaMandatorySuffix>,
     nfa_mandatory_cut: Option<NfaMandatoryCut>,
@@ -1474,21 +1476,24 @@ pub struct CompiledProgram {
 pub struct ProgramWorkspace {
     identity: [u8; 32],
     nfa: Option<K0Workspace>,
+    partial_resume: Option<K0ResumeSet>,
     partial_dfa: PartialDfaRuntimeState,
 }
 
 /// Per-prepared-workspace admission state for a retained partial table.
 ///
-/// A side exit restarts K0 from the original window, so repeated holes are
-/// pure duplicate work. After two consecutive holes, use bounded exponential
-/// bypass and periodically re-probe. Early holes receive the steeper backoff;
-/// a complete decision immediately restores direct execution.
+/// Missing forward rows normally resume K0 directly and count as complete
+/// partial executions. The fallback guard remains for holes more cheaply
+/// decided by another complete accelerator, a foreign compatible workspace,
+/// and variable-width positive spans that still need ordinary start recovery.
 #[derive(Clone, Copy, Debug, Default)]
 struct PartialDfaRuntimeState {
     consecutive_fallbacks: u8,
     bypass_remaining: u16,
     prefix_plan: Option<PartialDfaPrefixPlan>,
     prefix_supported: bool,
+    #[cfg(test)]
+    resumed: usize,
 }
 
 impl PartialDfaRuntimeState {
@@ -1515,6 +1520,14 @@ impl PartialDfaRuntimeState {
     fn observe_complete(&mut self) {
         self.consecutive_fallbacks = 0;
         self.bypass_remaining = 0;
+    }
+
+    fn observe_resume(&mut self) {
+        #[cfg(test)]
+        {
+            self.resumed = self.resumed.saturating_add(1);
+        }
+        self.observe_complete();
     }
 
     fn observe_fallback(&mut self, consumed: usize, input_bytes: usize) {
@@ -1979,9 +1992,24 @@ impl CompiledProgram {
             }),
             ProgramEngine::OrderedDfa(_) => None,
         };
+        let partial_resume = self
+            .partial_dfa
+            .as_ref()
+            .filter(|partial| partial.resume_frontier_count() != 0)
+            .map(|partial| {
+                K0ResumeSet::new(
+                    &self.automaton,
+                    partial.resume_frontier_count(),
+                    partial.resume_item_count()?,
+                    partial.resume_frontiers(),
+                )
+                .map_err(CompileError::from)
+            })
+            .transpose()?;
         Ok(ProgramWorkspace {
             identity: self.identity,
             nfa,
+            partial_resume,
             partial_dfa: PartialDfaRuntimeState::new(self.anchored_prefix.sets()),
         })
     }
@@ -2017,7 +2045,13 @@ impl CompiledProgram {
         match &self.engine {
             ProgramEngine::OrderedNfa => {
                 if let Some(nfa) = workspace.nfa.as_mut() {
-                    return self.search_nfa(haystack, window, nfa, &mut workspace.partial_dfa);
+                    return self.search_nfa(
+                        haystack,
+                        window,
+                        nfa,
+                        &mut workspace.partial_resume,
+                        &mut workspace.partial_dfa,
+                    );
                 }
                 let product = self
                     .nfa_mandatory_cut
@@ -2067,11 +2101,16 @@ impl CompiledProgram {
         haystack: &[u8],
         window: SearchWindow,
         workspace: &mut K0Workspace,
+        resume_set: &mut Option<K0ResumeSet>,
         partial_state: &mut PartialDfaRuntimeState,
     ) -> Result<MatchResult, CompileError> {
-        if let Some(found) =
-            self.search_nfa_with_partial_dfa(haystack, window, partial_state)?
-        {
+        if let Some(found) = self.search_nfa_with_partial_dfa(
+            haystack,
+            window,
+            workspace,
+            resume_set,
+            partial_state,
+        )? {
             return Ok(found);
         }
         if let Some(found) = self.search_nfa_with_mandatory_suffix(haystack, window, workspace)? {
@@ -2108,12 +2147,15 @@ impl CompiledProgram {
 
     /// Execute retained, canonical subset rows until they either decide the
     /// complete result or reach a state whose row was not completed under the
-    /// caller's determinization budget. A side exit returns `None` and the
-    /// caller restarts the exact ordered NFA over the original window.
+    /// caller's determinization budget. A side exit carries the exact ordered
+    /// subset and pending endpoint into K0 at the first unconsumed byte; the
+    /// original prefix is never replayed.
     fn search_nfa_with_partial_dfa(
         &self,
         haystack: &[u8],
         window: SearchWindow,
+        workspace: &mut K0Workspace,
+        resume_set: &mut Option<K0ResumeSet>,
         state: &mut PartialDfaRuntimeState,
     ) -> Result<Option<MatchResult>, CompileError> {
         let Some(partial) = &self.partial_dfa else {
@@ -2135,10 +2177,14 @@ impl CompiledProgram {
                     state.observe_complete();
                     Ok(Some(MatchResult::Exists(found)))
                 }
-                PartialDfaResult::Fallback { consumed } => {
-                    state.observe_fallback(consumed, input_bytes);
-                    Ok(None)
-                }
+                PartialDfaResult::Resume(resume) => self.resolve_partial_hole(
+                    haystack,
+                    window,
+                    workspace,
+                    resume_set,
+                    state,
+                    resume,
+                ),
             },
             OutputContract::SelectedEnd => {
                 match partial.selected_end(
@@ -2152,10 +2198,14 @@ impl CompiledProgram {
                         state.observe_complete();
                         Ok(Some(MatchResult::SelectedEnd(found)))
                     }
-                    PartialDfaResult::Fallback { consumed } => {
-                        state.observe_fallback(consumed, input_bytes);
-                        Ok(None)
-                    }
+                    PartialDfaResult::Resume(resume) => self.resolve_partial_hole(
+                        haystack,
+                        window,
+                        workspace,
+                        resume_set,
+                        state,
+                        resume,
+                    ),
                 }
             }
             OutputContract::Span => {
@@ -2166,10 +2216,14 @@ impl CompiledProgram {
                     self.anchored_prefix.sets(),
                     state.prefix_plan,
                 )? {
-                    PartialDfaResult::Fallback { consumed } => {
-                        state.observe_fallback(consumed, input_bytes);
-                        Ok(None)
-                    }
+                    PartialDfaResult::Resume(resume) => self.resolve_partial_hole(
+                        haystack,
+                        window,
+                        workspace,
+                        resume_set,
+                        state,
+                        resume,
+                    ),
                     PartialDfaResult::Complete(None) => {
                         state.observe_complete();
                         Ok(Some(MatchResult::Span(None)))
@@ -2192,6 +2246,137 @@ impl CompiledProgram {
                         Ok(Some(MatchResult::Span(Some((start, end)))))
                     }
                 }
+            }
+        }
+    }
+
+    fn resolve_partial_hole(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut K0Workspace,
+        resume_set: &mut Option<K0ResumeSet>,
+        state: &mut PartialDfaRuntimeState,
+        resume: PartialDfaResume,
+    ) -> Result<Option<MatchResult>, CompileError> {
+        let input_bytes = window.end.saturating_sub(window.start);
+        let consumed = resume.position.saturating_sub(window.start);
+        if let Some(found) = self.search_nfa_with_mandatory_suffix(haystack, window, workspace)? {
+            state.observe_fallback(consumed, input_bytes);
+            return Ok(Some(found));
+        }
+        if let Some(found) = self.search_nfa_with_mandatory_cut(haystack, window) {
+            state.observe_fallback(consumed, input_bytes);
+            return Ok(Some(found));
+        }
+        if resume_set
+            .as_ref()
+            .is_none_or(|set| !set.is_bound_to(&self.automaton))
+        {
+            state.observe_fallback(consumed, input_bytes);
+            return Ok(None);
+        }
+        let found = self.search_nfa_from_partial_resume(
+            haystack,
+            window,
+            workspace,
+            resume_set,
+            resume,
+        )?;
+        state.observe_resume();
+        Ok(Some(found))
+    }
+
+    fn search_nfa_from_partial_resume(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut K0Workspace,
+        resume_set: &mut Option<K0ResumeSet>,
+        resume: PartialDfaResume,
+    ) -> Result<MatchResult, CompileError> {
+        let resume_set = resume_set
+            .as_mut()
+            .ok_or(CompileError::InternalInvariant(
+                "partial DFA hole has no authenticated K0 resume set",
+            ))?;
+        let k0_window = K0SearchWindow::new(window.start, window.end);
+        let limits = SearchLimits::unlimited();
+        match self.output {
+            OutputContract::Exists => {
+                let found = self
+                    .automaton
+                    .prepare::<Exists>()
+                    .search_window_from_ordered_resume(
+                        haystack,
+                        k0_window,
+                        workspace,
+                        resume_set,
+                        resume.state,
+                        resume.position,
+                        resume.pending_end,
+                        limits,
+                    )?
+                    .into_output();
+                Ok(MatchResult::Exists(found))
+            }
+            OutputContract::SelectedEnd => {
+                let found = self
+                    .automaton
+                    .prepare::<SelectedEnd>()
+                    .search_window_from_ordered_resume(
+                        haystack,
+                        k0_window,
+                        workspace,
+                        resume_set,
+                        resume.state,
+                        resume.position,
+                        resume.pending_end,
+                        limits,
+                    )?
+                    .into_output();
+                Ok(MatchResult::SelectedEnd(found))
+            }
+            OutputContract::Span => {
+                let found = if let Some(width) = self.exact_match_width {
+                    self.automaton
+                        .prepare::<SelectedEnd>()
+                        .search_window_from_ordered_resume(
+                            haystack,
+                            k0_window,
+                            workspace,
+                            resume_set,
+                            resume.state,
+                            resume.position,
+                            resume.pending_end,
+                            limits,
+                        )?
+                        .into_output()
+                        .map(|end| {
+                            end.checked_sub(width).map(|start| (start, end)).ok_or(
+                                CompileError::InternalInvariant(
+                                    "resumed fixed-width match end preceded its proved width",
+                                ),
+                            )
+                        })
+                        .transpose()?
+                } else {
+                    self.automaton
+                        .prepare::<Span>()
+                        .search_window_from_ordered_resume(
+                            haystack,
+                            k0_window,
+                            workspace,
+                            resume_set,
+                            resume.state,
+                            resume.position,
+                            resume.pending_end,
+                            limits,
+                        )?
+                        .into_output()
+                        .map(|span| (span.start(), span.end()))
+                };
+                Ok(MatchResult::Span(found))
             }
         }
     }
@@ -2661,6 +2846,7 @@ impl CompiledProgram {
                         dfa_bytes,
                         alphabet_shape.construction_classes(),
                         &alphabet_shape.boundary_starts,
+                        &raw.roles,
                     )?;
                     partial.validate_canonical(
                         &raw,
@@ -6190,20 +6376,24 @@ mod tests {
 
     #[test]
     fn resource_decline_retains_canonical_partial_rows_for_every_contract() {
-        let pattern = r"[b-c][a-b]{1,5}z";
+        // The disjoint terminal alternatives deliberately leave no suffix
+        // sidecar eligible, so every missing retained row exercises the
+        // authenticated K0 continuation rather than another accelerator.
+        let pattern = r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)";
         let limits = DeterminizeLimits {
             max_states: 32,
             ..DeterminizeLimits::default()
         };
         let mut haystacks = generated_byte_strings(&[0, b'a', b'b', b'c', b'x', b'z', 255], 5);
         haystacks.extend([
-            b"xxcbbbbzxx".to_vec(),
+            b"xxcbbbbxyy".to_vec(),
             b"bbbbbbbbbbbb".to_vec(),
-            b"xxbaaaaazyy".to_vec(),
+            b"xxbaaaayyy".to_vec(),
+            b"aaaQ".to_vec(),
             vec![b'a'; 257],
             {
                 let mut value = vec![b'x'; 255];
-                value.extend_from_slice(b"cbbbbz");
+                value.extend_from_slice(b"cbbbbx");
                 value
             },
         ]);
@@ -6223,6 +6413,7 @@ mod tests {
             assert!(complete_rows < discovered_states);
             let report = partial.determinization_report().unwrap();
             assert!(report.decline.is_some(), "{output:?}");
+            assert!(partial.nfa_mandatory_suffix.is_none(), "{output:?}");
 
             let bytes = partial.serialize().expect("serialize partial DFA");
             assert_eq!(
@@ -6267,6 +6458,334 @@ mod tests {
                         );
                     }
                 }
+            }
+            assert!(
+                partial_workspace.partial_dfa.resumed > 0,
+                "fresh {output:?} never exercised stateful K0 resume"
+            );
+            assert!(
+                restored_workspace.partial_dfa.resumed > 0,
+                "restored {output:?} never exercised stateful K0 resume"
+            );
+        }
+    }
+
+    #[test]
+    fn partial_hole_uses_complete_suffix_proof_and_adapts_away_from_redundant_probe() {
+        let pattern = r"[b-c][a-b]{1,10}z";
+        let limited = program(
+            pattern,
+            OutputContract::SelectedEnd,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 32,
+                ..DeterminizeLimits::default()
+            },
+        );
+        let partial = limited.partial_dfa.as_ref().expect("retained rows");
+        assert!(limited.nfa_mandatory_suffix.is_some());
+        let (prefix_plan, supported) = PartialDfaPrefixPlan::derive(limited.anchored_prefix.sets());
+        assert!(supported);
+        let haystack = b"cbbbbbbbbbbz";
+        let resume = match partial
+            .selected_end(haystack, 0, haystack.len(), limited.anchored_prefix.sets(), prefix_plan)
+            .expect("partial probe")
+        {
+            PartialDfaResult::Resume(resume) => resume,
+            PartialDfaResult::Complete(found) => {
+                panic!("test input did not reach a retained hole: {found:?}")
+            }
+        };
+        assert!(resume.position > 0);
+        assert!(resume.position < haystack.len());
+
+        let reference = program(
+            pattern,
+            OutputContract::SelectedEnd,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let expected = reference
+            .search(haystack, SearchWindow::full(haystack))
+            .expect("reference search");
+        let mut workspace = limited.prepare_workspace().expect("workspace");
+        for attempt in 0..2 {
+            assert_eq!(
+                limited
+                    .search_with_workspace(
+                        haystack,
+                        SearchWindow::full(haystack),
+                        &mut workspace,
+                    )
+                    .expect("accelerated search"),
+                expected,
+                "attempt {attempt}"
+            );
+        }
+        assert_eq!(workspace.partial_dfa.resumed, 0);
+        assert_eq!(workspace.partial_dfa.consecutive_fallbacks, 2);
+        assert!(workspace.partial_dfa.bypass_remaining > 0);
+    }
+
+    #[test]
+    fn partial_hole_uses_complete_mandatory_cut_proof_and_round_trips() {
+        let pattern = r"[b-c][a-b]{1,10}7[A-Za-z]+";
+        let limited = program(
+            pattern,
+            OutputContract::SelectedEnd,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 32,
+                ..DeterminizeLimits::default()
+            },
+        );
+        let partial = limited.partial_dfa.as_ref().expect("retained rows");
+        assert!(limited.nfa_mandatory_suffix.is_none());
+        assert!(limited.nfa_mandatory_cut.is_some());
+        let bytes = limited.serialize().expect("serialize combined sidecars");
+        assert_eq!(
+            bytes[15],
+            PROGRAM_FLAG_NFA_MANDATORY_CUT | PROGRAM_FLAG_NFA_PARTIAL_DFA
+        );
+        let restored = CompiledProgram::deserialize(&bytes).expect("restore combined sidecars");
+        assert!(restored.partial_dfa.is_some());
+        assert!(restored.nfa_mandatory_cut.is_some());
+        assert_eq!(restored.serialize().unwrap(), bytes);
+
+        let (prefix_plan, supported) = PartialDfaPrefixPlan::derive(limited.anchored_prefix.sets());
+        assert!(supported);
+        let haystack = b"cbbbbbbbbbbbb";
+        let resume = match partial
+            .selected_end(haystack, 0, haystack.len(), limited.anchored_prefix.sets(), prefix_plan)
+            .expect("partial probe")
+        {
+            PartialDfaResult::Resume(resume) => resume,
+            PartialDfaResult::Complete(found) => {
+                panic!("test input did not reach a retained hole: {found:?}")
+            }
+        };
+        assert!(resume.position > 0);
+
+        let reference = program(
+            pattern,
+            OutputContract::SelectedEnd,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let expected = reference
+            .search(haystack, SearchWindow::full(haystack))
+            .expect("reference search");
+        let mut workspace = limited.prepare_workspace().expect("workspace");
+        for attempt in 0..2 {
+            assert_eq!(
+                limited
+                    .search_with_workspace(
+                        haystack,
+                        SearchWindow::full(haystack),
+                        &mut workspace,
+                    )
+                    .expect("accelerated search"),
+                expected,
+                "attempt {attempt}"
+            );
+        }
+        assert_eq!(workspace.partial_dfa.resumed, 0);
+        assert_eq!(workspace.partial_dfa.consecutive_fallbacks, 2);
+        assert!(workspace.partial_dfa.bypass_remaining > 0);
+    }
+
+    #[test]
+    fn partial_resume_with_a_foreign_semantic_workspace_falls_back_exactly() {
+        let pattern = r"a+Q|[b-c][a-b]{1,10}(?:x+|y+)";
+        let limited = program(
+            pattern,
+            OutputContract::SelectedEnd,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 32,
+                ..DeterminizeLimits::default()
+            },
+        );
+        assert!(limited.nfa_mandatory_suffix.is_none());
+        let partial = limited.partial_dfa.as_ref().expect("retained rows");
+        let (prefix_plan, supported) = PartialDfaPrefixPlan::derive(limited.anchored_prefix.sets());
+        assert!(supported);
+        let haystack = b"cbbbbbbbbbbx";
+        assert!(matches!(
+            partial
+                .selected_end(
+                    haystack,
+                    0,
+                    haystack.len(),
+                    limited.anchored_prefix.sets(),
+                    prefix_plan,
+                )
+                .expect("partial probe"),
+            PartialDfaResult::Resume(_)
+        ));
+
+        let reference = program(
+            pattern,
+            OutputContract::SelectedEnd,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let expected = reference
+            .search(haystack, SearchWindow::full(haystack))
+            .expect("reference search");
+        let mut foreign_workspace = reference.prepare_workspace().expect("foreign workspace");
+        assert!(foreign_workspace.partial_resume.is_none());
+        assert_eq!(
+            limited
+                .search_with_workspace(
+                    haystack,
+                    SearchWindow::full(haystack),
+                    &mut foreign_workspace,
+                )
+                .expect("exact compatibility fallback"),
+            expected
+        );
+        assert_eq!(foreign_workspace.partial_dfa.resumed, 0);
+    }
+
+    #[test]
+    fn late_partial_hole_resumes_after_the_retained_prefix() {
+        let pattern = r"a+Z|[b-c][a-b]{1,16}(?:x+|y+)";
+        let limited = program(
+            pattern,
+            OutputContract::SelectedEnd,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 256,
+                ..DeterminizeLimits::default()
+            },
+        );
+        assert!(limited.nfa_mandatory_suffix.is_none());
+        let mut haystack = vec![b'a'; 4_096];
+        haystack.extend(std::iter::repeat_n(b'b', 24));
+        let partial = limited.partial_dfa.as_ref().expect("retained rows");
+        let (prefix_plan, supported) = PartialDfaPrefixPlan::derive(limited.anchored_prefix.sets());
+        assert!(supported);
+        let resume = match partial
+            .selected_end(
+                &haystack,
+                0,
+                haystack.len(),
+                limited.anchored_prefix.sets(),
+                prefix_plan,
+            )
+            .expect("partial probe")
+        {
+            PartialDfaResult::Resume(resume) => resume,
+            PartialDfaResult::Complete(found) => {
+                panic!("test input did not reach a retained hole: {found:?}")
+            }
+        };
+        assert!(resume.position > 4_096);
+        assert_eq!(resume.pending_end, None);
+
+        let reference = program(
+            pattern,
+            OutputContract::SelectedEnd,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let expected = reference
+            .search(&haystack, SearchWindow::full(&haystack))
+            .expect("reference search");
+        let mut workspace = limited.prepare_workspace().expect("workspace");
+        assert_eq!(
+            limited
+                .search_with_workspace(
+                    &haystack,
+                    SearchWindow::full(&haystack),
+                    &mut workspace,
+                )
+                .expect("resumed search"),
+            expected
+        );
+        assert_eq!(workspace.partial_dfa.resumed, 1);
+    }
+
+    #[test]
+    fn stateful_partial_resume_preserves_pending_priority_for_every_small_window() {
+        let patterns = [
+            r"(?:a+Q|[b-c][a-b]{1,10}(?:za|z))",
+            r"(?:a+Q|[b-c][a-b]{1,10}(?:z[a-b]+|z))",
+            r"(?:a+Q|[b-c][a-b]{1,10}(?:z[a-b]+?|z))",
+        ];
+        let limits = DeterminizeLimits {
+            max_states: 32,
+            ..DeterminizeLimits::default()
+        };
+        let mut haystacks = generated_byte_strings(&[b'a', b'b', b'c', b'z'], 5);
+        haystacks.extend([
+            b"xxcbbbbzxx".to_vec(),
+            b"xxcbbbbzayy".to_vec(),
+            b"cbbbbzabbx".to_vec(),
+            b"cbbbbbbbbbbbb".to_vec(),
+            b"xxbaaaaazyy".to_vec(),
+            b"aaaQ".to_vec(),
+        ]);
+        for pattern in patterns {
+            for output in [
+                OutputContract::Exists,
+                OutputContract::SelectedEnd,
+                OutputContract::Span,
+            ] {
+                let partial = program(pattern, output, CompileMode::Optimizing, limits);
+                let retained = partial
+                    .partial_dfa
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("missing partial table for {pattern:?}/{output:?}"));
+                let (complete, discovered) = retained.retained_dimensions();
+                assert!(complete < discovered, "{pattern:?}/{output:?}");
+                assert_eq!(
+                    retained.resume_frontier_count(),
+                    discovered - complete,
+                    "{pattern:?}/{output:?}"
+                );
+                assert!(
+                    partial.nfa_mandatory_suffix.is_none(),
+                    "{pattern:?}/{output:?}"
+                );
+                let reference = program(
+                    pattern,
+                    output,
+                    CompileMode::Fast,
+                    DeterminizeLimits::default(),
+                );
+                let mut partial_workspace = partial.prepare_workspace().unwrap();
+                let mut reference_workspace = reference.prepare_workspace().unwrap();
+                for haystack in &haystacks {
+                    for start in 0..=haystack.len() {
+                        for end in start..=haystack.len() {
+                            let window = SearchWindow::new(start, end);
+                            let expected = reference
+                                .search_with_workspace(
+                                    haystack,
+                                    window,
+                                    &mut reference_workspace,
+                                )
+                                .unwrap();
+                            assert_eq!(
+                                partial
+                                    .search_with_workspace(
+                                        haystack,
+                                        window,
+                                        &mut partial_workspace,
+                                    )
+                                    .unwrap(),
+                                expected,
+                                "{pattern:?}/{output:?} {haystack:?} {start}..{end}"
+                            );
+                        }
+                    }
+                }
+                assert!(
+                    partial_workspace.partial_dfa.resumed > 0,
+                    "{pattern:?}/{output:?} never reached a retained hole"
+                );
             }
         }
     }
@@ -6325,9 +6844,83 @@ mod tests {
             .checked_add(raw_serialized_len(&compiled.raw).unwrap())
             .and_then(|offset| offset.checked_add(8))
             .unwrap();
-        let mut changed_limit = bytes;
+        let class_count = usize::try_from(u32::from_le_bytes(
+            bytes[payload + 24..payload + 28].try_into().unwrap(),
+        ))
+        .unwrap();
+        let state_counts = payload + 284 + class_count;
+        let discovered = usize::try_from(u32::from_le_bytes(
+            bytes[state_counts..state_counts + 4].try_into().unwrap(),
+        ))
+        .unwrap();
+        let complete = usize::try_from(u32::from_le_bytes(
+            bytes[state_counts + 4..state_counts + 8]
+                .try_into()
+                .unwrap(),
+        ))
+        .unwrap();
+        let cell_count = usize::try_from(u64::from_le_bytes(
+            bytes[state_counts + 8..state_counts + 16]
+                .try_into()
+                .unwrap(),
+        ))
+        .unwrap();
+        let resume_count_offset = state_counts + 24;
+        let resume_descriptors = resume_count_offset + 8 + cell_count * 8;
+        assert!(discovered > complete);
+
+        let mut changed_limit = bytes.clone();
         changed_limit[payload..payload + 8].copy_from_slice(&0_u64.to_le_bytes());
         assert!(CompiledProgram::deserialize(&changed_limit).is_err());
+
+        let mut changed_resume_count = bytes.clone();
+        changed_resume_count[resume_count_offset..resume_count_offset + 8]
+            .copy_from_slice(&0_u64.to_le_bytes());
+        assert!(CompiledProgram::deserialize(&changed_resume_count).is_err());
+
+        let mut changed_pending = bytes.clone();
+        let first_descriptor = u32::from_le_bytes(
+            changed_pending[resume_descriptors..resume_descriptors + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_ne!(first_descriptor & 0x7fff_ffff, 0);
+        changed_pending[resume_descriptors..resume_descriptors + 4]
+            .copy_from_slice(&(first_descriptor ^ (1 << 31)).to_le_bytes());
+        assert!(CompiledProgram::deserialize(&changed_pending).is_err());
+
+        let accept = compiled
+            .raw
+            .roles
+            .iter()
+            .position(|&role| role == StateRole::Accept)
+            .and_then(|state| u32::try_from(state).ok())
+            .unwrap();
+        let mut changed_item_role = bytes.clone();
+        changed_item_role[resume_descriptors + 4..resume_descriptors + 8]
+            .copy_from_slice(&accept.to_le_bytes());
+        assert!(CompiledProgram::deserialize(&changed_item_role).is_err());
+
+        let mut descriptor = resume_descriptors;
+        let mut swappable = None;
+        for _ in complete..discovered {
+            let encoded = u32::from_le_bytes(
+                bytes[descriptor..descriptor + 4].try_into().unwrap(),
+            );
+            let length = usize::try_from(encoded & 0x7fff_ffff).unwrap();
+            if length >= 2 {
+                swappable = Some(descriptor + 4);
+                break;
+            }
+            descriptor += 4 + length * 4;
+        }
+        let first_item = swappable.expect("partial resume payload has a multi-item frontier");
+        let mut reordered = bytes;
+        let left = reordered[first_item..first_item + 4].to_vec();
+        let right = reordered[first_item + 4..first_item + 8].to_vec();
+        reordered[first_item..first_item + 4].copy_from_slice(&right);
+        reordered[first_item + 4..first_item + 8].copy_from_slice(&left);
+        assert!(CompiledProgram::deserialize(&reordered).is_err());
     }
 
     #[test]

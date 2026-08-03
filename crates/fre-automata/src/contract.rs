@@ -1,8 +1,8 @@
 use core::marker::PhantomData;
 
 use crate::{
-    Automaton, K0SearchSession, K0SpanSourceCursor, K0Workspace, SearchError, SearchLimits,
-    SearchWindow,
+    Automaton, K0ResumeSet, K0SearchSession, K0SpanSourceCursor, K0Workspace, SearchError,
+    SearchLimits, SearchWindow,
 };
 
 /// The capture-free output promised by a prepared entry point.
@@ -445,6 +445,57 @@ impl<O: Operation> TypedPlan<'_, O> {
             haystack,
             window,
             workspace,
+            limits,
+            O::CONTRACT,
+        )?;
+        Ok(SearchReport::new(
+            O::project(report.found),
+            report.accounting,
+        ))
+    }
+
+    /// Continue from one authenticated ordered consuming frontier at an
+    /// already-consumed byte boundary.
+    ///
+    /// The original `window` remains authoritative for assertion-independent
+    /// unanchored semantics and span start recovery. `resume_position` is the
+    /// first unconsumed byte. `pending_end` must be present exactly when the
+    /// selected frontier's pending mode is set, and must identify the most
+    /// recent accepted boundary in the consumed prefix.
+    ///
+    /// This entry is reserved for a producer that canonically authenticates
+    /// frontier reachability, such as the AOT partial ordered-DFA executor.
+    /// K0 validates graph binding and state shape again before continuation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] for an invalid window, mismatched resume state,
+    /// incompatible workspace, hard-limit refusal, or execution failure.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the resume boundary keeps its original window and committed prefix explicit"
+    )]
+    pub fn search_window_from_ordered_resume(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut K0Workspace,
+        resume_set: &mut K0ResumeSet,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end: Option<usize>,
+        limits: SearchLimits,
+    ) -> Result<SearchReport<O::Output>, SearchError> {
+        let report = crate::k0::search_from_resume_with_workspace(
+            self.automaton,
+            haystack,
+            window,
+            workspace,
+            resume_set,
+            resume_state,
+            resume_position,
+            pending_end,
             limits,
             O::CONTRACT,
         )?;

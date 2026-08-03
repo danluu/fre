@@ -2010,6 +2010,245 @@ impl ReverseWorkspace {
     }
 }
 
+/// Graph-bound ordered consuming frontiers admitted for exact K0 continuation.
+///
+/// A frontier is the complete ordered list at one byte boundary after epsilon
+/// closure has stopped at the first accepting path, plus the selected-end
+/// pending bit. The list order is semantic: earlier entries have higher
+/// priority. Construction validates graph binding, consuming roles, bounds,
+/// uniqueness, and the declared flat shape. Reachability from a particular
+/// prefix is deliberately a producer proof; the AOT producer authenticates
+/// that proof by canonically regenerating its partial table before this set is
+/// constructed.
+///
+/// Cached lazy-state IDs are only hints. Every hint is content-checked against
+/// the paired workspace before reuse, so moving a set between compatible
+/// workspaces cannot cross an unauthenticated state identity.
+#[derive(Debug)]
+pub struct K0ResumeSet {
+    automaton_identity: u64,
+    offsets: Vec<usize>,
+    lengths: Vec<u32>,
+    modes: Vec<u8>,
+    items: Vec<u32>,
+    cached_states: Vec<u32>,
+    retained_bytes: usize,
+}
+
+impl K0ResumeSet {
+    /// Copy a canonical collection of ordered frontiers and bind it to one
+    /// immutable automaton instance.
+    ///
+    /// `state_count` and `total_items` make the allocation and iteration shape
+    /// explicit before any input is copied. Every yielded slice must be
+    /// non-empty and contain distinct consuming-state indices in priority
+    /// order. The boolean is the frontier's pending selected-end mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidResumeState`] for an invalid shape or
+    /// graph item, or [`SearchError::ScratchAllocationFailed`] if the fixed
+    /// retained payload cannot be allocated.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the one-time graph binding validates and publishes the complete flat resume shape"
+    )]
+    pub fn new<'a, I>(
+        automaton: &Automaton,
+        state_count: usize,
+        total_items: usize,
+        frontiers: I,
+    ) -> Result<Self, SearchError>
+    where
+        I: IntoIterator<Item = (&'a [u32], bool)>,
+    {
+        if automaton.stats().assertion_edges() != 0 {
+            return Err(SearchError::InvalidResumeState {
+                detail: "ordered-frontier continuation requires an assertion-free automaton",
+            });
+        }
+        if state_count == 0 || total_items == 0 {
+            return Err(SearchError::InvalidResumeState {
+                detail: "resume set has no non-empty frontier",
+            });
+        }
+        let retained_bytes = state_count
+            .checked_mul(size_of::<usize>())
+            .and_then(|bytes| {
+                state_count
+                    .checked_mul(size_of::<u32>())
+                    .and_then(|more| bytes.checked_add(more))
+            })
+            .and_then(|bytes| bytes.checked_add(state_count))
+            .and_then(|bytes| {
+                state_count
+                    .checked_mul(size_of::<u32>())
+                    .and_then(|more| bytes.checked_add(more))
+            })
+            .and_then(|bytes| {
+                total_items
+                    .checked_mul(size_of::<u32>())
+                    .and_then(|more| bytes.checked_add(more))
+            })
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "ordered-frontier resume storage bytes",
+            })?;
+        let mut offsets = allocate_slots(state_count, 0_usize, retained_bytes)?;
+        let mut lengths = allocate_slots(state_count, 0_u32, retained_bytes)?;
+        let mut modes = allocate_slots(state_count, 0_u8, retained_bytes)?;
+        let mut items = allocate_slots(total_items, 0_u32, retained_bytes)?;
+        let cached_states = allocate_slots(state_count, LAZY_NO_STATE, retained_bytes)?;
+
+        let mut frontiers = frontiers.into_iter();
+        let mut item_cursor = 0usize;
+        for state in 0..state_count {
+            let (frontier, pending) = frontiers.next().ok_or(
+                SearchError::InvalidResumeState {
+                    detail: "resume iterator ended before its declared state count",
+                },
+            )?;
+            if frontier.is_empty() {
+                return Err(SearchError::InvalidResumeState {
+                    detail: "resume frontier is empty",
+                });
+            }
+            let length = u32::try_from(frontier.len()).map_err(|_| {
+                SearchError::InvalidResumeState {
+                    detail: "resume frontier length exceeds u32",
+                }
+            })?;
+            let item_end = item_cursor.checked_add(frontier.len()).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "ordered-frontier resume item end",
+                },
+            )?;
+            if item_end > items.len() {
+                return Err(SearchError::InvalidResumeState {
+                    detail: "resume frontiers exceed their declared total item count",
+                });
+            }
+            for (ordinal, &item) in frontier.iter().enumerate() {
+                let item_index = usize::try_from(item).map_err(|_| {
+                    SearchError::InvalidResumeState {
+                        detail: "resume item does not fit the host index space",
+                    }
+                })?;
+                if automaton.roles.get(item_index) != Some(&StateRole::Consume) {
+                    return Err(SearchError::InvalidResumeState {
+                        detail: "resume item is not a consuming automaton state",
+                    });
+                }
+                if frontier[..ordinal].contains(&item) {
+                    return Err(SearchError::InvalidResumeState {
+                        detail: "resume frontier contains a duplicate state",
+                    });
+                }
+            }
+            items[item_cursor..item_end].copy_from_slice(frontier);
+            offsets[state] = item_cursor;
+            lengths[state] = length;
+            modes[state] = u8::from(pending);
+            item_cursor = item_end;
+        }
+        if frontiers.next().is_some() {
+            return Err(SearchError::InvalidResumeState {
+                detail: "resume iterator exceeds its declared state count",
+            });
+        }
+        if item_cursor != total_items {
+            return Err(SearchError::InvalidResumeState {
+                detail: "resume frontiers do not fill their declared item count",
+            });
+        }
+
+        let retained_bytes = offsets
+            .capacity()
+            .checked_mul(size_of::<usize>())
+            .and_then(|bytes| {
+                lengths
+                    .capacity()
+                    .checked_mul(size_of::<u32>())
+                    .and_then(|more| bytes.checked_add(more))
+            })
+            .and_then(|bytes| bytes.checked_add(modes.capacity()))
+            .and_then(|bytes| {
+                cached_states
+                    .capacity()
+                    .checked_mul(size_of::<u32>())
+                    .and_then(|more| bytes.checked_add(more))
+            })
+            .and_then(|bytes| {
+                items
+                    .capacity()
+                    .checked_mul(size_of::<u32>())
+                    .and_then(|more| bytes.checked_add(more))
+            })
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "retained ordered-frontier resume storage bytes",
+            })?;
+
+        Ok(Self {
+            automaton_identity: automaton.identity(),
+            offsets,
+            lengths,
+            modes,
+            items,
+            cached_states,
+            retained_bytes,
+        })
+    }
+
+    /// Allocator-retained payload owned by this continuation set.
+    #[must_use]
+    pub const fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+
+    /// Whether this continuation set was authenticated against `automaton`.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn is_bound_to(&self, automaton: &Automaton) -> bool {
+        self.automaton_identity == automaton.identity()
+    }
+
+    fn frontier(&self, state: usize) -> Result<(&[u32], bool), SearchError> {
+        let offset = *self
+            .offsets
+            .get(state)
+            .ok_or(SearchError::InvalidResumeState {
+                detail: "resume state index is outside the authenticated set",
+            })?;
+        let length = usize::try_from(*self.lengths.get(state).ok_or(
+            SearchError::InternalInvariant {
+                detail: "resume state length is outside its metadata",
+            },
+        )?)
+        .map_err(|_| SearchError::InternalInvariant {
+            detail: "resume state length does not fit usize",
+        })?;
+        let end = offset
+            .checked_add(length)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "ordered-frontier resume state end",
+            })?;
+        let items = self
+            .items
+            .get(offset..end)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "resume state items are outside their retained arena",
+            })?;
+        let pending = *self
+            .modes
+            .get(state)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "resume pending mode is outside its metadata",
+            })?
+            != 0;
+        Ok((items, pending))
+    }
+}
+
 /// Caller-owned fixed-capacity storage for allocation-free repeated K0 calls.
 ///
 /// All backing vectors retain their full initialized length. Separate logical
@@ -2643,6 +2882,74 @@ pub(crate) fn search_prevalidated_window_with_authenticated_workspace(
         limits,
         contract,
         workspace.bound_capabilities,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the continuation entry keeps its authenticated frontier and original window explicit"
+)]
+pub(crate) fn search_from_resume_with_workspace(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    resume_set: &mut K0ResumeSet,
+    resume_state: usize,
+    resume_position: usize,
+    pending_end: Option<usize>,
+    limits: SearchLimits,
+    contract: OutputContract,
+) -> Result<UntypedReport, SearchError> {
+    validate_window(haystack, window)?;
+    if resume_position < window.start() || resume_position > window.end() {
+        return Err(SearchError::InvalidResumeState {
+            detail: "resume position is outside the original search window",
+        });
+    }
+    if resume_set.automaton_identity != automaton.identity() {
+        return Err(SearchError::InvalidResumeState {
+            detail: "resume set belongs to a different immutable automaton",
+        });
+    }
+    if !workspace.lazy.is_allocated() || !workspace.lazy.is_bound_to(automaton) {
+        return Err(SearchError::InvalidResumeState {
+            detail: "resume requires an accelerated workspace bound to the same automaton",
+        });
+    }
+    let (_, resume_pending) = resume_set.frontier(resume_state)?;
+    if resume_pending != pending_end.is_some() {
+        return Err(SearchError::InvalidResumeState {
+            detail: "resume pending mode disagrees with the selected endpoint",
+        });
+    }
+    if pending_end.is_some_and(|end| end < window.start() || end > resume_position) {
+        return Err(SearchError::InvalidResumeState {
+            detail: "resume selected endpoint is outside the consumed prefix",
+        });
+    }
+    if !matches!(
+        contract,
+        OutputContract::Exists
+            | OutputContract::EarliestEnd
+            | OutputContract::SelectedEnd
+            | OutputContract::Span
+    ) {
+        return Err(SearchError::InvalidResumeState {
+            detail: "resume output contract is unsupported",
+        });
+    }
+    execute_from_resume(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        resume_set,
+        resume_state,
+        resume_position,
+        pending_end,
+        limits,
+        contract,
     )
 }
 
@@ -3626,6 +3933,398 @@ fn execute_prepared(
             boundaries,
         ),
     })
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the resume transaction keeps forward commitment, optional reverse recovery, and accounting adjacent"
+)]
+fn execute_from_resume(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    resume_set: &mut K0ResumeSet,
+    resume_state: usize,
+    resume_position: usize,
+    pending_end: Option<usize>,
+    limits: SearchLimits,
+    contract: OutputContract,
+) -> Result<UntypedReport, SearchError> {
+    let wants_span = contract == OutputContract::Span;
+    if wants_span
+        && (!workspace.reverse.is_allocated() || !workspace.reverse.is_bound_to(automaton))
+    {
+        return Err(SearchError::InvalidResumeState {
+            detail: "span resume requires a bidirectional workspace",
+        });
+    }
+
+    let mut setup = SetupAccounting::empty(workspace.retained_bytes, true);
+    let (mut meter, setup_work) = prepare_invocation(
+        automaton,
+        workspace,
+        window,
+        limits,
+        &mut setup,
+        true,
+        wants_span,
+    )?;
+    let remaining_bytes = window
+        .end()
+        .checked_sub(resume_position)
+        .ok_or(SearchError::InvalidResumeState {
+            detail: "resume position follows the original window end",
+        })?;
+    let window_bytes = window
+        .end()
+        .checked_sub(window.start())
+        .ok_or(SearchError::InternalInvariant {
+            detail: "validated resume window descends",
+        })?;
+    let forward_reserve = if limits.max_work == u64::MAX {
+        0
+    } else {
+        automaton
+            .conservative_transition_work_bound(remaining_bytes)
+            .unwrap_or(u64::MAX)
+    };
+    let reverse_reserve = if wants_span && limits.max_work != u64::MAX {
+        conservative_reverse_work_bound(automaton, window_bytes).unwrap_or(u64::MAX)
+    } else {
+        0
+    };
+    let completion_reserve = forward_reserve.saturating_add(reverse_reserve);
+
+    // Preparing the ordinary initial row is optional for semantics, but lets
+    // the resumed frontier intern into the same persistent cache and reuse its
+    // future rows. If finite work cannot admit that setup, continuation stays
+    // exact from an inline frontier.
+    let may_intern = prepare_lazy(
+        automaton,
+        workspace,
+        &mut meter,
+        completion_reserve,
+        resume_position,
+    )?;
+    let state = seed_lazy_resume_state(
+        automaton,
+        workspace,
+        resume_set,
+        resume_state,
+        &mut meter,
+        completion_reserve,
+        resume_position,
+        may_intern,
+    )?;
+    let (mut pending, mut boundaries) = execute_lazy_resume_loop(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        &mut meter,
+        contract,
+        completion_reserve,
+        state,
+        resume_position,
+        pending_end,
+    )?;
+
+    if wants_span {
+        if let Some(selected) = pending {
+            let end = selected.end();
+            if !prepare_reverse_lazy(
+                automaton,
+                workspace,
+                &mut meter,
+                reverse_reserve,
+                end,
+            )? {
+                if workspace.reverse.declined {
+                    return Err(SearchError::InternalInvariant {
+                        detail: "selected resume endpoint has no reverse start frontier",
+                    });
+                }
+                return Err(SearchError::WorkLimitExceeded {
+                    limit: limits.max_work,
+                    consumed: meter.consumed,
+                    requested: reverse_initial_work_upper(automaton)?,
+                    position: end,
+                });
+            }
+            let (start, reverse_boundaries) = execute_reverse_lazy_loop(
+                automaton,
+                haystack,
+                window.start(),
+                end,
+                workspace,
+                &mut meter,
+                reverse_reserve,
+            )?;
+            let start = start.ok_or(SearchError::InternalInvariant {
+                detail: "reverse DFA could not recover the resume-selected span",
+            })?;
+            pending = Some(MatchSpan::new(start, end));
+            boundaries = boundaries.checked_add(reverse_boundaries).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "resume bidirectional examined boundary count",
+                },
+            )?;
+        }
+    }
+
+    let transition_work = meter
+        .consumed
+        .checked_sub(setup_work)
+        .ok_or(SearchError::InternalInvariant {
+            detail: "resume setup work exceeded total search work",
+        })?;
+    Ok(UntypedReport {
+        found: pending,
+        accounting: SearchAccounting::new(
+            meter.consumed,
+            setup,
+            transition_work,
+            workspace.retained_bytes,
+            boundaries,
+        ),
+    })
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the seed publication checks both external and workspace state identities"
+)]
+fn seed_lazy_resume_state(
+    automaton: &Automaton,
+    workspace: &mut K0Workspace,
+    resume_set: &mut K0ResumeSet,
+    resume_state: usize,
+    meter: &mut WorkMeter,
+    core_reserve: u64,
+    position: usize,
+    may_intern: bool,
+) -> Result<LazyState, SearchError> {
+    let (offset, length, pending) = {
+        let offset = *resume_set
+            .offsets
+            .get(resume_state)
+            .ok_or(SearchError::InvalidResumeState {
+                detail: "resume state index is outside the authenticated set",
+            })?;
+        let length = usize::try_from(*resume_set.lengths.get(resume_state).ok_or(
+            SearchError::InternalInvariant {
+                detail: "resume state length is outside its metadata",
+            },
+        )?)
+        .map_err(|_| SearchError::InternalInvariant {
+            detail: "resume state length does not fit usize",
+        })?;
+        let pending = *resume_set
+            .modes
+            .get(resume_state)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "resume state mode is outside its metadata",
+            })?
+            != 0;
+        (offset, length, pending)
+    };
+    let end = offset
+        .checked_add(length)
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "ordered-frontier resume seed end",
+        })?;
+    let seed = resume_set
+        .items
+        .get(offset..end)
+        .ok_or(SearchError::InternalInvariant {
+            detail: "resume seed items are outside their retained arena",
+        })?;
+
+    let cached_hint = *resume_set
+        .cached_states
+        .get(resume_state)
+        .ok_or(SearchError::InternalInvariant {
+            detail: "resume cached-state hint is outside its metadata",
+        })?;
+    if cached_hint != LAZY_NO_STATE
+        && usize::try_from(cached_hint)
+            .ok()
+            .is_some_and(|state| state < workspace.lazy.state_len)
+    {
+        let comparison_work = u64::try_from(length.saturating_add(1)).map_err(|_| {
+            SearchError::ArithmeticOverflow {
+                computation: "resume cached-state comparison work",
+            }
+        })?;
+        meter.charge(comparison_work, position)?;
+        let (cached_offset, cached_length, cached_pending) =
+            workspace.lazy.state_bounds(cached_hint)?;
+        let cached_end = cached_offset.checked_add(cached_length).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "resume cached-state item end",
+            },
+        )?;
+        if cached_pending == pending
+            && workspace.lazy.items.get(cached_offset..cached_end) == Some(seed)
+        {
+            return Ok(LazyState::Cached(cached_hint));
+        }
+    }
+    resume_set.cached_states[resume_state] = LAZY_NO_STATE;
+
+    let copy_work = u64::try_from(length).map_err(|_| SearchError::ArithmeticOverflow {
+        computation: "resume frontier copy work",
+    })?;
+    meter.charge(copy_work, position)?;
+    if length > workspace.lazy.scratch.len() || length > workspace.lazy.frontier.len() {
+        return Err(SearchError::InvalidResumeState {
+            detail: "resume frontier exceeds the automaton workspace arena",
+        });
+    }
+    if may_intern && workspace.lazy.initialized && !workspace.lazy.declined {
+        workspace.lazy.scratch[..length].copy_from_slice(seed);
+        workspace.lazy.scratch_len = length;
+        match workspace
+            .lazy
+            .intern_speculative(pending, meter, core_reserve, position)?
+        {
+            LazyInterned::State(state) => {
+                resume_set.cached_states[resume_state] = state;
+                return Ok(LazyState::Cached(state));
+            }
+            LazyInterned::BudgetDeclined => {
+                workspace.lazy.retain_scratch_as_frontier()?;
+                return Ok(LazyState::Inline { pending });
+            }
+            LazyInterned::CapacityFull => {
+                validate_lazy_capacity_full(
+                    automaton.stats().consuming_states(),
+                    "exact small resume frontier exhausted its proven cache capacity",
+                )?;
+                workspace.lazy.saturated = true;
+                workspace.lazy.retain_scratch_as_frontier()?;
+                return Ok(LazyState::Inline { pending });
+            }
+        }
+    }
+
+    workspace.lazy.frontier[..length].copy_from_slice(seed);
+    workspace.lazy.frontier_len = length;
+    Ok(LazyState::Inline { pending })
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the exact resume loop keeps its committed endpoint and frontier together"
+)]
+fn execute_lazy_resume_loop(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    contract: OutputContract,
+    core_reserve: u64,
+    mut state: LazyState,
+    mut position: usize,
+    mut pending_end: Option<usize>,
+) -> Result<(Option<MatchSpan>, usize), SearchError> {
+    let earliest = matches!(
+        contract,
+        OutputContract::Exists | OutputContract::EarliestEnd
+    );
+    if earliest && pending_end.is_some() {
+        return Ok((
+            pending_end.map(|end| MatchSpan::new(window.start(), end)),
+            1,
+        ));
+    }
+    let mut boundaries = 1usize;
+    loop {
+        if position == window.end() {
+            return Ok((
+                pending_end.map(|end| MatchSpan::new(window.start(), end)),
+                boundaries,
+            ));
+        }
+        meter.charge(1, position)?;
+        let byte = *haystack
+            .get(position)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "resume source position exceeded the validated window",
+            })?;
+        let transition = match state {
+            LazyState::Cached(cached) => {
+                let cell = workspace.lazy.cell(cached, byte)?;
+                if cell == LAZY_CELL_UNFILLED {
+                    build_lazy_cached_transition(
+                        automaton,
+                        cached,
+                        byte,
+                        workspace,
+                        meter,
+                        core_reserve,
+                        position,
+                    )?
+                } else {
+                    LazyTransition::Ready(cell)
+                }
+            }
+            LazyState::Inline { pending } => {
+                build_lazy_inline_transition(automaton, byte, pending, workspace, meter, position)?
+            }
+        };
+        position = position
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "resume input position",
+            })?;
+        boundaries = boundaries
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "resume examined boundary count",
+            })?;
+
+        let (accepted, next) = match transition {
+            LazyTransition::Ready(cell) => {
+                let encoded = cell & LAZY_CELL_STATE_MASK;
+                (
+                    cell & LAZY_CELL_ACCEPT != 0,
+                    if encoded == 0 {
+                        None
+                    } else {
+                        Some(LazyState::Cached(encoded.checked_sub(1).ok_or(
+                            SearchError::InternalInvariant {
+                                detail: "resume encoded state underflowed",
+                            },
+                        )?))
+                    },
+                )
+            }
+            LazyTransition::Inline { accepted, pending } => {
+                (accepted, Some(LazyState::Inline { pending }))
+            }
+        };
+        if accepted {
+            pending_end = Some(position);
+            if earliest {
+                return Ok((
+                    Some(MatchSpan::new(window.start(), position)),
+                    boundaries,
+                ));
+            }
+        }
+        let Some(next) = next else {
+            return Ok((
+                pending_end.map(|end| MatchSpan::new(window.start(), end)),
+                boundaries,
+            ));
+        };
+        state = next;
+    }
 }
 
 #[allow(
@@ -8761,7 +9460,7 @@ mod tests {
             START_FILTER_MAX_SELECTION_WORK, START_FILTER_POSITION_COUNT,
             START_FILTER_PROBE_SELECTION_WORK, START_FILTER_SCANNER_SELECTION_WORK,
         },
-        Automaton, CompileLimits, EarliestEnd, EdgeKind, Exists, K0SearchSession,
+        Automaton, CompileLimits, EarliestEnd, EdgeKind, Exists, K0ResumeSet, K0SearchSession,
         K0SpanSourceCursor, K0Workspace, MatchSpan, OutputContract, RawPlan, ResourceKind,
         SearchError, SearchLimits, SearchWindow, SelectedEnd, Span, StateRole, WorkspaceLimits,
     };
@@ -19207,5 +19906,97 @@ mod tests {
             Some(2)
         );
         assert!(workspace.lazy.is_bound_to(&plan));
+    }
+
+    #[test]
+    fn ordered_frontier_resume_is_graph_bound_and_recovers_exact_span() {
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b')]);
+        let frontier = [1_u32];
+        let mut resume = K0ResumeSet::new(&plan, 1, 1, [(&frontier[..], false)]).unwrap();
+        let mut workspace =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let haystack = b"zzabzzab";
+        let window = SearchWindow::full(haystack);
+
+        let selected = plan
+            .prepare::<SelectedEnd>()
+            .search_window_from_ordered_resume(
+                haystack,
+                window,
+                &mut workspace,
+                &mut resume,
+                0,
+                3,
+                None,
+                SearchLimits::unlimited(),
+            )
+            .unwrap()
+            .into_output();
+        assert_eq!(selected, Some(4));
+
+        let span = plan
+            .prepare::<Span>()
+            .search_window_from_ordered_resume(
+                haystack,
+                window,
+                &mut workspace,
+                &mut resume,
+                0,
+                3,
+                None,
+                SearchLimits::unlimited(),
+            )
+            .unwrap()
+            .into_output();
+        assert_eq!(span, Some(MatchSpan::new(2, 4)));
+
+        assert!(matches!(
+            plan.prepare::<SelectedEnd>()
+                .search_window_from_ordered_resume(
+                    haystack,
+                    window,
+                    &mut workspace,
+                    &mut resume,
+                    0,
+                    3,
+                    Some(2),
+                    SearchLimits::unlimited(),
+                ),
+            Err(SearchError::InvalidResumeState { .. })
+        ));
+
+        let cloned = plan.clone();
+        let mut cloned_workspace =
+            K0Workspace::new_accelerated(&cloned, WorkspaceLimits::unlimited()).unwrap();
+        assert!(matches!(
+            cloned
+                .prepare::<SelectedEnd>()
+                .search_window_from_ordered_resume(
+                    haystack,
+                    window,
+                    &mut cloned_workspace,
+                    &mut resume,
+                    0,
+                    3,
+                    None,
+                    SearchLimits::unlimited(),
+                ),
+            Err(SearchError::InvalidResumeState { .. })
+        ));
+    }
+
+    #[test]
+    fn ordered_frontier_resume_rejects_nonconsuming_and_duplicate_items() {
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b')]);
+        let accept = [2_u32];
+        assert!(matches!(
+            K0ResumeSet::new(&plan, 1, 1, [(&accept[..], false)]),
+            Err(SearchError::InvalidResumeState { .. })
+        ));
+        let duplicate = [1_u32, 1_u32];
+        assert!(matches!(
+            K0ResumeSet::new(&plan, 1, 2, [(&duplicate[..], false)]),
+            Err(SearchError::InvalidResumeState { .. })
+        ));
     }
 }
