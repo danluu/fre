@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 #[cfg(test)]
 use std::cell::Cell;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{
     CompileMode,
@@ -50,6 +51,47 @@ const PROGRAM_KNOWN_FLAGS: u8 = PROGRAM_FLAG_NFA_MANDATORY_SUFFIX
     | PROGRAM_FLAG_NFA_EXACT_PRODUCT
     | PROGRAM_FLAG_NFA_PARTIAL_DFA;
 const DEFAULT_LINE_TERMINATOR: u8 = b'\n';
+
+static NEXT_PROGRAM_INSTANCE_IDENTITY: AtomicU64 = AtomicU64::new(1);
+
+fn next_program_instance_identity() -> u64 {
+    NEXT_PROGRAM_INSTANCE_IDENTITY
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |identity| {
+            identity.checked_add(1)
+        })
+        .unwrap_or_else(|_| panic!("program instance identity space exhausted"))
+}
+
+/// Exact semantic artifact identity plus a process-local clone lineage.
+///
+/// Independently constructed programs still compare the complete stable
+/// SHA-256 digest. A program and its derived clones share the unique lineage,
+/// letting their prepared workspaces take one integer comparison on the hot
+/// path without an auxiliary allocation or atomic reference-count update.
+#[derive(Clone, Copy, Debug)]
+struct ProgramIdentity {
+    artifact: [u8; 32],
+    instance: u64,
+}
+
+impl ProgramIdentity {
+    const UNASSIGNED: Self = Self {
+        artifact: [0; 32],
+        instance: 0,
+    };
+
+    fn new(artifact: [u8; 32]) -> Self {
+        Self {
+            artifact,
+            instance: next_program_instance_identity(),
+        }
+    }
+
+    #[inline]
+    fn compatible(self, other: Self) -> bool {
+        self.instance == other.instance || self.artifact == other.artifact
+    }
+}
 /// Number of bytes that a runtime must read before it can discover the exact
 /// serialized artifact extent.
 pub const PROGRAM_HEADER_LEN: usize = 24;
@@ -1935,7 +1977,7 @@ fn derive_nfa_mandatory_cut(
 pub struct CompiledProgram {
     raw: RawPlan,
     automaton: Automaton,
-    identity: [u8; 32],
+    identity: ProgramIdentity,
     line_terminator: u8,
     output: OutputContract,
     engine: ProgramEngine,
@@ -2012,7 +2054,7 @@ impl ProgramOptimizationSidecar {
 /// executor instead of being reused across instances.
 #[derive(Debug)]
 pub struct ProgramWorkspace {
-    identity: [u8; 32],
+    identity: ProgramIdentity,
     nfa: Option<K0Workspace>,
     partial: Option<Box<PartialDfaWorkspace>>,
 }
@@ -2367,7 +2409,7 @@ impl CompiledProgram {
         let mut program = Self {
             raw,
             automaton,
-            identity: [0; 32],
+            identity: ProgramIdentity::UNASSIGNED,
             line_terminator,
             output,
             engine,
@@ -2397,7 +2439,7 @@ impl CompiledProgram {
         // prepared under one determinization limit or output contract from
         // being paired with a different table for the same regex language.
         // The length cap is checked before serialization allocates its output.
-        program.identity = program.serialized_sha256()?;
+        program.identity = ProgramIdentity::new(program.serialized_sha256()?);
         Ok(program)
     }
 
@@ -2566,7 +2608,7 @@ impl CompiledProgram {
     }
 
     pub(crate) const fn artifact_identity(&self) -> [u8; 32] {
-        self.identity
+        self.identity.artifact
     }
 
     /// Return the bounded graph-derived fixed-prefix facts.
@@ -2859,7 +2901,7 @@ impl CompiledProgram {
                 haystack_len: haystack.len(),
             });
         }
-        if workspace.identity != self.identity {
+        if !workspace.identity.compatible(self.identity) {
             return Err(CompileError::InternalInvariant(
                 "program workspace belongs to a different semantic program",
             ));
@@ -2973,7 +3015,7 @@ impl CompiledProgram {
                 haystack_len: haystack.len(),
             });
         }
-        if workspace.identity != self.identity {
+        if !workspace.identity.compatible(self.identity) {
             return Err(CompileError::InternalInvariant(
                 "program workspace belongs to a different semantic program",
             ));
@@ -3880,7 +3922,7 @@ impl CompiledProgram {
             EngineKind::OrderedNfa | EngineKind::OrderedContextDfa => None,
             EngineKind::OrderedDfa => Some(EngineSelectionReason::CompleteDfa),
         };
-        let identity: [u8; 32] = Sha256::digest(bytes).into();
+        let identity = ProgramIdentity::new(Sha256::digest(bytes).into());
         let anchored_prefix = derive_anchored_prefix(&raw);
         let anchored_suffix = derive_anchored_suffix(&raw);
         let required_literals = if engine_kind == EngineKind::OrderedDfa
