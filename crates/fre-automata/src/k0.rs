@@ -3234,11 +3234,15 @@ fn execute_lazy_loop(
             }
         }
         if !entered {
-            boundaries = boundaries
-                .checked_add(1)
-                .ok_or(SearchError::ArithmeticOverflow {
-                    computation: "lazy DFA examined boundary count",
-                })?;
+            // A Rust slice is no longer than `isize::MAX`, and this counter is
+            // at most the validated window length plus its initial boundary.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "the validated window proves the initial boundary increment fits"
+            )]
+            {
+                boundaries += 1;
+            }
             entered = true;
         }
         if position == window.end() {
@@ -3279,16 +3283,18 @@ fn execute_lazy_loop(
                 build_lazy_inline_transition(automaton, byte, pending, workspace, meter, position)?
             }
         };
-        position = position
-            .checked_add(1)
-            .ok_or(SearchError::ArithmeticOverflow {
-                computation: "lazy DFA input position",
-            })?;
-        boundaries = boundaries
-            .checked_add(1)
-            .ok_or(SearchError::ArithmeticOverflow {
-                computation: "lazy DFA examined boundary count",
-            })?;
+        // `position < window.end() <= haystack.len() <= isize::MAX` at this
+        // point. Carry that already-authenticated range proof directly rather
+        // than repeating fallible arithmetic on every warmed transition.
+        debug_assert!(position < window.end());
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "the validated window proves hot-loop position and boundary increments fit"
+        )]
+        {
+            position += 1;
+            boundaries += 1;
+        }
 
         let (accepted, next) = match transition {
             LazyTransition::Ready(cell) => {
