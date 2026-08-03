@@ -88,7 +88,7 @@ impl ProgramIdentity {
     }
 
     #[inline]
-    fn compatible(self, other: Self) -> bool {
+    fn compatible(&self, other: &Self) -> bool {
         self.instance == other.instance || self.artifact == other.artifact
     }
 }
@@ -2901,7 +2901,7 @@ impl CompiledProgram {
                 haystack_len: haystack.len(),
             });
         }
-        if !workspace.identity.compatible(self.identity) {
+        if !workspace.identity.compatible(&self.identity) {
             return Err(CompileError::InternalInvariant(
                 "program workspace belongs to a different semantic program",
             ));
@@ -3015,7 +3015,7 @@ impl CompiledProgram {
                 haystack_len: haystack.len(),
             });
         }
-        if !workspace.identity.compatible(self.identity) {
+        if !workspace.identity.compatible(&self.identity) {
             return Err(CompileError::InternalInvariant(
                 "program workspace belongs to a different semantic program",
             ));
