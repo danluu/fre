@@ -4170,7 +4170,7 @@ fn seed_lazy_resume_state(
         if cached_pending == pending
             && workspace.lazy.items.get(cached_offset..cached_end) == Some(seed)
         {
-            return Ok(LazyState::Cached(cached_hint));
+            return Ok(LazyState::Cached(direct_row_offset(cached_hint)?));
         }
     }
     resume_set.cached_states[resume_state] = LAZY_NO_STATE;
@@ -4193,7 +4193,7 @@ fn seed_lazy_resume_state(
         {
             LazyInterned::State(state) => {
                 resume_set.cached_states[resume_state] = state;
-                return Ok(LazyState::Cached(state));
+                return Ok(LazyState::Cached(direct_row_offset(state)?));
             }
             LazyInterned::BudgetDeclined => {
                 workspace.lazy.retain_scratch_as_frontier()?;
@@ -4258,11 +4258,11 @@ fn execute_lazy_resume_loop(
             })?;
         let transition = match state {
             LazyState::Cached(cached) => {
-                let cell = workspace.lazy.cell(cached, byte)?;
+                let cell = workspace.lazy.direct_cell(cached, byte)?;
                 if cell == LAZY_CELL_UNFILLED {
                     build_lazy_cached_transition(
                         automaton,
-                        cached,
+                        direct_row_state(cached),
                         byte,
                         workspace,
                         meter,

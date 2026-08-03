@@ -1371,7 +1371,21 @@ fn scan_full_cut(set: ByteSet256, classifier: &ByteSetClassifier, haystack: &[u8
 )]
 enum ProgramEngine {
     OrderedNfa,
+    OrderedNfaWithPartial(Box<PartialDfa>),
     OrderedDfa(OrderedDfa),
+}
+
+impl ProgramEngine {
+    const fn is_ordered_nfa(&self) -> bool {
+        matches!(self, Self::OrderedNfa | Self::OrderedNfaWithPartial(_))
+    }
+
+    const fn partial_dfa(&self) -> Option<&PartialDfa> {
+        match self {
+            Self::OrderedNfaWithPartial(partial) => Some(partial),
+            Self::OrderedNfa | Self::OrderedDfa(_) => None,
+        }
+    }
 }
 
 fn derive_nfa_suffix(
@@ -1383,7 +1397,7 @@ fn derive_nfa_suffix(
     enabled: bool,
 ) -> Option<NfaMandatorySuffix> {
     if !enabled
-        || !matches!(engine, ProgramEngine::OrderedNfa)
+        || !engine.is_ordered_nfa()
         || raw
             .edge_kinds
             .iter()
@@ -1401,7 +1415,7 @@ fn derive_nfa_mandatory_cut(
     mandatory_suffix_present: bool,
     enabled: bool,
 ) -> Option<NfaMandatoryCut> {
-    if !enabled || mandatory_suffix_present || !matches!(engine, ProgramEngine::OrderedNfa) {
+    if !enabled || mandatory_suffix_present || !engine.is_ordered_nfa() {
         return None;
     }
 
@@ -1459,10 +1473,6 @@ pub struct CompiledProgram {
     required_literals: RequiredLiterals,
     exact_match_width: Option<usize>,
     max_match_width: MaxMatchWidthStats,
-    /// Canonical compile-time subset rows retained after a bounded complete
-    /// determinization attempt declines. Execution side-exits with the exact
-    /// ordered frontier into K0 on the first absent row.
-    partial_dfa: Option<Box<PartialDfa>>,
     nfa_mandatory_suffix: Option<NfaMandatorySuffix>,
     nfa_mandatory_cut: Option<NfaMandatoryCut>,
 }
@@ -1476,8 +1486,16 @@ pub struct CompiledProgram {
 pub struct ProgramWorkspace {
     identity: [u8; 32],
     nfa: Option<K0Workspace>,
-    partial_resume: Option<Box<K0ResumeSet>>,
-    partial_dfa: Option<Box<PartialDfaRuntimeState>>,
+    partial: Option<Box<PartialDfaWorkspace>>,
+}
+
+/// Scratch used only by an ordered-NFA program with retained subset rows.
+/// Keeping the route in one optional owner leaves ordinary NFA workspaces
+/// unchanged apart from one cold pointer-sized niche.
+#[derive(Debug)]
+struct PartialDfaWorkspace {
+    resume: Option<K0ResumeSet>,
+    state: PartialDfaRuntimeState,
 }
 
 /// Per-prepared-workspace admission state for a retained partial table.
@@ -1705,6 +1723,18 @@ impl CompiledProgram {
                     mode == CompileMode::Optimizing && context_dfa.is_none(),
                 )
             });
+        let engine = match (engine, partial_dfa.filter(|_| nfa_exact_product.is_none())) {
+            (ProgramEngine::OrderedNfa, Some(partial)) => {
+                ProgramEngine::OrderedNfaWithPartial(Box::new(partial))
+            }
+            (engine, None) => engine,
+            (ProgramEngine::OrderedNfaWithPartial(_), Some(_))
+            | (ProgramEngine::OrderedDfa(_), Some(_)) => {
+                return Err(CompileError::InternalInvariant(
+                    "partial DFA was paired with a non-fallback engine",
+                ));
+            }
+        };
         Ok(Self {
             raw,
             automaton,
@@ -1721,7 +1751,6 @@ impl CompiledProgram {
             required_literals,
             exact_match_width,
             max_match_width,
-            partial_dfa: partial_dfa.map(Box::new),
             nfa_mandatory_suffix,
             nfa_mandatory_cut,
         })
@@ -1744,7 +1773,9 @@ impl CompiledProgram {
             return EngineKind::OrderedContextDfa;
         }
         match self.engine {
-            ProgramEngine::OrderedNfa => EngineKind::OrderedNfa,
+            ProgramEngine::OrderedNfa | ProgramEngine::OrderedNfaWithPartial(_) => {
+                EngineKind::OrderedNfa
+            }
             ProgramEngine::OrderedDfa(_) => EngineKind::OrderedDfa,
         }
     }
@@ -1761,7 +1792,7 @@ impl CompiledProgram {
                 flags |= PROGRAM_FLAG_NFA_MANDATORY_CUT;
             }
         }
-        if self.partial_dfa.is_some() {
+        if matches!(self.engine, ProgramEngine::OrderedNfaWithPartial(_)) {
             flags |= PROGRAM_FLAG_NFA_PARTIAL_DFA;
         }
         flags
@@ -1782,9 +1813,13 @@ impl CompiledProgram {
     #[must_use]
     pub const fn dfa_stats(&self) -> Option<DfaStats> {
         match &self.engine {
-            ProgramEngine::OrderedNfa => None,
+            ProgramEngine::OrderedNfa | ProgramEngine::OrderedNfaWithPartial(_) => None,
             ProgramEngine::OrderedDfa(machine) => Some(machine.stats()),
         }
+    }
+
+    fn partial_dfa(&self) -> Option<&PartialDfa> {
+        self.engine.partial_dfa()
     }
 
     /// Return dimensions of the optional in-memory contextual optimizer.
@@ -1918,7 +1953,7 @@ impl CompiledProgram {
     #[allow(dead_code, reason = "structural handoff for native code generation")]
     pub(crate) fn native_dfa_view(&self) -> Option<NativeProgramView<'_>> {
         match &self.engine {
-            ProgramEngine::OrderedNfa => None,
+            ProgramEngine::OrderedNfa | ProgramEngine::OrderedNfaWithPartial(_) => None,
             ProgramEngine::OrderedDfa(machine) => Some(NativeProgramView {
                 output: self.output,
                 raw: &self.raw,
@@ -1969,17 +2004,13 @@ impl CompiledProgram {
     /// Returns a portable executor error if the NFA workspace cannot be
     /// prepared.
     pub fn prepare_workspace(&self) -> Result<ProgramWorkspace, CompileError> {
-        let nfa = match self.engine {
-            ProgramEngine::OrderedNfa
-                if self
-                    .nfa_mandatory_cut
-                    .as_ref()
-                    .and_then(NfaMandatoryCut::exact_product)
-                    .is_some() =>
-            {
-                None
-            }
-            ProgramEngine::OrderedNfa => Some(match self.output {
+        let exact_product = self
+            .nfa_mandatory_cut
+            .as_ref()
+            .and_then(NfaMandatoryCut::exact_product)
+            .is_some();
+        let nfa = if self.engine.is_ordered_nfa() && !exact_product {
+            Some(match self.output {
                 OutputContract::Exists | OutputContract::SelectedEnd => {
                     K0Workspace::new_accelerated(&self.automaton, WorkspaceLimits::unlimited())?
                 }
@@ -1989,34 +2020,34 @@ impl CompiledProgram {
                 OutputContract::Span => {
                     K0Workspace::new_bidirectional(&self.automaton, WorkspaceLimits::unlimited())?
                 }
-            }),
-            ProgramEngine::OrderedDfa(_) => None,
+            })
+        } else {
+            None
         };
-        let partial_resume = self
-            .partial_dfa
-            .as_deref()
-            .filter(|partial| partial.resume_frontier_count() != 0)
+        let partial = self
+            .partial_dfa()
             .map(|partial| {
-                K0ResumeSet::new(
-                    &self.automaton,
-                    partial.resume_frontier_count(),
-                    partial.resume_item_count()?,
-                    partial.resume_frontiers(),
-                )
-                .map(Box::new)
-                .map_err(CompileError::from)
+                let resume = (partial.resume_frontier_count() != 0)
+                    .then(|| {
+                        K0ResumeSet::new(
+                            &self.automaton,
+                            partial.resume_frontier_count(),
+                            partial.resume_item_count()?,
+                            partial.resume_frontiers(),
+                        )
+                        .map_err(CompileError::from)
+                    })
+                    .transpose()?;
+                Ok::<_, CompileError>(Box::new(PartialDfaWorkspace {
+                    resume,
+                    state: PartialDfaRuntimeState::new(self.anchored_prefix.sets()),
+                }))
             })
             .transpose()?;
-        let partial_dfa = self.partial_dfa.as_ref().map(|_| {
-            Box::new(PartialDfaRuntimeState::new(
-                self.anchored_prefix.sets(),
-            ))
-        });
         Ok(ProgramWorkspace {
             identity: self.identity,
             nfa,
-            partial_resume,
-            partial_dfa,
+            partial,
         })
     }
 
@@ -2051,17 +2082,6 @@ impl CompiledProgram {
         match &self.engine {
             ProgramEngine::OrderedNfa => {
                 if let Some(nfa) = workspace.nfa.as_mut() {
-                    if let Some(state) = workspace.partial_dfa.as_deref_mut()
-                        && let Some(found) = self.search_nfa_with_partial_dfa(
-                            haystack,
-                            window,
-                            nfa,
-                            &mut workspace.partial_resume,
-                            state,
-                        )?
-                    {
-                        return Ok(found);
-                    }
                     return self.search_nfa(haystack, window, nfa);
                 }
                 let product = self
@@ -2072,6 +2092,31 @@ impl CompiledProgram {
                         "ordered-NFA program workspace has no executable storage",
                     ))?;
                 Ok(product.search(&self.anchored_prefix, haystack, window, self.output))
+            }
+            ProgramEngine::OrderedNfaWithPartial(partial) => {
+                let nfa = workspace
+                    .nfa
+                    .as_mut()
+                    .ok_or(CompileError::InternalInvariant(
+                        "partial-DFA program workspace has no K0 storage",
+                    ))?;
+                let Some(partial_workspace) = workspace.partial.as_deref_mut() else {
+                    // A workspace prepared by the structurally identical fast
+                    // program remains compatible. It simply takes the
+                    // ordinary K0 route selected for that prepared session.
+                    return self.search_nfa(haystack, window, nfa);
+                };
+                if let Some(found) = self.search_nfa_with_partial_dfa(
+                    partial,
+                    haystack,
+                    window,
+                    nfa,
+                    &mut partial_workspace.resume,
+                    &mut partial_workspace.state,
+                )? {
+                    return Ok(found);
+                }
+                self.search_nfa(haystack, window, nfa)
             }
             ProgramEngine::OrderedDfa(machine) => {
                 match self.output {
@@ -2152,15 +2197,13 @@ impl CompiledProgram {
     /// original prefix is never replayed.
     fn search_nfa_with_partial_dfa(
         &self,
+        partial: &PartialDfa,
         haystack: &[u8],
         window: SearchWindow,
         workspace: &mut K0Workspace,
-        resume_set: &mut Option<Box<K0ResumeSet>>,
+        resume_set: &mut Option<K0ResumeSet>,
         state: &mut PartialDfaRuntimeState,
     ) -> Result<Option<MatchResult>, CompileError> {
-        let Some(partial) = &self.partial_dfa else {
-            return Ok(None);
-        };
         if !state.admit() {
             return Ok(None);
         }
@@ -2177,14 +2220,8 @@ impl CompiledProgram {
                     state.observe_complete();
                     Ok(Some(MatchResult::Exists(found)))
                 }
-                PartialDfaResult::Resume(resume) => self.resolve_partial_hole(
-                    haystack,
-                    window,
-                    workspace,
-                    resume_set,
-                    state,
-                    resume,
-                ),
+                PartialDfaResult::Resume(resume) => self
+                    .resolve_partial_hole(haystack, window, workspace, resume_set, state, resume),
             },
             OutputContract::SelectedEnd => {
                 match partial.selected_end(
@@ -2199,12 +2236,7 @@ impl CompiledProgram {
                         Ok(Some(MatchResult::SelectedEnd(found)))
                     }
                     PartialDfaResult::Resume(resume) => self.resolve_partial_hole(
-                        haystack,
-                        window,
-                        workspace,
-                        resume_set,
-                        state,
-                        resume,
+                        haystack, window, workspace, resume_set, state, resume,
                     ),
                 }
             }
@@ -2217,12 +2249,7 @@ impl CompiledProgram {
                     state.prefix_plan,
                 )? {
                     PartialDfaResult::Resume(resume) => self.resolve_partial_hole(
-                        haystack,
-                        window,
-                        workspace,
-                        resume_set,
-                        state,
-                        resume,
+                        haystack, window, workspace, resume_set, state, resume,
                     ),
                     PartialDfaResult::Complete(None) => {
                         state.observe_complete();
@@ -2237,11 +2264,11 @@ impl CompiledProgram {
                             state.observe_fallback(input_bytes, input_bytes);
                             return Ok(None);
                         };
-                        let start = end.checked_sub(width).ok_or(
-                            CompileError::InternalInvariant(
-                                "partial fixed-width match end preceded its proved width",
-                            ),
-                        )?;
+                        let start =
+                            end.checked_sub(width)
+                                .ok_or(CompileError::InternalInvariant(
+                                    "partial fixed-width match end preceded its proved width",
+                                ))?;
                         state.observe_complete();
                         Ok(Some(MatchResult::Span(Some((start, end)))))
                     }
@@ -2255,7 +2282,7 @@ impl CompiledProgram {
         haystack: &[u8],
         window: SearchWindow,
         workspace: &mut K0Workspace,
-        resume_set: &mut Option<Box<K0ResumeSet>>,
+        resume_set: &mut Option<K0ResumeSet>,
         state: &mut PartialDfaRuntimeState,
         resume: PartialDfaResume,
     ) -> Result<Option<MatchResult>, CompileError> {
@@ -2270,19 +2297,14 @@ impl CompiledProgram {
             return Ok(Some(found));
         }
         if resume_set
-            .as_deref()
+            .as_ref()
             .is_none_or(|set| !set.is_bound_to(&self.automaton))
         {
             state.observe_fallback(consumed, input_bytes);
             return Ok(None);
         }
-        let found = self.search_nfa_from_partial_resume(
-            haystack,
-            window,
-            workspace,
-            resume_set,
-            resume,
-        )?;
+        let found =
+            self.search_nfa_from_partial_resume(haystack, window, workspace, resume_set, resume)?;
         state.observe_resume();
         Ok(Some(found))
     }
@@ -2292,14 +2314,12 @@ impl CompiledProgram {
         haystack: &[u8],
         window: SearchWindow,
         workspace: &mut K0Workspace,
-        resume_set: &mut Option<Box<K0ResumeSet>>,
+        resume_set: &mut Option<K0ResumeSet>,
         resume: PartialDfaResume,
     ) -> Result<MatchResult, CompileError> {
-        let resume_set = resume_set
-            .as_deref_mut()
-            .ok_or(CompileError::InternalInvariant(
-                "partial DFA hole has no authenticated K0 resume set",
-            ))?;
+        let resume_set = resume_set.as_mut().ok_or(CompileError::InternalInvariant(
+            "partial DFA hole has no authenticated K0 resume set",
+        ))?;
         let k0_window = K0SearchWindow::new(window.start, window.end);
         let limits = SearchLimits::unlimited();
         match self.output {
@@ -2645,10 +2665,8 @@ impl CompiledProgram {
     pub fn serialized_len(&self) -> Result<usize, CompileError> {
         let raw = raw_serialized_len(&self.raw)?;
         let dfa = match &self.engine {
-            ProgramEngine::OrderedNfa => self
-                .partial_dfa
-                .as_deref()
-                .map_or(Ok(0), PartialDfa::serialized_len)?,
+            ProgramEngine::OrderedNfa => 0,
+            ProgramEngine::OrderedNfaWithPartial(partial) => partial.serialized_len()?,
             ProgramEngine::OrderedDfa(machine) => machine.serialized_len()?,
         };
         PROGRAM_HEADER_LEN
@@ -2686,10 +2704,8 @@ impl CompiledProgram {
         );
         serialize_raw(&self.raw, &mut bytes);
         let dfa_len = match &self.engine {
-            ProgramEngine::OrderedNfa => self
-                .partial_dfa
-                .as_deref()
-                .map_or(Ok(0), PartialDfa::serialized_len)?,
+            ProgramEngine::OrderedNfa => 0,
+            ProgramEngine::OrderedNfaWithPartial(partial) => partial.serialized_len()?,
             ProgramEngine::OrderedDfa(machine) => machine.serialized_len()?,
         };
         put_u64(
@@ -2699,11 +2715,8 @@ impl CompiledProgram {
             })?,
         );
         match &self.engine {
-            ProgramEngine::OrderedNfa => {
-                if let Some(partial) = &self.partial_dfa {
-                    partial.serialize_into(&mut bytes);
-                }
-            }
+            ProgramEngine::OrderedNfa => {}
+            ProgramEngine::OrderedNfaWithPartial(partial) => partial.serialize_into(&mut bytes),
             ProgramEngine::OrderedDfa(machine) => machine.serialize_into(&mut bytes),
         }
         if bytes.len() != expected {
@@ -2943,6 +2956,23 @@ impl CompiledProgram {
         let nfa_mandatory_cut = nfa_exact_product
             .map(NfaMandatoryCut::from_exact_product)
             .or(ordinary_mandatory_cut);
+        if nfa_exact_product.is_some() && partial_dfa.is_some() {
+            return Err(ProgramFormatError::Malformed(
+                "exact-product and partial-DFA sidecars are mutually exclusive",
+            ));
+        }
+        let engine = match (engine, partial_dfa) {
+            (ProgramEngine::OrderedNfa, Some(partial)) => {
+                ProgramEngine::OrderedNfaWithPartial(partial)
+            }
+            (engine, None) => engine,
+            (ProgramEngine::OrderedNfaWithPartial(_), Some(_))
+            | (ProgramEngine::OrderedDfa(_), Some(_)) => {
+                return Err(ProgramFormatError::Malformed(
+                    "partial DFA was paired with a non-fallback engine",
+                ));
+            }
+        };
         let program = Self {
             raw,
             automaton,
@@ -2959,7 +2989,6 @@ impl CompiledProgram {
             required_literals,
             exact_match_width,
             max_match_width,
-            partial_dfa,
             nfa_mandatory_suffix,
             nfa_mandatory_cut,
         };
@@ -6405,8 +6434,7 @@ mod tests {
             let partial = program(pattern, output, CompileMode::Optimizing, limits);
             assert_eq!(partial.engine_kind(), EngineKind::OrderedNfa);
             let retained = partial
-                .partial_dfa
-                .as_ref()
+                .partial_dfa()
                 .unwrap_or_else(|| panic!("missing retained rows for {output:?}"));
             let (complete_rows, discovered_states) = retained.retained_dimensions();
             assert!(complete_rows > 0);
@@ -6422,7 +6450,7 @@ mod tests {
             );
             assert_ne!(bytes[15] & PROGRAM_FLAG_NFA_PARTIAL_DFA, 0);
             let restored = CompiledProgram::deserialize(&bytes).expect("restore partial DFA");
-            assert!(restored.partial_dfa.is_some());
+            assert!(restored.partial_dfa().is_some());
             assert_eq!(restored.serialize().unwrap(), bytes);
 
             let reference = program(
@@ -6460,11 +6488,11 @@ mod tests {
                 }
             }
             assert!(
-                partial_workspace.partial_dfa.as_deref().unwrap().resumed > 0,
+                partial_workspace.partial.as_deref().unwrap().state.resumed > 0,
                 "fresh {output:?} never exercised stateful K0 resume"
             );
             assert!(
-                restored_workspace.partial_dfa.as_deref().unwrap().resumed > 0,
+                restored_workspace.partial.as_deref().unwrap().state.resumed > 0,
                 "restored {output:?} never exercised stateful K0 resume"
             );
         }
@@ -6482,13 +6510,19 @@ mod tests {
                 ..DeterminizeLimits::default()
             },
         );
-        let partial = limited.partial_dfa.as_ref().expect("retained rows");
+        let partial = limited.partial_dfa().expect("retained rows");
         assert!(limited.nfa_mandatory_suffix.is_some());
         let (prefix_plan, supported) = PartialDfaPrefixPlan::derive(limited.anchored_prefix.sets());
         assert!(supported);
         let haystack = b"cbbbbbbbbbbz";
         let resume = match partial
-            .selected_end(haystack, 0, haystack.len(), limited.anchored_prefix.sets(), prefix_plan)
+            .selected_end(
+                haystack,
+                0,
+                haystack.len(),
+                limited.anchored_prefix.sets(),
+                prefix_plan,
+            )
             .expect("partial probe")
         {
             PartialDfaResult::Resume(resume) => resume,
@@ -6512,17 +6546,13 @@ mod tests {
         for attempt in 0..2 {
             assert_eq!(
                 limited
-                    .search_with_workspace(
-                        haystack,
-                        SearchWindow::full(haystack),
-                        &mut workspace,
-                    )
+                    .search_with_workspace(haystack, SearchWindow::full(haystack), &mut workspace,)
                     .expect("accelerated search"),
                 expected,
                 "attempt {attempt}"
             );
         }
-        let state = workspace.partial_dfa.as_deref().unwrap();
+        let state = &workspace.partial.as_deref().unwrap().state;
         assert_eq!(state.resumed, 0);
         assert_eq!(state.consecutive_fallbacks, 2);
         assert!(state.bypass_remaining > 0);
@@ -6540,7 +6570,7 @@ mod tests {
                 ..DeterminizeLimits::default()
             },
         );
-        let partial = limited.partial_dfa.as_ref().expect("retained rows");
+        let partial = limited.partial_dfa().expect("retained rows");
         assert!(limited.nfa_mandatory_suffix.is_none());
         assert!(limited.nfa_mandatory_cut.is_some());
         let bytes = limited.serialize().expect("serialize combined sidecars");
@@ -6549,7 +6579,7 @@ mod tests {
             PROGRAM_FLAG_NFA_MANDATORY_CUT | PROGRAM_FLAG_NFA_PARTIAL_DFA
         );
         let restored = CompiledProgram::deserialize(&bytes).expect("restore combined sidecars");
-        assert!(restored.partial_dfa.is_some());
+        assert!(restored.partial_dfa().is_some());
         assert!(restored.nfa_mandatory_cut.is_some());
         assert_eq!(restored.serialize().unwrap(), bytes);
 
@@ -6557,7 +6587,13 @@ mod tests {
         assert!(supported);
         let haystack = b"cbbbbbbbbbbbb";
         let resume = match partial
-            .selected_end(haystack, 0, haystack.len(), limited.anchored_prefix.sets(), prefix_plan)
+            .selected_end(
+                haystack,
+                0,
+                haystack.len(),
+                limited.anchored_prefix.sets(),
+                prefix_plan,
+            )
             .expect("partial probe")
         {
             PartialDfaResult::Resume(resume) => resume,
@@ -6580,17 +6616,13 @@ mod tests {
         for attempt in 0..2 {
             assert_eq!(
                 limited
-                    .search_with_workspace(
-                        haystack,
-                        SearchWindow::full(haystack),
-                        &mut workspace,
-                    )
+                    .search_with_workspace(haystack, SearchWindow::full(haystack), &mut workspace,)
                     .expect("accelerated search"),
                 expected,
                 "attempt {attempt}"
             );
         }
-        let state = workspace.partial_dfa.as_deref().unwrap();
+        let state = &workspace.partial.as_deref().unwrap().state;
         assert_eq!(state.resumed, 0);
         assert_eq!(state.consecutive_fallbacks, 2);
         assert!(state.bypass_remaining > 0);
@@ -6599,15 +6631,11 @@ mod tests {
     #[test]
     fn partial_cold_payloads_are_indirect_and_absent_without_retained_rows() {
         assert_eq!(
-            core::mem::size_of::<Option<Box<PartialDfa>>>(),
+            core::mem::size_of::<Box<PartialDfa>>(),
             core::mem::size_of::<usize>()
         );
         assert_eq!(
-            core::mem::size_of::<Option<Box<K0ResumeSet>>>(),
-            core::mem::size_of::<usize>()
-        );
-        assert_eq!(
-            core::mem::size_of::<Option<Box<PartialDfaRuntimeState>>>(),
+            core::mem::size_of::<Option<Box<PartialDfaWorkspace>>>(),
             core::mem::size_of::<usize>()
         );
 
@@ -6620,10 +6648,10 @@ mod tests {
                 ..DeterminizeLimits::default()
             },
         );
-        assert!(limited.partial_dfa.is_none());
+        assert!(limited.partial_dfa().is_none());
+        assert!(matches!(limited.engine, ProgramEngine::OrderedNfa));
         let workspace = limited.prepare_workspace().expect("workspace");
-        assert!(workspace.partial_resume.is_none());
-        assert!(workspace.partial_dfa.is_none());
+        assert!(workspace.partial.is_none());
     }
 
     #[test]
@@ -6639,7 +6667,7 @@ mod tests {
             },
         );
         assert!(limited.nfa_mandatory_suffix.is_none());
-        let partial = limited.partial_dfa.as_ref().expect("retained rows");
+        let partial = limited.partial_dfa().expect("retained rows");
         let (prefix_plan, supported) = PartialDfaPrefixPlan::derive(limited.anchored_prefix.sets());
         assert!(supported);
         let haystack = b"cbbbbbbbbbbx";
@@ -6666,7 +6694,7 @@ mod tests {
             .search(haystack, SearchWindow::full(haystack))
             .expect("reference search");
         let mut foreign_workspace = reference.prepare_workspace().expect("foreign workspace");
-        assert!(foreign_workspace.partial_resume.is_none());
+        assert!(foreign_workspace.partial.is_none());
         assert_eq!(
             limited
                 .search_with_workspace(
@@ -6677,7 +6705,7 @@ mod tests {
                 .expect("exact compatibility fallback"),
             expected
         );
-        assert!(foreign_workspace.partial_dfa.is_none());
+        assert!(foreign_workspace.partial.is_none());
     }
 
     #[test]
@@ -6695,7 +6723,7 @@ mod tests {
         assert!(limited.nfa_mandatory_suffix.is_none());
         let mut haystack = vec![b'a'; 4_096];
         haystack.extend(std::iter::repeat_n(b'b', 24));
-        let partial = limited.partial_dfa.as_ref().expect("retained rows");
+        let partial = limited.partial_dfa().expect("retained rows");
         let (prefix_plan, supported) = PartialDfaPrefixPlan::derive(limited.anchored_prefix.sets());
         assert!(supported);
         let resume = match partial
@@ -6728,15 +6756,11 @@ mod tests {
         let mut workspace = limited.prepare_workspace().expect("workspace");
         assert_eq!(
             limited
-                .search_with_workspace(
-                    &haystack,
-                    SearchWindow::full(&haystack),
-                    &mut workspace,
-                )
+                .search_with_workspace(&haystack, SearchWindow::full(&haystack), &mut workspace,)
                 .expect("resumed search"),
             expected
         );
-        assert_eq!(workspace.partial_dfa.as_deref().unwrap().resumed, 1);
+        assert_eq!(workspace.partial.as_deref().unwrap().state.resumed, 1);
     }
 
     #[test]
@@ -6767,8 +6791,7 @@ mod tests {
             ] {
                 let partial = program(pattern, output, CompileMode::Optimizing, limits);
                 let retained = partial
-                    .partial_dfa
-                    .as_ref()
+                    .partial_dfa()
                     .unwrap_or_else(|| panic!("missing partial table for {pattern:?}/{output:?}"));
                 let (complete, discovered) = retained.retained_dimensions();
                 assert!(complete < discovered, "{pattern:?}/{output:?}");
@@ -6794,11 +6817,7 @@ mod tests {
                         for end in start..=haystack.len() {
                             let window = SearchWindow::new(start, end);
                             let expected = reference
-                                .search_with_workspace(
-                                    haystack,
-                                    window,
-                                    &mut reference_workspace,
-                                )
+                                .search_with_workspace(haystack, window, &mut reference_workspace)
                                 .unwrap();
                             assert_eq!(
                                 partial
@@ -6815,7 +6834,7 @@ mod tests {
                     }
                 }
                 assert!(
-                    partial_workspace.partial_dfa.as_deref().unwrap().resumed > 0,
+                    partial_workspace.partial.as_deref().unwrap().state.resumed > 0,
                     "{pattern:?}/{output:?} never reached a retained hole"
                 );
             }
@@ -6860,7 +6879,7 @@ mod tests {
                 ..DeterminizeLimits::default()
             },
         );
-        assert!(compiled.partial_dfa.is_some());
+        assert!(compiled.partial_dfa().is_some());
         let bytes = compiled.serialize().unwrap();
         assert_ne!(bytes[15] & PROGRAM_FLAG_NFA_PARTIAL_DFA, 0);
 
@@ -6936,9 +6955,7 @@ mod tests {
         let mut descriptor = resume_descriptors;
         let mut swappable = None;
         for _ in complete..discovered {
-            let encoded = u32::from_le_bytes(
-                bytes[descriptor..descriptor + 4].try_into().unwrap(),
-            );
+            let encoded = u32::from_le_bytes(bytes[descriptor..descriptor + 4].try_into().unwrap());
             let length = usize::try_from(encoded & 0x7fff_ffff).unwrap();
             if length >= 2 {
                 swappable = Some(descriptor + 4);
