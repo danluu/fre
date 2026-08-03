@@ -605,6 +605,41 @@ struct NfaMandatorySuffix {
     reverse: SeededReverseDfa,
 }
 
+/// Find the first member of an arbitrary byte set through the host-selected
+/// wide/narrow classifier and a scalar tail.
+fn find_full_byte_set_member(
+    set: ByteSet256,
+    classifier: &ByteSetClassifier,
+    bytes: &[u8],
+) -> Option<usize> {
+    let mut position = 0usize;
+    while bytes.len().saturating_sub(position) >= BYTE_SET_WIDE_BLOCK_BYTES {
+        let end = position.checked_add(BYTE_SET_WIDE_BLOCK_BYTES)?;
+        let block: &[u8; BYTE_SET_WIDE_BLOCK_BYTES] =
+            bytes.get(position..end)?.try_into().ok()?;
+        let mask = classifier.classify_32(block).member_mask();
+        if mask != 0 {
+            return position.checked_add(usize::try_from(mask.trailing_zeros()).ok()?);
+        }
+        position = end;
+    }
+    if bytes.len().saturating_sub(position) >= BYTE_SET_BLOCK_BYTES {
+        let end = position.checked_add(BYTE_SET_BLOCK_BYTES)?;
+        let block: &[u8; BYTE_SET_BLOCK_BYTES] =
+            bytes.get(position..end)?.try_into().ok()?;
+        let mask = classifier.classify_16(block).member_mask();
+        if mask != 0 {
+            return position.checked_add(usize::try_from(mask.trailing_zeros()).ok()?);
+        }
+        position = end;
+    }
+    bytes
+        .get(position..)?
+        .iter()
+        .position(|&byte| set.contains(byte))
+        .and_then(|offset| position.checked_add(offset))
+}
+
 /// Complete scanner for an exact fixed-width Cartesian byte product.
 ///
 /// This sidecar is admitted only when a bounded graph walk proves that every
@@ -614,16 +649,22 @@ struct NfaMandatorySuffix {
 /// this preserves equivalent duplicated continuations without confusing a
 /// correlated alternation for a Cartesian language. Scanning one selective
 /// column and checking the remaining columns can then replace ordered-NFA
-/// execution without losing alternation or greediness semantics.
+/// execution without losing alternation or greediness semantics. Tiny sets
+/// retain the memchr family; every larger selective set uses the same
+/// target-dispatched full-byte classifier as the general runtime.
 #[derive(Clone, Copy, Debug)]
 struct NfaExactProduct {
-    primary_bytes: [u8; 3],
-    primary_count: u8,
     primary_offset: u8,
     width: u8,
 }
 
-impl NfaExactProduct {
+#[derive(Clone, Debug)]
+struct NfaExactProductPlan {
+    product: NfaExactProduct,
+    scanner: NfaMandatoryCutScanner,
+}
+
+impl NfaExactProductPlan {
     fn derive(
         raw: &RawPlan,
         prefix: &AnchoredPrefix,
@@ -642,49 +683,51 @@ impl NfaExactProduct {
             .iter()
             .copied()
             .enumerate()
-            .filter(|(_, set)| (1..=3).contains(&usize::from(set.cardinality())))
+            .filter(|(_, set)| (1..=255).contains(&usize::from(set.cardinality())))
             .min_by_key(|(offset, set)| (set.cardinality(), *offset != 0, *offset))?;
         if !nfa_prefix_is_exact_product(raw, prefix.sets()) {
             return None;
         }
-        let primary_count = usize::from(primary.cardinality());
-        let mut primary_bytes = [0_u8; 3];
-        let mut count = 0usize;
-        for byte in u8::MIN..=u8::MAX {
-            if !primary.contains(byte) {
-                continue;
+        let cardinality = usize::from(primary.cardinality());
+        let scanner = if cardinality <= 3 {
+            let mut bytes = [0_u8; 3];
+            let mut count = 0usize;
+            for byte in u8::MIN..=u8::MAX {
+                if !primary.contains(byte) {
+                    continue;
+                }
+                *bytes.get_mut(count)? = byte;
+                count = count.checked_add(1)?;
             }
-            *primary_bytes.get_mut(count)? = byte;
-            count = count.checked_add(1)?;
-        }
-        if count != primary_count {
-            return None;
-        }
+            if count != cardinality {
+                return None;
+            }
+            NfaMandatoryCutScanner::Small {
+                bytes,
+                count: u8::try_from(count).ok()?,
+            }
+        } else {
+            let set = ByteSet256::from_words(primary.words());
+            NfaMandatoryCutScanner::Full {
+                set,
+                classifier: ByteSetClassifier::new(set),
+            }
+        };
         Some(Self {
-            primary_bytes,
-            primary_count: u8::try_from(primary_count).ok()?,
-            primary_offset: u8::try_from(primary_offset).ok()?,
-            width: u8::try_from(width).ok()?,
+            product: NfaExactProduct {
+                primary_offset: u8::try_from(primary_offset).ok()?,
+                width: u8::try_from(width).ok()?,
+            },
+            scanner,
         })
     }
+}
 
-    fn find_primary(&self, haystack: &[u8]) -> Option<usize> {
-        match self.primary_count {
-            1 => memchr(self.primary_bytes[0], haystack),
-            2 => memchr2(self.primary_bytes[0], self.primary_bytes[1], haystack),
-            3 => memchr3(
-                self.primary_bytes[0],
-                self.primary_bytes[1],
-                self.primary_bytes[2],
-                haystack,
-            ),
-            _ => None,
-        }
-    }
-
+impl NfaExactProduct {
     #[inline(never)]
     fn search(
-        &self,
+        self,
+        scanner: &NfaMandatoryCutScanner,
         prefix: &AnchoredPrefix,
         haystack: &[u8],
         window: SearchWindow,
@@ -717,7 +760,7 @@ impl NfaExactProduct {
             let Some(source) = haystack.get(scan..scan_end) else {
                 return no_match();
             };
-            let Some(relative) = self.find_primary(source) else {
+            let Some(relative) = scanner.find_exact_product_primary(source) else {
                 return no_match();
             };
             let Some(hit) = scan.checked_add(relative) else {
@@ -1430,15 +1473,31 @@ enum NfaMandatoryCutScanner {
     },
 }
 
+impl NfaMandatoryCutScanner {
+    fn find_exact_product_primary(&self, haystack: &[u8]) -> Option<usize> {
+        match self {
+            Self::Small { bytes, count: 1 } => memchr(bytes[0], haystack),
+            Self::Small { bytes, count: 2 } => memchr2(bytes[0], bytes[1], haystack),
+            Self::Small { bytes, count: 3 } => {
+                memchr3(bytes[0], bytes[1], bytes[2], haystack)
+            }
+            Self::Small { .. } | Self::Ascii { .. } => None,
+            Self::Full { set, classifier } => {
+                find_full_byte_set_member(*set, classifier, haystack)
+            }
+        }
+    }
+}
+
 impl NfaMandatoryCut {
-    const fn from_exact_product(product: NfaExactProduct) -> Self {
+    fn from_exact_product(plan: NfaExactProductPlan) -> Self {
         Self {
             root_state: NFA_EXACT_PRODUCT_ROOT_SENTINEL,
-            cardinality: u16::from_le_bytes([product.width, product.primary_offset]),
-            scanner: NfaMandatoryCutScanner::Small {
-                bytes: product.primary_bytes,
-                count: product.primary_count,
-            },
+            cardinality: u16::from_le_bytes([
+                plan.product.width,
+                plan.product.primary_offset,
+            ]),
+            scanner: plan.scanner,
         }
     }
 
@@ -1447,15 +1506,19 @@ impl NfaMandatoryCut {
             return None;
         }
         let [width, primary_offset] = self.cardinality.to_le_bytes();
-        let NfaMandatoryCutScanner::Small { bytes, count } = &self.scanner else {
-            return None;
-        };
-        if width == 0 || primary_offset >= width || *count == 0 || *count > 3 {
+        match &self.scanner {
+            NfaMandatoryCutScanner::Small { count, .. } => {
+                if *count == 0 || *count > 3 {
+                    return None;
+                }
+            }
+            NfaMandatoryCutScanner::Full { .. } => {}
+            NfaMandatoryCutScanner::Ascii { .. } => return None,
+        }
+        if width == 0 || primary_offset >= width {
             return None;
         }
         Some(NfaExactProduct {
-            primary_bytes: *bytes,
-            primary_count: *count,
             primary_offset,
             width,
         })
@@ -2066,8 +2129,11 @@ impl CompiledProgram {
         };
         let max_match_width = derive_max_match_width(&raw);
         let nfa_exact_product = (mode == CompileMode::Optimizing)
-            .then(|| NfaExactProduct::derive(&raw, &anchored_prefix, exact_match_width, &engine))
+            .then(|| {
+                NfaExactProductPlan::derive(&raw, &anchored_prefix, exact_match_width, &engine)
+            })
             .flatten();
+        let has_nfa_exact_product = nfa_exact_product.is_some();
         let nfa_mandatory_suffix = (nfa_exact_product.is_none())
             .then(|| {
                 derive_nfa_suffix(
@@ -2093,7 +2159,7 @@ impl CompiledProgram {
             });
         let optimization_sidecar = match (
             context_determinization_report,
-            partial_dfa.filter(|_| nfa_exact_product.is_none()),
+            partial_dfa.filter(|_| !has_nfa_exact_product),
         ) {
             (Some(report), None) => ProgramOptimizationSidecar::Context(report),
             (None, Some(partial)) if matches!(engine, ProgramEngine::OrderedNfa) => {
@@ -2520,14 +2586,24 @@ impl CompiledProgram {
                 if let Some(nfa) = workspace.nfa.as_mut() {
                     return self.search_nfa(haystack, window, nfa);
                 }
-                let product = self
+                let accelerator = self
                     .nfa_mandatory_cut
                     .as_ref()
-                    .and_then(NfaMandatoryCut::exact_product)
                     .ok_or(CompileError::InternalInvariant(
                         "ordered-NFA program workspace has no executable storage",
                     ))?;
-                Ok(product.search(&self.anchored_prefix, haystack, window, self.output))
+                let product = accelerator.exact_product().ok_or(
+                    CompileError::InternalInvariant(
+                        "ordered-NFA program workspace has no executable storage",
+                    ),
+                )?;
+                Ok(product.search(
+                    &accelerator.scanner,
+                    &self.anchored_prefix,
+                    haystack,
+                    window,
+                    self.output,
+                ))
             }
             ProgramEngine::OrderedDfa(machine) => {
                 match self.output {
@@ -2724,7 +2800,13 @@ impl CompiledProgram {
     ) -> Option<MatchResult> {
         let accelerator = self.nfa_mandatory_cut.as_ref()?;
         if let Some(product) = accelerator.exact_product() {
-            return Some(product.search(&self.anchored_prefix, haystack, window, self.output));
+            return Some(product.search(
+                &accelerator.scanner,
+                &self.anchored_prefix,
+                haystack,
+                window,
+                self.output,
+            ));
         }
         let source = haystack.get(window.start..window.end)?;
         if accelerator.has_member(source) {
@@ -3492,8 +3574,11 @@ impl CompiledProgram {
         };
         let max_match_width = derive_max_match_width(&raw);
         let nfa_exact_product = exact_product_enabled
-            .then(|| NfaExactProduct::derive(&raw, &anchored_prefix, exact_match_width, &engine))
+            .then(|| {
+                NfaExactProductPlan::derive(&raw, &anchored_prefix, exact_match_width, &engine)
+            })
             .flatten();
+        let has_nfa_exact_product = nfa_exact_product.is_some();
         if exact_product_enabled != nfa_exact_product.is_some() {
             return Err(ProgramFormatError::Malformed(
                 "exact-product flag is incompatible with the embedded graph",
@@ -3527,7 +3612,7 @@ impl CompiledProgram {
         let nfa_mandatory_cut = nfa_exact_product
             .map(NfaMandatoryCut::from_exact_product)
             .or(ordinary_mandatory_cut);
-        if nfa_exact_product.is_some() && partial_dfa.is_some() {
+        if has_nfa_exact_product && partial_dfa.is_some() {
             return Err(ProgramFormatError::Malformed(
                 "exact-product and partial-DFA sidecars are mutually exclusive",
             ));
@@ -5490,6 +5575,14 @@ mod tests {
             ("(?:ab|cb)(?:d|e)", b"abcde".as_slice(), 4, Some(1_u8)),
             ("[ab]x", b"abxy".as_slice(), 3, Some(1_u8)),
             ("[ab][01]Z", b"ab01Zx".as_slice(), 3, Some(2_u8)),
+            ("[a-h][0-9]", b"ah09x".as_slice(), 3, Some(0_u8)),
+            ("[a-z][0-9A-F]", b"az09AFx".as_slice(), 3, Some(1_u8)),
+            (
+                r"(?-u:[\x00-\xFE])",
+                b"\x00\x01\xfe\xff".as_slice(),
+                2,
+                Some(0_u8),
+            ),
         ] {
             assert_exact_product_matches_fast_for_every_window(
                 pattern,
@@ -5519,6 +5612,102 @@ mod tests {
                 "correlated, early-accepting, or variable graph must decline: {pattern}"
             );
         }
+    }
+
+    #[test]
+    fn exact_product_primary_scanner_matches_scalar_for_every_selective_cardinality() {
+        let source = (0usize..384)
+            .map(|index| u8::try_from((index * 73 + 19) & 255).unwrap())
+            .collect::<Vec<_>>();
+        for cardinality in 4usize..=255 {
+            let mut words = [0_u64; 4];
+            for ordinal in 0..cardinality {
+                let byte = u8::try_from((ordinal * 197 + cardinality * 29) & 255).unwrap();
+                words[usize::from(byte) / 64] |= 1_u64 << (usize::from(byte) % 64);
+            }
+            let set = ByteSet256::from_words(words);
+            let scanner = NfaMandatoryCutScanner::Full {
+                set,
+                classifier: ByteSetClassifier::new(set),
+            };
+            for start in 0..32 {
+                for length in 0..=64 {
+                    let bytes = &source[start..start + length];
+                    assert_eq!(
+                        scanner.find_exact_product_primary(bytes),
+                        bytes.iter().position(|&byte| set.contains(byte)),
+                        "cardinality={cardinality}, start={start}, length={length}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exact_product_admits_every_structurally_selective_primary_cardinality() {
+        let fallback_limits = DeterminizeLimits {
+            max_states: 0,
+            ..DeterminizeLimits::default()
+        };
+        let one_column_graph = |end: u8| RawPlan {
+            start: 0,
+            roles: vec![StateRole::Consume, StateRole::Accept],
+            edge_offsets: vec![0, 1, 1],
+            edge_targets: vec![1],
+            edge_kinds: vec![EdgeKind::ByteRange],
+            byte_starts: vec![0],
+            byte_ends: vec![end],
+        };
+
+        for cardinality in 1usize..=255 {
+            let end = u8::try_from(cardinality - 1).unwrap();
+            let compiled = raw_program(
+                &one_column_graph(end),
+                OutputContract::Span,
+                CompileMode::Optimizing,
+                fallback_limits,
+            );
+            let accelerator = compiled
+                .nfa_mandatory_cut
+                .as_ref()
+                .unwrap_or_else(|| panic!("selective cardinality {cardinality} was declined"));
+            let product = accelerator
+                .exact_product()
+                .unwrap_or_else(|| panic!("selective cardinality {cardinality} was declined"));
+            assert_eq!(product.primary_offset, 0);
+            assert_eq!(product.width, 1);
+            match &accelerator.scanner {
+                NfaMandatoryCutScanner::Small { count, .. } => {
+                    assert!(cardinality <= 3);
+                    assert_eq!(usize::from(*count), cardinality);
+                }
+                NfaMandatoryCutScanner::Full { set, classifier } => {
+                    assert!(cardinality > 3);
+                    assert_eq!(classifier.set(), *set);
+                    assert_eq!(
+                        set.words().iter().map(|word| word.count_ones()).sum::<u32>(),
+                        u32::try_from(cardinality).unwrap()
+                    );
+                }
+                NfaMandatoryCutScanner::Ascii { .. } => {
+                    panic!("exact products use the full-byte classifier for larger sets")
+                }
+            }
+        }
+
+        let unselective = raw_program(
+            &one_column_graph(u8::MAX),
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            fallback_limits,
+        );
+        assert!(
+            unselective
+                .nfa_mandatory_cut
+                .as_ref()
+                .and_then(NfaMandatoryCut::exact_product)
+                .is_none()
+        );
     }
 
     #[test]
