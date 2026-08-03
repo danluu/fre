@@ -155,7 +155,7 @@ fn static_profile_rejects_policies_that_would_retarget_a_direct_leaf() {
     if static_run_variant_id(AsciiRunTableMode::SmallComplement) != SCALAR_RUN_VARIANT_ID {
         let error = SimdDispatchContext::capture()
             .ascii_byte_set_run_scanner_prefer_small_complement(
-                all_ascii_except(&[b'\n']),
+                all_ascii_except(b"\n"),
                 DispatchPolicy::Portable,
             )
             .expect_err("portable policy cannot retarget a compiler-fixed complement scanner");
@@ -1637,7 +1637,8 @@ fn forced_sve2_match_run_scanner_covers_every_small_set_size_and_lane() {
 #[allow(
     unsafe_code,
     clippy::arithmetic_side_effects,
-    reason = "the test gates private complement SVE2 leaves on independently proved immutable SVE and SVE2 host facts"
+    clippy::too_many_lines,
+    reason = "one exhaustive test keeps the private complement SVE2 feature gate, cardinalities, barriers, tails, alignments, and accounting adjacent"
 )]
 fn forced_sve2_complement_run_scanner_covers_holes_high_bytes_and_boundaries() {
     let required = FeatureSet::EMPTY
