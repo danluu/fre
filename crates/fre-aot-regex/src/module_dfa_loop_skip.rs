@@ -92,7 +92,16 @@ fn x86_restore_start_constants(
     layout: &NativeDfaLayout,
     vector_filter: Option<NativeVectorFilter>,
     kind: X86StartFilterKind,
+    use_exact_avx2: bool,
 ) -> Result<(), ObjectError> {
+    if use_exact_avx2 {
+        let storage = layout
+            .exact_start_storage
+            .ok_or(ObjectError::InvalidModule(
+                "x86 loop-skip restore lost exact scanner storage",
+            ))?;
+        return super::x86_emit_exact_avx2_constants(assembler, storage);
+    }
     if let Some(plan) = layout
         .prefix_relation
         .and_then(|relation| relation.vector_plan)
@@ -127,12 +136,17 @@ fn x86_restore_start_constants(
 ///
 /// `ordinary` is the original scalar transition body and `exhausted` is its
 /// existing end-of-window path. The function always branches to one of them.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the emitter needs the active scanner mode and its four control-flow inputs"
+)]
 pub(super) fn x86_emit_dfa_loop_skip(
     assembler: &mut X86Assembler,
     plan: NativeDfaLoopSkip,
     layout: &NativeDfaLayout,
     vector_filter: Option<NativeVectorFilter>,
     kind: X86StartFilterKind,
+    use_exact_avx2: bool,
     ordinary: X86Label,
     exhausted: X86Label,
 ) -> Result<(), ObjectError> {
@@ -232,7 +246,13 @@ pub(super) fn x86_emit_dfa_loop_skip(
     assembler.branch(&[0xe9], scalar)?;
 
     assembler.bind(exit)?;
-    x86_restore_start_constants(assembler, layout, vector_filter, kind)?;
+    x86_restore_start_constants(
+        assembler,
+        layout,
+        vector_filter,
+        kind,
+        use_exact_avx2,
+    )?;
     assembler.branch(&[0xe9], ordinary)?;
     Ok(())
 }
@@ -242,6 +262,14 @@ fn aarch64_restore_start_constants(
     layout: &NativeDfaLayout,
     vector_filter: Option<NativeVectorFilter>,
 ) -> Result<(), ObjectError> {
+    if layout.exact_start_byte_set.is_some() {
+        let storage = layout
+            .exact_start_storage
+            .ok_or(ObjectError::InvalidModule(
+                "AArch64 loop-skip restore lost exact scanner storage",
+            ))?;
+        return super::aarch64_emit_exact_asimd_constants(assembler, storage);
+    }
     if let Some(plan) = layout
         .prefix_relation
         .and_then(|relation| relation.vector_plan)

@@ -1382,6 +1382,60 @@ struct NativeExactByteSet {
     from_anchored_prefix: bool,
 }
 
+/// Three exact 16-entry lookup tables for an arbitrary 256-bit byte set.
+///
+/// Indexing the two row tables by the low nibble returns one bit for each
+/// possible high nibble. The third table maps that high nibble to its bit.
+/// Selecting the low or high row bank with the input byte's top bit and then
+/// intersecting the two lookup results classifies every possible `ByteSet256`
+/// exactly; unlike a two-table character-class decomposition, this encoding
+/// does not admit false-positive byte pairs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeExactNibbleTables {
+    low_rows: [u8; 16],
+    high_rows: [u8; 16],
+    high_bits: [u8; 16],
+}
+
+impl NativeExactNibbleTables {
+    fn from_set(set: NativeExactByteSet) -> Self {
+        let mut low_rows = [0_u8; 16];
+        let mut high_rows = [0_u8; 16];
+        let mut high_bits = [0_u8; 16];
+        for high in 0_u8..16 {
+            let bit = 1_u8 << (high & 7);
+            high_bits[usize::from(high)] = bit;
+            for low in 0_u8..16 {
+                let byte = (high << 4) | low;
+                if set.contains(byte) {
+                    let rows = if high < 8 {
+                        &mut low_rows
+                    } else {
+                        &mut high_rows
+                    };
+                    rows[usize::from(low)] |= bit;
+                }
+            }
+        }
+        Self {
+            low_rows,
+            high_rows,
+            high_bits,
+        }
+    }
+
+    #[cfg(test)]
+    fn contains(self, byte: u8) -> bool {
+        let high = byte >> 4;
+        let rows = if byte & 0x80 == 0 {
+            self.low_rows
+        } else {
+            self.high_rows
+        };
+        rows[usize::from(byte & 0x0f)] & self.high_bits[usize::from(high)] != 0
+    }
+}
+
 impl NativeExactByteSet {
     fn from_membership(
         membership: [u64; 4],
@@ -1417,11 +1471,14 @@ impl NativeExactByteSet {
 /// Exact-set table addresses installed transactionally after all established
 /// DFA and prefix data. The bitmap is always present for deterministic
 /// cross-target inspection; AArch64 additionally uses the byte-indexed LUT in
-/// its scalar lowering.
+/// its scalar lowering. `nibble_base` names three logical 16-byte
+/// tables. AArch64 stores them directly, while x86 duplicates each 128-bit
+/// table into both AVX2 lanes and appends one duplicated `0x0f` index mask.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NativeExactByteSetStorage {
     bitmap_offset: u32,
     aarch64_lut_offset: Option<u32>,
+    nibble_base: u32,
 }
 
 /// Exact complement of a DFA-proven all-state reset set.
@@ -3302,6 +3359,10 @@ fn append_native_prefix_block(
 /// native representation. The caller will then reject mandatory publication
 /// and retain the established runtime route; no partially initialized offset
 /// becomes visible in a layout.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the transactional layout calculation and its one commit point are kept contiguous"
+)]
 fn append_native_exact_byte_set(
     bytes: &mut Vec<u8>,
     set: NativeExactByteSet,
@@ -3311,6 +3372,10 @@ fn append_native_exact_byte_set(
     const BITMAP_ALIGNMENT: usize = core::mem::align_of::<u64>();
     const BITMAP_BYTES: usize = 4 * core::mem::size_of::<u64>();
     const LUT_BYTES: usize = 256;
+    const NIBBLE_TABLE_BYTES: usize = 16;
+    const AARCH64_NIBBLE_BYTES: usize = 3 * NIBBLE_TABLE_BYTES;
+    const X86_NIBBLE_STRIDE: usize = 2 * NIBBLE_TABLE_BYTES;
+    const X86_NIBBLE_BYTES: usize = 4 * X86_NIBBLE_STRIDE;
 
     if !set.is_valid() {
         return Err(ObjectError::InvalidModule(
@@ -3330,7 +3395,7 @@ fn append_native_exact_byte_set(
         .ok_or(ObjectError::ArithmeticOverflow(
             "native exact-set bitmap bytes",
         ))?;
-    let end = bitmap_end
+    let lut_end = bitmap_end
         .checked_add(if architecture == Architecture::Aarch64 {
             LUT_BYTES
         } else {
@@ -3339,14 +3404,50 @@ fn append_native_exact_byte_set(
         .ok_or(ObjectError::ArithmeticOverflow(
             "native exact-set table bytes",
         ))?;
+    let nibble_alignment = if architecture == Architecture::X86_64 {
+        X86_NIBBLE_STRIDE
+    } else {
+        NIBBLE_TABLE_BYTES
+    };
+    let nibble_alignment_mask = nibble_alignment
+        .checked_sub(1)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "native exact-set nibble-table alignment",
+        ))?;
+    let nibble_aligned = lut_end
+        .checked_add(nibble_alignment_mask)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "native exact-set nibble-table alignment",
+        ))?
+        & !nibble_alignment_mask;
+    let nibble_bytes = if architecture == Architecture::X86_64 {
+        X86_NIBBLE_BYTES
+    } else {
+        AARCH64_NIBBLE_BYTES
+    };
+    let end = nibble_aligned
+        .checked_add(nibble_bytes)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "native exact-set nibble-table bytes",
+        ))?;
     if end > maximum_table_bytes {
         return Ok(None);
     }
-    if architecture == Architecture::X86_64 && i32::try_from(aligned).is_err() {
-        // x86-64's compact BT form sign-extends its disp32 from the stable R9
-        // table base. Decline instead of letting a large positive table
-        // offset address backwards.
-        return Ok(None);
+    if architecture == Architecture::X86_64 {
+        let final_table_delta = 3_usize.checked_mul(X86_NIBBLE_STRIDE).ok_or(
+            ObjectError::ArithmeticOverflow("native exact-set final x86 nibble table"),
+        )?;
+        let last_nibble_table = nibble_aligned
+            .checked_add(final_table_delta)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "native exact-set final x86 nibble table",
+            ))?;
+        if i32::try_from(aligned).is_err() || i32::try_from(last_nibble_table).is_err() {
+            // Both BT and every VMOVDQU sign-extend disp32 from the stable R9
+            // table base. Decline transactionally instead of letting a large
+            // positive table offset address backwards.
+            return Ok(None);
+        }
     }
     let additional = end
         .checked_sub(bytes.len())
@@ -3378,6 +3479,29 @@ fn append_native_exact_byte_set(
     } else {
         None
     };
+    if bytes.len() != lut_end {
+        return Err(ObjectError::InvalidModule(
+            "native exact-set scalar constants changed extent",
+        ));
+    }
+    let nibble_base = u32::try_from(nibble_aligned)
+        .map_err(|_| ObjectError::ArithmeticOverflow("native exact-set nibble-table offset"))?;
+    bytes.resize(nibble_aligned, 0);
+    let nibble_tables = NativeExactNibbleTables::from_set(set);
+    for table in [
+        nibble_tables.low_rows,
+        nibble_tables.high_rows,
+        nibble_tables.high_bits,
+    ] {
+        bytes.extend_from_slice(&table);
+        if architecture == Architecture::X86_64 {
+            bytes.extend_from_slice(&table);
+        }
+    }
+    if architecture == Architecture::X86_64 {
+        bytes.extend_from_slice(&[0x0f; NIBBLE_TABLE_BYTES]);
+        bytes.extend_from_slice(&[0x0f; NIBBLE_TABLE_BYTES]);
+    }
     if bytes.len() != end {
         return Err(ObjectError::InvalidModule(
             "native exact-set constants changed extent",
@@ -3386,6 +3510,7 @@ fn append_native_exact_byte_set(
     Ok(Some(NativeExactByteSetStorage {
         bitmap_offset,
         aarch64_lut_offset,
+        nibble_base,
     }))
 }
 
@@ -6011,10 +6136,11 @@ fn x86_emit_start_filter_vector_load(
     };
     if scan_offset == 0 {
         instruction.extend_from_slice(&[0x04, 0x17]);
-    } else if kind == X86StartFilterKind::Avx512Bw {
+    } else if kind == X86StartFilterKind::Avx512Bw || scan_offset > 0x7f {
         // EVEX disp8 is compressed and scales by the 64-byte ZMM tuple size.
-        // Prefix/suffix byte-column offsets are ordinary byte displacements,
-        // so encode them as an unscaled disp32.
+        // Prefix/suffix byte-column offsets are ordinary byte displacements;
+        // SSE/AVX disp8 is also signed. Encode either case as an unscaled
+        // disp32 when the byte offset cannot use a positive ordinary disp8.
         instruction.extend_from_slice(&[0x84, 0x17]);
         instruction.extend_from_slice(&i32::from(scan_offset).to_le_bytes());
     } else {
@@ -6100,6 +6226,78 @@ fn x86_exact_bitmap_displacement(
     i32::try_from(storage.bitmap_offset).map_err(|_| {
         ObjectError::InvalidModule("x86 exact-set bitmap exceeds signed displacement")
     })
+}
+
+fn x86_exact_nibble_displacement(
+    storage: NativeExactByteSetStorage,
+    table_index: u8,
+) -> Result<i32, ObjectError> {
+    const X86_NIBBLE_TABLE_STRIDE: u32 = 32;
+    if storage.aarch64_lut_offset.is_some()
+        || !storage.nibble_base.is_multiple_of(X86_NIBBLE_TABLE_STRIDE)
+        || table_index > 3
+    {
+        return Err(ObjectError::InvalidModule(
+            "x86 exact-set nibble-table storage is malformed",
+        ));
+    }
+    let table_delta = u32::from(table_index)
+        .checked_mul(X86_NIBBLE_TABLE_STRIDE)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "x86 exact-set nibble-table displacement",
+        ))?;
+    let displacement = storage
+        .nibble_base
+        .checked_add(table_delta)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "x86 exact-set nibble-table displacement",
+        ))?;
+    i32::try_from(displacement).map_err(|_| {
+        ObjectError::InvalidModule("x86 exact-set nibble table exceeds signed displacement")
+    })
+}
+
+/// Load the three duplicated nibble tables and the fixed low-nibble mask into
+/// caller-saved YMM registers. These constants remain live across scalar DFA
+/// work and prefix guards; those paths reserve YMM1..YMM3/YMM7 when the exact
+/// primary owns the scanner route.
+fn x86_emit_exact_avx2_constants(
+    assembler: &mut X86Assembler,
+    storage: NativeExactByteSetStorage,
+) -> Result<(), ObjectError> {
+    for (table_index, destination) in [(0_u8, 1_u8), (1, 2), (2, 3), (3, 7)] {
+        let displacement = x86_exact_nibble_displacement(storage, table_index)?;
+        let mut load = vec![0xc4, 0xc1, 0x7e, 0x6f, 0x81 | (destination << 3)];
+        load.extend_from_slice(&displacement.to_le_bytes());
+        assembler.instruction(&load)?; // vmovdqu ymmN, disp32[r9]
+    }
+    Ok(())
+}
+
+/// Produce the exact 32-lane membership mask in EAX for one AVX2 block.
+///
+/// YMM1/YMM2 are the low/high row banks, YMM3 maps high nibbles to bits, and
+/// YMM7 is `0x0f` in every byte. The input byte's sign bit selects its row bank;
+/// intersecting that row bitset with its exact high-nibble bit cannot create a
+/// false-positive byte pair.
+fn x86_emit_exact_avx2_candidates(
+    assembler: &mut X86Assembler,
+    scan_offset: u8,
+) -> Result<(), ObjectError> {
+    x86_emit_start_filter_vector_load(assembler, X86StartFilterKind::Avx2, scan_offset)?;
+    assembler.instruction(&[0xc5, 0xdd, 0x71, 0xd0, 0x04])?; // high nibbles in ymm4
+    assembler.instruction(&[0xc5, 0xfd, 0xdb, 0xef])?; // low nibbles in ymm5
+    assembler.instruction(&[0xc5, 0xdd, 0xdb, 0xe7])?; // mask high nibbles
+    assembler.instruction(&[0xc4, 0xe2, 0x75, 0x00, 0xf5])?; // low rows in ymm6
+    assembler.instruction(&[0xc4, 0xe2, 0x6d, 0x00, 0xed])?; // high rows in ymm5
+    assembler.instruction(&[0xc4, 0xe3, 0x4d, 0x4c, 0xf5, 0x00])?; // select row bank
+    assembler.instruction(&[0xc4, 0xe2, 0x65, 0x00, 0xe4])?; // exact high bits
+    assembler.instruction(&[0xc5, 0xcd, 0xdb, 0xf4])?; // intersect in ymm6
+    assembler.instruction(&[0xc5, 0xd5, 0xef, 0xed])?; // zero ymm5
+    assembler.instruction(&[0xc5, 0xcd, 0x74, 0xf5])?; // zero lanes are 0xff
+    assembler.instruction(&[0xc5, 0xfd, 0xd7, 0xc6])?; // vpmovmskb eax, ymm6
+    assembler.instruction(&[0xf7, 0xd0])?; // invert: member lanes are one
+    Ok(())
 }
 
 fn x86_emit_start_filter_scalar_bound(
@@ -7635,6 +7833,8 @@ fn lower_x86_64_dfa_with_emission(
         .or_else(|| layout.loop_skip.map(|skip| skip.filter));
     let filter_kind = (layout.exact_start_byte_set.is_some() || instruction_filter.is_some())
         .then(|| x86_start_filter_kind(features));
+    let use_exact_avx2 = layout.exact_start_byte_set.is_some()
+        && features.has(CpuFeature::X86Avx2);
     let mut scanner_emission = None;
     let prefix_relation_vector = layout
         .prefix_relation
@@ -7747,6 +7947,11 @@ fn lower_x86_64_dfa_with_emission(
         } else {
             x86_emit_start_filter_constants(&mut assembler, filter, kind, 1)?;
         }
+    } else if use_exact_avx2 {
+        let storage = layout.exact_start_storage.ok_or(ObjectError::InvalidModule(
+            "x86 AVX2 exact scanner has no canonical storage",
+        ))?;
+        x86_emit_exact_avx2_constants(&mut assembler, storage)?;
     }
 
     if layout.initial_pending {
@@ -7947,8 +8152,12 @@ fn lower_x86_64_dfa_with_emission(
         scanner_emission = Some(NativeScannerEmission {
             scan_offset: exact.scan_offset,
             membership: exact.membership,
-            isa: NativeScannerIsa::X86ScalarBitmap,
-            vectorized: false,
+            isa: if use_exact_avx2 {
+                NativeScannerIsa::X86Avx2
+            } else {
+                NativeScannerIsa::X86ScalarBitmap
+            },
+            vectorized: use_exact_avx2,
         });
         if layout.output != OutputContract::Exists {
             assembler.instruction(&[0x49, 0x83, 0xfb, 0xff])?; // cmp r11, -1
@@ -7960,52 +8169,74 @@ fn lower_x86_64_dfa_with_emission(
         assembler.instruction(&[0x49, 0x39, 0xc2])?;
         assembler.branch(&[0x0f, 0x85], scalar_scan)?;
 
-        let unrolled = assembler.label()?;
         let scalar = assembler.label()?;
-        let lane_one = assembler.label()?;
-        let lane_two = assembler.label()?;
-        let lane_three = assembler.label()?;
-        assembler.bind(unrolled)?;
-        assembler.instruction(&[0x48, 0x89, 0xc8])?; // remaining = end
-        assembler.instruction(&[0x48, 0x29, 0xd0])?; // remaining -= position
-        let required = u32::from(exact.scan_offset)
-            .checked_add(4)
-            .ok_or(ObjectError::ArithmeticOverflow(
-                "x86 exact scanner unrolled bound",
-            ))?;
-        let mut compare = vec![0x48, 0x3d];
-        compare.extend_from_slice(&required.to_le_bytes());
-        assembler.instruction(&compare)?;
-        assembler.branch(&[0x0f, 0x82], scalar)?;
-        x86_emit_exact_byte_set_scalar_load(&mut assembler, u16::from(exact.scan_offset))?;
-        x86_emit_exact_byte_set_test(&mut assembler, storage, candidate)?;
-        x86_emit_exact_byte_set_scalar_load(
-            &mut assembler,
-            u16::from(exact.scan_offset) + 1,
-        )?;
-        x86_emit_exact_byte_set_test(&mut assembler, storage, lane_one)?;
-        x86_emit_exact_byte_set_scalar_load(
-            &mut assembler,
-            u16::from(exact.scan_offset) + 2,
-        )?;
-        x86_emit_exact_byte_set_test(&mut assembler, storage, lane_two)?;
-        x86_emit_exact_byte_set_scalar_load(
-            &mut assembler,
-            u16::from(exact.scan_offset) + 3,
-        )?;
-        x86_emit_exact_byte_set_test(&mut assembler, storage, lane_three)?;
-        assembler.instruction(&[0x48, 0x83, 0xc2, 4])?;
-        assembler.branch(&[0xe9], unrolled)?;
+        if use_exact_avx2 {
+            let vector = assembler.label()?;
+            let vector_hit = assembler.label()?;
+            assembler.bind(vector)?;
+            assembler.instruction(&[0x48, 0x89, 0xc8])?; // remaining = end
+            assembler.instruction(&[0x48, 0x29, 0xd0])?; // remaining -= position
+            let required = u32::from(exact.scan_offset).checked_add(32).ok_or(
+                ObjectError::ArithmeticOverflow("x86 exact AVX2 scanner bound"),
+            )?;
+            let mut compare = vec![0x48, 0x3d];
+            compare.extend_from_slice(&required.to_le_bytes());
+            assembler.instruction(&compare)?;
+            assembler.branch(&[0x0f, 0x82], scalar)?;
+            x86_emit_exact_avx2_candidates(&mut assembler, exact.scan_offset)?;
+            assembler.instruction(&[0x85, 0xc0])?; // test exact lane mask
+            assembler.branch(&[0x0f, 0x85], vector_hit)?;
+            assembler.instruction(&[0x48, 0x83, 0xc2, 32])?;
+            assembler.branch(&[0xe9], vector)?;
+            assembler.bind(vector_hit)?;
+            x86_emit_first_candidate_lane(&mut assembler, X86CandidateMask::MovemaskEax)?;
+            assembler.instruction(&[0x48, 0x01, 0xc2])?;
+            assembler.branch(&[0xe9], candidate)?;
+        } else {
+            let unrolled = assembler.label()?;
+            let lane_one = assembler.label()?;
+            let lane_two = assembler.label()?;
+            let lane_three = assembler.label()?;
+            assembler.bind(unrolled)?;
+            assembler.instruction(&[0x48, 0x89, 0xc8])?; // remaining = end
+            assembler.instruction(&[0x48, 0x29, 0xd0])?; // remaining -= position
+            let required = u32::from(exact.scan_offset).checked_add(4).ok_or(
+                ObjectError::ArithmeticOverflow("x86 exact scanner unrolled bound"),
+            )?;
+            let mut compare = vec![0x48, 0x3d];
+            compare.extend_from_slice(&required.to_le_bytes());
+            assembler.instruction(&compare)?;
+            assembler.branch(&[0x0f, 0x82], scalar)?;
+            x86_emit_exact_byte_set_scalar_load(&mut assembler, u16::from(exact.scan_offset))?;
+            x86_emit_exact_byte_set_test(&mut assembler, storage, candidate)?;
+            x86_emit_exact_byte_set_scalar_load(
+                &mut assembler,
+                u16::from(exact.scan_offset) + 1,
+            )?;
+            x86_emit_exact_byte_set_test(&mut assembler, storage, lane_one)?;
+            x86_emit_exact_byte_set_scalar_load(
+                &mut assembler,
+                u16::from(exact.scan_offset) + 2,
+            )?;
+            x86_emit_exact_byte_set_test(&mut assembler, storage, lane_two)?;
+            x86_emit_exact_byte_set_scalar_load(
+                &mut assembler,
+                u16::from(exact.scan_offset) + 3,
+            )?;
+            x86_emit_exact_byte_set_test(&mut assembler, storage, lane_three)?;
+            assembler.instruction(&[0x48, 0x83, 0xc2, 4])?;
+            assembler.branch(&[0xe9], unrolled)?;
 
-        assembler.bind(lane_three)?;
-        assembler.instruction(&[0x48, 0x83, 0xc2, 3])?;
-        assembler.branch(&[0xe9], candidate)?;
-        assembler.bind(lane_two)?;
-        assembler.instruction(&[0x48, 0x83, 0xc2, 2])?;
-        assembler.branch(&[0xe9], candidate)?;
-        assembler.bind(lane_one)?;
-        assembler.instruction(&[0x48, 0xff, 0xc2])?;
-        assembler.branch(&[0xe9], candidate)?;
+            assembler.bind(lane_three)?;
+            assembler.instruction(&[0x48, 0x83, 0xc2, 3])?;
+            assembler.branch(&[0xe9], candidate)?;
+            assembler.bind(lane_two)?;
+            assembler.instruction(&[0x48, 0x83, 0xc2, 2])?;
+            assembler.branch(&[0xe9], candidate)?;
+            assembler.bind(lane_one)?;
+            assembler.instruction(&[0x48, 0xff, 0xc2])?;
+            assembler.branch(&[0xe9], candidate)?;
+        }
 
         assembler.bind(scalar)?;
         x86_emit_exact_byte_set_scalar_bound(&mut assembler, exact.scan_offset, finish)?;
@@ -8098,6 +8329,7 @@ fn lower_x86_64_dfa_with_emission(
             &layout,
             vector_filter,
             kind,
+            use_exact_avx2,
             scalar_transition,
             finish,
         )?;
@@ -10189,6 +10421,45 @@ fn aarch64_load_q(destination: u8, base: u8) -> Result<u32, ObjectError> {
     Ok(0x3dc0_0000 | aarch64_reg(base, 5)? | aarch64_reg(destination, 0)?)
 }
 
+fn aarch64_ld1_three_16b(first_destination: u8, base: u8) -> Result<u32, ObjectError> {
+    if first_destination > 29 {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 three-register LD1 wraps the vector file",
+        ));
+    }
+    Ok(0x4c40_6000 | aarch64_reg(base, 5)? | aarch64_reg(first_destination, 0)?)
+}
+
+fn aarch64_ushr_16b_by_4(destination: u8, source: u8) -> Result<u32, ObjectError> {
+    Ok(0x6f0c_0400 | aarch64_reg(source, 5)? | aarch64_reg(destination, 0)?)
+}
+
+fn aarch64_tbl1_16b(
+    destination: u8,
+    table: u8,
+    indices: u8,
+) -> Result<u32, ObjectError> {
+    Ok(0x4e00_0000
+        | aarch64_reg(indices, 16)?
+        | aarch64_reg(table, 5)?
+        | aarch64_reg(destination, 0)?)
+}
+
+fn aarch64_cmlt_zero_16b(destination: u8, source: u8) -> Result<u32, ObjectError> {
+    Ok(0x4e20_a800 | aarch64_reg(source, 5)? | aarch64_reg(destination, 0)?)
+}
+
+fn aarch64_cmtst_16b(
+    destination: u8,
+    left: u8,
+    right: u8,
+) -> Result<u32, ObjectError> {
+    Ok(0x4e20_8c00
+        | aarch64_reg(right, 16)?
+        | aarch64_reg(left, 5)?
+        | aarch64_reg(destination, 0)?)
+}
+
 fn aarch64_ld1_four_16b(first_destination: u8, base: u8) -> Result<u32, ObjectError> {
     if first_destination > 28 {
         return Err(ObjectError::InvalidModule(
@@ -11795,6 +12066,53 @@ fn aarch64_emit_exact_byte_set_lut_test(
     Ok(())
 }
 
+fn aarch64_emit_exact_asimd_constants(
+    assembler: &mut Aarch64Assembler,
+    storage: NativeExactByteSetStorage,
+) -> Result<(), ObjectError> {
+    let lut_end = storage
+        .aarch64_lut_offset
+        .and_then(|offset| offset.checked_add(256))
+        .ok_or(ObjectError::InvalidModule(
+            "AArch64 exact-set scanner has no bounded LUT",
+        ))?;
+    if !storage.nibble_base.is_multiple_of(16)
+        || storage.nibble_base < lut_end
+    {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 exact-set nibble-table storage is malformed",
+        ));
+    }
+    aarch64_set_table_address(assembler, 6, storage.nibble_base)?;
+    assembler.instruction(aarch64_ld1_three_16b(16, 6)?)?;
+    assembler.instruction(aarch64_movi_16b(19, 0x0f)?)?;
+    Ok(())
+}
+
+/// Produce one exact 16-lane arbitrary-byte-set mask in V24.
+///
+/// V16/V17 hold low/high row banks, V18 maps high nibbles to their row bit,
+/// and V19 is the fixed low-nibble mask. The input byte's sign selects its row
+/// bank, so every set bit in the result proves exact membership.
+fn aarch64_emit_exact_asimd_candidates(
+    assembler: &mut Aarch64Assembler,
+    scan_offset: u8,
+) -> Result<(), ObjectError> {
+    aarch64_emit_start_filter_address(assembler, scan_offset)?;
+    assembler.instruction(aarch64_load_q(0, 12)?)?;
+    assembler.instruction(aarch64_ushr_16b_by_4(20, 0)?)?;
+    assembler.instruction(aarch64_and_16b(21, 0, 19)?)?;
+    assembler.instruction(aarch64_tbl1_16b(22, 16, 21)?)?;
+    assembler.instruction(aarch64_tbl1_16b(23, 17, 21)?)?;
+    assembler.instruction(aarch64_cmlt_zero_16b(24, 0)?)?;
+    assembler.instruction(aarch64_bsl_16b(24, 23, 22)?)?;
+    assembler.instruction(aarch64_and_16b(20, 20, 19)?)?;
+    assembler.instruction(aarch64_tbl1_16b(20, 18, 20)?)?;
+    assembler.instruction(aarch64_and_16b(24, 24, 20)?)?;
+    assembler.instruction(aarch64_cmtst_16b(24, 24, 24)?)?;
+    aarch64_emit_candidate_any(assembler, 24)
+}
+
 fn aarch64_emit_suffix_lower_bound(
     assembler: &mut Aarch64Assembler,
     backtrack: u64,
@@ -12336,6 +12654,8 @@ fn lower_aarch64_dfa_for_operating_system_with_emission(
         && layout
             .start_filter
             .is_some_and(|filter| !filter.ranges().is_empty());
+    let use_exact_asimd = features.has(CpuFeature::Aarch64Asimd)
+        && layout.exact_start_byte_set.is_some();
     let mut scanner_emission = None;
     let sve_suffix_kind = selected_aarch64_sve_suffix_kind(layout, features, operating_system);
     let use_asimd_suffix = features.has(CpuFeature::Aarch64Asimd)
@@ -12398,7 +12718,9 @@ fn lower_aarch64_dfa_for_operating_system_with_emission(
         && !retain_vector_candidates
         && (prefix_relation_vector.is_none() || use_asimd_relation_batch)
         && layout.start_filter.is_some_and(use_aarch64_filter_batch);
-    if use_exact_asimd_lane && (use_asimd_filter || use_asimd_suffix || use_asimd_loop) {
+    if use_exact_asimd_lane
+        && (use_asimd_filter || use_exact_asimd || use_asimd_suffix || use_asimd_loop)
+    {
         let lane_index_offset =
             layout
                 .asimd_lane_index_offset
@@ -12465,6 +12787,11 @@ fn lower_aarch64_dfa_for_operating_system_with_emission(
             let first_register = AARCH64_STANDALONE_FILTER_FIRST_CONSTANT;
             aarch64_emit_start_filter_constants(&mut assembler, filter, first_register)?;
         }
+    } else if use_exact_asimd {
+        let storage = layout.exact_start_storage.ok_or(ObjectError::InvalidModule(
+            "AArch64 ASIMD exact scanner has no canonical storage",
+        ))?;
+        aarch64_emit_exact_asimd_constants(&mut assembler, storage)?;
     }
     let mut filter_batch_first_candidates = None;
 
@@ -12784,8 +13111,12 @@ fn lower_aarch64_dfa_for_operating_system_with_emission(
         scanner_emission = Some(NativeScannerEmission {
             scan_offset: exact.scan_offset,
             membership: exact.membership,
-            isa: NativeScannerIsa::Aarch64ScalarLut,
-            vectorized: false,
+            isa: if use_exact_asimd {
+                NativeScannerIsa::Aarch64Asimd
+            } else {
+                NativeScannerIsa::Aarch64ScalarLut
+            },
+            vectorized: use_exact_asimd,
         });
         if layout.output != OutputContract::Exists {
             assembler.instruction(aarch64_cmp_x(7, 13)?)?;
@@ -12794,6 +13125,35 @@ fn lower_aarch64_dfa_for_operating_system_with_emission(
         aarch64_set_table_address(&mut assembler, 12, layout.forward_offset)?;
         assembler.instruction(aarch64_cmp_x(11, 12)?)?;
         assembler.branch_cond(AARCH64_NE, scalar_scan)?;
+        let exact_scalar = assembler.label()?;
+        let exact_scalar_loop = assembler.label()?;
+        if use_exact_asimd {
+            let exact_vector = assembler.label()?;
+            let exact_vector_hit = assembler.label()?;
+            assembler.bind(exact_vector)?;
+            assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+            let required = u16::from(exact.scan_offset).checked_add(16).ok_or(
+                ObjectError::ArithmeticOverflow("AArch64 exact ASIMD scanner bound"),
+            )?;
+            assembler.instruction(aarch64_cmp_x_imm(12, required)?)?;
+            assembler.branch_cond(AARCH64_LO, exact_scalar)?;
+            aarch64_emit_exact_asimd_candidates(&mut assembler, exact.scan_offset)?;
+            assembler.branch_cond(
+                AARCH64_NE,
+                if use_exact_asimd_lane {
+                    exact_vector_hit
+                } else {
+                    exact_scalar
+                },
+            )?;
+            assembler.instruction(aarch64_add_x_imm(2, 2, 16)?)?;
+            assembler.branch(exact_vector)?;
+            assembler.bind(exact_vector_hit)?;
+            aarch64_emit_first_candidate_lane(&mut assembler, 24)?;
+            assembler.branch(candidate)?;
+        }
+
+        assembler.bind(exact_scalar)?;
         aarch64_set_table_address(
             &mut assembler,
             6,
@@ -12803,14 +13163,12 @@ fn lower_aarch64_dfa_for_operating_system_with_emission(
                     "AArch64 exact scanner has no LUT",
                 ))?,
         )?;
-
-        let exact_scalar = assembler.label()?;
-        assembler.bind(exact_scalar)?;
+        assembler.bind(exact_scalar_loop)?;
         aarch64_emit_start_filter_scalar_bound(&mut assembler, exact.scan_offset, finish)?;
         aarch64_emit_start_filter_scalar_load(&mut assembler, exact.scan_offset)?;
         aarch64_emit_exact_byte_set_lut_test(&mut assembler, 6, candidate)?;
         assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
-        assembler.branch(exact_scalar)?;
+        assembler.branch(exact_scalar_loop)?;
     }
 
     if layout.has_prefix_guard() {
@@ -13368,6 +13726,68 @@ mod tests {
 
     #[allow(
         clippy::arithmetic_side_effects,
+        reason = "canonical test storage extents are checked before this extraction helper"
+    )]
+    fn exact_nibble_tables_from_storage(
+        bytes: &[u8],
+        storage: NativeExactByteSetStorage,
+        architecture: Architecture,
+    ) -> NativeExactNibbleTables {
+        let start = usize::try_from(storage.nibble_base).expect("nibble-table offset");
+        let stride = if architecture == Architecture::X86_64 {
+            32
+        } else {
+            16
+        };
+        let mut tables = [[0_u8; 16]; 3];
+        for (index, table) in tables.iter_mut().enumerate() {
+            let offset = start + index * stride;
+            table.copy_from_slice(&bytes[offset..offset + 16]);
+            if architecture == Architecture::X86_64 {
+                assert_eq!(&bytes[offset..offset + 16], &bytes[offset + 16..offset + 32]);
+            }
+        }
+        if architecture == Architecture::X86_64 {
+            assert_eq!(&bytes[start + 96..start + 128], &[0x0f; 32]);
+        }
+        NativeExactNibbleTables {
+            low_rows: tables[0],
+            high_rows: tables[1],
+            high_bits: tables[2],
+        }
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the exhaustive oracle bounds every test index by its allocated haystack"
+    )]
+    fn exact_nibble_first_candidate(
+        tables: NativeExactNibbleTables,
+        haystack: &[u8],
+        mut position: usize,
+        end: usize,
+        scan_offset: usize,
+        vector_width: usize,
+    ) -> Option<usize> {
+        while end.checked_sub(position)? >= scan_offset.checked_add(vector_width)? {
+            if let Some(lane) = (0..vector_width)
+                .find(|&lane| tables.contains(haystack[position + scan_offset + lane]))
+            {
+                return position.checked_add(lane);
+            }
+            position = position.checked_add(vector_width)?;
+        }
+        while position.checked_add(scan_offset)? < end {
+            if tables.contains(haystack[position + scan_offset]) {
+                return Some(position);
+            }
+            position = position.checked_add(1)?;
+        }
+        None
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
         reason = "the exhaustive scanner oracle bounds every offset before indexing or advancing"
     )]
     fn exact_storage_first_candidate(
@@ -13631,6 +14051,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one exhaustive test keeps canonical layout and transactional bounds together"
+    )]
     fn exact_byte_set_storage_is_canonical_exhaustive_and_transactional() {
         assert!(NativeExactByteSet::from_membership([0; 4], 0, true).is_none());
         assert!(NativeExactByteSet::from_membership([u64::MAX; 4], 0, true).is_none());
@@ -13638,6 +14062,7 @@ mod tests {
             x86_exact_bitmap_displacement(NativeExactByteSetStorage {
                 bitmap_offset: u32::try_from(i32::MAX).unwrap(),
                 aarch64_lut_offset: None,
+                nibble_base: 0,
             })
             .unwrap(),
             i32::MAX
@@ -13646,7 +14071,29 @@ mod tests {
             x86_exact_bitmap_displacement(NativeExactByteSetStorage {
                 bitmap_offset: u32::try_from(i32::MAX).unwrap() + 1,
                 aarch64_lut_offset: None,
+                nibble_base: 0,
             })
+            .is_err()
+        );
+        let maximum_nibble_offset = (u32::try_from(i32::MAX).unwrap() - 96) & !31;
+        let maximum_nibble_storage = NativeExactByteSetStorage {
+            bitmap_offset: 0,
+            aarch64_lut_offset: None,
+            nibble_base: maximum_nibble_offset,
+        };
+        assert_eq!(
+            x86_exact_nibble_displacement(maximum_nibble_storage, 3).unwrap(),
+            i32::try_from(maximum_nibble_offset + 96).unwrap()
+        );
+        assert!(x86_exact_nibble_displacement(maximum_nibble_storage, 4).is_err());
+        assert!(
+            x86_exact_nibble_displacement(
+                NativeExactByteSetStorage {
+                    nibble_base: 0x8000_0000,
+                    ..maximum_nibble_storage
+                },
+                0
+            )
             .is_err()
         );
 
@@ -13675,6 +14122,15 @@ mod tests {
                 .expect("exact-set storage");
                 assert_eq!(&bytes[..prefix_len], prefix.as_slice());
                 assert_eq!(usize::try_from(storage.bitmap_offset).unwrap() % 8, 0);
+                assert_eq!(
+                    usize::try_from(storage.nibble_base).unwrap()
+                        % if architecture == Architecture::X86_64 {
+                            32
+                        } else {
+                            16
+                        },
+                    0
+                );
                 let bitmap = usize::try_from(storage.bitmap_offset).unwrap();
                 for (index, word) in set.membership.iter().enumerate() {
                     let start = bitmap + index * 8;
@@ -13684,11 +14140,18 @@ mod tests {
                     storage.aarch64_lut_offset.is_some(),
                     architecture == Architecture::Aarch64
                 );
+                let nibble_tables =
+                    exact_nibble_tables_from_storage(&bytes, storage, architecture);
                 for byte in u8::MIN..=u8::MAX {
                     assert_eq!(
                         exact_storage_contains(&bytes, storage, architecture, byte),
                         expected[usize::from(byte)],
                         "{architecture:?}, cardinality={cardinality}, byte={byte}"
+                    );
+                    assert_eq!(
+                        nibble_tables.contains(byte),
+                        expected[usize::from(byte)],
+                        "nibble {architecture:?}, cardinality={cardinality}, byte={byte}"
                     );
                 }
             }
@@ -13698,19 +14161,34 @@ mod tests {
         for architecture in [Architecture::X86_64, Architecture::Aarch64] {
             let mut bytes = vec![0x5a; 7];
             let original = bytes.clone();
-            let bitmap_end = 8 + 32;
-            let required = bitmap_end
-                + if architecture == Architecture::Aarch64 {
-                    256
-                } else {
-                    0
-                };
+            let required = if architecture == Architecture::Aarch64 {
+                // Bitmap 8..40, scalar LUT 40..296, 8 bytes of alignment,
+                // and three logical 16-byte nibble tables.
+                352
+            } else {
+                // Bitmap 8..40, 24 bytes of alignment, three duplicated
+                // nibble tables and one duplicated low-nibble mask.
+                192
+            };
             assert_eq!(
                 append_native_exact_byte_set(&mut bytes, set, architecture, required - 1)
                     .expect("bounded exact-set append"),
                 None
             );
             assert_eq!(bytes, original, "{architecture:?} mutated on decline");
+            let installed = append_native_exact_byte_set(
+                &mut bytes,
+                set,
+                architecture,
+                required,
+            )
+            .expect("exact-bound exact-set append")
+            .expect("exact-bound exact-set storage");
+            assert_eq!(bytes.len(), required);
+            assert_eq!(
+                exact_nibble_tables_from_storage(&bytes, installed, architecture),
+                NativeExactNibbleTables::from_set(set)
+            );
         }
     }
 
@@ -13778,6 +14256,108 @@ mod tests {
                             ),
                             expected_position,
                             "{architecture:?}, cardinality={cardinality}, offset={scan_offset}, tail={tail}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "all exhaustive alignment, tail, and lane indices are bounded by their test allocations"
+    )]
+    fn exact_nibble_classifier_exhausts_cardinalities_alignments_tails_and_first_hits() {
+        for cardinality in 1_u16..=255 {
+            let (set, expected) = exact_membership_with_cardinality(cardinality);
+            let tables = NativeExactNibbleTables::from_set(set);
+            let member = (u8::MIN..=u8::MAX)
+                .find(|&byte| expected[usize::from(byte)])
+                .expect("nonempty exact set");
+            let nonmember = (u8::MIN..=u8::MAX)
+                .find(|&byte| !expected[usize::from(byte)])
+                .expect("nonuniversal exact set");
+
+            for vector_width in [16_usize, 32] {
+                for scan_offset in [0_usize, usize::from(cardinality)] {
+                    // Every address residue reaches the same first-lane result
+                    // through the unaligned vector load.
+                    for alignment in 0..vector_width {
+                        let lane = (usize::from(cardinality) + alignment) % vector_width;
+                        let mut haystack =
+                            vec![nonmember; alignment + scan_offset + vector_width + 1];
+                        haystack[alignment + scan_offset + lane] = member;
+                        assert_eq!(
+                            exact_nibble_first_candidate(
+                                tables,
+                                &haystack,
+                                alignment,
+                                haystack.len(),
+                                scan_offset,
+                                vector_width,
+                            ),
+                            Some(alignment + lane),
+                            "cardinality={cardinality}, width={vector_width}, offset={scan_offset}, alignment={alignment}"
+                        );
+                    }
+
+                    // Exhaust every sub-vector tail and every possible first
+                    // hit inside it. A later hit proves lane ordering rather
+                    // than mere any-byte membership.
+                    for tail in 0..vector_width {
+                        let empty = vec![nonmember; scan_offset + tail];
+                        assert_eq!(
+                            exact_nibble_first_candidate(
+                                tables,
+                                &empty,
+                                0,
+                                empty.len(),
+                                scan_offset,
+                                vector_width,
+                            ),
+                            None
+                        );
+                        for first in 0..tail {
+                            let mut haystack = vec![nonmember; scan_offset + tail];
+                            haystack[scan_offset + first] = member;
+                            if first + 1 < tail {
+                                haystack[scan_offset + first + 1] = member;
+                            }
+                            assert_eq!(
+                                exact_nibble_first_candidate(
+                                    tables,
+                                    &haystack,
+                                    0,
+                                    haystack.len(),
+                                    scan_offset,
+                                    vector_width,
+                                ),
+                                Some(first),
+                                "cardinality={cardinality}, width={vector_width}, offset={scan_offset}, tail={tail}, first={first}"
+                            );
+                        }
+                    }
+
+                    // Every lane of one complete block is selected exactly,
+                    // including the AVX2 upper 128-bit lane.
+                    for first in 0..vector_width {
+                        let mut haystack = vec![nonmember; scan_offset + vector_width];
+                        haystack[scan_offset + first] = member;
+                        if first + 1 < vector_width {
+                            haystack[scan_offset + first + 1] = member;
+                        }
+                        assert_eq!(
+                            exact_nibble_first_candidate(
+                                tables,
+                                &haystack,
+                                0,
+                                haystack.len(),
+                                scan_offset,
+                                vector_width,
+                            ),
+                            Some(first),
+                            "cardinality={cardinality}, width={vector_width}, offset={scan_offset}, first={first}"
                         );
                     }
                 }
@@ -13901,6 +14481,233 @@ mod tests {
                 assert_eq!(varied_receipt.membership, exact.membership);
                 assert!(!varied_receipt.vectorized);
             }
+        }
+    }
+
+    #[test]
+    fn exact_avx2_and_asimd_backends_emit_authenticated_vector_receipts() {
+        // A dense arbitrary root set needs the exact nibble scanner, while its
+        // singleton complement also admits the independent interior loop
+        // skipper. This exercises restoration of the scanner's live tables.
+        let pattern = r"(?-u:[^Q])+";
+        let compiled = complete_forward_resource_fallback(
+            pattern,
+            OutputContract::SelectedEnd,
+            Target::x86_64_linux(),
+        );
+        let view = compiled
+            .program()
+            .native_dfa_view()
+            .expect("complete retained native view");
+        let requirement = view
+            .retained_prefix_requirement
+            .expect("mandatory exact primary");
+
+        let (_, x86_layout) =
+            build_native_dfa_table_for_architecture(view, Architecture::X86_64).unwrap();
+        assert!(x86_layout.loop_skip.is_some());
+        let x86 = lower_x86_64_dfa_with_emission(
+            x86_layout,
+            FeatureSet::of(CpuFeature::X86Avx2),
+        )
+        .unwrap();
+        let x86_receipt = x86.scanner.expect("AVX2 exact scanner receipt");
+        assert_eq!(x86_receipt.isa, NativeScannerIsa::X86Avx2);
+        assert!(x86_receipt.vectorized);
+        assert!(retained_prefix_scanner_is_preserved(
+            Some(x86_receipt),
+            requirement
+        ));
+        assert!(
+            x86.code
+                .windows(4)
+                .filter(|window| *window == [0xc4, 0xc1, 0x7e, 0x6f])
+                .count()
+                >= 8,
+            "AVX2 exact scanner did not restore all duplicated nibble constants after loop skip"
+        );
+        for opcode in [
+            [0xc4, 0xe2, 0x75, 0x00, 0xf5].as_slice(),
+            [0xc4, 0xe2, 0x6d, 0x00, 0xed].as_slice(),
+            [0xc4, 0xe2, 0x65, 0x00, 0xe4].as_slice(),
+            [0xc5, 0xfd, 0xd7, 0xc6].as_slice(),
+        ] {
+            assert!(
+                x86.code.windows(opcode.len()).any(|window| window == opcode),
+                "AVX2 exact classifier is missing {opcode:02x?}"
+            );
+        }
+
+        let (_, aarch64_layout) =
+            build_native_dfa_table_for_architecture(view, Architecture::Aarch64).unwrap();
+        assert!(aarch64_layout.loop_skip.is_some());
+        let aarch64 = lower_aarch64_dfa_for_operating_system_with_emission(
+            aarch64_layout,
+            FeatureSet::of(CpuFeature::Aarch64Asimd),
+            OperatingSystem::Macos,
+            None,
+        )
+        .unwrap();
+        let aarch64_receipt = aarch64.scanner.expect("ASIMD exact scanner receipt");
+        assert_eq!(aarch64_receipt.isa, NativeScannerIsa::Aarch64Asimd);
+        assert!(aarch64_receipt.vectorized);
+        assert!(retained_prefix_scanner_is_preserved(
+            Some(aarch64_receipt),
+            requirement
+        ));
+        let words = aarch64
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        for instruction in [
+            aarch64_ld1_three_16b(16, 6).unwrap(),
+            aarch64_ushr_16b_by_4(20, 0).unwrap(),
+            aarch64_tbl1_16b(22, 16, 21).unwrap(),
+            aarch64_tbl1_16b(23, 17, 21).unwrap(),
+            aarch64_tbl1_16b(20, 18, 20).unwrap(),
+            aarch64_cmtst_16b(24, 24, 24).unwrap(),
+        ] {
+            assert!(
+                words.contains(&instruction),
+                "ASIMD exact classifier is missing {instruction:#010x}"
+            );
+        }
+        assert!(
+            words
+                .iter()
+                .filter(|&&word| word == aarch64_ld1_three_16b(16, 6).unwrap())
+                .count()
+                >= 2,
+            "ASIMD exact scanner did not restore nibble constants after loop skip"
+        );
+    }
+
+    #[test]
+    fn exact_nibble_vector_helpers_have_exact_encodings_and_displacement_boundaries() {
+        let cases = [
+            (0_u8, vec![0xc5, 0xfe, 0x6f, 0x04, 0x17]),
+            (127, vec![0xc5, 0xfe, 0x6f, 0x44, 0x17, 0x7f]),
+            (
+                128,
+                vec![0xc5, 0xfe, 0x6f, 0x84, 0x17, 0x80, 0x00, 0x00, 0x00],
+            ),
+            (
+                255,
+                vec![0xc5, 0xfe, 0x6f, 0x84, 0x17, 0xff, 0x00, 0x00, 0x00],
+            ),
+        ];
+        for (scan_offset, expected) in cases {
+            let mut assembler = X86Assembler::new();
+            x86_emit_start_filter_vector_load(
+                &mut assembler,
+                X86StartFilterKind::Avx2,
+                scan_offset,
+            )
+            .unwrap();
+            assert_eq!(assembler.finish().unwrap(), expected);
+        }
+
+        assert_eq!(aarch64_ld1_three_16b(16, 6).unwrap(), 0x4c40_60d0);
+        assert_eq!(aarch64_ushr_16b_by_4(20, 0).unwrap(), 0x6f0c_0414);
+        assert_eq!(aarch64_tbl1_16b(22, 16, 21).unwrap(), 0x4e15_0216);
+        assert_eq!(aarch64_tbl1_16b(23, 17, 21).unwrap(), 0x4e15_0237);
+        assert_eq!(aarch64_cmlt_zero_16b(24, 0).unwrap(), 0x4e20_a818);
+        assert_eq!(aarch64_bsl_16b(24, 23, 22).unwrap(), 0x6e76_1ef8);
+        assert_eq!(aarch64_tbl1_16b(20, 18, 20).unwrap(), 0x4e14_0254);
+        assert_eq!(aarch64_cmtst_16b(24, 24, 24).unwrap(), 0x4e38_8f18);
+        assert!(aarch64_ld1_three_16b(30, 6).is_err());
+    }
+
+    #[test]
+    fn exact_vector_publication_covers_all_outputs_and_supported_operating_systems() {
+        let targets = [
+            (
+                Target::x86_64_linux()
+                    .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                    .unwrap(),
+                StartAccelerator::X86Avx2,
+            ),
+            (
+                Target::x86_64_macos()
+                    .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                    .unwrap(),
+                StartAccelerator::X86Avx2,
+            ),
+            (
+                Target::aarch64_linux()
+                    .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                    .unwrap(),
+                StartAccelerator::Aarch64Asimd,
+            ),
+            (
+                Target::aarch64_macos()
+                    .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                    .unwrap(),
+                StartAccelerator::Aarch64Asimd,
+            ),
+        ];
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let pattern = if output == OutputContract::Span {
+                r"(?-u:[\x00-\x40])cdefghij(?-u:.){8}"
+            } else {
+                r"(?-u:[\x00-\x40])+"
+            };
+            for (target, accelerator) in targets {
+                let compiled = complete_forward_resource_fallback(pattern, output, target);
+                assert!(
+                    !compiled.receipt().runtime_helper_required,
+                    "{output:?}/{target:?} did not publish its exact vector scanner; accelerator={:?}, reason={:?}, view={:?}",
+                    compiled.module().start_accelerator(),
+                    compiled.receipt().engine_selection_reason,
+                    compiled.program().native_dfa_view(),
+                );
+                assert!(compiled.module().required_runtime_symbol().is_none());
+                assert!(compiled.module().required_runtime_program().is_none());
+                assert_eq!(compiled.module().start_accelerator(), accelerator);
+                assert!(
+                    compiled.module().relocations().iter().all(|relocation| {
+                        relocation.section == TEXT_SECTION
+                            && relocation.symbol == PROGRAM_SYMBOL
+                            && usize::try_from(relocation.offset).is_ok_and(|offset| {
+                                offset < compiled.module().sections()[TEXT_SECTION].bytes().len()
+                            })
+                    }),
+                    "{output:?}/{target:?} emitted an out-of-section or external exact-scanner relocation"
+                );
+                assert!(
+                    compiled
+                        .receipt()
+                        .passes
+                        .contains(&crate::OptimizationPass::TargetInstructionSelection)
+                );
+            }
+        }
+
+        // These are explicit future tiers. Neither a baseline x86 object nor a
+        // pure SVE/SVE2 object may claim that AVX2/ASIMD code was emitted.
+        for target in [
+            Target::x86_64_linux(),
+            Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Sve))
+                .unwrap(),
+            Target::aarch64_linux()
+                .with_features(
+                    FeatureSet::of(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2),
+                )
+                .unwrap(),
+        ] {
+            let compiled = complete_forward_resource_fallback(
+                r"(?-u:[\x00-\x40])+",
+                OutputContract::Exists,
+                target,
+            );
+            assert!(compiled.receipt().runtime_helper_required, "{target:?}");
+            assert_eq!(compiled.module().start_accelerator(), StartAccelerator::None);
         }
     }
 
@@ -14189,6 +14996,142 @@ mod tests {
         let output = Command::new(&executable)
             .output()
             .expect("execute linked native harness");
+        assert!(
+            output.status.success(),
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    #[ignore = "links and executes arbitrary exact-set retained objects natively"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the opt-in cross-contract differential keeps object production and execution auditable"
+    )]
+    fn linked_aarch64_exact_byteset_contracts_match_portable_program() {
+        use std::{fmt::Write as _, fs, process::Command};
+
+        let target = Target::aarch64_macos()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .expect("ASIMD target");
+        let long_selected_end = [
+            vec![b'Q'; 40],
+            vec![b'!'; 96],
+            vec![b'Q'; 2],
+        ]
+        .concat();
+        let cases = [
+            (
+                r"(?-u:[\x00-\x40])+",
+                OutputContract::Exists,
+                b"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\x20\x21zz".as_slice(),
+            ),
+            (
+                r"(?-u:[^Q])+",
+                OutputContract::SelectedEnd,
+                long_selected_end.as_slice(),
+            ),
+            (
+                r"(?-u:[\x00-\x40])cdefghij(?-u:.){8}",
+                OutputContract::Span,
+                b"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz!cdefghij12345678yy".as_slice(),
+            ),
+        ];
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-exact-byteset-retained-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("create exact-set linker fixture directory");
+        let mut source = String::from("#include <stdint.h>\n#include <stddef.h>\n");
+        let mut calls = String::from("int main(void){size_t r[2];uint32_t s;\n");
+        let mut objects = Vec::new();
+
+        for (case, (pattern, contract, haystack)) in cases.iter().enumerate() {
+            let compiled = complete_forward_resource_fallback(pattern, *contract, target);
+            assert!(compiled.module().required_runtime_symbol().is_none());
+            assert_eq!(
+                compiled.module().start_accelerator(),
+                StartAccelerator::Aarch64Asimd
+            );
+            let bytes = haystack
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            writeln!(source, "static const unsigned char h{case}[]={{{bytes}}};")
+                .expect("write exact-set fixture");
+            let symbol = compiled.module().entry_symbol();
+            writeln!(
+                source,
+                "extern uint32_t {symbol}(const unsigned char*,size_t,size_t,size_t,size_t*);"
+            )
+            .expect("write exact-set declaration");
+            let object = directory.join(format!("case{case}.o"));
+            fs::write(&object, compiled.object()).expect("write exact-set native object");
+            objects.push(object);
+
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let expected = compiled
+                        .search(haystack, SearchWindow::new(start, end))
+                        .expect("portable exact-set result");
+                    writeln!(
+                        calls,
+                        "r[0]=99;r[1]=99;s={symbol}(h{case},{},{start},{end},r);",
+                        haystack.len()
+                    )
+                    .expect("write exact-set native call");
+                    match expected {
+                        MatchResult::Exists(found) => writeln!(
+                            calls,
+                            "if(s!={}||r[0]!=0||r[1]!=0)return {};",
+                            u8::from(found),
+                            case + 40
+                        )
+                        .expect("write Exists assertion"),
+                        MatchResult::SelectedEnd(Some(match_end)) => writeln!(
+                            calls,
+                            "if(s!=1||r[0]!={match_end}||r[1]!={match_end})return {};",
+                            case + 40
+                        )
+                        .expect("write SelectedEnd assertion"),
+                        MatchResult::Span(Some((match_start, match_end))) => writeln!(
+                            calls,
+                            "if(s!=1||r[0]!={match_start}||r[1]!={match_end})return {};",
+                            case + 40
+                        )
+                        .expect("write Span assertion"),
+                        MatchResult::SelectedEnd(None) | MatchResult::Span(None) => writeln!(
+                            calls,
+                            "if(s!=0||r[0]!=0||r[1]!=0)return {};",
+                            case + 40
+                        )
+                        .expect("write no-match assertion"),
+                    }
+                }
+            }
+        }
+        calls.push_str("return 0;}\n");
+        source.push_str(&calls);
+        let c_path = directory.join("exact_byteset_retained.c");
+        let executable = directory.join("exact_byteset_retained");
+        fs::write(&c_path, source).expect("write exact-set linker harness");
+        let status = Command::new("clang")
+            .arg("-O0")
+            .arg(&c_path)
+            .args(&objects)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .expect("invoke clang");
+        assert!(status.success());
+        let output = Command::new(&executable)
+            .output()
+            .expect("execute linked exact-set native harness");
         assert!(
             output.status.success(),
             "status={:?} stdout={} stderr={}",
