@@ -35,7 +35,10 @@ const PROGRAM_FORMAT_VERSION_V3: u32 = 3;
 const PROGRAM_FORMAT_VERSION: u32 = PROGRAM_FORMAT_VERSION_V3;
 const PROGRAM_FLAG_NFA_MANDATORY_SUFFIX: u8 = 1 << 0;
 const PROGRAM_FLAG_NFA_MANDATORY_CUT: u8 = 1 << 1;
-const PROGRAM_KNOWN_FLAGS: u8 = PROGRAM_FLAG_NFA_MANDATORY_SUFFIX | PROGRAM_FLAG_NFA_MANDATORY_CUT;
+const PROGRAM_FLAG_NFA_EXACT_PRODUCT: u8 = 1 << 2;
+const PROGRAM_KNOWN_FLAGS: u8 = PROGRAM_FLAG_NFA_MANDATORY_SUFFIX
+    | PROGRAM_FLAG_NFA_MANDATORY_CUT
+    | PROGRAM_FLAG_NFA_EXACT_PRODUCT;
 const DEFAULT_LINE_TERMINATOR: u8 = b'\n';
 /// Number of bytes that a runtime must read before it can discover the exact
 /// serialized artifact extent.
@@ -92,6 +95,10 @@ const NFA_SUFFIX_SCAN_ONLY_REVERSE_WORK_MULTIPLIER: usize = 2;
 /// sets cannot amortize even their short scalar admission probe. Real sources
 /// can still benefit from any narrower class that is absent from a window.
 const MAX_NFA_MANDATORY_CUT_CARDINALITY: u16 = 64;
+/// An ordinary mandatory cut always names a real Thompson state. This reserved
+/// value lets the mutually exclusive cut slot retain a complete exact-product
+/// scanner without changing the scanner enum or compiled-program layout.
+const NFA_EXACT_PRODUCT_ROOT_SENTINEL: u32 = u32::MAX;
 /// Because the cut is an extra pass, it must halve the strongest existing
 /// forward column's uniform expected hit rate. This prevents a marginally
 /// narrower interior class from displacing K0's already-vectorized filter.
@@ -543,6 +550,349 @@ struct NfaMandatorySuffix {
     reverse: SeededReverseDfa,
 }
 
+/// Complete scanner for an exact fixed-width Cartesian byte product.
+///
+/// This sidecar is admitted only when a graph walk proves that every
+/// consuming edge in a byte layer reaches the same next Thompson state. The
+/// continuation is therefore independent of which member of that layer's
+/// byte set was consumed, so the anchored columns describe the complete
+/// language rather than merely necessary conditions. Scanning one selective
+/// column and checking the remaining columns can then replace ordered-NFA
+/// execution without losing alternation or greediness semantics.
+#[derive(Clone, Copy, Debug)]
+struct NfaExactProduct {
+    primary_bytes: [u8; 3],
+    primary_count: u8,
+    primary_offset: u8,
+    width: u8,
+}
+
+impl NfaExactProduct {
+    fn derive(
+        raw: &RawPlan,
+        prefix: &AnchoredPrefix,
+        exact_width: Option<usize>,
+        engine: &ProgramEngine,
+    ) -> Option<Self> {
+        if !matches!(engine, ProgramEngine::OrderedNfa) || prefix.context_assertions {
+            return None;
+        }
+        let width = exact_width?;
+        if width == 0 || width != prefix.sets().len() || width > MAX_ANCHORED_PREFIX_BYTES {
+            return None;
+        }
+        if !nfa_prefix_is_exact_product(raw, prefix.sets()) {
+            return None;
+        }
+
+        let (primary_offset, primary) = prefix
+            .sets()
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, set)| (1..=3).contains(&usize::from(set.cardinality())))
+            .min_by_key(|(offset, set)| (set.cardinality(), *offset != 0, *offset))?;
+        let primary_count = usize::from(primary.cardinality());
+        let mut primary_bytes = [0_u8; 3];
+        let mut count = 0usize;
+        for byte in u8::MIN..=u8::MAX {
+            if !primary.contains(byte) {
+                continue;
+            }
+            *primary_bytes.get_mut(count)? = byte;
+            count = count.checked_add(1)?;
+        }
+        if count != primary_count {
+            return None;
+        }
+        Some(Self {
+            primary_bytes,
+            primary_count: u8::try_from(primary_count).ok()?,
+            primary_offset: u8::try_from(primary_offset).ok()?,
+            width: u8::try_from(width).ok()?,
+        })
+    }
+
+    fn find_primary(&self, haystack: &[u8]) -> Option<usize> {
+        match self.primary_count {
+            1 => memchr(self.primary_bytes[0], haystack),
+            2 => memchr2(self.primary_bytes[0], self.primary_bytes[1], haystack),
+            3 => memchr3(
+                self.primary_bytes[0],
+                self.primary_bytes[1],
+                self.primary_bytes[2],
+                haystack,
+            ),
+            _ => None,
+        }
+    }
+
+    #[inline(never)]
+    fn search(
+        &self,
+        prefix: &AnchoredPrefix,
+        haystack: &[u8],
+        window: SearchWindow,
+        output: OutputContract,
+    ) -> MatchResult {
+        let width = usize::from(self.width);
+        let offset = usize::from(self.primary_offset);
+        let no_match = || match output {
+            OutputContract::Exists => MatchResult::Exists(false),
+            OutputContract::SelectedEnd => MatchResult::SelectedEnd(None),
+            OutputContract::Span => MatchResult::Span(None),
+        };
+        let Some(last_start) = window.end.checked_sub(width) else {
+            return no_match();
+        };
+        if last_start < window.start {
+            return no_match();
+        }
+        let Some(mut scan) = window.start.checked_add(offset) else {
+            return no_match();
+        };
+        let Some(scan_end) = last_start
+            .checked_add(offset)
+            .and_then(|last| last.checked_add(1))
+        else {
+            return no_match();
+        };
+
+        while scan < scan_end {
+            let Some(source) = haystack.get(scan..scan_end) else {
+                return no_match();
+            };
+            let Some(relative) = self.find_primary(source) else {
+                return no_match();
+            };
+            let Some(hit) = scan.checked_add(relative) else {
+                return no_match();
+            };
+            let Some(start) = hit.checked_sub(offset) else {
+                return no_match();
+            };
+            let exact = prefix
+                .sets()
+                .iter()
+                .copied()
+                .enumerate()
+                .all(|(depth, set)| {
+                    start
+                        .checked_add(depth)
+                        .and_then(|position| haystack.get(position))
+                        .is_some_and(|&byte| set.contains(byte))
+                });
+            if exact {
+                let end = start
+                    .checked_add(width)
+                    .expect("validated exact-product candidate width");
+                return match output {
+                    OutputContract::Exists => MatchResult::Exists(true),
+                    OutputContract::SelectedEnd => MatchResult::SelectedEnd(Some(end)),
+                    OutputContract::Span => MatchResult::Span(Some((start, end))),
+                };
+            }
+            let Some(next) = hit.checked_add(1) else {
+                return no_match();
+            };
+            scan = next;
+        }
+        no_match()
+    }
+}
+
+/// Sufficient graph proof that every anchored byte column has a
+/// byte-independent continuation.
+///
+/// The Thompson closure at each depth may contain several consuming states
+/// and ranges, but all of their consuming edges must converge on one exact
+/// target. Consequently every member of the unioned anchored set reaches the
+/// same next closure. Repeating that proof through the exact width makes the
+/// per-column Cartesian product complete. More general correlated graphs
+/// simply decline this optional sidecar.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the bounded product proof keeps graph validation and convergence together"
+)]
+fn nfa_prefix_is_exact_product(raw: &RawPlan, sets: &[AnchoredByteSet]) -> bool {
+    let states = raw.roles.len();
+    let Ok(mut current) = usize::try_from(raw.start) else {
+        return false;
+    };
+    if current >= states || raw.edge_offsets.len() != states.saturating_add(1) {
+        return false;
+    }
+    let mut seen = Vec::new();
+    if seen.try_reserve_exact(states).is_err() {
+        return false;
+    }
+    seen.resize(states, false);
+    let mut stack = Vec::new();
+    let mut consuming = Vec::new();
+    let Some(stack_capacity) = raw.edge_targets.len().checked_add(1) else {
+        return false;
+    };
+    if stack.try_reserve_exact(stack_capacity).is_err()
+        || consuming.try_reserve_exact(states).is_err()
+    {
+        return false;
+    }
+
+    for expected in sets {
+        seen.fill(false);
+        stack.clear();
+        consuming.clear();
+        stack.push(current);
+        while let Some(state) = stack.pop() {
+            let Some(mark) = seen.get_mut(state) else {
+                return false;
+            };
+            if *mark {
+                continue;
+            }
+            *mark = true;
+            match raw.roles.get(state) {
+                Some(StateRole::Split) => {
+                    let Some(&begin) = raw.edge_offsets.get(state) else {
+                        return false;
+                    };
+                    let Some(&end) = raw.edge_offsets.get(state.saturating_add(1)) else {
+                        return false;
+                    };
+                    let (Ok(begin), Ok(end)) = (usize::try_from(begin), usize::try_from(end))
+                    else {
+                        return false;
+                    };
+                    if begin > end || end > raw.edge_kinds.len() {
+                        return false;
+                    }
+                    for edge in begin..end {
+                        if raw.edge_kinds.get(edge) != Some(&EdgeKind::Epsilon) {
+                            return false;
+                        }
+                        let Some(&target) = raw.edge_targets.get(edge) else {
+                            return false;
+                        };
+                        let Ok(target) = usize::try_from(target) else {
+                            return false;
+                        };
+                        if target >= states {
+                            return false;
+                        }
+                        stack.push(target);
+                    }
+                }
+                Some(StateRole::Consume) => consuming.push(state),
+                _ => return false,
+            }
+        }
+        if consuming.is_empty() {
+            return false;
+        }
+
+        let mut words = [0_u64; 4];
+        let mut common_target = None;
+        for &state in &consuming {
+            let Some(&begin) = raw.edge_offsets.get(state) else {
+                return false;
+            };
+            let Some(&end) = raw.edge_offsets.get(state.saturating_add(1)) else {
+                return false;
+            };
+            let (Ok(begin), Ok(end)) = (usize::try_from(begin), usize::try_from(end)) else {
+                return false;
+            };
+            if begin >= end || end > raw.edge_kinds.len() {
+                return false;
+            }
+            for edge in begin..end {
+                if raw.edge_kinds.get(edge) != Some(&EdgeKind::ByteRange) {
+                    return false;
+                }
+                let (Some(&start), Some(&end), Some(&target)) = (
+                    raw.byte_starts.get(edge),
+                    raw.byte_ends.get(edge),
+                    raw.edge_targets.get(edge),
+                ) else {
+                    return false;
+                };
+                let Ok(target) = usize::try_from(target) else {
+                    return false;
+                };
+                if start > end || target >= states {
+                    return false;
+                }
+                if common_target.is_some_and(|common| common != target) {
+                    return false;
+                }
+                common_target = Some(target);
+                for byte in start..=end {
+                    let index = usize::from(byte);
+                    words[index / 64] |= 1_u64 << (index % 64);
+                }
+            }
+        }
+        if words != expected.words() {
+            return false;
+        }
+        let Some(target) = common_target else {
+            return false;
+        };
+        current = target;
+    }
+
+    // Every product member reaches this same closure. At least one Accept in
+    // it proves membership; the independent exact-width analysis rules out an
+    // accepting continuation at any other byte depth.
+    seen.fill(false);
+    stack.clear();
+    stack.push(current);
+    while let Some(state) = stack.pop() {
+        let Some(mark) = seen.get_mut(state) else {
+            return false;
+        };
+        if *mark {
+            continue;
+        }
+        *mark = true;
+        match raw.roles.get(state) {
+            Some(StateRole::Accept) => return true,
+            Some(StateRole::Split) => {
+                let Some(&begin) = raw.edge_offsets.get(state) else {
+                    return false;
+                };
+                let Some(&end) = raw.edge_offsets.get(state.saturating_add(1)) else {
+                    return false;
+                };
+                let (Ok(begin), Ok(end)) = (usize::try_from(begin), usize::try_from(end)) else {
+                    return false;
+                };
+                if begin > end || end > raw.edge_kinds.len() {
+                    return false;
+                }
+                for edge in begin..end {
+                    if raw.edge_kinds.get(edge) != Some(&EdgeKind::Epsilon) {
+                        return false;
+                    }
+                    let Some(&target) = raw.edge_targets.get(edge) else {
+                        return false;
+                    };
+                    let Ok(target) = usize::try_from(target) else {
+                        return false;
+                    };
+                    if target >= states {
+                        return false;
+                    }
+                    stack.push(target);
+                }
+            }
+            Some(StateRole::Consume) => {}
+            Some(_) | None => return false,
+        }
+    }
+    false
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NfaMandatorySuffixScan {
     Candidate(usize),
@@ -790,6 +1140,36 @@ enum NfaMandatoryCutScanner {
 }
 
 impl NfaMandatoryCut {
+    const fn from_exact_product(product: NfaExactProduct) -> Self {
+        Self {
+            root_state: NFA_EXACT_PRODUCT_ROOT_SENTINEL,
+            cardinality: u16::from_le_bytes([product.width, product.primary_offset]),
+            scanner: NfaMandatoryCutScanner::Small {
+                bytes: product.primary_bytes,
+                count: product.primary_count,
+            },
+        }
+    }
+
+    const fn exact_product(&self) -> Option<NfaExactProduct> {
+        if self.root_state != NFA_EXACT_PRODUCT_ROOT_SENTINEL {
+            return None;
+        }
+        let [width, primary_offset] = self.cardinality.to_le_bytes();
+        let NfaMandatoryCutScanner::Small { bytes, count } = &self.scanner else {
+            return None;
+        };
+        if width == 0 || primary_offset >= width || *count == 0 || *count > 3 {
+            return None;
+        }
+        Some(NfaExactProduct {
+            primary_bytes: *bytes,
+            primary_count: *count,
+            primary_offset,
+            width,
+        })
+    }
+
     fn from_candidate(candidate: &required_literals::RequiredInteriorCandidate) -> Option<Self> {
         if candidate.depth() == 0 || candidate.literals().is_empty() {
             return None;
@@ -839,8 +1219,12 @@ impl NfaMandatoryCut {
                 classifier: ByteSetClassifier::new(set),
             }
         };
+        let root_state = candidate.root_state();
+        if root_state == NFA_EXACT_PRODUCT_ROOT_SENTINEL {
+            return None;
+        }
         Some(Self {
-            root_state: candidate.root_state(),
+            root_state,
             cardinality,
             scanner,
         })
@@ -1210,21 +1594,32 @@ impl CompiledProgram {
             RequiredLiterals::unavailable()
         };
         let max_match_width = derive_max_match_width(&raw);
-        let nfa_mandatory_suffix = derive_nfa_suffix(
-            &raw,
-            &anchored_prefix,
-            &anchored_suffix,
-            max_match_width,
-            &engine,
-            mode == CompileMode::Optimizing,
-        );
-        let nfa_mandatory_cut = derive_nfa_mandatory_cut(
-            &anchored_prefix,
-            &required_literals,
-            &engine,
-            nfa_mandatory_suffix.is_some(),
-            mode == CompileMode::Optimizing && context_dfa.is_none(),
-        );
+        let nfa_exact_product = (mode == CompileMode::Optimizing)
+            .then(|| NfaExactProduct::derive(&raw, &anchored_prefix, exact_match_width, &engine))
+            .flatten();
+        let nfa_mandatory_suffix = (nfa_exact_product.is_none())
+            .then(|| {
+                derive_nfa_suffix(
+                    &raw,
+                    &anchored_prefix,
+                    &anchored_suffix,
+                    max_match_width,
+                    &engine,
+                    mode == CompileMode::Optimizing,
+                )
+            })
+            .flatten();
+        let nfa_mandatory_cut = nfa_exact_product
+            .map(NfaMandatoryCut::from_exact_product)
+            .or_else(|| {
+                derive_nfa_mandatory_cut(
+                    &anchored_prefix,
+                    &required_literals,
+                    &engine,
+                    nfa_mandatory_suffix.is_some(),
+                    mode == CompileMode::Optimizing && context_dfa.is_none(),
+                )
+            });
         Ok(Self {
             raw,
             automaton,
@@ -1273,8 +1668,12 @@ impl CompiledProgram {
         if self.nfa_mandatory_suffix.is_some() {
             flags |= PROGRAM_FLAG_NFA_MANDATORY_SUFFIX;
         }
-        if self.nfa_mandatory_cut.is_some() {
-            flags |= PROGRAM_FLAG_NFA_MANDATORY_CUT;
+        if let Some(sidecar) = &self.nfa_mandatory_cut {
+            if sidecar.exact_product().is_some() {
+                flags |= PROGRAM_FLAG_NFA_EXACT_PRODUCT;
+            } else {
+                flags |= PROGRAM_FLAG_NFA_MANDATORY_CUT;
+            }
         }
         flags
     }
@@ -1470,8 +1869,9 @@ impl CompiledProgram {
     /// Allocate and initialize reusable storage for this exact program.
     ///
     /// Ordered-DFA programs require no scratch allocation. Ordered-NFA
-    /// programs retain a fully initialized fixed-capacity K0 workspace. The
-    /// workspace includes the bounded endpoint cache for existence/end
+    /// programs retain a fully initialized fixed-capacity K0 workspace unless
+    /// a complete graph-proved sidecar makes the ordered executor unreachable.
+    /// The workspace includes the bounded endpoint cache for existence/end
     /// contracts and bidirectional start recovery for spans, so repeated calls
     /// can reuse learned rows without allocating.
     ///
@@ -1481,6 +1881,15 @@ impl CompiledProgram {
     /// prepared.
     pub fn prepare_workspace(&self) -> Result<ProgramWorkspace, CompileError> {
         let nfa = match self.engine {
+            ProgramEngine::OrderedNfa
+                if self
+                    .nfa_mandatory_cut
+                    .as_ref()
+                    .and_then(NfaMandatoryCut::exact_product)
+                    .is_some() =>
+            {
+                None
+            }
             ProgramEngine::OrderedNfa => Some(match self.output {
                 OutputContract::Exists | OutputContract::SelectedEnd => {
                     K0Workspace::new_accelerated(&self.automaton, WorkspaceLimits::unlimited())?
@@ -1530,13 +1939,17 @@ impl CompiledProgram {
         }
         match &self.engine {
             ProgramEngine::OrderedNfa => {
-                let nfa = workspace
-                    .nfa
-                    .as_mut()
+                if let Some(nfa) = workspace.nfa.as_mut() {
+                    return self.search_nfa(haystack, window, nfa);
+                }
+                let product = self
+                    .nfa_mandatory_cut
+                    .as_ref()
+                    .and_then(NfaMandatoryCut::exact_product)
                     .ok_or(CompileError::InternalInvariant(
-                        "ordered-NFA program workspace has no K0 storage",
+                        "ordered-NFA program workspace has no executable storage",
                     ))?;
-                self.search_nfa(haystack, window, nfa)
+                Ok(product.search(&self.anchored_prefix, haystack, window, self.output))
             }
             ProgramEngine::OrderedDfa(machine) => {
                 match self.output {
@@ -1587,15 +2000,18 @@ impl CompiledProgram {
         self.search_nfa_unaccelerated(haystack, window, workspace)
     }
 
-    /// Try a whole-window rejection through one graph-proved mandatory
-    /// consuming cut. A member hit is deliberately inconclusive and leaves
-    /// the original window untouched for the ordered executor.
+    /// Try the mutually exclusive graph-proved forward sidecar. An exact
+    /// product returns a complete result; an ordinary mandatory-cut member is
+    /// deliberately inconclusive and leaves the window to the ordered NFA.
     fn search_nfa_with_mandatory_cut(
         &self,
         haystack: &[u8],
         window: SearchWindow,
     ) -> Option<MatchResult> {
         let accelerator = self.nfa_mandatory_cut.as_ref()?;
+        if let Some(product) = accelerator.exact_product() {
+            return Some(product.search(&self.anchored_prefix, haystack, window, self.output));
+        }
         let source = haystack.get(window.start..window.end)?;
         if accelerator.has_member(source) {
             return None;
@@ -2005,16 +2421,20 @@ impl CompiledProgram {
         let program_flags = header_program_flags(header, version)?;
         let mandatory_suffix_enabled = program_flags & PROGRAM_FLAG_NFA_MANDATORY_SUFFIX != 0;
         let mandatory_cut_enabled = program_flags & PROGRAM_FLAG_NFA_MANDATORY_CUT != 0;
-        if (mandatory_suffix_enabled || mandatory_cut_enabled)
+        let exact_product_enabled = program_flags & PROGRAM_FLAG_NFA_EXACT_PRODUCT != 0;
+        if (mandatory_suffix_enabled || mandatory_cut_enabled || exact_product_enabled)
             && engine_kind != EngineKind::OrderedNfa
         {
             return Err(ProgramFormatError::Malformed(
                 "mandatory NFA sidecar flag requires an ordered-NFA engine",
             ));
         }
-        if mandatory_suffix_enabled && mandatory_cut_enabled {
+        if (mandatory_suffix_enabled && mandatory_cut_enabled)
+            || (mandatory_suffix_enabled && exact_product_enabled)
+            || (mandatory_cut_enabled && exact_product_enabled)
+        {
             return Err(ProgramFormatError::Malformed(
-                "mandatory suffix and cut flags are mutually exclusive",
+                "ordered-NFA sidecar flags are mutually exclusive",
             ));
         }
         let mut reader = ProgramReader::new(
@@ -2078,6 +2498,14 @@ impl CompiledProgram {
             RequiredLiterals::unavailable()
         };
         let max_match_width = derive_max_match_width(&raw);
+        let nfa_exact_product = exact_product_enabled
+            .then(|| NfaExactProduct::derive(&raw, &anchored_prefix, exact_match_width, &engine))
+            .flatten();
+        if exact_product_enabled != nfa_exact_product.is_some() {
+            return Err(ProgramFormatError::Malformed(
+                "exact-product flag is incompatible with the embedded graph",
+            ));
+        }
         let nfa_mandatory_suffix = derive_nfa_suffix(
             &raw,
             &anchored_prefix,
@@ -2091,18 +2519,21 @@ impl CompiledProgram {
                 "mandatory-suffix flag is incompatible with the embedded graph",
             ));
         }
-        let nfa_mandatory_cut = derive_nfa_mandatory_cut(
+        let ordinary_mandatory_cut = derive_nfa_mandatory_cut(
             &anchored_prefix,
             &required_literals,
             &engine,
             nfa_mandatory_suffix.is_some(),
-            mandatory_cut_enabled,
+            mandatory_cut_enabled && nfa_exact_product.is_none(),
         );
-        if mandatory_cut_enabled != nfa_mandatory_cut.is_some() {
+        if mandatory_cut_enabled != ordinary_mandatory_cut.is_some() {
             return Err(ProgramFormatError::Malformed(
                 "mandatory-cut flag is incompatible with the embedded graph",
             ));
         }
+        let nfa_mandatory_cut = nfa_exact_product
+            .map(NfaMandatoryCut::from_exact_product)
+            .or(ordinary_mandatory_cut);
         let program = Self {
             raw,
             automaton,
@@ -3728,6 +4159,199 @@ mod tests {
         let mut strings = Vec::new();
         extend(&mut strings, &mut Vec::new(), alphabet, max_len);
         strings
+    }
+
+    #[test]
+    fn resource_fallback_exact_product_is_graph_proved_complete_and_round_trips() {
+        let fallback_limits = DeterminizeLimits {
+            max_states: 0,
+            ..DeterminizeLimits::default()
+        };
+        let haystacks = generated_byte_strings(b"aZ012x", 4);
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let accelerated = program("a[0-2]Z", output, CompileMode::Optimizing, fallback_limits);
+            assert!(
+                accelerated
+                    .nfa_mandatory_cut
+                    .as_ref()
+                    .and_then(NfaMandatoryCut::exact_product)
+                    .is_some()
+            );
+            assert!(accelerated.nfa_mandatory_suffix.is_none());
+            let serialized = accelerated
+                .serialize()
+                .expect("serialize exact-product sidecar");
+            assert_eq!(serialized[15], PROGRAM_FLAG_NFA_EXACT_PRODUCT);
+            let restored =
+                CompiledProgram::deserialize(&serialized).expect("restore exact-product sidecar");
+            assert!(
+                restored
+                    .nfa_mandatory_cut
+                    .as_ref()
+                    .and_then(NfaMandatoryCut::exact_product)
+                    .is_some()
+            );
+
+            let reference = program(
+                "a[0-2]Z",
+                output,
+                CompileMode::Fast,
+                DeterminizeLimits::default(),
+            );
+            assert!(
+                reference
+                    .nfa_mandatory_cut
+                    .as_ref()
+                    .and_then(NfaMandatoryCut::exact_product)
+                    .is_none()
+            );
+            let mut accelerated_workspace = accelerated.prepare_workspace().unwrap();
+            assert!(accelerated_workspace.nfa.is_none());
+            let mut restored_workspace = restored.prepare_workspace().unwrap();
+            assert!(restored_workspace.nfa.is_none());
+            let mut reference_workspace = reference.prepare_workspace().unwrap();
+            for haystack in &haystacks {
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        let expected = reference
+                            .search_with_workspace(haystack, window, &mut reference_workspace)
+                            .unwrap();
+                        assert_eq!(
+                            accelerated
+                                .search_with_workspace(
+                                    haystack,
+                                    window,
+                                    &mut accelerated_workspace,
+                                )
+                                .unwrap(),
+                            expected,
+                            "accelerated {output:?}/{haystack:?}/{start}..{end}"
+                        );
+                        assert_eq!(
+                            restored
+                                .search_with_workspace(haystack, window, &mut restored_workspace)
+                                .unwrap(),
+                            expected,
+                            "restored {output:?}/{haystack:?}/{start}..{end}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Exercise selective columns after the first byte. Candidate starts
+        // must remain ordered and window-relative when the primary hit is
+        // translated back by a nonzero offset.
+        for (pattern, alphabet, max_len, primary_offset) in [
+            ("[ab]x", b"abxy".as_slice(), 3, 1_u8),
+            ("[ab][01]Z", b"ab01Zx".as_slice(), 3, 2_u8),
+        ] {
+            let haystacks = generated_byte_strings(alphabet, max_len);
+            for output in [
+                OutputContract::Exists,
+                OutputContract::SelectedEnd,
+                OutputContract::Span,
+            ] {
+                let accelerated =
+                    program(pattern, output, CompileMode::Optimizing, fallback_limits);
+                assert_eq!(
+                    accelerated
+                        .nfa_mandatory_cut
+                        .as_ref()
+                        .and_then(NfaMandatoryCut::exact_product)
+                        .expect("nonzero-offset exact product")
+                        .primary_offset,
+                    primary_offset
+                );
+                let reference = program(
+                    pattern,
+                    output,
+                    CompileMode::Fast,
+                    DeterminizeLimits::default(),
+                );
+                let mut accelerated_workspace = accelerated.prepare_workspace().unwrap();
+                let mut reference_workspace = reference.prepare_workspace().unwrap();
+                for haystack in &haystacks {
+                    for start in 0..=haystack.len() {
+                        for end in start..=haystack.len() {
+                            let window = SearchWindow::new(start, end);
+                            assert_eq!(
+                                accelerated
+                                    .search_with_workspace(
+                                        haystack,
+                                        window,
+                                        &mut accelerated_workspace,
+                                    )
+                                    .unwrap(),
+                                reference
+                                    .search_with_workspace(
+                                        haystack,
+                                        window,
+                                        &mut reference_workspace,
+                                    )
+                                    .unwrap(),
+                                "{pattern}/{output:?}/{haystack:?}/{start}..{end}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        for (pattern, eligible) in [
+            ("a", true),
+            ("abcdefghijklmnop", true),
+            ("abcdefghijklmnopq", false),
+            (r"(?-u:[\x00-\xFF])", false),
+        ] {
+            let compiled = program(
+                pattern,
+                OutputContract::Span,
+                CompileMode::Optimizing,
+                fallback_limits,
+            );
+            assert_eq!(
+                compiled
+                    .nfa_mandatory_cut
+                    .as_ref()
+                    .and_then(NfaMandatoryCut::exact_product)
+                    .is_some(),
+                eligible,
+                "{pattern}"
+            );
+        }
+
+        let correlated = program(
+            "(?:ab|cd)",
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            fallback_limits,
+        );
+        assert!(
+            correlated
+                .nfa_mandatory_cut
+                .as_ref()
+                .and_then(NfaMandatoryCut::exact_product)
+                .is_none()
+        );
+        let variable = program(
+            "a[0-2]+Z",
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            fallback_limits,
+        );
+        assert!(
+            variable
+                .nfa_mandatory_cut
+                .as_ref()
+                .and_then(NfaMandatoryCut::exact_product)
+                .is_none()
+        );
     }
 
     #[test]
@@ -5896,6 +6520,10 @@ mod tests {
         let mut contradictory = cut_bytes.clone();
         contradictory[15] = PROGRAM_FLAG_NFA_MANDATORY_SUFFIX | PROGRAM_FLAG_NFA_MANDATORY_CUT;
         assert!(CompiledProgram::deserialize(&contradictory).is_err());
+        contradictory[15] = PROGRAM_FLAG_NFA_MANDATORY_SUFFIX | PROGRAM_FLAG_NFA_EXACT_PRODUCT;
+        assert!(CompiledProgram::deserialize(&contradictory).is_err());
+        contradictory[15] = PROGRAM_FLAG_NFA_MANDATORY_CUT | PROGRAM_FLAG_NFA_EXACT_PRODUCT;
+        assert!(CompiledProgram::deserialize(&contradictory).is_err());
 
         let mut incompatible = program(
             "a*",
@@ -5906,6 +6534,8 @@ mod tests {
         .serialize()
         .unwrap();
         incompatible[15] = PROGRAM_FLAG_NFA_MANDATORY_CUT;
+        assert!(CompiledProgram::deserialize(&incompatible).is_err());
+        incompatible[15] = PROGRAM_FLAG_NFA_EXACT_PRODUCT;
         assert!(CompiledProgram::deserialize(&incompatible).is_err());
 
         let unbounded = program(
@@ -5932,6 +6562,8 @@ mod tests {
         wrong_engine[15] = PROGRAM_FLAG_NFA_MANDATORY_SUFFIX;
         assert!(CompiledProgram::deserialize(&wrong_engine).is_err());
         wrong_engine[15] = PROGRAM_FLAG_NFA_MANDATORY_CUT;
+        assert!(CompiledProgram::deserialize(&wrong_engine).is_err());
+        wrong_engine[15] = PROGRAM_FLAG_NFA_EXACT_PRODUCT;
         assert!(CompiledProgram::deserialize(&wrong_engine).is_err());
     }
 
