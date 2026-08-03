@@ -3,11 +3,38 @@ use regex::bytes::{Regex, RegexBuilder};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    Architecture, CompileLimitsV1, CompileMode, CompileRequest, ContextDfaResource,
-    DeterminizationResource, DeterminizationStage, EngineKind, EngineSelectionReason,
+    Architecture, CompileError, CompileLimitsV1, CompileMode, CompileRequest, CompileResource,
+    ContextDfaResource, DeterminizationResource, DeterminizationStage, EngineKind,
+    EngineSelectionReason,
     MAX_STABLE_DFA_BUILD_WORK, MatchResult, OperatingSystem, OptimizationPass, OutputContract,
     SearchWindow, SectionKind, StartAccelerator, Target, compile,
 };
+
+#[test]
+fn program_byte_cap_rejects_before_canonical_serialization() {
+    let mut limits = CompileLimitsV1::default();
+    limits.max_program_bytes = 1;
+    crate::program::reset_test_serialize_calls();
+    let error = compile(
+        CompileRequest::new(r"(?:foo|bar)+[0-9]{2}", Target::x86_64_linux())
+            .mode(CompileMode::Optimizing)
+            .limits(limits),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        CompileError::Resource {
+            resource: CompileResource::ProgramBytes,
+            limit: 1,
+            required,
+        } if required > 1
+    ));
+    assert_eq!(
+        crate::program::test_serialize_calls(),
+        0,
+        "the bounded artifact must not allocate/serialize before cap rejection"
+    );
+}
 
 fn oracle(pattern: &str, haystack: &[u8], start: usize, end: usize) -> Option<(usize, usize)> {
     let regex = RegexBuilder::new(pattern).build().expect("oracle build");

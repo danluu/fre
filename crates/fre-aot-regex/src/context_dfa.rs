@@ -4565,6 +4565,7 @@ mod tests {
             OutputContract::Span,
             CompileMode::Fast,
             DeterminizeLimits::default(),
+            usize::MAX,
         )
         .unwrap_or_else(|error| panic!("reference {pattern:?}: {error}"));
         (machine, reference)
@@ -5212,6 +5213,7 @@ mod tests {
             OutputContract::Span,
             CompileMode::Fast,
             DeterminizeLimits::default(),
+            usize::MAX,
         )
         .expect("contextual decline must preserve universal compiler eligibility");
         assert_eq!(fallback.engine_kind(), EngineKind::OrderedNfa);

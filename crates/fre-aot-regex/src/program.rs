@@ -9,6 +9,8 @@ use fre_simd_kernels::{
 };
 use memchr::{memchr, memchr2, memchr3};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use std::cell::Cell;
 use std::fmt;
 
 use crate::{
@@ -22,7 +24,7 @@ use crate::{
         NativeDfaView, OrderedDfa, PartialDfa, PartialDfaPrefixPlan, PartialDfaResult,
         PartialDfaResume,
     },
-    error::CompileError,
+    error::{CompileError, CompileResource},
     required_literals::{self, RequiredLiterals},
     seeded_reverse::{
         SeededReverseBuild, SeededReverseDfa, SeededReverseLimits, SeededReverseSeed,
@@ -57,6 +59,21 @@ pub const PROGRAM_HEADER_LEN: usize = 24;
 /// pointer extent that the runtime discovers from the artifact itself.
 pub const MAX_SERIALIZED_PROGRAM_BYTES: usize = 256 * 1024 * 1024;
 const MIN_SERIALIZED_PROGRAM_BYTES: usize = PROGRAM_HEADER_LEN + 52 + 8;
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_SERIALIZE_CALLS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_test_serialize_calls() {
+    TEST_SERIALIZE_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn test_serialize_calls() -> usize {
+    TEST_SERIALIZE_CALLS.with(Cell::get)
+}
 /// Maximum fixed byte depth inspected by the source-independent anchored
 /// prefix analysis.
 pub const MAX_ANCHORED_PREFIX_BYTES: usize = 16;
@@ -1683,6 +1700,7 @@ impl CompiledProgram {
         output: OutputContract,
         mode: CompileMode,
         limits: DeterminizeLimits,
+        max_program_bytes: usize,
     ) -> Result<Self, CompileError> {
         let line_terminator = automaton.line_terminator();
         let exact_match_width = derive_exact_match_width(&raw);
@@ -1829,10 +1847,20 @@ impl CompiledProgram {
             nfa_mandatory_suffix,
             nfa_mandatory_cut,
         };
+        let program_bytes = program.serialized_len()?;
+        let effective_program_limit = max_program_bytes.min(MAX_SERIALIZED_PROGRAM_BYTES);
+        if program_bytes > effective_program_limit {
+            return Err(CompileError::Resource {
+                resource: CompileResource::ProgramBytes,
+                limit: effective_program_limit,
+                required: program_bytes,
+            });
+        }
         // Workspace compatibility includes the exact canonical artifact, not
         // just its Thompson graph. This prevents a retained frontier table
         // prepared under one determinization limit or output contract from
         // being paired with a different table for the same regex language.
+        // The length cap is checked before serialization allocates its output.
         program.identity = program.serialized_sha256()?;
         Ok(program)
     }
@@ -1982,6 +2010,10 @@ impl CompiledProgram {
     #[must_use]
     pub const fn determinization_report(&self) -> Option<&DeterminizationReport> {
         self.determinization_report.as_ref()
+    }
+
+    pub(crate) const fn artifact_identity(&self) -> [u8; 32] {
+        self.identity
     }
 
     /// Return the bounded graph-derived fixed-prefix facts.
@@ -2867,6 +2899,8 @@ impl CompiledProgram {
     /// Returns an invariant error if a dimension cannot be represented or the
     /// bounded output allocation cannot be reserved.
     pub fn serialize(&self) -> Result<Vec<u8>, CompileError> {
+        #[cfg(test)]
+        TEST_SERIALIZE_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
         let expected = self.serialized_len()?;
         let mut bytes = Vec::new();
         bytes.try_reserve_exact(expected).map_err(|_| {
@@ -4772,7 +4806,15 @@ mod tests {
         let automaton = Automaton::from_raw(raw.clone(), CompileLimits::default())
             .expect("validate")
             .with_line_terminator(line_terminator);
-        CompiledProgram::build(raw, automaton, output, mode, determinize).expect("compile")
+        CompiledProgram::build(
+            raw,
+            automaton,
+            output,
+            mode,
+            determinize,
+            usize::MAX,
+        )
+        .expect("compile")
     }
 
     fn generated_byte_strings(alphabet: &[u8], max_len: usize) -> Vec<Vec<u8>> {
@@ -5961,6 +6003,7 @@ mod tests {
                 max_states: 0,
                 ..DeterminizeLimits::default()
             },
+            usize::MAX,
         )
         .expect("compile cyclic multi-accept fallback");
         assert!(accelerated.nfa_mandatory_suffix.is_none());

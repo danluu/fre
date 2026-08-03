@@ -408,17 +408,16 @@ pub fn compile_raw_with_line_terminator(
     let automaton = Automaton::from_raw(raw.clone(), limits.lower.automata)?
         .with_line_terminator(line_terminator);
     let stats = automaton.stats();
-    let program = CompiledProgram::build(raw, automaton, output, mode, limits.determinize)?;
+    let program = CompiledProgram::build(
+        raw,
+        automaton,
+        output,
+        mode,
+        limits.determinize,
+        limits.max_program_bytes,
+    )?;
     let program_bytes = program.serialized_len()?;
-    let effective_program_limit = limits.max_program_bytes.min(MAX_SERIALIZED_PROGRAM_BYTES);
-    if program_bytes > effective_program_limit {
-        return Err(CompileError::Resource {
-            resource: CompileResource::ProgramBytes,
-            limit: effective_program_limit,
-            required: program_bytes,
-        });
-    }
-    let program_sha256 = program.serialized_sha256()?;
+    let program_sha256 = program.artifact_identity();
     let module = CompiledModule::lower(&program, target)?;
     let format = ObjectFormat::for_target(target);
     let object = emit_object(&module, format, limits.max_object_bytes)?;

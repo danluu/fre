@@ -2668,6 +2668,7 @@ mod tests {
             output,
             CompileMode::Optimizing,
             DeterminizeLimits::default(),
+            usize::MAX,
         )
         .unwrap_or_else(|error| panic!("compile {pattern:?}: {error}"));
         assert!(

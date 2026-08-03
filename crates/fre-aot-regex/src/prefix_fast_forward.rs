@@ -504,6 +504,7 @@ mod tests {
             OutputContract::Exists,
             CompileMode::Optimizing,
             DeterminizeLimits::default(),
+            usize::MAX,
         )
         .unwrap_or_else(|error| panic!("determinize {pattern:?}: {error}"))
     }

@@ -1780,6 +1780,7 @@ mod tests {
             OutputContract::Span,
             CompileMode::Optimizing,
             DeterminizeLimits::default(),
+            usize::MAX,
         )
         .expect("compile test graph")
     }
