@@ -5,13 +5,15 @@ use fre::{
     SearchLimits, SearchSessionLimits, SearchWindow,
 };
 
-const CASES: [(&str, &str); 6] = [
+const CASES: [(&str, &str); 8] = [
     ("constant-256", "(?s-u:.)+"),
     ("small-1", "a+"),
     ("small-2", "(?-u:[ab])+"),
     ("small-3", "(?-u:[abc])+"),
-    ("classified-4", "(?-u:[abcd])+"),
-    ("classified-255", "(?-u:[^\\x00])+"),
+    ("range-4", "(?-u:[abcd])+"),
+    ("range-255", "(?-u:[^\\x00])+"),
+    ("small-noncontiguous-2", "(?-u:[ac])+"),
+    ("classified-noncontiguous-4", "(?-u:[aceg])+"),
 ];
 
 fn build(pattern: &str) -> PortableRegex {
@@ -131,53 +133,58 @@ fn value_exists_is_exhaustive_across_leaf_cardinality_boundaries() {
 }
 
 #[test]
-fn classified_scanner_block_edges_preserve_results_and_refusal_payloads() {
-    let regex = build("(?-u:[abcd])+");
-    let mut session = regex
-        .search_session(SearchSessionLimits::unlimited())
-        .unwrap();
-    assert_eq!(
-        session.runtime_implementation_id(),
-        fre::PURE_BYTE_CLASS_REPEAT_PLAN_ID
-    );
-    assert!(session.workspace_setup_accounting().is_none());
+fn range_and_classified_scanner_block_edges_preserve_results_and_refusal_payloads() {
+    for (case, pattern) in [
+        ("range", "(?-u:[abcd])+"),
+        ("classified", "(?-u:[aceg])+"),
+    ] {
+        let regex = build(pattern);
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        assert_eq!(
+            session.runtime_implementation_id(),
+            fre::PURE_BYTE_CLASS_REPEAT_PLAN_ID
+        );
+        assert!(session.workspace_setup_accounting().is_none());
 
-    for length in [0_usize, 1, 15, 16, 17, 18, 31, 32, 33, 34, 47, 48, 49] {
-        let mut hit_positions = vec![None];
-        for position in [0_usize, 1, 15, 16, 17, 31, 32, length.saturating_sub(1)] {
-            if position < length {
-                hit_positions.push(Some(position));
+        for length in [0_usize, 1, 15, 16, 17, 18, 31, 32, 33, 34, 47, 48, 49] {
+            let mut hit_positions = vec![None];
+            for position in [0_usize, 1, 15, 16, 17, 31, 32, length.saturating_sub(1)] {
+                if position < length {
+                    hit_positions.push(Some(position));
+                }
             }
-        }
-        hit_positions.sort_unstable();
-        hit_positions.dedup();
+            hit_positions.sort_unstable();
+            hit_positions.dedup();
 
-        for hit in hit_positions {
-            let mut haystack = vec![b'!'; length.saturating_add(2)];
-            haystack[1..length + 1].fill(b'z');
-            if let Some(position) = hit {
-                haystack[position + 1] = b'a';
-            }
-            let window = SearchWindow::new(1, length + 1);
-            assert_eq!(
-                reporting(&regex, &haystack, window, SearchLimits::unlimited()),
-                Ok(hit.is_some()),
-                "length={length}, hit={hit:?}"
-            );
-
-            let work = measured_work(&regex, &haystack, window);
-            for max_work in 0..=work.saturating_add(1) {
-                assert_direct_and_session_parity(
-                    &regex,
-                    &mut session,
-                    &haystack,
-                    window,
-                    SearchLimits {
-                        max_work,
-                        max_scratch_bytes: usize::MAX,
-                    },
-                    &format!("length={length}, hit={hit:?}"),
+            for hit in hit_positions {
+                let mut haystack = vec![b'!'; length.saturating_add(2)];
+                haystack[1..length + 1].fill(b'z');
+                if let Some(position) = hit {
+                    haystack[position + 1] = b'a';
+                }
+                let window = SearchWindow::new(1, length + 1);
+                assert_eq!(
+                    reporting(&regex, &haystack, window, SearchLimits::unlimited()),
+                    Ok(hit.is_some()),
+                    "case={case}, length={length}, hit={hit:?}"
                 );
+
+                let work = measured_work(&regex, &haystack, window);
+                for max_work in 0..=work.saturating_add(1) {
+                    assert_direct_and_session_parity(
+                        &regex,
+                        &mut session,
+                        &haystack,
+                        window,
+                        SearchLimits {
+                            max_work,
+                            max_scratch_bytes: usize::MAX,
+                        },
+                        &format!("case={case}, length={length}, hit={hit:?}"),
+                    );
+                }
             }
         }
     }

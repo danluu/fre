@@ -10,7 +10,7 @@
 use fre_exact_alloc::{CopyError, ExactBoxOrUsize};
 use fre_kernels::{
     BYTE_SET_BLOCK_BYTES, BYTE_SET_CLASSIFIER_BUILD_WORK, ByteSet256, ByteSetClassifier,
-    DispatchPolicy, SimdDispatchContext,
+    DispatchPolicy, SimdDispatchContext, classify_byte_delta_16,
 };
 use memchr::{memchr, memchr2, memchr3};
 use regex_syntax::hir::{Class, Hir, HirKind};
@@ -115,12 +115,17 @@ impl InspectionOutcome {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SetSeek {
     Constant(bool),
     One(u8),
     Two(u8, u8),
     Three(u8, u8, u8),
+    Range {
+        origin: u8,
+        maximum_delta: u8,
+        inverted: bool,
+    },
     Classified { inverted: bool },
 }
 
@@ -154,10 +159,26 @@ impl SetSeek {
                     _ => unreachable!("the small-cardinality branch admits one to three members"),
                 }
             }
-            _ => Self::Classified {
-                inverted: classified_inverted,
-            },
+            _ => {
+                if let Some((origin, maximum_delta, inverted)) =
+                    contiguous_range(words, cardinality)
+                {
+                    Self::Range {
+                        origin,
+                        maximum_delta,
+                        inverted,
+                    }
+                } else {
+                    Self::Classified {
+                        inverted: classified_inverted,
+                    }
+                }
+            }
         }
+    }
+
+    pub(super) const fn requires_classifier(self) -> bool {
+        matches!(self, Self::Classified { .. })
     }
 
     pub(super) fn seek(
@@ -173,6 +194,19 @@ impl SetSeek {
             Self::One(_) | Self::Two(_, _) | Self::Three(_, _, _) => {
                 seek_small(self, haystack, position, end, meter)
             }
+            Self::Range {
+                origin,
+                maximum_delta,
+                inverted,
+            } => seek_range(
+                origin,
+                maximum_delta,
+                inverted,
+                haystack,
+                position,
+                end,
+                meter,
+            ),
             Self::Classified { inverted } => seek_classified(
                 classifier.expect("a classified leaf retains the shared classifier"),
                 inverted,
@@ -183,6 +217,45 @@ impl SetSeek {
             ),
         }
     }
+}
+
+#[cold]
+fn contiguous_range(words: [u64; 4], cardinality: u32) -> Option<(u8, u8, bool)> {
+    if let Some((origin, maximum_delta)) = contiguous_bounds(words, cardinality) {
+        return Some((origin, maximum_delta, false));
+    }
+    let complement_cardinality = 256_u32.checked_sub(cardinality)?;
+    contiguous_bounds(words.map(|word| !word), complement_cardinality)
+        .map(|(origin, maximum_delta)| (origin, maximum_delta, true))
+}
+
+#[cold]
+fn contiguous_bounds(words: [u64; 4], cardinality: u32) -> Option<(u8, u8)> {
+    if cardinality == 0 {
+        return None;
+    }
+    let word_bits = usize::try_from(u64::BITS).expect("the u64 bit width fits usize");
+    let first_word = words.iter().position(|word| *word != 0)?;
+    let last_word = words.iter().rposition(|word| *word != 0)?;
+    let first = first_word
+        .checked_mul(word_bits)?
+        .checked_add(usize::try_from(words[first_word].trailing_zeros()).ok()?)?;
+    let last_bit = u64::BITS
+        .checked_sub(1)?
+        .checked_sub(words[last_word].leading_zeros())?;
+    let last = last_word
+        .checked_mul(word_bits)?
+        .checked_add(usize::try_from(last_bit).ok()?)?;
+    let span = last
+        .checked_sub(first)?
+        .checked_add(1)?;
+    if span != usize::try_from(cardinality).ok()? {
+        return None;
+    }
+    Some((
+        u8::try_from(first).ok()?,
+        u8::try_from(last.checked_sub(first)?).ok()?,
+    ))
 }
 
 struct Owner {
@@ -529,6 +602,51 @@ fn seek_small(
     })
 }
 
+fn seek_range(
+    origin: u8,
+    maximum_delta: u8,
+    inverted: bool,
+    haystack: &[u8],
+    mut position: usize,
+    end: usize,
+    meter: &mut WorkMeter,
+) -> Result<Option<usize>, SearchError> {
+    if position == end {
+        return Ok(None);
+    }
+
+    meter.charge(1)?;
+    if (haystack[position].wrapping_sub(origin) <= maximum_delta) != inverted {
+        return Ok(Some(position));
+    }
+    position += 1;
+
+    while end.saturating_sub(position) >= BYTE_SET_BLOCK_BYTES {
+        meter.charge(BYTE_SET_BLOCK_BYTES)?;
+        let block_end = position + BYTE_SET_BLOCK_BYTES;
+        let block: &[u8; BYTE_SET_BLOCK_BYTES] = haystack[position..block_end]
+            .try_into()
+            .expect("the range classifier checked its complete fixed extent");
+        let classified = classify_byte_delta_16(origin, maximum_delta, block).member_mask();
+        let members = if inverted { !classified } else { classified };
+        if members != 0 {
+            let offset = usize::try_from(members.trailing_zeros())
+                .expect("a fixed-width range-classifier lane fits usize");
+            return Ok(Some(position + offset));
+        }
+        position = block_end;
+    }
+
+    while position < end {
+        meter.charge(1)?;
+        if (haystack[position].wrapping_sub(origin) <= maximum_delta) != inverted {
+            return Ok(Some(position));
+        }
+        position += 1;
+    }
+    Ok(None)
+}
+
 fn seek_classified(
     classifier: &ByteSetClassifier,
     inverted: bool,
@@ -631,8 +749,10 @@ pub(crate) fn inspect(
     let run_end_cardinality = 256_u32 - member_cardinality;
     charge_leaf_selection(&mut work, max_planner_work)?;
     charge_leaf_selection(&mut work, max_planner_work)?;
-    let member_classified = matches!(member_cardinality, 4..=255);
-    let run_end_classified = matches!(run_end_cardinality, 4..=255);
+    let member_seek = SetSeek::build(words, member_cardinality, false);
+    let member_classified = member_seek.requires_classifier();
+    let run_end_seek = SetSeek::build(complement, run_end_cardinality, member_classified);
+    let run_end_classified = run_end_seek.requires_classifier();
     if member_classified || run_end_classified {
         charge_planner(
             &mut work,
@@ -650,8 +770,8 @@ pub(crate) fn inspect(
     };
     Ok(InspectionOutcome::Eligible(Inspection {
         greedy: repetition.greedy,
-        member_seek: SetSeek::build(words, member_cardinality, false),
-        run_end_seek: SetSeek::build(complement, run_end_cardinality, member_classified),
+        member_seek,
+        run_end_seek,
         classifier_words,
         planner_work: work,
     }))
@@ -692,11 +812,11 @@ fn charge_planner(work: &mut u64, additional: u64, limit: u64) -> Result<(), Ins
 
 #[cfg(test)]
 mod tests {
-    use super::{Accounting, Error, Operation, PLAN_ID};
+    use super::{Accounting, Error, InspectionOutcome, Operation, PLAN_ID, SetSeek, WorkMeter};
     use crate::{
         BuildError, BuildLimits, PlanKind, PlanSelection, PortableBuilder, PortableFindIterLimits,
-        PortableTextBuilder, SearchAccounting, SearchError as FacadeSearchError, SearchLimits,
-        SearchWindow,
+        PortablePlan, PortableTextBuilder, SearchAccounting, SearchError as FacadeSearchError,
+        SearchLimits, SearchWindow,
     };
 
     fn build(pattern: &str) -> crate::PortableRegex {
@@ -715,6 +835,285 @@ mod tests {
 
     fn span(matched: Option<crate::Match>) -> Option<(usize, usize)> {
         matched.map(|matched| (matched.start(), matched.end()))
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "test helpers only set bits in the fixed 256-byte domain"
+    )]
+    fn member_words(members: &[u8]) -> [u64; 4] {
+        let mut words = [0_u64; 4];
+        for &byte in members {
+            let word = usize::from(byte >> 6);
+            let bit = u32::from(byte & 63);
+            words[word] |= 1_u64 << bit;
+        }
+        words
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "test helpers only set bits in one validated inclusive byte range"
+    )]
+    fn inclusive_words(start: u8, end: u8) -> [u64; 4] {
+        let mut words = [0_u64; 4];
+        for byte in start..=end {
+            let word = usize::from(byte >> 6);
+            let bit = u32::from(byte & 63);
+            words[word] |= 1_u64 << bit;
+        }
+        words
+    }
+
+    #[test]
+    fn shared_set_seek_selects_every_contiguous_shape_without_displacing_small_leaves() {
+        for start in u16::from(u8::MIN)..=u16::from(u8::MAX) {
+            for end in start..=u16::from(u8::MAX) {
+                let start = u8::try_from(start).expect("the byte-domain start fits u8");
+                let end = u8::try_from(end).expect("the byte-domain end fits u8");
+                let cardinality = u32::from(end)
+                    .checked_sub(u32::from(start))
+                    .and_then(|delta| delta.checked_add(1))
+                    .expect("one inclusive byte range has bounded cardinality");
+                let words = inclusive_words(start, end);
+                let member = SetSeek::build(words, cardinality, false);
+                let expected = match cardinality {
+                    1 => SetSeek::One(start),
+                    2 => SetSeek::Two(start, start.checked_add(1).expect("two-byte range")),
+                    3 => SetSeek::Three(
+                        start,
+                        start.checked_add(1).expect("three-byte range middle"),
+                        start.checked_add(2).expect("three-byte range end"),
+                    ),
+                    256 => SetSeek::Constant(true),
+                    _ => SetSeek::Range {
+                        origin: start,
+                        maximum_delta: end.wrapping_sub(start),
+                        inverted: false,
+                    },
+                };
+                assert_eq!(member, expected, "member range {start:#04x}..={end:#04x}");
+                assert!(!member.requires_classifier());
+
+                let complement = words.map(|word| !word);
+                let complement_cardinality = 256_u32
+                    .checked_sub(cardinality)
+                    .expect("one byte-set complement has bounded cardinality");
+                let run_end = SetSeek::build(
+                    complement,
+                    complement_cardinality,
+                    member.requires_classifier(),
+                );
+                match complement_cardinality {
+                    0 => assert_eq!(run_end, SetSeek::Constant(false)),
+                    1 => assert!(matches!(run_end, SetSeek::One(_))),
+                    2 => assert!(matches!(run_end, SetSeek::Two(_, _))),
+                    3 => assert!(matches!(run_end, SetSeek::Three(_, _, _))),
+                    _ => assert!(matches!(run_end, SetSeek::Range { .. })),
+                }
+                assert!(
+                    !run_end.requires_classifier(),
+                    "complement of {start:#04x}..={end:#04x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shared_set_seek_retains_generic_fallback_for_holey_sets() {
+        let pair = member_words(&[1, 3]);
+        let member = SetSeek::build(pair, 2, false);
+        assert_eq!(member, SetSeek::Two(1, 3));
+        let run_end = SetSeek::build(pair.map(|word| !word), 254, false);
+        assert_eq!(run_end, SetSeek::Classified { inverted: false });
+
+        let holey = member_words(&[1, 3, 65, 130]);
+        let member = SetSeek::build(holey, 4, false);
+        assert_eq!(member, SetSeek::Classified { inverted: false });
+        let run_end = SetSeek::build(holey.map(|word| !word), 252, true);
+        assert_eq!(run_end, SetSeek::Classified { inverted: true });
+    }
+
+    #[test]
+    fn range_and_complement_seeks_preserve_exact_fixed_block_work() {
+        let words = inclusive_words(0x40, 0x7f);
+        let member = SetSeek::build(words, 64, false);
+        let run_end = SetSeek::build(words.map(|word| !word), 192, false);
+        assert!(matches!(member, SetSeek::Range { inverted: false, .. }));
+        assert!(matches!(run_end, SetSeek::Range { inverted: true, .. }));
+
+        let mut member_haystack = [0_u8; 40];
+        member_haystack[20] = 0x40;
+        let mut run_end_haystack = [0x40_u8; 40];
+        run_end_haystack[20] = 0;
+        for (leaf, haystack) in [
+            (member, &member_haystack[..]),
+            (run_end, &run_end_haystack[..]),
+        ] {
+            let mut exact = WorkMeter::new(33);
+            assert_eq!(
+                leaf.seek(haystack, 0, haystack.len(), &mut exact, None),
+                Ok(Some(20))
+            );
+            assert_eq!(exact.consumed(), 33);
+
+            let mut one_below = WorkMeter::new(32);
+            assert_eq!(
+                leaf.seek(haystack, 0, haystack.len(), &mut one_below, None),
+                Err(Error::WorkLimit {
+                    needed: 33,
+                    limit: 32,
+                })
+            );
+            assert_eq!(one_below.consumed(), 17);
+
+            let mut empty = WorkMeter::new(0);
+            assert_eq!(leaf.seek(haystack, 0, 0, &mut empty, None), Ok(None));
+            assert_eq!(empty.consumed(), 0);
+        }
+
+        let mut absent = WorkMeter::new(40);
+        assert_eq!(
+            member.seek(&[0_u8; 40], 0, 40, &mut absent, None),
+            Ok(None)
+        );
+        assert_eq!(absent.consumed(), 40);
+    }
+
+    #[test]
+    fn range_plan_omits_generic_classifier_and_preserves_identity_receipts() {
+        use regex_syntax::ParserBuilder;
+
+        let hir = ParserBuilder::new()
+            .unicode(false)
+            .utf8(false)
+            .build()
+            .parse("(?-u:[A-Z])+")
+            .expect("one byte range should parse");
+        let initial_work = 11_u64;
+        let outcome = super::inspect(&hir, initial_work, u64::MAX)
+            .expect("one byte range should inspect");
+        let InspectionOutcome::Eligible(inspection) = outcome else {
+            panic!("one byte range should select the pure repeat plan");
+        };
+        assert_eq!(
+            inspection.member_seek,
+            SetSeek::Range {
+                origin: b'A',
+                maximum_delta: b'Z'.wrapping_sub(b'A'),
+                inverted: false,
+            }
+        );
+        assert_eq!(
+            inspection.run_end_seek,
+            SetSeek::Range {
+                origin: b'A',
+                maximum_delta: b'Z'.wrapping_sub(b'A'),
+                inverted: true,
+            }
+        );
+        assert!(inspection.classifier_words.is_none());
+        let expected_work = [
+            initial_work,
+            super::NODE_INSPECTION_WORK,
+            super::NODE_INSPECTION_WORK,
+            super::RANGE_INSPECTION_WORK,
+            26_u64
+                .checked_mul(super::MEMBER_INSERTION_WORK)
+                .expect("the fixed member work fits u64"),
+            super::LEAF_SELECTION_WORK,
+            super::LEAF_SELECTION_WORK,
+        ]
+        .into_iter()
+        .try_fold(0_u64, |total, work| total.checked_add(work))
+        .expect("the fixed inspection work fits u64");
+        assert_eq!(inspection.planner_work, expected_work);
+
+        let regex = build("(?-u:[A-Z])+");
+        assert_eq!(regex.runtime_implementation_id(), PLAN_ID);
+        let PortablePlan::PureByteClassRepeat(plan) = &regex.plan else {
+            panic!("one byte range should retain the pure repeat plan");
+        };
+        assert!(plan.owner().classifier.is_none());
+        let (matched, receipt) = regex
+            .find(b"!!ABCDEFGHIJKLMNOPQRSTUVWXYZ!!", SearchLimits::unlimited())
+            .expect("one range search should succeed");
+        assert_eq!(span(matched), Some((2, 28)));
+        let receipt = accounting(receipt);
+        assert_eq!(receipt.plan_id, PLAN_ID);
+        assert_eq!(receipt.operation, Operation::Span);
+        assert_eq!(
+            receipt.actual_work,
+            u64::try_from(receipt.source_reads).expect("source reads fit u64")
+        );
+        assert!(receipt.actual_work <= receipt.work_upper_bound);
+
+        let generic = build("(?-u:[A-Z_a-z])+");
+        let PortablePlan::PureByteClassRepeat(plan) = &generic.plan else {
+            panic!("one holey byte set should retain the pure repeat plan");
+        };
+        assert!(matches!(plan.owner().member_seek, SetSeek::Classified { inverted: false }));
+        assert!(matches!(plan.owner().run_end_seek, SetSeek::Classified { inverted: true }));
+        assert!(plan.owner().classifier.is_some());
+
+        let generic_hir = ParserBuilder::new()
+            .unicode(false)
+            .utf8(false)
+            .build()
+            .parse("(?-u:[A-Z_a-z])+")
+            .expect("one holey byte set should parse");
+        let outcome = super::inspect(&generic_hir, initial_work, u64::MAX)
+            .expect("one holey byte set should inspect");
+        let InspectionOutcome::Eligible(inspection) = outcome else {
+            panic!("one holey byte set should select the pure repeat plan");
+        };
+        assert!(inspection.classifier_words.is_some());
+        let expected_generic_work = [
+            initial_work,
+            super::NODE_INSPECTION_WORK,
+            super::NODE_INSPECTION_WORK,
+            3_u64
+                .checked_mul(super::RANGE_INSPECTION_WORK)
+                .expect("the fixed range work fits u64"),
+            53_u64
+                .checked_mul(super::MEMBER_INSERTION_WORK)
+                .expect("the fixed member work fits u64"),
+            super::LEAF_SELECTION_WORK,
+            super::LEAF_SELECTION_WORK,
+            u64::try_from(super::BYTE_SET_CLASSIFIER_BUILD_WORK)
+                .expect("the classifier build work fits u64"),
+        ]
+        .into_iter()
+        .try_fold(0_u64, |total, work| total.checked_add(work))
+        .expect("the fixed generic inspection work fits u64");
+        assert_eq!(inspection.planner_work, expected_generic_work);
+
+        let small_holey = build("(?-u:[ac])+");
+        let PortablePlan::PureByteClassRepeat(plan) = &small_holey.plan else {
+            panic!("one small holey set should retain the pure repeat plan");
+        };
+        assert_eq!(plan.owner().member_seek, SetSeek::Two(b'a', b'c'));
+        assert_eq!(
+            plan.owner().run_end_seek,
+            SetSeek::Classified { inverted: false }
+        );
+        let classifier = plan
+            .owner()
+            .classifier
+            .as_ref()
+            .expect("a holey small-set complement needs the generic classifier");
+        assert!(!classifier.set().contains(b'a'));
+        assert!(classifier.set().contains(b'b'));
+        assert!(!classifier.set().contains(b'c'));
+        assert_eq!(
+            span(
+                small_holey
+                    .find(b"!!acacacacacacacacacacb", SearchLimits::unlimited())
+                    .expect("the complement-backed run-end seek should succeed")
+                    .0
+            ),
+            Some((2, 22))
+        );
     }
 
     #[test]

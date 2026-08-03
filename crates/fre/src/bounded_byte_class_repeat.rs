@@ -407,8 +407,10 @@ pub(crate) fn inspect(
     let run_end_cardinality = 256_u32 - member_cardinality;
     charge_planner(&mut work, LEAF_SELECTION_WORK, max_planner_work)?;
     charge_planner(&mut work, LEAF_SELECTION_WORK, max_planner_work)?;
-    let member_classified = matches!(member_cardinality, 4..=255);
-    let run_end_classified = matches!(run_end_cardinality, 4..=255);
+    let member_seek = SetSeek::build(words, member_cardinality, false);
+    let member_classified = member_seek.requires_classifier();
+    let run_end_seek = SetSeek::build(complement, run_end_cardinality, member_classified);
+    let run_end_classified = run_end_seek.requires_classifier();
     if member_classified || run_end_classified {
         charge_planner(
             &mut work,
@@ -428,8 +430,8 @@ pub(crate) fn inspect(
         minimum: repetition.min,
         maximum,
         greedy: repetition.greedy,
-        member_seek: SetSeek::build(words, member_cardinality, false),
-        run_end_seek: SetSeek::build(complement, run_end_cardinality, member_classified),
+        member_seek,
+        run_end_seek,
         classifier_words,
         planner_work: work,
     }))
@@ -466,6 +468,7 @@ fn charge_planner(work: &mut u64, additional: u64, limit: u64) -> Result<(), Ins
 #[cfg(test)]
 mod tests {
     use super::PLAN_ID;
+    use crate::pure_byte_class_repeat::SetSeek;
     use crate::{
         BuildError, BuildLimits, PlanKind, PlanSelection, PortableBuilder, PortableFindIterLimits,
         PortablePlan, PortableTextBuilder, SearchAccounting, SearchError as FacadeSearchError,
@@ -535,6 +538,78 @@ mod tests {
             text.build_report().portable.plan,
             PlanKind::PureByteClassRepeat
         );
+    }
+
+    #[test]
+    fn contiguous_and_small_owners_share_range_seeks_without_generic_classifier() {
+        let range = build(r"(?-u:[\x40-\x7f]){3,7}");
+        assert_eq!(range.runtime_implementation_id(), PLAN_ID);
+        let PortablePlan::BoundedByteClassRepeat(plan) = &range.plan else {
+            panic!("one bounded range should retain the bounded repeat plan");
+        };
+        assert_eq!(
+            plan.owner().member_seek,
+            SetSeek::Range {
+                origin: 0x40,
+                maximum_delta: 0x3f,
+                inverted: false,
+            }
+        );
+        assert_eq!(
+            plan.owner().run_end_seek,
+            SetSeek::Range {
+                origin: 0x40,
+                maximum_delta: 0x3f,
+                inverted: true,
+            }
+        );
+        assert!(plan.owner().classifier.is_none());
+
+        let (matched, receipt) = range
+            .find(b"................................@@@@!", SearchLimits::unlimited())
+            .expect("one bounded range search should succeed");
+        assert_eq!(span(matched), Some((32, 36)));
+        let receipt = accounting(receipt);
+        assert_eq!(receipt.plan_id, PLAN_ID);
+        assert_eq!(receipt.operation, Operation::Span);
+        assert_eq!(
+            receipt.actual_work,
+            u64::try_from(receipt.source_reads).expect("source reads fit u64")
+        );
+        assert!(receipt.actual_work <= receipt.work_upper_bound);
+
+        let small = build("a{2,5}");
+        let PortablePlan::BoundedByteClassRepeat(plan) = &small.plan else {
+            panic!("one bounded literal should retain the bounded repeat plan");
+        };
+        assert_eq!(plan.owner().member_seek, SetSeek::One(b'a'));
+        assert_eq!(
+            plan.owner().run_end_seek,
+            SetSeek::Range {
+                origin: b'a',
+                maximum_delta: 0,
+                inverted: true,
+            }
+        );
+        assert!(plan.owner().classifier.is_none());
+
+        let small_holey = build("(?-u:[ac]){2,5}");
+        let PortablePlan::BoundedByteClassRepeat(plan) = &small_holey.plan else {
+            panic!("one bounded holey pair should retain the bounded repeat plan");
+        };
+        assert_eq!(plan.owner().member_seek, SetSeek::Two(b'a', b'c'));
+        assert_eq!(
+            plan.owner().run_end_seek,
+            SetSeek::Classified { inverted: false }
+        );
+        let classifier = plan
+            .owner()
+            .classifier
+            .as_ref()
+            .expect("a bounded holey-pair complement needs the generic classifier");
+        assert!(!classifier.set().contains(b'a'));
+        assert!(classifier.set().contains(b'b'));
+        assert!(!classifier.set().contains(b'c'));
     }
 
     #[test]

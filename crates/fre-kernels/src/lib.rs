@@ -20,7 +20,7 @@ pub use fre_simd_kernels::{
     BYTE_PAIR_BARRIER_GROUP_BYTES, BYTE_SET_CLASSIFIER_BUILD_WORK, BytePairBarrierScan,
     BytePairBarrierScanner, ByteSet256, ByteSetClassifier, DispatchPolicy, DispatchProfile, Feature,
     FeatureSet, SelectionReceipt, SimdDispatchContext, TuningClass, UnsupportedRequiredFeatures,
-    VectorKind, dispatch_profile,
+    VectorKind, classify_byte_delta_16, dispatch_profile,
 };
 
 mod anchored_line_capture;
