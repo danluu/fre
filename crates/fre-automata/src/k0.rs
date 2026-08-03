@@ -1202,6 +1202,23 @@ impl LazyWorkspace {
             })
     }
 
+    /// Read a cell whose source was produced by this authenticated cache.
+    #[inline]
+    fn authenticated_cell(&self, state: u32, byte: u8) -> Result<u32, SearchError> {
+        let state = usize::try_from(state).map_err(|_| SearchError::InternalInvariant {
+            detail: "authenticated lazy DFA state does not fit usize",
+        })?;
+        debug_assert!(state < self.state_len);
+        debug_assert!(self.state_len <= LAZY_MAX_STATES);
+        let cell_index = direct_row_cell_index(state, byte);
+        self.rows
+            .get(cell_index)
+            .copied()
+            .ok_or(SearchError::InternalInvariant {
+                detail: "authenticated lazy DFA cell is outside the direct table",
+            })
+    }
+
     fn set_cell(&mut self, state: u32, byte: u8, cell: u32) -> Result<(), SearchError> {
         let state = usize::try_from(state).map_err(|_| SearchError::InternalInvariant {
             detail: "lazy DFA transition state does not fit usize",
@@ -1705,6 +1722,23 @@ impl ReverseWorkspace {
             .copied()
             .ok_or(SearchError::InternalInvariant {
                 detail: "reverse DFA transition cell is outside the direct table",
+            })
+    }
+
+    /// Read a cell whose source was produced by this authenticated cache.
+    #[inline]
+    fn authenticated_cell(&self, state: u32, byte: u8) -> Result<u32, SearchError> {
+        let state = usize::try_from(state).map_err(|_| SearchError::InternalInvariant {
+            detail: "authenticated reverse DFA state does not fit usize",
+        })?;
+        debug_assert!(state < self.state_len);
+        debug_assert!(self.state_len <= LAZY_MAX_STATES);
+        let cell = direct_row_cell_index(state, byte);
+        self.rows
+            .get(cell)
+            .copied()
+            .ok_or(SearchError::InternalInvariant {
+                detail: "authenticated reverse DFA cell is outside the direct table",
             })
     }
 
@@ -3264,7 +3298,7 @@ fn execute_lazy_loop(
             })?;
         let transition = match state {
             LazyState::Cached(cached) => {
-                let cell = workspace.lazy.cell(cached, byte)?;
+                let cell = workspace.lazy.authenticated_cell(cached, byte)?;
                 if cell == LAZY_CELL_UNFILLED {
                     build_lazy_cached_transition(
                         automaton,
@@ -4767,15 +4801,22 @@ fn execute_reverse_lazy_loop(
             detail: "reverse DFA source position exceeded the validated window",
         })?;
         let transition = match state {
-            ReverseState::Cached(cached) => build_reverse_cached_transition(
-                automaton,
-                cached,
-                byte,
-                workspace,
-                meter,
-                core_reserve,
-                source,
-            )?,
+            ReverseState::Cached(cached) => {
+                let cell = workspace.reverse.authenticated_cell(cached, byte)?;
+                if cell == LAZY_CELL_UNFILLED {
+                    build_reverse_cached_transition(
+                        automaton,
+                        cached,
+                        byte,
+                        workspace,
+                        meter,
+                        core_reserve,
+                        source,
+                    )?
+                } else {
+                    ReverseTransition::Ready(cell)
+                }
+            }
             ReverseState::Inline => {
                 build_reverse_inline_transition(automaton, byte, workspace, meter, source)?
             }
@@ -17073,6 +17114,60 @@ mod tests {
         assert!(
             accelerated.accounting().transition_work() * 2 < pike.accounting().transition_work(),
             "warmed rows should replace repeated ordered closure"
+        );
+    }
+
+    #[test]
+    fn authenticated_direct_cells_keep_physical_bounds_checked() {
+        let plan = a_plus(true);
+        let mut forward =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        plan.prepare::<SelectedEnd>()
+            .search_with_workspace(b"aa", &mut forward, SearchLimits::unlimited())
+            .unwrap();
+        let forward_initial = forward.lazy.initial;
+        assert!(forward.lazy.state_len > 0);
+        let forward_outside = u32::try_from(forward.lazy.state_len).unwrap();
+        assert_eq!(
+            forward.lazy.cell(forward_outside, b'a').unwrap_err(),
+            SearchError::InternalInvariant {
+                detail: "lazy DFA transition state is outside the cache",
+            }
+        );
+        forward.lazy.rows.clear();
+        assert_eq!(
+            forward
+                .lazy
+                .authenticated_cell(forward_initial, b'a')
+                .unwrap_err(),
+            SearchError::InternalInvariant {
+                detail: "authenticated lazy DFA cell is outside the direct table",
+            }
+        );
+
+        let mut reverse =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        plan.prepare::<Span>()
+            .search_with_workspace(b"aa", &mut reverse, SearchLimits::unlimited())
+            .unwrap();
+        let reverse_initial = reverse.reverse.initial;
+        assert!(reverse.reverse.state_len > 0);
+        let reverse_outside = u32::try_from(reverse.reverse.state_len).unwrap();
+        assert_eq!(
+            reverse.reverse.cell(reverse_outside, b'a').unwrap_err(),
+            SearchError::InternalInvariant {
+                detail: "reverse DFA transition state is outside the cache",
+            }
+        );
+        reverse.reverse.rows.clear();
+        assert_eq!(
+            reverse
+                .reverse
+                .authenticated_cell(reverse_initial, b'a')
+                .unwrap_err(),
+            SearchError::InternalInvariant {
+                detail: "authenticated reverse DFA cell is outside the direct table",
+            }
         );
     }
 
