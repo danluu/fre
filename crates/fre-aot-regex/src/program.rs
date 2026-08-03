@@ -20,7 +20,7 @@ use crate::{
         NativeContextDfaView,
     },
     dfa::{
-        self, DeterminizationReport, DeterminizeLimits, DeterminizeOutcome, DfaStats,
+        self, DeterminizationReport, DeterminizeLimits, DeterminizeOutcome, DfaStats, ForwardCell,
         NativeDfaView, OrderedDfa, PartialDfa, PartialDfaPrefixPlan, PartialDfaResult,
         PartialDfaResume,
     },
@@ -2163,11 +2163,29 @@ pub(crate) struct NativeProgramView<'a> {
     pub(crate) required_literals: &'a RequiredLiterals,
     pub(crate) exact_match_width: Option<usize>,
     pub(crate) max_match_width: Option<usize>,
+    /// Width of a complete graph-proved Cartesian language whose native
+    /// scanner verifies every anchored column before returning. This lets a
+    /// no-row ordered-NFA artifact reuse the ordinary target backends without
+    /// pretending its deliberately unreachable placeholder row is a DFA
+    /// proof.
+    pub(crate) exact_product_width: Option<u8>,
     /// Exact moving scanner owned by a complete retained fallback's portable
     /// entry. Native lowering may publish that fallback only when the emitted
     /// target scanner preserves both this membership and its byte offset.
     pub(crate) retained_prefix_requirement: Option<NativeRetainedPrefixRequirement>,
 }
+
+// An exact-product native entry returns directly from its moving primary
+// scanner after verifying every other graph-proved column. The backend still
+// requires a structurally valid table layout for shared register/address
+// setup, so retain one unreachable rejecting row rather than synthesizing or
+// interpreting a general DFA.
+const NATIVE_EXACT_PRODUCT_BYTE_CLASSES: [u8; 256] = [0; 256];
+const NATIVE_EXACT_PRODUCT_CLASS_REPRESENTATIVES: [u8; 1] = [0];
+const NATIVE_EXACT_PRODUCT_REJECTING_ROW: [ForwardCell; 1] = [ForwardCell {
+    next: u32::MAX,
+    accepted: false,
+}];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct NativeRetainedPrefixRequirement {
@@ -2679,7 +2697,61 @@ impl CompiledProgram {
             required_literals: &self.required_literals,
             exact_match_width: self.exact_match_width,
             max_match_width: self.max_match_width(),
+            exact_product_width: None,
             retained_prefix_requirement,
+        })
+    }
+
+    /// Return the complete fixed-width Cartesian proof as a native scanner
+    /// program, even though determinization retained no rows.
+    ///
+    /// The exact-product analysis proves that checking the anchored byte sets
+    /// is the complete language, not merely a prefix filter. Native lowering
+    /// may therefore scan the canonical selective column and return directly
+    /// after verifying the remaining columns for every output contract.
+    pub(crate) fn native_exact_product_view(&self) -> Option<NativeProgramView<'_>> {
+        let product = self
+            .nfa_mandatory_cut
+            .as_ref()
+            .and_then(NfaMandatoryCut::exact_product)?;
+        let width = usize::from(product.width);
+        let primary_offset = usize::from(product.primary_offset);
+        let sets = self.anchored_prefix.sets();
+        if !matches!(self.engine, ProgramEngine::OrderedNfa)
+            || self.exact_match_width != Some(width)
+            || sets.len() != width
+            || primary_offset >= width
+        {
+            return None;
+        }
+        let primary = *sets.get(primary_offset)?;
+        if !(1..=255).contains(&usize::from(primary.cardinality())) {
+            return None;
+        }
+        Some(NativeProgramView {
+            output: self.output,
+            raw: &self.raw,
+            dfa: NativeDfaView {
+                initial_state: 0,
+                initial_pending: false,
+                initial_terminal: false,
+                byte_classes: &NATIVE_EXACT_PRODUCT_BYTE_CLASSES,
+                class_count: 1,
+                class_representatives: &NATIVE_EXACT_PRODUCT_CLASS_REPRESENTATIVES,
+                forward_cells: &NATIVE_EXACT_PRODUCT_REJECTING_ROW,
+                reverse_initial: None,
+                reverse_cells: &[],
+            },
+            anchored_prefix: &self.anchored_prefix,
+            anchored_suffix: &self.anchored_suffix,
+            required_literals: &self.required_literals,
+            exact_match_width: Some(width),
+            max_match_width: self.max_match_width(),
+            exact_product_width: Some(product.width),
+            retained_prefix_requirement: Some(NativeRetainedPrefixRequirement {
+                scan_offset: product.primary_offset,
+                membership: primary.words(),
+            }),
         })
     }
 

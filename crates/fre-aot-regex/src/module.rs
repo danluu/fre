@@ -619,7 +619,9 @@ impl CompiledModule {
     pub fn lower(program: &CompiledProgram, target: Target) -> Result<Self, CompileError> {
         target.validate()?;
         let program_bytes = program.serialize()?;
-        let native = program.native_dfa_view();
+        let native = program
+            .native_dfa_view()
+            .or_else(|| program.native_exact_product_view());
         let native_context = program.native_context_program_view();
         Self::lower_serialized(program_bytes, native, native_context, target)
             .map_err(CompileError::from)
@@ -1937,9 +1939,18 @@ fn lower_native_dfa(
             sve_filter_plan,
         )?,
     };
-    if view.retained_prefix_requirement.is_some_and(|requirement| {
-        !retained_prefix_scanner_is_preserved(emission.scanner, requirement)
-    }) {
+    // Scalar exact-set emitters remain available for backend correctness and
+    // cross-target inspection, but publishing a moving no-row product through
+    // them loses badly to the portable exact-product scanner. Require the
+    // emitted target receipt to prove a SIMD scanner for every mandatory
+    // primary. This is a target/code-shape gate: range-backed SSE2, AVX2,
+    // AVX-512, ASIMD, SVE, and SVE2 routes remain eligible.
+    if view
+        .retained_prefix_requirement
+        .is_some_and(|requirement| {
+            !retained_prefix_scanner_is_preserved(emission.scanner, requirement)
+        })
+    {
         return Ok(None);
     }
     let start_accelerator =
@@ -2285,6 +2296,29 @@ fn build_native_dfa_table_with_cost_model(
     {
         return Err(ObjectError::InvalidModule("invalid native DFA table shape"));
     }
+    if let Some(width) = view.exact_product_width {
+        let width = usize::from(width);
+        let requirement = view.retained_prefix_requirement.ok_or(
+            ObjectError::InvalidModule("native exact product has no primary scanner"),
+        )?;
+        let primary_offset = usize::from(requirement.scan_offset);
+        if width == 0
+            || width != view.anchored_prefix.sets().len()
+            || view.exact_match_width != Some(width)
+            || primary_offset >= width
+            || view
+                .anchored_prefix
+                .sets()
+                .get(primary_offset)
+                .copied()
+                .map(AnchoredByteSet::words)
+                != Some(requirement.membership)
+        {
+            return Err(ObjectError::InvalidModule(
+                "native exact-product proof is inconsistent",
+            ));
+        }
+    }
     let span_needs_start = view.output == OutputContract::Span && !dfa.initial_pending;
     let exact_span_width = if span_needs_start {
         view.exact_match_width
@@ -2374,7 +2408,11 @@ fn build_native_dfa_table_with_cost_model(
             "mandatory retained primary has invalid exact membership",
         ));
     }
-    let mut selected_suffix_filter = derive_suffix_filter(view)?;
+    let mut selected_suffix_filter = if view.exact_product_width.is_some() {
+        None
+    } else {
+        derive_suffix_filter(view)?
+    };
     let coalesced_start_filter =
         if view.retained_prefix_requirement.is_none()
             && ENABLE_NATIVE_COALESCED_INITIAL_FILTER
@@ -2473,13 +2511,23 @@ fn build_native_dfa_table_with_cost_model(
     )?;
     let prefix_predicates = prefix_plan.predicates().len();
     let scanner_prefix_positions = usize::from(filtered_prefix_position.is_some());
-    let exact_prefix_match_width = derive_exact_prefix_product_width(view).filter(|_| {
-        selective_prefix_positions != 0
-            && candidate_guard_active
-            && prefix_predicates
-                .checked_add(scanner_prefix_positions)
-                .is_some_and(|covered| covered == selective_prefix_positions)
-    });
+    let exact_prefix_match_width = view
+        .exact_product_width
+        .or_else(|| derive_exact_prefix_product_width(view))
+        .filter(|_| {
+            selective_prefix_positions != 0
+                && candidate_guard_active
+                && prefix_predicates
+                    .checked_add(scanner_prefix_positions)
+                    .is_some_and(|covered| covered == selective_prefix_positions)
+        });
+    if view.exact_product_width.is_some()
+        && exact_prefix_match_width != view.exact_product_width
+    {
+        return Err(ObjectError::InvalidModule(
+            "native exact-product scanner does not verify every selective column",
+        ));
+    }
     let prefix_fast_forward = if ENABLE_NATIVE_PREFIX_FAST_FORWARD
         && candidate_guard_active
         && exact_prefix_match_width.is_none()
@@ -13989,6 +14037,34 @@ mod tests {
         fallback
     }
 
+    fn no_row_exact_product_resource_fallback(
+        pattern: &str,
+        output: OutputContract,
+        target: Target,
+    ) -> CompiledRegex {
+        let limits = CompileLimitsV1 {
+            determinize: DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+            ..CompileLimitsV1::default()
+        };
+        let fallback = compile(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(output)
+                .limits(limits),
+        )
+        .expect("no-row exact-product fallback");
+        assert_eq!(fallback.receipt().engine, EngineKind::OrderedNfa);
+        assert!(
+            fallback.program().has_nfa_exact_product(),
+            "missing exact-product proof for {pattern:?}/{output:?}"
+        );
+        assert!(fallback.program().partial_dfa_stats().unwrap().is_none());
+        fallback
+    }
+
     fn generated_byte_strings(alphabet: &[u8], maximum_length: usize) -> Vec<Vec<u8>> {
         let mut strings = vec![Vec::new()];
         let mut frontier = vec![Vec::new()];
@@ -14294,6 +14370,172 @@ mod tests {
             assert_eq!(target.operating_system, operating_system);
             assert_eq!(target.abi, abi);
             assert_eq!(target.validate(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn no_row_exact_products_lower_self_contained_across_target_matrix() {
+        let cases = [
+            ("[ab]x", 2_u8),
+            ("(?:ab|cb)(?:d|e)", 3),
+            (r"(?-u:[ACEGIKMOQ])(?-u:[\x00-\xff])", 2),
+            ("abcdefghijklmnop", 16),
+        ];
+        for target in identity_target_matrix() {
+            for (pattern, width) in cases {
+                for output in [
+                    OutputContract::Exists,
+                    OutputContract::SelectedEnd,
+                    OutputContract::Span,
+                ] {
+                    let compiled =
+                        no_row_exact_product_resource_fallback(pattern, output, target);
+                    assert!(compiled.program().native_dfa_view().is_none());
+                    let view = compiled
+                        .program()
+                        .native_exact_product_view()
+                        .expect("graph-proved native exact-product view");
+                    assert_eq!(view.exact_product_width, Some(width));
+                    let requirement = view
+                        .retained_prefix_requirement
+                        .expect("exact-product primary scanner");
+                    let (_, layout) = build_native_dfa_table_for_architecture(
+                        view,
+                        target.architecture,
+                    )
+                    .expect("native exact-product layout");
+                    assert!(layout.has_start_scanner());
+                    assert_eq!(layout.start_scanner_offset(), Some(requirement.scan_offset));
+                    let scanner_membership = if let Some(filter) = layout.start_filter {
+                        start_filter_membership(filter).expect("range scanner membership")
+                    } else {
+                        layout
+                            .exact_start_byte_set
+                            .expect("exact scanner membership")
+                            .membership
+                    };
+                    assert_eq!(scanner_membership, requirement.membership);
+                    assert_eq!(layout.exact_prefix_match_width, Some(width));
+                    assert_eq!(layout.prefix_guaranteed_bytes().unwrap(), width);
+                    assert!(layout.suffix_filter.is_none());
+                    assert_eq!(
+                        layout.exact_span_width,
+                        (output == OutputContract::Span).then_some(u64::from(width))
+                    );
+
+                    // Publication is intentionally target-shape based. The
+                    // scalar exact-set backend remains structurally valid,
+                    // while no-row products use it only through the faster
+                    // portable exact-product route.
+                    let direct = compiled.module().start_accelerator() != StartAccelerator::None;
+                    assert_eq!(compiled.receipt().runtime_helper_required, !direct);
+                    assert_eq!(compiled.module().required_runtime_symbol().is_some(), !direct);
+                    assert_eq!(compiled.module().required_runtime_program().is_some(), !direct);
+                    assert_eq!(
+                        compiled
+                            .receipt()
+                            .passes
+                            .contains(&crate::OptimizationPass::TargetInstructionSelection),
+                        direct
+                    );
+                    assert_eq!(
+                        compiled
+                            .receipt()
+                            .passes
+                            .contains(&crate::OptimizationPass::RuntimeAdapterLowering),
+                        !direct
+                    );
+
+                    let serialized = compiled.program().serialize().unwrap();
+                    let restored = crate::CompiledProgram::deserialize(&serialized)
+                        .expect("restore exact-product program");
+                    let restored_module = CompiledModule::lower(&restored, target)
+                        .expect("re-lower exact-product program");
+                    assert_eq!(
+                        restored_module.start_accelerator(),
+                        compiled.module().start_accelerator()
+                    );
+                    assert_eq!(restored_module.entry_symbol(), compiled.module().entry_symbol());
+                    assert_eq!(restored_module.sections(), compiled.module().sections());
+                    assert_eq!(restored_module.symbols(), compiled.module().symbols());
+                    assert_eq!(
+                        restored_module.relocations(),
+                        compiled.module().relocations()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_row_exact_products_publish_only_vector_target_scanners() {
+        let exact_pattern = r"(?-u:[ACEGIKMOQ])(?-u:[\x00-\xff])";
+        let range_pattern = "[ab]x";
+        let avx512 = FeatureSet::of(CpuFeature::X86Avx512F)
+            .with(CpuFeature::X86Avx512Bw)
+            .with(CpuFeature::X86Avx512Vl);
+        let sve2 = FeatureSet::of(CpuFeature::Aarch64Sve)
+            .with(CpuFeature::Aarch64Sve2);
+        let cases = [
+            (
+                Target::x86_64_linux(),
+                exact_pattern,
+                None,
+            ),
+            (
+                Target::x86_64_linux()
+                    .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                    .unwrap(),
+                exact_pattern,
+                Some(StartAccelerator::X86Avx2),
+            ),
+            (
+                Target::x86_64_linux().with_features(avx512).unwrap(),
+                range_pattern,
+                Some(StartAccelerator::X86Avx512Bw),
+            ),
+            (
+                Target::aarch64_linux(),
+                exact_pattern,
+                None,
+            ),
+            (
+                Target::aarch64_macos()
+                    .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                    .unwrap(),
+                exact_pattern,
+                Some(StartAccelerator::Aarch64Asimd),
+            ),
+            (
+                Target::aarch64_linux()
+                    .with_features(FeatureSet::of(CpuFeature::Aarch64Sve))
+                    .unwrap(),
+                exact_pattern,
+                Some(StartAccelerator::Aarch64Sve),
+            ),
+            (
+                Target::aarch64_linux().with_features(sve2).unwrap(),
+                exact_pattern,
+                Some(StartAccelerator::Aarch64Sve2),
+            ),
+        ];
+        for (target, pattern, expected) in cases {
+            let compiled = no_row_exact_product_resource_fallback(
+                pattern,
+                OutputContract::Span,
+                target,
+            );
+            assert_eq!(
+                (compiled.module().start_accelerator() != StartAccelerator::None)
+                    .then_some(compiled.module().start_accelerator()),
+                expected,
+                "{target:?}"
+            );
+            assert_eq!(
+                compiled.module().required_runtime_symbol().is_some(),
+                expected.is_none(),
+                "{target:?}"
+            );
         }
     }
 
@@ -15926,6 +16168,189 @@ mod tests {
         let output = Command::new(&executable)
             .output()
             .expect("execute linked exact-set native harness");
+        assert!(
+            output.status.success(),
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    #[ignore = "links and executes generated no-row exact-product objects natively"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the opt-in native differential keeps generated windows and ABI assertions together"
+    )]
+    fn linked_host_no_row_exact_products_match_fast_program_for_every_window() {
+        use std::{fmt::Write as _, fs, process::Command};
+
+        let target = if cfg!(target_arch = "x86_64") {
+            let base = if cfg!(target_os = "linux") {
+                Target::x86_64_linux()
+            } else {
+                Target::x86_64_macos()
+            };
+            // This opt-in linked differential includes fragmented arbitrary
+            // byte sets, whose profitable x86 publication tier is AVX2.
+            base.with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                .expect("host AVX2 target")
+        } else {
+            let base = if cfg!(target_os = "linux") {
+                Target::aarch64_linux()
+            } else {
+                Target::aarch64_macos()
+            };
+            base.with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .expect("host ASIMD target")
+        };
+        let mut cases = vec![
+            ("a", generated_byte_strings(b"ax\xff", 3)),
+            ("[ab]x", generated_byte_strings(b"abxy", 3)),
+            (
+                "(?:ab|cb)(?:d|e)",
+                generated_byte_strings(b"abcdex", 3),
+            ),
+            ("[ab][01]Z", generated_byte_strings(b"ab01Zx", 3)),
+            (
+                r"(?-u:[ACEGIKMOQ])(?-u:[\x00-\xff])",
+                generated_byte_strings(&[b'A', b'C', b'Q', b'x', 0, u8::MAX], 3),
+            ),
+            (
+                r"(?-u:[\x00-\x40])(?-u:[\x80-\xff])",
+                generated_byte_strings(&[0, 0x20, 0x40, 0x41, 0x80, 0xff], 3),
+            ),
+        ];
+        let mut width_sixteen = vec![
+            Vec::new(),
+            b"abcdefghijklmnop".to_vec(),
+            b"xabcdefghijklmnopy".to_vec(),
+            b"abcdefghijklmnoq".to_vec(),
+            b"abcdefghijklmnabcdefghijklmnop".to_vec(),
+        ];
+        let mut deterministic = (0_u16..=255)
+            .map(|byte| u8::try_from((byte * 197 + 31) & 255).unwrap())
+            .collect::<Vec<_>>();
+        deterministic[117..133].copy_from_slice(b"abcdefghijklmnop");
+        width_sixteen.push(deterministic);
+        cases.push(("abcdefghijklmnop", width_sixteen));
+
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-no-row-exact-product-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("create exact-product fixture directory");
+        let mut source = String::from("#include <stdint.h>\n#include <stddef.h>\n");
+        let mut calls = String::from("int main(void){size_t r[2];uint32_t s;\n");
+        let mut objects = Vec::new();
+        let mut artifact = 0usize;
+
+        for (pattern, haystacks) in cases {
+            for output in [
+                OutputContract::Exists,
+                OutputContract::SelectedEnd,
+                OutputContract::Span,
+            ] {
+                let compiled = no_row_exact_product_resource_fallback(pattern, output, target);
+                assert!(compiled.module().required_runtime_symbol().is_none());
+                let reference = compile(
+                    CompileRequest::new(pattern, target)
+                        .mode(CompileMode::Fast)
+                        .output(output),
+                )
+                .expect("fast ordered-NFA reference");
+                let symbol = compiled.module().entry_symbol();
+                writeln!(
+                    source,
+                    "extern uint32_t {symbol}(const unsigned char*,size_t,size_t,size_t,size_t*);"
+                )
+                .expect("write exact-product declaration");
+                let object = directory.join(format!("case{artifact}.o"));
+                fs::write(&object, compiled.object()).expect("write exact-product object");
+                objects.push(object);
+
+                for (haystack_index, haystack) in haystacks.iter().enumerate() {
+                    let bytes = if haystack.is_empty() {
+                        "0".to_owned()
+                    } else {
+                        haystack
+                            .iter()
+                            .map(std::string::ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    };
+                    writeln!(
+                        source,
+                        "static const unsigned char h{artifact}_{haystack_index}[]={{{bytes}}};"
+                    )
+                    .expect("write exact-product haystack");
+                    for start in 0..=haystack.len() {
+                        for end in start..=haystack.len() {
+                            let expected = reference
+                                .search(haystack, SearchWindow::new(start, end))
+                                .expect("fast expected result");
+                            writeln!(
+                                calls,
+                                "r[0]=99;r[1]=99;s={symbol}(h{artifact}_{haystack_index},{},{start},{end},r);",
+                                haystack.len()
+                            )
+                            .expect("write exact-product native call");
+                            let failure = 10 + artifact;
+                            match expected {
+                                MatchResult::Exists(found) => writeln!(
+                                    calls,
+                                    "if(s!={}||r[0]!=0||r[1]!=0)return {failure};",
+                                    u8::from(found)
+                                ),
+                                MatchResult::SelectedEnd(Some(match_end)) => writeln!(
+                                    calls,
+                                    "if(s!=1||r[0]!={match_end}||r[1]!={match_end})return {failure};"
+                                ),
+                                MatchResult::Span(Some((match_start, match_end))) => writeln!(
+                                    calls,
+                                    "if(s!=1||r[0]!={match_start}||r[1]!={match_end})return {failure};"
+                                ),
+                                MatchResult::SelectedEnd(None) | MatchResult::Span(None) => {
+                                    writeln!(
+                                        calls,
+                                        "if(s!=0||r[0]!=0||r[1]!=0)return {failure};"
+                                    )
+                                }
+                            }
+                            .expect("write exact-product result assertion");
+                        }
+                    }
+                }
+                artifact += 1;
+            }
+        }
+        calls.push_str("return 0;}\n");
+        source.push_str(&calls);
+        let c_path = directory.join("exact_product.c");
+        let executable = directory.join("exact_product");
+        fs::write(&c_path, source).expect("write exact-product linker harness");
+        let compiler = if cfg!(target_os = "macos") {
+            "clang"
+        } else {
+            "cc"
+        };
+        let status = Command::new(compiler)
+            .arg("-O0")
+            .arg(&c_path)
+            .args(&objects)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .expect("invoke host C compiler");
+        assert!(status.success());
+        let output = Command::new(&executable)
+            .output()
+            .expect("execute exact-product native differential");
         assert!(
             output.status.success(),
             "status={:?} stdout={} stderr={}",
