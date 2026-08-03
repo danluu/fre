@@ -29,6 +29,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(unsafe_code)]
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, OnceLock, TryLockError};
@@ -182,6 +183,34 @@ fn prepared_entry(
         .lock()
         .map(|registry| registry.entries.get(&handle.0).cloned())
         .map_err(|_| ())
+}
+
+thread_local! {
+    /// One bounded per-thread registry hit. Repeated searches normally use one
+    /// prepared program, so retaining its state owner removes the global map
+    /// mutex and `Arc` increment from the hot path. Tokens are never reused,
+    /// and destroy clears the state behind every retained owner before it
+    /// returns, so a cached entry cannot revive an invalidated handle.
+    static PREPARED_ENTRY_CACHE: RefCell<Option<(u64, Arc<PreparedHandleState>)>> =
+        const { RefCell::new(None) };
+}
+
+fn with_cached_prepared_entry<T>(
+    handle: FreAotRegexPreparedHandleV1,
+    use_entry: impl FnOnce(&PreparedHandleState) -> T,
+) -> Result<Option<T>, ()> {
+    PREPARED_ENTRY_CACHE
+        .try_with(|cache| {
+            let mut cache = cache.try_borrow_mut().map_err(|_| ())?;
+            if cache.as_ref().is_none_or(|(token, _)| *token != handle.0) {
+                let Some(entry) = prepared_entry(handle)? else {
+                    return Ok(None);
+                };
+                *cache = Some((handle.0, entry));
+            }
+            Ok(cache.as_ref().map(|(_, entry)| use_entry(entry.as_ref())))
+        })
+        .map_err(|_| ())?
 }
 
 fn remove_prepared_entry(
@@ -372,26 +401,27 @@ unsafe fn search_prepared_checked_pointers(
     window_end: usize,
     result_ptr: *mut FreAotRegexResultV1,
 ) -> u32 {
-    let entry = match prepared_entry(handle) {
-        Ok(Some(entry)) => entry,
+    let searched = with_cached_prepared_entry(handle, |entry| {
+        let mut state = match entry.prepared.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::WouldBlock) => return Err(STATUS_HANDLE_BUSY),
+            Err(TryLockError::Poisoned(_)) => return Err(STATUS_RUNTIME_FAILURE),
+        };
+        let Some(prepared) = state.as_mut() else {
+            return Err(STATUS_INVALID_HANDLE);
+        };
+        // SAFETY: guaranteed by the exported prepared-search contract and
+        // checked length.
+        let haystack = unsafe { std::slice::from_raw_parts(haystack_ptr, haystack_len) };
+        execute_search(prepared, haystack, window_start, window_end)
+            .map_err(|_| STATUS_RUNTIME_FAILURE)
+    });
+    let (status, result) = match searched {
+        Ok(Some(Ok(found))) => found,
+        Ok(Some(Err(status))) => return status,
         Ok(None) => return STATUS_INVALID_HANDLE,
         Err(()) => return STATUS_RUNTIME_FAILURE,
     };
-    let mut state = match entry.prepared.try_lock() {
-        Ok(state) => state,
-        Err(TryLockError::WouldBlock) => return STATUS_HANDLE_BUSY,
-        Err(TryLockError::Poisoned(_)) => return STATUS_RUNTIME_FAILURE,
-    };
-    let Some(prepared) = state.as_mut() else {
-        return STATUS_INVALID_HANDLE;
-    };
-    // SAFETY: guaranteed by the exported prepared-search contract and checked
-    // length.
-    let haystack = unsafe { std::slice::from_raw_parts(haystack_ptr, haystack_len) };
-    let Ok((status, result)) = execute_search(prepared, haystack, window_start, window_end) else {
-        return STATUS_RUNTIME_FAILURE;
-    };
-    let _ = haystack;
     // SAFETY: guaranteed aligned, writable, and disjoint by the exported
     // prepared-search contract.
     unsafe { result_ptr.write(result) };
