@@ -2038,9 +2038,11 @@ struct PartialDfaWorkspace {
 /// near the beginning of a large window join the existing periodic fallback
 /// guard because they do not amortize the retained-table dispatch. Deep
 /// resumes remain complete partial executions. The same guard covers holes
-/// more cheaply decided by another complete accelerator, a foreign compatible
-/// workspace, and variable-width positive spans that need reverse start
-/// recovery and may lose to another complete accelerator on repeated inputs.
+/// more cheaply decided by another complete accelerator or a foreign
+/// compatible workspace. Complete accelerators are tried before this state is
+/// consulted, so an exact retained forward completion followed by reverse-only
+/// start recovery is itself a successful retained execution and resets the
+/// guard.
 #[derive(Clone, Copy, Debug, Default)]
 struct PartialDfaRuntimeState {
     consecutive_fallbacks: u8,
@@ -2051,6 +2053,8 @@ struct PartialDfaRuntimeState {
     resumed: usize,
     #[cfg(test)]
     reverse_recovered: usize,
+    #[cfg(test)]
+    forward_start_certified: usize,
     #[cfg(test)]
     complete_accelerated: usize,
 }
@@ -2105,15 +2109,24 @@ impl PartialDfaRuntimeState {
         }
     }
 
-    fn observe_reverse_recovered(&mut self, selected_bytes: usize, input_bytes: usize) {
+    fn observe_reverse_recovered(&mut self, _selected_bytes: usize, _input_bytes: usize) {
         #[cfg(test)]
         {
             self.reverse_recovered = self.reverse_recovered.saturating_add(1);
         }
-        // Reverse recovery is exact, but unlike a forward-only completion it
-        // still invokes K0. Keep sampling retained rows so repeated searches
-        // can prefer a cheaper complete accelerator when one exists.
-        self.observe_fallback(selected_bytes, input_bytes);
+        // The complete suffix/cut routes have already run before retained
+        // execution. Falling back here would therefore replay the whole
+        // forward window in K0 rather than discovering a cheaper sidecar.
+        // Retained forward plus reverse-only recovery is a complete success.
+        self.observe_complete();
+    }
+
+    fn observe_forward_start_certified(&mut self) {
+        #[cfg(test)]
+        {
+            self.forward_start_certified = self.forward_start_certified.saturating_add(1);
+        }
+        self.observe_complete();
     }
 
     fn observe_fallback(&mut self, consumed: usize, input_bytes: usize) {
@@ -3010,7 +3023,7 @@ impl CompiledProgram {
                 }
             }
             OutputContract::Span => {
-                match partial.selected_end(
+                match partial.selected_span_end(
                     haystack,
                     window.start,
                     window.end,
@@ -3020,12 +3033,26 @@ impl CompiledProgram {
                     PartialDfaResult::Resume(resume) => self.resolve_partial_hole(
                         haystack, window, workspace, resume_set, state, resume,
                     ),
-                    PartialDfaResult::Complete(None) => {
-                        state.observe_complete();
-                        Ok(Some(MatchResult::Span(None)))
-                    }
-                    PartialDfaResult::Complete(Some(end)) => {
-                        let start = if let Some(width) = self.exact_match_width {
+                    PartialDfaResult::Complete(selection) => {
+                        let Some(end) = selection.end else {
+                            state.observe_complete();
+                            return Ok(Some(MatchResult::Span(None)));
+                        };
+                        let start = if let Some(start) = selection.start {
+                            state.observe_forward_start_certified();
+                            start
+                        } else if partial.initial_pending() {
+                            // A nullable initial subset has already selected
+                            // the authoritative window start. Ordered forward
+                            // execution may extend its endpoint (for example,
+                            // a greedy nullable repetition), but no later
+                            // unanchored start can outrank it. This is the same
+                            // graph proof used by the complete ordered-DFA
+                            // Span executor and makes reverse recovery
+                            // redundant.
+                            state.observe_complete();
+                            window.start
+                        } else if let Some(width) = self.exact_match_width {
                             let start =
                                 end.checked_sub(width)
                                     .ok_or(CompileError::InternalInvariant(
@@ -3136,7 +3163,25 @@ impl CompiledProgram {
                 Ok(MatchResult::SelectedEnd(found))
             }
             OutputContract::Span => {
-                let found = if let Some(width) = self.exact_match_width {
+                let found = if self
+                    .partial_dfa()
+                    .is_some_and(PartialDfa::initial_pending)
+                {
+                    self.automaton
+                        .prepare::<SelectedEnd>()
+                        .search_window_from_ordered_resume(
+                            haystack,
+                            k0_window,
+                            workspace,
+                            resume_set,
+                            resume.state,
+                            resume.position,
+                            resume.pending_end,
+                            limits,
+                        )?
+                        .into_output()
+                        .map(|end| (window.start, end))
+                } else if let Some(width) = self.exact_match_width {
                     self.automaton
                         .prepare::<SelectedEnd>()
                         .search_window_from_ordered_resume(
@@ -3655,7 +3700,7 @@ impl CompiledProgram {
                         &alphabet_shape.boundary_starts,
                         &raw.roles,
                     )?;
-                    partial.validate_canonical(
+                    let partial = partial.validate_canonical(
                         &raw,
                         output == OutputContract::Span && exact_match_width.is_none(),
                     )?;
@@ -7853,6 +7898,241 @@ mod tests {
     }
 
     #[test]
+    fn nullable_retained_span_keeps_the_proved_window_start() {
+        // The nullable branch fixes the selected start at the authoritative
+        // window boundary, while the overlapping positive branch creates
+        // enough ordered subsets to exercise a genuinely retained prefix.
+        let pattern = r"(?:[b-c][a-b]{1,16}z)?";
+        let mut limited = (2..=128)
+            .find_map(|max_states| {
+                let candidate = program(
+                    pattern,
+                    OutputContract::Span,
+                    CompileMode::Optimizing,
+                    DeterminizeLimits {
+                        max_states,
+                        ..DeterminizeLimits::default()
+                    },
+                );
+                let retained_nullable = candidate
+                    .partial_dfa()
+                    .is_some_and(PartialDfa::initial_pending);
+                retained_nullable.then_some(candidate)
+            })
+            .expect("nullable graph must retain a canonical row prefix");
+        assert_eq!(limited.exact_match_width, None);
+        // Isolate retained execution from unrelated complete no-match
+        // sidecars. The start proof itself depends only on the initial ordered
+        // subset and remains valid for every source/window.
+        limited.nfa_mandatory_suffix = None;
+        limited.nfa_mandatory_cut = None;
+
+        let reference = program(
+            pattern,
+            OutputContract::Span,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let mut limited_workspace = limited.prepare_workspace().unwrap();
+        let mut reference_workspace = reference.prepare_workspace().unwrap();
+        let haystacks = generated_byte_strings(&[b'a', b'b', b'x'], 4);
+        for haystack in &haystacks {
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let window = SearchWindow::new(start, end);
+                    let expected = reference
+                        .search_with_workspace(haystack, window, &mut reference_workspace)
+                        .unwrap();
+                    assert_eq!(
+                        limited
+                            .search_with_retained_partial_workspace(
+                                haystack,
+                                window,
+                                &mut limited_workspace,
+                            )
+                            .unwrap(),
+                        expected,
+                        "nullable retained Span mismatch for {haystack:?} in {start}..{end}"
+                    );
+                }
+            }
+        }
+        let state = &limited_workspace.partial.as_deref().unwrap().state;
+        assert_eq!(
+            state.reverse_recovered, 0,
+            "nullable retained completions must not invoke reverse recovery"
+        );
+    }
+
+    #[test]
+    fn retained_forward_start_certificate_is_exact_after_priority_commit() {
+        // The short alternative can commit a selected match entirely inside
+        // retained rows. The overlapping bounded alternative forces a later
+        // subset-construction decline, so the same partial artifact also owns
+        // authenticated K0 holes on other inputs.
+        let pattern = r"a|[b-c][a-b]{1,10}z";
+        let probe = b"axxx";
+        let mut limited = (2..=64)
+            .find_map(|max_states| {
+                let candidate = program(
+                    pattern,
+                    OutputContract::Span,
+                    CompileMode::Optimizing,
+                    DeterminizeLimits {
+                        max_states,
+                        ..DeterminizeLimits::default()
+                    },
+                );
+                let Some(partial) = candidate.partial_dfa() else {
+                    return None;
+                };
+                let (prefix_plan, supported) =
+                    PartialDfaPrefixPlan::derive(candidate.anchored_prefix.sets());
+                if !supported {
+                    return None;
+                }
+                let certified = matches!(
+                    partial.selected_span_end(
+                        probe,
+                        0,
+                        probe.len(),
+                        candidate.anchored_prefix.sets(),
+                        prefix_plan,
+                    ),
+                    Ok(PartialDfaResult::Complete(selection))
+                        if selection.end.is_some() && selection.start.is_some()
+                );
+                certified.then_some(candidate)
+            })
+            .expect("fixture must retain a start-certified forward path");
+        limited.nfa_mandatory_suffix = None;
+        limited.nfa_mandatory_cut = None;
+        let serialized = limited.serialize().unwrap();
+        let mut restored = CompiledProgram::deserialize(&serialized).unwrap();
+        restored.nfa_mandatory_suffix = None;
+        restored.nfa_mandatory_cut = None;
+        let reference = program(
+            pattern,
+            OutputContract::Span,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let mut limited_workspace = limited.prepare_workspace().unwrap();
+        let mut restored_workspace = restored.prepare_workspace().unwrap();
+        let mut reference_workspace = reference.prepare_workspace().unwrap();
+        let mut haystacks = generated_byte_strings(&[b'a', b'b', b'c', b'x', b'z'], 4);
+        haystacks.extend([probe.to_vec(), b"xxax".to_vec(), b"cbbbbbbbbbbz".to_vec()]);
+        for haystack in &haystacks {
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let window = SearchWindow::new(start, end);
+                    let expected = reference
+                        .search_with_workspace(haystack, window, &mut reference_workspace)
+                        .unwrap();
+                    assert_eq!(
+                        limited
+                            .search_with_retained_partial_workspace(
+                                haystack,
+                                window,
+                                &mut limited_workspace,
+                            )
+                            .unwrap(),
+                        expected,
+                        "fresh start certificate mismatch for {haystack:?} in {start}..{end}"
+                    );
+                    assert_eq!(
+                        restored
+                            .search_with_retained_partial_workspace(
+                                haystack,
+                                window,
+                                &mut restored_workspace,
+                            )
+                            .unwrap(),
+                        expected,
+                        "restored start certificate mismatch for {haystack:?} in {start}..{end}"
+                    );
+                }
+            }
+        }
+        for workspace in [&limited_workspace, &restored_workspace] {
+            assert!(
+                workspace
+                    .partial
+                    .as_deref()
+                    .unwrap()
+                    .state
+                    .forward_start_certified
+                    > 0
+            );
+        }
+    }
+
+    #[test]
+    fn retained_span_does_not_restart_an_older_initial_subset_provenance() {
+        // After the first `a`, the lazy repetition returns to the canonical
+        // initial subset. That equality is an endpoint-search restart point,
+        // but it does not erase the older ordered start carried by the
+        // repetition. The bounded repeated-atom alternative only forces a
+        // retained resource decline; it is not part of the semantic witness.
+        let pattern = r"(?:a|[c-d][a-b]{1,10}z)*?b";
+        let probe = b"ab";
+        let mut limited = (2..=128)
+            .find_map(|max_states| {
+                let candidate = program(
+                    pattern,
+                    OutputContract::Span,
+                    CompileMode::Optimizing,
+                    DeterminizeLimits {
+                        max_states,
+                        ..DeterminizeLimits::default()
+                    },
+                );
+                let partial = candidate.partial_dfa()?;
+                let (prefix_plan, supported) =
+                    PartialDfaPrefixPlan::derive(candidate.anchored_prefix.sets());
+                if !supported {
+                    return None;
+                }
+                matches!(
+                    partial.selected_span_end(
+                        probe,
+                        0,
+                        probe.len(),
+                        candidate.anchored_prefix.sets(),
+                        prefix_plan,
+                    ),
+                    Ok(PartialDfaResult::Complete(selection))
+                        if selection.end == Some(2) && selection.start == Some(0)
+                )
+                .then_some(candidate)
+            })
+            .expect("fixture must retain and certify the lazy-star witness");
+        limited.nfa_mandatory_suffix = None;
+        limited.nfa_mandatory_cut = None;
+
+        let mut workspace = limited.prepare_workspace().unwrap();
+        assert_eq!(
+            limited
+                .search_with_retained_partial_workspace(
+                    probe,
+                    SearchWindow::full(probe),
+                    &mut workspace,
+                )
+                .unwrap(),
+            MatchResult::Span(Some((0, 2)))
+        );
+        assert!(
+            workspace
+                .partial
+                .as_deref()
+                .unwrap()
+                .state
+                .forward_start_certified
+                > 0
+        );
+    }
+
+    #[test]
     fn general_byte_set_prefix_executes_retained_rows() {
         let pattern = r"[b-f][a-e]{1,10}Z";
         let complete = program(
@@ -8524,8 +8804,6 @@ mod tests {
         assert!(state.admit());
         state.observe_reverse_recovered(1, 1_024);
         assert_eq!(state.reverse_recovered, 2);
-        assert_eq!(state.bypass_remaining, 16);
-        state.observe_complete();
         assert_eq!(state.consecutive_fallbacks, 0);
         assert_eq!(state.bypass_remaining, 0);
     }

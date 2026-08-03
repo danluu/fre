@@ -542,6 +542,11 @@ struct PartialForwardDfa {
     initial_pending: bool,
     initial_terminal: bool,
     transitions: Vec<ForwardCell>,
+    /// Source-independent effect of every completed transition on a scalar
+    /// proof that all live ordered threads share one match start. This is a
+    /// derived in-memory certificate: stable artifacts regenerate it while
+    /// canonically validating the retained table.
+    start_actions: Vec<ForwardStartAction>,
     discovered_states: usize,
     complete_rows: usize,
     /// Ordered subset keys for exactly the incomplete suffix
@@ -619,6 +624,39 @@ pub(crate) struct PartialDfaResume {
     pub(crate) position: usize,
     /// Most recent selected endpoint in the already-consumed prefix.
     pub(crate) pending_end: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ForwardStartAction {
+    Drop,
+    Propagate,
+    Reset,
+}
+
+impl ForwardStartAction {
+    const fn derive(source_len: usize, final_len: usize, injected_root: bool) -> Self {
+        if !injected_root {
+            return Self::Propagate;
+        }
+        if source_len == 0 {
+            return if final_len == 0 {
+                Self::Drop
+            } else {
+                Self::Reset
+            };
+        }
+        if final_len == source_len {
+            Self::Propagate
+        } else {
+            Self::Drop
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PartialDfaSelection {
+    pub(crate) end: Option<usize>,
+    pub(crate) start: Option<usize>,
 }
 
 #[allow(dead_code, reason = "structural handoff for native code generation")]
@@ -1117,6 +1155,17 @@ fn find_byte_set_member(
 }
 
 impl PartialDfa {
+    /// Whether the canonical initial subset has already selected an empty
+    /// match at the authoritative search-window start.
+    ///
+    /// For `Span`, every later endpoint selected while this bit remains in
+    /// the ordered state still belongs to that same leftmost start. A caller
+    /// that has completed the retained forward search can therefore recover
+    /// the exact span without executing a reverse machine.
+    pub(crate) const fn initial_pending(&self) -> bool {
+        self.forward.initial_pending
+    }
+
     pub(crate) const fn retained_dimensions(&self) -> (usize, usize) {
         (
             self.forward.complete_rows,
@@ -1162,6 +1211,7 @@ impl PartialDfa {
                 initial_pending: forward.initial_pending,
                 initial_terminal: forward.initial_terminal,
                 transitions: forward.transitions,
+                start_actions: Vec::new(),
                 discovered_states: forward.states,
                 complete_rows: forward.states,
                 resume_keys: Vec::new(),
@@ -1176,17 +1226,26 @@ impl PartialDfa {
         window_start: usize,
         window_end: usize,
         earliest: bool,
+        track_start: bool,
         prefix_sets: &[AnchoredByteSet],
         prefix_plan: Option<PartialDfaPrefixPlan>,
-    ) -> Result<PartialDfaResult<Option<usize>>, CompileError> {
+    ) -> Result<PartialDfaResult<PartialDfaSelection>, CompileError> {
         if self.forward.initial_pending && (earliest || self.forward.initial_terminal) {
-            return Ok(PartialDfaResult::Complete(Some(window_start)));
+            return Ok(PartialDfaResult::Complete(PartialDfaSelection {
+                end: Some(window_start),
+                start: Some(window_start),
+            }));
         }
 
         let classes = self.alphabet.classes();
+        let tracks_start = track_start
+            && self.forward.start_actions.len() == self.forward.transitions.len();
         let mut state = 0_u32;
         let mut position = window_start;
         let mut pending_end = self.forward.initial_pending.then_some(window_start);
+        let mut active_start = tracks_start.then_some(window_start);
+        let mut pending_start = (tracks_start && self.forward.initial_pending)
+            .then_some(window_start);
         while position < window_end {
             let source = usize::try_from(state).map_err(|_| {
                 CompileError::InternalInvariant("partial DFA state exceeded usize")
@@ -1209,14 +1268,23 @@ impl PartialDfa {
                     pending_end,
                 }));
             }
-            if source == 0 && pending_end.is_none() {
+            if source == 0
+                && pending_end.is_none()
+                && (!tracks_start || active_start == Some(position))
+            {
                 if let Some(filter) = prefix_plan {
                     let Some(candidate) =
                         filter.next_candidate(prefix_sets, haystack, position, window_end)
                     else {
-                        return Ok(PartialDfaResult::Complete(None));
+                        return Ok(PartialDfaResult::Complete(PartialDfaSelection {
+                            end: None,
+                            start: None,
+                        }));
                     };
                     position = candidate;
+                    if tracks_start {
+                        active_start = Some(candidate);
+                    }
                 }
             }
             let byte = *haystack
@@ -1238,14 +1306,34 @@ impl PartialDfa {
                 .ok_or(CompileError::InternalInvariant(
                     "partial DFA input position overflowed",
                 ))?;
+            let next_start = if tracks_start {
+                match *self.forward.start_actions.get(index).ok_or(
+                    CompileError::InternalInvariant(
+                        "partial DFA start certificate is incomplete",
+                    ),
+                )? {
+                    ForwardStartAction::Drop => None,
+                    ForwardStartAction::Propagate => active_start,
+                    ForwardStartAction::Reset => Some(position),
+                }
+            } else {
+                None
+            };
             if cell.accepted {
                 pending_end = Some(position);
+                pending_start = next_start;
                 if earliest {
-                    return Ok(PartialDfaResult::Complete(pending_end));
+                    return Ok(PartialDfaResult::Complete(PartialDfaSelection {
+                        end: pending_end,
+                        start: pending_start,
+                    }));
                 }
             }
             if cell.next == NO_STATE {
-                return Ok(PartialDfaResult::Complete(pending_end));
+                return Ok(PartialDfaResult::Complete(PartialDfaSelection {
+                    end: pending_end,
+                    start: pending_start,
+                }));
             }
             if usize::try_from(cell.next)
                 .ok()
@@ -1256,8 +1344,12 @@ impl PartialDfa {
                 ));
             }
             state = cell.next;
+            active_start = next_start;
         }
-        Ok(PartialDfaResult::Complete(pending_end))
+        Ok(PartialDfaResult::Complete(PartialDfaSelection {
+            end: pending_end,
+            start: pending_start,
+        }))
     }
 
     pub(crate) fn exists(
@@ -1274,10 +1366,13 @@ impl PartialDfa {
                 window_start,
                 window_end,
                 true,
+                false,
                 prefix_sets,
                 prefix_plan,
             )? {
-                PartialDfaResult::Complete(end) => PartialDfaResult::Complete(end.is_some()),
+                PartialDfaResult::Complete(selection) => {
+                    PartialDfaResult::Complete(selection.end.is_some())
+                }
                 PartialDfaResult::Resume(resume) => PartialDfaResult::Resume(resume),
             },
         )
@@ -1291,11 +1386,36 @@ impl PartialDfa {
         prefix_sets: &[AnchoredByteSet],
         prefix_plan: Option<PartialDfaPrefixPlan>,
     ) -> Result<PartialDfaResult<Option<usize>>, CompileError> {
+        Ok(match self.selected_end_impl(
+            haystack,
+            window_start,
+            window_end,
+            false,
+            false,
+            prefix_sets,
+            prefix_plan,
+        )? {
+            PartialDfaResult::Complete(selection) => {
+                PartialDfaResult::Complete(selection.end)
+            }
+            PartialDfaResult::Resume(resume) => PartialDfaResult::Resume(resume),
+        })
+    }
+
+    pub(crate) fn selected_span_end(
+        &self,
+        haystack: &[u8],
+        window_start: usize,
+        window_end: usize,
+        prefix_sets: &[AnchoredByteSet],
+        prefix_plan: Option<PartialDfaPrefixPlan>,
+    ) -> Result<PartialDfaResult<PartialDfaSelection>, CompileError> {
         self.selected_end_impl(
             haystack,
             window_start,
             window_end,
             false,
+            true,
             prefix_sets,
             prefix_plan,
         )
@@ -1615,6 +1735,7 @@ impl PartialDfa {
                 initial_pending,
                 initial_terminal,
                 transitions,
+                start_actions: Vec::new(),
                 discovered_states,
                 complete_rows,
                 resume_keys,
@@ -1627,7 +1748,7 @@ impl PartialDfa {
         &self,
         raw: &RawPlan,
         wants_span: bool,
-    ) -> Result<(), ProgramFormatError> {
+    ) -> Result<Self, ProgramFormatError> {
         let regenerated = determinize(raw, wants_span, self.effective_limits).map_err(|_| {
             ProgramFormatError::Malformed("partial DFA canonical regeneration returned an error")
         })?;
@@ -1654,12 +1775,20 @@ impl PartialDfa {
                 ))?
             }
         };
-        if regenerated != *self {
+        let same_wire_payload = regenerated.alphabet == self.alphabet
+            && regenerated.effective_limits == self.effective_limits
+            && regenerated.forward.initial_pending == self.forward.initial_pending
+            && regenerated.forward.initial_terminal == self.forward.initial_terminal
+            && regenerated.forward.transitions == self.forward.transitions
+            && regenerated.forward.discovered_states == self.forward.discovered_states
+            && regenerated.forward.complete_rows == self.forward.complete_rows
+            && regenerated.forward.resume_keys == self.forward.resume_keys;
+        if !same_wire_payload {
             return Err(ProgramFormatError::Malformed(
                 "partial DFA payload is not the canonical retained prefix",
             ));
         }
-        Ok(())
+        Ok(regenerated)
     }
 }
 
@@ -3316,6 +3445,7 @@ fn compact_columns<T: Copy>(
 /// Allocation failure simply declines the optional partial artifact.
 fn compact_partial_forward(
     transitions: &[ForwardCell],
+    start_actions: &[ForwardStartAction],
     states: Vec<ForwardKey>,
     complete_rows: usize,
     classes: usize,
@@ -3332,6 +3462,12 @@ fn compact_partial_forward(
         .try_reserve_exact(completed_cells)
         .ok()?;
     compact_transitions.extend_from_slice(completed);
+    let completed_actions = start_actions.get(..completed_cells)?;
+    let mut compact_start_actions = Vec::new();
+    compact_start_actions
+        .try_reserve_exact(completed_cells)
+        .ok()?;
+    compact_start_actions.extend_from_slice(completed_actions);
 
     let discovered_states = states.len();
     let resume_count = discovered_states.checked_sub(complete_rows)?;
@@ -3342,6 +3478,7 @@ fn compact_partial_forward(
         initial_pending,
         initial_terminal,
         transitions: compact_transitions,
+        start_actions: compact_start_actions,
         discovered_states,
         complete_rows,
         resume_keys,
@@ -3390,11 +3527,15 @@ fn build_forward(
     let Some(mut transitions) = build_vec(alphabet.classes(), budget) else {
         return Ok(ForwardBuildOutcome::Declined(None));
     };
+    let Some(mut start_actions) = build_vec(alphabet.classes(), budget) else {
+        return Ok(ForwardBuildOutcome::Declined(None));
+    };
     let mut cursor = 0usize;
     macro_rules! decline_with_complete_rows {
         () => {{
             let partial = compact_partial_forward(
                 &transitions,
+                &start_actions,
                 states,
                 cursor,
                 alphabet.classes(),
@@ -3439,7 +3580,10 @@ fn build_forward(
                     }
                 }
             }
+            let source_len = closure.items.len();
+            let mut injected_root = false;
             if !accepted && !key.pending {
+                injected_root = true;
                 let injected = closure.expand(raw, raw.start, budget)?;
                 if budget.declined {
                     decline_with_complete_rows!();
@@ -3450,6 +3594,11 @@ fn build_forward(
                     ));
                 }
             }
+            let start_action = ForwardStartAction::derive(
+                source_len,
+                closure.items.len(),
+                injected_root,
+            );
             let next_pending = key.pending || accepted;
             let Some(next_items) = closure.copy_items(budget) else {
                 decline_with_complete_rows!();
@@ -3487,6 +3636,11 @@ fn build_forward(
                         ))?;
                     if !ensure_vec_capacity(&mut states, next_state_count, budget)
                         || !ensure_vec_capacity(&mut transitions, next_transition_count, budget)
+                        || !ensure_vec_capacity(
+                            &mut start_actions,
+                            next_transition_count,
+                            budget,
+                        )
                         || !reserve_map(&mut interned, 1, budget)
                     {
                         decline_with_complete_rows!();
@@ -3497,6 +3651,7 @@ fn build_forward(
                 }
             };
             transitions.push(ForwardCell { next, accepted });
+            start_actions.push(start_action);
         }
         cursor = cursor
             .checked_add(1)
@@ -3512,9 +3667,9 @@ fn build_forward(
             .ok_or(CompileError::InternalInvariant(
                 "forward DFA table shape overflowed",
             ))?;
-    if transitions.len() != expected {
+    if transitions.len() != expected || start_actions.len() != expected {
         return Err(CompileError::InternalInvariant(
-            "forward DFA table is incomplete",
+            "forward DFA table or start certificate is incomplete",
         ));
     }
     Ok(ForwardBuildOutcome::Complete(ForwardDfa {
@@ -4190,7 +4345,8 @@ mod tests {
             pending: item % 2 == 1,
         }));
 
-        let partial = compact_partial_forward(&transitions, states, 2, 3, false, false)
+        let actions = vec![ForwardStartAction::Drop; transitions.len()];
+        let partial = compact_partial_forward(&transitions, &actions, states, 2, 3, false, false)
             .expect("compact retained prefix");
         assert_eq!(partial.discovered_states, 4);
         assert_eq!(partial.complete_rows, 2);
