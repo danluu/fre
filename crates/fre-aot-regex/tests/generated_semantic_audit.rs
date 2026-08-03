@@ -266,7 +266,7 @@ fn parse_serialized(
     assert_eq!(bytes.len(), compiled.receipt().program_bytes);
     assert_eq!(&bytes[..8], b"FREGAOT\0");
     let mut cursor = 8;
-    assert_eq!(get_u32(bytes, &mut cursor), 2);
+    assert_eq!(get_u32(bytes, &mut cursor), 3);
     let engine = bytes[cursor];
     cursor += 1;
     assert_eq!(
