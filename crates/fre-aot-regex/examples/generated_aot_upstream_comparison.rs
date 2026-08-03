@@ -77,7 +77,7 @@ use std::{
 use fre_aot_regex::{
     Architecture, CompileLimitsV1, CompileMode, CompileRequest, CompiledRegex, CpuFeature,
     EngineKind, EngineSelectionReason, FeatureSet, MatchResult, OperatingSystem, OutputContract,
-    SearchWindow, StartAccelerator, Target, compile,
+    PartialDfaStats, SearchWindow, StartAccelerator, Target, compile,
 };
 use regex::bytes::Regex;
 
@@ -126,6 +126,11 @@ OPTIONS:
                          generated source. Contextual sources retain their
                          separate assertion fallback route. This is a generic
                          fallback diagnostic, not a pattern allowlist.
+  --force-retained-resource-fallback
+                         Probe each source structurally, then force a canonical
+                         decline that preserves nonempty DFA rows when the
+                         graph supports them. Keeps excluded exact-product and
+                         contextual rows in the printed diagnostic matrix.
   --seed N               Measure one generated seed (decimal or 0x-prefixed).
                          Both grammar modes accept any new root seed.
   --grammar              Use the separate seeded grammar-generated diagnostic
@@ -161,6 +166,7 @@ struct Config {
     measurement_order: MeasurementOrder,
     output_matrix: bool,
     force_resource_fallback: bool,
+    force_retained_resource_fallback: bool,
     seed_filter: Option<u64>,
     grammar: bool,
     nested_grammar: bool,
@@ -181,6 +187,7 @@ struct PartialConfig {
     measurement_order: Option<MeasurementOrder>,
     output_matrix: bool,
     force_resource_fallback: bool,
+    force_retained_resource_fallback: bool,
     seed_filter: Option<u64>,
     grammar: bool,
     nested_grammar: bool,
@@ -196,6 +203,9 @@ impl Config {
                 Some("--smoke") => partial.smoke = true,
                 Some("--output-matrix") => partial.output_matrix = true,
                 Some("--force-resource-fallback") => partial.force_resource_fallback = true,
+                Some("--force-retained-resource-fallback") => {
+                    partial.force_retained_resource_fallback = true;
+                }
                 Some("--grammar") => partial.grammar = true,
                 Some("--nested-grammar") => partial.nested_grammar = true,
                 Some("--trials") => {
@@ -259,6 +269,12 @@ impl Config {
         if partial.grammar && partial.nested_grammar {
             return Err("--grammar and --nested-grammar are mutually exclusive".to_owned());
         }
+        if partial.force_resource_fallback && partial.force_retained_resource_fallback {
+            return Err(
+                "--force-resource-fallback and --force-retained-resource-fallback are mutually exclusive"
+                    .to_owned(),
+            );
+        }
         if warmup_rounds == 0 || bytes_per_trial == 0 || min_searches == 0 || min_trial_ns == 0 {
             return Err(
                 "warmup rounds, bytes per trial, searches, and trial duration must be non-zero"
@@ -298,6 +314,7 @@ impl Config {
             measurement_order: partial.measurement_order.unwrap_or_default(),
             output_matrix: partial.output_matrix,
             force_resource_fallback: partial.force_resource_fallback,
+            force_retained_resource_fallback: partial.force_retained_resource_fallback,
             seed_filter: partial.seed_filter,
             grammar: partial.grammar,
             nested_grammar: partial.nested_grammar,
@@ -1753,6 +1770,9 @@ struct CompiledShape {
     upstream: Regex,
     aot: CompiledRegex,
     runtime_program: Option<(String, usize)>,
+    partial_dfa: Option<PartialDfaStats>,
+    fallback_artifact_kind: &'static str,
+    retained_limit_derivation: &'static str,
 }
 
 impl CompiledShape {
@@ -1766,6 +1786,66 @@ impl CompiledShape {
             }
             EngineSelectionReason::FastMode => "unexpected_fast_mode",
         }
+    }
+}
+
+fn compile_shape_aot(
+    spec: &SeededPatternSpec,
+    target: Target,
+    limits: CompileLimitsV1,
+) -> Result<CompiledRegex, String> {
+    compile(
+        CompileRequest::new(spec.pattern.clone(), target)
+            .mode(CompileMode::Optimizing)
+            .output(spec.output.contract())
+            .limits(limits),
+    )
+    .map_err(|error| format!("{} AOT compilation failed: {error}", spec.name))
+}
+
+fn retained_partial_stats(compiled: &CompiledRegex) -> Result<Option<PartialDfaStats>, String> {
+    compiled
+        .program()
+        .partial_dfa_stats()
+        .map_err(|error| format!("partial-DFA statistics failed: {error}"))
+}
+
+fn compile_retained_resource_probe(
+    spec: &SeededPatternSpec,
+    target: Target,
+) -> Result<(CompiledRegex, &'static str), String> {
+    let probe = compile_shape_aot(spec, target, CompileLimitsV1::default())?;
+    if probe.receipt().context_determinization.is_some() {
+        return Ok((probe, "excluded_contextual"));
+    }
+    if retained_partial_stats(&probe)?.is_some_and(|stats| stats.complete_rows > 0) {
+        return Ok((probe, "natural_decline"));
+    }
+    let Some(dfa) = probe.receipt().dfa else {
+        return Ok((probe, "excluded_non_dfa_probe"));
+    };
+
+    if let Some(max_states) = dfa.forward_states_before_minimization.checked_sub(1)
+        && max_states > 0
+    {
+        let mut limits = CompileLimitsV1::default();
+        limits.determinize.max_states = max_states;
+        let state_limited = compile_shape_aot(spec, target, limits)?;
+        if retained_partial_stats(&state_limited)?.is_some_and(|stats| stats.complete_rows > 0) {
+            return Ok((state_limited, "forward_state_limit"));
+        }
+    }
+
+    let Some(max_work) = dfa.build_work.checked_sub(1) else {
+        return Ok((probe, "excluded_zero_build_work"));
+    };
+    let mut limits = CompileLimitsV1::default();
+    limits.determinize.max_work = max_work;
+    let work_limited = compile_shape_aot(spec, target, limits)?;
+    if retained_partial_stats(&work_limited)?.is_some_and(|stats| stats.complete_rows > 0) {
+        Ok((work_limited, "final_work_limit"))
+    } else {
+        Ok((work_limited, "excluded_no_retained_rows"))
     }
 }
 
@@ -1815,30 +1895,29 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
                     .is_none_or(|name| spec.base_name == name || spec.name == name)
         })
         .map(|spec| {
-            let has_context_assertions = matches!(
-                spec.family,
-                "line_assertion"
-                    | "word_assertion"
-                    | "grammar_assertion"
-                    | "nested_line_assertion"
-                    | "nested_word_assertion"
-            );
-            let force_ordinary_fallback = spec.force_fallback
-                || config.force_resource_fallback && !has_context_assertions;
             let force_runtime_fallback = spec.force_fallback || config.force_resource_fallback;
             let upstream = Regex::new(&spec.pattern)
                 .map_err(|error| format!("{} upstream compilation failed: {error}", spec.name))?;
-            let mut limits = CompileLimitsV1::default();
-            if force_runtime_fallback {
-                limits.determinize.max_states = 0;
-            }
-            let aot = compile(
-                CompileRequest::new(spec.pattern.clone(), config.target)
-                    .mode(CompileMode::Optimizing)
-                    .output(spec.output.contract())
-                    .limits(limits),
-            )
-            .map_err(|error| format!("{} AOT compilation failed: {error}", spec.name))?;
+            let (aot, retained_limit_derivation) =
+                if config.force_retained_resource_fallback {
+                    compile_retained_resource_probe(&spec, config.target)?
+                } else {
+                    let mut limits = CompileLimitsV1::default();
+                    if force_runtime_fallback {
+                        limits.determinize.max_states = 0;
+                    }
+                    (
+                        compile_shape_aot(&spec, config.target, limits)?,
+                        if force_runtime_fallback {
+                            "legacy_zero_state"
+                        } else {
+                            "not_requested"
+                        },
+                    )
+                };
+            let has_context_assertions = aot.receipt().context_determinization.is_some();
+            let force_ordinary_fallback = spec.force_fallback
+                || config.force_resource_fallback && !has_context_assertions;
             let witness_upstream = upstream_search(&upstream, spec.output, &spec.fixture);
             let witness_aot = AbiResult::from_aot(
                 aot.search(&spec.fixture, SearchWindow::full(&spec.fixture))
@@ -1889,6 +1968,7 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
             if runtime_program.is_some()
                 && !spec.force_fallback
                 && !config.force_resource_fallback
+                && !config.force_retained_resource_fallback
                 && !has_context_assertions
                 && !natural_resource_fallback
             {
@@ -1909,11 +1989,43 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
                     spec.name
                 ));
             }
+            let partial_dfa = retained_partial_stats(&aot)?;
+            let fallback_artifact_kind = if partial_dfa.is_some() {
+                "retained_partial"
+            } else if aot.program().has_nfa_exact_product() {
+                "exact_product"
+            } else if has_context_assertions {
+                "contextual"
+            } else if aot.receipt().engine == EngineKind::OrderedNfa {
+                "plain_nfa"
+            } else {
+                "direct"
+            };
+            if config.force_retained_resource_fallback {
+                if let Some(stats) = partial_dfa {
+                    if reason != EngineSelectionReason::DeterminizationResourceLimit
+                        || aot.receipt().engine != EngineKind::OrderedNfa
+                        || runtime_program.is_none()
+                        || stats.complete_rows == 0
+                        || !stats.optimized_entry_supported
+                    {
+                        return Err(format!(
+                            "{} retained-row probe produced an inconsistent artifact: reason={reason:?}, engine={:?}, runtime={}, stats={stats:?}",
+                            spec.name,
+                            aot.receipt().engine,
+                            runtime_program.is_some(),
+                        ));
+                    }
+                }
+            }
             Ok(CompiledShape {
                 spec,
                 upstream,
                 aot,
                 runtime_program,
+                partial_dfa,
+                fallback_artifact_kind,
+                retained_limit_derivation,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -3325,6 +3437,67 @@ fn command_version(program: &OsStr, argument: &str) -> String {
         .replace(['\t', '\r', '\n'], " ")
 }
 
+fn print_partial_dfa_metadata(shapes: &[CompiledShape]) {
+    println!(
+        "#partial_dfa\tpattern\tfamily\tseed\toutput\tartifact_kind\tscore_scope\tlimit_derivation\truntime_program\tcomplete_rows\tdiscovered_states\tresume_frontiers\tresume_items\toptimized_entry_supported\tmin_input_bytes\trequested_max_states\trequested_max_transitions\trequested_max_work\teffective_max_states\teffective_max_transitions\teffective_max_work\tdecline_stage\tdecline_resource\twork_completed\tstates_completed\ttransitions_completed\texact_product\tstatus"
+    );
+    for shape in shapes {
+        let report = &shape.aot.receipt().determinization;
+        let requested = report.requested_limits;
+        let effective = report.effective_limits;
+        let decline = report.decline;
+        let partial = shape.partial_dfa;
+        let number = |value: Option<u64>| {
+            value.map_or_else(|| "na".to_owned(), |value| value.to_string())
+        };
+        let decline_stage = decline.map_or_else(
+            || "none".to_owned(),
+            |decline| format!("{:?}", decline.stage),
+        );
+        let decline_resource = decline.map_or_else(
+            || "none".to_owned(),
+            |decline| format!("{:?}", decline.resource).replace(' ', ""),
+        );
+        let fields = [
+            "partial_dfa".to_owned(),
+            shape.spec.name.clone(),
+            shape.spec.family.to_owned(),
+            format!("0x{:016x}", shape.spec.seed),
+            shape.spec.output.name().to_owned(),
+            shape.fallback_artifact_kind.to_owned(),
+            if partial.is_some() {
+                "retained_partial_windows_ge_min".to_owned()
+            } else {
+                "excluded_from_retained_partial".to_owned()
+            },
+            shape.retained_limit_derivation.to_owned(),
+            shape.runtime_program.is_some().to_string(),
+            number(partial.map(|stats| stats.complete_rows as u64)),
+            number(partial.map(|stats| stats.discovered_states as u64)),
+            number(partial.map(|stats| stats.resume_frontiers as u64)),
+            number(partial.map(|stats| stats.resume_items as u64)),
+            partial.map_or_else(|| "na".to_owned(), |stats| {
+                stats.optimized_entry_supported.to_string()
+            }),
+            number(partial.map(|stats| stats.min_input_bytes as u64)),
+            requested.max_states.to_string(),
+            requested.max_transitions.to_string(),
+            requested.max_work.to_string(),
+            effective.max_states.to_string(),
+            effective.max_transitions.to_string(),
+            effective.max_work.to_string(),
+            decline_stage,
+            decline_resource,
+            report.work_completed.to_string(),
+            report.states_completed.to_string(),
+            report.transitions_completed.to_string(),
+            shape.aot.program().has_nfa_exact_product().to_string(),
+            "ok".to_owned(),
+        ];
+        println!("{}", fields.join("\t"));
+    }
+}
+
 fn print_environment(config: &Config, shapes: &[CompiledShape], scenario_count: usize) {
     let compiler = env::var_os("CC").unwrap_or_else(|| OsString::from("cc"));
     let rustc = env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
@@ -3429,6 +3602,22 @@ fn print_environment(config: &Config, shapes: &[CompiledShape], scenario_count: 
         "environment\tforce_resource_fallback\t{}",
         config.force_resource_fallback
     );
+    println!(
+        "environment\tforce_retained_resource_fallback\t{}",
+        config.force_retained_resource_fallback
+    );
+    let artifact_counts = shapes.iter().fold(BTreeMap::new(), |mut counts, shape| {
+        *counts.entry(shape.fallback_artifact_kind).or_insert(0_usize) += 1;
+        counts
+    });
+    println!(
+        "environment\tfallback_artifact_counts\t{}",
+        artifact_counts
+            .into_iter()
+            .map(|(kind, count)| format!("{kind}={count}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
     println!("environment\tseeds\t{seeds}");
     println!("environment\tcompiled_patterns\t{}", shapes.len());
     println!("environment\tscenarios\t{scenario_count}");
@@ -3449,7 +3638,7 @@ fn run(config: &Config) -> Result<(), String> {
     };
     let shapes = compile_shapes(config)?;
     eprintln!(
-        "generated comparison: {architecture}-{operating_system}, patterns={}, cells={}, feature_bits={:#x}, trials={}, bytes_per_trial={}, min_searches={}, min_trial_ns={}, smoke={}, grammar={}, nested_grammar={}, output_matrix={}, force_resource_fallback={}, family_filter={}, pattern_filter={}, route_filter={}, measurement_order={}, seed_filter={}",
+        "generated comparison: {architecture}-{operating_system}, patterns={}, cells={}, feature_bits={:#x}, trials={}, bytes_per_trial={}, min_searches={}, min_trial_ns={}, smoke={}, grammar={}, nested_grammar={}, output_matrix={}, force_resource_fallback={}, force_retained_resource_fallback={}, family_filter={}, pattern_filter={}, route_filter={}, measurement_order={}, seed_filter={}",
         shapes.len(),
         shapes.len() * sizes(config).len() * positions(config).len() * densities(config).len(),
         config.target.features.bits(),
@@ -3462,6 +3651,7 @@ fn run(config: &Config) -> Result<(), String> {
         config.nested_grammar,
         config.output_matrix,
         config.force_resource_fallback,
+        config.force_retained_resource_fallback,
         config.family_filter.as_deref().unwrap_or("all"),
         config.pattern_filter.as_deref().unwrap_or("all"),
         config.route_filter.as_deref().unwrap_or("all"),
@@ -3476,6 +3666,7 @@ fn run(config: &Config) -> Result<(), String> {
     let executable = compile_native_harness(&scratch.0, config, &shapes, &scenarios, &runtime)?;
     let prepared_native = prepare_native_harness(&executable, &scratch.0)?;
     print_environment(config, &shapes, scenarios.len());
+    print_partial_dfa_metadata(&shapes);
     let (upstream, native) = measure_in_order(
         config.measurement_order,
         || measure_upstream(config, &shapes, &scenarios),
@@ -3528,6 +3719,7 @@ mod tests {
             measurement_order: MeasurementOrder::default(),
             output_matrix: false,
             force_resource_fallback: false,
+            force_retained_resource_fallback: false,
             seed_filter,
             grammar: true,
             nested_grammar: false,
