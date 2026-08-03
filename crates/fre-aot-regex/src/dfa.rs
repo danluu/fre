@@ -1071,12 +1071,15 @@ impl PartialDfaPrefixPlan {
 }
 
 impl PartialDfa {
-    #[cfg(test)]
     pub(crate) const fn retained_dimensions(&self) -> (usize, usize) {
         (
             self.forward.complete_rows,
             self.forward.discovered_states,
         )
+    }
+
+    pub(crate) const fn effective_limits(&self) -> DeterminizeLimits {
+        self.effective_limits
     }
 
     pub(crate) fn resume_frontier_count(&self) -> usize {
@@ -3258,6 +3261,47 @@ fn compact_columns<T: Copy>(
     Ok(Some(compact))
 }
 
+/// Publish only the completed table prefix and incomplete frontier suffix.
+///
+/// Subset construction may have reserved storage for a much larger BFS
+/// backlog before a limit declines. Moving those original vectors into the
+/// optional sidecar would retain that abandoned capacity, so publication
+/// fallibly copies/moves the exact logical payload into fresh compact owners.
+/// Allocation failure simply declines the optional partial artifact.
+fn compact_partial_forward(
+    transitions: &[ForwardCell],
+    states: Vec<ForwardKey>,
+    complete_rows: usize,
+    classes: usize,
+    initial_pending: bool,
+    initial_terminal: bool,
+) -> Option<PartialForwardDfa> {
+    if complete_rows == 0 || complete_rows > states.len() {
+        return None;
+    }
+    let completed_cells = complete_rows.checked_mul(classes)?;
+    let completed = transitions.get(..completed_cells)?;
+    let mut compact_transitions = Vec::new();
+    compact_transitions
+        .try_reserve_exact(completed_cells)
+        .ok()?;
+    compact_transitions.extend_from_slice(completed);
+
+    let discovered_states = states.len();
+    let resume_count = discovered_states.checked_sub(complete_rows)?;
+    let mut resume_keys = Vec::new();
+    resume_keys.try_reserve_exact(resume_count).ok()?;
+    resume_keys.extend(states.into_iter().skip(complete_rows));
+    Some(PartialForwardDfa {
+        initial_pending,
+        initial_terminal,
+        transitions: compact_transitions,
+        discovered_states,
+        complete_rows,
+        resume_keys,
+    })
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "complete ordered subset construction is kept in one auditable worklist"
@@ -3303,21 +3347,14 @@ fn build_forward(
     let mut cursor = 0usize;
     macro_rules! decline_with_complete_rows {
         () => {{
-            let completed_cells = cursor.checked_mul(alphabet.classes()).ok_or(
-                CompileError::InternalInvariant("partial DFA table shape overflowed"),
-            )?;
-            transitions.truncate(completed_cells);
-            let discovered_states = states.len();
-            states.drain(..cursor);
-            let resume_keys = states;
-            let partial = (cursor != 0).then_some(PartialForwardDfa {
-                initial_pending: initial_accepted,
+            let partial = compact_partial_forward(
+                &transitions,
+                states,
+                cursor,
+                alphabet.classes(),
+                initial_accepted,
                 initial_terminal,
-                transitions,
-                discovered_states,
-                complete_rows: cursor,
-                resume_keys,
-            });
+            );
             return Ok(ForwardBuildOutcome::Declined(partial));
         }};
     }
@@ -4066,6 +4103,31 @@ fn put_u64(bytes: &mut Vec<u8>, value: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_publication_drops_abandoned_bfs_capacity() {
+        let mut transitions = Vec::with_capacity(4_096);
+        transitions.extend((0_u32..12).map(|next| ForwardCell {
+            next,
+            accepted: next % 2 == 0,
+        }));
+        let mut states = Vec::with_capacity(4_096);
+        states.extend((0_u32..4).map(|item| ForwardKey {
+            items: vec![item],
+            pending: item % 2 == 1,
+        }));
+
+        let partial = compact_partial_forward(&transitions, states, 2, 3, false, false)
+            .expect("compact retained prefix");
+        assert_eq!(partial.discovered_states, 4);
+        assert_eq!(partial.complete_rows, 2);
+        assert_eq!(partial.transitions, transitions[..6]);
+        assert_eq!(partial.resume_keys.len(), 2);
+        assert_eq!(partial.resume_keys[0].items, [2]);
+        assert_eq!(partial.resume_keys[1].items, [3]);
+        assert!(partial.transitions.capacity() < 4_096);
+        assert!(partial.resume_keys.capacity() < 4_096);
+    }
 
     fn lowered_assertion_free(pattern: &str) -> RawPlan {
         use fre_lower::{LowerLimits, OperationSemantics};

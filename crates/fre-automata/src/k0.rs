@@ -3935,8 +3935,8 @@ fn execute_prepared(
     })
 }
 
-// Retained-frontier continuation is a cold, separately selected engine
-// entry. Give it private setup and transition helpers so it cannot turn the
+// Retained-frontier continuation is a separately selected engine entry. Give
+// it private setup and transition helpers so it cannot turn the
 // ordinary K0 helpers into multi-caller outlining candidates under ThinLTO.
 fn prepare_resume_invocation(
     automaton: &Automaton,
@@ -3960,6 +3960,13 @@ fn prepare_resume_invocation(
             actual_edges: workspace.layout.edges,
             required_zero_width_edges: required_layout.zero_width_edges,
             actual_zero_width_edges: workspace.layout.zero_width_edges,
+        });
+    }
+    if setup.retained_bytes > limits.max_scratch_bytes {
+        return Err(SearchError::ResourceLimit {
+            resource: ResourceKind::ScratchBytes,
+            needed: setup.retained_bytes,
+            limit: limits.max_scratch_bytes,
         });
     }
 
@@ -4279,7 +4286,13 @@ fn execute_from_resume(
         });
     }
 
-    let mut setup = SetupAccounting::empty(workspace.retained_bytes, true);
+    let scratch_bytes = workspace
+        .retained_bytes
+        .checked_add(resume_set.retained_bytes)
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "resume invocation retained scratch bytes",
+        })?;
+    let mut setup = SetupAccounting::empty(scratch_bytes, true);
     let (mut meter, setup_work) = prepare_resume_invocation(
         automaton,
         workspace,
@@ -4314,6 +4327,21 @@ fn execute_from_resume(
         0
     };
     let completion_reserve = forward_reserve.saturating_add(reverse_reserve);
+    let reverse_initial_reserve = if wants_span
+        && limits.max_work != u64::MAX
+        && !workspace.reverse.initialized
+    {
+        reverse_initial_work_upper(automaton).unwrap_or(u64::MAX)
+    } else {
+        0
+    };
+    let post_seed_reserve = completion_reserve.saturating_add(reverse_initial_reserve);
+    let seed_reserve = if limits.max_work == u64::MAX {
+        0
+    } else {
+        resume_seed_work_upper(resume_set, resume_state)?
+    };
+    let pre_seed_reserve = post_seed_reserve.saturating_add(seed_reserve);
 
     // Preparing the ordinary initial row is optional for semantics, but lets
     // the resumed frontier intern into the same persistent cache and reuse its
@@ -4323,7 +4351,7 @@ fn execute_from_resume(
         automaton,
         workspace,
         &mut meter,
-        completion_reserve,
+        pre_seed_reserve,
         resume_position,
     )?;
     let state = seed_lazy_resume_state(
@@ -4332,7 +4360,7 @@ fn execute_from_resume(
         resume_set,
         resume_state,
         &mut meter,
-        completion_reserve,
+        post_seed_reserve,
         resume_position,
         may_intern,
     )?;
@@ -4343,7 +4371,7 @@ fn execute_from_resume(
         workspace,
         &mut meter,
         contract,
-        completion_reserve,
+        post_seed_reserve,
         state,
         resume_position,
         pending_end,
@@ -4404,10 +4432,30 @@ fn execute_from_resume(
             meter.consumed,
             setup,
             transition_work,
-            workspace.retained_bytes,
+            scratch_bytes,
             boundaries,
         ),
     })
+}
+
+/// Mandatory work needed to authenticate a retained frontier and copy it
+/// into inline scratch. A valid cached hint may first compare every item plus
+/// its pending-mode bit and then miss, so the exact worst case is `2n + 1`.
+fn resume_seed_work_upper(
+    resume_set: &K0ResumeSet,
+    resume_state: usize,
+) -> Result<u64, SearchError> {
+    let length = u64::from(*resume_set.lengths.get(resume_state).ok_or(
+        SearchError::InvalidResumeState {
+            detail: "resume state index is outside the authenticated set",
+        },
+    )?);
+    length
+        .checked_mul(2)
+        .and_then(|work| work.checked_add(1))
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "resume seed work bound",
+        })
 }
 
 #[allow(
@@ -20496,6 +20544,179 @@ mod tests {
                     SearchLimits::unlimited(),
                 ),
             Err(SearchError::InvalidResumeState { .. })
+        ));
+    }
+
+    #[test]
+    fn ordered_frontier_resume_reserves_seed_reverse_and_exact_scratch() {
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b')]);
+        let haystack = b"zzabzzab";
+        let window = SearchWindow::full(haystack);
+        let frontier = [1_u32];
+
+        // A finite cold Span continuation must preserve all mandatory work
+        // before considering ordinary lazy-initial publication: frontier
+        // authentication, forward completion, reverse initialization, and
+        // reverse completion.
+        let mut cold_resume = K0ResumeSet::new(&plan, 1, 1, [(&frontier[..], false)]).unwrap();
+        let mut cold_workspace =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let cold_scratch = cold_workspace
+            .retained_bytes()
+            .checked_add(cold_resume.retained_bytes())
+            .unwrap();
+        let forward = plan
+            .conservative_transition_work_bound(window.end() - 3)
+            .unwrap();
+        let reverse =
+            super::conservative_reverse_work_bound(&plan, window.end() - window.start()).unwrap();
+        let reverse_initial = super::reverse_initial_work_upper(&plan).unwrap();
+        let seed = super::resume_seed_work_upper(&cold_resume, 0).unwrap();
+        let cold_exact = INVOCATION_RESET_WORK
+            .checked_add(forward)
+            .and_then(|work| work.checked_add(reverse))
+            .and_then(|work| work.checked_add(reverse_initial))
+            .and_then(|work| work.checked_add(seed))
+            .unwrap();
+        let cold = plan
+            .prepare::<Span>()
+            .search_window_from_ordered_resume(
+                haystack,
+                window,
+                &mut cold_workspace,
+                &mut cold_resume,
+                0,
+                3,
+                None,
+                SearchLimits {
+                    max_work: cold_exact,
+                    max_scratch_bytes: cold_scratch,
+                },
+            )
+            .unwrap();
+        assert_eq!(cold.into_output(), Some(MatchSpan::new(2, 4)));
+        assert_eq!(cold.accounting().scratch_bytes(), cold_scratch);
+        assert_eq!(cold.accounting().setup().retained_bytes(), cold_scratch);
+        assert!(!cold_workspace.lazy.initialized);
+
+        let mut refused_resume = K0ResumeSet::new(&plan, 1, 1, [(&frontier[..], false)]).unwrap();
+        let mut refused_workspace =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        assert!(matches!(
+            plan.prepare::<Span>().search_window_from_ordered_resume(
+                haystack,
+                window,
+                &mut refused_workspace,
+                &mut refused_resume,
+                0,
+                3,
+                None,
+                SearchLimits {
+                    max_work: u64::MAX,
+                    max_scratch_bytes: cold_scratch - 1,
+                },
+            ),
+            Err(SearchError::ResourceLimit {
+                resource: ResourceKind::ScratchBytes,
+                needed,
+                limit,
+            }) if needed == cold_scratch && limit == cold_scratch - 1
+        ));
+
+        // This SelectedEnd limit is deliberately enough for the old
+        // completion-only reserve to publish the optional lazy initial row,
+        // but not enough for the corrected completion+seed reserve to do so.
+        // The exact continuation therefore succeeds inline without letting
+        // optional setup steal the frontier-authentication allowance.
+        let mut endpoint_resume =
+            K0ResumeSet::new(&plan, 1, 1, [(&frontier[..], false)]).unwrap();
+        let mut endpoint_workspace =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let endpoint_scratch = endpoint_workspace
+            .retained_bytes()
+            .checked_add(endpoint_resume.retained_bytes())
+            .unwrap();
+        let lazy_initial = super::lazy_initial_work_upper(&plan).unwrap();
+        let endpoint_limit = INVOCATION_RESET_WORK
+            .checked_add(forward)
+            .and_then(|work| work.checked_add(lazy_initial))
+            .unwrap();
+        let old_optional = endpoint_limit - INVOCATION_RESET_WORK - forward;
+        let new_optional = old_optional.checked_sub(seed).unwrap();
+        assert!(lazy_initial <= old_optional);
+        assert!(lazy_initial > new_optional);
+        assert_eq!(
+            plan.prepare::<SelectedEnd>()
+                .search_window_from_ordered_resume(
+                    haystack,
+                    window,
+                    &mut endpoint_workspace,
+                    &mut endpoint_resume,
+                    0,
+                    3,
+                    None,
+                    SearchLimits {
+                        max_work: endpoint_limit,
+                        max_scratch_bytes: endpoint_scratch,
+                    },
+                )
+                .unwrap()
+                .into_output(),
+            Some(4)
+        );
+        assert!(!endpoint_workspace.lazy.initialized);
+
+        // Once both caches and the resume-set hint are warm, actual work is
+        // the exact finite boundary and one less is a hard refusal.
+        fn warm_span(
+            plan: &Automaton,
+            haystack: &[u8],
+            max_work: u64,
+        ) -> Result<(Option<MatchSpan>, u64, bool), SearchError> {
+            let frontier = [1_u32];
+            let mut resume = K0ResumeSet::new(plan, 1, 1, [(&frontier[..], false)]).unwrap();
+            let mut workspace =
+                K0Workspace::new_bidirectional(plan, WorkspaceLimits::unlimited()).unwrap();
+            let scratch = workspace
+                .retained_bytes()
+                .checked_add(resume.retained_bytes())
+                .unwrap();
+            plan.prepare::<Span>().search_window_from_ordered_resume(
+                haystack,
+                SearchWindow::full(haystack),
+                &mut workspace,
+                &mut resume,
+                0,
+                3,
+                None,
+                SearchLimits::unlimited(),
+            )?;
+            let cached = resume.cached_states[0] != super::LAZY_NO_STATE;
+            let report = plan.prepare::<Span>().search_window_from_ordered_resume(
+                haystack,
+                SearchWindow::full(haystack),
+                &mut workspace,
+                &mut resume,
+                0,
+                3,
+                None,
+                SearchLimits {
+                    max_work,
+                    max_scratch_bytes: scratch,
+                },
+            )?;
+            Ok((report.into_output(), report.accounting().work(), cached))
+        }
+        let (warm_expected, warm_exact, cached) = warm_span(&plan, haystack, u64::MAX).unwrap();
+        assert!(cached);
+        assert_eq!(warm_expected, Some(MatchSpan::new(2, 4)));
+        assert_eq!(
+            warm_span(&plan, haystack, warm_exact).unwrap().0,
+            warm_expected
+        );
+        assert!(matches!(
+            warm_span(&plan, haystack, warm_exact - 1),
+            Err(SearchError::WorkLimitExceeded { limit, .. }) if limit == warm_exact - 1
         ));
     }
 

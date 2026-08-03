@@ -331,7 +331,7 @@ impl PreparedAotRegex {
         window: SearchWindow,
     ) -> Result<MatchResult, CompileError> {
         self.program
-            .search_with_workspace(haystack, window, &mut self.workspace)
+            .search_optimized_with_workspace(haystack, window, &mut self.workspace)
     }
 
     /// Find the first selected span in `haystack`.
@@ -881,8 +881,7 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_v1(
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let prepared = &mut *handle.0.cast::<PreparedAotRegex>();
         let haystack = std::slice::from_raw_parts(haystack_ptr, haystack_len);
-        let Ok((status, result)) =
-            execute_search(prepared, haystack, window_start, window_end)
+        let Ok((status, result)) = execute_search(prepared, haystack, window_start, window_end)
         else {
             return STATUS_RUNTIME_FAILURE;
         };
@@ -1297,11 +1296,8 @@ mod tests {
         ) -> u32 = fre_aot_regex_runtime_search_prepared_v1;
         let _: extern "C" fn(FreAotRegexPreparedHandleV1) -> u32 =
             fre_aot_regex_runtime_destroy_prepared_v1;
-        let _: unsafe extern "C" fn(
-            *const u8,
-            usize,
-            *mut FreAotRegexExclusiveHandleV1,
-        ) -> u32 = fre_aot_regex_runtime_prepare_exclusive_v1;
+        let _: unsafe extern "C" fn(*const u8, usize, *mut FreAotRegexExclusiveHandleV1) -> u32 =
+            fre_aot_regex_runtime_prepare_exclusive_v1;
         let _: unsafe extern "C" fn(
             FreAotRegexExclusiveHandleV1,
             *const u8,
@@ -1736,6 +1732,74 @@ mod tests {
                     STATUS_SUCCESS
                 );
             }
+        }
+    }
+
+    #[test]
+    fn exclusive_prepared_runtime_executes_retained_resource_rows() {
+        let pattern = r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)";
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let mut limits = CompileLimitsV1::default();
+            limits.determinize.max_states = 32;
+            let compiled = compile(
+                CompileRequest::new(pattern, Target::x86_64_linux())
+                    .mode(CompileMode::Optimizing)
+                    .limits(limits)
+                    .output(output),
+            )
+            .expect("compile retained resource fallback");
+            let reference = compile(
+                CompileRequest::new(pattern, Target::x86_64_linux())
+                    .mode(CompileMode::Fast)
+                    .output(output),
+            )
+            .expect("compile universal reference");
+            assert_eq!(
+                compiled.receipt().engine_selection_reason,
+                EngineSelectionReason::DeterminizationResourceLimit
+            );
+            let stats = compiled
+                .program()
+                .partial_dfa_stats()
+                .expect("partial stats")
+                .expect("retained rows");
+            assert!(stats.complete_rows > 0);
+            assert!(stats.complete_rows < stats.discovered_states);
+            assert!(stats.resume_frontiers > 0);
+
+            let serialized = compiled.program().serialize().expect("serialize partial");
+            assert_ne!(serialized[15] & (1 << 3), 0, "V4 partial flag");
+            let exclusive = prepare_exclusive(&serialized);
+            let short = b"cbbbbx";
+            let mut long = vec![b'x'; 256];
+            long.extend_from_slice(short);
+            for haystack in [short.as_slice(), long.as_slice()] {
+                let expected = expected_ffi(
+                    reference
+                        .search(haystack, SearchWindow::full(haystack))
+                        .expect("universal reference search"),
+                );
+                let mut actual = FreAotRegexResultV1::default();
+                assert_eq!(
+                    (
+                        call_exclusive(exclusive, haystack, 0, haystack.len(), &mut actual),
+                        actual,
+                    ),
+                    expected,
+                    "output={output:?}, len={}",
+                    haystack.len()
+                );
+            }
+            // SAFETY: this test owns the unique live exclusive handle and no
+            // call overlaps destruction.
+            assert_eq!(
+                unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(exclusive) },
+                STATUS_SUCCESS
+            );
         }
     }
 

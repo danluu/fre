@@ -307,6 +307,8 @@ pub struct ProgramStats {
     pub thompson_edges: usize,
     pub serialized_bytes: usize,
     pub dfa: Option<DfaStats>,
+    /// Canonical rows retained after bounded determinization declined.
+    pub partial_dfa: Option<PartialDfaStats>,
     /// Fresh contextual-determinization outcome. This is `None` for
     /// assertion-free programs, Fast mode, and deserialized artifacts.
     pub context_determinization: Option<ContextDeterminizationReport>,
@@ -317,6 +319,20 @@ pub struct ProgramStats {
     /// Proven maximum consumed byte width, or `None` when the graph is
     /// structurally unbounded or the optional bounded proof declined.
     pub max_match_width: Option<usize>,
+}
+
+/// Dimensions and exact construction limits of a retained partial DFA.
+///
+/// A resource-fallback receipt without this value executes the universal NFA
+/// directly; a present value proves that the prepared optimizing entry can
+/// run complete canonical rows and resume K0 at authenticated holes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PartialDfaStats {
+    pub complete_rows: usize,
+    pub discovered_states: usize,
+    pub resume_frontiers: usize,
+    pub resume_items: usize,
+    pub effective_limits: DeterminizeLimits,
 }
 
 /// Fresh-compilation provenance for optional contextual determinization.
@@ -1517,8 +1533,12 @@ impl ProgramOptimizationSidecar {
 /// Reusable, allocation-free execution storage for one semantic program.
 ///
 /// Construct this with [`CompiledProgram::prepare_workspace`] and pass it to
-/// [`CompiledProgram::search_with_workspace`]. A semantic identity check
-/// prevents accidentally pairing storage with another program.
+/// [`CompiledProgram::search_with_workspace`] or
+/// [`CompiledProgram::search_optimized_with_workspace`]. A semantic identity
+/// check prevents accidentally pairing storage with another program. An
+/// exact serialized clone remains semantically compatible, but immutable
+/// instance-bound cache hints conservatively fall back to the universal
+/// executor instead of being reused across instances.
 #[derive(Debug)]
 pub struct ProgramWorkspace {
     identity: [u8; 32],
@@ -1736,7 +1756,6 @@ impl CompiledProgram {
                 ),
             },
         };
-        let identity = automaton_digest(&raw, line_terminator);
         let anchored_prefix = derive_anchored_prefix(&raw);
         let anchored_suffix = derive_anchored_suffix(&raw);
         let required_literals = if mode == CompileMode::Optimizing {
@@ -1791,10 +1810,10 @@ impl CompiledProgram {
                 ));
             }
         };
-        Ok(Self {
+        let mut program = Self {
             raw,
             automaton,
-            identity,
+            identity: [0; 32],
             line_terminator,
             output,
             engine,
@@ -1809,7 +1828,13 @@ impl CompiledProgram {
             max_match_width,
             nfa_mandatory_suffix,
             nfa_mandatory_cut,
-        })
+        };
+        // Workspace compatibility includes the exact canonical artifact, not
+        // just its Thompson graph. This prevents a retained frontier table
+        // prepared under one determinization limit or output contract from
+        // being paired with a different table for the same regex language.
+        program.identity = program.serialized_sha256()?;
+        Ok(program)
     }
 
     #[must_use]
@@ -1874,6 +1899,30 @@ impl CompiledProgram {
 
     fn partial_dfa(&self) -> Option<&PartialDfa> {
         self.optimization_sidecar.partial_dfa()
+    }
+
+    /// Return canonical retained-row dimensions for a resource fallback.
+    ///
+    /// `None` distinguishes a plain universal-NFA fallback from one whose
+    /// bounded determinization prefix is available to the optimizing entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invariant error only if canonical resume-item accounting
+    /// overflows the host `usize`.
+    pub fn partial_dfa_stats(&self) -> Result<Option<PartialDfaStats>, CompileError> {
+        self.partial_dfa()
+            .map(|partial| {
+                let (complete_rows, discovered_states) = partial.retained_dimensions();
+                Ok(PartialDfaStats {
+                    complete_rows,
+                    discovered_states,
+                    resume_frontiers: partial.resume_frontier_count(),
+                    resume_items: partial.resume_item_count()?,
+                    effective_limits: partial.effective_limits(),
+                })
+            })
+            .transpose()
     }
 
     /// Return dimensions of the optional in-memory contextual optimizer.
@@ -1997,6 +2046,7 @@ impl CompiledProgram {
             thompson_edges: graph.edges(),
             serialized_bytes: self.serialized_len()?,
             dfa: self.dfa_stats(),
+            partial_dfa: self.partial_dfa_stats()?,
             context_determinization: self.context_determinization_report().cloned(),
             determinization: self.determinization_report.clone(),
             anchored_prefix: self.anchored_prefix_stats(),
@@ -2181,13 +2231,40 @@ impl CompiledProgram {
         }
     }
 
+    /// Execute through the optimizing compiler's prepared portable entry.
+    ///
+    /// This preserves the ordinary semantic entry's compact call graph while
+    /// selecting a retained partial DFA only when the artifact and its exact
+    /// workspace both carry one and the input can amortize its fixed dispatch.
+    /// Runtime adapters for optimizing AOT artifacts should use this entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation, workspace-identity, and executor errors as
+    /// [`Self::search_with_workspace`].
+    #[inline]
+    pub fn search_optimized_with_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+    ) -> Result<MatchResult, CompileError> {
+        if window.end.saturating_sub(window.start) >= PARTIAL_DFA_MIN_INPUT_BYTES
+            && workspace.has_retained_partial_workspace()
+            && self.partial_dfa().is_some()
+        {
+            self.search_with_retained_partial_workspace(haystack, window, workspace)
+        } else {
+            self.search_with_workspace(haystack, window, workspace)
+        }
+    }
+
     /// Execute the separately prepared retained-row route.
     ///
     /// This is deliberately not selected by [`Self::search_with_workspace`].
-    /// The AOT facade is the sole owner of that policy decision, which keeps
-    /// the ordinary ordered-NFA dispatch and call graph identical to a
-    /// program that has no retained determinization rows.
-    #[cold]
+    /// The separate optimizing entry owns that policy decision, which keeps
+    /// the ordinary ordered-NFA dispatch and call graph identical to a program
+    /// that has no retained determinization rows.
     #[inline(never)]
     pub(crate) fn search_with_retained_partial_workspace(
         &self,
@@ -2213,8 +2290,8 @@ impl CompiledProgram {
             ));
         }
         let partial = self.partial_dfa().ok_or(CompileError::InternalInvariant(
-                "retained partial execution was selected without retained rows",
-            ))?;
+            "retained partial execution was selected without retained rows",
+        ))?;
         self.search_nfa_with_partial_entry(partial, haystack, window, workspace)
     }
 
@@ -2258,9 +2335,9 @@ impl CompiledProgram {
                 "partial-DFA program workspace has no K0 storage",
             ))?;
         let Some(partial_workspace) = workspace.partial.as_deref_mut() else {
-            // A workspace prepared by the structurally identical fast program
-            // remains compatible. Skip optional accelerators and enter the
-            // exact executor directly without sharing the ordinary hot entry.
+            // Keep this defensive path exact without sharing the ordinary hot
+            // entry. Public artifact identity normally prevents a workspace
+            // without the program's serialized partial payload reaching it.
             return self.search_nfa_unaccelerated(haystack, window, nfa);
         };
         if let Some(found) = self.search_nfa_with_partial_dfa(
@@ -2936,6 +3013,11 @@ impl CompiledProgram {
                 "partial-DFA flag requires an ordered-NFA engine",
             ));
         }
+        if exact_product_enabled && program_flags & PROGRAM_FLAG_NFA_PARTIAL_DFA != 0 {
+            return Err(ProgramFormatError::Malformed(
+                "exact-product and partial-DFA flags are mutually exclusive",
+            ));
+        }
         let mut reader = ProgramReader::new(
             bytes
                 .get(PROGRAM_HEADER_LEN..)
@@ -3018,7 +3100,7 @@ impl CompiledProgram {
             EngineKind::OrderedNfa | EngineKind::OrderedContextDfa => None,
             EngineKind::OrderedDfa => Some(EngineSelectionReason::CompleteDfa),
         };
-        let identity = automaton_digest(&raw, line_terminator);
+        let identity: [u8; 32] = Sha256::digest(bytes).into();
         let anchored_prefix = derive_anchored_prefix(&raw);
         let anchored_suffix = derive_anchored_suffix(&raw);
         let required_literals = if engine_kind == EngineKind::OrderedDfa
@@ -4741,6 +4823,12 @@ mod tests {
                 .serialize()
                 .expect("serialize exact-product sidecar");
             assert_eq!(serialized[15], PROGRAM_FLAG_NFA_EXACT_PRODUCT);
+            let mut contradictory = serialized.clone();
+            contradictory[15] |= PROGRAM_FLAG_NFA_PARTIAL_DFA;
+            assert!(CompiledProgram::deserialize(&contradictory).is_err());
+            let mut legacy_v3 = serialized.clone();
+            legacy_v3[8..12].copy_from_slice(&PROGRAM_FORMAT_VERSION_V3.to_le_bytes());
+            assert!(CompiledProgram::deserialize(&legacy_v3).is_ok());
             let restored =
                 CompiledProgram::deserialize(&serialized).expect("restore exact-product sidecar");
             assert!(
@@ -6778,7 +6866,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_resume_with_a_foreign_semantic_workspace_falls_back_exactly() {
+    fn partial_resume_rejects_a_foreign_semantic_workspace() {
         let pattern = r"a+Q|[b-c][a-b]{1,10}(?:x+|y+)";
         let limited = program(
             pattern,
@@ -6818,17 +6906,29 @@ mod tests {
             .expect("reference search");
         let mut foreign_workspace = reference.prepare_workspace().expect("foreign workspace");
         assert!(foreign_workspace.partial.is_none());
+        assert!(matches!(
+            limited.search_with_retained_partial_workspace(
+                haystack,
+                SearchWindow::full(haystack),
+                &mut foreign_workspace,
+            ),
+            Err(CompileError::InternalInvariant(
+                "program workspace belongs to a different semantic program"
+            ))
+        ));
+        assert!(foreign_workspace.partial.is_none());
+
+        let mut own_workspace = limited.prepare_workspace().expect("partial workspace");
         assert_eq!(
             limited
                 .search_with_retained_partial_workspace(
                     haystack,
                     SearchWindow::full(haystack),
-                    &mut foreign_workspace,
+                    &mut own_workspace,
                 )
-                .expect("exact compatibility fallback"),
+                .expect("exact retained execution"),
             expected
         );
-        assert!(foreign_workspace.partial.is_none());
     }
 
     #[test]
@@ -6966,6 +7066,174 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn optimized_partial_workspace_is_bound_to_the_exact_artifact() {
+        let pattern = r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)";
+        let limits = DeterminizeLimits {
+            max_states: 32,
+            ..DeterminizeLimits::default()
+        };
+        let partial = program(
+            pattern,
+            OutputContract::SelectedEnd,
+            CompileMode::Optimizing,
+            limits,
+        );
+        assert!(partial.partial_dfa().is_some());
+        let reference = program(
+            pattern,
+            OutputContract::SelectedEnd,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let sources = [vec![b'a'; PARTIAL_DFA_MIN_INPUT_BYTES + 1], {
+            let mut source = vec![b'x'; PARTIAL_DFA_MIN_INPUT_BYTES];
+            source.extend_from_slice(b"cbbbbx");
+            source
+        }];
+        let mut partial_workspace = partial.prepare_workspace().unwrap();
+        let mut reference_workspace = reference.prepare_workspace().unwrap();
+        let short = b"cbbbbx";
+        assert_eq!(
+            partial
+                .search_optimized_with_workspace(
+                    short,
+                    SearchWindow::full(short),
+                    &mut partial_workspace,
+                )
+                .unwrap(),
+            reference
+                .search_with_workspace(
+                    short,
+                    SearchWindow::full(short),
+                    &mut reference_workspace,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            partial_workspace
+                .partial
+                .as_deref()
+                .expect("retained workspace")
+                .state
+                .resumed,
+            0,
+            "sub-threshold input must stay on the ordinary semantic entry"
+        );
+        for source in &sources {
+            let window = SearchWindow::full(source);
+            assert_eq!(
+                partial
+                    .search_optimized_with_workspace(source, window, &mut partial_workspace)
+                    .unwrap(),
+                reference
+                    .search_with_workspace(source, window, &mut reference_workspace)
+                    .unwrap()
+            );
+        }
+        assert!(
+            partial_workspace
+                .partial
+                .as_deref()
+                .is_some_and(|workspace| workspace.state.resumed > 0),
+            "the optimizing entry never resumed a retained frontier"
+        );
+
+        let resumed_before_clone = partial_workspace
+            .partial
+            .as_deref()
+            .unwrap()
+            .state
+            .resumed;
+        let cloned = partial.clone();
+        let clone_source = &sources[1];
+        assert_eq!(
+            cloned
+                .search_optimized_with_workspace(
+                    clone_source,
+                    SearchWindow::full(clone_source),
+                    &mut partial_workspace,
+                )
+                .unwrap(),
+            reference
+                .search_with_workspace(
+                    clone_source,
+                    SearchWindow::full(clone_source),
+                    &mut reference_workspace,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            partial_workspace.partial.as_deref().unwrap().state.resumed,
+            resumed_before_clone,
+            "an immutable-instance-bound resume hint must deopt across clones"
+        );
+
+        let serialized = partial.serialize().unwrap();
+        let restored = CompiledProgram::deserialize(&serialized).unwrap();
+        let source = &sources[1];
+        assert!(
+            restored
+                .search_optimized_with_workspace(
+                    source,
+                    SearchWindow::full(source),
+                    &mut partial_workspace,
+                )
+                .is_ok(),
+            "the canonical round trip must retain workspace identity"
+        );
+
+        let other_limit = program(
+            pattern,
+            OutputContract::SelectedEnd,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 33,
+                ..DeterminizeLimits::default()
+            },
+        );
+        assert!(other_limit.partial_dfa().is_some());
+        assert!(
+            other_limit
+                .search_optimized_with_workspace(
+                    source,
+                    SearchWindow::full(source),
+                    &mut partial_workspace,
+                )
+                .is_err(),
+            "different retained limits must reject a foreign workspace"
+        );
+
+        let mut fast_workspace = reference.prepare_workspace().unwrap();
+        assert!(
+            partial
+                .search_optimized_with_workspace(
+                    source,
+                    SearchWindow::full(source),
+                    &mut fast_workspace,
+                )
+                .is_err(),
+            "Fast and optimizing artifacts must not share optional state"
+        );
+        let other_output = program(
+            pattern,
+            OutputContract::Exists,
+            CompileMode::Optimizing,
+            limits,
+        );
+        let mut other_output_workspace = other_output.prepare_workspace().unwrap();
+        assert!(
+            partial
+                .search_optimized_with_workspace(
+                    source,
+                    SearchWindow::full(source),
+                    &mut other_output_workspace,
+                )
+                .is_err(),
+            "output contracts must participate in workspace identity"
+        );
     }
 
     #[test]

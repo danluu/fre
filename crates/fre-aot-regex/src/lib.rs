@@ -50,8 +50,8 @@ pub use object::{ObjectFormat, emit_object};
 pub use program::{
     AnchoredPrefixStats, CompiledProgram, ContextDeterminizationReport, EngineKind,
     EngineSelectionReason, MAX_ANCHORED_PREFIX_BYTES, MAX_SERIALIZED_PROGRAM_BYTES, MatchResult,
-    OutputContract, PROGRAM_HEADER_LEN, ProgramFormatError, ProgramStats, ProgramWorkspace,
-    SearchWindow,
+    OutputContract, PROGRAM_HEADER_LEN, PartialDfaStats, ProgramFormatError, ProgramStats,
+    ProgramWorkspace, SearchWindow,
 };
 
 /// Stable compiler pipeline identity.
@@ -265,9 +265,10 @@ impl CompiledRegex {
 
     /// Execute with storage prepared by this AOT compiler result.
     ///
-    /// Retained rows are selected only here, outside the ordinary semantic
-    /// program dispatch. Short windows use the exact ordinary prepared entry
-    /// because retained-row setup has a fixed cost that they cannot amortize.
+    /// Retained rows are selected through the program's separate optimizing
+    /// entry, outside the ordinary semantic dispatch. Short windows use the
+    /// exact ordinary prepared entry because retained-row setup has a fixed
+    /// cost that they cannot amortize.
     ///
     /// # Errors
     ///
@@ -281,19 +282,8 @@ impl CompiledRegex {
         window: SearchWindow,
         workspace: &mut CompiledRegexWorkspace,
     ) -> Result<MatchResult, CompileError> {
-        if window.end().saturating_sub(window.start())
-            >= program::PARTIAL_DFA_MIN_INPUT_BYTES
-            && workspace.program.has_retained_partial_workspace()
-        {
-            self.program.search_with_retained_partial_workspace(
-                haystack,
-                window,
-                &mut workspace.program,
-            )
-        } else {
-            self.program
-                .search_with_workspace(haystack, window, &mut workspace.program)
-        }
+        self.program
+            .search_optimized_with_workspace(haystack, window, &mut workspace.program)
     }
 
     /// Execute the compiler's target-neutral semantic program.
