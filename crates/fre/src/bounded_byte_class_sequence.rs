@@ -18,8 +18,9 @@
 //! The tail is therefore verified once per first-class run instead of once per
 //! member. For one immutable plan this is O(N), with a complete
 //! source-independent bound of `N * (maximum_tail_width + 16)` charged by the
-//! shared byte-class work meter. Small finite languages and fixed products are
-//! deliberately left to their established incumbent plans.
+//! shared byte-class work meter. Fixed products remain with their established
+//! incumbent plans; every structurally eligible variable product is admitted,
+//! including small products that the earlier finite-language plans decline.
 
 use fre_exact_alloc::{CopyError, ExactBoxOrUsize};
 use fre_kernels::{
@@ -707,8 +708,9 @@ mod tests {
     }
 
     #[test]
-    fn selects_only_large_variable_sequences_with_deterministic_boundaries() {
+    fn selects_variable_sequences_with_deterministic_boundaries() {
         for pattern in [
+            "a{1,2}b{1,2}",
             "(?-u:[A-Z]){1,3}(?-u:[a-z]){2,5}(?-u:[0-9]){1,2}",
             "(?-u:[abcd]){1,3}(?-u:[WXYZ]){1,3}",
             "(?-u:[ab]){1,4}(?-u:[cd]){1,4}(?-u:[ab]){1,4}",
@@ -728,7 +730,6 @@ mod tests {
         }
 
         for pattern in [
-            "a{1,2}b{1,2}",
             "(?-u:[abcdefgh]){1,4}(?-u:[hijklmno]){1,4}",
             "(?-u:[abcdefgh]){1,4}?(?-u:[WXYZ]){1,4}",
             "(?-u:[ab])+(?-u:[cd]){1,4}",
@@ -758,10 +759,11 @@ mod tests {
     #[test]
     fn exhaustive_windows_and_iteration_match_the_bytes_oracle() {
         let patterns = [
+            "a{1,2}b{1,2}",
             "(?-u:[abcd]){1,3}(?-u:[WXYZ]){1,3}",
             "(?-u:[ab]){1,4}(?-u:[cd]){1,4}(?-u:[ab]){1,4}",
         ];
-        let alphabet = [b'a', b'd', b'W', b'Z', b'c', b'x'];
+        let alphabet = [b'a', b'b', b'd', b'W', b'Z', b'c', b'x'];
         for pattern in patterns {
             let fre = build(pattern);
             assert_eq!(fre.runtime_implementation_id(), PLAN_ID);
