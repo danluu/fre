@@ -1371,20 +1371,12 @@ fn scan_full_cut(set: ByteSet256, classifier: &ByteSetClassifier, haystack: &[u8
 )]
 enum ProgramEngine {
     OrderedNfa,
-    OrderedNfaWithPartial(Box<PartialDfa>),
     OrderedDfa(OrderedDfa),
 }
 
 impl ProgramEngine {
     const fn is_ordered_nfa(&self) -> bool {
-        matches!(self, Self::OrderedNfa | Self::OrderedNfaWithPartial(_))
-    }
-
-    const fn partial_dfa(&self) -> Option<&PartialDfa> {
-        match self {
-            Self::OrderedNfaWithPartial(partial) => Some(partial),
-            Self::OrderedNfa | Self::OrderedDfa(_) => None,
-        }
+        matches!(self, Self::OrderedNfa)
     }
 }
 
@@ -1465,9 +1457,11 @@ pub struct CompiledProgram {
     /// Optional in-memory assertion optimizer. Stable serialization keeps
     /// the universal ordered-NFA engine and deliberately omits this sidecar.
     context_dfa: Option<ContextDfa>,
-    /// Fresh contextual construction provenance. This is omitted from the
-    /// stable wire format together with `context_dfa`.
-    context_determinization_report: Option<ContextDeterminizationReport>,
+    /// Mutually exclusive, cold optimizing artifacts. Contextual provenance
+    /// and assertion-free retained rows cannot coexist. Combining them keeps
+    /// this field exactly the size and alignment of the former contextual
+    /// provenance option, so ordinary `CompiledProgram` layout is unchanged.
+    optimization_sidecar: ProgramOptimizationSidecar,
     anchored_prefix: AnchoredPrefix,
     anchored_suffix: AnchoredSuffix,
     required_literals: RequiredLiterals,
@@ -1475,6 +1469,49 @@ pub struct CompiledProgram {
     max_match_width: MaxMatchWidthStats,
     nfa_mandatory_suffix: Option<NfaMandatorySuffix>,
     nfa_mandatory_cut: Option<NfaMandatoryCut>,
+}
+
+/// A fresh contextual attempt and an assertion-free partial DFA are mutually
+/// exclusive compiler outcomes. The large contextual report has enough enum
+/// niches to retain the partial owner without growing `CompiledProgram`.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the mutually exclusive sidecar preserves the baseline contextual-report layout"
+)]
+#[derive(Clone, Debug)]
+enum ProgramOptimizationSidecar {
+    None,
+    Context(ContextDeterminizationReport),
+    Partial(Box<PartialDfa>),
+}
+
+const _: () = assert!(
+    core::mem::size_of::<ProgramOptimizationSidecar>()
+        == core::mem::size_of::<Option<ContextDeterminizationReport>>()
+);
+const _: () = assert!(
+    core::mem::align_of::<ProgramOptimizationSidecar>()
+        == core::mem::align_of::<Option<ContextDeterminizationReport>>()
+);
+
+impl ProgramOptimizationSidecar {
+    const fn context_report(&self) -> Option<&ContextDeterminizationReport> {
+        match self {
+            Self::Context(report) => Some(report),
+            Self::None | Self::Partial(_) => None,
+        }
+    }
+
+    fn partial_dfa(&self) -> Option<&PartialDfa> {
+        match self {
+            Self::Partial(partial) => Some(partial),
+            Self::None | Self::Context(_) => None,
+        }
+    }
+
+    const fn has_partial_dfa(&self) -> bool {
+        matches!(self, Self::Partial(_))
+    }
 }
 
 /// Reusable, allocation-free execution storage for one semantic program.
@@ -1487,6 +1524,12 @@ pub struct ProgramWorkspace {
     identity: [u8; 32],
     nfa: Option<K0Workspace>,
     partial: Option<Box<PartialDfaWorkspace>>,
+}
+
+impl ProgramWorkspace {
+    pub(crate) const fn has_retained_partial_workspace(&self) -> bool {
+        self.partial.is_some()
+    }
 }
 
 /// Scratch used only by an ordered-NFA program with retained subset rows.
@@ -1513,6 +1556,11 @@ struct PartialDfaRuntimeState {
     #[cfg(test)]
     resumed: usize,
 }
+
+// Retained rows have a fixed dispatch, workspace, and possible resume cost.
+// Below this general amortization floor, enter the already-prepared ordinary
+// executor directly; larger windows can repay the retained-row setup.
+pub(crate) const PARTIAL_DFA_MIN_INPUT_BYTES: usize = 256;
 
 impl PartialDfaRuntimeState {
     fn new(prefix: &[AnchoredByteSet]) -> Self {
@@ -1723,13 +1771,21 @@ impl CompiledProgram {
                     mode == CompileMode::Optimizing && context_dfa.is_none(),
                 )
             });
-        let engine = match (engine, partial_dfa.filter(|_| nfa_exact_product.is_none())) {
-            (ProgramEngine::OrderedNfa, Some(partial)) => {
-                ProgramEngine::OrderedNfaWithPartial(Box::new(partial))
+        let optimization_sidecar = match (
+            context_determinization_report,
+            partial_dfa.filter(|_| nfa_exact_product.is_none()),
+        ) {
+            (Some(report), None) => ProgramOptimizationSidecar::Context(report),
+            (None, Some(partial)) if matches!(engine, ProgramEngine::OrderedNfa) => {
+                ProgramOptimizationSidecar::Partial(Box::new(partial))
             }
-            (engine, None) => engine,
-            (ProgramEngine::OrderedNfaWithPartial(_), Some(_))
-            | (ProgramEngine::OrderedDfa(_), Some(_)) => {
+            (None, None) => ProgramOptimizationSidecar::None,
+            (Some(_), Some(_)) => {
+                return Err(CompileError::InternalInvariant(
+                    "contextual provenance was paired with a partial DFA",
+                ));
+            }
+            (None, Some(_)) => {
                 return Err(CompileError::InternalInvariant(
                     "partial DFA was paired with a non-fallback engine",
                 ));
@@ -1745,7 +1801,7 @@ impl CompiledProgram {
             engine_selection_reason: Some(engine_selection_reason),
             determinization_report: Some(determinization_report),
             context_dfa,
-            context_determinization_report,
+            optimization_sidecar,
             anchored_prefix,
             anchored_suffix,
             required_literals,
@@ -1773,9 +1829,7 @@ impl CompiledProgram {
             return EngineKind::OrderedContextDfa;
         }
         match self.engine {
-            ProgramEngine::OrderedNfa | ProgramEngine::OrderedNfaWithPartial(_) => {
-                EngineKind::OrderedNfa
-            }
+            ProgramEngine::OrderedNfa => EngineKind::OrderedNfa,
             ProgramEngine::OrderedDfa(_) => EngineKind::OrderedDfa,
         }
     }
@@ -1792,7 +1846,7 @@ impl CompiledProgram {
                 flags |= PROGRAM_FLAG_NFA_MANDATORY_CUT;
             }
         }
-        if matches!(self.engine, ProgramEngine::OrderedNfaWithPartial(_)) {
+        if self.optimization_sidecar.has_partial_dfa() {
             flags |= PROGRAM_FLAG_NFA_PARTIAL_DFA;
         }
         flags
@@ -1813,13 +1867,13 @@ impl CompiledProgram {
     #[must_use]
     pub const fn dfa_stats(&self) -> Option<DfaStats> {
         match &self.engine {
-            ProgramEngine::OrderedNfa | ProgramEngine::OrderedNfaWithPartial(_) => None,
+            ProgramEngine::OrderedNfa => None,
             ProgramEngine::OrderedDfa(machine) => Some(machine.stats()),
         }
     }
 
     fn partial_dfa(&self) -> Option<&PartialDfa> {
-        self.engine.partial_dfa()
+        self.optimization_sidecar.partial_dfa()
     }
 
     /// Return dimensions of the optional in-memory contextual optimizer.
@@ -1842,7 +1896,7 @@ impl CompiledProgram {
     /// reconstructed stable program returns `None`.
     #[must_use]
     pub const fn context_determinization_report(&self) -> Option<&ContextDeterminizationReport> {
-        self.context_determinization_report.as_ref()
+        self.optimization_sidecar.context_report()
     }
 
     #[allow(
@@ -1943,7 +1997,7 @@ impl CompiledProgram {
             thompson_edges: graph.edges(),
             serialized_bytes: self.serialized_len()?,
             dfa: self.dfa_stats(),
-            context_determinization: self.context_determinization_report.clone(),
+            context_determinization: self.context_determinization_report().cloned(),
             determinization: self.determinization_report.clone(),
             anchored_prefix: self.anchored_prefix_stats(),
             max_match_width: self.max_match_width(),
@@ -1953,7 +2007,7 @@ impl CompiledProgram {
     #[allow(dead_code, reason = "structural handoff for native code generation")]
     pub(crate) fn native_dfa_view(&self) -> Option<NativeProgramView<'_>> {
         match &self.engine {
-            ProgramEngine::OrderedNfa | ProgramEngine::OrderedNfaWithPartial(_) => None,
+            ProgramEngine::OrderedNfa => None,
             ProgramEngine::OrderedDfa(machine) => Some(NativeProgramView {
                 output: self.output,
                 raw: &self.raw,
@@ -2093,31 +2147,6 @@ impl CompiledProgram {
                     ))?;
                 Ok(product.search(&self.anchored_prefix, haystack, window, self.output))
             }
-            ProgramEngine::OrderedNfaWithPartial(partial) => {
-                let nfa = workspace
-                    .nfa
-                    .as_mut()
-                    .ok_or(CompileError::InternalInvariant(
-                        "partial-DFA program workspace has no K0 storage",
-                    ))?;
-                let Some(partial_workspace) = workspace.partial.as_deref_mut() else {
-                    // A workspace prepared by the structurally identical fast
-                    // program remains compatible. It simply takes the
-                    // ordinary K0 route selected for that prepared session.
-                    return self.search_nfa(haystack, window, nfa);
-                };
-                if let Some(found) = self.search_nfa_with_partial_dfa(
-                    partial,
-                    haystack,
-                    window,
-                    nfa,
-                    &mut partial_workspace.resume,
-                    &mut partial_workspace.state,
-                )? {
-                    return Ok(found);
-                }
-                self.search_nfa(haystack, window, nfa)
-            }
             ProgramEngine::OrderedDfa(machine) => {
                 match self.output {
                     OutputContract::Exists => Ok(MatchResult::Exists(machine.exists(
@@ -2152,6 +2181,48 @@ impl CompiledProgram {
         }
     }
 
+    /// Execute the separately prepared retained-row route.
+    ///
+    /// This is deliberately not selected by [`Self::search_with_workspace`].
+    /// The AOT facade is the sole owner of that policy decision, which keeps
+    /// the ordinary ordered-NFA dispatch and call graph identical to a
+    /// program that has no retained determinization rows.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn search_with_retained_partial_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+    ) -> Result<MatchResult, CompileError> {
+        if window.start > window.end || window.end > haystack.len() {
+            return Err(CompileError::InvalidWindow {
+                start: window.start,
+                end: window.end,
+                haystack_len: haystack.len(),
+            });
+        }
+        if workspace.identity != self.identity {
+            return Err(CompileError::InternalInvariant(
+                "program workspace belongs to a different semantic program",
+            ));
+        }
+        if self.context_dfa.is_some() || !matches!(self.engine, ProgramEngine::OrderedNfa) {
+            return Err(CompileError::InternalInvariant(
+                "retained partial rows require the universal ordered-NFA engine",
+            ));
+        }
+        let partial = self.partial_dfa().ok_or(CompileError::InternalInvariant(
+                "retained partial execution was selected without retained rows",
+            ))?;
+        self.search_nfa_with_partial_entry(partial, haystack, window, workspace)
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn has_retained_partial_dfa(&self) -> bool {
+        self.optimization_sidecar.has_partial_dfa()
+    }
+
     fn search_nfa(
         &self,
         haystack: &[u8],
@@ -2165,6 +2236,44 @@ impl CompiledProgram {
             return Ok(found);
         }
         self.search_nfa_unaccelerated(haystack, window, workspace)
+    }
+
+    /// Keep retained-row selection and its rare whole-window fallback out of
+    /// the ordinary ordered-NFA call tree. In particular, the partial route
+    /// must not become a second caller of `search_nfa`: doing so changes the
+    /// optimizer's inlining and hot-code placement for every program that has
+    /// no retained rows.
+    #[inline(never)]
+    fn search_nfa_with_partial_entry(
+        &self,
+        partial: &PartialDfa,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+    ) -> Result<MatchResult, CompileError> {
+        let nfa = workspace
+            .nfa
+            .as_mut()
+            .ok_or(CompileError::InternalInvariant(
+                "partial-DFA program workspace has no K0 storage",
+            ))?;
+        let Some(partial_workspace) = workspace.partial.as_deref_mut() else {
+            // A workspace prepared by the structurally identical fast program
+            // remains compatible. Skip optional accelerators and enter the
+            // exact executor directly without sharing the ordinary hot entry.
+            return self.search_nfa_unaccelerated(haystack, window, nfa);
+        };
+        if let Some(found) = self.search_nfa_with_partial_dfa(
+            partial,
+            haystack,
+            window,
+            nfa,
+            &mut partial_workspace.resume,
+            &mut partial_workspace.state,
+        )? {
+            return Ok(found);
+        }
+        self.search_nfa_unaccelerated(haystack, window, nfa)
     }
 
     /// Try the mutually exclusive graph-proved forward sidecar. An exact
@@ -2288,14 +2397,6 @@ impl CompiledProgram {
     ) -> Result<Option<MatchResult>, CompileError> {
         let input_bytes = window.end.saturating_sub(window.start);
         let consumed = resume.position.saturating_sub(window.start);
-        if let Some(found) = self.search_nfa_with_mandatory_suffix(haystack, window, workspace)? {
-            state.observe_fallback(consumed, input_bytes);
-            return Ok(Some(found));
-        }
-        if let Some(found) = self.search_nfa_with_mandatory_cut(haystack, window) {
-            state.observe_fallback(consumed, input_bytes);
-            return Ok(Some(found));
-        }
         if resume_set
             .as_ref()
             .is_none_or(|set| !set.is_bound_to(&self.automaton))
@@ -2665,8 +2766,11 @@ impl CompiledProgram {
     pub fn serialized_len(&self) -> Result<usize, CompileError> {
         let raw = raw_serialized_len(&self.raw)?;
         let dfa = match &self.engine {
-            ProgramEngine::OrderedNfa => 0,
-            ProgramEngine::OrderedNfaWithPartial(partial) => partial.serialized_len()?,
+            ProgramEngine::OrderedNfa => self
+                .partial_dfa()
+                .map(PartialDfa::serialized_len)
+                .transpose()?
+                .unwrap_or(0),
             ProgramEngine::OrderedDfa(machine) => machine.serialized_len()?,
         };
         PROGRAM_HEADER_LEN
@@ -2704,8 +2808,11 @@ impl CompiledProgram {
         );
         serialize_raw(&self.raw, &mut bytes);
         let dfa_len = match &self.engine {
-            ProgramEngine::OrderedNfa => 0,
-            ProgramEngine::OrderedNfaWithPartial(partial) => partial.serialized_len()?,
+            ProgramEngine::OrderedNfa => self
+                .partial_dfa()
+                .map(PartialDfa::serialized_len)
+                .transpose()?
+                .unwrap_or(0),
             ProgramEngine::OrderedDfa(machine) => machine.serialized_len()?,
         };
         put_u64(
@@ -2715,8 +2822,11 @@ impl CompiledProgram {
             })?,
         );
         match &self.engine {
-            ProgramEngine::OrderedNfa => {}
-            ProgramEngine::OrderedNfaWithPartial(partial) => partial.serialize_into(&mut bytes),
+            ProgramEngine::OrderedNfa => {
+                if let Some(partial) = self.partial_dfa() {
+                    partial.serialize_into(&mut bytes);
+                }
+            }
             ProgramEngine::OrderedDfa(machine) => machine.serialize_into(&mut bytes),
         }
         if bytes.len() != expected {
@@ -2961,18 +3071,15 @@ impl CompiledProgram {
                 "exact-product and partial-DFA sidecars are mutually exclusive",
             ));
         }
-        let engine = match (engine, partial_dfa) {
-            (ProgramEngine::OrderedNfa, Some(partial)) => {
-                ProgramEngine::OrderedNfaWithPartial(partial)
-            }
-            (engine, None) => engine,
-            (ProgramEngine::OrderedNfaWithPartial(_), Some(_))
-            | (ProgramEngine::OrderedDfa(_), Some(_)) => {
-                return Err(ProgramFormatError::Malformed(
-                    "partial DFA was paired with a non-fallback engine",
-                ));
-            }
-        };
+        if partial_dfa.is_some() && !matches!(engine, ProgramEngine::OrderedNfa) {
+            return Err(ProgramFormatError::Malformed(
+                "partial DFA was paired with a non-fallback engine",
+            ));
+        }
+        let optimization_sidecar = partial_dfa.map_or(
+            ProgramOptimizationSidecar::None,
+            ProgramOptimizationSidecar::Partial,
+        );
         let program = Self {
             raw,
             automaton,
@@ -2983,7 +3090,7 @@ impl CompiledProgram {
             engine_selection_reason,
             determinization_report: None,
             context_dfa: None,
-            context_determinization_report: None,
+            optimization_sidecar,
             anchored_prefix,
             anchored_suffix,
             required_literals,
@@ -6472,14 +6579,22 @@ mod tests {
                             .unwrap();
                         assert_eq!(
                             partial
-                                .search_with_workspace(haystack, window, &mut partial_workspace)
+                                .search_with_retained_partial_workspace(
+                                    haystack,
+                                    window,
+                                    &mut partial_workspace,
+                                )
                                 .unwrap(),
                             expected,
                             "fresh {output:?} {haystack:?} {start}..{end}"
                         );
                         assert_eq!(
                             restored
-                                .search_with_workspace(haystack, window, &mut restored_workspace)
+                                .search_with_retained_partial_workspace(
+                                    haystack,
+                                    window,
+                                    &mut restored_workspace,
+                                )
                                 .unwrap(),
                             expected,
                             "restored {output:?} {haystack:?} {start}..{end}"
@@ -6499,7 +6614,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_hole_uses_complete_suffix_proof_and_adapts_away_from_redundant_probe() {
+    fn partial_hole_resumes_without_entering_the_ordinary_suffix_tree() {
         let pattern = r"[b-c][a-b]{1,10}z";
         let limited = program(
             pattern,
@@ -6546,20 +6661,24 @@ mod tests {
         for attempt in 0..2 {
             assert_eq!(
                 limited
-                    .search_with_workspace(haystack, SearchWindow::full(haystack), &mut workspace,)
+                    .search_with_retained_partial_workspace(
+                        haystack,
+                        SearchWindow::full(haystack),
+                        &mut workspace,
+                    )
                     .expect("accelerated search"),
                 expected,
                 "attempt {attempt}"
             );
         }
         let state = &workspace.partial.as_deref().unwrap().state;
-        assert_eq!(state.resumed, 0);
-        assert_eq!(state.consecutive_fallbacks, 2);
-        assert!(state.bypass_remaining > 0);
+        assert_eq!(state.resumed, 2);
+        assert_eq!(state.consecutive_fallbacks, 0);
+        assert_eq!(state.bypass_remaining, 0);
     }
 
     #[test]
-    fn partial_hole_uses_complete_mandatory_cut_proof_and_round_trips() {
+    fn partial_hole_resumes_without_entering_the_ordinary_cut_tree() {
         let pattern = r"[b-c][a-b]{1,10}7[A-Za-z]+";
         let limited = program(
             pattern,
@@ -6616,16 +6735,20 @@ mod tests {
         for attempt in 0..2 {
             assert_eq!(
                 limited
-                    .search_with_workspace(haystack, SearchWindow::full(haystack), &mut workspace,)
+                    .search_with_retained_partial_workspace(
+                        haystack,
+                        SearchWindow::full(haystack),
+                        &mut workspace,
+                    )
                     .expect("accelerated search"),
                 expected,
                 "attempt {attempt}"
             );
         }
         let state = &workspace.partial.as_deref().unwrap().state;
-        assert_eq!(state.resumed, 0);
-        assert_eq!(state.consecutive_fallbacks, 2);
-        assert!(state.bypass_remaining > 0);
+        assert_eq!(state.resumed, 2);
+        assert_eq!(state.consecutive_fallbacks, 0);
+        assert_eq!(state.bypass_remaining, 0);
     }
 
     #[test]
@@ -6697,7 +6820,7 @@ mod tests {
         assert!(foreign_workspace.partial.is_none());
         assert_eq!(
             limited
-                .search_with_workspace(
+                .search_with_retained_partial_workspace(
                     haystack,
                     SearchWindow::full(haystack),
                     &mut foreign_workspace,
@@ -6756,7 +6879,11 @@ mod tests {
         let mut workspace = limited.prepare_workspace().expect("workspace");
         assert_eq!(
             limited
-                .search_with_workspace(&haystack, SearchWindow::full(&haystack), &mut workspace,)
+                .search_with_retained_partial_workspace(
+                    &haystack,
+                    SearchWindow::full(&haystack),
+                    &mut workspace,
+                )
                 .expect("resumed search"),
             expected
         );
@@ -6821,7 +6948,7 @@ mod tests {
                                 .unwrap();
                             assert_eq!(
                                 partial
-                                    .search_with_workspace(
+                                    .search_with_retained_partial_workspace(
                                         haystack,
                                         window,
                                         &mut partial_workspace,

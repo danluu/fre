@@ -220,6 +220,16 @@ pub struct CompiledRegex {
     receipt: CompileReceipt,
 }
 
+/// Reusable execution storage prepared by an AOT compiler result.
+///
+/// This wrapper is intentionally distinct from [`ProgramWorkspace`]. It lets
+/// the AOT facade select a retained partial-DFA entry without adding a field
+/// load or branch to [`CompiledProgram::search_with_workspace`].
+#[derive(Debug)]
+pub struct CompiledRegexWorkspace {
+    program: ProgramWorkspace,
+}
+
 impl CompiledRegex {
     #[must_use]
     pub const fn program(&self) -> &CompiledProgram {
@@ -241,6 +251,51 @@ impl CompiledRegex {
         &self.receipt
     }
 
+    /// Allocate reusable execution storage for this compiler result.
+    ///
+    /// # Errors
+    ///
+    /// Returns a portable executor error if the universal NFA workspace
+    /// cannot be prepared.
+    pub fn prepare_workspace(&self) -> Result<CompiledRegexWorkspace, CompileError> {
+        Ok(CompiledRegexWorkspace {
+            program: self.program.prepare_workspace()?,
+        })
+    }
+
+    /// Execute with storage prepared by this AOT compiler result.
+    ///
+    /// Retained rows are selected only here, outside the ordinary semantic
+    /// program dispatch. Short windows use the exact ordinary prepared entry
+    /// because retained-row setup has a fixed cost that they cannot amortize.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed invalid-window error before reading the haystack, a
+    /// portable executor error, or an invariant error if `workspace` belongs
+    /// to a different semantic program.
+    #[inline(never)]
+    pub fn search_with_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut CompiledRegexWorkspace,
+    ) -> Result<MatchResult, CompileError> {
+        if window.end().saturating_sub(window.start())
+            >= program::PARTIAL_DFA_MIN_INPUT_BYTES
+            && workspace.program.has_retained_partial_workspace()
+        {
+            self.program.search_with_retained_partial_workspace(
+                haystack,
+                window,
+                &mut workspace.program,
+            )
+        } else {
+            self.program
+                .search_with_workspace(haystack, window, &mut workspace.program)
+        }
+    }
+
     /// Execute the compiler's target-neutral semantic program.
     ///
     /// This is the differential-testing and portable-adoption boundary. Native
@@ -255,7 +310,8 @@ impl CompiledRegex {
         haystack: &[u8],
         window: SearchWindow,
     ) -> Result<MatchResult, CompileError> {
-        self.program.search(haystack, window)
+        let mut workspace = self.prepare_workspace()?;
+        self.search_with_workspace(haystack, window, &mut workspace)
     }
 }
 

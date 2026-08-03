@@ -3935,11 +3935,329 @@ fn execute_prepared(
     })
 }
 
+// Retained-frontier continuation is a cold, separately selected engine
+// entry. Give it private setup and transition helpers so it cannot turn the
+// ordinary K0 helpers into multi-caller outlining candidates under ThinLTO.
+fn prepare_resume_invocation(
+    automaton: &Automaton,
+    workspace: &mut K0Workspace,
+    window: SearchWindow,
+    limits: SearchLimits,
+    setup: &mut SetupAccounting,
+    may_use_lazy: bool,
+    may_use_reverse: bool,
+) -> Result<(WorkMeter, u64), SearchError> {
+    let required_layout = WorkspaceLayout::for_automaton(automaton)?;
+    if required_layout.states != workspace.layout.states
+        || required_layout.edges != workspace.layout.edges
+        || required_layout.zero_width_edges != workspace.layout.zero_width_edges
+        || required_layout.closure_slots != workspace.layout.closure_slots
+    {
+        return Err(SearchError::WorkspaceLayoutMismatch {
+            required_states: required_layout.states,
+            actual_states: workspace.layout.states,
+            required_edges: required_layout.edges,
+            actual_edges: workspace.layout.edges,
+            required_zero_width_edges: required_layout.zero_width_edges,
+            actual_zero_width_edges: workspace.layout.zero_width_edges,
+        });
+    }
+
+    prepare_bound_invocation(
+        automaton,
+        workspace,
+        window,
+        limits,
+        setup,
+        may_use_lazy,
+        may_use_reverse,
+    )
+}
+
+#[allow(
+    clippy::inline_always,
+    reason = "the private resume clone must not become an outlined second caller"
+)]
+#[inline(always)]
+fn resume_lazy_state_bounds(
+    lazy: &LazyWorkspace,
+    state: u32,
+) -> Result<(usize, usize, bool), SearchError> {
+    let state = usize::try_from(state).map_err(|_| SearchError::InternalInvariant {
+        detail: "lazy DFA state does not fit usize",
+    })?;
+    if state >= lazy.state_len {
+        return Err(SearchError::InternalInvariant {
+            detail: "lazy DFA state is outside the retained cache",
+        });
+    }
+    let offset = *lazy
+        .offsets
+        .get(state)
+        .ok_or(SearchError::InternalInvariant {
+            detail: "lazy DFA state offset is outside metadata",
+        })?;
+    let length = usize::try_from(*lazy.lengths.get(state).ok_or(
+        SearchError::InternalInvariant {
+            detail: "lazy DFA state length is outside metadata",
+        },
+    )?)
+    .map_err(|_| SearchError::InternalInvariant {
+        detail: "lazy DFA state length does not fit usize",
+    })?;
+    let end = offset
+        .checked_add(length)
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "lazy DFA state item end",
+        })?;
+    if end > lazy.item_len || end > lazy.items.len() {
+        return Err(SearchError::InternalInvariant {
+            detail: "lazy DFA state items are outside the retained arena",
+        });
+    }
+    let pending = *lazy
+        .modes
+        .get(state)
+        .ok_or(SearchError::InternalInvariant {
+            detail: "lazy DFA state mode is outside metadata",
+        })?
+        != 0;
+    Ok((offset, length, pending))
+}
+
+const fn resume_lazy_start_action(
+    source_len: usize,
+    final_len: usize,
+    injected_root: bool,
+) -> LazyStartAction {
+    if !injected_root {
+        return LazyStartAction::Propagate;
+    }
+    if source_len == 0 {
+        return if final_len == 0 {
+            LazyStartAction::Drop
+        } else {
+            LazyStartAction::Reset
+        };
+    }
+    if final_len == source_len {
+        LazyStartAction::Propagate
+    } else {
+        LazyStartAction::Drop
+    }
+}
+
+#[allow(
+    clippy::inline_always,
+    clippy::too_many_arguments,
+    reason = "the private resume publication must not alter the ordinary helper call graph"
+)]
+#[inline(always)]
+fn finish_resume_lazy_cached_transition(
+    automaton: &Automaton,
+    state: u32,
+    byte: u8,
+    accepted: bool,
+    pending: bool,
+    start_action: LazyStartAction,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    core_reserve: u64,
+    position: usize,
+) -> Result<LazyTransition, SearchError> {
+    let next_pending = pending || accepted;
+    let encoded = if workspace.lazy.scratch_len == 0 {
+        0
+    } else {
+        match workspace
+            .lazy
+            .intern_speculative(next_pending, meter, core_reserve, position)?
+        {
+            LazyInterned::State(next) => direct_row_encoded_state(next)?,
+            LazyInterned::BudgetDeclined => {
+                workspace.lazy.retain_scratch_as_frontier()?;
+                workspace.lazy.inline_start_action = start_action;
+                return Ok(LazyTransition::Inline {
+                    accepted,
+                    pending: next_pending,
+                });
+            }
+            LazyInterned::CapacityFull => {
+                validate_lazy_capacity_full(
+                    automaton.stats().consuming_states(),
+                    "exact small lazy DFA exhausted its proven capacity",
+                )?;
+                workspace.lazy.saturated = true;
+                workspace.lazy.retain_scratch_as_frontier()?;
+                workspace.lazy.inline_start_action = start_action;
+                return Ok(LazyTransition::Inline {
+                    accepted,
+                    pending: next_pending,
+                });
+            }
+        }
+    };
+    let cell = encoded | if accepted { LAZY_CELL_ACCEPT } else { 0 } | start_action.cell_bits();
+    workspace.lazy.set_cell(state, byte, cell)?;
+    Ok(LazyTransition::Ready(cell))
+}
+
+#[allow(
+    clippy::inline_always,
+    clippy::too_many_arguments,
+    reason = "the private resumed miss must stay isolated from the ordinary helper call graph"
+)]
+#[inline(always)]
+fn build_resume_lazy_cached_transition(
+    automaton: &Automaton,
+    state: u32,
+    byte: u8,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    core_reserve: u64,
+    position: usize,
+) -> Result<LazyTransition, SearchError> {
+    let cached = workspace.lazy.cell(state, byte)?;
+    if cached != LAZY_CELL_UNFILLED {
+        return Ok(LazyTransition::Ready(cached));
+    }
+
+    let (offset, length, pending) = resume_lazy_state_bounds(&workspace.lazy, state)?;
+    begin_lazy_closure(workspace, meter, position)?;
+    let mut accepted = false;
+    'frontier: for ordinal in 0..length {
+        let item = offset
+            .checked_add(ordinal)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "lazy DFA item index",
+            })?;
+        let consuming =
+            *workspace
+                .lazy
+                .items
+                .get(item)
+                .ok_or(SearchError::InternalInvariant {
+                    detail: "lazy DFA item is outside the retained arena",
+                })?;
+        for edge in automaton.state_edges(consuming) {
+            meter.charge(1, position)?;
+            if automaton.byte_starts[edge] <= byte
+                && byte <= automaton.byte_ends[edge]
+                && expand_lazy_root(
+                    automaton,
+                    automaton.edge_targets[edge],
+                    workspace,
+                    meter,
+                    position,
+                )?
+            {
+                accepted = true;
+                break 'frontier;
+            }
+        }
+    }
+    let source_len = workspace.lazy.scratch_len;
+    let mut injected_root = false;
+    if !accepted && !pending {
+        injected_root = true;
+        if expand_lazy_root(automaton, automaton.start, workspace, meter, position)? {
+            return Err(SearchError::InternalInvariant {
+                detail: "nonnullable lazy DFA accepted an injected empty match",
+            });
+        }
+    }
+    let start_action =
+        resume_lazy_start_action(source_len, workspace.lazy.scratch_len, injected_root);
+    finish_resume_lazy_cached_transition(
+        automaton,
+        state,
+        byte,
+        accepted,
+        pending,
+        start_action,
+        workspace,
+        meter,
+        core_reserve,
+        position,
+    )
+}
+
+#[allow(
+    clippy::inline_always,
+    reason = "the private resumed miss must stay isolated from the ordinary helper call graph"
+)]
+#[inline(always)]
+fn build_resume_lazy_inline_transition(
+    automaton: &Automaton,
+    byte: u8,
+    pending: bool,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    position: usize,
+) -> Result<LazyTransition, SearchError> {
+    let length = workspace.lazy.frontier_len;
+    begin_lazy_closure(workspace, meter, position)?;
+    let mut accepted = false;
+    'frontier: for ordinal in 0..length {
+        let consuming =
+            *workspace
+                .lazy
+                .frontier
+                .get(ordinal)
+                .ok_or(SearchError::InternalInvariant {
+                    detail: "lazy DFA inline frontier item is outside its arena",
+                })?;
+        for edge in automaton.state_edges(consuming) {
+            meter.charge(1, position)?;
+            if automaton.byte_starts[edge] <= byte
+                && byte <= automaton.byte_ends[edge]
+                && expand_lazy_root(
+                    automaton,
+                    automaton.edge_targets[edge],
+                    workspace,
+                    meter,
+                    position,
+                )?
+            {
+                accepted = true;
+                break 'frontier;
+            }
+        }
+    }
+    let source_len = workspace.lazy.scratch_len;
+    let mut injected_root = false;
+    if !accepted && !pending {
+        injected_root = true;
+        if expand_lazy_root(automaton, automaton.start, workspace, meter, position)? {
+            return Err(SearchError::InternalInvariant {
+                detail: "nonnullable inline lazy DFA accepted an injected empty match",
+            });
+        }
+    }
+    let start_action =
+        resume_lazy_start_action(source_len, workspace.lazy.scratch_len, injected_root);
+    let next_pending = pending || accepted;
+    if workspace.lazy.scratch_len == 0 {
+        workspace.lazy.frontier_len = 0;
+        let accepted_bit = if accepted { LAZY_CELL_ACCEPT } else { 0 };
+        return Ok(LazyTransition::Ready(
+            accepted_bit | start_action.cell_bits(),
+        ));
+    }
+    workspace.lazy.retain_scratch_as_frontier()?;
+    workspace.lazy.inline_start_action = start_action;
+    Ok(LazyTransition::Inline {
+        accepted,
+        pending: next_pending,
+    })
+}
+
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
     reason = "the resume transaction keeps forward commitment, optional reverse recovery, and accounting adjacent"
 )]
+#[inline(never)]
 fn execute_from_resume(
     automaton: &Automaton,
     haystack: &[u8],
@@ -3962,7 +4280,7 @@ fn execute_from_resume(
     }
 
     let mut setup = SetupAccounting::empty(workspace.retained_bytes, true);
-    let (mut meter, setup_work) = prepare_invocation(
+    let (mut meter, setup_work) = prepare_resume_invocation(
         automaton,
         workspace,
         window,
@@ -4053,7 +4371,7 @@ fn execute_from_resume(
                     position: end,
                 });
             }
-            let (start, reverse_boundaries) = execute_reverse_lazy_loop(
+            let (start, reverse_boundaries) = execute_resume_reverse_lazy_loop(
                 automaton,
                 haystack,
                 window.start(),
@@ -4097,6 +4415,7 @@ fn execute_from_resume(
     clippy::too_many_lines,
     reason = "the seed publication checks both external and workspace state identities"
 )]
+#[inline(never)]
 fn seed_lazy_resume_state(
     automaton: &Automaton,
     workspace: &mut K0Workspace,
@@ -4161,7 +4480,7 @@ fn seed_lazy_resume_state(
         })?;
         meter.charge(comparison_work, position)?;
         let (cached_offset, cached_length, cached_pending) =
-            workspace.lazy.state_bounds(cached_hint)?;
+            resume_lazy_state_bounds(&workspace.lazy, cached_hint)?;
         let cached_end = cached_offset.checked_add(cached_length).ok_or(
             SearchError::ArithmeticOverflow {
                 computation: "resume cached-state item end",
@@ -4220,6 +4539,7 @@ fn seed_lazy_resume_state(
     clippy::too_many_arguments,
     reason = "the exact resume loop keeps its committed endpoint and frontier together"
 )]
+#[inline(never)]
 fn execute_lazy_resume_loop(
     automaton: &Automaton,
     haystack: &[u8],
@@ -4260,7 +4580,7 @@ fn execute_lazy_resume_loop(
             LazyState::Cached(cached) => {
                 let cell = workspace.lazy.direct_cell(cached, byte)?;
                 if cell == LAZY_CELL_UNFILLED {
-                    build_lazy_cached_transition(
+                    build_resume_lazy_cached_transition(
                         automaton,
                         direct_row_state(cached),
                         byte,
@@ -4274,7 +4594,9 @@ fn execute_lazy_resume_loop(
                 }
             }
             LazyState::Inline { pending } => {
-                build_lazy_inline_transition(automaton, byte, pending, workspace, meter, position)?
+                build_resume_lazy_inline_transition(
+                    automaton, byte, pending, workspace, meter, position,
+                )?
             }
         };
         position = position
@@ -6115,6 +6437,198 @@ fn execute_reverse_lazy_loop(
         state = next;
     }
     Ok((candidate, boundaries))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the retained-resume copy preserves the ordinary reverse loop's single-caller codegen"
+)]
+fn execute_resume_reverse_lazy_loop(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window_start: usize,
+    selected_end: usize,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    core_reserve: u64,
+) -> Result<(Option<usize>, usize), SearchError> {
+    if !workspace.reverse.initialized {
+        return Err(SearchError::InternalInvariant {
+            detail: "reverse DFA executed without an initialized state",
+        });
+    }
+    let initial = workspace.reverse.initial;
+    if initial == LAZY_NO_STATE {
+        return Err(SearchError::InternalInvariant {
+            detail: "initialized reverse DFA has no initial state",
+        });
+    }
+    let mut state = ReverseState::Cached(direct_row_offset(initial)?);
+    let mut cursor = selected_end;
+    let mut candidate = None;
+    // The Accept-seeded state is the reverse automaton's selected-end
+    // boundary; every consumed byte adds one earlier boundary.
+    let mut boundaries = 1usize;
+    while cursor > window_start {
+        let source = cursor
+            .checked_sub(1)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "reverse DFA cursor underflowed",
+            })?;
+        meter.charge(1, source)?;
+        let byte = *haystack.get(source).ok_or(SearchError::InternalInvariant {
+            detail: "reverse DFA source position exceeded the validated window",
+        })?;
+        let transition = match state {
+            ReverseState::Cached(cached) => {
+                let cell = workspace.reverse.direct_cell(cached, byte)?;
+                if cell == LAZY_CELL_UNFILLED {
+                    build_resume_reverse_cached_transition(
+                        automaton,
+                        direct_row_state(cached),
+                        byte,
+                        workspace,
+                        meter,
+                        core_reserve,
+                        source,
+                    )?
+                } else {
+                    ReverseTransition::Ready(cell)
+                }
+            }
+            ReverseState::Inline => {
+                build_resume_reverse_inline_transition(automaton, byte, workspace, meter, source)?
+            }
+        };
+        cursor = source;
+        boundaries = boundaries
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "reverse DFA examined boundary count",
+            })?;
+        let (reaches_start, next) = match transition {
+            ReverseTransition::Ready(cell) => {
+                let encoded = cell & LAZY_CELL_STATE_MASK;
+                (
+                    cell & LAZY_CELL_ACCEPT != 0,
+                    if encoded == 0 {
+                        None
+                    } else {
+                        Some(ReverseState::Cached(encoded.checked_sub(1).ok_or(
+                            SearchError::InternalInvariant {
+                                detail: "reverse DFA encoded state underflowed",
+                            },
+                        )?))
+                    },
+                )
+            }
+            ReverseTransition::Inline { reaches_start } => {
+                (reaches_start, Some(ReverseState::Inline))
+            }
+        };
+        if reaches_start {
+            candidate = Some(cursor);
+        }
+        let Some(next) = next else {
+            break;
+        };
+        state = next;
+    }
+    Ok((candidate, boundaries))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the retained-resume copy preserves the ordinary reverse builder's single-caller codegen"
+)]
+fn build_resume_reverse_cached_transition(
+    automaton: &Automaton,
+    state: u32,
+    byte: u8,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    core_reserve: u64,
+    position: usize,
+) -> Result<ReverseTransition, SearchError> {
+    let cached = workspace.reverse.cell(state, byte)?;
+    if cached != LAZY_CELL_UNFILLED {
+        return Ok(ReverseTransition::Ready(cached));
+    }
+    let (_, length) = workspace.reverse.state_bounds(state)?;
+    begin_reverse_closure(workspace, meter, position)?;
+    let mut reaches_start = false;
+    for ordinal in 0..length {
+        let incoming = usize::try_from(workspace.reverse.item(state, ordinal)?).map_err(|_| {
+            SearchError::InternalInvariant {
+                detail: "reverse DFA incoming item does not fit usize",
+            }
+        })?;
+        meter.charge(1, position)?;
+        let start = workspace.reverse.incoming_starts[incoming];
+        let end = workspace.reverse.incoming_ends[incoming];
+        if start <= byte && byte <= end {
+            reaches_start |= expand_reverse_root(
+                automaton,
+                workspace.reverse.incoming_sources[incoming],
+                workspace,
+                meter,
+                position,
+            )?;
+        }
+    }
+    collect_reverse_frontier(automaton, workspace, meter, position)?;
+    finish_reverse_cached_transition(
+        automaton,
+        state,
+        byte,
+        reaches_start,
+        workspace,
+        meter,
+        core_reserve,
+        position,
+    )
+}
+
+fn build_resume_reverse_inline_transition(
+    automaton: &Automaton,
+    byte: u8,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    position: usize,
+) -> Result<ReverseTransition, SearchError> {
+    let length = workspace.reverse.frontier_len;
+    begin_reverse_closure(workspace, meter, position)?;
+    let mut reaches_start = false;
+    for ordinal in 0..length {
+        let incoming = usize::try_from(workspace.reverse.frontier[ordinal]).map_err(|_| {
+            SearchError::InternalInvariant {
+                detail: "reverse DFA inline item does not fit usize",
+            }
+        })?;
+        meter.charge(1, position)?;
+        let start = workspace.reverse.incoming_starts[incoming];
+        let end = workspace.reverse.incoming_ends[incoming];
+        if start <= byte && byte <= end {
+            reaches_start |= expand_reverse_root(
+                automaton,
+                workspace.reverse.incoming_sources[incoming],
+                workspace,
+                meter,
+                position,
+            )?;
+        }
+    }
+    collect_reverse_frontier(automaton, workspace, meter, position)?;
+    if workspace.reverse.scratch_len == 0 {
+        workspace.reverse.frontier_len = 0;
+        return Ok(ReverseTransition::Ready(if reaches_start {
+            LAZY_CELL_ACCEPT
+        } else {
+            0
+        }));
+    }
+    workspace.reverse.retain_scratch_as_frontier()?;
+    Ok(ReverseTransition::Inline { reaches_start })
 }
 
 fn execute_context_reverse_lazy_loop(

@@ -269,6 +269,38 @@ fn determinization_limit_changes_engine_not_compiler_eligibility() {
 }
 
 #[test]
+fn compiled_regex_facade_executes_retained_rows_on_amortized_windows() {
+    let mut limits = CompileLimitsV1::default();
+    limits.determinize.max_states = 32;
+    let compiled = compile(
+        CompileRequest::new(r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)", Target::aarch64_macos())
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::SelectedEnd)
+            .limits(limits),
+    )
+    .unwrap();
+    assert_eq!(compiled.receipt().engine, EngineKind::OrderedNfa);
+    assert_eq!(
+        compiled.receipt().engine_selection_reason,
+        EngineSelectionReason::DeterminizationResourceLimit
+    );
+    assert!(compiled.program().has_retained_partial_dfa());
+
+    let mut haystack = vec![b'x'; 300];
+    haystack.extend_from_slice(b"cbbbbx");
+    let window = SearchWindow::full(&haystack);
+    let expected = MatchResult::SelectedEnd(Some(haystack.len()));
+    let mut workspace = compiled.prepare_workspace().unwrap();
+    assert_eq!(
+        compiled
+            .search_with_workspace(&haystack, window, &mut workspace)
+            .unwrap(),
+        expected
+    );
+    assert_eq!(compiled.search(&haystack, window).unwrap(), expected);
+}
+
+#[test]
 fn stable_dfa_work_ceiling_and_effective_limits_are_explicit() {
     assert_eq!(
         crate::DeterminizeLimits::unlimited().max_work,
