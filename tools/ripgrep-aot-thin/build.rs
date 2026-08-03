@@ -38,8 +38,9 @@ fn main() {
         );
     }
     let mut generated = String::from(
-        "use super::{AbiResult, AotMode, AotOutput, BackendFactory, CompiledSpec};\n\n#[allow(unsafe_code, reason = \"generated declarations for audited FRE AOT object entries\")]\nunsafe extern \"C\" {\n",
+        "use super::{AbiResult, AotMode, AotOutput, BackendFactory, CompiledSpec, NativeFillOutcome, NativeIterState, fill_native_spans};\n\n#[allow(unsafe_code, reason = \"generated declarations for audited FRE AOT object entries\")]\nunsafe extern \"C\" {\n",
     );
+    let mut native_fills = String::new();
     let mut rows = String::new();
     let mut objects = Vec::new();
 
@@ -99,7 +100,18 @@ fn main() {
                         compiled.module().entry_symbol(),
                     )
                     .expect("String writes cannot fail");
-                    format!("BackendFactory::Native({declaration})")
+                    let fill = if output == OutputContract::Span {
+                        let fill = format!("fill_{stem}");
+                        writeln!(
+                            &mut native_fills,
+                            "#[allow(unsafe_code, reason = \"generated shim calls its exact compiler-produced AOT entry\")]\nfn {fill}(haystack: &[u8], state: &mut NativeIterState, output: &mut [core::mem::MaybeUninit<AbiResult>]) -> NativeFillOutcome {{\n    // SAFETY: this closure invokes the exact compiler-produced Span entry; status 1 initializes result and no argument is retained.\n    unsafe {{\n        fill_native_spans(haystack, state, output, |haystack, start, result| {{\n            {declaration}(haystack.as_ptr(), haystack.len(), start, haystack.len(), result)\n        }})\n    }}\n}}\n"
+                        )
+                        .expect("String writes cannot fail");
+                        format!("Some({fill})")
+                    } else {
+                        "None".to_owned()
+                    };
+                    format!("BackendFactory::Native {{ search: {declaration}, fill: {fill} }}")
                 } else {
                     let program = out_dir.join(format!("{stem}.program"));
                     let bytes = compiled
@@ -124,7 +136,9 @@ fn main() {
             }
         }
     }
-    generated.push_str("}\n\npub(super) const SPECS: &[CompiledSpec] = &[\n");
+    generated.push_str("}\n\n");
+    generated.push_str(&native_fills);
+    generated.push_str("\npub(super) const SPECS: &[CompiledSpec] = &[\n");
     generated.push_str(&rows);
     generated.push_str("];\n");
     fs::write(out_dir.join("registry.rs"), generated).expect("write generated registry");

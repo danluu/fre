@@ -303,25 +303,13 @@ fn run_aot(
         }
         ScanMode::WholeFile => {
             let (stats, timing) = scan_whole_files(args, corpus, |haystack, stats| {
-                let mut start = 0;
-                loop {
-                    let Some((match_start, match_end)) = matcher
-                        .find_at(haystack, start)
-                        .map_err(|error| format!("FRE_AOT_UNSUPPORTED search: {error}"))?
-                    else {
-                        break;
-                    };
-                    stats.record_match(match_start, match_end)?;
-                    if match_start == match_end {
-                        if match_end == haystack.len() {
-                            break;
-                        }
-                        start = match_end
-                            .checked_add(1)
-                            .ok_or_else(|| "empty-match progress overflow".to_owned())?;
-                    } else {
-                        start = match_end;
-                    }
+                let matches = matcher
+                    .find_iter(haystack)
+                    .map_err(|error| format!("FRE_AOT_UNSUPPORTED search: {error}"))?;
+                for matched in matches {
+                    let matched =
+                        matched.map_err(|error| format!("FRE_AOT_UNSUPPORTED search: {error}"))?;
+                    stats.record_match(matched.start(), matched.end())?;
                 }
                 Ok(())
             })?;

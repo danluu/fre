@@ -42,8 +42,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 
 use fre_aot_regex::{
-    CompileError, CompiledProgram, MatchResult, PROGRAM_HEADER_LEN, ProgramFormatError,
-    ProgramWorkspace, SearchWindow,
+    CompileError, CompiledProgram, MatchResult, OutputContract, PROGRAM_HEADER_LEN,
+    ProgramFormatError, ProgramWorkspace, SearchWindow,
 };
 
 /// No match was selected.
@@ -74,6 +74,171 @@ pub const C_API_V1_HEADER: &str = include_str!("../include/fre_aot_regex_runtime
 pub struct FreAotRegexResultV1 {
     pub start: usize,
     pub end: usize,
+}
+
+/// One selected half-open byte match borrowing its original haystack.
+///
+/// Offsets and [`Self::as_bytes`] always refer to the complete haystack used to
+/// construct the match, whether through [`Self::from_span`],
+/// [`PreparedAotRegex::find`], [`PreparedAotRegex::find_at`], or
+/// [`PreparedAotRegex::find_iter`].
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub struct AotMatch<'h> {
+    haystack: &'h [u8],
+    start: usize,
+    end: usize,
+}
+
+impl<'h> AotMatch<'h> {
+    /// Construct a borrowed match after checking its half-open span.
+    ///
+    /// Returns `None` unless `start <= end <= haystack.len()`.
+    #[must_use]
+    pub const fn from_span(haystack: &'h [u8], start: usize, end: usize) -> Option<Self> {
+        if start <= end && end <= haystack.len() {
+            Some(Self {
+                haystack,
+                start,
+                end,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Start byte offset in the original haystack.
+    #[must_use]
+    pub const fn start(&self) -> usize {
+        self.start
+    }
+
+    /// Exclusive end byte offset in the original haystack.
+    #[must_use]
+    pub const fn end(&self) -> usize {
+        self.end
+    }
+
+    /// Length of this match in bytes.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.end.saturating_sub(self.start)
+    }
+
+    /// Whether this match contains no bytes.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.start == self.end
+    }
+
+    /// Half-open byte range in the original haystack.
+    #[must_use]
+    pub const fn range(&self) -> std::ops::Range<usize> {
+        self.start..self.end
+    }
+
+    /// Bytes selected from the original haystack.
+    #[must_use]
+    pub fn as_bytes(&self) -> &'h [u8] {
+        &self.haystack[self.start..self.end]
+    }
+}
+
+impl std::fmt::Debug for AotMatch<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AotMatch")
+            .field("start", &self.start())
+            .field("end", &self.end())
+            .field("bytes", &DebugMatchBytes(self.as_bytes()))
+            .finish()
+    }
+}
+
+struct DebugMatchBytes<'a>(&'a [u8]);
+
+impl std::fmt::Debug for DebugMatchBytes<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("\"")?;
+        let mut bytes = self.0;
+        while !bytes.is_empty() {
+            match std::str::from_utf8(bytes) {
+                Ok(valid) => {
+                    write_debug_match_str(formatter, valid)?;
+                    bytes = &[];
+                }
+                Err(error) => {
+                    let valid_up_to = error.valid_up_to();
+                    let valid = std::str::from_utf8(&bytes[..valid_up_to])
+                        .expect("UTF-8 error's valid prefix must decode");
+                    write_debug_match_str(formatter, valid)?;
+                    write!(formatter, r"\x{:02x}", bytes[valid_up_to])?;
+                    bytes = &bytes[valid_up_to.saturating_add(1)..];
+                }
+            }
+        }
+        formatter.write_str("\"")
+    }
+}
+
+fn write_debug_match_str(formatter: &mut std::fmt::Formatter<'_>, valid: &str) -> std::fmt::Result {
+    for character in valid.chars() {
+        match character {
+            '\0' => formatter.write_str("\\0")?,
+            '\u{1}'..='\u{8}' | '\u{b}' | '\u{c}' | '\u{e}'..='\u{19}' | '\u{7f}' => {
+                write!(formatter, "\\x{:02x}", u32::from(character))?;
+            }
+            _ => write!(formatter, "{}", character.escape_debug())?,
+        }
+    }
+    Ok(())
+}
+
+impl<'h> From<AotMatch<'h>> for &'h [u8] {
+    fn from(matched: AotMatch<'h>) -> Self {
+        matched.as_bytes()
+    }
+}
+
+impl From<AotMatch<'_>> for std::ops::Range<usize> {
+    fn from(matched: AotMatch<'_>) -> Self {
+        matched.range()
+    }
+}
+
+/// Failure while using a prepared artifact as a span finder.
+#[derive(Debug)]
+pub enum AotRegexFindError {
+    /// The artifact was compiled for a result other than [`OutputContract::Span`].
+    OutputContract { actual: OutputContract },
+    /// The reusable semantic program rejected or failed a search.
+    Search(CompileError),
+}
+
+impl std::fmt::Display for AotRegexFindError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OutputContract { actual } => write!(
+                formatter,
+                "prepared AOT find requires Span output, artifact uses {actual:?}"
+            ),
+            Self::Search(error) => write!(formatter, "prepared AOT find failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for AotRegexFindError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::OutputContract { .. } => None,
+            Self::Search(error) => Some(error),
+        }
+    }
+}
+
+impl From<CompileError> for AotRegexFindError {
+    fn from(value: CompileError) -> Self {
+        Self::Search(value)
+    }
 }
 
 /// Process-local opaque identifier for owned prepared runtime state.
@@ -168,7 +333,171 @@ impl PreparedAotRegex {
         self.program
             .search_with_workspace(haystack, window, &mut self.workspace)
     }
+
+    /// Find the first selected span in `haystack`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an output-contract error unless this artifact was compiled for
+    /// [`OutputContract::Span`], or a search error if execution fails.
+    pub fn find<'h>(
+        &mut self,
+        haystack: &'h [u8],
+    ) -> Result<Option<AotMatch<'h>>, AotRegexFindError> {
+        self.find_at(haystack, 0)
+    }
+
+    /// Find the first selected span at or after `start` in the original
+    /// `haystack`.
+    ///
+    /// Passing the complete haystack preserves absolute and contextual
+    /// assertions while only the search window advances.
+    ///
+    /// # Errors
+    ///
+    /// Returns an output-contract error unless this artifact was compiled for
+    /// [`OutputContract::Span`]. An out-of-bounds `start` and executor failures
+    /// are returned as [`AotRegexFindError::Search`].
+    pub fn find_at<'h>(
+        &mut self,
+        haystack: &'h [u8],
+        start: usize,
+    ) -> Result<Option<AotMatch<'h>>, AotRegexFindError> {
+        self.require_span_output()?;
+        self.find_span_at(haystack, start)
+    }
+
+    /// Iterate over non-overlapping byte matches in the original haystack.
+    ///
+    /// Empty matches use byte-wise progress and an empty match at the previous
+    /// match end is suppressed, matching `regex::bytes::Regex::find_iter`.
+    /// The iterator exclusively borrows this prepared matcher so its reusable
+    /// workspace remains attached for the complete iteration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an output-contract error unless this artifact was compiled for
+    /// [`OutputContract::Span`]. Execution failures are yielded by the
+    /// iterator, which becomes fused after its first failure.
+    pub fn find_iter<'p, 'h>(
+        &'p mut self,
+        haystack: &'h [u8],
+    ) -> Result<PreparedAotMatches<'p, 'h>, AotRegexFindError> {
+        self.require_span_output()?;
+        Ok(PreparedAotMatches {
+            prepared: self,
+            haystack,
+            start: 0,
+            last_match_end: None,
+            pending_empty_progress: false,
+            finished: false,
+        })
+    }
+
+    fn require_span_output(&self) -> Result<(), AotRegexFindError> {
+        let actual = self.program.output_contract();
+        if actual == OutputContract::Span {
+            Ok(())
+        } else {
+            Err(AotRegexFindError::OutputContract { actual })
+        }
+    }
+
+    fn find_span_at<'h>(
+        &mut self,
+        haystack: &'h [u8],
+        start: usize,
+    ) -> Result<Option<AotMatch<'h>>, AotRegexFindError> {
+        let result = self
+            .search(haystack, SearchWindow::new(start, haystack.len()))
+            .map_err(AotRegexFindError::Search)?;
+        let MatchResult::Span(span) = result else {
+            return Err(AotRegexFindError::OutputContract {
+                actual: self.program.output_contract(),
+            });
+        };
+        span.map(|(match_start, match_end)| {
+            if match_start < start {
+                return Err(AotRegexFindError::Search(CompileError::InternalInvariant(
+                    "span program returned a match before its search start",
+                )));
+            }
+            AotMatch::from_span(haystack, match_start, match_end).ok_or(AotRegexFindError::Search(
+                CompileError::InternalInvariant(
+                    "span program returned a match outside its haystack",
+                ),
+            ))
+        })
+        .transpose()
+    }
 }
+
+/// Fallible iterator over non-overlapping matches from a prepared AOT Span
+/// artifact.
+#[derive(Debug)]
+pub struct PreparedAotMatches<'p, 'h> {
+    prepared: &'p mut PreparedAotRegex,
+    haystack: &'h [u8],
+    start: usize,
+    last_match_end: Option<usize>,
+    pending_empty_progress: bool,
+    finished: bool,
+}
+
+impl PreparedAotMatches<'_, '_> {
+    fn fail<'h>(&mut self, error: AotRegexFindError) -> Result<AotMatch<'h>, AotRegexFindError> {
+        self.finished = true;
+        Err(error)
+    }
+
+    fn advance_past_repeated_empty(&mut self) -> bool {
+        if self.start == self.haystack.len() {
+            self.finished = true;
+            return false;
+        }
+        self.start = self.start.saturating_add(1);
+        true
+    }
+}
+
+impl<'h> Iterator for PreparedAotMatches<'_, 'h> {
+    type Item = Result<AotMatch<'h>, AotRegexFindError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while !self.finished {
+            if self.pending_empty_progress {
+                self.pending_empty_progress = false;
+                if !self.advance_past_repeated_empty() {
+                    return None;
+                }
+            }
+
+            let matched = match self.prepared.find_span_at(self.haystack, self.start) {
+                Ok(Some(matched)) => matched,
+                Ok(None) => {
+                    self.finished = true;
+                    return None;
+                }
+                Err(error) => return Some(self.fail(error)),
+            };
+
+            if matched.is_empty() && self.last_match_end == Some(matched.end()) {
+                if !self.advance_past_repeated_empty() {
+                    return None;
+                }
+                continue;
+            }
+
+            self.start = matched.end();
+            self.last_match_end = Some(matched.end());
+            self.pending_empty_progress = matched.is_empty();
+            return Some(Ok(matched));
+        }
+        None
+    }
+}
+
+impl std::iter::FusedIterator for PreparedAotMatches<'_, '_> {}
 
 struct PreparedHandleState {
     prepared: Mutex<Option<PreparedAotRegex>>,
@@ -782,6 +1111,28 @@ mod tests {
         compiled.program().serialize().expect("serialize program")
     }
 
+    fn prepared(pattern: &str, output: OutputContract, mode: CompileMode) -> PreparedAotRegex {
+        let compiled = compile(
+            CompileRequest::new(pattern, Target::x86_64_linux())
+                .mode(mode)
+                .output(output),
+        )
+        .unwrap_or_else(|error| panic!("compile {mode:?} {pattern:?}: {error}"));
+        let bytes = compiled.program().serialize().expect("serialize program");
+        PreparedAotRegex::deserialize(&bytes).expect("prepare program")
+    }
+
+    fn collected_spans(prepared: &mut PreparedAotRegex, haystack: &[u8]) -> Vec<(usize, usize)> {
+        prepared
+            .find_iter(haystack)
+            .expect("Span iterator")
+            .map(|matched| {
+                let matched = matched.expect("successful iterator search");
+                (matched.start(), matched.end())
+            })
+            .collect()
+    }
+
     fn call(
         program: &[u8],
         haystack: &[u8],
@@ -1144,6 +1495,158 @@ mod tests {
                 MatchResult::Span(expected)
             );
         }
+    }
+
+    #[test]
+    fn borrowed_aot_match_checks_and_exposes_its_original_bytes() {
+        let haystack = b"xabz";
+        let matched = AotMatch::from_span(haystack, 1, 3).expect("valid span");
+        assert_eq!(matched.start(), 1);
+        assert_eq!(matched.end(), 3);
+        assert_eq!(matched.len(), 2);
+        assert!(!matched.is_empty());
+        assert_eq!(matched.range(), 1..3);
+        assert_eq!(matched.as_bytes(), b"ab");
+        assert_eq!(
+            format!("{matched:?}"),
+            r#"AotMatch { start: 1, end: 3, bytes: "ab" }"#
+        );
+        let matched_bytes: &[u8] = matched.into();
+        let matched_range: std::ops::Range<usize> = matched.into();
+        assert_eq!(matched_bytes, b"ab");
+        assert_eq!(matched_range, 1..3);
+
+        let empty = AotMatch::from_span(haystack, 4, 4).expect("empty EOF span");
+        assert!(empty.is_empty());
+        assert_eq!(empty.len(), 0);
+        assert_eq!(empty.as_bytes(), b"");
+        assert!(AotMatch::from_span(haystack, 3, 2).is_none());
+        assert!(AotMatch::from_span(haystack, 0, 5).is_none());
+
+        let invalid_utf8 = [0xff];
+        let invalid = AotMatch::from_span(&invalid_utf8, 0, 1).expect("valid byte span");
+        assert!(format!("{invalid:?}").contains(r#"bytes: "\xff""#));
+    }
+
+    #[test]
+    fn prepared_find_and_find_at_return_borrowed_spans() {
+        for mode in [CompileMode::Fast, CompileMode::Optimizing] {
+            let mut prepared = prepared("ab+", OutputContract::Span, mode);
+            let haystack = b"xxabbb ab";
+            let first = prepared.find(haystack).expect("find").expect("first match");
+            assert_eq!(first.range(), 2..6);
+            assert_eq!(first.as_bytes(), b"abbb");
+
+            let second = prepared
+                .find_at(haystack, first.end())
+                .expect("find_at")
+                .expect("second match");
+            assert_eq!(second.range(), 7..9);
+            assert_eq!(second.as_bytes(), b"ab");
+            assert_eq!(
+                prepared.find_at(haystack, second.end()).expect("EOF find"),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_find_iter_matches_rust_byte_empty_progress_semantics() {
+        let cases: Vec<(&str, &[u8], Vec<(usize, usize)>)> = vec![
+            ("", b"", vec![(0, 0)]),
+            ("", &[0xC3, 0xA9], vec![(0, 0), (1, 1), (2, 2)]),
+            ("", &[0xFF, b'a'], vec![(0, 0), (1, 1), (2, 2)]),
+            ("a|", b"a", vec![(0, 1)]),
+            ("a?", b"ba", vec![(0, 0), (1, 2)]),
+            ("(?:ab|)", b"ab", vec![(0, 2)]),
+            ("(?:ab|)", b"xab", vec![(0, 0), (1, 3)]),
+        ];
+        for mode in [CompileMode::Fast, CompileMode::Optimizing] {
+            for (pattern, haystack, expected) in &cases {
+                let mut prepared = prepared(pattern, OutputContract::Span, mode);
+                assert_eq!(
+                    collected_spans(&mut prepared, haystack),
+                    *expected,
+                    "mode={mode:?}, pattern={pattern:?}, haystack={haystack:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_iteration_retains_original_assertion_context() {
+        for mode in [CompileMode::Fast, CompileMode::Optimizing] {
+            let mut absolute = prepared("^a", OutputContract::Span, mode);
+            assert_eq!(absolute.find_at(b"xa", 1).expect("absolute find"), None);
+
+            let mut boundary = prepared(r"\ba", OutputContract::Span, mode);
+            assert_eq!(boundary.find_at(b"xa", 1).expect("boundary find"), None);
+            assert_eq!(
+                boundary
+                    .find_at(b"x a", 1)
+                    .expect("contextual find")
+                    .expect("match")
+                    .range(),
+                2..3
+            );
+
+            let mut multiline = prepared(r"(?m:^a)", OutputContract::Span, mode);
+            assert_eq!(collected_spans(&mut multiline, b"x\na\nxa"), vec![(2, 3)]);
+        }
+    }
+
+    #[test]
+    fn prepared_find_reports_output_contract_and_invalid_start() {
+        for output in [OutputContract::Exists, OutputContract::SelectedEnd] {
+            let mut prepared = prepared("a", output, CompileMode::Fast);
+            assert!(matches!(
+                prepared.find(b"a"),
+                Err(AotRegexFindError::OutputContract { actual }) if actual == output
+            ));
+            assert!(matches!(
+                prepared.find_at(b"a", 0),
+                Err(AotRegexFindError::OutputContract { actual }) if actual == output
+            ));
+            assert!(matches!(
+                prepared.find_iter(b"a"),
+                Err(AotRegexFindError::OutputContract { actual }) if actual == output
+            ));
+        }
+
+        let mut prepared = prepared("a", OutputContract::Span, CompileMode::Fast);
+        assert!(matches!(
+            prepared.find_at(b"a", 2),
+            Err(AotRegexFindError::Search(CompileError::InvalidWindow {
+                start: 2,
+                end: 1,
+                haystack_len: 1,
+            }))
+        ));
+    }
+
+    #[test]
+    fn prepared_find_iterator_is_fused_and_releases_the_workspace_on_drop() {
+        fn assert_fused<I: std::iter::FusedIterator>(_: &I) {}
+
+        let mut prepared = prepared("a", OutputContract::Span, CompileMode::Fast);
+        {
+            let mut matches = prepared.find_iter(b"a").expect("Span iterator");
+            assert_fused(&matches);
+            assert_eq!(
+                matches.next().expect("one item").expect("search").range(),
+                0..1
+            );
+            assert!(matches.next().is_none());
+            assert!(matches.next().is_none());
+        }
+        assert_eq!(
+            prepared
+                .find(b"za")
+                .expect("reused workspace")
+                .expect("match")
+                .range(),
+            1..2
+        );
     }
 
     #[test]
