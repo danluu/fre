@@ -1302,11 +1302,27 @@ impl AdaptiveFallback {
             // The existing range classifier has one authenticated 16-byte
             // operation. It is deliberately not widened by this mechanism.
             AdaptiveFinder::Range { .. } => BYTE_SET_BLOCK_BYTES,
+            AdaptiveFinder::Set(classifier) => {
+                #[cfg(any(
+                    target_arch = "x86_64",
+                    all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
+                ))]
+                {
+                    classifier.candidate_block_bytes()
+                }
+                #[cfg(not(any(
+                    target_arch = "x86_64",
+                    all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
+                )))]
+                {
+                    let _ = classifier;
+                    BYTE_SET_CANDIDATE_BLOCK_BYTES
+                }
+            }
             AdaptiveFinder::One(_)
             | AdaptiveFinder::Two(_, _)
             | AdaptiveFinder::Three(_, _, _)
-            | AdaptiveFinder::Four(_)
-            | AdaptiveFinder::Set(_) => BYTE_SET_CANDIDATE_BLOCK_BYTES,
+            | AdaptiveFinder::Four(_) => BYTE_SET_CANDIDATE_BLOCK_BYTES,
         }
     }
 
@@ -6265,6 +6281,17 @@ mod tests {
         // classifier because direct anchor verification is bounded by one
         // predicate check per candidate.
         assert_eq!(accounting.anchor_mask_reads, 512);
+        #[cfg(any(
+            feature = "static-dispatch",
+            target_arch = "x86_64",
+            all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
+        ))]
+        assert_eq!(accounting.work_upper_bound, 2_064);
+        #[cfg(not(any(
+            feature = "static-dispatch",
+            target_arch = "x86_64",
+            all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
+        )))]
         assert_eq!(accounting.work_upper_bound, 2_063);
         assert_eq!(accounting.adaptive_classifier_build_work, 0);
         assert_eq!(accounting.work_charged, 786);

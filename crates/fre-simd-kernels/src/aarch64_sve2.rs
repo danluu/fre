@@ -251,9 +251,8 @@ fre_byte_set_mask32_sve2_asm:
     .cfi_def_cfa_offset 32
     mov x8, #0
     mov x9, #32
-    mov x10, #16
     mov x12, #0
-    whilelo p3.b, xzr, x10
+    ptrue p3.b, vl16
     ld1b z0.b, p3/z, [x0]
     ld1b z1.b, p3/z, [x1]
     cntb x11
@@ -267,12 +266,12 @@ fre_byte_set_mask32_sve2_asm:
     tbl z5.b, {{z0.b}}, z3.b
     tbl z6.b, {{z1.b}}, z3.b
 
-    // Every architectural 128-bit segment of z7 contains 0..7 twice, so
-    // MATCH identifies precisely the lower high-nibble half.
-    index z7.b, #0, #1
-    and z7.b, z7.b, #7
-    match p2.b, p0/z, z4.b, z7.b
-    sel z5.b, p2, z5.b, z6.b
+    // High nibbles above seven select the upper table. Unlike MATCH against
+    // a synthesized 0..7 vector, the immediate comparison needs no temporary
+    // vector construction and remains exact at every architectural SVE
+    // vector length.
+    cmphi p2.b, p0/z, z4.b, #7
+    sel z5.b, p2, z6.b, z5.b
     and z4.b, z4.b, #7
     mov z7.b, #1
     lsl z7.b, p0/m, z7.b, z4.b

@@ -1,5 +1,11 @@
 use core::{fmt, mem::size_of};
 
+#[cfg(any(
+    test,
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
+))]
+use fre_simd_kernels::BYTE_SET_WIDE_BLOCK_BYTES;
 use fre_simd_kernels::{
     classify_byte_delta_16, AsciiByteSet, AsciiByteSetClassifier, ByteSet256, ByteSetClassifier,
     ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, BYTE_SET_BLOCK_BYTES,
@@ -36,6 +42,11 @@ const GENERATION_FAST_WINDOW_MAX: usize = 4_294_967_295;
 const _: () = assert!(START_FILTER_POSITION_COUNT == 16);
 const GENERATION_FAST_RESERVE: u64 = 3 * 4_294_967_295 + 16 + 3;
 const START_FILTER_OWNER_ALLOCATION_WORK: u64 = 1;
+#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+// A 16-byte-VL SVE2 leaf only amortizes its fixed predicate/table setup once
+// a scan reaches several complete blocks. Ordinary ASIMD never selects this
+// direct-wide path, and x86 uses its independently selected AVX2 leaf.
+const AARCH64_SET_WIDE_MINIMUM_SPAN: usize = 256;
 const ROOT_RUN_WINDOW_BYTES: usize = 64;
 const ROOT_RUN_SCANNER_SHAPE_MAX_WORK: usize =
     BYTE_START_BITMAP_POPULATION_WORK + BYTE_START_RANGE_DETECTION_WORK;
@@ -8232,6 +8243,10 @@ fn next_range_start_candidate(
     })
 }
 
+#[cfg(not(any(
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
+)))]
 fn next_set_start_candidate(
     classifier: &StartByteSetClassifier,
     haystack: &[u8],
@@ -8306,6 +8321,203 @@ fn next_set_start_candidate(
     next_small_start_candidate(haystack, position, end, meter, |source| {
         source.iter().position(|&byte| set.contains(byte))
     })
+}
+
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
+))]
+fn next_set_start_candidate(
+    classifier: &StartByteSetClassifier,
+    haystack: &[u8],
+    position: usize,
+    end: usize,
+    meter: &mut WorkMeter,
+    cursor: Option<&mut RetainedStartMaskCursor>,
+) -> Result<usize, SearchError> {
+    let candidate_block_bytes = set_candidate_block_bytes(classifier, end.saturating_sub(position));
+    next_set_start_candidate_with_block_bytes(
+        classifier,
+        haystack,
+        position,
+        end,
+        meter,
+        cursor,
+        candidate_block_bytes,
+    )
+}
+
+#[cfg(any(
+    test,
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
+))]
+#[inline]
+fn set_candidate_block_bytes(classifier: &StartByteSetClassifier, _candidate_span: usize) -> usize {
+    #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+    if _candidate_span < AARCH64_SET_WIDE_MINIMUM_SPAN {
+        return BYTE_SET_BLOCK_BYTES;
+    }
+    classifier.classifier().candidate_block_bytes()
+}
+
+#[cfg(any(
+    test,
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
+))]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the scanner transaction coordinates its scalar prefix, isolated wide leaf, narrow remainder, retained masks, and exact work timing"
+)]
+fn next_set_start_candidate_with_block_bytes(
+    classifier: &StartByteSetClassifier,
+    haystack: &[u8],
+    mut position: usize,
+    end: usize,
+    meter: &mut WorkMeter,
+    mut cursor: Option<&mut RetainedStartMaskCursor>,
+    candidate_block_bytes: usize,
+) -> Result<usize, SearchError> {
+    debug_assert!(matches!(
+        candidate_block_bytes,
+        BYTE_SET_BLOCK_BYTES | BYTE_SET_WIDE_BLOCK_BYTES
+    ));
+    // A table classifier has a higher fixed cost than one bitmap lookup. Keep
+    // the first complete classifier-width block scalar so short searches and
+    // repeated nearby candidates retain the low-latency path; vector work is
+    // reserved for the long no-candidate spans that can amortize it.
+    let set = classifier.set();
+    let compiled = classifier.classifier();
+    if let Some(cursor) = cursor.as_deref_mut() {
+        match cursor.take(position, end)? {
+            RetainedStartCandidate::Unavailable => {}
+            RetainedStartCandidate::Candidate(candidate) => return Ok(candidate),
+            RetainedStartCandidate::ResumeAt(resume) => position = resume,
+        }
+    }
+    let scalar_prefix_end = position.saturating_add(BYTE_SET_BLOCK_BYTES).min(end);
+    let prefix_candidate =
+        next_small_start_candidate(haystack, position, scalar_prefix_end, meter, |source| {
+            source.iter().position(|&byte| set.contains(byte))
+        })?;
+    if prefix_candidate < scalar_prefix_end {
+        return Ok(prefix_candidate);
+    }
+    position = scalar_prefix_end;
+
+    // Start-filter work counts each logically examined source byte once. This
+    // preserves the scalar scanner's hard-limit threshold and monotonicity.
+    if candidate_block_bytes == BYTE_SET_WIDE_BLOCK_BYTES {
+        let (resume, candidate) =
+            next_set_wide_blocks(compiled, haystack, position, end, meter, &mut cursor)?;
+        if let Some(candidate) = candidate {
+            return Ok(candidate);
+        }
+        position = resume;
+    }
+
+    let block_work =
+        u64::try_from(BYTE_SET_BLOCK_BYTES).expect("classifier block width fits in u64");
+    while end.saturating_sub(position) >= BYTE_SET_BLOCK_BYTES && meter.remaining() >= block_work {
+        meter.charge_admitted(block_work);
+        let block_end =
+            position
+                .checked_add(BYTE_SET_BLOCK_BYTES)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "full-byte start-classifier block end",
+                })?;
+        let source = haystack
+            .get(position..block_end)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "full-byte start classifier exceeded the validated search window",
+            })?;
+        let block: &[u8; BYTE_SET_BLOCK_BYTES] = source
+            .try_into()
+            .expect("checked full-byte classifier extent");
+        let members = compiled.classify_16(block).member_mask();
+        if members != 0 {
+            if let Some(cursor) = cursor.as_deref_mut() {
+                return cursor.retain_complete_block(
+                    position,
+                    BYTE_SET_BLOCK_BYTES,
+                    u64::from(members),
+                    end,
+                );
+            }
+            let offset = usize::try_from(members.trailing_zeros())
+                .expect("a classified full-byte lane fits in usize");
+            return position
+                .checked_add(offset)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "full-byte start-classifier candidate",
+                });
+        }
+        position = block_end;
+    }
+
+    next_small_start_candidate(haystack, position, end, meter, |source| {
+        source.iter().position(|&byte| set.contains(byte))
+    })
+}
+
+#[cfg(any(
+    test,
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
+))]
+#[inline(never)]
+fn next_set_wide_blocks(
+    classifier: &ByteSetClassifier,
+    haystack: &[u8],
+    mut position: usize,
+    end: usize,
+    meter: &mut WorkMeter,
+    cursor: &mut Option<&mut RetainedStartMaskCursor>,
+) -> Result<(usize, Option<usize>), SearchError> {
+    let wide_work =
+        u64::try_from(BYTE_SET_WIDE_BLOCK_BYTES).expect("wide classifier block width fits in u64");
+    while end.saturating_sub(position) >= BYTE_SET_WIDE_BLOCK_BYTES
+        && meter.remaining() >= wide_work
+    {
+        meter.charge_admitted(wide_work);
+        let block_end = position.checked_add(BYTE_SET_WIDE_BLOCK_BYTES).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "wide full-byte start-classifier block end",
+            },
+        )?;
+        let source = haystack
+            .get(position..block_end)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "wide full-byte start classifier exceeded the validated search window",
+            })?;
+        let block: &[u8; BYTE_SET_WIDE_BLOCK_BYTES] = source
+            .try_into()
+            .expect("checked wide full-byte classifier extent");
+        let members = classifier.classify_32(block).member_mask();
+        if members != 0 {
+            if let Some(cursor) = cursor.as_deref_mut() {
+                let candidate = cursor.retain_complete_block(
+                    position,
+                    BYTE_SET_WIDE_BLOCK_BYTES,
+                    u64::from(members),
+                    end,
+                )?;
+                return Ok((position, Some(candidate)));
+            }
+            let offset = usize::try_from(members.trailing_zeros())
+                .expect("a wide classified full-byte lane fits in usize");
+            let candidate =
+                position
+                    .checked_add(offset)
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "wide full-byte start-classifier candidate",
+                    })?;
+            return Ok((position, Some(candidate)));
+        }
+        position = block_end;
+    }
+    Ok((position, None))
 }
 
 fn next_ascii_start_candidate(
@@ -10008,8 +10220,8 @@ mod tests {
 
     use super::{
         classify_byte_delta_16, scratch_bytes, ContextTransitionSlot, WorkMeter,
-        ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, BYTE_SET_BLOCK_BYTES, CONTEXT_INITIAL_SOURCE,
-        INVOCATION_RESET_WORK, ROOT_RUN_SCANNER_SHAPE_MAX_WORK,
+        ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, BYTE_SET_BLOCK_BYTES, BYTE_SET_WIDE_BLOCK_BYTES,
+        CONTEXT_INITIAL_SOURCE, INVOCATION_RESET_WORK, ROOT_RUN_SCANNER_SHAPE_MAX_WORK,
     };
     use crate::{
         plan::{
@@ -12098,7 +12310,12 @@ mod tests {
         u64::try_from(work.checked_add(tail).unwrap()).unwrap()
     }
 
-    fn expected_full_byte_scanner_work(start: usize, end: usize, expected: usize) -> u64 {
+    fn expected_full_byte_scanner_work(
+        start: usize,
+        end: usize,
+        expected: usize,
+        candidate_block_bytes: usize,
+    ) -> u64 {
         let mut position = start;
         let mut work = 0_usize;
         let scalar_prefix_end = start
@@ -12111,13 +12328,17 @@ mod tests {
             }
             position = position.checked_add(1).unwrap();
         }
-        while end.saturating_sub(position) >= fre_simd_kernels::BYTE_SET_BLOCK_BYTES {
-            work = work
-                .checked_add(fre_simd_kernels::BYTE_SET_BLOCK_BYTES)
-                .unwrap();
-            let block_end = position
-                .checked_add(fre_simd_kernels::BYTE_SET_BLOCK_BYTES)
-                .unwrap();
+        while end.saturating_sub(position) >= candidate_block_bytes {
+            work = work.checked_add(candidate_block_bytes).unwrap();
+            let block_end = position.checked_add(candidate_block_bytes).unwrap();
+            if expected < block_end {
+                return u64::try_from(work).unwrap();
+            }
+            position = block_end;
+        }
+        while end.saturating_sub(position) >= BYTE_SET_BLOCK_BYTES {
+            work = work.checked_add(BYTE_SET_BLOCK_BYTES).unwrap();
+            let block_end = position.checked_add(BYTE_SET_BLOCK_BYTES).unwrap();
             if expected < block_end {
                 return u64::try_from(work).unwrap();
             }
@@ -12173,6 +12394,17 @@ mod tests {
             .and_then(|work| work.checked_add(START_FILTER_PROBE_SELECTION_WORK))
             .unwrap();
         assert_eq!(START_FILTER_MAX_SELECTION_WORK, expected_selection_work);
+        #[cfg(any(
+            feature = "static-dispatch",
+            target_arch = "x86_64",
+            all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
+        ))]
+        assert_eq!(START_FILTER_MAX_SELECTION_WORK, 358);
+        #[cfg(not(any(
+            feature = "static-dispatch",
+            target_arch = "x86_64",
+            all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
+        )))]
         assert_eq!(START_FILTER_MAX_SELECTION_WORK, 357);
 
         // All exact-position sets remain a transient cold stack value. The
@@ -13621,9 +13853,21 @@ mod tests {
                             StartScanner::AsciiSet { .. } => {
                                 expected_ascii_scanner_work(start, end, expected)
                             }
-                            StartScanner::Set(_) | StartScanner::Range { .. } => {
-                                expected_full_byte_scanner_work(start, end, expected)
-                            }
+                            StartScanner::Set(ref classifier) => expected_full_byte_scanner_work(
+                                start,
+                                end,
+                                expected,
+                                super::set_candidate_block_bytes(
+                                    classifier,
+                                    end.saturating_sub(start),
+                                ),
+                            ),
+                            StartScanner::Range { .. } => expected_full_byte_scanner_work(
+                                start,
+                                end,
+                                expected,
+                                BYTE_SET_BLOCK_BYTES,
+                            ),
                             StartScanner::Empty => 0,
                             StartScanner::One(_)
                             | StartScanner::Two(_, _)
@@ -14826,7 +15070,15 @@ mod tests {
                         );
                         assert_eq!(
                             meter.consumed,
-                            expected_full_byte_scanner_work(start, end, expected),
+                            expected_full_byte_scanner_work(
+                                start,
+                                end,
+                                expected,
+                                super::set_candidate_block_bytes(
+                                    classifier,
+                                    end.saturating_sub(start),
+                                ),
+                            ),
                             "full-byte set {set_index} charged the wrong work for {start}..{end} at length {length}"
                         );
                     }
@@ -14858,8 +15110,45 @@ mod tests {
                         );
                         assert_eq!(
                             meter.consumed,
-                            expected_full_byte_scanner_work(start, end, expected)
+                            expected_full_byte_scanner_work(
+                                start,
+                                end,
+                                expected,
+                                super::set_candidate_block_bytes(
+                                    classifier,
+                                    end.saturating_sub(start),
+                                ),
+                            )
                         );
+                        for candidate_block_bytes in
+                            [BYTE_SET_BLOCK_BYTES, BYTE_SET_WIDE_BLOCK_BYTES]
+                        {
+                            let mut forced_meter = WorkMeter::new(u64::MAX, 0);
+                            let forced = super::next_set_start_candidate_with_block_bytes(
+                                classifier,
+                                &haystack,
+                                start,
+                                end,
+                                &mut forced_meter,
+                                None,
+                                candidate_block_bytes,
+                            )
+                            .unwrap();
+                            assert_eq!(
+                                forced, expected,
+                                "forced width {candidate_block_bytes} set {set_index} disagreed for {start}..{end}"
+                            );
+                            assert_eq!(
+                                forced_meter.consumed,
+                                expected_full_byte_scanner_work(
+                                    start,
+                                    end,
+                                    expected,
+                                    candidate_block_bytes,
+                                ),
+                                "forced width {candidate_block_bytes} set {set_index} charged the wrong work for {start}..{end}"
+                            );
+                        }
                     }
                 }
             }
@@ -14913,11 +15202,97 @@ mod tests {
     }
 
     #[test]
+    fn forced_wide_full_byte_scanner_preserves_exact_hard_work_limits() {
+        let set = ByteSet::from_words([
+            0xaaaa_aaaa_aaaa_aaaa,
+            0x5555_5555_5555_5555,
+            0x0123_4567_89ab_cdef,
+            0xfedc_ba98_7654_3210,
+        ]);
+        let scanner = scanner_for_set(set);
+        let StartScanner::Set(classifier) = scanner else {
+            panic!("non-ASCII bitmap did not retain its full-byte classifier");
+        };
+        let nonmember = (0_u8..=u8::MAX)
+            .find(|&byte| !set.contains(byte))
+            .expect("the test set leaves at least one nonmember");
+        for length in [1_usize, 15, 16, 17, 31, 32, 33, 63, 64, 65] {
+            let start = 3_usize;
+            let end = start.checked_add(length).unwrap();
+            let haystack = vec![nonmember; end + 2];
+            for limit in 0..=u64::try_from(length).unwrap() {
+                let mut meter = WorkMeter::new(limit, 0);
+                let result = super::next_set_start_candidate_with_block_bytes(
+                    &classifier,
+                    &haystack,
+                    start,
+                    end,
+                    &mut meter,
+                    None,
+                    BYTE_SET_WIDE_BLOCK_BYTES,
+                );
+                if limit == u64::try_from(length).unwrap() {
+                    assert_eq!(result.unwrap(), end);
+                    assert_eq!(meter.consumed, limit);
+                } else {
+                    assert!(matches!(
+                        result.unwrap_err(),
+                        SearchError::WorkLimitExceeded {
+                            consumed,
+                            requested: 1,
+                            position,
+                            ..
+                        } if consumed == limit
+                            && position == start + usize::try_from(limit).unwrap()
+                    ));
+                    assert_eq!(meter.consumed, limit);
+                }
+            }
+        }
+
+        let mut classified_source =
+            vec![nonmember; BYTE_SET_BLOCK_BYTES + BYTE_SET_WIDE_BLOCK_BYTES];
+        classified_source[BYTE_SET_BLOCK_BYTES..].fill(0x80);
+        assert!(set.contains(0x80));
+        let mut cursor = super::RetainedStartMaskCursor::default();
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            super::next_set_start_candidate_with_block_bytes(
+                &classifier,
+                &classified_source,
+                0,
+                classified_source.len(),
+                &mut meter,
+                Some(&mut cursor),
+                BYTE_SET_WIDE_BLOCK_BYTES,
+            )
+            .unwrap(),
+            BYTE_SET_BLOCK_BYTES
+        );
+        assert_eq!(usize::from(cursor.width), BYTE_SET_WIDE_BLOCK_BYTES);
+        let classified_work = meter.consumed;
+        assert_eq!(
+            super::next_set_start_candidate_with_block_bytes(
+                &classifier,
+                &classified_source,
+                BYTE_SET_BLOCK_BYTES + 1,
+                classified_source.len(),
+                &mut meter,
+                Some(&mut cursor),
+                BYTE_SET_WIDE_BLOCK_BYTES,
+            )
+            .unwrap(),
+            BYTE_SET_BLOCK_BYTES + 1
+        );
+        assert_eq!(meter.consumed, classified_work);
+    }
+
+    #[test]
     fn full_byte_scalar_extents_preserve_exact_and_one_below_work() {
         let range = root_scanner(scanner_for_set(byte_range_set(0x40, 0x7f)));
         assert!(matches!(&range.scanner, StartScanner::Range { .. }));
         let set = root_scanner(scanner_for_set(byte_set(&[0x80, 0x82, 0x84, 0x86])));
-        assert!(matches!(&set.scanner, StartScanner::Set(_)));
+        assert!(matches!(set.scanner, StartScanner::Set(_)));
 
         let start = 3_usize;
         let length = BYTE_SET_BLOCK_BYTES

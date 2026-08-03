@@ -10,6 +10,8 @@ use core::fmt;
 
 #[cfg(feature = "static-dispatch")]
 use crate::require_static_selection;
+#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+use crate::TuningClass;
 use crate::{
     Architecture, ArchitectureRequirement, CpuCapabilities, DispatchPolicy, Feature, FeatureSet,
     KernelVariant, SelectedKernel, SelectionReceipt, UnsupportedRequiredFeatures, VectorKind,
@@ -59,15 +61,23 @@ pub const BYTE_SET_CANDIDATE_BLOCK_BYTES: usize = BYTE_SET_WIDE_BLOCK_BYTES;
     )
 )))]
 pub const BYTE_SET_CANDIDATE_BLOCK_BYTES: usize = BYTE_SET_BLOCK_BYTES;
-/// Exact abstract work to visit all byte values and bind one immutable leaf.
+/// Exact abstract work to visit all byte values and bind both immutable leaves.
+#[cfg(any(
+    feature = "static-dispatch",
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
+))]
+pub const BYTE_SET_CLASSIFIER_BUILD_WORK: usize = 256 + 2;
+/// Exact abstract work when this target has no direct wide runtime tier.
+#[cfg(not(any(
+    feature = "static-dispatch",
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
+)))]
 pub const BYTE_SET_CLASSIFIER_BUILD_WORK: usize = 256 + 1;
 
 const BYTE_SET_VECTOR_BYTES: u16 = 16;
-#[cfg(all(
-    feature = "static-dispatch",
-    target_arch = "x86_64",
-    target_feature = "avx2"
-))]
+#[cfg(target_arch = "x86_64")]
 const BYTE_SET_WIDE_VECTOR_BYTES: u16 = 32;
 const SCALAR_VARIANT_ID: &str = "byte-set.mask16.scalar.v1";
 #[cfg_attr(
@@ -94,6 +104,10 @@ const SCALAR_VARIANT_ID: &str = "byte-set.mask16.scalar.v1";
 const SPLIT_MASK32_VARIANT_ID: &str = "byte-set.mask32.split16.v1";
 #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
 const SVE2_MASK32_VARIANT_ID: &str = "byte-set.mask32.sve2.v1";
+#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+const SVE2_ARM_41_D84_MASK32_VARIANT_ID: &str = "byte-set.mask32.sve2.arm-41-d84.v1";
+#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+const SPLIT_NEON_MASK32_VARIANT_ID: &str = "byte-set.mask32.split16-neon.v1";
 #[cfg(target_arch = "x86_64")]
 const AVX2_MASK32_VARIANT_ID: &str = "byte-set.mask32.avx2.v1";
 #[cfg(target_arch = "aarch64")]
@@ -253,6 +267,7 @@ impl fmt::Debug for ByteSetClassifier {
             .debug_struct("ByteSetClassifier")
             .field("set", &self.set)
             .field("selection", &self.selection())
+            .field("wide_selection", &self.wide_selection())
             .finish_non_exhaustive()
     }
 }
@@ -283,12 +298,37 @@ impl ByteSetClassifier {
             return Ok(Self::from_static_profile(set));
         }
         let selected = select(capabilities, policy)?;
+        #[cfg(any(
+            feature = "static-dispatch",
+            target_arch = "x86_64",
+            all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
+        ))]
+        let wide = select_wide(capabilities, policy)?;
+        #[cfg(all(
+            not(feature = "static-dispatch"),
+            any(
+                target_arch = "x86_64",
+                all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
+            )
+        ))]
+        assert_eq!(
+            wide.receipt().variant_id,
+            runtime_wide_selection(selected.receipt()).variant_id,
+            "the compact wide receipt must reproduce table selection"
+        );
         #[cfg(feature = "static-dispatch")]
-        require_static_selection(
-            selected.receipt(),
-            automatic_selection(),
-            static_variant_id(),
-        )?;
+        {
+            require_static_selection(
+                selected.receipt(),
+                automatic_selection(),
+                static_variant_id(),
+            )?;
+            require_static_selection(
+                wide.receipt(),
+                automatic_wide_selection(automatic_selection()),
+                static_wide_variant_id(),
+            )?;
+        }
         Ok(Self {
             set,
             tables: set.tables(),
@@ -329,29 +369,37 @@ impl ByteSetClassifier {
 
     /// Stable receipt for the actual candidate-stream loop operation.
     ///
-    /// Portable and runtime-dispatched loops retain the authenticated 16-byte
-    /// leaf. Only compiler-static profiles with a reviewed native wide leaf
-    /// report 32 bytes.
+    /// Split-wide implementations retain the authenticated 16-byte leaf;
+    /// runtime or compiler-static native-wide implementations report 32 bytes.
     #[must_use]
     pub const fn candidate_selection(&self) -> SelectionReceipt {
-        if BYTE_SET_CANDIDATE_BLOCK_BYTES == BYTE_SET_WIDE_BLOCK_BYTES {
+        if self.candidate_block_bytes() == BYTE_SET_WIDE_BLOCK_BYTES {
             self.wide_selection()
         } else {
             self.selection()
         }
     }
 
+    /// Width of the direct candidate-stream leaf selected at construction.
+    ///
+    /// Split-wide implementations retain the authenticated 16-byte child;
+    /// native SVE2 and AVX2 leaves expose their direct 32-byte width.
+    #[must_use]
+    pub const fn candidate_block_bytes(&self) -> usize {
+        #[cfg(not(feature = "static-dispatch"))]
+        {
+            if runtime_has_direct_wide(self.selection) {
+                return BYTE_SET_WIDE_BLOCK_BYTES;
+            }
+        }
+        BYTE_SET_CANDIDATE_BLOCK_BYTES
+    }
+
     /// Stable receipt for the explicit 32-byte classification operation.
     #[must_use]
     #[cfg(not(feature = "static-dispatch"))]
     pub const fn wide_selection(&self) -> SelectionReceipt {
-        SelectionReceipt {
-            variant_id: SPLIT_MASK32_VARIANT_ID,
-            delegate_variant_id: Some(self.selection.variant_id),
-            selection_input_bytes: BYTE_SET_WIDE_BLOCK_BYTES,
-            minimum_input_bytes: BYTE_SET_WIDE_BLOCK_BYTES,
-            ..self.selection
-        }
+        runtime_wide_selection(self.selection)
     }
 
     /// Compiler-fixed receipt for the explicit 32-byte operation.
@@ -384,15 +432,70 @@ impl ByteSetClassifier {
     /// Classify exactly 32 bytes.
     ///
     /// The general fallback is exactly two already-authenticated 16-byte
-    /// operations. Only compiler-static profiles with a reviewed native leaf
-    /// replace that split operation.
+    /// operations. Runtime and compiler-static profiles may replace that
+    /// composition with one construction-authenticated native wide leaf.
     #[must_use]
     #[allow(
         unsafe_code,
-        reason = "the compiler-static cfg and fixed array jointly prove every native wide leaf; other builds execute two safe narrow calls"
+        reason = "immutable runtime or compiler-static dispatch proves every native wide leaf; the fixed array proves its complete source extent"
     )]
     pub fn classify_32(&self, bytes: &[u8; BYTE_SET_WIDE_BLOCK_BYTES]) -> ByteSetMask32 {
+        #[cfg(all(not(feature = "static-dispatch"), target_arch = "x86_64"))]
+        {
+            if runtime_has_direct_wide(self.selection) {
+                // SAFETY: the immutable narrow receipt contains the authentic
+                // policy-visible AVX2 fact used to reconstruct wide selection.
+                return unsafe { classify_32_avx2(&self.tables, bytes) };
+            }
+            let first: &[u8; BYTE_SET_BLOCK_BYTES] = bytes[..BYTE_SET_BLOCK_BYTES]
+                .try_into()
+                .expect("the first wide half is exactly sixteen bytes");
+            let second: &[u8; BYTE_SET_BLOCK_BYTES] = bytes[BYTE_SET_BLOCK_BYTES..]
+                .try_into()
+                .expect("the second wide half is exactly sixteen bytes");
+            ByteSetMask32::from_halves(self.classify_16(first), self.classify_16(second))
+        }
         #[cfg(all(
+            not(feature = "static-dispatch"),
+            target_arch = "aarch64",
+            target_os = "linux",
+            target_endian = "little"
+        ))]
+        {
+            if runtime_has_direct_wide(self.selection) {
+                // SAFETY: the immutable narrow receipt contains the authentic
+                // policy-visible SVE/SVE2 and V3 tuning facts used to
+                // reconstruct wide selection.
+                return unsafe {
+                    crate::aarch64_sve2::classify_byte_set_32_sve2(&self.tables, bytes)
+                };
+            }
+            let first: &[u8; BYTE_SET_BLOCK_BYTES] = bytes[..BYTE_SET_BLOCK_BYTES]
+                .try_into()
+                .expect("the first wide half is exactly sixteen bytes");
+            let second: &[u8; BYTE_SET_BLOCK_BYTES] = bytes[BYTE_SET_BLOCK_BYTES..]
+                .try_into()
+                .expect("the second wide half is exactly sixteen bytes");
+            ByteSetMask32::from_halves(self.classify_16(first), self.classify_16(second))
+        }
+        #[cfg(all(
+            not(feature = "static-dispatch"),
+            not(any(
+                target_arch = "x86_64",
+                all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
+            ))
+        ))]
+        {
+            let first: &[u8; BYTE_SET_BLOCK_BYTES] = bytes[..BYTE_SET_BLOCK_BYTES]
+                .try_into()
+                .expect("the first wide half is exactly sixteen bytes");
+            let second: &[u8; BYTE_SET_BLOCK_BYTES] = bytes[BYTE_SET_BLOCK_BYTES..]
+                .try_into()
+                .expect("the second wide half is exactly sixteen bytes");
+            ByteSetMask32::from_halves(self.classify_16(first), self.classify_16(second))
+        }
+        #[cfg(all(
+            feature = "static-dispatch",
             feature = "static-dispatch-arm-41-d84",
             target_arch = "aarch64",
             target_os = "linux",
@@ -415,21 +518,20 @@ impl ByteSetClassifier {
             // fixed source array proves the complete 32-byte extent.
             unsafe { classify_32_avx2(&self.tables, bytes) }
         }
-        #[cfg(not(any(
-            all(
-                feature = "static-dispatch-arm-41-d84",
-                target_arch = "aarch64",
-                target_os = "linux",
-                target_endian = "little",
-                target_feature = "sve",
-                target_feature = "sve2"
-            ),
-            all(
-                feature = "static-dispatch",
-                target_arch = "x86_64",
-                target_feature = "avx2"
-            )
-        )))]
+        #[cfg(all(
+            feature = "static-dispatch",
+            not(any(
+                all(
+                    feature = "static-dispatch-arm-41-d84",
+                    target_arch = "aarch64",
+                    target_os = "linux",
+                    target_endian = "little",
+                    target_feature = "sve",
+                    target_feature = "sve2"
+                ),
+                all(target_arch = "x86_64", target_feature = "avx2")
+            ))
+        ))]
         {
             let first: &[u8; BYTE_SET_BLOCK_BYTES] = bytes[..BYTE_SET_BLOCK_BYTES]
                 .try_into()
@@ -439,6 +541,124 @@ impl ByteSetClassifier {
                 .expect("the second wide half is exactly sixteen bytes");
             ByteSetMask32::from_halves(self.classify_16(first), self.classify_16(second))
         }
+    }
+}
+
+#[cfg(all(not(feature = "static-dispatch"), target_arch = "x86_64"))]
+const fn runtime_has_direct_wide(narrow: SelectionReceipt) -> bool {
+    narrow.policy_usable.contains(Feature::X86Avx2)
+}
+
+#[cfg(all(not(feature = "static-dispatch"), target_arch = "x86_64"))]
+const fn runtime_wide_selection(narrow: SelectionReceipt) -> SelectionReceipt {
+    if runtime_has_direct_wide(narrow) {
+        SelectionReceipt {
+            variant_id: AVX2_MASK32_VARIANT_ID,
+            delegate_variant_id: None,
+            required: FeatureSet::of(Feature::X86Avx2),
+            vector: VectorKind::Fixed {
+                bytes: BYTE_SET_WIDE_VECTOR_BYTES,
+            },
+            selection_input_bytes: BYTE_SET_WIDE_BLOCK_BYTES,
+            minimum_input_bytes: BYTE_SET_WIDE_BLOCK_BYTES,
+            ..narrow
+        }
+    } else {
+        SelectionReceipt {
+            variant_id: SPLIT_MASK32_VARIANT_ID,
+            delegate_variant_id: Some(narrow.variant_id),
+            selection_input_bytes: BYTE_SET_WIDE_BLOCK_BYTES,
+            minimum_input_bytes: BYTE_SET_WIDE_BLOCK_BYTES,
+            ..narrow
+        }
+    }
+}
+
+#[cfg(all(
+    not(feature = "static-dispatch"),
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_endian = "little"
+))]
+const fn runtime_has_direct_wide(narrow: SelectionReceipt) -> bool {
+    let sve2 = narrow.policy_usable.contains(Feature::ArmSve)
+        && narrow.policy_usable.contains(Feature::ArmSve2);
+    let neoverse_v3 = matches!(
+        narrow.host_tuning,
+        TuningClass::ArmServer { cpu: Some(cpu) }
+            if cpu.implementer == 0x41 && cpu.part == 0xd84
+    );
+    sve2 && (neoverse_v3 || !narrow.policy_usable.contains(Feature::ArmNeon))
+}
+
+#[cfg(all(
+    not(feature = "static-dispatch"),
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_endian = "little"
+))]
+const fn runtime_wide_selection(narrow: SelectionReceipt) -> SelectionReceipt {
+    if runtime_has_direct_wide(narrow) {
+        let variant_id = match narrow.host_tuning {
+            TuningClass::ArmServer { cpu: Some(cpu) }
+                if cpu.implementer == 0x41 && cpu.part == 0xd84 =>
+            {
+                SVE2_ARM_41_D84_MASK32_VARIANT_ID
+            }
+            _ => SVE2_MASK32_VARIANT_ID,
+        };
+        SelectionReceipt {
+            variant_id,
+            delegate_variant_id: None,
+            required: FeatureSet::EMPTY
+                .with(Feature::ArmSve)
+                .with(Feature::ArmSve2),
+            vector: VectorKind::Scalable,
+            selection_input_bytes: BYTE_SET_WIDE_BLOCK_BYTES,
+            minimum_input_bytes: BYTE_SET_WIDE_BLOCK_BYTES,
+            ..narrow
+        }
+    } else {
+        let variant_id = if narrow.policy_usable.contains(Feature::ArmNeon) {
+            SPLIT_NEON_MASK32_VARIANT_ID
+        } else {
+            SPLIT_MASK32_VARIANT_ID
+        };
+        SelectionReceipt {
+            variant_id,
+            delegate_variant_id: Some(narrow.variant_id),
+            selection_input_bytes: BYTE_SET_WIDE_BLOCK_BYTES,
+            minimum_input_bytes: BYTE_SET_WIDE_BLOCK_BYTES,
+            ..narrow
+        }
+    }
+}
+
+#[cfg(all(
+    not(feature = "static-dispatch"),
+    not(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
+    ))
+))]
+const fn runtime_has_direct_wide(_narrow: SelectionReceipt) -> bool {
+    false
+}
+
+#[cfg(all(
+    not(feature = "static-dispatch"),
+    not(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
+    ))
+))]
+const fn runtime_wide_selection(narrow: SelectionReceipt) -> SelectionReceipt {
+    SelectionReceipt {
+        variant_id: SPLIT_MASK32_VARIANT_ID,
+        delegate_variant_id: Some(narrow.variant_id),
+        selection_input_bytes: BYTE_SET_WIDE_BLOCK_BYTES,
+        minimum_input_bytes: BYTE_SET_WIDE_BLOCK_BYTES,
+        ..narrow
     }
 }
 
@@ -610,6 +830,113 @@ const VARIANTS: [KernelVariant<ByteSetEntry>; 2] = [
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 const VARIANTS: [KernelVariant<ByteSetEntry>; 1] = [SCALAR];
 
+#[cfg(any(
+    feature = "static-dispatch",
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
+))]
+const SPLIT_32: KernelVariant<()> = KernelVariant::new(
+    SPLIT_MASK32_VARIANT_ID,
+    ArchitectureRequirement::Any,
+    FeatureSet::EMPTY,
+    VectorKind::Fixed {
+        bytes: BYTE_SET_VECTOR_BYTES,
+    },
+    BYTE_SET_WIDE_BLOCK_BYTES,
+    0,
+    (),
+);
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+const SVE2_PREFERENCE: u16 = if cfg!(feature = "static-dispatch-arm-41-d84") {
+    200
+} else {
+    50
+};
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+const SPLIT_NEON_PREFERENCE: u16 = if cfg!(feature = "static-dispatch") {
+    0
+} else {
+    100
+};
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+const WIDE_VARIANTS: [KernelVariant<()>; 4] = [
+    SPLIT_32,
+    KernelVariant::new(
+        SVE2_MASK32_VARIANT_ID,
+        ArchitectureRequirement::Exact(Architecture::Aarch64),
+        FeatureSet::EMPTY
+            .with(Feature::ArmSve)
+            .with(Feature::ArmSve2),
+        VectorKind::Scalable,
+        BYTE_SET_WIDE_BLOCK_BYTES,
+        SVE2_PREFERENCE,
+        (),
+    ),
+    KernelVariant::new(
+        SPLIT_NEON_MASK32_VARIANT_ID,
+        ArchitectureRequirement::Exact(Architecture::Aarch64),
+        FeatureSet::of(Feature::ArmNeon),
+        VectorKind::Fixed {
+            bytes: BYTE_SET_VECTOR_BYTES,
+        },
+        BYTE_SET_WIDE_BLOCK_BYTES,
+        SPLIT_NEON_PREFERENCE,
+        (),
+    ),
+    KernelVariant::new(
+        SVE2_ARM_41_D84_MASK32_VARIANT_ID,
+        ArchitectureRequirement::Exact(Architecture::Aarch64),
+        FeatureSet::EMPTY
+            .with(Feature::ArmSve)
+            .with(Feature::ArmSve2),
+        VectorKind::Scalable,
+        BYTE_SET_WIDE_BLOCK_BYTES,
+        150,
+        (),
+    )
+    .when_tuning(is_neoverse_v3),
+];
+
+#[cfg(target_arch = "x86_64")]
+const WIDE_VARIANTS: [KernelVariant<()>; 2] = [
+    SPLIT_32,
+    // AVX-512 hosts retain this AVX2 leaf until a separately qualified
+    // AVX-512 byte-table implementation beats it. The explicit wide table
+    // keeps that future tier independent of scanner semantics.
+    KernelVariant::new(
+        AVX2_MASK32_VARIANT_ID,
+        ArchitectureRequirement::Exact(Architecture::X86_64),
+        FeatureSet::of(Feature::X86Avx2),
+        VectorKind::Fixed {
+            bytes: BYTE_SET_WIDE_VECTOR_BYTES,
+        },
+        BYTE_SET_WIDE_BLOCK_BYTES,
+        100,
+        (),
+    ),
+];
+
+#[cfg(all(
+    feature = "static-dispatch",
+    not(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
+    ))
+))]
+const WIDE_VARIANTS: [KernelVariant<()>; 1] = [SPLIT_32];
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+fn is_neoverse_v3(tuning: TuningClass) -> bool {
+    matches!(
+        tuning,
+        TuningClass::ArmServer { cpu: Some(cpu) }
+            if cpu.implementer == 0x41 && cpu.part == 0xd84
+    )
+}
+
 fn select(
     capabilities: CpuCapabilities,
     policy: DispatchPolicy,
@@ -618,6 +945,24 @@ fn select(
         select_kernel(capabilities, policy, BYTE_SET_BLOCK_BYTES, &VARIANTS)?
             .expect("the byte-set table always contains its scalar fallback"),
     )
+}
+
+#[cfg(any(
+    feature = "static-dispatch",
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
+))]
+fn select_wide(
+    capabilities: CpuCapabilities,
+    policy: DispatchPolicy,
+) -> Result<SelectedKernel<()>, UnsupportedRequiredFeatures> {
+    Ok(select_kernel(
+        capabilities,
+        policy,
+        BYTE_SET_WIDE_BLOCK_BYTES,
+        &WIDE_VARIANTS,
+    )?
+    .expect("the byte-set wide table always contains its split fallback"))
 }
 
 #[cfg(feature = "static-dispatch")]
@@ -714,10 +1059,45 @@ const fn automatic_wide_selection(_narrow: SelectionReceipt) -> SelectionReceipt
 }
 
 #[cfg(all(
+    feature = "static-dispatch-arm-41-d84",
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_endian = "little",
+    target_feature = "sve",
+    target_feature = "sve2"
+))]
+const fn static_wide_variant_id() -> &'static str {
+    SVE2_MASK32_VARIANT_ID
+}
+
+#[cfg(all(
     feature = "static-dispatch",
     target_arch = "x86_64",
     target_feature = "avx2"
 ))]
+const fn static_wide_variant_id() -> &'static str {
+    AVX2_MASK32_VARIANT_ID
+}
+
+#[cfg(all(
+    feature = "static-dispatch",
+    not(any(
+        all(
+            feature = "static-dispatch-arm-41-d84",
+            target_arch = "aarch64",
+            target_os = "linux",
+            target_endian = "little",
+            target_feature = "sve",
+            target_feature = "sve2"
+        ),
+        all(target_arch = "x86_64", target_feature = "avx2")
+    ))
+))]
+const fn static_wide_variant_id() -> &'static str {
+    SPLIT_MASK32_VARIANT_ID
+}
+
+#[cfg(target_arch = "x86_64")]
 #[allow(
     unsafe_code,
     unsafe_op_in_unsafe_fn,
@@ -853,8 +1233,8 @@ unsafe fn static_classify(
 #[cfg(test)]
 mod tests {
     use super::{
-        BYTE_SET_BLOCK_BYTES, BYTE_SET_CANDIDATE_BLOCK_BYTES, BYTE_SET_WIDE_BLOCK_BYTES,
-        ByteSet256, ByteSetClassifier, classify_scalar,
+        BYTE_SET_BLOCK_BYTES, BYTE_SET_WIDE_BLOCK_BYTES, ByteSet256, ByteSetClassifier,
+        classify_scalar,
     };
     use crate::{DispatchPolicy, SimdDispatchContext};
 
@@ -950,12 +1330,134 @@ mod tests {
             let candidate = classifier.candidate_selection();
             assert_eq!(
                 candidate.selection_input_bytes,
-                BYTE_SET_CANDIDATE_BLOCK_BYTES
+                classifier.candidate_block_bytes()
             );
             assert_eq!(
                 candidate.minimum_input_bytes,
-                BYTE_SET_CANDIDATE_BLOCK_BYTES
+                classifier.candidate_block_bytes()
             );
+        }
+    }
+
+    #[cfg(not(feature = "static-dispatch"))]
+    #[test]
+    fn portable_policy_retains_the_authenticated_narrow_candidate_leaf() {
+        let classifier = ByteSetClassifier::with_policy(
+            ByteSet256::from_words([
+                0x0123_4567_89ab_cdef,
+                0xfedc_ba98_7654_3210,
+                0xaaaa_5555_ffff_0000,
+                0x1357_9bdf_2468_ace0,
+            ]),
+            DispatchPolicy::Portable,
+        )
+        .unwrap();
+        assert_eq!(classifier.candidate_block_bytes(), BYTE_SET_BLOCK_BYTES);
+        assert_eq!(
+            classifier.candidate_selection().variant_id,
+            "byte-set.mask16.scalar.v1"
+        );
+        assert_eq!(
+            classifier.wide_selection().variant_id,
+            "byte-set.mask32.split16.v1"
+        );
+        assert_eq!(
+            classifier.wide_selection().delegate_variant_id,
+            Some("byte-set.mask16.scalar.v1")
+        );
+    }
+
+    #[cfg(all(not(feature = "static-dispatch"), target_arch = "x86_64"))]
+    #[test]
+    fn x86_automatic_wide_tier_uses_avx2_and_keeps_avx512_policy_explicit() {
+        use crate::Feature;
+
+        let context = SimdDispatchContext::capture();
+        let classifier = context
+            .byte_set_classifier(ByteSet256::from_words([u64::MAX; 4]), DispatchPolicy::Auto)
+            .unwrap();
+        if context.capabilities().usable().contains(Feature::X86Avx2) {
+            assert_eq!(
+                classifier.candidate_block_bytes(),
+                BYTE_SET_WIDE_BLOCK_BYTES
+            );
+            assert_eq!(
+                classifier.candidate_selection().variant_id,
+                "byte-set.mask32.avx2.v1"
+            );
+            if context
+                .capabilities()
+                .usable()
+                .contains(Feature::X86Avx512F)
+                && context
+                    .capabilities()
+                    .usable()
+                    .contains(Feature::X86Avx512Bw)
+                && context
+                    .capabilities()
+                    .usable()
+                    .contains(Feature::X86Avx512Vl)
+            {
+                assert_eq!(
+                    classifier.candidate_selection().variant_id,
+                    "byte-set.mask32.avx2.v1",
+                    "AVX-512 remains an explicit future tier until independently qualified"
+                );
+            }
+        } else {
+            assert_eq!(classifier.candidate_block_bytes(), BYTE_SET_BLOCK_BYTES);
+            assert!(classifier.wide_selection().delegate_variant_id.is_some());
+        }
+    }
+
+    #[cfg(all(
+        not(feature = "static-dispatch"),
+        target_arch = "aarch64",
+        target_os = "linux",
+        target_endian = "little"
+    ))]
+    #[test]
+    fn aarch64_automatic_wide_tier_follows_neon_and_neoverse_v3_policy() {
+        use crate::{Feature, TuningClass};
+
+        let context = SimdDispatchContext::capture();
+        let classifier = context
+            .byte_set_classifier(ByteSet256::from_words([u64::MAX; 4]), DispatchPolicy::Auto)
+            .unwrap();
+        let usable = context.capabilities().usable();
+        let sve2 = usable.contains(Feature::ArmSve) && usable.contains(Feature::ArmSve2);
+        let neoverse_v3 = matches!(
+            context.capabilities().tuning(),
+            TuningClass::ArmServer { cpu: Some(cpu) }
+                if cpu.implementer == 0x41 && cpu.part == 0xd84
+        );
+        if sve2 && neoverse_v3 {
+            assert_eq!(
+                classifier.candidate_block_bytes(),
+                BYTE_SET_WIDE_BLOCK_BYTES
+            );
+            assert_eq!(
+                classifier.candidate_selection().variant_id,
+                "byte-set.mask32.sve2.arm-41-d84.v1"
+            );
+        } else if usable.contains(Feature::ArmNeon) {
+            assert_eq!(classifier.candidate_block_bytes(), BYTE_SET_BLOCK_BYTES);
+            assert_eq!(
+                classifier.wide_selection().variant_id,
+                "byte-set.mask32.split16-neon.v1"
+            );
+            assert!(classifier.wide_selection().delegate_variant_id.is_some());
+        } else if sve2 {
+            assert_eq!(
+                classifier.candidate_block_bytes(),
+                BYTE_SET_WIDE_BLOCK_BYTES
+            );
+            assert_eq!(
+                classifier.candidate_selection().variant_id,
+                "byte-set.mask32.sve2.v1"
+            );
+        } else {
+            assert_eq!(classifier.candidate_block_bytes(), BYTE_SET_BLOCK_BYTES);
         }
     }
 

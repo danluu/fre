@@ -504,7 +504,9 @@ impl StartByteSetClassifier {
 
 impl PartialEq for StartByteSetClassifier {
     fn eq(&self, other: &Self) -> bool {
-        self.inner.set() == other.inner.set() && self.inner.selection() == other.inner.selection()
+        self.inner.set() == other.inner.set()
+            && self.inner.selection() == other.inner.selection()
+            && self.inner.wide_selection() == other.inner.wide_selection()
     }
 }
 
