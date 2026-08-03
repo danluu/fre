@@ -356,6 +356,57 @@ pub enum StartAccelerator {
     Aarch64Sve2,
 }
 
+/// Target instruction family that actually implemented one emitted primary
+/// scanner. This private receipt is produced by the backend, not inferred by
+/// the planner, so retained-fallback publication can authenticate the code
+/// that was generated rather than merely the intended layout.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeScannerIsa {
+    ScalarEmpty,
+    X86ScalarBitmap,
+    X86Sse2,
+    X86Avx2,
+    X86Avx512Bw,
+    Aarch64ScalarRange,
+    Aarch64ScalarLut,
+    Aarch64Asimd,
+    Aarch64Sve,
+    Aarch64Sve2,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeScannerEmission {
+    scan_offset: u8,
+    membership: [u64; 4],
+    isa: NativeScannerIsa,
+    vectorized: bool,
+}
+
+struct NativeDfaEmission {
+    code: Vec<u8>,
+    relocations: Vec<ModuleRelocation>,
+    scanner: Option<NativeScannerEmission>,
+}
+
+impl NativeScannerEmission {
+    const fn start_accelerator(self) -> StartAccelerator {
+        match self.isa {
+            NativeScannerIsa::ScalarEmpty
+            | NativeScannerIsa::X86ScalarBitmap
+            | NativeScannerIsa::Aarch64ScalarRange
+            | NativeScannerIsa::Aarch64ScalarLut => {
+                StartAccelerator::Scalar
+            }
+            NativeScannerIsa::X86Sse2 => StartAccelerator::X86Sse2,
+            NativeScannerIsa::X86Avx2 => StartAccelerator::X86Avx2,
+            NativeScannerIsa::X86Avx512Bw => StartAccelerator::X86Avx512Bw,
+            NativeScannerIsa::Aarch64Asimd => StartAccelerator::Aarch64Asimd,
+            NativeScannerIsa::Aarch64Sve => StartAccelerator::Aarch64Sve,
+            NativeScannerIsa::Aarch64Sve2 => StartAccelerator::Aarch64Sve2,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Aarch64PrimaryScannerIsa {
     Scalar,
@@ -1315,6 +1366,64 @@ struct NativeStartFilter {
     from_anchored_prefix: bool,
 }
 
+/// Complete membership for a moving native primary scanner.
+///
+/// This representation is deliberately independent of the bounded range
+/// filter above. It is admitted only for a mandatory retained primary that
+/// the range representation cannot encode, so ordinary complete-DFA planning
+/// and its cost model remain byte-for-byte unchanged. Word and byte order are
+/// canonical: word zero owns bytes `0..=63`, with byte zero in its least
+/// significant bit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeExactByteSet {
+    membership: [u64; 4],
+    cardinality: u16,
+    scan_offset: u8,
+    from_anchored_prefix: bool,
+}
+
+impl NativeExactByteSet {
+    fn from_membership(
+        membership: [u64; 4],
+        scan_offset: u8,
+        from_anchored_prefix: bool,
+    ) -> Option<Self> {
+        let cardinality = membership.iter().try_fold(0_u16, |count, word| {
+            count.checked_add(u16::try_from(word.count_ones()).ok()?)
+        })?;
+        (cardinality != 0 && cardinality != 256).then_some(Self {
+            membership,
+            cardinality,
+            scan_offset,
+            from_anchored_prefix,
+        })
+    }
+
+    fn contains(self, byte: u8) -> bool {
+        let byte = usize::from(byte);
+        self.membership[byte / 64] & (1_u64 << (byte % 64)) != 0
+    }
+
+    fn is_valid(self) -> bool {
+        Self::from_membership(
+            self.membership,
+            self.scan_offset,
+            self.from_anchored_prefix,
+        )
+        .is_some_and(|canonical| canonical.cardinality == self.cardinality)
+    }
+}
+
+/// Exact-set table addresses installed transactionally after all established
+/// DFA and prefix data. The bitmap is always present for deterministic
+/// cross-target inspection; AArch64 additionally uses the byte-indexed LUT in
+/// its scalar lowering.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeExactByteSetStorage {
+    bitmap_offset: u32,
+    aarch64_lut_offset: Option<u32>,
+}
+
 /// Exact complement of a DFA-proven all-state reset set.
 ///
 /// Unlike [`NativeStartFilter`], this is not used to form SIMD constants and
@@ -1575,6 +1684,8 @@ struct NativeDfaLayout {
     exact_prefix_match_width: Option<u8>,
     output: OutputContract,
     start_filter: Option<NativeStartFilter>,
+    exact_start_byte_set: Option<NativeExactByteSet>,
+    exact_start_storage: Option<NativeExactByteSetStorage>,
     suffix_filter: Option<NativeSuffixFilter>,
     /// A complete graph-derived RootState reverse proof was omitted because
     /// its initial row already reaches the search start and cannot reject the
@@ -1591,6 +1702,18 @@ struct NativeDfaLayout {
 }
 
 impl NativeDfaLayout {
+    const fn has_start_scanner(self) -> bool {
+        self.start_filter.is_some() || self.exact_start_byte_set.is_some()
+    }
+
+    const fn start_scanner_offset(self) -> Option<u8> {
+        match (self.start_filter, self.exact_start_byte_set) {
+            (Some(filter), None) => Some(filter.scan_offset),
+            (None, Some(exact)) => Some(exact.scan_offset),
+            _ => None,
+        }
+    }
+
     const fn has_prefix_guard(self) -> bool {
         self.prefix_filter.is_some()
             || self.prefix_relation.is_some()
@@ -1726,42 +1849,33 @@ fn lower_native_dfa(
         vector_cost_model,
         relation_vector_owns_route,
     )?;
-    let sve_filter_plan = install_aarch64_sve_filter_plan(&mut data, layout, target)?;
-    let start_accelerator = selected_start_accelerator(layout, target, sve_filter_plan);
-    let vector_start_emitted = layout.start_filter.is_some_and(|filter| {
-        filter.candidate_bytes != 0
-            && !filter.ranges().is_empty()
-            && match target.architecture {
-                // SSE2 is part of the x86-64 baseline used by this lowering.
-                Architecture::X86_64 => true,
-                Architecture::Aarch64 => {
-                    sve_filter_plan.is_some()
-                        || target.features.has(CpuFeature::Aarch64Asimd)
-                }
-            }
-    });
-    if view.retained_prefix_requirement.is_some_and(|requirement| {
-        !retained_prefix_scanner_is_preserved(
-            layout.start_filter,
-            vector_start_emitted,
-            requirement,
-        )
-    }) {
+    // An optional exact-set allocation may decline transactionally. A
+    // mandatory retained program must never reach a backend with the
+    // corresponding accelerated cell bits but no installed primary scanner.
+    if view.retained_prefix_requirement.is_some() && !layout.has_start_scanner() {
         return Ok(None);
     }
-    let (code, relocations) = match target.architecture {
-        Architecture::X86_64 => lower_x86_64_dfa(layout, target.features)?,
-        Architecture::Aarch64 => lower_aarch64_dfa_for_operating_system(
+    let sve_filter_plan = install_aarch64_sve_filter_plan(&mut data, layout, target)?;
+    let emission = match target.architecture {
+        Architecture::X86_64 => lower_x86_64_dfa_with_emission(layout, target.features)?,
+        Architecture::Aarch64 => lower_aarch64_dfa_for_operating_system_with_emission(
             layout,
             target.features,
             target.operating_system,
             sve_filter_plan,
         )?,
     };
+    if view.retained_prefix_requirement.is_some_and(|requirement| {
+        !retained_prefix_scanner_is_preserved(emission.scanner, requirement)
+    }) {
+        return Ok(None);
+    }
+    let start_accelerator =
+        selected_start_accelerator(layout, target, sve_filter_plan, emission.scanner);
     Ok(Some(NativeLowering {
-        code,
+        code: emission.code,
         data,
-        relocations,
+        relocations: emission.relocations,
         needs_runtime: false,
         start_accelerator,
         anchored_prefix_filter_bytes: layout
@@ -1771,24 +1885,84 @@ fn lower_native_dfa(
 }
 
 fn retained_prefix_scanner_is_preserved(
-    start_filter: Option<NativeStartFilter>,
-    vector_start_emitted: bool,
+    emission: Option<NativeScannerEmission>,
     requirement: NativeRetainedPrefixRequirement,
 ) -> bool {
-    let Some(filter) = start_filter else {
+    let Some(emission) = emission else {
         return false;
     };
-    if filter.scan_offset != requirement.scan_offset || !vector_start_emitted {
-        return false;
-    }
+    emission.vectorized
+        && emission.scan_offset == requirement.scan_offset
+        && emission.membership == requirement.membership
+}
+
+fn start_filter_membership(filter: NativeStartFilter) -> Result<[u64; 4], ObjectError> {
     let mut membership = [0_u64; 4];
     for range in filter.ranges() {
+        if range.start > range.end {
+            return Err(ObjectError::InvalidModule(
+                "native start-filter range is reversed",
+            ));
+        }
         for byte in u16::from(range.start)..=u16::from(range.end) {
             let byte = usize::from(byte);
             membership[byte / 64] |= 1_u64 << (byte % 64);
         }
     }
-    membership == requirement.membership
+    let cardinality = membership.iter().try_fold(0_u16, |count, word| {
+        count.checked_add(u16::try_from(word.count_ones()).ok()?)
+    });
+    if cardinality != Some(filter.candidate_bytes) {
+        return Err(ObjectError::InvalidModule(
+            "native start-filter cardinality is inconsistent",
+        ));
+    }
+    Ok(membership)
+}
+
+fn x86_range_scanner_emission(
+    filter: NativeStartFilter,
+    kind: X86StartFilterKind,
+) -> Result<NativeScannerEmission, ObjectError> {
+    let isa = match kind {
+        X86StartFilterKind::Sse2 => NativeScannerIsa::X86Sse2,
+        X86StartFilterKind::Avx2 => NativeScannerIsa::X86Avx2,
+        X86StartFilterKind::Avx512Bw => NativeScannerIsa::X86Avx512Bw,
+    };
+    Ok(NativeScannerEmission {
+        scan_offset: filter.scan_offset,
+        membership: start_filter_membership(filter)?,
+        isa,
+        vectorized: true,
+    })
+}
+
+fn aarch64_range_scanner_emission(
+    filter: NativeStartFilter,
+    use_sve_filter: bool,
+    use_asimd_filter: bool,
+    sve_filter_plan: Option<Aarch64SveFilterPlan>,
+) -> Result<NativeScannerEmission, ObjectError> {
+    let (isa, vectorized) = if use_sve_filter {
+        (
+            if sve_filter_plan.is_some_and(Aarch64SveFilterPlan::uses_sve2) {
+                NativeScannerIsa::Aarch64Sve2
+            } else {
+                NativeScannerIsa::Aarch64Sve
+            },
+            true,
+        )
+    } else if use_asimd_filter {
+        (NativeScannerIsa::Aarch64Asimd, true)
+    } else {
+        (NativeScannerIsa::Aarch64ScalarRange, false)
+    };
+    Ok(NativeScannerEmission {
+        scan_offset: filter.scan_offset,
+        membership: start_filter_membership(filter)?,
+        isa,
+        vectorized,
+    })
 }
 
 #[allow(
@@ -1799,14 +1973,12 @@ fn selected_start_accelerator(
     layout: NativeDfaLayout,
     target: Target,
     sve_filter_plan: Option<Aarch64SveFilterPlan>,
+    scanner_emission: Option<NativeScannerEmission>,
 ) -> StartAccelerator {
-    let filter = match layout.start_filter {
-        Some(filter) => Some(filter),
-        None => match layout.suffix_filter {
-            Some(suffix) => Some(suffix.filter),
-            None => None,
-        },
-    };
+    if let Some(emission) = scanner_emission {
+        return emission.start_accelerator();
+    }
+    let filter = layout.suffix_filter.map(|suffix| suffix.filter);
     let Some(filter) = filter else {
         return StartAccelerator::None;
     };
@@ -2102,26 +2274,47 @@ fn build_native_dfa_table_with_cost_model(
     // the portable entry's exact root scanner. Prefer that same byte column
     // over the ordinary complete-DFA cost ranking; later admission also
     // verifies the emitted target tier and exact reconstructed membership.
-    let exact_start_filter = if let Some(requirement) = view.retained_prefix_requirement {
-        filter_from_membership_words(
-            requirement.membership,
-            usize::from(requirement.scan_offset),
-            true,
-        )?
-    } else {
-        derive_start_filter(view)?
-    };
+    let (exact_start_filter, requested_exact_start_byte_set) =
+        if let Some(requirement) = view.retained_prefix_requirement {
+            let range_filter = filter_from_membership_words(
+                requirement.membership,
+                usize::from(requirement.scan_offset),
+                true,
+            )?;
+            let exact = if range_filter.is_none() {
+                NativeExactByteSet::from_membership(
+                    requirement.membership,
+                    requirement.scan_offset,
+                    true,
+                )
+            } else {
+                None
+            };
+            (range_filter, exact)
+        } else {
+            (derive_start_filter(view)?, None)
+        };
+    if view.retained_prefix_requirement.is_some()
+        && exact_start_filter.is_none()
+        && requested_exact_start_byte_set.is_none()
+    {
+        return Err(ObjectError::InvalidModule(
+            "mandatory retained primary has invalid exact membership",
+        ));
+    }
     let mut selected_suffix_filter = derive_suffix_filter(view)?;
     let coalesced_start_filter =
         if view.retained_prefix_requirement.is_none()
             && ENABLE_NATIVE_COALESCED_INITIAL_FILTER
             && exact_start_filter.is_none()
+            && requested_exact_start_byte_set.is_none()
         {
             derive_coalesced_initial_start_filter(view)?
         } else {
             None
         };
     let start_filter = exact_start_filter.or(coalesced_start_filter);
+    let has_start_scanner = start_filter.is_some() || requested_exact_start_byte_set.is_some();
     // Both accelerators skip the same initial-state self-loop bytes. Once the
     // coalesced scanner is admitted, retaining a cost-rejected suffix prepass
     // would pay two moving scans before the ordinary DFA and recreate the
@@ -2141,6 +2334,7 @@ fn build_native_dfa_table_with_cost_model(
     )?;
     let retains_asimd_candidate_mask = architecture == Architecture::Aarch64
         && (start_filter.is_some_and(|filter| !filter.ranges().is_empty())
+            || requested_exact_start_byte_set.is_some()
             || suffix_filter.is_some_and(|suffix| !suffix.filter.ranges().is_empty())
             || loop_skip.is_some());
     let reverse_offset =
@@ -2154,28 +2348,44 @@ fn build_native_dfa_table_with_cost_model(
         .ok_or(ObjectError::ArithmeticOverflow("native DFA data bytes"))?;
     let filtered_prefix_position = start_filter
         .filter(|filter| filter.from_anchored_prefix)
-        .map(|filter| usize::from(filter.scan_offset));
+        .map(|filter| usize::from(filter.scan_offset))
+        .or_else(|| {
+            requested_exact_start_byte_set
+                .filter(|set| set.from_anchored_prefix)
+                .map(|set| usize::from(set.scan_offset))
+        });
     let candidate_guard_active = start_filter
-        .is_some_and(|filter| filter.candidate_bytes != 0 && !filter.ranges().is_empty());
+        .is_some_and(|filter| filter.candidate_bytes != 0 && !filter.ranges().is_empty())
+        || requested_exact_start_byte_set.is_some();
     let prefix_block_plan = candidate_guard_active
         .then(|| prefix_block::derive(view.anchored_prefix.sets()))
         .flatten();
-    let prefix_relation = derive_native_prefix_relation(view, start_filter);
+    // The first exact-set version deliberately keeps secondary-column SIMD
+    // planning disabled. Scalar prefix predicates still verify every other
+    // selective column after an exact primary hit.
+    let prefix_relation = requested_exact_start_byte_set
+        .is_none()
+        .then(|| derive_native_prefix_relation(view, start_filter))
+        .flatten();
     let prefix_relation_vector = prefix_relation
         .as_ref()
         .and_then(|relation| derive_native_prefix_relation_vector(relation, architecture));
     // A vectorized relation supersedes multicolumn scanning in both native
     // backends. Retain established planning when the cheaper SVE2 column
     // model would not be consumed by the emitted direct scanner.
-    let vector_filter = derive_vector_filter_with_cost_model(
-        start_filter,
-        view.anchored_prefix.sets(),
-        if relation_vector_owns_route && prefix_relation_vector.is_some() {
-            NativeVectorFilterCostModel::Established
-        } else {
-            vector_cost_model
-        },
-    )?;
+    let vector_filter = if requested_exact_start_byte_set.is_some() {
+        None
+    } else {
+        derive_vector_filter_with_cost_model(
+            start_filter,
+            view.anchored_prefix.sets(),
+            if relation_vector_owns_route && prefix_relation_vector.is_some() {
+                NativeVectorFilterCostModel::Established
+            } else {
+                vector_cost_model
+            },
+        )?
+    };
     let selective_prefix_positions = view
         .anchored_prefix
         .sets()
@@ -2455,7 +2665,7 @@ fn build_native_dfa_table_with_cost_model(
                         forward_offset,
                         row_bytes,
                         forward_states,
-                        start_filter.is_some(),
+                        has_start_scanner,
                         loop_skip.map(|plan| plan.state),
                         cells,
                     )?,
@@ -2484,7 +2694,7 @@ fn build_native_dfa_table_with_cost_model(
                             forward_offset,
                             row_bytes,
                             forward_states,
-                            start_filter.is_some(),
+                            has_start_scanner,
                             loop_skip.map(|plan| plan.state),
                             cells,
                         )?,
@@ -2615,6 +2825,13 @@ fn build_native_dfa_table_with_cost_model(
         .map(|plan| append_native_prefix_block(&mut bytes, plan, maximum_table_bytes))
         .transpose()?
         .flatten();
+    let exact_start_storage = requested_exact_start_byte_set
+        .map(|set| {
+            append_native_exact_byte_set(&mut bytes, set, architecture, maximum_table_bytes)
+        })
+        .transpose()?
+        .flatten();
+    let exact_start_byte_set = exact_start_storage.and(requested_exact_start_byte_set);
     Ok((
         bytes,
         NativeDfaLayout {
@@ -2630,6 +2847,8 @@ fn build_native_dfa_table_with_cost_model(
             exact_prefix_match_width,
             output: view.output,
             start_filter,
+            exact_start_byte_set,
+            exact_start_storage,
             suffix_filter,
             declined_redundant_root_reverse,
             seeded_reverse,
@@ -3074,6 +3293,99 @@ fn append_native_prefix_block(
         expected_offset,
         byte_mask_offset,
         lane_mask: plan.lane_mask(),
+    }))
+}
+
+/// Install one exact primary's canonical constants as a single transaction.
+///
+/// Failure to reserve the fixed auxiliary extent declines only this optional
+/// native representation. The caller will then reject mandatory publication
+/// and retain the established runtime route; no partially initialized offset
+/// becomes visible in a layout.
+fn append_native_exact_byte_set(
+    bytes: &mut Vec<u8>,
+    set: NativeExactByteSet,
+    architecture: Architecture,
+    maximum_table_bytes: usize,
+) -> Result<Option<NativeExactByteSetStorage>, ObjectError> {
+    const BITMAP_ALIGNMENT: usize = core::mem::align_of::<u64>();
+    const BITMAP_BYTES: usize = 4 * core::mem::size_of::<u64>();
+    const LUT_BYTES: usize = 256;
+
+    if !set.is_valid() {
+        return Err(ObjectError::InvalidModule(
+            "native exact-set membership is inconsistent",
+        ));
+    }
+
+    let aligned = bytes
+        .len()
+        .checked_add(BITMAP_ALIGNMENT - 1)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "native exact-set alignment",
+        ))?
+        & !(BITMAP_ALIGNMENT - 1);
+    let bitmap_end = aligned
+        .checked_add(BITMAP_BYTES)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "native exact-set bitmap bytes",
+        ))?;
+    let end = bitmap_end
+        .checked_add(if architecture == Architecture::Aarch64 {
+            LUT_BYTES
+        } else {
+            0
+        })
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "native exact-set table bytes",
+        ))?;
+    if end > maximum_table_bytes {
+        return Ok(None);
+    }
+    if architecture == Architecture::X86_64 && i32::try_from(aligned).is_err() {
+        // x86-64's compact BT form sign-extends its disp32 from the stable R9
+        // table base. Decline instead of letting a large positive table
+        // offset address backwards.
+        return Ok(None);
+    }
+    let additional = end
+        .checked_sub(bytes.len())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "native exact-set table bytes",
+        ))?;
+    if bytes.try_reserve_exact(additional).is_err() {
+        return Ok(None);
+    }
+
+    let bitmap_offset = u32::try_from(aligned)
+        .map_err(|_| ObjectError::ArithmeticOverflow("native exact-set bitmap offset"))?;
+    bytes.resize(aligned, 0);
+    for word in set.membership {
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    if bytes.len() != bitmap_end {
+        return Err(ObjectError::InvalidModule(
+            "native exact-set bitmap changed extent",
+        ));
+    }
+    let aarch64_lut_offset = if architecture == Architecture::Aarch64 {
+        let offset = u32::try_from(bitmap_end)
+            .map_err(|_| ObjectError::ArithmeticOverflow("native exact-set LUT offset"))?;
+        for byte in u8::MIN..=u8::MAX {
+            bytes.push(u8::from(set.contains(byte)));
+        }
+        Some(offset)
+    } else {
+        None
+    };
+    if bytes.len() != end {
+        return Err(ObjectError::InvalidModule(
+            "native exact-set constants changed extent",
+        ));
+    }
+    Ok(Some(NativeExactByteSetStorage {
+        bitmap_offset,
+        aarch64_lut_offset,
     }))
 }
 
@@ -5724,6 +6036,72 @@ fn x86_emit_start_filter_scalar_load(
     Ok(())
 }
 
+fn x86_emit_exact_byte_set_scalar_load(
+    assembler: &mut X86Assembler,
+    scan_offset: u16,
+) -> Result<(), ObjectError> {
+    if scan_offset == 0 {
+        assembler.instruction(&[0x0f, 0xb6, 0x04, 0x17])?;
+    } else if let Ok(displacement) = u8::try_from(scan_offset)
+        && displacement <= 0x7f
+    {
+        assembler.instruction(&[0x0f, 0xb6, 0x44, 0x17, displacement])?;
+    } else {
+        let mut instruction = vec![0x0f, 0xb6, 0x84, 0x17];
+        instruction.extend_from_slice(&i32::from(scan_offset).to_le_bytes());
+        assembler.instruction(&instruction)?;
+    }
+    Ok(())
+}
+
+fn x86_emit_exact_byte_set_scalar_bound(
+    assembler: &mut X86Assembler,
+    scan_offset: u8,
+    exhausted: X86Label,
+) -> Result<(), ObjectError> {
+    if scan_offset == 0 {
+        assembler.instruction(&[0x48, 0x39, 0xca])?; // cmp position, end
+    } else if scan_offset <= 0x7f {
+        assembler.instruction(&[0x48, 0x8d, 0x42, scan_offset])?;
+        assembler.instruction(&[0x48, 0x39, 0xc8])?;
+    } else {
+        let mut address = vec![0x48, 0x8d, 0x82]; // lea disp32(position), scratch
+        address.extend_from_slice(&i32::from(scan_offset).to_le_bytes());
+        assembler.instruction(&address)?;
+        assembler.instruction(&[0x48, 0x39, 0xc8])?;
+    }
+    assembler.branch(&[0x0f, 0x83], exhausted)?;
+    Ok(())
+}
+
+/// Test EAX's byte value against the canonical little-endian 256-bit bitmap.
+/// `BT [r9 + bitmap], rax` treats the four words as one contiguous bit string.
+fn x86_emit_exact_byte_set_test(
+    assembler: &mut X86Assembler,
+    storage: NativeExactByteSetStorage,
+    member: X86Label,
+) -> Result<(), ObjectError> {
+    if storage.aarch64_lut_offset.is_some() {
+        return Err(ObjectError::InvalidModule(
+            "x86 exact-set scanner received an AArch64 LUT",
+        ));
+    }
+    let displacement = x86_exact_bitmap_displacement(storage)?;
+    let mut test = vec![0x49, 0x0f, 0xa3, 0x81];
+    test.extend_from_slice(&displacement.to_le_bytes());
+    assembler.instruction(&test)?;
+    assembler.branch(&[0x0f, 0x82], member)?; // jc
+    Ok(())
+}
+
+fn x86_exact_bitmap_displacement(
+    storage: NativeExactByteSetStorage,
+) -> Result<i32, ObjectError> {
+    i32::try_from(storage.bitmap_offset).map_err(|_| {
+        ObjectError::InvalidModule("x86 exact-set bitmap exceeds signed displacement")
+    })
+}
+
 fn x86_emit_start_filter_scalar_bound(
     assembler: &mut X86Assembler,
     scan_offset: u8,
@@ -7115,10 +7493,10 @@ fn x86_emit_exact_start_probe(
         .ok_or(ObjectError::InvalidModule(
             "x86 exact-start width is absent",
         ))?;
-    let primary = layout.start_filter.ok_or(ObjectError::InvalidModule(
+    let primary_offset = layout.start_scanner_offset().ok_or(ObjectError::InvalidModule(
         "x86 exact-start probe has no primary",
     ))?;
-    if primary.scan_offset >= width {
+    if primary_offset >= width {
         return Err(ObjectError::InvalidModule(
             "x86 exact-start primary is outside its product",
         ));
@@ -7145,9 +7523,23 @@ fn x86_emit_exact_start_probe(
     }
     if layout
         .prefix_block
-        .is_none_or(|block| !block.covers_position(primary.scan_offset))
+        .is_none_or(|block| !block.covers_position(primary_offset))
     {
-        x86_emit_scalar_filter_membership(assembler, primary, failed)?;
+        if let Some(primary) = layout.start_filter {
+            x86_emit_scalar_filter_membership(assembler, primary, failed)?;
+        } else {
+            let exact = layout.exact_start_byte_set.ok_or(ObjectError::InvalidModule(
+                "x86 exact-start probe lost its exact primary",
+            ))?;
+            let storage = layout.exact_start_storage.ok_or(ObjectError::InvalidModule(
+                "x86 exact-start probe has no canonical storage",
+            ))?;
+            x86_emit_exact_byte_set_scalar_load(assembler, u16::from(exact.scan_offset))?;
+            let member = assembler.label()?;
+            x86_emit_exact_byte_set_test(assembler, storage, member)?;
+            assembler.branch(&[0xe9], failed)?;
+            assembler.bind(member)?;
+        }
     }
     if let Some(prefix) = layout.prefix_filter {
         for &predicate in prefix.predicates() {
@@ -7182,10 +7574,17 @@ fn x86_emit_start_filter_range_vector_test(
     clippy::too_many_lines,
     reason = "the specialized forward/reverse control-flow graph is kept contiguous for auditing"
 )]
-fn lower_x86_64_dfa(
+fn lower_x86_64_dfa_with_emission(
     layout: NativeDfaLayout,
     features: FeatureSet,
-) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
+) -> Result<NativeDfaEmission, ObjectError> {
+    if layout.start_filter.is_some() && layout.exact_start_byte_set.is_some()
+        || layout.exact_start_byte_set.is_some() != layout.exact_start_storage.is_some()
+    {
+        return Err(ObjectError::InvalidModule(
+            "x86 primary scanner layout is inconsistent",
+        ));
+    }
     let mut assembler = X86Assembler::new();
     let scan = assembler.label()?;
     let scalar_scan = assembler.label()?;
@@ -7234,7 +7633,9 @@ fn lower_x86_64_dfa(
                 .filter(|filter| !filter.ranges().is_empty())
         })
         .or_else(|| layout.loop_skip.map(|skip| skip.filter));
-    let filter_kind = instruction_filter.map(|_| x86_start_filter_kind(features));
+    let filter_kind = (layout.exact_start_byte_set.is_some() || instruction_filter.is_some())
+        .then(|| x86_start_filter_kind(features));
+    let mut scanner_emission = None;
     let prefix_relation_vector = layout
         .prefix_relation
         .and_then(|relation| relation.vector_plan);
@@ -7376,12 +7777,19 @@ fn lower_x86_64_dfa(
         assembler.branch(&[0x0f, 0x85], scalar_scan)?;
 
         if filter.ranges().is_empty() {
+            scanner_emission = Some(NativeScannerEmission {
+                scan_offset: filter.scan_offset,
+                membership: start_filter_membership(filter)?,
+                isa: NativeScannerIsa::ScalarEmpty,
+                vectorized: false,
+            });
             assembler.instruction(&[0x48, 0x89, 0xca])?; // position = end
             assembler.branch(&[0xe9], finish)?;
         } else {
             let kind = filter_kind.ok_or(ObjectError::InvalidModule(
                 "x86 start filter has no instruction selection",
             ))?;
+            scanner_emission = Some(x86_range_scanner_emission(filter, kind)?);
             let maximum_scan_offset = prefix_relation_vector.map_or_else(
                 || vector_filter.map_or(filter.scan_offset, NativeVectorFilter::max_scan_offset),
                 |_| 1,
@@ -7524,6 +7932,87 @@ fn lower_x86_64_dfa(
                 },
             )?;
         }
+    } else if let Some(exact) = layout.exact_start_byte_set {
+        let storage = layout.exact_start_storage.ok_or(ObjectError::InvalidModule(
+            "x86 exact scanner has no canonical storage",
+        ))?;
+        if storage.aarch64_lut_offset.is_some()
+            || !storage.bitmap_offset.is_multiple_of(8)
+            || !exact.is_valid()
+        {
+            return Err(ObjectError::InvalidModule(
+                "x86 exact scanner storage is malformed",
+            ));
+        }
+        scanner_emission = Some(NativeScannerEmission {
+            scan_offset: exact.scan_offset,
+            membership: exact.membership,
+            isa: NativeScannerIsa::X86ScalarBitmap,
+            vectorized: false,
+        });
+        if layout.output != OutputContract::Exists {
+            assembler.instruction(&[0x49, 0x83, 0xfb, 0xff])?; // cmp r11, -1
+            assembler.branch(&[0x0f, 0x85], scalar_scan)?;
+        }
+        let mut initial_row = vec![0x49, 0x8d, 0x81];
+        initial_row.extend_from_slice(&layout.forward_offset.to_le_bytes());
+        assembler.instruction(&initial_row)?;
+        assembler.instruction(&[0x49, 0x39, 0xc2])?;
+        assembler.branch(&[0x0f, 0x85], scalar_scan)?;
+
+        let unrolled = assembler.label()?;
+        let scalar = assembler.label()?;
+        let lane_one = assembler.label()?;
+        let lane_two = assembler.label()?;
+        let lane_three = assembler.label()?;
+        assembler.bind(unrolled)?;
+        assembler.instruction(&[0x48, 0x89, 0xc8])?; // remaining = end
+        assembler.instruction(&[0x48, 0x29, 0xd0])?; // remaining -= position
+        let required = u32::from(exact.scan_offset)
+            .checked_add(4)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "x86 exact scanner unrolled bound",
+            ))?;
+        let mut compare = vec![0x48, 0x3d];
+        compare.extend_from_slice(&required.to_le_bytes());
+        assembler.instruction(&compare)?;
+        assembler.branch(&[0x0f, 0x82], scalar)?;
+        x86_emit_exact_byte_set_scalar_load(&mut assembler, u16::from(exact.scan_offset))?;
+        x86_emit_exact_byte_set_test(&mut assembler, storage, candidate)?;
+        x86_emit_exact_byte_set_scalar_load(
+            &mut assembler,
+            u16::from(exact.scan_offset) + 1,
+        )?;
+        x86_emit_exact_byte_set_test(&mut assembler, storage, lane_one)?;
+        x86_emit_exact_byte_set_scalar_load(
+            &mut assembler,
+            u16::from(exact.scan_offset) + 2,
+        )?;
+        x86_emit_exact_byte_set_test(&mut assembler, storage, lane_two)?;
+        x86_emit_exact_byte_set_scalar_load(
+            &mut assembler,
+            u16::from(exact.scan_offset) + 3,
+        )?;
+        x86_emit_exact_byte_set_test(&mut assembler, storage, lane_three)?;
+        assembler.instruction(&[0x48, 0x83, 0xc2, 4])?;
+        assembler.branch(&[0xe9], unrolled)?;
+
+        assembler.bind(lane_three)?;
+        assembler.instruction(&[0x48, 0x83, 0xc2, 3])?;
+        assembler.branch(&[0xe9], candidate)?;
+        assembler.bind(lane_two)?;
+        assembler.instruction(&[0x48, 0x83, 0xc2, 2])?;
+        assembler.branch(&[0xe9], candidate)?;
+        assembler.bind(lane_one)?;
+        assembler.instruction(&[0x48, 0xff, 0xc2])?;
+        assembler.branch(&[0xe9], candidate)?;
+
+        assembler.bind(scalar)?;
+        x86_emit_exact_byte_set_scalar_bound(&mut assembler, exact.scan_offset, finish)?;
+        x86_emit_exact_byte_set_scalar_load(&mut assembler, u16::from(exact.scan_offset))?;
+        x86_emit_exact_byte_set_test(&mut assembler, storage, candidate)?;
+        assembler.instruction(&[0x48, 0xff, 0xc2])?;
+        assembler.branch(&[0xe9], scalar)?;
     }
 
     if layout.has_prefix_guard() {
@@ -7847,16 +8336,31 @@ fn lower_x86_64_dfa(
     }
 
     let code = finished.code;
-    Ok((
-        code,
-        vec![ModuleRelocation {
+    let relocations = vec![ModuleRelocation {
             section: TEXT_SECTION,
             offset: offset_u64(table_displacement, "x86 DFA table relocation offset")?,
             kind: RelocationKind::X86PcRelative32,
             symbol: PROGRAM_SYMBOL,
             addend: -4,
-        }],
-    ))
+        }];
+    Ok(NativeDfaEmission {
+        code,
+        relocations,
+        scanner: scanner_emission,
+    })
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::large_types_passed_by_value,
+    reason = "the test-only compatibility wrapper consumes the same copyable layout as the receipt-returning backend"
+)]
+fn lower_x86_64_dfa(
+    layout: NativeDfaLayout,
+    features: FeatureSet,
+) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
+    let emission = lower_x86_64_dfa_with_emission(layout, features)?;
+    Ok((emission.code, emission.relocations))
 }
 
 fn lower_x86_64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
@@ -9206,10 +9710,10 @@ fn aarch64_emit_exact_start_probe(
         .ok_or(ObjectError::InvalidModule(
             "AArch64 exact-start width is absent",
         ))?;
-    let primary = layout.start_filter.ok_or(ObjectError::InvalidModule(
+    let primary_offset = layout.start_scanner_offset().ok_or(ObjectError::InvalidModule(
         "AArch64 exact-start probe has no primary",
     ))?;
-    if primary.scan_offset >= width {
+    if primary_offset >= width {
         return Err(ObjectError::InvalidModule(
             "AArch64 exact-start primary is outside its product",
         ));
@@ -9234,9 +9738,23 @@ fn aarch64_emit_exact_start_probe(
     if !use_prefix_block
         || layout
             .prefix_block
-            .is_none_or(|block| !block.covers_position(primary.scan_offset))
+            .is_none_or(|block| !block.covers_position(primary_offset))
     {
-        aarch64_emit_scalar_filter_membership(assembler, primary, failed)?;
+        if let Some(primary) = layout.start_filter {
+            aarch64_emit_scalar_filter_membership(assembler, primary, failed)?;
+        } else {
+            let exact = layout.exact_start_byte_set.ok_or(ObjectError::InvalidModule(
+                "AArch64 exact-start probe lost its exact primary",
+            ))?;
+            let storage = layout.exact_start_storage.ok_or(ObjectError::InvalidModule(
+                "AArch64 exact-start probe has no canonical storage",
+            ))?;
+            aarch64_emit_start_filter_scalar_load(assembler, exact.scan_offset)?;
+            let member = assembler.label()?;
+            aarch64_emit_exact_byte_set_test(assembler, storage, member)?;
+            assembler.branch(failed)?;
+            assembler.bind(member)?;
+        }
     }
     if let Some(prefix) = layout.prefix_filter {
         for &predicate in prefix.predicates() {
@@ -11251,6 +11769,32 @@ fn aarch64_emit_start_filter_scalar_load(
     Ok(())
 }
 
+/// Test the byte already loaded in W8 through the canonical 0/1 LUT.
+fn aarch64_emit_exact_byte_set_test(
+    assembler: &mut Aarch64Assembler,
+    storage: NativeExactByteSetStorage,
+    member: Aarch64Label,
+) -> Result<(), ObjectError> {
+    let lut_offset = storage
+        .aarch64_lut_offset
+        .ok_or(ObjectError::InvalidModule(
+            "AArch64 exact-set scanner has no LUT",
+        ))?;
+    aarch64_set_table_address(assembler, 12, lut_offset)?;
+    aarch64_emit_exact_byte_set_lut_test(assembler, 12, member)
+}
+
+fn aarch64_emit_exact_byte_set_lut_test(
+    assembler: &mut Aarch64Assembler,
+    lut_base: u8,
+    member: Aarch64Label,
+) -> Result<(), ObjectError> {
+    assembler.instruction(aarch64_load_byte_reg(8, lut_base, 8)?)?;
+    assembler.instruction(aarch64_cmp_w_imm(8, 0)?)?;
+    assembler.branch_cond(AARCH64_NE, member)?;
+    Ok(())
+}
+
 fn aarch64_emit_suffix_lower_bound(
     assembler: &mut Aarch64Assembler,
     backtrack: u64,
@@ -11684,12 +12228,40 @@ const fn aarch64_use_exact_first_lane(_operating_system: OperatingSystem) -> boo
     clippy::too_many_lines,
     reason = "the specialized forward/reverse control-flow graph is kept contiguous for auditing"
 )]
+#[cfg(test)]
 fn lower_aarch64_dfa_for_operating_system(
     layout: NativeDfaLayout,
     features: FeatureSet,
     operating_system: OperatingSystem,
     sve_filter_plan: Option<Aarch64SveFilterPlan>,
 ) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
+    let emission = lower_aarch64_dfa_for_operating_system_with_emission(
+        layout,
+        features,
+        operating_system,
+        sve_filter_plan,
+    )?;
+    Ok((emission.code, emission.relocations))
+}
+
+#[allow(
+    clippy::large_types_passed_by_value,
+    clippy::too_many_lines,
+    reason = "the specialized forward/reverse control-flow graph is kept contiguous for auditing"
+)]
+fn lower_aarch64_dfa_for_operating_system_with_emission(
+    layout: NativeDfaLayout,
+    features: FeatureSet,
+    operating_system: OperatingSystem,
+    sve_filter_plan: Option<Aarch64SveFilterPlan>,
+) -> Result<NativeDfaEmission, ObjectError> {
+    if layout.start_filter.is_some() && layout.exact_start_byte_set.is_some()
+        || layout.exact_start_byte_set.is_some() != layout.exact_start_storage.is_some()
+    {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 primary scanner layout is inconsistent",
+        ));
+    }
     let mut assembler = Aarch64Assembler::new();
     let scan = assembler.label()?;
     let scalar_scan = assembler.label()?;
@@ -11764,6 +12336,7 @@ fn lower_aarch64_dfa_for_operating_system(
         && layout
             .start_filter
             .is_some_and(|filter| !filter.ranges().is_empty());
+    let mut scanner_emission = None;
     let sve_suffix_kind = selected_aarch64_sve_suffix_kind(layout, features, operating_system);
     let use_asimd_suffix = features.has(CpuFeature::Aarch64Asimd)
         && layout
@@ -11931,9 +12504,21 @@ fn lower_aarch64_dfa_for_operating_system(
         assembler.branch_cond(AARCH64_NE, scalar_scan)?;
 
         if filter.ranges().is_empty() {
+            scanner_emission = Some(NativeScannerEmission {
+                scan_offset: filter.scan_offset,
+                membership: start_filter_membership(filter)?,
+                isa: NativeScannerIsa::ScalarEmpty,
+                vectorized: false,
+            });
             assembler.instruction(aarch64_mov_x(2, 3)?)?;
             assembler.branch(finish)?;
         } else {
+            scanner_emission = Some(aarch64_range_scanner_emission(
+                filter,
+                use_sve_filter,
+                use_asimd_filter,
+                sve_filter_plan,
+            )?);
             let maximum_scan_offset = prefix_relation_vector.map_or_else(
                 || vector_filter.map_or(filter.scan_offset, NativeVectorFilter::max_scan_offset),
                 |_| 1,
@@ -12183,6 +12768,49 @@ fn lower_aarch64_dfa_for_operating_system(
                 assembler.branch(filter_scalar)?;
             }
         }
+    } else if let Some(exact) = layout.exact_start_byte_set {
+        let storage = layout.exact_start_storage.ok_or(ObjectError::InvalidModule(
+            "AArch64 exact scanner has no canonical storage",
+        ))?;
+        if !storage.bitmap_offset.is_multiple_of(8)
+            || storage.aarch64_lut_offset
+                != storage.bitmap_offset.checked_add(32)
+            || !exact.is_valid()
+        {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 exact scanner storage is malformed",
+            ));
+        }
+        scanner_emission = Some(NativeScannerEmission {
+            scan_offset: exact.scan_offset,
+            membership: exact.membership,
+            isa: NativeScannerIsa::Aarch64ScalarLut,
+            vectorized: false,
+        });
+        if layout.output != OutputContract::Exists {
+            assembler.instruction(aarch64_cmp_x(7, 13)?)?;
+            assembler.branch_cond(AARCH64_NE, scalar_scan)?;
+        }
+        aarch64_set_table_address(&mut assembler, 12, layout.forward_offset)?;
+        assembler.instruction(aarch64_cmp_x(11, 12)?)?;
+        assembler.branch_cond(AARCH64_NE, scalar_scan)?;
+        aarch64_set_table_address(
+            &mut assembler,
+            6,
+            storage
+                .aarch64_lut_offset
+                .ok_or(ObjectError::InvalidModule(
+                    "AArch64 exact scanner has no LUT",
+                ))?,
+        )?;
+
+        let exact_scalar = assembler.label()?;
+        assembler.bind(exact_scalar)?;
+        aarch64_emit_start_filter_scalar_bound(&mut assembler, exact.scan_offset, finish)?;
+        aarch64_emit_start_filter_scalar_load(&mut assembler, exact.scan_offset)?;
+        aarch64_emit_exact_byte_set_lut_test(&mut assembler, 6, candidate)?;
+        assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+        assembler.branch(exact_scalar)?;
     }
 
     if layout.has_prefix_guard() {
@@ -12443,9 +13071,7 @@ fn lower_aarch64_dfa_for_operating_system(
 
     let mut relocation_offsets = [table_page, table_page_offset];
     let code = assembler.finish_with_offsets(&mut relocation_offsets)?;
-    Ok((
-        code,
-        vec![
+    let relocations = vec![
             ModuleRelocation {
                 section: TEXT_SECTION,
                 offset: offset_u64(relocation_offsets[0], "AArch64 DFA ADRP relocation offset")?,
@@ -12460,8 +13086,12 @@ fn lower_aarch64_dfa_for_operating_system(
                 symbol: PROGRAM_SYMBOL,
                 addend: 0,
             },
-        ],
-    ))
+        ];
+    Ok(NativeDfaEmission {
+        code,
+        relocations,
+        scanner: scanner_emission,
+    })
 }
 
 fn aarch64_instruction(code: &mut Vec<u8>, instruction: u32) -> Result<(), ObjectError> {
@@ -12681,6 +13311,88 @@ mod tests {
         }
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bounded exhaustive-test permutation arithmetic stays within u32 and 256-byte arrays"
+    )]
+    fn exact_membership_with_cardinality(cardinality: u16) -> (NativeExactByteSet, [bool; 256]) {
+        assert!((1..=255).contains(&cardinality));
+        let mut membership = [0_u64; 4];
+        let mut expected = [false; 256];
+        // Multiplication by an odd number permutes every byte and yields
+        // fragmented sets independently of regex syntax.
+        for rank in 0..cardinality {
+            let byte = usize::from(
+                u8::try_from((u32::from(rank) * 73 + 19) & 0xff).expect("permuted byte"),
+            );
+            membership[byte / 64] |= 1_u64 << (byte % 64);
+            expected[byte] = true;
+        }
+        (
+            NativeExactByteSet::from_membership(membership, 0, true)
+                .expect("nontrivial exact byte set"),
+            expected,
+        )
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "canonical storage offsets are constructed and checked by the test fixture"
+    )]
+    fn exact_storage_contains(
+        bytes: &[u8],
+        storage: NativeExactByteSetStorage,
+        architecture: Architecture,
+        byte: u8,
+    ) -> bool {
+        match architecture {
+            Architecture::X86_64 => {
+                let start = usize::try_from(storage.bitmap_offset).expect("bitmap offset");
+                let word_start = start + usize::from(byte / 64) * 8;
+                let word = u64::from_le_bytes(
+                    bytes[word_start..word_start + 8]
+                        .try_into()
+                        .expect("bitmap word"),
+                );
+                word & (1_u64 << (byte % 64)) != 0
+            }
+            Architecture::Aarch64 => {
+                let start = usize::try_from(
+                    storage.aarch64_lut_offset.expect("AArch64 exact-set LUT"),
+                )
+                .expect("LUT offset");
+                bytes[start + usize::from(byte)] != 0
+            }
+        }
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the exhaustive scanner oracle bounds every offset before indexing or advancing"
+    )]
+    fn exact_storage_first_candidate(
+        bytes: &[u8],
+        storage: NativeExactByteSetStorage,
+        architecture: Architecture,
+        haystack: &[u8],
+        mut position: usize,
+        end: usize,
+        scan_offset: usize,
+    ) -> Option<usize> {
+        while position.checked_add(scan_offset)? < end {
+            if exact_storage_contains(
+                bytes,
+                storage,
+                architecture,
+                haystack[position + scan_offset],
+            ) {
+                return Some(position);
+            }
+            position += 1;
+        }
+        None
+    }
+
     #[test]
     fn target_matrix_has_the_platform_abi() {
         let cases = [
@@ -12884,43 +13596,347 @@ mod tests {
             scan_offset: 4,
             membership: [0b1010, 0, 0, 0],
         };
+        let emission = NativeScannerEmission {
+            scan_offset: filter.scan_offset,
+            membership: start_filter_membership(filter).unwrap(),
+            isa: NativeScannerIsa::X86Sse2,
+            vectorized: true,
+        };
         assert!(retained_prefix_scanner_is_preserved(
-            Some(filter),
-            true,
+            Some(emission),
             requirement
         ));
         assert!(!retained_prefix_scanner_is_preserved(
-            Some(filter),
-            false,
+            Some(NativeScannerEmission {
+                vectorized: false,
+                ..emission
+            }),
             requirement
         ));
+        assert!(!retained_prefix_scanner_is_preserved(None, requirement));
         assert!(!retained_prefix_scanner_is_preserved(
-            None,
-            true,
-            requirement
-        ));
-        assert!(!retained_prefix_scanner_is_preserved(
-            Some(NativeStartFilter {
+            Some(NativeScannerEmission {
                 scan_offset: 3,
-                ..filter
+                ..emission
             }),
-            true,
             requirement
         ));
         assert!(!retained_prefix_scanner_is_preserved(
-            Some(NativeStartFilter {
-                ranges: {
-                    let mut coalesced = [EMPTY_NATIVE_BYTE_RANGE; MAX_START_FILTER_RANGES];
-                    coalesced[0] = NativeByteRange { start: 1, end: 3 };
-                    coalesced
-                },
-                range_count: 1,
-                candidate_bytes: 3,
-                ..filter
+            Some(NativeScannerEmission {
+                membership: [0b1110, 0, 0, 0],
+                ..emission
             }),
-            true,
             requirement
         ));
+    }
+
+    #[test]
+    fn exact_byte_set_storage_is_canonical_exhaustive_and_transactional() {
+        assert!(NativeExactByteSet::from_membership([0; 4], 0, true).is_none());
+        assert!(NativeExactByteSet::from_membership([u64::MAX; 4], 0, true).is_none());
+        assert_eq!(
+            x86_exact_bitmap_displacement(NativeExactByteSetStorage {
+                bitmap_offset: u32::try_from(i32::MAX).unwrap(),
+                aarch64_lut_offset: None,
+            })
+            .unwrap(),
+            i32::MAX
+        );
+        assert!(
+            x86_exact_bitmap_displacement(NativeExactByteSetStorage {
+                bitmap_offset: u32::try_from(i32::MAX).unwrap() + 1,
+                aarch64_lut_offset: None,
+            })
+            .is_err()
+        );
+
+        for cardinality in 1_u16..=255 {
+            let (set, expected) = exact_membership_with_cardinality(cardinality);
+            assert_eq!(set.cardinality, cardinality);
+            for byte in u8::MIN..=u8::MAX {
+                assert_eq!(
+                    set.contains(byte),
+                    expected[usize::from(byte)],
+                    "cardinality={cardinality}, byte={byte}"
+                );
+            }
+
+            for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+                let prefix_len = usize::from(cardinality % 8);
+                let prefix = vec![0xa5; prefix_len];
+                let mut bytes = prefix.clone();
+                let storage = append_native_exact_byte_set(
+                    &mut bytes,
+                    set,
+                    architecture,
+                    usize::MAX,
+                )
+                .expect("exact-set append")
+                .expect("exact-set storage");
+                assert_eq!(&bytes[..prefix_len], prefix.as_slice());
+                assert_eq!(usize::try_from(storage.bitmap_offset).unwrap() % 8, 0);
+                let bitmap = usize::try_from(storage.bitmap_offset).unwrap();
+                for (index, word) in set.membership.iter().enumerate() {
+                    let start = bitmap + index * 8;
+                    assert_eq!(&bytes[start..start + 8], &word.to_le_bytes());
+                }
+                assert_eq!(
+                    storage.aarch64_lut_offset.is_some(),
+                    architecture == Architecture::Aarch64
+                );
+                for byte in u8::MIN..=u8::MAX {
+                    assert_eq!(
+                        exact_storage_contains(&bytes, storage, architecture, byte),
+                        expected[usize::from(byte)],
+                        "{architecture:?}, cardinality={cardinality}, byte={byte}"
+                    );
+                }
+            }
+        }
+
+        let (set, _) = exact_membership_with_cardinality(129);
+        for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+            let mut bytes = vec![0x5a; 7];
+            let original = bytes.clone();
+            let bitmap_end = 8 + 32;
+            let required = bitmap_end
+                + if architecture == Architecture::Aarch64 {
+                    256
+                } else {
+                    0
+                };
+            assert_eq!(
+                append_native_exact_byte_set(&mut bytes, set, architecture, required - 1)
+                    .expect("bounded exact-set append"),
+                None
+            );
+            assert_eq!(bytes, original, "{architecture:?} mutated on decline");
+        }
+    }
+
+    #[test]
+    fn exact_scalar_storage_oracle_covers_offsets_tails_and_first_candidate() {
+        for cardinality in [1_u16, 2, 63, 64, 65, 127, 128, 129, 191, 255] {
+            let (set, expected) = exact_membership_with_cardinality(cardinality);
+            for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+                let mut bytes = Vec::new();
+                let storage = append_native_exact_byte_set(
+                    &mut bytes,
+                    set,
+                    architecture,
+                    usize::MAX,
+                )
+                .unwrap()
+                .unwrap();
+                for byte in u8::MIN..=u8::MAX {
+                    let singleton = [byte];
+                    assert_eq!(
+                        exact_storage_first_candidate(
+                            &bytes,
+                            storage,
+                            architecture,
+                            &singleton,
+                            0,
+                            1,
+                            0,
+                        ),
+                        expected[usize::from(byte)].then_some(0),
+                        "{architecture:?}, cardinality={cardinality}, byte={byte}"
+                    );
+                }
+
+                let member_bytes = (u8::MIN..=u8::MAX)
+                    .filter(|&byte| expected[usize::from(byte)])
+                    .take(2)
+                    .collect::<Vec<_>>();
+                let nonmember = (u8::MIN..=u8::MAX)
+                    .find(|&byte| !expected[usize::from(byte)])
+                    .unwrap_or(member_bytes[0]);
+                for scan_offset in [0_usize, 1, 3, 7, 15] {
+                    for tail in 0_usize..=8 {
+                        let mut haystack = vec![nonmember; scan_offset + tail];
+                        let expected_position = if tail == 0 {
+                            None
+                        } else {
+                            let first = (tail - 1).min(2);
+                            haystack[scan_offset + first] = member_bytes[0];
+                            if tail > first + 2 {
+                                haystack[scan_offset + first + 2] =
+                                    *member_bytes.get(1).unwrap_or(&member_bytes[0]);
+                            }
+                            Some(first)
+                        };
+                        assert_eq!(
+                            exact_storage_first_candidate(
+                                &bytes,
+                                storage,
+                                architecture,
+                                &haystack,
+                                0,
+                                haystack.len(),
+                                scan_offset,
+                            ),
+                            expected_position,
+                            "{architecture:?}, cardinality={cardinality}, offset={scan_offset}, tail={tail}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one cross-ISA structural test keeps layout, encoding, receipt, and offset assertions together"
+    )]
+    fn exact_scalar_backends_emit_authenticated_but_unpublishable_receipts() {
+        let pattern = r"(?-u:[\x00-\x40])+";
+        let compiled = complete_forward_resource_fallback(
+            pattern,
+            OutputContract::Exists,
+            Target::x86_64_linux(),
+        );
+        let view = compiled
+            .program()
+            .native_dfa_view()
+            .expect("complete retained native view");
+        let requirement = view
+            .retained_prefix_requirement
+            .expect("mandatory exact primary");
+        assert_eq!(
+            requirement
+                .membership
+                .iter()
+                .map(|word| word.count_ones())
+                .sum::<u32>(),
+            65
+        );
+
+        for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+            let (data, layout) = build_native_dfa_table_for_architecture(view, architecture)
+                .expect("exact scalar layout");
+            assert!(layout.start_filter.is_none());
+            let exact = layout.exact_start_byte_set.expect("exact primary IR");
+            let storage = layout.exact_start_storage.expect("exact primary storage");
+            assert_eq!(exact.membership, requirement.membership);
+            assert_eq!(exact.scan_offset, requirement.scan_offset);
+            for byte in u8::MIN..=u8::MAX {
+                assert_eq!(
+                    exact_storage_contains(&data, storage, architecture, byte),
+                    exact.contains(byte)
+                );
+            }
+
+            let (code, receipt) = match architecture {
+                Architecture::X86_64 => {
+                    let emission =
+                        lower_x86_64_dfa_with_emission(layout, FeatureSet::EMPTY).unwrap();
+                    assert!(
+                        emission
+                            .code
+                            .windows(4)
+                            .filter(|window| *window == [0x49, 0x0f, 0xa3, 0x81])
+                            .count()
+                            >= 5,
+                        "x86 exact scanner lacks unrolled bitmap tests"
+                    );
+                    (emission.code, emission.scanner)
+                }
+                Architecture::Aarch64 => {
+                    let emission =
+                        lower_aarch64_dfa_for_operating_system_with_emission(
+                            layout,
+                            FeatureSet::EMPTY,
+                            OperatingSystem::Linux,
+                            None,
+                        )
+                        .unwrap();
+                    let words = emission
+                        .code
+                        .chunks_exact(4)
+                        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                        .collect::<Vec<_>>();
+                    assert!(words.contains(&aarch64_load_byte_reg(8, 6, 8).unwrap()));
+                    (emission.code, emission.scanner)
+                }
+            };
+            assert!(!code.is_empty());
+            let receipt = receipt.expect("emitted exact primary receipt");
+            assert_eq!(receipt.scan_offset, requirement.scan_offset);
+            assert_eq!(receipt.membership, requirement.membership);
+            assert!(!receipt.vectorized);
+            assert!(!retained_prefix_scanner_is_preserved(
+                Some(receipt),
+                requirement
+            ));
+
+            for scan_offset in [0_u8, 1, 31, 127, 255] {
+                let varied = NativeDfaLayout {
+                    exact_start_byte_set: Some(NativeExactByteSet {
+                        scan_offset,
+                        ..exact
+                    }),
+                    ..layout
+                };
+                let varied_receipt = match architecture {
+                    Architecture::X86_64 => {
+                        lower_x86_64_dfa_with_emission(varied, FeatureSet::EMPTY)
+                            .unwrap()
+                            .scanner
+                    }
+                    Architecture::Aarch64 => {
+                        lower_aarch64_dfa_for_operating_system_with_emission(
+                            varied,
+                            FeatureSet::EMPTY,
+                            OperatingSystem::Macos,
+                            None,
+                        )
+                        .unwrap()
+                        .scanner
+                    }
+                }
+                .expect("varied exact scanner receipt");
+                assert_eq!(varied_receipt.scan_offset, scan_offset);
+                assert_eq!(varied_receipt.membership, exact.membership);
+                assert!(!varied_receipt.vectorized);
+            }
+        }
+    }
+
+    #[test]
+    fn exact_retained_primary_rebuilds_identically_after_serialization() {
+        let target = Target::x86_64_linux();
+        let compiled = complete_forward_resource_fallback(
+            r"(?-u:[\x00-\x40])+",
+            OutputContract::Exists,
+            target,
+        );
+        let wire = compiled.program().serialize().expect("serialize exact primary");
+        let restored = crate::CompiledProgram::deserialize(&wire).expect("restore exact primary");
+        let original_view = compiled
+            .program()
+            .native_dfa_view()
+            .expect("original exact native view");
+        let restored_view = restored
+            .native_dfa_view()
+            .expect("restored exact native view");
+        assert_eq!(
+            original_view.retained_prefix_requirement,
+            restored_view.retained_prefix_requirement
+        );
+        for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+            let original = build_native_dfa_table_for_architecture(original_view, architecture)
+                .expect("original exact layout");
+            let rebuilt = build_native_dfa_table_for_architecture(restored_view, architecture)
+                .expect("rebuilt exact layout");
+            assert_eq!(original, rebuilt, "{architecture:?} exact layout drifted");
+        }
+        let restored_module = CompiledModule::lower(&restored, target).expect("lower restored");
+        assert_eq!(restored_module.sections(), compiled.module().sections());
+        assert_eq!(restored_module.symbols(), compiled.module().symbols());
+        assert_eq!(restored_module.relocations(), compiled.module().relocations());
+        assert_eq!(restored_module.start_accelerator(), StartAccelerator::None);
     }
 
     #[test]
@@ -20179,6 +21195,8 @@ mod tests {
             exact_prefix_match_width: None,
             output: OutputContract::SelectedEnd,
             start_filter: None,
+            exact_start_byte_set: None,
+            exact_start_storage: None,
             suffix_filter: None,
             declined_redundant_root_reverse: false,
             seeded_reverse: None,
@@ -21089,6 +22107,8 @@ mod tests {
             exact_prefix_match_width: None,
             output: OutputContract::Span,
             start_filter: None,
+            exact_start_byte_set: None,
+            exact_start_storage: None,
             suffix_filter: None,
             declined_redundant_root_reverse: false,
             seeded_reverse: None,
@@ -21230,6 +22250,8 @@ mod tests {
             exact_prefix_match_width: None,
             output: OutputContract::Exists,
             start_filter: Some(start_filter),
+            exact_start_byte_set: None,
+            exact_start_storage: None,
             suffix_filter: None,
             declined_redundant_root_reverse: false,
             seeded_reverse: None,

@@ -456,6 +456,8 @@ mod tests {
             exact_prefix_match_width: None,
             output: OutputContract::Exists,
             start_filter: None,
+            exact_start_byte_set: None,
+            exact_start_storage: None,
             suffix_filter: Some(suffix),
             declined_redundant_root_reverse: false,
             seeded_reverse: Some(reverse),
