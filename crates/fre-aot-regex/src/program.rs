@@ -73,6 +73,14 @@ const MAX_NFA_SUFFIX_REVERSE_MEMORY_BYTES: usize = 16 * 1024 * 1024;
 /// observed input is denser.
 const NFA_SUFFIX_PRIMARY_HIT_CREDIT: usize = 8;
 const NFA_SUFFIX_PRIMARY_HIT_DENOMINATOR: usize = 64;
+/// Bound cumulative reverse verification for mandatory suffixes whose match
+/// width is unbounded (or whose width proof exhausted its resource envelope).
+/// One late sparse candidate may inspect the complete preceding window, but
+/// repeated false candidates may not turn the accelerator into a quadratic
+/// scan. The credit keeps short windows and a small burst of candidates out of
+/// the ordinary executor without weakening the asymptotic bound.
+const NFA_SUFFIX_SCAN_ONLY_REVERSE_WORK_CREDIT: usize = 1_024;
+const NFA_SUFFIX_SCAN_ONLY_REVERSE_WORK_MULTIPLIER: usize = 2;
 
 /// Checked failure while reconstructing a stable AOT semantic program.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -490,22 +498,29 @@ impl AnchoredSuffix {
     }
 }
 
-/// Optional portable accelerator for finite-width ordered-NFA programs.
+/// Optional portable accelerator for ordered-NFA programs with a graph-proved
+/// non-empty terminal suffix.
 ///
 /// The suffix column is only a necessary filter. Every hit is verified by an
 /// independently determinized reverse machine seeded from all Accept states.
 /// For endpoint-sensitive contracts, reverse verification is used only to
-/// discover the globally earliest viable start; the ordinary ordered NFA is
-/// then replayed from that start through its complete proved width. That final
-/// replay, rather than the unordered reverse subset, selects alternation and
-/// greedy/lazy priority.
+/// discover the globally earliest viable start when maximum width is finite;
+/// the ordinary ordered NFA is then replayed from that start through its
+/// complete proved width. That final replay, rather than the unordered reverse
+/// subset, selects alternation and greedy/lazy priority. Without an admitted
+/// finite width, exhausting the suffix scanner still proves no match for every
+/// output. Sparse candidates are reverse-verified within a linear work
+/// envelope. `Exists` may return directly from that exact proof, while an
+/// endpoint-sensitive proved match is handed back to the ordinary ordered NFA
+/// so the accelerator never double-walks an unbounded match to recover
+/// priority.
 #[derive(Clone, Debug)]
 struct NfaMandatorySuffix {
     primary_bytes: [u8; 3],
     primary_count: u8,
     primary_depth: u8,
     minimum_width: u8,
-    maximum_width: usize,
+    maximum_width: Option<usize>,
     reverse: SeededReverseDfa,
 }
 
@@ -523,9 +538,10 @@ impl NfaMandatorySuffix {
         suffix: &AnchoredSuffix,
         maximum_width: Option<usize>,
     ) -> Option<Self> {
-        let maximum_width = maximum_width?;
         let minimum_width = suffix.sets().len();
-        if minimum_width == 0 || maximum_width < minimum_width {
+        if minimum_width == 0
+            || maximum_width.is_some_and(|maximum_width| maximum_width < minimum_width)
+        {
             return None;
         }
 
@@ -550,9 +566,16 @@ impl NfaMandatorySuffix {
         if primary_count >= best_forward_count {
             return None;
         }
-        if maximum_width.checked_mul(primary_count)? > MAX_NFA_SUFFIX_CANDIDATE_WORK {
-            return None;
-        }
+        // A small finite bound admits earliest-start recovery and ordered
+        // replay. Wider finite graphs still retain the scan-only/no-match
+        // proof and the adaptively bounded reverse verifier; treating them
+        // like an unbounded graph avoids discarding a generally useful
+        // accelerator solely because bounded endpoint replay is unavailable.
+        let maximum_width = maximum_width.filter(|maximum_width| {
+            maximum_width
+                .checked_mul(primary_count)
+                .is_some_and(|work| work <= MAX_NFA_SUFFIX_CANDIDATE_WORK)
+        });
 
         let mut primary_bytes = [0_u8; 3];
         let mut count = 0usize;
@@ -619,6 +642,21 @@ impl NfaMandatorySuffix {
         let proportional = scanned.saturating_mul(usize::from(self.primary_count))
             / NFA_SUFFIX_PRIMARY_HIT_DENOMINATOR;
         primary_hits > NFA_SUFFIX_PRIMARY_HIT_CREDIT.saturating_add(proportional)
+    }
+
+    /// Admit another scan-only reverse verification while cumulative charged
+    /// work remains linear in the portion of the window reached so far.
+    fn next_scan_only_reverse_work(
+        reverse_work: usize,
+        window_start: usize,
+        endpoint: usize,
+    ) -> Option<usize> {
+        let candidate_work = endpoint.checked_sub(window_start)?;
+        let next_reverse_work = reverse_work.checked_add(candidate_work)?;
+        let permitted_work = candidate_work
+            .saturating_mul(NFA_SUFFIX_SCAN_ONLY_REVERSE_WORK_MULTIPLIER)
+            .saturating_add(NFA_SUFFIX_SCAN_ONLY_REVERSE_WORK_CREDIT);
+        (next_reverse_work <= permitted_work).then_some(next_reverse_work)
     }
 
     /// Return the next endpoint whose complete graph-proved suffix columns
@@ -1274,6 +1312,10 @@ impl CompiledProgram {
             return Ok(None);
         };
 
+        let Some(maximum_width) = accelerator.maximum_width else {
+            return self.search_nfa_with_scan_only_mandatory_suffix(haystack, window);
+        };
+
         let mut from_endpoint = window
             .start
             .checked_add(usize::from(accelerator.minimum_width))
@@ -1290,7 +1332,7 @@ impl CompiledProgram {
             // as part of the complete decision range for `s`.
             let maximum_endpoint = match earliest_start {
                 Some(start) => start
-                    .checked_add(accelerator.maximum_width)
+                    .checked_add(maximum_width)
                     .and_then(|endpoint| endpoint.checked_sub(1))
                     .map_or(window.end, |endpoint| endpoint.min(window.end)),
                 None => window.end,
@@ -1317,9 +1359,7 @@ impl CompiledProgram {
                 // while reverse verification would duplicate that short walk.
                 return Ok(None);
             }
-            let reverse_start = endpoint
-                .saturating_sub(accelerator.maximum_width)
-                .max(window.start);
+            let reverse_start = endpoint.saturating_sub(maximum_width).max(window.start);
             let candidate_start = accelerator
                 .reverse
                 .trace(haystack, reverse_start, endpoint)
@@ -1352,7 +1392,7 @@ impl CompiledProgram {
             }));
         };
         let replay_end = earliest_start
-            .checked_add(accelerator.maximum_width)
+            .checked_add(maximum_width)
             .map_or(window.end, |end| end.min(window.end));
         self.search_nfa_unaccelerated(
             haystack,
@@ -1360,6 +1400,99 @@ impl CompiledProgram {
             workspace,
         )
         .map(Some)
+    }
+
+    /// Search a mandatory suffix without an admitted finite replay width.
+    /// This includes genuinely unbounded graphs, exhausted width proofs, and
+    /// finite widths whose worst-case replay cost exceeded the accelerator's
+    /// bounded-replay envelope.
+    ///
+    /// Exhausting the graph-proved suffix scanner is a complete no-match
+    /// proof for every output contract. An independently determinized reverse
+    /// machine rejects sparse false candidates and proves matches directly for
+    /// `Exists`. A proved endpoint-sensitive match falls back immediately to
+    /// the ordinary ordered NFA, avoiding a reverse walk followed by an
+    /// unbounded ordered replay. Cumulative reverse work is conservatively
+    /// bounded before each verification, preventing adversarial sparse
+    /// candidates from inducing quadratic execution.
+    fn search_nfa_with_scan_only_mandatory_suffix(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+    ) -> Result<Option<MatchResult>, CompileError> {
+        let accelerator =
+            self.nfa_mandatory_suffix
+                .as_ref()
+                .ok_or(CompileError::InternalInvariant(
+                    "scan-only mandatory-suffix search has no sidecar",
+                ))?;
+        if accelerator.maximum_width.is_some() {
+            return Err(CompileError::InternalInvariant(
+                "scan-only mandatory-suffix search received a bounded-replay sidecar",
+            ));
+        }
+
+        let mut from_endpoint = window
+            .start
+            .checked_add(usize::from(accelerator.minimum_width))
+            .ok_or(CompileError::InternalInvariant(
+                "mandatory-suffix minimum endpoint overflowed",
+            ))?;
+        let mut primary_hits = 0usize;
+        let mut reverse_work = 0usize;
+        loop {
+            let endpoint = match accelerator.next_candidate_endpoint(
+                &self.anchored_suffix,
+                haystack,
+                window.start,
+                window.end,
+                from_endpoint,
+                &mut primary_hits,
+            ) {
+                NfaMandatorySuffixScan::Candidate(endpoint) => endpoint,
+                NfaMandatorySuffixScan::Exhausted => {
+                    break;
+                }
+                NfaMandatorySuffixScan::Fallback => return Ok(None),
+            };
+
+            let Some(next_reverse_work) = NfaMandatorySuffix::next_scan_only_reverse_work(
+                reverse_work,
+                window.start,
+                endpoint,
+            ) else {
+                return Ok(None);
+            };
+            reverse_work = next_reverse_work;
+            let proves_match = accelerator
+                .reverse
+                .trace(haystack, window.start, endpoint)
+                .map_err(|_| {
+                    CompileError::InternalInvariant(
+                        "mandatory-suffix reverse verifier received an invalid window",
+                    )
+                })?
+                .next()
+                .is_some();
+            if proves_match {
+                if self.output == OutputContract::Exists {
+                    return Ok(Some(MatchResult::Exists(true)));
+                }
+                return Ok(None);
+            }
+            if accelerator.primary_hits_are_dense(window.start, endpoint, primary_hits) {
+                return Ok(None);
+            }
+            let Some(next_endpoint) = endpoint.checked_add(1) else {
+                break;
+            };
+            from_endpoint = next_endpoint;
+        }
+        Ok(Some(match self.output {
+            OutputContract::Exists => MatchResult::Exists(false),
+            OutputContract::SelectedEnd => MatchResult::SelectedEnd(None),
+            OutputContract::Span => MatchResult::Span(None),
+        }))
     }
 
     fn search_nfa_unaccelerated(
@@ -1554,9 +1687,8 @@ impl CompiledProgram {
         let version = read_u32_at(header, 8)?;
         let line_terminator = header_line_terminator(header, version)?;
         let program_flags = header_program_flags(header, version)?;
-        if program_flags & PROGRAM_FLAG_NFA_MANDATORY_SUFFIX != 0
-            && engine_kind != EngineKind::OrderedNfa
-        {
+        let mandatory_suffix_enabled = program_flags & PROGRAM_FLAG_NFA_MANDATORY_SUFFIX != 0;
+        if mandatory_suffix_enabled && engine_kind != EngineKind::OrderedNfa {
             return Err(ProgramFormatError::Malformed(
                 "mandatory-suffix flag requires an ordered-NFA engine",
             ));
@@ -1628,10 +1760,9 @@ impl CompiledProgram {
             &anchored_suffix,
             max_match_width,
             &engine,
-            program_flags & PROGRAM_FLAG_NFA_MANDATORY_SUFFIX != 0,
+            mandatory_suffix_enabled,
         );
-        if program_flags & PROGRAM_FLAG_NFA_MANDATORY_SUFFIX != 0 && nfa_mandatory_suffix.is_none()
-        {
+        if mandatory_suffix_enabled != nfa_mandatory_suffix.is_some() {
             return Err(ProgramFormatError::Malformed(
                 "mandatory-suffix flag is incompatible with the embedded graph",
             ));
@@ -3893,7 +4024,7 @@ mod tests {
                 .expect("finite selective suffix should construct the sidecar");
             assert_eq!(accelerator.primary_depth, 1);
             assert_eq!(accelerator.primary_bytes[0], b'q');
-            assert_eq!(accelerator.maximum_width, 4);
+            assert_eq!(accelerator.maximum_width, Some(4));
 
             let bytes = compiled.serialize().expect("serialize fallback");
             assert_eq!(
@@ -4067,6 +4198,266 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn scan_only_mandatory_suffix_is_structural_and_round_trips() {
+        let fallback_limits = DeterminizeLimits {
+            max_states: 0,
+            ..DeterminizeLimits::default()
+        };
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let compiled = program(
+                "(?:ab|c)*q[xz]",
+                output,
+                CompileMode::Optimizing,
+                fallback_limits,
+            );
+            assert_eq!(compiled.engine_kind(), EngineKind::OrderedNfa);
+            assert!(compiled.max_match_width.width.is_none());
+            assert!(compiled.max_match_width.unbounded);
+            let accelerator = compiled
+                .nfa_mandatory_suffix
+                .as_ref()
+                .expect("unbounded selective suffix should construct the sidecar");
+            assert_eq!(accelerator.primary_depth, 1);
+            assert_eq!(accelerator.primary_bytes[0], b'q');
+            assert_eq!(accelerator.maximum_width, None);
+
+            let bytes = compiled.serialize().expect("serialize fallback");
+            assert_eq!(bytes[15], PROGRAM_FLAG_NFA_MANDATORY_SUFFIX);
+            let restored = CompiledProgram::deserialize(&bytes).expect("restore fallback");
+            assert!(restored.nfa_mandatory_suffix.is_some());
+            assert_eq!(
+                restored
+                    .nfa_mandatory_suffix
+                    .as_ref()
+                    .and_then(|sidecar| sidecar.maximum_width),
+                None
+            );
+            assert_eq!(restored.serialize().unwrap(), bytes);
+        }
+
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let wide = program(".{1,65}z", output, CompileMode::Optimizing, fallback_limits);
+            assert!(
+                wide.max_match_width
+                    .width
+                    .is_some_and(|width| width > MAX_NFA_SUFFIX_CANDIDATE_WORK)
+            );
+            assert_eq!(
+                wide.nfa_mandatory_suffix
+                    .as_ref()
+                    .expect("wide finite suffix should retain the scan-only sidecar")
+                    .maximum_width,
+                None
+            );
+            let bytes = wide.serialize().unwrap();
+            assert_eq!(bytes[15], PROGRAM_FLAG_NFA_MANDATORY_SUFFIX);
+            let restored = CompiledProgram::deserialize(&bytes).unwrap();
+            assert_eq!(restored.serialize().unwrap(), bytes);
+            for haystack in [
+                b"xxxxxxxxxxxxxxxx".as_slice(),
+                b"xxxxxxxxxxxxxxxz",
+                b"zxxxxxxxxxxxxxxx",
+                b"\n\n\n\n\n\n\n\n",
+            ] {
+                let mut reference = wide.clone();
+                reference.nfa_mandatory_suffix = None;
+                assert_eq!(
+                    wide.search(haystack, SearchWindow::full(haystack)).unwrap(),
+                    reference
+                        .search(haystack, SearchWindow::full(haystack))
+                        .unwrap(),
+                    "{output:?}/{haystack:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scan_only_mandatory_suffix_matches_ordered_nfa_for_every_small_window() {
+        fn extend_haystacks(
+            haystacks: &mut Vec<Vec<u8>>,
+            prefix: &mut Vec<u8>,
+            alphabet: &[u8],
+            remaining: usize,
+        ) {
+            haystacks.push(prefix.clone());
+            if remaining == 0 {
+                return;
+            }
+            for &byte in alphabet {
+                prefix.push(byte);
+                extend_haystacks(haystacks, prefix, alphabet, remaining - 1);
+                prefix.pop();
+            }
+        }
+
+        let patterns = [
+            "a*z",
+            "a*?z",
+            "(?:ab)*z",
+            "(?:ab)*?z",
+            "(?:ab|c)*q[xz]",
+            "(?:ab|c)*?q[xz]",
+            "(?:a|bc)*qz",
+            "(?:a|bc)*?qz",
+        ];
+        let fallback_limits = DeterminizeLimits {
+            max_states: 0,
+            ..DeterminizeLimits::default()
+        };
+        let mut haystacks = Vec::new();
+        extend_haystacks(&mut haystacks, &mut Vec::new(), b"abqzx", 4);
+        haystacks.extend([
+            b"aaaaaaaaaz".to_vec(),
+            b"ababababqz".to_vec(),
+            b"ccccccqz".to_vec(),
+            b"zqzxqz".to_vec(),
+            b"xxxxxxxx".to_vec(),
+        ]);
+
+        for pattern in patterns {
+            for output in [
+                OutputContract::Exists,
+                OutputContract::SelectedEnd,
+                OutputContract::Span,
+            ] {
+                let accelerated =
+                    program(pattern, output, CompileMode::Optimizing, fallback_limits);
+                assert_eq!(
+                    accelerated.engine_kind(),
+                    EngineKind::OrderedNfa,
+                    "{pattern:?}"
+                );
+                assert!(
+                    accelerated.nfa_mandatory_suffix.is_some(),
+                    "eligible unbounded fixture was declined: {pattern:?}"
+                );
+                assert_eq!(
+                    accelerated
+                        .nfa_mandatory_suffix
+                        .as_ref()
+                        .and_then(|sidecar| sidecar.maximum_width),
+                    None,
+                    "{pattern:?}"
+                );
+                let restored = CompiledProgram::deserialize(
+                    &accelerated
+                        .serialize()
+                        .expect("serialize scan-only sidecar"),
+                )
+                .expect("restore scan-only sidecar");
+                assert!(restored.nfa_mandatory_suffix.is_some());
+                let reference = program(
+                    pattern,
+                    output,
+                    CompileMode::Fast,
+                    DeterminizeLimits::default(),
+                );
+                assert!(reference.nfa_mandatory_suffix.is_none());
+                let mut accelerated_workspace = accelerated.prepare_workspace().unwrap();
+                let mut restored_workspace = restored.prepare_workspace().unwrap();
+                let mut reference_workspace = reference.prepare_workspace().unwrap();
+
+                for haystack in &haystacks {
+                    for start in 0..=haystack.len() {
+                        for end in start..=haystack.len() {
+                            let window = SearchWindow::new(start, end);
+                            let expected = reference
+                                .search_with_workspace(haystack, window, &mut reference_workspace)
+                                .unwrap();
+                            let actual = accelerated
+                                .search_with_workspace(haystack, window, &mut accelerated_workspace)
+                                .unwrap();
+                            let restored_actual = restored
+                                .search_with_workspace(haystack, window, &mut restored_workspace)
+                                .unwrap();
+                            assert_eq!(
+                                actual, expected,
+                                "{pattern:?}/{output:?}/{haystack:?}/{start}..{end}"
+                            );
+                            assert_eq!(
+                                restored_actual, expected,
+                                "round trip {pattern:?}/{output:?}/{haystack:?}/{start}..{end}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scan_only_mandatory_suffix_escapes_adversarial_candidates() {
+        let endpoints = [1_025, 2_049, 3_073, 4_097];
+        let mut reverse_work = 0;
+        for &endpoint in &endpoints[..3] {
+            reverse_work =
+                NfaMandatorySuffix::next_scan_only_reverse_work(reverse_work, 0, endpoint)
+                    .expect("sparse prefix remains inside the linear reverse-work envelope");
+        }
+        assert!(
+            NfaMandatorySuffix::next_scan_only_reverse_work(reverse_work, 0, endpoints[3],)
+                .is_none()
+        );
+
+        let fallback_limits = DeterminizeLimits {
+            max_states: 0,
+            ..DeterminizeLimits::default()
+        };
+        let mut sparse_false_candidates = vec![b'x'; 5_000];
+        for endpoint in endpoints {
+            sparse_false_candidates[endpoint - 1] = b'z';
+        }
+        let dense_candidates = vec![b'z'; 4_096];
+
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            for (pattern, haystack) in [
+                ("[ab]+z", sparse_false_candidates.as_slice()),
+                ("[ab]*z", dense_candidates.as_slice()),
+            ] {
+                let accelerated =
+                    program(pattern, output, CompileMode::Optimizing, fallback_limits);
+                assert_eq!(
+                    accelerated
+                        .nfa_mandatory_suffix
+                        .as_ref()
+                        .and_then(|sidecar| sidecar.maximum_width),
+                    None,
+                    "{pattern:?}"
+                );
+                assert!(accelerated.nfa_mandatory_suffix.is_some(), "{pattern:?}");
+                let reference = program(
+                    pattern,
+                    output,
+                    CompileMode::Fast,
+                    DeterminizeLimits::default(),
+                );
+                assert_eq!(
+                    accelerated
+                        .search(haystack, SearchWindow::full(haystack))
+                        .unwrap(),
+                    reference
+                        .search(haystack, SearchWindow::full(haystack))
+                        .unwrap(),
+                    "{pattern:?}/{output:?}"
+                );
             }
         }
     }
@@ -4802,6 +5193,19 @@ mod tests {
         let mut unknown = bytes;
         unknown[15] |= 1 << 7;
         assert!(CompiledProgram::deserialize(&unknown).is_err());
+
+        let unbounded = program(
+            "(?:ab|c)*q[xz]",
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        let unbounded_bytes = unbounded.serialize().unwrap();
+        assert_eq!(unbounded_bytes[15], PROGRAM_FLAG_NFA_MANDATORY_SUFFIX);
+        assert!(CompiledProgram::deserialize(&unbounded_bytes).is_ok());
 
         let dfa = program(
             "(?:ab|ac)+",
