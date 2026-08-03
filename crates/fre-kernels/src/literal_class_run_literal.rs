@@ -2918,6 +2918,43 @@ impl LiteralClassRunSearchPlan {
         Ok((matched.map(|(_, end)| end), accounting))
     }
 
+    /// Whether any selected match exists without constructing diagnostic
+    /// accounting on the success path.
+    ///
+    /// Once both source-independent execution envelopes fit the caller's
+    /// limits, the unguarded route can execute without prospective metering:
+    /// every possible finder, classification, comparison, and candidate
+    /// event has already been admitted. Finite envelopes retain the ordinary
+    /// metered search so refusal remains exact at the next charged event.
+    pub fn is_match_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<bool, SearchError> {
+        if self.boundary_semantics() != BoundarySemantics::Unguarded {
+            return self
+                .shortest_window(haystack, window, limits)
+                .map(|(matched, _)| matched.is_some());
+        }
+        let (upper, _, _, meter) = self.search_preflight(haystack.len(), window, limits)?;
+        if meter.work_envelope_admitted
+            && upper.anchor_candidates <= limits.max_candidate_visits
+        {
+            let slice =
+                haystack
+                    .get(window.start()..window.end())
+                    .ok_or(SearchError::InvalidWindow {
+                        start: window.start(),
+                        end: window.end(),
+                        haystack_len: haystack.len(),
+                    })?;
+            return Ok(self.search_prefix_exists_value(slice));
+        }
+        self.shortest_window(haystack, window, limits)
+            .map(|(matched, _)| matched.is_some())
+    }
+
     fn search_window(
         &self,
         haystack: &[u8],
@@ -2987,6 +3024,11 @@ impl LiteralClassRunSearchPlan {
         ))
     }
 
+    #[allow(
+        clippy::inline_always,
+        reason = "retaining the established search body avoids outlining this newly shared preflight"
+    )]
+    #[inline(always)]
     fn search_preflight(
         &self,
         haystack_len: usize,
@@ -3029,6 +3071,11 @@ impl LiteralClassRunSearchPlan {
         Ok((upper, window_bytes, assertion_context_bytes, meter))
     }
 
+    #[allow(
+        clippy::inline_always,
+        reason = "the established search body already inlined these source-independent bounds"
+    )]
+    #[inline(always)]
     fn search_upper_bounds(&self, input_bytes: usize) -> Result<ReduceUpperBounds, ReduceError> {
         let anchor_bytes = self.anchor.needle().len();
         let anchor_candidates = input_bytes
@@ -3278,6 +3325,74 @@ impl LiteralClassRunSearchPlan {
                 .ok_or(ReduceError::ArithmeticOverflow {
                     computation: "generalized rejected candidate progress",
                 })?;
+        }
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the admitted fast path keeps every cursor within one proven nonempty-prefix slice"
+    )]
+    fn search_prefix_exists_value(&self, haystack: &[u8]) -> bool {
+        debug_assert_eq!(self.anchor_kind, Anchor::Prefix);
+        let prefix_bytes = self.prefix().len();
+        let mut cursor = 0_usize;
+        loop {
+            let Some(relative) = self.anchor.find(&haystack[cursor..]) else {
+                return false;
+            };
+            let anchor_start = cursor + relative;
+            let anchor_end = anchor_start + prefix_bytes;
+
+            if self.suffix().is_empty() {
+                match self.minimum {
+                    SearchRunMinimum::Zero => return true,
+                    SearchRunMinimum::One => {
+                        if anchor_end < haystack.len() && self.class.contains(haystack[anchor_end])
+                        {
+                            return true;
+                        }
+                        cursor = anchor_start + 1;
+                        continue;
+                    }
+                }
+            }
+
+            let recovered = if self.unicode_all_non_ascii {
+                scan_unicode_all_non_ascii_run_forward_value(
+                    haystack,
+                    self.class,
+                    self.ascii_scanner.as_ref(),
+                    anchor_end,
+                )
+            } else {
+                scan_class_run_forward_value(
+                    haystack,
+                    self.class,
+                    self.ascii_scanner.as_ref(),
+                    anchor_end,
+                )
+            };
+            let run_end = match (self.minimum, recovered) {
+                (SearchRunMinimum::Zero, None) => anchor_end,
+                (SearchRunMinimum::Zero | SearchRunMinimum::One, Some(end)) => end,
+                (SearchRunMinimum::One, None) => {
+                    cursor = anchor_start + 1;
+                    continue;
+                }
+            };
+            if haystack
+                .get(run_end..)
+                .is_some_and(|remaining| remaining.starts_with(self.suffix()))
+            {
+                return true;
+            }
+
+            // Prefix occurrences whose repeated runs share an end can be
+            // skipped as a group. These additions are bounded by the slice:
+            // the prefix is nonempty, the anchor lies inside the slice, and
+            // the recovered run end never exceeds it.
+            let overlapping_end = run_end - prefix_bytes + 1;
+            cursor = (anchor_start + 1).max(overlapping_end);
         }
     }
 
@@ -4187,6 +4302,91 @@ fn scan_class_run_forward(
     }
 }
 
+fn scan_class_run_forward_value(
+    haystack: &[u8],
+    class: ByteClass,
+    scanner: Option<&AsciiClassScanner>,
+    start: usize,
+) -> Option<usize> {
+    match scanner {
+        Some(AsciiClassScanner::Run(scanner)) => {
+            scan_class_run_forward_direct_value(haystack, scanner, start)
+        }
+        Some(AsciiClassScanner::Fixed(classifier)) => {
+            scan_class_run_forward_fixed_value(haystack, class, classifier, start)
+        }
+        None => scan_class_run_forward_scalar_value(haystack, class, start),
+    }
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the scanner-reported run is bounded by the suffix passed to the scanner"
+)]
+fn scan_class_run_forward_direct_value(
+    haystack: &[u8],
+    scanner: &AsciiByteSetRunScanner,
+    start: usize,
+) -> Option<usize> {
+    let result = scanner.scan_forward(&haystack[start..]);
+    let run = result.member_run_len();
+    (run != 0).then_some(start + run)
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "loop guards prove every fixed-width block and cursor increment remains in the slice"
+)]
+fn scan_class_run_forward_fixed_value(
+    haystack: &[u8],
+    class: ByteClass,
+    classifier: &AsciiByteSetClassifier,
+    start: usize,
+) -> Option<usize> {
+    let mut end = start;
+    for _ in 0..SIMD_SCALAR_PROOF_BYTES {
+        if end == haystack.len() {
+            return (end != start).then_some(end);
+        }
+        if !class.contains(haystack[end]) {
+            return (end != start).then_some(end);
+        }
+        end += 1;
+    }
+    while haystack.len() - end >= ASCII_WIDE_BYTES {
+        let block: &[u8; ASCII_WIDE_BYTES] = haystack[end..end + ASCII_WIDE_BYTES]
+            .try_into()
+            .expect("the fixed-width loop proves a complete block");
+        let members = classifier.classify_32(block).member_mask();
+        if members == u32::MAX {
+            end += ASCII_WIDE_BYTES;
+            continue;
+        }
+        end += usize::try_from(members.trailing_ones()).expect("a 32-bit member prefix fits usize");
+        return Some(end);
+    }
+    while end < haystack.len() && class.contains(haystack[end]) {
+        end += 1;
+    }
+    (end != start).then_some(end)
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the loop guard proves each unit cursor increment remains in the slice"
+)]
+fn scan_class_run_forward_scalar_value(
+    haystack: &[u8],
+    class: ByteClass,
+    start: usize,
+) -> Option<usize> {
+    let mut end = start;
+    while end < haystack.len() && class.contains(haystack[end]) {
+        end += 1;
+    }
+    (end != start).then_some(end)
+}
+
 fn scan_class_run_forward_direct(
     haystack: &[u8],
     scanner: &AsciiByteSetRunScanner,
@@ -4599,6 +4799,76 @@ fn scan_unicode_all_non_ascii_run_forward(
             if end == haystack.len() {
                 return Ok(Some(end));
             }
+        }
+    }
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the decoder width and resumed corridor are each bounded by the remaining slice"
+)]
+fn scan_unicode_all_non_ascii_run_forward_value(
+    haystack: &[u8],
+    class: ByteClass,
+    scanner: Option<&AsciiClassScanner>,
+    start: usize,
+) -> Option<usize> {
+    let mut end = scan_class_run_forward_value(haystack, class, scanner, start).unwrap_or(start);
+    if end == haystack.len() {
+        return (end != start).then_some(end);
+    }
+
+    loop {
+        let decoded = decode_scalar(&haystack[end..]);
+        let Some(scalar) = decoded.scalar else {
+            return (end != start).then_some(end);
+        };
+        let ascii_member = if scalar <= 0x7F {
+            let byte = u8::try_from(scalar).expect("ASCII scalar fits u8");
+            if !class.contains(byte) {
+                return (end != start).then_some(end);
+            }
+            true
+        } else {
+            false
+        };
+        end += decoded.width;
+        if end == haystack.len() {
+            return Some(end);
+        }
+        if ascii_member {
+            end = resume_unicode_ascii_corridor_value(haystack, class, scanner, end);
+            if end == haystack.len() {
+                return Some(end);
+            }
+        }
+    }
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the loop guard proves each unit cursor increment remains in the slice"
+)]
+fn resume_unicode_ascii_corridor_value(
+    haystack: &[u8],
+    class: ByteClass,
+    scanner: Option<&AsciiClassScanner>,
+    start: usize,
+) -> usize {
+    match scanner {
+        None => start,
+        Some(AsciiClassScanner::Fixed(classifier)) => {
+            scan_class_run_forward_fixed_value(haystack, class, classifier, start).unwrap_or(start)
+        }
+        Some(AsciiClassScanner::Run(scanner)) => {
+            let mut end = start;
+            for _ in 0..ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD {
+                if end == haystack.len() || !class.contains(haystack[end]) {
+                    return end;
+                }
+                end += 1;
+            }
+            scan_class_run_forward_direct_value(haystack, scanner, end).unwrap_or(end)
         }
     }
 }
@@ -5219,6 +5489,10 @@ mod tests {
             .unwrap();
         assert_eq!(selected, Some((1, 5)));
         assert_eq!(earliest, Some(2));
+        assert!(
+            plan.is_match_window_value(haystack, window, SearchLimits::unlimited())
+                .unwrap()
+        );
         assert_eq!(
             selected_accounting.operation_id,
             GENERAL_SEARCH_OPERATION_ID
@@ -5229,6 +5503,76 @@ mod tests {
         );
         assert_eq!(selected_accounting.window_bytes, 4);
         assert_eq!(earliest_accounting.window_bytes, 4);
+    }
+
+    #[test]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "small exhaustive fixtures have fixed lengths and bounded radix arithmetic"
+    )]
+    fn generalized_value_existence_matches_byte_oracle_in_every_window() {
+        let cases = [
+            (
+                generalized_plan(
+                    b"a",
+                    [(b'a', b'b')].into_iter(),
+                    b"c",
+                    SearchRunMinimum::Zero,
+                ),
+                r"a[ab]*c",
+            ),
+            (
+                generalized_plan(
+                    b"a",
+                    [(b'a', b'b')].into_iter(),
+                    b"c",
+                    SearchRunMinimum::One,
+                ),
+                r"a[ab]+c",
+            ),
+            (
+                generalized_plan(
+                    b"a",
+                    [(b'b', b'c')].into_iter(),
+                    b"",
+                    SearchRunMinimum::Zero,
+                ),
+                r"a[bc]*",
+            ),
+            (
+                generalized_plan(b"a", [(b'b', b'c')].into_iter(), b"", SearchRunMinimum::One),
+                r"a[bc]+",
+            ),
+        ];
+        let alphabet = b"abcx";
+        for (plan, pattern) in cases {
+            let oracle = RegexBuilder::new(pattern).unicode(false).build().unwrap();
+            for length in 0_usize..=5 {
+                let haystack_count = alphabet.len().pow(u32::try_from(length).unwrap());
+                for mut ordinal in 0..haystack_count {
+                    let mut haystack = vec![0_u8; length];
+                    for byte in &mut haystack {
+                        *byte = alphabet[ordinal % alphabet.len()];
+                        ordinal /= alphabet.len();
+                    }
+                    for start in 0..=haystack.len() {
+                        for end in start..=haystack.len() {
+                            let expected = oracle.find(&haystack[start..end]).is_some();
+                            assert_eq!(
+                                plan.is_match_window_value(
+                                    &haystack,
+                                    Window::new(start, end),
+                                    SearchLimits::unlimited(),
+                                )
+                                .unwrap(),
+                                expected,
+                                "pattern={pattern:?} haystack={haystack:?} window={start}..{end}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -5269,6 +5613,12 @@ mod tests {
                             .0,
                         expected_shortest,
                         "shortest haystack={haystack:?} window={start}..{end}"
+                    );
+                    assert_eq!(
+                        plan.is_match_window_value(haystack, window, SearchLimits::unlimited())
+                            .unwrap(),
+                        expected.is_some(),
+                        "exists haystack={haystack:?} window={start}..{end}"
                     );
                 }
             }
@@ -5571,6 +5921,31 @@ mod tests {
             Err(SearchError::WorkLimit { needed, limit })
                 if needed == exact_work && limit + 1 == needed
         ));
+        assert!(
+            plan.is_match_window_value(
+                haystack,
+                Window::full(haystack),
+                SearchLimits {
+                    max_work_upper_bound: exact_work,
+                    max_candidate_visits: usize::MAX,
+                    max_scratch_bytes: 0,
+                },
+            )
+            .unwrap()
+        );
+        assert!(matches!(
+            plan.is_match_window_value(
+                haystack,
+                Window::full(haystack),
+                SearchLimits {
+                    max_work_upper_bound: exact_work - 1,
+                    max_candidate_visits: usize::MAX,
+                    max_scratch_bytes: 0,
+                },
+            ),
+            Err(SearchError::WorkLimit { needed, limit })
+                if needed == exact_work && limit + 1 == needed
+        ));
 
         let mut mixed = b"a".to_vec();
         mixed.extend_from_slice("é€🦀".as_bytes());
@@ -5696,6 +6071,21 @@ mod tests {
                 limit: 0
             })
         ));
+        assert!(matches!(
+            plan.is_match_window_value(
+                haystack,
+                Window::full(haystack),
+                SearchLimits {
+                    max_work_upper_bound: u64::MAX,
+                    max_candidate_visits: 0,
+                    max_scratch_bytes: 0,
+                },
+            ),
+            Err(SearchError::CandidateLimit {
+                needed: 1,
+                limit: 0
+            })
+        ));
         assert_eq!(
             plan.find(
                 b"xxxxx",
@@ -5708,6 +6098,19 @@ mod tests {
             .unwrap()
             .0,
             None
+        );
+        assert!(
+            !plan
+                .is_match_window_value(
+                    b"xxxxx",
+                    Window::full(b"xxxxx"),
+                    SearchLimits {
+                        max_work_upper_bound: u64::MAX,
+                        max_candidate_visits: 0,
+                        max_scratch_bytes: 0,
+                    },
+                )
+                .unwrap()
         );
     }
 

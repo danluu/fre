@@ -4521,12 +4521,11 @@ impl PortableRegex {
                 .map(|(matched, _)| matched.is_some())
                 .map_err(SearchError::from),
             PortablePlan::LiteralClassRunSearch(plan) => plan
-                .shortest_window(
+                .is_match_window_value(
                     haystack,
                     LiteralWindow::new(window.start(), window.end()),
                     literal_class_run_literal_limits(limits),
                 )
-                .map(|(matched, _)| matched.is_some())
                 .map_err(SearchError::from),
             PortablePlan::PureByteClassRepeat(plan) => plan
                 .is_match_window_value(haystack, window, limits)
@@ -6962,6 +6961,23 @@ mod tests {
             );
             assert_eq!(
                 regex
+                    .is_match_value(haystack, SearchLimits::unlimited())
+                    .unwrap(),
+                expected.is_some(),
+                "value-only haystack={haystack:?}"
+            );
+            let mut session = regex
+                .search_session(SearchSessionLimits::unlimited())
+                .unwrap();
+            assert_eq!(
+                session
+                    .is_match_value(haystack, SearchLimits::unlimited())
+                    .unwrap(),
+                expected.is_some(),
+                "session value-only haystack={haystack:?}"
+            );
+            assert_eq!(
+                regex
                     .shortest_match(haystack, SearchLimits::unlimited())
                     .unwrap()
                     .0,
@@ -6993,6 +7009,13 @@ mod tests {
                 assert_eq!(
                     actual_at, expected_at,
                     "haystack={haystack:?} start={start}"
+                );
+                assert_eq!(
+                    regex
+                        .is_match_value_at(haystack, start, SearchLimits::unlimited())
+                        .unwrap(),
+                    expected_at.is_some(),
+                    "exists haystack={haystack:?} start={start}"
                 );
                 assert_eq!(
                     regex
@@ -7031,6 +7054,13 @@ mod tests {
                 })
                 .collect();
             assert_eq!(actual, expected, "pattern={pattern:?}");
+            assert_eq!(
+                regex
+                    .is_match_value(haystack, SearchLimits::unlimited())
+                    .unwrap(),
+                !expected.is_empty(),
+                "value-only pattern={pattern:?}"
+            );
         }
     }
 
