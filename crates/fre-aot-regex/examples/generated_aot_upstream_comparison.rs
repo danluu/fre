@@ -2470,14 +2470,14 @@ fn build_c_harness(config: &Config, shapes: &[CompiledShape], scenarios: &[Scena
          #include <string.h>\n\
          #include <time.h>\n\n\
          #define ROTATIONS 4U\n\n\
-         typedef uint64_t prepared_handle;\n\
+         typedef void *exclusive_handle;\n\
          typedef uint32_t (*entry_fn)(const unsigned char *, size_t, size_t, size_t, size_t *);\n\
-         extern uint32_t fre_aot_regex_runtime_prepare_v1(const unsigned char *, size_t, prepared_handle *);\n\
-         extern uint32_t fre_aot_regex_runtime_search_prepared_v1(prepared_handle, const unsigned char *, size_t, size_t, size_t, size_t *);\n\
-         extern uint32_t fre_aot_regex_runtime_destroy_prepared_v1(prepared_handle);\n\n\
+         extern uint32_t fre_aot_regex_runtime_prepare_exclusive_v1(const unsigned char *, size_t, exclusive_handle *);\n\
+         extern uint32_t fre_aot_regex_runtime_search_exclusive_v1(exclusive_handle, const unsigned char *, size_t, size_t, size_t, size_t *);\n\
+         extern uint32_t fre_aot_regex_runtime_destroy_exclusive_v1(exclusive_handle);\n\n\
          typedef struct {\n\
            const char *name; entry_fn direct; const unsigned char *program; size_t program_len;\n\
-           prepared_handle prepared; const unsigned char *fixture; size_t fixture_len;\n\
+           exclusive_handle prepared; const unsigned char *fixture; size_t fixture_len;\n\
            const unsigned char *candidates; size_t candidate_len; int guard_before; int guard_after;\n\
            uint64_t seed; size_t generation_id; unsigned nested_distribution;\n\
          } shape_spec;\n\
@@ -2665,7 +2665,7 @@ fn build_c_harness(config: &Config, shapes: &[CompiledShape], scenarios: &[Scena
          }\n\n\
          static uint32_t invoke(shape_spec *shape, const unsigned char *haystack, size_t length, size_t *result) {\n\
            if (shape->program != NULL)\n\
-             return fre_aot_regex_runtime_search_prepared_v1(shape->prepared, haystack, length, 0U, length, result);\n\
+             return fre_aot_regex_runtime_search_exclusive_v1(shape->prepared, haystack, length, 0U, length, result);\n\
            return shape->direct(haystack, length, 0U, length, result);\n\
          }\n\n"
     );
@@ -2751,7 +2751,7 @@ fn build_c_harness(config: &Config, shapes: &[CompiledShape], scenarios: &[Scena
            const size_t shape_count = sizeof(shapes) / sizeof(shapes[0]);\n\
            for (size_t index = 0; index < shape_count; ++index) {{\n\
              if (shapes[index].program != NULL) {{\n\
-               uint32_t status = fre_aot_regex_runtime_prepare_v1(shapes[index].program, shapes[index].program_len, &shapes[index].prepared);\n\
+               uint32_t status = fre_aot_regex_runtime_prepare_exclusive_v1(shapes[index].program, shapes[index].program_len, &shapes[index].prepared);\n\
                if (status != 0U) {{ fprintf(stderr, \"prepare failed for %s: %u\\n\", shapes[index].name, status); return 72; }}\n\
              }}\n\
            }}\n\
@@ -2760,7 +2760,7 @@ fn build_c_harness(config: &Config, shapes: &[CompiledShape], scenarios: &[Scena
            const size_t count = sizeof(scenarios) / sizeof(scenarios[0]);\n\
            for (size_t index = 0; index < count; ++index) {{ int status = measure_one(&scenarios[index]); if (status != 0) return status; }}\n\
            for (size_t index = 0; index < shape_count; ++index) {{\n\
-             if (shapes[index].program != NULL && fre_aot_regex_runtime_destroy_prepared_v1(shapes[index].prepared) != 0U) return 73;\n\
+             if (shapes[index].program != NULL && fre_aot_regex_runtime_destroy_exclusive_v1(shapes[index].prepared) != 0U) return 73;\n\
            }}\n\
            return 0;\n\
          }}\n",
@@ -3618,7 +3618,7 @@ mod tests {
 
         let source = build_c_harness(&flat_grammar_config(None), &[], &[]);
         let prepare = source
-            .find("fre_aot_regex_runtime_prepare_v1(shapes[index].program")
+            .find("fre_aot_regex_runtime_prepare_exclusive_v1(shapes[index].program")
             .expect("runtime preparation call");
         let ready = source.find("fputs(\"ready\\n\"").expect("ready handshake");
         let wait = source.find("getchar() == EOF").expect("measurement gate");

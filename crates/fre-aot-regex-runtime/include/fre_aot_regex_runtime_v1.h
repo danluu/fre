@@ -13,6 +13,7 @@
 #define FRE_AOT_REGEX_STATUS_SUCCESS 0u
 
 typedef uint64_t FreAotRegexPreparedHandleV1;
+typedef void *FreAotRegexExclusiveHandleV1;
 
 typedef struct FreAotRegexResultV1 {
     size_t start;
@@ -54,6 +55,27 @@ uint32_t fre_aot_regex_runtime_search_prepared_v1(
 
 uint32_t fre_aot_regex_runtime_destroy_prepared_v1(
     FreAotRegexPreparedHandleV1 handle);
+
+/*
+ * The exclusive lifecycle avoids all per-search synchronization. Its handle
+ * must remain exclusively owned, must be destroyed exactly once, and must
+ * never be searched after destruction.
+ */
+uint32_t fre_aot_regex_runtime_prepare_exclusive_v1(
+    const uint8_t *program_ptr,
+    size_t program_len,
+    FreAotRegexExclusiveHandleV1 *handle_out);
+
+uint32_t fre_aot_regex_runtime_search_exclusive_v1(
+    FreAotRegexExclusiveHandleV1 handle,
+    const uint8_t *haystack_ptr,
+    size_t haystack_len,
+    size_t window_start,
+    size_t window_end,
+    FreAotRegexResultV1 *result_ptr);
+
+uint32_t fre_aot_regex_runtime_destroy_exclusive_v1(
+    FreAotRegexExclusiveHandleV1 handle);
 
 #ifdef __cplusplus
 }

@@ -25,6 +25,13 @@
 //! [`fre_aot_regex_runtime_search_prepared_v1`], and release it with
 //! [`fre_aot_regex_runtime_destroy_prepared_v1`]. A handle owns its decoded
 //! program and workspace; it never borrows the input artifact.
+//!
+//! Callers that can guarantee exclusive single-threaded ownership may instead
+//! use [`fre_aot_regex_runtime_prepare_exclusive_v1`],
+//! [`fre_aot_regex_runtime_search_exclusive_v1`], and
+//! [`fre_aot_regex_runtime_destroy_exclusive_v1`]. That explicitly unsafe
+//! lifecycle passes an opaque allocation pointer directly and therefore pays
+//! no registry, reference-count, thread-local, or mutex cost per search.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(unsafe_code)]
@@ -86,6 +93,34 @@ impl FreAotRegexPreparedHandleV1 {
     #[must_use]
     pub const fn is_invalid(self) -> bool {
         self.0 == 0
+    }
+}
+
+/// Exclusively owned prepared runtime state for the direct-pointer ABI.
+///
+/// The null value is invalid. Unlike [`FreAotRegexPreparedHandleV1`], this
+/// handle must not be copied for concurrent use, sent to another thread while
+/// a call is active, searched after destruction, or destroyed more than once.
+/// Those lifecycle rules are safety preconditions rather than recoverable
+/// status checks, which permits a synchronization-free hot path.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(transparent)]
+pub struct FreAotRegexExclusiveHandleV1(*mut std::ffi::c_void);
+
+impl FreAotRegexExclusiveHandleV1 {
+    /// The stable invalid/null handle representation.
+    pub const INVALID: Self = Self(std::ptr::null_mut());
+
+    /// Return whether this is the invalid/null handle.
+    #[must_use]
+    pub const fn is_invalid(self) -> bool {
+        self.0.is_null()
+    }
+}
+
+impl Default for FreAotRegexExclusiveHandleV1 {
+    fn default() -> Self {
+        Self::INVALID
     }
 }
 
@@ -321,6 +356,51 @@ unsafe fn prepare_checked_pointers(
     STATUS_SUCCESS
 }
 
+/// Validate, own, and prepare one serialized program as an exclusively owned
+/// direct-pointer session.
+///
+/// On success, `handle_out` receives a non-null handle and the source bytes
+/// may immediately be released. Unlike the registry-backed prepared ABI, the
+/// returned handle has no recoverable stale-handle or concurrent-use checks.
+///
+/// # Safety
+///
+/// The pointer requirements are identical to
+/// [`fre_aot_regex_runtime_prepare_v1`]. After success, the caller must retain
+/// exclusive ownership of the returned handle, pass it only to the exclusive
+/// search and destroy functions, and destroy it exactly once.
+#[unsafe(no_mangle)]
+#[allow(
+    unsafe_code,
+    reason = "this exported symbol is an audited raw C pointer boundary"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_prepare_exclusive_v1(
+    program_ptr: *const u8,
+    program_len: usize,
+    handle_out: *mut FreAotRegexExclusiveHandleV1,
+) -> u32 {
+    if program_ptr.is_null()
+        || handle_out.is_null()
+        || !handle_out.is_aligned()
+        || program_len > isize::MAX.unsigned_abs()
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+
+    // SAFETY: the function contract supplies the readable source extent and
+    // aligned, writable, non-overlapping output.
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        let program_bytes = std::slice::from_raw_parts(program_ptr, program_len);
+        let Ok(prepared) = PreparedAotRegex::deserialize(program_bytes) else {
+            return STATUS_RUNTIME_FAILURE;
+        };
+        let allocation = Box::into_raw(Box::new(prepared)).cast::<std::ffi::c_void>();
+        handle_out.write(FreAotRegexExclusiveHandleV1(allocation));
+        STATUS_SUCCESS
+    }))
+    .unwrap_or(STATUS_RUNTIME_FAILURE)
+}
+
 /// Search an owned prepared program without reconstructing it or allocating
 /// executor workspace.
 ///
@@ -428,6 +508,61 @@ unsafe fn search_prepared_checked_pointers(
     status
 }
 
+/// Search an exclusively owned direct-pointer prepared session.
+///
+/// Status and result conventions are identical to
+/// [`fre_aot_regex_runtime_search_v1`]. This path performs no registry lookup,
+/// reference counting, thread-local access, or synchronization.
+///
+/// # Safety
+///
+/// `handle` must be a live value returned by
+/// [`fre_aot_regex_runtime_prepare_exclusive_v1`], with no overlapping search
+/// or destroy call on any copy. It must not have been destroyed. Haystack and
+/// result pointer requirements are identical to
+/// [`fre_aot_regex_runtime_search_prepared_v1`].
+#[unsafe(no_mangle)]
+#[allow(
+    unsafe_code,
+    reason = "this exported symbol is an audited raw C pointer boundary"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_v1(
+    handle: FreAotRegexExclusiveHandleV1,
+    haystack_ptr: *const u8,
+    haystack_len: usize,
+    window_start: usize,
+    window_end: usize,
+    result_ptr: *mut FreAotRegexResultV1,
+) -> u32 {
+    if handle.is_invalid() {
+        return STATUS_INVALID_HANDLE;
+    }
+    if haystack_ptr.is_null()
+        || result_ptr.is_null()
+        || !result_ptr.is_aligned()
+        || haystack_len > isize::MAX.unsigned_abs()
+        || window_start > window_end
+        || window_end > haystack_len
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+
+    // SAFETY: the caller guarantees a live exclusively owned session plus the
+    // readable haystack and writable disjoint result extents.
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        let prepared = &mut *handle.0.cast::<PreparedAotRegex>();
+        let haystack = std::slice::from_raw_parts(haystack_ptr, haystack_len);
+        let Ok((status, result)) =
+            execute_search(prepared, haystack, window_start, window_end)
+        else {
+            return STATUS_RUNTIME_FAILURE;
+        };
+        result_ptr.write(result);
+        status
+    }))
+    .unwrap_or(STATUS_RUNTIME_FAILURE)
+}
+
 /// Invalidate and release one prepared handle.
 ///
 /// Returns [`STATUS_SUCCESS`] after the owned program and workspace are
@@ -464,6 +599,31 @@ fn destroy_prepared(handle: FreAotRegexPreparedHandleV1) -> u32 {
     } else {
         STATUS_INVALID_HANDLE
     }
+}
+
+/// Destroy one exclusively owned direct-pointer prepared session.
+///
+/// # Safety
+///
+/// `handle` must be a live value returned by
+/// [`fre_aot_regex_runtime_prepare_exclusive_v1`]. No search may overlap this
+/// call, and no copy of the handle may be used or destroyed afterward.
+#[unsafe(no_mangle)]
+#[allow(
+    unsafe_code,
+    reason = "this exported symbol releases an exclusively owned opaque allocation"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_destroy_exclusive_v1(
+    handle: FreAotRegexExclusiveHandleV1,
+) -> u32 {
+    if handle.is_invalid() {
+        return STATUS_INVALID_HANDLE;
+    }
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        drop(Box::from_raw(handle.0.cast::<PreparedAotRegex>()));
+        STATUS_SUCCESS
+    }))
+    .unwrap_or(STATUS_RUNTIME_FAILURE)
 }
 
 /// Execute one immutable, serialized general AOT regex program.
@@ -676,6 +836,44 @@ mod tests {
         }
     }
 
+    fn prepare_exclusive(program: &[u8]) -> FreAotRegexExclusiveHandleV1 {
+        let mut handle = FreAotRegexExclusiveHandleV1::INVALID;
+        // SAFETY: the complete compiler-produced slice is readable for the
+        // call and the disjoint aligned output remains live. This helper owns
+        // the returned session until its explicit destroy below.
+        let status = unsafe {
+            fre_aot_regex_runtime_prepare_exclusive_v1(
+                program.as_ptr(),
+                program.len(),
+                &raw mut handle,
+            )
+        };
+        assert_eq!(status, STATUS_SUCCESS);
+        assert!(!handle.is_invalid());
+        handle
+    }
+
+    fn call_exclusive(
+        handle: FreAotRegexExclusiveHandleV1,
+        haystack: &[u8],
+        start: usize,
+        end: usize,
+        result: &mut FreAotRegexResultV1,
+    ) -> u32 {
+        // SAFETY: each test keeps exclusive ownership of the live session;
+        // the readable haystack and disjoint aligned result outlive the call.
+        unsafe {
+            fre_aot_regex_runtime_search_exclusive_v1(
+                handle,
+                haystack.as_ptr(),
+                haystack.len(),
+                start,
+                end,
+                result,
+            )
+        }
+    }
+
     fn expected_ffi(result: MatchResult) -> (u32, FreAotRegexResultV1) {
         match result {
             MatchResult::Exists(false)
@@ -715,12 +913,23 @@ mod tests {
     fn c_abi_layout_declarations_and_function_types_are_stable() {
         assert_eq!(size_of::<FreAotRegexPreparedHandleV1>(), size_of::<u64>());
         assert_eq!(align_of::<FreAotRegexPreparedHandleV1>(), align_of::<u64>());
+        assert_eq!(
+            size_of::<FreAotRegexExclusiveHandleV1>(),
+            size_of::<*mut std::ffi::c_void>()
+        );
+        assert_eq!(
+            align_of::<FreAotRegexExclusiveHandleV1>(),
+            align_of::<*mut std::ffi::c_void>()
+        );
         assert_eq!(size_of::<FreAotRegexResultV1>(), size_of::<[usize; 2]>());
         for symbol in [
             "fre_aot_regex_runtime_search_v1",
             "fre_aot_regex_runtime_prepare_v1",
             "fre_aot_regex_runtime_search_prepared_v1",
             "fre_aot_regex_runtime_destroy_prepared_v1",
+            "fre_aot_regex_runtime_prepare_exclusive_v1",
+            "fre_aot_regex_runtime_search_exclusive_v1",
+            "fre_aot_regex_runtime_destroy_exclusive_v1",
         ] {
             assert!(C_API_V1_HEADER.contains(symbol), "{symbol}");
         }
@@ -737,6 +946,21 @@ mod tests {
         ) -> u32 = fre_aot_regex_runtime_search_prepared_v1;
         let _: extern "C" fn(FreAotRegexPreparedHandleV1) -> u32 =
             fre_aot_regex_runtime_destroy_prepared_v1;
+        let _: unsafe extern "C" fn(
+            *const u8,
+            usize,
+            *mut FreAotRegexExclusiveHandleV1,
+        ) -> u32 = fre_aot_regex_runtime_prepare_exclusive_v1;
+        let _: unsafe extern "C" fn(
+            FreAotRegexExclusiveHandleV1,
+            *const u8,
+            usize,
+            usize,
+            usize,
+            *mut FreAotRegexResultV1,
+        ) -> u32 = fre_aot_regex_runtime_search_exclusive_v1;
+        let _: unsafe extern "C" fn(FreAotRegexExclusiveHandleV1) -> u32 =
+            fre_aot_regex_runtime_destroy_exclusive_v1;
     }
 
     #[test]
@@ -958,6 +1182,7 @@ mod tests {
                 assert_eq!(compiled.receipt().engine_selection_reason, expected_reason);
                 let serialized = compiled.program().serialize().expect("serialize");
                 let handle = prepare_handle(&serialized);
+                let exclusive = prepare_exclusive(&serialized);
                 drop(serialized);
 
                 for haystack in &haystacks {
@@ -978,11 +1203,33 @@ mod tests {
                                 expected,
                                 "pattern={pattern:?}, output={output:?}, haystack={haystack:?}, window={start}..{end}"
                             );
+                            let mut exclusive_actual = FreAotRegexResultV1 {
+                                start: usize::MAX,
+                                end: usize::MAX,
+                            };
+                            let exclusive_status = call_exclusive(
+                                exclusive,
+                                haystack,
+                                start,
+                                end,
+                                &mut exclusive_actual,
+                            );
+                            assert_eq!(
+                                (exclusive_status, exclusive_actual),
+                                expected,
+                                "exclusive pattern={pattern:?}, output={output:?}, haystack={haystack:?}, window={start}..{end}"
+                            );
                         }
                     }
                 }
                 assert_eq!(
                     fre_aot_regex_runtime_destroy_prepared_v1(handle),
+                    STATUS_SUCCESS
+                );
+                // SAFETY: this is the unique live exclusive handle and no
+                // search overlaps destruction.
+                assert_eq!(
+                    unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(exclusive) },
                     STATUS_SUCCESS
                 );
             }
