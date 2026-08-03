@@ -223,6 +223,7 @@ dependencies = [
  "fre-automata",
  "fre-lower",
  "fre-syntax",
+ "memchr",
  "regex 1.13.1",
  "sha2",
 ]

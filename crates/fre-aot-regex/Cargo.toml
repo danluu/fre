@@ -14,6 +14,7 @@ path = "src/lib.rs"
 fre-automata = { path = "../fre-automata" }
 fre-lower = { path = "../fre-lower" }
 fre-syntax = { path = "../fre-syntax" }
+memchr = "2.7"
 sha2 = "0.10.9"
 
 [dev-dependencies]
