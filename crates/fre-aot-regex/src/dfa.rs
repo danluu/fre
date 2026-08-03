@@ -1,11 +1,12 @@
 use core::hash::{BuildHasherDefault, Hash, Hasher};
+use memchr::{memchr, memchr2, memchr3};
 use std::collections::HashMap;
 
 use fre_automata::{EdgeKind, RawPlan, StateRole};
 
 use crate::{
     error::CompileError,
-    program::{OutputContract, ProgramFormatError},
+    program::{AnchoredByteSet, OutputContract, ProgramFormatError},
 };
 
 const NO_STATE: u32 = u32::MAX;
@@ -533,6 +534,20 @@ struct ForwardDfa {
     states: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PartialForwardDfa {
+    initial_pending: bool,
+    initial_terminal: bool,
+    transitions: Vec<ForwardCell>,
+    discovered_states: usize,
+    complete_rows: usize,
+}
+
+enum ForwardBuildOutcome {
+    Complete(ForwardDfa),
+    Declined(Option<PartialForwardDfa>),
+}
+
 impl ForwardDfa {
     fn cell(&self, state: u32, class: usize, classes: usize) -> Option<ForwardCell> {
         let state = usize::try_from(state).ok()?;
@@ -565,6 +580,27 @@ pub(crate) struct OrderedDfa {
     forward: ForwardDfa,
     reverse: Option<ReverseDfa>,
     stats: DfaStats,
+}
+
+/// Canonical prefix of ordered subset construction retained when bounded
+/// determinization declines.
+///
+/// Every stored row is complete for every graph alphabet class. A transition
+/// may name a discovered state whose own row was not completed; execution
+/// treats entry into that state as a side exit to the exact ordered-NFA
+/// engine. The side exit restarts the original search window, so no NFA
+/// continuation state or priority proof crosses the engine boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PartialDfa {
+    alphabet: Alphabet,
+    forward: PartialForwardDfa,
+    effective_limits: DeterminizeLimits,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PartialDfaResult<T> {
+    Complete(T),
+    Fallback { consumed: usize },
 }
 
 #[allow(dead_code, reason = "structural handoff for native code generation")]
@@ -916,6 +952,516 @@ impl NativeDfaView<'_> {
             membership,
             cardinality: membership.cardinality(),
         })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PartialDfaPrefixPlan {
+    primary_depth: usize,
+    primary_members: [u8; 3],
+    primary_count: usize,
+}
+
+impl PartialDfaPrefixPlan {
+    pub(crate) fn derive(sets: &[AnchoredByteSet]) -> (Option<Self>, bool) {
+        let Some((primary_depth, primary)) = sets
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, set)| set.cardinality() < 256)
+            .min_by_key(|(depth, set)| (set.cardinality(), *depth))
+        else {
+            return (None, true);
+        };
+        let cardinality = usize::from(primary.cardinality());
+        // The portable sidecar currently delegates only one-to-three-member
+        // scans to memchr's host-dispatched leaves. Larger selective sets stay
+        // on K0, whose prepared start classifier already has exact
+        // ASIMD/SSSE3 and static AVX2/SVE2 paths. Raw scalar rescanning here
+        // would defeat that accelerator.
+        if cardinality == 0 || cardinality > 3 {
+            return (None, false);
+        }
+        let mut primary_members = [0_u8; 3];
+        let mut primary_count = 0usize;
+        if cardinality <= primary_members.len() {
+            for byte in u8::MIN..=u8::MAX {
+                if primary.contains(byte) {
+                    primary_members[primary_count] = byte;
+                    primary_count += 1;
+                }
+            }
+            if primary_count != cardinality {
+                return (None, false);
+            }
+        }
+        (
+            Some(Self {
+                primary_depth,
+                primary_members,
+                primary_count,
+            }),
+            true,
+        )
+    }
+
+    fn find_primary(&self, primary: AnchoredByteSet, bytes: &[u8]) -> Option<usize> {
+        match self.primary_count {
+            1 => memchr(self.primary_members[0], bytes),
+            2 => memchr2(self.primary_members[0], self.primary_members[1], bytes),
+            3 => memchr3(
+                self.primary_members[0],
+                self.primary_members[1],
+                self.primary_members[2],
+                bytes,
+            ),
+            _ => bytes.iter().position(|&byte| primary.contains(byte)),
+        }
+    }
+
+    fn next_candidate(
+        &self,
+        sets: &[AnchoredByteSet],
+        haystack: &[u8],
+        mut start: usize,
+        window_end: usize,
+    ) -> Option<usize> {
+        let maximum_start = window_end.checked_sub(sets.len())?;
+        while start <= maximum_start {
+            let primary_start = start.checked_add(self.primary_depth)?;
+            let primary_end = maximum_start
+                .checked_add(self.primary_depth)?
+                .checked_add(1)?;
+            let bytes = haystack.get(primary_start..primary_end)?;
+            let primary = *sets.get(self.primary_depth)?;
+            let hit = primary_start.checked_add(self.find_primary(primary, bytes)?)?;
+            let candidate = hit.checked_sub(self.primary_depth)?;
+            if sets
+                .iter()
+                .copied()
+                .enumerate()
+                .all(|(depth, set)| {
+                    candidate
+                        .checked_add(depth)
+                        .and_then(|position| haystack.get(position))
+                        .is_some_and(|&byte| set.contains(byte))
+                })
+            {
+                return Some(candidate);
+            }
+            start = candidate.checked_add(1)?;
+        }
+        None
+    }
+}
+
+impl PartialDfa {
+    #[cfg(test)]
+    pub(crate) const fn retained_dimensions(&self) -> (usize, usize) {
+        (
+            self.forward.complete_rows,
+            self.forward.discovered_states,
+        )
+    }
+
+    fn from_complete_forward(
+        alphabet: Alphabet,
+        forward: ForwardDfa,
+        effective_limits: DeterminizeLimits,
+    ) -> Self {
+        Self {
+            alphabet,
+            forward: PartialForwardDfa {
+                initial_pending: forward.initial_pending,
+                initial_terminal: forward.initial_terminal,
+                transitions: forward.transitions,
+                discovered_states: forward.states,
+                complete_rows: forward.states,
+            },
+            effective_limits,
+        }
+    }
+
+    fn selected_end_impl(
+        &self,
+        haystack: &[u8],
+        window_start: usize,
+        window_end: usize,
+        earliest: bool,
+        prefix_sets: &[AnchoredByteSet],
+        prefix_plan: Option<PartialDfaPrefixPlan>,
+    ) -> Result<PartialDfaResult<Option<usize>>, CompileError> {
+        if self.forward.initial_pending && (earliest || self.forward.initial_terminal) {
+            return Ok(PartialDfaResult::Complete(Some(window_start)));
+        }
+
+        let classes = self.alphabet.classes();
+        let mut state = 0_u32;
+        let mut position = window_start;
+        let mut examined = 0usize;
+        let mut pending_end = self.forward.initial_pending.then_some(window_start);
+        while position < window_end {
+            let source = usize::try_from(state).map_err(|_| {
+                CompileError::InternalInvariant("partial DFA state exceeded usize")
+            })?;
+            if source >= self.forward.complete_rows {
+                return Ok(PartialDfaResult::Fallback {
+                    consumed: examined,
+                });
+            }
+            if source == 0 && pending_end.is_none() {
+                if let Some(filter) = prefix_plan {
+                    let Some(candidate) =
+                        filter.next_candidate(prefix_sets, haystack, position, window_end)
+                    else {
+                        return Ok(PartialDfaResult::Complete(None));
+                    };
+                    position = candidate;
+                }
+            }
+            let byte = *haystack
+                .get(position)
+                .ok_or(CompileError::InternalInvariant(
+                    "partial DFA source position exceeded validated window",
+                ))?;
+            let index = source
+                .checked_mul(classes)
+                .and_then(|row| row.checked_add(self.alphabet.class(byte)))
+                .ok_or(CompileError::InternalInvariant(
+                    "partial DFA transition index overflowed",
+                ))?;
+            let cell = *self.forward.transitions.get(index).ok_or(
+                CompileError::InternalInvariant("partial DFA row is incomplete"),
+            )?;
+            examined = examined
+                .checked_add(1)
+                .ok_or(CompileError::InternalInvariant(
+                    "partial DFA examined-step count overflowed",
+                ))?;
+            position = position
+                .checked_add(1)
+                .ok_or(CompileError::InternalInvariant(
+                    "partial DFA input position overflowed",
+                ))?;
+            if cell.accepted {
+                pending_end = Some(position);
+                if earliest {
+                    return Ok(PartialDfaResult::Complete(pending_end));
+                }
+            }
+            if cell.next == NO_STATE {
+                return Ok(PartialDfaResult::Complete(pending_end));
+            }
+            if usize::try_from(cell.next)
+                .ok()
+                .is_none_or(|next| next >= self.forward.discovered_states)
+            {
+                return Err(CompileError::InternalInvariant(
+                    "partial DFA transition references an undiscovered state",
+                ));
+            }
+            state = cell.next;
+        }
+        Ok(PartialDfaResult::Complete(pending_end))
+    }
+
+    pub(crate) fn exists(
+        &self,
+        haystack: &[u8],
+        window_start: usize,
+        window_end: usize,
+        prefix_sets: &[AnchoredByteSet],
+        prefix_plan: Option<PartialDfaPrefixPlan>,
+    ) -> Result<PartialDfaResult<bool>, CompileError> {
+        Ok(
+            match self.selected_end_impl(
+                haystack,
+                window_start,
+                window_end,
+                true,
+                prefix_sets,
+                prefix_plan,
+            )? {
+                PartialDfaResult::Complete(end) => PartialDfaResult::Complete(end.is_some()),
+                PartialDfaResult::Fallback { consumed } => {
+                    PartialDfaResult::Fallback { consumed }
+                }
+            },
+        )
+    }
+
+    pub(crate) fn selected_end(
+        &self,
+        haystack: &[u8],
+        window_start: usize,
+        window_end: usize,
+        prefix_sets: &[AnchoredByteSet],
+        prefix_plan: Option<PartialDfaPrefixPlan>,
+    ) -> Result<PartialDfaResult<Option<usize>>, CompileError> {
+        self.selected_end_impl(
+            haystack,
+            window_start,
+            window_end,
+            false,
+            prefix_sets,
+            prefix_plan,
+        )
+    }
+
+    pub(crate) fn serialized_len(&self) -> Result<usize, CompileError> {
+        let cells = self.forward.transitions.len().checked_mul(8).ok_or(
+            CompileError::InternalInvariant("partial DFA serialization length overflowed"),
+        )?;
+        308_usize
+            .checked_add(self.alphabet.representatives.len())
+            .and_then(|value| value.checked_add(cells))
+            .ok_or(CompileError::InternalInvariant(
+                "partial DFA serialization length overflowed",
+            ))
+    }
+
+    pub(crate) fn serialize_into(&self, bytes: &mut Vec<u8>) {
+        put_u64(
+            bytes,
+            u64::try_from(self.effective_limits.max_states).unwrap_or(u64::MAX),
+        );
+        put_u64(
+            bytes,
+            u64::try_from(self.effective_limits.max_transitions).unwrap_or(u64::MAX),
+        );
+        put_u64(bytes, self.effective_limits.max_work);
+        put_u32(
+            bytes,
+            u32::try_from(self.alphabet.classes()).unwrap_or(u32::MAX),
+        );
+        bytes.extend_from_slice(&self.alphabet.byte_to_class);
+        bytes.extend_from_slice(&self.alphabet.representatives);
+        put_u32(
+            bytes,
+            u32::try_from(self.forward.discovered_states).unwrap_or(u32::MAX),
+        );
+        put_u32(
+            bytes,
+            u32::try_from(self.forward.complete_rows).unwrap_or(u32::MAX),
+        );
+        put_u64(
+            bytes,
+            u64::try_from(self.forward.transitions.len()).unwrap_or(u64::MAX),
+        );
+        bytes.push(u8::from(self.forward.initial_pending));
+        bytes.push(u8::from(self.forward.initial_terminal));
+        bytes.extend_from_slice(&[0; 6]);
+        for cell in &self.forward.transitions {
+            put_u32(bytes, cell.next);
+            bytes.push(u8::from(cell.accepted));
+            bytes.extend_from_slice(&[0; 3]);
+        }
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the stable partial-table wire shape and cross-field checks stay adjacent"
+    )]
+    pub(crate) fn deserialize(
+        bytes: &[u8],
+        construction_classes: (usize, usize),
+        boundary_starts: &[bool; 256],
+    ) -> Result<Self, ProgramFormatError> {
+        let (boundary_classes, graph_classes) = construction_classes;
+        let mut reader = DfaReader::new(bytes);
+        let effective_limits = DeterminizeLimits {
+            max_states: reader.usize_u64("partial DFA state limit is truncated")?,
+            max_transitions: reader.usize_u64("partial DFA transition limit is truncated")?,
+            max_work: reader.u64("partial DFA work limit is truncated")?,
+        };
+        if effective_limits.max_states > MAX_STABLE_DFA_STATES
+            || effective_limits.max_transitions > MAX_STABLE_DFA_TRANSITIONS
+            || effective_limits.max_work > MAX_STABLE_DFA_BUILD_WORK
+        {
+            return Err(ProgramFormatError::Malformed(
+                "partial DFA limits exceed the stable construction bounds",
+            ));
+        }
+        let class_count = usize::try_from(reader.u32("partial DFA class count is truncated")?)
+            .map_err(|_| ProgramFormatError::Malformed("partial DFA class count exceeded usize"))?;
+        if !(1..=256).contains(&class_count)
+            || graph_classes == 0
+            || graph_classes > boundary_classes
+            || class_count > graph_classes
+        {
+            return Err(ProgramFormatError::Malformed(
+                "partial DFA alphabet width is outside the graph partition",
+            ));
+        }
+        let mut byte_to_class = [0_u8; 256];
+        byte_to_class.copy_from_slice(
+            reader.take(256, "partial DFA byte-class map is truncated")?,
+        );
+        if byte_to_class
+            .iter()
+            .any(|&class| usize::from(class) >= class_count)
+        {
+            return Err(ProgramFormatError::Malformed(
+                "partial DFA byte-class map references an absent class",
+            ));
+        }
+        for ((previous, current), &is_boundary) in byte_to_class
+            .iter()
+            .zip(byte_to_class.iter().skip(1))
+            .zip(boundary_starts.iter().skip(1))
+        {
+            if current != previous && !is_boundary {
+                return Err(ProgramFormatError::Malformed(
+                    "partial DFA class map splits a raw byte-range partition",
+                ));
+            }
+        }
+        let representatives = reader
+            .take(class_count, "partial DFA representatives are truncated")?
+            .to_vec();
+        let mut next_class = 0usize;
+        for (byte, &encoded_class) in byte_to_class.iter().enumerate() {
+            let class = usize::from(encoded_class);
+            if class == next_class {
+                if representatives.get(class).copied() != u8::try_from(byte).ok() {
+                    return Err(ProgramFormatError::Malformed(
+                        "partial DFA representative is not its class's first byte",
+                    ));
+                }
+                next_class = next_class.checked_add(1).ok_or(
+                    ProgramFormatError::Malformed("partial DFA class count overflowed"),
+                )?;
+            } else if class > next_class {
+                return Err(ProgramFormatError::Malformed(
+                    "partial DFA classes are not numbered by first occurrence",
+                ));
+            }
+        }
+        if next_class != class_count {
+            return Err(ProgramFormatError::Malformed(
+                "partial DFA class map does not use every declared class",
+            ));
+        }
+
+        let discovered_states = usize::try_from(
+            reader.u32("partial DFA discovered-state count is truncated")?,
+        )
+        .map_err(|_| ProgramFormatError::Malformed("partial DFA state count exceeded usize"))?;
+        let complete_rows = usize::try_from(
+            reader.u32("partial DFA complete-row count is truncated")?,
+        )
+        .map_err(|_| ProgramFormatError::Malformed("partial DFA row count exceeded usize"))?;
+        if complete_rows == 0 || complete_rows > discovered_states {
+            return Err(ProgramFormatError::Malformed(
+                "partial DFA complete rows are outside discovered states",
+            ));
+        }
+        if discovered_states > effective_limits.max_states {
+            return Err(ProgramFormatError::Malformed(
+                "partial DFA states exceed the recorded construction limit",
+            ));
+        }
+        let reserved_transitions = discovered_states.checked_mul(graph_classes).ok_or(
+            ProgramFormatError::Malformed("partial DFA reserved transitions overflowed"),
+        )?;
+        if reserved_transitions > effective_limits.max_transitions {
+            return Err(ProgramFormatError::Malformed(
+                "partial DFA states exceed the recorded transition limit",
+            ));
+        }
+        let cell_count = reader.usize_u64("partial DFA cell count is truncated")?;
+        let expected_cells = complete_rows.checked_mul(class_count).ok_or(
+            ProgramFormatError::Malformed("partial DFA table shape overflowed"),
+        )?;
+        if cell_count != expected_cells {
+            return Err(ProgramFormatError::Malformed(
+                "partial DFA cell count does not match complete rows times classes",
+            ));
+        }
+        let initial_pending = reader.boolean("partial DFA initial-pending flag is invalid")?;
+        let initial_terminal = reader.boolean("partial DFA initial-terminal flag is invalid")?;
+        reader.zeros(6, "partial DFA reserved bytes are non-zero")?;
+        if initial_terminal && !initial_pending {
+            return Err(ProgramFormatError::Malformed(
+                "terminal partial DFA initial state is not pending",
+            ));
+        }
+        let cell_bytes = cell_count
+            .checked_mul(8)
+            .ok_or(ProgramFormatError::Malformed("partial DFA cell bytes overflowed"))?;
+        if cell_bytes > reader.remaining() {
+            return Err(ProgramFormatError::Malformed(
+                "partial DFA cells exceed the payload extent",
+            ));
+        }
+        let mut transitions = dfa_reserve(cell_count, "partial DFA cell")?;
+        for _ in 0..cell_count {
+            let next = reader.u32("partial DFA cell is truncated")?;
+            if next != NO_STATE
+                && usize::try_from(next).map_or(true, |state| state >= discovered_states)
+            {
+                return Err(ProgramFormatError::Malformed(
+                    "partial DFA cell references an undiscovered state",
+                ));
+            }
+            let accepted = reader.boolean("partial DFA accepted flag is invalid")?;
+            reader.zeros(3, "partial DFA cell reserved bytes are non-zero")?;
+            transitions.push(ForwardCell { next, accepted });
+        }
+        reader.finish()?;
+        Ok(Self {
+            alphabet: Alphabet {
+                byte_to_class,
+                representatives: representatives.into_boxed_slice(),
+            },
+            forward: PartialForwardDfa {
+                initial_pending,
+                initial_terminal,
+                transitions,
+                discovered_states,
+                complete_rows,
+            },
+            effective_limits,
+        })
+    }
+
+    pub(crate) fn validate_canonical(
+        &self,
+        raw: &RawPlan,
+        wants_span: bool,
+    ) -> Result<(), ProgramFormatError> {
+        let regenerated = determinize(raw, wants_span, self.effective_limits).map_err(|_| {
+            ProgramFormatError::Malformed("partial DFA canonical regeneration returned an error")
+        })?;
+        let regenerated = match regenerated {
+            DeterminizeOutcome::Complete { .. } => {
+                return Err(ProgramFormatError::Malformed(
+                    "partial DFA limits canonically produce a complete machine",
+                ));
+            }
+            DeterminizeOutcome::Declined { report, partial } => {
+                if matches!(
+                    report.decline,
+                    Some(DeterminizationDecline {
+                        resource: DeterminizationResource::Allocation { .. },
+                        ..
+                    })
+                ) {
+                    return Err(ProgramFormatError::Allocation(
+                        "canonical partial DFA regeneration",
+                    ));
+                }
+                partial.ok_or(ProgramFormatError::Malformed(
+                    "partial DFA limits canonically retain no complete row",
+                ))?
+            }
+        };
+        if regenerated != *self {
+            return Err(ProgramFormatError::Malformed(
+                "partial DFA payload is not the canonical retained prefix",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1483,7 +2029,7 @@ impl OrderedDfa {
         })?;
         let regenerated = match regenerated {
             DeterminizeOutcome::Complete { machine, .. } => machine,
-            DeterminizeOutcome::Declined(report) => {
+            DeterminizeOutcome::Declined { report, .. } => {
                 if matches!(
                     report.decline,
                     Some(DeterminizationDecline {
@@ -1689,15 +2235,37 @@ pub(crate) enum DeterminizeOutcome {
         machine: OrderedDfa,
         report: DeterminizationReport,
     },
-    Declined(DeterminizationReport),
+    Declined {
+        report: DeterminizationReport,
+        partial: Option<PartialDfa>,
+    },
 }
 
 impl DeterminizeOutcome {
-    fn from_budget(machine: Option<OrderedDfa>, budget: BuildBudget) -> Self {
+    fn from_budget(
+        machine: Option<OrderedDfa>,
+        partial: Option<PartialDfa>,
+        budget: BuildBudget,
+    ) -> Self {
+        // Allocation refusal is environmental rather than a canonical
+        // consequence of the recorded numeric limits. Retaining such a table
+        // would make strict replay depend on allocator history, so only
+        // state/transition/work refusals publish a stable partial machine.
+        let partial = if matches!(
+            budget.decline,
+            Some(DeterminizationDecline {
+                resource: DeterminizationResource::Allocation { .. },
+                ..
+            })
+        ) {
+            None
+        } else {
+            partial
+        };
         let report = budget.into_report();
         match machine {
             Some(machine) => Self::Complete { machine, report },
-            None => Self::Declined(report),
+            None => Self::Declined { report, partial },
         }
     }
 }
@@ -1720,7 +2288,7 @@ pub(crate) fn determinize(
     let mut budget = BuildBudget::new(requested_limits);
     budget.begin_stage(DeterminizationStage::AlphabetPartition);
     let Some(built_alphabet) = Alphabet::build(raw, &mut budget)? else {
-        return Ok(DeterminizeOutcome::from_budget(None, budget));
+        return Ok(DeterminizeOutcome::from_budget(None, None, budget));
     };
     let BuiltAlphabet {
         mut alphabet,
@@ -1729,14 +2297,27 @@ pub(crate) fn determinize(
     } = built_alphabet;
     budget.complete_stage(DeterminizationStage::AlphabetPartition)?;
     budget.begin_stage(DeterminizationStage::ForwardSubsetConstruction);
-    let Some(mut forward) = build_forward(raw, &alphabet, &mut budget)? else {
-        return Ok(DeterminizeOutcome::from_budget(None, budget));
+    let mut forward = match build_forward(raw, &alphabet, &mut budget)? {
+        ForwardBuildOutcome::Complete(forward) => forward,
+        ForwardBuildOutcome::Declined(partial) => {
+            let partial = partial.map(|forward| PartialDfa {
+                alphabet,
+                forward,
+                effective_limits: budget.limits,
+            });
+            return Ok(DeterminizeOutcome::from_budget(None, partial, budget));
+        }
     };
     budget.complete_stage(DeterminizationStage::ForwardSubsetConstruction)?;
     let mut reverse = if wants_span && !forward.initial_pending {
         budget.begin_stage(DeterminizationStage::ReverseSubsetConstruction);
         let Some(reverse) = build_reverse(raw, &alphabet, &mut budget)? else {
-            return Ok(DeterminizeOutcome::from_budget(None, budget));
+            let partial = PartialDfa::from_complete_forward(alphabet, forward, budget.limits);
+            return Ok(DeterminizeOutcome::from_budget(
+                None,
+                Some(partial),
+                budget,
+            ));
         };
         budget.complete_stage(DeterminizationStage::ReverseSubsetConstruction)?;
         Some(reverse)
@@ -1747,12 +2328,22 @@ pub(crate) fn determinize(
     let reverse_states_before_minimization = reverse.as_ref().map_or(0, |machine| machine.states);
     budget.begin_stage(DeterminizationStage::DfaStateMinimization);
     if !minimize_dfa_states(&mut forward, &mut reverse, alphabet.classes(), &mut budget)? {
-        return Ok(DeterminizeOutcome::from_budget(None, budget));
+        let partial = PartialDfa::from_complete_forward(alphabet, forward, budget.limits);
+        return Ok(DeterminizeOutcome::from_budget(
+            None,
+            Some(partial),
+            budget,
+        ));
     }
     budget.complete_stage(DeterminizationStage::DfaStateMinimization)?;
     budget.begin_stage(DeterminizationStage::AlphabetColumnCoalescing);
     if !coalesce_alphabet_columns(&mut alphabet, &mut forward, &mut reverse, &mut budget)? {
-        return Ok(DeterminizeOutcome::from_budget(None, budget));
+        let partial = PartialDfa::from_complete_forward(alphabet, forward, budget.limits);
+        return Ok(DeterminizeOutcome::from_budget(
+            None,
+            Some(partial),
+            budget,
+        ));
     }
     budget.complete_stage(DeterminizationStage::AlphabetColumnCoalescing)?;
     let forward_transitions = forward.transitions.len();
@@ -1778,7 +2369,7 @@ pub(crate) fn determinize(
         reverse,
         stats,
     };
-    Ok(DeterminizeOutcome::from_budget(Some(machine), budget))
+    Ok(DeterminizeOutcome::from_budget(Some(machine), None, budget))
 }
 
 trait RefinementCell: Copy + Eq {
@@ -2526,16 +3117,16 @@ fn build_forward(
     raw: &RawPlan,
     alphabet: &Alphabet,
     budget: &mut BuildBudget,
-) -> Result<Option<ForwardDfa>, CompileError> {
+) -> Result<ForwardBuildOutcome, CompileError> {
     let Some(mut closure) = ForwardClosure::new(raw, budget) else {
-        return Ok(None);
+        return Ok(ForwardBuildOutcome::Declined(None));
     };
     let initial_accepted = closure.expand(raw, raw.start, budget)?;
     if budget.declined {
-        return Ok(None);
+        return Ok(ForwardBuildOutcome::Declined(None));
     }
     let Some(initial_items) = closure.copy_items(budget) else {
-        return Ok(None);
+        return Ok(ForwardBuildOutcome::Declined(None));
     };
     let initial_terminal = initial_accepted && initial_items.is_empty();
     let initial = ForwardKey {
@@ -2543,24 +3134,40 @@ fn build_forward(
         pending: initial_accepted,
     };
     if !budget.reserve_state(alphabet.classes()) {
-        return Ok(None);
+        return Ok(ForwardBuildOutcome::Declined(None));
     }
 
     let Some(mut states) = build_vec(1, budget) else {
-        return Ok(None);
+        return Ok(ForwardBuildOutcome::Declined(None));
     };
     let Some(initial_state) = clone_forward_key(&initial, budget) else {
-        return Ok(None);
+        return Ok(ForwardBuildOutcome::Declined(None));
     };
     states.push(initial_state);
     let Some(mut interned) = build_map(1, budget) else {
-        return Ok(None);
+        return Ok(ForwardBuildOutcome::Declined(None));
     };
     interned.insert(initial, 0_u32);
     let Some(mut transitions) = build_vec(alphabet.classes(), budget) else {
-        return Ok(None);
+        return Ok(ForwardBuildOutcome::Declined(None));
     };
     let mut cursor = 0usize;
+    macro_rules! decline_with_complete_rows {
+        () => {{
+            let completed_cells = cursor.checked_mul(alphabet.classes()).ok_or(
+                CompileError::InternalInvariant("partial DFA table shape overflowed"),
+            )?;
+            transitions.truncate(completed_cells);
+            let partial = (cursor != 0).then_some(PartialForwardDfa {
+                initial_pending: initial_accepted,
+                initial_terminal,
+                transitions,
+                discovered_states: states.len(),
+                complete_rows: cursor,
+            });
+            return Ok(ForwardBuildOutcome::Declined(partial));
+        }};
+    }
     while cursor < states.len() {
         let Some(key) = clone_forward_key(
             states.get(cursor).ok_or(CompileError::InternalInvariant(
@@ -2568,21 +3175,21 @@ fn build_forward(
             ))?,
             budget,
         ) else {
-            return Ok(None);
+            decline_with_complete_rows!();
         };
         for &byte in alphabet.representatives.as_ref() {
             if !budget.charge(1) {
-                return Ok(None);
+                decline_with_complete_rows!();
             }
             closure.begin();
             let mut accepted = false;
             'items: for &consuming in &key.items {
                 if !budget.charge(1) {
-                    return Ok(None);
+                    decline_with_complete_rows!();
                 }
                 for edge in state_edges(raw, consuming)? {
                     if !budget.charge(1) {
-                        return Ok(None);
+                        decline_with_complete_rows!();
                     }
                     if raw.byte_starts[edge] <= byte
                         && byte <= raw.byte_ends[edge]
@@ -2592,14 +3199,14 @@ fn build_forward(
                         break 'items;
                     }
                     if budget.declined {
-                        return Ok(None);
+                        decline_with_complete_rows!();
                     }
                 }
             }
             if !accepted && !key.pending {
                 let injected = closure.expand(raw, raw.start, budget)?;
                 if budget.declined {
-                    return Ok(None);
+                    decline_with_complete_rows!();
                 }
                 if injected {
                     return Err(CompileError::InternalInvariant(
@@ -2609,7 +3216,7 @@ fn build_forward(
             }
             let next_pending = key.pending || accepted;
             let Some(next_items) = closure.copy_items(budget) else {
-                return Ok(None);
+                decline_with_complete_rows!();
             };
             let next = if next_items.is_empty() {
                 NO_STATE
@@ -2622,13 +3229,13 @@ fn build_forward(
                     known
                 } else {
                     if !budget.reserve_state(alphabet.classes()) {
-                        return Ok(None);
+                        decline_with_complete_rows!();
                     }
                     let id = u32::try_from(states.len()).map_err(|_| {
                         CompileError::InternalInvariant("forward DFA state count exceeded u32")
                     })?;
                     let Some(state_key) = clone_forward_key(&next_key, budget) else {
-                        return Ok(None);
+                        decline_with_complete_rows!();
                     };
                     let next_state_count =
                         states
@@ -2646,7 +3253,7 @@ fn build_forward(
                         || !ensure_vec_capacity(&mut transitions, next_transition_count, budget)
                         || !reserve_map(&mut interned, 1, budget)
                     {
-                        return Ok(None);
+                        decline_with_complete_rows!();
                     }
                     states.push(state_key);
                     interned.insert(next_key, id);
@@ -2674,7 +3281,7 @@ fn build_forward(
             "forward DFA table is incomplete",
         ));
     }
-    Ok(Some(ForwardDfa {
+    Ok(ForwardBuildOutcome::Complete(ForwardDfa {
         initial_pending: initial_accepted,
         initial_terminal,
         transitions,

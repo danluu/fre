@@ -18,7 +18,7 @@ use crate::{
     },
     dfa::{
         self, DeterminizationReport, DeterminizeLimits, DeterminizeOutcome, DfaStats,
-        NativeDfaView, OrderedDfa,
+        NativeDfaView, OrderedDfa, PartialDfa, PartialDfaPrefixPlan, PartialDfaResult,
     },
     error::CompileError,
     required_literals::{self, RequiredLiterals},
@@ -32,13 +32,19 @@ const PROGRAM_MAGIC: &[u8; 8] = b"FREGAOT\0";
 const PROGRAM_FORMAT_VERSION_V1: u32 = 1;
 const PROGRAM_FORMAT_VERSION_V2: u32 = 2;
 const PROGRAM_FORMAT_VERSION_V3: u32 = 3;
-const PROGRAM_FORMAT_VERSION: u32 = PROGRAM_FORMAT_VERSION_V3;
+const PROGRAM_FORMAT_VERSION_V4: u32 = 4;
+const PROGRAM_FORMAT_VERSION: u32 = PROGRAM_FORMAT_VERSION_V4;
 const PROGRAM_FLAG_NFA_MANDATORY_SUFFIX: u8 = 1 << 0;
 const PROGRAM_FLAG_NFA_MANDATORY_CUT: u8 = 1 << 1;
 const PROGRAM_FLAG_NFA_EXACT_PRODUCT: u8 = 1 << 2;
-const PROGRAM_KNOWN_FLAGS: u8 = PROGRAM_FLAG_NFA_MANDATORY_SUFFIX
+const PROGRAM_FLAG_NFA_PARTIAL_DFA: u8 = 1 << 3;
+const PROGRAM_V3_KNOWN_FLAGS: u8 = PROGRAM_FLAG_NFA_MANDATORY_SUFFIX
     | PROGRAM_FLAG_NFA_MANDATORY_CUT
     | PROGRAM_FLAG_NFA_EXACT_PRODUCT;
+const PROGRAM_KNOWN_FLAGS: u8 = PROGRAM_FLAG_NFA_MANDATORY_SUFFIX
+    | PROGRAM_FLAG_NFA_MANDATORY_CUT
+    | PROGRAM_FLAG_NFA_EXACT_PRODUCT
+    | PROGRAM_FLAG_NFA_PARTIAL_DFA;
 const DEFAULT_LINE_TERMINATOR: u8 = b'\n';
 /// Number of bytes that a runtime must read before it can discover the exact
 /// serialized artifact extent.
@@ -427,7 +433,7 @@ impl AnchoredByteSet {
         self.words
     }
 
-    fn contains(self, byte: u8) -> bool {
+    pub(crate) fn contains(self, byte: u8) -> bool {
         let index = usize::from(byte);
         self.words[index / 64] & (1_u64 << (index % 64)) != 0
     }
@@ -1451,6 +1457,10 @@ pub struct CompiledProgram {
     required_literals: RequiredLiterals,
     exact_match_width: Option<usize>,
     max_match_width: MaxMatchWidthStats,
+    /// Canonical compile-time subset rows retained after a bounded complete
+    /// determinization attempt declines. Execution side-exits to the exact
+    /// ordered NFA on the first absent row.
+    partial_dfa: Option<PartialDfa>,
     nfa_mandatory_suffix: Option<NfaMandatorySuffix>,
     nfa_mandatory_cut: Option<NfaMandatoryCut>,
 }
@@ -1464,6 +1474,63 @@ pub struct CompiledProgram {
 pub struct ProgramWorkspace {
     identity: [u8; 32],
     nfa: Option<K0Workspace>,
+    partial_dfa: PartialDfaRuntimeState,
+}
+
+/// Per-prepared-workspace admission state for a retained partial table.
+///
+/// A side exit restarts K0 from the original window, so repeated holes are
+/// pure duplicate work. After two consecutive holes, use bounded exponential
+/// bypass and periodically re-probe. Early holes receive the steeper backoff;
+/// a complete decision immediately restores direct execution.
+#[derive(Clone, Copy, Debug, Default)]
+struct PartialDfaRuntimeState {
+    consecutive_fallbacks: u8,
+    bypass_remaining: u16,
+    prefix_plan: Option<PartialDfaPrefixPlan>,
+    prefix_supported: bool,
+}
+
+impl PartialDfaRuntimeState {
+    fn new(prefix: &[AnchoredByteSet]) -> Self {
+        let (prefix_plan, prefix_supported) = PartialDfaPrefixPlan::derive(prefix);
+        Self {
+            prefix_plan,
+            prefix_supported,
+            ..Self::default()
+        }
+    }
+
+    fn admit(&mut self) -> bool {
+        if !self.prefix_supported {
+            false
+        } else if self.bypass_remaining == 0 {
+            true
+        } else {
+            self.bypass_remaining = self.bypass_remaining.saturating_sub(1);
+            false
+        }
+    }
+
+    fn observe_complete(&mut self) {
+        self.consecutive_fallbacks = 0;
+        self.bypass_remaining = 0;
+    }
+
+    fn observe_fallback(&mut self, consumed: usize, input_bytes: usize) {
+        self.consecutive_fallbacks = self.consecutive_fallbacks.saturating_add(1);
+        if self.consecutive_fallbacks < 2 {
+            return;
+        }
+        let early = consumed <= 16 || consumed <= input_bytes / 8;
+        let base_shift = if early { 4_u32 } else { 0_u32 };
+        let maximum_shift = if early { 10_u32 } else { 3_u32 };
+        let fallback_exponent = u32::from(self.consecutive_fallbacks.saturating_sub(2));
+        let shift = base_shift
+            .saturating_add(fallback_exponent)
+            .min(maximum_shift);
+        self.bypass_remaining = 1_u16 << shift;
+    }
 }
 
 #[allow(dead_code, reason = "structural handoff for native code generation")]
@@ -1531,11 +1598,13 @@ impl CompiledProgram {
             determinization_report,
             context_dfa,
             context_determinization_report,
+            partial_dfa,
         ) = match mode {
             CompileMode::Fast => (
                 ProgramEngine::OrderedNfa,
                 EngineSelectionReason::FastMode,
                 DeterminizationReport::not_attempted(limits),
+                None,
                 None,
                 None,
             ),
@@ -1566,6 +1635,7 @@ impl CompiledProgram {
                     DeterminizationReport::not_attempted(limits),
                     contextual,
                     Some(contextual_report),
+                    None,
                 )
             }
             CompileMode::Optimizing => match dfa::determinize(&raw, needs_reverse_span, limits)? {
@@ -1575,13 +1645,15 @@ impl CompiledProgram {
                     report,
                     None,
                     None,
+                    None,
                 ),
-                DeterminizeOutcome::Declined(report) => (
+                DeterminizeOutcome::Declined { report, partial } => (
                     ProgramEngine::OrderedNfa,
                     EngineSelectionReason::DeterminizationResourceLimit,
                     report,
                     None,
                     None,
+                    partial,
                 ),
             },
         };
@@ -1636,6 +1708,7 @@ impl CompiledProgram {
             required_literals,
             exact_match_width,
             max_match_width,
+            partial_dfa,
             nfa_mandatory_suffix,
             nfa_mandatory_cut,
         })
@@ -1674,6 +1747,9 @@ impl CompiledProgram {
             } else {
                 flags |= PROGRAM_FLAG_NFA_MANDATORY_CUT;
             }
+        }
+        if self.partial_dfa.is_some() {
+            flags |= PROGRAM_FLAG_NFA_PARTIAL_DFA;
         }
         flags
     }
@@ -1906,6 +1982,7 @@ impl CompiledProgram {
         Ok(ProgramWorkspace {
             identity: self.identity,
             nfa,
+            partial_dfa: PartialDfaRuntimeState::new(self.anchored_prefix.sets()),
         })
     }
 
@@ -1940,7 +2017,7 @@ impl CompiledProgram {
         match &self.engine {
             ProgramEngine::OrderedNfa => {
                 if let Some(nfa) = workspace.nfa.as_mut() {
-                    return self.search_nfa(haystack, window, nfa);
+                    return self.search_nfa(haystack, window, nfa, &mut workspace.partial_dfa);
                 }
                 let product = self
                     .nfa_mandatory_cut
@@ -1990,7 +2067,13 @@ impl CompiledProgram {
         haystack: &[u8],
         window: SearchWindow,
         workspace: &mut K0Workspace,
+        partial_state: &mut PartialDfaRuntimeState,
     ) -> Result<MatchResult, CompileError> {
+        if let Some(found) =
+            self.search_nfa_with_partial_dfa(haystack, window, partial_state)?
+        {
+            return Ok(found);
+        }
         if let Some(found) = self.search_nfa_with_mandatory_suffix(haystack, window, workspace)? {
             return Ok(found);
         }
@@ -2021,6 +2104,96 @@ impl CompiledProgram {
             OutputContract::SelectedEnd => MatchResult::SelectedEnd(None),
             OutputContract::Span => MatchResult::Span(None),
         })
+    }
+
+    /// Execute retained, canonical subset rows until they either decide the
+    /// complete result or reach a state whose row was not completed under the
+    /// caller's determinization budget. A side exit returns `None` and the
+    /// caller restarts the exact ordered NFA over the original window.
+    fn search_nfa_with_partial_dfa(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        state: &mut PartialDfaRuntimeState,
+    ) -> Result<Option<MatchResult>, CompileError> {
+        let Some(partial) = &self.partial_dfa else {
+            return Ok(None);
+        };
+        if !state.admit() {
+            return Ok(None);
+        }
+        let input_bytes = window.end.saturating_sub(window.start);
+        match self.output {
+            OutputContract::Exists => match partial.exists(
+                haystack,
+                window.start,
+                window.end,
+                self.anchored_prefix.sets(),
+                state.prefix_plan,
+            )? {
+                PartialDfaResult::Complete(found) => {
+                    state.observe_complete();
+                    Ok(Some(MatchResult::Exists(found)))
+                }
+                PartialDfaResult::Fallback { consumed } => {
+                    state.observe_fallback(consumed, input_bytes);
+                    Ok(None)
+                }
+            },
+            OutputContract::SelectedEnd => {
+                match partial.selected_end(
+                    haystack,
+                    window.start,
+                    window.end,
+                    self.anchored_prefix.sets(),
+                    state.prefix_plan,
+                )? {
+                    PartialDfaResult::Complete(found) => {
+                        state.observe_complete();
+                        Ok(Some(MatchResult::SelectedEnd(found)))
+                    }
+                    PartialDfaResult::Fallback { consumed } => {
+                        state.observe_fallback(consumed, input_bytes);
+                        Ok(None)
+                    }
+                }
+            }
+            OutputContract::Span => {
+                match partial.selected_end(
+                    haystack,
+                    window.start,
+                    window.end,
+                    self.anchored_prefix.sets(),
+                    state.prefix_plan,
+                )? {
+                    PartialDfaResult::Fallback { consumed } => {
+                        state.observe_fallback(consumed, input_bytes);
+                        Ok(None)
+                    }
+                    PartialDfaResult::Complete(None) => {
+                        state.observe_complete();
+                        Ok(Some(MatchResult::Span(None)))
+                    }
+                    PartialDfaResult::Complete(Some(end)) => {
+                        let Some(width) = self.exact_match_width else {
+                            // The retained forward rows prove the selected end,
+                            // but variable-width start recovery requires an
+                            // exact reverse machine. Until partial reverse rows
+                            // are retained, let bidirectional K0 recover it.
+                            state.observe_fallback(input_bytes, input_bytes);
+                            return Ok(None);
+                        };
+                        let start = end.checked_sub(width).ok_or(
+                            CompileError::InternalInvariant(
+                                "partial fixed-width match end preceded its proved width",
+                            ),
+                        )?;
+                        state.observe_complete();
+                        Ok(Some(MatchResult::Span(Some((start, end)))))
+                    }
+                }
+            }
+        }
     }
 
     /// Try the graph-derived mandatory-suffix route. `None` means this program
@@ -2287,7 +2460,10 @@ impl CompiledProgram {
     pub fn serialized_len(&self) -> Result<usize, CompileError> {
         let raw = raw_serialized_len(&self.raw)?;
         let dfa = match &self.engine {
-            ProgramEngine::OrderedNfa => 0,
+            ProgramEngine::OrderedNfa => self
+                .partial_dfa
+                .as_ref()
+                .map_or(Ok(0), PartialDfa::serialized_len)?,
             ProgramEngine::OrderedDfa(machine) => machine.serialized_len()?,
         };
         PROGRAM_HEADER_LEN
@@ -2325,7 +2501,10 @@ impl CompiledProgram {
         );
         serialize_raw(&self.raw, &mut bytes);
         let dfa_len = match &self.engine {
-            ProgramEngine::OrderedNfa => 0,
+            ProgramEngine::OrderedNfa => self
+                .partial_dfa
+                .as_ref()
+                .map_or(Ok(0), PartialDfa::serialized_len)?,
             ProgramEngine::OrderedDfa(machine) => machine.serialized_len()?,
         };
         put_u64(
@@ -2334,8 +2513,13 @@ impl CompiledProgram {
                 CompileError::InternalInvariant("DFA serialization length exceeded u64")
             })?,
         );
-        if let ProgramEngine::OrderedDfa(machine) = &self.engine {
-            machine.serialize_into(&mut bytes);
+        match &self.engine {
+            ProgramEngine::OrderedNfa => {
+                if let Some(partial) = &self.partial_dfa {
+                    partial.serialize_into(&mut bytes);
+                }
+            }
+            ProgramEngine::OrderedDfa(machine) => machine.serialize_into(&mut bytes),
         }
         if bytes.len() != expected {
             return Err(CompileError::InternalInvariant(
@@ -2437,6 +2621,13 @@ impl CompiledProgram {
                 "ordered-NFA sidecar flags are mutually exclusive",
             ));
         }
+        if program_flags & PROGRAM_FLAG_NFA_PARTIAL_DFA != 0
+            && engine_kind != EngineKind::OrderedNfa
+        {
+            return Err(ProgramFormatError::Malformed(
+                "partial-DFA flag requires an ordered-NFA engine",
+            ));
+        }
         let mut reader = ProgramReader::new(
             bytes
                 .get(PROGRAM_HEADER_LEN..)
@@ -2448,14 +2639,43 @@ impl CompiledProgram {
 
         let dfa_len = reader.usize_u64("DFA byte length")?;
         let dfa_bytes = reader.take(dfa_len, "DFA body is truncated")?;
-        let engine = match engine_kind {
+        let (engine, partial_dfa) = match engine_kind {
             EngineKind::OrderedNfa | EngineKind::OrderedContextDfa => {
-                if dfa_len != 0 {
-                    return Err(ProgramFormatError::Malformed(
-                        "ordered-NFA program contains a DFA payload",
-                    ));
-                }
-                ProgramEngine::OrderedNfa
+                let partial = if program_flags & PROGRAM_FLAG_NFA_PARTIAL_DFA != 0 {
+                    if dfa_len == 0 {
+                        return Err(ProgramFormatError::Malformed(
+                            "partial-DFA program has no partial payload",
+                        ));
+                    }
+                    if raw
+                        .edge_kinds
+                        .iter()
+                        .any(|kind| !matches!(kind, EdgeKind::Epsilon | EdgeKind::ByteRange))
+                    {
+                        return Err(ProgramFormatError::Malformed(
+                            "partial-DFA graph contains a context assertion",
+                        ));
+                    }
+                    let alphabet_shape = dfa_alphabet_shape(&raw)?;
+                    let partial = PartialDfa::deserialize(
+                        dfa_bytes,
+                        alphabet_shape.construction_classes(),
+                        &alphabet_shape.boundary_starts,
+                    )?;
+                    partial.validate_canonical(
+                        &raw,
+                        output == OutputContract::Span && exact_match_width.is_none(),
+                    )?;
+                    Some(partial)
+                } else {
+                    if dfa_len != 0 {
+                        return Err(ProgramFormatError::Malformed(
+                            "ordered-NFA program contains an unflagged DFA payload",
+                        ));
+                    }
+                    None
+                };
+                (ProgramEngine::OrderedNfa, partial)
             }
             EngineKind::OrderedDfa => {
                 if dfa_len == 0 {
@@ -2481,7 +2701,7 @@ impl CompiledProgram {
                     &alphabet_shape.boundary_starts,
                 )?;
                 machine.validate_canonical(&raw)?;
-                ProgramEngine::OrderedDfa(machine)
+                (ProgramEngine::OrderedDfa(machine), None)
             }
         };
         reader.finish()?;
@@ -2492,7 +2712,10 @@ impl CompiledProgram {
         let identity = automaton_digest(&raw, line_terminator);
         let anchored_prefix = derive_anchored_prefix(&raw);
         let anchored_suffix = derive_anchored_suffix(&raw);
-        let required_literals = if engine_kind == EngineKind::OrderedDfa || mandatory_cut_enabled {
+        let required_literals = if engine_kind == EngineKind::OrderedDfa
+            || mandatory_cut_enabled
+            || program_flags & PROGRAM_FLAG_NFA_PARTIAL_DFA != 0
+        {
             required_literals::derive(&raw)
         } else {
             RequiredLiterals::unavailable()
@@ -2550,6 +2773,7 @@ impl CompiledProgram {
             required_literals,
             exact_match_width,
             max_match_width,
+            partial_dfa,
             nfa_mandatory_suffix,
             nfa_mandatory_cut,
         };
@@ -3929,7 +4153,7 @@ fn header_line_terminator(header: &[u8], version: u32) -> Result<u8, ProgramForm
             }
             Ok(header[14])
         }
-        PROGRAM_FORMAT_VERSION_V3 => Ok(header[14]),
+        PROGRAM_FORMAT_VERSION_V3 | PROGRAM_FORMAT_VERSION_V4 => Ok(header[14]),
         _ => Err(ProgramFormatError::Malformed(
             "unsupported program format version",
         )),
@@ -3941,9 +4165,18 @@ fn header_program_flags(header: &[u8], version: u32) -> Result<u8, ProgramFormat
         PROGRAM_FORMAT_VERSION_V1 | PROGRAM_FORMAT_VERSION_V2 => Ok(0),
         PROGRAM_FORMAT_VERSION_V3 => {
             let flags = header[15];
-            if flags & !PROGRAM_KNOWN_FLAGS != 0 {
+            if flags & !PROGRAM_V3_KNOWN_FLAGS != 0 {
                 return Err(ProgramFormatError::Malformed(
                     "V3 program header contains unknown flags",
+                ));
+            }
+            Ok(flags)
+        }
+        PROGRAM_FORMAT_VERSION_V4 => {
+            let flags = header[15];
+            if flags & !PROGRAM_KNOWN_FLAGS != 0 {
+                return Err(ProgramFormatError::Malformed(
+                    "V4 program header contains unknown flags",
                 ));
             }
             Ok(flags)
@@ -4990,7 +5223,7 @@ mod tests {
             let bytes = compiled.serialize().expect("serialize fallback");
             assert_eq!(
                 u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
-                PROGRAM_FORMAT_VERSION_V3
+                PROGRAM_FORMAT_VERSION_V4
             );
             assert_eq!(bytes[15], PROGRAM_FLAG_NFA_MANDATORY_SUFFIX);
             let restored = CompiledProgram::deserialize(&bytes).expect("restore fallback");
@@ -5872,7 +6105,7 @@ mod tests {
             .expect("legacy reverse determinization")
         {
             DeterminizeOutcome::Complete { machine, .. } => machine,
-            DeterminizeOutcome::Declined(report) => {
+            DeterminizeOutcome::Declined { report, .. } => {
                 panic!("legacy reverse determinization declined: {report:?}")
             }
         };
@@ -5953,6 +6186,148 @@ mod tests {
             }
         );
         assert_eq!(decline.states_completed, 65_536);
+    }
+
+    #[test]
+    fn resource_decline_retains_canonical_partial_rows_for_every_contract() {
+        let pattern = r"[b-c][a-b]{1,5}z";
+        let limits = DeterminizeLimits {
+            max_states: 32,
+            ..DeterminizeLimits::default()
+        };
+        let mut haystacks = generated_byte_strings(&[0, b'a', b'b', b'c', b'x', b'z', 255], 5);
+        haystacks.extend([
+            b"xxcbbbbzxx".to_vec(),
+            b"bbbbbbbbbbbb".to_vec(),
+            b"xxbaaaaazyy".to_vec(),
+            vec![b'a'; 257],
+            {
+                let mut value = vec![b'x'; 255];
+                value.extend_from_slice(b"cbbbbz");
+                value
+            },
+        ]);
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let partial = program(pattern, output, CompileMode::Optimizing, limits);
+            assert_eq!(partial.engine_kind(), EngineKind::OrderedNfa);
+            let retained = partial
+                .partial_dfa
+                .as_ref()
+                .unwrap_or_else(|| panic!("missing retained rows for {output:?}"));
+            let (complete_rows, discovered_states) = retained.retained_dimensions();
+            assert!(complete_rows > 0);
+            assert!(complete_rows < discovered_states);
+            let report = partial.determinization_report().unwrap();
+            assert!(report.decline.is_some(), "{output:?}");
+
+            let bytes = partial.serialize().expect("serialize partial DFA");
+            assert_eq!(
+                u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+                PROGRAM_FORMAT_VERSION_V4
+            );
+            assert_ne!(bytes[15] & PROGRAM_FLAG_NFA_PARTIAL_DFA, 0);
+            let restored = CompiledProgram::deserialize(&bytes).expect("restore partial DFA");
+            assert!(restored.partial_dfa.is_some());
+            assert_eq!(restored.serialize().unwrap(), bytes);
+
+            let reference = program(
+                pattern,
+                output,
+                CompileMode::Fast,
+                DeterminizeLimits::default(),
+            );
+            let mut partial_workspace = partial.prepare_workspace().unwrap();
+            let mut restored_workspace = restored.prepare_workspace().unwrap();
+            let mut reference_workspace = reference.prepare_workspace().unwrap();
+            for haystack in &haystacks {
+                let haystack = haystack.as_slice();
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        let expected = reference
+                            .search_with_workspace(haystack, window, &mut reference_workspace)
+                            .unwrap();
+                        assert_eq!(
+                            partial
+                                .search_with_workspace(haystack, window, &mut partial_workspace)
+                                .unwrap(),
+                            expected,
+                            "fresh {output:?} {haystack:?} {start}..{end}"
+                        );
+                        assert_eq!(
+                            restored
+                                .search_with_workspace(haystack, window, &mut restored_workspace)
+                                .unwrap(),
+                            expected,
+                            "restored {output:?} {haystack:?} {start}..{end}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_early_partial_holes_back_off_and_complete_probe_resets() {
+        let mut state = PartialDfaRuntimeState {
+            prefix_supported: true,
+            ..PartialDfaRuntimeState::default()
+        };
+        assert!(state.admit());
+        state.observe_fallback(1, 1_024);
+        assert!(state.admit());
+        state.observe_fallback(1, 1_024);
+        assert_eq!(state.bypass_remaining, 16);
+        for _ in 0..16 {
+            assert!(!state.admit(), "early-hole bypass interval");
+        }
+        assert!(state.admit(), "the guard periodically re-probes");
+        state.observe_fallback(1, 1_024);
+        assert_eq!(state.bypass_remaining, 32);
+        for _ in 0..32 {
+            assert!(!state.admit());
+        }
+        assert!(state.admit());
+        state.observe_complete();
+        assert!(state.admit());
+        assert_eq!(state.consecutive_fallbacks, 0);
+        assert_eq!(state.bypass_remaining, 0);
+    }
+
+    #[test]
+    fn partial_dfa_wire_requires_strict_flag_and_canonical_limit_provenance() {
+        let compiled = program(
+            r"[b-c][a-b]{1,5}z",
+            OutputContract::SelectedEnd,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 32,
+                ..DeterminizeLimits::default()
+            },
+        );
+        assert!(compiled.partial_dfa.is_some());
+        let bytes = compiled.serialize().unwrap();
+        assert_ne!(bytes[15] & PROGRAM_FLAG_NFA_PARTIAL_DFA, 0);
+
+        let mut unflagged = bytes.clone();
+        unflagged[15] &= !PROGRAM_FLAG_NFA_PARTIAL_DFA;
+        assert!(CompiledProgram::deserialize(&unflagged).is_err());
+
+        let mut legacy_flag = bytes.clone();
+        legacy_flag[8..12].copy_from_slice(&PROGRAM_FORMAT_VERSION_V3.to_le_bytes());
+        assert!(CompiledProgram::deserialize(&legacy_flag).is_err());
+
+        let payload = PROGRAM_HEADER_LEN
+            .checked_add(raw_serialized_len(&compiled.raw).unwrap())
+            .and_then(|offset| offset.checked_add(8))
+            .unwrap();
+        let mut changed_limit = bytes;
+        changed_limit[payload..payload + 8].copy_from_slice(&0_u64.to_le_bytes());
+        assert!(CompiledProgram::deserialize(&changed_limit).is_err());
     }
 
     #[test]
@@ -6465,7 +6840,7 @@ mod tests {
             let bytes = original.serialize().unwrap();
             assert_eq!(
                 u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
-                PROGRAM_FORMAT_VERSION_V3
+                PROGRAM_FORMAT_VERSION_V4
             );
             assert_eq!(bytes[14], b'\n');
             assert_eq!(bytes[15], 0);
@@ -6487,7 +6862,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_mandatory_nfa_sidecar_flags_are_strict_and_engine_scoped() {
+    fn v4_nfa_sidecar_flags_are_strict_versioned_and_engine_scoped() {
         let fallback = program(
             "(?:a|bb)q[xz]",
             OutputContract::Span,
@@ -6551,6 +6926,11 @@ mod tests {
         assert_eq!(unbounded_bytes[15], PROGRAM_FLAG_NFA_MANDATORY_SUFFIX);
         assert!(CompiledProgram::deserialize(&unbounded_bytes).is_ok());
 
+        let mut legacy_v3_partial = bytes;
+        legacy_v3_partial[8..12].copy_from_slice(&PROGRAM_FORMAT_VERSION_V3.to_le_bytes());
+        legacy_v3_partial[15] |= PROGRAM_FLAG_NFA_PARTIAL_DFA;
+        assert!(CompiledProgram::deserialize(&legacy_v3_partial).is_err());
+
         let dfa = program(
             "(?:ab|ac)+",
             OutputContract::Span,
@@ -6568,7 +6948,7 @@ mod tests {
     }
 
     #[test]
-    fn line_terminator_is_bound_to_v3_header_identity_and_execution() {
+    fn line_terminator_is_bound_to_v4_header_identity_and_execution() {
         let original = program_with_line_terminator(
             r"(?m:^a$)",
             b';',
@@ -6613,7 +6993,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_v1_programs_decode_as_lf_and_reserialize_as_v3() {
+    fn strict_v1_programs_decode_as_lf_and_reserialize_as_v4() {
         let original = program(
             r"(?m:^a$)",
             OutputContract::Span,
@@ -6638,13 +7018,13 @@ mod tests {
             MatchResult::Span(Some((1, 2)))
         );
 
-        let v3 = restored.serialize().unwrap();
+        let v4 = restored.serialize().unwrap();
         assert_eq!(
-            u32::from_le_bytes(v3[8..12].try_into().unwrap()),
-            PROGRAM_FORMAT_VERSION_V3
+            u32::from_le_bytes(v4[8..12].try_into().unwrap()),
+            PROGRAM_FORMAT_VERSION_V4
         );
-        assert_eq!(v3[14], b'\n');
-        assert_eq!(v3[15], 0);
+        assert_eq!(v4[14], b'\n');
+        assert_eq!(v4[15], 0);
 
         let mut noncanonical_v1 = v1.clone();
         noncanonical_v1[14] = b'\n';
@@ -6655,7 +7035,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_v1_ordered_dfa_canonical_upgrades_to_v3_with_identical_semantics() {
+    fn strict_v1_ordered_dfa_canonical_upgrades_to_v4_with_identical_semantics() {
         let original = program(
             "(?:ab|a)+?b",
             OutputContract::Span,
@@ -6663,8 +7043,8 @@ mod tests {
             DeterminizeLimits::default(),
         );
         assert_eq!(original.engine_kind(), EngineKind::OrderedDfa);
-        let canonical_v3 = original.serialize().unwrap();
-        let mut v1 = canonical_v3.clone();
+        let canonical_v4 = original.serialize().unwrap();
+        let mut v1 = canonical_v4.clone();
         v1[8..12].copy_from_slice(&PROGRAM_FORMAT_VERSION_V1.to_le_bytes());
         v1[14] = 0;
         v1[15] = 0;
@@ -6677,7 +7057,7 @@ mod tests {
         );
         assert_eq!(restored.line_terminator(), DEFAULT_LINE_TERMINATOR);
         assert_eq!(restored.dfa_stats(), original.dfa_stats());
-        assert_eq!(restored.serialize().unwrap(), canonical_v3);
+        assert_eq!(restored.serialize().unwrap(), canonical_v4);
 
         for haystack in [
             b"".as_slice(),
@@ -6720,7 +7100,7 @@ mod tests {
         malformed[0] ^= 1;
         assert!(CompiledProgram::deserialize(&malformed).is_err());
         malformed = valid.clone();
-        malformed[8..12].copy_from_slice(&4_u32.to_le_bytes());
+        malformed[8..12].copy_from_slice(&5_u32.to_le_bytes());
         assert!(CompiledProgram::deserialize(&malformed).is_err());
         malformed = valid.clone();
         malformed[12] = 9;
