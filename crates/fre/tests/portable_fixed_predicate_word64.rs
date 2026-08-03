@@ -801,7 +801,7 @@ fn declined_fixed_predicate_inspections_preserve_exact_cumulative_planner_work()
 }
 
 #[test]
-fn fixed_predicate_admission_preserves_finite_incumbents_and_k0_refusals() {
+fn fixed_predicate_admission_preserves_finite_incumbents_and_structural_refusals() {
     assert_eq!(
         build_auto("abc").build_report().plan,
         PlanKind::ExactLiteral
@@ -835,7 +835,7 @@ fn fixed_predicate_admission_preserves_finite_incumbents_and_k0_refusals() {
     assert_eq!(build_auto(&alternation).build_report().plan, PlanKind::K0);
     assert_eq!(
         build_auto("[abc]{8,9}[def]{8,9}").build_report().plan,
-        PlanKind::K0
+        PlanKind::BoundedByteClassSequence
     );
 }
 
