@@ -350,6 +350,10 @@ pub struct PartialDfaStats {
     pub resume_frontiers: usize,
     pub resume_items: usize,
     pub effective_limits: DeterminizeLimits,
+    /// Whether the prepared optimizing entry can scan this prefix shape.
+    pub optimized_entry_supported: bool,
+    /// Minimum window length at which the optimizing entry considers rows.
+    pub min_input_bytes: usize,
 }
 
 /// Fresh-compilation provenance for optional contextual determinization.
@@ -1929,6 +1933,19 @@ impl CompiledProgram {
         self.optimization_sidecar.partial_dfa()
     }
 
+    /// Whether this ordered-NFA artifact has a complete exact-product scanner.
+    ///
+    /// Exact products and retained partial DFA rows are mutually exclusive.
+    /// This structural fact lets tooling distinguish an optimized fallback
+    /// from a plain universal NFA without decoding private wire flags.
+    #[must_use]
+    pub fn has_nfa_exact_product(&self) -> bool {
+        self.nfa_mandatory_cut
+            .as_ref()
+            .and_then(NfaMandatoryCut::exact_product)
+            .is_some()
+    }
+
     /// Return canonical retained-row dimensions for a resource fallback.
     ///
     /// `None` distinguishes a plain universal-NFA fallback from one whose
@@ -1942,12 +1959,16 @@ impl CompiledProgram {
         self.partial_dfa()
             .map(|partial| {
                 let (complete_rows, discovered_states) = partial.retained_dimensions();
+                let (_, optimized_entry_supported) =
+                    PartialDfaPrefixPlan::derive(self.anchored_prefix.sets());
                 Ok(PartialDfaStats {
                     complete_rows,
                     discovered_states,
                     resume_frontiers: partial.resume_frontier_count(),
                     resume_items: partial.resume_item_count()?,
                     effective_limits: partial.effective_limits(),
+                    optimized_entry_supported,
+                    min_input_bytes: PARTIAL_DFA_MIN_INPUT_BYTES,
                 })
             })
             .transpose()
@@ -6742,6 +6763,65 @@ mod tests {
                 "restored {output:?} never exercised stateful K0 resume"
             );
         }
+    }
+
+    #[test]
+    fn general_byte_set_prefix_executes_retained_rows() {
+        let pattern = r"[b-f][a-e]{1,10}Z";
+        let complete = program(
+            pattern,
+            OutputContract::SelectedEnd,
+            CompileMode::Optimizing,
+            DeterminizeLimits::default(),
+        );
+        let forward_states = complete
+            .dfa_stats()
+            .expect("complete structural probe")
+            .forward_states_before_minimization;
+        let limited = program(
+            pattern,
+            OutputContract::SelectedEnd,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: forward_states.checked_sub(1).expect("multiple forward states"),
+                ..DeterminizeLimits::default()
+            },
+        );
+        let stats = limited
+            .partial_dfa_stats()
+            .unwrap()
+            .expect("retained rows");
+        assert!(stats.optimized_entry_supported);
+        assert!(stats.complete_rows > 0);
+        assert!(stats.resume_frontiers > 0);
+        assert_eq!(stats.min_input_bytes, PARTIAL_DFA_MIN_INPUT_BYTES);
+        let (prefix_plan, supported) = PartialDfaPrefixPlan::derive(limited.anchored_prefix.sets());
+        assert!(supported);
+        assert!(prefix_plan.is_some());
+
+        let mut haystack = vec![b'x'; PARTIAL_DFA_MIN_INPUT_BYTES];
+        haystack.extend_from_slice(b"beeeeeeeeeeZ");
+        let reference = program(
+            pattern,
+            OutputContract::SelectedEnd,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let expected = reference
+            .search(&haystack, SearchWindow::full(&haystack))
+            .unwrap();
+        let mut workspace = limited.prepare_workspace().unwrap();
+        assert_eq!(
+            limited
+                .search_optimized_with_workspace(
+                    &haystack,
+                    SearchWindow::full(&haystack),
+                    &mut workspace,
+                )
+                .unwrap(),
+            expected
+        );
+        assert!(workspace.partial.as_deref().unwrap().state.resumed > 0);
     }
 
     #[test]

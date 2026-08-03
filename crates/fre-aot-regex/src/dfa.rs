@@ -3,6 +3,9 @@ use memchr::{memchr, memchr2, memchr3};
 use std::collections::HashMap;
 
 use fre_automata::{EdgeKind, RawPlan, StateRole};
+use fre_simd_kernels::{
+    BYTE_SET_BLOCK_BYTES, BYTE_SET_WIDE_BLOCK_BYTES, ByteSet256, ByteSetClassifier,
+};
 
 use crate::{
     error::CompileError,
@@ -973,8 +976,19 @@ impl NativeDfaView<'_> {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PartialDfaPrefixPlan {
     primary_depth: usize,
-    primary_members: [u8; 3],
-    primary_count: usize,
+    scanner: PartialDfaPrefixScanner,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PartialDfaPrefixScanner {
+    Small {
+        members: [u8; 3],
+        count: usize,
+    },
+    Full {
+        set: ByteSet256,
+        classifier: ByteSetClassifier,
+    },
 }
 
 impl PartialDfaPrefixPlan {
@@ -989,48 +1003,50 @@ impl PartialDfaPrefixPlan {
             return (None, true);
         };
         let cardinality = usize::from(primary.cardinality());
-        // The portable sidecar currently delegates only one-to-three-member
-        // scans to memchr's host-dispatched leaves. Larger selective sets stay
-        // on K0, whose prepared start classifier already has exact
-        // ASIMD/SSSE3 and static AVX2/SVE2 paths. Raw scalar rescanning here
-        // would defeat that accelerator.
-        if cardinality == 0 || cardinality > 3 {
-            return (None, false);
-        }
-        let mut primary_members = [0_u8; 3];
-        let mut primary_count = 0usize;
-        if cardinality <= primary_members.len() {
+        let scanner = if cardinality <= 3 {
+            let mut members = [0_u8; 3];
+            let mut count = 0usize;
             for byte in u8::MIN..=u8::MAX {
                 if primary.contains(byte) {
-                    primary_members[primary_count] = byte;
-                    primary_count += 1;
+                    members[count] = byte;
+                    count += 1;
                 }
             }
-            if primary_count != cardinality {
+            if count != cardinality {
                 return (None, false);
             }
-        }
+            PartialDfaPrefixScanner::Small { members, count }
+        } else {
+            let set = ByteSet256::from_words(primary.words());
+            PartialDfaPrefixScanner::Full {
+                set,
+                classifier: ByteSetClassifier::new(set),
+            }
+        };
         (
             Some(Self {
                 primary_depth,
-                primary_members,
-                primary_count,
+                scanner,
             }),
             true,
         )
     }
 
     fn find_primary(&self, primary: AnchoredByteSet, bytes: &[u8]) -> Option<usize> {
-        match self.primary_count {
-            1 => memchr(self.primary_members[0], bytes),
-            2 => memchr2(self.primary_members[0], self.primary_members[1], bytes),
-            3 => memchr3(
-                self.primary_members[0],
-                self.primary_members[1],
-                self.primary_members[2],
-                bytes,
-            ),
-            _ => bytes.iter().position(|&byte| primary.contains(byte)),
+        match self.scanner {
+            PartialDfaPrefixScanner::Small { members, count: 1 } => memchr(members[0], bytes),
+            PartialDfaPrefixScanner::Small { members, count: 2 } => {
+                memchr2(members[0], members[1], bytes)
+            }
+            PartialDfaPrefixScanner::Small { members, count: 3 } => {
+                memchr3(members[0], members[1], members[2], bytes)
+            }
+            PartialDfaPrefixScanner::Small { .. } => {
+                bytes.iter().position(|&byte| primary.contains(byte))
+            }
+            PartialDfaPrefixScanner::Full { set, classifier } => {
+                find_byte_set_member(set, &classifier, bytes)
+            }
         }
     }
 
@@ -1068,6 +1084,36 @@ impl PartialDfaPrefixPlan {
         }
         None
     }
+}
+
+fn find_byte_set_member(
+    set: ByteSet256,
+    classifier: &ByteSetClassifier,
+    bytes: &[u8],
+) -> Option<usize> {
+    let mut position = 0usize;
+    while bytes.len().saturating_sub(position) >= BYTE_SET_WIDE_BLOCK_BYTES {
+        let end = position.checked_add(BYTE_SET_WIDE_BLOCK_BYTES)?;
+        let block: &[u8; BYTE_SET_WIDE_BLOCK_BYTES] = bytes.get(position..end)?.try_into().ok()?;
+        let mask = classifier.classify_32(block).member_mask();
+        if mask != 0 {
+            return position.checked_add(mask.trailing_zeros() as usize);
+        }
+        position = end;
+    }
+    if bytes.len().saturating_sub(position) >= BYTE_SET_BLOCK_BYTES {
+        let end = position.checked_add(BYTE_SET_BLOCK_BYTES)?;
+        let block: &[u8; BYTE_SET_BLOCK_BYTES] = bytes.get(position..end)?.try_into().ok()?;
+        let mask = classifier.classify_16(block).member_mask();
+        if mask != 0 {
+            return position.checked_add(mask.trailing_zeros() as usize);
+        }
+        position = end;
+    }
+    bytes.get(position..)?
+        .iter()
+        .position(|&byte| set.contains(byte))
+        .and_then(|offset| position.checked_add(offset))
 }
 
 impl PartialDfa {
@@ -4103,6 +4149,33 @@ fn put_u64(bytes: &mut Vec<u8>, value: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_prefix_full_byte_classifier_matches_scalar_at_every_alignment() {
+        let mut words = [0_u64; 4];
+        for byte in [0_u8, 17, 128, 255] {
+            words[usize::from(byte) / 64] |= 1_u64 << (usize::from(byte) % 64);
+        }
+        let set = ByteSet256::from_words(words);
+        let classifier = ByteSetClassifier::new(set);
+        let source = (0_u8..=u8::MAX).cycle().take(384).collect::<Vec<_>>();
+        for start in 0..32 {
+            for length in 0..=96 {
+                let bytes = &source[start..start + length];
+                assert_eq!(
+                    find_byte_set_member(set, &classifier, bytes),
+                    bytes.iter().position(|&byte| set.contains(byte)),
+                    "start={start}, length={length}"
+                );
+            }
+        }
+
+        let anchored = AnchoredByteSet::from_words(words);
+        let (plan, supported) = PartialDfaPrefixPlan::derive(&[anchored]);
+        assert!(supported);
+        let plan = plan.expect("four-member prefix has a general classifier");
+        assert_eq!(plan.next_candidate(&[anchored], b"zz\x11x", 0, 4), Some(2));
+    }
 
     #[test]
     fn partial_publication_drops_abandoned_bfs_capacity() {
