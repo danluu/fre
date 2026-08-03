@@ -28,6 +28,13 @@ use crate::{
 };
 
 const INVOCATION_RESET_WORK: u64 = 3;
+// A contextual bidirectional invocation consumes at most three generations
+// per source byte plus the fixed boundary and cold start-proof closures. Use
+// that universal ceiling while the retained generation is comfortably below
+// rollover, avoiding mode-dependent bound reconstruction on ordinary inputs.
+const GENERATION_FAST_WINDOW_MAX: usize = 4_294_967_295;
+const _: () = assert!(START_FILTER_POSITION_COUNT == 16);
+const GENERATION_FAST_RESERVE: u64 = 3 * 4_294_967_295 + 16 + 3;
 const START_FILTER_OWNER_ALLOCATION_WORK: u64 = 1;
 const ROOT_RUN_WINDOW_BYTES: usize = 64;
 const ROOT_RUN_SCANNER_SHAPE_MAX_WORK: usize =
@@ -7502,8 +7509,14 @@ fn prepare_prevalidated_invocation(
     may_use_lazy: bool,
     may_use_reverse: bool,
 ) -> Result<(WorkMeter, u64), SearchError> {
-    let required_generations =
-        required_generation_count(automaton, window, may_use_lazy, may_use_reverse)?;
+    let window_bytes = window.end().saturating_sub(window.start());
+    let required_generations = if window_bytes <= GENERATION_FAST_WINDOW_MAX
+        && workspace.generation <= u64::MAX - GENERATION_FAST_RESERVE
+    {
+        GENERATION_FAST_RESERVE
+    } else {
+        required_generation_count(automaton, window, may_use_lazy, may_use_reverse)?
+    };
     let mut meter = WorkMeter::new(limits.max_work, setup.work);
     workspace.begin_invocation(required_generations, &mut meter, setup, window.start())?;
     let setup_work = meter.consumed;
