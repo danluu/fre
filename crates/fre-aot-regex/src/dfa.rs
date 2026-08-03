@@ -1347,24 +1347,22 @@ impl PartialDfa {
         }
     }
 
-    fn selected_end_impl(
+    fn selected_end_impl<const EARLIEST: bool, const TRACK_START: bool>(
         &self,
         haystack: &[u8],
         window_start: usize,
         window_end: usize,
-        earliest: bool,
-        track_start: bool,
         prefix_sets: &[AnchoredByteSet],
         prefix_plan: Option<PartialDfaPrefixPlan>,
     ) -> Result<PartialDfaResult<PartialDfaSelection>, CompileError> {
-        if self.forward.initial_pending && (earliest || self.forward.initial_terminal) {
+        if self.forward.initial_pending && (EARLIEST || self.forward.initial_terminal) {
             return Ok(PartialDfaResult::Complete(PartialDfaSelection {
                 end: Some(window_start),
                 start: Some(window_start),
             }));
         }
 
-        let tracks_start = track_start
+        let tracks_start = TRACK_START
             && self.forward.start_actions.len() == self.forward.transitions.len();
         let mut row = 0_usize;
         let mut position = window_start;
@@ -1427,7 +1425,7 @@ impl PartialDfa {
             if cell.accepted() {
                 pending_end = Some(position);
                 pending_start = next_start;
-                if earliest {
+                if EARLIEST {
                     return Ok(PartialDfaResult::Complete(PartialDfaSelection {
                         end: pending_end,
                         start: pending_start,
@@ -1484,12 +1482,10 @@ impl PartialDfa {
         prefix_plan: Option<PartialDfaPrefixPlan>,
     ) -> Result<PartialDfaResult<bool>, CompileError> {
         Ok(
-            match self.selected_end_impl(
+            match self.selected_end_impl::<true, false>(
                 haystack,
                 window_start,
                 window_end,
-                true,
-                false,
                 prefix_sets,
                 prefix_plan,
             )? {
@@ -1509,12 +1505,10 @@ impl PartialDfa {
         prefix_sets: &[AnchoredByteSet],
         prefix_plan: Option<PartialDfaPrefixPlan>,
     ) -> Result<PartialDfaResult<Option<usize>>, CompileError> {
-        Ok(match self.selected_end_impl(
+        Ok(match self.selected_end_impl::<false, false>(
             haystack,
             window_start,
             window_end,
-            false,
-            false,
             prefix_sets,
             prefix_plan,
         )? {
@@ -1533,12 +1527,10 @@ impl PartialDfa {
         prefix_sets: &[AnchoredByteSet],
         prefix_plan: Option<PartialDfaPrefixPlan>,
     ) -> Result<PartialDfaResult<PartialDfaSelection>, CompileError> {
-        self.selected_end_impl(
+        self.selected_end_impl::<false, true>(
             haystack,
             window_start,
             window_end,
-            false,
-            true,
             prefix_sets,
             prefix_plan,
         )
