@@ -709,7 +709,7 @@ fn forced_capture_build_receipt_binds_sidecars_and_literal_preflight() {
             .closes()
     );
 
-    let singleton = patterns(&["(a)"]);
+    let singleton = patterns(&["(a?)"]);
     let no_proof = PriorityAggregateManyBuilder::new(&singleton)
         .unicode(false)
         .build_capture_count(ForcedExecution::Sparse, PriorityTarget::portable())

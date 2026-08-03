@@ -84,7 +84,7 @@ fn adapter_runner_and_typed_plan_identity_agree() {
         runner.matches("adapter={} report={REPORT_SCHEMA}").count(),
         1
     );
-    assert_eq!(fre::AGGREGATE_EXPLAIN_SCHEMA_VERSION, 45);
+    assert_eq!(fre::AGGREGATE_EXPLAIN_SCHEMA_VERSION, 47);
     assert_eq!(runner.matches("aggregate-explain={}").count(), 1);
     assert_eq!(
         runner

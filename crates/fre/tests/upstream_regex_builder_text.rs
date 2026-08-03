@@ -88,7 +88,24 @@ fn assert_searches_equal(
                     expected,
                     "window/{pattern:?}/{haystack:?}/{start}"
                 );
-                assert_eq!(find_at_accounting, windowed_accounting);
+                let (repeated, repeated_find_at_accounting) = fre
+                    .find_at(haystack, start, SearchLimits::unlimited())
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "repeated FRE search failed for \
+                             {pattern:?}/{haystack:?}/{start}: {error}"
+                        )
+                    });
+                assert_eq!(
+                    repeated.map(|matched| (matched.start(), matched.end())),
+                    expected,
+                    "repeated/{pattern:?}/{haystack:?}/{start}"
+                );
+                // The first successful K0 call may publish and charge one
+                // immutable plan-side start proof. Compare the equivalent APIs
+                // only after both are in the same warm plan state.
+                assert_eq!(repeated_find_at_accounting, windowed_accounting);
+                assert_eq!(find_at_accounting.plan(), windowed_accounting.plan());
             }
 
             assert_eq!(

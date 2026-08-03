@@ -55,6 +55,7 @@
 
 use core::fmt;
 
+use fre_kernels::FixedPredicateWord64SearchCursor;
 use regex_syntax::hir::{Hir, HirKind};
 
 mod aggregate;
@@ -468,9 +469,8 @@ pub use fre_kernels::{
     FIXED_CLASS_SANDWICH_SPAN_SUM_OPERATION_ID, FIXED_PREDICATE_WORD64_COUNT_OPERATION_ID,
     FIXED_PREDICATE_WORD64_MASK_SLOTS, FIXED_PREDICATE_WORD64_MAX_WIDTH,
     FIXED_PREDICATE_WORD64_MIN_WIDTH, FIXED_PREDICATE_WORD64_PLAN_ID,
-    FIXED_PREDICATE_WORD64_SEARCH_PLAN_ID,
-    FIXED_PREDICATE_WORD64_SPAN_SUM_OPERATION_ID, FixedAbsoluteDomainActual,
-    FixedAbsoluteDomainBuildAccounting, FixedAbsoluteDomainBuildActual,
+    FIXED_PREDICATE_WORD64_SEARCH_PLAN_ID, FIXED_PREDICATE_WORD64_SPAN_SUM_OPERATION_ID,
+    FixedAbsoluteDomainActual, FixedAbsoluteDomainBuildAccounting, FixedAbsoluteDomainBuildActual,
     FixedAbsoluteDomainBuildError, FixedAbsoluteDomainBuildErrorKind,
     FixedAbsoluteDomainBuildLimits, FixedAbsoluteDomainBuildProspective,
     FixedAbsoluteDomainBuildResource, FixedAbsoluteDomainContentDigest,
@@ -487,10 +487,9 @@ pub use fre_kernels::{
     FixedClassSandwichReduceError, FixedClassSandwichReduceLimits, FixedClassSandwichSemantics,
     FixedClassSandwichUpperBounds, FixedPredicateWord64ActualCounters,
     FixedPredicateWord64AdaptiveFinderIdentity, FixedPredicateWord64AdaptiveFinderKind,
-    FixedPredicateWord64AdaptiveHandoffIdentity,
-    FixedPredicateWord64BuildAccounting, FixedPredicateWord64BuildError,
-    FixedPredicateWord64BuildLimits, FixedPredicateWord64CountResult,
-    FixedPredicateWord64ExactAnchorIdentity,
+    FixedPredicateWord64AdaptiveHandoffIdentity, FixedPredicateWord64BuildAccounting,
+    FixedPredicateWord64BuildError, FixedPredicateWord64BuildLimits,
+    FixedPredicateWord64CountResult, FixedPredicateWord64ExactAnchorIdentity,
     FixedPredicateWord64MatchSelection, FixedPredicateWord64MatchSemantics,
     FixedPredicateWord64Operation, FixedPredicateWord64OperationIdentity, FixedPredicateWord64Plan,
     FixedPredicateWord64ReduceAccounting, FixedPredicateWord64ReduceError,
@@ -498,10 +497,10 @@ pub use fre_kernels::{
     FixedPredicateWord64SearchAccounting, FixedPredicateWord64SearchActualCounters,
     FixedPredicateWord64SearchError, FixedPredicateWord64SearchLimits,
     FixedPredicateWord64SearchOperation, FixedPredicateWord64SearchOperationIdentity,
-    FixedPredicateWord64SearchUpperBounds,
-    FixedPredicateWord64SpanSumResult, FixedPredicateWord64UpperBounds,
-    GraphemeScalarDfaActualCounters, GraphemeScalarDfaBuildAccounting, GraphemeScalarDfaBuildError,
-    GraphemeScalarDfaBuildLimits, GraphemeScalarDfaOperation, GraphemeScalarDfaOperationIdentity,
+    FixedPredicateWord64SearchUpperBounds, FixedPredicateWord64SpanSumResult,
+    FixedPredicateWord64UpperBounds, GraphemeScalarDfaActualCounters,
+    GraphemeScalarDfaBuildAccounting, GraphemeScalarDfaBuildError, GraphemeScalarDfaBuildLimits,
+    GraphemeScalarDfaOperation, GraphemeScalarDfaOperationIdentity,
     GraphemeScalarDfaReduceAccounting, GraphemeScalarDfaReduceError, GraphemeScalarDfaReduceLimits,
     GraphemeScalarDfaRole, GraphemeScalarDfaSemantics, GraphemeScalarDfaUpperBounds,
     LITERAL_AGGREGATE_ACCOUNTING_VERSION, LITERAL_AGGREGATE_ALGORITHM_VERSION,
@@ -3247,8 +3246,7 @@ impl PortableBuilder {
                 let expected_hir_nodes = usize::try_from(syntax.hir_nodes).map_err(|_| {
                     BuildError::InternalInvariant("syntax HIR-node count does not fit usize")
                 })?;
-                if fixed.hir_nodes() != expected_hir_nodes
-                    || fixed.captures() != explicit_captures
+                if fixed.hir_nodes() != expected_hir_nodes || fixed.captures() != explicit_captures
                 {
                     return Err(BuildError::InternalInvariant(
                         "syntax summary differs from fixed-predicate search inspection",
@@ -3259,8 +3257,8 @@ impl PortableBuilder {
                         "fixed-predicate search source lost its variable predicate proof",
                     ));
                 }
-                let mut normalized = [finite::FixedPredicateRanges::EMPTY;
-                    FIXED_PREDICATE_WORD64_MAX_WIDTH];
+                let mut normalized =
+                    [finite::FixedPredicateRanges::EMPTY; FIXED_PREDICATE_WORD64_MAX_WIDTH];
                 for (index, ranges) in fixed.positions().enumerate() {
                     let Some(slot) = normalized.get_mut(index) else {
                         return Err(BuildError::InternalInvariant(
@@ -4306,10 +4304,7 @@ impl PortableRegex {
                     LiteralWindow::new(window.start(), window.end()),
                     fixed_predicate_word64_search_limits(limits),
                 )?;
-                Ok((
-                    matched,
-                    SearchAccounting::FixedPredicateWord64(accounting),
-                ))
+                Ok((matched, SearchAccounting::FixedPredicateWord64(accounting)))
             }
         }
     }
@@ -4867,10 +4862,8 @@ impl PortableRegex {
                 ))
             }
             PortablePlan::FixedPredicateWord64(plan) => {
-                let (end, accounting) = plan.selected_end(
-                    haystack,
-                    fixed_predicate_word64_search_limits(limits),
-                )?;
+                let (end, accounting) =
+                    plan.selected_end(haystack, fixed_predicate_word64_search_limits(limits))?;
                 Ok((end, SearchAccounting::FixedPredicateWord64(accounting)))
             }
         }
@@ -4961,10 +4954,16 @@ impl PortableRegex {
         limits: PortableFindIterLimits,
         empty_match_progress: EmptyMatchProgress,
     ) -> Result<PortableMatches<'r, 'h>, SearchError> {
+        let fixed_predicate_cursor = self.fixed_predicate_search_cursor(haystack);
         let session = self.search_session(limits.session)?;
         Ok(PortableMatches {
             session,
-            state: PortableMatchIterState::new(haystack, limits.run(), empty_match_progress),
+            state: PortableMatchIterState::new(
+                haystack,
+                limits.run(),
+                empty_match_progress,
+                fixed_predicate_cursor,
+            ),
         })
     }
 
@@ -5428,6 +5427,16 @@ impl PortableRegex {
         }
     }
 
+    fn fixed_predicate_search_cursor<'r, 'h>(
+        &'r self,
+        haystack: &'h [u8],
+    ) -> Option<FixedPredicateWord64SearchCursor<'r, 'h>> {
+        match &self.plan {
+            PortablePlan::FixedPredicateWord64(plan) => Some(plan.search_cursor(haystack)),
+            _ => None,
+        }
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "each native owner projects its span and exact iterator work without facade accounting"
@@ -5465,66 +5474,48 @@ impl PortableRegex {
                 ))
             }
             PortablePlan::RequiredLiteral(required) => {
-                let (matched, accounting) = required.find_window(
-                    haystack,
-                    window,
-                    required_literal_limits(limits),
-                )?;
+                let (matched, accounting) =
+                    required.find_window(haystack, window, required_literal_limits(limits))?;
                 Ok((
                     matched.map(|(start, end)| Match { start, end }),
                     accounting.work_upper_bound,
                 ))
             }
             PortablePlan::DispatchedRequiredLiteral(required) => {
-                let (matched, accounting) = required.find_window(
-                    haystack,
-                    window,
-                    required_literal_limits(limits),
-                )?;
+                let (matched, accounting) =
+                    required.find_window(haystack, window, required_literal_limits(limits))?;
                 Ok((
                     matched.map(|(start, end)| Match { start, end }),
                     accounting.work_upper_bound,
                 ))
             }
             PortablePlan::BoundedRequiredLiteral(required) => {
-                let (matched, accounting) = required.find_window(
-                    haystack,
-                    window,
-                    required_literal_limits(limits),
-                )?;
+                let (matched, accounting) =
+                    required.find_window(haystack, window, required_literal_limits(limits))?;
                 Ok((
                     matched.map(|(start, end)| Match { start, end }),
                     accounting.work_upper_bound,
                 ))
             }
             PortablePlan::DispatchedBoundedRequiredLiteral(required) => {
-                let (matched, accounting) = required.find_window(
-                    haystack,
-                    window,
-                    required_literal_limits(limits),
-                )?;
+                let (matched, accounting) =
+                    required.find_window(haystack, window, required_literal_limits(limits))?;
                 Ok((
                     matched.map(|(start, end)| Match { start, end }),
                     accounting.work_upper_bound,
                 ))
             }
             PortablePlan::LiteralClassRunLiteral(plan) => {
-                let (matched, accounting) = plan.find_window(
-                    haystack,
-                    window,
-                    literal_class_run_literal_limits(limits),
-                )?;
+                let (matched, accounting) =
+                    plan.find_window(haystack, window, literal_class_run_literal_limits(limits))?;
                 Ok((
                     matched.map(|(start, end)| Match { start, end }),
                     accounting.work_upper_bound,
                 ))
             }
             PortablePlan::LiteralClassRunSearch(plan) => {
-                let (matched, accounting) = plan.find_window(
-                    haystack,
-                    window,
-                    literal_class_run_literal_limits(limits),
-                )?;
+                let (matched, accounting) =
+                    plan.find_window(haystack, window, literal_class_run_literal_limits(limits))?;
                 Ok((
                     matched.map(|(start, end)| Match { start, end }),
                     accounting.work_upper_bound,
@@ -5565,11 +5556,8 @@ impl PortableRegex {
                 ))
             }
             PortablePlan::UnicodeFoldedLiteral(plan) => {
-                let (matched, accounting) = plan.find_window(
-                    haystack,
-                    window,
-                    unicode_folded_literal_limits(limits),
-                )?;
+                let (matched, accounting) =
+                    plan.find_window(haystack, window, unicode_folded_literal_limits(limits))?;
                 Ok((
                     matched.map(|candidate| Match {
                         start: candidate.start(),
@@ -6140,9 +6128,27 @@ impl<'r> PortableSearchSession<'r> {
         limits: PortableFindIterRunLimits,
         empty_match_progress: EmptyMatchProgress,
     ) -> PortableSessionMatches<'s, 'r, 'h> {
+        let fixed_predicate_cursor = self.fixed_predicate_search_cursor(haystack);
         PortableSessionMatches {
             session: self,
-            state: PortableMatchIterState::new(haystack, limits, empty_match_progress),
+            state: PortableMatchIterState::new(
+                haystack,
+                limits,
+                empty_match_progress,
+                fixed_predicate_cursor,
+            ),
+        }
+    }
+
+    fn fixed_predicate_search_cursor<'h>(
+        &self,
+        haystack: &'h [u8],
+    ) -> Option<FixedPredicateWord64SearchCursor<'r, 'h>> {
+        match &self.plan {
+            PortableSearchSessionPlan::Native(regex) => {
+                regex.fixed_predicate_search_cursor(haystack)
+            }
+            PortableSearchSessionPlan::K0 { .. } => None,
         }
     }
 
@@ -6178,7 +6184,7 @@ impl<'r> PortableSearchSession<'r> {
 #[derive(Debug)]
 pub struct PortableMatches<'r, 'h> {
     session: PortableSearchSession<'r>,
-    state: PortableMatchIterState<'h>,
+    state: PortableMatchIterState<'r, 'h>,
 }
 
 /// Fallible byte-match iterator borrowing an existing search session.
@@ -6190,11 +6196,20 @@ pub struct PortableMatches<'r, 'h> {
 #[derive(Debug)]
 pub struct PortableSessionMatches<'s, 'r, 'h> {
     session: &'s mut PortableSearchSession<'r>,
-    state: PortableMatchIterState<'h>,
+    state: PortableMatchIterState<'r, 'h>,
 }
 
 #[derive(Debug)]
-struct PortableMatchIterState<'h> {
+enum PortableMatchIterState<'r, 'h> {
+    General(PortableMatchIterCore<'h>),
+    FixedPredicate {
+        core: PortableMatchIterCore<'h>,
+        cursor: FixedPredicateWord64SearchCursor<'r, 'h>,
+    },
+}
+
+#[derive(Debug)]
+struct PortableMatchIterCore<'h> {
     k0_source: K0SpanSourceCursor<'h>,
     limits: PortableFindIterRunLimits,
     empty_match_progress: EmptyMatchProgress,
@@ -6211,7 +6226,7 @@ enum EmptyMatchProgress {
     Utf8Scalar,
 }
 
-impl<'h> PortableMatchIterState<'h> {
+impl<'h> PortableMatchIterCore<'h> {
     const fn new(
         haystack: &'h [u8],
         limits: PortableFindIterRunLimits,
@@ -6361,9 +6376,13 @@ impl<'h> PortableMatchIterState<'h> {
         self.advance_past_repeated_empty()
     }
 
-    fn next_match(
+    fn next_match_with(
         &mut self,
-        session: &mut PortableSearchSession<'_>,
+        mut search: impl FnMut(
+            &mut K0SpanSourceCursor<'h>,
+            usize,
+            SearchLimits,
+        ) -> Result<(Option<Match>, u64), SearchError>,
     ) -> Option<Result<Match, PortableFindIterError>> {
         while !self.finished {
             match self.advance_pending_empty() {
@@ -6374,8 +6393,7 @@ impl<'h> PortableMatchIterState<'h> {
             if let Err(error) = self.begin_search() {
                 return Some(self.fail(error));
             }
-            let searched =
-                session.find_iter_at(&mut self.k0_source, self.start, self.limits.search);
+            let searched = search(&mut self.k0_source, self.start, self.limits.search);
             let (matched, search_work) = match searched {
                 Ok(result) => result,
                 Err(error) => return Some(self.fail(PortableFindIterError::Search(error))),
@@ -6411,11 +6429,74 @@ impl<'h> PortableMatchIterState<'h> {
     }
 }
 
+impl<'r, 'h> PortableMatchIterState<'r, 'h> {
+    const fn new(
+        haystack: &'h [u8],
+        limits: PortableFindIterRunLimits,
+        empty_match_progress: EmptyMatchProgress,
+        fixed_predicate_cursor: Option<FixedPredicateWord64SearchCursor<'r, 'h>>,
+    ) -> Self {
+        let core = PortableMatchIterCore::new(haystack, limits, empty_match_progress);
+        match fixed_predicate_cursor {
+            Some(cursor) => Self::FixedPredicate { core, cursor },
+            None => Self::General(core),
+        }
+    }
+
+    const fn core(&self) -> &PortableMatchIterCore<'h> {
+        match self {
+            Self::General(core) | Self::FixedPredicate { core, .. } => core,
+        }
+    }
+
+    #[cfg(test)]
+    fn core_mut(&mut self) -> &mut PortableMatchIterCore<'h> {
+        match self {
+            Self::General(core) | Self::FixedPredicate { core, .. } => core,
+        }
+    }
+
+    const fn haystack(&self) -> &'h [u8] {
+        self.core().haystack()
+    }
+
+    const fn accounting(&self) -> PortableFindIterAccounting {
+        self.core().accounting
+    }
+
+    #[cfg(test)]
+    const fn is_fixed_predicate(&self) -> bool {
+        matches!(self, Self::FixedPredicate { .. })
+    }
+
+    fn next_match(
+        &mut self,
+        session: &mut PortableSearchSession<'r>,
+    ) -> Option<Result<Match, PortableFindIterError>> {
+        match self {
+            Self::General(core) => core.next_match_with(|source, start, limits| {
+                session.find_iter_at(source, start, limits)
+            }),
+            Self::FixedPredicate { core, cursor } => {
+                core.next_match_with(|_source, start, limits| {
+                    let (matched, accounting) = cursor
+                        .find_at(start, fixed_predicate_word64_search_limits(limits))
+                        .map_err(SearchError::from)?;
+                    Ok((
+                        matched.map(|(start, end)| Match { start, end }),
+                        accounting.actual.work,
+                    ))
+                })
+            }
+        }
+    }
+}
+
 impl PortableMatches<'_, '_> {
     /// Exact counters accumulated through the most recent iterator action.
     #[must_use]
     pub const fn accounting(&self) -> PortableFindIterAccounting {
-        self.state.accounting
+        self.state.accounting()
     }
 
     /// One-time K0 workspace setup facts, or `None` for native plans.
@@ -6442,7 +6523,7 @@ impl PortableSessionMatches<'_, '_, '_> {
     /// already searched other haystacks.
     #[must_use]
     pub const fn accounting(&self) -> PortableFindIterAccounting {
-        self.state.accounting
+        self.state.accounting()
     }
 
     /// The reused session's one-time K0 setup facts.
@@ -6605,11 +6686,12 @@ fn fixed_predicate_word64_search_limits(limits: SearchLimits) -> FixedPredicateW
 #[cfg(test)]
 mod tests {
     use super::{
-        BuildError, BuildLimits, CaptureFreeOperation, PlanKind, PlanSelection, PortableBuilder,
-        PortableFindIterAccounting, PortableFindIterError, PortableFindIterLimits,
+        BuildError, BuildLimits, CaptureFreeOperation, Match, PlanKind, PlanSelection,
+        PortableBuilder, PortableFindIterAccounting, PortableFindIterError, PortableFindIterLimits,
         PortableFindIterRunLimits, PortablePlan, PortableRegex, SearchAccounting, SearchError,
-        SearchLimits, SearchWindow,
+        SearchLimits, SearchSessionLimits, SearchWindow,
     };
+    use fre_kernels::FixedPredicateWord64SearchCursor;
     use fre_lower::UnsupportedFeature;
     use std::fmt::Write as _;
 
@@ -6620,44 +6702,44 @@ mod tests {
             .find_iter_utf8("é", PortableFindIterLimits::unlimited())
             .unwrap();
 
-        iterator.state.accounting = PortableFindIterAccounting {
+        iterator.state.core_mut().accounting = PortableFindIterAccounting {
             work_or_linear_terms: u64::MAX,
             ..PortableFindIterAccounting::default()
         };
-        let before = iterator.state.accounting;
+        let before = iterator.state.accounting();
         assert_eq!(
-            iterator.state.record_utf8_progress(1, 1),
+            iterator.state.core_mut().record_utf8_progress(1, 1),
             Err(PortableFindIterError::AccountingOverflow {
                 counter: "utf8-progress-work",
             })
         );
-        assert_eq!(iterator.state.accounting, before);
+        assert_eq!(iterator.state.accounting(), before);
 
-        iterator.state.accounting = PortableFindIterAccounting {
+        iterator.state.core_mut().accounting = PortableFindIterAccounting {
             utf8_progress_work: u64::MAX,
             ..PortableFindIterAccounting::default()
         };
-        let before = iterator.state.accounting;
+        let before = iterator.state.accounting();
         assert_eq!(
-            iterator.state.record_utf8_progress(1, 1),
+            iterator.state.core_mut().record_utf8_progress(1, 1),
             Err(PortableFindIterError::AccountingOverflow {
                 counter: "utf8-progress-work",
             })
         );
-        assert_eq!(iterator.state.accounting, before);
+        assert_eq!(iterator.state.accounting(), before);
 
-        iterator.state.accounting = PortableFindIterAccounting {
+        iterator.state.core_mut().accounting = PortableFindIterAccounting {
             utf8_progress_byte_probes: u64::MAX,
             ..PortableFindIterAccounting::default()
         };
-        let before = iterator.state.accounting;
+        let before = iterator.state.accounting();
         assert_eq!(
-            iterator.state.record_utf8_progress(1, 1),
+            iterator.state.core_mut().record_utf8_progress(1, 1),
             Err(PortableFindIterError::AccountingOverflow {
                 counter: "utf8-progress-byte-probe",
             })
         );
-        assert_eq!(iterator.state.accounting, before);
+        assert_eq!(iterator.state.accounting(), before);
     }
 
     #[test]
@@ -6809,6 +6891,33 @@ mod tests {
     }
 
     #[test]
+    fn fixed_predicate_iterator_cursor_has_a_bounded_inline_layout() {
+        let word = core::mem::size_of::<usize>();
+        let cursor = core::mem::size_of::<FixedPredicateWord64SearchCursor<'static, 'static>>();
+        let state = core::mem::size_of::<super::PortableMatchIterState<'static, 'static>>();
+        let general = core::mem::size_of::<super::PortableMatchIterCore<'static>>();
+        let source_cursor = core::mem::size_of::<fre_automata::K0SpanSourceCursor<'static>>();
+
+        assert_eq!(
+            core::mem::align_of::<FixedPredicateWord64SearchCursor<'static, 'static>>(),
+            core::mem::align_of::<usize>()
+        );
+        assert!(cursor <= 10 * word, "cursor grew to {cursor} bytes");
+        assert!(
+            state >= cursor + source_cursor,
+            "fixed iterator variant lost one of its two independent source cursors"
+        );
+        assert!(
+            general < state,
+            "general iterator payload retained the fixed cursor"
+        );
+        assert!(
+            state <= 32 * word,
+            "iterator state grew beyond its inline 32-word envelope: {state} bytes"
+        );
+    }
+
+    #[test]
     fn packed_ineligibility_is_resolved_before_selecting_the_dfa() {
         let limits = BuildLimits {
             packed_literal_set: fre_kernels::PackedLiteralSetBuildLimits {
@@ -6855,6 +6964,73 @@ mod tests {
             accounting,
             SearchAccounting::FixedPredicateWord64(_)
         ));
+    }
+
+    #[test]
+    fn fixed_predicate_iterators_retain_candidates_and_reset_after_early_drop() {
+        let limits = BuildLimits {
+            literal_set: fre_kernels::LiteralSetBuildLimits {
+                max_patterns: 4,
+                ..fre_kernels::LiteralSetBuildLimits::default()
+            },
+            ..BuildLimits::default()
+        };
+        let regex = PortableBuilder::new(r"[A-D][\x00-\x7F]Q")
+            .unicode(false)
+            .limits(limits)
+            .build()
+            .unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::FixedPredicateWord64);
+
+        let mut haystack = Vec::new();
+        for _ in 0..8 {
+            haystack.extend_from_slice(&[b'A', 0xff, b'Q']);
+        }
+        for _ in 0..64 {
+            haystack.extend_from_slice(b"A!Q");
+        }
+        let expected_first = Match { start: 24, end: 27 };
+
+        let mut early = regex
+            .find_iter(&haystack, PortableFindIterLimits::unlimited())
+            .unwrap();
+        assert!(early.state.is_fixed_predicate());
+        assert_eq!(early.next().unwrap().unwrap(), expected_first);
+        drop(early);
+        let mut restarted = regex
+            .find_iter(&haystack, PortableFindIterLimits::unlimited())
+            .unwrap();
+        assert!(restarted.state.is_fixed_predicate());
+        assert_eq!(restarted.next().unwrap().unwrap(), expected_first);
+        assert_eq!(restarted.count(), 63);
+
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        let mut session_matches =
+            session.find_iter(&haystack, PortableFindIterRunLimits::unlimited());
+        assert!(session_matches.state.is_fixed_predicate());
+        let matches = session_matches
+            .by_ref()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        drop(session_matches);
+        assert_eq!(matches.len(), 64);
+        assert_eq!(matches[0], expected_first);
+        assert!(
+            matches
+                .windows(2)
+                .all(|pair| pair[0].end() == pair[1].start())
+        );
+
+        let exact = PortableBuilder::new("literal")
+            .unicode(false)
+            .build()
+            .unwrap();
+        let exact_iter = exact
+            .find_iter(b"literal", PortableFindIterLimits::unlimited())
+            .unwrap();
+        assert!(!exact_iter.state.is_fixed_predicate());
     }
 
     #[test]
@@ -6941,9 +7117,7 @@ mod tests {
                 .unwrap();
             let actual: Result<Vec<_>, _> = session
                 .find_iter(haystack, PortableFindIterRunLimits::unlimited())
-                .map(|matched| {
-                    matched.map(|matched| (matched.start(), matched.end()))
-                })
+                .map(|matched| matched.map(|matched| (matched.start(), matched.end())))
                 .collect();
             assert_eq!(actual.unwrap(), expected, "pattern={pattern}");
         }
@@ -6961,28 +7135,51 @@ mod tests {
             .search_session(super::SearchSessionLimits::unlimited())
             .unwrap();
         let dense = b"acegacegacegacegacegacegacegacegacegacegacegacegacegacegacegaceg";
+        let expected: Vec<_> = (0..dense.len())
+            .step_by(2)
+            .map(|start| (start, start.checked_add(2).unwrap()))
+            .collect();
 
-        let mut matches =
-            session.find_iter(dense, PortableFindIterRunLimits::unlimited());
-        let first = matches.next().unwrap().unwrap();
-        assert_eq!((first.start(), first.end()), (0, 2));
-        let second = matches.next().unwrap().unwrap();
-        assert_eq!((second.start(), second.end()), (2, 4));
-        let third = matches.next().unwrap().unwrap();
-        assert_eq!((third.start(), third.end()), (4, 6));
-        let activated_work = matches.accounting().work_or_linear_terms;
-        let fourth = matches.next().unwrap().unwrap();
-        assert_eq!((fourth.start(), fourth.end()), (6, 8));
+        let fresh: Result<Vec<_>, _> = fre
+            .find_iter(dense, PortableFindIterLimits::unlimited())
+            .unwrap()
+            .map(|matched| matched.map(|matched| (matched.start(), matched.end())))
+            .collect();
+        assert_eq!(fresh.unwrap(), expected);
+
+        {
+            let mut matches = session.find_iter(dense, PortableFindIterRunLimits::unlimited());
+            let first = matches.next().unwrap().unwrap();
+            assert_eq!((first.start(), first.end()), (0, 2));
+            let second = matches.next().unwrap().unwrap();
+            assert_eq!((second.start(), second.end()), (2, 4));
+            let third = matches.next().unwrap().unwrap();
+            assert_eq!((third.start(), third.end()), (4, 6));
+            let activated_work = matches.accounting().work_or_linear_terms;
+            let fourth = matches.next().unwrap().unwrap();
+            assert_eq!((fourth.start(), fourth.end()), (6, 8));
+            assert_eq!(
+                matches
+                    .accounting()
+                    .work_or_linear_terms
+                    .checked_sub(activated_work)
+                    .unwrap(),
+                3,
+                "a retained qualified-start mask needs only the K0 invocation reset"
+            );
+            // End the iterator borrow early; the next block must start with
+            // fresh source-bound cursors while retaining the session itself.
+        }
+
+        let restarted: Result<Vec<_>, _> = session
+            .find_iter(dense, PortableFindIterRunLimits::unlimited())
+            .map(|matched| matched.map(|matched| (matched.start(), matched.end())))
+            .collect();
         assert_eq!(
-            matches
-                .accounting()
-                .work_or_linear_terms
-                .checked_sub(activated_work)
-                .unwrap(),
-            3,
-            "a retained qualified-start mask needs only the K0 invocation reset"
+            restarted.unwrap(),
+            expected,
+            "a new non-fixed K0 iterator must start with fresh source cursors after early drop"
         );
-        drop(matches);
 
         assert_eq!(
             session

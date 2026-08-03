@@ -607,7 +607,7 @@ fn caller_match_buffer_matches_pinned_bytes_additive_and_ranged_semantics() {
                         upstream.matches_at(haystack, start).iter().count()
                     );
 
-                    let mut alias = seed;
+                    let mut alias = seed.clone();
                     let alias_result = fre
                         .read_matches_at(
                             &mut alias,
@@ -620,7 +620,35 @@ fn caller_match_buffer_matches_pinned_bytes_additive_and_ranged_semantics() {
                         )
                         .expect("caller-buffer compatibility alias");
                     assert_eq!(alias, expected);
-                    assert_eq!(alias_result, (actual_any, report));
+                    let mut repeated = seed;
+                    let repeated_result = fre
+                        .matches_read_at(
+                            &mut repeated,
+                            haystack,
+                            start,
+                            PortableRegexSetRunLimits {
+                                max_output_bytes: 0,
+                                ..PortableRegexSetRunLimits::unlimited()
+                            },
+                        )
+                        .expect("repeated canonical caller-buffer search");
+                    assert_eq!(repeated, expected);
+                    // The first canonical call may publish per-pattern K0
+                    // proofs. The alias and repeated canonical call are both
+                    // warm, so exact work is comparable without erasing cold
+                    // accounting from the initial report.
+                    assert_eq!(alias_result, repeated_result);
+                    assert_eq!(repeated_result.0, actual_any);
+                    assert_eq!(repeated_result.1.start, report.start);
+                    assert_eq!(
+                        repeated_result.1.patterns_searched,
+                        report.patterns_searched
+                    );
+                    assert_eq!(repeated_result.1.matched_patterns, report.matched_patterns);
+                    assert_eq!(
+                        repeated_result.1.output_capacity_bytes,
+                        report.output_capacity_bytes
+                    );
                 }
             }
         }

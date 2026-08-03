@@ -224,6 +224,8 @@ pub use fixed_class_sandwich::{
     SPAN_SUM_OPERATION_ID as FIXED_CLASS_SANDWICH_SPAN_SUM_OPERATION_ID,
     Semantics as FixedClassSandwichSemantics, SpanSumResult as FixedClassSandwichSpanSumResult,
 };
+#[doc(hidden)]
+pub use fixed_predicate_word64::FixedPredicateWord64SearchCursor;
 pub use fixed_predicate_word64::{
     AdaptiveFinderIdentity as FixedPredicateWord64AdaptiveFinderIdentity,
     AdaptiveFinderKind as FixedPredicateWord64AdaptiveFinderKind,
@@ -238,8 +240,8 @@ pub use fixed_predicate_word64::{
     BuildAttemptReceipt as FixedPredicateWord64BuildAttemptReceipt,
     BuildError as FixedPredicateWord64BuildError, BuildLimits as FixedPredicateWord64BuildLimits,
     COUNT_OPERATION_ID as FIXED_PREDICATE_WORD64_COUNT_OPERATION_ID,
-    CountResult as FixedPredicateWord64CountResult, FixedPredicateWord64Plan,
-    ExactAnchorIdentity as FixedPredicateWord64ExactAnchorIdentity,
+    CountResult as FixedPredicateWord64CountResult,
+    ExactAnchorIdentity as FixedPredicateWord64ExactAnchorIdentity, FixedPredicateWord64Plan,
     MASK_SLOTS as FIXED_PREDICATE_WORD64_MASK_SLOTS, MAX_WIDTH as FIXED_PREDICATE_WORD64_MAX_WIDTH,
     MIN_WIDTH as FIXED_PREDICATE_WORD64_MIN_WIDTH,
     MatchSelection as FixedPredicateWord64MatchSelection,
@@ -253,6 +255,7 @@ pub use fixed_predicate_word64::{
     ReduceLimits as FixedPredicateWord64ReduceLimits,
     ReduceUpperBounds as FixedPredicateWord64UpperBounds, Reducer as FixedPredicateWord64Reducer,
     SEARCH_PLAN_ID as FIXED_PREDICATE_WORD64_SEARCH_PLAN_ID,
+    SPAN_SUM_OPERATION_ID as FIXED_PREDICATE_WORD64_SPAN_SUM_OPERATION_ID,
     SearchAccounting as FixedPredicateWord64SearchAccounting,
     SearchActualCounters as FixedPredicateWord64SearchActualCounters,
     SearchError as FixedPredicateWord64SearchError,
@@ -260,7 +263,6 @@ pub use fixed_predicate_word64::{
     SearchOperation as FixedPredicateWord64SearchOperation,
     SearchOperationIdentity as FixedPredicateWord64SearchOperationIdentity,
     SearchUpperBounds as FixedPredicateWord64SearchUpperBounds,
-    SPAN_SUM_OPERATION_ID as FIXED_PREDICATE_WORD64_SPAN_SUM_OPERATION_ID,
     SpanSumResult as FixedPredicateWord64SpanSumResult,
 };
 pub use folded_literal_trie::{

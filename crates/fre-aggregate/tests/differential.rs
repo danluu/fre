@@ -1769,7 +1769,7 @@ fn unicode_casefold_suffix_domains_cover_width_changes_and_wide_refusal() {
 }
 
 #[test]
-fn forced_suffix_ordinary_and_observed_publish_the_same_route_receipt() {
+fn forced_suffix_ordinary_and_observed_preserve_route_with_an_observed_prefix() {
     let pattern = r"\b[a-z]+ing\b";
     let haystack = b"!wording! thing singing! wording?".repeat(64);
     let expected = upstream_unicode_byte_stable(pattern, &haystack);
@@ -1807,8 +1807,46 @@ fn forced_suffix_ordinary_and_observed_publish_the_same_route_receipt() {
     assert_eq!(ordinary.as_slice(), expected.as_slice());
     assert_eq!(observed.as_slice(), expected.as_slice());
     assert_eq!(ordinary.as_slice(), observed.as_slice());
-    assert_eq!(ordinary.certificate(), observed.certificate());
-    assert_eq!(ordinary.accounting(), observed.accounting());
+    assert_eq!(
+        ordinary.certificate().operation_id(),
+        observed.certificate().operation_id()
+    );
+    assert_eq!(
+        ordinary.certificate().physical_route,
+        OperationPhysicalRoute::RequiredSuffixRows
+    );
+    assert_eq!(
+        ordinary.certificate().prepublication_fallback,
+        observed.certificate().prepublication_fallback
+    );
+    assert_eq!(
+        observed.certificate().sequential_bytes_bound,
+        ordinary
+            .certificate()
+            .sequential_bytes_bound
+            .checked_add(haystack.len())
+            .unwrap()
+    );
+    let observed_prefix_bytes = observed.accounting().required_literal_source_bytes;
+    let observed_prefix_comparisons = observed.accounting().required_literal_comparisons;
+    assert!(observed_prefix_bytes > 0 && observed_prefix_bytes <= haystack.len());
+    assert!(observed_prefix_comparisons >= observed_prefix_bytes);
+    let mut normalized_observed = observed.accounting().clone();
+    normalized_observed.required_literal_source_bytes = 0;
+    normalized_observed.required_literal_comparisons = 0;
+    normalized_observed.sequential_bytes_read = normalized_observed
+        .sequential_bytes_read
+        .checked_sub(observed_prefix_bytes)
+        .unwrap();
+    normalized_observed.work = normalized_observed
+        .work
+        .checked_sub(
+            observed_prefix_bytes
+                .checked_add(observed_prefix_comparisons)
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(normalized_observed, ordinary.accounting());
     assert_eq!(ordinary.certificate().work_bound, forced_work);
     assert!(ordinary.accounting().work <= forced_work);
     assert!(ordinary.accounting().work < dense.certificate().work_bound);
@@ -3032,6 +3070,11 @@ fn sparse_start_count_and_sum_match_pinned_rust_at_every_byte_range() {
         .unicode(false)
         .utf8(false);
     for pattern in patterns {
+        let expected_route = if matches!(pattern, r"(?m:^)(?:)" | r"(?Rm:^)(?:)") {
+            OperationPhysicalRoute::RootAssertion
+        } else {
+            OperationPhysicalRoute::StartDomain
+        };
         let hir = parse(pattern);
         let compiled = CompiledRegex::from_hir_erasing_captures_for_whole_match(
             &hir,
@@ -3072,10 +3115,7 @@ fn sparse_start_count_and_sum_match_pinned_rust_at_every_byte_range() {
                         expected.len(),
                         "{pattern:?} {haystack:?} {range:?}"
                     );
-                    assert_eq!(
-                        count.receipt.identity.physical_route,
-                        Some(OperationPhysicalRoute::StartDomain)
-                    );
+                    assert_eq!(count.receipt.identity.physical_route, Some(expected_route));
                     let sum = compiled
                         .span_sum_value_with_receipt(
                             haystack,
@@ -3094,10 +3134,7 @@ fn sparse_start_count_and_sum_match_pinned_rust_at_every_byte_range() {
                             .sum::<usize>(),
                         "{pattern:?} {haystack:?} {range:?}"
                     );
-                    assert_eq!(
-                        sum.receipt.identity.physical_route,
-                        Some(OperationPhysicalRoute::StartDomain)
-                    );
+                    assert_eq!(sum.receipt.identity.physical_route, Some(expected_route));
                 }
             }
         }

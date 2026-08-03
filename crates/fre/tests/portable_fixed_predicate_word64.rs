@@ -290,12 +290,7 @@ fn assert_structural_wide_parity(
     verification_positions: usize,
     expected_plan: PlanKind,
 ) {
-    assert_structural_wide_parity_with_anchor(
-        width,
-        verification_positions,
-        "Q",
-        expected_plan,
-    );
+    assert_structural_wide_parity_with_anchor(width, verification_positions, "Q", expected_plan);
 }
 
 fn assert_structural_wide_parity_with_anchor(
@@ -317,7 +312,10 @@ fn assert_structural_wide_parity_with_anchor(
     for haystack in structural_wide_haystacks(&word) {
         let limits = SearchLimits::unlimited();
         let (auto_match, accounting) = auto.find(&haystack, limits).unwrap();
-        assert_eq!(span(auto_match), span(k0.find(&haystack, limits).unwrap().0));
+        assert_eq!(
+            span(auto_match),
+            span(k0.find(&haystack, limits).unwrap().0)
+        );
         assert_eq!(
             matches!(accounting, SearchAccounting::FixedPredicateWord64(_)),
             expected_plan == PlanKind::FixedPredicateWord64
@@ -418,9 +416,7 @@ fn wide_universal_positions_charge_no_verification_work() {
     let (pattern, _) = structural_wide_case(64, 0, "Q");
     let regex = build_auto(&pattern);
     let haystack = vec![0xFF; 1024];
-    let (matched, accounting) = regex
-        .find(&haystack, SearchLimits::unlimited())
-        .unwrap();
+    let (matched, accounting) = regex.find(&haystack, SearchLimits::unlimited()).unwrap();
     assert_eq!(matched, None);
     let SearchAccounting::FixedPredicateWord64(accounting) = accounting else {
         panic!("wide V=0 route lost fixed-predicate accounting");
@@ -455,9 +451,7 @@ fn wide_set_fallback_can_handoff_to_shift_and() {
     for start in 0..=haystack.len() - width {
         haystack[start + anchor_offset] = b'Q';
     }
-    let (_, accounting) = regex
-        .find(&haystack, SearchLimits::unlimited())
-        .unwrap();
+    let (_, accounting) = regex.find(&haystack, SearchLimits::unlimited()).unwrap();
     let SearchAccounting::FixedPredicateWord64(accounting) = accounting else {
         panic!("wide set-fallback route lost fixed-predicate accounting");
     };

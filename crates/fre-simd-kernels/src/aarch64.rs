@@ -90,6 +90,103 @@ pub(super) unsafe fn classify_byte_delta_16_neon(
     unsafe_code,
     reason = "this private target-feature leaf loads one exact block after the compiler target proved NEON usable"
 )]
+#[target_feature(enable = "neon")]
+#[inline]
+#[cfg_attr(
+    all(
+        target_os = "linux",
+        target_endian = "little",
+        target_feature = "sve",
+        target_feature = "sve2"
+    ),
+    allow(
+        dead_code,
+        reason = "SVE2 compiler targets select the direct exact-one leaf instead of NEON"
+    )
+)]
+pub(super) unsafe fn classify_byte_set1_16_neon(
+    member: u8,
+    bytes: &[u8; BYTE_SET_BLOCK_BYTES],
+) -> ByteSetMask16 {
+    let (input, lane_weights) =
+        unsafe { (vld1q_u8(bytes.as_ptr()), vld1q_u8(LANE_WEIGHTS.as_ptr())) };
+    let member_lanes = vceqq_u8(input, vdupq_n_u8(member));
+    ByteSetMask16::new(unsafe { boolean_lanes_to_mask(member_lanes, lane_weights) })
+}
+
+#[allow(
+    unsafe_code,
+    reason = "this private target-feature leaf loads one exact block after the compiler target proved NEON usable"
+)]
+#[target_feature(enable = "neon")]
+#[inline]
+#[cfg_attr(
+    all(
+        target_os = "linux",
+        target_endian = "little",
+        target_feature = "sve",
+        target_feature = "sve2"
+    ),
+    allow(
+        dead_code,
+        reason = "SVE2 compiler targets select the direct exact-two leaf instead of NEON"
+    )
+)]
+pub(super) unsafe fn classify_byte_set2_16_neon(
+    members: [u8; 2],
+    bytes: &[u8; BYTE_SET_BLOCK_BYTES],
+) -> ByteSetMask16 {
+    use core::arch::aarch64::vorrq_u8;
+
+    let (input, lane_weights) =
+        unsafe { (vld1q_u8(bytes.as_ptr()), vld1q_u8(LANE_WEIGHTS.as_ptr())) };
+    let member_lanes = vorrq_u8(
+        vceqq_u8(input, vdupq_n_u8(members[0])),
+        vceqq_u8(input, vdupq_n_u8(members[1])),
+    );
+    ByteSetMask16::new(unsafe { boolean_lanes_to_mask(member_lanes, lane_weights) })
+}
+
+#[allow(
+    unsafe_code,
+    reason = "this private target-feature leaf loads one exact block after the compiler target proved NEON usable"
+)]
+#[target_feature(enable = "neon")]
+#[inline]
+#[cfg_attr(
+    all(
+        target_os = "linux",
+        target_endian = "little",
+        target_feature = "sve",
+        target_feature = "sve2"
+    ),
+    allow(
+        dead_code,
+        reason = "SVE2 compiler targets select the direct exact-three MATCH leaf instead of NEON"
+    )
+)]
+pub(super) unsafe fn classify_byte_set3_16_neon(
+    members: [u8; 3],
+    bytes: &[u8; BYTE_SET_BLOCK_BYTES],
+) -> ByteSetMask16 {
+    use core::arch::aarch64::vorrq_u8;
+
+    let (input, lane_weights) =
+        unsafe { (vld1q_u8(bytes.as_ptr()), vld1q_u8(LANE_WEIGHTS.as_ptr())) };
+    let member_lanes = vorrq_u8(
+        vorrq_u8(
+            vceqq_u8(input, vdupq_n_u8(members[0])),
+            vceqq_u8(input, vdupq_n_u8(members[1])),
+        ),
+        vceqq_u8(input, vdupq_n_u8(members[2])),
+    );
+    ByteSetMask16::new(unsafe { boolean_lanes_to_mask(member_lanes, lane_weights) })
+}
+
+#[allow(
+    unsafe_code,
+    reason = "this private target-feature leaf loads one exact block after the compiler target proved NEON usable"
+)]
 #[cfg_attr(
     all(
         target_os = "linux",
