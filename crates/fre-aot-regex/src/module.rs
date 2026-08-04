@@ -591,15 +591,15 @@ const PARTIAL_TABLE_SYMBOL: usize = 5;
 const PARTIAL_IDENTITY_SYMBOL: usize = 6;
 const PARTIAL_RUNTIME_SYMBOL: usize = 7;
 const PREPARED_FALLBACK_RUNTIME_SYMBOL: usize = 8;
-const PREPARED_ADMISSION_RUNTIME_SYMBOL: usize = 9;
+const PREPARED_PREFLIGHT_RUNTIME_SYMBOL: usize = 9;
 
 const RUNTIME_SYMBOL_NAME: &str = "fre_aot_regex_runtime_search_v1";
 const PARTIAL_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_from_partial_v1";
 const PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_v1";
-const PREPARED_ADMISSION_RUNTIME_SYMBOL_NAME: &str =
-    "fre_aot_regex_runtime_prepared_partial_should_enter_v1";
+const PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME: &str =
+    "fre_aot_regex_runtime_search_exclusive_partial_preflight_v1";
 const ENTRY_SYMBOL_PREFIX: &str = "fre_aot_regex_search_v1_";
 const PREPARED_ENTRY_SYMBOL_PREFIX: &str = "fre_aot_regex_search_exclusive_v1_";
 const PROGRAM_SYMBOL_PREFIX: &str = "fre_aot_regex_program_v1_";
@@ -610,6 +610,7 @@ const PARTIAL_CELL_ACCEPTED: u32 = 1 << 31;
 const PARTIAL_CELL_HOLE_BASE: u32 = 1 << 30;
 const PARTIAL_CELL_DEAD: u32 = PARTIAL_CELL_ACCEPTED - 1;
 const PARTIAL_CLASS_MAP_BYTES: usize = 256;
+const PARTIAL_PREFLIGHT_ENTER_STATUS: u8 = 6;
 
 struct NativeLowering {
     code: Vec<u8>,
@@ -849,7 +850,7 @@ impl CompiledModule {
                 size: 0,
             });
             symbols.push(ModuleSymbol {
-                name: PREPARED_ADMISSION_RUNTIME_SYMBOL_NAME.to_owned(),
+                name: PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME.to_owned(),
                 binding: SymbolBinding::Global,
                 kind: SymbolKind::Function,
                 section: None,
@@ -936,13 +937,23 @@ impl CompiledModule {
             .map(|symbol| symbol.name.as_str())
     }
 
-    /// Return the adaptive retained-row admission helper required by the
-    /// additive prepared entry, when that entry is present.
+    /// Return the legacy standalone retained-row admission dependency.
+    ///
+    /// Newly lowered objects combine admission with authenticated graph
+    /// preflight and therefore always return `None` here. The accessor remains
+    /// source-compatible for integrators that also consume older objects.
     #[must_use]
     pub fn required_prepared_admission_runtime_symbol(&self) -> Option<&str> {
+        None
+    }
+
+    /// Return the authenticated accelerator/admission transaction required by
+    /// the additive prepared entry, when that entry is present.
+    #[must_use]
+    pub fn required_prepared_preflight_runtime_symbol(&self) -> Option<&str> {
         self.prepared_entry_symbol_index?;
         self.symbols
-            .get(PREPARED_ADMISSION_RUNTIME_SYMBOL)
+            .get(PREPARED_PREFLIGHT_RUNTIME_SYMBOL)
             .filter(|symbol| symbol.section.is_none())
             .map(|symbol| symbol.name.as_str())
     }
@@ -1249,12 +1260,12 @@ fn native_module_digest(
         if lowering
             .relocations
             .iter()
-            .any(|relocation| relocation.symbol == PREPARED_ADMISSION_RUNTIME_SYMBOL)
+            .any(|relocation| relocation.symbol == PREPARED_PREFLIGHT_RUNTIME_SYMBOL)
         {
             update_bytes(
                 &mut digest,
-                PREPARED_ADMISSION_RUNTIME_SYMBOL_NAME.as_bytes(),
-                "prepared admission runtime symbol identity byte length",
+                PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME.as_bytes(),
+                "prepared preflight runtime symbol identity byte length",
             )?;
         }
     }
@@ -9246,9 +9257,9 @@ fn lower_x86_64_partial_prepared(
     let no_match = assembler.label()?;
     let matched = assembler.label()?;
     let return_local = assembler.label()?;
+    let preflight_enter = assembler.label()?;
     let invalid = assembler.label()?;
     let invalid_handle = assembler.label()?;
-    let fallback_after_admission = assembler.label()?;
     let fallback_runtime = assembler.label()?;
 
     // Exclusive prepared ABI: handle, haystack, length, start, end, result.
@@ -9279,8 +9290,8 @@ fn lower_x86_64_partial_prepared(
     assembler.instruction(&compare_minimum)?;
     assembler.branch(&[0x0f, 0x82], fallback_runtime)?;
 
-    // Entry RSP is 8 modulo 16. A 120-byte frame aligns it for the rare call
-    // and reserves five SysV stack arguments before saved public registers.
+    // Entry RSP is 8 modulo 16. A 120-byte frame aligns it for calls, reserves
+    // five SysV hole arguments, and leaves two exact-window output slots.
     assembler.instruction(&[0x48, 0x83, 0xec, FRAME_BYTES])?;
     assembler.instruction(&[0x48, 0x89, 0x7c, 0x24, 0x28])?;
     assembler.instruction(&[0x48, 0x89, 0x74, 0x24, 0x30])?;
@@ -9289,21 +9300,40 @@ fn lower_x86_64_partial_prepared(
     assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x48])?;
     assembler.instruction(&[0x4c, 0x89, 0x4c, 0x24, 0x50])?;
 
-    // The admission helper receives (handle, window length). Reload every
-    // caller-saved public argument after the call before entering native rows.
-    assembler.instruction(&[0x48, 0x89, 0xc6])?; // mov rax, rsi
-    assembler.instruction(&[0xe8])?;
-    let admission_runtime_displacement_label = assembler.label()?;
-    assembler.bind(admission_runtime_displacement_label)?;
+    // One authenticated runtime transaction settles the prior local native
+    // result, runs suffix then cut, and consults adaptive admission. SysV
+    // arguments seven and eight are the identity and exact-window output.
+    assembler.instruction(&[0x48, 0x8d, 0x05])?;
+    let preflight_identity_displacement_label = assembler.label()?;
+    assembler.bind(preflight_identity_displacement_label)?;
     push_bytes(&mut assembler.code, &[0; 4])?;
-    assembler.instruction(&[0x85, 0xc0])?; // test eax, eax
-    assembler.branch(&[0x0f, 0x84], fallback_after_admission)?;
+    assembler.instruction(&[0x48, 0x89, 0x04, 0x24])?;
+    assembler.instruction(&[0x48, 0x8d, 0x44, 0x24, 0x68])?;
+    assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 0x08])?;
     assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x28])?;
     assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x30])?;
     assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x38])?;
     assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x40])?;
     assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x48])?;
     assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x50])?;
+    assembler.instruction(&[0xe8])?;
+    let preflight_runtime_displacement_label = assembler.label()?;
+    assembler.bind(preflight_runtime_displacement_label)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x83, 0xf8, PARTIAL_PREFLIGHT_ENTER_STATUS])?;
+    assembler.branch(&[0x0f, 0x84], preflight_enter)?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.instruction(&[0xc3])?;
+
+    assembler.bind(preflight_enter)?;
+    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x28])?;
+    assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x30])?;
+    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x38])?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x68])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x70])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x50])?;
+    assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, 0x40])?;
+    assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x48])?;
 
     assembler.instruction(&[0x49, 0xc7, 0x01, 0, 0, 0, 0])?;
     assembler.instruction(&[0x49, 0xc7, 0x41, 0x08, 0, 0, 0, 0])?;
@@ -9436,16 +9466,6 @@ fn lower_x86_64_partial_prepared(
     assembler.instruction(&[0xb8, 5, 0, 0, 0])?;
     assembler.instruction(&[0xc3])?;
 
-    assembler.bind(fallback_after_admission)?;
-    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x28])?;
-    assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x30])?;
-    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x38])?;
-    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x40])?;
-    assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x48])?;
-    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x50])?;
-    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
-    assembler.branch(&[0xe9], fallback_runtime)?;
-
     assembler.bind(fallback_runtime)?;
     assembler.instruction(&[0xe9])?;
     let fallback_runtime_displacement_label = assembler.label()?;
@@ -9454,8 +9474,10 @@ fn lower_x86_64_partial_prepared(
 
     let finished = assembler.finish_with_label_offsets()?;
     let table_displacement = finished.label_offset(table_displacement_label)?;
-    let admission_runtime_displacement =
-        finished.label_offset(admission_runtime_displacement_label)?;
+    let preflight_identity_displacement =
+        finished.label_offset(preflight_identity_displacement_label)?;
+    let preflight_runtime_displacement =
+        finished.label_offset(preflight_runtime_displacement_label)?;
     let identity_displacement = finished.label_offset(identity_displacement_label)?;
     let runtime_displacement = finished.label_offset(runtime_displacement_label)?;
     let fallback_runtime_displacement =
@@ -9466,11 +9488,21 @@ fn lower_x86_64_partial_prepared(
             ModuleRelocation {
                 section: TEXT_SECTION,
                 offset: offset_u64(
-                    admission_runtime_displacement,
-                    "x86 prepared admission runtime relocation",
+                    preflight_identity_displacement,
+                    "x86 prepared preflight identity relocation",
+                )?,
+                kind: RelocationKind::X86PcRelative32,
+                symbol: PARTIAL_IDENTITY_SYMBOL,
+                addend: -4,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(
+                    preflight_runtime_displacement,
+                    "x86 prepared preflight runtime relocation",
                 )?,
                 kind: RelocationKind::X86PltRelative32,
-                symbol: PREPARED_ADMISSION_RUNTIME_SYMBOL,
+                symbol: PREPARED_PREFLIGHT_RUNTIME_SYMBOL,
                 addend: -4,
             },
             ModuleRelocation {
@@ -14770,9 +14802,9 @@ fn lower_aarch64_partial_prepared(
     let no_match = assembler.label()?;
     let matched = assembler.label()?;
     let return_local = assembler.label()?;
+    let preflight_enter = assembler.label()?;
     let invalid = assembler.label()?;
     let invalid_handle = assembler.label()?;
-    let fallback_after_admission = assembler.label()?;
     let fallback_runtime = assembler.label()?;
 
     // Exclusive prepared ABI: handle, haystack, length, start, end, result.
@@ -14809,19 +14841,38 @@ fn lower_aarch64_partial_prepared(
     assembler.instruction(aarch64_store_x(4, 31, 64)?)?;
     assembler.instruction(aarch64_store_x(5, 31, 72)?)?;
 
-    // The admission helper receives (handle, window length). Its call may
-    // clobber every public argument register, so restore x0..x5 before either
-    // native execution or the ordinary prepared tail branch.
-    assembler.instruction(aarch64_mov_x(1, 6)?)?;
-    let admission_runtime_branch = assembler.instruction(0x9400_0000)?;
-    assembler.instruction(aarch64_mov_x(6, 0)?)?;
+    // AAPCS64 carries the authenticated identity and exact-window output in
+    // x6/x7, so the combined suffix/cut/admission transaction needs no stack
+    // arguments. It either completes the search or admits native rows once.
+    let preflight_identity_page = assembler.instruction(0x9000_0006)?;
+    let preflight_identity_page_offset =
+        assembler.instruction(aarch64_add_x_imm(6, 6, 0)?)?;
+    assembler.instruction(aarch64_add_x_imm(7, 31, 80)?)?;
     assembler.instruction(aarch64_load_x_imm(0, 31, 32)?)?;
     assembler.instruction(aarch64_load_x_imm(1, 31, 40)?)?;
     assembler.instruction(aarch64_load_x_imm(2, 31, 48)?)?;
     assembler.instruction(aarch64_load_x_imm(3, 31, 56)?)?;
     assembler.instruction(aarch64_load_x_imm(4, 31, 64)?)?;
     assembler.instruction(aarch64_load_x_imm(5, 31, 72)?)?;
-    assembler.branch_zero_w(6, fallback_after_admission)?;
+    let preflight_runtime_branch = assembler.instruction(0x9400_0000)?;
+    assembler.instruction(aarch64_cmp_w_imm(
+        0,
+        u16::from(PARTIAL_PREFLIGHT_ENTER_STATUS),
+    )?)?;
+    assembler.branch_cond(AARCH64_EQ, preflight_enter)?;
+    assembler.instruction(aarch64_load_x_imm(30, 31, 104)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    assembler.bind(preflight_enter)?;
+    assembler.instruction(aarch64_load_x_imm(0, 31, 32)?)?;
+    assembler.instruction(aarch64_load_x_imm(1, 31, 40)?)?;
+    assembler.instruction(aarch64_load_x_imm(2, 31, 48)?)?;
+    assembler.instruction(aarch64_load_x_imm(3, 31, 80)?)?;
+    assembler.instruction(aarch64_load_x_imm(4, 31, 88)?)?;
+    assembler.instruction(aarch64_load_x_imm(5, 31, 72)?)?;
+    assembler.instruction(aarch64_store_x(3, 31, 56)?)?;
+    assembler.instruction(aarch64_store_x(4, 31, 64)?)?;
 
     assembler.instruction(aarch64_store_x(31, 5, 0)?)?;
     assembler.instruction(aarch64_store_x(31, 5, 8)?)?;
@@ -14943,16 +14994,13 @@ fn lower_aarch64_partial_prepared(
     assembler.instruction(aarch64_movz_w(0, 5)?)?;
     assembler.instruction(0xd65f_03c0)?;
 
-    assembler.bind(fallback_after_admission)?;
-    assembler.instruction(aarch64_load_x_imm(30, 31, 104)?)?;
-    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
-    assembler.branch(fallback_runtime)?;
-
     assembler.bind(fallback_runtime)?;
     let fallback_runtime_branch = assembler.instruction(0x1400_0000)?;
 
     let mut relocation_offsets = [
-        admission_runtime_branch,
+        preflight_identity_page,
+        preflight_identity_page_offset,
+        preflight_runtime_branch,
         table_page,
         table_page_offset,
         identity_page,
@@ -14968,43 +15016,63 @@ fn lower_aarch64_partial_prepared(
                 section: TEXT_SECTION,
                 offset: offset_u64(
                     relocation_offsets[0],
-                    "AArch64 prepared admission runtime branch",
+                    "AArch64 prepared preflight identity ADRP",
+                )?,
+                kind: RelocationKind::Aarch64Page21,
+                symbol: PARTIAL_IDENTITY_SYMBOL,
+                addend: 0,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(
+                    relocation_offsets[1],
+                    "AArch64 prepared preflight identity ADD",
+                )?,
+                kind: RelocationKind::Aarch64PageOff12,
+                symbol: PARTIAL_IDENTITY_SYMBOL,
+                addend: 0,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(
+                    relocation_offsets[2],
+                    "AArch64 prepared preflight runtime branch",
                 )?,
                 kind: RelocationKind::Aarch64Branch26,
-                symbol: PREPARED_ADMISSION_RUNTIME_SYMBOL,
+                symbol: PREPARED_PREFLIGHT_RUNTIME_SYMBOL,
                 addend: 0,
             },
             ModuleRelocation {
                 section: TEXT_SECTION,
-                offset: offset_u64(relocation_offsets[1], "AArch64 partial table ADRP")?,
+                offset: offset_u64(relocation_offsets[3], "AArch64 partial table ADRP")?,
                 kind: RelocationKind::Aarch64Page21,
                 symbol: PARTIAL_TABLE_SYMBOL,
                 addend: 0,
             },
             ModuleRelocation {
                 section: TEXT_SECTION,
-                offset: offset_u64(relocation_offsets[2], "AArch64 partial table ADD")?,
+                offset: offset_u64(relocation_offsets[4], "AArch64 partial table ADD")?,
                 kind: RelocationKind::Aarch64PageOff12,
                 symbol: PARTIAL_TABLE_SYMBOL,
                 addend: 0,
             },
             ModuleRelocation {
                 section: TEXT_SECTION,
-                offset: offset_u64(relocation_offsets[3], "AArch64 partial identity ADRP")?,
+                offset: offset_u64(relocation_offsets[5], "AArch64 partial identity ADRP")?,
                 kind: RelocationKind::Aarch64Page21,
                 symbol: PARTIAL_IDENTITY_SYMBOL,
                 addend: 0,
             },
             ModuleRelocation {
                 section: TEXT_SECTION,
-                offset: offset_u64(relocation_offsets[4], "AArch64 partial identity ADD")?,
+                offset: offset_u64(relocation_offsets[6], "AArch64 partial identity ADD")?,
                 kind: RelocationKind::Aarch64PageOff12,
                 symbol: PARTIAL_IDENTITY_SYMBOL,
                 addend: 0,
             },
             ModuleRelocation {
                 section: TEXT_SECTION,
-                offset: offset_u64(relocation_offsets[5], "AArch64 partial runtime branch")?,
+                offset: offset_u64(relocation_offsets[7], "AArch64 partial runtime branch")?,
                 kind: RelocationKind::Aarch64Branch26,
                 symbol: PARTIAL_RUNTIME_SYMBOL,
                 addend: 0,
@@ -15012,7 +15080,7 @@ fn lower_aarch64_partial_prepared(
             ModuleRelocation {
                 section: TEXT_SECTION,
                 offset: offset_u64(
-                    relocation_offsets[6],
+                    relocation_offsets[8],
                     "AArch64 prepared fallback runtime branch",
                 )?,
                 kind: RelocationKind::Aarch64Branch26,
@@ -17790,7 +17858,7 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_retained_forward_with_complete_nfa_accelerator_stays_runtime_backed() {
+    fn incomplete_retained_forward_with_complete_nfa_accelerator_publishes_preflight() {
         let limits = CompileLimitsV1 {
             determinize: DeterminizeLimits {
                 max_states: 8,
@@ -17822,22 +17890,28 @@ mod tests {
                     .unwrap_or_else(|| panic!("missing retained rows: {target:?}/{pattern:?}"));
                 assert!(partial.complete_rows < partial.discovered_states);
                 assert!(partial.resume_frontiers > 0);
-                assert!(compiled.program().native_partial_dfa_view().is_none());
-                assert!(compiled.module().prepared_entry_symbol().is_none());
+                assert!(compiled.program().native_partial_dfa_view().is_some());
+                assert!(compiled.module().prepared_entry_symbol().is_some());
                 assert!(compiled.module().required_runtime_program().is_some());
                 assert!(compiled.module().required_runtime_symbol().is_some());
-                assert!(compiled.module().required_prepared_runtime_symbol().is_none());
+                assert!(compiled.module().required_prepared_runtime_symbol().is_some());
                 assert!(
                     compiled
                         .module()
                         .required_prepared_fallback_runtime_symbol()
-                        .is_none()
+                        .is_some()
                 );
                 assert!(
                     compiled
                         .module()
                         .required_prepared_admission_runtime_symbol()
                         .is_none()
+                );
+                assert_eq!(
+                    compiled
+                        .module()
+                        .required_prepared_preflight_runtime_symbol(),
+                    Some(PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME)
                 );
             }
         }
@@ -17935,18 +18009,22 @@ mod tests {
                     Some(PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME)
                 );
                 assert_eq!(
-                    compiled.module().symbols()[PREPARED_ADMISSION_RUNTIME_SYMBOL].name,
-                    PREPARED_ADMISSION_RUNTIME_SYMBOL_NAME
+                    compiled.module().symbols()[PREPARED_PREFLIGHT_RUNTIME_SYMBOL].name,
+                    PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME
                 );
                 assert_eq!(
-                    compiled.module().symbols()[PREPARED_ADMISSION_RUNTIME_SYMBOL].section,
+                    compiled.module().symbols()[PREPARED_PREFLIGHT_RUNTIME_SYMBOL].section,
+                    None
+                );
+                assert_eq!(
+                    compiled.module().required_prepared_admission_runtime_symbol(),
                     None
                 );
                 assert_eq!(
                     compiled
                         .module()
-                        .required_prepared_admission_runtime_symbol(),
-                    Some(PREPARED_ADMISSION_RUNTIME_SYMBOL_NAME)
+                        .required_prepared_preflight_runtime_symbol(),
+                    Some(PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME)
                 );
                 assert!(compiled.module().relocations().iter().any(|relocation| {
                     relocation.symbol == PARTIAL_TABLE_SYMBOL
@@ -17961,7 +18039,7 @@ mod tests {
                     relocation.symbol == PREPARED_FALLBACK_RUNTIME_SYMBOL
                 }));
                 assert!(compiled.module().relocations().iter().any(|relocation| {
-                    relocation.symbol == PREPARED_ADMISSION_RUNTIME_SYMBOL
+                    relocation.symbol == PREPARED_PREFLIGHT_RUNTIME_SYMBOL
                 }));
                 let serialized = compiled.program().serialize().expect("serialize program");
                 assert_eq!(
@@ -17996,6 +18074,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "both emitter ABIs and every relocation participate in one code-shape contract"
+    )]
     fn partial_prepared_emitters_preserve_accept_final_hole_and_call_shapes() {
         let limits = CompileLimitsV1 {
             determinize: DeterminizeLimits {
@@ -18026,7 +18108,8 @@ mod tests {
                 .map(|relocation| relocation.symbol)
                 .collect::<Vec<_>>(),
             [
-                PREPARED_ADMISSION_RUNTIME_SYMBOL,
+                PARTIAL_IDENTITY_SYMBOL,
+                PREPARED_PREFLIGHT_RUNTIME_SYMBOL,
                 PARTIAL_TABLE_SYMBOL,
                 PARTIAL_IDENTITY_SYMBOL,
                 PARTIAL_RUNTIME_SYMBOL,
@@ -18051,11 +18134,16 @@ mod tests {
             .position(|bytes| bytes == [0x3d, 0, 0, 0, 0x40])
             .expect("x86 hole compare");
         assert!(accept_clear < hole_compare);
-        let admission_offset = usize::try_from(x86_relocations[0].offset).unwrap();
-        assert_eq!(x86.get(admission_offset.wrapping_sub(1)), Some(&0xe8));
-        let runtime_offset = usize::try_from(x86_relocations[3].offset).unwrap();
+        let preflight_offset = usize::try_from(x86_relocations[1].offset).unwrap();
+        assert_eq!(x86.get(preflight_offset.wrapping_sub(1)), Some(&0xe8));
+        assert!(x86.windows(3).any(|bytes| {
+            bytes == [0x83, 0xf8, PARTIAL_PREFLIGHT_ENTER_STATUS]
+        }));
+        assert!(x86.windows(5).any(|bytes| bytes == [0x48, 0x8b, 0x4c, 0x24, 0x68]));
+        assert!(x86.windows(5).any(|bytes| bytes == [0x4c, 0x8b, 0x44, 0x24, 0x70]));
+        let runtime_offset = usize::try_from(x86_relocations[4].offset).unwrap();
         assert_eq!(x86.get(runtime_offset.wrapping_sub(1)), Some(&0xe8));
-        let fallback_offset = usize::try_from(x86_relocations[4].offset).unwrap();
+        let fallback_offset = usize::try_from(x86_relocations[5].offset).unwrap();
         assert_eq!(x86.get(fallback_offset.wrapping_sub(1)), Some(&0xe9));
 
         let (aarch64, aarch64_relocations) = lower_aarch64_partial_prepared(view).unwrap();
@@ -18065,7 +18153,9 @@ mod tests {
                 .map(|relocation| relocation.symbol)
                 .collect::<Vec<_>>(),
             [
-                PREPARED_ADMISSION_RUNTIME_SYMBOL,
+                PARTIAL_IDENTITY_SYMBOL,
+                PARTIAL_IDENTITY_SYMBOL,
+                PREPARED_PREFLIGHT_RUNTIME_SYMBOL,
                 PARTIAL_TABLE_SYMBOL,
                 PARTIAL_TABLE_SYMBOL,
                 PARTIAL_IDENTITY_SYMBOL,
@@ -18086,25 +18176,179 @@ mod tests {
         assert!(words.contains(
             &aarch64_cmp_x_imm(6, u16::try_from(PARTIAL_DFA_MIN_INPUT_BYTES).unwrap()).unwrap()
         ));
-        let admission_offset = usize::try_from(aarch64_relocations[0].offset).unwrap();
+        let preflight_offset = usize::try_from(aarch64_relocations[2].offset).unwrap();
         assert_eq!(
             u32::from_le_bytes(
-                aarch64[admission_offset..admission_offset + 4]
+                aarch64[preflight_offset..preflight_offset + 4]
                     .try_into()
                     .unwrap()
             ),
             0x9400_0000
         );
-        let runtime_offset = usize::try_from(aarch64_relocations[5].offset).unwrap();
+        assert!(words.contains(&aarch64_add_x_imm(7, 31, 80).unwrap()));
+        assert!(words.contains(&aarch64_load_x_imm(3, 31, 80).unwrap()));
+        assert!(words.contains(&aarch64_load_x_imm(4, 31, 88).unwrap()));
+        assert!(words.contains(&aarch64_store_x(3, 31, 56).unwrap()));
+        assert!(words.contains(&aarch64_store_x(4, 31, 64).unwrap()));
+        let runtime_offset = usize::try_from(aarch64_relocations[7].offset).unwrap();
         assert_eq!(
             u32::from_le_bytes(aarch64[runtime_offset..runtime_offset + 4].try_into().unwrap()),
             0x9400_0000
         );
-        let fallback_offset = usize::try_from(aarch64_relocations[6].offset).unwrap();
+        let fallback_offset = usize::try_from(aarch64_relocations[8].offset).unwrap();
         assert_eq!(
             u32::from_le_bytes(aarch64[fallback_offset..fallback_offset + 4].try_into().unwrap()),
             0x1400_0000
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the complete target and feature matrix shares one exact ABI and relocation audit"
+    )]
+    fn partial_preflight_has_one_call_and_exact_window_abi_on_every_target() {
+        let limits = CompileLimitsV1 {
+            determinize: DeterminizeLimits {
+                max_states: 8,
+                ..DeterminizeLimits::default()
+            },
+            ..CompileLimitsV1::default()
+        };
+        for target in identity_target_matrix() {
+            let compiled = compile(
+                CompileRequest::new(
+                    r"(?-u:[\x00-\xFF])*(?:a+Q|[b-c][a-b]{1,5}(?:x+|y+))Z",
+                    target,
+                )
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::SelectedEnd)
+                .limits(limits),
+            )
+            .unwrap_or_else(|error| panic!("partial preflight {target:?}: {error}"));
+            assert!(compiled.module().prepared_entry_symbol().is_some(), "{target:?}");
+            assert_eq!(
+                compiled
+                    .module()
+                    .required_prepared_preflight_runtime_symbol(),
+                Some(PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME),
+                "{target:?}"
+            );
+            assert_eq!(
+                compiled.module().required_prepared_admission_runtime_symbol(),
+                None,
+                "{target:?}"
+            );
+            assert!(compiled
+                .module()
+                .symbols()
+                .iter()
+                .all(|symbol| symbol.name != "fre_aot_regex_runtime_prepared_partial_should_enter_v1"));
+            let relocations = compiled.module().relocations();
+            assert_eq!(
+                relocations
+                    .iter()
+                    .filter(|relocation| relocation.symbol == PREPARED_PREFLIGHT_RUNTIME_SYMBOL)
+                    .count(),
+                1,
+                "{target:?}"
+            );
+            assert_eq!(
+                relocations
+                    .iter()
+                    .filter(|relocation| relocation.symbol == PREPARED_FALLBACK_RUNTIME_SYMBOL)
+                    .count(),
+                1,
+                "{target:?}"
+            );
+            assert_eq!(
+                relocations
+                    .iter()
+                    .filter(|relocation| relocation.symbol == PARTIAL_RUNTIME_SYMBOL)
+                    .count(),
+                1,
+                "{target:?}"
+            );
+            let text = compiled.module().sections()[TEXT_SECTION].bytes();
+            let prepared = &compiled.module().symbols()[PREPARED_ENTRY_SYMBOL];
+            let prepared_start = usize::try_from(prepared.offset).unwrap();
+            let prepared_end = prepared_start + usize::try_from(prepared.size).unwrap();
+            let code = &text[prepared_start..prepared_end];
+            let preflight = relocations
+                .iter()
+                .find(|relocation| relocation.symbol == PREPARED_PREFLIGHT_RUNTIME_SYMBOL)
+                .unwrap();
+            let preflight_offset = usize::try_from(preflight.offset).unwrap() - prepared_start;
+
+            match target.architecture {
+                Architecture::X86_64 => {
+                    assert_eq!(code.get(preflight_offset.wrapping_sub(1)), Some(&0xe8));
+                    assert_eq!(
+                        relocations
+                            .iter()
+                            .filter(|relocation| relocation.symbol == PARTIAL_IDENTITY_SYMBOL)
+                            .count(),
+                        2,
+                        "{target:?}"
+                    );
+                    assert!(code.windows(3).any(|bytes| {
+                        bytes == [0x83, 0xf8, PARTIAL_PREFLIGHT_ENTER_STATUS]
+                    }));
+                    assert!(code
+                        .windows(5)
+                        .any(|bytes| bytes == [0x48, 0x8b, 0x4c, 0x24, 0x68]));
+                    assert!(code
+                        .windows(5)
+                        .any(|bytes| bytes == [0x4c, 0x8b, 0x44, 0x24, 0x70]));
+                    assert!(code
+                        .windows(5)
+                        .any(|bytes| bytes == [0x48, 0x89, 0x4c, 0x24, 0x40]));
+                    assert!(code
+                        .windows(5)
+                        .any(|bytes| bytes == [0x4c, 0x89, 0x44, 0x24, 0x48]));
+                    assert!(code
+                        .windows(5)
+                        .any(|bytes| bytes == [0x48, 0x83, 0xc4, 120, 0xc3]));
+                }
+                Architecture::Aarch64 => {
+                    assert_eq!(
+                        u32::from_le_bytes(
+                            code[preflight_offset..preflight_offset + 4]
+                                .try_into()
+                                .unwrap()
+                        ),
+                        0x9400_0000,
+                        "{target:?}"
+                    );
+                    assert_eq!(
+                        relocations
+                            .iter()
+                            .filter(|relocation| relocation.symbol == PARTIAL_IDENTITY_SYMBOL)
+                            .count(),
+                        4,
+                        "{target:?}"
+                    );
+                    let words = code
+                        .chunks_exact(4)
+                        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                        .collect::<Vec<_>>();
+                    for instruction in [
+                        aarch64_add_x_imm(7, 31, 80).unwrap(),
+                        aarch64_cmp_w_imm(
+                            0,
+                            u16::from(PARTIAL_PREFLIGHT_ENTER_STATUS),
+                        )
+                        .unwrap(),
+                        aarch64_load_x_imm(3, 31, 80).unwrap(),
+                        aarch64_load_x_imm(4, 31, 88).unwrap(),
+                        aarch64_store_x(3, 31, 56).unwrap(),
+                        aarch64_store_x(4, 31, 64).unwrap(),
+                    ] {
+                        assert!(words.contains(&instruction), "{target:?}/{instruction:#x}");
+                    }
+                }
+            }
+        }
     }
 
     #[cfg(all(
@@ -18206,13 +18450,15 @@ mod tests {
             .expect("reachable interior partial hole");
         let (hole_bytes, relative_hole) = witness;
         let window_start = 2_usize;
+        let narrowed_start = window_start + 16;
         let window_end = window_start + PARTIAL_DFA_MIN_INPUT_BYTES;
         let mut haystack = vec![b'!'; window_end + 1];
-        haystack[window_start..window_start + hole_bytes.len()].copy_from_slice(&hole_bytes);
+        haystack[narrowed_start..narrowed_start + hole_bytes.len()]
+            .copy_from_slice(&hole_bytes);
         let hole = Hole {
             state: relative_hole.state,
-            position: relative_hole.position + window_start,
-            pending_end: relative_hole.pending_end.map(|end| end + window_start),
+            position: relative_hole.position + narrowed_start,
+            pending_end: relative_hole.pending_end.map(|end| end + narrowed_start),
         };
         let final_hole_end = hole.position;
         let expected_final = compiled
@@ -18240,25 +18486,29 @@ mod tests {
         let pending_end = hole.pending_end.unwrap_or(0);
         let mut source = format!(
             "#include <stddef.h>\n#include <stdint.h>\n#include <string.h>\n\
-             typedef void *handle_t;\n\
+             typedef void *handle_t;typedef struct{{size_t start;size_t end;}} window_t;\n\
              extern uint32_t {symbol}(handle_t,const unsigned char*,size_t,size_t,size_t,size_t*);\n\
              static const unsigned char identity[32]={{{}}};\n\
              static const unsigned char haystack[]={{{}}};\n\
-             static int expect_path;\n\
+             static int expect_path;static int fallback_calls;static int preflight_calls;\n\
              uint32_t fre_aot_regex_runtime_search_v1(const unsigned char*a,const unsigned char*b,size_t c,size_t d,size_t e,size_t*f){{(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 98U;}}\n\
              uint32_t fre_aot_regex_runtime_search_exclusive_v1(\
                handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,size_t*r){{\
+               fallback_calls++;\
                if(h!=(handle_t)(uintptr_t)0x1234U||p!=haystack||n!=sizeof(haystack)||s!={window_start}U||r==NULL)return 89U;\
                if(expect_path==1&&e=={final_hole_end}U){{r[0]={fallback_start}U;r[1]={fallback_end}U;return {fallback_status}U;}}\
-               if(expect_path==3&&e=={window_end}U){{r[0]=321U;r[1]=654U;return 76U;}}return 89U;}}\n\
-             uint32_t fre_aot_regex_runtime_prepared_partial_should_enter_v1(handle_t h,size_t n){{\
-               if(h!=(handle_t)(uintptr_t)0x1234U||n!={PARTIAL_DFA_MIN_INPUT_BYTES}U)return 88U;\
-               if(expect_path==2)return 1U;if(expect_path==3)return 0U;return 88U;}}\n\
+               return 89U;}}\n\
+             uint32_t fre_aot_regex_runtime_search_exclusive_partial_preflight_v1(\
+               handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,size_t*r,const unsigned char*d,window_t*w){{\
+               preflight_calls++;if(h!=(handle_t)(uintptr_t)0x1234U||p!=haystack||n!=sizeof(haystack)||\
+                  s!={window_start}U||e!={window_end}U||r==NULL||w==NULL||memcmp(d,identity,32U)!=0)return 88U;\
+               if(expect_path==2){{w->start={narrowed_start}U;w->end=e;return 6U;}}\
+               if(expect_path==3){{r[0]=321U;r[1]=654U;return 76U;}}return 88U;}}\n\
              uint32_t fre_aot_regex_runtime_search_exclusive_from_partial_v1(\
                handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,size_t*r,\
                const unsigned char*d,size_t state,size_t position,uint32_t pending,size_t pend){{\
                if(expect_path!=2||h!=(handle_t)(uintptr_t)0x1234U||p!=haystack||n!=sizeof(haystack)||\
-                  s!={window_start}U||e!={window_end}U||r==NULL||memcmp(d,identity,32U)!=0||\
+                  s!={narrowed_start}U||e!={window_end}U||r==NULL||memcmp(d,identity,32U)!=0||\
                   state!={}U||position!={}U||pending!={pending_present}U||pend!={pending_end}U)return 90U;\
                r[0]=123U;r[1]=456U;return 77U;}}\n\
              int main(void){{size_t r[2]={{91U,92U}};uint32_t status;\n",
@@ -18269,17 +18519,17 @@ mod tests {
         );
         writeln!(
             source,
-            "expect_path=1;status={symbol}((handle_t)(uintptr_t)0x1234U,haystack,sizeof(haystack),{window_start}U,{final_hole_end}U,r);if(status!={fallback_status}U||r[0]!={fallback_start}U||r[1]!={fallback_end}U)return 10;"
+            "expect_path=1;fallback_calls=0;preflight_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234U,haystack,sizeof(haystack),{window_start}U,{final_hole_end}U,r);if(status!={fallback_status}U||r[0]!={fallback_start}U||r[1]!={fallback_end}U||fallback_calls!=1||preflight_calls!=0)return 10;"
         )
         .unwrap();
         writeln!(
             source,
-            "expect_path=2;r[0]=91U;r[1]=92U;status={symbol}((handle_t)(uintptr_t)0x1234U,haystack,sizeof(haystack),{window_start}U,{window_end}U,r);if(status!=77U||r[0]!=123U||r[1]!=456U)return 11;"
+            "expect_path=2;fallback_calls=0;preflight_calls=0;r[0]=91U;r[1]=92U;status={symbol}((handle_t)(uintptr_t)0x1234U,haystack,sizeof(haystack),{window_start}U,{window_end}U,r);if(status!=77U||r[0]!=123U||r[1]!=456U||fallback_calls!=0||preflight_calls!=1)return 11;"
         )
         .unwrap();
         writeln!(
             source,
-            "expect_path=3;r[0]=91U;r[1]=92U;status={symbol}((handle_t)(uintptr_t)0x1234U,haystack,sizeof(haystack),{window_start}U,{window_end}U,r);if(status!=76U||r[0]!=321U||r[1]!=654U)return 12;"
+            "expect_path=3;fallback_calls=0;preflight_calls=0;r[0]=91U;r[1]=92U;status={symbol}((handle_t)(uintptr_t)0x1234U,haystack,sizeof(haystack),{window_start}U,{window_end}U,r);if(status!=76U||r[0]!=321U||r[1]!=654U||fallback_calls!=0||preflight_calls!=1)return 12;"
         )
         .unwrap();
         writeln!(
@@ -18316,6 +18566,119 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         fs::remove_dir_all(&directory).expect("remove prepared linker directory");
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    #[ignore = "cross-links x86_64 Mach-O and executes the prepared ABI through Rosetta"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the Rosetta probe keeps x86 SysV stack outputs, final statuses, short fallback, and identity authentication together"
+    )]
+    fn linked_x86_macos_partial_preflight_abi_executes_under_rosetta() {
+        use std::{fmt::Write as _, fs, process::Command};
+
+        let mut limits = CompileLimitsV1::default();
+        limits.determinize.max_states = 8;
+        let compiled = compile(
+            CompileRequest::new(
+                r"(?-u:[\x00-\xFF])*(?:a+Q|[b-c][a-b]{1,5}(?:x+|y+))Z",
+                Target::x86_64_macos(),
+            )
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::SelectedEnd)
+            .limits(limits),
+        )
+        .expect("x86 macOS partial preflight object");
+        assert!(compiled.program().native_partial_dfa_view().is_some());
+        let symbol = compiled
+            .module()
+            .prepared_entry_symbol()
+            .expect("x86 prepared symbol");
+        let identity = compiled.program().artifact_identity();
+        let identity_bytes = identity
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-x86-partial-preflight-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("create x86 preflight directory");
+        let object = directory.join("preflight.o");
+        fs::write(&object, compiled.object()).expect("write x86 preflight object");
+        let mut source = format!(
+            "#include <stddef.h>\n#include <stdint.h>\n#include <string.h>\n\
+             typedef void *handle_t;typedef struct{{size_t start;size_t end;}} window_t;\n\
+             extern uint32_t {symbol}(handle_t,const unsigned char*,size_t,size_t,size_t,size_t*);\n\
+             static const unsigned char identity[32]={{{identity_bytes}}};\n\
+             static const unsigned char haystack[320]={{0}};\n\
+             static int mode;static int preflight_calls;static int fallback_calls;\n\
+             uint32_t fre_aot_regex_runtime_search_v1(const unsigned char*a,const unsigned char*b,size_t c,size_t d,size_t e,size_t*f){{(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 98U;}}\n\
+             uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,size_t*r){{\
+               fallback_calls++;if(mode!=2||h!=(handle_t)(uintptr_t)0x1234U||p!=haystack||n!=sizeof(haystack)||s!=0U||e!=100U||r==NULL)return 89U;\
+               r[0]=9U;r[1]=9U;return 77U;}}\n\
+             uint32_t fre_aot_regex_runtime_search_exclusive_from_partial_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,size_t*r,const unsigned char*d,size_t a,size_t b,uint32_t c,size_t z){{\
+               (void)h;(void)p;(void)n;(void)s;(void)e;(void)r;(void)d;(void)a;(void)b;(void)c;(void)z;return 90U;}}\n\
+             uint32_t fre_aot_regex_runtime_search_exclusive_partial_preflight_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,size_t*r,const unsigned char*d,window_t*w){{\
+               preflight_calls++;if(h!=(handle_t)(uintptr_t)0x1234U||p!=haystack||n!=sizeof(haystack)||s!=0U||e!=sizeof(haystack)||r==NULL||w==NULL||memcmp(d,identity,32U)!=0)return 88U;\
+               if(mode==0){{r[0]=123U;r[1]=123U;return 1U;}}\
+               if(mode==1){{w->start=sizeof(haystack);w->end=sizeof(haystack);return 6U;}}\
+               if(mode==3){{r[0]=321U;r[1]=654U;return 76U;}}return 87U;}}\n\
+             int main(void){{size_t r[2];uint32_t status;\n"
+        );
+        writeln!(
+            source,
+            "mode=0;preflight_calls=0;fallback_calls=0;r[0]=91U;r[1]=92U;status={symbol}((handle_t)(uintptr_t)0x1234U,haystack,sizeof(haystack),0U,sizeof(haystack),r);if(status!=1U||r[0]!=123U||r[1]!=123U||preflight_calls!=1||fallback_calls!=0)return 10;"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "mode=1;preflight_calls=0;fallback_calls=0;r[0]=91U;r[1]=92U;status={symbol}((handle_t)(uintptr_t)0x1234U,haystack,sizeof(haystack),0U,sizeof(haystack),r);if(status!=0U||r[0]!=0U||r[1]!=0U||preflight_calls!=1||fallback_calls!=0)return 11;"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "mode=2;preflight_calls=0;fallback_calls=0;r[0]=91U;r[1]=92U;status={symbol}((handle_t)(uintptr_t)0x1234U,haystack,sizeof(haystack),0U,100U,r);if(status!=77U||r[0]!=9U||r[1]!=9U||preflight_calls!=0||fallback_calls!=1)return 12;"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "mode=3;preflight_calls=0;fallback_calls=0;r[0]=91U;r[1]=92U;status={symbol}((handle_t)(uintptr_t)0x1234U,haystack,sizeof(haystack),0U,sizeof(haystack),r);if(status!=76U||r[0]!=321U||r[1]!=654U||preflight_calls!=1||fallback_calls!=0)return 13;"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "mode=0;preflight_calls=0;fallback_calls=0;r[0]=91U;r[1]=92U;status={symbol}((handle_t)0,haystack,sizeof(haystack),0U,sizeof(haystack),r);if(status!=5U||r[0]!=91U||r[1]!=92U||preflight_calls!=0||fallback_calls!=0)return 14;"
+        )
+        .unwrap();
+        source.push_str("return 0;}\n");
+
+        let c_path = directory.join("preflight.c");
+        let executable = directory.join("preflight");
+        fs::write(&c_path, source).expect("write x86 preflight harness");
+        let status = Command::new("clang")
+            .args(["-O0", "-arch", "x86_64"])
+            .arg(&c_path)
+            .arg(&object)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .expect("link x86 preflight harness");
+        assert!(status.success());
+        let output = Command::new(&executable)
+            .output()
+            .expect("execute x86 preflight harness through Rosetta");
+        assert!(
+            output.status.success(),
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::remove_dir_all(&directory).expect("remove x86 preflight directory");
     }
 
     #[test]

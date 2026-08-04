@@ -32,13 +32,17 @@
 //! [`fre_aot_regex_runtime_destroy_exclusive_v1`]. That explicitly unsafe
 //! lifecycle passes an opaque allocation pointer directly and therefore pays
 //! no registry, reference-count, thread-local, or mutex cost per search.
-//! A compiler-emitted retained-row entry consults
-//! [`fre_aot_regex_runtime_prepared_partial_should_enter_v1`] once per
-//! admitted window. If it then reaches a partial-DFA hole, it can continue the
-//! same exclusive session through
+//! Current compiler-emitted retained-row entries use
+//! [`fre_aot_regex_runtime_search_exclusive_partial_preflight_v1`] before
+//! native rows execute. That call settles the prior local completion, runs
+//! suffix then cut, and combines adaptive admission with exact-window handoff
+//! or in-helper K0 completion. If a native scan then reaches a partial-DFA
+//! hole, it can continue the same exclusive session through
 //! [`fre_aot_regex_runtime_search_exclusive_from_partial_v1`]. That entry
 //! authenticates the producer's exact artifact identity and compact canonical
 //! resume-state index before continuing K0 without replaying the prefix.
+//! [`fre_aot_regex_runtime_prepared_partial_should_enter_v1`] remains exported
+//! only for compatibility with older generated objects.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(unsafe_code)]
@@ -50,7 +54,7 @@ use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 
 use fre_aot_regex::{
     CompileError, CompiledProgram, MatchResult, OutputContract, PROGRAM_HEADER_LEN,
-    ProgramFormatError, ProgramWorkspace, SearchWindow,
+    ProgramFormatError, ProgramWorkspace, RetainedPartialPreflight, SearchWindow,
 };
 
 /// No match was selected.
@@ -65,6 +69,8 @@ pub const STATUS_RUNTIME_FAILURE: u32 = 3;
 pub const STATUS_HANDLE_BUSY: u32 = 4;
 /// A prepared handle was zero, unknown, destroyed, or concurrently invalidated.
 pub const STATUS_INVALID_HANDLE: u32 = 5;
+/// Native retained rows were admitted on the returned exact search window.
+pub const STATUS_PARTIAL_PREFLIGHT_ENTER: u32 = 6;
 /// Successful status for prepare and destroy lifecycle operations.
 pub const STATUS_SUCCESS: u32 = 0;
 /// Bytes in the exact SHA-256 semantic-artifact identity accepted by resume.
@@ -85,6 +91,14 @@ pub const C_API_V1_HEADER: &str = include_str!("../include/fre_aot_regex_runtime
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(C)]
 pub struct FreAotRegexResultV1 {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// C-layout exact search window returned to an admitted native retained table.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(C)]
+pub struct FreAotRegexSearchWindowV1 {
     pub start: usize,
     pub end: usize,
 }
@@ -374,6 +388,20 @@ impl PreparedAotRegex {
     ) -> Result<bool, CompileError> {
         self.program
             .prepared_partial_should_enter_with_workspace(&mut self.workspace, input_bytes)
+    }
+
+    fn preflight_retained_partial(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+        expected_artifact_identity: [u8; ARTIFACT_IDENTITY_BYTES],
+    ) -> Result<RetainedPartialPreflight, CompileError> {
+        self.program.preflight_retained_partial_with_workspace(
+            haystack,
+            window,
+            &mut self.workspace,
+            expected_artifact_identity,
+        )
     }
 
     /// Find the first selected span in `haystack`.
@@ -933,11 +961,11 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_v1(
     .unwrap_or(STATUS_RUNTIME_FAILURE)
 }
 
-/// Decide whether an exclusive prepared native entry should execute its
+/// Decide whether a legacy exclusive prepared native entry should execute its
 /// retained partial-DFA rows for a window of `input_bytes` bytes.
 ///
 /// Returns [`PARTIAL_ENTRY_ENTER`] or [`PARTIAL_ENTRY_BYPASS`]. This is a
-/// narrow coordination seam for compiler-emitted entries: on bypass, the
+/// compatibility seam for older compiler-emitted entries: on bypass, the
 /// entry must immediately invoke [`fre_aot_regex_runtime_search_exclusive_v1`]
 /// for the same search so the ordinary prepared path consumes one adaptive
 /// bypass. On enter, the emitted scan must either return a complete local
@@ -1055,6 +1083,92 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_from_partial_v1(
         let (status, result) = encode_match_result(found);
         result_ptr.write(result);
         status
+    }))
+    .unwrap_or(STATUS_RUNTIME_FAILURE)
+}
+
+/// Authenticate and prepare one native incomplete-retained search.
+///
+/// The call settles any prior local native completion, runs the complete
+/// suffix and cut proofs in portable order, and then applies adaptive native
+/// admission. On [`STATUS_NO_MATCH`] or [`STATUS_MATCH`], `result_ptr` is
+/// initialized and the search is complete. On
+/// [`STATUS_PARTIAL_PREFLIGHT_ENTER`], `window_out` is initialized to the
+/// exact possibly narrowed window and the native table must enter there. If
+/// admission declines, K0 completes from that narrowed window inside this
+/// call; the generated entry must not replay the accelerators.
+///
+/// The expected identity points to exactly [`ARTIFACT_IDENTITY_BYTES`] bytes
+/// and binds the emitted native table to the prepared semantic program.
+///
+/// # Safety
+///
+/// The exclusive handle, haystack, result, and identity requirements are the
+/// same as for [`fre_aot_regex_runtime_search_exclusive_from_partial_v1`].
+/// `window_out` must be non-null, aligned, writable, and disjoint from all
+/// readable inputs and `result_ptr`. No overlapping search or destroy may use
+/// any copy of `handle`.
+#[unsafe(no_mangle)]
+#[allow(
+    unsafe_code,
+    clippy::too_many_arguments,
+    reason = "this exported preflight is an audited raw C boundary with explicit artifact and exact-window outputs"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_partial_preflight_v1(
+    handle: FreAotRegexExclusiveHandleV1,
+    haystack_ptr: *const u8,
+    haystack_len: usize,
+    window_start: usize,
+    window_end: usize,
+    result_ptr: *mut FreAotRegexResultV1,
+    expected_artifact_identity_ptr: *const u8,
+    window_out: *mut FreAotRegexSearchWindowV1,
+) -> u32 {
+    if handle.is_invalid() {
+        return STATUS_INVALID_HANDLE;
+    }
+    if haystack_ptr.is_null()
+        || result_ptr.is_null()
+        || !result_ptr.is_aligned()
+        || expected_artifact_identity_ptr.is_null()
+        || window_out.is_null()
+        || !window_out.is_aligned()
+        || haystack_len > isize::MAX.unsigned_abs()
+        || window_start > window_end
+        || window_end > haystack_len
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+
+    // SAFETY: the caller guarantees one exclusively owned live session plus
+    // the disjoint readable and writable extents documented above.
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        let prepared = &mut *handle.0.cast::<PreparedAotRegex>();
+        let haystack = std::slice::from_raw_parts(haystack_ptr, haystack_len);
+        let expected_artifact_identity = expected_artifact_identity_ptr
+            .cast::<[u8; ARTIFACT_IDENTITY_BYTES]>()
+            .read();
+        let Ok(outcome) = prepared.preflight_retained_partial(
+            haystack,
+            SearchWindow::new(window_start, window_end),
+            expected_artifact_identity,
+        ) else {
+            return STATUS_RUNTIME_FAILURE;
+        };
+        match outcome {
+            RetainedPartialPreflight::Complete(found) => {
+                let (status, result) = encode_match_result(found);
+                result_ptr.write(result);
+                status
+            }
+            RetainedPartialPreflight::Enter(window) => {
+                window_out.write(FreAotRegexSearchWindowV1 {
+                    start: window.start(),
+                    end: window.end(),
+                });
+                STATUS_PARTIAL_PREFLIGHT_ENTER
+            }
+        }
     }))
     .unwrap_or(STATUS_RUNTIME_FAILURE)
 }
@@ -1441,6 +1555,35 @@ mod tests {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the test helper mirrors the authenticated exact-window preflight ABI"
+    )]
+    fn call_exclusive_partial_preflight(
+        handle: FreAotRegexExclusiveHandleV1,
+        haystack: &[u8],
+        start: usize,
+        end: usize,
+        result: &mut FreAotRegexResultV1,
+        expected_artifact_identity: &[u8; ARTIFACT_IDENTITY_BYTES],
+        window: &mut FreAotRegexSearchWindowV1,
+    ) -> u32 {
+        // SAFETY: each test keeps exclusive ownership of the live session;
+        // all readable and disjoint aligned writable extents outlive the call.
+        unsafe {
+            fre_aot_regex_runtime_search_exclusive_partial_preflight_v1(
+                handle,
+                haystack.as_ptr(),
+                haystack.len(),
+                start,
+                end,
+                result,
+                expected_artifact_identity.as_ptr(),
+                window,
+            )
+        }
+    }
+
     fn expected_ffi(result: MatchResult) -> (u32, FreAotRegexResultV1) {
         match result {
             MatchResult::Exists(false)
@@ -1489,8 +1632,17 @@ mod tests {
             align_of::<*mut std::ffi::c_void>()
         );
         assert_eq!(size_of::<FreAotRegexResultV1>(), size_of::<[usize; 2]>());
+        assert_eq!(
+            size_of::<FreAotRegexSearchWindowV1>(),
+            size_of::<[usize; 2]>()
+        );
+        assert_eq!(
+            align_of::<FreAotRegexSearchWindowV1>(),
+            align_of::<usize>()
+        );
         assert_eq!(ARTIFACT_IDENTITY_BYTES, 32);
         assert!(C_API_V1_HEADER.contains("FRE_AOT_REGEX_ARTIFACT_IDENTITY_BYTES 32u"));
+        assert!(C_API_V1_HEADER.contains("FRE_AOT_REGEX_STATUS_PARTIAL_PREFLIGHT_ENTER 6u"));
         assert!(C_API_V1_HEADER.contains("FRE_AOT_REGEX_PARTIAL_ENTRY_BYPASS 0u"));
         assert!(C_API_V1_HEADER.contains("FRE_AOT_REGEX_PARTIAL_ENTRY_ENTER 1u"));
         for symbol in [
@@ -1502,6 +1654,7 @@ mod tests {
             "fre_aot_regex_runtime_search_exclusive_v1",
             "fre_aot_regex_runtime_prepared_partial_should_enter_v1",
             "fre_aot_regex_runtime_search_exclusive_from_partial_v1",
+            "fre_aot_regex_runtime_search_exclusive_partial_preflight_v1",
             "fre_aot_regex_runtime_destroy_exclusive_v1",
         ] {
             assert!(C_API_V1_HEADER.contains(symbol), "{symbol}");
@@ -1544,6 +1697,16 @@ mod tests {
             u32,
             usize,
         ) -> u32 = fre_aot_regex_runtime_search_exclusive_from_partial_v1;
+        let _: unsafe extern "C" fn(
+            FreAotRegexExclusiveHandleV1,
+            *const u8,
+            usize,
+            usize,
+            usize,
+            *mut FreAotRegexResultV1,
+            *const u8,
+            *mut FreAotRegexSearchWindowV1,
+        ) -> u32 = fre_aot_regex_runtime_search_exclusive_partial_preflight_v1;
         let _: unsafe extern "C" fn(FreAotRegexExclusiveHandleV1) -> u32 =
             fre_aot_regex_runtime_destroy_exclusive_v1;
     }
@@ -2412,6 +2575,242 @@ mod tests {
             unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(handle) },
             STATUS_SUCCESS
         );
+    }
+
+    #[test]
+    fn exclusive_partial_preflight_is_transactional_and_returns_exact_windows() {
+        let sentinel_result = FreAotRegexResultV1 { start: 71, end: 73 };
+        let sentinel_window = FreAotRegexSearchWindowV1 { start: 79, end: 83 };
+        let mut limits = CompileLimitsV1::default();
+        limits.determinize.max_states = 8;
+
+        let plain = compile(
+            CompileRequest::new(
+                r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)",
+                Target::x86_64_linux(),
+            )
+            .mode(CompileMode::Optimizing)
+            .limits(limits)
+            .output(OutputContract::SelectedEnd),
+        )
+        .expect("compile plain partial preflight artifact");
+        assert!(plain.program().partial_dfa_stats().unwrap().is_some());
+        let plain_identity = plain.receipt().program_sha256;
+        let plain_bytes = plain.program().serialize().unwrap();
+        let plain_handle = prepare_exclusive(&plain_bytes);
+        let plain_haystack = vec![b'x'; 300];
+
+        // No graph accelerator changes the exact public window. A second call
+        // without a continuation also proves that the prior native local
+        // completion is settled at the start of this transaction.
+        for _ in 0..2 {
+            let mut result = sentinel_result;
+            let mut window = sentinel_window;
+            assert_eq!(
+                call_exclusive_partial_preflight(
+                    plain_handle,
+                    &plain_haystack,
+                    11,
+                    289,
+                    &mut result,
+                    &plain_identity,
+                    &mut window,
+                ),
+                STATUS_PARTIAL_PREFLIGHT_ENTER
+            );
+            assert_eq!(result, sentinel_result);
+            assert_eq!(window, FreAotRegexSearchWindowV1 { start: 11, end: 289 });
+        }
+
+        // Identity authentication precedes state mutation and both outputs
+        // remain transactional on rejection.
+        let mut wrong_identity = plain_identity;
+        wrong_identity[0] ^= 1;
+        let mut result = sentinel_result;
+        let mut window = sentinel_window;
+        assert_eq!(
+            call_exclusive_partial_preflight(
+                plain_handle,
+                &plain_haystack,
+                11,
+                289,
+                &mut result,
+                &wrong_identity,
+                &mut window,
+            ),
+            STATUS_RUNTIME_FAILURE
+        );
+        assert_eq!(result, sentinel_result);
+        assert_eq!(window, sentinel_window);
+
+        // The direct ABI remains complete below the native amortization floor.
+        assert_eq!(
+            call_exclusive_partial_preflight(
+                plain_handle,
+                &plain_haystack,
+                11,
+                42,
+                &mut result,
+                &plain_identity,
+                &mut window,
+            ),
+            STATUS_NO_MATCH
+        );
+        assert_eq!(result, FreAotRegexResultV1::default());
+        assert_eq!(window, sentinel_window);
+
+        result = sentinel_result;
+        window = sentinel_window;
+        assert_eq!(
+            call_exclusive_partial_preflight(
+                FreAotRegexExclusiveHandleV1::INVALID,
+                &plain_haystack,
+                11,
+                289,
+                &mut result,
+                &plain_identity,
+                &mut window,
+            ),
+            STATUS_INVALID_HANDLE
+        );
+        assert_eq!(result, sentinel_result);
+        assert_eq!(window, sentinel_window);
+        // SAFETY: all non-null inputs are valid and the deliberately null
+        // output is rejected before dereference.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_search_exclusive_partial_preflight_v1(
+                    plain_handle,
+                    plain_haystack.as_ptr(),
+                    plain_haystack.len(),
+                    11,
+                    289,
+                    &raw mut result,
+                    plain_identity.as_ptr(),
+                    std::ptr::null_mut(),
+                )
+            },
+            STATUS_INVALID_ARGUMENT
+        );
+        assert_eq!(result, sentinel_result);
+
+        let cut = compile(
+            CompileRequest::new(
+                r"[b-c][a-b]{1,10}7[A-Za-z]{1,2}",
+                Target::x86_64_linux(),
+            )
+            .mode(CompileMode::Optimizing)
+            .limits(limits)
+            .output(OutputContract::SelectedEnd),
+        )
+        .expect("compile cut partial preflight artifact");
+        assert!(cut.program().partial_dfa_stats().unwrap().is_some());
+        let cut_identity = cut.receipt().program_sha256;
+        let cut_bytes = cut.program().serialize().unwrap();
+        let cut_handle = prepare_exclusive(&cut_bytes);
+        let mut cut_haystack = vec![b'!'; 256 + 16];
+        cut_haystack.extend_from_slice(b"cbbbbbbbbbb7AZ");
+        result = sentinel_result;
+        window = sentinel_window;
+        assert_eq!(
+            call_exclusive_partial_preflight(
+                cut_handle,
+                &cut_haystack,
+                3,
+                cut_haystack.len(),
+                &mut result,
+                &cut_identity,
+                &mut window,
+            ),
+            STATUS_PARTIAL_PREFLIGHT_ENTER
+        );
+        assert_eq!(result, sentinel_result);
+        assert!(window.start > 3, "mandatory cut did not narrow: {window:?}");
+        assert_eq!(window.end, cut_haystack.len());
+
+        // SAFETY: both handles remain uniquely owned and no call overlaps
+        // either destruction.
+        assert_eq!(
+            unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(cut_handle) },
+            STATUS_SUCCESS
+        );
+        assert_eq!(
+            unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(plain_handle) },
+            STATUS_SUCCESS
+        );
+    }
+
+    #[test]
+    fn exclusive_partial_preflight_runs_concurrently_on_independent_sessions() {
+        let mut limits = CompileLimitsV1::default();
+        limits.determinize.max_states = 8;
+        let compiled = compile(
+            CompileRequest::new(
+                r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)",
+                Target::x86_64_linux(),
+            )
+            .mode(CompileMode::Optimizing)
+            .limits(limits)
+            .output(OutputContract::SelectedEnd),
+        )
+        .expect("compile concurrent partial preflight artifact");
+        assert!(compiled.program().partial_dfa_stats().unwrap().is_some());
+
+        let identity = compiled.receipt().program_sha256;
+        let serialized = Arc::new(compiled.program().serialize().unwrap());
+        let haystack = Arc::new(vec![b'x'; 300]);
+        let worker_count = 4_usize;
+        let barrier = Arc::new(std::sync::Barrier::new(worker_count));
+
+        // A single exclusive handle may not be used by overlapping calls.
+        // Each worker therefore creates, calls, and destroys its own session;
+        // the barrier makes the valid independent-session calls overlap.
+        std::thread::scope(|scope| {
+            for worker in 0..worker_count {
+                let serialized = Arc::clone(&serialized);
+                let haystack = Arc::clone(&haystack);
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    let handle = prepare_exclusive(&serialized);
+                    for iteration in 0..64 {
+                        let sentinel_result = FreAotRegexResultV1 {
+                            start: 1_000 + worker,
+                            end: 2_000 + iteration,
+                        };
+                        let sentinel_window = FreAotRegexSearchWindowV1 {
+                            start: 3_000 + worker,
+                            end: 4_000 + iteration,
+                        };
+                        let mut result = sentinel_result;
+                        let mut window = sentinel_window;
+                        assert_eq!(
+                            call_exclusive_partial_preflight(
+                                handle,
+                                &haystack,
+                                11,
+                                289,
+                                &mut result,
+                                &identity,
+                                &mut window,
+                            ),
+                            STATUS_PARTIAL_PREFLIGHT_ENTER
+                        );
+                        assert_eq!(result, sentinel_result);
+                        assert_eq!(
+                            window,
+                            FreAotRegexSearchWindowV1 { start: 11, end: 289 }
+                        );
+                    }
+                    // SAFETY: the worker has sole ownership of its session and
+                    // all of its synchronous calls have returned.
+                    assert_eq!(
+                        unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(handle) },
+                        STATUS_SUCCESS
+                    );
+                });
+            }
+        });
     }
 
     #[test]

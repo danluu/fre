@@ -10,6 +10,7 @@
 #define FRE_AOT_REGEX_STATUS_RUNTIME_FAILURE 3u
 #define FRE_AOT_REGEX_STATUS_HANDLE_BUSY 4u
 #define FRE_AOT_REGEX_STATUS_INVALID_HANDLE 5u
+#define FRE_AOT_REGEX_STATUS_PARTIAL_PREFLIGHT_ENTER 6u
 #define FRE_AOT_REGEX_STATUS_SUCCESS 0u
 #define FRE_AOT_REGEX_ARTIFACT_IDENTITY_BYTES 32u
 #define FRE_AOT_REGEX_PARTIAL_ENTRY_BYPASS 0u
@@ -22,6 +23,11 @@ typedef struct FreAotRegexResultV1 {
     size_t start;
     size_t end;
 } FreAotRegexResultV1;
+
+typedef struct FreAotRegexSearchWindowV1 {
+    size_t start;
+    size_t end;
+} FreAotRegexSearchWindowV1;
 
 /* Every identity-suffixed direct or runtime-backed object entry has this ABI. */
 typedef uint32_t (*FreAotRegexEntryV1)(
@@ -87,10 +93,11 @@ uint32_t fre_aot_regex_runtime_search_exclusive_v1(
     FreAotRegexResultV1 *result_ptr);
 
 /*
- * Compiler-emitted adaptive admission. A bypass must be followed immediately
- * by fre_aot_regex_runtime_search_exclusive_v1 for the same search. An entry
+ * Legacy compiler-emitted adaptive admission, retained for old-object
+ * compatibility. A bypass must be followed immediately by
+ * fre_aot_regex_runtime_search_exclusive_v1 for the same search. An entry
  * decision must be followed by either a local native result or the partial
- * continuation call below.
+ * continuation call below. New objects use the combined preflight below.
  */
 uint32_t fre_aot_regex_runtime_prepared_partial_should_enter_v1(
     FreAotRegexExclusiveHandleV1 handle,
@@ -115,6 +122,24 @@ uint32_t fre_aot_regex_runtime_search_exclusive_from_partial_v1(
     size_t resume_position,
     uint32_t pending_end_present,
     size_t pending_end);
+
+/*
+ * Authenticate one native incomplete-retained search. The helper settles the
+ * prior local native completion, runs suffix then cut, and consults adaptive
+ * admission. Status 0 or 1 initializes result_out and completes the search.
+ * FRE_AOT_REGEX_STATUS_PARTIAL_PREFLIGHT_ENTER initializes window_out with
+ * the exact window on which the native table must enter. Other statuses are
+ * errors and initialize neither output.
+ */
+uint32_t fre_aot_regex_runtime_search_exclusive_partial_preflight_v1(
+    FreAotRegexExclusiveHandleV1 handle,
+    const uint8_t *haystack_ptr,
+    size_t haystack_len,
+    size_t window_start,
+    size_t window_end,
+    FreAotRegexResultV1 *result_ptr,
+    const uint8_t expected_artifact_identity[FRE_AOT_REGEX_ARTIFACT_IDENTITY_BYTES],
+    FreAotRegexSearchWindowV1 *window_out);
 
 uint32_t fre_aot_regex_runtime_destroy_exclusive_v1(
     FreAotRegexExclusiveHandleV1 handle);

@@ -284,6 +284,19 @@ pub struct SearchWindow {
     end: usize,
 }
 
+/// Result of the authenticated runtime preflight for native incomplete
+/// retained rows.
+///
+/// A complete suffix/cut proof or an adaptive native-entry decline returns
+/// the semantic result directly. Otherwise the native table may enter on the
+/// exact possibly narrowed window without replaying either accelerator.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetainedPartialPreflight {
+    Complete(MatchResult),
+    Enter(SearchWindow),
+}
+
 impl SearchWindow {
     #[must_use]
     pub const fn new(start: usize, end: usize) -> Self {
@@ -2450,6 +2463,24 @@ impl PartialDfaRuntimeState {
         enter
     }
 
+    /// Claim a native entry after the caller has already settled the previous
+    /// entry and run the complete accelerators. Unlike the legacy two-call
+    /// admission choreography, a decline here consumes one adaptive bypass:
+    /// the combined preflight completes K0 itself instead of tail-calling the
+    /// ordinary entry to consume it.
+    fn claim_native_entry_after_accelerators(&mut self) -> bool {
+        debug_assert!(!self.native_entry_in_flight);
+        if !self.prefix_supported {
+            false
+        } else if self.bypass_remaining == 0 {
+            self.native_entry_in_flight = true;
+            true
+        } else {
+            self.bypass_remaining = self.bypass_remaining.saturating_sub(1);
+            false
+        }
+    }
+
     /// A native entry reports an interior hole through the continuation ABI.
     /// If the next admission arrives without such a report, the prior native
     /// scan necessarily completed locally and is settled as a successful
@@ -3099,13 +3130,6 @@ impl CompiledProgram {
         if self.context_dfa.is_some() || !matches!(self.engine, ProgramEngine::OrderedNfa) {
             return None;
         }
-        // Match complete retained-table publication: the prepared partial
-        // entry does not carry either whole-window NFA accelerator. Publishing
-        // it would silently replace a complete suffix/cut route with a scalar
-        // retained-row scan followed by an unaccelerated K0 continuation.
-        if self.nfa_mandatory_suffix.is_some() || self.nfa_mandatory_cut.is_some() {
-            return None;
-        }
         let dfa = self.partial_dfa()?.native_incomplete_view()?;
         let (prefix_plan, prefix_supported) =
             PartialDfaPrefixPlan::derive(self.anchored_prefix.sets());
@@ -3566,6 +3590,106 @@ impl CompiledProgram {
             window.end.saturating_sub(window.start),
         );
         Ok(found)
+    }
+
+    /// Authenticate and prepare one native incomplete-retained execution.
+    ///
+    /// The transaction mirrors the portable retained route: settle the prior
+    /// native completion, run mandatory suffix then mandatory cut, and only
+    /// then consult adaptive admission. An accelerator result or admission
+    /// decline is completed in this call. Only an admitted native scan returns
+    /// [`RetainedPartialPreflight::Enter`] with the exact narrowed window.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed invalid-window error before reading the haystack, or an
+    /// invariant/search error if the artifact identity, workspace, engine, or
+    /// retained optimization sidecar does not authenticate.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "validation, proof order, admission, and narrowed completion form one authenticated transaction"
+    )]
+    pub fn preflight_retained_partial_with_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        expected_artifact_identity: [u8; 32],
+    ) -> Result<RetainedPartialPreflight, CompileError> {
+        if window.start > window.end || window.end > haystack.len() {
+            return Err(CompileError::InvalidWindow {
+                start: window.start,
+                end: window.end,
+                haystack_len: haystack.len(),
+            });
+        }
+        if expected_artifact_identity != self.identity.artifact {
+            return Err(CompileError::InternalInvariant(
+                "retained partial preflight artifact identity does not match the prepared program",
+            ));
+        }
+        if !workspace.identity.compatible(&self.identity) {
+            return Err(CompileError::InternalInvariant(
+                "program workspace belongs to a different semantic program",
+            ));
+        }
+        if self.context_dfa.is_some() || !matches!(self.engine, ProgramEngine::OrderedNfa) {
+            return Err(CompileError::InternalInvariant(
+                "retained partial preflight requires the universal ordered-NFA engine",
+            ));
+        }
+        if self.partial_dfa().is_none() {
+            return Err(CompileError::InternalInvariant(
+                "retained partial preflight requires retained rows",
+            ));
+        }
+
+        let input_bytes = window.end.saturating_sub(window.start);
+        let ProgramWorkspace { nfa, partial, .. } = workspace;
+        let nfa = nfa.as_mut().ok_or(CompileError::InternalInvariant(
+            "retained partial preflight has no prepared K0 workspace",
+        ))?;
+        let partial_workspace = partial.as_deref_mut().ok_or(
+            CompileError::InternalInvariant(
+                "retained partial preflight has no prepared retained workspace",
+            ),
+        )?;
+
+        // This must precede every proof for the current search. A native local
+        // return has no continuation callback; reaching this transaction is
+        // the first authoritative evidence that it completed successfully.
+        partial_workspace.state.finish_unobserved_native_entry();
+
+        let narrowed = match self
+            .search_nfa_with_retained_complete_accelerators(haystack, window, nfa)?
+        {
+            NfaMandatoryCutOutcome::Complete(found) => {
+                #[cfg(test)]
+                {
+                    partial_workspace.state.complete_accelerated = partial_workspace
+                        .state
+                        .complete_accelerated
+                        .saturating_add(1);
+                }
+                return Ok(RetainedPartialPreflight::Complete(found));
+            }
+            NfaMandatoryCutOutcome::Continue(narrowed) => narrowed,
+        };
+
+        // The native entry has already enforced this floor, but preserving it
+        // here makes the authenticated helper complete when called directly
+        // and exactly matches the portable optimizing route's outer policy.
+        let enter = input_bytes >= PARTIAL_DFA_MIN_INPUT_BYTES
+            && partial_workspace
+                .state
+                .claim_native_entry_after_accelerators();
+        if enter {
+            Ok(RetainedPartialPreflight::Enter(narrowed))
+        } else {
+            self.search_nfa_unaccelerated(haystack, narrowed, nfa)
+                .map(RetainedPartialPreflight::Complete)
+        }
     }
 
     #[cfg(test)]
@@ -10965,7 +11089,7 @@ mod tests {
     }
 
     #[test]
-    fn native_partial_publication_preserves_complete_nfa_accelerators() {
+    fn native_partial_publication_carries_complete_nfa_accelerators() {
         let limits = DeterminizeLimits {
             max_states: 8,
             ..DeterminizeLimits::default()
@@ -11000,10 +11124,340 @@ mod tests {
             assert_eq!(compiled.nfa_mandatory_suffix.is_some(), expect_suffix);
             assert_eq!(compiled.nfa_mandatory_cut.is_some(), !expect_suffix);
             assert!(
-                compiled.native_partial_dfa_view().is_none(),
-                "native publication replaced a complete NFA accelerator: {pattern:?}"
+                compiled.native_partial_dfa_view().is_some(),
+                "combined preflight did not carry a complete NFA accelerator: {pattern:?}"
             );
         }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "every output, generated tail, and long search window participates in one preflight composition proof"
+    )]
+    fn retained_partial_preflight_matches_every_generated_output_and_window() {
+        let limits = DeterminizeLimits {
+            max_states: 8,
+            ..DeterminizeLimits::default()
+        };
+        let cases = [
+            (
+                "suffix",
+                r"(?-u:[\x00-\xFF])*(?:a+Q|[b-c][a-b]{1,5}(?:x+|y+))Z",
+                true,
+            ),
+            (
+                "cut",
+                r"[b-c][a-b]{1,10}7[A-Za-z]{1,2}",
+                false,
+            ),
+        ];
+        let tails = generated_byte_strings(b"abcxyQ7AZ", 2);
+
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            for (name, pattern, suffix) in cases {
+                let limited = program(pattern, output, CompileMode::Optimizing, limits);
+                assert!(limited.partial_dfa().is_some(), "{name}/{output:?}");
+                assert_eq!(
+                    limited.nfa_mandatory_suffix.is_some(),
+                    suffix,
+                    "{name}/{output:?}"
+                );
+                assert!(
+                    suffix || limited.nfa_mandatory_cut.is_some(),
+                    "{name}/{output:?}"
+                );
+                let reference = program(
+                    pattern,
+                    output,
+                    CompileMode::Fast,
+                    DeterminizeLimits::default(),
+                );
+                let mut enters = 0_usize;
+                let mut completes = 0_usize;
+
+                for tail in &tails {
+                    let mut haystack = vec![b'!'; PARTIAL_DFA_MIN_INPUT_BYTES];
+                    haystack.extend_from_slice(tail);
+                    for start in 0..=tail.len().min(2) {
+                        for end in PARTIAL_DFA_MIN_INPUT_BYTES..=haystack.len() {
+                            if end.saturating_sub(start) < PARTIAL_DFA_MIN_INPUT_BYTES {
+                                continue;
+                            }
+                            let window = SearchWindow::new(start, end);
+                            let expected = reference.search(&haystack, window).unwrap();
+
+                            let mut proof_workspace = limited.prepare_workspace().unwrap();
+                            let direct = limited
+                                .search_nfa_with_retained_complete_accelerators(
+                                    &haystack,
+                                    window,
+                                    proof_workspace.nfa.as_mut().unwrap(),
+                                )
+                                .unwrap();
+                            let mut preflight_workspace = limited.prepare_workspace().unwrap();
+                            let outcome = limited
+                                .preflight_retained_partial_with_workspace(
+                                    &haystack,
+                                    window,
+                                    &mut preflight_workspace,
+                                    limited.artifact_identity(),
+                                )
+                                .unwrap();
+
+                            match (direct, outcome) {
+                                (
+                                    NfaMandatoryCutOutcome::Complete(proved),
+                                    RetainedPartialPreflight::Complete(found),
+                                ) => {
+                                    assert_eq!(found, proved, "{name}/{output:?}/{window:?}");
+                                    assert_eq!(found, expected, "{name}/{output:?}/{window:?}");
+                                    completes = completes.saturating_add(1);
+                                }
+                                (
+                                    NfaMandatoryCutOutcome::Continue(narrowed),
+                                    RetainedPartialPreflight::Enter(actual),
+                                ) => {
+                                    assert_eq!(actual, narrowed, "{name}/{output:?}/{window:?}");
+                                    assert!(actual.start >= window.start);
+                                    assert!(actual.end <= window.end);
+
+                                    // This is the portable model of the native
+                                    // row loop: continue on the exact returned
+                                    // window without replaying suffix or cut.
+                                    let partial = limited.partial_dfa().unwrap();
+                                    let mut continued = limited.prepare_workspace().unwrap();
+                                    let ProgramWorkspace { nfa, partial: state, .. } =
+                                        &mut continued;
+                                    let state = state.as_deref_mut().unwrap();
+                                    let found = limited
+                                        .search_nfa_with_partial_dfa(
+                                            partial,
+                                            &haystack,
+                                            actual,
+                                            nfa.as_mut().unwrap(),
+                                            &mut state.resume,
+                                            &mut state.state,
+                                        )
+                                        .unwrap()
+                                        .expect("fresh retained route must decide or resume K0");
+                                    assert_eq!(found, expected, "{name}/{output:?}/{window:?}");
+                                    enters = enters.saturating_add(1);
+                                }
+                                pair => panic!(
+                                    "preflight disagreed with suffix/cut proof for {name}/{output:?}/{window:?}: {pair:?}"
+                                ),
+                            }
+                        }
+                    }
+                }
+                assert!(completes > 0, "no complete proof: {name}/{output:?}");
+                if !suffix {
+                    assert!(enters > 0, "cut never admitted rows: {name}/{output:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn combined_preflight_settles_then_accelerates_then_consumes_admission() {
+        let limits = DeterminizeLimits {
+            max_states: 8,
+            ..DeterminizeLimits::default()
+        };
+        let suffix = program(
+            r"(?-u:[\x00-\xFF])*(?:a+Q|[b-c][a-b]{1,5}(?:x+|y+))Z",
+            OutputContract::SelectedEnd,
+            CompileMode::Optimizing,
+            limits,
+        );
+        let absent = vec![b'x'; PARTIAL_DFA_MIN_INPUT_BYTES + 17];
+        let window = SearchWindow::full(&absent);
+
+        // A previous local native return is settled before the current
+        // suffix proof. If settlement happened only at admission, this
+        // complete suffix result would leave the old backoff intact.
+        let mut prior = suffix.prepare_workspace().unwrap();
+        {
+            let state = &mut prior.partial.as_deref_mut().unwrap().state;
+            state.native_entry_in_flight = true;
+            state.consecutive_fallbacks = 2;
+            state.bypass_remaining = 16;
+        }
+        assert_eq!(
+            suffix
+                .preflight_retained_partial_with_workspace(
+                    &absent,
+                    window,
+                    &mut prior,
+                    suffix.artifact_identity(),
+                )
+                .unwrap(),
+            RetainedPartialPreflight::Complete(MatchResult::SelectedEnd(None))
+        );
+        let state = &prior.partial.as_deref().unwrap().state;
+        assert!(!state.native_entry_in_flight);
+        assert_eq!(state.consecutive_fallbacks, 0);
+        assert_eq!(state.bypass_remaining, 0);
+
+        // A complete accelerator precedes current admission and therefore
+        // cannot consume a current adaptive bypass.
+        let mut accelerated = suffix.prepare_workspace().unwrap();
+        accelerated
+            .partial
+            .as_deref_mut()
+            .unwrap()
+            .state
+            .bypass_remaining = 16;
+        assert!(matches!(
+            suffix
+                .preflight_retained_partial_with_workspace(
+                    &absent,
+                    window,
+                    &mut accelerated,
+                    suffix.artifact_identity(),
+                )
+                .unwrap(),
+            RetainedPartialPreflight::Complete(_)
+        ));
+        assert_eq!(
+            accelerated
+                .partial
+                .as_deref()
+                .unwrap()
+                .state
+                .bypass_remaining,
+            16
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "finite-cut selection, adaptive decline, authenticated resume, and narrowed accounting are one ordered transaction"
+    )]
+    fn combined_preflight_declines_inside_narrowed_window_and_accounts_from_it() {
+        let pattern = r"[b-c][a-b]{1,10}7[A-Za-z]{1,2}";
+        let witness_start = PARTIAL_DFA_MIN_INPUT_BYTES + 16;
+        let mut haystack = vec![b'!'; witness_start];
+        haystack.extend_from_slice(b"cbbbbbbbbbb7AZ");
+        let original = SearchWindow::new(3, haystack.len());
+
+        let (limited, narrowed, resume) = (2..=128)
+            .find_map(|max_states| {
+                let candidate = program(
+                    pattern,
+                    OutputContract::SelectedEnd,
+                    CompileMode::Optimizing,
+                    DeterminizeLimits {
+                        max_states,
+                        ..DeterminizeLimits::default()
+                    },
+                );
+                let NfaMandatoryCutOutcome::Continue(narrowed) =
+                    candidate.search_nfa_with_mandatory_cut(&haystack, original)
+                else {
+                    return None;
+                };
+                if narrowed.start <= original.start {
+                    return None;
+                }
+                let partial = candidate.partial_dfa()?;
+                let (prefix_plan, supported) =
+                    PartialDfaPrefixPlan::derive(candidate.anchored_prefix.sets());
+                if !supported {
+                    return None;
+                }
+                let PartialDfaResult::Resume(resume) = partial
+                    .selected_end(
+                        &haystack,
+                        narrowed.start,
+                        narrowed.end,
+                        candidate.anchored_prefix.sets(),
+                        prefix_plan,
+                    )
+                    .ok()?
+                else {
+                    return None;
+                };
+                let consumed = resume.position.saturating_sub(narrowed.start);
+                (consumed <= 16 && resume.position < narrowed.end)
+                    .then_some((candidate, narrowed, resume))
+            })
+            .expect("finite cut with a shallow retained hole");
+        assert!(resume.position.saturating_sub(original.start) > 16);
+        let expected = program(
+            pattern,
+            OutputContract::SelectedEnd,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        )
+        .search(&haystack, original)
+        .unwrap();
+
+        // A declined probe consumes one bypass and completes unaccelerated K0
+        // from `narrowed` inside the helper. No native claim remains pending.
+        let mut declined = limited.prepare_workspace().unwrap();
+        declined
+            .partial
+            .as_deref_mut()
+            .unwrap()
+            .state
+            .bypass_remaining = 2;
+        assert_eq!(
+            limited
+                .preflight_retained_partial_with_workspace(
+                    &haystack,
+                    original,
+                    &mut declined,
+                    limited.artifact_identity(),
+                )
+                .unwrap(),
+            RetainedPartialPreflight::Complete(expected)
+        );
+        let state = &declined.partial.as_deref().unwrap().state;
+        assert_eq!(state.bypass_remaining, 1);
+        assert!(!state.native_entry_in_flight);
+
+        // Two authenticated shallow holes are measured from the returned cut
+        // window, not from the much earlier public window. That must engage
+        // the shallow-exit backoff.
+        let mut resumed = limited.prepare_workspace().unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                limited
+                    .preflight_retained_partial_with_workspace(
+                        &haystack,
+                        original,
+                        &mut resumed,
+                        limited.artifact_identity(),
+                    )
+                    .unwrap(),
+                RetainedPartialPreflight::Enter(narrowed)
+            );
+            assert_eq!(
+                limited
+                    .search_from_retained_partial_resume_with_workspace(
+                        &haystack,
+                        narrowed,
+                        &mut resumed,
+                        limited.artifact_identity(),
+                        resume.state,
+                        resume.position,
+                        resume.pending_end,
+                    )
+                    .unwrap(),
+                expected
+            );
+        }
+        let state = &resumed.partial.as_deref().unwrap().state;
+        assert_eq!(state.consecutive_fallbacks, 2);
+        assert_eq!(state.bypass_remaining, 16);
+        assert!(!state.native_entry_in_flight);
     }
 
     #[test]

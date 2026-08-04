@@ -51,7 +51,7 @@ pub use program::{
     AnchoredPrefixStats, CompiledProgram, ContextDeterminizationReport, EngineKind,
     EngineSelectionReason, MAX_ANCHORED_PREFIX_BYTES, MAX_SERIALIZED_PROGRAM_BYTES, MatchResult,
     OutputContract, PROGRAM_HEADER_LEN, PartialDfaStats, ProgramFormatError, ProgramStats,
-    ProgramWorkspace, SearchWindow,
+    ProgramWorkspace, RetainedPartialPreflight, SearchWindow,
 };
 
 /// Stable compiler pipeline identity.
