@@ -448,8 +448,9 @@ enum Aarch64MixedVectorPreference {
 /// only after the current primary route proves that its shape has an SVE
 /// lowering. Supported mixed routes select ASIMD at runtime when `CNTB` is 16
 /// and scalable SVE above that width. Unsupported SVE route shapes fall
-/// through to ASIMD, while suffix and loop accelerators make their independent
-/// graph-derived ASIMD choices.
+/// through to ASIMD. Suffix accelerators apply the same policy independently
+/// after proving their own graph-derived scalable route; loop accelerators
+/// retain their independent ASIMD choice.
 ///
 /// Keeping the preference as one private switch also permits source-identical
 /// native A/B qualification without consulting pattern names or input data.
@@ -2558,6 +2559,7 @@ fn lower_native_dfa_with_entry_contract(
         return Ok(None);
     }
     let sve_filter_plan = install_aarch64_sve_filter_plan(&mut data, layout, target)?;
+    let sve_suffix_kind = install_aarch64_sve_suffix_kind(&mut data, layout, target)?;
     if entry_contract == NativeDfaEntryContract::PreparedPartialCore && layout.partial.is_none() {
         return Err(ObjectError::InvalidModule(
             "trusted prepared core has no partial continuation layout",
@@ -2572,21 +2574,14 @@ fn lower_native_dfa_with_entry_contract(
                 lower_x86_64_dfa_with_entry_contract(layout, target.features, entry_contract)?
             }
         },
-        Architecture::Aarch64 => match entry_contract {
-            NativeDfaEntryContract::Public => lower_aarch64_dfa_for_operating_system_with_emission(
-                layout,
-                target.features,
-                target.operating_system,
-                sve_filter_plan,
-            )?,
-            NativeDfaEntryContract::PreparedPartialCore => lower_aarch64_dfa_with_entry_contract(
-                layout,
-                target.features,
-                target.operating_system,
-                sve_filter_plan,
-                entry_contract,
-            )?,
-        },
+        Architecture::Aarch64 => lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
+            layout,
+            target.features,
+            target.operating_system,
+            sve_filter_plan,
+            sve_suffix_kind,
+            entry_contract,
+        )?,
     };
     // Scalar exact-set emitters remain available for backend correctness and
     // cross-target inspection, but publishing a moving no-row product through
@@ -2624,8 +2619,13 @@ fn lower_native_dfa_with_entry_contract(
     {
         return Ok(None);
     }
-    let start_accelerator =
-        selected_start_accelerator(layout, target, sve_filter_plan, emission.scanner);
+    let start_accelerator = selected_start_accelerator(
+        layout,
+        target,
+        sve_filter_plan,
+        sve_suffix_kind,
+        emission.scanner,
+    );
     Ok(Some(NativeLowering {
         code: emission.code,
         data,
@@ -2743,6 +2743,7 @@ fn selected_start_accelerator(
     layout: NativeDfaLayout,
     target: Target,
     sve_filter_plan: Option<Aarch64SveFilterPlan>,
+    sve_suffix_kind: Option<Aarch64SveFilterKind>,
     scanner_emission: Option<NativeScannerEmission>,
 ) -> StartAccelerator {
     if let Some(emission) = scanner_emission {
@@ -2774,14 +2775,12 @@ fn selected_start_accelerator(
                 } else {
                     StartAccelerator::Aarch64Sve
                 }
-            } else if selected_aarch64_sve_suffix_kind(
-                layout,
-                target.features,
-                target.operating_system,
-            )
-            .is_some()
-            {
-                StartAccelerator::Aarch64Sve
+            } else if let Some(sve_suffix_kind) = sve_suffix_kind {
+                if matches!(sve_suffix_kind, Aarch64SveFilterKind::Sve2 { .. }) {
+                    StartAccelerator::Aarch64Sve2
+                } else {
+                    StartAccelerator::Aarch64Sve
+                }
             } else if target.features.has(CpuFeature::Aarch64Asimd) {
                 StartAccelerator::Aarch64Asimd
             } else {
@@ -2798,12 +2797,85 @@ fn selected_aarch64_sve_suffix_kind(
 ) -> Option<Aarch64SveFilterKind> {
     (operating_system == OperatingSystem::Linux
         && features.has(CpuFeature::Aarch64Sve)
-        && !features.has(CpuFeature::Aarch64Asimd)
         && layout.seeded_reverse.is_none()
         && layout
             .suffix_filter
             .is_some_and(|suffix| aarch64_base_sve_filter_supported(suffix.filter)))
     .then_some(Aarch64SveFilterKind::Sve)
+}
+
+fn install_aarch64_sve_suffix_kind(
+    data: &mut Vec<u8>,
+    layout: NativeDfaLayout,
+    target: Target,
+) -> Result<Option<Aarch64SveFilterKind>, ObjectError> {
+    let maximum_table_bytes = usize::try_from(i32::MAX)
+        .map_err(|_| ObjectError::ArithmeticOverflow("SVE2 suffix table address limit"))?;
+    install_aarch64_sve_suffix_kind_with_limit(data, layout, target, maximum_table_bytes)
+}
+
+fn install_aarch64_sve_suffix_kind_with_limit(
+    data: &mut Vec<u8>,
+    layout: NativeDfaLayout,
+    target: Target,
+    maximum_table_bytes: usize,
+) -> Result<Option<Aarch64SveFilterKind>, ObjectError> {
+    if target.architecture != Architecture::Aarch64 {
+        return Ok(None);
+    }
+    let Some(base_kind) = selected_aarch64_sve_suffix_kind(
+        layout,
+        target.features,
+        target.operating_system,
+    ) else {
+        return Ok(None);
+    };
+    let filter = layout
+        .suffix_filter
+        .ok_or(ObjectError::InvalidModule("SVE suffix plan has no filter"))?
+        .filter;
+    if !target.features.has(CpuFeature::Aarch64Sve2) || !filter.is_exact() {
+        return Ok(Some(base_kind));
+    }
+
+    // MATCH consumes the same exact singleton representation already proved
+    // by the graph selector. Reserve the whole repeated table transactionally;
+    // allocation or address-limit pressure falls back to the exact base-SVE
+    // lowering without changing the program data.
+    let aligned = data
+        .len()
+        .checked_add(15)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "SVE2 suffix match-table alignment",
+        ))?
+        & !15;
+    let total = aligned
+        .checked_add(16)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "SVE2 suffix match-table bytes",
+        ))?;
+    if total > maximum_table_bytes {
+        return Ok(Some(base_kind));
+    }
+    let additional = total
+        .checked_sub(data.len())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "SVE2 suffix table reservation",
+        ))?;
+    if data.try_reserve_exact(additional).is_err() {
+        return Ok(Some(base_kind));
+    }
+    let match_table_offset = u32::try_from(aligned)
+        .map_err(|_| ObjectError::ArithmeticOverflow("SVE2 suffix match-table offset"))?;
+    data.resize(aligned, 0);
+    for index in 0..16_usize {
+        let range = filter
+            .ranges()
+            .get(index % filter.ranges().len())
+            .ok_or(ObjectError::InvalidModule("empty SVE2 suffix match table"))?;
+        data.push(range.start);
+    }
+    Ok(Some(Aarch64SveFilterKind::Sve2 { match_table_offset }))
 }
 
 fn install_aarch64_sve_filter_plan(
@@ -12739,6 +12811,7 @@ fn aarch64_emit_sve_start_filter_scanner(
     maximum_scan_offset: u8,
     kind: Aarch64SveFilterKind,
     rematerialize_filter_setup: bool,
+    vector_length_is_precomputed: bool,
     vector: Aarch64Label,
     scalar: Aarch64Label,
     candidate: Aarch64Label,
@@ -12772,7 +12845,9 @@ fn aarch64_emit_sve_start_filter_scanner(
         aarch64_emit_sve_filter_setup(assembler, filter, kind, 0)?;
     }
     assembler.instruction(aarch64_sve_ptrue_b())?;
-    assembler.instruction(aarch64_sve_cntb(6)?)?;
+    if !vector_length_is_precomputed {
+        assembler.instruction(aarch64_sve_cntb(6)?)?;
+    }
 
     if let Some((maximum_vector_bytes, batch, batch_hit, batch_hits)) = batch_plan {
         let batch_vectors = u8::try_from(AARCH64_SVE_BATCH_VECTORS)
@@ -13890,11 +13965,7 @@ fn aarch64_emit_suffix_prepass(
     matched: Aarch64Label,
 ) -> Result<(), ObjectError> {
     let use_sve = sve_kind.is_some();
-    if use_sve && use_asimd {
-        return Err(ObjectError::InvalidModule(
-            "AArch64 suffix filter selected both SVE and ASIMD",
-        ));
-    }
+    let use_runtime_vl_dispatch = use_sve && use_asimd;
     if let Some(reverse) = layout.seeded_reverse {
         return module_seeded_reverse_aarch64::aarch64_emit_seeded_reverse_prepass(
             assembler,
@@ -13924,6 +13995,22 @@ fn aarch64_emit_suffix_prepass(
     } else {
         None
     };
+    let mixed_asimd_setup = if use_runtime_vl_dispatch {
+        Some(assembler.label()?)
+    } else {
+        None
+    };
+    let mixed_sve_setup = if use_runtime_vl_dispatch {
+        Some(assembler.label()?)
+    } else {
+        None
+    };
+    let mixed_retry = if use_runtime_vl_dispatch {
+        Some(assembler.label()?)
+    } else {
+        None
+    };
+    let retry_scan = mixed_retry.unwrap_or_else(|| sve_vector.unwrap_or(vector));
     let filter = suffix.filter;
     let scalar_filter = suffix.vector_filter.or(suffix.scalar_filter);
     let maximum_scan_offset =
@@ -13955,14 +14042,34 @@ fn aarch64_emit_suffix_prepass(
         }
         Ok(())
     };
-    if !ENABLE_DEFERRED_SUFFIX_FILTER_CONSTANTS {
+    if !ENABLE_DEFERRED_SUFFIX_FILTER_CONSTANTS && !use_runtime_vl_dispatch {
         emit_constants(assembler)?;
     }
     assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
     assembler.instruction(aarch64_cmp_x_imm(12, SUFFIX_PREFILTER_MIN_WINDOW_BYTES)?)?;
     assembler.branch_cond(AARCH64_LO, done)?;
-    if ENABLE_DEFERRED_SUFFIX_FILTER_CONSTANTS {
+    if ENABLE_DEFERRED_SUFFIX_FILTER_CONSTANTS && !use_runtime_vl_dispatch {
         emit_constants(assembler)?;
+    }
+
+    if use_runtime_vl_dispatch {
+        // X16 is caller-saved, untouched by the suffix scalar verifier and
+        // bounded retry, and live only until this prepass returns. Retaining
+        // CNTB here lets every retry choose the same ISA without repeating a
+        // candidate scan or rematerializing either aliased V/Z constant bank.
+        assembler.instruction(aarch64_sve_cntb(16)?)?;
+        assembler.instruction(aarch64_cmp_x_imm(16, 16)?)?;
+        assembler.branch_cond(
+            AARCH64_LS,
+            mixed_asimd_setup.ok_or(ObjectError::InvalidModule(
+                "mixed suffix ASIMD setup is absent",
+            ))?,
+        )?;
+        if mixed_sve_setup.is_none() {
+            return Err(ObjectError::InvalidModule(
+                "mixed suffix SVE setup is absent",
+            ));
+        }
     }
 
     if let Some(sve_vector) = sve_vector {
@@ -13971,16 +14078,22 @@ fn aarch64_emit_suffix_prepass(
         let sve_kind = sve_kind.ok_or(ObjectError::InvalidModule(
             "AArch64 SVE suffix scanner has no filter kind",
         ))?;
-        // SVE and ASIMD suffix scanners are mutually exclusive above. The
-        // scalar verifier cannot clobber Z16..Z23, so materialize this stable
-        // primary filter once and let retry edges skip the setup.
+        if let Some(mixed_sve_setup) = mixed_sve_setup {
+            assembler.bind(mixed_sve_setup)?;
+        }
+        // Each runtime route materializes only its own constants. The scalar
+        // verifier cannot clobber Z16..Z23, so retry edges skip this setup.
         aarch64_emit_sve_filter_setup(assembler, filter, sve_kind, 0)?;
+        if use_runtime_vl_dispatch {
+            assembler.instruction(aarch64_mov_x(6, 16)?)?;
+        }
         aarch64_emit_sve_start_filter_scanner(
             assembler,
             filter,
             maximum_scan_offset,
             sve_kind,
             false,
+            use_runtime_vl_dispatch,
             sve_vector,
             scalar,
             sve_candidate,
@@ -13994,10 +14107,14 @@ fn aarch64_emit_suffix_prepass(
         assembler.branch(apply)?;
         assembler.bind(sve_reject)?;
         assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
-        assembler.branch(sve_vector)?;
+        assembler.branch(retry_scan)?;
     }
 
     if use_asimd {
+        if let Some(mixed_asimd_setup) = mixed_asimd_setup {
+            assembler.bind(mixed_asimd_setup)?;
+            emit_constants(assembler)?;
+        }
         assembler.bind(vector)?;
         assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
         if use_asimd_batch {
@@ -14140,6 +14257,18 @@ fn aarch64_emit_suffix_prepass(
         assembler.branch(scalar)?;
     }
 
+    if let Some(mixed_retry) = mixed_retry {
+        assembler.bind(mixed_retry)?;
+        assembler.instruction(aarch64_cmp_x_imm(16, 16)?)?;
+        assembler.branch_cond(AARCH64_LS, vector)?;
+        // Bounded DFA verification uses W6 for row tokens. Restore the
+        // retained VL before re-entering the scalable scanner.
+        assembler.instruction(aarch64_mov_x(6, 16)?)?;
+        assembler.branch(sve_vector.ok_or(ObjectError::InvalidModule(
+            "mixed suffix retry has no SVE scanner",
+        ))?)?;
+    }
+
     assembler.bind(scalar)?;
     aarch64_emit_start_filter_scalar_bound(assembler, maximum_scan_offset, no_match)?;
     aarch64_emit_start_filter_scalar_load(assembler, filter.scan_offset)?;
@@ -14171,7 +14300,7 @@ fn aarch64_emit_suffix_prepass(
         assembler.branch(apply)?;
         assembler.bind(scalar_reject)?;
         assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
-        assembler.branch(sve_vector.unwrap_or(vector))?;
+        assembler.branch(retry_scan)?;
     } else {
         assembler.bind(scalar_columns)?;
         assembler.branch(apply)?;
@@ -14185,7 +14314,7 @@ fn aarch64_emit_suffix_prepass(
             assembler,
             layout,
             retry,
-            sve_vector.unwrap_or(vector),
+            retry_scan,
             no_match,
             matched,
         )?;
@@ -14239,17 +14368,21 @@ fn lower_aarch64_dfa_for_operating_system(
     clippy::too_many_lines,
     reason = "the specialized forward/reverse control-flow graph is kept contiguous for auditing"
 )]
+#[cfg(test)]
 fn lower_aarch64_dfa_for_operating_system_with_emission(
     layout: NativeDfaLayout,
     features: FeatureSet,
     operating_system: OperatingSystem,
     sve_filter_plan: Option<Aarch64SveFilterPlan>,
 ) -> Result<NativeDfaEmission, ObjectError> {
-    lower_aarch64_dfa_with_entry_contract(
+    let sve_suffix_kind =
+        selected_aarch64_sve_suffix_kind(layout, features, operating_system);
+    lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
         layout,
         features,
         operating_system,
         sve_filter_plan,
+        sve_suffix_kind,
         NativeDfaEntryContract::Public,
     )
 }
@@ -14259,11 +14392,12 @@ fn lower_aarch64_dfa_for_operating_system_with_emission(
     clippy::too_many_lines,
     reason = "the specialized forward/reverse control-flow graph is kept contiguous for auditing"
 )]
-fn lower_aarch64_dfa_with_entry_contract(
+fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     layout: NativeDfaLayout,
     features: FeatureSet,
     operating_system: OperatingSystem,
     sve_filter_plan: Option<Aarch64SveFilterPlan>,
+    sve_suffix_kind: Option<Aarch64SveFilterKind>,
     entry_contract: NativeDfaEntryContract,
 ) -> Result<NativeDfaEmission, ObjectError> {
     if layout.start_filter.is_some() && layout.exact_start_byte_set.is_some()
@@ -14362,7 +14496,13 @@ fn lower_aarch64_dfa_with_entry_contract(
             selected_aarch64_exact_sve_kind(operating_system, features, storage)
         });
     let mut scanner_emission = None;
-    let sve_suffix_kind = selected_aarch64_sve_suffix_kind(layout, features, operating_system);
+    if sve_suffix_kind.is_some()
+        && selected_aarch64_sve_suffix_kind(layout, features, operating_system).is_none()
+    {
+        return Err(ObjectError::InvalidModule(
+            "installed AArch64 SVE suffix plan is unsupported",
+        ));
+    }
     let use_asimd_suffix = features.has(CpuFeature::Aarch64Asimd)
         && layout
             .suffix_filter
@@ -14627,6 +14767,7 @@ fn lower_aarch64_dfa_with_entry_contract(
                         maximum_scan_offset,
                         sve_filter_plan.primary(),
                         !retain_sve_filter_setup,
+                        false,
                         filter_sve,
                         filter_scalar,
                         filter_sve_candidate,
@@ -24066,6 +24207,7 @@ mod tests {
     fn pure_sve_suffix_only_receipt_names_the_emitted_scanner() {
         let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
         for features in [sve, sve.with(CpuFeature::Aarch64Sve2)] {
+            let uses_sve2 = features.has(CpuFeature::Aarch64Sve2);
             let target = Target::aarch64_linux().with_features(features).unwrap();
             let compiled = compile(
                 CompileRequest::new("(?s:.+?)z", target)
@@ -24089,7 +24231,11 @@ mod tests {
             );
             assert_eq!(
                 compiled.module().start_accelerator(),
-                StartAccelerator::Aarch64Sve,
+                if uses_sve2 {
+                    StartAccelerator::Aarch64Sve2
+                } else {
+                    StartAccelerator::Aarch64Sve
+                },
                 "the receipt must report the strongest scanner actually emitted"
             );
             let words = compiled.module().sections()[TEXT_SECTION]
@@ -24102,8 +24248,8 @@ mod tests {
                     .iter()
                     .filter(|&&word| word == aarch64_sve_ptrue_b())
                     .count(),
-                1,
-                "the suffix-only route must contain exactly one SVE scanner"
+                if uses_sve2 { 2 } else { 1 },
+                "MATCH setup and the suffix scanner must each establish only their required predicate"
             );
             assert_eq!(
                 words
@@ -24113,7 +24259,305 @@ mod tests {
                 1,
                 "the suffix scanner must hoist exactly one runtime-VL query"
             );
+            assert_eq!(
+                words.contains(&aarch64_sve2_match_b(1, 0, 16).unwrap()),
+                uses_sve2,
+                "SVE2 MATCH is reserved for the installed exact suffix table"
+            );
         }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one structural test audits both arms and every retry edge of the mixed-VL suffix CFG"
+    )]
+    fn mixed_vl_suffix_dispatches_vl16_to_asimd_and_wider_vl_to_sve() {
+        fn conditional_branch_target(words: &[u32], index: usize) -> usize {
+            let word = words[index];
+            assert_eq!(word & 0xff00_0010, 0x5400_0000, "expected B.cond");
+            let immediate = (((word >> 5) & 0x7_ffff) << 13).cast_signed() >> 13;
+            usize::try_from(
+                i32::try_from(index)
+                    .unwrap()
+                    .checked_add(immediate)
+                    .expect("conditional branch target arithmetic"),
+            )
+                .expect("in-section conditional branch target")
+        }
+
+        fn unconditional_branch_target(words: &[u32], index: usize) -> usize {
+            let word = words[index];
+            assert_eq!(word & 0xfc00_0000, 0x1400_0000, "expected B");
+            let immediate = ((word & 0x03ff_ffff) << 6).cast_signed() >> 6;
+            usize::try_from(
+                i32::try_from(index)
+                    .unwrap()
+                    .checked_add(immediate)
+                    .expect("unconditional branch target arithmetic"),
+            )
+                .expect("in-section unconditional branch target")
+        }
+
+        let asimd = FeatureSet::of(CpuFeature::Aarch64Asimd);
+        let mixed_sve = asimd.with(CpuFeature::Aarch64Sve);
+        let mixed_sve2 = mixed_sve.with(CpuFeature::Aarch64Sve2);
+        let compile_suffix = |pattern, features| {
+            compile(
+                CompileRequest::new(
+                    pattern,
+                    Target::aarch64_linux().with_features(features).unwrap(),
+                )
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span),
+            )
+            .unwrap()
+        };
+
+        for (pattern, features, expected_accelerator, setup_word, scalable_membership) in [
+            (
+                "(?s:.+?)z",
+                mixed_sve,
+                StartAccelerator::Aarch64Sve,
+                aarch64_sve_dup_b_imm(16, b'z').unwrap(),
+                aarch64_sve_cmpeq_b(1, 0, 16).unwrap(),
+            ),
+            (
+                "(?s:.+?)z",
+                mixed_sve2,
+                StartAccelerator::Aarch64Sve2,
+                aarch64_sve_ptrue_b(),
+                aarch64_sve2_match_b(1, 0, 16).unwrap(),
+            ),
+            (
+                "(?s:.+?)[3-7]",
+                mixed_sve2,
+                StartAccelerator::Aarch64Sve,
+                aarch64_sve_dup_b_imm(16, b'3').unwrap(),
+                aarch64_sve_cmphs_b(1, 0, 16).unwrap(),
+            ),
+        ] {
+            let compiled = compile_suffix(pattern, features);
+            let layout = build_native_dfa_table_for_architecture(
+                compiled.program().native_dfa_view().unwrap(),
+                Architecture::Aarch64,
+            )
+            .unwrap()
+            .1;
+            assert!(layout.start_filter.is_none(), "suffix-only structural case");
+            let suffix = layout.suffix_filter.expect("mandatory suffix filter");
+            assert!(layout.seeded_reverse.is_none());
+            assert_eq!(
+                compiled.module().start_accelerator(),
+                expected_accelerator
+            );
+            let words = compiled.module().sections()[TEXT_SECTION]
+                .bytes()
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+
+            let dispatch = words
+                .windows(3)
+                .position(|window| {
+                    window[0] == aarch64_sve_cntb(16).unwrap()
+                        && window[1] == aarch64_cmp_x_imm(16, 16).unwrap()
+                        && window[2] & 0xff00_001f == 0x5400_0009
+                })
+                .expect("mixed suffix initial VL dispatch");
+            assert_eq!(
+                words
+                    .iter()
+                    .filter(|&&word| word == aarch64_sve_cntb(16).unwrap())
+                    .count(),
+                1,
+                "CNTB must be outside both steady-state loops"
+            );
+            assert_eq!(
+                words
+                    .iter()
+                    .filter(|&&word| word == aarch64_sve_cntb(6).unwrap())
+                    .count(),
+                0,
+                "the wider suffix arm must consume the retained VL"
+            );
+            let asimd_setup = conditional_branch_target(&words, dispatch + 2);
+            let sve_setup = dispatch + 3;
+            assert_eq!(
+                words[asimd_setup],
+                aarch64_movi_16b(16, suffix.filter.ranges()[0].start).unwrap(),
+                "VL16 must enter route-local ASIMD constant setup"
+            );
+            assert_eq!(
+                words[sve_setup], setup_word,
+                "wider VL must enter route-local scalable setup"
+            );
+            assert!(words.contains(&aarch64_load_q(0, 12).unwrap()));
+            assert!(words.contains(&aarch64_sve_ld1b_vl(0, 12, 0).unwrap()));
+            assert!(words.contains(&scalable_membership));
+            assert_eq!(
+                words.contains(&aarch64_sve2_match_b(1, 0, 16).unwrap()),
+                expected_accelerator == StartAccelerator::Aarch64Sve2,
+                "only an installed exact representation may use SVE2 MATCH"
+            );
+            let maximum_scan_offset = suffix
+                .vector_filter
+                .or(suffix.scalar_filter)
+                .map_or(suffix.filter.scan_offset, NativeVectorFilter::max_scan_offset);
+            let partial_end = if maximum_scan_offset == 0 { 3 } else { 12 };
+            assert!(
+                words.contains(&aarch64_sve_whilelo_b(0, 2, partial_end).unwrap()),
+                "wider-VL suffix must retain its predicated tail"
+            );
+
+            let retry = words
+                .windows(4)
+                .enumerate()
+                .find_map(|(index, window)| {
+                    (index != dispatch
+                        && window[0] == aarch64_cmp_x_imm(16, 16).unwrap()
+                        && window[1] & 0xff00_001f == 0x5400_0009
+                        && window[2] == aarch64_mov_x(6, 16).unwrap()
+                        && window[3] & 0xfc00_0000 == 0x1400_0000)
+                        .then_some(index)
+                })
+                .expect("mixed suffix retry dispatch");
+            let asimd_retry = conditional_branch_target(&words, retry + 1);
+            let sve_retry = unconditional_branch_target(&words, retry + 3);
+            assert_eq!(words[asimd_retry], aarch64_sub_x_reg(12, 3, 2).unwrap());
+            assert_eq!(words[sve_retry], aarch64_sve_ptrue_b());
+        }
+
+        let exact = compile_suffix("(?s:.+?)z", mixed_sve2);
+        let (mut data, layout) = build_native_dfa_table_for_architecture(
+            exact.program().native_dfa_view().unwrap(),
+            Architecture::Aarch64,
+        )
+        .unwrap();
+        let original = data.clone();
+        let limit = data.len();
+        assert_eq!(
+            install_aarch64_sve_suffix_kind_with_limit(
+                &mut data,
+                layout,
+                Target::aarch64_linux().with_features(mixed_sve2).unwrap(),
+                limit,
+            )
+            .unwrap(),
+            Some(Aarch64SveFilterKind::Sve),
+            "table pressure must fall back transactionally to exact base SVE"
+        );
+        assert_eq!(data, original);
+
+        let retry_compiled = compile(
+            CompileRequest::new(
+                r"(?:MQw|[d-e]|r74){2,3}[j-k]Q",
+                Target::aarch64_linux().with_features(mixed_sve2).unwrap(),
+            )
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Exists),
+        )
+        .unwrap();
+        let retry_layout = build_native_dfa_table_for_architecture(
+            retry_compiled.program().native_dfa_view().unwrap(),
+            Architecture::Aarch64,
+        )
+        .unwrap()
+        .1;
+        assert!(
+            retry_layout
+                .suffix_filter
+                .is_some_and(|suffix| suffix.retry.is_some()),
+            "the structural witness must exercise bounded suffix retry"
+        );
+        assert!(retry_layout.seeded_reverse.is_none());
+        let retry_words = retry_compiled.module().sections()[TEXT_SECTION]
+            .bytes()
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let retry_dispatch = retry_words
+            .windows(4)
+            .position(|window| {
+                window[0] == aarch64_cmp_x_imm(16, 16).unwrap()
+                    && window[1] & 0xff00_001f == 0x5400_0009
+                    && window[2] == aarch64_mov_x(6, 16).unwrap()
+                    && window[3] & 0xfc00_0000 == 0x1400_0000
+            })
+            .expect("bounded retry mixed-VL dispatch");
+        assert!(
+            retry_words.iter().copied().enumerate().any(|(index, word)| {
+                word & 0xfc00_0000 == 0x1400_0000
+                    && unconditional_branch_target(&retry_words, index) == retry_dispatch
+            }),
+            "a rejected bounded verifier must re-enter ISA dispatch at the next base"
+        );
+
+        let seeded_pattern = "(?s:.+)z";
+        let linux_asimd = compile(
+            CompileRequest::new(
+                seeded_pattern,
+                Target::aarch64_linux().with_features(asimd).unwrap(),
+            )
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Exists),
+        )
+        .unwrap();
+        let linux_mixed = compile(
+            CompileRequest::new(
+                seeded_pattern,
+                Target::aarch64_linux().with_features(mixed_sve2).unwrap(),
+            )
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Exists),
+        )
+        .unwrap();
+        let seeded_layout = build_native_dfa_table_for_architecture(
+            linux_mixed.program().native_dfa_view().unwrap(),
+            Architecture::Aarch64,
+        )
+        .unwrap()
+        .1;
+        assert!(seeded_layout.seeded_reverse.is_some());
+        assert_eq!(
+            selected_aarch64_sve_suffix_kind(
+                seeded_layout,
+                mixed_sve2,
+                OperatingSystem::Linux,
+            ),
+            None,
+            "seeded reverse keeps its established ASIMD route"
+        );
+        assert_eq!(linux_mixed.module().sections(), linux_asimd.module().sections());
+        assert_eq!(
+            linux_mixed.module().relocations(),
+            linux_asimd.module().relocations()
+        );
+
+        let mac_asimd = compile(
+            CompileRequest::new(
+                "(?s:.+?)z",
+                Target::aarch64_macos().with_features(asimd).unwrap(),
+            )
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span),
+        )
+        .unwrap();
+        let mac_mixed = compile(
+            CompileRequest::new(
+                "(?s:.+?)z",
+                Target::aarch64_macos().with_features(mixed_sve2).unwrap(),
+            )
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span),
+        )
+        .unwrap();
+        assert_eq!(
+            mac_mixed.module().start_accelerator(),
+            StartAccelerator::Aarch64Asimd
+        );
+        assert_eq!(mac_mixed.module().sections(), mac_asimd.module().sections());
+        assert_eq!(mac_mixed.module().relocations(), mac_asimd.module().relocations());
     }
 
     #[test]
