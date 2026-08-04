@@ -56,6 +56,11 @@ enum ClassMatcher {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CandidateMode {
+    /// Every class member is an ASCII word byte. A complete match must
+    /// therefore consume one whole ASCII word: neither assertion can hold at
+    /// an interior class boundary. This lets the search classify each word at
+    /// most once instead of replaying independent start and end cursors.
+    AsciiWordSubset,
     /// Every class member is ASCII, so the classifier's member mask is exact.
     ExactAsciiMembers,
     /// ASCII members and every high byte require scalar Unicode inspection.
@@ -370,7 +375,9 @@ impl CandidateScanner {
                 .expect("the candidate scanner checked its wide extent");
             let masks = self.classifier.classify_32(block);
             let decoded = match self.mode {
-                CandidateMode::ExactAsciiMembers => ASCII_WIDE_BYTES,
+                CandidateMode::AsciiWordSubset | CandidateMode::ExactAsciiMembers => {
+                    ASCII_WIDE_BYTES
+                }
                 CandidateMode::UnicodeAsciiMemberOrNonAscii => {
                     usize::try_from(masks.ascii_mask().count_ones())
                         .expect("a 32-bit ASCII lane count fits usize")
@@ -378,7 +385,9 @@ impl CandidateScanner {
             };
             record_source(accounting, ASCII_WIDE_BYTES, decoded, limits)?;
             let candidates = match self.mode {
-                CandidateMode::ExactAsciiMembers => masks.member_mask(),
+                CandidateMode::AsciiWordSubset | CandidateMode::ExactAsciiMembers => {
+                    masks.member_mask()
+                }
                 CandidateMode::UnicodeAsciiMemberOrNonAscii => {
                     masks.member_mask() | !masks.ascii_mask()
                 }
@@ -418,7 +427,9 @@ impl CandidateScanner {
                 .expect("the candidate scanner checked its narrow extent");
             let masks = self.classifier.classify_16(block);
             let decoded = match self.mode {
-                CandidateMode::ExactAsciiMembers => ASCII_NARROW_BYTES,
+                CandidateMode::AsciiWordSubset | CandidateMode::ExactAsciiMembers => {
+                    ASCII_NARROW_BYTES
+                }
                 CandidateMode::UnicodeAsciiMemberOrNonAscii => {
                     usize::try_from(masks.ascii_mask().count_ones())
                         .expect("a 16-bit ASCII lane count fits usize")
@@ -426,7 +437,9 @@ impl CandidateScanner {
             };
             record_source(accounting, ASCII_NARROW_BYTES, decoded, limits)?;
             let candidates = match self.mode {
-                CandidateMode::ExactAsciiMembers => masks.member_mask(),
+                CandidateMode::AsciiWordSubset | CandidateMode::ExactAsciiMembers => {
+                    masks.member_mask()
+                }
                 CandidateMode::UnicodeAsciiMemberOrNonAscii => {
                     masks.member_mask() | !masks.ascii_mask()
                 }
@@ -477,8 +490,12 @@ impl CandidateScanner {
     ) -> Result<Option<ScannedCandidate>, Error> {
         charge(accounting, limits)?;
         let byte = haystack[position];
-        let decoded =
-            usize::from(matches!(self.mode, CandidateMode::ExactAsciiMembers) || byte.is_ascii());
+        let decoded = usize::from(
+            matches!(
+                self.mode,
+                CandidateMode::AsciiWordSubset | CandidateMode::ExactAsciiMembers
+            ) || byte.is_ascii(),
+        );
         record_source(accounting, 1, decoded, limits)?;
         if self.classifier.set().contains(byte) {
             return Ok(Some(ScannedCandidate::AsciiMember { position, byte }));
@@ -592,7 +609,10 @@ impl Inspection<'_> {
         };
         let candidate_scanner = match (self.candidate_mode, &class) {
             (None, _) => None,
-            (Some(CandidateMode::ExactAsciiMembers), ClassMatcher::Bytes(words)) => {
+            (
+                Some(mode @ (CandidateMode::AsciiWordSubset | CandidateMode::ExactAsciiMembers)),
+                ClassMatcher::Bytes(words),
+            ) => {
                 if words[2] != 0 || words[3] != 0 {
                     return Err(crate::BuildError::InternalInvariant(
                         "exact-ASCII candidate scanner retained a high-byte class member",
@@ -624,7 +644,7 @@ impl Inspection<'_> {
                 Some(CandidateScanner {
                     classifier,
                     nonmember_scanner,
-                    mode: CandidateMode::ExactAsciiMembers,
+                    mode,
                 })
             }
             (
@@ -768,6 +788,13 @@ impl EstablishedPlan {
         greedy: bool,
     ) -> Result<(Option<Match>, Accounting), Error> {
         validate_window(haystack, window)?;
+        if self
+            .candidate_scanner
+            .as_ref()
+            .is_some_and(|scanner| scanner.mode == CandidateMode::AsciiWordSubset)
+        {
+            return self.search_ascii_word_subset_window(haystack, window, limits);
+        }
         let mut accounting = Accounting {
             work: 0,
             bytes_examined: 0,
@@ -850,6 +877,132 @@ impl EstablishedPlan {
                 )?
             {
                 return Ok((Some(matched), accounting));
+            }
+        }
+        Ok((None, accounting))
+    }
+
+    /// Search a class proved to be a subset of ASCII word bytes.
+    ///
+    /// Both assertions are ASCII word boundaries. Once a class candidate is
+    /// inside an ASCII word, no later class byte in that word can be a valid
+    /// start. Likewise, a valid end can only be the end of the same complete
+    /// word. The generic bounded search cannot use that fact because it also
+    /// owns classes containing non-word members, so it advances independent
+    /// start and end boundary cursors and reclassifies their shared prefix.
+    /// This proof collapses those cursors into one monotone word traversal.
+    fn search_ascii_word_subset_window(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<(Option<Match>, Accounting), Error> {
+        debug_assert_eq!(self.mode, BoundaryMode::Ascii);
+        let ClassMatcher::Bytes(class_words) = &self.class else {
+            unreachable!("the ASCII-word-subset proof owns one byte class");
+        };
+        let scanner = self
+            .candidate_scanner
+            .as_ref()
+            .expect("the ASCII-word-subset path retains its candidate scanner");
+        debug_assert_eq!(scanner.mode, CandidateMode::AsciiWordSubset);
+
+        let mut accounting = Accounting {
+            work: 0,
+            bytes_examined: 0,
+            scalars_decoded: 0,
+        };
+        let mut position = window.start();
+        while position < window.end() {
+            let Some(candidate) =
+                scanner.next(haystack, position, window.end(), &mut accounting, limits)?
+            else {
+                break;
+            };
+            let ScannedCandidate::AsciiMember {
+                position: word_start,
+                ..
+            } = candidate
+            else {
+                unreachable!("an ASCII byte-class scanner cannot emit a non-ASCII candidate");
+            };
+
+            // Assertion context is read from the original haystack, including
+            // when the search window begins in the middle of an ASCII word.
+            charge(&mut accounting, limits)?;
+            let has_word_before = word_start
+                .checked_sub(1)
+                .and_then(|index| haystack.get(index))
+                .is_some_and(|&byte| is_ascii_word(byte));
+            position = word_start
+                .checked_add(1)
+                .ok_or_else(|| accounting_overflow(limits))?;
+            if has_word_before {
+                // No interior position in this word can satisfy the start
+                // assertion. Skip it once rather than rediscovering every
+                // later class member as another impossible candidate.
+                while position < window.end() {
+                    charge(&mut accounting, limits)?;
+                    let byte = haystack[position];
+                    record_source(&mut accounting, 1, 1, limits)?;
+                    position = position
+                        .checked_add(1)
+                        .ok_or_else(|| accounting_overflow(limits))?;
+                    if !is_ascii_word(byte) {
+                        break;
+                    }
+                }
+                continue;
+            }
+
+            // The candidate byte is already proved and charged by the
+            // scanner. Traverse the rest of its ASCII word exactly once,
+            // retaining whether every byte belongs to the repeated class.
+            let mut word_units = 1_usize;
+            let mut class_only = true;
+            while position < window.end() {
+                charge(&mut accounting, limits)?;
+                let byte = haystack[position];
+                record_source(&mut accounting, 1, 1, limits)?;
+                if !is_ascii_word(byte) {
+                    break;
+                }
+                class_only &= byte_set_contains(*class_words, byte);
+                word_units = word_units
+                    .checked_add(1)
+                    .ok_or_else(|| accounting_overflow(limits))?;
+                position = position
+                    .checked_add(1)
+                    .ok_or_else(|| accounting_overflow(limits))?;
+            }
+
+            charge(&mut accounting, limits)?;
+            let complete_word = !haystack
+                .get(position)
+                .is_some_and(|&byte| is_ascii_word(byte));
+            let within_maximum = self
+                .maximum_units
+                .is_none_or(|maximum| word_units <= maximum);
+            if complete_word
+                && class_only
+                && word_units >= self.minimum_units
+                && within_maximum
+            {
+                return Ok((
+                    Some(Match {
+                        start: word_start,
+                        end: position,
+                    }),
+                    accounting,
+                ));
+            }
+
+            // If the loop observed a non-word byte inside the window, it has
+            // already been classified and cannot start a class match.
+            if position < window.end() {
+                position = position
+                    .checked_add(1)
+                    .ok_or_else(|| accounting_overflow(limits))?;
             }
         }
         Ok((None, accounting))
@@ -1375,9 +1528,10 @@ pub(crate) fn inspect(
             (BoundaryMode::Ascii, HirKind::Class(Class::Bytes(class))) => {
                 let range_count = u64::try_from(class.ranges().len())
                     .map_err(|_| InspectionError::ArithmeticOverflow("byte class ranges"))?;
-                let (members, ascii_only) = class.ranges().iter().try_fold(
-                    (0_u64, true),
-                    |(total, ascii_only), range| {
+                let (members, ascii_only, ascii_word_subset) =
+                    class.ranges().iter().try_fold(
+                    (0_u64, true, true),
+                    |(total, ascii_only, ascii_word_subset), range| {
                         let width = u64::from(range.end())
                             .checked_sub(u64::from(range.start()))
                             .and_then(|value| value.checked_add(1))
@@ -1385,7 +1539,13 @@ pub(crate) fn inspect(
                         let total = total
                             .checked_add(width)
                             .ok_or(InspectionError::ArithmeticOverflow("byte class members"))?;
-                        Ok::<_, InspectionError>((total, ascii_only && range.end().is_ascii()))
+                        Ok::<_, InspectionError>((
+                            total,
+                            ascii_only && range.end().is_ascii(),
+                            ascii_word_subset
+                                && range.end().is_ascii()
+                                && (range.start()..=range.end()).all(is_ascii_word),
+                        ))
                     },
                 )?;
                 charge_build(&mut work, range_count, max_planner_work)?;
@@ -1393,7 +1553,11 @@ pub(crate) fn inspect(
                 if ascii_only {
                     (
                         InspectedClass::Bytes(class),
-                        Some(CandidateMode::ExactAsciiMembers),
+                        Some(if ascii_word_subset {
+                            CandidateMode::AsciiWordSubset
+                        } else {
+                            CandidateMode::ExactAsciiMembers
+                        }),
                         false,
                     )
                 } else {
@@ -1455,7 +1619,10 @@ pub(crate) fn inspect(
             max_planner_work,
         )?;
     }
-    if candidate_mode == Some(CandidateMode::ExactAsciiMembers) {
+    if matches!(
+        candidate_mode,
+        Some(CandidateMode::AsciiWordSubset | CandidateMode::ExactAsciiMembers)
+    ) {
         charge_build(
             &mut work,
             u64::try_from(ASCII_RUN_SCANNER_BUILD_WORK)
@@ -1473,11 +1640,14 @@ pub(crate) fn inspect(
                 "Unicode class retained bytes",
             ))?,
     };
-    let run_scanner_bytes = usize::from(candidate_mode == Some(CandidateMode::ExactAsciiMembers))
-        .checked_mul(core::mem::size_of::<AsciiByteSetRunScanner>())
-        .ok_or(InspectionError::ArithmeticOverflow(
-            "bounded word-class run-scanner storage",
-        ))?;
+    let run_scanner_bytes = usize::from(matches!(
+        candidate_mode,
+        Some(CandidateMode::AsciiWordSubset | CandidateMode::ExactAsciiMembers)
+    ))
+    .checked_mul(core::mem::size_of::<AsciiByteSetRunScanner>())
+    .ok_or(InspectionError::ArithmeticOverflow(
+        "bounded word-class run-scanner storage",
+    ))?;
     let byte_classifier_bytes = usize::from(exact_byte_candidates)
         .checked_mul(core::mem::size_of::<ByteSetClassifier>())
         .ok_or(InspectionError::ArithmeticOverflow(
@@ -1732,6 +1902,119 @@ mod tests {
     }
 
     #[test]
+    fn ascii_word_subset_proof_collapses_cursors_without_changing_windows_or_endpoints() {
+        let patterns = [
+            r"(?-u:\b[a-z]{2,5}\b)",
+            r"(?-u:\b[0-9_]{1,3}\b)",
+            r"(?-u:\b[A-Za-z0-9_]{2,}\b)",
+        ];
+        let alphabet = [b'a', b'z', b'0', b'_', b'!', 0xff];
+        for pattern in patterns {
+            let specialized = plan(pattern, false);
+            let mut generic = plan(pattern, false);
+            let super::Plan::Established(generic) = &mut generic else {
+                panic!("an ASCII word subset uses the established owner");
+            };
+            let scanner = generic
+                .candidate_scanner
+                .as_mut()
+                .expect("an ASCII word subset retains a candidate scanner");
+            assert_eq!(scanner.mode, CandidateMode::AsciiWordSubset);
+            scanner.mode = CandidateMode::ExactAsciiMembers;
+
+            for length in 0_u32..=4 {
+                for mut encoded in 0..alphabet.len().pow(length) {
+                    let mut haystack = Vec::with_capacity(usize::try_from(length).unwrap());
+                    for _ in 0..length {
+                        haystack.push(alphabet[encoded % alphabet.len()]);
+                        encoded /= alphabet.len();
+                    }
+                    for start in 0..=haystack.len() {
+                        for end in start..=haystack.len() {
+                            let window = SearchWindow::new(start, end);
+                            let expected = generic
+                                .find_window(&haystack, window, SearchLimits::unlimited())
+                                .expect("generic bounded search")
+                                .0;
+                            let actual = specialized
+                                .find_window(&haystack, window, SearchLimits::unlimited())
+                                .expect("collapsed bounded search")
+                                .0;
+                            assert_eq!(actual, expected, "{pattern:?}/{haystack:?}/{start}..{end}");
+                            let expected_end = generic
+                                .shortest_window(&haystack, window, SearchLimits::unlimited())
+                                .expect("generic bounded shortest")
+                                .0;
+                            let actual_end = specialized
+                                .shortest_window(&haystack, window, SearchLimits::unlimited())
+                                .expect("collapsed bounded shortest")
+                                .0;
+                            assert_eq!(
+                                actual_end, expected_end,
+                                "shortest {pattern:?}/{haystack:?}/{start}..{end}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let super::Plan::Established(mixed) = plan(r"(?-u:\b[A_-]{1,3}\b)", false)
+        else {
+            panic!("a mixed ASCII class uses the established owner");
+        };
+        assert_eq!(
+            mixed
+                .candidate_scanner
+                .expect("a mixed ASCII class retains a candidate scanner")
+                .mode,
+            CandidateMode::ExactAsciiMembers
+        );
+    }
+
+    #[test]
+    fn ascii_word_subset_route_preserves_original_context_and_exact_work_fence() {
+        let plan = plan(r"(?-u:\b[a-z]{2,5}\b)", false);
+        let haystack = b"1ab!cde!fghijk!yz";
+        for (window, expected) in [
+            (SearchWindow::new(0, haystack.len()), Some(4..7)),
+            (SearchWindow::new(1, haystack.len()), Some(4..7)),
+            (SearchWindow::new(2, haystack.len()), Some(4..7)),
+            (SearchWindow::new(4, 7), Some(4..7)),
+            (SearchWindow::new(5, 7), None),
+            (SearchWindow::new(4, 6), None),
+        ] {
+            let (matched, accounting) = plan
+                .find_window(haystack, window, SearchLimits::unlimited())
+                .expect("ASCII word-subset window");
+            assert_eq!(matched.map(|matched| matched.range()), expected, "{window:?}");
+            assert!(accounting.work() > 0);
+            assert!(
+                plan.find_window(
+                    haystack,
+                    window,
+                    SearchLimits {
+                        max_work: accounting.work(),
+                        max_scratch_bytes: 0,
+                    },
+                )
+                .is_ok()
+            );
+            assert!(matches!(
+                plan.find_window(
+                    haystack,
+                    window,
+                    SearchLimits {
+                        max_work: accounting.work() - 1,
+                        max_scratch_bytes: 0,
+                    },
+                ),
+                Err(crate::UnicodeWordRunError::WorkLimitExceeded { .. })
+            ));
+        }
+    }
+
+    #[test]
     fn mixed_wordness_uses_leftmost_start_and_greedy_boundary_end() {
         let plan = plan(r"(?-u:\b[A/_-]{2,5}\b)", false);
         let haystack = b" A-A/A.";
@@ -1787,7 +2070,7 @@ mod tests {
         else {
             panic!("high-byte class should be eligible");
         };
-        assert_eq!(ascii.candidate_mode, Some(CandidateMode::ExactAsciiMembers));
+        assert_eq!(ascii.candidate_mode, Some(CandidateMode::AsciiWordSubset));
         assert!(!ascii.exact_byte_candidates);
         assert_eq!(high.candidate_mode, None);
         assert!(high.exact_byte_candidates);
@@ -1820,7 +2103,7 @@ mod tests {
                     plan.candidate_scanner.as_ref(),
                     Some(CandidateScanner {
                         nonmember_scanner,
-                        mode: CandidateMode::ExactAsciiMembers,
+                        mode: CandidateMode::AsciiWordSubset,
                         ..
                     }) if nonmember_scanner.boxed().is_some()
                 )
@@ -1958,9 +2241,9 @@ mod tests {
             .find_window(&near, SearchWindow::full(&near), SearchLimits::unlimited())
             .expect("scalar-prefix candidate");
         assert_eq!(matched.expect("near match").range(), 3..4);
-        assert_eq!(accounting.work(), 10);
-        assert_eq!(accounting.bytes_examined(), 7);
-        assert_eq!(accounting.scalars_decoded(), 7);
+        assert_eq!(accounting.work(), 7);
+        assert_eq!(accounting.bytes_examined(), 5);
+        assert_eq!(accounting.scalars_decoded(), 5);
 
         let mut wide = vec![b'-'; 64];
         wide[20] = b'A';
@@ -1968,9 +2251,9 @@ mod tests {
             .find_window(&wide, SearchWindow::full(&wide), SearchLimits::unlimited())
             .expect("wide candidate");
         assert_eq!(matched.expect("wide match").range(), 20..21);
-        assert_eq!(accounting.work(), 47);
-        assert_eq!(accounting.bytes_examined(), 44);
-        assert_eq!(accounting.scalars_decoded(), 43);
+        assert_eq!(accounting.work(), 44);
+        assert_eq!(accounting.bytes_examined(), 42);
+        assert_eq!(accounting.scalars_decoded(), 41);
         assert!(matches!(
             plan.find_window(
                 &wide,
@@ -1981,8 +2264,8 @@ mod tests {
                 },
             ),
             Err(crate::UnicodeWordRunError::WorkLimitExceeded {
-                needed: 47,
-                limit: 46,
+                needed: 44,
+                limit: 43,
             })
         ));
     }
@@ -2085,15 +2368,15 @@ mod tests {
         );
         assert_eq!(
             accounting.work(),
-            u64::try_from(candidate.checked_add(7).unwrap()).unwrap()
+            u64::try_from(candidate.checked_add(4).unwrap()).unwrap()
         );
         assert_eq!(
             accounting.bytes_examined(),
-            candidate.checked_add(4).unwrap()
+            candidate.checked_add(2).unwrap()
         );
         assert_eq!(
             accounting.scalars_decoded(),
-            candidate.checked_add(4).unwrap()
+            candidate.checked_add(2).unwrap()
         );
 
         sparse[128..160].fill(0xFF);
