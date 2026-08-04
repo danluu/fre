@@ -91,6 +91,7 @@ mod line_capture;
 mod line_total_grep;
 mod literal_assertions;
 mod literal_class_run_literal;
+mod nullable_optional_chain;
 pub mod operation_session;
 mod pure_byte_class_repeat;
 #[cfg(feature = "qualified-exact-search-jit")]
@@ -128,6 +129,10 @@ pub use bounded_byte_class_sequence::{
     Error as BoundedByteClassSequenceSearchError,
     Operation as BoundedByteClassSequenceOperation,
     PLAN_ID as BOUNDED_BYTE_CLASS_SEQUENCE_PLAN_ID,
+};
+pub use nullable_optional_chain::{
+    Accounting as NullableOptionalChainAccounting, Error as NullableOptionalChainSearchError,
+    Operation as NullableOptionalChainOperation, PLAN_ID as NULLABLE_OPTIONAL_CHAIN_PLAN_ID,
 };
 pub use unicode_folded_literal::{
     UNICODE_FOLDED_LITERAL_ALGORITHM_ID, UNICODE_FOLDED_LITERAL_COUNT_OPERATION_ID,
@@ -1004,7 +1009,10 @@ pub struct BuildReport {
     /// Exact minimum bytes consumed by any match, or `None` if the HIR's
     /// language is empty. This is preserved for future aggregate routing.
     pub minimum_match_bytes: Option<usize>,
-    /// Complete construction certificate for the proof-restricted plan.
+    /// Complete construction certificate for the classic
+    /// `CLASS{min,max} SUFFIX` required-tail runtime. Other members of the
+    /// broader [`PlanKind::RequiredLiteral`] family retain their own typed
+    /// accounting and leave this field absent.
     pub required_literal: Option<RequiredLiteralBuildAccounting>,
     /// Complete construction certificate for the literal/class-run plan.
     pub literal_class_run_literal: Option<LiteralClassRunLiteralBuildAccounting>,
@@ -1022,7 +1030,9 @@ pub enum PlanKind {
     PackedLiteralSet,
     /// Bounded ordered finite-literal DFA used when packed search is ineligible.
     LiteralSetDfa,
-    /// Proof-restricted SIMD-aware `CLASS{min,max} SUFFIX` kernel. This is not JIT.
+    /// Proof-restricted required-tail native searches, including
+    /// `CLASS{min,max} SUFFIX` and tail-head-disjoint nullable optional-chain
+    /// prefixes. This is not JIT.
     RequiredLiteral,
     /// Canonical literal/class-run search backed by one native literal anchor.
     LiteralClassRunLiteral,
@@ -2789,6 +2799,8 @@ pub enum SearchAccounting {
     PureByteClassRepeat(PureByteClassRepeatAccounting),
     /// Exact bounded byte-class sequence counters.
     BoundedByteClassSequence(BoundedByteClassSequenceAccounting),
+    /// Exact nullable optional-chain counters.
+    NullableOptionalChain(NullableOptionalChainAccounting),
     /// Complete forward-boundary proof-bound and structural counters.
     ForwardAnchored(ForwardAnchoredSearchAccounting),
     /// Exact folded-scalar trie early-stop counters.
@@ -2818,6 +2830,7 @@ impl SearchAccounting {
             Self::LiteralClassRunLiteral(_) => PlanKind::LiteralClassRunLiteral,
             Self::PureByteClassRepeat(_) => PlanKind::PureByteClassRepeat,
             Self::BoundedByteClassSequence(_) => PlanKind::BoundedByteClassSequence,
+            Self::NullableOptionalChain(_) => PlanKind::RequiredLiteral,
             Self::ForwardAnchored(_) => PlanKind::ForwardAnchored,
             Self::UnicodeFoldedLiteral(_) => PlanKind::UnicodeFoldedLiteral,
             Self::UnicodeWordRun(_) => PlanKind::UnicodeWordRun,
@@ -2846,6 +2859,7 @@ impl SearchAccounting {
             Self::LiteralClassRunLiteral(accounting) => accounting.work_upper_bound,
             Self::PureByteClassRepeat(accounting) => accounting.actual_work,
             Self::BoundedByteClassSequence(accounting) => accounting.actual_work,
+            Self::NullableOptionalChain(accounting) => accounting.actual_work,
             Self::ForwardAnchored(accounting) => accounting.work_upper_bound,
             Self::UnicodeFoldedLiteral(accounting) => {
                 u64::try_from(accounting.work).unwrap_or(u64::MAX)
@@ -2889,6 +2903,7 @@ pub enum SearchError {
     LiteralClassRunLiteral(LiteralClassRunLiteralSearchError),
     PureByteClassRepeat(PureByteClassRepeatSearchError),
     BoundedByteClassSequence(BoundedByteClassSequenceSearchError),
+    NullableOptionalChain(NullableOptionalChainSearchError),
     ForwardAnchored(ForwardAnchoredSearchError),
     UnicodeFoldedLiteral(UnicodeFoldedLiteralSearchError),
     UnicodeWordRun(UnicodeWordRunError),
@@ -2918,6 +2933,9 @@ impl fmt::Display for SearchError {
             Self::BoundedByteClassSequence(error) => {
                 write!(f, "bounded byte-class sequence search failed: {error}")
             }
+            Self::NullableOptionalChain(error) => {
+                write!(f, "nullable optional-chain search failed: {error}")
+            }
             Self::ForwardAnchored(error) => {
                 write!(f, "forward-anchored search failed: {error}")
             }
@@ -2944,6 +2962,7 @@ impl std::error::Error for SearchError {
             Self::LiteralClassRunLiteral(error) => Some(error),
             Self::PureByteClassRepeat(error) => Some(error),
             Self::BoundedByteClassSequence(error) => Some(error),
+            Self::NullableOptionalChain(error) => Some(error),
             Self::ForwardAnchored(error) => Some(error),
             Self::UnicodeFoldedLiteral(error) => Some(error),
             Self::UnicodeWordRun(error) => Some(error),
@@ -3003,6 +3022,12 @@ impl From<PureByteClassRepeatSearchError> for SearchError {
 impl From<BoundedByteClassSequenceSearchError> for SearchError {
     fn from(value: BoundedByteClassSequenceSearchError) -> Self {
         Self::BoundedByteClassSequence(value)
+    }
+}
+
+impl From<NullableOptionalChainSearchError> for SearchError {
+    fn from(value: NullableOptionalChainSearchError) -> Self {
+        Self::NullableOptionalChain(value)
     }
 }
 
@@ -4277,6 +4302,78 @@ impl PortableBuilder {
                 },
             });
         }
+        let mut nullable_optional_chain_work = fixed_predicate_work;
+        if self.selection == PlanSelection::Auto && self.pure_byte_class_repeat_allowed {
+            let inspection = nullable_optional_chain::inspect(
+                &rust.hir,
+                fixed_predicate_work,
+                self.limits.max_planner_work,
+            )?;
+            nullable_optional_chain_work = inspection.planner_work();
+            if let nullable_optional_chain::InspectionOutcome::Eligible(inspection) = inspection
+            {
+                let plan_storage_bytes = inspection.plan_storage_bytes()?;
+                let charged_persistent_bytes = source_storage_bytes
+                    .checked_add(capture_name_storage_bytes)
+                    .and_then(|bytes| bytes.checked_add(plan_storage_bytes))
+                    .ok_or(BuildError::PersistentBytesOverflow)?;
+                if charged_persistent_bytes > self.limits.max_persistent_bytes {
+                    return Err(BuildError::PersistentBytesLimit {
+                        needed: charged_persistent_bytes,
+                        limit: self.limits.max_persistent_bytes,
+                    });
+                }
+                let plan = inspection.build(self.limits.literal)?;
+                if plan.storage_bytes()? != plan_storage_bytes {
+                    return Err(BuildError::InternalInvariant(
+                        "nullable optional-chain storage projection changed during construction",
+                    ));
+                }
+                let plan = fre_exact_alloc::try_box_preserve(plan).map_err(|(error, _)| {
+                    match error {
+                        fre_exact_alloc::CopyError::LayoutOverflow => BuildError::InternalInvariant(
+                            "nullable optional-chain owner layout overflowed",
+                        ),
+                        fre_exact_alloc::CopyError::AllocationFailed => {
+                            BuildError::AllocationFailed {
+                                structure: "nullable optional-chain owner",
+                                additional: 1,
+                            }
+                        }
+                    }
+                })?;
+                return Ok(PortableRegex {
+                    source,
+                    capture_names,
+                    line_total_grep_plan,
+                    plan: PortablePlan::NullableOptionalChain(plan),
+                    profile: profile.clone(),
+                    limits: self.limits,
+                    selection: self.selection,
+                    report: BuildReport {
+                        profile: profile.clone(),
+                        admission,
+                        syntax,
+                        plan: PlanKind::RequiredLiteral,
+                        planner_work: nullable_optional_chain_work,
+                        lowering: None,
+                        states: 0,
+                        edges: 0,
+                        plan_storage_bytes,
+                        source_storage_bytes,
+                        capture_name_storage_bytes,
+                        charged_persistent_bytes,
+                        persistent_byte_limit: self.limits.max_persistent_bytes,
+                        captures_len,
+                        static_captures_len,
+                        minimum_match_bytes,
+                        required_literal: None,
+                        literal_class_run_literal: None,
+                        forward_anchored: None,
+                    },
+                });
+            }
+        }
         let retained_facade_bytes = source_storage_bytes
             .checked_add(capture_name_storage_bytes)
             .ok_or(BuildError::PersistentBytesOverflow)?;
@@ -4298,7 +4395,7 @@ impl PortableBuilder {
             &rust.hir,
             self.limits.literal_set.max_patterns,
             self.limits.literal_set.max_pattern_bytes,
-            fixed_predicate_work,
+            nullable_optional_chain_work,
             self.limits.max_planner_work,
             derive_guarded_ascii_dictionary,
             guarded_literal_set::extraction_limits(
@@ -5068,6 +5165,7 @@ enum PortablePlan {
     FixedPredicateWord64(Box<FixedPredicateWord64Plan>),
     BoundedByteClassSequence(bounded_byte_class_sequence::Plan),
     GuardedLiteralSet(guarded_literal_set::Plan),
+    NullableOptionalChain(Box<nullable_optional_chain::Plan>),
 }
 
 impl PortablePlan {
@@ -5095,6 +5193,7 @@ impl PortablePlan {
             Self::FixedPredicateWord64(_) => FIXED_PREDICATE_WORD64_SEARCH_PLAN_ID,
             Self::BoundedByteClassSequence(_) => bounded_byte_class_sequence::PLAN_ID,
             Self::GuardedLiteralSet(_) => guarded_literal_set::PLAN_ID,
+            Self::NullableOptionalChain(_) => nullable_optional_chain::PLAN_ID,
         }
     }
 }
@@ -5621,6 +5720,15 @@ impl PortableRegex {
                     SearchAccounting::BoundedByteClassSequence(accounting),
                 ))
             }
+            PortablePlan::NullableOptionalChain(plan) => {
+                let (matched, accounting) = plan
+                    .is_match_window(haystack, window, limits)
+                    .map_err(SearchError::NullableOptionalChain)?;
+                Ok((
+                    matched,
+                    SearchAccounting::NullableOptionalChain(accounting),
+                ))
+            }
             PortablePlan::ForwardAnchored(forward) => {
                 let literal_window = LiteralWindow::new(window.start(), window.end());
                 let (matched, accounting) = forward.find_window(
@@ -5810,6 +5918,9 @@ impl PortableRegex {
             PortablePlan::BoundedByteClassSequence(plan) => plan
                 .is_match_window_value(haystack, window, limits)
                 .map_err(SearchError::BoundedByteClassSequence),
+            PortablePlan::NullableOptionalChain(plan) => plan
+                .is_match_window_value(haystack, window, limits)
+                .map_err(SearchError::NullableOptionalChain),
             PortablePlan::ForwardAnchored(forward) => forward
                 .find_window(
                     haystack,
@@ -6035,6 +6146,12 @@ impl PortableRegex {
                     SearchAccounting::BoundedByteClassSequence(accounting),
                 ))
             }
+            PortablePlan::NullableOptionalChain(plan) => {
+                let (end, accounting) = plan
+                    .earliest_end_window(haystack, window, limits)
+                    .map_err(SearchError::NullableOptionalChain)?;
+                Ok((end, SearchAccounting::NullableOptionalChain(accounting)))
+            }
             PortablePlan::ForwardAnchored(forward) => {
                 let literal_window = LiteralWindow::new(window.start(), window.end());
                 let (matched, accounting) = forward.find_window(
@@ -6228,6 +6345,12 @@ impl PortableRegex {
                     end,
                     SearchAccounting::BoundedByteClassSequence(accounting),
                 ))
+            }
+            PortablePlan::NullableOptionalChain(plan) => {
+                let (end, accounting) = plan
+                    .selected_end_window(haystack, SearchWindow::full(haystack), limits)
+                    .map_err(SearchError::NullableOptionalChain)?;
+                Ok((end, SearchAccounting::NullableOptionalChain(accounting)))
             }
             PortablePlan::ForwardAnchored(forward) => {
                 let (matched, accounting) =
@@ -6624,6 +6747,15 @@ impl PortableRegex {
                     SearchAccounting::BoundedByteClassSequence(accounting),
                 ))
             }
+            PortablePlan::NullableOptionalChain(plan) => {
+                let (matched, accounting) = plan
+                    .find_window(haystack, window, limits)
+                    .map_err(SearchError::NullableOptionalChain)?;
+                Ok((
+                    matched,
+                    SearchAccounting::NullableOptionalChain(accounting),
+                ))
+            }
             PortablePlan::ForwardAnchored(forward) => {
                 let literal_window = LiteralWindow::new(window.start(), window.end());
                 let (matched, accounting) = forward.find_window(
@@ -6875,6 +7007,9 @@ impl PortableRegex {
             PortablePlan::BoundedByteClassSequence(plan) => plan
                 .find_window_value(haystack, window, limits)
                 .map_err(SearchError::BoundedByteClassSequence),
+            PortablePlan::NullableOptionalChain(plan) => plan
+                .find_window_value(haystack, window, limits)
+                .map_err(SearchError::NullableOptionalChain),
             PortablePlan::FixedPredicateWord64(plan) => plan
                 .find_window_value(
                     haystack,
@@ -7005,6 +7140,12 @@ impl PortableRegex {
                 let (matched, accounting) = plan
                     .find_window(haystack, SearchWindow::new(start, haystack.len()), limits)
                     .map_err(SearchError::BoundedByteClassSequence)?;
+                Ok((matched, accounting.actual_work))
+            }
+            PortablePlan::NullableOptionalChain(plan) => {
+                let (matched, accounting) = plan
+                    .find_window(haystack, SearchWindow::new(start, haystack.len()), limits)
+                    .map_err(SearchError::NullableOptionalChain)?;
                 Ok((matched, accounting.actual_work))
             }
             PortablePlan::ForwardAnchored(forward) => {
