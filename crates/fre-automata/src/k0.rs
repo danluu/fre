@@ -7992,18 +7992,33 @@ fn execute_from_resume(
         resume_position,
         may_intern,
     )?;
-    let (mut pending, mut boundaries) = execute_lazy_resume_loop(
-        automaton,
-        haystack,
-        window,
-        workspace,
-        &mut meter,
-        contract,
-        post_seed_reserve,
-        state,
-        resume_position,
-        pending_end,
-    )?;
+    let (mut pending, mut boundaries) = if limits.max_work == u64::MAX {
+        execute_lazy_resume_loop::<true>(
+            automaton,
+            haystack,
+            window,
+            workspace,
+            &mut meter,
+            contract,
+            post_seed_reserve,
+            state,
+            resume_position,
+            pending_end,
+        )?
+    } else {
+        execute_lazy_resume_loop::<false>(
+            automaton,
+            haystack,
+            window,
+            workspace,
+            &mut meter,
+            contract,
+            post_seed_reserve,
+            state,
+            resume_position,
+            pending_end,
+        )?
+    };
 
     if wants_span {
         if let Some(selected) = pending {
@@ -8216,7 +8231,7 @@ fn seed_lazy_resume_state(
     reason = "the exact resume loop keeps its committed endpoint and frontier together"
 )]
 #[inline(never)]
-fn execute_lazy_resume_loop(
+fn execute_lazy_resume_loop<const BATCH_WARM: bool>(
     automaton: &Automaton,
     haystack: &[u8],
     window: SearchWindow,
@@ -8240,6 +8255,87 @@ fn execute_lazy_resume_loop(
     }
     let mut boundaries = 1usize;
     loop {
+        if BATCH_WARM {
+            if let LazyState::Cached(mut cached) = state {
+                let batch_start = position;
+                let mut direct_steps = 0usize;
+                loop {
+                    if position == window.end() {
+                        settle_resume_direct_steps(
+                            meter,
+                            batch_start,
+                            direct_steps,
+                            &mut boundaries,
+                        )?;
+                        return Ok((
+                            pending_end.map(|end| MatchSpan::new(window.start(), end)),
+                            boundaries,
+                        ));
+                    }
+                    let byte = *haystack.get(position).ok_or(
+                        SearchError::InternalInvariant {
+                            detail: "resume source position exceeded the validated window",
+                        },
+                    )?;
+                    let class = automaton.byte_classes().class_of(byte);
+                    let cell = workspace.lazy.direct_cell(cached, class)?;
+                    if cell == LAZY_CELL_UNFILLED {
+                        break;
+                    }
+                    // A Rust slice and every valid search window fit in
+                    // `isize::MAX`. The loop guard therefore proves both
+                    // monotone counters can advance through this batch.
+                    #[allow(
+                        clippy::arithmetic_side_effects,
+                        reason = "the validated window bounds direct resume progress"
+                    )]
+                    {
+                        position += 1;
+                        direct_steps += 1;
+                    }
+                    if cell & LAZY_CELL_ACCEPT != 0 {
+                        pending_end = Some(position);
+                        if earliest {
+                            settle_resume_direct_steps(
+                                meter,
+                                batch_start,
+                                direct_steps,
+                                &mut boundaries,
+                            )?;
+                            return Ok((
+                                Some(MatchSpan::new(window.start(), position)),
+                                boundaries,
+                            ));
+                        }
+                    }
+                    let encoded = cell & LAZY_CELL_STATE_MASK;
+                    if encoded == 0 {
+                        settle_resume_direct_steps(
+                            meter,
+                            batch_start,
+                            direct_steps,
+                            &mut boundaries,
+                        )?;
+                        return Ok((
+                            pending_end.map(|end| MatchSpan::new(window.start(), end)),
+                            boundaries,
+                        ));
+                    }
+                    cached = encoded.checked_sub(1).ok_or(
+                        SearchError::InternalInvariant {
+                            detail: "resume encoded state underflowed",
+                        },
+                    )?;
+                }
+                settle_resume_direct_steps(
+                    meter,
+                    batch_start,
+                    direct_steps,
+                    &mut boundaries,
+                )?;
+                state = LazyState::Cached(cached);
+            }
+        }
         if position == window.end() {
             return Ok((
                 pending_end.map(|end| MatchSpan::new(window.start(), end)),
@@ -8325,6 +8421,25 @@ fn execute_lazy_resume_loop(
         };
         state = next;
     }
+}
+
+#[inline(always)]
+fn settle_resume_direct_steps(
+    meter: &mut WorkMeter,
+    batch_start: usize,
+    direct_steps: usize,
+    boundaries: &mut usize,
+) -> Result<(), SearchError> {
+    let work = u64::try_from(direct_steps).map_err(|_| SearchError::ArithmeticOverflow {
+        computation: "resume direct-step work conversion",
+    })?;
+    meter.charge(work, batch_start)?;
+    *boundaries = boundaries
+        .checked_add(direct_steps)
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "resume examined boundary count",
+        })?;
+    Ok(())
 }
 
 #[allow(
