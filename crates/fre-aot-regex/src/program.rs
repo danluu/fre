@@ -3196,16 +3196,10 @@ impl CompiledProgram {
         } else {
             None
         };
-        // The incomplete artifact intentionally has no reverse DFA. A local
-        // Span completion can therefore publish only when the selected end
-        // itself proves the start. Interior holes remain valid for every Span
-        // artifact because K0 owns exact reverse/start recovery after resume.
-        if self.output == OutputContract::Span
-            && !dfa.initial_pending
-            && self.exact_match_width.is_none()
-        {
-            return None;
-        }
+        // A variable-width non-nullable Span publishes its selected endpoint
+        // through the native core, then authenticates this exact preflight
+        // window and recovers only the start through reverse K0. Interior
+        // holes continue through the ordinary authenticated K0 resume ABI.
         Some(NativePartialProgramView {
             output: self.output,
             dfa: partial,

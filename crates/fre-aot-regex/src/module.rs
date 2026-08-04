@@ -608,6 +608,7 @@ const PARTIAL_NATIVE_CORE_SYMBOL: usize = 7;
 const PARTIAL_RUNTIME_SYMBOL: usize = 8;
 const PREPARED_FALLBACK_RUNTIME_SYMBOL: usize = 9;
 const PREPARED_PREFLIGHT_RUNTIME_SYMBOL: usize = 10;
+const PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL: usize = 11;
 
 const RUNTIME_SYMBOL_NAME: &str = "fre_aot_regex_runtime_search_v1";
 const PARTIAL_RUNTIME_SYMBOL_NAME: &str =
@@ -616,6 +617,8 @@ const PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_v1";
 const PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_partial_preflight_v1";
+const PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME: &str =
+    "fre_aot_regex_runtime_search_exclusive_recover_partial_span_v1";
 const ENTRY_SYMBOL_PREFIX: &str = "fre_aot_regex_search_v1_";
 const PREPARED_ENTRY_SYMBOL_PREFIX: &str = "fre_aot_regex_search_exclusive_v1_";
 const PROGRAM_SYMBOL_PREFIX: &str = "fre_aot_regex_program_v1_";
@@ -647,6 +650,7 @@ struct PreparedEntryLayout {
     table_offset: usize,
     table_size: usize,
     identity_offset: usize,
+    span_recovery: bool,
 }
 
 impl CompiledModule {
@@ -706,7 +710,7 @@ impl CompiledModule {
             (lowering, native_digest, None)
         } else if let Some(view) = native_partial {
             if let Some((lowering, prepared_layout)) =
-                lower_native_partial_prepared(program_bytes.clone(), view, target)?
+                lower_native_partial_prepared(program_bytes.clone(), &view, target)?
             {
                 let native_digest = native_module_digest(&lowering.data, target, &lowering)?;
                 (lowering, native_digest, Some(prepared_layout))
@@ -888,6 +892,21 @@ impl CompiledModule {
                 offset: 0,
                 size: 0,
             });
+            if prepared.span_recovery {
+                if symbols.len() != PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL {
+                    return Err(ObjectError::InvalidModule(
+                        "partial Span recovery symbol order is inconsistent",
+                    ));
+                }
+                symbols.push(ModuleSymbol {
+                    name: PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME.to_owned(),
+                    binding: SymbolBinding::Global,
+                    kind: SymbolKind::Function,
+                    section: None,
+                    offset: 0,
+                    size: 0,
+                });
+            }
             Some(PREPARED_ENTRY_SYMBOL)
         } else {
             None
@@ -989,6 +1008,24 @@ impl CompiledModule {
             .map(|symbol| symbol.name.as_str())
     }
 
+    /// Return the authenticated selected-end-to-Span recovery helper required
+    /// by a variable-width partial Span entry, when that entry is present.
+    #[must_use]
+    pub fn required_prepared_span_recovery_runtime_symbol(&self) -> Option<&str> {
+        self.prepared_entry_symbol_index?;
+        if !self
+            .relocations
+            .iter()
+            .any(|relocation| relocation.symbol == PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL)
+        {
+            return None;
+        }
+        self.symbols
+            .get(PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL)
+            .filter(|symbol| symbol.section.is_none())
+            .map(|symbol| symbol.name.as_str())
+    }
+
     /// Return the fixed versioned runtime helper symbol.
     #[must_use]
     pub fn runtime_symbol(&self) -> &str {
@@ -1063,7 +1100,7 @@ fn lower_runtime_adapter(
 )]
 fn lower_native_partial_prepared(
     mut program_bytes: Vec<u8>,
-    view: NativePartialProgramView<'_>,
+    view: &NativePartialProgramView<'_>,
     target: Target,
 ) -> Result<Option<(NativeLowering, PreparedEntryLayout)>, ObjectError> {
     let dfa = view.dfa;
@@ -1149,14 +1186,9 @@ fn lower_native_partial_prepared(
             }
         }
     }
-    if view.output == OutputContract::Span
+    let span_recovery = view.output == OutputContract::Span
         && !dfa.initial_pending
-        && view.exact_match_width.is_none()
-    {
-        return Err(ObjectError::InvalidModule(
-            "partial native Span has no local start proof",
-        ));
-    }
+        && view.exact_match_width.is_none();
 
     // This is the sole target-specific selective-root publication gate. The
     // ordinary full-native lowering returns `None` unless its emitted scanner
@@ -1289,10 +1321,15 @@ fn lower_native_partial_prepared(
             table_offset,
             table_size,
             identity_offset,
+            span_recovery,
         },
     )))
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the module identity hashes every emitted section, runtime dependency, and relocation in one canonical order"
+)]
 fn native_module_digest(
     program_bytes: &[u8],
     target: Target,
@@ -1393,6 +1430,17 @@ fn native_module_digest(
                 &mut digest,
                 PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME.as_bytes(),
                 "prepared preflight runtime symbol identity byte length",
+            )?;
+        }
+        if lowering
+            .relocations
+            .iter()
+            .any(|relocation| relocation.symbol == PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL)
+        {
+            update_bytes(
+                &mut digest,
+                PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME.as_bytes(),
+                "partial Span recovery runtime symbol identity byte length",
             )?;
         }
     }
@@ -9661,13 +9709,21 @@ fn lower_x86_64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), Ob
     reason = "the prepared SysV entry keeps validation, preflight, private native outcome, and continuation marshaling contiguous"
 )]
 fn lower_x86_64_partial_prepared(
-    _view: NativePartialProgramView<'_>,
+    view: &NativePartialProgramView<'_>,
 ) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
     const FRAME_BYTES: u8 = 104;
     let mut assembler = X86Assembler::new();
+    let span_recovery = view.output == OutputContract::Span
+        && !view.dfa.initial_pending
+        && view.exact_match_width.is_none();
+    let native_resume_status = u8::try_from(NATIVE_PARTIAL_STATUS_RESUME)
+        .map_err(|_| ObjectError::InvalidModule("native partial resume status"))?;
+    let native_selected_end_status = u8::try_from(NATIVE_PARTIAL_STATUS_SELECTED_END)
+        .map_err(|_| ObjectError::InvalidModule("native selected-end status"))?;
     let preflight_enter = assembler.label()?;
     let native_match = assembler.label()?;
     let native_resume = assembler.label()?;
+    let native_selected_end = span_recovery.then(|| assembler.label()).transpose()?;
     let native_pending_ready = assembler.label()?;
     let native_invalid = assembler.label()?;
     let invalid = assembler.label()?;
@@ -9764,8 +9820,12 @@ fn lower_x86_64_partial_prepared(
     push_bytes(&mut assembler.code, &[0; 4])?;
     assembler.instruction(&[0x83, 0xf8, 1])?;
     assembler.branch(&[0x0f, 0x84], native_match)?;
-    assembler.instruction(&[0x83, 0xf8, NATIVE_PARTIAL_STATUS_RESUME as u8])?;
+    assembler.instruction(&[0x83, 0xf8, native_resume_status])?;
     assembler.branch(&[0x0f, 0x84], native_resume)?;
+    if let Some(native_selected_end) = native_selected_end {
+        assembler.instruction(&[0x83, 0xf8, native_selected_end_status])?;
+        assembler.branch(&[0x0f, 0x84], native_selected_end)?;
+    }
     assembler.instruction(&[0x85, 0xc0])?;
     assembler.branch(&[0x0f, 0x85], native_invalid)?;
     assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x50])?;
@@ -9783,6 +9843,37 @@ fn lower_x86_64_partial_prepared(
     assembler.instruction(&[0xb8, 1, 0, 0, 0])?;
     assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
     assembler.instruction(&[0xc3])?;
+
+    let span_recovery_relocations = if let Some(native_selected_end) = native_selected_end {
+        assembler.bind(native_selected_end)?;
+        // The native core left the selected end in the second private result
+        // word. Pass the exact admitted window, caller result, authenticated
+        // identity, and endpoint to reverse-K0 recovery without publishing an
+        // intermediate result.
+        assembler.instruction(&[0x48, 0x8d, 0x05])?;
+        let recovery_identity_displacement_label = assembler.label()?;
+        assembler.bind(recovery_identity_displacement_label)?;
+        push_bytes(&mut assembler.code, &[0; 4])?;
+        assembler.instruction(&[0x48, 0x89, 0x04, 0x24])?;
+        assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x28])?;
+        assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x30])?;
+        assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x38])?;
+        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x40])?;
+        assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x48])?;
+        assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x50])?;
+        assembler.instruction(&[0xe8])?;
+        let recovery_runtime_displacement_label = assembler.label()?;
+        assembler.bind(recovery_runtime_displacement_label)?;
+        push_bytes(&mut assembler.code, &[0; 4])?;
+        assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+        assembler.instruction(&[0xc3])?;
+        Some((
+            recovery_identity_displacement_label,
+            recovery_runtime_displacement_label,
+        ))
+    } else {
+        None
+    };
 
     assembler.bind(native_resume)?;
     // Convert the private five-word outcome directly into SysV arguments
@@ -9840,69 +9931,91 @@ fn lower_x86_64_partial_prepared(
     let preflight_runtime_displacement =
         finished.label_offset(preflight_runtime_displacement_label)?;
     let native_core_displacement = finished.label_offset(native_core_displacement_label)?;
+    let span_recovery_displacements = span_recovery_relocations
+        .map(|(identity, runtime)| {
+            Ok::<_, ObjectError>((
+                finished.label_offset(identity)?,
+                finished.label_offset(runtime)?,
+            ))
+        })
+        .transpose()?;
     let identity_displacement = finished.label_offset(identity_displacement_label)?;
     let runtime_displacement = finished.label_offset(runtime_displacement_label)?;
     let fallback_runtime_displacement =
         finished.label_offset(fallback_runtime_displacement_label)?;
-    Ok((
-        finished.code,
-        vec![
-            ModuleRelocation {
-                section: TEXT_SECTION,
-                offset: offset_u64(
-                    preflight_identity_displacement,
-                    "x86 prepared preflight identity relocation",
-                )?,
-                kind: RelocationKind::X86PcRelative32,
-                symbol: PARTIAL_IDENTITY_SYMBOL,
-                addend: -4,
-            },
-            ModuleRelocation {
-                section: TEXT_SECTION,
-                offset: offset_u64(
-                    native_core_displacement,
-                    "x86 prepared native core relocation",
-                )?,
-                kind: RelocationKind::X86PcRelative32,
-                symbol: PARTIAL_NATIVE_CORE_SYMBOL,
-                addend: -4,
-            },
-            ModuleRelocation {
-                section: TEXT_SECTION,
-                offset: offset_u64(
-                    preflight_runtime_displacement,
-                    "x86 prepared preflight runtime relocation",
-                )?,
-                kind: RelocationKind::X86PltRelative32,
-                symbol: PREPARED_PREFLIGHT_RUNTIME_SYMBOL,
-                addend: -4,
-            },
-            ModuleRelocation {
-                section: TEXT_SECTION,
-                offset: offset_u64(identity_displacement, "x86 partial identity relocation")?,
-                kind: RelocationKind::X86PcRelative32,
-                symbol: PARTIAL_IDENTITY_SYMBOL,
-                addend: -4,
-            },
-            ModuleRelocation {
-                section: TEXT_SECTION,
-                offset: offset_u64(runtime_displacement, "x86 partial runtime relocation")?,
-                kind: RelocationKind::X86PltRelative32,
-                symbol: PARTIAL_RUNTIME_SYMBOL,
-                addend: -4,
-            },
-            ModuleRelocation {
-                section: TEXT_SECTION,
-                offset: offset_u64(
-                    fallback_runtime_displacement,
-                    "x86 prepared fallback runtime relocation",
-                )?,
-                kind: RelocationKind::X86PltRelative32,
-                symbol: PREPARED_FALLBACK_RUNTIME_SYMBOL,
-                addend: -4,
-            },
-        ],
-    ))
+    let mut relocations = vec![
+        ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(
+                preflight_identity_displacement,
+                "x86 prepared preflight identity relocation",
+            )?,
+            kind: RelocationKind::X86PcRelative32,
+            symbol: PARTIAL_IDENTITY_SYMBOL,
+            addend: -4,
+        },
+        ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(
+                native_core_displacement,
+                "x86 prepared native core relocation",
+            )?,
+            kind: RelocationKind::X86PcRelative32,
+            symbol: PARTIAL_NATIVE_CORE_SYMBOL,
+            addend: -4,
+        },
+        ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(
+                preflight_runtime_displacement,
+                "x86 prepared preflight runtime relocation",
+            )?,
+            kind: RelocationKind::X86PltRelative32,
+            symbol: PREPARED_PREFLIGHT_RUNTIME_SYMBOL,
+            addend: -4,
+        },
+        ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(identity_displacement, "x86 partial identity relocation")?,
+            kind: RelocationKind::X86PcRelative32,
+            symbol: PARTIAL_IDENTITY_SYMBOL,
+            addend: -4,
+        },
+        ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(runtime_displacement, "x86 partial runtime relocation")?,
+            kind: RelocationKind::X86PltRelative32,
+            symbol: PARTIAL_RUNTIME_SYMBOL,
+            addend: -4,
+        },
+        ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(
+                fallback_runtime_displacement,
+                "x86 prepared fallback runtime relocation",
+            )?,
+            kind: RelocationKind::X86PltRelative32,
+            symbol: PREPARED_FALLBACK_RUNTIME_SYMBOL,
+            addend: -4,
+        },
+    ];
+    if let Some((identity, runtime)) = span_recovery_displacements {
+        relocations.push(ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(identity, "x86 partial Span recovery identity relocation")?,
+            kind: RelocationKind::X86PcRelative32,
+            symbol: PARTIAL_IDENTITY_SYMBOL,
+            addend: -4,
+        });
+        relocations.push(ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(runtime, "x86 partial Span recovery runtime relocation")?,
+            kind: RelocationKind::X86PltRelative32,
+            symbol: PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL,
+            addend: -4,
+        });
+    }
+    Ok((finished.code, relocations))
 }
 
 type Aarch64Label = usize;
@@ -15219,13 +15332,17 @@ fn lower_aarch64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), O
     reason = "the prepared AAPCS64 entry keeps validation, preflight, private native outcome, and continuation marshaling contiguous"
 )]
 fn lower_aarch64_partial_prepared(
-    _view: NativePartialProgramView<'_>,
+    view: &NativePartialProgramView<'_>,
 ) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
     const FRAME_BYTES: u16 = 128;
     let mut assembler = Aarch64Assembler::new();
+    let span_recovery = view.output == OutputContract::Span
+        && !view.dfa.initial_pending
+        && view.exact_match_width.is_none();
     let preflight_enter = assembler.label()?;
     let native_match = assembler.label()?;
     let native_resume = assembler.label()?;
+    let native_selected_end = span_recovery.then(|| assembler.label()).transpose()?;
     let native_pending_ready = assembler.label()?;
     let native_invalid = assembler.label()?;
     let invalid = assembler.label()?;
@@ -15319,6 +15436,14 @@ fn lower_aarch64_partial_prepared(
             .map_err(|_| ObjectError::InvalidModule("native partial resume status"))?,
     )?)?;
     assembler.branch_cond(AARCH64_EQ, native_resume)?;
+    if let Some(native_selected_end) = native_selected_end {
+        assembler.instruction(aarch64_cmp_w_imm(
+            0,
+            u16::try_from(NATIVE_PARTIAL_STATUS_SELECTED_END)
+                .map_err(|_| ObjectError::InvalidModule("native selected-end status"))?,
+        )?)?;
+        assembler.branch_cond(AARCH64_EQ, native_selected_end)?;
+    }
     assembler.instruction(aarch64_cmp_w_imm(0, 0)?)?;
     assembler.branch_cond(AARCH64_NE, native_invalid)?;
     assembler.instruction(aarch64_load_x_imm(5, 31, 72)?)?;
@@ -15338,6 +15463,34 @@ fn lower_aarch64_partial_prepared(
     assembler.instruction(aarch64_load_x_imm(30, 31, 120)?)?;
     assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
     assembler.instruction(0xd65f_03c0)?;
+
+    let span_recovery_relocations = if let Some(native_selected_end) = native_selected_end {
+        assembler.bind(native_selected_end)?;
+        // AAPCS64 carries identity and selected end in x6/x7. The exact
+        // admitted window and untouched caller result reload from their saved
+        // public-argument slots.
+        let recovery_identity_page = assembler.instruction(0x9000_0006)?;
+        let recovery_identity_page_offset =
+            assembler.instruction(aarch64_add_x_imm(6, 6, 0)?)?;
+        assembler.instruction(aarch64_load_x_imm(7, 31, 88)?)?;
+        assembler.instruction(aarch64_load_x_imm(0, 31, 32)?)?;
+        assembler.instruction(aarch64_load_x_imm(1, 31, 40)?)?;
+        assembler.instruction(aarch64_load_x_imm(2, 31, 48)?)?;
+        assembler.instruction(aarch64_load_x_imm(3, 31, 56)?)?;
+        assembler.instruction(aarch64_load_x_imm(4, 31, 64)?)?;
+        assembler.instruction(aarch64_load_x_imm(5, 31, 72)?)?;
+        let recovery_runtime_branch = assembler.instruction(0x9400_0000)?;
+        assembler.instruction(aarch64_load_x_imm(30, 31, 120)?)?;
+        assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+        assembler.instruction(0xd65f_03c0)?;
+        Some((
+            recovery_identity_page,
+            recovery_identity_page_offset,
+            recovery_runtime_branch,
+        ))
+    } else {
+        None
+    };
 
     assembler.bind(native_resume)?;
     // Convert the private five-word outcome directly into AAPCS64 arguments
@@ -15384,7 +15537,7 @@ fn lower_aarch64_partial_prepared(
     assembler.bind(fallback_runtime)?;
     let fallback_runtime_branch = assembler.instruction(0x1400_0000)?;
 
-    let mut relocation_offsets = [
+    let mut relocation_offsets = vec![
         preflight_identity_page,
         preflight_identity_page_offset,
         preflight_runtime_branch,
@@ -15394,80 +15547,123 @@ fn lower_aarch64_partial_prepared(
         runtime_branch,
         fallback_runtime_branch,
     ];
+    let span_recovery_relocation_base = span_recovery_relocations.map(
+        |(identity_page, identity_page_offset, runtime_branch)| {
+            let base = relocation_offsets.len();
+            relocation_offsets.extend([identity_page, identity_page_offset, runtime_branch]);
+            base
+        },
+    );
     let code = assembler.finish_with_offsets(&mut relocation_offsets)?;
-    Ok((
-        code,
-        vec![
-            ModuleRelocation {
-                section: TEXT_SECTION,
-                offset: offset_u64(
-                    relocation_offsets[0],
-                    "AArch64 prepared preflight identity ADRP",
-                )?,
-                kind: RelocationKind::Aarch64Page21,
-                symbol: PARTIAL_IDENTITY_SYMBOL,
-                addend: 0,
-            },
-            ModuleRelocation {
-                section: TEXT_SECTION,
-                offset: offset_u64(
-                    relocation_offsets[1],
-                    "AArch64 prepared preflight identity ADD",
-                )?,
-                kind: RelocationKind::Aarch64PageOff12,
-                symbol: PARTIAL_IDENTITY_SYMBOL,
-                addend: 0,
-            },
-            ModuleRelocation {
-                section: TEXT_SECTION,
-                offset: offset_u64(
-                    relocation_offsets[2],
-                    "AArch64 prepared preflight runtime branch",
-                )?,
-                kind: RelocationKind::Aarch64Branch26,
-                symbol: PREPARED_PREFLIGHT_RUNTIME_SYMBOL,
-                addend: 0,
-            },
-            ModuleRelocation {
-                section: TEXT_SECTION,
-                offset: offset_u64(relocation_offsets[3], "AArch64 prepared native core branch")?,
-                kind: RelocationKind::Aarch64Branch26,
-                symbol: PARTIAL_NATIVE_CORE_SYMBOL,
-                addend: 0,
-            },
-            ModuleRelocation {
-                section: TEXT_SECTION,
-                offset: offset_u64(relocation_offsets[4], "AArch64 partial identity ADRP")?,
-                kind: RelocationKind::Aarch64Page21,
-                symbol: PARTIAL_IDENTITY_SYMBOL,
-                addend: 0,
-            },
-            ModuleRelocation {
-                section: TEXT_SECTION,
-                offset: offset_u64(relocation_offsets[5], "AArch64 partial identity ADD")?,
-                kind: RelocationKind::Aarch64PageOff12,
-                symbol: PARTIAL_IDENTITY_SYMBOL,
-                addend: 0,
-            },
-            ModuleRelocation {
-                section: TEXT_SECTION,
-                offset: offset_u64(relocation_offsets[6], "AArch64 partial runtime branch")?,
-                kind: RelocationKind::Aarch64Branch26,
-                symbol: PARTIAL_RUNTIME_SYMBOL,
-                addend: 0,
-            },
-            ModuleRelocation {
-                section: TEXT_SECTION,
-                offset: offset_u64(
-                    relocation_offsets[7],
-                    "AArch64 prepared fallback runtime branch",
-                )?,
-                kind: RelocationKind::Aarch64Branch26,
-                symbol: PREPARED_FALLBACK_RUNTIME_SYMBOL,
-                addend: 0,
-            },
-        ],
-    ))
+    let mut relocations = vec![
+        ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(
+                relocation_offsets[0],
+                "AArch64 prepared preflight identity ADRP",
+            )?,
+            kind: RelocationKind::Aarch64Page21,
+            symbol: PARTIAL_IDENTITY_SYMBOL,
+            addend: 0,
+        },
+        ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(
+                relocation_offsets[1],
+                "AArch64 prepared preflight identity ADD",
+            )?,
+            kind: RelocationKind::Aarch64PageOff12,
+            symbol: PARTIAL_IDENTITY_SYMBOL,
+            addend: 0,
+        },
+        ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(
+                relocation_offsets[2],
+                "AArch64 prepared preflight runtime branch",
+            )?,
+            kind: RelocationKind::Aarch64Branch26,
+            symbol: PREPARED_PREFLIGHT_RUNTIME_SYMBOL,
+            addend: 0,
+        },
+        ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(relocation_offsets[3], "AArch64 prepared native core branch")?,
+            kind: RelocationKind::Aarch64Branch26,
+            symbol: PARTIAL_NATIVE_CORE_SYMBOL,
+            addend: 0,
+        },
+        ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(relocation_offsets[4], "AArch64 partial identity ADRP")?,
+            kind: RelocationKind::Aarch64Page21,
+            symbol: PARTIAL_IDENTITY_SYMBOL,
+            addend: 0,
+        },
+        ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(relocation_offsets[5], "AArch64 partial identity ADD")?,
+            kind: RelocationKind::Aarch64PageOff12,
+            symbol: PARTIAL_IDENTITY_SYMBOL,
+            addend: 0,
+        },
+        ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(relocation_offsets[6], "AArch64 partial runtime branch")?,
+            kind: RelocationKind::Aarch64Branch26,
+            symbol: PARTIAL_RUNTIME_SYMBOL,
+            addend: 0,
+        },
+        ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(
+                relocation_offsets[7],
+                "AArch64 prepared fallback runtime branch",
+            )?,
+            kind: RelocationKind::Aarch64Branch26,
+            symbol: PREPARED_FALLBACK_RUNTIME_SYMBOL,
+            addend: 0,
+        },
+    ];
+    if let Some(base) = span_recovery_relocation_base {
+        let identity_page_offset_index = base.checked_add(1).ok_or(
+            ObjectError::ArithmeticOverflow("AArch64 Span recovery identity relocation index"),
+        )?;
+        let runtime_branch_index = base.checked_add(2).ok_or(
+            ObjectError::ArithmeticOverflow("AArch64 Span recovery runtime relocation index"),
+        )?;
+        relocations.push(ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(
+                relocation_offsets[base],
+                "AArch64 partial Span recovery identity ADRP",
+            )?,
+            kind: RelocationKind::Aarch64Page21,
+            symbol: PARTIAL_IDENTITY_SYMBOL,
+            addend: 0,
+        });
+        relocations.push(ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(
+                relocation_offsets[identity_page_offset_index],
+                "AArch64 partial Span recovery identity ADD",
+            )?,
+            kind: RelocationKind::Aarch64PageOff12,
+            symbol: PARTIAL_IDENTITY_SYMBOL,
+            addend: 0,
+        });
+        relocations.push(ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(
+                relocation_offsets[runtime_branch_index],
+                "AArch64 partial Span recovery runtime branch",
+            )?,
+            kind: RelocationKind::Aarch64Branch26,
+            symbol: PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL,
+            addend: 0,
+        });
+    }
+    Ok((code, relocations))
 }
 
 #[cfg(test)]
@@ -18486,7 +18682,7 @@ mod tests {
             .native_partial_dfa_view()
             .expect("partial prepared view");
 
-        let (x86, x86_relocations) = lower_x86_64_partial_prepared(view).unwrap();
+        let (x86, x86_relocations) = lower_x86_64_partial_prepared(&view).unwrap();
         assert_eq!(x86.len(), 497, "x86 slim prepared wrapper size");
         assert_eq!(
             x86_relocations
@@ -18547,7 +18743,7 @@ mod tests {
         let fallback_offset = usize::try_from(x86_relocations[5].offset).unwrap();
         assert_eq!(x86.get(fallback_offset.wrapping_sub(1)), Some(&0xe9));
 
-        let (aarch64, aarch64_relocations) = lower_aarch64_partial_prepared(view).unwrap();
+        let (aarch64, aarch64_relocations) = lower_aarch64_partial_prepared(&view).unwrap();
         assert_eq!(aarch64.len(), 464, "AArch64 slim prepared wrapper size");
         assert_eq!(
             aarch64_relocations
@@ -18698,7 +18894,11 @@ mod tests {
     }
 
     #[test]
-    fn partial_span_never_exposes_the_native_selected_end_only_status() {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "cross-ISA status, relocation, and malformed-view checks share one variable-width Span fixture"
+    )]
+    fn partial_span_routes_selected_end_status_to_authenticated_recovery() {
         let limits = CompileLimitsV1 {
             determinize: DeterminizeLimits {
                 max_states: 8,
@@ -18716,7 +18916,78 @@ mod tests {
             .unwrap()
         };
         let span = compile_output(OutputContract::Span);
-        assert!(span.program().native_partial_dfa_view().is_none());
+        let span_view = span
+            .program()
+            .native_partial_dfa_view()
+            .expect("variable-width partial Span native view");
+        assert!(!span_view.dfa.initial_pending);
+        assert!(span_view.exact_match_width.is_none());
+        assert_eq!(
+            span.module()
+                .required_prepared_span_recovery_runtime_symbol(),
+            Some(PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME)
+        );
+        assert_eq!(
+            span.module()
+                .relocations()
+                .iter()
+                .filter(|relocation| {
+                    relocation.symbol == PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL
+                })
+                .count(),
+            1
+        );
+
+        for (code, relocations, architecture) in [
+            {
+                let (code, relocations) = lower_x86_64_partial_prepared(&span_view).unwrap();
+                (code, relocations, Architecture::X86_64)
+            },
+            {
+                let (code, relocations) = lower_aarch64_partial_prepared(&span_view).unwrap();
+                (code, relocations, Architecture::Aarch64)
+            },
+        ] {
+            assert_eq!(
+                relocations
+                    .iter()
+                    .filter(|relocation| {
+                        relocation.symbol == PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL
+                    })
+                    .count(),
+                1,
+                "{architecture:?}"
+            );
+            let recovery = relocations
+                .iter()
+                .find(|relocation| relocation.symbol == PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL)
+                .unwrap();
+            let offset = usize::try_from(recovery.offset).unwrap();
+            match architecture {
+                Architecture::X86_64 => {
+                    assert_eq!(code.get(offset.wrapping_sub(1)), Some(&0xe8));
+                    assert!(code.windows(3).any(|bytes| {
+                        bytes
+                            == [
+                                0x83,
+                                0xf8,
+                                u8::try_from(NATIVE_PARTIAL_STATUS_SELECTED_END).unwrap(),
+                            ]
+                    }));
+                }
+                Architecture::Aarch64 => {
+                    assert_eq!(
+                        u32::from_le_bytes(code[offset..offset + 4].try_into().unwrap()),
+                        0x9400_0000
+                    );
+                    let words = code
+                        .chunks_exact(4)
+                        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                        .collect::<Vec<_>>();
+                    assert!(words.contains(&aarch64_load_x_imm(7, 31, 88).unwrap()));
+                }
+            }
+        }
 
         let selected = compile_output(OutputContract::SelectedEnd);
         let view = selected.program().native_partial_dfa_view().unwrap();
@@ -18725,7 +18996,7 @@ mod tests {
         let reject = |malformed| {
             match lower_native_partial_prepared(
                 selected.program().serialize().unwrap(),
-                malformed,
+                &malformed,
                 Target::x86_64_linux(),
             ) {
                 Err(error) => assert!(matches!(error, ObjectError::InvalidModule(_))),
@@ -18747,10 +19018,6 @@ mod tests {
             !semantic_disagreement.native.dfa.initial_terminal;
         reject(semantic_disagreement);
 
-        let mut variable_span = view;
-        variable_span.output = OutputContract::Span;
-        variable_span.native.output = OutputContract::Span;
-        reject(variable_span);
     }
 
     #[test]
@@ -19248,6 +19515,129 @@ mod tests {
         }
     }
 
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the complete target and feature matrix shares one exact Span recovery ABI audit"
+    )]
+    fn partial_span_recovery_has_exact_relocation_and_abi_on_every_target() {
+        let limits = CompileLimitsV1 {
+            determinize: DeterminizeLimits {
+                max_states: 8,
+                ..DeterminizeLimits::default()
+            },
+            ..CompileLimitsV1::default()
+        };
+        for target in identity_target_matrix() {
+            let compiled = compile(
+                CompileRequest::new(
+                    r"(?-u:[\x00-\xFF])*(?:a+Q|[b-c][a-b]{1,5}(?:x+|y+))Z",
+                    target,
+                )
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span)
+                .limits(limits),
+            )
+            .unwrap_or_else(|error| panic!("partial Span recovery {target:?}: {error}"));
+            let view = compiled
+                .program()
+                .native_partial_dfa_view()
+                .unwrap_or_else(|| panic!("missing partial Span view: {target:?}"));
+            assert!(!view.dfa.initial_pending, "{target:?}");
+            assert!(view.exact_match_width.is_none(), "{target:?}");
+            assert_eq!(
+                compiled
+                    .module()
+                    .required_prepared_span_recovery_runtime_symbol(),
+                Some(PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME),
+                "{target:?}"
+            );
+
+            let prepared = &compiled.module().symbols()[PREPARED_ENTRY_SYMBOL];
+            let prepared_start = usize::try_from(prepared.offset).unwrap();
+            let prepared_end = prepared_start + usize::try_from(prepared.size).unwrap();
+            let text = compiled.module().sections()[TEXT_SECTION].bytes();
+            let code = &text[prepared_start..prepared_end];
+            let recoveries = compiled
+                .module()
+                .relocations()
+                .iter()
+                .filter(|relocation| {
+                    relocation.symbol == PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(recoveries.len(), 1, "{target:?}");
+            let recovery_offset = usize::try_from(recoveries[0].offset).unwrap();
+            assert!(
+                (prepared_start..prepared_end).contains(&recovery_offset),
+                "{target:?}"
+            );
+            let local_recovery = recovery_offset - prepared_start;
+
+            match target.architecture {
+                Architecture::X86_64 => {
+                    assert_eq!(code.get(local_recovery.wrapping_sub(1)), Some(&0xe8));
+                    assert!(code.windows(3).any(|bytes| {
+                        bytes
+                            == [
+                                0x83,
+                                0xf8,
+                                u8::try_from(NATIVE_PARTIAL_STATUS_SELECTED_END).unwrap(),
+                            ]
+                    }));
+                    let identity = compiled
+                        .module()
+                        .relocations()
+                        .iter()
+                        .filter(|relocation| {
+                            relocation.symbol == PARTIAL_IDENTITY_SYMBOL
+                                && usize::try_from(relocation.offset).is_ok_and(|offset| {
+                                    (prepared_start..recovery_offset).contains(&offset)
+                                })
+                        })
+                        .max_by_key(|relocation| relocation.offset)
+                        .expect("x86 Span recovery identity relocation");
+                    let identity_offset =
+                        usize::try_from(identity.offset).unwrap() - prepared_start;
+                    assert_eq!(
+                        code.get(identity_offset.wrapping_sub(3)..identity_offset),
+                        Some([0x48, 0x8d, 0x05].as_slice()),
+                        "{target:?}"
+                    );
+                }
+                Architecture::Aarch64 => {
+                    assert_eq!(
+                        u32::from_le_bytes(
+                            code[local_recovery..local_recovery + 4]
+                                .try_into()
+                                .unwrap()
+                        ),
+                        0x9400_0000,
+                        "{target:?}"
+                    );
+                    let words = code
+                        .chunks_exact(4)
+                        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                        .collect::<Vec<_>>();
+                    assert!(
+                        words.contains(&aarch64_load_x_imm(7, 31, 88).unwrap()),
+                        "{target:?}"
+                    );
+                    assert!(
+                        words.contains(
+                            &aarch64_cmp_w_imm(
+                                0,
+                                u16::try_from(NATIVE_PARTIAL_STATUS_SELECTED_END).unwrap(),
+                            )
+                            .unwrap()
+                        ),
+                        "{target:?}"
+                    );
+                }
+            }
+        }
+    }
+
     #[cfg(all(
         any(target_arch = "x86_64", target_arch = "aarch64"),
         any(target_os = "linux", target_os = "macos")
@@ -19692,6 +20082,231 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         fs::remove_dir_all(&directory).expect("remove real-runtime linker directory");
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    #[ignore = "requires `cargo build -p fre-aot-regex-runtime --lib`; links every output contract against the real exclusive runtime"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the opt-in linked differential proves every output contract and the Span selected-end postflight in native machine code"
+    )]
+    fn linked_host_partial_prepared_all_outputs_match_real_runtime() {
+        use std::{fs, process::Command, time::SystemTime};
+
+        fn local_selected_end(
+            view: &NativePartialProgramView<'_>,
+            bytes: &[u8],
+            start: usize,
+            end: usize,
+        ) -> Option<usize> {
+            let mut row = 0_usize;
+            let mut position = start;
+            let mut pending = view.dfa.initial_pending.then_some(start);
+            while position < end {
+                let byte = *bytes.get(position)?;
+                let class = usize::from(view.dfa.byte_classes[usize::from(byte)]);
+                let cell = view
+                    .dfa
+                    .packed_cells
+                    .get(row.checked_add(class)?)?
+                    .raw();
+                position = position.checked_add(1)?;
+                if cell & PARTIAL_CELL_ACCEPTED != 0 {
+                    pending = Some(position);
+                }
+                let next = cell & !PARTIAL_CELL_ACCEPTED;
+                if next == PARTIAL_CELL_DEAD {
+                    return pending;
+                }
+                if next >= PARTIAL_CELL_HOLE_BASE {
+                    return if position == end { pending } else { None };
+                }
+                row = usize::try_from(next).ok()?;
+            }
+            pending
+        }
+
+        fn c_bytes(bytes: &[u8]) -> String {
+            bytes
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+
+        let mut target = if cfg!(target_arch = "x86_64") {
+            if cfg!(target_os = "linux") {
+                Target::x86_64_linux()
+            } else {
+                Target::x86_64_macos()
+            }
+        } else if cfg!(target_os = "linux") {
+            Target::aarch64_linux()
+        } else {
+            Target::aarch64_macos()
+        };
+        if cfg!(target_arch = "aarch64") {
+            target = target
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap();
+        }
+        let limits = CompileLimitsV1 {
+            determinize: DeterminizeLimits {
+                max_states: 8,
+                ..DeterminizeLimits::default()
+            },
+            ..CompileLimitsV1::default()
+        };
+        let current_exe = std::env::current_exe().expect("current test executable");
+        let profile_dir = current_exe
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("Cargo profile directory");
+        let static_runtime = profile_dir.join("libfre_aot_regex_runtime.a");
+        assert!(
+            static_runtime.is_file(),
+            "build the linked runtime first: cargo build -p fre-aot-regex-runtime --lib ({})",
+            static_runtime.display()
+        );
+
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-real-partial-all-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("create all-output linker directory");
+        let mut haystack = vec![b'!'; PARTIAL_DFA_MIN_INPUT_BYTES];
+        haystack.extend_from_slice(b"aQ");
+        let no_match_len = PARTIAL_DFA_MIN_INPUT_BYTES + 64;
+
+        for (case, output) in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let compiled = compile(
+                CompileRequest::new("a+Q|[b-c][a-b]{1,5}(?:x+|y+)", target)
+                    .mode(CompileMode::Optimizing)
+                    .output(output)
+                    .limits(limits),
+            )
+            .unwrap_or_else(|error| panic!("host partial {output:?}: {error}"));
+            let view = compiled
+                .program()
+                .native_partial_dfa_view()
+                .unwrap_or_else(|| panic!("missing host partial view for {output:?}"));
+            assert!(compiled.module().prepared_entry_symbol().is_some());
+            assert_eq!(
+                compiled
+                    .module()
+                    .required_prepared_span_recovery_runtime_symbol()
+                    .is_some(),
+                output == OutputContract::Span
+            );
+
+            if output == OutputContract::Span {
+                let expected = compiled
+                    .search(&haystack, SearchWindow::new(0, haystack.len()))
+                    .unwrap();
+                let MatchResult::Span(Some((_, selected_end))) = expected else {
+                    panic!("Span fixture did not match: {expected:?}");
+                };
+                let mut workspace = compiled.program().prepare_workspace().unwrap();
+                let preflight = compiled
+                    .program()
+                    .preflight_retained_partial_with_workspace(
+                        &haystack,
+                        SearchWindow::new(0, haystack.len()),
+                        &mut workspace,
+                        compiled.program().artifact_identity(),
+                    )
+                    .unwrap();
+                let crate::program::RetainedPartialPreflight::Enter(native_window) = preflight
+                else {
+                    panic!("Span fixture did not enter native rows: {preflight:?}");
+                };
+                assert_eq!(
+                    local_selected_end(
+                        &view,
+                        &haystack,
+                        native_window.start(),
+                        native_window.end(),
+                    ),
+                    Some(selected_end),
+                    "fixture must exercise native status 4"
+                );
+            }
+
+            let symbol = compiled.module().prepared_entry_symbol().unwrap();
+            let (program_symbol, program_len) =
+                compiled.module().required_runtime_program().unwrap();
+            let object = directory.join(format!("prepared-{case}.o"));
+            fs::write(&object, compiled.object()).expect("write all-output object");
+            let source = format!(
+                "#include <stddef.h>\n#include <stdint.h>\n\
+                 typedef void *handle_t;typedef struct{{size_t start;size_t end;}} result_t;\n\
+                 extern const unsigned char {program_symbol}[];\n\
+                 extern uint32_t {symbol}(handle_t,const unsigned char*,size_t,size_t,size_t,result_t*);\n\
+                 extern uint32_t fre_aot_regex_runtime_prepare_exclusive_v1(const unsigned char*,size_t,handle_t*);\n\
+                 extern uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t,const unsigned char*,size_t,size_t,size_t,result_t*);\n\
+                 extern uint32_t fre_aot_regex_runtime_destroy_exclusive_v1(handle_t);\n\
+                 static const unsigned char haystack[]={{{}}};\n\
+                 static const unsigned char no_match[{no_match_len}]={{0}};\n\
+                 static int prepare(handle_t*h){{return fre_aot_regex_runtime_prepare_exclusive_v1({program_symbol},{program_len}U,h)==0U;}}\n\
+                 static int destroy(handle_t h){{return fre_aot_regex_runtime_destroy_exclusive_v1(h)==0U;}}\n\
+                 static int compare(const unsigned char*p,size_t n,size_t s,size_t e){{\
+                   handle_t native=0,baseline=0;result_t nr={{91U,92U}},br={{93U,94U}};\
+                   if(!prepare(&native)||!prepare(&baseline))return 1;\
+                   uint32_t ns={symbol}(native,p,n,s,e,&nr);\
+                   uint32_t bs=fre_aot_regex_runtime_search_exclusive_v1(baseline,p,n,s,e,&br);\
+                   if(ns!=bs||nr.start!=br.start||nr.end!=br.end)return 2;\
+                   if(!destroy(native)||!destroy(baseline))return 3;return 0;}}\n\
+                 int main(void){{int s=compare(haystack,sizeof(haystack),0U,sizeof(haystack));\
+                   if(s!=0)return 10+s;s=compare(no_match,sizeof(no_match),0U,sizeof(no_match));\
+                   if(s!=0)return 20+s;s=compare(haystack,sizeof(haystack),sizeof(haystack),sizeof(haystack));\
+                   return s==0?0:30+s;}}\n",
+                c_bytes(&haystack),
+            );
+            let c_path = directory.join(format!("prepared-{case}.c"));
+            let executable = directory.join(format!("prepared-{case}"));
+            fs::write(&c_path, source).expect("write all-output C harness");
+            let c_compiler = if cfg!(target_os = "macos") {
+                "clang"
+            } else {
+                "cc"
+            };
+            let status = Command::new(c_compiler)
+                .arg("-O0")
+                .arg(&c_path)
+                .arg(&object)
+                .arg(&static_runtime)
+                .arg("-o")
+                .arg(&executable)
+                .status()
+                .expect("link all-output real-runtime harness");
+            assert!(status.success(), "failed to link {output:?}");
+            let result = Command::new(&executable)
+                .output()
+                .expect("execute all-output real-runtime harness");
+            assert!(
+                result.status.success(),
+                "{output:?}: status={:?} stdout={} stderr={}",
+                result.status.code(),
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        fs::remove_dir_all(&directory).expect("remove all-output linker directory");
     }
 
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
