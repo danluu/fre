@@ -3073,6 +3073,13 @@ impl CompiledProgram {
         if self.context_dfa.is_some() || !matches!(self.engine, ProgramEngine::OrderedNfa) {
             return None;
         }
+        // Match complete retained-table publication: the prepared partial
+        // entry does not carry either whole-window NFA accelerator. Publishing
+        // it would silently replace a complete suffix/cut route with a scalar
+        // retained-row scan followed by an unaccelerated K0 continuation.
+        if self.nfa_mandatory_suffix.is_some() || self.nfa_mandatory_cut.is_some() {
+            return None;
+        }
         let dfa = self.partial_dfa()?.native_incomplete_view()?;
         let (prefix_plan, prefix_supported) =
             PartialDfaPrefixPlan::derive(self.anchored_prefix.sets());
@@ -10886,6 +10893,48 @@ mod tests {
         let state = &workspace.partial.as_deref().unwrap().state;
         assert_eq!(state.complete_accelerated, 1);
         assert_eq!(state.resumed, 0);
+    }
+
+    #[test]
+    fn native_partial_publication_preserves_complete_nfa_accelerators() {
+        let limits = DeterminizeLimits {
+            max_states: 8,
+            ..DeterminizeLimits::default()
+        };
+        for (pattern, expect_suffix) in [
+            (
+                r"(?-u:[\x00-\xFF])*(?:a+Q|[b-c][a-b]{1,5}(?:x+|y+))Z",
+                true,
+            ),
+            (
+                r"(?-u:[\x00-\xFF])*[b-c][a-b]{1,10}7[A-Za-z]+",
+                false,
+            ),
+        ] {
+            let compiled = program(
+                pattern,
+                OutputContract::SelectedEnd,
+                CompileMode::Optimizing,
+                limits,
+            );
+            let partial = compiled
+                .partial_dfa()
+                .and_then(PartialDfa::native_incomplete_view)
+                .unwrap_or_else(|| panic!("fixture has no incomplete retained rows: {pattern:?}"));
+            let (prefix_plan, prefix_supported) =
+                PartialDfaPrefixPlan::derive(compiled.anchored_prefix.sets());
+            assert!(prefix_supported, "unsupported prefix fixture: {pattern:?}");
+            assert!(
+                partial.initial_pending || prefix_plan.is_none(),
+                "selective root already excludes fixture: {pattern:?}"
+            );
+            assert_eq!(compiled.nfa_mandatory_suffix.is_some(), expect_suffix);
+            assert_eq!(compiled.nfa_mandatory_cut.is_some(), !expect_suffix);
+            assert!(
+                compiled.native_partial_dfa_view().is_none(),
+                "native publication replaced a complete NFA accelerator: {pattern:?}"
+            );
+        }
     }
 
     #[test]

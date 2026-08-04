@@ -17598,6 +17598,48 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_retained_forward_with_complete_nfa_accelerator_stays_runtime_backed() {
+        let limits = CompileLimitsV1 {
+            determinize: DeterminizeLimits {
+                max_states: 8,
+                ..DeterminizeLimits::default()
+            },
+            ..CompileLimitsV1::default()
+        };
+        for target in [
+            Target::x86_64_linux(),
+            Target::x86_64_macos(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos(),
+        ] {
+            for pattern in [
+                r"(?-u:[\x00-\xFF])*(?:a+Q|[b-c][a-b]{1,5}(?:x+|y+))Z",
+                r"(?-u:[\x00-\xFF])*[b-c][a-b]{1,10}7[A-Za-z]+",
+            ] {
+                let compiled = compile(
+                    CompileRequest::new(pattern, target)
+                        .mode(CompileMode::Optimizing)
+                        .output(OutputContract::SelectedEnd)
+                        .limits(limits),
+                )
+                .unwrap_or_else(|error| panic!("accelerated partial compile {target:?}: {error}"));
+                let partial = compiled
+                    .program()
+                    .partial_dfa_stats()
+                    .expect("partial-DFA statistics")
+                    .unwrap_or_else(|| panic!("missing retained rows: {target:?}/{pattern:?}"));
+                assert!(partial.complete_rows < partial.discovered_states);
+                assert!(partial.resume_frontiers > 0);
+                assert!(compiled.program().native_partial_dfa_view().is_none());
+                assert!(compiled.module().prepared_entry_symbol().is_none());
+                assert!(compiled.module().required_runtime_program().is_some());
+                assert!(compiled.module().required_runtime_symbol().is_some());
+                assert!(compiled.module().required_prepared_runtime_symbol().is_none());
+            }
+        }
+    }
+
+    #[test]
     #[allow(
         clippy::too_many_lines,
         reason = "the cross-target contract test keeps publication, relocation, and stable-regeneration assertions together"
@@ -17624,12 +17666,8 @@ mod tests {
         ] {
             for (output, pattern) in [
                 (
-                    OutputContract::Exists,
-                    "(?-u:[\\x00-\\xFF])*(?:a+Q|[b-c][a-b]{1,5}(?:x+|y+))",
-                ),
-                (
                     OutputContract::SelectedEnd,
-                    "(?-u:[\\x00-\\xFF])*(?:a+Q|[b-c][a-b]{1,5}(?:x+|y+))",
+                    "a+Q|[b-c][a-b]{1,5}(?:x+|y+)|a*",
                 ),
                 (
                     OutputContract::Span,
