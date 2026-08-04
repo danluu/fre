@@ -1,6 +1,6 @@
 use core::mem::size_of;
 
-use fre_automata::{EdgeKind, RawPlan, StateRole};
+use fre_automata::{Automaton, EdgeKind, RawPlan, StateRole};
 use regex_syntax::{
     hir::{Class, ClassUnicode, Hir, HirKind, Look},
     utf8::{Utf8Range, Utf8Sequences},
@@ -96,6 +96,48 @@ const fn nullable_initial_word_look(look: Look) -> bool {
         look,
         Look::WordAscii | Look::WordAsciiNegate | Look::WordUnicode
     )
+}
+
+// Each bit is one exact `(word_before, word_after)` class, ordered as
+// `(false, false)`, `(true, false)`, `(false, true)`, `(true, true)`. Keeping
+// this as a semantic table lets the lowering proof use ordinary set union;
+// no source spelling or particular pair of assertions is privileged.
+const ASCII_WORD_TRUTH_ALL: u8 = 0b1111;
+const ASCII_WORD_TRUTH_TABLE: [(Look, u8); 6] = [
+    (Look::WordAscii, 0b0110),
+    (Look::WordAsciiNegate, 0b1001),
+    (Look::WordStartAscii, 0b0100),
+    (Look::WordEndAscii, 0b0010),
+    (Look::WordStartHalfAscii, 0b0101),
+    (Look::WordEndHalfAscii, 0b0011),
+];
+
+fn ascii_word_truth(look: Look) -> Option<u8> {
+    ASCII_WORD_TRUTH_TABLE
+        .iter()
+        .find_map(|&(candidate, truth)| (candidate == look).then_some(truth))
+}
+
+fn ascii_word_look(truth: u8) -> Option<Look> {
+    ASCII_WORD_TRUTH_TABLE
+        .iter()
+        .find_map(|&(look, candidate)| (candidate == truth).then_some(look))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FlatLookBranch {
+    Always,
+    Never,
+    AsciiWord(u8),
+    Other(Look),
+    NotFlat,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FlatLookReduction {
+    Always,
+    Never,
+    Look(Look),
 }
 
 #[derive(Clone, Copy)]
@@ -334,6 +376,23 @@ impl<'h> Compiler<'h> {
                 Ok(())
             }
             HirKind::Alternation(branches) => {
+                // This proof deliberately sees only source HIR. In
+                // particular, it can never erase the Unicode scalar-boundary
+                // pair synthesized later by `utf8_start_guard_fragment`.
+                if hir.properties().maximum_len() == Some(0)
+                    && let Some(reduction) = self.try_flat_look_alternation(branches)?
+                {
+                    let fragment = match reduction {
+                        FlatLookReduction::Always => self.empty_fragment()?,
+                        FlatLookReduction::Never => {
+                            self.class_fragment(core::iter::empty())?
+                        }
+                        FlatLookReduction::Look(look) => {
+                            self.assertion_fragment(assertion_edge_kind(look))?
+                        }
+                    };
+                    return self.push_fragment(fragment);
+                }
                 self.push_task(Task::FinishAlternation(branches.len()))?;
                 for branch in branches.iter().rev() {
                     self.push_task(Task::Visit(branch))?;
@@ -341,6 +400,80 @@ impl<'h> Compiler<'h> {
                 Ok(())
             }
             HirKind::Repetition(repetition) => self.visit_repetition(repetition),
+        }
+    }
+
+    /// Reduce one flat capture-transparent alternation of zero-width leaves.
+    ///
+    /// Every branch is classified before graph emission, so a consuming or
+    /// compound branch declines without leaving unreachable states behind.
+    /// Branch order is unobservable after capture erasure because every
+    /// admitted success consumes zero bytes and reaches the same continuation.
+    /// Unicode looks remain opaque: in the pinned byte semantics, Unicode
+    /// `\b|\B` is false at some malformed and continuation-byte boundaries.
+    fn try_flat_look_alternation(
+        &mut self,
+        branches: &'h [Hir],
+    ) -> Result<Option<FlatLookReduction>, LowerError> {
+        let mut always = false;
+        let mut ascii_word = 0_u8;
+        let mut other = None;
+        let mut different_other = false;
+
+        for branch in branches {
+            match self.flat_look_branch(branch)? {
+                FlatLookBranch::Always => always = true,
+                FlatLookBranch::Never => {}
+                FlatLookBranch::AsciiWord(truth) => ascii_word |= truth,
+                FlatLookBranch::Other(look) => match other {
+                    None => other = Some(look),
+                    Some(existing) if existing == look => {}
+                    Some(_) => different_other = true,
+                },
+                FlatLookBranch::NotFlat => return Ok(None),
+            }
+        }
+
+        if always || ascii_word == ASCII_WORD_TRUTH_ALL {
+            return Ok(Some(FlatLookReduction::Always));
+        }
+        if different_other || other.is_some() && ascii_word != 0 {
+            return Ok(None);
+        }
+        if let Some(look) = other {
+            return Ok(Some(FlatLookReduction::Look(look)));
+        }
+        if ascii_word == 0 {
+            return Ok(Some(FlatLookReduction::Never));
+        }
+        Ok(ascii_word_look(ascii_word).map(FlatLookReduction::Look))
+    }
+
+    fn flat_look_branch(&mut self, mut hir: &'h Hir) -> Result<FlatLookBranch, LowerError> {
+        loop {
+            // The proof owns no dynamic storage. Charge exactly one unit for
+            // every source node it inspects before either publication or a
+            // transactional decline to ordinary Thompson lowering.
+            self.charge(1, "flat look-alternation proof")?;
+            match hir.kind() {
+                HirKind::Capture(capture) => hir = &capture.sub,
+                HirKind::Empty => return Ok(FlatLookBranch::Always),
+                HirKind::Literal(literal) if literal.0.is_empty() => {
+                    return Ok(FlatLookBranch::Always);
+                }
+                HirKind::Class(class) if class.is_empty() => {
+                    return Ok(FlatLookBranch::Never);
+                }
+                HirKind::Look(look) => {
+                    return Ok(ascii_word_truth(*look)
+                        .map_or(FlatLookBranch::Other(*look), FlatLookBranch::AsciiWord));
+                }
+                HirKind::Literal(_)
+                | HirKind::Class(_)
+                | HirKind::Concat(_)
+                | HirKind::Alternation(_)
+                | HirKind::Repetition(_) => return Ok(FlatLookBranch::NotFlat),
+            }
         }
     }
 
@@ -1882,6 +2015,11 @@ fn preflight_final_tables(
     edges: usize,
     limits: LowerLimits,
 ) -> Result<(), LowerError> {
+    let byte_class_work = Automaton::byte_class_map_validation_work(edges).ok_or(
+        LowerError::ArithmeticOverflow {
+            computation: "automaton byte-class validation work",
+        },
+    )?;
     let validation_work = states
         .checked_mul(2)
         .and_then(|value| {
@@ -1890,6 +2028,7 @@ fn preflight_final_tables(
                 .and_then(|tail| value.checked_add(tail))
         })
         .and_then(|value| value.checked_add(1))
+        .and_then(|value| value.checked_add(byte_class_work))
         .ok_or(LowerError::ArithmeticOverflow {
             computation: "automaton validation work",
         })?;
@@ -1931,6 +2070,7 @@ fn preflight_final_tables(
     let storage = offsets
         .checked_add(roles)
         .and_then(|value| value.checked_add(edge_storage))
+        .and_then(|value| value.checked_add(Automaton::BYTE_CLASS_MAP_RETAINED_BYTES))
         .ok_or(LowerError::ArithmeticOverflow {
             computation: "raw table storage",
         })?;

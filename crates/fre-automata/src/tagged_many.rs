@@ -24,7 +24,7 @@ use crate::{
 };
 
 /// Stable identity for the shared owner-tagged Build-Many implementation.
-pub const TAGGED_MANY_ACCOUNTING_ID: &str = "fre.automata.tagged-many.v2";
+pub const TAGGED_MANY_ACCOUNTING_ID: &str = "fre.automata.tagged-many.v3";
 const MAX_OWNERS: usize = 128;
 const EMPTY_INDEX: u32 = u32::MAX;
 /// Exact builder-owned allocation attempts for one published quotient.
@@ -1218,6 +1218,16 @@ fn signature_table_capacity(states: usize) -> Result<usize, TaggedManyBuildError
 }
 
 fn raw_validation_work(states: usize, edges: usize) -> Result<u64, TaggedManyBuildError> {
+    let byte_class_work = Automaton::byte_class_map_validation_work(edges).ok_or(
+        TaggedManyBuildError::ArithmeticOverflow {
+            computation: "tagged byte-class validation work",
+        },
+    )?;
+    let byte_class_work = u64::try_from(byte_class_work).map_err(|_| {
+        TaggedManyBuildError::ArithmeticOverflow {
+            computation: "tagged byte-class validation work",
+        }
+    })?;
     let states = u64::try_from(states).map_err(|_| TaggedManyBuildError::ArithmeticOverflow {
         computation: "tagged validation state work",
     })?;
@@ -1228,6 +1238,7 @@ fn raw_validation_work(states: usize, edges: usize) -> Result<u64, TaggedManyBui
         .checked_mul(4)
         .and_then(|work| edges.checked_mul(4).and_then(|tail| work.checked_add(tail)))
         .and_then(|work| work.checked_add(4))
+        .and_then(|work| work.checked_add(byte_class_work))
         .ok_or(TaggedManyBuildError::ArithmeticOverflow {
             computation: "tagged validation work",
         })
@@ -4490,6 +4501,31 @@ mod tests {
             byte_starts: starts,
             byte_ends: ends,
         }
+    }
+
+    #[test]
+    fn source_validation_work_includes_the_exact_byte_class_pass() {
+        let raw = literal(b"a");
+        let states = raw.roles.len();
+        let edges = raw.edge_targets.len();
+        let byte_class_work = Automaton::byte_class_map_validation_work(edges).unwrap();
+        let expected = u64::try_from(4 * states + 4 * edges + 4 + byte_class_work).unwrap();
+        assert_eq!(raw_validation_work(states, edges).unwrap(), expected);
+
+        let limit = expected - 1;
+        assert!(matches!(
+            TaggedManyPlan::<DirectCount>::from_raw(
+                vec![raw],
+                b'\n',
+                compile_limits(),
+                TaggedManyBuildLimits {
+                    max_work: limit,
+                    ..TaggedManyBuildLimits::unlimited()
+                },
+            ),
+            Err(TaggedManyBuildError::WorkLimit { needed, limit: actual_limit })
+                if needed == expected && actual_limit == limit
+        ));
     }
 
     fn uniform_nonliteral_chain(depth: usize) -> RawPlan {

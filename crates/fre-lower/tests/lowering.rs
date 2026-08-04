@@ -356,6 +356,225 @@ fn lowering_maps_every_unicode_word_boundary_without_approximating_it() {
 }
 
 #[test]
+fn flat_ascii_look_alternation_uses_the_complete_truth_lattice() {
+    let cases = [
+        (r"(?-u:\b|\B)", EdgeKind::Epsilon),
+        (r"(?-u:\B|\b)", EdgeKind::Epsilon),
+        (r"(?-u:(\b)|(\B))", EdgeKind::Epsilon),
+        (r"(?-u:\b{start}|\b{end})", EdgeKind::AssertWordAscii),
+        (
+            r"(?-u:\b{start}|\b{start-half})",
+            EdgeKind::AssertWordStartHalfAscii,
+        ),
+    ];
+    for (pattern, expected) in cases {
+        let parsed = parsed(pattern, false);
+        let lowered = lower_raw(
+            &parsed,
+            OperationSemantics::CaptureFree,
+            LowerLimits::default(),
+        )
+        .unwrap_or_else(|error| panic!("failed to lower {pattern:?}: {error}"));
+        assert_eq!(lowered.plan().edge_kinds.as_slice(), &[expected], "{pattern:?}");
+        assert_eq!(lowered.stats().states(), 2, "{pattern:?}");
+        assert_eq!(lowered.stats().edges(), 1, "{pattern:?}");
+    }
+
+    let malformed = [0xFF, 0x80, b'a'];
+    for at in 0..=malformed.len() {
+        assert_eq!(
+            find_window(
+                r"(?-u:\b|\B)",
+                &malformed,
+                SearchWindow::new(at, at),
+            ),
+            Some((at, at)),
+            "at={at}"
+        );
+    }
+}
+
+#[test]
+fn flat_ascii_look_alternation_is_removed_inside_consuming_loops() {
+    let pattern = r"(?:(?-u:\b|\B)[ab])+z";
+    let parsed = parsed(pattern, false);
+    let lowered = lower_raw(
+        &parsed,
+        OperationSemantics::CaptureFree,
+        LowerLimits::default(),
+    )
+    .expect("embedded exhaustive ASCII look lowers");
+    assert!(lowered.plan().edge_kinds.iter().all(|kind| !matches!(
+        kind,
+        EdgeKind::AssertWordAscii | EdgeKind::AssertWordAsciiNegate
+    )));
+    assert_eq!(tuple(find(pattern, &[0xFF, b'a', b'a', b'b', b'z'])), Some((1, 5)));
+
+    let general = lower_general(
+        &parsed,
+        OperationSemantics::CaptureFree,
+        LowerLimits::default(),
+    )
+    .expect("general lowering accepts the same embedded proof");
+    assert_eq!(
+        tuple(
+            general
+                .automaton()
+                .prepare::<Span>()
+                .search(
+                    &[0xFF, b'a', b'a', b'b', b'z'],
+                    SearchLimits::unlimited(),
+                )
+                .expect("general embedded search succeeds")
+                .into_output(),
+        ),
+        Some((1, 5))
+    );
+}
+
+#[test]
+fn unicode_exhaustive_look_alternation_is_not_erased_on_byte_boundaries() {
+    let parsed = parsed(r"\b|\B", true);
+    let lowered = lower_raw(
+        &parsed,
+        OperationSemantics::CaptureFree,
+        LowerLimits::default(),
+    )
+    .expect("Unicode look alternation lowers");
+    assert!(
+        lowered
+            .plan()
+            .edge_kinds
+            .contains(&EdgeKind::AssertWordUnicode)
+    );
+    assert!(
+        lowered
+            .plan()
+            .edge_kinds
+            .contains(&EdgeKind::AssertWordUnicodeNegate)
+    );
+
+    let automaton = lower(
+        &parsed,
+        OperationSemantics::CaptureFree,
+        LowerLimits::default(),
+    )
+    .expect("Unicode look alternation validates");
+    assert_eq!(
+        automaton
+            .automaton()
+            .prepare::<Span>()
+            .search(&[0x80], SearchLimits::unlimited())
+            .expect("malformed-byte search succeeds")
+            .into_output(),
+        None
+    );
+    let alpha = "α".as_bytes();
+    assert_eq!(
+        automaton
+            .automaton()
+            .prepare::<Span>()
+            .search_window(
+                alpha,
+                SearchWindow::new(1, 1),
+                SearchLimits::unlimited(),
+            )
+            .expect("continuation-boundary search succeeds")
+            .into_output(),
+        None
+    );
+}
+
+#[test]
+fn flat_ascii_reduction_preserves_the_synthesized_utf8_start_guard() {
+    let parsed = parsed(r"(?-u:\b|\B)", true);
+    let guarded = lower_utf8_start_guarded(
+        &parsed,
+        OperationSemantics::CaptureFree,
+        LowerLimits::default(),
+    )
+    .expect("guarded exhaustive ASCII look lowers");
+    assert_eq!(guarded.stats().states(), 5);
+    assert_eq!(guarded.stats().edges(), 5);
+
+    let alpha = "α".as_bytes();
+    assert_eq!(
+        guarded
+            .automaton()
+            .prepare::<Span>()
+            .search_window(
+                alpha,
+                SearchWindow::new(1, 1),
+                SearchLimits::unlimited(),
+            )
+            .expect("guarded continuation-boundary search succeeds")
+            .into_output(),
+        None
+    );
+}
+
+#[test]
+fn flat_ascii_look_alternation_has_exact_resource_boundaries() {
+    let parsed = parsed(r"(?-u:(\b)|(\B))", false);
+    let lowered = lower_raw(
+        &parsed,
+        OperationSemantics::CaptureFree,
+        LowerLimits::default(),
+    )
+    .expect("capture-transparent assertion proof lowers");
+    let exact_work = lowered.stats().work();
+
+    let exact = lower_raw(
+        &parsed,
+        OperationSemantics::CaptureFree,
+        LowerLimits {
+            max_work: exact_work,
+            ..LowerLimits::default()
+        },
+    )
+    .expect("exact assertion-algebra work limit passes");
+    assert_eq!(exact.stats().work(), exact_work);
+    assert!(matches!(
+        lower_raw(
+            &parsed,
+            OperationSemantics::CaptureFree,
+            LowerLimits {
+                max_work: exact_work - 1,
+                ..LowerLimits::default()
+            },
+        ),
+        Err(LowerError::ResourceLimit {
+            resource: LowerResource::Work,
+            needed,
+            limit,
+        }) if needed == exact_work && limit == exact_work - 1
+    ));
+
+    for automata in [
+        fre_automata::CompileLimits {
+            max_states: 1,
+            ..fre_automata::CompileLimits::default()
+        },
+        fre_automata::CompileLimits {
+            max_edges: 0,
+            ..fre_automata::CompileLimits::default()
+        },
+    ] {
+        assert!(matches!(
+            lower_raw(
+                &parsed,
+                OperationSemantics::CaptureFree,
+                LowerLimits {
+                    automata,
+                    ..LowerLimits::default()
+                },
+            ),
+            Err(LowerError::ResourceLimit { .. })
+        ));
+    }
+}
+
+#[test]
 fn ordered_priority_and_repeat_greed_are_preserved() {
     assert_eq!(tuple(find("a|ab", b"ab")), Some((0, 1)));
     assert_eq!(tuple(find("ab|a", b"ab")), Some((0, 2)));
@@ -728,7 +947,8 @@ fn ordered_consuming_empty_repetition_proof_and_resources_remain_exact() {
         + stats.edges()
             * (core::mem::size_of::<u32>()
                 + core::mem::size_of::<EdgeKind>()
-                + 2 * core::mem::size_of::<u8>());
+                + 2 * core::mem::size_of::<u8>())
+        + fre_automata::Automaton::BYTE_CLASS_MAP_RETAINED_BYTES;
     let exact_storage_u64 = u64::try_from(exact_storage).expect("small graph storage fits u64");
 
     let exact_limits = LowerLimits {
@@ -1137,7 +1357,8 @@ fn ordered_start_look_nullable_repetition_proof_and_resources_are_exact() {
         + stats.edges()
             * (core::mem::size_of::<u32>()
                 + core::mem::size_of::<EdgeKind>()
-                + 2 * core::mem::size_of::<u8>());
+                + 2 * core::mem::size_of::<u8>())
+        + fre_automata::Automaton::BYTE_CLASS_MAP_RETAINED_BYTES;
     let exact_storage_u64 = u64::try_from(exact_storage).expect("small graph storage fits u64");
 
     let exact_limits = LowerLimits {
@@ -1294,7 +1515,8 @@ fn ordered_empty_nullable_repetition_proof_and_resources_are_exact() {
         + stats.edges()
             * (core::mem::size_of::<u32>()
                 + core::mem::size_of::<EdgeKind>()
-                + 2 * core::mem::size_of::<u8>());
+                + 2 * core::mem::size_of::<u8>())
+        + fre_automata::Automaton::BYTE_CLASS_MAP_RETAINED_BYTES;
     let exact_storage_u64 = u64::try_from(exact_storage).expect("small graph storage fits u64");
 
     let exact_limits = LowerLimits {

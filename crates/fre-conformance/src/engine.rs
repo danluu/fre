@@ -705,13 +705,29 @@ fn compile_automaton(ast: &CaseAst, limits: HarnessLimits) -> Result<Automaton, 
     };
     let accept = builder.add_state(StateRole::Accept, Vec::new())?;
     let start = builder.compile(ast, accept)?;
+    let raw = builder.finish(start)?;
+    let byte_class_work = Automaton::byte_class_map_validation_work(raw.edge_targets.len())
+        .ok_or(Outcome::Refused(RefusalKind::Arithmetic))?;
+    let validation_work = raw
+        .roles
+        .len()
+        .checked_mul(2)
+        .and_then(|states| {
+            raw.edge_targets
+                .len()
+                .checked_mul(2)
+                .and_then(|edges| states.checked_add(edges))
+        })
+        .and_then(|work| work.checked_add(1))
+        .and_then(|work| work.checked_add(byte_class_work))
+        .ok_or(Outcome::Refused(RefusalKind::Arithmetic))?;
     Automaton::from_raw(
-        builder.finish(start)?,
+        raw,
         CompileLimits {
             max_states: limits.max_plan_states,
             max_edges: limits.max_plan_edges,
             max_storage_bytes: limits.max_scratch_bytes,
-            max_validation_work: limits.max_plan_edges.saturating_mul(4),
+            max_validation_work: validation_work,
         },
     )
     .map_err(|error| match error {

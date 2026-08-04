@@ -5,13 +5,20 @@ use std::sync::{
 };
 
 use fre_simd_kernels::{
-    AsciiByteSet, AsciiByteSetClassifier, AsciiSelection, ByteSetClassifier,
-    ASCII_CLASSIFIER_BUILD_WORK,
+    AsciiByteSet, AsciiByteSetClassifier, AsciiByteSetRunScanner, AsciiSelection,
+    ByteSetClassifier, ASCII_CLASSIFIER_BUILD_WORK, ASCII_RUN_SCANNER_BUILD_WORK,
 };
 
 use crate::{CompileError, MalformedPlan, Operation, ResourceKind, TypedPlan, WorkspaceLayout};
 
 static NEXT_AUTOMATON_IDENTITY: AtomicU64 = AtomicU64::new(1);
+
+const BYTE_CLASS_DOMAIN_SIZE: usize = 256;
+// One bounded pass records the at-most-two boundary effects of every edge,
+// including the kind check for zero-width edges.
+const BYTE_CLASS_BOUNDARY_WORK_PER_EDGE: usize = 1;
+// One bounded pass emits the class of every byte.
+const BYTE_CLASS_EMISSION_WORK: usize = BYTE_CLASS_DOMAIN_SIZE;
 
 fn next_automaton_identity() -> u64 {
     NEXT_AUTOMATON_IDENTITY
@@ -41,12 +48,26 @@ pub(crate) const BYTE_START_RANGE_DETECTION_WORK: usize = 4;
 /// Exact abstract work to compile a broad full-byte bitmap classifier.
 ///
 /// Construction visits the complete 256-byte domain once while populating two
-/// exact 16-byte nibble tables. Host capture and immutable leaf selection
-/// happen once after that fixed pass.
+/// exact 16-byte nibble tables. Targets with the wide full-byte execution path
+/// also compile its ASCII nonmember-run scanner. Host capture and immutable
+/// leaf selection happen once after those fixed passes.
+#[cfg(any(
+    test,
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
+))]
+pub(crate) const BYTE_START_SET_CLASSIFIER_BUILD_WORK: usize =
+    fre_simd_kernels::BYTE_SET_CLASSIFIER_BUILD_WORK + ASCII_RUN_SCANNER_BUILD_WORK;
+#[cfg(not(any(
+    test,
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
+)))]
 pub(crate) const BYTE_START_SET_CLASSIFIER_BUILD_WORK: usize =
     fre_simd_kernels::BYTE_SET_CLASSIFIER_BUILD_WORK;
 /// Exact abstract work to compile a broad all-ASCII bitmap scanner.
-pub(crate) const BYTE_START_ASCII_CLASSIFIER_SELECTION_WORK: usize = ASCII_CLASSIFIER_BUILD_WORK;
+pub(crate) const BYTE_START_ASCII_CLASSIFIER_SELECTION_WORK: usize =
+    ASCII_CLASSIFIER_BUILD_WORK + ASCII_RUN_SCANNER_BUILD_WORK;
 /// Exact abstract work to compare one position with the incumbent scanner.
 pub(crate) const START_FILTER_SCANNER_SELECTION_WORK: usize = 1;
 /// Exact abstract work to compare one non-scanner position with the incumbent
@@ -245,6 +266,71 @@ pub struct PlanStats {
     consuming_edges: usize,
     storage_bytes: usize,
     validation_work: usize,
+}
+
+/// Immutable conservative byte equivalence classes for transition caching.
+///
+/// Class IDs follow increasing boundary intervals. The partition need not
+/// merge disjoint intervals with identical edge membership, but every
+/// validated byte range is exactly a union of complete classes. One fixed
+/// inline map makes construction allocation-free and retains all 256
+/// singleton classes when every byte is independently delimited. A class
+/// representative is recovered by a bounded cold scan instead of retaining a
+/// second 256-byte table.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ByteClasses {
+    class_by_byte: [u8; BYTE_CLASS_DOMAIN_SIZE],
+    count: u16,
+}
+
+impl ByteClasses {
+    fn from_validated_ranges(raw: &RawPlan) -> Self {
+        let mut starts_class = [false; BYTE_CLASS_DOMAIN_SIZE];
+        starts_class[0] = true;
+        for edge in 0..raw.edge_kinds.len() {
+            if raw.edge_kinds[edge] != EdgeKind::ByteRange {
+                continue;
+            }
+            let start = usize::from(raw.byte_starts[edge]);
+            let end = raw.byte_ends[edge];
+            starts_class[start] = true;
+            if end != u8::MAX {
+                starts_class[usize::from(end) + 1] = true;
+            }
+        }
+
+        let mut class_by_byte = [0_u8; BYTE_CLASS_DOMAIN_SIZE];
+        let mut count = 0usize;
+        for byte in 0..BYTE_CLASS_DOMAIN_SIZE {
+            if starts_class[byte] {
+                count += 1;
+            }
+            class_by_byte[byte] = u8::try_from(count - 1)
+                .expect("at most 256 byte classes have IDs fitting u8");
+        }
+        Self {
+            class_by_byte,
+            count: u16::try_from(count).expect("the byte-class count fits u16"),
+        }
+    }
+
+    pub(crate) fn class_of(&self, byte: u8) -> u8 {
+        self.class_by_byte[usize::from(byte)]
+    }
+
+    pub(crate) fn representative(&self, class: u8) -> Option<u8> {
+        if usize::from(class) >= self.count() {
+            return None;
+        }
+        self.class_by_byte
+            .iter()
+            .position(|&candidate| candidate == class)
+            .and_then(|byte| u8::try_from(byte).ok())
+    }
+
+    pub(crate) fn count(&self) -> usize {
+        usize::from(self.count)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -448,17 +534,29 @@ impl ByteSet {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StartAsciiClassifier {
     inner: AsciiByteSetClassifier,
+    nonmembers: AsciiByteSetRunScanner,
 }
 
 impl StartAsciiClassifier {
     pub(crate) fn new(set: AsciiByteSet) -> Self {
+        let words = set.words();
         Self {
             inner: AsciiByteSetClassifier::new(set),
+            // This scanner advances only across ASCII bytes outside the exact
+            // start set. A high byte deliberately ends the run so the caller
+            // can fall back to the full fixed-block membership path.
+            nonmembers: AsciiByteSetRunScanner::new(AsciiByteSet::from_words([
+                !words[0], !words[1],
+            ])),
         }
     }
 
     pub(crate) const fn classifier(&self) -> &AsciiByteSetClassifier {
         &self.inner
+    }
+
+    pub(crate) const fn nonmember_scanner(&self) -> &AsciiByteSetRunScanner {
+        &self.nonmembers
     }
 
     const fn set(&self) -> AsciiByteSet {
@@ -468,11 +566,18 @@ impl StartAsciiClassifier {
     const fn selection(&self) -> AsciiSelection {
         self.inner.selection()
     }
+
+    const fn nonmember_selection(&self) -> fre_simd_kernels::SelectionReceipt {
+        self.nonmembers.selection()
+    }
 }
 
 impl PartialEq for StartAsciiClassifier {
     fn eq(&self, other: &Self) -> bool {
-        self.set() == other.set() && self.selection() == other.selection()
+        self.set() == other.set()
+            && self.selection() == other.selection()
+            && self.nonmembers.set() == other.nonmembers.set()
+            && self.nonmember_selection() == other.nonmember_selection()
     }
 }
 
@@ -486,11 +591,36 @@ impl Eq for StartAsciiClassifier {}
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StartByteSetClassifier {
     inner: ByteSetClassifier,
+    #[cfg(any(
+        test,
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
+    ))]
+    ascii_nonmembers: AsciiByteSetRunScanner,
 }
 
 impl StartByteSetClassifier {
-    pub(crate) const fn new(inner: ByteSetClassifier) -> Self {
-        Self { inner }
+    pub(crate) fn new(inner: ByteSetClassifier) -> Self {
+        #[cfg(any(
+            test,
+            target_arch = "x86_64",
+            all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
+        ))]
+        let words = inner.set().words();
+        Self {
+            inner,
+            // The run contains only ASCII bytes absent from the exact
+            // 256-byte set. Every high byte terminates it and is rechecked by
+            // the full classifier, whether that byte is a member or not.
+            #[cfg(any(
+                test,
+                target_arch = "x86_64",
+                all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
+            ))]
+            ascii_nonmembers: AsciiByteSetRunScanner::new(AsciiByteSet::from_words([
+                !words[0], !words[1],
+            ])),
+        }
     }
 
     pub(crate) const fn set(&self) -> ByteSet {
@@ -500,13 +630,40 @@ impl StartByteSetClassifier {
     pub(crate) const fn classifier(&self) -> &ByteSetClassifier {
         &self.inner
     }
+
+    #[cfg(any(
+        test,
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
+    ))]
+    pub(crate) const fn ascii_nonmember_scanner(&self) -> &AsciiByteSetRunScanner {
+        &self.ascii_nonmembers
+    }
 }
 
 impl PartialEq for StartByteSetClassifier {
     fn eq(&self, other: &Self) -> bool {
-        self.inner.set() == other.inner.set()
+        let inner_equal = self.inner.set() == other.inner.set()
             && self.inner.selection() == other.inner.selection()
-            && self.inner.wide_selection() == other.inner.wide_selection()
+            && self.inner.wide_selection() == other.inner.wide_selection();
+        #[cfg(any(
+            test,
+            target_arch = "x86_64",
+            all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
+        ))]
+        {
+            inner_equal
+                && self.ascii_nonmembers.set() == other.ascii_nonmembers.set()
+                && self.ascii_nonmembers.selection() == other.ascii_nonmembers.selection()
+        }
+        #[cfg(not(any(
+            test,
+            target_arch = "x86_64",
+            all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
+        )))]
+        {
+            inner_equal
+        }
     }
 }
 
@@ -694,6 +851,7 @@ pub struct Automaton {
     pub(crate) edge_kinds: Box<[EdgeKind]>,
     pub(crate) byte_starts: Box<[u8]>,
     pub(crate) byte_ends: Box<[u8]>,
+    byte_classes: ByteClasses,
     pub(crate) start_filter_proof: StartFilterProofCell,
     line_terminator: u8,
     stats: PlanStats,
@@ -710,6 +868,7 @@ impl Clone for Automaton {
             edge_kinds: self.edge_kinds.clone(),
             byte_starts: self.byte_starts.clone(),
             byte_ends: self.byte_ends.clone(),
+            byte_classes: self.byte_classes,
             // A clone is a new immutable plan construction. Do not silently
             // copy first-use specialization that this instance has not paid
             // to derive.
@@ -721,6 +880,18 @@ impl Clone for Automaton {
 }
 
 impl Automaton {
+    /// Retained inline bytes added by the exact full-byte class map.
+    pub const BYTE_CLASS_MAP_RETAINED_BYTES: usize = size_of::<ByteClasses>();
+
+    /// Exact additional validation work for the byte-class boundary and
+    /// emission passes over a graph with `edges` edges.
+    #[must_use]
+    pub fn byte_class_map_validation_work(edges: usize) -> Option<usize> {
+        edges
+            .checked_mul(BYTE_CLASS_BOUNDARY_WORK_PER_EDGE)
+            .and_then(|work| work.checked_add(BYTE_CLASS_EMISSION_WORK))
+    }
+
     /// Validate all dimensions, resource limits, roles, edge payloads, and
     /// targets before freezing the supplied vectors.
     ///
@@ -731,7 +902,7 @@ impl Automaton {
     /// or [`CompileError::ArithmeticOverflow`] when a charge cannot be
     /// represented. No partially validated automaton is returned.
     pub fn from_raw(raw: RawPlan, limits: CompileLimits) -> Result<Self, CompileError> {
-        let stats = validate_raw(&raw, limits)?;
+        let (stats, byte_classes) = validate_raw(&raw, limits)?;
         Ok(Self {
             identity: next_automaton_identity(),
             start: raw.start,
@@ -741,6 +912,7 @@ impl Automaton {
             edge_kinds: raw.edge_kinds.into_boxed_slice(),
             byte_starts: raw.byte_starts.into_boxed_slice(),
             byte_ends: raw.byte_ends.into_boxed_slice(),
+            byte_classes,
             start_filter_proof: StartFilterProofCell::new(),
             line_terminator: b'\n',
             stats,
@@ -769,6 +941,11 @@ impl Automaton {
     #[must_use]
     pub const fn stats(&self) -> PlanStats {
         self.stats
+    }
+
+    /// Exact bounded alphabet partition derived from validated byte ranges.
+    pub(crate) const fn byte_classes(&self) -> &ByteClasses {
+        &self.byte_classes
     }
 
     pub(crate) const fn identity(&self) -> u64 {
@@ -1022,22 +1199,29 @@ struct Shape {
     validation_work: usize,
 }
 
-fn validate_raw(raw: &RawPlan, limits: CompileLimits) -> Result<PlanStats, CompileError> {
+fn validate_raw(
+    raw: &RawPlan,
+    limits: CompileLimits,
+) -> Result<(PlanStats, ByteClasses), CompileError> {
     let shape = validate_shape(raw, limits)?;
     validate_offsets(&raw.edge_offsets, shape.edges)?;
     let (zero_width_edges, assertion_edges, assertion_kinds, consuming_states, consuming_edges) =
         validate_graph(raw, shape.states)?;
-    Ok(PlanStats {
-        states: shape.states,
-        edges: shape.edges,
-        zero_width_edges,
-        assertion_edges,
-        assertion_kinds,
-        consuming_states,
-        consuming_edges,
-        storage_bytes: shape.storage_bytes,
-        validation_work: shape.validation_work,
-    })
+    let byte_classes = ByteClasses::from_validated_ranges(raw);
+    Ok((
+        PlanStats {
+            states: shape.states,
+            edges: shape.edges,
+            zero_width_edges,
+            assertion_edges,
+            assertion_kinds,
+            consuming_states,
+            consuming_edges,
+            storage_bytes: shape.storage_bytes,
+            validation_work: shape.validation_work,
+        },
+        byte_classes,
+    ))
 }
 
 fn validate_shape(raw: &RawPlan, limits: CompileLimits) -> Result<Shape, CompileError> {
@@ -1072,6 +1256,11 @@ fn validate_shape(raw: &RawPlan, limits: CompileLimits) -> Result<Shape, Compile
     }
     validate_edge_array_lengths(raw, edges)?;
 
+    let byte_class_work = Automaton::byte_class_map_validation_work(edges).ok_or(
+        CompileError::ArithmeticOverflow {
+            computation: "byte-class validation work",
+        },
+    )?;
     let validation_work = states
         .checked_mul(2)
         .and_then(|value| {
@@ -1080,6 +1269,7 @@ fn validate_shape(raw: &RawPlan, limits: CompileLimits) -> Result<Shape, Compile
                 .and_then(|edge_work| value.checked_add(edge_work))
         })
         .and_then(|value| value.checked_add(1))
+        .and_then(|value| value.checked_add(byte_class_work))
         .ok_or(CompileError::ArithmeticOverflow {
             computation: "validation work",
         })?;
@@ -1291,6 +1481,7 @@ fn storage_bytes(states: usize, edges: usize) -> Result<usize, CompileError> {
     offsets
         .checked_add(state_bytes)
         .and_then(|value| value.checked_add(edge_bytes))
+        .and_then(|value| value.checked_add(Automaton::BYTE_CLASS_MAP_RETAINED_BYTES))
         .ok_or(CompileError::ArithmeticOverflow {
             computation: "automaton storage bytes",
         })
@@ -1331,3 +1522,191 @@ fn validate_offsets(offsets: &[u32], edges: usize) -> Result<(), CompileError> {
 }
 
 use crate::SearchError;
+
+#[cfg(test)]
+mod tests {
+    use core::mem::size_of;
+
+    use super::*;
+
+    fn raw_ranges(ranges: &[(u8, u8)]) -> RawPlan {
+        let edges = u32::try_from(ranges.len()).expect("focused edge count fits u32");
+        RawPlan {
+            start: 0,
+            roles: vec![StateRole::Consume, StateRole::Accept],
+            edge_offsets: vec![0, edges, edges],
+            edge_targets: vec![1; ranges.len()],
+            edge_kinds: vec![EdgeKind::ByteRange; ranges.len()],
+            byte_starts: ranges.iter().map(|&(start, _)| start).collect(),
+            byte_ends: ranges.iter().map(|&(_, end)| end).collect(),
+        }
+    }
+
+    fn compile_ranges(ranges: &[(u8, u8)]) -> Automaton {
+        Automaton::from_raw(raw_ranges(ranges), CompileLimits::default())
+            .expect("focused byte ranges form a valid automaton")
+    }
+
+    #[test]
+    fn byte_classes_cover_overlapping_disjoint_full_and_high_ranges() {
+        let overlapping = compile_ranges(&[(1, 5), (3, 7)]);
+        let classes = overlapping.byte_classes();
+        assert_eq!(classes.count(), 5);
+        for (byte, class) in [
+            (0, 0),
+            (1, 1),
+            (2, 1),
+            (3, 2),
+            (5, 2),
+            (6, 3),
+            (7, 3),
+            (8, 4),
+            (255, 4),
+        ] {
+            assert_eq!(classes.class_of(byte), class, "byte={byte}");
+        }
+        for (class, representative) in [(0, 0), (1, 1), (2, 3), (3, 6), (4, 8)] {
+            assert_eq!(classes.representative(class), Some(representative));
+        }
+        assert_eq!(classes.representative(5), None);
+
+        let disjoint = compile_ranges(&[(10, 20), (30, 40)]);
+        let classes = disjoint.byte_classes();
+        assert_eq!(classes.count(), 5);
+        for (class, representative) in [(0, 0), (1, 10), (2, 21), (3, 30), (4, 41)] {
+            assert_eq!(classes.representative(class), Some(representative));
+        }
+
+        let full = compile_ranges(&[(0, u8::MAX)]);
+        let classes = full.byte_classes();
+        assert_eq!(classes.count(), 1);
+        assert_eq!(classes.representative(0), Some(0));
+        assert!((u8::MIN..=u8::MAX).all(|byte| classes.class_of(byte) == 0));
+
+        let high = compile_ranges(&[(254, 255), (255, 255)]);
+        let classes = high.byte_classes();
+        assert_eq!(classes.count(), 3);
+        assert_eq!(classes.representative(0), Some(0));
+        assert_eq!(classes.representative(1), Some(254));
+        assert_eq!(classes.representative(2), Some(255));
+    }
+
+    #[test]
+    fn byte_classes_support_all_singletons_and_clone_preserves_the_map() {
+        let ranges: Vec<_> = (u8::MIN..=u8::MAX).map(|byte| (byte, byte)).collect();
+        let automaton = compile_ranges(&ranges);
+        let classes = automaton.byte_classes();
+        assert_eq!(classes.count(), BYTE_CLASS_DOMAIN_SIZE);
+        for byte in u8::MIN..=u8::MAX {
+            assert_eq!(classes.class_of(byte), byte);
+            assert_eq!(classes.representative(byte), Some(byte));
+        }
+        assert_eq!(
+            Automaton::BYTE_CLASS_MAP_RETAINED_BYTES,
+            BYTE_CLASS_DOMAIN_SIZE + size_of::<u16>()
+        );
+
+        let expected_validation_work = 2 * 2
+            + ranges.len() * 2
+            + 1
+            + Automaton::byte_class_map_validation_work(ranges.len()).unwrap();
+        assert_eq!(automaton.stats().validation_work(), expected_validation_work);
+        let expected_storage_bytes = 3 * size_of::<u32>()
+            + 2 * size_of::<StateRole>()
+            + ranges.len()
+                * (size_of::<u32>() + size_of::<EdgeKind>() + 2 * size_of::<u8>())
+            + Automaton::BYTE_CLASS_MAP_RETAINED_BYTES;
+        assert_eq!(automaton.stats().storage_bytes(), expected_storage_bytes);
+
+        let identity = automaton.identity();
+        let cloned = automaton.clone();
+        assert_ne!(cloned.identity(), identity);
+        assert_eq!(cloned.byte_classes(), automaton.byte_classes());
+        assert_eq!(cloned.stats(), automaton.stats());
+    }
+
+    #[test]
+    fn byte_classes_refine_every_validated_edge_exhaustively() {
+        let ranges = [
+            (0, 0),
+            (0, 255),
+            (1, 17),
+            (5, 9),
+            (9, 200),
+            (64, 127),
+            (128, 254),
+            (200, 255),
+            (255, 255),
+        ];
+        let automaton = compile_ranges(&ranges);
+        let classes = automaton.byte_classes();
+        for class in 0..classes.count() {
+            let class = u8::try_from(class).expect("class ID fits u8");
+            let representative = classes
+                .representative(class)
+                .expect("each retained class has a representative");
+            assert_eq!(classes.class_of(representative), class);
+            for &(start, end) in &ranges {
+                let representative_is_member = start <= representative && representative <= end;
+                for byte in u8::MIN..=u8::MAX {
+                    if classes.class_of(byte) == class {
+                        assert_eq!(
+                            start <= byte && byte <= end,
+                            representative_is_member,
+                            "class={class} byte={byte} range={start}..={end}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn byte_classes_preserve_malformed_and_exact_limit_boundaries() {
+        let malformed = raw_ranges(&[(9, 8)]);
+        assert_eq!(
+            Automaton::from_raw(malformed, CompileLimits::default()).unwrap_err(),
+            CompileError::Malformed(MalformedPlan::InvalidByteRange {
+                edge: 0,
+                start: 9,
+                end: 8,
+            })
+        );
+
+        let raw = raw_ranges(&[(0, 7), (3, 11), (250, 255)]);
+        let baseline = Automaton::from_raw(raw.clone(), CompileLimits::default())
+            .expect("baseline limits admit byte classes");
+        let storage_bytes = baseline.stats().storage_bytes();
+        let validation_work = baseline.stats().validation_work();
+        assert_eq!(
+            Automaton::from_raw(
+                raw.clone(),
+                CompileLimits {
+                    max_storage_bytes: storage_bytes - 1,
+                    ..CompileLimits::default()
+                },
+            )
+            .unwrap_err(),
+            CompileError::ResourceLimit {
+                resource: ResourceKind::StorageBytes,
+                needed: storage_bytes,
+                limit: storage_bytes - 1,
+            }
+        );
+        assert_eq!(
+            Automaton::from_raw(
+                raw,
+                CompileLimits {
+                    max_validation_work: validation_work - 1,
+                    ..CompileLimits::default()
+                },
+            )
+            .unwrap_err(),
+            CompileError::ResourceLimit {
+                resource: ResourceKind::ValidationWork,
+                needed: validation_work,
+                limit: validation_work - 1,
+            }
+        );
+    }
+}

@@ -289,10 +289,10 @@ impl<'r> PortableGrepSession<'r> {
         } else {
             match &regex.plan {
                 PortablePlan::ExactLiteral(_) => empty_slot,
-                PortablePlan::K0(automaton) => AutomatonSlotLayout::for_automaton(
-                    automaton.stats().states(),
-                    automaton.stats().edges(),
-                    automaton.stats().zero_width_edges(),
+                PortablePlan::K0(k0) => AutomatonSlotLayout::for_automaton(
+                    k0.automaton.stats().states(),
+                    k0.automaton.stats().edges(),
+                    k0.automaton.stats().zero_width_edges(),
                 )?
                 .admission(),
                 PortablePlan::UnicodeWordRun(plan) if word::supports(*plan) => empty_slot,
@@ -381,8 +381,8 @@ impl<'r> PortableGrepSession<'r> {
                 PortablePlan::ExactLiteral(plan) => {
                     EngineProspective::Literal(literal::prospective(plan, haystack_len)?)
                 }
-                PortablePlan::K0(automaton) => {
-                    EngineProspective::K0(k0_grep::prospective(automaton, haystack_len)?)
+                PortablePlan::K0(k0) => {
+                    EngineProspective::K0(k0_grep::prospective(&k0.automaton, haystack_len)?)
                 }
                 PortablePlan::UnicodeWordRun(plan) if word::supports(*plan) => {
                     EngineProspective::Word(word::prospective(*plan, haystack_len)?)
@@ -476,10 +476,10 @@ impl<'r> PortableGrepSession<'r> {
                     run_limits,
                 )
             }
-            (PortablePlan::K0(automaton), EngineProspective::K0(engine)) => Self::execute_k0(
+            (PortablePlan::K0(k0), EngineProspective::K0(engine)) => Self::execute_k0(
                 &mut self.operation,
                 self.compiled_plan_id,
-                automaton,
+                &k0.automaton,
                 haystack,
                 engine,
                 required,
@@ -1263,8 +1263,8 @@ fn compiled_plan_id(regex: &PortableRegex) -> [u8; 16] {
         PortablePlan::ExactLiteral(plan) => {
             digest.tagged_bytes(0x0f, plan.needle());
         }
-        PortablePlan::K0(automaton) => {
-            digest.tagged_bytes(0x10, &k0_grep::structural_plan_identity(automaton));
+        PortablePlan::K0(k0) => {
+            digest.tagged_bytes(0x10, &k0_grep::structural_plan_identity(&k0.automaton));
         }
         PortablePlan::UnicodeWordRun(plan) if word::supports(*plan) => {
             digest.byte(0x11);

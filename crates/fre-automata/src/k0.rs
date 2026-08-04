@@ -1,14 +1,10 @@
 use core::{fmt, mem::size_of};
 
-#[cfg(any(
-    test,
-    target_arch = "x86_64",
-    all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
-))]
-use fre_simd_kernels::BYTE_SET_WIDE_BLOCK_BYTES;
 use fre_simd_kernels::{
-    classify_byte_delta_16, AsciiByteSet, AsciiByteSetClassifier, ByteSet256, ByteSetClassifier,
-    ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, BYTE_SET_BLOCK_BYTES,
+    classify_byte_delta_16, AsciiByteSet, AsciiByteSetClassifier, AsciiByteSetRunScanner,
+    ByteSet256, ByteSetClassifier, ASCII_NARROW_BYTES, ASCII_RUN_SCANNER_BUILD_WORK,
+    ASCII_WIDE_BYTES, BYTE_SET_BLOCK_BYTES, BYTE_SET_CLASSIFIER_BUILD_WORK,
+    BYTE_SET_WIDE_BLOCK_BYTES,
 };
 use memchr::{memchr, memchr2, memchr3};
 
@@ -47,12 +43,27 @@ const START_FILTER_OWNER_ALLOCATION_WORK: u64 = 1;
 // a scan reaches several complete blocks. Ordinary ASIMD never selects this
 // direct-wide path, and x86 uses its independently selected AVX2 leaf.
 const AARCH64_SET_WIDE_MINIMUM_SPAN: usize = 256;
+// Enter the whole-slice nonmember-run leaf only when it can replace at least
+// two ordinary wide classifications. One fixed block always goes first so
+// nearby and dense candidates keep their retained-mask path.
+const ASCII_START_BULK_MIN_BYTES: usize = ASCII_WIDE_BYTES * 2;
 const ROOT_RUN_WINDOW_BYTES: usize = 64;
 // Keep the report-free prefix to one existing classifier block. The cutoff is
 // only an outlining boundary: a stack-local continuation carries the exact
 // DFA row and source position into the complete warm executor, so neither
 // scanner nor transition work is repeated when the prefix is inconclusive.
 const WARM_EXISTS_INLINE_BYTES: usize = BYTE_SET_BLOCK_BYTES;
+// Contextual value projection is speculative because one unpublished
+// `(state, byte, assertion-mask)` record must restart the ordinary executor
+// from the original window. Bound both scanner work and transition progress,
+// and admit that bounded replay only on windows large enough to amortize it.
+const WARM_CONTEXT_SPECULATION_WORK: u64 = 256;
+const WARM_CONTEXT_MIN_WINDOW_BYTES: usize = 4_096;
+// A graph-certified loop scan must replace enough scalar DFA iterations to
+// amortize one state comparison plus the selected run-scanner entry. The
+// threshold is independent of the source contents and deliberately matches
+// two ordinary wide ASCII blocks.
+const LAZY_LOOP_SKIP_MIN_BYTES: usize = ASCII_WIDE_BYTES * 2;
 const ROOT_RUN_SCANNER_SHAPE_MAX_WORK: usize =
     BYTE_START_BITMAP_POPULATION_WORK + BYTE_START_RANGE_DETECTION_WORK;
 const ORDINARY_START_FILTER_PROOF: StartFilterProof = StartFilterProof {
@@ -88,11 +99,13 @@ const _: () = assert!(LAZY_HASH_INDEX_BOOTSTRAP_WORDS * 64 == LAZY_HASH_INDEX_MA
 const EXACT_LAZY_CAPACITY_MAX_ITEMS: usize = 3;
 const LAZY_CELL_ACCEPT: u32 = 1 << 31;
 const LAZY_CELL_RESTART: u32 = 1 << 30;
-// Direct non-context cells use the two bits below as a three-way provenance
-// action. Contextual cells retain `LAZY_CELL_RESTART` with its existing
-// meaning and leave `LAZY_CELL_START_PROPAGATE` clear; reverse cells leave
-// both clear. Even after reserving the extra bit, the encoded direct-row
-// ceiling is orders of magnitude below the remaining state field.
+// Forward cells use the two bits below as a three-way provenance action.
+// For contextual cells, `LAZY_CELL_RESTART` also retains its existing scanner
+// restart meaning: a transition whose source frontier died establishes the
+// new boundary as the only possible start (vacuously so when its contextual
+// root is empty). Reverse cells leave both bits clear. Even after reserving
+// the extra bit, the encoded row ceiling is orders of magnitude below the
+// remaining state field.
 const LAZY_CELL_START_PROPAGATE: u32 = 1 << 29;
 const LAZY_CELL_STATE_MASK: u32 = LAZY_CELL_START_PROPAGATE - 1;
 const LAZY_CELL_UNFILLED: u32 = u32::MAX;
@@ -100,6 +113,8 @@ const LAZY_NO_STATE: u32 = u32::MAX;
 #[cfg(test)]
 const ASSERTION_KIND_COUNT: usize = 18;
 const CONTEXT_SYMBOL_BYTE_BITS: u32 = 9;
+const CONTEXT_SYMBOL_BYTE_MASK: u32 = (1 << CONTEXT_SYMBOL_BYTE_BITS) - 1;
+const CONTEXT_DEPENDENCY_UNCOMPUTED: u32 = u32::MAX;
 const CONTEXT_INITIAL_BYTE: u32 = 256;
 const CONTEXT_TRANSITION_WAYS: usize = 4;
 const CONTEXT_TRANSITION_MAX_SLOTS: usize = LAZY_MAX_STATES * BYTE_ALPHABET;
@@ -120,9 +135,9 @@ const CONTEXT_INITIAL_SOURCE: u32 = u32::MAX - 1;
     clippy::arithmetic_side_effects,
     reason = "the fixed lazy-state ceiling and byte alphabet prove the row index fits usize"
 )]
-fn direct_row_cell_index(state: usize, byte: u8) -> usize {
+fn direct_row_cell_index(state: usize, class: u8) -> usize {
     debug_assert!(state < LAZY_MAX_STATES);
-    state * BYTE_ALPHABET + usize::from(byte)
+    state * BYTE_ALPHABET + usize::from(class)
 }
 
 /// Authenticate one direct-row source once, before entering a warmed loop.
@@ -229,9 +244,30 @@ impl ContextTransitionSlot {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ContextHotTransition {
+    symbol: u32,
+    value: u32,
+    dependency_mask: u32,
+    lookup_work: u8,
+}
+
+impl ContextHotTransition {
+    const EMPTY: Self = Self {
+        symbol: u32::MAX,
+        value: 0,
+        dependency_mask: CONTEXT_DEPENDENCY_UNCOMPUTED,
+        lookup_work: 0,
+    };
+}
+
 struct ContextTransitionStore {
     slots: Vec<ContextTransitionSlot>,
+    hot: Vec<ContextHotTransition>,
+    hot_initial: ContextHotTransition,
     bucket_mask: usize,
+    published: u32,
+    loop_candidates_published: u32,
 }
 
 impl fmt::Debug for ContextTransitionStore {
@@ -244,6 +280,7 @@ impl fmt::Debug for ContextTransitionStore {
         formatter
             .debug_struct("ContextTransitionStore")
             .field("slots", &self.slots.len())
+            .field("hot", &self.hot.len())
             .field("buckets", &buckets)
             .field("occupied", &self.occupied_slots())
             .finish()
@@ -251,18 +288,30 @@ impl fmt::Debug for ContextTransitionStore {
 }
 
 impl ContextTransitionStore {
-    fn new(slot_count: usize, total_bytes: usize) -> Result<Self, SearchError> {
+    fn new(
+        slot_count: usize,
+        hot_count: usize,
+        total_bytes: usize,
+    ) -> Result<Self, SearchError> {
         let bucket_mask = contextual_transition_bucket_mask(slot_count)?;
         Ok(Self {
             slots: allocate_slots(slot_count, ContextTransitionSlot::EMPTY, total_bytes)?,
+            hot: allocate_slots(hot_count, ContextHotTransition::EMPTY, total_bytes)?,
+            hot_initial: ContextHotTransition::EMPTY,
             bucket_mask,
+            published: 0,
+            loop_candidates_published: 0,
         })
     }
 
     const fn disabled() -> Self {
         Self {
             slots: Vec::new(),
+            hot: Vec::new(),
+            hot_initial: ContextHotTransition::EMPTY,
             bucket_mask: 0,
+            published: 0,
+            loop_candidates_published: 0,
         }
     }
 
@@ -278,7 +327,17 @@ impl ContextTransitionStore {
     }
 
     fn retained_bytes(&self) -> Result<usize, SearchError> {
-        capacity_bytes::<ContextTransitionSlot>(&self.slots, "contextual transition cache bytes")
+        let slots =
+            capacity_bytes::<ContextTransitionSlot>(&self.slots, "contextual transition cache bytes")?;
+        let hot = capacity_bytes::<ContextHotTransition>(
+            &self.hot,
+            "contextual hot-transition cache bytes",
+        )?;
+        slots
+            .checked_add(hot)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "contextual transition retained bytes",
+            })
     }
 
     fn lookup(
@@ -288,20 +347,12 @@ impl ContextTransitionStore {
         meter: &mut WorkMeter,
         position: usize,
     ) -> Result<(Option<u32>, Option<usize>), SearchError> {
-        let expected_slots = self
-            .bucket_mask
-            .checked_add(1)
-            .and_then(|buckets| buckets.checked_mul(CONTEXT_TRANSITION_WAYS))
-            .ok_or(SearchError::ArithmeticOverflow {
-                computation: "contextual transition store shape",
-            })?;
-        if self.slots.is_empty()
-            || self.slots.len() != expected_slots
-            || self.slots.len() > CONTEXT_TRANSITION_MAX_SLOTS
-        {
-            return Err(SearchError::InternalInvariant {
-                detail: "contextual transition store has an invalid bucket shape",
-            });
+        self.validate_shape()?;
+        let hot = self.hot_transition(source)?;
+        if hot.symbol == symbol {
+            debug_assert!((2..=CONTEXT_TRANSITION_WAYS + 1).contains(&usize::from(hot.lookup_work)));
+            meter.charge(u64::from(hot.lookup_work), position)?;
+            return Ok((Some(hot.value), None));
         }
         meter.charge(1, position)?;
         let bucket = contextual_transition_hash(source, symbol) & self.bucket_mask;
@@ -336,6 +387,88 @@ impl ContextTransitionStore {
         Ok((None, empty))
     }
 
+    fn validate_shape(&self) -> Result<(), SearchError> {
+        let expected_slots = self
+            .bucket_mask
+            .checked_add(1)
+            .and_then(|buckets| buckets.checked_mul(CONTEXT_TRANSITION_WAYS))
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "contextual transition store shape",
+            })?;
+        if self.slots.is_empty()
+            || self.slots.len() != expected_slots
+            || self.slots.len() > CONTEXT_TRANSITION_MAX_SLOTS
+            || self.hot.len() > LAZY_MAX_STATES
+        {
+            return Err(SearchError::InternalInvariant {
+                detail: "contextual transition store has an invalid bucket shape",
+            });
+        }
+        Ok(())
+    }
+
+    fn hot_transition(&self, source: u32) -> Result<ContextHotTransition, SearchError> {
+        if source == CONTEXT_INITIAL_SOURCE {
+            return Ok(self.hot_initial);
+        }
+        if self.hot.is_empty() {
+            return Ok(ContextHotTransition::EMPTY);
+        }
+        self.hot
+            .get(
+                usize::try_from(source).map_err(|_| SearchError::InternalInvariant {
+                    detail: "contextual hot-transition source does not fit usize",
+                })?,
+            )
+            .copied()
+            .ok_or(SearchError::InternalInvariant {
+                detail: "contextual hot-transition source is outside its state domain",
+            })
+    }
+
+    /// Read one already-published contextual transition after one outer shape
+    /// validation, without reserving a slot or charging report-visible work.
+    /// A miss leaves the store untouched so ordinary execution can restart
+    /// transactionally.
+    fn lookup_existing_prevalidated(
+        &self,
+        source: u32,
+        symbol: u32,
+    ) -> Result<Option<u32>, SearchError> {
+        debug_assert!(self.validate_shape().is_ok());
+        let hot = self.hot_transition(source)?;
+        if hot.symbol == symbol {
+            return Ok(Some(hot.value));
+        }
+        let bucket = contextual_transition_hash(source, symbol) & self.bucket_mask;
+        let begin =
+            bucket
+                .checked_mul(CONTEXT_TRANSITION_WAYS)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "contextual transition bucket",
+                })?;
+        let end = begin
+            .checked_add(CONTEXT_TRANSITION_WAYS)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "contextual transition bucket end",
+            })?;
+        let ways = self
+            .slots
+            .get(begin..end)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "contextual transition bucket is outside the fixed store",
+            })?;
+        for &slot in ways {
+            if slot.source == source && slot.symbol == symbol {
+                return Ok(Some(slot.value));
+            }
+            if slot.source == CONTEXT_EMPTY_SOURCE {
+                return Ok(None);
+            }
+        }
+        Ok(None)
+    }
+
     fn publish(
         &mut self,
         index: Option<usize>,
@@ -351,14 +484,68 @@ impl ContextTransitionStore {
             return Ok(());
         }
         meter.charge(1, position)?;
-        let slot = self
-            .slots
-            .get_mut(index)
-            .ok_or(SearchError::InternalInvariant {
-                detail: "contextual transition publication is outside the fixed store",
+        let published = {
+            let slot = self
+                .slots
+                .get_mut(index)
+                .ok_or(SearchError::InternalInvariant {
+                    detail: "contextual transition publication is outside the fixed store",
+                })?;
+            if slot.source == CONTEXT_EMPTY_SOURCE {
+                *slot = record;
+                true
+            } else {
+                false
+            }
+        };
+        if published {
+            self.published = self.published.checked_add(1).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "contextual transition publication count",
+                },
+            )?;
+            let way = index % CONTEXT_TRANSITION_WAYS;
+            let lookup_work = u8::try_from(
+                way.checked_add(2)
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "contextual hot-transition lookup work",
+                    })?,
+            )
+            .map_err(|_| SearchError::InternalInvariant {
+                detail: "contextual hot-transition lookup work does not fit u8",
             })?;
-        if slot.source == CONTEXT_EMPTY_SOURCE {
-            *slot = record;
+            let mut hot = ContextHotTransition {
+                symbol: record.symbol,
+                value: record.value,
+                dependency_mask: CONTEXT_DEPENDENCY_UNCOMPUTED,
+                lookup_work,
+            };
+            if record.source == CONTEXT_INITIAL_SOURCE {
+                hot.dependency_mask = self.hot_initial.dependency_mask;
+                self.hot_initial = hot;
+            } else if !self.hot.is_empty() {
+                let source = usize::try_from(record.source).map_err(|_| {
+                    SearchError::InternalInvariant {
+                        detail: "contextual hot-transition publication source does not fit usize",
+                    }
+                })?;
+                let retained = self.hot.get_mut(source).ok_or(SearchError::InternalInvariant {
+                    detail: "contextual hot-transition publication is outside its state domain",
+                })?;
+                hot.dependency_mask = retained.dependency_mask;
+                let symbol_byte = record.symbol & CONTEXT_SYMBOL_BYTE_MASK;
+                if symbol_byte < CONTEXT_INITIAL_BYTE
+                    && context_cell_is_nonaccepting_self_loop(record)
+                {
+                    self.loop_candidates_published = self
+                        .loop_candidates_published
+                        .checked_add(1)
+                        .ok_or(SearchError::ArithmeticOverflow {
+                            computation: "contextual loop candidate publication count",
+                        })?;
+                }
+                *retained = hot;
+            }
         }
         Ok(())
     }
@@ -423,6 +610,36 @@ fn contextual_transition_hash(source: u32, symbol: u32) -> usize {
 
 const fn contextual_symbol(byte: u32, assertions: u32) -> u32 {
     byte | (assertions << CONTEXT_SYMBOL_BYTE_BITS)
+}
+
+const fn encoded_nonaccepting_self_loop_action(
+    encoded: u32,
+    value: u32,
+) -> Option<LazyStartAction> {
+    if value & LAZY_CELL_STATE_MASK != encoded
+        || value & (LAZY_CELL_ACCEPT | LAZY_CELL_RESTART) != 0
+    {
+        return None;
+    }
+    if value & LAZY_CELL_START_PROPAGATE != 0 {
+        Some(LazyStartAction::Propagate)
+    } else {
+        Some(LazyStartAction::Drop)
+    }
+}
+
+const fn context_nonaccepting_self_loop_action(
+    source: u32,
+    value: u32,
+) -> Option<LazyStartAction> {
+    let Some(encoded) = source.checked_add(1) else {
+        return None;
+    };
+    encoded_nonaccepting_self_loop_action(encoded, value)
+}
+
+const fn context_cell_is_nonaccepting_self_loop(record: ContextTransitionSlot) -> bool {
+    context_nonaccepting_self_loop_action(record.source, record.value).is_some()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -876,11 +1093,15 @@ impl WorkspaceLayout {
         let lazy_allocations = if lazy_state_capacity == 0 {
             0
         } else {
-            // The contextual store replaces the direct-row allocation.
+            // The contextual store replaces the direct-row allocation and
+            // its exact-tag hot vector adds one further nonempty allocation.
             7usize
-                .checked_add(usize::from(
-                    lazy_state_capacity >= LAZY_HASH_INDEX_MIN_STATES,
-                ))
+                .checked_add(usize::from(lazy_context_slots != 0))
+                .and_then(|value| {
+                    value.checked_add(usize::from(
+                        lazy_state_capacity >= LAZY_HASH_INDEX_MIN_STATES,
+                    ))
+                })
                 .and_then(|value| value.checked_add(usize::from(lazy_item_capacity != 0)))
                 .ok_or(SearchError::ArithmeticOverflow {
                     computation: "lazy workspace allocation count",
@@ -1059,6 +1280,203 @@ enum LazyStartAction {
     Reset,
 }
 
+/// One immutable scanner for a graph-proved byte-class member run.
+///
+/// ASCII-only classes retain the operation-specific run scanner. Mixed or
+/// high-byte classes use the exact 256-byte classifier, while the universal
+/// class needs no source classification at all: the graph proof already says
+/// every byte has the same transition. Construction fixes the dispatch choice
+/// before this scanner enters a warmed executor.
+#[derive(Clone, Copy, Debug)]
+enum LazyLoopScanner {
+    All,
+    Ascii(AsciiByteSetRunScanner),
+    Set(ByteSetClassifier),
+}
+
+impl LazyLoopScanner {
+    #[cold]
+    fn new(words: [u64; 4]) -> Self {
+        if words == [u64::MAX; 4] {
+            return Self::All;
+        }
+        if words[2] == 0 && words[3] == 0 {
+            return Self::Ascii(AsciiByteSetRunScanner::new(AsciiByteSet::from_words([
+                words[0], words[1],
+            ])));
+        }
+        Self::Set(ByteSetClassifier::new(ByteSet256::from_words(words)))
+    }
+
+    const fn build_work(words: [u64; 4]) -> u64 {
+        if words[0] == u64::MAX
+            && words[1] == u64::MAX
+            && words[2] == u64::MAX
+            && words[3] == u64::MAX
+        {
+            0
+        } else if words[2] == 0 && words[3] == 0 {
+            ASCII_RUN_SCANNER_BUILD_WORK as u64
+        } else {
+            BYTE_SET_CLASSIFIER_BUILD_WORK as u64
+        }
+    }
+
+    fn scan_forward(&self, source: &[u8]) -> usize {
+        match self {
+            Self::All => source.len(),
+            Self::Ascii(scanner) => scanner.scan_forward(source).member_run_len(),
+            Self::Set(classifier) => scan_full_byte_member_prefix(classifier, source),
+        }
+    }
+
+    #[cfg(test)]
+    fn contains(&self, byte: u8) -> bool {
+        match self {
+            Self::All => true,
+            Self::Ascii(scanner) => {
+                byte.is_ascii() && scanner.set().contains(byte)
+            }
+            Self::Set(classifier) => classifier.set().contains(byte),
+        }
+    }
+
+    fn cardinality(&self) -> u32 {
+        match self {
+            Self::All => 256,
+            Self::Ascii(scanner) => {
+                let words = scanner.set().words();
+                words[0].count_ones() + words[1].count_ones()
+            }
+            Self::Set(classifier) => classifier
+                .set()
+                .words()
+                .into_iter()
+                .map(u64::count_ones)
+                .sum(),
+        }
+    }
+}
+
+#[inline]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "fixed classifier extents and a bounded source slice prove every block advance"
+)]
+fn scan_full_byte_member_prefix(classifier: &ByteSetClassifier, source: &[u8]) -> usize {
+    let mut position = 0usize;
+    let candidate_block_bytes = classifier.candidate_block_bytes();
+    #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+    let candidate_block_bytes = if source.len() < AARCH64_SET_WIDE_MINIMUM_SPAN {
+        BYTE_SET_BLOCK_BYTES
+    } else {
+        candidate_block_bytes
+    };
+
+    if candidate_block_bytes == BYTE_SET_WIDE_BLOCK_BYTES {
+        while source.len().saturating_sub(position) >= BYTE_SET_WIDE_BLOCK_BYTES {
+            let end = position + BYTE_SET_WIDE_BLOCK_BYTES;
+            let block: &[u8; BYTE_SET_WIDE_BLOCK_BYTES] = source[position..end]
+                .try_into()
+                .expect("the full-byte loop scanner checked its wide extent");
+            let nonmembers = !classifier.classify_32(block).member_mask();
+            if nonmembers != 0 {
+                return position
+                    + usize::try_from(nonmembers.trailing_zeros())
+                        .expect("a wide full-byte lane fits usize");
+            }
+            position = end;
+        }
+    }
+
+    while source.len().saturating_sub(position) >= BYTE_SET_BLOCK_BYTES {
+        let end = position + BYTE_SET_BLOCK_BYTES;
+        let block: &[u8; BYTE_SET_BLOCK_BYTES] = source[position..end]
+            .try_into()
+            .expect("the full-byte loop scanner checked its narrow extent");
+        let nonmembers = !classifier.classify_16(block).member_mask();
+        if nonmembers != 0 {
+            return position
+                + usize::try_from(nonmembers.trailing_zeros())
+                    .expect("a narrow full-byte lane fits usize");
+        }
+        position = end;
+    }
+
+    let set = classifier.set();
+    position
+        + source[position..]
+            .iter()
+            .take_while(|&&byte| set.contains(byte))
+            .count()
+}
+
+/// One graph-only proof for skipping a nonaccepting direct-DFA loop.
+///
+/// One already-published cell authenticates that the complete ordered
+/// transition returns to `row_offset`, does not accept, and has one exact
+/// start-provenance action. State-local ordered-edge equivalence supplies any
+/// inferred sibling bytes with that same action to the scanner without
+/// publishing their cells.
+#[derive(Clone, Copy, Debug)]
+struct LazyLoopSkipPlan {
+    row_offset: u32,
+    scanner: LazyLoopScanner,
+    start_action: LazyStartAction,
+}
+
+/// One authenticated contextual self-loop whose complete transition closure
+/// is stable throughout either a full assertion-independent run or the
+/// interior of one exact byte-context category.
+#[derive(Clone, Copy, Debug)]
+struct ContextLazyLoopSkipPlan {
+    state: u32,
+    scanner: LazyLoopScanner,
+    start_action: LazyStartAction,
+    leave_final_member: bool,
+}
+
+/// Invocation-local suppression for an unproductive retained loop scanner.
+///
+/// Narrow graph classes can still have long profitable runs, so plan
+/// admission is class-size independent. If one runtime probe finds less than
+/// one wide block, wait two wide blocks of scalar progress before trying that
+/// same state again. Leaving the plan state clears the negative evidence.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct LazyLoopProbe {
+    retry_at: Option<usize>,
+}
+
+impl LazyLoopProbe {
+    const fn is_ready(self, position: usize) -> bool {
+        match self.retry_at {
+            Some(retry_at) => position >= retry_at,
+            None => true,
+        }
+    }
+
+    const fn left_plan_state(&mut self) {
+        self.retry_at = None;
+    }
+
+    fn observe(
+        &mut self,
+        position: usize,
+        member_run: usize,
+    ) -> Result<(), SearchError> {
+        self.retry_at = if member_run < ASCII_WIDE_BYTES {
+            Some(position.checked_add(LAZY_LOOP_SKIP_MIN_BYTES).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "lazy loop probe retry position",
+                },
+            )?)
+        } else {
+            None
+        };
+        Ok(())
+    }
+}
+
 impl LazyStartAction {
     const fn cell_bits(self) -> u32 {
         match self {
@@ -1090,6 +1508,7 @@ enum ContextLazyTransition {
         accepted: bool,
         pending: bool,
         restartable: bool,
+        start_action: LazyStartAction,
     },
 }
 
@@ -1141,6 +1560,13 @@ struct LazyWorkspace {
     initial: u32,
     initial_kind: LazyInitialKind,
     inline_start_action: LazyStartAction,
+    loop_skip_plan: Option<LazyLoopSkipPlan>,
+    context_loop_skip_plan: Option<ContextLazyLoopSkipPlan>,
+    direct_cells_published: u32,
+    loop_skip_analyzed_at_cells: u32,
+    context_loop_skip_analyzed_at_candidates: u32,
+    context_dependencies_analyzed: usize,
+    context_loop_skip_analyzed_at_dependencies: usize,
     initialized: bool,
     declined: bool,
     saturated: bool,
@@ -1173,7 +1599,15 @@ impl LazyWorkspace {
             frontier: allocate_slots(layout.states, 0_u32, total_bytes)?,
             frontier_len: 0,
             rows: allocate_slots(row_cells, LAZY_CELL_UNFILLED, total_bytes)?,
-            context: ContextTransitionStore::new(layout.lazy_context_slots, total_bytes)?,
+            context: ContextTransitionStore::new(
+                layout.lazy_context_slots,
+                if layout.lazy_context_slots == 0 {
+                    0
+                } else {
+                    state_capacity
+                },
+                total_bytes,
+            )?,
             offsets: allocate_slots(state_capacity, 0_usize, total_bytes)?,
             lengths: allocate_slots(state_capacity, 0_u32, total_bytes)?,
             modes: allocate_slots(state_capacity, 0_u8, total_bytes)?,
@@ -1189,6 +1623,13 @@ impl LazyWorkspace {
             initial: LAZY_NO_STATE,
             initial_kind: LazyInitialKind::Uninitialized,
             inline_start_action: LazyStartAction::Drop,
+            loop_skip_plan: None,
+            context_loop_skip_plan: None,
+            direct_cells_published: 0,
+            loop_skip_analyzed_at_cells: 0,
+            context_loop_skip_analyzed_at_candidates: 0,
+            context_dependencies_analyzed: 0,
+            context_loop_skip_analyzed_at_dependencies: 0,
             initialized: false,
             declined: false,
             saturated: false,
@@ -1215,6 +1656,13 @@ impl LazyWorkspace {
             initial: LAZY_NO_STATE,
             initial_kind: LazyInitialKind::Uninitialized,
             inline_start_action: LazyStartAction::Drop,
+            loop_skip_plan: None,
+            context_loop_skip_plan: None,
+            direct_cells_published: 0,
+            loop_skip_analyzed_at_cells: 0,
+            context_loop_skip_analyzed_at_candidates: 0,
+            context_dependencies_analyzed: 0,
+            context_loop_skip_analyzed_at_dependencies: 0,
             initialized: false,
             declined: true,
             saturated: false,
@@ -1298,6 +1746,39 @@ impl LazyWorkspace {
         Ok((offset, length, pending))
     }
 
+    fn exact_context_dependency_mask(&self, state: u32) -> Result<Option<u32>, SearchError> {
+        let state = usize::try_from(state).map_err(|_| SearchError::InternalInvariant {
+            detail: "contextual dependency state does not fit usize",
+        })?;
+        if state >= self.state_len {
+            return Err(SearchError::InternalInvariant {
+                detail: "contextual dependency state is outside the retained cache",
+            });
+        }
+        let mask = self
+            .context
+            .hot
+            .get(state)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "contextual dependency state is outside hot metadata",
+            })?
+            .dependency_mask;
+        Ok((mask != CONTEXT_DEPENDENCY_UNCOMPUTED).then_some(mask))
+    }
+
+    fn context_dependency_mask(&self, state: u32, fallback: u32) -> Result<u32, SearchError> {
+        Ok(self.exact_context_dependency_mask(state)?.unwrap_or(fallback))
+    }
+
+    fn context_root_dependency_mask(&self, fallback: u32) -> u32 {
+        let mask = self.context.hot_initial.dependency_mask;
+        if mask == CONTEXT_DEPENDENCY_UNCOMPUTED {
+            fallback
+        } else {
+            mask
+        }
+    }
+
     fn item(&self, state: u32, ordinal: usize) -> Result<u32, SearchError> {
         let (offset, length, _) = self.state_bounds(state)?;
         if ordinal >= length {
@@ -1318,7 +1799,7 @@ impl LazyWorkspace {
             })
     }
 
-    fn cell(&self, state: u32, byte: u8) -> Result<u32, SearchError> {
+    fn cell(&self, state: u32, class: u8) -> Result<u32, SearchError> {
         let state = usize::try_from(state).map_err(|_| SearchError::InternalInvariant {
             detail: "lazy DFA transition state does not fit usize",
         })?;
@@ -1328,7 +1809,7 @@ impl LazyWorkspace {
             });
         }
         debug_assert!(self.state_len <= LAZY_MAX_STATES);
-        let cell_index = direct_row_cell_index(state, byte);
+        let cell_index = direct_row_cell_index(state, class);
         self.rows
             .get(cell_index)
             .copied()
@@ -1342,7 +1823,7 @@ impl LazyWorkspace {
         clippy::arithmetic_side_effects,
         reason = "direct row offsets are bounded by the fixed lazy-state ceiling"
     )]
-    fn direct_cell(&self, row_offset: u32, byte: u8) -> Result<u32, SearchError> {
+    fn direct_cell(&self, row_offset: u32, class: u8) -> Result<u32, SearchError> {
         let row_offset =
             usize::try_from(row_offset).map_err(|_| SearchError::InternalInvariant {
                 detail: "lazy DFA direct row offset does not fit usize",
@@ -1350,14 +1831,14 @@ impl LazyWorkspace {
         debug_assert_eq!(row_offset % BYTE_ALPHABET, 0);
         debug_assert!(row_offset / BYTE_ALPHABET < self.state_len);
         self.rows
-            .get(row_offset + usize::from(byte))
+            .get(row_offset + usize::from(class))
             .copied()
             .ok_or(SearchError::InternalInvariant {
                 detail: "lazy DFA transition cell is outside the direct table",
             })
     }
 
-    fn set_cell(&mut self, state: u32, byte: u8, cell: u32) -> Result<(), SearchError> {
+    fn set_cell(&mut self, state: u32, class: u8, cell: u32) -> Result<(), SearchError> {
         let state = usize::try_from(state).map_err(|_| SearchError::InternalInvariant {
             detail: "lazy DFA transition state does not fit usize",
         })?;
@@ -1367,13 +1848,24 @@ impl LazyWorkspace {
             });
         }
         debug_assert!(self.state_len <= LAZY_MAX_STATES);
-        let cell_index = direct_row_cell_index(state, byte);
-        *self
+        let cell_index = direct_row_cell_index(state, class);
+        let slot = self
             .rows
             .get_mut(cell_index)
             .ok_or(SearchError::InternalInvariant {
                 detail: "lazy DFA transition cell is outside the direct table",
-            })? = cell;
+            })?;
+        if *slot != LAZY_CELL_UNFILLED {
+            return Err(SearchError::InternalInvariant {
+                detail: "lazy DFA transition cell was published twice",
+            });
+        }
+        *slot = cell;
+        self.direct_cells_published = self.direct_cells_published.checked_add(1).ok_or(
+            SearchError::InternalInvariant {
+                detail: "lazy DFA direct-cell publication count overflowed",
+            },
+        )?;
         Ok(())
     }
 
@@ -1801,7 +2293,11 @@ impl ReverseWorkspace {
             frontier: allocate_slots(layout.edges, 0_u32, total_bytes)?,
             frontier_len: 0,
             rows: allocate_slots(row_cells, LAZY_CELL_UNFILLED, total_bytes)?,
-            context: ContextTransitionStore::new(layout.reverse_context_slots, total_bytes)?,
+            context: ContextTransitionStore::new(
+                layout.reverse_context_slots,
+                0,
+                total_bytes,
+            )?,
             offsets: allocate_slots(state_capacity, 0_usize, total_bytes)?,
             lengths: allocate_slots(state_capacity, 0_u32, total_bytes)?,
             hashes: allocate_slots(state_capacity, 0_u64, total_bytes)?,
@@ -2031,7 +2527,7 @@ impl ReverseWorkspace {
             })
     }
 
-    fn cell(&self, state: u32, byte: u8) -> Result<u32, SearchError> {
+    fn cell(&self, state: u32, class: u8) -> Result<u32, SearchError> {
         let state = usize::try_from(state).map_err(|_| SearchError::InternalInvariant {
             detail: "reverse DFA transition state does not fit usize",
         })?;
@@ -2041,7 +2537,7 @@ impl ReverseWorkspace {
             });
         }
         debug_assert!(self.state_len <= LAZY_MAX_STATES);
-        let cell = direct_row_cell_index(state, byte);
+        let cell = direct_row_cell_index(state, class);
         self.rows
             .get(cell)
             .copied()
@@ -2055,7 +2551,7 @@ impl ReverseWorkspace {
         clippy::arithmetic_side_effects,
         reason = "direct row offsets are bounded by the fixed lazy-state ceiling"
     )]
-    fn direct_cell(&self, row_offset: u32, byte: u8) -> Result<u32, SearchError> {
+    fn direct_cell(&self, row_offset: u32, class: u8) -> Result<u32, SearchError> {
         let row_offset =
             usize::try_from(row_offset).map_err(|_| SearchError::InternalInvariant {
                 detail: "reverse DFA direct row offset does not fit usize",
@@ -2063,14 +2559,14 @@ impl ReverseWorkspace {
         debug_assert_eq!(row_offset % BYTE_ALPHABET, 0);
         debug_assert!(row_offset / BYTE_ALPHABET < self.state_len);
         self.rows
-            .get(row_offset + usize::from(byte))
+            .get(row_offset + usize::from(class))
             .copied()
             .ok_or(SearchError::InternalInvariant {
                 detail: "reverse DFA transition cell is outside the direct table",
             })
     }
 
-    fn set_cell(&mut self, state: u32, byte: u8, value: u32) -> Result<(), SearchError> {
+    fn set_cell(&mut self, state: u32, class: u8, value: u32) -> Result<(), SearchError> {
         let state = usize::try_from(state).map_err(|_| SearchError::InternalInvariant {
             detail: "reverse DFA transition state does not fit usize",
         })?;
@@ -2080,7 +2576,7 @@ impl ReverseWorkspace {
             });
         }
         debug_assert!(self.state_len <= LAZY_MAX_STATES);
-        let cell = direct_row_cell_index(state, byte);
+        let cell = direct_row_cell_index(state, class);
         *self
             .rows
             .get_mut(cell)
@@ -2524,6 +3020,120 @@ pub struct K0SearchSession<'a> {
     root_run: Option<RootRunDescriptor>,
 }
 
+/// Private limits for authenticating one positive match endpoint.
+///
+/// These limits bound only the verifier invocation. They neither replace nor
+/// mutate the limits used by later ordinary searches on the same session.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct K0PositiveEndLimits {
+    max_work: u64,
+    max_reverse_bytes: usize,
+}
+
+impl K0PositiveEndLimits {
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn new(max_work: u64, max_reverse_bytes: usize) -> Self {
+        Self {
+            max_work,
+            max_reverse_bytes,
+        }
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn unlimited() -> Self {
+        Self::new(u64::MAX, usize::MAX)
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn max_work(self) -> u64 {
+        self.max_work
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn max_reverse_bytes(self) -> usize {
+        self.max_reverse_bytes
+    }
+}
+
+/// Exact result of attempting to authenticate one positive match endpoint.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum K0PositiveEndOutcome {
+    /// At least one positive-width match ends at the requested boundary.
+    Matched,
+    /// No positive-width match in the supplied window ends there.
+    Rejected,
+    /// An optional reverse tier or a private verifier limit was unavailable.
+    Declined,
+}
+
+/// Work and source reads actually completed by one endpoint verification.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct K0PositiveEndReceipt {
+    work: u64,
+    reverse_source_bytes: usize,
+}
+
+impl K0PositiveEndReceipt {
+    const fn new(work: u64, reverse_source_bytes: usize) -> Self {
+        Self {
+            work,
+            reverse_source_bytes,
+        }
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn work(self) -> u64 {
+        self.work
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn reverse_source_bytes(self) -> usize {
+        self.reverse_source_bytes
+    }
+}
+
+/// Typed endpoint result paired with its exact verifier receipt.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct K0PositiveEndVerification {
+    outcome: K0PositiveEndOutcome,
+    receipt: K0PositiveEndReceipt,
+}
+
+impl K0PositiveEndVerification {
+    const fn new(
+        outcome: K0PositiveEndOutcome,
+        work: u64,
+        reverse_source_bytes: usize,
+    ) -> Self {
+        Self {
+            outcome,
+            receipt: K0PositiveEndReceipt::new(work, reverse_source_bytes),
+        }
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn outcome(self) -> K0PositiveEndOutcome {
+        self.outcome
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn receipt(self) -> K0PositiveEndReceipt {
+        self.receipt
+    }
+}
+
 impl K0Workspace {
     /// Allocate and fully initialize fixed-capacity workspace for `automaton`.
     ///
@@ -2897,6 +3507,218 @@ impl<'a> K0SearchSession<'a> {
         self.workspace.construction_accounting()
     }
 
+    /// Whether ordinary reused K0 can represent its full work certificate.
+    ///
+    /// This source-only query is bound to the session's exact immutable plan.
+    /// It performs no search, allocation, publication, or workspace mutation.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn negative_terminal_has_reused_work_certificate(&self, input_bytes: usize) -> bool {
+        self.automaton
+            .conservative_reused_work_bound(input_bytes)
+            .is_ok()
+    }
+
+    /// Whether this exact session can run the private positive-end verifier.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn positive_end_verifier_available(&self) -> bool {
+        self.capabilities.reverse
+            && self.workspace.reverse.is_allocated()
+            && self.workspace.reverse.is_bound_to(self.automaton)
+    }
+
+    /// Conservative ordinary reused-work certificate for verifier admission.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn positive_end_verifier_work_certificate(&self, input_bytes: usize) -> Option<u64> {
+        self.positive_end_verifier_available()
+            .then(|| {
+                self.automaton
+                    .conservative_reused_work_bound(input_bytes)
+                    .ok()
+            })
+            .flatten()
+    }
+
+    /// Authenticate whether any positive-width match ends at `endpoint`.
+    ///
+    /// Unlike selected-end recovery, this verifier does not assume that a
+    /// forward search chose `endpoint`: it asks the assertion-free reverse
+    /// automaton directly and returns as soon as any start reaches the exact
+    /// plan root. Assertion-bearing graphs use the source-contextual reverse
+    /// tier and therefore authenticate zero-width edges at their original byte
+    /// boundaries. `Declined` is reserved for an unavailable reverse tier or
+    /// either private verifier cap. All malformed-window, binding, arithmetic,
+    /// layout, and invariant failures remain [`SearchError`] values.
+    ///
+    /// A cap decline may leave unpublished closure scratch behind. The next
+    /// reverse transition resets that scratch before reading it, while cache
+    /// cells are published only after a complete transition, so later ordinary
+    /// session calls remain sound.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] for an invalid window or endpoint, an automaton
+    /// binding mismatch or an internal checked failure unrelated to the
+    /// private verifier limits.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "validation, private-cap decline, and exact receipts form one transaction"
+    )]
+    #[inline(never)]
+    pub fn try_positive_match_ending_at(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+        endpoint: usize,
+        limits: K0PositiveEndLimits,
+    ) -> Result<K0PositiveEndVerification, SearchError> {
+        validate_window(haystack, window)?;
+        if endpoint < window.start() || endpoint > window.end() {
+            return Err(SearchError::InvalidResumeState {
+                detail: "positive endpoint is outside the original search window",
+            });
+        }
+        if self.workspace.bound_automaton_identity != self.automaton.identity() {
+            return Err(SearchError::InvalidResumeState {
+                detail: "positive-end verifier workspace belongs to another automaton",
+            });
+        }
+        if endpoint == window.start() {
+            return Ok(K0PositiveEndVerification::new(
+                K0PositiveEndOutcome::Rejected,
+                0,
+                0,
+            ));
+        }
+        if !self.capabilities.reverse || !self.workspace.reverse.is_allocated() {
+            return Ok(K0PositiveEndVerification::new(
+                K0PositiveEndOutcome::Declined,
+                0,
+                0,
+            ));
+        }
+        if !self.workspace.reverse.is_bound_to(self.automaton) {
+            return Err(SearchError::InvalidResumeState {
+                detail: "positive-end verifier requires a bound bidirectional workspace",
+            });
+        }
+
+        let reverse_window = SearchWindow::new(window.start(), endpoint);
+        let scratch_bytes = self.workspace.retained_bytes;
+        let mut setup = SetupAccounting::empty(scratch_bytes, true);
+        let search_limits = SearchLimits {
+            max_work: limits.max_work,
+            max_scratch_bytes: scratch_bytes,
+        };
+        let mut meter = match prepare_resume_invocation(
+            self.automaton,
+            &mut self.workspace,
+            reverse_window,
+            search_limits,
+            &mut setup,
+            false,
+            true,
+        ) {
+            Ok((meter, _)) => meter,
+            Err(SearchError::WorkLimitExceeded {
+                limit, consumed, ..
+            }) if limit == limits.max_work => {
+                return Ok(K0PositiveEndVerification::new(
+                    K0PositiveEndOutcome::Declined,
+                    consumed,
+                    0,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+
+        if !self.capabilities.contextual {
+            match prepare_reverse_lazy(
+                self.automaton,
+                &mut self.workspace,
+                &mut meter,
+                0,
+                endpoint,
+            ) {
+                Ok(true) => {}
+                Ok(false) => {
+                    let outcome = if self.workspace.reverse.declined {
+                        // An allocated direct reverse tier sets this sticky bit
+                        // only after proving that no positive Accept-seeded
+                        // frontier exists for the immutable plan.
+                        K0PositiveEndOutcome::Rejected
+                    } else {
+                        K0PositiveEndOutcome::Declined
+                    };
+                    return Ok(K0PositiveEndVerification::new(
+                        outcome,
+                        meter.consumed,
+                        0,
+                    ));
+                }
+                Err(SearchError::WorkLimitExceeded {
+                    limit, consumed, ..
+                }) if limit == limits.max_work => {
+                    return Ok(K0PositiveEndVerification::new(
+                        K0PositiveEndOutcome::Declined,
+                        consumed,
+                        0,
+                    ));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        let mut reverse_source_bytes = 0usize;
+        let execution = if self.capabilities.contextual {
+            execute_positive_end_context_reverse_loop(
+                self.automaton,
+                haystack,
+                window.start(),
+                endpoint,
+                &mut self.workspace,
+                &mut meter,
+                limits.max_reverse_bytes,
+                &mut reverse_source_bytes,
+            )
+        } else {
+            execute_positive_end_reverse_lazy_loop(
+                self.automaton,
+                haystack,
+                window.start(),
+                endpoint,
+                &mut self.workspace,
+                &mut meter,
+                limits.max_reverse_bytes,
+                &mut reverse_source_bytes,
+            )
+        };
+        let outcome = match execution {
+            Ok(outcome) => outcome,
+            Err(SearchError::WorkLimitExceeded {
+                limit, consumed, ..
+            }) if limit == limits.max_work => {
+                return Ok(K0PositiveEndVerification::new(
+                    K0PositiveEndOutcome::Declined,
+                    consumed,
+                    reverse_source_bytes,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(K0PositiveEndVerification::new(
+            outcome,
+            meter.consumed,
+            reverse_source_bytes,
+        ))
+    }
+
     pub(crate) fn search_window_untyped(
         &mut self,
         haystack: &[u8],
@@ -2915,15 +3737,15 @@ impl<'a> K0SearchSession<'a> {
         )
     }
 
-    /// Project warm assertion-free existence directly for value-only callers.
+    /// Project warm existence directly for value-only callers.
     ///
     /// The ordinary report-producing entry remains authoritative for finite
-    /// limits, cold cache/proof publication, contextual graphs, unfilled
-    /// transitions, and every non-existence contract. Once an exact session
-    /// has already authenticated its direct lazy cache and immutable start
-    /// proof, an unlimited existence call can read filled DFA rows without
-    /// mutating the workspace or constructing diagnostics that its caller will
-    /// immediately discard. Any unavailable row declines before mutation and
+    /// limits, cold cache/proof publication, unfilled transitions, and every
+    /// non-existence contract. Once an exact session has authenticated its
+    /// lazy cache and immutable start proof, an unlimited existence call can
+    /// read filled direct rows or contextual records without mutating the
+    /// workspace or constructing diagnostics that its caller will immediately
+    /// discard. Any unavailable transition declines before mutation and
     /// re-enters the ordinary executor from the original state.
     pub(crate) fn search_exists_value_untyped(
         &mut self,
@@ -2985,6 +3807,7 @@ impl<'a> K0SearchSession<'a> {
                     validate_window(haystack, window)?;
                     if let WarmDirectSelectedEnd::Complete(found) =
                         try_warm_direct_selected_end(
+                            self.automaton,
                             haystack,
                             window,
                             &self.workspace.lazy,
@@ -3098,10 +3921,10 @@ impl<'a> K0SearchSession<'a> {
     }
 }
 
-/// Try the immutable, already-filled direct rows for one authenticated value
-/// call. Returning `None` is a transactional decline: neither the retained
-/// rows nor invocation scratch have been changed, so the ordinary executor
-/// can restart from the original window.
+/// Try the immutable, already-filled direct rows or contextual records for
+/// one authenticated value call. Returning `None` is a transactional decline:
+/// neither retained cache nor invocation scratch has changed, so the ordinary
+/// executor can restart from the original window.
 fn try_authenticated_warm_exists_value(
     automaton: &Automaton,
     haystack: &[u8],
@@ -3112,7 +3935,6 @@ fn try_authenticated_warm_exists_value(
 ) -> Result<Option<bool>, SearchError> {
     if limits != SearchLimits::unlimited()
         || !capabilities.lazy
-        || capabilities.contextual
         || !workspace.lazy.is_bound_to(automaton)
         || !workspace.lazy.initialized
         || workspace.lazy.declined
@@ -3123,6 +3945,15 @@ fn try_authenticated_warm_exists_value(
     let Some(proof) = automaton.start_filter_proof.get() else {
         return Ok(None);
     };
+    if capabilities.contextual {
+        return try_warm_context_exists(
+            automaton,
+            haystack,
+            window,
+            &workspace.lazy,
+            proof,
+        );
+    }
     let nullable_initial = matches!(
         workspace.lazy.initial_kind,
         LazyInitialKind::NullablePrefix | LazyInitialKind::NullableTerminal
@@ -3134,7 +3965,418 @@ fn try_authenticated_warm_exists_value(
     if proof.force_haystack_start || proof.relaxed_nullable != nullable_initial {
         return Ok(None);
     }
-    try_warm_direct_exists(haystack, window, &workspace.lazy, proof)
+    try_warm_direct_exists(automaton, haystack, window, &workspace.lazy, proof)
+}
+
+/// Read one already-published contextual initial state.
+///
+/// `None` is a cache miss, not a negative language result. The caller must
+/// restart the ordinary executor without retaining any invocation-local
+/// scanner state.
+fn warm_context_initial_state(
+    lazy: &LazyWorkspace,
+    assertions: u32,
+) -> Result<Option<u32>, SearchError> {
+    let symbol = contextual_symbol(CONTEXT_INITIAL_BYTE, assertions);
+    let Some(cell) = lazy
+        .context
+        .lookup_existing_prevalidated(CONTEXT_INITIAL_SOURCE, symbol)?
+    else {
+        return Ok(None);
+    };
+    let encoded = cell & LAZY_CELL_STATE_MASK;
+    if encoded == 0 || cell & (LAZY_CELL_ACCEPT | LAZY_CELL_RESTART) != LAZY_CELL_RESTART {
+        return Err(SearchError::InternalInvariant {
+            detail: "warm contextual lazy DFA initial cache cell is invalid",
+        });
+    }
+    encoded
+        .checked_sub(1)
+        .map(Some)
+        .ok_or(SearchError::InternalInvariant {
+            detail: "warm contextual lazy DFA initial state underflowed",
+        })
+}
+
+/// Read an initial record through its dependency-normalized key, falling back
+/// to the exact broader key used before dependency analysis completed.
+///
+/// The retained dependency proof establishes that omitted assertion bits
+/// cannot affect the closure. The fallback still recomputes every broader bit
+/// from this invocation's source boundary, so it never aliases a raw context
+/// from another haystack or position and publishes no normalized record.
+fn warm_context_initial_state_for_dependencies(
+    automaton: &Automaton,
+    haystack: &[u8],
+    position: usize,
+    lazy: &LazyWorkspace,
+    dependencies: u32,
+    global_dependencies: u32,
+) -> Result<Option<u32>, SearchError> {
+    debug_assert_eq!(dependencies & !global_dependencies, 0);
+    let assertions = enabled_assertion_mask_unmetered_for_dependencies(
+        automaton,
+        dependencies,
+        haystack,
+        position,
+    );
+    if let Some(state) = warm_context_initial_state(lazy, assertions)? {
+        return Ok(Some(state));
+    }
+    if dependencies == global_dependencies {
+        return Ok(None);
+    }
+    let exact_assertions = enabled_assertion_mask_unmetered_for_dependencies(
+        automaton,
+        global_dependencies,
+        haystack,
+        position,
+    );
+    if exact_assertions == assertions {
+        return Ok(None);
+    }
+    warm_context_initial_state(lazy, exact_assertions)
+}
+
+/// Read one transition through its dependency-normalized key, with the same
+/// exact raw-key fallback used for a pre-analysis contextual publication.
+fn warm_context_transition_for_dependencies(
+    automaton: &Automaton,
+    haystack: &[u8],
+    destination: usize,
+    lazy: &LazyWorkspace,
+    state: u32,
+    byte: u8,
+    dependencies: u32,
+    global_dependencies: u32,
+) -> Result<Option<u32>, SearchError> {
+    debug_assert_eq!(dependencies & !global_dependencies, 0);
+    let assertions = enabled_assertion_mask_unmetered_for_dependencies(
+        automaton,
+        dependencies,
+        haystack,
+        destination,
+    );
+    let symbol = contextual_symbol(u32::from(byte), assertions);
+    if let Some(cell) = lazy.context.lookup_existing_prevalidated(state, symbol)? {
+        return Ok(Some(cell));
+    }
+    if dependencies == global_dependencies {
+        return Ok(None);
+    }
+    let exact_assertions = enabled_assertion_mask_unmetered_for_dependencies(
+        automaton,
+        global_dependencies,
+        haystack,
+        destination,
+    );
+    if exact_assertions == assertions {
+        return Ok(None);
+    }
+    lazy.context.lookup_existing_prevalidated(
+        state,
+        contextual_symbol(u32::from(byte), exact_assertions),
+    )
+}
+
+/// Project existence from one complete, already-published contextual path.
+///
+/// Every mutable search cursor is invocation-local. The retained workspace,
+/// its associative transition store, and the immutable start proof are read
+/// only. If any required initial or transition record is absent, `None`
+/// declines the entire attempt and the ordinary executor starts again at the
+/// original window boundary.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the warm loop mirrors the ordinary contextual scanner and restart state explicitly"
+)]
+fn try_warm_context_exists(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    lazy: &LazyWorkspace,
+    proof: &StartFilterProof,
+) -> Result<Option<bool>, SearchError> {
+    if !lazy.context.is_allocated()
+        || !lazy.is_bound_to(automaton)
+        || !lazy.initialized
+        || lazy.declined
+        || lazy.saturated
+        || proof.relaxed_nullable
+    {
+        return Ok(None);
+    }
+    let window_bytes = window
+        .end()
+        .checked_sub(window.start())
+        .ok_or(SearchError::InternalInvariant {
+            detail: "warm contextual window has a descending range",
+        })?;
+    if window_bytes < WARM_CONTEXT_MIN_WINDOW_BYTES {
+        return Ok(None);
+    }
+    lazy.context.validate_shape()?;
+
+    let bounded = if let Some(loop_skip) = lazy.context_loop_skip_plan {
+        try_warm_context_exists_bounded::<true>(
+            automaton,
+            haystack,
+            window,
+            lazy,
+            proof,
+            Some(loop_skip),
+        )
+    } else {
+        try_warm_context_exists_bounded::<false>(
+            automaton,
+            haystack,
+            window,
+            lazy,
+            proof,
+            None,
+        )
+    };
+    match bounded {
+        Err(SearchError::WorkLimitExceeded { limit, .. })
+            if limit == WARM_CONTEXT_SPECULATION_WORK =>
+        {
+            Ok(None)
+        }
+        result => result,
+    }
+}
+
+/// Execute one warm contextual attempt under a private bound. The caller
+/// converts only this bound's exhaustion into a cache miss; all semantic and
+/// invariant failures remain observable.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the bounded loop mirrors the ordinary contextual scanner and restart state explicitly"
+)]
+fn try_warm_context_exists_bounded<const LOOP_SKIP: bool>(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    lazy: &LazyWorkspace,
+    proof: &StartFilterProof,
+    loop_skip: Option<ContextLazyLoopSkipPlan>,
+) -> Result<Option<bool>, SearchError> {
+    debug_assert_eq!(LOOP_SKIP, loop_skip.is_some());
+    let global_dependencies = automaton.boundary_context_classifier().assertions();
+    let root_dependencies = lazy.context_root_dependency_mask(global_dependencies);
+    let scanner = proof.scanner.as_ref();
+    let guard = proof.guard();
+    let probe = proof.probe();
+    let mut meter = WorkMeter::new(WARM_CONTEXT_SPECULATION_WORK, 0);
+    let mut position = window.start();
+    let mut initial_candidate_scanned = false;
+    let mut retained_start_mask = RetainedStartMaskCursor::default();
+    let mut adaptive_probe = AdaptiveStartProbe::default();
+    let mut engine_candidate = None;
+    let mut loop_probe = LazyLoopProbe::default();
+
+    if let Some(scanner) = scanner {
+        // Preserve the absolute-start alternative at original boundary zero;
+        // every later restart is eligible for the published scanner.
+        if !(proof.force_haystack_start && position == 0) {
+            position = next_start_candidate_adaptive(
+                scanner,
+                haystack,
+                position,
+                window.end(),
+                guard,
+                probe,
+                &mut meter,
+                &mut retained_start_mask,
+                &mut adaptive_probe,
+            )?;
+            if position == window.end() {
+                return Ok(Some(false));
+            }
+            if probe.is_some() && adaptive_probe.samples_rejections() {
+                engine_candidate = Some(position);
+            }
+            initial_candidate_scanned = true;
+        }
+    }
+
+    let Some(mut state) = warm_context_initial_state_for_dependencies(
+        automaton,
+        haystack,
+        position,
+        lazy,
+        root_dependencies,
+        global_dependencies,
+    )? else {
+        return Ok(None);
+    };
+    let mut restartable = true;
+    let mut entered = false;
+
+    loop {
+        if (!initial_candidate_scanned || entered)
+            && restartable
+            && !(proof.force_haystack_start && position == 0)
+        {
+            let candidate = if let Some(scanner) = scanner {
+                if position < window.end() {
+                    if let (Some(probe), Some(candidate)) = (probe, engine_candidate.take()) {
+                        adaptive_probe.observe_restartable_rejection(
+                            probe,
+                            haystack,
+                            candidate,
+                            window.end(),
+                            &mut meter,
+                        )?;
+                    }
+                } else {
+                    engine_candidate = None;
+                }
+                next_start_candidate_adaptive(
+                    scanner,
+                    haystack,
+                    position,
+                    window.end(),
+                    guard,
+                    probe,
+                    &mut meter,
+                    &mut retained_start_mask,
+                    &mut adaptive_probe,
+                )?
+            } else {
+                position
+            };
+            if candidate == window.end() {
+                return Ok(Some(false));
+            }
+            if probe.is_some() && adaptive_probe.samples_rejections() {
+                engine_candidate = Some(candidate);
+            }
+            if candidate != position {
+                position = candidate;
+                let Some(initial) = warm_context_initial_state_for_dependencies(
+                    automaton,
+                    haystack,
+                    position,
+                    lazy,
+                    root_dependencies,
+                    global_dependencies,
+                )? else {
+                    return Ok(None);
+                };
+                state = initial;
+            }
+        }
+        entered = true;
+        if position == window.end() {
+            return Ok(Some(false));
+        }
+
+        if LOOP_SKIP {
+            let plan = loop_skip.ok_or(SearchError::InternalInvariant {
+                detail: "warm contextual loop executed without its retained proof",
+            })?;
+            let in_plan_state = state == plan.state;
+            let scan_threshold = if plan.leave_final_member {
+                LAZY_LOOP_SKIP_MIN_BYTES.checked_add(1).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "warm contextual loop scan threshold",
+                    },
+                )?
+            } else {
+                LAZY_LOOP_SKIP_MIN_BYTES
+            };
+            if !in_plan_state {
+                loop_probe.left_plan_state();
+            }
+            if in_plan_state
+                && loop_probe.is_ready(position)
+                && window.end().saturating_sub(position) >= scan_threshold
+                && meter.remaining()
+                    >= u64::try_from(scan_threshold)
+                        .expect("warm contextual loop threshold fits u64")
+            {
+                let available = usize::try_from(meter.remaining())
+                    .unwrap_or(usize::MAX)
+                    .min(window.end().saturating_sub(position));
+                let scan_end = position.checked_add(available).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "warm contextual loop scan end",
+                    },
+                )?;
+                let source = haystack.get(position..scan_end).ok_or(
+                    SearchError::InternalInvariant {
+                        detail: "warm contextual loop scan exceeded its validated window",
+                    },
+                )?;
+                let member_run = plan.scanner.scan_forward(source);
+                let skipped = if plan.leave_final_member {
+                    member_run.saturating_sub(1)
+                } else {
+                    member_run
+                };
+                loop_probe.observe(position, skipped)?;
+                if skipped != 0 {
+                    meter.charge_admitted(
+                        u64::try_from(skipped)
+                            .expect("warm contextual loop skip length fits u64"),
+                    );
+                    position = position.checked_add(skipped).ok_or(
+                        SearchError::ArithmeticOverflow {
+                            computation: "warm contextual loop source progress",
+                        },
+                    )?;
+                    // A skipped self-loop is nonaccepting and cannot restart
+                    // the root. Start provenance is irrelevant to Exists,
+                    // including a graph-proved `Drop` action.
+                    restartable = false;
+                    if position == window.end() {
+                        continue;
+                    }
+                }
+            }
+        }
+
+        meter.charge(1, position)?;
+        let byte = *haystack
+            .get(position)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "warm contextual lazy DFA source exceeded the validated window",
+            })?;
+        let destination = position
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "warm contextual lazy DFA destination",
+            })?;
+        let dependencies = lazy.context_dependency_mask(state, global_dependencies)?;
+        let Some(cell) = warm_context_transition_for_dependencies(
+            automaton,
+            haystack,
+            destination,
+            lazy,
+            state,
+            byte,
+            dependencies,
+            global_dependencies,
+        )? else {
+            return Ok(None);
+        };
+        position = destination;
+
+        if cell & LAZY_CELL_ACCEPT != 0 {
+            return Ok(Some(true));
+        }
+        let encoded = cell & LAZY_CELL_STATE_MASK;
+        if encoded == 0 {
+            return Ok(Some(false));
+        }
+        state = encoded
+            .checked_sub(1)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "warm contextual lazy DFA encoded state underflowed",
+            })?;
+        restartable = cell & LAZY_CELL_RESTART != 0;
+    }
 }
 
 /// Outcome of scanning the bounded inline candidate prefix.
@@ -3165,6 +4407,7 @@ enum WarmDirectSelectedEnd {
     reason = "the complete inline prefix preserves one explicit transactional decline boundary"
 )]
 fn try_warm_direct_exists(
+    automaton: &Automaton,
     haystack: &[u8],
     window: SearchWindow,
     lazy: &LazyWorkspace,
@@ -3200,6 +4443,7 @@ fn try_warm_direct_exists(
                     },
                 )?;
                 return continue_warm_direct_exists(
+                    automaton,
                     haystack,
                     window,
                     lazy,
@@ -3233,7 +4477,8 @@ fn try_warm_direct_exists(
                 computation: "warm existence prefix work",
             })?;
         let byte = haystack[position];
-        let cell = lazy.direct_cell(state, byte)?;
+        let class = automaton.byte_classes().class_of(byte);
+        let cell = lazy.direct_cell(state, class)?;
         if cell == LAZY_CELL_UNFILLED {
             return Ok(None);
         }
@@ -3260,6 +4505,7 @@ fn try_warm_direct_exists(
             })?;
         if state == initial_row && proof.scanner.is_some() {
             return continue_warm_direct_exists(
+                automaton,
                 haystack,
                 window,
                 lazy,
@@ -3277,6 +4523,7 @@ fn try_warm_direct_exists(
     }
 
     continue_warm_direct_exists(
+        automaton,
         haystack,
         window,
         lazy,
@@ -3295,6 +4542,55 @@ fn try_warm_direct_exists(
 )]
 #[inline(never)]
 fn continue_warm_direct_exists(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    lazy: &LazyWorkspace,
+    proof: &StartFilterProof,
+    initial_row: u32,
+    state: u32,
+    position: usize,
+    consumed: u64,
+    engine_candidate: Option<usize>,
+) -> Result<Option<bool>, SearchError> {
+    if let Some(loop_skip) = lazy.loop_skip_plan {
+        continue_warm_direct_exists_loop::<true>(
+            automaton,
+            haystack,
+            window,
+            lazy,
+            proof,
+            initial_row,
+            state,
+            position,
+            consumed,
+            engine_candidate,
+            Some(loop_skip),
+        )
+    } else {
+        continue_warm_direct_exists_loop::<false>(
+            automaton,
+            haystack,
+            window,
+            lazy,
+            proof,
+            initial_row,
+            state,
+            position,
+            consumed,
+            engine_candidate,
+            None,
+        )
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the outlined warm continuation keeps its exact local DFA, scanner, and retained loop proof explicit"
+)]
+#[inline(never)]
+fn continue_warm_direct_exists_loop<const LOOP_SKIP: bool>(
+    automaton: &Automaton,
     haystack: &[u8],
     window: SearchWindow,
     lazy: &LazyWorkspace,
@@ -3304,10 +4600,13 @@ fn continue_warm_direct_exists(
     mut position: usize,
     consumed: u64,
     mut engine_candidate: Option<usize>,
+    loop_skip: Option<LazyLoopSkipPlan>,
 ) -> Result<Option<bool>, SearchError> {
+    debug_assert_eq!(LOOP_SKIP, loop_skip.is_some());
     let mut meter = WorkMeter::new(u64::MAX, consumed);
     let mut retained_start_mask = RetainedStartMaskCursor::default();
     let mut adaptive_probe = AdaptiveStartProbe::default();
+    let mut loop_probe = LazyLoopProbe::default();
 
     loop {
         if state == initial_row {
@@ -3346,6 +4645,35 @@ fn continue_warm_direct_exists(
                 }
             }
         }
+        if LOOP_SKIP {
+            let plan = loop_skip.ok_or(SearchError::InternalInvariant {
+                detail: "warm existence loop executed without its retained proof",
+            })?;
+            let in_plan_state = state == plan.row_offset;
+            if !in_plan_state {
+                loop_probe.left_plan_state();
+            }
+            if in_plan_state
+                && loop_probe.is_ready(position)
+                && haystack.len().saturating_sub(position) >= LAZY_LOOP_SKIP_MIN_BYTES
+            {
+                let skipped = plan.scanner.scan_forward(&haystack[position..]);
+                loop_probe.observe(position, skipped)?;
+                if skipped != 0 {
+                    meter.charge_admitted(
+                        u64::try_from(skipped).expect("warm existence loop length fits u64"),
+                    );
+                    position = position.checked_add(skipped).ok_or(
+                        SearchError::ArithmeticOverflow {
+                            computation: "warm existence loop source progress",
+                        },
+                    )?;
+                    if position == haystack.len() {
+                        continue;
+                    }
+                }
+            }
+        }
         if position >= haystack.len() {
             return if position == haystack.len() {
                 Ok(Some(false))
@@ -3358,7 +4686,8 @@ fn continue_warm_direct_exists(
 
         meter.charge(1, position)?;
         let byte = haystack[position];
-        let cell = lazy.direct_cell(state, byte)?;
+        let class = automaton.byte_classes().class_of(byte);
+        let cell = lazy.direct_cell(state, class)?;
         if cell == LAZY_CELL_UNFILLED {
             return Ok(None);
         }
@@ -3416,12 +4745,16 @@ fn complete_warm_direct_selected_end(
     reason = "the read-only loop keeps endpoint priority and scanner state together"
 )]
 fn try_warm_direct_selected_end(
+    automaton: &Automaton,
     haystack: &[u8],
     window: SearchWindow,
     lazy: &LazyWorkspace,
     proof: &StartFilterProof,
 ) -> Result<WarmDirectSelectedEnd, SearchError> {
-    if lazy.saturated {
+    // The ordinary selected-end executor is plan-aware. Decline rather than
+    // shadowing an authenticated loop scanner with this scalar read-only
+    // projection.
+    if lazy.saturated || lazy.loop_skip_plan.is_some() {
         return Ok(WarmDirectSelectedEnd::Declined);
     }
     let haystack = haystack
@@ -3508,7 +4841,8 @@ fn try_warm_direct_selected_end(
             reason = "the immediately dominating clipped-window check proves this source index"
         )]
         let byte = haystack[position];
-        let cell = lazy.direct_cell(state, byte)?;
+        let class = automaton.byte_classes().class_of(byte);
+        let cell = lazy.direct_cell(state, class)?;
         if cell == LAZY_CELL_UNFILLED {
             return Ok(WarmDirectSelectedEnd::Declined);
         }
@@ -3566,11 +4900,14 @@ fn complete_warm_proved_start_selected_end(
 /// its accepting frontier commits. Any unavailable cell or false proof
 /// declines before mutation and re-enters the ordinary executor.
 fn try_warm_proved_start_selected_end(
+    automaton: &Automaton,
     haystack: &[u8],
     window: SearchWindow,
     lazy: &LazyWorkspace,
 ) -> Result<Option<usize>, SearchError> {
-    if lazy.saturated {
+    // Preserve retained loop acceleration through the plan-aware proved-start
+    // fallback until this read-only projection grows an equivalent scanner.
+    if lazy.saturated || lazy.loop_skip_plan.is_some() {
         return Ok(None);
     }
     let haystack = haystack
@@ -3610,7 +4947,8 @@ fn try_warm_proved_start_selected_end(
             reason = "the immediately dominating clipped-window check proves this source index"
         )]
         let byte = haystack[position];
-        let cell = lazy.direct_cell(state, byte)?;
+        let class = automaton.byte_classes().class_of(byte);
+        let cell = lazy.direct_cell(state, class)?;
         if cell == LAZY_CELL_UNFILLED {
             return Ok(None);
         }
@@ -3701,7 +5039,10 @@ fn try_warm_direct_span_with_reverse(
     reverse: &ReverseWorkspace,
     proof: &StartFilterProof,
 ) -> Result<WarmDirectSpan, SearchError> {
-    if lazy.saturated {
+    // The ordinary Span path applies the retained loop action to start
+    // provenance and can skip the run safely. Do not shadow it with this
+    // scalar-only optimistic reader.
+    if lazy.saturated || lazy.loop_skip_plan.is_some() {
         return Ok(WarmDirectSpan::Declined);
     }
     let haystack = haystack
@@ -3800,7 +5141,8 @@ fn try_warm_direct_span_with_reverse(
             .ok_or(SearchError::InternalInvariant {
                 detail: "warm Span position exceeded the validated source",
             })?;
-        let cell = lazy.direct_cell(state, byte)?;
+        let class = automaton.byte_classes().class_of(byte);
+        let cell = lazy.direct_cell(state, class)?;
         if cell == LAZY_CELL_UNFILLED {
             return Ok(WarmDirectSpan::Declined);
         }
@@ -3882,7 +5224,8 @@ fn try_warm_direct_span_with_reverse(
             .ok_or(SearchError::InternalInvariant {
                 detail: "warm Span reverse position exceeded the validated source",
             })?;
-        let cell = reverse.direct_cell(state, byte)?;
+        let class = automaton.byte_classes().class_of(byte);
+        let cell = reverse.direct_cell(state, class)?;
         if cell == LAZY_CELL_UNFILLED {
             return Ok(WarmDirectSpan::Declined);
         }
@@ -4270,7 +5613,13 @@ pub(crate) fn search_prevalidated_selected_end_value_with_authenticated_workspac
             );
             if !proof.force_haystack_start && proof.relaxed_nullable == nullable_initial {
                 if let WarmDirectSelectedEnd::Complete(found) =
-                    try_warm_direct_selected_end(haystack, window, &workspace.lazy, proof)?
+                    try_warm_direct_selected_end(
+                        automaton,
+                        haystack,
+                        window,
+                        &workspace.lazy,
+                        proof,
+                    )?
                 {
                     return Ok(found);
                 }
@@ -4526,8 +5875,12 @@ pub(crate) fn search_prevalidated_proved_exact_start_selected_end_value_with_aut
         && !workspace.lazy.declined
         && !workspace.lazy.saturated
     {
-        if let Some(end) =
-            try_warm_proved_start_selected_end(haystack, window, &workspace.lazy)?
+        if let Some(end) = try_warm_proved_start_selected_end(
+            automaton,
+            haystack,
+            window,
+            &workspace.lazy,
+        )?
         {
             return Ok(Some(end));
         }
@@ -5125,12 +6478,14 @@ fn execute_lazy_loop(
         let byte = haystack[position];
         let transition = match state {
             LazyState::Cached(cached) => {
-                let cell = workspace.lazy.direct_cell(cached, byte)?;
+                let class = automaton.byte_classes().class_of(byte);
+                let cell = workspace.lazy.direct_cell(cached, class)?;
                 if cell == LAZY_CELL_UNFILLED {
                     build_lazy_cached_transition(
                         automaton,
                         direct_row_state(cached),
                         byte,
+                        class,
                         workspace,
                         meter,
                         core_reserve,
@@ -5439,23 +6794,43 @@ fn execute_proved_exact_start_prepared(
         )?
     {
         let mut adaptive_probe = AdaptiveStartProbe::default();
-        execute_lazy_span_loop::<false>(
-            automaton,
-            haystack,
-            window,
-            workspace,
-            &mut meter,
-            contract,
-            core_reserve,
-            None,
-            None,
-            None,
-            &mut adaptive_probe,
-            DirectLazyReady,
-        )?
+        if let Some(loop_skip) = workspace.lazy.loop_skip_plan {
+            execute_lazy_span_loop::<false, true>(
+                automaton,
+                haystack,
+                window,
+                workspace,
+                &mut meter,
+                contract,
+                core_reserve,
+                None,
+                None,
+                None,
+                &mut adaptive_probe,
+                DirectLazyReady,
+                Some(loop_skip),
+            )?
+        } else {
+            execute_lazy_span_loop::<false, false>(
+                automaton,
+                haystack,
+                window,
+                workspace,
+                &mut meter,
+                contract,
+                core_reserve,
+                None,
+                None,
+                None,
+                &mut adaptive_probe,
+                DirectLazyReady,
+                None,
+            )?
+        }
     } else {
         None
     };
+    let used_lazy = lazy.is_some();
     let (found, boundaries) = if let Some((Some(found), boundaries, _)) = lazy {
         (Some(found), boundaries)
     } else {
@@ -5475,6 +6850,17 @@ fn execute_proved_exact_start_prepared(
             earliest,
         )?
     };
+    // Proved-start execution owns the same contract-neutral ordered rows as
+    // the ordinary entry. Publish any newly authenticated self-loop after a
+    // complete, large, unlimited lazy attempt so later plan-aware calls do not
+    // lose the generalized scanner merely because the facade supplied the
+    // exact start.
+    if limits == SearchLimits::unlimited()
+        && used_lazy
+        && window.end().saturating_sub(window.start()) >= LAZY_LOOP_SKIP_MIN_BYTES
+    {
+        try_derive_lazy_loop_skip(automaton, workspace, &mut meter)?;
+    }
     let transition_work =
         meter
             .consumed
@@ -5688,6 +7074,9 @@ fn execute_prepared(
     let mut adaptive_probe = AdaptiveStartProbe::default();
     let lazy = if may_use_lazy && bidirectional_ready && supported_contract {
         if contextual {
+            let context_loop_skip = (limits == SearchLimits::unlimited())
+                .then_some(workspace.lazy.context_loop_skip_plan)
+                .flatten();
             execute_context_lazy_loop(
                 automaton,
                 haystack,
@@ -5701,9 +7090,9 @@ fn execute_prepared(
                 start_proof.proof().probe(),
                 start_proof.proof().force_haystack_start,
                 start_proof.proof().relaxed_nullable,
+                context_loop_skip,
                 &mut adaptive_probe,
             )?
-            .map(|(found, boundaries)| (found, boundaries, false))
         } else {
             let ready = if let Some(ready) = direct_ready {
                 Some(ready)
@@ -5719,7 +7108,41 @@ fn execute_prepared(
             };
             if let Some(ready) = ready {
                 if wants_span {
-                    execute_lazy_span_loop::<true>(
+                    if let Some(loop_skip) = workspace.lazy.loop_skip_plan {
+                        execute_lazy_span_loop::<true, true>(
+                            automaton,
+                            haystack,
+                            window,
+                            workspace,
+                            &mut meter,
+                            contract,
+                            lazy_core_reserve,
+                            start_proof.proof().scanner.as_ref(),
+                            start_proof.proof().guard(),
+                            start_proof.proof().probe(),
+                            &mut adaptive_probe,
+                            ready,
+                            Some(loop_skip),
+                        )?
+                    } else {
+                        execute_lazy_span_loop::<true, false>(
+                            automaton,
+                            haystack,
+                            window,
+                            workspace,
+                            &mut meter,
+                            contract,
+                            lazy_core_reserve,
+                            start_proof.proof().scanner.as_ref(),
+                            start_proof.proof().guard(),
+                            start_proof.proof().probe(),
+                            &mut adaptive_probe,
+                            ready,
+                            None,
+                        )?
+                    }
+                } else if let Some(loop_skip) = workspace.lazy.loop_skip_plan {
+                    execute_lazy_span_loop::<false, true>(
                         automaton,
                         haystack,
                         window,
@@ -5732,6 +7155,7 @@ fn execute_prepared(
                         start_proof.proof().probe(),
                         &mut adaptive_probe,
                         ready,
+                        Some(loop_skip),
                     )?
                 } else {
                     execute_lazy_loop(
@@ -5788,6 +7212,7 @@ fn execute_prepared(
         if let Some(selected) = pending {
             if !direct_start_known {
                 let end = selected.end();
+                let reverse_floor = selected.start();
                 let (start, reverse_boundaries) = if contextual {
                     execute_context_reverse_lazy_loop(
                         automaton,
@@ -5802,7 +7227,7 @@ fn execute_prepared(
                     execute_reverse_lazy_loop(
                         automaton,
                         haystack,
-                        window.start(),
+                        reverse_floor,
                         end,
                         workspace,
                         &mut meter,
@@ -5830,6 +7255,31 @@ fn execute_prepared(
         &mut setup,
         &mut setup_work,
     );
+    // Dependency learning is source-free and useful to every later contextual
+    // contract, including absent Exists workloads. Keep it outside loop-plan
+    // admission, but only after a completed unlimited lazy result so finite
+    // completion certificates and cold fallback behavior remain unchanged.
+    if limits == SearchLimits::unlimited() && contextual && used_lazy {
+        try_learn_context_dependency_masks(automaton, workspace, &mut meter)?;
+    }
+    // Learn only after a completed, sufficiently large unlimited lazy call.
+    // The first call keeps ordinary scalar semantics and publishes the start
+    // proof first; the retained publication epochs make this a no-op until a
+    // new exact loop witness (or contextual dependency proof) can matter.
+    // Window size, rather than the returned match tail, keeps absent, late,
+    // early-return, and nonpending loops eligible without observing source
+    // contents here. The proof is contract-neutral: direct state identity
+    // already contains the selected-end pending mode.
+    if limits == SearchLimits::unlimited()
+        && used_lazy
+        && window.end().saturating_sub(window.start()) >= LAZY_LOOP_SKIP_MIN_BYTES
+    {
+        if contextual {
+            try_derive_context_lazy_loop_skip(automaton, workspace, &mut meter)?;
+        } else {
+            try_derive_lazy_loop_skip(automaton, workspace, &mut meter)?;
+        }
+    }
     let scratch_bytes = workspace
         .retained_bytes
         .checked_add(published_proof_bytes)
@@ -5981,7 +7431,7 @@ const fn resume_lazy_start_action(
 fn finish_resume_lazy_cached_transition(
     automaton: &Automaton,
     state: u32,
-    byte: u8,
+    class: u8,
     accepted: bool,
     pending: bool,
     start_action: LazyStartAction,
@@ -6023,7 +7473,7 @@ fn finish_resume_lazy_cached_transition(
         }
     };
     let cell = encoded | if accepted { LAZY_CELL_ACCEPT } else { 0 } | start_action.cell_bits();
-    workspace.lazy.set_cell(state, byte, cell)?;
+    workspace.lazy.set_cell(state, class, cell)?;
     Ok(LazyTransition::Ready(cell))
 }
 
@@ -6037,12 +7487,13 @@ fn build_resume_lazy_cached_transition(
     automaton: &Automaton,
     state: u32,
     byte: u8,
+    class: u8,
     workspace: &mut K0Workspace,
     meter: &mut WorkMeter,
     core_reserve: u64,
     position: usize,
 ) -> Result<LazyTransition, SearchError> {
-    let cached = workspace.lazy.cell(state, byte)?;
+    let cached = workspace.lazy.cell(state, class)?;
     if cached != LAZY_CELL_UNFILLED {
         return Ok(LazyTransition::Ready(cached));
     }
@@ -6096,7 +7547,7 @@ fn build_resume_lazy_cached_transition(
     finish_resume_lazy_cached_transition(
         automaton,
         state,
-        byte,
+        class,
         accepted,
         pending,
         start_action,
@@ -6544,12 +7995,14 @@ fn execute_lazy_resume_loop(
             })?;
         let transition = match state {
             LazyState::Cached(cached) => {
-                let cell = workspace.lazy.direct_cell(cached, byte)?;
+                let class = automaton.byte_classes().class_of(byte);
+                let cell = workspace.lazy.direct_cell(cached, class)?;
                 if cell == LAZY_CELL_UNFILLED {
                     build_resume_lazy_cached_transition(
                         automaton,
                         direct_row_state(cached),
                         byte,
+                        class,
                         workspace,
                         meter,
                         core_reserve,
@@ -6620,7 +8073,7 @@ fn execute_lazy_resume_loop(
     clippy::too_many_lines,
     reason = "the forward loop keeps endpoint commitment and cache handoff together"
 )]
-fn execute_lazy_span_loop<const TRACK_START: bool>(
+fn execute_lazy_span_loop<const TRACK_START: bool, const LOOP_SKIP: bool>(
     automaton: &Automaton,
     haystack: &[u8],
     window: SearchWindow,
@@ -6633,7 +8086,12 @@ fn execute_lazy_span_loop<const TRACK_START: bool>(
     probe: Option<&StartPositionClass>,
     adaptive_probe: &mut AdaptiveStartProbe,
     _ready: DirectLazyReady,
+    loop_skip: Option<LazyLoopSkipPlan>,
 ) -> Result<Option<(Option<MatchSpan>, usize, bool)>, SearchError> {
+    // `TRACK_START` authenticates an ordinary unanchored Span and permits its
+    // candidate floor to narrow later reverse recovery. An untracked caller
+    // either projects only an endpoint or separately owns an exact
+    // `window.start()` proof; it must never use the candidate floor as a start.
     debug_assert!(matches!(
         contract,
         OutputContract::Exists
@@ -6645,6 +8103,7 @@ fn execute_lazy_span_loop<const TRACK_START: bool>(
     debug_assert!(workspace.lazy.is_bound_to(automaton));
     debug_assert!(workspace.lazy.initialized);
     debug_assert!(!workspace.lazy.declined);
+    debug_assert_eq!(LOOP_SKIP, loop_skip.is_some());
 
     // Bind the direct executor to the already-validated window ceiling once.
     // Subsequent source positions are monotone and tested against that same
@@ -6704,6 +8163,11 @@ fn execute_lazy_span_loop<const TRACK_START: bool>(
     let mut entered = false;
     let mut retained_start_mask = RetainedStartMaskCursor::default();
     let mut engine_candidate = None;
+    // Every scanner jump occurs only after all earlier candidates have been
+    // rejected. Even if DFA state merging later loses one exact start, this
+    // monotone floor remains a sound lower bound for reverse span recovery.
+    let mut candidate_floor = window.start();
+    let mut loop_probe = LazyLoopProbe::default();
 
     loop {
         if pending_end.is_none()
@@ -6740,6 +8204,7 @@ fn execute_lazy_span_loop<const TRACK_START: bool>(
                 if position == window.end() {
                     return Ok(Some((None, boundaries, false)));
                 }
+                candidate_floor = position;
                 if TRACK_START {
                     // One root expansion creates every positive initial
                     // frontier item at this exact candidate boundary.
@@ -6769,9 +8234,14 @@ fn execute_lazy_span_loop<const TRACK_START: bool>(
         if position >= haystack.len() {
             if position == haystack.len() {
                 let start_known = TRACK_START && pending_end.is_some() && pending_start.is_some();
+                let fallback_start = if TRACK_START {
+                    candidate_floor
+                } else {
+                    window.start()
+                };
                 return Ok(Some((
                     pending_end
-                        .map(|end| MatchSpan::new(pending_start.unwrap_or(window.start()), end)),
+                        .map(|end| MatchSpan::new(pending_start.unwrap_or(fallback_start), end)),
                     boundaries,
                     start_known,
                 )));
@@ -6779,6 +8249,60 @@ fn execute_lazy_span_loop<const TRACK_START: bool>(
             return Err(SearchError::InternalInvariant {
                 detail: "lazy DFA source position exceeded the validated window",
             });
+        }
+
+        if LOOP_SKIP {
+            let plan = loop_skip.ok_or(SearchError::InternalInvariant {
+                detail: "plan-aware lazy loop executed without its retained proof",
+            })?;
+            let in_plan_state = state == LazyState::Cached(plan.row_offset);
+            if !in_plan_state {
+                loop_probe.left_plan_state();
+            }
+            if in_plan_state
+                && loop_probe.is_ready(position)
+                && haystack.len().saturating_sub(position) >= LAZY_LOOP_SKIP_MIN_BYTES
+                && meter.remaining()
+                    >= u64::try_from(LAZY_LOOP_SKIP_MIN_BYTES)
+                        .expect("lazy loop threshold fits u64")
+            {
+                // Pending mode is part of the cached identity. A nonaccepting
+                // loop leaves any selected endpoint and its start unchanged;
+                // only the live-frontier start proof can be dropped.
+                let available = usize::try_from(meter.remaining())
+                    .unwrap_or(usize::MAX)
+                    .min(haystack.len().saturating_sub(position));
+                let scan_end = position.checked_add(available).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "lazy loop scan end",
+                    },
+                )?;
+                let skipped = plan
+                    .scanner
+                    .scan_forward(&haystack[position..scan_end]);
+                loop_probe.observe(position, skipped)?;
+                if skipped != 0 {
+                    meter.charge_admitted(
+                        u64::try_from(skipped).expect("lazy loop skip length fits u64"),
+                    );
+                    position = position.checked_add(skipped).ok_or(
+                        SearchError::ArithmeticOverflow {
+                            computation: "lazy loop source progress",
+                        },
+                    )?;
+                    boundaries = boundaries.checked_add(skipped).ok_or(
+                        SearchError::ArithmeticOverflow {
+                            computation: "lazy loop examined boundary count",
+                        },
+                    )?;
+                    if TRACK_START && plan.start_action == LazyStartAction::Drop {
+                        active_start = None;
+                    }
+                    if position == haystack.len() {
+                        continue;
+                    }
+                }
+            }
         }
 
         // Charge the source step before indexing the validated window. A
@@ -6793,12 +8317,14 @@ fn execute_lazy_span_loop<const TRACK_START: bool>(
         let byte = haystack[position];
         let transition = match state {
             LazyState::Cached(cached) => {
-                let cell = workspace.lazy.direct_cell(cached, byte)?;
+                let class = automaton.byte_classes().class_of(byte);
+                let cell = workspace.lazy.direct_cell(cached, class)?;
                 if cell == LAZY_CELL_UNFILLED {
                     build_lazy_cached_transition(
                         automaton,
                         direct_row_state(cached),
                         byte,
+                        class,
                         workspace,
                         meter,
                         core_reserve,
@@ -6869,9 +8395,14 @@ fn execute_lazy_span_loop<const TRACK_START: bool>(
             pending_end = Some(position);
             pending_start = next_start;
             if earliest {
+                let fallback_start = if TRACK_START {
+                    candidate_floor
+                } else {
+                    window.start()
+                };
                 return Ok(Some((
                     Some(MatchSpan::new(
-                        pending_start.unwrap_or(window.start()),
+                        pending_start.unwrap_or(fallback_start),
                         position,
                     )),
                     boundaries,
@@ -6881,8 +8412,16 @@ fn execute_lazy_span_loop<const TRACK_START: bool>(
         }
         let Some(next) = next else {
             let start_known = TRACK_START && pending_end.is_some() && pending_start.is_some();
+            let fallback_start = if TRACK_START {
+                candidate_floor
+            } else {
+                window.start()
+            };
             return Ok(Some((
-                pending_end.map(|end| MatchSpan::new(pending_start.unwrap_or(window.start()), end)),
+                pending_end.map(|end| MatchSpan::new(
+                    pending_start.unwrap_or(fallback_start),
+                    end,
+                )),
                 boundaries,
                 start_known,
             )));
@@ -6910,8 +8449,9 @@ fn execute_context_lazy_loop(
     probe: Option<&StartPositionClass>,
     force_haystack_start: bool,
     relaxed_nullable: bool,
+    loop_skip: Option<ContextLazyLoopSkipPlan>,
     adaptive_probe: &mut AdaptiveStartProbe,
-) -> Result<Option<(Option<MatchSpan>, usize)>, SearchError> {
+) -> Result<Option<(Option<MatchSpan>, usize, bool)>, SearchError> {
     if !matches!(
         contract,
         OutputContract::Exists
@@ -6933,11 +8473,16 @@ fn execute_context_lazy_loop(
         contract,
         OutputContract::Exists | OutputContract::EarliestEnd
     );
+    let global_dependencies = automaton.boundary_context_classifier().assertions();
+    let root_dependencies = workspace
+        .lazy
+        .context_root_dependency_mask(global_dependencies);
     let mut position = window.start();
     let mut boundaries = 0usize;
     let mut initial_candidate_scanned = false;
     let mut retained_start_mask = RetainedStartMaskCursor::default();
     let mut engine_candidate = None;
+    let mut loop_probe = LazyLoopProbe::default();
     if let Some(scanner) = scanner {
         // An absolute-start branch may contribute only at original haystack
         // boundary zero. Otherwise the proven scanner can establish the first
@@ -6956,7 +8501,7 @@ fn execute_context_lazy_loop(
                 adaptive_probe,
             )?;
             if position == window.end() {
-                return Ok(Some((None, boundaries)));
+                return Ok(Some((None, boundaries, false)));
             }
             if probe.is_some() && adaptive_probe.samples_rejections() {
                 engine_candidate = Some(position);
@@ -6964,7 +8509,13 @@ fn execute_context_lazy_loop(
             initial_candidate_scanned = true;
         }
     }
-    let initial_mask = enabled_assertion_mask(automaton, haystack, position, meter)?;
+    let initial_mask = enabled_assertion_mask_for_dependencies(
+        automaton,
+        root_dependencies,
+        haystack,
+        position,
+        meter,
+    )?;
     let Some((mut state, mut restartable)) = context_lazy_initial(
         automaton,
         initial_mask,
@@ -6979,6 +8530,11 @@ fn execute_context_lazy_loop(
     workspace.lazy.initialized = true;
 
     let mut pending_end = None;
+    // The contextual initial closure is rooted at this exact invocation
+    // boundary. Subsequent cached cells preserve, reset, or conservatively
+    // drop that scalar proof without including it in reusable state identity.
+    let mut active_start = Some(position);
+    let mut pending_start = None;
     let mut entered = false;
 
     loop {
@@ -7016,14 +8572,20 @@ fn execute_context_lazy_loop(
                 position
             };
             if candidate == window.end() {
-                return Ok(Some((None, boundaries)));
+                return Ok(Some((None, boundaries, false)));
             }
             if probe.is_some() && adaptive_probe.samples_rejections() {
                 engine_candidate = Some(candidate);
             }
             if candidate != position {
                 position = candidate;
-                let mask = enabled_assertion_mask(automaton, haystack, position, meter)?;
+                let mask = enabled_assertion_mask_for_dependencies(
+                    automaton,
+                    root_dependencies,
+                    haystack,
+                    position,
+                    meter,
+                )?;
                 let Some(initial) = context_lazy_initial(
                     automaton,
                     mask,
@@ -7036,6 +8598,7 @@ fn execute_context_lazy_loop(
                     return Ok(None);
                 };
                 state = initial.0;
+                active_start = Some(position);
             }
         }
         if !entered {
@@ -7047,10 +8610,81 @@ fn execute_context_lazy_loop(
             entered = true;
         }
         if position == window.end() {
+            let start_known = pending_end.is_some() && pending_start.is_some();
             return Ok(Some((
-                pending_end.map(|end| MatchSpan::new(window.start(), end)),
+                pending_end.map(|end| {
+                    MatchSpan::new(pending_start.unwrap_or(window.start()), end)
+                }),
                 boundaries,
+                start_known,
             )));
+        }
+
+        if let Some(plan) = loop_skip {
+            let in_plan_state = state == LazyState::Cached(plan.state);
+            let scan_threshold = if plan.leave_final_member {
+                LAZY_LOOP_SKIP_MIN_BYTES.checked_add(1).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "contextual lazy loop scan threshold",
+                    },
+                )?
+            } else {
+                LAZY_LOOP_SKIP_MIN_BYTES
+            };
+            if !in_plan_state {
+                loop_probe.left_plan_state();
+            }
+            if in_plan_state
+                && loop_probe.is_ready(position)
+                && window.end().saturating_sub(position) >= scan_threshold
+                && meter.remaining()
+                    >= u64::try_from(scan_threshold)
+                        .expect("lazy loop threshold fits u64")
+            {
+                let available = usize::try_from(meter.remaining())
+                    .unwrap_or(usize::MAX)
+                    .min(window.end().saturating_sub(position));
+                let scan_end = position.checked_add(available).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "contextual lazy loop scan end",
+                    },
+                )?;
+                let source = haystack.get(position..scan_end).ok_or(
+                    SearchError::InternalInvariant {
+                        detail: "contextual lazy loop scan exceeded its validated window",
+                    },
+                )?;
+                let member_run = plan.scanner.scan_forward(source);
+                let skipped = if plan.leave_final_member {
+                    member_run.saturating_sub(1)
+                } else {
+                    member_run
+                };
+                loop_probe.observe(position, skipped)?;
+                if skipped != 0 {
+                    meter.charge_admitted(
+                        u64::try_from(skipped)
+                            .expect("contextual lazy loop skip length fits u64"),
+                    );
+                    position = position.checked_add(skipped).ok_or(
+                        SearchError::ArithmeticOverflow {
+                            computation: "contextual lazy loop source progress",
+                        },
+                    )?;
+                    boundaries = boundaries.checked_add(skipped).ok_or(
+                        SearchError::ArithmeticOverflow {
+                            computation: "contextual lazy loop examined boundary count",
+                        },
+                    )?;
+                    restartable = false;
+                    if plan.start_action == LazyStartAction::Drop {
+                        active_start = None;
+                    }
+                    if position == window.end() {
+                        continue;
+                    }
+                }
+            }
         }
 
         meter.charge(1, position)?;
@@ -7064,7 +8698,19 @@ fn execute_context_lazy_loop(
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "contextual lazy DFA destination",
             })?;
-        let assertions = enabled_assertion_mask(automaton, haystack, destination, meter)?;
+        let dependencies = match state {
+            LazyState::Cached(cached) => workspace
+                .lazy
+                .context_dependency_mask(cached, global_dependencies)?,
+            LazyState::Inline { .. } => global_dependencies,
+        };
+        let assertions = enabled_assertion_mask_for_dependencies(
+            automaton,
+            dependencies,
+            haystack,
+            destination,
+            meter,
+        )?;
         let symbol = contextual_symbol(u32::from(byte), assertions);
         let transition = match state {
             LazyState::Cached(cached) => build_context_lazy_cached_transition(
@@ -7095,7 +8741,7 @@ fn execute_context_lazy_loop(
                 computation: "contextual lazy DFA examined boundary count",
             })?;
 
-        let (accepted, next_pending, next_restartable, next) = match transition {
+        let (accepted, next_pending, next_restartable, next, start_action) = match transition {
             ContextLazyTransition::Ready(cell) => {
                 let encoded = cell & LAZY_CELL_STATE_MASK;
                 (
@@ -7111,32 +8757,49 @@ fn execute_context_lazy_loop(
                             },
                         )?))
                     },
+                    LazyStartAction::from_direct_cell(cell),
                 )
             }
             ContextLazyTransition::Inline {
                 accepted,
                 pending,
                 restartable,
+                start_action,
             } => (
                 accepted,
                 pending,
                 restartable,
                 Some(LazyState::Inline { pending }),
+                start_action,
             ),
+        };
+        let next_start = match start_action {
+            LazyStartAction::Drop => None,
+            LazyStartAction::Propagate => active_start,
+            LazyStartAction::Reset => Some(position),
         };
         if accepted {
             pending_end = Some(position);
+            pending_start = next_start;
             if earliest {
                 return Ok(Some((
-                    Some(MatchSpan::new(window.start(), position)),
+                    Some(MatchSpan::new(
+                        pending_start.unwrap_or(window.start()),
+                        position,
+                    )),
                     boundaries,
+                    pending_start.is_some(),
                 )));
             }
         }
         let Some(next) = next else {
+            let start_known = pending_end.is_some() && pending_start.is_some();
             return Ok(Some((
-                pending_end.map(|end| MatchSpan::new(window.start(), end)),
+                pending_end.map(|end| {
+                    MatchSpan::new(pending_start.unwrap_or(window.start()), end)
+                }),
                 boundaries,
+                start_known,
             )));
         };
         state = match next {
@@ -7146,6 +8809,7 @@ fn execute_context_lazy_loop(
             },
         };
         restartable = next_restartable;
+        active_start = next_start;
     }
 }
 
@@ -7256,9 +8920,12 @@ fn build_context_lazy_cached_transition(
             }
         }
     }
+    let source_len = workspace.lazy.scratch_len;
+    let mut injected_root = false;
     let mut restartable = false;
     if !accepted && !pending {
-        restartable = workspace.lazy.scratch_len == 0;
+        injected_root = true;
+        restartable = source_len == 0;
         if expand_context_lazy_root(
             automaton,
             automaton.start,
@@ -7272,9 +8939,17 @@ fn build_context_lazy_cached_transition(
             });
         }
     }
+    // A restartable contextual edge has no live source provenance. Treat its
+    // destination as a reset even when the root is empty: no acceptance can
+    // observe the vacuous scalar before a later nonempty reset replaces it.
+    let start_action = if restartable {
+        LazyStartAction::Reset
+    } else {
+        lazy_start_action(source_len, workspace.lazy.scratch_len, injected_root)
+    };
     let next_pending = pending || accepted;
     if workspace.lazy.scratch_len == 0 && next_pending {
-        let cell = if accepted { LAZY_CELL_ACCEPT } else { 0 };
+        let cell = (if accepted { LAZY_CELL_ACCEPT } else { 0 }) | start_action.cell_bits();
         workspace.lazy.context.publish(
             slot,
             ContextTransitionSlot::populated(state, symbol, cell),
@@ -7294,9 +8969,8 @@ fn build_context_lazy_cached_transition(
         position,
     )?;
     let accepted_bit = if accepted { LAZY_CELL_ACCEPT } else { 0 };
-    let restart_bit = if restartable { LAZY_CELL_RESTART } else { 0 };
     if let Some(encoded) = encoded {
-        let cell = encoded | accepted_bit | restart_bit;
+        let cell = encoded | accepted_bit | start_action.cell_bits();
         workspace.lazy.context.publish(
             slot,
             ContextTransitionSlot::populated(state, symbol, cell),
@@ -7315,6 +8989,7 @@ fn build_context_lazy_cached_transition(
             accepted,
             pending,
             restartable,
+            start_action,
         })
     }
 }
@@ -7362,9 +9037,12 @@ fn build_context_lazy_inline_transition(
             }
         }
     }
+    let source_len = workspace.lazy.scratch_len;
+    let mut injected_root = false;
     let mut restartable = false;
     if !accepted && !pending {
-        restartable = workspace.lazy.scratch_len == 0;
+        injected_root = true;
+        restartable = source_len == 0;
         if expand_context_lazy_root(
             automaton,
             automaton.start,
@@ -7378,20 +9056,24 @@ fn build_context_lazy_inline_transition(
             });
         }
     }
+    let start_action = if restartable {
+        LazyStartAction::Reset
+    } else {
+        lazy_start_action(source_len, workspace.lazy.scratch_len, injected_root)
+    };
     let next_pending = pending || accepted;
     if workspace.lazy.scratch_len == 0 {
         workspace.lazy.frontier_len = 0;
         if next_pending {
-            return Ok(ContextLazyTransition::Ready(if accepted {
-                LAZY_CELL_ACCEPT
-            } else {
-                0
-            }));
+            let cell = (if accepted { LAZY_CELL_ACCEPT } else { 0 })
+                | start_action.cell_bits();
+            return Ok(ContextLazyTransition::Ready(cell));
         }
         return Ok(ContextLazyTransition::Inline {
             accepted,
             pending: false,
             restartable,
+            start_action,
         });
     }
     workspace.lazy.retain_scratch_as_frontier()?;
@@ -7399,6 +9081,7 @@ fn build_context_lazy_inline_transition(
         accepted,
         pending: next_pending,
         restartable,
+        start_action,
     })
 }
 
@@ -7686,16 +9369,635 @@ const fn lazy_start_action(
     }
 }
 
+fn byte_bitmap_contains(words: [u64; 4], byte: u8) -> bool {
+    let word = usize::from(byte / 64);
+    let bit = u32::from(byte % 64);
+    words[word] & (1_u64 << bit) != 0
+}
+
+fn byte_bitmap_insert(words: &mut [u64; 4], byte: u8) {
+    let word = usize::from(byte / 64);
+    let bit = u32::from(byte % 64);
+    words[word] |= 1_u64 << bit;
+}
+
+fn context_interior_category_matches(
+    classifier: BoundaryContextClassifier,
+    line_terminator: u8,
+    representative: u8,
+    candidate: u8,
+) -> bool {
+    (classifier.configured_line() == 0
+        || (representative == line_terminator) == (candidate == line_terminator))
+        && (classifier.crlf_line() == 0
+            || match (representative, candidate) {
+                (b'\r', b'\r') | (b'\n', b'\n') => true,
+                (b'\r' | b'\n', _) | (_, b'\r' | b'\n') => false,
+                _ => true,
+            })
+        && ((classifier.ascii_word() | classifier.unicode_word()) == 0
+            || is_ascii_word(representative) == is_ascii_word(candidate))
+}
+
+fn try_context_interior_equivalence_class(
+    automaton: &Automaton,
+    lazy: &LazyWorkspace,
+    state: u32,
+    dependencies: u32,
+    representative: u8,
+    meter: &mut WorkMeter,
+) -> Result<Option<[u64; 4]>, SearchError> {
+    let Some(graph_members) = try_lazy_state_equivalence_class(
+        automaton,
+        lazy,
+        state,
+        representative,
+        meter,
+    )? else {
+        return Ok(None);
+    };
+    let classifier = BoundaryContextClassifier::new(dependencies);
+    let candidate_maximum = if classifier.unicode_word() == 0 {
+        u8::MAX
+    } else {
+        // Adjacent ASCII members are complete one-byte scalars, so the
+        // retained Unicode-word specialization is exact. No byte-local proof
+        // is sufficient for a high-byte interior.
+        0x7f
+    };
+    let mut members = [0_u64; 4];
+    for candidate in u8::MIN..=candidate_maximum {
+        if !byte_bitmap_contains(graph_members, candidate) {
+            continue;
+        }
+        if !meter.try_charge_optional(1, 0) {
+            return Ok(None);
+        }
+        if context_interior_category_matches(
+            classifier,
+            automaton.line_terminator(),
+            representative,
+            candidate,
+        ) {
+            byte_bitmap_insert(&mut members, candidate);
+        }
+    }
+    Ok(Some(members))
+}
+
+const fn byte_bitmap_cardinality(words: [u64; 4]) -> u32 {
+    words[0].count_ones()
+        + words[1].count_ones()
+        + words[2].count_ones()
+        + words[3].count_ones()
+}
+
+const LAZY_LOOP_EDGE_EQUIVALENCE_WORK: u64 = 9;
+
+/// Return the complete byte equivalence class of one representative for one
+/// exact retained lazy state.
+///
+/// The transition executor can inspect only the ByteRange edges outgoing from
+/// the state's ordered consuming frontier. Intersecting either each such range
+/// or its complement reproduces the representative's complete ordered
+/// edge-membership vector. Every retained byte consequently performs the same
+/// closures, acceptance stop, root injection, pending update, destination,
+/// and provenance action. Edges outside this exact state cannot affect its
+/// transition and deliberately do not split the class.
+fn try_lazy_state_equivalence_class(
+    automaton: &Automaton,
+    lazy: &LazyWorkspace,
+    state: u32,
+    representative: u8,
+    meter: &mut WorkMeter,
+) -> Result<Option<[u64; 4]>, SearchError> {
+    let (_, length, _) = lazy.state_bounds(state)?;
+    let mut members = [u64::MAX; 4];
+    for ordinal in 0..length {
+        if !meter.try_charge_optional(1, 0) {
+            return Ok(None);
+        }
+        let consuming = lazy.item(state, ordinal)?;
+        for edge in automaton.state_edges(consuming) {
+            // One edge inspection, four range-bitmap word writes, and four
+            // equivalence intersections form the exact abstract proof charge.
+            if !meter.try_charge_optional(LAZY_LOOP_EDGE_EQUIVALENCE_WORK, 0) {
+                return Ok(None);
+            }
+            if automaton.edge_kinds[edge] != EdgeKind::ByteRange {
+                return Err(SearchError::InternalInvariant {
+                    detail: "lazy loop equivalence reached a non-consuming edge",
+                });
+            }
+            let start = automaton.byte_starts[edge];
+            let end = automaton.byte_ends[edge];
+            let mut range = [0_u64; 4];
+            insert_byte_range(&mut range, start, end);
+            let representative_matches = start <= representative && representative <= end;
+            for word in 0..range.len() {
+                members[word] &= if representative_matches {
+                    range[word]
+                } else {
+                    !range[word]
+                };
+            }
+        }
+    }
+    debug_assert!(byte_bitmap_contains(members, representative));
+    Ok(Some(members))
+}
+
+/// Learn at most one exact self-loop from already-published direct cells.
+///
+/// This cold pass is attempted only after a sufficiently large completed
+/// unlimited lazy invocation. Inferred equivalent bytes are retained only in
+/// the scanner; direct cache cells, state identities, saturation, and ordinary
+/// transition learning remain byte-for-byte unchanged. Runtime backoff,
+/// rather than a graph-class cardinality cliff, controls narrow unproductive
+/// runs.
+fn try_derive_lazy_loop_skip(
+    automaton: &Automaton,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+) -> Result<(), SearchError> {
+    if automaton.stats().assertion_edges() != 0
+        || !workspace.lazy.is_bound_to(automaton)
+        || workspace.lazy.loop_skip_analyzed_at_cells
+            == workspace.lazy.direct_cells_published
+    {
+        return Ok(());
+    }
+
+    let analyzed_cells = workspace.lazy.direct_cells_published;
+    let mut best_cardinality = workspace
+        .lazy
+        .loop_skip_plan
+        .map_or(0, |plan| plan.scanner.cardinality());
+    let mut best_candidate = None;
+    for state in 0..workspace.lazy.state_len {
+        if !meter.try_charge_optional(1, 0) {
+            return Ok(());
+        }
+        let state_u32 = u32::try_from(state).map_err(|_| SearchError::InternalInvariant {
+            detail: "lazy loop analysis state does not fit u32",
+        })?;
+        let row_offset = direct_row_offset(state_u32)?;
+        let same_row_encoded = direct_row_encoded_state(state_u32)?;
+        let mut propagate_members = [0_u64; 4];
+        let mut drop_members = [0_u64; 4];
+        for class_index in 0..automaton.byte_classes().count() {
+            let class = u8::try_from(class_index).map_err(|_| {
+                SearchError::InternalInvariant {
+                    detail: "lazy loop byte class does not fit u8",
+                }
+            })?;
+            let byte = automaton
+                .byte_classes()
+                .representative(class)
+                .ok_or(SearchError::InternalInvariant {
+                    detail: "lazy loop byte class has no representative",
+                })?;
+            if byte_bitmap_contains(propagate_members, byte)
+                || byte_bitmap_contains(drop_members, byte)
+            {
+                continue;
+            }
+            if !meter.try_charge_optional(1, 0) {
+                return Ok(());
+            }
+            let cell = workspace.lazy.direct_cell(row_offset, class)?;
+            let Some(start_action) = encoded_nonaccepting_self_loop_action(same_row_encoded, cell)
+            else {
+                continue;
+            };
+            let Some(equivalent) = try_lazy_state_equivalence_class(
+                automaton,
+                &workspace.lazy,
+                state_u32,
+                byte,
+                meter,
+            )? else {
+                return Ok(());
+            };
+            let members = match start_action {
+                LazyStartAction::Propagate => &mut propagate_members,
+                LazyStartAction::Drop => &mut drop_members,
+                LazyStartAction::Reset => {
+                    return Err(SearchError::InternalInvariant {
+                        detail: "nonrestarting direct loop retained a Reset action",
+                    });
+                }
+            };
+            for word in 0..members.len() {
+                members[word] |= equivalent[word];
+            }
+        }
+
+        for (start_action, members) in [
+            (LazyStartAction::Propagate, propagate_members),
+            (LazyStartAction::Drop, drop_members),
+        ] {
+            let cardinality = byte_bitmap_cardinality(members);
+            if cardinality > best_cardinality {
+                best_cardinality = cardinality;
+                best_candidate = Some((row_offset, members, start_action));
+            }
+        }
+    }
+
+    if let Some((row_offset, members, start_action)) = best_candidate {
+        let publication_work = LazyLoopScanner::build_work(members)
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "lazy loop scanner publication work",
+            })?;
+        if !meter.try_charge_optional(publication_work, 0) {
+            return Ok(());
+        }
+        workspace.lazy.loop_skip_plan = Some(LazyLoopSkipPlan {
+            row_offset,
+            scanner: LazyLoopScanner::new(members),
+            start_action,
+        });
+    }
+    // Direct cells are immutable and this cold pass publishes none. Retain the
+    // exact completed epoch so a no-plan result costs nothing on later calls,
+    // yet any newly learned cell makes analysis retryable.
+    workspace.lazy.loop_skip_analyzed_at_cells = analyzed_cells;
+    Ok(())
+}
+
+/// Add every assertion bit reachable from one zero-width closure root.
+///
+/// Assertion targets are followed regardless of whether that assertion was
+/// enabled at any observed source boundary. The resulting mask is therefore a
+/// source-free dependency proof, not a profile of one transition.
+fn try_extend_context_dependency_mask(
+    automaton: &Automaton,
+    root: u32,
+    marker: u64,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    dependency_mask: &mut u32,
+) -> Result<bool, SearchError> {
+    workspace.stack_len = 0;
+    workspace.push_stack(Thread { state: root, start: 0 })?;
+    while let Some(thread) = workspace.pop_stack() {
+        if !meter.try_charge_optional(1, 0) {
+            return Ok(false);
+        }
+        let state = crate::plan::plan_index(thread.state);
+        if workspace.seen_at[state] == marker {
+            continue;
+        }
+        workspace.seen_at[state] = marker;
+        match automaton.roles[state] {
+            StateRole::Accept | StateRole::Consume => {}
+            StateRole::Split => {
+                for edge in automaton.state_edges(thread.state).rev() {
+                    if !meter.try_charge_optional(1, 0) {
+                        return Ok(false);
+                    }
+                    let kind = automaton.edge_kinds[edge];
+                    if kind == EdgeKind::ByteRange {
+                        return Err(SearchError::InternalInvariant {
+                            detail: "contextual dependency closure reached a consuming split edge",
+                        });
+                    }
+                    if let Some(bit) = kind.assertion_bit() {
+                        *dependency_mask |= bit;
+                    }
+                    // Follow assertion targets as well as epsilon targets. Two
+                    // contexts can differ below this edge only after the edge's
+                    // own bit (already retained above) differs.
+                    workspace.push_stack(Thread {
+                        state: automaton.edge_targets[edge],
+                        start: 0,
+                    })?;
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn try_context_state_dependency_mask(
+    automaton: &Automaton,
+    state: u32,
+    root_dependencies: u32,
+    marker: u64,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+) -> Result<Option<u32>, SearchError> {
+    if !meter.try_charge_optional(1, 0) {
+        return Ok(None);
+    }
+    let (_, length, pending) = workspace.lazy.state_bounds(state)?;
+    let mut dependencies = 0_u32;
+    for ordinal in 0..length {
+        if !meter.try_charge_optional(1, 0) {
+            return Ok(None);
+        }
+        let consuming = workspace.lazy.item(state, ordinal)?;
+        for edge in automaton.state_edges(consuming) {
+            if !meter.try_charge_optional(1, 0) {
+                return Ok(None);
+            }
+            if automaton.edge_kinds[edge] != EdgeKind::ByteRange {
+                return Err(SearchError::InternalInvariant {
+                    detail: "contextual dependency state contained a zero-width consuming edge",
+                });
+            }
+            // Drain each target before admitting another. A Consume may have
+            // more overlapping edges than the zero-width DFS stack has slots.
+            if !try_extend_context_dependency_mask(
+                automaton,
+                automaton.edge_targets[edge],
+                marker,
+                workspace,
+                meter,
+                &mut dependencies,
+            )? {
+                return Ok(None);
+            }
+        }
+    }
+    if !pending {
+        dependencies |= root_dependencies;
+    }
+    Ok(Some(dependencies))
+}
+
+/// Learn immutable contextual assertion dependencies for retained lazy states.
+///
+/// `seen_at` is invocation scratch, so this post-result optional transaction
+/// precharges both complete clears and uses a distinct local marker for every
+/// analyzed identity. A decline publishes only the already-complete prefix;
+/// the current state remains sentinel-tagged and retries on a later call.
+fn try_learn_context_dependency_masks(
+    automaton: &Automaton,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+) -> Result<(), SearchError> {
+    if !workspace.lazy.context.is_allocated() || !workspace.lazy.is_bound_to(automaton) {
+        return Ok(());
+    }
+    if workspace.lazy.context_dependencies_analyzed > workspace.lazy.state_len {
+        return Err(SearchError::InternalInvariant {
+            detail: "contextual dependency high-water exceeds retained states",
+        });
+    }
+    let root_uncomputed = workspace.lazy.context.hot_initial.dependency_mask
+        == CONTEXT_DEPENDENCY_UNCOMPUTED;
+    if !root_uncomputed
+        && workspace.lazy.context_dependencies_analyzed == workspace.lazy.state_len
+    {
+        return Ok(());
+    }
+
+    let clear_work = u64::try_from(workspace.seen_at.len())
+        .ok()
+        .and_then(|work| work.checked_mul(2))
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "contextual dependency proof clear work",
+        })?;
+    if !meter.try_charge_optional(clear_work, 0) {
+        return Ok(());
+    }
+    workspace.seen_at.fill(0);
+    workspace.stack_len = 0;
+    let state_len = workspace.lazy.state_len;
+    let global_dependencies = automaton.boundary_context_classifier().assertions();
+    let result = (|| -> Result<(), SearchError> {
+        let mut marker = 1_u64;
+        if root_uncomputed {
+            let mut root_dependencies = 0_u32;
+            if !try_extend_context_dependency_mask(
+                automaton,
+                automaton.start,
+                marker,
+                workspace,
+                meter,
+                &mut root_dependencies,
+            )? || !meter.try_charge_optional(1, 0)
+            {
+                return Ok(());
+            }
+            debug_assert_eq!(root_dependencies & !global_dependencies, 0);
+            workspace.lazy.context.hot_initial.dependency_mask = root_dependencies;
+            marker = marker.checked_add(1).ok_or(SearchError::InternalInvariant {
+                detail: "contextual dependency marker overflowed",
+            })?;
+        }
+
+        let root_dependencies = workspace.lazy.context.hot_initial.dependency_mask;
+        if root_dependencies == CONTEXT_DEPENDENCY_UNCOMPUTED {
+            return Ok(());
+        }
+        while workspace.lazy.context_dependencies_analyzed < state_len {
+            let state = workspace.lazy.context_dependencies_analyzed;
+            let state_u32 = u32::try_from(state).map_err(|_| SearchError::InternalInvariant {
+                detail: "contextual dependency state does not fit u32",
+            })?;
+            let Some(dependencies) = try_context_state_dependency_mask(
+                automaton,
+                state_u32,
+                root_dependencies,
+                marker,
+                workspace,
+                meter,
+            )? else {
+                return Ok(());
+            };
+            if !meter.try_charge_optional(1, 0) {
+                return Ok(());
+            }
+            debug_assert_eq!(dependencies & !global_dependencies, 0);
+            let hot = workspace
+                .lazy
+                .context
+                .hot
+                .get_mut(state)
+                .ok_or(SearchError::InternalInvariant {
+                    detail: "contextual dependency state is outside hot metadata",
+                })?;
+            if hot.dependency_mask != CONTEXT_DEPENDENCY_UNCOMPUTED {
+                return Err(SearchError::InternalInvariant {
+                    detail: "contextual dependency state was published out of order",
+                });
+            }
+            hot.dependency_mask = dependencies;
+            workspace.lazy.context_dependencies_analyzed = state
+                .checked_add(1)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "contextual dependency high-water",
+                })?;
+            marker = marker.checked_add(1).ok_or(SearchError::InternalInvariant {
+                detail: "contextual dependency marker overflowed",
+            })?;
+        }
+        Ok(())
+    })();
+    workspace.stack_len = 0;
+    workspace.seen_at.fill(0);
+    result
+}
+
+/// Learn one context-stable contextual self-loop from already-published exact
+/// transitions. Assertion-independent loops may consume a complete member
+/// run. A byte-context loop consumes only `run - 1`, keeping one final member
+/// for scalar evaluation against the real successor or endpoint. Unicode word
+/// context is exact inside an ASCII run because each adjacent byte is a valid
+/// one-byte scalar and Unicode word membership equals ASCII word membership.
+/// The bounded slot walk prevents a later EOF-context hot record from hiding
+/// an earlier interior-context witness. Equivalent bytes remain scanner-only;
+/// no inferred contextual record is published.
+fn try_derive_context_lazy_loop_skip(
+    automaton: &Automaton,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+) -> Result<(), SearchError> {
+    if !workspace.lazy.context.is_allocated()
+        || !workspace.lazy.is_bound_to(automaton)
+        || (workspace.lazy.context_loop_skip_analyzed_at_candidates
+            == workspace.lazy.context.loop_candidates_published
+            && workspace.lazy.context_loop_skip_analyzed_at_dependencies
+                == workspace.lazy.context_dependencies_analyzed)
+    {
+        return Ok(());
+    }
+
+    let analyzed_candidates = workspace.lazy.context.loop_candidates_published;
+    let analyzed_dependencies = workspace.lazy.context_dependencies_analyzed;
+    let mut best_cardinality = workspace
+        .lazy
+        .context_loop_skip_plan
+        .map_or(0, |plan| plan.scanner.cardinality());
+    let mut best_leave_final_member = workspace
+        .lazy
+        .context_loop_skip_plan
+        .is_none_or(|plan| plan.leave_final_member);
+    let mut best_candidate = None;
+    for &record in &workspace.lazy.context.slots {
+        if !meter.try_charge_optional(1, 0) {
+            return Ok(());
+        }
+        if record.source == CONTEXT_EMPTY_SOURCE
+            || record.source == CONTEXT_INITIAL_SOURCE
+            || usize::try_from(record.source)
+                .ok()
+                .is_none_or(|state| state >= workspace.lazy.state_len)
+        {
+            continue;
+        }
+        let symbol_byte = record.symbol & CONTEXT_SYMBOL_BYTE_MASK;
+        let Ok(representative) = u8::try_from(symbol_byte) else {
+            continue;
+        };
+        let Some(start_action) =
+            context_nonaccepting_self_loop_action(record.source, record.value)
+        else {
+            continue;
+        };
+        let state = usize::try_from(record.source).map_err(|_| {
+            SearchError::InternalInvariant {
+                detail: "contextual loop analysis state does not fit usize",
+            }
+        })?;
+        let hot = *workspace
+            .lazy
+            .context
+            .hot
+            .get(state)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "contextual loop analysis hot state is outside metadata",
+            })?;
+        let dependencies = hot.dependency_mask;
+        if dependencies == CONTEXT_DEPENDENCY_UNCOMPUTED {
+            continue;
+        }
+        let classifier = BoundaryContextClassifier::new(dependencies);
+        if classifier.unicode_word() != 0 && !representative.is_ascii() {
+            // A high byte is not a complete Unicode scalar. Preserve the
+            // proven ASCII-interior specialization without inferring a
+            // byte-local Unicode category for an arbitrary encoded sequence.
+            continue;
+        }
+        let checks = u64::from(dependencies.count_ones());
+        if !meter.try_charge_optional(checks, 0) {
+            return Ok(());
+        }
+        let interior = [representative, representative];
+        let interior_assertions = enabled_assertion_mask_unmetered_with_classifier(
+            classifier,
+            automaton.line_terminator(),
+            &interior,
+            1,
+        );
+        if record.symbol >> CONTEXT_SYMBOL_BYTE_BITS != interior_assertions {
+            continue;
+        }
+        let Some(equivalent) = try_context_interior_equivalence_class(
+            automaton,
+            &workspace.lazy,
+            record.source,
+            dependencies,
+            representative,
+            meter,
+        )? else {
+            return Ok(());
+        };
+        let cardinality = byte_bitmap_cardinality(equivalent);
+        let leave_final_member = dependencies != 0;
+        if cardinality > best_cardinality
+            || cardinality == best_cardinality
+                && best_leave_final_member
+                && !leave_final_member
+        {
+            best_cardinality = cardinality;
+            best_leave_final_member = leave_final_member;
+            best_candidate = Some((
+                record.source,
+                equivalent,
+                start_action,
+                leave_final_member,
+            ));
+        }
+    }
+
+    if let Some((state, members, start_action, leave_final_member)) = best_candidate {
+        let publication_work = LazyLoopScanner::build_work(members)
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "contextual lazy loop scanner publication work",
+            })?;
+        if !meter.try_charge_optional(publication_work, 0) {
+            return Ok(());
+        }
+        workspace.lazy.context_loop_skip_plan = Some(ContextLazyLoopSkipPlan {
+            state,
+            scanner: LazyLoopScanner::new(members),
+            start_action,
+            leave_final_member,
+        });
+    }
+    workspace.lazy.context_loop_skip_analyzed_at_candidates = analyzed_candidates;
+    workspace.lazy.context_loop_skip_analyzed_at_dependencies =
+        analyzed_dependencies;
+    Ok(())
+}
+
 fn build_lazy_cached_transition(
     automaton: &Automaton,
     state: u32,
     byte: u8,
+    class: u8,
     workspace: &mut K0Workspace,
     meter: &mut WorkMeter,
     core_reserve: u64,
     position: usize,
 ) -> Result<LazyTransition, SearchError> {
-    let cached = workspace.lazy.cell(state, byte)?;
+    let cached = workspace.lazy.cell(state, class)?;
     if cached != LAZY_CELL_UNFILLED {
         return Ok(LazyTransition::Ready(cached));
     }
@@ -7736,7 +10038,7 @@ fn build_lazy_cached_transition(
     finish_lazy_cached_transition(
         automaton,
         state,
-        byte,
+        class,
         accepted,
         pending,
         start_action,
@@ -7754,7 +10056,7 @@ fn build_lazy_cached_transition(
 fn finish_lazy_cached_transition(
     automaton: &Automaton,
     state: u32,
-    byte: u8,
+    class: u8,
     accepted: bool,
     pending: bool,
     start_action: LazyStartAction,
@@ -7796,7 +10098,7 @@ fn finish_lazy_cached_transition(
         }
     };
     let cell = encoded | if accepted { LAZY_CELL_ACCEPT } else { 0 } | start_action.cell_bits();
-    workspace.lazy.set_cell(state, byte, cell)?;
+    workspace.lazy.set_cell(state, class, cell)?;
     Ok(LazyTransition::Ready(cell))
 }
 
@@ -8186,12 +10488,13 @@ fn build_reverse_cached_transition(
     automaton: &Automaton,
     state: u32,
     byte: u8,
+    class: u8,
     workspace: &mut K0Workspace,
     meter: &mut WorkMeter,
     core_reserve: u64,
     position: usize,
 ) -> Result<ReverseTransition, SearchError> {
-    let cached = workspace.reverse.cell(state, byte)?;
+    let cached = workspace.reverse.cell(state, class)?;
     if cached != LAZY_CELL_UNFILLED {
         return Ok(ReverseTransition::Ready(cached));
     }
@@ -8221,7 +10524,7 @@ fn build_reverse_cached_transition(
     finish_reverse_cached_transition(
         automaton,
         state,
-        byte,
+        class,
         reaches_start,
         workspace,
         meter,
@@ -8237,7 +10540,7 @@ fn build_reverse_cached_transition(
 fn finish_reverse_cached_transition(
     automaton: &Automaton,
     state: u32,
-    byte: u8,
+    class: u8,
     reaches_start: bool,
     workspace: &mut K0Workspace,
     meter: &mut WorkMeter,
@@ -8268,7 +10571,7 @@ fn finish_reverse_cached_transition(
         }
     };
     let cell = encoded | if reaches_start { LAZY_CELL_ACCEPT } else { 0 };
-    workspace.reverse.set_cell(state, byte, cell)?;
+    workspace.reverse.set_cell(state, class, cell)?;
     Ok(ReverseTransition::Ready(cell))
 }
 
@@ -8314,6 +10617,295 @@ fn build_reverse_inline_transition(
     Ok(ReverseTransition::Inline { reaches_start })
 }
 
+// Keep the optional arbitrary-endpoint verifier from turning the ordinary K0
+// reverse-transition builders into multi-caller outlining candidates under
+// ThinLTO. These private clones deliberately share only lower-level closure
+// primitives whose ordinary call boundaries are already stable.
+fn build_positive_end_cached_transition(
+    automaton: &Automaton,
+    state: u32,
+    byte: u8,
+    class: u8,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    position: usize,
+) -> Result<ReverseTransition, SearchError> {
+    let cached = workspace.reverse.cell(state, class)?;
+    if cached != LAZY_CELL_UNFILLED {
+        return Ok(ReverseTransition::Ready(cached));
+    }
+    let (_, length) = workspace.reverse.state_bounds(state)?;
+    begin_reverse_closure(workspace, meter, position)?;
+    let mut reaches_start = false;
+    for ordinal in 0..length {
+        let incoming = usize::try_from(workspace.reverse.item(state, ordinal)?).map_err(|_| {
+            SearchError::InternalInvariant {
+                detail: "positive-end reverse incoming item does not fit usize",
+            }
+        })?;
+        meter.charge(1, position)?;
+        let start = workspace.reverse.incoming_starts[incoming];
+        let end = workspace.reverse.incoming_ends[incoming];
+        if start <= byte && byte <= end {
+            reaches_start |= expand_reverse_root(
+                automaton,
+                workspace.reverse.incoming_sources[incoming],
+                workspace,
+                meter,
+                position,
+            )?;
+        }
+    }
+    collect_reverse_frontier(automaton, workspace, meter, position)?;
+    finish_reverse_cached_transition(
+        automaton,
+        state,
+        class,
+        reaches_start,
+        workspace,
+        meter,
+        0,
+        position,
+    )
+}
+
+fn build_positive_end_inline_transition(
+    automaton: &Automaton,
+    byte: u8,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    position: usize,
+) -> Result<ReverseTransition, SearchError> {
+    let length = workspace.reverse.frontier_len;
+    begin_reverse_closure(workspace, meter, position)?;
+    let mut reaches_start = false;
+    for ordinal in 0..length {
+        let incoming = usize::try_from(workspace.reverse.frontier[ordinal]).map_err(|_| {
+            SearchError::InternalInvariant {
+                detail: "positive-end reverse inline item does not fit usize",
+            }
+        })?;
+        meter.charge(1, position)?;
+        let start = workspace.reverse.incoming_starts[incoming];
+        let end = workspace.reverse.incoming_ends[incoming];
+        if start <= byte && byte <= end {
+            reaches_start |= expand_reverse_root(
+                automaton,
+                workspace.reverse.incoming_sources[incoming],
+                workspace,
+                meter,
+                position,
+            )?;
+        }
+    }
+    collect_reverse_frontier(automaton, workspace, meter, position)?;
+    if workspace.reverse.scratch_len == 0 {
+        workspace.reverse.frontier_len = 0;
+        return Ok(ReverseTransition::Ready(if reaches_start {
+            LAZY_CELL_ACCEPT
+        } else {
+            0
+        }));
+    }
+    workspace.reverse.retain_scratch_as_frontier()?;
+    Ok(ReverseTransition::Inline { reaches_start })
+}
+
+/// Test arbitrary positive endpoints without importing the selected-end
+/// recovery contract into the reverse machine.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the verifier keeps its immutable source, private caps, and exact receipt explicit"
+)]
+#[inline(never)]
+fn execute_positive_end_reverse_lazy_loop(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window_start: usize,
+    endpoint: usize,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    max_reverse_bytes: usize,
+    reverse_source_bytes: &mut usize,
+) -> Result<K0PositiveEndOutcome, SearchError> {
+    if !workspace.reverse.initialized {
+        return Err(SearchError::InternalInvariant {
+            detail: "positive-end verifier executed without an initialized reverse state",
+        });
+    }
+    let initial = workspace.reverse.initial;
+    if initial == LAZY_NO_STATE {
+        return Err(SearchError::InternalInvariant {
+            detail: "positive-end verifier has no initialized reverse state",
+        });
+    }
+    let mut state = ReverseState::Cached(direct_row_offset(initial)?);
+    let mut cursor = endpoint;
+    while cursor > window_start {
+        if *reverse_source_bytes >= max_reverse_bytes {
+            return Ok(K0PositiveEndOutcome::Declined);
+        }
+        let source = cursor
+            .checked_sub(1)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "positive-end reverse cursor underflowed",
+            })?;
+        meter.charge(1, source)?;
+        let byte = *haystack.get(source).ok_or(SearchError::InternalInvariant {
+            detail: "positive-end reverse source exceeded the validated window",
+        })?;
+        *reverse_source_bytes = (*reverse_source_bytes).checked_add(1).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "positive-end reverse source byte count",
+            },
+        )?;
+        let transition = match state {
+            ReverseState::Cached(cached) => {
+                let class = automaton.byte_classes().class_of(byte);
+                let cell = workspace.reverse.direct_cell(cached, class)?;
+                if cell == LAZY_CELL_UNFILLED {
+                    build_positive_end_cached_transition(
+                        automaton,
+                        direct_row_state(cached),
+                        byte,
+                        class,
+                        workspace,
+                        meter,
+                        source,
+                    )?
+                } else {
+                    ReverseTransition::Ready(cell)
+                }
+            }
+            ReverseState::Inline => {
+                build_positive_end_inline_transition(automaton, byte, workspace, meter, source)?
+            }
+        };
+        cursor = source;
+        let (reaches_start, next) = match transition {
+            ReverseTransition::Ready(cell) => {
+                let encoded = cell & LAZY_CELL_STATE_MASK;
+                (
+                    cell & LAZY_CELL_ACCEPT != 0,
+                    if encoded == 0 {
+                        None
+                    } else {
+                        Some(ReverseState::Cached(encoded.checked_sub(1).ok_or(
+                            SearchError::InternalInvariant {
+                                detail: "positive-end reverse state encoding underflowed",
+                            },
+                        )?))
+                    },
+                )
+            }
+            ReverseTransition::Inline { reaches_start } => {
+                (reaches_start, Some(ReverseState::Inline))
+            }
+        };
+        if reaches_start {
+            return Ok(K0PositiveEndOutcome::Matched);
+        }
+        let Some(next) = next else {
+            return Ok(K0PositiveEndOutcome::Rejected);
+        };
+        state = next;
+    }
+    Ok(K0PositiveEndOutcome::Rejected)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the contextual verifier keeps its immutable source, private cap, and exact receipt explicit"
+)]
+#[inline(never)]
+fn execute_positive_end_context_reverse_loop(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window_start: usize,
+    endpoint: usize,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    max_reverse_bytes: usize,
+    reverse_source_bytes: &mut usize,
+) -> Result<K0PositiveEndOutcome, SearchError> {
+    let assertions = enabled_assertion_mask(automaton, haystack, endpoint, meter)?;
+    let Some(mut state) = context_reverse_initial(
+        automaton,
+        assertions,
+        workspace,
+        meter,
+        0,
+        endpoint,
+    )?
+    else {
+        return Ok(K0PositiveEndOutcome::Declined);
+    };
+    workspace.reverse.initialized = true;
+
+    let mut cursor = endpoint;
+    while cursor > window_start {
+        if *reverse_source_bytes >= max_reverse_bytes {
+            return Ok(K0PositiveEndOutcome::Declined);
+        }
+        let source = cursor
+            .checked_sub(1)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "positive-end contextual reverse cursor underflowed",
+            })?;
+        meter.charge(1, source)?;
+        let byte = *haystack.get(source).ok_or(SearchError::InternalInvariant {
+            detail: "positive-end contextual reverse source exceeded the validated window",
+        })?;
+        // Count the authenticated source read before assertion or transition
+        // work can exhaust the private work cap, matching the direct verifier
+        // receipt and keeping a decline's byte count exact.
+        *reverse_source_bytes = (*reverse_source_bytes).checked_add(1).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "positive-end contextual reverse source byte count",
+            },
+        )?;
+        let assertions = enabled_assertion_mask(automaton, haystack, source, meter)?;
+        let symbol = contextual_symbol(u32::from(byte), assertions);
+        let transition = match state {
+            ReverseState::Cached(cached) => build_context_reverse_cached_transition(
+                automaton, cached, byte, symbol, assertions, workspace, meter, 0, source,
+            )?,
+            ReverseState::Inline => build_context_reverse_inline_transition(
+                automaton, byte, assertions, workspace, meter, source,
+            )?,
+        };
+        cursor = source;
+        let (reaches_start, next) = match transition {
+            ReverseTransition::Ready(cell) => {
+                let encoded = cell & LAZY_CELL_STATE_MASK;
+                (
+                    cell & LAZY_CELL_ACCEPT != 0,
+                    if encoded == 0 {
+                        None
+                    } else {
+                        Some(ReverseState::Cached(encoded.checked_sub(1).ok_or(
+                            SearchError::InternalInvariant {
+                                detail: "positive-end contextual reverse state underflowed",
+                            },
+                        )?))
+                    },
+                )
+            }
+            ReverseTransition::Inline { reaches_start } => {
+                (reaches_start, Some(ReverseState::Inline))
+            }
+        };
+        if reaches_start {
+            return Ok(K0PositiveEndOutcome::Matched);
+        }
+        let Some(next) = next else {
+            return Ok(K0PositiveEndOutcome::Rejected);
+        };
+        state = next;
+    }
+    Ok(K0PositiveEndOutcome::Rejected)
+}
+
 fn execute_reverse_lazy_loop(
     automaton: &Automaton,
     haystack: &[u8],
@@ -8352,12 +10944,14 @@ fn execute_reverse_lazy_loop(
         })?;
         let transition = match state {
             ReverseState::Cached(cached) => {
-                let cell = workspace.reverse.direct_cell(cached, byte)?;
+                let class = automaton.byte_classes().class_of(byte);
+                let cell = workspace.reverse.direct_cell(cached, class)?;
                 if cell == LAZY_CELL_UNFILLED {
                     build_reverse_cached_transition(
                         automaton,
                         direct_row_state(cached),
                         byte,
+                        class,
                         workspace,
                         meter,
                         core_reserve,
@@ -8450,12 +11044,14 @@ fn execute_resume_reverse_lazy_loop(
         })?;
         let transition = match state {
             ReverseState::Cached(cached) => {
-                let cell = workspace.reverse.direct_cell(cached, byte)?;
+                let class = automaton.byte_classes().class_of(byte);
+                let cell = workspace.reverse.direct_cell(cached, class)?;
                 if cell == LAZY_CELL_UNFILLED {
                     build_resume_reverse_cached_transition(
                         automaton,
                         direct_row_state(cached),
                         byte,
+                        class,
                         workspace,
                         meter,
                         core_reserve,
@@ -8514,12 +11110,13 @@ fn build_resume_reverse_cached_transition(
     automaton: &Automaton,
     state: u32,
     byte: u8,
+    class: u8,
     workspace: &mut K0Workspace,
     meter: &mut WorkMeter,
     core_reserve: u64,
     position: usize,
 ) -> Result<ReverseTransition, SearchError> {
-    let cached = workspace.reverse.cell(state, byte)?;
+    let cached = workspace.reverse.cell(state, class)?;
     if cached != LAZY_CELL_UNFILLED {
         return Ok(ReverseTransition::Ready(cached));
     }
@@ -8549,7 +11146,7 @@ fn build_resume_reverse_cached_transition(
     finish_reverse_cached_transition(
         automaton,
         state,
-        byte,
+        class,
         reaches_start,
         workspace,
         meter,
@@ -8642,12 +11239,14 @@ fn execute_selected_end_reverse_lazy_loop(
         })?;
         let transition = match state {
             ReverseState::Cached(cached) => {
-                let cell = workspace.reverse.direct_cell(cached, byte)?;
+                let class = automaton.byte_classes().class_of(byte);
+                let cell = workspace.reverse.direct_cell(cached, class)?;
                 if cell == LAZY_CELL_UNFILLED {
                     build_selected_end_reverse_cached_transition(
                         automaton,
                         direct_row_state(cached),
                         byte,
+                        class,
                         workspace,
                         meter,
                         core_reserve,
@@ -8706,12 +11305,13 @@ fn build_selected_end_reverse_cached_transition(
     automaton: &Automaton,
     state: u32,
     byte: u8,
+    class: u8,
     workspace: &mut K0Workspace,
     meter: &mut WorkMeter,
     core_reserve: u64,
     position: usize,
 ) -> Result<ReverseTransition, SearchError> {
-    let cached = workspace.reverse.cell(state, byte)?;
+    let cached = workspace.reverse.cell(state, class)?;
     if cached != LAZY_CELL_UNFILLED {
         return Ok(ReverseTransition::Ready(cached));
     }
@@ -8741,7 +11341,7 @@ fn build_selected_end_reverse_cached_transition(
     finish_reverse_cached_transition(
         automaton,
         state,
-        byte,
+        class,
         reaches_start,
         workspace,
         meter,
@@ -10275,7 +12875,7 @@ fn next_scanner_candidate(
             end: range_end,
         } => next_range_start_candidate(*start, *range_end, haystack, position, end, meter, cursor),
         StartScanner::AsciiSet { classifier, .. } => next_ascii_start_candidate(
-            classifier.classifier(),
+            classifier,
             haystack,
             position,
             end,
@@ -10593,7 +13193,7 @@ fn next_set_start_candidate_with_block_bytes(
     // preserves the scalar scanner's hard-limit threshold and monotonicity.
     if candidate_block_bytes == BYTE_SET_WIDE_BLOCK_BYTES {
         let (resume, candidate) =
-            next_set_wide_blocks(compiled, haystack, position, end, meter, &mut cursor)?;
+            next_set_wide_blocks(classifier, haystack, position, end, meter, &mut cursor)?;
         if let Some(candidate) = candidate {
             return Ok(candidate);
         }
@@ -10651,18 +13251,52 @@ fn next_set_start_candidate_with_block_bytes(
 ))]
 #[inline(never)]
 fn next_set_wide_blocks(
-    classifier: &ByteSetClassifier,
+    classifier: &StartByteSetClassifier,
     haystack: &[u8],
     mut position: usize,
     end: usize,
     meter: &mut WorkMeter,
     cursor: &mut Option<&mut RetainedStartMaskCursor>,
 ) -> Result<(usize, Option<usize>), SearchError> {
+    let compiled = classifier.classifier();
+    let nonmembers = classifier.ascii_nonmember_scanner();
     let wide_work =
         u64::try_from(BYTE_SET_WIDE_BLOCK_BYTES).expect("wide classifier block width fits in u64");
+    let mut fixed_block_proved = false;
     while end.saturating_sub(position) >= BYTE_SET_WIDE_BLOCK_BYTES
         && meter.remaining() >= wide_work
     {
+        if fixed_block_proved && end.saturating_sub(position) >= ASCII_START_BULK_MIN_BYTES {
+            let available = usize::try_from(meter.remaining()).unwrap_or(usize::MAX);
+            let mut bulk_len = end.saturating_sub(position).min(available);
+            bulk_len -= bulk_len % BYTE_SET_WIDE_BLOCK_BYTES;
+            if bulk_len >= ASCII_START_BULK_MIN_BYTES {
+                let bulk_end = position.checked_add(bulk_len).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "full-byte ASCII nonmember-run end",
+                    },
+                )?;
+                let skipped = nonmembers
+                    .scan_forward(&haystack[position..bulk_end])
+                    .member_run_len();
+                let completed = skipped - (skipped % BYTE_SET_WIDE_BLOCK_BYTES);
+                meter.charge_admitted(
+                    u64::try_from(completed)
+                        .expect("full-byte ASCII nonmember completed blocks fit u64"),
+                );
+                position = position.checked_add(completed).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "full-byte ASCII nonmember-run progress",
+                    },
+                )?;
+                if position == bulk_end {
+                    return Ok((position, None));
+                }
+                // A real ASCII member or any high byte stopped the run. The
+                // exact 256-byte classifier below resolves its containing
+                // block and retains every candidate lane.
+            }
+        }
         meter.charge_admitted(wide_work);
         let block_end = position.checked_add(BYTE_SET_WIDE_BLOCK_BYTES).ok_or(
             SearchError::ArithmeticOverflow {
@@ -10677,7 +13311,7 @@ fn next_set_wide_blocks(
         let block: &[u8; BYTE_SET_WIDE_BLOCK_BYTES] = source
             .try_into()
             .expect("checked wide full-byte classifier extent");
-        let members = classifier.classify_32(block).member_mask();
+        let members = compiled.classify_32(block).member_mask();
         if members != 0 {
             if let Some(cursor) = cursor.as_deref_mut() {
                 let candidate = cursor.retain_complete_block(
@@ -10699,12 +13333,13 @@ fn next_set_wide_blocks(
             return Ok((position, Some(candidate)));
         }
         position = block_end;
+        fixed_block_proved = true;
     }
     Ok((position, None))
 }
 
 fn next_ascii_start_candidate(
-    classifier: &AsciiByteSetClassifier,
+    compiled: &StartAsciiClassifier,
     haystack: &[u8],
     mut position: usize,
     end: usize,
@@ -10718,9 +13353,49 @@ fn next_ascii_start_candidate(
             RetainedStartCandidate::ResumeAt(resume) => position = resume,
         }
     }
+    let classifier = compiled.classifier();
+    let nonmembers = compiled.nonmember_scanner();
+    let mut fixed_block_proved = false;
     while end.saturating_sub(position) >= ASCII_WIDE_BYTES
         && meter.remaining() >= u64::try_from(ASCII_WIDE_BYTES).expect("classifier width fits u64")
     {
+        if fixed_block_proved && end.saturating_sub(position) >= ASCII_START_BULK_MIN_BYTES {
+            let available = usize::try_from(meter.remaining()).unwrap_or(usize::MAX);
+            let mut bulk_len = end.saturating_sub(position).min(available);
+            // Preserve the established exact work threshold: the old path
+            // charges complete 32-byte blocks through the candidate block.
+            bulk_len -= bulk_len % ASCII_WIDE_BYTES;
+            if bulk_len >= ASCII_START_BULK_MIN_BYTES {
+                let bulk_end = position.checked_add(bulk_len).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "ASCII start nonmember-run end",
+                    },
+                )?;
+                let skipped = nonmembers
+                    .scan_forward(&haystack[position..bulk_end])
+                    .member_run_len();
+                let completed = skipped - (skipped % ASCII_WIDE_BYTES);
+                meter.charge_admitted(
+                    u64::try_from(completed)
+                        .expect("ASCII nonmember completed blocks fit u64"),
+                );
+                position = position.checked_add(completed).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "ASCII start nonmember-run progress",
+                    },
+                )?;
+                if position == bulk_end {
+                    if position == end {
+                        return Ok(end);
+                    }
+                    continue;
+                }
+                // The run stopped either at a real ASCII member or at a high
+                // byte. Reclassify its containing block once through the
+                // exact all-byte path below, retaining every member lane and
+                // charging precisely the same block as the old loop.
+            }
+        }
         meter.charge_admitted(u64::try_from(ASCII_WIDE_BYTES).expect("classifier width fits u64"));
         let block_end =
             position
@@ -10750,6 +13425,7 @@ fn next_ascii_start_candidate(
                 });
         }
         position = block_end;
+        fixed_block_proved = true;
     }
     if end.saturating_sub(position) >= ASCII_NARROW_BYTES
         && meter.remaining()
@@ -11761,6 +14437,58 @@ fn enabled_assertion_mask(
     )
 }
 
+#[cfg(test)]
+fn enabled_assertion_mask_unmetered(
+    automaton: &Automaton,
+    haystack: &[u8],
+    position: usize,
+) -> u32 {
+    enabled_assertion_mask_unmetered_with_classifier(
+        automaton.boundary_context_classifier(),
+        automaton.line_terminator(),
+        haystack,
+        position,
+    )
+}
+
+fn enabled_assertion_mask_for_dependencies(
+    automaton: &Automaton,
+    dependencies: u32,
+    haystack: &[u8],
+    position: usize,
+    meter: &mut WorkMeter,
+) -> Result<u32, SearchError> {
+    debug_assert_eq!(
+        dependencies & !automaton.boundary_context_classifier().assertions(),
+        0
+    );
+    enabled_assertion_mask_with_classifier(
+        BoundaryContextClassifier::new(dependencies),
+        automaton.line_terminator(),
+        haystack,
+        position,
+        meter,
+    )
+}
+
+fn enabled_assertion_mask_unmetered_for_dependencies(
+    automaton: &Automaton,
+    dependencies: u32,
+    haystack: &[u8],
+    position: usize,
+) -> u32 {
+    debug_assert_eq!(
+        dependencies & !automaton.boundary_context_classifier().assertions(),
+        0
+    );
+    enabled_assertion_mask_unmetered_with_classifier(
+        BoundaryContextClassifier::new(dependencies),
+        automaton.line_terminator(),
+        haystack,
+        position,
+    )
+}
+
 fn enabled_assertion_mask_with_classifier(
     classifier: BoundaryContextClassifier,
     line_terminator: u8,
@@ -11769,6 +14497,9 @@ fn enabled_assertion_mask_with_classifier(
     meter: &mut WorkMeter,
 ) -> Result<u32, SearchError> {
     debug_assert!(position <= haystack.len());
+    if classifier.assertions() == 0 {
+        return Ok(0);
+    }
     let checks = u64::from(classifier.assertions().count_ones());
     if checks <= meter.remaining() {
         meter.charge_admitted(checks);
@@ -11780,6 +14511,24 @@ fn enabled_assertion_mask_with_classifier(
         }
     }
 
+    Ok(enabled_assertion_mask_unmetered_with_classifier(
+        classifier,
+        line_terminator,
+        haystack,
+        position,
+    ))
+}
+
+fn enabled_assertion_mask_unmetered_with_classifier(
+    classifier: BoundaryContextClassifier,
+    line_terminator: u8,
+    haystack: &[u8],
+    position: usize,
+) -> u32 {
+    debug_assert!(position <= haystack.len());
+    if classifier.assertions() == 0 {
+        return 0;
+    }
     let mut enabled = 0_u32;
     let absolute = classifier.absolute();
     if absolute != 0 {
@@ -11832,7 +14581,7 @@ fn enabled_assertion_mask_with_classifier(
         let class = UnicodeLookMatcher::classify_prevalidated(haystack, position).class();
         enabled |= UNICODE_WORD_ENABLED_BY_CLASS[class] & unicode_word;
     }
-    Ok(enabled)
+    enabled
 }
 
 const fn binary_boundary_class(left: bool, right: bool) -> usize {
@@ -12132,10 +14881,12 @@ fn lazy_initialized_slots(
         0
     };
     let index_slots = lazy_index_slots(state_capacity)?;
+    let context_hot_slots = if context_slots == 0 { 0 } else { state_capacity };
     states
         .checked_mul(2)
         .and_then(|slots| slots.checked_add(rows))
         .and_then(|slots| slots.checked_add(context_slots))
+        .and_then(|slots| slots.checked_add(context_hot_slots))
         .and_then(|slots| slots.checked_add(state_capacity))
         .and_then(|slots| slots.checked_add(state_capacity))
         .and_then(|slots| slots.checked_add(state_capacity))
@@ -12199,11 +14950,21 @@ fn lazy_scratch_bytes(
         .ok_or(SearchError::ArithmeticOverflow {
             computation: "lazy DFA contextual transition bytes",
         })?;
+    let context_hot_bytes = if context_slots == 0 {
+        0
+    } else {
+        state_capacity
+            .checked_mul(size_of::<ContextHotTransition>())
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "lazy DFA contextual hot-transition bytes",
+            })?
+    };
     u32_bytes
         .checked_add(offsets)
         .and_then(|bytes| bytes.checked_add(modes))
         .and_then(|bytes| bytes.checked_add(hashes))
         .and_then(|bytes| bytes.checked_add(context_bytes))
+        .and_then(|bytes| bytes.checked_add(context_hot_bytes))
         .ok_or(SearchError::ArithmeticOverflow {
             computation: "lazy DFA scratch bytes",
         })
@@ -12462,13 +15223,18 @@ mod tests {
             START_FILTER_MAX_SELECTION_WORK, START_FILTER_POSITION_COUNT,
             START_FILTER_PROBE_SELECTION_WORK, START_FILTER_SCANNER_SELECTION_WORK,
         },
-        Automaton, CompileLimits, EarliestEnd, EdgeKind, Exists, K0ResumeSet, K0SearchSession,
-        K0SpanSourceCursor, K0Workspace, MatchSpan, OutputContract, RawPlan, ResourceKind,
-        SearchError, SearchLimits, SearchWindow, SelectedEnd, Span, StateRole, WorkspaceLimits,
+        Automaton, CompileLimits, EarliestEnd, EdgeKind, Exists, K0PositiveEndLimits,
+        K0PositiveEndOutcome, K0ResumeSet, K0SearchSession, K0SpanSourceCursor, K0Workspace,
+        MatchSpan, OutputContract, RawPlan, ResourceKind, SearchError, SearchLimits, SearchWindow,
+        SelectedEnd, Span, StateRole, WorkspaceLimits,
     };
 
     fn ascii_literal(byte: u8) -> Automaton {
         ascii_root_bytes(&[byte])
+    }
+
+    fn byte_class(automaton: &Automaton, byte: u8) -> u8 {
+        automaton.byte_classes().class_of(byte)
     }
 
     fn one_below_owner_free(work: u64) -> u64 {
@@ -13374,6 +16140,644 @@ mod tests {
         .unwrap()
     }
 
+    fn a_greedy_any_star_z() -> Automaton {
+        // a.*z: after an early `z` accepts, the higher-priority full-byte
+        // branch retains a pending same-row loop while it proves the selected
+        // end cannot extend farther.
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Consume,
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 1, 3, 4, 5, 5],
+                edge_targets: vec![1, 2, 3, 1, 4],
+                edge_kinds: vec![
+                    EdgeKind::ByteRange,
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                ],
+                byte_starts: vec![b'a', 0, 0, u8::MIN, b'z'],
+                byte_ends: vec![b'a', 0, 0, u8::MAX, b'z'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn absolute_a_greedy_any_star_z() -> Automaton {
+        // \Aa.*z: the absolute assertion is confined to the initial closure;
+        // the pending full-byte loop after an early match is assertion-free.
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 1, 2, 4, 5, 6, 6],
+                edge_targets: vec![1, 2, 3, 4, 2, 5],
+                edge_kinds: vec![
+                    EdgeKind::AssertHaystackStart,
+                    EdgeKind::ByteRange,
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                ],
+                byte_starts: vec![0, b'a', 0, 0, u8::MIN, b'z'],
+                byte_ends: vec![0, b'a', 0, 0, u8::MAX, b'z'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn asserted_pending_a_greedy_any_star_z() -> Automaton {
+        // The complementary word assertions preserve the language while
+        // forcing every repeated transition to observe its destination
+        // context. A contextual loop proof must therefore decline it.
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                    StateRole::Split,
+                ],
+                edge_offsets: vec![0, 1, 2, 4, 5, 6, 6, 8],
+                edge_targets: vec![1, 2, 3, 4, 6, 5, 2, 2],
+                edge_kinds: vec![
+                    EdgeKind::AssertHaystackStart,
+                    EdgeKind::ByteRange,
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::AssertWordAscii,
+                    EdgeKind::AssertWordAsciiNegate,
+                ],
+                byte_starts: vec![0, b'a', 0, 0, u8::MIN, b'z', 0, 0],
+                byte_ends: vec![0, b'a', 0, 0, u8::MAX, b'z', 0, 0],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn contextual_dependency_cycle_with_overlap() -> Automaton {
+        // Root-only absolute context leads to one Consume with overlapping
+        // byte edges. Both targets enter the same cyclic zero-width component,
+        // which contains two distinct assertion kinds.
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Split,
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 1, 3, 5, 7, 8, 8],
+                edge_targets: vec![1, 2, 3, 3, 4, 2, 4, 5],
+                edge_kinds: vec![
+                    EdgeKind::AssertHaystackStart,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::Epsilon,
+                    EdgeKind::AssertLineEndLf,
+                    EdgeKind::Epsilon,
+                    EdgeKind::AssertWordAscii,
+                    EdgeKind::ByteRange,
+                ],
+                byte_starts: vec![0, b'a', b'm', 0, 0, 0, 0, b'b'],
+                byte_ends: vec![0, b'z', b'z', 0, 0, 0, 0, b'b'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn dependency_workspace(plan: &Automaton) -> K0Workspace {
+        let mut workspace =
+            K0Workspace::new_accelerated(plan, WorkspaceLimits::unlimited()).unwrap();
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        workspace.lazy.scratch[0] = 1;
+        workspace.lazy.scratch_len = 1;
+        assert_eq!(workspace.lazy.intern_initial(true, &mut meter, 0).unwrap(), 0);
+        workspace.lazy.scratch[0] = 1;
+        workspace.lazy.scratch_len = 1;
+        assert_eq!(
+            workspace
+                .lazy
+                .intern_speculative(false, &mut meter, 0, 0)
+                .unwrap(),
+            super::LazyInterned::State(1)
+        );
+        workspace
+    }
+
+    fn ascii_loop_class(cardinality: u8) -> Automaton {
+        assert!((1..=127).contains(&cardinality));
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![StateRole::Consume, StateRole::Accept],
+                edge_offsets: vec![0, 2, 2],
+                edge_targets: vec![0, 1],
+                edge_kinds: vec![EdgeKind::ByteRange, EdgeKind::ByteRange],
+                byte_starts: vec![0, cardinality],
+                byte_ends: vec![cardinality - 1, cardinality],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn direct_split_loop_then_terminal() -> Automaton {
+        // State zero treats `a` and `b` identically, while the reachable
+        // `q b` branch forces them into distinct global byte classes. A loop
+        // proof learned from `a` may therefore scan `b` without publishing
+        // the physically distinct direct-row cell.
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Consume,
+                    StateRole::Accept,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 3, 3, 4, 4],
+                edge_targets: vec![0, 1, 2, 3],
+                edge_kinds: vec![EdgeKind::ByteRange; 4],
+                byte_starts: vec![b'a', b'z', b'q', b'b'],
+                byte_ends: vec![b'b', b'z', b'q', b'b'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn direct_drop_loop_then_terminal() -> Automaton {
+        // The retained frontier is `[A, B]`. On `x`, A survives and B dies;
+        // unanchored root injection restores B, returning to the exact same
+        // ordered state but mixing provenance. The self-loop is consequently
+        // Drop, while a later `z` acceptance still belongs to the surviving
+        // earlier A thread and requires reverse start recovery.
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 2, 4, 5, 5],
+                edge_targets: vec![1, 2, 1, 3, 3],
+                edge_kinds: vec![
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                ],
+                byte_starts: vec![0, 0, b'x', b'z', b'q'],
+                byte_ends: vec![0, 0, b'x', b'z', b'q'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn direct_mixed_action_loops_then_terminal() -> Automaton {
+        // Both `w..=x` and `y` return to `[A, B]`. The former kill B before
+        // root injection restores it and are Drop transitions; `y` preserves
+        // both source threads and is Propagate. Exact-action scanners must not
+        // merge the adjacent graph classes.
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 2, 4, 6, 6],
+                edge_targets: vec![1, 2, 1, 3, 2, 3],
+                edge_kinds: vec![
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                ],
+                byte_starts: vec![0, 0, b'w', b'z', b'y', b'q'],
+                byte_ends: vec![0, 0, b'y', b'z', b'y', b'q'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn full_byte_loop_class() -> Automaton {
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![StateRole::Consume, StateRole::Accept],
+                edge_offsets: vec![0, 1, 1],
+                edge_targets: vec![0],
+                edge_kinds: vec![EdgeKind::ByteRange],
+                byte_starts: vec![u8::MIN],
+                byte_ends: vec![u8::MAX],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn disjoint_ascii_and_high_loop_classes() -> Automaton {
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![StateRole::Consume, StateRole::Accept],
+                edge_offsets: vec![0, 3, 3],
+                edge_targets: vec![0, 0, 1],
+                edge_kinds: vec![
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                ],
+                byte_starts: vec![b'a', 0x80, b'z'],
+                byte_ends: vec![b'c', 0xff, b'z'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn contextual_high_loop_then_terminal(unicode: bool) -> Automaton {
+        let assertions = if unicode {
+            [
+                EdgeKind::AssertWordUnicode,
+                EdgeKind::AssertWordUnicodeNegate,
+            ]
+        } else {
+            [
+                EdgeKind::AssertWordAscii,
+                EdgeKind::AssertWordAsciiNegate,
+            ]
+        };
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![StateRole::Consume, StateRole::Split, StateRole::Accept],
+                edge_offsets: vec![0, 2, 4, 4],
+                edge_targets: vec![1, 2, 0, 0],
+                edge_kinds: vec![
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    assertions[0],
+                    assertions[1],
+                ],
+                byte_starts: vec![0x80, b'z', 0, 0],
+                byte_ends: vec![0xff, b'z', 0, 0],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn contextual_high_loop_workspace(plan: &Automaton) -> K0Workspace {
+        let mut workspace =
+            K0Workspace::new_accelerated(plan, WorkspaceLimits::unlimited()).unwrap();
+        let mut intern = WorkMeter::new(u64::MAX, 0);
+        workspace.lazy.scratch[0] = 0;
+        workspace.lazy.scratch_len = 1;
+        assert_eq!(workspace.lazy.intern_initial(false, &mut intern, 0).unwrap(), 0);
+
+        let dependencies = plan.boundary_context_classifier().assertions();
+        let representative = 0x80_u8;
+        let interior_assertions = super::enabled_assertion_mask_unmetered_for_dependencies(
+            plan,
+            dependencies,
+            &[representative, representative],
+            1,
+        );
+        let mut publish = WorkMeter::new(u64::MAX, 0);
+        workspace
+            .lazy
+            .context
+            .publish(
+                Some(0),
+                ContextTransitionSlot::populated(
+                    0,
+                    super::contextual_symbol(u32::from(representative), interior_assertions),
+                    1 | super::LazyStartAction::Propagate.cell_bits(),
+                ),
+                &mut publish,
+                0,
+                0,
+            )
+            .unwrap();
+        workspace.lazy.context.hot[0].dependency_mask = dependencies;
+        workspace.lazy.context_dependencies_analyzed = 1;
+        workspace
+    }
+
+    fn direct_nonpending_loop_workspace(plan: &Automaton, cell: u32) -> K0Workspace {
+        let mut workspace =
+            K0Workspace::new_accelerated(plan, WorkspaceLimits::unlimited()).unwrap();
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        workspace.lazy.scratch[0] = 0;
+        workspace.lazy.scratch_len = 1;
+        assert_eq!(workspace.lazy.intern_initial(false, &mut meter, 0).unwrap(), 0);
+        workspace.lazy.set_cell(0, 0, cell).unwrap();
+        workspace
+    }
+
+    fn narrow_then_high_loop_workspace(plan: &Automaton, cell: u32) -> K0Workspace {
+        let mut workspace =
+            K0Workspace::new_accelerated(plan, WorkspaceLimits::unlimited()).unwrap();
+        let mut intern = WorkMeter::new(u64::MAX, 0);
+        workspace.lazy.scratch[0] = 0;
+        workspace.lazy.scratch_len = 1;
+        assert_eq!(workspace.lazy.intern_initial(false, &mut intern, 0).unwrap(), 0);
+        workspace
+            .lazy
+            .set_cell(0, byte_class(plan, b'a'), cell)
+            .unwrap();
+        let mut derive = WorkMeter::new(u64::MAX, 0);
+        super::try_derive_lazy_loop_skip(plan, &mut workspace, &mut derive).unwrap();
+        assert_eq!(
+            workspace
+                .lazy
+                .loop_skip_plan
+                .expect("the narrow loop plan must be retained")
+                .scanner
+                .cardinality(),
+            3
+        );
+        workspace
+            .lazy
+            .set_cell(0, byte_class(plan, 0x80), cell)
+            .unwrap();
+        workspace
+    }
+
+    fn contextual_nonpending_loop_then_terminal() -> Automaton {
+        // State zero has an exact nonpending `a` self-loop and a terminal `z`
+        // edge. The reachable `q`/`r` branch makes the automaton contextual,
+        // but its assertion is beyond another Consume and is therefore not a
+        // dependency of state zero or of its root closure.
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Consume,
+                    StateRole::Accept,
+                    StateRole::Consume,
+                    StateRole::Split,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 3, 3, 4, 5, 5],
+                edge_targets: vec![0, 1, 2, 3, 4],
+                edge_kinds: vec![
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::AssertLineEndLf,
+                ],
+                byte_starts: vec![b'a', b'z', b'q', b'r', 0],
+                byte_ends: vec![b'a', b'z', b'q', b'r', 0],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn contextual_split_loop_then_terminal() -> Automaton {
+        // State zero has an assertion-independent `a`/`b` self-loop. The
+        // reachable `q b` assertion branch makes the plan contextual and
+        // splits the two loop members into distinct global byte classes,
+        // without making that assertion a dependency of state zero.
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Consume,
+                    StateRole::Accept,
+                    StateRole::Consume,
+                    StateRole::Split,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 3, 3, 4, 5, 5],
+                edge_targets: vec![0, 1, 2, 3, 4],
+                edge_kinds: vec![
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::AssertLineEndLf,
+                ],
+                byte_starts: vec![b'a', b'z', b'q', b'b', 0],
+                byte_ends: vec![b'b', b'z', b'q', b'b', 0],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn contextual_word_loop_then_terminal() -> Automaton {
+        // Both complementary word assertions return the `a` transition to
+        // state zero. Its exact state transition is therefore a self-loop in
+        // both interior and endpoint contexts, but the published symbols and
+        // start-provenance actions remain context specific.
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![StateRole::Consume, StateRole::Split, StateRole::Accept],
+                edge_offsets: vec![0, 2, 4, 4],
+                edge_targets: vec![1, 2, 0, 0],
+                edge_kinds: vec![
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::AssertWordAscii,
+                    EdgeKind::AssertWordAsciiNegate,
+                ],
+                byte_starts: vec![b'a', b'z', 0, 0],
+                byte_ends: vec![b'a', b'z', 0, 0],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn contextual_unicode_word_loop_then_terminal() -> Automaton {
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![StateRole::Consume, StateRole::Split, StateRole::Accept],
+                edge_offsets: vec![0, 2, 4, 4],
+                edge_targets: vec![1, 2, 0, 0],
+                edge_kinds: vec![
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::AssertWordUnicode,
+                    EdgeKind::AssertWordUnicodeNegate,
+                ],
+                byte_starts: vec![b'a', b'z', 0, 0],
+                byte_ends: vec![b'a', b'z', 0, 0],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn anchored_unicode_negated_word_loop_then_terminals() -> Automaton {
+        // The anchored `a` loop survives only while the destination boundary
+        // has equal, valid Unicode-word sides. `z` and any high byte are
+        // terminals. Consequently the final ASCII member must be evaluated
+        // scalar when the following context is punctuation, malformed UTF-8,
+        // a non-word scalar or the haystack endpoint.
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Split,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 1, 4, 5, 5],
+                edge_targets: vec![1, 2, 3, 3, 1],
+                edge_kinds: vec![
+                    EdgeKind::AssertHaystackStart,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::AssertWordUnicodeNegate,
+                ],
+                byte_starts: vec![0, b'a', b'z', 0x80, 0],
+                byte_ends: vec![0, b'a', b'z', 0xff, 0],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn contextual_unicode_drop_loop_then_terminal() -> Automaton {
+        // The retained frontier is `[A, B]`. On `x`, A survives and B dies;
+        // unanchored root injection restores B, returning to the exact same
+        // ordered state but mixing provenance. The Unicode word-boundary edge
+        // is false between ASCII word bytes, so the authenticated contextual
+        // self-loop is Drop. A later `z` acceptance requires reverse recovery.
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Split,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 2, 4, 5, 6, 6],
+                edge_targets: vec![1, 2, 1, 4, 3, 4],
+                edge_kinds: vec![
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::AssertWordUnicode,
+                ],
+                byte_starts: vec![0, 0, b'x', b'z', b'q', 0],
+                byte_ends: vec![0, 0, b'x', b'z', b'q', 0],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn contextual_word_loop_workspace(plan: &Automaton) -> K0Workspace {
+        let mut workspace =
+            K0Workspace::new_accelerated(plan, WorkspaceLimits::unlimited()).unwrap();
+        let mut intern = WorkMeter::new(u64::MAX, 0);
+        workspace.lazy.scratch[0] = 0;
+        workspace.lazy.scratch_len = 1;
+        assert_eq!(workspace.lazy.intern_initial(false, &mut intern, 0).unwrap(), 0);
+
+        let dependencies = plan.boundary_context_classifier().assertions();
+        let interior_assertions = super::enabled_assertion_mask_unmetered_for_dependencies(
+            plan,
+            dependencies,
+            b"aa",
+            1,
+        );
+        let endpoint_assertions = super::enabled_assertion_mask_unmetered_for_dependencies(
+            plan,
+            dependencies,
+            b"a",
+            1,
+        );
+        assert_ne!(interior_assertions, endpoint_assertions);
+        let mut publish = WorkMeter::new(u64::MAX, 0);
+        workspace
+            .lazy
+            .context
+            .publish(
+                Some(0),
+                ContextTransitionSlot::populated(
+                    0,
+                    super::contextual_symbol(u32::from(b'a'), interior_assertions),
+                    1 | super::LazyStartAction::Propagate.cell_bits(),
+                ),
+                &mut publish,
+                0,
+                0,
+            )
+            .unwrap();
+        workspace
+            .lazy
+            .context
+            .publish(
+                Some(1),
+                ContextTransitionSlot::populated(
+                    0,
+                    super::contextual_symbol(u32::from(b'a'), endpoint_assertions),
+                    1 | super::LazyStartAction::Drop.cell_bits(),
+                ),
+                &mut publish,
+                0,
+                0,
+            )
+            .unwrap();
+        workspace.lazy.context.hot[0].dependency_mask = dependencies;
+        workspace.lazy.context_dependencies_analyzed = 1;
+        workspace
+    }
+
     fn a_question(greedy: bool) -> Automaton {
         let split_targets = if greedy { [1, 2] } else { [2, 1] };
         Automaton::from_raw(
@@ -13586,6 +16990,108 @@ mod tests {
                 Err(SearchError::InternalInvariant { .. })
             ));
         }
+    }
+
+    #[test]
+    fn contextual_hot_tags_are_exact_source_isolated_and_preserve_lookup_work() {
+        let slots = super::contextual_transition_slots(2).unwrap();
+        let mut store =
+            super::ContextTransitionStore::new(slots, 2, usize::MAX).unwrap();
+        let source = 0_u32;
+        let symbol = super::contextual_symbol(u32::from(b'a'), 1 << 2);
+        let value = 7_u32 | super::LAZY_CELL_START_PROPAGATE;
+
+        let mut miss = WorkMeter::new(u64::MAX, 0);
+        let (cached, slot) = store.lookup(source, symbol, &mut miss, 11).unwrap();
+        assert_eq!(cached, None);
+        let slot = slot.unwrap();
+        let mut publish = WorkMeter::new(u64::MAX, 0);
+        store
+            .publish(
+                Some(slot),
+                super::ContextTransitionSlot::populated(source, symbol, value),
+                &mut publish,
+                0,
+                11,
+            )
+            .unwrap();
+        let hot = store.hot[usize::try_from(source).unwrap()];
+        assert_eq!(hot.symbol, symbol);
+        assert_eq!(hot.value, value);
+        assert_eq!(u64::from(hot.lookup_work), miss.consumed);
+
+        // Make the associative backing path unavailable while leaving the
+        // exact tag intact. This uniquely proves the hot tier serves the hit.
+        store.slots[slot] = super::ContextTransitionSlot::EMPTY;
+        let mut exact = WorkMeter::new(u64::from(hot.lookup_work), 0);
+        assert_eq!(
+            store.lookup(source, symbol, &mut exact, 11).unwrap(),
+            (Some(value), None)
+        );
+        assert_eq!(exact.consumed, u64::from(hot.lookup_work));
+        let mut one_below = WorkMeter::new(u64::from(hot.lookup_work) - 1, 0);
+        assert!(matches!(
+            store.lookup(source, symbol, &mut one_below, 11),
+            Err(SearchError::WorkLimitExceeded {
+                consumed: 0,
+                requested,
+                position: 11,
+                ..
+            }) if requested == u64::from(hot.lookup_work)
+        ));
+
+        let other_symbol = super::contextual_symbol(u32::from(b'b'), 1 << 2);
+        let mut other = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(store.lookup(source, other_symbol, &mut other, 0).unwrap().0, None);
+        let mut other_source = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            store
+                .lookup(1, symbol, &mut other_source, 0)
+                .unwrap()
+                .0,
+            None
+        );
+        let mut initial = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            store
+                .lookup(
+                    super::CONTEXT_INITIAL_SOURCE,
+                    symbol,
+                    &mut initial,
+                    0,
+                )
+                .unwrap()
+                .0,
+            None
+        );
+
+        let mut replace_lookup = WorkMeter::new(u64::MAX, 0);
+        let replacement_slot = store
+            .lookup(source, other_symbol, &mut replace_lookup, 0)
+            .unwrap()
+            .1
+            .unwrap();
+        let mut replace_publish = WorkMeter::new(u64::MAX, 0);
+        store
+            .publish(
+                Some(replacement_slot),
+                super::ContextTransitionSlot::populated(source, other_symbol, 19),
+                &mut replace_publish,
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(store.hot[0].symbol, other_symbol);
+        let mut old = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(store.lookup(source, symbol, &mut old, 0).unwrap().0, None);
+        let mut replacement = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            store
+                .lookup(source, other_symbol, &mut replacement, 0)
+                .unwrap()
+                .0,
+            Some(19)
+        );
     }
 
     #[test]
@@ -14231,10 +17737,13 @@ mod tests {
         assert!(workspace.lazy.rows.is_empty());
         assert!(workspace.reverse.rows.is_empty());
         assert_eq!(workspace.lazy.context.slots.len(), 1_024);
+        assert_eq!(workspace.lazy.context.hot.len(), 3);
         assert_eq!(workspace.reverse.context.slots.len(), 512);
+        assert!(workspace.reverse.context.hot.is_empty());
         assert_eq!(
             workspace.lazy.context.retained_bytes().unwrap(),
             1_024 * size_of::<ContextTransitionSlot>()
+                + 3 * size_of::<super::ContextHotTransition>()
         );
         assert_eq!(
             workspace.reverse.context.retained_bytes().unwrap(),
@@ -14831,7 +18340,7 @@ mod tests {
         assert!(endpoint.lazy.initialized);
         assert!(!endpoint.lazy.declined);
         assert!(bidirectional.lazy.initialized);
-        assert!(bidirectional.reverse.initialized);
+        assert!(bidirectional.reverse.is_allocated());
         assert!(!bidirectional.reverse.declined);
     }
 
@@ -15116,13 +18625,13 @@ mod tests {
             target_arch = "x86_64",
             all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
         ))]
-        assert_eq!(START_FILTER_MAX_SELECTION_WORK, 358);
+        assert_eq!(START_FILTER_MAX_SELECTION_WORK, 488);
         #[cfg(not(any(
             feature = "static-dispatch",
             target_arch = "x86_64",
             all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
         )))]
-        assert_eq!(START_FILTER_MAX_SELECTION_WORK, 357);
+        assert_eq!(START_FILTER_MAX_SELECTION_WORK, 487);
 
         // All exact-position sets remain a transient cold stack value. The
         // immutable owner still retains only its selected scanner and guard.
@@ -15296,6 +18805,7 @@ mod tests {
                 None,
                 force_haystack_start,
                 false,
+                None,
                 &mut adaptive_probe,
             );
             (result, meter.consumed, workspace.lazy.initialized)
@@ -15511,6 +19021,37 @@ mod tests {
     }
 
     #[test]
+    fn contextual_start_provenance_elides_reverse_and_is_call_local() {
+        let plan = trailing_assertion_or_bang(EdgeKind::AssertLineEndLf);
+        let mut haystack = b"xa\n".to_vec();
+        let mut workspace =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+
+        let exact = plan
+            .prepare::<Span>()
+            .search_with_workspace(&haystack, &mut workspace, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(exact.output(), &Some(MatchSpan::new(1, 2)));
+        assert!(workspace.lazy.initialized);
+        assert!(
+            !workspace.reverse.initialized,
+            "a source-only contextual transition must carry its exact start"
+        );
+
+        // Reuse the same allocation and immutable plan with a different
+        // assertion symbol. The continuing `!` thread and injected `a` root
+        // have distinct starts, so the cached transition must drop the scalar
+        // proof and the ordinary reverse machine must recover it.
+        haystack.copy_from_slice(b"a!\n");
+        let mixed = plan
+            .prepare::<Span>()
+            .search_with_workspace(&haystack, &mut workspace, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(mixed.output(), &Some(MatchSpan::new(0, 2)));
+        assert!(workspace.reverse.initialized);
+    }
+
+    #[test]
     fn contextual_candidate_first_misses_preserve_work_boundaries_and_cache_state() {
         let plan = trailing_assertion_or_bang(EdgeKind::AssertLineEndLf);
         let scanner = StartPositionScanner {
@@ -15533,6 +19074,7 @@ mod tests {
                 None,
                 false,
                 false,
+                None,
                 &mut adaptive_probe,
             )
             .unwrap()
@@ -15542,7 +19084,7 @@ mod tests {
 
         let mut cold_miss =
             K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
-        assert_eq!(run(&mut cold_miss, b"xxxx"), ((None, 0), 4));
+        assert_eq!(run(&mut cold_miss, b"xxxx"), ((None, 0, false), 4));
         assert!(!cold_miss.lazy.initialized);
         assert_eq!(cold_miss.lazy.state_len, 0);
         assert_eq!(cold_miss.lazy.item_len, 0);
@@ -15550,7 +19092,7 @@ mod tests {
 
         let mut warm = K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
         let (cold_result, cold_work) = run(&mut warm, b"a\n");
-        assert_eq!(cold_result, (Some(MatchSpan::new(0, 1)), 2));
+        assert_eq!(cold_result, (Some(MatchSpan::new(0, 1)), 2, true));
         assert!(warm.lazy.initialized);
         assert!(warm.lazy.state_len > 0);
         assert!(warm.lazy.item_len > 0);
@@ -15569,7 +19111,7 @@ mod tests {
         assert_eq!(warm.lazy.item_len, warm_item_len);
         assert_eq!(warm.lazy.context.occupied_slots(), warm_slots);
 
-        assert_eq!(run(&mut warm, b"xxxx"), ((None, 0), 4));
+        assert_eq!(run(&mut warm, b"xxxx"), ((None, 0, false), 4));
         assert_eq!(warm.lazy.state_len, warm_state_len);
         assert_eq!(warm.lazy.item_len, warm_item_len);
         assert_eq!(warm.lazy.context.occupied_slots(), warm_slots);
@@ -15592,10 +19134,11 @@ mod tests {
             None,
             false,
             false,
+            None,
             &mut no_scanner_probe,
         )
         .unwrap();
-        assert_eq!(empty, Some((None, 0)));
+        assert_eq!(empty, Some((None, 0, false)));
         assert!(no_scanner_workspace.lazy.initialized);
         assert!(no_scanner_meter.consumed > 0);
     }
@@ -15716,10 +19259,11 @@ mod tests {
             None,
             false,
             false,
+            None,
             &mut clipped_probe,
         )
         .unwrap();
-        assert_eq!(clipped_result, Some((None, 0)));
+        assert_eq!(clipped_result, Some((None, 0, false)));
         assert_eq!(clipped_meter.consumed, 0);
         assert!(!clipped.lazy.initialized);
         assert_eq!(clipped.lazy.context.occupied_slots(), 0);
@@ -18005,6 +21549,262 @@ mod tests {
     }
 
     #[test]
+    fn ascii_nonmember_bulk_scan_preserves_boundaries_masks_and_exact_limits() {
+        let scanner = root_scanner(scanner_for_set(byte_set(b"aceg")));
+        assert!(matches!(&scanner.scanner, StartScanner::AsciiSet { .. }));
+        let start = 5_usize;
+        let length = 257_usize;
+        let end = start.checked_add(length).unwrap();
+
+        for &offset in &[63_usize, 64, 95, 96, 127, 128, 191, 192] {
+            let mut haystack = vec![b'x'; end + 3];
+            haystack[start + 80] = 0xff;
+            haystack[start + offset] = b'a';
+            let unlimited_work = expected_ascii_scanner_work(start, end, start + offset);
+            let exact_limit = u64::try_from(offset + 1).unwrap();
+
+            let mut unlimited = WorkMeter::new(u64::MAX, 0);
+            assert_eq!(
+                super::next_start_candidate(
+                    &scanner,
+                    &haystack,
+                    start,
+                    end,
+                    None,
+                    &mut unlimited,
+                )
+                .unwrap(),
+                start + offset
+            );
+            assert_eq!(unlimited.consumed, unlimited_work);
+
+            let mut exact = WorkMeter::new(exact_limit, 0);
+            assert_eq!(
+                super::next_start_candidate(
+                    &scanner,
+                    &haystack,
+                    start,
+                    end,
+                    None,
+                    &mut exact,
+                )
+                .unwrap(),
+                start + offset
+            );
+            assert_eq!(exact.consumed, exact_limit);
+
+            let mut one_below = WorkMeter::new(exact_limit - 1, 0);
+            assert!(matches!(
+                super::next_start_candidate(
+                    &scanner,
+                    &haystack,
+                    start,
+                    end,
+                    None,
+                    &mut one_below,
+                ),
+                Err(SearchError::WorkLimitExceeded { .. })
+            ));
+            assert_eq!(one_below.consumed, exact_limit - 1);
+        }
+
+        let mut absent = vec![b'x'; end + 3];
+        for offset in [63_usize, 64, 95, 96, 127, 128, 191, 192] {
+            absent[start + offset] = 0xff;
+        }
+        let mut exact = WorkMeter::new(u64::try_from(length).unwrap(), 0);
+        assert_eq!(
+            super::next_start_candidate(&scanner, &absent, start, end, None, &mut exact).unwrap(),
+            end
+        );
+        assert_eq!(exact.consumed, u64::try_from(length).unwrap());
+        let mut one_below = WorkMeter::new(u64::try_from(length - 1).unwrap(), 0);
+        assert!(matches!(
+            super::next_start_candidate(
+                &scanner,
+                &absent,
+                start,
+                end,
+                None,
+                &mut one_below,
+            ),
+            Err(SearchError::WorkLimitExceeded { .. })
+        ));
+
+        let mut clustered = vec![b'x'; 160];
+        clustered[100] = b'a';
+        clustered[107] = b'c';
+        clustered[127] = b'e';
+        let mut cursor = super::RetainedStartMaskCursor::default();
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            super::next_start_candidate_retained(
+                &scanner,
+                &clustered,
+                0,
+                clustered.len(),
+                None,
+                &mut meter,
+                &mut cursor,
+            )
+            .unwrap(),
+            100
+        );
+        assert_eq!(usize::from(cursor.width), ASCII_WIDE_BYTES);
+        let classified_work = meter.consumed;
+        assert_eq!(
+            super::next_start_candidate_retained(
+                &scanner,
+                &clustered,
+                101,
+                clustered.len(),
+                None,
+                &mut meter,
+                &mut cursor,
+            )
+            .unwrap(),
+            107
+        );
+        assert_eq!(meter.consumed, classified_work);
+    }
+
+    #[test]
+    fn full_byte_nonmember_bulk_scan_reclassifies_high_bytes_and_preserves_limits() {
+        let scanner = scanner_for_set(byte_set(&[b'a', b'c', b'e', b'g', 0x80]));
+        let StartScanner::Set(classifier) = scanner else {
+            panic!("mixed broad set did not retain its full-byte classifier");
+        };
+        let start = 5_usize;
+        let length = 257_usize;
+        let end = start.checked_add(length).unwrap();
+
+        for &(offset, member) in &[
+            (79_usize, b'a'),
+            (80, 0x80),
+            (111, b'c'),
+            (112, 0x80),
+            (143, b'e'),
+            (144, 0x80),
+            (207, b'g'),
+            (208, 0x80),
+        ] {
+            let mut haystack = vec![b'x'; end + 3];
+            haystack[start + 96] = 0x81;
+            haystack[start + offset] = member;
+            let unlimited_work = expected_full_byte_scanner_work(
+                start,
+                end,
+                start + offset,
+                BYTE_SET_WIDE_BLOCK_BYTES,
+            );
+            let exact_limit = u64::try_from(offset + 1).unwrap();
+
+            let mut unlimited = WorkMeter::new(u64::MAX, 0);
+            assert_eq!(
+                super::next_set_start_candidate_with_block_bytes(
+                    &classifier,
+                    &haystack,
+                    start,
+                    end,
+                    &mut unlimited,
+                    None,
+                    BYTE_SET_WIDE_BLOCK_BYTES,
+                )
+                .unwrap(),
+                start + offset
+            );
+            assert_eq!(unlimited.consumed, unlimited_work);
+
+            let mut exact = WorkMeter::new(exact_limit, 0);
+            assert_eq!(
+                super::next_set_start_candidate_with_block_bytes(
+                    &classifier,
+                    &haystack,
+                    start,
+                    end,
+                    &mut exact,
+                    None,
+                    BYTE_SET_WIDE_BLOCK_BYTES,
+                )
+                .unwrap(),
+                start + offset
+            );
+            assert_eq!(exact.consumed, exact_limit);
+
+            let mut one_below = WorkMeter::new(exact_limit - 1, 0);
+            assert!(matches!(
+                super::next_set_start_candidate_with_block_bytes(
+                    &classifier,
+                    &haystack,
+                    start,
+                    end,
+                    &mut one_below,
+                    None,
+                    BYTE_SET_WIDE_BLOCK_BYTES,
+                ),
+                Err(SearchError::WorkLimitExceeded { .. })
+            ));
+            assert_eq!(one_below.consumed, exact_limit - 1);
+        }
+
+        let mut absent = vec![b'x'; end + 3];
+        for offset in [63_usize, 64, 95, 96, 127, 128, 191, 192] {
+            absent[start + offset] = 0x81;
+        }
+        let mut exact = WorkMeter::new(u64::try_from(length).unwrap(), 0);
+        assert_eq!(
+            super::next_set_start_candidate_with_block_bytes(
+                &classifier,
+                &absent,
+                start,
+                end,
+                &mut exact,
+                None,
+                BYTE_SET_WIDE_BLOCK_BYTES,
+            )
+            .unwrap(),
+            end
+        );
+        assert_eq!(exact.consumed, u64::try_from(length).unwrap());
+
+        let mut clustered = vec![b'x'; 176];
+        clustered[120] = b'a';
+        clustered[125] = 0x80;
+        clustered[143] = b'c';
+        let mut cursor = super::RetainedStartMaskCursor::default();
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            super::next_set_start_candidate_with_block_bytes(
+                &classifier,
+                &clustered,
+                0,
+                clustered.len(),
+                &mut meter,
+                Some(&mut cursor),
+                BYTE_SET_WIDE_BLOCK_BYTES,
+            )
+            .unwrap(),
+            120
+        );
+        assert_eq!(usize::from(cursor.width), BYTE_SET_WIDE_BLOCK_BYTES);
+        let classified_work = meter.consumed;
+        assert_eq!(
+            super::next_set_start_candidate_with_block_bytes(
+                &classifier,
+                &clustered,
+                121,
+                clustered.len(),
+                &mut meter,
+                Some(&mut cursor),
+                BYTE_SET_WIDE_BLOCK_BYTES,
+            )
+            .unwrap(),
+            125
+        );
+        assert_eq!(meter.consumed, classified_work);
+    }
+
+    #[test]
     fn full_byte_scalar_extents_preserve_exact_and_one_below_work() {
         let range = root_scanner(scanner_for_set(byte_range_set(0x40, 0x7f)));
         assert!(matches!(&range.scanner, StartScanner::Range { .. }));
@@ -19051,7 +22851,10 @@ mod tests {
         #[cfg(target_pointer_width = "64")]
         {
             assert!(size_of::<StartFilterProofCell>() <= 16);
-            assert!(size_of::<Automaton>() <= 192);
+            assert!(
+                size_of::<Automaton>()
+                    <= 192 + Automaton::BYTE_CLASS_MAP_RETAINED_BYTES
+            );
         }
         #[cfg(all(
             target_pointer_width = "64",
@@ -19060,11 +22863,11 @@ mod tests {
         ))]
         {
             assert_eq!(size_of::<StartFilterProofCell>(), 16);
-            assert_eq!(size_of::<Automaton>(), 192);
+            assert_eq!(size_of::<Automaton>(), 448);
             #[cfg(feature = "static-dispatch")]
-            assert_eq!(size_of::<StartFilterProof>(), 136);
+            assert_eq!(size_of::<StartFilterProof>(), 192);
             #[cfg(not(feature = "static-dispatch"))]
-            assert_eq!(size_of::<StartFilterProof>(), 480);
+            assert_eq!(size_of::<StartFilterProof>(), 704);
         }
     }
 
@@ -20476,13 +24279,19 @@ mod tests {
         let initial = propagated_workspace.lazy.initial;
         assert_eq!(
             super::LazyStartAction::from_direct_cell(
-                propagated_workspace.lazy.cell(initial, b'a').unwrap()
+                propagated_workspace
+                    .lazy
+                    .cell(initial, byte_class(&propagated, b'a'))
+                    .unwrap()
             ),
             super::LazyStartAction::Propagate
         );
         assert_eq!(
             super::LazyStartAction::from_direct_cell(
-                propagated_workspace.lazy.cell(initial, b'b').unwrap()
+                propagated_workspace
+                    .lazy
+                    .cell(initial, byte_class(&propagated, b'b'))
+                    .unwrap()
             ),
             super::LazyStartAction::Reset
         );
@@ -20503,7 +24312,10 @@ mod tests {
             super::LazyStartAction::from_direct_cell(
                 mixed_workspace
                     .lazy
-                    .cell(mixed_workspace.lazy.initial, b'a')
+                    .cell(
+                        mixed_workspace.lazy.initial,
+                        byte_class(&mixed, b'a'),
+                    )
                     .unwrap()
             ),
             super::LazyStartAction::Drop,
@@ -20531,7 +24343,7 @@ mod tests {
             super::LazyStartAction::from_direct_cell(
                 uniform_multi_workspace
                     .lazy
-                    .cell(uniform_multi_initial, b'a')
+                    .cell(uniform_multi_initial, byte_class(&uniform_multi, b'a'))
                     .unwrap()
             ),
             super::LazyStartAction::Propagate
@@ -20540,7 +24352,7 @@ mod tests {
             super::LazyStartAction::from_direct_cell(
                 uniform_multi_workspace
                     .lazy
-                    .cell(uniform_multi_initial, b'b')
+                    .cell(uniform_multi_initial, byte_class(&uniform_multi, b'b'))
                     .unwrap()
             ),
             super::LazyStartAction::Reset
@@ -20562,7 +24374,10 @@ mod tests {
             super::LazyStartAction::from_direct_cell(
                 mixed_multi_workspace
                     .lazy
-                    .cell(mixed_multi_workspace.lazy.initial, b'a')
+                    .cell(
+                        mixed_multi_workspace.lazy.initial,
+                        byte_class(&mixed_multi, b'a'),
+                    )
                     .unwrap()
             ),
             super::LazyStartAction::Drop,
@@ -20642,6 +24457,1689 @@ mod tests {
                 .into_output(),
             Some(MatchSpan::new(0, 4))
         );
+    }
+
+    #[test]
+    fn unlimited_nonspan_contracts_learn_direct_loop_plans_and_keep_finite_limits_exact() {
+        let run_len = super::LAZY_LOOP_SKIP_MIN_BYTES * 2;
+        let mut haystack = vec![2_u8; run_len + 33];
+        haystack[..run_len].fill(0);
+        haystack[run_len] = 1;
+        let window = SearchWindow::full(&haystack);
+
+        let exists_plan = ascii_loop_class(1);
+        pin_without_start_filter(&exists_plan);
+        let mut exists =
+            K0Workspace::new_accelerated(&exists_plan, WorkspaceLimits::unlimited()).unwrap();
+        assert!(
+            exists_plan
+                .prepare::<Exists>()
+                .search_window_with_workspace(
+                    &haystack,
+                    window,
+                    &mut exists,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output()
+        );
+        assert!(exists.lazy.loop_skip_plan.is_some());
+
+        let earliest_plan = ascii_loop_class(1);
+        pin_without_start_filter(&earliest_plan);
+        let mut earliest =
+            K0Workspace::new_accelerated(&earliest_plan, WorkspaceLimits::unlimited()).unwrap();
+        assert_eq!(
+            earliest_plan
+                .prepare::<EarliestEnd>()
+                .search_window_with_workspace(
+                    &haystack,
+                    window,
+                    &mut earliest,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output(),
+            Some(run_len + 1)
+        );
+        assert!(earliest.lazy.loop_skip_plan.is_some());
+
+        let selected_plan = ascii_loop_class(1);
+        pin_without_start_filter(&selected_plan);
+        let mut selected =
+            K0Workspace::new_accelerated(&selected_plan, WorkspaceLimits::unlimited()).unwrap();
+        let cold_finite = selected_plan
+            .prepare::<SelectedEnd>()
+            .search_window_with_workspace(
+                &haystack,
+                window,
+                &mut selected,
+                SearchLimits {
+                    max_work: u64::MAX - 1,
+                    max_scratch_bytes: usize::MAX,
+                },
+            )
+            .unwrap();
+        assert_eq!(cold_finite.output(), &Some(run_len + 1));
+        assert!(
+            selected.lazy.loop_skip_plan.is_none(),
+            "a finite completion certificate must not publish optional analysis"
+        );
+        assert_eq!(
+            selected_plan
+                .prepare::<SelectedEnd>()
+                .search_window_with_workspace(
+                    &haystack,
+                    window,
+                    &mut selected,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output(),
+            Some(run_len + 1)
+        );
+        assert!(selected.lazy.loop_skip_plan.is_some());
+
+        let measured = selected_plan
+            .prepare::<SelectedEnd>()
+            .search_window_with_workspace(
+                &haystack,
+                window,
+                &mut selected,
+                SearchLimits::unlimited(),
+            )
+            .unwrap();
+        let exact_work = measured.accounting().work();
+        let retained = selected.retained_bytes();
+        assert_eq!(
+            selected_plan
+                .prepare::<SelectedEnd>()
+                .search_window_with_workspace(
+                    &haystack,
+                    window,
+                    &mut selected,
+                    SearchLimits {
+                        max_work: exact_work,
+                        max_scratch_bytes: retained,
+                    },
+                )
+                .unwrap()
+                .into_output(),
+            Some(run_len + 1)
+        );
+        assert!(matches!(
+            selected_plan
+                .prepare::<SelectedEnd>()
+                .search_window_with_workspace(
+                    &haystack,
+                    window,
+                    &mut selected,
+                    SearchLimits {
+                        max_work: exact_work.checked_sub(1).unwrap(),
+                        max_scratch_bytes: retained,
+                    },
+                ),
+            Err(SearchError::WorkLimitExceeded { limit, .. })
+                if limit == exact_work.checked_sub(1).unwrap()
+        ));
+    }
+
+    #[test]
+    fn report_free_exists_scans_inferred_direct_cells_read_only_after_same_address_mutation() {
+        let plan = direct_split_loop_then_terminal();
+        pin_without_start_filter(&plan);
+        assert_ne!(byte_class(&plan, b'a'), byte_class(&plan, b'b'));
+        let run_end = super::WARM_EXISTS_INLINE_BYTES + super::LAZY_LOOP_SKIP_MIN_BYTES * 2;
+        let mut haystack = vec![b'!'; super::WARM_CONTEXT_MIN_WINDOW_BYTES];
+        haystack[..run_end].fill(b'a');
+        haystack[run_end] = b'z';
+        let address = haystack.as_ptr();
+        let window = SearchWindow::full(&haystack);
+        let mut session =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+
+        assert!(
+            session
+                .search_window::<Exists>(&haystack, window, SearchLimits::unlimited())
+                .unwrap()
+                .into_output()
+        );
+        let loop_plan = session
+            .workspace
+            .lazy
+            .loop_skip_plan
+            .expect("an early-return Exists call must retain its completed loop witness");
+        assert_eq!(loop_plan.start_action, super::LazyStartAction::Propagate);
+        assert!(loop_plan.scanner.contains(b'a'));
+        assert!(loop_plan.scanner.contains(b'b'));
+        assert_eq!(
+            session
+                .workspace
+                .lazy
+                .direct_cell(loop_plan.row_offset, byte_class(&plan, b'b'))
+                .unwrap(),
+            super::LAZY_CELL_UNFILLED
+        );
+
+        let generation = session.workspace.generation;
+        let current_len = session.workspace.current_len;
+        let roots_len = session.workspace.roots_len;
+        let stack_len = session.workspace.stack_len;
+        let frontier_len = session.workspace.lazy.frontier_len;
+        let rows = session.workspace.lazy.rows.clone();
+        let offsets = session.workspace.lazy.offsets.clone();
+        let lengths = session.workspace.lazy.lengths.clone();
+        let items = session.workspace.lazy.items.clone();
+        let modes = session.workspace.lazy.modes.clone();
+        let published = session.workspace.lazy.direct_cells_published;
+
+        haystack[super::WARM_EXISTS_INLINE_BYTES..run_end].fill(b'b');
+        assert_eq!(haystack.as_ptr(), address);
+        assert!(
+            session
+                .search_exists_value(&haystack, window, SearchLimits::unlimited())
+                .unwrap()
+        );
+        assert_eq!(session.workspace.generation, generation);
+        assert_eq!(session.workspace.current_len, current_len);
+        assert_eq!(session.workspace.roots_len, roots_len);
+        assert_eq!(session.workspace.stack_len, stack_len);
+        assert_eq!(session.workspace.lazy.frontier_len, frontier_len);
+        assert_eq!(session.workspace.lazy.rows, rows);
+        assert_eq!(session.workspace.lazy.offsets, offsets);
+        assert_eq!(session.workspace.lazy.lengths, lengths);
+        assert_eq!(session.workspace.lazy.items, items);
+        assert_eq!(session.workspace.lazy.modes, modes);
+        assert_eq!(session.workspace.lazy.direct_cells_published, published);
+        assert_eq!(
+            session
+                .workspace
+                .lazy
+                .direct_cell(loop_plan.row_offset, byte_class(&plan, b'b'))
+                .unwrap(),
+            super::LAZY_CELL_UNFILLED,
+            "the retained graph proof must not impersonate cell publication"
+        );
+    }
+
+    #[test]
+    fn report_free_exists_ignores_drop_provenance_and_remains_read_only() {
+        let plan = direct_drop_loop_then_terminal();
+        pin_without_start_filter(&plan);
+        let run_end = super::WARM_EXISTS_INLINE_BYTES + super::LAZY_LOOP_SKIP_MIN_BYTES * 3;
+        let reset_at = super::WARM_EXISTS_INLINE_BYTES + super::LAZY_LOOP_SKIP_MIN_BYTES;
+        let mut source = vec![b'x'; run_end + 1];
+        source[reset_at] = b'!';
+        source[run_end] = b'z';
+        let address = source.as_ptr();
+        let window = SearchWindow::full(&source);
+        let mut session =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+
+        assert!(
+            session
+                .search_window::<Exists>(&source, window, SearchLimits::unlimited())
+                .unwrap()
+                .into_output()
+        );
+        let loop_plan = session
+            .workspace
+            .lazy
+            .loop_skip_plan
+            .expect("the unanchored Drop self-loop must retain a scanner");
+        assert_eq!(loop_plan.start_action, super::LazyStartAction::Drop);
+        assert!(loop_plan.scanner.contains(b'x'));
+        assert!(!loop_plan.scanner.contains(b'!'));
+        assert_ne!(
+            session
+                .workspace
+                .lazy
+                .direct_cell(loop_plan.row_offset, byte_class(&plan, b'!'))
+                .unwrap(),
+            super::LAZY_CELL_UNFILLED,
+            "the first call must warm the later Reset transition"
+        );
+
+        let generation = session.workspace.generation;
+        let current_len = session.workspace.current_len;
+        let roots_len = session.workspace.roots_len;
+        let stack_len = session.workspace.stack_len;
+        let frontier_len = session.workspace.lazy.frontier_len;
+        let rows = session.workspace.lazy.rows.clone();
+        let offsets = session.workspace.lazy.offsets.clone();
+        let lengths = session.workspace.lazy.lengths.clone();
+        let items = session.workspace.lazy.items.clone();
+        let modes = session.workspace.lazy.modes.clone();
+        let published = session.workspace.lazy.direct_cells_published;
+
+        source[run_end] = b'!';
+        assert_eq!(source.as_ptr(), address);
+        assert!(
+            !session
+                .search_exists_value(&source, window, SearchLimits::unlimited())
+                .unwrap()
+        );
+        assert_eq!(session.workspace.generation, generation);
+        assert_eq!(session.workspace.current_len, current_len);
+        assert_eq!(session.workspace.roots_len, roots_len);
+        assert_eq!(session.workspace.stack_len, stack_len);
+        assert_eq!(session.workspace.lazy.frontier_len, frontier_len);
+        assert_eq!(session.workspace.lazy.rows, rows);
+        assert_eq!(session.workspace.lazy.offsets, offsets);
+        assert_eq!(session.workspace.lazy.lengths, lengths);
+        assert_eq!(session.workspace.lazy.items, items);
+        assert_eq!(session.workspace.lazy.modes, modes);
+        assert_eq!(session.workspace.lazy.direct_cells_published, published);
+    }
+
+    #[test]
+    fn pending_loop_plan_certifies_equivalent_bytes_without_publishing_cells() {
+        let plan = a_greedy_any_star_z();
+        let mut workspace =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let mut haystack = vec![b'!'; 4_096];
+        haystack[0] = b'a';
+        haystack[1] = b'z';
+        let address = haystack.as_ptr();
+
+        let first = plan
+            .prepare::<Span>()
+            .search_with_workspace(
+                &haystack,
+                &mut workspace,
+                SearchLimits::unlimited(),
+            )
+            .unwrap();
+        let scalar_boundaries = first.accounting().boundaries();
+        assert_eq!(first.into_output(), Some(MatchSpan::new(0, 2)));
+        let loop_plan = workspace
+            .lazy
+            .loop_skip_plan
+            .expect("a long pending full-byte loop must retain a scanner");
+        assert_eq!(loop_plan.start_action, super::LazyStartAction::Propagate);
+        assert!(matches!(loop_plan.scanner, super::LazyLoopScanner::Set(_)));
+        assert_eq!(loop_plan.scanner.cardinality(), 255);
+        assert!(loop_plan.scanner.contains(u8::MIN));
+        assert!(loop_plan.scanner.contains(u8::MAX));
+        assert!(!loop_plan.scanner.contains(b'z'));
+        assert!(loop_plan.scanner.contains(b'!'));
+        assert!(loop_plan.scanner.contains(b'b'));
+        assert_eq!(
+            workspace
+                .lazy
+                .direct_cell(loop_plan.row_offset, byte_class(&plan, b'b'))
+                .unwrap(),
+            super::LAZY_CELL_UNFILLED,
+            "graph equivalence must not impersonate direct-cell publication"
+        );
+        let published = workspace.lazy.direct_cells_published;
+
+        // Reuse the exact source allocation with a different member of the
+        // proved graph class. The retained plan owns no source pointer or
+        // bytes, and the inferred sibling remains physically unfilled after
+        // the plan-aware executor skips it.
+        haystack[2..].fill(u8::MAX);
+        assert_eq!(address, haystack.as_ptr());
+        let second = plan
+            .prepare::<Span>()
+            .search_with_workspace(
+                &haystack,
+                &mut workspace,
+                SearchLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(second.into_output(), Some(MatchSpan::new(0, 2)));
+        assert_eq!(workspace.lazy.direct_cells_published, published);
+        assert_eq!(
+            workspace
+                .lazy
+                .direct_cell(loop_plan.row_offset, byte_class(&plan, u8::MAX))
+                .unwrap(),
+            super::LAZY_CELL_UNFILLED
+        );
+
+        let selected = plan
+            .prepare::<SelectedEnd>()
+            .search_with_workspace(
+                &haystack,
+                &mut workspace,
+                SearchLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(selected.into_output(), Some(2));
+        assert_eq!(workspace.lazy.direct_cells_published, published);
+        assert_eq!(
+            workspace
+                .lazy
+                .direct_cell(loop_plan.row_offset, byte_class(&plan, u8::MAX))
+                .unwrap(),
+            super::LAZY_CELL_UNFILLED,
+            "SelectedEnd must use the full-byte proof without publishing inferred cells"
+        );
+
+        let measured = plan
+            .prepare::<Span>()
+            .search_with_workspace(
+                &haystack,
+                &mut workspace,
+                SearchLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(
+            measured.accounting().boundaries(),
+            scalar_boundaries,
+            "bulk loop scanning must retain scalar boundary accounting"
+        );
+        let exact_work = measured.accounting().work();
+        let retained = workspace.retained_bytes();
+        assert_eq!(
+            plan.prepare::<Span>()
+                .search_with_workspace(
+                    &haystack,
+                    &mut workspace,
+                    SearchLimits {
+                        max_work: exact_work,
+                        max_scratch_bytes: retained,
+                    },
+                )
+                .unwrap()
+                .into_output(),
+            Some(MatchSpan::new(0, 2))
+        );
+        assert!(matches!(
+            plan.prepare::<Span>().search_with_workspace(
+                &haystack,
+                &mut workspace,
+                SearchLimits {
+                    max_work: exact_work.checked_sub(1).unwrap(),
+                    max_scratch_bytes: retained,
+                },
+            ),
+            Err(SearchError::WorkLimitExceeded { limit, .. })
+                if limit == exact_work.checked_sub(1).unwrap()
+        ));
+    }
+
+    #[test]
+    fn full_byte_loop_scanner_matches_scalar_prefix_across_block_boundaries() {
+        let mut words = [0_u64; 4];
+        for byte in [0x00, 0x02, 0x80, 0x82, 0xfe, 0xff] {
+            super::byte_bitmap_insert(&mut words, byte);
+        }
+        let scanner = super::LazyLoopScanner::new(words);
+        assert!(matches!(scanner, super::LazyLoopScanner::Set(_)));
+        assert_eq!(
+            super::LazyLoopScanner::build_work(words),
+            u64::try_from(super::BYTE_SET_CLASSIFIER_BUILD_WORK).unwrap()
+        );
+
+        let members = [0x00, 0x02, 0x80, 0x82, 0xfe, 0xff];
+        let mut source = (0..97)
+            .map(|index| members[index % members.len()])
+            .collect::<Vec<_>>();
+        let address = source.as_ptr();
+        assert_eq!(scanner.scan_forward(&source), source.len());
+        for stop in [0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 95, 96] {
+            let saved = source[stop];
+            source[stop] = 0x7f;
+            let expected = source.iter().take_while(|&&byte| scanner.contains(byte)).count();
+            assert_eq!(scanner.scan_forward(&source), expected, "stop={stop}");
+            source[stop] = saved;
+        }
+        assert_eq!(source.as_ptr(), address);
+        source.fill(0xff);
+        source[32] = 0x7f;
+        assert_eq!(scanner.scan_forward(&source), 32);
+
+        let all = super::LazyLoopScanner::new([u64::MAX; 4]);
+        assert!(matches!(all, super::LazyLoopScanner::All));
+        assert_eq!(super::LazyLoopScanner::build_work([u64::MAX; 4]), 0);
+        assert_eq!(all.scan_forward(&source), source.len());
+
+        let plan = full_byte_loop_class();
+        let cell = super::direct_row_encoded_state(0).unwrap()
+            | super::LazyStartAction::Propagate.cell_bits();
+        let mut workspace = direct_nonpending_loop_workspace(&plan, cell);
+        let mut derive = WorkMeter::new(u64::MAX, 0);
+        super::try_derive_lazy_loop_skip(&plan, &mut workspace, &mut derive).unwrap();
+        let retained = workspace.lazy.loop_skip_plan.unwrap();
+        assert_eq!(retained.start_action, super::LazyStartAction::Propagate);
+        assert!(matches!(retained.scanner, super::LazyLoopScanner::All));
+        assert_eq!(retained.scanner.cardinality(), 256);
+    }
+
+    #[test]
+    fn direct_loop_plan_upgrades_transactionally_to_disjoint_high_members() {
+        let plan = disjoint_ascii_and_high_loop_classes();
+        let cell = super::direct_row_encoded_state(0).unwrap()
+            | super::LazyStartAction::Propagate.cell_bits();
+
+        let mut measured = narrow_then_high_loop_workspace(&plan, cell);
+        let retained_bytes = measured.retained_bytes();
+        let published = measured.lazy.direct_cells_published;
+        let rows = measured.lazy.rows.clone();
+        let mut exact = WorkMeter::new(u64::MAX, 0);
+        super::try_derive_lazy_loop_skip(&plan, &mut measured, &mut exact).unwrap();
+        let upgrade_work = exact.consumed;
+        let upgraded = measured.lazy.loop_skip_plan.unwrap();
+        assert_eq!(upgraded.start_action, super::LazyStartAction::Propagate);
+        assert_eq!(upgraded.scanner.cardinality(), 131);
+        assert!(matches!(upgraded.scanner, super::LazyLoopScanner::Set(_)));
+        assert!(upgraded.scanner.contains(b'a'));
+        assert!(upgraded.scanner.contains(0x80));
+        assert!(upgraded.scanner.contains(0xff));
+        assert!(!upgraded.scanner.contains(b'z'));
+        assert_eq!(measured.lazy.direct_cells_published, published);
+        assert_eq!(measured.lazy.rows, rows);
+        assert_eq!(measured.retained_bytes(), retained_bytes);
+
+        let mut refused = narrow_then_high_loop_workspace(&plan, cell);
+        let refused_rows = refused.lazy.rows.clone();
+        let mut one_below = WorkMeter::new(upgrade_work.checked_sub(1).unwrap(), 0);
+        super::try_derive_lazy_loop_skip(&plan, &mut refused, &mut one_below).unwrap();
+        assert_eq!(refused.lazy.loop_skip_plan.unwrap().scanner.cardinality(), 3);
+        assert_ne!(
+            refused.lazy.loop_skip_analyzed_at_cells,
+            refused.lazy.direct_cells_published
+        );
+        assert_eq!(refused.lazy.rows, refused_rows);
+
+        let mut retry = WorkMeter::new(upgrade_work, 0);
+        super::try_derive_lazy_loop_skip(&plan, &mut refused, &mut retry).unwrap();
+        assert_eq!(retry.consumed, upgrade_work);
+        assert_eq!(refused.lazy.loop_skip_plan.unwrap().scanner.cardinality(), 131);
+    }
+
+    #[test]
+    fn loop_skip_admits_narrow_ascii_classes_and_nonpending_states() {
+        let encoded = super::direct_row_encoded_state(0).unwrap();
+        let cell = encoded | super::LazyStartAction::Propagate.cell_bits();
+        let mut singleton_work = None;
+
+        for cardinality in [1_u8, 15, 16, 127] {
+            let plan = ascii_loop_class(cardinality);
+            let mut workspace = direct_nonpending_loop_workspace(&plan, cell);
+            assert_eq!(workspace.lazy.modes[0], 0, "class {cardinality}");
+
+            let mut meter = WorkMeter::new(u64::MAX, 0);
+            super::try_derive_lazy_loop_skip(&plan, &mut workspace, &mut meter).unwrap();
+            let retained = workspace
+                .lazy
+                .loop_skip_plan
+                .expect("every nonempty exact class must retain a runtime-guarded plan");
+            let members = (u8::MIN..=0x7f)
+                .filter(|&byte| retained.scanner.contains(byte))
+                .count();
+            assert_eq!(members, usize::from(cardinality));
+            assert_eq!(retained.row_offset, 0);
+            assert_eq!(retained.start_action, super::LazyStartAction::Propagate);
+            if cardinality == 1 {
+                singleton_work = Some(meter.consumed);
+            }
+        }
+
+        let plan = ascii_loop_class(1);
+        let analysis_work = singleton_work.unwrap();
+        let mut refused = direct_nonpending_loop_workspace(&plan, cell);
+        let rows = refused.lazy.rows.clone();
+        let published = refused.lazy.direct_cells_published;
+        let mut one_below = WorkMeter::new(analysis_work.checked_sub(1).unwrap(), 0);
+        super::try_derive_lazy_loop_skip(&plan, &mut refused, &mut one_below).unwrap();
+        assert!(refused.lazy.loop_skip_plan.is_none());
+        assert_ne!(refused.lazy.loop_skip_analyzed_at_cells, published);
+        assert_eq!(refused.lazy.rows, rows);
+
+        let mut retry = WorkMeter::new(analysis_work, 0);
+        super::try_derive_lazy_loop_skip(&plan, &mut refused, &mut retry).unwrap();
+        assert!(refused.lazy.loop_skip_plan.is_some());
+        assert_eq!(retry.consumed, analysis_work);
+    }
+
+    #[test]
+    fn loop_skip_keeps_drop_and_propagate_equivalence_classes_separate() {
+        let plan = direct_mixed_action_loops_then_terminal();
+        pin_without_start_filter(&plan);
+        let mut haystack = vec![b'w'; super::LAZY_LOOP_SKIP_MIN_BYTES * 2];
+        haystack[0] = b'y';
+        haystack.push(b'z');
+        let mut workspace =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+
+        assert_eq!(
+            plan.prepare::<SelectedEnd>()
+                .search_with_workspace(
+                    &haystack,
+                    &mut workspace,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output(),
+            Some(haystack.len())
+        );
+        let retained = workspace
+            .lazy
+            .loop_skip_plan
+            .expect("the wider Drop class must retain its exact-action scanner");
+        assert_eq!(retained.start_action, super::LazyStartAction::Drop);
+        assert_eq!(retained.scanner.cardinality(), 2);
+        assert!(retained.scanner.contains(b'w'));
+        assert!(retained.scanner.contains(b'x'));
+        assert!(!retained.scanner.contains(b'y'));
+    }
+
+    #[test]
+    fn loop_skip_rejects_accept_restart_and_nonself_cells() {
+        let plan = ascii_loop_class(1);
+        let self_encoded = super::direct_row_encoded_state(0).unwrap();
+        let other_encoded = super::direct_row_encoded_state(1).unwrap();
+        let rejected = [
+            (
+                "accept",
+                self_encoded
+                    | super::LAZY_CELL_ACCEPT
+                    | super::LazyStartAction::Propagate.cell_bits(),
+            ),
+            (
+                "restart",
+                self_encoded | super::LazyStartAction::Reset.cell_bits(),
+            ),
+            (
+                "nonself",
+                other_encoded | super::LazyStartAction::Propagate.cell_bits(),
+            ),
+        ];
+
+        for (name, cell) in rejected {
+            let mut workspace = direct_nonpending_loop_workspace(&plan, cell);
+            let mut meter = WorkMeter::new(u64::MAX, 0);
+            super::try_derive_lazy_loop_skip(&plan, &mut workspace, &mut meter).unwrap();
+            assert!(workspace.lazy.loop_skip_plan.is_none(), "{name}");
+            assert_eq!(
+                workspace.lazy.loop_skip_analyzed_at_cells,
+                workspace.lazy.direct_cells_published,
+                "{name}: completed negative epoch"
+            );
+        }
+    }
+
+    #[test]
+    fn contextual_loop_candidate_survives_hot_terminal_and_publication_declines() {
+        let plan = contextual_nonpending_loop_then_terminal();
+        let mut workspace =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let mut intern = WorkMeter::new(u64::MAX, 0);
+        workspace.lazy.scratch[0] = 0;
+        workspace.lazy.scratch_len = 1;
+        assert_eq!(workspace.lazy.intern_initial(false, &mut intern, 0).unwrap(), 0);
+
+        let loop_symbol = super::contextual_symbol(u32::from(b'a'), 0);
+        let loop_cell = 1 | super::LazyStartAction::Propagate.cell_bits();
+        let loop_record = ContextTransitionSlot::populated(0, loop_symbol, loop_cell);
+        let mut declined = WorkMeter::new(1, 0);
+        workspace
+            .lazy
+            .context
+            .publish(Some(0), loop_record, &mut declined, 1, 0)
+            .unwrap();
+        assert_eq!(workspace.lazy.context.published, 0);
+        assert_eq!(workspace.lazy.context.loop_candidates_published, 0);
+
+        let mut cache_full = WorkMeter::new(u64::MAX, 0);
+        workspace
+            .lazy
+            .context
+            .publish(None, loop_record, &mut cache_full, 0, 0)
+            .unwrap();
+        assert_eq!(workspace.lazy.context.published, 0);
+        assert_eq!(workspace.lazy.context.loop_candidates_published, 0);
+
+        let rejected = [
+            loop_cell | super::LAZY_CELL_ACCEPT,
+            1 | super::LazyStartAction::Reset.cell_bits(),
+            2 | super::LazyStartAction::Propagate.cell_bits(),
+        ];
+        for (index, value) in rejected.into_iter().enumerate() {
+            let mut meter = WorkMeter::new(u64::MAX, 0);
+            workspace
+                .lazy
+                .context
+                .publish(
+                    Some(index),
+                    ContextTransitionSlot::populated(
+                        0,
+                        super::contextual_symbol(u32::from(b'b' + u8::try_from(index).unwrap()), 0),
+                        value,
+                    ),
+                    &mut meter,
+                    0,
+                    0,
+                )
+                .unwrap();
+            assert_eq!(workspace.lazy.context.loop_candidates_published, 0);
+        }
+
+        let drop_symbol = loop_symbol;
+        let drop_cell = 1 | super::LazyStartAction::Drop.cell_bits();
+        workspace
+            .lazy
+            .context
+            .publish(
+                Some(3),
+                ContextTransitionSlot::populated(0, drop_symbol, drop_cell),
+                &mut cache_full,
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(workspace.lazy.context.loop_candidates_published, 1);
+        assert_eq!(workspace.lazy.context.slots[3].symbol, drop_symbol);
+        assert_eq!(workspace.lazy.context.slots[3].value, drop_cell);
+
+        let mut publish = WorkMeter::new(u64::MAX, 0);
+        workspace
+            .lazy
+            .context
+            .publish(Some(4), loop_record, &mut publish, 0, 0)
+            .unwrap();
+        assert_eq!(workspace.lazy.context.loop_candidates_published, 2);
+
+        let terminal_symbol = super::contextual_symbol(u32::from(b'z'), 0);
+        workspace
+            .lazy
+            .context
+            .publish(
+                Some(5),
+                ContextTransitionSlot::populated(0, terminal_symbol, super::LAZY_CELL_ACCEPT),
+                &mut publish,
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(workspace.lazy.context.hot[0].symbol, terminal_symbol);
+        assert_eq!(workspace.lazy.context.loop_candidates_published, 2);
+        assert_eq!(workspace.lazy.context.slots[4], loop_record);
+        assert_eq!(size_of::<super::ContextHotTransition>(), 16);
+
+        workspace.lazy.context.hot[0].dependency_mask = 0;
+        workspace.lazy.context_dependencies_analyzed = 1;
+        let mut derive = WorkMeter::new(u64::MAX, 0);
+        super::try_derive_context_lazy_loop_skip(&plan, &mut workspace, &mut derive).unwrap();
+        let retained = workspace.lazy.context_loop_skip_plan.unwrap();
+        assert_eq!(retained.state, 0);
+        assert!(retained.scanner.contains(b'a'));
+    }
+
+    #[test]
+    fn contextual_high_byte_categories_are_raw_and_unicode_stays_ascii_only() {
+        let ascii = contextual_high_loop_then_terminal(false);
+        let mut workspace = contextual_high_loop_workspace(&ascii);
+        assert_eq!(workspace.lazy.context.loop_candidates_published, 1);
+        let published = workspace.lazy.context.published;
+        let retained_bytes = workspace.retained_bytes();
+        let mut derive = WorkMeter::new(u64::MAX, 0);
+        super::try_derive_context_lazy_loop_skip(&ascii, &mut workspace, &mut derive).unwrap();
+        let retained = workspace
+            .lazy
+            .context_loop_skip_plan
+            .expect("an ASCII-word nonword high-byte interior must retain a scanner");
+        assert!(retained.leave_final_member);
+        assert_eq!(retained.scanner.cardinality(), 128);
+        assert!(matches!(retained.scanner, super::LazyLoopScanner::Set(_)));
+        assert!(retained.scanner.contains(0x80));
+        assert!(retained.scanner.contains(0xff));
+        assert!(!retained.scanner.contains(0x7f));
+        assert!(!retained.scanner.contains(b'z'));
+
+        let mut source = vec![0x80; super::LAZY_LOOP_SKIP_MIN_BYTES * 2 + 1];
+        let address = source.as_ptr();
+        assert_eq!(retained.scanner.scan_forward(&source), source.len());
+        source[super::BYTE_SET_WIDE_BLOCK_BYTES] = b'a';
+        assert_eq!(source.as_ptr(), address);
+        assert_eq!(
+            retained.scanner.scan_forward(&source),
+            super::BYTE_SET_WIDE_BLOCK_BYTES
+        );
+        assert_eq!(workspace.lazy.context.published, published);
+        assert_eq!(workspace.retained_bytes(), retained_bytes);
+
+        let unicode = contextual_high_loop_then_terminal(true);
+        let mut unicode_workspace = contextual_high_loop_workspace(&unicode);
+        assert_eq!(unicode_workspace.lazy.context.loop_candidates_published, 1);
+        let mut decline = WorkMeter::new(u64::MAX, 0);
+        super::try_derive_context_lazy_loop_skip(
+            &unicode,
+            &mut unicode_workspace,
+            &mut decline,
+        )
+        .unwrap();
+        assert!(unicode_workspace.lazy.context_loop_skip_plan.is_none());
+        assert_eq!(
+            unicode_workspace.lazy.context_loop_skip_analyzed_at_candidates,
+            unicode_workspace.lazy.context.loop_candidates_published
+        );
+    }
+
+    #[test]
+    fn contextual_nonpending_loop_is_learned_for_late_and_absent_spans() {
+        let plan = contextual_nonpending_loop_then_terminal();
+        for terminal in [true, false] {
+            let mut source = vec![b'a'; super::LAZY_LOOP_SKIP_MIN_BYTES * 4];
+            if terminal {
+                *source.last_mut().unwrap() = b'z';
+            }
+            let address = source.as_ptr();
+            let mut workspace =
+                K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+            let first = plan
+                .prepare::<Span>()
+                .search_with_workspace(&source, &mut workspace, SearchLimits::unlimited())
+                .unwrap();
+            let expected = terminal.then_some(MatchSpan::new(0, source.len()));
+            assert_eq!(first.into_output(), expected, "terminal={terminal}");
+            let retained = workspace
+                .lazy
+                .context_loop_skip_plan
+                .expect("a completed large Span must analyze its exact loop epoch");
+            assert_eq!(workspace.lazy.modes[usize::try_from(retained.state).unwrap()], 0);
+            assert_eq!(
+                workspace
+                    .lazy
+                    .exact_context_dependency_mask(retained.state)
+                    .unwrap(),
+                Some(0)
+            );
+            assert!(retained.scanner.contains(b'a'));
+            if terminal {
+                let hot = workspace.lazy.context.hot[usize::try_from(retained.state).unwrap()];
+                assert_eq!(hot.symbol & super::CONTEXT_SYMBOL_BYTE_MASK, u32::from(b'z'));
+                assert!(workspace.lazy.context.slots.iter().any(|slot| {
+                    slot.source == retained.state
+                        && slot.symbol & super::CONTEXT_SYMBOL_BYTE_MASK == u32::from(b'a')
+                        && super::context_cell_is_nonaccepting_self_loop(*slot)
+                }));
+            }
+
+            let middle = source.len() / 2;
+            source[middle] = b'b';
+            *source.last_mut().unwrap() = b'z';
+            assert_eq!(source.as_ptr(), address);
+            assert_eq!(
+                plan.prepare::<Span>()
+                    .search_with_workspace(&source, &mut workspace, SearchLimits::unlimited())
+                    .unwrap()
+                    .into_output(),
+                Some(MatchSpan::new(middle + 1, source.len()))
+            );
+        }
+    }
+
+    #[test]
+    fn loop_probe_backoff_bounds_short_runs_and_resets_after_state_change() {
+        let mut probe = super::LazyLoopProbe::default();
+        let end = super::LAZY_LOOP_SKIP_MIN_BYTES * 4;
+        let mut attempts = 0usize;
+        for position in 0..end {
+            if probe.is_ready(position) {
+                attempts += 1;
+                probe.observe(position, 0).unwrap();
+            }
+        }
+        assert_eq!(attempts, 4);
+
+        probe.left_plan_state();
+        assert!(probe.is_ready(1));
+        probe.observe(1, super::ASCII_WIDE_BYTES - 1).unwrap();
+        assert!(!probe.is_ready(1));
+        probe.observe(1, super::ASCII_WIDE_BYTES).unwrap();
+        assert!(probe.is_ready(1));
+    }
+
+    #[test]
+    fn contextual_dependency_masks_handle_cycles_overlap_and_finite_decline() {
+        let plan = contextual_dependency_cycle_with_overlap();
+        let root = EdgeKind::AssertHaystackStart.assertion_bit().unwrap();
+        let primary = EdgeKind::AssertLineEndLf.assertion_bit().unwrap()
+            | EdgeKind::AssertWordAscii.assertion_bit().unwrap();
+
+        let mut exact = dependency_workspace(&plan);
+        let mut exact_meter = WorkMeter::new(u64::MAX, 0);
+        super::try_learn_context_dependency_masks(&plan, &mut exact, &mut exact_meter).unwrap();
+        let exact_work = exact_meter.consumed;
+        assert!(exact_work > 0);
+        assert_eq!(exact.lazy.context.hot_initial.dependency_mask, root);
+        assert_eq!(exact.lazy.exact_context_dependency_mask(0).unwrap(), Some(primary));
+        assert_eq!(
+            exact.lazy.exact_context_dependency_mask(1).unwrap(),
+            Some(primary | root)
+        );
+        assert_eq!(exact.lazy.context_dependencies_analyzed, 2);
+        assert_eq!(exact.stack_len, 0);
+        assert!(exact.seen_at.iter().all(|&marker| marker == 0));
+
+        let mut exactly_bounded = dependency_workspace(&plan);
+        let mut exact_limit = WorkMeter::new(exact_work, 0);
+        super::try_learn_context_dependency_masks(
+            &plan,
+            &mut exactly_bounded,
+            &mut exact_limit,
+        )
+        .unwrap();
+        assert_eq!(exact_limit.consumed, exact_work);
+        assert_eq!(exactly_bounded.lazy.context_dependencies_analyzed, 2);
+
+        let mut one_below = dependency_workspace(&plan);
+        let mut refused = WorkMeter::new(exact_work.checked_sub(1).unwrap(), 0);
+        super::try_learn_context_dependency_masks(&plan, &mut one_below, &mut refused).unwrap();
+        assert!(one_below.lazy.context_dependencies_analyzed < 2);
+        assert_eq!(one_below.stack_len, 0);
+        assert!(one_below.seen_at.iter().all(|&marker| marker == 0));
+
+        let mut retry = WorkMeter::new(u64::MAX, 0);
+        super::try_learn_context_dependency_masks(&plan, &mut one_below, &mut retry).unwrap();
+        assert_eq!(one_below.lazy.context.hot_initial.dependency_mask, root);
+        assert_eq!(
+            one_below.lazy.exact_context_dependency_mask(0).unwrap(),
+            Some(primary)
+        );
+        assert_eq!(
+            one_below.lazy.exact_context_dependency_mask(1).unwrap(),
+            Some(primary | root)
+        );
+    }
+
+    #[test]
+    fn contextual_dependency_keys_coalesce_only_irrelevant_context() {
+        let plan = asserted_pending_a_greedy_any_star_z();
+        let mut workspace =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let mut haystack = vec![b'!'; 4_096];
+        haystack[0] = b'a';
+        haystack[1] = b'z';
+        assert_eq!(
+            plan.prepare::<Span>()
+                .search_with_workspace(&haystack, &mut workspace, SearchLimits::unlimited())
+                .unwrap()
+                .into_output(),
+            Some(MatchSpan::new(0, 2))
+        );
+        assert_eq!(
+            workspace.lazy.context_dependencies_analyzed,
+            workspace.lazy.state_len
+        );
+
+        let word = EdgeKind::AssertWordAscii.assertion_bit().unwrap()
+            | EdgeKind::AssertWordAsciiNegate.assertion_bit().unwrap();
+        let absolute = EdgeKind::AssertHaystackStart.assertion_bit().unwrap();
+        let dependencies = (0..workspace.lazy.state_len)
+            .find_map(|state| {
+                (workspace.lazy.modes[state] != 0
+                    && workspace.lazy.context.hot[state].dependency_mask & word == word)
+                    .then_some(workspace.lazy.context.hot[state].dependency_mask)
+            })
+            .expect("the repeated pending state must retain both word assertions");
+        assert_eq!(dependencies & absolute, 0, "pending states exclude the root");
+
+        let at_absolute_start = b"a";
+        let after_punctuation = b"!a";
+        let inside_word = b"aa";
+        let start_mask = super::enabled_assertion_mask_unmetered_for_dependencies(
+            &plan,
+            dependencies,
+            at_absolute_start,
+            0,
+        );
+        let punctuation_mask = super::enabled_assertion_mask_unmetered_for_dependencies(
+            &plan,
+            dependencies,
+            after_punctuation,
+            1,
+        );
+        let inside_mask = super::enabled_assertion_mask_unmetered_for_dependencies(
+            &plan,
+            dependencies,
+            inside_word,
+            1,
+        );
+        assert_eq!(start_mask, punctuation_mask);
+        assert_eq!(
+            super::contextual_symbol(u32::from(b'x'), start_mask),
+            super::contextual_symbol(u32::from(b'x'), punctuation_mask)
+        );
+        assert_ne!(punctuation_mask, inside_mask);
+        assert_ne!(
+            super::enabled_assertion_mask_unmetered(&plan, at_absolute_start, 0),
+            super::enabled_assertion_mask_unmetered(&plan, after_punctuation, 1),
+            "the coalesced contexts differ in a global but irrelevant root bit"
+        );
+    }
+
+    #[test]
+    fn zero_context_dependency_skips_all_classification_work() {
+        let plan = every_assertion();
+        let mut meter = WorkMeter::new(0, 0);
+        assert_eq!(
+            super::enabled_assertion_mask_for_dependencies(&plan, 0, b"a", 1, &mut meter)
+                .unwrap(),
+            0
+        );
+        assert_eq!(meter.consumed, 0);
+        assert_eq!(
+            super::enabled_assertion_mask_unmetered_for_dependencies(&plan, 0, b"a", 1),
+            0
+        );
+    }
+
+    #[test]
+    fn contextual_interior_product_matches_every_ascii_classifier_family() {
+        let all = every_assertion().boundary_context_classifier();
+        let families = [
+            all.absolute(),
+            all.configured_line(),
+            all.crlf_line(),
+            all.ascii_word(),
+            all.unicode_word(),
+        ];
+        let mut compared = 0usize;
+        for enabled_families in 0_u8..32 {
+            let dependencies = families
+                .into_iter()
+                .enumerate()
+                .filter(|(family, _)| enabled_families & (1 << family) != 0)
+                .fold(0_u32, |mask, (_, family)| mask | family);
+            let classifier = super::BoundaryContextClassifier::new(dependencies);
+            for line_terminator in [0, b'\r', b'\n', b';', 0x7f, 0xff] {
+                for left in u8::MIN..=0x7f {
+                    let reference = super::enabled_assertion_mask_unmetered_with_classifier(
+                        classifier,
+                        line_terminator,
+                        &[left, left],
+                        1,
+                    );
+                    for right in u8::MIN..=0x7f {
+                        if !super::context_interior_category_matches(
+                            classifier,
+                            line_terminator,
+                            left,
+                            right,
+                        ) {
+                            continue;
+                        }
+                        let actual = super::enabled_assertion_mask_unmetered_with_classifier(
+                            classifier,
+                            line_terminator,
+                            &[left, right],
+                            1,
+                        );
+                        assert_eq!(
+                            actual, reference,
+                            "families={enabled_families:05b} terminator={line_terminator} left={left} right={right}"
+                        );
+                        compared = compared.checked_add(1).unwrap();
+                    }
+                }
+            }
+        }
+        assert!(compared > 100_000);
+    }
+
+    #[test]
+    fn contextual_interior_product_matches_full_byte_nonunicode_families() {
+        let all = every_assertion().boundary_context_classifier();
+        let families = [
+            all.absolute(),
+            all.configured_line(),
+            all.crlf_line(),
+            all.ascii_word(),
+        ];
+        let mut compared = 0usize;
+        for enabled_families in 0_u8..16 {
+            let dependencies = families
+                .into_iter()
+                .enumerate()
+                .filter(|(family, _)| enabled_families & (1 << family) != 0)
+                .fold(0_u32, |mask, (_, family)| mask | family);
+            let classifier = super::BoundaryContextClassifier::new(dependencies);
+            for line_terminator in [0, b'\r', b'\n', b';', 0x7f, 0xff] {
+                for left in u8::MIN..=u8::MAX {
+                    let reference = super::enabled_assertion_mask_unmetered_with_classifier(
+                        classifier,
+                        line_terminator,
+                        &[left, left],
+                        1,
+                    );
+                    for right in u8::MIN..=u8::MAX {
+                        if !super::context_interior_category_matches(
+                            classifier,
+                            line_terminator,
+                            left,
+                            right,
+                        ) {
+                            continue;
+                        }
+                        let actual = super::enabled_assertion_mask_unmetered_with_classifier(
+                            classifier,
+                            line_terminator,
+                            &[left, right],
+                            1,
+                        );
+                        assert_eq!(
+                            actual, reference,
+                            "families={enabled_families:04b} terminator={line_terminator} left={left} right={right}"
+                        );
+                        compared = compared.checked_add(1).unwrap();
+                    }
+                }
+            }
+        }
+        assert!(compared > 1_000_000);
+    }
+
+    #[test]
+    fn contextual_loop_derivation_finds_interior_slot_behind_endpoint_hot_record() {
+        let plan = contextual_word_loop_then_terminal();
+        let mut workspace = contextual_word_loop_workspace(&plan);
+        assert_eq!(workspace.lazy.context.loop_candidates_published, 2);
+        let endpoint_hot = workspace.lazy.context.hot[0];
+        let endpoint_assertions = super::enabled_assertion_mask_unmetered_for_dependencies(
+            &plan,
+            endpoint_hot.dependency_mask,
+            b"a",
+            1,
+        );
+        assert_eq!(
+            endpoint_hot.symbol,
+            super::contextual_symbol(u32::from(b'a'), endpoint_assertions)
+        );
+
+        let mut derive = WorkMeter::new(u64::MAX, 0);
+        super::try_derive_context_lazy_loop_skip(&plan, &mut workspace, &mut derive).unwrap();
+        let retained = workspace
+            .lazy
+            .context_loop_skip_plan
+            .expect("the bounded slot walk must retain the earlier interior witness");
+        assert_eq!(retained.state, 0);
+        assert_eq!(retained.start_action, super::LazyStartAction::Propagate);
+        assert!(retained.leave_final_member);
+        assert!(retained.scanner.contains(b'a'));
+        assert_eq!(
+            workspace.lazy.context_loop_skip_analyzed_at_candidates,
+            workspace.lazy.context.loop_candidates_published
+        );
+
+        let analysis_work = derive.consumed;
+        let mut refused = contextual_word_loop_workspace(&plan);
+        let slots = refused.lazy.context.slots.clone();
+        let hot = refused.lazy.context.hot.clone();
+        let mut one_below = WorkMeter::new(analysis_work.checked_sub(1).unwrap(), 0);
+        super::try_derive_context_lazy_loop_skip(&plan, &mut refused, &mut one_below).unwrap();
+        assert!(refused.lazy.context_loop_skip_plan.is_none());
+        assert_ne!(
+            refused.lazy.context_loop_skip_analyzed_at_candidates,
+            refused.lazy.context.loop_candidates_published
+        );
+        assert_eq!(refused.lazy.context.slots, slots);
+        assert_eq!(refused.lazy.context.hot, hot);
+
+        let mut retry = WorkMeter::new(analysis_work, 0);
+        super::try_derive_context_lazy_loop_skip(&plan, &mut refused, &mut retry).unwrap();
+        assert!(refused.lazy.context_loop_skip_plan.is_some());
+        assert_eq!(retry.consumed, analysis_work);
+    }
+
+    #[test]
+    fn contextual_loop_derivation_rejects_mixed_and_reset_witnesses() {
+        let plan = contextual_word_loop_then_terminal();
+        let mut mixed = contextual_word_loop_workspace(&plan);
+        mixed.lazy.context.slots[0] = ContextTransitionSlot::EMPTY;
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        super::try_derive_context_lazy_loop_skip(&plan, &mut mixed, &mut meter).unwrap();
+        assert!(mixed.lazy.context_loop_skip_plan.is_none());
+
+        let mut reset = contextual_word_loop_workspace(&plan);
+        for slot in &mut reset.lazy.context.slots {
+            if slot.source == 0 {
+                slot.value = 1 | super::LazyStartAction::Reset.cell_bits();
+            }
+        }
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        super::try_derive_context_lazy_loop_skip(&plan, &mut reset, &mut meter).unwrap();
+        assert!(reset.lazy.context_loop_skip_plan.is_none());
+    }
+
+    #[test]
+    fn contextual_loop_derivation_admits_ascii_unicode_word_interiors_transactionally() {
+        let unicode = contextual_unicode_word_loop_then_terminal();
+        let mut unicode_workspace = contextual_word_loop_workspace(&unicode);
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        super::try_derive_context_lazy_loop_skip(
+            &unicode,
+            &mut unicode_workspace,
+            &mut meter,
+        )
+        .unwrap();
+        let loop_plan = unicode_workspace
+            .lazy
+            .context_loop_skip_plan
+            .expect("ASCII Unicode-word interiors must retain a loop scanner");
+        assert_eq!(loop_plan.state, 0);
+        assert_eq!(loop_plan.start_action, super::LazyStartAction::Propagate);
+        assert!(loop_plan.leave_final_member);
+        assert!(loop_plan.scanner.contains(b'a'));
+        assert!(!loop_plan.scanner.contains(b'_'));
+        assert_ne!(
+            unicode_workspace.lazy.context.hot[0].dependency_mask
+                & unicode.boundary_context_classifier().unicode_word(),
+            0
+        );
+
+        let analysis_work = meter.consumed;
+        let mut refused = contextual_word_loop_workspace(&unicode);
+        let slots = refused.lazy.context.slots.clone();
+        let hot = refused.lazy.context.hot.clone();
+        let mut one_below = WorkMeter::new(analysis_work.checked_sub(1).unwrap(), 0);
+        super::try_derive_context_lazy_loop_skip(&unicode, &mut refused, &mut one_below).unwrap();
+        assert!(refused.lazy.context_loop_skip_plan.is_none());
+        assert_ne!(
+            refused.lazy.context_loop_skip_analyzed_at_candidates,
+            refused.lazy.context.loop_candidates_published
+        );
+        assert_eq!(refused.lazy.context.slots, slots);
+        assert_eq!(refused.lazy.context.hot, hot);
+
+        let mut retry = WorkMeter::new(analysis_work, 0);
+        super::try_derive_context_lazy_loop_skip(&unicode, &mut refused, &mut retry).unwrap();
+        assert!(refused.lazy.context_loop_skip_plan.is_some());
+        assert_eq!(retry.consumed, analysis_work);
+    }
+
+    #[test]
+    fn unicode_context_loop_keeps_endpoint_and_nonascii_successors_scalar_after_mutation() {
+        let plan = anchored_unicode_negated_word_loop_then_terminals();
+        let run_len = super::LAZY_LOOP_SKIP_MIN_BYTES * 3;
+        let mut haystack = vec![b'a'; run_len + 4];
+        haystack[run_len..].copy_from_slice(b"z!!!");
+        let address = haystack.as_ptr();
+        let mut workspace =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+
+        let learned = plan
+            .prepare::<Span>()
+            .search_with_workspace(&haystack, &mut workspace, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(learned.output(), &Some(MatchSpan::new(0, run_len + 1)));
+        let loop_plan = workspace
+            .lazy
+            .context_loop_skip_plan
+            .expect("the warmed ASCII Unicode-word loop must retain a scanner");
+        assert!(loop_plan.leave_final_member);
+        assert!(loop_plan.scanner.contains(b'a'));
+        assert!(!loop_plan.scanner.contains(b'!'));
+
+        let mut run = |loop_skip| {
+            let mut meter = WorkMeter::new(u64::MAX, 0);
+            let mut adaptive = super::AdaptiveStartProbe::default();
+            let result = super::execute_context_lazy_loop(
+                &plan,
+                &haystack,
+                SearchWindow::full(&haystack),
+                &mut workspace,
+                &mut meter,
+                OutputContract::Span,
+                0,
+                None,
+                None,
+                None,
+                false,
+                false,
+                loop_skip,
+                &mut adaptive,
+            )
+            .unwrap()
+            .unwrap();
+            (result, meter.consumed)
+        };
+        let (skipped, skipped_work) = run(Some(loop_plan));
+        let (scalar, scalar_work) = run(None);
+        assert_eq!(skipped.0, scalar.0);
+        assert!(
+            skipped_work < scalar_work,
+            "the retained plan must execute the long interior through its run scanner"
+        );
+        drop(run);
+
+        let suffixes = [
+            [b'z', b'!', b'!', b'!'],
+            [b'!', b'z', b'!', b'!'],
+            [0xc3, 0xa9, b'z', b'!'],
+            [0xf0, 0x9f, 0x92, 0xa9],
+            [0xf0, 0x28, 0x8c, 0xbc],
+            [0xc3, b'z', b'!', b'!'],
+            [0x80, b'z', b'!', b'!'],
+        ];
+        for suffix in suffixes {
+            haystack[run_len..].copy_from_slice(&suffix);
+            assert_eq!(haystack.as_ptr(), address);
+            let mut reference = K0Workspace::new(&plan, WorkspaceLimits::unlimited()).unwrap();
+            let expected = plan
+                .prepare::<Span>()
+                .search_with_workspace(&haystack, &mut reference, SearchLimits::unlimited())
+                .unwrap()
+                .into_output();
+            let actual = plan
+                .prepare::<Span>()
+                .search_with_workspace(&haystack, &mut workspace, SearchLimits::unlimited())
+                .unwrap()
+                .into_output();
+            assert_eq!(
+                actual, expected,
+                "same-address Unicode successor mismatch suffix={suffix:?}"
+            );
+        }
+
+        let endpoint = &haystack[..run_len];
+        let mut reference = K0Workspace::new(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let expected = plan
+            .prepare::<Span>()
+            .search_with_workspace(endpoint, &mut reference, SearchLimits::unlimited())
+            .unwrap()
+            .into_output();
+        let actual = plan
+            .prepare::<Span>()
+            .search_with_workspace(endpoint, &mut workspace, SearchLimits::unlimited())
+            .unwrap()
+            .into_output();
+        assert_eq!(actual, expected, "the real haystack endpoint must remain scalar");
+
+        haystack[run_len..].copy_from_slice(&[0xf0, 0x9f, 0x92, 0xa9]);
+        let clipped = SearchWindow::new(0, run_len);
+        let mut reference = K0Workspace::new(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let expected = plan
+            .prepare::<Span>()
+            .search_window_with_workspace(
+                &haystack,
+                clipped,
+                &mut reference,
+                SearchLimits::unlimited(),
+            )
+            .unwrap()
+            .into_output();
+        let actual = plan
+            .prepare::<Span>()
+            .search_window_with_workspace(
+                &haystack,
+                clipped,
+                &mut workspace,
+                SearchLimits::unlimited(),
+            )
+            .unwrap()
+            .into_output();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn contextual_pending_loop_plan_handles_context_stable_interior_runs() {
+        let plan = absolute_a_greedy_any_star_z();
+        let mut workspace =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let mut haystack = vec![b'!'; 4_096];
+        haystack[0] = b'a';
+        haystack[1] = b'z';
+        let address = haystack.as_ptr();
+
+        let first = plan
+            .prepare::<Span>()
+            .search_with_workspace(&haystack, &mut workspace, SearchLimits::unlimited())
+            .unwrap();
+        let scalar_boundaries = first.accounting().boundaries();
+        assert_eq!(first.into_output(), Some(MatchSpan::new(0, 2)));
+        let loop_plan = workspace
+            .lazy
+            .context_loop_skip_plan
+            .expect("the assertion-free pending suffix must retain a contextual scanner");
+        assert_eq!(
+            workspace.lazy.context.hot_initial.dependency_mask,
+            EdgeKind::AssertHaystackStart.assertion_bit().unwrap()
+        );
+        assert_eq!(
+            workspace
+                .lazy
+                .exact_context_dependency_mask(loop_plan.state)
+                .unwrap(),
+            Some(0),
+            "pending continuation dependencies must exclude the asserted root"
+        );
+        assert!(loop_plan.scanner.contains(b'!'));
+        assert!(loop_plan.scanner.contains(b'b'));
+
+        let assertions = super::enabled_assertion_mask_unmetered(&plan, &haystack, 3);
+        let inferred_symbol = super::contextual_symbol(u32::from(b'b'), assertions);
+        assert_eq!(
+            workspace
+                .lazy
+                .context
+                .lookup_existing_prevalidated(loop_plan.state, inferred_symbol)
+                .unwrap(),
+            None,
+            "graph equivalence must not impersonate contextual publication"
+        );
+        let published = workspace.lazy.context.published;
+
+        haystack[2..].fill(b'b');
+        assert_eq!(address, haystack.as_ptr());
+        let second = plan
+            .prepare::<Span>()
+            .search_with_workspace(&haystack, &mut workspace, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(second.into_output(), Some(MatchSpan::new(0, 2)));
+        assert_eq!(workspace.lazy.context.published, published);
+        assert_eq!(
+            workspace
+                .lazy
+                .context
+                .lookup_existing_prevalidated(loop_plan.state, inferred_symbol)
+                .unwrap(),
+            None
+        );
+
+        let measured = plan
+            .prepare::<Span>()
+            .search_with_workspace(&haystack, &mut workspace, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(measured.into_output(), Some(MatchSpan::new(0, 2)));
+        assert_eq!(
+            measured.accounting().boundaries(),
+            scalar_boundaries,
+            "contextual bulk scanning must retain scalar boundary accounting"
+        );
+
+        // Contextual loop plans are deliberately unlimited-only. A finite
+        // report retains the original assertion and associative-lookup work.
+        let retained = workspace.retained_bytes();
+        let finite = SearchLimits {
+            max_work: u64::MAX - 1,
+            max_scratch_bytes: retained,
+        };
+        let finite_report = plan
+            .prepare::<Span>()
+            .search_with_workspace(&haystack, &mut workspace, finite)
+            .unwrap();
+        assert_eq!(finite_report.output(), &Some(MatchSpan::new(0, 2)));
+        assert_eq!(finite_report.accounting().boundaries(), scalar_boundaries);
+
+        let asserted = asserted_pending_a_greedy_any_star_z();
+        let mut asserted_workspace =
+            K0Workspace::new_bidirectional(&asserted, WorkspaceLimits::unlimited()).unwrap();
+        assert_eq!(
+            asserted
+                .prepare::<Span>()
+                .search_with_workspace(
+                    &haystack,
+                    &mut asserted_workspace,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output(),
+            Some(MatchSpan::new(0, 2))
+        );
+        let asserted_loop = asserted_workspace
+            .lazy
+            .context_loop_skip_plan
+            .expect("a context-stable interior must retain a loop scanner");
+        assert!(asserted_loop.leave_final_member);
+        assert!(asserted_loop.scanner.contains(b'b'));
+        assert!(!asserted_loop.scanner.contains(b'!'));
+        assert!(
+            asserted_workspace.lazy.context.hot[..asserted_workspace.lazy.state_len]
+                .iter()
+                .zip(&asserted_workspace.lazy.modes)
+                .any(|(hot, &pending)| pending != 0
+                    && hot.dependency_mask != super::CONTEXT_DEPENDENCY_UNCOMPUTED
+                    && hot.dependency_mask != 0),
+            "the asserted pending state must retain its contextual dependency"
+        );
+    }
+
+    #[test]
+    fn direct_drop_loop_skip_preserves_reverse_finite_limits_and_source_mutation() {
+        let plan = direct_drop_loop_then_terminal();
+        pin_without_start_filter(&plan);
+        let run_len = super::LAZY_LOOP_SKIP_MIN_BYTES * 3;
+        let mut haystack = vec![b'x'; run_len];
+        haystack.push(b'z');
+        let address = haystack.as_ptr();
+        let window = SearchWindow::full(&haystack);
+        let mut workspace =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+
+        assert_eq!(
+            plan.prepare::<SelectedEnd>()
+                .search_with_workspace(
+                    &haystack,
+                    &mut workspace,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output(),
+            Some(haystack.len())
+        );
+        let loop_plan = workspace
+            .lazy
+            .loop_skip_plan
+            .expect("the direct nonpending Drop self-loop must retain a scanner");
+        assert_eq!(loop_plan.start_action, super::LazyStartAction::Drop);
+        assert!(loop_plan.scanner.contains(b'x'));
+        assert!(!loop_plan.scanner.contains(b'z'));
+        assert!(!workspace.reverse.initialized);
+
+        let mut scalar_meter = WorkMeter::new(u64::MAX, 0);
+        let mut scalar_adaptive = super::AdaptiveStartProbe::default();
+        let scalar = super::execute_lazy_span_loop::<true, false>(
+            &plan,
+            &haystack,
+            window,
+            &mut workspace,
+            &mut scalar_meter,
+            OutputContract::Span,
+            0,
+            None,
+            None,
+            None,
+            &mut scalar_adaptive,
+            super::DirectLazyReady,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let mut skipped_meter = WorkMeter::new(u64::MAX, 0);
+        let mut skipped_adaptive = super::AdaptiveStartProbe::default();
+        let skipped = super::execute_lazy_span_loop::<true, true>(
+            &plan,
+            &haystack,
+            window,
+            &mut workspace,
+            &mut skipped_meter,
+            OutputContract::Span,
+            0,
+            None,
+            None,
+            None,
+            &mut skipped_adaptive,
+            super::DirectLazyReady,
+            Some(loop_plan),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(skipped.0, scalar.0);
+        assert_eq!(skipped.1, scalar.1);
+        assert!(!scalar.2);
+        assert!(!skipped.2, "Drop scanning must not invent start provenance");
+        assert_eq!(skipped_meter.consumed, scalar_meter.consumed);
+
+        assert_eq!(
+            plan.prepare::<Span>()
+                .search_with_workspace(
+                    &haystack,
+                    &mut workspace,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output(),
+            Some(MatchSpan::new(0, haystack.len()))
+        );
+        assert!(workspace.reverse.initialized);
+
+        let measured = plan
+            .prepare::<Span>()
+            .search_with_workspace(
+                &haystack,
+                &mut workspace,
+                SearchLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(measured.output(), &Some(MatchSpan::new(0, haystack.len())));
+        let exact_work = measured.accounting().work();
+        let retained = workspace.retained_bytes();
+        assert_eq!(
+            plan.prepare::<Span>()
+                .search_with_workspace(
+                    &haystack,
+                    &mut workspace,
+                    SearchLimits {
+                        max_work: exact_work,
+                        max_scratch_bytes: retained,
+                    },
+                )
+                .unwrap()
+                .into_output(),
+            Some(MatchSpan::new(0, haystack.len()))
+        );
+        assert!(matches!(
+            plan.prepare::<Span>().search_with_workspace(
+                &haystack,
+                &mut workspace,
+                SearchLimits {
+                    max_work: exact_work.checked_sub(1).unwrap(),
+                    max_scratch_bytes: retained,
+                },
+            ),
+            Err(SearchError::WorkLimitExceeded { limit, .. })
+                if limit == exact_work.checked_sub(1).unwrap()
+        ));
+
+        let reset_at = run_len / 2;
+        haystack[reset_at] = b'!';
+        assert_eq!(haystack.as_ptr(), address);
+        let mut reference = K0Workspace::new(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let expected = plan
+            .prepare::<Span>()
+            .search_with_workspace(
+                &haystack,
+                &mut reference,
+                SearchLimits::unlimited(),
+            )
+            .unwrap()
+            .into_output();
+        let actual = plan
+            .prepare::<Span>()
+            .search_with_workspace(
+                &haystack,
+                &mut workspace,
+                SearchLimits::unlimited(),
+            )
+            .unwrap()
+            .into_output();
+        assert_eq!(expected, Some(MatchSpan::new(reset_at + 1, haystack.len())));
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn contextual_drop_loop_skip_preserves_later_reverse_recovery() {
+        let plan = contextual_unicode_drop_loop_then_terminal();
+        let mut haystack = vec![b'x'; super::LAZY_LOOP_SKIP_MIN_BYTES * 3];
+        haystack.push(b'z');
+        let window = SearchWindow::full(&haystack);
+        let mut workspace =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        let mut adaptive = super::AdaptiveStartProbe::default();
+        let learned = super::execute_context_lazy_loop(
+            &plan,
+            &haystack,
+            window,
+            &mut workspace,
+            &mut meter,
+            OutputContract::Span,
+            0,
+            None,
+            None,
+            None,
+            false,
+            false,
+            None,
+            &mut adaptive,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(learned.0, Some(MatchSpan::new(0, haystack.len())));
+        assert!(!learned.2);
+        super::try_learn_context_dependency_masks(&plan, &mut workspace, &mut meter).unwrap();
+        super::try_derive_context_lazy_loop_skip(&plan, &mut workspace, &mut meter).unwrap();
+        let loop_plan = workspace
+            .lazy
+            .context_loop_skip_plan
+            .expect("the Unicode-dependent nonpending Drop self-loop must retain a scanner");
+        assert_eq!(loop_plan.start_action, super::LazyStartAction::Drop);
+        assert!(loop_plan.leave_final_member);
+        assert!(loop_plan.scanner.contains(b'x'));
+        assert_ne!(
+            workspace
+                .lazy
+                .exact_context_dependency_mask(loop_plan.state)
+                .unwrap()
+                .unwrap()
+                & plan.boundary_context_classifier().unicode_word(),
+            0
+        );
+        assert!(!workspace.reverse.initialized);
+
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        let mut adaptive = super::AdaptiveStartProbe::default();
+        let skipped = super::execute_context_lazy_loop(
+            &plan,
+            &haystack,
+            window,
+            &mut workspace,
+            &mut meter,
+            OutputContract::Span,
+            0,
+            None,
+            None,
+            None,
+            false,
+            false,
+            Some(loop_plan),
+            &mut adaptive,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(skipped.0, learned.0);
+        assert!(!skipped.2, "Drop scanning must not invent start provenance");
+
+        assert_eq!(
+            plan.prepare::<Span>()
+                .search_with_workspace(
+                    &haystack,
+                    &mut workspace,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output(),
+            Some(MatchSpan::new(0, haystack.len()))
+        );
+        assert!(workspace.reverse.initialized);
     }
 
     #[test]
@@ -21528,7 +27026,7 @@ mod tests {
         assert_eq!(report.output(), &Some(MatchSpan::new(2, 3)));
         assert!(report.accounting().work() <= span_limit);
         assert!(span.lazy.initialized);
-        assert!(span.reverse.initialized);
+        assert!(!span.reverse.initialized);
         assert_eq!(span.lazy.state_len, 0);
         assert_eq!(span.reverse.state_len, 0);
         assert_eq!(span.lazy.context.occupied_slots(), 0);
@@ -21973,6 +27471,313 @@ mod tests {
     }
 
     #[test]
+    fn direct_cache_uses_byte_classes_without_changing_the_physical_layout() {
+        let plan = byte_chain(&[(b'a', b'c')]);
+        pin_without_start_filter(&plan);
+        let layout = super::WorkspaceLayout::for_accelerated_automaton(&plan).unwrap();
+        let mut workspace =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        assert_eq!(super::BYTE_ALPHABET, 256);
+        assert_eq!(
+            workspace.lazy.rows.len(),
+            layout.lazy_state_capacity * super::BYTE_ALPHABET
+        );
+        assert_eq!(
+            super::direct_row_offset(1).unwrap() - super::direct_row_offset(0).unwrap(),
+            256
+        );
+
+        let class = byte_class(&plan, b'a');
+        assert_eq!(byte_class(&plan, b'b'), class);
+        assert_eq!(byte_class(&plan, b'c'), class);
+        let mut initialization = WorkMeter::new(u64::MAX, 0);
+        assert!(
+            super::prepare_lazy(&plan, &mut workspace, &mut initialization, 0, 0).unwrap()
+        );
+        let state = workspace.lazy.initial;
+        assert_eq!(
+            workspace.lazy.cell(state, class).unwrap(),
+            super::LAZY_CELL_UNFILLED
+        );
+
+        let published = workspace.lazy.direct_cells_published;
+        let mut first = WorkMeter::new(u64::MAX, 0);
+        let first_transition = super::build_lazy_cached_transition(
+            &plan,
+            state,
+            b'a',
+            class,
+            &mut workspace,
+            &mut first,
+            0,
+            0,
+        )
+        .unwrap();
+        let first_cell = match first_transition {
+            super::LazyTransition::Ready(cell) => cell,
+            super::LazyTransition::Inline { .. } => panic!("unlimited first miss must publish"),
+        };
+        assert!(first.consumed > 0);
+        assert_eq!(workspace.lazy.direct_cells_published, published + 1);
+
+        let mut second = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            super::build_lazy_cached_transition(
+                &plan,
+                state,
+                b'b',
+                class,
+                &mut workspace,
+                &mut second,
+                0,
+                0,
+            )
+            .unwrap(),
+            super::LazyTransition::Ready(first_cell)
+        );
+        assert_eq!(second.consumed, 0, "an equivalent-byte hit does no closure work");
+        assert_eq!(workspace.lazy.direct_cells_published, published + 1);
+
+        let mut source = vec![b'a'];
+        let address = source.as_ptr();
+        let _ = plan
+            .prepare::<SelectedEnd>()
+            .search_with_workspace(&source, &mut workspace, SearchLimits::unlimited())
+            .unwrap();
+        let warm_a = plan
+            .prepare::<SelectedEnd>()
+            .search_with_workspace(&source, &mut workspace, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(warm_a.output(), &Some(1));
+        let warm_work = warm_a.accounting().work();
+        source[0] = b'b';
+        assert_eq!(source.as_ptr(), address);
+        let warm_b = plan
+            .prepare::<SelectedEnd>()
+            .search_with_workspace(&source, &mut workspace, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(warm_b.output(), &Some(1));
+        assert_eq!(warm_b.accounting().work(), warm_work);
+
+        let retained = workspace.retained_bytes();
+        assert_eq!(
+            plan.prepare::<SelectedEnd>()
+                .search_with_workspace(
+                    &source,
+                    &mut workspace,
+                    SearchLimits {
+                        max_work: warm_work,
+                        max_scratch_bytes: retained,
+                    },
+                )
+                .unwrap()
+                .into_output(),
+            Some(1)
+        );
+        assert!(matches!(
+            plan.prepare::<SelectedEnd>().search_with_workspace(
+                &source,
+                &mut workspace,
+                SearchLimits {
+                    max_work: warm_work.checked_sub(1).unwrap(),
+                    max_scratch_bytes: retained,
+                },
+            ),
+            Err(SearchError::WorkLimitExceeded { limit, .. })
+                if limit == warm_work.checked_sub(1).unwrap()
+        ));
+        assert_eq!(
+            plan.accelerated_workspace_layout().unwrap(),
+            layout,
+            "cache-key normalization must not change the workspace contract"
+        );
+        assert_eq!(
+            workspace.lazy.rows.len(),
+            layout.lazy_state_capacity * super::BYTE_ALPHABET
+        );
+    }
+
+    #[test]
+    fn selected_end_reverse_recovery_reuses_an_equivalent_byte_cell() {
+        let plan = byte_chain(&[(b'a', b'c')]);
+        let layout = super::WorkspaceLayout::for_bidirectional_automaton(&plan).unwrap();
+        let mut workspace =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let class = byte_class(&plan, b'a');
+        assert_eq!(byte_class(&plan, b'b'), class);
+        let mut source = vec![b'a'];
+        let address = source.as_ptr();
+        let window = SearchWindow::full(&source);
+        let mut initialization = WorkMeter::new(u64::MAX, 0);
+        assert!(
+            super::prepare_reverse_lazy(&plan, &mut workspace, &mut initialization, 0, 0,)
+                .unwrap()
+        );
+        let state = workspace.reverse.initial;
+        assert_eq!(
+            workspace.reverse.cell(state, class).unwrap(),
+            super::LAZY_CELL_UNFILLED
+        );
+
+        let first = plan
+            .prepare::<Span>()
+            .recover_span_from_selected_end_with_workspace(
+                &source,
+                window,
+                &mut workspace,
+                1,
+                SearchLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(first.output(), &MatchSpan::new(0, 1));
+        let first_work = first.accounting().work();
+        let cell = workspace.reverse.cell(state, class).unwrap();
+        assert_ne!(cell, super::LAZY_CELL_UNFILLED);
+
+        source[0] = b'b';
+        assert_eq!(source.as_ptr(), address);
+        let second = plan
+            .prepare::<Span>()
+            .recover_span_from_selected_end_with_workspace(
+                &source,
+                SearchWindow::full(&source),
+                &mut workspace,
+                1,
+                SearchLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(second.output(), &MatchSpan::new(0, 1));
+        assert!(second.accounting().work() < first_work);
+        assert_eq!(workspace.reverse.cell(state, class).unwrap(), cell);
+        assert_eq!(
+            workspace.reverse.rows.len(),
+            layout.reverse_state_capacity * super::BYTE_ALPHABET
+        );
+        assert_eq!(plan.bidirectional_workspace_layout().unwrap(), layout);
+    }
+
+    #[test]
+    fn positive_end_verifier_reuses_an_equivalent_byte_cell() {
+        let plan = byte_chain(&[(b'a', b'c')]);
+        let class = byte_class(&plan, b'a');
+        assert_eq!(byte_class(&plan, b'b'), class);
+        let mut source = vec![b'a'];
+        let address = source.as_ptr();
+        let mut session =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true).unwrap();
+        let mut initialization = WorkMeter::new(u64::MAX, 0);
+        assert!(
+            super::prepare_reverse_lazy(
+                &plan,
+                &mut session.workspace,
+                &mut initialization,
+                0,
+                0,
+            )
+            .unwrap()
+        );
+        let state = session.workspace.reverse.initial;
+        assert_eq!(
+            session.workspace.reverse.cell(state, class).unwrap(),
+            super::LAZY_CELL_UNFILLED
+        );
+
+        let first = session
+            .try_positive_match_ending_at(
+                &source,
+                SearchWindow::full(&source),
+                1,
+                K0PositiveEndLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(first.outcome(), K0PositiveEndOutcome::Matched);
+        let first_work = first.receipt().work();
+        let cell = session.workspace.reverse.cell(state, class).unwrap();
+        assert_ne!(cell, super::LAZY_CELL_UNFILLED);
+
+        source[0] = b'b';
+        assert_eq!(source.as_ptr(), address);
+        let second = session
+            .try_positive_match_ending_at(
+                &source,
+                SearchWindow::full(&source),
+                1,
+                K0PositiveEndLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(second.outcome(), K0PositiveEndOutcome::Matched);
+        assert!(second.receipt().work() < first_work);
+        assert_eq!(session.workspace.reverse.cell(state, class).unwrap(), cell);
+
+        let exact_work = second.receipt().work();
+        let exact = session
+            .try_positive_match_ending_at(
+                &source,
+                SearchWindow::full(&source),
+                1,
+                K0PositiveEndLimits::new(exact_work, usize::MAX),
+            )
+            .unwrap();
+        assert_eq!(exact.outcome(), K0PositiveEndOutcome::Matched);
+        assert_eq!(exact.receipt().work(), exact_work);
+        let one_below = exact_work.checked_sub(1).unwrap();
+        let declined = session
+            .try_positive_match_ending_at(
+                &source,
+                SearchWindow::full(&source),
+                1,
+                K0PositiveEndLimits::new(one_below, usize::MAX),
+            )
+            .unwrap();
+        assert_eq!(declined.outcome(), K0PositiveEndOutcome::Declined);
+        assert_eq!(declined.receipt().work(), one_below);
+    }
+
+    #[test]
+    fn direct_cache_accepts_singleton_class_255() {
+        let bytes: Vec<_> = (u8::MIN..=u8::MAX).collect();
+        let plan = ascii_root_bytes(&bytes);
+        pin_without_start_filter(&plan);
+        assert_eq!(plan.byte_classes().count(), 256);
+        assert_eq!(byte_class(&plan, u8::MAX), u8::MAX);
+        let layout = super::WorkspaceLayout::for_accelerated_automaton(&plan).unwrap();
+        let mut workspace =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let mut initialization = WorkMeter::new(u64::MAX, 0);
+        assert!(
+            super::prepare_lazy(&plan, &mut workspace, &mut initialization, 0, 0).unwrap()
+        );
+        let state = workspace.lazy.initial;
+        let mut first = WorkMeter::new(u64::MAX, 0);
+        assert!(matches!(
+            super::build_lazy_cached_transition(
+                &plan,
+                state,
+                u8::MAX,
+                u8::MAX,
+                &mut workspace,
+                &mut first,
+                0,
+                0,
+            )
+            .unwrap(),
+            super::LazyTransition::Ready(cell) if cell & super::LAZY_CELL_ACCEPT != 0
+        ));
+        assert_ne!(
+            workspace.lazy.cell(state, u8::MAX).unwrap(),
+            super::LAZY_CELL_UNFILLED
+        );
+        assert_eq!(
+            workspace.lazy.cell(state, u8::MAX - 1).unwrap(),
+            super::LAZY_CELL_UNFILLED
+        );
+        assert_eq!(
+            workspace.lazy.rows.len(),
+            layout.lazy_state_capacity * super::BYTE_ALPHABET
+        );
+    }
+
+    #[test]
     fn bidirectional_span_layout_and_warm_limits_are_exact() {
         let plan = a_plus(true);
         let endpoint = plan.accelerated_workspace_layout().unwrap();
@@ -22086,8 +27891,9 @@ mod tests {
             super::prepare_reverse_lazy(&plan, &mut workspace, &mut initialization, 0, 0,).unwrap()
         );
         let state = workspace.reverse.initial;
+        let class = byte_class(&plan, b'a');
         assert_eq!(
-            workspace.reverse.cell(state, b'a').unwrap(),
+            workspace.reverse.cell(state, class).unwrap(),
             super::LAZY_CELL_UNFILLED
         );
 
@@ -22097,6 +27903,7 @@ mod tests {
                 &plan,
                 state,
                 b'a',
+                class,
                 &mut workspace,
                 &mut declined,
                 u64::MAX,
@@ -22107,7 +27914,7 @@ mod tests {
         ));
         assert!(!workspace.reverse.saturated);
         assert_eq!(
-            workspace.reverse.cell(state, b'a').unwrap(),
+            workspace.reverse.cell(state, class).unwrap(),
             super::LAZY_CELL_UNFILLED
         );
         let mut retry = WorkMeter::new(u64::MAX, 0);
@@ -22116,6 +27923,7 @@ mod tests {
                 &plan,
                 state,
                 b'a',
+                class,
                 &mut workspace,
                 &mut retry,
                 0,
@@ -22125,7 +27933,7 @@ mod tests {
             super::ReverseTransition::Ready(_)
         ));
         assert_ne!(
-            workspace.reverse.cell(state, b'a').unwrap(),
+            workspace.reverse.cell(state, class).unwrap(),
             super::LAZY_CELL_UNFILLED
         );
 
@@ -22263,8 +28071,9 @@ mod tests {
             .search_with_workspace(b"", &mut retryable, SearchLimits::unlimited())
             .unwrap();
         let initial = retryable.lazy.initial;
+        let class = byte_class(&plan, b'a');
         assert_eq!(
-            retryable.lazy.cell(initial, b'a').unwrap(),
+            retryable.lazy.cell(initial, class).unwrap(),
             super::LAZY_CELL_UNFILLED
         );
         let mut refused = WorkMeter::new(u64::MAX, 0);
@@ -22273,6 +28082,7 @@ mod tests {
                 &plan,
                 initial,
                 b'a',
+                class,
                 &mut retryable,
                 &mut refused,
                 u64::MAX,
@@ -22287,7 +28097,7 @@ mod tests {
         ));
         assert!(!retryable.lazy.saturated);
         assert_eq!(
-            retryable.lazy.cell(initial, b'a').unwrap(),
+            retryable.lazy.cell(initial, class).unwrap(),
             super::LAZY_CELL_UNFILLED
         );
         let mut retry = WorkMeter::new(u64::MAX, 0);
@@ -22296,6 +28106,7 @@ mod tests {
                 &plan,
                 initial,
                 b'a',
+                class,
                 &mut retryable,
                 &mut retry,
                 0,
@@ -22305,7 +28116,7 @@ mod tests {
             super::LazyTransition::Ready(_)
         ));
         assert_ne!(
-            retryable.lazy.cell(initial, b'a').unwrap(),
+            retryable.lazy.cell(initial, class).unwrap(),
             super::LAZY_CELL_UNFILLED
         );
     }
@@ -22452,10 +28263,11 @@ mod tests {
             Some(1)
         );
         let initial = workspace.lazy.initial;
-        let pending = workspace.lazy.cell(initial, b'a').unwrap() & super::LAZY_CELL_STATE_MASK;
+        let class = byte_class(&plan, b'a');
+        let pending = workspace.lazy.cell(initial, class).unwrap() & super::LAZY_CELL_STATE_MASK;
         let pending = super::direct_row_state(pending.checked_sub(1).unwrap());
         assert_eq!(
-            workspace.lazy.cell(pending, b'a').unwrap(),
+            workspace.lazy.cell(pending, class).unwrap(),
             super::LAZY_CELL_UNFILLED
         );
 
@@ -22476,7 +28288,7 @@ mod tests {
         );
         assert!(!workspace.lazy.saturated);
         assert_eq!(
-            workspace.lazy.cell(pending, b'a').unwrap(),
+            workspace.lazy.cell(pending, class).unwrap(),
             super::LAZY_CELL_UNFILLED,
             "a bound-certified call must decline optional learning"
         );
@@ -22489,7 +28301,7 @@ mod tests {
             Some(2)
         );
         assert_ne!(
-            workspace.lazy.cell(pending, b'a').unwrap(),
+            workspace.lazy.cell(pending, class).unwrap(),
             super::LAZY_CELL_UNFILLED,
             "a later call with surplus work must retry and publish the row"
         );
@@ -23092,6 +28904,7 @@ mod tests {
 
                         let optimistic = if plan.stats().assertion_edges() == 0 {
                             super::try_warm_proved_start_selected_end(
+                                plan,
                                 haystack,
                                 window,
                                 &session.workspace.lazy,
@@ -23150,6 +28963,7 @@ mod tests {
         );
         assert_eq!(
             super::try_warm_proved_start_selected_end(
+                &plan,
                 haystack,
                 window,
                 &session.workspace.lazy,
@@ -23183,10 +28997,11 @@ mod tests {
             super::direct_row_offset(session.workspace.lazy.initial).unwrap(),
         )
         .unwrap();
-        let first_cell = initial_row + usize::from(b'a');
+        let first_cell = initial_row + usize::from(byte_class(&plan, b'a'));
         session.workspace.lazy.rows[first_cell] = super::LAZY_CELL_UNFILLED;
         assert_eq!(
             super::try_warm_proved_start_selected_end(
+                &plan,
                 haystack,
                 window,
                 &session.workspace.lazy,
@@ -23365,6 +29180,7 @@ mod tests {
         let proof = plan.start_filter_proof.get().unwrap();
         assert_eq!(
             super::try_warm_direct_selected_end(
+                &plan,
                 haystack,
                 window,
                 &session.workspace.lazy,
@@ -23374,6 +29190,7 @@ mod tests {
         );
         assert_eq!(
             super::try_warm_direct_selected_end(
+                &plan,
                 absent,
                 absent_window,
                 &session.workspace.lazy,
@@ -23415,7 +29232,7 @@ mod tests {
             super::direct_row_offset(session.workspace.lazy.initial).unwrap(),
         )
         .unwrap();
-        let first_cell = initial_row + usize::from(b'A');
+        let first_cell = initial_row + usize::from(byte_class(&plan, b'A'));
         session.workspace.lazy.rows[first_cell] = super::LAZY_CELL_UNFILLED;
         assert_eq!(
             session
@@ -23750,6 +29567,137 @@ mod tests {
     }
 
     #[test]
+    fn absent_contextual_exists_learns_dependencies_without_a_loop_plan() {
+        let plan = asserted_line_a();
+        let mut source = vec![b'x'; super::WARM_CONTEXT_MIN_WINDOW_BYTES];
+        source[1] = b'a';
+        let window = SearchWindow::full(&source);
+        let mut session =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+
+        assert!(
+            !session
+                .search_window::<Exists>(&source, window, SearchLimits::unlimited())
+                .unwrap()
+                .into_output()
+        );
+        assert!(session.workspace.lazy.state_len > 0);
+        assert_eq!(
+            session.workspace.lazy.context_dependencies_analyzed,
+            session.workspace.lazy.state_len
+        );
+        assert_eq!(
+            session.workspace.lazy.context.hot_initial.dependency_mask,
+            EdgeKind::AssertLineStartLf.assertion_bit().unwrap()
+        );
+        assert!(session.workspace.lazy.context_loop_skip_plan.is_none());
+    }
+
+    #[test]
+    fn warm_context_exists_scans_inferred_raw_keys_read_only_after_same_address_mutation() {
+        let plan = contextual_split_loop_then_terminal();
+        pin_without_start_filter(&plan);
+        assert_ne!(byte_class(&plan, b'a'), byte_class(&plan, b'b'));
+        let run_end = super::LAZY_LOOP_SKIP_MIN_BYTES * 2;
+        let mut source = vec![b'!'; super::WARM_CONTEXT_MIN_WINDOW_BYTES];
+        source[..run_end].fill(b'a');
+        source[run_end] = b'z';
+        let address = source.as_ptr();
+        let window = SearchWindow::full(&source);
+        let mut session =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+
+        assert!(
+            session
+                .search_window::<Exists>(&source, window, SearchLimits::unlimited())
+                .unwrap()
+                .into_output()
+        );
+        let loop_plan = session
+            .workspace
+            .lazy
+            .context_loop_skip_plan
+            .expect("an assertion-independent contextual loop must retain a scanner");
+        assert_eq!(loop_plan.start_action, super::LazyStartAction::Propagate);
+        assert!(!loop_plan.leave_final_member);
+        assert!(loop_plan.scanner.contains(b'a'));
+        assert!(loop_plan.scanner.contains(b'b'));
+        assert_eq!(
+            session
+                .workspace
+                .lazy
+                .exact_context_dependency_mask(loop_plan.state)
+                .unwrap(),
+            Some(0)
+        );
+        let inferred_symbol = super::contextual_symbol(u32::from(b'b'), 0);
+        assert_eq!(
+            session
+                .workspace
+                .lazy
+                .context
+                .lookup_existing_prevalidated(loop_plan.state, inferred_symbol)
+                .unwrap(),
+            None,
+            "graph equivalence must not publish a raw contextual key"
+        );
+
+        let generation = session.workspace.generation;
+        let current_len = session.workspace.current_len;
+        let roots_len = session.workspace.roots_len;
+        let stack_len = session.workspace.stack_len;
+        let frontier_len = session.workspace.lazy.frontier_len;
+        let rows = session.workspace.lazy.rows.clone();
+        let offsets = session.workspace.lazy.offsets.clone();
+        let lengths = session.workspace.lazy.lengths.clone();
+        let items = session.workspace.lazy.items.clone();
+        let modes = session.workspace.lazy.modes.clone();
+        let slots = session.workspace.lazy.context.slots.clone();
+        let hot = session.workspace.lazy.context.hot.clone();
+        let hot_initial = session.workspace.lazy.context.hot_initial;
+        let published = session.workspace.lazy.context.published;
+        let dependencies_analyzed = session.workspace.lazy.context_dependencies_analyzed;
+
+        source[..run_end].fill(b'b');
+        assert_eq!(source.as_ptr(), address);
+        assert!(
+            session
+                .search_exists_value(&source, window, SearchLimits::unlimited())
+                .unwrap()
+        );
+        assert_eq!(session.workspace.generation, generation);
+        assert_eq!(session.workspace.current_len, current_len);
+        assert_eq!(session.workspace.roots_len, roots_len);
+        assert_eq!(session.workspace.stack_len, stack_len);
+        assert_eq!(session.workspace.lazy.frontier_len, frontier_len);
+        assert_eq!(session.workspace.lazy.rows, rows);
+        assert_eq!(session.workspace.lazy.offsets, offsets);
+        assert_eq!(session.workspace.lazy.lengths, lengths);
+        assert_eq!(session.workspace.lazy.items, items);
+        assert_eq!(session.workspace.lazy.modes, modes);
+        assert_eq!(session.workspace.lazy.context.slots, slots);
+        assert_eq!(session.workspace.lazy.context.hot, hot);
+        assert_eq!(session.workspace.lazy.context.hot_initial, hot_initial);
+        assert_eq!(session.workspace.lazy.context.published, published);
+        assert_eq!(
+            session.workspace.lazy.context_dependencies_analyzed,
+            dependencies_analyzed
+        );
+        assert_eq!(
+            session
+                .workspace
+                .lazy
+                .context
+                .lookup_existing_prevalidated(loop_plan.state, inferred_symbol)
+                .unwrap(),
+            None,
+            "warm projection must keep the inferred raw key physically absent"
+        );
+    }
+
+    #[test]
     fn warm_value_span_preserves_unlimited_work_overflow() {
         let meter = WorkMeter::new(u64::MAX, u64::MAX);
         assert!(matches!(
@@ -23782,7 +29730,9 @@ mod tests {
             super::direct_row_offset(forward.workspace.lazy.initial).unwrap(),
         )
         .unwrap();
-        let forward_cell = forward_row.checked_add(usize::from(b'a')).unwrap();
+        let forward_cell = forward_row
+            .checked_add(usize::from(byte_class(&plan, b'a')))
+            .unwrap();
         assert_ne!(
             forward.workspace.lazy.rows[forward_cell],
             super::LAZY_CELL_UNFILLED
@@ -23830,7 +29780,9 @@ mod tests {
             super::direct_row_offset(reverse.workspace.reverse.initial).unwrap(),
         )
         .unwrap();
-        let reverse_cell = reverse_row.checked_add(usize::from(b'b')).unwrap();
+        let reverse_cell = reverse_row
+            .checked_add(usize::from(byte_class(&plan, b'b')))
+            .unwrap();
         assert_ne!(
             reverse.workspace.reverse.rows[reverse_cell],
             super::LAZY_CELL_UNFILLED
@@ -23966,6 +29918,220 @@ mod tests {
     }
 
     #[test]
+    fn warm_context_exists_preserves_ascii_unicode_high_and_drop_loop_categories() {
+        fn exercise_context_category(
+            name: &str,
+            plan: &Automaton,
+            member: u8,
+            expected_action: super::LazyStartAction,
+        ) {
+            pin_without_start_filter(plan);
+            let run_end = super::LAZY_LOOP_SKIP_MIN_BYTES * 2;
+            let mut source = vec![b'!'; super::WARM_CONTEXT_MIN_WINDOW_BYTES];
+            source[..run_end].fill(member);
+            source[run_end] = b'z';
+            let window = SearchWindow::full(&source);
+            let mut session =
+                K0SearchSession::new_selected(plan, WorkspaceLimits::unlimited(), true, true)
+                    .unwrap();
+            assert!(
+                session
+                    .search_window::<Exists>(&source, window, SearchLimits::unlimited())
+                    .unwrap()
+                    .into_output()
+            );
+            let loop_plan = session
+                .workspace
+                .lazy
+                .context_loop_skip_plan
+                .expect("the contextual category must retain its interior loop proof");
+            assert_eq!(loop_plan.start_action, expected_action);
+            assert!(loop_plan.leave_final_member);
+            assert!(loop_plan.scanner.contains(member));
+            assert!(!session.workspace.lazy.declined, "{name} declined");
+            assert!(!session.workspace.lazy.saturated, "{name} saturated");
+            let dependencies = session
+                .workspace
+                .lazy
+                .exact_context_dependency_mask(loop_plan.state)
+                .unwrap()
+                .unwrap();
+            let final_assertions = super::enabled_assertion_mask_unmetered_for_dependencies(
+                plan,
+                dependencies,
+                &source,
+                run_end,
+            );
+            let final_symbol = super::contextual_symbol(u32::from(member), final_assertions);
+            let final_cell = session
+                .workspace
+                .lazy
+                .context
+                .lookup_existing_prevalidated(loop_plan.state, final_symbol)
+                .unwrap()
+                .expect("final member record");
+            assert_eq!(
+                super::context_nonaccepting_self_loop_action(loop_plan.state, final_cell),
+                Some(expected_action),
+                "{name} final member action"
+            );
+            let terminal_assertions = super::enabled_assertion_mask_unmetered_for_dependencies(
+                plan,
+                dependencies,
+                &source,
+                run_end + 1,
+            );
+            let terminal_symbol =
+                super::contextual_symbol(u32::from(b'z'), terminal_assertions);
+            let terminal_cell = session
+                .workspace
+                .lazy
+                .context
+                .lookup_existing_prevalidated(loop_plan.state, terminal_symbol)
+                .unwrap()
+                .expect("terminal record");
+            assert_ne!(
+                terminal_cell & super::LAZY_CELL_ACCEPT,
+                0,
+                "{name} terminal acceptance"
+            );
+            let global_dependencies = plan.boundary_context_classifier().assertions();
+            let root_dependencies = session
+                .workspace
+                .lazy
+                .context_root_dependency_mask(global_dependencies);
+            assert_eq!(
+                super::warm_context_initial_state_for_dependencies(
+                    plan,
+                    &source,
+                    0,
+                    &session.workspace.lazy,
+                    root_dependencies,
+                    global_dependencies,
+                )
+                .unwrap(),
+                Some(loop_plan.state),
+                "{name} initial state"
+            );
+
+            let generation = session.workspace.generation;
+            let slots = session.workspace.lazy.context.slots.clone();
+            let hot = session.workspace.lazy.context.hot.clone();
+            let hot_initial = session.workspace.lazy.context.hot_initial;
+            let published = session.workspace.lazy.context.published;
+            let proof = plan.start_filter_proof.get().unwrap();
+            assert_eq!(
+                super::try_warm_context_exists(
+                    plan,
+                    &source,
+                    window,
+                    &session.workspace.lazy,
+                    proof,
+                ),
+                Ok(Some(true)),
+                "{name} warm projection"
+            );
+            assert_eq!(session.workspace.generation, generation);
+            assert_eq!(session.workspace.lazy.context.slots, slots);
+            assert_eq!(session.workspace.lazy.context.hot, hot);
+            assert_eq!(session.workspace.lazy.context.hot_initial, hot_initial);
+            assert_eq!(session.workspace.lazy.context.published, published);
+        }
+
+        exercise_context_category(
+            "ASCII word",
+            &contextual_word_loop_then_terminal(),
+            b'a',
+            super::LazyStartAction::Propagate,
+        );
+        exercise_context_category(
+            "Unicode word",
+            &contextual_unicode_word_loop_then_terminal(),
+            b'a',
+            super::LazyStartAction::Propagate,
+        );
+        exercise_context_category(
+            "Unicode Drop",
+            &contextual_unicode_drop_loop_then_terminal(),
+            b'x',
+            super::LazyStartAction::Drop,
+        );
+
+        let high = contextual_high_loop_then_terminal(false);
+        pin_without_start_filter(&high);
+        let run_end = super::LAZY_LOOP_SKIP_MIN_BYTES * 2;
+        let mut source = vec![b'!'; super::WARM_CONTEXT_MIN_WINDOW_BYTES];
+        source[..run_end].fill(0x80);
+        source[run_end] = b'z';
+        let address = source.as_ptr();
+        let window = SearchWindow::full(&source);
+        let mut session =
+            K0SearchSession::new_selected(&high, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+        assert!(
+            session
+                .search_window::<Exists>(&source, window, SearchLimits::unlimited())
+                .unwrap()
+                .into_output()
+        );
+        let loop_plan = session
+            .workspace
+            .lazy
+            .context_loop_skip_plan
+            .expect("the high-byte ASCII-context category must retain a loop proof");
+        assert_eq!(loop_plan.start_action, super::LazyStartAction::Propagate);
+        assert!(loop_plan.leave_final_member);
+        assert!(loop_plan.scanner.contains(0x80));
+        assert!(loop_plan.scanner.contains(0xff));
+        let dependencies = session
+            .workspace
+            .lazy
+            .exact_context_dependency_mask(loop_plan.state)
+            .unwrap()
+            .unwrap();
+        let inferred_assertions = super::enabled_assertion_mask_unmetered_for_dependencies(
+            &high,
+            dependencies,
+            &[0xff, 0xff],
+            1,
+        );
+        let inferred_symbol = super::contextual_symbol(0xff, inferred_assertions);
+        assert_eq!(
+            session
+                .workspace
+                .lazy
+                .context
+                .lookup_existing_prevalidated(loop_plan.state, inferred_symbol)
+                .unwrap(),
+            None
+        );
+        let slots = session.workspace.lazy.context.slots.clone();
+        let hot = session.workspace.lazy.context.hot.clone();
+        let published = session.workspace.lazy.context.published;
+
+        source[..run_end - 1].fill(0xff);
+        assert_eq!(source.as_ptr(), address);
+        assert!(
+            session
+                .search_exists_value(&source, window, SearchLimits::unlimited())
+                .unwrap()
+        );
+        assert_eq!(session.workspace.lazy.context.slots, slots);
+        assert_eq!(session.workspace.lazy.context.hot, hot);
+        assert_eq!(session.workspace.lazy.context.published, published);
+        assert_eq!(
+            session
+                .workspace
+                .lazy
+                .context
+                .lookup_existing_prevalidated(loop_plan.state, inferred_symbol)
+                .unwrap(),
+            None,
+            "the high-byte scanner must leave its inferred raw record absent"
+        );
+    }
+
+    #[test]
     fn value_span_cold_finite_contextual_and_error_paths_remain_ordinary() {
         let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b')]);
         let haystack = b"zzabzz";
@@ -24052,6 +30218,201 @@ mod tests {
     }
 
     #[test]
+    fn warm_context_exists_is_bounded_read_only_and_source_context_bound() {
+        let plan = asserted_line_a();
+        let mut source = vec![b'x'; super::WARM_CONTEXT_MIN_WINDOW_BYTES];
+        source[0] = b'a';
+        let window = SearchWindow::full(&source);
+        let mut session =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+
+        assert!(
+            session
+                .search_window::<Exists>(&source, window, SearchLimits::unlimited())
+                .unwrap()
+                .into_output()
+        );
+        assert_eq!(
+            session.workspace.lazy.context_dependencies_analyzed,
+            session.workspace.lazy.state_len
+        );
+        let proof = plan.start_filter_proof.get().unwrap();
+        assert_eq!(
+            super::try_warm_context_exists(
+                &plan,
+                &source,
+                window,
+                &session.workspace.lazy,
+                proof,
+            ),
+            Ok(Some(true)),
+        );
+
+        let generation = session.workspace.generation;
+        let current_len = session.workspace.current_len;
+        let roots_len = session.workspace.roots_len;
+        let stack_len = session.workspace.stack_len;
+        let frontier_len = session.workspace.lazy.frontier_len;
+        let rows = session.workspace.lazy.rows.clone();
+        let offsets = session.workspace.lazy.offsets.clone();
+        let lengths = session.workspace.lazy.lengths.clone();
+        let items = session.workspace.lazy.items.clone();
+        let modes = session.workspace.lazy.modes.clone();
+        let slots = session.workspace.lazy.context.slots.clone();
+        let hot = session.workspace.lazy.context.hot.clone();
+        let hot_initial = session.workspace.lazy.context.hot_initial;
+        let dependencies_analyzed = session.workspace.lazy.context_dependencies_analyzed;
+        assert!(
+            session
+                .search_exists_value(&source, window, SearchLimits::unlimited())
+                .unwrap()
+        );
+        assert_eq!(session.workspace.generation, generation);
+        assert_eq!(session.workspace.current_len, current_len);
+        assert_eq!(session.workspace.roots_len, roots_len);
+        assert_eq!(session.workspace.stack_len, stack_len);
+        assert_eq!(session.workspace.lazy.frontier_len, frontier_len);
+        assert_eq!(session.workspace.lazy.rows, rows);
+        assert_eq!(session.workspace.lazy.offsets, offsets);
+        assert_eq!(session.workspace.lazy.lengths, lengths);
+        assert_eq!(session.workspace.lazy.items, items);
+        assert_eq!(session.workspace.lazy.modes, modes);
+        assert_eq!(session.workspace.lazy.context.slots, slots);
+        assert_eq!(session.workspace.lazy.context.hot, hot);
+        assert_eq!(session.workspace.lazy.context.hot_initial, hot_initial);
+        assert_eq!(
+            session.workspace.lazy.context_dependencies_analyzed,
+            dependencies_analyzed
+        );
+
+        // Removing one already-published transition makes the speculative
+        // read decline. Ordinary execution restarts from the original window,
+        // returns the same answer, and may then republish the missing record.
+        let transition_slot = session
+            .workspace
+            .lazy
+            .context
+            .slots
+            .iter()
+            .position(|slot| {
+                slot.source != super::CONTEXT_EMPTY_SOURCE
+                    && slot.source != CONTEXT_INITIAL_SOURCE
+            })
+            .unwrap();
+        let retained = session.workspace.lazy.context.slots[transition_slot];
+        let hot_source = usize::try_from(retained.source).unwrap();
+        let retained_hot = session.workspace.lazy.context.hot[hot_source];
+        session.workspace.lazy.context.slots[transition_slot] = ContextTransitionSlot::EMPTY;
+        let mut empty_hot = super::ContextHotTransition::EMPTY;
+        empty_hot.dependency_mask = retained_hot.dependency_mask;
+        session.workspace.lazy.context.hot[hot_source] = empty_hot;
+        assert_eq!(
+            super::try_warm_context_exists(
+                &plan,
+                &source,
+                window,
+                &session.workspace.lazy,
+                proof,
+            ),
+            Ok(None),
+        );
+        assert!(
+            session
+                .search_exists_value(&source, window, SearchLimits::unlimited())
+                .unwrap()
+        );
+        assert_eq!(
+            session.workspace.lazy.context.slots[transition_slot],
+            retained
+        );
+        assert_eq!(session.workspace.lazy.context.hot[hot_source], retained_hot);
+
+        // Keep the same allocation and candidate byte while changing only its
+        // left boundary. A novel assertion mask must miss transactionally;
+        // restoring a real line boundary may reuse only the matching record.
+        source[0] = b'x';
+        source[1] = b'a';
+        assert_eq!(
+            super::try_warm_context_exists(
+                &plan,
+                &source,
+                window,
+                &session.workspace.lazy,
+                proof,
+            ),
+            Ok(None),
+        );
+        assert!(
+            !session
+                .search_exists_value(&source, window, SearchLimits::unlimited())
+                .unwrap()
+        );
+        source[0] = b'\n';
+        assert_eq!(
+            super::try_warm_context_exists(
+                &plan,
+                &source,
+                window,
+                &session.workspace.lazy,
+                proof,
+            ),
+            Ok(Some(true)),
+        );
+
+        // A candidate beyond the private scanner allowance cannot cause an
+        // unbounded prefix replay. The warm attempt is read-only and ordinary
+        // execution still finds the later line start from the original range.
+        source.fill(b'x');
+        let far = usize::try_from(super::WARM_CONTEXT_SPECULATION_WORK)
+            .unwrap()
+            .checked_add(1)
+            .unwrap();
+        source[far - 1] = b'\n';
+        source[far] = b'a';
+        let bounded_generation = session.workspace.generation;
+        let bounded_slots = session.workspace.lazy.context.slots.clone();
+        let bounded_hot = session.workspace.lazy.context.hot.clone();
+        let bounded_hot_initial = session.workspace.lazy.context.hot_initial;
+        let bounded_dependencies = session.workspace.lazy.context_dependencies_analyzed;
+        assert_eq!(
+            super::try_warm_context_exists(
+                &plan,
+                &source,
+                window,
+                &session.workspace.lazy,
+                proof,
+            ),
+            Ok(None),
+        );
+        assert_eq!(session.workspace.generation, bounded_generation);
+        assert_eq!(session.workspace.lazy.context.slots, bounded_slots);
+        assert_eq!(session.workspace.lazy.context.hot, bounded_hot);
+        assert_eq!(session.workspace.lazy.context.hot_initial, bounded_hot_initial);
+        assert_eq!(
+            session.workspace.lazy.context_dependencies_analyzed,
+            bounded_dependencies
+        );
+        assert!(
+            session
+                .search_exists_value(&source, window, SearchLimits::unlimited())
+                .unwrap()
+        );
+
+        let short = SearchWindow::new(0, super::WARM_CONTEXT_MIN_WINDOW_BYTES - 1);
+        assert_eq!(
+            super::try_warm_context_exists(
+                &plan,
+                &source,
+                short,
+                &session.workspace.lazy,
+                proof,
+            ),
+            Ok(None),
+        );
+    }
+
+    #[test]
     fn scanner_selected_warm_exists_hit_is_read_only_and_finite_calls_fall_back() {
         let plan = byte_chain(&[
             (b'A', b'Z'),
@@ -24072,7 +30433,13 @@ mod tests {
         );
         let proof = plan.start_filter_proof.get().unwrap();
         assert_eq!(
-            super::try_warm_direct_exists(haystack, window, &session.workspace.lazy, proof),
+            super::try_warm_direct_exists(
+                &plan,
+                haystack,
+                window,
+                &session.workspace.lazy,
+                proof,
+            ),
             Ok(Some(true)),
         );
 
@@ -24098,7 +30465,7 @@ mod tests {
             super::direct_row_offset(session.workspace.lazy.initial).unwrap(),
         )
         .unwrap();
-        let first_cell = initial_row + usize::from(b'A');
+        let first_cell = initial_row + usize::from(byte_class(&plan, b'A'));
         session.workspace.lazy.rows[first_cell] = super::LAZY_CELL_UNFILLED;
         assert!(
             session
@@ -24343,6 +30710,7 @@ mod tests {
         let proof = plan.start_filter_proof.get().unwrap();
         assert_eq!(
             super::try_warm_direct_exists(
+                &plan,
                 &long_at_start,
                 SearchWindow::full(&long_at_start),
                 &session.workspace.lazy,
@@ -24385,6 +30753,7 @@ mod tests {
         ));
         assert_eq!(
             super::try_warm_direct_exists(
+                &plan,
                 &late,
                 SearchWindow::full(&late),
                 &session.workspace.lazy,
@@ -24422,6 +30791,7 @@ mod tests {
         );
         assert_eq!(
             super::try_warm_direct_exists(
+                &plan,
                 &absent,
                 SearchWindow::full(&absent),
                 &absent_session.workspace.lazy,
@@ -24513,7 +30883,13 @@ mod tests {
         assert!(session.workspace.lazy.saturated);
         let proof = plan.start_filter_proof.get().unwrap();
         assert_eq!(
-            super::try_warm_direct_exists(&source, window, &session.workspace.lazy, proof),
+            super::try_warm_direct_exists(
+                &plan,
+                &source,
+                window,
+                &session.workspace.lazy,
+                proof,
+            ),
             Ok(None),
         );
         assert!(
@@ -25250,6 +31626,185 @@ mod tests {
                 ),
             Err(SearchError::InvalidResumeState { .. })
         ));
+    }
+
+    #[test]
+    fn positive_end_verifier_authenticates_arbitrary_endpoints() {
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b')]);
+        let haystack = b"abxxab";
+        let window = SearchWindow::full(haystack);
+        let mut session =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true).unwrap();
+
+        let later = session
+            .try_positive_match_ending_at(
+                haystack,
+                window,
+                haystack.len(),
+                K0PositiveEndLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(later.outcome(), K0PositiveEndOutcome::Matched);
+        assert_eq!(later.receipt().reverse_source_bytes(), 2);
+        assert!(later.receipt().work() >= 2);
+
+        let rejected = session
+            .try_positive_match_ending_at(haystack, window, 3, K0PositiveEndLimits::unlimited())
+            .unwrap();
+        assert_eq!(rejected.outcome(), K0PositiveEndOutcome::Rejected);
+        assert_eq!(rejected.receipt().reverse_source_bytes(), 1);
+
+        let clipped = session
+            .try_positive_match_ending_at(
+                haystack,
+                SearchWindow::new(3, haystack.len()),
+                haystack.len(),
+                K0PositiveEndLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(clipped.outcome(), K0PositiveEndOutcome::Matched);
+        let clipped_before_start = session
+            .try_positive_match_ending_at(
+                haystack,
+                SearchWindow::new(5, haystack.len()),
+                haystack.len(),
+                K0PositiveEndLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(
+            clipped_before_start.outcome(),
+            K0PositiveEndOutcome::Rejected
+        );
+
+        let zero = session
+            .try_positive_match_ending_at(haystack, window, 0, K0PositiveEndLimits::unlimited())
+            .unwrap();
+        assert_eq!(zero.outcome(), K0PositiveEndOutcome::Rejected);
+        assert_eq!(zero.receipt().work(), 0);
+        assert_eq!(zero.receipt().reverse_source_bytes(), 0);
+        for input_bytes in [0, haystack.len(), usize::MAX] {
+            assert_eq!(
+                session.negative_terminal_has_reused_work_certificate(input_bytes),
+                plan.conservative_reused_work_bound(input_bytes).is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn positive_end_verifier_caps_are_exact_and_later_calls_remain_sound() {
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b')]);
+        let haystack = b"zzab";
+        let window = SearchWindow::full(haystack);
+        let mut session =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true).unwrap();
+
+        let byte_decline = session
+            .try_positive_match_ending_at(
+                haystack,
+                window,
+                haystack.len(),
+                K0PositiveEndLimits::new(u64::MAX, 1),
+            )
+            .unwrap();
+        assert_eq!(byte_decline.outcome(), K0PositiveEndOutcome::Declined);
+        assert_eq!(byte_decline.receipt().reverse_source_bytes(), 1);
+        assert!(session
+            .search::<Exists>(haystack, SearchLimits::unlimited())
+            .unwrap()
+            .into_output());
+
+        let exact_bytes = session
+            .try_positive_match_ending_at(
+                haystack,
+                window,
+                haystack.len(),
+                K0PositiveEndLimits::new(u64::MAX, 2),
+            )
+            .unwrap();
+        assert_eq!(exact_bytes.outcome(), K0PositiveEndOutcome::Matched);
+        assert_eq!(exact_bytes.receipt().reverse_source_bytes(), 2);
+        let warm = session
+            .try_positive_match_ending_at(
+                haystack,
+                window,
+                haystack.len(),
+                K0PositiveEndLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(warm.outcome(), K0PositiveEndOutcome::Matched);
+        let one_below = warm.receipt().work().checked_sub(1).unwrap();
+        let work_decline = session
+            .try_positive_match_ending_at(
+                haystack,
+                window,
+                haystack.len(),
+                K0PositiveEndLimits::new(one_below, usize::MAX),
+            )
+            .unwrap();
+        assert_eq!(work_decline.outcome(), K0PositiveEndOutcome::Declined);
+        assert_eq!(work_decline.receipt().work(), one_below);
+        assert_eq!(work_decline.receipt().reverse_source_bytes(), 1);
+        let exact = session
+            .try_positive_match_ending_at(
+                haystack,
+                window,
+                haystack.len(),
+                K0PositiveEndLimits::new(warm.receipt().work(), usize::MAX),
+            )
+            .unwrap();
+        assert_eq!(exact.outcome(), K0PositiveEndOutcome::Matched);
+        assert_eq!(exact.receipt(), warm.receipt());
+    }
+
+    #[test]
+    fn positive_end_verifier_declines_only_optional_tiers_and_authenticates_assertions() {
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b')]);
+        let mut forward_only =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, false).unwrap();
+        let absent = forward_only
+            .try_positive_match_ending_at(
+                b"ab",
+                SearchWindow::new(0, 2),
+                2,
+                K0PositiveEndLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(absent.outcome(), K0PositiveEndOutcome::Declined);
+        assert_eq!(absent.receipt().work(), 0);
+
+        let asserted = byte_class_then_range(
+            &[b'a'],
+            (b'b', b'b'),
+            Some(EdgeKind::AssertHaystackStart),
+        );
+        let mut asserted_session = K0SearchSession::new_selected(
+            &asserted,
+            WorkspaceLimits::unlimited(),
+            true,
+            true,
+        )
+        .unwrap();
+        let asserted_match = asserted_session
+            .try_positive_match_ending_at(
+                b"ab",
+                SearchWindow::new(0, 2),
+                2,
+                K0PositiveEndLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(asserted_match.outcome(), K0PositiveEndOutcome::Matched);
+        let asserted_reject = asserted_session
+            .try_positive_match_ending_at(
+                b"xab",
+                SearchWindow::new(0, 3),
+                3,
+                K0PositiveEndLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(
+            asserted_reject.outcome(),
+            K0PositiveEndOutcome::Rejected
+        );
     }
 
     #[test]

@@ -17,6 +17,7 @@ pub const CAPTURE_REQUIRED_LITERAL_PLAN_ID: &str = "fre.capture.required-any-lit
 
 const MAX_INLINE_NEEDLES: usize = 64;
 const NEEDLE_OFFSET_SLOTS: usize = MAX_INLINE_NEEDLES + 1;
+pub(crate) const MAX_CONJUNCTIVE_REQUIRED_LITERALS: usize = 8;
 
 #[derive(Clone, Copy)]
 enum RawNeedle<'hir> {
@@ -343,6 +344,503 @@ pub(crate) struct CaptureRequiredLiteralBuildOutcome {
 pub(crate) struct CaptureRequiredLiteralBuildFailure {
     pub(crate) source: CaptureRequiredLiteralBuildError,
     pub(crate) planner_work: usize,
+}
+
+/// Closed proof-only inspection result for one mandatory literal.
+///
+/// `literal == None` is a semantic decline: the bounded required-literal
+/// lattice did not reduce to exactly one borrowed nonempty HIR literal. The
+/// actual work remains available so a caller can preserve its incumbent
+/// planner ledger even though no sidecar is published.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct SingletonRequiredLiteralInspection<'hir> {
+    pub(crate) literal: Option<&'hir [u8]>,
+    pub(crate) actual_work: usize,
+}
+
+/// Closed proof-only inspection failure.
+///
+/// Construction-resource refusal is deliberately separate from semantic
+/// ineligibility, but both success and failure retain the exact work completed
+/// before the attempt closed.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct SingletonRequiredLiteralInspectionFailure {
+    pub(crate) source: CaptureRequiredLiteralBuildError,
+    pub(crate) actual_work: usize,
+}
+
+/// Closed proof-only inspection result for independent mandatory literals.
+///
+/// Only the first `count` entries are populated. After duplicate and
+/// substring-redundant obligations are removed, they are ordered by descending
+/// byte length. Equal-length literals retain first structural occurrence order.
+/// Every returned byte slice is borrowed directly from one literal HIR node;
+/// no byte-class alternative is synthesized.
+#[derive(Debug)]
+pub(crate) struct ConjunctiveRequiredLiteralInspection<'hir> {
+    pub(crate) literals: [&'hir [u8]; MAX_CONJUNCTIVE_REQUIRED_LITERALS],
+    pub(crate) count: usize,
+    pub(crate) actual_work: usize,
+}
+
+/// Closed failure from independent mandatory-literal inspection.
+///
+/// The exact completed work is retained on every resource or invariant
+/// failure so an optional caller can close its incumbent planner ledger.
+#[derive(Debug)]
+pub(crate) struct ConjunctiveRequiredLiteralInspectionFailure {
+    pub(crate) source: CaptureRequiredLiteralBuildError,
+    pub(crate) actual_work: usize,
+}
+
+/// Inspect one HIR for a singleton mandatory literal without publishing a DFA.
+///
+/// This reuses the same bounded measure, collection and effective-antichain
+/// proof as [`build_from_hir`]. Only a borrowed, nonempty HIR literal is
+/// returned. A singleton synthesized from a byte class is declined because it
+/// has no HIR-owned byte slice whose lifetime can be bound to the result. The
+/// proof-only path allocates no heap or retained storage; its fixed inline
+/// arrays are admitted against `max_scratch_bytes`.
+#[cfg(test)]
+pub(crate) fn inspect_singleton_required_literal(
+    hir: &Hir,
+    limits: CaptureRequiredLiteralBuildLimits,
+) -> Result<SingletonRequiredLiteralInspection<'_>, SingletonRequiredLiteralInspectionFailure> {
+    let mut meter = Meter::new(limits);
+    match inspect_singleton_required_literal_metered(hir, limits, &mut meter) {
+        Ok(literal) => Ok(SingletonRequiredLiteralInspection {
+            literal,
+            actual_work: meter.work,
+        }),
+        Err(source) => Err(SingletonRequiredLiteralInspectionFailure {
+            source,
+            actual_work: meter.work,
+        }),
+    }
+}
+
+#[cfg(test)]
+fn inspect_singleton_required_literal_metered<'hir>(
+    hir: &'hir Hir,
+    limits: CaptureRequiredLiteralBuildLimits,
+    meter: &mut Meter,
+) -> Result<Option<&'hir [u8]>, CaptureRequiredLiteralBuildError> {
+    inspect_singleton_required_literal_at_depth_metered(hir, limits, meter, 1)
+}
+
+fn inspect_singleton_required_literal_at_depth_metered<'hir>(
+    hir: &'hir Hir,
+    limits: CaptureRequiredLiteralBuildLimits,
+    meter: &mut Meter,
+    depth: usize,
+) -> Result<Option<&'hir [u8]>, CaptureRequiredLiteralBuildError> {
+    let Some(raw_metrics) = measure(hir, depth, meter)? else {
+        return Ok(None);
+    };
+    if raw_metrics.needles > MAX_INLINE_NEEDLES {
+        return Err(CaptureRequiredLiteralBuildError::Resource {
+            resource: "raw needle references",
+            required: raw_metrics.needles,
+            limit: MAX_INLINE_NEEDLES,
+        });
+    }
+
+    let canonical_scratch = size_of::<[RawNeedle<'static>; MAX_INLINE_NEEDLES]>()
+        .checked_add(size_of::<[bool; MAX_INLINE_NEEDLES]>())
+        .ok_or(CaptureRequiredLiteralBuildError::Overflow(
+            "canonical antichain scratch",
+        ))?;
+    check_limit("scratch bytes", canonical_scratch, limits.max_scratch_bytes)?;
+
+    let mut raw_needles = [RawNeedle::Literal(&[]); MAX_INLINE_NEEDLES];
+    let mut raw_count = 0_usize;
+    collect_refs(hir, depth, meter, &mut raw_needles, &mut raw_count)?;
+    if raw_count != raw_metrics.needles {
+        return Err(CaptureRequiredLiteralBuildError::InternalInvariant(
+            "collected raw needle count differs from proof",
+        ));
+    }
+    let (retained, effective) = effective_antichain(&raw_needles[..raw_count], meter)?;
+    check_metric_limits(effective, limits)?;
+    if effective.needles != 1 {
+        return Ok(None);
+    }
+
+    let mut retained_index = None;
+    for (index, is_retained) in retained[..raw_count].iter().enumerate() {
+        meter.charge(1)?;
+        if *is_retained {
+            retained_index = Some(index);
+            break;
+        }
+    }
+    let retained_index =
+        retained_index.ok_or(CaptureRequiredLiteralBuildError::InternalInvariant(
+            "singleton effective antichain lost its retained needle",
+        ))?;
+    match raw_needles[retained_index] {
+        RawNeedle::Literal(bytes) if !bytes.is_empty() => Ok(Some(bytes)),
+        RawNeedle::Literal(_) => Err(CaptureRequiredLiteralBuildError::InternalInvariant(
+            "singleton required HIR literal is empty",
+        )),
+        RawNeedle::Byte(_) => Ok(None),
+    }
+}
+
+/// Inspect one HIR for up to eight independent mandatory borrowed literals.
+///
+/// Concatenation joins the obligations proved by every child. Captures and
+/// positive repetitions preserve their child's obligations. An alternation
+/// contributes only when the existing complete any-literal proof for that
+/// entire alternation reduces to one borrowed literal. Nullable, optional,
+/// byte-class, and otherwise unsupported nodes contribute nothing. The
+/// operation performs no allocation and admits its complete fixed scratch
+/// requirement before reading the HIR. When more than eight independent
+/// obligations survive canonicalization, the longest are retained; structural
+/// order breaks equal-length ties.
+pub(crate) fn inspect_conjunctive_required_literals(
+    hir: &Hir,
+    limits: CaptureRequiredLiteralBuildLimits,
+) -> Result<ConjunctiveRequiredLiteralInspection<'_>, ConjunctiveRequiredLiteralInspectionFailure> {
+    let mut meter = Meter::new(limits);
+    match inspect_conjunctive_required_literals_metered(hir, limits, &mut meter) {
+        Ok((literals, count)) => Ok(ConjunctiveRequiredLiteralInspection {
+            literals,
+            count,
+            actual_work: meter.work,
+        }),
+        Err(source) => Err(ConjunctiveRequiredLiteralInspectionFailure {
+            source,
+            actual_work: meter.work,
+        }),
+    }
+}
+
+fn inspect_conjunctive_required_literals_metered<'hir>(
+    hir: &'hir Hir,
+    limits: CaptureRequiredLiteralBuildLimits,
+    meter: &mut Meter,
+) -> Result<
+    ([&'hir [u8]; MAX_CONJUNCTIVE_REQUIRED_LITERALS], usize),
+    CaptureRequiredLiteralBuildError,
+> {
+    // The outer collection remains live while a nested alternation uses the
+    // singleton proof's raw-reference and antichain arrays. Admit that exact
+    // peak rather than accounting only for either array in isolation.
+    let outer_scratch = size_of::<[RawNeedle<'static>; MAX_INLINE_NEEDLES]>();
+    let singleton_scratch = outer_scratch
+        .checked_add(size_of::<[bool; MAX_INLINE_NEEDLES]>())
+        .ok_or(CaptureRequiredLiteralBuildError::Overflow(
+            "singleton antichain scratch",
+        ))?;
+    let peak_scratch = outer_scratch.checked_add(singleton_scratch).ok_or(
+        CaptureRequiredLiteralBuildError::Overflow("conjunctive inspection scratch"),
+    )?;
+    check_limit("scratch bytes", peak_scratch, limits.max_scratch_bytes)?;
+
+    let mut raw_needles = [RawNeedle::Literal(&[]); MAX_INLINE_NEEDLES];
+    let mut raw_count = 0_usize;
+    collect_conjunctive_refs(hir, 1, limits, meter, &mut raw_needles, &mut raw_count)?;
+    let (retained_count, effective) =
+        canonicalize_conjunctive_literals(&mut raw_needles, raw_count, meter)?;
+    if let Some(effective) = effective {
+        check_metric_limits(effective, limits)?;
+    }
+
+    select_strongest_conjunctive_literals(&raw_needles, retained_count, meter)
+}
+
+fn collect_conjunctive_refs<'hir>(
+    hir: &'hir Hir,
+    depth: usize,
+    limits: CaptureRequiredLiteralBuildLimits,
+    meter: &mut Meter,
+    output: &mut [RawNeedle<'hir>; MAX_INLINE_NEEDLES],
+    count: &mut usize,
+) -> Result<(), CaptureRequiredLiteralBuildError> {
+    if matches!(hir.kind(), HirKind::Alternation(children) if !children.is_empty()) {
+        if let Some(bytes) =
+            inspect_singleton_required_literal_at_depth_metered(hir, limits, meter, depth)?
+        {
+            push_conjunctive_literal(bytes, meter, output, count)?;
+        }
+        return Ok(());
+    }
+
+    meter.enter(depth)?;
+    match hir.kind() {
+        HirKind::Literal(literal) if !literal.0.is_empty() => {
+            meter.charge(literal.0.len())?;
+            push_conjunctive_literal(literal.0.as_ref(), meter, output, count)
+        }
+        HirKind::Capture(capture) => collect_conjunctive_refs(
+            &capture.sub,
+            next_depth(depth)?,
+            limits,
+            meter,
+            output,
+            count,
+        ),
+        HirKind::Repetition(repetition) if repetition.min > 0 => collect_conjunctive_refs(
+            &repetition.sub,
+            next_depth(depth)?,
+            limits,
+            meter,
+            output,
+            count,
+        ),
+        HirKind::Concat(children) => {
+            for child in children {
+                collect_conjunctive_refs(child, next_depth(depth)?, limits, meter, output, count)?;
+            }
+            Ok(())
+        }
+        HirKind::Empty
+        | HirKind::Literal(_)
+        | HirKind::Class(_)
+        | HirKind::Look(_)
+        | HirKind::Repetition(_)
+        | HirKind::Alternation(_) => Ok(()),
+    }
+}
+
+fn push_conjunctive_literal<'hir>(
+    bytes: &'hir [u8],
+    meter: &mut Meter,
+    output: &mut [RawNeedle<'hir>; MAX_INLINE_NEEDLES],
+    count: &mut usize,
+) -> Result<(), CaptureRequiredLiteralBuildError> {
+    if bytes.is_empty() {
+        return Err(CaptureRequiredLiteralBuildError::InternalInvariant(
+            "conjunctive inspection tried to publish an empty literal",
+        ));
+    }
+    let required = count
+        .checked_add(1)
+        .ok_or(CaptureRequiredLiteralBuildError::Overflow(
+            "conjunctive raw literal count",
+        ))?;
+    if required > MAX_INLINE_NEEDLES {
+        return Err(CaptureRequiredLiteralBuildError::Resource {
+            resource: "raw needle references",
+            required,
+            limit: MAX_INLINE_NEEDLES,
+        });
+    }
+    meter.charge(1)?;
+    output[*count] = RawNeedle::Literal(bytes);
+    *count = required;
+    Ok(())
+}
+
+fn canonicalize_conjunctive_literals(
+    raw: &mut [RawNeedle<'_>; MAX_INLINE_NEEDLES],
+    raw_count: usize,
+    meter: &mut Meter,
+) -> Result<(usize, Option<Metrics>), CaptureRequiredLiteralBuildError> {
+    let mut retained_count = 0_usize;
+    for raw_index in 0..raw_count {
+        meter.charge(1)?;
+        let candidate = raw[raw_index];
+        let RawNeedle::Literal(candidate_bytes) = candidate else {
+            continue;
+        };
+        if candidate_bytes.is_empty() {
+            return Err(CaptureRequiredLiteralBuildError::InternalInvariant(
+                "conjunctive raw literal is empty",
+            ));
+        }
+
+        let mut retained_index = 0_usize;
+        let mut redundant = false;
+        while retained_index < retained_count {
+            meter.charge(3)?;
+            let retained_bytes = raw[retained_index].bytes();
+            match retained_bytes.len().cmp(&candidate_bytes.len()) {
+                core::cmp::Ordering::Equal => {
+                    if equal_metered(retained_bytes, candidate_bytes, meter)? {
+                        redundant = true;
+                        break;
+                    }
+                    retained_index = retained_index.checked_add(1).ok_or(
+                        CaptureRequiredLiteralBuildError::Overflow(
+                            "conjunctive retained literal index",
+                        ),
+                    )?;
+                }
+                core::cmp::Ordering::Greater => {
+                    if contains_metered(retained_bytes, candidate_bytes, meter)? {
+                        redundant = true;
+                        break;
+                    }
+                    retained_index = retained_index.checked_add(1).ok_or(
+                        CaptureRequiredLiteralBuildError::Overflow(
+                            "conjunctive retained literal index",
+                        ),
+                    )?;
+                }
+                core::cmp::Ordering::Less => {
+                    if contains_metered(candidate_bytes, retained_bytes, meter)? {
+                        remove_conjunctive_literal(
+                            raw,
+                            &mut retained_count,
+                            retained_index,
+                            meter,
+                        )?;
+                    } else {
+                        retained_index = retained_index.checked_add(1).ok_or(
+                            CaptureRequiredLiteralBuildError::Overflow(
+                                "conjunctive retained literal index",
+                            ),
+                        )?;
+                    }
+                }
+            }
+        }
+        if redundant {
+            continue;
+        }
+        meter.charge(1)?;
+        raw[retained_count] = candidate;
+        retained_count =
+            retained_count
+                .checked_add(1)
+                .ok_or(CaptureRequiredLiteralBuildError::Overflow(
+                    "conjunctive retained literal count",
+                ))?;
+    }
+
+    if retained_count == 0 {
+        return Ok((0, None));
+    }
+    let mut bytes = 0_usize;
+    let mut minimum_bytes = usize::MAX;
+    for literal in &raw[..retained_count] {
+        meter.charge(2)?;
+        let literal_bytes = literal.bytes().len();
+        bytes =
+            bytes
+                .checked_add(literal_bytes)
+                .ok_or(CaptureRequiredLiteralBuildError::Overflow(
+                    "conjunctive effective literal bytes",
+                ))?;
+        minimum_bytes = minimum_bytes.min(literal_bytes);
+    }
+    Ok((
+        retained_count,
+        Some(Metrics {
+            needles: retained_count,
+            bytes,
+            minimum_bytes,
+        }),
+    ))
+}
+
+fn select_strongest_conjunctive_literals<'hir>(
+    raw: &[RawNeedle<'hir>; MAX_INLINE_NEEDLES],
+    retained_count: usize,
+    meter: &mut Meter,
+) -> Result<
+    ([&'hir [u8]; MAX_CONJUNCTIVE_REQUIRED_LITERALS], usize),
+    CaptureRequiredLiteralBuildError,
+> {
+    if retained_count > raw.len() {
+        return Err(CaptureRequiredLiteralBuildError::InternalInvariant(
+            "conjunctive retained count exceeded inline storage",
+        ));
+    }
+
+    let mut literals = [&[][..]; MAX_CONJUNCTIVE_REQUIRED_LITERALS];
+    let mut count = 0_usize;
+    for candidate_index in 0..retained_count {
+        // Charge before inspecting each canonical candidate. Canonicalization
+        // has already established deduplication and substring minimality; this
+        // pass changes only which bounded subset is published.
+        meter.charge(1)?;
+        let candidate = match raw[candidate_index] {
+            RawNeedle::Literal(bytes) if !bytes.is_empty() => bytes,
+            RawNeedle::Literal(_) => {
+                return Err(CaptureRequiredLiteralBuildError::InternalInvariant(
+                    "conjunctive inspection retained an empty literal",
+                ));
+            }
+            RawNeedle::Byte(_) => {
+                return Err(CaptureRequiredLiteralBuildError::InternalInvariant(
+                    "conjunctive inspection retained a synthesized byte",
+                ));
+            }
+        };
+
+        let mut insertion = 0_usize;
+        while insertion < count {
+            meter.charge(1)?;
+            if candidate.len() > literals[insertion].len() {
+                break;
+            }
+            insertion =
+                insertion
+                    .checked_add(1)
+                    .ok_or(CaptureRequiredLiteralBuildError::Overflow(
+                        "conjunctive selection insertion index",
+                    ))?;
+        }
+        if insertion == MAX_CONJUNCTIVE_REQUIRED_LITERALS {
+            continue;
+        }
+
+        let expanded = count
+            .checked_add(1)
+            .ok_or(CaptureRequiredLiteralBuildError::Overflow(
+                "conjunctive selected literal count",
+            ))?;
+        let next_count = expanded.min(MAX_CONJUNCTIVE_REQUIRED_LITERALS);
+        let mut destination = next_count.checked_sub(1).ok_or(
+            CaptureRequiredLiteralBuildError::InternalInvariant(
+                "conjunctive selection produced an empty publication",
+            ),
+        )?;
+        while destination > insertion {
+            meter.charge(1)?;
+            let source = destination.checked_sub(1).ok_or(
+                CaptureRequiredLiteralBuildError::InternalInvariant(
+                    "conjunctive selection shift underflowed",
+                ),
+            )?;
+            literals[destination] = literals[source];
+            destination = source;
+        }
+        // Strict length comparison above inserts after existing equal-length
+        // literals, making structural order the deterministic stable tie rule.
+        meter.charge(1)?;
+        literals[insertion] = candidate;
+        count = next_count;
+    }
+    Ok((literals, count))
+}
+
+fn remove_conjunctive_literal(
+    raw: &mut [RawNeedle<'_>; MAX_INLINE_NEEDLES],
+    retained_count: &mut usize,
+    removed: usize,
+    meter: &mut Meter,
+) -> Result<(), CaptureRequiredLiteralBuildError> {
+    let next = removed
+        .checked_add(1)
+        .ok_or(CaptureRequiredLiteralBuildError::Overflow(
+            "conjunctive removal start",
+        ))?;
+    for source in next..*retained_count {
+        meter.charge(1)?;
+        raw[source - 1] = raw[source];
+    }
+    *retained_count = retained_count.checked_sub(1).ok_or(
+        CaptureRequiredLiteralBuildError::InternalInvariant(
+            "conjunctive removal underflowed retained literals",
+        ),
+    )?;
+    Ok(())
 }
 
 #[allow(
@@ -1341,6 +1839,33 @@ mod tests {
         (key, rust.hir)
     }
 
+    fn inspect_singleton_owned(
+        pattern: &str,
+        limits: CaptureRequiredLiteralBuildLimits,
+    ) -> Result<(Option<Vec<u8>>, usize), SingletonRequiredLiteralInspectionFailure> {
+        let (_, hir) = parsed_hir(pattern);
+        let inspection = inspect_singleton_required_literal(&hir, limits)?;
+        Ok((
+            inspection.literal.map(<[u8]>::to_vec),
+            inspection.actual_work,
+        ))
+    }
+
+    fn inspect_conjunctive_owned(
+        pattern: &str,
+        limits: CaptureRequiredLiteralBuildLimits,
+    ) -> Result<(Vec<Vec<u8>>, usize), ConjunctiveRequiredLiteralInspectionFailure> {
+        let (_, hir) = parsed_hir(pattern);
+        let inspection = inspect_conjunctive_required_literals(&hir, limits)?;
+        Ok((
+            inspection.literals[..inspection.count]
+                .iter()
+                .map(|literal| literal.to_vec())
+                .collect(),
+            inspection.actual_work,
+        ))
+    }
+
     fn build(
         pattern: &str,
         limits: CaptureRequiredLiteralBuildLimits,
@@ -1429,6 +1954,216 @@ mod tests {
                 .plan
                 .is_none()
         );
+    }
+
+    #[test]
+    fn singleton_inspection_admits_concat_positive_repeat_and_common_literal() {
+        for pattern in [
+            r"x.*MANDATORY",
+            r"(?:MANDATORY)+",
+            r"(?:MANDATORY|xMANDATORY)",
+        ] {
+            let (literal, actual_work) =
+                inspect_singleton_owned(pattern, CaptureRequiredLiteralBuildLimits::default())
+                    .unwrap_or_else(|failure| {
+                        panic!(
+                            "singleton inspection failed for {pattern:?} after {} work: {}",
+                            failure.actual_work, failure.source,
+                        )
+                    });
+            assert_eq!(literal.as_deref(), Some(b"MANDATORY".as_slice()));
+            assert!(actual_work > 0);
+        }
+    }
+
+    #[test]
+    fn singleton_inspection_declines_nullable_and_multi_alternative_proofs() {
+        for pattern in [r"(?:MANDATORY|)", r"(?:LEFT|RIGHT)"] {
+            let (literal, actual_work) =
+                inspect_singleton_owned(pattern, CaptureRequiredLiteralBuildLimits::default())
+                    .unwrap_or_else(|failure| {
+                        panic!(
+                            "singleton inspection failed for {pattern:?} after {} work: {}",
+                            failure.actual_work, failure.source,
+                        )
+                    });
+            assert_eq!(literal, None, "pattern={pattern:?}");
+            assert!(actual_work > 0);
+        }
+    }
+
+    #[test]
+    fn singleton_inspection_closes_exact_and_one_below_planner_work() {
+        let (_, hir) = parsed_hir("MANDATORY");
+        let baseline =
+            inspect_singleton_required_literal(&hir, CaptureRequiredLiteralBuildLimits::default())
+                .expect("unlimited singleton inspection");
+        let exact_work = baseline.actual_work;
+        assert_eq!(baseline.literal, Some(b"MANDATORY".as_slice()));
+        assert!(exact_work > 0);
+
+        let exact = inspect_singleton_required_literal(
+            &hir,
+            CaptureRequiredLiteralBuildLimits {
+                max_planner_work: exact_work,
+                ..CaptureRequiredLiteralBuildLimits::default()
+            },
+        )
+        .expect("exact planner-work boundary");
+        assert_eq!(exact.literal, baseline.literal);
+        assert_eq!(exact.actual_work, exact_work);
+
+        let one_below_limit = exact_work.checked_sub(1).expect("positive exact work");
+        let failure = inspect_singleton_required_literal(
+            &hir,
+            CaptureRequiredLiteralBuildLimits {
+                max_planner_work: one_below_limit,
+                ..CaptureRequiredLiteralBuildLimits::default()
+            },
+        )
+        .expect_err("one-below planner-work boundary must close as a refusal");
+        assert_eq!(failure.actual_work, one_below_limit);
+        assert!(matches!(
+            failure.source,
+            CaptureRequiredLiteralBuildError::Resource {
+                resource: "planner work",
+                required,
+                limit,
+            } if required == exact_work && limit == one_below_limit
+        ));
+    }
+
+    #[test]
+    fn conjunctive_inspection_unions_concat_and_positive_repeat_obligations() {
+        let (literals, actual_work) = inspect_conjunctive_owned(
+            r"prefix.*NEEDLE.*END",
+            CaptureRequiredLiteralBuildLimits::default(),
+        )
+        .expect("conjunctive concat inspection");
+        assert_eq!(
+            literals,
+            vec![b"prefix".to_vec(), b"NEEDLE".to_vec(), b"END".to_vec(),]
+        );
+        assert!(actual_work > 0);
+
+        let (repeated, _) = inspect_conjunctive_owned(
+            r"(?:(REPEAT))+.*TAIL",
+            CaptureRequiredLiteralBuildLimits::default(),
+        )
+        .expect("positive repetition inspection");
+        assert_eq!(repeated, vec![b"REPEAT".to_vec(), b"TAIL".to_vec()]);
+    }
+
+    #[test]
+    fn conjunctive_inspection_excludes_optional_obligations() {
+        let (literals, _) = inspect_conjunctive_owned(
+            r"START.*(?:OPTIONAL)?.*END",
+            CaptureRequiredLiteralBuildLimits::default(),
+        )
+        .expect("optional child inspection");
+        assert_eq!(literals, vec![b"START".to_vec(), b"END".to_vec()]);
+    }
+
+    #[test]
+    fn conjunctive_inspection_requires_a_genuine_singleton_from_alternation() {
+        let (common, _) = inspect_conjunctive_owned(
+            r"(?:COMMON|xCOMMON).*TAIL",
+            CaptureRequiredLiteralBuildLimits::default(),
+        )
+        .expect("common alternation inspection");
+        assert_eq!(common, vec![b"COMMON".to_vec(), b"TAIL".to_vec()]);
+
+        let (disjoint, _) = inspect_conjunctive_owned(
+            r"(?:LEFT|RIGHT).*TAIL",
+            CaptureRequiredLiteralBuildLimits::default(),
+        )
+        .expect("disjoint alternation inspection");
+        assert_eq!(disjoint, vec![b"TAIL".to_vec()]);
+    }
+
+    #[test]
+    fn conjunctive_inspection_retains_stronger_literals_in_structural_order() {
+        let (literals, _) = inspect_conjunctive_owned(
+            r"OOB.*MIDDLE.*FOOBAR.*FOOBAR",
+            CaptureRequiredLiteralBuildLimits::default(),
+        )
+        .expect("conjunctive canonicalization");
+        assert_eq!(literals, vec![b"MIDDLE".to_vec(), b"FOOBAR".to_vec()]);
+    }
+
+    #[test]
+    fn conjunctive_inspection_ranks_before_bounded_retention_and_preserves_ties() {
+        let (literals, _) = inspect_conjunctive_owned(
+            r"a.*b.*c.*d.*e.*f.*g.*h.*SELECTIVE",
+            CaptureRequiredLiteralBuildLimits::default(),
+        )
+        .expect("bounded conjunctive selection");
+        assert_eq!(
+            literals,
+            vec![
+                b"SELECTIVE".to_vec(),
+                b"a".to_vec(),
+                b"b".to_vec(),
+                b"c".to_vec(),
+                b"d".to_vec(),
+                b"e".to_vec(),
+                b"f".to_vec(),
+                b"g".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn conjunctive_inspection_closes_exact_and_one_below_planner_work() {
+        let (_, hir) = parsed_hir(r"FIRST.*SECOND.*THIRD");
+        let baseline = inspect_conjunctive_required_literals(
+            &hir,
+            CaptureRequiredLiteralBuildLimits::default(),
+        )
+        .expect("unlimited conjunctive inspection");
+        let exact_work = baseline.actual_work;
+        assert_eq!(
+            &baseline.literals[..baseline.count],
+            [
+                b"SECOND".as_slice(),
+                b"FIRST".as_slice(),
+                b"THIRD".as_slice()
+            ]
+        );
+        assert!(exact_work > 0);
+
+        let exact = inspect_conjunctive_required_literals(
+            &hir,
+            CaptureRequiredLiteralBuildLimits {
+                max_planner_work: exact_work,
+                ..CaptureRequiredLiteralBuildLimits::default()
+            },
+        )
+        .expect("exact conjunctive planner-work boundary");
+        assert_eq!(
+            &exact.literals[..exact.count],
+            &baseline.literals[..baseline.count]
+        );
+        assert_eq!(exact.actual_work, exact_work);
+
+        let one_below_limit = exact_work.checked_sub(1).expect("positive exact work");
+        let failure = inspect_conjunctive_required_literals(
+            &hir,
+            CaptureRequiredLiteralBuildLimits {
+                max_planner_work: one_below_limit,
+                ..CaptureRequiredLiteralBuildLimits::default()
+            },
+        )
+        .expect_err("one-below conjunctive planner-work boundary must refuse");
+        assert_eq!(failure.actual_work, one_below_limit);
+        assert!(matches!(
+            failure.source,
+            CaptureRequiredLiteralBuildError::Resource {
+                resource: "planner work",
+                required,
+                limit,
+            } if required == exact_work && limit == one_below_limit
+        ));
     }
 
     #[test]

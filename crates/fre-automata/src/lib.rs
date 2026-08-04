@@ -20,6 +20,8 @@ mod contract;
 mod error;
 mod k0;
 mod k0_root_corridor;
+mod mandatory_cut;
+mod mandatory_suffix;
 pub mod p16_grep_stream;
 mod plan;
 mod priority;
@@ -32,8 +34,25 @@ pub use contract::{
 };
 pub use error::{CompileError, MalformedPlan, ResourceKind, SearchError};
 pub use k0::{
-    K0ResumeSet, K0SearchSession, K0SpanSourceCursor, K0Workspace, WorkspaceLayout,
-    WorkspaceLimits,
+    K0PositiveEndLimits, K0PositiveEndOutcome, K0PositiveEndReceipt, K0PositiveEndVerification,
+    K0ResumeSet, K0SearchSession, K0SpanSourceCursor, K0Workspace, WorkspaceLayout, WorkspaceLimits,
+};
+pub use mandatory_cut::{
+    DEFAULT_MANDATORY_CUT_MAX_ALLOCATION_ATTEMPTS, DEFAULT_MANDATORY_CUT_MAX_ALLOCATION_ITEMS,
+    DEFAULT_MANDATORY_CUT_MAX_WORK, MANDATORY_CUT_ACCOUNTING_ID, MandatoryCutAnalysis,
+    MandatoryCutAnalysisDecline, MandatoryCutAnalysisLimits, MandatoryCutAnalysisReport,
+    MandatoryCutAnalysisStats, MandatoryCutByteClass, MandatoryCutCandidate,
+    MandatoryCutDeclineReason, MandatoryCutGraphIssue, MandatoryCutResource,
+    MaximumConsumedDistance, analyze_mandatory_cut,
+};
+pub use mandatory_suffix::{
+    DEFAULT_MANDATORY_SUFFIX_MAX_ALLOCATION_ATTEMPTS,
+    DEFAULT_MANDATORY_SUFFIX_MAX_ALLOCATION_ITEMS, DEFAULT_MANDATORY_SUFFIX_MAX_BYTES,
+    DEFAULT_MANDATORY_SUFFIX_MAX_WORK, MANDATORY_SUFFIX_ACCOUNTING_ID,
+    MAX_MANDATORY_SUFFIX_BYTES, MandatorySuffixAnalysis, MandatorySuffixAnalysisDecline,
+    MandatorySuffixAnalysisLimits, MandatorySuffixAnalysisReport, MandatorySuffixAnalysisStats,
+    MandatorySuffixCandidate, MandatorySuffixDeclineReason, MandatorySuffixGraphIssue,
+    MandatorySuffixResource, MandatorySuffixStopReason, analyze_mandatory_suffix,
 };
 pub use plan::{
     Automaton, CompileLimits, EdgeKind, PlanStats, RawPlan, SearchLimits, SearchWindow, StateRole,

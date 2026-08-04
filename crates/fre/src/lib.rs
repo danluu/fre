@@ -56,7 +56,8 @@
 use core::fmt;
 
 use fre_kernels::FixedPredicateWord64SearchCursor;
-use regex_syntax::hir::{Hir, HirKind};
+use memchr::{memchr, memchr2, memchr3};
+use regex_syntax::hir::{Hir, HirKind, Look};
 
 mod aggregate;
 mod aggregate_construction;
@@ -670,11 +671,16 @@ pub use text_set::{
 };
 
 use fre_automata::{
-    Automaton, EarliestEnd, Exists, K0SearchSession, K0SpanSourceCursor, SelectedEnd, Span,
+    Automaton, EarliestEnd, Exists, K0PositiveEndLimits, K0PositiveEndOutcome, K0SearchSession,
+    K0SpanSourceCursor, MandatoryCutAnalysis, MandatoryCutAnalysisLimits, MandatoryCutCandidate,
+    MandatoryCutDeclineReason, MandatoryCutResource, MandatorySuffixAnalysis,
+    MandatorySuffixAnalysisLimits, MandatorySuffixDeclineReason, MandatorySuffixResource,
+    MaximumConsumedDistance, SelectedEnd, Span,
 };
 use fre_kernels::{
-    AbsoluteEndFixedPlan, BoundedRequiredLiteralPlan, DispatchedBoundedRequiredLiteralPlan,
-    DispatchedForwardAnchoredPlan, DispatchedRequiredLiteralPlan, ForwardAnchoredBuildAccounting,
+    ASCII_RUN_SCANNER_BUILD_WORK, AbsoluteEndFixedPlan, AsciiByteSet, AsciiByteSetRunScanner,
+    BoundedRequiredLiteralPlan, DispatchedBoundedRequiredLiteralPlan, DispatchedForwardAnchoredPlan,
+    DispatchedRequiredLiteralPlan, ForwardAnchoredBuildAccounting,
     ForwardAnchoredBuildError, ForwardAnchoredBuildLimits, ForwardAnchoredPlan,
     ForwardAnchoredSearchAccounting, ForwardAnchoredSearchError, ForwardAnchoredSearchLimits,
     LiteralAccounting, LiteralBuildLimits, LiteralClassRunLiteralPlan, LiteralClassRunSearchPlan,
@@ -1275,6 +1281,810 @@ fn charge_unicode_folded_planner_work(
         return Err(BuildError::PlannerWorkLimit { needed, limit });
     }
     Ok(needed)
+}
+
+const K0_NEGATIVE_PREFILTER_MIN_NEEDLE_BYTES: usize = 3;
+const K0_NEGATIVE_PREFILTER_MAX_NEEDLE_BYTES: usize = 1_024;
+// Mandatory-cut materialization charges one operation per bitmap word read,
+// byte-domain membership test, retained byte write and final inline plan.
+const K0_MANDATORY_CUT_CARDINALITY_WORK: u64 = 4;
+const K0_MANDATORY_CUT_BYTE_ENUMERATION_WORK: u64 = 256;
+const K0_MANDATORY_CUT_PLAN_CONSTRUCTION_WORK: u64 = 1;
+
+#[derive(Clone, Copy, Debug)]
+struct K0MandatoryCutPlan {
+    candidate: MandatoryCutCandidate,
+    bytes: [u8; 3],
+    count: u8,
+}
+
+impl K0MandatoryCutPlan {
+    fn try_from_candidate(
+        candidate: MandatoryCutCandidate,
+        planner_work: &mut u64,
+        max_planner_work: u64,
+    ) -> Result<Option<Self>, BuildError> {
+        if !try_charge_k0_mandatory_cut_work(
+            planner_work,
+            K0_MANDATORY_CUT_CARDINALITY_WORK,
+            max_planner_work,
+        )? {
+            return Ok(None);
+        }
+        let cardinality = usize::from(candidate.byte_class().cardinality());
+        if !(1..=3).contains(&cardinality) {
+            return Ok(None);
+        }
+        let retained_byte_work = u64::try_from(cardinality).map_err(|_| {
+            BuildError::InternalInvariant("K0 mandatory-cut cardinality does not fit planner work")
+        })?;
+        let construction_work = K0_MANDATORY_CUT_BYTE_ENUMERATION_WORK
+            .checked_add(retained_byte_work)
+            .and_then(|work| work.checked_add(K0_MANDATORY_CUT_PLAN_CONSTRUCTION_WORK))
+            .ok_or(BuildError::InternalInvariant(
+                "K0 mandatory-cut construction work overflowed",
+            ))?;
+        // Precharge the complete fixed-domain scan, retained-byte writes and
+        // final inline plan construction. A refusal therefore publishes no
+        // partially enumerated sidecar and leaves only completed work charged.
+        if !try_charge_k0_mandatory_cut_work(
+            planner_work,
+            construction_work,
+            max_planner_work,
+        )? {
+            return Ok(None);
+        }
+        let mut bytes = [0_u8; 3];
+        let mut count = 0usize;
+        for byte in u8::MIN..=u8::MAX {
+            if candidate.byte_class().contains(byte) {
+                *bytes.get_mut(count).ok_or(BuildError::InternalInvariant(
+                    "eligible K0 mandatory-cut class exceeded inline storage",
+                ))? = byte;
+                count = count.checked_add(1).ok_or(BuildError::InternalInvariant(
+                    "K0 mandatory-cut cardinality overflowed",
+                ))?;
+            }
+        }
+        if count != cardinality {
+            return Err(BuildError::InternalInvariant(
+                "K0 mandatory-cut enumeration disagreed with its cardinality",
+            ));
+        }
+        Ok(Some(Self {
+            candidate,
+            bytes,
+            count: u8::try_from(count).map_err(|_| {
+                BuildError::InternalInvariant("K0 mandatory-cut cardinality does not fit u8")
+            })?,
+        }))
+    }
+
+    fn first_member(self, haystack: &[u8]) -> Option<usize> {
+        debug_assert_eq!(
+            usize::from(self.candidate.byte_class().cardinality()),
+            usize::from(self.count)
+        );
+        match self.count {
+            1 => memchr(self.bytes[0], haystack),
+            2 => memchr2(self.bytes[0], self.bytes[1], haystack),
+            3 => memchr3(self.bytes[0], self.bytes[1], self.bytes[2], haystack),
+            _ => None,
+        }
+    }
+
+    fn candidate_floor(self, window_start: usize, first_member: usize) -> Option<usize> {
+        let MaximumConsumedDistance::Finite(maximum_before_root) =
+            self.candidate.maximum_before_root()
+        else {
+            return None;
+        };
+        let first_member = window_start.checked_add(first_member)?;
+        let maximum_before_root =
+            usize::try_from(maximum_before_root).unwrap_or(usize::MAX);
+        // If a selected match starts at s and consumes its mandatory-cut
+        // byte at c, then c - s <= M. The first class member p is no later
+        // than c, so p - M <= s; saturation only weakens that lower bound.
+        Some(
+            first_member
+                .saturating_sub(maximum_before_root)
+                .max(window_start),
+        )
+    }
+
+    #[cfg(test)]
+    const fn maximum_before_root(self) -> MaximumConsumedDistance {
+        self.candidate.maximum_before_root()
+    }
+
+    #[cfg(test)]
+    const fn bytes(self) -> ([u8; 3], u8) {
+        (self.bytes, self.count)
+    }
+}
+
+fn try_charge_k0_mandatory_cut_work(
+    work: &mut u64,
+    amount: u64,
+    limit: u64,
+) -> Result<bool, BuildError> {
+    let needed = work.checked_add(amount).ok_or(BuildError::InternalInvariant(
+        "K0 mandatory-cut planner work overflowed",
+    ))?;
+    if needed > limit {
+        return Ok(false);
+    }
+    *work = needed;
+    Ok(true)
+}
+
+struct K0MandatoryCutBuild {
+    plan: Option<K0MandatoryCutPlan>,
+    planner_work: u64,
+    storage_bytes: usize,
+}
+
+fn try_build_k0_mandatory_cut(
+    raw: &fre_automata::RawPlan,
+    limits: BuildLimits,
+    incumbent_planner_work: u64,
+) -> Result<K0MandatoryCutBuild, BuildError> {
+    let remaining_work = limits
+        .max_planner_work
+        .checked_sub(incumbent_planner_work)
+        .ok_or(BuildError::InternalInvariant(
+            "incumbent planner work exceeded its enforced limit",
+        ))?;
+    if remaining_work == 0 {
+        return Ok(K0MandatoryCutBuild {
+            plan: None,
+            planner_work: incumbent_planner_work,
+            storage_bytes: 0,
+        });
+    }
+    let mut analysis_limits = MandatoryCutAnalysisLimits::default();
+    analysis_limits.max_work = analysis_limits.max_work.min(remaining_work);
+    analysis_limits.max_allocation_items = analysis_limits
+        .max_allocation_items
+        .min(limits.lowering.max_stack_items);
+    let analysis = fre_automata::analyze_mandatory_cut(raw, analysis_limits);
+    let stats = analysis.stats();
+    if !stats.closes(analysis_limits) {
+        return Err(BuildError::InternalInvariant(
+            "K0 mandatory-cut analysis receipt did not close",
+        ));
+    }
+    let mut planner_work = incumbent_planner_work
+        .checked_add(stats.work())
+        .ok_or(BuildError::InternalInvariant(
+            "cumulative K0 mandatory-cut planner work overflowed u64",
+        ))?;
+    if planner_work > limits.max_planner_work {
+        return Err(BuildError::InternalInvariant(
+            "K0 mandatory-cut analysis exceeded its admitted planner work",
+        ));
+    }
+    let candidate = match analysis {
+        MandatoryCutAnalysis::Complete(report) => report.candidate(),
+        MandatoryCutAnalysis::Declined(decline) => match decline.reason() {
+            MandatoryCutDeclineReason::Resource {
+                resource:
+                    MandatoryCutResource::Work
+                    | MandatoryCutResource::AllocationItems
+                    | MandatoryCutResource::AllocationAttempts,
+                ..
+            }
+            | MandatoryCutDeclineReason::Allocation { .. } => None,
+            MandatoryCutDeclineReason::MalformedGraph(_)
+            | MandatoryCutDeclineReason::ArithmeticOverflow { .. }
+            | MandatoryCutDeclineReason::InternalInvariant { .. } => {
+                return Err(BuildError::InternalInvariant(
+                    "lowered K0 graph failed mandatory-cut analysis",
+                ));
+            }
+            _ => {
+                return Err(BuildError::InternalInvariant(
+                    "K0 mandatory-cut analysis returned an unknown decline",
+                ));
+            }
+        },
+    };
+    let plan = match candidate {
+        Some(candidate) => K0MandatoryCutPlan::try_from_candidate(
+            candidate,
+            &mut planner_work,
+            limits.max_planner_work,
+        )?,
+        None => None,
+    };
+    Ok(K0MandatoryCutBuild {
+        storage_bytes: plan.map_or(0, |_| core::mem::size_of::<K0MandatoryCutPlan>()),
+        plan,
+        planner_work,
+    })
+}
+
+#[derive(Debug)]
+struct K0ConsumptionRunPlan {
+    members: [u64; 4],
+    ascii_members: AsciiByteSetRunScanner,
+}
+
+impl K0ConsumptionRunPlan {
+    fn contains(&self, byte: u8) -> bool {
+        let word = usize::from(byte / 64);
+        let bit = u32::from(byte % 64);
+        self.members[word] & (1_u64 << bit) != 0
+    }
+
+    fn narrowed_start_before(&self, haystack: &[u8], window_start: usize, end: usize) -> usize {
+        let mut cursor = end;
+        let mut high_members = 0_usize;
+        while cursor > window_start {
+            let run = self
+                .ascii_members
+                .scan_backward(&haystack[window_start..cursor]);
+            cursor = cursor.saturating_sub(run.member_run_len());
+            if cursor == window_start {
+                return window_start;
+            }
+
+            let byte_position = cursor.saturating_sub(1);
+            let byte = haystack[byte_position];
+            if !self.contains(byte) {
+                // The byte at cursor - 1 cannot occur on any consuming edge,
+                // so no match can cross it and the next byte is a sound lower
+                // bound for every match containing the selected suffix.
+                return cursor;
+            }
+
+            // Every admitted ASCII member is consumed by the run scanner. A
+            // remaining exact member is therefore high. Bound scalar recovery
+            // independently of the source; exhausting the bound fails open
+            // all the way to the original window start.
+            debug_assert!(byte > 0x7f);
+            if high_members >= K0_SUFFIX_HIGH_BYTE_BACKWARD_MAX {
+                return window_start;
+            }
+            high_members = high_members.saturating_add(1);
+            cursor = byte_position;
+        }
+        window_start
+    }
+}
+
+#[derive(Debug)]
+struct K0MandatorySuffixPlan {
+    literal: LiteralPlan,
+    consumption_run: Option<K0ConsumptionRunPlan>,
+}
+
+impl K0MandatorySuffixPlan {
+    fn needle(&self) -> &[u8] {
+        self.literal.needle()
+    }
+
+    fn find_window(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        end: usize,
+    ) -> Result<Option<(usize, usize)>, LiteralError> {
+        self.literal
+            .find_window(
+                haystack,
+                LiteralWindow::new(start, end),
+                LiteralSearchLimits::unlimited(),
+            )
+            .map(|(matched, _)| matched)
+    }
+
+    fn narrowed_start_before(&self, haystack: &[u8], window_start: usize, end: usize) -> usize {
+        let Some(scanner) = self.consumption_run.as_ref() else {
+            return window_start;
+        };
+        scanner.narrowed_start_before(haystack, window_start, end)
+    }
+}
+
+struct K0MandatorySuffixBuild {
+    plan: Option<K0MandatorySuffixPlan>,
+    planner_work: u64,
+    storage_bytes: usize,
+}
+
+fn try_build_k0_mandatory_suffix(
+    raw: &fre_automata::RawPlan,
+    limits: BuildLimits,
+    incumbent_planner_work: u64,
+) -> Result<K0MandatorySuffixBuild, BuildError> {
+    let declined = |planner_work| K0MandatorySuffixBuild {
+        plan: None,
+        planner_work,
+        storage_bytes: 0,
+    };
+    let remaining_work = limits
+        .max_planner_work
+        .checked_sub(incumbent_planner_work)
+        .ok_or(BuildError::InternalInvariant(
+            "incumbent planner work exceeded its enforced limit",
+        ))?;
+    if remaining_work == 0 {
+        return Ok(declined(incumbent_planner_work));
+    }
+    let mut analysis_limits = MandatorySuffixAnalysisLimits::default();
+    analysis_limits.max_work = analysis_limits.max_work.min(remaining_work);
+    analysis_limits.max_allocation_items = analysis_limits
+        .max_allocation_items
+        .min(limits.lowering.max_stack_items);
+    let analysis = fre_automata::analyze_mandatory_suffix(raw, analysis_limits);
+    let stats = analysis.stats();
+    if !stats.closes(analysis_limits) {
+        return Err(BuildError::InternalInvariant(
+            "K0 mandatory-suffix analysis receipt did not close",
+        ));
+    }
+    let mut planner_work = incumbent_planner_work
+        .checked_add(stats.work())
+        .ok_or(BuildError::InternalInvariant(
+            "cumulative K0 mandatory-suffix planner work overflowed u64",
+        ))?;
+    if planner_work > limits.max_planner_work {
+        return Err(BuildError::InternalInvariant(
+            "K0 mandatory-suffix analysis exceeded its admitted planner work",
+        ));
+    }
+    let candidate = match analysis {
+        MandatorySuffixAnalysis::Complete(report) => report.candidate(),
+        MandatorySuffixAnalysis::Declined(decline) => match decline.reason() {
+            MandatorySuffixDeclineReason::Resource {
+                resource:
+                    MandatorySuffixResource::SuffixBytes
+                    | MandatorySuffixResource::Work
+                    | MandatorySuffixResource::AllocationItems
+                    | MandatorySuffixResource::AllocationAttempts,
+                ..
+            }
+            | MandatorySuffixDeclineReason::Allocation { .. }
+            | MandatorySuffixDeclineReason::AssertionsPresent
+            | MandatorySuffixDeclineReason::EmptyLanguage
+            | MandatorySuffixDeclineReason::NullableLanguage
+            | MandatorySuffixDeclineReason::AmbiguousSuffixLayer => {
+                return Ok(declined(planner_work));
+            }
+            MandatorySuffixDeclineReason::MalformedGraph(_)
+            | MandatorySuffixDeclineReason::ArithmeticOverflow { .. }
+            | MandatorySuffixDeclineReason::InternalInvariant { .. } => {
+                return Err(BuildError::InternalInvariant(
+                    "lowered K0 graph failed mandatory-suffix analysis",
+                ));
+            }
+            _ => {
+                return Err(BuildError::InternalInvariant(
+                    "K0 mandatory-suffix analysis returned an unknown decline",
+                ));
+            }
+        },
+    };
+    if candidate.len() < K0_NEGATIVE_PREFILTER_MIN_NEEDLE_BYTES {
+        return Ok(declined(planner_work));
+    }
+    let copy_work = u64::try_from(candidate.len()).map_err(|_| {
+        BuildError::InternalInvariant("K0 mandatory suffix length does not fit u64")
+    })?;
+    if !try_charge_k0_negative_prefilter_work(
+        &mut planner_work,
+        copy_work,
+        limits.max_planner_work,
+    )? {
+        return Ok(declined(planner_work));
+    }
+    let literal = match LiteralPlan::new(candidate.as_bytes(), limits.literal) {
+        Ok(literal) => literal,
+        Err(LiteralError::NeedleLimit { .. } | LiteralError::AllocationFailed { .. }) => {
+            return Ok(declined(planner_work));
+        }
+        Err(_) => {
+            return Err(BuildError::InternalInvariant(
+                "admitted K0 mandatory suffix failed literal construction",
+            ));
+        }
+    };
+    if !try_charge_k0_negative_prefilter_work(&mut planner_work, 1, limits.max_planner_work)? {
+        return Ok(declined(planner_work));
+    }
+    let consumption_run = try_build_k0_consumption_run(
+        raw,
+        &mut planner_work,
+        limits.max_planner_work,
+    )?;
+    let storage_bytes = core::mem::size_of::<K0MandatorySuffixPlan>()
+        .checked_add(literal.storage_bytes())
+        .ok_or(BuildError::PersistentBytesOverflow)?;
+    Ok(K0MandatorySuffixBuild {
+        plan: Some(K0MandatorySuffixPlan {
+            literal,
+            consumption_run,
+        }),
+        planner_work,
+        storage_bytes,
+    })
+}
+
+fn try_build_k0_consumption_run(
+    raw: &fre_automata::RawPlan,
+    planner_work: &mut u64,
+    max_planner_work: u64,
+) -> Result<Option<K0ConsumptionRunPlan>, BuildError> {
+    let edge_work = u64::try_from(raw.edge_kinds.len()).map_err(|_| {
+        BuildError::InternalInvariant("K0 consuming-edge count does not fit planner work")
+    })?;
+    if !try_charge_k0_negative_prefilter_work(planner_work, edge_work, max_planner_work)? {
+        return Ok(None);
+    }
+
+    let mut members = [0_u64; 4];
+    for (edge, &kind) in raw.edge_kinds.iter().enumerate() {
+        if kind != fre_automata::EdgeKind::ByteRange {
+            continue;
+        }
+        let start = raw.byte_starts[edge];
+        let end = raw.byte_ends[edge];
+        insert_k0_consumption_range(&mut members, start, end)?;
+    }
+    if members == [0; 4] || members == [u64::MAX; 4] {
+        return Ok(None);
+    }
+    if !try_charge_k0_negative_prefilter_work(
+        planner_work,
+        u64::try_from(ASCII_RUN_SCANNER_BUILD_WORK)
+            .expect("ASCII run-scanner construction work fits u64"),
+        max_planner_work,
+    )? {
+        return Ok(None);
+    }
+    Ok(Some(K0ConsumptionRunPlan {
+        members,
+        ascii_members: AsciiByteSetRunScanner::new(AsciiByteSet::from_words([
+            members[0],
+            members[1],
+        ])),
+    }))
+}
+
+fn insert_k0_consumption_range(
+    members: &mut [u64; 4],
+    start: u8,
+    end: u8,
+) -> Result<(), BuildError> {
+    if start > end {
+        return Err(BuildError::InternalInvariant(
+            "lowered K0 consuming range is reversed",
+        ));
+    }
+    let first_word = usize::from(start / 64);
+    let last_word = usize::from(end / 64);
+    for word_index in first_word..=last_word {
+        let first_bit = if word_index == first_word {
+            u32::from(start % 64)
+        } else {
+            0
+        };
+        let last_bit = if word_index == last_word {
+            u32::from(end % 64)
+        } else {
+            u64::BITS - 1
+        };
+        let through_last = if last_bit == u64::BITS - 1 {
+            u64::MAX
+        } else {
+            1_u64
+                .checked_shl(last_bit.saturating_add(1))
+                .and_then(|mask| mask.checked_sub(1))
+                .ok_or(BuildError::InternalInvariant(
+                    "lowered K0 consuming range upper mask overflowed",
+                ))?
+        };
+        let below_first = if first_bit == 0 {
+            0
+        } else {
+            1_u64
+                .checked_shl(first_bit)
+                .and_then(|mask| mask.checked_sub(1))
+                .ok_or(BuildError::InternalInvariant(
+                    "lowered K0 consuming range lower mask overflowed",
+                ))?
+        };
+        members[word_index] |= through_last & !below_first;
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct K0NegativePrefilterPlan {
+    literals: fre_exact_alloc::ExactVec<LiteralPlan>,
+    maximum_needle_bytes: usize,
+}
+
+impl K0NegativePrefilterPlan {
+    fn primary_needle_bytes(&self) -> Option<usize> {
+        self.literals
+            .iter()
+            .map(|literal| literal.needle().len())
+            .max()
+    }
+}
+
+struct K0NegativePrefilterBuild {
+    plan: Option<Box<K0NegativePrefilterPlan>>,
+    planner_work: u64,
+    storage_bytes: usize,
+}
+
+fn try_charge_k0_negative_prefilter_work(
+    work: &mut u64,
+    amount: u64,
+    limit: u64,
+) -> Result<bool, BuildError> {
+    let needed = work.checked_add(amount).ok_or(BuildError::InternalInvariant(
+        "K0 negative-prefilter planner work overflowed",
+    ))?;
+    if needed > limit {
+        return Ok(false);
+    }
+    *work = needed;
+    Ok(true)
+}
+
+fn try_build_k0_negative_prefilter(
+    hir: &Hir,
+    minimum_match_bytes: Option<usize>,
+    limits: BuildLimits,
+    incumbent_planner_work: u64,
+    source_storage_bytes: usize,
+    capture_name_storage_bytes: usize,
+    automaton_storage_bytes: usize,
+) -> Result<K0NegativePrefilterBuild, BuildError> {
+    let declined = |planner_work| K0NegativePrefilterBuild {
+        plan: None,
+        planner_work,
+        storage_bytes: 0,
+    };
+    if !matches!(minimum_match_bytes, Some(minimum) if minimum > 0) {
+        return Ok(declined(incumbent_planner_work));
+    }
+    // K0 can reject a fully absolute-start-anchored pattern without injecting
+    // candidate starts across the window. A whole-window literal pass would
+    // turn that constant-prefix rejection into a linear scan.
+    if hir.properties().look_set_prefix().contains(Look::Start) {
+        return Ok(declined(incumbent_planner_work));
+    }
+    let base_persistent_bytes = source_storage_bytes
+        .checked_add(capture_name_storage_bytes)
+        .and_then(|bytes| bytes.checked_add(automaton_storage_bytes))
+        .ok_or(BuildError::PersistentBytesOverflow)?;
+    let minimum_sidecar_bytes = core::mem::size_of::<K0NegativePrefilterPlan>()
+        .checked_add(core::mem::size_of::<LiteralPlan>())
+        .and_then(|bytes| bytes.checked_add(K0_NEGATIVE_PREFILTER_MIN_NEEDLE_BYTES))
+        .ok_or(BuildError::PersistentBytesOverflow)?;
+    if limits
+        .max_persistent_bytes
+        .saturating_sub(base_persistent_bytes)
+        < minimum_sidecar_bytes
+    {
+        return Ok(declined(incumbent_planner_work));
+    }
+
+    let remaining_planner_work = limits
+        .max_planner_work
+        .checked_sub(incumbent_planner_work)
+        .ok_or(BuildError::InternalInvariant(
+            "incumbent planner work exceeded its enforced limit",
+        ))?;
+    if remaining_planner_work == 0 {
+        return Ok(declined(incumbent_planner_work));
+    }
+    let mut inspection_limits = CaptureRequiredLiteralBuildLimits::default();
+    inspection_limits.max_planner_work = inspection_limits.max_planner_work.min(
+        usize::try_from(remaining_planner_work).unwrap_or(usize::MAX),
+    );
+    inspection_limits.max_needle_bytes = inspection_limits
+        .max_needle_bytes
+        .min(K0_NEGATIVE_PREFILTER_MAX_NEEDLE_BYTES);
+
+    let inspection =
+        match capture_required_literal::inspect_conjunctive_required_literals(hir, inspection_limits)
+        {
+            Ok(inspection) => inspection,
+            Err(failure) => {
+                let actual_work = u64::try_from(failure.actual_work).map_err(|_| {
+                    BuildError::InternalInvariant(
+                        "K0 negative-prefilter planner work does not fit u64",
+                    )
+                })?;
+                let planner_work = incumbent_planner_work.checked_add(actual_work).ok_or(
+                    BuildError::InternalInvariant(
+                        "cumulative K0 negative-prefilter planner work overflowed u64",
+                    ),
+                )?;
+                if planner_work > limits.max_planner_work {
+                    return Err(BuildError::InternalInvariant(
+                        "K0 negative-prefilter attempt exceeded its planner-work admission",
+                    ));
+                }
+                return match failure.source {
+                    CaptureRequiredLiteralBuildError::Resource { .. }
+                    | CaptureRequiredLiteralBuildError::Allocation { .. } => {
+                        Ok(declined(planner_work))
+                    }
+                    CaptureRequiredLiteralBuildError::Overflow(computation)
+                    | CaptureRequiredLiteralBuildError::InternalInvariant(computation) => {
+                        Err(BuildError::InternalInvariant(computation))
+                    }
+                    CaptureRequiredLiteralBuildError::LiteralSet(_) => {
+                        Err(BuildError::InternalInvariant(
+                            "proof-only K0 negative-prefilter inspection constructed a literal set",
+                        ))
+                    }
+                };
+            }
+        };
+    let actual_work = u64::try_from(inspection.actual_work).map_err(|_| {
+        BuildError::InternalInvariant("K0 negative-prefilter planner work does not fit u64")
+    })?;
+    let mut planner_work = incumbent_planner_work.checked_add(actual_work).ok_or(
+        BuildError::InternalInvariant(
+            "cumulative K0 negative-prefilter planner work overflowed u64",
+        ),
+    )?;
+    if planner_work > limits.max_planner_work {
+        return Err(BuildError::InternalInvariant(
+            "K0 negative-prefilter inspection exceeded its planner-work admission",
+        ));
+    }
+    let inspected = inspection
+        .literals
+        .get(..inspection.count)
+        .ok_or(BuildError::InternalInvariant(
+            "K0 negative-prefilter inspection count exceeded inline literals",
+        ))?;
+    let inspected_work = u64::try_from(inspected.len()).map_err(|_| {
+        BuildError::InternalInvariant("K0 negative-prefilter inspected count does not fit u64")
+    })?;
+    if !try_charge_k0_negative_prefilter_work(
+        &mut planner_work,
+        inspected_work,
+        limits.max_planner_work,
+    )? {
+        return Ok(declined(planner_work));
+    }
+    let mut eligible = [None; capture_required_literal::MAX_CONJUNCTIVE_REQUIRED_LITERALS];
+    let mut literal_count = 0usize;
+    let mut literal_bytes = 0usize;
+    let mut maximum_needle_bytes = 0usize;
+    for &literal in inspected {
+        if literal.len() > K0_NEGATIVE_PREFILTER_MAX_NEEDLE_BYTES
+            || literal.len() > limits.literal.max_needle_bytes
+        {
+            continue;
+        }
+        *eligible
+            .get_mut(literal_count)
+            .ok_or(BuildError::InternalInvariant(
+                "K0 negative-prefilter eligible literals exceeded inline storage",
+            ))? = Some(literal);
+        literal_count = literal_count
+            .checked_add(1)
+            .ok_or(BuildError::PersistentBytesOverflow)?;
+        literal_bytes = literal_bytes
+            .checked_add(literal.len())
+            .ok_or(BuildError::PersistentBytesOverflow)?;
+        maximum_needle_bytes = maximum_needle_bytes.max(literal.len());
+    }
+    // Short literals become useful as cheap conjuncts only when at least one
+    // independently mandatory selective literal justifies the sidecar. A
+    // lone one- or two-byte whole-window pre-pass remains with K0's existing
+    // start scanner.
+    if literal_count == 0 || maximum_needle_bytes < K0_NEGATIVE_PREFILTER_MIN_NEEDLE_BYTES {
+        return Ok(declined(planner_work));
+    }
+    let storage_bytes = core::mem::size_of::<K0NegativePrefilterPlan>()
+        .checked_add(
+            literal_count
+                .checked_mul(core::mem::size_of::<LiteralPlan>())
+                .ok_or(BuildError::PersistentBytesOverflow)?,
+        )
+        .and_then(|bytes| bytes.checked_add(literal_bytes))
+        .ok_or(BuildError::PersistentBytesOverflow)?;
+    let charged_with_sidecar = base_persistent_bytes
+        .checked_add(storage_bytes)
+        .ok_or(BuildError::PersistentBytesOverflow)?;
+    if charged_with_sidecar > limits.max_persistent_bytes {
+        return Ok(declined(planner_work));
+    }
+    if !try_charge_k0_negative_prefilter_work(
+        &mut planner_work,
+        1,
+        limits.max_planner_work,
+    )? {
+        return Ok(declined(planner_work));
+    }
+    let mut literals = match fre_exact_alloc::ExactVec::try_with_capacity(literal_count) {
+        Ok(literals) => literals,
+        Err(fre_exact_alloc::CopyError::AllocationFailed) => {
+            return Ok(declined(planner_work));
+        }
+        Err(fre_exact_alloc::CopyError::LayoutOverflow) => {
+            return Err(BuildError::InternalInvariant(
+                "K0 negative-prefilter literal vector layout overflowed",
+            ));
+        }
+    };
+    for literal in eligible[..literal_count].iter().copied() {
+        let literal = literal.ok_or(BuildError::InternalInvariant(
+            "K0 negative-prefilter eligible literal was not initialized",
+        ))?;
+        let copy_work = u64::try_from(literal.len()).map_err(|_| {
+            BuildError::InternalInvariant("K0 negative-prefilter literal size does not fit u64")
+        })?;
+        if !try_charge_k0_negative_prefilter_work(
+            &mut planner_work,
+            copy_work,
+            limits.max_planner_work,
+        )? {
+            return Ok(declined(planner_work));
+        }
+        let plan = match LiteralPlan::new(literal, limits.literal) {
+            Ok(plan) => plan,
+            Err(LiteralError::NeedleLimit { .. } | LiteralError::AllocationFailed { .. }) => {
+                return Ok(declined(planner_work));
+            }
+            Err(_) => {
+                return Err(BuildError::InternalInvariant(
+                    "admitted K0 negative-prefilter literal failed infallible construction",
+                ));
+            }
+        };
+        if !try_charge_k0_negative_prefilter_work(
+            &mut planner_work,
+            1,
+            limits.max_planner_work,
+        )? {
+            return Ok(declined(planner_work));
+        }
+        literals.try_push(plan).map_err(|_| {
+            BuildError::InternalInvariant(
+                "admitted K0 negative-prefilter vector rejected a literal",
+            )
+        })?;
+    }
+    let plan = K0NegativePrefilterPlan {
+        literals,
+        maximum_needle_bytes,
+    };
+    if !try_charge_k0_negative_prefilter_work(
+        &mut planner_work,
+        1,
+        limits.max_planner_work,
+    )? {
+        return Ok(declined(planner_work));
+    }
+    let plan = match fre_exact_alloc::try_box_preserve(plan) {
+        Ok(plan) => plan,
+        Err((fre_exact_alloc::CopyError::AllocationFailed, _)) => {
+            return Ok(declined(planner_work));
+        }
+        Err((fre_exact_alloc::CopyError::LayoutOverflow, _)) => {
+            return Err(BuildError::InternalInvariant(
+                "K0 negative-prefilter owner layout overflowed",
+            ));
+        }
+    };
+    Ok(K0NegativePrefilterBuild {
+        plan: Some(plan),
+        planner_work,
+        storage_bytes,
+    })
 }
 
 fn folded_tail_planner_work_upper_bound(
@@ -2594,7 +3404,12 @@ impl PortableBuilder {
                 source,
                 capture_names,
                 line_total_grep_plan,
-                plan: PortablePlan::K0(automaton),
+                plan: PortablePlan::K0(PortableK0Plan {
+                    automaton,
+                    mandatory_suffix: None,
+                    mandatory_cut: None,
+                    negative_prefilter: None,
+                }),
                 profile: profile.clone(),
                 limits: self.limits,
                 selection: self.selection,
@@ -3638,18 +4453,96 @@ impl PortableBuilder {
                 }
             }
         }
-        let lowered =
-            fre_lower::lower(&rust, OperationSemantics::CaptureFree, self.limits.lowering)?;
+        let lowered = fre_lower::lower_raw(
+            &rust,
+            OperationSemantics::CaptureFree,
+            self.limits.lowering,
+        )?;
         let lowering = lowered.stats();
-        let automaton = lowered
-            .into_automaton()
+        let raw = lowered.into_plan();
+        let mandatory_cut = if matches!(minimum_match_bytes, Some(minimum) if minimum > 0)
+            && !rust.hir.properties().look_set_prefix().contains(Look::Start)
+        {
+            try_build_k0_mandatory_cut(&raw, self.limits, fallback_planner_work)?
+        } else {
+            K0MandatoryCutBuild {
+                plan: None,
+                planner_work: fallback_planner_work,
+                storage_bytes: 0,
+            }
+        };
+        fallback_planner_work = mandatory_cut.planner_work;
+        let mandatory_suffix = if matches!(minimum_match_bytes, Some(minimum) if minimum > 0)
+            && !rust.hir.properties().look_set_prefix().contains(Look::Start)
+        {
+            try_build_k0_mandatory_suffix(&raw, self.limits, fallback_planner_work)?
+        } else {
+            K0MandatorySuffixBuild {
+                plan: None,
+                planner_work: fallback_planner_work,
+                storage_bytes: 0,
+            }
+        };
+        fallback_planner_work = mandatory_suffix.planner_work;
+        let automaton = Automaton::from_raw(raw, self.limits.lowering.automata)
+            .map_err(fre_lower::LowerError::from)?
             .with_line_terminator(self.profile.options.line_terminator);
-        let plan = automaton.stats();
+        let automaton_stats = automaton.stats();
+        let base_persistent_bytes = source_storage_bytes
+            .checked_add(capture_name_storage_bytes)
+            .and_then(|bytes| bytes.checked_add(automaton_stats.storage_bytes()))
+            .ok_or(BuildError::PersistentBytesOverflow)?;
+        let available_optional_bytes = self
+            .limits
+            .max_persistent_bytes
+            .saturating_sub(base_persistent_bytes);
+        let mut mandatory_suffix_plan = mandatory_suffix.plan;
+        let mut mandatory_suffix_storage_bytes = mandatory_suffix_plan
+            .as_ref()
+            .map_or(0, |_| mandatory_suffix.storage_bytes);
+        if mandatory_suffix_storage_bytes > available_optional_bytes {
+            mandatory_suffix_plan = None;
+            mandatory_suffix_storage_bytes = 0;
+        }
+        let mut mandatory_cut_plan = mandatory_cut.plan;
+        let mut mandatory_cut_storage_bytes = mandatory_cut_plan
+            .map_or(0, |_| mandatory_cut.storage_bytes);
+        let cut_fits = mandatory_cut_storage_bytes
+            <= available_optional_bytes.saturating_sub(mandatory_suffix_storage_bytes);
+        if !cut_fits {
+            mandatory_cut_plan = None;
+            mandatory_cut_storage_bytes = 0;
+        }
+        let negative_prefilter = try_build_k0_negative_prefilter(
+            &rust.hir,
+            minimum_match_bytes,
+            self.limits,
+            fallback_planner_work,
+            source_storage_bytes,
+            capture_name_storage_bytes,
+            automaton_stats
+                .storage_bytes()
+                .checked_add(mandatory_suffix_storage_bytes)
+                .and_then(|bytes| bytes.checked_add(mandatory_cut_storage_bytes))
+                .ok_or(BuildError::PersistentBytesOverflow)?,
+        )?;
+        fallback_planner_work = negative_prefilter.planner_work;
+        let plan_storage_bytes = automaton_stats
+            .storage_bytes()
+            .checked_add(mandatory_suffix_storage_bytes)
+            .and_then(|bytes| bytes.checked_add(mandatory_cut_storage_bytes))
+            .and_then(|bytes| bytes.checked_add(negative_prefilter.storage_bytes))
+            .ok_or(BuildError::PersistentBytesOverflow)?;
         Ok(PortableRegex {
             source,
             capture_names,
             line_total_grep_plan,
-            plan: PortablePlan::K0(automaton),
+            plan: PortablePlan::K0(PortableK0Plan {
+                automaton,
+                mandatory_suffix: mandatory_suffix_plan,
+                mandatory_cut: mandatory_cut_plan,
+                negative_prefilter: negative_prefilter.plan,
+            }),
             profile: profile.clone(),
             limits: self.limits,
             selection: self.selection,
@@ -3660,9 +4553,9 @@ impl PortableBuilder {
                 plan: PlanKind::K0,
                 planner_work: fallback_planner_work,
                 lowering: Some(lowering),
-                states: plan.states(),
-                edges: plan.edges(),
-                plan_storage_bytes: plan.storage_bytes(),
+                states: automaton_stats.states(),
+                edges: automaton_stats.edges(),
+                plan_storage_bytes,
                 source_storage_bytes,
                 capture_name_storage_bytes,
                 charged_persistent_bytes: 0,
@@ -3887,6 +4780,13 @@ impl TryFrom<String> for PortableRegex {
     }
 }
 
+struct PortableK0Plan {
+    automaton: Automaton,
+    mandatory_suffix: Option<K0MandatorySuffixPlan>,
+    mandatory_cut: Option<K0MandatoryCutPlan>,
+    negative_prefilter: Option<Box<K0NegativePrefilterPlan>>,
+}
+
 enum PortablePlan {
     ExactLiteral(LiteralPlan),
     PackedLiteralSet(PackedLiteralSetPlan),
@@ -3901,7 +4801,7 @@ enum PortablePlan {
     ForwardAnchored(ForwardAnchoredPlan),
     DispatchedForwardAnchored(DispatchedForwardAnchoredPlan),
     ForwardEndFixed(AbsoluteEndFixedPlan),
-    K0(Automaton),
+    K0(PortableK0Plan),
     UnicodeFoldedLiteral(Box<unicode_folded_literal::UnicodeFoldedLiteralSearchPlan>),
     UnicodeWordRun(unicode_word_run::Plan),
     AsciiWordRun(unicode_word_run::AsciiPlan),
@@ -4059,6 +4959,53 @@ impl PortableRegex {
         &self.report
     }
 
+    /// Maximum length among the construction-proved mandatory literals
+    /// retained for reusable unlimited K0 value searches.
+    ///
+    /// `None` means either another runtime family was selected or the
+    /// optional proof, resource, and regret gates declined the sidecar.
+    /// Literals prove negative results directly. An exact graph-proved suffix
+    /// may additionally propose endpoints, but every positive result is still
+    /// authenticated by the original K0 reverse machine.
+    #[must_use]
+    pub fn k0_negative_prefilter_needle_bytes(&self) -> Option<usize> {
+        match &self.plan {
+            PortablePlan::K0(k0) => {
+                let suffix = k0
+                    .mandatory_suffix
+                    .as_ref()
+                    .map(|suffix| suffix.needle().len());
+                let conjunctive = k0
+                    .negative_prefilter
+                    .as_deref()
+                    .and_then(K0NegativePrefilterPlan::primary_needle_bytes);
+                match (suffix, conjunctive) {
+                    (Some(left), Some(right)) => Some(left.max(right)),
+                    (Some(length), None) | (None, Some(length)) => Some(length),
+                    (None, None) => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Number of independent mandatory literal sidecars retained for K0.
+    ///
+    /// This includes the exact graph-proved suffix, when present, plus every
+    /// conjunctive negative-prefilter literal.
+    #[must_use]
+    pub fn k0_negative_prefilter_needle_count(&self) -> usize {
+        match &self.plan {
+            PortablePlan::K0(k0) => {
+                usize::from(k0.mandatory_suffix.is_some())
+                    + k0.negative_prefilter
+                        .as_deref()
+                        .map_or(0, |plan| plan.literals.len())
+            }
+            _ => 0,
+        }
+    }
+
     /// Complete admitted-only construction census for the Unicode
     /// folded-literal plan.
     ///
@@ -4165,7 +5112,7 @@ impl PortableRegex {
         bidirectional: bool,
     ) -> Result<PortableSearchSession<'_>, SearchError> {
         let plan = match &self.plan {
-            PortablePlan::K0(automaton) => {
+            PortablePlan::K0(k0) => {
                 let workspace_limits = SearchSessionLimits {
                     max_setup_work: limits.max_setup_work,
                     max_scratch_bytes: limits.max_scratch_bytes,
@@ -4173,19 +5120,28 @@ impl PortableRegex {
                 let positive =
                     matches!(self.report.minimum_match_bytes, Some(minimum) if minimum > 0);
                 let assertion_free_nullable = self.report.minimum_match_bytes == Some(0)
-                    && !automaton.stats().has_assertions();
+                    && !k0.automaton.stats().has_assertions();
                 let endpoint_eligible = positive || assertion_free_nullable;
                 // Select the optional cache from its source-free layout before
                 // allocating. Once accelerated construction begins, propagate
                 // every failure so a partial attempt cannot disappear from
                 // successful setup accounting.
                 let session = K0SearchSession::new_selected(
-                    automaton,
+                    &k0.automaton,
                     workspace_limits,
                     endpoint_eligible,
                     bidirectional && positive,
                 )?;
-                PortableSearchSessionPlan::K0 { session }
+                PortableSearchSessionPlan::K0 {
+                    session,
+                    mandatory_suffix: k0.mandatory_suffix.as_ref(),
+                    mandatory_cut: k0.mandatory_cut.as_ref(),
+                    negative_prefilter: k0.negative_prefilter.as_deref(),
+                    mandatory_suffix_exists_state: K0NegativePrefilterState::default(),
+                    mandatory_suffix_span_state: K0NegativePrefilterState::default(),
+                    negative_prefilter_exists_state: K0NegativePrefilterState::default(),
+                    negative_prefilter_span_state: K0NegativePrefilterState::default(),
+                }
             }
             _ => PortableSearchSessionPlan::Native(self),
         };
@@ -4444,8 +5400,9 @@ impl PortableRegex {
                     SearchAccounting::UnicodeFoldedLiteral(accounting.actual),
                 ))
             }
-            PortablePlan::K0(automaton) => {
-                let report = automaton
+            PortablePlan::K0(k0) => {
+                let report = k0
+                    .automaton
                     .prepare::<Exists>()
                     .search_window(haystack, window, limits)?;
                 let accounting = report.accounting();
@@ -4616,7 +5573,8 @@ impl PortableRegex {
                 )
                 .map(|(matched, _)| matched)
                 .map_err(SearchError::from),
-            PortablePlan::K0(automaton) => automaton
+            PortablePlan::K0(k0) => k0
+                .automaton
                 .prepare::<Exists>()
                 .search_window(haystack, window, limits)
                 .map(fre_automata::SearchReport::into_output)
@@ -4848,8 +5806,9 @@ impl PortableRegex {
                     SearchAccounting::UnicodeFoldedLiteral(accounting.actual),
                 ))
             }
-            PortablePlan::K0(automaton) => {
-                let report = automaton
+            PortablePlan::K0(k0) => {
+                let report = k0
+                    .automaton
                     .prepare::<EarliestEnd>()
                     .search_window(haystack, window, limits)?;
                 let accounting = report.accounting();
@@ -5024,8 +5983,9 @@ impl PortableRegex {
                     SearchAccounting::UnicodeFoldedLiteral(accounting.actual),
                 ))
             }
-            PortablePlan::K0(automaton) => {
-                let report = automaton
+            PortablePlan::K0(k0) => {
+                let report = k0
+                    .automaton
                     .prepare::<SelectedEnd>()
                     .search(haystack, limits)?;
                 let accounting = report.accounting();
@@ -5423,8 +6383,9 @@ impl PortableRegex {
                     SearchAccounting::UnicodeFoldedLiteral(accounting.actual),
                 ))
             }
-            PortablePlan::K0(automaton) => {
-                let report = automaton
+            PortablePlan::K0(k0) => {
+                let report = k0
+                    .automaton
                     .prepare::<Span>()
                     .search_window(haystack, window, limits)?;
                 let accounting = report.accounting();
@@ -5580,7 +6541,8 @@ impl PortableRegex {
                 )
                 .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
                 .map_err(SearchError::from),
-            PortablePlan::K0(automaton) => automaton
+            PortablePlan::K0(k0) => k0
+                .automaton
                 .prepare::<Span>()
                 .search_window(haystack, window, limits)
                 .map(|report| {
@@ -5937,8 +6899,9 @@ impl PortableRegex {
 /// Operation-local reusable search state for one immutable portable matcher.
 ///
 /// This keeps construction-selected specialized plans unchanged. Only K0 owns
-/// mutable state, consisting of one fixed-capacity workspace whose size is
-/// determined entirely by the validated automaton.
+/// mutable state, consisting of one fixed-capacity workspace plus bounded
+/// performance-only prefilter histories whose sizes are determined entirely
+/// by the validated plan.
 #[derive(Debug)]
 pub struct PortableSearchSession<'a> {
     plan: PortableSearchSessionPlan<'a>,
@@ -5951,7 +6914,501 @@ pub struct PortableSearchSession<'a> {
 )]
 enum PortableSearchSessionPlan<'a> {
     Native(&'a PortableRegex),
-    K0 { session: K0SearchSession<'a> },
+    K0 {
+        session: K0SearchSession<'a>,
+        mandatory_suffix: Option<&'a K0MandatorySuffixPlan>,
+        mandatory_cut: Option<&'a K0MandatoryCutPlan>,
+        negative_prefilter: Option<&'a K0NegativePrefilterPlan>,
+        mandatory_suffix_exists_state: K0NegativePrefilterState,
+        mandatory_suffix_span_state: K0NegativePrefilterState,
+        negative_prefilter_exists_state: K0NegativePrefilterState,
+        negative_prefilter_span_state: K0NegativePrefilterState,
+    },
+}
+
+// A negative literal pass pays for itself only on a reusable, sufficiently
+// large window. Requiring four windows of needle width limits exposure for
+// long needles whose first occurrence is early while retaining the broad
+// absent-input case this sidecar is meant to accelerate.
+const K0_NEGATIVE_PREFILTER_MIN_WINDOW_BYTES: usize = 1_024;
+const K0_NEGATIVE_PREFILTER_WINDOW_NEEDLE_FACTOR: usize = 4;
+const K0_NEGATIVE_PREFILTER_PRESENT_STREAK_LIMIT: u8 = 8;
+const K0_NEGATIVE_PREFILTER_MAX_DISABLED_CALLS: u8 = 64;
+const K0_NEGATIVE_PREFILTER_SIZE_CLASS_STATES: usize = 4;
+const K0_SUFFIX_FORWARD_FALLBACK_BYTES: usize = 1_024;
+// Scalar recovery is needed only for high bytes because the exact ASCII
+// subset is scanned in bulk. High-heavy inputs fail open instead of turning
+// this optional separator proof into an unbounded reverse byte walk.
+const K0_SUFFIX_HIGH_BYTE_BACKWARD_MAX: usize = 256;
+const K0_SUFFIX_MAX_CANDIDATES: usize = 8;
+const K0_SUFFIX_REVERSE_CREDIT_BYTES: usize = 1_024;
+const K0_SUFFIX_REVERSE_PROGRESS_FACTOR: usize = 2;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct K0NegativePrefilterClassState {
+    present_streak: u8,
+    disabled_calls: u8,
+    present_backoff: u8,
+    next_predicate: u8,
+    window_size_class: Option<u32>,
+}
+
+impl K0NegativePrefilterClassState {
+    const fn observe_absent(&mut self) {
+        self.present_streak = 0;
+        self.disabled_calls = 0;
+        self.present_backoff = 0;
+    }
+
+    fn observe_present(&mut self) {
+        self.present_streak = self.present_streak.saturating_add(1);
+        if self.present_streak >= K0_NEGATIVE_PREFILTER_PRESENT_STREAK_LIMIT {
+            self.present_streak = K0_NEGATIVE_PREFILTER_PRESENT_STREAK_LIMIT - 1;
+            self.present_backoff = if self.present_backoff == 0 {
+                1
+            } else {
+                self.present_backoff
+                    .saturating_mul(2)
+                    .min(K0_NEGATIVE_PREFILTER_MAX_DISABLED_CALLS)
+            };
+            self.disabled_calls = self.present_backoff;
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct K0NegativePrefilterState {
+    classes: [K0NegativePrefilterClassState; K0_NEGATIVE_PREFILTER_SIZE_CLASS_STATES],
+    next_replacement: u8,
+}
+
+impl K0NegativePrefilterState {
+    fn class_for(&mut self, window_size_class: u32) -> usize {
+        if let Some(index) = self
+            .classes
+            .iter()
+            .position(|state| state.window_size_class == Some(window_size_class))
+        {
+            return index;
+        }
+        if let Some(index) = self
+            .classes
+            .iter()
+            .position(|state| state.window_size_class.is_none())
+        {
+            self.classes[index].window_size_class = Some(window_size_class);
+            return index;
+        }
+        let index = usize::from(self.next_replacement) % self.classes.len();
+        self.next_replacement = self
+            .next_replacement
+            .wrapping_add(1)
+            % u8::try_from(self.classes.len()).expect("size-class state count fits u8");
+        self.classes[index] = K0NegativePrefilterClassState {
+            window_size_class: Some(window_size_class),
+            ..K0NegativePrefilterClassState::default()
+        };
+        index
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum K0NegativePrefilterOutcome {
+    Bypass,
+    Absent,
+    Present,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct K0NegativePrefilterAttempt {
+    outcome: K0NegativePrefilterOutcome,
+    candidate_floor: Option<usize>,
+    state_after_success: K0NegativePrefilterState,
+}
+
+fn run_k0_negative_prefilter(
+    mandatory_cut: Option<&K0MandatoryCutPlan>,
+    plan: Option<&K0NegativePrefilterPlan>,
+    state: K0NegativePrefilterState,
+    haystack: &[u8],
+    window: SearchWindow,
+    limits: SearchLimits,
+) -> K0NegativePrefilterAttempt {
+    let unchanged = |outcome| K0NegativePrefilterAttempt {
+        outcome,
+        candidate_floor: None,
+        state_after_success: state,
+    };
+    if mandatory_cut.is_none() && plan.is_none() {
+        return unchanged(K0NegativePrefilterOutcome::Bypass);
+    }
+    if limits != SearchLimits::unlimited()
+        || window.start() > window.end()
+        || window.end() > haystack.len()
+    {
+        return unchanged(K0NegativePrefilterOutcome::Bypass);
+    }
+    let window_bytes = window.end() - window.start();
+    let maximum_needle_bytes = plan.map_or(1, |plan| plan.maximum_needle_bytes);
+    let minimum_window_bytes = K0_NEGATIVE_PREFILTER_MIN_WINDOW_BYTES.max(
+        maximum_needle_bytes
+            .saturating_mul(K0_NEGATIVE_PREFILTER_WINDOW_NEEDLE_FACTOR),
+    );
+    if window_bytes < minimum_window_bytes {
+        return unchanged(K0NegativePrefilterOutcome::Bypass);
+    }
+    let window_size_class = usize::BITS - window_bytes.leading_zeros();
+    let mut next_state = state;
+    let class_index = next_state.class_for(window_size_class);
+    let class_state = &mut next_state.classes[class_index];
+    if class_state.disabled_calls != 0 {
+        class_state.disabled_calls -= 1;
+        return K0NegativePrefilterAttempt {
+            outcome: K0NegativePrefilterOutcome::Bypass,
+            candidate_floor: None,
+            state_after_success: next_state,
+        };
+    }
+    let literal_count = plan.map_or(0, |plan| plan.literals.len());
+    let cut_count = usize::from(mandatory_cut.is_some());
+    let predicate_count = cut_count
+        .checked_add(literal_count)
+        .expect("bounded negative-predicate count cannot overflow");
+    if predicate_count == 0 {
+        return unchanged(K0NegativePrefilterOutcome::Bypass);
+    }
+    // K0 already derives its own graph-proved forward start filter. Start at
+    // the cheap graph cut when available, then the longest structural literal;
+    // conjunctive inspection publishes literals in descending length order.
+    // The exact suffix is a mutually exclusive positive-verification route.
+    // Keeping an equal literal here is intentional fallback coverage for calls
+    // where suffix verification bypasses before scanning. One probe owns
+    // exactly one whole-window pass; retaining an absent predicate's ordinal
+    // makes subsequent calls reuse the useful proof instead of paying for
+    // other conjuncts first.
+    let predicate_ordinal = usize::from(class_state.next_predicate) % predicate_count;
+    let mut candidate_floor = None;
+    let present = if predicate_ordinal < cut_count {
+        let cut = mandatory_cut
+            .copied()
+            .expect("cut ordinal requires a mandatory-cut plan");
+        match cut.first_member(&haystack[window.start()..window.end()]) {
+            Some(first_member) => {
+                candidate_floor = cut.candidate_floor(window.start(), first_member);
+                true
+            }
+            None => false,
+        }
+    } else {
+        let plan = plan.expect("literal ordinal requires a literal plan");
+        let literal_index = predicate_ordinal
+            .checked_sub(cut_count)
+            .expect("literal predicate ordinal follows the cut");
+        let literal = &plan.literals[literal_index];
+        match literal.find_window(
+            haystack,
+            LiteralWindow::new(window.start(), window.end()),
+            LiteralSearchLimits::unlimited(),
+        ) {
+            Ok((found, _)) => found.is_some(),
+            Err(_) => return unchanged(K0NegativePrefilterOutcome::Bypass),
+        }
+    };
+    if !present {
+        class_state.observe_absent();
+        K0NegativePrefilterAttempt {
+            outcome: K0NegativePrefilterOutcome::Absent,
+            candidate_floor: None,
+            state_after_success: next_state,
+        }
+    } else {
+        class_state.next_predicate = u8::try_from(
+            predicate_ordinal
+                .checked_add(1)
+                .expect("bounded predicate ordinal cannot overflow")
+                % predicate_count,
+        )
+        .expect("bounded predicate count fits u8");
+        class_state.observe_present();
+        K0NegativePrefilterAttempt {
+            outcome: K0NegativePrefilterOutcome::Present,
+            candidate_floor,
+            state_after_success: next_state,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum K0MandatorySuffixOutcome {
+    Bypass,
+    Fallback,
+    Found(bool),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct K0MandatorySuffixAttempt {
+    outcome: K0MandatorySuffixOutcome,
+    state_after_success: K0NegativePrefilterState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum K0MandatorySuffixSpanOutcome {
+    Bypass,
+    Fallback,
+    Absent,
+    Narrowed(usize),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct K0MandatorySuffixSpanAttempt {
+    outcome: K0MandatorySuffixSpanOutcome,
+    state_after_success: K0NegativePrefilterState,
+}
+
+fn try_k0_mandatory_suffix_span_start(
+    suffix: &K0MandatorySuffixPlan,
+    state: K0NegativePrefilterState,
+    haystack: &[u8],
+    window: SearchWindow,
+    limits: SearchLimits,
+) -> K0MandatorySuffixSpanAttempt {
+    let unchanged = |outcome| K0MandatorySuffixSpanAttempt {
+        outcome,
+        state_after_success: state,
+    };
+    if limits != SearchLimits::unlimited()
+        || suffix.consumption_run.is_none()
+        || window.start() > window.end()
+        || window.end() > haystack.len()
+    {
+        return unchanged(K0MandatorySuffixSpanOutcome::Bypass);
+    }
+    let window_bytes = window.end().saturating_sub(window.start());
+    if window_bytes < K0_NEGATIVE_PREFILTER_MIN_WINDOW_BYTES {
+        return unchanged(K0MandatorySuffixSpanOutcome::Bypass);
+    }
+
+    let window_size_class = usize::BITS - window_bytes.leading_zeros();
+    let mut next_state = state;
+    let class_index = next_state.class_for(window_size_class);
+    if next_state.classes[class_index].disabled_calls != 0 {
+        next_state.classes[class_index].disabled_calls -= 1;
+        return K0MandatorySuffixSpanAttempt {
+            outcome: K0MandatorySuffixSpanOutcome::Fallback,
+            state_after_success: next_state,
+        };
+    }
+
+    let occurrence = match suffix.find_window(haystack, window.start(), window.end()) {
+        Ok(occurrence) => occurrence,
+        Err(_) => {
+            next_state.classes[class_index].observe_present();
+            return K0MandatorySuffixSpanAttempt {
+                outcome: K0MandatorySuffixSpanOutcome::Fallback,
+                state_after_success: next_state,
+            };
+        }
+    };
+    let Some((occurrence_start, _)) = occurrence else {
+        next_state.classes[class_index].observe_absent();
+        return K0MandatorySuffixSpanAttempt {
+            outcome: K0MandatorySuffixSpanOutcome::Absent,
+            state_after_success: next_state,
+        };
+    };
+    let narrowed = suffix.narrowed_start_before(haystack, window.start(), occurrence_start);
+    let useful = narrowed
+        .checked_sub(window.start())
+        .is_some_and(|saved| saved >= K0_SUFFIX_FORWARD_FALLBACK_BYTES);
+    if !useful {
+        next_state.classes[class_index].observe_present();
+        return K0MandatorySuffixSpanAttempt {
+            outcome: K0MandatorySuffixSpanOutcome::Fallback,
+            state_after_success: next_state,
+        };
+    }
+    next_state.classes[class_index].observe_absent();
+    K0MandatorySuffixSpanAttempt {
+        outcome: K0MandatorySuffixSpanOutcome::Narrowed(narrowed),
+        state_after_success: next_state,
+    }
+}
+
+#[inline(never)]
+fn try_k0_mandatory_suffix_exists(
+    session: &mut K0SearchSession<'_>,
+    suffix: &K0MandatorySuffixPlan,
+    state: K0NegativePrefilterState,
+    haystack: &[u8],
+    window: SearchWindow,
+    limits: SearchLimits,
+) -> Result<K0MandatorySuffixAttempt, SearchError> {
+    let unchanged = |outcome| K0MandatorySuffixAttempt {
+        outcome,
+        state_after_success: state,
+    };
+    if limits != SearchLimits::unlimited()
+        || window.start() > window.end()
+        || window.end() > haystack.len()
+    {
+        return Ok(unchanged(K0MandatorySuffixOutcome::Bypass));
+    }
+    let Some(window_bytes) = window.end().checked_sub(window.start()) else {
+        return Ok(unchanged(K0MandatorySuffixOutcome::Bypass));
+    };
+    if window_bytes < K0_NEGATIVE_PREFILTER_MIN_WINDOW_BYTES
+        || !session.positive_end_verifier_available()
+    {
+        return Ok(unchanged(K0MandatorySuffixOutcome::Bypass));
+    }
+
+    let window_size_class = usize::BITS - window_bytes.leading_zeros();
+    let mut next_state = state;
+    let class_index = next_state.class_for(window_size_class);
+    if next_state.classes[class_index].disabled_calls != 0 {
+        next_state.classes[class_index].disabled_calls -= 1;
+        return Ok(K0MandatorySuffixAttempt {
+            // This size class already learned that suffix speculation loses.
+            // Run ordinary K0 directly instead of phase-locking a second
+            // adaptive predicate while the suffix retry clock counts down.
+            outcome: K0MandatorySuffixOutcome::Fallback,
+            state_after_success: next_state,
+        });
+    }
+    if !session.negative_terminal_has_reused_work_certificate(window_bytes) {
+        return Ok(unchanged(K0MandatorySuffixOutcome::Bypass));
+    }
+
+    let mut search_start = window.start();
+    let mut candidates = 0usize;
+    let mut cumulative_work = 0u64;
+    let mut cumulative_reverse_bytes = 0usize;
+    loop {
+        let occurrence = match suffix.find_window(haystack, search_start, window.end()) {
+            Ok(occurrence) => occurrence,
+            Err(_) => {
+                next_state.classes[class_index].observe_present();
+                return Ok(K0MandatorySuffixAttempt {
+                    outcome: K0MandatorySuffixOutcome::Fallback,
+                    state_after_success: next_state,
+                });
+            }
+        };
+        let Some((occurrence_start, endpoint)) = occurrence else {
+            next_state.classes[class_index].observe_absent();
+            return Ok(K0MandatorySuffixAttempt {
+                outcome: K0MandatorySuffixOutcome::Found(false),
+                state_after_success: next_state,
+            });
+        };
+        let Some(progress) = endpoint.checked_sub(window.start()) else {
+            next_state.classes[class_index].observe_present();
+            return Ok(K0MandatorySuffixAttempt {
+                outcome: K0MandatorySuffixOutcome::Fallback,
+                state_after_success: next_state,
+            });
+        };
+        candidates = candidates.saturating_add(1);
+        if candidates > K0_SUFFIX_MAX_CANDIDATES
+            || progress <= K0_SUFFIX_FORWARD_FALLBACK_BYTES
+        {
+            next_state.classes[class_index].observe_present();
+            return Ok(K0MandatorySuffixAttempt {
+                outcome: K0MandatorySuffixOutcome::Fallback,
+                state_after_success: next_state,
+            });
+        }
+        let Some(allowed_reverse_bytes) = progress
+            .checked_mul(K0_SUFFIX_REVERSE_PROGRESS_FACTOR)
+            .and_then(|bytes| bytes.checked_add(K0_SUFFIX_REVERSE_CREDIT_BYTES))
+        else {
+            next_state.classes[class_index].observe_present();
+            return Ok(K0MandatorySuffixAttempt {
+                outcome: K0MandatorySuffixOutcome::Fallback,
+                state_after_success: next_state,
+            });
+        };
+        let Some(remaining_reverse_bytes) =
+            allowed_reverse_bytes.checked_sub(cumulative_reverse_bytes)
+        else {
+            next_state.classes[class_index].observe_present();
+            return Ok(K0MandatorySuffixAttempt {
+                outcome: K0MandatorySuffixOutcome::Fallback,
+                state_after_success: next_state,
+            });
+        };
+        let Some(work_budget_bytes) = progress.checked_add(K0_SUFFIX_REVERSE_CREDIT_BYTES) else {
+            next_state.classes[class_index].observe_present();
+            return Ok(K0MandatorySuffixAttempt {
+                outcome: K0MandatorySuffixOutcome::Fallback,
+                state_after_success: next_state,
+            });
+        };
+        let Some(allowed_work) =
+            session.positive_end_verifier_work_certificate(work_budget_bytes)
+        else {
+            next_state.classes[class_index].observe_present();
+            return Ok(K0MandatorySuffixAttempt {
+                outcome: K0MandatorySuffixOutcome::Fallback,
+                state_after_success: next_state,
+            });
+        };
+        let Some(remaining_work) = allowed_work.checked_sub(cumulative_work) else {
+            next_state.classes[class_index].observe_present();
+            return Ok(K0MandatorySuffixAttempt {
+                outcome: K0MandatorySuffixOutcome::Fallback,
+                state_after_success: next_state,
+            });
+        };
+        let verification = session
+            .try_positive_match_ending_at(
+                haystack,
+                window,
+                endpoint,
+                K0PositiveEndLimits::new(remaining_work, remaining_reverse_bytes),
+            )
+            .map_err(SearchError::from)?;
+        cumulative_work = cumulative_work
+            .checked_add(verification.receipt().work())
+            .ok_or(SearchError::K0(K0SearchError::ArithmeticOverflow {
+                computation: "cumulative mandatory-suffix verifier work",
+            }))?;
+        cumulative_reverse_bytes = cumulative_reverse_bytes
+            .checked_add(verification.receipt().reverse_source_bytes())
+            .ok_or(SearchError::K0(
+                K0SearchError::ArithmeticOverflow {
+                    computation: "cumulative mandatory-suffix reverse bytes",
+                },
+            ))?;
+        match verification.outcome() {
+            K0PositiveEndOutcome::Matched => {
+                let useful_work = u64::try_from(progress)
+                    .is_ok_and(|progress| cumulative_work <= progress);
+                if useful_work {
+                    next_state.classes[class_index].observe_absent();
+                } else {
+                    next_state.classes[class_index].observe_present();
+                }
+                return Ok(K0MandatorySuffixAttempt {
+                    outcome: K0MandatorySuffixOutcome::Found(true),
+                    state_after_success: next_state,
+                });
+            }
+            K0PositiveEndOutcome::Declined => {
+                next_state.classes[class_index].observe_present();
+                return Ok(K0MandatorySuffixAttempt {
+                    outcome: K0MandatorySuffixOutcome::Fallback,
+                    state_after_success: next_state,
+                });
+            }
+            K0PositiveEndOutcome::Rejected => {}
+        }
+        search_start = occurrence_start.checked_add(1).ok_or(SearchError::K0(
+            K0SearchError::ArithmeticOverflow {
+                computation: "next overlapping mandatory-suffix occurrence",
+            },
+        ))?;
+    }
 }
 
 impl<'r> PortableSearchSession<'r> {
@@ -5972,7 +7429,9 @@ impl<'r> PortableSearchSession<'r> {
     pub const fn workspace_setup_accounting(&self) -> Option<SearchSessionSetupAccounting> {
         match &self.plan {
             PortableSearchSessionPlan::Native(_) => None,
-            PortableSearchSessionPlan::K0 { session } => Some(session.construction_accounting()),
+            PortableSearchSessionPlan::K0 { session, .. } => {
+                Some(session.construction_accounting())
+            }
         }
     }
 
@@ -6054,7 +7513,7 @@ impl<'r> PortableSearchSession<'r> {
             PortableSearchSessionPlan::Native(regex) => {
                 regex.is_match_window(haystack, window, limits)
             }
-            PortableSearchSessionPlan::K0 { session } => {
+            PortableSearchSessionPlan::K0 { session, .. } => {
                 let report = session.search_window::<Exists>(haystack, window, limits)?;
                 let accounting = report.accounting();
                 Ok((report.into_output(), SearchAccounting::K0(accounting)))
@@ -6080,9 +7539,76 @@ impl<'r> PortableSearchSession<'r> {
             PortableSearchSessionPlan::Native(regex) => {
                 regex.is_match_window_value(haystack, window, limits)
             }
-            PortableSearchSessionPlan::K0 { session } => session
-                .search_exists_value(haystack, window, limits)
-                .map_err(SearchError::from),
+            PortableSearchSessionPlan::K0 {
+                session,
+                mandatory_suffix,
+                mandatory_cut,
+                negative_prefilter,
+                mandatory_suffix_exists_state,
+                negative_prefilter_exists_state,
+                ..
+            } => {
+                let mut suffix_state_after_success = *mandatory_suffix_exists_state;
+                if let Some(suffix) = *mandatory_suffix {
+                    let suffix_attempt = try_k0_mandatory_suffix_exists(
+                        session,
+                        suffix,
+                        *mandatory_suffix_exists_state,
+                        haystack,
+                        window,
+                        limits,
+                    )?;
+                    suffix_state_after_success = suffix_attempt.state_after_success;
+                    match suffix_attempt.outcome {
+                        K0MandatorySuffixOutcome::Found(found) => {
+                            *mandatory_suffix_exists_state = suffix_state_after_success;
+                            return Ok(found);
+                        }
+                        K0MandatorySuffixOutcome::Fallback => {
+                            let result = session
+                                .search_exists_value(haystack, window, limits)
+                                .map_err(SearchError::from);
+                            if result.is_ok() {
+                                *mandatory_suffix_exists_state = suffix_state_after_success;
+                            }
+                            return result;
+                        }
+                        K0MandatorySuffixOutcome::Bypass => {}
+                    }
+                }
+                let attempt = run_k0_negative_prefilter(
+                    *mandatory_cut,
+                    *negative_prefilter,
+                    *negative_prefilter_exists_state,
+                    haystack,
+                    window,
+                    limits,
+                );
+                if attempt.outcome == K0NegativePrefilterOutcome::Absent {
+                    let certified = window
+                        .end()
+                        .checked_sub(window.start())
+                        .is_some_and(|input_bytes| {
+                            session.negative_terminal_has_reused_work_certificate(input_bytes)
+                        });
+                    if certified {
+                        *mandatory_suffix_exists_state = suffix_state_after_success;
+                        *negative_prefilter_exists_state = attempt.state_after_success;
+                        return Ok(false);
+                    }
+                }
+                let search_window = attempt
+                    .candidate_floor
+                    .map_or(window, |start| SearchWindow::new(start, window.end()));
+                let result = session
+                    .search_exists_value(haystack, search_window, limits)
+                    .map_err(SearchError::from);
+                if result.is_ok() {
+                    *mandatory_suffix_exists_state = suffix_state_after_success;
+                    *negative_prefilter_exists_state = attempt.state_after_success;
+                }
+                result
+            }
         }
     }
 
@@ -6126,7 +7652,7 @@ impl<'r> PortableSearchSession<'r> {
             PortableSearchSessionPlan::Native(regex) => {
                 regex.shortest_match_window(haystack, window, limits)
             }
-            PortableSearchSessionPlan::K0 { session } => {
+            PortableSearchSessionPlan::K0 { session, .. } => {
                 let report = session.search_window::<EarliestEnd>(haystack, window, limits)?;
                 let accounting = report.accounting();
                 Ok((report.into_output(), SearchAccounting::K0(accounting)))
@@ -6147,7 +7673,7 @@ impl<'r> PortableSearchSession<'r> {
     ) -> Result<(Option<usize>, SearchAccounting), SearchError> {
         match &mut self.plan {
             PortableSearchSessionPlan::Native(regex) => regex.selected_end(haystack, limits),
-            PortableSearchSessionPlan::K0 { session } => {
+            PortableSearchSessionPlan::K0 { session, .. } => {
                 let report = session.search::<SelectedEnd>(haystack, limits)?;
                 let accounting = report.accounting();
                 Ok((report.into_output(), SearchAccounting::K0(accounting)))
@@ -6262,8 +7788,12 @@ impl<'r> PortableSearchSession<'r> {
     ) -> Result<(Option<Match>, SearchAccounting), SearchError> {
         match &mut self.plan {
             PortableSearchSessionPlan::Native(regex) => regex.find_window(haystack, window, limits),
-            PortableSearchSessionPlan::K0 { session } => {
-                let report = session.search_window::<Span>(haystack, window, limits)?;
+            PortableSearchSessionPlan::K0 { session, .. } => {
+                let report = if window.end() == haystack.len() {
+                    session.search_span_at_cursor(haystack, window.start(), limits)?
+                } else {
+                    session.search_window::<Span>(haystack, window, limits)?
+                };
                 let accounting = report.accounting();
                 let matched = report.into_output().map(|span| Match {
                     start: span.start(),
@@ -6291,15 +7821,117 @@ impl<'r> PortableSearchSession<'r> {
             PortableSearchSessionPlan::Native(regex) => {
                 regex.find_window_value(haystack, window, limits)
             }
-            PortableSearchSessionPlan::K0 { session } => session
-                .search_span_value(haystack, window, limits)
-                .map(|found| {
-                    found.map(|span| Match {
-                        start: span.start(),
-                        end: span.end(),
+            PortableSearchSessionPlan::K0 {
+                session,
+                mandatory_suffix,
+                mandatory_cut,
+                negative_prefilter,
+                mandatory_suffix_span_state,
+                negative_prefilter_span_state,
+                ..
+            } => {
+                let mut suffix_state_after_success = *mandatory_suffix_span_state;
+                if let Some(suffix) = *mandatory_suffix {
+                    let suffix_attempt = try_k0_mandatory_suffix_span_start(
+                        suffix,
+                        *mandatory_suffix_span_state,
+                        haystack,
+                        window,
+                        limits,
+                    );
+                    suffix_state_after_success = suffix_attempt.state_after_success;
+                    let run_k0_directly = match suffix_attempt.outcome {
+                        K0MandatorySuffixSpanOutcome::Absent => {
+                            let certified = window
+                                .end()
+                                .checked_sub(window.start())
+                                .is_some_and(|input_bytes| {
+                                    session
+                                        .negative_terminal_has_reused_work_certificate(input_bytes)
+                                });
+                            if certified {
+                                *mandatory_suffix_span_state = suffix_state_after_success;
+                                return Ok(None);
+                            }
+                            true
+                        }
+                        K0MandatorySuffixSpanOutcome::Narrowed(start) => {
+                            let narrowed = SearchWindow::new(start, window.end());
+                            let result = session
+                                .search_span_value(haystack, narrowed, limits)
+                                .map(|found| {
+                                    found.map(|span| Match {
+                                        start: span.start(),
+                                        end: span.end(),
+                                    })
+                                })
+                                .map_err(SearchError::from);
+                            if result.is_ok() {
+                                *mandatory_suffix_span_state = suffix_state_after_success;
+                            }
+                            return result;
+                        }
+                        K0MandatorySuffixSpanOutcome::Fallback => true,
+                        K0MandatorySuffixSpanOutcome::Bypass => false,
+                    };
+                    if run_k0_directly {
+                        // A completed or failed suffix attempt may already
+                        // have scanned the source. Do not phase-lock a second
+                        // sidecar predicate behind it.
+                        let result = session
+                            .search_span_value(haystack, window, limits)
+                            .map(|found| {
+                                found.map(|span| Match {
+                                    start: span.start(),
+                                    end: span.end(),
+                                })
+                            })
+                            .map_err(SearchError::from);
+                        if result.is_ok() {
+                            *mandatory_suffix_span_state = suffix_state_after_success;
+                        }
+                        return result;
+                    }
+                }
+                let attempt = run_k0_negative_prefilter(
+                    *mandatory_cut,
+                    *negative_prefilter,
+                    *negative_prefilter_span_state,
+                    haystack,
+                    window,
+                    limits,
+                );
+                if attempt.outcome == K0NegativePrefilterOutcome::Absent {
+                    let certified = window
+                        .end()
+                        .checked_sub(window.start())
+                        .is_some_and(|input_bytes| {
+                            session.negative_terminal_has_reused_work_certificate(input_bytes)
+                        });
+                    if certified {
+                        *mandatory_suffix_span_state = suffix_state_after_success;
+                        *negative_prefilter_span_state = attempt.state_after_success;
+                        return Ok(None);
+                    }
+                }
+                let search_window = attempt
+                    .candidate_floor
+                    .map_or(window, |start| SearchWindow::new(start, window.end()));
+                let result = session
+                    .search_span_value(haystack, search_window, limits)
+                    .map(|found| {
+                        found.map(|span| Match {
+                            start: span.start(),
+                            end: span.end(),
+                        })
                     })
-                })
-                .map_err(SearchError::from),
+                    .map_err(SearchError::from);
+                if result.is_ok() {
+                    *mandatory_suffix_span_state = suffix_state_after_success;
+                    *negative_prefilter_span_state = attempt.state_after_success;
+                }
+                result
+            }
         }
     }
 
@@ -6373,7 +8005,7 @@ impl<'r> PortableSearchSession<'r> {
             PortableSearchSessionPlan::Native(regex) => {
                 regex.find_iter_at(source.haystack(), start, limits)
             }
-            PortableSearchSessionPlan::K0 { session } => {
+            PortableSearchSessionPlan::K0 { session, .. } => {
                 let report = session.search_span_at_source_cursor(source, start, limits)?;
                 let work = report.accounting().work();
                 let matched = report.into_output().map(|span| Match {
@@ -6897,14 +8529,428 @@ fn fixed_predicate_word64_search_limits(limits: SearchLimits) -> FixedPredicateW
 #[cfg(test)]
 mod tests {
     use super::{
-        BuildError, BuildLimits, CaptureFreeOperation, Match, PlanKind, PlanSelection,
+        Automaton, BuildError, BuildLimits, CanonicalPattern, CaptureFreeOperation,
+        CompatibilityProfile, K0MandatoryCutPlan, K0NegativePrefilterOutcome, Match,
+        OperationSemantics, PlanKind, PlanSelection,
         PortableBuilder, PortableFindIterAccounting, PortableFindIterError, PortableFindIterLimits,
         PortableFindIterRunLimits, PortablePlan, PortableRegex, SearchAccounting, SearchError,
-        SearchLimits, SearchSessionLimits, SearchWindow,
+        SearchLimits, SearchSessionLimits, SearchWindow, K0NegativePrefilterClassState,
+        K0NegativePrefilterState, K0_NEGATIVE_PREFILTER_MAX_DISABLED_CALLS,
+        K0_MANDATORY_CUT_BYTE_ENUMERATION_WORK, K0_MANDATORY_CUT_CARDINALITY_WORK,
+        K0_MANDATORY_CUT_PLAN_CONSTRUCTION_WORK,
+        K0_NEGATIVE_PREFILTER_PRESENT_STREAK_LIMIT, K0_NEGATIVE_PREFILTER_SIZE_CLASS_STATES,
+        run_k0_negative_prefilter, try_build_k0_mandatory_cut,
     };
+    use fre_automata::{MandatoryCutAnalysisLimits, MaximumConsumedDistance};
     use fre_kernels::FixedPredicateWord64SearchCursor;
     use fre_lower::UnsupportedFeature;
     use std::fmt::Write as _;
+
+    fn lowered_k0_mandatory_cut(
+        pattern: &str,
+    ) -> (fre_automata::RawPlan, BuildLimits, u8) {
+        let builder = PortableBuilder::new(pattern).unicode(false);
+        let profile = CompatibilityProfile::RustBytes(builder.profile.clone());
+        let request = fre_syntax::ParseRequest::rust(pattern, profile)
+            .with_admission(builder.limits.admission)
+            .with_safety_envelope(builder.limits.syntax_safety);
+        let parsed = fre_syntax::parse(request)
+            .expect("focused mandatory-cut pattern parses under the builder profile");
+        let CanonicalPattern::Rust(rust) = parsed.pattern else {
+            panic!("Rust bytes request produced a non-Rust canonical pattern");
+        };
+        let raw = fre_lower::lower_raw(
+            &rust,
+            OperationSemantics::CaptureFree,
+            builder.limits.lowering,
+        )
+        .expect("focused mandatory-cut pattern lowers through K0")
+        .into_plan();
+        (
+            raw,
+            builder.limits,
+            builder.profile.options.line_terminator,
+        )
+    }
+
+    fn analyzed_k0_mandatory_cut(pattern: &str) -> (K0MandatoryCutPlan, Automaton) {
+        let (raw, limits, line_terminator) = lowered_k0_mandatory_cut(pattern);
+        let cut = try_build_k0_mandatory_cut(&raw, limits, 0)
+            .expect("focused mandatory-cut analysis completes")
+            .plan
+            .expect("focused pattern retains a mandatory-cut proof");
+        let automaton = Automaton::from_raw(raw, limits.lowering.automata)
+            .expect("focused mandatory-cut graph validates")
+            .with_line_terminator(line_terminator);
+        (cut, automaton)
+    }
+
+    fn forced_k0_mandatory_cut(pattern: &str) -> K0MandatoryCutPlan {
+        analyzed_k0_mandatory_cut(pattern).0
+    }
+
+    fn forced_k0_with_only_mandatory_cut(pattern: &str) -> PortableRegex {
+        let (cut, automaton) = analyzed_k0_mandatory_cut(pattern);
+        let mut regex = PortableBuilder::new(pattern)
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .expect("focused mandatory-cut pattern builds through K0");
+        let PortablePlan::K0(plan) = &mut regex.plan else {
+            panic!("forced mandatory-cut pattern did not retain K0");
+        };
+        plan.automaton = automaton;
+        plan.mandatory_cut = Some(cut);
+        plan.mandatory_suffix = None;
+        plan.negative_prefilter = None;
+        regex
+    }
+
+    #[test]
+    fn k0_mandatory_cut_construction_work_is_exact_and_transactional() {
+        for (pattern, expected_retained_bytes) in
+            [("Z", 1_u64), ("[XZ]", 2), ("[XYZ]", 3)]
+        {
+            let (raw, limits, _) = lowered_k0_mandatory_cut(pattern);
+            let mut analysis_limits = MandatoryCutAnalysisLimits::default();
+            analysis_limits.max_work = analysis_limits.max_work.min(limits.max_planner_work);
+            analysis_limits.max_allocation_items = analysis_limits
+                .max_allocation_items
+                .min(limits.lowering.max_stack_items);
+            let analysis = fre_automata::analyze_mandatory_cut(&raw, analysis_limits);
+            assert!(analysis.stats().closes(analysis_limits));
+
+            let complete = try_build_k0_mandatory_cut(&raw, limits, 0).unwrap();
+            let retained_bytes = u64::from(
+                complete
+                    .plan
+                    .expect("default work retains the mandatory-cut sidecar")
+                    .bytes()
+                    .1,
+            );
+            assert_eq!(retained_bytes, expected_retained_bytes, "pattern={pattern:?}");
+            let required = analysis
+                .stats()
+                .work()
+                .checked_add(K0_MANDATORY_CUT_CARDINALITY_WORK)
+                .and_then(|work| work.checked_add(K0_MANDATORY_CUT_BYTE_ENUMERATION_WORK))
+                .and_then(|work| work.checked_add(retained_bytes))
+                .and_then(|work| work.checked_add(K0_MANDATORY_CUT_PLAN_CONSTRUCTION_WORK))
+                .unwrap();
+            assert_eq!(complete.planner_work, required, "pattern={pattern:?}");
+            assert_eq!(
+                complete.storage_bytes,
+                core::mem::size_of::<K0MandatoryCutPlan>(),
+                "pattern={pattern:?}"
+            );
+
+            let exact = try_build_k0_mandatory_cut(
+                &raw,
+                BuildLimits {
+                    max_planner_work: required,
+                    ..limits
+                },
+                0,
+            )
+            .unwrap();
+            assert!(exact.plan.is_some(), "pattern={pattern:?}");
+            assert_eq!(exact.planner_work, required, "pattern={pattern:?}");
+            assert_eq!(
+                exact.storage_bytes, complete.storage_bytes,
+                "pattern={pattern:?}"
+            );
+
+            let one_below = try_build_k0_mandatory_cut(
+                &raw,
+                BuildLimits {
+                    max_planner_work: required.checked_sub(1).unwrap(),
+                    ..limits
+                },
+                0,
+            )
+            .unwrap();
+            assert!(one_below.plan.is_none(), "pattern={pattern:?}");
+            assert_eq!(one_below.storage_bytes, 0, "pattern={pattern:?}");
+            assert_eq!(
+                one_below.planner_work,
+                analysis
+                    .stats()
+                    .work()
+                    .checked_add(K0_MANDATORY_CUT_CARDINALITY_WORK)
+                    .unwrap(),
+                "pattern={pattern:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn k0_mandatory_cut_scan_returns_exact_sound_candidate_floors() {
+        let zero = forced_k0_mandatory_cut("Z[ab]{2}");
+        let small = forced_k0_mandatory_cut("[ab]{2}Z");
+        let unbounded = forced_k0_mandatory_cut("[ab]+Z");
+        assert_eq!(zero.maximum_before_root(), MaximumConsumedDistance::Finite(0));
+        assert_eq!(small.maximum_before_root(), MaximumConsumedDistance::Finite(2));
+        assert_eq!(unbounded.maximum_before_root(), MaximumConsumedDistance::Unbounded);
+        for cut in [zero, small, unbounded] {
+            let (bytes, count) = cut.bytes();
+            assert_eq!(count, 1);
+            assert_eq!(bytes[0], b'Z');
+        }
+
+        let window = SearchWindow::new(100, 1_500);
+        let mut haystack = vec![b'x'; 2_048];
+        haystack[99] = b'Z';
+        haystack[100] = b'Z';
+        haystack[1_200] = b'Z';
+        let early = run_k0_negative_prefilter(
+            Some(&zero),
+            None,
+            K0NegativePrefilterState::default(),
+            &haystack,
+            window,
+            SearchLimits::unlimited(),
+        );
+        assert_eq!(early.outcome, K0NegativePrefilterOutcome::Present);
+        assert_eq!(early.candidate_floor, Some(100));
+
+        haystack[100] = b'x';
+        let late = run_k0_negative_prefilter(
+            Some(&zero),
+            None,
+            K0NegativePrefilterState::default(),
+            &haystack,
+            window,
+            SearchLimits::unlimited(),
+        );
+        assert_eq!(late.candidate_floor, Some(1_200));
+
+        haystack[101] = b'Z';
+        let boundary = run_k0_negative_prefilter(
+            Some(&small),
+            None,
+            K0NegativePrefilterState::default(),
+            &haystack,
+            window,
+            SearchLimits::unlimited(),
+        );
+        assert_eq!(boundary.candidate_floor, Some(100));
+        haystack[101] = b'x';
+        haystack[900] = b'Z';
+        let multiple = run_k0_negative_prefilter(
+            Some(&small),
+            None,
+            K0NegativePrefilterState::default(),
+            &haystack,
+            window,
+            SearchLimits::unlimited(),
+        );
+        assert_eq!(multiple.candidate_floor, Some(898));
+
+        let unlimited_distance = run_k0_negative_prefilter(
+            Some(&unbounded),
+            None,
+            K0NegativePrefilterState::default(),
+            &haystack,
+            window,
+            SearchLimits::unlimited(),
+        );
+        assert_eq!(unlimited_distance.outcome, K0NegativePrefilterOutcome::Present);
+        assert_eq!(unlimited_distance.candidate_floor, None);
+
+        haystack[900] = b'x';
+        haystack[1_200] = b'x';
+        let absent = run_k0_negative_prefilter(
+            Some(&small),
+            None,
+            K0NegativePrefilterState::default(),
+            &haystack,
+            window,
+            SearchLimits::unlimited(),
+        );
+        assert_eq!(absent.outcome, K0NegativePrefilterOutcome::Absent);
+        assert_eq!(absent.candidate_floor, None);
+    }
+
+    #[test]
+    fn k0_mandatory_cut_floor_rescans_mutated_storage_and_preserves_outputs() {
+        let cut = forced_k0_mandatory_cut("[ab]{2}Z");
+        let mut haystack = vec![b'x'; 4_096];
+        let address = haystack.as_ptr();
+        haystack[1_500] = b'Z';
+        let first = run_k0_negative_prefilter(
+            Some(&cut),
+            None,
+            K0NegativePrefilterState::default(),
+            &haystack,
+            SearchWindow::full(&haystack),
+            SearchLimits::unlimited(),
+        );
+        assert_eq!(first.candidate_floor, Some(1_498));
+        haystack[1_500] = b'x';
+        haystack[400] = b'Z';
+        assert_eq!(haystack.as_ptr(), address);
+        let second = run_k0_negative_prefilter(
+            Some(&cut),
+            None,
+            first.state_after_success,
+            &haystack,
+            SearchWindow::full(&haystack),
+            SearchLimits::unlimited(),
+        );
+        assert_eq!(second.candidate_floor, Some(398));
+
+        let regex = forced_k0_with_only_mandatory_cut("[ab]{2}Z");
+        haystack[400] = b'x';
+        haystack[30..33].copy_from_slice(b"abZ");
+        haystack[1_200] = b'Z';
+        haystack[3_000..3_003].copy_from_slice(b"abZ");
+        let window = SearchWindow::new(128, 4_000);
+        let expected = regex
+            .find_window(&haystack, window, SearchLimits::unlimited())
+            .unwrap()
+            .0;
+        assert_eq!(expected, Some(Match { start: 3_000, end: 3_003 }));
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        assert_eq!(
+            session
+                .find_window_value(&haystack, window, SearchLimits::unlimited())
+                .unwrap(),
+            expected
+        );
+        assert!(session
+            .is_match_window_value(&haystack, window, SearchLimits::unlimited())
+            .unwrap());
+    }
+
+    #[test]
+    fn k0_mandatory_cut_floor_bypasses_every_finite_search_limit() {
+        let cut = forced_k0_mandatory_cut("[ab]{2}Z");
+        let haystack = vec![b'x'; 2_048];
+        let finite = SearchLimits {
+            max_work: 0,
+            max_scratch_bytes: usize::MAX,
+        };
+        let attempt = run_k0_negative_prefilter(
+            Some(&cut),
+            None,
+            K0NegativePrefilterState::default(),
+            &haystack,
+            SearchWindow::full(&haystack),
+            finite,
+        );
+        assert_eq!(attempt.outcome, K0NegativePrefilterOutcome::Bypass);
+        assert_eq!(attempt.candidate_floor, None);
+        assert!(attempt
+            .state_after_success
+            .classes
+            .iter()
+            .all(|class| class.window_size_class.is_none()));
+
+        let regex = forced_k0_with_only_mandatory_cut("[ab]{2}Z");
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        assert!(matches!(
+            session.find_window_value(
+                &haystack,
+                SearchWindow::full(&haystack),
+                finite,
+            ),
+            Err(SearchError::K0(_))
+        ));
+    }
+
+    #[test]
+    fn k0_negative_prefilter_backoff_grows_and_absence_resets_it() {
+        let mut state = K0NegativePrefilterClassState {
+            window_size_class: Some(17),
+            ..K0NegativePrefilterClassState::default()
+        };
+        for _ in 0..K0_NEGATIVE_PREFILTER_PRESENT_STREAK_LIMIT {
+            state.observe_present();
+        }
+        assert_eq!(state.disabled_calls, 1);
+        assert_eq!(state.present_backoff, 1);
+
+        let mut expected = 2;
+        while expected <= K0_NEGATIVE_PREFILTER_MAX_DISABLED_CALLS {
+            state.disabled_calls = 0;
+            state.observe_present();
+            assert_eq!(state.disabled_calls, expected);
+            assert_eq!(state.present_backoff, expected);
+            if expected == K0_NEGATIVE_PREFILTER_MAX_DISABLED_CALLS {
+                break;
+            }
+            expected *= 2;
+        }
+
+        state.observe_absent();
+        assert_eq!(state.present_streak, 0);
+        assert_eq!(state.disabled_calls, 0);
+        assert_eq!(state.present_backoff, 0);
+        assert_eq!(state.window_size_class, Some(17));
+    }
+
+    #[test]
+    fn k0_negative_prefilter_probes_the_longest_conjunctive_literal_first() {
+        let regex = PortableBuilder::new("LONGNEEDLE.*abc")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .expect("focused conjunctive pattern builds through K0");
+        let PortablePlan::K0(plan) = &regex.plan else {
+            panic!("forced conjunctive pattern did not retain K0");
+        };
+        let prefilter = plan
+            .negative_prefilter
+            .as_deref()
+            .expect("focused conjunctive pattern retains a negative prefilter");
+        assert_eq!(prefilter.literals.len(), 2);
+        assert_eq!(prefilter.literals[0].needle(), b"LONGNEEDLE");
+        assert_eq!(prefilter.literals[1].needle(), b"abc");
+
+        let mut haystack = vec![b'x'; 4_096];
+        haystack[2_000..2_003].copy_from_slice(b"abc");
+        let attempt = run_k0_negative_prefilter(
+            None,
+            Some(prefilter),
+            K0NegativePrefilterState::default(),
+            &haystack,
+            SearchWindow::full(&haystack),
+            SearchLimits::unlimited(),
+        );
+        assert_eq!(attempt.outcome, K0NegativePrefilterOutcome::Absent);
+    }
+
+    #[test]
+    fn k0_negative_prefilter_retains_bounded_size_class_histories() {
+        let mut state = K0NegativePrefilterState::default();
+        let state_count = u32::try_from(K0_NEGATIVE_PREFILTER_SIZE_CLASS_STATES).unwrap();
+        for size_class in 10..10 + state_count {
+            let index = state.class_for(size_class);
+            state.classes[index].present_backoff = u8::try_from(size_class).unwrap();
+        }
+        for size_class in 10..10 + state_count {
+            let index = state.class_for(size_class);
+            assert_eq!(
+                state.classes[index].present_backoff,
+                u8::try_from(size_class).unwrap()
+            );
+        }
+
+        let replacement = state.class_for(99);
+        assert_eq!(replacement, 0);
+        assert_eq!(state.classes[replacement].window_size_class, Some(99));
+        assert_eq!(state.classes[replacement].present_backoff, 0);
+        for size_class in 11..10 + state_count {
+            assert!(state
+                .classes
+                .iter()
+                .any(|entry| entry.window_size_class == Some(size_class)));
+        }
+    }
 
     #[test]
     fn utf8_progress_accounting_overflow_is_atomic() {

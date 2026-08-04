@@ -5464,6 +5464,10 @@ fn deserialize_automaton(
     raw: &RawPlan,
     line_terminator: u8,
 ) -> Result<Automaton, ProgramFormatError> {
+    let byte_class_work = Automaton::byte_class_map_validation_work(raw.edge_targets.len())
+        .ok_or(ProgramFormatError::Malformed(
+            "automaton byte-class validation work overflowed",
+        ))?;
     let validation_work = raw
         .roles
         .len()
@@ -5475,6 +5479,7 @@ fn deserialize_automaton(
                 .and_then(|edges| states.checked_add(edges))
         })
         .and_then(|work| work.checked_add(1))
+        .and_then(|work| work.checked_add(byte_class_work))
         .ok_or(ProgramFormatError::Malformed(
             "automaton validation work overflowed",
         ))?;
