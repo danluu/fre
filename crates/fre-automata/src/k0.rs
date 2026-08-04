@@ -1124,9 +1124,11 @@ impl WorkspaceLayout {
         let reverse_allocations = if reverse_state_capacity == 0 {
             0
         } else {
-            // Context replaces rows and additionally retains incoming kinds.
+            // Context replaces rows and additionally retains incoming kinds
+            // plus one exact-tag hot entry for every reverse state.
+            let context_allocations = if reverse_context_slots == 0 { 0 } else { 2 };
             11usize
-                .checked_add(usize::from(reverse_context_slots != 0))
+                .checked_add(context_allocations)
                 .ok_or(SearchError::ArithmeticOverflow {
                     computation: "reverse workspace allocation count",
                 })?
@@ -2426,7 +2428,11 @@ impl ReverseWorkspace {
             rows: allocate_slots(row_cells, LAZY_CELL_UNFILLED, total_bytes)?,
             context: ContextTransitionStore::new(
                 layout.reverse_context_slots,
-                0,
+                if layout.reverse_context_slots == 0 {
+                    0
+                } else {
+                    state_capacity
+                },
                 total_bytes,
             )?,
             offsets: allocate_slots(state_capacity, 0_usize, total_bytes)?,
@@ -15846,6 +15852,7 @@ fn reverse_initialized_slots(
     } else {
         0
     };
+    let context_hot_slots = if context_slots == 0 { 0 } else { state_capacity };
     states
         .checked_add(1)
         .and_then(|slots| {
@@ -15861,6 +15868,7 @@ fn reverse_initialized_slots(
         .and_then(|slots| slots.checked_add(if context_slots == 0 { 0 } else { edges }))
         .and_then(|slots| slots.checked_add(rows))
         .and_then(|slots| slots.checked_add(context_slots))
+        .and_then(|slots| slots.checked_add(context_hot_slots))
         .and_then(|slots| {
             state_capacity
                 .checked_mul(3)
@@ -15942,12 +15950,22 @@ fn reverse_scratch_bytes(
         .ok_or(SearchError::ArithmeticOverflow {
             computation: "reverse contextual transition bytes",
         })?;
+    let context_hot_bytes = if context_slots == 0 {
+        0
+    } else {
+        state_capacity
+            .checked_mul(size_of::<ContextHotTransition>())
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "reverse contextual hot-transition bytes",
+            })?
+    };
     u32_bytes
         .checked_add(range_bytes)
         .and_then(|bytes| bytes.checked_add(kind_bytes))
         .and_then(|bytes| bytes.checked_add(offsets))
         .and_then(|bytes| bytes.checked_add(hashes))
         .and_then(|bytes| bytes.checked_add(context_bytes))
+        .and_then(|bytes| bytes.checked_add(context_hot_bytes))
         .ok_or(SearchError::ArithmeticOverflow {
             computation: "reverse lazy DFA scratch bytes",
         })
@@ -19048,7 +19066,7 @@ mod tests {
         assert_eq!(workspace.lazy.context.slots.len(), 1_024);
         assert_eq!(workspace.lazy.context.hot.len(), 3);
         assert_eq!(workspace.reverse.context.slots.len(), 512);
-        assert!(workspace.reverse.context.hot.is_empty());
+        assert_eq!(workspace.reverse.context.hot.len(), 2);
         assert_eq!(
             workspace.lazy.context.retained_bytes().unwrap(),
             1_024 * size_of::<ContextTransitionSlot>()
@@ -19057,6 +19075,7 @@ mod tests {
         assert_eq!(
             workspace.reverse.context.retained_bytes().unwrap(),
             512 * size_of::<ContextTransitionSlot>()
+                + 2 * size_of::<super::ContextHotTransition>()
         );
         assert_eq!(workspace.retained_bytes(), full.logical_bytes());
         assert_eq!(
@@ -19077,6 +19096,7 @@ mod tests {
             K0Workspace::new_bidirectional(&three_classes, WorkspaceLimits::unlimited()).unwrap();
         assert_eq!(workspace.lazy.context.slots.len(), 8_192);
         assert_eq!(workspace.reverse.context.slots.len(), 4_096);
+        assert_eq!(workspace.reverse.context.hot.len(), 16);
         assert_eq!(workspace.retained_bytes(), full.logical_bytes());
         assert_eq!(
             workspace.construction_accounting().allocated_bytes(),
@@ -28702,6 +28722,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(workspace.reverse.context.published, reverse_before + 1);
+        let reverse_hot =
+            workspace.reverse.context.hot[usize::try_from(reverse).unwrap()];
+        let super::ReverseTransition::Ready(first_cell) = first else {
+            panic!("unlimited contextual reverse transition must be retained");
+        };
+        assert_eq!(reverse_hot.symbol, reverse_symbol);
+        assert_eq!(reverse_hot.value, first_cell);
+        let backing = workspace
+            .reverse
+            .context
+            .slots
+            .iter()
+            .position(|slot| {
+                slot.source == reverse
+                    && slot.symbol == reverse_symbol
+                    && slot.value == first_cell
+            })
+            .expect("published reverse hot transition must retain associative backing");
+        let backing_record = workspace.reverse.context.slots[backing];
+        workspace.reverse.context.slots[backing] = super::ContextTransitionSlot::EMPTY;
+
+        let exact_work = u64::from(reverse_hot.lookup_work);
+        let mut exact = WorkMeter::new(exact_work, 0);
         let aliased = super::build_context_reverse_cached_transition(
             &plan,
             reverse,
@@ -28709,13 +28752,36 @@ mod tests {
             super::contextual_symbol_for_byte(&plan, b'b', 0),
             0,
             &mut workspace,
-            &mut meter,
+            &mut exact,
             0,
             0,
         )
         .unwrap();
         assert_eq!(aliased, first);
+        assert_eq!(exact.consumed, exact_work);
         assert_eq!(workspace.reverse.context.published, reverse_before + 1);
+        let one_below_limit = exact_work.checked_sub(1).unwrap();
+        let mut one_below = WorkMeter::new(one_below_limit, 0);
+        assert!(matches!(
+            super::build_context_reverse_cached_transition(
+                &plan,
+                reverse,
+                b'b',
+                super::contextual_symbol_for_byte(&plan, b'b', 0),
+                0,
+                &mut workspace,
+                &mut one_below,
+                0,
+                0,
+            ),
+            Err(SearchError::WorkLimitExceeded {
+                limit,
+                consumed: 0,
+                requested,
+                position: 0,
+            }) if limit == one_below_limit && requested == exact_work
+        ));
+        workspace.reverse.context.slots[backing] = backing_record;
 
         let _different_mask = super::build_context_reverse_cached_transition(
             &plan,
@@ -29303,7 +29369,7 @@ mod tests {
             })
             .unwrap();
         let expected_reverse_work = reverse_initialized
-            .checked_add(12)
+            .checked_add(13)
             .and_then(|work| work.checked_add(reverse_build))
             .and_then(|work| u64::try_from(work).ok())
             .unwrap();
