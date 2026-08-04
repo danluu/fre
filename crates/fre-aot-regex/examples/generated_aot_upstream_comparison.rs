@@ -2591,11 +2591,13 @@ fn build_c_harness(config: &Config, shapes: &[CompiledShape], scenarios: &[Scena
          #define ROTATIONS 4U\n\n\
          typedef void *exclusive_handle;\n\
          typedef uint32_t (*entry_fn)(const unsigned char *, size_t, size_t, size_t, size_t *);\n\
+         typedef uint32_t (*exclusive_entry_fn)(exclusive_handle, const unsigned char *, size_t, size_t, size_t, size_t *);\n\
          extern uint32_t fre_aot_regex_runtime_prepare_exclusive_v1(const unsigned char *, size_t, exclusive_handle *);\n\
          extern uint32_t fre_aot_regex_runtime_search_exclusive_v1(exclusive_handle, const unsigned char *, size_t, size_t, size_t, size_t *);\n\
          extern uint32_t fre_aot_regex_runtime_destroy_exclusive_v1(exclusive_handle);\n\n\
          typedef struct {\n\
-           const char *name; entry_fn direct; const unsigned char *program; size_t program_len;\n\
+           const char *name; entry_fn direct; exclusive_entry_fn prepared_direct;\n\
+           const unsigned char *program; size_t program_len;\n\
            exclusive_handle prepared; const unsigned char *fixture; size_t fixture_len;\n\
            const unsigned char *candidates; size_t candidate_len; int guard_before; int guard_after;\n\
            uint64_t seed; size_t generation_id; unsigned nested_distribution;\n\
@@ -2613,6 +2615,13 @@ fn build_c_harness(config: &Config, shapes: &[CompiledShape], scenarios: &[Scena
             "extern uint32_t {entry}(const unsigned char *, size_t, size_t, size_t, size_t *);"
         )
         .unwrap();
+        if let Some(prepared_entry) = shape.aot.module().prepared_entry_symbol() {
+            writeln!(
+                &mut source,
+                "extern uint32_t {prepared_entry}(exclusive_handle, const unsigned char *, size_t, size_t, size_t, size_t *);"
+            )
+            .unwrap();
+        }
         if let Some((symbol, _)) = &shape.runtime_program {
             writeln!(&mut source, "extern const unsigned char {symbol}[];").unwrap();
         }
@@ -2631,13 +2640,21 @@ fn build_c_harness(config: &Config, shapes: &[CompiledShape], scenarios: &[Scena
     }
     source.push_str("\nstatic shape_spec shapes[] = {\n");
     for (index, shape) in shapes.iter().enumerate() {
-        let (direct, program, program_len) = shape.runtime_program.as_ref().map_or_else(
-            || (shape.aot.module().entry_symbol(), "NULL", 0),
-            |(symbol, bytes)| ("NULL", symbol.as_str(), *bytes),
-        );
+        let (direct, prepared_direct, program, program_len) =
+            shape.runtime_program.as_ref().map_or_else(
+                || (shape.aot.module().entry_symbol(), "NULL", "NULL", 0),
+                |(symbol, bytes)| {
+                    (
+                        "NULL",
+                        shape.aot.module().prepared_entry_symbol().unwrap_or("NULL"),
+                        symbol.as_str(),
+                        *bytes,
+                    )
+                },
+            );
         writeln!(
             &mut source,
-            "  {{\"{}\", {direct}, {program}, {program_len}, 0, fixture_{index}, sizeof(fixture_{index}), candidates_{index}, sizeof(candidates_{index}), {}, {}, UINT64_C({}), {}, {}}},",
+            "  {{\"{}\", {direct}, {prepared_direct}, {program}, {program_len}, 0, fixture_{index}, sizeof(fixture_{index}), candidates_{index}, sizeof(candidates_{index}), {}, {}, UINT64_C({}), {}, {}}},",
             c_string(&shape.spec.name), option_byte(shape.spec.guard_before), option_byte(shape.spec.guard_after),
             shape.spec.seed, shape.spec.generation_id,
             u8::from(shape.spec.source_kind == "nested_grammar_generated"),
@@ -2783,6 +2800,8 @@ fn build_c_harness(config: &Config, shapes: &[CompiledShape], scenarios: &[Scena
            }\n\
          }\n\n\
          static uint32_t invoke(shape_spec *shape, const unsigned char *haystack, size_t length, size_t *result) {\n\
+           if (shape->prepared_direct != NULL)\n\
+             return shape->prepared_direct(shape->prepared, haystack, length, 0U, length, result);\n\
            if (shape->program != NULL)\n\
              return fre_aot_regex_runtime_search_exclusive_v1(shape->prepared, haystack, length, 0U, length, result);\n\
            return shape->direct(haystack, length, 0U, length, result);\n\

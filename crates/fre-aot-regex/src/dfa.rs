@@ -606,7 +606,7 @@ const _: () = assert!(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(transparent)]
-struct PackedForwardCell(u32);
+pub(crate) struct PackedForwardCell(u32);
 
 impl PackedForwardCell {
     fn from_cell(cell: ForwardCell, complete_rows: usize, classes: usize) -> Option<Self> {
@@ -632,11 +632,15 @@ impl PackedForwardCell {
                 hole
             }
         };
-        Some(Self(next | u32::from(cell.accepted) * PARTIAL_CELL_ACCEPTED))
+        Some(Self(next | (u32::from(cell.accepted) * PARTIAL_CELL_ACCEPTED)))
     }
 
     const fn accepted(self) -> bool {
         self.0 & PARTIAL_CELL_ACCEPTED != 0
+    }
+
+    pub(crate) const fn raw(self) -> u32 {
+        self.0
     }
 }
 
@@ -758,6 +762,23 @@ pub(crate) struct NativeDfaView<'a> {
     pub(crate) forward_cells: &'a [ForwardCell],
     pub(crate) reverse_initial: Option<u32>,
     pub(crate) reverse_cells: &'a [ReverseCell],
+}
+
+/// Canonically packed completed rows from an authenticated incomplete DFA.
+///
+/// Unlike [`NativeDfaView`], destinations at or above the hole base name a
+/// compact runtime-resume frontier rather than another native row. The packed
+/// representation is exactly the one exercised by the portable retained-row
+/// executor, so native lowering does not reinterpret semantic frontier data.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NativePartialDfaView<'a> {
+    pub(crate) initial_pending: bool,
+    pub(crate) initial_terminal: bool,
+    pub(crate) byte_classes: &'a [u8; 256],
+    pub(crate) class_count: usize,
+    pub(crate) packed_cells: &'a [PackedForwardCell],
+    pub(crate) complete_rows: usize,
+    pub(crate) resume_states: usize,
 }
 
 /// Maximum number of structurally ranked forward-DFA self-loop plans handed
@@ -1308,6 +1329,36 @@ impl PartialDfa {
             forward_cells: &self.forward.transitions,
             reverse_initial: None,
             reverse_cells: &[],
+        })
+    }
+
+    /// Expose the canonical completed-row prefix only when at least one row
+    /// exists and at least one authenticated incomplete frontier remains.
+    pub(crate) fn native_incomplete_view(&self) -> Option<NativePartialDfaView<'_>> {
+        let classes = self.alphabet.classes();
+        let resume_states = self
+            .forward
+            .discovered_states
+            .checked_sub(self.forward.complete_rows)?;
+        let expected_cells = self.forward.complete_rows.checked_mul(classes)?;
+        let packed_cells = self.forward.packed_transitions.as_deref()?;
+        if classes == 0
+            || self.forward.complete_rows == 0
+            || resume_states == 0
+            || packed_cells.len() != expected_cells
+            || self.forward.transitions.len() != expected_cells
+            || self.forward.resume_keys.len() != resume_states
+        {
+            return None;
+        }
+        Some(NativePartialDfaView {
+            initial_pending: self.forward.initial_pending,
+            initial_terminal: self.forward.initial_terminal,
+            byte_classes: &self.alphabet.byte_to_class,
+            class_count: classes,
+            packed_cells,
+            complete_rows: self.forward.complete_rows,
+            resume_states,
         })
     }
 

@@ -27,7 +27,8 @@ use crate::{
     prefix_relation::{self, PrefixRelation},
     program::{
         AnchoredByteSet, CompiledProgram, MAX_ANCHORED_PREFIX_BYTES, NativeContextProgramView,
-        NativeProgramView, NativeRetainedPrefixRequirement, OutputContract,
+        NativePartialProgramView, NativeProgramView, NativeRetainedPrefixRequirement,
+        OutputContract,
     },
     required_literals::{MaximumConsumedDistance, RequiredInteriorCandidate, RequiredLiteralSet},
     seeded_reverse::{
@@ -572,6 +573,7 @@ pub struct CompiledModule {
     symbols: Box<[ModuleSymbol]>,
     relocations: Box<[ModuleRelocation]>,
     entry_symbol_index: usize,
+    prepared_entry_symbol_index: Option<usize>,
     runtime_symbol_index: Option<usize>,
     runtime_program_symbol_index: Option<usize>,
     start_accelerator: StartAccelerator,
@@ -584,13 +586,24 @@ const ENTRY_SYMBOL: usize = 0;
 const PROGRAM_SYMBOL: usize = 1;
 const RUNTIME_SYMBOL: usize = 2;
 const RUNTIME_PROGRAM_SYMBOL: usize = 3;
+const PREPARED_ENTRY_SYMBOL: usize = 4;
+const PARTIAL_TABLE_SYMBOL: usize = 5;
+const PARTIAL_IDENTITY_SYMBOL: usize = 6;
+const PARTIAL_RUNTIME_SYMBOL: usize = 7;
 
 const RUNTIME_SYMBOL_NAME: &str = "fre_aot_regex_runtime_search_v1";
+const PARTIAL_RUNTIME_SYMBOL_NAME: &str =
+    "fre_aot_regex_runtime_search_exclusive_from_partial_v1";
 const ENTRY_SYMBOL_PREFIX: &str = "fre_aot_regex_search_v1_";
+const PREPARED_ENTRY_SYMBOL_PREFIX: &str = "fre_aot_regex_search_exclusive_v1_";
 const PROGRAM_SYMBOL_PREFIX: &str = "fre_aot_regex_program_v1_";
 const RUNTIME_PROGRAM_SYMBOL_PREFIX: &str = "fre_aot_regex_runtime_program_v1_";
 const NATIVE_LOWERING_VERSION: u32 = 1;
 const NATIVE_MODULE_IDENTITY_DOMAIN: &[u8] = b"fre-aot-regex/native-module-identity\0";
+const PARTIAL_CELL_ACCEPTED: u32 = 1 << 31;
+const PARTIAL_CELL_HOLE_BASE: u32 = 1 << 30;
+const PARTIAL_CELL_DEAD: u32 = PARTIAL_CELL_ACCEPTED - 1;
+const PARTIAL_CLASS_MAP_BYTES: usize = 256;
 
 struct NativeLowering {
     code: Vec<u8>,
@@ -599,6 +612,14 @@ struct NativeLowering {
     needs_runtime: bool,
     start_accelerator: StartAccelerator,
     anchored_prefix_filter_bytes: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PreparedEntryLayout {
+    code_offset: usize,
+    table_offset: usize,
+    table_size: usize,
+    identity_offset: usize,
 }
 
 impl CompiledModule {
@@ -624,7 +645,8 @@ impl CompiledModule {
             .native_dfa_view()
             .or_else(|| program.native_exact_product_view());
         let native_context = program.native_context_program_view();
-        Self::lower_serialized(program_bytes, native, native_context, target)
+        let native_partial = program.native_partial_dfa_view();
+        Self::lower_serialized(program_bytes, native, native_context, native_partial, target)
             .map_err(CompileError::from)
     }
 
@@ -636,29 +658,39 @@ impl CompiledModule {
         program_bytes: Vec<u8>,
         native: Option<NativeProgramView<'_>>,
         native_context: Option<NativeContextProgramView<'_>>,
+        native_partial: Option<NativePartialProgramView<'_>>,
         target: Target,
     ) -> Result<Self, ObjectError> {
+        let serialized_program_size = program_bytes.len();
         let program_digest = Sha256::digest(&program_bytes);
         let program_name = identity_symbol(PROGRAM_SYMBOL_PREFIX, program_digest.as_slice())?;
-        let (lowering, native_digest) = if let Some(view) = native {
+        let (lowering, native_digest, prepared_layout) = if let Some(view) = native {
             if let Some(lowering) = lower_native_dfa(view, target)? {
                 let native_digest = native_module_digest(&program_bytes, target, &lowering)?;
-                (lowering, native_digest)
+                (lowering, native_digest, None)
             } else {
                 let lowering = lower_runtime_adapter(program_bytes, target.architecture)?;
                 let native_digest = native_module_digest(&lowering.data, target, &lowering)?;
-                (lowering, native_digest)
+                (lowering, native_digest, None)
             }
         } else if let Some(view) = native_context {
             let lowering = module_context::lower_native_context(view, target)?;
             let native_digest = native_module_digest(&program_bytes, target, &lowering)?;
-            (lowering, native_digest)
+            (lowering, native_digest, None)
+        } else if let Some(view) = native_partial {
+            let (lowering, prepared_layout) =
+                lower_native_partial_prepared(program_bytes, view, target)?;
+            let native_digest = native_module_digest(&lowering.data, target, &lowering)?;
+            (lowering, native_digest, Some(prepared_layout))
         } else {
             let lowering = lower_runtime_adapter(program_bytes, target.architecture)?;
             let native_digest = native_module_digest(&lowering.data, target, &lowering)?;
-            (lowering, native_digest)
+            (lowering, native_digest, None)
         };
         let entry_name = identity_symbol(ENTRY_SYMBOL_PREFIX, &native_digest)?;
+        let prepared_entry_name = prepared_layout
+            .map(|_| identity_symbol(PREPARED_ENTRY_SYMBOL_PREFIX, &native_digest))
+            .transpose()?;
         let runtime_program_name = lowering
             .needs_runtime
             .then(|| identity_symbol(RUNTIME_PROGRAM_SYMBOL_PREFIX, &native_digest))
@@ -666,8 +698,31 @@ impl CompiledModule {
 
         let code_size = u64::try_from(lowering.code.len())
             .map_err(|_| ObjectError::ArithmeticOverflow("module code size"))?;
-        let program_size = u64::try_from(lowering.data.len())
+        let data_size = u64::try_from(lowering.data.len())
             .map_err(|_| ObjectError::ArithmeticOverflow("module program size"))?;
+        let program_size = if lowering.needs_runtime {
+            u64::try_from(serialized_program_size)
+                .map_err(|_| ObjectError::ArithmeticOverflow("serialized module program size"))?
+        } else {
+            data_size
+        };
+        let entry_size = if let Some(prepared) = prepared_layout {
+            u64::try_from(prepared.code_offset)
+                .map_err(|_| ObjectError::ArithmeticOverflow("module entry code size"))?
+        } else {
+            code_size
+        };
+        let prepared_code_size = prepared_layout
+            .map(|prepared| {
+                lowering
+                    .code
+                    .len()
+                    .checked_sub(prepared.code_offset)
+                    .ok_or(ObjectError::InvalidModule(
+                        "prepared entry offset exceeds native code",
+                    ))
+            })
+            .transpose()?;
 
         let sections = vec![
             ModuleSection {
@@ -694,7 +749,7 @@ impl CompiledModule {
                 kind: SymbolKind::Function,
                 section: Some(TEXT_SECTION),
                 offset: 0,
-                size: code_size,
+                size: entry_size,
             },
             ModuleSymbol {
                 name: program_name,
@@ -728,6 +783,61 @@ impl CompiledModule {
         } else {
             (None, None)
         };
+        let prepared_entry_symbol_index = if let Some(prepared) = prepared_layout {
+            if symbols.len() != PREPARED_ENTRY_SYMBOL {
+                return Err(ObjectError::InvalidModule(
+                    "prepared entry symbol order is inconsistent",
+                ));
+            }
+            symbols.push(ModuleSymbol {
+                name: prepared_entry_name.ok_or(ObjectError::InvalidModule(
+                    "prepared entry identity was not constructed",
+                ))?,
+                binding: SymbolBinding::Global,
+                kind: SymbolKind::Function,
+                section: Some(TEXT_SECTION),
+                offset: u64::try_from(prepared.code_offset).map_err(|_| {
+                    ObjectError::ArithmeticOverflow("prepared entry code offset")
+                })?,
+                size: u64::try_from(prepared_code_size.ok_or(
+                    ObjectError::InvalidModule("prepared entry code size is absent"),
+                )?)
+                .map_err(|_| ObjectError::ArithmeticOverflow("prepared entry code size"))?,
+            });
+            symbols.push(ModuleSymbol {
+                name: ".Lfre_aot_regex_partial_table_v1".to_owned(),
+                binding: SymbolBinding::Local,
+                kind: SymbolKind::Object,
+                section: Some(PROGRAM_SECTION),
+                offset: u64::try_from(prepared.table_offset).map_err(|_| {
+                    ObjectError::ArithmeticOverflow("prepared table offset")
+                })?,
+                size: u64::try_from(prepared.table_size).map_err(|_| {
+                    ObjectError::ArithmeticOverflow("prepared table size")
+                })?,
+            });
+            symbols.push(ModuleSymbol {
+                name: ".Lfre_aot_regex_partial_identity_v1".to_owned(),
+                binding: SymbolBinding::Local,
+                kind: SymbolKind::Object,
+                section: Some(PROGRAM_SECTION),
+                offset: u64::try_from(prepared.identity_offset).map_err(|_| {
+                    ObjectError::ArithmeticOverflow("prepared identity offset")
+                })?,
+                size: 32,
+            });
+            symbols.push(ModuleSymbol {
+                name: PARTIAL_RUNTIME_SYMBOL_NAME.to_owned(),
+                binding: SymbolBinding::Global,
+                kind: SymbolKind::Function,
+                section: None,
+                offset: 0,
+                size: 0,
+            });
+            Some(PREPARED_ENTRY_SYMBOL)
+        } else {
+            None
+        };
 
         Ok(Self {
             target,
@@ -735,6 +845,7 @@ impl CompiledModule {
             symbols: symbols.into_boxed_slice(),
             relocations: lowering.relocations.into_boxed_slice(),
             entry_symbol_index: ENTRY_SYMBOL,
+            prepared_entry_symbol_index,
             runtime_symbol_index,
             runtime_program_symbol_index,
             start_accelerator: lowering.start_accelerator,
@@ -772,6 +883,26 @@ impl CompiledModule {
         &self.symbols[self.entry_symbol_index].name
     }
 
+    /// Return the additive exclusive-handle entry when authenticated
+    /// incomplete retained rows were lowered into this module.
+    #[must_use]
+    pub fn prepared_entry_symbol(&self) -> Option<&str> {
+        self.prepared_entry_symbol_index
+            .and_then(|index| self.symbols.get(index))
+            .map(|symbol| symbol.name.as_str())
+    }
+
+    /// Return the authenticated hole-continuation helper required by the
+    /// additive prepared entry, when that entry is present.
+    #[must_use]
+    pub fn required_prepared_runtime_symbol(&self) -> Option<&str> {
+        self.prepared_entry_symbol_index?;
+        self.symbols
+            .get(PARTIAL_RUNTIME_SYMBOL)
+            .filter(|symbol| symbol.section.is_none())
+            .map(|symbol| symbol.name.as_str())
+    }
+
     /// Return the fixed versioned runtime helper symbol.
     #[must_use]
     pub fn runtime_symbol(&self) -> &str {
@@ -793,8 +924,8 @@ impl CompiledModule {
     pub fn required_runtime_program(&self) -> Option<(&str, usize)> {
         let index = self.runtime_program_symbol_index?;
         let symbol = self.symbols.get(index)?;
-        let program = self.sections.get(PROGRAM_SECTION)?;
-        Some((symbol.name.as_str(), program.data.len()))
+        let length = usize::try_from(symbol.size).ok()?;
+        Some((symbol.name.as_str(), length))
     }
 
     /// Return the number of emitted native text bytes.
@@ -838,6 +969,146 @@ fn lower_runtime_adapter(
         start_accelerator: StartAccelerator::None,
         anchored_prefix_filter_bytes: 0,
     })
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "serialized program, retained table, code entries, and relocations are installed transactionally"
+)]
+fn lower_native_partial_prepared(
+    mut program_bytes: Vec<u8>,
+    view: NativePartialProgramView<'_>,
+    target: Target,
+) -> Result<(NativeLowering, PreparedEntryLayout), ObjectError> {
+    let dfa = view.dfa;
+    let expected_cells = dfa
+        .complete_rows
+        .checked_mul(dfa.class_count)
+        .ok_or(ObjectError::ArithmeticOverflow("partial native table shape"))?;
+    if dfa.class_count == 0
+        || dfa.class_count > 256
+        || dfa.complete_rows == 0
+        || dfa.resume_states == 0
+        || dfa.packed_cells.len() != expected_cells
+        || dfa
+            .byte_classes
+            .iter()
+            .any(|&class| usize::from(class) >= dfa.class_count)
+    {
+        return Err(ObjectError::InvalidModule(
+            "invalid authenticated partial native table",
+        ));
+    }
+    for &cell in dfa.packed_cells {
+        let next = cell.raw() & !PARTIAL_CELL_ACCEPTED;
+        if next == PARTIAL_CELL_DEAD {
+            continue;
+        }
+        if next >= PARTIAL_CELL_HOLE_BASE {
+            let resume = next
+                .checked_sub(PARTIAL_CELL_HOLE_BASE)
+                .and_then(|resume| usize::try_from(resume).ok())
+                .ok_or(ObjectError::InvalidModule(
+                    "partial resume state overflowed",
+                ))?;
+            if resume >= dfa.resume_states {
+                return Err(ObjectError::InvalidModule(
+                    "partial cell names an absent resume state",
+                ));
+            }
+        } else {
+            let row = usize::try_from(next)
+                .map_err(|_| ObjectError::InvalidModule("partial row offset overflowed"))?;
+            if row >= expected_cells || !row.is_multiple_of(dfa.class_count) {
+                return Err(ObjectError::InvalidModule(
+                    "partial cell names an invalid completed row",
+                ));
+            }
+        }
+    }
+    if view.output == OutputContract::Span
+        && !dfa.initial_pending
+        && view.exact_match_width.is_none()
+    {
+        return Err(ObjectError::InvalidModule(
+            "partial native Span has no local start proof",
+        ));
+    }
+
+    let table_offset = program_bytes
+        .len()
+        .checked_add(15)
+        .ok_or(ObjectError::ArithmeticOverflow("partial table alignment"))?
+        & !15;
+    program_bytes.resize(table_offset, 0);
+    program_bytes.extend_from_slice(dfa.byte_classes);
+    for &cell in dfa.packed_cells {
+        program_bytes.extend_from_slice(&cell.raw().to_le_bytes());
+    }
+    let table_size = program_bytes
+        .len()
+        .checked_sub(table_offset)
+        .ok_or(ObjectError::ArithmeticOverflow("partial table size"))?;
+    let identity_offset = program_bytes
+        .len()
+        .checked_add(15)
+        .ok_or(ObjectError::ArithmeticOverflow("partial identity alignment"))?
+        & !15;
+    program_bytes.resize(identity_offset, 0);
+    program_bytes.extend_from_slice(&view.artifact_identity);
+
+    let (mut code, mut relocations) = match target.architecture {
+        Architecture::X86_64 => lower_x86_64_runtime_adapter()?,
+        Architecture::Aarch64 => lower_aarch64_runtime_adapter()?,
+    };
+    let code_alignment_mask = match target.architecture {
+        Architecture::X86_64 => 15,
+        Architecture::Aarch64 => 3,
+    };
+    let code_offset = code
+        .len()
+        .checked_add(code_alignment_mask)
+        .ok_or(ObjectError::ArithmeticOverflow("prepared code alignment"))?
+        & !code_alignment_mask;
+    match target.architecture {
+        Architecture::X86_64 => code.resize(code_offset, 0x90),
+        Architecture::Aarch64 => {
+            while code.len() < code_offset {
+                push_bytes(&mut code, &0xd503_201f_u32.to_le_bytes())?;
+            }
+        }
+    }
+    let (prepared_code, prepared_relocations) = match target.architecture {
+        Architecture::X86_64 => lower_x86_64_partial_prepared(view)?,
+        Architecture::Aarch64 => lower_aarch64_partial_prepared(view)?,
+    };
+    push_bytes(&mut code, &prepared_code)?;
+    for mut relocation in prepared_relocations {
+        relocation.offset = relocation
+            .offset
+            .checked_add(offset_u64(code_offset, "prepared code relocation base")?)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "prepared code relocation offset",
+            ))?;
+        relocations.push(relocation);
+    }
+
+    Ok((
+        NativeLowering {
+            code,
+            data: program_bytes,
+            relocations,
+            needs_runtime: true,
+            start_accelerator: StartAccelerator::None,
+            anchored_prefix_filter_bytes: 0,
+        },
+        PreparedEntryLayout {
+            code_offset,
+            table_offset,
+            table_size,
+            identity_offset,
+        },
+    ))
 }
 
 fn native_module_digest(
@@ -909,6 +1180,17 @@ fn native_module_digest(
             RUNTIME_SYMBOL_NAME.as_bytes(),
             "runtime symbol identity byte length",
         )?;
+        if lowering
+            .relocations
+            .iter()
+            .any(|relocation| relocation.symbol == PARTIAL_RUNTIME_SYMBOL)
+        {
+            update_bytes(
+                &mut digest,
+                PARTIAL_RUNTIME_SYMBOL_NAME.as_bytes(),
+                "partial runtime symbol identity byte length",
+            )?;
+        }
     }
     let relocation_count = u64::try_from(lowering.relocations.len())
         .map_err(|_| ObjectError::ArithmeticOverflow("relocation identity count"))?;
@@ -8881,6 +9163,214 @@ fn lower_x86_64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), Ob
     ))
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the prepared SysV entry keeps validation, retained transitions, and the eleven-argument hole call contiguous"
+)]
+fn lower_x86_64_partial_prepared(
+    view: NativePartialProgramView<'_>,
+) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
+    const FRAME_BYTES: u8 = 120;
+    let mut assembler = X86Assembler::new();
+    let scan = assembler.label()?;
+    let accept = assembler.label()?;
+    let classify = assembler.label()?;
+    let hole = assembler.label()?;
+    let finish = assembler.label()?;
+    let no_match = assembler.label()?;
+    let matched = assembler.label()?;
+    let return_local = assembler.label()?;
+    let invalid = assembler.label()?;
+    let invalid_handle = assembler.label()?;
+
+    // Exclusive prepared ABI: handle, haystack, length, start, end, result.
+    assembler.instruction(&[0x48, 0x85, 0xff])?; // test rdi, rdi
+    assembler.branch(&[0x0f, 0x84], invalid_handle)?;
+    assembler.instruction(&[0x48, 0x85, 0xd2])?; // test rdx, rdx
+    assembler.branch(&[0x0f, 0x88], invalid)?;
+    assembler.instruction(&[0x49, 0x39, 0xd0])?; // cmp r8, rdx
+    assembler.branch(&[0x0f, 0x87], invalid)?;
+    assembler.instruction(&[0x4c, 0x39, 0xc1])?; // cmp rcx, r8
+    assembler.branch(&[0x0f, 0x87], invalid)?;
+    assembler.instruction(&[0x4d, 0x85, 0xc9])?; // test r9, r9
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x41, 0xf6, 0xc1, 0x07])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xf6])?; // test rsi, rsi
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+
+    // Entry RSP is 8 modulo 16. A 120-byte frame aligns it for the rare call
+    // and reserves five SysV stack arguments before saved public registers.
+    assembler.instruction(&[0x48, 0x83, 0xec, FRAME_BYTES])?;
+    assembler.instruction(&[0x48, 0x89, 0x7c, 0x24, 0x28])?;
+    assembler.instruction(&[0x48, 0x89, 0x74, 0x24, 0x30])?;
+    assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x38])?;
+    assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, 0x40])?;
+    assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x48])?;
+    assembler.instruction(&[0x4c, 0x89, 0x4c, 0x24, 0x50])?;
+    assembler.instruction(&[0x49, 0xc7, 0x01, 0, 0, 0, 0])?;
+    assembler.instruction(&[0x49, 0xc7, 0x41, 0x08, 0, 0, 0, 0])?;
+    assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x58, 0, 0, 0, 0])?;
+    assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x60, 0, 0, 0, 0])?;
+
+    // lea partial_table(%rip), r10
+    assembler.instruction(&[0x4c, 0x8d, 0x15])?;
+    let table_displacement_label = assembler.label()?;
+    assembler.bind(table_displacement_label)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+
+    assembler.instruction(&[0x49, 0x89, 0xcb])?; // position = start
+    if view.dfa.initial_pending {
+        assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, 0x58])?;
+        assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x60, 1, 0, 0, 0])?;
+    }
+    assembler.instruction(&[0x31, 0xc9])?; // packed row offset = 0
+    if view.dfa.initial_pending
+        && (view.output == OutputContract::Exists || view.dfa.initial_terminal)
+    {
+        assembler.branch(&[0xe9], matched)?;
+    }
+
+    assembler.bind(scan)?;
+    assembler.instruction(&[0x4c, 0x3b, 0x5c, 0x24, 0x48])?;
+    assembler.branch(&[0x0f, 0x83], finish)?;
+    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x30])?;
+    assembler.instruction(&[0x42, 0x0f, 0xb6, 0x04, 0x1a])?;
+    assembler.instruction(&[0x41, 0x0f, 0xb6, 0x04, 0x02])?;
+    assembler.instruction(&[0x01, 0xc8])?;
+    assembler.instruction(&[0x41, 0x8b, 0x84, 0x82, 0, 1, 0, 0])?;
+    assembler.instruction(&[0x49, 0xff, 0xc3])?;
+    assembler.instruction(&[0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x88], accept)?;
+    assembler.branch(&[0xe9], classify)?;
+
+    assembler.bind(accept)?;
+    assembler.instruction(&[0x4c, 0x89, 0x5c, 0x24, 0x58])?;
+    assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x60, 1, 0, 0, 0])?;
+    if view.output == OutputContract::Exists {
+        assembler.branch(&[0xe9], matched)?;
+    }
+    assembler.instruction(&[0x25, 0xff, 0xff, 0xff, 0x7f])?;
+
+    assembler.bind(classify)?;
+    assembler.instruction(&[0x3d, 0xff, 0xff, 0xff, 0x7f])?;
+    assembler.branch(&[0x0f, 0x84], finish)?;
+    assembler.instruction(&[0x3d, 0, 0, 0, 0x40])?;
+    assembler.branch(&[0x0f, 0x83], hole)?;
+    assembler.instruction(&[0x89, 0xc1])?;
+    assembler.branch(&[0xe9], scan)?;
+
+    assembler.bind(hole)?;
+    // A hole reached after the final consumed byte needs no continuation.
+    assembler.instruction(&[0x4c, 0x3b, 0x5c, 0x24, 0x48])?;
+    assembler.branch(&[0x0f, 0x84], finish)?;
+    assembler.instruction(&[0x2d, 0, 0, 0, 0x40])?;
+
+    // Stack arguments seven through eleven: identity, state, position,
+    // pending-present, and pending end. The first six reload unchanged.
+    assembler.instruction(&[0x48, 0x8d, 0x15])?;
+    let identity_displacement_label = assembler.label()?;
+    assembler.bind(identity_displacement_label)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x48, 0x89, 0x14, 0x24])?;
+    assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 0x08])?;
+    assembler.instruction(&[0x4c, 0x89, 0x5c, 0x24, 0x10])?;
+    assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x60])?;
+    assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 0x18])?;
+    assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x58])?;
+    assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 0x20])?;
+    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x28])?;
+    assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x30])?;
+    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x38])?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x40])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x48])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x50])?;
+    assembler.instruction(&[0xe8])?;
+    let runtime_displacement_label = assembler.label()?;
+    assembler.bind(runtime_displacement_label)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.instruction(&[0xc3])?;
+
+    assembler.bind(finish)?;
+    assembler.instruction(&[0x48, 0x83, 0x7c, 0x24, 0x60, 0])?;
+    assembler.branch(&[0x0f, 0x84], no_match)?;
+    assembler.bind(matched)?;
+    if view.output != OutputContract::Exists {
+        assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x58])?;
+        assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x50])?;
+        match view.output {
+            OutputContract::Exists => {}
+            OutputContract::SelectedEnd => {
+                assembler.instruction(&[0x49, 0x89, 0x01])?;
+                assembler.instruction(&[0x49, 0x89, 0x41, 0x08])?;
+            }
+            OutputContract::Span => {
+                if view.dfa.initial_pending {
+                    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x40])?;
+                } else {
+                    let width = u64::try_from(view.exact_match_width.ok_or(
+                        ObjectError::InvalidModule("partial Span width is absent"),
+                    )?)
+                    .map_err(|_| ObjectError::ArithmeticOverflow("partial Span width"))?;
+                    let mut load_width = vec![0x48, 0xba];
+                    load_width.extend_from_slice(&width.to_le_bytes());
+                    assembler.instruction(&load_width)?;
+                    assembler.instruction(&[0x48, 0x29, 0xd0])?;
+                    assembler.instruction(&[0x48, 0x89, 0xc2])?;
+                }
+                assembler.instruction(&[0x49, 0x89, 0x11])?;
+                assembler.instruction(&[0x49, 0x89, 0x41, 0x08])?;
+            }
+        }
+    }
+    assembler.instruction(&[0xb8, 1, 0, 0, 0])?;
+    assembler.branch(&[0xe9], return_local)?;
+    assembler.bind(no_match)?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.bind(return_local)?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.instruction(&[0xc3])?;
+
+    assembler.bind(invalid)?;
+    assembler.instruction(&[0xb8, 2, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(invalid_handle)?;
+    assembler.instruction(&[0xb8, 5, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+
+    let finished = assembler.finish_with_label_offsets()?;
+    let table_displacement = finished.label_offset(table_displacement_label)?;
+    let identity_displacement = finished.label_offset(identity_displacement_label)?;
+    let runtime_displacement = finished.label_offset(runtime_displacement_label)?;
+    Ok((
+        finished.code,
+        vec![
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(table_displacement, "x86 partial table relocation")?,
+                kind: RelocationKind::X86PcRelative32,
+                symbol: PARTIAL_TABLE_SYMBOL,
+                addend: -4,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(identity_displacement, "x86 partial identity relocation")?,
+                kind: RelocationKind::X86PcRelative32,
+                symbol: PARTIAL_IDENTITY_SYMBOL,
+                addend: -4,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(runtime_displacement, "x86 partial runtime relocation")?,
+                kind: RelocationKind::X86PltRelative32,
+                symbol: PARTIAL_RUNTIME_SYMBOL,
+                addend: -4,
+            },
+        ],
+    ))
+}
+
 type Aarch64Label = usize;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -9871,6 +10361,16 @@ fn aarch64_store_x(source: u8, base: u8, byte_offset: u16) -> Result<u32, Object
         | (u32::from(byte_offset / 8) << 10)
         | aarch64_reg(base, 5)?
         | aarch64_reg(source, 0)?)
+}
+
+fn aarch64_load_x_imm(destination: u8, base: u8, byte_offset: u16) -> Result<u32, ObjectError> {
+    if !byte_offset.is_multiple_of(8) || byte_offset / 8 > 0x0fff {
+        return Err(ObjectError::InvalidModule("AArch64 LDR offset"));
+    }
+    Ok(0xf940_0000
+        | (u32::from(byte_offset / 8) << 10)
+        | aarch64_reg(base, 5)?
+        | aarch64_reg(destination, 0)?)
 }
 
 fn aarch64_load_byte_reg(destination: u8, base: u8, index: u8) -> Result<u32, ObjectError> {
@@ -14115,6 +14615,222 @@ fn lower_aarch64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), O
     ))
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the prepared AAPCS64 entry keeps validation, retained transitions, and the eleven-argument hole call contiguous"
+)]
+fn lower_aarch64_partial_prepared(
+    view: NativePartialProgramView<'_>,
+) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
+    const FRAME_BYTES: u16 = 112;
+    let mut assembler = Aarch64Assembler::new();
+    let scan = assembler.label()?;
+    let accept = assembler.label()?;
+    let classify = assembler.label()?;
+    let row = assembler.label()?;
+    let hole = assembler.label()?;
+    let finish = assembler.label()?;
+    let no_match = assembler.label()?;
+    let matched = assembler.label()?;
+    let return_local = assembler.label()?;
+    let invalid = assembler.label()?;
+    let invalid_handle = assembler.label()?;
+
+    // Exclusive prepared ABI: handle, haystack, length, start, end, result.
+    assembler.instruction(aarch64_cmp_x_imm(0, 0)?)?;
+    assembler.branch_cond(AARCH64_EQ, invalid_handle)?;
+    assembler.instruction(aarch64_cmp_x_imm(2, 0)?)?;
+    assembler.branch_cond(AARCH64_MI, invalid)?;
+    assembler.instruction(aarch64_cmp_x(4, 2)?)?;
+    assembler.branch_cond(AARCH64_HI, invalid)?;
+    assembler.instruction(aarch64_cmp_x(3, 4)?)?;
+    assembler.branch_cond(AARCH64_HI, invalid)?;
+    assembler.instruction(aarch64_cmp_x_imm(5, 0)?)?;
+    assembler.branch_cond(AARCH64_EQ, invalid)?;
+    assembler.instruction(aarch64_and_low_x(6, 5, 3)?)?;
+    assembler.instruction(aarch64_cmp_x_imm(6, 0)?)?;
+    assembler.branch_cond(AARCH64_NE, invalid)?;
+    assembler.instruction(aarch64_cmp_x_imm(1, 0)?)?;
+    assembler.branch_cond(AARCH64_EQ, invalid)?;
+
+    assembler.instruction(aarch64_sub_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(aarch64_store_x(30, 31, 104)?)?;
+    assembler.instruction(aarch64_store_x(0, 31, 32)?)?;
+    assembler.instruction(aarch64_store_x(1, 31, 40)?)?;
+    assembler.instruction(aarch64_store_x(2, 31, 48)?)?;
+    assembler.instruction(aarch64_store_x(3, 31, 56)?)?;
+    assembler.instruction(aarch64_store_x(4, 31, 64)?)?;
+    assembler.instruction(aarch64_store_x(5, 31, 72)?)?;
+    assembler.instruction(aarch64_store_x(31, 5, 0)?)?;
+    assembler.instruction(aarch64_store_x(31, 5, 8)?)?;
+
+    let table_page = assembler.instruction(0x9000_000a)?; // adrp x10, table
+    let table_page_offset = assembler.instruction(aarch64_add_x_imm(10, 10, 0)?)?;
+    assembler.instruction(aarch64_add_x_imm(
+        9,
+        10,
+        u16::try_from(PARTIAL_CLASS_MAP_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("partial class map size"))?,
+    )?)?;
+    assembler.instruction(aarch64_mov_x(11, 3)?)?;
+    assembler.instruction(aarch64_movz_w(12, 0)?)?;
+    assembler.instruction(aarch64_movz_x(13, 0, 0)?)?;
+    assembler.instruction(aarch64_movz_w(14, 0)?)?;
+    if view.dfa.initial_pending {
+        assembler.instruction(aarch64_mov_x(13, 3)?)?;
+        assembler.instruction(aarch64_movz_w(14, 1)?)?;
+    }
+    if view.dfa.initial_pending
+        && (view.output == OutputContract::Exists || view.dfa.initial_terminal)
+    {
+        assembler.branch(matched)?;
+    }
+
+    assembler.bind(scan)?;
+    assembler.instruction(aarch64_cmp_x(11, 4)?)?;
+    assembler.branch_cond(AARCH64_HS, finish)?;
+    assembler.instruction(aarch64_load_byte_reg(6, 1, 11)?)?;
+    assembler.instruction(aarch64_load_byte_reg(6, 10, 6)?)?;
+    assembler.instruction(aarch64_add_x_reg(7, 12, 6)?)?;
+    assembler.instruction(aarch64_load_w_uxtw(15, 9, 7)?)?;
+    assembler.instruction(aarch64_add_x_imm(11, 11, 1)?)?;
+    assembler.branch_bit_set_w(15, 31, accept)?;
+    assembler.branch(classify)?;
+
+    assembler.bind(accept)?;
+    assembler.instruction(aarch64_mov_x(13, 11)?)?;
+    assembler.instruction(aarch64_movz_w(14, 1)?)?;
+    if view.output == OutputContract::Exists {
+        assembler.branch(matched)?;
+    }
+    assembler.instruction(aarch64_and_low_31(15, 15)?)?;
+
+    assembler.bind(classify)?;
+    aarch64_load_u32_constant(&mut assembler, 6, PARTIAL_CELL_DEAD)?;
+    assembler.instruction(aarch64_cmp_x(15, 6)?)?;
+    assembler.branch_cond(AARCH64_EQ, finish)?;
+    assembler.branch_bit_clear_w(15, 30, row)?;
+    assembler.branch(hole)?;
+
+    assembler.bind(row)?;
+    assembler.instruction(aarch64_mov_x(12, 15)?)?;
+    assembler.branch(scan)?;
+
+    assembler.bind(hole)?;
+    // Accepting semantics were resolved above. A final-byte hole completes
+    // locally because there is no unconsumed byte for K0 to inspect.
+    assembler.instruction(aarch64_cmp_x(11, 4)?)?;
+    assembler.branch_cond(AARCH64_EQ, finish)?;
+    aarch64_load_u32_constant(&mut assembler, 6, PARTIAL_CELL_HOLE_BASE)?;
+    assembler.instruction(aarch64_sub_x_reg(7, 15, 6)?)?;
+
+    let identity_page = assembler.instruction(0x9000_0006)?; // adrp x6, identity
+    let identity_page_offset = assembler.instruction(aarch64_add_x_imm(6, 6, 0)?)?;
+    assembler.instruction(aarch64_store_x(11, 31, 0)?)?;
+    assembler.instruction(aarch64_store_x(14, 31, 8)?)?;
+    assembler.instruction(aarch64_store_x(13, 31, 16)?)?;
+    assembler.instruction(aarch64_load_x_imm(0, 31, 32)?)?;
+    assembler.instruction(aarch64_load_x_imm(1, 31, 40)?)?;
+    assembler.instruction(aarch64_load_x_imm(2, 31, 48)?)?;
+    assembler.instruction(aarch64_load_x_imm(3, 31, 56)?)?;
+    assembler.instruction(aarch64_load_x_imm(4, 31, 64)?)?;
+    assembler.instruction(aarch64_load_x_imm(5, 31, 72)?)?;
+    let runtime_branch = assembler.instruction(0x9400_0000)?; // bl runtime helper
+    assembler.instruction(aarch64_load_x_imm(30, 31, 104)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    assembler.bind(finish)?;
+    assembler.branch_zero_w(14, no_match)?;
+    assembler.bind(matched)?;
+    match view.output {
+        OutputContract::Exists => {}
+        OutputContract::SelectedEnd => {
+            assembler.instruction(aarch64_store_x(13, 5, 0)?)?;
+            assembler.instruction(aarch64_store_x(13, 5, 8)?)?;
+        }
+        OutputContract::Span => {
+            let start = 6;
+            if view.dfa.initial_pending {
+                assembler.instruction(aarch64_mov_x(start, 3)?)?;
+            } else {
+                let width = u64::try_from(view.exact_match_width.ok_or(
+                    ObjectError::InvalidModule("partial Span width is absent"),
+                )?)
+                .map_err(|_| ObjectError::ArithmeticOverflow("partial Span width"))?;
+                aarch64_load_u64_constant(&mut assembler, start, width)?;
+                assembler.instruction(aarch64_sub_x_reg(start, 13, start)?)?;
+            }
+            assembler.instruction(aarch64_store_x(start, 5, 0)?)?;
+            assembler.instruction(aarch64_store_x(13, 5, 8)?)?;
+        }
+    }
+    assembler.instruction(aarch64_movz_w(0, 1)?)?;
+    assembler.branch(return_local)?;
+    assembler.bind(no_match)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.bind(return_local)?;
+    assembler.instruction(aarch64_load_x_imm(30, 31, 104)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(invalid_handle)?;
+    assembler.instruction(aarch64_movz_w(0, 5)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let mut relocation_offsets = [
+        table_page,
+        table_page_offset,
+        identity_page,
+        identity_page_offset,
+        runtime_branch,
+    ];
+    let code = assembler.finish_with_offsets(&mut relocation_offsets)?;
+    Ok((
+        code,
+        vec![
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(relocation_offsets[0], "AArch64 partial table ADRP")?,
+                kind: RelocationKind::Aarch64Page21,
+                symbol: PARTIAL_TABLE_SYMBOL,
+                addend: 0,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(relocation_offsets[1], "AArch64 partial table ADD")?,
+                kind: RelocationKind::Aarch64PageOff12,
+                symbol: PARTIAL_TABLE_SYMBOL,
+                addend: 0,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(relocation_offsets[2], "AArch64 partial identity ADRP")?,
+                kind: RelocationKind::Aarch64Page21,
+                symbol: PARTIAL_IDENTITY_SYMBOL,
+                addend: 0,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(relocation_offsets[3], "AArch64 partial identity ADD")?,
+                kind: RelocationKind::Aarch64PageOff12,
+                symbol: PARTIAL_IDENTITY_SYMBOL,
+                addend: 0,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(relocation_offsets[4], "AArch64 partial runtime branch")?,
+                kind: RelocationKind::Aarch64Branch26,
+                symbol: PARTIAL_RUNTIME_SYMBOL,
+                addend: 0,
+            },
+        ],
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -16874,7 +17590,418 @@ mod tests {
             assert!(partial.resume_frontiers > 0);
             assert!(compiled.receipt().runtime_helper_required);
             assert!(compiled.module().required_runtime_symbol().is_some());
+            assert!(
+                compiled.module().prepared_entry_symbol().is_none(),
+                "selective retained root must keep its established scanner: {target:?}"
+            );
         }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the cross-target contract test keeps publication, relocation, and stable-regeneration assertions together"
+    )]
+    fn incomplete_retained_forward_publishes_guarded_prepared_entry() {
+        let limits = CompileLimitsV1 {
+            determinize: DeterminizeLimits {
+                max_states: 8,
+                ..DeterminizeLimits::default()
+            },
+            ..CompileLimitsV1::default()
+        };
+        for target in [
+            Target::x86_64_linux(),
+            Target::x86_64_macos(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos(),
+            Target::x86_64_linux()
+                .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                .expect("AVX2 target"),
+            Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .expect("ASIMD target"),
+        ] {
+            for (output, pattern) in [
+                (
+                    OutputContract::Exists,
+                    "(?-u:[\\x00-\\xFF])*(?:a+Q|[b-c][a-b]{1,5}(?:x+|y+))",
+                ),
+                (
+                    OutputContract::SelectedEnd,
+                    "(?-u:[\\x00-\\xFF])*(?:a+Q|[b-c][a-b]{1,5}(?:x+|y+))",
+                ),
+                (
+                    OutputContract::Span,
+                    "a+Q|[b-c][a-b]{1,5}(?:x+|y+)|a*",
+                ),
+            ] {
+                let compiled = compile(
+                    CompileRequest::new(pattern, target)
+                        .mode(CompileMode::Optimizing)
+                        .output(output)
+                        .limits(limits),
+                )
+                .expect("nullable incomplete retained fallback");
+                let partial = compiled
+                    .program()
+                    .partial_dfa_stats()
+                    .expect("partial-DFA statistics")
+                    .unwrap_or_else(|| panic!("incomplete retained table: {target:?}/{output:?}"));
+                assert!(partial.complete_rows < partial.discovered_states);
+                assert!(partial.resume_frontiers > 0);
+                assert!(
+                    compiled.program().native_partial_dfa_view().is_some(),
+                    "missing prepared view: {target:?}/{output:?}/{:?}",
+                    compiled.program().anchored_prefix_stats()
+                );
+                let prepared = compiled
+                    .module()
+                    .prepared_entry_symbol()
+                    .expect("prepared entry symbol");
+                assert!(prepared.starts_with(PREPARED_ENTRY_SYMBOL_PREFIX));
+                assert_eq!(
+                    compiled.module().start_accelerator(),
+                    StartAccelerator::None
+                );
+                assert_eq!(compiled.module().anchored_prefix_filter_bytes(), 0);
+                assert_eq!(compiled.module().symbols().len(), 8);
+                assert_eq!(
+                    compiled.module().symbols()[PARTIAL_RUNTIME_SYMBOL].name,
+                    PARTIAL_RUNTIME_SYMBOL_NAME
+                );
+                assert_eq!(
+                    compiled.module().symbols()[PARTIAL_RUNTIME_SYMBOL].section,
+                    None
+                );
+                assert_eq!(
+                    compiled.module().required_prepared_runtime_symbol(),
+                    Some(PARTIAL_RUNTIME_SYMBOL_NAME)
+                );
+                assert!(compiled.module().relocations().iter().any(|relocation| {
+                    relocation.symbol == PARTIAL_TABLE_SYMBOL
+                }));
+                assert!(compiled.module().relocations().iter().any(|relocation| {
+                    relocation.symbol == PARTIAL_IDENTITY_SYMBOL
+                }));
+                assert!(compiled.module().relocations().iter().any(|relocation| {
+                    relocation.symbol == PARTIAL_RUNTIME_SYMBOL
+                }));
+                let serialized = compiled.program().serialize().expect("serialize program");
+                assert_eq!(
+                    compiled.module().required_runtime_program().map(|(_, size)| size),
+                    Some(serialized.len())
+                );
+                assert!(
+                    compiled.module().sections()[PROGRAM_SECTION].bytes().len() > serialized.len()
+                );
+                assert_eq!(
+                    emit_object(
+                        compiled.module(),
+                        ObjectFormat::for_target(target),
+                        usize::MAX,
+                    )
+                    .expect("emit prepared object"),
+                    compiled.object()
+                );
+                let restored = crate::CompiledProgram::deserialize(&serialized)
+                    .expect("restore prepared partial program");
+                let restored_module = CompiledModule::lower(&restored, target)
+                    .expect("lower restored prepared partial program");
+                assert_eq!(restored_module.sections(), compiled.module().sections());
+                assert_eq!(restored_module.symbols(), compiled.module().symbols());
+                assert_eq!(restored_module.relocations(), compiled.module().relocations());
+                assert_eq!(
+                    restored_module.prepared_entry_symbol(),
+                    compiled.module().prepared_entry_symbol()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn partial_prepared_emitters_preserve_accept_final_hole_and_call_shapes() {
+        let limits = CompileLimitsV1 {
+            determinize: DeterminizeLimits {
+                max_states: 8,
+                ..DeterminizeLimits::default()
+            },
+            ..CompileLimitsV1::default()
+        };
+        let compiled = compile(
+            CompileRequest::new(
+                "(?-u:[\\x00-\\xFF])*(?:a+Q|[b-c][a-b]{1,5}(?:x+|y+))",
+                Target::x86_64_linux(),
+            )
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::SelectedEnd)
+            .limits(limits),
+        )
+        .expect("partial prepared shape");
+        let view = compiled
+            .program()
+            .native_partial_dfa_view()
+            .expect("partial prepared view");
+
+        let (x86, x86_relocations) = lower_x86_64_partial_prepared(view).unwrap();
+        assert_eq!(
+            x86_relocations
+                .iter()
+                .map(|relocation| relocation.symbol)
+                .collect::<Vec<_>>(),
+            [
+                PARTIAL_TABLE_SYMBOL,
+                PARTIAL_IDENTITY_SYMBOL,
+                PARTIAL_RUNTIME_SYMBOL,
+            ]
+        );
+        assert!(x86.starts_with(&[0x48, 0x85, 0xff]));
+        assert!(x86.windows(4).any(|bytes| bytes == [0x48, 0x83, 0xec, 120]));
+        let accept_clear = x86
+            .windows(5)
+            .position(|bytes| bytes == [0x25, 0xff, 0xff, 0xff, 0x7f])
+            .expect("x86 accept-bit clear");
+        let hole_compare = x86
+            .windows(5)
+            .position(|bytes| bytes == [0x3d, 0, 0, 0, 0x40])
+            .expect("x86 hole compare");
+        assert!(accept_clear < hole_compare);
+        let runtime_offset = usize::try_from(x86_relocations[2].offset).unwrap();
+        assert_eq!(x86.get(runtime_offset.wrapping_sub(1)), Some(&0xe8));
+
+        let (aarch64, aarch64_relocations) = lower_aarch64_partial_prepared(view).unwrap();
+        assert_eq!(
+            aarch64_relocations
+                .iter()
+                .map(|relocation| relocation.symbol)
+                .collect::<Vec<_>>(),
+            [
+                PARTIAL_TABLE_SYMBOL,
+                PARTIAL_TABLE_SYMBOL,
+                PARTIAL_IDENTITY_SYMBOL,
+                PARTIAL_IDENTITY_SYMBOL,
+                PARTIAL_RUNTIME_SYMBOL,
+            ]
+        );
+        let words = aarch64
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(words.contains(&aarch64_sub_x_imm(31, 31, 112).unwrap()));
+        assert!(words.contains(&aarch64_store_x(30, 31, 104).unwrap()));
+        assert!(words.contains(&aarch64_store_x(11, 31, 0).unwrap()));
+        assert!(words.contains(&aarch64_store_x(14, 31, 8).unwrap()));
+        assert!(words.contains(&aarch64_store_x(13, 31, 16).unwrap()));
+        let runtime_offset = usize::try_from(aarch64_relocations[4].offset).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(aarch64[runtime_offset..runtime_offset + 4].try_into().unwrap()),
+            0x9400_0000
+        );
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    #[ignore = "links and executes the additive prepared entry against an ABI-checking hole stub"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the opt-in native test keeps table tracing, object linking, window checks, and side-exit ABI assertions together"
+    )]
+    fn linked_host_partial_prepared_entry_completes_locally_and_marshals_holes() {
+        use std::{fmt::Write as _, fs, process::Command};
+
+        #[derive(Clone, Copy, Debug)]
+        struct Hole {
+            state: usize,
+            position: usize,
+            pending_end: Option<usize>,
+        }
+
+        fn trace(
+            view: NativePartialProgramView<'_>,
+            bytes: &[u8],
+            start: usize,
+            end: usize,
+        ) -> Option<Hole> {
+            let mut row = 0_usize;
+            let mut position = start;
+            let mut pending_end = view.dfa.initial_pending.then_some(start);
+            while position < end {
+                let class =
+                    usize::from(view.dfa.byte_classes[usize::from(*bytes.get(position)?)]);
+                let cell = view.dfa.packed_cells.get(row.checked_add(class)?)?.raw();
+                position = position.checked_add(1)?;
+                if cell & PARTIAL_CELL_ACCEPTED != 0 {
+                    pending_end = Some(position);
+                }
+                let next = cell & !PARTIAL_CELL_ACCEPTED;
+                if next == PARTIAL_CELL_DEAD {
+                    return None;
+                }
+                if next >= PARTIAL_CELL_HOLE_BASE {
+                    return (position < end).then_some(Hole {
+                        state: usize::try_from(next - PARTIAL_CELL_HOLE_BASE).ok()?,
+                        position,
+                        pending_end,
+                    });
+                }
+                row = usize::try_from(next).ok()?;
+            }
+            None
+        }
+
+        fn c_bytes(bytes: &[u8]) -> String {
+            bytes
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+
+        let target = if cfg!(target_arch = "x86_64") {
+            if cfg!(target_os = "linux") {
+                Target::x86_64_linux()
+            } else {
+                Target::x86_64_macos()
+            }
+        } else if cfg!(target_os = "linux") {
+            Target::aarch64_linux()
+        } else {
+            Target::aarch64_macos()
+        };
+        let limits = CompileLimitsV1 {
+            determinize: DeterminizeLimits {
+                max_states: 8,
+                ..DeterminizeLimits::default()
+            },
+            ..CompileLimitsV1::default()
+        };
+        let compiled = compile(
+            CompileRequest::new(
+                "(?-u:[\\x00-\\xFF])*(?:a+Q|[b-c][a-b]{1,5}(?:x+|y+))",
+                target,
+            )
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::SelectedEnd)
+            .limits(limits),
+        )
+        .expect("host prepared partial object");
+        let view = compiled
+            .program()
+            .native_partial_dfa_view()
+            .expect("host partial native view");
+        let witness = generated_byte_strings(&[0, b'a', b'b', b'c', b'x', b'y', b'Q', b'z'], 6)
+            .into_iter()
+            .find_map(|bytes| trace(view, &bytes, 0, bytes.len()).map(|hole| (bytes, hole)))
+            .expect("reachable interior partial hole");
+        let (hole_bytes, relative_hole) = witness;
+        let window_start = 2_usize;
+        let mut haystack = vec![b'!', b'!'];
+        haystack.extend_from_slice(&hole_bytes);
+        haystack.push(b'!');
+        let window_end = window_start + hole_bytes.len();
+        let hole = Hole {
+            state: relative_hole.state,
+            position: relative_hole.position + window_start,
+            pending_end: relative_hole.pending_end.map(|end| end + window_start),
+        };
+        let final_hole_end = hole.position;
+        let expected_final = compiled
+            .search(&haystack, SearchWindow::new(window_start, final_hole_end))
+            .expect("portable final-hole result");
+
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-partial-prepared-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("create prepared linker directory");
+        let object = directory.join("prepared.o");
+        fs::write(&object, compiled.object()).expect("write prepared object");
+        let symbol = compiled
+            .module()
+            .prepared_entry_symbol()
+            .expect("prepared symbol");
+        let identity = compiled.program().artifact_identity();
+        let pending_present = u8::from(hole.pending_end.is_some());
+        let pending_end = hole.pending_end.unwrap_or(0);
+        let mut source = format!(
+            "#include <stddef.h>\n#include <stdint.h>\n#include <string.h>\n\
+             typedef void *handle_t;\n\
+             extern uint32_t {symbol}(handle_t,const unsigned char*,size_t,size_t,size_t,size_t*);\n\
+             static const unsigned char identity[32]={{{}}};\n\
+             static const unsigned char haystack[]={{{}}};\n\
+             static int expect_hole;\n\
+             uint32_t fre_aot_regex_runtime_search_v1(const unsigned char*a,const unsigned char*b,size_t c,size_t d,size_t e,size_t*f){{(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 98U;}}\n\
+             uint32_t fre_aot_regex_runtime_search_exclusive_from_partial_v1(\
+               handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,size_t*r,\
+               const unsigned char*d,size_t state,size_t position,uint32_t pending,size_t pend){{\
+               if(!expect_hole||h!=(handle_t)(uintptr_t)0x1234U||p!=haystack||n!=sizeof(haystack)||\
+                  s!={window_start}U||e!={window_end}U||r==NULL||memcmp(d,identity,32U)!=0||\
+                  state!={}U||position!={}U||pending!={pending_present}U||pend!={pending_end}U)return 90U;\
+               r[0]=123U;r[1]=456U;return 77U;}}\n\
+             int main(void){{size_t r[2]={{91U,92U}};uint32_t status;\n",
+            c_bytes(&identity),
+            c_bytes(&haystack),
+            hole.state,
+            hole.position,
+        );
+        writeln!(
+            source,
+            "expect_hole=0;status={symbol}((handle_t)(uintptr_t)0x1234U,haystack,sizeof(haystack),{window_start}U,{final_hole_end}U,r);"
+        )
+        .unwrap();
+        match expected_final {
+            MatchResult::SelectedEnd(Some(end)) => writeln!(
+                source,
+                "if(status!=1U||r[0]!={end}U||r[1]!={end}U)return 10;"
+            )
+            .unwrap(),
+            MatchResult::SelectedEnd(None) => {
+                source.push_str("if(status!=0U||r[0]!=0U||r[1]!=0U)return 10;\n");
+            }
+            _ => panic!("unexpected prepared test output contract"),
+        }
+        writeln!(
+            source,
+            "expect_hole=1;r[0]=91U;r[1]=92U;status={symbol}((handle_t)(uintptr_t)0x1234U,haystack,sizeof(haystack),{window_start}U,{window_end}U,r);if(status!=77U||r[0]!=123U||r[1]!=456U)return 11;"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "expect_hole=0;r[0]=91U;r[1]=92U;status={symbol}((handle_t)0,haystack,sizeof(haystack),{window_start}U,{window_end}U,r);if(status!=5U||r[0]!=91U||r[1]!=92U)return 12;"
+        )
+        .unwrap();
+        source.push_str("return 0;}\n");
+        let c_path = directory.join("prepared.c");
+        let executable = directory.join("prepared");
+        fs::write(&c_path, source).expect("write prepared C harness");
+        let c_compiler = if cfg!(target_os = "macos") {
+            "clang"
+        } else {
+            "cc"
+        };
+        let status = Command::new(c_compiler)
+            .arg("-O0")
+            .arg(&c_path)
+            .arg(&object)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .expect("link prepared native harness");
+        assert!(status.success());
+        let output = Command::new(&executable)
+            .output()
+            .expect("execute prepared native harness");
+        assert!(
+            output.status.success(),
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::remove_dir_all(&directory).expect("remove prepared linker directory");
     }
 
     #[test]

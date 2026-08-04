@@ -29,6 +29,15 @@ typedef uint32_t (*FreAotRegexEntryV1)(
     size_t window_end,
     FreAotRegexResultV1 *result_ptr);
 
+/* Additive native retained-row entry for an exclusively prepared program. */
+typedef uint32_t (*FreAotRegexExclusiveEntryV1)(
+    FreAotRegexExclusiveHandleV1 handle,
+    const uint8_t *haystack_ptr,
+    size_t haystack_len,
+    size_t window_start,
+    size_t window_end,
+    FreAotRegexResultV1 *result_ptr);
+
 #ifdef __cplusplus
 extern "C" {
 #endif

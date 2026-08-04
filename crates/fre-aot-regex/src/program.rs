@@ -22,8 +22,8 @@ use crate::{
     },
     dfa::{
         self, DeterminizationReport, DeterminizeLimits, DeterminizeOutcome, DfaStats, ForwardCell,
-        NativeDfaView, OrderedDfa, PartialDfa, PartialDfaPrefixPlan, PartialDfaResult,
-        PartialDfaResume,
+        NativeDfaView, NativePartialDfaView, OrderedDfa, PartialDfa, PartialDfaPrefixPlan,
+        PartialDfaResult, PartialDfaResume,
     },
     error::{CompileError, CompileResource},
     required_literals::{self, RequiredLiterals},
@@ -2527,6 +2527,16 @@ pub(crate) struct NativeProgramView<'a> {
     pub(crate) retained_prefix_requirement: Option<NativeRetainedPrefixRequirement>,
 }
 
+/// Authenticated incomplete retained rows eligible for a prepared native
+/// entry with exact K0 side exits.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NativePartialProgramView<'a> {
+    pub(crate) output: OutputContract,
+    pub(crate) dfa: NativePartialDfaView<'a>,
+    pub(crate) exact_match_width: Option<usize>,
+    pub(crate) artifact_identity: [u8; 32],
+}
+
 // An exact-product native entry returns directly from its moving primary
 // scanner after verifying every other graph-proved column. The backend still
 // requires a structurally valid table layout for shared register/address
@@ -3053,6 +3063,42 @@ impl CompiledProgram {
             max_match_width: self.max_match_width(),
             exact_product_width: None,
             retained_prefix_requirement,
+        })
+    }
+
+    /// Return authenticated incomplete retained rows for the additive
+    /// exclusive prepared entry. Ordinary object entry selection remains
+    /// unchanged and continues to use the stable runtime adapter.
+    pub(crate) fn native_partial_dfa_view(&self) -> Option<NativePartialProgramView<'_>> {
+        if self.context_dfa.is_some() || !matches!(self.engine, ProgramEngine::OrderedNfa) {
+            return None;
+        }
+        let dfa = self.partial_dfa()?.native_incomplete_view()?;
+        let (prefix_plan, prefix_supported) =
+            PartialDfaPrefixPlan::derive(self.anchored_prefix.sets());
+        // A selective portable root owns its established SIMD scanner. Until
+        // native partial lowering emits and authenticates the same primary,
+        // publishing a scalar prepared symbol would replace that route with a
+        // long-window byte-at-a-time scan. Initial-pending machines bypass the
+        // root scanner entirely; nonselective roots have no scanner to lose.
+        if !prefix_supported || (!dfa.initial_pending && prefix_plan.is_some()) {
+            return None;
+        }
+        // The incomplete artifact intentionally has no reverse DFA. A local
+        // Span completion can therefore publish only when the selected end
+        // itself proves the start. Interior holes remain valid for every Span
+        // artifact because K0 owns exact reverse/start recovery after resume.
+        if self.output == OutputContract::Span
+            && !dfa.initial_pending
+            && self.exact_match_width.is_none()
+        {
+            return None;
+        }
+        Some(NativePartialProgramView {
+            output: self.output,
+            dfa,
+            exact_match_width: self.exact_match_width,
+            artifact_identity: self.artifact_identity(),
         })
     }
 
