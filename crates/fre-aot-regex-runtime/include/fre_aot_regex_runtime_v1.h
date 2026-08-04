@@ -128,8 +128,8 @@ uint32_t fre_aot_regex_runtime_search_exclusive_from_partial_v1(
  * prior local native completion, runs suffix then cut, and consults adaptive
  * admission. Status 0 or 1 initializes result_out and completes the search.
  * FRE_AOT_REGEX_STATUS_PARTIAL_PREFLIGHT_ENTER initializes window_out with
- * the exact window on which the native table must enter. Other statuses are
- * errors and initialize neither output.
+ * the exact non-empty window on which the native table must enter. Other
+ * statuses are errors and initialize neither output.
  */
 uint32_t fre_aot_regex_runtime_search_exclusive_partial_preflight_v1(
     FreAotRegexExclusiveHandleV1 handle,

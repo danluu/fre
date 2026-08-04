@@ -1094,9 +1094,9 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_from_partial_v1(
 /// admission. On [`STATUS_NO_MATCH`] or [`STATUS_MATCH`], `result_ptr` is
 /// initialized and the search is complete. On
 /// [`STATUS_PARTIAL_PREFLIGHT_ENTER`], `window_out` is initialized to the
-/// exact possibly narrowed window and the native table must enter there. If
-/// admission declines, K0 completes from that narrowed window inside this
-/// call; the generated entry must not replay the accelerators.
+/// exact non-empty, possibly narrowed window and the native table must enter
+/// there. If admission declines, K0 completes from that narrowed window
+/// inside this call; the generated entry must not replay the accelerators.
 ///
 /// The expected identity points to exactly [`ARTIFACT_IDENTITY_BYTES`] bytes
 /// and binds the emitted native table to the prepared semantic program.

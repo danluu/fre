@@ -289,7 +289,8 @@ pub struct SearchWindow {
 ///
 /// A complete suffix/cut proof or an adaptive native-entry decline returns
 /// the semantic result directly. Otherwise the native table may enter on the
-/// exact possibly narrowed window without replaying either accelerator.
+/// exact non-empty, possibly narrowed window without replaying either
+/// accelerator.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RetainedPartialPreflight {
@@ -3721,7 +3722,8 @@ impl CompiledProgram {
         // The native entry has already enforced this floor, but preserving it
         // here makes the authenticated helper complete when called directly
         // and exactly matches the portable optimizing route's outer policy.
-        let enter = input_bytes >= PARTIAL_DFA_MIN_INPUT_BYTES
+        let enter = narrowed.start < narrowed.end
+            && input_bytes >= PARTIAL_DFA_MIN_INPUT_BYTES
             && partial_workspace
                 .state
                 .claim_native_entry_after_accelerators();
