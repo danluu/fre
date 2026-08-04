@@ -85,6 +85,7 @@ mod fixed_absolute;
 mod forward_anchored;
 mod grapheme_scalar;
 pub mod guarded_ascii_word;
+mod guarded_literal_set;
 pub mod guarded_unicode_word;
 mod line_capture;
 mod line_total_grep;
@@ -698,6 +699,11 @@ use fre_syntax::{
 };
 
 pub use fre_syntax::{CompatibilityProfile, RustProfile};
+pub use guarded_literal_set::{
+    SearchAccounting as GuardedLiteralSetSearchAccounting,
+    SearchActual as GuardedLiteralSetSearchActual, SearchError as GuardedLiteralSetSearchError,
+    SearchUpperBounds as GuardedLiteralSetSearchUpperBounds,
+};
 pub use line_capture::{
     ANCHORED_ASCII_SEPARATED_FIELDS_CAPTURE_PATTERN,
     ANCHORED_ASCII_SEPARATED_FIELDS_INSPECTION_WORK, ANCHORED_ASCII_SEPARATED_FIELDS_OPERATION_ID,
@@ -1010,7 +1016,8 @@ pub struct BuildReport {
 pub enum PlanKind {
     /// SIMD-aware shared native exact-substring primitive. This is not JIT.
     ExactLiteral,
-    /// Shared SIMD packed ordered finite-literal primitive. This is not JIT.
+    /// Shared native finite-literal primitive, including the fixed-column
+    /// exact complete-word composition. This is not JIT.
     PackedLiteralSet,
     /// Bounded ordered finite-literal DFA used when packed search is ineligible.
     LiteralSetDfa,
@@ -2682,6 +2689,8 @@ pub enum SearchAccounting {
     UnicodeWordRun(UnicodeWordRunAccounting),
     /// Exact fixed-predicate first-match counters.
     FixedPredicateWord64(FixedPredicateWord64SearchAccounting),
+    /// Fixed-column candidate and exact maximal-word dictionary accounting.
+    GuardedLiteralSet(GuardedLiteralSetSearchAccounting),
 }
 
 impl SearchAccounting {
@@ -2691,7 +2700,7 @@ impl SearchAccounting {
         match self {
             Self::K0(_) => PlanKind::K0,
             Self::ExactLiteral(_) => PlanKind::ExactLiteral,
-            Self::PackedLiteralSet(_) => PlanKind::PackedLiteralSet,
+            Self::PackedLiteralSet(_) | Self::GuardedLiteralSet(_) => PlanKind::PackedLiteralSet,
             Self::LiteralSetDfa(_) => PlanKind::LiteralSetDfa,
             Self::RequiredLiteral(_) => PlanKind::RequiredLiteral,
             Self::LiteralClassRunLiteral(_) => PlanKind::LiteralClassRunLiteral,
@@ -2714,6 +2723,9 @@ impl SearchAccounting {
             }
             Self::PackedLiteralSet(accounting) => {
                 u64::try_from(accounting.work_upper_bound).unwrap_or(u64::MAX)
+            }
+            Self::GuardedLiteralSet(accounting) => {
+                u64::try_from(accounting.upper_bounds.total_work).unwrap_or(u64::MAX)
             }
             Self::LiteralSetDfa(accounting) => {
                 u64::try_from(accounting.transitions_upper_bound).unwrap_or(u64::MAX)
@@ -2769,6 +2781,7 @@ pub enum SearchError {
     UnicodeFoldedLiteral(UnicodeFoldedLiteralSearchError),
     UnicodeWordRun(UnicodeWordRunError),
     FixedPredicateWord64(FixedPredicateWord64SearchError),
+    GuardedLiteralSet(GuardedLiteralSetSearchError),
 }
 
 impl fmt::Display for SearchError {
@@ -2778,6 +2791,9 @@ impl fmt::Display for SearchError {
             Self::ExactLiteral(error) => write!(f, "literal search failed: {error}"),
             Self::PackedLiteralSet(error) => {
                 write!(f, "packed literal-set search failed: {error}")
+            }
+            Self::GuardedLiteralSet(error) => {
+                write!(f, "guarded literal-set search failed: {error}")
             }
             Self::LiteralSetDfa(error) => write!(f, "literal-set DFA search failed: {error}"),
             Self::RequiredLiteral(error) => write!(f, "required-literal search failed: {error}"),
@@ -2810,6 +2826,7 @@ impl std::error::Error for SearchError {
             Self::K0(error) => Some(error),
             Self::ExactLiteral(error) => Some(error),
             Self::PackedLiteralSet(error) => Some(error),
+            Self::GuardedLiteralSet(error) => Some(error),
             Self::LiteralSetDfa(error) => Some(error),
             Self::RequiredLiteral(error) => Some(error),
             Self::LiteralClassRunLiteral(error) => Some(error),
@@ -2838,6 +2855,12 @@ impl From<LiteralError> for SearchError {
 impl From<PackedLiteralSetError> for SearchError {
     fn from(value: PackedLiteralSetError) -> Self {
         Self::PackedLiteralSet(value)
+    }
+}
+
+impl From<GuardedLiteralSetSearchError> for SearchError {
+    fn from(value: GuardedLiteralSetSearchError) -> Self {
+        Self::GuardedLiteralSet(value)
     }
 }
 
@@ -4142,16 +4165,129 @@ impl PortableBuilder {
                 },
             });
         }
-        let (finite_words, mut finite_work) = finite::extract(
+        let retained_facade_bytes = source_storage_bytes
+            .checked_add(capture_name_storage_bytes)
+            .ok_or(BuildError::PersistentBytesOverflow)?;
+        let guarded_plan_persistent_bytes = self
+            .limits
+            .max_persistent_bytes
+            .saturating_sub(retained_facade_bytes);
+        let look_set = rust.hir.properties().look_set();
+        let has_guarded_ascii_left = look_set.contains(Look::WordAscii)
+            || look_set.contains(Look::WordStartAscii)
+            || look_set.contains(Look::WordStartHalfAscii);
+        let has_guarded_ascii_right = look_set.contains(Look::WordAscii)
+            || look_set.contains(Look::WordEndAscii)
+            || look_set.contains(Look::WordEndHalfAscii);
+        let derive_guarded_ascii_dictionary = self.selection == PlanSelection::Auto
+            && has_guarded_ascii_left
+            && has_guarded_ascii_right;
+        let finite_outcome = finite::extract(
             &rust.hir,
             self.limits.literal_set.max_patterns,
             self.limits.literal_set.max_pattern_bytes,
             fixed_predicate_work,
             self.limits.max_planner_work,
-            false,
-            finite::GuardedFiniteBuildLimits::unlimited(),
-        )
-        .into_incumbent_words()?;
+            derive_guarded_ascii_dictionary,
+            guarded_literal_set::extraction_limits(
+                self.limits.packed_literal_set,
+                guarded_plan_persistent_bytes,
+            ),
+        );
+        if !finite_outcome.has_closed_receipt() {
+            return Err(BuildError::InternalInvariant(
+                "finite outcome lost its extraction-attempt closure",
+            ));
+        }
+        let mut finite_work = finite_outcome.work();
+        let (finite_words, guarded_dictionary) = match finite_outcome {
+            finite::FiniteOutcome::Fits { words, .. } => (Some(words), None),
+            finite::FiniteOutcome::GuardedFiniteBody { dictionary, .. } => {
+                (None, Some(dictionary))
+            }
+            finite::FiniteOutcome::TooLargeFixedSequence { .. }
+            | finite::FiniteOutcome::Unsupported { .. }
+            | finite::FiniteOutcome::GuardedResourceFailure {
+                error: finite::GuardedFiniteBuildError::ConstructionLimit { .. },
+                ..
+            } => (None, None),
+            finite::FiniteOutcome::ResourceFailure { error, .. } => return Err(error),
+            finite::FiniteOutcome::GuardedResourceFailure {
+                error: finite::GuardedFiniteBuildError::Dictionary(error),
+                ..
+            } => match error.kind {
+                guarded_ascii_word::BuildErrorKind::ResourceLimit { .. }
+                | guarded_ascii_word::BuildErrorKind::WorkLimit { .. }
+                | guarded_ascii_word::BuildErrorKind::RepresentationLimit { .. } => (None, None),
+                guarded_ascii_word::BuildErrorKind::AllocationFailed {
+                    structure,
+                    additional,
+                } => {
+                    return Err(BuildError::AllocationFailed {
+                        structure,
+                        additional,
+                    });
+                }
+                guarded_ascii_word::BuildErrorKind::ArithmeticOverflow { computation } => {
+                    return Err(BuildError::InternalInvariant(computation));
+                }
+                guarded_ascii_word::BuildErrorKind::InternalInvariant { detail } => {
+                    return Err(BuildError::InternalInvariant(detail));
+                }
+                guarded_ascii_word::BuildErrorKind::EmptyDictionary
+                | guarded_ascii_word::BuildErrorKind::ImpossibleDimensions { .. }
+                | guarded_ascii_word::BuildErrorKind::SourceLengthMismatch { .. }
+                | guarded_ascii_word::BuildErrorKind::PackedBytesMismatch { .. }
+                | guarded_ascii_word::BuildErrorKind::EmptyWord { .. }
+                | guarded_ascii_word::BuildErrorKind::InvalidLeftGuard { .. }
+                | guarded_ascii_word::BuildErrorKind::InvalidRightGuard { .. }
+                | guarded_ascii_word::BuildErrorKind::NonAsciiWordByte { .. } => {
+                    return Err(BuildError::InternalInvariant(
+                        "guarded finite extraction produced an invalid ASCII-word dictionary",
+                    ));
+                }
+            },
+        };
+        if let Some(dictionary) = guarded_dictionary
+            && let Ok(plan) = guarded_literal_set::Plan::build(
+                dictionary,
+                self.limits.packed_literal_set,
+                guarded_plan_persistent_bytes,
+            )
+        {
+            let storage = plan.storage_bytes();
+            return Ok(PortableRegex {
+                source,
+                capture_names,
+                line_total_grep_plan,
+                plan: PortablePlan::GuardedLiteralSet(plan),
+                profile: profile.clone(),
+                limits: self.limits,
+                selection: self.selection,
+                report: BuildReport {
+                    profile: profile.clone(),
+                    admission,
+                    syntax,
+                    plan: PlanKind::PackedLiteralSet,
+                    planner_work: finite_work,
+                    lowering: None,
+                    states: 0,
+                    edges: 0,
+                    plan_storage_bytes: storage,
+                    source_storage_bytes,
+                    capture_name_storage_bytes,
+                    charged_persistent_bytes: 0,
+                    persistent_byte_limit: 0,
+                    captures_len,
+                    static_captures_len,
+                    minimum_match_bytes,
+                    required_literal: None,
+                    literal_class_run_literal: None,
+                    forward_anchored: None,
+                }
+                .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
+            });
+        }
         if let Some(words) = finite_words {
             if words.len() == 1 {
                 let literal = LiteralPlan::new(&words[0], self.limits.literal)?;
@@ -4813,6 +4949,7 @@ enum PortablePlan {
     BoundedByteClassRepeat(bounded_byte_class_repeat::Plan),
     FixedPredicateWord64(Box<FixedPredicateWord64Plan>),
     BoundedByteClassSequence(bounded_byte_class_sequence::Plan),
+    GuardedLiteralSet(guarded_literal_set::Plan),
 }
 
 impl PortablePlan {
@@ -4839,6 +4976,7 @@ impl PortablePlan {
             Self::BoundedWordClass(plan) => plan.plan_id(),
             Self::FixedPredicateWord64(_) => FIXED_PREDICATE_WORD64_SEARCH_PLAN_ID,
             Self::BoundedByteClassSequence(_) => bounded_byte_class_sequence::PLAN_ID,
+            Self::GuardedLiteralSet(_) => guarded_literal_set::PLAN_ID,
         }
     }
 }
@@ -5259,6 +5397,13 @@ impl PortableRegex {
                     SearchAccounting::PackedLiteralSet(accounting),
                 ))
             }
+            PortablePlan::GuardedLiteralSet(plan) => {
+                let (matched, accounting) = plan.find_window(haystack, window, limits)?;
+                Ok((
+                    matched.is_some(),
+                    SearchAccounting::GuardedLiteralSet(accounting),
+                ))
+            }
             PortablePlan::LiteralSetDfa(literal_set) => {
                 let literal_window = LiteralWindow::new(window.start(), window.end());
                 let (matched, accounting) = literal_set.find_window(
@@ -5478,6 +5623,10 @@ impl PortableRegex {
                 )
                 .map(|(matched, _)| matched.is_some())
                 .map_err(SearchError::from),
+            PortablePlan::GuardedLiteralSet(plan) => plan
+                .find_window_value(haystack, window, limits)
+                .map(|matched| matched.is_some())
+                .map_err(SearchError::from),
             PortablePlan::LiteralSetDfa(literal_set) => literal_set
                 .find_window(
                     haystack,
@@ -5668,6 +5817,10 @@ impl PortableRegex {
                     matched.map(|(_, end)| end),
                     SearchAccounting::PackedLiteralSet(accounting),
                 ))
+            }
+            PortablePlan::GuardedLiteralSet(plan) => {
+                let (end, accounting) = plan.shortest_window(haystack, window, limits)?;
+                Ok((end, SearchAccounting::GuardedLiteralSet(accounting)))
             }
             PortablePlan::LiteralSetDfa(literal_set) => {
                 let literal_window = LiteralWindow::new(window.start(), window.end());
@@ -5874,6 +6027,14 @@ impl PortableRegex {
                     matched.map(|(_, end)| end),
                     SearchAccounting::PackedLiteralSet(accounting),
                 ))
+            }
+            PortablePlan::GuardedLiteralSet(plan) => {
+                let (end, accounting) = plan.shortest_window(
+                    haystack,
+                    SearchWindow::full(haystack),
+                    limits,
+                )?;
+                Ok((end, SearchAccounting::GuardedLiteralSet(accounting)))
             }
             PortablePlan::LiteralSetDfa(literal_set) => {
                 let (matched, accounting) =
@@ -6239,6 +6400,13 @@ impl PortableRegex {
                     SearchAccounting::PackedLiteralSet(accounting),
                 ))
             }
+            PortablePlan::GuardedLiteralSet(plan) => {
+                let (matched, accounting) = plan.find_window(haystack, window, limits)?;
+                Ok((
+                    matched,
+                    SearchAccounting::GuardedLiteralSet(accounting),
+                ))
+            }
             PortablePlan::LiteralSetDfa(literal_set) => {
                 let literal_window = LiteralWindow::new(window.start(), window.end());
                 let (matched, accounting) = literal_set.find_window(
@@ -6459,6 +6627,9 @@ impl PortableRegex {
                 )
                 .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
                 .map_err(SearchError::from),
+            PortablePlan::GuardedLiteralSet(plan) => plan
+                .find_window_value(haystack, window, limits)
+                .map_err(SearchError::from),
             PortablePlan::LiteralSetDfa(literal_set) => literal_set
                 .find_window(
                     haystack,
@@ -6633,6 +6804,17 @@ impl PortableRegex {
                 Ok((
                     matched.map(|(start, end)| Match { start, end }),
                     u64::try_from(accounting.work_upper_bound).unwrap_or(u64::MAX),
+                ))
+            }
+            PortablePlan::GuardedLiteralSet(plan) => {
+                let (matched, accounting) = plan.find_window(
+                    haystack,
+                    SearchWindow::new(start, haystack.len()),
+                    limits,
+                )?;
+                Ok((
+                    matched,
+                    u64::try_from(accounting.upper_bounds.total_work).unwrap_or(u64::MAX),
                 ))
             }
             PortablePlan::LiteralSetDfa(literal_set) => {
@@ -8577,7 +8759,8 @@ fn fixed_predicate_word64_search_limits(limits: SearchLimits) -> FixedPredicateW
 mod tests {
     use super::{
         Automaton, BuildError, BuildLimits, CanonicalPattern, CaptureFreeOperation,
-        CompatibilityProfile, K0MandatoryCutPlan, K0MandatorySuffixPlan,
+        CompatibilityProfile, GuardedLiteralSetSearchError, K0MandatoryCutPlan,
+        K0MandatorySuffixPlan,
         K0NegativePrefilterOutcome, Match, OperationSemantics, PlanKind, PlanSelection,
         PortableBuilder, PortableFindIterAccounting, PortableFindIterError, PortableFindIterLimits,
         PortableFindIterRunLimits, PortablePlan, PortableRegex, SearchAccounting, SearchError,
@@ -9436,6 +9619,97 @@ mod tests {
                 );
                 assert_eq!(accounting.plan(), fre.build_report().plan);
             }
+        }
+    }
+
+    #[test]
+    fn boundary_wrapped_finite_ascii_words_select_guarded_candidates() {
+        let pattern = r"(?-u:\b(?:a|ab|cat|dog)\b)";
+        let fre = PortableBuilder::new(pattern).unicode(false).build().unwrap();
+        assert_eq!(fre.build_report().plan, PlanKind::PackedLiteralSet);
+        assert_eq!(
+            fre.runtime_implementation_id(),
+            "guarded-ascii-word-literal-set.fixed-column-dictionary.v3",
+        );
+        let upstream = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let haystacks: &[&[u8]] = &[
+            b"",
+            b"ab",
+            b"a",
+            b"alphabet cat dogmatic dog",
+            b"xcat catz cat",
+            b"\xffcat\xff",
+        ];
+        for &haystack in haystacks {
+            for start in 0..=haystack.len() {
+                let expected = upstream
+                    .find_at(haystack, start)
+                    .map(|matched| (matched.start(), matched.end()));
+                let (actual, accounting) = fre
+                    .find_at(haystack, start, SearchLimits::unlimited())
+                    .unwrap();
+                assert_eq!(
+                    actual.map(|matched| (matched.start(), matched.end())),
+                    expected,
+                    "haystack={haystack:?}, start={start}",
+                );
+                assert!(matches!(
+                    accounting,
+                    SearchAccounting::GuardedLiteralSet(_)
+                ));
+            }
+        }
+
+        let (_, SearchAccounting::GuardedLiteralSet(accounting)) = fre
+            .find(b"zz dog", SearchLimits::unlimited())
+            .unwrap()
+        else {
+            panic!("guarded route returned another accounting family");
+        };
+        let exact = u64::try_from(accounting.upper_bounds.total_work).unwrap();
+        assert!(fre
+            .find(
+                b"zz dog",
+                SearchLimits {
+                    max_work: exact,
+                    max_scratch_bytes: 0,
+                },
+            )
+            .is_ok());
+        assert!(matches!(
+            fre.find(
+                b"zz dog",
+                SearchLimits {
+                    max_work: exact - 1,
+                    max_scratch_bytes: 0,
+                },
+            ),
+            Err(SearchError::GuardedLiteralSet(
+                GuardedLiteralSetSearchError::WorkLimit { .. }
+            )),
+        ));
+    }
+
+    #[test]
+    fn directional_ascii_word_boundaries_select_the_same_guarded_plan() {
+        for pattern in [
+            r"(?-u:\b{start}(?:a|ab)\b{end})",
+            r"(?-u:\b{start-half}(?:a|ab)\b{end-half})",
+        ] {
+            let fre = PortableBuilder::new(pattern).unicode(false).build().unwrap();
+            assert_eq!(fre.build_report().plan, PlanKind::PackedLiteralSet);
+            assert_eq!(
+                fre.runtime_implementation_id(),
+                "guarded-ascii-word-literal-set.fixed-column-dictionary.v3",
+            );
+            assert_eq!(
+                fre.find_value(b"x ab y", SearchLimits::unlimited())
+                    .unwrap(),
+                Some(Match { start: 2, end: 4 }),
+            );
         }
     }
 

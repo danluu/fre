@@ -415,6 +415,7 @@ pub use packed_literal_set::{
     CERTIFIED_MAX_PATTERNS as PACKED_LITERAL_SET_CERTIFIED_MAX_PATTERNS,
     PackedLiteralSetAccounting, PackedLiteralSetBuildAccounting, PackedLiteralSetBuildLimits,
     PackedLiteralSetError, PackedLiteralSetPlan, PackedLiteralSetSearchLimits,
+    packed_literal_anchor_frequency_rank,
 };
 pub use packed_ordered_literal_aggregate::{
     ALGORITHM_ID as PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,

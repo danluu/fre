@@ -1958,22 +1958,31 @@ impl fmt::Display for ReduceError {
 impl std::error::Error for ReduceError {}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct LookupActual {
-    fingerprint_bytes: usize,
-    binary_search_comparisons: usize,
-    collision_slots: usize,
-    full_equality_checks: usize,
-    full_equality_bytes: usize,
+pub(crate) struct LookupActual {
+    pub(crate) fingerprint_bytes: usize,
+    pub(crate) binary_search_comparisons: usize,
+    pub(crate) collision_slots: usize,
+    pub(crate) full_equality_checks: usize,
+    pub(crate) full_equality_bytes: usize,
 }
 
 impl LookupActual {
-    fn steps(self) -> Option<usize> {
+    pub(crate) fn steps(self) -> Option<usize> {
         self.fingerprint_bytes
             .checked_add(self.binary_search_comparisons)?
             .checked_add(self.collision_slots)?
             .checked_add(self.full_equality_checks)?
             .checked_add(self.full_equality_bytes)
     }
+}
+
+/// Compact source-independent lookup envelope for sibling guarded plans that
+/// already own this published dictionary and do not perform a full reduction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LookupUpperBounds {
+    pub(crate) candidate_words: usize,
+    pub(crate) lookup_steps: usize,
+    pub(crate) total_work: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2258,7 +2267,31 @@ impl Dictionary {
         })
     }
 
-    fn lookup_counted(&self, candidate: &[u8]) -> Result<(bool, LookupActual), ReduceError> {
+    pub(crate) fn lookup_upper_bounds(
+        &self,
+        haystack_bytes: usize,
+    ) -> Result<LookupUpperBounds, ReduceError> {
+        if !self.accounting_actual.published {
+            return Err(reduce_preflight_invariant(
+                "lookup owner is not a published exact dictionary",
+            ));
+        }
+        let upper = reduce_upper_bounds_for_dimensions(
+            self.accounting_dimensions,
+            0,
+            haystack_bytes,
+        )?;
+        Ok(LookupUpperBounds {
+            candidate_words: upper.candidate_words,
+            lookup_steps: upper.lookup_steps,
+            total_work: upper.total_work,
+        })
+    }
+
+    pub(crate) fn lookup_counted(
+        &self,
+        candidate: &[u8],
+    ) -> Result<(bool, LookupActual), ReduceError> {
         let mut actual = LookupActual::default();
         let mut sum = 0_u64;
         for &byte in candidate {
@@ -2341,6 +2374,18 @@ pub fn reduce_upper_bounds(
             "dictionary build receipt is not a published exact identity",
         ));
     }
+    reduce_upper_bounds_for_dimensions(
+        build.prospective.dimensions,
+        build.actual.persistent_bytes,
+        haystack_bytes,
+    )
+}
+
+fn reduce_upper_bounds_for_dimensions(
+    dimensions: BuildDimensions,
+    persistent_bytes: usize,
+    haystack_bytes: usize,
+) -> Result<ReduceUpperBounds, ReduceError> {
     let fingerprint_sum_bound = u64::try_from(haystack_bytes)
         .ok()
         .and_then(|bytes| bytes.checked_mul(u64::from(u8::MAX)));
@@ -2353,7 +2398,7 @@ pub fn reduce_upper_bounds(
         .checked_add(1)
         .map(|value| value / 2)
         .ok_or_else(|| reduce_preflight_overflow("candidate-word upper bound"))?;
-    let entries = build.prospective.dimensions.words;
+    let entries = dimensions.words;
     let binary_per_candidate = binary_search_comparison_bound(entries)?;
     let binary_search_comparisons = candidate_words
         .checked_mul(binary_per_candidate)
@@ -2363,7 +2408,7 @@ pub fn reduce_upper_bounds(
         .ok_or_else(|| reduce_preflight_overflow("collision-slot upper bound"))?;
     let full_equality_checks = collision_slots;
     let full_equality_bytes = candidate_words
-        .checked_mul(build.prospective.dimensions.packed_bytes)
+        .checked_mul(dimensions.packed_bytes)
         .ok_or_else(|| reduce_preflight_overflow("full-equality byte upper bound"))?;
     let fingerprint_bytes = haystack_bytes;
     let lookup_steps = fingerprint_bytes
@@ -2381,7 +2426,6 @@ pub fn reduce_upper_bounds(
         .and_then(|work| work.checked_add(lookup_steps))
         .and_then(|work| work.checked_add(candidate_words))
         .ok_or_else(|| reduce_preflight_overflow("total-work upper bound"))?;
-    let persistent_bytes = build.actual.persistent_bytes;
     Ok(ReduceUpperBounds {
         haystack_bytes,
         candidate_words,

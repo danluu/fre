@@ -43,6 +43,17 @@ const NATIVE_FILTER_MAX_CANDIDATE_VERIFICATION_WORK: usize = 32;
 // strictly more impossible starts than that byte-set route.
 const SHARED_FRAGMENT_MIN_BYTES: usize = 2;
 
+/// Frozen general-purpose byte-frequency rank used by packed finite-language
+/// anchor selectors. Lower values identify bytes expected to be rarer.
+///
+/// Facades that prove a different exact acceptance predicate can reuse this
+/// immutable ranking without retaining the packed engine's private candidate
+/// metadata or verification policy.
+#[must_use]
+pub fn packed_literal_anchor_frequency_rank(byte: u8) -> u8 {
+    crate::packed_ordered_literal_aggregate::byte_frequency_rank(byte)
+}
+
 /// Hard limits for a packed finite-literal plan.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PackedLiteralSetBuildLimits {
