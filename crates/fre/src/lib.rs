@@ -673,15 +673,16 @@ pub use text_set::{
 
 use fre_automata::{
     Automaton, EarliestEnd, Exists, K0PositiveEndLimits, K0PositiveEndOutcome, K0SearchSession,
-    K0SpanSourceCursor, MandatoryCutAnalysis, MandatoryCutAnalysisLimits, MandatoryCutCandidate,
-    MandatoryCutDeclineReason, MandatoryCutResource, MandatorySuffixAnalysis,
-    MandatorySuffixAnalysisLimits, MandatorySuffixDeclineReason, MandatorySuffixResource,
-    MaximumConsumedDistance, SelectedEnd, Span,
+    K0PositiveEndStartOutcome, K0SpanSourceCursor, MandatoryCutAnalysis,
+    MandatoryCutAnalysisLimits, MandatoryCutCandidate, MandatoryCutDeclineReason,
+    MandatoryCutResource, MandatorySuffixAnalysis, MandatorySuffixAnalysisLimits,
+    MandatorySuffixDeclineReason, MandatorySuffixResource, MaximumConsumedDistance, SelectedEnd,
+    Span,
 };
 use fre_kernels::{
     ASCII_RUN_SCANNER_BUILD_WORK, AbsoluteEndFixedPlan, AsciiByteSet, AsciiByteSetRunScanner,
-    BoundedRequiredLiteralPlan, DispatchedBoundedRequiredLiteralPlan, DispatchedForwardAnchoredPlan,
-    DispatchedRequiredLiteralPlan, ForwardAnchoredBuildAccounting,
+    BYTE_SET_BLOCK_BYTES, BoundedRequiredLiteralPlan, DispatchedBoundedRequiredLiteralPlan,
+    DispatchedForwardAnchoredPlan, DispatchedRequiredLiteralPlan, ForwardAnchoredBuildAccounting,
     ForwardAnchoredBuildError, ForwardAnchoredBuildLimits, ForwardAnchoredPlan,
     ForwardAnchoredSearchAccounting, ForwardAnchoredSearchError, ForwardAnchoredSearchLimits,
     LiteralAccounting, LiteralBuildLimits, LiteralClassRunLiteralPlan, LiteralClassRunSearchPlan,
@@ -1400,9 +1401,12 @@ impl K0MandatoryCutPlan {
         )
     }
 
-    #[cfg(test)]
     const fn maximum_before_root(self) -> MaximumConsumedDistance {
         self.candidate.maximum_before_root()
+    }
+
+    fn cardinality(self) -> usize {
+        usize::from(self.count)
     }
 
     #[cfg(test)]
@@ -1562,9 +1566,19 @@ impl K0ConsumptionRunPlan {
 }
 
 #[derive(Debug)]
+enum K0MandatorySuffixRecoveryPlan {
+    None,
+    ConsumptionRun(K0ConsumptionRunPlan),
+    FiniteMaximum {
+        maximum_match_bytes: usize,
+        prefix_hedge_bytes: usize,
+    },
+}
+
+#[derive(Debug)]
 struct K0MandatorySuffixPlan {
     literal: LiteralPlan,
-    consumption_run: Option<K0ConsumptionRunPlan>,
+    recovery: K0MandatorySuffixRecoveryPlan,
 }
 
 impl K0MandatorySuffixPlan {
@@ -1588,10 +1602,39 @@ impl K0MandatorySuffixPlan {
     }
 
     fn narrowed_start_before(&self, haystack: &[u8], window_start: usize, end: usize) -> usize {
-        let Some(scanner) = self.consumption_run.as_ref() else {
+        let K0MandatorySuffixRecoveryPlan::ConsumptionRun(scanner) = &self.recovery else {
             return window_start;
         };
         scanner.narrowed_start_before(haystack, window_start, end)
+    }
+
+    fn has_consumption_run(&self) -> bool {
+        matches!(
+            &self.recovery,
+            K0MandatorySuffixRecoveryPlan::ConsumptionRun(_)
+        )
+    }
+
+    fn finite_maximum_match_bytes(&self) -> Option<usize> {
+        match &self.recovery {
+            K0MandatorySuffixRecoveryPlan::FiniteMaximum {
+                maximum_match_bytes,
+                ..
+            } => Some(*maximum_match_bytes),
+            K0MandatorySuffixRecoveryPlan::None
+            | K0MandatorySuffixRecoveryPlan::ConsumptionRun(_) => None,
+        }
+    }
+
+    fn finite_prefix_hedge_bytes(&self) -> Option<usize> {
+        match &self.recovery {
+            K0MandatorySuffixRecoveryPlan::FiniteMaximum {
+                prefix_hedge_bytes,
+                ..
+            } => Some(*prefix_hedge_bytes),
+            K0MandatorySuffixRecoveryPlan::None
+            | K0MandatorySuffixRecoveryPlan::ConsumptionRun(_) => None,
+        }
     }
 }
 
@@ -1601,8 +1644,51 @@ struct K0MandatorySuffixBuild {
     storage_bytes: usize,
 }
 
+fn k0_finite_suffix_prefix_hedge_bytes(
+    maximum_match_bytes: usize,
+    suffix_bytes: usize,
+    mandatory_cut: Option<K0MandatoryCutPlan>,
+) -> usize {
+    let maximum_prefix = maximum_match_bytes.saturating_sub(suffix_bytes);
+    let cut_maximum_before = mandatory_cut
+        .map(|cut| match cut.maximum_before_root() {
+            MaximumConsumedDistance::Finite(maximum) => {
+                usize::try_from(maximum).unwrap_or(usize::MAX)
+            }
+            MaximumConsumedDistance::Unbounded => maximum_prefix,
+        })
+        .unwrap_or(maximum_prefix)
+        .min(maximum_prefix);
+    // One complete directional proof envelope covers the finite prefix, one
+    // full ordered replay, the cut-to-root displacement, and one classified
+    // seek block. The break-even extension uses only immutable plan geometry:
+    // expected incumbent candidate work scales with cut cardinality and full
+    // width, while suffix verification scales with the maximum pre-suffix
+    // prefix. A narrow modeled advantage gives the incumbent a longer hedge;
+    // a decisive suffix advantage keeps almost only the proof envelope.
+    let proof_envelope = maximum_prefix
+        .saturating_add(maximum_match_bytes)
+        .saturating_add(cut_maximum_before)
+        .saturating_add(BYTE_SET_BLOCK_BYTES);
+    let incumbent_cost = mandatory_cut
+        .map_or(1, K0MandatoryCutPlan::cardinality)
+        .saturating_mul(maximum_match_bytes.max(1));
+    let suffix_cost = maximum_prefix.max(1);
+    let advantage = incumbent_cost.saturating_sub(suffix_cost).max(1);
+    let proof = u128::try_from(proof_envelope).unwrap_or(u128::MAX);
+    let extension = proof
+        .saturating_mul(u128::try_from(suffix_cost).unwrap_or(u128::MAX))
+        .div_ceil(u128::try_from(advantage).unwrap_or(u128::MAX));
+    let extension = usize::try_from(extension)
+        .unwrap_or(usize::MAX)
+        .min(K0_SUFFIX_FORWARD_FALLBACK_BYTES);
+    proof_envelope.saturating_add(extension)
+}
+
 fn try_build_k0_mandatory_suffix(
     raw: &fre_automata::RawPlan,
+    maximum_match_bytes: Option<usize>,
+    mandatory_cut: Option<K0MandatoryCutPlan>,
     limits: BuildLimits,
     incumbent_planner_work: u64,
 ) -> Result<K0MandatorySuffixBuild, BuildError> {
@@ -1674,9 +1760,25 @@ fn try_build_k0_mandatory_suffix(
             }
         },
     };
-    if candidate.len() < K0_MANDATORY_SUFFIX_MIN_NEEDLE_BYTES {
+    let finite_positive = maximum_match_bytes.is_some_and(|maximum| maximum > 0);
+    if candidate.len() < K0_MANDATORY_SUFFIX_MIN_NEEDLE_BYTES && !finite_positive {
         return Ok(declined(planner_work));
     }
+    if maximum_match_bytes.is_some_and(|maximum| candidate.len() > maximum) {
+        return Err(BuildError::InternalInvariant(
+            "mandatory suffix exceeds the HIR maximum match width",
+        ));
+    }
+    // The existing three-byte-or-longer sidecar remains authoritative. Finite
+    // recovery fills only its short-suffix admission gap, so incumbent plans
+    // retain their exact construction and runtime routing.
+    let finite_recovery_maximum_match_bytes = if candidate.len()
+        < K0_MANDATORY_SUFFIX_MIN_NEEDLE_BYTES
+    {
+        maximum_match_bytes
+    } else {
+        None
+    };
     let copy_work = u64::try_from(candidate.len()).map_err(|_| {
         BuildError::InternalInvariant("K0 mandatory suffix length does not fit u64")
     })?;
@@ -1701,18 +1803,28 @@ fn try_build_k0_mandatory_suffix(
     if !try_charge_k0_negative_prefilter_work(&mut planner_work, 1, limits.max_planner_work)? {
         return Ok(declined(planner_work));
     }
-    let consumption_run = try_build_k0_consumption_run(
-        raw,
-        &mut planner_work,
-        limits.max_planner_work,
-    )?;
+    let recovery = if let Some(maximum_match_bytes) = finite_recovery_maximum_match_bytes {
+        K0MandatorySuffixRecoveryPlan::FiniteMaximum {
+            maximum_match_bytes,
+            prefix_hedge_bytes: k0_finite_suffix_prefix_hedge_bytes(
+                maximum_match_bytes,
+                candidate.len(),
+                mandatory_cut,
+            ),
+        }
+    } else {
+        match try_build_k0_consumption_run(raw, &mut planner_work, limits.max_planner_work)? {
+            Some(run) => K0MandatorySuffixRecoveryPlan::ConsumptionRun(run),
+            None => K0MandatorySuffixRecoveryPlan::None,
+        }
+    };
     let storage_bytes = core::mem::size_of::<K0MandatorySuffixPlan>()
         .checked_add(literal.storage_bytes())
         .ok_or(BuildError::PersistentBytesOverflow)?;
     Ok(K0MandatorySuffixBuild {
         plan: Some(K0MandatorySuffixPlan {
             literal,
-            consumption_run,
+            recovery,
         }),
         planner_work,
         storage_bytes,
@@ -4613,7 +4725,13 @@ impl PortableBuilder {
         let mandatory_suffix = if matches!(minimum_match_bytes, Some(minimum) if minimum > 0)
             && !rust.hir.properties().look_set_prefix().contains(Look::Start)
         {
-            try_build_k0_mandatory_suffix(&raw, self.limits, fallback_planner_work)?
+            try_build_k0_mandatory_suffix(
+                &raw,
+                rust.hir.properties().maximum_len(),
+                mandatory_cut.plan,
+                self.limits,
+                fallback_planner_work,
+            )?
         } else {
             K0MandatorySuffixBuild {
                 plan: None,
@@ -7127,8 +7245,21 @@ const K0_SUFFIX_HIGH_BYTE_BACKWARD_MAX: usize = 256;
 const K0_SUFFIX_MAX_CANDIDATES: usize = 8;
 const K0_SUFFIX_REVERSE_CREDIT_BYTES: usize = 1_024;
 const K0_SUFFIX_REVERSE_PROGRESS_FACTOR: usize = 2;
+// A finite-width reverse proof must be substantially narrower than the source
+// window before it may replace an ordinary left-to-right K0 pass.
+const K0_SUFFIX_FINITE_WIDTH_WINDOW_FACTOR: usize = 4;
+// Finite short suffixes and the incumbent cut/conjunctive prefilter are two
+// adaptive alternatives. New size classes try the incumbent first: an absent
+// incumbent remains the cheapest negative proof, while a present incumbent
+// gives the exact suffix one opportunity to bypass its candidate frontier.
+const K0_FINITE_SUFFIX_INCUMBENT_ROUTE: u8 = 0;
+const K0_FINITE_SUFFIX_EXACT_ROUTE: u8 = 1;
+// Mandatory-suffix state uses only route ordinals zero and one. Retain the
+// first incumbent's zero-boundary classification in an otherwise unused bit
+// instead of widening every adaptive size-class record.
+const K0_FINITE_SUFFIX_SINGLE_PASS_NEGATIVE: u8 = 1 << 7;
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct K0NegativePrefilterClassState {
     present_streak: u8,
     disabled_calls: u8,
@@ -7160,7 +7291,7 @@ impl K0NegativePrefilterClassState {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct K0NegativePrefilterState {
     classes: [K0NegativePrefilterClassState; K0_NEGATIVE_PREFILTER_SIZE_CLASS_STATES],
     next_replacement: u8,
@@ -7197,10 +7328,203 @@ impl K0NegativePrefilterState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum K0FiniteSuffixRoute {
+    Incumbent { may_switch_to_suffix: bool },
+    ExactSuffix,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum K0FiniteSuffixDirectRoute {
+    FreshClass { class_index: usize },
+    ExactLossBackoff,
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the inline route must close the same finite-sidecar admission envelope before mutating adaptive state"
+)]
+#[inline]
+fn select_k0_finite_suffix_direct_route(
+    session: &K0SearchSession<'_>,
+    state: &mut K0NegativePrefilterState,
+    maximum_match_bytes: usize,
+    haystack_len: usize,
+    window: SearchWindow,
+    limits: SearchLimits,
+    enforce_width_ratio: bool,
+) -> Option<K0FiniteSuffixDirectRoute> {
+    if limits != SearchLimits::unlimited()
+        || maximum_match_bytes == 0
+        || window.start() > window.end()
+        || window.end() > haystack_len
+    {
+        return None;
+    }
+    let window_bytes = window.end().checked_sub(window.start())?;
+    if window_bytes < K0_NEGATIVE_PREFILTER_MIN_WINDOW_BYTES
+        || (enforce_width_ratio
+            && maximum_match_bytes > window_bytes / K0_SUFFIX_FINITE_WIDTH_WINDOW_FACTOR)
+        || !session.positive_end_verifier_available()
+    {
+        return None;
+    }
+
+    let window_size_class = usize::BITS - window_bytes.leading_zeros();
+    let Some(class_index) = state
+        .classes
+        .iter()
+        .position(|class| class.window_size_class == Some(window_size_class))
+    else {
+        // A size class receives one pure incumbent observation before any
+        // optional sidecar work. The retained class makes this a one-time
+        // exploration cost: a subsequent call may compare the cut/suffix
+        // route, while an early first match pays exactly the ordinary K0 path.
+        let class_index = state.class_for(window_size_class);
+        return Some(K0FiniteSuffixDirectRoute::FreshClass { class_index });
+    };
+    let class = &mut state.classes[class_index];
+    if class.disabled_calls != 0 {
+        // An exact-route loss has already compared the incumbent and suffix
+        // for this size class. Consume its retry clock without entering
+        // either outlined sidecar or the independent negative prefilter;
+        // ordinary K0 is the selected route for the complete call.
+        class.next_predicate &= K0_FINITE_SUFFIX_SINGLE_PASS_NEGATIVE;
+        class.disabled_calls -= 1;
+        return Some(K0FiniteSuffixDirectRoute::ExactLossBackoff);
+    }
+    None
+}
+
+fn select_k0_finite_suffix_route(
+    state: &mut K0NegativePrefilterClassState,
+) -> K0FiniteSuffixRoute {
+    if state.next_predicate & K0_FINITE_SUFFIX_EXACT_ROUTE != 0 && state.disabled_calls == 0 {
+        return K0FiniteSuffixRoute::ExactSuffix;
+    }
+    state.next_predicate &= K0_FINITE_SUFFIX_SINGLE_PASS_NEGATIVE;
+    if state.disabled_calls != 0 {
+        state.disabled_calls -= 1;
+        K0FiniteSuffixRoute::Incumbent {
+            may_switch_to_suffix: false,
+        }
+    } else {
+        K0FiniteSuffixRoute::Incumbent {
+            may_switch_to_suffix: true,
+        }
+    }
+}
+
+fn observe_k0_finite_suffix_loss(state: &mut K0NegativePrefilterClassState) {
+    // The incumbent already ran successfully before this exact-route trial.
+    // One completed loss therefore compares both alternatives for this size
+    // class; enter bounded retry backoff immediately instead of requiring
+    // eight more speculative suffix passes to rediscover the same result.
+    state.present_streak = K0_NEGATIVE_PREFILTER_PRESENT_STREAK_LIMIT - 1;
+    state.observe_present();
+    state.next_predicate &= K0_FINITE_SUFFIX_SINGLE_PASS_NEGATIVE;
+}
+
+fn observe_k0_finite_suffix_win(state: &mut K0NegativePrefilterClassState) {
+    state.observe_absent();
+    // A sidecar win supersedes the first incumbent observation. Do not let a
+    // negative result from an earlier haystack bias a subsequently proven
+    // exact-route win for this size class.
+    // Re-prime the incumbent on every successful operation. The following
+    // call can cheaply prove absence, retain a strong candidate-floor skip,
+    // or immediately readmit the exact suffix when the incumbent leaves most
+    // of the window exposed. This prevents a sparse success from pinning the
+    // session permanently to reverse verification after the input changes.
+    state.next_predicate = K0_FINITE_SUFFIX_INCUMBENT_ROUTE;
+}
+
+fn observe_k0_finite_suffix_direct_incumbent(
+    state: &mut K0NegativePrefilterClassState,
+    single_pass_negative: bool,
+) {
+    // The first call for a size class must run ordinary K0 anyway. Reuse that
+    // completed call's exact boundary receipt instead of scheduling a second
+    // warm probe. A zero-boundary negative from the small scanner family
+    // immediately selects bounded incumbent backoff; every other result
+    // leaves the exact sidecar eligible on the following call.
+    state.next_predicate = if single_pass_negative {
+        K0_FINITE_SUFFIX_SINGLE_PASS_NEGATIVE
+    } else {
+        K0_FINITE_SUFFIX_INCUMBENT_ROUTE
+    };
+    if single_pass_negative {
+        observe_k0_finite_suffix_loss(state);
+    }
+}
+
+const fn k0_finite_suffix_incumbent_single_pass_negative(
+    state: &K0NegativePrefilterClassState,
+) -> bool {
+    state.next_predicate & K0_FINITE_SUFFIX_SINGLE_PASS_NEGATIVE != 0
+}
+
+fn observe_k0_mandatory_suffix_loss(
+    state: &mut K0NegativePrefilterClassState,
+    finite_recovery: bool,
+) {
+    if finite_recovery {
+        observe_k0_finite_suffix_loss(state);
+    } else {
+        state.observe_present();
+    }
+}
+
+fn observe_k0_mandatory_suffix_win(
+    state: &mut K0NegativePrefilterClassState,
+    finite_recovery: bool,
+) {
+    if finite_recovery {
+        observe_k0_finite_suffix_win(state);
+    } else {
+        state.observe_absent();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum K0NegativePrefilterOutcome {
     Bypass,
     Absent,
     Present,
+}
+
+fn k0_candidate_floor_leaves_broad_residual(
+    candidate_floor: Option<usize>,
+    window: SearchWindow,
+) -> bool {
+    candidate_floor.is_none_or(|floor| {
+        let skipped = floor.saturating_sub(window.start());
+        let remaining = window.end().saturating_sub(floor);
+        skipped < remaining
+    })
+}
+
+fn observe_k0_finite_suffix_incumbent(
+    state: &mut K0NegativePrefilterState,
+    class_index: usize,
+    may_switch_to_suffix: bool,
+    outcome: K0NegativePrefilterOutcome,
+    candidate_floor: Option<usize>,
+    window: SearchWindow,
+) -> bool {
+    let class = &mut state.classes[class_index];
+    class.next_predicate &= K0_FINITE_SUFFIX_SINGLE_PASS_NEGATIVE;
+    // A finite graph cut publishes a sound lower bound for every possible
+    // match start. If that bound removes at least as much source as it leaves,
+    // ordinary K0 already owns the smaller residual search. Otherwise the
+    // exact suffix gets one immediate trial; its measured verification work
+    // decides whether retries back off. `None` carries no structural progress
+    // evidence and therefore leaves the exact alternative eligible.
+    let use_exact = may_switch_to_suffix
+        && outcome != K0NegativePrefilterOutcome::Absent
+        && k0_candidate_floor_leaves_broad_residual(candidate_floor, window);
+    if use_exact {
+        class.next_predicate |= K0_FINITE_SUFFIX_EXACT_ROUTE;
+    }
+    use_exact
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -7306,14 +7630,23 @@ fn run_k0_negative_prefilter(
             state_after_success: next_state,
         }
     } else {
-        class_state.next_predicate = u8::try_from(
-            predicate_ordinal
-                .checked_add(1)
-                .expect("bounded predicate ordinal cannot overflow")
-                % predicate_count,
-        )
-        .expect("bounded predicate count fits u8");
-        class_state.observe_present();
+        if candidate_floor.is_some()
+            && !k0_candidate_floor_leaves_broad_residual(candidate_floor, window)
+        {
+            // A sound cut that discards at least half the window is useful
+            // positive evidence, not a failed negative probe. Retain its
+            // ordinal and keep it enabled for stable sparse searches.
+            class_state.observe_absent();
+        } else {
+            class_state.next_predicate = u8::try_from(
+                predicate_ordinal
+                    .checked_add(1)
+                    .expect("bounded predicate ordinal cannot overflow")
+                    % predicate_count,
+            )
+            .expect("bounded predicate count fits u8");
+            class_state.observe_present();
+        }
         K0NegativePrefilterAttempt {
             outcome: K0NegativePrefilterOutcome::Present,
             candidate_floor,
@@ -7325,6 +7658,10 @@ fn run_k0_negative_prefilter(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum K0MandatorySuffixOutcome {
     Bypass,
+    Incumbent {
+        class_index: usize,
+        may_switch_to_suffix: bool,
+    },
     Fallback,
     Found(bool),
 }
@@ -7336,28 +7673,34 @@ struct K0MandatorySuffixAttempt {
 }
 
 fn k0_mandatory_suffix_completed_negative_is_useful(
+    state: &K0NegativePrefilterClassState,
     window_bytes: usize,
     candidates: usize,
     verifier_work: u64,
 ) -> bool {
-    // Finding no suffix candidate is the sidecar's intended fast negative
-    // proof, so keep it as an immediate reset independently of numeric
-    // conversions. Once endpoint verification begins, learn from two
+    // A zero-candidate suffix is normally the sidecar's ideal negative proof.
+    // It is nevertheless redundant when the completed first incumbent call
+    // expanded no automaton boundary and its immutable start proof used the
+    // same cheap one-to-three-byte scanner family. Prefer the one-pass native
+    // route in that case. Once endpoint verification begins, learn from two
     // disjoint costs outside the base suffix pass: one additional literal
     // dispatch per candidate and the verifier's complete work receipt. The
     // receipt already charges each reverse source byte, so do not count its
     // physical traffic again. Equality pays for one extra window-equivalent
     // pass; anything larger should let ordinary K0 run directly after the
     // existing streak threshold.
-    candidates == 0
-        || u64::try_from(window_bytes).is_ok_and(|window_work| {
-            u64::try_from(candidates)
-                .ok()
-                .and_then(|candidate_work| candidate_work.checked_add(verifier_work))
-                .is_some_and(|extra_work| extra_work <= window_work)
-        })
+    if candidates == 0 {
+        return !k0_finite_suffix_incumbent_single_pass_negative(state);
+    }
+    u64::try_from(window_bytes).is_ok_and(|window_work| {
+        u64::try_from(candidates)
+            .ok()
+            .and_then(|candidate_work| candidate_work.checked_add(verifier_work))
+            .is_some_and(|extra_work| extra_work <= window_work)
+    })
 }
 
+#[cfg(test)]
 fn observe_k0_mandatory_suffix_completed_negative(
     state: &mut K0NegativePrefilterClassState,
     window_bytes: usize,
@@ -7365,6 +7708,7 @@ fn observe_k0_mandatory_suffix_completed_negative(
     verifier_work: u64,
 ) {
     if k0_mandatory_suffix_completed_negative_is_useful(
+        state,
         window_bytes,
         candidates,
         verifier_work,
@@ -7378,9 +7722,17 @@ fn observe_k0_mandatory_suffix_completed_negative(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum K0MandatorySuffixSpanOutcome {
     Bypass,
+    Incumbent {
+        class_index: usize,
+        may_switch_to_suffix: bool,
+    },
     Fallback,
     Absent,
     Narrowed(usize),
+    ProvedStart {
+        start: usize,
+        maximum_match_bytes: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -7389,27 +7741,380 @@ struct K0MandatorySuffixSpanAttempt {
     state_after_success: K0NegativePrefilterState,
 }
 
-fn try_k0_mandatory_suffix_span_start(
+fn finish_k0_finite_mandatory_suffix_start(
+    session: &K0SearchSession<'_>,
+    mut state: K0NegativePrefilterState,
+    class_index: usize,
+    window_start: usize,
+    window_end: usize,
+    incumbent_candidate_floor: Option<usize>,
+    start: usize,
+    maximum_match_bytes: usize,
+    candidates: usize,
+    verifier_work: u64,
+) -> K0MandatorySuffixSpanAttempt {
+    // Credit only source that ordinary K0 would still have searched after the
+    // incumbent cut. Counting the whole prefix made a single sparse suffix at
+    // a late candidate floor look like a large win even though the cut had
+    // already removed that prefix for free.
+    let saved_bytes = start.checked_sub(incumbent_candidate_floor.unwrap_or(window_start));
+    let replay_bytes = window_end
+        .saturating_sub(start)
+        .min(maximum_match_bytes);
+    let replay_work = session.positive_end_verifier_work_certificate(replay_bytes);
+    let useful = saved_bytes
+        .filter(|&saved| {
+            saved >= K0_SUFFIX_FORWARD_FALLBACK_BYTES && replay_bytes <= saved
+        })
+        .and_then(|saved| u64::try_from(saved).ok())
+        .zip(u64::try_from(candidates).ok())
+        .zip(replay_work)
+        .and_then(|((saved, candidate_work), replay_work)| {
+            candidate_work
+                .checked_add(verifier_work)
+                .and_then(|work| work.checked_add(replay_work))
+                .map(|work| (saved, work))
+        })
+        .is_some_and(|(saved, work)| work <= saved);
+    if !useful {
+        observe_k0_finite_suffix_loss(&mut state.classes[class_index]);
+        return K0MandatorySuffixSpanAttempt {
+            outcome: K0MandatorySuffixSpanOutcome::Fallback,
+            state_after_success: state,
+        };
+    }
+    observe_k0_finite_suffix_win(&mut state.classes[class_index]);
+    K0MandatorySuffixSpanAttempt {
+        outcome: K0MandatorySuffixSpanOutcome::ProvedStart {
+            start,
+            maximum_match_bytes,
+        },
+        state_after_success: state,
+    }
+}
+
+fn finish_k0_finite_mandatory_suffix_absent(
+    mut state: K0NegativePrefilterState,
+    class_index: usize,
+    window_bytes: usize,
+    candidates: usize,
+    verifier_work: u64,
+) -> K0MandatorySuffixSpanAttempt {
+    if k0_mandatory_suffix_completed_negative_is_useful(
+        &state.classes[class_index],
+        window_bytes,
+        candidates,
+        verifier_work,
+    ) {
+        observe_k0_finite_suffix_win(&mut state.classes[class_index]);
+    } else {
+        observe_k0_finite_suffix_loss(&mut state.classes[class_index]);
+    }
+    K0MandatorySuffixSpanAttempt {
+        outcome: K0MandatorySuffixSpanOutcome::Absent,
+        state_after_success: state,
+    }
+}
+
+#[inline(never)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the finite-width proof keeps admission, exact caps, and adaptive publication in one transaction"
+)]
+fn try_k0_finite_mandatory_suffix_span_start(
+    session: &mut K0SearchSession<'_>,
     suffix: &K0MandatorySuffixPlan,
+    maximum_match_bytes: usize,
     state: K0NegativePrefilterState,
     haystack: &[u8],
     window: SearchWindow,
     limits: SearchLimits,
-) -> K0MandatorySuffixSpanAttempt {
+    incumbent_candidate_floor: Option<usize>,
+) -> Result<K0MandatorySuffixSpanAttempt, SearchError> {
     let unchanged = |outcome| K0MandatorySuffixSpanAttempt {
         outcome,
         state_after_success: state,
     };
     if limits != SearchLimits::unlimited()
-        || suffix.consumption_run.is_none()
+        || maximum_match_bytes == 0
+        || window.start() > window.end()
+        || window.end() > haystack.len()
+        || incumbent_candidate_floor
+            .is_some_and(|floor| !(window.start()..=window.end()).contains(&floor))
+    {
+        return Ok(unchanged(K0MandatorySuffixSpanOutcome::Bypass));
+    }
+    let Some(window_bytes) = window.end().checked_sub(window.start()) else {
+        return Ok(unchanged(K0MandatorySuffixSpanOutcome::Bypass));
+    };
+    if window_bytes < K0_NEGATIVE_PREFILTER_MIN_WINDOW_BYTES
+        || maximum_match_bytes
+            > window_bytes / K0_SUFFIX_FINITE_WIDTH_WINDOW_FACTOR
+        || !session.positive_end_verifier_available()
+    {
+        return Ok(unchanged(K0MandatorySuffixSpanOutcome::Bypass));
+    }
+
+    let window_size_class = usize::BITS - window_bytes.leading_zeros();
+    let mut next_state = state;
+    let class_index = next_state.class_for(window_size_class);
+    match select_k0_finite_suffix_route(&mut next_state.classes[class_index]) {
+        K0FiniteSuffixRoute::Incumbent {
+            may_switch_to_suffix,
+        } => {
+            return Ok(K0MandatorySuffixSpanAttempt {
+                outcome: K0MandatorySuffixSpanOutcome::Incumbent {
+                    class_index,
+                    may_switch_to_suffix,
+                },
+                state_after_success: next_state,
+            });
+        }
+        K0FiniteSuffixRoute::ExactSuffix => {}
+    }
+
+    let proof_start = incumbent_candidate_floor.unwrap_or(window.start());
+    let proof_window_bytes = window.end().saturating_sub(proof_start);
+    let mut search_start = proof_start;
+    let mut candidates = 0usize;
+    let mut cumulative_work = 0u64;
+    let mut cumulative_reverse_bytes = 0usize;
+    let mut best_start = None;
+    loop {
+        // Once a matching start `best` is known, a later suffix endpoint at
+        // or beyond `best + maximum_match_bytes` cannot lead to an earlier
+        // start. Limit the next literal pass to that proof horizon instead of
+        // scanning an irrelevant remainder of the caller's window. Saturation
+        // only weakens the bound back to the validated window end.
+        let search_end = best_start.map_or(window.end(), |best: usize| {
+            best.saturating_add(maximum_match_bytes).min(window.end())
+        });
+        if search_start >= search_end {
+            return Ok(if let Some(start) = best_start {
+                finish_k0_finite_mandatory_suffix_start(
+                    session,
+                    next_state,
+                    class_index,
+                    window.start(),
+                    window.end(),
+                    incumbent_candidate_floor,
+                    start,
+                    maximum_match_bytes,
+                    candidates,
+                    cumulative_work,
+                )
+            } else {
+                // Rejecting the last suffix candidate advances the scan to
+                // the ordinary half-open window end. That closes a valid
+                // completed-negative proof; it is not a horizon invariant
+                // failure merely because no earlier candidate matched.
+                finish_k0_finite_mandatory_suffix_absent(
+                    next_state,
+                    class_index,
+                    proof_window_bytes,
+                    candidates,
+                    cumulative_work,
+                )
+            });
+        }
+        let occurrence = match suffix.find_window(haystack, search_start, search_end) {
+            Ok(occurrence) => occurrence,
+            Err(_) => {
+                observe_k0_finite_suffix_loss(&mut next_state.classes[class_index]);
+                return Ok(K0MandatorySuffixSpanAttempt {
+                    outcome: K0MandatorySuffixSpanOutcome::Fallback,
+                    state_after_success: next_state,
+                });
+            }
+        };
+        let Some((occurrence_start, endpoint)) = occurrence else {
+            if let Some(start) = best_start {
+                return Ok(finish_k0_finite_mandatory_suffix_start(
+                    session,
+                    next_state,
+                    class_index,
+                    window.start(),
+                    window.end(),
+                    incumbent_candidate_floor,
+                    start,
+                    maximum_match_bytes,
+                    candidates,
+                    cumulative_work,
+                ));
+            }
+            return Ok(finish_k0_finite_mandatory_suffix_absent(
+                next_state,
+                class_index,
+                proof_window_bytes,
+                candidates,
+                cumulative_work,
+            ));
+        };
+
+        candidates = candidates.saturating_add(1);
+        let reverse_start = endpoint
+            .saturating_sub(maximum_match_bytes)
+            .max(proof_start);
+        if let Some(best) = best_start {
+            if reverse_start >= best {
+                return Ok(finish_k0_finite_mandatory_suffix_start(
+                    session,
+                    next_state,
+                    class_index,
+                    window.start(),
+                    window.end(),
+                    incumbent_candidate_floor,
+                    best,
+                    maximum_match_bytes,
+                    candidates,
+                    cumulative_work,
+                ));
+            }
+        }
+        let Some(progress) = endpoint.checked_sub(proof_start) else {
+            observe_k0_finite_suffix_loss(&mut next_state.classes[class_index]);
+            return Ok(K0MandatorySuffixSpanAttempt {
+                outcome: K0MandatorySuffixSpanOutcome::Fallback,
+                state_after_success: next_state,
+            });
+        };
+        if candidates > K0_SUFFIX_MAX_CANDIDATES
+            || progress <= K0_SUFFIX_FORWARD_FALLBACK_BYTES
+        {
+            observe_k0_finite_suffix_loss(&mut next_state.classes[class_index]);
+            return Ok(K0MandatorySuffixSpanAttempt {
+                outcome: K0MandatorySuffixSpanOutcome::Fallback,
+                state_after_success: next_state,
+            });
+        }
+
+        let Some(allowed_reverse_bytes) = progress
+            .checked_mul(K0_SUFFIX_REVERSE_PROGRESS_FACTOR)
+            .and_then(|bytes| bytes.checked_add(K0_SUFFIX_REVERSE_CREDIT_BYTES))
+        else {
+            observe_k0_finite_suffix_loss(&mut next_state.classes[class_index]);
+            return Ok(K0MandatorySuffixSpanAttempt {
+                outcome: K0MandatorySuffixSpanOutcome::Fallback,
+                state_after_success: next_state,
+            });
+        };
+        let Some(remaining_reverse_bytes) =
+            allowed_reverse_bytes.checked_sub(cumulative_reverse_bytes)
+        else {
+            observe_k0_finite_suffix_loss(&mut next_state.classes[class_index]);
+            return Ok(K0MandatorySuffixSpanAttempt {
+                outcome: K0MandatorySuffixSpanOutcome::Fallback,
+                state_after_success: next_state,
+            });
+        };
+        let Some(work_budget_bytes) = progress.checked_add(K0_SUFFIX_REVERSE_CREDIT_BYTES) else {
+            observe_k0_finite_suffix_loss(&mut next_state.classes[class_index]);
+            return Ok(K0MandatorySuffixSpanAttempt {
+                outcome: K0MandatorySuffixSpanOutcome::Fallback,
+                state_after_success: next_state,
+            });
+        };
+        let Some(allowed_work) =
+            session.positive_end_verifier_work_certificate(work_budget_bytes)
+        else {
+            observe_k0_finite_suffix_loss(&mut next_state.classes[class_index]);
+            return Ok(K0MandatorySuffixSpanAttempt {
+                outcome: K0MandatorySuffixSpanOutcome::Fallback,
+                state_after_success: next_state,
+            });
+        };
+        let Some(remaining_work) = allowed_work.checked_sub(cumulative_work) else {
+            observe_k0_finite_suffix_loss(&mut next_state.classes[class_index]);
+            return Ok(K0MandatorySuffixSpanAttempt {
+                outcome: K0MandatorySuffixSpanOutcome::Fallback,
+                state_after_success: next_state,
+            });
+        };
+        let reverse_window = SearchWindow::new(reverse_start, endpoint);
+        let verification = session
+            .try_earliest_start_ending_at(
+                haystack,
+                reverse_window,
+                endpoint,
+                K0PositiveEndLimits::new(remaining_work, remaining_reverse_bytes),
+            )
+            .map_err(SearchError::from)?;
+        cumulative_work = cumulative_work
+            .checked_add(verification.receipt().work())
+            .ok_or(SearchError::K0(K0SearchError::ArithmeticOverflow {
+                computation: "cumulative finite mandatory-suffix verifier work",
+            }))?;
+        cumulative_reverse_bytes = cumulative_reverse_bytes
+            .checked_add(verification.receipt().reverse_source_bytes())
+            .ok_or(SearchError::K0(K0SearchError::ArithmeticOverflow {
+                computation: "cumulative finite mandatory-suffix reverse bytes",
+            }))?;
+        match verification.outcome() {
+            K0PositiveEndStartOutcome::Matched { start } => {
+                if start < reverse_start || start >= endpoint {
+                    return Err(SearchError::K0(K0SearchError::InternalInvariant {
+                        detail: "finite mandatory-suffix verifier returned an invalid start",
+                    }));
+                }
+                best_start = Some(best_start.map_or(start, |best: usize| best.min(start)));
+            }
+            K0PositiveEndStartOutcome::Rejected => {}
+            K0PositiveEndStartOutcome::Declined => {
+                observe_k0_finite_suffix_loss(&mut next_state.classes[class_index]);
+                return Ok(K0MandatorySuffixSpanAttempt {
+                    outcome: K0MandatorySuffixSpanOutcome::Fallback,
+                    state_after_success: next_state,
+                });
+            }
+        }
+        search_start = occurrence_start.checked_add(1).ok_or(SearchError::K0(
+            K0SearchError::ArithmeticOverflow {
+                computation: "next overlapping finite mandatory-suffix occurrence",
+            },
+        ))?;
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "finite suffix admission carries the incumbent's sound candidate-floor evidence"
+)]
+fn try_k0_mandatory_suffix_span_start(
+    session: &mut K0SearchSession<'_>,
+    suffix: &K0MandatorySuffixPlan,
+    state: K0NegativePrefilterState,
+    haystack: &[u8],
+    window: SearchWindow,
+    limits: SearchLimits,
+    finite_incumbent_candidate_floor: Option<usize>,
+) -> Result<K0MandatorySuffixSpanAttempt, SearchError> {
+    if let Some(maximum_match_bytes) = suffix.finite_maximum_match_bytes() {
+        return try_k0_finite_mandatory_suffix_span_start(
+            session,
+            suffix,
+            maximum_match_bytes,
+            state,
+            haystack,
+            window,
+            limits,
+            finite_incumbent_candidate_floor,
+        );
+    }
+    let unchanged = |outcome| K0MandatorySuffixSpanAttempt {
+        outcome,
+        state_after_success: state,
+    };
+    if limits != SearchLimits::unlimited()
+        || !suffix.has_consumption_run()
         || window.start() > window.end()
         || window.end() > haystack.len()
     {
-        return unchanged(K0MandatorySuffixSpanOutcome::Bypass);
+        return Ok(unchanged(K0MandatorySuffixSpanOutcome::Bypass));
     }
     let window_bytes = window.end().saturating_sub(window.start());
     if window_bytes < K0_NEGATIVE_PREFILTER_MIN_WINDOW_BYTES {
-        return unchanged(K0MandatorySuffixSpanOutcome::Bypass);
+        return Ok(unchanged(K0MandatorySuffixSpanOutcome::Bypass));
     }
 
     let window_size_class = usize::BITS - window_bytes.leading_zeros();
@@ -7417,28 +8122,28 @@ fn try_k0_mandatory_suffix_span_start(
     let class_index = next_state.class_for(window_size_class);
     if next_state.classes[class_index].disabled_calls != 0 {
         next_state.classes[class_index].disabled_calls -= 1;
-        return K0MandatorySuffixSpanAttempt {
+        return Ok(K0MandatorySuffixSpanAttempt {
             outcome: K0MandatorySuffixSpanOutcome::Fallback,
             state_after_success: next_state,
-        };
+        });
     }
 
     let occurrence = match suffix.find_window(haystack, window.start(), window.end()) {
         Ok(occurrence) => occurrence,
         Err(_) => {
             next_state.classes[class_index].observe_present();
-            return K0MandatorySuffixSpanAttempt {
+            return Ok(K0MandatorySuffixSpanAttempt {
                 outcome: K0MandatorySuffixSpanOutcome::Fallback,
                 state_after_success: next_state,
-            };
+            });
         }
     };
     let Some((occurrence_start, _)) = occurrence else {
         next_state.classes[class_index].observe_absent();
-        return K0MandatorySuffixSpanAttempt {
+        return Ok(K0MandatorySuffixSpanAttempt {
             outcome: K0MandatorySuffixSpanOutcome::Absent,
             state_after_success: next_state,
-        };
+        });
     };
     let narrowed = suffix.narrowed_start_before(haystack, window.start(), occurrence_start);
     let useful = narrowed
@@ -7446,19 +8151,23 @@ fn try_k0_mandatory_suffix_span_start(
         .is_some_and(|saved| saved >= K0_SUFFIX_FORWARD_FALLBACK_BYTES);
     if !useful {
         next_state.classes[class_index].observe_present();
-        return K0MandatorySuffixSpanAttempt {
+        return Ok(K0MandatorySuffixSpanAttempt {
             outcome: K0MandatorySuffixSpanOutcome::Fallback,
             state_after_success: next_state,
-        };
+        });
     }
     next_state.classes[class_index].observe_absent();
-    K0MandatorySuffixSpanAttempt {
+    Ok(K0MandatorySuffixSpanAttempt {
         outcome: K0MandatorySuffixSpanOutcome::Narrowed(narrowed),
         state_after_success: next_state,
-    }
+    })
 }
 
 #[inline(never)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "finite suffix admission carries the incumbent's sound candidate-floor evidence"
+)]
 fn try_k0_mandatory_suffix_exists(
     session: &mut K0SearchSession<'_>,
     suffix: &K0MandatorySuffixPlan,
@@ -7466,7 +8175,9 @@ fn try_k0_mandatory_suffix_exists(
     haystack: &[u8],
     window: SearchWindow,
     limits: SearchLimits,
+    finite_incumbent_candidate_floor: Option<usize>,
 ) -> Result<K0MandatorySuffixAttempt, SearchError> {
+    let finite_recovery = suffix.finite_maximum_match_bytes().is_some();
     let unchanged = |outcome| K0MandatorySuffixAttempt {
         outcome,
         state_after_success: state,
@@ -7474,6 +8185,8 @@ fn try_k0_mandatory_suffix_exists(
     if limits != SearchLimits::unlimited()
         || window.start() > window.end()
         || window.end() > haystack.len()
+        || finite_incumbent_candidate_floor
+            .is_some_and(|floor| !(window.start()..=window.end()).contains(&floor))
     {
         return Ok(unchanged(K0MandatorySuffixOutcome::Bypass));
     }
@@ -7489,7 +8202,22 @@ fn try_k0_mandatory_suffix_exists(
     let window_size_class = usize::BITS - window_bytes.leading_zeros();
     let mut next_state = state;
     let class_index = next_state.class_for(window_size_class);
-    if next_state.classes[class_index].disabled_calls != 0 {
+    if finite_recovery {
+        match select_k0_finite_suffix_route(&mut next_state.classes[class_index]) {
+            K0FiniteSuffixRoute::Incumbent {
+                may_switch_to_suffix,
+            } => {
+                return Ok(K0MandatorySuffixAttempt {
+                    outcome: K0MandatorySuffixOutcome::Incumbent {
+                        class_index,
+                        may_switch_to_suffix,
+                    },
+                    state_after_success: next_state,
+                });
+            }
+            K0FiniteSuffixRoute::ExactSuffix => {}
+        }
+    } else if next_state.classes[class_index].disabled_calls != 0 {
         next_state.classes[class_index].disabled_calls -= 1;
         return Ok(K0MandatorySuffixAttempt {
             // This size class already learned that suffix speculation loses.
@@ -7503,7 +8231,10 @@ fn try_k0_mandatory_suffix_exists(
         return Ok(unchanged(K0MandatorySuffixOutcome::Bypass));
     }
 
-    let mut search_start = window.start();
+    let proof_start = finite_incumbent_candidate_floor.unwrap_or(window.start());
+    let proof_window = SearchWindow::new(proof_start, window.end());
+    let proof_window_bytes = window.end().saturating_sub(proof_start);
+    let mut search_start = proof_start;
     let mut candidates = 0usize;
     let mut cumulative_work = 0u64;
     let mut cumulative_reverse_bytes = 0usize;
@@ -7511,7 +8242,10 @@ fn try_k0_mandatory_suffix_exists(
         let occurrence = match suffix.find_window(haystack, search_start, window.end()) {
             Ok(occurrence) => occurrence,
             Err(_) => {
-                next_state.classes[class_index].observe_present();
+                observe_k0_mandatory_suffix_loss(
+                    &mut next_state.classes[class_index],
+                    finite_recovery,
+                );
                 return Ok(K0MandatorySuffixAttempt {
                     outcome: K0MandatorySuffixOutcome::Fallback,
                     state_after_success: next_state,
@@ -7519,19 +8253,32 @@ fn try_k0_mandatory_suffix_exists(
             }
         };
         let Some((occurrence_start, endpoint)) = occurrence else {
-            observe_k0_mandatory_suffix_completed_negative(
-                &mut next_state.classes[class_index],
-                window_bytes,
+            if k0_mandatory_suffix_completed_negative_is_useful(
+                &next_state.classes[class_index],
+                proof_window_bytes,
                 candidates,
                 cumulative_work,
-            );
+            ) {
+                observe_k0_mandatory_suffix_win(
+                    &mut next_state.classes[class_index],
+                    finite_recovery,
+                );
+            } else {
+                observe_k0_mandatory_suffix_loss(
+                    &mut next_state.classes[class_index],
+                    finite_recovery,
+                );
+            }
             return Ok(K0MandatorySuffixAttempt {
                 outcome: K0MandatorySuffixOutcome::Found(false),
                 state_after_success: next_state,
             });
         };
-        let Some(progress) = endpoint.checked_sub(window.start()) else {
-            next_state.classes[class_index].observe_present();
+        let Some(progress) = endpoint.checked_sub(proof_start) else {
+            observe_k0_mandatory_suffix_loss(
+                &mut next_state.classes[class_index],
+                finite_recovery,
+            );
             return Ok(K0MandatorySuffixAttempt {
                 outcome: K0MandatorySuffixOutcome::Fallback,
                 state_after_success: next_state,
@@ -7541,7 +8288,10 @@ fn try_k0_mandatory_suffix_exists(
         if candidates > K0_SUFFIX_MAX_CANDIDATES
             || progress <= K0_SUFFIX_FORWARD_FALLBACK_BYTES
         {
-            next_state.classes[class_index].observe_present();
+            observe_k0_mandatory_suffix_loss(
+                &mut next_state.classes[class_index],
+                finite_recovery,
+            );
             return Ok(K0MandatorySuffixAttempt {
                 outcome: K0MandatorySuffixOutcome::Fallback,
                 state_after_success: next_state,
@@ -7551,7 +8301,10 @@ fn try_k0_mandatory_suffix_exists(
             .checked_mul(K0_SUFFIX_REVERSE_PROGRESS_FACTOR)
             .and_then(|bytes| bytes.checked_add(K0_SUFFIX_REVERSE_CREDIT_BYTES))
         else {
-            next_state.classes[class_index].observe_present();
+            observe_k0_mandatory_suffix_loss(
+                &mut next_state.classes[class_index],
+                finite_recovery,
+            );
             return Ok(K0MandatorySuffixAttempt {
                 outcome: K0MandatorySuffixOutcome::Fallback,
                 state_after_success: next_state,
@@ -7560,14 +8313,20 @@ fn try_k0_mandatory_suffix_exists(
         let Some(remaining_reverse_bytes) =
             allowed_reverse_bytes.checked_sub(cumulative_reverse_bytes)
         else {
-            next_state.classes[class_index].observe_present();
+            observe_k0_mandatory_suffix_loss(
+                &mut next_state.classes[class_index],
+                finite_recovery,
+            );
             return Ok(K0MandatorySuffixAttempt {
                 outcome: K0MandatorySuffixOutcome::Fallback,
                 state_after_success: next_state,
             });
         };
         let Some(work_budget_bytes) = progress.checked_add(K0_SUFFIX_REVERSE_CREDIT_BYTES) else {
-            next_state.classes[class_index].observe_present();
+            observe_k0_mandatory_suffix_loss(
+                &mut next_state.classes[class_index],
+                finite_recovery,
+            );
             return Ok(K0MandatorySuffixAttempt {
                 outcome: K0MandatorySuffixOutcome::Fallback,
                 state_after_success: next_state,
@@ -7576,14 +8335,20 @@ fn try_k0_mandatory_suffix_exists(
         let Some(allowed_work) =
             session.positive_end_verifier_work_certificate(work_budget_bytes)
         else {
-            next_state.classes[class_index].observe_present();
+            observe_k0_mandatory_suffix_loss(
+                &mut next_state.classes[class_index],
+                finite_recovery,
+            );
             return Ok(K0MandatorySuffixAttempt {
                 outcome: K0MandatorySuffixOutcome::Fallback,
                 state_after_success: next_state,
             });
         };
         let Some(remaining_work) = allowed_work.checked_sub(cumulative_work) else {
-            next_state.classes[class_index].observe_present();
+            observe_k0_mandatory_suffix_loss(
+                &mut next_state.classes[class_index],
+                finite_recovery,
+            );
             return Ok(K0MandatorySuffixAttempt {
                 outcome: K0MandatorySuffixOutcome::Fallback,
                 state_after_success: next_state,
@@ -7592,7 +8357,7 @@ fn try_k0_mandatory_suffix_exists(
         let verification = session
             .try_positive_match_ending_at(
                 haystack,
-                window,
+                proof_window,
                 endpoint,
                 K0PositiveEndLimits::new(remaining_work, remaining_reverse_bytes),
             )
@@ -7611,12 +8376,27 @@ fn try_k0_mandatory_suffix_exists(
             ))?;
         match verification.outcome() {
             K0PositiveEndOutcome::Matched => {
-                let useful_work = u64::try_from(progress)
-                    .is_ok_and(|progress| cumulative_work <= progress);
-                if useful_work {
-                    next_state.classes[class_index].observe_absent();
+                let credited_progress = if finite_recovery {
+                    finite_incumbent_candidate_floor.map_or(progress, |floor| {
+                        endpoint.checked_sub(floor).unwrap_or(0)
+                    })
                 } else {
-                    next_state.classes[class_index].observe_present();
+                    progress
+                };
+                let useful_work = (!finite_recovery
+                    || credited_progress >= K0_SUFFIX_FORWARD_FALLBACK_BYTES)
+                    && u64::try_from(credited_progress)
+                        .is_ok_and(|progress| cumulative_work <= progress);
+                if useful_work {
+                    observe_k0_mandatory_suffix_win(
+                        &mut next_state.classes[class_index],
+                        finite_recovery,
+                    );
+                } else {
+                    observe_k0_mandatory_suffix_loss(
+                        &mut next_state.classes[class_index],
+                        finite_recovery,
+                    );
                 }
                 return Ok(K0MandatorySuffixAttempt {
                     outcome: K0MandatorySuffixOutcome::Found(true),
@@ -7624,7 +8404,10 @@ fn try_k0_mandatory_suffix_exists(
                 });
             }
             K0PositiveEndOutcome::Declined => {
-                next_state.classes[class_index].observe_present();
+                observe_k0_mandatory_suffix_loss(
+                    &mut next_state.classes[class_index],
+                    finite_recovery,
+                );
                 return Ok(K0MandatorySuffixAttempt {
                     outcome: K0MandatorySuffixOutcome::Fallback,
                     state_after_success: next_state,
@@ -7638,6 +8421,135 @@ fn try_k0_mandatory_suffix_exists(
             },
         ))?;
     }
+}
+
+fn replay_k0_finite_proved_start(
+    session: &mut K0SearchSession<'_>,
+    haystack: &[u8],
+    window: SearchWindow,
+    limits: SearchLimits,
+    start: usize,
+    maximum_match_bytes: usize,
+) -> Result<Option<Match>, SearchError> {
+    let replay_end = start
+        .saturating_add(maximum_match_bytes)
+        .min(window.end());
+    let replay_window = SearchWindow::new(start, replay_end);
+    match session
+        .search_proved_exact_start_selected_end_value(haystack, replay_window, limits)
+        .map_err(SearchError::from)?
+    {
+        Some(end) if start < end && end <= replay_end => Ok(Some(Match { start, end })),
+        Some(_) | None => session
+            .search_span_value(haystack, window, limits)
+            .map(|found| {
+                found.map(|span| Match {
+                    start: span.start(),
+                    end: span.end(),
+                })
+            })
+            .map_err(SearchError::from),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum K0FinitePrefixExistsHedge {
+    Found,
+    ResumeAt(usize),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum K0FinitePrefixSpanHedge {
+    Found(Match),
+    ResumeAt(usize),
+}
+
+fn k0_finite_prefix_hedge_window(
+    window: SearchWindow,
+    incumbent_candidate_floor: Option<usize>,
+    maximum_match_bytes: usize,
+    prefix_hedge_bytes: usize,
+) -> (SearchWindow, usize, bool) {
+    let search_start = incumbent_candidate_floor
+        .unwrap_or(window.start())
+        .max(window.start())
+        .min(window.end());
+    let first_unproved_start = search_start
+        .saturating_add(prefix_hedge_bytes)
+        .min(window.end());
+    // A match beginning strictly before the first unproved start consumes at
+    // most `maximum_match_bytes`, so this capped source window supplies its
+    // complete forward proof and ordered endpoint. When the cap reaches the
+    // original end, the hedge is the complete incumbent search.
+    let scan_end = first_unproved_start
+        .saturating_add(maximum_match_bytes)
+        .min(window.end());
+    (
+        SearchWindow::new(search_start, scan_end),
+        first_unproved_start,
+        scan_end == window.end(),
+    )
+}
+
+fn run_k0_finite_prefix_exists_hedge(
+    session: &mut K0SearchSession<'_>,
+    haystack: &[u8],
+    window: SearchWindow,
+    limits: SearchLimits,
+    incumbent_candidate_floor: Option<usize>,
+    maximum_match_bytes: usize,
+    prefix_hedge_bytes: usize,
+) -> Result<K0FinitePrefixExistsHedge, SearchError> {
+    let (hedge_window, first_unproved_start, complete) = k0_finite_prefix_hedge_window(
+        window,
+        incumbent_candidate_floor,
+        maximum_match_bytes,
+        prefix_hedge_bytes,
+    );
+    if session
+        .search_exists_value(haystack, hedge_window, limits)
+        .map_err(SearchError::from)?
+    {
+        return Ok(K0FinitePrefixExistsHedge::Found);
+    }
+    Ok(K0FinitePrefixExistsHedge::ResumeAt(if complete {
+        window.end()
+    } else {
+        first_unproved_start
+    }))
+}
+
+fn run_k0_finite_prefix_span_hedge(
+    session: &mut K0SearchSession<'_>,
+    haystack: &[u8],
+    window: SearchWindow,
+    limits: SearchLimits,
+    incumbent_candidate_floor: Option<usize>,
+    maximum_match_bytes: usize,
+    prefix_hedge_bytes: usize,
+) -> Result<K0FinitePrefixSpanHedge, SearchError> {
+    let (hedge_window, first_unproved_start, complete) = k0_finite_prefix_hedge_window(
+        window,
+        incumbent_candidate_floor,
+        maximum_match_bytes,
+        prefix_hedge_bytes,
+    );
+    let found = session
+        .search_span_value(haystack, hedge_window, limits)
+        .map_err(SearchError::from)?;
+    if let Some(span) = found {
+        if complete || span.start() < first_unproved_start {
+            return Ok(K0FinitePrefixSpanHedge::Found(Match {
+                start: span.start(),
+                end: span.end(),
+            }));
+        }
+    }
+    Ok(K0FinitePrefixSpanHedge::ResumeAt(if complete {
+        window.end()
+    } else {
+        first_unproved_start
+    }))
 }
 
 impl<'r> PortableSearchSession<'r> {
@@ -7778,17 +8690,73 @@ impl<'r> PortableSearchSession<'r> {
                 ..
             } => {
                 let mut suffix_state_after_success = *mandatory_suffix_exists_state;
+                let mut finite_suffix_incumbent = None;
                 if let Some(suffix) = *mandatory_suffix {
+                    if let Some(maximum_match_bytes) = suffix.finite_maximum_match_bytes() {
+                        if window.end().checked_sub(window.start()).is_some_and(|bytes| {
+                            bytes < K0_NEGATIVE_PREFILTER_MIN_WINDOW_BYTES
+                        }) {
+                            return session
+                                .search_exists_value(haystack, window, limits)
+                                .map_err(SearchError::from);
+                        }
+                        if let Some(direct_route) = select_k0_finite_suffix_direct_route(
+                            session,
+                            &mut suffix_state_after_success,
+                            maximum_match_bytes,
+                            haystack.len(),
+                            window,
+                            limits,
+                            false,
+                        ) {
+                            let result = match direct_route {
+                                K0FiniteSuffixDirectRoute::FreshClass { class_index } => {
+                                    match session
+                                        .search_window::<Exists>(haystack, window, limits)
+                                    {
+                                        Ok(report) => {
+                                            let single_pass_negative = !*report.output()
+                                                && report.accounting().boundaries() == 0
+                                                && session
+                                                    .negative_terminal_has_small_start_scanner();
+                                            observe_k0_finite_suffix_direct_incumbent(
+                                                &mut suffix_state_after_success.classes
+                                                    [class_index],
+                                                single_pass_negative,
+                                            );
+                                            Ok(report.into_output())
+                                        }
+                                        Err(error) => Err(SearchError::from(error)),
+                                    }
+                                }
+                                K0FiniteSuffixDirectRoute::ExactLossBackoff => session
+                                    .search_exists_value(haystack, window, limits)
+                                    .map_err(SearchError::from),
+                            };
+                            if result.is_ok() {
+                                *mandatory_suffix_exists_state = suffix_state_after_success;
+                            }
+                            return result;
+                        }
+                    }
                     let suffix_attempt = try_k0_mandatory_suffix_exists(
                         session,
                         suffix,
-                        *mandatory_suffix_exists_state,
+                        suffix_state_after_success,
                         haystack,
                         window,
                         limits,
+                        None,
                     )?;
                     suffix_state_after_success = suffix_attempt.state_after_success;
                     match suffix_attempt.outcome {
+                        K0MandatorySuffixOutcome::Incumbent {
+                            class_index,
+                            may_switch_to_suffix,
+                        } => {
+                            finite_suffix_incumbent =
+                                Some((class_index, may_switch_to_suffix));
+                        }
                         K0MandatorySuffixOutcome::Found(found) => {
                             *mandatory_suffix_exists_state = suffix_state_after_success;
                             return Ok(found);
@@ -7813,6 +8781,94 @@ impl<'r> PortableSearchSession<'r> {
                     window,
                     limits,
                 );
+                let retry_finite_suffix = finite_suffix_incumbent.is_some_and(
+                    |(class_index, may_switch_to_suffix)| {
+                        observe_k0_finite_suffix_incumbent(
+                            &mut suffix_state_after_success,
+                            class_index,
+                            may_switch_to_suffix,
+                            attempt.outcome,
+                            attempt.candidate_floor,
+                            window,
+                        )
+                    },
+                );
+                let mut search_candidate_floor = attempt.candidate_floor;
+                if retry_finite_suffix {
+                    let suffix = mandatory_suffix
+                        .as_ref()
+                        .copied()
+                        .expect("finite suffix retry requires its retained plan");
+                    let maximum_match_bytes = suffix
+                        .finite_maximum_match_bytes()
+                        .expect("finite suffix retry retains its maximum width");
+                    let prefix_hedge_bytes = suffix
+                        .finite_prefix_hedge_bytes()
+                        .expect("finite suffix retry retains its prefix hedge");
+                    match run_k0_finite_prefix_exists_hedge(
+                        session,
+                        haystack,
+                        window,
+                        limits,
+                        search_candidate_floor,
+                        maximum_match_bytes,
+                        prefix_hedge_bytes,
+                    )? {
+                        K0FinitePrefixExistsHedge::Found => {
+                            let (class_index, _) = finite_suffix_incumbent
+                                .expect("finite suffix hedge retains its class");
+                            observe_k0_finite_suffix_loss(
+                                &mut suffix_state_after_success.classes[class_index],
+                            );
+                            *mandatory_suffix_exists_state = suffix_state_after_success;
+                            *negative_prefilter_exists_state = attempt.state_after_success;
+                            return Ok(true);
+                        }
+                        K0FinitePrefixExistsHedge::ResumeAt(resume_start) => {
+                            if resume_start >= window.end() {
+                                let (class_index, _) = finite_suffix_incumbent
+                                    .expect("finite suffix hedge retains its class");
+                                observe_k0_finite_suffix_loss(
+                                    &mut suffix_state_after_success.classes[class_index],
+                                );
+                                *mandatory_suffix_exists_state = suffix_state_after_success;
+                                *negative_prefilter_exists_state = attempt.state_after_success;
+                                return Ok(false);
+                            }
+                            search_candidate_floor = Some(resume_start);
+                        }
+                    }
+                    let suffix_attempt = try_k0_mandatory_suffix_exists(
+                        session,
+                        suffix,
+                        suffix_state_after_success,
+                        haystack,
+                        window,
+                        limits,
+                        search_candidate_floor,
+                    )?;
+                    suffix_state_after_success = suffix_attempt.state_after_success;
+                    match suffix_attempt.outcome {
+                        K0MandatorySuffixOutcome::Found(found) => {
+                            *mandatory_suffix_exists_state = suffix_state_after_success;
+                            *negative_prefilter_exists_state = attempt.state_after_success;
+                            return Ok(found);
+                        }
+                        K0MandatorySuffixOutcome::Fallback => {}
+                        K0MandatorySuffixOutcome::Incumbent { class_index, .. } => {
+                            observe_k0_finite_suffix_loss(
+                                &mut suffix_state_after_success.classes[class_index],
+                            );
+                        }
+                        K0MandatorySuffixOutcome::Bypass => {
+                            let (class_index, _) = finite_suffix_incumbent
+                                .expect("finite suffix retry retains its class");
+                            observe_k0_finite_suffix_loss(
+                                &mut suffix_state_after_success.classes[class_index],
+                            );
+                        }
+                    }
+                }
                 if attempt.outcome == K0NegativePrefilterOutcome::Absent {
                     let certified = window
                         .end()
@@ -7826,8 +8882,7 @@ impl<'r> PortableSearchSession<'r> {
                         return Ok(false);
                     }
                 }
-                let search_window = attempt
-                    .candidate_floor
+                let search_window = search_candidate_floor
                     .map_or(window, |start| SearchWindow::new(start, window.end()));
                 let result = session
                     .search_exists_value(haystack, search_window, limits)
@@ -8060,16 +9115,96 @@ impl<'r> PortableSearchSession<'r> {
                 ..
             } => {
                 let mut suffix_state_after_success = *mandatory_suffix_span_state;
+                let mut finite_suffix_incumbent = None;
                 if let Some(suffix) = *mandatory_suffix {
+                    if let Some(maximum_match_bytes) = suffix.finite_maximum_match_bytes() {
+                        if window.end().checked_sub(window.start()).is_some_and(|bytes| {
+                            bytes < K0_NEGATIVE_PREFILTER_MIN_WINDOW_BYTES
+                        }) {
+                            return session
+                                .search_span_value(haystack, window, limits)
+                                .map(|found| {
+                                    found.map(|span| Match {
+                                        start: span.start(),
+                                        end: span.end(),
+                                    })
+                                })
+                                .map_err(SearchError::from);
+                        }
+                        if let Some(direct_route) = select_k0_finite_suffix_direct_route(
+                            session,
+                            &mut suffix_state_after_success,
+                            maximum_match_bytes,
+                            haystack.len(),
+                            window,
+                            limits,
+                            true,
+                        ) {
+                            let result = match direct_route {
+                                K0FiniteSuffixDirectRoute::FreshClass { class_index } => {
+                                    let report = if window.end() == haystack.len() {
+                                        session.search_span_at_cursor(
+                                            haystack,
+                                            window.start(),
+                                            limits,
+                                        )
+                                    } else {
+                                        session.search_window::<Span>(haystack, window, limits)
+                                    };
+                                    match report {
+                                        Ok(report) => {
+                                            let single_pass_negative = report.output().is_none()
+                                                && report.accounting().boundaries() == 0
+                                                && session
+                                                    .negative_terminal_has_small_start_scanner();
+                                            observe_k0_finite_suffix_direct_incumbent(
+                                                &mut suffix_state_after_success.classes
+                                                    [class_index],
+                                                single_pass_negative,
+                                            );
+                                            Ok(report.into_output().map(|span| Match {
+                                                start: span.start(),
+                                                end: span.end(),
+                                            }))
+                                        }
+                                        Err(error) => Err(SearchError::from(error)),
+                                    }
+                                }
+                                K0FiniteSuffixDirectRoute::ExactLossBackoff => session
+                                    .search_span_value(haystack, window, limits)
+                                    .map(|found| {
+                                        found.map(|span| Match {
+                                            start: span.start(),
+                                            end: span.end(),
+                                        })
+                                    })
+                                    .map_err(SearchError::from),
+                            };
+                            if result.is_ok() {
+                                *mandatory_suffix_span_state = suffix_state_after_success;
+                            }
+                            return result;
+                        }
+                    }
                     let suffix_attempt = try_k0_mandatory_suffix_span_start(
+                        session,
                         suffix,
-                        *mandatory_suffix_span_state,
+                        suffix_state_after_success,
                         haystack,
                         window,
                         limits,
-                    );
+                        None,
+                    )?;
                     suffix_state_after_success = suffix_attempt.state_after_success;
                     let run_k0_directly = match suffix_attempt.outcome {
+                        K0MandatorySuffixSpanOutcome::Incumbent {
+                            class_index,
+                            may_switch_to_suffix,
+                        } => {
+                            finite_suffix_incumbent =
+                                Some((class_index, may_switch_to_suffix));
+                            false
+                        }
                         K0MandatorySuffixSpanOutcome::Absent => {
                             let certified = window
                                 .end()
@@ -8095,6 +9230,23 @@ impl<'r> PortableSearchSession<'r> {
                                     })
                                 })
                                 .map_err(SearchError::from);
+                            if result.is_ok() {
+                                *mandatory_suffix_span_state = suffix_state_after_success;
+                            }
+                            return result;
+                        }
+                        K0MandatorySuffixSpanOutcome::ProvedStart {
+                            start,
+                            maximum_match_bytes,
+                        } => {
+                            let result = replay_k0_finite_proved_start(
+                                session,
+                                haystack,
+                                window,
+                                limits,
+                                start,
+                                maximum_match_bytes,
+                            );
                             if result.is_ok() {
                                 *mandatory_suffix_span_state = suffix_state_after_success;
                             }
@@ -8130,6 +9282,139 @@ impl<'r> PortableSearchSession<'r> {
                     window,
                     limits,
                 );
+                let retry_finite_suffix = finite_suffix_incumbent.is_some_and(
+                    |(class_index, may_switch_to_suffix)| {
+                        observe_k0_finite_suffix_incumbent(
+                            &mut suffix_state_after_success,
+                            class_index,
+                            may_switch_to_suffix,
+                            attempt.outcome,
+                            attempt.candidate_floor,
+                            window,
+                        )
+                    },
+                );
+                let mut search_candidate_floor = attempt.candidate_floor;
+                if retry_finite_suffix {
+                    let suffix = mandatory_suffix
+                        .as_ref()
+                        .copied()
+                        .expect("finite suffix retry requires its retained plan");
+                    let maximum_match_bytes = suffix
+                        .finite_maximum_match_bytes()
+                        .expect("finite suffix retry retains its maximum width");
+                    let prefix_hedge_bytes = suffix
+                        .finite_prefix_hedge_bytes()
+                        .expect("finite suffix retry retains its prefix hedge");
+                    match run_k0_finite_prefix_span_hedge(
+                        session,
+                        haystack,
+                        window,
+                        limits,
+                        search_candidate_floor,
+                        maximum_match_bytes,
+                        prefix_hedge_bytes,
+                    )? {
+                        K0FinitePrefixSpanHedge::Found(found) => {
+                            let (class_index, _) = finite_suffix_incumbent
+                                .expect("finite suffix hedge retains its class");
+                            observe_k0_finite_suffix_loss(
+                                &mut suffix_state_after_success.classes[class_index],
+                            );
+                            *mandatory_suffix_span_state = suffix_state_after_success;
+                            *negative_prefilter_span_state = attempt.state_after_success;
+                            return Ok(Some(found));
+                        }
+                        K0FinitePrefixSpanHedge::ResumeAt(resume_start) => {
+                            if resume_start >= window.end() {
+                                let (class_index, _) = finite_suffix_incumbent
+                                    .expect("finite suffix hedge retains its class");
+                                observe_k0_finite_suffix_loss(
+                                    &mut suffix_state_after_success.classes[class_index],
+                                );
+                                *mandatory_suffix_span_state = suffix_state_after_success;
+                                *negative_prefilter_span_state = attempt.state_after_success;
+                                return Ok(None);
+                            }
+                            search_candidate_floor = Some(resume_start);
+                        }
+                    }
+                    let suffix_attempt = try_k0_mandatory_suffix_span_start(
+                        session,
+                        suffix,
+                        suffix_state_after_success,
+                        haystack,
+                        window,
+                        limits,
+                        search_candidate_floor,
+                    )?;
+                    suffix_state_after_success = suffix_attempt.state_after_success;
+                    match suffix_attempt.outcome {
+                        K0MandatorySuffixSpanOutcome::Absent => {
+                            let certified = window
+                                .end()
+                                .checked_sub(window.start())
+                                .is_some_and(|input_bytes| {
+                                    session.negative_terminal_has_reused_work_certificate(
+                                        input_bytes,
+                                    )
+                                });
+                            if certified {
+                                *mandatory_suffix_span_state = suffix_state_after_success;
+                                *negative_prefilter_span_state = attempt.state_after_success;
+                                return Ok(None);
+                            }
+                        }
+                        K0MandatorySuffixSpanOutcome::Narrowed(start) => {
+                            let narrowed = SearchWindow::new(start, window.end());
+                            let result = session
+                                .search_span_value(haystack, narrowed, limits)
+                                .map(|found| {
+                                    found.map(|span| Match {
+                                        start: span.start(),
+                                        end: span.end(),
+                                    })
+                                })
+                                .map_err(SearchError::from);
+                            if result.is_ok() {
+                                *mandatory_suffix_span_state = suffix_state_after_success;
+                                *negative_prefilter_span_state = attempt.state_after_success;
+                            }
+                            return result;
+                        }
+                        K0MandatorySuffixSpanOutcome::ProvedStart {
+                            start,
+                            maximum_match_bytes,
+                        } => {
+                            let result = replay_k0_finite_proved_start(
+                                session,
+                                haystack,
+                                window,
+                                limits,
+                                start,
+                                maximum_match_bytes,
+                            );
+                            if result.is_ok() {
+                                *mandatory_suffix_span_state = suffix_state_after_success;
+                                *negative_prefilter_span_state = attempt.state_after_success;
+                            }
+                            return result;
+                        }
+                        K0MandatorySuffixSpanOutcome::Fallback => {}
+                        K0MandatorySuffixSpanOutcome::Incumbent { class_index, .. } => {
+                            observe_k0_finite_suffix_loss(
+                                &mut suffix_state_after_success.classes[class_index],
+                            );
+                        }
+                        K0MandatorySuffixSpanOutcome::Bypass => {
+                            let (class_index, _) = finite_suffix_incumbent
+                                .expect("finite suffix retry retains its class");
+                            observe_k0_finite_suffix_loss(
+                                &mut suffix_state_after_success.classes[class_index],
+                            );
+                        }
+                    }
+                }
                 if attempt.outcome == K0NegativePrefilterOutcome::Absent {
                     let certified = window
                         .end()
@@ -8143,8 +9428,7 @@ impl<'r> PortableSearchSession<'r> {
                         return Ok(None);
                     }
                 }
-                let search_window = attempt
-                    .candidate_floor
+                let search_window = search_candidate_floor
                     .map_or(window, |start| SearchWindow::new(start, window.end()));
                 let result = session
                     .search_span_value(haystack, search_window, limits)
@@ -8760,19 +10044,25 @@ mod tests {
     use super::{
         Automaton, BuildError, BuildLimits, CanonicalPattern, CaptureFreeOperation,
         CompatibilityProfile, GuardedLiteralSetSearchError, K0MandatoryCutPlan,
-        K0MandatorySuffixPlan,
+        K0MandatorySuffixPlan, K0FiniteSuffixRoute, K0MandatorySuffixSpanOutcome,
         K0NegativePrefilterOutcome, Match, OperationSemantics, PlanKind, PlanSelection,
         PortableBuilder, PortableFindIterAccounting, PortableFindIterError, PortableFindIterLimits,
         PortableFindIterRunLimits, PortablePlan, PortableRegex, SearchAccounting, SearchError,
-        SearchLimits, SearchSessionLimits, SearchWindow, K0NegativePrefilterClassState,
-        K0NegativePrefilterState,
+        SearchLimits, SearchSessionLimits, SearchWindow, PortableSearchSessionPlan,
+        K0NegativePrefilterClassState, K0NegativePrefilterState,
         K0_NEGATIVE_PREFILTER_MAX_DISABLED_CALLS,
         K0_MANDATORY_CUT_BYTE_ENUMERATION_WORK, K0_MANDATORY_CUT_CARDINALITY_WORK,
         K0_MANDATORY_CUT_PLAN_CONSTRUCTION_WORK,
         K0_NEGATIVE_PREFILTER_PRESENT_STREAK_LIMIT, K0_NEGATIVE_PREFILTER_SIZE_CLASS_STATES,
-        k0_mandatory_suffix_completed_negative_is_useful,
-        observe_k0_mandatory_suffix_completed_negative, run_k0_negative_prefilter,
-        try_build_k0_mandatory_cut,
+        k0_finite_prefix_hedge_window, k0_finite_suffix_prefix_hedge_bytes,
+        k0_mandatory_suffix_completed_negative_is_useful, K0FinitePrefixExistsHedge,
+        K0FinitePrefixSpanHedge, K0FiniteSuffixDirectRoute,
+        observe_k0_finite_suffix_incumbent, observe_k0_finite_suffix_loss,
+        observe_k0_finite_suffix_win, observe_k0_mandatory_suffix_completed_negative,
+        run_k0_finite_prefix_exists_hedge, run_k0_finite_prefix_span_hedge,
+        run_k0_negative_prefilter, select_k0_finite_suffix_direct_route,
+        select_k0_finite_suffix_route, try_build_k0_mandatory_cut,
+        try_k0_mandatory_suffix_span_start, BYTE_SET_BLOCK_BYTES,
     };
     use fre_automata::{MandatoryCutAnalysisLimits, MaximumConsumedDistance};
     use fre_kernels::FixedPredicateWord64SearchCursor;
@@ -8945,17 +10235,27 @@ mod tests {
         );
         assert_eq!(early.outcome, K0NegativePrefilterOutcome::Present);
         assert_eq!(early.candidate_floor, Some(100));
+        assert_eq!(early.state_after_success.classes[0].present_streak, 1);
 
         haystack[100] = b'x';
+        let mut late_state = K0NegativePrefilterState::default();
+        let window_size_class = usize::BITS - (window.end() - window.start()).leading_zeros();
+        let late_class_index = late_state.class_for(window_size_class);
+        late_state.classes[late_class_index].present_streak =
+            K0_NEGATIVE_PREFILTER_PRESENT_STREAK_LIMIT - 1;
+        late_state.classes[late_class_index].present_backoff = 8;
         let late = run_k0_negative_prefilter(
             Some(&zero),
             None,
-            K0NegativePrefilterState::default(),
+            late_state,
             &haystack,
             window,
             SearchLimits::unlimited(),
         );
         assert_eq!(late.candidate_floor, Some(1_200));
+        assert_eq!(late.state_after_success.classes[late_class_index].present_streak, 0);
+        assert_eq!(late.state_after_success.classes[late_class_index].disabled_calls, 0);
+        assert_eq!(late.state_after_success.classes[late_class_index].present_backoff, 0);
 
         haystack[101] = b'Z';
         let boundary = run_k0_negative_prefilter(
@@ -9127,21 +10427,377 @@ mod tests {
     }
 
     #[test]
+    fn finite_suffix_router_keeps_absent_incumbents_and_backs_off_exact_losses() {
+        let mut state = K0NegativePrefilterState::default();
+        let class_index = state.class_for(17);
+        let window = SearchWindow::new(0, 4_096);
+        assert_eq!(
+            select_k0_finite_suffix_route(&mut state.classes[class_index]),
+            K0FiniteSuffixRoute::Incumbent {
+                may_switch_to_suffix: true,
+            },
+        );
+        assert!(!observe_k0_finite_suffix_incumbent(
+            &mut state,
+            class_index,
+            true,
+            K0NegativePrefilterOutcome::Absent,
+            None,
+            window,
+        ));
+        assert_eq!(
+            select_k0_finite_suffix_route(&mut state.classes[class_index]),
+            K0FiniteSuffixRoute::Incumbent {
+                may_switch_to_suffix: true,
+            },
+        );
+
+        assert!(!observe_k0_finite_suffix_incumbent(
+            &mut state,
+            class_index,
+            true,
+            K0NegativePrefilterOutcome::Present,
+            Some(3_072),
+            window,
+        ));
+        assert_eq!(
+            select_k0_finite_suffix_route(&mut state.classes[class_index]),
+            K0FiniteSuffixRoute::Incumbent {
+                may_switch_to_suffix: true,
+            },
+        );
+        assert!(observe_k0_finite_suffix_incumbent(
+            &mut state,
+            class_index,
+            true,
+            K0NegativePrefilterOutcome::Present,
+            Some(0),
+            window,
+        ));
+        assert_eq!(
+            select_k0_finite_suffix_route(&mut state.classes[class_index]),
+            K0FiniteSuffixRoute::ExactSuffix,
+        );
+        observe_k0_finite_suffix_loss(&mut state.classes[class_index]);
+        assert_eq!(state.classes[class_index].disabled_calls, 1);
+        assert_eq!(
+            select_k0_finite_suffix_route(&mut state.classes[class_index]),
+            K0FiniteSuffixRoute::Incumbent {
+                may_switch_to_suffix: false,
+            },
+        );
+        assert!(!observe_k0_finite_suffix_incumbent(
+            &mut state,
+            class_index,
+            false,
+            K0NegativePrefilterOutcome::Present,
+            Some(0),
+            window,
+        ));
+        assert_eq!(
+            select_k0_finite_suffix_route(&mut state.classes[class_index]),
+            K0FiniteSuffixRoute::Incumbent {
+                may_switch_to_suffix: true,
+            },
+        );
+        assert!(observe_k0_finite_suffix_incumbent(
+            &mut state,
+            class_index,
+            true,
+            K0NegativePrefilterOutcome::Present,
+            Some(0),
+            window,
+        ));
+        assert_eq!(
+            select_k0_finite_suffix_route(&mut state.classes[class_index]),
+            K0FiniteSuffixRoute::ExactSuffix,
+        );
+        observe_k0_finite_suffix_win(&mut state.classes[class_index]);
+        assert_eq!(state.classes[class_index].present_streak, 0);
+        assert_eq!(state.classes[class_index].disabled_calls, 0);
+        assert_eq!(state.classes[class_index].present_backoff, 0);
+        assert_eq!(
+            select_k0_finite_suffix_route(&mut state.classes[class_index]),
+            K0FiniteSuffixRoute::Incumbent {
+                may_switch_to_suffix: true,
+            },
+        );
+    }
+
+    #[test]
+    fn finite_suffix_direct_route_owns_fresh_classes_and_exact_loss_backoff() {
+        let regex = PortableBuilder::new(r"(?-u:\x6a\x6b[\x30-\x39]{2,6}\x71\x72)")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .expect("finite direct-route fixture builds through K0");
+        let PortablePlan::K0(plan) = &regex.plan else {
+            panic!("finite direct-route fixture did not retain K0");
+        };
+        let maximum_match_bytes = plan
+            .mandatory_suffix
+            .as_ref()
+            .and_then(K0MandatorySuffixPlan::finite_maximum_match_bytes)
+            .expect("finite direct-route fixture retains its maximum width");
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("finite direct-route session constructs");
+        let PortableSearchSessionPlan::K0 {
+            session: k0_session,
+            ..
+        } = &mut session.plan
+        else {
+            panic!("finite direct-route session did not retain K0");
+        };
+        let window = SearchWindow::new(0, 4_096);
+        let window_size_class = usize::BITS - 4_096_usize.leading_zeros();
+        let mut state = K0NegativePrefilterState::default();
+
+        assert_eq!(
+            select_k0_finite_suffix_direct_route(
+                k0_session,
+                &mut state,
+                maximum_match_bytes,
+                window.end(),
+                window,
+                SearchLimits::unlimited(),
+                true,
+            ),
+            Some(K0FiniteSuffixDirectRoute::FreshClass { class_index: 0 }),
+        );
+        let class_index = state.class_for(window_size_class);
+        assert_eq!(state.classes[class_index].disabled_calls, 0);
+        observe_k0_finite_suffix_direct_incumbent(&mut state.classes[class_index], true);
+        assert!(
+            k0_finite_suffix_incumbent_single_pass_negative(&state.classes[class_index]),
+            "the first ordinary result publishes its zero-boundary classification",
+        );
+        assert_eq!(state.classes[class_index].disabled_calls, 1);
+        assert_eq!(
+            select_k0_finite_suffix_direct_route(
+                k0_session,
+                &mut state,
+                maximum_match_bytes,
+                window.end(),
+                window,
+                SearchLimits::unlimited(),
+                true,
+            ),
+            Some(K0FiniteSuffixDirectRoute::ExactLossBackoff),
+        );
+        assert_eq!(state.classes[class_index].disabled_calls, 0);
+        assert_eq!(
+            select_k0_finite_suffix_direct_route(
+                k0_session,
+                &mut state,
+                maximum_match_bytes,
+                window.end(),
+                window,
+                SearchLimits::unlimited(),
+                true,
+            ),
+            None,
+            "the bounded backoff eventually readmits an exact comparison",
+        );
+
+        assert!(observe_k0_finite_suffix_incumbent(
+            &mut state,
+            class_index,
+            true,
+            K0NegativePrefilterOutcome::Present,
+            None,
+            window,
+        ));
+        assert!(k0_finite_suffix_incumbent_single_pass_negative(
+            &state.classes[class_index],
+        ));
+        assert_eq!(
+            select_k0_finite_suffix_route(&mut state.classes[class_index]),
+            K0FiniteSuffixRoute::ExactSuffix,
+            "the packed receipt must coexist with the exact-route bit",
+        );
+
+        observe_k0_finite_suffix_loss(&mut state.classes[class_index]);
+        assert_eq!(state.classes[class_index].disabled_calls, 2);
+        assert!(
+            k0_finite_suffix_incumbent_single_pass_negative(&state.classes[class_index]),
+            "an exact loss retains the receipt that made a zero-candidate rescan redundant",
+        );
+        assert_eq!(
+            select_k0_finite_suffix_direct_route(
+                k0_session,
+                &mut state,
+                maximum_match_bytes,
+                window.end(),
+                window,
+                SearchLimits::unlimited(),
+                true,
+            ),
+            Some(K0FiniteSuffixDirectRoute::ExactLossBackoff),
+        );
+        assert_eq!(state.classes[class_index].disabled_calls, 1);
+        assert_eq!(
+            state.classes[class_index].next_predicate,
+            K0_FINITE_SUFFIX_INCUMBENT_ROUTE,
+        );
+        let before_limited = state;
+        assert_eq!(
+            select_k0_finite_suffix_direct_route(
+                k0_session,
+                &mut state,
+                maximum_match_bytes,
+                window.end(),
+                window,
+                SearchLimits {
+                    max_work: u64::MAX - 1,
+                    ..SearchLimits::unlimited()
+                },
+                true,
+            ),
+            None,
+        );
+        assert_eq!(state, before_limited, "ineligible calls do not consume backoff");
+
+        observe_k0_finite_suffix_win(&mut state.classes[class_index]);
+        assert!(!k0_finite_suffix_incumbent_single_pass_negative(
+            &state.classes[class_index],
+        ));
+        assert_eq!(
+            select_k0_finite_suffix_direct_route(
+                k0_session,
+                &mut state,
+                maximum_match_bytes,
+                window.end(),
+                window,
+                SearchLimits::unlimited(),
+                true,
+            ),
+            None,
+            "an exact win must keep the sidecar eligible on the next call",
+        );
+    }
+
+    #[test]
+    fn finite_suffix_first_incumbent_distinguishes_exhausted_and_dense_start_scans() {
+        const HAYSTACK_BYTES: usize = 4_096;
+        let exhausted = PortableBuilder::new(r"(?-u:(?:\x21\x31|\x21\x32|\x22){0,5}\x7d)")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .expect("finite exhausted-scanner fixture builds through K0");
+        let absent = vec![b'x'; HAYSTACK_BYTES];
+        let window = SearchWindow::full(&absent);
+        let window_size_class = usize::BITS - HAYSTACK_BYTES.leading_zeros();
+        let mut exhausted_session = exhausted
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("finite exhausted-scanner session constructs");
+        assert!(!exhausted_session
+            .is_match_window_value(&absent, window, SearchLimits::unlimited())
+            .unwrap());
+        {
+            let PortableSearchSessionPlan::K0 {
+                mandatory_suffix_exists_state,
+                negative_prefilter_exists_state,
+                ..
+            } = &mut exhausted_session.plan
+            else {
+                panic!("finite exhausted-scanner fixture did not retain K0");
+            };
+            let class_index = mandatory_suffix_exists_state.class_for(window_size_class);
+            assert!(k0_finite_suffix_incumbent_single_pass_negative(
+                &mandatory_suffix_exists_state.classes[class_index],
+            ));
+            assert_eq!(mandatory_suffix_exists_state.classes[class_index].disabled_calls, 1);
+            assert_eq!(
+                *negative_prefilter_exists_state,
+                K0NegativePrefilterState::default(),
+            );
+        }
+        assert!(!exhausted_session
+            .is_match_window_value(&absent, window, SearchLimits::unlimited())
+            .unwrap());
+        {
+            let PortableSearchSessionPlan::K0 {
+                mandatory_suffix_exists_state,
+                negative_prefilter_exists_state,
+                ..
+            } = &mut exhausted_session.plan
+            else {
+                panic!("finite exhausted-scanner fixture did not retain K0");
+            };
+            let class_index = mandatory_suffix_exists_state.class_for(window_size_class);
+            assert_eq!(mandatory_suffix_exists_state.classes[class_index].disabled_calls, 0);
+            assert!(k0_finite_suffix_incumbent_single_pass_negative(
+                &mandatory_suffix_exists_state.classes[class_index],
+            ));
+            assert_eq!(
+                *negative_prefilter_exists_state,
+                K0NegativePrefilterState::default(),
+                "the direct backoff route must bypass every optional sidecar",
+            );
+        }
+
+        let dense = PortableBuilder::new(r"(?-u:\x61\xfe[\x30-\x40]{0,8}\x7f)")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .expect("finite dense-scanner fixture builds through K0");
+        let mut decoys = Vec::with_capacity(HAYSTACK_BYTES);
+        while decoys.len() < HAYSTACK_BYTES {
+            decoys.extend_from_slice(&[b'a', 0xfe, b'0', b'0', b'x']);
+        }
+        decoys.truncate(HAYSTACK_BYTES);
+        let dense_window = SearchWindow::full(&decoys);
+        let mut dense_session = dense
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("finite dense-scanner session constructs");
+        assert!(!dense_session
+            .is_match_window_value(&decoys, dense_window, SearchLimits::unlimited())
+            .unwrap());
+        let PortableSearchSessionPlan::K0 {
+            mandatory_suffix_exists_state,
+            ..
+        } = &mut dense_session.plan
+        else {
+            panic!("finite dense-scanner fixture did not retain K0");
+        };
+        let class_index = mandatory_suffix_exists_state.class_for(window_size_class);
+        assert!(
+            !k0_finite_suffix_incumbent_single_pass_negative(
+                &mandatory_suffix_exists_state.classes[class_index],
+            ),
+            "native candidate expansion must preserve exact-sidecar exploration",
+        );
+        assert_eq!(mandatory_suffix_exists_state.classes[class_index].disabled_calls, 0);
+    }
+
+    #[test]
     fn k0_mandatory_suffix_negative_cost_thresholds_are_exact() {
+        let ordinary = K0NegativePrefilterClassState::default();
+        let single_pass = K0NegativePrefilterClassState {
+            next_predicate: K0_FINITE_SUFFIX_SINGLE_PASS_NEGATIVE,
+            ..K0NegativePrefilterClassState::default()
+        };
         assert!(k0_mandatory_suffix_completed_negative_is_useful(
-            1_024, 7, 1_017,
+            &ordinary, 1_024, 7, 1_017,
         ));
         assert!(!k0_mandatory_suffix_completed_negative_is_useful(
-            1_023, 7, 1_017,
+            &ordinary, 1_023, 7, 1_017,
         ));
         assert!(!k0_mandatory_suffix_completed_negative_is_useful(
-            1_024, 8, 1_017,
+            &ordinary, 1_024, 8, 1_017,
         ));
         assert!(!k0_mandatory_suffix_completed_negative_is_useful(
-            1_024, 7, 1_018,
+            &ordinary, 1_024, 7, 1_018,
         ));
         assert!(!k0_mandatory_suffix_completed_negative_is_useful(
-            usize::MAX, 1, u64::MAX,
+            &ordinary, usize::MAX, 1, u64::MAX,
+        ));
+        assert!(k0_mandatory_suffix_completed_negative_is_useful(
+            &ordinary, 1_024, 0, u64::MAX,
+        ));
+        assert!(!k0_mandatory_suffix_completed_negative_is_useful(
+            &single_pass, 1_024, 0, 0,
         ));
     }
 
@@ -9167,6 +10823,21 @@ mod tests {
         assert_eq!(zero_candidates.present_backoff, 0);
         assert_eq!(zero_candidates.next_predicate, 3);
         assert_eq!(zero_candidates.window_size_class, Some(14));
+
+        let mut redundant_zero_candidates = primed;
+        redundant_zero_candidates.next_predicate |= K0_FINITE_SUFFIX_SINGLE_PASS_NEGATIVE;
+        observe_k0_mandatory_suffix_completed_negative(
+            &mut redundant_zero_candidates,
+            1_024,
+            0,
+            0,
+        );
+        assert_eq!(
+            redundant_zero_candidates.present_streak,
+            K0_NEGATIVE_PREFILTER_PRESENT_STREAK_LIMIT - 1,
+        );
+        assert_eq!(redundant_zero_candidates.disabled_calls, 16);
+        assert_eq!(redundant_zero_candidates.present_backoff, 16);
 
         let mut cheap_candidates = primed;
         observe_k0_mandatory_suffix_completed_negative(
@@ -9265,6 +10936,691 @@ mod tests {
         write(&mut haystack, 8_000, b"XYZ");
         assert_eq!(haystack.as_ptr(), address);
         check(&haystack, true);
+    }
+
+    #[test]
+    fn finite_k0_prefix_hedge_carries_a_complete_width_proof_to_its_resume_start() {
+        let window = SearchWindow::new(11, 511);
+        let (hedge_window, first_unproved_start, complete) =
+            k0_finite_prefix_hedge_window(window, Some(31), 17, 80);
+        assert_eq!(hedge_window, SearchWindow::new(31, 128));
+        assert_eq!(first_unproved_start, 111);
+        assert!(!complete);
+
+        let (complete_window, first_unproved_start, complete) =
+            k0_finite_prefix_hedge_window(window, Some(451), 17, 80);
+        assert_eq!(complete_window, SearchWindow::new(451, 511));
+        assert_eq!(first_unproved_start, window.end());
+        assert!(complete);
+    }
+
+    #[test]
+    fn finite_k0_prefix_hedge_resumes_at_the_first_unproved_start() {
+        let pattern = r"(?-u:\x6a\x6b[\x30-\x39]{2,6}\x71\x72)";
+        let regex = PortableBuilder::new(pattern)
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .expect("finite prefix-hedge fixture builds through K0");
+        let PortablePlan::K0(plan) = &regex.plan else {
+            panic!("forced finite prefix-hedge fixture did not retain K0");
+        };
+        let suffix = plan
+            .mandatory_suffix
+            .as_ref()
+            .expect("finite two-byte suffix is retained");
+        assert_eq!(suffix.needle(), b"qr");
+        let maximum_match_bytes = suffix
+            .finite_maximum_match_bytes()
+            .expect("finite suffix retains its maximum width");
+        let prefix_hedge_bytes = suffix
+            .finite_prefix_hedge_bytes()
+            .expect("finite suffix retains its prefix hedge");
+        assert_eq!(maximum_match_bytes, 10);
+        let maximum_prefix = maximum_match_bytes - suffix.needle().len();
+        let cut_maximum_before = plan
+            .mandatory_cut
+            .map(|cut| match cut.maximum_before_root() {
+                MaximumConsumedDistance::Finite(maximum) => {
+                    usize::try_from(maximum).unwrap_or(usize::MAX)
+                }
+                MaximumConsumedDistance::Unbounded => maximum_prefix,
+            })
+            .unwrap_or(maximum_prefix)
+            .min(maximum_prefix);
+        let proof_envelope = maximum_prefix
+            .saturating_add(maximum_match_bytes)
+            .saturating_add(cut_maximum_before)
+            .saturating_add(BYTE_SET_BLOCK_BYTES);
+        assert!(prefix_hedge_bytes >= proof_envelope);
+        assert!(prefix_hedge_bytes <= proof_envelope.saturating_add(1_024));
+        assert_eq!(
+            prefix_hedge_bytes,
+            k0_finite_suffix_prefix_hedge_bytes(
+                maximum_match_bytes,
+                suffix.needle().len(),
+                plan.mandatory_cut,
+            ),
+        );
+
+        let window_start = 37;
+        let first_unproved_start = window_start
+            .checked_add(prefix_hedge_bytes)
+            .expect("bounded hedge start fits usize");
+        let haystack_len = first_unproved_start
+            .checked_add(maximum_match_bytes)
+            .and_then(|end| end.checked_add(64))
+            .expect("bounded hedge fixture length fits usize");
+        let window = SearchWindow::new(window_start, haystack_len);
+
+        let before_start = first_unproved_start - 1;
+        let mut before = vec![b'x'; haystack_len];
+        before[before_start..before_start + 8].copy_from_slice(b"jk1234qr");
+        let mut before_session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("finite prefix-hedge session constructs");
+        let PortableSearchSessionPlan::K0 {
+            session: before_k0,
+            ..
+        } = &mut before_session.plan
+        else {
+            panic!("finite prefix-hedge session did not retain K0");
+        };
+        assert_eq!(
+            run_k0_finite_prefix_span_hedge(
+                before_k0,
+                &before,
+                window,
+                SearchLimits::unlimited(),
+                None,
+                maximum_match_bytes,
+                prefix_hedge_bytes,
+            )
+            .unwrap(),
+            K0FinitePrefixSpanHedge::Found(Match {
+                start: before_start,
+                end: before_start + 8,
+            }),
+        );
+
+        let mut boundary = vec![b'x'; haystack_len];
+        boundary[first_unproved_start..first_unproved_start + 8]
+            .copy_from_slice(b"jk1234qr");
+        let mut boundary_session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("finite prefix-hedge boundary session constructs");
+        let PortableSearchSessionPlan::K0 {
+            session: boundary_k0,
+            ..
+        } = &mut boundary_session.plan
+        else {
+            panic!("finite prefix-hedge boundary session did not retain K0");
+        };
+        assert_eq!(
+            run_k0_finite_prefix_span_hedge(
+                boundary_k0,
+                &boundary,
+                window,
+                SearchLimits::unlimited(),
+                None,
+                maximum_match_bytes,
+                prefix_hedge_bytes,
+            )
+            .unwrap(),
+            K0FinitePrefixSpanHedge::ResumeAt(first_unproved_start),
+        );
+        assert_eq!(
+            boundary_k0
+                .search_span_value(
+                    &boundary,
+                    SearchWindow::new(first_unproved_start, window.end()),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .map(|span| Match {
+                    start: span.start(),
+                    end: span.end(),
+                }),
+            Some(Match {
+                start: first_unproved_start,
+                end: first_unproved_start + 8,
+            }),
+        );
+
+        let mut exists_session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("finite prefix-hedge exists session constructs");
+        let PortableSearchSessionPlan::K0 {
+            session: exists_k0,
+            ..
+        } = &mut exists_session.plan
+        else {
+            panic!("finite prefix-hedge exists session did not retain K0");
+        };
+        assert_eq!(
+            run_k0_finite_prefix_exists_hedge(
+                exists_k0,
+                &boundary,
+                window,
+                SearchLimits::unlimited(),
+                None,
+                maximum_match_bytes,
+                prefix_hedge_bytes,
+            )
+            .unwrap(),
+            K0FinitePrefixExistsHedge::Found,
+        );
+
+        let absent = vec![b'x'; haystack_len];
+        let mut absent_session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("finite prefix-hedge absent session constructs");
+        let PortableSearchSessionPlan::K0 {
+            session: absent_k0,
+            ..
+        } = &mut absent_session.plan
+        else {
+            panic!("finite prefix-hedge absent session did not retain K0");
+        };
+        assert_eq!(
+            run_k0_finite_prefix_exists_hedge(
+                absent_k0,
+                &absent,
+                window,
+                SearchLimits::unlimited(),
+                None,
+                maximum_match_bytes,
+                prefix_hedge_bytes,
+            )
+            .unwrap(),
+            K0FinitePrefixExistsHedge::ResumeAt(first_unproved_start),
+        );
+    }
+
+    #[test]
+    fn finite_k0_prefix_hedge_keeps_early_matches_on_the_incumbent_engine() {
+        const MATCH_START: usize = 128;
+        const HAYSTACK_BYTES: usize = 4_096;
+        let pattern = r"(?-u:\x6a\x6b[\x30-\x39]{2,6}\x71\x72)";
+        let regex = PortableBuilder::new(pattern)
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .expect("finite early-match fixture builds through K0");
+        let mut haystack = vec![b'x'; HAYSTACK_BYTES];
+        haystack[MATCH_START..MATCH_START + 8].copy_from_slice(b"jk1234qr");
+        let expected = Match {
+            start: MATCH_START,
+            end: MATCH_START + 8,
+        };
+
+        let mut span_session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("finite early-match span session constructs");
+        assert_eq!(
+            span_session
+                .find_window_value(
+                    &haystack,
+                    SearchWindow::full(&haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            Some(expected),
+        );
+        let window_size_class = usize::BITS - HAYSTACK_BYTES.leading_zeros();
+        {
+            let PortableSearchSessionPlan::K0 {
+                mandatory_suffix_span_state,
+                negative_prefilter_span_state,
+                ..
+            } = &mut span_session.plan
+            else {
+                panic!("finite early-match span session did not retain K0");
+            };
+            let class_index = mandatory_suffix_span_state.class_for(window_size_class);
+            assert_eq!(
+                mandatory_suffix_span_state.classes[class_index].disabled_calls,
+                0,
+                "the fresh size class should run only the incumbent",
+            );
+            assert!(
+                !k0_finite_suffix_incumbent_single_pass_negative(
+                    &mandatory_suffix_span_state.classes[class_index],
+                ),
+                "the first incumbent receipt should preserve sidecar exploration",
+            );
+            assert_eq!(
+                *negative_prefilter_span_state,
+                K0NegativePrefilterState::default(),
+                "the fresh direct route should not enter the negative prefilter",
+            );
+        }
+        assert_eq!(
+            span_session
+                .find_window_value(
+                    &haystack,
+                    SearchWindow::full(&haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            Some(expected),
+        );
+        let negative_span_after_probe = {
+            let PortableSearchSessionPlan::K0 {
+                mandatory_suffix_span_state,
+                negative_prefilter_span_state,
+                ..
+            } = &mut span_session.plan
+            else {
+                panic!("finite early-match span session did not retain K0");
+            };
+            let class_index = mandatory_suffix_span_state.class_for(window_size_class);
+            assert_ne!(
+                mandatory_suffix_span_state.classes[class_index].disabled_calls,
+                0,
+                "the bounded incumbent hedge should back off the redundant exact route",
+            );
+            *negative_prefilter_span_state
+        };
+        assert_eq!(
+            span_session
+                .find_window_value(
+                    &haystack,
+                    SearchWindow::full(&haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            Some(expected),
+        );
+        {
+            let PortableSearchSessionPlan::K0 {
+                mandatory_suffix_span_state,
+                negative_prefilter_span_state,
+                ..
+            } = &mut span_session.plan
+            else {
+                panic!("finite early-match span session did not retain K0");
+            };
+            let class_index = mandatory_suffix_span_state.class_for(window_size_class);
+            assert_eq!(
+                mandatory_suffix_span_state.classes[class_index].disabled_calls,
+                0,
+            );
+            assert_eq!(
+                *negative_prefilter_span_state,
+                negative_span_after_probe,
+                "the direct backoff route should not enter the negative prefilter",
+            );
+        }
+
+        let mut exists_session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("finite early-match exists session constructs");
+        assert!(
+            exists_session
+                .is_match_window_value(
+                    &haystack,
+                    SearchWindow::full(&haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+        );
+        {
+            let PortableSearchSessionPlan::K0 {
+                mandatory_suffix_exists_state,
+                negative_prefilter_exists_state,
+                ..
+            } = &mut exists_session.plan
+            else {
+                panic!("finite early-match exists session did not retain K0");
+            };
+            let class_index = mandatory_suffix_exists_state.class_for(window_size_class);
+            assert_eq!(
+                mandatory_suffix_exists_state.classes[class_index].disabled_calls,
+                0,
+            );
+            assert!(!k0_finite_suffix_incumbent_single_pass_negative(
+                &mandatory_suffix_exists_state.classes[class_index],
+            ));
+            assert_eq!(
+                *negative_prefilter_exists_state,
+                K0NegativePrefilterState::default(),
+            );
+        }
+        assert!(
+            exists_session
+                .is_match_window_value(
+                    &haystack,
+                    SearchWindow::full(&haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+        );
+        let negative_exists_after_probe = {
+            let PortableSearchSessionPlan::K0 {
+                mandatory_suffix_exists_state,
+                negative_prefilter_exists_state,
+                ..
+            } = &mut exists_session.plan
+            else {
+                panic!("finite early-match exists session did not retain K0");
+            };
+            let class_index = mandatory_suffix_exists_state.class_for(window_size_class);
+            assert_ne!(
+                mandatory_suffix_exists_state.classes[class_index].disabled_calls,
+                0,
+            );
+            *negative_prefilter_exists_state
+        };
+        assert!(
+            exists_session
+                .is_match_window_value(
+                    &haystack,
+                    SearchWindow::full(&haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+        );
+        let PortableSearchSessionPlan::K0 {
+            mandatory_suffix_exists_state,
+            negative_prefilter_exists_state,
+            ..
+        } = &mut exists_session.plan
+        else {
+            panic!("finite early-match exists session did not retain K0");
+        };
+        let class_index = mandatory_suffix_exists_state.class_for(window_size_class);
+        assert_eq!(
+            mandatory_suffix_exists_state.classes[class_index].disabled_calls,
+            0,
+        );
+        assert_eq!(
+            *negative_prefilter_exists_state,
+            negative_exists_after_probe,
+            "the direct backoff route should not enter the negative prefilter",
+        );
+    }
+
+    #[test]
+    fn finite_k0_suffix_recovers_global_start_before_ordered_forward_replay() {
+        const PREFIX: usize = 16_384;
+        let pattern = r"(?-u:(?:[abZ]{5}|b)Z)";
+        let regex = PortableBuilder::new(pattern)
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .expect("finite suffix fixture builds through K0");
+        let PortablePlan::K0(plan) = &regex.plan else {
+            panic!("forced finite suffix fixture did not retain K0");
+        };
+        let suffix = plan
+            .mandatory_suffix
+            .as_ref()
+            .expect("finite one-byte suffix is retained");
+        assert_eq!(suffix.needle(), b"Z");
+        assert_eq!(suffix.finite_maximum_match_bytes(), Some(6));
+        assert!(suffix.finite_prefix_hedge_bytes().is_some());
+
+        let mut haystack = vec![b'x'; PREFIX];
+        haystack.extend_from_slice(b"abZaaZ");
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("finite suffix session constructs");
+        {
+            let PortableSearchSessionPlan::K0 {
+                session: k0_session,
+                mandatory_suffix: Some(session_suffix),
+                ..
+            } = &mut session.plan
+            else {
+                panic!("finite suffix session did not retain its K0 sidecar");
+            };
+            let window = SearchWindow::full(&haystack);
+            let window_bytes = window.end().checked_sub(window.start()).unwrap();
+            let window_size_class = usize::BITS - window_bytes.leading_zeros();
+            let mut suffix_state = K0NegativePrefilterState::default();
+            let class_index = suffix_state.class_for(window_size_class);
+            observe_k0_finite_suffix_incumbent(
+                &mut suffix_state,
+                class_index,
+                true,
+                K0NegativePrefilterOutcome::Present,
+                None,
+                window,
+            );
+            let attempt = try_k0_mandatory_suffix_span_start(
+                k0_session,
+                session_suffix,
+                suffix_state,
+                &haystack,
+                window,
+                SearchLimits::unlimited(),
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                attempt.outcome,
+                K0MandatorySuffixSpanOutcome::ProvedStart {
+                    start: PREFIX,
+                    maximum_match_bytes: 6,
+                },
+            );
+
+            let mut sparse_state = K0NegativePrefilterState::default();
+            let sparse_class_index = sparse_state.class_for(window_size_class);
+            observe_k0_finite_suffix_incumbent(
+                &mut sparse_state,
+                sparse_class_index,
+                true,
+                K0NegativePrefilterOutcome::Present,
+                None,
+                window,
+            );
+            let sparse_attempt = try_k0_mandatory_suffix_span_start(
+                k0_session,
+                session_suffix,
+                sparse_state,
+                &haystack,
+                window,
+                SearchLimits::unlimited(),
+                Some(PREFIX),
+            )
+            .unwrap();
+            assert_eq!(
+                sparse_attempt.outcome,
+                K0MandatorySuffixSpanOutcome::Fallback,
+            );
+        }
+        assert_eq!(
+            session
+                .find_window_value(
+                    &haystack,
+                    SearchWindow::full(&haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            Some(Match {
+                start: PREFIX,
+                end: PREFIX + 6,
+            }),
+        );
+        assert_eq!(
+            session
+                .find_window_value(
+                    &haystack,
+                    SearchWindow::new(PREFIX + 1, haystack.len()),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            Some(Match {
+                start: PREFIX + 1,
+                end: PREFIX + 3,
+            }),
+        );
+        assert_eq!(
+            session
+                .find_window_value(
+                    &haystack,
+                    SearchWindow::new(0, PREFIX + 2),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            None,
+        );
+    }
+
+    #[test]
+    fn finite_k0_suffix_replay_preserves_greedy_and_lazy_endpoint_priority() {
+        let mut haystack = vec![b'x'; 1_300];
+        haystack.extend_from_slice(b"aZaaZ");
+        for (pattern, expected_end) in [
+            (r"(?-u:[aZ]{1,4}Z)", 1_305),
+            (r"(?-u:[aZ]{1,4}?Z)", 1_302),
+        ] {
+            let regex = PortableBuilder::new(pattern)
+                .unicode(false)
+                .plan_selection(PlanSelection::ForceK0)
+                .build()
+                .expect("finite suffix priority fixture builds through K0");
+            let mut session = regex
+                .search_session(SearchSessionLimits::unlimited())
+                .expect("finite suffix priority session constructs");
+            assert_eq!(
+                session
+                    .find_window_value(
+                        &haystack,
+                        SearchWindow::full(&haystack),
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap(),
+                Some(Match {
+                    start: 1_300,
+                    end: expected_end,
+                }),
+                "pattern={pattern:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn finite_k0_suffix_retains_no_start_across_same_address_mutation() {
+        let regex = PortableBuilder::new(r"(?-u:[aZ]{1,4}Z)")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .expect("finite suffix mutation fixture builds through K0");
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("finite suffix mutation session constructs");
+        let mut haystack = vec![b'x'; 2_048];
+        let address = haystack.as_ptr();
+        haystack[1_500..1_505].copy_from_slice(b"aZaaZ");
+        assert_eq!(
+            session
+                .find_window_value(
+                    &haystack,
+                    SearchWindow::full(&haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            Some(Match {
+                start: 1_500,
+                end: 1_505,
+            }),
+        );
+
+        haystack[1_500..1_505].copy_from_slice(b"xxxxx");
+        assert_eq!(haystack.as_ptr(), address);
+        assert_eq!(
+            session
+                .find_window_value(
+                    &haystack,
+                    SearchWindow::full(&haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            None,
+        );
+
+        haystack[1_200..1_205].copy_from_slice(b"aZaaZ");
+        assert_eq!(haystack.as_ptr(), address);
+        assert_eq!(
+            session
+                .find_window_value(
+                    &haystack,
+                    SearchWindow::full(&haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            Some(Match {
+                start: 1_200,
+                end: 1_205,
+            }),
+        );
+    }
+
+    #[test]
+    fn finite_k0_suffix_last_rejected_candidate_is_absent_in_retained_session() {
+        let regex = PortableBuilder::new(r"(?-u:\b(?:ab|ac){0,5}Z\b)")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .expect("finite boundary suffix fixture builds through K0");
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("finite boundary suffix session constructs");
+        let mut haystack = vec![b'a'; 2_048];
+        let haystack_end = haystack.len();
+        haystack[haystack_end - 1] = b'Z';
+
+        assert_eq!(
+            regex
+                .find_at_value(&haystack, 0, SearchLimits::unlimited())
+                .unwrap(),
+            None,
+        );
+        {
+            let PortableSearchSessionPlan::K0 {
+                mandatory_suffix_span_state,
+                ..
+            } = &mut session.plan
+            else {
+                panic!("finite boundary suffix session did not retain K0");
+            };
+            let window_size_class = usize::BITS - haystack.len().leading_zeros();
+            let class_index = mandatory_suffix_span_state.class_for(window_size_class);
+            observe_k0_finite_suffix_incumbent(
+                mandatory_suffix_span_state,
+                class_index,
+                true,
+                K0NegativePrefilterOutcome::Present,
+                None,
+                SearchWindow::full(&haystack),
+            );
+        }
+        // The only suffix is the final byte. Its trailing boundary succeeds,
+        // but its leading boundary does not: the preceding `a` is also a word
+        // byte. Rejecting that last candidate advances exactly to the window
+        // end and must publish an ordinary completed-negative result.
+        assert_eq!(
+            session
+                .find_at_value(&haystack, 0, SearchLimits::unlimited())
+                .unwrap(),
+            None,
+        );
+
+        let address = haystack.as_ptr();
+        haystack[haystack_end - 4..haystack_end].copy_from_slice(b"!abZ");
+        assert_eq!(haystack.as_ptr(), address);
+        assert_eq!(
+            session
+                .find_at_value(&haystack, 0, SearchLimits::unlimited())
+                .unwrap(),
+            Some(Match {
+                start: haystack_end - 3,
+                end: haystack_end,
+            }),
+        );
     }
 
     #[test]

@@ -3322,6 +3322,26 @@ pub enum K0PositiveEndOutcome {
     Declined,
 }
 
+/// Exact result of recovering the earliest positive match start for one end.
+///
+/// The start is earliest only inside the verifier window supplied by the
+/// caller. A facade that narrows that window from a separately proved maximum
+/// match width may therefore promote it to a global start proof for that
+/// endpoint.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum K0PositiveEndStartOutcome {
+    /// At least one positive-width match ends at the requested boundary.
+    Matched {
+        /// Earliest matching start inside the supplied verifier window.
+        start: usize,
+    },
+    /// No positive-width match in the supplied window ends there.
+    Rejected,
+    /// An optional reverse tier or a private verifier limit was unavailable.
+    Declined,
+}
+
 /// Work and source reads actually completed by one endpoint verification.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3357,6 +3377,39 @@ impl K0PositiveEndReceipt {
 pub struct K0PositiveEndVerification {
     outcome: K0PositiveEndOutcome,
     receipt: K0PositiveEndReceipt,
+}
+
+/// Typed earliest-start result paired with its exact verifier receipt.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct K0PositiveEndStartVerification {
+    outcome: K0PositiveEndStartOutcome,
+    receipt: K0PositiveEndReceipt,
+}
+
+impl K0PositiveEndStartVerification {
+    const fn new(
+        outcome: K0PositiveEndStartOutcome,
+        work: u64,
+        reverse_source_bytes: usize,
+    ) -> Self {
+        Self {
+            outcome,
+            receipt: K0PositiveEndReceipt::new(work, reverse_source_bytes),
+        }
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn outcome(self) -> K0PositiveEndStartOutcome {
+        self.outcome
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn receipt(self) -> K0PositiveEndReceipt {
+        self.receipt
+    }
 }
 
 impl K0PositiveEndVerification {
@@ -3770,6 +3823,28 @@ impl<'a> K0SearchSession<'a> {
             .is_ok()
     }
 
+    /// Whether the retained ordinary start proof uses a small byte scanner.
+    ///
+    /// This source-only query neither derives nor publishes a proof. A false
+    /// result therefore includes a cold or unavailable proof as well as every
+    /// wider scanner shape. Callers combine it with one completed incumbent
+    /// receipt before treating an exact negative sidecar as redundant.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn negative_terminal_has_small_start_scanner(&self) -> bool {
+        self.automaton
+            .start_filter_proof
+            .get()
+            .and_then(|proof| proof.scanner.as_ref())
+            .is_some_and(|scanner| {
+                matches!(
+                    scanner.scanner,
+                    StartScanner::One(_) | StartScanner::Two(_, _) | StartScanner::Three(_, _, _)
+                )
+            })
+    }
+
     /// Whether this exact session can run the private positive-end verifier.
     #[doc(hidden)]
     #[must_use]
@@ -3926,8 +4001,9 @@ impl<'a> K0SearchSession<'a> {
         }
 
         let mut reverse_source_bytes = 0usize;
+        let mut ignored_earliest_start = None;
         let execution = if self.capabilities.contextual {
-            execute_positive_end_context_reverse_loop(
+            execute_positive_end_context_reverse_loop::<false>(
                 self.automaton,
                 haystack,
                 window.start(),
@@ -3936,9 +4012,10 @@ impl<'a> K0SearchSession<'a> {
                 &mut meter,
                 limits.max_reverse_bytes,
                 &mut reverse_source_bytes,
+                &mut ignored_earliest_start,
             )
         } else {
-            execute_positive_end_reverse_lazy_loop(
+            execute_positive_end_reverse_lazy_loop::<false>(
                 self.automaton,
                 haystack,
                 window.start(),
@@ -3947,6 +4024,7 @@ impl<'a> K0SearchSession<'a> {
                 &mut meter,
                 limits.max_reverse_bytes,
                 &mut reverse_source_bytes,
+                &mut ignored_earliest_start,
             )
         };
         let outcome = match execution {
@@ -3963,6 +4041,186 @@ impl<'a> K0SearchSession<'a> {
             Err(error) => return Err(error),
         };
         Ok(K0PositiveEndVerification::new(
+            outcome,
+            meter.consumed,
+            reverse_source_bytes,
+        ))
+    }
+
+    /// Recover the earliest positive match start for one exact endpoint.
+    ///
+    /// This verifier differs from [`Self::try_positive_match_ending_at`] only
+    /// in continuing through the complete reverse frontier after the first
+    /// accepting start. The returned start is therefore earliest within
+    /// `window`. A caller may use a smaller window only when a separate proof,
+    /// such as a finite maximum match width derived from the same immutable
+    /// plan, rules out every earlier start.
+    ///
+    /// `Declined` is transactional in the same sense as the endpoint-only
+    /// verifier: no partial start is published when either private cap is
+    /// reached, and later ordinary searches remain authoritative.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] for an invalid window or endpoint, an automaton
+    /// binding mismatch, or an internal checked failure unrelated to the
+    /// private verifier limits.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "validation, private-cap decline, and exact receipts form one transaction"
+    )]
+    #[inline(never)]
+    pub fn try_earliest_start_ending_at(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+        endpoint: usize,
+        limits: K0PositiveEndLimits,
+    ) -> Result<K0PositiveEndStartVerification, SearchError> {
+        validate_window(haystack, window)?;
+        if endpoint < window.start() || endpoint > window.end() {
+            return Err(SearchError::InvalidResumeState {
+                detail: "positive endpoint is outside the earliest-start verifier window",
+            });
+        }
+        if self.workspace.bound_automaton_identity != self.automaton.identity() {
+            return Err(SearchError::InvalidResumeState {
+                detail: "positive-end verifier workspace belongs to another automaton",
+            });
+        }
+        if endpoint == window.start() {
+            return Ok(K0PositiveEndStartVerification::new(
+                K0PositiveEndStartOutcome::Rejected,
+                0,
+                0,
+            ));
+        }
+        if !self.capabilities.reverse || !self.workspace.reverse.is_allocated() {
+            return Ok(K0PositiveEndStartVerification::new(
+                K0PositiveEndStartOutcome::Declined,
+                0,
+                0,
+            ));
+        }
+        if !self.workspace.reverse.is_bound_to(self.automaton) {
+            return Err(SearchError::InvalidResumeState {
+                detail: "positive-end verifier requires a bound bidirectional workspace",
+            });
+        }
+
+        let reverse_window = SearchWindow::new(window.start(), endpoint);
+        let scratch_bytes = self.workspace.retained_bytes;
+        let mut setup = SetupAccounting::empty(scratch_bytes, true);
+        let search_limits = SearchLimits {
+            max_work: limits.max_work,
+            max_scratch_bytes: scratch_bytes,
+        };
+        let mut meter = match prepare_resume_invocation(
+            self.automaton,
+            &mut self.workspace,
+            reverse_window,
+            search_limits,
+            &mut setup,
+            false,
+            true,
+        ) {
+            Ok((meter, _)) => meter,
+            Err(SearchError::WorkLimitExceeded {
+                limit, consumed, ..
+            }) if limit == limits.max_work => {
+                return Ok(K0PositiveEndStartVerification::new(
+                    K0PositiveEndStartOutcome::Declined,
+                    consumed,
+                    0,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+
+        if !self.capabilities.contextual {
+            match prepare_reverse_lazy(
+                self.automaton,
+                &mut self.workspace,
+                &mut meter,
+                0,
+                endpoint,
+            ) {
+                Ok(true) => {}
+                Ok(false) => {
+                    let outcome = if self.workspace.reverse.declined {
+                        K0PositiveEndStartOutcome::Rejected
+                    } else {
+                        K0PositiveEndStartOutcome::Declined
+                    };
+                    return Ok(K0PositiveEndStartVerification::new(
+                        outcome,
+                        meter.consumed,
+                        0,
+                    ));
+                }
+                Err(SearchError::WorkLimitExceeded {
+                    limit, consumed, ..
+                }) if limit == limits.max_work => {
+                    return Ok(K0PositiveEndStartVerification::new(
+                        K0PositiveEndStartOutcome::Declined,
+                        consumed,
+                        0,
+                    ));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        let mut reverse_source_bytes = 0usize;
+        let mut earliest_start = None;
+        let execution = if self.capabilities.contextual {
+            execute_positive_end_context_reverse_loop::<true>(
+                self.automaton,
+                haystack,
+                window.start(),
+                endpoint,
+                &mut self.workspace,
+                &mut meter,
+                limits.max_reverse_bytes,
+                &mut reverse_source_bytes,
+                &mut earliest_start,
+            )
+        } else {
+            execute_positive_end_reverse_lazy_loop::<true>(
+                self.automaton,
+                haystack,
+                window.start(),
+                endpoint,
+                &mut self.workspace,
+                &mut meter,
+                limits.max_reverse_bytes,
+                &mut reverse_source_bytes,
+                &mut earliest_start,
+            )
+        };
+        let outcome = match execution {
+            Ok(K0PositiveEndOutcome::Matched) => {
+                K0PositiveEndStartOutcome::Matched {
+                    start: earliest_start.ok_or(SearchError::InternalInvariant {
+                        detail: "earliest-start verifier matched without retaining a start",
+                    })?,
+                }
+            }
+            Ok(K0PositiveEndOutcome::Rejected) => K0PositiveEndStartOutcome::Rejected,
+            Ok(K0PositiveEndOutcome::Declined) => K0PositiveEndStartOutcome::Declined,
+            Err(SearchError::WorkLimitExceeded {
+                limit, consumed, ..
+            }) if limit == limits.max_work => {
+                return Ok(K0PositiveEndStartVerification::new(
+                    K0PositiveEndStartOutcome::Declined,
+                    consumed,
+                    reverse_source_bytes,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(K0PositiveEndStartVerification::new(
             outcome,
             meter.consumed,
             reverse_source_bytes,
@@ -4080,6 +4338,36 @@ impl<'a> K0SearchSession<'a> {
             self.capabilities,
         )
         .map(|report| report.found.map(MatchSpan::end))
+    }
+
+    /// Select the ordered endpoint for one caller-proved globally earliest
+    /// matching start.
+    ///
+    /// The caller must prove both that `window.start()` begins a match and
+    /// that no match begins earlier in its original search range. The window
+    /// end may be narrowed by an exact maximum-width proof tied to this same
+    /// immutable automaton. Assertions still inspect the complete haystack.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] for an invalid window, a workspace binding or
+    /// hard-limit failure, or an execution error. A false matching-start proof
+    /// violates this facade-only method's precondition.
+    #[doc(hidden)]
+    pub fn search_proved_exact_start_selected_end_value(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<Option<usize>, SearchError> {
+        validate_window(haystack, window)?;
+        search_prevalidated_proved_exact_start_selected_end_value_with_authenticated_workspace(
+            self.automaton,
+            haystack,
+            window,
+            &mut self.workspace,
+            limits,
+        )
     }
 
     /// Project one authenticated warm Span without report construction.
@@ -12115,7 +12403,7 @@ fn build_positive_end_inline_transition(
     reason = "the verifier keeps its immutable source, private caps, and exact receipt explicit"
 )]
 #[inline(never)]
-fn execute_positive_end_reverse_lazy_loop(
+fn execute_positive_end_reverse_lazy_loop<const COMPLETE_FRONTIER: bool>(
     automaton: &Automaton,
     haystack: &[u8],
     window_start: usize,
@@ -12124,6 +12412,7 @@ fn execute_positive_end_reverse_lazy_loop(
     meter: &mut WorkMeter,
     max_reverse_bytes: usize,
     reverse_source_bytes: &mut usize,
+    earliest_start: &mut Option<usize>,
 ) -> Result<K0PositiveEndOutcome, SearchError> {
     if !workspace.reverse.initialized {
         return Err(SearchError::InternalInvariant {
@@ -12200,14 +12489,26 @@ fn execute_positive_end_reverse_lazy_loop(
             }
         };
         if reaches_start {
-            return Ok(K0PositiveEndOutcome::Matched);
+            if COMPLETE_FRONTIER {
+                *earliest_start = Some(source);
+            } else {
+                return Ok(K0PositiveEndOutcome::Matched);
+            }
         }
         let Some(next) = next else {
-            return Ok(K0PositiveEndOutcome::Rejected);
+            return Ok(if COMPLETE_FRONTIER && earliest_start.is_some() {
+                K0PositiveEndOutcome::Matched
+            } else {
+                K0PositiveEndOutcome::Rejected
+            });
         };
         state = next;
     }
-    Ok(K0PositiveEndOutcome::Rejected)
+    Ok(if COMPLETE_FRONTIER && earliest_start.is_some() {
+        K0PositiveEndOutcome::Matched
+    } else {
+        K0PositiveEndOutcome::Rejected
+    })
 }
 
 #[allow(
@@ -12215,7 +12516,7 @@ fn execute_positive_end_reverse_lazy_loop(
     reason = "the contextual verifier keeps its immutable source, private cap, and exact receipt explicit"
 )]
 #[inline(never)]
-fn execute_positive_end_context_reverse_loop(
+fn execute_positive_end_context_reverse_loop<const COMPLETE_FRONTIER: bool>(
     automaton: &Automaton,
     haystack: &[u8],
     window_start: usize,
@@ -12224,6 +12525,7 @@ fn execute_positive_end_context_reverse_loop(
     meter: &mut WorkMeter,
     max_reverse_bytes: usize,
     reverse_source_bytes: &mut usize,
+    earliest_start: &mut Option<usize>,
 ) -> Result<K0PositiveEndOutcome, SearchError> {
     let assertions = enabled_assertion_mask(automaton, haystack, endpoint, meter)?;
     let Some(mut state) = context_reverse_initial(
@@ -12293,14 +12595,26 @@ fn execute_positive_end_context_reverse_loop(
             }
         };
         if reaches_start {
-            return Ok(K0PositiveEndOutcome::Matched);
+            if COMPLETE_FRONTIER {
+                *earliest_start = Some(source);
+            } else {
+                return Ok(K0PositiveEndOutcome::Matched);
+            }
         }
         let Some(next) = next else {
-            return Ok(K0PositiveEndOutcome::Rejected);
+            return Ok(if COMPLETE_FRONTIER && earliest_start.is_some() {
+                K0PositiveEndOutcome::Matched
+            } else {
+                K0PositiveEndOutcome::Rejected
+            });
         };
         state = next;
     }
-    Ok(K0PositiveEndOutcome::Rejected)
+    Ok(if COMPLETE_FRONTIER && earliest_start.is_some() {
+        K0PositiveEndOutcome::Matched
+    } else {
+        K0PositiveEndOutcome::Rejected
+    })
 }
 
 fn execute_reverse_lazy_loop(
@@ -16633,9 +16947,9 @@ mod tests {
             START_FILTER_PROBE_SELECTION_WORK, START_FILTER_SCANNER_SELECTION_WORK,
         },
         Automaton, CompileLimits, EarliestEnd, EdgeKind, Exists, K0PositiveEndLimits,
-        K0PositiveEndOutcome, K0ResumeSet, K0SearchSession, K0SpanSourceCursor, K0Workspace,
-        MatchSpan, OutputContract, RawPlan, ResourceKind, SearchError, SearchLimits, SearchWindow,
-        SelectedEnd, Span, StateRole, WorkspaceLimits,
+        K0PositiveEndOutcome, K0PositiveEndStartOutcome, K0ResumeSet, K0SearchSession,
+        K0SpanSourceCursor, K0Workspace, MatchSpan, OutputContract, RawPlan, ResourceKind,
+        SearchError, SearchLimits, SearchWindow, SelectedEnd, Span, StateRole, WorkspaceLimits,
     };
 
     fn ascii_literal(byte: u8) -> Automaton {
@@ -36001,6 +36315,97 @@ mod tests {
                 plan.conservative_reused_work_bound(input_bytes).is_ok()
             );
         }
+    }
+
+    #[test]
+    fn completed_incumbent_publishes_small_start_scanner_fact() {
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b')]);
+        let haystack = b"xxxxxxxx";
+        let window = SearchWindow::full(haystack);
+        let mut session =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true).unwrap();
+
+        assert!(!session.negative_terminal_has_small_start_scanner());
+        let report = session
+            .search_window::<Exists>(haystack, window, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(report.output(), &false);
+        assert_eq!(report.accounting().boundaries(), 0);
+        assert!(session.negative_terminal_has_small_start_scanner());
+
+        let wider = ascii_root_bytes(&[b'a', b'b', b'c', b'd']);
+        let mut wider_session =
+            K0SearchSession::new_selected(&wider, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+        let wider_report = wider_session
+            .search_window::<Exists>(haystack, window, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(wider_report.output(), &false);
+        assert_eq!(wider_report.accounting().boundaries(), 0);
+        assert!(!wider_session.negative_terminal_has_small_start_scanner());
+    }
+
+    #[test]
+    fn positive_end_earliest_start_verifier_completes_the_bounded_reverse_window() {
+        let plan = greedy_a_plus_or_a();
+        let haystack = b"aaaa";
+        let window = SearchWindow::full(haystack);
+        let mut session =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true).unwrap();
+
+        let endpoint_only = session
+            .try_positive_match_ending_at(
+                haystack,
+                window,
+                haystack.len(),
+                K0PositiveEndLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(endpoint_only.outcome(), K0PositiveEndOutcome::Matched);
+        assert_eq!(endpoint_only.receipt().reverse_source_bytes(), 1);
+
+        let complete = session
+            .try_earliest_start_ending_at(
+                haystack,
+                window,
+                haystack.len(),
+                K0PositiveEndLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(
+            complete.outcome(),
+            K0PositiveEndStartOutcome::Matched { start: 0 }
+        );
+        assert_eq!(complete.receipt().reverse_source_bytes(), haystack.len());
+
+        let clipped = session
+            .try_earliest_start_ending_at(
+                haystack,
+                SearchWindow::new(2, haystack.len()),
+                haystack.len(),
+                K0PositiveEndLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(
+            clipped.outcome(),
+            K0PositiveEndStartOutcome::Matched { start: 2 }
+        );
+        assert_eq!(clipped.receipt().reverse_source_bytes(), 2);
+
+        let capped = session
+            .try_earliest_start_ending_at(
+                haystack,
+                window,
+                haystack.len(),
+                K0PositiveEndLimits::new(u64::MAX, haystack.len() - 1),
+            )
+            .unwrap();
+        assert_eq!(capped.outcome(), K0PositiveEndStartOutcome::Declined);
+        assert_eq!(capped.receipt().reverse_source_bytes(), haystack.len() - 1);
+        assert!(session
+            .search::<Exists>(haystack, SearchLimits::unlimited())
+            .unwrap()
+            .into_output());
     }
 
     #[test]
