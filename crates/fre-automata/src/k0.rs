@@ -2931,38 +2931,19 @@ impl<'a> K0SearchSession<'a> {
         window: SearchWindow,
         limits: SearchLimits,
     ) -> Result<bool, SearchError> {
-        if limits == SearchLimits::unlimited()
-            && self.capabilities.lazy
-            && !self.capabilities.contextual
-            && self.workspace.lazy.is_bound_to(self.automaton)
-            && self.workspace.lazy.initialized
-            && !self.workspace.lazy.declined
-            && !self.workspace.lazy.saturated
-        {
-            if let Some(proof) = self.automaton.start_filter_proof.get() {
-                let nullable_initial = matches!(
-                    self.workspace.lazy.initial_kind,
-                    LazyInitialKind::NullablePrefix | LazyInitialKind::NullableTerminal
-                );
-                // Assertion-free plans cannot require absolute haystack start,
-                // and their start proof must agree with the exact lazy initial
-                // closure about nullability. Keep both planner invariants local
-                // to this report-free executor instead of relying on its caller.
-                if !proof.force_haystack_start && proof.relaxed_nullable == nullable_initial {
-                    validate_window(haystack, window)?;
-                    if let Some(found) = try_warm_direct_exists(
-                        haystack,
-                        window,
-                        &self.workspace.lazy,
-                        proof,
-                    )? {
-                        return Ok(found);
-                    }
-                }
-            }
+        validate_window(haystack, window)?;
+        if let Some(found) = try_authenticated_warm_exists_value(
+            self.automaton,
+            haystack,
+            window,
+            &self.workspace,
+            limits,
+            self.capabilities,
+        )? {
+            return Ok(found);
         }
 
-        execute_bound(
+        execute_bound_prevalidated(
             self.automaton,
             haystack,
             window,
@@ -3005,6 +2986,45 @@ impl<'a> K0SearchSession<'a> {
             &mut self.span_start_proof,
         )
     }
+}
+
+/// Try the immutable, already-filled direct rows for one authenticated value
+/// call. Returning `None` is a transactional decline: neither the retained
+/// rows nor invocation scratch have been changed, so the ordinary executor
+/// can restart from the original window.
+fn try_authenticated_warm_exists_value(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &K0Workspace,
+    limits: SearchLimits,
+    capabilities: LazyCapabilities,
+) -> Result<Option<bool>, SearchError> {
+    if limits != SearchLimits::unlimited()
+        || !capabilities.lazy
+        || capabilities.contextual
+        || !workspace.lazy.is_bound_to(automaton)
+        || !workspace.lazy.initialized
+        || workspace.lazy.declined
+        || workspace.lazy.saturated
+    {
+        return Ok(None);
+    }
+    let Some(proof) = automaton.start_filter_proof.get() else {
+        return Ok(None);
+    };
+    let nullable_initial = matches!(
+        workspace.lazy.initial_kind,
+        LazyInitialKind::NullablePrefix | LazyInitialKind::NullableTerminal
+    );
+    // Assertion-free plans cannot require absolute haystack start, and their
+    // start proof must agree with the exact lazy initial closure about
+    // nullability. Keep both planner invariants local to this report-free
+    // executor instead of relying on either facade.
+    if proof.force_haystack_start || proof.relaxed_nullable != nullable_initial {
+        return Ok(None);
+    }
+    try_warm_direct_exists(haystack, window, &workspace.lazy, proof)
 }
 
 /// Outcome of scanning the bounded inline candidate prefix.
@@ -3562,6 +3582,50 @@ pub(crate) fn search_prevalidated_window_with_authenticated_workspace(
         contract,
         workspace.bound_capabilities,
     )
+}
+
+pub(crate) fn search_prevalidated_exists_value_with_authenticated_workspace(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    limits: SearchLimits,
+) -> Result<bool, SearchError> {
+    if workspace.bound_automaton_identity != automaton.identity() {
+        // A semantic clone does not share the facade's exact-automaton proof.
+        // Preserve the complete public validation and accounting path before
+        // projecting its value.
+        return search_with_workspace(
+            automaton,
+            haystack,
+            window,
+            workspace,
+            limits,
+            OutputContract::Exists,
+        )
+        .map(|report| report.found.is_some());
+    }
+    debug_assert!(validate_window(haystack, window).is_ok());
+    if let Some(found) = try_authenticated_warm_exists_value(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        limits,
+        workspace.bound_capabilities,
+    )? {
+        return Ok(found);
+    }
+    execute_bound_prevalidated(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        limits,
+        OutputContract::Exists,
+        workspace.bound_capabilities,
+    )
+    .map(|report| report.found.is_some())
 }
 
 pub(crate) fn search_prevalidated_exact_start_with_authenticated_workspace(
@@ -22322,6 +22386,83 @@ mod tests {
         ));
         assert_eq!(session.workspace.generation, before_invalid_generation);
         assert_eq!(session.workspace.lazy.rows, before_invalid_rows);
+    }
+
+    #[test]
+    fn authenticated_exists_value_bridge_reuses_warm_rows_transactionally() {
+        let plan = byte_chain(&[
+            (b'A', b'Z'),
+            (b'a', b'z'),
+            (b'a', b'z'),
+            (b'0', b'9'),
+        ]);
+        let haystack = b"........Abc7........";
+        let window = SearchWindow::full(haystack);
+        let mut workspace =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let prepared = plan.prepare::<Exists>();
+        let expected = prepared
+            .search_prevalidated_window_with_authenticated_workspace(
+                haystack,
+                window,
+                &mut workspace,
+                SearchLimits::unlimited(),
+            )
+            .unwrap()
+            .into_output();
+        let generation = workspace.generation;
+        let rows = workspace.lazy.rows.clone();
+
+        assert_eq!(
+            prepared
+                .search_prevalidated_exists_value_with_authenticated_workspace(
+                    haystack,
+                    window,
+                    &mut workspace,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            expected,
+        );
+        assert_eq!(workspace.generation, generation);
+        assert_eq!(workspace.lazy.rows, rows);
+
+        let measured = prepared
+            .search_prevalidated_window_with_authenticated_workspace(
+                haystack,
+                window,
+                &mut workspace,
+                SearchLimits::unlimited(),
+            )
+            .unwrap()
+            .accounting()
+            .work();
+        assert_eq!(
+            prepared
+                .search_prevalidated_exists_value_with_authenticated_workspace(
+                    haystack,
+                    window,
+                    &mut workspace,
+                    SearchLimits {
+                        max_work: measured,
+                        max_scratch_bytes: usize::MAX,
+                    },
+                )
+                .unwrap(),
+            expected,
+        );
+        assert!(matches!(
+            prepared.search_prevalidated_exists_value_with_authenticated_workspace(
+                haystack,
+                window,
+                &mut workspace,
+                SearchLimits {
+                    max_work: measured.checked_sub(1).unwrap(),
+                    max_scratch_bytes: usize::MAX,
+                },
+            ),
+            Err(SearchError::WorkLimitExceeded { .. })
+        ));
     }
 
     #[test]

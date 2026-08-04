@@ -589,6 +589,35 @@ impl<O: Operation> TypedPlan<'_, O> {
     }
 }
 
+impl TypedPlan<'_, Exists> {
+    /// Return only existence through a caller-validated, authenticated
+    /// workspace. Unlimited warm calls may read immutable completed lazy rows
+    /// without constructing accounting that this value-only facade discards.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same contract as
+    /// [`TypedPlan::search_prevalidated_window_with_authenticated_workspace`].
+    /// Supplying an invalid window violates this facade-only entry's
+    /// precondition.
+    #[doc(hidden)]
+    pub fn search_prevalidated_exists_value_with_authenticated_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut K0Workspace,
+        limits: SearchLimits,
+    ) -> Result<bool, SearchError> {
+        crate::k0::search_prevalidated_exists_value_with_authenticated_workspace(
+            self.automaton,
+            haystack,
+            window,
+            workspace,
+            limits,
+        )
+    }
+}
+
 impl TypedPlan<'_, Span> {
     /// Recover a span from one already authenticated selected endpoint.
     ///

@@ -3764,10 +3764,9 @@ impl CompiledProgram {
                 let found = self
                     .automaton
                     .prepare::<Exists>()
-                    .search_prevalidated_window_with_authenticated_workspace(
+                    .search_prevalidated_exists_value_with_authenticated_workspace(
                         haystack, window, workspace, limits,
-                    )?
-                    .into_output();
+                    )?;
                 Ok(MatchResult::Exists(found))
             }
             OutputContract::SelectedEnd => {
