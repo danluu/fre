@@ -3771,20 +3771,18 @@ impl CompiledProgram {
                 let found = self
                     .automaton
                     .prepare::<SelectedEnd>()
-                    .search_prevalidated_window_with_authenticated_workspace(
+                    .search_prevalidated_selected_end_value_with_authenticated_workspace(
                         haystack, window, workspace, limits,
-                    )?
-                    .into_output();
+                    )?;
                 Ok(MatchResult::SelectedEnd(found))
             }
             OutputContract::Span => {
                 let found = if let Some(width) = self.exact_match_width {
                     self.automaton
                         .prepare::<SelectedEnd>()
-                        .search_prevalidated_window_with_authenticated_workspace(
+                        .search_prevalidated_selected_end_value_with_authenticated_workspace(
                             haystack, window, workspace, limits,
                         )?
-                        .into_output()
                         .map(|end| {
                             end.checked_sub(width).map(|start| (start, end)).ok_or(
                                 CompileError::InternalInvariant(

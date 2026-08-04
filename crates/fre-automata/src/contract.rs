@@ -619,6 +619,36 @@ impl TypedPlan<'_, Exists> {
 }
 
 impl TypedPlan<'_, SelectedEnd> {
+    /// Return only the selected endpoint through an authenticated,
+    /// caller-validated workspace.
+    ///
+    /// An unlimited exact-identity call may read already-filled forward rows
+    /// without constructing diagnostic accounting. Every finite, cold,
+    /// contextual, unfilled, or unauthenticated case uses the ordinary
+    /// report-producing executor with unchanged error behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] for an incompatible workspace, hard-limit
+    /// refusal, or execution failure. Supplying an invalid window violates
+    /// this facade-only entry's precondition.
+    #[doc(hidden)]
+    pub fn search_prevalidated_selected_end_value_with_authenticated_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut K0Workspace,
+        limits: SearchLimits,
+    ) -> Result<Option<usize>, SearchError> {
+        crate::k0::search_prevalidated_selected_end_value_with_authenticated_workspace(
+            self.automaton,
+            haystack,
+            window,
+            workspace,
+            limits,
+        )
+    }
+
     /// Return the selected endpoint for an authenticated matching start.
     ///
     /// An unlimited exact-identity call may read already-filled forward rows
@@ -781,6 +811,27 @@ impl K0SearchSession<'_> {
         limits: SearchLimits,
     ) -> Result<bool, SearchError> {
         self.search_exists_value_untyped(haystack, window, limits)
+    }
+
+    /// Return only the selected endpoint, allowing an authenticated warm
+    /// session to omit diagnostic report construction for unlimited calls.
+    ///
+    /// Finite limits and every cold, contextual, or otherwise ineligible call
+    /// use the ordinary report-producing executor with unchanged accounting
+    /// and error precedence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] for an invalid range, a hard-limit refusal, or
+    /// execution failure.
+    #[doc(hidden)]
+    pub fn search_selected_end_value(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<Option<usize>, SearchError> {
+        self.search_selected_end_value_untyped(haystack, window, limits)
     }
 
     /// Search a complete-haystack suffix with retained source-independent
