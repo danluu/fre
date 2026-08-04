@@ -3794,10 +3794,9 @@ impl CompiledProgram {
                 } else {
                     self.automaton
                         .prepare::<Span>()
-                        .search_prevalidated_window_with_authenticated_workspace(
+                        .search_prevalidated_span_value_with_authenticated_workspace(
                             haystack, window, workspace, limits,
                         )?
-                        .into_output()
                         .map(|span| (span.start(), span.end()))
                 };
                 Ok(MatchResult::Span(found))
@@ -8343,6 +8342,39 @@ mod tests {
                 .expect("fixed-width fallback search"),
             MatchResult::Span(Some((2, 4)))
         );
+    }
+
+    #[test]
+    fn variable_width_ordered_nfa_span_reuses_the_value_only_warm_route() {
+        let compiled = program(
+            "(?:ab|ac|ad)+z",
+            OutputContract::Span,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        assert_eq!(compiled.engine_kind(), EngineKind::OrderedNfa);
+        assert_eq!(compiled.exact_match_width(), None);
+        assert!(compiled.partial_dfa().is_none());
+        let mut workspace = compiled.prepare_workspace().expect("prepare NFA workspace");
+
+        for (haystack, expected) in [
+            (b"xxacadz".as_slice(), Some((2, 7))),
+            (b"xxacady".as_slice(), None),
+        ] {
+            let window = SearchWindow::full(haystack);
+            assert_eq!(
+                compiled
+                    .search_with_workspace(haystack, window, &mut workspace)
+                    .expect("cold ordered-NFA Span search"),
+                MatchResult::Span(expected)
+            );
+            assert_eq!(
+                compiled
+                    .search_with_workspace(haystack, window, &mut workspace)
+                    .expect("warm value-only ordered-NFA Span search"),
+                MatchResult::Span(expected)
+            );
+        }
     }
 
     #[test]

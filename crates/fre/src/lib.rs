@@ -6292,9 +6292,9 @@ impl<'r> PortableSearchSession<'r> {
                 regex.find_window_value(haystack, window, limits)
             }
             PortableSearchSessionPlan::K0 { session } => session
-                .search_window::<Span>(haystack, window, limits)
-                .map(|report| {
-                    report.into_output().map(|span| Match {
+                .search_span_value(haystack, window, limits)
+                .map(|found| {
+                    found.map(|span| Match {
                         start: span.start(),
                         end: span.end(),
                     })

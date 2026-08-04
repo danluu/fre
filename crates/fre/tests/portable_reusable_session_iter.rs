@@ -3,7 +3,7 @@
 use fre::{
     Match, PlanSelection, PortableBuilder, PortableFindIterAccounting, PortableFindIterError,
     PortableFindIterRunLimits, PortableSearchSession, PortableTextBuilder, SearchLimits,
-    SearchSessionLimits,
+    SearchSessionLimits, SearchWindow,
 };
 
 fn collect_bytes(
@@ -24,6 +24,42 @@ fn spans(matches: &[Match]) -> Vec<(usize, usize)> {
         .iter()
         .map(|matched| (matched.start(), matched.end()))
         .collect()
+}
+
+#[test]
+fn reusable_k0_value_find_matches_warmed_reported_span_and_no_match() {
+    let regex = PortableBuilder::new("(?:ab|ac|ad)+z")
+        .unicode(false)
+        .plan_selection(PlanSelection::ForceK0)
+        .build()
+        .expect("portable variable-width K0");
+    let mut session = regex
+        .search_session(SearchSessionLimits::unlimited())
+        .expect("reusable bidirectional K0 session");
+    assert_eq!(session.runtime_implementation_id(), "k0");
+
+    for (haystack, expected) in [
+        (b"xxacadz".as_slice(), Some((2, 7))),
+        (b"xxacady".as_slice(), None),
+    ] {
+        let window = SearchWindow::full(haystack);
+        let reported = session
+            .find_window(haystack, window, SearchLimits::unlimited())
+            .expect("reported K0 Span")
+            .0
+            .map(|matched| (matched.start(), matched.end()));
+        assert_eq!(reported, expected);
+        let value = session
+            .find_window_value(haystack, window, SearchLimits::unlimited())
+            .expect("warmed value-only K0 Span")
+            .map(|matched| (matched.start(), matched.end()));
+        assert_eq!(value, expected);
+        let repeated = session
+            .find_value(haystack, SearchLimits::unlimited())
+            .expect("repeated value-only K0 Span")
+            .map(|matched| (matched.start(), matched.end()));
+        assert_eq!(repeated, expected);
+    }
 }
 
 #[test]

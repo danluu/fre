@@ -3011,13 +3011,13 @@ impl<'a> K0SearchSession<'a> {
 
     /// Project one authenticated warm Span without report construction.
     ///
-    /// This prototype deliberately admits only unlimited, assertion-free,
-    /// fully initialized bidirectional sessions. The optimistic transaction
-    /// borrows both DFA caches immutably: a missing forward or reverse cell
-    /// therefore declines without changing invocation scratch, cache rows, or
-    /// retained metadata. The ordinary executor then restarts from the exact
-    /// original window and remains authoritative for every finite call,
-    /// preparation, decline, and error.
+    /// Unlimited, assertion-free sessions may complete through immutable
+    /// forward rows. Reverse rows are required only when the selected endpoint
+    /// lacks scalar start provenance. A missing required cell declines without
+    /// changing invocation scratch, cache rows, or retained metadata. The
+    /// ordinary executor then restarts from the exact original window and
+    /// remains authoritative for every finite call, preparation, decline, and
+    /// error.
     pub(crate) fn search_span_value_untyped(
         &mut self,
         haystack: &[u8],
@@ -3026,16 +3026,11 @@ impl<'a> K0SearchSession<'a> {
     ) -> Result<Option<MatchSpan>, SearchError> {
         if limits == SearchLimits::unlimited()
             && self.capabilities.lazy
-            && self.capabilities.reverse
             && !self.capabilities.contextual
             && self.workspace.lazy.is_bound_to(self.automaton)
             && self.workspace.lazy.initialized
             && !self.workspace.lazy.declined
             && !self.workspace.lazy.saturated
-            && self.workspace.reverse.is_bound_to(self.automaton)
-            && self.workspace.reverse.initialized
-            && !self.workspace.reverse.declined
-            && !self.workspace.reverse.saturated
         {
             if let Some(proof) = self.automaton.start_filter_proof.get() {
                 let nullable_initial = matches!(
@@ -3044,14 +3039,15 @@ impl<'a> K0SearchSession<'a> {
                 );
                 if !proof.force_haystack_start && proof.relaxed_nullable == nullable_initial {
                     validate_window(haystack, window)?;
-                    if let Some(found) = try_warm_direct_span_with_reverse(
+                    if let WarmDirectSpan::Complete(found) = try_warm_direct_span_with_reverse(
+                        self.automaton,
                         haystack,
                         window,
                         &self.workspace.lazy,
                         &self.workspace.reverse,
                         proof,
                     )? {
-                        return Ok(Some(found.span()));
+                        return Ok(found.map(WarmDirectMatch::span));
                     }
                 }
             }
@@ -3642,17 +3638,45 @@ fn try_warm_proved_start_selected_end(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WarmDirectSpan {
+enum WarmDirectMatch {
     KnownStart(MatchSpan),
     ReverseRecovered(MatchSpan),
 }
 
-impl WarmDirectSpan {
+impl WarmDirectMatch {
     const fn span(self) -> MatchSpan {
         match self {
             Self::KnownStart(span) | Self::ReverseRecovered(span) => span,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WarmDirectSpan {
+    Declined,
+    Complete(Option<WarmDirectMatch>),
+}
+
+/// Complete a report-free warmed span while preserving unlimited-work
+/// overflow semantics. Scanner and secondary-filter work is already present
+/// in `meter`; direct forward and reverse steps are settled once at a terminal
+/// result.
+fn complete_warm_direct_span(
+    found: Option<WarmDirectMatch>,
+    meter: &WorkMeter,
+    direct_steps: usize,
+) -> Result<WarmDirectSpan, SearchError> {
+    let direct_steps =
+        u64::try_from(direct_steps).map_err(|_| SearchError::ArithmeticOverflow {
+            computation: "warm span direct-step conversion",
+        })?;
+    meter
+        .consumed
+        .checked_add(direct_steps)
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "search work counter",
+        })?;
+    Ok(WarmDirectSpan::Complete(found))
 }
 
 /// Read one complete assertion-free Span through already-filled direct rows.
@@ -3661,21 +3685,24 @@ impl WarmDirectSpan {
 /// and carries the source-provenance action authenticated in every cell. If
 /// that action cannot retain a scalar start, the reverse half begins from the
 /// exact selected endpoint and keeps the earliest start reached by its cached
-/// subset. Both caches are immutable borrows, so `None` is a transactional
-/// decline on the first unavailable cell rather than a partially learned run.
+/// subset. Both caches are immutable borrows, so [`WarmDirectSpan::Declined`]
+/// is a transactional decline on the first unavailable cell rather than a
+/// partially learned run. [`WarmDirectSpan::Complete`] authenticates either a
+/// selected match or no match without rerunning ordinary execution.
 #[allow(
     clippy::too_many_lines,
     reason = "the forward and reverse halves share one explicit read-only decline transaction"
 )]
 fn try_warm_direct_span_with_reverse(
+    automaton: &Automaton,
     haystack: &[u8],
     window: SearchWindow,
     lazy: &LazyWorkspace,
     reverse: &ReverseWorkspace,
     proof: &StartFilterProof,
-) -> Result<Option<WarmDirectSpan>, SearchError> {
-    if lazy.saturated || reverse.saturated {
-        return Ok(None);
+) -> Result<WarmDirectSpan, SearchError> {
+    if lazy.saturated {
+        return Ok(WarmDirectSpan::Declined);
     }
     let haystack = haystack
         .get(..window.end())
@@ -3686,30 +3713,30 @@ fn try_warm_direct_span_with_reverse(
         LazyInitialKind::Positive | LazyInitialKind::PositiveSingle => (false, false),
         LazyInitialKind::NullablePrefix => (true, false),
         LazyInitialKind::NullableTerminal => (true, true),
-        LazyInitialKind::Uninitialized => return Ok(None),
+        LazyInitialKind::Uninitialized => return Ok(WarmDirectSpan::Declined),
     };
+    let mut direct_steps = 0usize;
+    let mut meter = WorkMeter::new(u64::MAX, INVOCATION_RESET_WORK);
     if initial_pending && initial_terminal {
-        return Ok(Some(WarmDirectSpan::KnownStart(MatchSpan::new(
-            window.start(),
-            window.start(),
-        ))));
+        return complete_warm_direct_span(
+            Some(WarmDirectMatch::KnownStart(MatchSpan::new(
+                window.start(),
+                window.start(),
+            ))),
+            &meter,
+            direct_steps,
+        );
     }
     if lazy.initial == LAZY_NO_STATE {
-        return Ok(None);
+        return Ok(WarmDirectSpan::Declined);
     }
 
     let initial_row = direct_row_offset(lazy.initial)?;
     let mut state = initial_row;
     let mut position = window.start();
     let mut pending_end = initial_pending.then_some(window.start());
-    let mut active_start = (initial_pending
-        || matches!(
-            lazy.initial_kind,
-            LazyInitialKind::Positive | LazyInitialKind::PositiveSingle
-        ))
-    .then_some(window.start());
+    let mut active_start = Some(window.start());
     let mut pending_start = initial_pending.then_some(window.start());
-    let mut meter = WorkMeter::new(u64::MAX, INVOCATION_RESET_WORK);
     let mut retained_start_mask = RetainedStartMaskCursor::default();
     let mut adaptive_probe = AdaptiveStartProbe::default();
     let mut engine_candidate = None;
@@ -3744,7 +3771,7 @@ fn try_warm_direct_span_with_reverse(
                     &mut adaptive_probe,
                 )?;
                 if position == window.end() {
-                    return Ok(None);
+                    return complete_warm_direct_span(None, &meter, direct_steps);
                 }
                 active_start = matches!(
                     lazy.initial_kind,
@@ -3758,7 +3785,7 @@ fn try_warm_direct_span_with_reverse(
         }
         if position == window.end() {
             let Some(end) = pending_end else {
-                return Ok(None);
+                return complete_warm_direct_span(None, &meter, direct_steps);
             };
             break (end, pending_start);
         }
@@ -3775,12 +3802,17 @@ fn try_warm_direct_span_with_reverse(
             })?;
         let cell = lazy.direct_cell(state, byte)?;
         if cell == LAZY_CELL_UNFILLED {
-            return Ok(None);
+            return Ok(WarmDirectSpan::Declined);
         }
         position = position
             .checked_add(1)
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "warm Span forward position",
+            })?;
+        direct_steps = direct_steps
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "warm Span direct steps",
             })?;
         let start_action = LazyStartAction::from_direct_cell(cell);
         let next_start = match start_action {
@@ -3795,7 +3827,7 @@ fn try_warm_direct_span_with_reverse(
         let encoded = cell & LAZY_CELL_STATE_MASK;
         if encoded == 0 {
             let Some(end) = pending_end else {
-                return Ok(None);
+                return complete_warm_direct_span(None, &meter, direct_steps);
             };
             break (end, pending_start);
         }
@@ -3808,19 +3840,32 @@ fn try_warm_direct_span_with_reverse(
     };
 
     if let Some(start) = selected_start {
-        return Ok(Some(WarmDirectSpan::KnownStart(MatchSpan::new(
-            start,
-            selected_end,
-        ))));
+        return complete_warm_direct_span(
+            Some(WarmDirectMatch::KnownStart(MatchSpan::new(
+                start,
+                selected_end,
+            ))),
+            &meter,
+            direct_steps,
+        );
     }
     if selected_end == window.start() {
-        return Ok(Some(WarmDirectSpan::KnownStart(MatchSpan::new(
-            window.start(),
-            selected_end,
-        ))));
+        return complete_warm_direct_span(
+            Some(WarmDirectMatch::KnownStart(MatchSpan::new(
+                window.start(),
+                selected_end,
+            ))),
+            &meter,
+            direct_steps,
+        );
     }
-    if !reverse.initialized || reverse.initial == LAZY_NO_STATE {
-        return Ok(None);
+    if !reverse.is_bound_to(automaton)
+        || !reverse.initialized
+        || reverse.declined
+        || reverse.saturated
+        || reverse.initial == LAZY_NO_STATE
+    {
+        return Ok(WarmDirectSpan::Declined);
     }
 
     let mut state = direct_row_offset(reverse.initial)?;
@@ -3839,8 +3884,13 @@ fn try_warm_direct_span_with_reverse(
             })?;
         let cell = reverse.direct_cell(state, byte)?;
         if cell == LAZY_CELL_UNFILLED {
-            return Ok(None);
+            return Ok(WarmDirectSpan::Declined);
         }
+        direct_steps = direct_steps
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "warm Span direct steps",
+            })?;
         debug_assert_eq!(cell & (LAZY_CELL_RESTART | LAZY_CELL_START_PROPAGATE), 0);
         cursor = source;
         if cell & LAZY_CELL_ACCEPT != 0 {
@@ -3859,10 +3909,14 @@ fn try_warm_direct_span_with_reverse(
     let start = candidate.ok_or(SearchError::InternalInvariant {
         detail: "warmed reverse DFA could not recover the forward-selected span",
     })?;
-    Ok(Some(WarmDirectSpan::ReverseRecovered(MatchSpan::new(
-        start,
-        selected_end,
-    ))))
+    complete_warm_direct_span(
+        Some(WarmDirectMatch::ReverseRecovered(MatchSpan::new(
+            start,
+            selected_end,
+        ))),
+        &meter,
+        direct_steps,
+    )
 }
 
 #[allow(
@@ -4277,6 +4331,65 @@ pub(crate) fn search_prevalidated_exists_value_with_authenticated_workspace(
         workspace.bound_capabilities,
     )
     .map(|report| report.found.is_some())
+}
+
+pub(crate) fn search_prevalidated_span_value_with_authenticated_workspace(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    limits: SearchLimits,
+) -> Result<Option<MatchSpan>, SearchError> {
+    if workspace.bound_automaton_identity != automaton.identity() {
+        return search_with_workspace(
+            automaton,
+            haystack,
+            window,
+            workspace,
+            limits,
+            OutputContract::Span,
+        )
+        .map(|report| report.found);
+    }
+    debug_assert!(validate_window(haystack, window).is_ok());
+    let capabilities = workspace.bound_capabilities;
+    if limits == SearchLimits::unlimited()
+        && capabilities.lazy
+        && !capabilities.contextual
+        && workspace.lazy.is_bound_to(automaton)
+        && workspace.lazy.initialized
+        && !workspace.lazy.declined
+        && !workspace.lazy.saturated
+    {
+        if let Some(proof) = automaton.start_filter_proof.get() {
+            let nullable_initial = matches!(
+                workspace.lazy.initial_kind,
+                LazyInitialKind::NullablePrefix | LazyInitialKind::NullableTerminal
+            );
+            if !proof.force_haystack_start && proof.relaxed_nullable == nullable_initial {
+                if let WarmDirectSpan::Complete(found) = try_warm_direct_span_with_reverse(
+                    automaton,
+                    haystack,
+                    window,
+                    &workspace.lazy,
+                    &workspace.reverse,
+                    proof,
+                )? {
+                    return Ok(found.map(WarmDirectMatch::span));
+                }
+            }
+        }
+    }
+    execute_bound_prevalidated(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        limits,
+        OutputContract::Span,
+        capabilities,
+    )
+    .map(|report| report.found)
 }
 
 pub(crate) fn search_prevalidated_exact_start_with_authenticated_workspace(
@@ -23438,13 +23551,16 @@ mod tests {
         let proof = plan.start_filter_proof.get().unwrap();
         assert_eq!(
             super::try_warm_direct_span_with_reverse(
+                &plan,
                 haystack,
                 window,
                 &session.workspace.lazy,
                 &session.workspace.reverse,
                 proof,
             ),
-            Ok(Some(super::WarmDirectSpan::ReverseRecovered(expected_span)))
+            Ok(super::WarmDirectSpan::Complete(Some(
+                super::WarmDirectMatch::ReverseRecovered(expected_span)
+            )))
         );
 
         let generation = session.workspace.generation;
@@ -23484,6 +23600,167 @@ mod tests {
     }
 
     #[test]
+    fn scanner_selected_warm_value_span_no_match_is_complete_and_read_only() {
+        let plan = byte_chain(&[
+            (b'A', b'Z'),
+            (b'a', b'z'),
+            (b'a', b'z'),
+            (b'0', b'9'),
+        ]);
+        let haystack = b".Abcx~";
+        let window = SearchWindow::full(haystack);
+        let mut session =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+        assert_eq!(
+            session
+                .search_window::<Span>(haystack, window, SearchLimits::unlimited())
+                .unwrap()
+                .into_output(),
+            None
+        );
+        let proof = plan.start_filter_proof.get().unwrap();
+        assert_eq!(
+            super::try_warm_direct_span_with_reverse(
+                &plan,
+                haystack,
+                window,
+                &session.workspace.lazy,
+                &session.workspace.reverse,
+                proof,
+            ),
+            Ok(super::WarmDirectSpan::Complete(None))
+        );
+
+        let generation = session.workspace.generation;
+        let current_len = session.workspace.current_len;
+        let roots_len = session.workspace.roots_len;
+        let stack_len = session.workspace.stack_len;
+        let lazy_scratch_len = session.workspace.lazy.scratch_len;
+        let lazy_frontier_len = session.workspace.lazy.frontier_len;
+        let lazy_state_len = session.workspace.lazy.state_len;
+        let lazy_item_len = session.workspace.lazy.item_len;
+        let lazy_rows = session.workspace.lazy.rows.clone();
+        let reverse_scratch_len = session.workspace.reverse.scratch_len;
+        let reverse_frontier_len = session.workspace.reverse.frontier_len;
+        let reverse_state_len = session.workspace.reverse.state_len;
+        let reverse_item_len = session.workspace.reverse.item_len;
+        let reverse_rows = session.workspace.reverse.rows.clone();
+        assert_eq!(
+            session
+                .search_span_value(haystack, window, SearchLimits::unlimited())
+                .unwrap(),
+            None
+        );
+        assert_eq!(session.workspace.generation, generation);
+        assert_eq!(session.workspace.current_len, current_len);
+        assert_eq!(session.workspace.roots_len, roots_len);
+        assert_eq!(session.workspace.stack_len, stack_len);
+        assert_eq!(session.workspace.lazy.scratch_len, lazy_scratch_len);
+        assert_eq!(session.workspace.lazy.frontier_len, lazy_frontier_len);
+        assert_eq!(session.workspace.lazy.state_len, lazy_state_len);
+        assert_eq!(session.workspace.lazy.item_len, lazy_item_len);
+        assert_eq!(session.workspace.lazy.rows, lazy_rows);
+        assert_eq!(session.workspace.reverse.scratch_len, reverse_scratch_len);
+        assert_eq!(session.workspace.reverse.frontier_len, reverse_frontier_len);
+        assert_eq!(session.workspace.reverse.state_len, reverse_state_len);
+        assert_eq!(session.workspace.reverse.item_len, reverse_item_len);
+        assert_eq!(session.workspace.reverse.rows, reverse_rows);
+    }
+
+    #[test]
+    fn warm_value_span_needs_reverse_storage_only_for_unknown_starts() {
+        let nullable = empty_or_ab(true);
+        let haystack = b"abxxx";
+        let window = SearchWindow::full(haystack);
+        let expected_span = MatchSpan::new(0, 0);
+        let expected = Some(expected_span);
+        let mut nullable_session =
+            K0SearchSession::new_selected(&nullable, WorkspaceLimits::unlimited(), true, false)
+                .unwrap();
+        assert!(!nullable_session.workspace.reverse.is_bound_to(&nullable));
+        assert_eq!(
+            nullable_session
+                .search_window::<SelectedEnd>(haystack, window, SearchLimits::unlimited())
+                .unwrap()
+                .into_output(),
+            Some(0)
+        );
+        let proof = nullable.start_filter_proof.get().unwrap();
+        assert_eq!(
+            super::try_warm_direct_span_with_reverse(
+                &nullable,
+                haystack,
+                window,
+                &nullable_session.workspace.lazy,
+                &nullable_session.workspace.reverse,
+                proof,
+            ),
+            Ok(super::WarmDirectSpan::Complete(Some(
+                super::WarmDirectMatch::KnownStart(expected_span)
+            )))
+        );
+        assert_eq!(
+            nullable_session
+                .search_span_value(haystack, window, SearchLimits::unlimited())
+                .unwrap(),
+            expected
+        );
+
+        let nonnullable = byte_chain(&[(b'a', b'a'), (b'b', b'b')]);
+        let absent = b"xxxxx";
+        let absent_window = SearchWindow::full(absent);
+        let mut absent_session = K0SearchSession::new_selected(
+            &nonnullable,
+            WorkspaceLimits::unlimited(),
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(!absent_session.workspace.reverse.is_bound_to(&nonnullable));
+        assert_eq!(
+            absent_session
+                .search_window::<SelectedEnd>(
+                    absent,
+                    absent_window,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output(),
+            None
+        );
+        let proof = nonnullable.start_filter_proof.get().unwrap();
+        assert_eq!(
+            super::try_warm_direct_span_with_reverse(
+                &nonnullable,
+                absent,
+                absent_window,
+                &absent_session.workspace.lazy,
+                &absent_session.workspace.reverse,
+                proof,
+            ),
+            Ok(super::WarmDirectSpan::Complete(None))
+        );
+        assert_eq!(
+            absent_session
+                .search_span_value(absent, absent_window, SearchLimits::unlimited())
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn warm_value_span_preserves_unlimited_work_overflow() {
+        let meter = WorkMeter::new(u64::MAX, u64::MAX);
+        assert!(matches!(
+            super::complete_warm_direct_span(None, &meter, 1),
+            Err(SearchError::ArithmeticOverflow {
+                computation: "search work counter"
+            })
+        ));
+    }
+
+    #[test]
     fn warmed_value_span_declines_transactionally_on_each_unfilled_direction() {
         let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b')]);
         let haystack = b"zzabzz";
@@ -23516,13 +23793,14 @@ mod tests {
         let generation = forward.workspace.generation;
         assert_eq!(
             super::try_warm_direct_span_with_reverse(
+                &plan,
                 haystack,
                 window,
                 &forward.workspace.lazy,
                 &forward.workspace.reverse,
                 proof,
             ),
-            Ok(None)
+            Ok(super::WarmDirectSpan::Declined)
         );
         assert_eq!(forward.workspace.lazy.rows, forward_rows);
         assert_eq!(forward.workspace.reverse.rows, reverse_rows);
@@ -23563,13 +23841,14 @@ mod tests {
         let generation = reverse.workspace.generation;
         assert_eq!(
             super::try_warm_direct_span_with_reverse(
+                &plan,
                 haystack,
                 window,
                 &reverse.workspace.lazy,
                 &reverse.workspace.reverse,
                 proof,
             ),
-            Ok(None)
+            Ok(super::WarmDirectSpan::Declined)
         );
         assert_eq!(reverse.workspace.lazy.rows, forward_rows);
         assert_eq!(reverse.workspace.reverse.rows, reverse_rows);
@@ -23604,6 +23883,7 @@ mod tests {
         let mut comparisons = 0usize;
         let mut known = 0usize;
         let mut recovered = 0usize;
+        let mut no_match = 0usize;
 
         for plan in &plans {
             let mut session =
@@ -23623,6 +23903,7 @@ mod tests {
                             .into_output();
                         let proof = plan.start_filter_proof.get().unwrap();
                         let optimistic = super::try_warm_direct_span_with_reverse(
+                            plan,
                             haystack,
                             window,
                             &session.workspace.lazy,
@@ -23631,15 +23912,25 @@ mod tests {
                         )
                         .unwrap();
                         match optimistic {
-                            Some(super::WarmDirectSpan::KnownStart(span)) => {
+                            super::WarmDirectSpan::Complete(Some(
+                                super::WarmDirectMatch::KnownStart(span),
+                            )) => {
                                 assert_eq!(Some(span), expected);
                                 known = known.checked_add(1).unwrap();
                             }
-                            Some(super::WarmDirectSpan::ReverseRecovered(span)) => {
+                            super::WarmDirectSpan::Complete(Some(
+                                super::WarmDirectMatch::ReverseRecovered(span),
+                            )) => {
                                 assert_eq!(Some(span), expected);
                                 recovered = recovered.checked_add(1).unwrap();
                             }
-                            None => assert!(expected.is_none()),
+                            super::WarmDirectSpan::Complete(None) => {
+                                assert!(expected.is_none());
+                                no_match = no_match.checked_add(1).unwrap();
+                            }
+                            super::WarmDirectSpan::Declined => {
+                                panic!("a fully warmed assertion-free case declined")
+                            }
                         }
 
                         let lazy_rows = session.workspace.lazy.rows.clone();
@@ -23655,7 +23946,7 @@ mod tests {
                                 .unwrap(),
                             expected
                         );
-                        if optimistic.is_some() {
+                        if matches!(optimistic, super::WarmDirectSpan::Complete(_)) {
                             assert_eq!(session.workspace.lazy.rows, lazy_rows);
                             assert_eq!(session.workspace.reverse.rows, reverse_rows);
                             assert_eq!(session.workspace.generation, generation);
@@ -23667,6 +23958,7 @@ mod tests {
         }
         assert!(comparisons > 3_000);
         assert!(known > 100);
+        assert!(no_match > 100);
         assert!(
             recovered > 10,
             "the exhaustive corpus reached only {recovered} reverse-recovered spans"

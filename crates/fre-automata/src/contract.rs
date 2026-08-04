@@ -681,6 +681,36 @@ impl TypedPlan<'_, SelectedEnd> {
 }
 
 impl TypedPlan<'_, Span> {
+    /// Return only a selected span through an authenticated, caller-validated
+    /// workspace.
+    ///
+    /// An unlimited exact-identity call may use already-filled forward and
+    /// reverse rows without constructing diagnostic accounting. Every finite,
+    /// cold, contextual, unfilled, or unauthenticated case uses the ordinary
+    /// report-producing executor with unchanged error behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] for an incompatible workspace, hard-limit
+    /// refusal, or execution failure. Supplying an invalid window violates
+    /// this facade-only entry's precondition.
+    #[doc(hidden)]
+    pub fn search_prevalidated_span_value_with_authenticated_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut K0Workspace,
+        limits: SearchLimits,
+    ) -> Result<Option<MatchSpan>, SearchError> {
+        crate::k0::search_prevalidated_span_value_with_authenticated_workspace(
+            self.automaton,
+            haystack,
+            window,
+            workspace,
+            limits,
+        )
+    }
+
     /// Recover a span from one already authenticated selected endpoint.
     ///
     /// This entry runs only K0's reverse machine. `selected_end` must be the
