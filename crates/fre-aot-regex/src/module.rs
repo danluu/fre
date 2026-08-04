@@ -610,7 +610,6 @@ const NATIVE_MODULE_IDENTITY_DOMAIN: &[u8] = b"fre-aot-regex/native-module-ident
 const PARTIAL_CELL_ACCEPTED: u32 = 1 << 31;
 const PARTIAL_CELL_HOLE_BASE: u32 = 1 << 30;
 const PARTIAL_CELL_DEAD: u32 = PARTIAL_CELL_ACCEPTED - 1;
-const PARTIAL_CLASS_MAP_BYTES: usize = 256;
 const PARTIAL_PREFLIGHT_ENTER_STATUS: u8 = 6;
 const NATIVE_PARTIAL_STATUS_RESUME: u32 = 3;
 const NATIVE_PARTIAL_STATUS_SELECTED_END: u32 = 4;
@@ -9583,21 +9582,13 @@ fn lower_x86_64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), Ob
 
 #[allow(
     clippy::too_many_lines,
-    reason = "the prepared SysV entry keeps validation, retained transitions, and the eleven-argument hole call contiguous"
+    reason = "the prepared SysV entry keeps validation, preflight, private native outcome, and continuation marshaling contiguous"
 )]
 fn lower_x86_64_partial_prepared(
-    view: NativePartialProgramView<'_>,
+    _view: NativePartialProgramView<'_>,
 ) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
-    const FRAME_BYTES: u8 = 120;
+    const FRAME_BYTES: u8 = 104;
     let mut assembler = X86Assembler::new();
-    let scan = assembler.label()?;
-    let accept = assembler.label()?;
-    let classify = assembler.label()?;
-    let hole = assembler.label()?;
-    let finish = assembler.label()?;
-    let no_match = assembler.label()?;
-    let matched = assembler.label()?;
-    let return_local = assembler.label()?;
     let preflight_enter = assembler.label()?;
     let native_match = assembler.label()?;
     let native_resume = assembler.label()?;
@@ -9635,8 +9626,8 @@ fn lower_x86_64_partial_prepared(
     assembler.instruction(&compare_minimum)?;
     assembler.branch(&[0x0f, 0x82], fallback_runtime)?;
 
-    // Entry RSP is 8 modulo 16. A 120-byte frame aligns it for calls, reserves
-    // five SysV hole arguments, and leaves two exact-window output slots.
+    // Entry RSP is 8 modulo 16. A 104-byte frame aligns it for calls, reserves
+    // five SysV continuation arguments, and leaves two exact-window outputs.
     assembler.instruction(&[0x48, 0x83, 0xec, FRAME_BYTES])?;
     assembler.instruction(&[0x48, 0x89, 0x7c, 0x24, 0x28])?;
     assembler.instruction(&[0x48, 0x89, 0x74, 0x24, 0x30])?;
@@ -9653,7 +9644,7 @@ fn lower_x86_64_partial_prepared(
     assembler.bind(preflight_identity_displacement_label)?;
     push_bytes(&mut assembler.code, &[0; 4])?;
     assembler.instruction(&[0x48, 0x89, 0x04, 0x24])?;
-    assembler.instruction(&[0x48, 0x8d, 0x44, 0x24, 0x68])?;
+    assembler.instruction(&[0x48, 0x8d, 0x44, 0x24, 0x58])?;
     assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 0x08])?;
     assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x28])?;
     assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x30])?;
@@ -9674,14 +9665,11 @@ fn lower_x86_64_partial_prepared(
     assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x28])?;
     assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x30])?;
     assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x38])?;
-    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x68])?;
-    assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x70])?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x58])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x60])?;
     assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x50])?;
     assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, 0x40])?;
     assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x48])?;
-
-    assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x58, 0, 0, 0, 0])?;
-    assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x60, 0, 0, 0, 0])?;
 
     // Execute the receipt-authenticated full native core over the exact
     // window returned by preflight. The five outgoing SysV stack slots double
@@ -9721,84 +9709,17 @@ fn lower_x86_64_partial_prepared(
     assembler.instruction(&[0xc3])?;
 
     assembler.bind(native_resume)?;
-    // Re-enter the existing single continuation block with the state shape
-    // expected immediately before its canonical hole-token normalization.
+    // Convert the private five-word outcome directly into SysV arguments
+    // seven through eleven: identity, state, position, pending-present, and
+    // pending end. No scalar-table token is reconstructed or rescanned.
     assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x10])?; // resume state
-    assembler.instruction(&[0x05, 0, 0, 0, 0x40])?; // + portable hole base
     assembler.instruction(&[0x4c, 0x8b, 0x5c, 0x24, 0x18])?; // resume position
     assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?; // pending end
-    assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x58])?;
-    assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x60, 0, 0, 0, 0])?;
+    assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x18, 0, 0, 0, 0])?;
     assembler.instruction(&[0x48, 0x83, 0xfa, 0xff])?;
     assembler.branch(&[0x0f, 0x84], native_pending_ready)?;
-    assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x60, 1, 0, 0, 0])?;
+    assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x18, 1, 0, 0, 0])?;
     assembler.bind(native_pending_ready)?;
-    assembler.branch(&[0xe9], hole)?;
-
-    assembler.bind(native_invalid)?;
-    assembler.instruction(&[0xb8, 2, 0, 0, 0])?;
-    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
-    assembler.instruction(&[0xc3])?;
-
-    // The legacy scalar loop below is deliberately cold and unreachable from
-    // prepared entry. It remains only so `native_resume` can share its one
-    // canonical authenticated continuation block at `hole`; a later layout
-    // pass may split that block and remove this dead body.
-    // lea partial_table(%rip), r10
-    assembler.instruction(&[0x4c, 0x8d, 0x15])?;
-    let table_displacement_label = assembler.label()?;
-    assembler.bind(table_displacement_label)?;
-    push_bytes(&mut assembler.code, &[0; 4])?;
-
-    assembler.instruction(&[0x49, 0x89, 0xcb])?; // position = start
-    if view.dfa.initial_pending {
-        assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, 0x58])?;
-        assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x60, 1, 0, 0, 0])?;
-    }
-    assembler.instruction(&[0x31, 0xc9])?; // packed row offset = 0
-    if view.dfa.initial_pending
-        && (view.output == OutputContract::Exists || view.dfa.initial_terminal)
-    {
-        assembler.branch(&[0xe9], matched)?;
-    }
-
-    assembler.bind(scan)?;
-    assembler.instruction(&[0x4c, 0x3b, 0x5c, 0x24, 0x48])?;
-    assembler.branch(&[0x0f, 0x83], finish)?;
-    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x30])?;
-    assembler.instruction(&[0x42, 0x0f, 0xb6, 0x04, 0x1a])?;
-    assembler.instruction(&[0x41, 0x0f, 0xb6, 0x04, 0x02])?;
-    assembler.instruction(&[0x01, 0xc8])?;
-    assembler.instruction(&[0x41, 0x8b, 0x84, 0x82, 0, 1, 0, 0])?;
-    assembler.instruction(&[0x49, 0xff, 0xc3])?;
-    assembler.instruction(&[0x85, 0xc0])?;
-    assembler.branch(&[0x0f, 0x88], accept)?;
-    assembler.branch(&[0xe9], classify)?;
-
-    assembler.bind(accept)?;
-    assembler.instruction(&[0x4c, 0x89, 0x5c, 0x24, 0x58])?;
-    assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x60, 1, 0, 0, 0])?;
-    if view.output == OutputContract::Exists {
-        assembler.branch(&[0xe9], matched)?;
-    }
-    assembler.instruction(&[0x25, 0xff, 0xff, 0xff, 0x7f])?;
-
-    assembler.bind(classify)?;
-    assembler.instruction(&[0x3d, 0xff, 0xff, 0xff, 0x7f])?;
-    assembler.branch(&[0x0f, 0x84], finish)?;
-    assembler.instruction(&[0x3d, 0, 0, 0, 0x40])?;
-    assembler.branch(&[0x0f, 0x83], hole)?;
-    assembler.instruction(&[0x89, 0xc1])?;
-    assembler.branch(&[0xe9], scan)?;
-
-    assembler.bind(hole)?;
-    // A hole reached after the final consumed byte needs no continuation.
-    assembler.instruction(&[0x4c, 0x3b, 0x5c, 0x24, 0x48])?;
-    assembler.branch(&[0x0f, 0x84], finish)?;
-    assembler.instruction(&[0x2d, 0, 0, 0, 0x40])?;
-
-    // Stack arguments seven through eleven: identity, state, position,
-    // pending-present, and pending end. The first six reload unchanged.
     assembler.instruction(&[0x48, 0x8d, 0x15])?;
     let identity_displacement_label = assembler.label()?;
     assembler.bind(identity_displacement_label)?;
@@ -9806,10 +9727,6 @@ fn lower_x86_64_partial_prepared(
     assembler.instruction(&[0x48, 0x89, 0x14, 0x24])?;
     assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 0x08])?;
     assembler.instruction(&[0x4c, 0x89, 0x5c, 0x24, 0x10])?;
-    assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x60])?;
-    assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 0x18])?;
-    assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x58])?;
-    assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 0x20])?;
     assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x28])?;
     assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x30])?;
     assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x38])?;
@@ -9823,43 +9740,8 @@ fn lower_x86_64_partial_prepared(
     assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
     assembler.instruction(&[0xc3])?;
 
-    assembler.bind(finish)?;
-    assembler.instruction(&[0x48, 0x83, 0x7c, 0x24, 0x60, 0])?;
-    assembler.branch(&[0x0f, 0x84], no_match)?;
-    assembler.bind(matched)?;
-    if view.output != OutputContract::Exists {
-        assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x58])?;
-        assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x50])?;
-        match view.output {
-            OutputContract::Exists => {}
-            OutputContract::SelectedEnd => {
-                assembler.instruction(&[0x49, 0x89, 0x01])?;
-                assembler.instruction(&[0x49, 0x89, 0x41, 0x08])?;
-            }
-            OutputContract::Span => {
-                if view.dfa.initial_pending {
-                    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x40])?;
-                } else {
-                    let width = u64::try_from(view.exact_match_width.ok_or(
-                        ObjectError::InvalidModule("partial Span width is absent"),
-                    )?)
-                    .map_err(|_| ObjectError::ArithmeticOverflow("partial Span width"))?;
-                    let mut load_width = vec![0x48, 0xba];
-                    load_width.extend_from_slice(&width.to_le_bytes());
-                    assembler.instruction(&load_width)?;
-                    assembler.instruction(&[0x48, 0x29, 0xd0])?;
-                    assembler.instruction(&[0x48, 0x89, 0xc2])?;
-                }
-                assembler.instruction(&[0x49, 0x89, 0x11])?;
-                assembler.instruction(&[0x49, 0x89, 0x41, 0x08])?;
-            }
-        }
-    }
-    assembler.instruction(&[0xb8, 1, 0, 0, 0])?;
-    assembler.branch(&[0xe9], return_local)?;
-    assembler.bind(no_match)?;
-    assembler.instruction(&[0x31, 0xc0])?;
-    assembler.bind(return_local)?;
+    assembler.bind(native_invalid)?;
+    assembler.instruction(&[0xb8, 2, 0, 0, 0])?;
     assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
     assembler.instruction(&[0xc3])?;
 
@@ -9877,7 +9759,6 @@ fn lower_x86_64_partial_prepared(
     push_bytes(&mut assembler.code, &[0; 4])?;
 
     let finished = assembler.finish_with_label_offsets()?;
-    let table_displacement = finished.label_offset(table_displacement_label)?;
     let preflight_identity_displacement =
         finished.label_offset(preflight_identity_displacement_label)?;
     let preflight_runtime_displacement =
@@ -9918,13 +9799,6 @@ fn lower_x86_64_partial_prepared(
                 )?,
                 kind: RelocationKind::X86PltRelative32,
                 symbol: PREPARED_PREFLIGHT_RUNTIME_SYMBOL,
-                addend: -4,
-            },
-            ModuleRelocation {
-                section: TEXT_SECTION,
-                offset: offset_u64(table_displacement, "x86 partial table relocation")?,
-                kind: RelocationKind::X86PcRelative32,
-                symbol: PARTIAL_TABLE_SYMBOL,
                 addend: -4,
             },
             ModuleRelocation {
@@ -15241,22 +15115,13 @@ fn lower_aarch64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), O
 
 #[allow(
     clippy::too_many_lines,
-    reason = "the prepared AAPCS64 entry keeps validation, retained transitions, and the eleven-argument hole call contiguous"
+    reason = "the prepared AAPCS64 entry keeps validation, preflight, private native outcome, and continuation marshaling contiguous"
 )]
 fn lower_aarch64_partial_prepared(
-    view: NativePartialProgramView<'_>,
+    _view: NativePartialProgramView<'_>,
 ) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
     const FRAME_BYTES: u16 = 128;
     let mut assembler = Aarch64Assembler::new();
-    let scan = assembler.label()?;
-    let accept = assembler.label()?;
-    let classify = assembler.label()?;
-    let row = assembler.label()?;
-    let hole = assembler.label()?;
-    let finish = assembler.label()?;
-    let no_match = assembler.label()?;
-    let matched = assembler.label()?;
-    let return_local = assembler.label()?;
     let preflight_enter = assembler.label()?;
     let native_match = assembler.label()?;
     let native_resume = assembler.label()?;
@@ -15374,9 +15239,10 @@ fn lower_aarch64_partial_prepared(
     assembler.instruction(0xd65f_03c0)?;
 
     assembler.bind(native_resume)?;
+    // Convert the private five-word outcome directly into AAPCS64 arguments
+    // seven through eleven: identity, state, position, pending-present, and
+    // pending end. No scalar-table token is reconstructed or rescanned.
     assembler.instruction(aarch64_load_x_imm(7, 31, 96)?)?; // resume state
-    aarch64_load_u32_constant(&mut assembler, 6, PARTIAL_CELL_HOLE_BASE)?;
-    assembler.instruction(aarch64_add_x_reg(15, 7, 6)?)?;
     assembler.instruction(aarch64_load_x_imm(11, 31, 104)?)?; // resume position
     assembler.instruction(aarch64_load_x_imm(13, 31, 112)?)?; // pending end/sentinel
     assembler.instruction(aarch64_movz_w(14, 0)?)?;
@@ -15385,78 +15251,6 @@ fn lower_aarch64_partial_prepared(
     assembler.branch_cond(AARCH64_EQ, native_pending_ready)?;
     assembler.instruction(aarch64_movz_w(14, 1)?)?;
     assembler.bind(native_pending_ready)?;
-    assembler.branch(hole)?;
-
-    assembler.bind(native_invalid)?;
-    assembler.instruction(aarch64_movz_w(0, 2)?)?;
-    assembler.instruction(aarch64_load_x_imm(30, 31, 120)?)?;
-    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
-    assembler.instruction(0xd65f_03c0)?;
-
-    // The legacy scalar loop below is deliberately cold and unreachable from
-    // prepared entry. It remains only so `native_resume` can share its one
-    // canonical authenticated continuation block at `hole`; a later layout
-    // pass may split that block and remove this dead body.
-    let table_page = assembler.instruction(0x9000_000a)?; // adrp x10, table
-    let table_page_offset = assembler.instruction(aarch64_add_x_imm(10, 10, 0)?)?;
-    assembler.instruction(aarch64_add_x_imm(
-        9,
-        10,
-        u16::try_from(PARTIAL_CLASS_MAP_BYTES)
-            .map_err(|_| ObjectError::ArithmeticOverflow("partial class map size"))?,
-    )?)?;
-    assembler.instruction(aarch64_mov_x(11, 3)?)?;
-    assembler.instruction(aarch64_movz_w(12, 0)?)?;
-    assembler.instruction(aarch64_movz_x(13, 0, 0)?)?;
-    assembler.instruction(aarch64_movz_w(14, 0)?)?;
-    if view.dfa.initial_pending {
-        assembler.instruction(aarch64_mov_x(13, 3)?)?;
-        assembler.instruction(aarch64_movz_w(14, 1)?)?;
-    }
-    if view.dfa.initial_pending
-        && (view.output == OutputContract::Exists || view.dfa.initial_terminal)
-    {
-        assembler.branch(matched)?;
-    }
-
-    assembler.bind(scan)?;
-    assembler.instruction(aarch64_cmp_x(11, 4)?)?;
-    assembler.branch_cond(AARCH64_HS, finish)?;
-    assembler.instruction(aarch64_load_byte_reg(6, 1, 11)?)?;
-    assembler.instruction(aarch64_load_byte_reg(6, 10, 6)?)?;
-    assembler.instruction(aarch64_add_x_reg(7, 12, 6)?)?;
-    assembler.instruction(aarch64_load_w_uxtw(15, 9, 7)?)?;
-    assembler.instruction(aarch64_add_x_imm(11, 11, 1)?)?;
-    assembler.branch_bit_set_w(15, 31, accept)?;
-    assembler.branch(classify)?;
-
-    assembler.bind(accept)?;
-    assembler.instruction(aarch64_mov_x(13, 11)?)?;
-    assembler.instruction(aarch64_movz_w(14, 1)?)?;
-    if view.output == OutputContract::Exists {
-        assembler.branch(matched)?;
-    }
-    assembler.instruction(aarch64_and_low_31(15, 15)?)?;
-
-    assembler.bind(classify)?;
-    aarch64_load_u32_constant(&mut assembler, 6, PARTIAL_CELL_DEAD)?;
-    assembler.instruction(aarch64_cmp_x(15, 6)?)?;
-    assembler.branch_cond(AARCH64_EQ, finish)?;
-    assembler.branch_bit_clear_w(15, 30, row)?;
-    assembler.branch(hole)?;
-
-    assembler.bind(row)?;
-    assembler.instruction(aarch64_mov_x(12, 15)?)?;
-    assembler.branch(scan)?;
-
-    assembler.bind(hole)?;
-    // Accepting semantics were resolved above. A final-byte hole completes
-    // locally because there is no unconsumed byte for K0 to inspect.
-    assembler.instruction(aarch64_cmp_x(11, 4)?)?;
-    assembler.branch_cond(AARCH64_EQ, finish)?;
-    aarch64_load_u32_constant(&mut assembler, 6, PARTIAL_CELL_HOLE_BASE)?;
-    assembler.instruction(aarch64_sub_x_reg(7, 15, 6)?)?;
-
     let identity_page = assembler.instruction(0x9000_0006)?; // adrp x6, identity
     let identity_page_offset = assembler.instruction(aarch64_add_x_imm(6, 6, 0)?)?;
     assembler.instruction(aarch64_store_x(11, 31, 0)?)?;
@@ -15473,36 +15267,8 @@ fn lower_aarch64_partial_prepared(
     assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
     assembler.instruction(0xd65f_03c0)?;
 
-    assembler.bind(finish)?;
-    assembler.branch_zero_w(14, no_match)?;
-    assembler.bind(matched)?;
-    match view.output {
-        OutputContract::Exists => {}
-        OutputContract::SelectedEnd => {
-            assembler.instruction(aarch64_store_x(13, 5, 0)?)?;
-            assembler.instruction(aarch64_store_x(13, 5, 8)?)?;
-        }
-        OutputContract::Span => {
-            let start = 6;
-            if view.dfa.initial_pending {
-                assembler.instruction(aarch64_mov_x(start, 3)?)?;
-            } else {
-                let width = u64::try_from(view.exact_match_width.ok_or(
-                    ObjectError::InvalidModule("partial Span width is absent"),
-                )?)
-                .map_err(|_| ObjectError::ArithmeticOverflow("partial Span width"))?;
-                aarch64_load_u64_constant(&mut assembler, start, width)?;
-                assembler.instruction(aarch64_sub_x_reg(start, 13, start)?)?;
-            }
-            assembler.instruction(aarch64_store_x(start, 5, 0)?)?;
-            assembler.instruction(aarch64_store_x(13, 5, 8)?)?;
-        }
-    }
-    assembler.instruction(aarch64_movz_w(0, 1)?)?;
-    assembler.branch(return_local)?;
-    assembler.bind(no_match)?;
-    assembler.instruction(aarch64_movz_w(0, 0)?)?;
-    assembler.bind(return_local)?;
+    assembler.bind(native_invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
     assembler.instruction(aarch64_load_x_imm(30, 31, 120)?)?;
     assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
     assembler.instruction(0xd65f_03c0)?;
@@ -15522,8 +15288,6 @@ fn lower_aarch64_partial_prepared(
         preflight_identity_page_offset,
         preflight_runtime_branch,
         native_core_branch,
-        table_page,
-        table_page_offset,
         identity_page,
         identity_page_offset,
         runtime_branch,
@@ -15572,35 +15336,21 @@ fn lower_aarch64_partial_prepared(
             },
             ModuleRelocation {
                 section: TEXT_SECTION,
-                offset: offset_u64(relocation_offsets[4], "AArch64 partial table ADRP")?,
-                kind: RelocationKind::Aarch64Page21,
-                symbol: PARTIAL_TABLE_SYMBOL,
-                addend: 0,
-            },
-            ModuleRelocation {
-                section: TEXT_SECTION,
-                offset: offset_u64(relocation_offsets[5], "AArch64 partial table ADD")?,
-                kind: RelocationKind::Aarch64PageOff12,
-                symbol: PARTIAL_TABLE_SYMBOL,
-                addend: 0,
-            },
-            ModuleRelocation {
-                section: TEXT_SECTION,
-                offset: offset_u64(relocation_offsets[6], "AArch64 partial identity ADRP")?,
+                offset: offset_u64(relocation_offsets[4], "AArch64 partial identity ADRP")?,
                 kind: RelocationKind::Aarch64Page21,
                 symbol: PARTIAL_IDENTITY_SYMBOL,
                 addend: 0,
             },
             ModuleRelocation {
                 section: TEXT_SECTION,
-                offset: offset_u64(relocation_offsets[7], "AArch64 partial identity ADD")?,
+                offset: offset_u64(relocation_offsets[5], "AArch64 partial identity ADD")?,
                 kind: RelocationKind::Aarch64PageOff12,
                 symbol: PARTIAL_IDENTITY_SYMBOL,
                 addend: 0,
             },
             ModuleRelocation {
                 section: TEXT_SECTION,
-                offset: offset_u64(relocation_offsets[8], "AArch64 partial runtime branch")?,
+                offset: offset_u64(relocation_offsets[6], "AArch64 partial runtime branch")?,
                 kind: RelocationKind::Aarch64Branch26,
                 symbol: PARTIAL_RUNTIME_SYMBOL,
                 addend: 0,
@@ -15608,7 +15358,7 @@ fn lower_aarch64_partial_prepared(
             ModuleRelocation {
                 section: TEXT_SECTION,
                 offset: offset_u64(
-                    relocation_offsets[9],
+                    relocation_offsets[7],
                     "AArch64 prepared fallback runtime branch",
                 )?,
                 kind: RelocationKind::Aarch64Branch26,
@@ -18612,7 +18362,7 @@ mod tests {
         clippy::too_many_lines,
         reason = "both emitter ABIs and every relocation participate in one code-shape contract"
     )]
-    fn partial_prepared_emitters_preserve_accept_final_hole_and_call_shapes() {
+    fn partial_prepared_emitters_are_slim_and_preserve_native_call_shapes() {
         let limits = CompileLimitsV1 {
             determinize: DeterminizeLimits {
                 max_states: 8,
@@ -18636,6 +18386,7 @@ mod tests {
             .expect("partial prepared view");
 
         let (x86, x86_relocations) = lower_x86_64_partial_prepared(view).unwrap();
+        assert_eq!(x86.len(), 497, "x86 slim prepared wrapper size");
         assert_eq!(
             x86_relocations
                 .iter()
@@ -18645,11 +18396,15 @@ mod tests {
                 PARTIAL_IDENTITY_SYMBOL,
                 PARTIAL_NATIVE_CORE_SYMBOL,
                 PREPARED_PREFLIGHT_RUNTIME_SYMBOL,
-                PARTIAL_TABLE_SYMBOL,
                 PARTIAL_IDENTITY_SYMBOL,
                 PARTIAL_RUNTIME_SYMBOL,
                 PREPARED_FALLBACK_RUNTIME_SYMBOL,
             ]
+        );
+        assert!(
+            x86_relocations
+                .iter()
+                .all(|relocation| relocation.symbol != PARTIAL_TABLE_SYMBOL)
         );
         assert!(x86.starts_with(&[0x48, 0x85, 0xff]));
         let mut x86_floor = vec![0x48, 0x3d];
@@ -18659,16 +18414,7 @@ mod tests {
                 .to_le_bytes(),
         );
         assert!(x86.windows(x86_floor.len()).any(|bytes| bytes == x86_floor));
-        assert!(x86.windows(4).any(|bytes| bytes == [0x48, 0x83, 0xec, 120]));
-        let accept_clear = x86
-            .windows(5)
-            .position(|bytes| bytes == [0x25, 0xff, 0xff, 0xff, 0x7f])
-            .expect("x86 accept-bit clear");
-        let hole_compare = x86
-            .windows(5)
-            .position(|bytes| bytes == [0x3d, 0, 0, 0, 0x40])
-            .expect("x86 hole compare");
-        assert!(accept_clear < hole_compare);
+        assert!(x86.windows(4).any(|bytes| bytes == [0x48, 0x83, 0xec, 104]));
         let native_core_offset = usize::try_from(x86_relocations[1].offset).unwrap();
         assert_eq!(x86.get(native_core_offset.wrapping_sub(1)), Some(&0xe8));
         let caller_zero_start = x86
@@ -18689,18 +18435,19 @@ mod tests {
         );
         assert!(
             x86.windows(5)
-                .any(|bytes| bytes == [0x48, 0x8b, 0x4c, 0x24, 0x68])
+                .any(|bytes| bytes == [0x48, 0x8b, 0x4c, 0x24, 0x58])
         );
         assert!(
             x86.windows(5)
-                .any(|bytes| bytes == [0x4c, 0x8b, 0x44, 0x24, 0x70])
+                .any(|bytes| bytes == [0x4c, 0x8b, 0x44, 0x24, 0x60])
         );
-        let runtime_offset = usize::try_from(x86_relocations[5].offset).unwrap();
+        let runtime_offset = usize::try_from(x86_relocations[4].offset).unwrap();
         assert_eq!(x86.get(runtime_offset.wrapping_sub(1)), Some(&0xe8));
-        let fallback_offset = usize::try_from(x86_relocations[6].offset).unwrap();
+        let fallback_offset = usize::try_from(x86_relocations[5].offset).unwrap();
         assert_eq!(x86.get(fallback_offset.wrapping_sub(1)), Some(&0xe9));
 
         let (aarch64, aarch64_relocations) = lower_aarch64_partial_prepared(view).unwrap();
+        assert_eq!(aarch64.len(), 464, "AArch64 slim prepared wrapper size");
         assert_eq!(
             aarch64_relocations
                 .iter()
@@ -18711,13 +18458,16 @@ mod tests {
                 PARTIAL_IDENTITY_SYMBOL,
                 PREPARED_PREFLIGHT_RUNTIME_SYMBOL,
                 PARTIAL_NATIVE_CORE_SYMBOL,
-                PARTIAL_TABLE_SYMBOL,
-                PARTIAL_TABLE_SYMBOL,
                 PARTIAL_IDENTITY_SYMBOL,
                 PARTIAL_IDENTITY_SYMBOL,
                 PARTIAL_RUNTIME_SYMBOL,
                 PREPARED_FALLBACK_RUNTIME_SYMBOL,
             ]
+        );
+        assert!(
+            aarch64_relocations
+                .iter()
+                .all(|relocation| relocation.symbol != PARTIAL_TABLE_SYMBOL)
         );
         let words = aarch64
             .chunks_exact(4)
@@ -18764,12 +18514,12 @@ mod tests {
         assert!(words.contains(&aarch64_load_x_imm(4, 31, 88).unwrap()));
         assert!(words.contains(&aarch64_store_x(3, 31, 56).unwrap()));
         assert!(words.contains(&aarch64_store_x(4, 31, 64).unwrap()));
-        let runtime_offset = usize::try_from(aarch64_relocations[8].offset).unwrap();
+        let runtime_offset = usize::try_from(aarch64_relocations[6].offset).unwrap();
         assert_eq!(
             u32::from_le_bytes(aarch64[runtime_offset..runtime_offset + 4].try_into().unwrap()),
             0x9400_0000
         );
-        let fallback_offset = usize::try_from(aarch64_relocations[9].offset).unwrap();
+        let fallback_offset = usize::try_from(aarch64_relocations[7].offset).unwrap();
         assert_eq!(
             u32::from_le_bytes(aarch64[fallback_offset..fallback_offset + 4].try_into().unwrap()),
             0x1400_0000
@@ -19254,10 +19004,10 @@ mod tests {
                     }));
                     assert!(code
                         .windows(5)
-                        .any(|bytes| bytes == [0x48, 0x8b, 0x4c, 0x24, 0x68]));
+                        .any(|bytes| bytes == [0x48, 0x8b, 0x4c, 0x24, 0x58]));
                     assert!(code
                         .windows(5)
-                        .any(|bytes| bytes == [0x4c, 0x8b, 0x44, 0x24, 0x70]));
+                        .any(|bytes| bytes == [0x4c, 0x8b, 0x44, 0x24, 0x60]));
                     assert!(code
                         .windows(5)
                         .any(|bytes| bytes == [0x48, 0x89, 0x4c, 0x24, 0x40]));
@@ -19266,7 +19016,7 @@ mod tests {
                         .any(|bytes| bytes == [0x4c, 0x89, 0x44, 0x24, 0x48]));
                     assert!(code
                         .windows(5)
-                        .any(|bytes| bytes == [0x48, 0x83, 0xc4, 120, 0xc3]));
+                        .any(|bytes| bytes == [0x48, 0x83, 0xc4, 104, 0xc3]));
                 }
                 Architecture::Aarch64 => {
                     assert_eq!(
