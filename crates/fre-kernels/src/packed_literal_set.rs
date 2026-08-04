@@ -273,9 +273,13 @@ struct SharedFragment {
     width: usize,
     minimum_pattern_width: usize,
     maximum_candidate_verification_work: usize,
-    // Maximum source length kept wholly on the native engine and, on longer
-    // sources, the exclusive start boundary proved by its prefix search.
+    // Exclusive start boundary proved by the native prefix search.
     native_start_budget: usize,
+    // Maximum source length kept wholly on the native engine and, on longer
+    // sources, the prefix byte extent. This includes the exact right overlap
+    // needed to prove every start below `native_start_budget`. Construction
+    // computes it once so an early native match has no arithmetic tail.
+    native_prefix_bytes: usize,
     finder: Finder<'static>,
     // Source-order patterns encoded as a little-endian u16 width followed by
     // the bytes. The retained-byte and candidate-work proofs are shared with
@@ -601,12 +605,7 @@ impl PackedLiteralSetPlan {
             PackedLiteralEngine::NativeSharedFragment {
                 searcher,
                 shared_fragment,
-            } => find_native_shared_fragment(
-                searcher,
-                shared_fragment,
-                self.build.max_pattern_bytes,
-                window_bytes,
-            ),
+            } => find_native_shared_fragment(searcher, shared_fragment, window_bytes),
             PackedLiteralEngine::Factored(factored) => {
                 accounting.factored_columns = true;
                 factored.find(window_bytes)
@@ -626,31 +625,22 @@ impl PackedLiteralSetPlan {
 fn find_native_shared_fragment(
     searcher: &Searcher,
     fragment: &SharedFragment,
-    maximum_pattern_width: usize,
     haystack: &[u8],
 ) -> Option<(usize, usize)> {
     let native_start_budget = fragment.native_start_budget;
-    if haystack.len() <= native_start_budget {
+    let native_prefix_bytes = fragment.native_prefix_bytes;
+    if haystack.len() <= native_prefix_bytes {
         return searcher
             .find(haystack)
             .map(|matched| (matched.start(), matched.end()));
     }
-    let Some(native_prefix_end) = maximum_pattern_width
-        .checked_sub(1)
-        .and_then(|overlap| native_start_budget.checked_add(overlap))
-        .map(|end| end.min(haystack.len()))
-    else {
-        return searcher
-            .find(haystack)
-            .map(|matched| (matched.start(), matched.end()));
-    };
-    let native_prefix_match = searcher.find(&haystack[..native_prefix_end]);
-    if native_prefix_end == haystack.len()
-        || native_prefix_match
-            .as_ref()
-            .is_some_and(|matched| matched.start() < native_start_budget)
-    {
-        return native_prefix_match.map(|matched| (matched.start(), matched.end()));
+    if let Some(matched) = searcher.find(&haystack[..native_prefix_bytes]) {
+        if matched.start() < native_start_budget {
+            // Every alternative at this start fits in the right overlap, so
+            // the prefix engine observed the same source-priority choice as a
+            // search of the complete source.
+            return Some((matched.start(), matched.end()));
+        }
     }
 
     // The public certificate charges every alternative at every possible
@@ -855,6 +845,10 @@ fn select_shared_fragment<P: AsRef<[u8]>>(
         .iter()
         .map(|pattern| pattern.as_ref().len())
         .min()?;
+    let maximum_pattern_width = patterns
+        .iter()
+        .map(|pattern| pattern.as_ref().len())
+        .max()?;
     let mut best_offset = 0_usize;
     let mut best_width = 0_usize;
     let mut best_frequency_score = u64::MAX;
@@ -912,6 +906,9 @@ fn select_shared_fragment<P: AsRef<[u8]>>(
         native_minimum_haystack_bytes,
         maximum_candidate_verification_work,
     );
+    let native_prefix_bytes = maximum_pattern_width
+        .checked_sub(1)?
+        .checked_add(native_start_budget)?;
 
     let mut retained = Vec::with_capacity(retained_pattern_bytes);
     for pattern in patterns {
@@ -928,6 +925,7 @@ fn select_shared_fragment<P: AsRef<[u8]>>(
         minimum_pattern_width,
         maximum_candidate_verification_work,
         native_start_budget,
+        native_prefix_bytes,
         finder: FinderBuilder::new().build_forward_owned(needle),
         patterns: retained.into_boxed_slice(),
     })
@@ -1619,6 +1617,20 @@ mod tests {
             native_start_budget,
             searcher.minimum_len().checked_mul(expected_quanta).unwrap()
         );
+        assert_eq!(
+            fragment.native_prefix_bytes,
+            native_start_budget
+                .checked_add(
+                    patterns
+                        .iter()
+                        .map(|pattern| pattern.len())
+                        .max()
+                        .unwrap()
+                        .checked_sub(1)
+                        .unwrap(),
+                )
+                .unwrap()
+        );
         let persistent = plan.build_accounting().persistent_bytes;
         assert_eq!(
             PackedLiteralSetPlan::new(
@@ -1825,6 +1837,21 @@ mod tests {
             panic!("shared-prefix language did not retain its common fragment")
         };
         let native_start_budget = shared_fragment.native_start_budget;
+        let native_prefix_bytes = shared_fragment.native_prefix_bytes;
+        let overlap_match_start = native_start_budget;
+        let overlap_match_end = overlap_match_start.checked_add(4).unwrap();
+        let mut overlap_haystack = vec![b'.'; native_prefix_bytes.checked_add(48).unwrap()];
+        overlap_haystack[overlap_match_start..overlap_match_end].copy_from_slice(b"xy00");
+        assert_eq!(
+            long_first
+                .find(
+                    &overlap_haystack,
+                    PackedLiteralSetSearchLimits::unlimited(),
+                )
+                .unwrap()
+                .0,
+            Some((overlap_match_start, overlap_match_end))
+        );
         let match_start = native_start_budget.checked_add(48).unwrap();
         let match_end = match_start.checked_add(4).unwrap();
         let mut priority_haystack = vec![b'.'; match_end.checked_add(48).unwrap()];
@@ -1863,6 +1890,7 @@ mod tests {
             shared_fragment.native_start_budget,
             native_start_budget
         );
+        assert_eq!(shared_fragment.native_prefix_bytes, native_prefix_bytes);
         assert_eq!(
             short_first
                 .find(
