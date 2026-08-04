@@ -591,12 +591,15 @@ const PARTIAL_TABLE_SYMBOL: usize = 5;
 const PARTIAL_IDENTITY_SYMBOL: usize = 6;
 const PARTIAL_RUNTIME_SYMBOL: usize = 7;
 const PREPARED_FALLBACK_RUNTIME_SYMBOL: usize = 8;
+const PREPARED_ADMISSION_RUNTIME_SYMBOL: usize = 9;
 
 const RUNTIME_SYMBOL_NAME: &str = "fre_aot_regex_runtime_search_v1";
 const PARTIAL_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_from_partial_v1";
 const PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_v1";
+const PREPARED_ADMISSION_RUNTIME_SYMBOL_NAME: &str =
+    "fre_aot_regex_runtime_prepared_partial_should_enter_v1";
 const ENTRY_SYMBOL_PREFIX: &str = "fre_aot_regex_search_v1_";
 const PREPARED_ENTRY_SYMBOL_PREFIX: &str = "fre_aot_regex_search_exclusive_v1_";
 const PROGRAM_SYMBOL_PREFIX: &str = "fre_aot_regex_program_v1_";
@@ -845,6 +848,14 @@ impl CompiledModule {
                 offset: 0,
                 size: 0,
             });
+            symbols.push(ModuleSymbol {
+                name: PREPARED_ADMISSION_RUNTIME_SYMBOL_NAME.to_owned(),
+                binding: SymbolBinding::Global,
+                kind: SymbolKind::Function,
+                section: None,
+                offset: 0,
+                size: 0,
+            });
             Some(PREPARED_ENTRY_SYMBOL)
         } else {
             None
@@ -921,6 +932,17 @@ impl CompiledModule {
         self.prepared_entry_symbol_index?;
         self.symbols
             .get(PREPARED_FALLBACK_RUNTIME_SYMBOL)
+            .filter(|symbol| symbol.section.is_none())
+            .map(|symbol| symbol.name.as_str())
+    }
+
+    /// Return the adaptive retained-row admission helper required by the
+    /// additive prepared entry, when that entry is present.
+    #[must_use]
+    pub fn required_prepared_admission_runtime_symbol(&self) -> Option<&str> {
+        self.prepared_entry_symbol_index?;
+        self.symbols
+            .get(PREPARED_ADMISSION_RUNTIME_SYMBOL)
             .filter(|symbol| symbol.section.is_none())
             .map(|symbol| symbol.name.as_str())
     }
@@ -1222,6 +1244,17 @@ fn native_module_digest(
                 &mut digest,
                 PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME.as_bytes(),
                 "prepared fallback runtime symbol identity byte length",
+            )?;
+        }
+        if lowering
+            .relocations
+            .iter()
+            .any(|relocation| relocation.symbol == PREPARED_ADMISSION_RUNTIME_SYMBOL)
+        {
+            update_bytes(
+                &mut digest,
+                PREPARED_ADMISSION_RUNTIME_SYMBOL_NAME.as_bytes(),
+                "prepared admission runtime symbol identity byte length",
             )?;
         }
     }
@@ -9215,6 +9248,7 @@ fn lower_x86_64_partial_prepared(
     let return_local = assembler.label()?;
     let invalid = assembler.label()?;
     let invalid_handle = assembler.label()?;
+    let fallback_after_admission = assembler.label()?;
     let fallback_runtime = assembler.label()?;
 
     // Exclusive prepared ABI: handle, haystack, length, start, end, result.
@@ -9254,6 +9288,23 @@ fn lower_x86_64_partial_prepared(
     assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, 0x40])?;
     assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x48])?;
     assembler.instruction(&[0x4c, 0x89, 0x4c, 0x24, 0x50])?;
+
+    // The admission helper receives (handle, window length). Reload every
+    // caller-saved public argument after the call before entering native rows.
+    assembler.instruction(&[0x48, 0x89, 0xc6])?; // mov rax, rsi
+    assembler.instruction(&[0xe8])?;
+    let admission_runtime_displacement_label = assembler.label()?;
+    assembler.bind(admission_runtime_displacement_label)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x85, 0xc0])?; // test eax, eax
+    assembler.branch(&[0x0f, 0x84], fallback_after_admission)?;
+    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x28])?;
+    assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x30])?;
+    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x38])?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x40])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x48])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x50])?;
+
     assembler.instruction(&[0x49, 0xc7, 0x01, 0, 0, 0, 0])?;
     assembler.instruction(&[0x49, 0xc7, 0x41, 0x08, 0, 0, 0, 0])?;
     assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x58, 0, 0, 0, 0])?;
@@ -9385,6 +9436,16 @@ fn lower_x86_64_partial_prepared(
     assembler.instruction(&[0xb8, 5, 0, 0, 0])?;
     assembler.instruction(&[0xc3])?;
 
+    assembler.bind(fallback_after_admission)?;
+    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x28])?;
+    assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x30])?;
+    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x38])?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x40])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x48])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x50])?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.branch(&[0xe9], fallback_runtime)?;
+
     assembler.bind(fallback_runtime)?;
     assembler.instruction(&[0xe9])?;
     let fallback_runtime_displacement_label = assembler.label()?;
@@ -9393,6 +9454,8 @@ fn lower_x86_64_partial_prepared(
 
     let finished = assembler.finish_with_label_offsets()?;
     let table_displacement = finished.label_offset(table_displacement_label)?;
+    let admission_runtime_displacement =
+        finished.label_offset(admission_runtime_displacement_label)?;
     let identity_displacement = finished.label_offset(identity_displacement_label)?;
     let runtime_displacement = finished.label_offset(runtime_displacement_label)?;
     let fallback_runtime_displacement =
@@ -9400,6 +9463,16 @@ fn lower_x86_64_partial_prepared(
     Ok((
         finished.code,
         vec![
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(
+                    admission_runtime_displacement,
+                    "x86 prepared admission runtime relocation",
+                )?,
+                kind: RelocationKind::X86PltRelative32,
+                symbol: PREPARED_ADMISSION_RUNTIME_SYMBOL,
+                addend: -4,
+            },
             ModuleRelocation {
                 section: TEXT_SECTION,
                 offset: offset_u64(table_displacement, "x86 partial table relocation")?,
@@ -14699,6 +14772,7 @@ fn lower_aarch64_partial_prepared(
     let return_local = assembler.label()?;
     let invalid = assembler.label()?;
     let invalid_handle = assembler.label()?;
+    let fallback_after_admission = assembler.label()?;
     let fallback_runtime = assembler.label()?;
 
     // Exclusive prepared ABI: handle, haystack, length, start, end, result.
@@ -14734,6 +14808,21 @@ fn lower_aarch64_partial_prepared(
     assembler.instruction(aarch64_store_x(3, 31, 56)?)?;
     assembler.instruction(aarch64_store_x(4, 31, 64)?)?;
     assembler.instruction(aarch64_store_x(5, 31, 72)?)?;
+
+    // The admission helper receives (handle, window length). Its call may
+    // clobber every public argument register, so restore x0..x5 before either
+    // native execution or the ordinary prepared tail branch.
+    assembler.instruction(aarch64_mov_x(1, 6)?)?;
+    let admission_runtime_branch = assembler.instruction(0x9400_0000)?;
+    assembler.instruction(aarch64_mov_x(6, 0)?)?;
+    assembler.instruction(aarch64_load_x_imm(0, 31, 32)?)?;
+    assembler.instruction(aarch64_load_x_imm(1, 31, 40)?)?;
+    assembler.instruction(aarch64_load_x_imm(2, 31, 48)?)?;
+    assembler.instruction(aarch64_load_x_imm(3, 31, 56)?)?;
+    assembler.instruction(aarch64_load_x_imm(4, 31, 64)?)?;
+    assembler.instruction(aarch64_load_x_imm(5, 31, 72)?)?;
+    assembler.branch_zero_w(6, fallback_after_admission)?;
+
     assembler.instruction(aarch64_store_x(31, 5, 0)?)?;
     assembler.instruction(aarch64_store_x(31, 5, 8)?)?;
 
@@ -14854,10 +14943,16 @@ fn lower_aarch64_partial_prepared(
     assembler.instruction(aarch64_movz_w(0, 5)?)?;
     assembler.instruction(0xd65f_03c0)?;
 
+    assembler.bind(fallback_after_admission)?;
+    assembler.instruction(aarch64_load_x_imm(30, 31, 104)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.branch(fallback_runtime)?;
+
     assembler.bind(fallback_runtime)?;
     let fallback_runtime_branch = assembler.instruction(0x1400_0000)?;
 
     let mut relocation_offsets = [
+        admission_runtime_branch,
         table_page,
         table_page_offset,
         identity_page,
@@ -14871,35 +14966,45 @@ fn lower_aarch64_partial_prepared(
         vec![
             ModuleRelocation {
                 section: TEXT_SECTION,
-                offset: offset_u64(relocation_offsets[0], "AArch64 partial table ADRP")?,
+                offset: offset_u64(
+                    relocation_offsets[0],
+                    "AArch64 prepared admission runtime branch",
+                )?,
+                kind: RelocationKind::Aarch64Branch26,
+                symbol: PREPARED_ADMISSION_RUNTIME_SYMBOL,
+                addend: 0,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(relocation_offsets[1], "AArch64 partial table ADRP")?,
                 kind: RelocationKind::Aarch64Page21,
                 symbol: PARTIAL_TABLE_SYMBOL,
                 addend: 0,
             },
             ModuleRelocation {
                 section: TEXT_SECTION,
-                offset: offset_u64(relocation_offsets[1], "AArch64 partial table ADD")?,
+                offset: offset_u64(relocation_offsets[2], "AArch64 partial table ADD")?,
                 kind: RelocationKind::Aarch64PageOff12,
                 symbol: PARTIAL_TABLE_SYMBOL,
                 addend: 0,
             },
             ModuleRelocation {
                 section: TEXT_SECTION,
-                offset: offset_u64(relocation_offsets[2], "AArch64 partial identity ADRP")?,
+                offset: offset_u64(relocation_offsets[3], "AArch64 partial identity ADRP")?,
                 kind: RelocationKind::Aarch64Page21,
                 symbol: PARTIAL_IDENTITY_SYMBOL,
                 addend: 0,
             },
             ModuleRelocation {
                 section: TEXT_SECTION,
-                offset: offset_u64(relocation_offsets[3], "AArch64 partial identity ADD")?,
+                offset: offset_u64(relocation_offsets[4], "AArch64 partial identity ADD")?,
                 kind: RelocationKind::Aarch64PageOff12,
                 symbol: PARTIAL_IDENTITY_SYMBOL,
                 addend: 0,
             },
             ModuleRelocation {
                 section: TEXT_SECTION,
-                offset: offset_u64(relocation_offsets[4], "AArch64 partial runtime branch")?,
+                offset: offset_u64(relocation_offsets[5], "AArch64 partial runtime branch")?,
                 kind: RelocationKind::Aarch64Branch26,
                 symbol: PARTIAL_RUNTIME_SYMBOL,
                 addend: 0,
@@ -14907,7 +15012,7 @@ fn lower_aarch64_partial_prepared(
             ModuleRelocation {
                 section: TEXT_SECTION,
                 offset: offset_u64(
-                    relocation_offsets[5],
+                    relocation_offsets[6],
                     "AArch64 prepared fallback runtime branch",
                 )?,
                 kind: RelocationKind::Aarch64Branch26,
@@ -17728,6 +17833,12 @@ mod tests {
                         .required_prepared_fallback_runtime_symbol()
                         .is_none()
                 );
+                assert!(
+                    compiled
+                        .module()
+                        .required_prepared_admission_runtime_symbol()
+                        .is_none()
+                );
             }
         }
     }
@@ -17796,7 +17907,7 @@ mod tests {
                     StartAccelerator::None
                 );
                 assert_eq!(compiled.module().anchored_prefix_filter_bytes(), 0);
-                assert_eq!(compiled.module().symbols().len(), 9);
+                assert_eq!(compiled.module().symbols().len(), 10);
                 assert_eq!(
                     compiled.module().symbols()[PARTIAL_RUNTIME_SYMBOL].name,
                     PARTIAL_RUNTIME_SYMBOL_NAME
@@ -17823,6 +17934,20 @@ mod tests {
                         .required_prepared_fallback_runtime_symbol(),
                     Some(PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME)
                 );
+                assert_eq!(
+                    compiled.module().symbols()[PREPARED_ADMISSION_RUNTIME_SYMBOL].name,
+                    PREPARED_ADMISSION_RUNTIME_SYMBOL_NAME
+                );
+                assert_eq!(
+                    compiled.module().symbols()[PREPARED_ADMISSION_RUNTIME_SYMBOL].section,
+                    None
+                );
+                assert_eq!(
+                    compiled
+                        .module()
+                        .required_prepared_admission_runtime_symbol(),
+                    Some(PREPARED_ADMISSION_RUNTIME_SYMBOL_NAME)
+                );
                 assert!(compiled.module().relocations().iter().any(|relocation| {
                     relocation.symbol == PARTIAL_TABLE_SYMBOL
                 }));
@@ -17834,6 +17959,9 @@ mod tests {
                 }));
                 assert!(compiled.module().relocations().iter().any(|relocation| {
                     relocation.symbol == PREPARED_FALLBACK_RUNTIME_SYMBOL
+                }));
+                assert!(compiled.module().relocations().iter().any(|relocation| {
+                    relocation.symbol == PREPARED_ADMISSION_RUNTIME_SYMBOL
                 }));
                 let serialized = compiled.program().serialize().expect("serialize program");
                 assert_eq!(
@@ -17898,6 +18026,7 @@ mod tests {
                 .map(|relocation| relocation.symbol)
                 .collect::<Vec<_>>(),
             [
+                PREPARED_ADMISSION_RUNTIME_SYMBOL,
                 PARTIAL_TABLE_SYMBOL,
                 PARTIAL_IDENTITY_SYMBOL,
                 PARTIAL_RUNTIME_SYMBOL,
@@ -17922,9 +18051,11 @@ mod tests {
             .position(|bytes| bytes == [0x3d, 0, 0, 0, 0x40])
             .expect("x86 hole compare");
         assert!(accept_clear < hole_compare);
-        let runtime_offset = usize::try_from(x86_relocations[2].offset).unwrap();
+        let admission_offset = usize::try_from(x86_relocations[0].offset).unwrap();
+        assert_eq!(x86.get(admission_offset.wrapping_sub(1)), Some(&0xe8));
+        let runtime_offset = usize::try_from(x86_relocations[3].offset).unwrap();
         assert_eq!(x86.get(runtime_offset.wrapping_sub(1)), Some(&0xe8));
-        let fallback_offset = usize::try_from(x86_relocations[3].offset).unwrap();
+        let fallback_offset = usize::try_from(x86_relocations[4].offset).unwrap();
         assert_eq!(x86.get(fallback_offset.wrapping_sub(1)), Some(&0xe9));
 
         let (aarch64, aarch64_relocations) = lower_aarch64_partial_prepared(view).unwrap();
@@ -17934,6 +18065,7 @@ mod tests {
                 .map(|relocation| relocation.symbol)
                 .collect::<Vec<_>>(),
             [
+                PREPARED_ADMISSION_RUNTIME_SYMBOL,
                 PARTIAL_TABLE_SYMBOL,
                 PARTIAL_TABLE_SYMBOL,
                 PARTIAL_IDENTITY_SYMBOL,
@@ -17954,12 +18086,21 @@ mod tests {
         assert!(words.contains(
             &aarch64_cmp_x_imm(6, u16::try_from(PARTIAL_DFA_MIN_INPUT_BYTES).unwrap()).unwrap()
         ));
-        let runtime_offset = usize::try_from(aarch64_relocations[4].offset).unwrap();
+        let admission_offset = usize::try_from(aarch64_relocations[0].offset).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(
+                aarch64[admission_offset..admission_offset + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            0x9400_0000
+        );
+        let runtime_offset = usize::try_from(aarch64_relocations[5].offset).unwrap();
         assert_eq!(
             u32::from_le_bytes(aarch64[runtime_offset..runtime_offset + 4].try_into().unwrap()),
             0x9400_0000
         );
-        let fallback_offset = usize::try_from(aarch64_relocations[5].offset).unwrap();
+        let fallback_offset = usize::try_from(aarch64_relocations[6].offset).unwrap();
         assert_eq!(
             u32::from_le_bytes(aarch64[fallback_offset..fallback_offset + 4].try_into().unwrap()),
             0x1400_0000
@@ -18107,9 +18248,12 @@ mod tests {
              uint32_t fre_aot_regex_runtime_search_v1(const unsigned char*a,const unsigned char*b,size_t c,size_t d,size_t e,size_t*f){{(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 98U;}}\n\
              uint32_t fre_aot_regex_runtime_search_exclusive_v1(\
                handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,size_t*r){{\
-               if(expect_path!=1||h!=(handle_t)(uintptr_t)0x1234U||p!=haystack||n!=sizeof(haystack)||\
-                  s!={window_start}U||e!={final_hole_end}U||r==NULL)return 89U;\
-               r[0]={fallback_start}U;r[1]={fallback_end}U;return {fallback_status}U;}}\n\
+               if(h!=(handle_t)(uintptr_t)0x1234U||p!=haystack||n!=sizeof(haystack)||s!={window_start}U||r==NULL)return 89U;\
+               if(expect_path==1&&e=={final_hole_end}U){{r[0]={fallback_start}U;r[1]={fallback_end}U;return {fallback_status}U;}}\
+               if(expect_path==3&&e=={window_end}U){{r[0]=321U;r[1]=654U;return 76U;}}return 89U;}}\n\
+             uint32_t fre_aot_regex_runtime_prepared_partial_should_enter_v1(handle_t h,size_t n){{\
+               if(h!=(handle_t)(uintptr_t)0x1234U||n!={PARTIAL_DFA_MIN_INPUT_BYTES}U)return 88U;\
+               if(expect_path==2)return 1U;if(expect_path==3)return 0U;return 88U;}}\n\
              uint32_t fre_aot_regex_runtime_search_exclusive_from_partial_v1(\
                handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,size_t*r,\
                const unsigned char*d,size_t state,size_t position,uint32_t pending,size_t pend){{\
@@ -18135,7 +18279,12 @@ mod tests {
         .unwrap();
         writeln!(
             source,
-            "expect_path=0;r[0]=91U;r[1]=92U;status={symbol}((handle_t)0,haystack,sizeof(haystack),{window_start}U,{window_end}U,r);if(status!=5U||r[0]!=91U||r[1]!=92U)return 12;"
+            "expect_path=3;r[0]=91U;r[1]=92U;status={symbol}((handle_t)(uintptr_t)0x1234U,haystack,sizeof(haystack),{window_start}U,{window_end}U,r);if(status!=76U||r[0]!=321U||r[1]!=654U)return 12;"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "expect_path=0;r[0]=91U;r[1]=92U;status={symbol}((handle_t)0,haystack,sizeof(haystack),{window_start}U,{window_end}U,r);if(status!=5U||r[0]!=91U||r[1]!=92U)return 13;"
         )
         .unwrap();
         source.push_str("return 0;}\n");

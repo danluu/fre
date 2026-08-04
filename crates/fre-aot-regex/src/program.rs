@@ -2399,6 +2399,7 @@ struct PartialDfaWorkspace {
 struct PartialDfaRuntimeState {
     consecutive_fallbacks: u8,
     bypass_remaining: u16,
+    native_entry_in_flight: bool,
     prefix_plan: Option<PartialDfaPrefixPlan>,
     prefix_supported: bool,
     #[cfg(test)]
@@ -2427,6 +2428,7 @@ impl PartialDfaRuntimeState {
     }
 
     fn admit(&mut self) -> bool {
+        self.finish_unobserved_native_entry();
         if !self.prefix_supported {
             false
         } else if self.bypass_remaining == 0 {
@@ -2437,12 +2439,36 @@ impl PartialDfaRuntimeState {
         }
     }
 
+    /// Claim one native retained-row attempt without consuming a pending
+    /// bypass. A false decision is followed immediately by the ordinary
+    /// optimizing entry, whose regular `admit` call consumes that bypass
+    /// exactly once before it falls through to K0.
+    fn claim_native_entry(&mut self) -> bool {
+        self.finish_unobserved_native_entry();
+        let enter = self.prefix_supported && self.bypass_remaining == 0;
+        self.native_entry_in_flight = enter;
+        enter
+    }
+
+    /// A native entry reports an interior hole through the continuation ABI.
+    /// If the next admission arrives without such a report, the prior native
+    /// scan necessarily completed locally and is settled as a successful
+    /// retained execution at that point.
+    fn finish_unobserved_native_entry(&mut self) {
+        if self.native_entry_in_flight {
+            self.native_entry_in_flight = false;
+            self.observe_complete();
+        }
+    }
+
     fn observe_complete(&mut self) {
+        self.native_entry_in_flight = false;
         self.consecutive_fallbacks = 0;
         self.bypass_remaining = 0;
     }
 
     fn observe_resume(&mut self, consumed: usize, input_bytes: usize) {
+        self.native_entry_in_flight = false;
         #[cfg(test)]
         {
             self.resumed = self.resumed.saturating_add(1);
@@ -3360,6 +3386,40 @@ impl CompiledProgram {
         }
     }
 
+    /// Decide whether a prepared native entry should attempt authenticated
+    /// retained rows for this input length.
+    ///
+    /// A false decision deliberately leaves a pending adaptive bypass for the
+    /// immediately following ordinary optimizing search to consume. A true
+    /// decision is completed either by an authenticated continuation call or
+    /// lazily when the next admission proves that the native scan returned
+    /// locally. This is an internal native/runtime coordination seam, not a
+    /// general search API.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invariant error when `workspace` belongs to another
+    /// semantic program.
+    #[doc(hidden)]
+    pub fn prepared_partial_should_enter_with_workspace(
+        &self,
+        workspace: &mut ProgramWorkspace,
+        input_bytes: usize,
+    ) -> Result<bool, CompileError> {
+        if !workspace.identity.compatible(&self.identity) {
+            return Err(CompileError::InternalInvariant(
+                "program workspace belongs to a different semantic program",
+            ));
+        }
+        if input_bytes < PARTIAL_DFA_MIN_INPUT_BYTES || self.partial_dfa().is_none() {
+            return Ok(false);
+        }
+        let Some(partial_workspace) = workspace.partial.as_deref_mut() else {
+            return Ok(false);
+        };
+        Ok(partial_workspace.state.claim_native_entry())
+    }
+
     /// Execute the separately prepared retained-row route.
     ///
     /// This is deliberately not selected by [`Self::search_with_workspace`].
@@ -3475,6 +3535,10 @@ impl CompiledProgram {
                 "retained partial resume has no prepared partial workspace",
             ),
         )?;
+        // Reaching the continuation ABI proves that the claimed native entry
+        // did not complete locally. Do not let a later search misclassify a
+        // failed authentication or K0 continuation as a completed probe.
+        partial_workspace.state.native_entry_in_flight = false;
         if partial_workspace
             .resume
             .as_ref()
@@ -3484,7 +3548,7 @@ impl CompiledProgram {
                 "retained partial resume has no authenticated K0 resume set",
             ));
         }
-        self.search_nfa_from_partial_resume(
+        let found = self.search_nfa_from_partial_resume(
             haystack,
             window,
             workspace.nfa.as_mut().ok_or(CompileError::InternalInvariant(
@@ -3496,7 +3560,12 @@ impl CompiledProgram {
                 position: resume_position,
                 pending_end,
             },
-        )
+        )?;
+        partial_workspace.state.observe_resume(
+            resume_position.saturating_sub(window.start),
+            window.end.saturating_sub(window.start),
+        );
+        Ok(found)
     }
 
     #[cfg(test)]
@@ -10967,6 +11036,35 @@ mod tests {
         assert!(state.admit());
         state.observe_reverse_recovered(1, 1_024);
         assert_eq!(state.reverse_recovered, 2);
+        assert_eq!(state.consecutive_fallbacks, 0);
+        assert_eq!(state.bypass_remaining, 0);
+    }
+
+    #[test]
+    fn native_partial_admission_peeks_at_bypass_and_lazily_observes_completion() {
+        let mut state = PartialDfaRuntimeState {
+            prefix_supported: true,
+            ..PartialDfaRuntimeState::default()
+        };
+        for _ in 0..2 {
+            assert!(state.claim_native_entry());
+            state.observe_resume(1, 1_024);
+        }
+        assert_eq!(state.consecutive_fallbacks, 2);
+        assert_eq!(state.bypass_remaining, 16);
+
+        for remaining in (1..=16).rev() {
+            assert!(!state.claim_native_entry());
+            assert_eq!(state.bypass_remaining, remaining);
+            assert!(!state.admit(), "ordinary entry consumes one bypass");
+            assert_eq!(state.bypass_remaining, remaining - 1);
+        }
+
+        assert!(state.claim_native_entry(), "periodic native re-probe");
+        // No continuation report means that native execution completed
+        // locally. The following decision settles that success before
+        // considering the next call.
+        assert!(state.claim_native_entry());
         assert_eq!(state.consecutive_fallbacks, 0);
         assert_eq!(state.bypass_remaining, 0);
     }

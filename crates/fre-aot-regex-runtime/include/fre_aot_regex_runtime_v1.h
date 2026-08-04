@@ -12,6 +12,8 @@
 #define FRE_AOT_REGEX_STATUS_INVALID_HANDLE 5u
 #define FRE_AOT_REGEX_STATUS_SUCCESS 0u
 #define FRE_AOT_REGEX_ARTIFACT_IDENTITY_BYTES 32u
+#define FRE_AOT_REGEX_PARTIAL_ENTRY_BYPASS 0u
+#define FRE_AOT_REGEX_PARTIAL_ENTRY_ENTER 1u
 
 typedef uint64_t FreAotRegexPreparedHandleV1;
 typedef void *FreAotRegexExclusiveHandleV1;
@@ -83,6 +85,16 @@ uint32_t fre_aot_regex_runtime_search_exclusive_v1(
     size_t window_start,
     size_t window_end,
     FreAotRegexResultV1 *result_ptr);
+
+/*
+ * Compiler-emitted adaptive admission. A bypass must be followed immediately
+ * by fre_aot_regex_runtime_search_exclusive_v1 for the same search. An entry
+ * decision must be followed by either a local native result or the partial
+ * continuation call below.
+ */
+uint32_t fre_aot_regex_runtime_prepared_partial_should_enter_v1(
+    FreAotRegexExclusiveHandleV1 handle,
+    size_t input_bytes);
 
 /*
  * Continue a retained partial-DFA hole without replay. The identity points to

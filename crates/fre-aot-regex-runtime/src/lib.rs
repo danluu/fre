@@ -32,7 +32,9 @@
 //! [`fre_aot_regex_runtime_destroy_exclusive_v1`]. That explicitly unsafe
 //! lifecycle passes an opaque allocation pointer directly and therefore pays
 //! no registry, reference-count, thread-local, or mutex cost per search.
-//! A native producer that reaches a retained partial-DFA hole can continue the
+//! A compiler-emitted retained-row entry consults
+//! [`fre_aot_regex_runtime_prepared_partial_should_enter_v1`] once per
+//! admitted window. If it then reaches a partial-DFA hole, it can continue the
 //! same exclusive session through
 //! [`fre_aot_regex_runtime_search_exclusive_from_partial_v1`]. That entry
 //! authenticates the producer's exact artifact identity and compact canonical
@@ -67,6 +69,10 @@ pub const STATUS_INVALID_HANDLE: u32 = 5;
 pub const STATUS_SUCCESS: u32 = 0;
 /// Bytes in the exact SHA-256 semantic-artifact identity accepted by resume.
 pub const ARTIFACT_IDENTITY_BYTES: usize = 32;
+/// The prepared native retained-row entry should use the ordinary executor.
+pub const PARTIAL_ENTRY_BYPASS: u32 = 0;
+/// The prepared native retained-row entry should execute its authenticated rows.
+pub const PARTIAL_ENTRY_ENTER: u32 = 1;
 
 /// C declarations for the complete stable V1 runtime ABI.
 ///
@@ -360,6 +366,14 @@ impl PreparedAotRegex {
                 resume_position,
                 pending_end,
             )
+    }
+
+    fn prepared_partial_should_enter(
+        &mut self,
+        input_bytes: usize,
+    ) -> Result<bool, CompileError> {
+        self.program
+            .prepared_partial_should_enter_with_workspace(&mut self.workspace, input_bytes)
     }
 
     /// Find the first selected span in `haystack`.
@@ -919,6 +933,45 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_v1(
     .unwrap_or(STATUS_RUNTIME_FAILURE)
 }
 
+/// Decide whether an exclusive prepared native entry should execute its
+/// retained partial-DFA rows for a window of `input_bytes` bytes.
+///
+/// Returns [`PARTIAL_ENTRY_ENTER`] or [`PARTIAL_ENTRY_BYPASS`]. This is a
+/// narrow coordination seam for compiler-emitted entries: on bypass, the
+/// entry must immediately invoke [`fre_aot_regex_runtime_search_exclusive_v1`]
+/// for the same search so the ordinary prepared path consumes one adaptive
+/// bypass. On enter, the emitted scan must either return a complete local
+/// result or report its interior hole through
+/// [`fre_aot_regex_runtime_search_exclusive_from_partial_v1`].
+///
+/// # Safety
+///
+/// `handle` must satisfy the exclusive live-handle requirements of
+/// [`fre_aot_regex_runtime_search_exclusive_v1`]. No search, admission, or
+/// destroy call may overlap this call or the native search it admits.
+#[unsafe(no_mangle)]
+#[allow(
+    unsafe_code,
+    reason = "this exported symbol is an audited exclusive raw-handle boundary"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_prepared_partial_should_enter_v1(
+    handle: FreAotRegexExclusiveHandleV1,
+    input_bytes: usize,
+) -> u32 {
+    if handle.is_invalid() {
+        return PARTIAL_ENTRY_BYPASS;
+    }
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        let prepared = &mut *handle.0.cast::<PreparedAotRegex>();
+        u32::from(
+            prepared
+                .prepared_partial_should_enter(input_bytes)
+                .unwrap_or(false),
+        )
+    }))
+    .unwrap_or(PARTIAL_ENTRY_BYPASS)
+}
+
 /// Continue an exclusively owned prepared session from an authenticated
 /// retained partial-DFA hole without replaying the consumed prefix.
 ///
@@ -1342,6 +1395,17 @@ mod tests {
         }
     }
 
+    fn call_partial_should_enter(
+        handle: FreAotRegexExclusiveHandleV1,
+        input_bytes: usize,
+    ) -> u32 {
+        // SAFETY: each test keeps exclusive ownership of the live session and
+        // does not overlap admission with search or destruction.
+        unsafe {
+            fre_aot_regex_runtime_prepared_partial_should_enter_v1(handle, input_bytes)
+        }
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "the test helper mirrors the explicit authenticated continuation ABI"
@@ -1427,6 +1491,8 @@ mod tests {
         assert_eq!(size_of::<FreAotRegexResultV1>(), size_of::<[usize; 2]>());
         assert_eq!(ARTIFACT_IDENTITY_BYTES, 32);
         assert!(C_API_V1_HEADER.contains("FRE_AOT_REGEX_ARTIFACT_IDENTITY_BYTES 32u"));
+        assert!(C_API_V1_HEADER.contains("FRE_AOT_REGEX_PARTIAL_ENTRY_BYPASS 0u"));
+        assert!(C_API_V1_HEADER.contains("FRE_AOT_REGEX_PARTIAL_ENTRY_ENTER 1u"));
         for symbol in [
             "fre_aot_regex_runtime_search_v1",
             "fre_aot_regex_runtime_prepare_v1",
@@ -1434,6 +1500,7 @@ mod tests {
             "fre_aot_regex_runtime_destroy_prepared_v1",
             "fre_aot_regex_runtime_prepare_exclusive_v1",
             "fre_aot_regex_runtime_search_exclusive_v1",
+            "fre_aot_regex_runtime_prepared_partial_should_enter_v1",
             "fre_aot_regex_runtime_search_exclusive_from_partial_v1",
             "fre_aot_regex_runtime_destroy_exclusive_v1",
         ] {
@@ -1462,6 +1529,8 @@ mod tests {
             usize,
             *mut FreAotRegexResultV1,
         ) -> u32 = fre_aot_regex_runtime_search_exclusive_v1;
+        let _: unsafe extern "C" fn(FreAotRegexExclusiveHandleV1, usize) -> u32 =
+            fre_aot_regex_runtime_prepared_partial_should_enter_v1;
         let _: unsafe extern "C" fn(
             FreAotRegexExclusiveHandleV1,
             *const u8,
@@ -2238,6 +2307,111 @@ mod tests {
                 STATUS_SUCCESS
             );
         }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the end-to-end adaptive protocol keeps admission, continuation, bypass, and lazy completion in one exclusive handle lifecycle"
+    )]
+    fn exclusive_native_partial_admission_backs_off_and_reprobes() {
+        let pattern = r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)";
+        let mut limits = CompileLimitsV1::default();
+        limits.determinize.max_states = 8;
+        let compiled = compile(
+            CompileRequest::new(pattern, Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .limits(limits)
+                .output(OutputContract::Exists),
+        )
+        .expect("compile adaptive retained partial artifact");
+        assert!(compiled.program().partial_dfa_stats().unwrap().is_some());
+        let identity = compiled.receipt().program_sha256;
+        let serialized = compiled.program().serialize().expect("serialize partial");
+        let handle = prepare_exclusive(&serialized);
+        let mut haystack = b"xxcbbbbyyy".to_vec();
+        haystack.resize(1_024, b'x');
+        let expected = expected_ffi(
+            compiled
+                .search(&haystack, SearchWindow::full(&haystack))
+                .expect("portable adaptive result"),
+        );
+
+        for _ in 0..2 {
+            assert_eq!(
+                call_partial_should_enter(handle, haystack.len()),
+                PARTIAL_ENTRY_ENTER
+            );
+            let mut result = FreAotRegexResultV1::default();
+            assert_eq!(
+                call_exclusive_from_partial(
+                    handle,
+                    &haystack,
+                    0,
+                    haystack.len(),
+                    &mut result,
+                    &identity,
+                    0,
+                    5,
+                    None,
+                ),
+                expected.0
+            );
+            assert_eq!(result, expected.1);
+        }
+
+        for _ in 0..16 {
+            assert_eq!(
+                call_partial_should_enter(handle, haystack.len()),
+                PARTIAL_ENTRY_BYPASS
+            );
+            let mut result = FreAotRegexResultV1::default();
+            assert_eq!(
+                call_exclusive(handle, &haystack, 0, haystack.len(), &mut result),
+                expected.0
+            );
+            assert_eq!(result, expected.1);
+        }
+
+        assert_eq!(
+            call_partial_should_enter(handle, haystack.len()),
+            PARTIAL_ENTRY_ENTER,
+            "periodic native re-probe"
+        );
+        // Model a native scan that returned locally: no continuation call is
+        // made, so the next admission must settle it as a completion.
+        assert_eq!(
+            call_partial_should_enter(handle, haystack.len()),
+            PARTIAL_ENTRY_ENTER,
+            "local native completion resets adaptive backoff"
+        );
+        let mut result = FreAotRegexResultV1::default();
+        assert_eq!(
+            call_exclusive_from_partial(
+                handle,
+                &haystack,
+                0,
+                haystack.len(),
+                &mut result,
+                &identity,
+                0,
+                5,
+                None,
+            ),
+            expected.0
+        );
+        assert_eq!(result, expected.1);
+        assert_eq!(
+            call_partial_should_enter(FreAotRegexExclusiveHandleV1::INVALID, haystack.len()),
+            PARTIAL_ENTRY_BYPASS
+        );
+
+        // SAFETY: the handle remains uniquely owned and no call overlaps its
+        // destruction.
+        assert_eq!(
+            unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(handle) },
+            STATUS_SUCCESS
+        );
     }
 
     #[test]
