@@ -3,7 +3,10 @@
 use core::{fmt, mem::size_of};
 
 use aho_corasick::packed::Searcher;
-use memchr::{memchr, memchr2, memchr3};
+use memchr::{
+    memchr, memchr2, memchr3,
+    memmem::{Finder, FinderBuilder},
+};
 
 use crate::Window;
 
@@ -25,16 +28,20 @@ pub const CERTIFIED_MAX_PATTERNS: usize = MAX_FACTORED_PATTERNS;
 const MAX_FACTORED_COLUMNS: usize = 16;
 const MAX_FACTORED_ANCHOR_BYTES: usize = 3;
 const FACTORED_SIMD_MINIMUM_HAYSTACK_BYTES: usize = 32;
-// A sparse anchor verifies a bounded number of candidates itself. If those
-// candidates are all decoys, the native packed searcher resumes after the
-// last start already disproved. Thus sparse inputs need only one source pass,
-// while dense decoys pay bounded work and never restart from byte zero.
-const SPARSE_ANCHOR_CANDIDATE_BUDGET: usize = 4;
-const SPARSE_ANCHOR_MAX_RETAINED_PATTERN_BYTES: usize = 4 * 1024;
-// Retain only anchor groups whose exact source-order verification fits in two
+// A native side filter verifies a bounded number of candidates itself. If
+// those candidates are all decoys, the packed searcher resumes after the last
+// start already disproved. Thus sparse inputs need only one source pass, while
+// dense decoys pay bounded work and never restart from byte zero.
+const NATIVE_FILTER_CANDIDATE_BUDGET: usize = 4;
+const NATIVE_FILTER_MAX_RETAINED_PATTERN_BYTES: usize = 4 * 1024;
+// Retain only filters whose exact source-order verification fits in two
 // 16-byte blocks. After a rejection, another candidate is attempted only when
 // the proved skip amortizes all exact verification performed so far.
-const SPARSE_ANCHOR_MAX_CANDIDATE_VERIFICATION_WORK: usize = 32;
+const NATIVE_FILTER_MAX_CANDIDATE_VERIFICATION_WORK: usize = 32;
+// A one-byte common fragment is already represented by `SparseAnchor`. Two
+// bytes are the smallest exact fragment whose occurrence stream can prove
+// strictly more impossible starts than that byte-set route.
+const SHARED_FRAGMENT_MIN_BYTES: usize = 2;
 
 /// Hard limits for a packed finite-literal plan.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -253,6 +260,29 @@ struct SparseAnchor {
     patterns: Box<[u8]>,
 }
 
+/// A longest exact byte run occurring at one fixed offset in every literal.
+///
+/// Short sources remain entirely native. On longer sources a bounded native
+/// prefix proves early starts before one monotone substring scan finds the only
+/// remaining starts at which any alternative can match. The fragment itself
+/// needs no second comparison, so source-order verification reads only bytes
+/// outside it. Dense false occurrences hand back to the native searcher.
+#[derive(Clone, Debug)]
+struct SharedFragment {
+    offset: usize,
+    width: usize,
+    minimum_pattern_width: usize,
+    maximum_candidate_verification_work: usize,
+    // Maximum source length kept wholly on the native engine and, on longer
+    // sources, the exclusive start boundary proved by its prefix search.
+    native_start_budget: usize,
+    finder: Finder<'static>,
+    // Source-order patterns encoded as a little-endian u16 width followed by
+    // the bytes. The retained-byte and candidate-work proofs are shared with
+    // `SparseAnchor`.
+    patterns: Box<[u8]>,
+}
+
 impl SparseAnchor {
     fn earliest_possible_start_from(&self, haystack: &[u8], minimum_start: usize) -> Option<usize> {
         let last_start = haystack.len().checked_sub(self.minimum_pattern_width)?;
@@ -301,6 +331,50 @@ impl SparseAnchor {
         size_of::<Self>()
             .checked_add(self.patterns.len())
             .expect("the sparse-anchor construction cap proves its persistent bytes")
+    }
+}
+
+impl SharedFragment {
+    fn earliest_possible_start_from(&self, haystack: &[u8], minimum_start: usize) -> Option<usize> {
+        let last_start = haystack.len().checked_sub(self.minimum_pattern_width)?;
+        if minimum_start > last_start {
+            return None;
+        }
+        let scan_start = minimum_start.checked_add(self.offset)?;
+        let scan_end = last_start
+            .checked_add(self.offset)?
+            .checked_add(self.width)?;
+        let relative = self.finder.find(haystack.get(scan_start..scan_end)?)?;
+        minimum_start.checked_add(relative)
+    }
+
+    fn verify_at(&self, haystack: &[u8], start: usize) -> Option<usize> {
+        let fragment_end = self.offset.checked_add(self.width)?;
+        let mut encoded = self.patterns.as_ref();
+        while !encoded.is_empty() {
+            let (&low, rest) = encoded.split_first()?;
+            let (&high, rest) = rest.split_first()?;
+            let width = usize::from(u16::from_le_bytes([low, high]));
+            let (pattern, rest) = rest.split_at_checked(width)?;
+            encoded = rest;
+            let end = start.checked_add(width)?;
+            let Some(candidate) = haystack.get(start..end) else {
+                continue;
+            };
+            if candidate.get(..self.offset) == pattern.get(..self.offset)
+                && candidate.get(fragment_end..) == pattern.get(fragment_end..)
+            {
+                return Some(end);
+            }
+        }
+        None
+    }
+
+    fn persistent_bytes(&self) -> usize {
+        size_of::<Self>()
+            .checked_add(self.patterns.len())
+            .and_then(|bytes| bytes.checked_add(self.width))
+            .expect("the shared-fragment construction caps prove its persistent bytes")
     }
 }
 
@@ -354,6 +428,10 @@ enum PackedLiteralEngine {
         searcher: Searcher,
         sparse_anchor: Box<SparseAnchor>,
     },
+    NativeSharedFragment {
+        searcher: Searcher,
+        shared_fragment: Box<SharedFragment>,
+    },
     Factored(Box<FactoredColumns>),
 }
 
@@ -361,10 +439,11 @@ enum PackedLiteralEngine {
 ///
 /// This is a shared native primitive, not pattern-specialized JIT code. The
 /// pinned implementation uses Teddy on supported x86-64/AArch64 haystacks and
-/// a bounded Rabin-Karp path for short inputs. Larger complete byte-column
-/// products use one native byte-set scan plus exact column verification.
-/// Construction refuses unsupported targets/shapes and search never changes
-/// plan after selection.
+/// a bounded Rabin-Karp path for short inputs. Native sets may first scan a
+/// proved shared fixed-offset fragment before source-order tail verification.
+/// Larger complete byte-column products use one native byte-set scan plus exact
+/// column verification. Construction refuses unsupported targets/shapes and
+/// search never changes plan after selection.
 #[derive(Clone, Debug)]
 pub struct PackedLiteralSetPlan {
     engine: PackedLiteralEngine,
@@ -386,13 +465,27 @@ impl PackedLiteralSetPlan {
         let mut build = preflight(patterns, limits)?;
         let engine =
             if let Some(native_searcher) = Searcher::new(patterns.iter().map(AsRef::as_ref)) {
+                // Preserve an already-admitted sparse anchor: a rare byte at
+                // another offset can be more selective than a common fragment.
+                // The fragment route expands only native sets whose byte
+                // anchor could not bound source-order candidate verification.
                 let sparse_anchor = select_sparse_anchor(patterns).map(Box::new);
+                let shared_fragment = if sparse_anchor.is_some() {
+                    None
+                } else {
+                    select_shared_fragment(patterns, native_searcher.minimum_len()).map(Box::new)
+                };
                 build.persistent_bytes = native_searcher
                     .memory_usage()
                     .checked_add(
-                        sparse_anchor
-                            .as_ref()
-                            .map_or(0, |anchor| anchor.persistent_bytes()),
+                        sparse_anchor.as_ref().map_or_else(
+                            || {
+                                shared_fragment
+                                    .as_ref()
+                                    .map_or(0, |fragment| fragment.persistent_bytes())
+                            },
+                            |anchor| anchor.persistent_bytes(),
+                        ),
                     )
                     .ok_or(PackedLiteralSetError::ArithmeticOverflow {
                         computation: "packed literal persistent bytes",
@@ -403,6 +496,11 @@ impl PackedLiteralSetPlan {
                     PackedLiteralEngine::NativeSparse {
                         searcher: native_searcher,
                         sparse_anchor,
+                    }
+                } else if let Some(shared_fragment) = shared_fragment {
+                    PackedLiteralEngine::NativeSharedFragment {
+                        searcher: native_searcher,
+                        shared_fragment,
                     }
                 } else {
                     PackedLiteralEngine::Native(native_searcher)
@@ -500,6 +598,15 @@ impl PackedLiteralSetPlan {
                 searcher,
                 sparse_anchor,
             } => find_native(searcher, sparse_anchor, window_bytes),
+            PackedLiteralEngine::NativeSharedFragment {
+                searcher,
+                shared_fragment,
+            } => find_native_shared_fragment(
+                searcher,
+                shared_fragment,
+                self.build.max_pattern_bytes,
+                window_bytes,
+            ),
             PackedLiteralEngine::Factored(factored) => {
                 accounting.factored_columns = true;
                 factored.find(window_bytes)
@@ -516,13 +623,98 @@ impl PackedLiteralSetPlan {
 }
 
 #[inline]
+fn find_native_shared_fragment(
+    searcher: &Searcher,
+    fragment: &SharedFragment,
+    maximum_pattern_width: usize,
+    haystack: &[u8],
+) -> Option<(usize, usize)> {
+    let native_start_budget = fragment.native_start_budget;
+    if haystack.len() <= native_start_budget {
+        return searcher
+            .find(haystack)
+            .map(|matched| (matched.start(), matched.end()));
+    }
+    let Some(native_prefix_end) = maximum_pattern_width
+        .checked_sub(1)
+        .and_then(|overlap| native_start_budget.checked_add(overlap))
+        .map(|end| end.min(haystack.len()))
+    else {
+        return searcher
+            .find(haystack)
+            .map(|matched| (matched.start(), matched.end()));
+    };
+    let native_prefix_match = searcher.find(&haystack[..native_prefix_end]);
+    if native_prefix_end == haystack.len()
+        || native_prefix_match
+            .as_ref()
+            .is_some_and(|matched| matched.start() < native_start_budget)
+    {
+        return native_prefix_match.map(|matched| (matched.start(), matched.end()));
+    }
+
+    // The public certificate charges every alternative at every possible
+    // start. The bounded native prefix includes `maximum_pattern_width - 1`
+    // bytes of right overlap, proving every start below `native_start_budget`.
+    // The remaining envelope covers the monotone fragment pass, at most four
+    // bounded outside-fragment verifications, and one packed fallback over a
+    // suffix whose earlier starts have already been disproved.
+    let fragment_haystack = haystack.get(native_start_budget..)?;
+    let mut minimum_start = 0_usize;
+    for attempt in 0..NATIVE_FILTER_CANDIDATE_BUDGET {
+        let candidate = fragment.earliest_possible_start_from(fragment_haystack, minimum_start)?;
+        let after_candidate = candidate.checked_add(1)?;
+        let verification_attempts = attempt.checked_add(1)?;
+        let required_skip = fragment
+            .maximum_candidate_verification_work
+            .checked_mul(verification_attempts)?;
+        // Do not pay an exact probe that its proved source skip cannot
+        // amortize. The native fallback restarts at the first unverified start,
+        // so an actual match at this candidate and all overlaps remain visible.
+        if after_candidate < required_skip {
+            break;
+        }
+        if let Some(end) = fragment.verify_at(fragment_haystack, candidate) {
+            return Some((
+                native_start_budget.checked_add(candidate)?,
+                native_start_budget.checked_add(end)?,
+            ));
+        }
+        minimum_start = after_candidate;
+    }
+    let fallback_start = native_start_budget.checked_add(minimum_start)?;
+    searcher
+        .find(&haystack[fallback_start..])
+        .and_then(|matched| {
+            Some((
+                fallback_start.checked_add(matched.start())?,
+                fallback_start.checked_add(matched.end())?,
+            ))
+        })
+}
+
+fn shared_fragment_native_start_budget(
+    native_minimum_haystack_bytes: usize,
+    maximum_candidate_verification_work: usize,
+) -> usize {
+    // `minimum_len` is the native engine's smallest packed-effective service
+    // quantum. A fragment probe may directly visit at most
+    // `NATIVE_FILTER_CANDIDATE_BUDGET` candidates, each with the retained
+    // worst-case verification work. Only a source longer than that complete
+    // bounded filter envelope pays for a second engine.
+    maximum_candidate_verification_work
+        .saturating_mul(NATIVE_FILTER_CANDIDATE_BUDGET)
+        .saturating_mul(native_minimum_haystack_bytes)
+}
+
+#[inline]
 fn find_native(
     searcher: &Searcher,
     anchor: &SparseAnchor,
     haystack: &[u8],
 ) -> Option<(usize, usize)> {
     let mut minimum_start = 0_usize;
-    for attempt in 0..SPARSE_ANCHOR_CANDIDATE_BUDGET {
+    for attempt in 0..NATIVE_FILTER_CANDIDATE_BUDGET {
         let candidate = anchor.earliest_possible_start_from(haystack, minimum_start)?;
         if let Some(end) = anchor.verify_at(haystack, candidate) {
             return Some((candidate, end));
@@ -570,7 +762,7 @@ fn select_sparse_anchor<P: AsRef<[u8]>>(patterns: &[P]) -> Option<SparseAnchor> 
         let _ = u16::try_from(width).ok()?;
         total.checked_add(width)?.checked_add(size_of::<u16>())
     })?;
-    if retained_pattern_bytes > SPARSE_ANCHOR_MAX_RETAINED_PATTERN_BYTES {
+    if retained_pattern_bytes > NATIVE_FILTER_MAX_RETAINED_PATTERN_BYTES {
         return None;
     }
     let minimum_width = patterns
@@ -629,7 +821,7 @@ fn select_sparse_anchor<P: AsRef<[u8]>>(patterns: &[P]) -> Option<SparseAnchor> 
         maximum_candidate_verification_work = maximum_candidate_verification_work.max(group_work);
     }
     debug_assert_eq!(retained.len(), retained_pattern_bytes);
-    if maximum_candidate_verification_work > SPARSE_ANCHOR_MAX_CANDIDATE_VERIFICATION_WORK {
+    if maximum_candidate_verification_work > NATIVE_FILTER_MAX_CANDIDATE_VERIFICATION_WORK {
         return None;
     }
     Some(SparseAnchor {
@@ -639,6 +831,104 @@ fn select_sparse_anchor<P: AsRef<[u8]>>(patterns: &[P]) -> Option<SparseAnchor> 
         minimum_pattern_width: minimum_width,
         group_ends,
         maximum_candidate_verification_work,
+        patterns: retained.into_boxed_slice(),
+    })
+}
+
+fn select_shared_fragment<P: AsRef<[u8]>>(
+    patterns: &[P],
+    native_minimum_haystack_bytes: usize,
+) -> Option<SharedFragment> {
+    if patterns.len() < 2 {
+        return None;
+    }
+    let retained_pattern_bytes = patterns.iter().try_fold(0_usize, |total, pattern| {
+        let width = pattern.as_ref().len();
+        let _ = u16::try_from(width).ok()?;
+        total.checked_add(width)?.checked_add(size_of::<u16>())
+    })?;
+    if retained_pattern_bytes > NATIVE_FILTER_MAX_RETAINED_PATTERN_BYTES {
+        return None;
+    }
+    let first = patterns.first()?.as_ref();
+    let minimum_pattern_width = patterns
+        .iter()
+        .map(|pattern| pattern.as_ref().len())
+        .min()?;
+    let mut best_offset = 0_usize;
+    let mut best_width = 0_usize;
+    let mut best_frequency_score = u64::MAX;
+    let mut column = 0_usize;
+    while column < minimum_pattern_width {
+        if patterns
+            .iter()
+            .any(|pattern| pattern.as_ref()[column] != first[column])
+        {
+            column = column.checked_add(1)?;
+            continue;
+        }
+        let run_start = column;
+        let mut frequency_score = 0_u64;
+        while column < minimum_pattern_width
+            && patterns
+                .iter()
+                .all(|pattern| pattern.as_ref()[column] == first[column])
+        {
+            frequency_score = frequency_score.checked_add(
+                u64::from(crate::packed_ordered_literal_aggregate::byte_frequency_rank(
+                    first[column],
+                )) + 1,
+            )?;
+            column = column.checked_add(1)?;
+        }
+        let run_width = column.checked_sub(run_start)?;
+        if run_width > best_width
+            || (run_width == best_width
+                && (frequency_score, run_start) < (best_frequency_score, best_offset))
+        {
+            best_offset = run_start;
+            best_width = run_width;
+            best_frequency_score = frequency_score;
+        }
+    }
+    if best_width < SHARED_FRAGMENT_MIN_BYTES {
+        return None;
+    }
+    let maximum_candidate_verification_work = patterns.iter().try_fold(
+        0_usize,
+        |work, pattern| {
+            pattern
+                .as_ref()
+                .len()
+                .checked_sub(best_width)?
+                .checked_add(1)?
+                .checked_add(work)
+        },
+    )?;
+    if maximum_candidate_verification_work > NATIVE_FILTER_MAX_CANDIDATE_VERIFICATION_WORK {
+        return None;
+    }
+    let native_start_budget = shared_fragment_native_start_budget(
+        native_minimum_haystack_bytes,
+        maximum_candidate_verification_work,
+    );
+
+    let mut retained = Vec::with_capacity(retained_pattern_bytes);
+    for pattern in patterns {
+        let pattern = pattern.as_ref();
+        retained.extend_from_slice(&u16::try_from(pattern.len()).ok()?.to_le_bytes());
+        retained.extend_from_slice(pattern);
+    }
+    let fragment_end = best_offset.checked_add(best_width)?;
+    let mut needle = Vec::with_capacity(best_width);
+    needle.extend_from_slice(first.get(best_offset..fragment_end)?);
+    Some(SharedFragment {
+        offset: best_offset,
+        width: best_width,
+        minimum_pattern_width,
+        maximum_candidate_verification_work,
+        native_start_budget,
+        finder: FinderBuilder::new().build_forward_owned(needle),
         patterns: retained.into_boxed_slice(),
     })
 }
@@ -841,9 +1131,10 @@ fn preflight<P: AsRef<[u8]>>(
 #[cfg(test)]
 mod tests {
     use super::{
-        BUILD_FACTOR, PackedLiteralEngine, PackedLiteralSetAccounting, PackedLiteralSetBuildLimits,
-        PackedLiteralSetError, PackedLiteralSetPlan, PackedLiteralSetSearchLimits,
-        select_sparse_anchor,
+        BUILD_FACTOR, NATIVE_FILTER_CANDIDATE_BUDGET, PackedLiteralEngine,
+        PackedLiteralSetAccounting, PackedLiteralSetBuildLimits, PackedLiteralSetError,
+        PackedLiteralSetPlan, PackedLiteralSetSearchLimits, select_shared_fragment,
+        select_sparse_anchor, shared_fragment_native_start_budget,
     };
     use crate::Window;
 
@@ -874,6 +1165,12 @@ mod tests {
 
     fn pattern_refs(patterns: &[Vec<u8>]) -> Vec<&[u8]> {
         patterns.iter().map(Vec::as_slice).collect()
+    }
+
+    fn shared_prefix_patterns() -> [&'static [u8]; 8] {
+        [
+            b"aa00", b"aa11", b"aa22", b"aa33", b"aa44", b"aa55", b"aa66", b"aa77",
+        ]
     }
 
     fn cartesian_patterns() -> Vec<Vec<u8>> {
@@ -1002,7 +1299,8 @@ mod tests {
     fn assert_native_anchor_matches_unfiltered(plan: &PackedLiteralSetPlan, haystack: &[u8]) {
         let searcher = match &plan.engine {
             PackedLiteralEngine::Native(searcher)
-            | PackedLiteralEngine::NativeSparse { searcher, .. } => searcher,
+            | PackedLiteralEngine::NativeSparse { searcher, .. }
+            | PackedLiteralEngine::NativeSharedFragment { searcher, .. } => searcher,
             PackedLiteralEngine::Factored(_) => {
                 panic!("differential helper requires a native packed plan")
             }
@@ -1238,6 +1536,385 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn shared_fragment_selects_the_longest_fixed_offset_run() {
+        let prefix_patterns = [
+            b"xy00".as_slice(),
+            b"xy11".as_slice(),
+            b"xy22".as_slice(),
+            b"xy33".as_slice(),
+            b"xy44".as_slice(),
+            b"xy55".as_slice(),
+            b"xy66".as_slice(),
+            b"xy77".as_slice(),
+        ];
+        let prefix = select_shared_fragment(&prefix_patterns, 1).unwrap();
+        assert_eq!((prefix.offset, prefix.width), (0, 2));
+        assert_eq!(prefix.maximum_candidate_verification_work, 24);
+
+        let interior_patterns = [
+            b"aQR0".as_slice(),
+            b"bQR1".as_slice(),
+            b"cQR2".as_slice(),
+        ];
+        let interior = select_shared_fragment(&interior_patterns, 1).unwrap();
+        assert_eq!((interior.offset, interior.width), (1, 2));
+        assert_eq!(interior.maximum_candidate_verification_work, 9);
+        assert!(select_sparse_anchor(&interior_patterns).is_some());
+        if let Some(incumbent) = plan(&interior_patterns) {
+            assert!(matches!(
+                &incumbent.engine,
+                PackedLiteralEngine::NativeSparse { .. }
+            ));
+        }
+
+        let expensive = [
+            b"xy00".as_slice(),
+            b"xy11".as_slice(),
+            b"xy22".as_slice(),
+            b"xy33".as_slice(),
+            b"xy44".as_slice(),
+            b"xy55".as_slice(),
+            b"xy66".as_slice(),
+            b"xy77".as_slice(),
+            b"xy88".as_slice(),
+            b"xy99".as_slice(),
+            b"xyAA".as_slice(),
+        ];
+        assert!(select_shared_fragment(&expensive, 1).is_none());
+        assert!(
+            select_shared_fragment(&[b"ab".as_slice(), b"ac".as_slice()], 1).is_none()
+        );
+    }
+
+    #[test]
+    fn native_shared_fragment_cost_and_persistence_are_bounded() {
+        let patterns = shared_prefix_patterns();
+        let Some(plan) = plan(&patterns) else {
+            return;
+        };
+        let PackedLiteralEngine::NativeSharedFragment {
+            searcher,
+            shared_fragment: fragment,
+        } = &plan.engine
+        else {
+            panic!("shared-prefix language did not retain its common fragment")
+        };
+        assert_eq!((fragment.offset, fragment.width), (0, 2));
+        let native_start_budget = fragment.native_start_budget;
+        let expected_quanta = fragment
+            .maximum_candidate_verification_work
+            .checked_mul(NATIVE_FILTER_CANDIDATE_BUDGET)
+            .unwrap();
+        assert_eq!(
+            native_start_budget,
+            shared_fragment_native_start_budget(
+                searcher.minimum_len(),
+                fragment.maximum_candidate_verification_work,
+            )
+        );
+        assert_eq!(
+            native_start_budget,
+            searcher.minimum_len().checked_mul(expected_quanta).unwrap()
+        );
+        let persistent = plan.build_accounting().persistent_bytes;
+        assert_eq!(
+            PackedLiteralSetPlan::new(
+                &patterns,
+                PackedLiteralSetBuildLimits {
+                    max_persistent_bytes: persistent,
+                    ..PackedLiteralSetBuildLimits::default()
+                },
+            )
+            .unwrap()
+            .build_accounting()
+            .persistent_bytes,
+            persistent
+        );
+        assert!(matches!(
+            PackedLiteralSetPlan::new(
+                &patterns,
+                PackedLiteralSetBuildLimits {
+                    max_persistent_bytes: persistent - 1,
+                    ..PackedLiteralSetBuildLimits::default()
+                },
+            ),
+            Err(PackedLiteralSetError::PersistentBytesLimit { needed, limit })
+                if needed == persistent && limit == persistent - 1
+        ));
+    }
+
+    #[test]
+    fn native_shared_fragment_preserves_priority_windows_and_dense_fallback() {
+        let patterns = shared_prefix_patterns();
+        let Some(plan) = plan(&patterns) else {
+            return;
+        };
+        let PackedLiteralEngine::NativeSharedFragment {
+            shared_fragment,
+            ..
+        } = &plan.engine
+        else {
+            panic!("shared-prefix language did not retain its common fragment")
+        };
+        let native_start_budget = shared_fragment.native_start_budget;
+        let decoy_start = native_start_budget.checked_add(128).unwrap();
+        let decoy_end = decoy_start.checked_add(12).unwrap();
+        let match_start = native_start_budget.checked_add(300).unwrap();
+        let match_end = match_start.checked_add(4).unwrap();
+        let haystack_len = match_end.checked_add(60).unwrap();
+        let mut haystack = vec![b'.'; haystack_len];
+        // The native prefix first proves all earlier starts. The distant run
+        // then supplies overlapping fragment occurrences; four are verified
+        // before the packed fallback resumes beyond starts already disproved.
+        haystack[decoy_start..decoy_end].fill(b'a');
+        haystack[match_start..match_end].copy_from_slice(b"aa77");
+        assert_native_anchor_matches_unfiltered(&plan, b"aazz....aa77");
+        assert_eq!(
+            plan.find(&haystack, PackedLiteralSetSearchLimits::unlimited())
+                .unwrap()
+                .0,
+            Some((match_start, match_end))
+        );
+        assert_search_certificate(
+            &plan,
+            false,
+            &haystack,
+            Window::full(&haystack),
+            Some((match_start, match_end)),
+        );
+        assert_eq!(
+            plan.find_window(
+                &haystack,
+                Window::new(41, match_end),
+                PackedLiteralSetSearchLimits::unlimited(),
+            )
+            .unwrap()
+            .0,
+            Some((match_start, match_end))
+        );
+        assert_eq!(
+            plan.find_window(
+                &haystack,
+                Window::new(41, match_end.checked_sub(1).unwrap()),
+                PackedLiteralSetSearchLimits::unlimited(),
+            )
+            .unwrap()
+            .0,
+            None
+        );
+
+        haystack.fill(b'.');
+        haystack[7..11].copy_from_slice(b"aa22");
+        assert_native_anchor_matches_unfiltered(&plan, &haystack[..48]);
+        assert_eq!(
+            plan.find(&haystack, PackedLiteralSetSearchLimits::unlimited())
+                .unwrap()
+                .0,
+            Some((7, 11))
+        );
+    }
+
+    #[test]
+    fn native_shared_fragment_prefix_boundary_has_exact_right_overlap() {
+        let patterns = shared_prefix_patterns();
+        let Some(plan) = plan(&patterns) else {
+            return;
+        };
+        let PackedLiteralEngine::NativeSharedFragment {
+            searcher,
+            shared_fragment,
+        } = &plan.engine
+        else {
+            panic!("shared-prefix language did not retain its common fragment")
+        };
+        let native_start_budget = shared_fragment.native_start_budget;
+        let short_match_start = native_start_budget.checked_sub(4).unwrap();
+        let mut short_haystack = vec![b'.'; native_start_budget];
+        short_haystack[short_match_start..native_start_budget].copy_from_slice(b"aa11");
+        assert_eq!(
+            plan.find(
+                &short_haystack,
+                PackedLiteralSetSearchLimits::unlimited(),
+            )
+            .unwrap()
+            .0,
+            Some((short_match_start, native_start_budget))
+        );
+
+        let haystack_len = native_start_budget.checked_add(64).unwrap();
+        for match_start in [
+            native_start_budget.checked_sub(1).unwrap(),
+            native_start_budget,
+            native_start_budget.checked_add(1).unwrap(),
+        ] {
+            let mut haystack = vec![b'.'; haystack_len];
+            let match_end = match_start.checked_add(4).unwrap();
+            haystack[match_start..match_end].copy_from_slice(b"aa22");
+            let expected = searcher
+                .find(&haystack)
+                .map(|matched| (matched.start(), matched.end()));
+            assert_eq!(expected, Some((match_start, match_end)));
+            assert_eq!(
+                plan.find(&haystack, PackedLiteralSetSearchLimits::unlimited())
+                    .unwrap()
+                    .0,
+                expected
+            );
+        }
+        let miss = vec![b'.'; haystack_len];
+        assert_eq!(
+            plan.find(&miss, PackedLiteralSetSearchLimits::unlimited())
+                .unwrap()
+                .0,
+            None
+        );
+
+        let window_start = 17_usize;
+        let match_start = window_start
+            .checked_add(native_start_budget)
+            .and_then(|start| start.checked_sub(1))
+            .unwrap();
+        let match_end = match_start.checked_add(4).unwrap();
+        let mut windowed = vec![b'.'; window_start.checked_add(haystack_len).unwrap()];
+        windowed[match_start..match_end].copy_from_slice(b"aa44");
+        assert_eq!(
+            plan.find_window(
+                &windowed,
+                Window::new(window_start, windowed.len()),
+                PackedLiteralSetSearchLimits::unlimited(),
+            )
+            .unwrap()
+            .0,
+            Some((match_start, match_end))
+        );
+        assert_eq!(
+            plan.find_window(
+                &windowed,
+                Window::new(window_start, match_end.checked_sub(1).unwrap()),
+                PackedLiteralSetSearchLimits::unlimited(),
+            )
+            .unwrap()
+            .0,
+            None
+        );
+    }
+
+    #[test]
+    fn shared_fragment_verification_keeps_source_order() {
+        let long_first_patterns = [
+            b"xy00".as_slice(),
+            b"xy".as_slice(),
+            b"xy11".as_slice(),
+            b"xy22".as_slice(),
+            b"xy33".as_slice(),
+            b"xy44".as_slice(),
+            b"xy55".as_slice(),
+            b"xy66".as_slice(),
+        ];
+        let Some(long_first) = plan(&long_first_patterns) else {
+            return;
+        };
+        let PackedLiteralEngine::NativeSharedFragment {
+            shared_fragment,
+            ..
+        } = &long_first.engine
+        else {
+            panic!("shared-prefix language did not retain its common fragment")
+        };
+        let native_start_budget = shared_fragment.native_start_budget;
+        let match_start = native_start_budget.checked_add(48).unwrap();
+        let match_end = match_start.checked_add(4).unwrap();
+        let mut priority_haystack = vec![b'.'; match_end.checked_add(48).unwrap()];
+        priority_haystack[match_start..match_end].copy_from_slice(b"xy00");
+        assert_eq!(
+            long_first
+                .find(
+                    &priority_haystack,
+                    PackedLiteralSetSearchLimits::unlimited(),
+                )
+                .unwrap()
+                .0,
+            Some((match_start, match_end))
+        );
+        let short_first_patterns = [
+            b"xy".as_slice(),
+            b"xy00".as_slice(),
+            b"xy11".as_slice(),
+            b"xy22".as_slice(),
+            b"xy33".as_slice(),
+            b"xy44".as_slice(),
+            b"xy55".as_slice(),
+            b"xy66".as_slice(),
+        ];
+        let Some(short_first) = plan(&short_first_patterns) else {
+            return;
+        };
+        let PackedLiteralEngine::NativeSharedFragment {
+            shared_fragment,
+            ..
+        } = &short_first.engine
+        else {
+            panic!("reordered shared-prefix language lost its common fragment")
+        };
+        assert_eq!(
+            shared_fragment.native_start_budget,
+            native_start_budget
+        );
+        assert_eq!(
+            short_first
+                .find(
+                    &priority_haystack,
+                    PackedLiteralSetSearchLimits::unlimited(),
+                )
+                .unwrap()
+                .0,
+            Some((match_start, match_start.checked_add(2).unwrap()))
+        );
+    }
+
+    #[test]
+    fn shared_fragment_verification_handles_interior_offsets() {
+        let interior_patterns = [
+            b"aQR0".as_slice(),
+            b"bQR1".as_slice(),
+            b"cQR2".as_slice(),
+            b"dQR3".as_slice(),
+            b"eQR4".as_slice(),
+            b"fQR5".as_slice(),
+            b"gQR6".as_slice(),
+            b"hQR7".as_slice(),
+        ];
+        let Some(interior) = plan(&interior_patterns) else {
+            return;
+        };
+        let PackedLiteralEngine::NativeSharedFragment {
+            shared_fragment,
+            ..
+        } = &interior.engine
+        else {
+            panic!("shared-interior language did not retain its common fragment")
+        };
+        let interior_budget = shared_fragment.native_start_budget;
+        let decoy_start = interior_budget.checked_add(32).unwrap();
+        let decoy_end = decoy_start.checked_add(4).unwrap();
+        let match_start = interior_budget.checked_add(72).unwrap();
+        let match_end = match_start.checked_add(4).unwrap();
+        let mut interior_haystack = vec![b'.'; match_end.checked_add(48).unwrap()];
+        interior_haystack[decoy_start..decoy_end].copy_from_slice(b"aQRx");
+        interior_haystack[match_start..match_end].copy_from_slice(b"bQR1");
+        assert_eq!(
+            interior
+                .find(
+                    &interior_haystack,
+                    PackedLiteralSetSearchLimits::unlimited(),
+                )
+                .unwrap()
+                .0,
+            Some((match_start, match_end))
+        );
     }
 
     #[test]
