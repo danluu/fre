@@ -112,10 +112,15 @@ const LAZY_CELL_UNFILLED: u32 = u32::MAX;
 const LAZY_NO_STATE: u32 = u32::MAX;
 #[cfg(test)]
 const ASSERTION_KIND_COUNT: usize = 18;
-const CONTEXT_SYMBOL_BYTE_BITS: u32 = 9;
-const CONTEXT_SYMBOL_BYTE_MASK: u32 = (1 << CONTEXT_SYMBOL_BYTE_BITS) - 1;
+// Contextual transition identity retains the immutable global byte class,
+// not the raw source byte. ByteClasses proves that every member takes the
+// same ordered consuming edges; the exact assertion mask still separates all
+// raw boundary behavior before a transition can alias. Nine bits reserve one
+// value above the complete u8 class domain for the initial closure.
+const CONTEXT_SYMBOL_CLASS_BITS: u32 = 9;
+const CONTEXT_SYMBOL_CLASS_MASK: u32 = (1 << CONTEXT_SYMBOL_CLASS_BITS) - 1;
 const CONTEXT_DEPENDENCY_UNCOMPUTED: u32 = u32::MAX;
-const CONTEXT_INITIAL_BYTE: u32 = 256;
+const CONTEXT_INITIAL_CLASS: u32 = 256;
 const CONTEXT_TRANSITION_WAYS: usize = 4;
 const CONTEXT_TRANSITION_MAX_SLOTS: usize = LAZY_MAX_STATES * BYTE_ALPHABET;
 const CONTEXT_TRANSITION_MAX_BUCKETS: usize =
@@ -533,8 +538,8 @@ impl ContextTransitionStore {
                     detail: "contextual hot-transition publication is outside its state domain",
                 })?;
                 hot.dependency_mask = retained.dependency_mask;
-                let symbol_byte = record.symbol & CONTEXT_SYMBOL_BYTE_MASK;
-                if symbol_byte < CONTEXT_INITIAL_BYTE
+                let symbol_class = record.symbol & CONTEXT_SYMBOL_CLASS_MASK;
+                if symbol_class < CONTEXT_INITIAL_CLASS
                     && context_cell_is_nonaccepting_self_loop(record)
                 {
                     self.loop_candidates_published = self
@@ -608,8 +613,16 @@ fn contextual_transition_hash(source: u32, symbol: u32) -> usize {
     usize::try_from(folded).expect("folded context hash fits usize")
 }
 
-const fn contextual_symbol(byte: u32, assertions: u32) -> u32 {
-    byte | (assertions << CONTEXT_SYMBOL_BYTE_BITS)
+const fn contextual_class_symbol(class: u8, assertions: u32) -> u32 {
+    (class as u32) | (assertions << CONTEXT_SYMBOL_CLASS_BITS)
+}
+
+fn contextual_symbol_for_byte(automaton: &Automaton, byte: u8, assertions: u32) -> u32 {
+    contextual_class_symbol(automaton.byte_classes().class_of(byte), assertions)
+}
+
+const fn contextual_initial_symbol(assertions: u32) -> u32 {
+    CONTEXT_INITIAL_CLASS | (assertions << CONTEXT_SYMBOL_CLASS_BITS)
 }
 
 const fn encoded_nonaccepting_self_loop_action(
@@ -3977,7 +3990,7 @@ fn warm_context_initial_state(
     lazy: &LazyWorkspace,
     assertions: u32,
 ) -> Result<Option<u32>, SearchError> {
-    let symbol = contextual_symbol(CONTEXT_INITIAL_BYTE, assertions);
+    let symbol = contextual_initial_symbol(assertions);
     let Some(cell) = lazy
         .context
         .lookup_existing_prevalidated(CONTEXT_INITIAL_SOURCE, symbol)?
@@ -4057,7 +4070,7 @@ fn warm_context_transition_for_dependencies(
         haystack,
         destination,
     );
-    let symbol = contextual_symbol(u32::from(byte), assertions);
+    let symbol = contextual_symbol_for_byte(automaton, byte, assertions);
     if let Some(cell) = lazy.context.lookup_existing_prevalidated(state, symbol)? {
         return Ok(Some(cell));
     }
@@ -4075,7 +4088,7 @@ fn warm_context_transition_for_dependencies(
     }
     lazy.context.lookup_existing_prevalidated(
         state,
-        contextual_symbol(u32::from(byte), exact_assertions),
+        contextual_symbol_for_byte(automaton, byte, exact_assertions),
     )
 }
 
@@ -8711,7 +8724,7 @@ fn execute_context_lazy_loop(
             destination,
             meter,
         )?;
-        let symbol = contextual_symbol(u32::from(byte), assertions);
+        let symbol = contextual_symbol_for_byte(automaton, byte, assertions);
         let transition = match state {
             LazyState::Cached(cached) => build_context_lazy_cached_transition(
                 automaton,
@@ -8821,7 +8834,7 @@ fn context_lazy_initial(
     core_reserve: u64,
     position: usize,
 ) -> Result<Option<(LazyState, bool)>, SearchError> {
-    let symbol = contextual_symbol(CONTEXT_INITIAL_BYTE, assertions);
+    let symbol = contextual_initial_symbol(assertions);
     let (cached, slot) =
         workspace
             .lazy
@@ -9445,6 +9458,56 @@ fn try_context_interior_equivalence_class(
     Ok(Some(members))
 }
 
+/// Recover one raw member of a retained contextual byte class whose diagonal
+/// boundary produces the record's exact dependency mask.
+///
+/// Context symbols intentionally store an immutable global class ID. That ID
+/// is not itself a source byte: a class may cross an assertion category even
+/// though every member follows the same consuming graph edges. Enumerating
+/// the class here recovers an actual witness before the loop proof narrows its
+/// scanner to one exact interior category. Unicode-word dependencies remain
+/// byte-local only for complete one-byte ASCII scalars.
+enum ContextDiagonalRepresentative {
+    Found(u8),
+    Absent,
+    ResourceDeclined,
+}
+
+fn try_context_diagonal_class_representative(
+    automaton: &Automaton,
+    class: u8,
+    dependencies: u32,
+    stored_assertions: u32,
+    meter: &mut WorkMeter,
+) -> ContextDiagonalRepresentative {
+    let classifier = BoundaryContextClassifier::new(dependencies);
+    let checks = u64::from(dependencies.count_ones());
+    for representative in u8::MIN..=u8::MAX {
+        if !meter.try_charge_optional(1, 0) {
+            return ContextDiagonalRepresentative::ResourceDeclined;
+        }
+        if automaton.byte_classes().class_of(representative) != class
+            || classifier.unicode_word() != 0 && !representative.is_ascii()
+        {
+            continue;
+        }
+        if !meter.try_charge_optional(checks, 0) {
+            return ContextDiagonalRepresentative::ResourceDeclined;
+        }
+        let interior = [representative, representative];
+        let interior_assertions = enabled_assertion_mask_unmetered_with_classifier(
+            classifier,
+            automaton.line_terminator(),
+            &interior,
+            1,
+        );
+        if interior_assertions == stored_assertions {
+            return ContextDiagonalRepresentative::Found(representative);
+        }
+    }
+    ContextDiagonalRepresentative::Absent
+}
+
 const fn byte_bitmap_cardinality(words: [u64; 4]) -> u32 {
     words[0].count_ones()
         + words[1].count_ones()
@@ -9890,8 +9953,8 @@ fn try_derive_context_lazy_loop_skip(
         {
             continue;
         }
-        let symbol_byte = record.symbol & CONTEXT_SYMBOL_BYTE_MASK;
-        let Ok(representative) = u8::try_from(symbol_byte) else {
+        let symbol_class = record.symbol & CONTEXT_SYMBOL_CLASS_MASK;
+        let Ok(class) = u8::try_from(symbol_class) else {
             continue;
         };
         let Some(start_action) =
@@ -9916,27 +9979,18 @@ fn try_derive_context_lazy_loop_skip(
         if dependencies == CONTEXT_DEPENDENCY_UNCOMPUTED {
             continue;
         }
-        let classifier = BoundaryContextClassifier::new(dependencies);
-        if classifier.unicode_word() != 0 && !representative.is_ascii() {
-            // A high byte is not a complete Unicode scalar. Preserve the
-            // proven ASCII-interior specialization without inferring a
-            // byte-local Unicode category for an arbitrary encoded sequence.
-            continue;
-        }
-        let checks = u64::from(dependencies.count_ones());
-        if !meter.try_charge_optional(checks, 0) {
-            return Ok(());
-        }
-        let interior = [representative, representative];
-        let interior_assertions = enabled_assertion_mask_unmetered_with_classifier(
-            classifier,
-            automaton.line_terminator(),
-            &interior,
-            1,
-        );
-        if record.symbol >> CONTEXT_SYMBOL_BYTE_BITS != interior_assertions {
-            continue;
-        }
+        let stored_assertions = record.symbol >> CONTEXT_SYMBOL_CLASS_BITS;
+        let representative = match try_context_diagonal_class_representative(
+            automaton,
+            class,
+            dependencies,
+            stored_assertions,
+            meter,
+        ) {
+            ContextDiagonalRepresentative::Found(representative) => representative,
+            ContextDiagonalRepresentative::Absent => continue,
+            ContextDiagonalRepresentative::ResourceDeclined => return Ok(()),
+        };
         let Some(equivalent) = try_context_interior_equivalence_class(
             automaton,
             &workspace.lazy,
@@ -10865,7 +10919,7 @@ fn execute_positive_end_context_reverse_loop(
             },
         )?;
         let assertions = enabled_assertion_mask(automaton, haystack, source, meter)?;
-        let symbol = contextual_symbol(u32::from(byte), assertions);
+        let symbol = contextual_symbol_for_byte(automaton, byte, assertions);
         let transition = match state {
             ReverseState::Cached(cached) => build_context_reverse_cached_transition(
                 automaton, cached, byte, symbol, assertions, workspace, meter, 0, source,
@@ -11431,7 +11485,7 @@ fn execute_context_reverse_lazy_loop(
             detail: "contextual reverse DFA source exceeded the validated window",
         })?;
         let assertions = enabled_assertion_mask(automaton, haystack, source, meter)?;
-        let symbol = contextual_symbol(u32::from(byte), assertions);
+        let symbol = contextual_symbol_for_byte(automaton, byte, assertions);
         let transition = match state {
             ReverseState::Cached(cached) => build_context_reverse_cached_transition(
                 automaton,
@@ -11499,7 +11553,7 @@ fn context_reverse_initial(
     {
         return Ok(None);
     }
-    let symbol = contextual_symbol(CONTEXT_INITIAL_BYTE, assertions);
+    let symbol = contextual_initial_symbol(assertions);
     let (cached, slot) =
         workspace
             .reverse
@@ -15809,6 +15863,81 @@ mod tests {
         .unwrap()
     }
 
+    fn trailing_range_assertion_or_bang(assertion: EdgeKind) -> Automaton {
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Consume,
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 1, 3, 4, 4],
+                edge_targets: vec![1, 3, 2, 3],
+                edge_kinds: vec![
+                    EdgeKind::ByteRange,
+                    assertion,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                ],
+                byte_starts: vec![b'a', 0, 0, b'!'],
+                byte_ends: vec![b'c', 0, 0, b'!'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn absolute_any_then_assertion(assertion: EdgeKind) -> Automaton {
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Split,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 1, 2, 3, 3],
+                edge_targets: vec![1, 2, 3],
+                edge_kinds: vec![
+                    EdgeKind::AssertHaystackStart,
+                    EdgeKind::ByteRange,
+                    assertion,
+                ],
+                byte_starts: vec![0, u8::MIN, 0],
+                byte_ends: vec![0, u8::MAX, 0],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn full_byte_contextual_word_loop() -> Automaton {
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![StateRole::Consume, StateRole::Split, StateRole::Accept],
+                edge_offsets: vec![0, 1, 7, 7],
+                edge_targets: vec![1, 0, 0, 0, 0, 0, 0],
+                edge_kinds: vec![
+                    EdgeKind::ByteRange,
+                    EdgeKind::AssertWordAscii,
+                    EdgeKind::AssertWordAsciiNegate,
+                    EdgeKind::AssertWordStartAscii,
+                    EdgeKind::AssertWordEndAscii,
+                    EdgeKind::AssertWordStartHalfAscii,
+                    EdgeKind::AssertWordEndHalfAscii,
+                ],
+                byte_starts: vec![u8::MIN, 0, 0, 0, 0, 0, 0],
+                byte_ends: vec![u8::MAX, 0, 0, 0, 0, 0, 0],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
     fn asserted_line_a() -> Automaton {
         Automaton::from_raw(
             RawPlan {
@@ -16491,7 +16620,7 @@ mod tests {
                 Some(0),
                 ContextTransitionSlot::populated(
                     0,
-                    super::contextual_symbol(u32::from(representative), interior_assertions),
+                    super::contextual_symbol_for_byte(plan, representative, interior_assertions),
                     1 | super::LazyStartAction::Propagate.cell_bits(),
                 ),
                 &mut publish,
@@ -16750,7 +16879,7 @@ mod tests {
                 Some(0),
                 ContextTransitionSlot::populated(
                     0,
-                    super::contextual_symbol(u32::from(b'a'), interior_assertions),
+                    super::contextual_symbol_for_byte(plan, b'a', interior_assertions),
                     1 | super::LazyStartAction::Propagate.cell_bits(),
                 ),
                 &mut publish,
@@ -16765,7 +16894,7 @@ mod tests {
                 Some(1),
                 ContextTransitionSlot::populated(
                     0,
-                    super::contextual_symbol(u32::from(b'a'), endpoint_assertions),
+                    super::contextual_symbol_for_byte(plan, b'a', endpoint_assertions),
                     1 | super::LazyStartAction::Drop.cell_bits(),
                 ),
                 &mut publish,
@@ -16998,7 +17127,7 @@ mod tests {
         let mut store =
             super::ContextTransitionStore::new(slots, 2, usize::MAX).unwrap();
         let source = 0_u32;
-        let symbol = super::contextual_symbol(u32::from(b'a'), 1 << 2);
+        let symbol = super::contextual_class_symbol(b'a', 1 << 2);
         let value = 7_u32 | super::LAZY_CELL_START_PROPAGATE;
 
         let mut miss = WorkMeter::new(u64::MAX, 0);
@@ -17040,7 +17169,7 @@ mod tests {
             }) if requested == u64::from(hot.lookup_work)
         ));
 
-        let other_symbol = super::contextual_symbol(u32::from(b'b'), 1 << 2);
+        let other_symbol = super::contextual_class_symbol(b'b', 1 << 2);
         let mut other = WorkMeter::new(u64::MAX, 0);
         assert_eq!(store.lookup(source, other_symbol, &mut other, 0).unwrap().0, None);
         let mut other_source = WorkMeter::new(u64::MAX, 0);
@@ -25074,7 +25203,7 @@ mod tests {
         workspace.lazy.scratch_len = 1;
         assert_eq!(workspace.lazy.intern_initial(false, &mut intern, 0).unwrap(), 0);
 
-        let loop_symbol = super::contextual_symbol(u32::from(b'a'), 0);
+        let loop_symbol = super::contextual_symbol_for_byte(&plan, b'a', 0);
         let loop_cell = 1 | super::LazyStartAction::Propagate.cell_bits();
         let loop_record = ContextTransitionSlot::populated(0, loop_symbol, loop_cell);
         let mut declined = WorkMeter::new(1, 0);
@@ -25109,7 +25238,11 @@ mod tests {
                     Some(index),
                     ContextTransitionSlot::populated(
                         0,
-                        super::contextual_symbol(u32::from(b'b' + u8::try_from(index).unwrap()), 0),
+                        super::contextual_symbol_for_byte(
+                            &plan,
+                            b'b' + u8::try_from(index).unwrap(),
+                            0,
+                        ),
                         value,
                     ),
                     &mut meter,
@@ -25145,7 +25278,7 @@ mod tests {
             .unwrap();
         assert_eq!(workspace.lazy.context.loop_candidates_published, 2);
 
-        let terminal_symbol = super::contextual_symbol(u32::from(b'z'), 0);
+        let terminal_symbol = super::contextual_symbol_for_byte(&plan, b'z', 0);
         workspace
             .lazy
             .context
@@ -25253,10 +25386,14 @@ mod tests {
             assert!(retained.scanner.contains(b'a'));
             if terminal {
                 let hot = workspace.lazy.context.hot[usize::try_from(retained.state).unwrap()];
-                assert_eq!(hot.symbol & super::CONTEXT_SYMBOL_BYTE_MASK, u32::from(b'z'));
+                assert_eq!(
+                    hot.symbol & super::CONTEXT_SYMBOL_CLASS_MASK,
+                    u32::from(byte_class(&plan, b'z'))
+                );
                 assert!(workspace.lazy.context.slots.iter().any(|slot| {
                     slot.source == retained.state
-                        && slot.symbol & super::CONTEXT_SYMBOL_BYTE_MASK == u32::from(b'a')
+                        && slot.symbol & super::CONTEXT_SYMBOL_CLASS_MASK
+                            == u32::from(byte_class(&plan, b'a'))
                         && super::context_cell_is_nonaccepting_self_loop(*slot)
                 }));
             }
@@ -25404,8 +25541,8 @@ mod tests {
         );
         assert_eq!(start_mask, punctuation_mask);
         assert_eq!(
-            super::contextual_symbol(u32::from(b'x'), start_mask),
-            super::contextual_symbol(u32::from(b'x'), punctuation_mask)
+            super::contextual_symbol_for_byte(&plan, b'x', start_mask),
+            super::contextual_symbol_for_byte(&plan, b'x', punctuation_mask)
         );
         assert_ne!(punctuation_mask, inside_mask);
         assert_ne!(
@@ -25550,7 +25687,7 @@ mod tests {
         );
         assert_eq!(
             endpoint_hot.symbol,
-            super::contextual_symbol(u32::from(b'a'), endpoint_assertions)
+            super::contextual_symbol_for_byte(&plan, b'a', endpoint_assertions)
         );
 
         let mut derive = WorkMeter::new(u64::MAX, 0);
@@ -25814,7 +25951,7 @@ mod tests {
         assert!(loop_plan.scanner.contains(b'b'));
 
         let assertions = super::enabled_assertion_mask_unmetered(&plan, &haystack, 3);
-        let inferred_symbol = super::contextual_symbol(u32::from(b'b'), assertions);
+        let inferred_symbol = super::contextual_symbol_for_byte(&plan, b'b', assertions);
         assert_eq!(
             workspace
                 .lazy
@@ -26691,8 +26828,8 @@ mod tests {
             panic!("unlimited initial state must be retained");
         };
         let bit = kind.assertion_bit().unwrap();
-        let disabled_symbol = super::contextual_symbol(u32::from(b'a'), 0);
-        let enabled_symbol = super::contextual_symbol(u32::from(b'a'), bit);
+        let disabled_symbol = super::contextual_symbol_for_byte(&plan, b'a', 0);
+        let enabled_symbol = super::contextual_symbol_for_byte(&plan, b'a', bit);
         let disabled = super::build_context_lazy_cached_transition(
             &plan,
             source,
@@ -26731,6 +26868,291 @@ mod tests {
         assert!(workspace.lazy.context.slots.iter().any(|slot| {
             slot.source == source && slot.symbol == enabled_symbol && slot.value == enabled
         }));
+    }
+
+    #[test]
+    fn contextual_forward_and_reverse_keys_alias_only_the_same_class_and_mask() {
+        let kind = EdgeKind::AssertLineEndLf;
+        let bit = kind.assertion_bit().unwrap();
+        let plan = trailing_range_assertion_or_bang(kind);
+        assert_eq!(byte_class(&plan, b'a'), byte_class(&plan, b'b'));
+        assert_ne!(byte_class(&plan, b'a'), byte_class(&plan, b'!'));
+        assert_eq!(
+            super::contextual_symbol_for_byte(&plan, b'a', bit),
+            super::contextual_symbol_for_byte(&plan, b'b', bit)
+        );
+        assert_ne!(
+            super::contextual_symbol_for_byte(&plan, b'a', bit),
+            super::contextual_symbol_for_byte(&plan, b'a', 0)
+        );
+        assert_ne!(
+            super::contextual_symbol_for_byte(&plan, b'a', bit),
+            super::contextual_symbol_for_byte(&plan, b'!', bit)
+        );
+
+        let mut workspace =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        let (forward, _) =
+            super::context_lazy_initial(&plan, 0, &mut workspace, &mut meter, 0, 0)
+                .unwrap()
+                .unwrap();
+        let super::LazyState::Cached(forward) = forward else {
+            panic!("unlimited contextual forward state must be retained");
+        };
+        let forward_before = workspace.lazy.context.published;
+        let forward_symbol = super::contextual_symbol_for_byte(&plan, b'a', bit);
+        let first = super::build_context_lazy_cached_transition(
+            &plan,
+            forward,
+            b'a',
+            forward_symbol,
+            bit,
+            &mut workspace,
+            &mut meter,
+            0,
+            1,
+        )
+        .unwrap();
+        assert_eq!(workspace.lazy.context.published, forward_before + 1);
+        let aliased = super::build_context_lazy_cached_transition(
+            &plan,
+            forward,
+            b'b',
+            super::contextual_symbol_for_byte(&plan, b'b', bit),
+            bit,
+            &mut workspace,
+            &mut meter,
+            0,
+            1,
+        )
+        .unwrap();
+        assert_eq!(aliased, first);
+        assert_eq!(workspace.lazy.context.published, forward_before + 1);
+
+        let _different_mask = super::build_context_lazy_cached_transition(
+            &plan,
+            forward,
+            b'b',
+            super::contextual_symbol_for_byte(&plan, b'b', 0),
+            0,
+            &mut workspace,
+            &mut meter,
+            0,
+            1,
+        )
+        .unwrap();
+        assert_eq!(workspace.lazy.context.published, forward_before + 2);
+        let _different_class = super::build_context_lazy_cached_transition(
+            &plan,
+            forward,
+            b'!',
+            super::contextual_symbol_for_byte(&plan, b'!', bit),
+            bit,
+            &mut workspace,
+            &mut meter,
+            0,
+            1,
+        )
+        .unwrap();
+        assert_eq!(workspace.lazy.context.published, forward_before + 3);
+
+        let reverse = super::context_reverse_initial(
+            &plan,
+            bit,
+            &mut workspace,
+            &mut meter,
+            0,
+            1,
+        )
+        .unwrap()
+        .unwrap();
+        let super::ReverseState::Cached(reverse) = reverse else {
+            panic!("unlimited contextual reverse state must be retained");
+        };
+        let reverse_before = workspace.reverse.context.published;
+        let reverse_symbol = super::contextual_symbol_for_byte(&plan, b'a', 0);
+        let first = super::build_context_reverse_cached_transition(
+            &plan,
+            reverse,
+            b'a',
+            reverse_symbol,
+            0,
+            &mut workspace,
+            &mut meter,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(workspace.reverse.context.published, reverse_before + 1);
+        let aliased = super::build_context_reverse_cached_transition(
+            &plan,
+            reverse,
+            b'b',
+            super::contextual_symbol_for_byte(&plan, b'b', 0),
+            0,
+            &mut workspace,
+            &mut meter,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(aliased, first);
+        assert_eq!(workspace.reverse.context.published, reverse_before + 1);
+
+        let _different_mask = super::build_context_reverse_cached_transition(
+            &plan,
+            reverse,
+            b'b',
+            super::contextual_symbol_for_byte(&plan, b'b', bit),
+            bit,
+            &mut workspace,
+            &mut meter,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(workspace.reverse.context.published, reverse_before + 2);
+        let _different_class = super::build_context_reverse_cached_transition(
+            &plan,
+            reverse,
+            b'!',
+            super::contextual_symbol_for_byte(&plan, b'!', 0),
+            0,
+            &mut workspace,
+            &mut meter,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(workspace.reverse.context.published, reverse_before + 3);
+    }
+
+    #[test]
+    fn contextual_class_255_remains_distinct_from_the_initial_sentinel() {
+        let bytes: Vec<_> = (u8::MIN..=u8::MAX).collect();
+        let plan = ascii_root_bytes(&bytes);
+        assert_eq!(plan.byte_classes().count(), super::BYTE_ALPHABET);
+        let class = byte_class(&plan, u8::MAX);
+        assert_eq!(class, u8::MAX);
+        let assertions = EdgeKind::AssertLineEndLf.assertion_bit().unwrap();
+        let transition = super::contextual_class_symbol(class, assertions);
+        let initial = super::contextual_initial_symbol(assertions);
+        assert_eq!(transition & super::CONTEXT_SYMBOL_CLASS_MASK, u32::from(u8::MAX));
+        assert_eq!(initial & super::CONTEXT_SYMBOL_CLASS_MASK, super::CONTEXT_INITIAL_CLASS);
+        assert_ne!(transition, initial);
+    }
+
+    #[test]
+    fn contextual_loop_derivation_decodes_a_real_member_of_a_cross_category_class() {
+        let plan = full_byte_contextual_word_loop();
+        assert_eq!(plan.byte_classes().count(), 1);
+        assert_eq!(plan.byte_classes().representative(0), Some(0));
+        let dependencies = plan.boundary_context_classifier().assertions();
+        let word_assertions = super::enabled_assertion_mask_unmetered_for_dependencies(
+            &plan,
+            dependencies,
+            b"aa",
+            1,
+        );
+        let raw_representative_assertions =
+            super::enabled_assertion_mask_unmetered_for_dependencies(
+                &plan,
+                dependencies,
+                &[0, 0],
+                1,
+            );
+        assert_ne!(word_assertions, raw_representative_assertions);
+
+        let mut workspace =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        workspace.lazy.scratch[0] = 0;
+        workspace.lazy.scratch_len = 1;
+        assert_eq!(workspace.lazy.intern_initial(false, &mut meter, 0).unwrap(), 0);
+        workspace
+            .lazy
+            .context
+            .publish(
+                Some(0),
+                ContextTransitionSlot::populated(
+                    0,
+                    super::contextual_symbol_for_byte(&plan, b'a', word_assertions),
+                    1 | super::LazyStartAction::Propagate.cell_bits(),
+                ),
+                &mut meter,
+                0,
+                0,
+            )
+            .unwrap();
+        workspace.lazy.context.hot[0].dependency_mask = dependencies;
+        workspace.lazy.context_dependencies_analyzed = 1;
+        super::try_derive_context_lazy_loop_skip(&plan, &mut workspace, &mut meter).unwrap();
+        let retained = workspace
+            .lazy
+            .context_loop_skip_plan
+            .expect("the class must be decoded through its word-category member");
+        assert!(retained.scanner.contains(b'a'));
+        assert!(retained.scanner.contains(b'_'));
+        assert!(!retained.scanner.contains(0));
+        assert!(!retained.scanner.contains(b'!'));
+    }
+
+    #[test]
+    fn contextual_class_keys_remain_raw_context_exact_after_same_address_mutation() {
+        fn check(plan: &Automaton, source: &mut [u8], cases: &[&[u8]]) {
+            let address = source.as_ptr();
+            let mut accelerated =
+                K0Workspace::new_bidirectional(plan, WorkspaceLimits::unlimited()).unwrap();
+            for &case in cases {
+                assert_eq!(case.len(), source.len());
+                source.copy_from_slice(case);
+                assert_eq!(source.as_ptr(), address);
+                let mut reference = K0Workspace::new(plan, WorkspaceLimits::unlimited()).unwrap();
+                let expected = plan
+                    .prepare::<Span>()
+                    .search_with_workspace(source, &mut reference, SearchLimits::unlimited())
+                    .unwrap()
+                    .into_output();
+                let actual = plan
+                    .prepare::<Span>()
+                    .search_with_workspace(source, &mut accelerated, SearchLimits::unlimited())
+                    .unwrap()
+                    .into_output();
+                assert_eq!(actual, expected, "source={source:?}");
+            }
+        }
+
+        let configured = absolute_any_then_assertion(EdgeKind::AssertLineEndLf)
+            .with_line_terminator(b';');
+        let mut configured_source = vec![0; 2];
+        check(
+            &configured,
+            &mut configured_source,
+            &[b"x;", b"xx", b"x;", b"x!"],
+        );
+
+        let crlf = absolute_any_then_assertion(EdgeKind::AssertLineEndCrlf);
+        let mut crlf_source = vec![0; 2];
+        check(
+            &crlf,
+            &mut crlf_source,
+            &[b"\r\n", b"a\n", b"ax", b"\r\n"],
+        );
+
+        let unicode = absolute_any_then_assertion(EdgeKind::AssertWordUnicodeNegate);
+        let mut unicode_source = vec![0; 3];
+        check(
+            &unicode,
+            &mut unicode_source,
+            &[
+                &[b'a', 0xc3, 0xa9],
+                &[b'a', 0xc3, b'('],
+                &[b'a', b'a', b'!'],
+                &[b'a', b'!', b'!'],
+                &[b'a', 0xc3, 0xa9],
+            ],
+        );
     }
 
     #[test]
@@ -29632,7 +30054,7 @@ mod tests {
                 .unwrap(),
             Some(0)
         );
-        let inferred_symbol = super::contextual_symbol(u32::from(b'b'), 0);
+        let inferred_symbol = super::contextual_symbol_for_byte(&plan, b'b', 0);
         assert_eq!(
             session
                 .workspace
@@ -29962,7 +30384,8 @@ mod tests {
                 &source,
                 run_end,
             );
-            let final_symbol = super::contextual_symbol(u32::from(member), final_assertions);
+            let final_symbol =
+                super::contextual_symbol_for_byte(plan, member, final_assertions);
             let final_cell = session
                 .workspace
                 .lazy
@@ -29982,7 +30405,7 @@ mod tests {
                 run_end + 1,
             );
             let terminal_symbol =
-                super::contextual_symbol(u32::from(b'z'), terminal_assertions);
+                super::contextual_symbol_for_byte(plan, b'z', terminal_assertions);
             let terminal_cell = session
                 .workspace
                 .lazy
@@ -30095,15 +30518,28 @@ mod tests {
             &[0xff, 0xff],
             1,
         );
-        let inferred_symbol = super::contextual_symbol(0xff, inferred_assertions);
+        let inferred_symbol =
+            super::contextual_symbol_for_byte(&high, 0xff, inferred_assertions);
+        let representative_symbol =
+            super::contextual_symbol_for_byte(&high, 0x80, inferred_assertions);
+        assert_eq!(inferred_symbol, representative_symbol);
+        let inferred_cell = session
+            .workspace
+            .lazy
+            .context
+            .lookup_existing_prevalidated(loop_plan.state, inferred_symbol)
+            .unwrap();
+        assert!(inferred_cell.is_some(), "one class record serves every high member");
         assert_eq!(
             session
                 .workspace
                 .lazy
                 .context
-                .lookup_existing_prevalidated(loop_plan.state, inferred_symbol)
-                .unwrap(),
-            None
+                .slots
+                .iter()
+                .filter(|slot| slot.source == loop_plan.state && slot.symbol == inferred_symbol)
+                .count(),
+            1
         );
         let slots = session.workspace.lazy.context.slots.clone();
         let hot = session.workspace.lazy.context.hot.clone();
@@ -30126,8 +30562,8 @@ mod tests {
                 .context
                 .lookup_existing_prevalidated(loop_plan.state, inferred_symbol)
                 .unwrap(),
-            None,
-            "the high-byte scanner must leave its inferred raw record absent"
+            inferred_cell,
+            "the high-byte scanner must reuse without republishing its exact class record"
         );
     }
 
