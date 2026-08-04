@@ -83,6 +83,7 @@ const _: () = assert!(BYTE_ALPHABET == 1 << 8);
 // avoids falling back to an ordered closure on every subsequent byte once a
 // moderately branching unbounded expression crosses 64 subsets.
 const LAZY_MAX_STATES: usize = 256;
+const _: () = assert!(LAZY_MAX_STATES <= BYTE_ALPHABET);
 const _: () = assert!(LAZY_MAX_STATES <= usize::MAX / BYTE_ALPHABET);
 const LAZY_MAX_ITEMS: usize = 16_384;
 // Contiguous metadata wins for small retained sets. At sixteen identities the
@@ -1343,6 +1344,17 @@ impl LazyLoopScanner {
         }
     }
 
+    fn words(&self) -> [u64; 4] {
+        match self {
+            Self::All => [u64::MAX; 4],
+            Self::Ascii(scanner) => {
+                let words = scanner.set().words();
+                [words[0], words[1], 0, 0]
+            }
+            Self::Set(classifier) => classifier.set().words(),
+        }
+    }
+
     #[cfg(test)]
     fn contains(&self, byte: u8) -> bool {
         match self {
@@ -1435,6 +1447,112 @@ fn scan_full_byte_member_prefix(classifier: &ByteSetClassifier, source: &[u8]) -
 struct LazyLoopSkipPlan {
     row_offset: u32,
     scanner: LazyLoopScanner,
+    start_action: LazyStartAction,
+}
+
+const LAZY_LOOP_SKIP_PLAN_CAPACITY: usize = 4;
+const _: () = assert!(LAZY_LOOP_SKIP_PLAN_CAPACITY <= LAZY_MAX_STATES);
+const LAZY_LOOP_SKIP_OWNER_PUBLICATION_WORK: u64 = 1;
+const LAZY_LOOP_SKIP_BITMAP_PUBLICATION_WORK: u64 = 1;
+
+/// A bounded set of independently authenticated direct-loop proofs.
+///
+/// Candidate selection is best-first, while physical owner slots remain
+/// stable across cold reanalysis. An unchanged signature therefore shares its
+/// already-compiled scanner byte-for-byte; only an evicted owner's slot is
+/// replaced. Runtime lookup checks the invocation's active owner first for the
+/// common same-state path, then slot zero for a cold common case.
+/// `state_members` acts as a negative filter before walking the remaining
+/// owners. A hit is always resolved against the exact row offset before any
+/// proof is used.
+#[derive(Debug)]
+struct LazyLoopSkipPlans {
+    entries: [Option<LazyLoopSkipPlan>; LAZY_LOOP_SKIP_PLAN_CAPACITY],
+    state_members: [u64; 4],
+}
+
+impl LazyLoopSkipPlans {
+    const fn empty() -> Self {
+        Self {
+            entries: [None; LAZY_LOOP_SKIP_PLAN_CAPACITY],
+            state_members: [0; 4],
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.iter().all(|entry| entry.is_none())
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.iter().flatten().count()
+    }
+
+    #[cfg(test)]
+    fn first(&self) -> Option<LazyLoopSkipPlan> {
+        self.entries.iter().flatten().copied().next()
+    }
+
+    fn matching_slot(&self, candidate: LazyLoopSkipCandidate) -> Option<usize> {
+        self.entries.iter().position(|entry| {
+            entry.as_ref().is_some_and(|plan| {
+                direct_row_state(plan.row_offset) == candidate.state
+                    && plan.start_action == candidate.start_action
+                    && plan.scanner.words() == candidate.members
+            })
+        })
+    }
+
+    #[cfg(test)]
+    fn find(&self, row_offset: u32) -> Option<(usize, &LazyLoopSkipPlan)> {
+        self.find_with_hint(row_offset, None)
+    }
+
+    #[inline]
+    fn find_with_hint(
+        &self,
+        row_offset: u32,
+        preferred_slot: Option<usize>,
+    ) -> Option<(usize, &LazyLoopSkipPlan)> {
+        if let Some(slot) = preferred_slot {
+            if let Some(plan) = self.entries.get(slot).and_then(|entry| entry.as_ref()) {
+                if plan.row_offset == row_offset {
+                    return Some((slot, plan));
+                }
+            }
+        }
+        if preferred_slot != Some(0) {
+            if let Some(plan) = self.entries[0].as_ref() {
+                if plan.row_offset == row_offset {
+                    return Some((0, plan));
+                }
+            }
+        }
+        let state = u8::try_from(direct_row_state(row_offset)).ok()?;
+        if !byte_bitmap_contains(self.state_members, state) {
+            return None;
+        }
+        let found = self
+            .entries
+            .iter()
+            .enumerate()
+            .find_map(|(slot, plan)| {
+                if preferred_slot == Some(slot) || slot == 0 {
+                    return None;
+                }
+                plan.as_ref()
+                    .filter(|plan| plan.row_offset == row_offset)
+                    .map(|plan| (slot, plan))
+            });
+        debug_assert!(found.is_some(), "direct loop state bitmap has no exact plan");
+        found
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LazyLoopSkipCandidate {
+    state: u32,
+    members: [u64; 4],
     start_action: LazyStartAction,
 }
 
@@ -1573,7 +1691,7 @@ struct LazyWorkspace {
     initial: u32,
     initial_kind: LazyInitialKind,
     inline_start_action: LazyStartAction,
-    loop_skip_plan: Option<LazyLoopSkipPlan>,
+    loop_skip_plans: LazyLoopSkipPlans,
     context_loop_skip_plan: Option<ContextLazyLoopSkipPlan>,
     direct_cells_published: u32,
     loop_skip_analyzed_at_cells: u32,
@@ -1636,7 +1754,7 @@ impl LazyWorkspace {
             initial: LAZY_NO_STATE,
             initial_kind: LazyInitialKind::Uninitialized,
             inline_start_action: LazyStartAction::Drop,
-            loop_skip_plan: None,
+            loop_skip_plans: LazyLoopSkipPlans::empty(),
             context_loop_skip_plan: None,
             direct_cells_published: 0,
             loop_skip_analyzed_at_cells: 0,
@@ -1669,7 +1787,7 @@ impl LazyWorkspace {
             initial: LAZY_NO_STATE,
             initial_kind: LazyInitialKind::Uninitialized,
             inline_start_action: LazyStartAction::Drop,
-            loop_skip_plan: None,
+            loop_skip_plans: LazyLoopSkipPlans::empty(),
             context_loop_skip_plan: None,
             direct_cells_published: 0,
             loop_skip_analyzed_at_cells: 0,
@@ -4566,21 +4684,7 @@ fn continue_warm_direct_exists(
     consumed: u64,
     engine_candidate: Option<usize>,
 ) -> Result<Option<bool>, SearchError> {
-    if let Some(loop_skip) = lazy.loop_skip_plan {
-        continue_warm_direct_exists_loop::<true>(
-            automaton,
-            haystack,
-            window,
-            lazy,
-            proof,
-            initial_row,
-            state,
-            position,
-            consumed,
-            engine_candidate,
-            Some(loop_skip),
-        )
-    } else {
+    if lazy.loop_skip_plans.is_empty() {
         continue_warm_direct_exists_loop::<false>(
             automaton,
             haystack,
@@ -4592,13 +4696,26 @@ fn continue_warm_direct_exists(
             position,
             consumed,
             engine_candidate,
-            None,
+        )
+    } else {
+        continue_warm_direct_exists_loop::<true>(
+            automaton,
+            haystack,
+            window,
+            lazy,
+            proof,
+            initial_row,
+            state,
+            position,
+            consumed,
+            engine_candidate,
         )
     }
 }
 
 #[allow(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "the outlined warm continuation keeps its exact local DFA, scanner, and retained loop proof explicit"
 )]
 #[inline(never)]
@@ -4613,13 +4730,13 @@ fn continue_warm_direct_exists_loop<const LOOP_SKIP: bool>(
     mut position: usize,
     consumed: u64,
     mut engine_candidate: Option<usize>,
-    loop_skip: Option<LazyLoopSkipPlan>,
 ) -> Result<Option<bool>, SearchError> {
-    debug_assert_eq!(LOOP_SKIP, loop_skip.is_some());
+    debug_assert!(!LOOP_SKIP || !lazy.loop_skip_plans.is_empty());
     let mut meter = WorkMeter::new(u64::MAX, consumed);
     let mut retained_start_mask = RetainedStartMaskCursor::default();
     let mut adaptive_probe = AdaptiveStartProbe::default();
     let mut loop_probe = LazyLoopProbe::default();
+    let mut active_loop_slot = None;
 
     loop {
         if state == initial_row {
@@ -4659,30 +4776,33 @@ fn continue_warm_direct_exists_loop<const LOOP_SKIP: bool>(
             }
         }
         if LOOP_SKIP {
-            let plan = loop_skip.ok_or(SearchError::InternalInvariant {
-                detail: "warm existence loop executed without its retained proof",
-            })?;
-            let in_plan_state = state == plan.row_offset;
-            if !in_plan_state {
+            let selected = lazy
+                .loop_skip_plans
+                .find_with_hint(state, active_loop_slot);
+            let selected_slot = selected.map(|(slot, _)| slot);
+            if selected_slot != active_loop_slot {
                 loop_probe.left_plan_state();
+                active_loop_slot = selected_slot;
             }
-            if in_plan_state
-                && loop_probe.is_ready(position)
-                && haystack.len().saturating_sub(position) >= LAZY_LOOP_SKIP_MIN_BYTES
-            {
-                let skipped = plan.scanner.scan_forward(&haystack[position..]);
-                loop_probe.observe(position, skipped)?;
-                if skipped != 0 {
-                    meter.charge_admitted(
-                        u64::try_from(skipped).expect("warm existence loop length fits u64"),
-                    );
-                    position = position.checked_add(skipped).ok_or(
-                        SearchError::ArithmeticOverflow {
-                            computation: "warm existence loop source progress",
-                        },
-                    )?;
-                    if position == haystack.len() {
-                        continue;
+            if let Some((_, plan)) = selected {
+                if loop_probe.is_ready(position)
+                    && haystack.len().saturating_sub(position) >= LAZY_LOOP_SKIP_MIN_BYTES
+                {
+                    let skipped = plan.scanner.scan_forward(&haystack[position..]);
+                    loop_probe.observe(position, skipped)?;
+                    if skipped != 0 {
+                        meter.charge_admitted(
+                            u64::try_from(skipped)
+                                .expect("warm existence loop length fits u64"),
+                        );
+                        position = position.checked_add(skipped).ok_or(
+                            SearchError::ArithmeticOverflow {
+                                computation: "warm existence loop source progress",
+                            },
+                        )?;
+                        if position == haystack.len() {
+                            continue;
+                        }
                     }
                 }
             }
@@ -4767,7 +4887,7 @@ fn try_warm_direct_selected_end(
     // The ordinary selected-end executor is plan-aware. Decline rather than
     // shadowing an authenticated loop scanner with this scalar read-only
     // projection.
-    if lazy.saturated || lazy.loop_skip_plan.is_some() {
+    if lazy.saturated || !lazy.loop_skip_plans.is_empty() {
         return Ok(WarmDirectSelectedEnd::Declined);
     }
     let haystack = haystack
@@ -4920,7 +5040,7 @@ fn try_warm_proved_start_selected_end(
 ) -> Result<Option<usize>, SearchError> {
     // Preserve retained loop acceleration through the plan-aware proved-start
     // fallback until this read-only projection grows an equivalent scanner.
-    if lazy.saturated || lazy.loop_skip_plan.is_some() {
+    if lazy.saturated || !lazy.loop_skip_plans.is_empty() {
         return Ok(None);
     }
     let haystack = haystack
@@ -5055,7 +5175,7 @@ fn try_warm_direct_span_with_reverse(
     // The ordinary Span path applies the retained loop action to start
     // provenance and can skip the run safely. Do not shadow it with this
     // scalar-only optimistic reader.
-    if lazy.saturated || lazy.loop_skip_plan.is_some() {
+    if lazy.saturated || !lazy.loop_skip_plans.is_empty() {
         return Ok(WarmDirectSpan::Declined);
     }
     let haystack = haystack
@@ -6807,23 +6927,7 @@ fn execute_proved_exact_start_prepared(
         )?
     {
         let mut adaptive_probe = AdaptiveStartProbe::default();
-        if let Some(loop_skip) = workspace.lazy.loop_skip_plan {
-            execute_lazy_span_loop::<false, true>(
-                automaton,
-                haystack,
-                window,
-                workspace,
-                &mut meter,
-                contract,
-                core_reserve,
-                None,
-                None,
-                None,
-                &mut adaptive_probe,
-                DirectLazyReady,
-                Some(loop_skip),
-            )?
-        } else {
+        if workspace.lazy.loop_skip_plans.is_empty() {
             execute_lazy_span_loop::<false, false>(
                 automaton,
                 haystack,
@@ -6837,7 +6941,21 @@ fn execute_proved_exact_start_prepared(
                 None,
                 &mut adaptive_probe,
                 DirectLazyReady,
+            )?
+        } else {
+            execute_lazy_span_loop::<false, true>(
+                automaton,
+                haystack,
+                window,
+                workspace,
+                &mut meter,
+                contract,
+                core_reserve,
                 None,
+                None,
+                None,
+                &mut adaptive_probe,
+                DirectLazyReady,
             )?
         }
     } else {
@@ -7121,23 +7239,7 @@ fn execute_prepared(
             };
             if let Some(ready) = ready {
                 if wants_span {
-                    if let Some(loop_skip) = workspace.lazy.loop_skip_plan {
-                        execute_lazy_span_loop::<true, true>(
-                            automaton,
-                            haystack,
-                            window,
-                            workspace,
-                            &mut meter,
-                            contract,
-                            lazy_core_reserve,
-                            start_proof.proof().scanner.as_ref(),
-                            start_proof.proof().guard(),
-                            start_proof.proof().probe(),
-                            &mut adaptive_probe,
-                            ready,
-                            Some(loop_skip),
-                        )?
-                    } else {
+                    if workspace.lazy.loop_skip_plans.is_empty() {
                         execute_lazy_span_loop::<true, false>(
                             automaton,
                             haystack,
@@ -7151,10 +7253,24 @@ fn execute_prepared(
                             start_proof.proof().probe(),
                             &mut adaptive_probe,
                             ready,
-                            None,
+                        )?
+                    } else {
+                        execute_lazy_span_loop::<true, true>(
+                            automaton,
+                            haystack,
+                            window,
+                            workspace,
+                            &mut meter,
+                            contract,
+                            lazy_core_reserve,
+                            start_proof.proof().scanner.as_ref(),
+                            start_proof.proof().guard(),
+                            start_proof.proof().probe(),
+                            &mut adaptive_probe,
+                            ready,
                         )?
                     }
-                } else if let Some(loop_skip) = workspace.lazy.loop_skip_plan {
+                } else if !workspace.lazy.loop_skip_plans.is_empty() {
                     execute_lazy_span_loop::<false, true>(
                         automaton,
                         haystack,
@@ -7168,7 +7284,6 @@ fn execute_prepared(
                         start_proof.proof().probe(),
                         &mut adaptive_probe,
                         ready,
-                        Some(loop_skip),
                     )?
                 } else {
                     execute_lazy_loop(
@@ -8099,7 +8214,6 @@ fn execute_lazy_span_loop<const TRACK_START: bool, const LOOP_SKIP: bool>(
     probe: Option<&StartPositionClass>,
     adaptive_probe: &mut AdaptiveStartProbe,
     _ready: DirectLazyReady,
-    loop_skip: Option<LazyLoopSkipPlan>,
 ) -> Result<Option<(Option<MatchSpan>, usize, bool)>, SearchError> {
     // `TRACK_START` authenticates an ordinary unanchored Span and permits its
     // candidate floor to narrow later reverse recovery. An untracked caller
@@ -8116,7 +8230,7 @@ fn execute_lazy_span_loop<const TRACK_START: bool, const LOOP_SKIP: bool>(
     debug_assert!(workspace.lazy.is_bound_to(automaton));
     debug_assert!(workspace.lazy.initialized);
     debug_assert!(!workspace.lazy.declined);
-    debug_assert_eq!(LOOP_SKIP, loop_skip.is_some());
+    debug_assert!(!LOOP_SKIP || !workspace.lazy.loop_skip_plans.is_empty());
 
     // Bind the direct executor to the already-validated window ceiling once.
     // Subsequent source positions are monotone and tested against that same
@@ -8181,6 +8295,7 @@ fn execute_lazy_span_loop<const TRACK_START: bool, const LOOP_SKIP: bool>(
     // monotone floor remains a sound lower bound for reverse span recovery.
     let mut candidate_floor = window.start();
     let mut loop_probe = LazyLoopProbe::default();
+    let mut active_loop_slot = None;
 
     loop {
         if pending_end.is_none()
@@ -8265,54 +8380,60 @@ fn execute_lazy_span_loop<const TRACK_START: bool, const LOOP_SKIP: bool>(
         }
 
         if LOOP_SKIP {
-            let plan = loop_skip.ok_or(SearchError::InternalInvariant {
-                detail: "plan-aware lazy loop executed without its retained proof",
-            })?;
-            let in_plan_state = state == LazyState::Cached(plan.row_offset);
-            if !in_plan_state {
+            let selected = match state {
+                LazyState::Cached(row_offset) => workspace
+                    .lazy
+                    .loop_skip_plans
+                    .find_with_hint(row_offset, active_loop_slot),
+                LazyState::Inline { .. } => None,
+            };
+            let selected_slot = selected.map(|(slot, _)| slot);
+            if selected_slot != active_loop_slot {
                 loop_probe.left_plan_state();
+                active_loop_slot = selected_slot;
             }
-            if in_plan_state
-                && loop_probe.is_ready(position)
-                && haystack.len().saturating_sub(position) >= LAZY_LOOP_SKIP_MIN_BYTES
-                && meter.remaining()
-                    >= u64::try_from(LAZY_LOOP_SKIP_MIN_BYTES)
-                        .expect("lazy loop threshold fits u64")
-            {
-                // Pending mode is part of the cached identity. A nonaccepting
-                // loop leaves any selected endpoint and its start unchanged;
-                // only the live-frontier start proof can be dropped.
-                let available = usize::try_from(meter.remaining())
-                    .unwrap_or(usize::MAX)
-                    .min(haystack.len().saturating_sub(position));
-                let scan_end = position.checked_add(available).ok_or(
-                    SearchError::ArithmeticOverflow {
-                        computation: "lazy loop scan end",
-                    },
-                )?;
-                let skipped = plan
-                    .scanner
-                    .scan_forward(&haystack[position..scan_end]);
-                loop_probe.observe(position, skipped)?;
-                if skipped != 0 {
-                    meter.charge_admitted(
-                        u64::try_from(skipped).expect("lazy loop skip length fits u64"),
-                    );
-                    position = position.checked_add(skipped).ok_or(
+            if let Some((_, plan)) = selected {
+                if loop_probe.is_ready(position)
+                    && haystack.len().saturating_sub(position) >= LAZY_LOOP_SKIP_MIN_BYTES
+                    && meter.remaining()
+                        >= u64::try_from(LAZY_LOOP_SKIP_MIN_BYTES)
+                            .expect("lazy loop threshold fits u64")
+                {
+                    // Pending mode is part of the cached identity. A
+                    // nonaccepting loop leaves any selected endpoint and its
+                    // start unchanged; only the live-frontier proof can drop.
+                    let available = usize::try_from(meter.remaining())
+                        .unwrap_or(usize::MAX)
+                        .min(haystack.len().saturating_sub(position));
+                    let scan_end = position.checked_add(available).ok_or(
                         SearchError::ArithmeticOverflow {
-                            computation: "lazy loop source progress",
+                            computation: "lazy loop scan end",
                         },
                     )?;
-                    boundaries = boundaries.checked_add(skipped).ok_or(
-                        SearchError::ArithmeticOverflow {
-                            computation: "lazy loop examined boundary count",
-                        },
-                    )?;
-                    if TRACK_START && plan.start_action == LazyStartAction::Drop {
-                        active_start = None;
-                    }
-                    if position == haystack.len() {
-                        continue;
+                    let skipped = plan
+                        .scanner
+                        .scan_forward(&haystack[position..scan_end]);
+                    loop_probe.observe(position, skipped)?;
+                    if skipped != 0 {
+                        meter.charge_admitted(
+                            u64::try_from(skipped).expect("lazy loop skip length fits u64"),
+                        );
+                        position = position.checked_add(skipped).ok_or(
+                            SearchError::ArithmeticOverflow {
+                                computation: "lazy loop source progress",
+                            },
+                        )?;
+                        boundaries = boundaries.checked_add(skipped).ok_or(
+                            SearchError::ArithmeticOverflow {
+                                computation: "lazy loop examined boundary count",
+                            },
+                        )?;
+                        if TRACK_START && plan.start_action == LazyStartAction::Drop {
+                            active_start = None;
+                        }
+                        if position == haystack.len() {
+                            continue;
+                        }
                     }
                 }
             }
@@ -9910,7 +10031,324 @@ fn try_lazy_state_equivalence_class(
     Ok(Some(members))
 }
 
-/// Learn at most one exact self-loop from already-published direct cells.
+/// Compare exact retained graph identities without using their discovery-order
+/// state numbers. A lower pending-mode/item sequence is the canonical winner.
+fn compare_lazy_loop_graph_states(
+    lazy: &LazyWorkspace,
+    left: u32,
+    right: u32,
+    meter: &mut WorkMeter,
+) -> Result<Option<core::cmp::Ordering>, SearchError> {
+    if left == right {
+        return Ok(Some(core::cmp::Ordering::Equal));
+    }
+    let (left_offset, left_len, left_pending) = lazy.state_bounds(left)?;
+    let (right_offset, right_len, right_pending) = lazy.state_bounds(right)?;
+    let left_end = left_offset
+        .checked_add(left_len)
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "direct loop ranking left state end",
+        })?;
+    let right_end = right_offset
+        .checked_add(right_len)
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "direct loop ranking right state end",
+        })?;
+    let left_items = lazy
+        .items
+        .get(left_offset..left_end)
+        .ok_or(SearchError::InternalInvariant {
+            detail: "direct loop ranking left state is outside retained items",
+        })?;
+    let right_items = lazy
+        .items
+        .get(right_offset..right_end)
+        .ok_or(SearchError::InternalInvariant {
+            detail: "direct loop ranking right state is outside retained items",
+        })?;
+    if !meter.try_charge_optional(1, 0) {
+        return Ok(None);
+    }
+    let pending = left_pending.cmp(&right_pending);
+    if pending != core::cmp::Ordering::Equal {
+        return Ok(Some(pending));
+    }
+    for (&left_item, &right_item) in left_items.iter().zip(right_items) {
+        if !meter.try_charge_optional(1, 0) {
+            return Ok(None);
+        }
+        let item = left_item.cmp(&right_item);
+        if item != core::cmp::Ordering::Equal {
+            return Ok(Some(item));
+        }
+    }
+    if !meter.try_charge_optional(1, 0) {
+        return Ok(None);
+    }
+    Ok(Some(
+        left_items
+            .len()
+            .cmp(&right_items.len())
+            // Exact state interning makes this fallback unreachable for
+            // distinct identities. Retain a total order if corrupted test
+            // storage violates that stronger invariant.
+            .then_with(|| left.cmp(&right)),
+    ))
+}
+
+const fn lazy_loop_action_rank(action: LazyStartAction) -> u8 {
+    match action {
+        LazyStartAction::Propagate => 0,
+        LazyStartAction::Drop => 1,
+        LazyStartAction::Reset => 2,
+    }
+}
+
+/// Best-first, source-independent ordering for direct loop proofs.
+///
+/// Cardinality preserves the existing global admission policy. Equal-width
+/// plans use the exact graph state rather than publication order; action and
+/// bitmap then make same-state candidates deterministic without combining
+/// their independently authenticated provenance.
+fn compare_lazy_loop_candidates(
+    lazy: &LazyWorkspace,
+    left: LazyLoopSkipCandidate,
+    right: LazyLoopSkipCandidate,
+    meter: &mut WorkMeter,
+) -> Result<Option<core::cmp::Ordering>, SearchError> {
+    let cardinality = byte_bitmap_cardinality(right.members)
+        .cmp(&byte_bitmap_cardinality(left.members));
+    if cardinality != core::cmp::Ordering::Equal {
+        return Ok(Some(cardinality));
+    }
+    let Some(state) = compare_lazy_loop_graph_states(lazy, left.state, right.state, meter)? else {
+        return Ok(None);
+    };
+    if state != core::cmp::Ordering::Equal {
+        return Ok(Some(state));
+    }
+    Ok(Some(
+        lazy_loop_action_rank(left.start_action)
+            .cmp(&lazy_loop_action_rank(right.start_action))
+            .then_with(|| left.members.cmp(&right.members)),
+    ))
+}
+
+/// Retain one local winner per exact state and the four best distinct states
+/// overall. The fixed insertion sort is cold, allocation-free, and independent
+/// of state discovery/publication order.
+fn try_retain_lazy_loop_candidate(
+    lazy: &LazyWorkspace,
+    retained: &mut [Option<LazyLoopSkipCandidate>; LAZY_LOOP_SKIP_PLAN_CAPACITY],
+    candidate: LazyLoopSkipCandidate,
+    meter: &mut WorkMeter,
+) -> Result<bool, SearchError> {
+    if byte_bitmap_cardinality(candidate.members) == 0 {
+        return Ok(true);
+    }
+    let len = retained
+        .iter()
+        .position(Option::is_none)
+        .unwrap_or(LAZY_LOOP_SKIP_PLAN_CAPACITY);
+    debug_assert!(retained[..len].iter().all(Option::is_some));
+    debug_assert!(retained[len..].iter().all(Option::is_none));
+
+    let same_state = retained[..len]
+        .iter()
+        .position(|entry| entry.is_some_and(|entry| entry.state == candidate.state));
+    let inserted = if let Some(slot) = same_state {
+        let existing = retained
+            .get(slot)
+            .copied()
+            .flatten()
+            .ok_or(SearchError::InternalInvariant {
+                detail: "direct loop candidate prefix contains a hole",
+            })?;
+        let Some(ordering) = compare_lazy_loop_candidates(lazy, candidate, existing, meter)? else {
+            return Ok(false);
+        };
+        if ordering != core::cmp::Ordering::Less {
+            return Ok(true);
+        }
+        retained[slot] = Some(candidate);
+        len
+    } else if len < LAZY_LOOP_SKIP_PLAN_CAPACITY {
+        retained[len] = Some(candidate);
+        len.checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "direct loop retained candidate count",
+            })?
+    } else {
+        let worst = retained[LAZY_LOOP_SKIP_PLAN_CAPACITY - 1].ok_or(
+            SearchError::InternalInvariant {
+                detail: "full direct loop candidate cache has an empty tail",
+            },
+        )?;
+        let Some(ordering) = compare_lazy_loop_candidates(lazy, candidate, worst, meter)? else {
+            return Ok(false);
+        };
+        if ordering != core::cmp::Ordering::Less {
+            return Ok(true);
+        }
+        retained[LAZY_LOOP_SKIP_PLAN_CAPACITY - 1] = Some(candidate);
+        len
+    };
+
+    for right in 1..inserted {
+        let mut slot = right;
+        while slot != 0 {
+            let previous_slot = slot.checked_sub(1).ok_or(
+                SearchError::InternalInvariant {
+                    detail: "nonzero direct loop candidate slot underflowed",
+                },
+            )?;
+            let current = retained[slot].ok_or(SearchError::InternalInvariant {
+                detail: "direct loop candidate sort contains a current hole",
+            })?;
+            let previous = retained[previous_slot].ok_or(SearchError::InternalInvariant {
+                detail: "direct loop candidate sort contains a previous hole",
+            })?;
+            let Some(ordering) =
+                compare_lazy_loop_candidates(lazy, current, previous, meter)?
+            else {
+                return Ok(false);
+            };
+            if ordering != core::cmp::Ordering::Less {
+                break;
+            }
+            retained.swap(slot, previous_slot);
+            slot = previous_slot;
+        }
+    }
+    Ok(true)
+}
+
+/// Publish one completely selected direct-loop set with stable scanner owners.
+///
+/// Exact signature matches retain their physical owner slot and incur no
+/// publication work. New signatures occupy only slots not referenced by the
+/// selected set, so a K+1 replacement constructs and publishes one scanner
+/// rather than copying the three survivors. The state bitmap is one separate
+/// owner and is charged only when its exact value changes. All validation and
+/// aggregate admission precede the first write.
+fn try_publish_lazy_loop_skip_candidates(
+    lazy: &mut LazyWorkspace,
+    candidates: [Option<LazyLoopSkipCandidate>; LAZY_LOOP_SKIP_PLAN_CAPACITY],
+    meter: &mut WorkMeter,
+) -> Result<bool, SearchError> {
+    let mut target = [None; LAZY_LOOP_SKIP_PLAN_CAPACITY];
+    let mut target_rows = [None; LAZY_LOOP_SKIP_PLAN_CAPACITY];
+    let mut assigned = [false; LAZY_LOOP_SKIP_PLAN_CAPACITY];
+    let mut reused = [false; LAZY_LOOP_SKIP_PLAN_CAPACITY];
+    let mut unresolved = [None; LAZY_LOOP_SKIP_PLAN_CAPACITY];
+    let mut unresolved_len = 0usize;
+
+    for candidate in candidates.into_iter().flatten() {
+        if let Some(slot) = lazy.loop_skip_plans.matching_slot(candidate) {
+            if assigned[slot] {
+                return Err(SearchError::InternalInvariant {
+                    detail: "direct loop publication selected one owner twice",
+                });
+            }
+            target[slot] = Some(candidate);
+            assigned[slot] = true;
+            reused[slot] = true;
+        } else {
+            let unresolved_slot = unresolved.get_mut(unresolved_len).ok_or(
+                SearchError::InternalInvariant {
+                    detail: "direct loop publication exceeded its unresolved capacity",
+                },
+            )?;
+            *unresolved_slot = Some(candidate);
+            unresolved_len = unresolved_len.checked_add(1).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "direct loop unresolved publication count",
+                },
+            )?;
+        }
+    }
+
+    for candidate in unresolved.into_iter().take(unresolved_len).flatten() {
+        let slot = assigned.iter().position(|&occupied| !occupied).ok_or(
+            SearchError::InternalInvariant {
+                detail: "direct loop publication has no replaceable owner slot",
+            },
+        )?;
+        target[slot] = Some(candidate);
+        assigned[slot] = true;
+    }
+
+    let mut target_members = [0_u64; 4];
+    for (slot, candidate) in target.iter().copied().enumerate() {
+        let Some(candidate) = candidate else {
+            continue;
+        };
+        let state = u8::try_from(candidate.state).map_err(|_| {
+            SearchError::InternalInvariant {
+                detail: "direct loop publication state does not fit its fixed bitmap",
+            }
+        })?;
+        if byte_bitmap_contains(target_members, state) {
+            return Err(SearchError::InternalInvariant {
+                detail: "direct loop publication retained one state twice",
+            });
+        }
+        byte_bitmap_insert(&mut target_members, state);
+        target_rows[slot] = Some(direct_row_offset(candidate.state)?);
+    }
+
+    let mut changed = [false; LAZY_LOOP_SKIP_PLAN_CAPACITY];
+    let mut publication_work = 0_u64;
+    for slot in 0..LAZY_LOOP_SKIP_PLAN_CAPACITY {
+        if reused[slot]
+            || (target[slot].is_none() && lazy.loop_skip_plans.entries[slot].is_none())
+        {
+            continue;
+        }
+        changed[slot] = true;
+        publication_work = publication_work
+            .checked_add(LAZY_LOOP_SKIP_OWNER_PUBLICATION_WORK)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "direct loop owner publication work",
+            })?;
+        if let Some(candidate) = target[slot] {
+            publication_work = publication_work
+                .checked_add(LazyLoopScanner::build_work(candidate.members))
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "direct loop scanner construction work",
+                })?;
+        }
+    }
+    let bitmap_changed = target_members != lazy.loop_skip_plans.state_members;
+    if bitmap_changed {
+        publication_work = publication_work
+            .checked_add(LAZY_LOOP_SKIP_BITMAP_PUBLICATION_WORK)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "direct loop bitmap publication work",
+            })?;
+    }
+    if !meter.try_charge_optional(publication_work, 0) {
+        return Ok(false);
+    }
+
+    for slot in 0..LAZY_LOOP_SKIP_PLAN_CAPACITY {
+        if !changed[slot] {
+            continue;
+        }
+        lazy.loop_skip_plans.entries[slot] = target[slot].map(|candidate| LazyLoopSkipPlan {
+            row_offset: target_rows[slot]
+                .expect("a validated direct loop publication has one exact row"),
+            scanner: LazyLoopScanner::new(candidate.members),
+            start_action: candidate.start_action,
+        });
+    }
+    if bitmap_changed {
+        lazy.loop_skip_plans.state_members = target_members;
+    }
+    Ok(true)
+}
+
+/// Learn up to four exact self-loops from already-published direct cells.
 ///
 /// This cold pass is attempted only after a sufficiently large completed
 /// unlimited lazy invocation. Inferred equivalent bytes are retained only in
@@ -9918,6 +10356,10 @@ fn try_lazy_state_equivalence_class(
 /// transition learning remain byte-for-byte unchanged. Runtime backoff,
 /// rather than a graph-class cardinality cliff, controls narrow unproductive
 /// runs.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the cold transaction derives every state candidate before publishing the complete fixed cache"
+)]
 fn try_derive_lazy_loop_skip(
     automaton: &Automaton,
     workspace: &mut K0Workspace,
@@ -9932,11 +10374,7 @@ fn try_derive_lazy_loop_skip(
     }
 
     let analyzed_cells = workspace.lazy.direct_cells_published;
-    let mut best_cardinality = workspace
-        .lazy
-        .loop_skip_plan
-        .map_or(0, |plan| plan.scanner.cardinality());
-    let mut best_candidate = None;
+    let mut best_candidates = [None; LAZY_LOOP_SKIP_PLAN_CAPACITY];
     for state in 0..workspace.lazy.state_len {
         if !meter.try_charge_optional(1, 0) {
             return Ok(());
@@ -10000,28 +10438,23 @@ fn try_derive_lazy_loop_skip(
             (LazyStartAction::Propagate, propagate_members),
             (LazyStartAction::Drop, drop_members),
         ] {
-            let cardinality = byte_bitmap_cardinality(members);
-            if cardinality > best_cardinality {
-                best_cardinality = cardinality;
-                best_candidate = Some((row_offset, members, start_action));
+            if !try_retain_lazy_loop_candidate(
+                &workspace.lazy,
+                &mut best_candidates,
+                LazyLoopSkipCandidate {
+                    state: state_u32,
+                    members,
+                    start_action,
+                },
+                meter,
+            )? {
+                return Ok(());
             }
         }
     }
 
-    if let Some((row_offset, members, start_action)) = best_candidate {
-        let publication_work = LazyLoopScanner::build_work(members)
-            .checked_add(1)
-            .ok_or(SearchError::ArithmeticOverflow {
-                computation: "lazy loop scanner publication work",
-            })?;
-        if !meter.try_charge_optional(publication_work, 0) {
-            return Ok(());
-        }
-        workspace.lazy.loop_skip_plan = Some(LazyLoopSkipPlan {
-            row_offset,
-            scanner: LazyLoopScanner::new(members),
-            start_action,
-        });
+    if !try_publish_lazy_loop_skip_candidates(&mut workspace.lazy, best_candidates, meter)? {
+        return Ok(());
     }
     // Direct cells are immutable and this cold pass publishes none. Retain the
     // exact completed epoch so a no-plan result costs nothing on later calls,
@@ -16912,6 +17345,70 @@ mod tests {
         .unwrap()
     }
 
+    fn five_equal_direct_loop_states() -> Automaton {
+        // The split makes all five Consume nodes part of the immutable graph
+        // shape. Tests retain singleton lazy states in different discovery
+        // orders; each node has one equal-width exact self-loop.
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 5, 6, 7, 8, 9, 10, 10],
+                edge_targets: vec![1, 2, 3, 4, 5, 1, 2, 3, 4, 5],
+                edge_kinds: vec![
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                ],
+                byte_starts: vec![0, 0, 0, 0, 0, b'a', b'b', b'c', b'd', b'e'],
+                byte_ends: vec![0, 0, 0, 0, 0, b'a', b'b', b'c', b'd', b'e'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn direct_two_state_inferred_loop() -> Automaton {
+        // State zero has an `a` self-loop and enters state one on `x`. State
+        // one's `b..=c` edge is one graph equivalence class, while the `q b`
+        // branch splits `b` and `c` into distinct global byte classes. A plan
+        // learned from the physical `c` cell may therefore scan `b` without
+        // publishing that sibling cell.
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 3, 4, 5, 5],
+                edge_targets: vec![0, 1, 2, 1, 3],
+                edge_kinds: vec![EdgeKind::ByteRange; 5],
+                byte_starts: vec![b'a', b'x', b'q', b'b', b'b'],
+                byte_ends: vec![b'a', b'x', b'q', b'c', b'b'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
     fn direct_split_loop_then_terminal() -> Automaton {
         // State zero treats `a` and `b` identically, while the reachable
         // `q b` branch forces them into distinct global byte classes. A loop
@@ -17117,6 +17614,161 @@ mod tests {
         workspace
     }
 
+    fn direct_equal_loop_cache_workspace(
+        plan: &Automaton,
+        discovery: [u32; 5],
+        published_items: &[u32],
+    ) -> (K0Workspace, [u32; 5]) {
+        let mut workspace =
+            K0Workspace::new_accelerated(plan, WorkspaceLimits::unlimited()).unwrap();
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        let mut states_by_item = [super::LAZY_NO_STATE; 5];
+        for (ordinal, item) in discovery.into_iter().enumerate() {
+            workspace.lazy.scratch[0] = item;
+            workspace.lazy.scratch_len = 1;
+            let state = if ordinal == 0 {
+                workspace.lazy.intern_initial(false, &mut meter, 0).unwrap()
+            } else {
+                match workspace
+                    .lazy
+                    .intern_speculative(false, &mut meter, 0, 0)
+                    .unwrap()
+                {
+                    super::LazyInterned::State(state) => state,
+                    other => panic!("equal-loop state was not retained: {other:?}"),
+                }
+            };
+            states_by_item[usize::try_from(item.checked_sub(1).unwrap()).unwrap()] = state;
+        }
+        let loop_bytes = [b'a', b'b', b'c', b'd', b'e'];
+        for &item in published_items {
+            let item_index = usize::try_from(item.checked_sub(1).unwrap()).unwrap();
+            let state = states_by_item[item_index];
+            let cell = super::direct_row_encoded_state(state).unwrap()
+                | super::LazyStartAction::Propagate.cell_bits();
+            workspace
+                .lazy
+                .set_cell(state, byte_class(plan, loop_bytes[item_index]), cell)
+                .unwrap();
+        }
+        (workspace, states_by_item)
+    }
+
+    fn direct_loop_cache_signature(
+        workspace: &K0Workspace,
+    ) -> Vec<(u32, super::LazyStartAction, [u64; 4])> {
+        workspace
+            .lazy
+            .loop_skip_plans
+            .entries
+            .iter()
+            .flatten()
+            .map(|plan| {
+                (
+                    super::direct_row_state(plan.row_offset),
+                    plan.start_action,
+                    plan.scanner.words(),
+                )
+            })
+            .collect()
+    }
+
+    fn direct_loop_cache_items(workspace: &K0Workspace) -> Vec<u32> {
+        let mut items = workspace
+            .lazy
+            .loop_skip_plans
+            .entries
+            .iter()
+            .flatten()
+            .map(|plan| {
+                workspace
+                    .lazy
+                    .item(super::direct_row_state(plan.row_offset), 0)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        items.sort_unstable();
+        items
+    }
+
+    fn direct_equal_loop_candidates(
+        states_by_item: [u32; 5],
+        items: [u32; super::LAZY_LOOP_SKIP_PLAN_CAPACITY],
+    ) -> [Option<super::LazyLoopSkipCandidate>; super::LAZY_LOOP_SKIP_PLAN_CAPACITY] {
+        let loop_bytes = [b'a', b'b', b'c', b'd', b'e'];
+        let mut candidates = [None; super::LAZY_LOOP_SKIP_PLAN_CAPACITY];
+        for (slot, item) in items.into_iter().enumerate() {
+            let item_index = usize::try_from(item.checked_sub(1).unwrap()).unwrap();
+            let mut members = [0_u64; 4];
+            super::byte_bitmap_insert(&mut members, loop_bytes[item_index]);
+            candidates[slot] = Some(super::LazyLoopSkipCandidate {
+                state: states_by_item[item_index],
+                members,
+                start_action: super::LazyStartAction::Propagate,
+            });
+        }
+        candidates
+    }
+
+    fn direct_loop_cache_slot_for_item(workspace: &K0Workspace, item: u32) -> usize {
+        workspace
+            .lazy
+            .loop_skip_plans
+            .entries
+            .iter()
+            .enumerate()
+            .find_map(|(slot, plan)| {
+                let state = super::direct_row_state(plan.as_ref()?.row_offset);
+                (workspace.lazy.item(state, 0).unwrap() == item).then_some(slot)
+            })
+            .expect("a retained direct loop item has one physical owner slot")
+    }
+
+    fn direct_two_state_loop_workspace(plan: &Automaton) -> K0Workspace {
+        let mut workspace =
+            K0Workspace::new_accelerated(plan, WorkspaceLimits::unlimited()).unwrap();
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        workspace.lazy.scratch[0] = 0;
+        workspace.lazy.scratch_len = 1;
+        let initial = workspace.lazy.intern_initial(false, &mut meter, 0).unwrap();
+        workspace.lazy.scratch[0] = 1;
+        workspace.lazy.scratch_len = 1;
+        let second = match workspace
+            .lazy
+            .intern_speculative(false, &mut meter, 0, 0)
+            .unwrap()
+        {
+            super::LazyInterned::State(state) => state,
+            other => panic!("second direct loop state was not retained: {other:?}"),
+        };
+        workspace.lazy.initial = initial;
+        workspace.lazy.initial_kind = super::LazyInitialKind::Positive;
+        workspace.lazy.initialized = true;
+
+        let initial_loop = super::direct_row_encoded_state(initial).unwrap()
+            | super::LazyStartAction::Propagate.cell_bits();
+        let enter_second = super::direct_row_encoded_state(second).unwrap()
+            | super::LazyStartAction::Propagate.cell_bits();
+        let second_loop = super::direct_row_encoded_state(second).unwrap()
+            | super::LazyStartAction::Propagate.cell_bits();
+        workspace
+            .lazy
+            .set_cell(initial, byte_class(plan, b'a'), initial_loop)
+            .unwrap();
+        workspace
+            .lazy
+            .set_cell(initial, byte_class(plan, b'x'), enter_second)
+            .unwrap();
+        workspace
+            .lazy
+            .set_cell(second, byte_class(plan, b'c'), second_loop)
+            .unwrap();
+        let mut derive = WorkMeter::new(u64::MAX, 0);
+        super::try_derive_lazy_loop_skip(plan, &mut workspace, &mut derive).unwrap();
+        assert_eq!(workspace.lazy.loop_skip_plans.len(), 2);
+        workspace
+    }
+
     fn narrow_then_high_loop_workspace(plan: &Automaton, cell: u32) -> K0Workspace {
         let mut workspace =
             K0Workspace::new_accelerated(plan, WorkspaceLimits::unlimited()).unwrap();
@@ -17133,7 +17785,8 @@ mod tests {
         assert_eq!(
             workspace
                 .lazy
-                .loop_skip_plan
+                .loop_skip_plans
+                .first()
                 .expect("the narrow loop plan must be retained")
                 .scanner
                 .cardinality(),
@@ -25139,7 +25792,7 @@ mod tests {
                 .unwrap()
                 .into_output()
         );
-        assert!(exists.lazy.loop_skip_plan.is_some());
+        assert!(!exists.lazy.loop_skip_plans.is_empty());
 
         let earliest_plan = ascii_loop_class(1);
         pin_without_start_filter(&earliest_plan);
@@ -25158,7 +25811,7 @@ mod tests {
                 .into_output(),
             Some(run_len + 1)
         );
-        assert!(earliest.lazy.loop_skip_plan.is_some());
+        assert!(!earliest.lazy.loop_skip_plans.is_empty());
 
         let selected_plan = ascii_loop_class(1);
         pin_without_start_filter(&selected_plan);
@@ -25178,7 +25831,7 @@ mod tests {
             .unwrap();
         assert_eq!(cold_finite.output(), &Some(run_len + 1));
         assert!(
-            selected.lazy.loop_skip_plan.is_none(),
+            selected.lazy.loop_skip_plans.is_empty(),
             "a finite completion certificate must not publish optional analysis"
         );
         assert_eq!(
@@ -25194,7 +25847,7 @@ mod tests {
                 .into_output(),
             Some(run_len + 1)
         );
-        assert!(selected.lazy.loop_skip_plan.is_some());
+        assert!(!selected.lazy.loop_skip_plans.is_empty());
 
         let measured = selected_plan
             .prepare::<SelectedEnd>()
@@ -25264,7 +25917,8 @@ mod tests {
         let loop_plan = session
             .workspace
             .lazy
-            .loop_skip_plan
+            .loop_skip_plans
+            .first()
             .expect("an early-return Exists call must retain its completed loop witness");
         assert_eq!(loop_plan.start_action, super::LazyStartAction::Propagate);
         assert!(loop_plan.scanner.contains(b'a'));
@@ -25343,7 +25997,8 @@ mod tests {
         let loop_plan = session
             .workspace
             .lazy
-            .loop_skip_plan
+            .loop_skip_plans
+            .first()
             .expect("the unanchored Drop self-loop must retain a scanner");
         assert_eq!(loop_plan.start_action, super::LazyStartAction::Drop);
         assert!(loop_plan.scanner.contains(b'x'));
@@ -25412,7 +26067,8 @@ mod tests {
         assert_eq!(first.into_output(), Some(MatchSpan::new(0, 2)));
         let loop_plan = workspace
             .lazy
-            .loop_skip_plan
+            .loop_skip_plans
+            .first()
             .expect("a long pending full-byte loop must retain a scanner");
         assert_eq!(loop_plan.start_action, super::LazyStartAction::Propagate);
         assert!(matches!(loop_plan.scanner, super::LazyLoopScanner::Set(_)));
@@ -25560,10 +26216,525 @@ mod tests {
         let mut workspace = direct_nonpending_loop_workspace(&plan, cell);
         let mut derive = WorkMeter::new(u64::MAX, 0);
         super::try_derive_lazy_loop_skip(&plan, &mut workspace, &mut derive).unwrap();
-        let retained = workspace.lazy.loop_skip_plan.unwrap();
+        let retained = workspace.lazy.loop_skip_plans.first().unwrap();
         assert_eq!(retained.start_action, super::LazyStartAction::Propagate);
         assert!(matches!(retained.scanner, super::LazyLoopScanner::All));
         assert_eq!(retained.scanner.cardinality(), 256);
+    }
+
+    #[test]
+    fn direct_loop_cache_retains_canonical_distinct_states_and_exact_bitmap() {
+        let plan = five_equal_direct_loop_states();
+        let discoveries = [[1, 2, 3, 4, 5], [5, 4, 3, 2, 1]];
+        for discovery in discoveries {
+            let (mut workspace, states_by_item) =
+                direct_equal_loop_cache_workspace(&plan, discovery, &[1, 2, 3, 4, 5]);
+            let rows = workspace.lazy.rows.clone();
+            let published = workspace.lazy.direct_cells_published;
+            let mut derive = WorkMeter::new(u64::MAX, 0);
+            super::try_derive_lazy_loop_skip(&plan, &mut workspace, &mut derive).unwrap();
+
+            assert_eq!(workspace.lazy.loop_skip_plans.len(), 4);
+            assert_eq!(direct_loop_cache_items(&workspace), [1, 2, 3, 4]);
+            assert_eq!(workspace.lazy.rows, rows);
+            assert_eq!(workspace.lazy.direct_cells_published, published);
+            assert_eq!(
+                super::byte_bitmap_cardinality(workspace.lazy.loop_skip_plans.state_members),
+                4
+            );
+            for (item_index, state) in states_by_item.into_iter().enumerate() {
+                let expected = item_index < 4;
+                let row_offset = super::direct_row_offset(state).unwrap();
+                assert_eq!(
+                    workspace.lazy.loop_skip_plans.find(row_offset).is_some(),
+                    expected,
+                    "graph item {}",
+                    item_index + 1
+                );
+                assert_eq!(
+                    super::byte_bitmap_contains(
+                        workspace.lazy.loop_skip_plans.state_members,
+                        u8::try_from(state).unwrap(),
+                    ),
+                    expected,
+                    "bitmap graph item {}",
+                    item_index + 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn direct_loop_cache_unchanged_top_four_has_zero_publication_work() {
+        let plan = five_equal_direct_loop_states();
+        let (mut workspace, states_by_item) =
+            direct_equal_loop_cache_workspace(&plan, [5, 4, 3, 2, 1], &[2, 3, 4, 5]);
+        let mut derive = WorkMeter::new(u64::MAX, 0);
+        super::try_derive_lazy_loop_skip(&plan, &mut workspace, &mut derive).unwrap();
+        assert_eq!(direct_loop_cache_items(&workspace), [2, 3, 4, 5]);
+
+        let candidates = direct_equal_loop_candidates(states_by_item, [2, 3, 4, 5]);
+        let signature = direct_loop_cache_signature(&workspace);
+        let bitmap = workspace.lazy.loop_skip_plans.state_members;
+        let rows = workspace.lazy.rows.clone();
+        let mut exact_zero = WorkMeter::new(0, 0);
+        assert!(super::try_publish_lazy_loop_skip_candidates(
+            &mut workspace.lazy,
+            candidates,
+            &mut exact_zero,
+        )
+        .unwrap());
+        assert_eq!(exact_zero.consumed, 0);
+        assert_eq!(direct_loop_cache_signature(&workspace), signature);
+        assert_eq!(workspace.lazy.loop_skip_plans.state_members, bitmap);
+        assert_eq!(workspace.lazy.rows, rows);
+    }
+
+    #[test]
+    fn direct_loop_cache_one_new_three_reused_has_exact_structural_sharing_work() {
+        let plan = five_equal_direct_loop_states();
+        let prepare = || {
+            let (mut workspace, states_by_item) =
+                direct_equal_loop_cache_workspace(&plan, [5, 4, 3, 2, 1], &[2, 3, 4, 5]);
+            let mut derive = WorkMeter::new(u64::MAX, 0);
+            super::try_derive_lazy_loop_skip(&plan, &mut workspace, &mut derive).unwrap();
+            assert_eq!(direct_loop_cache_items(&workspace), [2, 3, 4, 5]);
+            (workspace, states_by_item)
+        };
+        let expected_work = u64::try_from(super::ASCII_RUN_SCANNER_BUILD_WORK)
+            .unwrap()
+            .checked_add(super::LAZY_LOOP_SKIP_OWNER_PUBLICATION_WORK)
+            .unwrap()
+            .checked_add(super::LAZY_LOOP_SKIP_BITMAP_PUBLICATION_WORK)
+            .unwrap();
+
+        let (mut refused, refused_states) = prepare();
+        let candidates = direct_equal_loop_candidates(refused_states, [1, 2, 3, 4]);
+        let signature = direct_loop_cache_signature(&refused);
+        let bitmap = refused.lazy.loop_skip_plans.state_members;
+        let rows = refused.lazy.rows.clone();
+        let mut one_below = WorkMeter::new(expected_work.checked_sub(1).unwrap(), 0);
+        assert!(!super::try_publish_lazy_loop_skip_candidates(
+            &mut refused.lazy,
+            candidates,
+            &mut one_below,
+        )
+        .unwrap());
+        assert_eq!(one_below.consumed, 0);
+        assert_eq!(direct_loop_cache_signature(&refused), signature);
+        assert_eq!(refused.lazy.loop_skip_plans.state_members, bitmap);
+        assert_eq!(refused.lazy.rows, rows);
+
+        let (mut exact, exact_states) = prepare();
+        let reused_slots = [2, 3, 4].map(|item| direct_loop_cache_slot_for_item(&exact, item));
+        let evicted_slot = direct_loop_cache_slot_for_item(&exact, 5);
+        let candidates = direct_equal_loop_candidates(exact_states, [1, 2, 3, 4]);
+        let mut exact_meter = WorkMeter::new(expected_work, 0);
+        assert!(super::try_publish_lazy_loop_skip_candidates(
+            &mut exact.lazy,
+            candidates,
+            &mut exact_meter,
+        )
+        .unwrap());
+        assert_eq!(exact_meter.consumed, expected_work);
+        assert_eq!(direct_loop_cache_items(&exact), [1, 2, 3, 4]);
+        assert_eq!(
+            [2, 3, 4].map(|item| direct_loop_cache_slot_for_item(&exact, item)),
+            reused_slots
+        );
+        assert_eq!(direct_loop_cache_slot_for_item(&exact, 1), evicted_slot);
+    }
+
+    #[test]
+    fn direct_loop_cache_initial_publication_has_exact_whole_cache_work_boundary() {
+        let plan = five_equal_direct_loop_states();
+        let prepare = || {
+            direct_equal_loop_cache_workspace(&plan, [5, 4, 3, 2, 1], &[1, 2, 3, 4, 5]).0
+        };
+
+        let mut measured = prepare();
+        let retained_bytes = measured.retained_bytes();
+        let rows = measured.lazy.rows.clone();
+        let published = measured.lazy.direct_cells_published;
+        let mut exact = WorkMeter::new(u64::MAX, 0);
+        super::try_derive_lazy_loop_skip(&plan, &mut measured, &mut exact).unwrap();
+        let publication_work = exact.consumed;
+        assert_eq!(direct_loop_cache_items(&measured), [1, 2, 3, 4]);
+        assert_eq!(measured.lazy.rows, rows);
+        assert_eq!(measured.lazy.direct_cells_published, published);
+        assert_eq!(measured.retained_bytes(), retained_bytes);
+
+        let mut refused = prepare();
+        let old_epoch = refused.lazy.loop_skip_analyzed_at_cells;
+        let refused_rows = refused.lazy.rows.clone();
+        let mut one_below = WorkMeter::new(publication_work.checked_sub(1).unwrap(), 0);
+        super::try_derive_lazy_loop_skip(&plan, &mut refused, &mut one_below).unwrap();
+        assert!(refused.lazy.loop_skip_plans.is_empty());
+        assert_eq!(refused.lazy.loop_skip_analyzed_at_cells, old_epoch);
+        assert_eq!(refused.lazy.rows, refused_rows);
+
+        let mut retry = WorkMeter::new(publication_work, 0);
+        super::try_derive_lazy_loop_skip(&plan, &mut refused, &mut retry).unwrap();
+        assert_eq!(retry.consumed, publication_work);
+        assert_eq!(direct_loop_cache_items(&refused), [1, 2, 3, 4]);
+        assert_eq!(
+            refused.lazy.loop_skip_analyzed_at_cells,
+            refused.lazy.direct_cells_published
+        );
+    }
+
+    #[test]
+    fn direct_loop_candidate_reducer_is_distinct_widest_and_action_deterministic() {
+        let plan = five_equal_direct_loop_states();
+        let (workspace, states_by_item) =
+            direct_equal_loop_cache_workspace(&plan, [5, 4, 3, 2, 1], &[]);
+        let mut retained = [None; super::LAZY_LOOP_SKIP_PLAN_CAPACITY];
+        let mut ranking = WorkMeter::new(u64::MAX, 0);
+        let ranked_members = [1_u64, 3, 7, 15, 31];
+        for (item_index, state) in states_by_item.into_iter().enumerate() {
+            super::try_retain_lazy_loop_candidate(
+                &workspace.lazy,
+                &mut retained,
+                super::LazyLoopSkipCandidate {
+                    state,
+                    members: [ranked_members[item_index], 0, 0, 0],
+                    start_action: super::LazyStartAction::Drop,
+                },
+                &mut ranking,
+            )
+            .unwrap();
+        }
+        let ranked = retained
+            .into_iter()
+            .flatten()
+            .map(|candidate| {
+                workspace.lazy.item(candidate.state, 0).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ranked, [5, 4, 3, 2]);
+
+        let state_five = states_by_item[4];
+        let before = retained;
+        super::try_retain_lazy_loop_candidate(
+            &workspace.lazy,
+            &mut retained,
+            super::LazyLoopSkipCandidate {
+                state: state_five,
+                members: [1, 0, 0, 0],
+                start_action: super::LazyStartAction::Propagate,
+            },
+            &mut ranking,
+        )
+        .unwrap();
+        assert_eq!(retained, before, "a narrower local plan cannot displace its winner");
+
+        let state_one = states_by_item[0];
+        let mut equal_action = [None; super::LAZY_LOOP_SKIP_PLAN_CAPACITY];
+        for start_action in [
+            super::LazyStartAction::Drop,
+            super::LazyStartAction::Propagate,
+        ] {
+            super::try_retain_lazy_loop_candidate(
+                &workspace.lazy,
+                &mut equal_action,
+                super::LazyLoopSkipCandidate {
+                    state: state_one,
+                    members: [3, 0, 0, 0],
+                    start_action,
+                },
+                &mut ranking,
+            )
+            .unwrap();
+        }
+        assert_eq!(equal_action.into_iter().flatten().count(), 1);
+        assert_eq!(
+            equal_action[0].unwrap().start_action,
+            super::LazyStartAction::Propagate
+        );
+    }
+
+    #[test]
+    fn saturated_direct_loop_cache_eviction_and_publication_are_failure_atomic() {
+        let plan = five_equal_direct_loop_states();
+        let prepare = || {
+            let (mut workspace, states_by_item) = direct_equal_loop_cache_workspace(
+                &plan,
+                [5, 4, 3, 2, 1],
+                &[2, 3, 4, 5],
+            );
+            let mut initial = WorkMeter::new(u64::MAX, 0);
+            super::try_derive_lazy_loop_skip(&plan, &mut workspace, &mut initial).unwrap();
+            assert_eq!(direct_loop_cache_items(&workspace), [2, 3, 4, 5]);
+            let state = states_by_item[0];
+            let cell = super::direct_row_encoded_state(state).unwrap()
+                | super::LazyStartAction::Propagate.cell_bits();
+            workspace
+                .lazy
+                .set_cell(state, byte_class(&plan, b'a'), cell)
+                .unwrap();
+            workspace.lazy.saturated = true;
+            (workspace, states_by_item)
+        };
+
+        let (mut measured, measured_states) = prepare();
+        let retained_bytes = measured.retained_bytes();
+        let rows = measured.lazy.rows.clone();
+        let published = measured.lazy.direct_cells_published;
+        let mut exact = WorkMeter::new(u64::MAX, 0);
+        super::try_derive_lazy_loop_skip(&plan, &mut measured, &mut exact).unwrap();
+        let upgrade_work = exact.consumed;
+        assert_eq!(direct_loop_cache_items(&measured), [1, 2, 3, 4]);
+        let evicted_state = measured_states[4];
+        let evicted_row = super::direct_row_offset(evicted_state).unwrap();
+        assert!(measured.lazy.loop_skip_plans.find(evicted_row).is_none());
+        assert!(!super::byte_bitmap_contains(
+            measured.lazy.loop_skip_plans.state_members,
+            u8::try_from(evicted_state).unwrap(),
+        ));
+        assert_eq!(measured.lazy.rows, rows);
+        assert_eq!(measured.lazy.direct_cells_published, published);
+        assert_eq!(measured.retained_bytes(), retained_bytes);
+        assert!(measured.lazy.saturated);
+
+        let (mut refused, _) = prepare();
+        let old_signature = direct_loop_cache_signature(&refused);
+        let old_bitmap = refused.lazy.loop_skip_plans.state_members;
+        let old_epoch = refused.lazy.loop_skip_analyzed_at_cells;
+        let refused_rows = refused.lazy.rows.clone();
+        let mut one_below = WorkMeter::new(upgrade_work.checked_sub(1).unwrap(), 0);
+        super::try_derive_lazy_loop_skip(&plan, &mut refused, &mut one_below).unwrap();
+        assert_eq!(direct_loop_cache_signature(&refused), old_signature);
+        assert_eq!(refused.lazy.loop_skip_plans.state_members, old_bitmap);
+        assert_eq!(refused.lazy.loop_skip_analyzed_at_cells, old_epoch);
+        assert_eq!(refused.lazy.rows, refused_rows);
+        assert!(refused.lazy.saturated);
+
+        let mut retry = WorkMeter::new(upgrade_work, 0);
+        super::try_derive_lazy_loop_skip(&plan, &mut refused, &mut retry).unwrap();
+        assert_eq!(retry.consumed, upgrade_work);
+        assert_eq!(direct_loop_cache_items(&refused), [1, 2, 3, 4]);
+        assert_eq!(
+            refused.lazy.loop_skip_analyzed_at_cells,
+            refused.lazy.direct_cells_published
+        );
+        assert!(refused.lazy.saturated);
+    }
+
+    #[test]
+    fn direct_loop_cache_resets_probe_when_selected_slot_changes() {
+        let plan = direct_two_state_inferred_loop();
+        let mut haystack = vec![b'b'; super::LAZY_LOOP_SKIP_MIN_BYTES * 2 + 1];
+        haystack[0] = b'x';
+        let window = SearchWindow::full(&haystack);
+
+        let mut ordinary = direct_two_state_loop_workspace(&plan);
+        let initial_row = super::direct_row_offset(ordinary.lazy.initial).unwrap();
+        let second_row = super::direct_row_offset(1).unwrap();
+        let initial_slot = ordinary.lazy.loop_skip_plans.find(initial_row).unwrap().0;
+        let (second_slot, second_contains_b) = ordinary
+            .lazy
+            .loop_skip_plans
+            .find(second_row)
+            .map(|(slot, plan)| (slot, plan.scanner.contains(b'b')))
+            .unwrap();
+        assert_ne!(initial_slot, second_slot);
+        assert!(second_contains_b);
+        let b_class = byte_class(&plan, b'b');
+        assert_eq!(
+            ordinary.lazy.direct_cell(second_row, b_class).unwrap(),
+            super::LAZY_CELL_UNFILLED
+        );
+        let published = ordinary.lazy.direct_cells_published;
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        let mut adaptive = super::AdaptiveStartProbe::default();
+        let result = super::execute_lazy_span_loop::<false, true>(
+            &plan,
+            &haystack,
+            window,
+            &mut ordinary,
+            &mut meter,
+            OutputContract::Exists,
+            0,
+            None,
+            None,
+            None,
+            &mut adaptive,
+            super::DirectLazyReady,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.0, None);
+        assert_eq!(ordinary.lazy.direct_cells_published, published);
+        assert_eq!(
+            ordinary.lazy.direct_cell(second_row, b_class).unwrap(),
+            super::LAZY_CELL_UNFILLED,
+            "slot B must scan immediately rather than inherit slot A's cooldown"
+        );
+
+        let warm = direct_two_state_loop_workspace(&plan);
+        assert_eq!(
+            super::continue_warm_direct_exists_loop::<true>(
+                &plan,
+                &haystack,
+                window,
+                &warm.lazy,
+                &super::ORDINARY_START_FILTER_PROOF,
+                initial_row,
+                initial_row,
+                0,
+                0,
+                None,
+            )
+            .unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            warm.lazy.direct_cell(second_row, b_class).unwrap(),
+            super::LAZY_CELL_UNFILLED,
+            "warm slot B must not inherit slot A's speculative cooldown"
+        );
+    }
+
+    #[test]
+    fn direct_multi_loop_cache_is_bound_to_the_exact_immutable_automaton() {
+        let first = direct_two_state_inferred_loop();
+        let second = direct_two_state_inferred_loop();
+        assert_eq!(first.workspace_layout(), second.workspace_layout());
+        let mut workspace = direct_two_state_loop_workspace(&first);
+        assert!(workspace.lazy.is_bound_to(&first));
+        assert!(!workspace.lazy.is_bound_to(&second));
+
+        let signature = direct_loop_cache_signature(&workspace);
+        let rows = workspace.lazy.rows.clone();
+        let published = workspace.lazy.direct_cells_published;
+        let epoch = workspace.lazy.loop_skip_analyzed_at_cells;
+        let mut derive = WorkMeter::new(u64::MAX, 0);
+        super::try_derive_lazy_loop_skip(&second, &mut workspace, &mut derive).unwrap();
+        assert_eq!(derive.consumed, 0);
+        assert_eq!(direct_loop_cache_signature(&workspace), signature);
+        assert_eq!(workspace.lazy.rows, rows);
+        assert_eq!(workspace.lazy.direct_cells_published, published);
+        assert_eq!(workspace.lazy.loop_skip_analyzed_at_cells, epoch);
+
+        assert_eq!(
+            second
+                .prepare::<SelectedEnd>()
+                .search_with_workspace(b"qb", &mut workspace, SearchLimits::unlimited())
+                .unwrap()
+                .into_output(),
+            Some(2)
+        );
+        assert!(workspace.lazy.is_bound_to(&first));
+        assert!(!workspace.lazy.is_bound_to(&second));
+        assert_eq!(direct_loop_cache_signature(&workspace), signature);
+        assert_eq!(workspace.lazy.rows, rows);
+        assert_eq!(workspace.lazy.direct_cells_published, published);
+        assert_eq!(workspace.lazy.loop_skip_analyzed_at_cells, epoch);
+    }
+
+    #[test]
+    fn direct_multi_loop_cache_survives_same_address_haystack_mutation() {
+        let plan = direct_two_state_inferred_loop();
+        let mut haystack = vec![b'a'; super::LAZY_LOOP_SKIP_MIN_BYTES * 2 + 1];
+        let address = haystack.as_ptr();
+        let window = SearchWindow::full(&haystack);
+        let mut skipped_workspace = direct_two_state_loop_workspace(&plan);
+        let mut scalar_workspace = direct_two_state_loop_workspace(&plan);
+        let signature = direct_loop_cache_signature(&skipped_workspace);
+        let rows = skipped_workspace.lazy.rows.clone();
+        let published = skipped_workspace.lazy.direct_cells_published;
+
+        let mut scalar_meter = WorkMeter::new(u64::MAX, 0);
+        let mut scalar_adaptive = super::AdaptiveStartProbe::default();
+        let scalar = super::execute_lazy_span_loop::<false, false>(
+            &plan,
+            &haystack,
+            window,
+            &mut scalar_workspace,
+            &mut scalar_meter,
+            OutputContract::Exists,
+            0,
+            None,
+            None,
+            None,
+            &mut scalar_adaptive,
+            super::DirectLazyReady,
+        )
+        .unwrap()
+        .unwrap();
+        let mut skipped_meter = WorkMeter::new(u64::MAX, 0);
+        let mut skipped_adaptive = super::AdaptiveStartProbe::default();
+        let skipped = super::execute_lazy_span_loop::<false, true>(
+            &plan,
+            &haystack,
+            window,
+            &mut skipped_workspace,
+            &mut skipped_meter,
+            OutputContract::Exists,
+            0,
+            None,
+            None,
+            None,
+            &mut skipped_adaptive,
+            super::DirectLazyReady,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(skipped, scalar);
+        assert_eq!(skipped_meter.consumed, scalar_meter.consumed);
+
+        haystack.fill(b'b');
+        haystack[0] = b'x';
+        assert_eq!(haystack.as_ptr(), address);
+        let mut scalar_meter = WorkMeter::new(u64::MAX, 0);
+        let mut scalar_adaptive = super::AdaptiveStartProbe::default();
+        let scalar = super::execute_lazy_span_loop::<false, false>(
+            &plan,
+            &haystack,
+            window,
+            &mut scalar_workspace,
+            &mut scalar_meter,
+            OutputContract::Exists,
+            0,
+            None,
+            None,
+            None,
+            &mut scalar_adaptive,
+            super::DirectLazyReady,
+        )
+        .unwrap()
+        .unwrap();
+        let mut skipped_meter = WorkMeter::new(u64::MAX, 0);
+        let mut skipped_adaptive = super::AdaptiveStartProbe::default();
+        let skipped = super::execute_lazy_span_loop::<false, true>(
+            &plan,
+            &haystack,
+            window,
+            &mut skipped_workspace,
+            &mut skipped_meter,
+            OutputContract::Exists,
+            0,
+            None,
+            None,
+            None,
+            &mut skipped_adaptive,
+            super::DirectLazyReady,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(skipped, scalar);
+        assert_eq!(direct_loop_cache_signature(&skipped_workspace), signature);
+        assert_eq!(skipped_workspace.lazy.rows, rows);
+        assert_eq!(skipped_workspace.lazy.direct_cells_published, published);
+        let second_row = super::direct_row_offset(1).unwrap();
+        assert_eq!(
+            skipped_workspace
+                .lazy
+                .direct_cell(second_row, byte_class(&plan, b'b'))
+                .unwrap(),
+            super::LAZY_CELL_UNFILLED,
+            "the second retained plan must scan inferred bytes without publishing them"
+        );
     }
 
     #[test]
@@ -25579,7 +26750,7 @@ mod tests {
         let mut exact = WorkMeter::new(u64::MAX, 0);
         super::try_derive_lazy_loop_skip(&plan, &mut measured, &mut exact).unwrap();
         let upgrade_work = exact.consumed;
-        let upgraded = measured.lazy.loop_skip_plan.unwrap();
+        let upgraded = measured.lazy.loop_skip_plans.first().unwrap();
         assert_eq!(upgraded.start_action, super::LazyStartAction::Propagate);
         assert_eq!(upgraded.scanner.cardinality(), 131);
         assert!(matches!(upgraded.scanner, super::LazyLoopScanner::Set(_)));
@@ -25595,7 +26766,16 @@ mod tests {
         let refused_rows = refused.lazy.rows.clone();
         let mut one_below = WorkMeter::new(upgrade_work.checked_sub(1).unwrap(), 0);
         super::try_derive_lazy_loop_skip(&plan, &mut refused, &mut one_below).unwrap();
-        assert_eq!(refused.lazy.loop_skip_plan.unwrap().scanner.cardinality(), 3);
+        assert_eq!(
+            refused
+                .lazy
+                .loop_skip_plans
+                .first()
+                .unwrap()
+                .scanner
+                .cardinality(),
+            3
+        );
         assert_ne!(
             refused.lazy.loop_skip_analyzed_at_cells,
             refused.lazy.direct_cells_published
@@ -25605,7 +26785,16 @@ mod tests {
         let mut retry = WorkMeter::new(upgrade_work, 0);
         super::try_derive_lazy_loop_skip(&plan, &mut refused, &mut retry).unwrap();
         assert_eq!(retry.consumed, upgrade_work);
-        assert_eq!(refused.lazy.loop_skip_plan.unwrap().scanner.cardinality(), 131);
+        assert_eq!(
+            refused
+                .lazy
+                .loop_skip_plans
+                .first()
+                .unwrap()
+                .scanner
+                .cardinality(),
+            131
+        );
     }
 
     #[test]
@@ -25623,7 +26812,8 @@ mod tests {
             super::try_derive_lazy_loop_skip(&plan, &mut workspace, &mut meter).unwrap();
             let retained = workspace
                 .lazy
-                .loop_skip_plan
+                .loop_skip_plans
+                .first()
                 .expect("every nonempty exact class must retain a runtime-guarded plan");
             let members = (u8::MIN..=0x7f)
                 .filter(|&byte| retained.scanner.contains(byte))
@@ -25643,13 +26833,13 @@ mod tests {
         let published = refused.lazy.direct_cells_published;
         let mut one_below = WorkMeter::new(analysis_work.checked_sub(1).unwrap(), 0);
         super::try_derive_lazy_loop_skip(&plan, &mut refused, &mut one_below).unwrap();
-        assert!(refused.lazy.loop_skip_plan.is_none());
+        assert!(refused.lazy.loop_skip_plans.is_empty());
         assert_ne!(refused.lazy.loop_skip_analyzed_at_cells, published);
         assert_eq!(refused.lazy.rows, rows);
 
         let mut retry = WorkMeter::new(analysis_work, 0);
         super::try_derive_lazy_loop_skip(&plan, &mut refused, &mut retry).unwrap();
-        assert!(refused.lazy.loop_skip_plan.is_some());
+        assert!(!refused.lazy.loop_skip_plans.is_empty());
         assert_eq!(retry.consumed, analysis_work);
     }
 
@@ -25676,7 +26866,8 @@ mod tests {
         );
         let retained = workspace
             .lazy
-            .loop_skip_plan
+            .loop_skip_plans
+            .first()
             .expect("the wider Drop class must retain its exact-action scanner");
         assert_eq!(retained.start_action, super::LazyStartAction::Drop);
         assert_eq!(retained.scanner.cardinality(), 2);
@@ -25711,7 +26902,7 @@ mod tests {
             let mut workspace = direct_nonpending_loop_workspace(&plan, cell);
             let mut meter = WorkMeter::new(u64::MAX, 0);
             super::try_derive_lazy_loop_skip(&plan, &mut workspace, &mut meter).unwrap();
-            assert!(workspace.lazy.loop_skip_plan.is_none(), "{name}");
+            assert!(workspace.lazy.loop_skip_plans.is_empty(), "{name}");
             assert_eq!(
                 workspace.lazy.loop_skip_analyzed_at_cells,
                 workspace.lazy.direct_cells_published,
@@ -26590,7 +27781,8 @@ mod tests {
         );
         let loop_plan = workspace
             .lazy
-            .loop_skip_plan
+            .loop_skip_plans
+            .first()
             .expect("the direct nonpending Drop self-loop must retain a scanner");
         assert_eq!(loop_plan.start_action, super::LazyStartAction::Drop);
         assert!(loop_plan.scanner.contains(b'x'));
@@ -26612,7 +27804,6 @@ mod tests {
             None,
             &mut scalar_adaptive,
             super::DirectLazyReady,
-            None,
         )
         .unwrap()
         .unwrap();
@@ -26631,7 +27822,6 @@ mod tests {
             None,
             &mut skipped_adaptive,
             super::DirectLazyReady,
-            Some(loop_plan),
         )
         .unwrap()
         .unwrap();
