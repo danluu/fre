@@ -1327,14 +1327,27 @@ impl PartialDfa {
             .forward
             .discovered_states
             .checked_mul(self.alphabet.classes())?;
+        let packed = self.forward.packed_transitions.as_deref()?;
         let exact_extent = self.forward.transitions.len() == expected_cells;
+        let authenticated_packing = packed.len() == expected_cells
+            && packed
+                .iter()
+                .copied()
+                .zip(self.forward.transitions.iter().copied())
+                .all(|(packed, semantic)| {
+                    packed.authenticates(
+                        semantic,
+                        self.forward.complete_rows,
+                        self.alphabet.classes(),
+                    )
+                });
         let bounded_targets = self.forward.transitions.iter().all(|cell| {
             cell.next == NO_STATE
                 || usize::try_from(cell.next)
                     .ok()
                     .is_some_and(|next| next < self.forward.discovered_states)
         });
-        if !complete || !exact_extent || !bounded_targets {
+        if !complete || !exact_extent || !authenticated_packing || !bounded_targets {
             return None;
         }
         Some(NativeDfaView {
@@ -5381,6 +5394,30 @@ mod tests {
                 pending: accepted,
             }],
         )
+    }
+
+    #[test]
+    fn complete_zero_frontier_view_requires_authenticated_packing() {
+        let complete = synthetic_partial(
+            vec![ForwardCell {
+                next: 0,
+                accepted: true,
+            }],
+            vec![ForwardStartAction::Propagate],
+            1,
+            1,
+            Vec::new(),
+        );
+        assert!(complete.native_complete_view().is_some());
+        assert!(complete.native_incomplete_view().is_none());
+
+        let mut unauthenticated = complete;
+        unauthenticated
+            .forward
+            .packed_transitions
+            .as_mut()
+            .expect("synthetic packing")[0] = PackedForwardCell(0);
+        assert!(unauthenticated.native_complete_view().is_none());
     }
 
     #[test]

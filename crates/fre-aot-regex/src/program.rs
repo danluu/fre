@@ -1662,6 +1662,26 @@ fn nfa_terminal_suffix_is_barrier(raw: &RawPlan, terminal: AnchoredByteSet) -> b
 }
 
 impl NfaMandatorySuffix {
+    fn native_requirement(&self) -> Option<NativeRetainedSuffixRequirement> {
+        let scan_offset = self
+            .minimum_width
+            .checked_sub(self.primary_depth)?
+            .checked_sub(1)?;
+        let mut membership = [0_u64; 4];
+        for &byte in self
+            .primary_bytes
+            .get(..usize::from(self.primary_count))?
+        {
+            let byte = usize::from(byte);
+            membership[byte / 64] |= 1_u64 << (byte % 64);
+        }
+        Some(NativeRetainedSuffixRequirement {
+            scan_offset,
+            membership,
+            minimum_width: self.minimum_width,
+        })
+    }
+
     fn derive(
         raw: &RawPlan,
         prefix: &AnchoredPrefix,
@@ -2617,6 +2637,11 @@ pub(crate) struct NativeProgramView<'a> {
     /// entry. Native lowering may publish that fallback only when the emitted
     /// target scanner preserves both this membership and its byte offset.
     pub(crate) retained_prefix_requirement: Option<NativeRetainedPrefixRequirement>,
+    /// Exact terminal-suffix primary owned by a complete retained fallback's
+    /// portable entry. Ordinary native publication is allowed only when the
+    /// selected suffix remains at the same aligned column and the backend
+    /// receipts an equivalent vector scanner.
+    pub(crate) retained_suffix_requirement: Option<NativeRetainedSuffixRequirement>,
 }
 
 /// Authenticated incomplete retained rows eligible for a prepared native
@@ -2653,6 +2678,13 @@ const NATIVE_EXACT_PRODUCT_REJECTING_ROW: [ForwardCell; 1] = [ForwardCell {
 pub(crate) struct NativeRetainedPrefixRequirement {
     pub(crate) scan_offset: u8,
     pub(crate) membership: [u64; 4],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeRetainedSuffixRequirement {
+    pub(crate) scan_offset: u8,
+    pub(crate) membership: [u64; 4],
+    pub(crate) minimum_width: u8,
 }
 
 #[allow(
@@ -3105,15 +3137,15 @@ impl CompiledProgram {
 
     #[allow(dead_code, reason = "structural handoff for native code generation")]
     pub(crate) fn native_dfa_view(&self) -> Option<NativeProgramView<'_>> {
-        let (dfa, retained_prefix_requirement) = match &self.engine {
-            ProgramEngine::OrderedDfa(machine) => (machine.native_view(), None),
+        let (dfa, retained_prefix_requirement, retained_suffix_requirement) = match &self.engine {
+            ProgramEngine::OrderedDfa(machine) => (machine.native_view(), None, None),
             ProgramEngine::OrderedNfa => {
-                // The retained portable entry runs these complete graph
-                // accelerators before consulting its DFA rows. Until native
-                // lowering carries the same proofs explicitly, keep this
-                // program on the runtime adapter rather than silently
-                // replacing a stronger route with a full-table scan.
-                if self.nfa_mandatory_suffix.is_some() || self.nfa_mandatory_cut.is_some() {
+                // A mandatory cut can narrow the semantic window more
+                // strongly than the ordinary native prefix filters. Keep the
+                // baseline runtime route until native lowering carries and
+                // receipts that exact graph proof. A terminal suffix has a
+                // narrower publication contract below.
+                if self.nfa_mandatory_cut.is_some() {
                     return None;
                 }
                 let partial = self.partial_dfa()?;
@@ -3149,7 +3181,11 @@ impl CompiledProgram {
                 } else {
                     None
                 };
-                (dfa, requirement)
+                let suffix_requirement = match &self.nfa_mandatory_suffix {
+                    Some(suffix) => Some(suffix.native_requirement()?),
+                    None => None,
+                };
+                (dfa, requirement, suffix_requirement)
             }
         };
         Some(NativeProgramView {
@@ -3164,6 +3200,7 @@ impl CompiledProgram {
             max_match_width: self.max_match_width(),
             exact_product_width: None,
             retained_prefix_requirement,
+            retained_suffix_requirement,
         })
     }
 
@@ -3216,6 +3253,7 @@ impl CompiledProgram {
                 max_match_width: self.max_match_width(),
                 exact_product_width: None,
                 retained_prefix_requirement,
+                retained_suffix_requirement: None,
             },
             complete_rows: partial.complete_rows,
             resume_states: partial.resume_states,
@@ -3274,6 +3312,7 @@ impl CompiledProgram {
                 scan_offset: product.primary_offset,
                 membership: primary.words(),
             }),
+            retained_suffix_requirement: None,
         })
     }
 

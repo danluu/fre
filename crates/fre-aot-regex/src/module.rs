@@ -28,7 +28,7 @@ use crate::{
     program::{
         AnchoredByteSet, CompiledProgram, MAX_ANCHORED_PREFIX_BYTES, NativeContextProgramView,
         NativePartialProgramView, NativeProgramView, NativeRetainedPrefixRequirement,
-        OutputContract, PARTIAL_DFA_MIN_INPUT_BYTES,
+        NativeRetainedSuffixRequirement, OutputContract, PARTIAL_DFA_MIN_INPUT_BYTES,
     },
     required_literals::{MaximumConsumedDistance, RequiredInteriorCandidate, RequiredLiteralSet},
     seeded_reverse::{
@@ -387,6 +387,7 @@ struct NativeDfaEmission {
     code: Vec<u8>,
     relocations: Vec<ModuleRelocation>,
     scanner: Option<NativeScannerEmission>,
+    suffix_scanner: Option<NativeScannerEmission>,
     conjunction: Option<NativeVectorConjunctionEmission>,
 }
 
@@ -2601,6 +2602,18 @@ fn lower_native_dfa_with_entry_contract(
     {
         return Ok(None);
     }
+    if view
+        .retained_suffix_requirement
+        .is_some_and(|requirement| {
+            !retained_suffix_scanner_is_preserved(
+                emission.suffix_scanner,
+                layout.suffix_filter,
+                requirement,
+            )
+        })
+    {
+        return Ok(None);
+    }
     if view.exact_product_width.is_some()
         && !(relation_vector_owns_route
             && layout
@@ -2635,6 +2648,22 @@ fn retained_prefix_scanner_is_preserved(
     emission.vectorized
         && emission.scan_offset == requirement.scan_offset
         && emission.membership == requirement.membership
+}
+
+fn retained_suffix_scanner_is_preserved(
+    emission: Option<NativeScannerEmission>,
+    suffix: Option<NativeSuffixFilter>,
+    requirement: NativeRetainedSuffixRequirement,
+) -> bool {
+    let (Some(emission), Some(suffix)) = (emission, suffix) else {
+        return false;
+    };
+    emission.vectorized
+        && emission.scan_offset == requirement.scan_offset
+        && emission.membership == requirement.membership
+        && suffix.minimum_width == requirement.minimum_width
+        && suffix.filter.scan_offset == requirement.scan_offset
+        && matches!(suffix.reverse_seed, NativeSuffixReverseSeed::AcceptBoundary)
 }
 
 fn start_filter_membership(filter: NativeStartFilter) -> Result<[u64; 4], ObjectError> {
@@ -9615,10 +9644,20 @@ fn lower_x86_64_dfa_with_entry_contract(
             coverage,
             batch_vectors: conjunction_batch_vectors,
         });
+    let suffix_scanner = layout
+        .suffix_filter
+        .map(|suffix| {
+            let kind = filter_kind.ok_or(ObjectError::InvalidModule(
+                "x86 suffix scanner has no instruction selection",
+            ))?;
+            x86_range_scanner_emission(suffix.filter, kind)
+        })
+        .transpose()?;
     Ok(NativeDfaEmission {
         code,
         relocations,
         scanner: scanner_emission,
+        suffix_scanner,
         conjunction,
     })
 }
@@ -15244,10 +15283,22 @@ fn lower_aarch64_dfa_with_entry_contract(
     } else {
         None
     };
+    let suffix_scanner = layout
+        .suffix_filter
+        .map(|suffix| {
+            aarch64_range_scanner_emission(
+                suffix.filter,
+                sve_suffix_kind.is_some(),
+                use_asimd_suffix,
+                None,
+            )
+        })
+        .transpose()?;
     Ok(NativeDfaEmission {
         code,
         relocations,
         scanner: scanner_emission,
+        suffix_scanner,
         conjunction,
     })
 }
@@ -17803,12 +17854,31 @@ mod tests {
     }
 
     #[test]
-    fn complete_retained_forward_keeps_stronger_portable_routes_on_runtime() {
+    fn zero_frontier_suffix_normalization_requires_an_exact_vector_receipt() {
         let targets = [
             Target::x86_64_linux(),
             Target::x86_64_macos(),
             Target::aarch64_linux(),
             Target::aarch64_macos(),
+            Target::x86_64_linux()
+                .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                .unwrap(),
+            Target::x86_64_linux()
+                .with_features(
+                    FeatureSet::of(CpuFeature::X86Avx512F)
+                        .with(CpuFeature::X86Avx512Bw)
+                        .with(CpuFeature::X86Avx512Vl),
+                )
+                .unwrap(),
+            Target::aarch64_linux()
+                .with_features(
+                    FeatureSet::of(CpuFeature::Aarch64Sve)
+                        .with(CpuFeature::Aarch64Sve2),
+                )
+                .unwrap(),
+            Target::aarch64_macos()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap(),
         ];
         for target in targets {
             let variable_span = complete_forward_resource_fallback(
@@ -17818,23 +17888,54 @@ mod tests {
             );
             assert!(variable_span.receipt().runtime_helper_required);
             assert!(variable_span.module().required_runtime_symbol().is_some());
+            assert!(variable_span.program().native_dfa_view().is_none());
+            assert!(variable_span.program().native_partial_dfa_view().is_none());
+            assert!(variable_span.module().prepared_entry_symbol().is_none());
 
-            // The selective terminal column admits the complete portable
-            // mandatory-suffix proof. Even though the retained forward table
-            // has no holes, native publication must not bypass that
-            // accelerator.
-            let suffix_accelerated = complete_forward_resource_fallback(
-                "[b-c][a-b]{1,10}z",
+            for output in [
+                OutputContract::Exists,
                 OutputContract::SelectedEnd,
-                target,
-            );
-            assert!(suffix_accelerated.receipt().runtime_helper_required);
-            assert!(suffix_accelerated.module().required_runtime_symbol().is_some());
+                OutputContract::Span,
+            ] {
+                let compiled =
+                    complete_forward_resource_fallback("[b-c][a-b]{1,10}z", output, target);
+                let direct_view = compiled.program().native_dfa_view();
+                let vector_suffix = target.architecture == Architecture::X86_64
+                    || target.features.has(CpuFeature::Aarch64Asimd)
+                    || (target.operating_system == OperatingSystem::Linux
+                        && target.features.has(CpuFeature::Aarch64Sve));
+                let direct = output != OutputContract::Span && vector_suffix;
+                assert_eq!(direct_view.is_some(), output != OutputContract::Span);
+                assert_eq!(!compiled.receipt().runtime_helper_required, direct);
+                assert_eq!(compiled.module().required_runtime_symbol().is_none(), direct);
+                assert!(compiled.program().native_partial_dfa_view().is_none());
+                assert!(compiled.module().prepared_entry_symbol().is_none());
+                if direct {
+                    let view = direct_view.expect("direct complete suffix view");
+                    let (_, layout) =
+                        build_native_dfa_table_for_architecture(view, target.architecture)
+                            .expect("direct complete suffix layout");
+                    assert!(view.partial_discovered_states.is_none());
+                    assert!(view.retained_suffix_requirement.is_some());
+                    assert!(layout.partial.is_none());
+                    assert!(layout.suffix_filter.is_some());
+                    assert!(layout.prefix_fast_forward.is_some());
+                    assert!(!matches!(
+                        compiled.module().start_accelerator(),
+                        StartAccelerator::None | StartAccelerator::Scalar
+                    ));
+                } else {
+                    assert_eq!(compiled.module().start_accelerator(), StartAccelerator::None);
+                }
+            }
 
             // The portable retained path scans arbitrary exact byte sets.
             // Native range filters deliberately have tighter hot-loop bounds,
             // so a complete table must not replace that scanner with a scalar
             // byte-by-byte root walk when no native moving filter is emitted.
+            if target.features != FeatureSet::EMPTY {
+                continue;
+            }
             for pattern in [
                 r"(?-u:[\x00-\x40])+",
                 r"(?-u:[\x00\x20\x40\x60\x80\xa0\xc0\xe0\xff])+",
@@ -17855,6 +17956,137 @@ mod tests {
                 );
             }
         }
+
+        let target = Target::x86_64_linux();
+        let nullable_span = complete_forward_resource_fallback(
+            "[ab]*",
+            OutputContract::Span,
+            target,
+        );
+        let nullable_view = nullable_span
+            .program()
+            .native_dfa_view()
+            .expect("initial-pending complete retained Span view");
+        let (_, nullable_layout) =
+            build_native_dfa_table(nullable_view).expect("initial-pending Span layout");
+        assert!(nullable_view.dfa.initial_pending);
+        assert_eq!(nullable_view.exact_match_width, None);
+        assert!(nullable_view.partial_discovered_states.is_none());
+        assert!(nullable_view.retained_suffix_requirement.is_none());
+        assert!(!nullable_layout.has_reverse);
+        assert!(!nullable_span.receipt().runtime_helper_required);
+        assert!(nullable_span.program().native_partial_dfa_view().is_none());
+        assert!(nullable_span.module().prepared_entry_symbol().is_none());
+
+        let exact_span = complete_forward_resource_fallback(
+            "(?:ab|cd)z",
+            OutputContract::Span,
+            target,
+        );
+        let exact_view = exact_span
+            .program()
+            .native_dfa_view()
+            .expect("fixed-width complete retained Span view");
+        let (_, exact_layout) =
+            build_native_dfa_table(exact_view).expect("fixed-width Span layout");
+        assert!(!exact_view.dfa.initial_pending);
+        assert_eq!(exact_view.exact_match_width, Some(3));
+        assert!(exact_view.partial_discovered_states.is_none());
+        assert!(exact_view.retained_suffix_requirement.is_none());
+        assert_eq!(exact_layout.exact_span_width, Some(3));
+        assert!(!exact_layout.has_reverse);
+        assert!(!exact_span.receipt().runtime_helper_required);
+        assert!(exact_span.program().native_partial_dfa_view().is_none());
+        assert!(exact_span.module().prepared_entry_symbol().is_none());
+
+        let cut = complete_forward_resource_fallback(
+            "[b-c][a-b]{1,10}7[A-Za-z]{1,2}",
+            OutputContract::Exists,
+            target,
+        );
+        assert!(cut.program().native_dfa_view().is_none());
+        assert!(cut.program().native_partial_dfa_view().is_none());
+        assert!(cut.receipt().runtime_helper_required);
+        assert!(cut.module().prepared_entry_symbol().is_none());
+
+        let compiled = complete_forward_resource_fallback(
+            "[b-c][a-b]{1,10}z",
+            OutputContract::Exists,
+            target,
+        );
+        let wire = compiled.program().serialize().expect("serialize suffix");
+        let restored = crate::CompiledProgram::deserialize(&wire).expect("restore suffix");
+        assert_eq!(
+            restored
+                .native_dfa_view()
+                .and_then(|view| view.retained_suffix_requirement),
+            compiled
+                .program()
+                .native_dfa_view()
+                .and_then(|view| view.retained_suffix_requirement)
+        );
+        let restored_module = CompiledModule::lower(&restored, target).expect("lower restored");
+        assert_eq!(restored_module.sections(), compiled.module().sections());
+        assert_eq!(restored_module.symbols(), compiled.module().symbols());
+        assert_eq!(restored_module.relocations(), compiled.module().relocations());
+
+        let mut mismatched = compiled
+            .program()
+            .native_dfa_view()
+            .expect("complete suffix view");
+        mismatched
+            .retained_suffix_requirement
+            .as_mut()
+            .expect("suffix requirement")
+            .membership[0] ^= 1;
+        assert!(lower_native_dfa(mismatched, target).unwrap().is_none());
+
+        let mut mismatched = compiled
+            .program()
+            .native_dfa_view()
+            .expect("complete suffix view");
+        let requirement = mismatched
+            .retained_suffix_requirement
+            .as_mut()
+            .expect("suffix requirement");
+        requirement.scan_offset = requirement
+            .scan_offset
+            .checked_add(1)
+            .expect("small suffix scan offset");
+        assert!(lower_native_dfa(mismatched, target).unwrap().is_none());
+
+        let mut mismatched = compiled
+            .program()
+            .native_dfa_view()
+            .expect("complete suffix view");
+        let requirement = mismatched
+            .retained_suffix_requirement
+            .as_mut()
+            .expect("suffix requirement");
+        requirement.minimum_width = requirement
+            .minimum_width
+            .checked_add(1)
+            .expect("small suffix minimum width");
+        assert!(lower_native_dfa(mismatched, target).unwrap().is_none());
+
+        // This view is otherwise directly eligible, but baseline AArch64 has
+        // no emitted vector-suffix receipt. The decline must restore the
+        // ordinary runtime adapter, never a complete prepared wrapper.
+        let declined_target = Target::aarch64_linux();
+        let declined = complete_forward_resource_fallback(
+            "[b-c][a-b]{1,10}z",
+            OutputContract::Exists,
+            declined_target,
+        );
+        let declined_view = declined
+            .program()
+            .native_dfa_view()
+            .expect("target-independent complete suffix view");
+        assert!(lower_native_dfa(declined_view, declined_target)
+            .unwrap()
+            .is_none());
+        assert!(declined.module().required_runtime_symbol().is_some());
+        assert!(declined.module().prepared_entry_symbol().is_none());
     }
 
     #[test]
