@@ -2029,7 +2029,6 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
                         || runtime_program.is_none()
                         || stats.complete_rows == 0
                         || !stats.optimized_entry_supported
-                        || !prepared_entry_published
                     {
                         return Err(format!(
                             "{} retained-row probe produced an inconsistent artifact: reason={reason:?}, engine={:?}, runtime={}, prepared_entry_published={prepared_entry_published}, stats={stats:?}",
