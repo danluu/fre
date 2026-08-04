@@ -390,6 +390,21 @@ struct NativeDfaEmission {
     conjunction: Option<NativeVectorConjunctionEmission>,
 }
 
+/// Validation contract at one emitted native-DFA entry.
+///
+/// Public entries validate every raw ABI argument and initialize their public
+/// two-word result before running any scanner. The prepared partial entry has
+/// a distinct, local-only core symbol. Its caller has already validated the
+/// public haystack, length, and output, the authenticated preflight returns a
+/// bounded exact window, and the caller constructs an aligned, zeroed private
+/// five-word outcome. That local contract may therefore enter after the raw
+/// checks and result initialization without weakening any public boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeDfaEntryContract {
+    Public,
+    PreparedPartialCore,
+}
+
 impl NativeScannerEmission {
     const fn start_accelerator(self) -> StartAccelerator {
         match self.isa {
@@ -1147,7 +1162,16 @@ fn lower_native_partial_prepared(
     // ordinary full-native lowering returns `None` unless its emitted scanner
     // receipt exactly matches the portable primary offset/membership and is a
     // supported SIMD tier.
-    let Some(native) = lower_native_dfa(view.native, target)? else {
+    // The prepared emitter below is the sole caller of the resulting local
+    // core symbol. Before that call it validates the original raw ABI,
+    // authenticates preflight's bounded exact window, reloads the same
+    // haystack and length, and constructs an aligned, zeroed private outcome.
+    // Keep this explicit contract separate from every public native entry.
+    let Some(native) = lower_native_dfa_with_entry_contract(
+        view.native,
+        target,
+        NativeDfaEntryContract::PreparedPartialCore,
+    )? else {
         return Ok(None);
     };
     if native.needs_runtime {
@@ -2462,6 +2486,14 @@ fn lower_native_dfa(
     view: NativeProgramView<'_>,
     target: Target,
 ) -> Result<Option<NativeLowering>, ObjectError> {
+    lower_native_dfa_with_entry_contract(view, target, NativeDfaEntryContract::Public)
+}
+
+fn lower_native_dfa_with_entry_contract(
+    view: NativeProgramView<'_>,
+    target: Target,
+    entry_contract: NativeDfaEntryContract,
+) -> Result<Option<NativeLowering>, ObjectError> {
     let vector_cost_model = native_vector_filter_cost_model_for_target(target, true);
     let relation_vector_owns_route = direct_relation_vector_owns_route(target);
     let (mut data, layout) = build_native_dfa_table_with_cost_model(
@@ -2477,14 +2509,35 @@ fn lower_native_dfa(
         return Ok(None);
     }
     let sve_filter_plan = install_aarch64_sve_filter_plan(&mut data, layout, target)?;
+    if entry_contract == NativeDfaEntryContract::PreparedPartialCore && layout.partial.is_none() {
+        return Err(ObjectError::InvalidModule(
+            "trusted prepared core has no partial continuation layout",
+        ));
+    }
     let emission = match target.architecture {
-        Architecture::X86_64 => lower_x86_64_dfa_with_emission(layout, target.features)?,
-        Architecture::Aarch64 => lower_aarch64_dfa_for_operating_system_with_emission(
-            layout,
-            target.features,
-            target.operating_system,
-            sve_filter_plan,
-        )?,
+        Architecture::X86_64 => match entry_contract {
+            NativeDfaEntryContract::Public => {
+                lower_x86_64_dfa_with_emission(layout, target.features)?
+            }
+            NativeDfaEntryContract::PreparedPartialCore => {
+                lower_x86_64_dfa_with_entry_contract(layout, target.features, entry_contract)?
+            }
+        },
+        Architecture::Aarch64 => match entry_contract {
+            NativeDfaEntryContract::Public => lower_aarch64_dfa_for_operating_system_with_emission(
+                layout,
+                target.features,
+                target.operating_system,
+                sve_filter_plan,
+            )?,
+            NativeDfaEntryContract::PreparedPartialCore => lower_aarch64_dfa_with_entry_contract(
+                layout,
+                target.features,
+                target.operating_system,
+                sve_filter_plan,
+                entry_contract,
+            )?,
+        },
     };
     // Scalar exact-set emitters remain available for backend correctness and
     // cross-target inspection, but publishing a moving no-row product through
@@ -8616,6 +8669,23 @@ fn lower_x86_64_dfa_with_emission(
     layout: NativeDfaLayout,
     features: FeatureSet,
 ) -> Result<NativeDfaEmission, ObjectError> {
+    lower_x86_64_dfa_with_entry_contract(
+        layout,
+        features,
+        NativeDfaEntryContract::Public,
+    )
+}
+
+#[allow(
+    clippy::large_types_passed_by_value,
+    clippy::too_many_lines,
+    reason = "the specialized forward/reverse control-flow graph is kept contiguous for auditing"
+)]
+fn lower_x86_64_dfa_with_entry_contract(
+    layout: NativeDfaLayout,
+    features: FeatureSet,
+    entry_contract: NativeDfaEntryContract,
+) -> Result<NativeDfaEmission, ObjectError> {
     if layout.start_filter.is_some() && layout.exact_start_byte_set.is_some()
         || layout.exact_start_byte_set.is_some() != layout.exact_start_storage.is_some()
     {
@@ -8735,23 +8805,29 @@ fn lower_x86_64_dfa_with_emission(
         assembler.instruction(&[0x41, 0x57])?; // push r15
     }
 
-    // Validate start <= end <= length before touching result memory.
-    assembler.instruction(&[0x48, 0x85, 0xf6])?; // test length sign bit
-    assembler.branch(&[0x0f, 0x88], invalid)?;
-    assembler.instruction(&[0x48, 0x39, 0xf1])?; // cmp rcx, rsi
-    assembler.branch(&[0x0f, 0x87], invalid)?; // ja
-    assembler.instruction(&[0x48, 0x39, 0xca])?; // cmp rdx, rcx
-    assembler.branch(&[0x0f, 0x87], invalid)?;
-    assembler.instruction(&[0x4d, 0x85, 0xc0])?; // test r8, r8
-    assembler.branch(&[0x0f, 0x84], invalid)?;
-    assembler.instruction(&[0x41, 0xf6, 0xc0, 0x07])?; // test result alignment
-    assembler.branch(&[0x0f, 0x85], invalid)?;
-    assembler.instruction(&[0x48, 0x85, 0xff])?; // test rdi, rdi
-    assembler.branch(&[0x0f, 0x84], invalid)?;
+    if entry_contract == NativeDfaEntryContract::Public {
+        // Validate start <= end <= length before touching public result
+        // memory. The prepared partial core receives the same facts from its
+        // sole validated caller and authenticated exact-window preflight.
+        assembler.instruction(&[0x48, 0x85, 0xf6])?; // test length sign bit
+        assembler.branch(&[0x0f, 0x88], invalid)?;
+        assembler.instruction(&[0x48, 0x39, 0xf1])?; // cmp rcx, rsi
+        assembler.branch(&[0x0f, 0x87], invalid)?; // ja
+        assembler.instruction(&[0x48, 0x39, 0xca])?; // cmp rdx, rcx
+        assembler.branch(&[0x0f, 0x87], invalid)?;
+        assembler.instruction(&[0x4d, 0x85, 0xc0])?; // test r8, r8
+        assembler.branch(&[0x0f, 0x84], invalid)?;
+        assembler.instruction(&[0x41, 0xf6, 0xc0, 0x07])?; // test result alignment
+        assembler.branch(&[0x0f, 0x85], invalid)?;
+        assembler.instruction(&[0x48, 0x85, 0xff])?; // test rdi, rdi
+        assembler.branch(&[0x0f, 0x84], invalid)?;
+    }
     assembler.instruction(&[0x48, 0x89, 0xd6])?; // mov rsi, rdx (window start)
-    assembler.instruction(&[0x31, 0xc0])?;
-    assembler.instruction(&[0x49, 0x89, 0x00])?;
-    assembler.instruction(&[0x49, 0x89, 0x40, 0x08])?;
+    if entry_contract == NativeDfaEntryContract::Public {
+        assembler.instruction(&[0x31, 0xc0])?;
+        assembler.instruction(&[0x49, 0x89, 0x00])?;
+        assembler.instruction(&[0x49, 0x89, 0x40, 0x08])?;
+    }
 
     // lea table(%rip), r9
     assembler.instruction(&[0x4c, 0x8d, 0x0d])?;
@@ -14017,6 +14093,27 @@ fn lower_aarch64_dfa_for_operating_system_with_emission(
     operating_system: OperatingSystem,
     sve_filter_plan: Option<Aarch64SveFilterPlan>,
 ) -> Result<NativeDfaEmission, ObjectError> {
+    lower_aarch64_dfa_with_entry_contract(
+        layout,
+        features,
+        operating_system,
+        sve_filter_plan,
+        NativeDfaEntryContract::Public,
+    )
+}
+
+#[allow(
+    clippy::large_types_passed_by_value,
+    clippy::too_many_lines,
+    reason = "the specialized forward/reverse control-flow graph is kept contiguous for auditing"
+)]
+fn lower_aarch64_dfa_with_entry_contract(
+    layout: NativeDfaLayout,
+    features: FeatureSet,
+    operating_system: OperatingSystem,
+    sve_filter_plan: Option<Aarch64SveFilterPlan>,
+    entry_contract: NativeDfaEntryContract,
+) -> Result<NativeDfaEmission, ObjectError> {
     if layout.start_filter.is_some() && layout.exact_start_byte_set.is_some()
         || layout.exact_start_byte_set.is_some() != layout.exact_start_storage.is_some()
     {
@@ -14068,22 +14165,26 @@ fn lower_aarch64_dfa_for_operating_system_with_emission(
     let reverse_finish = assembler.label()?;
     let exact_start_probe_failed = assembler.label()?;
 
-    assembler.instruction(0xf100_003f)?; // cmp length, #0
-    assembler.branch_cond(AARCH64_MI, invalid)?;
-    assembler.instruction(aarch64_cmp_x(3, 1)?)?;
-    assembler.branch_cond(AARCH64_HI, invalid)?;
-    assembler.instruction(aarch64_cmp_x(2, 3)?)?;
-    assembler.branch_cond(AARCH64_HI, invalid)?;
-    assembler.instruction(0xf100_009f)?; // cmp x4, #0
-    assembler.branch_cond(AARCH64_EQ, invalid)?;
-    assembler.instruction(aarch64_and_low_x(5, 4, 3)?)?;
-    assembler.instruction(0xf100_00bf)?; // cmp alignment scratch, #0
-    assembler.branch_cond(AARCH64_NE, invalid)?;
-    assembler.instruction(0xf100_001f)?; // cmp x0, #0
-    assembler.branch_cond(AARCH64_EQ, invalid)?;
+    if entry_contract == NativeDfaEntryContract::Public {
+        assembler.instruction(0xf100_003f)?; // cmp length, #0
+        assembler.branch_cond(AARCH64_MI, invalid)?;
+        assembler.instruction(aarch64_cmp_x(3, 1)?)?;
+        assembler.branch_cond(AARCH64_HI, invalid)?;
+        assembler.instruction(aarch64_cmp_x(2, 3)?)?;
+        assembler.branch_cond(AARCH64_HI, invalid)?;
+        assembler.instruction(0xf100_009f)?; // cmp x4, #0
+        assembler.branch_cond(AARCH64_EQ, invalid)?;
+        assembler.instruction(aarch64_and_low_x(5, 4, 3)?)?;
+        assembler.instruction(0xf100_00bf)?; // cmp alignment scratch, #0
+        assembler.branch_cond(AARCH64_NE, invalid)?;
+        assembler.instruction(0xf100_001f)?; // cmp x0, #0
+        assembler.branch_cond(AARCH64_EQ, invalid)?;
+    }
     assembler.instruction(aarch64_mov_x(9, 2)?)?;
-    assembler.instruction(aarch64_store_x(31, 4, 0)?)?;
-    assembler.instruction(aarch64_store_x(31, 4, 8)?)?;
+    if entry_contract == NativeDfaEntryContract::Public {
+        assembler.instruction(aarch64_store_x(31, 4, 0)?)?;
+        assembler.instruction(aarch64_store_x(31, 4, 8)?)?;
+    }
 
     let table_page = assembler.instruction(0x9000_0005)?;
     let table_page_offset = assembler.instruction(aarch64_add_x_imm(5, 5, 0)?)?;
@@ -18733,6 +18834,56 @@ mod tests {
             let lowering = lower_native_dfa(partial.native, target)
                 .expect("lower native partial core")
                 .unwrap_or_else(|| panic!("{target:?} declined its exact retained scanner"));
+            let explicit_public = lower_native_dfa_with_entry_contract(
+                partial.native,
+                target,
+                NativeDfaEntryContract::Public,
+            )
+            .expect("lower explicit public native partial core")
+            .unwrap_or_else(|| panic!("{target:?} declined its explicit public scanner"));
+            assert_eq!(explicit_public.code, lowering.code, "{target:?}");
+            assert_eq!(explicit_public.data, lowering.data, "{target:?}");
+            assert_eq!(explicit_public.relocations, lowering.relocations, "{target:?}");
+            assert_eq!(
+                explicit_public.start_accelerator,
+                lowering.start_accelerator,
+                "{target:?}"
+            );
+
+            let trusted = lower_native_dfa_with_entry_contract(
+                partial.native,
+                target,
+                NativeDfaEntryContract::PreparedPartialCore,
+            )
+            .expect("lower trusted prepared partial core")
+            .unwrap_or_else(|| panic!("{target:?} declined its trusted prepared scanner"));
+            let removed_entry_bytes = match target.architecture {
+                Architecture::X86_64 => 64,
+                Architecture::Aarch64 => 60,
+            };
+            assert_eq!(
+                lowering.code.len().checked_sub(trusted.code.len()),
+                Some(removed_entry_bytes),
+                "{target:?}"
+            );
+            assert_eq!(trusted.data, lowering.data, "{target:?}");
+            assert_eq!(
+                trusted.start_accelerator,
+                lowering.start_accelerator,
+                "{target:?}"
+            );
+            assert_eq!(trusted.relocations.len(), lowering.relocations.len());
+            for (public, private) in lowering.relocations.iter().zip(&trusted.relocations) {
+                assert_eq!(public.section, private.section, "{target:?}");
+                assert_eq!(public.kind, private.kind, "{target:?}");
+                assert_eq!(public.symbol, private.symbol, "{target:?}");
+                assert_eq!(public.addend, private.addend, "{target:?}");
+                assert_eq!(
+                    public.offset.checked_sub(private.offset),
+                    Some(u64::try_from(removed_entry_bytes).unwrap()),
+                    "{target:?}"
+                );
+            }
             assert_eq!(
                 lowering.start_accelerator, expected_accelerator,
                 "{target:?}"
@@ -18894,6 +19045,27 @@ mod tests {
                 .chunks_exact(4)
                 .any(|bytes| bytes == aarch64_sve2_match_b(1, 0, 16).unwrap().to_le_bytes())
         );
+        let trusted_sve2 = lower_native_dfa_with_entry_contract(
+            fragmented.native,
+            Target::aarch64_linux().with_features(sve2).unwrap(),
+            NativeDfaEntryContract::PreparedPartialCore,
+        )
+        .unwrap()
+        .expect("trusted SVE2 fragmented scanner");
+        assert_eq!(
+            sve2_lowering.code.len().checked_sub(trusted_sve2.code.len()),
+            Some(60)
+        );
+        assert_eq!(
+            trusted_sve2.start_accelerator,
+            StartAccelerator::Aarch64Sve2
+        );
+        assert!(
+            trusted_sve2
+                .code
+                .chunks_exact(4)
+                .any(|bytes| bytes == aarch64_sve2_match_b(1, 0, 16).unwrap().to_le_bytes())
+        );
     }
 
     #[test]
@@ -19017,6 +19189,16 @@ mod tests {
                     assert!(code
                         .windows(5)
                         .any(|bytes| bytes == [0x48, 0x83, 0xc4, 104, 0xc3]));
+                    for offset in [0_u8, 8, 16, 24, 32] {
+                        let instruction = [
+                            0x48, 0xc7, 0x44, 0x24, offset, 0x00, 0x00, 0x00, 0x00,
+                        ];
+                        assert!(
+                            code.windows(instruction.len())
+                                .any(|bytes| bytes == instruction),
+                            "{target:?} did not initialize private word {offset}"
+                        );
+                    }
                 }
                 Architecture::Aarch64 => {
                     assert_eq!(
@@ -19053,6 +19235,13 @@ mod tests {
                         aarch64_store_x(4, 31, 64).unwrap(),
                     ] {
                         assert!(words.contains(&instruction), "{target:?}/{instruction:#x}");
+                    }
+                    for offset in [80_u16, 88, 96, 104, 112] {
+                        let instruction = aarch64_store_x(31, 31, offset).unwrap();
+                        assert!(
+                            words.contains(&instruction),
+                            "{target:?} did not initialize private word {offset}"
+                        );
                     }
                 }
             }
@@ -19152,6 +19341,19 @@ mod tests {
             .program()
             .native_partial_dfa_view()
             .expect("host partial native view");
+        let public_core = lower_native_dfa(view.native, target)
+            .expect("lower public host core")
+            .expect("host core preserves its scanner");
+        let private_core = &compiled.module().symbols()[PARTIAL_NATIVE_CORE_SYMBOL];
+        let removed_entry_bytes = match target.architecture {
+            Architecture::X86_64 => 64,
+            Architecture::Aarch64 => 60,
+        };
+        assert_eq!(
+            usize::try_from(private_core.size).unwrap(),
+            public_core.code.len() - removed_entry_bytes,
+            "the linked differential must execute the trusted local core"
+        );
         let witness = generated_byte_strings(&[0, b'a', b'b', b'c', b'x', b'y', b'Q', b'z'], 6)
             .into_iter()
             .find_map(|bytes| trace(&view, &bytes, 0, bytes.len()).map(|hole| (bytes, hole)))
