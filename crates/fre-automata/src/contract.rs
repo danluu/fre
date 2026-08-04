@@ -834,6 +834,28 @@ impl K0SearchSession<'_> {
         self.search_selected_end_value_untyped(haystack, window, limits)
     }
 
+    /// Return only a Span, allowing an authenticated warm bidirectional
+    /// session to omit diagnostic construction and recover an unknown start
+    /// through already-filled reverse DFA rows.
+    ///
+    /// Finite limits and every cold, contextual, or incomplete-cache call use
+    /// the ordinary report-producing executor with unchanged resource and
+    /// error behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] for an invalid range, a hard-limit refusal, or
+    /// execution failure.
+    #[doc(hidden)]
+    pub fn search_span_value(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<Option<MatchSpan>, SearchError> {
+        self.search_span_value_untyped(haystack, window, limits)
+    }
+
     /// Search a complete-haystack suffix with retained source-independent
     /// span cursor facts.
     ///

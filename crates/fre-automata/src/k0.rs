@@ -3009,6 +3009,66 @@ impl<'a> K0SearchSession<'a> {
         .map(|report| report.found.map(MatchSpan::end))
     }
 
+    /// Project one authenticated warm Span without report construction.
+    ///
+    /// This prototype deliberately admits only unlimited, assertion-free,
+    /// fully initialized bidirectional sessions. The optimistic transaction
+    /// borrows both DFA caches immutably: a missing forward or reverse cell
+    /// therefore declines without changing invocation scratch, cache rows, or
+    /// retained metadata. The ordinary executor then restarts from the exact
+    /// original window and remains authoritative for every finite call,
+    /// preparation, decline, and error.
+    pub(crate) fn search_span_value_untyped(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<Option<MatchSpan>, SearchError> {
+        if limits == SearchLimits::unlimited()
+            && self.capabilities.lazy
+            && self.capabilities.reverse
+            && !self.capabilities.contextual
+            && self.workspace.lazy.is_bound_to(self.automaton)
+            && self.workspace.lazy.initialized
+            && !self.workspace.lazy.declined
+            && !self.workspace.lazy.saturated
+            && self.workspace.reverse.is_bound_to(self.automaton)
+            && self.workspace.reverse.initialized
+            && !self.workspace.reverse.declined
+            && !self.workspace.reverse.saturated
+        {
+            if let Some(proof) = self.automaton.start_filter_proof.get() {
+                let nullable_initial = matches!(
+                    self.workspace.lazy.initial_kind,
+                    LazyInitialKind::NullablePrefix | LazyInitialKind::NullableTerminal
+                );
+                if !proof.force_haystack_start && proof.relaxed_nullable == nullable_initial {
+                    validate_window(haystack, window)?;
+                    if let Some(found) = try_warm_direct_span_with_reverse(
+                        haystack,
+                        window,
+                        &self.workspace.lazy,
+                        &self.workspace.reverse,
+                        proof,
+                    )? {
+                        return Ok(Some(found.span()));
+                    }
+                }
+            }
+        }
+
+        execute_bound(
+            self.automaton,
+            haystack,
+            window,
+            &mut self.workspace,
+            limits,
+            OutputContract::Span,
+            self.capabilities,
+        )
+        .map(|report| report.found)
+    }
+
     pub(crate) fn search_span_at_untyped(
         &mut self,
         source: &mut K0SpanSourceCursor<'_>,
@@ -3579,6 +3639,230 @@ fn try_warm_proved_start_selected_end(
                 detail: "warm proved-start encoded state underflowed",
             })?;
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WarmDirectSpan {
+    KnownStart(MatchSpan),
+    ReverseRecovered(MatchSpan),
+}
+
+impl WarmDirectSpan {
+    const fn span(self) -> MatchSpan {
+        match self {
+            Self::KnownStart(span) | Self::ReverseRecovered(span) => span,
+        }
+    }
+}
+
+/// Read one complete assertion-free Span through already-filled direct rows.
+///
+/// The forward half selects the same endpoint as the ordinary ordered loop
+/// and carries the source-provenance action authenticated in every cell. If
+/// that action cannot retain a scalar start, the reverse half begins from the
+/// exact selected endpoint and keeps the earliest start reached by its cached
+/// subset. Both caches are immutable borrows, so `None` is a transactional
+/// decline on the first unavailable cell rather than a partially learned run.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the forward and reverse halves share one explicit read-only decline transaction"
+)]
+fn try_warm_direct_span_with_reverse(
+    haystack: &[u8],
+    window: SearchWindow,
+    lazy: &LazyWorkspace,
+    reverse: &ReverseWorkspace,
+    proof: &StartFilterProof,
+) -> Result<Option<WarmDirectSpan>, SearchError> {
+    if lazy.saturated || reverse.saturated {
+        return Ok(None);
+    }
+    let haystack = haystack
+        .get(..window.end())
+        .ok_or(SearchError::InternalInvariant {
+            detail: "warm Span window exceeds the validated haystack",
+        })?;
+    let (initial_pending, initial_terminal) = match lazy.initial_kind {
+        LazyInitialKind::Positive | LazyInitialKind::PositiveSingle => (false, false),
+        LazyInitialKind::NullablePrefix => (true, false),
+        LazyInitialKind::NullableTerminal => (true, true),
+        LazyInitialKind::Uninitialized => return Ok(None),
+    };
+    if initial_pending && initial_terminal {
+        return Ok(Some(WarmDirectSpan::KnownStart(MatchSpan::new(
+            window.start(),
+            window.start(),
+        ))));
+    }
+    if lazy.initial == LAZY_NO_STATE {
+        return Ok(None);
+    }
+
+    let initial_row = direct_row_offset(lazy.initial)?;
+    let mut state = initial_row;
+    let mut position = window.start();
+    let mut pending_end = initial_pending.then_some(window.start());
+    let mut active_start = (initial_pending
+        || matches!(
+            lazy.initial_kind,
+            LazyInitialKind::Positive | LazyInitialKind::PositiveSingle
+        ))
+    .then_some(window.start());
+    let mut pending_start = initial_pending.then_some(window.start());
+    let mut meter = WorkMeter::new(u64::MAX, INVOCATION_RESET_WORK);
+    let mut retained_start_mask = RetainedStartMaskCursor::default();
+    let mut adaptive_probe = AdaptiveStartProbe::default();
+    let mut engine_candidate = None;
+
+    let (selected_end, selected_start) = loop {
+        if pending_end.is_none() && state == initial_row && active_start == Some(position) {
+            if let Some(scanner) = proof.scanner.as_ref() {
+                if position < window.end() {
+                    if let (Some(probe), Some(candidate)) =
+                        (proof.probe(), engine_candidate.take())
+                    {
+                        adaptive_probe.observe_restartable_rejection(
+                            probe,
+                            haystack,
+                            candidate,
+                            window.end(),
+                            &mut meter,
+                        )?;
+                    }
+                } else {
+                    engine_candidate = None;
+                }
+                position = next_start_candidate_adaptive(
+                    scanner,
+                    haystack,
+                    position,
+                    window.end(),
+                    proof.guard(),
+                    proof.probe(),
+                    &mut meter,
+                    &mut retained_start_mask,
+                    &mut adaptive_probe,
+                )?;
+                if position == window.end() {
+                    return Ok(None);
+                }
+                active_start = matches!(
+                    lazy.initial_kind,
+                    LazyInitialKind::Positive | LazyInitialKind::PositiveSingle
+                )
+                .then_some(position);
+                if proof.probe().is_some() && adaptive_probe.samples_rejections() {
+                    engine_candidate = Some(position);
+                }
+            }
+        }
+        if position == window.end() {
+            let Some(end) = pending_end else {
+                return Ok(None);
+            };
+            break (end, pending_start);
+        }
+        if position > window.end() {
+            return Err(SearchError::InternalInvariant {
+                detail: "warm Span position exceeded the validated window",
+            });
+        }
+
+        let byte = *haystack
+            .get(position)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "warm Span position exceeded the validated source",
+            })?;
+        let cell = lazy.direct_cell(state, byte)?;
+        if cell == LAZY_CELL_UNFILLED {
+            return Ok(None);
+        }
+        position = position
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "warm Span forward position",
+            })?;
+        let start_action = LazyStartAction::from_direct_cell(cell);
+        let next_start = match start_action {
+            LazyStartAction::Drop => None,
+            LazyStartAction::Propagate => active_start,
+            LazyStartAction::Reset => Some(position),
+        };
+        if cell & LAZY_CELL_ACCEPT != 0 {
+            pending_end = Some(position);
+            pending_start = next_start;
+        }
+        let encoded = cell & LAZY_CELL_STATE_MASK;
+        if encoded == 0 {
+            let Some(end) = pending_end else {
+                return Ok(None);
+            };
+            break (end, pending_start);
+        }
+        state = encoded
+            .checked_sub(1)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "warm Span encoded forward state underflowed",
+            })?;
+        active_start = next_start;
+    };
+
+    if let Some(start) = selected_start {
+        return Ok(Some(WarmDirectSpan::KnownStart(MatchSpan::new(
+            start,
+            selected_end,
+        ))));
+    }
+    if selected_end == window.start() {
+        return Ok(Some(WarmDirectSpan::KnownStart(MatchSpan::new(
+            window.start(),
+            selected_end,
+        ))));
+    }
+    if !reverse.initialized || reverse.initial == LAZY_NO_STATE {
+        return Ok(None);
+    }
+
+    let mut state = direct_row_offset(reverse.initial)?;
+    let mut cursor = selected_end;
+    let mut candidate = None;
+    while cursor > window.start() {
+        let source = cursor
+            .checked_sub(1)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "warm Span reverse cursor underflowed",
+            })?;
+        let byte = *haystack
+            .get(source)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "warm Span reverse position exceeded the validated source",
+            })?;
+        let cell = reverse.direct_cell(state, byte)?;
+        if cell == LAZY_CELL_UNFILLED {
+            return Ok(None);
+        }
+        debug_assert_eq!(cell & (LAZY_CELL_RESTART | LAZY_CELL_START_PROPAGATE), 0);
+        cursor = source;
+        if cell & LAZY_CELL_ACCEPT != 0 {
+            candidate = Some(cursor);
+        }
+        let encoded = cell & LAZY_CELL_STATE_MASK;
+        if encoded == 0 {
+            break;
+        }
+        state = encoded
+            .checked_sub(1)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "warm Span encoded reverse state underflowed",
+            })?;
+    }
+    let start = candidate.ok_or(SearchError::InternalInvariant {
+        detail: "warmed reverse DFA could not recover the forward-selected span",
+    })?;
+    Ok(Some(WarmDirectSpan::ReverseRecovered(MatchSpan::new(
+        start,
+        selected_end,
+    ))))
 }
 
 #[allow(
@@ -23132,6 +23416,347 @@ mod tests {
             }
         }
         assert!(comparisons > 40_000);
+    }
+
+    #[test]
+    fn warmed_value_span_reaches_common_unknown_starts_without_mutation() {
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b')]);
+        let haystack = b"zzabzz";
+        let window = SearchWindow::full(haystack);
+        let expected_span = MatchSpan::new(2, 4);
+        let expected = Some(expected_span);
+        let mut session =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+        assert_eq!(
+            session
+                .search_window::<Span>(haystack, window, SearchLimits::unlimited())
+                .unwrap()
+                .into_output(),
+            expected
+        );
+        let proof = plan.start_filter_proof.get().unwrap();
+        assert_eq!(
+            super::try_warm_direct_span_with_reverse(
+                haystack,
+                window,
+                &session.workspace.lazy,
+                &session.workspace.reverse,
+                proof,
+            ),
+            Ok(Some(super::WarmDirectSpan::ReverseRecovered(expected_span)))
+        );
+
+        let generation = session.workspace.generation;
+        let current_len = session.workspace.current_len;
+        let roots_len = session.workspace.roots_len;
+        let stack_len = session.workspace.stack_len;
+        let lazy_scratch_len = session.workspace.lazy.scratch_len;
+        let lazy_frontier_len = session.workspace.lazy.frontier_len;
+        let lazy_state_len = session.workspace.lazy.state_len;
+        let lazy_item_len = session.workspace.lazy.item_len;
+        let lazy_rows = session.workspace.lazy.rows.clone();
+        let reverse_scratch_len = session.workspace.reverse.scratch_len;
+        let reverse_frontier_len = session.workspace.reverse.frontier_len;
+        let reverse_state_len = session.workspace.reverse.state_len;
+        let reverse_item_len = session.workspace.reverse.item_len;
+        let reverse_rows = session.workspace.reverse.rows.clone();
+        assert_eq!(
+            session
+                .search_span_value(haystack, window, SearchLimits::unlimited())
+                .unwrap(),
+            expected
+        );
+        assert_eq!(session.workspace.generation, generation);
+        assert_eq!(session.workspace.current_len, current_len);
+        assert_eq!(session.workspace.roots_len, roots_len);
+        assert_eq!(session.workspace.stack_len, stack_len);
+        assert_eq!(session.workspace.lazy.scratch_len, lazy_scratch_len);
+        assert_eq!(session.workspace.lazy.frontier_len, lazy_frontier_len);
+        assert_eq!(session.workspace.lazy.state_len, lazy_state_len);
+        assert_eq!(session.workspace.lazy.item_len, lazy_item_len);
+        assert_eq!(session.workspace.lazy.rows, lazy_rows);
+        assert_eq!(session.workspace.reverse.scratch_len, reverse_scratch_len);
+        assert_eq!(session.workspace.reverse.frontier_len, reverse_frontier_len);
+        assert_eq!(session.workspace.reverse.state_len, reverse_state_len);
+        assert_eq!(session.workspace.reverse.item_len, reverse_item_len);
+        assert_eq!(session.workspace.reverse.rows, reverse_rows);
+    }
+
+    #[test]
+    fn warmed_value_span_declines_transactionally_on_each_unfilled_direction() {
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b')]);
+        let haystack = b"zzabzz";
+        let window = SearchWindow::full(haystack);
+        let expected = Some(MatchSpan::new(2, 4));
+
+        let mut forward =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+        assert_eq!(
+            forward
+                .search_window::<Span>(haystack, window, SearchLimits::unlimited())
+                .unwrap()
+                .into_output(),
+            expected
+        );
+        let proof = plan.start_filter_proof.get().unwrap();
+        let forward_row = usize::try_from(
+            super::direct_row_offset(forward.workspace.lazy.initial).unwrap(),
+        )
+        .unwrap();
+        let forward_cell = forward_row.checked_add(usize::from(b'a')).unwrap();
+        assert_ne!(
+            forward.workspace.lazy.rows[forward_cell],
+            super::LAZY_CELL_UNFILLED
+        );
+        forward.workspace.lazy.rows[forward_cell] = super::LAZY_CELL_UNFILLED;
+        let forward_rows = forward.workspace.lazy.rows.clone();
+        let reverse_rows = forward.workspace.reverse.rows.clone();
+        let generation = forward.workspace.generation;
+        assert_eq!(
+            super::try_warm_direct_span_with_reverse(
+                haystack,
+                window,
+                &forward.workspace.lazy,
+                &forward.workspace.reverse,
+                proof,
+            ),
+            Ok(None)
+        );
+        assert_eq!(forward.workspace.lazy.rows, forward_rows);
+        assert_eq!(forward.workspace.reverse.rows, reverse_rows);
+        assert_eq!(forward.workspace.generation, generation);
+        assert_eq!(
+            forward
+                .search_span_value(haystack, window, SearchLimits::unlimited())
+                .unwrap(),
+            expected
+        );
+        assert_ne!(
+            forward.workspace.lazy.rows[forward_cell],
+            super::LAZY_CELL_UNFILLED
+        );
+
+        let mut reverse =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+        assert_eq!(
+            reverse
+                .search_window::<Span>(haystack, window, SearchLimits::unlimited())
+                .unwrap()
+                .into_output(),
+            expected
+        );
+        let reverse_row = usize::try_from(
+            super::direct_row_offset(reverse.workspace.reverse.initial).unwrap(),
+        )
+        .unwrap();
+        let reverse_cell = reverse_row.checked_add(usize::from(b'b')).unwrap();
+        assert_ne!(
+            reverse.workspace.reverse.rows[reverse_cell],
+            super::LAZY_CELL_UNFILLED
+        );
+        reverse.workspace.reverse.rows[reverse_cell] = super::LAZY_CELL_UNFILLED;
+        let forward_rows = reverse.workspace.lazy.rows.clone();
+        let reverse_rows = reverse.workspace.reverse.rows.clone();
+        let generation = reverse.workspace.generation;
+        assert_eq!(
+            super::try_warm_direct_span_with_reverse(
+                haystack,
+                window,
+                &reverse.workspace.lazy,
+                &reverse.workspace.reverse,
+                proof,
+            ),
+            Ok(None)
+        );
+        assert_eq!(reverse.workspace.lazy.rows, forward_rows);
+        assert_eq!(reverse.workspace.reverse.rows, reverse_rows);
+        assert_eq!(reverse.workspace.generation, generation);
+        assert_eq!(
+            reverse
+                .search_span_value(haystack, window, SearchLimits::unlimited())
+                .unwrap(),
+            expected
+        );
+        assert_ne!(
+            reverse.workspace.reverse.rows[reverse_cell],
+            super::LAZY_CELL_UNFILLED
+        );
+    }
+
+    #[test]
+    fn warmed_value_span_matches_reported_span_exhaustively() {
+        let plans = [
+            byte_chain(&[(b'a', b'a'), (b'b', b'b')]),
+            ordered_ab_or_ac(),
+            ordered_a_or_ab(true),
+            ordered_a_or_ab(false),
+            greedy_a_star_b(),
+            lazy_a_star_b(),
+            a_plus(true),
+            a_plus(false),
+            empty_or_ab(true),
+            empty_or_ab(false),
+        ];
+        let haystacks = bounded_words(b"abcx", 3);
+        let mut comparisons = 0usize;
+        let mut known = 0usize;
+        let mut recovered = 0usize;
+
+        for plan in &plans {
+            let mut session =
+                K0SearchSession::new_selected(plan, WorkspaceLimits::unlimited(), true, true)
+                    .unwrap();
+            for haystack in &haystacks {
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        let expected = session
+                            .search_window::<Span>(
+                                haystack,
+                                window,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap()
+                            .into_output();
+                        let proof = plan.start_filter_proof.get().unwrap();
+                        let optimistic = super::try_warm_direct_span_with_reverse(
+                            haystack,
+                            window,
+                            &session.workspace.lazy,
+                            &session.workspace.reverse,
+                            proof,
+                        )
+                        .unwrap();
+                        match optimistic {
+                            Some(super::WarmDirectSpan::KnownStart(span)) => {
+                                assert_eq!(Some(span), expected);
+                                known = known.checked_add(1).unwrap();
+                            }
+                            Some(super::WarmDirectSpan::ReverseRecovered(span)) => {
+                                assert_eq!(Some(span), expected);
+                                recovered = recovered.checked_add(1).unwrap();
+                            }
+                            None => assert!(expected.is_none()),
+                        }
+
+                        let lazy_rows = session.workspace.lazy.rows.clone();
+                        let reverse_rows = session.workspace.reverse.rows.clone();
+                        let generation = session.workspace.generation;
+                        assert_eq!(
+                            session
+                                .search_span_value(
+                                    haystack,
+                                    window,
+                                    SearchLimits::unlimited(),
+                                )
+                                .unwrap(),
+                            expected
+                        );
+                        if optimistic.is_some() {
+                            assert_eq!(session.workspace.lazy.rows, lazy_rows);
+                            assert_eq!(session.workspace.reverse.rows, reverse_rows);
+                            assert_eq!(session.workspace.generation, generation);
+                        }
+                        comparisons = comparisons.checked_add(1).unwrap();
+                    }
+                }
+            }
+        }
+        assert!(comparisons > 3_000);
+        assert!(known > 100);
+        assert!(
+            recovered > 10,
+            "the exhaustive corpus reached only {recovered} reverse-recovered spans"
+        );
+    }
+
+    #[test]
+    fn value_span_cold_finite_contextual_and_error_paths_remain_ordinary() {
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b')]);
+        let haystack = b"zzabzz";
+        let window = SearchWindow::full(haystack);
+        let expected = Some(MatchSpan::new(2, 4));
+        let mut session =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+        assert_eq!(
+            session
+                .search_span_value(haystack, window, SearchLimits::unlimited())
+                .unwrap(),
+            expected
+        );
+        assert!(session.workspace.lazy.initialized);
+        assert!(session.workspace.reverse.initialized);
+
+        let warm = session
+            .search_window::<Span>(haystack, window, SearchLimits::unlimited())
+            .unwrap();
+        let measured = warm.accounting().work();
+        assert_eq!(
+            session
+                .search_span_value(
+                    haystack,
+                    window,
+                    SearchLimits {
+                        max_work: measured,
+                        max_scratch_bytes: usize::MAX,
+                    },
+                )
+                .unwrap(),
+            expected
+        );
+        assert!(matches!(
+            session.search_span_value(
+                haystack,
+                window,
+                SearchLimits {
+                    max_work: measured.checked_sub(1).unwrap(),
+                    max_scratch_bytes: usize::MAX,
+                },
+            ),
+            Err(SearchError::WorkLimitExceeded { limit, .. })
+                if limit == measured.checked_sub(1).unwrap()
+        ));
+        assert!(matches!(
+            session.search_span_value(
+                haystack,
+                SearchWindow::new(5, 3),
+                SearchLimits::unlimited(),
+            ),
+            Err(SearchError::InvalidWindow { start: 5, end: 3, .. })
+        ));
+
+        let contextual = asserted_line_a();
+        let contextual_source = b"a\n";
+        let contextual_window = SearchWindow::new(0, 1);
+        let mut contextual_session = K0SearchSession::new_selected(
+            &contextual,
+            WorkspaceLimits::unlimited(),
+            true,
+            true,
+        )
+        .unwrap();
+        let expected = contextual_session
+            .search_window::<Span>(
+                contextual_source,
+                contextual_window,
+                SearchLimits::unlimited(),
+            )
+            .unwrap()
+            .into_output();
+        assert_eq!(
+            contextual_session
+                .search_span_value(
+                    contextual_source,
+                    contextual_window,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            expected
+        );
     }
 
     #[test]
