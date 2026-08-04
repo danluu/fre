@@ -1200,6 +1200,11 @@ impl PartialDfaPrefixPlan {
                 .iter()
                 .copied()
                 .enumerate()
+                // `find_primary` returned this exact byte from `primary`, so
+                // its membership is already proved. In particular, a
+                // one-position prefix needs no scalar verification after the
+                // moving scanner finds a candidate.
+                .filter(|(depth, _)| *depth != self.primary_depth)
                 .all(|(depth, set)| {
                     candidate
                         .checked_add(depth)
@@ -5444,6 +5449,24 @@ mod tests {
         assert!(supported);
         let plan = plan.expect("four-member prefix has a general classifier");
         assert_eq!(plan.next_candidate(&[anchored], b"zz\x11x", 0, 4), Some(2));
+
+        let singleton = |byte: u8| {
+            let mut words = [0_u64; 4];
+            words[usize::from(byte) / 64] |= 1_u64 << (usize::from(byte) % 64);
+            AnchoredByteSet::from_words(words)
+        };
+        let singleton_primary = singleton(b'q');
+        let suffix = singleton(b'z');
+        let (plan, supported) =
+            PartialDfaPrefixPlan::derive(&[singleton_primary, suffix]);
+        assert!(supported);
+        let plan = plan.expect("selective two-position prefix");
+        assert_eq!(plan.primary_depth(), 0);
+        assert_eq!(
+            plan.next_candidate(&[singleton_primary, suffix], b"qxqz", 0, 4),
+            Some(2),
+            "skipping the proved primary must still verify every secondary position"
+        );
     }
 
     #[test]
