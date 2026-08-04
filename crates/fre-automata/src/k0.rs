@@ -1368,6 +1368,7 @@ impl LazyLoopScanner {
         }
     }
 
+    #[cfg(test)]
     fn cardinality(&self) -> u32 {
         match self {
             Self::All => 256,
@@ -1569,6 +1570,114 @@ struct ContextLazyLoopSkipPlan {
     leave_final_member: bool,
 }
 
+const CONTEXT_LAZY_LOOP_SKIP_PLAN_CAPACITY: usize = 4;
+const _: () = assert!(CONTEXT_LAZY_LOOP_SKIP_PLAN_CAPACITY <= LAZY_MAX_STATES);
+const CONTEXT_LAZY_LOOP_SKIP_OWNER_PUBLICATION_WORK: u64 = 1;
+const CONTEXT_LAZY_LOOP_SKIP_BITMAP_PUBLICATION_WORK: u64 = 1;
+
+/// A bounded set of independently authenticated contextual-loop proofs.
+///
+/// Exact signatures keep their physical owner slots across reanalysis, so an
+/// unchanged compiled scanner is never rebuilt or republished. The state
+/// bitmap rejects nonmembers before the remaining exact-owner walk. Runtime
+/// lookup first checks the invocation's active owner, preserving the common
+/// same-state path without making discovery or source order part of ranking.
+#[derive(Debug)]
+struct ContextLazyLoopSkipPlans {
+    entries: [Option<ContextLazyLoopSkipPlan>; CONTEXT_LAZY_LOOP_SKIP_PLAN_CAPACITY],
+    state_members: [u64; 4],
+}
+
+impl ContextLazyLoopSkipPlans {
+    const fn empty() -> Self {
+        Self {
+            entries: [None; CONTEXT_LAZY_LOOP_SKIP_PLAN_CAPACITY],
+            state_members: [0; 4],
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.iter().all(Option::is_none)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.iter().flatten().count()
+    }
+
+    #[cfg(test)]
+    fn first(&self) -> Option<ContextLazyLoopSkipPlan> {
+        self.entries.iter().flatten().copied().next()
+    }
+
+    fn matching_slot(&self, candidate: ContextLazyLoopSkipCandidate) -> Option<usize> {
+        self.entries.iter().position(|entry| {
+            entry.as_ref().is_some_and(|plan| {
+                plan.state == candidate.state
+                    && plan.start_action == candidate.start_action
+                    && plan.leave_final_member == candidate.leave_final_member
+                    && plan.scanner.words() == candidate.members
+            })
+        })
+    }
+
+    #[cfg(test)]
+    fn find(&self, state: u32) -> Option<(usize, &ContextLazyLoopSkipPlan)> {
+        self.find_with_hint(state, None)
+    }
+
+    #[inline]
+    fn find_with_hint(
+        &self,
+        state: u32,
+        preferred_slot: Option<usize>,
+    ) -> Option<(usize, &ContextLazyLoopSkipPlan)> {
+        if let Some(slot) = preferred_slot {
+            if let Some(plan) = self.entries.get(slot).and_then(|entry| entry.as_ref()) {
+                if plan.state == state {
+                    return Some((slot, plan));
+                }
+            }
+        }
+        if preferred_slot != Some(0) {
+            if let Some(plan) = self.entries[0].as_ref() {
+                if plan.state == state {
+                    return Some((0, plan));
+                }
+            }
+        }
+        let state = u8::try_from(state).ok()?;
+        if !byte_bitmap_contains(self.state_members, state) {
+            return None;
+        }
+        let found = self
+            .entries
+            .iter()
+            .enumerate()
+            .find_map(|(slot, plan)| {
+                if preferred_slot == Some(slot) || slot == 0 {
+                    return None;
+                }
+                plan.as_ref()
+                    .filter(|plan| plan.state == u32::from(state))
+                    .map(|plan| (slot, plan))
+            });
+        debug_assert!(
+            found.is_some(),
+            "contextual loop state bitmap has no exact plan"
+        );
+        found
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ContextLazyLoopSkipCandidate {
+    state: u32,
+    members: [u64; 4],
+    start_action: LazyStartAction,
+    leave_final_member: bool,
+}
+
 /// Invocation-local suppression for an unproductive retained loop scanner.
 ///
 /// Narrow graph classes can still have long profitable runs, so plan
@@ -1694,7 +1803,7 @@ struct LazyWorkspace {
     initial_kind: LazyInitialKind,
     inline_start_action: LazyStartAction,
     loop_skip_plans: LazyLoopSkipPlans,
-    context_loop_skip_plan: Option<ContextLazyLoopSkipPlan>,
+    context_loop_skip_plans: ContextLazyLoopSkipPlans,
     direct_cells_published: u32,
     loop_skip_analyzed_at_cells: u32,
     context_loop_skip_analyzed_at_candidates: u32,
@@ -1757,7 +1866,7 @@ impl LazyWorkspace {
             initial_kind: LazyInitialKind::Uninitialized,
             inline_start_action: LazyStartAction::Drop,
             loop_skip_plans: LazyLoopSkipPlans::empty(),
-            context_loop_skip_plan: None,
+            context_loop_skip_plans: ContextLazyLoopSkipPlans::empty(),
             direct_cells_published: 0,
             loop_skip_analyzed_at_cells: 0,
             context_loop_skip_analyzed_at_candidates: 0,
@@ -1790,7 +1899,7 @@ impl LazyWorkspace {
             initial_kind: LazyInitialKind::Uninitialized,
             inline_start_action: LazyStartAction::Drop,
             loop_skip_plans: LazyLoopSkipPlans::empty(),
-            context_loop_skip_plan: None,
+            context_loop_skip_plans: ContextLazyLoopSkipPlans::empty(),
             direct_cells_published: 0,
             loop_skip_analyzed_at_cells: 0,
             context_loop_skip_analyzed_at_candidates: 0,
@@ -4254,23 +4363,21 @@ fn try_warm_context_exists(
     }
     lazy.context.validate_shape()?;
 
-    let bounded = if let Some(loop_skip) = lazy.context_loop_skip_plan {
-        try_warm_context_exists_bounded::<true>(
-            automaton,
-            haystack,
-            window,
-            lazy,
-            proof,
-            Some(loop_skip),
-        )
-    } else {
+    let bounded = if lazy.context_loop_skip_plans.is_empty() {
         try_warm_context_exists_bounded::<false>(
             automaton,
             haystack,
             window,
             lazy,
             proof,
-            None,
+        )
+    } else {
+        try_warm_context_exists_bounded::<true>(
+            automaton,
+            haystack,
+            window,
+            lazy,
+            proof,
         )
     };
     match bounded {
@@ -4296,9 +4403,8 @@ fn try_warm_context_exists_bounded<const LOOP_SKIP: bool>(
     window: SearchWindow,
     lazy: &LazyWorkspace,
     proof: &StartFilterProof,
-    loop_skip: Option<ContextLazyLoopSkipPlan>,
 ) -> Result<Option<bool>, SearchError> {
-    debug_assert_eq!(LOOP_SKIP, loop_skip.is_some());
+    debug_assert!(!LOOP_SKIP || !lazy.context_loop_skip_plans.is_empty());
     let global_dependencies = automaton.boundary_context_classifier().assertions();
     let root_dependencies = lazy.context_root_dependency_mask(global_dependencies);
     let scanner = proof.scanner.as_ref();
@@ -4311,6 +4417,7 @@ fn try_warm_context_exists_bounded<const LOOP_SKIP: bool>(
     let mut adaptive_probe = AdaptiveStartProbe::default();
     let mut engine_candidate = None;
     let mut loop_probe = LazyLoopProbe::default();
+    let mut active_loop_slot = None;
 
     if let Some(scanner) = scanner {
         // Preserve the absolute-start alternative at original boundary zero;
@@ -4410,65 +4517,67 @@ fn try_warm_context_exists_bounded<const LOOP_SKIP: bool>(
         }
 
         if LOOP_SKIP {
-            let plan = loop_skip.ok_or(SearchError::InternalInvariant {
-                detail: "warm contextual loop executed without its retained proof",
-            })?;
-            let in_plan_state = state == plan.state;
-            let scan_threshold = if plan.leave_final_member {
-                LAZY_LOOP_SKIP_MIN_BYTES.checked_add(1).ok_or(
-                    SearchError::ArithmeticOverflow {
-                        computation: "warm contextual loop scan threshold",
-                    },
-                )?
-            } else {
-                LAZY_LOOP_SKIP_MIN_BYTES
-            };
-            if !in_plan_state {
+            let selected = lazy
+                .context_loop_skip_plans
+                .find_with_hint(state, active_loop_slot);
+            let selected_slot = selected.map(|(slot, _)| slot);
+            if selected_slot != active_loop_slot {
                 loop_probe.left_plan_state();
+                active_loop_slot = selected_slot;
             }
-            if in_plan_state
-                && loop_probe.is_ready(position)
-                && window.end().saturating_sub(position) >= scan_threshold
-                && meter.remaining()
-                    >= u64::try_from(scan_threshold)
-                        .expect("warm contextual loop threshold fits u64")
-            {
-                let available = usize::try_from(meter.remaining())
-                    .unwrap_or(usize::MAX)
-                    .min(window.end().saturating_sub(position));
-                let scan_end = position.checked_add(available).ok_or(
-                    SearchError::ArithmeticOverflow {
-                        computation: "warm contextual loop scan end",
-                    },
-                )?;
-                let source = haystack.get(position..scan_end).ok_or(
-                    SearchError::InternalInvariant {
-                        detail: "warm contextual loop scan exceeded its validated window",
-                    },
-                )?;
-                let member_run = plan.scanner.scan_forward(source);
-                let skipped = if plan.leave_final_member {
-                    member_run.saturating_sub(1)
-                } else {
-                    member_run
-                };
-                loop_probe.observe(position, skipped)?;
-                if skipped != 0 {
-                    meter.charge_admitted(
-                        u64::try_from(skipped)
-                            .expect("warm contextual loop skip length fits u64"),
-                    );
-                    position = position.checked_add(skipped).ok_or(
+            if let Some((_, plan)) = selected {
+                let scan_threshold = if plan.leave_final_member {
+                    LAZY_LOOP_SKIP_MIN_BYTES.checked_add(1).ok_or(
                         SearchError::ArithmeticOverflow {
-                            computation: "warm contextual loop source progress",
+                            computation: "warm contextual loop scan threshold",
+                        },
+                    )?
+                } else {
+                    LAZY_LOOP_SKIP_MIN_BYTES
+                };
+                if loop_probe.is_ready(position)
+                    && window.end().saturating_sub(position) >= scan_threshold
+                    && meter.remaining()
+                        >= u64::try_from(scan_threshold)
+                            .expect("warm contextual loop threshold fits u64")
+                {
+                    let available = usize::try_from(meter.remaining())
+                        .unwrap_or(usize::MAX)
+                        .min(window.end().saturating_sub(position));
+                    let scan_end = position.checked_add(available).ok_or(
+                        SearchError::ArithmeticOverflow {
+                            computation: "warm contextual loop scan end",
                         },
                     )?;
-                    // A skipped self-loop is nonaccepting and cannot restart
-                    // the root. Start provenance is irrelevant to Exists,
-                    // including a graph-proved `Drop` action.
-                    restartable = false;
-                    if position == window.end() {
-                        continue;
+                    let source = haystack.get(position..scan_end).ok_or(
+                        SearchError::InternalInvariant {
+                            detail: "warm contextual loop scan exceeded its validated window",
+                        },
+                    )?;
+                    let member_run = plan.scanner.scan_forward(source);
+                    let skipped = if plan.leave_final_member {
+                        member_run.saturating_sub(1)
+                    } else {
+                        member_run
+                    };
+                    loop_probe.observe(position, skipped)?;
+                    if skipped != 0 {
+                        meter.charge_admitted(
+                            u64::try_from(skipped)
+                                .expect("warm contextual loop skip length fits u64"),
+                        );
+                        position = position.checked_add(skipped).ok_or(
+                            SearchError::ArithmeticOverflow {
+                                computation: "warm contextual loop source progress",
+                            },
+                        )?;
+                        // A skipped self-loop is nonaccepting and cannot restart
+                        // the root. Start provenance is irrelevant to Exists,
+                        // including a graph-proved `Drop` action.
+                        restartable = false;
+                        if position == window.end() {
+                            continue;
+                        }
                     }
                 }
             }
@@ -7211,25 +7320,41 @@ fn execute_prepared(
     let mut adaptive_probe = AdaptiveStartProbe::default();
     let lazy = if may_use_lazy && bidirectional_ready && supported_contract {
         if contextual {
-            let context_loop_skip = (limits == SearchLimits::unlimited())
-                .then_some(workspace.lazy.context_loop_skip_plan)
-                .flatten();
-            execute_context_lazy_loop(
-                automaton,
-                haystack,
-                window,
-                workspace,
-                &mut meter,
-                contract,
-                contextual_learning_reserve,
-                start_proof.proof().scanner.as_ref(),
-                start_proof.proof().guard(),
-                start_proof.proof().probe(),
-                start_proof.proof().force_haystack_start,
-                start_proof.proof().relaxed_nullable,
-                context_loop_skip,
-                &mut adaptive_probe,
-            )?
+            if limits == SearchLimits::unlimited()
+                && !workspace.lazy.context_loop_skip_plans.is_empty()
+            {
+                execute_context_lazy_loop::<true>(
+                    automaton,
+                    haystack,
+                    window,
+                    workspace,
+                    &mut meter,
+                    contract,
+                    contextual_learning_reserve,
+                    start_proof.proof().scanner.as_ref(),
+                    start_proof.proof().guard(),
+                    start_proof.proof().probe(),
+                    start_proof.proof().force_haystack_start,
+                    start_proof.proof().relaxed_nullable,
+                    &mut adaptive_probe,
+                )?
+            } else {
+                execute_context_lazy_loop::<false>(
+                    automaton,
+                    haystack,
+                    window,
+                    workspace,
+                    &mut meter,
+                    contract,
+                    contextual_learning_reserve,
+                    start_proof.proof().scanner.as_ref(),
+                    start_proof.proof().guard(),
+                    start_proof.proof().probe(),
+                    start_proof.proof().force_haystack_start,
+                    start_proof.proof().relaxed_nullable,
+                    &mut adaptive_probe,
+                )?
+            }
         } else {
             let ready = if let Some(ready) = direct_ready {
                 Some(ready)
@@ -8576,7 +8701,7 @@ fn execute_lazy_span_loop<const TRACK_START: bool, const LOOP_SKIP: bool>(
     clippy::too_many_lines,
     reason = "contextual endpoint execution keeps scanner restart and semantic cache keys together"
 )]
-fn execute_context_lazy_loop(
+fn execute_context_lazy_loop<const LOOP_SKIP: bool>(
     automaton: &Automaton,
     haystack: &[u8],
     window: SearchWindow,
@@ -8589,7 +8714,6 @@ fn execute_context_lazy_loop(
     probe: Option<&StartPositionClass>,
     force_haystack_start: bool,
     relaxed_nullable: bool,
-    loop_skip: Option<ContextLazyLoopSkipPlan>,
     adaptive_probe: &mut AdaptiveStartProbe,
 ) -> Result<Option<(Option<MatchSpan>, usize, bool)>, SearchError> {
     if !matches!(
@@ -8608,6 +8732,7 @@ fn execute_context_lazy_loop(
         workspace.lazy.declined = true;
         return Ok(None);
     }
+    debug_assert!(!LOOP_SKIP || !workspace.lazy.context_loop_skip_plans.is_empty());
 
     let earliest = matches!(
         contract,
@@ -8623,6 +8748,7 @@ fn execute_context_lazy_loop(
     let mut retained_start_mask = RetainedStartMaskCursor::default();
     let mut engine_candidate = None;
     let mut loop_probe = LazyLoopProbe::default();
+    let mut active_loop_slot = None;
     if let Some(scanner) = scanner {
         // An absolute-start branch may contribute only at original haystack
         // boundary zero. Otherwise the proven scanner can establish the first
@@ -8760,68 +8886,77 @@ fn execute_context_lazy_loop(
             )));
         }
 
-        if let Some(plan) = loop_skip {
-            let in_plan_state = state == LazyState::Cached(plan.state);
-            let scan_threshold = if plan.leave_final_member {
-                LAZY_LOOP_SKIP_MIN_BYTES.checked_add(1).ok_or(
-                    SearchError::ArithmeticOverflow {
-                        computation: "contextual lazy loop scan threshold",
-                    },
-                )?
-            } else {
-                LAZY_LOOP_SKIP_MIN_BYTES
+        if LOOP_SKIP {
+            let selected = match state {
+                LazyState::Cached(state) => workspace
+                    .lazy
+                    .context_loop_skip_plans
+                    .find_with_hint(state, active_loop_slot),
+                LazyState::Inline { .. } => None,
             };
-            if !in_plan_state {
+            let selected_slot = selected.map(|(slot, _)| slot);
+            if selected_slot != active_loop_slot {
                 loop_probe.left_plan_state();
+                active_loop_slot = selected_slot;
             }
-            if in_plan_state
-                && loop_probe.is_ready(position)
-                && window.end().saturating_sub(position) >= scan_threshold
-                && meter.remaining()
-                    >= u64::try_from(scan_threshold)
-                        .expect("lazy loop threshold fits u64")
-            {
-                let available = usize::try_from(meter.remaining())
-                    .unwrap_or(usize::MAX)
-                    .min(window.end().saturating_sub(position));
-                let scan_end = position.checked_add(available).ok_or(
-                    SearchError::ArithmeticOverflow {
-                        computation: "contextual lazy loop scan end",
-                    },
-                )?;
-                let source = haystack.get(position..scan_end).ok_or(
-                    SearchError::InternalInvariant {
-                        detail: "contextual lazy loop scan exceeded its validated window",
-                    },
-                )?;
-                let member_run = plan.scanner.scan_forward(source);
-                let skipped = if plan.leave_final_member {
-                    member_run.saturating_sub(1)
+            if let Some((_, plan)) = selected {
+                let scan_threshold = if plan.leave_final_member {
+                    LAZY_LOOP_SKIP_MIN_BYTES.checked_add(1).ok_or(
+                        SearchError::ArithmeticOverflow {
+                            computation: "contextual lazy loop scan threshold",
+                        },
+                    )?
                 } else {
-                    member_run
+                    LAZY_LOOP_SKIP_MIN_BYTES
                 };
-                loop_probe.observe(position, skipped)?;
-                if skipped != 0 {
-                    meter.charge_admitted(
-                        u64::try_from(skipped)
-                            .expect("contextual lazy loop skip length fits u64"),
-                    );
-                    position = position.checked_add(skipped).ok_or(
+                if loop_probe.is_ready(position)
+                    && window.end().saturating_sub(position) >= scan_threshold
+                    && meter.remaining()
+                        >= u64::try_from(scan_threshold)
+                            .expect("lazy loop threshold fits u64")
+                {
+                    let available = usize::try_from(meter.remaining())
+                        .unwrap_or(usize::MAX)
+                        .min(window.end().saturating_sub(position));
+                    let scan_end = position.checked_add(available).ok_or(
                         SearchError::ArithmeticOverflow {
-                            computation: "contextual lazy loop source progress",
+                            computation: "contextual lazy loop scan end",
                         },
                     )?;
-                    boundaries = boundaries.checked_add(skipped).ok_or(
-                        SearchError::ArithmeticOverflow {
-                            computation: "contextual lazy loop examined boundary count",
+                    let source = haystack.get(position..scan_end).ok_or(
+                        SearchError::InternalInvariant {
+                            detail: "contextual lazy loop scan exceeded its validated window",
                         },
                     )?;
-                    restartable = false;
-                    if plan.start_action == LazyStartAction::Drop {
-                        active_start = None;
-                    }
-                    if position == window.end() {
-                        continue;
+                    let member_run = plan.scanner.scan_forward(source);
+                    let skipped = if plan.leave_final_member {
+                        member_run.saturating_sub(1)
+                    } else {
+                        member_run
+                    };
+                    loop_probe.observe(position, skipped)?;
+                    if skipped != 0 {
+                        meter.charge_admitted(
+                            u64::try_from(skipped)
+                                .expect("contextual lazy loop skip length fits u64"),
+                        );
+                        position = position.checked_add(skipped).ok_or(
+                            SearchError::ArithmeticOverflow {
+                                computation: "contextual lazy loop source progress",
+                            },
+                        )?;
+                        boundaries = boundaries.checked_add(skipped).ok_or(
+                            SearchError::ArithmeticOverflow {
+                                computation: "contextual lazy loop examined boundary count",
+                            },
+                        )?;
+                        restartable = false;
+                        if plan.start_action == LazyStartAction::Drop {
+                            active_start = None;
+                        }
+                        if position == window.end() {
+                            continue;
+                        }
                     }
                 }
             }
@@ -10685,6 +10820,262 @@ fn try_learn_context_dependency_masks(
     result
 }
 
+/// Best-first, source-independent ordering for contextual loop proofs.
+///
+/// A wider exact member set remains the primary policy. Consuming the complete
+/// run is strictly better than retaining one scalar member at equal width.
+/// Exact graph contents, provenance, and the member bitmap then provide a
+/// canonical total order without using transition-slot or state discovery
+/// order.
+fn compare_context_lazy_loop_candidates(
+    lazy: &LazyWorkspace,
+    left: ContextLazyLoopSkipCandidate,
+    right: ContextLazyLoopSkipCandidate,
+    meter: &mut WorkMeter,
+) -> Result<Option<core::cmp::Ordering>, SearchError> {
+    let cardinality = byte_bitmap_cardinality(right.members)
+        .cmp(&byte_bitmap_cardinality(left.members));
+    if cardinality != core::cmp::Ordering::Equal {
+        return Ok(Some(cardinality));
+    }
+    let final_member = left.leave_final_member.cmp(&right.leave_final_member);
+    if final_member != core::cmp::Ordering::Equal {
+        return Ok(Some(final_member));
+    }
+    let Some(state) = compare_lazy_loop_graph_states(lazy, left.state, right.state, meter)? else {
+        return Ok(None);
+    };
+    if state != core::cmp::Ordering::Equal {
+        return Ok(Some(state));
+    }
+    Ok(Some(
+        lazy_loop_action_rank(left.start_action)
+            .cmp(&lazy_loop_action_rank(right.start_action))
+            .then_with(|| left.members.cmp(&right.members)),
+    ))
+}
+
+/// Retain one local winner per exact contextual state and the four canonical
+/// winners overall.
+fn try_retain_context_lazy_loop_candidate(
+    lazy: &LazyWorkspace,
+    retained: &mut [Option<ContextLazyLoopSkipCandidate>;
+         CONTEXT_LAZY_LOOP_SKIP_PLAN_CAPACITY],
+    candidate: ContextLazyLoopSkipCandidate,
+    meter: &mut WorkMeter,
+) -> Result<bool, SearchError> {
+    if byte_bitmap_cardinality(candidate.members) == 0 {
+        return Ok(true);
+    }
+    let len = retained
+        .iter()
+        .position(Option::is_none)
+        .unwrap_or(CONTEXT_LAZY_LOOP_SKIP_PLAN_CAPACITY);
+    debug_assert!(retained[..len].iter().all(Option::is_some));
+    debug_assert!(retained[len..].iter().all(Option::is_none));
+
+    let same_state = retained[..len]
+        .iter()
+        .position(|entry| entry.is_some_and(|entry| entry.state == candidate.state));
+    let inserted = if let Some(slot) = same_state {
+        let existing = retained
+            .get(slot)
+            .copied()
+            .flatten()
+            .ok_or(SearchError::InternalInvariant {
+                detail: "contextual loop candidate prefix contains a hole",
+            })?;
+        let Some(ordering) =
+            compare_context_lazy_loop_candidates(lazy, candidate, existing, meter)?
+        else {
+            return Ok(false);
+        };
+        if ordering != core::cmp::Ordering::Less {
+            return Ok(true);
+        }
+        retained[slot] = Some(candidate);
+        len
+    } else if len < CONTEXT_LAZY_LOOP_SKIP_PLAN_CAPACITY {
+        retained[len] = Some(candidate);
+        len.checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "contextual loop retained candidate count",
+            })?
+    } else {
+        let worst = retained[CONTEXT_LAZY_LOOP_SKIP_PLAN_CAPACITY - 1].ok_or(
+            SearchError::InternalInvariant {
+                detail: "full contextual loop candidate cache has an empty tail",
+            },
+        )?;
+        let Some(ordering) =
+            compare_context_lazy_loop_candidates(lazy, candidate, worst, meter)?
+        else {
+            return Ok(false);
+        };
+        if ordering != core::cmp::Ordering::Less {
+            return Ok(true);
+        }
+        retained[CONTEXT_LAZY_LOOP_SKIP_PLAN_CAPACITY - 1] = Some(candidate);
+        len
+    };
+
+    for right in 1..inserted {
+        let mut slot = right;
+        while slot != 0 {
+            let previous_slot = slot.checked_sub(1).ok_or(
+                SearchError::InternalInvariant {
+                    detail: "nonzero contextual loop candidate slot underflowed",
+                },
+            )?;
+            let current = retained[slot].ok_or(SearchError::InternalInvariant {
+                detail: "contextual loop candidate sort contains a current hole",
+            })?;
+            let previous = retained[previous_slot].ok_or(SearchError::InternalInvariant {
+                detail: "contextual loop candidate sort contains a previous hole",
+            })?;
+            let Some(ordering) =
+                compare_context_lazy_loop_candidates(lazy, current, previous, meter)?
+            else {
+                return Ok(false);
+            };
+            if ordering != core::cmp::Ordering::Less {
+                break;
+            }
+            retained.swap(slot, previous_slot);
+            slot = previous_slot;
+        }
+    }
+    Ok(true)
+}
+
+/// Publish one completely selected contextual-loop set with stable scanner
+/// owners. All signature validation and aggregate work admission precede the
+/// first owner or bitmap write.
+fn try_publish_context_lazy_loop_skip_candidates(
+    lazy: &mut LazyWorkspace,
+    candidates: [Option<ContextLazyLoopSkipCandidate>;
+        CONTEXT_LAZY_LOOP_SKIP_PLAN_CAPACITY],
+    meter: &mut WorkMeter,
+) -> Result<bool, SearchError> {
+    let mut target = [None; CONTEXT_LAZY_LOOP_SKIP_PLAN_CAPACITY];
+    let mut assigned = [false; CONTEXT_LAZY_LOOP_SKIP_PLAN_CAPACITY];
+    let mut reused = [false; CONTEXT_LAZY_LOOP_SKIP_PLAN_CAPACITY];
+    let mut unresolved = [None; CONTEXT_LAZY_LOOP_SKIP_PLAN_CAPACITY];
+    let mut unresolved_len = 0usize;
+
+    for candidate in candidates.into_iter().flatten() {
+        if let Some(slot) = lazy.context_loop_skip_plans.matching_slot(candidate) {
+            if assigned[slot] {
+                return Err(SearchError::InternalInvariant {
+                    detail: "contextual loop publication selected one owner twice",
+                });
+            }
+            target[slot] = Some(candidate);
+            assigned[slot] = true;
+            reused[slot] = true;
+        } else {
+            let unresolved_slot = unresolved.get_mut(unresolved_len).ok_or(
+                SearchError::InternalInvariant {
+                    detail: "contextual loop publication exceeded its unresolved capacity",
+                },
+            )?;
+            *unresolved_slot = Some(candidate);
+            unresolved_len = unresolved_len.checked_add(1).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "contextual loop unresolved publication count",
+                },
+            )?;
+        }
+    }
+
+    for candidate in unresolved.into_iter().take(unresolved_len).flatten() {
+        let slot = assigned.iter().position(|&occupied| !occupied).ok_or(
+            SearchError::InternalInvariant {
+                detail: "contextual loop publication has no replaceable owner slot",
+            },
+        )?;
+        target[slot] = Some(candidate);
+        assigned[slot] = true;
+    }
+
+    let mut target_members = [0_u64; 4];
+    for candidate in target.iter().copied().flatten() {
+        let state = usize::try_from(candidate.state).map_err(|_| {
+            SearchError::InternalInvariant {
+                detail: "contextual loop publication state does not fit usize",
+            }
+        })?;
+        if state >= lazy.state_len {
+            return Err(SearchError::InternalInvariant {
+                detail: "contextual loop publication state is outside retained states",
+            });
+        }
+        let state = u8::try_from(candidate.state).map_err(|_| {
+            SearchError::InternalInvariant {
+                detail: "contextual loop publication state does not fit its fixed bitmap",
+            }
+        })?;
+        if byte_bitmap_contains(target_members, state) {
+            return Err(SearchError::InternalInvariant {
+                detail: "contextual loop publication retained one state twice",
+            });
+        }
+        byte_bitmap_insert(&mut target_members, state);
+    }
+
+    let mut changed = [false; CONTEXT_LAZY_LOOP_SKIP_PLAN_CAPACITY];
+    let mut publication_work = 0_u64;
+    for slot in 0..CONTEXT_LAZY_LOOP_SKIP_PLAN_CAPACITY {
+        if reused[slot]
+            || (target[slot].is_none()
+                && lazy.context_loop_skip_plans.entries[slot].is_none())
+        {
+            continue;
+        }
+        changed[slot] = true;
+        publication_work = publication_work
+            .checked_add(CONTEXT_LAZY_LOOP_SKIP_OWNER_PUBLICATION_WORK)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "contextual loop owner publication work",
+            })?;
+        if let Some(candidate) = target[slot] {
+            publication_work = publication_work
+                .checked_add(LazyLoopScanner::build_work(candidate.members))
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "contextual loop scanner construction work",
+                })?;
+        }
+    }
+    let bitmap_changed = target_members != lazy.context_loop_skip_plans.state_members;
+    if bitmap_changed {
+        publication_work = publication_work
+            .checked_add(CONTEXT_LAZY_LOOP_SKIP_BITMAP_PUBLICATION_WORK)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "contextual loop bitmap publication work",
+            })?;
+    }
+    if !meter.try_charge_optional(publication_work, 0) {
+        return Ok(false);
+    }
+
+    for slot in 0..CONTEXT_LAZY_LOOP_SKIP_PLAN_CAPACITY {
+        if !changed[slot] {
+            continue;
+        }
+        lazy.context_loop_skip_plans.entries[slot] =
+            target[slot].map(|candidate| ContextLazyLoopSkipPlan {
+                state: candidate.state,
+                scanner: LazyLoopScanner::new(candidate.members),
+                start_action: candidate.start_action,
+                leave_final_member: candidate.leave_final_member,
+            });
+    }
+    if bitmap_changed {
+        lazy.context_loop_skip_plans.state_members = target_members;
+    }
+    Ok(true)
+}
+
 /// Learn one context-stable contextual self-loop from already-published exact
 /// transitions. Assertion-independent loops may consume a complete member
 /// run. A byte-context loop consumes only `run - 1`, keeping one final member
@@ -10711,15 +11102,32 @@ fn try_derive_context_lazy_loop_skip(
 
     let analyzed_candidates = workspace.lazy.context.loop_candidates_published;
     let analyzed_dependencies = workspace.lazy.context_dependencies_analyzed;
-    let mut best_cardinality = workspace
+    let mut best_candidates = [None; CONTEXT_LAZY_LOOP_SKIP_PLAN_CAPACITY];
+    // A retained proof stays valid when its exact associative transition
+    // record is later evicted. Seed those immutable owners into the next
+    // canonical selection before considering newly observed records.
+    for plan in workspace
         .lazy
-        .context_loop_skip_plan
-        .map_or(0, |plan| plan.scanner.cardinality());
-    let mut best_leave_final_member = workspace
-        .lazy
-        .context_loop_skip_plan
-        .is_none_or(|plan| plan.leave_final_member);
-    let mut best_candidate = None;
+        .context_loop_skip_plans
+        .entries
+        .iter()
+        .flatten()
+        .copied()
+    {
+        if !try_retain_context_lazy_loop_candidate(
+            &workspace.lazy,
+            &mut best_candidates,
+            ContextLazyLoopSkipCandidate {
+                state: plan.state,
+                members: plan.scanner.words(),
+                start_action: plan.start_action,
+                leave_final_member: plan.leave_final_member,
+            },
+            meter,
+        )? {
+            return Ok(());
+        }
+    }
     for &record in &workspace.lazy.context.slots {
         if !meter.try_charge_optional(1, 0) {
             return Ok(());
@@ -10788,21 +11196,19 @@ fn try_derive_context_lazy_loop_skip(
         ) else {
             return Ok(());
         };
-        let cardinality = byte_bitmap_cardinality(equivalent);
         let leave_final_member = dependencies != 0;
-        if cardinality > best_cardinality
-            || cardinality == best_cardinality
-                && best_leave_final_member
-                && !leave_final_member
-        {
-            best_cardinality = cardinality;
-            best_leave_final_member = leave_final_member;
-            best_candidate = Some((
-                record.source,
-                equivalent,
+        if !try_retain_context_lazy_loop_candidate(
+            &workspace.lazy,
+            &mut best_candidates,
+            ContextLazyLoopSkipCandidate {
+                state: record.source,
+                members: equivalent,
                 start_action,
                 leave_final_member,
-            ));
+            },
+            meter,
+        )? {
+            return Ok(());
         }
         if dependencies != 0 {
             let union = match try_pair_closed_context_loop_union(
@@ -10818,31 +11224,29 @@ fn try_derive_context_lazy_loop_skip(
                 ContextLoopUnionAnalysis::ResourceDeclined => return Ok(()),
             };
             if let Some(union) = union {
-                let cardinality = byte_bitmap_cardinality(union);
-                if cardinality > best_cardinality {
-                    best_cardinality = cardinality;
-                    best_leave_final_member = true;
-                    best_candidate = Some((record.source, union, start_action, true));
+                if !try_retain_context_lazy_loop_candidate(
+                    &workspace.lazy,
+                    &mut best_candidates,
+                    ContextLazyLoopSkipCandidate {
+                        state: record.source,
+                        members: union,
+                        start_action,
+                        leave_final_member: true,
+                    },
+                    meter,
+                )? {
+                    return Ok(());
                 }
             }
         }
     }
 
-    if let Some((state, members, start_action, leave_final_member)) = best_candidate {
-        let publication_work = LazyLoopScanner::build_work(members)
-            .checked_add(1)
-            .ok_or(SearchError::ArithmeticOverflow {
-                computation: "contextual lazy loop scanner publication work",
-            })?;
-        if !meter.try_charge_optional(publication_work, 0) {
-            return Ok(());
-        }
-        workspace.lazy.context_loop_skip_plan = Some(ContextLazyLoopSkipPlan {
-            state,
-            scanner: LazyLoopScanner::new(members),
-            start_action,
-            leave_final_member,
-        });
+    if !try_publish_context_lazy_loop_skip_candidates(
+        &mut workspace.lazy,
+        best_candidates,
+        meter,
+    )? {
+        return Ok(());
     }
     workspace.lazy.context_loop_skip_analyzed_at_candidates = analyzed_candidates;
     workspace.lazy.context_loop_skip_analyzed_at_dependencies =
@@ -17401,6 +17805,82 @@ mod tests {
         .unwrap()
     }
 
+    fn five_equal_context_loop_states() -> Automaton {
+        // Five singleton Consume identities have equal-width self-loops. A
+        // sixth reachable Consume leads to an assertion, selecting contextual
+        // storage without making that assertion a dependency of the five
+        // manually retained loop states.
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Split,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 6, 7, 8, 9, 10, 11, 12, 13, 13],
+                edge_targets: vec![1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5, 7, 8],
+                edge_kinds: vec![
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::AssertLineEndLf,
+                ],
+                byte_starts: vec![0, 0, 0, 0, 0, 0, b'a', b'b', b'c', b'd', b'e', b'q', 0],
+                byte_ends: vec![0, 0, 0, 0, 0, 0, b'a', b'b', b'c', b'd', b'e', b'q', 0],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn alternating_context_loop_states() -> Automaton {
+        // The absolute assertion anchors one exact path. Long `a` and `b`
+        // runs occupy distinct equal-width contextual states, while `x` and
+        // `y` switch between them and `z` accepts from either state.
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 1, 4, 7, 7],
+                edge_targets: vec![1, 1, 2, 3, 2, 1, 3],
+                edge_kinds: vec![
+                    EdgeKind::AssertHaystackStart,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                ],
+                byte_starts: vec![0, b'a', b'x', b'z', b'b', b'y', b'z'],
+                byte_ends: vec![0, b'a', b'x', b'z', b'b', b'y', b'z'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
     fn direct_two_state_inferred_loop() -> Automaton {
         // State zero has an `a` self-loop and enters state one on `x`. State
         // one's `b..=c` edge is one graph equivalence class, while the `q b`
@@ -17740,6 +18220,172 @@ mod tests {
                 (workspace.lazy.item(state, 0).unwrap() == item).then_some(slot)
             })
             .expect("a retained direct loop item has one physical owner slot")
+    }
+
+    fn contextual_equal_loop_cache_workspace(
+        plan: &Automaton,
+        discovery: [u32; 5],
+        published_items: &[u32],
+    ) -> (K0Workspace, [u32; 5]) {
+        let mut workspace =
+            K0Workspace::new_accelerated(plan, WorkspaceLimits::unlimited()).unwrap();
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        let mut states_by_item = [super::LAZY_NO_STATE; 5];
+        for (ordinal, item) in discovery.into_iter().enumerate() {
+            workspace.lazy.scratch[0] = item;
+            workspace.lazy.scratch_len = 1;
+            let state = if ordinal == 0 {
+                workspace.lazy.intern_initial(false, &mut meter, 0).unwrap()
+            } else {
+                match workspace
+                    .lazy
+                    .intern_speculative(false, &mut meter, 0, 0)
+                    .unwrap()
+                {
+                    super::LazyInterned::State(state) => state,
+                    other => panic!("equal contextual loop state was not retained: {other:?}"),
+                }
+            };
+            states_by_item[usize::try_from(item.checked_sub(1).unwrap()).unwrap()] = state;
+        }
+        workspace.lazy.context.hot_initial.dependency_mask = 0;
+        for state in 0..workspace.lazy.state_len {
+            workspace.lazy.context.hot[state].dependency_mask = 0;
+        }
+        workspace.lazy.context_dependencies_analyzed = workspace.lazy.state_len;
+
+        let loop_bytes = [b'a', b'b', b'c', b'd', b'e'];
+        for &item in published_items {
+            let item_index = usize::try_from(item.checked_sub(1).unwrap()).unwrap();
+            let state = states_by_item[item_index];
+            let symbol = super::contextual_symbol_for_byte(plan, loop_bytes[item_index], 0);
+            let (cached, slot) = workspace
+                .lazy
+                .context
+                .lookup(state, symbol, &mut meter, 0)
+                .unwrap();
+            assert!(cached.is_none());
+            workspace
+                .lazy
+                .context
+                .publish(
+                    slot,
+                    ContextTransitionSlot::populated(
+                        state,
+                        symbol,
+                        state.checked_add(1).unwrap()
+                            | super::LazyStartAction::Propagate.cell_bits(),
+                    ),
+                    &mut meter,
+                    0,
+                    0,
+                )
+                .unwrap();
+        }
+        (workspace, states_by_item)
+    }
+
+    fn contextual_loop_cache_signature(
+        workspace: &K0Workspace,
+    ) -> Vec<(u32, super::LazyStartAction, bool, [u64; 4])> {
+        workspace
+            .lazy
+            .context_loop_skip_plans
+            .entries
+            .iter()
+            .flatten()
+            .map(|plan| {
+                (
+                    plan.state,
+                    plan.start_action,
+                    plan.leave_final_member,
+                    plan.scanner.words(),
+                )
+            })
+            .collect()
+    }
+
+    fn contextual_loop_cache_items(workspace: &K0Workspace) -> Vec<u32> {
+        let mut items = workspace
+            .lazy
+            .context_loop_skip_plans
+            .entries
+            .iter()
+            .flatten()
+            .map(|plan| workspace.lazy.item(plan.state, 0).unwrap())
+            .collect::<Vec<_>>();
+        items.sort_unstable();
+        items
+    }
+
+    fn contextual_equal_loop_candidates(
+        states_by_item: [u32; 5],
+        items: [u32; super::CONTEXT_LAZY_LOOP_SKIP_PLAN_CAPACITY],
+    ) -> [Option<super::ContextLazyLoopSkipCandidate>;
+        super::CONTEXT_LAZY_LOOP_SKIP_PLAN_CAPACITY] {
+        let loop_bytes = [b'a', b'b', b'c', b'd', b'e'];
+        let mut candidates = [None; super::CONTEXT_LAZY_LOOP_SKIP_PLAN_CAPACITY];
+        for (slot, item) in items.into_iter().enumerate() {
+            let item_index = usize::try_from(item.checked_sub(1).unwrap()).unwrap();
+            let mut members = [0_u64; 4];
+            super::byte_bitmap_insert(&mut members, loop_bytes[item_index]);
+            candidates[slot] = Some(super::ContextLazyLoopSkipCandidate {
+                state: states_by_item[item_index],
+                members,
+                start_action: super::LazyStartAction::Propagate,
+                leave_final_member: false,
+            });
+        }
+        candidates
+    }
+
+    fn contextual_loop_cache_slot_for_item(workspace: &K0Workspace, item: u32) -> usize {
+        workspace
+            .lazy
+            .context_loop_skip_plans
+            .entries
+            .iter()
+            .enumerate()
+            .find_map(|(slot, plan)| {
+                let state = plan.as_ref()?.state;
+                (workspace.lazy.item(state, 0).unwrap() == item).then_some(slot)
+            })
+            .expect("a retained contextual loop item has one physical owner slot")
+    }
+
+    fn publish_contextual_equal_loop_item(
+        plan: &Automaton,
+        workspace: &mut K0Workspace,
+        states_by_item: [u32; 5],
+        item: u32,
+    ) {
+        let loop_bytes = [b'a', b'b', b'c', b'd', b'e'];
+        let item_index = usize::try_from(item.checked_sub(1).unwrap()).unwrap();
+        let state = states_by_item[item_index];
+        let symbol = super::contextual_symbol_for_byte(plan, loop_bytes[item_index], 0);
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        let (cached, slot) = workspace
+            .lazy
+            .context
+            .lookup(state, symbol, &mut meter, 0)
+            .unwrap();
+        assert!(cached.is_none());
+        workspace
+            .lazy
+            .context
+            .publish(
+                slot,
+                ContextTransitionSlot::populated(
+                    state,
+                    symbol,
+                    state.checked_add(1).unwrap()
+                        | super::LazyStartAction::Propagate.cell_bits(),
+                ),
+                &mut meter,
+                0,
+                0,
+            )
+            .unwrap();
     }
 
     fn direct_two_state_loop_workspace(plan: &Automaton) -> K0Workspace {
@@ -20121,7 +20767,7 @@ mod tests {
                 K0Workspace::new_accelerated(plan, WorkspaceLimits::unlimited()).unwrap();
             let mut meter = WorkMeter::new(limit, 0);
             let mut adaptive_probe = super::AdaptiveStartProbe::default();
-            let result = super::execute_context_lazy_loop(
+            let result = super::execute_context_lazy_loop::<false>(
                 plan,
                 haystack,
                 window,
@@ -20134,7 +20780,6 @@ mod tests {
                 None,
                 force_haystack_start,
                 false,
-                None,
                 &mut adaptive_probe,
             );
             (result, meter.consumed, workspace.lazy.initialized)
@@ -20390,7 +21035,7 @@ mod tests {
         let run = |workspace: &mut K0Workspace, haystack: &[u8]| {
             let mut meter = WorkMeter::new(u64::MAX, 0);
             let mut adaptive_probe = super::AdaptiveStartProbe::default();
-            let result = super::execute_context_lazy_loop(
+            let result = super::execute_context_lazy_loop::<false>(
                 &plan,
                 haystack,
                 SearchWindow::full(haystack),
@@ -20403,7 +21048,6 @@ mod tests {
                 None,
                 false,
                 false,
-                None,
                 &mut adaptive_probe,
             )
             .unwrap()
@@ -20450,7 +21094,7 @@ mod tests {
             K0Workspace::new_accelerated(&no_scanner, WorkspaceLimits::unlimited()).unwrap();
         let mut no_scanner_meter = WorkMeter::new(u64::MAX, 0);
         let mut no_scanner_probe = super::AdaptiveStartProbe::default();
-        let empty = super::execute_context_lazy_loop(
+        let empty = super::execute_context_lazy_loop::<false>(
             &no_scanner,
             b"",
             SearchWindow::new(0, 0),
@@ -20463,7 +21107,6 @@ mod tests {
             None,
             false,
             false,
-            None,
             &mut no_scanner_probe,
         )
         .unwrap();
@@ -20575,7 +21218,7 @@ mod tests {
             K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
         let mut clipped_meter = WorkMeter::new(u64::MAX, 0);
         let mut clipped_probe = super::AdaptiveStartProbe::default();
-        let clipped_result = super::execute_context_lazy_loop(
+        let clipped_result = super::execute_context_lazy_loop::<false>(
             &plan,
             haystack,
             SearchWindow::new(2, 3),
@@ -20588,7 +21231,6 @@ mod tests {
             None,
             false,
             false,
-            None,
             &mut clipped_probe,
         )
         .unwrap();
@@ -26366,6 +27008,215 @@ mod tests {
     }
 
     #[test]
+    fn contextual_loop_cache_retains_canonical_distinct_states_and_exact_bitmap() {
+        let plan = five_equal_context_loop_states();
+        let discoveries = [[1, 2, 3, 4, 5], [5, 4, 3, 2, 1]];
+        for discovery in discoveries {
+            let (mut workspace, states_by_item) =
+                contextual_equal_loop_cache_workspace(&plan, discovery, &[1, 2, 3, 4, 5]);
+            let slots = workspace.lazy.context.slots.clone();
+            let published = workspace.lazy.context.published;
+            let mut derive = WorkMeter::new(u64::MAX, 0);
+            super::try_derive_context_lazy_loop_skip(&plan, &mut workspace, &mut derive)
+                .unwrap();
+
+            assert_eq!(workspace.lazy.context_loop_skip_plans.len(), 4);
+            assert_eq!(contextual_loop_cache_items(&workspace), [1, 2, 3, 4]);
+            assert_eq!(workspace.lazy.context.slots, slots);
+            assert_eq!(workspace.lazy.context.published, published);
+            assert_eq!(
+                super::byte_bitmap_cardinality(
+                    workspace.lazy.context_loop_skip_plans.state_members,
+                ),
+                4
+            );
+            for (item_index, state) in states_by_item.into_iter().enumerate() {
+                let expected = item_index < 4;
+                assert_eq!(
+                    workspace.lazy.context_loop_skip_plans.find(state).is_some(),
+                    expected,
+                    "graph item {}",
+                    item_index + 1
+                );
+                assert_eq!(
+                    super::byte_bitmap_contains(
+                        workspace.lazy.context_loop_skip_plans.state_members,
+                        u8::try_from(state).unwrap(),
+                    ),
+                    expected,
+                    "bitmap graph item {}",
+                    item_index + 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn contextual_loop_cache_publication_is_stable_exact_and_failure_atomic() {
+        let plan = five_equal_context_loop_states();
+        let prepare = || {
+            let (mut workspace, states_by_item) = contextual_equal_loop_cache_workspace(
+                &plan,
+                [5, 4, 3, 2, 1],
+                &[2, 3, 4, 5],
+            );
+            let mut derive = WorkMeter::new(u64::MAX, 0);
+            super::try_derive_context_lazy_loop_skip(&plan, &mut workspace, &mut derive)
+                .unwrap();
+            assert_eq!(contextual_loop_cache_items(&workspace), [2, 3, 4, 5]);
+            (workspace, states_by_item)
+        };
+
+        let (mut unchanged, unchanged_states) = prepare();
+        let candidates = contextual_equal_loop_candidates(unchanged_states, [2, 3, 4, 5]);
+        let signature = contextual_loop_cache_signature(&unchanged);
+        let bitmap = unchanged.lazy.context_loop_skip_plans.state_members;
+        let slots = unchanged.lazy.context.slots.clone();
+        let mut exact_zero = WorkMeter::new(0, 0);
+        assert!(super::try_publish_context_lazy_loop_skip_candidates(
+            &mut unchanged.lazy,
+            candidates,
+            &mut exact_zero,
+        )
+        .unwrap());
+        assert_eq!(exact_zero.consumed, 0);
+        assert_eq!(contextual_loop_cache_signature(&unchanged), signature);
+        assert_eq!(unchanged.lazy.context_loop_skip_plans.state_members, bitmap);
+        assert_eq!(unchanged.lazy.context.slots, slots);
+
+        let expected_work = u64::try_from(super::ASCII_RUN_SCANNER_BUILD_WORK)
+            .unwrap()
+            .checked_add(super::CONTEXT_LAZY_LOOP_SKIP_OWNER_PUBLICATION_WORK)
+            .unwrap()
+            .checked_add(super::CONTEXT_LAZY_LOOP_SKIP_BITMAP_PUBLICATION_WORK)
+            .unwrap();
+        let (mut refused, refused_states) = prepare();
+        let candidates = contextual_equal_loop_candidates(refused_states, [1, 2, 3, 4]);
+        let signature = contextual_loop_cache_signature(&refused);
+        let bitmap = refused.lazy.context_loop_skip_plans.state_members;
+        let slots = refused.lazy.context.slots.clone();
+        let mut one_below = WorkMeter::new(expected_work.checked_sub(1).unwrap(), 0);
+        assert!(!super::try_publish_context_lazy_loop_skip_candidates(
+            &mut refused.lazy,
+            candidates,
+            &mut one_below,
+        )
+        .unwrap());
+        assert_eq!(one_below.consumed, 0);
+        assert_eq!(contextual_loop_cache_signature(&refused), signature);
+        assert_eq!(refused.lazy.context_loop_skip_plans.state_members, bitmap);
+        assert_eq!(refused.lazy.context.slots, slots);
+
+        let (mut exact, exact_states) = prepare();
+        let reused_slots =
+            [2, 3, 4].map(|item| contextual_loop_cache_slot_for_item(&exact, item));
+        let evicted_slot = contextual_loop_cache_slot_for_item(&exact, 5);
+        let candidates = contextual_equal_loop_candidates(exact_states, [1, 2, 3, 4]);
+        let mut exact_meter = WorkMeter::new(expected_work, 0);
+        assert!(super::try_publish_context_lazy_loop_skip_candidates(
+            &mut exact.lazy,
+            candidates,
+            &mut exact_meter,
+        )
+        .unwrap());
+        assert_eq!(exact_meter.consumed, expected_work);
+        assert_eq!(contextual_loop_cache_items(&exact), [1, 2, 3, 4]);
+        assert_eq!(
+            [2, 3, 4].map(|item| contextual_loop_cache_slot_for_item(&exact, item)),
+            reused_slots
+        );
+        assert_eq!(contextual_loop_cache_slot_for_item(&exact, 1), evicted_slot);
+    }
+
+    #[test]
+    fn contextual_loop_candidate_reducer_is_distinct_widest_and_canonical() {
+        let plan = five_equal_context_loop_states();
+        let (workspace, states_by_item) = contextual_equal_loop_cache_workspace(
+            &plan,
+            [5, 4, 3, 2, 1],
+            &[],
+        );
+        let mut retained = [None; super::CONTEXT_LAZY_LOOP_SKIP_PLAN_CAPACITY];
+        let mut ranking = WorkMeter::new(u64::MAX, 0);
+        let ranked_members = [1_u64, 3, 7, 15, 31];
+        for (item_index, state) in states_by_item.into_iter().enumerate() {
+            assert!(super::try_retain_context_lazy_loop_candidate(
+                &workspace.lazy,
+                &mut retained,
+                super::ContextLazyLoopSkipCandidate {
+                    state,
+                    members: [ranked_members[item_index], 0, 0, 0],
+                    start_action: super::LazyStartAction::Drop,
+                    leave_final_member: true,
+                },
+                &mut ranking,
+            )
+            .unwrap());
+        }
+        let ranked = retained
+            .into_iter()
+            .flatten()
+            .map(|candidate| workspace.lazy.item(candidate.state, 0).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ranked, [5, 4, 3, 2]);
+
+        let state = states_by_item[0];
+        let mut equal = [None; super::CONTEXT_LAZY_LOOP_SKIP_PLAN_CAPACITY];
+        for (leave_final_member, start_action) in [
+            (true, super::LazyStartAction::Drop),
+            (false, super::LazyStartAction::Drop),
+            (false, super::LazyStartAction::Propagate),
+        ] {
+            assert!(super::try_retain_context_lazy_loop_candidate(
+                &workspace.lazy,
+                &mut equal,
+                super::ContextLazyLoopSkipCandidate {
+                    state,
+                    members: [3, 0, 0, 0],
+                    start_action,
+                    leave_final_member,
+                },
+                &mut ranking,
+            )
+            .unwrap());
+        }
+        assert_eq!(equal.into_iter().flatten().count(), 1);
+        assert!(!equal[0].unwrap().leave_final_member);
+        assert_eq!(
+            equal[0].unwrap().start_action,
+            super::LazyStartAction::Propagate
+        );
+    }
+
+    #[test]
+    fn contextual_loop_cache_reanalyzes_new_epoch_after_saturation() {
+        let plan = five_equal_context_loop_states();
+        let (mut workspace, states_by_item) = contextual_equal_loop_cache_workspace(
+            &plan,
+            [5, 4, 3, 2, 1],
+            &[2, 3, 4, 5],
+        );
+        let mut initial = WorkMeter::new(u64::MAX, 0);
+        super::try_derive_context_lazy_loop_skip(&plan, &mut workspace, &mut initial).unwrap();
+        assert_eq!(contextual_loop_cache_items(&workspace), [2, 3, 4, 5]);
+        workspace.lazy.saturated = true;
+
+        publish_contextual_equal_loop_item(&plan, &mut workspace, states_by_item, 1);
+        assert_ne!(
+            workspace.lazy.context_loop_skip_analyzed_at_candidates,
+            workspace.lazy.context.loop_candidates_published
+        );
+        let mut upgrade = WorkMeter::new(u64::MAX, 0);
+        super::try_derive_context_lazy_loop_skip(&plan, &mut workspace, &mut upgrade).unwrap();
+        assert_eq!(contextual_loop_cache_items(&workspace), [1, 2, 3, 4]);
+        assert_eq!(
+            workspace.lazy.context_loop_skip_analyzed_at_candidates,
+            workspace.lazy.context.loop_candidates_published
+        );
+        assert!(workspace.lazy.saturated);
+    }
+
+    #[test]
     fn direct_loop_cache_initial_publication_has_exact_whole_cache_work_boundary() {
         let plan = five_equal_direct_loop_states();
         let prepare = || {
@@ -26758,6 +27609,239 @@ mod tests {
     }
 
     #[test]
+    fn contextual_multi_loop_cache_covers_alternating_states_and_all_contracts() {
+        let plan = alternating_context_loop_states();
+        let run_len = super::LAZY_LOOP_SKIP_MIN_BYTES * 2;
+        let mut haystack = vec![b'!'; super::WARM_CONTEXT_MIN_WINDOW_BYTES];
+        haystack[..run_len].fill(b'a');
+        haystack[run_len] = b'x';
+        haystack[run_len + 1..run_len * 2 + 1].fill(b'b');
+        haystack[run_len * 2 + 1] = b'y';
+        haystack[run_len * 2 + 2..run_len * 3 + 2].fill(b'a');
+        let match_end = run_len * 3 + 3;
+        haystack[match_end - 1] = b'z';
+        let window = SearchWindow::full(&haystack);
+        let mut workspace =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+
+        assert_eq!(
+            plan.prepare::<Span>()
+                .search_window_with_workspace(
+                    &haystack,
+                    window,
+                    &mut workspace,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output(),
+            Some(MatchSpan::new(0, match_end))
+        );
+        assert_eq!(workspace.lazy.context_loop_skip_plans.len(), 2);
+        let a_plan = workspace
+            .lazy
+            .context_loop_skip_plans
+            .entries
+            .iter()
+            .enumerate()
+            .find_map(|(slot, plan)| {
+                let plan = plan.as_ref()?;
+                plan.scanner.contains(b'a').then_some((slot, plan.state))
+            })
+            .expect("the first alternating state must retain its scanner");
+        let b_plan = workspace
+            .lazy
+            .context_loop_skip_plans
+            .entries
+            .iter()
+            .enumerate()
+            .find_map(|(slot, plan)| {
+                let plan = plan.as_ref()?;
+                plan.scanner.contains(b'b').then_some((slot, plan.state))
+            })
+            .expect("the second alternating state must retain its scanner");
+        assert_ne!(a_plan.0, b_plan.0);
+        assert_ne!(a_plan.1, b_plan.1);
+        assert!(workspace
+            .lazy
+            .context_loop_skip_plans
+            .find_with_hint(a_plan.1, Some(b_plan.0))
+            .is_some_and(|(slot, _)| slot == a_plan.0));
+        assert!(workspace
+            .lazy
+            .context_loop_skip_plans
+            .find_with_hint(b_plan.1, Some(a_plan.0))
+            .is_some_and(|(slot, _)| slot == b_plan.0));
+
+        assert!(plan
+            .prepare::<Exists>()
+            .search_window_with_workspace(
+                &haystack,
+                window,
+                &mut workspace,
+                SearchLimits::unlimited(),
+            )
+            .unwrap()
+            .into_output());
+        assert_eq!(
+            plan.prepare::<EarliestEnd>()
+                .search_window_with_workspace(
+                    &haystack,
+                    window,
+                    &mut workspace,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output(),
+            Some(match_end)
+        );
+        assert_eq!(
+            plan.prepare::<SelectedEnd>()
+                .search_window_with_workspace(
+                    &haystack,
+                    window,
+                    &mut workspace,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output(),
+            Some(match_end)
+        );
+        assert_eq!(
+            plan.prepare::<Span>()
+                .search_window_with_workspace(
+                    &haystack,
+                    window,
+                    &mut workspace,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output(),
+            Some(MatchSpan::new(0, match_end))
+        );
+    }
+
+    #[test]
+    fn contextual_multi_loop_cache_is_read_only_across_same_address_mutation() {
+        let plan = alternating_context_loop_states();
+        let run_len = super::LAZY_LOOP_SKIP_MIN_BYTES * 2;
+        let mut haystack = vec![b'!'; super::WARM_CONTEXT_MIN_WINDOW_BYTES];
+        haystack[..run_len].fill(b'a');
+        haystack[run_len] = b'x';
+        haystack[run_len + 1..run_len * 2 + 1].fill(b'b');
+        haystack[run_len * 2 + 1] = b'y';
+        haystack[run_len * 2 + 2..run_len * 3 + 2].fill(b'a');
+        let match_end = run_len * 3 + 3;
+        haystack[match_end - 1] = b'z';
+        let address = haystack.as_ptr();
+        let window = SearchWindow::full(&haystack);
+        let mut session =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+
+        assert!(session
+            .search_window::<Exists>(&haystack, window, SearchLimits::unlimited())
+            .unwrap()
+            .into_output());
+        assert_eq!(session.workspace.lazy.context_loop_skip_plans.len(), 2);
+        let signature = contextual_loop_cache_signature(&session.workspace);
+        let slots = session.workspace.lazy.context.slots.clone();
+        let hot = session.workspace.lazy.context.hot.clone();
+        let published = session.workspace.lazy.context.published;
+        assert!(session
+            .search_exists_value(&haystack, window, SearchLimits::unlimited())
+            .unwrap());
+        assert_eq!(contextual_loop_cache_signature(&session.workspace), signature);
+        assert_eq!(session.workspace.lazy.context.slots, slots);
+        assert_eq!(session.workspace.lazy.context.hot, hot);
+        assert_eq!(session.workspace.lazy.context.published, published);
+
+        // Mutate lengths and contents in place while staying within the exact
+        // boundary categories already published above. Starting with `x`
+        // would introduce a new haystack-start assertion key and correctly
+        // require ordinary publication, which is not a read-only-cache case.
+        let changed_x = run_len / 2;
+        let changed_y = changed_x + 1 + run_len / 2;
+        haystack[..match_end].fill(b'a');
+        haystack[changed_x] = b'x';
+        haystack[changed_x + 1..changed_y].fill(b'b');
+        haystack[changed_y] = b'y';
+        haystack[match_end - 1] = b'z';
+        assert_eq!(haystack.as_ptr(), address);
+        assert!(session
+            .search_exists_value(&haystack, window, SearchLimits::unlimited())
+            .unwrap());
+        assert_eq!(contextual_loop_cache_signature(&session.workspace), signature);
+        assert_eq!(session.workspace.lazy.context.slots, slots);
+        assert_eq!(session.workspace.lazy.context.hot, hot);
+        assert_eq!(session.workspace.lazy.context.published, published);
+    }
+
+    #[test]
+    fn contextual_multi_loop_cache_is_bound_to_one_immutable_automaton() {
+        let first = alternating_context_loop_states();
+        let second = alternating_context_loop_states();
+        assert_eq!(first.workspace_layout(), second.workspace_layout());
+        let run_len = super::LAZY_LOOP_SKIP_MIN_BYTES * 2;
+        let mut haystack = vec![b'a'; run_len * 2 + 2];
+        haystack[run_len] = b'x';
+        haystack[run_len + 1..run_len * 2 + 1].fill(b'b');
+        haystack[run_len * 2 + 1] = b'z';
+        let match_end = haystack.len();
+        let mut workspace =
+            K0Workspace::new_bidirectional(&first, WorkspaceLimits::unlimited()).unwrap();
+        assert_eq!(
+            first
+                .prepare::<Span>()
+                .search_with_workspace(
+                    &haystack,
+                    &mut workspace,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output(),
+            Some(MatchSpan::new(0, match_end))
+        );
+        assert_eq!(workspace.lazy.context_loop_skip_plans.len(), 2);
+        assert!(workspace.lazy.is_bound_to(&first));
+        assert!(!workspace.lazy.is_bound_to(&second));
+
+        let signature = contextual_loop_cache_signature(&workspace);
+        let slots = workspace.lazy.context.slots.clone();
+        let candidates_epoch = workspace.lazy.context_loop_skip_analyzed_at_candidates;
+        let dependencies_epoch = workspace.lazy.context_loop_skip_analyzed_at_dependencies;
+        let mut derive = WorkMeter::new(u64::MAX, 0);
+        super::try_derive_context_lazy_loop_skip(&second, &mut workspace, &mut derive).unwrap();
+        assert_eq!(derive.consumed, 0);
+        assert_eq!(contextual_loop_cache_signature(&workspace), signature);
+        assert_eq!(workspace.lazy.context.slots, slots);
+        assert_eq!(
+            workspace.lazy.context_loop_skip_analyzed_at_candidates,
+            candidates_epoch
+        );
+        assert_eq!(
+            workspace.lazy.context_loop_skip_analyzed_at_dependencies,
+            dependencies_epoch
+        );
+
+        assert_eq!(
+            second
+                .prepare::<SelectedEnd>()
+                .search_with_workspace(
+                    &haystack,
+                    &mut workspace,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output(),
+            Some(match_end)
+        );
+        assert_eq!(contextual_loop_cache_signature(&workspace), signature);
+        assert_eq!(workspace.lazy.context.slots, slots);
+        assert!(workspace.lazy.is_bound_to(&first));
+        assert!(!workspace.lazy.is_bound_to(&second));
+    }
+
+    #[test]
     fn direct_loop_plan_upgrades_transactionally_to_disjoint_high_members() {
         let plan = disjoint_ascii_and_high_loop_classes();
         let cell = super::direct_row_encoded_state(0).unwrap()
@@ -27037,7 +28121,7 @@ mod tests {
         workspace.lazy.context_dependencies_analyzed = 1;
         let mut derive = WorkMeter::new(u64::MAX, 0);
         super::try_derive_context_lazy_loop_skip(&plan, &mut workspace, &mut derive).unwrap();
-        let retained = workspace.lazy.context_loop_skip_plan.unwrap();
+        let retained = workspace.lazy.context_loop_skip_plans.first().unwrap();
         assert_eq!(retained.state, 0);
         assert!(retained.scanner.contains(b'a'));
     }
@@ -27053,7 +28137,8 @@ mod tests {
         super::try_derive_context_lazy_loop_skip(&ascii, &mut workspace, &mut derive).unwrap();
         let retained = workspace
             .lazy
-            .context_loop_skip_plan
+            .context_loop_skip_plans
+            .first()
             .expect("an ASCII-word nonword high-byte interior must retain a scanner");
         assert!(retained.leave_final_member);
         assert_eq!(retained.scanner.cardinality(), 128);
@@ -27085,7 +28170,7 @@ mod tests {
             &mut decline,
         )
         .unwrap();
-        assert!(unicode_workspace.lazy.context_loop_skip_plan.is_none());
+        assert!(unicode_workspace.lazy.context_loop_skip_plans.is_empty());
         assert_eq!(
             unicode_workspace.lazy.context_loop_skip_analyzed_at_candidates,
             unicode_workspace.lazy.context.loop_candidates_published
@@ -27111,7 +28196,8 @@ mod tests {
             assert_eq!(first.into_output(), expected, "terminal={terminal}");
             let retained = workspace
                 .lazy
-                .context_loop_skip_plan
+                .context_loop_skip_plans
+                .first()
                 .expect("a completed large Span must analyze its exact loop epoch");
             assert_eq!(workspace.lazy.modes[usize::try_from(retained.state).unwrap()], 0);
             assert_eq!(
@@ -27432,7 +28518,8 @@ mod tests {
         super::try_derive_context_lazy_loop_skip(&plan, &mut workspace, &mut derive).unwrap();
         let retained = workspace
             .lazy
-            .context_loop_skip_plan
+            .context_loop_skip_plans
+            .first()
             .expect("the bounded slot walk must retain the earlier interior witness");
         assert_eq!(retained.state, 0);
         assert_eq!(retained.start_action, super::LazyStartAction::Propagate);
@@ -27449,7 +28536,7 @@ mod tests {
         let hot = refused.lazy.context.hot.clone();
         let mut one_below = WorkMeter::new(analysis_work.checked_sub(1).unwrap(), 0);
         super::try_derive_context_lazy_loop_skip(&plan, &mut refused, &mut one_below).unwrap();
-        assert!(refused.lazy.context_loop_skip_plan.is_none());
+        assert!(refused.lazy.context_loop_skip_plans.is_empty());
         assert_ne!(
             refused.lazy.context_loop_skip_analyzed_at_candidates,
             refused.lazy.context.loop_candidates_published
@@ -27459,7 +28546,7 @@ mod tests {
 
         let mut retry = WorkMeter::new(analysis_work, 0);
         super::try_derive_context_lazy_loop_skip(&plan, &mut refused, &mut retry).unwrap();
-        assert!(refused.lazy.context_loop_skip_plan.is_some());
+        assert!(!refused.lazy.context_loop_skip_plans.is_empty());
         assert_eq!(retry.consumed, analysis_work);
     }
 
@@ -27470,7 +28557,7 @@ mod tests {
         mixed.lazy.context.slots[0] = ContextTransitionSlot::EMPTY;
         let mut meter = WorkMeter::new(u64::MAX, 0);
         super::try_derive_context_lazy_loop_skip(&plan, &mut mixed, &mut meter).unwrap();
-        assert!(mixed.lazy.context_loop_skip_plan.is_none());
+        assert!(mixed.lazy.context_loop_skip_plans.is_empty());
 
         let mut reset = contextual_word_loop_workspace(&plan);
         for slot in &mut reset.lazy.context.slots {
@@ -27480,7 +28567,7 @@ mod tests {
         }
         let mut meter = WorkMeter::new(u64::MAX, 0);
         super::try_derive_context_lazy_loop_skip(&plan, &mut reset, &mut meter).unwrap();
-        assert!(reset.lazy.context_loop_skip_plan.is_none());
+        assert!(reset.lazy.context_loop_skip_plans.is_empty());
     }
 
     #[test]
@@ -27496,7 +28583,8 @@ mod tests {
         .unwrap();
         let loop_plan = unicode_workspace
             .lazy
-            .context_loop_skip_plan
+            .context_loop_skip_plans
+            .first()
             .expect("ASCII Unicode-word interiors must retain a loop scanner");
         assert_eq!(loop_plan.state, 0);
         assert_eq!(loop_plan.start_action, super::LazyStartAction::Propagate);
@@ -27515,7 +28603,7 @@ mod tests {
         let hot = refused.lazy.context.hot.clone();
         let mut one_below = WorkMeter::new(analysis_work.checked_sub(1).unwrap(), 0);
         super::try_derive_context_lazy_loop_skip(&unicode, &mut refused, &mut one_below).unwrap();
-        assert!(refused.lazy.context_loop_skip_plan.is_none());
+        assert!(refused.lazy.context_loop_skip_plans.is_empty());
         assert_ne!(
             refused.lazy.context_loop_skip_analyzed_at_candidates,
             refused.lazy.context.loop_candidates_published
@@ -27525,7 +28613,7 @@ mod tests {
 
         let mut retry = WorkMeter::new(analysis_work, 0);
         super::try_derive_context_lazy_loop_skip(&unicode, &mut refused, &mut retry).unwrap();
-        assert!(refused.lazy.context_loop_skip_plan.is_some());
+        assert!(!refused.lazy.context_loop_skip_plans.is_empty());
         assert_eq!(retry.consumed, analysis_work);
     }
 
@@ -27546,16 +28634,17 @@ mod tests {
         assert_eq!(learned.output(), &Some(MatchSpan::new(0, run_len + 1)));
         let loop_plan = workspace
             .lazy
-            .context_loop_skip_plan
+            .context_loop_skip_plans
+            .first()
             .expect("the warmed ASCII Unicode-word loop must retain a scanner");
         assert!(loop_plan.leave_final_member);
         assert!(loop_plan.scanner.contains(b'a'));
         assert!(!loop_plan.scanner.contains(b'!'));
 
-        let mut run = |loop_skip| {
+        let (skipped, skipped_work) = {
             let mut meter = WorkMeter::new(u64::MAX, 0);
             let mut adaptive = super::AdaptiveStartProbe::default();
-            let result = super::execute_context_lazy_loop(
+            let result = super::execute_context_lazy_loop::<true>(
                 &plan,
                 &haystack,
                 SearchWindow::full(&haystack),
@@ -27568,21 +28657,39 @@ mod tests {
                 None,
                 false,
                 false,
-                loop_skip,
                 &mut adaptive,
             )
             .unwrap()
             .unwrap();
             (result, meter.consumed)
         };
-        let (skipped, skipped_work) = run(Some(loop_plan));
-        let (scalar, scalar_work) = run(None);
+        let (scalar, scalar_work) = {
+            let mut meter = WorkMeter::new(u64::MAX, 0);
+            let mut adaptive = super::AdaptiveStartProbe::default();
+            let result = super::execute_context_lazy_loop::<false>(
+                &plan,
+                &haystack,
+                SearchWindow::full(&haystack),
+                &mut workspace,
+                &mut meter,
+                OutputContract::Span,
+                0,
+                None,
+                None,
+                None,
+                false,
+                false,
+                &mut adaptive,
+            )
+            .unwrap()
+            .unwrap();
+            (result, meter.consumed)
+        };
         assert_eq!(skipped.0, scalar.0);
         assert!(
             skipped_work < scalar_work,
             "the retained plan must execute the long interior through its run scanner"
         );
-        drop(run);
 
         let suffixes = [
             [b'z', b'!', b'!', b'!'],
@@ -27671,7 +28778,8 @@ mod tests {
         assert_eq!(first.into_output(), Some(MatchSpan::new(0, 2)));
         let loop_plan = workspace
             .lazy
-            .context_loop_skip_plan
+            .context_loop_skip_plans
+            .first()
             .expect("the assertion-free pending suffix must retain a contextual scanner");
         assert_eq!(
             workspace.lazy.context.hot_initial.dependency_mask,
@@ -27760,7 +28868,8 @@ mod tests {
         );
         let asserted_loop = asserted_workspace
             .lazy
-            .context_loop_skip_plan
+            .context_loop_skip_plans
+            .first()
             .expect("a context-stable interior must retain a loop scanner");
         assert!(asserted_loop.leave_final_member);
         assert!(asserted_loop.scanner.contains(b'b'));
@@ -27939,7 +29048,7 @@ mod tests {
 
         let mut meter = WorkMeter::new(u64::MAX, 0);
         let mut adaptive = super::AdaptiveStartProbe::default();
-        let learned = super::execute_context_lazy_loop(
+        let learned = super::execute_context_lazy_loop::<false>(
             &plan,
             &haystack,
             window,
@@ -27952,7 +29061,6 @@ mod tests {
             None,
             false,
             false,
-            None,
             &mut adaptive,
         )
         .unwrap()
@@ -27963,7 +29071,8 @@ mod tests {
         super::try_derive_context_lazy_loop_skip(&plan, &mut workspace, &mut meter).unwrap();
         let loop_plan = workspace
             .lazy
-            .context_loop_skip_plan
+            .context_loop_skip_plans
+            .first()
             .expect("the Unicode-dependent nonpending Drop self-loop must retain a scanner");
         assert_eq!(loop_plan.start_action, super::LazyStartAction::Drop);
         assert!(loop_plan.leave_final_member);
@@ -27981,7 +29090,7 @@ mod tests {
 
         let mut meter = WorkMeter::new(u64::MAX, 0);
         let mut adaptive = super::AdaptiveStartProbe::default();
-        let skipped = super::execute_context_lazy_loop(
+        let skipped = super::execute_context_lazy_loop::<true>(
             &plan,
             &haystack,
             window,
@@ -27994,7 +29103,6 @@ mod tests {
             None,
             false,
             false,
-            Some(loop_plan),
             &mut adaptive,
         )
         .unwrap()
@@ -28873,7 +29981,8 @@ mod tests {
         super::try_derive_context_lazy_loop_skip(&plan, &mut workspace, &mut meter).unwrap();
         let retained = workspace
             .lazy
-            .context_loop_skip_plan
+            .context_loop_skip_plans
+            .first()
             .expect("the class must be decoded through its word-category member");
         assert!(retained.scanner.contains(b'a'));
         assert!(retained.scanner.contains(b'_'));
@@ -28901,7 +30010,8 @@ mod tests {
             super::try_derive_context_lazy_loop_skip(&plan, &mut workspace, &mut meter).unwrap();
             let retained = workspace
                 .lazy
-                .context_loop_skip_plan
+                .context_loop_skip_plans
+                .first()
                 .expect("the complete ordered-pair matrix must retain its union");
             assert_eq!(retained.start_action, action);
             assert!(retained.leave_final_member);
@@ -28952,7 +30062,8 @@ mod tests {
         super::try_derive_context_lazy_loop_skip(&plan, &mut workspace, &mut meter).unwrap();
         let retained = workspace
             .lazy
-            .context_loop_skip_plan
+            .context_loop_skip_plans
+            .first()
             .expect("a complete diagonal category still retains the original narrow proof");
         assert_eq!(retained.scanner.cardinality(), 193);
         assert!(retained.scanner.contains(b'!'));
@@ -28997,7 +30108,8 @@ mod tests {
         super::try_derive_context_lazy_loop_skip(&plan, &mut workspace, &mut meter).unwrap();
         let retained = workspace
             .lazy
-            .context_loop_skip_plan
+            .context_loop_skip_plans
+            .first()
             .expect("the unchanged nonword diagonal still retains a narrow proof");
         assert_eq!(retained.start_action, super::LazyStartAction::Propagate);
         assert_eq!(retained.scanner.cardinality(), 193);
@@ -29021,7 +30133,8 @@ mod tests {
         super::try_derive_context_lazy_loop_skip(&plan, &mut workspace, &mut meter).unwrap();
         let retained = workspace
             .lazy
-            .context_loop_skip_plan
+            .context_loop_skip_plans
+            .first()
             .expect("all four line-context products must form one pair-closed union");
         assert!(retained.leave_final_member);
         assert_eq!(retained.scanner.cardinality(), 256);
@@ -29060,7 +30173,8 @@ mod tests {
         super::try_derive_context_lazy_loop_skip(&plan, &mut workspace, &mut meter).unwrap();
         let retained = workspace
             .lazy
-            .context_loop_skip_plan
+            .context_loop_skip_plans
+            .first()
             .expect("the complete five-atom matrix must retain one union");
         assert!(retained.leave_final_member);
         assert_eq!(retained.scanner.cardinality(), 256);
@@ -29082,7 +30196,8 @@ mod tests {
         super::try_derive_context_lazy_loop_skip(&plan, &mut workspace, &mut meter).unwrap();
         let retained = workspace
             .lazy
-            .context_loop_skip_plan
+            .context_loop_skip_plans
+            .first()
             .expect("complete ASCII Unicode-word products must form a union");
         assert!(retained.leave_final_member);
         assert_eq!(retained.scanner.cardinality(), 128);
@@ -29114,7 +30229,8 @@ mod tests {
         assert_eq!(
             measured
                 .lazy
-                .context_loop_skip_plan
+                .context_loop_skip_plans
+                .first()
                 .unwrap()
                 .scanner
                 .cardinality(),
@@ -29132,7 +30248,7 @@ mod tests {
         super::try_derive_context_lazy_loop_skip(&plan, &mut refused, &mut one_below).unwrap();
         assert!(one_below.consumed <= one_below_limit);
         assert!(one_below.consumed < exact_work);
-        assert!(refused.lazy.context_loop_skip_plan.is_none());
+        assert!(refused.lazy.context_loop_skip_plans.is_empty());
         assert_eq!(
             refused.lazy.context_loop_skip_analyzed_at_candidates,
             candidates_epoch
@@ -29151,7 +30267,8 @@ mod tests {
         assert_eq!(
             refused
                 .lazy
-                .context_loop_skip_plan
+                .context_loop_skip_plans
+                .first()
                 .unwrap()
                 .scanner
                 .cardinality(),
@@ -29188,7 +30305,8 @@ mod tests {
         assert_eq!(first, Some(MatchSpan::new(0, source.len())));
         let retained = workspace
             .lazy
-            .context_loop_skip_plan
+            .context_loop_skip_plans
+            .first()
             .expect("the training matrix must retain its all-nonterminal union");
         assert!(retained.leave_final_member);
         assert_eq!(retained.scanner.cardinality(), 255);
@@ -29217,7 +30335,8 @@ mod tests {
         assert_eq!(
             workspace
                 .lazy
-                .context_loop_skip_plan
+                .context_loop_skip_plans
+                .first()
                 .unwrap()
                 .scanner
                 .cardinality(),
@@ -32140,7 +33259,7 @@ mod tests {
             session.workspace.lazy.context.hot_initial.dependency_mask,
             EdgeKind::AssertLineStartLf.assertion_bit().unwrap()
         );
-        assert!(session.workspace.lazy.context_loop_skip_plan.is_none());
+        assert!(session.workspace.lazy.context_loop_skip_plans.is_empty());
     }
 
     #[test]
@@ -32167,7 +33286,8 @@ mod tests {
         let loop_plan = session
             .workspace
             .lazy
-            .context_loop_skip_plan
+            .context_loop_skip_plans
+            .first()
             .expect("an assertion-independent contextual loop must retain a scanner");
         assert_eq!(loop_plan.start_action, super::LazyStartAction::Propagate);
         assert!(!loop_plan.leave_final_member);
@@ -32492,7 +33612,8 @@ mod tests {
             let loop_plan = session
                 .workspace
                 .lazy
-                .context_loop_skip_plan
+                .context_loop_skip_plans
+                .first()
                 .expect("the contextual category must retain its interior loop proof");
             assert_eq!(loop_plan.start_action, expected_action);
             assert!(loop_plan.leave_final_member);
@@ -32627,7 +33748,8 @@ mod tests {
         let loop_plan = session
             .workspace
             .lazy
-            .context_loop_skip_plan
+            .context_loop_skip_plans
+            .first()
             .expect("the high-byte ASCII-context category must retain a loop proof");
         assert_eq!(loop_plan.start_action, super::LazyStartAction::Propagate);
         assert!(loop_plan.leave_final_member);
