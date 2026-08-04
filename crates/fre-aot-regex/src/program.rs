@@ -166,6 +166,10 @@ const NFA_SUFFIX_PRIMARY_HIT_DENOMINATOR: usize = 64;
 /// the ordinary executor without weakening the asymptotic bound.
 const NFA_SUFFIX_SCAN_ONLY_REVERSE_WORK_CREDIT: usize = 1_024;
 const NFA_SUFFIX_SCAN_ONLY_REVERSE_WORK_MULTIPLIER: usize = 2;
+/// Bound the optional graph proof that a terminal suffix byte cannot be
+/// consumed anywhere before the terminal edge of an accepting path. The
+/// analysis is source independent and declines the optimization on exhaustion.
+const MAX_NFA_SUFFIX_TERMINAL_BARRIER_WORK: u64 = 4_000_000;
 /// A graph-wide byte cut must be substantially selective before its probe is
 /// placed in front of the ordinary ordered-NFA executor. For a uniformly
 /// distributed source, 64 members imply one hit every four bytes; broader
@@ -644,6 +648,10 @@ struct NfaMandatorySuffix {
     primary_depth: u8,
     minimum_width: u8,
     maximum_width: Option<usize>,
+    /// Every primary byte is consumed only by a terminal edge whose target
+    /// cannot continue consuming. A verified first primary endpoint is then a
+    /// source barrier: no later match can begin before it and cross it.
+    terminal_barrier: bool,
     reverse: SeededReverseDfa,
 }
 
@@ -1416,6 +1424,229 @@ enum NfaMandatorySuffixScan {
     Fallback,
 }
 
+fn byte_set_overlaps_range(set: AnchoredByteSet, start: u8, end: u8) -> bool {
+    if start > end {
+        return false;
+    }
+    let words = set.words();
+    let first = usize::from(start / 64);
+    let last = usize::from(end / 64);
+    for word in first..=last {
+        let low = if word == first {
+            u64::MAX << u32::from(start % 64)
+        } else {
+            u64::MAX
+        };
+        let high = if word == last {
+            u64::MAX >> u32::from(63_u8.saturating_sub(end % 64))
+        } else {
+            u64::MAX
+        };
+        if words.get(word).is_some_and(|bits| bits & low & high != 0) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Prove that every member of the final suffix column is a source barrier.
+///
+/// The reverse epsilon closure of every accept identifies the exact consuming
+/// edges that can terminate a match. Their union must equal `terminal`. After
+/// any such edge, epsilon closure must be terminal-only, and no other
+/// consuming edge may accept a terminal byte. Consequently a match cannot
+/// consume one terminal byte in its body and finish at a later one. Once the
+/// first suffix endpoint is reverse-verified, its earliest start is therefore
+/// globally leftmost and ordered replay may be anchored there.
+///
+/// This is deliberately conservative. Malformed relations, allocations, the
+/// fixed work ceiling, assertions, overlapping body ranges, and terminal
+/// continuations all decline the proof without changing the executable plan.
+#[allow(
+    clippy::too_many_lines,
+    reason = "keeping the two graph closures and their shared invariants contiguous makes the barrier proof auditable"
+)]
+fn nfa_terminal_suffix_is_barrier(raw: &RawPlan, terminal: AnchoredByteSet) -> bool {
+    if terminal.cardinality() == 0
+        || raw.roles.is_empty()
+        || raw.edge_offsets.len() != raw.roles.len().saturating_add(1)
+        || raw.edge_targets.len() != raw.edge_kinds.len()
+        || raw.byte_starts.len() != raw.edge_kinds.len()
+        || raw.byte_ends.len() != raw.edge_kinds.len()
+    {
+        return false;
+    }
+
+    let mut work = AnchoredWork::new(MAX_NFA_SUFFIX_TERMINAL_BARRIER_WORK);
+    let Some(incoming) = AnalysisIncoming::build(raw, &mut work) else {
+        return false;
+    };
+    let states = raw.roles.len();
+    let edges = raw.edge_kinds.len();
+
+    let mut reverse_seen = Vec::new();
+    if reverse_seen.try_reserve_exact(states).is_err() {
+        return false;
+    }
+    reverse_seen.resize(states, false);
+    let mut terminal_edges = Vec::new();
+    if terminal_edges.try_reserve_exact(edges).is_err() {
+        return false;
+    }
+    terminal_edges.resize(edges, false);
+    let mut stack = Vec::new();
+    if stack.try_reserve(states).is_err() {
+        return false;
+    }
+    for (state, &role) in raw.roles.iter().enumerate() {
+        if !work.charge(1) {
+            return false;
+        }
+        if role == StateRole::Accept {
+            let Ok(state) = u32::try_from(state) else {
+                return false;
+            };
+            if !anchored_push(&mut stack, state, &mut work) {
+                return false;
+            }
+        }
+    }
+    if stack.is_empty() {
+        return false;
+    }
+
+    while let Some(state) = stack.pop() {
+        if !work.charge(1) {
+            return false;
+        }
+        let Ok(state) = usize::try_from(state) else {
+            return false;
+        };
+        let Some(seen) = reverse_seen.get_mut(state) else {
+            return false;
+        };
+        if *seen {
+            continue;
+        }
+        *seen = true;
+        let Some(row) = incoming.by_target.get(state) else {
+            return false;
+        };
+        for &incoming_edge in row {
+            if !work.charge(1) {
+                return false;
+            }
+            let (Ok(source), Ok(edge)) = (
+                usize::try_from(incoming_edge.source),
+                usize::try_from(incoming_edge.edge),
+            ) else {
+                return false;
+            };
+            match (raw.roles.get(source), raw.edge_kinds.get(edge)) {
+                (Some(StateRole::Split), Some(EdgeKind::Epsilon)) => {
+                    if !anchored_push(&mut stack, incoming_edge.source, &mut work) {
+                        return false;
+                    }
+                }
+                (Some(StateRole::Consume), Some(EdgeKind::ByteRange)) => {
+                    let Some(mark) = terminal_edges.get_mut(edge) else {
+                        return false;
+                    };
+                    *mark = true;
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    let mut terminal_union = AnchoredByteSet::EMPTY;
+    let mut forward_stack = Vec::new();
+    if forward_stack.try_reserve(states).is_err() {
+        return false;
+    }
+    for (edge, &is_terminal) in terminal_edges.iter().enumerate() {
+        if !work.charge(1) {
+            return false;
+        }
+        let (Some(&kind), Some(&start), Some(&end), Some(&target)) = (
+            raw.edge_kinds.get(edge),
+            raw.byte_starts.get(edge),
+            raw.byte_ends.get(edge),
+            raw.edge_targets.get(edge),
+        ) else {
+            return false;
+        };
+        if kind != EdgeKind::ByteRange || start > end {
+            if is_terminal {
+                return false;
+            }
+            continue;
+        }
+        if is_terminal {
+            if !terminal_union.insert_range(start, end, &mut work) {
+                return false;
+            }
+            if !anchored_push(&mut forward_stack, target, &mut work) {
+                return false;
+            }
+        } else if byte_set_overlaps_range(terminal, start, end) {
+            return false;
+        }
+    }
+    if terminal_union != terminal || forward_stack.is_empty() {
+        return false;
+    }
+
+    // A terminal edge must enter an epsilon-only closure that cannot resume
+    // consumption. This also rejects an accepting/continuing loop such as
+    // `a+`, where the final byte class legitimately occurs in the body.
+    let mut forward_seen = Vec::new();
+    if forward_seen.try_reserve_exact(states).is_err() {
+        return false;
+    }
+    forward_seen.resize(states, false);
+    while let Some(state) = forward_stack.pop() {
+        if !work.charge(1) {
+            return false;
+        }
+        let Ok(state) = usize::try_from(state) else {
+            return false;
+        };
+        let Some(seen) = forward_seen.get_mut(state) else {
+            return false;
+        };
+        if *seen {
+            continue;
+        }
+        *seen = true;
+        match raw.roles.get(state) {
+            Some(StateRole::Accept) => {
+                if analysis_state_edges(raw, state).is_none_or(|row| !row.is_empty()) {
+                    return false;
+                }
+            }
+            Some(StateRole::Split) => {
+                let Some(row) = analysis_state_edges(raw, state) else {
+                    return false;
+                };
+                for edge in row {
+                    if !work.charge(1) || raw.edge_kinds.get(edge) != Some(&EdgeKind::Epsilon) {
+                        return false;
+                    }
+                    let Some(&target) = raw.edge_targets.get(edge) else {
+                        return false;
+                    };
+                    if !anchored_push(&mut forward_stack, target, &mut work) {
+                        return false;
+                    }
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
 impl NfaMandatorySuffix {
     fn derive(
         raw: &RawPlan,
@@ -1499,6 +1730,7 @@ impl NfaMandatorySuffix {
             primary_depth: u8::try_from(primary_depth).ok()?,
             minimum_width: u8::try_from(minimum_width).ok()?,
             maximum_width,
+            terminal_barrier: primary_depth == 0 && nfa_terminal_suffix_is_barrier(raw, primary),
             reverse,
         })
     }
@@ -3520,7 +3752,7 @@ impl CompiledProgram {
         };
 
         let Some(maximum_width) = accelerator.maximum_width else {
-            return self.search_nfa_with_scan_only_mandatory_suffix(haystack, window);
+            return self.search_nfa_with_scan_only_mandatory_suffix(haystack, window, workspace);
         };
 
         let mut from_endpoint = window
@@ -3617,15 +3849,19 @@ impl CompiledProgram {
     /// Exhausting the graph-proved suffix scanner is a complete no-match
     /// proof for every output contract. An independently determinized reverse
     /// machine rejects sparse false candidates and proves matches directly for
-    /// `Exists`. A proved endpoint-sensitive match falls back immediately to
-    /// the ordinary ordered NFA, avoiding a reverse walk followed by an
-    /// unbounded ordered replay. Cumulative reverse work is conservatively
-    /// bounded before each verification, preventing adversarial sparse
-    /// candidates from inducing quadratic execution.
+    /// `Exists`. Endpoint-sensitive matches normally fall back immediately to
+    /// the ordinary ordered NFA. When a separate graph proof establishes that
+    /// the primary terminal byte cannot occur in the body, however, the first
+    /// verified endpoint is a barrier: its earliest reverse start is globally
+    /// leftmost and exact-start replay is bounded by that endpoint. Cumulative
+    /// reverse work is conservatively bounded before each verification,
+    /// preventing adversarial sparse candidates from inducing quadratic
+    /// execution.
     fn search_nfa_with_scan_only_mandatory_suffix(
         &self,
         haystack: &[u8],
         window: SearchWindow,
+        workspace: &mut K0Workspace,
     ) -> Result<Option<MatchResult>, CompileError> {
         let accelerator =
             self.nfa_mandatory_suffix
@@ -3671,17 +3907,25 @@ impl CompiledProgram {
                 return Ok(None);
             };
             reverse_work = next_reverse_work;
-            let proves_match = accelerator
+            let mut trace = accelerator
                 .reverse
                 .trace(haystack, window.start, endpoint)
                 .map_err(|_| {
                     CompileError::InternalInvariant(
                         "mandatory-suffix reverse verifier received an invalid window",
                     )
-                })?
-                .next()
-                .is_some();
-            if proves_match {
+                })?;
+            if self.output != OutputContract::Exists && accelerator.terminal_barrier {
+                if let Some(start) = trace.last() {
+                    return self
+                        .search_nfa_at_exact_start(
+                            haystack,
+                            SearchWindow::new(start, endpoint),
+                            workspace,
+                        )
+                        .map(Some);
+                }
+            } else if trace.next().is_some() {
                 if self.output == OutputContract::Exists {
                     return Ok(Some(MatchResult::Exists(true)));
                 }
@@ -7213,6 +7457,129 @@ mod tests {
                 .search(&haystack, SearchWindow::full(&haystack))
                 .unwrap()
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the terminal-barrier theorem is checked across graph shapes, contracts, windows, and wire reconstruction"
+    )]
+    fn unbounded_terminal_suffix_barrier_replays_from_the_proved_start() {
+        let fallback_limits = DeterminizeLimits {
+            max_states: 0,
+            ..DeterminizeLimits::default()
+        };
+        let cases: &[(&str, &[u8])] = &[
+            ("(?:a|b)+Q", b"abQx"),
+            ("(?:ab)?(?:a|b)*Q", b"abQx"),
+            ("(?:ab|x)+?Q", b"abxQ"),
+            ("(?:a|b|c)+(?:Q|Z)", b"abcQZ"),
+        ];
+
+        for &(pattern, alphabet) in cases {
+            let haystacks = generated_byte_strings(alphabet, 3);
+            for output in [
+                OutputContract::Exists,
+                OutputContract::SelectedEnd,
+                OutputContract::Span,
+            ] {
+                let accelerated =
+                    program(pattern, output, CompileMode::Optimizing, fallback_limits);
+                let suffix = accelerated
+                    .nfa_mandatory_suffix
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("missing suffix sidecar for {pattern:?}"));
+                assert_eq!(suffix.maximum_width, None, "{pattern:?}");
+                assert_eq!(suffix.primary_depth, 0, "{pattern:?}");
+                assert!(suffix.terminal_barrier, "{pattern:?}");
+
+                let restored = CompiledProgram::deserialize(
+                    &accelerated.serialize().expect("serialize barrier program"),
+                )
+                .expect("restore barrier program");
+                assert!(
+                    restored
+                        .nfa_mandatory_suffix
+                        .as_ref()
+                        .is_some_and(|suffix| suffix.terminal_barrier),
+                    "restored {pattern:?}"
+                );
+
+                let mut ordinary = accelerated.clone();
+                ordinary.nfa_mandatory_suffix = None;
+                for haystack in &haystacks {
+                    for start in 0..=haystack.len() {
+                        for end in start..=haystack.len() {
+                            let window = SearchWindow::new(start, end);
+                            let expected = ordinary.search(haystack, window).unwrap();
+                            assert_eq!(
+                                accelerated.search(haystack, window).unwrap(),
+                                expected,
+                                "fresh {pattern:?}/{output:?}/{haystack:?}/{start}..{end}"
+                            );
+                            assert_eq!(
+                                restored.search(haystack, window).unwrap(),
+                                expected,
+                                "restored {pattern:?}/{output:?}/{haystack:?}/{start}..{end}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_suffix_barrier_declines_body_overlap_and_nonterminal_primary() {
+        let fallback_limits = DeterminizeLimits {
+            max_states: 0,
+            ..DeterminizeLimits::default()
+        };
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let overlap = program(
+                "(?:xQ|aQ*B)Q",
+                output,
+                CompileMode::Optimizing,
+                fallback_limits,
+            );
+            let suffix = overlap
+                .nfa_mandatory_suffix
+                .as_ref()
+                .expect("overlap graph still owns the ordinary suffix sidecar");
+            assert_eq!(suffix.maximum_width, None);
+            assert_eq!(suffix.primary_depth, 0);
+            assert!(!suffix.terminal_barrier);
+
+            let nonterminal_primary = program(
+                "(?:ab|c)+q[xz]",
+                output,
+                CompileMode::Optimizing,
+                fallback_limits,
+            );
+            let suffix = nonterminal_primary
+                .nfa_mandatory_suffix
+                .as_ref()
+                .expect("the selective preceding suffix column owns the sidecar");
+            assert_eq!(suffix.primary_depth, 1);
+            assert!(!suffix.terminal_barrier);
+
+            let terminal_continuation = program(
+                "(?:a|b)+Q+",
+                output,
+                CompileMode::Optimizing,
+                fallback_limits,
+            );
+            let suffix = terminal_continuation
+                .nfa_mandatory_suffix
+                .as_ref()
+                .expect("the repeated terminal still owns the ordinary suffix sidecar");
+            assert_eq!(suffix.primary_depth, 0);
+            assert!(!suffix.terminal_barrier);
+        }
     }
 
     #[test]
