@@ -298,6 +298,36 @@ struct SharedFragment {
     patterns: Box<[u8]>,
 }
 
+/// Exact source-pattern identities admitted by one fixed byte column.
+///
+/// Intersecting these masks across a candidate word preserves correlations
+/// between columns. This is stronger than checking only the marginal byte
+/// classes: a nonempty final mask proves that one original literal equals the
+/// complete candidate.
+#[derive(Clone, Debug)]
+struct SharedColumnMask {
+    offset: usize,
+    by_byte: [u64; 256],
+}
+
+/// A fixed-width literal set factored around one byte common to every word.
+///
+/// The common byte supplies one monotone `memchr` stream. Every remaining
+/// column maps its observed byte to the source-patterns containing that byte;
+/// intersecting the maps verifies the complete word without rereading the
+/// anchor or walking the retained alternatives.
+#[derive(Clone, Debug)]
+struct SharedColumns {
+    width: usize,
+    anchor_offset: usize,
+    anchor_byte: u8,
+    pattern_mask: u64,
+    maximum_candidate_verification_work: usize,
+    native_start_budget: usize,
+    native_prefix_bytes: usize,
+    columns: Box<[SharedColumnMask]>,
+}
+
 impl SparseAnchor {
     fn earliest_possible_start_from(&self, haystack: &[u8], minimum_start: usize) -> Option<usize> {
         let last_start = haystack.len().checked_sub(self.minimum_pattern_width)?;
@@ -393,6 +423,50 @@ impl SharedFragment {
     }
 }
 
+impl SharedColumns {
+    fn earliest_possible_start_from(&self, haystack: &[u8], minimum_start: usize) -> Option<usize> {
+        let last_start = haystack.len().checked_sub(self.width)?;
+        if minimum_start > last_start {
+            return None;
+        }
+        let scan_start = minimum_start.checked_add(self.anchor_offset)?;
+        let scan_end = last_start
+            .checked_add(self.anchor_offset)?
+            .checked_add(1)?;
+        let relative = memchr(self.anchor_byte, haystack.get(scan_start..scan_end)?)?;
+        minimum_start.checked_add(relative)
+    }
+
+    fn verify_at(&self, haystack: &[u8], start: usize) -> Option<usize> {
+        let end = start.checked_add(self.width)?;
+        let candidate = haystack.get(start..end)?;
+        let mut matching_patterns = self.pattern_mask;
+        for column in self.columns.as_ref() {
+            let byte = *candidate.get(column.offset)?;
+            matching_patterns &= column.by_byte[usize::from(byte)];
+            if matching_patterns == 0 {
+                return None;
+            }
+        }
+        // The least significant surviving bit is the first source pattern.
+        // All admitted patterns have the same width, so every surviving bit
+        // yields the same observable span while retaining source priority.
+        debug_assert!(matching_patterns.trailing_zeros() < u64::BITS);
+        Some(end)
+    }
+
+    fn persistent_bytes(&self) -> usize {
+        size_of::<Self>()
+            .checked_add(
+                self.columns
+                    .len()
+                    .checked_mul(size_of::<SharedColumnMask>())
+                    .expect("the shared-column work cap proves its column bytes"),
+            )
+            .expect("the shared-column construction caps prove its persistent bytes")
+    }
+}
+
 impl FactoredColumns {
     fn find(&self, haystack: &[u8]) -> Option<(usize, usize)> {
         let width = usize::from(self.width);
@@ -447,6 +521,10 @@ enum PackedLiteralEngine {
         searcher: Searcher,
         shared_fragment: Box<SharedFragment>,
     },
+    NativeSharedColumns {
+        searcher: Searcher,
+        shared_columns: Box<SharedColumns>,
+    },
     Factored(Box<FactoredColumns>),
 }
 
@@ -455,10 +533,11 @@ enum PackedLiteralEngine {
 /// This is a shared native primitive, not pattern-specialized JIT code. The
 /// pinned implementation uses Teddy on supported x86-64/AArch64 haystacks and
 /// a bounded Rabin-Karp path for short inputs. Native sets may first scan a
-/// proved shared fixed-offset fragment before source-order tail verification.
-/// Larger complete byte-column products use one native byte-set scan plus exact
-/// column verification. Construction refuses unsupported targets/shapes and
-/// search never changes plan after selection.
+/// proved shared fixed-offset fragment or intersect exact correlated columns
+/// before source-order tail verification. Larger complete byte-column products
+/// use one native byte-set scan plus exact column verification. Construction
+/// refuses unsupported targets/shapes and search never changes plan after
+/// selection.
 #[derive(Clone, Debug)]
 pub struct PackedLiteralSetPlan {
     engine: PackedLiteralEngine,
@@ -482,26 +561,35 @@ impl PackedLiteralSetPlan {
             if let Some(native_searcher) = Searcher::new(patterns.iter().map(AsRef::as_ref)) {
                 // Preserve an already-admitted sparse anchor: a rare byte at
                 // another offset can be more selective than a common fragment.
-                // The fragment route expands only native sets whose byte
-                // anchor could not bound source-order candidate verification.
+                // Fixed-width sets next get exact correlated column masks;
+                // variable widths retain the common-fragment verifier.
                 let sparse_anchor = select_sparse_anchor(patterns).map(Box::new);
-                let shared_fragment = if sparse_anchor.is_some() {
+                let shared_columns = if sparse_anchor.is_some() {
+                    None
+                } else {
+                    select_shared_columns(patterns, native_searcher.minimum_len()).map(Box::new)
+                };
+                let shared_fragment = if sparse_anchor.is_some() || shared_columns.is_some() {
                     None
                 } else {
                     select_shared_fragment(patterns, native_searcher.minimum_len()).map(Box::new)
                 };
-                build.persistent_bytes = native_searcher
-                    .memory_usage()
-                    .checked_add(
-                        sparse_anchor.as_ref().map_or_else(
+                let sidecar_bytes = sparse_anchor.as_ref().map_or_else(
+                    || {
+                        shared_columns.as_ref().map_or_else(
                             || {
                                 shared_fragment
                                     .as_ref()
                                     .map_or(0, |fragment| fragment.persistent_bytes())
                             },
-                            |anchor| anchor.persistent_bytes(),
-                        ),
-                    )
+                            |columns| columns.persistent_bytes(),
+                        )
+                    },
+                    |anchor| anchor.persistent_bytes(),
+                );
+                build.persistent_bytes = native_searcher
+                    .memory_usage()
+                    .checked_add(sidecar_bytes)
                     .ok_or(PackedLiteralSetError::ArithmeticOverflow {
                         computation: "packed literal persistent bytes",
                     })?;
@@ -511,6 +599,11 @@ impl PackedLiteralSetPlan {
                     PackedLiteralEngine::NativeSparse {
                         searcher: native_searcher,
                         sparse_anchor,
+                    }
+                } else if let Some(shared_columns) = shared_columns {
+                    PackedLiteralEngine::NativeSharedColumns {
+                        searcher: native_searcher,
+                        shared_columns,
                     }
                 } else if let Some(shared_fragment) = shared_fragment {
                     PackedLiteralEngine::NativeSharedFragment {
@@ -617,6 +710,10 @@ impl PackedLiteralSetPlan {
                 searcher,
                 shared_fragment,
             } => find_native_shared_fragment(searcher, shared_fragment, window_bytes),
+            PackedLiteralEngine::NativeSharedColumns {
+                searcher,
+                shared_columns,
+            } => find_native_shared_columns(searcher, shared_columns, window_bytes),
             PackedLiteralEngine::Factored(factored) => {
                 accounting.factored_columns = true;
                 factored.find(window_bytes)
@@ -630,6 +727,56 @@ impl PackedLiteralSetPlan {
         });
         Ok((matched, accounting))
     }
+}
+
+#[inline]
+fn find_native_shared_columns(
+    searcher: &Searcher,
+    columns: &SharedColumns,
+    haystack: &[u8],
+) -> Option<(usize, usize)> {
+    let native_start_budget = columns.native_start_budget;
+    let native_prefix_bytes = columns.native_prefix_bytes;
+    if haystack.len() <= native_prefix_bytes {
+        return searcher
+            .find(haystack)
+            .map(|matched| (matched.start(), matched.end()));
+    }
+    if let Some(matched) = searcher.find(&haystack[..native_prefix_bytes]) {
+        if matched.start() < native_start_budget {
+            return Some((matched.start(), matched.end()));
+        }
+    }
+
+    let factored_haystack = haystack.get(native_start_budget..)?;
+    let mut minimum_start = 0_usize;
+    for attempt in 0..NATIVE_FILTER_CANDIDATE_BUDGET {
+        let candidate = columns.earliest_possible_start_from(factored_haystack, minimum_start)?;
+        let after_candidate = candidate.checked_add(1)?;
+        let verification_attempts = attempt.checked_add(1)?;
+        let required_skip = columns
+            .maximum_candidate_verification_work
+            .checked_mul(verification_attempts)?;
+        if after_candidate < required_skip {
+            break;
+        }
+        if let Some(end) = columns.verify_at(factored_haystack, candidate) {
+            return Some((
+                native_start_budget.checked_add(candidate)?,
+                native_start_budget.checked_add(end)?,
+            ));
+        }
+        minimum_start = after_candidate;
+    }
+    let fallback_start = native_start_budget.checked_add(minimum_start)?;
+    searcher
+        .find(&haystack[fallback_start..])
+        .and_then(|matched| {
+            Some((
+                fallback_start.checked_add(matched.start())?,
+                fallback_start.checked_add(matched.end())?,
+            ))
+        })
 }
 
 #[inline]
@@ -833,6 +980,122 @@ fn select_sparse_anchor<P: AsRef<[u8]>>(patterns: &[P]) -> Option<SparseAnchor> 
         group_ends,
         maximum_candidate_verification_work,
         patterns: retained.into_boxed_slice(),
+    })
+}
+
+fn select_shared_columns<P: AsRef<[u8]>>(
+    patterns: &[P],
+    native_minimum_haystack_bytes: usize,
+) -> Option<SharedColumns> {
+    if patterns.len() < 2 || patterns.len() > TEDDY_PATTERNS_PER_SEARCHER {
+        return None;
+    }
+    let first = patterns.first()?.as_ref();
+    let width = first.len();
+    if width < 2
+        || patterns
+            .iter()
+            .any(|pattern| pattern.as_ref().len() != width)
+        || patterns
+            .iter()
+            .skip(1)
+            .all(|pattern| pattern.as_ref() == first)
+    {
+        return None;
+    }
+
+    // One mask lookup is charged for every non-anchor column plus the final
+    // nonempty-mask decision. This derives the admitted width from the same
+    // bounded candidate-work theorem used by the incumbent native filters.
+    let maximum_candidate_verification_work = width;
+    if maximum_candidate_verification_work > NATIVE_FILTER_MAX_CANDIDATE_VERIFICATION_WORK {
+        return None;
+    }
+
+    let mut anchor = None;
+    let mut anchor_score = (u8::MAX, usize::MAX);
+    for offset in 0..width {
+        let byte = first[offset];
+        if patterns
+            .iter()
+            .all(|pattern| pattern.as_ref()[offset] == byte)
+        {
+            let score = (
+                crate::packed_ordered_literal_aggregate::byte_frequency_rank(byte),
+                offset,
+            );
+            if score < anchor_score {
+                anchor_score = score;
+                anchor = Some((offset, byte));
+            }
+        }
+    }
+    let (anchor_offset, anchor_byte) = anchor?;
+
+    let pattern_mask = if patterns.len() == usize::try_from(u64::BITS).ok()? {
+        u64::MAX
+    } else {
+        1_u64
+            .checked_shl(u32::try_from(patterns.len()).ok()?)?
+            .checked_sub(1)?
+    };
+    let mut ordered_columns = Vec::with_capacity(width.checked_sub(1)?);
+    for offset in 0..width {
+        if offset == anchor_offset {
+            continue;
+        }
+        let mut by_byte = [0_u64; 256];
+        for (pattern_index, pattern) in patterns.iter().enumerate() {
+            let bit = 1_u64.checked_shl(u32::try_from(pattern_index).ok()?)?;
+            let byte = pattern.as_ref()[offset];
+            by_byte[usize::from(byte)] |= bit;
+        }
+        let maximum_bucket = by_byte.iter().try_fold(0_usize, |maximum, mask| {
+            Some(maximum.max(usize::try_from(mask.count_ones()).ok()?))
+        })?;
+        let frequency_score = by_byte.iter().enumerate().try_fold(
+            0_u64,
+            |score, (byte, &mask)| {
+                if mask == 0 {
+                    Some(score)
+                } else {
+                    let rank = u64::from(
+                        crate::packed_ordered_literal_aggregate::byte_frequency_rank(
+                            u8::try_from(byte).ok()?,
+                        ),
+                    );
+                    score.checked_add(rank.checked_add(1)?)
+                }
+            },
+        )?;
+        let score = (maximum_bucket, frequency_score, offset);
+        ordered_columns.push((score, SharedColumnMask { offset, by_byte }));
+    }
+    // A column that isolates fewer alternatives is consumed first. This can
+    // reject a false anchor after one lookup, while every successful path
+    // still intersects every column and therefore proves an original word.
+    ordered_columns.sort_by_key(|(score, _)| *score);
+    let columns = ordered_columns
+        .into_iter()
+        .map(|(_, column)| column)
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    let native_start_budget = shared_fragment_native_start_budget(
+        native_minimum_haystack_bytes,
+        maximum_candidate_verification_work,
+    );
+    let native_prefix_bytes = width
+        .checked_sub(1)?
+        .checked_add(native_start_budget)?;
+    Some(SharedColumns {
+        width,
+        anchor_offset,
+        anchor_byte,
+        pattern_mask,
+        maximum_candidate_verification_work,
+        native_start_budget,
+        native_prefix_bytes,
+        columns,
     })
 }
 
@@ -1142,8 +1405,8 @@ mod tests {
     use super::{
         BUILD_FACTOR, NATIVE_FILTER_CANDIDATE_BUDGET, PackedLiteralEngine,
         PackedLiteralSetAccounting, PackedLiteralSetBuildLimits, PackedLiteralSetError,
-        PackedLiteralSetPlan, PackedLiteralSetSearchLimits, select_shared_fragment,
-        select_sparse_anchor, shared_fragment_native_start_budget,
+        PackedLiteralSetPlan, PackedLiteralSetSearchLimits, select_shared_columns,
+        select_shared_fragment, select_sparse_anchor, shared_fragment_native_start_budget,
     };
     use crate::Window;
 
@@ -1178,7 +1441,7 @@ mod tests {
 
     fn shared_prefix_patterns() -> [&'static [u8]; 8] {
         [
-            b"aa00", b"aa11", b"aa22", b"aa33", b"aa44", b"aa55", b"aa66", b"aa77",
+            b"aa00x", b"aa11", b"aa22", b"aa33", b"aa44", b"aa55", b"aa66", b"aa77",
         ]
     }
 
@@ -1309,7 +1572,8 @@ mod tests {
         let searcher = match &plan.engine {
             PackedLiteralEngine::Native(searcher)
             | PackedLiteralEngine::NativeSparse { searcher, .. }
-            | PackedLiteralEngine::NativeSharedFragment { searcher, .. } => searcher,
+            | PackedLiteralEngine::NativeSharedFragment { searcher, .. }
+            | PackedLiteralEngine::NativeSharedColumns { searcher, .. } => searcher,
             PackedLiteralEngine::Factored(_) => {
                 panic!("differential helper requires a native packed plan")
             }
@@ -1595,6 +1859,148 @@ mod tests {
         assert!(select_shared_fragment(&expensive, 1).is_none());
         assert!(
             select_shared_fragment(&[b"ab".as_slice(), b"ac".as_slice()], 1).is_none()
+        );
+    }
+
+    #[test]
+    fn shared_columns_intersect_correlated_fixed_words_exactly() {
+        let patterns = [
+            [0x91, 0x00, 0x10, 0xf0],
+            [0x91, 0x01, 0x21, 0xe1],
+            [0x91, 0x02, 0x32, 0xd2],
+            [0x91, 0x03, 0x43, 0xc3],
+            [0x91, 0x04, 0x54, 0xb4],
+            [0x91, 0x05, 0x65, 0xa5],
+            [0x91, 0x06, 0x76, 0x96],
+            [0x91, 0x07, 0x87, 0x87],
+        ];
+        let refs = patterns
+            .iter()
+            .map(|pattern| pattern.as_slice())
+            .collect::<Vec<_>>();
+        assert!(select_sparse_anchor(&refs).is_none());
+        let columns = select_shared_columns(&refs, 7).unwrap();
+        assert_eq!((columns.width, columns.anchor_offset), (4, 0));
+        assert_eq!(columns.anchor_byte, 0x91);
+        assert_eq!(columns.maximum_candidate_verification_work, 4);
+        assert_eq!(columns.columns.len(), 3);
+        assert_eq!(columns.native_start_budget, 112);
+        for pattern in &patterns {
+            assert_eq!(columns.verify_at(pattern, 0), Some(4));
+        }
+        // Every byte occurs in its marginal column, but no one source word
+        // contains this cross-pattern tuple. Independent byte classes would
+        // accept it; correlated source masks must reject it.
+        let mixed_tuple = [0x91, patterns[0][1], patterns[1][2], patterns[2][3]];
+        assert_eq!(columns.verify_at(&mixed_tuple, 0), None);
+    }
+
+    #[test]
+    fn native_shared_columns_preserve_windows_bounds_and_dense_fallback() {
+        let patterns = [
+            b"qbma".as_slice(),
+            b"qbdb".as_slice(),
+            b"qbuc".as_slice(),
+            b"qbld".as_slice(),
+            b"qbce".as_slice(),
+            b"qbtf".as_slice(),
+            b"qbkg".as_slice(),
+            b"qbbh".as_slice(),
+        ];
+        let Some(plan) = plan(&patterns) else {
+            return;
+        };
+        let PackedLiteralEngine::NativeSharedColumns {
+            searcher,
+            shared_columns,
+        } = &plan.engine
+        else {
+            panic!("fixed shared-prefix language did not retain correlated columns")
+        };
+        assert_eq!((shared_columns.width, shared_columns.anchor_offset), (4, 0));
+        assert_eq!(shared_columns.anchor_byte, b'q');
+        assert_eq!(shared_columns.maximum_candidate_verification_work, 4);
+        assert_eq!(
+            shared_columns.native_start_budget,
+            shared_fragment_native_start_budget(searcher.minimum_len(), 4)
+        );
+        assert_eq!(
+            shared_columns.native_prefix_bytes,
+            shared_columns.native_start_budget.checked_add(3).unwrap()
+        );
+
+        let persistent = plan.build_accounting().persistent_bytes;
+        assert_eq!(
+            PackedLiteralSetPlan::new(
+                &patterns,
+                PackedLiteralSetBuildLimits {
+                    max_persistent_bytes: persistent,
+                    ..PackedLiteralSetBuildLimits::default()
+                },
+            )
+            .unwrap()
+            .build_accounting()
+            .persistent_bytes,
+            persistent
+        );
+        assert!(matches!(
+            PackedLiteralSetPlan::new(
+                &patterns,
+                PackedLiteralSetBuildLimits {
+                    max_persistent_bytes: persistent - 1,
+                    ..PackedLiteralSetBuildLimits::default()
+                },
+            ),
+            Err(PackedLiteralSetError::PersistentBytesLimit { needed, limit })
+                if needed == persistent && limit == persistent - 1
+        ));
+
+        let budget = shared_columns.native_start_budget;
+        let window_start = 19_usize;
+        let decoy_start = window_start.checked_add(budget).unwrap().checked_add(37).unwrap();
+        let match_start = window_start.checked_add(budget).unwrap().checked_add(91).unwrap();
+        let match_end = match_start.checked_add(4).unwrap();
+        let mut haystack = vec![b'!'; match_end.checked_add(29).unwrap()];
+        haystack[decoy_start..decoy_start.checked_add(4).unwrap()].copy_from_slice(b"qbzz");
+        haystack[match_start..match_end].copy_from_slice(b"qbce");
+        assert_eq!(
+            plan.find_window(
+                &haystack,
+                Window::new(window_start, haystack.len()),
+                PackedLiteralSetSearchLimits::unlimited(),
+            )
+            .unwrap()
+            .0,
+            Some((match_start, match_end))
+        );
+        assert_eq!(
+            plan.find_window(
+                &haystack,
+                Window::new(window_start, match_end.checked_sub(1).unwrap()),
+                PackedLiteralSetSearchLimits::unlimited(),
+            )
+            .unwrap()
+            .0,
+            None
+        );
+
+        // A dense common-byte stream cannot make the side filter unbounded:
+        // its first unamortized candidate hands the untouched suffix back to
+        // the native source-priority searcher.
+        let dense_start = budget.checked_add(8).unwrap();
+        let dense_match = dense_start.checked_add(73).unwrap();
+        let dense_end = dense_match.checked_add(4).unwrap();
+        let mut dense = vec![b'q'; dense_end.checked_add(16).unwrap()];
+        dense[dense_match..dense_end].copy_from_slice(b"qbbh");
+        let expected = searcher
+            .find(&dense)
+            .map(|matched| (matched.start(), matched.end()));
+        assert_eq!(expected, Some((dense_match, dense_end)));
+        assert_eq!(
+            plan.find(&dense, PackedLiteralSetSearchLimits::unlimited())
+                .unwrap()
+                .0,
+            expected
         );
     }
 
@@ -1917,7 +2323,7 @@ mod tests {
     #[test]
     fn shared_fragment_verification_handles_interior_offsets() {
         let interior_patterns = [
-            b"aQR0".as_slice(),
+            b"aQR00".as_slice(),
             b"bQR1".as_slice(),
             b"cQR2".as_slice(),
             b"dQR3".as_slice(),
@@ -2090,7 +2496,57 @@ mod tests {
             return;
         };
         assert_eq!(single.build_accounting().patterns, 64);
-        assert!(matches!(&single.engine, PackedLiteralEngine::Native(_)));
+        let PackedLiteralEngine::NativeSharedColumns {
+            shared_columns,
+            ..
+        } = &single.engine
+        else {
+            panic!("the native 64-pattern boundary lost its exact shared-column factor")
+        };
+        assert_eq!(shared_columns.pattern_mask, u64::MAX);
+        assert_eq!(shared_columns.width, 4);
+        assert!(refs_64.iter().all(|pattern| {
+            pattern[shared_columns.anchor_offset] == shared_columns.anchor_byte
+        }));
+        let match_start = shared_columns
+            .native_start_budget
+            .checked_add(31)
+            .unwrap();
+        let match_end = match_start.checked_add(4).unwrap();
+        let mut haystack = vec![b'!'; match_end.checked_add(17).unwrap()];
+        haystack[match_start..match_end].copy_from_slice(&patterns_64[63]);
+        assert_eq!(
+            single
+                .find(&haystack, PackedLiteralSetSearchLimits::unlimited())
+                .unwrap()
+                .0,
+            Some((match_start, match_end))
+        );
+        let persistent = single.build_accounting().persistent_bytes;
+        assert_eq!(
+            PackedLiteralSetPlan::new(
+                &refs_64,
+                PackedLiteralSetBuildLimits {
+                    max_persistent_bytes: persistent,
+                    ..PackedLiteralSetBuildLimits::default()
+                },
+            )
+            .unwrap()
+            .build_accounting()
+            .persistent_bytes,
+            persistent
+        );
+        assert!(matches!(
+            PackedLiteralSetPlan::new(
+                &refs_64,
+                PackedLiteralSetBuildLimits {
+                    max_persistent_bytes: persistent - 1,
+                    ..PackedLiteralSetBuildLimits::default()
+                },
+            ),
+            Err(PackedLiteralSetError::PersistentBytesLimit { needed, limit })
+                if needed == persistent && limit == persistent - 1
+        ));
 
         for count in [65, 72, 128] {
             let patterns = fixed_patterns(count, 4);
