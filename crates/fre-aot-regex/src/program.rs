@@ -3343,6 +3343,109 @@ impl CompiledProgram {
         self.search_nfa_with_partial_entry(partial, haystack, window, workspace)
     }
 
+    /// Continue K0 from a hole reached by this exact artifact's retained
+    /// partial DFA without replaying the already-consumed prefix.
+    ///
+    /// This narrow runtime seam accepts only the compact index of a canonical
+    /// frontier already owned by the artifact. Workspace preparation copied
+    /// and graph-bound every such frontier in a [`K0ResumeSet`]; callers
+    /// cannot provide frontier contents. The exact stable artifact identity
+    /// additionally binds a native producer to the prepared semantic program.
+    ///
+    /// `resume_position` is the first unconsumed byte and must lie strictly
+    /// inside `window`. `pending_end` must agree with the canonical frontier's
+    /// pending mode and, when present, name a boundary in the consumed prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed invalid-window error before reading the haystack, or an
+    /// invariant/search error if the artifact identity, prepared workspace,
+    /// retained table, compact state, position, or pending endpoint does not
+    /// authenticate.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the continuation boundary keeps artifact, window, frontier, and committed prefix explicit"
+    )]
+    pub fn search_from_retained_partial_resume_with_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        expected_artifact_identity: [u8; 32],
+        resume_state: usize,
+        resume_position: usize,
+        pending_end: Option<usize>,
+    ) -> Result<MatchResult, CompileError> {
+        if window.start > window.end || window.end > haystack.len() {
+            return Err(CompileError::InvalidWindow {
+                start: window.start,
+                end: window.end,
+                haystack_len: haystack.len(),
+            });
+        }
+        if expected_artifact_identity != self.identity.artifact {
+            return Err(CompileError::InternalInvariant(
+                "retained partial resume artifact identity does not match the prepared program",
+            ));
+        }
+        if !workspace.identity.compatible(&self.identity) {
+            return Err(CompileError::InternalInvariant(
+                "program workspace belongs to a different semantic program",
+            ));
+        }
+        if self.context_dfa.is_some() || !matches!(self.engine, ProgramEngine::OrderedNfa) {
+            return Err(CompileError::InternalInvariant(
+                "retained partial resume requires the universal ordered-NFA engine",
+            ));
+        }
+        if resume_position <= window.start || resume_position >= window.end {
+            return Err(CompileError::InternalInvariant(
+                "retained partial resume position is not inside the original search window",
+            ));
+        }
+        let partial = self.partial_dfa().ok_or(CompileError::InternalInvariant(
+            "retained partial resume was selected without retained rows",
+        ))?;
+        let canonical_pending = partial.resume_pending(resume_state).ok_or(
+            CompileError::InternalInvariant(
+                "retained partial resume state is outside the canonical artifact",
+            ),
+        )?;
+        if canonical_pending != pending_end.is_some() {
+            return Err(CompileError::InternalInvariant(
+                "retained partial resume pending mode disagrees with the canonical artifact",
+            ));
+        }
+        let partial_workspace = workspace.partial.as_deref_mut().ok_or(
+            CompileError::InternalInvariant(
+                "retained partial resume has no prepared partial workspace",
+            ),
+        )?;
+        if partial_workspace
+            .resume
+            .as_ref()
+            .is_none_or(|resume| !resume.is_bound_to(&self.automaton))
+        {
+            return Err(CompileError::InternalInvariant(
+                "retained partial resume has no authenticated K0 resume set",
+            ));
+        }
+        self.search_nfa_from_partial_resume(
+            haystack,
+            window,
+            workspace.nfa.as_mut().ok_or(CompileError::InternalInvariant(
+                "retained partial resume has no prepared K0 workspace",
+            ))?,
+            &mut partial_workspace.resume,
+            PartialDfaResume {
+                state: resume_state,
+                position: resume_position,
+                pending_end,
+            },
+        )
+    }
+
     #[cfg(test)]
     pub(crate) const fn has_retained_partial_dfa(&self) -> bool {
         self.optimization_sidecar.has_partial_dfa()
@@ -6063,6 +6166,58 @@ mod tests {
         let mut strings = Vec::new();
         extend(&mut strings, &mut Vec::new(), alphabet, max_len);
         strings
+    }
+
+    fn authentic_partial_resume(
+        program: &CompiledProgram,
+        haystack: &[u8],
+        window: SearchWindow,
+    ) -> Option<PartialDfaResume> {
+        let partial = program.partial_dfa()?;
+        let (prefix_plan, supported) =
+            PartialDfaPrefixPlan::derive(program.anchored_prefix.sets());
+        assert!(supported, "test fixture has no retained-prefix scanner");
+        match program.output {
+            OutputContract::Exists => match partial
+                .exists(
+                    haystack,
+                    window.start,
+                    window.end,
+                    program.anchored_prefix.sets(),
+                    prefix_plan,
+                )
+                .ok()?
+            {
+                PartialDfaResult::Resume(resume) => Some(resume),
+                PartialDfaResult::Complete(_) => None,
+            },
+            OutputContract::SelectedEnd => match partial
+                .selected_end(
+                    haystack,
+                    window.start,
+                    window.end,
+                    program.anchored_prefix.sets(),
+                    prefix_plan,
+                )
+                .ok()?
+            {
+                PartialDfaResult::Resume(resume) => Some(resume),
+                PartialDfaResult::Complete(_) => None,
+            },
+            OutputContract::Span => match partial
+                .selected_span_end(
+                    haystack,
+                    window.start,
+                    window.end,
+                    program.anchored_prefix.sets(),
+                    prefix_plan,
+                )
+                .ok()?
+            {
+                PartialDfaResult::Resume(resume) => Some(resume),
+                PartialDfaResult::Complete(_) => None,
+            },
+        }
     }
 
     fn assert_exact_product_matches_fast_for_every_window(
@@ -10148,6 +10303,130 @@ mod tests {
         assert!(matches!(limited.engine, ProgramEngine::OrderedNfa));
         let workspace = limited.prepare_workspace().expect("workspace");
         assert!(workspace.partial.is_none());
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "all contracts and every authenticated continuation rejection share one exact fixture"
+    )]
+    fn authenticated_external_partial_resume_matches_ordinary_prepared_search() {
+        let probes = [
+            b"cbbbbx".as_slice(),
+            b"cbbbby".as_slice(),
+            b"xxcbbbbxyy".as_slice(),
+            b"bbbbbbbbbbbb".as_slice(),
+            b"xxbaaaayyy".as_slice(),
+            b"cbza".as_slice(),
+            b"cbzabx".as_slice(),
+            b"cbbbbzabbx".as_slice(),
+            b"xxcbbbbzayy".as_slice(),
+        ];
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let (pattern, max_states) = match output {
+                OutputContract::Exists => (r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)", 8),
+                OutputContract::SelectedEnd | OutputContract::Span => {
+                    (r"(?:a+Q|[b-c][a-b]{1,10}(?:z[a-b]+|z))", 10)
+                }
+            };
+            let retained = program(
+                pattern,
+                output,
+                CompileMode::Optimizing,
+                DeterminizeLimits {
+                    max_states,
+                    ..DeterminizeLimits::default()
+                },
+            );
+            let (haystack, resume) = probes
+                .iter()
+                .find_map(|&haystack| {
+                    let window = SearchWindow::full(haystack);
+                    authentic_partial_resume(&retained, haystack, window)
+                        .filter(|resume| {
+                            output == OutputContract::Exists || resume.pending_end.is_some()
+                        })
+                        .map(|resume| (haystack, resume))
+                })
+                .unwrap_or_else(|| panic!("no authentic hole for {output:?}"));
+            let window = SearchWindow::full(haystack);
+            assert!(resume.position > window.start && resume.position < window.end);
+
+            let mut ordinary_workspace = retained.prepare_workspace().expect("ordinary workspace");
+            let expected = retained
+                .search_with_workspace(haystack, window, &mut ordinary_workspace)
+                .expect("ordinary prepared search");
+            let mut resume_workspace = retained.prepare_workspace().expect("resume workspace");
+            assert_eq!(
+                retained
+                    .search_from_retained_partial_resume_with_workspace(
+                        haystack,
+                        window,
+                        &mut resume_workspace,
+                        retained.artifact_identity(),
+                        resume.state,
+                        resume.position,
+                        resume.pending_end,
+                    )
+                    .expect("authenticated continuation"),
+                expected,
+                "{output:?}"
+            );
+
+            let mut mismatched_identity = retained.artifact_identity();
+            mismatched_identity[0] ^= 1;
+            assert!(
+                retained
+                    .search_from_retained_partial_resume_with_workspace(
+                        haystack,
+                        window,
+                        &mut resume_workspace,
+                        mismatched_identity,
+                        resume.state,
+                        resume.position,
+                        resume.pending_end,
+                    )
+                    .is_err()
+            );
+
+            let plain = program(
+                pattern,
+                output,
+                CompileMode::Fast,
+                DeterminizeLimits::default(),
+            );
+            let mut plain_workspace = plain.prepare_workspace().expect("plain workspace");
+            assert!(
+                plain
+                    .search_from_retained_partial_resume_with_workspace(
+                        haystack,
+                        window,
+                        &mut plain_workspace,
+                        plain.artifact_identity(),
+                        resume.state,
+                        resume.position,
+                        resume.pending_end,
+                    )
+                    .is_err()
+            );
+            assert!(
+                retained
+                    .search_from_retained_partial_resume_with_workspace(
+                        haystack,
+                        window,
+                        &mut plain_workspace,
+                        retained.artifact_identity(),
+                        resume.state,
+                        resume.position,
+                        resume.pending_end,
+                    )
+                    .is_err()
+            );
+        }
     }
 
     #[test]

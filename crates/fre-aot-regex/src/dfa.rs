@@ -1315,6 +1315,16 @@ impl PartialDfa {
         self.forward.resume_keys.len()
     }
 
+    /// Return the canonical pending-end mode for one compact resume state.
+    ///
+    /// The state is only an index into the partial artifact's authenticated
+    /// incomplete-state suffix. Frontier contents remain private and are
+    /// copied into a graph-bound [`fre_automata::K0ResumeSet`] when workspace
+    /// preparation validates the complete table.
+    pub(crate) fn resume_pending(&self, state: usize) -> Option<bool> {
+        self.forward.resume_keys.get(state).map(|key| key.pending)
+    }
+
     pub(crate) fn resume_item_count(&self) -> Result<usize, CompileError> {
         self.forward
             .resume_keys

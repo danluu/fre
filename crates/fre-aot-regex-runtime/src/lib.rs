@@ -32,6 +32,11 @@
 //! [`fre_aot_regex_runtime_destroy_exclusive_v1`]. That explicitly unsafe
 //! lifecycle passes an opaque allocation pointer directly and therefore pays
 //! no registry, reference-count, thread-local, or mutex cost per search.
+//! A native producer that reaches a retained partial-DFA hole can continue the
+//! same exclusive session through
+//! [`fre_aot_regex_runtime_search_exclusive_from_partial_v1`]. That entry
+//! authenticates the producer's exact artifact identity and compact canonical
+//! resume-state index before continuing K0 without replaying the prefix.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(unsafe_code)]
@@ -60,6 +65,8 @@ pub const STATUS_HANDLE_BUSY: u32 = 4;
 pub const STATUS_INVALID_HANDLE: u32 = 5;
 /// Successful status for prepare and destroy lifecycle operations.
 pub const STATUS_SUCCESS: u32 = 0;
+/// Bytes in the exact SHA-256 semantic-artifact identity accepted by resume.
+pub const ARTIFACT_IDENTITY_BYTES: usize = 32;
 
 /// C declarations for the complete stable V1 runtime ABI.
 ///
@@ -332,6 +339,27 @@ impl PreparedAotRegex {
     ) -> Result<MatchResult, CompileError> {
         self.program
             .search_optimized_with_workspace(haystack, window, &mut self.workspace)
+    }
+
+    fn search_from_retained_partial_resume(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+        expected_artifact_identity: [u8; ARTIFACT_IDENTITY_BYTES],
+        resume_state: usize,
+        resume_position: usize,
+        pending_end: Option<usize>,
+    ) -> Result<MatchResult, CompileError> {
+        self.program
+            .search_from_retained_partial_resume_with_workspace(
+                haystack,
+                window,
+                &mut self.workspace,
+                expected_artifact_identity,
+                resume_state,
+                resume_position,
+                pending_end,
+            )
     }
 
     /// Find the first selected span in `haystack`.
@@ -891,6 +919,93 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_v1(
     .unwrap_or(STATUS_RUNTIME_FAILURE)
 }
 
+/// Continue an exclusively owned prepared session from an authenticated
+/// retained partial-DFA hole without replaying the consumed prefix.
+///
+/// `expected_artifact_identity_ptr` supplies exactly
+/// [`ARTIFACT_IDENTITY_BYTES`] bytes containing the stable serialized-program
+/// SHA-256 identity embedded by the native producer. `resume_state` is only a
+/// compact index into that artifact's canonical retained frontier table;
+/// frontier contents never cross this ABI. `resume_position` is the first
+/// unconsumed byte and must lie strictly inside the original search window.
+/// `pending_end_present` must be `0` or `1`; when it is `1`, `pending_end`
+/// names the selected boundary already committed in the consumed prefix.
+///
+/// Status and result conventions are identical to
+/// [`fre_aot_regex_runtime_search_exclusive_v1`]. A mismatched artifact
+/// identity, absent retained table, invalid compact state, incompatible
+/// pending mode/value, or invalid resume position returns
+/// [`STATUS_RUNTIME_FAILURE`] and leaves `result_ptr` untouched.
+///
+/// # Safety
+///
+/// `handle` must satisfy the exclusive live-handle requirements of
+/// [`fre_aot_regex_runtime_search_exclusive_v1`]. Haystack and result pointer
+/// requirements are identical to that function. Additionally,
+/// `expected_artifact_identity_ptr` must be non-null and readable for exactly
+/// [`ARTIFACT_IDENTITY_BYTES`] bytes. The result storage must not overlap
+/// either readable extent. The compact resume fields must have been emitted
+/// after actually executing the retained table in the identified artifact.
+#[unsafe(no_mangle)]
+#[allow(
+    unsafe_code,
+    clippy::too_many_arguments,
+    reason = "this exported continuation symbol is an audited raw C pointer boundary with an explicit authenticated prefix state"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_from_partial_v1(
+    handle: FreAotRegexExclusiveHandleV1,
+    haystack_ptr: *const u8,
+    haystack_len: usize,
+    window_start: usize,
+    window_end: usize,
+    result_ptr: *mut FreAotRegexResultV1,
+    expected_artifact_identity_ptr: *const u8,
+    resume_state: usize,
+    resume_position: usize,
+    pending_end_present: u32,
+    pending_end: usize,
+) -> u32 {
+    if handle.is_invalid() {
+        return STATUS_INVALID_HANDLE;
+    }
+    if haystack_ptr.is_null()
+        || result_ptr.is_null()
+        || !result_ptr.is_aligned()
+        || expected_artifact_identity_ptr.is_null()
+        || haystack_len > isize::MAX.unsigned_abs()
+        || window_start > window_end
+        || window_end > haystack_len
+        || pending_end_present > 1
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+
+    // SAFETY: the caller guarantees one live exclusively owned session plus
+    // all readable and writable disjoint extents described above.
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        let prepared = &mut *handle.0.cast::<PreparedAotRegex>();
+        let haystack = std::slice::from_raw_parts(haystack_ptr, haystack_len);
+        let expected_artifact_identity = expected_artifact_identity_ptr
+            .cast::<[u8; ARTIFACT_IDENTITY_BYTES]>()
+            .read();
+        let pending_end = (pending_end_present == 1).then_some(pending_end);
+        let Ok(found) = prepared.search_from_retained_partial_resume(
+            haystack,
+            SearchWindow::new(window_start, window_end),
+            expected_artifact_identity,
+            resume_state,
+            resume_position,
+            pending_end,
+        ) else {
+            return STATUS_RUNTIME_FAILURE;
+        };
+        let (status, result) = encode_match_result(found);
+        result_ptr.write(result);
+        status
+    }))
+    .unwrap_or(STATUS_RUNTIME_FAILURE)
+}
+
 /// Invalidate and release one prepared handle.
 ///
 /// Returns [`STATUS_SUCCESS`] after the owned program and workspace are
@@ -1067,23 +1182,26 @@ fn execute_search(
     window_start: usize,
     window_end: usize,
 ) -> Result<(u32, FreAotRegexResultV1), CompileError> {
-    Ok(
-        match prepared.search(haystack, SearchWindow::new(window_start, window_end))? {
-            MatchResult::Exists(false)
-            | MatchResult::SelectedEnd(None)
-            | MatchResult::Span(None) => (STATUS_NO_MATCH, FreAotRegexResultV1::default()),
-            MatchResult::Exists(true) => {
-                // Exists deliberately exposes no endpoint information.
-                (STATUS_MATCH, FreAotRegexResultV1::default())
-            }
-            MatchResult::SelectedEnd(Some(end)) => {
-                (STATUS_MATCH, FreAotRegexResultV1 { start: end, end })
-            }
-            MatchResult::Span(Some((start, end))) => {
-                (STATUS_MATCH, FreAotRegexResultV1 { start, end })
-            }
-        },
-    )
+    Ok(encode_match_result(prepared.search(
+        haystack,
+        SearchWindow::new(window_start, window_end),
+    )?))
+}
+
+fn encode_match_result(result: MatchResult) -> (u32, FreAotRegexResultV1) {
+    match result {
+        MatchResult::Exists(false) | MatchResult::SelectedEnd(None) | MatchResult::Span(None) => {
+            (STATUS_NO_MATCH, FreAotRegexResultV1::default())
+        }
+        MatchResult::Exists(true) => {
+            // Exists deliberately exposes no endpoint information.
+            (STATUS_MATCH, FreAotRegexResultV1::default())
+        }
+        MatchResult::SelectedEnd(Some(end)) => {
+            (STATUS_MATCH, FreAotRegexResultV1 { start: end, end })
+        }
+        MatchResult::Span(Some((start, end))) => (STATUS_MATCH, FreAotRegexResultV1 { start, end }),
+    }
 }
 
 #[cfg(test)]
@@ -1224,6 +1342,41 @@ mod tests {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the test helper mirrors the explicit authenticated continuation ABI"
+    )]
+    fn call_exclusive_from_partial(
+        handle: FreAotRegexExclusiveHandleV1,
+        haystack: &[u8],
+        start: usize,
+        end: usize,
+        result: &mut FreAotRegexResultV1,
+        expected_artifact_identity: &[u8; ARTIFACT_IDENTITY_BYTES],
+        resume_state: usize,
+        resume_position: usize,
+        pending_end: Option<usize>,
+    ) -> u32 {
+        // SAFETY: each test keeps exclusive ownership of the live session;
+        // the compiler-produced identity, readable haystack, and disjoint
+        // aligned result all outlive the synchronous call.
+        unsafe {
+            fre_aot_regex_runtime_search_exclusive_from_partial_v1(
+                handle,
+                haystack.as_ptr(),
+                haystack.len(),
+                start,
+                end,
+                result,
+                expected_artifact_identity.as_ptr(),
+                resume_state,
+                resume_position,
+                u32::from(pending_end.is_some()),
+                pending_end.unwrap_or(0),
+            )
+        }
+    }
+
     fn expected_ffi(result: MatchResult) -> (u32, FreAotRegexResultV1) {
         match result {
             MatchResult::Exists(false)
@@ -1272,6 +1425,8 @@ mod tests {
             align_of::<*mut std::ffi::c_void>()
         );
         assert_eq!(size_of::<FreAotRegexResultV1>(), size_of::<[usize; 2]>());
+        assert_eq!(ARTIFACT_IDENTITY_BYTES, 32);
+        assert!(C_API_V1_HEADER.contains("FRE_AOT_REGEX_ARTIFACT_IDENTITY_BYTES 32u"));
         for symbol in [
             "fre_aot_regex_runtime_search_v1",
             "fre_aot_regex_runtime_prepare_v1",
@@ -1279,6 +1434,7 @@ mod tests {
             "fre_aot_regex_runtime_destroy_prepared_v1",
             "fre_aot_regex_runtime_prepare_exclusive_v1",
             "fre_aot_regex_runtime_search_exclusive_v1",
+            "fre_aot_regex_runtime_search_exclusive_from_partial_v1",
             "fre_aot_regex_runtime_destroy_exclusive_v1",
         ] {
             assert!(C_API_V1_HEADER.contains(symbol), "{symbol}");
@@ -1306,6 +1462,19 @@ mod tests {
             usize,
             *mut FreAotRegexResultV1,
         ) -> u32 = fre_aot_regex_runtime_search_exclusive_v1;
+        let _: unsafe extern "C" fn(
+            FreAotRegexExclusiveHandleV1,
+            *const u8,
+            usize,
+            usize,
+            usize,
+            *mut FreAotRegexResultV1,
+            *const u8,
+            usize,
+            usize,
+            u32,
+            usize,
+        ) -> u32 = fre_aot_regex_runtime_search_exclusive_from_partial_v1;
         let _: unsafe extern "C" fn(FreAotRegexExclusiveHandleV1) -> u32 =
             fre_aot_regex_runtime_destroy_exclusive_v1;
     }
@@ -1744,7 +1913,11 @@ mod tests {
             OutputContract::Span,
         ] {
             let mut limits = CompileLimitsV1::default();
-            limits.determinize.max_states = 32;
+            limits.determinize.max_states = if output == OutputContract::Exists {
+                8
+            } else {
+                16
+            };
             let compiled = compile(
                 CompileRequest::new(pattern, Target::x86_64_linux())
                     .mode(CompileMode::Optimizing)
@@ -1798,6 +1971,270 @@ mod tests {
             // call overlaps destruction.
             assert_eq!(
                 unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(exclusive) },
+                STATUS_SUCCESS
+            );
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "all output contracts and raw-boundary authentication failures share the same exclusive continuation lifecycle"
+    )]
+    fn exclusive_partial_resume_abi_authenticates_and_continues_without_replay() {
+        let cases = [
+            (
+                r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)",
+                OutputContract::Exists,
+                8,
+                b"xxcbbbbyyy".as_slice(),
+                0,
+                5,
+                None,
+            ),
+            (
+                r"(?:a+Q|[b-c][a-b]{1,10}(?:z[a-b]+|z))",
+                OutputContract::SelectedEnd,
+                10,
+                b"cbza".as_slice(),
+                2,
+                3,
+                Some(3),
+            ),
+            (
+                r"(?:a+Q|[b-c][a-b]{1,10}(?:z[a-b]+|z))",
+                OutputContract::Span,
+                10,
+                b"cbza".as_slice(),
+                2,
+                3,
+                Some(3),
+            ),
+        ];
+        let sentinel = FreAotRegexResultV1 { start: 71, end: 73 };
+
+        for (pattern, output, max_states, haystack, resume_state, resume_position, pending_end) in
+            cases
+        {
+            let mut limits = CompileLimitsV1::default();
+            limits.determinize.max_states = max_states;
+            let compiled = compile(
+                CompileRequest::new(pattern, Target::x86_64_linux())
+                    .mode(CompileMode::Optimizing)
+                    .limits(limits)
+                    .output(output),
+            )
+            .expect("compile retained partial artifact");
+            let stats = compiled
+                .program()
+                .partial_dfa_stats()
+                .expect("partial statistics")
+                .expect("retained partial table");
+            assert!(resume_state < stats.resume_frontiers);
+            let identity = compiled.receipt().program_sha256;
+            let serialized = compiled.program().serialize().expect("serialize partial");
+            let handle = prepare_exclusive(&serialized);
+
+            let mut expected_result = sentinel;
+            let expected_status =
+                call_exclusive(handle, haystack, 0, haystack.len(), &mut expected_result);
+            let mut resumed_result = sentinel;
+            let resumed_status = call_exclusive_from_partial(
+                handle,
+                haystack,
+                0,
+                haystack.len(),
+                &mut resumed_result,
+                &identity,
+                resume_state,
+                resume_position,
+                pending_end,
+            );
+            assert_eq!(
+                (resumed_status, resumed_result),
+                (expected_status, expected_result),
+                "{output:?}"
+            );
+
+            let mut wrong_identity = identity;
+            wrong_identity[0] ^= 1;
+            let mut result = sentinel;
+            {
+                let mut reject_resume = |expected_identity: &[u8; ARTIFACT_IDENTITY_BYTES],
+                                         state,
+                                         position,
+                                         pending| {
+                    result = sentinel;
+                    assert_eq!(
+                        call_exclusive_from_partial(
+                            handle,
+                            haystack,
+                            0,
+                            haystack.len(),
+                            &mut result,
+                            expected_identity,
+                            state,
+                            position,
+                            pending,
+                        ),
+                        STATUS_RUNTIME_FAILURE
+                    );
+                    assert_eq!(result, sentinel);
+                };
+                reject_resume(&wrong_identity, resume_state, resume_position, pending_end);
+                reject_resume(
+                    &identity,
+                    stats.resume_frontiers,
+                    resume_position,
+                    pending_end,
+                );
+                let wrong_pending = if pending_end.is_some() { None } else { Some(0) };
+                reject_resume(&identity, resume_state, resume_position, wrong_pending);
+                if pending_end.is_some() {
+                    reject_resume(
+                        &identity,
+                        resume_state,
+                        resume_position,
+                        resume_position.checked_add(1),
+                    );
+                }
+                for invalid_position in [0, haystack.len()] {
+                    reject_resume(&identity, resume_state, invalid_position, pending_end);
+                }
+            }
+            for (invalid_start, invalid_end) in [
+                (1, 0),
+                (
+                    0,
+                    haystack.len().checked_add(1).expect("small test haystack"),
+                ),
+            ] {
+                assert_eq!(
+                    call_exclusive_from_partial(
+                        handle,
+                        haystack,
+                        invalid_start,
+                        invalid_end,
+                        &mut result,
+                        &identity,
+                        resume_state,
+                        resume_position,
+                        pending_end,
+                    ),
+                    STATUS_INVALID_ARGUMENT
+                );
+                assert_eq!(result, sentinel);
+            }
+
+            if output == OutputContract::Exists {
+                let raw_call =
+                    |raw_handle, raw_haystack, raw_result, raw_identity, pending_present| {
+                        // SAFETY: every deliberately invalid pointer/flag is
+                        // rejected before dereference; all non-null extents remain
+                        // live and the exclusive handle has no overlapping call.
+                        unsafe {
+                            fre_aot_regex_runtime_search_exclusive_from_partial_v1(
+                                raw_handle,
+                                raw_haystack,
+                                haystack.len(),
+                                0,
+                                haystack.len(),
+                                raw_result,
+                                raw_identity,
+                                resume_state,
+                                resume_position,
+                                pending_present,
+                                pending_end.unwrap_or(0),
+                            )
+                        }
+                    };
+                assert_eq!(
+                    raw_call(
+                        handle,
+                        std::ptr::null(),
+                        &raw mut result,
+                        identity.as_ptr(),
+                        u32::from(pending_end.is_some()),
+                    ),
+                    STATUS_INVALID_ARGUMENT
+                );
+                assert_eq!(
+                    raw_call(
+                        handle,
+                        haystack.as_ptr(),
+                        std::ptr::null_mut(),
+                        identity.as_ptr(),
+                        u32::from(pending_end.is_some()),
+                    ),
+                    STATUS_INVALID_ARGUMENT
+                );
+                assert_eq!(
+                    raw_call(
+                        handle,
+                        haystack.as_ptr(),
+                        &raw mut result,
+                        std::ptr::null(),
+                        u32::from(pending_end.is_some()),
+                    ),
+                    STATUS_INVALID_ARGUMENT
+                );
+                assert_eq!(
+                    raw_call(
+                        handle,
+                        haystack.as_ptr(),
+                        &raw mut result,
+                        identity.as_ptr(),
+                        2,
+                    ),
+                    STATUS_INVALID_ARGUMENT
+                );
+                assert_eq!(
+                    raw_call(
+                        FreAotRegexExclusiveHandleV1::INVALID,
+                        haystack.as_ptr(),
+                        &raw mut result,
+                        identity.as_ptr(),
+                        u32::from(pending_end.is_some()),
+                    ),
+                    STATUS_INVALID_HANDLE
+                );
+                assert_eq!(result, sentinel);
+            }
+
+            let plain = compile(
+                CompileRequest::new(pattern, Target::x86_64_linux())
+                    .mode(CompileMode::Fast)
+                    .output(output),
+            )
+            .expect("compile no-partial artifact");
+            assert!(plain.program().partial_dfa_stats().unwrap().is_none());
+            let plain_identity = plain.receipt().program_sha256;
+            let plain_serialized = plain.program().serialize().expect("serialize plain");
+            let plain_handle = prepare_exclusive(&plain_serialized);
+            assert_eq!(
+                call_exclusive_from_partial(
+                    plain_handle,
+                    haystack,
+                    0,
+                    haystack.len(),
+                    &mut result,
+                    &plain_identity,
+                    resume_state,
+                    resume_position,
+                    pending_end,
+                ),
+                STATUS_RUNTIME_FAILURE
+            );
+            assert_eq!(result, sentinel);
+
+            // SAFETY: each handle is still uniquely owned and no call
+            // overlaps either destruction.
+            assert_eq!(
+                unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(plain_handle) },
+                STATUS_SUCCESS
+            );
+            assert_eq!(
+                unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(handle) },
                 STATUS_SUCCESS
             );
         }
