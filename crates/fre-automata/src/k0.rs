@@ -83,6 +83,10 @@ const _: () = assert!(BYTE_ALPHABET == 1 << 8);
 // avoids falling back to an ordered closure on every subsequent byte once a
 // moderately branching unbounded expression crosses 64 subsets.
 const LAZY_MAX_STATES: usize = 256;
+// Keep cold and short direct runs in the ordinary executor. Once four
+// consecutive transitions have proved this invocation's row path warm, bulk
+// accounting can amortize its entry and settlement work.
+const RESUME_DIRECT_BATCH_MIN_READY: u8 = 4;
 const _: () = assert!(LAZY_MAX_STATES <= BYTE_ALPHABET);
 const _: () = assert!(LAZY_MAX_STATES <= usize::MAX / BYTE_ALPHABET);
 const LAZY_MAX_ITEMS: usize = 16_384;
@@ -8254,8 +8258,9 @@ fn execute_lazy_resume_loop<const BATCH_WARM: bool>(
         ));
     }
     let mut boundaries = 1usize;
+    let mut direct_ready_streak = 0u8;
     loop {
-        if BATCH_WARM {
+        if BATCH_WARM && direct_ready_streak >= RESUME_DIRECT_BATCH_MIN_READY {
             if let LazyState::Cached(mut cached) = state {
                 let batch_start = position;
                 let mut direct_steps = 0usize;
@@ -8334,6 +8339,7 @@ fn execute_lazy_resume_loop<const BATCH_WARM: bool>(
                     &mut boundaries,
                 )?;
                 state = LazyState::Cached(cached);
+                direct_ready_streak = 0;
             }
         }
         if position == window.end() {
@@ -8348,6 +8354,7 @@ fn execute_lazy_resume_loop<const BATCH_WARM: bool>(
             .ok_or(SearchError::InternalInvariant {
                 detail: "resume source position exceeded the validated window",
             })?;
+        let mut warmed_direct = false;
         let transition = match state {
             LazyState::Cached(cached) => {
                 let class = automaton.byte_classes().class_of(byte);
@@ -8364,6 +8371,7 @@ fn execute_lazy_resume_loop<const BATCH_WARM: bool>(
                         position,
                     )?
                 } else {
+                    warmed_direct = true;
                     LazyTransition::Ready(cell)
                 }
             }
@@ -8420,6 +8428,13 @@ fn execute_lazy_resume_loop<const BATCH_WARM: bool>(
             ));
         };
         state = next;
+        if BATCH_WARM {
+            direct_ready_streak = if warmed_direct {
+                direct_ready_streak.saturating_add(1)
+            } else {
+                0
+            };
+        }
     }
 }
 
