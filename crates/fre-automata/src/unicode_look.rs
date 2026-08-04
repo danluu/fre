@@ -127,20 +127,41 @@ impl UnicodeLookMatcher {
         debug_assert!(at <= haystack.len());
         let before = &haystack[..at];
         let after = &haystack[at..];
-        let left_scalar = decode_last_utf8(before);
-        let right_scalar = decode_utf8(after);
         UnicodeWordBoundary {
-            left: classify_unicode_word_side(left_scalar, before.is_empty()),
-            right: classify_unicode_word_side(right_scalar, after.is_empty()),
+            left: classify_unicode_word_before(before),
+            right: classify_unicode_word_after(after),
         }
     }
 }
 
-fn classify_unicode_word_side(scalar: Option<char>, empty: bool) -> UnicodeWordSide {
+fn classify_unicode_word_before(bytes: &[u8]) -> UnicodeWordSide {
+    match bytes.last().copied() {
+        None => UnicodeWordSide::NonWord,
+        Some(byte) if byte.is_ascii() => classify_ascii_word_byte(byte),
+        Some(_) => classify_decoded_unicode_word_side(decode_last_utf8(bytes)),
+    }
+}
+
+fn classify_unicode_word_after(bytes: &[u8]) -> UnicodeWordSide {
+    match bytes.first().copied() {
+        None => UnicodeWordSide::NonWord,
+        Some(byte) if byte.is_ascii() => classify_ascii_word_byte(byte),
+        Some(_) => classify_decoded_unicode_word_side(decode_utf8(bytes)),
+    }
+}
+
+fn classify_ascii_word_byte(byte: u8) -> UnicodeWordSide {
+    if byte == b'_' || byte.is_ascii_alphanumeric() {
+        UnicodeWordSide::Word
+    } else {
+        UnicodeWordSide::NonWord
+    }
+}
+
+fn classify_decoded_unicode_word_side(scalar: Option<char>) -> UnicodeWordSide {
     match scalar {
         Some(character) if is_unicode_word_character(character) => UnicodeWordSide::Word,
         Some(_) => UnicodeWordSide::NonWord,
-        None if empty => UnicodeWordSide::NonWord,
         None => UnicodeWordSide::Invalid,
     }
 }
