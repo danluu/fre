@@ -3564,6 +3564,112 @@ pub(crate) fn search_prevalidated_window_with_authenticated_workspace(
     )
 }
 
+pub(crate) fn search_prevalidated_exact_start_with_authenticated_workspace(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    limits: SearchLimits,
+    contract: OutputContract,
+) -> Result<UntypedReport, SearchError> {
+    if workspace.bound_automaton_identity != automaton.identity() {
+        // A semantic clone does not share the facade's exact-identity proof.
+        // Re-enter shape and range validation, but preserve exact-start
+        // semantics rather than falling back to an ordinary unanchored search.
+        validate_window(haystack, window)?;
+        let mut setup = SetupAccounting::empty(workspace.retained_bytes, true);
+        let (meter, setup_work) = prepare_invocation(
+            automaton,
+            workspace,
+            window,
+            limits,
+            &mut setup,
+            false,
+            false,
+        )?;
+        return execute_exact_start_prepared(
+            automaton, haystack, window, workspace, setup, contract, meter, setup_work,
+        );
+    }
+    debug_assert!(validate_window(haystack, window).is_ok());
+    let mut setup = SetupAccounting::empty(workspace.retained_bytes, true);
+    let (meter, setup_work) = prepare_bound_invocation(
+        automaton,
+        workspace,
+        window,
+        limits,
+        &mut setup,
+        false,
+        false,
+    )?;
+    execute_exact_start_prepared(
+        automaton, haystack, window, workspace, setup, contract, meter, setup_work,
+    )
+}
+
+pub(crate) fn search_prevalidated_proved_exact_start_with_authenticated_workspace(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    limits: SearchLimits,
+    contract: OutputContract,
+) -> Result<UntypedReport, SearchError> {
+    let endpoint_contract = matches!(contract, OutputContract::SelectedEnd | OutputContract::Span);
+    let may_use_lazy = endpoint_contract
+        && automaton.stats().assertion_edges() == 0
+        && workspace.lazy.is_allocated()
+        && workspace.lazy.is_bound_to(automaton);
+    if workspace.bound_automaton_identity != automaton.identity() {
+        validate_window(haystack, window)?;
+        let mut setup = SetupAccounting::empty(workspace.retained_bytes, true);
+        let (meter, setup_work) = prepare_invocation(
+            automaton,
+            workspace,
+            window,
+            limits,
+            &mut setup,
+            may_use_lazy,
+            false,
+        )?;
+        return execute_proved_exact_start_prepared(
+            automaton,
+            haystack,
+            window,
+            workspace,
+            limits,
+            setup,
+            contract,
+            may_use_lazy,
+            meter,
+            setup_work,
+        );
+    }
+    debug_assert!(validate_window(haystack, window).is_ok());
+    let mut setup = SetupAccounting::empty(workspace.retained_bytes, true);
+    let (meter, setup_work) = prepare_bound_invocation(
+        automaton,
+        workspace,
+        window,
+        limits,
+        &mut setup,
+        may_use_lazy,
+        false,
+    )?;
+    execute_proved_exact_start_prepared(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        limits,
+        setup,
+        contract,
+        may_use_lazy,
+        meter,
+        setup_work,
+    )
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "the continuation entry keeps its authenticated frontier and original window explicit"
@@ -4374,6 +4480,145 @@ fn execute_bound_prevalidated(
         setup_work,
         start_proof,
     )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the exact-start entry retains the authenticated invocation ledger"
+)]
+fn execute_exact_start_prepared(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    setup: SetupAccounting,
+    contract: OutputContract,
+    mut meter: WorkMeter,
+    setup_work: u64,
+) -> Result<UntypedReport, SearchError> {
+    let earliest = matches!(
+        contract,
+        OutputContract::Exists | OutputContract::EarliestEnd
+    );
+    let (found, boundaries) = execute_exact_start_loop(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        &mut meter,
+        earliest,
+    )?;
+    let transition_work =
+        meter
+            .consumed
+            .checked_sub(setup_work)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "exact-start setup work exceeded total search work",
+            })?;
+    Ok(UntypedReport {
+        found,
+        accounting: SearchAccounting::new(
+            meter.consumed,
+            setup,
+            transition_work,
+            workspace.retained_bytes,
+            boundaries,
+        ),
+    })
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the proved-start entry retains its lazy admission and invocation ledger"
+)]
+fn execute_proved_exact_start_prepared(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    limits: SearchLimits,
+    setup: SetupAccounting,
+    contract: OutputContract,
+    may_use_lazy: bool,
+    mut meter: WorkMeter,
+    setup_work: u64,
+) -> Result<UntypedReport, SearchError> {
+    let window_bytes = window
+        .end()
+        .checked_sub(window.start())
+        .ok_or(SearchError::InternalInvariant {
+            detail: "validated proved-start window descends",
+        })?;
+    let core_reserve = if may_use_lazy && limits.max_work != u64::MAX {
+        automaton
+            .conservative_transition_work_bound(window_bytes)
+            .unwrap_or(u64::MAX)
+    } else {
+        0
+    };
+    let lazy = if may_use_lazy
+        && prepare_lazy(
+            automaton,
+            workspace,
+            &mut meter,
+            core_reserve,
+            window.start(),
+        )?
+    {
+        let mut adaptive_probe = AdaptiveStartProbe::default();
+        execute_lazy_span_loop::<false>(
+            automaton,
+            haystack,
+            window,
+            workspace,
+            &mut meter,
+            contract,
+            core_reserve,
+            None,
+            None,
+            None,
+            &mut adaptive_probe,
+            DirectLazyReady,
+        )?
+    } else {
+        None
+    };
+    let (found, boundaries) = if let Some((Some(found), boundaries, _)) = lazy {
+        (Some(found), boundaries)
+    } else {
+        // A valid matching-start proof cannot reach either decline. Preserve
+        // exact semantics under an unavailable lazy tier and make a false
+        // proof fail closed when the lazy machine finds no match.
+        let earliest = matches!(
+            contract,
+            OutputContract::Exists | OutputContract::EarliestEnd
+        );
+        execute_exact_start_loop(
+            automaton,
+            haystack,
+            window,
+            workspace,
+            &mut meter,
+            earliest,
+        )?
+    };
+    let transition_work =
+        meter
+            .consumed
+            .checked_sub(setup_work)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "proved-start setup work exceeded total search work",
+            })?;
+    Ok(UntypedReport {
+        found,
+        accounting: SearchAccounting::new(
+            meter.consumed,
+            setup,
+            transition_work,
+            workspace.retained_bytes,
+            boundaries,
+        ),
+    })
 }
 
 #[allow(
@@ -8091,6 +8336,87 @@ fn execute_unfiltered_loop(
             .checked_add(1)
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "input position",
+            })?;
+    }
+
+    Ok((pending, boundaries))
+}
+
+/// Execute one ordered start frontier without admitting any later start.
+///
+/// The caller has already reset the workspace. Every root produced after the
+/// initial expansion therefore retains `window.start()` provenance, including
+/// through assertion-bearing epsilon closures.
+fn execute_exact_start_loop(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    earliest: bool,
+) -> Result<(Option<MatchSpan>, usize), SearchError> {
+    let mut position = window.start();
+    let mut boundaries = 0usize;
+    let mut pending = None;
+    let mut initial = true;
+
+    loop {
+        boundaries = boundaries
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "exact-start examined boundary count",
+            })?;
+        workspace.begin_boundary(meter, position)?;
+
+        let root_count = workspace.roots_len;
+        let mut root_index = 0usize;
+        while root_index < root_count {
+            let root = workspace.roots[root_index];
+            if let Some(found) =
+                expand_root(automaton, haystack, position, root, workspace, meter)?
+            {
+                pending = Some(found);
+                break;
+            }
+            root_index =
+                root_index
+                    .checked_add(1)
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "exact-start next-boundary root index",
+                    })?;
+        }
+        workspace.roots_len = 0;
+
+        if initial {
+            debug_assert_eq!(root_count, 0);
+            pending = expand_root(
+                automaton,
+                haystack,
+                position,
+                Thread {
+                    state: automaton.start,
+                    start: window.start(),
+                },
+                workspace,
+                meter,
+            )?;
+            initial = false;
+        }
+
+        if earliest && pending.is_some() {
+            break;
+        }
+        // Once the single authenticated start frontier dies, no later start
+        // may be introduced and the pending endpoint (if any) is selected.
+        if workspace.current_len == 0 || position == window.end() {
+            break;
+        }
+
+        consume_current(automaton, haystack[position], position, workspace, meter)?;
+        position = position
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "exact-start input position",
             })?;
     }
 
@@ -13242,6 +13568,201 @@ mod tests {
             frontier = next;
         }
         words
+    }
+
+    /// Derive exact-start results from the ordinary unanchored Pike contract.
+    ///
+    /// A match at `window.start()` must beat every later start, so the
+    /// ordinary selected span is an exact-start witness precisely when its
+    /// start equals the window start. Repeating that independent query over
+    /// every prefix ceiling yields the first accepting boundary as well.
+    fn exact_start_oracle(
+        plan: &Automaton,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut K0Workspace,
+    ) -> (bool, Option<usize>, Option<usize>, Option<MatchSpan>) {
+        let selected = plan
+            .prepare::<Span>()
+            .search_window_with_workspace(
+                haystack,
+                window,
+                workspace,
+                SearchLimits::unlimited(),
+            )
+            .unwrap()
+            .into_output()
+            .filter(|span| span.start() == window.start());
+        let earliest = if selected.is_some() {
+            (window.start()..=window.end()).find(|&end| {
+                plan.prepare::<Span>()
+                    .search_window_with_workspace(
+                        haystack,
+                        SearchWindow::new(window.start(), end),
+                        workspace,
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap()
+                    .into_output()
+                    .is_some_and(|span| span.start() == window.start())
+            })
+        } else {
+            None
+        };
+        (
+            selected.is_some(),
+            earliest,
+            selected.map(MatchSpan::end),
+            selected,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one exact-start differential checks all four contracts over the same windows"
+    )]
+    fn assert_exact_start_all_contracts(
+        name: &str,
+        plan: &Automaton,
+        haystacks: &[Vec<u8>],
+    ) -> usize {
+        let mut oracle = K0Workspace::new(plan, WorkspaceLimits::unlimited()).unwrap();
+        let mut exact =
+            K0Workspace::new_bidirectional(plan, WorkspaceLimits::unlimited()).unwrap();
+        let mut proved =
+            K0Workspace::new_bidirectional(plan, WorkspaceLimits::unlimited()).unwrap();
+        let mut checked = 0usize;
+
+        for haystack in haystacks {
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let window = SearchWindow::new(start, end);
+                    let (want_exists, want_earliest, want_selected, want_span) =
+                        exact_start_oracle(plan, haystack, window, &mut oracle);
+
+                    let got_exists = plan
+                        .prepare::<Exists>()
+                        .search_prevalidated_exact_start_with_authenticated_workspace(
+                            haystack,
+                            window,
+                            &mut exact,
+                            SearchLimits::unlimited(),
+                        )
+                        .unwrap()
+                        .into_output();
+                    assert_eq!(
+                        got_exists, want_exists,
+                        "{name}: exact Exists mismatch source={haystack:?} window={window:?}"
+                    );
+
+                    let got_earliest = plan
+                        .prepare::<EarliestEnd>()
+                        .search_prevalidated_exact_start_with_authenticated_workspace(
+                            haystack,
+                            window,
+                            &mut exact,
+                            SearchLimits::unlimited(),
+                        )
+                        .unwrap()
+                        .into_output();
+                    assert_eq!(
+                        got_earliest, want_earliest,
+                        "{name}: exact EarliestEnd mismatch source={haystack:?} window={window:?}"
+                    );
+
+                    let got_selected = plan
+                        .prepare::<SelectedEnd>()
+                        .search_prevalidated_exact_start_with_authenticated_workspace(
+                            haystack,
+                            window,
+                            &mut exact,
+                            SearchLimits::unlimited(),
+                        )
+                        .unwrap()
+                        .into_output();
+                    assert_eq!(
+                        got_selected, want_selected,
+                        "{name}: exact SelectedEnd mismatch source={haystack:?} window={window:?}"
+                    );
+
+                    let got_span = plan
+                        .prepare::<Span>()
+                        .search_prevalidated_exact_start_with_authenticated_workspace(
+                            haystack,
+                            window,
+                            &mut exact,
+                            SearchLimits::unlimited(),
+                        )
+                        .unwrap()
+                        .into_output();
+                    assert_eq!(
+                        got_span, want_span,
+                        "{name}: exact Span mismatch source={haystack:?} window={window:?}"
+                    );
+
+                    if want_exists {
+                        let proved_exists = plan
+                            .prepare::<Exists>()
+                            .search_prevalidated_proved_exact_start_with_authenticated_workspace(
+                                haystack,
+                                window,
+                                &mut proved,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap()
+                            .into_output();
+                        assert!(
+                            proved_exists,
+                            "{name}: proved Exists mismatch source={haystack:?} window={window:?}"
+                        );
+                        let proved_earliest = plan
+                            .prepare::<EarliestEnd>()
+                            .search_prevalidated_proved_exact_start_with_authenticated_workspace(
+                                haystack,
+                                window,
+                                &mut proved,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap()
+                            .into_output();
+                        assert_eq!(
+                            proved_earliest, want_earliest,
+                            "{name}: proved EarliestEnd mismatch source={haystack:?} window={window:?}"
+                        );
+                        let proved_selected = plan
+                            .prepare::<SelectedEnd>()
+                            .search_prevalidated_proved_exact_start_with_authenticated_workspace(
+                                haystack,
+                                window,
+                                &mut proved,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap()
+                            .into_output();
+                        assert_eq!(
+                            proved_selected, want_selected,
+                            "{name}: proved SelectedEnd mismatch source={haystack:?} window={window:?}"
+                        );
+                        let proved_span = plan
+                            .prepare::<Span>()
+                            .search_prevalidated_proved_exact_start_with_authenticated_workspace(
+                                haystack,
+                                window,
+                                &mut proved,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap()
+                            .into_output();
+                        assert_eq!(
+                            proved_span, want_span,
+                            "{name}: proved Span mismatch source={haystack:?} window={window:?}"
+                        );
+                    }
+                    checked = checked.checked_add(1).unwrap();
+                }
+            }
+        }
+        checked
     }
 
     fn assert_all_windows_match_unspecialized(
@@ -19011,6 +19532,58 @@ mod tests {
             assert!(!bidirectional.reverse.declined);
         }
         assert!(checked > 10_000);
+    }
+
+    #[test]
+    fn exact_start_replay_is_exhaustive_for_every_contract_and_assertion() {
+        let mut haystacks = bounded_words(b"a:!\n_", 3);
+        haystacks.extend([
+            b"\r\na!\r\n".to_vec(),
+            b";a!;".to_vec(),
+            "éa! α:a".as_bytes().to_vec(),
+            vec![0x80, b'a', b'!', 0xc3, b':'],
+            vec![b'x', 0xf0, 0x28, 0x8c, 0xbc, b'a', b'!'],
+        ]);
+        let assertion_free = [
+            a_plus(true),
+            a_plus(false),
+            a_star(true),
+            a_star(false),
+            greedy_a_star_b(),
+            lazy_a_star_b(),
+            ordered_a_or_ab(true),
+            ordered_a_or_ab(false),
+            greedy_a_plus_or_a(),
+        ];
+        let mut checked = 0usize;
+        for (index, plan) in assertion_free.iter().enumerate() {
+            checked = checked
+                .checked_add(assert_exact_start_all_contracts(
+                    &format!("assertion-free-{index}"),
+                    plan,
+                    &haystacks,
+                ))
+                .unwrap();
+        }
+        for kind in super::ASSERTION_KINDS {
+            let leading = assertion_or_colon(kind).with_line_terminator(b';');
+            checked = checked
+                .checked_add(assert_exact_start_all_contracts(
+                    &format!("leading-{}", kind.name()),
+                    &leading,
+                    &haystacks,
+                ))
+                .unwrap();
+            let trailing = trailing_assertion_or_bang(kind).with_line_terminator(b';');
+            checked = checked
+                .checked_add(assert_exact_start_all_contracts(
+                    &format!("trailing-{}", kind.name()),
+                    &trailing,
+                    &haystacks,
+                ))
+                .unwrap();
+        }
+        assert!(checked > 50_000);
     }
 
     #[test]

@@ -454,6 +454,89 @@ impl<O: Operation> TypedPlan<'_, O> {
         ))
     }
 
+    /// Replay the ordered automaton from exactly the first boundary of a
+    /// caller-validated window.
+    ///
+    /// Unlike an ordinary search, this entry never injects a new start after
+    /// `window.start()`. It is reserved for facades that carry an independent
+    /// graph proof that the globally selected match begins at that boundary.
+    /// Assertions still inspect the original `haystack`, and ordered
+    /// alternation plus greedy/lazy priority remain authoritative for the
+    /// selected endpoint.
+    ///
+    /// This bridge does not trust the proof for memory safety: a false proof
+    /// simply produces no match. The exact automaton/workspace identity and
+    /// the caller's prevalidated window retain the same contract as
+    /// [`Self::search_prevalidated_window_with_authenticated_workspace`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] for an incompatible workspace shape,
+    /// insufficient hard limits, or an execution failure. Supplying an invalid
+    /// window violates this facade-only entry's precondition.
+    #[doc(hidden)]
+    pub fn search_prevalidated_exact_start_with_authenticated_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut K0Workspace,
+        limits: SearchLimits,
+    ) -> Result<SearchReport<O::Output>, SearchError> {
+        let report = crate::k0::search_prevalidated_exact_start_with_authenticated_workspace(
+            self.automaton,
+            haystack,
+            window,
+            workspace,
+            limits,
+            O::CONTRACT,
+        )?;
+        Ok(SearchReport::new(
+            O::project(report.found),
+            report.accounting,
+        ))
+    }
+
+    /// Replay a caller-proved matching start through ordered lazy rows when
+    /// their assertion-free route is available.
+    ///
+    /// This is the stronger counterpart to
+    /// [`Self::search_prevalidated_exact_start_with_authenticated_workspace`]:
+    /// the facade must prove both that `window.start()` is globally earliest
+    /// and that a match beginning there exists. That proof makes every later
+    /// root carried by an ordinary ordered lazy row permanently lower
+    /// priority, so K0 may omit source-start bookkeeping while it selects the
+    /// exact start's greedy/lazy endpoint. Unsupported contracts and
+    /// assertion-bearing graphs retain the exact-start Pike route.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] for an incompatible workspace shape,
+    /// insufficient hard limits, or an execution failure. Supplying an invalid
+    /// window or a false matching-start proof violates this facade-only
+    /// entry's precondition.
+    #[doc(hidden)]
+    pub fn search_prevalidated_proved_exact_start_with_authenticated_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut K0Workspace,
+        limits: SearchLimits,
+    ) -> Result<SearchReport<O::Output>, SearchError> {
+        let report =
+            crate::k0::search_prevalidated_proved_exact_start_with_authenticated_workspace(
+                self.automaton,
+                haystack,
+                window,
+                workspace,
+                limits,
+                O::CONTRACT,
+            )?;
+        Ok(SearchReport::new(
+            O::project(report.found),
+            report.accounting,
+        ))
+    }
+
     /// Continue from one authenticated ordered consuming frontier at an
     /// already-consumed byte boundary.
     ///

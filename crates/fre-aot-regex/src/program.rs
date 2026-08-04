@@ -3601,7 +3601,7 @@ impl CompiledProgram {
         let replay_end = earliest_start
             .checked_add(maximum_width)
             .map_or(window.end, |end| end.min(window.end));
-        self.search_nfa_unaccelerated(
+        self.search_nfa_at_exact_start(
             haystack,
             SearchWindow::new(earliest_start, replay_end),
             workspace,
@@ -3700,6 +3700,55 @@ impl CompiledProgram {
             OutputContract::SelectedEnd => MatchResult::SelectedEnd(None),
             OutputContract::Span => MatchResult::Span(None),
         }))
+    }
+
+    /// Replay one graph-authenticated start without admitting any later root.
+    ///
+    /// The mandatory-suffix reverse machine proves that `window.start` is the
+    /// globally earliest viable start. K0 remains authoritative for ordered
+    /// alternation and greedy/lazy endpoint priority, but need not rediscover
+    /// that start through its ordinary unanchored scanner or reverse recovery.
+    fn search_nfa_at_exact_start(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut K0Workspace,
+    ) -> Result<MatchResult, CompileError> {
+        let window = K0SearchWindow::new(window.start, window.end);
+        let limits = SearchLimits::unlimited();
+        match self.output {
+            OutputContract::Exists => {
+                let found = self
+                    .automaton
+                    .prepare::<Exists>()
+                    .search_prevalidated_exact_start_with_authenticated_workspace(
+                        haystack, window, workspace, limits,
+                    )?
+                    .into_output();
+                Ok(MatchResult::Exists(found))
+            }
+            OutputContract::SelectedEnd => {
+                let found = self
+                    .automaton
+                    .prepare::<SelectedEnd>()
+                    .search_prevalidated_proved_exact_start_with_authenticated_workspace(
+                        haystack, window, workspace, limits,
+                    )?
+                    .into_output();
+                Ok(MatchResult::SelectedEnd(found))
+            }
+            OutputContract::Span => {
+                let found = self
+                    .automaton
+                    .prepare::<Span>()
+                    .search_prevalidated_proved_exact_start_with_authenticated_workspace(
+                        haystack, window, workspace, limits,
+                    )?
+                    .into_output()
+                    .map(|span| (span.start(), span.end()));
+                Ok(MatchResult::Span(found))
+            }
+        }
     }
 
     fn search_nfa_unaccelerated(
