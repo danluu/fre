@@ -114,8 +114,11 @@ OPTIONS:
   --pattern-name NAME    Measure only this generated pattern name.
   --route NAME           Measure only direct_dfa, direct_context_dfa,
                          direct_resource_fallback,
-                         prepared_runtime_assertion, or
-                         prepared_runtime_resource_fallback.
+                         prepared_runtime_assertion,
+                         ordinary_runtime_resource_fallback, or
+                         prepared_runtime_resource_fallback. Retained resource
+                         fallbacks without a published native prepared entry
+                         use ordinary_runtime_resource_fallback.
   --measurement-order O  Timed engine order: upstream-native (default) or
                          native-upstream. All build/link/runtime preparation
                          completes before either timed phase.
@@ -128,10 +131,11 @@ OPTIONS:
                          separate assertion fallback route. This is a generic
                          fallback diagnostic, not a pattern allowlist.
   --force-retained-resource-fallback
-                         Probe each source structurally, then force a canonical
-                         decline that preserves nonempty DFA rows when the
-                         graph supports them. Keeps excluded exact-product and
-                         contextual rows in the printed diagnostic matrix.
+                        Probe each source structurally, then force a canonical
+                        decline that preserves nonempty DFA rows when the
+                        graph supports them. Retained rows must publish their
+                        native prepared entry. Keeps excluded exact-product
+                        and contextual rows in the printed diagnostic matrix.
   --seed N               Measure one generated seed (decimal or 0x-prefixed).
                          Both grammar modes accept any new root seed.
   --grammar              Use the separate seeded grammar-generated diagnostic
@@ -289,6 +293,7 @@ impl Config {
                     | "direct_context_dfa"
                     | "direct_resource_fallback"
                     | "prepared_runtime_assertion"
+                    | "ordinary_runtime_resource_fallback"
                     | "prepared_runtime_resource_fallback"
             )
         {
@@ -1786,8 +1791,10 @@ impl CompiledShape {
             EngineSelectionReason::DeterminizationResourceLimit => {
                 if self.runtime_program.is_none() {
                     "direct_resource_fallback"
-                } else {
+                } else if self.aot.module().prepared_entry_symbol().is_some() {
                     "prepared_runtime_resource_fallback"
+                } else {
+                    "ordinary_runtime_resource_fallback"
                 }
             }
             EngineSelectionReason::FastMode => "unexpected_fast_mode",
@@ -1997,6 +2004,13 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
                 ));
             }
             let partial_dfa = retained_partial_stats(&aot)?;
+            let prepared_entry_published = aot.module().prepared_entry_symbol().is_some();
+            if prepared_entry_published && (runtime_program.is_none() || partial_dfa.is_none()) {
+                return Err(format!(
+                    "{} published a prepared native entry without its retained runtime artifact",
+                    spec.name
+                ));
+            }
             let fallback_artifact_kind = if partial_dfa.is_some() {
                 "retained_partial"
             } else if exact_product {
@@ -2015,9 +2029,10 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
                         || runtime_program.is_none()
                         || stats.complete_rows == 0
                         || !stats.optimized_entry_supported
+                        || !prepared_entry_published
                     {
                         return Err(format!(
-                            "{} retained-row probe produced an inconsistent artifact: reason={reason:?}, engine={:?}, runtime={}, stats={stats:?}",
+                            "{} retained-row probe produced an inconsistent artifact: reason={reason:?}, engine={:?}, runtime={}, prepared_entry_published={prepared_entry_published}, stats={stats:?}",
                             spec.name,
                             aot.receipt().engine,
                             runtime_program.is_some(),
@@ -2038,6 +2053,16 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
         .collect::<Result<Vec<_>, String>>()?;
     if let Some(route) = config.route_filter.as_deref() {
         shapes.retain(|shape| shape.route() == route);
+        if route == "prepared_runtime_resource_fallback"
+            && shapes
+                .iter()
+                .any(|shape| shape.aot.module().prepared_entry_symbol().is_none())
+        {
+            return Err(
+                "prepared runtime route selected an artifact without a published native entry"
+                    .to_owned(),
+            );
+        }
     }
     if shapes.is_empty() {
         return Err("the requested filters selected no generated patterns".to_owned());
@@ -3465,7 +3490,7 @@ fn command_version(program: &OsStr, argument: &str) -> String {
 
 fn print_partial_dfa_metadata(shapes: &[CompiledShape]) {
     println!(
-        "#partial_dfa\tpattern\tfamily\tseed\toutput\tartifact_kind\tscore_scope\tlimit_derivation\truntime_program\tcomplete_rows\tdiscovered_states\tresume_frontiers\tresume_items\toptimized_entry_supported\tmin_input_bytes\trequested_max_states\trequested_max_transitions\trequested_max_work\teffective_max_states\teffective_max_transitions\teffective_max_work\tdecline_stage\tdecline_resource\twork_completed\tstates_completed\ttransitions_completed\texact_product\tstatus"
+        "#partial_dfa\tpattern\tfamily\tseed\toutput\tartifact_kind\tscore_scope\tlimit_derivation\truntime_program\tprepared_entry_published\tprepared_entry_symbol\tcomplete_rows\tdiscovered_states\tresume_frontiers\tresume_items\toptimized_entry_supported\tmin_input_bytes\trequested_max_states\trequested_max_transitions\trequested_max_work\teffective_max_states\teffective_max_transitions\teffective_max_work\tdecline_stage\tdecline_resource\twork_completed\tstates_completed\ttransitions_completed\texact_product\tstatus"
     );
     for shape in shapes {
         let report = &shape.aot.receipt().determinization;
@@ -3498,6 +3523,18 @@ fn print_partial_dfa_metadata(shapes: &[CompiledShape]) {
             },
             shape.retained_limit_derivation.to_owned(),
             shape.runtime_program.is_some().to_string(),
+            shape
+                .aot
+                .module()
+                .prepared_entry_symbol()
+                .is_some()
+                .to_string(),
+            shape
+                .aot
+                .module()
+                .prepared_entry_symbol()
+                .unwrap_or("none")
+                .to_owned(),
             number(partial.map(|stats| stats.complete_rows as u64)),
             number(partial.map(|stats| stats.discovered_states as u64)),
             number(partial.map(|stats| stats.resume_frontiers as u64)),
@@ -3876,6 +3913,65 @@ mod tests {
             retained_limit_derivation: "legacy_zero_state",
         };
         assert_eq!(shape.route(), "direct_resource_fallback");
+    }
+
+    #[test]
+    fn retained_resource_routes_track_the_published_prepared_symbol() {
+        let target = Target::x86_64_linux();
+        let limits = CompileLimitsV1 {
+            determinize: fre_aot_regex::DeterminizeLimits {
+                max_states: 8,
+                ..fre_aot_regex::DeterminizeLimits::default()
+            },
+            ..CompileLimitsV1::default()
+        };
+        let mut base_spec = grammar_patterns(&flat_grammar_config(Some(UNSEEN_TEST_SEED)))
+            .into_iter()
+            .next()
+            .expect("grammar shape");
+        base_spec.output = OutputKind::SelectedEnd;
+
+        for (pattern, expected_route, prepared) in [
+            (
+                "a+Q|[b-c][a-b]{1,5}(?:x+|y+)|a*",
+                "prepared_runtime_resource_fallback",
+                true,
+            ),
+            (
+                r"(?-u:[\x00-\xFF])*(?:a+Q|[b-c][a-b]{1,5}(?:x+|y+))Z",
+                "ordinary_runtime_resource_fallback",
+                false,
+            ),
+        ] {
+            let aot = compile(
+                CompileRequest::new(pattern, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::SelectedEnd)
+                    .limits(limits),
+            )
+            .expect("compile retained route fixture");
+            let runtime_program = aot
+                .module()
+                .required_runtime_program()
+                .map(|(symbol, bytes)| (symbol.to_owned(), bytes));
+            let partial_dfa = retained_partial_stats(&aot).unwrap();
+            assert!(runtime_program.is_some());
+            assert!(partial_dfa.is_some());
+            assert_eq!(aot.module().prepared_entry_symbol().is_some(), prepared);
+
+            let mut spec = base_spec.clone();
+            spec.pattern = pattern.to_owned();
+            let shape = CompiledShape {
+                spec,
+                upstream: Regex::new(pattern).unwrap(),
+                aot,
+                runtime_program,
+                partial_dfa,
+                fallback_artifact_kind: "retained_partial",
+                retained_limit_derivation: "forward_state_limit",
+            };
+            assert_eq!(shape.route(), expected_route);
+        }
     }
 
     #[test]
