@@ -2414,6 +2414,7 @@ struct PartialDfaRuntimeState {
     consecutive_fallbacks: u8,
     bypass_remaining: u16,
     native_entry_in_flight: bool,
+    native_entry_window: Option<SearchWindow>,
     prefix_plan: Option<PartialDfaPrefixPlan>,
     prefix_supported: bool,
     #[cfg(test)]
@@ -2460,6 +2461,7 @@ impl PartialDfaRuntimeState {
     fn claim_native_entry(&mut self) -> bool {
         self.finish_unobserved_native_entry();
         let enter = self.prefix_supported && self.bypass_remaining == 0;
+        debug_assert!(self.native_entry_window.is_none());
         self.native_entry_in_flight = enter;
         enter
     }
@@ -2469,12 +2471,19 @@ impl PartialDfaRuntimeState {
     /// admission choreography, a decline here consumes one adaptive bypass:
     /// the combined preflight completes K0 itself instead of tail-calling the
     /// ordinary entry to consume it.
-    fn claim_native_entry_after_accelerators(&mut self) -> bool {
+    fn claim_native_entry_after_accelerators(
+        &mut self,
+        span_postflight_window: Option<SearchWindow>,
+    ) -> bool {
         debug_assert!(!self.native_entry_in_flight);
+        debug_assert!(self.native_entry_window.is_none());
         if !self.prefix_supported {
             false
         } else if self.bypass_remaining == 0 {
             self.native_entry_in_flight = true;
+            if let Some(window) = span_postflight_window {
+                self.native_entry_window = Some(window);
+            }
             true
         } else {
             self.bypass_remaining = self.bypass_remaining.saturating_sub(1);
@@ -2488,19 +2497,38 @@ impl PartialDfaRuntimeState {
     /// retained execution at that point.
     fn finish_unobserved_native_entry(&mut self) {
         if self.native_entry_in_flight {
-            self.native_entry_in_flight = false;
             self.observe_complete();
+        } else {
+            debug_assert!(self.native_entry_window.is_none());
+        }
+    }
+
+    /// Consume an entry admitted by the combined preflight and authenticate
+    /// the exact narrowed window on which native retained rows ran. Reaching
+    /// a continuation boundary proves that the entry did not return locally,
+    /// so even a mismatched callback aborts the outstanding transaction.
+    fn consume_native_entry_window(&mut self, window: SearchWindow) -> bool {
+        let authenticated =
+            self.native_entry_in_flight && self.native_entry_window == Some(window);
+        self.clear_native_entry();
+        authenticated
+    }
+
+    fn clear_native_entry(&mut self) {
+        self.native_entry_in_flight = false;
+        if self.native_entry_window.is_some() {
+            self.native_entry_window = None;
         }
     }
 
     fn observe_complete(&mut self) {
-        self.native_entry_in_flight = false;
+        self.clear_native_entry();
         self.consecutive_fallbacks = 0;
         self.bypass_remaining = 0;
     }
 
     fn observe_resume(&mut self, consumed: usize, input_bytes: usize) {
-        self.native_entry_in_flight = false;
+        self.clear_native_entry();
         #[cfg(test)]
         {
             self.resumed = self.resumed.saturating_add(1);
@@ -3604,7 +3632,7 @@ impl CompiledProgram {
         // Reaching the continuation ABI proves that the claimed native entry
         // did not complete locally. Do not let a later search misclassify a
         // failed authentication or K0 continuation as a completed probe.
-        partial_workspace.state.native_entry_in_flight = false;
+        partial_workspace.state.clear_native_entry();
         if partial_workspace
             .resume
             .as_ref()
@@ -3632,6 +3660,122 @@ impl CompiledProgram {
             window.end.saturating_sub(window.start),
         );
         Ok(found)
+    }
+
+    /// Recover the selected start after an authenticated native retained-row
+    /// completion produced only the selected endpoint.
+    ///
+    /// This seam is intentionally narrower than a general reverse search. It
+    /// accepts only a variable-width, non-nullable [`OutputContract::Span`]
+    /// artifact with genuinely incomplete retained rows, and only immediately
+    /// after the combined preflight admitted the exact supplied window. The
+    /// endpoint must lie inside that non-empty window. Reverse K0 then proves
+    /// a span ending at exactly the native-selected endpoint without replaying
+    /// the forward search.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed invalid-window error before reading the haystack, or an
+    /// invariant/search error if the artifact, workspace, engine, retained
+    /// table, output contract, admitted window, selected endpoint, or reverse
+    /// result does not authenticate. Once the exact admitted transaction is
+    /// reached, it is cleared before any fallible reverse work so a later
+    /// preflight cannot misclassify a failed continuation as a local native
+    /// completion.
+    #[doc(hidden)]
+    pub fn recover_retained_partial_span_from_selected_end_with_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        expected_artifact_identity: [u8; 32],
+        selected_end: usize,
+    ) -> Result<MatchResult, CompileError> {
+        if window.start > window.end || window.end > haystack.len() {
+            return Err(CompileError::InvalidWindow {
+                start: window.start,
+                end: window.end,
+                haystack_len: haystack.len(),
+            });
+        }
+        if expected_artifact_identity != self.identity.artifact {
+            return Err(CompileError::InternalInvariant(
+                "retained partial Span recovery artifact identity does not match the prepared program",
+            ));
+        }
+        if !workspace.identity.compatible(&self.identity) {
+            return Err(CompileError::InternalInvariant(
+                "program workspace belongs to a different semantic program",
+            ));
+        }
+        if self.context_dfa.is_some() || !matches!(self.engine, ProgramEngine::OrderedNfa) {
+            return Err(CompileError::InternalInvariant(
+                "retained partial Span recovery requires the universal ordered-NFA engine",
+            ));
+        }
+        if self.output != OutputContract::Span {
+            return Err(CompileError::InternalInvariant(
+                "retained partial Span recovery requires the Span output contract",
+            ));
+        }
+        let partial = self.partial_dfa().ok_or(CompileError::InternalInvariant(
+            "retained partial Span recovery was selected without retained rows",
+        ))?;
+        if partial.native_incomplete_view().is_none() {
+            return Err(CompileError::InternalInvariant(
+                "retained partial Span recovery requires incomplete retained rows",
+            ));
+        }
+        if partial.initial_pending() || self.exact_match_width.is_some() {
+            return Err(CompileError::InternalInvariant(
+                "retained partial Span recovery requires a variable-width non-nullable artifact",
+            ));
+        }
+
+        let ProgramWorkspace { nfa, partial, .. } = workspace;
+        let partial_workspace = partial.as_deref_mut().ok_or(
+            CompileError::InternalInvariant(
+                "retained partial Span recovery has no prepared retained workspace",
+            ),
+        )?;
+        if !partial_workspace.state.consume_native_entry_window(window) {
+            return Err(CompileError::InternalInvariant(
+                "retained partial Span recovery window was not admitted by preflight",
+            ));
+        }
+        if selected_end <= window.start || selected_end > window.end {
+            return Err(CompileError::InternalInvariant(
+                "retained partial Span recovery endpoint is not inside the admitted window",
+            ));
+        }
+
+        let workspace = nfa.as_mut().ok_or(CompileError::InternalInvariant(
+            "retained partial Span recovery has no prepared bidirectional K0 workspace",
+        ))?;
+        let recovered = self
+            .automaton
+            .prepare::<Span>()
+            .recover_span_from_selected_end_with_workspace(
+                haystack,
+                K0SearchWindow::new(window.start, window.end),
+                workspace,
+                selected_end,
+                SearchLimits::unlimited(),
+            )?
+            .into_output();
+        if recovered.start() < window.start
+            || recovered.start() > selected_end
+            || recovered.end() != selected_end
+        {
+            return Err(CompileError::InternalInvariant(
+                "reverse K0 did not recover a span inside the admitted window at the native forward-selected endpoint",
+            ));
+        }
+        partial_workspace.state.observe_reverse_recovered(
+            selected_end.saturating_sub(window.start),
+            window.end.saturating_sub(window.start),
+        );
+        Ok(MatchResult::Span(Some((recovered.start(), selected_end))))
     }
 
     /// Authenticate and prepare one native incomplete-retained execution.
@@ -3681,11 +3825,13 @@ impl CompiledProgram {
                 "retained partial preflight requires the universal ordered-NFA engine",
             ));
         }
-        if self.partial_dfa().is_none() {
-            return Err(CompileError::InternalInvariant(
-                "retained partial preflight requires retained rows",
-            ));
-        }
+        let partial_dfa = self.partial_dfa().ok_or(CompileError::InternalInvariant(
+            "retained partial preflight requires retained rows",
+        ))?;
+        let span_postflight_eligible = self.output == OutputContract::Span
+            && self.exact_match_width.is_none()
+            && !partial_dfa.initial_pending()
+            && partial_dfa.native_incomplete_view().is_some();
 
         let input_bytes = window.end.saturating_sub(window.start);
         let ProgramWorkspace { nfa, partial, .. } = workspace;
@@ -3726,7 +3872,9 @@ impl CompiledProgram {
             && input_bytes >= PARTIAL_DFA_MIN_INPUT_BYTES
             && partial_workspace
                 .state
-                .claim_native_entry_after_accelerators();
+                .claim_native_entry_after_accelerators(
+                    span_postflight_eligible.then_some(narrowed),
+                );
         if enter {
             Ok(RetainedPartialPreflight::Enter(narrowed))
         } else {
@@ -11304,6 +11452,387 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "generated semantic parity and every authenticated postflight rejection share one exact native transaction fixture"
+    )]
+    fn retained_partial_span_postflight_is_general_and_transactional() {
+        let pattern = r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)";
+        let limits = DeterminizeLimits {
+            max_states: 16,
+            ..DeterminizeLimits::default()
+        };
+        let limited = program(
+            pattern,
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            limits,
+        );
+        let retained = limited.partial_dfa().expect("retained Span rows");
+        assert!(retained.native_incomplete_view().is_some());
+        assert!(!retained.initial_pending());
+        assert_eq!(limited.exact_match_width, None);
+        assert!(limited.nfa_mandatory_suffix.is_none());
+        assert!(limited.nfa_mandatory_cut.is_none());
+        let (prefix_plan, prefix_supported) =
+            PartialDfaPrefixPlan::derive(limited.anchored_prefix.sets());
+        assert!(prefix_supported);
+
+        let reference = program(
+            pattern,
+            OutputContract::Span,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let mut tails = generated_byte_strings(b"abcxyQ", 3);
+        tails.extend([
+            b"aQ".to_vec(),
+            b"aaQ".to_vec(),
+            b"cbbx".to_vec(),
+            b"xxcbbbbyyy".to_vec(),
+        ]);
+        let mut completed_spans = 0_usize;
+        let mut resumed = 0_usize;
+        let mut witness = None;
+
+        for tail in tails {
+            let mut haystack = vec![b'!'; PARTIAL_DFA_MIN_INPUT_BYTES];
+            haystack.extend_from_slice(&tail);
+            for start in 0..=2 {
+                let public_window = SearchWindow::new(start, haystack.len());
+                if public_window.end.saturating_sub(public_window.start)
+                    < PARTIAL_DFA_MIN_INPUT_BYTES
+                {
+                    continue;
+                }
+                let expected = reference.search(&haystack, public_window).unwrap();
+                let mut workspace = limited.prepare_workspace().unwrap();
+                let outcome = limited
+                    .preflight_retained_partial_with_workspace(
+                        &haystack,
+                        public_window,
+                        &mut workspace,
+                        limited.artifact_identity(),
+                    )
+                    .unwrap();
+                let RetainedPartialPreflight::Enter(native_window) = outcome else {
+                    assert_eq!(outcome, RetainedPartialPreflight::Complete(expected));
+                    continue;
+                };
+                match retained
+                    .selected_span_end(
+                        &haystack,
+                        native_window.start,
+                        native_window.end,
+                        limited.anchored_prefix.sets(),
+                        prefix_plan,
+                    )
+                    .unwrap()
+                {
+                    PartialDfaResult::Resume(_) => {
+                        resumed = resumed.saturating_add(1);
+                    }
+                    PartialDfaResult::Complete(selection) => {
+                        let Some(selected_end) = selection.end else {
+                            assert_eq!(expected, MatchResult::Span(None));
+                            continue;
+                        };
+                        assert!(matches!(
+                            expected,
+                            MatchResult::Span(Some((_, end))) if end == selected_end
+                        ));
+                        assert_eq!(
+                            limited
+                                .recover_retained_partial_span_from_selected_end_with_workspace(
+                                    &haystack,
+                                    native_window,
+                                    &mut workspace,
+                                    limited.artifact_identity(),
+                                    selected_end,
+                                )
+                                .unwrap(),
+                            expected,
+                            "generated tail {tail:?} in {public_window:?}"
+                        );
+                        let state = &workspace.partial.as_deref().unwrap().state;
+                        assert!(!state.native_entry_in_flight);
+                        assert_eq!(state.native_entry_window, None);
+                        assert_eq!(state.reverse_recovered, 1);
+                        completed_spans = completed_spans.saturating_add(1);
+                        witness.get_or_insert((
+                            haystack.clone(),
+                            public_window,
+                            native_window,
+                            selected_end,
+                            expected,
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(completed_spans > 0, "no generated local Span completion");
+        assert!(resumed > 0, "no generated retained hole");
+
+        let (haystack, public_window, native_window, selected_end, expected) =
+            witness.expect("authenticated Span witness");
+
+        // Foreign artifact authentication happens before state mutation. The
+        // exact producer can still complete the outstanding transaction.
+        let mut workspace = limited.prepare_workspace().unwrap();
+        assert_eq!(
+            limited
+                .preflight_retained_partial_with_workspace(
+                    &haystack,
+                    public_window,
+                    &mut workspace,
+                    limited.artifact_identity(),
+                )
+                .unwrap(),
+            RetainedPartialPreflight::Enter(native_window)
+        );
+        let mut wrong_identity = limited.artifact_identity();
+        wrong_identity[0] ^= 1;
+        assert!(
+            limited
+                .recover_retained_partial_span_from_selected_end_with_workspace(
+                    &haystack,
+                    native_window,
+                    &mut workspace,
+                    wrong_identity,
+                    selected_end,
+                )
+                .is_err()
+        );
+        assert!(
+            workspace
+                .partial
+                .as_deref()
+                .unwrap()
+                .state
+                .native_entry_in_flight
+        );
+        assert_eq!(
+            limited
+                .recover_retained_partial_span_from_selected_end_with_workspace(
+                    &haystack,
+                    native_window,
+                    &mut workspace,
+                    limited.artifact_identity(),
+                    selected_end,
+                )
+                .unwrap(),
+            expected
+        );
+
+        // A callback for another window aborts the admitted transaction. It
+        // cannot be retried as though the native scan had completed locally.
+        assert_eq!(
+            limited
+                .preflight_retained_partial_with_workspace(
+                    &haystack,
+                    public_window,
+                    &mut workspace,
+                    limited.artifact_identity(),
+                )
+                .unwrap(),
+            RetainedPartialPreflight::Enter(native_window)
+        );
+        let wrong_window = SearchWindow::new(native_window.start + 1, native_window.end);
+        assert!(selected_end > wrong_window.start);
+        assert!(
+            limited
+                .recover_retained_partial_span_from_selected_end_with_workspace(
+                    &haystack,
+                    wrong_window,
+                    &mut workspace,
+                    limited.artifact_identity(),
+                    selected_end,
+                )
+                .is_err()
+        );
+        let state = &workspace.partial.as_deref().unwrap().state;
+        assert!(!state.native_entry_in_flight);
+        assert_eq!(state.native_entry_window, None);
+        assert!(
+            limited
+                .recover_retained_partial_span_from_selected_end_with_workspace(
+                    &haystack,
+                    native_window,
+                    &mut workspace,
+                    limited.artifact_identity(),
+                    selected_end,
+                )
+                .is_err(),
+            "an aborted transaction was reused"
+        );
+
+        // An in-range endpoint without an accepting span fails reverse K0 and
+        // is likewise cleared before that fallible continuation begins.
+        assert_eq!(
+            limited
+                .preflight_retained_partial_with_workspace(
+                    &haystack,
+                    public_window,
+                    &mut workspace,
+                    limited.artifact_identity(),
+                )
+                .unwrap(),
+            RetainedPartialPreflight::Enter(native_window)
+        );
+        let wrong_end = native_window.start + 1;
+        assert_ne!(wrong_end, selected_end);
+        assert!(
+            limited
+                .recover_retained_partial_span_from_selected_end_with_workspace(
+                    &haystack,
+                    native_window,
+                    &mut workspace,
+                    limited.artifact_identity(),
+                    wrong_end,
+                )
+                .is_err()
+        );
+        let state = &workspace.partial.as_deref().unwrap().state;
+        assert!(!state.native_entry_in_flight);
+        assert_eq!(state.native_entry_window, None);
+
+        let mut fresh = limited.prepare_workspace().unwrap();
+        assert!(
+            limited
+                .recover_retained_partial_span_from_selected_end_with_workspace(
+                    &haystack,
+                    native_window,
+                    &mut fresh,
+                    limited.artifact_identity(),
+                    selected_end,
+                )
+                .is_err(),
+            "postflight was accepted without preflight"
+        );
+        let mut foreign_workspace = reference.prepare_workspace().unwrap();
+        assert!(
+            limited
+                .recover_retained_partial_span_from_selected_end_with_workspace(
+                    &haystack,
+                    native_window,
+                    &mut foreign_workspace,
+                    limited.artifact_identity(),
+                    selected_end,
+                )
+                .is_err(),
+            "foreign semantic workspace was accepted"
+        );
+
+        // Both other output contracts can own the same kind of incomplete
+        // retained rows, but they must never enter the Span-only postflight.
+        for output in [OutputContract::Exists, OutputContract::SelectedEnd] {
+            let output_limits = DeterminizeLimits {
+                max_states: if output == OutputContract::Exists { 8 } else { 16 },
+                ..DeterminizeLimits::default()
+            };
+            let other = program(pattern, output, CompileMode::Optimizing, output_limits);
+            assert!(other.partial_dfa().is_some(), "{output:?}");
+            let mut other_workspace = other.prepare_workspace().unwrap();
+            let outcome = other
+                .preflight_retained_partial_with_workspace(
+                    &haystack,
+                    public_window,
+                    &mut other_workspace,
+                    other.artifact_identity(),
+                )
+                .unwrap();
+            let RetainedPartialPreflight::Enter(other_window) = outcome else {
+                panic!("{output:?} did not admit retained rows: {outcome:?}");
+            };
+            let state = &other_workspace.partial.as_deref().unwrap().state;
+            assert!(state.native_entry_in_flight, "{output:?}");
+            assert_eq!(
+                state.native_entry_window, None,
+                "{output:?} paid Span postflight window bookkeeping"
+            );
+            assert!(
+                other
+                    .recover_retained_partial_span_from_selected_end_with_workspace(
+                        &haystack,
+                        other_window,
+                        &mut other_workspace,
+                        other.artifact_identity(),
+                        selected_end,
+                    )
+                    .is_err(),
+                "{output:?} entered Span postflight"
+            );
+        }
+
+        // Fixed-width Span also computes its start locally and therefore
+        // keeps only universal completion accounting, never a postflight
+        // window. The correlated alternatives prevent an exact-product
+        // replacement while the low state ceiling leaves real retained holes.
+        let fixed_pattern = r"(?:ab|ba|cd|dc|ef|fe){4}";
+        let fixed = (2..=64)
+            .find_map(|max_states| {
+                let candidate = program(
+                    fixed_pattern,
+                    OutputContract::Span,
+                    CompileMode::Optimizing,
+                    DeterminizeLimits {
+                        max_states,
+                        ..DeterminizeLimits::default()
+                    },
+                );
+                (candidate.exact_match_width() == Some(8)
+                    && candidate
+                        .partial_dfa()
+                        .and_then(PartialDfa::native_incomplete_view)
+                        .is_some())
+                .then_some(candidate)
+            })
+            .expect("fixed-width Span with incomplete retained rows");
+        let mut fixed_haystack = vec![b'!'; PARTIAL_DFA_MIN_INPUT_BYTES];
+        fixed_haystack.extend_from_slice(b"abababab");
+        let fixed_window = SearchWindow::full(&fixed_haystack);
+        let mut fixed_workspace = fixed.prepare_workspace().unwrap();
+        let outcome = fixed
+            .preflight_retained_partial_with_workspace(
+                &fixed_haystack,
+                fixed_window,
+                &mut fixed_workspace,
+                fixed.artifact_identity(),
+            )
+            .unwrap();
+        assert!(
+            matches!(outcome, RetainedPartialPreflight::Enter(_)),
+            "fixed-width Span did not admit retained rows: {outcome:?}"
+        );
+        let state = &fixed_workspace.partial.as_deref().unwrap().state;
+        assert!(state.native_entry_in_flight);
+        assert_eq!(
+            state.native_entry_window, None,
+            "fixed-width Span paid reverse postflight window bookkeeping"
+        );
+
+        let plain = program(
+            pattern,
+            OutputContract::Span,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let mut plain_workspace = plain.prepare_workspace().unwrap();
+        assert!(
+            plain
+                .recover_retained_partial_span_from_selected_end_with_workspace(
+                    &haystack,
+                    native_window,
+                    &mut plain_workspace,
+                    plain.artifact_identity(),
+                    selected_end,
+                )
+                .is_err(),
+            "a program without retained rows entered Span postflight"
+        );
     }
 
     #[test]

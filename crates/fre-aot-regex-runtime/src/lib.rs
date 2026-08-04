@@ -41,6 +41,10 @@
 //! [`fre_aot_regex_runtime_search_exclusive_from_partial_v1`]. That entry
 //! authenticates the producer's exact artifact identity and compact canonical
 //! resume-state index before continuing K0 without replaying the prefix.
+//! A variable-width Span table that completes locally with only its selected
+//! endpoint uses
+//! [`fre_aot_regex_runtime_search_exclusive_recover_partial_span_v1`] to
+//! authenticate the preflight window and recover only the selected start.
 //! [`fre_aot_regex_runtime_prepared_partial_should_enter_v1`] remains exported
 //! only for compatibility with older generated objects.
 
@@ -402,6 +406,23 @@ impl PreparedAotRegex {
             &mut self.workspace,
             expected_artifact_identity,
         )
+    }
+
+    fn recover_retained_partial_span_from_selected_end(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+        expected_artifact_identity: [u8; ARTIFACT_IDENTITY_BYTES],
+        selected_end: usize,
+    ) -> Result<MatchResult, CompileError> {
+        self.program
+            .recover_retained_partial_span_from_selected_end_with_workspace(
+                haystack,
+                window,
+                &mut self.workspace,
+                expected_artifact_identity,
+                selected_end,
+            )
     }
 
     /// Find the first selected span in `haystack`.
@@ -1087,6 +1108,88 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_from_partial_v1(
     .unwrap_or(STATUS_RUNTIME_FAILURE)
 }
 
+/// Recover a Span start after an authenticated native retained-row completion
+/// selected only its endpoint.
+///
+/// This entry accepts only a variable-width, non-nullable Span program with a
+/// genuinely incomplete retained table. The exact `window_start..window_end`
+/// must be the window returned by the immediately preceding successful
+/// [`fre_aot_regex_runtime_search_exclusive_partial_preflight_v1`] call on the
+/// same exclusive session. `selected_end` must lie strictly after the window
+/// start and at or before its end. Reverse K0 must recover a span whose end is
+/// exactly `selected_end`; the forward search is not replayed.
+///
+/// On success this function returns [`STATUS_MATCH`] and initializes
+/// `result_ptr` with the exact Span. Every rejection returns an error status
+/// and leaves `result_ptr` untouched. In particular, Exists, SelectedEnd,
+/// nullable Span, fixed-width Span, complete-table, foreign-artifact, stale,
+/// and cross-window calls are rejected.
+///
+/// # Safety
+///
+/// `handle` must satisfy the exclusive live-handle requirements of
+/// [`fre_aot_regex_runtime_search_exclusive_v1`]. Haystack, result, and
+/// identity pointer requirements are the same as for
+/// [`fre_aot_regex_runtime_search_exclusive_from_partial_v1`]. The caller must
+/// pass the same haystack and exact window on which the identified native
+/// table ran, and `selected_end` must be the local native completion it
+/// produced. No overlapping call or destroy may use any copy of `handle`.
+#[unsafe(no_mangle)]
+#[allow(
+    unsafe_code,
+    clippy::too_many_arguments,
+    reason = "this exported postflight is an audited raw C boundary with explicit artifact, exact window, and selected endpoint"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_recover_partial_span_v1(
+    handle: FreAotRegexExclusiveHandleV1,
+    haystack_ptr: *const u8,
+    haystack_len: usize,
+    window_start: usize,
+    window_end: usize,
+    result_ptr: *mut FreAotRegexResultV1,
+    expected_artifact_identity_ptr: *const u8,
+    selected_end: usize,
+) -> u32 {
+    if handle.is_invalid() {
+        return STATUS_INVALID_HANDLE;
+    }
+    if haystack_ptr.is_null()
+        || result_ptr.is_null()
+        || !result_ptr.is_aligned()
+        || expected_artifact_identity_ptr.is_null()
+        || haystack_len > isize::MAX.unsigned_abs()
+        || window_start > window_end
+        || window_end > haystack_len
+        || selected_end <= window_start
+        || selected_end > window_end
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+
+    // SAFETY: the caller guarantees one live exclusively owned session plus
+    // all readable and writable disjoint extents described above.
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        let prepared = &mut *handle.0.cast::<PreparedAotRegex>();
+        let haystack = std::slice::from_raw_parts(haystack_ptr, haystack_len);
+        let expected_artifact_identity = expected_artifact_identity_ptr
+            .cast::<[u8; ARTIFACT_IDENTITY_BYTES]>()
+            .read();
+        let Ok(MatchResult::Span(Some((start, end)))) = prepared
+            .recover_retained_partial_span_from_selected_end(
+                haystack,
+                SearchWindow::new(window_start, window_end),
+                expected_artifact_identity,
+                selected_end,
+            )
+        else {
+            return STATUS_RUNTIME_FAILURE;
+        };
+        result_ptr.write(FreAotRegexResultV1 { start, end });
+        STATUS_MATCH
+    }))
+    .unwrap_or(STATUS_RUNTIME_FAILURE)
+}
+
 /// Authenticate and prepare one native incomplete-retained search.
 ///
 /// The call settles any prior local native completion, runs the complete
@@ -1584,6 +1687,35 @@ mod tests {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the test helper mirrors the authenticated exact-window Span postflight ABI"
+    )]
+    fn call_exclusive_recover_partial_span(
+        handle: FreAotRegexExclusiveHandleV1,
+        haystack: &[u8],
+        start: usize,
+        end: usize,
+        result: &mut FreAotRegexResultV1,
+        expected_artifact_identity: &[u8; ARTIFACT_IDENTITY_BYTES],
+        selected_end: usize,
+    ) -> u32 {
+        // SAFETY: each test keeps exclusive ownership of the live session;
+        // all readable and disjoint aligned writable extents outlive the call.
+        unsafe {
+            fre_aot_regex_runtime_search_exclusive_recover_partial_span_v1(
+                handle,
+                haystack.as_ptr(),
+                haystack.len(),
+                start,
+                end,
+                result,
+                expected_artifact_identity.as_ptr(),
+                selected_end,
+            )
+        }
+    }
+
     fn expected_ffi(result: MatchResult) -> (u32, FreAotRegexResultV1) {
         match result {
             MatchResult::Exists(false)
@@ -1654,6 +1786,7 @@ mod tests {
             "fre_aot_regex_runtime_search_exclusive_v1",
             "fre_aot_regex_runtime_prepared_partial_should_enter_v1",
             "fre_aot_regex_runtime_search_exclusive_from_partial_v1",
+            "fre_aot_regex_runtime_search_exclusive_recover_partial_span_v1",
             "fre_aot_regex_runtime_search_exclusive_partial_preflight_v1",
             "fre_aot_regex_runtime_destroy_exclusive_v1",
         ] {
@@ -1697,6 +1830,16 @@ mod tests {
             u32,
             usize,
         ) -> u32 = fre_aot_regex_runtime_search_exclusive_from_partial_v1;
+        let _: unsafe extern "C" fn(
+            FreAotRegexExclusiveHandleV1,
+            *const u8,
+            usize,
+            usize,
+            usize,
+            *mut FreAotRegexResultV1,
+            *const u8,
+            usize,
+        ) -> u32 = fre_aot_regex_runtime_search_exclusive_recover_partial_span_v1;
         let _: unsafe extern "C" fn(
             FreAotRegexExclusiveHandleV1,
             *const u8,
@@ -2741,6 +2884,402 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "success, exact transaction authentication, all-output rejection, and raw pointer validation share one stable postflight ABI lifecycle"
+    )]
+    fn exclusive_partial_span_postflight_authenticates_and_recovers() {
+        let pattern = r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)";
+        let mut limits = CompileLimitsV1::default();
+        limits.determinize.max_states = 16;
+        let compiled = compile(
+            CompileRequest::new(pattern, Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .limits(limits)
+                .output(OutputContract::Span),
+        )
+        .expect("compile variable-width retained Span artifact");
+        let stats = compiled
+            .program()
+            .partial_dfa_stats()
+            .unwrap()
+            .expect("retained Span rows");
+        assert!(stats.complete_rows < stats.discovered_states);
+        assert_eq!(compiled.program().exact_match_width(), None);
+
+        let identity = compiled.receipt().program_sha256;
+        let serialized = compiled.program().serialize().unwrap();
+        let handle = prepare_exclusive(&serialized);
+        let mut haystack = vec![b'!'; 256];
+        haystack.extend_from_slice(b"aQ");
+        let public_start = 0_usize;
+        let public_end = haystack.len();
+        let expected = compiled
+            .search(
+                &haystack,
+                SearchWindow::new(public_start, public_end),
+            )
+            .unwrap();
+        let MatchResult::Span(Some((expected_start, selected_end))) = expected else {
+            panic!("fixture did not select a Span: {expected:?}");
+        };
+        let expected_result = FreAotRegexResultV1 {
+            start: expected_start,
+            end: selected_end,
+        };
+        let sentinel_result = FreAotRegexResultV1 { start: 71, end: 73 };
+        let sentinel_window = FreAotRegexSearchWindowV1 { start: 79, end: 83 };
+
+        let preflight = || {
+            let mut result = sentinel_result;
+            let mut window = sentinel_window;
+            assert_eq!(
+                call_exclusive_partial_preflight(
+                    handle,
+                    &haystack,
+                    public_start,
+                    public_end,
+                    &mut result,
+                    &identity,
+                    &mut window,
+                ),
+                STATUS_PARTIAL_PREFLIGHT_ENTER
+            );
+            assert_eq!(result, sentinel_result);
+            assert_ne!(window, sentinel_window);
+            window
+        };
+
+        let window = preflight();
+        let mut result = sentinel_result;
+        assert_eq!(
+            call_exclusive_recover_partial_span(
+                handle,
+                &haystack,
+                window.start,
+                window.end,
+                &mut result,
+                &identity,
+                selected_end,
+            ),
+            STATUS_MATCH
+        );
+        assert_eq!(result, expected_result);
+
+        // The exact preflight transaction is single use.
+        result = sentinel_result;
+        assert_eq!(
+            call_exclusive_recover_partial_span(
+                handle,
+                &haystack,
+                window.start,
+                window.end,
+                &mut result,
+                &identity,
+                selected_end,
+            ),
+            STATUS_RUNTIME_FAILURE
+        );
+        assert_eq!(result, sentinel_result);
+
+        // A foreign identity is rejected before consuming the transaction.
+        let window = preflight();
+        let mut wrong_identity = identity;
+        wrong_identity[0] ^= 1;
+        assert_eq!(
+            call_exclusive_recover_partial_span(
+                handle,
+                &haystack,
+                window.start,
+                window.end,
+                &mut result,
+                &wrong_identity,
+                selected_end,
+            ),
+            STATUS_RUNTIME_FAILURE
+        );
+        assert_eq!(result, sentinel_result);
+        assert_eq!(
+            call_exclusive_recover_partial_span(
+                handle,
+                &haystack,
+                window.start,
+                window.end,
+                &mut result,
+                &identity,
+                selected_end,
+            ),
+            STATUS_MATCH
+        );
+        assert_eq!(result, expected_result);
+
+        // A different valid window aborts the transaction and cannot be
+        // followed by a retry against the originally admitted window.
+        let window = preflight();
+        assert!(selected_end > window.start + 1);
+        result = sentinel_result;
+        assert_eq!(
+            call_exclusive_recover_partial_span(
+                handle,
+                &haystack,
+                window.start + 1,
+                window.end,
+                &mut result,
+                &identity,
+                selected_end,
+            ),
+            STATUS_RUNTIME_FAILURE
+        );
+        assert_eq!(result, sentinel_result);
+        assert_eq!(
+            call_exclusive_recover_partial_span(
+                handle,
+                &haystack,
+                window.start,
+                window.end,
+                &mut result,
+                &identity,
+                selected_end,
+            ),
+            STATUS_RUNTIME_FAILURE
+        );
+        assert_eq!(result, sentinel_result);
+
+        // An in-range endpoint with no accepting span fails reverse K0 after
+        // the in-flight marker has been cleared.
+        let window = preflight();
+        let wrong_end = window.start + 1;
+        assert_ne!(wrong_end, selected_end);
+        assert_eq!(
+            call_exclusive_recover_partial_span(
+                handle,
+                &haystack,
+                window.start,
+                window.end,
+                &mut result,
+                &identity,
+                wrong_end,
+            ),
+            STATUS_RUNTIME_FAILURE
+        );
+        assert_eq!(result, sentinel_result);
+        assert_eq!(
+            call_exclusive_recover_partial_span(
+                handle,
+                &haystack,
+                window.start,
+                window.end,
+                &mut result,
+                &identity,
+                selected_end,
+            ),
+            STATUS_RUNTIME_FAILURE
+        );
+
+        // Raw pointer and numeric validation precede every read or state
+        // mutation. All invalid calls leave both result and transaction live.
+        let window = preflight();
+        let raw_call = |raw_handle,
+                        raw_haystack,
+                        raw_len,
+                        raw_start,
+                        raw_end,
+                        raw_result,
+                        raw_identity,
+                        raw_selected_end| {
+            // SAFETY: every deliberately invalid argument is rejected before
+            // dereference; all non-null extents remain live and disjoint.
+            unsafe {
+                fre_aot_regex_runtime_search_exclusive_recover_partial_span_v1(
+                    raw_handle,
+                    raw_haystack,
+                    raw_len,
+                    raw_start,
+                    raw_end,
+                    raw_result,
+                    raw_identity,
+                    raw_selected_end,
+                )
+            }
+        };
+        for status in [
+            raw_call(
+                handle,
+                std::ptr::null(),
+                haystack.len(),
+                window.start,
+                window.end,
+                &raw mut result,
+                identity.as_ptr(),
+                selected_end,
+            ),
+            raw_call(
+                handle,
+                haystack.as_ptr(),
+                haystack.len(),
+                window.start,
+                window.end,
+                std::ptr::null_mut(),
+                identity.as_ptr(),
+                selected_end,
+            ),
+            raw_call(
+                handle,
+                haystack.as_ptr(),
+                haystack.len(),
+                window.start,
+                window.end,
+                &raw mut result,
+                std::ptr::null(),
+                selected_end,
+            ),
+            raw_call(
+                handle,
+                haystack.as_ptr(),
+                haystack.len(),
+                window.end,
+                window.start,
+                &raw mut result,
+                identity.as_ptr(),
+                selected_end,
+            ),
+            raw_call(
+                handle,
+                haystack.as_ptr(),
+                haystack.len(),
+                window.start,
+                window.end,
+                &raw mut result,
+                identity.as_ptr(),
+                window.start,
+            ),
+            raw_call(
+                handle,
+                haystack.as_ptr(),
+                haystack.len(),
+                window.start,
+                window.end,
+                &raw mut result,
+                identity.as_ptr(),
+                window.end + 1,
+            ),
+        ] {
+            assert_eq!(status, STATUS_INVALID_ARGUMENT);
+            assert_eq!(result, sentinel_result);
+        }
+        assert_eq!(
+            raw_call(
+                FreAotRegexExclusiveHandleV1::INVALID,
+                haystack.as_ptr(),
+                haystack.len(),
+                window.start,
+                window.end,
+                &raw mut result,
+                identity.as_ptr(),
+                selected_end,
+            ),
+            STATUS_INVALID_HANDLE
+        );
+        let mut misaligned_storage = vec![
+            0_u8;
+            size_of::<FreAotRegexResultV1>() + align_of::<FreAotRegexResultV1>()
+        ];
+        let misaligned_result = (0..align_of::<FreAotRegexResultV1>())
+            .map(|offset| unsafe { misaligned_storage.as_mut_ptr().add(offset) })
+            .map(|pointer| pointer.cast::<FreAotRegexResultV1>())
+            .find(|pointer| !pointer.is_aligned())
+            .expect("misaligned result address");
+        assert_eq!(
+            raw_call(
+                handle,
+                haystack.as_ptr(),
+                haystack.len(),
+                window.start,
+                window.end,
+                misaligned_result,
+                identity.as_ptr(),
+                selected_end,
+            ),
+            STATUS_INVALID_ARGUMENT
+        );
+        assert_eq!(result, sentinel_result);
+        assert_eq!(
+            call_exclusive_recover_partial_span(
+                handle,
+                &haystack,
+                window.start,
+                window.end,
+                &mut result,
+                &identity,
+                selected_end,
+            ),
+            STATUS_MATCH,
+            "raw validation consumed the authenticated transaction"
+        );
+        assert_eq!(result, expected_result);
+
+        // Every non-Span output is rejected even when its own retained table
+        // and exact artifact identity were successfully preflighted.
+        for output in [OutputContract::Exists, OutputContract::SelectedEnd] {
+            let mut output_limits = CompileLimitsV1::default();
+            output_limits.determinize.max_states =
+                if output == OutputContract::Exists { 8 } else { 16 };
+            let other = compile(
+                CompileRequest::new(pattern, Target::x86_64_linux())
+                    .mode(CompileMode::Optimizing)
+                    .limits(output_limits)
+                    .output(output),
+            )
+            .unwrap();
+            assert!(other.program().partial_dfa_stats().unwrap().is_some());
+            let other_identity = other.receipt().program_sha256;
+            let other_bytes = other.program().serialize().unwrap();
+            let other_handle = prepare_exclusive(&other_bytes);
+            let mut other_result = sentinel_result;
+            let mut other_window = sentinel_window;
+            assert_eq!(
+                call_exclusive_partial_preflight(
+                    other_handle,
+                    &haystack,
+                    public_start,
+                    public_end,
+                    &mut other_result,
+                    &other_identity,
+                    &mut other_window,
+                ),
+                STATUS_PARTIAL_PREFLIGHT_ENTER,
+                "{output:?}"
+            );
+            assert_eq!(
+                call_exclusive_recover_partial_span(
+                    other_handle,
+                    &haystack,
+                    other_window.start,
+                    other_window.end,
+                    &mut other_result,
+                    &other_identity,
+                    selected_end,
+                ),
+                STATUS_RUNTIME_FAILURE,
+                "{output:?}"
+            );
+            assert_eq!(other_result, sentinel_result);
+            // SAFETY: this test uniquely owns the live session.
+            assert_eq!(
+                unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(other_handle) },
+                STATUS_SUCCESS
+            );
+        }
+
+        // SAFETY: this test uniquely owns the live session and all calls have
+        // completed before destruction.
+        assert_eq!(
+            unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(handle) },
+            STATUS_SUCCESS
+        );
+    }
+
+    #[test]
     fn exclusive_partial_preflight_runs_concurrently_on_independent_sessions() {
         let mut limits = CompileLimitsV1::default();
         limits.determinize.max_states = 8;
@@ -2804,6 +3343,100 @@ mod tests {
                     }
                     // SAFETY: the worker has sole ownership of its session and
                     // all of its synchronous calls have returned.
+                    assert_eq!(
+                        unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(handle) },
+                        STATUS_SUCCESS
+                    );
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn exclusive_partial_span_postflight_runs_concurrently_on_independent_sessions() {
+        let mut limits = CompileLimitsV1::default();
+        limits.determinize.max_states = 16;
+        let compiled = compile(
+            CompileRequest::new(
+                r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)",
+                Target::x86_64_linux(),
+            )
+            .mode(CompileMode::Optimizing)
+            .limits(limits)
+            .output(OutputContract::Span),
+        )
+        .expect("compile concurrent retained Span artifact");
+        assert!(compiled.program().partial_dfa_stats().unwrap().is_some());
+
+        let identity = compiled.receipt().program_sha256;
+        let serialized = Arc::new(compiled.program().serialize().unwrap());
+        let mut source = vec![b'!'; 256];
+        source.extend_from_slice(b"aQ");
+        let haystack = Arc::new(source);
+        let MatchResult::Span(Some((expected_start, selected_end))) = compiled
+            .search(&haystack, SearchWindow::full(&haystack))
+            .unwrap()
+        else {
+            panic!("concurrent fixture did not select a Span");
+        };
+        let expected = FreAotRegexResultV1 {
+            start: expected_start,
+            end: selected_end,
+        };
+        let worker_count = 4_usize;
+        let barrier = Arc::new(std::sync::Barrier::new(worker_count));
+
+        // An exclusive session is synchronization-free and cannot overlap
+        // itself. Independent sessions from the same immutable artifact may
+        // preflight and recover concurrently without sharing transaction or
+        // bidirectional-workspace state.
+        std::thread::scope(|scope| {
+            for worker in 0..worker_count {
+                let serialized = Arc::clone(&serialized);
+                let haystack = Arc::clone(&haystack);
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    let handle = prepare_exclusive(&serialized);
+                    barrier.wait();
+                    for iteration in 0..64 {
+                        let sentinel = FreAotRegexResultV1 {
+                            start: 1_000 + worker,
+                            end: 2_000 + iteration,
+                        };
+                        let mut result = sentinel;
+                        let mut window = FreAotRegexSearchWindowV1 {
+                            start: 3_000 + worker,
+                            end: 4_000 + iteration,
+                        };
+                        assert_eq!(
+                            call_exclusive_partial_preflight(
+                                handle,
+                                &haystack,
+                                0,
+                                haystack.len(),
+                                &mut result,
+                                &identity,
+                                &mut window,
+                            ),
+                            STATUS_PARTIAL_PREFLIGHT_ENTER
+                        );
+                        assert_eq!(result, sentinel);
+                        assert_eq!(
+                            call_exclusive_recover_partial_span(
+                                handle,
+                                &haystack,
+                                window.start,
+                                window.end,
+                                &mut result,
+                                &identity,
+                                selected_end,
+                            ),
+                            STATUS_MATCH
+                        );
+                        assert_eq!(result, expected);
+                    }
+                    // SAFETY: this worker uniquely owns its session and all
+                    // synchronous calls have returned.
                     assert_eq!(
                         unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(handle) },
                         STATUS_SUCCESS
