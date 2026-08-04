@@ -217,6 +217,52 @@ impl SetSeek {
             ),
         }
     }
+
+    /// Search one already-validated unlimited value projection without
+    /// constructing or updating the finite-work meter.
+    #[inline]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "validated slice bounds make the returned relative offset safe to add"
+    )]
+    pub(super) fn seek_unmetered(
+        self,
+        haystack: &[u8],
+        position: usize,
+        end: usize,
+        classifier: Option<&ByteSetClassifier>,
+    ) -> Option<usize> {
+        match self {
+            Self::Constant(matches) => (matches && position < end).then_some(position),
+            Self::One(byte) => memchr(byte, &haystack[position..end])
+                .map(|relative| position + relative),
+            Self::Two(first, second) => memchr2(first, second, &haystack[position..end])
+                .map(|relative| position + relative),
+            Self::Three(first, second, third) => {
+                memchr3(first, second, third, &haystack[position..end])
+                    .map(|relative| position + relative)
+            }
+            Self::Range {
+                origin,
+                maximum_delta,
+                inverted,
+            } => seek_range_unmetered(
+                origin,
+                maximum_delta,
+                inverted,
+                haystack,
+                position,
+                end,
+            ),
+            Self::Classified { inverted } => seek_classified_unmetered(
+                classifier.expect("a classified leaf retains the shared classifier"),
+                inverted,
+                haystack,
+                position,
+                end,
+            ),
+        }
+    }
 }
 
 #[cold]
@@ -335,6 +381,24 @@ impl Plan {
         limits: SearchLimits,
     ) -> Result<bool, SearchError> {
         validate_window(haystack, window)?;
+        let window_width = window
+            .end()
+            .checked_sub(window.start())
+            .expect("a validated window has ordered bounds");
+        if limits == SearchLimits::unlimited()
+            && u64::try_from(window_width).is_ok()
+        {
+            let owner = self.owner();
+            return Ok(owner
+                .member_seek
+                .seek_unmetered(
+                    haystack,
+                    window.start(),
+                    window.end(),
+                    owner.classifier.as_ref(),
+                )
+                .is_some());
+        }
         let mut meter = WorkMeter::new(limits.max_work);
         self.owner()
             .member_seek
@@ -722,6 +786,90 @@ fn seek_classified(
         needed: meter.consumed.saturating_add(1),
         limit: meter.limit,
     })
+}
+
+#[inline]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "validated slice bounds and the fixed block extent bound every addition"
+)]
+fn seek_range_unmetered(
+    origin: u8,
+    maximum_delta: u8,
+    inverted: bool,
+    haystack: &[u8],
+    mut position: usize,
+    end: usize,
+) -> Option<usize> {
+    if position == end {
+        return None;
+    }
+    if (haystack[position].wrapping_sub(origin) <= maximum_delta) != inverted {
+        return Some(position);
+    }
+    position += 1;
+
+    while end.saturating_sub(position) >= BYTE_SET_BLOCK_BYTES {
+        let block_end = position + BYTE_SET_BLOCK_BYTES;
+        let block: &[u8; BYTE_SET_BLOCK_BYTES] = haystack[position..block_end]
+            .try_into()
+            .expect("the range classifier checked its complete fixed extent");
+        let raw_mask = classify_byte_delta_16(origin, maximum_delta, block).member_mask();
+        let matching_mask = if inverted { !raw_mask } else { raw_mask };
+        if matching_mask != 0 {
+            let offset = usize::try_from(matching_mask.trailing_zeros())
+                .expect("a fixed-width range-classifier lane fits usize");
+            return Some(position + offset);
+        }
+        position = block_end;
+    }
+
+    haystack[position..end]
+        .iter()
+        .position(|&byte| (byte.wrapping_sub(origin) <= maximum_delta) != inverted)
+        .map(|relative| position + relative)
+}
+
+#[inline]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "validated slice bounds and the fixed block extent bound every addition"
+)]
+fn seek_classified_unmetered(
+    classifier: &ByteSetClassifier,
+    inverted: bool,
+    haystack: &[u8],
+    mut position: usize,
+    end: usize,
+) -> Option<usize> {
+    if position == end {
+        return None;
+    }
+    if classifier.set().contains(haystack[position]) != inverted {
+        return Some(position);
+    }
+    position += 1;
+
+    while end.saturating_sub(position) >= BYTE_SET_BLOCK_BYTES {
+        let block_end = position + BYTE_SET_BLOCK_BYTES;
+        let block: &[u8; BYTE_SET_BLOCK_BYTES] = haystack[position..block_end]
+            .try_into()
+            .expect("the classifier checked its complete fixed extent");
+        let raw_mask = classifier.classify_16(block).member_mask();
+        let matching_mask = if inverted { !raw_mask } else { raw_mask };
+        if matching_mask != 0 {
+            let offset = usize::try_from(matching_mask.trailing_zeros())
+                .expect("a fixed-width classifier lane fits usize");
+            return Some(position + offset);
+        }
+        position = block_end;
+    }
+
+    let set = classifier.set();
+    haystack[position..end]
+        .iter()
+        .position(|&byte| set.contains(byte) != inverted)
+        .map(|relative| position + relative)
 }
 
 pub(super) fn validate_window(haystack: &[u8], window: SearchWindow) -> Result<(), SearchError> {

@@ -48,6 +48,11 @@ const START_FILTER_OWNER_ALLOCATION_WORK: u64 = 1;
 // direct-wide path, and x86 uses its independently selected AVX2 leaf.
 const AARCH64_SET_WIDE_MINIMUM_SPAN: usize = 256;
 const ROOT_RUN_WINDOW_BYTES: usize = 64;
+// Keep the report-free prefix to one existing classifier block. The cutoff is
+// only an outlining boundary: a stack-local continuation carries the exact
+// DFA row and source position into the complete warm executor, so neither
+// scanner nor transition work is repeated when the prefix is inconclusive.
+const WARM_EXISTS_INLINE_BYTES: usize = BYTE_SET_BLOCK_BYTES;
 const ROOT_RUN_SCANNER_SHAPE_MAX_WORK: usize =
     BYTE_START_BITMAP_POPULATION_WORK + BYTE_START_RANGE_DETECTION_WORK;
 const ORDINARY_START_FILTER_PROOF: StartFilterProof = StartFilterProof {
@@ -2910,6 +2915,65 @@ impl<'a> K0SearchSession<'a> {
         )
     }
 
+    /// Project warm assertion-free existence directly for value-only callers.
+    ///
+    /// The ordinary report-producing entry remains authoritative for finite
+    /// limits, cold cache/proof publication, contextual graphs, unfilled
+    /// transitions, and every non-existence contract. Once an exact session
+    /// has already authenticated its direct lazy cache and immutable start
+    /// proof, an unlimited existence call can read filled DFA rows without
+    /// mutating the workspace or constructing diagnostics that its caller will
+    /// immediately discard. Any unavailable row declines before mutation and
+    /// re-enters the ordinary executor from the original state.
+    pub(crate) fn search_exists_value_untyped(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<bool, SearchError> {
+        if limits == SearchLimits::unlimited()
+            && self.capabilities.lazy
+            && !self.capabilities.contextual
+            && self.workspace.lazy.is_bound_to(self.automaton)
+            && self.workspace.lazy.initialized
+            && !self.workspace.lazy.declined
+            && !self.workspace.lazy.saturated
+        {
+            if let Some(proof) = self.automaton.start_filter_proof.get() {
+                let nullable_initial = matches!(
+                    self.workspace.lazy.initial_kind,
+                    LazyInitialKind::NullablePrefix | LazyInitialKind::NullableTerminal
+                );
+                // Assertion-free plans cannot require absolute haystack start,
+                // and their start proof must agree with the exact lazy initial
+                // closure about nullability. Keep both planner invariants local
+                // to this report-free executor instead of relying on its caller.
+                if !proof.force_haystack_start && proof.relaxed_nullable == nullable_initial {
+                    validate_window(haystack, window)?;
+                    if let Some(found) = try_warm_direct_exists(
+                        haystack,
+                        window,
+                        &self.workspace.lazy,
+                        proof,
+                    )? {
+                        return Ok(found);
+                    }
+                }
+            }
+        }
+
+        execute_bound(
+            self.automaton,
+            haystack,
+            window,
+            &mut self.workspace,
+            limits,
+            OutputContract::Exists,
+            self.capabilities,
+        )
+        .map(|report| report.found.is_some())
+    }
+
     pub(crate) fn search_span_at_untyped(
         &mut self,
         source: &mut K0SpanSourceCursor<'_>,
@@ -2940,6 +3004,392 @@ impl<'a> K0SearchSession<'a> {
             self.capabilities,
             &mut self.span_start_proof,
         )
+    }
+}
+
+/// Outcome of scanning the bounded inline candidate prefix.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WarmBoundedStart {
+    Candidate { position: usize, work: u64 },
+    ResumeAt { position: usize, work: u64 },
+    Exhausted,
+}
+
+/// Read one already-warmed assertion-free existence machine without changing
+/// its cache or invocation scratch.
+///
+/// The first classifier-width prefix stays inline. If it cannot decide the
+/// complete result, the outlined executor consumes its exact stack-local DFA
+/// row and next unread source position; it never restarts the prefix. `None`
+/// remains a transactional cache decline, and saturated workspaces decline
+/// before reading any source byte.
+#[inline]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the complete inline prefix preserves one explicit transactional decline boundary"
+)]
+fn try_warm_direct_exists(
+    haystack: &[u8],
+    window: SearchWindow,
+    lazy: &LazyWorkspace,
+    proof: &StartFilterProof,
+) -> Result<Option<bool>, SearchError> {
+    if lazy.saturated {
+        return Ok(None);
+    }
+    let haystack = haystack
+        .get(..window.end())
+        .ok_or(SearchError::InternalInvariant {
+            detail: "warm existence window exceeds the validated haystack",
+        })?;
+    match lazy.initial_kind {
+        LazyInitialKind::NullablePrefix | LazyInitialKind::NullableTerminal => {
+            return Ok(Some(true));
+        }
+        LazyInitialKind::Positive | LazyInitialKind::PositiveSingle => {}
+        LazyInitialKind::Uninitialized => return Ok(None),
+    }
+    if lazy.initial == LAZY_NO_STATE {
+        return Ok(None);
+    }
+
+    let initial_row = direct_row_offset(lazy.initial)?;
+    let (mut state, mut position, mut consumed, engine_candidate) =
+        match warm_bounded_start(haystack, window, proof)? {
+            WarmBoundedStart::Exhausted => return Ok(Some(false)),
+            WarmBoundedStart::ResumeAt { position, work } => {
+                let consumed = INVOCATION_RESET_WORK.checked_add(work).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "warm existence prefix work",
+                    },
+                )?;
+                return continue_warm_direct_exists(
+                    haystack,
+                    window,
+                    lazy,
+                    proof,
+                    initial_row,
+                    initial_row,
+                    position,
+                    consumed,
+                    None,
+                );
+            }
+            WarmBoundedStart::Candidate { position, work } => (
+                initial_row,
+                position,
+                INVOCATION_RESET_WORK.checked_add(work).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "warm existence prefix work",
+                    },
+                )?,
+                proof.probe().map(|_| position),
+            ),
+        };
+
+    let inline_end = position
+        .saturating_add(WARM_EXISTS_INLINE_BYTES)
+        .min(window.end());
+    while position < inline_end {
+        consumed = consumed
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "warm existence prefix work",
+            })?;
+        let byte = haystack[position];
+        let cell = lazy.direct_cell(state, byte)?;
+        if cell == LAZY_CELL_UNFILLED {
+            return Ok(None);
+        }
+        // A Rust slice is no longer than `isize::MAX`; the validated ceiling
+        // therefore proves this increment cannot overflow.
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "the validated warm prefix is strictly below its slice ceiling"
+        )]
+        {
+            position += 1;
+        }
+        if cell & LAZY_CELL_ACCEPT != 0 {
+            return Ok(Some(true));
+        }
+        let encoded = cell & LAZY_CELL_STATE_MASK;
+        if encoded == 0 {
+            return Ok(Some(false));
+        }
+        state = encoded
+            .checked_sub(1)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "warm existence encoded state underflowed",
+            })?;
+        if state == initial_row && proof.scanner.is_some() {
+            return continue_warm_direct_exists(
+                haystack,
+                window,
+                lazy,
+                proof,
+                initial_row,
+                state,
+                position,
+                consumed,
+                engine_candidate,
+            );
+        }
+    }
+    if position == window.end() {
+        return Ok(Some(false));
+    }
+
+    continue_warm_direct_exists(
+        haystack,
+        window,
+        lazy,
+        proof,
+        initial_row,
+        state,
+        position,
+        consumed,
+        engine_candidate,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the outlined warm continuation keeps its exact local DFA and scanner state explicit"
+)]
+#[inline(never)]
+fn continue_warm_direct_exists(
+    haystack: &[u8],
+    window: SearchWindow,
+    lazy: &LazyWorkspace,
+    proof: &StartFilterProof,
+    initial_row: u32,
+    mut state: u32,
+    mut position: usize,
+    consumed: u64,
+    mut engine_candidate: Option<usize>,
+) -> Result<Option<bool>, SearchError> {
+    let mut meter = WorkMeter::new(u64::MAX, consumed);
+    let mut retained_start_mask = RetainedStartMaskCursor::default();
+    let mut adaptive_probe = AdaptiveStartProbe::default();
+
+    loop {
+        if state == initial_row {
+            if let Some(scanner) = proof.scanner.as_ref() {
+                if position < window.end() {
+                    if let (Some(probe), Some(candidate)) =
+                        (proof.probe(), engine_candidate.take())
+                    {
+                        adaptive_probe.observe_restartable_rejection(
+                            probe,
+                            haystack,
+                            candidate,
+                            window.end(),
+                            &mut meter,
+                        )?;
+                    }
+                } else {
+                    engine_candidate = None;
+                }
+                position = next_start_candidate_adaptive(
+                    scanner,
+                    haystack,
+                    position,
+                    window.end(),
+                    proof.guard(),
+                    proof.probe(),
+                    &mut meter,
+                    &mut retained_start_mask,
+                    &mut adaptive_probe,
+                )?;
+                if position == window.end() {
+                    return Ok(Some(false));
+                }
+                if proof.probe().is_some() && adaptive_probe.samples_rejections() {
+                    engine_candidate = Some(position);
+                }
+            }
+        }
+        if position >= haystack.len() {
+            return if position == haystack.len() {
+                Ok(Some(false))
+            } else {
+                Err(SearchError::InternalInvariant {
+                    detail: "warm existence position exceeded the validated window",
+                })
+            };
+        }
+
+        meter.charge(1, position)?;
+        let byte = haystack[position];
+        let cell = lazy.direct_cell(state, byte)?;
+        if cell == LAZY_CELL_UNFILLED {
+            return Ok(None);
+        }
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "the validated warm continuation is strictly below its slice ceiling"
+        )]
+        {
+            position += 1;
+        }
+        if cell & LAZY_CELL_ACCEPT != 0 {
+            return Ok(Some(true));
+        }
+        let encoded = cell & LAZY_CELL_STATE_MASK;
+        if encoded == 0 {
+            return Ok(Some(false));
+        }
+        state = encoded
+            .checked_sub(1)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "warm existence encoded state underflowed",
+            })?;
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "all start-scanner shapes share one bounded cutoff and exact work projection"
+)]
+fn warm_bounded_start(
+    haystack: &[u8],
+    window: SearchWindow,
+    proof: &StartFilterProof,
+) -> Result<WarmBoundedStart, SearchError> {
+    let Some(scanner) = proof.scanner.as_ref() else {
+        return Ok(WarmBoundedStart::Candidate {
+            position: window.start(),
+            work: 0,
+        });
+    };
+    if matches!(scanner.scanner, StartScanner::Empty) {
+        return Ok(WarmBoundedStart::Exhausted);
+    }
+    let candidate_end = window
+        .start()
+        .saturating_add(WARM_EXISTS_INLINE_BYTES)
+        .min(window.end());
+    let scan_end = candidate_end
+        .saturating_add(usize::from(scanner.offset))
+        .min(window.end());
+    let mut search = window.start();
+    let mut work = 0_u64;
+    loop {
+        if search >= candidate_end {
+            return Ok(if candidate_end == window.end() {
+                WarmBoundedStart::Exhausted
+            } else {
+                WarmBoundedStart::ResumeAt {
+                    position: candidate_end,
+                    work,
+                }
+            });
+        }
+        let scan_start = search.checked_add(usize::from(scanner.offset)).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "warm start-filter scan position",
+            },
+        )?;
+        if scan_start >= scan_end {
+            return Ok(if candidate_end == window.end() {
+                WarmBoundedStart::Exhausted
+            } else {
+                WarmBoundedStart::ResumeAt {
+                    position: candidate_end,
+                    work,
+                }
+            });
+        }
+        let remaining = haystack.get(scan_start..scan_end).ok_or(
+            SearchError::InternalInvariant {
+                detail: "warm start-filter prefix exceeded the validated window",
+            },
+        )?;
+        let relative = match &scanner.scanner {
+            StartScanner::Empty => unreachable!("empty warm scanner returned after exhaustion"),
+            StartScanner::One(byte) => memchr(*byte, remaining),
+            StartScanner::Two(first, second) => memchr2(*first, *second, remaining),
+            StartScanner::Three(first, second, third) => {
+                memchr3(*first, *second, *third, remaining)
+            }
+            StartScanner::Range { start, end } => remaining
+                .iter()
+                .position(|byte| start <= byte && byte <= end),
+            StartScanner::AsciiSet { set, .. } => {
+                remaining.iter().position(|byte| set.contains(*byte))
+            }
+            StartScanner::Set(classifier) => {
+                let set = classifier.set();
+                remaining.iter().position(|byte| set.contains(*byte))
+            }
+        };
+        let inspected_bytes =
+            relative.map_or(remaining.len(), |relative| relative.saturating_add(1));
+        let inspected_work =
+            u64::try_from(inspected_bytes).map_err(|_| SearchError::ArithmeticOverflow {
+                computation: "warm start-filter prefix work",
+            })?;
+        work = work
+            .checked_add(inspected_work)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "warm start-filter prefix work",
+            })?;
+        let Some(relative) = relative else {
+            return Ok(if candidate_end == window.end() {
+                WarmBoundedStart::Exhausted
+            } else {
+                WarmBoundedStart::ResumeAt {
+                    position: candidate_end,
+                    work,
+                }
+            });
+        };
+        let scan_position = scan_start.checked_add(relative).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "warm start-filter candidate position",
+            },
+        )?;
+        let candidate = scan_position
+            .checked_sub(usize::from(scanner.offset))
+            .ok_or(SearchError::InternalInvariant {
+                detail: "warm start-filter candidate preceded its exact offset",
+            })?;
+        if candidate >= candidate_end {
+            return Ok(if candidate_end == window.end() {
+                WarmBoundedStart::Exhausted
+            } else {
+                WarmBoundedStart::ResumeAt {
+                    position: candidate_end,
+                    work,
+                }
+            });
+        }
+        let Some(guard) = proof.guard() else {
+            return Ok(WarmBoundedStart::Candidate {
+                position: candidate,
+                work,
+            });
+        };
+        work = work.checked_add(1).ok_or(SearchError::ArithmeticOverflow {
+            computation: "warm start-filter prefix work",
+        })?;
+        let guard_position = candidate.checked_add(usize::from(guard.offset)).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "warm start-filter guard position",
+            },
+        )?;
+        if guard_position < window.end() && guard.set.contains(haystack[guard_position]) {
+            return Ok(WarmBoundedStart::Candidate {
+                position: candidate,
+                work,
+            });
+        }
+        search = candidate
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "warm start-filter next candidate",
+            })?;
     }
 }
 
@@ -10800,6 +11250,7 @@ mod tests {
         classify_byte_delta_16, scratch_bytes, ContextTransitionSlot, WorkMeter,
         ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, BYTE_SET_BLOCK_BYTES, BYTE_SET_WIDE_BLOCK_BYTES,
         CONTEXT_INITIAL_SOURCE, INVOCATION_RESET_WORK, ROOT_RUN_SCANNER_SHAPE_MAX_WORK,
+        WARM_EXISTS_INLINE_BYTES,
     };
     use crate::{
         plan::{
@@ -21137,6 +21588,459 @@ mod tests {
             Some(3)
         );
         assert!(workspace.lazy.initialized);
+    }
+
+    #[test]
+    fn warm_value_exists_matches_reported_execution_across_scanners_and_windows() {
+        let plans = [
+            ascii_root_bytes(b"a"),
+            ascii_root_bytes(b"ac"),
+            ascii_root_bytes(b"abc"),
+            ascii_root_bytes(b"aceg"),
+            ascii_root_bytes(&[0x00, 0x80, 0xff]),
+            byte_chain(&[(b'A', b'Z'), (b'a', b'z'), (b'0', b'9')]),
+            a_star(true),
+            empty_or_ab(false),
+            asserted_line_a(),
+        ];
+        let haystacks = bounded_words(&[0x00, b'A', b'a', b'b', b'1', b'z', 0x80, 0xff], 3);
+        let mut comparisons = 0usize;
+
+        for plan in &plans {
+            let mut value =
+                K0SearchSession::new_selected(plan, WorkspaceLimits::unlimited(), true, true)
+                    .unwrap();
+            let mut reported =
+                K0SearchSession::new_selected(plan, WorkspaceLimits::unlimited(), true, true)
+                    .unwrap();
+            for haystack in &haystacks {
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        let warm_value = value
+                            .search_window::<Exists>(haystack, window, SearchLimits::unlimited())
+                            .unwrap()
+                            .into_output();
+                        let expected = reported
+                            .search_window::<Exists>(haystack, window, SearchLimits::unlimited())
+                            .unwrap()
+                            .into_output();
+                        assert_eq!(warm_value, expected);
+
+                        let actual = value
+                            .search_exists_value(haystack, window, SearchLimits::unlimited())
+                            .unwrap();
+                        assert_eq!(actual, expected);
+
+                        let after_value = value
+                            .search_window::<Exists>(haystack, window, SearchLimits::unlimited())
+                            .unwrap();
+                        let after_reported = reported
+                            .search_window::<Exists>(haystack, window, SearchLimits::unlimited())
+                            .unwrap();
+                        assert_eq!(after_value.output(), after_reported.output());
+                        assert_eq!(after_value.accounting(), after_reported.accounting());
+                        comparisons = comparisons.saturating_add(1);
+                    }
+                }
+            }
+        }
+        assert!(comparisons > 40_000);
+    }
+
+    #[test]
+    fn scanner_selected_warm_exists_hit_is_read_only_and_finite_calls_fall_back() {
+        let plan = byte_chain(&[
+            (b'A', b'Z'),
+            (b'a', b'z'),
+            (b'a', b'z'),
+            (b'0', b'9'),
+        ]);
+        let haystack = b".Abc7~";
+        let window = SearchWindow::full(haystack);
+        let mut session =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+        assert!(
+            session
+                .search_window::<Exists>(haystack, window, SearchLimits::unlimited())
+                .unwrap()
+                .into_output()
+        );
+        let proof = plan.start_filter_proof.get().unwrap();
+        assert_eq!(
+            super::try_warm_direct_exists(haystack, window, &session.workspace.lazy, proof),
+            Ok(Some(true)),
+        );
+
+        let before_generation = session.workspace.generation;
+        let before_current = session.workspace.current_len;
+        let before_roots = session.workspace.roots_len;
+        let before_stack = session.workspace.stack_len;
+        let before_frontier = session.workspace.lazy.frontier_len;
+        let before_rows = session.workspace.lazy.rows.clone();
+        assert!(
+            session
+                .search_exists_value(haystack, window, SearchLimits::unlimited())
+                .unwrap()
+        );
+        assert_eq!(session.workspace.generation, before_generation);
+        assert_eq!(session.workspace.current_len, before_current);
+        assert_eq!(session.workspace.roots_len, before_roots);
+        assert_eq!(session.workspace.stack_len, before_stack);
+        assert_eq!(session.workspace.lazy.frontier_len, before_frontier);
+        assert_eq!(session.workspace.lazy.rows, before_rows);
+
+        let initial_row = usize::try_from(
+            super::direct_row_offset(session.workspace.lazy.initial).unwrap(),
+        )
+        .unwrap();
+        let first_cell = initial_row + usize::from(b'A');
+        session.workspace.lazy.rows[first_cell] = super::LAZY_CELL_UNFILLED;
+        assert!(
+            session
+                .search_exists_value(haystack, window, SearchLimits::unlimited())
+                .unwrap()
+        );
+        assert_ne!(
+            session.workspace.lazy.rows[first_cell],
+            super::LAZY_CELL_UNFILLED
+        );
+
+        let measured = session
+            .search_window::<Exists>(haystack, window, SearchLimits::unlimited())
+            .unwrap()
+            .accounting()
+            .work();
+        let one_below_measured = measured.checked_sub(1).unwrap();
+        assert!(
+            session
+                .search_exists_value(
+                    haystack,
+                    window,
+                    SearchLimits {
+                        max_work: measured,
+                        max_scratch_bytes: usize::MAX,
+                    },
+                )
+                .unwrap()
+        );
+        assert!(matches!(
+            session.search_exists_value(
+                haystack,
+                window,
+                SearchLimits {
+                    max_work: one_below_measured,
+                    max_scratch_bytes: usize::MAX,
+                },
+            ),
+            Err(SearchError::WorkLimitExceeded { limit, .. }) if limit == one_below_measured
+        ));
+
+        let before_invalid_rows = session.workspace.lazy.rows.clone();
+        let before_invalid_generation = session.workspace.generation;
+        assert!(matches!(
+            session.search_exists_value(
+                haystack,
+                SearchWindow::new(5, 3),
+                SearchLimits::unlimited(),
+            ),
+            Err(SearchError::InvalidWindow { start: 5, end: 3, .. })
+        ));
+        assert_eq!(session.workspace.generation, before_invalid_generation);
+        assert_eq!(session.workspace.lazy.rows, before_invalid_rows);
+    }
+
+    #[test]
+    fn warm_exists_inline_scan_has_one_global_search_bound() {
+        let proof = StartFilterProof {
+            scanner: Some(StartPositionScanner {
+                offset: 0,
+                scanner: StartScanner::One(b'a'),
+            }),
+            filter: Some(StartPositionFilter::Guard(StartPositionClass {
+                offset: 1,
+                set: byte_set(b"z"),
+            })),
+            force_haystack_start: false,
+            relaxed_nullable: false,
+        };
+        let mut source = vec![b'x'; 64];
+        for position in (0..64).step_by(2) {
+            source[position] = b'a';
+        }
+        source[19] = b'z';
+        assert!(matches!(
+            super::warm_bounded_start(&source, SearchWindow::full(&source), &proof),
+            Ok(super::WarmBoundedStart::ResumeAt { position, .. })
+                if position == WARM_EXISTS_INLINE_BYTES
+        ));
+
+        source[7] = b'z';
+        assert!(matches!(
+            super::warm_bounded_start(&source, SearchWindow::full(&source), &proof),
+            Ok(super::WarmBoundedStart::Candidate { position: 6, .. })
+        ));
+    }
+
+    #[test]
+    fn warm_exists_inline_scan_bounds_memchr_and_offset_scanners() {
+        let scanners = [
+            (StartScanner::One(b'a'), b'a'),
+            (StartScanner::Two(b'a', b'b'), b'b'),
+            (StartScanner::Three(b'a', b'b', b'c'), b'c'),
+        ];
+        let last_candidate = WARM_EXISTS_INLINE_BYTES.checked_sub(1).unwrap();
+        for (scanner, hit) in scanners {
+            let proof = StartFilterProof {
+                scanner: Some(StartPositionScanner { offset: 0, scanner }),
+                filter: None,
+                force_haystack_start: false,
+                relaxed_nullable: false,
+            };
+            let mut source = vec![b'x'; 64];
+            source[WARM_EXISTS_INLINE_BYTES] = hit;
+            assert!(matches!(
+                super::warm_bounded_start(&source, SearchWindow::full(&source), &proof),
+                Ok(super::WarmBoundedStart::ResumeAt { position, .. })
+                    if position == WARM_EXISTS_INLINE_BYTES
+            ));
+            source[last_candidate] = hit;
+            assert!(matches!(
+                super::warm_bounded_start(&source, SearchWindow::full(&source), &proof),
+                Ok(super::WarmBoundedStart::Candidate { position, .. })
+                    if position == last_candidate
+            ));
+        }
+
+        let offset = 3_u8;
+        let proof = StartFilterProof {
+            scanner: Some(StartPositionScanner {
+                offset,
+                scanner: StartScanner::One(b'q'),
+            }),
+            filter: None,
+            force_haystack_start: false,
+            relaxed_nullable: false,
+        };
+        let mut source = vec![b'x'; 64];
+        let first_excluded_scan = WARM_EXISTS_INLINE_BYTES
+            .checked_add(usize::from(offset))
+            .unwrap();
+        let last_included_scan = first_excluded_scan.checked_sub(1).unwrap();
+        source[first_excluded_scan] = b'q';
+        assert!(matches!(
+            super::warm_bounded_start(&source, SearchWindow::full(&source), &proof),
+            Ok(super::WarmBoundedStart::ResumeAt { position, .. })
+                if position == WARM_EXISTS_INLINE_BYTES
+        ));
+        source[last_included_scan] = b'q';
+        assert!(matches!(
+            super::warm_bounded_start(&source, SearchWindow::full(&source), &proof),
+            Ok(super::WarmBoundedStart::Candidate { position, .. })
+                if position == last_candidate
+        ));
+    }
+
+    #[test]
+    fn warm_value_exists_continues_after_inline_cutoff_and_long_prefix() {
+        let match_len = WARM_EXISTS_INLINE_BYTES.checked_add(4).unwrap();
+        let plan = byte_chain(&vec![(b'a', b'a'); match_len]);
+        let mut session =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+        let long_at_start = vec![b'a'; match_len];
+        assert!(
+            session
+                .search_window::<Exists>(
+                    &long_at_start,
+                    SearchWindow::full(&long_at_start),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output()
+        );
+        let proof = plan.start_filter_proof.get().unwrap();
+        assert_eq!(
+            super::try_warm_direct_exists(
+                &long_at_start,
+                SearchWindow::full(&long_at_start),
+                &session.workspace.lazy,
+                proof,
+            ),
+            Ok(Some(true)),
+        );
+        let before_long_rows = session.workspace.lazy.rows.clone();
+        let before_long_generation = session.workspace.generation;
+        assert!(
+            session
+                .search_exists_value(
+                    &long_at_start,
+                    SearchWindow::full(&long_at_start),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+        );
+        assert_eq!(session.workspace.generation, before_long_generation);
+        assert_eq!(session.workspace.lazy.rows, before_long_rows);
+
+        let late_start = WARM_EXISTS_INLINE_BYTES.checked_add(4).unwrap();
+        let late_end = late_start.checked_add(match_len).unwrap();
+        let mut late = vec![b'x'; late_start];
+        late.resize(late_end, b'a');
+        assert!(
+            session
+                .search_window::<Exists>(
+                    &late,
+                    SearchWindow::full(&late),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output()
+        );
+        assert!(matches!(
+            super::warm_bounded_start(&late, SearchWindow::full(&late), proof),
+            Ok(super::WarmBoundedStart::ResumeAt { position, .. })
+                if position == WARM_EXISTS_INLINE_BYTES
+        ));
+        assert_eq!(
+            super::try_warm_direct_exists(
+                &late,
+                SearchWindow::full(&late),
+                &session.workspace.lazy,
+                proof,
+            ),
+            Ok(Some(true)),
+        );
+        let before_late_rows = session.workspace.lazy.rows.clone();
+        let before_late_generation = session.workspace.generation;
+        assert!(
+            session
+                .search_exists_value(
+                    &late,
+                    SearchWindow::full(&late),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+        );
+        assert_eq!(session.workspace.generation, before_late_generation);
+        assert_eq!(session.workspace.lazy.rows, before_late_rows);
+
+        let absent = vec![b'x'; late_end];
+        let mut absent_session =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+        assert!(
+            !absent_session
+                .search_window::<Exists>(
+                    &absent,
+                    SearchWindow::full(&absent),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output()
+        );
+        assert_eq!(
+            super::try_warm_direct_exists(
+                &absent,
+                SearchWindow::full(&absent),
+                &absent_session.workspace.lazy,
+                proof,
+            ),
+            Ok(Some(false)),
+        );
+    }
+
+    #[test]
+    fn warm_value_exists_continuation_is_invocation_local() {
+        let ab = byte_chain(&[(b'a', b'a'), (b'b', b'b')]);
+        let ac = byte_chain(&[(b'a', b'a'), (b'c', b'c')]);
+        let mut ab_session =
+            K0SearchSession::new_selected(&ab, WorkspaceLimits::unlimited(), true, true).unwrap();
+        let mut ac_session =
+            K0SearchSession::new_selected(&ac, WorkspaceLimits::unlimited(), true, true).unwrap();
+        let mut source = b"axaxaxaxaxaxaxaxaxaxab".to_vec();
+        let window = SearchWindow::full(&source);
+
+        assert!(
+            ab_session
+                .search_window::<Exists>(&source, window, SearchLimits::unlimited())
+                .unwrap()
+                .into_output()
+        );
+        assert!(!
+            ac_session
+                .search_window::<Exists>(&source, window, SearchLimits::unlimited())
+                .unwrap()
+                .into_output()
+        );
+        let ab_rows = ab_session.workspace.lazy.rows.clone();
+        let ab_generation = ab_session.workspace.generation;
+        assert!(
+            ab_session
+                .search_exists_value(&source, window, SearchLimits::unlimited())
+                .unwrap()
+        );
+        assert_eq!(ab_session.workspace.lazy.rows, ab_rows);
+        assert_eq!(ab_session.workspace.generation, ab_generation);
+
+        // Keep the allocation and address stable while changing every
+        // candidate's second byte. No source-derived continuation may survive
+        // the call that created it or cross into the other immutable plan.
+        for pair in source.chunks_exact_mut(2) {
+            pair[1] = b'c';
+        }
+        assert!(!
+            ab_session
+                .search_exists_value(&source, window, SearchLimits::unlimited())
+                .unwrap()
+        );
+        assert!(
+            ac_session
+                .search_exists_value(&source, window, SearchLimits::unlimited())
+                .unwrap()
+        );
+        for pair in source.chunks_exact_mut(2) {
+            pair[1] = b'b';
+        }
+        assert!(
+            ab_session
+                .search_exists_value(&source, window, SearchLimits::unlimited())
+                .unwrap()
+        );
+        assert!(!
+            ac_session
+                .search_exists_value(&source, window, SearchLimits::unlimited())
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn saturated_warm_exists_declines_before_speculative_execution() {
+        let depth = super::LAZY_MAX_STATES.checked_add(1).unwrap();
+        let plan = byte_chain(&vec![(b'a', b'a'); depth]);
+        let source = vec![b'a'; depth];
+        let window = SearchWindow::full(&source);
+        let mut session =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+        assert!(
+            session
+                .search_window::<Exists>(&source, window, SearchLimits::unlimited())
+                .unwrap()
+                .into_output()
+        );
+        assert!(session.workspace.lazy.saturated);
+        let proof = plan.start_filter_proof.get().unwrap();
+        assert_eq!(
+            super::try_warm_direct_exists(&source, window, &session.workspace.lazy, proof),
+            Ok(None),
+        );
+        assert!(
+            session
+                .search_exists_value(&source, window, SearchLimits::unlimited())
+                .unwrap()
+        );
     }
 
     #[test]

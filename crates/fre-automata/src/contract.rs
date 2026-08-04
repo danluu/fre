@@ -618,6 +618,27 @@ impl K0SearchSession<'_> {
         ))
     }
 
+    /// Return only existence, allowing an authenticated warm session to omit
+    /// diagnostic report construction for unlimited value-only calls.
+    ///
+    /// Finite limits and every cold or structurally ineligible invocation use
+    /// the ordinary report-producing executor with unchanged accounting and
+    /// error precedence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] for an invalid range, a hard-limit refusal, or
+    /// execution failure.
+    #[doc(hidden)]
+    pub fn search_exists_value(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<bool, SearchError> {
+        self.search_exists_value_untyped(haystack, window, limits)
+    }
+
     /// Search a complete-haystack suffix with retained source-independent
     /// span cursor facts.
     ///

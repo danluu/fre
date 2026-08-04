@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
 use fre::{
-    PlanKind, PortableBuilder, PortableRegex, PortableSearchSession, SearchAccounting, SearchError,
-    SearchLimits, SearchSessionLimits, SearchWindow,
+    PlanKind, PlanSelection, PortableBuilder, PortableRegex, PortableSearchSession,
+    SearchAccounting, SearchError, SearchLimits, SearchSessionLimits, SearchWindow,
 };
 
 const CASES: [(&str, &str); 8] = [
@@ -111,6 +111,15 @@ fn value_exists_is_exhaustive_across_leaf_cardinality_boundaries() {
                         Ok(expected_semantics),
                         "oracle: case={case}, haystack={haystack:?}, window={start}..{end}"
                     );
+                    assert_direct_parity(
+                        &regex,
+                        haystack,
+                        window,
+                        SearchLimits::unlimited(),
+                        &format!(
+                            "unlimited: case={case}, haystack={haystack:?}, window={start}..{end}"
+                        ),
+                    );
 
                     let work = measured_work(&regex, haystack, window);
                     for max_work in 0..=work.saturating_add(1) {
@@ -134,9 +143,11 @@ fn value_exists_is_exhaustive_across_leaf_cardinality_boundaries() {
 
 #[test]
 fn range_and_classified_scanner_block_edges_preserve_results_and_refusal_payloads() {
-    for (case, pattern) in [
-        ("range", "(?-u:[abcd])+"),
-        ("classified", "(?-u:[aceg])+"),
+    for (case, pattern, filler, member) in [
+        ("range", "(?-u:[abcd])+", b'z', b'a'),
+        ("classified", "(?-u:[aceg])+", b'z', b'a'),
+        ("inverted-range", "(?-u:[^a-d])+", b'a', b'z'),
+        ("inverted-classified", "(?-u:[^aceg])+", b'a', b'z'),
     ] {
         let regex = build(pattern);
         let mut session = regex
@@ -160,15 +171,23 @@ fn range_and_classified_scanner_block_edges_preserve_results_and_refusal_payload
 
             for hit in hit_positions {
                 let mut haystack = vec![b'!'; length.saturating_add(2)];
-                haystack[1..length + 1].fill(b'z');
+                haystack[1..length + 1].fill(filler);
                 if let Some(position) = hit {
-                    haystack[position + 1] = b'a';
+                    haystack[position + 1] = member;
                 }
                 let window = SearchWindow::new(1, length + 1);
                 assert_eq!(
                     reporting(&regex, &haystack, window, SearchLimits::unlimited()),
                     Ok(hit.is_some()),
                     "case={case}, length={length}, hit={hit:?}"
+                );
+                assert_direct_and_session_parity(
+                    &regex,
+                    &mut session,
+                    &haystack,
+                    window,
+                    SearchLimits::unlimited(),
+                    &format!("unlimited: case={case}, length={length}, hit={hit:?}"),
                 );
 
                 let work = measured_work(&regex, &haystack, window);
@@ -220,6 +239,53 @@ fn invalid_windows_win_before_zero_work_for_direct_and_native_session_paths() {
             );
         }
     }
+}
+
+#[test]
+fn cold_short_k0_value_call_preserves_warming_before_finite_search() {
+    let build = || {
+        PortableBuilder::new(r"(?-u:[QX][a-z_]{19,20}[0-9]?)")
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .unwrap()
+    };
+    let short = vec![b'.'; 17];
+
+    let measured = build();
+    let mut measured_session = measured
+        .search_session(SearchSessionLimits::unlimited())
+        .unwrap();
+    let (cold_matched, cold_accounting) = measured_session
+        .is_match(&short, SearchLimits::unlimited())
+        .unwrap();
+    assert!(!cold_matched);
+    let (_, warm_accounting) = measured_session
+        .is_match(&short, SearchLimits::unlimited())
+        .unwrap();
+    let warm_work = warm_accounting.work_or_linear_terms();
+    assert!(cold_accounting.work_or_linear_terms() > warm_work);
+
+    let candidate = build();
+    let mut candidate_session = candidate
+        .search_session(SearchSessionLimits::unlimited())
+        .unwrap();
+    assert!(
+        !candidate_session
+            .is_match_value(&short, SearchLimits::unlimited())
+            .unwrap()
+    );
+    assert!(
+        !candidate_session
+            .is_match(
+                &short,
+                SearchLimits {
+                    max_work: warm_work,
+                    max_scratch_bytes: usize::MAX,
+                },
+            )
+            .unwrap()
+            .0
+    );
 }
 
 fn words(alphabet: &[u8], max_len: usize) -> Vec<Vec<u8>> {

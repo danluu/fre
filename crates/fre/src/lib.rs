@@ -5573,8 +5573,7 @@ impl PortableRegex {
                 .map(|(matched, _)| matched)
                 .map_err(SearchError::from),
             PortablePlan::BoundedByteClassSequence(plan) => plan
-                .find_window(haystack, window, limits)
-                .map(|(matched, _)| matched)
+                .find_window_value(haystack, window, limits)
                 .map_err(SearchError::BoundedByteClassSequence),
             PortablePlan::FixedPredicateWord64(plan) => plan
                 .find_window_value(
@@ -6035,8 +6034,7 @@ impl<'r> PortableSearchSession<'r> {
                 regex.is_match_window_value(haystack, window, limits)
             }
             PortableSearchSessionPlan::K0 { session } => session
-                .search_window::<Exists>(haystack, window, limits)
-                .map(fre_automata::SearchReport::into_output)
+                .search_exists_value(haystack, window, limits)
                 .map_err(SearchError::from),
         }
     }

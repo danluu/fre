@@ -1,14 +1,21 @@
-//! Direct search for finite positive greedy byte-class run sequences.
+//! Direct search for finite greedy byte-class run sequences.
 //!
 //! The admitted HIR is a root concatenation of two through sixteen
-//! `CLASS{min,max}` terms. Capture chains may wrap the root concatenation,
-//! each immediate repetition term, or each repetition's single-byte class
-//! body; captures around a proper subsequence concatenation are not flattened.
-//! Every bound is finite and positive, every repetition is greedy, at least
-//! one bound is variable, and adjacent classes are disjoint. The last
-//! condition makes each greedy boundary deterministic: a byte consumed by one
-//! run can never be returned to its successor. Non-adjacent classes may
-//! overlap.
+//! byte-class terms. A term is either a bare single-byte class/literal, treated
+//! as a fixed `1..1` run, or a finite greedy `CLASS{min,max}` repetition. The
+//! first two runs are positive; a suffix beginning at the third or a later run
+//! may have zero minima when every maximum is positive. Capture chains may
+//! wrap the root concatenation, each
+//! immediate term, or each repetition's single-byte class body; captures
+//! around a proper subsequence concatenation are not flattened. At least one
+//! bound is variable. Every boundary whose successor is required has disjoint
+//! classes, making the required prefix deterministic: a byte consumed by one
+//! run cannot be returned to its required successor. The nullable region is a
+//! terminal suffix, so it cannot invalidate the prefix and no later required
+//! run can force it to give bytes back. Boundaries into and within that suffix
+//! may overlap because an already-successful match never backtracks merely to
+//! redistribute bytes among greedy optional runs. Other non-adjacent classes
+//! may overlap as well.
 //!
 //! Search scans physical runs of the first class. Within one such run, only
 //! its earliest suffix of at most the first maximum can reach the disjoint
@@ -16,7 +23,9 @@
 //! first class, and every later eligible start reaches the same successor
 //! boundary.
 //! The tail is therefore verified once per first-class run instead of once per
-//! member. For one immutable plan this is O(N), with a complete
+//! member. Requiring a positive second run is what makes that physical-run
+//! collapse valid even when a later tail run is nullable. For one immutable
+//! plan this is O(N), with a complete
 //! source-independent bound of `N * (maximum_tail_width + 16)` charged by the
 //! shared byte-class work meter. Fixed products remain with their established
 //! incumbent plans; every structurally eligible variable product is admitted,
@@ -183,6 +192,7 @@ impl InspectionOutcome {
 struct Owner {
     runs: [Run; MAX_RUNS],
     run_count: usize,
+    last_required_run: usize,
     total_minimum: usize,
     total_maximum: usize,
     first_seek: SetSeek,
@@ -213,6 +223,21 @@ impl Plan {
         classifier_words: Option<[u64; 4]>,
         dispatch: SimdDispatchContext,
     ) -> Result<Self, CopyError> {
+        let retained_runs = &runs[..run_count];
+        let last_required_run = retained_runs
+            .iter()
+            .rposition(|run| run.minimum != 0)
+            .expect("a bounded sequence has two required leading runs");
+        debug_assert!(last_required_run >= 1);
+        debug_assert!(retained_runs[..=last_required_run]
+            .iter()
+            .all(|run| run.minimum != 0));
+        let nullable_suffix_start = last_required_run
+            .checked_add(1)
+            .expect("the final required run lies within the retained run array");
+        debug_assert!(retained_runs[nullable_suffix_start..]
+            .iter()
+            .all(|run| run.minimum == 0));
         let classifier = classifier_words.map(|words| {
             dispatch
                 .byte_set_classifier(ByteSet256::from_words(words), DispatchPolicy::Auto)
@@ -221,6 +246,7 @@ impl Plan {
         let owner = ExactBoxOrUsize::try_from_boxed(Owner {
             runs,
             run_count,
+            last_required_run,
             total_minimum,
             total_maximum,
             first_seek,
@@ -260,8 +286,32 @@ impl Plan {
         window: SearchWindow,
         limits: SearchLimits,
     ) -> Result<bool, SearchError> {
+        if limits == SearchLimits::unlimited() {
+            validate_window(haystack, window)?;
+            if self.unmetered_work_fits(window) {
+                return Ok(self.search_value(haystack, window, true).is_some());
+            }
+        }
         self.search(haystack, window, limits, true)
             .map(|state| state.span.is_some())
+    }
+
+    pub(crate) fn find_window_value(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<Option<Match>, SearchError> {
+        if limits == SearchLimits::unlimited() {
+            validate_window(haystack, window)?;
+            if self.unmetered_work_fits(window) {
+                return Ok(self
+                    .search_value(haystack, window, false)
+                    .map(|(start, end)| Match { start, end }));
+            }
+        }
+        self.find_window(haystack, window, limits)
+            .map(|(matched, _)| matched)
     }
 
     pub(crate) fn earliest_end_window(
@@ -399,6 +449,89 @@ impl Plan {
         })
     }
 
+    fn unmetered_work_fits(&self, window: SearchWindow) -> bool {
+        let owner = self.owner();
+        let input_bytes = window
+            .end()
+            .checked_sub(window.start())
+            .expect("the caller validated ordered window bounds");
+        let Some(maximum_tail_width) = owner
+            .total_maximum
+            .checked_sub(owner.runs[0].maximum)
+        else {
+            return false;
+        };
+        let Some(per_candidate) = maximum_tail_width.checked_add(BYTE_SET_BLOCK_BYTES) else {
+            return false;
+        };
+        u64::try_from(input_bytes)
+            .ok()
+            .and_then(|input| {
+                u64::try_from(per_candidate)
+                    .ok()
+                    .and_then(|per_candidate| input.checked_mul(per_candidate))
+            })
+            .is_some()
+    }
+
+    fn search_value(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        shortest_last: bool,
+    ) -> Option<(usize, usize)> {
+        let owner = self.owner();
+        let last_start = window.end().checked_sub(owner.total_minimum)?;
+        if last_start < window.start() {
+            return None;
+        }
+        let candidate_end = last_start
+            .checked_add(1)
+            .expect("a last start before the window end advances once");
+        let mut position = window.start();
+        while position < candidate_end {
+            let Some(run_start) = owner.first_seek.seek_unmetered(
+                haystack,
+                position,
+                candidate_end,
+                owner.classifier.as_ref(),
+            ) else {
+                break;
+            };
+            let after_run_start = run_start
+                .checked_add(1)
+                .expect("a first-run member before the window end advances once");
+            let run_end = owner
+                .first_run_end_seek
+                .seek_unmetered(
+                    haystack,
+                    after_run_start,
+                    window.end(),
+                    owner.classifier.as_ref(),
+                )
+                .unwrap_or(window.end());
+            let first = owner.runs[0];
+            let run_length = run_end
+                .checked_sub(run_start)
+                .expect("the first-run end cannot precede its start");
+            if run_length >= first.minimum {
+                let start = run_end.saturating_sub(first.maximum).max(run_start);
+                if let Some(end) =
+                    owner.verify_tail_value(haystack, run_end, window.end(), shortest_last)
+                {
+                    return Some((start, end));
+                }
+            }
+            if run_end == window.end() {
+                break;
+            }
+            position = run_end
+                .checked_add(1)
+                .expect("a first-run boundary before the window end advances once");
+        }
+        None
+    }
+
     fn finish_accounting(
         &self,
         operation: Operation,
@@ -430,6 +563,44 @@ impl Plan {
 }
 
 impl Owner {
+    fn verify_tail_value(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        end: usize,
+        shortest_last: bool,
+    ) -> Option<usize> {
+        let mut position = start;
+        let runs = &self.runs[..self.run_count];
+        for (index, &run) in runs.iter().enumerate().skip(1) {
+            let shortest_terminal = shortest_last && index == self.last_required_run;
+            let maximum = if shortest_terminal {
+                run.minimum
+            } else {
+                run.maximum
+            };
+            let mut consumed = 0_usize;
+            while consumed < maximum && position < end {
+                if !run.contains(haystack[position]) {
+                    break;
+                }
+                position = position
+                    .checked_add(1)
+                    .expect("a position before the window end advances once");
+                consumed = consumed
+                    .checked_add(1)
+                    .expect("one run cannot exceed its finite maximum");
+            }
+            if consumed < run.minimum {
+                return None;
+            }
+            if shortest_terminal {
+                return Some(position);
+            }
+        }
+        Some(position)
+    }
+
     fn verify_tail(
         &self,
         haystack: &[u8],
@@ -445,7 +616,8 @@ impl Owner {
             *run_scans = run_scans.checked_add(1).ok_or(Error::CounterOverflow {
                 counter: "run-scan",
             })?;
-            let maximum = if shortest_last && index + 1 == runs.len() {
+            let shortest_terminal = shortest_last && index == self.last_required_run;
+            let maximum = if shortest_terminal {
                 run.minimum
             } else {
                 run.maximum
@@ -465,6 +637,9 @@ impl Owner {
             }
             if consumed < run.minimum {
                 return Ok(None);
+            }
+            if shortest_terminal {
+                return Ok(Some(position));
             }
         }
         Ok(Some(position))
@@ -506,8 +681,9 @@ pub(crate) fn inspect(
     let mut total_minimum = 0_usize;
     let mut total_maximum = 0_usize;
     let mut has_variable_bound = false;
+    let mut nullable_suffix_started = false;
     for (index, part) in parts.iter().enumerate() {
-        let Some(run) = inspect_run(part, &mut work, max_planner_work)? else {
+        let Some(run) = inspect_run(part, index >= 2, &mut work, max_planner_work)? else {
             return Ok(InspectionOutcome::Ineligible { planner_work: work });
         };
         if index != 0 {
@@ -516,7 +692,7 @@ pub(crate) fn inspect(
                 ADJACENT_DISJOINT_WORD_WORK,
                 max_planner_work,
             )?;
-            if runs[index - 1].overlaps(run) {
+            if run.minimum != 0 && runs[index - 1].overlaps(run) {
                 return Ok(InspectionOutcome::Ineligible { planner_work: work });
             }
         }
@@ -528,6 +704,11 @@ pub(crate) fn inspect(
         total_minimum = next_total_minimum;
         total_maximum = next_total_maximum;
         has_variable_bound |= run.minimum != run.maximum;
+        if run.minimum == 0 {
+            nullable_suffix_started = true;
+        } else if nullable_suffix_started {
+            return Ok(InspectionOutcome::Ineligible { planner_work: work });
+        }
         runs[index] = run;
     }
     if !has_variable_bound {
@@ -588,20 +769,38 @@ fn checked_width_totals(
 
 fn inspect_run(
     hir: &Hir,
+    allow_zero_minimum: bool,
     work: &mut u64,
     max_planner_work: u64,
 ) -> Result<Option<Run>, InspectionError> {
     let hir = peel_captures(hir, work, max_planner_work)?;
-    let HirKind::Repetition(repetition) = hir.kind() else {
-        return Ok(None);
+    let (body, minimum, maximum) = match hir.kind() {
+        HirKind::Repetition(repetition) => {
+            let Some(maximum) = repetition.max else {
+                return Ok(None);
+            };
+            if maximum == 0
+                || maximum < repetition.min
+                || !repetition.greedy
+                || (repetition.min == 0 && !allow_zero_minimum)
+            {
+                return Ok(None);
+            }
+            let Ok(minimum) = usize::try_from(repetition.min) else {
+                return Ok(None);
+            };
+            let Ok(maximum) = usize::try_from(maximum) else {
+                return Ok(None);
+            };
+            (
+                peel_captures(&repetition.sub, work, max_planner_work)?,
+                minimum,
+                maximum,
+            )
+        }
+        HirKind::Class(_) | HirKind::Literal(_) => (hir, 1, 1),
+        _ => return Ok(None),
     };
-    let Some(maximum) = repetition.max else {
-        return Ok(None);
-    };
-    if repetition.min == 0 || maximum < repetition.min || !repetition.greedy {
-        return Ok(None);
-    }
-    let body = peel_captures(&repetition.sub, work, max_planner_work)?;
     let mut words = [0_u64; 4];
     match body.kind() {
         HirKind::Class(Class::Bytes(class)) => {
@@ -609,30 +808,24 @@ fn inspect_run(
                 charge_planner(work, RANGE_INSPECTION_WORK, max_planner_work)?;
                 for byte in range.start()..=range.end() {
                     charge_planner(work, MEMBER_INSERTION_WORK, max_planner_work)?;
-                    let word = usize::from(byte >> 6);
+                    let bitmap_index = usize::from(byte >> 6);
                     let bit = u32::from(byte & 63);
-                    words[word] |= 1_u64 << bit;
+                    words[bitmap_index] |= 1_u64 << bit;
                 }
             }
         }
         HirKind::Literal(literal) if literal.0.len() == 1 => {
             charge_planner(work, MEMBER_INSERTION_WORK, max_planner_work)?;
             let byte = literal.0[0];
-            let word = usize::from(byte >> 6);
+            let bitmap_index = usize::from(byte >> 6);
             let bit = u32::from(byte & 63);
-            words[word] |= 1_u64 << bit;
+            words[bitmap_index] |= 1_u64 << bit;
         }
         _ => return Ok(None),
     }
     if words.iter().all(|word| *word == 0) {
         return Ok(None);
     }
-    let Ok(minimum) = usize::try_from(repetition.min) else {
-        return Ok(None);
-    };
-    let Ok(maximum) = usize::try_from(maximum) else {
-        return Ok(None);
-    };
     Ok(Some(Run {
         words,
         minimum,
@@ -711,6 +904,13 @@ mod tests {
     fn selects_variable_sequences_with_deterministic_boundaries() {
         for pattern in [
             "a{1,2}b{1,2}",
+            "(?-u:[QX])(?-u:[a-z_]){19,20}(?-u:[0-9])?",
+            "(?-u:[ab])(?-u:[CD]){1,2}",
+            "(?-u:[ab]){1,2}(?-u:[CD])(?-u:[xy])?",
+            "(?-u:[ab])(?-u:[CD]){1,2}(?-u:[xy])?(?-u:[CD]){0,2}",
+            "(?-u:[ab])(?-u:[CD]){1,2}(?-u:[CD])?",
+            "(?-u:[ab])(?-u:[CD]){1,2}(?-u:[xy])?(?-u:[xy])?",
+            "(?-u:[\\x00\\x80\\xFE\\xFF])(?-u:[\\x20-\\x7E]){2,3}(?-u:[0-9])?",
             "(?-u:[A-Z]){1,3}(?-u:[a-z]){2,5}(?-u:[0-9]){1,2}",
             "(?-u:[abcd]){1,3}(?-u:[WXYZ]){1,3}",
             "(?-u:[ab]){1,4}(?-u:[cd]){1,4}(?-u:[ab]){1,4}",
@@ -734,6 +934,11 @@ mod tests {
             "(?-u:[abcdefgh]){1,4}?(?-u:[WXYZ]){1,4}",
             "(?-u:[ab])+(?-u:[cd]){1,4}",
             "(?-u:[ab]){2}(?-u:[cd]){2}",
+            "(?-u:[ab])?(?-u:[CD]){1,2}(?-u:[xy])",
+            "(?-u:[ab]){1,2}(?-u:[CD])?(?-u:[xy])",
+            "(?-u:[ab]){1,2}(?-u:[CD]){0}(?-u:[xy])",
+            "(?-u:[Aa])(?-u:[Bb]){1,2}(?-u:[Cc])?(?-u:[Bb])",
+            "(?-u:[Aa])(?-u:[Bb]){1,2}(?-u:[Cc])?(?-u:[Dd])",
             "((?-u:[A-Z]){1,3}(?-u:[a-z]){2,5})(?-u:[0-9]){1,2}",
             r"(?-u:[\x00-\xFF]){1,32}A{1,32}",
         ] {
@@ -830,6 +1035,12 @@ mod tests {
     fn exhaustive_windows_and_iteration_match_the_bytes_oracle() {
         let patterns = [
             "a{1,2}b{1,2}",
+            "(?-u:[ab])(?-u:[cd]){1,2}",
+            "(?-u:[ab]){1,2}(?-u:[cd])(?-u:[WZ])?",
+            "(?-u:[ab])(?-u:[cd]){1,2}(?-u:[WZ])?",
+            "(?-u:[ab]){1,2}(?-u:[cd]){1,2}(?-u:[WZ]){0,2}(?-u:[ab])?",
+            "(?-u:[ab])(?-u:[cd]){1,2}(?-u:[WZ])?(?-u:[cd]){0,2}",
+            "(?-u:[ab])(?-u:[cd]){1,2}(?-u:[cd])?(?-u:[cd])?",
             "(?-u:[abcd]){1,3}(?-u:[WXYZ]){1,3}",
             "(?-u:[ab]){1,4}(?-u:[cd]){1,4}(?-u:[ab]){1,4}",
         ];
@@ -837,6 +1048,9 @@ mod tests {
         for pattern in patterns {
             let fre = build(pattern);
             assert_eq!(fre.runtime_implementation_id(), PLAN_ID);
+            let PortablePlan::BoundedByteClassSequence(plan) = &fre.plan else {
+                panic!("one admitted sequence should retain its sequence plan");
+            };
             let oracle = regex::bytes::RegexBuilder::new(pattern)
                 .unicode(false)
                 .build()
@@ -886,6 +1100,16 @@ mod tests {
                                 expected_shortest,
                             );
                             assert_eq!(
+                                plan.selected_end_window(
+                                    &haystack,
+                                    window,
+                                    SearchLimits::unlimited(),
+                                )
+                                .unwrap()
+                                .0,
+                                expected.map(|(_, finish)| finish),
+                            );
+                            assert_eq!(
                                 span(
                                     fre.find_window(
                                         &haystack,
@@ -925,6 +1149,106 @@ mod tests {
                     assert_eq!(actual, expected, "{pattern} {haystack:?}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn nullable_tail_preserves_shortest_and_greedy_selected_ends() {
+        let regex = build("(?-u:[ab]){1,3}(?-u:[CD]){1,2}(?-u:[xy])?");
+        assert_eq!(regex.runtime_implementation_id(), PLAN_ID);
+        let haystack = b"aaCCx";
+        assert_eq!(
+            regex
+                .shortest_match(haystack, SearchLimits::unlimited())
+                .unwrap()
+                .0,
+            Some(3),
+        );
+        assert_eq!(
+            span(regex.find(haystack, SearchLimits::unlimited()).unwrap().0),
+            Some((0, 5)),
+        );
+
+        // A nullable second run would invalidate the physical-first-run
+        // collapse when the optional suffix accepts before that run ends.
+        let declined = build("(?-u:[ab]){1,3}(?-u:[CD])?");
+        assert_ne!(declined.runtime_implementation_id(), PLAN_ID);
+        assert_eq!(
+            span(
+                declined
+                    .find(b"aaaa", SearchLimits::unlimited())
+                    .unwrap()
+                    .0,
+            ),
+            Some((0, 3)),
+        );
+
+        // A required run after a nullable bridge can require backtracking a
+        // preceding greedy run across that bridge. Such interiors stay with
+        // the complete incumbent executor.
+        let bridged = build("(?-u:[Aa])(?-u:[Bb]){1,2}(?-u:[Cc])?(?-u:[Bb])");
+        assert_ne!(bridged.runtime_implementation_id(), PLAN_ID);
+        assert_eq!(
+            span(bridged.find(b"ABB", SearchLimits::unlimited()).unwrap().0),
+            Some((0, 3)),
+        );
+
+        // Once the complete required prefix has succeeded, overlapping
+        // optional runs cannot force a greedy predecessor to backtrack.
+        let overlapping = build(
+            "(?-u:[ab])(?-u:[CD]){1,2}(?-u:[CD])?(?-u:[CD])?",
+        );
+        assert_eq!(overlapping.runtime_implementation_id(), PLAN_ID);
+        assert_eq!(
+            overlapping
+                .shortest_match(b"aCCCC", SearchLimits::unlimited())
+                .unwrap()
+                .0,
+            Some(2),
+        );
+        assert_eq!(
+            span(
+                overlapping
+                    .find(b"aCCCC", SearchLimits::unlimited())
+                    .unwrap()
+                    .0
+            ),
+            Some((0, 5)),
+        );
+    }
+
+    #[test]
+    fn noncontiguous_first_run_value_scanner_crosses_block_edges() {
+        let regex = build(r"(?-u:[aceg]){1,32}(?-u:[WZ]){1,2}");
+        assert_eq!(regex.runtime_implementation_id(), PLAN_ID);
+        for run_length in [15_usize, 16, 17, 31, 32] {
+            let matched = [vec![b'a'; run_length], vec![b'W']].concat();
+            assert!(
+                regex
+                    .is_match_value(&matched, SearchLimits::unlimited())
+                    .unwrap()
+            );
+            assert_eq!(
+                span(
+                    regex
+                        .find_value(&matched, SearchLimits::unlimited())
+                        .unwrap()
+                ),
+                Some((0, run_length + 1)),
+            );
+
+            let absent = vec![b'a'; run_length];
+            assert!(
+                !regex
+                    .is_match_value(&absent, SearchLimits::unlimited())
+                    .unwrap()
+            );
+            assert_eq!(
+                regex
+                    .find_value(&absent, SearchLimits::unlimited())
+                    .unwrap(),
+                None,
+            );
         }
     }
 
@@ -1005,8 +1329,8 @@ mod tests {
 
     #[test]
     fn exact_search_and_construction_limits_close() {
-        let pattern = "(?-u:[abcd]){1,3}(?-u:[WXYZ]){1,3}";
-        let haystack = b"xxaaaQzaaWZxx";
+        let pattern = "(?-u:[abcd])(?-u:[WXYZ]){1,3}(?-u:[mn])?";
+        let haystack = b"xxaQzaWZmx";
         let regex = build(pattern);
         let PortablePlan::BoundedByteClassSequence(plan) = &regex.plan else {
             panic!("expected bounded sequence plan");
@@ -1133,15 +1457,19 @@ mod tests {
 
     #[test]
     fn invalid_window_is_rejected_before_source_reads() {
-        let regex = build("(?-u:[abcd]){1,3}(?-u:[WXYZ]){1,3}");
+        let regex = build("(?-u:[abcd])(?-u:[WXYZ]){1,3}(?-u:[mn])?");
+        let zero_work = SearchLimits {
+            max_work: 0,
+            max_scratch_bytes: 0,
+        };
+        let (too_short, accounting) = regex.find(b"a", zero_work).unwrap();
+        assert_eq!(too_short, None);
+        assert_eq!(accounting.work(), 0);
         assert!(matches!(
             regex.find_window(
                 b"abc",
                 SearchWindow::new(2, 1),
-                SearchLimits {
-                    max_work: 0,
-                    max_scratch_bytes: 0,
-                },
+                zero_work,
             ),
             Err(FacadeSearchError::BoundedByteClassSequence(Error::InvalidWindow))
         ));
