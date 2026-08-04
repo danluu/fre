@@ -25,6 +25,16 @@ pub const CERTIFIED_MAX_PATTERNS: usize = MAX_FACTORED_PATTERNS;
 const MAX_FACTORED_COLUMNS: usize = 16;
 const MAX_FACTORED_ANCHOR_BYTES: usize = 3;
 const FACTORED_SIMD_MINIMUM_HAYSTACK_BYTES: usize = 32;
+// A sparse anchor verifies a bounded number of candidates itself. If those
+// candidates are all decoys, the native packed searcher resumes after the
+// last start already disproved. Thus sparse inputs need only one source pass,
+// while dense decoys pay bounded work and never restart from byte zero.
+const SPARSE_ANCHOR_CANDIDATE_BUDGET: usize = 4;
+const SPARSE_ANCHOR_MAX_RETAINED_PATTERN_BYTES: usize = 4 * 1024;
+// Retain only anchor groups whose exact source-order verification fits in two
+// 16-byte blocks. After a rejection, another candidate is attempted only when
+// the proved skip amortizes all exact verification performed so far.
+const SPARSE_ANCHOR_MAX_CANDIDATE_VERIFICATION_WORK: usize = 32;
 
 /// Hard limits for a packed finite-literal plan.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -222,6 +232,78 @@ struct FactoredColumns {
     anchor_len: u8,
 }
 
+/// A fixed-offset byte set present in every native literal.
+///
+/// Scanning from `offset` finds the earliest position that could belong to a
+/// match. Subtracting the offset therefore skips only starts proved
+/// impossible, while the unchanged ordered searcher retains source priority.
+#[derive(Clone, Debug)]
+struct SparseAnchor {
+    offset: usize,
+    bytes: [u8; MAX_FACTORED_ANCHOR_BYTES],
+    len: u8,
+    minimum_pattern_width: usize,
+    // End offsets for anchor-byte groups in `patterns`. Every group preserves
+    // source order; patterns in other groups cannot match the candidate.
+    group_ends: [u16; MAX_FACTORED_ANCHOR_BYTES],
+    maximum_candidate_verification_work: usize,
+    // Patterns encoded as a little-endian u16 width followed by the bytes.
+    // Native packed sets contain at most 64 patterns; the explicit retained
+    // byte cap keeps exact candidate verification bounded.
+    patterns: Box<[u8]>,
+}
+
+impl SparseAnchor {
+    fn earliest_possible_start_from(&self, haystack: &[u8], minimum_start: usize) -> Option<usize> {
+        let last_start = haystack.len().checked_sub(self.minimum_pattern_width)?;
+        if minimum_start > last_start {
+            return None;
+        }
+        let scan_start = minimum_start.checked_add(self.offset)?;
+        let scan_end = last_start.checked_add(self.offset)?.checked_add(1)?;
+        let suffix = haystack.get(scan_start..scan_end)?;
+        let relative = match self.len {
+            1 => memchr(self.bytes[0], suffix),
+            2 => memchr2(self.bytes[0], self.bytes[1], suffix),
+            3 => memchr3(self.bytes[0], self.bytes[1], self.bytes[2], suffix),
+            _ => None,
+        }?;
+        minimum_start.checked_add(relative)
+    }
+
+    fn verify_at(&self, haystack: &[u8], start: usize) -> Option<usize> {
+        let anchor_byte = *haystack.get(start.checked_add(self.offset)?)?;
+        let group = self.bytes[..usize::from(self.len)]
+            .iter()
+            .position(|&byte| byte == anchor_byte)?;
+        let group_start = if group == 0 {
+            0
+        } else {
+            usize::from(self.group_ends[group - 1])
+        };
+        let group_end = usize::from(self.group_ends[group]);
+        let mut encoded = self.patterns.get(group_start..group_end)?;
+        while !encoded.is_empty() {
+            let (&low, rest) = encoded.split_first()?;
+            let (&high, rest) = rest.split_first()?;
+            let width = usize::from(u16::from_le_bytes([low, high]));
+            let (pattern, rest) = rest.split_at_checked(width)?;
+            encoded = rest;
+            let end = start.checked_add(width);
+            if end.and_then(|end| haystack.get(start..end)) == Some(pattern) {
+                return end;
+            }
+        }
+        None
+    }
+
+    fn persistent_bytes(&self) -> usize {
+        size_of::<Self>()
+            .checked_add(self.patterns.len())
+            .expect("the sparse-anchor construction cap proves its persistent bytes")
+    }
+}
+
 impl FactoredColumns {
     fn find(&self, haystack: &[u8]) -> Option<(usize, usize)> {
         let width = usize::from(self.width);
@@ -268,6 +350,10 @@ impl FactoredColumns {
 #[derive(Clone, Debug)]
 enum PackedLiteralEngine {
     Native(Searcher),
+    NativeSparse {
+        searcher: Searcher,
+        sparse_anchor: Box<SparseAnchor>,
+    },
     Factored(Box<FactoredColumns>),
 }
 
@@ -300,10 +386,27 @@ impl PackedLiteralSetPlan {
         let mut build = preflight(patterns, limits)?;
         let engine =
             if let Some(native_searcher) = Searcher::new(patterns.iter().map(AsRef::as_ref)) {
-                build.persistent_bytes = native_searcher.memory_usage();
+                let sparse_anchor = select_sparse_anchor(patterns).map(Box::new);
+                build.persistent_bytes = native_searcher
+                    .memory_usage()
+                    .checked_add(
+                        sparse_anchor
+                            .as_ref()
+                            .map_or(0, |anchor| anchor.persistent_bytes()),
+                    )
+                    .ok_or(PackedLiteralSetError::ArithmeticOverflow {
+                        computation: "packed literal persistent bytes",
+                    })?;
                 build.simd_minimum_haystack_bytes = native_searcher.minimum_len();
                 enforce_persistent_limit(&build, limits)?;
-                PackedLiteralEngine::Native(native_searcher)
+                if let Some(sparse_anchor) = sparse_anchor {
+                    PackedLiteralEngine::NativeSparse {
+                        searcher: native_searcher,
+                        sparse_anchor,
+                    }
+                } else {
+                    PackedLiteralEngine::Native(native_searcher)
+                }
             } else if let Some(factored) = factor_complete_columns(patterns, &build) {
                 build.persistent_bytes = size_of::<FactoredColumns>();
                 build.simd_minimum_haystack_bytes = FACTORED_SIMD_MINIMUM_HAYSTACK_BYTES;
@@ -393,6 +496,10 @@ impl PackedLiteralSetPlan {
             PackedLiteralEngine::Native(searcher) => searcher
                 .find(window_bytes)
                 .map(|matched| (matched.start(), matched.end())),
+            PackedLiteralEngine::NativeSparse {
+                searcher,
+                sparse_anchor,
+            } => find_native(searcher, sparse_anchor, window_bytes),
             PackedLiteralEngine::Factored(factored) => {
                 accounting.factored_columns = true;
                 factored.find(window_bytes)
@@ -406,6 +513,37 @@ impl PackedLiteralSetPlan {
         });
         Ok((matched, accounting))
     }
+}
+
+#[inline]
+fn find_native(
+    searcher: &Searcher,
+    anchor: &SparseAnchor,
+    haystack: &[u8],
+) -> Option<(usize, usize)> {
+    let mut minimum_start = 0_usize;
+    for attempt in 0..SPARSE_ANCHOR_CANDIDATE_BUDGET {
+        let candidate = anchor.earliest_possible_start_from(haystack, minimum_start)?;
+        if let Some(end) = anchor.verify_at(haystack, candidate) {
+            return Some((candidate, end));
+        }
+        minimum_start = candidate.checked_add(1)?;
+        let verification_attempts = attempt.checked_add(1)?;
+        let required_skip = anchor
+            .maximum_candidate_verification_work
+            .checked_mul(verification_attempts)?;
+        if minimum_start < required_skip {
+            break;
+        }
+    }
+    searcher
+        .find(&haystack[minimum_start..])
+        .and_then(|matched| {
+            Some((
+                minimum_start.checked_add(matched.start())?,
+                minimum_start.checked_add(matched.end())?,
+            ))
+        })
 }
 
 fn enforce_persistent_limit(
@@ -424,6 +562,85 @@ fn enforce_persistent_limit(
 
 const fn factored_search_is_cost_admitted(build: &PackedLiteralSetBuildAccounting) -> bool {
     build.patterns > TEDDY_PATTERNS_PER_SEARCHER && build.patterns <= MAX_FACTORED_PATTERNS
+}
+
+fn select_sparse_anchor<P: AsRef<[u8]>>(patterns: &[P]) -> Option<SparseAnchor> {
+    let retained_pattern_bytes = patterns.iter().try_fold(0_usize, |total, pattern| {
+        let width = pattern.as_ref().len();
+        let _ = u16::try_from(width).ok()?;
+        total.checked_add(width)?.checked_add(size_of::<u16>())
+    })?;
+    if retained_pattern_bytes > SPARSE_ANCHOR_MAX_RETAINED_PATTERN_BYTES {
+        return None;
+    }
+    let minimum_width = patterns
+        .iter()
+        .map(|pattern| pattern.as_ref().len())
+        .min()?;
+    let mut best = None;
+    let mut best_score = (u64::MAX, usize::MAX, usize::MAX);
+    for offset in 0..minimum_width {
+        let mut bytes = [0_u8; MAX_FACTORED_ANCHOR_BYTES];
+        let mut len = 0_usize;
+        let mut eligible = true;
+        for pattern in patterns {
+            let byte = pattern.as_ref()[offset];
+            if bytes[..len].contains(&byte) {
+                continue;
+            }
+            let Some(slot) = bytes.get_mut(len) else {
+                eligible = false;
+                break;
+            };
+            *slot = byte;
+            len = len.checked_add(1)?;
+        }
+        if !eligible || len == 0 {
+            continue;
+        }
+        let frequency_score = bytes[..len]
+            .iter()
+            .map(|&byte| {
+                u64::from(crate::packed_ordered_literal_aggregate::byte_frequency_rank(byte)) + 1
+            })
+            .sum();
+        let score = (frequency_score, len, offset);
+        if score < best_score {
+            best_score = score;
+            best = Some((offset, bytes, u8::try_from(len).ok()?));
+        }
+    }
+    let (offset, bytes, len) = best?;
+    let mut retained = Vec::with_capacity(retained_pattern_bytes);
+    let mut group_ends = [0_u16; MAX_FACTORED_ANCHOR_BYTES];
+    let mut maximum_candidate_verification_work = 0_usize;
+    for (group, &anchor_byte) in bytes[..usize::from(len)].iter().enumerate() {
+        let mut group_work = 0_usize;
+        for pattern in patterns {
+            let pattern = pattern.as_ref();
+            if pattern[offset] != anchor_byte {
+                continue;
+            }
+            retained.extend_from_slice(&u16::try_from(pattern.len()).ok()?.to_le_bytes());
+            retained.extend_from_slice(pattern);
+            group_work = group_work.checked_add(pattern.len())?.checked_add(1)?;
+        }
+        group_ends[group] = u16::try_from(retained.len()).ok()?;
+        maximum_candidate_verification_work = maximum_candidate_verification_work.max(group_work);
+    }
+    debug_assert_eq!(retained.len(), retained_pattern_bytes);
+    if maximum_candidate_verification_work > SPARSE_ANCHOR_MAX_CANDIDATE_VERIFICATION_WORK {
+        return None;
+    }
+    Some(SparseAnchor {
+        offset,
+        bytes,
+        len,
+        minimum_pattern_width: minimum_width,
+        group_ends,
+        maximum_candidate_verification_work,
+        patterns: retained.into_boxed_slice(),
+    })
 }
 
 fn factor_complete_columns<P: AsRef<[u8]>>(
@@ -626,6 +843,7 @@ mod tests {
     use super::{
         BUILD_FACTOR, PackedLiteralEngine, PackedLiteralSetAccounting, PackedLiteralSetBuildLimits,
         PackedLiteralSetError, PackedLiteralSetPlan, PackedLiteralSetSearchLimits,
+        select_sparse_anchor,
     };
     use crate::Window;
 
@@ -678,6 +896,10 @@ mod tests {
             }
         }
         patterns
+    }
+
+    fn high_byte_suffix_patterns() -> Vec<Vec<u8>> {
+        (0x80_u8..=0x9f).map(|byte| vec![byte, b'Q']).collect()
     }
 
     fn cartesian_four(classes: [&[u8]; 4]) -> Vec<Vec<u8>> {
@@ -777,12 +999,44 @@ mod tests {
         );
     }
 
+    fn assert_native_anchor_matches_unfiltered(plan: &PackedLiteralSetPlan, haystack: &[u8]) {
+        let searcher = match &plan.engine {
+            PackedLiteralEngine::Native(searcher)
+            | PackedLiteralEngine::NativeSparse { searcher, .. } => searcher,
+            PackedLiteralEngine::Factored(_) => {
+                panic!("differential helper requires a native packed plan")
+            }
+        };
+        for start in 0..=haystack.len() {
+            for end in start..=haystack.len() {
+                let expected = searcher.find(&haystack[start..end]).map(|matched| {
+                    (
+                        start.checked_add(matched.start()).unwrap(),
+                        start.checked_add(matched.end()).unwrap(),
+                    )
+                });
+                let actual = plan
+                    .find_window(
+                        haystack,
+                        Window::new(start, end),
+                        PackedLiteralSetSearchLimits::unlimited(),
+                    )
+                    .unwrap()
+                    .0;
+                assert_eq!(actual, expected, "window={start}..{end}");
+            }
+        }
+    }
+
     #[test]
     fn native_and_factored_certificates_preserve_windows_limits_and_accounting() {
         let Some(native) = plan(&[b"ab", b"cd"]) else {
             return;
         };
-        assert!(matches!(&native.engine, PackedLiteralEngine::Native(_)));
+        assert!(matches!(
+            &native.engine,
+            PackedLiteralEngine::Native(_) | PackedLiteralEngine::NativeSparse { .. }
+        ));
         let native_haystack = b"ab--cd";
         assert_invalid_windows_precede_work(&native, native_haystack);
         for (window, expected) in [
@@ -806,6 +1060,183 @@ mod tests {
             (Window::new(4, 6), None),
         ] {
             assert_search_certificate(&factored, true, factored_haystack, window, expected);
+        }
+    }
+
+    #[test]
+    fn native_sparse_anchor_skips_only_proved_impossible_starts() {
+        let patterns = [b"aQ".as_slice(), b"bQ".as_slice(), b"cQ".as_slice()];
+        let Some(plan) = plan(&patterns) else {
+            return;
+        };
+        let PackedLiteralEngine::NativeSparse {
+            sparse_anchor: anchor,
+            ..
+        } = &plan.engine
+        else {
+            panic!("native language did not retain its sparse anchor")
+        };
+        assert_eq!(anchor.offset, 1);
+        assert_eq!(anchor.len, 1);
+        assert_eq!(anchor.bytes[0], b'Q');
+        let persistent = plan.build_accounting().persistent_bytes;
+        assert_eq!(
+            PackedLiteralSetPlan::new(
+                &patterns,
+                PackedLiteralSetBuildLimits {
+                    max_persistent_bytes: persistent,
+                    ..PackedLiteralSetBuildLimits::default()
+                },
+            )
+            .unwrap()
+            .build_accounting()
+            .persistent_bytes,
+            persistent
+        );
+        assert!(matches!(
+            PackedLiteralSetPlan::new(
+                &patterns,
+                PackedLiteralSetBuildLimits {
+                    max_persistent_bytes: persistent - 1,
+                    ..PackedLiteralSetBuildLimits::default()
+                },
+            ),
+            Err(PackedLiteralSetError::PersistentBytesLimit { needed, limit })
+                if needed == persistent && limit == persistent - 1
+        ));
+
+        let mut haystack = vec![b'.'; 384];
+        assert_native_anchor_matches_unfiltered(&plan, &haystack);
+        let (matched, accounting) = plan
+            .find(&haystack, PackedLiteralSetSearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(matched, None);
+        assert_eq!(
+            plan.find(
+                &haystack,
+                PackedLiteralSetSearchLimits {
+                    max_work: accounting.work_upper_bound.checked_sub(1).unwrap(),
+                },
+            ),
+            Err(PackedLiteralSetError::WorkLimit {
+                needed: accounting.work_upper_bound,
+                limit: accounting.work_upper_bound.checked_sub(1).unwrap(),
+            })
+        );
+
+        // An early anchor that cannot complete a word may reduce the prefix,
+        // but the unchanged ordered searcher still finds the later match.
+        for anchor in [13_usize, 25, 37, 49] {
+            haystack[anchor] = b'Q';
+        }
+        haystack[96] = b'b';
+        haystack[97] = b'Q';
+        assert_native_anchor_matches_unfiltered(&plan, &haystack);
+        assert_eq!(
+            plan.find(&haystack, PackedLiteralSetSearchLimits::unlimited())
+                .unwrap()
+                .0,
+            Some((96, 98))
+        );
+        assert_eq!(
+            plan.find_window(
+                &haystack,
+                Window::new(34, 96),
+                PackedLiteralSetSearchLimits::unlimited(),
+            )
+            .unwrap()
+            .0,
+            None
+        );
+
+        // Reusing the same allocation after mutation cannot retain a prior
+        // negative decision because the anchor owns no haystack-derived state.
+        haystack.fill(b'.');
+        haystack[12] = b'a';
+        haystack[13] = b'Q';
+        assert_native_anchor_matches_unfiltered(&plan, &haystack);
+        assert_eq!(
+            plan.find(&haystack, PackedLiteralSetSearchLimits::unlimited())
+                .unwrap()
+                .0,
+            Some((12, 14))
+        );
+
+        // Four clustered false candidates exhaust the largest admitted
+        // direct-verification budget. Teddy resumes strictly after them and
+        // still reports the later leftmost match.
+        let mut dense_decoys = vec![b'.'; 1_536];
+        for anchor in [13_usize, 25, 37, 49] {
+            dense_decoys[anchor] = b'Q';
+        }
+        dense_decoys[700] = b'c';
+        dense_decoys[701] = b'Q';
+        assert_eq!(
+            plan.find(&dense_decoys, PackedLiteralSetSearchLimits::unlimited())
+                .unwrap()
+                .0,
+            Some((700, 702))
+        );
+    }
+
+    #[test]
+    fn sparse_anchor_selects_one_two_and_three_byte_columns() {
+        let one_patterns = [b"aQ".as_slice(), b"bQ".as_slice(), b"cQ".as_slice()];
+        let one = select_sparse_anchor(&one_patterns).unwrap();
+        assert_eq!((one.offset, one.len), (1, 1));
+        assert_eq!(one.maximum_candidate_verification_work, 9);
+
+        let too_expensive = high_byte_suffix_patterns();
+        let too_expensive_refs = pattern_refs(&too_expensive);
+        assert!(select_sparse_anchor(&too_expensive_refs).is_none());
+
+        let two_patterns = [
+            [b'a', 0x80, b'w'],
+            [b'b', 0x81, b'x'],
+            [b'c', 0x80, b'y'],
+            [b'd', 0x81, b'z'],
+        ];
+        let two_anchor = select_sparse_anchor(&two_patterns).unwrap();
+        assert_eq!((two_anchor.offset, two_anchor.len), (1, 2));
+
+        let three_patterns = [
+            [b'a', 0x80, b'w'],
+            [b'b', 0x81, b'x'],
+            [b'c', 0x82, b'y'],
+            [b'd', 0x80, b'z'],
+        ];
+        let three_anchor = select_sparse_anchor(&three_patterns).unwrap();
+        assert_eq!((three_anchor.offset, three_anchor.len), (1, 3));
+
+        let mut beyond = select_sparse_anchor(&[b"Q"]).unwrap();
+        beyond.offset = 8;
+        assert_eq!(beyond.earliest_possible_start_from(b"short", 0), None);
+
+        for patterns in [two_patterns.as_slice(), three_patterns.as_slice()] {
+            let refs: Vec<&[u8]> = patterns.iter().map(|pattern| pattern.as_slice()).collect();
+            let Some(plan) = plan(&refs) else {
+                return;
+            };
+            let mut haystack = vec![b'.'; 192];
+            haystack[25] = patterns[0][1];
+            haystack[140..143].copy_from_slice(&patterns[2]);
+            let expected = Some((140, 143));
+            assert_eq!(
+                plan.find(&haystack, PackedLiteralSetSearchLimits::unlimited())
+                    .unwrap()
+                    .0,
+                expected
+            );
+            assert_eq!(
+                plan.find_window(
+                    &haystack,
+                    Window::new(12, 180),
+                    PackedLiteralSetSearchLimits::unlimited(),
+                )
+                .unwrap()
+                .0,
+                expected
+            );
         }
     }
 
@@ -835,6 +1266,26 @@ mod tests {
                 .0,
             Some((2, 4))
         );
+
+        let mut long_haystack = vec![b'.'; 160];
+        long_haystack[64] = b'a';
+        long_haystack[65] = b'b';
+        assert_eq!(
+            short_first
+                .find(&long_haystack, PackedLiteralSetSearchLimits::unlimited())
+                .unwrap()
+                .0,
+            Some((64, 65))
+        );
+        assert_eq!(
+            long_first
+                .find(&long_haystack, PackedLiteralSetSearchLimits::unlimited())
+                .unwrap()
+                .0,
+            Some((64, 66))
+        );
+        assert_native_anchor_matches_unfiltered(&short_first, &long_haystack);
+        assert_native_anchor_matches_unfiltered(&long_first, &long_haystack);
     }
 
     #[test]
