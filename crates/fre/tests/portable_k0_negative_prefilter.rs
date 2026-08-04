@@ -44,11 +44,14 @@ fn auto_k0_retains_only_general_mandatory_literals() {
     );
     assert_eq!(
         auto(r"(?-u:[A-Za-z0-9_]+).*XY.*z").k0_negative_prefilter_needle_bytes(),
-        None
+        Some(2)
+    );
+    assert_eq!(
+        auto(r"a(?:MANDATORY)?.*z").k0_negative_prefilter_needle_bytes(),
+        Some(1)
     );
     for pattern in [
         r"(?:a.*MANDATORY.*z)?",
-        r"a(?:MANDATORY)?.*z",
         r"(?:a.*LEFT.*z|q.*RIGHT.*r)",
         r"\Aa.*MANDATORY.*z",
     ] {
@@ -243,7 +246,7 @@ fn optional_sidecar_closes_planner_literal_and_persistent_limits() {
     limits.literal.max_needle_bytes = 8;
     assert_eq!(
         build(PATTERN, PlanSelection::Auto, limits).k0_negative_prefilter_needle_bytes(),
-        None
+        Some(1)
     );
 
     limits = BuildLimits::default();

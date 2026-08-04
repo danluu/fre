@@ -1283,7 +1283,8 @@ fn charge_unicode_folded_planner_work(
     Ok(needed)
 }
 
-const K0_NEGATIVE_PREFILTER_MIN_NEEDLE_BYTES: usize = 3;
+const K0_NEGATIVE_PREFILTER_MIN_NEEDLE_BYTES: usize = 1;
+const K0_MANDATORY_SUFFIX_MIN_NEEDLE_BYTES: usize = 3;
 const K0_NEGATIVE_PREFILTER_MAX_NEEDLE_BYTES: usize = 1_024;
 // Mandatory-cut materialization charges one operation per bitmap word read,
 // byte-domain membership test, retained byte write and final inline plan.
@@ -1666,7 +1667,7 @@ fn try_build_k0_mandatory_suffix(
             }
         },
     };
-    if candidate.len() < K0_NEGATIVE_PREFILTER_MIN_NEEDLE_BYTES {
+    if candidate.len() < K0_MANDATORY_SUFFIX_MIN_NEEDLE_BYTES {
         return Ok(declined(planner_work));
     }
     let copy_work = u64::try_from(candidate.len()).map_err(|_| {
@@ -1981,11 +1982,12 @@ fn try_build_k0_negative_prefilter(
             .ok_or(BuildError::PersistentBytesOverflow)?;
         maximum_needle_bytes = maximum_needle_bytes.max(literal.len());
     }
-    // Short literals become useful as cheap conjuncts only when at least one
-    // independently mandatory selective literal justifies the sidecar. A
-    // lone one- or two-byte whole-window pre-pass remains with K0's existing
-    // start scanner.
-    if literal_count == 0 || maximum_needle_bytes < K0_NEGATIVE_PREFILTER_MIN_NEEDLE_BYTES {
+    // Every retained literal is independently mandatory. Short predicates are
+    // absence-only filters in the runtime below: a present byte never proposes
+    // an endpoint and adaptive backoff returns repeatedly positive inputs to
+    // K0. Keeping them in this last-priority sidecar avoids displacing the
+    // graph cut or the more capable exact-suffix verifier.
+    if literal_count == 0 {
         return Ok(declined(planner_work));
     }
     let storage_bytes = core::mem::size_of::<K0NegativePrefilterPlan>()
