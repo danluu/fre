@@ -9412,23 +9412,13 @@ fn context_interior_category_matches(
             || is_ascii_word(representative) == is_ascii_word(candidate))
 }
 
-fn try_context_interior_equivalence_class(
+fn try_context_interior_category_members(
     automaton: &Automaton,
-    lazy: &LazyWorkspace,
-    state: u32,
+    graph_members: [u64; 4],
     dependencies: u32,
     representative: u8,
     meter: &mut WorkMeter,
-) -> Result<Option<[u64; 4]>, SearchError> {
-    let Some(graph_members) = try_lazy_state_equivalence_class(
-        automaton,
-        lazy,
-        state,
-        representative,
-        meter,
-    )? else {
-        return Ok(None);
-    };
+) -> Option<[u64; 4]> {
     let classifier = BoundaryContextClassifier::new(dependencies);
     let candidate_maximum = if classifier.unicode_word() == 0 {
         u8::MAX
@@ -9444,7 +9434,7 @@ fn try_context_interior_equivalence_class(
             continue;
         }
         if !meter.try_charge_optional(1, 0) {
-            return Ok(None);
+            return None;
         }
         if context_interior_category_matches(
             classifier,
@@ -9455,7 +9445,7 @@ fn try_context_interior_equivalence_class(
             byte_bitmap_insert(&mut members, candidate);
         }
     }
-    Ok(Some(members))
+    Some(members)
 }
 
 /// Recover one raw member of a retained contextual byte class whose diagonal
@@ -9506,6 +9496,356 @@ fn try_context_diagonal_class_representative(
         }
     }
     ContextDiagonalRepresentative::Absent
+}
+
+const CONTEXT_LOOP_MAX_ATOMS: usize = 5;
+const CONTEXT_LOOP_NO_PRODUCT: u16 = u16::MAX;
+// The partition owns one byte-to-product table, one class/atom product table,
+// four product metadata tables, and two atom metadata tables. Charge every
+// fixed initialization before constructing those stack arrays so an optional
+// proof cannot perform hidden work before declining.
+const CONTEXT_LOOP_PARTITION_INITIALIZATION_WORK: u64 =
+    (BYTE_ALPHABET * (1 + CONTEXT_LOOP_MAX_ATOMS + 4) + CONTEXT_LOOP_MAX_ATOMS * 2) as u64;
+// One admitted graph member performs a bounded atom search plus key, class,
+// product, metadata, and cardinality updates. The fixed ceiling is deliberately
+// conservative; partitioning is a cold optional proof transaction.
+const CONTEXT_LOOP_PARTITION_MEMBER_WORK: u64 = (CONTEXT_LOOP_MAX_ATOMS + 11) as u64;
+
+/// One byte-local interior category relevant to an exact dependency mask.
+///
+/// Absolute assertions are constant at every skipped destination. The other
+/// assertion families depend only on configured-terminator membership,
+/// CR/LF/other identity, and (for either ASCII or ASCII-specialized Unicode
+/// word assertions) ASCII-word membership. At most three distinguished raw
+/// bytes can split the two word categories, so no graph class realizes more
+/// than five atoms.
+fn context_loop_atom_key(
+    classifier: BoundaryContextClassifier,
+    line_terminator: u8,
+    byte: u8,
+) -> u8 {
+    let configured = u8::from(classifier.configured_line() != 0 && byte == line_terminator);
+    let crlf = if classifier.crlf_line() == 0 {
+        0
+    } else if byte == b'\r' {
+        1
+    } else if byte == b'\n' {
+        2
+    } else {
+        3
+    };
+    let word = u8::from(
+        classifier.ascii_word() | classifier.unicode_word() != 0 && is_ascii_word(byte),
+    );
+    configured | (crlf << 1) | (word << 3)
+}
+
+struct ContextLoopPartition {
+    product_by_byte: [u16; BYTE_ALPHABET],
+    product_class: [u8; BYTE_ALPHABET],
+    product_atom: [u8; BYTE_ALPHABET],
+    product_representative: [u8; BYTE_ALPHABET],
+    product_cardinality: [u16; BYTE_ALPHABET],
+    product_count: usize,
+    atom_representative: [u8; CONTEXT_LOOP_MAX_ATOMS],
+    atom_count: usize,
+}
+
+enum ContextLoopPartitionAnalysis {
+    Complete(ContextLoopPartition),
+    ResourceDeclined,
+}
+
+fn try_partition_context_loop_members(
+    automaton: &Automaton,
+    graph_members: [u64; 4],
+    dependencies: u32,
+    meter: &mut WorkMeter,
+) -> Result<ContextLoopPartitionAnalysis, SearchError> {
+    let classifier = BoundaryContextClassifier::new(dependencies);
+    let candidate_maximum = if classifier.unicode_word() == 0 {
+        u8::MAX
+    } else {
+        0x7f
+    };
+    if !meter.try_charge_optional(CONTEXT_LOOP_PARTITION_INITIALIZATION_WORK, 0) {
+        return Ok(ContextLoopPartitionAnalysis::ResourceDeclined);
+    }
+    let mut product_by_byte = [CONTEXT_LOOP_NO_PRODUCT; BYTE_ALPHABET];
+    let mut product_by_class_atom =
+        [[CONTEXT_LOOP_NO_PRODUCT; CONTEXT_LOOP_MAX_ATOMS]; BYTE_ALPHABET];
+    let mut product_class = [0_u8; BYTE_ALPHABET];
+    let mut product_atom = [0_u8; BYTE_ALPHABET];
+    let mut product_representative = [0_u8; BYTE_ALPHABET];
+    let mut product_cardinality = [0_u16; BYTE_ALPHABET];
+    let mut product_count = 0usize;
+    let mut atom_keys = [0_u8; CONTEXT_LOOP_MAX_ATOMS];
+    let mut atom_representative = [0_u8; CONTEXT_LOOP_MAX_ATOMS];
+    let mut atom_count = 0usize;
+
+    for byte in u8::MIN..=candidate_maximum {
+        if !meter.try_charge_optional(1, 0) {
+            return Ok(ContextLoopPartitionAnalysis::ResourceDeclined);
+        }
+        if !byte_bitmap_contains(graph_members, byte) {
+            continue;
+        }
+        if !meter.try_charge_optional(CONTEXT_LOOP_PARTITION_MEMBER_WORK, 0) {
+            return Ok(ContextLoopPartitionAnalysis::ResourceDeclined);
+        }
+        let key = context_loop_atom_key(classifier, automaton.line_terminator(), byte);
+        let atom = if let Some(atom) = atom_keys[..atom_count]
+            .iter()
+            .position(|&candidate| candidate == key)
+        {
+            atom
+        } else {
+            if atom_count == CONTEXT_LOOP_MAX_ATOMS {
+                return Err(SearchError::InternalInvariant {
+                    detail: "contextual loop dependency product exceeded five raw atoms",
+                });
+            }
+            atom_keys[atom_count] = key;
+            atom_representative[atom_count] = byte;
+            let atom = atom_count;
+            atom_count = atom_count.checked_add(1).ok_or(SearchError::ArithmeticOverflow {
+                computation: "contextual loop atom count",
+            })?;
+            atom
+        };
+        let class = automaton.byte_classes().class_of(byte);
+        let retained = &mut product_by_class_atom[usize::from(class)][atom];
+        let product = if *retained == CONTEXT_LOOP_NO_PRODUCT {
+            let product = u16::try_from(product_count).map_err(|_| {
+                SearchError::InternalInvariant {
+                    detail: "contextual loop product count does not fit u16",
+                }
+            })?;
+            product_class[product_count] = class;
+            product_atom[product_count] = u8::try_from(atom).map_err(|_| {
+                SearchError::InternalInvariant {
+                    detail: "contextual loop atom does not fit u8",
+                }
+            })?;
+            product_representative[product_count] = byte;
+            *retained = product;
+            product_count = product_count.checked_add(1).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "contextual loop product count",
+                },
+            )?;
+            product
+        } else {
+            *retained
+        };
+        product_by_byte[usize::from(byte)] = product;
+        let product = usize::from(product);
+        product_cardinality[product] = product_cardinality[product].checked_add(1).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "contextual loop product cardinality",
+            },
+        )?;
+    }
+    if product_count == 0 || atom_count == 0 {
+        return Err(SearchError::InternalInvariant {
+            detail: "contextual loop graph class has no byte-local product",
+        });
+    }
+    Ok(ContextLoopPartitionAnalysis::Complete(ContextLoopPartition {
+        product_by_byte,
+        product_class,
+        product_atom,
+        product_representative,
+        product_cardinality,
+        product_count,
+        atom_representative,
+        atom_count,
+    }))
+}
+
+enum ContextLoopUnionAnalysis {
+    Complete(Option<[u64; 4]>),
+    ResourceDeclined,
+}
+
+/// Complete conservative work for one atom-subset transaction.
+///
+/// Every subset initializes the complete product-selection table, inspects
+/// every retained product, considers every product/atom pair, and may rebuild
+/// one complete byte bitmap. A contextual lookup is charged at its bounded
+/// hot/hash/four-way ceiling even when an earlier way succeeds. Precharging
+/// the whole envelope keeps a decline ahead of all subset-local work and
+/// makes retry/publication atomic.
+fn context_loop_subset_work_upper(
+    product_count: usize,
+    atom_count: usize,
+    assertion_work: u64,
+) -> Result<u64, SearchError> {
+    let products = u64::try_from(product_count).map_err(|_| {
+        SearchError::ArithmeticOverflow {
+            computation: "contextual loop product work conversion",
+        }
+    })?;
+    let atoms = u64::try_from(atom_count).map_err(|_| SearchError::ArithmeticOverflow {
+        computation: "contextual loop atom work conversion",
+    })?;
+    let byte_domain = u64::try_from(BYTE_ALPHABET).expect("the byte alphabet fits u64");
+    let lookup_work = u64::try_from(CONTEXT_TRANSITION_WAYS)
+        .expect("the contextual transition ways fit u64")
+        .checked_add(1)
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "contextual loop lookup work",
+        })?;
+    let pair_work = assertion_work
+        .checked_add(lookup_work)
+        .and_then(|work| work.checked_add(1))
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "contextual loop pair work",
+        })?;
+    let all_pairs = products
+        .checked_mul(atoms)
+        .and_then(|pairs| pairs.checked_mul(pair_work))
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "contextual loop all-pair work",
+        })?;
+    1_u64
+        .checked_add(byte_domain)
+        .and_then(|work| work.checked_add(products))
+        .and_then(|work| work.checked_add(all_pairs))
+        .and_then(|work| work.checked_add(1))
+        .and_then(|work| work.checked_add(byte_domain))
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "contextual loop subset work",
+        })
+}
+
+/// Find the widest pair-closed union of byte-context atoms for one exact
+/// contextual self-loop value.
+///
+/// A product combines one immutable global ByteClass with one raw-context
+/// atom. For a fixed left product, an exact transition key depends on the
+/// right product only through its atom. Checking every selected right atom is
+/// therefore equivalent to checking every ordered representative pair. A
+/// compatible product can then be added wholesale: all of its bytes take the
+/// same ordered consuming edges and produce the same assertion mask against
+/// every selected atom. No inferred transition is published.
+fn try_pair_closed_context_loop_union(
+    automaton: &Automaton,
+    lazy: &LazyWorkspace,
+    state: u32,
+    value: u32,
+    dependencies: u32,
+    graph_members: [u64; 4],
+    meter: &mut WorkMeter,
+) -> Result<ContextLoopUnionAnalysis, SearchError> {
+    debug_assert_ne!(dependencies, 0);
+    debug_assert!(context_nonaccepting_self_loop_action(state, value).is_some());
+    lazy.context.validate_shape()?;
+    let partition = match try_partition_context_loop_members(
+        automaton,
+        graph_members,
+        dependencies,
+        meter,
+    )? {
+        ContextLoopPartitionAnalysis::Complete(partition) => partition,
+        ContextLoopPartitionAnalysis::ResourceDeclined => {
+            return Ok(ContextLoopUnionAnalysis::ResourceDeclined);
+        }
+    };
+    let classifier = BoundaryContextClassifier::new(dependencies);
+    let assertion_work = u64::from(dependencies.count_ones());
+    let subset_work = context_loop_subset_work_upper(
+        partition.product_count,
+        partition.atom_count,
+        assertion_work,
+    )?;
+    let subset_end = 1_u8
+        .checked_shl(u32::try_from(partition.atom_count).map_err(|_| {
+            SearchError::InternalInvariant {
+                detail: "contextual loop atom count does not fit u32",
+            }
+        })?)
+        .ok_or(SearchError::InternalInvariant {
+            detail: "contextual loop atom subset count overflowed",
+        })?;
+    let mut best_cardinality = 0_u32;
+    let mut best_members = None;
+
+    for subset in 1_u8..subset_end {
+        if !meter.try_charge_optional(subset_work, 0) {
+            return Ok(ContextLoopUnionAnalysis::ResourceDeclined);
+        }
+        let mut selected_products = [false; BYTE_ALPHABET];
+        let mut realized_atoms = 0_u8;
+        let mut cardinality = 0_u32;
+        for product in 0..partition.product_count {
+            let atom = partition.product_atom[product];
+            let atom_bit = 1_u8
+                .checked_shl(u32::from(atom))
+                .ok_or(SearchError::InternalInvariant {
+                    detail: "contextual loop product atom bit overflowed",
+                })?;
+            if subset & atom_bit == 0 {
+                continue;
+            }
+            let left = partition.product_representative[product];
+            let mut compatible = true;
+            for right_atom in 0..partition.atom_count {
+                let right_atom_u8 = u8::try_from(right_atom).map_err(|_| {
+                    SearchError::InternalInvariant {
+                        detail: "contextual loop right atom does not fit u8",
+                    }
+                })?;
+                let right_bit = 1_u8.checked_shl(u32::from(right_atom_u8)).ok_or(
+                    SearchError::InternalInvariant {
+                        detail: "contextual loop right atom bit overflowed",
+                    },
+                )?;
+                if subset & right_bit == 0 {
+                    continue;
+                }
+                let right = partition.atom_representative[right_atom];
+                let pair = [left, right];
+                let assertions = enabled_assertion_mask_unmetered_with_classifier(
+                    classifier,
+                    automaton.line_terminator(),
+                    &pair,
+                    1,
+                );
+                let symbol =
+                    contextual_class_symbol(partition.product_class[product], assertions);
+                if lazy.context.lookup_existing_prevalidated(state, symbol)? != Some(value) {
+                    compatible = false;
+                    break;
+                }
+            }
+            if compatible {
+                selected_products[product] = true;
+                realized_atoms |= atom_bit;
+                cardinality = cardinality
+                    .checked_add(u32::from(partition.product_cardinality[product]))
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "contextual loop union cardinality",
+                    })?;
+            }
+        }
+        if realized_atoms != subset {
+            continue;
+        }
+        if cardinality <= best_cardinality {
+            continue;
+        }
+        let mut members = [0_u64; 4];
+        for byte in u8::MIN..=u8::MAX {
+            let product = partition.product_by_byte[usize::from(byte)];
+            if product != CONTEXT_LOOP_NO_PRODUCT && selected_products[usize::from(product)] {
+                byte_bitmap_insert(&mut members, byte);
+            }
+        }
+        best_cardinality = cardinality;
+        best_members = Some(members);
+    }
+    Ok(ContextLoopUnionAnalysis::Complete(best_members))
 }
 
 const fn byte_bitmap_cardinality(words: [u64; 4]) -> u32 {
@@ -9991,14 +10331,22 @@ fn try_derive_context_lazy_loop_skip(
             ContextDiagonalRepresentative::Absent => continue,
             ContextDiagonalRepresentative::ResourceDeclined => return Ok(()),
         };
-        let Some(equivalent) = try_context_interior_equivalence_class(
+        let Some(graph_members) = try_lazy_state_equivalence_class(
             automaton,
             &workspace.lazy,
             record.source,
-            dependencies,
             representative,
             meter,
         )? else {
+            return Ok(());
+        };
+        let Some(equivalent) = try_context_interior_category_members(
+            automaton,
+            graph_members,
+            dependencies,
+            representative,
+            meter,
+        ) else {
             return Ok(());
         };
         let cardinality = byte_bitmap_cardinality(equivalent);
@@ -10016,6 +10364,28 @@ fn try_derive_context_lazy_loop_skip(
                 start_action,
                 leave_final_member,
             ));
+        }
+        if dependencies != 0 {
+            let union = match try_pair_closed_context_loop_union(
+                automaton,
+                &workspace.lazy,
+                record.source,
+                record.value,
+                dependencies,
+                graph_members,
+                meter,
+            )? {
+                ContextLoopUnionAnalysis::Complete(union) => union,
+                ContextLoopUnionAnalysis::ResourceDeclined => return Ok(()),
+            };
+            if let Some(union) = union {
+                let cardinality = byte_bitmap_cardinality(union);
+                if cardinality > best_cardinality {
+                    best_cardinality = cardinality;
+                    best_leave_final_member = true;
+                    best_candidate = Some((record.source, union, start_action, true));
+                }
+            }
         }
     }
 
@@ -15938,6 +16308,109 @@ mod tests {
         .unwrap()
     }
 
+    fn full_byte_contextual_unicode_word_loop() -> Automaton {
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![StateRole::Consume, StateRole::Split, StateRole::Accept],
+                edge_offsets: vec![0, 1, 7, 7],
+                edge_targets: vec![1, 0, 0, 0, 0, 0, 0],
+                edge_kinds: vec![
+                    EdgeKind::ByteRange,
+                    EdgeKind::AssertWordUnicode,
+                    EdgeKind::AssertWordUnicodeNegate,
+                    EdgeKind::AssertWordStartUnicode,
+                    EdgeKind::AssertWordEndUnicode,
+                    EdgeKind::AssertWordStartHalfUnicode,
+                    EdgeKind::AssertWordEndHalfUnicode,
+                ],
+                byte_starts: vec![u8::MIN, 0, 0, 0, 0, 0, 0],
+                byte_ends: vec![u8::MAX, 0, 0, 0, 0, 0, 0],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn full_byte_contextual_line_loop() -> Automaton {
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![StateRole::Consume, StateRole::Split, StateRole::Accept],
+                edge_offsets: vec![0, 1, 6, 6],
+                edge_targets: vec![1, 0, 0, 0, 0, 0],
+                edge_kinds: vec![
+                    EdgeKind::ByteRange,
+                    EdgeKind::Epsilon,
+                    EdgeKind::AssertLineStartLf,
+                    EdgeKind::AssertLineEndLf,
+                    EdgeKind::AssertLineStartCrlf,
+                    EdgeKind::AssertLineEndCrlf,
+                ],
+                byte_starts: vec![u8::MIN, 0, 0, 0, 0, 0],
+                byte_ends: vec![u8::MAX, 0, 0, 0, 0, 0],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+        .with_line_terminator(b';')
+    }
+
+    fn full_byte_contextual_five_atom_loop() -> Automaton {
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![StateRole::Consume, StateRole::Split, StateRole::Accept],
+                edge_offsets: vec![0, 1, 12, 12],
+                edge_targets: vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                edge_kinds: vec![
+                    EdgeKind::ByteRange,
+                    EdgeKind::Epsilon,
+                    EdgeKind::AssertLineStartLf,
+                    EdgeKind::AssertLineEndLf,
+                    EdgeKind::AssertLineStartCrlf,
+                    EdgeKind::AssertLineEndCrlf,
+                    EdgeKind::AssertWordAscii,
+                    EdgeKind::AssertWordAsciiNegate,
+                    EdgeKind::AssertWordStartAscii,
+                    EdgeKind::AssertWordEndAscii,
+                    EdgeKind::AssertWordStartHalfAscii,
+                    EdgeKind::AssertWordEndHalfAscii,
+                ],
+                byte_starts: vec![u8::MIN, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                byte_ends: vec![u8::MAX, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+        .with_line_terminator(b';')
+    }
+
+    fn contextual_word_loop_then_z() -> Automaton {
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![StateRole::Consume, StateRole::Split, StateRole::Accept],
+                edge_offsets: vec![0, 2, 8, 8],
+                edge_targets: vec![1, 2, 0, 0, 0, 0, 0, 0],
+                edge_kinds: vec![
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::AssertWordAscii,
+                    EdgeKind::AssertWordAsciiNegate,
+                    EdgeKind::AssertWordStartAscii,
+                    EdgeKind::AssertWordEndAscii,
+                    EdgeKind::AssertWordStartHalfAscii,
+                    EdgeKind::AssertWordEndHalfAscii,
+                ],
+                byte_starts: vec![u8::MIN, b'z', 0, 0, 0, 0, 0, 0],
+                byte_ends: vec![u8::MAX, b'z', 0, 0, 0, 0, 0, 0],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
     fn asserted_line_a() -> Automaton {
         Automaton::from_raw(
             RawPlan {
@@ -16902,6 +17375,60 @@ mod tests {
                 0,
             )
             .unwrap();
+        workspace.lazy.context.hot[0].dependency_mask = dependencies;
+        workspace.lazy.context_dependencies_analyzed = 1;
+        workspace
+    }
+
+    fn contextual_pair_loop_workspace(
+        plan: &Automaton,
+        left_representatives: &[u8],
+        right_representatives: &[u8],
+        action: super::LazyStartAction,
+        omitted: Option<(u8, u8)>,
+    ) -> K0Workspace {
+        let mut workspace =
+            K0Workspace::new_accelerated(plan, WorkspaceLimits::unlimited()).unwrap();
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        workspace.lazy.scratch[0] = 0;
+        workspace.lazy.scratch_len = 1;
+        assert_eq!(workspace.lazy.intern_initial(false, &mut meter, 0).unwrap(), 0);
+        let dependencies = plan.boundary_context_classifier().assertions();
+        let value = 1 | action.cell_bits();
+        for &left in left_representatives {
+            for &right in right_representatives {
+                if omitted == Some((left, right)) {
+                    continue;
+                }
+                let assertions = super::enabled_assertion_mask_unmetered_for_dependencies(
+                    plan,
+                    dependencies,
+                    &[left, right],
+                    1,
+                );
+                let symbol = super::contextual_symbol_for_byte(plan, left, assertions);
+                let (cached, slot) = workspace
+                    .lazy
+                    .context
+                    .lookup(0, symbol, &mut meter, 0)
+                    .unwrap();
+                if let Some(cached) = cached {
+                    assert_eq!(cached, value);
+                    continue;
+                }
+                workspace
+                    .lazy
+                    .context
+                    .publish(
+                        slot,
+                        ContextTransitionSlot::populated(0, symbol, value),
+                        &mut meter,
+                        0,
+                        0,
+                    )
+                    .unwrap();
+            }
+        }
         workspace.lazy.context.hot[0].dependency_mask = dependencies;
         workspace.lazy.context_dependencies_analyzed = 1;
         workspace
@@ -27096,6 +27623,350 @@ mod tests {
         assert!(retained.scanner.contains(b'_'));
         assert!(!retained.scanner.contains(0));
         assert!(!retained.scanner.contains(b'!'));
+    }
+
+    #[test]
+    fn contextual_pair_closed_union_covers_every_ordered_word_pair_and_drop_action() {
+        let plan = full_byte_contextual_word_loop();
+        let representatives = [b'a', b'!'];
+        for action in [
+            super::LazyStartAction::Propagate,
+            super::LazyStartAction::Drop,
+        ] {
+            let mut workspace = contextual_pair_loop_workspace(
+                &plan,
+                &representatives,
+                &representatives,
+                action,
+                None,
+            );
+            let published = workspace.lazy.context.published;
+            let mut meter = WorkMeter::new(u64::MAX, 0);
+            super::try_derive_context_lazy_loop_skip(&plan, &mut workspace, &mut meter).unwrap();
+            let retained = workspace
+                .lazy
+                .context_loop_skip_plan
+                .expect("the complete ordered-pair matrix must retain its union");
+            assert_eq!(retained.start_action, action);
+            assert!(retained.leave_final_member);
+            assert_eq!(retained.scanner.cardinality(), 256);
+            assert!(matches!(retained.scanner, super::LazyLoopScanner::All));
+            assert_eq!(workspace.lazy.context.published, published);
+
+            let dependencies = plan.boundary_context_classifier().assertions();
+            let value = 1 | action.cell_bits();
+            for left in u8::MIN..=u8::MAX {
+                for right in u8::MIN..=u8::MAX {
+                    let assertions =
+                        super::enabled_assertion_mask_unmetered_for_dependencies(
+                            &plan,
+                            dependencies,
+                            &[left, right],
+                            1,
+                        );
+                    let symbol =
+                        super::contextual_symbol_for_byte(&plan, left, assertions);
+                    assert_eq!(
+                        workspace
+                            .lazy
+                            .context
+                            .lookup_existing_prevalidated(0, symbol)
+                            .unwrap(),
+                        Some(value),
+                        "action={action:?} left={left:#04x} right={right:#04x}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn contextual_pair_closed_union_rejects_one_missing_cross_category_record() {
+        let plan = full_byte_contextual_word_loop();
+        let representatives = [b'a', b'!'];
+        let mut workspace = contextual_pair_loop_workspace(
+            &plan,
+            &representatives,
+            &representatives,
+            super::LazyStartAction::Propagate,
+            Some((b'a', b'!')),
+        );
+        let published = workspace.lazy.context.published;
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        super::try_derive_context_lazy_loop_skip(&plan, &mut workspace, &mut meter).unwrap();
+        let retained = workspace
+            .lazy
+            .context_loop_skip_plan
+            .expect("a complete diagonal category still retains the original narrow proof");
+        assert_eq!(retained.scanner.cardinality(), 193);
+        assert!(retained.scanner.contains(b'!'));
+        assert!(!retained.scanner.contains(b'a'));
+        assert_eq!(workspace.lazy.context.published, published);
+    }
+
+    #[test]
+    fn contextual_pair_closed_union_rejects_one_different_cross_category_value() {
+        let plan = full_byte_contextual_word_loop();
+        let representatives = [b'a', b'!'];
+        let mut workspace = contextual_pair_loop_workspace(
+            &plan,
+            &representatives,
+            &representatives,
+            super::LazyStartAction::Propagate,
+            None,
+        );
+        let dependencies = plan.boundary_context_classifier().assertions();
+        let assertions = super::enabled_assertion_mask_unmetered_for_dependencies(
+            &plan,
+            dependencies,
+            b"a!",
+            1,
+        );
+        let symbol = super::contextual_symbol_for_byte(&plan, b'a', assertions);
+        let different = 1 | super::LazyStartAction::Drop.cell_bits();
+        let slot = workspace
+            .lazy
+            .context
+            .slots
+            .iter_mut()
+            .find(|slot| slot.source == 0 && slot.symbol == symbol)
+            .expect("the complete matrix must retain the word-to-nonword key");
+        slot.value = different;
+        if workspace.lazy.context.hot[0].symbol == symbol {
+            workspace.lazy.context.hot[0].value = different;
+        }
+
+        let published = workspace.lazy.context.published;
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        super::try_derive_context_lazy_loop_skip(&plan, &mut workspace, &mut meter).unwrap();
+        let retained = workspace
+            .lazy
+            .context_loop_skip_plan
+            .expect("the unchanged nonword diagonal still retains a narrow proof");
+        assert_eq!(retained.start_action, super::LazyStartAction::Propagate);
+        assert_eq!(retained.scanner.cardinality(), 193);
+        assert!(retained.scanner.contains(b'!'));
+        assert!(!retained.scanner.contains(b'a'));
+        assert_eq!(workspace.lazy.context.published, published);
+    }
+
+    #[test]
+    fn contextual_pair_closed_union_handles_configured_line_and_crlf_products() {
+        let plan = full_byte_contextual_line_loop();
+        let representatives = [b'a', b';', b'\r', b'\n'];
+        let mut workspace = contextual_pair_loop_workspace(
+            &plan,
+            &representatives,
+            &representatives,
+            super::LazyStartAction::Propagate,
+            None,
+        );
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        super::try_derive_context_lazy_loop_skip(&plan, &mut workspace, &mut meter).unwrap();
+        let retained = workspace
+            .lazy
+            .context_loop_skip_plan
+            .expect("all four line-context products must form one pair-closed union");
+        assert!(retained.leave_final_member);
+        assert_eq!(retained.scanner.cardinality(), 256);
+        for member in [0, b'a', b';', b'\r', b'\n', u8::MAX] {
+            assert!(retained.scanner.contains(member));
+        }
+    }
+
+    #[test]
+    fn contextual_pair_closed_partition_realizes_all_five_byte_atoms() {
+        let plan = full_byte_contextual_five_atom_loop();
+        let dependencies = plan.boundary_context_classifier().assertions();
+        let mut partition_meter = WorkMeter::new(u64::MAX, 0);
+        let partition = super::try_partition_context_loop_members(
+            &plan,
+            [u64::MAX; 4],
+            dependencies,
+            &mut partition_meter,
+        )
+        .unwrap();
+        let super::ContextLoopPartitionAnalysis::Complete(partition) = partition else {
+            panic!("an unlimited five-atom partition cannot decline");
+        };
+        assert_eq!(partition.atom_count, super::CONTEXT_LOOP_MAX_ATOMS);
+        assert_eq!(partition.product_count, super::CONTEXT_LOOP_MAX_ATOMS);
+
+        let representatives = [b'a', b'!', b';', b'\r', b'\n'];
+        let mut workspace = contextual_pair_loop_workspace(
+            &plan,
+            &representatives,
+            &representatives,
+            super::LazyStartAction::Propagate,
+            None,
+        );
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        super::try_derive_context_lazy_loop_skip(&plan, &mut workspace, &mut meter).unwrap();
+        let retained = workspace
+            .lazy
+            .context_loop_skip_plan
+            .expect("the complete five-atom matrix must retain one union");
+        assert!(retained.leave_final_member);
+        assert_eq!(retained.scanner.cardinality(), 256);
+        assert!(matches!(retained.scanner, super::LazyLoopScanner::All));
+    }
+
+    #[test]
+    fn contextual_pair_closed_unicode_union_remains_ascii_only() {
+        let plan = full_byte_contextual_unicode_word_loop();
+        let representatives = [b'a', b'!'];
+        let mut workspace = contextual_pair_loop_workspace(
+            &plan,
+            &representatives,
+            &representatives,
+            super::LazyStartAction::Propagate,
+            None,
+        );
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        super::try_derive_context_lazy_loop_skip(&plan, &mut workspace, &mut meter).unwrap();
+        let retained = workspace
+            .lazy
+            .context_loop_skip_plan
+            .expect("complete ASCII Unicode-word products must form a union");
+        assert!(retained.leave_final_member);
+        assert_eq!(retained.scanner.cardinality(), 128);
+        for member in [0, b'!', b'a', b'_', 0x7f] {
+            assert!(retained.scanner.contains(member));
+        }
+        for nonmember in [0x80, 0xc3, 0xa9, u8::MAX] {
+            assert!(!retained.scanner.contains(nonmember));
+        }
+    }
+
+    #[test]
+    fn contextual_pair_closed_union_publication_and_epochs_are_failure_atomic() {
+        let plan = full_byte_contextual_word_loop();
+        let representatives = [b'a', b'!'];
+        let build = || {
+            contextual_pair_loop_workspace(
+                &plan,
+                &representatives,
+                &representatives,
+                super::LazyStartAction::Propagate,
+                None,
+            )
+        };
+        let mut measured = build();
+        let mut unlimited = WorkMeter::new(u64::MAX, 0);
+        super::try_derive_context_lazy_loop_skip(&plan, &mut measured, &mut unlimited).unwrap();
+        let exact_work = unlimited.consumed;
+        assert_eq!(
+            measured
+                .lazy
+                .context_loop_skip_plan
+                .unwrap()
+                .scanner
+                .cardinality(),
+            256
+        );
+
+        let mut refused = build();
+        let slots = refused.lazy.context.slots.clone();
+        let hot = refused.lazy.context.hot.clone();
+        let hot_initial = refused.lazy.context.hot_initial;
+        let candidates_epoch = refused.lazy.context_loop_skip_analyzed_at_candidates;
+        let dependencies_epoch = refused.lazy.context_loop_skip_analyzed_at_dependencies;
+        let one_below_limit = exact_work.checked_sub(1).unwrap();
+        let mut one_below = WorkMeter::new(one_below_limit, 0);
+        super::try_derive_context_lazy_loop_skip(&plan, &mut refused, &mut one_below).unwrap();
+        assert!(one_below.consumed <= one_below_limit);
+        assert!(one_below.consumed < exact_work);
+        assert!(refused.lazy.context_loop_skip_plan.is_none());
+        assert_eq!(
+            refused.lazy.context_loop_skip_analyzed_at_candidates,
+            candidates_epoch
+        );
+        assert_eq!(
+            refused.lazy.context_loop_skip_analyzed_at_dependencies,
+            dependencies_epoch
+        );
+        assert_eq!(refused.lazy.context.slots, slots);
+        assert_eq!(refused.lazy.context.hot, hot);
+        assert_eq!(refused.lazy.context.hot_initial, hot_initial);
+
+        let mut exact = WorkMeter::new(exact_work, 0);
+        super::try_derive_context_lazy_loop_skip(&plan, &mut refused, &mut exact).unwrap();
+        assert_eq!(exact.consumed, exact_work);
+        assert_eq!(
+            refused
+                .lazy
+                .context_loop_skip_plan
+                .unwrap()
+                .scanner
+                .cardinality(),
+            256
+        );
+        assert_eq!(
+            refused.lazy.context_loop_skip_analyzed_at_candidates,
+            refused.lazy.context.loop_candidates_published
+        );
+        assert_eq!(
+            refused.lazy.context_loop_skip_analyzed_at_dependencies,
+            refused.lazy.context_dependencies_analyzed
+        );
+    }
+
+    #[test]
+    fn contextual_pair_closed_union_survives_same_address_category_mutation() {
+        let plan = contextual_word_loop_then_z();
+        pin_without_start_filter(&plan);
+        let training = [b'a', b'a', b'a', b'!', b'!', b'a', b'!', b'!', b'{', b'a', b'{', b'{'];
+        let mut source = Vec::with_capacity(training.len() * 8 + 1);
+        for _ in 0..8 {
+            source.extend_from_slice(&training);
+        }
+        source.push(b'z');
+        let address = source.as_ptr();
+        let mut workspace =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let first = plan
+            .prepare::<Span>()
+            .search_with_workspace(&source, &mut workspace, SearchLimits::unlimited())
+            .unwrap()
+            .into_output();
+        assert_eq!(first, Some(MatchSpan::new(0, source.len())));
+        let retained = workspace
+            .lazy
+            .context_loop_skip_plan
+            .expect("the training matrix must retain its all-nonterminal union");
+        assert!(retained.leave_final_member);
+        assert_eq!(retained.scanner.cardinality(), 255);
+        assert!(!retained.scanner.contains(b'z'));
+        for member in [b'a', b'!', b'{', 0x80, u8::MAX] {
+            assert!(retained.scanner.contains(member));
+        }
+        let source_len = source.len();
+        for index in 0..source_len - 1 {
+            source[index] = [b'a', b'!', b'{', 0x80][index % 4];
+        }
+        assert_eq!(source.as_ptr(), address);
+        let mut reference = K0Workspace::new(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let expected = plan
+            .prepare::<Span>()
+            .search_with_workspace(&source, &mut reference, SearchLimits::unlimited())
+            .unwrap()
+            .into_output();
+        let actual = plan
+            .prepare::<Span>()
+            .search_with_workspace(&source, &mut workspace, SearchLimits::unlimited())
+            .unwrap()
+            .into_output();
+        assert_eq!(actual, expected);
+        assert_eq!(source.as_ptr(), address);
+        assert_eq!(
+            workspace
+                .lazy
+                .context_loop_skip_plan
+                .unwrap()
+                .scanner
+                .cardinality(),
+            255
+        );
     }
 
     #[test]
