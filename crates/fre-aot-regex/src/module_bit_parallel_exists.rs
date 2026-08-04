@@ -17,12 +17,14 @@ use super::{
     AARCH64_HI, AARCH64_HS, AARCH64_MI, AARCH64_NE, Aarch64Assembler, Architecture,
     ModuleRelocation, NativeLowering, PROGRAM_SYMBOL, RelocationKind, StartAccelerator,
     TEXT_SECTION, Target, X86Assembler, aarch64_add_x_imm, aarch64_add_x_reg, aarch64_and_low_x,
-    aarch64_cmp_x, aarch64_load_byte_imm, aarch64_load_byte_reg, aarch64_load_u64_constant,
-    aarch64_load_x_lsl3, aarch64_lsr_x_imm, aarch64_mov_x, aarch64_movz_w, aarch64_reg,
-    aarch64_store_x, offset_u64, push_bytes,
+    aarch64_cmp_x, aarch64_load_byte_imm, aarch64_load_u64_constant, aarch64_load_x_lsl3,
+    aarch64_lsr_x_imm, aarch64_mov_x, aarch64_movz_w, aarch64_reg, aarch64_store_x, offset_u64,
+    push_bytes,
 };
 
 const BYTE_VALUES: usize = 256;
+const CLASSIFIER_ENTRY_BYTES: usize = core::mem::size_of::<u32>();
+const CLASSIFIER_BYTES: usize = BYTE_VALUES * CLASSIFIER_ENTRY_BYTES;
 const NIBBLE_BITS: usize = 4;
 const NIBBLE_SUBSETS: usize = 1 << NIBBLE_BITS;
 const NIBBLE_ROW_BYTES: usize = NIBBLE_SUBSETS * core::mem::size_of::<u64>();
@@ -33,7 +35,7 @@ const CONSUMING_BITS: u64 = ACCEPT_BIT - 1;
 // caps independently bound object growth and make a failed optional lowering
 // fall back to the serialized runtime route.
 const MAX_NATIVE_BIT_PARALLEL_DATA_BYTES: usize =
-    BYTE_VALUES + 256 * (MAX_BIT_PARALLEL_EXISTS_STATES / NIBBLE_BITS) * NIBBLE_ROW_BYTES;
+    CLASSIFIER_BYTES + 256 * (MAX_BIT_PARALLEL_EXISTS_STATES / NIBBLE_BITS) * NIBBLE_ROW_BYTES;
 const MAX_NATIVE_BIT_PARALLEL_CODE_BYTES: usize = 2 * 1024;
 
 #[derive(Debug)]
@@ -98,7 +100,7 @@ fn build_native_bit_parallel_layout(
         .checked_mul(source_nibbles)?
         .checked_mul(NIBBLE_SUBSETS)?;
     let transition_bytes = transition_entries.checked_mul(core::mem::size_of::<u64>())?;
-    let data_bytes = BYTE_VALUES.checked_add(transition_bytes)?;
+    let data_bytes = CLASSIFIER_BYTES.checked_add(transition_bytes)?;
     let retained_bytes = core::mem::size_of::<BitParallelExists>().checked_add(transition_bytes)?;
     if stats.source_nibbles != source_nibbles
         || stats.transition_entries != transition_entries
@@ -162,7 +164,13 @@ fn build_native_bit_parallel_layout(
     let mut data = Vec::new();
     if constant_result.is_none() {
         data.try_reserve_exact(data_bytes).ok()?;
-        data.extend_from_slice(view.byte_to_class);
+        let class_stride = source_nibbles.checked_mul(NIBBLE_ROW_BYTES)?;
+        for &class in view.byte_to_class {
+            let offset = usize::from(class)
+                .checked_mul(class_stride)?
+                .checked_add(CLASSIFIER_BYTES)?;
+            data.extend_from_slice(&u32::try_from(offset).ok()?.to_le_bytes());
+        }
         for &mask in view.transition_masks {
             data.extend_from_slice(&mask.to_le_bytes());
         }
@@ -238,16 +246,8 @@ fn lower_x86_64_bit_parallel(
         assembler.branch(&[0x0f, 0x83], no_match)?; // jae
         assembler.instruction(&[0x0f, 0xb6, 0x07])?; // movzx [rdi], eax
         assembler.instruction(&[0x48, 0xff, 0xc7])?; // inc rdi
-        assembler.instruction(&[0x41, 0x0f, 0xb6, 0x04, 0x01])?; // class = table[byte]
-        let class_stride =
-            u32::try_from(layout.source_nibbles.checked_mul(NIBBLE_ROW_BYTES).ok_or(
-                ObjectError::ArithmeticOverflow("x86 bit-parallel class stride"),
-            )?)
-            .map_err(|_| ObjectError::ArithmeticOverflow("x86 bit-parallel class stride"))?;
-        let mut scale_class = vec![0x48, 0x69, 0xd0]; // imul stride, rax, rdx
-        scale_class.extend_from_slice(&class_stride.to_le_bytes());
-        assembler.instruction(&scale_class)?;
-        assembler.instruction(&[0x49, 0x8d, 0x94, 0x11, 0x00, 0x01, 0x00, 0x00])?;
+        assembler.instruction(&[0x41, 0x8b, 0x04, 0x81])?; // row offset = table[byte]
+        assembler.instruction(&[0x49, 0x8d, 0x14, 0x01])?; // row = table + offset
         assembler.instruction(&[0x31, 0xc0])?; // reached = 0
 
         for nibble in 0..layout.source_nibbles {
@@ -317,25 +317,10 @@ fn lower_x86_64_bit_parallel(
     })
 }
 
-fn aarch64_mul_x(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
-    Ok(
-        0x9b00_7c00
-            | aarch64_reg(right, 16)?
-            | aarch64_reg(left, 5)?
-            | aarch64_reg(destination, 0)?,
-    )
-}
-
-fn aarch64_lsl_x_imm(destination: u8, source: u8, shift: u8) -> Result<u32, ObjectError> {
-    if shift > 63 {
-        return Err(ObjectError::InvalidModule("AArch64 LSL immediate"));
-    }
-    let rotation = (64_u8.wrapping_sub(shift)) & 63;
-    let size = 63_u8.wrapping_sub(shift);
-    Ok(0xd340_0000
-        | (u32::from(rotation) << 16)
-        | (u32::from(size) << 10)
-        | aarch64_reg(source, 5)?
+fn aarch64_load_w_lsl2(destination: u8, base: u8, index: u8) -> Result<u32, ObjectError> {
+    Ok(0xb860_7800
+        | aarch64_reg(index, 16)?
+        | aarch64_reg(base, 5)?
         | aarch64_reg(destination, 0)?)
 }
 
@@ -395,28 +380,14 @@ fn lower_aarch64_bit_parallel(
         assembler.instruction(aarch64_add_x_reg(6, 0, 2)?)?; // current pointer
         aarch64_load_u64_constant(&mut assembler, 9, layout.root)?;
         assembler.instruction(aarch64_mov_x(8, 9)?)?;
-        aarch64_load_u64_constant(
-            &mut assembler,
-            14,
-            u64::try_from(layout.source_nibbles)
-                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 nibble count"))?,
-        )?;
 
         assembler.bind(loop_head)?;
         assembler.instruction(aarch64_cmp_x(6, 7)?)?;
         assembler.branch_cond(AARCH64_HS, no_match)?;
         assembler.instruction(aarch64_load_byte_imm(12, 6, 0)?)?;
         assembler.instruction(aarch64_add_x_imm(6, 6, 1)?)?;
-        assembler.instruction(aarch64_load_byte_reg(12, 5, 12)?)?;
-        assembler.instruction(aarch64_mul_x(11, 12, 14)?)?;
-        assembler.instruction(aarch64_lsl_x_imm(11, 11, 7)?)?;
+        assembler.instruction(aarch64_load_w_lsl2(11, 5, 12)?)?;
         assembler.instruction(aarch64_add_x_reg(11, 5, 11)?)?;
-        assembler.instruction(aarch64_add_x_imm(
-            11,
-            11,
-            u16::try_from(BYTE_VALUES)
-                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 classifier extent"))?,
-        )?)?;
         assembler.instruction(aarch64_movz_w(10, 0)?)?;
 
         for nibble in 0..layout.source_nibbles {
@@ -587,20 +558,32 @@ mod tests {
             "keep full subset audit bounded"
         );
         let layout = build_native_bit_parallel_layout(view).expect("native layout");
-        assert_eq!(&layout.data[..BYTE_VALUES], view.byte_to_class);
         assert_eq!(
             layout.data.len(),
-            BYTE_VALUES
+            CLASSIFIER_BYTES
                 .checked_add(core::mem::size_of_val(view.transition_masks))
                 .expect("native data extent")
         );
+        let class_stride = view.stats.source_nibbles * NIBBLE_ROW_BYTES;
+        for (byte, &class) in view.byte_to_class.iter().enumerate() {
+            let classifier_offset = byte * CLASSIFIER_ENTRY_BYTES;
+            let actual = u32::from_le_bytes(
+                layout.data[classifier_offset..classifier_offset + CLASSIFIER_ENTRY_BYTES]
+                    .try_into()
+                    .expect("one classifier offset"),
+            );
+            assert_eq!(
+                usize::try_from(actual).unwrap(),
+                CLASSIFIER_BYTES + usize::from(class) * class_stride
+            );
+        }
 
         for class in 0..view.stats.byte_classes {
             for nibble in 0..view.stats.source_nibbles {
                 for subset in 0..NIBBLE_SUBSETS {
                     let table_index =
                         (class * view.stats.source_nibbles + nibble) * NIBBLE_SUBSETS + subset;
-                    let offset = BYTE_VALUES + table_index * core::mem::size_of::<u64>();
+                    let offset = CLASSIFIER_BYTES + table_index * core::mem::size_of::<u64>();
                     let actual = u64::from_le_bytes(
                         layout.data[offset..offset + 8]
                             .try_into()
@@ -616,6 +599,15 @@ mod tests {
             for byte in 0_u16..=u16::from(u8::MAX) {
                 let byte = u8::try_from(byte).unwrap();
                 let class = usize::from(view.byte_to_class[usize::from(byte)]);
+                let classifier_offset = usize::from(byte) * CLASSIFIER_ENTRY_BYTES;
+                let class_offset = usize::try_from(u32::from_le_bytes(
+                    layout.data
+                        [classifier_offset..classifier_offset + CLASSIFIER_ENTRY_BYTES]
+                        .try_into()
+                        .expect("one classifier offset"),
+                ))
+                .unwrap();
+                assert_eq!(class_offset, CLASSIFIER_BYTES + class * class_stride);
                 let mut canonical = 0_u64;
                 let mut packed = 0_u64;
                 for nibble in 0..view.stats.source_nibbles {
@@ -624,7 +616,9 @@ mod tests {
                     let index =
                         (class * view.stats.source_nibbles + nibble) * NIBBLE_SUBSETS + subset;
                     canonical |= view.transition_masks[index];
-                    let offset = BYTE_VALUES + index * core::mem::size_of::<u64>();
+                    let offset = class_offset
+                        + nibble * NIBBLE_ROW_BYTES
+                        + subset * core::mem::size_of::<u64>();
                     packed |= u64::from_le_bytes(
                         layout.data[offset..offset + 8]
                             .try_into()
@@ -652,7 +646,7 @@ mod tests {
             assert_eq!(layout.source_nibbles, source_nibbles);
             assert_eq!(
                 layout.data.len(),
-                BYTE_VALUES + source_nibbles * NIBBLE_ROW_BYTES
+                CLASSIFIER_BYTES + source_nibbles * NIBBLE_ROW_BYTES
             );
 
             let x86 = lower_x86_64_bit_parallel(&layout).expect("x86 leaf");
@@ -661,11 +655,38 @@ mod tests {
                 count_bytes(&x86.code, &[0x4a, 0x0b, 0x84, 0xd2]),
                 source_nibbles
             );
+            assert_eq!(count_bytes(&x86.code, &[0x41, 0x8b, 0x04, 0x81]), 1);
+            assert_eq!(count_bytes(&x86.code, &[0x48, 0x69, 0xd0]), 0);
             assert_eq!(x86.relocations.len(), 1);
             assert!(x86.code.len() <= MAX_NATIVE_BIT_PARALLEL_CODE_BYTES);
 
             let aarch64 = lower_aarch64_bit_parallel(&layout).expect("AArch64 leaf");
             let union_load = aarch64_load_x_lsl3(13, 11, 12).unwrap();
+            let classifier_load = aarch64_load_w_lsl2(11, 5, 12).unwrap();
+            let old_class_multiply = 0x9b00_7c00
+                | aarch64_reg(14, 16).unwrap()
+                | aarch64_reg(12, 5).unwrap()
+                | aarch64_reg(11, 0).unwrap();
+            assert_eq!(
+                aarch64
+                    .code
+                    .chunks_exact(4)
+                    .filter(|bytes| {
+                        u32::from_le_bytes((*bytes).try_into().unwrap()) == classifier_load
+                    })
+                    .count(),
+                1
+            );
+            assert_eq!(
+                aarch64
+                    .code
+                    .chunks_exact(4)
+                    .filter(|bytes| {
+                        u32::from_le_bytes((*bytes).try_into().unwrap()) == old_class_multiply
+                    })
+                    .count(),
+                0
+            );
             assert_eq!(
                 aarch64
                     .code
@@ -766,7 +787,7 @@ mod tests {
                 .expect("native view");
             assert_eq!(
                 data.len(),
-                BYTE_VALUES + view.stats.transition_entries * core::mem::size_of::<u64>()
+                CLASSIFIER_BYTES + view.stats.transition_entries * core::mem::size_of::<u64>()
             );
             if let Some(expected) = &canonical_data {
                 assert_eq!(
