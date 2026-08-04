@@ -1140,7 +1140,7 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_from_partial_v1(
 ///
 /// On success this function returns [`STATUS_MATCH`] and initializes
 /// `result_ptr` with the exact Span. Every rejection returns an error status
-/// and leaves `result_ptr` untouched. In particular, Exists, SelectedEnd,
+/// and leaves `result_ptr` untouched. In particular, `Exists`, `SelectedEnd`,
 /// nullable Span, fixed-width Span, complete-table, foreign-artifact, stale,
 /// and cross-window calls are rejected.
 ///
@@ -3365,10 +3365,18 @@ mod tests {
             0_u8;
             size_of::<FreAotRegexResultV1>() + align_of::<FreAotRegexResultV1>()
         ];
+        #[allow(
+            clippy::cast_ptr_alignment,
+            reason = "the raw-boundary test deliberately constructs a more-strictly-aligned result pointer at an unaligned address"
+        )]
         let misaligned_result = (0..align_of::<FreAotRegexResultV1>())
-            .map(|offset| unsafe { misaligned_storage.as_mut_ptr().add(offset) })
-            .map(|pointer| pointer.cast::<FreAotRegexResultV1>())
-            .find(|pointer| !pointer.is_aligned())
+            .find_map(|offset| {
+                let pointer = misaligned_storage
+                    .as_mut_ptr()
+                    .wrapping_add(offset)
+                    .cast::<FreAotRegexResultV1>();
+                (!pointer.is_aligned()).then_some(pointer)
+            })
             .expect("misaligned result address");
         assert_eq!(
             raw_call(
