@@ -1,21 +1,29 @@
 //! Direct search for finite greedy byte-class run sequences.
 //!
-//! The admitted HIR is a root concatenation of two through sixteen
-//! byte-class terms. A term is either a bare single-byte class/literal, treated
-//! as a fixed `1..1` run, or a finite greedy `CLASS{min,max}` repetition. The
-//! first two runs are positive; a suffix beginning at the third or a later run
-//! may have zero minima when every maximum is positive. Capture chains may
-//! wrap the root concatenation, each
-//! immediate term, or each repetition's single-byte class body; captures
-//! around a proper subsequence concatenation are not flattened. At least one
-//! bound is variable. Every boundary whose successor is required has disjoint
-//! classes, making the required prefix deterministic: a byte consumed by one
-//! run cannot be returned to its required successor. The nullable region is a
-//! terminal suffix, so it cannot invalidate the prefix and no later required
-//! run can force it to give bytes back. Boundaries into and within that suffix
-//! may overlap because an already-successful match never backtracks merely to
-//! redistribute bytes among greedy optional runs. Other non-adjacent classes
-//! may overlap as well.
+//! The admitted HIR is a root concatenation of two through sixteen byte-class
+//! terms, optionally preceded by exactly one absolute-start look. A term is
+//! either a bare single-byte class/literal, treated as a fixed `1..1` run, or a
+//! finite greedy `CLASS{min,max}` repetition. The ordinary form has two
+//! positive leading runs; a suffix beginning at the third or a later run may
+//! have zero minima when every maximum is positive.
+//! One sealed exception is admitted after the first or a later required run: a
+//! single greedy `CLASS{0,M}` followed by a fixed-width required byte/class.
+//! That successor is the final required run, and the preceding required class
+//! is disjoint from both corridor classes. A disjoint successor follows the
+//! ordinary sequential verifier. When the bridge and successor overlap,
+//! backtracking is confined to selecting one split inside the nullable run; it
+//! can never escape into the prefix. Capture chains may wrap the root
+//! concatenation, each immediate term, or each repetition's single-byte class
+//! body; captures around a proper subsequence concatenation are not flattened.
+//! At least one bound is variable. Every other boundary whose successor is
+//! required has disjoint classes, making
+//! the ordinary required prefix deterministic: a byte consumed by one run
+//! cannot be returned to its required successor. Outside the one sealed
+//! corridor, the nullable region is a terminal suffix, so it cannot invalidate
+//! the prefix and no later required run can force it to give bytes back.
+//! Boundaries into and within that suffix may overlap because an
+//! already-successful match never backtracks merely to redistribute bytes
+//! among greedy optional runs. Other non-adjacent classes may overlap as well.
 //!
 //! Search scans physical runs of the first class. Within one such run, only
 //! its earliest suffix of at most the first maximum can reach the disjoint
@@ -23,20 +31,27 @@
 //! first class, and every later eligible start reaches the same successor
 //! boundary.
 //! The tail is therefore verified once per first-class run instead of once per
-//! member. Requiring a positive second run is what makes that physical-run
-//! collapse valid even when a later tail run is nullable. For one immutable
-//! plan this is O(N), with a complete
+//! member. Ordinarily a positive second run makes that physical-run collapse
+//! valid even when a later tail run is nullable. When the second run is the
+//! sealed corridor, disjointness of the first class from both corridor classes
+//! proves the same fact: a capped earlier start stops on another first-class
+//! byte and fails, while every viable suffix reaches the physical run end. For
+//! one immutable plan this is O(N), with a complete
 //! source-independent bound of `N * (maximum_tail_width + 16)` charged by the
 //! shared byte-class work meter. Fixed products remain with their established
 //! incumbent plans; every structurally eligible variable product is admitted,
 //! including small products that the earlier finite-language plans decline.
+//! An absolute-start plan instead evaluates exactly one candidate at byte zero:
+//! it scans the first run only to its finite maximum and verifies the tail from
+//! that exact boundary. A window beginning after zero cannot satisfy the
+//! haystack-global look and returns no match without reading the source.
 
 use fre_exact_alloc::{CopyError, ExactBoxOrUsize};
 use fre_kernels::{
     BYTE_SET_BLOCK_BYTES, BYTE_SET_CLASSIFIER_BUILD_WORK, ByteSet256, ByteSetClassifier,
     DispatchPolicy, SimdDispatchContext,
 };
-use regex_syntax::hir::{Class, Hir, HirKind};
+use regex_syntax::hir::{Class, Hir, HirKind, Look};
 
 use crate::pure_byte_class_repeat::{Error as SeekError, SetSeek, WorkMeter, validate_window};
 use crate::{Match, SearchLimits, SearchWindow};
@@ -48,6 +63,7 @@ const NODE_INSPECTION_WORK: u64 = 1;
 const RANGE_INSPECTION_WORK: u64 = 1;
 const MEMBER_INSERTION_WORK: u64 = 1;
 const ADJACENT_DISJOINT_WORD_WORK: u64 = 4;
+const BRIDGE_SEAL_WORD_WORK: u64 = 4;
 const LEAF_SELECTION_WORK: u64 = 1;
 
 /// Operation selected for a bounded byte-class sequence search.
@@ -164,11 +180,25 @@ impl Run {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SealedBridge {
+    index: usize,
+    overlaps_successor: bool,
+}
+
+impl SealedBridge {
+    fn overlap_index(self) -> Option<usize> {
+        self.overlaps_successor.then_some(self.index)
+    }
+}
+
 pub(crate) struct Inspection {
     runs: [Run; MAX_RUNS],
     run_count: usize,
     total_minimum: usize,
     total_maximum: usize,
+    anchored_start: bool,
+    sealed_bridge: Option<SealedBridge>,
     first_seek: SetSeek,
     first_run_end_seek: SetSeek,
     classifier_words: Option<[u64; 4]>,
@@ -195,6 +225,8 @@ struct Owner {
     last_required_run: usize,
     total_minimum: usize,
     total_maximum: usize,
+    anchored_start: bool,
+    sealed_bridge: Option<SealedBridge>,
     first_seek: SetSeek,
     first_run_end_seek: SetSeek,
     classifier: Option<ByteSetClassifier>,
@@ -218,6 +250,8 @@ impl Plan {
         run_count: usize,
         total_minimum: usize,
         total_maximum: usize,
+        anchored_start: bool,
+        sealed_bridge: Option<SealedBridge>,
         first_seek: SetSeek,
         first_run_end_seek: SetSeek,
         classifier_words: Option<[u64; 4]>,
@@ -227,11 +261,30 @@ impl Plan {
         let last_required_run = retained_runs
             .iter()
             .rposition(|run| run.minimum != 0)
-            .expect("a bounded sequence has two required leading runs");
+            .expect("a bounded sequence has at least one required run");
         debug_assert!(last_required_run >= 1);
-        debug_assert!(retained_runs[..=last_required_run]
-            .iter()
-            .all(|run| run.minimum != 0));
+        if let Some(seal) = sealed_bridge {
+            let bridge = seal.index;
+            let successor = bridge
+                .checked_add(1)
+                .expect("a corridor successor fits the bounded run array");
+            debug_assert!(bridge >= 1);
+            debug_assert_eq!(last_required_run, successor);
+            debug_assert!(retained_runs[..bridge]
+                .iter()
+                .all(|run| run.minimum != 0));
+            debug_assert_eq!(retained_runs[bridge].minimum, 0);
+            debug_assert_eq!(retained_runs[successor].minimum, 1);
+            debug_assert_eq!(retained_runs[successor].maximum, 1);
+            debug_assert_eq!(
+                retained_runs[bridge].overlaps(retained_runs[successor]),
+                seal.overlaps_successor
+            );
+        } else {
+            debug_assert!(retained_runs[..=last_required_run]
+                .iter()
+                .all(|run| run.minimum != 0));
+        }
         let nullable_suffix_start = last_required_run
             .checked_add(1)
             .expect("the final required run lies within the retained run array");
@@ -249,6 +302,8 @@ impl Plan {
             last_required_run,
             total_minimum,
             total_maximum,
+            anchored_start,
+            sealed_bridge,
             first_seek,
             first_run_end_seek,
             classifier,
@@ -359,6 +414,9 @@ impl Plan {
     ) -> Result<SearchState, SearchError> {
         validate_window(haystack, window)?;
         let owner = self.owner();
+        if owner.anchored_start {
+            return self.search_anchored(haystack, window, limits, shortest_last);
+        }
         let mut meter = WorkMeter::new(limits.max_work);
         let Some(last_start) = window.end().checked_sub(owner.total_minimum) else {
             return Ok(SearchState {
@@ -449,6 +507,62 @@ impl Plan {
         })
     }
 
+    fn search_anchored(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+        shortest_last: bool,
+    ) -> Result<SearchState, SearchError> {
+        let owner = self.owner();
+        let mut meter = WorkMeter::new(limits.max_work);
+        if window.start() != 0 || window.end() < owner.total_minimum {
+            return Ok(SearchState {
+                span: None,
+                meter,
+                candidate_scans: 0,
+                run_scans: 0,
+            });
+        }
+
+        let first = owner.runs[0];
+        let mut position = 0_usize;
+        let mut consumed = 0_usize;
+        while consumed < first.maximum && position < window.end() {
+            meter.charge(1)?;
+            if !first.contains(haystack[position]) {
+                break;
+            }
+            position = position
+                .checked_add(1)
+                .expect("an anchored position before the window end advances once");
+            consumed = consumed
+                .checked_add(1)
+                .expect("the finite anchored first run cannot exceed its maximum");
+        }
+        let mut run_scans = 1_u64;
+        let span = if consumed < first.minimum {
+            None
+        } else {
+            owner
+                .verify_tail(
+                    haystack,
+                    position,
+                    window.end(),
+                    shortest_last,
+                    &mut meter,
+                    &mut run_scans,
+                )?
+                .map(|end| (0, end))
+        };
+        Ok(SearchState {
+            span,
+            meter,
+            candidate_scans: 1,
+            run_scans,
+        })
+    }
+
     fn unmetered_work_fits(&self, window: SearchWindow) -> bool {
         let owner = self.owner();
         let input_bytes = window
@@ -481,6 +595,9 @@ impl Plan {
         shortest_last: bool,
     ) -> Option<(usize, usize)> {
         let owner = self.owner();
+        if owner.anchored_start {
+            return self.search_anchored_value(haystack, window, shortest_last);
+        }
         let last_start = window.end().checked_sub(owner.total_minimum)?;
         if last_start < window.start() {
             return None;
@@ -532,6 +649,38 @@ impl Plan {
         None
     }
 
+    fn search_anchored_value(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        shortest_last: bool,
+    ) -> Option<(usize, usize)> {
+        let owner = self.owner();
+        if window.start() != 0 || window.end() < owner.total_minimum {
+            return None;
+        }
+        let first = owner.runs[0];
+        let mut position = 0_usize;
+        let mut consumed = 0_usize;
+        while consumed < first.maximum && position < window.end() {
+            if !first.contains(haystack[position]) {
+                break;
+            }
+            position = position
+                .checked_add(1)
+                .expect("an anchored position before the window end advances once");
+            consumed = consumed
+                .checked_add(1)
+                .expect("the finite anchored first run cannot exceed its maximum");
+        }
+        if consumed < first.minimum {
+            return None;
+        }
+        owner
+            .verify_tail_value(haystack, position, window.end(), shortest_last)
+            .map(|end| (0, end))
+    }
+
     fn finish_accounting(
         &self,
         operation: Operation,
@@ -563,6 +712,101 @@ impl Plan {
 }
 
 impl Owner {
+    /// Select one valid split between a nullable greedy class and its
+    /// overlapping fixed-width successor. The earliest-end operation chooses
+    /// the first valid split; selected-end/span retain regex greediness by
+    /// choosing the last valid split before the nullable run stops or reaches
+    /// its maximum. Each candidate boundary loads its byte exactly once.
+    fn verify_overlap_corridor_value(
+        &self,
+        haystack: &[u8],
+        position: usize,
+        end: usize,
+        bridge_index: usize,
+        shortest: bool,
+    ) -> Option<usize> {
+        let bridge = self.runs[bridge_index];
+        let successor_index = bridge_index
+            .checked_add(1)
+            .expect("a corridor successor fits the bounded run array");
+        let successor = self.runs[successor_index];
+        debug_assert_eq!(bridge.minimum, 0);
+        debug_assert_eq!((successor.minimum, successor.maximum), (1, 1));
+        let mut consumed = 0_usize;
+        let mut selected = None;
+        loop {
+            let candidate = position
+                .checked_add(consumed)
+                .expect("a bounded corridor candidate fits its validated window");
+            if candidate >= end {
+                break;
+            }
+            let byte = haystack[candidate];
+            if successor.contains(byte) {
+                let after = candidate
+                    .checked_add(1)
+                    .expect("a corridor successor before the window end advances once");
+                if shortest {
+                    return Some(after);
+                }
+                selected = Some(after);
+            }
+            if consumed == bridge.maximum || !bridge.contains(byte) {
+                break;
+            }
+            consumed = consumed
+                .checked_add(1)
+                .expect("one corridor cannot exceed its finite maximum");
+        }
+        selected
+    }
+
+    fn verify_overlap_corridor(
+        &self,
+        haystack: &[u8],
+        position: usize,
+        end: usize,
+        bridge_index: usize,
+        shortest: bool,
+        meter: &mut WorkMeter,
+    ) -> Result<Option<usize>, SearchError> {
+        let bridge = self.runs[bridge_index];
+        let successor_index = bridge_index
+            .checked_add(1)
+            .expect("a corridor successor fits the bounded run array");
+        let successor = self.runs[successor_index];
+        debug_assert_eq!(bridge.minimum, 0);
+        debug_assert_eq!((successor.minimum, successor.maximum), (1, 1));
+        let mut consumed = 0_usize;
+        let mut selected = None;
+        loop {
+            let candidate = position
+                .checked_add(consumed)
+                .expect("a bounded corridor candidate fits its validated window");
+            if candidate >= end {
+                break;
+            }
+            meter.charge(1)?;
+            let byte = haystack[candidate];
+            if successor.contains(byte) {
+                let after = candidate
+                    .checked_add(1)
+                    .expect("a corridor successor before the window end advances once");
+                if shortest {
+                    return Ok(Some(after));
+                }
+                selected = Some(after);
+            }
+            if consumed == bridge.maximum || !bridge.contains(byte) {
+                break;
+            }
+            consumed = consumed
+                .checked_add(1)
+                .expect("one corridor cannot exceed its finite maximum");
+        }
+        Ok(selected)
+    }
+
     fn verify_tail_value(
         &self,
         haystack: &[u8],
@@ -572,7 +816,57 @@ impl Owner {
     ) -> Option<usize> {
         let mut position = start;
         let runs = &self.runs[..self.run_count];
-        for (index, &run) in runs.iter().enumerate().skip(1) {
+        let Some(overlap_bridge) = self
+            .sealed_bridge
+            .and_then(SealedBridge::overlap_index)
+        else {
+            for (index, &run) in runs.iter().enumerate().skip(1) {
+                let shortest_terminal = shortest_last && index == self.last_required_run;
+                let maximum = if shortest_terminal {
+                    run.minimum
+                } else {
+                    run.maximum
+                };
+                let mut consumed = 0_usize;
+                while consumed < maximum && position < end {
+                    if !run.contains(haystack[position]) {
+                        break;
+                    }
+                    position = position
+                        .checked_add(1)
+                        .expect("a position before the window end advances once");
+                    consumed = consumed
+                        .checked_add(1)
+                        .expect("one run cannot exceed its finite maximum");
+                }
+                if consumed < run.minimum {
+                    return None;
+                }
+                if shortest_terminal {
+                    return Some(position);
+                }
+            }
+            return Some(position);
+        };
+        let mut index = 1_usize;
+        while index < runs.len() {
+            if index == overlap_bridge {
+                position = self.verify_overlap_corridor_value(
+                    haystack,
+                    position,
+                    end,
+                    overlap_bridge,
+                    shortest_last,
+                )?;
+                if shortest_last {
+                    return Some(position);
+                }
+                index = index
+                    .checked_add(2)
+                    .expect("a corridor and successor fit the bounded run array");
+                continue;
+            }
+            let run = runs[index];
             let shortest_terminal = shortest_last && index == self.last_required_run;
             let maximum = if shortest_terminal {
                 run.minimum
@@ -597,6 +891,9 @@ impl Owner {
             if shortest_terminal {
                 return Some(position);
             }
+            index = index
+                .checked_add(1)
+                .expect("one run fits the bounded run array");
         }
         Some(position)
     }
@@ -612,7 +909,68 @@ impl Owner {
     ) -> Result<Option<usize>, SearchError> {
         let mut position = start;
         let runs = &self.runs[..self.run_count];
-        for (index, &run) in runs.iter().enumerate().skip(1) {
+        let Some(overlap_bridge) = self
+            .sealed_bridge
+            .and_then(SealedBridge::overlap_index)
+        else {
+            for (index, &run) in runs.iter().enumerate().skip(1) {
+                *run_scans = run_scans.checked_add(1).ok_or(Error::CounterOverflow {
+                    counter: "run-scan",
+                })?;
+                let shortest_terminal = shortest_last && index == self.last_required_run;
+                let maximum = if shortest_terminal {
+                    run.minimum
+                } else {
+                    run.maximum
+                };
+                let mut consumed = 0_usize;
+                while consumed < maximum && position < end {
+                    meter.charge(1)?;
+                    if !run.contains(haystack[position]) {
+                        break;
+                    }
+                    position = position
+                        .checked_add(1)
+                        .expect("a position before the window end advances once");
+                    consumed = consumed
+                        .checked_add(1)
+                        .expect("one run cannot exceed its finite maximum");
+                }
+                if consumed < run.minimum {
+                    return Ok(None);
+                }
+                if shortest_terminal {
+                    return Ok(Some(position));
+                }
+            }
+            return Ok(Some(position));
+        };
+        let mut index = 1_usize;
+        while index < runs.len() {
+            if index == overlap_bridge {
+                *run_scans = run_scans.checked_add(2).ok_or(Error::CounterOverflow {
+                    counter: "run-scan",
+                })?;
+                let Some(next) = self.verify_overlap_corridor(
+                    haystack,
+                    position,
+                    end,
+                    overlap_bridge,
+                    shortest_last,
+                    meter,
+                )? else {
+                    return Ok(None);
+                };
+                position = next;
+                if shortest_last {
+                    return Ok(Some(position));
+                }
+                index = index
+                    .checked_add(2)
+                    .expect("a corridor and successor fit the bounded run array");
+                continue;
+            }
+            let run = runs[index];
             *run_scans = run_scans.checked_add(1).ok_or(Error::CounterOverflow {
                 counter: "run-scan",
             })?;
@@ -641,6 +999,9 @@ impl Owner {
             if shortest_terminal {
                 return Ok(Some(position));
             }
+            index = index
+                .checked_add(1)
+                .expect("one run fits the bounded run array");
         }
         Ok(Some(position))
     }
@@ -654,6 +1015,8 @@ impl Inspection {
             self.run_count,
             self.total_minimum,
             self.total_maximum,
+            self.anchored_start,
+            self.sealed_bridge,
             self.first_seek,
             self.first_run_end_seek,
             self.classifier_words,
@@ -670,8 +1033,20 @@ pub(crate) fn inspect(
 ) -> Result<InspectionOutcome, InspectionError> {
     let mut work = initial_work;
     let root = peel_captures(hir, &mut work, max_planner_work)?;
-    let HirKind::Concat(parts) = root.kind() else {
+    let HirKind::Concat(root_parts) = root.kind() else {
         return Ok(InspectionOutcome::Ineligible { planner_work: work });
+    };
+    let parts = root_parts.as_slice();
+    let (anchored_start, parts) = match parts.split_first() {
+        Some((first, rest)) if matches!(first.kind(), HirKind::Look(Look::Start)) => {
+            charge_planner(
+                &mut work,
+                NODE_INSPECTION_WORK,
+                max_planner_work,
+            )?;
+            (true, rest)
+        }
+        _ => (false, parts),
     };
     if !(2..=MAX_RUNS).contains(&parts.len()) {
         return Ok(InspectionOutcome::Ineligible { planner_work: work });
@@ -681,9 +1056,11 @@ pub(crate) fn inspect(
     let mut total_minimum = 0_usize;
     let mut total_maximum = 0_usize;
     let mut has_variable_bound = false;
-    let mut nullable_suffix_started = false;
+    let mut nullable_suffix_start = None;
+    let mut sealed_bridge = None;
+    let mut last_adjacent_overlap = false;
     for (index, part) in parts.iter().enumerate() {
-        let Some(run) = inspect_run(part, index >= 2, &mut work, max_planner_work)? else {
+        let Some(run) = inspect_run(part, index >= 1, &mut work, max_planner_work)? else {
             return Ok(InspectionOutcome::Ineligible { planner_work: work });
         };
         if index != 0 {
@@ -692,9 +1069,57 @@ pub(crate) fn inspect(
                 ADJACENT_DISJOINT_WORD_WORK,
                 max_planner_work,
             )?;
-            if run.minimum != 0 && runs[index - 1].overlaps(run) {
-                return Ok(InspectionOutcome::Ineligible { planner_work: work });
+            let previous = runs[index - 1];
+            let adjacent_overlap = previous.overlaps(run);
+            if run.minimum == 0 {
+                if nullable_suffix_start.is_none() {
+                    nullable_suffix_start = Some(index);
+                }
+            } else if let Some(nullable_start) = nullable_suffix_start {
+                let bridge = index
+                    .checked_sub(1)
+                    .expect("a required successor has one preceding run");
+                // Admit exactly one sealed nullable bridge. The fixed-width
+                // successor closes it before any optional terminal suffix.
+                // Its predecessor was already checked against the bridge at
+                // the prior charged boundary; one extra four-word comparison
+                // seals that predecessor from the successor too. Only an
+                // overlapping bridge/successor pair needs the split scanner.
+                if sealed_bridge.is_some()
+                    || nullable_start != bridge
+                    || bridge == 0
+                    || run.minimum != 1
+                    || run.maximum != 1
+                    || last_adjacent_overlap
+                {
+                    return Ok(InspectionOutcome::Ineligible { planner_work: work });
+                }
+                charge_planner(
+                    &mut work,
+                    BRIDGE_SEAL_WORD_WORK,
+                    max_planner_work,
+                )?;
+                let predecessor_index = bridge
+                    .checked_sub(1)
+                    .expect("a sealed corridor has one required predecessor");
+                let predecessor = runs[predecessor_index];
+                if predecessor.overlaps(run) {
+                    return Ok(InspectionOutcome::Ineligible { planner_work: work });
+                }
+                sealed_bridge = Some(SealedBridge {
+                    index: bridge,
+                    overlaps_successor: adjacent_overlap,
+                });
+                nullable_suffix_start = None;
+            } else {
+                // Once a corridor has closed, its successor is the final
+                // required run. A later required run could force the local
+                // greedy split to backtrack again.
+                if sealed_bridge.is_some() || adjacent_overlap {
+                    return Ok(InspectionOutcome::Ineligible { planner_work: work });
+                }
             }
+            last_adjacent_overlap = adjacent_overlap;
         }
         let Some((next_total_minimum, next_total_maximum)) =
             checked_width_totals(total_minimum, total_maximum, run)
@@ -704,12 +1129,13 @@ pub(crate) fn inspect(
         total_minimum = next_total_minimum;
         total_maximum = next_total_maximum;
         has_variable_bound |= run.minimum != run.maximum;
-        if run.minimum == 0 {
-            nullable_suffix_started = true;
-        } else if nullable_suffix_started {
-            return Ok(InspectionOutcome::Ineligible { planner_work: work });
-        }
         runs[index] = run;
+    }
+    // A nullable second run is safe only when the following fixed successor
+    // closes the sealed corridor. Without that successor, physical-first-run
+    // collapse could skip the earlier capped match inside a long first run.
+    if nullable_suffix_start == Some(1) {
+        return Ok(InspectionOutcome::Ineligible { planner_work: work });
     }
     if !has_variable_bound {
         return Ok(InspectionOutcome::Ineligible { planner_work: work });
@@ -749,6 +1175,8 @@ pub(crate) fn inspect(
         run_count: parts.len(),
         total_minimum,
         total_maximum,
+        anchored_start,
+        sealed_bridge,
         first_seek,
         first_run_end_seek,
         classifier_words,
@@ -900,6 +1328,10 @@ mod tests {
         accounting
     }
 
+    fn oracle_earliest_end(regex: &regex::bytes::Regex, haystack: &[u8]) -> Option<usize> {
+        (0..=haystack.len()).find(|&end| regex.is_match(&haystack[..end]))
+    }
+
     #[test]
     fn selects_variable_sequences_with_deterministic_boundaries() {
         for pattern in [
@@ -910,6 +1342,8 @@ mod tests {
             "(?-u:[ab])(?-u:[CD]){1,2}(?-u:[xy])?(?-u:[CD]){0,2}",
             "(?-u:[ab])(?-u:[CD]){1,2}(?-u:[CD])?",
             "(?-u:[ab])(?-u:[CD]){1,2}(?-u:[xy])?(?-u:[xy])?",
+            "(?-u:[ab]){1,2}(?-u:[CD])?(?-u:[xy])",
+            "(?-u:[Aa])(?-u:[Bb]){1,2}(?-u:[Cc])?(?-u:[Dd])",
             "(?-u:[\\x00\\x80\\xFE\\xFF])(?-u:[\\x20-\\x7E]){2,3}(?-u:[0-9])?",
             "(?-u:[A-Z]){1,3}(?-u:[a-z]){2,5}(?-u:[0-9]){1,2}",
             "(?-u:[abcd]){1,3}(?-u:[WXYZ]){1,3}",
@@ -920,6 +1354,19 @@ mod tests {
             r"(?-u:[\x80-\x83]){1,32}(?-u:[A-D]){1,32}",
             r"(?-u:[\x00-\xFE]){1,32}(?-u:\xFF){1,32}",
             "a{1,4096}(?-u:[B-D]){1,4096}",
+            "(?-u:[Aa])(?-u:[Cc]){1,2}(?-u:[Bb]){0,3}(?-u:[Bb])",
+            "(?-u:[QX])(?-u:[0-2]){1,3}(?-u:[a-c]){0,4}(?-u:[b-d])",
+            "(?-u:[Aa])(?-u:[Cc]){1,2}(?-u:[Bb]){0,3}B",
+            "A(?-u:[C]){1,2}(?-u:[ab]){0,3}(?-u:[ab])(?-u:[xy])?",
+            "(A)((?-u:[C]){1,2})((?-u:[ab]){0,3})(?-u:([ab]))",
+            "(?-u:[AQ])(?-u:[ab]){0,3}(?-u:[ab])",
+            "(?-u:[WZ]){1,3}(?-u:[ab]){0,2}(?-u:[bd])(?-u:[xy])?",
+            r"(?-u:\x01[\x30-\x40]{0,64}\x40)",
+            r"\A(?-u:\x01[\x30-\x40]{0,64}\x40)",
+            r"\A(?-u:[WZ]){1,3}(?-u:[ab]){0,2}(?-u:[bd])(?-u:[xy])?",
+            r"(?-u:[\x10-\x17]){1,3}(?-u:[\x40-\x5F]){0,3}(?-u:\x7A)",
+            r"(?-u:[\x10-\x17]){1,3}(?-u:[\x40-\x5F]){0,11}(?-u:\x7A)",
+            r"\A(?-u:[\x10-\x17]){1,3}(?-u:[\x40-\x5F]){0,11}(?-u:\x7A)",
         ] {
             let regex = build(pattern);
             assert_eq!(
@@ -935,10 +1382,19 @@ mod tests {
             "(?-u:[ab])+(?-u:[cd]){1,4}",
             "(?-u:[ab]){2}(?-u:[cd]){2}",
             "(?-u:[ab])?(?-u:[CD]){1,2}(?-u:[xy])",
-            "(?-u:[ab]){1,2}(?-u:[CD])?(?-u:[xy])",
             "(?-u:[ab]){1,2}(?-u:[CD]){0}(?-u:[xy])",
             "(?-u:[Aa])(?-u:[Bb]){1,2}(?-u:[Cc])?(?-u:[Bb])",
-            "(?-u:[Aa])(?-u:[Bb]){1,2}(?-u:[Cc])?(?-u:[Dd])",
+            "A(?-u:[ab]){1,2}(?-u:[ab]){0,3}(?-u:[ab])",
+            "A(?-u:[c]){1,2}(?-u:[ab]){0,3}(?-u:[b]){1,2}",
+            "A(?-u:[b]){1,2}(?-u:[ac]){0,3}(?-u:[bc])",
+            "A(?-u:[C])(?-u:[ab]){0,3}(?-u:[ab])(?-u:[xy]){0,2}(?-u:[xy])",
+            "(?-u:[AQ])(?-u:[ab]){0,3}",
+            "(?-u:[ab]){1,3}(?-u:[ab]){0,3}(?-u:[ab])",
+            "(?-u:[b]){1,3}(?-u:[ac]){0,3}(?-u:[bc])",
+            "(?-u:[AQ])(?-u:[ab]){0,3}(?-u:[b]){1,2}",
+            r"\z(?-u:[AQ])(?-u:[ab]){0,3}(?-u:[ab])",
+            r"(?-u:[AQ])\A(?-u:[ab]){0,3}(?-u:[ab])",
+            r"\A(?-u:\b)(?-u:[AQ])(?-u:[ab]){0,3}(?-u:[ab])",
             "((?-u:[A-Z]){1,3}(?-u:[a-z]){2,5})(?-u:[0-9]){1,2}",
             r"(?-u:[\x00-\xFF]){1,32}A{1,32}",
         ] {
@@ -1043,6 +1499,13 @@ mod tests {
             "(?-u:[ab])(?-u:[cd]){1,2}(?-u:[cd])?(?-u:[cd])?",
             "(?-u:[abcd]){1,3}(?-u:[WXYZ]){1,3}",
             "(?-u:[ab]){1,4}(?-u:[cd]){1,4}(?-u:[ab]){1,4}",
+            "(?-u:[W])(?-u:[Z])(?-u:[ab]){0,2}(?-u:[ab])",
+            "(?-u:[W])(?-u:[Z])(?-u:[ab]){0,2}(?-u:[bd])",
+            "(?-u:[W])(?-u:[Zc]){1,2}(?-u:[ab]){0,2}(?-u:[ab])",
+            "(?-u:[W])(?-u:[ab]){0,2}(?-u:[ab])",
+            "(?-u:[WZ]){1,3}(?-u:[ab]){0,2}(?-u:[bd])",
+            "(?-u:[W])(?-u:[ab]){0,2}(?-u:[d])",
+            "(?-u:[WZ]){1,3}(?-u:[ab]){0,2}(?-u:[d])",
         ];
         let alphabet = [b'a', b'b', b'd', b'W', b'Z', b'c', b'x'];
         for pattern in patterns {
@@ -1072,7 +1535,7 @@ mod tests {
                                 .find(source)
                                 .map(|matched| (start + matched.start(), start + matched.end()));
                             let expected_shortest =
-                                oracle.shortest_match(source).map(|finish| start + finish);
+                                oracle_earliest_end(&oracle, source).map(|finish| start + finish);
                             let (exists, search_accounting) = fre
                                 .is_match_window(&haystack, window, SearchLimits::unlimited())
                                 .unwrap();
@@ -1080,6 +1543,142 @@ mod tests {
                             let accounting = accounting(search_accounting);
                             assert_eq!(accounting.plan_id, PLAN_ID);
                             assert!(accounting.actual_work <= accounting.work_upper_bound);
+                            assert_eq!(
+                                fre.is_match_window_value(
+                                    &haystack,
+                                    window,
+                                    SearchLimits::unlimited(),
+                                )
+                                .unwrap(),
+                                expected.is_some(),
+                            );
+                            assert_eq!(
+                                fre.shortest_match_window(
+                                    &haystack,
+                                    window,
+                                    SearchLimits::unlimited(),
+                                )
+                                .unwrap()
+                                .0,
+                                expected_shortest,
+                            );
+                            assert_eq!(
+                                plan.selected_end_window(
+                                    &haystack,
+                                    window,
+                                    SearchLimits::unlimited(),
+                                )
+                                .unwrap()
+                                .0,
+                                expected.map(|(_, finish)| finish),
+                            );
+                            assert_eq!(
+                                span(
+                                    fre.find_window(
+                                        &haystack,
+                                        window,
+                                        SearchLimits::unlimited(),
+                                    )
+                                    .unwrap()
+                                    .0,
+                                ),
+                                expected,
+                            );
+                            assert_eq!(
+                                span(
+                                    fre.find_window_value(
+                                        &haystack,
+                                        window,
+                                        SearchLimits::unlimited(),
+                                    )
+                                    .unwrap(),
+                                ),
+                                expected,
+                            );
+                        }
+                    }
+                    let expected = oracle
+                        .find_iter(&haystack)
+                        .map(|matched| (matched.start(), matched.end()))
+                        .collect::<Vec<_>>();
+                    let actual = fre
+                        .find_iter(&haystack, PortableFindIterLimits::unlimited())
+                        .unwrap()
+                        .map(|matched| {
+                            let matched = matched.unwrap();
+                            (matched.start(), matched.end())
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(actual, expected, "{pattern} {haystack:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exhaustive_absolute_start_corridors_match_global_window_semantics() {
+        let patterns = [
+            r"\A(?-u:[W])(?-u:[ab]){0,2}(?-u:[ab])",
+            r"\A(?-u:[WZ]){1,3}(?-u:[ab]){0,2}(?-u:[bd])",
+            r"\A(?-u:[WZ]){1,3}(?-u:[ab]){0,2}(?-u:[d])",
+        ];
+        let alphabet = [b'a', b'b', b'd', b'W', b'Z', b'x'];
+        for pattern in patterns {
+            let fre = build(pattern);
+            assert_eq!(fre.runtime_implementation_id(), PLAN_ID);
+            let PortablePlan::BoundedByteClassSequence(plan) = &fre.plan else {
+                panic!("one anchored corridor should retain its sequence plan");
+            };
+            assert!(plan.owner().anchored_start);
+            let seal = plan
+                .owner()
+                .sealed_bridge
+                .expect("one anchored pattern retains a sealed bridge");
+            assert_eq!(seal.index, 1);
+            let oracle = regex::bytes::RegexBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            for length in 0_u32..=5 {
+                let cases = alphabet.len().pow(length);
+                for encoded in 0..cases {
+                    let mut value = encoded;
+                    let mut haystack = vec![0_u8; usize::try_from(length).unwrap()];
+                    for byte in &mut haystack {
+                        *byte = alphabet[value % alphabet.len()];
+                        value /= alphabet.len();
+                    }
+                    for start in 0..=haystack.len() {
+                        for end in start..=haystack.len() {
+                            let window = SearchWindow::new(start, end);
+                            let (expected, expected_shortest) = if start == 0 {
+                                (
+                                    oracle
+                                        .find(&haystack[..end])
+                                        .map(|matched| (matched.start(), matched.end())),
+                                    oracle_earliest_end(&oracle, &haystack[..end]),
+                                )
+                            } else {
+                                (None, None)
+                            };
+                            let (exists, search_accounting) = fre
+                                .is_match_window(
+                                    &haystack,
+                                    window,
+                                    SearchLimits::unlimited(),
+                                )
+                                .unwrap();
+                            assert_eq!(exists, expected.is_some());
+                            let search_accounting = accounting(search_accounting);
+                            assert!(
+                                search_accounting.actual_work
+                                    <= search_accounting.work_upper_bound
+                            );
+                            if start != 0 {
+                                assert_eq!(search_accounting.actual_work, 0);
+                                assert_eq!(search_accounting.candidate_scans, 0);
+                                assert_eq!(search_accounting.run_scans, 0);
+                            }
                             assert_eq!(
                                 fre.is_match_window_value(
                                     &haystack,
@@ -1169,8 +1768,9 @@ mod tests {
             Some((0, 5)),
         );
 
-        // A nullable second run would invalidate the physical-first-run
-        // collapse when the optional suffix accepts before that run ends.
+        // An unsealed nullable second run would invalidate the
+        // physical-first-run collapse when the optional suffix accepts before
+        // that run ends.
         let declined = build("(?-u:[ab]){1,3}(?-u:[CD])?");
         assert_ne!(declined.runtime_implementation_id(), PLAN_ID);
         assert_eq!(
@@ -1214,6 +1814,272 @@ mod tests {
                     .0
             ),
             Some((0, 5)),
+        );
+    }
+
+    #[test]
+    fn sealed_overlap_corridor_uses_earliest_and_greedy_backtracking_splits() {
+        let pattern = "A(?-u:[C])(?-u:[B]){0,3}(?-u:[B])(?-u:[xy])?";
+        let regex = build(pattern);
+        assert_eq!(regex.runtime_implementation_id(), PLAN_ID);
+        let PortablePlan::BoundedByteClassSequence(plan) = &regex.plan else {
+            panic!("one sealed overlap corridor should retain the sequence plan");
+        };
+        assert_eq!(
+            plan.owner().sealed_bridge,
+            Some(super::SealedBridge {
+                index: 2,
+                overlaps_successor: true,
+            })
+        );
+
+        for (haystack, greedy_end) in [
+            (&b"ACB"[..], 3),
+            (&b"ACBB"[..], 4),
+            (&b"ACBBBB"[..], 6),
+            (&b"!ACBBBBy!"[..], 8),
+        ] {
+            let expected_start = usize::from(haystack.first() == Some(&b'!'));
+            assert!(regex
+                .is_match(haystack, SearchLimits::unlimited())
+                .unwrap()
+                .0);
+            assert_eq!(
+                regex
+                    .shortest_match(haystack, SearchLimits::unlimited())
+                    .unwrap()
+                    .0,
+                Some(expected_start + 3),
+            );
+            assert_eq!(
+                plan.selected_end_window(
+                    haystack,
+                    SearchWindow::full(haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .0,
+                Some(greedy_end),
+            );
+            assert_eq!(
+                span(regex.find(haystack, SearchLimits::unlimited()).unwrap().0),
+                Some((expected_start, greedy_end)),
+            );
+            assert_eq!(
+                span(
+                    regex
+                        .find_value(haystack, SearchLimits::unlimited())
+                        .unwrap(),
+                ),
+                Some((expected_start, greedy_end)),
+            );
+        }
+
+        let partial = build(
+            "(?-u:[Q])(?-u:[C])(?-u:[ab]){0,3}(?-u:[bd])(?-u:[xy])?",
+        );
+        assert_eq!(partial.runtime_implementation_id(), PLAN_ID);
+        assert_eq!(
+            span(
+                partial
+                    .find(b"QCaaabx", SearchLimits::unlimited())
+                    .unwrap()
+                    .0,
+            ),
+            Some((0, 7)),
+        );
+        assert_eq!(
+            partial
+                .shortest_match(b"QCaaabx", SearchLimits::unlimited())
+                .unwrap()
+                .0,
+            Some(6),
+        );
+    }
+
+    #[test]
+    fn sealed_second_run_corridor_collapses_variable_first_class_runs() {
+        let pattern =
+            "(?-u:[AQ]){1,3}(?-u:[B]){0,3}(?-u:[B])(?-u:[xy])?";
+        let regex = build(pattern);
+        assert_eq!(regex.runtime_implementation_id(), PLAN_ID);
+        let PortablePlan::BoundedByteClassSequence(plan) = &regex.plan else {
+            panic!("a sealed second-run corridor should retain the sequence plan");
+        };
+        assert_eq!(
+            plan.owner().sealed_bridge,
+            Some(super::SealedBridge {
+                index: 1,
+                overlaps_successor: true,
+            })
+        );
+
+        for (haystack, expected_start, shortest_end, greedy_end) in [
+            (&b"AB"[..], 0, 2, 2),
+            (&b"AAABBBB"[..], 0, 4, 7),
+            (&b"AAAAAB"[..], 2, 6, 6),
+            (&b"!QQBBBBy!"[..], 1, 4, 8),
+        ] {
+            assert!(regex
+                .is_match(haystack, SearchLimits::unlimited())
+                .unwrap()
+                .0);
+            assert_eq!(
+                regex
+                    .shortest_match(haystack, SearchLimits::unlimited())
+                    .unwrap()
+                    .0,
+                Some(shortest_end),
+            );
+            assert_eq!(
+                plan.selected_end_window(
+                    haystack,
+                    SearchWindow::full(haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .0,
+                Some(greedy_end),
+            );
+            assert_eq!(
+                span(regex.find(haystack, SearchLimits::unlimited()).unwrap().0),
+                Some((expected_start, greedy_end)),
+            );
+            assert_eq!(
+                span(
+                    regex
+                        .find_value(haystack, SearchLimits::unlimited())
+                        .unwrap(),
+                ),
+                Some((expected_start, greedy_end)),
+            );
+        }
+    }
+
+    #[test]
+    fn sealed_disjoint_bridge_uses_the_sequential_tail_verifier() {
+        let pattern =
+            "(?-u:[WZ]){1,3}(?-u:[ab]){0,3}(?-u:[d])(?-u:[xy])?";
+        let regex = build(pattern);
+        assert_eq!(regex.runtime_implementation_id(), PLAN_ID);
+        let PortablePlan::BoundedByteClassSequence(plan) = &regex.plan else {
+            panic!("a sealed disjoint bridge should retain the sequence plan");
+        };
+        assert_eq!(
+            plan.owner().sealed_bridge,
+            Some(super::SealedBridge {
+                index: 1,
+                overlaps_successor: false,
+            })
+        );
+
+        for (haystack, expected_start, shortest_end, greedy_end) in [
+            (&b"Wd"[..], 0, 2, 2),
+            (&b"WWWaaadxy"[..], 0, 7, 8),
+            (&b"ZZbdx"[..], 0, 4, 5),
+            (&b"WWWWd"[..], 1, 5, 5),
+        ] {
+            assert_eq!(
+                regex
+                    .shortest_match(haystack, SearchLimits::unlimited())
+                    .unwrap()
+                    .0,
+                Some(shortest_end),
+            );
+            assert_eq!(
+                plan.selected_end_window(
+                    haystack,
+                    SearchWindow::full(haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .0,
+                Some(greedy_end),
+            );
+            assert_eq!(
+                span(regex.find(haystack, SearchLimits::unlimited()).unwrap().0),
+                Some((expected_start, greedy_end)),
+            );
+            assert_eq!(
+                span(
+                    regex
+                        .find_value(haystack, SearchLimits::unlimited())
+                        .unwrap(),
+                ),
+                Some((expected_start, greedy_end)),
+            );
+        }
+
+        assert!(!regex
+            .is_match(b"WWaaaad", SearchLimits::unlimited())
+            .unwrap()
+            .0);
+    }
+
+    #[test]
+    fn absolute_start_scans_exactly_one_first_run_candidate() {
+        let pattern =
+            r"\A(?-u:[AQ]){2,3}(?-u:[B]){0,3}(?-u:[B])(?-u:[xy])?";
+        let regex = build(pattern);
+        assert_eq!(regex.runtime_implementation_id(), PLAN_ID);
+        let PortablePlan::BoundedByteClassSequence(plan) = &regex.plan else {
+            panic!("an absolute-start corridor should retain the sequence plan");
+        };
+        assert!(plan.owner().anchored_start);
+        assert_eq!(
+            plan.owner().sealed_bridge,
+            Some(super::SealedBridge {
+                index: 1,
+                overlaps_successor: true,
+            })
+        );
+
+        for (haystack, shortest_end, greedy_end) in [
+            (&b"AAB"[..], 3, 3),
+            (&b"AAABBBB"[..], 4, 7),
+            (&b"QQBBBBy"[..], 3, 7),
+        ] {
+            assert_eq!(
+                regex
+                    .shortest_match(haystack, SearchLimits::unlimited())
+                    .unwrap()
+                    .0,
+                Some(shortest_end),
+            );
+            assert_eq!(
+                span(regex.find(haystack, SearchLimits::unlimited()).unwrap().0),
+                Some((0, greedy_end)),
+            );
+        }
+
+        for haystack in [&b"AB"[..], &b"AAAAAB"[..], &b"!AAB"[..]] {
+            assert!(!regex
+                .is_match(haystack, SearchLimits::unlimited())
+                .unwrap()
+                .0);
+            assert_eq!(
+                regex
+                    .find_value(haystack, SearchLimits::unlimited())
+                    .unwrap(),
+                None,
+            );
+        }
+
+        let haystack = b"AAABBBB";
+        let window = SearchWindow::new(1, haystack.len());
+        let (matched, receipt) = regex
+            .find_window(haystack, window, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(matched, None);
+        let receipt = accounting(receipt);
+        assert_eq!(receipt.actual_work, 0);
+        assert_eq!(receipt.candidate_scans, 0);
+        assert_eq!(receipt.run_scans, 0);
+        assert_eq!(
+            regex
+                .find_window_value(haystack, window, SearchLimits::unlimited())
+                .unwrap(),
+            None,
         );
     }
 
@@ -1452,6 +2318,155 @@ mod tests {
                 .build(),
             Err(BuildError::PersistentBytesLimit { limit, .. })
                 if limit == measured_build.charged_persistent_bytes - 1
+        ));
+    }
+
+    #[test]
+    fn anchored_disjoint_bridge_search_and_planner_limits_are_exact() {
+        let pattern =
+            r"\A(?-u:[\x10-\x17]){1,3}(?-u:[\x40-\x5F]){0,11}(?-u:\x7A)";
+        let haystack = [
+            vec![0x10_u8, 0x11, 0x12],
+            vec![0x40_u8; 5],
+            vec![0x7A_u8],
+        ]
+        .concat();
+        let haystack = haystack.as_slice();
+        let regex = build(pattern);
+        let PortablePlan::BoundedByteClassSequence(plan) = &regex.plan else {
+            panic!("one anchored disjoint bridge should retain the sequence plan");
+        };
+        assert!(plan.owner().anchored_start);
+        assert_eq!(
+            plan.owner().sealed_bridge,
+            Some(super::SealedBridge {
+                index: 1,
+                overlaps_successor: false,
+            })
+        );
+        let window = SearchWindow::full(haystack);
+
+        for operation in [
+            Operation::Exists,
+            Operation::EarliestEnd,
+            Operation::SelectedEnd,
+            Operation::Span,
+        ] {
+            let measured = match operation {
+                Operation::Exists => accounting(
+                    regex
+                        .is_match_window(haystack, window, SearchLimits::unlimited())
+                        .unwrap()
+                        .1,
+                ),
+                Operation::EarliestEnd => accounting(
+                    regex
+                        .shortest_match_window(haystack, window, SearchLimits::unlimited())
+                        .unwrap()
+                        .1,
+                ),
+                Operation::SelectedEnd => plan
+                    .selected_end_window(haystack, window, SearchLimits::unlimited())
+                    .unwrap()
+                    .1,
+                Operation::Span => accounting(
+                    regex
+                        .find_window(haystack, window, SearchLimits::unlimited())
+                        .unwrap()
+                        .1,
+                ),
+            };
+            assert!(measured.actual_work > 0);
+            assert!(measured.actual_work <= measured.work_upper_bound);
+            let exact = SearchLimits {
+                max_work: measured.actual_work,
+                max_scratch_bytes: 0,
+            };
+            let exact_work = match operation {
+                Operation::Exists => accounting(
+                    regex.is_match_window(haystack, window, exact).unwrap().1,
+                )
+                .actual_work,
+                Operation::EarliestEnd => accounting(
+                    regex
+                        .shortest_match_window(haystack, window, exact)
+                        .unwrap()
+                        .1,
+                )
+                .actual_work,
+                Operation::SelectedEnd => plan
+                    .selected_end_window(haystack, window, exact)
+                    .unwrap()
+                    .1
+                    .actual_work,
+                Operation::Span => accounting(
+                    regex.find_window(haystack, window, exact).unwrap().1,
+                )
+                .actual_work,
+            };
+            assert_eq!(exact_work, measured.actual_work);
+
+            let one_below = SearchLimits {
+                max_work: measured.actual_work - 1,
+                max_scratch_bytes: 0,
+            };
+            let error = match operation {
+                Operation::Exists => regex
+                    .is_match_window(haystack, window, one_below)
+                    .unwrap_err(),
+                Operation::EarliestEnd => regex
+                    .shortest_match_window(haystack, window, one_below)
+                    .unwrap_err(),
+                Operation::SelectedEnd => plan
+                    .selected_end_window(haystack, window, one_below)
+                    .unwrap_err()
+                    .into(),
+                Operation::Span => regex
+                    .find_window(haystack, window, one_below)
+                    .unwrap_err(),
+            };
+            assert!(matches!(
+                error,
+                FacadeSearchError::BoundedByteClassSequence(Error::WorkLimit { limit, .. })
+                    if limit == measured.actual_work - 1
+            ));
+        }
+
+        let report = regex.build_report().clone();
+        let mut exact_limits = BuildLimits::default();
+        exact_limits.max_planner_work = report.planner_work;
+        exact_limits.max_persistent_bytes = report.charged_persistent_bytes;
+        let exact = PortableBuilder::new(pattern)
+            .unicode(false)
+            .limits(exact_limits)
+            .build()
+            .unwrap();
+        assert_eq!(exact.build_report().planner_work, report.planner_work);
+        assert_eq!(
+            exact.build_report().charged_persistent_bytes,
+            report.charged_persistent_bytes
+        );
+
+        let mut one_below = exact_limits;
+        one_below.max_planner_work = report.planner_work - 1;
+        assert!(matches!(
+            PortableBuilder::new(pattern)
+                .unicode(false)
+                .limits(one_below)
+                .build(),
+            Err(BuildError::PlannerWorkLimit { limit, .. })
+                if limit == report.planner_work - 1
+        ));
+
+        let mut persistent_one_below = exact_limits;
+        persistent_one_below.max_persistent_bytes = report.charged_persistent_bytes - 1;
+        assert!(matches!(
+            PortableBuilder::new(pattern)
+                .unicode(false)
+                .limits(persistent_one_below)
+                .build(),
+            Err(BuildError::PersistentBytesLimit { limit, .. })
+                if limit == report.charged_persistent_bytes - 1
         ));
     }
 
