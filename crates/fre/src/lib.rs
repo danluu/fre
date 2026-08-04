@@ -7153,6 +7153,46 @@ struct K0MandatorySuffixAttempt {
     state_after_success: K0NegativePrefilterState,
 }
 
+fn k0_mandatory_suffix_completed_negative_is_useful(
+    window_bytes: usize,
+    candidates: usize,
+    verifier_work: u64,
+) -> bool {
+    // Finding no suffix candidate is the sidecar's intended fast negative
+    // proof, so keep it as an immediate reset independently of numeric
+    // conversions. Once endpoint verification begins, learn from two
+    // disjoint costs outside the base suffix pass: one additional literal
+    // dispatch per candidate and the verifier's complete work receipt. The
+    // receipt already charges each reverse source byte, so do not count its
+    // physical traffic again. Equality pays for one extra window-equivalent
+    // pass; anything larger should let ordinary K0 run directly after the
+    // existing streak threshold.
+    candidates == 0
+        || u64::try_from(window_bytes).is_ok_and(|window_work| {
+            u64::try_from(candidates)
+                .ok()
+                .and_then(|candidate_work| candidate_work.checked_add(verifier_work))
+                .is_some_and(|extra_work| extra_work <= window_work)
+        })
+}
+
+fn observe_k0_mandatory_suffix_completed_negative(
+    state: &mut K0NegativePrefilterClassState,
+    window_bytes: usize,
+    candidates: usize,
+    verifier_work: u64,
+) {
+    if k0_mandatory_suffix_completed_negative_is_useful(
+        window_bytes,
+        candidates,
+        verifier_work,
+    ) {
+        state.observe_absent();
+    } else {
+        state.observe_present();
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum K0MandatorySuffixSpanOutcome {
     Bypass,
@@ -7297,7 +7337,12 @@ fn try_k0_mandatory_suffix_exists(
             }
         };
         let Some((occurrence_start, endpoint)) = occurrence else {
-            next_state.classes[class_index].observe_absent();
+            observe_k0_mandatory_suffix_completed_negative(
+                &mut next_state.classes[class_index],
+                window_bytes,
+                candidates,
+                cumulative_work,
+            );
             return Ok(K0MandatorySuffixAttempt {
                 outcome: K0MandatorySuffixOutcome::Found(false),
                 state_after_success: next_state,
@@ -8532,16 +8577,19 @@ fn fixed_predicate_word64_search_limits(limits: SearchLimits) -> FixedPredicateW
 mod tests {
     use super::{
         Automaton, BuildError, BuildLimits, CanonicalPattern, CaptureFreeOperation,
-        CompatibilityProfile, K0MandatoryCutPlan, K0NegativePrefilterOutcome, Match,
-        OperationSemantics, PlanKind, PlanSelection,
+        CompatibilityProfile, K0MandatoryCutPlan, K0MandatorySuffixPlan,
+        K0NegativePrefilterOutcome, Match, OperationSemantics, PlanKind, PlanSelection,
         PortableBuilder, PortableFindIterAccounting, PortableFindIterError, PortableFindIterLimits,
         PortableFindIterRunLimits, PortablePlan, PortableRegex, SearchAccounting, SearchError,
         SearchLimits, SearchSessionLimits, SearchWindow, K0NegativePrefilterClassState,
-        K0NegativePrefilterState, K0_NEGATIVE_PREFILTER_MAX_DISABLED_CALLS,
+        K0NegativePrefilterState,
+        K0_NEGATIVE_PREFILTER_MAX_DISABLED_CALLS,
         K0_MANDATORY_CUT_BYTE_ENUMERATION_WORK, K0_MANDATORY_CUT_CARDINALITY_WORK,
         K0_MANDATORY_CUT_PLAN_CONSTRUCTION_WORK,
         K0_NEGATIVE_PREFILTER_PRESENT_STREAK_LIMIT, K0_NEGATIVE_PREFILTER_SIZE_CLASS_STATES,
-        run_k0_negative_prefilter, try_build_k0_mandatory_cut,
+        k0_mandatory_suffix_completed_negative_is_useful,
+        observe_k0_mandatory_suffix_completed_negative, run_k0_negative_prefilter,
+        try_build_k0_mandatory_cut,
     };
     use fre_automata::{MandatoryCutAnalysisLimits, MaximumConsumedDistance};
     use fre_kernels::FixedPredicateWord64SearchCursor;
@@ -8893,6 +8941,147 @@ mod tests {
         assert_eq!(state.disabled_calls, 0);
         assert_eq!(state.present_backoff, 0);
         assert_eq!(state.window_size_class, Some(17));
+    }
+
+    #[test]
+    fn k0_mandatory_suffix_negative_cost_thresholds_are_exact() {
+        assert!(k0_mandatory_suffix_completed_negative_is_useful(
+            1_024, 7, 1_017,
+        ));
+        assert!(!k0_mandatory_suffix_completed_negative_is_useful(
+            1_023, 7, 1_017,
+        ));
+        assert!(!k0_mandatory_suffix_completed_negative_is_useful(
+            1_024, 8, 1_017,
+        ));
+        assert!(!k0_mandatory_suffix_completed_negative_is_useful(
+            1_024, 7, 1_018,
+        ));
+        assert!(!k0_mandatory_suffix_completed_negative_is_useful(
+            usize::MAX, 1, u64::MAX,
+        ));
+    }
+
+    #[test]
+    fn k0_mandatory_suffix_negative_learning_distinguishes_zero_cheap_and_costly() {
+        let primed = K0NegativePrefilterClassState {
+            present_streak: K0_NEGATIVE_PREFILTER_PRESENT_STREAK_LIMIT - 1,
+            present_backoff: 8,
+            next_predicate: 3,
+            window_size_class: Some(14),
+            ..K0NegativePrefilterClassState::default()
+        };
+
+        let mut zero_candidates = primed;
+        observe_k0_mandatory_suffix_completed_negative(
+            &mut zero_candidates,
+            1_024,
+            0,
+            u64::MAX,
+        );
+        assert_eq!(zero_candidates.present_streak, 0);
+        assert_eq!(zero_candidates.disabled_calls, 0);
+        assert_eq!(zero_candidates.present_backoff, 0);
+        assert_eq!(zero_candidates.next_predicate, 3);
+        assert_eq!(zero_candidates.window_size_class, Some(14));
+
+        let mut cheap_candidates = primed;
+        observe_k0_mandatory_suffix_completed_negative(
+            &mut cheap_candidates,
+            1_024,
+            7,
+            1_017,
+        );
+        assert_eq!(cheap_candidates.present_streak, 0);
+        assert_eq!(cheap_candidates.disabled_calls, 0);
+        assert_eq!(cheap_candidates.present_backoff, 0);
+
+        let mut costly_candidates = primed;
+        observe_k0_mandatory_suffix_completed_negative(
+            &mut costly_candidates,
+            1_024,
+            7,
+            1_018,
+        );
+        assert_eq!(
+            costly_candidates.present_streak,
+            K0_NEGATIVE_PREFILTER_PRESENT_STREAK_LIMIT - 1,
+        );
+        assert_eq!(costly_candidates.disabled_calls, 16);
+        assert_eq!(costly_candidates.present_backoff, 16);
+        assert_eq!(costly_candidates.next_predicate, 3);
+        assert_eq!(costly_candidates.window_size_class, Some(14));
+    }
+
+    #[test]
+    fn k0_mandatory_suffix_rescans_same_address_after_candidate_mutation() {
+        let regex = PortableBuilder::new("a.*XYZ")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .expect("focused suffix pattern builds through K0");
+        let PortablePlan::K0(plan) = &regex.plan else {
+            panic!("forced suffix pattern did not retain K0");
+        };
+        assert_eq!(
+            plan.mandatory_suffix
+                .as_ref()
+                .map(K0MandatorySuffixPlan::needle),
+            Some(b"XYZ".as_slice()),
+        );
+
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("focused suffix session constructs");
+        let mut haystack = vec![b'x'; 8_192];
+        let address = haystack.as_ptr();
+        let write = |source: &mut [u8], start: usize, bytes: &[u8; 3]| {
+            let end = start.checked_add(bytes.len()).unwrap();
+            source.get_mut(start..end).unwrap().copy_from_slice(bytes);
+        };
+        let mut check = |source: &[u8], expected: bool| {
+            assert_eq!(
+                regex
+                    .is_match_value(source, SearchLimits::unlimited())
+                    .unwrap(),
+                expected,
+            );
+            assert_eq!(
+                session
+                    .is_match_window_value(
+                        source,
+                        SearchWindow::full(source),
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap(),
+                expected,
+            );
+        };
+
+        check(&haystack, false);
+        write(&mut haystack, 1_200, b"XYZ");
+        assert_eq!(haystack.as_ptr(), address);
+        check(&haystack, false);
+        for position in [2_500, 5_000, 8_000] {
+            write(&mut haystack, position, b"XYZ");
+        }
+        assert_eq!(haystack.as_ptr(), address);
+        check(&haystack, false);
+        for _ in 1..K0_NEGATIVE_PREFILTER_PRESENT_STREAK_LIMIT {
+            check(&haystack, false);
+        }
+
+        haystack[0] = b'a';
+        assert_eq!(haystack.as_ptr(), address);
+        check(&haystack, true);
+        for position in [1_200, 2_500, 5_000, 8_000] {
+            write(&mut haystack, position, b"xxx");
+        }
+        assert_eq!(haystack.as_ptr(), address);
+        check(&haystack, false);
+        write(&mut haystack, 8_000, b"XYZ");
+        assert_eq!(haystack.as_ptr(), address);
+        check(&haystack, true);
     }
 
     #[test]
