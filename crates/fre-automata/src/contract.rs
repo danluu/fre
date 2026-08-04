@@ -618,6 +618,38 @@ impl TypedPlan<'_, Exists> {
     }
 }
 
+impl TypedPlan<'_, SelectedEnd> {
+    /// Return the selected endpoint for an authenticated matching start.
+    ///
+    /// An unlimited exact-identity call may read already-filled forward rows
+    /// without constructing diagnostic accounting. The facade must prove that
+    /// `window.start()` is both globally earliest and the start of a match.
+    /// Every cold, finite, contextual, incomplete-cache, or unauthenticated
+    /// case uses the ordinary proved-start executor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] for an incompatible workspace, hard-limit
+    /// refusal, or execution failure. An invalid window or false matching-start
+    /// proof violates this facade-only entry's precondition.
+    #[doc(hidden)]
+    pub fn search_prevalidated_proved_exact_start_selected_end_value_with_authenticated_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut K0Workspace,
+        limits: SearchLimits,
+    ) -> Result<Option<usize>, SearchError> {
+        crate::k0::search_prevalidated_proved_exact_start_selected_end_value_with_authenticated_workspace(
+            self.automaton,
+            haystack,
+            window,
+            workspace,
+            limits,
+        )
+    }
+}
+
 impl TypedPlan<'_, Span> {
     /// Recover a span from one already authenticated selected endpoint.
     ///

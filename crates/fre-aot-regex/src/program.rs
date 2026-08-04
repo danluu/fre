@@ -3731,21 +3731,19 @@ impl CompiledProgram {
                 let found = self
                     .automaton
                     .prepare::<SelectedEnd>()
-                    .search_prevalidated_proved_exact_start_with_authenticated_workspace(
+                    .search_prevalidated_proved_exact_start_selected_end_value_with_authenticated_workspace(
                         haystack, window, workspace, limits,
-                    )?
-                    .into_output();
+                    )?;
                 Ok(MatchResult::SelectedEnd(found))
             }
             OutputContract::Span => {
                 let found = self
                     .automaton
-                    .prepare::<Span>()
-                    .search_prevalidated_proved_exact_start_with_authenticated_workspace(
+                    .prepare::<SelectedEnd>()
+                    .search_prevalidated_proved_exact_start_selected_end_value_with_authenticated_workspace(
                         haystack, window, workspace, limits,
                     )?
-                    .into_output()
-                    .map(|span| (span.start(), span.end()));
+                    .map(|end| (window.start(), end));
                 Ok(MatchResult::Span(found))
             }
         }

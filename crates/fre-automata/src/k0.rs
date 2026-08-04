@@ -3268,6 +3268,108 @@ fn continue_warm_direct_exists(
     }
 }
 
+/// Settle the filled direct transitions of one report-free proved-start run.
+/// A missing selected endpoint is a transactional decline: the ordinary
+/// proved-start executor remains authoritative for a false facade proof.
+fn complete_warm_proved_start_selected_end(
+    pending_end: Option<usize>,
+    direct_steps: usize,
+) -> Result<Option<usize>, SearchError> {
+    let Some(end) = pending_end else {
+        return Ok(None);
+    };
+    let direct_steps =
+        u64::try_from(direct_steps).map_err(|_| SearchError::ArithmeticOverflow {
+            computation: "warm proved-start direct-step conversion",
+        })?;
+    INVOCATION_RESET_WORK
+        .checked_add(direct_steps)
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "search work counter",
+        })?;
+    Ok(Some(end))
+}
+
+/// Select an endpoint for one authenticated matching start through immutable
+/// filled rows.
+///
+/// The cached machine remains the ordinary unanchored ordered DFA. Because
+/// the facade proves that the first root matches, every later root is lower
+/// priority; the same cells therefore select the exact start's endpoint until
+/// its accepting frontier commits. Any unavailable cell or false proof
+/// declines before mutation and re-enters the ordinary executor.
+fn try_warm_proved_start_selected_end(
+    haystack: &[u8],
+    window: SearchWindow,
+    lazy: &LazyWorkspace,
+) -> Result<Option<usize>, SearchError> {
+    if lazy.saturated {
+        return Ok(None);
+    }
+    let haystack = haystack
+        .get(..window.end())
+        .ok_or(SearchError::InternalInvariant {
+            detail: "warm proved-start window exceeds the validated haystack",
+        })?;
+    let (initial_pending, initial_terminal) = match lazy.initial_kind {
+        LazyInitialKind::Positive | LazyInitialKind::PositiveSingle => (false, false),
+        LazyInitialKind::NullablePrefix => (true, false),
+        LazyInitialKind::NullableTerminal => (true, true),
+        LazyInitialKind::Uninitialized => return Ok(None),
+    };
+    if lazy.initial == LAZY_NO_STATE {
+        return Ok(None);
+    }
+    if initial_pending && initial_terminal {
+        return Ok(Some(window.start()));
+    }
+
+    let mut state = direct_row_offset(lazy.initial)?;
+    let mut position = window.start();
+    let mut pending_end = initial_pending.then_some(window.start());
+    let mut direct_steps = 0usize;
+    loop {
+        if position >= haystack.len() {
+            if position == haystack.len() {
+                return complete_warm_proved_start_selected_end(pending_end, direct_steps);
+            }
+            return Err(SearchError::InternalInvariant {
+                detail: "warm proved-start position exceeded the validated window",
+            });
+        }
+
+        #[allow(
+            clippy::indexing_slicing,
+            reason = "the immediately dominating clipped-window check proves this source index"
+        )]
+        let byte = haystack[position];
+        let cell = lazy.direct_cell(state, byte)?;
+        if cell == LAZY_CELL_UNFILLED {
+            return Ok(None);
+        }
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "the validated slice ceiling bounds both monotone counters"
+        )]
+        {
+            position += 1;
+            direct_steps += 1;
+        }
+        if cell & LAZY_CELL_ACCEPT != 0 {
+            pending_end = Some(position);
+        }
+        let encoded = cell & LAZY_CELL_STATE_MASK;
+        if encoded == 0 {
+            return complete_warm_proved_start_selected_end(pending_end, direct_steps);
+        }
+        state = encoded
+            .checked_sub(1)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "warm proved-start encoded state underflowed",
+            })?;
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "all start-scanner shapes share one bounded cutoff and exact work projection"
@@ -3732,6 +3834,51 @@ pub(crate) fn search_prevalidated_proved_exact_start_with_authenticated_workspac
         meter,
         setup_work,
     )
+}
+
+pub(crate) fn search_prevalidated_proved_exact_start_selected_end_value_with_authenticated_workspace(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    limits: SearchLimits,
+) -> Result<Option<usize>, SearchError> {
+    if workspace.bound_automaton_identity != automaton.identity() {
+        return search_prevalidated_proved_exact_start_with_authenticated_workspace(
+            automaton,
+            haystack,
+            window,
+            workspace,
+            limits,
+            OutputContract::SelectedEnd,
+        )
+        .map(|report| report.found.map(MatchSpan::end));
+    }
+    debug_assert!(validate_window(haystack, window).is_ok());
+    let capabilities = workspace.bound_capabilities;
+    if limits == SearchLimits::unlimited()
+        && capabilities.lazy
+        && !capabilities.contextual
+        && workspace.lazy.is_bound_to(automaton)
+        && workspace.lazy.initialized
+        && !workspace.lazy.declined
+        && !workspace.lazy.saturated
+    {
+        if let Some(end) =
+            try_warm_proved_start_selected_end(haystack, window, &workspace.lazy)?
+        {
+            return Ok(Some(end));
+        }
+    }
+    search_prevalidated_proved_exact_start_with_authenticated_workspace(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        limits,
+        OutputContract::SelectedEnd,
+    )
+    .map(|report| report.found.map(MatchSpan::end))
 }
 
 #[allow(
@@ -22225,6 +22372,220 @@ mod tests {
             Some(3)
         );
         assert!(workspace.lazy.initialized);
+    }
+
+    #[test]
+    fn warm_proved_start_end_matches_exact_execution_across_plans_and_windows() {
+        let plans = [
+            byte_chain(&[(b'a', b'a'), (b'b', b'b')]),
+            ordered_ab_or_ac(),
+            ordered_a_or_ab(true),
+            ordered_a_or_ab(false),
+            greedy_a_star_b(),
+            lazy_a_star_b(),
+            a_plus(true),
+            a_plus(false),
+            empty_or_ab(true),
+            empty_or_ab(false),
+            asserted_line_a(),
+        ];
+        let haystacks = bounded_words(b"abcx", 3);
+        let mut comparisons = 0usize;
+        let mut direct = 0usize;
+
+        for plan in &plans {
+            let mut session =
+                K0SearchSession::new_selected(plan, WorkspaceLimits::unlimited(), true, true)
+                    .unwrap();
+            for haystack in &haystacks {
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        let exact = super::search_prevalidated_exact_start_with_authenticated_workspace(
+                            plan,
+                            haystack,
+                            window,
+                            &mut session.workspace,
+                            SearchLimits::unlimited(),
+                            OutputContract::SelectedEnd,
+                        )
+                        .unwrap()
+                        .found
+                        .map(MatchSpan::end);
+                        let Some(expected) = exact else {
+                            continue;
+                        };
+                        let reported = super::search_prevalidated_proved_exact_start_with_authenticated_workspace(
+                            plan,
+                            haystack,
+                            window,
+                            &mut session.workspace,
+                            SearchLimits::unlimited(),
+                            OutputContract::SelectedEnd,
+                        )
+                        .unwrap()
+                        .found
+                        .map(MatchSpan::end);
+                        assert_eq!(reported, Some(expected));
+
+                        let optimistic = if plan.stats().assertion_edges() == 0 {
+                            super::try_warm_proved_start_selected_end(
+                                haystack,
+                                window,
+                                &session.workspace.lazy,
+                            )
+                            .unwrap()
+                        } else {
+                            None
+                        };
+                        let rows = session.workspace.lazy.rows.clone();
+                        let generation = session.workspace.generation;
+                        let actual = plan
+                            .prepare::<SelectedEnd>()
+                            .search_prevalidated_proved_exact_start_selected_end_value_with_authenticated_workspace(
+                                haystack,
+                                window,
+                                &mut session.workspace,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap();
+                        assert_eq!(actual, Some(expected));
+                        if optimistic.is_some() {
+                            assert_eq!(optimistic, Some(expected));
+                            assert_eq!(session.workspace.lazy.rows, rows);
+                            assert_eq!(session.workspace.generation, generation);
+                            direct = direct.saturating_add(1);
+                        }
+                        comparisons = comparisons.saturating_add(1);
+                    }
+                }
+            }
+        }
+        assert!(comparisons > 500);
+        assert!(direct > 250);
+    }
+
+    #[test]
+    fn warm_proved_start_end_is_read_only_and_declines_to_ordinary_limits() {
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b')]);
+        let haystack = b"abx";
+        let window = SearchWindow::full(haystack);
+        let expected = Some(2);
+        let mut session =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+
+        assert_eq!(
+            plan.prepare::<SelectedEnd>()
+                .search_prevalidated_proved_exact_start_selected_end_value_with_authenticated_workspace(
+                    haystack,
+                    window,
+                    &mut session.workspace,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            super::try_warm_proved_start_selected_end(
+                haystack,
+                window,
+                &session.workspace.lazy,
+            ),
+            Ok(expected)
+        );
+
+        let rows = session.workspace.lazy.rows.clone();
+        let generation = session.workspace.generation;
+        let current_len = session.workspace.current_len;
+        let roots_len = session.workspace.roots_len;
+        let stack_len = session.workspace.stack_len;
+        assert_eq!(
+            plan.prepare::<SelectedEnd>()
+                .search_prevalidated_proved_exact_start_selected_end_value_with_authenticated_workspace(
+                    haystack,
+                    window,
+                    &mut session.workspace,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            expected
+        );
+        assert_eq!(session.workspace.lazy.rows, rows);
+        assert_eq!(session.workspace.generation, generation);
+        assert_eq!(session.workspace.current_len, current_len);
+        assert_eq!(session.workspace.roots_len, roots_len);
+        assert_eq!(session.workspace.stack_len, stack_len);
+
+        let initial_row = usize::try_from(
+            super::direct_row_offset(session.workspace.lazy.initial).unwrap(),
+        )
+        .unwrap();
+        let first_cell = initial_row + usize::from(b'a');
+        session.workspace.lazy.rows[first_cell] = super::LAZY_CELL_UNFILLED;
+        assert_eq!(
+            super::try_warm_proved_start_selected_end(
+                haystack,
+                window,
+                &session.workspace.lazy,
+            ),
+            Ok(None)
+        );
+        assert_eq!(
+            plan.prepare::<SelectedEnd>()
+                .search_prevalidated_proved_exact_start_selected_end_value_with_authenticated_workspace(
+                    haystack,
+                    window,
+                    &mut session.workspace,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            expected
+        );
+        assert_ne!(
+            session.workspace.lazy.rows[first_cell],
+            super::LAZY_CELL_UNFILLED
+        );
+
+        let measured = plan
+            .prepare::<SelectedEnd>()
+            .search_prevalidated_proved_exact_start_with_authenticated_workspace(
+                haystack,
+                window,
+                &mut session.workspace,
+                SearchLimits::unlimited(),
+            )
+            .unwrap()
+            .accounting()
+            .work();
+        assert_eq!(
+            plan.prepare::<SelectedEnd>()
+                .search_prevalidated_proved_exact_start_selected_end_value_with_authenticated_workspace(
+                    haystack,
+                    window,
+                    &mut session.workspace,
+                    SearchLimits {
+                        max_work: measured,
+                        max_scratch_bytes: usize::MAX,
+                    },
+                )
+                .unwrap(),
+            expected
+        );
+        let one_below = measured.checked_sub(1).unwrap();
+        assert!(matches!(
+            plan.prepare::<SelectedEnd>()
+                .search_prevalidated_proved_exact_start_selected_end_value_with_authenticated_workspace(
+                    haystack,
+                    window,
+                    &mut session.workspace,
+                    SearchLimits {
+                        max_work: one_below,
+                        max_scratch_bytes: usize::MAX,
+                    },
+                ),
+            Err(SearchError::WorkLimitExceeded { limit, .. }) if limit == one_below
+        ));
     }
 
     #[test]
