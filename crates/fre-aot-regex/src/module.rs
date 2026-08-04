@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     CompileError, ObjectError,
+    bit_parallel_exists::NativeBitParallelExistsView,
     bounded_suffix_retry::{
         BoundedSuffixRetryPlan, select_bounded_interior_retry, select_bounded_suffix_retry,
     },
@@ -38,6 +39,8 @@ use crate::{
 
 #[path = "module_context.rs"]
 mod module_context;
+#[path = "module_bit_parallel_exists.rs"]
+mod module_bit_parallel_exists;
 #[path = "module_dfa_loop_skip.rs"]
 mod module_dfa_loop_skip;
 #[path = "module_seeded_reverse_aarch64.rs"]
@@ -624,7 +627,14 @@ impl CompiledModule {
             .native_dfa_view()
             .or_else(|| program.native_exact_product_view());
         let native_context = program.native_context_program_view();
-        Self::lower_serialized(program_bytes, native, native_context, target)
+        let native_bit_parallel = program.native_bit_parallel_exists_view();
+        Self::lower_serialized(
+            program_bytes,
+            native,
+            native_context,
+            native_bit_parallel,
+            target,
+        )
             .map_err(CompileError::from)
     }
 
@@ -636,6 +646,7 @@ impl CompiledModule {
         program_bytes: Vec<u8>,
         native: Option<NativeProgramView<'_>>,
         native_context: Option<NativeContextProgramView<'_>>,
+        native_bit_parallel: Option<NativeBitParallelExistsView<'_>>,
         target: Target,
     ) -> Result<Self, ObjectError> {
         let program_digest = Sha256::digest(&program_bytes);
@@ -653,6 +664,17 @@ impl CompiledModule {
             let lowering = module_context::lower_native_context(view, target)?;
             let native_digest = native_module_digest(&program_bytes, target, &lowering)?;
             (lowering, native_digest)
+        } else if let Some(view) = native_bit_parallel {
+            if let Some(lowering) =
+                module_bit_parallel_exists::lower_native_bit_parallel_exists(view, target)?
+            {
+                let native_digest = native_module_digest(&program_bytes, target, &lowering)?;
+                (lowering, native_digest)
+            } else {
+                let lowering = lower_runtime_adapter(program_bytes, target.architecture)?;
+                let native_digest = native_module_digest(&lowering.data, target, &lowering)?;
+                (lowering, native_digest)
+            }
         } else {
             let lowering = lower_runtime_adapter(program_bytes, target.architecture)?;
             let native_digest = native_module_digest(&lowering.data, target, &lowering)?;

@@ -37,6 +37,18 @@ pub struct BitParallelExistsStats {
     pub derivation_work: u64,
 }
 
+/// Borrowed, constructor-authenticated table view for self-contained native
+/// lowering. The byte classifier and nibble-union rows are the exact
+/// canonical storage used by the portable executor; native publication does
+/// not reconstruct the language from source spelling or benchmark identity.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NativeBitParallelExistsView<'a> {
+    pub(crate) byte_to_class: &'a [u8; BYTE_VALUES],
+    pub(crate) transition_masks: &'a [u64],
+    pub(crate) initial: u64,
+    pub(crate) stats: BitParallelExistsStats,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BitParallelExistsLimits {
     pub states: usize,
@@ -329,6 +341,15 @@ impl BitParallelExists {
 
     pub(crate) const fn stats(&self) -> BitParallelExistsStats {
         self.stats
+    }
+
+    pub(crate) fn native_view(&self) -> NativeBitParallelExistsView<'_> {
+        NativeBitParallelExistsView {
+            byte_to_class: &self.byte_to_class,
+            transition_masks: &self.transition_masks,
+            initial: self.initial,
+            stats: self.stats,
+        }
     }
 
     #[allow(

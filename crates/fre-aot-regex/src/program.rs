@@ -16,7 +16,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{
     CompileMode,
-    bit_parallel_exists::{BitParallelExists, BitParallelExistsStats},
+    bit_parallel_exists::{
+        BitParallelExists, BitParallelExistsStats, NativeBitParallelExistsView,
+    },
     context_dfa::{
         self, ContextDfa, ContextDfaDecline, ContextDfaLimits, ContextDfaOutcome, ContextDfaStats,
         NativeContextDfaView,
@@ -2659,6 +2661,20 @@ impl CompiledProgram {
     #[must_use]
     pub fn bit_parallel_exists_stats(&self) -> Option<BitParallelExistsStats> {
         self.bit_parallel_exists().map(BitParallelExists::stats)
+    }
+
+    /// Return the complete canonical one-word `Exists` machine for native
+    /// lowering. The explicit contract/engine checks keep the private sidecar
+    /// from becoming an accidental lowering seam for another result ABI.
+    pub(crate) fn native_bit_parallel_exists_view(
+        &self,
+    ) -> Option<NativeBitParallelExistsView<'_>> {
+        if self.output != OutputContract::Exists
+            || !matches!(self.engine, ProgramEngine::OrderedNfa)
+        {
+            return None;
+        }
+        self.bit_parallel_exists().map(BitParallelExists::native_view)
     }
 
     /// Whether this ordered-NFA artifact has a complete exact-product scanner.
