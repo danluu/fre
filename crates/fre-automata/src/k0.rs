@@ -35366,6 +35366,504 @@ mod tests {
         assert!(workspace.lazy.is_bound_to(&plan));
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ResumeBatchExit {
+        WindowEnd,
+        Accept,
+        Dead,
+        FirstUnfilled,
+    }
+
+    fn warm_resume_batch_fixture(
+        plan: &Automaton,
+        frontier: &[u32],
+        haystack: &[u8],
+        window: SearchWindow,
+        pending_end: Option<usize>,
+        contract: OutputContract,
+    ) -> (K0Workspace, K0ResumeSet) {
+        let mut resume =
+            K0ResumeSet::new(plan, 1, frontier.len(), [(frontier, pending_end.is_some())])
+                .unwrap();
+        let mut workspace =
+            K0Workspace::new_bidirectional(plan, WorkspaceLimits::unlimited()).unwrap();
+        super::search_from_resume_with_workspace(
+            plan,
+            haystack,
+            window,
+            &mut workspace,
+            &mut resume,
+            0,
+            window.start(),
+            pending_end,
+            SearchLimits {
+                max_work: u64::MAX - 1,
+                max_scratch_bytes: usize::MAX,
+            },
+            contract,
+        )
+        .unwrap();
+        assert!(workspace.lazy.initialized);
+        assert_ne!(resume.cached_states[0], super::LAZY_NO_STATE);
+        (workspace, resume)
+    }
+
+    fn assert_resume_batch_exit_shape(
+        plan: &Automaton,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &K0Workspace,
+        resume: &K0ResumeSet,
+        exit: ResumeBatchExit,
+    ) {
+        let ready = usize::from(super::RESUME_DIRECT_BATCH_MIN_READY) + 2;
+        let mut row = super::direct_row_offset(resume.cached_states[0]).unwrap();
+        let prefix_end = window.start().checked_add(ready).unwrap();
+        for &byte in haystack.get(window.start()..prefix_end).unwrap() {
+            assert_eq!(byte, b'a');
+            let cell = workspace
+                .lazy
+                .direct_cell(row, byte_class(plan, byte))
+                .unwrap();
+            assert_ne!(cell, super::LAZY_CELL_UNFILLED);
+            assert_eq!(cell & super::LAZY_CELL_ACCEPT, 0);
+            let encoded = cell & super::LAZY_CELL_STATE_MASK;
+            assert_ne!(encoded, 0);
+            row = encoded.checked_sub(1).unwrap();
+        }
+        let exit_position = prefix_end;
+        match exit {
+            ResumeBatchExit::WindowEnd => assert_eq!(exit_position, window.end()),
+            ResumeBatchExit::Accept => {
+                let byte = *haystack.get(exit_position).unwrap();
+                let cell = workspace
+                    .lazy
+                    .direct_cell(row, byte_class(plan, byte))
+                    .unwrap();
+                assert_ne!(cell, super::LAZY_CELL_UNFILLED);
+                assert_ne!(cell & super::LAZY_CELL_ACCEPT, 0);
+            }
+            ResumeBatchExit::Dead => {
+                let byte = *haystack.get(exit_position).unwrap();
+                let cell = workspace
+                    .lazy
+                    .direct_cell(row, byte_class(plan, byte))
+                    .unwrap();
+                assert_eq!(
+                    cell & (super::LAZY_CELL_STATE_MASK | super::LAZY_CELL_ACCEPT),
+                    0,
+                );
+            }
+            ResumeBatchExit::FirstUnfilled => {
+                let byte = *haystack.get(exit_position).unwrap();
+                assert_eq!(
+                    workspace
+                        .lazy
+                        .direct_cell(row, byte_class(plan, byte))
+                        .unwrap(),
+                    super::LAZY_CELL_UNFILLED,
+                );
+            }
+        }
+    }
+
+    fn assert_resume_cache_equivalent(left: &K0Workspace, right: &K0Workspace) {
+        assert_eq!(left.generation, right.generation);
+        assert_eq!(left.current_len, right.current_len);
+        assert_eq!(left.roots_len, right.roots_len);
+        assert_eq!(left.stack_len, right.stack_len);
+        assert_eq!(left.lazy.scratch, right.lazy.scratch);
+        assert_eq!(left.lazy.scratch_len, right.lazy.scratch_len);
+        assert_eq!(left.lazy.frontier, right.lazy.frontier);
+        assert_eq!(left.lazy.frontier_len, right.lazy.frontier_len);
+        assert_eq!(left.lazy.rows, right.lazy.rows);
+        assert_eq!(left.lazy.offsets, right.lazy.offsets);
+        assert_eq!(left.lazy.lengths, right.lazy.lengths);
+        assert_eq!(left.lazy.modes, right.lazy.modes);
+        assert_eq!(left.lazy.hashes, right.lazy.hashes);
+        assert_eq!(left.lazy.index, right.lazy.index);
+        assert_eq!(left.lazy.items, right.lazy.items);
+        assert_eq!(left.lazy.state_len, right.lazy.state_len);
+        assert_eq!(left.lazy.item_len, right.lazy.item_len);
+        assert_eq!(left.lazy.initial, right.lazy.initial);
+        assert_eq!(
+            left.lazy.direct_cells_published,
+            right.lazy.direct_cells_published,
+        );
+        assert_eq!(left.lazy.initialized, right.lazy.initialized);
+        assert_eq!(left.lazy.declined, right.lazy.declined);
+        assert_eq!(left.lazy.saturated, right.lazy.saturated);
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the differential keeps warmup and tested exit windows explicit"
+    )]
+    fn assert_warmed_resume_batch_case(
+        plan: &Automaton,
+        frontier: &[u32],
+        warm_haystack: &[u8],
+        warm_window: SearchWindow,
+        haystack: &[u8],
+        window: SearchWindow,
+        pending_end: Option<usize>,
+        contract: OutputContract,
+        exit: ResumeBatchExit,
+        expected: Option<MatchSpan>,
+    ) -> u64 {
+        let (mut batched_workspace, mut batched_resume) = warm_resume_batch_fixture(
+            plan,
+            frontier,
+            warm_haystack,
+            warm_window,
+            pending_end,
+            contract,
+        );
+        let (mut scalar_workspace, mut scalar_resume) = warm_resume_batch_fixture(
+            plan,
+            frontier,
+            warm_haystack,
+            warm_window,
+            pending_end,
+            contract,
+        );
+        assert_resume_batch_exit_shape(
+            plan,
+            haystack,
+            window,
+            &batched_workspace,
+            &batched_resume,
+            exit,
+        );
+        assert_resume_cache_equivalent(&batched_workspace, &scalar_workspace);
+        assert_eq!(batched_resume.cached_states, scalar_resume.cached_states);
+
+        // Unlimited dispatches the `BATCH_WARM=true` monomorph while every
+        // finite work limit dispatches the scalar `BATCH_WARM=false` path.
+        let batched = super::search_from_resume_with_workspace(
+            plan,
+            haystack,
+            window,
+            &mut batched_workspace,
+            &mut batched_resume,
+            0,
+            window.start(),
+            pending_end,
+            SearchLimits::unlimited(),
+            contract,
+        )
+        .unwrap_or_else(|error| {
+            panic!("batched {contract:?} {exit:?} continuation failed: {error:?}")
+        });
+        let scalar = super::search_from_resume_with_workspace(
+            plan,
+            haystack,
+            window,
+            &mut scalar_workspace,
+            &mut scalar_resume,
+            0,
+            window.start(),
+            pending_end,
+            SearchLimits {
+                max_work: u64::MAX - 1,
+                max_scratch_bytes: usize::MAX,
+            },
+            contract,
+        )
+        .unwrap_or_else(|error| {
+            panic!("scalar {contract:?} {exit:?} continuation failed: {error:?}")
+        });
+        assert_eq!(batched.found, expected);
+        assert_eq!(scalar.found, expected);
+        assert_eq!(batched.accounting, scalar.accounting);
+        assert_resume_cache_equivalent(&batched_workspace, &scalar_workspace);
+        assert_eq!(batched_resume.cached_states, scalar_resume.cached_states);
+        batched.accounting.work()
+    }
+
+    #[test]
+    fn warmed_resume_batch_matches_scalar_at_every_exit_and_contract() {
+        let endpoint_plan = greedy_a_star_b();
+        // Exact ordered closure of the `a*b` split.
+        let endpoint_frontier = [1_u32, 2_u32];
+        let span_plan = byte_chain(&[
+            (b'a', b'a'),
+            (b'a', b'a'),
+            (b'a', b'a'),
+            (b'a', b'a'),
+            (b'a', b'a'),
+            (b'a', b'a'),
+            (b'b', b'b'),
+        ]);
+        let span_frontier = [0_u32];
+        let window_end = b"aaaaaa";
+        let accept = b"aaaaaab";
+        let first_unfilled = b"aaaaaax";
+
+        for contract in [OutputContract::Exists, OutputContract::SelectedEnd] {
+            assert_warmed_resume_batch_case(
+                &endpoint_plan,
+                &endpoint_frontier,
+                window_end,
+                SearchWindow::full(window_end),
+                window_end,
+                SearchWindow::full(window_end),
+                None,
+                contract,
+                ResumeBatchExit::WindowEnd,
+                None,
+            );
+            assert_warmed_resume_batch_case(
+                &endpoint_plan,
+                &endpoint_frontier,
+                accept,
+                SearchWindow::full(accept),
+                accept,
+                SearchWindow::full(accept),
+                None,
+                contract,
+                ResumeBatchExit::Accept,
+                Some(MatchSpan::new(0, accept.len())),
+            );
+            assert_warmed_resume_batch_case(
+                &endpoint_plan,
+                &endpoint_frontier,
+                window_end,
+                SearchWindow::full(window_end),
+                first_unfilled,
+                SearchWindow::full(first_unfilled),
+                None,
+                contract,
+                ResumeBatchExit::FirstUnfilled,
+                None,
+            );
+        }
+        assert_warmed_resume_batch_case(
+            &span_plan,
+            &span_frontier,
+            window_end,
+            SearchWindow::full(window_end),
+            window_end,
+            SearchWindow::full(window_end),
+            None,
+            OutputContract::Span,
+            ResumeBatchExit::WindowEnd,
+            None,
+        );
+        assert_warmed_resume_batch_case(
+            &span_plan,
+            &span_frontier,
+            accept,
+            SearchWindow::full(accept),
+            accept,
+            SearchWindow::full(accept),
+            None,
+            OutputContract::Span,
+            ResumeBatchExit::Accept,
+            Some(MatchSpan::new(0, accept.len())),
+        );
+        assert_warmed_resume_batch_case(
+            &span_plan,
+            &span_frontier,
+            window_end,
+            SearchWindow::full(window_end),
+            first_unfilled,
+            SearchWindow::full(first_unfilled),
+            None,
+            OutputContract::Span,
+            ResumeBatchExit::FirstUnfilled,
+            None,
+        );
+        for contract in [OutputContract::SelectedEnd] {
+            assert_warmed_resume_batch_case(
+                &endpoint_plan,
+                &endpoint_frontier,
+                first_unfilled,
+                SearchWindow::full(first_unfilled),
+                first_unfilled,
+                SearchWindow::full(first_unfilled),
+                Some(0),
+                contract,
+                ResumeBatchExit::Dead,
+                Some(MatchSpan::new(0, 0)),
+            );
+        }
+        let exact_work = assert_warmed_resume_batch_case(
+            &span_plan,
+            &span_frontier,
+            accept,
+            SearchWindow::full(accept),
+            accept,
+            SearchWindow::full(accept),
+            None,
+            OutputContract::Span,
+            ResumeBatchExit::Accept,
+            Some(MatchSpan::new(0, accept.len())),
+        );
+        let (mut exact_workspace, mut exact_resume) = warm_resume_batch_fixture(
+            &span_plan,
+            &span_frontier,
+            accept,
+            SearchWindow::full(accept),
+            None,
+            OutputContract::Span,
+        );
+        let exact = super::search_from_resume_with_workspace(
+            &span_plan,
+            accept,
+            SearchWindow::full(accept),
+            &mut exact_workspace,
+            &mut exact_resume,
+            0,
+            0,
+            None,
+            SearchLimits {
+                max_work: exact_work,
+                max_scratch_bytes: usize::MAX,
+            },
+            OutputContract::Span,
+        )
+        .unwrap();
+        assert_eq!(exact.found, Some(MatchSpan::new(0, accept.len())));
+        assert_eq!(exact.accounting.work(), exact_work);
+
+        let (mut refused_workspace, mut refused_resume) = warm_resume_batch_fixture(
+            &span_plan,
+            &span_frontier,
+            accept,
+            SearchWindow::full(accept),
+            None,
+            OutputContract::Span,
+        );
+        assert!(matches!(
+            super::search_from_resume_with_workspace(
+                &span_plan,
+                accept,
+                SearchWindow::full(accept),
+                &mut refused_workspace,
+                &mut refused_resume,
+                0,
+                0,
+                None,
+                SearchLimits {
+                    max_work: exact_work - 1,
+                    max_scratch_bytes: usize::MAX,
+                },
+                OutputContract::Span,
+            ),
+            Err(SearchError::WorkLimitExceeded { limit, .. }) if limit == exact_work - 1
+        ));
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the direct differential names every authenticated continuation boundary"
+    )]
+    fn run_warmed_resume_loop<const BATCH_WARM: bool>(
+        plan: &Automaton,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut K0Workspace,
+        resume: &K0ResumeSet,
+        pending_end: Option<usize>,
+        contract: OutputContract,
+    ) -> ((Option<MatchSpan>, usize), u64) {
+        let state = super::LazyState::Cached(
+            super::direct_row_offset(resume.cached_states[0]).unwrap(),
+        );
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        let result = super::execute_lazy_resume_loop::<BATCH_WARM>(
+            plan,
+            haystack,
+            window,
+            workspace,
+            &mut meter,
+            contract,
+            0,
+            state,
+            window.start(),
+            pending_end,
+        )
+        .unwrap();
+        (result, meter.consumed)
+    }
+
+    #[test]
+    fn warmed_resume_batch_randomized_differential_is_exact() {
+        let plan = greedy_a_star_b();
+        let frontier = [1_u32, 2_u32];
+        let mut random = 0x9e37_79b9_7f4a_7c15_u64;
+        for case in 0..48 {
+            random = random
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let prefix_len = 5 + usize::try_from(random % 12).unwrap();
+            let start = usize::try_from((random >> 8) % 4).unwrap();
+            let suffix = match (random >> 16) % 3 {
+                0 => None,
+                1 => Some(b'b'),
+                _ => Some(b'x'),
+            };
+            let contract = match (random >> 24) % 3 {
+                0 => OutputContract::Exists,
+                1 => OutputContract::SelectedEnd,
+                _ => OutputContract::Span,
+            };
+            let pending = contract != OutputContract::Exists && (random >> 32) & 1 != 0;
+            let pending_end = pending.then_some(start);
+            let mut haystack = vec![b'q'; start];
+            haystack.extend(core::iter::repeat_n(b'a', prefix_len));
+            haystack.extend(suffix);
+            let end = haystack.len();
+            haystack.push(b'!');
+            let window = SearchWindow::new(start, end);
+
+            let warm_contract = if contract == OutputContract::Span {
+                OutputContract::SelectedEnd
+            } else {
+                contract
+            };
+            let (mut batched_workspace, batched_resume) = warm_resume_batch_fixture(
+                &plan,
+                &frontier,
+                &haystack,
+                window,
+                pending_end,
+                warm_contract,
+            );
+            let (mut scalar_workspace, scalar_resume) = warm_resume_batch_fixture(
+                &plan,
+                &frontier,
+                &haystack,
+                window,
+                pending_end,
+                warm_contract,
+            );
+            assert_resume_cache_equivalent(&batched_workspace, &scalar_workspace);
+            assert_eq!(batched_resume.cached_states, scalar_resume.cached_states);
+            let batched = run_warmed_resume_loop::<true>(
+                &plan,
+                &haystack,
+                window,
+                &mut batched_workspace,
+                &batched_resume,
+                pending_end,
+                contract,
+            );
+            let scalar = run_warmed_resume_loop::<false>(
+                &plan,
+                &haystack,
+                window,
+                &mut scalar_workspace,
+                &scalar_resume,
+                pending_end,
+                contract,
+            );
+            assert_eq!(batched, scalar, "randomized resume case {case}");
+            assert_resume_cache_equivalent(&batched_workspace, &scalar_workspace);
+        }
+    }
+
     #[test]
     fn ordered_frontier_resume_is_graph_bound_and_recovers_exact_span() {
         let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b')]);
