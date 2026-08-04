@@ -1631,17 +1631,23 @@ impl NfaMandatorySuffix {
 /// first byte of every alternative reconstructs that necessary set even when
 /// later paths branch or cycle. Absence of every set member from a semantic
 /// search window is a complete no-match proof for every output contract. A
-/// hit alone does not prove a match. When a separate graph proof bounds every
-/// match to at most `M` consumed bytes, however, the first set member at `p`
-/// proves that no match can start before `p + 1 - M`: every match contains a
-/// member at or after `p`. The ordered NFA (or retained rows before it) can
-/// therefore continue from that narrowed lower boundary without changing
-/// leftmost or priority semantics. An unavailable bound or malformed scanner
-/// fails open to the original window.
+/// hit alone does not prove a match. The graph also records the maximum bytes
+/// consumed before this root when that prefix is finite, even if the suffix is
+/// unbounded. Thus a first set member at `p` and prefix bound `B` prove that no
+/// match can start before `p - B`. A separate global maximum match width `M`
+/// supplies the independent bound `p + 1 - M`; the tighter available bound is
+/// used. The ordered NFA (or retained rows before it) can therefore continue
+/// from that narrowed lower boundary without changing leftmost or priority
+/// semantics. Unavailable bounds or malformed scanners fail open.
 #[derive(Clone, Debug)]
 struct NfaMandatoryCut {
     root_state: u32,
     cardinality: u16,
+    /// Exact maximum bytes consumed before entering the mandatory root.
+    /// This can remain finite even when accepting paths are unbounded after
+    /// the root, and therefore bounds how far a match start can precede the
+    /// first byte consumed there.
+    maximum_start_backtrack: Option<u32>,
     scanner: NfaMandatoryCutScanner,
 }
 
@@ -1699,6 +1705,7 @@ impl NfaMandatoryCut {
                 plan.product.width,
                 plan.product.primary_offset,
             ]),
+            maximum_start_backtrack: None,
             scanner: plan.scanner,
         }
     }
@@ -1779,18 +1786,23 @@ impl NfaMandatoryCut {
         if root_state == NFA_EXACT_PRODUCT_ROOT_SENTINEL {
             return None;
         }
+        let maximum_start_backtrack = match candidate.max_before_root() {
+            required_literals::MaximumConsumedDistance::Finite(distance) => Some(distance),
+            required_literals::MaximumConsumedDistance::Unbounded => None,
+        };
         Some(Self {
             root_state,
             cardinality,
+            maximum_start_backtrack,
             scanner,
         })
     }
 
     /// Stable target-neutral cost order. Smaller necessary sets dominate;
-    /// equal-cardinality sets prefer the lower-overhead scanner, then the
-    /// canonical state number and bitmap. No observed haystack or pattern
-    /// identity participates in this choice.
-    fn cost_key(&self) -> (u16, u8, u32, [u64; 4]) {
+    /// equal-cardinality sets prefer the lower-overhead scanner, then a finite
+    /// and tighter start-backtrack proof, then the canonical state number and
+    /// bitmap. No observed haystack or pattern identity participates.
+    fn cost_key(&self) -> (u16, u8, u8, u32, u32, [u64; 4]) {
         let (tier, words) = match &self.scanner {
             NfaMandatoryCutScanner::Small { bytes, count } => {
                 let mut words = [0_u64; 4];
@@ -1806,7 +1818,17 @@ impl NfaMandatoryCut {
             }
             NfaMandatoryCutScanner::Full { set, .. } => (2, set.words()),
         };
-        (self.cardinality, tier, self.root_state, words)
+        let (unbounded, backtrack) = self
+            .maximum_start_backtrack
+            .map_or((1, u32::MAX), |backtrack| (0, backtrack));
+        (
+            self.cardinality,
+            tier,
+            unbounded,
+            backtrack,
+            self.root_state,
+            words,
+        )
     }
 
     fn first_member(&self, haystack: &[u8]) -> NfaMandatoryCutScan {
@@ -3200,16 +3222,28 @@ impl CompiledProgram {
                 });
             }
         };
-        let Some(maximum_width) = self.max_match_width.width.filter(|&width| width != 0) else {
+        let root_backtrack = accelerator
+            .maximum_start_backtrack
+            .and_then(|distance| usize::try_from(distance).ok());
+        let width_backtrack = self
+            .max_match_width
+            .width
+            .and_then(|width| width.checked_sub(1));
+        let maximum_start_backtrack = match (root_backtrack, width_backtrack) {
+            (Some(root), Some(width)) => Some(root.min(width)),
+            (Some(root), None) => Some(root),
+            (None, Some(width)) => Some(width),
+            (None, None) => None,
+        };
+        let Some(maximum_start_backtrack) = maximum_start_backtrack else {
             return NfaMandatoryCutOutcome::Continue(window);
         };
         let Some(member) = window.start.checked_add(relative) else {
             return NfaMandatoryCutOutcome::Continue(window);
         };
-        let Some(after_member) = member.checked_add(1) else {
-            return NfaMandatoryCutOutcome::Continue(window);
-        };
-        let narrowed_start = after_member.saturating_sub(maximum_width).max(window.start);
+        let narrowed_start = member
+            .saturating_sub(maximum_start_backtrack)
+            .max(window.start);
         if narrowed_start > window.end {
             return NfaMandatoryCutOutcome::Continue(window);
         }
@@ -7512,10 +7546,16 @@ mod tests {
                 let window = SearchWindow::new(2, boundary_probe.len() - 1);
                 let member_position = maximum_width + 5;
                 boundary_probe[member_position] = member;
+                let width_backtrack = maximum_width
+                    .checked_sub(1)
+                    .expect("a consuming cut has positive maximum width");
+                let maximum_start_backtrack = cut
+                    .maximum_start_backtrack
+                    .and_then(|distance| usize::try_from(distance).ok())
+                    .map_or(width_backtrack, |root| root.min(width_backtrack));
                 let narrowed = SearchWindow::new(
                     member_position
-                        .saturating_add(1)
-                        .saturating_sub(maximum_width)
+                        .saturating_sub(maximum_start_backtrack)
                         .max(window.start),
                     window.end,
                 );
@@ -7606,6 +7646,79 @@ mod tests {
                 }
                 haystacks.truncate(haystacks.len().saturating_sub(2));
             }
+        }
+    }
+
+    #[test]
+    fn finite_prefix_distance_narrows_an_unbounded_mandatory_cut() {
+        let pattern = "(?:x|yz)7.*";
+        let limits = DeterminizeLimits {
+            max_states: 0,
+            ..DeterminizeLimits::default()
+        };
+        let witness_start = 73;
+        let mut haystack = vec![b'!'; witness_start];
+        haystack.extend_from_slice(b"yz7tail");
+        let original = SearchWindow::new(3, haystack.len());
+        let expected_window = SearchWindow::new(witness_start, haystack.len());
+
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let accelerated = program(pattern, output, CompileMode::Optimizing, limits);
+            assert_eq!(accelerated.engine_kind(), EngineKind::OrderedNfa);
+            assert_eq!(accelerated.max_match_width(), None);
+            assert!(accelerated.nfa_mandatory_suffix.is_none());
+            let cut = accelerated
+                .nfa_mandatory_cut
+                .as_ref()
+                .expect("mandatory interior byte");
+            assert!(cut.exact_product().is_none());
+            assert_eq!(cut.cardinality, 1);
+            assert_eq!(cut.maximum_start_backtrack, Some(2));
+            assert_eq!(
+                accelerated.search_nfa_with_mandatory_cut(&haystack, original),
+                NfaMandatoryCutOutcome::Continue(expected_window)
+            );
+
+            let serialized = accelerated.serialize().expect("serialize unbounded cut");
+            let restored =
+                CompiledProgram::deserialize(&serialized).expect("restore unbounded cut");
+            assert_eq!(restored.max_match_width(), None);
+            assert_eq!(
+                restored
+                    .nfa_mandatory_cut
+                    .as_ref()
+                    .and_then(|cut| cut.maximum_start_backtrack),
+                Some(2)
+            );
+            assert_eq!(
+                restored.search_nfa_with_mandatory_cut(&haystack, original),
+                NfaMandatoryCutOutcome::Continue(expected_window)
+            );
+
+            let mut reference = accelerated.clone();
+            reference.nfa_mandatory_cut = None;
+            let mut accelerated_workspace = accelerated.prepare_workspace().unwrap();
+            let mut restored_workspace = restored.prepare_workspace().unwrap();
+            let mut reference_workspace = reference.prepare_workspace().unwrap();
+            let expected = reference
+                .search_with_workspace(&haystack, original, &mut reference_workspace)
+                .unwrap();
+            assert_eq!(
+                accelerated
+                    .search_with_workspace(&haystack, original, &mut accelerated_workspace)
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(
+                restored
+                    .search_with_workspace(&haystack, original, &mut restored_workspace)
+                    .unwrap(),
+                expected
+            );
         }
     }
 
@@ -7717,6 +7830,7 @@ mod tests {
             let cut = NfaMandatoryCut {
                 root_state: 0,
                 cardinality: u16::try_from(members.len()).unwrap(),
+                maximum_start_backtrack: None,
                 scanner,
             };
             for alignment in 0..32 {
@@ -7760,6 +7874,7 @@ mod tests {
             let malformed = NfaMandatoryCut {
                 root_state: 0,
                 cardinality: 3,
+                maximum_start_backtrack: None,
                 scanner: NfaMandatoryCutScanner::Small {
                     bytes: [1, 17, 200],
                     count,
