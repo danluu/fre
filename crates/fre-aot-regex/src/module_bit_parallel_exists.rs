@@ -14,12 +14,23 @@ use crate::{
 };
 
 use super::{
-    AARCH64_HI, AARCH64_HS, AARCH64_MI, AARCH64_NE, Aarch64Assembler, Architecture,
-    ModuleRelocation, NativeLowering, PROGRAM_SYMBOL, RelocationKind, StartAccelerator,
-    TEXT_SECTION, Target, X86Assembler, aarch64_add_x_imm, aarch64_add_x_reg, aarch64_and_low_x,
-    aarch64_cmp_x, aarch64_load_byte_imm, aarch64_load_u64_constant, aarch64_load_x_lsl3,
-    aarch64_lsr_x_imm, aarch64_mov_x, aarch64_movz_w, aarch64_reg, aarch64_store_x, offset_u64,
-    push_bytes,
+    AARCH64_EQ, AARCH64_HI, AARCH64_HS, AARCH64_LO, AARCH64_MI, AARCH64_NE,
+    AARCH64_STANDALONE_FILTER_FIRST_CONSTANT, Aarch64Assembler, Aarch64SveFilterKind, Architecture,
+    CpuFeature, ModuleRelocation, NativeLowering, NativeStartFilter, OperatingSystem,
+    PROGRAM_SYMBOL, RelocationKind, StartAccelerator, TEXT_SECTION, Target, X86Assembler,
+    X86CandidateMask, aarch64_add_x_imm, aarch64_add_x_reg, aarch64_and_low_x, aarch64_cmp_x,
+    aarch64_emit_candidate_any, aarch64_emit_candidate_batch_any,
+    aarch64_emit_first_candidate_in_batch, aarch64_emit_first_candidate_lane,
+    aarch64_emit_first_lane_constants, aarch64_emit_scalar_filter_membership,
+    aarch64_emit_start_filter_address, aarch64_emit_start_filter_batch_candidates,
+    aarch64_emit_start_filter_constants, aarch64_emit_start_filter_scalar_bound,
+    aarch64_emit_start_filter_vector_candidates, aarch64_emit_sve_filter_setup,
+    aarch64_emit_sve_start_filter_scanner, aarch64_load_byte_reg, aarch64_load_q,
+    aarch64_load_u64_constant, aarch64_load_x_lsl3, aarch64_lsr_x_imm, aarch64_mov_x,
+    aarch64_movz_w, aarch64_reg, aarch64_store_x, filter_from_membership_words, offset_u64,
+    push_bytes, x86_emit_first_candidate_lane, x86_emit_scalar_filter_membership,
+    x86_emit_start_filter_constants, x86_emit_start_filter_scalar_bound,
+    x86_emit_start_filter_vector_candidate, x86_range_scanner_emission, x86_start_filter_kind,
 };
 
 const BYTE_VALUES: usize = 256;
@@ -31,11 +42,20 @@ const NIBBLE_ROW_BYTES: usize = NIBBLE_SUBSETS * core::mem::size_of::<u64>();
 const ACCEPT_BIT: u64 = 1_u64 << 63;
 const CONSUMING_BITS: u64 = ACCEPT_BIT - 1;
 
+// This prototype is deliberately narrower than semantic compilability. A
+// root-departure set wider than one eighth of the alphabet makes recurrence
+// replay common enough that publication must remain with the prepared K0
+// runtime until a stronger cost model proves otherwise.
+const MAX_ROOT_SKIP_CANDIDATE_BYTES: u16 = 32;
+const ROOT_SKIP_FIRST_LANE_BYTES: usize = 16;
+
 // The sidecar itself proves a tighter retained-memory ceiling. These native
 // caps independently bound object growth and make a failed optional lowering
 // fall back to the serialized runtime route.
 const MAX_NATIVE_BIT_PARALLEL_DATA_BYTES: usize =
-    CLASSIFIER_BYTES + 256 * (MAX_BIT_PARALLEL_EXISTS_STATES / NIBBLE_BITS) * NIBBLE_ROW_BYTES;
+    CLASSIFIER_BYTES
+        + 256 * (MAX_BIT_PARALLEL_EXISTS_STATES / NIBBLE_BITS) * NIBBLE_ROW_BYTES
+        + ROOT_SKIP_FIRST_LANE_BYTES * 2;
 const MAX_NATIVE_BIT_PARALLEL_CODE_BYTES: usize = 2 * 1024;
 
 #[derive(Debug)]
@@ -44,6 +64,9 @@ struct NativeBitParallelLayout {
     root: u64,
     source_nibbles: usize,
     constant_result: Option<bool>,
+    root_filter: Option<NativeStartFilter>,
+    first_lane_table_offset: Option<u32>,
+    sve2_match_table_offset: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -60,21 +83,67 @@ pub(super) fn lower_native_bit_parallel_exists(
     let Some(layout) = build_native_bit_parallel_layout(view) else {
         return Ok(None);
     };
+    if layout.constant_result.is_none() {
+        let Some(filter) = layout.root_filter else {
+            return Ok(None);
+        };
+        if layout.source_nibbles != 1
+            || filter.candidate_bytes > MAX_ROOT_SKIP_CANDIDATE_BYTES
+            || filter.constant_count() > 8
+            || filter.ranges().is_empty()
+        {
+            return Ok(None);
+        }
+        if target.architecture == Architecture::Aarch64
+            && !target.features.has(CpuFeature::Aarch64Asimd)
+            && !(target.operating_system == OperatingSystem::Linux
+                && target.features.has(CpuFeature::Aarch64Sve))
+        {
+            return Ok(None);
+        }
+    }
     let emission = match target.architecture {
-        Architecture::X86_64 => lower_x86_64_bit_parallel(&layout)?,
-        Architecture::Aarch64 => lower_aarch64_bit_parallel(&layout)?,
+        Architecture::X86_64 => lower_x86_64_bit_parallel(&layout, target)?,
+        Architecture::Aarch64 => lower_aarch64_bit_parallel(&layout, target)?,
     };
     if emission.code.len() > MAX_NATIVE_BIT_PARALLEL_CODE_BYTES
         || emission.emitted_nibbles != layout.source_nibbles
     {
         return Ok(None);
     }
+    let start_accelerator = if layout.constant_result.is_some() {
+        StartAccelerator::None
+    } else {
+        let filter = layout.root_filter.ok_or(ObjectError::InvalidModule(
+            "native bit-parallel scanner receipt has no root filter",
+        ))?;
+        match target.architecture {
+            Architecture::X86_64 => {
+                x86_range_scanner_emission(filter, x86_start_filter_kind(target.features))?
+                    .start_accelerator()
+            }
+            Architecture::Aarch64
+                if target.operating_system == OperatingSystem::Linux
+                    && target.features.has(CpuFeature::Aarch64Sve2)
+                    && layout.sve2_match_table_offset.is_some() =>
+            {
+                StartAccelerator::Aarch64Sve2
+            }
+            Architecture::Aarch64
+                if target.operating_system == OperatingSystem::Linux
+                    && target.features.has(CpuFeature::Aarch64Sve) =>
+            {
+                StartAccelerator::Aarch64Sve
+            }
+            Architecture::Aarch64 => StartAccelerator::Aarch64Asimd,
+        }
+    };
     Ok(Some(NativeLowering {
         code: emission.code,
         data: layout.data,
         relocations: emission.relocations,
         needs_runtime: false,
-        start_accelerator: StartAccelerator::None,
+        start_accelerator,
         anchored_prefix_filter_bytes: 0,
     }))
 }
@@ -161,6 +230,26 @@ fn build_native_bit_parallel_layout(
         return None;
     }
 
+    let root_filter = if constant_result.is_none() && source_nibbles == 1 {
+        let subset = usize::try_from(root & 0x0f).ok()?;
+        let mut membership = [0_u64; 4];
+        for byte in u8::MIN..=u8::MAX {
+            let class = usize::from(view.byte_to_class[usize::from(byte)]);
+            let index = class.checked_mul(NIBBLE_SUBSETS)?.checked_add(subset)?;
+            let reached = *view.transition_masks.get(index)?;
+            let changes_root = reached & (ACCEPT_BIT | (CONSUMING_BITS & !root)) != 0;
+            if changes_root {
+                let byte = usize::from(byte);
+                membership[byte / 64] |= 1_u64 << (byte % 64);
+            }
+        }
+        filter_from_membership_words(membership, 0, false)
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+
     let mut data = Vec::new();
     if constant_result.is_none() {
         data.try_reserve_exact(data_bytes).ok()?;
@@ -178,11 +267,38 @@ fn build_native_bit_parallel_layout(
             return None;
         }
     }
+
+    let mut first_lane_table_offset = None;
+    let mut sve2_match_table_offset = None;
+    if let Some(filter) = root_filter.filter(|filter| !filter.ranges().is_empty()) {
+        first_lane_table_offset = Some(u32::try_from(data.len()).ok()?);
+        data.try_reserve_exact(ROOT_SKIP_FIRST_LANE_BYTES.checked_mul(2)?)
+            .ok()?;
+        data.extend(0_u8..u8::try_from(ROOT_SKIP_FIRST_LANE_BYTES).ok()?);
+        if filter.is_exact() {
+            sve2_match_table_offset = Some(u32::try_from(data.len()).ok()?);
+            let first = filter.ranges().first()?.start;
+            for index in 0..ROOT_SKIP_FIRST_LANE_BYTES {
+                data.push(
+                    filter
+                        .ranges()
+                        .get(index)
+                        .map_or(first, |range| range.start),
+                );
+            }
+        }
+    }
+    if data.len() > MAX_NATIVE_BIT_PARALLEL_DATA_BYTES {
+        return None;
+    }
     Some(NativeBitParallelLayout {
         data,
         root,
         source_nibbles,
         constant_result,
+        root_filter,
+        first_lane_table_offset,
+        sve2_match_table_offset,
     })
 }
 
@@ -214,9 +330,15 @@ fn x86_emit_result_zero(assembler: &mut X86Assembler) -> Result<(), ObjectError>
 
 fn lower_x86_64_bit_parallel(
     layout: &NativeBitParallelLayout,
+    target: Target,
 ) -> Result<NativeBitParallelEmission, ObjectError> {
     let mut assembler = X86Assembler::new();
-    let loop_head = assembler.label()?;
+    let scan = assembler.label()?;
+    let vector_scan = assembler.label()?;
+    let vector_hit = assembler.label()?;
+    let scalar_scan = assembler.label()?;
+    let scalar_miss = assembler.label()?;
+    let recurrence = assembler.label()?;
     let no_match = assembler.label()?;
     let matched = assembler.label()?;
     let invalid = assembler.label()?;
@@ -224,58 +346,74 @@ fn lower_x86_64_bit_parallel(
 
     x86_emit_abi_validation(&mut assembler, invalid)?;
     x86_emit_result_zero(&mut assembler)?;
+    let filter_kind = layout
+        .root_filter
+        .map(|_| x86_start_filter_kind(target.features));
     if let Some(result) = layout.constant_result {
         assembler.instruction(&[0xb8, u8::from(result), 0, 0, 0])?;
         assembler.branch(&[0xe9], done)?;
     } else {
+        let filter = layout.root_filter.ok_or(ObjectError::InvalidModule(
+            "native bit-parallel root scanner is absent",
+        ))?;
+        let kind = filter_kind.ok_or(ObjectError::InvalidModule(
+            "native bit-parallel x86 scanner kind is absent",
+        ))?;
         // lea table(%rip), r9
         assembler.instruction(&[0x4c, 0x8d, 0x0d])?;
         let table_displacement_label = assembler.label()?;
         assembler.bind(table_displacement_label)?;
         push_bytes(&mut assembler.code, &[0; 4])?;
 
-        assembler.instruction(&[0x4c, 0x8d, 0x1c, 0x0f])?; // lea [rdi + rcx], r11
-        assembler.instruction(&[0x48, 0x01, 0xd7])?; // add rdx, rdi
-        let mut root = vec![0x48, 0xb9]; // movabs root, rcx
+        let mut root = vec![0x49, 0xbb]; // movabs root, r11
         root.extend_from_slice(&layout.root.to_le_bytes());
         assembler.instruction(&root)?;
-        assembler.instruction(&[0x48, 0x89, 0xce])?; // mov rcx, rsi
+        assembler.instruction(&[0x4d, 0x89, 0xda])?; // active r10 = root r11
+        x86_emit_start_filter_constants(&mut assembler, filter, kind, 1)?;
 
-        assembler.bind(loop_head)?;
-        assembler.instruction(&[0x4c, 0x39, 0xdf])?; // cmp r11, rdi
-        assembler.branch(&[0x0f, 0x83], no_match)?; // jae
-        assembler.instruction(&[0x0f, 0xb6, 0x07])?; // movzx [rdi], eax
-        assembler.instruction(&[0x48, 0xff, 0xc7])?; // inc rdi
+        // Only this edge owns the exact restart/root state. Every miss byte is
+        // graph-proven to leave both that state and acceptance unchanged.
+        assembler.bind(scan)?;
+        assembler.bind(vector_scan)?;
+        assembler.instruction(&[0x48, 0x89, 0xc8])?; // remaining = end
+        assembler.instruction(&[0x48, 0x29, 0xd0])?; // remaining -= position
+        assembler.instruction(&[0x48, 0x83, 0xf8, kind.width()])?;
+        assembler.branch(&[0x0f, 0x82], scalar_scan)?;
+        x86_emit_start_filter_vector_candidate(&mut assembler, filter, kind, vector_hit)?;
+        assembler.instruction(&[0x48, 0x83, 0xc2, kind.width()])?;
+        assembler.branch(&[0xe9], vector_scan)?;
+
+        assembler.bind(vector_hit)?;
+        x86_emit_first_candidate_lane(&mut assembler, X86CandidateMask::for_filter(filter, kind))?;
+        assembler.instruction(&[0x48, 0x01, 0xc2])?; // position += first lane
+        assembler.branch(&[0xe9], recurrence)?;
+
+        assembler.bind(scalar_scan)?;
+        x86_emit_start_filter_scalar_bound(&mut assembler, 0, no_match)?;
+        x86_emit_scalar_filter_membership(&mut assembler, filter, scalar_miss)?;
+        assembler.branch(&[0xe9], recurrence)?;
+        assembler.bind(scalar_miss)?;
+        assembler.instruction(&[0x48, 0xff, 0xc2])?;
+        assembler.branch(&[0xe9], scalar_scan)?;
+
+        assembler.bind(recurrence)?;
+        assembler.instruction(&[0x48, 0x39, 0xca])?; // position >= end
+        assembler.branch(&[0x0f, 0x83], no_match)?;
+        assembler.instruction(&[0x0f, 0xb6, 0x04, 0x17])?; // byte at position
+        assembler.instruction(&[0x48, 0xff, 0xc2])?; // position += 1
         assembler.instruction(&[0x41, 0x8b, 0x04, 0x81])?; // row offset = table[byte]
-        assembler.instruction(&[0x49, 0x8d, 0x14, 0x01])?; // row = table + offset
-        assembler.instruction(&[0x31, 0xc0])?; // reached = 0
-
-        for nibble in 0..layout.source_nibbles {
-            assembler.instruction(&[0x49, 0x89, 0xf2])?; // active -> r10
-            let shift = u8::try_from(
-                nibble
-                    .checked_mul(NIBBLE_BITS)
-                    .ok_or(ObjectError::ArithmeticOverflow("x86 bit-parallel shift"))?,
-            )
-            .map_err(|_| ObjectError::ArithmeticOverflow("x86 bit-parallel shift"))?;
-            if shift != 0 {
-                assembler.instruction(&[0x49, 0xc1, 0xea, shift])?;
-            }
-            assembler.instruction(&[0x41, 0x83, 0xe2, 0x0f])?;
-            let displacement = u32::try_from(nibble.checked_mul(NIBBLE_ROW_BYTES).ok_or(
-                ObjectError::ArithmeticOverflow("x86 bit-parallel row offset"),
-            )?)
-            .map_err(|_| ObjectError::ArithmeticOverflow("x86 bit-parallel row offset"))?;
-            let mut union = vec![0x4a, 0x0b, 0x84, 0xd2];
-            union.extend_from_slice(&displacement.to_le_bytes());
-            assembler.instruction(&union)?; // or [rdx + r10*8 + row], rax
-        }
+        assembler.instruction(&[0x49, 0x8d, 0x34, 0x01])?; // row = table + offset
+        assembler.instruction(&[0x4c, 0x89, 0xd0])?; // subset = active
+        assembler.instruction(&[0x83, 0xe0, 0x0f])?;
+        assembler.instruction(&[0x48, 0x8b, 0x04, 0xc6])?; // reached = row[subset]
         assembler.instruction(&[0x48, 0x85, 0xc0])?;
         assembler.branch(&[0x0f, 0x88], matched)?; // acceptance marker is the sign bit
         assembler.instruction(&[0x48, 0x0f, 0xba, 0xf0, 0x3f])?; // btr 63, rax
-        assembler.instruction(&[0x48, 0x09, 0xc8])?; // root | reached
-        assembler.instruction(&[0x48, 0x89, 0xc6])?; // next active
-        assembler.branch(&[0xe9], loop_head)?;
+        assembler.instruction(&[0x4c, 0x09, 0xd8])?; // root | reached
+        assembler.instruction(&[0x49, 0x89, 0xc2])?; // next active
+        assembler.instruction(&[0x4d, 0x39, 0xda])?; // root restored?
+        assembler.branch(&[0x0f, 0x84], scan)?;
+        assembler.branch(&[0xe9], recurrence)?;
 
         assembler.bind(no_match)?;
         assembler.instruction(&[0x31, 0xc0])?;
@@ -287,6 +425,9 @@ fn lower_x86_64_bit_parallel(
         assembler.bind(invalid)?;
         assembler.instruction(&[0xb8, 0x02, 0, 0, 0])?;
         assembler.bind(done)?;
+        if kind.needs_vzeroupper() {
+            assembler.instruction(&[0xc5, 0xf8, 0x77])?;
+        }
         assembler.instruction(&[0xc3])?;
         let finished = assembler.finish_with_label_offsets()?;
         let table_displacement = finished.label_offset(table_displacement_label)?;
@@ -309,6 +450,9 @@ fn lower_x86_64_bit_parallel(
     assembler.bind(invalid)?;
     assembler.instruction(&[0xb8, 0x02, 0, 0, 0])?;
     assembler.bind(done)?;
+    if filter_kind.is_some_and(|kind| kind.needs_vzeroupper()) {
+        assembler.instruction(&[0xc5, 0xf8, 0x77])?;
+    }
     assembler.instruction(&[0xc3])?;
     Ok(NativeBitParallelEmission {
         code: assembler.finish_with_label_offsets()?.code,
@@ -318,10 +462,12 @@ fn lower_x86_64_bit_parallel(
 }
 
 fn aarch64_load_w_lsl2(destination: u8, base: u8, index: u8) -> Result<u32, ObjectError> {
-    Ok(0xb860_7800
-        | aarch64_reg(index, 16)?
-        | aarch64_reg(base, 5)?
-        | aarch64_reg(destination, 0)?)
+    Ok(
+        0xb860_7800
+            | aarch64_reg(index, 16)?
+            | aarch64_reg(base, 5)?
+            | aarch64_reg(destination, 0)?,
+    )
 }
 
 fn aarch64_orr_x(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
@@ -359,9 +505,16 @@ fn aarch64_emit_abi_validation(
 )]
 fn lower_aarch64_bit_parallel(
     layout: &NativeBitParallelLayout,
+    target: Target,
 ) -> Result<NativeBitParallelEmission, ObjectError> {
     let mut assembler = Aarch64Assembler::new();
-    let loop_head = assembler.label()?;
+    let scan = assembler.label()?;
+    let single_vector = assembler.label()?;
+    let single_hit = assembler.label()?;
+    let batch_hit = assembler.label()?;
+    let scalar_scan = assembler.label()?;
+    let scalar_miss = assembler.label()?;
+    let recurrence = assembler.label()?;
     let no_match = assembler.label()?;
     let matched = assembler.label()?;
     let invalid = assembler.label()?;
@@ -374,59 +527,121 @@ fn lower_aarch64_bit_parallel(
         assembler.instruction(aarch64_movz_w(0, u16::from(result))?)?;
         assembler.branch(done)?;
     } else {
+        let filter = layout.root_filter.ok_or(ObjectError::InvalidModule(
+            "native bit-parallel root scanner is absent",
+        ))?;
+        let use_sve = target.operating_system == OperatingSystem::Linux
+            && target.features.has(CpuFeature::Aarch64Sve);
+        let use_asimd = !use_sve && target.features.has(CpuFeature::Aarch64Asimd);
+        if !use_sve && !use_asimd {
+            return Err(ObjectError::InvalidModule(
+                "native bit-parallel AArch64 scanner is not vectorized",
+            ));
+        }
         let table_page = assembler.instruction(0x9000_0005)?; // adrp x5, table
         let table_page_offset = assembler.instruction(aarch64_add_x_imm(5, 5, 0)?)?;
-        assembler.instruction(aarch64_add_x_reg(7, 0, 3)?)?; // end pointer
-        assembler.instruction(aarch64_add_x_reg(6, 0, 2)?)?; // current pointer
         aarch64_load_u64_constant(&mut assembler, 9, layout.root)?;
         assembler.instruction(aarch64_mov_x(8, 9)?)?;
 
-        assembler.bind(loop_head)?;
-        assembler.instruction(aarch64_cmp_x(6, 7)?)?;
+        if use_sve {
+            let kind = if target.features.has(CpuFeature::Aarch64Sve2)
+                && let Some(match_table_offset) = layout.sve2_match_table_offset
+            {
+                Aarch64SveFilterKind::Sve2 { match_table_offset }
+            } else {
+                Aarch64SveFilterKind::Sve
+            };
+            aarch64_emit_sve_filter_setup(&mut assembler, filter, kind, 0)?;
+            aarch64_emit_sve_start_filter_scanner(
+                &mut assembler,
+                filter,
+                0,
+                kind,
+                false,
+                scan,
+                scalar_scan,
+                recurrence,
+            )?;
+        } else {
+            aarch64_emit_start_filter_constants(
+                &mut assembler,
+                filter,
+                AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+            )?;
+            aarch64_emit_first_lane_constants(
+                &mut assembler,
+                layout
+                    .first_lane_table_offset
+                    .ok_or(ObjectError::InvalidModule(
+                        "native bit-parallel ASIMD first-lane table is absent",
+                    ))?,
+            )?;
+
+            assembler.bind(scan)?;
+            assembler.instruction(super::aarch64_sub_x_reg(12, 3, 2)?)?;
+            assembler.instruction(super::aarch64_cmp_x_imm(12, 64)?)?;
+            assembler.branch_cond(AARCH64_LO, single_vector)?;
+            let first_candidates = aarch64_emit_start_filter_batch_candidates(
+                &mut assembler,
+                filter,
+                AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+            )?;
+            aarch64_emit_candidate_batch_any(&mut assembler, first_candidates)?;
+            assembler.branch_cond(AARCH64_NE, batch_hit)?;
+            assembler.instruction(aarch64_add_x_imm(2, 2, 64)?)?;
+            assembler.branch(scan)?;
+
+            assembler.bind(batch_hit)?;
+            aarch64_emit_first_candidate_in_batch(&mut assembler, first_candidates)?;
+            assembler.branch(recurrence)?;
+
+            assembler.bind(single_vector)?;
+            assembler.instruction(super::aarch64_sub_x_reg(12, 3, 2)?)?;
+            assembler.instruction(super::aarch64_cmp_x_imm(12, 16)?)?;
+            assembler.branch_cond(AARCH64_LO, scalar_scan)?;
+            aarch64_emit_start_filter_address(&mut assembler, 0)?;
+            assembler.instruction(aarch64_load_q(0, 12)?)?;
+            aarch64_emit_start_filter_vector_candidates(
+                &mut assembler,
+                filter,
+                0,
+                24,
+                AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+            )?;
+            aarch64_emit_candidate_any(&mut assembler, 24)?;
+            assembler.branch_cond(AARCH64_NE, single_hit)?;
+            assembler.instruction(aarch64_add_x_imm(2, 2, 16)?)?;
+            assembler.branch(scan)?;
+
+            assembler.bind(single_hit)?;
+            aarch64_emit_first_candidate_lane(&mut assembler, 24)?;
+            assembler.branch(recurrence)?;
+        }
+
+        assembler.bind(scalar_scan)?;
+        aarch64_emit_start_filter_scalar_bound(&mut assembler, 0, no_match)?;
+        aarch64_emit_scalar_filter_membership(&mut assembler, filter, scalar_miss)?;
+        assembler.branch(recurrence)?;
+        assembler.bind(scalar_miss)?;
+        assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+        assembler.branch(scalar_scan)?;
+
+        assembler.bind(recurrence)?;
+        assembler.instruction(aarch64_cmp_x(2, 3)?)?;
         assembler.branch_cond(AARCH64_HS, no_match)?;
-        assembler.instruction(aarch64_load_byte_imm(12, 6, 0)?)?;
-        assembler.instruction(aarch64_add_x_imm(6, 6, 1)?)?;
+        assembler.instruction(aarch64_load_byte_reg(12, 0, 2)?)?;
+        assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
         assembler.instruction(aarch64_load_w_lsl2(11, 5, 12)?)?;
         assembler.instruction(aarch64_add_x_reg(11, 5, 11)?)?;
-        assembler.instruction(aarch64_movz_w(10, 0)?)?;
-
-        for nibble in 0..layout.source_nibbles {
-            let shift = u8::try_from(nibble.checked_mul(NIBBLE_BITS).ok_or(
-                ObjectError::ArithmeticOverflow("AArch64 bit-parallel shift"),
-            )?)
-            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 bit-parallel shift"))?;
-            if shift == 0 {
-                assembler.instruction(aarch64_mov_x(12, 8)?)?;
-            } else {
-                assembler.instruction(aarch64_lsr_x_imm(12, 8, shift)?)?;
-            }
-            assembler.instruction(aarch64_and_low_x(
-                12,
-                12,
-                u8::try_from(NIBBLE_BITS)
-                    .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 nibble width"))?,
-            )?)?;
-            assembler.instruction(aarch64_load_x_lsl3(13, 11, 12)?)?;
-            assembler.instruction(aarch64_orr_x(10, 10, 13)?)?;
-            if nibble
-                .checked_add(1)
-                .ok_or(ObjectError::ArithmeticOverflow("AArch64 next nibble"))?
-                != layout.source_nibbles
-            {
-                assembler.instruction(aarch64_add_x_imm(
-                    11,
-                    11,
-                    u16::try_from(NIBBLE_ROW_BYTES).map_err(|_| {
-                        ObjectError::ArithmeticOverflow("AArch64 bit-parallel row stride")
-                    })?,
-                )?)?;
-            }
-        }
+        assembler.instruction(aarch64_and_low_x(12, 8, 4)?)?;
+        assembler.instruction(aarch64_load_x_lsl3(10, 11, 12)?)?;
         assembler.instruction(aarch64_lsr_x_imm(12, 10, 63)?)?;
         assembler.branch_nonzero_w(12, matched)?;
         assembler.instruction(aarch64_and_low_x(8, 10, 63)?)?;
         assembler.instruction(aarch64_orr_x(8, 8, 9)?)?;
-        assembler.branch(loop_head)?;
+        assembler.instruction(aarch64_cmp_x(8, 9)?)?;
+        assembler.branch_cond(AARCH64_EQ, scan)?;
+        assembler.branch(recurrence)?;
 
         assembler.bind(no_match)?;
         assembler.instruction(aarch64_movz_w(0, 0)?)?;
@@ -558,12 +773,14 @@ mod tests {
             "keep full subset audit bounded"
         );
         let layout = build_native_bit_parallel_layout(view).expect("native layout");
+        let transition_extent = CLASSIFIER_BYTES
+            .checked_add(core::mem::size_of_val(view.transition_masks))
+            .expect("native transition extent");
         assert_eq!(
-            layout.data.len(),
-            CLASSIFIER_BYTES
-                .checked_add(core::mem::size_of_val(view.transition_masks))
-                .expect("native data extent")
+            layout.first_lane_table_offset,
+            Some(u32::try_from(transition_extent).unwrap())
         );
+        assert_eq!(layout.data.len(), transition_extent + 32);
         let class_stride = view.stats.source_nibbles * NIBBLE_ROW_BYTES;
         for (byte, &class) in view.byte_to_class.iter().enumerate() {
             let classifier_offset = byte * CLASSIFIER_ENTRY_BYTES;
@@ -601,8 +818,7 @@ mod tests {
                 let class = usize::from(view.byte_to_class[usize::from(byte)]);
                 let classifier_offset = usize::from(byte) * CLASSIFIER_ENTRY_BYTES;
                 let class_offset = usize::try_from(u32::from_le_bytes(
-                    layout.data
-                        [classifier_offset..classifier_offset + CLASSIFIER_ENTRY_BYTES]
+                    layout.data[classifier_offset..classifier_offset + CLASSIFIER_ENTRY_BYTES]
                         .try_into()
                         .expect("one classifier offset"),
                 ))
@@ -631,9 +847,63 @@ mod tests {
     }
 
     #[test]
-    fn every_bounded_nibble_count_has_exact_unrolled_cross_isa_code_shape() {
+    fn exact_w1_has_one_recurrence_load_and_wider_words_do_not_publish() {
+        let compiled = compiled_sidecar(Target::x86_64_linux());
+        let view = compiled
+            .program()
+            .native_bit_parallel_exists_view()
+            .expect("native W1 view");
+        let layout = build_native_bit_parallel_layout(view).expect("native W1 layout");
+        assert_eq!(layout.source_nibbles, 1);
+        let filter = layout.root_filter.expect("exact root filter");
+        assert!(!filter.ranges().is_empty());
+        assert!(filter.candidate_bytes <= MAX_ROOT_SKIP_CANDIDATE_BYTES);
+        let root_subset = usize::try_from(layout.root & 0x0f).unwrap();
+        for byte in u8::MIN..=u8::MAX {
+            let class = usize::from(view.byte_to_class[usize::from(byte)]);
+            let reached = view.transition_masks[class * NIBBLE_SUBSETS + root_subset];
+            let expected = reached & (ACCEPT_BIT | (CONSUMING_BITS & !layout.root)) != 0;
+            let admitted = filter
+                .ranges()
+                .iter()
+                .any(|range| range.start <= byte && byte <= range.end);
+            assert_eq!(admitted, expected, "root departure byte {byte:#04x}");
+            if !admitted {
+                assert_eq!(reached & ACCEPT_BIT, 0);
+                assert_eq!((reached & CONSUMING_BITS) | layout.root, layout.root);
+            }
+        }
+
+        let avx2 = Target::x86_64_linux()
+            .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+            .unwrap();
+        let x86 = lower_x86_64_bit_parallel(&layout, avx2).expect("x86 W1 leaf");
+        assert_eq!(x86.emitted_nibbles, 1);
+        assert_eq!(count_bytes(&x86.code, &[0x41, 0x8b, 0x04, 0x81]), 1);
+        assert_eq!(count_bytes(&x86.code, &[0xc5, 0xf8, 0x77]), 1);
+        assert_eq!(x86.relocations.len(), 1);
+
+        let asimd = Target::aarch64_macos()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .unwrap();
+        let aarch64 = lower_aarch64_bit_parallel(&layout, asimd).expect("ASIMD W1 leaf");
+        let union_load = aarch64_load_x_lsl3(10, 11, 12).unwrap();
+        let classifier_load = aarch64_load_w_lsl2(11, 5, 12).unwrap();
+        for expected in [union_load, classifier_load] {
+            assert_eq!(
+                aarch64
+                    .code
+                    .chunks_exact(4)
+                    .filter(|bytes| u32::from_le_bytes((*bytes).try_into().unwrap()) == expected)
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(aarch64.emitted_nibbles, 1);
+        assert_eq!(aarch64.relocations.len(), 2);
+
         let byte_to_class = [0_u8; BYTE_VALUES];
-        for source_nibbles in 1..=MAX_BIT_PARALLEL_EXISTS_STATES / NIBBLE_BITS {
+        for source_nibbles in 2..=MAX_BIT_PARALLEL_EXISTS_STATES / NIBBLE_BITS {
             let consuming_states = if source_nibbles == MAX_BIT_PARALLEL_EXISTS_STATES / NIBBLE_BITS
             {
                 63
@@ -644,62 +914,16 @@ mod tests {
             let view = synthetic_view(consuming_states, &byte_to_class, &masks);
             let layout = build_native_bit_parallel_layout(view).expect("synthetic native layout");
             assert_eq!(layout.source_nibbles, source_nibbles);
+            assert!(layout.root_filter.is_none());
             assert_eq!(
                 layout.data.len(),
                 CLASSIFIER_BYTES + source_nibbles * NIBBLE_ROW_BYTES
             );
-
-            let x86 = lower_x86_64_bit_parallel(&layout).expect("x86 leaf");
-            assert_eq!(x86.emitted_nibbles, source_nibbles);
-            assert_eq!(
-                count_bytes(&x86.code, &[0x4a, 0x0b, 0x84, 0xd2]),
-                source_nibbles
+            assert!(
+                lower_native_bit_parallel_exists(view, Target::x86_64_linux())
+                    .unwrap()
+                    .is_none()
             );
-            assert_eq!(count_bytes(&x86.code, &[0x41, 0x8b, 0x04, 0x81]), 1);
-            assert_eq!(count_bytes(&x86.code, &[0x48, 0x69, 0xd0]), 0);
-            assert_eq!(x86.relocations.len(), 1);
-            assert!(x86.code.len() <= MAX_NATIVE_BIT_PARALLEL_CODE_BYTES);
-
-            let aarch64 = lower_aarch64_bit_parallel(&layout).expect("AArch64 leaf");
-            let union_load = aarch64_load_x_lsl3(13, 11, 12).unwrap();
-            let classifier_load = aarch64_load_w_lsl2(11, 5, 12).unwrap();
-            let old_class_multiply = 0x9b00_7c00
-                | aarch64_reg(14, 16).unwrap()
-                | aarch64_reg(12, 5).unwrap()
-                | aarch64_reg(11, 0).unwrap();
-            assert_eq!(
-                aarch64
-                    .code
-                    .chunks_exact(4)
-                    .filter(|bytes| {
-                        u32::from_le_bytes((*bytes).try_into().unwrap()) == classifier_load
-                    })
-                    .count(),
-                1
-            );
-            assert_eq!(
-                aarch64
-                    .code
-                    .chunks_exact(4)
-                    .filter(|bytes| {
-                        u32::from_le_bytes((*bytes).try_into().unwrap()) == old_class_multiply
-                    })
-                    .count(),
-                0
-            );
-            assert_eq!(
-                aarch64
-                    .code
-                    .chunks_exact(4)
-                    .filter(|bytes| {
-                        u32::from_le_bytes((*bytes).try_into().unwrap()) == union_load
-                    })
-                    .count(),
-                source_nibbles
-            );
-            assert_eq!(aarch64.emitted_nibbles, source_nibbles);
-            assert_eq!(aarch64.relocations.len(), 2);
-            assert!(aarch64.code.len() <= MAX_NATIVE_BIT_PARALLEL_CODE_BYTES);
         }
     }
 
@@ -737,101 +961,120 @@ mod tests {
     }
 
     #[test]
-    fn every_target_and_feature_tier_publishes_the_same_self_contained_machine() {
-        let x86_features = [
-            FeatureSet::EMPTY,
-            FeatureSet::of(CpuFeature::X86Sse2),
-            FeatureSet::of(CpuFeature::X86Avx2),
-            FeatureSet::of(CpuFeature::X86Avx512F)
-                .with(CpuFeature::X86Avx512Bw)
-                .with(CpuFeature::X86Avx512Vl),
+    fn publication_receipt_requires_and_names_the_emitted_vector_scanner() {
+        let avx512 = FeatureSet::of(CpuFeature::X86Avx512F)
+            .with(CpuFeature::X86Avx512Bw)
+            .with(CpuFeature::X86Avx512Vl);
+        let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
+        let sve2 = sve.with(CpuFeature::Aarch64Sve2);
+        let mixed_sve2 = FeatureSet::of(CpuFeature::Aarch64Asimd).union(sve2);
+        let targets = [
+            (Target::x86_64_linux(), Some(StartAccelerator::X86Sse2)),
+            (
+                Target::x86_64_macos()
+                    .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                    .unwrap(),
+                Some(StartAccelerator::X86Avx2),
+            ),
+            (
+                Target::x86_64_linux().with_features(avx512).unwrap(),
+                Some(StartAccelerator::X86Avx512Bw),
+            ),
+            (Target::aarch64_linux(), None),
+            (Target::aarch64_macos(), None),
+            (
+                Target::aarch64_macos()
+                    .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                    .unwrap(),
+                Some(StartAccelerator::Aarch64Asimd),
+            ),
+            (
+                Target::aarch64_linux().with_features(sve).unwrap(),
+                Some(StartAccelerator::Aarch64Sve),
+            ),
+            (
+                Target::aarch64_linux().with_features(sve2).unwrap(),
+                Some(StartAccelerator::Aarch64Sve2),
+            ),
+            (
+                Target::aarch64_linux().with_features(mixed_sve2).unwrap(),
+                Some(StartAccelerator::Aarch64Sve2),
+            ),
+            (Target::aarch64_macos().with_features(sve2).unwrap(), None),
+            (
+                Target::aarch64_macos().with_features(mixed_sve2).unwrap(),
+                Some(StartAccelerator::Aarch64Asimd),
+            ),
         ];
-        let arm_features = [
-            FeatureSet::EMPTY,
-            FeatureSet::of(CpuFeature::Aarch64Asimd),
-            FeatureSet::of(CpuFeature::Aarch64Sve),
-            FeatureSet::of(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2),
-            FeatureSet::of(CpuFeature::Aarch64Asimd)
-                .with(CpuFeature::Aarch64Sve)
-                .with(CpuFeature::Aarch64Sve2),
-        ];
-        let mut targets = Vec::new();
-        for base in [Target::x86_64_linux(), Target::x86_64_macos()] {
-            for features in x86_features {
-                targets.push(base.with_features(features).unwrap());
-            }
-        }
-        for base in [Target::aarch64_linux(), Target::aarch64_macos()] {
-            for features in arm_features {
-                targets.push(base.with_features(features).unwrap());
-            }
-        }
 
-        let mut canonical_data = None::<Vec<u8>>;
-        for target in targets {
+        let mut canonical_native_data = None::<Vec<u8>>;
+        for (target, expected_accelerator) in targets {
             let compiled = compiled_sidecar(target);
-            assert!(!compiled.receipt().runtime_helper_required, "{target:?}");
-            assert!(
+            let native = expected_accelerator.is_some();
+            assert_eq!(
+                compiled.receipt().runtime_helper_required,
+                !native,
+                "{target:?}"
+            );
+            assert_eq!(
                 compiled.module().required_runtime_symbol().is_none(),
+                native,
                 "{target:?}"
             );
             assert_eq!(
                 compiled.module().start_accelerator(),
-                StartAccelerator::None
+                expected_accelerator.unwrap_or(StartAccelerator::None),
+                "{target:?}"
             );
             assert_eq!(compiled.module().anchored_prefix_filter_bytes(), 0);
             let data = compiled.module().sections()[1].bytes();
-            let view = compiled
-                .program()
-                .native_bit_parallel_exists_view()
-                .expect("native view");
-            assert_eq!(
-                data.len(),
-                CLASSIFIER_BYTES + view.stats.transition_entries * core::mem::size_of::<u64>()
-            );
-            if let Some(expected) = &canonical_data {
-                assert_eq!(
-                    data, expected,
-                    "target-private table changed for {target:?}"
-                );
-            } else {
-                canonical_data = Some(data.to_vec());
+            if native {
+                if let Some(expected) = &canonical_native_data {
+                    assert_eq!(
+                        data, expected,
+                        "target-private table changed for {target:?}"
+                    );
+                } else {
+                    canonical_native_data = Some(data.to_vec());
+                }
             }
             assert!(compiled.module().relocations().iter().all(|relocation| {
                 relocation.section == TEXT_SECTION
-                    && relocation.symbol == PROGRAM_SYMBOL
+                    && (!native || relocation.symbol == PROGRAM_SYMBOL)
                     && usize::try_from(relocation.offset)
                         .is_ok_and(|offset| offset < compiled.module().code_bytes())
             }));
-            match target.architecture {
-                Architecture::X86_64 => assert_eq!(
-                    compiled
-                        .module()
-                        .relocations()
-                        .iter()
-                        .map(|relocation| relocation.kind)
-                        .collect::<Vec<_>>(),
-                    [RelocationKind::X86PcRelative32]
-                ),
-                Architecture::Aarch64 => assert_eq!(
-                    compiled
-                        .module()
-                        .relocations()
-                        .iter()
-                        .map(|relocation| relocation.kind)
-                        .collect::<Vec<_>>(),
-                    [
-                        RelocationKind::Aarch64Page21,
-                        RelocationKind::Aarch64PageOff12
-                    ]
-                ),
+            if native {
+                match target.architecture {
+                    Architecture::X86_64 => assert_eq!(
+                        compiled
+                            .module()
+                            .relocations()
+                            .iter()
+                            .map(|relocation| relocation.kind)
+                            .collect::<Vec<_>>(),
+                        [RelocationKind::X86PcRelative32]
+                    ),
+                    Architecture::Aarch64 => assert_eq!(
+                        compiled
+                            .module()
+                            .relocations()
+                            .iter()
+                            .map(|relocation| relocation.kind)
+                            .collect::<Vec<_>>(),
+                        [
+                            RelocationKind::Aarch64Page21,
+                            RelocationKind::Aarch64PageOff12
+                        ]
+                    ),
+                }
             }
 
             let bytes = compiled.program().serialize().expect("serialize sidecar");
             let restored = CompiledProgram::deserialize(&bytes).expect("restore sidecar");
             let restored_module = super::super::CompiledModule::lower(&restored, target)
                 .expect("lower restored sidecar");
-            assert!(restored_module.required_runtime_symbol().is_none());
+            assert_eq!(restored_module.required_runtime_symbol().is_none(), native);
             assert_eq!(restored_module.sections()[1].bytes(), data);
             assert_eq!(
                 restored_module.relocations(),
@@ -979,8 +1222,12 @@ mod tests {
             }
         } else if cfg!(target_os = "linux") {
             Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap()
         } else {
             Target::aarch64_macos()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap()
         };
         run_linked_bit_parallel_differential(target, false);
     }
