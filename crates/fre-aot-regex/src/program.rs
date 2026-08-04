@@ -1631,7 +1631,13 @@ impl NfaMandatorySuffix {
 /// first byte of every alternative reconstructs that necessary set even when
 /// later paths branch or cycle. Absence of every set member from a semantic
 /// search window is a complete no-match proof for every output contract. A
-/// hit proves nothing and immediately hands the original window to K0.
+/// hit alone does not prove a match. When a separate graph proof bounds every
+/// match to at most `M` consumed bytes, however, the first set member at `p`
+/// proves that no match can start before `p + 1 - M`: every match contains a
+/// member at or after `p`. The ordered NFA (or retained rows before it) can
+/// therefore continue from that narrowed lower boundary without changing
+/// leftmost or priority semantics. An unavailable bound or malformed scanner
+/// fails open to the original window.
 #[derive(Clone, Debug)]
 struct NfaMandatoryCut {
     root_state: u32,
@@ -1653,6 +1659,19 @@ enum NfaMandatoryCutScanner {
         set: ByteSet256,
         classifier: ByteSetClassifier,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NfaMandatoryCutScan {
+    Member(usize),
+    Exhausted,
+    Fallback,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NfaMandatoryCutOutcome {
+    Complete(MatchResult),
+    Continue(SearchWindow),
 }
 
 impl NfaMandatoryCutScanner {
@@ -1790,37 +1809,49 @@ impl NfaMandatoryCut {
         (self.cardinality, tier, self.root_state, words)
     }
 
-    fn has_member(&self, haystack: &[u8]) -> bool {
+    fn first_member(&self, haystack: &[u8]) -> NfaMandatoryCutScan {
         match &self.scanner {
-            NfaMandatoryCutScanner::Small { bytes, count: 1 } => {
-                memchr(bytes[0], haystack).is_some()
-            }
+            NfaMandatoryCutScanner::Small { bytes, count: 1 } => memchr(bytes[0], haystack)
+                .map_or(NfaMandatoryCutScan::Exhausted, NfaMandatoryCutScan::Member),
             NfaMandatoryCutScanner::Small { bytes, count: 2 } => {
-                memchr2(bytes[0], bytes[1], haystack).is_some()
+                memchr2(bytes[0], bytes[1], haystack)
+                    .map_or(NfaMandatoryCutScan::Exhausted, NfaMandatoryCutScan::Member)
             }
             NfaMandatoryCutScanner::Small { bytes, count: 3 } => {
-                memchr3(bytes[0], bytes[1], bytes[2], haystack).is_some()
+                memchr3(bytes[0], bytes[1], bytes[2], haystack)
+                    .map_or(NfaMandatoryCutScan::Exhausted, NfaMandatoryCutScan::Member)
             }
             // A malformed internal count must fail open to the ordered NFA.
-            NfaMandatoryCutScanner::Small { .. } => true,
+            NfaMandatoryCutScanner::Small { .. } => NfaMandatoryCutScan::Fallback,
             NfaMandatoryCutScanner::Ascii { set, classifier } => {
-                scan_ascii_cut(*set, classifier, haystack)
+                find_ascii_cut(*set, classifier, haystack)
+                    .map_or(NfaMandatoryCutScan::Exhausted, NfaMandatoryCutScan::Member)
             }
             NfaMandatoryCutScanner::Full { set, classifier } => {
-                scan_full_cut(*set, classifier, haystack)
+                find_full_cut(*set, classifier, haystack)
+                    .map_or(NfaMandatoryCutScan::Exhausted, NfaMandatoryCutScan::Member)
             }
         }
     }
+
+    #[cfg(test)]
+    fn has_member(&self, haystack: &[u8]) -> bool {
+        !matches!(self.first_member(haystack), NfaMandatoryCutScan::Exhausted)
+    }
 }
 
-fn scan_ascii_cut(set: AsciiByteSet, classifier: &AsciiByteSetClassifier, haystack: &[u8]) -> bool {
+fn find_ascii_cut(
+    set: AsciiByteSet,
+    classifier: &AsciiByteSetClassifier,
+    haystack: &[u8],
+) -> Option<usize> {
     let prefix_end = haystack.len().min(NFA_MANDATORY_CUT_SCALAR_PREFIX_BYTES);
-    if haystack[..prefix_end]
+    if let Some(position) = haystack[..prefix_end]
         .iter()
         .copied()
-        .any(|byte| set.contains(byte))
+        .position(|byte| set.contains(byte))
     {
-        return true;
+        return Some(position);
     }
     let mut position = prefix_end;
     while haystack.len().saturating_sub(position) >= ASCII_WIDE_BYTES {
@@ -1830,8 +1861,9 @@ fn scan_ascii_cut(set: AsciiByteSet, classifier: &AsciiByteSetClassifier, haysta
         let block: &[u8; ASCII_WIDE_BYTES] = haystack[position..end]
             .try_into()
             .expect("checked ASCII cut block width");
-        if classifier.classify_32(block).member_mask() != 0 {
-            return true;
+        let mask = classifier.classify_32(block).member_mask();
+        if mask != 0 {
+            return position.checked_add(usize::try_from(mask.trailing_zeros()).ok()?);
         }
         position = end;
     }
@@ -1842,25 +1874,31 @@ fn scan_ascii_cut(set: AsciiByteSet, classifier: &AsciiByteSetClassifier, haysta
         let block: &[u8; ASCII_NARROW_BYTES] = haystack[position..end]
             .try_into()
             .expect("checked narrow ASCII cut block width");
-        if classifier.classify_16(block).member_mask() != 0 {
-            return true;
+        let mask = classifier.classify_16(block).member_mask();
+        if mask != 0 {
+            return position.checked_add(usize::try_from(mask.trailing_zeros()).ok()?);
         }
         position = end;
     }
     haystack[position..]
         .iter()
         .copied()
-        .any(|byte| set.contains(byte))
+        .position(|byte| set.contains(byte))
+        .and_then(|offset| position.checked_add(offset))
 }
 
-fn scan_full_cut(set: ByteSet256, classifier: &ByteSetClassifier, haystack: &[u8]) -> bool {
+fn find_full_cut(
+    set: ByteSet256,
+    classifier: &ByteSetClassifier,
+    haystack: &[u8],
+) -> Option<usize> {
     let prefix_end = haystack.len().min(NFA_MANDATORY_CUT_SCALAR_PREFIX_BYTES);
-    if haystack[..prefix_end]
+    if let Some(position) = haystack[..prefix_end]
         .iter()
         .copied()
-        .any(|byte| set.contains(byte))
+        .position(|byte| set.contains(byte))
     {
-        return true;
+        return Some(position);
     }
     let mut position = prefix_end;
     while haystack.len().saturating_sub(position) >= BYTE_SET_WIDE_BLOCK_BYTES {
@@ -1870,8 +1908,9 @@ fn scan_full_cut(set: ByteSet256, classifier: &ByteSetClassifier, haystack: &[u8
         let block: &[u8; BYTE_SET_WIDE_BLOCK_BYTES] = haystack[position..end]
             .try_into()
             .expect("checked full-byte cut block width");
-        if classifier.classify_32(block).member_mask() != 0 {
-            return true;
+        let mask = classifier.classify_32(block).member_mask();
+        if mask != 0 {
+            return position.checked_add(usize::try_from(mask.trailing_zeros()).ok()?);
         }
         position = end;
     }
@@ -1882,15 +1921,17 @@ fn scan_full_cut(set: ByteSet256, classifier: &ByteSetClassifier, haystack: &[u8
         let block: &[u8; BYTE_SET_BLOCK_BYTES] = haystack[position..end]
             .try_into()
             .expect("checked narrow full-byte cut block width");
-        if classifier.classify_16(block).member_mask() != 0 {
-            return true;
+        let mask = classifier.classify_16(block).member_mask();
+        if mask != 0 {
+            return position.checked_add(usize::try_from(mask.trailing_zeros()).ok()?);
         }
         position = end;
     }
     haystack[position..]
         .iter()
         .copied()
-        .any(|byte| set.contains(byte))
+        .position(|byte| set.contains(byte))
+        .and_then(|offset| position.checked_add(offset))
 }
 
 #[derive(Clone, Debug)]
@@ -3039,14 +3080,15 @@ impl CompiledProgram {
     fn search_nfa(
         &self,
         haystack: &[u8],
-        window: SearchWindow,
+        mut window: SearchWindow,
         workspace: &mut K0Workspace,
     ) -> Result<MatchResult, CompileError> {
         if let Some(found) = self.search_nfa_with_mandatory_suffix(haystack, window, workspace)? {
             return Ok(found);
         }
-        if let Some(found) = self.search_nfa_with_mandatory_cut(haystack, window) {
-            return Ok(found);
+        match self.search_nfa_with_mandatory_cut(haystack, window) {
+            NfaMandatoryCutOutcome::Complete(found) => return Ok(found),
+            NfaMandatoryCutOutcome::Continue(narrowed) => window = narrowed,
         }
         self.search_nfa_unaccelerated(haystack, window, workspace)
     }
@@ -3070,18 +3112,20 @@ impl CompiledProgram {
             .ok_or(CompileError::InternalInvariant(
                 "partial-DFA program workspace has no K0 storage",
             ))?;
-        if let Some(found) =
-            self.search_nfa_with_retained_complete_accelerators(haystack, window, nfa)?
-        {
-            #[cfg(test)]
-            if let Some(partial_workspace) = workspace.partial.as_deref_mut() {
-                partial_workspace.state.complete_accelerated = partial_workspace
-                    .state
-                    .complete_accelerated
-                    .saturating_add(1);
-            }
-            return Ok(found);
-        }
+        let window =
+            match self.search_nfa_with_retained_complete_accelerators(haystack, window, nfa)? {
+                NfaMandatoryCutOutcome::Complete(found) => {
+                    #[cfg(test)]
+                    if let Some(partial_workspace) = workspace.partial.as_deref_mut() {
+                        partial_workspace.state.complete_accelerated = partial_workspace
+                            .state
+                            .complete_accelerated
+                            .saturating_add(1);
+                    }
+                    return Ok(found);
+                }
+                NfaMandatoryCutOutcome::Continue(narrowed) => narrowed,
+            };
         let Some(partial_workspace) = workspace.partial.as_deref_mut() else {
             // Keep this defensive path exact without sharing the ordinary hot
             // entry. Public artifact identity normally prevents a workspace
@@ -3111,24 +3155,28 @@ impl CompiledProgram {
         haystack: &[u8],
         window: SearchWindow,
         workspace: &mut K0Workspace,
-    ) -> Result<Option<MatchResult>, CompileError> {
+    ) -> Result<NfaMandatoryCutOutcome, CompileError> {
         if let Some(found) = self.search_nfa_with_mandatory_suffix(haystack, window, workspace)? {
-            return Ok(Some(found));
+            return Ok(NfaMandatoryCutOutcome::Complete(found));
         }
         Ok(self.search_nfa_with_mandatory_cut(haystack, window))
     }
 
     /// Try the mutually exclusive graph-proved forward sidecar. An exact
-    /// product returns a complete result; an ordinary mandatory-cut member is
-    /// deliberately inconclusive and leaves the window to the ordered NFA.
+    /// product returns a complete result. An ordinary mandatory-cut member is
+    /// deliberately inconclusive, but its first position and a finite global
+    /// match-width proof can raise the window's lower boundary before the
+    /// ordered NFA or retained partial rows execute.
     fn search_nfa_with_mandatory_cut(
         &self,
         haystack: &[u8],
         window: SearchWindow,
-    ) -> Option<MatchResult> {
-        let accelerator = self.nfa_mandatory_cut.as_ref()?;
+    ) -> NfaMandatoryCutOutcome {
+        let Some(accelerator) = self.nfa_mandatory_cut.as_ref() else {
+            return NfaMandatoryCutOutcome::Continue(window);
+        };
         if let Some(product) = accelerator.exact_product() {
-            return Some(product.search(
+            return NfaMandatoryCutOutcome::Complete(product.search(
                 &accelerator.scanner,
                 &self.anchored_prefix,
                 haystack,
@@ -3136,14 +3184,38 @@ impl CompiledProgram {
                 self.output,
             ));
         }
-        let source = haystack.get(window.start..window.end)?;
-        if accelerator.has_member(source) {
-            return None;
+        let Some(source) = haystack.get(window.start..window.end) else {
+            return NfaMandatoryCutOutcome::Continue(window);
+        };
+        let relative = match accelerator.first_member(source) {
+            NfaMandatoryCutScan::Member(relative) => relative,
+            NfaMandatoryCutScan::Fallback => {
+                return NfaMandatoryCutOutcome::Continue(window);
+            }
+            NfaMandatoryCutScan::Exhausted => {
+                return NfaMandatoryCutOutcome::Complete(match self.output {
+                    OutputContract::Exists => MatchResult::Exists(false),
+                    OutputContract::SelectedEnd => MatchResult::SelectedEnd(None),
+                    OutputContract::Span => MatchResult::Span(None),
+                });
+            }
+        };
+        let Some(maximum_width) = self.max_match_width.width.filter(|&width| width != 0) else {
+            return NfaMandatoryCutOutcome::Continue(window);
+        };
+        let Some(member) = window.start.checked_add(relative) else {
+            return NfaMandatoryCutOutcome::Continue(window);
+        };
+        let Some(after_member) = member.checked_add(1) else {
+            return NfaMandatoryCutOutcome::Continue(window);
+        };
+        let narrowed_start = after_member.saturating_sub(maximum_width).max(window.start);
+        if narrowed_start > window.end {
+            return NfaMandatoryCutOutcome::Continue(window);
         }
-        Some(match self.output {
-            OutputContract::Exists => MatchResult::Exists(false),
-            OutputContract::SelectedEnd => MatchResult::SelectedEnd(None),
-            OutputContract::Span => MatchResult::Span(None),
+        NfaMandatoryCutOutcome::Continue(SearchWindow {
+            start: narrowed_start,
+            end: window.end,
         })
     }
 
@@ -7352,6 +7424,192 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        clippy::type_complexity,
+        reason = "all scanner tiers, contracts, windows, wire reconstruction, the exact narrowing boundary, and malformed fail-open behavior form one differential proof"
+    )]
+    fn finite_mandatory_cut_narrows_every_scanner_tier_and_preserves_every_window() {
+        const SMALL: u8 = 0;
+        const ASCII: u8 = 1;
+        const FULL: u8 = 2;
+
+        let limits = DeterminizeLimits {
+            max_states: 0,
+            ..DeterminizeLimits::default()
+        };
+        let cases: &[(&str, &[u8], &[u8], u16, u8)] = &[
+            ("(?:x|yz)7[A-Za-z]{1,2}", b"xyz7A!", b"yz7AA", 1, SMALL),
+            (
+                "(?:[A-Z]|[a-z][0-9])[QR][0-9]{1,2}",
+                b"Aa0QR!",
+                b"a0Q0",
+                2,
+                SMALL,
+            ),
+            (
+                "(?:[A-Z]|[a-z][0-9])[QWE][0-9]{1,2}",
+                b"Aa0QWE!",
+                b"a0W0",
+                3,
+                SMALL,
+            ),
+            (
+                "(?:[A-Z]|[a-z][0-9])[QWER][0-9]{1,2}",
+                b"Aa0QWER!",
+                b"a0R0",
+                4,
+                ASCII,
+            ),
+            (
+                r"(?-u:(?:[A-Z]|[a-z][0-9])[\x80-\x83][0-9]{1,2})",
+                &[b'A', b'a', b'0', 0x80, 0x83, b'!'],
+                &[b'a', b'0', 0x80, b'0'],
+                4,
+                FULL,
+            ),
+        ];
+
+        for &(pattern, alphabet, witness, cardinality, tier) in cases {
+            let mut haystacks = generated_byte_strings(alphabet, 4);
+            for output in [
+                OutputContract::Exists,
+                OutputContract::SelectedEnd,
+                OutputContract::Span,
+            ] {
+                let accelerated = program(pattern, output, CompileMode::Optimizing, limits);
+                assert_eq!(
+                    accelerated.engine_kind(),
+                    EngineKind::OrderedNfa,
+                    "{pattern}"
+                );
+                assert!(accelerated.nfa_mandatory_suffix.is_none(), "{pattern}");
+                let maximum_width = accelerated
+                    .max_match_width()
+                    .unwrap_or_else(|| panic!("missing finite width for {pattern}"));
+                let cut = accelerated
+                    .nfa_mandatory_cut
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("missing mandatory cut for {pattern}"));
+                assert!(cut.exact_product().is_none(), "{pattern}");
+                assert_eq!(cut.cardinality, cardinality, "{pattern}");
+                match (&cut.scanner, tier) {
+                    (NfaMandatoryCutScanner::Small { count, .. }, SMALL) => {
+                        assert_eq!(u16::from(*count), cardinality, "{pattern}");
+                    }
+                    (NfaMandatoryCutScanner::Ascii { .. }, ASCII)
+                    | (NfaMandatoryCutScanner::Full { .. }, FULL) => {}
+                    (scanner, _) => panic!("wrong scanner tier for {pattern}: {scanner:?}"),
+                }
+
+                let miss = (u8::MIN..=u8::MAX)
+                    .find(|&byte| cut.first_member(&[byte]) == NfaMandatoryCutScan::Exhausted)
+                    .expect("selective cut has a nonmember");
+                let member = (u8::MIN..=u8::MAX)
+                    .find(|&byte| cut.first_member(&[byte]) == NfaMandatoryCutScan::Member(0))
+                    .expect("nonempty cut has a member");
+                let mut boundary_probe = vec![miss; maximum_width + 12];
+                let window = SearchWindow::new(2, boundary_probe.len() - 1);
+                let member_position = maximum_width + 5;
+                boundary_probe[member_position] = member;
+                let narrowed = SearchWindow::new(
+                    member_position
+                        .saturating_add(1)
+                        .saturating_sub(maximum_width)
+                        .max(window.start),
+                    window.end,
+                );
+                assert!(narrowed.start > window.start, "{pattern}");
+                assert_eq!(
+                    accelerated.search_nfa_with_mandatory_cut(&boundary_probe, window),
+                    NfaMandatoryCutOutcome::Continue(narrowed),
+                    "fresh {pattern}/{output:?}"
+                );
+
+                let serialized = accelerated.serialize().expect("serialize finite cut");
+                let restored =
+                    CompiledProgram::deserialize(&serialized).expect("restore finite cut");
+                assert_eq!(restored.max_match_width(), Some(maximum_width));
+                assert_eq!(
+                    restored.search_nfa_with_mandatory_cut(&boundary_probe, window),
+                    NfaMandatoryCutOutcome::Continue(narrowed),
+                    "wire {pattern}/{output:?}"
+                );
+
+                let mut reference = accelerated.clone();
+                reference.nfa_mandatory_cut = None;
+                let mut malformed = accelerated.clone();
+                let malformed_cut = malformed
+                    .nfa_mandatory_cut
+                    .as_mut()
+                    .expect("cut to corrupt");
+                malformed_cut.scanner = NfaMandatoryCutScanner::Small {
+                    bytes: [member, 0, 0],
+                    count: 0,
+                };
+                assert_eq!(
+                    malformed.search_nfa_with_mandatory_cut(&boundary_probe, window),
+                    NfaMandatoryCutOutcome::Continue(window),
+                    "malformed scanner must fail open for {pattern}/{output:?}"
+                );
+
+                let mut late_match = vec![miss; maximum_width + 8];
+                late_match.extend_from_slice(witness);
+                haystacks.push(boundary_probe.clone());
+                haystacks.push(late_match);
+                let mut accelerated_workspace = accelerated.prepare_workspace().unwrap();
+                let mut restored_workspace = restored.prepare_workspace().unwrap();
+                let mut reference_workspace = reference.prepare_workspace().unwrap();
+                let mut malformed_workspace = malformed.prepare_workspace().unwrap();
+                for haystack in &haystacks {
+                    for start in 0..=haystack.len() {
+                        for end in start..=haystack.len() {
+                            let window = SearchWindow::new(start, end);
+                            let expected = reference
+                                .search_with_workspace(haystack, window, &mut reference_workspace)
+                                .unwrap();
+                            assert_eq!(
+                                accelerated
+                                    .search_with_workspace(
+                                        haystack,
+                                        window,
+                                        &mut accelerated_workspace,
+                                    )
+                                    .unwrap(),
+                                expected,
+                                "fresh {pattern}/{output:?}/{haystack:?}/{start}..{end}"
+                            );
+                            assert_eq!(
+                                restored
+                                    .search_with_workspace(
+                                        haystack,
+                                        window,
+                                        &mut restored_workspace,
+                                    )
+                                    .unwrap(),
+                                expected,
+                                "wire {pattern}/{output:?}/{haystack:?}/{start}..{end}"
+                            );
+                            assert_eq!(
+                                malformed
+                                    .search_with_workspace(
+                                        haystack,
+                                        window,
+                                        &mut malformed_workspace,
+                                    )
+                                    .unwrap(),
+                                expected,
+                                "fail-open {pattern}/{output:?}/{haystack:?}/{start}..{end}"
+                            );
+                        }
+                    }
+                }
+                haystacks.truncate(haystacks.len().saturating_sub(2));
+            }
+        }
+    }
+
+    #[test]
     fn mandatory_cut_classifiers_cover_every_block_boundary() {
         let limits = DeterminizeLimits {
             max_states: 0,
@@ -7388,6 +7646,130 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "every scanner tier, source alignment, block extent, member position, and malformed count form one boundary proof"
+    )]
+    fn mandatory_cut_scanners_return_the_first_member_at_every_block_boundary() {
+        fn words(bytes: &[u8]) -> [u64; 4] {
+            let mut words = [0_u64; 4];
+            for &byte in bytes {
+                let index = usize::from(byte);
+                words[index / 64] |= 1_u64 << (index % 64);
+            }
+            words
+        }
+
+        let ascii_words = words(&[1, 17, 65, 126]);
+        let ascii_set = AsciiByteSet::from_words([ascii_words[0], ascii_words[1]]);
+        let full_words = words(&[1, 17, 128, 254]);
+        let full_set = ByteSet256::from_words(full_words);
+        let scanners = [
+            (
+                "small-1",
+                NfaMandatoryCutScanner::Small {
+                    bytes: [1, 0, 0],
+                    count: 1,
+                },
+                vec![1],
+            ),
+            (
+                "small-2",
+                NfaMandatoryCutScanner::Small {
+                    bytes: [1, 17, 0],
+                    count: 2,
+                },
+                vec![1, 17],
+            ),
+            (
+                "small-3",
+                NfaMandatoryCutScanner::Small {
+                    bytes: [1, 17, 200],
+                    count: 3,
+                },
+                vec![1, 17, 200],
+            ),
+            (
+                "ascii",
+                NfaMandatoryCutScanner::Ascii {
+                    set: ascii_set,
+                    classifier: AsciiByteSetClassifier::new(ascii_set),
+                },
+                vec![1, 17, 65, 126],
+            ),
+            (
+                "full",
+                NfaMandatoryCutScanner::Full {
+                    set: full_set,
+                    classifier: ByteSetClassifier::new(full_set),
+                },
+                vec![1, 17, 128, 254],
+            ),
+        ];
+
+        // Vary both the slice address and extent through the scalar prefix,
+        // 16-byte classifier, 32-byte classifier, and scalar-tail boundaries.
+        for (name, scanner, members) in scanners {
+            let cut = NfaMandatoryCut {
+                root_state: 0,
+                cardinality: u16::try_from(members.len()).unwrap(),
+                scanner,
+            };
+            for alignment in 0..32 {
+                let mut storage = vec![u8::MAX; alignment + 96];
+                for length in 0..=96 {
+                    let source = &storage[alignment..alignment + length];
+                    assert_eq!(
+                        cut.first_member(source),
+                        NfaMandatoryCutScan::Exhausted,
+                        "{name}/alignment={alignment}/length={length}/miss"
+                    );
+                    for position in 0..length {
+                        for &member in &members {
+                            storage[alignment + position] = member;
+                            let source = &storage[alignment..alignment + length];
+                            assert_eq!(
+                                cut.first_member(source),
+                                NfaMandatoryCutScan::Member(position),
+                                "{name}/alignment={alignment}/length={length}/position={position}/member={member}"
+                            );
+                            storage[alignment + position] = u8::MAX;
+                        }
+                    }
+                    if length >= 2 {
+                        storage[alignment] = members[0];
+                        storage[alignment + length - 1] = *members.last().unwrap();
+                        let source = &storage[alignment..alignment + length];
+                        assert_eq!(
+                            cut.first_member(source),
+                            NfaMandatoryCutScan::Member(0),
+                            "{name}/alignment={alignment}/length={length}/first-of-two"
+                        );
+                        storage[alignment] = u8::MAX;
+                        storage[alignment + length - 1] = u8::MAX;
+                    }
+                }
+            }
+        }
+
+        for count in [0_u8, 4, u8::MAX] {
+            let malformed = NfaMandatoryCut {
+                root_state: 0,
+                cardinality: 3,
+                scanner: NfaMandatoryCutScanner::Small {
+                    bytes: [1, 17, 200],
+                    count,
+                },
+            };
+            assert_eq!(malformed.first_member(&[]), NfaMandatoryCutScan::Fallback);
+            assert_eq!(
+                malformed.first_member(&[1, 17, 200]),
+                NfaMandatoryCutScan::Fallback
+            );
         }
     }
 
@@ -8925,6 +9307,165 @@ mod tests {
         assert_eq!(state.resumed, 0);
         assert_eq!(state.consecutive_fallbacks, 0);
         assert_eq!(state.bypass_remaining, 0);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "all contracts, dynamic retained-row admission, wire reconstruction, exact narrowing, and authenticated resume form one composition proof"
+    )]
+    fn finite_mandatory_cut_narrows_before_retained_rows_for_every_contract() {
+        let pattern = r"[b-c][a-b]{1,10}7[A-Za-z]{1,2}";
+        let witness_start = PARTIAL_DFA_MIN_INPUT_BYTES + 16;
+        let mut haystack = vec![b'!'; witness_start];
+        haystack.extend_from_slice(b"cbbbbbbbbbb7AZ");
+        let original = SearchWindow::new(3, haystack.len());
+
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let limited = (2..=128)
+                .find_map(|max_states| {
+                    let candidate = program(
+                        pattern,
+                        output,
+                        CompileMode::Optimizing,
+                        DeterminizeLimits {
+                            max_states,
+                            ..DeterminizeLimits::default()
+                        },
+                    );
+                    let maximum_width = candidate.max_match_width()?;
+                    let cut = candidate.nfa_mandatory_cut.as_ref()?;
+                    if candidate.nfa_mandatory_suffix.is_some()
+                        || cut.exact_product().is_some()
+                        || cut.cardinality != 1
+                    {
+                        return None;
+                    }
+                    let NfaMandatoryCutOutcome::Continue(narrowed) =
+                        candidate.search_nfa_with_mandatory_cut(&haystack, original)
+                    else {
+                        return None;
+                    };
+                    if narrowed.start <= original.start {
+                        return None;
+                    }
+                    let partial = candidate.partial_dfa()?;
+                    let (prefix_plan, supported) =
+                        PartialDfaPrefixPlan::derive(candidate.anchored_prefix.sets());
+                    if !supported {
+                        return None;
+                    }
+                    let resumes = match output {
+                        OutputContract::Exists => matches!(
+                            partial.exists(
+                                &haystack,
+                                narrowed.start,
+                                narrowed.end,
+                                candidate.anchored_prefix.sets(),
+                                prefix_plan,
+                            ),
+                            Ok(PartialDfaResult::Resume(_))
+                        ),
+                        OutputContract::SelectedEnd => matches!(
+                            partial.selected_end(
+                                &haystack,
+                                narrowed.start,
+                                narrowed.end,
+                                candidate.anchored_prefix.sets(),
+                                prefix_plan,
+                            ),
+                            Ok(PartialDfaResult::Resume(_))
+                        ),
+                        OutputContract::Span => matches!(
+                            partial.selected_span_end(
+                                &haystack,
+                                narrowed.start,
+                                narrowed.end,
+                                candidate.anchored_prefix.sets(),
+                                prefix_plan,
+                            ),
+                            Ok(PartialDfaResult::Resume(_))
+                        ),
+                    };
+                    resumes.then_some((candidate, maximum_width, narrowed))
+                })
+                .unwrap_or_else(|| panic!("no retained finite-cut resume for {output:?}"));
+            let (limited, maximum_width, narrowed) = limited;
+            let member_position = witness_start + 11;
+            assert_eq!(
+                narrowed,
+                SearchWindow::new(
+                    (member_position + 1)
+                        .saturating_sub(maximum_width)
+                        .max(original.start),
+                    original.end,
+                ),
+                "{output:?}"
+            );
+            assert!(narrowed.start <= witness_start, "{output:?}");
+
+            let bytes = limited.serialize().expect("serialize retained finite cut");
+            assert_eq!(
+                bytes[15],
+                PROGRAM_FLAG_NFA_MANDATORY_CUT | PROGRAM_FLAG_NFA_PARTIAL_DFA,
+                "{output:?}"
+            );
+            let restored =
+                CompiledProgram::deserialize(&bytes).expect("restore retained finite cut");
+            assert_eq!(
+                restored.search_nfa_with_mandatory_cut(&haystack, original),
+                NfaMandatoryCutOutcome::Continue(narrowed),
+                "{output:?}"
+            );
+
+            let reference = program(
+                pattern,
+                output,
+                CompileMode::Fast,
+                DeterminizeLimits::default(),
+            );
+            let expected = reference.search(&haystack, original).unwrap();
+            let mut limited_workspace = limited.prepare_workspace().unwrap();
+            let mut restored_workspace = restored.prepare_workspace().unwrap();
+            assert_eq!(
+                limited
+                    .search_optimized_with_workspace(&haystack, original, &mut limited_workspace,)
+                    .unwrap(),
+                expected,
+                "fresh {output:?}"
+            );
+            assert_eq!(
+                restored
+                    .search_optimized_with_workspace(&haystack, original, &mut restored_workspace,)
+                    .unwrap(),
+                expected,
+                "wire {output:?}"
+            );
+            assert_eq!(
+                limited_workspace
+                    .partial
+                    .as_deref()
+                    .expect("fresh retained workspace")
+                    .state
+                    .resumed,
+                1,
+                "fresh {output:?} did not resume after narrowing"
+            );
+            assert_eq!(
+                restored_workspace
+                    .partial
+                    .as_deref()
+                    .expect("wire retained workspace")
+                    .state
+                    .resumed,
+                1,
+                "wire {output:?} did not resume after narrowing"
+            );
+        }
     }
 
     #[test]
