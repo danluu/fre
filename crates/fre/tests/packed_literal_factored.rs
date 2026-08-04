@@ -21,6 +21,23 @@ fn fixed_width_alternation(count: usize, width: usize) -> String {
     format!("(?:{})", words.join("|"))
 }
 
+fn cartesian_alternation(columns: &[&[u8]]) -> String {
+    let mut words = vec![String::new()];
+    for column in columns {
+        let mut next = Vec::with_capacity(words.len().saturating_mul(column.len()));
+        for prefix in &words {
+            for &byte in *column {
+                assert!(byte.is_ascii());
+                let mut word = prefix.clone();
+                word.push(char::from(byte));
+                next.push(word);
+            }
+        }
+        words = next;
+    }
+    format!("(?:{})", words.join("|"))
+}
+
 fn build(pattern: &str) -> fre::PortableRegex {
     PortableBuilder::new(pattern)
         .unicode(false)
@@ -53,7 +70,8 @@ fn planner_requires_a_complete_column_proof_above_the_teddy_boundary() {
             "{count} correlated four-byte alternatives"
         );
     }
-    let factored_65 = build(r"[a-e][A-M]Qx");
+    let factored_65_source = cartesian_alternation(&[b"abcde", b"ABCDEFGHIJKLM", b"Q", b"x"]);
+    let factored_65 = build(&factored_65_source);
     assert_eq!(factored_65.build_report().plan, PlanKind::PackedLiteralSet);
     assert!(is_factored(&factored_65));
 
@@ -70,14 +88,15 @@ fn planner_requires_a_complete_column_proof_above_the_teddy_boundary() {
     let shallow_filter = build(&fixed_width_alternation(65, 3));
     assert_eq!(shallow_filter.build_report().plan, PlanKind::LiteralSetDfa);
 
-    let cartesian = build(r"[a-f][0-5]Q[xy]");
+    let cartesian_source = cartesian_alternation(&[b"abcdef", b"012345", b"Q", b"xy"]);
+    let cartesian = build(&cartesian_source);
     assert_eq!(cartesian.build_report().plan, PlanKind::PackedLiteralSet);
     assert!(is_factored(&cartesian));
 }
 
 #[test]
 fn factored_route_matches_rust_regex_on_hits_misses_and_malformed_bytes() {
-    let source = r"[m-r][3-8]T[uv]";
+    let source = cartesian_alternation(&[b"mnopqr", b"345678", b"T", b"uv"]);
     let fre = build(&source);
     assert_eq!(fre.build_report().plan, PlanKind::PackedLiteralSet);
     assert!(is_factored(&fre));
@@ -119,20 +138,20 @@ fn factored_route_matches_rust_regex_on_hits_misses_and_malformed_bytes() {
 
 #[test]
 fn factored_route_has_exact_persistent_and_search_work_boundaries() {
-    let source = r"[m-r][3-8]T[uv]";
+    let source = cartesian_alternation(&[b"mnopqr", b"345678", b"T", b"uv"]);
     let probe = build(&source);
     assert_eq!(probe.build_report().plan, PlanKind::PackedLiteralSet);
     assert!(is_factored(&probe));
     let persistent = probe.build_report().charged_persistent_bytes;
 
-    let exact = PortableBuilder::new(source)
+    let exact = PortableBuilder::new(&source)
         .unicode(false)
         .max_persistent_bytes(persistent)
         .build()
         .unwrap();
     assert_eq!(exact.build_report().charged_persistent_bytes, persistent);
     assert!(matches!(
-        PortableBuilder::new(source)
+        PortableBuilder::new(&source)
             .unicode(false)
             .max_persistent_bytes(persistent - 1)
             .build(),
@@ -168,7 +187,8 @@ fn factored_route_has_exact_persistent_and_search_work_boundaries() {
 
 #[test]
 fn factored_route_has_zero_steady_allocations() {
-    let regex = build(r"[a-f][0-5]Q[xy]");
+    let source = cartesian_alternation(&[b"abcdef", b"012345", b"Q", b"xy"]);
+    let regex = build(&source);
     assert_eq!(regex.build_report().plan, PlanKind::PackedLiteralSet);
     assert!(is_factored(&regex));
     let mut haystack = vec![b'!'; 8_192];

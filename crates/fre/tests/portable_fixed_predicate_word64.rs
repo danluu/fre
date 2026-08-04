@@ -807,10 +807,10 @@ fn fixed_predicate_admission_preserves_finite_incumbents_and_structural_refusals
         PlanKind::ExactLiteral
     );
     assert_eq!(
-        build_auto("ab|ac|ad").build_report().plan,
+        build_auto("alpha|beta|gamma").build_report().plan,
         PlanKind::PackedLiteralSet
     );
-    let dfa = PortableBuilder::new("ab|ac|ad")
+    let dfa = PortableBuilder::new("alpha|beta|gamma")
         .unicode(false)
         .limits(BuildLimits {
             packed_literal_set: fre_kernels::PackedLiteralSetBuildLimits {
@@ -837,6 +837,94 @@ fn fixed_predicate_admission_preserves_finite_incumbents_and_structural_refusals
         build_auto("[abc]{8,9}[def]{8,9}").build_report().plan,
         PlanKind::BoundedByteClassSequence
     );
+}
+
+#[test]
+fn fixed_predicate_precedes_finite_products_but_not_true_alternation() {
+    let pattern = r"(?-u:[\x80-\x9F]Q)";
+    let fixed = PortableBuilder::new(pattern)
+        .unicode(false)
+        .build()
+        .unwrap();
+    assert_eq!(fixed.build_report().plan, PlanKind::FixedPredicateWord64);
+
+    let alternation = PortableBuilder::new("(?:alpha|beta|gamma)")
+        .unicode(false)
+        .build()
+        .unwrap();
+    assert_eq!(alternation.build_report().plan, PlanKind::PackedLiteralSet);
+
+    let upstream = regex::bytes::RegexBuilder::new(pattern)
+        .unicode(false)
+        .build()
+        .unwrap();
+    for first in u8::MIN..=u8::MAX {
+        for second in u8::MIN..=u8::MAX {
+            let haystack = [first, second];
+            let expected = upstream
+                .find(&haystack)
+                .map(|matched| (matched.start(), matched.end()));
+            let actual = fixed
+                .find(&haystack, SearchLimits::unlimited())
+                .unwrap()
+                .0
+                .map(|matched| (matched.start(), matched.end()));
+            assert_eq!(actual, expected, "haystack={haystack:?}");
+        }
+    }
+
+    let required = fixed.build_report().planner_work;
+    assert!(required > 0);
+    assert!(
+        PortableBuilder::new(pattern)
+            .unicode(false)
+            .limits(BuildLimits {
+                max_planner_work: required,
+                ..BuildLimits::default()
+            })
+            .build()
+            .is_ok()
+    );
+    assert!(matches!(
+        PortableBuilder::new(pattern)
+            .unicode(false)
+            .limits(BuildLimits {
+                max_planner_work: required - 1,
+                ..BuildLimits::default()
+            })
+            .build(),
+        Err(BuildError::PlannerWorkLimit { .. })
+    ));
+}
+
+#[test]
+fn cost_declined_fixed_product_preserves_finite_route_and_planner_receipt() {
+    let pattern = "[abc][def]";
+    let finite = build_auto(pattern);
+    assert_eq!(finite.build_report().plan, PlanKind::PackedLiteralSet);
+
+    let required = finite.build_report().planner_work;
+    assert!(required > 0);
+    let exact = PortableBuilder::new(pattern)
+        .unicode(false)
+        .limits(BuildLimits {
+            max_planner_work: required,
+            ..BuildLimits::default()
+        })
+        .build()
+        .unwrap();
+    assert_eq!(exact.build_report().plan, PlanKind::PackedLiteralSet);
+    assert_eq!(exact.build_report().planner_work, required);
+    assert!(matches!(
+        PortableBuilder::new(pattern)
+            .unicode(false)
+            .limits(BuildLimits {
+                max_planner_work: required - 1,
+                ..BuildLimits::default()
+            })
+            .build(),
+        Err(BuildError::PlannerWorkLimit { .. })
+    ));
 }
 
 #[test]

@@ -864,9 +864,9 @@ impl FixedPredicateInspectionAttempt {
 
 /// Inline proof source for a fixed-width byte Cartesian predicate word.
 ///
-/// Construction is only attempted after the incumbent finite route has
-/// declined its compact representation, so this source cannot displace a
-/// packed finite or guarded-dictionary success.
+/// The source is a structural Cartesian-language proof. Its caller owns plan
+/// precedence: search uses it before enumerating a finite product, while
+/// aggregate integrations may retain the legacy after-refusal ordering.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FixedPredicateWord64Source {
     positions: [FixedPredicate; FIXED_PREDICATE_WORD64_MAX_WIDTH],
@@ -1405,10 +1405,11 @@ pub(crate) fn extract_with_guarded_semantics(
     }
 }
 
-/// Inspect the compact predicate proof after an incumbent finite route has
-/// refused. `initial_work` is the completed incumbent work, so this retry
-/// cannot reset or launder the shared planner quota.
-pub(crate) fn inspect_fixed_predicate_word64_after_finite_refusal_attempt(
+/// Inspect the compact predicate proof inside a cumulative planner
+/// transaction. `initial_work` is completed incumbent work, so changing the
+/// relative ordering of this bounded inspection cannot reset or launder the
+/// shared planner quota.
+pub(crate) fn inspect_fixed_predicate_word64_attempt(
     hir: &Hir,
     initial_work: u64,
     work_limit: u64,
@@ -1428,6 +1429,16 @@ pub(crate) fn inspect_fixed_predicate_word64_after_finite_refusal_attempt(
                 .close_fixed_predicate(FixedPredicateInspectionTerminal::ResourceFailure),
         },
     }
+}
+
+/// Compatibility entry point for integrations that inspect only after finite
+/// extraction refuses.
+pub(crate) fn inspect_fixed_predicate_word64_after_finite_refusal_attempt(
+    hir: &Hir,
+    initial_work: u64,
+    work_limit: u64,
+) -> FixedPredicateInspectionAttempt {
+    inspect_fixed_predicate_word64_attempt(hir, initial_work, work_limit)
 }
 
 /// Legacy projection of

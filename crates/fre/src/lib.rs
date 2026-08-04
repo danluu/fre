@@ -1294,6 +1294,159 @@ fn folded_tail_planner_work_upper_bound(
         .checked_add(patterns.checked_mul(2)?)
 }
 
+struct FixedPredicateAutoAttempt {
+    plan: Option<Box<FixedPredicateWord64Plan>>,
+    planner_work: u64,
+    plan_storage_bytes: usize,
+    charged_persistent_bytes: usize,
+    declined: bool,
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn try_fixed_predicate_word64_before_finite(
+    hir: &Hir,
+    expected_hir_nodes: u64,
+    explicit_captures: usize,
+    initial_work: u64,
+    planner_work_limit: u64,
+    source_storage_bytes: usize,
+    capture_name_storage_bytes: usize,
+    persistent_byte_limit: usize,
+) -> Result<FixedPredicateAutoAttempt, BuildError> {
+    let inspection = finite::inspect_fixed_predicate_word64_attempt(
+        hir,
+        initial_work,
+        planner_work_limit,
+    );
+    if !inspection.has_closed_receipt() {
+        return Err(BuildError::InternalInvariant(
+            "fixed-predicate search inspection lost its attempt closure",
+        ));
+    }
+    let receipt = inspection.receipt();
+    if receipt.initial_work() != initial_work || receipt.work_limit() != planner_work_limit {
+        return Err(BuildError::InternalInvariant(
+            "fixed-predicate search inspection lost its cumulative planner envelope",
+        ));
+    }
+    let planner_work = receipt.actual().work;
+    let fixed = match inspection {
+        finite::FixedPredicateInspectionAttempt::Succeeded { source, .. } => source,
+        finite::FixedPredicateInspectionAttempt::Refused { .. } => {
+            return Ok(FixedPredicateAutoAttempt {
+                plan: None,
+                planner_work,
+                plan_storage_bytes: 0,
+                charged_persistent_bytes: 0,
+                declined: false,
+            });
+        }
+        finite::FixedPredicateInspectionAttempt::ResourceFailure { error, .. } => {
+            return Err(error);
+        }
+    };
+    let expected_hir_nodes = usize::try_from(expected_hir_nodes)
+        .map_err(|_| BuildError::InternalInvariant("syntax HIR-node count does not fit usize"))?;
+    if fixed.hir_nodes() != expected_hir_nodes || fixed.captures() != explicit_captures {
+        return Err(BuildError::InternalInvariant(
+            "syntax summary differs from fixed-predicate search inspection",
+        ));
+    }
+    if fixed.variable_predicates() == 0 {
+        return Err(BuildError::InternalInvariant(
+            "fixed-predicate search source lost its variable predicate proof",
+        ));
+    }
+    let mut normalized =
+        [finite::FixedPredicateRanges::EMPTY; FIXED_PREDICATE_WORD64_MAX_WIDTH];
+    for (index, ranges) in fixed.positions().enumerate() {
+        let Some(slot) = normalized.get_mut(index) else {
+            return Err(BuildError::InternalInvariant(
+                "fixed-predicate search source exceeded its inline width",
+            ));
+        };
+        *slot = ranges;
+    }
+    let Some(normalized) = normalized.get(..fixed.width()) else {
+        return Err(BuildError::InternalInvariant(
+            "fixed-predicate search source width exceeded its inline storage",
+        ));
+    };
+    let mut positions: [&[(u8, u8)]; FIXED_PREDICATE_WORD64_MAX_WIDTH] =
+        [&[]; FIXED_PREDICATE_WORD64_MAX_WIDTH];
+    for (slot, predicate) in positions.iter_mut().zip(normalized) {
+        *slot = predicate.ranges();
+    }
+    let attempt = match FixedPredicateWord64Plan::build_attempt(
+        &positions[..normalized.len()],
+        FixedPredicateWord64BuildLimits::unlimited(),
+    ) {
+        Ok(attempt) => attempt,
+        Err(error) => {
+            if !error.closes() {
+                return Err(BuildError::InternalInvariant(
+                    "fixed-predicate search construction failure lost its attempt closure",
+                ));
+            }
+            return Err(BuildError::InternalInvariant(
+                "inspected fixed-predicate search source failed kernel construction",
+            ));
+        }
+    };
+    if !attempt.closes() {
+        return Err(BuildError::InternalInvariant(
+            "fixed-predicate search construction lost its attempt closure",
+        ));
+    }
+    let (plan, _) = attempt.into_parts();
+    let reducer = plan
+        .search_operation_identity(FixedPredicateWord64SearchOperation::Exists)
+        .reducer;
+    let anchored = matches!(
+        reducer,
+        FixedPredicateWord64Reducer::OneByteAnchor | FixedPredicateWord64Reducer::TwoByteAnchor
+    );
+    let auto_admitted = anchored
+        && plan.max_verification_predicates()
+            <= FIXED_PREDICATE_SEARCH_AUTO_MAX_VERIFICATION_PREDICATES;
+    if !auto_admitted {
+        return Ok(FixedPredicateAutoAttempt {
+            plan: None,
+            planner_work,
+            plan_storage_bytes: 0,
+            charged_persistent_bytes: 0,
+            declined: true,
+        });
+    }
+    let plan_storage_bytes = plan.build_accounting().persistent_bytes;
+    let charged_persistent_bytes = source_storage_bytes
+        .checked_add(capture_name_storage_bytes)
+        .and_then(|bytes| bytes.checked_add(plan_storage_bytes))
+        .ok_or(BuildError::PersistentBytesOverflow)?;
+    if charged_persistent_bytes > persistent_byte_limit {
+        return Err(BuildError::PersistentBytesLimit {
+            needed: charged_persistent_bytes,
+            limit: persistent_byte_limit,
+        });
+    }
+    let plan = fre_exact_alloc::try_box_preserve(plan).map_err(|(error, _)| match error {
+        fre_exact_alloc::CopyError::LayoutOverflow => {
+            BuildError::InternalInvariant("fixed-predicate search owner layout overflowed")
+        }
+        fre_exact_alloc::CopyError::AllocationFailed => BuildError::AllocationFailed {
+            structure: "fixed-predicate search owner",
+            additional: 1,
+        },
+    })?;
+    Ok(FixedPredicateAutoAttempt {
+        plan: Some(plan),
+        planner_work,
+        plan_storage_bytes,
+        charged_persistent_bytes,
+        declined: false,
+    })
+}
+
 #[cold]
 #[inline(never)]
 fn try_attach_unicode_folded_long_tail(
@@ -3124,11 +3277,59 @@ impl PortableBuilder {
                 });
             }
         }
+        let FixedPredicateAutoAttempt {
+            plan: fixed_predicate_plan,
+            planner_work: fixed_predicate_work,
+            plan_storage_bytes: fixed_predicate_storage_bytes,
+            charged_persistent_bytes: fixed_predicate_charged_bytes,
+            declined: fixed_predicate_declined,
+        } = try_fixed_predicate_word64_before_finite(
+            &rust.hir,
+            syntax.hir_nodes,
+            explicit_captures,
+            bounded_byte_class_repeat_work,
+            self.limits.max_planner_work,
+            source_storage_bytes,
+            capture_name_storage_bytes,
+            self.limits.max_persistent_bytes,
+        )?;
+        if let Some(plan) = fixed_predicate_plan {
+            return Ok(PortableRegex {
+                source,
+                capture_names,
+                line_total_grep_plan,
+                plan: PortablePlan::FixedPredicateWord64(plan),
+                profile: profile.clone(),
+                limits: self.limits,
+                selection: self.selection,
+                report: BuildReport {
+                    profile: profile.clone(),
+                    admission,
+                    syntax,
+                    plan: PlanKind::FixedPredicateWord64,
+                    planner_work: fixed_predicate_work,
+                    lowering: None,
+                    states: 0,
+                    edges: 0,
+                    plan_storage_bytes: fixed_predicate_storage_bytes,
+                    source_storage_bytes,
+                    capture_name_storage_bytes,
+                    charged_persistent_bytes: fixed_predicate_charged_bytes,
+                    persistent_byte_limit: self.limits.max_persistent_bytes,
+                    captures_len,
+                    static_captures_len,
+                    minimum_match_bytes,
+                    required_literal: None,
+                    literal_class_run_literal: None,
+                    forward_anchored: None,
+                },
+            });
+        }
         let (finite_words, mut finite_work) = finite::extract(
             &rust.hir,
             self.limits.literal_set.max_patterns,
             self.limits.literal_set.max_pattern_bytes,
-            bounded_byte_class_repeat_work,
+            fixed_predicate_work,
             self.limits.max_planner_work,
             false,
             finite::GuardedFiniteBuildLimits::unlimited(),
@@ -3337,161 +3538,7 @@ impl PortableBuilder {
                 });
             }
         }
-        let fixed_predicate_inspection =
-            finite::inspect_fixed_predicate_word64_after_finite_refusal_attempt(
-                &rust.hir,
-                bounded_byte_class_sequence_work,
-                self.limits.max_planner_work,
-            );
-        if !fixed_predicate_inspection.has_closed_receipt() {
-            return Err(BuildError::InternalInvariant(
-                "fixed-predicate search inspection lost its attempt closure",
-            ));
-        }
-        let fixed_predicate_receipt = fixed_predicate_inspection.receipt();
-        if fixed_predicate_receipt.initial_work() != bounded_byte_class_sequence_work
-            || fixed_predicate_receipt.work_limit() != self.limits.max_planner_work
-        {
-            return Err(BuildError::InternalInvariant(
-                "fixed-predicate search inspection lost its cumulative planner envelope",
-            ));
-        }
-        finite_work = fixed_predicate_receipt.actual().work;
-        let fixed_predicate_declined = match fixed_predicate_inspection {
-            finite::FixedPredicateInspectionAttempt::Succeeded { source: fixed, .. } => {
-                let expected_hir_nodes = usize::try_from(syntax.hir_nodes).map_err(|_| {
-                    BuildError::InternalInvariant("syntax HIR-node count does not fit usize")
-                })?;
-                if fixed.hir_nodes() != expected_hir_nodes || fixed.captures() != explicit_captures
-                {
-                    return Err(BuildError::InternalInvariant(
-                        "syntax summary differs from fixed-predicate search inspection",
-                    ));
-                }
-                if fixed.variable_predicates() == 0 {
-                    return Err(BuildError::InternalInvariant(
-                        "fixed-predicate search source lost its variable predicate proof",
-                    ));
-                }
-                let mut normalized =
-                    [finite::FixedPredicateRanges::EMPTY; FIXED_PREDICATE_WORD64_MAX_WIDTH];
-                for (index, ranges) in fixed.positions().enumerate() {
-                    let Some(slot) = normalized.get_mut(index) else {
-                        return Err(BuildError::InternalInvariant(
-                            "fixed-predicate search source exceeded its inline width",
-                        ));
-                    };
-                    *slot = ranges;
-                }
-                let Some(normalized) = normalized.get(..fixed.width()) else {
-                    return Err(BuildError::InternalInvariant(
-                        "fixed-predicate search source width exceeded its inline storage",
-                    ));
-                };
-                let mut positions: [&[(u8, u8)]; FIXED_PREDICATE_WORD64_MAX_WIDTH] =
-                    [&[]; FIXED_PREDICATE_WORD64_MAX_WIDTH];
-                for (slot, predicate) in positions.iter_mut().zip(normalized) {
-                    *slot = predicate.ranges();
-                }
-                let attempt = match FixedPredicateWord64Plan::build_attempt(
-                    &positions[..normalized.len()],
-                    FixedPredicateWord64BuildLimits::unlimited(),
-                ) {
-                    Ok(attempt) => attempt,
-                    Err(error) => {
-                        if !error.closes() {
-                            return Err(BuildError::InternalInvariant(
-                                "fixed-predicate search construction failure lost its attempt closure",
-                            ));
-                        }
-                        return Err(BuildError::InternalInvariant(
-                            "inspected fixed-predicate search source failed kernel construction",
-                        ));
-                    }
-                };
-                if !attempt.closes() {
-                    return Err(BuildError::InternalInvariant(
-                        "fixed-predicate search construction lost its attempt closure",
-                    ));
-                }
-                let (plan, _) = attempt.into_parts();
-                let reducer = plan
-                    .search_operation_identity(FixedPredicateWord64SearchOperation::Exists)
-                    .reducer;
-                let anchored = matches!(
-                    reducer,
-                    FixedPredicateWord64Reducer::OneByteAnchor
-                        | FixedPredicateWord64Reducer::TwoByteAnchor
-                );
-                let auto_admitted = anchored
-                    && plan.max_verification_predicates()
-                        <= FIXED_PREDICATE_SEARCH_AUTO_MAX_VERIFICATION_PREDICATES;
-                if auto_admitted {
-                    let plan_storage_bytes = plan.build_accounting().persistent_bytes;
-                    let charged_persistent_bytes = source_storage_bytes
-                        .checked_add(capture_name_storage_bytes)
-                        .and_then(|bytes| bytes.checked_add(plan_storage_bytes))
-                        .ok_or(BuildError::PersistentBytesOverflow)?;
-                    if charged_persistent_bytes > self.limits.max_persistent_bytes {
-                        return Err(BuildError::PersistentBytesLimit {
-                            needed: charged_persistent_bytes,
-                            limit: self.limits.max_persistent_bytes,
-                        });
-                    }
-                    let plan =
-                        fre_exact_alloc::try_box_preserve(plan).map_err(
-                            |(error, _)| match error {
-                                fre_exact_alloc::CopyError::LayoutOverflow => {
-                                    BuildError::InternalInvariant(
-                                        "fixed-predicate search owner layout overflowed",
-                                    )
-                                }
-                                fre_exact_alloc::CopyError::AllocationFailed => {
-                                    BuildError::AllocationFailed {
-                                        structure: "fixed-predicate search owner",
-                                        additional: 1,
-                                    }
-                                }
-                            },
-                        )?;
-                    return Ok(PortableRegex {
-                        source,
-                        capture_names,
-                        line_total_grep_plan,
-                        plan: PortablePlan::FixedPredicateWord64(plan),
-                        profile: profile.clone(),
-                        limits: self.limits,
-                        selection: self.selection,
-                        report: BuildReport {
-                            profile: profile.clone(),
-                            admission,
-                            syntax,
-                            plan: PlanKind::FixedPredicateWord64,
-                            planner_work: finite_work,
-                            lowering: None,
-                            states: 0,
-                            edges: 0,
-                            plan_storage_bytes,
-                            source_storage_bytes,
-                            capture_name_storage_bytes,
-                            charged_persistent_bytes,
-                            persistent_byte_limit: self.limits.max_persistent_bytes,
-                            captures_len,
-                            static_captures_len,
-                            minimum_match_bytes,
-                            required_literal: None,
-                            literal_class_run_literal: None,
-                            forward_anchored: None,
-                        },
-                    });
-                }
-                true
-            }
-            finite::FixedPredicateInspectionAttempt::Refused { .. } => false,
-            finite::FixedPredicateInspectionAttempt::ResourceFailure { error, .. } => {
-                return Err(error);
-            }
-        };
+        finite_work = bounded_byte_class_sequence_work;
         let mut fallback_planner_work = finite_work;
         if self.selection == PlanSelection::Auto && !fixed_predicate_declined {
             let retained_facade_bytes = source_storage_bytes
@@ -7158,11 +7205,11 @@ mod tests {
     #[test]
     fn native_iterator_projection_matches_facade_spans_and_work() {
         let exact = PortableBuilder::new("aba").unicode(false).build().unwrap();
-        let packed = PortableBuilder::new("ab|ac|ad")
+        let packed = PortableBuilder::new("alpha|beta|gamma")
             .unicode(false)
             .build()
             .unwrap();
-        let dfa = PortableBuilder::new("ab|ac|ad")
+        let dfa = PortableBuilder::new("alpha|beta|gamma")
             .unicode(false)
             .limits(BuildLimits {
                 packed_literal_set: fre_kernels::PackedLiteralSetBuildLimits {
@@ -7177,7 +7224,7 @@ mod tests {
         assert_eq!(packed.build_report().plan, PlanKind::PackedLiteralSet);
         assert_eq!(dfa.build_report().plan, PlanKind::LiteralSetDfa);
 
-        let haystack = b"zzabacada";
+        let haystack = b"zzalpha-beta-gamma";
         for regex in [&exact, &packed, &dfa] {
             for start in 0..=haystack.len() {
                 let (expected, accounting) = regex
