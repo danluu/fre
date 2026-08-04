@@ -36,8 +36,12 @@
 //! [`fre_aot_regex_runtime_search_exclusive_partial_preflight_v1`] before
 //! native rows execute. That call settles the prior local completion, runs
 //! suffix then cut, and combines adaptive admission with exact-window handoff
-//! or in-helper K0 completion. If a native scan then reaches a partial-DFA
-//! hole, it can continue the same exclusive session through
+//! or in-helper K0 completion. A compiler that proves its emitted vectorized
+//! root scanner should own an admitted search can instead use
+//! [`fre_aot_regex_runtime_search_exclusive_partial_native_root_preflight_v1`];
+//! that authenticated call admits first and runs the portable proofs only on
+//! a decline. If a native scan then reaches a partial-DFA hole, it can continue
+//! the same exclusive session through
 //! [`fre_aot_regex_runtime_search_exclusive_from_partial_v1`]. That entry
 //! authenticates the producer's exact artifact identity and compact canonical
 //! resume-state index before continuing K0 without replaying the prefix.
@@ -422,6 +426,21 @@ impl PreparedAotRegex {
                 &mut self.workspace,
                 expected_artifact_identity,
                 selected_end,
+            )
+    }
+
+    fn preflight_retained_partial_native_root(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+        expected_artifact_identity: [u8; ARTIFACT_IDENTITY_BYTES],
+    ) -> Result<RetainedPartialPreflight, CompileError> {
+        self.program
+            .preflight_retained_partial_native_root_with_workspace(
+                haystack,
+                window,
+                &mut self.workspace,
+                expected_artifact_identity,
             )
     }
 
@@ -1227,6 +1246,92 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_partial_prefligh
     expected_artifact_identity_ptr: *const u8,
     window_out: *mut FreAotRegexSearchWindowV1,
 ) -> u32 {
+    // SAFETY: this forwards the exact public boundary and its documented
+    // requirements to the shared implementation without dereferencing them.
+    unsafe {
+        exclusive_partial_preflight(
+            handle,
+            haystack_ptr,
+            haystack_len,
+            window_start,
+            window_end,
+            result_ptr,
+            expected_artifact_identity_ptr,
+            window_out,
+            false,
+        )
+    }
+}
+
+/// Authenticate one native-root-owned incomplete-retained search.
+///
+/// The call settles any prior local native completion and applies adaptive
+/// admission before portable whole-window accelerators. On
+/// [`STATUS_PARTIAL_PREFLIGHT_ENTER`], `window_out` is initialized to the
+/// unchanged non-empty semantic window and the native table must execute that
+/// search exactly once. If admission declines (including the input-size
+/// floor), the ordinary
+/// suffix-then-cut order and K0 complete inside this call. Match/no-match and
+/// error output transactions are identical to
+/// [`fre_aot_regex_runtime_search_exclusive_partial_preflight_v1`].
+///
+/// The expected identity points to exactly [`ARTIFACT_IDENTITY_BYTES`] bytes
+/// and binds the emitted native table to the prepared semantic program.
+///
+/// # Safety
+///
+/// The exclusive handle, haystack, result, identity, and exact-window output
+/// requirements are identical to
+/// [`fre_aot_regex_runtime_search_exclusive_partial_preflight_v1`].
+#[unsafe(no_mangle)]
+#[allow(
+    unsafe_code,
+    clippy::too_many_arguments,
+    reason = "this exported preflight is an audited raw C boundary with explicit artifact and exact-window outputs"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_partial_native_root_preflight_v1(
+    handle: FreAotRegexExclusiveHandleV1,
+    haystack_ptr: *const u8,
+    haystack_len: usize,
+    window_start: usize,
+    window_end: usize,
+    result_ptr: *mut FreAotRegexResultV1,
+    expected_artifact_identity_ptr: *const u8,
+    window_out: *mut FreAotRegexSearchWindowV1,
+) -> u32 {
+    // SAFETY: this forwards the exact public boundary and its documented
+    // requirements to the shared implementation without dereferencing them.
+    unsafe {
+        exclusive_partial_preflight(
+            handle,
+            haystack_ptr,
+            haystack_len,
+            window_start,
+            window_end,
+            result_ptr,
+            expected_artifact_identity_ptr,
+            window_out,
+            true,
+        )
+    }
+}
+
+#[allow(
+    unsafe_code,
+    clippy::too_many_arguments,
+    reason = "shared validation and transactional output keep both versioned preflight policies identical"
+)]
+unsafe fn exclusive_partial_preflight(
+    handle: FreAotRegexExclusiveHandleV1,
+    haystack_ptr: *const u8,
+    haystack_len: usize,
+    window_start: usize,
+    window_end: usize,
+    result_ptr: *mut FreAotRegexResultV1,
+    expected_artifact_identity_ptr: *const u8,
+    window_out: *mut FreAotRegexSearchWindowV1,
+    native_root_owns_admitted_search: bool,
+) -> u32 {
     if handle.is_invalid() {
         return STATUS_INVALID_HANDLE;
     }
@@ -1251,11 +1356,17 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_partial_prefligh
         let expected_artifact_identity = expected_artifact_identity_ptr
             .cast::<[u8; ARTIFACT_IDENTITY_BYTES]>()
             .read();
-        let Ok(outcome) = prepared.preflight_retained_partial(
-            haystack,
-            SearchWindow::new(window_start, window_end),
-            expected_artifact_identity,
-        ) else {
+        let window = SearchWindow::new(window_start, window_end);
+        let outcome = if native_root_owns_admitted_search {
+            prepared.preflight_retained_partial_native_root(
+                haystack,
+                window,
+                expected_artifact_identity,
+            )
+        } else {
+            prepared.preflight_retained_partial(haystack, window, expected_artifact_identity)
+        };
+        let Ok(outcome) = outcome else {
             return STATUS_RUNTIME_FAILURE;
         };
         match outcome {
@@ -1716,6 +1827,35 @@ mod tests {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the test helper mirrors the authenticated native-root preflight ABI"
+    )]
+    fn call_exclusive_partial_native_root_preflight(
+        handle: FreAotRegexExclusiveHandleV1,
+        haystack: &[u8],
+        start: usize,
+        end: usize,
+        result: &mut FreAotRegexResultV1,
+        expected_artifact_identity: &[u8; ARTIFACT_IDENTITY_BYTES],
+        window: &mut FreAotRegexSearchWindowV1,
+    ) -> u32 {
+        // SAFETY: each test keeps exclusive ownership of the live session;
+        // all readable and disjoint aligned writable extents outlive the call.
+        unsafe {
+            fre_aot_regex_runtime_search_exclusive_partial_native_root_preflight_v1(
+                handle,
+                haystack.as_ptr(),
+                haystack.len(),
+                start,
+                end,
+                result,
+                expected_artifact_identity.as_ptr(),
+                window,
+            )
+        }
+    }
+
     fn expected_ffi(result: MatchResult) -> (u32, FreAotRegexResultV1) {
         match result {
             MatchResult::Exists(false)
@@ -1788,6 +1928,7 @@ mod tests {
             "fre_aot_regex_runtime_search_exclusive_from_partial_v1",
             "fre_aot_regex_runtime_search_exclusive_recover_partial_span_v1",
             "fre_aot_regex_runtime_search_exclusive_partial_preflight_v1",
+            "fre_aot_regex_runtime_search_exclusive_partial_native_root_preflight_v1",
             "fre_aot_regex_runtime_destroy_exclusive_v1",
         ] {
             assert!(C_API_V1_HEADER.contains(symbol), "{symbol}");
@@ -1850,6 +1991,16 @@ mod tests {
             *const u8,
             *mut FreAotRegexSearchWindowV1,
         ) -> u32 = fre_aot_regex_runtime_search_exclusive_partial_preflight_v1;
+        let _: unsafe extern "C" fn(
+            FreAotRegexExclusiveHandleV1,
+            *const u8,
+            usize,
+            usize,
+            usize,
+            *mut FreAotRegexResultV1,
+            *const u8,
+            *mut FreAotRegexSearchWindowV1,
+        ) -> u32 = fre_aot_regex_runtime_search_exclusive_partial_native_root_preflight_v1;
         let _: unsafe extern "C" fn(FreAotRegexExclusiveHandleV1) -> u32 =
             fre_aot_regex_runtime_destroy_exclusive_v1;
     }
@@ -2721,6 +2872,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "identity, output transactions, exact windows, both ownership orders, and lifecycle form one ABI proof"
+    )]
     fn exclusive_partial_preflight_is_transactional_and_returns_exact_windows() {
         let sentinel_result = FreAotRegexResultV1 { start: 71, end: 73 };
         let sentinel_window = FreAotRegexSearchWindowV1 { start: 79, end: 83 };
@@ -2870,6 +3025,32 @@ mod tests {
         assert_eq!(result, sentinel_result);
         assert!(window.start > 3, "mandatory cut did not narrow: {window:?}");
         assert_eq!(window.end, cut_haystack.len());
+
+        // The native-root policy keeps the same authenticated transaction but
+        // gives an admitted emitted scanner the original semantic window. The
+        // preceding unreported Enter is first settled as a local completion.
+        result = sentinel_result;
+        window = sentinel_window;
+        assert_eq!(
+            call_exclusive_partial_native_root_preflight(
+                cut_handle,
+                &cut_haystack,
+                3,
+                cut_haystack.len(),
+                &mut result,
+                &cut_identity,
+                &mut window,
+            ),
+            STATUS_PARTIAL_PREFLIGHT_ENTER
+        );
+        assert_eq!(result, sentinel_result);
+        assert_eq!(
+            window,
+            FreAotRegexSearchWindowV1 {
+                start: 3,
+                end: cut_haystack.len(),
+            }
+        );
 
         // SAFETY: both handles remain uniquely owned and no call overlaps
         // either destruction.

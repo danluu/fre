@@ -160,6 +160,24 @@ uint32_t fre_aot_regex_runtime_search_exclusive_partial_preflight_v1(
     const uint8_t expected_artifact_identity[FRE_AOT_REGEX_ARTIFACT_IDENTITY_BYTES],
     FreAotRegexSearchWindowV1 *window_out);
 
+/*
+ * Authenticate a native-root-owned incomplete-retained search. Admission is
+ * decided before the portable suffix/cut proofs. An admitted search returns
+ * the unchanged semantic window, which the native table must execute exactly
+ * once; a declined search runs the ordinary suffix-then-cut order and K0 to
+ * completion inside this call. Status and output transactions are otherwise
+ * identical to the preflight above.
+ */
+uint32_t fre_aot_regex_runtime_search_exclusive_partial_native_root_preflight_v1(
+    FreAotRegexExclusiveHandleV1 handle,
+    const uint8_t *haystack_ptr,
+    size_t haystack_len,
+    size_t window_start,
+    size_t window_end,
+    FreAotRegexResultV1 *result_ptr,
+    const uint8_t expected_artifact_identity[FRE_AOT_REGEX_ARTIFACT_IDENTITY_BYTES],
+    FreAotRegexSearchWindowV1 *window_out);
+
 uint32_t fre_aot_regex_runtime_destroy_exclusive_v1(
     FreAotRegexExclusiveHandleV1 handle);
 
