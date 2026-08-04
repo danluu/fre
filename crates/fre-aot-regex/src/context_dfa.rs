@@ -33,6 +33,7 @@ const NATIVE_CONTEXT_PROPERTIES_SHIFT: u8 = 9;
 const NATIVE_CONTEXT_PRESENT_BIT: u32 = 1 << 13;
 const NATIVE_CONTEXT_ABSOLUTE_START_BIT: u32 = 1 << 14;
 const NATIVE_CONTEXT_ABSOLUTE_END_BIT: u32 = 1 << 15;
+const EMPTY_REVERSE_ROW_OFFSETS: [u32; 1] = [0];
 
 type StableMap<K, V> = HashMap<K, V, BuildHasherDefault<StableFnvHasher>>;
 
@@ -151,11 +152,14 @@ pub struct ContextDfaStats {
     pub forward_states: usize,
     /// Complete flattened forward transition cells.
     pub forward_transitions: usize,
-    /// Canonical reverse initial boundary-context dispatch entries.
+    /// Canonical reverse initial boundary-context dispatch entries. This is
+    /// zero for a resource-rescued forward-only endpoint machine.
     pub reverse_initial_contexts: usize,
-    /// Complete reverse contextual states.
+    /// Complete reverse contextual states, or zero when an Exists/SelectedEnd
+    /// resource rescue omitted semantically unobservable start recovery.
     pub reverse_states: usize,
-    /// Complete flattened reverse transition cells.
+    /// Complete flattened reverse transition cells, or zero for that same
+    /// forward-only rescue.
     pub reverse_transitions: usize,
     /// Whether the optional exact-start forward sidecar was published.
     pub anchored_forward_present: bool,
@@ -1900,7 +1904,10 @@ pub(crate) struct ContextDfa {
     alphabet: Alphabet,
     initial_dispatch: NativeContextInitialDispatch,
     forward: ForwardDfa,
-    reverse: ReverseDfa,
+    /// Span recovery needs the reverse machine. A resource-limited retry for
+    /// Exists or SelectedEnd may publish a complete forward-only machine
+    /// because those contracts never observe a selected start.
+    reverse: Option<ReverseDfa>,
     anchored_forward: Option<AnchoredForwardDfa>,
     /// Representatives of a late semantic quotient need not retain the exact
     /// byte-boundary key of every merged state. Native flags and transition
@@ -1934,6 +1941,16 @@ impl ContextDfa {
     }
 
     pub(crate) fn native_view(&self) -> NativeContextDfaView<'_> {
+        let (reverse_initial, reverse_row_offsets, reverse_cells) = self.reverse.as_ref().map_or(
+            (&[][..], &EMPTY_REVERSE_ROW_OFFSETS[..], &[][..]),
+            |reverse| {
+                (
+                    reverse.canonical_initial.as_slice(),
+                    reverse.row_offsets.as_slice(),
+                    reverse.cells.as_slice(),
+                )
+            },
+        );
         NativeContextDfaView {
             initial_dispatch: self.initial_dispatch,
             byte_classes: &self.alphabet.byte_to_class,
@@ -1943,9 +1960,9 @@ impl ContextDfa {
             forward_states: &self.forward.native_states,
             forward_row_offsets: &self.forward.row_offsets,
             forward_cells: &self.forward.cells,
-            reverse_initial: &self.reverse.canonical_initial,
-            reverse_row_offsets: &self.reverse.row_offsets,
-            reverse_cells: &self.reverse.cells,
+            reverse_initial,
+            reverse_row_offsets,
+            reverse_cells,
             anchored_forward: self.anchored_forward.as_ref().map(|anchored| {
                 NativeContextAnchoredForwardView {
                     main_initial_to_anchored: &anchored.main_initial_to_anchored,
@@ -2199,16 +2216,20 @@ impl ContextDfa {
         window_start: usize,
         selected_end: usize,
     ) -> Result<Option<usize>, CompileError> {
+        let reverse = self
+            .reverse
+            .as_ref()
+            .ok_or(CompileError::InternalInvariant(
+                "contextual forward-only machine cannot recover a selected start",
+            ))?;
         let observation = self.alphabet.observe(haystack, selected_end)?;
         let boundary = ReverseBoundary::from_observation(observation, &self.alphabet)?;
-        let initial =
-            *self
-                .reverse
-                .initial
-                .get(&boundary)
-                .ok_or(CompileError::InternalInvariant(
-                    "contextual reverse initial boundary is absent",
-                ))?;
+        let initial = *reverse
+            .initial
+            .get(&boundary)
+            .ok_or(CompileError::InternalInvariant(
+                "contextual reverse initial boundary is absent",
+            ))?;
         let mut candidate = initial.reaches_start.then_some(selected_end);
         let mut state = initial.state;
         let mut cursor = selected_end;
@@ -2235,7 +2256,7 @@ impl ContextDfa {
                 .before_byte_class
                 .map_or(self.alphabet.classes(), usize::from);
             let cell =
-                self.reverse
+                reverse
                     .cell(current_state, symbol)
                     .ok_or(CompileError::InternalInvariant(
                         "contextual reverse transition is absent",
@@ -2262,6 +2283,10 @@ impl ContextDfa {
 
     fn reverse_state(&self, state: u32) -> Result<&ReverseKey, CompileError> {
         self.reverse
+            .as_ref()
+            .ok_or(CompileError::InternalInvariant(
+                "contextual forward-only machine has no reverse states",
+            ))?
             .states
             .get(usize::try_from(state).map_err(|_| {
                 CompileError::InternalInvariant("contextual reverse state exceeded usize")
@@ -2292,11 +2317,87 @@ pub(crate) fn determinize(
     )
 }
 
+/// Preserve the existing all-directions attempt, then retry a resource
+/// decline without reverse construction when the requested output never
+/// observes a match start. The retry is a complete forward machine, not a
+/// partial table; successful existing compilations are therefore byte-for-byte
+/// unaffected by this rescue path.
+pub(crate) fn determinize_for_output(
+    raw: &RawPlan,
+    line_terminator: u8,
+    limits: ContextDfaLimits,
+    output: OutputContract,
+) -> Result<ContextDfaOutcome, CompileError> {
+    let first = determinize(raw, line_terminator, limits)?;
+    let decline = match first {
+        ContextDfaOutcome::Complete(machine) => return Ok(ContextDfaOutcome::Complete(machine)),
+        ContextDfaOutcome::Declined(decline) => decline,
+    };
+    if output == OutputContract::Span
+        || matches!(
+            decline.resource,
+            ContextDfaResource::UnsupportedAssertion(_)
+        )
+    {
+        return Ok(ContextDfaOutcome::Declined(decline));
+    }
+    let remaining_work = limits.max_work.checked_sub(decline.work_completed).ok_or(
+        CompileError::InternalInvariant("contextual decline work exceeded its limit"),
+    )?;
+    if remaining_work == 0 {
+        return Ok(ContextDfaOutcome::Declined(decline));
+    }
+    let retry_limits = ContextDfaLimits {
+        max_work: remaining_work,
+        ..limits
+    };
+    match determinize_with_directions(
+        raw,
+        line_terminator,
+        retry_limits,
+        AnchoredForwardLimits::default(),
+        false,
+    )? {
+        ContextDfaOutcome::Complete(mut machine) => {
+            machine.stats.build_work = machine
+                .stats
+                .build_work
+                .checked_add(decline.work_completed)
+                .ok_or(CompileError::InternalInvariant(
+                    "contextual forward-only rescue work overflowed",
+                ))?;
+            Ok(ContextDfaOutcome::Complete(machine))
+        }
+        ContextDfaOutcome::Declined(retry_decline) => {
+            let work_completed = decline
+                .work_completed
+                .checked_add(retry_decline.work_completed)
+                .ok_or(CompileError::InternalInvariant(
+                    "discarded contextual rescue work overflowed",
+                ))?;
+            Ok(ContextDfaOutcome::Declined(ContextDfaDecline {
+                work_completed,
+                ..decline
+            }))
+        }
+    }
+}
+
 fn determinize_with_anchored_limits(
     raw: &RawPlan,
     line_terminator: u8,
     limits: ContextDfaLimits,
     anchored_limits: AnchoredForwardLimits,
+) -> Result<ContextDfaOutcome, CompileError> {
+    determinize_with_directions(raw, line_terminator, limits, anchored_limits, true)
+}
+
+fn determinize_with_directions(
+    raw: &RawPlan,
+    line_terminator: u8,
+    limits: ContextDfaLimits,
+    anchored_limits: AnchoredForwardLimits,
+    retain_reverse: bool,
 ) -> Result<ContextDfaOutcome, CompileError> {
     let needs = match ContextNeeds::inspect(raw) {
         Ok(needs) => needs,
@@ -2316,8 +2417,13 @@ fn determinize_with_anchored_limits(
     let Some(mut forward) = build_forward(raw, &alphabet, &mut budget)? else {
         return Ok(ContextDfaOutcome::Declined(budget.finish_decline()?));
     };
-    let Some(mut reverse) = build_reverse(raw, &alphabet, &mut budget)? else {
-        return Ok(ContextDfaOutcome::Declined(budget.finish_decline()?));
+    let mut reverse = if retain_reverse {
+        let Some(reverse) = build_reverse(raw, &alphabet, &mut budget)? else {
+            return Ok(ContextDfaOutcome::Declined(budget.finish_decline()?));
+        };
+        Some(reverse)
+    } else {
+        None
     };
     let initial_dispatch = NativeContextInitialDispatch::new(alphabet.classes())?;
     let mut anchored = build_anchored_forward(raw, &alphabet, &forward, anchored_limits)?;
@@ -2328,14 +2434,19 @@ fn determinize_with_anchored_limits(
             "contextual quotient row width overflowed",
         ))?;
     let mut semantic_quotient = false;
-    if let Some(quotient) =
-        late_context_quotient(&forward, &reverse, anchored.machine.as_ref(), row_width)?
-    {
+    let quotient = reverse
+        .as_ref()
+        .map(|reverse| {
+            late_context_quotient(&forward, reverse, anchored.machine.as_ref(), row_width)
+        })
+        .transpose()?
+        .flatten();
+    if let Some(quotient) = quotient {
         if let Some(machine) = quotient.forward {
             forward = machine;
         }
         if let Some(machine) = quotient.reverse {
-            reverse = machine;
+            reverse = Some(machine);
         }
         match quotient.anchored_update {
             AnchoredQuotientUpdate::Preserve => {}
@@ -2394,6 +2505,14 @@ fn determinize_with_anchored_limits(
             .ok_or(CompileError::InternalInvariant(
                 "contextual aggregate build work overflowed",
             ))?;
+    let (reverse_initial_contexts, reverse_states, reverse_transitions) =
+        reverse.as_ref().map_or((0, 0, 0), |reverse| {
+            (
+                reverse.canonical_initial.len(),
+                reverse.states.len(),
+                reverse.cells.len(),
+            )
+        });
     let stats = ContextDfaStats {
         alphabet_classes: alphabet.classes(),
         row_width: alphabet
@@ -2405,9 +2524,9 @@ fn determinize_with_anchored_limits(
         forward_initial_contexts: forward.canonical_initial.len(),
         forward_states: forward.states.len(),
         forward_transitions: forward.cells.len(),
-        reverse_initial_contexts: reverse.canonical_initial.len(),
-        reverse_states: reverse.states.len(),
-        reverse_transitions: reverse.cells.len(),
+        reverse_initial_contexts,
+        reverse_states,
+        reverse_transitions,
         anchored_forward_present,
         anchored_forward_initial_contexts,
         anchored_forward_states,
@@ -4491,7 +4610,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        CompileMode,
+        Architecture, CompileMode, CompiledModule, CpuFeature, FeatureSet, OperatingSystem, Target,
         dfa::DeterminizeLimits,
         program::{CompiledProgram, EngineKind},
     };
@@ -4591,6 +4710,190 @@ mod tests {
         let mut result = Vec::new();
         extend(&mut result, &mut Vec::new(), alphabet, max_len);
         result
+    }
+
+    #[test]
+    fn resource_decline_retries_complete_forward_only_for_endpoint_outputs() {
+        let raw = raw_plan(r"(?-u:\b)abc(?-u:\b)", b'\n');
+        let unlimited = ContextDfaLimits {
+            max_states: ContextDfaLimits::default().max_states,
+            max_transitions: usize::MAX,
+            max_work: u64::MAX,
+        };
+        let baseline =
+            complete(determinize(&raw, b'\n', unlimited).expect("complete bidirectional baseline"));
+        let minimum_state_limit = |retain_reverse| {
+            let mut low = 0usize;
+            let mut high = unlimited.max_states;
+            while low < high {
+                let middle = low + (high - low) / 2;
+                let outcome = determinize_with_directions(
+                    &raw,
+                    b'\n',
+                    ContextDfaLimits {
+                        max_states: middle,
+                        ..unlimited
+                    },
+                    AnchoredForwardLimits::default(),
+                    retain_reverse,
+                )
+                .expect("bounded contextual determinization");
+                if matches!(outcome, ContextDfaOutcome::Complete(_)) {
+                    high = middle;
+                } else {
+                    low = middle + 1;
+                }
+            }
+            low
+        };
+        let forward_limit = minimum_state_limit(false);
+        let bidirectional_limit = minimum_state_limit(true);
+        assert!(forward_limit < bidirectional_limit);
+        let rescue_limit = bidirectional_limit - 1;
+        assert!(rescue_limit >= forward_limit);
+        let limits = ContextDfaLimits {
+            max_states: rescue_limit,
+            ..unlimited
+        };
+        let all_directions_decline =
+            match determinize(&raw, b'\n', limits).expect("bounded all-directions attempt") {
+                ContextDfaOutcome::Declined(
+                    decline @ ContextDfaDecline {
+                        resource: ContextDfaResource::States { .. },
+                        ..
+                    },
+                ) => decline,
+                ContextDfaOutcome::Declined(decline) => {
+                    panic!("unexpected all-directions decline: {decline:?}")
+                }
+                ContextDfaOutcome::Complete(_) => {
+                    panic!("bounded all-directions attempt unexpectedly completed")
+                }
+            };
+        assert!(matches!(
+            determinize_for_output(&raw, b'\n', limits, OutputContract::Span)
+                .expect("span keeps its reverse requirement"),
+            ContextDfaOutcome::Declined(_)
+        ));
+
+        for output in [OutputContract::Exists, OutputContract::SelectedEnd] {
+            let rescued = complete(
+                determinize_for_output(&raw, b'\n', limits, output)
+                    .expect("forward-only endpoint rescue"),
+            );
+            let rescued_stats = rescued.stats();
+            assert_eq!(rescued_stats.reverse_initial_contexts, 0);
+            assert_eq!(rescued_stats.reverse_states, 0);
+            assert_eq!(rescued_stats.reverse_transitions, 0);
+            let aggregate_main_work = rescued_stats
+                .build_work
+                .checked_sub(rescued_stats.anchored_forward_build_work)
+                .expect("main contextual rescue work");
+            assert!(aggregate_main_work > all_directions_decline.work_completed);
+            assert!(matches!(
+                determinize_for_output(
+                    &raw,
+                    b'\n',
+                    ContextDfaLimits {
+                        max_work: aggregate_main_work,
+                        ..limits
+                    },
+                    output,
+                )
+                .expect("exact aggregate contextual rescue work"),
+                ContextDfaOutcome::Complete(_)
+            ));
+            let one_below_work = aggregate_main_work - 1;
+            let one_below = determinize_for_output(
+                &raw,
+                b'\n',
+                ContextDfaLimits {
+                    max_work: one_below_work,
+                    ..limits
+                },
+                output,
+            )
+            .expect("one-below aggregate contextual rescue work");
+            let ContextDfaOutcome::Declined(one_below_decline) = one_below else {
+                panic!("one-below contextual rescue unexpectedly completed")
+            };
+            assert!(one_below_decline.work_completed <= one_below_work);
+            let view = rescued.native_view();
+            assert!(view.reverse_initial.is_empty());
+            assert_eq!(view.reverse_row_offsets, [0]);
+            assert!(view.reverse_cells.is_empty());
+
+            let automaton = Automaton::from_raw(raw.clone(), CompileLimits::default())
+                .expect("validate contextual rescue graph")
+                .with_line_terminator(b'\n');
+            let compiled = CompiledProgram::build(
+                raw.clone(),
+                automaton,
+                output,
+                CompileMode::Optimizing,
+                DeterminizeLimits {
+                    max_states: rescue_limit,
+                    max_transitions: usize::MAX,
+                    max_work: u64::MAX,
+                },
+                usize::MAX,
+            )
+            .expect("compile forward-only contextual rescue");
+            assert_eq!(compiled.engine_kind(), EngineKind::OrderedContextDfa);
+            let compiled_stats = compiled
+                .context_dfa_stats()
+                .expect("compiled contextual rescue stats");
+            assert_eq!(compiled_stats.reverse_states, 0);
+            assert_eq!(
+                compiled
+                    .native_context_dfa_view()
+                    .expect("compiled contextual rescue native view")
+                    .reverse_row_offsets,
+                [0],
+            );
+            let x86_base = FeatureSet::of(CpuFeature::X86Sse2);
+            let x86_avx512 = x86_base
+                .with(CpuFeature::X86Avx2)
+                .with(CpuFeature::X86Avx512F)
+                .with(CpuFeature::X86Avx512Bw)
+                .with(CpuFeature::X86Avx512Vl);
+            let arm_base = FeatureSet::of(CpuFeature::Aarch64Asimd);
+            let arm_sve2 = arm_base
+                .with(CpuFeature::Aarch64Sve)
+                .with(CpuFeature::Aarch64Sve2);
+            for target in [
+                Target::new(Architecture::X86_64, OperatingSystem::Linux, x86_base)
+                    .expect("x86-64 Linux target"),
+                Target::new(Architecture::X86_64, OperatingSystem::Macos, x86_avx512)
+                    .expect("x86-64 macOS AVX-512 target"),
+                Target::new(Architecture::Aarch64, OperatingSystem::Macos, arm_base)
+                    .expect("AArch64 macOS ASIMD target"),
+                Target::new(Architecture::Aarch64, OperatingSystem::Linux, arm_sve2)
+                    .expect("AArch64 Linux SVE2 target"),
+            ] {
+                let module = CompiledModule::lower(&compiled, target)
+                    .expect("lower forward-only contextual rescue");
+                assert!(module.required_runtime_program().is_none(), "{target:?}");
+            }
+
+            for haystack in generated_haystacks(b" abcx_", 4) {
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        let actual = rescued
+                            .search(&haystack, window, output)
+                            .expect("forward-only contextual search");
+                        let expected = baseline
+                            .search(&haystack, window, output)
+                            .expect("bidirectional contextual search");
+                        assert_eq!(
+                            actual, expected,
+                            "output={output:?}, haystack={haystack:?}, window={start}..{end}",
+                        );
+                    }
+                }
+            }
+        }
     }
 
     fn assert_every_window(pattern: &str, line_terminator: u8, haystacks: &[Vec<u8>]) {

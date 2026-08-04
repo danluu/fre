@@ -1063,11 +1063,13 @@ fn build_context_native_layout_with_reverse_mode(
                 .map_err(|_| ObjectError::ArithmeticOverflow("context maximum match width"))
         })
         .transpose()?;
-    let retain_reverse = (view.output == OutputContract::Span && exact_match_width.is_none())
-        || (view.output == OutputContract::Exists && retain_reverse_for_suffix)
-        || (view.output == OutputContract::SelectedEnd
-            && exact_match_width.is_none()
-            && retain_reverse_for_suffix);
+    let reverse_available = reverse_states != 0;
+    let retain_reverse = reverse_available
+        && ((view.output == OutputContract::Span && exact_match_width.is_none())
+            || (view.output == OutputContract::Exists && retain_reverse_for_suffix)
+            || (view.output == OutputContract::SelectedEnd
+                && exact_match_width.is_none()
+                && retain_reverse_for_suffix));
     let raw_pair_initial = ENABLE_CONTEXT_RAW_PAIR_INITIAL_DISPATCH
         && raw_forward_initial_state_payload_fits(forward_states);
     let raw_pair_reverse_initial = retain_reverse

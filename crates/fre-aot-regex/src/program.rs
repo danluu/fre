@@ -2359,26 +2359,28 @@ impl CompiledProgram {
                 None,
             ),
             CompileMode::Optimizing if contains_context_assertions => {
-                let (contextual, reason, contextual_report) = match context_dfa::determinize(
-                    &raw,
-                    line_terminator,
-                    contextual_limits(limits),
-                )? {
-                    ContextDfaOutcome::Complete(machine) => {
-                        let report =
-                            ContextDeterminizationReport::complete(limits, machine.stats());
-                        (
-                            Some(machine),
-                            EngineSelectionReason::CompleteContextDfa,
-                            report,
-                        )
-                    }
-                    ContextDfaOutcome::Declined(decline) => (
-                        None,
-                        EngineSelectionReason::ContextAssertions,
-                        ContextDeterminizationReport::declined(limits, decline),
-                    ),
-                };
+                let (contextual, reason, contextual_report) =
+                    match context_dfa::determinize_for_output(
+                        &raw,
+                        line_terminator,
+                        contextual_limits(limits),
+                        output,
+                    )? {
+                        ContextDfaOutcome::Complete(machine) => {
+                            let report =
+                                ContextDeterminizationReport::complete(limits, machine.stats());
+                            (
+                                Some(machine),
+                                EngineSelectionReason::CompleteContextDfa,
+                                report,
+                            )
+                        }
+                        ContextDfaOutcome::Declined(decline) => (
+                            None,
+                            EngineSelectionReason::ContextAssertions,
+                            ContextDeterminizationReport::declined(limits, decline),
+                        ),
+                    };
                 (
                     ProgramEngine::OrderedNfa,
                     reason,
