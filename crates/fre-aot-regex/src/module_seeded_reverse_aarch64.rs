@@ -452,6 +452,7 @@ mod tests {
             initial_pending: false,
             initial_terminal: false,
             has_reverse: false,
+            partial: None,
             exact_span_width: None,
             exact_prefix_match_width: None,
             output: OutputContract::Exists,

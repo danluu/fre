@@ -2567,6 +2567,11 @@ pub(crate) struct NativeProgramView<'a> {
     /// format.
     pub(crate) raw: &'a RawPlan,
     pub(crate) dfa: NativeDfaView<'a>,
+    /// Exact discovered-state extent for a genuinely incomplete retained
+    /// forward table. `dfa.forward_cells` still contains only completed rows;
+    /// destinations in the remaining suffix name authenticated K0 resume
+    /// states.
+    pub(crate) partial_discovered_states: Option<usize>,
     pub(crate) anchored_prefix: &'a AnchoredPrefix,
     pub(crate) anchored_suffix: &'a AnchoredSuffix,
     pub(crate) required_literals: &'a RequiredLiterals,
@@ -2591,6 +2596,14 @@ pub(crate) struct NativePartialProgramView<'a> {
     pub(crate) output: OutputContract,
     pub(crate) dfa: NativePartialDfaView<'a>,
     pub(crate) exact_match_width: Option<usize>,
+    /// Full graph-derived native lowering input for the completed row prefix.
+    /// Its target-specific lowering is publishable only when a mandatory
+    /// retained scanner receives an exact SIMD code-generation receipt.
+    pub(crate) native: NativeProgramView<'a>,
+    /// Canonical portable packing retained solely to authenticate the semantic
+    /// cells before native target-specific row/hole repacking.
+    pub(crate) complete_rows: usize,
+    pub(crate) resume_states: usize,
     pub(crate) artifact_identity: [u8; 32],
 }
 
@@ -3113,6 +3126,7 @@ impl CompiledProgram {
             output: self.output,
             raw: &self.raw,
             dfa,
+            partial_discovered_states: None,
             anchored_prefix: &self.anchored_prefix,
             anchored_suffix: &self.anchored_suffix,
             required_literals: &self.required_literals,
@@ -3130,17 +3144,28 @@ impl CompiledProgram {
         if self.context_dfa.is_some() || !matches!(self.engine, ProgramEngine::OrderedNfa) {
             return None;
         }
-        let dfa = self.partial_dfa()?.native_incomplete_view()?;
+        let partial = self.partial_dfa()?.native_incomplete_view()?;
+        let dfa = partial.dfa;
         let (prefix_plan, prefix_supported) =
             PartialDfaPrefixPlan::derive(self.anchored_prefix.sets());
-        // A selective portable root owns its established SIMD scanner. Until
-        // native partial lowering emits and authenticates the same primary,
-        // publishing a scalar prepared symbol would replace that route with a
-        // long-window byte-at-a-time scan. Initial-pending machines bypass the
-        // root scanner entirely; nonselective roots have no scanner to lose.
-        if !prefix_supported || (!dfa.initial_pending && prefix_plan.is_some()) {
+        if !prefix_supported {
             return None;
         }
+        // The target-neutral view carries the exact portable primary. Module
+        // lowering may remove the selective-root guard only after the emitted
+        // target scanner authenticates this offset, membership, and SIMD tier.
+        let retained_prefix_requirement = if dfa.initial_pending {
+            None
+        } else if let Some(plan) = prefix_plan {
+            let depth = plan.primary_depth();
+            let membership = self.anchored_prefix.sets().get(depth)?.words();
+            Some(NativeRetainedPrefixRequirement {
+                scan_offset: u8::try_from(depth).ok()?,
+                membership,
+            })
+        } else {
+            None
+        };
         // The incomplete artifact intentionally has no reverse DFA. A local
         // Span completion can therefore publish only when the selected end
         // itself proves the start. Interior holes remain valid for every Span
@@ -3153,8 +3178,23 @@ impl CompiledProgram {
         }
         Some(NativePartialProgramView {
             output: self.output,
-            dfa,
+            dfa: partial,
             exact_match_width: self.exact_match_width,
+            native: NativeProgramView {
+                output: self.output,
+                raw: &self.raw,
+                dfa,
+                partial_discovered_states: Some(partial.discovered_states),
+                anchored_prefix: &self.anchored_prefix,
+                anchored_suffix: &self.anchored_suffix,
+                required_literals: &self.required_literals,
+                exact_match_width: self.exact_match_width,
+                max_match_width: self.max_match_width(),
+                exact_product_width: None,
+                retained_prefix_requirement,
+            },
+            complete_rows: partial.complete_rows,
+            resume_states: partial.resume_states,
             artifact_identity: self.artifact_identity(),
         })
     }
@@ -3199,6 +3239,7 @@ impl CompiledProgram {
                 reverse_initial: None,
                 reverse_cells: &[],
             },
+            partial_discovered_states: None,
             anchored_prefix: &self.anchored_prefix,
             anchored_suffix: &self.anchored_suffix,
             required_literals: &self.required_literals,

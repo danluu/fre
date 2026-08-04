@@ -642,6 +642,20 @@ impl PackedForwardCell {
     pub(crate) const fn raw(self) -> u32 {
         self.0
     }
+
+    /// Authenticate that this canonical retained-row cell is the exact
+    /// packing of its semantic transition. Native lowering uses the semantic
+    /// destination to choose a target-specific row/hole encoding, but it must
+    /// never do so from data that differs from the portable executor's sealed
+    /// representation.
+    pub(crate) fn authenticates(
+        self,
+        cell: ForwardCell,
+        complete_rows: usize,
+        classes: usize,
+    ) -> bool {
+        Self::from_cell(cell, complete_rows, classes) == Some(self)
+    }
 }
 
 enum ForwardBuildOutcome {
@@ -772,6 +786,9 @@ pub(crate) struct NativeDfaView<'a> {
 /// executor, so native lowering does not reinterpret semantic frontier data.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct NativePartialDfaView<'a> {
+    /// Semantic completed rows. Destinations beyond the completed prefix are
+    /// indices into the authenticated resume frontier.
+    pub(crate) dfa: NativeDfaView<'a>,
     pub(crate) initial_pending: bool,
     pub(crate) initial_terminal: bool,
     pub(crate) byte_classes: &'a [u8; 256],
@@ -779,6 +796,7 @@ pub(crate) struct NativePartialDfaView<'a> {
     pub(crate) packed_cells: &'a [PackedForwardCell],
     pub(crate) complete_rows: usize,
     pub(crate) resume_states: usize,
+    pub(crate) discovered_states: usize,
 }
 
 /// Maximum number of structurally ranked forward-DFA self-loop plans handed
@@ -1352,6 +1370,17 @@ impl PartialDfa {
             return None;
         }
         Some(NativePartialDfaView {
+            dfa: NativeDfaView {
+                initial_state: 0,
+                initial_pending: self.forward.initial_pending,
+                initial_terminal: self.forward.initial_terminal,
+                byte_classes: &self.alphabet.byte_to_class,
+                class_count: classes,
+                class_representatives: &self.alphabet.representatives,
+                forward_cells: &self.forward.transitions,
+                reverse_initial: None,
+                reverse_cells: &[],
+            },
             initial_pending: self.forward.initial_pending,
             initial_terminal: self.forward.initial_terminal,
             byte_classes: &self.alphabet.byte_to_class,
@@ -1359,6 +1388,7 @@ impl PartialDfa {
             packed_cells,
             complete_rows: self.forward.complete_rows,
             resume_states,
+            discovered_states: self.forward.discovered_states,
         })
     }
 
