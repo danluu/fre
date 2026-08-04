@@ -322,9 +322,21 @@ struct SharedColumns {
     anchor_offset: usize,
     anchor_byte: u8,
     pattern_mask: u64,
+    #[allow(
+        dead_code,
+        reason = "retained as an exact construction certificate and asserted by tests"
+    )]
     maximum_candidate_verification_work: usize,
-    native_start_budget: usize,
-    native_prefix_bytes: usize,
+    // Starts that one rejected exact-column probe must disprove before its
+    // work is competitive with one minimum native packed-search quantum.
+    // Later probes owe the same quantum again, so the cumulative admission
+    // boundary grows monotonically with the number of attempts.
+    minimum_candidate_skip: usize,
+    // Maximum complete haystack kept wholly on the native engine. Longer
+    // haystacks start with the monotone common-byte proof and invoke the
+    // native engine at most once, on the first start not disproved by the
+    // bounded exact-column filter.
+    native_haystack_bytes: usize,
     columns: Box<[SharedColumnMask]>,
 }
 
@@ -453,6 +465,15 @@ impl SharedColumns {
         // yields the same observable span while retaining source priority.
         debug_assert!(matching_patterns.trailing_zeros() < u64::BITS);
         Some(end)
+    }
+
+    fn candidate_is_amortized(&self, candidate: usize, attempt: usize) -> Option<bool> {
+        let proved_skip = candidate.checked_add(1)?;
+        let completed_attempts = attempt.checked_add(1)?;
+        let required_skip = self
+            .minimum_candidate_skip
+            .checked_mul(completed_attempts)?;
+        Some(proved_skip >= required_skip)
     }
 
     fn persistent_bytes(&self) -> usize {
@@ -735,46 +756,30 @@ fn find_native_shared_columns(
     columns: &SharedColumns,
     haystack: &[u8],
 ) -> Option<(usize, usize)> {
-    let native_start_budget = columns.native_start_budget;
-    let native_prefix_bytes = columns.native_prefix_bytes;
-    if haystack.len() <= native_prefix_bytes {
+    if haystack.len() <= columns.native_haystack_bytes {
         return searcher
             .find(haystack)
             .map(|matched| (matched.start(), matched.end()));
     }
-    if let Some(matched) = searcher.find(&haystack[..native_prefix_bytes]) {
-        if matched.start() < native_start_budget {
-            return Some((matched.start(), matched.end()));
-        }
-    }
 
-    let factored_haystack = haystack.get(native_start_budget..)?;
     let mut minimum_start = 0_usize;
     for attempt in 0..NATIVE_FILTER_CANDIDATE_BUDGET {
-        let candidate = columns.earliest_possible_start_from(factored_haystack, minimum_start)?;
+        let candidate = columns.earliest_possible_start_from(haystack, minimum_start)?;
         let after_candidate = candidate.checked_add(1)?;
-        let verification_attempts = attempt.checked_add(1)?;
-        let required_skip = columns
-            .maximum_candidate_verification_work
-            .checked_mul(verification_attempts)?;
-        if after_candidate < required_skip {
+        if !columns.candidate_is_amortized(candidate, attempt)? {
             break;
         }
-        if let Some(end) = columns.verify_at(factored_haystack, candidate) {
-            return Some((
-                native_start_budget.checked_add(candidate)?,
-                native_start_budget.checked_add(end)?,
-            ));
+        if let Some(end) = columns.verify_at(haystack, candidate) {
+            return Some((candidate, end));
         }
         minimum_start = after_candidate;
     }
-    let fallback_start = native_start_budget.checked_add(minimum_start)?;
     searcher
-        .find(&haystack[fallback_start..])
+        .find(&haystack[minimum_start..])
         .and_then(|matched| {
             Some((
-                fallback_start.checked_add(matched.start())?,
-                fallback_start.checked_add(matched.end())?,
+                minimum_start.checked_add(matched.start())?,
+                minimum_start.checked_add(matched.end())?,
             ))
         })
 }
@@ -1080,11 +1085,13 @@ fn select_shared_columns<P: AsRef<[u8]>>(
         .map(|(_, column)| column)
         .collect::<Vec<_>>()
         .into_boxed_slice();
+    let minimum_candidate_skip = maximum_candidate_verification_work
+        .checked_mul(native_minimum_haystack_bytes)?;
     let native_start_budget = shared_fragment_native_start_budget(
         native_minimum_haystack_bytes,
         maximum_candidate_verification_work,
     );
-    let native_prefix_bytes = width
+    let native_haystack_bytes = width
         .checked_sub(1)?
         .checked_add(native_start_budget)?;
     Some(SharedColumns {
@@ -1093,8 +1100,8 @@ fn select_shared_columns<P: AsRef<[u8]>>(
         anchor_byte,
         pattern_mask,
         maximum_candidate_verification_work,
-        native_start_budget,
-        native_prefix_bytes,
+        minimum_candidate_skip,
+        native_haystack_bytes,
         columns,
     })
 }
@@ -1883,8 +1890,9 @@ mod tests {
         assert_eq!((columns.width, columns.anchor_offset), (4, 0));
         assert_eq!(columns.anchor_byte, 0x91);
         assert_eq!(columns.maximum_candidate_verification_work, 4);
+        assert_eq!(columns.minimum_candidate_skip, 28);
         assert_eq!(columns.columns.len(), 3);
-        assert_eq!(columns.native_start_budget, 112);
+        assert_eq!(columns.native_haystack_bytes, 115);
         for pattern in &patterns {
             assert_eq!(columns.verify_at(pattern, 0), Some(4));
         }
@@ -1896,7 +1904,7 @@ mod tests {
     }
 
     #[test]
-    fn native_shared_columns_preserve_windows_bounds_and_dense_fallback() {
+    fn native_shared_columns_preserve_bounds_and_use_one_fallback() {
         let patterns = [
             b"qbma".as_slice(),
             b"qbdb".as_slice(),
@@ -1920,16 +1928,35 @@ mod tests {
         assert_eq!((shared_columns.width, shared_columns.anchor_offset), (4, 0));
         assert_eq!(shared_columns.anchor_byte, b'q');
         assert_eq!(shared_columns.maximum_candidate_verification_work, 4);
+        let minimum_candidate_skip = shared_columns
+            .maximum_candidate_verification_work
+            .checked_mul(searcher.minimum_len())
+            .unwrap();
+        assert_eq!(shared_columns.minimum_candidate_skip, minimum_candidate_skip);
         assert_eq!(
-            shared_columns.native_start_budget,
+            shared_columns.native_haystack_bytes,
             shared_fragment_native_start_budget(searcher.minimum_len(), 4)
-        );
-        assert_eq!(
-            shared_columns.native_prefix_bytes,
-            shared_columns.native_start_budget.checked_add(3).unwrap()
+                .checked_add(3)
+                .unwrap()
         );
 
         let persistent = plan.build_accounting().persistent_bytes;
+        let exact_sidecar_bytes = core::mem::size_of::<super::SharedColumns>()
+            .checked_add(
+                shared_columns
+                    .columns
+                    .len()
+                    .checked_mul(core::mem::size_of::<super::SharedColumnMask>())
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            persistent,
+            searcher
+                .memory_usage()
+                .checked_add(exact_sidecar_bytes)
+                .unwrap()
+        );
         assert_eq!(
             PackedLiteralSetPlan::new(
                 &patterns,
@@ -1955,24 +1982,116 @@ mod tests {
                 if needed == persistent && limit == persistent - 1
         ));
 
-        let budget = shared_columns.native_start_budget;
+        let native_haystack_bytes = shared_columns.native_haystack_bytes;
+
+        // Admission is exact at every cumulative native-service boundary:
+        // one fewer disproved start rejects the exact probe, while the
+        // boundary itself pays one native quantum per completed attempt.
+        for attempt in 0..NATIVE_FILTER_CANDIDATE_BUDGET {
+            let required_skip = minimum_candidate_skip
+                .checked_mul(attempt.checked_add(1).unwrap())
+                .unwrap();
+            assert_eq!(
+                shared_columns.candidate_is_amortized(required_skip - 2, attempt),
+                Some(false)
+            );
+            assert_eq!(
+                shared_columns.candidate_is_amortized(required_skip - 1, attempt),
+                Some(true)
+            );
+        }
+
+        // A long haystack with a candidate before one native quantum falls
+        // back without exact-column verification and remains observable.
+        let early_start = 17_usize;
+        let early_end = early_start.checked_add(4).unwrap();
+        let mut early = vec![b'!'; native_haystack_bytes.checked_add(29).unwrap()];
+        early[early_start..early_end].copy_from_slice(b"qbuc");
+        assert_eq!(
+            plan.find(&early, PackedLiteralSetSearchLimits::unlimited())
+                .unwrap()
+                .0,
+            Some((early_start, early_end))
+        );
+
+        // No common byte is an exact negative proof; no native fallback is
+        // needed after the monotone anchor scan exhausts the source.
+        let absent = vec![b'!'; native_haystack_bytes.checked_add(29).unwrap()];
+        assert_eq!(
+            plan.find(&absent, PackedLiteralSetSearchLimits::unlimited())
+                .unwrap()
+                .0,
+            None
+        );
+
+        // A window is its own immutable haystack for the side filter. A match
+        // before it must not influence either candidate positions or offsets.
         let window_start = 19_usize;
-        let decoy_start = window_start.checked_add(budget).unwrap().checked_add(37).unwrap();
-        let match_start = window_start.checked_add(budget).unwrap().checked_add(91).unwrap();
+        let decoy_start = window_start.checked_add(37).unwrap();
+        let match_start = window_start
+            .checked_add(native_haystack_bytes)
+            .unwrap()
+            .checked_add(29)
+            .unwrap();
         let match_end = match_start.checked_add(4).unwrap();
         let mut haystack = vec![b'!'; match_end.checked_add(29).unwrap()];
+        haystack[..4].copy_from_slice(b"qbma");
         haystack[decoy_start..decoy_start.checked_add(4).unwrap()].copy_from_slice(b"qbzz");
         haystack[match_start..match_end].copy_from_slice(b"qbce");
+        let window = Window::new(window_start, haystack.len());
+        let (matched, accounting) = plan
+            .find_window(
+                &haystack,
+                window,
+                PackedLiteralSetSearchLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(matched, Some((match_start, match_end)));
+        let searched_bytes = haystack.len().checked_sub(window_start).unwrap();
+        let verification_bytes_per_position = patterns
+            .iter()
+            .map(|pattern| pattern.len().checked_add(1).unwrap())
+            .sum::<usize>();
+        let exact_work = searched_bytes
+            .checked_add(1)
+            .unwrap()
+            .checked_mul(verification_bytes_per_position)
+            .unwrap();
+        assert_eq!(
+            accounting,
+            PackedLiteralSetAccounting {
+                searched_bytes,
+                positions_upper_bound: searched_bytes.checked_add(1).unwrap(),
+                verification_bytes_per_position,
+                work_upper_bound: exact_work,
+                scratch_bytes: 0,
+                factored_columns: false,
+                simd_eligible_length: true,
+            }
+        );
         assert_eq!(
             plan.find_window(
                 &haystack,
-                Window::new(window_start, haystack.len()),
-                PackedLiteralSetSearchLimits::unlimited(),
+                window,
+                PackedLiteralSetSearchLimits {
+                    max_work: exact_work,
+                },
             )
             .unwrap()
             .0,
             Some((match_start, match_end))
         );
+        assert!(matches!(
+            plan.find_window(
+                &haystack,
+                window,
+                PackedLiteralSetSearchLimits {
+                    max_work: exact_work - 1,
+                },
+            ),
+            Err(PackedLiteralSetError::WorkLimit { needed, limit })
+                if needed == exact_work && limit == exact_work - 1
+        ));
         assert_eq!(
             plan.find_window(
                 &haystack,
@@ -1984,11 +2103,10 @@ mod tests {
             None
         );
 
-        // A dense common-byte stream cannot make the side filter unbounded:
-        // its first unamortized candidate hands the untouched suffix back to
-        // the native source-priority searcher.
-        let dense_start = budget.checked_add(8).unwrap();
-        let dense_match = dense_start.checked_add(73).unwrap();
+        // A common byte at the first candidate cannot amortize even one exact
+        // probe. It therefore hands the complete haystack to the single native
+        // fallback without first splitting off a native prefix.
+        let dense_match = native_haystack_bytes.checked_add(73).unwrap();
         let dense_end = dense_match.checked_add(4).unwrap();
         let mut dense = vec![b'q'; dense_end.checked_add(16).unwrap()];
         dense[dense_match..dense_end].copy_from_slice(b"qbbh");
@@ -2001,6 +2119,32 @@ mod tests {
                 .unwrap()
                 .0,
             expected
+        );
+
+        // Four sparse, amortized false candidates consume the complete side
+        // budget. The one native fallback begins after the last rejected
+        // start and must still observe the later match.
+        let sparse_decoys = core::array::from_fn::<_, NATIVE_FILTER_CANDIDATE_BUDGET, _>(
+            |attempt| {
+                minimum_candidate_skip
+                    .checked_mul(attempt.checked_add(1).unwrap())
+                    .unwrap()
+                    .checked_sub(1)
+                    .unwrap()
+            },
+        );
+        let sparse_match = native_haystack_bytes.checked_add(83).unwrap();
+        let sparse_end = sparse_match.checked_add(4).unwrap();
+        let mut sparse = vec![b'!'; sparse_end.checked_add(23).unwrap()];
+        for start in sparse_decoys {
+            sparse[start..start.checked_add(4).unwrap()].copy_from_slice(b"qbzz");
+        }
+        sparse[sparse_match..sparse_end].copy_from_slice(b"qbkg");
+        assert_eq!(
+            plan.find(&sparse, PackedLiteralSetSearchLimits::unlimited())
+                .unwrap()
+                .0,
+            Some((sparse_match, sparse_end))
         );
     }
 
@@ -2509,7 +2653,7 @@ mod tests {
             pattern[shared_columns.anchor_offset] == shared_columns.anchor_byte
         }));
         let match_start = shared_columns
-            .native_start_budget
+            .native_haystack_bytes
             .checked_add(31)
             .unwrap();
         let match_end = match_start.checked_add(4).unwrap();
