@@ -1854,6 +1854,21 @@ impl NfaMandatorySuffix {
     }
 }
 
+/// Select exactly the reverse event required by the public output contract.
+///
+/// Every seeded-reverse event proves a match for `Exists`, so consuming the
+/// first event is sufficient. Endpoint-sensitive contracts need the earliest
+/// recognized start, which is the final event produced by the reverse trace.
+fn mandatory_suffix_reverse_start(
+    output: OutputContract,
+    trace: &mut impl Iterator<Item = usize>,
+) -> Option<usize> {
+    match output {
+        OutputContract::Exists => trace.next(),
+        OutputContract::SelectedEnd | OutputContract::Span => trace.last(),
+    }
+}
+
 /// Optional whole-window rejection filter proved by one mandatory consuming
 /// dominator in the productive Thompson graph.
 ///
@@ -3799,15 +3814,15 @@ impl CompiledProgram {
                 return Ok(None);
             }
             let reverse_start = endpoint.saturating_sub(maximum_width).max(window.start);
-            let candidate_start = accelerator
+            let mut trace = accelerator
                 .reverse
                 .trace(haystack, reverse_start, endpoint)
                 .map_err(|_| {
                     CompileError::InternalInvariant(
                         "mandatory-suffix reverse verifier received an invalid window",
                     )
-                })?
-                .last();
+                })?;
+            let candidate_start = mandatory_suffix_reverse_start(self.output, &mut trace);
             if let Some(start) = candidate_start {
                 if self.output == OutputContract::Exists {
                     return Ok(Some(MatchResult::Exists(true)));
@@ -7465,6 +7480,69 @@ mod tests {
     }
 
     #[test]
+    fn bounded_mandatory_suffix_exists_stops_after_first_reverse_event() {
+        let fallback_limits = DeterminizeLimits {
+            max_states: 0,
+            ..DeterminizeLimits::default()
+        };
+        let compiled = program(
+            "[a-y]{1,63}z",
+            OutputContract::Exists,
+            CompileMode::Optimizing,
+            fallback_limits,
+        );
+        let accelerator = compiled
+            .nfa_mandatory_suffix
+            .as_ref()
+            .expect("bounded selective suffix should construct the sidecar");
+        assert_eq!(accelerator.maximum_width, Some(64));
+
+        let mut haystack = vec![b'x'; 63];
+        haystack.push(b'z');
+        let mut exists_trace = accelerator
+            .reverse
+            .trace(&haystack, 0, haystack.len())
+            .expect("long bounded reverse trace");
+        assert_eq!(
+            mandatory_suffix_reverse_start(OutputContract::Exists, &mut exists_trace),
+            Some(62)
+        );
+        assert_eq!(
+            exists_trace.next(),
+            Some(61),
+            "Exists must leave later exact reverse events unconsumed"
+        );
+
+        for output in [OutputContract::SelectedEnd, OutputContract::Span] {
+            let mut trace = accelerator
+                .reverse
+                .trace(&haystack, 0, haystack.len())
+                .expect("endpoint-sensitive reverse trace");
+            assert_eq!(
+                mandatory_suffix_reverse_start(output, &mut trace),
+                Some(0),
+                "{output:?} must retain earliest-start selection"
+            );
+            assert_eq!(
+                trace.next(),
+                None,
+                "{output:?} must exhaust the reverse trace"
+            );
+        }
+
+        // Stopping one trace cannot mutate the immutable seeded-reverse table
+        // or any terminal fact used by a later trace.
+        let mut repeated = accelerator
+            .reverse
+            .trace(&haystack, 0, haystack.len())
+            .expect("repeated reverse trace");
+        assert_eq!(
+            mandatory_suffix_reverse_start(OutputContract::Exists, &mut repeated),
+            Some(62)
+        );
+    }
+
+    #[test]
     #[allow(
         clippy::too_many_lines,
         reason = "the terminal-barrier theorem is checked across graph shapes, contracts, windows, and wire reconstruction"
@@ -8334,6 +8412,7 @@ mod tests {
             ".{1,3}?z",
             "[ab]{1,3}z",
             "[ab]{1,3}?z",
+            "[a-y]{1,7}z",
             "(?:ab|ba){1,2}z",
             "(?:a|ba){1,2}z",
             "(?:a|bb)q[xz]",
@@ -8374,20 +8453,32 @@ mod tests {
                 let mut accelerated_workspace = accelerated.prepare_workspace().unwrap();
                 let mut reference_workspace = reference.prepare_workspace().unwrap();
 
-                for haystack in &haystacks {
-                    for start in 0..=haystack.len() {
-                        for end in start..=haystack.len() {
-                            let window = SearchWindow::new(start, end);
-                            let expected = reference
-                                .search_with_workspace(haystack, window, &mut reference_workspace)
-                                .unwrap();
-                            let actual = accelerated
-                                .search_with_workspace(haystack, window, &mut accelerated_workspace)
-                                .unwrap();
-                            assert_eq!(
-                                actual, expected,
-                                "{pattern:?}/{output:?}/{haystack:?}/{start}..{end}"
-                            );
+                // Repeating every window reuses any output-specific terminal
+                // and reverse facts cached by the first pass.
+                for pass in 0..2 {
+                    for haystack in &haystacks {
+                        for start in 0..=haystack.len() {
+                            for end in start..=haystack.len() {
+                                let window = SearchWindow::new(start, end);
+                                let expected = reference
+                                    .search_with_workspace(
+                                        haystack,
+                                        window,
+                                        &mut reference_workspace,
+                                    )
+                                    .unwrap();
+                                let actual = accelerated
+                                    .search_with_workspace(
+                                        haystack,
+                                        window,
+                                        &mut accelerated_workspace,
+                                    )
+                                    .unwrap();
+                                assert_eq!(
+                                    actual, expected,
+                                    "{pattern:?}/{output:?}/pass={pass}/{haystack:?}/{start}..{end}"
+                                );
+                            }
                         }
                     }
                 }
