@@ -6638,6 +6638,24 @@ impl PortableRegex {
         }
     }
 
+    /// Return only the profile-selected match end.
+    ///
+    /// This value-only projection shares the exact selected-span path with
+    /// [`Self::find_value`] and therefore does not construct facade diagnostic
+    /// accounting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same contract as [`Self::selected_end`].
+    pub fn selected_end_value(
+        &self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<Option<usize>, SearchError> {
+        self.find_value(haystack, limits)
+            .map(|matched| matched.map(Match::end))
+    }
+
     /// Return the profile-selected leftmost-first match.
     ///
     /// # Errors
@@ -10160,6 +10178,21 @@ impl<'r> PortableSearchSession<'r> {
                 Ok((report.into_output(), SearchAccounting::K0(accounting)))
             }
         }
+    }
+
+    /// Return only the selected match end, reusing the selected-span K0 route
+    /// and its operation-local state when applicable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same contract as [`Self::selected_end`].
+    pub fn selected_end_value(
+        &mut self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<Option<usize>, SearchError> {
+        self.find_value(haystack, limits)
+            .map(|matched| matched.map(Match::end))
     }
 
     /// Return the profile-selected leftmost-first match.
