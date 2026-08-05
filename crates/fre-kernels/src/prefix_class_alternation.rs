@@ -1686,12 +1686,10 @@ impl PrefixClassAlternationPlan {
         window: Window,
         limits: SearchLimits,
     ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
-        self.search_in_with_run_scanners(
+        self.search_selected_in_with_run_scanners(
             haystack,
             window,
             limits,
-            SearchProjection::Selected,
-            Operation::Search,
             self.search_identity(),
             [None, None],
         )
@@ -1713,14 +1711,13 @@ impl PrefixClassAlternationPlan {
         window: Window,
         limits: SearchLimits,
     ) -> Result<(bool, SearchAccounting), SearchError> {
-        let (matched, accounting) = self.search_in_with_run_scanners(
+        let (matched, accounting) = self.search_endpoint_in(
             haystack,
             window,
             limits,
-            SearchProjection::Exists,
+            EndpointProjection::Exists,
             Operation::Exists,
             self.exists_identity(),
-            [None, None],
         )?;
         Ok((matched.is_some(), accounting))
     }
@@ -1741,72 +1738,36 @@ impl PrefixClassAlternationPlan {
         window: Window,
         limits: SearchLimits,
     ) -> Result<(Option<usize>, SearchAccounting), SearchError> {
-        let (matched, accounting) = self.search_in_with_run_scanners(
+        let (matched, accounting) = self.search_endpoint_in(
             haystack,
             window,
             limits,
-            SearchProjection::EarliestEnd,
+            EndpointProjection::EarliestEnd,
             Operation::Shortest,
             self.shortest_identity(),
-            [None, None],
         )?;
         Ok((matched.map(|(_, end)| end), accounting))
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "projection, identity, and retained scanner choice remain authenticated at one search boundary"
-    )]
-    fn search_in_with_run_scanners(
+    fn search_selected_in_with_run_scanners(
         &self,
         haystack: &[u8],
         window: Window,
         limits: SearchLimits,
-        projection: SearchProjection,
-        operation: Operation,
         identity: OperationIdentity,
         run_scanners: [Option<&AsciiByteSetRunScanner>; RUN_SCANNERS],
     ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
-        let endpoint = match projection {
-            SearchProjection::Exists => Some(EndpointProjection::Exists),
-            SearchProjection::Selected => None,
-            SearchProjection::EarliestEnd => Some(EndpointProjection::EarliestEnd),
-        };
-        if let Some(endpoint) = endpoint {
-            let upper_bounds = self.search_preflight(
-                haystack,
-                window,
-                limits,
-                operation,
-                false,
-            )?;
-            let (matched, actual) = self.execute_endpoint_search(
-                haystack,
-                window,
-                endpoint,
-                upper_bounds,
-            )?;
-            return Ok((
-                matched,
-                SearchAccounting {
-                    identity,
-                    window,
-                    upper_bounds,
-                    actual,
-                },
-            ));
-        }
         let upper_bounds = self.search_preflight(
             haystack,
             window,
             limits,
-            operation,
+            Operation::Search,
             run_scanners[0].is_some(),
         )?;
         let (matched, actual) = self.execute_search(
             haystack,
             window,
-            projection,
+            SearchProjection::Selected,
             upper_bounds,
             run_scanners,
         )?;
@@ -1819,6 +1780,71 @@ impl PrefixClassAlternationPlan {
                 actual,
             },
         ))
+    }
+
+    fn search_endpoint_in(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+        projection: EndpointProjection,
+        operation: Operation,
+        identity: OperationIdentity,
+    ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
+        let upper_bounds = self.search_preflight(haystack, window, limits, operation, false)?;
+        let (matched, actual) =
+            self.execute_endpoint_search(haystack, window, projection, upper_bounds)?;
+        Ok((
+            matched,
+            SearchAccounting {
+                identity,
+                window,
+                upper_bounds,
+                actual,
+            },
+        ))
+    }
+
+    #[cfg(test)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "tests exercise all projections through one ordinary-search helper"
+    )]
+    fn search_in_with_run_scanners(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+        projection: SearchProjection,
+        operation: Operation,
+        identity: OperationIdentity,
+        run_scanners: [Option<&AsciiByteSetRunScanner>; RUN_SCANNERS],
+    ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
+        match projection {
+            SearchProjection::Selected => self.search_selected_in_with_run_scanners(
+                haystack,
+                window,
+                limits,
+                identity,
+                run_scanners,
+            ),
+            SearchProjection::Exists => self.search_endpoint_in(
+                haystack,
+                window,
+                limits,
+                EndpointProjection::Exists,
+                operation,
+                identity,
+            ),
+            SearchProjection::EarliestEnd => self.search_endpoint_in(
+                haystack,
+                window,
+                limits,
+                EndpointProjection::EarliestEnd,
+                operation,
+                identity,
+            ),
+        }
     }
 
     #[allow(
@@ -3595,12 +3621,10 @@ impl DispatchedPrefixClassAlternationPlan {
         window: Window,
         limits: SearchLimits,
     ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
-        self.plan().search_in_with_run_scanners(
+        self.plan().search_selected_in_with_run_scanners(
             haystack,
             window,
             limits,
-            SearchProjection::Selected,
-            Operation::Search,
             self.search_identity(),
             self.scanner_refs(),
         )
@@ -3620,14 +3644,13 @@ impl DispatchedPrefixClassAlternationPlan {
         window: Window,
         limits: SearchLimits,
     ) -> Result<(bool, SearchAccounting), SearchError> {
-        let (matched, accounting) = self.plan().search_in_with_run_scanners(
+        let (matched, accounting) = self.plan().search_endpoint_in(
             haystack,
             window,
             limits,
-            SearchProjection::Exists,
+            EndpointProjection::Exists,
             Operation::Exists,
             self.exists_identity(),
-            self.scanner_refs(),
         )?;
         Ok((matched.is_some(), accounting))
     }
@@ -3646,14 +3669,13 @@ impl DispatchedPrefixClassAlternationPlan {
         window: Window,
         limits: SearchLimits,
     ) -> Result<(Option<usize>, SearchAccounting), SearchError> {
-        let (matched, accounting) = self.plan().search_in_with_run_scanners(
+        let (matched, accounting) = self.plan().search_endpoint_in(
             haystack,
             window,
             limits,
-            SearchProjection::EarliestEnd,
+            EndpointProjection::EarliestEnd,
             Operation::Shortest,
             self.shortest_identity(),
-            self.scanner_refs(),
         )?;
         Ok((matched.map(|(_, end)| end), accounting))
     }
