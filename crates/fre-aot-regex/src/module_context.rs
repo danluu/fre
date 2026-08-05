@@ -6531,6 +6531,7 @@ fn aarch64_context_emit_prefix_prepass(
                 vector_filter.max_scan_offset(),
                 sve_filter_plan,
                 rematerialize_filter_setup,
+                false,
                 vector,
                 scalar,
                 vector_candidate,

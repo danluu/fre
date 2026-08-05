@@ -1576,6 +1576,11 @@ const MAX_ASIMD_EXACT_PRODUCT_SCALAR_RESIDUAL_BATCH_PREDICATES: usize = 3;
 const AARCH64_SVE_BATCH_VECTORS: u16 = 4;
 const AARCH64_SVE_MIN_VECTOR_BYTES: u16 = 16;
 const AARCH64_SVE_MAX_VECTOR_BYTES: u16 = 256;
+// The ordinary mixed-capability direct DFA is a leaf and emits no calls.
+// X16 and X17 are otherwise unused after the suffix/preflight phase, so they
+// retain the process VL and its zero-at-VL16 mode across every root retry.
+const AARCH64_MIXED_ROOT_VL_REGISTER: u8 = 16;
+const AARCH64_MIXED_ROOT_WIDE_MODE_REGISTER: u8 = 17;
 const X86_MASK_BATCH_VECTORS: u16 = 4;
 /// Keep an optional post-return cold tail from changing the cache-line
 /// placement of text sections linked after this self-contained object.
@@ -13089,6 +13094,7 @@ fn aarch64_emit_sve_multicol_start_filter_scanner(
     maximum_scan_offset: u8,
     plan: Aarch64SveFilterPlan,
     rematerialize_filter_setup: bool,
+    vector_length_is_precomputed: bool,
     vector: Aarch64Label,
     scalar: Aarch64Label,
     candidate: Aarch64Label,
@@ -13133,7 +13139,9 @@ fn aarch64_emit_sve_multicol_start_filter_scanner(
     // A rejected candidate may also re-enter after a predicated tail probe.
     // Restore the all-lanes predicate before any full-vector load.
     assembler.instruction(aarch64_sve_ptrue_b())?;
-    assembler.instruction(aarch64_sve_cntb(6)?)?;
+    if !vector_length_is_precomputed {
+        assembler.instruction(aarch64_sve_cntb(6)?)?;
+    }
 
     if let Some((maximum_vector_bytes, batch, batch_advance, batch_hit, batch_hits)) = batch_plan {
         let batch_vectors = u8::try_from(AARCH64_SVE_BATCH_VECTORS)
@@ -14831,6 +14839,21 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
         aarch64_emit_sve_filter_setups(&mut assembler, filter, vector_filter, sve_filter_plan)?;
     }
 
+    if use_runtime_vl_dispatch {
+        // The suffix prepass cannot provide this value: its short-window
+        // bypass reaches the root without executing its optional CNTB, and
+        // the seeded-reverse prepass also owns X16. Sample only after every
+        // prepass and initial-pending early exit. Since `scan` is bound after
+        // these instructions, all root retries preserve and reuse both
+        // caller-saved registers instead of querying the process VL again.
+        assembler.instruction(aarch64_sve_cntb(AARCH64_MIXED_ROOT_VL_REGISTER)?)?;
+        assembler.instruction(aarch64_sub_x_imm(
+            AARCH64_MIXED_ROOT_WIDE_MODE_REGISTER,
+            AARCH64_MIXED_ROOT_VL_REGISTER,
+            AARCH64_SVE_MIN_VECTOR_BYTES,
+        )?)?;
+    }
+
     assembler.bind(scan)?;
     if let Some(filter) = layout.start_filter {
         if layout.output != OutputContract::Exists {
@@ -14864,11 +14887,13 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
             if let Some(sve_filter_plan) = sve_filter_plan.filter(|_| use_sve_filter) {
                 if use_runtime_vl_dispatch {
                     // ASIMD's four-vector scanner is the lower-cost VL16
-                    // implementation. Wider process vector lengths retain
-                    // the scalable SVE lowering selected from the same graph.
-                    assembler.instruction(aarch64_sve_cntb(6)?)?;
-                    assembler.instruction(aarch64_cmp_x_imm(6, 16)?)?;
-                    assembler.branch_cond(AARCH64_LS, filter_vector)?;
+                    // implementation. The process VL is stable, so a retained
+                    // zero/nonzero mode makes every root retry one predictable
+                    // compare-and-branch. Wider VLs copy the retained byte
+                    // count into the SVE scanner's established X6 input.
+                    assembler
+                        .branch_zero_w(AARCH64_MIXED_ROOT_WIDE_MODE_REGISTER, filter_vector)?;
+                    assembler.instruction(aarch64_mov_x(6, AARCH64_MIXED_ROOT_VL_REGISTER)?)?;
                 }
                 if let Some(vector_filter) = vector_filter {
                     // Intersect the complete graph filter before selecting a
@@ -14881,6 +14906,7 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
                         maximum_scan_offset,
                         sve_filter_plan,
                         !retain_sve_filter_setup,
+                        use_runtime_vl_dispatch,
                         filter_sve,
                         filter_scalar,
                         filter_sve_candidate,
@@ -14892,7 +14918,7 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
                         maximum_scan_offset,
                         sve_filter_plan.primary(),
                         !retain_sve_filter_setup,
-                        false,
+                        use_runtime_vl_dispatch,
                         filter_sve,
                         filter_scalar,
                         filter_sve_candidate,
@@ -25430,10 +25456,9 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(mixed_ordinary_words.contains(&aarch64_sve_ptrue_b()));
         assert!(mixed_ordinary_words.contains(&aarch64_load_q(0, 12).unwrap()));
-        assert!(mixed_ordinary_words.windows(3).any(|words| {
-            words[0] == aarch64_sve_cntb(6).unwrap()
-                && words[1] == aarch64_cmp_x_imm(6, 16).unwrap()
-                && words[2] & 0xff00_001f == 0x5400_0009
+        assert!(mixed_ordinary_words.windows(2).any(|words| {
+            words[0] & 0xff00_001f == 0x3400_0011
+                && words[1] == aarch64_mov_x(6, 16).unwrap()
         }));
 
         let mixed_exact = compile_for(
@@ -25536,6 +25561,146 @@ mod tests {
     }
 
     #[test]
+    fn aarch64_mixed_root_samples_vl_once_and_keeps_retry_routes_stable() {
+        fn compare_branch_target(words: &[u32], index: usize) -> usize {
+            let word = words[index];
+            assert_eq!(word & 0xff00_001f, 0x3400_0011, "expected CBZ W17");
+            let immediate = (((word >> 5) & 0x7_ffff) << 13).cast_signed() >> 13;
+            usize::try_from(
+                i32::try_from(index)
+                    .unwrap()
+                    .checked_add(immediate)
+                    .expect("compare branch target arithmetic"),
+            )
+            .expect("in-section compare branch target")
+        }
+
+        fn unconditional_branch_target(words: &[u32], index: usize) -> Option<usize> {
+            let word = words[index];
+            if word & 0xfc00_0000 != 0x1400_0000 {
+                return None;
+            }
+            let immediate = ((word & 0x03ff_ffff) << 6).cast_signed() >> 6;
+            usize::try_from(i32::try_from(index).ok()?.checked_add(immediate)?).ok()
+        }
+
+        let features = FeatureSet::of(CpuFeature::Aarch64Asimd).with(CpuFeature::Aarch64Sve);
+        let compile_words = |pattern, output| {
+            let compiled = compile(
+                CompileRequest::new(
+                    pattern,
+                    Target::aarch64_linux().with_features(features).unwrap(),
+                )
+                .mode(CompileMode::Optimizing)
+                .output(output),
+            )
+            .unwrap();
+            let module = compiled.module();
+            let entry = module
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.name == module.entry_symbol())
+                .expect("public entry symbol");
+            let begin = usize::try_from(entry.offset).expect("public entry offset");
+            let end = begin
+                .checked_add(usize::try_from(entry.size).expect("public entry size"))
+                .expect("public entry extent");
+            module.sections()[TEXT_SECTION].bytes()[begin..end]
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>()
+        };
+
+        let words = compile_words("[3-7]", OutputContract::SelectedEnd);
+        let root_sample_mode = aarch64_sub_x_imm(
+            AARCH64_MIXED_ROOT_WIDE_MODE_REGISTER,
+            AARCH64_MIXED_ROOT_VL_REGISTER,
+            AARCH64_SVE_MIN_VECTOR_BYTES,
+        )
+        .unwrap();
+        let samples = words
+            .windows(2)
+            .enumerate()
+            .filter_map(|(index, window)| {
+                (window
+                    == [
+                        aarch64_sve_cntb(AARCH64_MIXED_ROOT_VL_REGISTER).unwrap(),
+                        root_sample_mode,
+                    ])
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            samples.len(),
+            1,
+            "mixed root must sample VL exactly once: {samples:?}"
+        );
+        let sample = samples[0];
+        assert_eq!(
+            words.get(sample + 1),
+            Some(&root_sample_mode),
+            "the one-time sample must form the retained VL16/wide mode"
+        );
+        assert_eq!(
+            words
+                .iter()
+                .filter(|&&word| word == aarch64_sve_cntb(6).unwrap())
+                .count(),
+            0,
+            "neither root dispatch nor its SVE scanner may resample VL"
+        );
+
+        let dispatch = words
+            .windows(2)
+            .position(|window| {
+                window[0] & 0xff00_001f == 0x3400_0011
+                    && window[1] == aarch64_mov_x(6, AARCH64_MIXED_ROOT_VL_REGISTER).unwrap()
+            })
+            .expect("retained mixed-root dispatch");
+        assert!(dispatch > sample + 1, "root loop must follow the VL sample");
+        let asimd = compare_branch_target(&words, dispatch);
+        assert_eq!(
+            words[asimd],
+            aarch64_sub_x_reg(12, 3, 2).unwrap(),
+            "VL16 must enter the established ASIMD scanner"
+        );
+
+        let root_retry_targets = words
+            .iter()
+            .enumerate()
+            .filter_map(|(index, _)| {
+                let target = unconditional_branch_target(&words, index)?;
+                (index > dispatch && target > sample && target <= dispatch).then_some(target)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !root_retry_targets.is_empty(),
+            "the emitted DFA must contain a root retry edge"
+        );
+        assert!(
+            root_retry_targets.iter().all(|&target| target > sample + 1),
+            "every root retry must skip the one-time VL sample and mode formation"
+        );
+
+        for vector_bytes in (AARCH64_SVE_MIN_VECTOR_BYTES..=AARCH64_SVE_MAX_VECTOR_BYTES)
+            .step_by(usize::from(AARCH64_SVE_MIN_VECTOR_BYTES))
+        {
+            let retained_mode = vector_bytes - AARCH64_SVE_MIN_VECTOR_BYTES;
+            assert_eq!(
+                retained_mode == 0,
+                vector_bytes == AARCH64_SVE_MIN_VECTOR_BYTES,
+                "CBZ mode must select ASIMD only for architectural VL16"
+            );
+        }
+
+        let multicol_words = compile_words("qeee", OutputContract::Exists);
+        assert!(
+            !multicol_words.contains(&aarch64_sve_cntb(6).unwrap()),
+            "the mixed multicolumn scanner must consume the retained root VL"
+        );
+    }
+
+    #[test]
     fn aarch64_pure_sve_retries_retain_filter_constants_but_mixed_rebuilds_them() {
         fn unconditional_branch_targets(words: &[u32]) -> Vec<usize> {
             let mut targets = Vec::new();
@@ -25572,7 +25737,7 @@ mod tests {
                 .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
                 .collect::<Vec<_>>()
         };
-        let setup = [
+        let pure_setup_words = [
             aarch64_sve_dup_b_imm(16, b'3').unwrap(),
             aarch64_sve_dup_b_imm(17, b'7').unwrap(),
             aarch64_sve_ptrue_b(),
@@ -25581,8 +25746,8 @@ mod tests {
 
         let pure_words = compile_words(FeatureSet::of(CpuFeature::Aarch64Sve));
         let pure_setup = pure_words
-            .windows(setup.len())
-            .position(|window| window == setup)
+            .windows(pure_setup_words.len())
+            .position(|window| window == pure_setup_words)
             .expect("pure-SVE filter setup");
         let pure_targets = unconditional_branch_targets(&pure_words);
         assert!(
@@ -25597,9 +25762,14 @@ mod tests {
         let mixed_words = compile_words(
             FeatureSet::of(CpuFeature::Aarch64Asimd).with(CpuFeature::Aarch64Sve),
         );
+        let mixed_setup_words = [
+            aarch64_sve_dup_b_imm(16, b'3').unwrap(),
+            aarch64_sve_dup_b_imm(17, b'7').unwrap(),
+            aarch64_sve_ptrue_b(),
+        ];
         let mixed_setup = mixed_words
-            .windows(setup.len())
-            .position(|window| window == setup)
+            .windows(mixed_setup_words.len())
+            .position(|window| window == mixed_setup_words)
             .expect("mixed SVE filter setup");
         assert!(
             unconditional_branch_targets(&mixed_words).contains(&mixed_setup),
