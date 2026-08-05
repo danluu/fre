@@ -10,9 +10,14 @@
 //! whole-match span: that maximal run. Source-order priority can change an
 //! internal path or capture, but not count or matched-byte sum.
 //!
-//! Sparse mixed-Unicode classes with multiple distinct literal-leading bytes
-//! first scan their union, then verify the one literal bound to the observed
-//! root.
+//! Sparse mixed-Unicode classes retain one immutable literal-column anchor.
+//! Construction scores every column common to all literals and minimizes the
+//! worst exact-verification bucket, then total bucket collisions, with the
+//! earliest column as the final deterministic tie break. Search scans that
+//! anchor-byte union once and verifies only the source-ordered literal mask
+//! bound to the observed byte. Shared roots, prefixes, and duplicate literals
+//! therefore keep one monotone candidate stream without weakening exact
+//! authentication.
 //! Existence and earliest-end projections prove an exact literal with only
 //! its immediately preceding and following class scalars. Earliest-end keeps
 //! the best accepting end while scanning every later literal start that can
@@ -48,14 +53,14 @@ use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptErro
 
 /// Stable identity of the admitted theorem and physical reducer.
 pub const PLAN_ID: &str = "reverse-inner.unicode-class-plus-ascii-literal-class-plus.v1";
-/// Physical identity of the sparse-mixed-Unicode adaptive literal-union form.
+/// Physical identity of the sparse-mixed-Unicode grouped fixed-column union.
 pub const UNION_PLAN_ID: &str =
-    "reverse-inner.sparse-mixed-unicode-class-plus-adaptive-literal-union.v1";
+    "reverse-inner.sparse-mixed-unicode-class-plus-grouped-fixed-column-union.v2";
 /// Accounting schema of the independent reusable finder form.
 pub const ACCOUNTING_ID: &str = "reverse-inner.independent-finder-accounting.v1";
-/// Accounting schema of the adaptive literal-union plus incumbent form.
+/// Accounting schema of the grouped fixed-column union plus incumbent form.
 pub const UNION_ACCOUNTING_ID: &str =
-    "reverse-inner.adaptive-first-byte-union-accounting.v1";
+    "reverse-inner.grouped-fixed-column-union-accounting.v2";
 /// Stable identity of complete non-overlapping match counting.
 pub const COUNT_OPERATION_ID: &str = "reverse-inner.count.maximal-unicode-class-run.v1";
 /// Stable identity of complete matched-byte summation.
@@ -90,6 +95,11 @@ const RUN_WORK: usize = 8;
 const MATCH_WORK: usize = 4;
 const MEMBERSHIP_WORK: usize = 2;
 const UNION_MASK_BUILD_WORK_PER_LITERAL: usize = 2;
+const UNION_ANCHOR_SET_BUILD_WORK_PER_LITERAL: usize = 1;
+const UNION_COLUMN_ZERO_WORK_PER_BUCKET: usize = 2;
+const UNION_COLUMN_LITERAL_WORK: usize = 5;
+const UNION_COLUMN_BUCKET_SCORE_WORK: usize = 6;
+const UNION_COLUMN_SCORE_WORK: usize = 4;
 const UNION_LITERAL_CHECK_WORK: usize = 1;
 const UNION_ROOT_CANDIDATE_WORK: usize = 1;
 const UNION_EXACT_CANDIDATE_WORK: usize = 1;
@@ -194,6 +204,19 @@ pub struct BuildAccounting {
     pub literal_bytes: usize,
     pub literal_fingerprint: u64,
     pub distinct_literal_first_bytes: usize,
+    /// Selected byte offset common to every literal, or zero when the grouped
+    /// union is not admitted. `adaptive_union` disambiguates a real offset 0.
+    pub union_anchor_offset: usize,
+    /// Exact population of the selected anchor-byte set.
+    pub union_anchor_distinct_bytes: usize,
+    /// Largest source-ordered literal bucket attached to one anchor byte.
+    pub union_anchor_max_bucket_literals: usize,
+    /// Largest exact literal-check plus byte-comparison cost for one bucket.
+    pub union_anchor_max_bucket_verification_work: usize,
+    /// Sum of `n * (n - 1) / 2` over selected anchor-byte buckets.
+    pub union_anchor_collision_pairs: usize,
+    /// Complete prospective construction work for scoring every common column.
+    pub union_anchor_selection_work: usize,
     pub adaptive_union: bool,
     pub work: usize,
     pub allocations: usize,
@@ -588,10 +611,195 @@ struct ScalarRange {
     end: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AnchorSelection {
+    offset: usize,
+    distinct_bytes: usize,
+    max_bucket_literals: usize,
+    max_bucket_verification_work: usize,
+    collision_pairs: usize,
+    selection_work: usize,
+}
+
 #[derive(Debug)]
 struct UnionState {
-    first_byte_masks: [u16; 128],
+    anchor_offset: usize,
+    anchor_byte_masks: [u16; 128],
     scanner: AsciiByteSetNonMemberScanner,
+}
+
+fn select_grouped_anchor(
+    literals: &[&[u8]],
+    distinct_literal_first_bytes: usize,
+    min_literal_bytes: usize,
+    max_literal_bytes: usize,
+) -> Result<AnchorSelection, BuildError> {
+    if literals.is_empty() {
+        return Err(BuildError::EmptyLiteralSet);
+    }
+    if distinct_literal_first_bytes == literals.len() {
+        // Unit buckets and zero collisions are global minima. Offset zero is
+        // also the deterministic earliest tie, so the incumbent unique-root
+        // route needs no second literal traversal or column-scoring work.
+        return Ok(AnchorSelection {
+            offset: 0,
+            distinct_bytes: literals.len(),
+            max_bucket_literals: 1,
+            max_bucket_verification_work: max_literal_bytes.checked_add(
+                UNION_LITERAL_CHECK_WORK,
+            ).ok_or(BuildError::ArithmeticOverflow {
+                computation: "unique-root literal-union verification work",
+            })?,
+            collision_pairs: 0,
+            selection_work: 0,
+        });
+    }
+    let common_columns = min_literal_bytes;
+    if common_columns == 0 {
+        return Err(BuildError::EmptyLiteral { index: 0 });
+    }
+
+    // The two 128-entry tables are initialized once. A fixed touched-byte list
+    // then makes every column O(literal_count), including score and reset work;
+    // with at most sixteen literals this is bounded by total literal bytes.
+    let mut selection_work = 128_usize
+        .checked_mul(UNION_COLUMN_ZERO_WORK_PER_BUCKET)
+        .ok_or(BuildError::ArithmeticOverflow {
+            computation: "grouped literal-union table initialization work",
+        })?;
+    let mut bucket_literals = [0_usize; 128];
+    let mut bucket_bytes = [0_usize; 128];
+    let mut best = None::<AnchorSelection>;
+    for offset in 0..common_columns {
+        let mut touched = [0_u8; MAX_LITERALS];
+        let mut touched_len = 0_usize;
+        for literal in literals {
+            let anchor = literal[offset];
+            let byte = usize::from(anchor);
+            if bucket_literals[byte] == 0 {
+                let slot = touched.get_mut(touched_len).ok_or(
+                    BuildError::ArithmeticOverflow {
+                        computation: "grouped literal-union touched-byte capacity",
+                    },
+                )?;
+                *slot = anchor;
+                touched_len = checked_add_build(
+                    touched_len,
+                    1,
+                    "grouped literal-union touched-byte population",
+                )?;
+            }
+            bucket_literals[byte] = checked_add_build(
+                bucket_literals[byte],
+                1,
+                "grouped literal-union bucket population",
+            )?;
+            bucket_bytes[byte] = checked_add_build(
+                bucket_bytes[byte],
+                literal.len(),
+                "grouped literal-union bucket verification bytes",
+            )?;
+        }
+        let literal_work = literals
+            .len()
+            .checked_mul(UNION_COLUMN_LITERAL_WORK)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "grouped literal-union column literal work",
+            })?;
+        let bucket_work = touched_len
+            .checked_mul(
+                UNION_COLUMN_BUCKET_SCORE_WORK
+                    .checked_add(UNION_COLUMN_ZERO_WORK_PER_BUCKET)
+                    .ok_or(BuildError::ArithmeticOverflow {
+                        computation: "grouped literal-union bucket score and reset work",
+                    })?,
+            )
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "grouped literal-union column bucket work",
+            })?;
+        selection_work = selection_work
+            .checked_add(literal_work)
+            .and_then(|work| work.checked_add(bucket_work))
+            .and_then(|work| work.checked_add(UNION_COLUMN_SCORE_WORK))
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "grouped literal-union total selection work",
+            })?;
+
+        let mut distinct_bytes = 0_usize;
+        let mut max_bucket_literals = 0_usize;
+        let mut max_bucket_verification_work = 0_usize;
+        let mut collision_pairs = 0_usize;
+        for &anchor in &touched[..touched_len] {
+            let byte = usize::from(anchor);
+            let count = bucket_literals[byte];
+            distinct_bytes = checked_add_build(
+                distinct_bytes,
+                1,
+                "grouped literal-union distinct anchor bytes",
+            )?;
+            max_bucket_literals = max_bucket_literals.max(count);
+            let check_work = count.checked_mul(UNION_LITERAL_CHECK_WORK).ok_or(
+                BuildError::ArithmeticOverflow {
+                    computation: "grouped literal-union bucket literal-check work",
+                },
+            )?;
+            let verification_work = bucket_bytes[byte].checked_add(check_work).ok_or(
+                BuildError::ArithmeticOverflow {
+                    computation: "grouped literal-union bucket verification work",
+                },
+            )?;
+            max_bucket_verification_work =
+                max_bucket_verification_work.max(verification_work);
+            let pairs = count
+                .checked_mul(count.saturating_sub(1))
+                .map(|product| product / 2)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "grouped literal-union bucket collision pairs",
+                })?;
+            collision_pairs = checked_add_build(
+                collision_pairs,
+                pairs,
+                "grouped literal-union collision pairs",
+            )?;
+            bucket_literals[byte] = 0;
+            bucket_bytes[byte] = 0;
+        }
+
+        let candidate = AnchorSelection {
+            offset,
+            distinct_bytes,
+            max_bucket_literals,
+            max_bucket_verification_work,
+            collision_pairs,
+            selection_work: 0,
+        };
+        let candidate_score = (
+            candidate.max_bucket_verification_work,
+            candidate.collision_pairs,
+            candidate.max_bucket_literals,
+            candidate.offset,
+        );
+        let replace = match best {
+            Some(incumbent) => {
+                candidate_score
+                    < (
+                        incumbent.max_bucket_verification_work,
+                        incumbent.collision_pairs,
+                        incumbent.max_bucket_literals,
+                        incumbent.offset,
+                    )
+            }
+            None => true,
+        };
+        if replace {
+            best = Some(candidate);
+        }
+    }
+    let mut selected = best.ok_or(BuildError::ArithmeticOverflow {
+        computation: "grouped literal-union missing anchor selection",
+    })?;
+    selected.selection_work = selection_work;
+    Ok(selected)
 }
 
 /// Owned, deliberately non-`Clone` plan.
@@ -731,6 +939,8 @@ impl ReverseInnerPlan {
             }
 
             let mut literal_bytes = 0_usize;
+            let mut min_retained_literal_bytes = usize::MAX;
+            let mut max_retained_literal_bytes = 0_usize;
             let mut literal_fingerprint = 0xcbf2_9ce4_8422_2325_u64;
             let mut literal_first_words = [0_u64; 2];
             let mut distinct_literal_first_bytes = 0_usize;
@@ -746,6 +956,8 @@ impl ReverseInnerPlan {
                 }
                 literal_bytes =
                     checked_add_build(literal_bytes, literal.len(), "literal byte total")?;
+                min_retained_literal_bytes = min_retained_literal_bytes.min(literal.len());
+                max_retained_literal_bytes = max_retained_literal_bytes.max(literal.len());
                 for &byte in *literal {
                     if !byte.is_ascii() {
                         return Err(BuildError::NonAsciiLiteral { index, byte });
@@ -790,22 +1002,46 @@ impl ReverseInnerPlan {
                     limit: limits.max_total_literal_bytes,
                 });
             }
-            let adaptive_union = literals.len() >= 2
+            let union_shape = literals.len() >= 2
                 && retained_non_ascii_ranges != 0
                 && non_ascii_scalars != 0
                 && non_ascii_scalars <= MAX_ADMITTED_NON_ASCII_SCALARS
-                && ascii_scalars <= MAX_ADMITTED_ASCII_SCALARS
-                && distinct_literal_first_bytes == literals.len();
-            if adaptive_union {
+                && ascii_scalars <= MAX_ADMITTED_ASCII_SCALARS;
+            let anchor_selection = if union_shape {
+                Some(select_grouped_anchor(
+                    literals,
+                    distinct_literal_first_bytes,
+                    min_retained_literal_bytes,
+                    max_retained_literal_bytes,
+                )?)
+            } else {
+                None
+            };
+            let adaptive_union = anchor_selection.is_some();
+            if let Some(selection) = anchor_selection {
                 let mask_work = literals
                     .len()
                     .checked_mul(UNION_MASK_BUILD_WORK_PER_LITERAL)
                     .ok_or(BuildError::ArithmeticOverflow {
                         computation: "literal-union mask construction work",
                     })?;
+                let anchor_set_work = if selection.offset == 0 {
+                    0
+                } else {
+                    literals
+                        .len()
+                        .checked_mul(UNION_ANCHOR_SET_BUILD_WORK_PER_LITERAL)
+                        .ok_or(BuildError::ArithmeticOverflow {
+                            computation: "literal-union anchor-set construction work",
+                        })?
+                };
                 work = work
-                    .checked_add(ASCII_NONMEMBER_RUN_SCANNER_BUILD_WORK)
+                    .checked_add(selection.selection_work)
+                    .and_then(|value| {
+                        value.checked_add(ASCII_NONMEMBER_RUN_SCANNER_BUILD_WORK)
+                    })
                     .and_then(|value| value.checked_add(mask_work))
+                    .and_then(|value| value.checked_add(anchor_set_work))
                     .ok_or(BuildError::ArithmeticOverflow {
                         computation: "literal-union construction work",
                     })?;
@@ -902,8 +1138,13 @@ impl ReverseInnerPlan {
                 record_initialization(&mut actual, size_of::<Finder<'static>>(), false)?;
             }
 
-            let union_state = if adaptive_union {
-                let mut first_byte_masks = [0_u16; 128];
+            let union_state = if let Some(selection) = anchor_selection {
+                let mut anchor_byte_masks = [0_u16; 128];
+                let mut anchor_words = if selection.offset == 0 {
+                    literal_first_words
+                } else {
+                    [0_u64; 2]
+                };
                 for (index, literal) in literals.iter().enumerate() {
                     let shift = u32::try_from(index).map_err(|_| {
                         BuildError::ArithmeticOverflow {
@@ -915,16 +1156,22 @@ impl ReverseInnerPlan {
                             computation: "literal-union mask bit",
                         },
                     )?;
-                    first_byte_masks[usize::from(literal[0])] |= bit;
+                    let anchor = literal[selection.offset];
+                    anchor_byte_masks[usize::from(anchor)] |= bit;
+                    if selection.offset != 0 {
+                        let word = usize::from(anchor / 64);
+                        anchor_words[word] |= 1_u64 << (anchor % 64);
+                    }
                 }
                 let scanner = dispatch
                     .ascii_byte_set_nonmember_scanner(
-                        AsciiByteSet::from_words(literal_first_words),
+                        AsciiByteSet::from_words(anchor_words),
                         DispatchPolicy::Auto,
                     )
                     .expect("automatic literal-union dispatch retains a scalar fallback");
                 let state = ExactBoxOrUsize::try_from_boxed(UnionState {
-                    first_byte_masks,
+                    anchor_offset: selection.offset,
+                    anchor_byte_masks,
                     scanner,
                 })
                 .map_err(|error| {
@@ -959,6 +1206,17 @@ impl ReverseInnerPlan {
                 literal_bytes,
                 literal_fingerprint,
                 distinct_literal_first_bytes,
+                union_anchor_offset: anchor_selection.map_or(0, |selection| selection.offset),
+                union_anchor_distinct_bytes: anchor_selection
+                    .map_or(0, |selection| selection.distinct_bytes),
+                union_anchor_max_bucket_literals: anchor_selection
+                    .map_or(0, |selection| selection.max_bucket_literals),
+                union_anchor_max_bucket_verification_work: anchor_selection
+                    .map_or(0, |selection| selection.max_bucket_verification_work),
+                union_anchor_collision_pairs: anchor_selection
+                    .map_or(0, |selection| selection.collision_pairs),
+                union_anchor_selection_work: anchor_selection
+                    .map_or(0, |selection| selection.selection_work),
                 adaptive_union,
                 work,
                 allocations,
@@ -1247,6 +1505,7 @@ impl ReverseInnerPlan {
                 &mut upper,
                 input_bytes,
                 self.build.retained_non_ascii_ranges,
+                self.build.union_anchor_max_bucket_literals,
             )?;
         }
         let work_upper_bound = u64::try_from(upper.work).unwrap_or(u64::MAX);
@@ -1425,10 +1684,24 @@ impl ReverseInnerPlan {
                 resource: "literal-union state",
                 actual: 0,
                 upper: 1,
-            })?;
+        })?;
         let mut previous_scanned_through = scan_start;
         while scan_start < ceiling {
-            let source = haystack.get(scan_start..ceiling).ok_or(
+            // Every admitted literal owns this same in-bounds offset. Moving
+            // the anchor scan to `scan_start + offset` therefore maps anchor
+            // positions one-to-one onto candidate starts at or after
+            // `scan_start`; neither an earlier start nor an overlap can be
+            // skipped. An anchor at or beyond `ceiling` cannot begin a
+            // literal that ends inside the checked window.
+            let anchor_scan_start = scan_start.checked_add(state.anchor_offset).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "literal-union anchor scan start",
+                },
+            )?;
+            if anchor_scan_start >= ceiling {
+                return Ok(UnionNext::Exhausted);
+            }
+            let source = haystack.get(anchor_scan_start..ceiling).ok_or(
                 ReduceError::ArithmeticOverflow {
                     computation: "literal-union scan window",
                 },
@@ -1452,17 +1725,22 @@ impl ReverseInnerPlan {
             if scanned.nonmember_run_len() == source.len() {
                 return Ok(UnionNext::Exhausted);
             }
-            let candidate_start = scan_start
+            let anchor_position = anchor_scan_start
                 .checked_add(scanned.nonmember_run_len())
                 .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "literal-union candidate start",
+                    computation: "literal-union anchor position",
                 })?;
-            let byte = *haystack.get(candidate_start).ok_or(
+            let candidate_start = anchor_position.checked_sub(state.anchor_offset).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "literal-union candidate start",
+                },
+            )?;
+            let byte = *haystack.get(anchor_position).ok_or(
                 ReduceError::ArithmeticOverflow {
                     computation: "literal-union candidate byte",
                 },
             )?;
-            let candidate_mask = *state.first_byte_masks.get(usize::from(byte)).ok_or(
+            let candidate_mask = *state.anchor_byte_masks.get(usize::from(byte)).ok_or(
                 ReduceError::AccountingInvariant {
                     resource: "literal-union ASCII candidate byte",
                     actual: u64::from(byte),
@@ -2025,9 +2303,11 @@ impl ReverseInnerPlan {
         &self,
         haystack: &[u8],
         window: Window,
+        projection: SearchProjection,
         candidate: UnionCandidate,
         actual: &mut ReduceActualCounters,
     ) -> Result<Option<(usize, usize)>, SearchError> {
+        debug_assert!(projection != SearchProjection::Selected);
         if candidate.start <= window.start() {
             return Ok(None);
         }
@@ -2043,57 +2323,73 @@ impl ReverseInnerPlan {
         if preceding.width == 0 || !self.contains(preceding_scalar, actual)? {
             return Ok(None);
         }
-
-        // Adaptive-union admission requires distinct literal-leading bytes,
-        // so the observed root can bind exactly one literal.
-        debug_assert!(candidate.matching_mask.is_power_of_two());
-        let candidate_index =
-            usize::try_from(candidate.matching_mask.trailing_zeros()).map_err(|_| {
-                ReduceError::ArithmeticOverflow {
-                    computation: "literal-union endpoint candidate index",
-                }
-            })?;
-        let finder = self.finders.get(candidate_index).ok_or(
-            ReduceError::AccountingInvariant {
-                resource: "literal-union endpoint finder",
-                actual: u64::try_from(candidate_index).unwrap_or(u64::MAX),
-                upper: u64::try_from(self.finders.len()).unwrap_or(u64::MAX),
-            },
-        )?;
-        let literal_end = candidate
-            .start
-            .checked_add(finder.needle().len())
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "literal-union endpoint literal end",
-            })?;
-        if literal_end >= window.end() {
-            return Ok(None);
-        }
-        let following_bytes = haystack.get(literal_end..window.end()).ok_or(
-            ReduceError::ArithmeticOverflow {
-                computation: "literal-union endpoint following window",
-            },
-        )?;
-        let following = decode_scalar(following_bytes);
-        charge_decode(following.byte_checks, actual)?;
-        let Some(following_scalar) = following.scalar else {
-            return Ok(None);
-        };
-        if following.width == 0 || !self.contains(following_scalar, actual)? {
-            return Ok(None);
-        }
-
         let start = candidate.start.checked_sub(preceding.width).ok_or(
             ReduceError::ArithmeticOverflow {
                 computation: "literal-union endpoint accepting start",
             },
         )?;
-        let end = literal_end.checked_add(following.width).ok_or(
-            ReduceError::ArithmeticOverflow {
-                computation: "literal-union endpoint accepting end",
-            },
-        )?;
-        Ok(Some((start, end)))
+        // The selected anchor byte may bind several exact literals. Traverse
+        // the complete mask in source order. Existence publishes the first
+        // viable source branch; earliest-end compares every viable length and
+        // retains the source-earlier branch on an equal end.
+        let mut unchecked_mask = candidate.matching_mask;
+        let mut best = None::<(usize, usize)>;
+        while unchecked_mask != 0 {
+            let shift = unchecked_mask.trailing_zeros();
+            let candidate_index = usize::try_from(shift).map_err(|_| {
+                ReduceError::ArithmeticOverflow {
+                    computation: "literal-union endpoint candidate index",
+                }
+            })?;
+            let bit = 1_u16.checked_shl(shift).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "literal-union endpoint candidate mask bit",
+                },
+            )?;
+            unchecked_mask &= !bit;
+            let finder = self.finders.get(candidate_index).ok_or(
+                ReduceError::AccountingInvariant {
+                    resource: "literal-union endpoint finder",
+                    actual: u64::try_from(candidate_index).unwrap_or(u64::MAX),
+                    upper: u64::try_from(self.finders.len()).unwrap_or(u64::MAX),
+                },
+            )?;
+            let literal_end = candidate
+                .start
+                .checked_add(finder.needle().len())
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "literal-union endpoint literal end",
+                })?;
+            if literal_end >= window.end() {
+                continue;
+            }
+            let following_bytes = haystack.get(literal_end..window.end()).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "literal-union endpoint following window",
+                },
+            )?;
+            let following = decode_scalar(following_bytes);
+            charge_decode(following.byte_checks, actual)?;
+            let Some(following_scalar) = following.scalar else {
+                continue;
+            };
+            if following.width == 0 || !self.contains(following_scalar, actual)? {
+                continue;
+            }
+            let end = literal_end.checked_add(following.width).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "literal-union endpoint accepting end",
+                },
+            )?;
+            let matched = (start, end);
+            if projection == SearchProjection::Exists {
+                return Ok(Some(matched));
+            }
+            if best.map_or(true, |old| end < old.1) {
+                best = Some(matched);
+            }
+        }
+        Ok(best)
     }
 
     #[allow(
@@ -2186,6 +2482,7 @@ impl ReverseInnerPlan {
             let proved = self.prove_union_endpoint_candidate(
                 haystack,
                 window,
+                projection,
                 candidate,
                 &mut actual,
             )?;
@@ -2985,21 +3282,37 @@ fn expand_union_endpoint_upper_bounds(
     upper: &mut ReduceUpperBounds,
     input_bytes: usize,
     retained_non_ascii_ranges: usize,
+    max_bucket_literals: usize,
 ) -> Result<(), ReduceError> {
-    // Every exact union root can inspect at most one previous scalar (eight
-    // byte checks) and one following scalar (four byte checks). The complete
-    // independent envelope remains available for a certified fallback, so
-    // these endpoint probes are conservatively additive.
-    let endpoint_decode_byte_checks = input_bytes.checked_mul(12).ok_or(
+    // Every exact union root can inspect one previous scalar (eight byte
+    // checks) plus one following scalar (four byte checks) for every retained
+    // literal in its worst-case bucket. The complete independent envelope
+    // remains available for certified fallback, so these probes are additive.
+    let following_decode_checks = max_bucket_literals.checked_mul(4).ok_or(
         ReduceError::ArithmeticOverflow {
+            computation: "literal-union endpoint following decode bound",
+        },
+    )?;
+    let decode_checks_per_candidate = following_decode_checks.checked_add(8).ok_or(
+        ReduceError::ArithmeticOverflow {
+            computation: "literal-union endpoint decode checks per candidate",
+        },
+    )?;
+    let endpoint_decode_byte_checks = input_bytes
+        .checked_mul(decode_checks_per_candidate)
+        .ok_or(ReduceError::ArithmeticOverflow {
             computation: "literal-union endpoint decode byte-check bound",
-        },
-    )?;
-    let endpoint_membership_tests = input_bytes.checked_mul(2).ok_or(
+        })?;
+    let membership_tests_per_candidate = max_bucket_literals.checked_add(1).ok_or(
         ReduceError::ArithmeticOverflow {
-            computation: "literal-union endpoint membership-test bound",
+            computation: "literal-union endpoint membership tests per candidate",
         },
     )?;
+    let endpoint_membership_tests = input_bytes
+        .checked_mul(membership_tests_per_candidate)
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "literal-union endpoint membership-test bound",
+        })?;
     let comparisons_per_membership =
         binary_search_comparison_bound(retained_non_ascii_ranges).max(1);
     let endpoint_range_comparisons = endpoint_membership_tests
@@ -3779,7 +4092,7 @@ mod tests {
         exercise(
             &[b"abc".as_slice(), b"ab".as_slice(), b"b".as_slice()],
             r"(?:[a-dλ]+abc[a-dλ]+|[a-dλ]+ab[a-dλ]+|[a-dλ]+b[a-dλ]+)",
-            false,
+            true,
         );
         exercise(
             &[b"abc".as_slice(), b"b".as_slice(), b"cd".as_slice()],
@@ -4420,7 +4733,7 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_union_admission_uses_exact_sparse_scalar_and_unique_root_boundaries() {
+    fn adaptive_union_admission_uses_exact_sparse_scalar_boundaries_and_grouped_roots() {
         let ascii_64 = plan(&[('\0', '?'), ('λ', 'λ')], &[b"0", b"1"]);
         assert_eq!(ascii_64.build_accounting().ascii_scalars, 64);
         assert_eq!(ascii_64.build_accounting().non_ascii_scalars, 1);
@@ -4476,7 +4789,272 @@ mod tests {
 
         let common_root = plan(&SMALL_CLASS, &[b"aa", b"ab"]);
         assert_eq!(common_root.build_accounting().distinct_literal_first_bytes, 1);
-        assert!(!common_root.build_accounting().adaptive_union);
+        assert!(common_root.build_accounting().adaptive_union);
+        assert_eq!(common_root.build_accounting().union_anchor_offset, 1);
+        assert_eq!(common_root.build_accounting().union_anchor_distinct_bytes, 2);
+        assert_eq!(
+            common_root
+                .build_accounting()
+                .union_anchor_max_bucket_literals,
+            1
+        );
+    }
+
+    #[test]
+    fn grouped_anchor_selection_minimizes_bucket_cost_collisions_and_offset() {
+        let ranges = [('a', 'd'), ('λ', 'λ')];
+        let middle_literals: [&[u8]; 4] = [b"aab", b"abb", b"acb", b"adb"];
+        let middle = plan(&ranges, &middle_literals);
+        let middle_build = middle.build_accounting();
+        assert!(middle_build.adaptive_union);
+        assert_eq!(middle_build.distinct_literal_first_bytes, 1);
+        assert_eq!(middle_build.union_anchor_offset, 1);
+        assert_eq!(middle_build.union_anchor_distinct_bytes, 4);
+        assert_eq!(middle_build.union_anchor_max_bucket_literals, 1);
+        assert_eq!(middle_build.union_anchor_max_bucket_verification_work, 4);
+        assert_eq!(middle_build.union_anchor_collision_pairs, 0);
+        // Two 128-entry tables, then complete touched-bucket work for column
+        // populations 1, 4, and 1.
+        assert_eq!(middle_build.union_anchor_selection_work, 376);
+        let middle_state = middle.union_state().expect("middle-column union state");
+        assert_eq!(middle_state.anchor_offset, 1);
+        for (index, byte) in [b'a', b'b', b'c', b'd'].into_iter().enumerate() {
+            assert_eq!(
+                middle_state.anchor_byte_masks[usize::from(byte)],
+                1_u16 << index
+            );
+        }
+
+        let last_literals: [&[u8]; 4] = [b"aaa", b"aab", b"aac", b"aad"];
+        let last = plan(&ranges, &last_literals);
+        let last_build = last.build_accounting();
+        assert_eq!(last_build.union_anchor_offset, 2);
+        assert_eq!(last_build.union_anchor_distinct_bytes, 4);
+        assert_eq!(last_build.union_anchor_max_bucket_literals, 1);
+        assert_eq!(last_build.union_anchor_collision_pairs, 0);
+        assert_eq!(last_build.union_anchor_selection_work, 376);
+        let last_oracle = oracle(
+            r"(?:[a-dλ]+aaa[a-dλ]+|[a-dλ]+aab[a-dλ]+|[a-dλ]+aac[a-dλ]+|[a-dλ]+aad[a-dλ]+)",
+        );
+        for haystack in [
+            b"daabd".as_slice(),
+            b"\xffdaacd\x80",
+            "λaaadλ".as_bytes(),
+            b"aaaa-aad",
+        ] {
+            assert_matches_oracle(&last, &last_oracle, haystack);
+        }
+
+        let bucket_literals: [&[u8]; 4] = [b"aaba", b"aabb", b"abaa", b"abab"];
+        let buckets = plan(&ranges, &bucket_literals);
+        let bucket_build = buckets.build_accounting();
+        assert_eq!(bucket_build.union_anchor_offset, 1);
+        assert_eq!(bucket_build.union_anchor_distinct_bytes, 2);
+        assert_eq!(bucket_build.union_anchor_max_bucket_literals, 2);
+        assert_eq!(bucket_build.union_anchor_max_bucket_verification_work, 10);
+        assert_eq!(bucket_build.union_anchor_collision_pairs, 2);
+        let bucket_oracle = oracle(
+            r"(?:[a-dλ]+aaba[a-dλ]+|[a-dλ]+aabb[a-dλ]+|[a-dλ]+abaa[a-dλ]+|[a-dλ]+abab[a-dλ]+)",
+        );
+        for haystack in [
+            b"daabad".as_slice(),
+            b"dababd",
+            b"\xffdabaad\x80",
+            "λaabbλ".as_bytes(),
+        ] {
+            assert_matches_oracle(&buckets, &bucket_oracle, haystack);
+        }
+
+        let tied_literals: [&[u8]; 4] = [b"aa", b"ab", b"ba", b"bb"];
+        let tied = plan(&ranges, &tied_literals);
+        let tied_build = tied.build_accounting();
+        assert_eq!(tied_build.union_anchor_offset, 0);
+        assert_eq!(tied_build.union_anchor_distinct_bytes, 2);
+        assert_eq!(tied_build.union_anchor_max_bucket_literals, 2);
+        assert_eq!(tied_build.union_anchor_max_bucket_verification_work, 6);
+        assert_eq!(tied_build.union_anchor_collision_pairs, 2);
+        assert_eq!(tied_build.union_anchor_selection_work, 336);
+        let tied_state = tied.union_state().expect("deterministic tie union state");
+        assert_eq!(tied_state.anchor_byte_masks[usize::from(b'a')], 0b0011);
+        assert_eq!(tied_state.anchor_byte_masks[usize::from(b'b')], 0b1100);
+
+        let duplicate_literals: [&[u8]; 4] = [b"ab", b"ab", b"ac", b"ac"];
+        let duplicates = plan(&ranges, &duplicate_literals);
+        let duplicate_build = duplicates.build_accounting();
+        assert_eq!(duplicate_build.union_anchor_offset, 1);
+        assert_eq!(duplicate_build.union_anchor_distinct_bytes, 2);
+        assert_eq!(duplicate_build.union_anchor_max_bucket_literals, 2);
+        assert_eq!(duplicate_build.union_anchor_max_bucket_verification_work, 6);
+        assert_eq!(duplicate_build.union_anchor_collision_pairs, 2);
+        let duplicate_state = duplicates
+            .union_state()
+            .expect("duplicate grouped union state");
+        assert_eq!(duplicate_state.anchor_byte_masks[usize::from(b'b')], 0b0011);
+        assert_eq!(duplicate_state.anchor_byte_masks[usize::from(b'c')], 0b1100);
+
+        let prefix_literals: [&[u8]; 4] = [b"b", b"ba", b"bab", b"baba"];
+        let prefixes = plan(&ranges, &prefix_literals);
+        let prefix_build = prefixes.build_accounting();
+        assert_eq!(prefix_build.union_anchor_offset, 0);
+        assert_eq!(prefix_build.union_anchor_distinct_bytes, 1);
+        assert_eq!(prefix_build.union_anchor_max_bucket_literals, 4);
+        assert_eq!(prefix_build.union_anchor_max_bucket_verification_work, 14);
+        assert_eq!(prefix_build.union_anchor_collision_pairs, 6);
+        assert_eq!(
+            prefixes
+                .union_state()
+                .expect("prefix grouped union state")
+                .anchor_byte_masks[usize::from(b'b')],
+            0b1111
+        );
+    }
+
+    #[test]
+    fn grouped_prefixes_duplicates_and_fixed_columns_match_oracle_exhaustively() {
+        fn exercise(literals: &[&[u8]], pattern: &str) {
+            fn visit(
+                depth: usize,
+                tokens: &[&[u8]],
+                haystack: &mut Vec<u8>,
+                plan: &ReverseInnerPlan,
+                regex: &Regex,
+            ) {
+                assert_matches_oracle(plan, regex, haystack);
+                if depth == 4 {
+                    return;
+                }
+                for token in tokens {
+                    let old_len = haystack.len();
+                    haystack.extend_from_slice(token);
+                    visit(depth + 1, tokens, haystack, plan, regex);
+                    haystack.truncate(old_len);
+                }
+            }
+
+            let ranges = [('a', 'd'), ('λ', 'λ')];
+            let plan = plan(&ranges, literals);
+            assert!(plan.build_accounting().adaptive_union);
+            let regex = oracle(pattern);
+            let tokens: [&[u8]; 8] = [
+                b"a",
+                b"b",
+                b"c",
+                b"d",
+                "λ".as_bytes(),
+                b"-",
+                b"\xff",
+                b"\x80",
+            ];
+            visit(0, &tokens, &mut Vec::new(), &plan, &regex);
+        }
+
+        exercise(
+            &[b"aab", b"abb", b"acb", b"adb"],
+            r"(?:[a-dλ]+aab[a-dλ]+|[a-dλ]+abb[a-dλ]+|[a-dλ]+acb[a-dλ]+|[a-dλ]+adb[a-dλ]+)",
+        );
+        exercise(
+            &[b"b", b"ba", b"bab", b"baba"],
+            r"(?:[a-dλ]+b[a-dλ]+|[a-dλ]+ba[a-dλ]+|[a-dλ]+bab[a-dλ]+|[a-dλ]+baba[a-dλ]+)",
+        );
+        exercise(
+            &[b"ab", b"ab", b"ac", b"ac"],
+            r"(?:[a-dλ]+ab[a-dλ]+|[a-dλ]+ab[a-dλ]+|[a-dλ]+ac[a-dλ]+|[a-dλ]+ac[a-dλ]+)",
+        );
+    }
+
+    #[test]
+    fn grouped_same_start_exists_keeps_source_order_and_shortest_checks_all_lengths() {
+        let ranges = [('a', 'z'), ('λ', 'λ')];
+        let literals: [&[u8]; 3] = [b"baba", b"b", b"ba"];
+        let plan = plan(&ranges, &literals);
+        assert_eq!(plan.build_accounting().union_anchor_offset, 0);
+        assert_eq!(plan.build_accounting().union_anchor_max_bucket_literals, 3);
+        let haystack = b"qbabaq";
+        let window = Window::full(haystack);
+        let mut actual = super::ReduceActualCounters::default();
+        let candidate = match plan
+            .next_union_candidate(haystack, window.start(), window.end(), &mut actual)
+            .expect("same-start grouped candidate")
+        {
+            super::UnionNext::Candidate(candidate) => candidate,
+            other => panic!("expected exact grouped candidate, got {other:?}"),
+        };
+        assert_eq!(candidate.start, 1);
+        assert_eq!(candidate.matching_mask, 0b111);
+        let source_first = plan
+            .prove_union_endpoint_candidate(
+                haystack,
+                window,
+                super::SearchProjection::Exists,
+                candidate,
+                &mut actual,
+            )
+            .expect("source-ordered grouped existence");
+        assert_eq!(source_first, Some((0, 6)));
+        let earliest = plan
+            .prove_union_endpoint_candidate(
+                haystack,
+                window,
+                super::SearchProjection::EarliestEnd,
+                candidate,
+                &mut actual,
+            )
+            .expect("all-length grouped earliest end");
+        assert_eq!(earliest, Some((0, 3)));
+        assert_eq!(
+            plan.shortest(haystack, SearchLimits::unlimited())
+                .expect("public grouped shortest")
+                .0,
+            Some(3)
+        );
+        assert_eq!(
+            plan.find(haystack, SearchLimits::unlimited())
+                .expect("public grouped selected span")
+                .0,
+            Some((0, 6))
+        );
+    }
+
+    #[test]
+    fn grouped_union_windows_and_invalid_utf8_boundaries_match_slice_oracle() {
+        let ranges = [('a', 'd'), ('λ', 'λ')];
+        let literals: [&[u8]; 4] = [b"aab", b"abb", b"acb", b"adb"];
+        let plan = plan(&ranges, &literals);
+        let regex = oracle(
+            r"(?:[a-dλ]+aab[a-dλ]+|[a-dλ]+abb[a-dλ]+|[a-dλ]+acb[a-dλ]+|[a-dλ]+adb[a-dλ]+)",
+        );
+        let haystack = b"\xff\x80\xce\xbbaab\xce\xbb-adbb-\xed\xa0\x80acbd\xce";
+        for start in 0..=haystack.len() {
+            for end in start..=haystack.len() {
+                let window = Window::new(start, end);
+                let expected = oracle_aggregates(&regex, &haystack[start..end]);
+                let expected_find = regex
+                    .find(&haystack[start..end])
+                    .map(|matched| (start + matched.start(), start + matched.end()));
+                let expected_shortest = regex
+                    .shortest_match(&haystack[start..end])
+                    .map(|matched_end| start + matched_end);
+                let count = plan
+                    .count_in(haystack, window, ReduceLimits::unlimited())
+                    .expect("grouped window count");
+                let sum = plan
+                    .span_sum_in(haystack, window, ReduceLimits::unlimited())
+                    .expect("grouped window span sum");
+                let (found, _) = plan
+                    .find_in(haystack, window, SearchLimits::unlimited())
+                    .expect("grouped window find");
+                let (exists, _) = plan
+                    .is_match_in(haystack, window, SearchLimits::unlimited())
+                    .expect("grouped window exists");
+                let (shortest, _) = plan
+                    .shortest_in(haystack, window, SearchLimits::unlimited())
+                    .expect("grouped window shortest");
+                assert_eq!((count.count, sum.span_sum), expected, "window={start}..{end}");
+                assert_eq!(found, expected_find, "find window={start}..{end}");
+                assert_eq!(exists, expected_find.is_some(), "exists window={start}..{end}");
+                assert_eq!(shortest, expected_shortest, "shortest window={start}..{end}");
+            }
+        }
     }
 
     fn assert_all_operations_fallback_to_later_match(
@@ -4516,6 +5094,193 @@ mod tests {
     }
 
     #[test]
+    fn grouped_dense_false_anchor_fallback_resumes_without_skipping_overlap() {
+        let ranges = [('a', 'z'), ('λ', 'λ')];
+        let literals: [&[u8]; 4] = [b"aab", b"abb", b"acb", b"adb"];
+        let plan = plan(&ranges, &literals);
+        assert_eq!(plan.build_accounting().union_anchor_offset, 1);
+        let haystack = b"xaxaxa-zaabz";
+        let probe = plan
+            .count(haystack, ReduceLimits::unlimited())
+            .expect("grouped false-anchor fallback probe");
+        assert_eq!(probe.accounting.actual.union_root_candidates, 1);
+        assert_eq!(probe.accounting.actual.union_exact_candidates, 0);
+        assert_eq!(probe.accounting.actual.union_fallbacks, 1);
+        assert!(probe.accounting.actual.outer_finder_calls > 0);
+        assert_all_operations_fallback_to_later_match(&plan, haystack, (7, 12), 12);
+    }
+
+    #[test]
+    fn grouped_union_is_plan_local_and_observes_same_address_mutation() {
+        let ranges = [('a', 'z'), ('λ', 'λ')];
+        let first = plan(&ranges, &[b"aab", b"abb"]);
+        let second = plan(&ranges, &[b"acb", b"adb"]);
+        assert_eq!(first.build_accounting().union_anchor_offset, 1);
+        assert_eq!(second.build_accounting().union_anchor_offset, 1);
+        let mut haystack = b"zaabz".to_vec();
+        let address = haystack.as_ptr();
+
+        assert_eq!(
+            first
+                .find(&haystack, SearchLimits::unlimited())
+                .expect("first grouped plan before mutation")
+                .0,
+            Some((0, 5))
+        );
+        assert!(
+            first
+                .is_match(&haystack, SearchLimits::unlimited())
+                .expect("first grouped endpoint before mutation")
+                .0
+        );
+        assert_eq!(
+            first
+                .shortest(&haystack, SearchLimits::unlimited())
+                .expect("first grouped shortest before mutation")
+                .0,
+            Some(5)
+        );
+        assert_eq!(
+            second
+                .find(&haystack, SearchLimits::unlimited())
+                .expect("second grouped plan before mutation")
+                .0,
+            None
+        );
+
+        haystack.copy_from_slice(b"zacbz");
+        assert_eq!(haystack.as_ptr(), address);
+        assert_eq!(
+            first
+                .find(&haystack, SearchLimits::unlimited())
+                .expect("first grouped plan after mutation")
+                .0,
+            None
+        );
+        assert_eq!(
+            second
+                .find(&haystack, SearchLimits::unlimited())
+                .expect("second grouped plan after mutation")
+                .0,
+            Some((0, 5))
+        );
+        assert!(
+            second
+                .is_match(&haystack, SearchLimits::unlimited())
+                .expect("second grouped endpoint after mutation")
+                .0
+        );
+        assert_eq!(
+            second
+                .shortest(&haystack, SearchLimits::unlimited())
+                .expect("second grouped shortest after mutation")
+                .0,
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn grouped_union_build_reduce_and_endpoint_limits_close_exactly() {
+        let ranges = [('a', 'z'), ('λ', 'λ')];
+        let literals: [&[u8]; 4] = [b"b", b"ba", b"bab", b"baba"];
+        let baseline = ReverseInnerPlan::build_attempt(
+            ranges.iter().copied(),
+            &literals,
+            BuildLimits::unlimited(),
+        )
+        .expect("grouped baseline build");
+        let build = baseline.into_plan().build_accounting();
+        assert!(build.adaptive_union);
+        assert_eq!(build.union_anchor_max_bucket_literals, 4);
+        assert_eq!(build.union_anchor_collision_pairs, 6);
+        assert!(build.union_anchor_selection_work > 0);
+        let exact_build = BuildLimits {
+            max_source_ranges: build.source_ranges,
+            max_literals: build.literal_count,
+            max_literal_bytes: 4,
+            max_total_literal_bytes: build.literal_bytes,
+            max_build_work: build.work,
+            max_scratch_bytes: build.scratch_bytes,
+            max_persistent_bytes: build.persistent_bytes,
+            max_peak_bytes: build.peak_bytes,
+        };
+        let exact_attempt = ReverseInnerPlan::build_attempt(
+            ranges.iter().copied(),
+            &literals,
+            exact_build,
+        )
+        .expect("exact grouped build limits");
+        let (plan, actual) = exact_attempt.into_parts();
+        assert_eq!(plan.build_accounting(), build);
+        assert_eq!(actual.work, u64::try_from(build.work).unwrap());
+        let one_below = ReverseInnerPlan::build_attempt(
+            ranges.iter().copied(),
+            &literals,
+            BuildLimits {
+                max_build_work: build.work - 1,
+                ..exact_build
+            },
+        )
+        .expect_err("one-below grouped build work");
+        assert_eq!(
+            one_below.source(),
+            &BuildError::WorkLimit {
+                needed: build.work,
+                limit: build.work - 1,
+            }
+        );
+        assert_eq!(one_below.actual().work, u64::try_from(build.work).unwrap());
+        assert_eq!(one_below.actual().allocations, 0);
+
+        let haystack = b"qbabq";
+        let upper = plan
+            .full_window_upper_bounds(haystack.len())
+            .expect("grouped reduction bounds");
+        let exact_reduce = exact_reduce_limits(upper);
+        plan.count(haystack, exact_reduce)
+            .expect("exact grouped reduction limits");
+        assert!(matches!(
+            plan.count(
+                haystack,
+                ReduceLimits {
+                    max_work: upper.work - 1,
+                    ..exact_reduce
+                },
+            ),
+            Err(ReduceError::WorkLimit { .. })
+        ));
+
+        let (_, endpoint) = plan
+            .shortest(haystack, SearchLimits::unlimited())
+            .expect("grouped endpoint bounds");
+        assert_eq!(
+            endpoint.upper_bounds.decode_byte_checks,
+            (16 + 8 + 4 * build.union_anchor_max_bucket_literals) * haystack.len()
+        );
+        assert_eq!(
+            endpoint.upper_bounds.membership_tests,
+            (2 + 1 + build.union_anchor_max_bucket_literals) * haystack.len()
+        );
+        let endpoint_work = u64::try_from(endpoint.upper_bounds.work).unwrap();
+        let exact_search = SearchLimits {
+            max_work_upper_bound: endpoint_work,
+            max_scratch_bytes: endpoint.upper_bounds.scratch_bytes,
+        };
+        plan.shortest(haystack, exact_search)
+            .expect("exact grouped endpoint limits");
+        assert!(matches!(
+            plan.shortest(
+                haystack,
+                SearchLimits {
+                    max_work_upper_bound: endpoint_work - 1,
+                    ..exact_search
+                },
+            ),
+            Err(ReduceError::WorkLimit { .. })
+        ));
+    }
+
+    #[test]
     fn false_root_fallback_preserves_later_viable_literal_in_same_run() {
         let plan = plan(&SMALL_CLASS, &SMALL_LITERALS);
         let count = plan
@@ -4539,7 +5304,7 @@ mod tests {
     }
 
     #[test]
-    fn sixteen_way_common_root_uses_independent_finder_plan() {
+    fn sixteen_way_common_root_selects_unique_second_column_union() {
         let literals: [&[u8]; 16] = [
             b"aa", b"ab", b"ac", b"ad", b"ae", b"af", b"ag", b"ah", b"ai", b"aj",
             b"ak", b"al", b"am", b"an", b"ao", b"ap",
@@ -4548,13 +5313,21 @@ mod tests {
         let build = plan.build_accounting();
         assert_eq!(build.literal_count, 16);
         assert_eq!(build.distinct_literal_first_bytes, 1);
-        assert!(!build.adaptive_union);
-        assert_eq!(plan.count_identity().plan_id, PLAN_ID);
-        assert_eq!(plan.count_identity().accounting_id, ACCOUNTING_ID);
-        let upper = plan.full_window_upper_bounds(256).expect("incumbent bounds");
-        assert_eq!(upper.union_scan_calls, 0);
-        assert_eq!(upper.union_root_candidates, 0);
-        assert_eq!(upper.union_verification_bytes, 0);
+        assert!(build.adaptive_union);
+        assert_eq!(build.union_anchor_offset, 1);
+        assert_eq!(build.union_anchor_distinct_bytes, 16);
+        assert_eq!(build.union_anchor_max_bucket_literals, 1);
+        assert_eq!(build.union_anchor_collision_pairs, 0);
+        assert_eq!(plan.count_identity().plan_id, UNION_PLAN_ID);
+        assert_eq!(plan.count_identity().accounting_id, UNION_ACCOUNTING_ID);
+        let state = plan.union_state().expect("sixteen-way grouped union state");
+        assert_eq!(state.anchor_byte_masks[usize::from(b'a')], 1);
+        assert_eq!(state.anchor_byte_masks[usize::from(b'p')], 1_u16 << 15);
+        let absent = plan
+            .count(b"qqqqqqqqqqqqqqqq", ReduceLimits::unlimited())
+            .expect("grouped-column absent reduction");
+        assert_eq!(absent.accounting.actual.union_scan_calls, 1);
+        assert_eq!(absent.accounting.actual.outer_finder_calls, 0);
     }
 
     #[test]
