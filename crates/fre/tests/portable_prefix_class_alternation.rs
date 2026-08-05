@@ -899,6 +899,22 @@ fn dispatched_ordinary_search_matches_scalar_across_windows_and_limits() {
         .is_match_in(haystack, full, KernelSearchLimits::unlimited())
         .expect("dispatched baseline exists");
     assert_eq!(
+        scalar_exists_accounting.actual,
+        dispatched_exists_accounting.actual
+    );
+    assert_eq!(
+        scalar_exists_accounting.upper_bounds.work,
+        dispatched_exists_accounting.upper_bounds.work
+    );
+    assert_eq!(
+        scalar_exists_accounting.upper_bounds.prefix_candidates,
+        dispatched_exists_accounting.upper_bounds.prefix_candidates
+    );
+    assert_eq!(
+        scalar_exists_accounting.upper_bounds.class_bytes,
+        dispatched_exists_accounting.upper_bounds.class_bytes
+    );
+    assert_eq!(
         dispatched_build.persistent_bytes,
         dispatched_exists_accounting.upper_bounds.persistent_bytes
     );
@@ -942,6 +958,13 @@ fn dispatched_ordinary_search_matches_scalar_across_windows_and_limits() {
             },
         )
         .is_err());
+    assert_eq!(
+        dispatched_exists,
+        dispatched
+            .is_match_in(haystack, full, dispatched_exists_exact)
+            .expect("dispatched existence retry after one-below refusal")
+            .0
+    );
 
     let (scalar_shortest, scalar_shortest_accounting) = scalar
         .shortest_in(haystack, full, KernelSearchLimits::unlimited())
@@ -949,6 +972,22 @@ fn dispatched_ordinary_search_matches_scalar_across_windows_and_limits() {
     let (dispatched_shortest, dispatched_shortest_accounting) = dispatched
         .shortest_in(haystack, full, KernelSearchLimits::unlimited())
         .expect("dispatched baseline shortest");
+    assert_eq!(
+        scalar_shortest_accounting.actual,
+        dispatched_shortest_accounting.actual
+    );
+    assert_eq!(
+        scalar_shortest_accounting.upper_bounds.work,
+        dispatched_shortest_accounting.upper_bounds.work
+    );
+    assert_eq!(
+        scalar_shortest_accounting.upper_bounds.prefix_candidates,
+        dispatched_shortest_accounting.upper_bounds.prefix_candidates
+    );
+    assert_eq!(
+        scalar_shortest_accounting.upper_bounds.class_bytes,
+        dispatched_shortest_accounting.upper_bounds.class_bytes
+    );
     assert_eq!(
         dispatched_build.persistent_bytes,
         dispatched_shortest_accounting.upper_bounds.persistent_bytes
@@ -993,6 +1032,13 @@ fn dispatched_ordinary_search_matches_scalar_across_windows_and_limits() {
             },
         )
         .is_err());
+    assert_eq!(
+        dispatched_shortest,
+        dispatched
+            .shortest_in(haystack, full, dispatched_shortest_exact)
+            .expect("dispatched shortest retry after one-below refusal")
+            .0
+    );
 
     assert!(dispatched
         .shortest_in(haystack, invalid, KernelSearchLimits::unlimited())
