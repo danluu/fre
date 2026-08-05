@@ -7,6 +7,7 @@ use fre::{
 };
 use fre_kernels::{
     DispatchedPrefixClassAlternationPlan as KernelDispatchedPlan,
+    PrefixClassAlternationBuildError as KernelBuildError,
     PrefixClassAlternationBuildLimits as KernelBuildLimits,
     PrefixClassAlternationPlan as KernelPlan,
     PrefixClassAlternationSearchAccounting as KernelSearchAccounting,
@@ -312,6 +313,9 @@ fn force_k0_bypasses_prefix_class_route() {
 #[test]
 fn search_limits_use_the_published_source_independent_envelope() {
     let actual = automatic(PATTERN);
+    let build = actual
+        .prefix_class_alternation_build_accounting()
+        .expect("prefix/class build accounting");
     let haystack = b"xxxxxxxxab12345";
     let (_, accounting) = actual
         .find(haystack, SearchLimits::unlimited())
@@ -319,6 +323,8 @@ fn search_limits_use_the_published_source_independent_envelope() {
     let SearchAccounting::PrefixClassAlternation(accounting) = accounting else {
         panic!("prefix/class accounting was not selected")
     };
+    assert_eq!(build.persistent_bytes, accounting.upper_bounds.persistent_bytes);
+    assert_eq!(build.peak_bytes, accounting.upper_bounds.peak_bytes);
     let exact = u64::try_from(accounting.upper_bounds.work).expect("small work bound");
     actual
         .find(
@@ -346,6 +352,9 @@ fn search_limits_use_the_published_source_independent_envelope() {
 #[test]
 fn exists_shortest_and_invalid_end_preserve_operation_envelopes() {
     let actual = automatic(PATTERN);
+    let build = actual
+        .prefix_class_alternation_build_accounting()
+        .expect("prefix/class build accounting");
     let haystack = b"xxab123!cdAZ";
 
     let (expected_exists, exists_accounting) = actual
@@ -358,6 +367,11 @@ fn exists_shortest_and_invalid_end_preserve_operation_envelopes() {
         fre::PREFIX_CLASS_ALTERNATION_EXISTS_OPERATION_ID,
         exists_accounting.identity.operation_id
     );
+    assert_eq!(
+        build.persistent_bytes,
+        exists_accounting.upper_bounds.persistent_bytes
+    );
+    assert_eq!(build.peak_bytes, exists_accounting.upper_bounds.peak_bytes);
     let exact_exists = SearchLimits {
         max_work: u64::try_from(exists_accounting.upper_bounds.work)
             .expect("small existence bound"),
@@ -388,6 +402,14 @@ fn exists_shortest_and_invalid_end_preserve_operation_envelopes() {
     assert_eq!(
         fre::PREFIX_CLASS_ALTERNATION_SHORTEST_SEARCH_OPERATION_ID,
         shortest_accounting.identity.operation_id
+    );
+    assert_eq!(
+        build.persistent_bytes,
+        shortest_accounting.upper_bounds.persistent_bytes
+    );
+    assert_eq!(
+        build.peak_bytes,
+        shortest_accounting.upper_bounds.peak_bytes
     );
     let exact_shortest = SearchLimits {
         max_work: u64::try_from(shortest_accounting.upper_bounds.work)
@@ -473,6 +495,85 @@ fn planner_and_persistent_limits_are_exact_at_publication() {
             .build(),
         Err(BuildError::PersistentBytesLimit { .. })
             | Err(BuildError::PrefixClassAlternation(_))
+    ));
+}
+
+#[test]
+fn prefix_class_build_limits_are_independent_and_exact() {
+    fn build_with(limits: BuildLimits) -> Result<fre::PortableRegex, BuildError> {
+        PortableBuilder::new(PATTERN)
+            .unicode(false)
+            .limits(limits)
+            .build()
+    }
+
+    let baseline = automatic(PATTERN);
+    let accounting = baseline
+        .prefix_class_alternation_build_accounting()
+        .expect("prefix/class build accounting");
+
+    let mut sibling_zero = BuildLimits::default();
+    sibling_zero.literal_class_run_literal.max_literal_bytes = 0;
+    sibling_zero.literal_class_run_literal.max_class_ranges = 0;
+    sibling_zero.literal_class_run_literal.max_class_members = 0;
+    let independent = build_with(sibling_zero).expect("independent prefix/class limits");
+    assert_eq!(
+        PlanKind::PrefixClassAlternation,
+        independent.build_report().plan
+    );
+
+    let mut exact = BuildLimits::default();
+    exact.prefix_class_alternation = KernelBuildLimits {
+        max_shape_units: accounting.shape_units,
+        max_build_work: accounting.work_upper_bound,
+        max_scratch_bytes: accounting.scratch_bytes,
+        max_persistent_bytes: accounting.persistent_bytes,
+        max_peak_bytes: accounting.peak_bytes,
+    };
+    assert_eq!(
+        accounting,
+        build_with(exact)
+            .expect("exact prefix/class build limits")
+            .prefix_class_alternation_build_accounting()
+            .expect("exact prefix/class build accounting")
+    );
+
+    let mut below_shape = exact;
+    below_shape.prefix_class_alternation.max_shape_units -= 1;
+    assert!(matches!(
+        build_with(below_shape),
+        Err(BuildError::PrefixClassAlternation(
+            KernelBuildError::ShapeLimit { needed, limit }
+        )) if needed == accounting.shape_units && limit + 1 == needed
+    ));
+
+    let mut below_work = exact;
+    below_work.prefix_class_alternation.max_build_work -= 1;
+    assert!(matches!(
+        build_with(below_work),
+        Err(BuildError::PrefixClassAlternation(
+            KernelBuildError::WorkLimit { needed, limit }
+        )) if needed == accounting.work_upper_bound && limit + 1 == needed
+    ));
+
+    let mut below_persistent = exact;
+    below_persistent
+        .prefix_class_alternation
+        .max_persistent_bytes -= 1;
+    assert!(matches!(
+        build_with(below_persistent),
+        Err(BuildError::PrefixClassAlternation(
+            KernelBuildError::PersistentLimit { needed, limit }
+        )) if needed == accounting.persistent_bytes && limit + 1 == needed
+    ));
+
+    let mut below_peak = exact;
+    below_peak.prefix_class_alternation.max_peak_bytes -= 1;
+    assert!(matches!(
+        build_with(below_peak),
+        Err(BuildError::PrefixClassAlternation(
+            KernelBuildError::PeakLimit { needed, limit }
+        )) if needed == accounting.peak_bytes && limit + 1 == needed
     ));
 }
 
@@ -608,7 +709,7 @@ fn dispatched_ordinary_search_matches_scalar_across_windows_and_limits() {
     if !KernelPlan::run_scanners_usable(dispatch) {
         return;
     }
-    let dispatched = KernelDispatchedPlan::build_with_dispatch(
+    let dispatched_attempt = KernelDispatchedPlan::build_attempt_with_dispatch(
         dispatch,
         [b"ab", b"cd"],
         [
@@ -618,6 +719,22 @@ fn dispatched_ordinary_search_matches_scalar_across_windows_and_limits() {
         KernelBuildLimits::unlimited(),
     )
     .expect("dispatched prefix/class kernel");
+    let dispatched_actual = dispatched_attempt.actual();
+    let dispatched = dispatched_attempt.into_plan();
+    let dispatched_build = dispatched.build_accounting();
+    assert_eq!(
+        u64::try_from(dispatched_build.work_upper_bound).expect("small build work"),
+        dispatched_actual.work
+    );
+    assert_eq!(
+        dispatched_build.persistent_bytes,
+        dispatched_actual.live_persistent_bytes
+    );
+    assert_eq!(
+        dispatched_build.persistent_bytes,
+        dispatched_actual.initialized_bytes
+    );
+    assert_eq!(dispatched_build.peak_bytes, dispatched_actual.peak_bytes);
 
     for start in 0..=haystack.len() {
         for end in start..=haystack.len() {
@@ -665,6 +782,14 @@ fn dispatched_ordinary_search_matches_scalar_across_windows_and_limits() {
     let (dispatched_find, dispatched_find_accounting) = dispatched
         .find_in(haystack, full, KernelSearchLimits::unlimited())
         .expect("dispatched baseline find");
+    assert_eq!(
+        dispatched_build.persistent_bytes,
+        dispatched_find_accounting.upper_bounds.persistent_bytes
+    );
+    assert_eq!(
+        dispatched_build.peak_bytes,
+        dispatched_find_accounting.upper_bounds.peak_bytes
+    );
     let scalar_find_exact = exact_kernel_limits(scalar_find_accounting);
     let dispatched_find_exact = exact_kernel_limits(dispatched_find_accounting);
     assert_eq!(
@@ -708,6 +833,14 @@ fn dispatched_ordinary_search_matches_scalar_across_windows_and_limits() {
     let (dispatched_exists, dispatched_exists_accounting) = dispatched
         .is_match_in(haystack, full, KernelSearchLimits::unlimited())
         .expect("dispatched baseline exists");
+    assert_eq!(
+        dispatched_build.persistent_bytes,
+        dispatched_exists_accounting.upper_bounds.persistent_bytes
+    );
+    assert_eq!(
+        dispatched_build.peak_bytes,
+        dispatched_exists_accounting.upper_bounds.peak_bytes
+    );
     let scalar_exists_exact = exact_kernel_limits(scalar_exists_accounting);
     let dispatched_exists_exact = exact_kernel_limits(dispatched_exists_accounting);
     assert_eq!(
@@ -751,6 +884,14 @@ fn dispatched_ordinary_search_matches_scalar_across_windows_and_limits() {
     let (dispatched_shortest, dispatched_shortest_accounting) = dispatched
         .shortest_in(haystack, full, KernelSearchLimits::unlimited())
         .expect("dispatched baseline shortest");
+    assert_eq!(
+        dispatched_build.persistent_bytes,
+        dispatched_shortest_accounting.upper_bounds.persistent_bytes
+    );
+    assert_eq!(
+        dispatched_build.peak_bytes,
+        dispatched_shortest_accounting.upper_bounds.peak_bytes
+    );
     let scalar_shortest_exact = exact_kernel_limits(scalar_shortest_accounting);
     let dispatched_shortest_exact = exact_kernel_limits(dispatched_shortest_accounting);
     assert_eq!(

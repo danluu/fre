@@ -814,6 +814,8 @@ pub struct BuildLimits {
     pub required_literal: RequiredLiteralBuildLimits,
     /// Canonical `LITERAL? BYTE_CLASS+ LITERAL?` construction limits.
     pub literal_class_run_literal: LiteralClassRunLiteralBuildLimits,
+    /// Ordered `LITERAL BYTE_CLASS+` alternative construction limits.
+    pub prefix_class_alternation: PrefixClassAlternationBuildLimits,
     /// Unique-boundary `\A CLASS+ SUFFIX (?:\z)?` construction limits.
     pub forward_anchored: ForwardAnchoredBuildLimits,
     /// Maximum checked planner traversal/copy work.
@@ -834,6 +836,7 @@ impl Default for BuildLimits {
             packed_literal_set: PackedLiteralSetBuildLimits::default(),
             required_literal: RequiredLiteralBuildLimits::default(),
             literal_class_run_literal: LiteralClassRunLiteralBuildLimits::default(),
+            prefix_class_alternation: PrefixClassAlternationBuildLimits::default(),
             forward_anchored: ForwardAnchoredBuildLimits::default(),
             max_planner_work: 8_000_000,
             max_persistent_bytes: 268_435_456,
@@ -4480,9 +4483,7 @@ impl PortableBuilder {
                                 .copied()
                                 .map(prefix_class_range_tuple),
                         ],
-                        prefix_class_alternation_build_limits(
-                            self.limits.literal_class_run_literal,
-                        ),
+                        self.limits.prefix_class_alternation,
                     )
                     .map(PortablePlan::DispatchedPrefixClassAlternation)
                 } else {
@@ -4500,9 +4501,7 @@ impl PortableBuilder {
                                 .copied()
                                 .map(prefix_class_range_tuple),
                         ],
-                        prefix_class_alternation_build_limits(
-                            self.limits.literal_class_run_literal,
-                        ),
+                        self.limits.prefix_class_alternation,
                     )
                     .map(PortablePlan::PrefixClassAlternation)
                 }
@@ -12385,20 +12384,6 @@ const fn reverse_inner_build_limits(
         max_literals: REVERSE_INNER_MAX_LITERALS,
         max_literal_bytes: limits.max_literal_bytes,
         max_total_literal_bytes: limits.max_literal_bytes,
-        max_build_work: limits.max_build_work,
-        max_scratch_bytes: limits.max_scratch_bytes,
-        max_persistent_bytes: limits.max_persistent_bytes,
-        max_peak_bytes: limits.max_peak_bytes,
-    }
-}
-
-const fn prefix_class_alternation_build_limits(
-    limits: LiteralClassRunLiteralBuildLimits,
-) -> PrefixClassAlternationBuildLimits {
-    PrefixClassAlternationBuildLimits {
-        max_shape_units: limits
-            .max_literal_bytes
-            .saturating_add(limits.max_class_ranges.saturating_mul(2)),
         max_build_work: limits.max_build_work,
         max_scratch_bytes: limits.max_scratch_bytes,
         max_persistent_bytes: limits.max_persistent_bytes,
