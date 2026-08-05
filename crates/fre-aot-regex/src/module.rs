@@ -1513,6 +1513,12 @@ const AARCH64_FIRST_LANE_INDEX: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11
 /// 32-KiB L1 data cache. Prefix filters and unrelated caller data retain the
 /// remaining capacity; larger machines keep their compact class mapping.
 const DIRECT_BYTE_TABLE_BUDGET: usize = 24 * 1024;
+/// An incomplete retained machine may spend a bounded amount of additional
+/// read-only data to remove the dependent byte-class lookup from every native
+/// transition. The comparison is against the exact narrow class-mapped
+/// geometry, so admission is independent of regex source and target features.
+/// The absolute direct-table budget above remains the final L1-footprint cap.
+const PARTIAL_DIRECT_BYTE_MAX_EXPANSION: usize = 4;
 const CELL_ACCEPTS: u32 = 1_u32 << 31;
 /// The forward table uses this target-derived hint to enter the compact
 /// accelerator dispatcher. Reverse cells deliberately leave it clear.
@@ -1892,17 +1898,38 @@ fn select_native_table_encoding_with_holes(
         forward_states,
         retained_reverse_states,
     );
+    let class_cells = select_cells(TransitionLayout::ClassMapped);
+    let narrow_class_bytes = native_machine_bytes(
+        TransitionLayout::ClassMapped,
+        class_cells,
+        class_count,
+        forward_states,
+        retained_reverse_states,
+    );
+    // Incomplete retained rows are a bounded native prefix followed by an
+    // authenticated side exit. When their exact direct-byte image stays
+    // within both the ordinary 24-KiB cache share and four times the narrow
+    // class-mapped image, remove one dependent load from every prefix
+    // transition. This duplicates only already-authenticated cells across
+    // their complete 256-byte preimages; row, accept, accelerator and hole
+    // tokens are otherwise unchanged.
+    let bounded_partial_direct = resume_states != 0
+        && direct_bytes.is_some_and(|direct| {
+            narrow_class_bytes
+                .and_then(|class| class.checked_mul(PARTIAL_DIRECT_BYTE_MAX_EXPANSION))
+                .is_some_and(|maximum| direct <= maximum)
+        });
     if direct_bytes.is_some_and(|bytes| {
         bytes <= DIRECT_BYTE_TABLE_BUDGET
             && (established_wide_direct
-                || wide_class_bytes.is_some_and(|class_bytes| bytes <= class_bytes))
+                || wide_class_bytes.is_some_and(|class_bytes| bytes <= class_bytes)
+                || bounded_partial_direct)
     }) {
         return (TransitionLayout::DirectByte, direct_cells);
     }
 
     let transitions = TransitionLayout::ClassMapped;
-    let cells = select_cells(transitions);
-    (transitions, cells)
+    (transitions, class_cells)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -29500,6 +29527,30 @@ mod tests {
             select_native_cell_encoding(TransitionLayout::DirectByte, 1, 65, 0),
             NativeCellEncoding::Wide32
         );
+        // Complete machines preserve the established table-size policy. An
+        // incomplete machine may remove the class-map dependency at the exact
+        // four-times boundary, but not one class below it.
+        assert_eq!(
+            select_native_table_encoding_with_holes(60, 32, 0, 0).0,
+            TransitionLayout::ClassMapped
+        );
+        assert_eq!(
+            select_native_table_encoding_with_holes(60, 32, 0, 1),
+            (TransitionLayout::DirectByte, NativeCellEncoding::Compact16)
+        );
+        assert_eq!(
+            select_native_table_encoding_with_holes(59, 32, 0, 1).0,
+            TransitionLayout::ClassMapped
+        );
+        // The independent absolute cache-footprint boundary is inclusive.
+        assert_eq!(
+            select_native_table_encoding_with_holes(64, 48, 0, 1),
+            (TransitionLayout::DirectByte, NativeCellEncoding::Compact16)
+        );
+        assert_eq!(
+            select_native_table_encoding_with_holes(64, 49, 0, 1).0,
+            TransitionLayout::ClassMapped
+        );
 
         let compile_span = |pattern: &str| {
             compile(
@@ -29599,6 +29650,222 @@ mod tests {
             u32::try_from(CLASS_MAP_BYTES).unwrap()
         );
         assert_eq!(&class_data[..CLASS_MAP_BYTES], class_view.dfa.byte_classes);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one invariant compares all raw-byte tokens and both target lookup shapes"
+    )]
+    fn partial_direct_rows_preserve_every_raw_byte_token_and_remove_class_loads() {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum Destination {
+            Dead,
+            Complete(u32),
+            Resume(u32),
+        }
+
+        fn partial_layout(
+            machine_offset: usize,
+            row_bytes: usize,
+            complete_states: usize,
+            resume_states: u32,
+        ) -> NativePartialDfaLayout {
+            let final_row = complete_states
+                .checked_sub(1)
+                .and_then(|state| state.checked_mul(row_bytes))
+                .and_then(|offset| machine_offset.checked_add(offset))
+                .expect("partial test final row");
+            let hole_token_base = encode_native_row_offset(
+                final_row,
+                NativeCellEncoding::Compact16,
+            )
+            .and_then(|token| token.checked_add(1))
+            .and_then(|token| u32::try_from(token).ok())
+            .expect("partial test hole token");
+            NativePartialDfaLayout {
+                hole_token_base,
+                resume_states,
+            }
+        }
+
+        fn decode(
+            packed: u32,
+            machine_offset: usize,
+            row_bytes: usize,
+            partial: NativePartialDfaLayout,
+        ) -> (Destination, bool, bool) {
+            let cells = NativeCellEncoding::Compact16;
+            let token = packed & cells.next_mask();
+            let destination = if token == 0 {
+                Destination::Dead
+            } else if token >= partial.hole_token_base {
+                Destination::Resume(token - partial.hole_token_base)
+            } else {
+                let byte_offset = usize::try_from(token - 1)
+                    .ok()
+                    .and_then(|token| token.checked_mul(cells.row_token_scale()))
+                    .expect("partial test row byte offset");
+                let state = byte_offset
+                    .checked_sub(machine_offset)
+                    .filter(|offset| offset.is_multiple_of(row_bytes))
+                    .and_then(|offset| offset.checked_div(row_bytes))
+                    .and_then(|state| u32::try_from(state).ok())
+                    .expect("partial test complete state");
+                Destination::Complete(state)
+            };
+            (
+                destination,
+                packed & cells.accepts() != 0,
+                packed & cells.accelerated() != 0,
+            )
+        }
+
+        let class_count = 60_usize;
+        let complete_states = 32_usize;
+        let resume_states = 2_u32;
+        let class_offset = CLASS_MAP_BYTES;
+        let class_row_bytes = class_count * NativeCellEncoding::Compact16.bytes();
+        let direct_offset = 0_usize;
+        let direct_row_bytes = DIRECT_BYTE_ROW_CELLS * NativeCellEncoding::Compact16.bytes();
+        let class_partial = partial_layout(
+            class_offset,
+            class_row_bytes,
+            complete_states,
+            resume_states,
+        );
+        let direct_partial = partial_layout(
+            direct_offset,
+            direct_row_bytes,
+            complete_states,
+            resume_states,
+        );
+        let mut covered = [false; 7];
+        for byte in u8::MIN..=u8::MAX {
+            let class = usize::from(byte) % class_count;
+            let kind = class % covered.len();
+            covered[kind] = true;
+            let (next, accepted) = match kind {
+                0 => (NO_DFA_STATE, false),
+                1 => (NO_DFA_STATE, true),
+                2 => (0, false),
+                3 => (1, false),
+                4 => (2, true),
+                5 => (u32::try_from(complete_states).unwrap(), false),
+                6 => (u32::try_from(complete_states).unwrap() + 1, true),
+                _ => unreachable!(),
+            };
+            let class_packed = pack_native_partial_forward_cell(
+                next,
+                accepted,
+                class_offset,
+                class_row_bytes,
+                complete_states,
+                true,
+                class_partial,
+                NativeCellEncoding::Compact16,
+            )
+            .unwrap();
+            let direct_packed = pack_native_partial_forward_cell(
+                next,
+                accepted,
+                direct_offset,
+                direct_row_bytes,
+                complete_states,
+                true,
+                direct_partial,
+                NativeCellEncoding::Compact16,
+            )
+            .unwrap();
+            assert_eq!(
+                decode(
+                    direct_packed,
+                    direct_offset,
+                    direct_row_bytes,
+                    direct_partial,
+                ),
+                decode(
+                    class_packed,
+                    class_offset,
+                    class_row_bytes,
+                    class_partial,
+                ),
+                "raw byte {byte}",
+            );
+        }
+        assert!(covered.into_iter().all(|value| value));
+
+        let mut x86_class = X86Assembler::new();
+        x86_emit_table_lookup(
+            &mut x86_class,
+            TransitionLayout::ClassMapped,
+            NativeCellEncoding::Compact16,
+        )
+        .unwrap();
+        let x86_class = x86_class.finish().unwrap();
+        let mut x86_direct = X86Assembler::new();
+        x86_emit_table_lookup(
+            &mut x86_direct,
+            TransitionLayout::DirectByte,
+            NativeCellEncoding::Compact16,
+        )
+        .unwrap();
+        let x86_direct = x86_direct.finish().unwrap();
+        assert_eq!(
+            x86_class.as_slice(),
+            &[
+                0x0f, 0xb6, 0x04, 0x17, // haystack byte
+                0x41, 0x0f, 0xb6, 0x04, 0x01, // dependent class-map load
+                0x41, 0x0f, 0xb7, 0x04, 0x42, // packed-cell load
+            ]
+        );
+        assert_eq!(
+            x86_direct.as_slice(),
+            &[
+                0x0f, 0xb6, 0x04, 0x17, // haystack byte
+                0x41, 0x0f, 0xb7, 0x04, 0x42, // packed-cell load
+            ]
+        );
+
+        let mut aarch64_class = Aarch64Assembler::new();
+        aarch64_emit_table_lookup(
+            &mut aarch64_class,
+            TransitionLayout::ClassMapped,
+            NativeCellEncoding::Compact16,
+        )
+        .unwrap();
+        let aarch64_class = aarch64_class.finish().unwrap();
+        let aarch64_class = aarch64_class
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let mut aarch64_direct = Aarch64Assembler::new();
+        aarch64_emit_table_lookup(
+            &mut aarch64_direct,
+            TransitionLayout::DirectByte,
+            NativeCellEncoding::Compact16,
+        )
+        .unwrap();
+        let aarch64_direct = aarch64_direct.finish().unwrap();
+        let aarch64_direct = aarch64_direct
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            aarch64_class.as_slice(),
+            &[
+                aarch64_load_byte_reg(8, 0, 2).unwrap(),
+                aarch64_load_byte_reg(8, 5, 8).unwrap(),
+                aarch64_load_h_uxtw(8, 11, 8).unwrap(),
+            ]
+        );
+        assert_eq!(
+            aarch64_direct.as_slice(),
+            &[
+                aarch64_load_byte_reg(8, 0, 2).unwrap(),
+                aarch64_load_h_uxtw(8, 11, 8).unwrap(),
+            ]
+        );
     }
 
     #[test]
