@@ -3810,6 +3810,18 @@ impl<'a> K0SearchSession<'a> {
         self.workspace.construction_accounting()
     }
 
+    /// Whether source-bound span iteration can reuse an admitted root-run
+    /// classifier cursor across successive suffix searches.
+    ///
+    /// This is a source-independent query over construction-authenticated
+    /// session state. It performs no search or workspace mutation.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub const fn retained_root_run_cursor_available(&self) -> bool {
+        self.root_run.is_some()
+    }
+
     /// Whether ordinary reused K0 can represent its full work certificate.
     ///
     /// This source-only query is bound to the session's exact immutable plan.

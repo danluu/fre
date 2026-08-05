@@ -3076,8 +3076,9 @@ impl From<FixedPredicateWord64SearchError> for SearchError {
 /// `max_search_calls` bounds the contextual searches actually executed across
 /// the whole iterator. A deterministic replay of an already emitted empty
 /// match is suppressed without executing another search; its byte- or
-/// scalar-wise progress remains accounted separately. The session and
-/// per-search limits retain their existing operation-specific meanings.
+/// scalar-wise progress remains explicit in the iterator state. Accountingful
+/// iterators report that progress separately. The session and per-search
+/// limits retain their existing operation-specific meanings.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PortableFindIterLimits {
     /// One-time reusable K0 workspace construction limits.
@@ -3101,9 +3102,9 @@ impl PortableFindIterLimits {
 
     /// Retain only the limits applied after session construction.
     ///
-    /// This is useful when moving from [`PortableRegex::find_iter`], which
-    /// constructs a fresh session, to [`PortableSearchSession::find_iter`],
-    /// which reuses an already constructed session.
+    /// This is useful when moving from either fresh [`PortableRegex`] iterator
+    /// to its corresponding [`PortableSearchSession`] iterator, which reuses
+    /// an already constructed session.
     #[must_use]
     pub const fn run(self) -> PortableFindIterRunLimits {
         PortableFindIterRunLimits {
@@ -3126,10 +3127,13 @@ impl Default for PortableFindIterLimits {
 /// Hard limits for one complete iteration on an existing search session.
 ///
 /// Unlike [`PortableFindIterLimits`], this has no session-construction
-/// allowance: [`PortableSearchSession::find_iter`] reuses the session's
-/// already allocated K0 workspace. Each new iterator starts fresh
-/// whole-iterator accounting while the one-time setup facts remain available
-/// from [`PortableSearchSession::workspace_setup_accounting`].
+/// allowance: [`PortableSearchSession::find_iter`] and
+/// [`PortableSearchSession::find_iter_value`] reuse the session's already
+/// allocated K0 workspace. Each new iterator starts with fresh progression and
+/// search-call-cap state. Accountingful iterators additionally start fresh
+/// whole-iterator accounting, while value-only iterators expose no such
+/// aggregate. One-time setup facts remain available from
+/// [`PortableSearchSession::workspace_setup_accounting`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PortableFindIterRunLimits {
     /// Limits applied independently to each contextual search.
@@ -6725,6 +6729,37 @@ impl PortableRegex {
         limits: PortableFindIterLimits,
     ) -> Result<PortableMatches<'r, 'h>, SearchError> {
         self.find_iter_with_progress(haystack, limits, EmptyMatchProgress::Byte)
+    }
+
+    /// Iterate over every non-overlapping byte match through the value-only
+    /// selected-span route.
+    ///
+    /// This retains the search-call cap and Rust bytes empty-match progress of
+    /// [`Self::find_iter`], but deliberately does not aggregate or expose
+    /// unified per-iterator search accounting. That permits value-only K0
+    /// accelerators to participate without requiring facade receipts. Use
+    /// [`Self::find_iter`] when reported iterator accounting is required.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] if reusable session construction exceeds
+    /// `limits.session`. Per-search failures and the whole-iterator call cap
+    /// are yielded as [`PortableFindIterError`] items.
+    pub fn find_iter_value<'r, 'h>(
+        &'r self,
+        haystack: &'h [u8],
+        limits: PortableFindIterLimits,
+    ) -> Result<PortableValueMatches<'r, 'h>, SearchError> {
+        let fixed_predicate_cursor = self.fixed_predicate_search_cursor(haystack);
+        let session = self.search_session(limits.session)?;
+        Ok(PortableValueMatches {
+            session,
+            state: PortableValueMatchIterState::new(
+                haystack,
+                limits.run(),
+                fixed_predicate_cursor,
+            ),
+        })
     }
 
     pub(crate) fn find_iter_utf8<'r, 'h>(
@@ -10763,6 +10798,26 @@ impl<'r> PortableSearchSession<'r> {
         self.find_iter_with_progress(haystack, limits, EmptyMatchProgress::Byte)
     }
 
+    /// Iterate over every non-overlapping byte match through this session's
+    /// value-only selected-span route.
+    ///
+    /// Empty-match progress and the whole-iterator search-call cap are
+    /// identical to [`Self::find_iter`]. The iterator intentionally omits a
+    /// unified per-iterator search-accounting aggregate so value-only
+    /// accelerators can be used without manufacturing facade receipts.
+    #[must_use]
+    pub fn find_iter_value<'s, 'h>(
+        &'s mut self,
+        haystack: &'h [u8],
+        limits: PortableFindIterRunLimits,
+    ) -> PortableSessionValueMatches<'s, 'r, 'h> {
+        let fixed_predicate_cursor = self.fixed_predicate_search_cursor(haystack);
+        PortableSessionValueMatches {
+            session: self,
+            state: PortableValueMatchIterState::new(haystack, limits, fixed_predicate_cursor),
+        }
+    }
+
     pub(crate) fn find_iter_utf8<'s, 'h>(
         &'s mut self,
         haystack: &'h str,
@@ -10799,6 +10854,37 @@ impl<'r> PortableSearchSession<'r> {
             }
             PortableSearchSessionPlan::K0 { .. } => None,
         }
+    }
+
+    fn find_iter_value_at(
+        &mut self,
+        source: &mut K0SpanSourceCursor<'_>,
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<Option<Match>, SearchError> {
+        let retained_root_run = match &self.plan {
+            PortableSearchSessionPlan::K0 {
+                session,
+                correlated_terminal: None,
+                mandatory_suffix: None,
+                mandatory_cut: None,
+                negative_prefilter: None,
+                ..
+            } => session.retained_root_run_cursor_available(),
+            PortableSearchSessionPlan::Native(_)
+            | PortableSearchSessionPlan::K0 { .. } => false,
+        };
+        if retained_root_run {
+            let PortableSearchSessionPlan::K0 { session, .. } = &mut self.plan else {
+                unreachable!("retained K0 root-run cursor was checked above");
+            };
+            let report = session.search_span_at_source_cursor(source, start, limits)?;
+            return Ok(report.into_output().map(|span| Match {
+                start: span.start(),
+                end: span.end(),
+            }));
+        }
+        self.find_at_value(source.haystack(), start, limits)
     }
 
     fn find_iter_at(
@@ -10848,6 +10934,30 @@ pub struct PortableSessionMatches<'s, 'r, 'h> {
     state: PortableMatchIterState<'r, 'h>,
 }
 
+/// Fallible value-only iterator owning a fresh search session.
+///
+/// Unlike [`PortableMatches`], this type exposes no per-search or
+/// whole-iterator work accounting and can therefore dispatch each contextual
+/// search through value-only accelerators. Exact one-time session setup facts
+/// remain available.
+#[derive(Debug)]
+pub struct PortableValueMatches<'r, 'h> {
+    session: PortableSearchSession<'r>,
+    state: PortableValueMatchIterState<'r, 'h>,
+}
+
+/// Fallible value-only iterator borrowing an existing search session.
+///
+/// Dropping the iterator releases the mutable session borrow. The iterator
+/// preserves the same byte progress, error fusion, and search-call cap as
+/// [`PortableSessionMatches`], but exposes no per-search or whole-iterator work
+/// accounting. Exact one-time session setup facts remain available.
+#[derive(Debug)]
+pub struct PortableSessionValueMatches<'s, 'r, 'h> {
+    session: &'s mut PortableSearchSession<'r>,
+    state: PortableValueMatchIterState<'r, 'h>,
+}
+
 #[derive(Debug)]
 enum PortableMatchIterState<'r, 'h> {
     General(PortableMatchIterCore<'h>),
@@ -10873,6 +10983,157 @@ struct PortableMatchIterCore<'h> {
 enum EmptyMatchProgress {
     Byte,
     Utf8Scalar,
+}
+
+#[derive(Debug)]
+enum PortableValueMatchIterState<'r, 'h> {
+    General(PortableValueMatchIterCore<'h>),
+    FixedPredicate {
+        core: PortableValueMatchIterCore<'h>,
+        cursor: FixedPredicateWord64SearchCursor<'r, 'h>,
+    },
+}
+
+#[derive(Debug)]
+struct PortableValueMatchIterCore<'h> {
+    k0_source: K0SpanSourceCursor<'h>,
+    limits: PortableFindIterRunLimits,
+    start: usize,
+    last_match_end: Option<usize>,
+    pending_empty_progress: bool,
+    search_calls: usize,
+    finished: bool,
+}
+
+impl<'h> PortableValueMatchIterCore<'h> {
+    const fn new(haystack: &'h [u8], limits: PortableFindIterRunLimits) -> Self {
+        Self {
+            k0_source: K0SpanSourceCursor::new(haystack),
+            limits,
+            start: 0,
+            last_match_end: None,
+            pending_empty_progress: false,
+            search_calls: 0,
+            finished: false,
+        }
+    }
+
+    fn fail(&mut self, error: PortableFindIterError) -> Result<Match, PortableFindIterError> {
+        self.finished = true;
+        Err(error)
+    }
+
+    fn begin_search(&mut self) -> Result<(), PortableFindIterError> {
+        let needed = self.search_calls.checked_add(1).ok_or(
+            PortableFindIterError::AccountingOverflow {
+                counter: "search-call",
+            },
+        )?;
+        if needed > self.limits.max_search_calls {
+            return Err(PortableFindIterError::SearchCallLimit {
+                needed,
+                limit: self.limits.max_search_calls,
+            });
+        }
+        self.search_calls = needed;
+        Ok(())
+    }
+
+    fn advance_past_repeated_empty(&mut self) -> bool {
+        if self.start == self.k0_source.haystack().len() {
+            self.finished = true;
+            return true;
+        }
+        self.start = self.start.saturating_add(1);
+        false
+    }
+
+    fn advance_pending_empty(&mut self) -> bool {
+        if !self.pending_empty_progress {
+            return false;
+        }
+        self.pending_empty_progress = false;
+        self.advance_past_repeated_empty()
+    }
+
+    fn next_match_with(
+        &mut self,
+        mut search: impl FnMut(
+            &mut K0SpanSourceCursor<'h>,
+            usize,
+            SearchLimits,
+        ) -> Result<Option<Match>, SearchError>,
+    ) -> Option<Result<Match, PortableFindIterError>> {
+        // Keep this byte progression sequence-equivalent to
+        // `PortableMatchIterCore`; the value path differs only in accounting
+        // and the contextual search it invokes.
+        while !self.finished {
+            if self.advance_pending_empty() {
+                return None;
+            }
+            if let Err(error) = self.begin_search() {
+                return Some(self.fail(error));
+            }
+            let matched = match search(&mut self.k0_source, self.start, self.limits.search) {
+                Ok(result) => result,
+                Err(error) => {
+                    return Some(self.fail(PortableFindIterError::Search(error)));
+                }
+            };
+            let Some(matched) = matched else {
+                self.finished = true;
+                return None;
+            };
+
+            if matched.is_empty() && self.last_match_end == Some(matched.end()) {
+                if self.advance_past_repeated_empty() {
+                    return None;
+                }
+                continue;
+            }
+
+            self.start = matched.end();
+            self.last_match_end = Some(matched.end());
+            self.pending_empty_progress = matched.is_empty();
+            return Some(Ok(matched));
+        }
+        None
+    }
+}
+
+impl<'r, 'h> PortableValueMatchIterState<'r, 'h> {
+    const fn new(
+        haystack: &'h [u8],
+        limits: PortableFindIterRunLimits,
+        fixed_predicate_cursor: Option<FixedPredicateWord64SearchCursor<'r, 'h>>,
+    ) -> Self {
+        let core = PortableValueMatchIterCore::new(haystack, limits);
+        match fixed_predicate_cursor {
+            Some(cursor) => Self::FixedPredicate { core, cursor },
+            None => Self::General(core),
+        }
+    }
+
+    fn next_match(
+        &mut self,
+        session: &mut PortableSearchSession<'r>,
+    ) -> Option<Result<Match, PortableFindIterError>> {
+        match self {
+            Self::General(core) => core.next_match_with(|source, start, limits| {
+                session.find_iter_value_at(source, start, limits)
+            }),
+            Self::FixedPredicate { core, cursor } => {
+                core.next_match_with(|_source, start, limits| {
+                    cursor
+                        .find_at(start, fixed_predicate_word64_search_limits(limits))
+                        .map(|(matched, _accounting)| {
+                            matched.map(|(start, end)| Match { start, end })
+                        })
+                        .map_err(SearchError::from)
+                })
+            }
+        }
+    }
 }
 
 impl<'h> PortableMatchIterCore<'h> {
@@ -11140,6 +11401,42 @@ impl<'r, 'h> PortableMatchIterState<'r, 'h> {
         }
     }
 }
+
+impl PortableValueMatches<'_, '_> {
+    /// One-time K0 workspace setup facts, or `None` for native plans.
+    #[must_use]
+    pub const fn workspace_setup_accounting(&self) -> Option<SearchSessionSetupAccounting> {
+        self.session.workspace_setup_accounting()
+    }
+}
+
+impl Iterator for PortableValueMatches<'_, '_> {
+    type Item = Result<Match, PortableFindIterError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.state.next_match(&mut self.session)
+    }
+}
+
+impl core::iter::FusedIterator for PortableValueMatches<'_, '_> {}
+
+impl PortableSessionValueMatches<'_, '_, '_> {
+    /// The reused session's one-time K0 setup facts.
+    #[must_use]
+    pub const fn workspace_setup_accounting(&self) -> Option<SearchSessionSetupAccounting> {
+        self.session.workspace_setup_accounting()
+    }
+}
+
+impl Iterator for PortableSessionValueMatches<'_, '_, '_> {
+    type Item = Result<Match, PortableFindIterError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.state.next_match(self.session)
+    }
+}
+
+impl core::iter::FusedIterator for PortableSessionValueMatches<'_, '_, '_> {}
 
 impl PortableMatches<'_, '_> {
     /// Exact counters accumulated through the most recent iterator action.
@@ -13400,6 +13697,194 @@ mod tests {
     }
 
     #[test]
+    fn value_iterators_preserve_byte_progression_across_plan_families() {
+        fn assert_iterators(
+            fre: &PortableRegex,
+            upstream: &regex::bytes::Regex,
+            haystack: &[u8],
+        ) {
+            let expected = upstream
+                .find_iter(haystack)
+                .map(|matched| (matched.start(), matched.end()))
+                .collect::<Vec<_>>();
+            let accounted = fre
+                .find_iter(haystack, PortableFindIterLimits::unlimited())
+                .unwrap()
+                .map(|matched| {
+                    let matched = matched.unwrap();
+                    (matched.start(), matched.end())
+                })
+                .collect::<Vec<_>>();
+            let fresh_value = fre
+                .find_iter_value(haystack, PortableFindIterLimits::unlimited())
+                .unwrap()
+                .map(|matched| {
+                    let matched = matched.unwrap();
+                    (matched.start(), matched.end())
+                })
+                .collect::<Vec<_>>();
+            let mut session = fre
+                .search_session(SearchSessionLimits::unlimited())
+                .unwrap();
+            let session_value = session
+                .find_iter_value(haystack, PortableFindIterRunLimits::unlimited())
+                .map(|matched| {
+                    let matched = matched.unwrap();
+                    (matched.start(), matched.end())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(accounted, expected);
+            assert_eq!(fresh_value, expected);
+            assert_eq!(session_value, expected);
+        }
+
+        let cases: [(&str, &[u8], bool); 8] = [
+            ("", b"", true),
+            ("", &[0xe2, 0x98, 0x83, 0xff], true),
+            ("a*", b"aba", true),
+            ("(?:a|)", b"ab", true),
+            ("(?:|a)", b"ab", true),
+            (r"\A|a$", b"ba", true),
+            ("aba", b"aba--aba", false),
+            ("alpha|beta|gamma", b"zzalpha-beta-gamma", false),
+        ];
+        for (pattern, haystack, force_k0) in cases {
+            let mut builder = PortableBuilder::new(pattern).unicode(false);
+            if force_k0 {
+                builder = builder.plan_selection(PlanSelection::ForceK0);
+            }
+            let fre = builder.build().unwrap();
+            let upstream = regex::bytes::RegexBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            assert_iterators(&fre, &upstream, haystack);
+        }
+
+        let guarded_pattern = r"(?-u:\b(?:cat|dog)\b)";
+        let guarded = PortableBuilder::new(guarded_pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(guarded.build_report().plan, PlanKind::PackedLiteralSet);
+        let guarded_upstream = regex::bytes::RegexBuilder::new(guarded_pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_iterators(&guarded, &guarded_upstream, b"cat catalog dog");
+
+        let fixed_limits = BuildLimits {
+            literal_set: fre_kernels::LiteralSetBuildLimits {
+                max_patterns: 4,
+                ..fre_kernels::LiteralSetBuildLimits::default()
+            },
+            ..BuildLimits::default()
+        };
+        let fixed_pattern = r"[A-D][\x00-\x7F]Q";
+        let fixed = PortableBuilder::new(fixed_pattern)
+            .unicode(false)
+            .limits(fixed_limits)
+            .build()
+            .unwrap();
+        assert_eq!(fixed.build_report().plan, PlanKind::FixedPredicateWord64);
+        let fixed_upstream = regex::bytes::RegexBuilder::new(fixed_pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_iterators(&fixed, &fixed_upstream, b"A\xffQ A!Q B?Q");
+    }
+
+    #[test]
+    fn value_iterator_limits_fuse_and_release_reused_sessions() {
+        let empty = PortableBuilder::new("")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .unwrap();
+        let mut session = empty
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+
+        let zero = PortableFindIterRunLimits {
+            search: SearchLimits::unlimited(),
+            max_search_calls: 0,
+        };
+        let mut refused = session.find_iter_value(b"ab", zero);
+        assert_eq!(
+            refused.next(),
+            Some(Err(PortableFindIterError::SearchCallLimit {
+                needed: 1,
+                limit: 0,
+            }))
+        );
+        assert_eq!(refused.next(), None);
+        drop(refused);
+
+        let exact = PortableFindIterRunLimits {
+            search: SearchLimits::unlimited(),
+            max_search_calls: 3,
+        };
+        let exact_matches = session
+            .find_iter_value(b"ab", exact)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            exact_matches,
+            vec![
+                Match { start: 0, end: 0 },
+                Match { start: 1, end: 1 },
+                Match { start: 2, end: 2 },
+            ]
+        );
+
+        let one_below = PortableFindIterRunLimits {
+            search: SearchLimits::unlimited(),
+            max_search_calls: 2,
+        };
+        let mut limited = session.find_iter_value(b"ab", one_below);
+        assert_eq!(limited.next().unwrap().unwrap(), Match { start: 0, end: 0 });
+        assert_eq!(limited.next().unwrap().unwrap(), Match { start: 1, end: 1 });
+        assert_eq!(
+            limited.next(),
+            Some(Err(PortableFindIterError::SearchCallLimit {
+                needed: 3,
+                limit: 2,
+            }))
+        );
+        assert_eq!(limited.next(), None);
+        drop(limited);
+
+        let forced = PortableBuilder::new("(?:ab|cd)+Z")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .unwrap();
+        let mut forced_session = forced
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        let no_work = PortableFindIterRunLimits {
+            search: SearchLimits {
+                max_work: 0,
+                max_scratch_bytes: usize::MAX,
+            },
+            max_search_calls: usize::MAX,
+        };
+        let mut failed = forced_session.find_iter_value(b"abZ", no_work);
+        assert!(matches!(
+            failed.next(),
+            Some(Err(PortableFindIterError::Search(_)))
+        ));
+        assert_eq!(failed.next(), None);
+        drop(failed);
+        assert_eq!(
+            forced_session
+                .find_value(b"xxcdZ", SearchLimits::unlimited())
+                .unwrap(),
+            Some(Match { start: 2, end: 5 })
+        );
+    }
+
+    #[test]
     fn fixed_predicate_iterator_cursor_has_a_bounded_inline_layout() {
         let word = core::mem::size_of::<usize>();
         let cursor = core::mem::size_of::<FixedPredicateWord64SearchCursor<'static, 'static>>();
@@ -13655,6 +14140,25 @@ mod tests {
             .map(|matched| matched.map(|matched| (matched.start(), matched.end())))
             .collect();
         assert_eq!(fresh.unwrap(), expected);
+        let fresh_value: Result<Vec<_>, _> = fre
+            .find_iter_value(dense, PortableFindIterLimits::unlimited())
+            .unwrap()
+            .map(|matched| matched.map(|matched| (matched.start(), matched.end())))
+            .collect();
+        assert_eq!(fresh_value.unwrap(), expected);
+
+        let PortableSearchSessionPlan::K0 {
+            session: k0_session,
+            correlated_terminal: None,
+            mandatory_suffix: None,
+            mandatory_cut: None,
+            negative_prefilter: None,
+            ..
+        } = &session.plan
+        else {
+            panic!("root-run value fixture unexpectedly retained a facade sidecar");
+        };
+        assert!(k0_session.retained_root_run_cursor_available());
 
         {
             let mut matches = session.find_iter(dense, PortableFindIterRunLimits::unlimited());
@@ -13690,6 +14194,28 @@ mod tests {
             "a new non-fixed K0 iterator must start with fresh source cursors after early drop"
         );
 
+        {
+            let mut value_matches =
+                session.find_iter_value(dense, PortableFindIterRunLimits::unlimited());
+            assert_eq!(
+                value_matches.next().unwrap().unwrap(),
+                Match { start: 0, end: 2 }
+            );
+            assert_eq!(
+                value_matches.next().unwrap().unwrap(),
+                Match { start: 2, end: 4 }
+            );
+        }
+        let restarted_value: Result<Vec<_>, _> = session
+            .find_iter_value(dense, PortableFindIterRunLimits::unlimited())
+            .map(|matched| matched.map(|matched| (matched.start(), matched.end())))
+            .collect();
+        assert_eq!(
+            restarted_value.unwrap(),
+            expected,
+            "a new value iterator must restart its source-bound root-run cursor after early drop"
+        );
+
         assert_eq!(
             session
                 .find(b"zzaceg", SearchLimits::unlimited())
@@ -13698,6 +14224,86 @@ mod tests {
                 .map(|matched| (matched.start(), matched.end())),
             Some((2, 4))
         );
+    }
+
+    #[test]
+    fn correlated_terminal_value_iterator_keeps_the_sidecar_and_adaptive_route() {
+        let pattern =
+            r"(?-u:\x10(?:\x70[\x30\x31]{0,16}\x60|\x71[\x36\x37]{1,16}\x61))";
+        let fre = PortableBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(fre.build_report().plan, PlanKind::K0);
+        let upstream = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+
+        let mut haystack = Vec::new();
+        for _ in 0..4 {
+            for _ in 0..4_000 {
+                haystack.extend_from_slice(b"\x10\x70\x62");
+            }
+            haystack.extend_from_slice(b"\x10\x70\x30\x60");
+        }
+        let expected = upstream
+            .find_iter(&haystack)
+            .map(|matched| (matched.start(), matched.end()))
+            .collect::<Vec<_>>();
+        assert_eq!(expected.len(), 4);
+
+        let fresh = fre
+            .find_iter_value(&haystack, PortableFindIterLimits::unlimited())
+            .unwrap()
+            .map(|matched| matched.map(|matched| (matched.start(), matched.end())))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(fresh, expected);
+
+        let mut session = fre
+            .search_session(super::SearchSessionLimits::unlimited())
+            .unwrap();
+        let PortableSearchSessionPlan::K0 {
+            correlated_terminal: Some(_),
+            ..
+        } = &session.plan
+        else {
+            panic!("correlated value-iterator fixture lost its facade sidecar");
+        };
+
+        // The first long, decoy-heavy search teaches the adaptive route. A
+        // fresh iterator over the same immutable plan and source then starts
+        // with the terminal sidecar while preserving the complete sequence.
+        {
+            let mut learning = session
+                .find_iter_value(&haystack, PortableFindIterRunLimits::unlimited());
+            assert_eq!(
+                learning.next().unwrap().unwrap(),
+                Match {
+                    start: expected[0].0,
+                    end: expected[0].1,
+                }
+            );
+        }
+        let PortableSearchSessionPlan::K0 {
+            correlated_terminal_span_state,
+            ..
+        } = &mut session.plan
+        else {
+            unreachable!("the fixture was checked as K0 above");
+        };
+        assert!(matches!(
+            correlated_terminal_span_state.select(haystack.len()),
+            super::correlated_bounded_alternation::Route::Terminal { .. }
+        ));
+
+        let retained = session
+            .find_iter_value(&haystack, PortableFindIterRunLimits::unlimited())
+            .map(|matched| matched.map(|matched| (matched.start(), matched.end())))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(retained, expected);
     }
 
     #[test]
