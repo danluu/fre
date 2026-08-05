@@ -97,6 +97,9 @@ const BUILD_FIXED_WORK: usize = 16;
 const BUILD_RANGE_WORK: usize = 4;
 const BUILD_LITERAL_FIXED_WORK: usize = 3;
 const BUILD_LITERAL_BYTE_WORK: usize = 5;
+/// One bytewise hash step for each byte in the domain word, route mode,
+/// distinct-root census, adaptive summary, and six grouped-anchor fields.
+const UNION_RECEIPT_DIGEST_BUILD_WORK: usize = 10 * size_of::<u64>();
 const REDUCE_FIXED_WORK: usize = 16;
 const FINDER_CALL_WORK: usize = 4;
 const RUN_WORK: usize = 8;
@@ -1192,6 +1195,11 @@ impl ReverseInnerPlan {
                         computation: "literal-union construction work",
                     })?;
             }
+            work = checked_add_build(
+                work,
+                UNION_RECEIPT_DIGEST_BUILD_WORK,
+                "union receipt digest work",
+            )?;
             actual.work = u64::try_from(work).map_err(|_| BuildError::ArithmeticOverflow {
                 computation: "build work as u64",
             })?;
@@ -4634,11 +4642,14 @@ mod tests {
     use regex::bytes::{Regex, RegexBuilder};
 
     use super::{
-        BuildError, BuildLimits, COUNT_OPERATION_ID, EXISTS_OPERATION_ID,
-        GROUPED_UNION_ACCOUNTING_ID, GROUPED_UNION_PLAN_ID, GroupedFallbackMeter,
-        MAX_ADMITTED_NON_ASCII_SCALARS, ReduceError, ReduceLimits, ReverseInnerPlan,
-        SEARCH_OPERATION_ID, SHORTEST_SEARCH_OPERATION_ID, SPAN_SUM_OPERATION_ID, ScalarRange,
-        SearchLimits, UNION_ACCOUNTING_ID, UNION_PLAN_ID, UnionMode, UnionState,
+        ASCII_NONMEMBER_RUN_SCANNER_BUILD_WORK, BUILD_FIXED_WORK, BUILD_LITERAL_BYTE_WORK,
+        BUILD_LITERAL_FIXED_WORK, BUILD_RANGE_WORK, BuildError, BuildLimits, COUNT_OPERATION_ID,
+        EXISTS_OPERATION_ID, GROUPED_UNION_ACCOUNTING_ID, GROUPED_UNION_PLAN_ID,
+        GroupedFallbackMeter, MAX_ADMITTED_NON_ASCII_SCALARS, ReduceError, ReduceLimits,
+        ReverseInnerPlan, SEARCH_OPERATION_ID, SHORTEST_SEARCH_OPERATION_ID,
+        SPAN_SUM_OPERATION_ID, ScalarRange, SearchLimits, UNION_ACCOUNTING_ID,
+        UNION_MASK_BUILD_WORK_PER_LITERAL, UNION_PLAN_ID, UNION_RECEIPT_DIGEST_BUILD_WORK,
+        UnionMode, UnionState,
     };
     use crate::{DirectBuildAttemptActual, Window};
 
@@ -5094,6 +5105,53 @@ mod tests {
             ),
             Err(BuildError::PersistentLimit { .. })
         ));
+    }
+
+    #[test]
+    fn cached_union_receipt_hash_work_is_exact_and_preallocation_bounded() {
+        let literal_work = SMALL_LITERALS.iter().fold(0_usize, |work, literal| {
+            work + BUILD_LITERAL_FIXED_WORK + literal.len() * BUILD_LITERAL_BYTE_WORK
+        });
+        let expected_work = BUILD_FIXED_WORK
+            + SMALL_CLASS.len() * BUILD_RANGE_WORK
+            + literal_work
+            + ASCII_NONMEMBER_RUN_SCANNER_BUILD_WORK
+            + SMALL_LITERALS.len() * UNION_MASK_BUILD_WORK_PER_LITERAL
+            + 10 * size_of::<u64>();
+        assert_eq!(UNION_RECEIPT_DIGEST_BUILD_WORK, 10 * size_of::<u64>());
+
+        let exact = ReverseInnerPlan::build_attempt(
+            SMALL_CLASS.iter().copied(),
+            &SMALL_LITERALS,
+            BuildLimits {
+                max_build_work: expected_work,
+                ..BuildLimits::unlimited()
+            },
+        )
+        .expect("exact cached-receipt work limit");
+        let (plan, actual) = exact.into_parts();
+        assert_eq!(plan.build_accounting().work, expected_work);
+        assert_eq!(actual.work, u64::try_from(expected_work).unwrap());
+
+        let one_below = ReverseInnerPlan::build_attempt(
+            SMALL_CLASS.iter().copied(),
+            &SMALL_LITERALS,
+            BuildLimits {
+                max_build_work: expected_work - 1,
+                ..BuildLimits::unlimited()
+            },
+        )
+        .expect_err("one-below cached-receipt work must fail before allocation");
+        assert_eq!(
+            one_below.source(),
+            &BuildError::WorkLimit {
+                needed: expected_work,
+                limit: expected_work - 1,
+            }
+        );
+        assert_eq!(one_below.actual().work, u64::try_from(expected_work).unwrap());
+        assert_eq!(one_below.actual().allocations, 0);
+        assert_eq!(one_below.actual().allocated_bytes, 0);
     }
 
     #[test]
