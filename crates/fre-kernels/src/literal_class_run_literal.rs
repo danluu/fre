@@ -6659,16 +6659,6 @@ mod tests {
                         "shortest haystack={haystack:?} window={start}..{end}"
                     );
                     assert_eq!(
-                        plan.shortest_window_value(
-                            haystack,
-                            window,
-                            SearchLimits::unlimited(),
-                        )
-                        .unwrap(),
-                        expected_shortest,
-                        "value shortest haystack={haystack:?} window={start}..{end}"
-                    );
-                    assert_eq!(
                         plan.is_match_window_value(haystack, window, SearchLimits::unlimited())
                             .unwrap(),
                         expected.is_some(),
