@@ -5342,7 +5342,7 @@ impl PortablePlan {
             Self::BoundedWordClass(plan) => plan.plan_id(),
             Self::FixedPredicateWord64(_) => FIXED_PREDICATE_WORD64_SEARCH_PLAN_ID,
             Self::BoundedByteClassSequence(_) => bounded_byte_class_sequence::PLAN_ID,
-            Self::GuardedLiteralSet(_) => guarded_literal_set::PLAN_ID,
+            Self::GuardedLiteralSet(plan) => plan.plan_id(),
             Self::NullableOptionalChain(_) => nullable_optional_chain::PLAN_ID,
             Self::NullableFiniteTokenRepeat(_) => nullable_finite_token_repeat::PLAN_ID,
         }
@@ -13687,7 +13687,10 @@ mod tests {
             .unicode(false)
             .build()
             .unwrap();
-        assert_eq!(wide.runtime_implementation_id(), "k0");
+        assert_eq!(
+            wide.runtime_implementation_id(),
+            "guarded-ascii-word-literal-set.wide-column-packed-dictionary.v1",
+        );
     }
 
     #[test]

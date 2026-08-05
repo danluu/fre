@@ -54,6 +54,31 @@ pub fn packed_literal_anchor_frequency_rank(byte: u8) -> u8 {
     crate::packed_ordered_literal_aggregate::byte_frequency_rank(byte)
 }
 
+/// Return the packed builder's conservative work envelope from already
+/// authenticated language dimensions, without reading any pattern bytes.
+///
+/// Composite planners can use this prospective before publishing borrowed
+/// pattern references or invoking [`PackedLiteralSetPlan::new`]. The returned
+/// bound is identical to the one enforced by the packed builder's own
+/// preflight.
+pub fn packed_literal_set_build_work_upper_bound_from_dimensions(
+    patterns: usize,
+    pattern_bytes: usize,
+) -> Result<usize, PackedLiteralSetError> {
+    if patterns == 0 {
+        return Err(PackedLiteralSetError::EmptyPatternSet);
+    }
+    if pattern_bytes == 0 {
+        return Err(PackedLiteralSetError::EmptyPattern { index: 0 });
+    }
+    pattern_bytes
+        .checked_add(patterns)
+        .and_then(|work| work.checked_mul(BUILD_FACTOR))
+        .ok_or(PackedLiteralSetError::ArithmeticOverflow {
+            computation: "packed literal build work",
+        })
+}
+
 /// Hard limits for a packed finite-literal plan.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PackedLiteralSetBuildLimits {
@@ -1362,12 +1387,8 @@ fn preflight<P: AsRef<[u8]>>(
             limit: limits.max_pattern_bytes,
         });
     }
-    let build_work_upper_bound = pattern_bytes
-        .checked_add(patterns.len())
-        .and_then(|work| work.checked_mul(BUILD_FACTOR))
-        .ok_or(PackedLiteralSetError::ArithmeticOverflow {
-            computation: "packed literal build work",
-        })?;
+    let build_work_upper_bound =
+        packed_literal_set_build_work_upper_bound_from_dimensions(patterns.len(), pattern_bytes)?;
     if build_work_upper_bound > limits.max_build_work {
         return Err(PackedLiteralSetError::BuildWorkLimit {
             needed: build_work_upper_bound,
@@ -1412,7 +1433,8 @@ mod tests {
     use super::{
         BUILD_FACTOR, NATIVE_FILTER_CANDIDATE_BUDGET, PackedLiteralEngine,
         PackedLiteralSetAccounting, PackedLiteralSetBuildLimits, PackedLiteralSetError,
-        PackedLiteralSetPlan, PackedLiteralSetSearchLimits, select_shared_columns,
+        PackedLiteralSetPlan, PackedLiteralSetSearchLimits,
+        packed_literal_set_build_work_upper_bound_from_dimensions, select_shared_columns,
         select_shared_fragment, select_sparse_anchor, shared_fragment_native_start_budget,
     };
     use crate::Window;
@@ -1604,6 +1626,51 @@ mod tests {
                 assert_eq!(actual, expected, "window={start}..{end}");
             }
         }
+    }
+
+    #[test]
+    fn dimension_only_build_work_matches_packed_preflight() {
+        assert_eq!(
+            packed_literal_set_build_work_upper_bound_from_dimensions(0, 0),
+            Err(PackedLiteralSetError::EmptyPatternSet),
+        );
+        assert_eq!(
+            packed_literal_set_build_work_upper_bound_from_dimensions(1, 0),
+            Err(PackedLiteralSetError::EmptyPattern { index: 0 }),
+        );
+        for pattern_bytes in [usize::MAX, usize::MAX / BUILD_FACTOR] {
+            assert!(matches!(
+                packed_literal_set_build_work_upper_bound_from_dimensions(1, pattern_bytes),
+                Err(PackedLiteralSetError::ArithmeticOverflow {
+                    computation: "packed literal build work",
+                }),
+            ));
+        }
+
+        let patterns: &[&[u8]] = &[b"a", b"bc", b"def"];
+        let pattern_bytes = 6_usize;
+        let expected = pattern_bytes
+            .checked_add(patterns.len())
+            .and_then(|work| work.checked_mul(BUILD_FACTOR))
+            .unwrap();
+        assert_eq!(
+            packed_literal_set_build_work_upper_bound_from_dimensions(
+                patterns.len(),
+                pattern_bytes,
+            ),
+            Ok(expected),
+        );
+        assert!(matches!(
+            PackedLiteralSetPlan::new(
+                patterns,
+                PackedLiteralSetBuildLimits {
+                    max_build_work: expected - 1,
+                    ..PackedLiteralSetBuildLimits::default()
+                },
+            ),
+            Err(PackedLiteralSetError::BuildWorkLimit { needed, limit })
+                if needed == expected && limit == expected - 1,
+        ));
     }
 
     #[test]
