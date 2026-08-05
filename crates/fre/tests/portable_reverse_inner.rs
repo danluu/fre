@@ -1,7 +1,7 @@
 use fre::{
     PlanKind, PlanSelection, PortableBuilder, PortableFindIterLimits,
     REVERSE_INNER_UNION_ACCOUNTING_ID, REVERSE_INNER_UNION_PLAN_ID, SearchAccounting,
-    SearchError, SearchLimits, SearchWindow,
+    SearchError, SearchLimits, SearchSessionLimits, SearchWindow,
 };
 use regex::bytes::{Regex, RegexBuilder};
 
@@ -218,8 +218,10 @@ fn accounting_refuses_one_below_source_independent_work_bound() {
 
 #[test]
 fn calls_are_plan_local_and_observe_same_address_mutation() {
-    let aa = fre(r"[abλ]+aa[abλ]+");
-    let bb = fre(r"[abλ]+bb[abλ]+");
+    let aa = fre(r"[abcλ]+(?:aa|bc)[abcλ]+");
+    let bb = fre(r"[abcλ]+(?:bb|ac)[abcλ]+");
+    assert_eq!(aa.runtime_implementation_id(), REVERSE_INNER_UNION_PLAN_ID);
+    assert_eq!(bb.runtime_implementation_id(), REVERSE_INNER_UNION_PLAN_ID);
     let mut haystack = b"xaaabx".to_vec();
     let address = haystack.as_ptr();
     assert!(aa.is_match_value(&haystack, SearchLimits::unlimited()).unwrap());
@@ -228,6 +230,31 @@ fn calls_are_plan_local_and_observe_same_address_mutation() {
     assert_eq!(haystack.as_ptr(), address);
     assert!(!aa.is_match_value(&haystack, SearchLimits::unlimited()).unwrap());
     assert!(bb.is_match_value(&haystack, SearchLimits::unlimited()).unwrap());
+
+    haystack[1..5].copy_from_slice(b"aaab");
+    assert_eq!(haystack.as_ptr(), address);
+    let mut aa_session = aa
+        .search_session(SearchSessionLimits::unlimited())
+        .expect("aa native session");
+    let mut bb_session = bb
+        .search_session(SearchSessionLimits::unlimited())
+        .expect("bb native session");
+    assert!(aa_session.workspace_setup_accounting().is_none());
+    assert!(bb_session.workspace_setup_accounting().is_none());
+    assert!(aa_session
+        .is_match_value(&haystack, SearchLimits::unlimited())
+        .unwrap());
+    assert!(!bb_session
+        .is_match_value(&haystack, SearchLimits::unlimited())
+        .unwrap());
+    haystack[1..5].copy_from_slice(b"abbb");
+    assert_eq!(haystack.as_ptr(), address);
+    assert!(!aa_session
+        .is_match_value(&haystack, SearchLimits::unlimited())
+        .unwrap());
+    assert!(bb_session
+        .is_match_value(&haystack, SearchLimits::unlimited())
+        .unwrap());
 }
 
 #[test]
@@ -278,6 +305,44 @@ fn structural_gate_keeps_ascii_byte_dense_and_negated_classes_off_reverse_inner(
             automatic.build_report().plan,
             PlanKind::ReverseInner,
             "structurally broad class entered reverse-inner: {pattern}"
+        );
+    }
+}
+
+#[test]
+fn structural_gate_uses_exact_ascii_and_non_ascii_population_boundaries() {
+    for pattern in [
+        r"[\x00-\x3Fλ]+01[\x00-\x3Fλ]+",
+        r"[a\u{10000}-\u{53DDF}]+a[a\u{10000}-\u{53DDF}]+",
+        r"\pL+ab\pL+",
+        r"[a-zλ]+ab[a-zλ]+",
+    ] {
+        assert_eq!(
+            PortableBuilder::new(pattern)
+                .unicode(true)
+                .build()
+                .expect("sparse boundary build")
+                .build_report()
+                .plan,
+            PlanKind::ReverseInner,
+            "sparse boundary class was refused: {pattern}"
+        );
+    }
+    for pattern in [
+        r"[\x00-\x40λ]+01[\x00-\x40λ]+",
+        r"[\x00-\x3F]+01[\x00-\x3F]+",
+        r"[a\u{10000}-\u{53DE0}]+a[a\u{10000}-\u{53DE0}]+",
+        r"[^\x40-\x7F]+01[^\x40-\x7F]+",
+    ] {
+        assert_ne!(
+            PortableBuilder::new(pattern)
+                .unicode(true)
+                .build()
+                .expect("broad boundary fallback build")
+                .build_report()
+                .plan,
+            PlanKind::ReverseInner,
+            "broad boundary class entered reverse-inner: {pattern}"
         );
     }
 }

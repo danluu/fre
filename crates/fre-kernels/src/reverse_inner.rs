@@ -10,8 +10,9 @@
 //! whole-match span: that maximal run. Source-order priority can change an
 //! internal path or capture, but not count or matched-byte sum.
 //!
-//! Sparse mixed-Unicode classes with multiple literals first scan the union of
-//! literal-leading bytes, then verify only literals sharing the observed root.
+//! Sparse mixed-Unicode classes with multiple distinct literal-leading bytes
+//! first scan their union, then verify the one literal bound to the observed
+//! root.
 //! Dense false-root samples, or repeated exact roots whose complete class runs
 //! prove non-accepting, certify a fallback boundary and resume the incumbent
 //! independent `memmem` streams after the proved prefix. Other plans use
@@ -65,6 +66,14 @@ pub const SHORTEST_SEARCH_OPERATION_ID: &str =
 pub const MAX_LITERALS: usize = 16;
 /// Auto admission ceiling for the Unicode class's exact ASCII population.
 pub const MAX_ADMITTED_ASCII_SCALARS: usize = 64;
+/// Auto admission ceiling for the Unicode class's exact non-ASCII population.
+///
+/// This is one quarter of the 1,111,936 valid non-ASCII Unicode scalar values.
+/// It excludes broad complements while retaining genuinely sparse mixed classes.
+pub const MAX_ADMITTED_NON_ASCII_SCALARS: usize = 277_984;
+
+const SURROGATE_START: u32 = 0xD800;
+const SURROGATE_END: u32 = 0xDFFF;
 
 const BUILD_FIXED_WORK: usize = 16;
 const BUILD_RANGE_WORK: usize = 4;
@@ -174,6 +183,8 @@ pub struct BuildAccounting {
     pub retained_non_ascii_ranges: usize,
     pub retained_range_capacity: usize,
     pub ascii_scalars: usize,
+    pub non_ascii_scalars: usize,
+    pub class_scalars: usize,
     pub literal_count: usize,
     pub literal_bytes: usize,
     pub literal_fingerprint: u64,
@@ -663,6 +674,7 @@ impl ReverseInnerPlan {
             let mut ascii = [0_u64; 2];
             let mut retained_non_ascii_ranges = 0_usize;
             let mut ascii_scalars = 0_usize;
+            let mut class_scalars = 0_usize;
             let mut previous_end = None::<u32>;
             let mut work = BUILD_FIXED_WORK;
             for (start, end) in ranges.clone() {
@@ -676,6 +688,11 @@ impl ReverseInnerPlan {
                 }
                 previous_end = Some(end);
                 work = checked_add_build(work, BUILD_RANGE_WORK, "range validation work")?;
+                class_scalars = checked_add_build(
+                    class_scalars,
+                    valid_scalar_population(start, end)?,
+                    "Unicode class scalar population",
+                )?;
                 if start <= 0x7F {
                     let ascii_end = end.min(0x7F);
                     insert_ascii_range(&mut ascii, start, ascii_end)?;
@@ -696,6 +713,16 @@ impl ReverseInnerPlan {
                         "retained non-ASCII range count",
                     )?;
                 }
+            }
+            let non_ascii_scalars = class_scalars.checked_sub(ascii_scalars).ok_or(
+                BuildError::ArithmeticOverflow {
+                    computation: "non-ASCII scalar population",
+                },
+            )?;
+            if ascii_scalars.checked_add(non_ascii_scalars) != Some(class_scalars) {
+                return Err(BuildError::ArithmeticOverflow {
+                    computation: "partitioned Unicode class scalar population",
+                });
             }
 
             let mut literal_bytes = 0_usize;
@@ -760,7 +787,10 @@ impl ReverseInnerPlan {
             }
             let adaptive_union = literals.len() >= 2
                 && retained_non_ascii_ranges != 0
-                && ascii_scalars <= MAX_ADMITTED_ASCII_SCALARS;
+                && non_ascii_scalars != 0
+                && non_ascii_scalars <= MAX_ADMITTED_NON_ASCII_SCALARS
+                && ascii_scalars <= MAX_ADMITTED_ASCII_SCALARS
+                && distinct_literal_first_bytes == literals.len();
             if adaptive_union {
                 let mask_work = literals
                     .len()
@@ -918,6 +948,8 @@ impl ReverseInnerPlan {
                 retained_non_ascii_ranges,
                 retained_range_capacity: source_ranges,
                 ascii_scalars,
+                non_ascii_scalars,
+                class_scalars,
                 literal_count: literals.len(),
                 literal_bytes,
                 literal_fingerprint,
@@ -2982,6 +3014,32 @@ fn ascii_contains(words: [u64; 2], byte: u8) -> bool {
     words[word] & (1_u64 << bit) != 0
 }
 
+fn valid_scalar_population(start: u32, end: u32) -> Result<usize, BuildError> {
+    let population = end
+        .checked_sub(start)
+        .and_then(|width| width.checked_add(1))
+        .ok_or(BuildError::ArithmeticOverflow {
+            computation: "Unicode range scalar population",
+        })?;
+    let surrogate_start = start.max(SURROGATE_START);
+    let surrogate_end = end.min(SURROGATE_END);
+    let surrogate_population = if surrogate_start <= surrogate_end {
+        surrogate_end - surrogate_start + 1
+    } else {
+        0
+    };
+    let valid_population = population.checked_sub(surrogate_population).ok_or(
+        BuildError::ArithmeticOverflow {
+            computation: "Unicode range valid scalar population",
+        },
+    )?;
+    usize::try_from(valid_population).map_err(|_| {
+        BuildError::ArithmeticOverflow {
+            computation: "Unicode range scalar population as usize",
+        }
+    })
+}
+
 fn checked_add_build(
     left: usize,
     right: usize,
@@ -3178,14 +3236,18 @@ const fn is_continuation(byte: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use core::mem::size_of;
+
+    use memchr::memmem::Finder;
     use regex::bytes::{Regex, RegexBuilder};
 
     use super::{
-        BuildError, BuildLimits, COUNT_OPERATION_ID, EXISTS_OPERATION_ID, ReduceError,
-        ReduceLimits, ReverseInnerPlan, SEARCH_OPERATION_ID, SHORTEST_SEARCH_OPERATION_ID,
-        SPAN_SUM_OPERATION_ID, SearchLimits, UNION_ACCOUNTING_ID, UNION_PLAN_ID,
+        ACCOUNTING_ID, BuildError, BuildLimits, COUNT_OPERATION_ID, EXISTS_OPERATION_ID,
+        MAX_ADMITTED_NON_ASCII_SCALARS, PLAN_ID, ReduceError, ReduceLimits, ReverseInnerPlan,
+        SEARCH_OPERATION_ID, SHORTEST_SEARCH_OPERATION_ID, SPAN_SUM_OPERATION_ID, SearchLimits,
+        ScalarRange, UNION_ACCOUNTING_ID, UNION_PLAN_ID, UnionState,
     };
-    use crate::Window;
+    use crate::{DirectBuildAttemptActual, Window};
 
     const ASCII_LETTERS: [(char, char); 2] = [('A', 'Z'), ('a', 'z')];
     const SMALL_CLASS: [(char, char); 2] = [('a', 'b'), ('λ', 'λ')];
@@ -3536,6 +3598,122 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn adaptive_union_build_receipt_exact_limits_and_atomic_one_below() {
+        let baseline = ReverseInnerPlan::build_attempt(
+            SMALL_CLASS.iter().copied(),
+            &SMALL_LITERALS,
+            BuildLimits::unlimited(),
+        )
+        .expect("baseline adaptive-union build");
+        let build = baseline.into_plan().build_accounting();
+        assert!(build.adaptive_union);
+        assert_eq!(build.allocations, build.literal_count + 3);
+        assert_eq!(build.scratch_bytes, 0);
+        let expected_allocated_bytes = build
+            .source_ranges
+            .checked_mul(size_of::<ScalarRange>())
+            .and_then(|bytes| {
+                build
+                    .literal_count
+                    .checked_mul(size_of::<Finder<'static>>())
+                    .and_then(|finder_bytes| bytes.checked_add(finder_bytes))
+            })
+            .and_then(|bytes| bytes.checked_add(build.literal_bytes))
+            .and_then(|bytes| bytes.checked_add(size_of::<UnionState>()))
+            .expect("small exact allocation receipt");
+        assert_eq!(build.allocated_bytes, expected_allocated_bytes);
+
+        let exact = BuildLimits {
+            max_source_ranges: build.source_ranges,
+            max_literals: build.literal_count,
+            max_literal_bytes: 2,
+            max_total_literal_bytes: build.literal_bytes,
+            max_build_work: build.work,
+            max_scratch_bytes: build.scratch_bytes,
+            max_persistent_bytes: build.persistent_bytes,
+            max_peak_bytes: build.peak_bytes,
+        };
+        let attempt = ReverseInnerPlan::build_attempt(
+            SMALL_CLASS.iter().copied(),
+            &SMALL_LITERALS,
+            exact,
+        )
+        .expect("exact adaptive-union build limits");
+        let (plan, actual) = attempt.into_parts();
+        assert_eq!(plan.build_accounting(), build);
+        assert_eq!(actual.work, u64::try_from(build.work).unwrap());
+        assert_eq!(actual.allocations, build.literal_count + 3);
+        assert_eq!(actual.allocated_bytes, build.allocated_bytes);
+        assert_eq!(actual.copied_bytes, build.literal_bytes);
+        assert_eq!(actual.live_persistent_bytes, build.persistent_bytes);
+        assert_eq!(actual.peak_bytes, build.peak_bytes);
+
+        let assert_preallocation_failure = |actual: DirectBuildAttemptActual| {
+            assert_eq!(actual.work, u64::try_from(build.work).unwrap());
+            assert_eq!(actual.allocations, 0);
+            assert_eq!(actual.allocated_bytes, 0);
+            assert_eq!(actual.copied_bytes, 0);
+            assert_eq!(actual.initialized_bytes, 0);
+            assert_eq!(actual.live_persistent_bytes, 0);
+            assert_eq!(actual.peak_bytes, 0);
+        };
+
+        let work_error = ReverseInnerPlan::build_attempt(
+            SMALL_CLASS.iter().copied(),
+            &SMALL_LITERALS,
+            BuildLimits {
+                max_build_work: build.work - 1,
+                ..exact
+            },
+        )
+        .expect_err("one-below adaptive-union work must fail");
+        assert_eq!(
+            work_error.source(),
+            &BuildError::WorkLimit {
+                needed: build.work,
+                limit: build.work - 1,
+            }
+        );
+        assert_preallocation_failure(work_error.actual());
+
+        let persistent_error = ReverseInnerPlan::build_attempt(
+            SMALL_CLASS.iter().copied(),
+            &SMALL_LITERALS,
+            BuildLimits {
+                max_persistent_bytes: build.persistent_bytes - 1,
+                ..exact
+            },
+        )
+        .expect_err("one-below adaptive-union persistent bytes must fail");
+        assert_eq!(
+            persistent_error.source(),
+            &BuildError::PersistentLimit {
+                needed: build.persistent_bytes,
+                limit: build.persistent_bytes - 1,
+            }
+        );
+        assert_preallocation_failure(persistent_error.actual());
+
+        let peak_error = ReverseInnerPlan::build_attempt(
+            SMALL_CLASS.iter().copied(),
+            &SMALL_LITERALS,
+            BuildLimits {
+                max_peak_bytes: build.peak_bytes - 1,
+                ..exact
+            },
+        )
+        .expect_err("one-below adaptive-union peak bytes must fail");
+        assert_eq!(
+            peak_error.source(),
+            &BuildError::PeakLimit {
+                needed: build.peak_bytes,
+                limit: build.peak_bytes - 1,
+            }
+        );
+        assert_preallocation_failure(peak_error.actual());
+    }
+
     fn exact_reduce_limits(upper: super::ReduceUpperBounds) -> ReduceLimits {
         ReduceLimits {
             max_input_bytes: upper.input_bytes,
@@ -3691,9 +3869,147 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_union_admission_uses_exact_sparse_scalar_and_unique_root_boundaries() {
+        let ascii_64 = plan(&[('\0', '?'), ('λ', 'λ')], &[b"0", b"1"]);
+        assert_eq!(ascii_64.build_accounting().ascii_scalars, 64);
+        assert_eq!(ascii_64.build_accounting().non_ascii_scalars, 1);
+        assert!(ascii_64.build_accounting().adaptive_union);
+
+        let ascii_65 = plan(&[('\0', '@'), ('λ', 'λ')], &[b"0", b"1"]);
+        assert_eq!(ascii_65.build_accounting().ascii_scalars, 65);
+        assert_eq!(ascii_65.build_accounting().non_ascii_scalars, 1);
+        assert!(!ascii_65.build_accounting().adaptive_union);
+
+        let no_non_ascii = plan(&[('\0', '?')], &[b"0", b"1"]);
+        assert_eq!(no_non_ascii.build_accounting().non_ascii_scalars, 0);
+        assert!(!no_non_ascii.build_accounting().adaptive_union);
+
+        let exact_non_ascii_cap = plan(
+            &[('a', 'b'), ('\u{10000}', '\u{53DDF}')],
+            &[b"a", b"b"],
+        );
+        assert_eq!(
+            exact_non_ascii_cap.build_accounting().non_ascii_scalars,
+            MAX_ADMITTED_NON_ASCII_SCALARS
+        );
+        assert_eq!(
+            exact_non_ascii_cap.build_accounting().class_scalars,
+            exact_non_ascii_cap.build_accounting().ascii_scalars
+                + exact_non_ascii_cap.build_accounting().non_ascii_scalars
+        );
+        assert!(exact_non_ascii_cap.build_accounting().adaptive_union);
+
+        let one_over_non_ascii_cap = plan(
+            &[('a', 'b'), ('\u{10000}', '\u{53DE0}')],
+            &[b"a", b"b"],
+        );
+        assert_eq!(
+            one_over_non_ascii_cap
+                .build_accounting()
+                .non_ascii_scalars,
+            MAX_ADMITTED_NON_ASCII_SCALARS + 1
+        );
+        assert!(!one_over_non_ascii_cap.build_accounting().adaptive_union);
+
+        let near_universal = plan(
+            &[('\0', '?'), ('\u{80}', '\u{10FFFF}')],
+            &[b"0", b"1"],
+        );
+        assert_eq!(near_universal.build_accounting().ascii_scalars, 64);
+        assert_eq!(
+            near_universal.build_accounting().non_ascii_scalars,
+            1_111_936
+        );
+        assert_eq!(near_universal.build_accounting().class_scalars, 1_112_000);
+        assert!(!near_universal.build_accounting().adaptive_union);
+
+        let common_root = plan(&SMALL_CLASS, &[b"aa", b"ab"]);
+        assert_eq!(common_root.build_accounting().distinct_literal_first_bytes, 1);
+        assert!(!common_root.build_accounting().adaptive_union);
+    }
+
+    fn assert_all_operations_fallback_to_later_match(
+        plan: &ReverseInnerPlan,
+        haystack: &[u8],
+        expected_span: (usize, usize),
+        expected_shortest: usize,
+    ) {
+        let count = plan
+            .count(haystack, ReduceLimits::unlimited())
+            .expect("fallback count");
+        assert_eq!(count.count, 1);
+        assert!(count.accounting.actual.union_fallbacks > 0);
+        let span = plan
+            .span_sum(haystack, ReduceLimits::unlimited())
+            .expect("fallback span sum");
+        assert_eq!(
+            span.span_sum,
+            u64::try_from(expected_span.1 - expected_span.0).unwrap()
+        );
+        assert!(span.accounting.actual.union_fallbacks > 0);
+        let (found, find_accounting) = plan
+            .find(haystack, SearchLimits::unlimited())
+            .expect("fallback find");
+        assert_eq!(found, Some(expected_span));
+        assert!(find_accounting.actual.union_fallbacks > 0);
+        let (matched, exists_accounting) = plan
+            .is_match(haystack, SearchLimits::unlimited())
+            .expect("fallback existence");
+        assert!(matched);
+        assert!(exists_accounting.actual.union_fallbacks > 0);
+        let (shortest, shortest_accounting) = plan
+            .shortest(haystack, SearchLimits::unlimited())
+            .expect("fallback shortest");
+        assert_eq!(shortest, Some(expected_shortest));
+        assert!(shortest_accounting.actual.union_fallbacks > 0);
+    }
+
+    #[test]
+    fn false_root_fallback_preserves_later_viable_literal_in_same_run() {
+        let plan = plan(&SMALL_CLASS, &SMALL_LITERALS);
+        let count = plan
+            .count(b"abbb", ReduceLimits::unlimited())
+            .expect("false-root fallback count");
+        assert_eq!(count.accounting.actual.union_root_candidates, 1);
+        assert_eq!(count.accounting.actual.union_exact_candidates, 0);
+        assert_eq!(count.accounting.actual.union_fallbacks, 1);
+        assert_all_operations_fallback_to_later_match(&plan, b"abbb", (0, 4), 3);
+    }
+
+    #[test]
+    fn two_unproductive_runs_fallback_preserves_later_viable_run() {
+        let plan = plan(&SMALL_CLASS, &SMALL_LITERALS);
+        let count = plan
+            .count(b"b-b-abbb", ReduceLimits::unlimited())
+            .expect("proved-run fallback count");
+        assert_eq!(count.accounting.actual.union_exact_candidates, 2);
+        assert_eq!(count.accounting.actual.union_fallbacks, 1);
+        assert_all_operations_fallback_to_later_match(&plan, b"b-b-abbb", (4, 8), 7);
+    }
+
+    #[test]
+    fn sixteen_way_common_root_uses_independent_finder_plan() {
+        let literals: [&[u8]; 16] = [
+            b"aa", b"ab", b"ac", b"ad", b"ae", b"af", b"ag", b"ah", b"ai", b"aj",
+            b"ak", b"al", b"am", b"an", b"ao", b"ap",
+        ];
+        let plan = plan(&[('a', 'p'), ('λ', 'λ')], &literals);
+        let build = plan.build_accounting();
+        assert_eq!(build.literal_count, 16);
+        assert_eq!(build.distinct_literal_first_bytes, 1);
+        assert!(!build.adaptive_union);
+        assert_eq!(plan.count_identity().plan_id, PLAN_ID);
+        assert_eq!(plan.count_identity().accounting_id, ACCOUNTING_ID);
+        let upper = plan.full_window_upper_bounds(256).expect("incumbent bounds");
+        assert_eq!(upper.union_scan_calls, 0);
+        assert_eq!(upper.union_root_candidates, 0);
+        assert_eq!(upper.union_verification_bytes, 0);
+    }
+
+    #[test]
     fn union_calls_are_plan_local_and_observe_same_address_mutation() {
-        let aa = plan(&SMALL_CLASS, &[b"aa", b"ab"]);
-        let bb = plan(&SMALL_CLASS, &[b"bb", b"ba"]);
+        let aa = plan(&SMALL_CLASS, &[b"aa", b"ba"]);
+        let bb = plan(&SMALL_CLASS, &[b"bb", b"ab"]);
         let mut haystack = b"xaaabx".to_vec();
         let address = haystack.as_ptr();
 

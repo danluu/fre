@@ -1,7 +1,8 @@
 //! Allocation-free canonical-HIR proof for the Unicode reverse-inner reducer.
 
 use fre_kernels::{
-    REVERSE_INNER_MAX_ADMITTED_ASCII_SCALARS, REVERSE_INNER_MAX_LITERALS,
+    REVERSE_INNER_MAX_ADMITTED_ASCII_SCALARS,
+    REVERSE_INNER_MAX_ADMITTED_NON_ASCII_SCALARS, REVERSE_INNER_MAX_LITERALS,
 };
 use regex_syntax::hir::{Class, ClassUnicode, Hir, HirKind};
 
@@ -295,11 +296,14 @@ fn sparse_mixed_unicode_class(
     budget: &mut Budget,
 ) -> Result<bool, InspectionError> {
     let mut ascii_scalars = 0_usize;
-    let mut has_non_ascii = false;
+    let mut class_scalars = 0_usize;
     for range in class.ranges() {
         budget.charge(1)?;
         let start = u32::from(range.start());
         let end = u32::from(range.end());
+        class_scalars = class_scalars
+            .checked_add(valid_scalar_population(start, end)?)
+            .ok_or(InspectionError::Overflow)?;
         if start <= 0x7f {
             let ascii_end = end.min(0x7f);
             let population = usize::try_from(ascii_end - start + 1)
@@ -311,9 +315,34 @@ fn sparse_mixed_unicode_class(
                 return Ok(false);
             }
         }
-        has_non_ascii |= end > 0x7f;
     }
-    Ok(has_non_ascii && ascii_scalars <= REVERSE_INNER_MAX_ADMITTED_ASCII_SCALARS)
+    let non_ascii_scalars = class_scalars
+        .checked_sub(ascii_scalars)
+        .ok_or(InspectionError::Overflow)?;
+    if ascii_scalars.checked_add(non_ascii_scalars) != Some(class_scalars) {
+        return Err(InspectionError::Overflow);
+    }
+    Ok(non_ascii_scalars != 0
+        && non_ascii_scalars <= REVERSE_INNER_MAX_ADMITTED_NON_ASCII_SCALARS
+        && ascii_scalars <= REVERSE_INNER_MAX_ADMITTED_ASCII_SCALARS)
+}
+
+fn valid_scalar_population(start: u32, end: u32) -> Result<usize, InspectionError> {
+    let population = end
+        .checked_sub(start)
+        .and_then(|width| width.checked_add(1))
+        .ok_or(InspectionError::Overflow)?;
+    let surrogate_start = start.max(0xD800);
+    let surrogate_end = end.min(0xDFFF);
+    let surrogate_population = if surrogate_start <= surrogate_end {
+        surrogate_end - surrogate_start + 1
+    } else {
+        0
+    };
+    let valid_population = population
+        .checked_sub(surrogate_population)
+        .ok_or(InspectionError::Overflow)?;
+    usize::try_from(valid_population).map_err(|_| InspectionError::Overflow)
 }
 
 fn full_branch<'a>(
@@ -514,6 +543,16 @@ mod tests {
         (work, hir_nodes, captures)
     }
 
+    fn assert_ineligible(pattern: &str) {
+        assert!(
+            matches!(
+                inspect(&parse(pattern), usize::MAX).unwrap(),
+                Inspection::Ineligible { .. }
+            ),
+            "unexpectedly admitted reverse-inner shape: {pattern}"
+        );
+    }
+
     #[test]
     fn unfactored_and_factored_shapes_are_eligible() {
         let expected: [&[u8]; 2] = [b"herloc", b"olme"];
@@ -603,5 +642,27 @@ mod tests {
                 "unexpectedly admitted structurally broad class: {pattern}"
             );
         }
+    }
+
+    #[test]
+    fn auto_gate_uses_exact_ascii_and_non_ascii_scalar_populations() {
+        assert_eligible(
+            r"[\x00-\x3Fλ]+01[\x00-\x3Fλ]+",
+            &[b"01"],
+        );
+        assert_ineligible(r"[\x00-\x40λ]+01[\x00-\x40λ]+");
+        assert_ineligible(r"[\x00-\x3F]+01[\x00-\x3F]+");
+
+        assert_eligible(
+            r"[a\u{10000}-\u{53DDF}]+a[a\u{10000}-\u{53DDF}]+",
+            &[b"a"],
+        );
+        assert_ineligible(
+            r"[a\u{10000}-\u{53DE0}]+a[a\u{10000}-\u{53DE0}]+",
+        );
+
+        assert_eligible(r"\pL+ab\pL+", &[b"ab"]);
+        assert_eligible(r"[a-zλ]+ab[a-zλ]+", &[b"ab"]);
+        assert_ineligible(r"[^\x40-\x7F]+01[^\x40-\x7F]+");
     }
 }

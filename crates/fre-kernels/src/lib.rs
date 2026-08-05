@@ -540,6 +540,7 @@ pub use reverse_inner::{
     CountResult as ReverseInnerCountResult,
     EXISTS_OPERATION_ID as REVERSE_INNER_EXISTS_OPERATION_ID,
     MAX_ADMITTED_ASCII_SCALARS as REVERSE_INNER_MAX_ADMITTED_ASCII_SCALARS,
+    MAX_ADMITTED_NON_ASCII_SCALARS as REVERSE_INNER_MAX_ADMITTED_NON_ASCII_SCALARS,
     MAX_LITERALS as REVERSE_INNER_MAX_LITERALS,
     Operation as ReverseInnerOperation, OperationIdentity as ReverseInnerOperationIdentity,
     PLAN_ID as REVERSE_INNER_PLAN_ID, ReduceAccounting as ReverseInnerReduceAccounting,

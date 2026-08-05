@@ -13770,13 +13770,19 @@ fn reverse_inner_plan_identity_matches(
         && build.source_ranges > 0
         && build.retained_non_ascii_ranges <= build.source_ranges
         && build.retained_range_capacity == build.source_ranges
+        && build.ascii_scalars.checked_add(build.non_ascii_scalars)
+            == Some(build.class_scalars)
         && (1..=fre::REVERSE_INNER_MAX_LITERALS).contains(&build.literal_count)
         && build.literal_bytes >= build.literal_count
         && (1..=build.literal_count).contains(&build.distinct_literal_first_bytes)
         && build.adaptive_union
             == (build.literal_count >= 2
                 && build.retained_non_ascii_ranges != 0
-                && build.ascii_scalars <= fre::REVERSE_INNER_MAX_ADMITTED_ASCII_SCALARS)
+                && build.non_ascii_scalars != 0
+                && build.non_ascii_scalars
+                    <= fre::REVERSE_INNER_MAX_ADMITTED_NON_ASCII_SCALARS
+                && build.ascii_scalars <= fre::REVERSE_INNER_MAX_ADMITTED_ASCII_SCALARS
+                && build.distinct_literal_first_bytes == build.literal_count)
         && build.allocations
             == build
                 .literal_count
