@@ -1,11 +1,12 @@
-//! Necessary-terminal acceleration for correlated bounded alternatives.
+//! Necessary-terminal acceleration for correlated byte-run alternatives.
 //!
-//! This inspector recognizes a nonempty literal prefix followed by two or
-//! more alternatives of the form `LEFT CLASS{min,max} RIGHT`. The final byte
-//! of every `RIGHT` is distinct, so their union is a necessary terminal set
-//! for the whole language. Runtime endpoint authentication remains the job of
-//! the immutable K0 automaton; this module only supplies a candidate source
-//! and exact finite width bounds.
+//! The bounded route recognizes a nonempty literal prefix followed by two or
+//! more alternatives of the form `LEFT CLASS{min,max} RIGHT`; immutable K0
+//! authenticates those finite-width endpoints. The exact-delimited route
+//! recognizes a root alternation of `LEFT CLASS{0,} RIGHT` branches when each
+//! distinct terminal is globally absent from every class and other fixed byte.
+//! That stronger proof partitions the source and permits direct branch-local
+//! reverse authentication without retaining haystack-dependent state.
 
 use fre_kernels::{
     BYTE_SET_CLASSIFIER_BUILD_WORK, ByteSet256, ByteSetClassifier, DispatchPolicy,
@@ -25,6 +26,10 @@ const SIZE_CLASS_STATES: usize = 4;
 const MAX_BACKOFF_CALLS: u8 = 64;
 const MAX_BRANCH_COUNT: usize = 8;
 const TERMINAL_WORK_PASSES_PER_BRANCH: usize = 64;
+const MAX_DELIMITED_LITERAL_BYTES: usize = 16;
+const NO_DELIMITED_BRANCH: u8 = u8::MAX;
+const CLASS_MEMBER_INSERTION_WORK: u64 = 1;
+const MEMBERSHIP_PROOF_WORK: u64 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InspectionError {
@@ -53,10 +58,22 @@ impl InspectionOutcome {
 pub(crate) struct Inspection {
     terminal_words: [u64; 4],
     terminal_seek: SetSeek,
-    minimum_match_bytes: usize,
-    maximum_match_bytes: usize,
-    branch_count: usize,
+    mode: InspectionMode,
     planner_work: u64,
+}
+
+enum InspectionMode {
+    Bounded {
+        minimum_match_bytes: usize,
+        maximum_match_bytes: usize,
+        branch_count: usize,
+    },
+    Delimited {
+        branches: [DelimitedBranch; MAX_BRANCH_COUNT],
+        terminal_to_branch: [u8; 256],
+        minimum_match_bytes: usize,
+        branch_count: usize,
+    },
 }
 
 impl Inspection {
@@ -73,20 +90,93 @@ impl Inspection {
         Plan {
             terminal_seek,
             classifier,
-            minimum_match_bytes: self.minimum_match_bytes,
-            maximum_match_bytes: self.maximum_match_bytes,
-            branch_count: self.branch_count,
+            mode: match self.mode {
+                InspectionMode::Bounded {
+                    minimum_match_bytes,
+                    maximum_match_bytes,
+                    branch_count,
+                } => PlanMode::Bounded {
+                    minimum_match_bytes,
+                    maximum_match_bytes,
+                    branch_count,
+                },
+                InspectionMode::Delimited {
+                    branches,
+                    terminal_to_branch,
+                    minimum_match_bytes,
+                    branch_count,
+                } => PlanMode::Delimited {
+                    branches,
+                    terminal_to_branch,
+                    minimum_match_bytes,
+                    branch_count,
+                },
+            },
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DelimitedBranch {
+    class_words: [u64; 4],
+    left: [u8; MAX_DELIMITED_LITERAL_BYTES],
+    right: [u8; MAX_DELIMITED_LITERAL_BYTES],
+    left_len: u8,
+    right_len: u8,
+    class_tail_len: u8,
+    minimum: u8,
+}
+
+impl DelimitedBranch {
+    const EMPTY: Self = Self {
+        class_words: [0; 4],
+        left: [0; MAX_DELIMITED_LITERAL_BYTES],
+        right: [0; MAX_DELIMITED_LITERAL_BYTES],
+        left_len: 0,
+        right_len: 0,
+        class_tail_len: 0,
+        minimum: 0,
+    };
+
+    fn class_contains(&self, byte: u8) -> bool {
+        let word = usize::from(byte >> 6);
+        let bit = u32::from(byte & 63);
+        self.class_words[word] & (1_u64 << bit) != 0
+    }
+
+    fn left(&self) -> &[u8] {
+        &self.left[..usize::from(self.left_len)]
+    }
+
+    fn right(&self) -> &[u8] {
+        &self.right[..usize::from(self.right_len)]
+    }
+
+    fn terminal(&self) -> u8 {
+        self.right[usize::from(self.right_len) - 1]
+    }
+}
+
+#[derive(Debug)]
+enum PlanMode {
+    Bounded {
+        minimum_match_bytes: usize,
+        maximum_match_bytes: usize,
+        branch_count: usize,
+    },
+    Delimited {
+        branches: [DelimitedBranch; MAX_BRANCH_COUNT],
+        terminal_to_branch: [u8; 256],
+        minimum_match_bytes: usize,
+        branch_count: usize,
+    },
 }
 
 #[derive(Debug)]
 pub(crate) struct Plan {
     terminal_seek: SetSeek,
     classifier: Option<ByteSetClassifier>,
-    minimum_match_bytes: usize,
-    maximum_match_bytes: usize,
-    branch_count: usize,
+    mode: PlanMode,
 }
 
 impl Plan {
@@ -95,15 +185,37 @@ impl Plan {
     }
 
     pub(crate) const fn minimum_match_bytes(&self) -> usize {
-        self.minimum_match_bytes
+        match &self.mode {
+            PlanMode::Bounded {
+                minimum_match_bytes,
+                ..
+            }
+            | PlanMode::Delimited {
+                minimum_match_bytes,
+                ..
+            } => *minimum_match_bytes,
+        }
     }
 
     pub(crate) const fn maximum_match_bytes(&self) -> usize {
-        self.maximum_match_bytes
+        match &self.mode {
+            PlanMode::Bounded {
+                maximum_match_bytes,
+                ..
+            } => *maximum_match_bytes,
+            PlanMode::Delimited { .. } => 0,
+        }
     }
 
     pub(crate) const fn branch_count(&self) -> usize {
-        self.branch_count
+        match &self.mode {
+            PlanMode::Bounded { branch_count, .. }
+            | PlanMode::Delimited { branch_count, .. } => *branch_count,
+        }
+    }
+
+    pub(crate) const fn is_exact_delimited(&self) -> bool {
+        matches!(&self.mode, PlanMode::Delimited { .. })
     }
 
     pub(crate) fn seek_terminal(
@@ -119,6 +231,83 @@ impl Plan {
             self.classifier.as_ref(),
         )
     }
+
+    /// Search one structurally proved union of terminal-delimited byte runs.
+    ///
+    /// Admission proves that every terminal byte is absent from every class
+    /// and from all fixed bytes except its own final position. Consequently,
+    /// each terminal partitions the source: a later match cannot begin before
+    /// an already inspected terminal. The first authenticated endpoint is
+    /// therefore both the selected leftmost match and the earliest endpoint.
+    pub(crate) fn find_exact_delimited(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        end: usize,
+    ) -> Option<(usize, usize)> {
+        let PlanMode::Delimited {
+            branches,
+            terminal_to_branch,
+            minimum_match_bytes,
+            ..
+        } = &self.mode
+        else {
+            return None;
+        };
+        let mut position = start.checked_add(minimum_match_bytes.saturating_sub(1))?;
+        while position < end {
+            let terminal_position = self.seek_terminal(haystack, position, end)?;
+            let branch_index = usize::from(terminal_to_branch[usize::from(
+                haystack[terminal_position],
+            )]);
+            if let Some(branch) = branches.get(branch_index) {
+                if let Some(matched) = authenticate_delimited_branch(
+                    branch,
+                    haystack,
+                    start,
+                    terminal_position,
+                ) {
+                    return Some(matched);
+                }
+            }
+            position = terminal_position.checked_add(1)?;
+        }
+        None
+    }
+}
+
+fn authenticate_delimited_branch(
+    branch: &DelimitedBranch,
+    haystack: &[u8],
+    window_start: usize,
+    terminal_position: usize,
+) -> Option<(usize, usize)> {
+    let endpoint = terminal_position.checked_add(1)?;
+    let right = branch.right();
+    let right_start = endpoint.checked_sub(right.len())?;
+    if right_start < window_start || haystack.get(right_start..endpoint)? != right {
+        return None;
+    }
+
+    let mut cursor = right_start;
+    while cursor > window_start && branch.class_contains(haystack[cursor - 1]) {
+        cursor -= 1;
+    }
+    let class_bytes = right_start - cursor;
+    let class_tail_len = usize::from(branch.class_tail_len);
+    if class_bytes < class_tail_len.checked_add(usize::from(branch.minimum))? {
+        return None;
+    }
+    let marker_len = branch.left().len().checked_sub(class_tail_len)?;
+    let match_start = cursor.checked_sub(marker_len)?;
+    if match_start < window_start {
+        return None;
+    }
+    let left_end = match_start.checked_add(branch.left().len())?;
+    if left_end > right_start || haystack.get(match_start..left_end)? != branch.left() {
+        return None;
+    }
+    Some((match_start, endpoint))
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -291,6 +480,13 @@ pub(crate) fn inspect(
 ) -> Result<InspectionOutcome, InspectionError> {
     let mut work = initial_work;
     let root = peel_captures(hir, &mut work, max_planner_work)?;
+    if let HirKind::Alternation(branches) = root.kind() {
+        return inspect_exact_delimited_alternation(
+            branches,
+            work,
+            max_planner_work,
+        );
+    }
     let HirKind::Concat(root_parts) = root.kind() else {
         return Ok(InspectionOutcome::Ineligible { planner_work: work });
     };
@@ -382,11 +578,253 @@ pub(crate) fn inspect(
     Ok(InspectionOutcome::Eligible(Inspection {
         terminal_words,
         terminal_seek,
-        minimum_match_bytes,
-        maximum_match_bytes,
-        branch_count: branches.len(),
+        mode: InspectionMode::Bounded {
+            minimum_match_bytes,
+            maximum_match_bytes,
+            branch_count: branches.len(),
+        },
         planner_work: work,
     }))
+}
+
+fn inspect_exact_delimited_alternation(
+    branches: &[Hir],
+    mut work: u64,
+    max_planner_work: u64,
+) -> Result<InspectionOutcome, InspectionError> {
+    if !(2..=MAX_BRANCH_COUNT).contains(&branches.len()) {
+        return Ok(InspectionOutcome::Ineligible { planner_work: work });
+    }
+
+    let mut inspected = [DelimitedBranch::EMPTY; MAX_BRANCH_COUNT];
+    let mut terminal_words = [0_u64; 4];
+    let mut terminal_to_branch = [NO_DELIMITED_BRANCH; 256];
+    let mut minimum_match_bytes = usize::MAX;
+    for (branch_index, branch) in branches.iter().enumerate() {
+        let Some(branch) = inspect_exact_delimited_branch(
+            branch,
+            &mut work,
+            max_planner_work,
+        )? else {
+            return Ok(InspectionOutcome::Ineligible { planner_work: work });
+        };
+        let terminal = branch.terminal();
+        charge(
+            &mut work,
+            TERMINAL_INSERTION_WORK,
+            max_planner_work,
+        )?;
+        let terminal_index = usize::from(terminal);
+        if terminal_to_branch[terminal_index] != NO_DELIMITED_BRANCH {
+            return Ok(InspectionOutcome::Ineligible { planner_work: work });
+        }
+        terminal_to_branch[terminal_index] = u8::try_from(branch_index)
+            .map_err(|_| InspectionError::ArithmeticOverflow)?;
+        let word = usize::from(terminal >> 6);
+        let bit = u32::from(terminal & 63);
+        terminal_words[word] |= 1_u64 << bit;
+        let minimum = checked_add_len(
+            branch.left().len(),
+            usize::from(branch.minimum),
+            &mut work,
+            max_planner_work,
+        )?;
+        let minimum = checked_add_len(
+            minimum,
+            branch.right().len(),
+            &mut work,
+            max_planner_work,
+        )?;
+        minimum_match_bytes = minimum_match_bytes.min(minimum);
+        inspected[branch_index] = branch;
+    }
+
+    // A terminal is a global partition only when it cannot occur inside any
+    // branch's class or fixed bytes. Its sole admitted fixed occurrence is the
+    // final byte of its own right literal. This proof makes a forward terminal
+    // scan complete for both leftmost starts and earliest endpoints.
+    for terminal_branch in 0..branches.len() {
+        let terminal = inspected[terminal_branch].terminal();
+        for (branch_index, branch) in inspected[..branches.len()].iter().enumerate() {
+            charge(
+                &mut work,
+                MEMBERSHIP_PROOF_WORK,
+                max_planner_work,
+            )?;
+            if branch.class_contains(terminal) {
+                return Ok(InspectionOutcome::Ineligible { planner_work: work });
+            }
+            for &byte in branch.left() {
+                charge(
+                    &mut work,
+                    MEMBERSHIP_PROOF_WORK,
+                    max_planner_work,
+                )?;
+                if byte == terminal {
+                    return Ok(InspectionOutcome::Ineligible { planner_work: work });
+                }
+            }
+            for (fixed_index, &byte) in branch.right().iter().enumerate() {
+                charge(
+                    &mut work,
+                    MEMBERSHIP_PROOF_WORK,
+                    max_planner_work,
+                )?;
+                let own_final = terminal_branch == branch_index
+                    && fixed_index.checked_add(1) == Some(branch.right().len());
+                if byte == terminal && !own_final {
+                    return Ok(InspectionOutcome::Ineligible { planner_work: work });
+                }
+            }
+        }
+    }
+
+    charge(&mut work, LEAF_SELECTION_WORK, max_planner_work)?;
+    let terminal_cardinality = u32::try_from(branches.len())
+        .map_err(|_| InspectionError::ArithmeticOverflow)?;
+    let terminal_seek = SetSeek::build(terminal_words, terminal_cardinality, false);
+    if terminal_seek.requires_classifier() {
+        charge(
+            &mut work,
+            u64::try_from(BYTE_SET_CLASSIFIER_BUILD_WORK)
+                .map_err(|_| InspectionError::ArithmeticOverflow)?,
+            max_planner_work,
+        )?;
+    }
+    Ok(InspectionOutcome::Eligible(Inspection {
+        terminal_words,
+        terminal_seek,
+        mode: InspectionMode::Delimited {
+            branches: inspected,
+            terminal_to_branch,
+            minimum_match_bytes,
+            branch_count: branches.len(),
+        },
+        planner_work: work,
+    }))
+}
+
+fn inspect_exact_delimited_branch(
+    branch: &Hir,
+    work: &mut u64,
+    max_planner_work: u64,
+) -> Result<Option<DelimitedBranch>, InspectionError> {
+    let branch = peel_captures(branch, work, max_planner_work)?;
+    let HirKind::Concat(parts) = branch.kind() else {
+        return Ok(None);
+    };
+    let mut inspected = DelimitedBranch::EMPTY;
+    let mut saw_repeat = false;
+    for part in parts {
+        let part = peel_captures(part, work, max_planner_work)?;
+        match part.kind() {
+            HirKind::Literal(literal) if !literal.0.is_empty() => {
+                charge_literal(literal.0.len(), work, max_planner_work)?;
+                let appended = if saw_repeat {
+                    append_delimited_literal(
+                        &mut inspected.right,
+                        &mut inspected.right_len,
+                        &literal.0,
+                    )
+                } else {
+                    append_delimited_literal(
+                        &mut inspected.left,
+                        &mut inspected.left_len,
+                        &literal.0,
+                    )
+                };
+                if !appended {
+                    return Ok(None);
+                }
+            }
+            HirKind::Repetition(repetition) if !saw_repeat => {
+                if inspected.left_len == 0
+                    || repetition.max.is_some()
+                    || repetition.min > 1
+                    || !repetition.greedy
+                {
+                    return Ok(None);
+                }
+                let atom = peel_captures(&repetition.sub, work, max_planner_work)?;
+                let HirKind::Class(Class::Bytes(class)) = atom.kind() else {
+                    return Ok(None);
+                };
+                let mut nonempty = false;
+                for range in class.ranges() {
+                    charge(work, RANGE_INSPECTION_WORK, max_planner_work)?;
+                    let mut byte = range.start();
+                    loop {
+                        charge(
+                            work,
+                            CLASS_MEMBER_INSERTION_WORK,
+                            max_planner_work,
+                        )?;
+                        let word = usize::from(byte >> 6);
+                        let bit = u32::from(byte & 63);
+                        inspected.class_words[word] |= 1_u64 << bit;
+                        nonempty = true;
+                        if byte == range.end() {
+                            break;
+                        }
+                        byte = byte
+                            .checked_add(1)
+                            .ok_or(InspectionError::ArithmeticOverflow)?;
+                    }
+                }
+                if !nonempty {
+                    return Ok(None);
+                }
+                inspected.minimum = u8::try_from(repetition.min)
+                    .map_err(|_| InspectionError::ArithmeticOverflow)?;
+                saw_repeat = true;
+            }
+            _ => return Ok(None),
+        }
+    }
+    if !saw_repeat || inspected.right_len == 0 {
+        return Ok(None);
+    }
+
+    let mut class_tail_len = 0_usize;
+    for &byte in inspected.left().iter().rev() {
+        charge(
+            work,
+            MEMBERSHIP_PROOF_WORK,
+            max_planner_work,
+        )?;
+        if !inspected.class_contains(byte) {
+            break;
+        }
+        class_tail_len = class_tail_len
+            .checked_add(1)
+            .ok_or(InspectionError::ArithmeticOverflow)?;
+    }
+    if class_tail_len == inspected.left().len() {
+        return Ok(None);
+    }
+    inspected.class_tail_len = u8::try_from(class_tail_len)
+        .map_err(|_| InspectionError::ArithmeticOverflow)?;
+    Ok(Some(inspected))
+}
+
+fn append_delimited_literal(
+    destination: &mut [u8; MAX_DELIMITED_LITERAL_BYTES],
+    destination_len: &mut u8,
+    source: &[u8],
+) -> bool {
+    let start = usize::from(*destination_len);
+    let Some(end) = start.checked_add(source.len()) else {
+        return false;
+    };
+    let Some(output) = destination.get_mut(start..end) else {
+        return false;
+    };
+    output.copy_from_slice(source);
+    let Ok(end) = u8::try_from(end) else {
+        return false;
+    };
+    *destination_len = end;
+    true
 }
 
 #[derive(Clone, Copy)]
@@ -568,4 +1006,136 @@ fn charge(
     }
     *work = needed;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use regex_syntax::ParserBuilder;
+
+    use super::{
+        InspectionError, InspectionOutcome, Plan, SimdDispatchContext, inspect,
+    };
+
+    const TARGET: &str = r"(?-u:(?:ab[bc]*Z|q[de]*Y))";
+
+    fn parse(pattern: &str) -> regex_syntax::hir::Hir {
+        ParserBuilder::new()
+            .unicode(false)
+            .utf8(false)
+            .build()
+            .parse(pattern)
+            .unwrap()
+    }
+
+    fn exact_plan(pattern: &str) -> (Plan, u64) {
+        let InspectionOutcome::Eligible(inspection) =
+            inspect(&parse(pattern), 0, u64::MAX).unwrap()
+        else {
+            panic!("exact delimited alternation was refused: {pattern:?}");
+        };
+        let work = inspection.planner_work;
+        let plan = inspection.build(SimdDispatchContext::capture());
+        assert!(plan.is_exact_delimited());
+        (plan, work)
+    }
+
+    #[test]
+    fn exact_delimited_alternation_authenticates_branch_local_runs() {
+        let (plan, _) = exact_plan(TARGET);
+        for (haystack, expected) in [
+            (b"".as_slice(), None),
+            (b"abZ", Some((0, 3))),
+            (b"xxabbbbbZyy", Some((2, 9))),
+            (b"xxqddddYyy", Some((2, 8))),
+            (b"abbbbbY qddZ", None),
+            (b"abbbbbY~qddY", Some((8, 12))),
+            (b"Z~qY~abccZ", Some((2, 4))),
+        ] {
+            assert_eq!(
+                plan.find_exact_delimited(haystack, 0, haystack.len()),
+                expected,
+                "haystack={haystack:?}",
+            );
+        }
+        assert_eq!(
+            plan.find_exact_delimited(b"xxabbbbbZyy", 3, 11),
+            None,
+            "a window may not reuse a delimiter before its start",
+        );
+    }
+
+    #[test]
+    fn one_minimum_excludes_the_left_literal_class_tail() {
+        let (plan, _) = exact_plan(r"(?-u:(?:ab[bc]+Z|q[de]+Y))");
+        assert_eq!(plan.find_exact_delimited(b"abZ~qY", 0, 6), None);
+        assert_eq!(
+            plan.find_exact_delimited(b"abZ~qdY~abbZ", 0, 12),
+            Some((4, 7)),
+        );
+    }
+
+    #[test]
+    fn exact_delimited_admits_eight_branches_and_arbitrary_bytes() {
+        let (plan, _) = exact_plan(
+            r"(?-u:(?:a[bc]*Z|d[ef]*Y|g[hi]*X|j[kl]*W|m[no]*V|p[qr]*U|s[tu]*T|v[wx]*S))",
+        );
+        assert_eq!(plan.branch_count(), 8);
+
+        let (plan, _) = exact_plan(
+            r"(?-u:(?:\x80[\x81-\x82]*\xFE|\x90[\x91-\x92]+\xFF))",
+        );
+        assert_eq!(
+            plan.find_exact_delimited(
+                &[0_u8, 0x80, 0x81, 0x82, 0xFE, 0x90, 0x91, 0xFF],
+                0,
+                8,
+            ),
+            Some((1, 5)),
+        );
+    }
+
+    #[test]
+    fn planner_work_and_fixed_storage_are_exact_boundaries() {
+        let hir = parse(TARGET);
+        let (plan, exact_work) = exact_plan(TARGET);
+        assert_eq!(Plan::storage_bytes(), core::mem::size_of_val(&plan));
+        assert!(matches!(
+            inspect(&hir, 0, exact_work).unwrap(),
+            InspectionOutcome::Eligible(_),
+        ));
+        let error = match inspect(&hir, 0, exact_work - 1) {
+            Err(error) => error,
+            Ok(_) => panic!("one-below planner work unexpectedly succeeded"),
+        };
+        assert_eq!(
+            error,
+            InspectionError::WorkLimit {
+                needed: exact_work,
+                limit: exact_work - 1,
+            },
+        );
+    }
+
+    #[test]
+    fn every_partition_or_shape_violation_is_refused() {
+        for pattern in [
+            r"(?-u:(?:ab[bc]*Z|q[de]*Z))",
+            r"(?-u:(?:ab[bZ]*Z|q[de]*Y))",
+            r"(?-u:(?:aYb[bc]*Z|q[de]*Y))",
+            r"(?-u:(?:ab[bc]*YZ|q[de]*Y))",
+            r"(?-u:(?:b[bc]*Z|q[de]*Y))",
+            r"(?-u:(?:ab[bc]*?Z|q[de]*Y))",
+            r"(?-u:(?:ab[bc]{0,8}Z|q[de]*Y))",
+            r"(?-u:(?:ab[bc]*Z|q[de]*Y|r[fg]*X|s[hi]*W|t[jk]*V|u[lm]*U|v[no]*T|w[pq]*S|x[rs]*R))",
+            r"(?-u:(?:ab[bc]*Z|q[de]*\bY))",
+        ] {
+            assert!(
+                matches!(
+                    inspect(&parse(pattern), 0, u64::MAX).unwrap(),
+                    InspectionOutcome::Ineligible { .. },
+                ),
+                "unexpected exact-delimited admission: {pattern:?}",
+            );
+        }
+    }
 }

@@ -9759,6 +9759,18 @@ fn k0_correlated_geometry_allows(
         && plan.maximum_match_bytes() <= window_bytes / K0_SUFFIX_FINITE_WIDTH_WINDOW_FACTOR
 }
 
+fn k0_correlated_exact_delimited_allows(
+    plan: &correlated_bounded_alternation::Plan,
+    haystack_len: usize,
+    window: SearchWindow,
+    limits: SearchLimits,
+) -> bool {
+    plan.is_exact_delimited()
+        && limits == SearchLimits::unlimited()
+        && window.start() <= window.end()
+        && window.end() <= haystack_len
+}
+
 fn k0_correlated_fallback_exists(
     session: &mut K0SearchSession<'_>,
     haystack: &[u8],
@@ -10557,6 +10569,20 @@ impl<'r> PortableSearchSession<'r> {
                 ..
             } => {
                 if let Some(plan) = *correlated_terminal {
+                    if k0_correlated_exact_delimited_allows(
+                        plan,
+                        haystack.len(),
+                        window,
+                        limits,
+                    ) {
+                        return Ok(plan
+                            .find_exact_delimited(
+                                haystack,
+                                window.start(),
+                                window.end(),
+                            )
+                            .is_some());
+                    }
                     if k0_correlated_geometry_allows(
                         session,
                         plan,
@@ -10899,6 +10925,20 @@ impl<'r> PortableSearchSession<'r> {
                 ..
             } => {
                 if let Some(plan) = *correlated_terminal {
+                    if k0_correlated_exact_delimited_allows(
+                        plan,
+                        haystack.len(),
+                        window,
+                        limits,
+                    ) {
+                        return Ok(plan
+                            .find_exact_delimited(
+                                haystack,
+                                window.start(),
+                                window.end(),
+                            )
+                            .map(|(_, end)| end));
+                    }
                     if k0_correlated_geometry_allows(
                         session,
                         plan,
@@ -11176,6 +11216,20 @@ impl<'r> PortableSearchSession<'r> {
                 ..
             } => {
                 if let Some(plan) = *correlated_terminal {
+                    if k0_correlated_exact_delimited_allows(
+                        plan,
+                        haystack.len(),
+                        window,
+                        limits,
+                    ) {
+                        return Ok(plan
+                            .find_exact_delimited(
+                                haystack,
+                                window.start(),
+                                window.end(),
+                            )
+                            .map(|(start, end)| Match { start, end }));
+                    }
                     if k0_correlated_geometry_allows(
                         session,
                         plan,
@@ -15606,6 +15660,261 @@ mod tests {
                 .0
                 .map(|matched| (matched.start(), matched.end())),
             Some((2, 4))
+        );
+    }
+
+    fn assert_correlated_delimited_session_matches_upstream(
+        session: &mut super::PortableSearchSession<'_>,
+        upstream: &regex::bytes::Regex,
+        haystack: &[u8],
+    ) {
+        let expected = upstream
+            .find(haystack)
+            .map(|matched| (matched.start(), matched.end()));
+        assert_eq!(
+            session
+                .find_value(haystack, SearchLimits::unlimited())
+                .unwrap()
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+        assert_eq!(
+            session
+                .is_match_window_value(
+                    haystack,
+                    SearchWindow::full(haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            expected.is_some(),
+        );
+        assert_eq!(
+            session
+                .shortest_match_window_value(
+                    haystack,
+                    SearchWindow::full(haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            upstream.shortest_match(haystack),
+        );
+        assert_eq!(
+            session
+                .selected_end_value(haystack, SearchLimits::unlimited())
+                .unwrap(),
+            expected.map(|(_, end)| end),
+        );
+        let expected_iter = upstream
+            .find_iter(haystack)
+            .map(|matched| (matched.start(), matched.end()))
+            .collect::<Vec<_>>();
+        let actual_iter = session
+            .find_iter_value(haystack, PortableFindIterRunLimits::unlimited())
+            .map(|matched| {
+                let matched = matched.unwrap();
+                (matched.start(), matched.end())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual_iter, expected_iter);
+    }
+
+    #[test]
+    fn correlated_delimited_root_alternation_is_exhaustive_over_small_sources_and_windows() {
+        const PATTERN: &str = r"(?-u:(?:ab[bc]*Z|q[de]*Y))";
+        let regex = PortableBuilder::new(PATTERN)
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::K0);
+        let upstream = regex::bytes::RegexBuilder::new(PATTERN)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        let PortableSearchSessionPlan::K0 {
+            correlated_terminal: Some(plan),
+            ..
+        } = &session.plan
+        else {
+            panic!("exact correlated alternation lost its K0 sidecar");
+        };
+        assert!(plan.is_exact_delimited());
+
+        fn enumerate(
+            alphabet: &[u8],
+            remaining: usize,
+            source: &mut Vec<u8>,
+            visit: &mut impl FnMut(&[u8]),
+        ) {
+            visit(source);
+            if remaining == 0 {
+                return;
+            }
+            for &byte in alphabet {
+                source.push(byte);
+                enumerate(alphabet, remaining - 1, source, visit);
+                source.pop();
+            }
+        }
+
+        enumerate(
+            b"abcZqdeYx",
+            4,
+            &mut Vec::new(),
+            &mut |haystack| {
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        let slice = &haystack[start..end];
+                        let expected = upstream.find(slice).map(|matched| {
+                            (start + matched.start(), start + matched.end())
+                        });
+                        let expected_shortest = upstream
+                            .shortest_match(slice)
+                            .map(|matched_end| start + matched_end);
+                        assert_eq!(
+                            session
+                                .find_window_value(
+                                    haystack,
+                                    window,
+                                    SearchLimits::unlimited(),
+                                )
+                                .unwrap()
+                                .map(|matched| (matched.start(), matched.end())),
+                            expected,
+                            "span haystack={haystack:?} window={start}..{end}",
+                        );
+                        assert_eq!(
+                            session
+                                .is_match_window_value(
+                                    haystack,
+                                    window,
+                                    SearchLimits::unlimited(),
+                                )
+                                .unwrap(),
+                            expected.is_some(),
+                            "exists haystack={haystack:?} window={start}..{end}",
+                        );
+                        assert_eq!(
+                            session
+                                .shortest_match_window_value(
+                                    haystack,
+                                    window,
+                                    SearchLimits::unlimited(),
+                                )
+                                .unwrap(),
+                            expected_shortest,
+                            "shortest haystack={haystack:?} window={start}..{end}",
+                        );
+                    }
+                }
+            },
+        );
+
+        for haystack in [
+            b"xxabbbbbZyyqddYzz".as_slice(),
+            b"Z~abbbbbY~qddddY~abccZ~Y",
+            b"qYqdeYabZabbbbbZ",
+        ] {
+            assert_correlated_delimited_session_matches_upstream(
+                &mut session,
+                &upstream,
+                haystack,
+            );
+        }
+    }
+
+    #[test]
+    fn correlated_delimited_sessions_retain_no_cross_plan_or_same_address_state() {
+        const LEFT: &str = r"(?-u:(?:ab[bc]*Z|q[de]*Y))";
+        const RIGHT: &str = r"(?-u:(?:mn[no]*X|r[st]+W))";
+        let left = PortableBuilder::new(LEFT)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let right = PortableBuilder::new(RIGHT)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let left_upstream = regex::bytes::RegexBuilder::new(LEFT)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let right_upstream = regex::bytes::RegexBuilder::new(RIGHT)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let mut left_session = left
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        let mut right_session = right
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        for session in [&left_session, &right_session] {
+            let PortableSearchSessionPlan::K0 {
+                correlated_terminal: Some(plan),
+                ..
+            } = &session.plan
+            else {
+                panic!("cross-plan fixture lost its exact sidecar");
+            };
+            assert!(plan.is_exact_delimited());
+        }
+
+        let mut variants = Vec::new();
+        for placements in [
+            &[][..],
+            &[(7_usize, b"abbbbZ".as_slice())][..],
+            &[(19_usize, b"rsttW".as_slice())][..],
+            &[
+                (3_usize, b"qdddY".as_slice()),
+                (31_usize, b"mnnnX".as_slice()),
+                (48_usize, b"abZ".as_slice()),
+            ][..],
+        ] {
+            let mut source = vec![b'~'; 64];
+            for &(start, bytes) in placements {
+                source[start..start + bytes.len()].copy_from_slice(bytes);
+            }
+            variants.push(source);
+        }
+        variants.push(b"ZYXW".repeat(16));
+        assert!(variants.iter().all(|variant| variant.len() == 64));
+
+        let mut haystack = vec![0_u8; 64];
+        let address = haystack.as_ptr();
+        let capacity = haystack.capacity();
+        for variant in variants.iter().cycle().take(12) {
+            haystack.copy_from_slice(variant);
+            assert_eq!(haystack.as_ptr(), address);
+            assert_eq!(haystack.capacity(), capacity);
+            assert_correlated_delimited_session_matches_upstream(
+                &mut left_session,
+                &left_upstream,
+                &haystack,
+            );
+            assert_correlated_delimited_session_matches_upstream(
+                &mut right_session,
+                &right_upstream,
+                &haystack,
+            );
+        }
+
+        let limited = SearchLimits {
+            max_work: 0,
+            max_scratch_bytes: 0,
+        };
+        assert!(left_session.find_value(&haystack, limited).is_err());
+        assert!(
+            left_session
+                .find_window_value(
+                    &haystack,
+                    SearchWindow::new(1, haystack.len() + 1),
+                    SearchLimits::unlimited(),
+                )
+                .is_err(),
         );
     }
 
