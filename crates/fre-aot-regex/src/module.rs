@@ -2735,6 +2735,32 @@ fn aarch64_range_scanner_emission(
     })
 }
 
+/// Receipt the strongest suffix-scanner arm emitted for one target.
+///
+/// A mixed ASIMD/SVE entry chooses its arm from the runtime vector length, so
+/// no single ISA describes every execution. The receipt consistently names
+/// the strongest emitted scalable arm; exact SVE2 MATCH therefore remains
+/// distinguishable from base SVE while the independent membership and offset
+/// fields authenticate the semantics shared by both runtime arms.
+fn aarch64_suffix_scanner_emission(
+    filter: NativeStartFilter,
+    sve_kind: Option<Aarch64SveFilterKind>,
+    use_asimd_filter: bool,
+) -> Result<NativeScannerEmission, ObjectError> {
+    let (isa, vectorized) = match sve_kind {
+        Some(Aarch64SveFilterKind::Sve2 { .. }) => (NativeScannerIsa::Aarch64Sve2, true),
+        Some(Aarch64SveFilterKind::Sve) => (NativeScannerIsa::Aarch64Sve, true),
+        None if use_asimd_filter => (NativeScannerIsa::Aarch64Asimd, true),
+        None => (NativeScannerIsa::Aarch64ScalarRange, false),
+    };
+    Ok(NativeScannerEmission {
+        scan_offset: filter.scan_offset,
+        membership: start_filter_membership(filter)?,
+        isa,
+        vectorized,
+    })
+}
+
 #[allow(
     clippy::large_types_passed_by_value,
     reason = "the copyable lowering layout is already consumed by the adjacent target selectors"
@@ -2790,18 +2816,36 @@ fn selected_start_accelerator(
     }
 }
 
+fn selected_aarch64_sve_suffix_kind_with_policy(
+    layout: NativeDfaLayout,
+    features: FeatureSet,
+    operating_system: OperatingSystem,
+    mixed_preference: Aarch64MixedVectorPreference,
+) -> Option<Aarch64SveFilterKind> {
+    let sve_route_supported = layout.seeded_reverse.is_none()
+        && layout
+            .suffix_filter
+            .is_some_and(|suffix| aarch64_base_sve_filter_supported(suffix.filter));
+    let isa = aarch64_primary_scanner_isa_with_policy(
+        operating_system,
+        features,
+        sve_route_supported,
+        mixed_preference,
+    );
+    aarch64_primary_scanner_uses_sve(isa).then_some(Aarch64SveFilterKind::Sve)
+}
+
 fn selected_aarch64_sve_suffix_kind(
     layout: NativeDfaLayout,
     features: FeatureSet,
     operating_system: OperatingSystem,
 ) -> Option<Aarch64SveFilterKind> {
-    (operating_system == OperatingSystem::Linux
-        && features.has(CpuFeature::Aarch64Sve)
-        && layout.seeded_reverse.is_none()
-        && layout
-            .suffix_filter
-            .is_some_and(|suffix| aarch64_base_sve_filter_supported(suffix.filter)))
-    .then_some(Aarch64SveFilterKind::Sve)
+    selected_aarch64_sve_suffix_kind_with_policy(
+        layout,
+        features,
+        operating_system,
+        AARCH64_LINUX_MIXED_VECTOR_PREFERENCE,
+    )
 }
 
 fn install_aarch64_sve_suffix_kind(
@@ -15508,11 +15552,10 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     let suffix_scanner = layout
         .suffix_filter
         .map(|suffix| {
-            aarch64_range_scanner_emission(
+            aarch64_suffix_scanner_emission(
                 suffix.filter,
-                sve_suffix_kind.is_some(),
+                sve_suffix_kind,
                 use_asimd_suffix,
-                None,
             )
         })
         .transpose()?;
@@ -22428,6 +22471,171 @@ mod tests {
             ),
             Aarch64PrimaryScannerIsa::Asimd
         );
+    }
+
+    fn aarch64_suffix_only_layout(features: FeatureSet) -> NativeDfaLayout {
+        let compiled = compile(
+            CompileRequest::new(
+                "(?s:.+?)z",
+                Target::aarch64_linux().with_features(features).unwrap(),
+            )
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span),
+        )
+        .unwrap();
+        let layout = build_native_dfa_table_for_architecture(
+            compiled.program().native_dfa_view().unwrap(),
+            Architecture::Aarch64,
+        )
+        .unwrap()
+        .1;
+        assert!(layout.start_filter.is_none());
+        assert!(layout.suffix_filter.is_some());
+        assert!(layout.seeded_reverse.is_none());
+        layout
+    }
+
+    #[test]
+    fn aarch64_mixed_suffix_prefer_asimd_matches_asimd_only_lowering() {
+        let asimd = FeatureSet::of(CpuFeature::Aarch64Asimd);
+        let mixed = asimd.with(CpuFeature::Aarch64Sve);
+        let layout = aarch64_suffix_only_layout(mixed);
+        let selected = selected_aarch64_sve_suffix_kind_with_policy(
+            layout,
+            mixed,
+            OperatingSystem::Linux,
+            Aarch64MixedVectorPreference::PreferAsimd,
+        );
+        assert_eq!(selected, None);
+
+        let mixed_emission = lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
+            layout,
+            mixed,
+            OperatingSystem::Linux,
+            None,
+            selected,
+            NativeDfaEntryContract::Public,
+        )
+        .unwrap();
+        let asimd_emission = lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
+            layout,
+            asimd,
+            OperatingSystem::Linux,
+            None,
+            None,
+            NativeDfaEntryContract::Public,
+        )
+        .unwrap();
+        assert_eq!(mixed_emission.code, asimd_emission.code);
+        assert_eq!(mixed_emission.relocations, asimd_emission.relocations);
+        let words = mixed_emission
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(!words.contains(&aarch64_sve_cntb(6).unwrap()));
+        assert!(!words.contains(&aarch64_sve_cntb(16).unwrap()));
+    }
+
+    #[test]
+    fn aarch64_mixed_suffix_prefer_sve_emits_runtime_vl_dispatch() {
+        let mixed = FeatureSet::of(CpuFeature::Aarch64Asimd).with(CpuFeature::Aarch64Sve);
+        let layout = aarch64_suffix_only_layout(mixed);
+        let selected = selected_aarch64_sve_suffix_kind_with_policy(
+            layout,
+            mixed,
+            OperatingSystem::Linux,
+            Aarch64MixedVectorPreference::PreferSve,
+        );
+        assert_eq!(selected, Some(Aarch64SveFilterKind::Sve));
+
+        let emission = lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
+            layout,
+            mixed,
+            OperatingSystem::Linux,
+            None,
+            selected,
+            NativeDfaEntryContract::Public,
+        )
+        .unwrap();
+        let words = emission
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(words.windows(3).any(|window| {
+            window[0] == aarch64_sve_cntb(16).unwrap()
+                && window[1] == aarch64_cmp_x_imm(16, 16).unwrap()
+                && window[2] & 0xff00_001f == 0x5400_0009
+        }));
+        assert!(words.contains(&aarch64_load_q(0, 12).unwrap()));
+        assert!(words.contains(&aarch64_sve_ld1b_vl(0, 12, 0).unwrap()));
+    }
+
+    #[test]
+    fn aarch64_pure_sve_suffix_ignores_mixed_prefer_asimd_policy() {
+        let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
+        let layout = aarch64_suffix_only_layout(sve);
+        let selected = selected_aarch64_sve_suffix_kind_with_policy(
+            layout,
+            sve,
+            OperatingSystem::Linux,
+            Aarch64MixedVectorPreference::PreferAsimd,
+        );
+        assert_eq!(selected, Some(Aarch64SveFilterKind::Sve));
+
+        let emission = lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
+            layout,
+            sve,
+            OperatingSystem::Linux,
+            None,
+            selected,
+            NativeDfaEntryContract::Public,
+        )
+        .unwrap();
+        let words = emission
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(words.contains(&aarch64_sve_cntb(6).unwrap()));
+        assert!(!words.contains(&aarch64_sve_cntb(16).unwrap()));
+    }
+
+    #[test]
+    fn aarch64_suffix_receipt_names_the_strongest_emitted_arm() {
+        let mixed = FeatureSet::of(CpuFeature::Aarch64Asimd)
+            .with(CpuFeature::Aarch64Sve)
+            .with(CpuFeature::Aarch64Sve2);
+        let filter = aarch64_suffix_only_layout(mixed)
+            .suffix_filter
+            .unwrap()
+            .filter;
+        let membership = start_filter_membership(filter).unwrap();
+        for (sve_kind, use_asimd, expected_isa, vectorized) in [
+            (
+                Some(Aarch64SveFilterKind::Sve2 {
+                    match_table_offset: 0,
+                }),
+                true,
+                NativeScannerIsa::Aarch64Sve2,
+                true,
+            ),
+            (
+                Some(Aarch64SveFilterKind::Sve),
+                true,
+                NativeScannerIsa::Aarch64Sve,
+                true,
+            ),
+            (None, true, NativeScannerIsa::Aarch64Asimd, true),
+            (None, false, NativeScannerIsa::Aarch64ScalarRange, false),
+        ] {
+            let receipt = aarch64_suffix_scanner_emission(filter, sve_kind, use_asimd).unwrap();
+            assert_eq!(receipt.isa, expected_isa);
+            assert_eq!(receipt.vectorized, vectorized);
+            assert_eq!(receipt.scan_offset, filter.scan_offset);
+            assert_eq!(receipt.membership, membership);
+        }
     }
 
     #[test]
