@@ -77,6 +77,10 @@ fn unfactored_and_factored_tom_shapes_select_reverse_inner() {
         assert_eq!(build.distinct_literal_first_bytes, 2);
         assert!(build.adaptive_union);
         assert_eq!(
+            identity.kernel.union_receipt_digest,
+            build.union_receipt_digest()
+        );
+        assert_eq!(
             count.build_report().retained_capacity_bytes,
             build.persistent_bytes
         );
@@ -142,6 +146,10 @@ fn canonical_middle_literal_alternation_selects_adaptive_union() {
     assert!(build.adaptive_union);
     assert_eq!(build.union_mode, ReverseInnerUnionMode::AdaptiveFirstByte);
     assert_eq!(build.distinct_literal_first_bytes, 4);
+    assert_eq!(
+        identity.kernel.union_receipt_digest,
+        build.union_receipt_digest()
+    );
 }
 
 #[test]
@@ -166,6 +174,10 @@ fn shared_root_alternation_selects_grouped_union_identity() {
     assert_eq!(build.union_mode, ReverseInnerUnionMode::GroupedFixedColumn);
     assert!(!build.adaptive_union);
     assert_eq!(build.distinct_literal_first_bytes, 1);
+    assert_eq!(
+        identity.kernel.union_receipt_digest,
+        build.union_receipt_digest()
+    );
     let haystack = b"qaabq-abb-qabbq";
     assert_eq!(
         plan.count_value(haystack, AggregateRunLimits::default())

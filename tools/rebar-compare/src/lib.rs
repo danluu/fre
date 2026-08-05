@@ -253,7 +253,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v54-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v54-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -761,6 +761,12 @@ impl CandidateAdapter for CurrentFreAdapter {
         );
         identity.availability.push_str(
             "; terminal-greedy-class-v1 verifies the EOF suffix then reverse-scans the maximal predecessor class without allocation or job dispatch",
+        );
+        identity.identity.push_str(
+            "; reverse-inner-v2 keeps independent finders, distinct-first-byte adaptive union, and shared-root grouped fixed-column union under distinct plan/accounting identities and binds the complete union-mode, first-byte census, compatibility summary, and six-field anchor receipt into one deterministic operation-identity digest",
+        );
+        identity.availability.push_str(
+            "; eligible sparse mixed-Unicode reverse-inner reducers publish independent, adaptive-union-v2, or grouped-union-v2 labels from the authenticated kernel plan ID; receipt-field or cross-mode transplants fail closed before source access",
         );
         identity
             .identity
@@ -2798,6 +2804,33 @@ fn build_current_fre_span_sum_lifecycle_incumbent(
     })
 }
 
+fn reverse_inner_single_plan_label(model: &str, report: &AggregateBuildReport) -> &'static str {
+    let plan_id = match report.plan_identity {
+        AggregatePlanIdentity::ReverseInner(identity) => Some(identity.kernel.plan_id),
+        _ => None,
+    };
+    match (model == "compile", plan_id) {
+        (true, Some(REVERSE_INNER_PLAN_ID)) => {
+            "compile-aggregate-reverse-inner-independent-v1"
+        }
+        (true, Some(REVERSE_INNER_UNION_PLAN_ID)) => {
+            "compile-aggregate-reverse-inner-adaptive-union-v2"
+        }
+        (true, Some(REVERSE_INNER_GROUPED_UNION_PLAN_ID)) => {
+            "compile-aggregate-reverse-inner-grouped-union-v2"
+        }
+        (false, Some(REVERSE_INNER_PLAN_ID)) => "aggregate-reverse-inner-independent-v1",
+        (false, Some(REVERSE_INNER_UNION_PLAN_ID)) => {
+            "aggregate-reverse-inner-adaptive-union-v2"
+        }
+        (false, Some(REVERSE_INNER_GROUPED_UNION_PLAN_ID)) => {
+            "aggregate-reverse-inner-grouped-union-v2"
+        }
+        (true, _) => "compile-aggregate-reverse-inner-unrecognized",
+        (false, _) => "aggregate-reverse-inner-unrecognized",
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the exhaustive stable plan-label dispatch keeps every public route adjacent"
@@ -2866,7 +2899,9 @@ fn aggregate_single_plan_label(model: &str, report: &AggregateBuildReport) -> &'
         ("compile", AggregatePlanKind::LiteralClassRunLiteral, _) => {
             "compile-aggregate-literal-class-run-literal-v2"
         }
-        ("compile", AggregatePlanKind::ReverseInner, _) => "compile-aggregate-reverse-inner-v1",
+        ("compile", AggregatePlanKind::ReverseInner, _) => {
+            reverse_inner_single_plan_label(model, report)
+        }
         ("compile", AggregatePlanKind::GraphemeScalarDfa, _) => {
             "compile-aggregate-grapheme-scalar-dfa"
         }
@@ -2917,7 +2952,7 @@ fn aggregate_single_plan_label(model: &str, report: &AggregateBuildReport) -> &'
         (_, AggregatePlanKind::LiteralClassRunLiteral, _) => {
             "aggregate-literal-class-run-literal-v2"
         }
-        (_, AggregatePlanKind::ReverseInner, _) => "aggregate-reverse-inner-v1",
+        (_, AggregatePlanKind::ReverseInner, _) => reverse_inner_single_plan_label(model, report),
         (_, AggregatePlanKind::GraphemeScalarDfa, _) => "aggregate-grapheme-scalar-dfa",
         (_, AggregatePlanKind::BoundedClassSequence, _) => "aggregate-bounded-class-sequence",
         (_, AggregatePlanKind::BoundedSeparatedFields, _) => "aggregate-bounded-separated-fields",
@@ -13784,6 +13819,7 @@ fn reverse_inner_plan_identity_matches(
         && identity.kernel.literal_count == build.literal_count
         && identity.kernel.literal_bytes == build.literal_bytes
         && identity.kernel.literal_fingerprint == build.literal_fingerprint
+        && identity.kernel.union_receipt_digest == build.union_receipt_digest()
         && identity.kernel.unicode
         && identity.kernel.greedy
         && identity.kernel.leftmost_first
@@ -24110,7 +24146,14 @@ mod tests {
     }
 
     #[test]
-    fn reverse_inner_adapter_distinguishes_v1_and_grouped_v2_receipts() {
+    fn reverse_inner_adapter_closes_independent_and_both_v2_union_receipts() {
+        let independent = current_fre_rebar_aggregate_builder(
+            r"[a-zλ]+ab[a-zλ]+",
+            true,
+            false,
+        )
+        .build_count()
+        .expect("independent reverse-inner plan");
         let distinct = current_fre_rebar_aggregate_builder(
             r"[a-zλ]+(?:ab|cd)[a-zλ]+",
             true,
@@ -24126,7 +24169,7 @@ mod tests {
         .build_count()
         .expect("grouped reverse-inner plan");
 
-        for plan in [&distinct, &grouped] {
+        for plan in [&independent, &distinct, &grouped] {
             current_fre_rebar_validate_aggregate_identity(
                 plan.build_report(),
                 true,
@@ -24134,6 +24177,30 @@ mod tests {
             )
             .expect("reverse-inner receipt closes");
         }
+        assert_eq!(
+            aggregate_single_plan_label("count", independent.build_report()),
+            "aggregate-reverse-inner-independent-v1"
+        );
+        assert_eq!(
+            aggregate_single_plan_label("compile", independent.build_report()),
+            "compile-aggregate-reverse-inner-independent-v1"
+        );
+        assert_eq!(
+            aggregate_single_plan_label("count", distinct.build_report()),
+            "aggregate-reverse-inner-adaptive-union-v2"
+        );
+        assert_eq!(
+            aggregate_single_plan_label("compile", distinct.build_report()),
+            "compile-aggregate-reverse-inner-adaptive-union-v2"
+        );
+        assert_eq!(
+            aggregate_single_plan_label("count", grouped.build_report()),
+            "aggregate-reverse-inner-grouped-union-v2"
+        );
+        assert_eq!(
+            aggregate_single_plan_label("compile", grouped.build_report()),
+            "compile-aggregate-reverse-inner-grouped-union-v2"
+        );
 
         let AggregateBuildAccounting::ReverseInner(distinct_build) = distinct.build_report().build
         else {
@@ -24154,6 +24221,52 @@ mod tests {
         );
         assert!(!grouped_build.adaptive_union);
 
+        let AggregatePlanIdentity::ReverseInner(grouped_identity) =
+            grouped.build_report().plan_identity
+        else {
+            panic!("grouped plan retained another identity");
+        };
+        assert_eq!(
+            grouped_identity.kernel.union_receipt_digest,
+            grouped_build.union_receipt_digest()
+        );
+
+        macro_rules! assert_grouped_field_forgery_rejected {
+            ($field:ident) => {{
+                let mut forged = grouped.build_report().clone();
+                let AggregateBuildAccounting::ReverseInner(ref mut build) = forged.build else {
+                    panic!("grouped plan retained another receipt");
+                };
+                build.$field = build
+                    .$field
+                    .checked_add(1)
+                    .expect("small grouped receipt field increment");
+                let forged_digest = build.union_receipt_digest();
+                let AggregatePlanIdentity::ReverseInner(identity) = forged.plan_identity else {
+                    panic!("grouped plan retained another identity");
+                };
+                assert_ne!(
+                    identity.kernel.union_receipt_digest,
+                    forged_digest,
+                    "{} escaped the union receipt digest",
+                    stringify!($field)
+                );
+                assert!(
+                    current_fre_rebar_validate_aggregate_identity(&forged, true, "count")
+                        .is_err(),
+                    "{} forgery authenticated",
+                    stringify!($field)
+                );
+            }};
+        }
+        assert_grouped_field_forgery_rejected!(union_anchor_offset);
+        assert_grouped_field_forgery_rejected!(union_anchor_distinct_bytes);
+        assert_grouped_field_forgery_rejected!(union_anchor_max_bucket_literals);
+        assert_grouped_field_forgery_rejected!(union_anchor_max_bucket_verification_work);
+        assert_grouped_field_forgery_rejected!(union_anchor_collision_pairs);
+        assert_grouped_field_forgery_rejected!(union_anchor_selection_work);
+        assert_grouped_field_forgery_rejected!(distinct_literal_first_bytes);
+
         let mut forged_legacy_summary = grouped.build_report().clone();
         let AggregateBuildAccounting::ReverseInner(ref mut build) =
             forged_legacy_summary.build
@@ -24161,6 +24274,16 @@ mod tests {
             panic!("grouped plan retained another receipt");
         };
         build.adaptive_union = true;
+        let forged_legacy_digest = build.union_receipt_digest();
+        let AggregatePlanIdentity::ReverseInner(identity) =
+            forged_legacy_summary.plan_identity
+        else {
+            panic!("grouped plan retained another identity");
+        };
+        assert_ne!(
+            identity.kernel.union_receipt_digest,
+            forged_legacy_digest
+        );
         assert!(
             current_fre_rebar_validate_aggregate_identity(
                 &forged_legacy_summary,
@@ -24170,19 +24293,48 @@ mod tests {
             .is_err()
         );
 
-        let mut forged_v1 = grouped.build_report().clone();
-        let AggregateBuildAccounting::ReverseInner(ref mut build) = forged_v1.build else {
+        let mut transplanted_adaptive = grouped.build_report().clone();
+        let AggregateBuildAccounting::ReverseInner(ref mut build) =
+            transplanted_adaptive.build
+        else {
             panic!("grouped plan retained another receipt");
         };
-        build.union_mode = ReverseInnerUnionMode::AdaptiveFirstByte;
-        build.adaptive_union = true;
-        let AggregatePlanIdentity::ReverseInner(ref mut identity) = forged_v1.plan_identity else {
+        build.distinct_literal_first_bytes = distinct_build.distinct_literal_first_bytes;
+        build.union_anchor_offset = distinct_build.union_anchor_offset;
+        build.union_anchor_distinct_bytes = distinct_build.union_anchor_distinct_bytes;
+        build.union_anchor_max_bucket_literals = distinct_build.union_anchor_max_bucket_literals;
+        build.union_anchor_max_bucket_verification_work =
+            distinct_build.union_anchor_max_bucket_verification_work;
+        build.union_anchor_collision_pairs = distinct_build.union_anchor_collision_pairs;
+        build.union_anchor_selection_work = distinct_build.union_anchor_selection_work;
+        build.adaptive_union = distinct_build.adaptive_union;
+        build.union_mode = distinct_build.union_mode;
+        let transplanted_digest = build.union_receipt_digest();
+        let AggregatePlanIdentity::ReverseInner(ref mut identity) =
+            transplanted_adaptive.plan_identity
+        else {
             panic!("grouped plan retained another identity");
         };
         identity.kernel.plan_id = REVERSE_INNER_UNION_PLAN_ID;
         identity.kernel.accounting_id = REVERSE_INNER_UNION_ACCOUNTING_ID;
+        assert_eq!(
+            build.distinct_literal_first_bytes,
+            build.literal_count,
+            "the transplanted adaptive receipt must carry a coherent first-byte census"
+        );
+        assert_eq!(
+            transplanted_digest,
+            distinct_build.union_receipt_digest(),
+            "the forged receipt must coherently reproduce the adaptive union summary"
+        );
+        assert_ne!(identity.kernel.union_receipt_digest, transplanted_digest);
         assert!(
-            current_fre_rebar_validate_aggregate_identity(&forged_v1, true, "count").is_err()
+            current_fre_rebar_validate_aggregate_identity(
+                &transplanted_adaptive,
+                true,
+                "count"
+            )
+            .is_err()
         );
     }
 
@@ -24192,7 +24344,15 @@ mod tests {
         assert_eq!(current_fre_adapter_id(), identity.adapter);
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v54-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1"
+            "fre-current-aggregate-capture-v54-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1"
+        );
+        assert!(identity.adapter.contains("-reverse-inner-v2-"));
+        assert!(!identity.adapter.contains("-reverse-inner-v1-"));
+        assert!(identity.identity.contains("six-field anchor receipt"));
+        assert!(
+            identity
+                .availability
+                .contains("receipt-field or cross-mode transplants fail closed")
         );
         assert!(
             identity

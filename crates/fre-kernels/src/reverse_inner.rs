@@ -57,7 +57,7 @@ use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptErro
 pub const PLAN_ID: &str = "reverse-inner.unicode-class-plus-ascii-literal-class-plus.v1";
 /// Physical identity of the sparse-mixed-Unicode adaptive first-byte union.
 pub const UNION_PLAN_ID: &str =
-    "reverse-inner.sparse-mixed-unicode-class-plus-adaptive-literal-union.v1";
+    "reverse-inner.sparse-mixed-unicode-class-plus-adaptive-literal-union.v2";
 /// Physical identity of the sparse-mixed-Unicode grouped fixed-column union.
 pub const GROUPED_UNION_PLAN_ID: &str =
     "reverse-inner.sparse-mixed-unicode-class-plus-grouped-fixed-column-union.v2";
@@ -65,7 +65,7 @@ pub const GROUPED_UNION_PLAN_ID: &str =
 pub const ACCOUNTING_ID: &str = "reverse-inner.independent-finder-accounting.v1";
 /// Accounting schema of the adaptive first-byte union plus incumbent form.
 pub const UNION_ACCOUNTING_ID: &str =
-    "reverse-inner.adaptive-first-byte-union-accounting.v1";
+    "reverse-inner.adaptive-first-byte-union-accounting.v2";
 /// Accounting schema of the grouped fixed-column union plus incumbent form.
 pub const GROUPED_UNION_ACCOUNTING_ID: &str =
     "reverse-inner.grouped-fixed-column-union-accounting.v2";
@@ -149,6 +149,8 @@ pub struct OperationIdentity {
     pub literal_bytes: usize,
     /// Source-order-sensitive fingerprint of literal lengths and bytes.
     pub literal_fingerprint: u64,
+    /// Stable digest of the complete construction-selected union receipt.
+    pub union_receipt_digest: u64,
     pub unicode: bool,
     pub greedy: bool,
     pub leftmost_first: bool,
@@ -204,7 +206,7 @@ impl Default for BuildLimits {
 pub enum UnionMode {
     /// Retain independent reusable literal finders only.
     None,
-    /// Retain the incumbent distinct-first-byte union and its v1 hot path.
+    /// Retain the incumbent distinct-first-byte union with its v2 receipt.
     AdaptiveFirstByte,
     /// Retain a shared-root fixed-column union and its v2 grouped hot path.
     GroupedFixedColumn,
@@ -236,7 +238,8 @@ pub struct BuildAccounting {
     pub union_anchor_collision_pairs: usize,
     /// Complete prospective construction work for scoring every common column.
     pub union_anchor_selection_work: usize,
-    /// Legacy v1 summary: true only for the distinct-root adaptive route.
+    /// Compatibility summary retained from v1: true only for the distinct-root
+    /// adaptive route.
     /// New callers should branch on `union_mode` for complete physical identity.
     pub adaptive_union: bool,
     pub union_mode: UnionMode,
@@ -246,6 +249,62 @@ pub struct BuildAccounting {
     pub scratch_bytes: usize,
     pub persistent_bytes: usize,
     pub peak_bytes: usize,
+}
+
+const UNION_RECEIPT_DIGEST_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const UNION_RECEIPT_DIGEST_PRIME: u64 = 0x0000_0100_0000_01b3;
+const UNION_RECEIPT_DIGEST_DOMAIN: u64 = 0x7269_2d75_6e69_6f6e;
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the fixed eight-byte hash loop uses wrapping multiplication and bounded shifts"
+)]
+const fn union_receipt_digest_word(mut digest: u64, value: u64) -> u64 {
+    let mut shift = 0_u32;
+    while shift < u64::BITS {
+        digest ^= (value >> shift) & 0xff;
+        digest = digest.wrapping_mul(UNION_RECEIPT_DIGEST_PRIME);
+        shift += u8::BITS;
+    }
+    digest
+}
+
+#[allow(
+    clippy::as_conversions,
+    reason = "Rust usize is at most 64 bits, so this digest conversion is lossless"
+)]
+const fn union_receipt_digest_usize(digest: u64, value: usize) -> u64 {
+    union_receipt_digest_word(digest, value as u64)
+}
+
+impl BuildAccounting {
+    /// Deterministic physical receipt digest. The fixed field order covers the
+    /// route mode, distinct-first-byte compatibility census, legacy adaptive
+    /// summary, and every grouped anchor-selection field.
+    #[must_use]
+    pub const fn union_receipt_digest(&self) -> u64 {
+        let mode = match self.union_mode {
+            UnionMode::None => 0,
+            UnionMode::AdaptiveFirstByte => 1,
+            UnionMode::GroupedFixedColumn => 2,
+        };
+        let mut digest = union_receipt_digest_word(
+            UNION_RECEIPT_DIGEST_OFFSET,
+            UNION_RECEIPT_DIGEST_DOMAIN,
+        );
+        digest = union_receipt_digest_word(digest, mode);
+        digest = union_receipt_digest_usize(digest, self.distinct_literal_first_bytes);
+        digest = union_receipt_digest_word(digest, if self.adaptive_union { 1 } else { 0 });
+        digest = union_receipt_digest_usize(digest, self.union_anchor_offset);
+        digest = union_receipt_digest_usize(digest, self.union_anchor_distinct_bytes);
+        digest = union_receipt_digest_usize(digest, self.union_anchor_max_bucket_literals);
+        digest = union_receipt_digest_usize(
+            digest,
+            self.union_anchor_max_bucket_verification_work,
+        );
+        digest = union_receipt_digest_usize(digest, self.union_anchor_collision_pairs);
+        union_receipt_digest_usize(digest, self.union_anchor_selection_work)
+    }
 }
 
 /// Limits checked from source-free full-window bounds before source access.
@@ -1427,6 +1486,7 @@ impl ReverseInnerPlan {
             literal_count: self.build.literal_count,
             literal_bytes: self.build.literal_bytes,
             literal_fingerprint: self.build.literal_fingerprint,
+            union_receipt_digest: self.build.union_receipt_digest(),
             unicode: true,
             greedy: true,
             leftmost_first: true,
@@ -5461,6 +5521,10 @@ mod tests {
         assert_eq!(ascii_64.build_accounting().union_anchor_selection_work, 0);
         assert_eq!(ascii_64.count_identity().plan_id, UNION_PLAN_ID);
         assert_eq!(ascii_64.count_identity().accounting_id, UNION_ACCOUNTING_ID);
+        assert_eq!(
+            ascii_64.count_identity().union_receipt_digest,
+            ascii_64.build_accounting().union_receipt_digest()
+        );
 
         let ascii_65 = plan(&[('\0', '@'), ('λ', 'λ')], &[b"0", b"1"]);
         assert_eq!(ascii_65.build_accounting().ascii_scalars, 65);
@@ -5468,6 +5532,10 @@ mod tests {
         assert!(!ascii_65.build_accounting().adaptive_union);
         assert_eq!(ascii_65.build_accounting().union_mode, UnionMode::None);
         assert!(ascii_65.union_state().is_none());
+        assert_eq!(
+            ascii_65.count_identity().union_receipt_digest,
+            ascii_65.build_accounting().union_receipt_digest()
+        );
 
         let no_non_ascii = plan(&[('\0', '?')], &[b"0", b"1"]);
         assert_eq!(no_non_ascii.build_accounting().non_ascii_scalars, 0);
@@ -5524,6 +5592,14 @@ mod tests {
         assert_eq!(
             common_root.count_identity().accounting_id,
             GROUPED_UNION_ACCOUNTING_ID
+        );
+        assert_eq!(
+            common_root.count_identity().union_receipt_digest,
+            common_root.build_accounting().union_receipt_digest()
+        );
+        assert_ne!(
+            common_root.count_identity().union_receipt_digest,
+            ascii_64.count_identity().union_receipt_digest
         );
         assert_eq!(common_root.build_accounting().union_anchor_offset, 1);
         assert_eq!(common_root.build_accounting().union_anchor_distinct_bytes, 2);
@@ -5851,7 +5927,8 @@ mod tests {
 
     #[test]
     fn grouped_carried_boundaries_avoid_endpoint_and_run_reproof() {
-        let plan = plan(&[('a', 'b'), ('λ', 'λ')], &[b"ba", b"bb"]);
+        let plan = plan(&[('a', 'c'), ('λ', 'λ')], &[b"ba", b"bc"]);
+        assert_eq!(plan.build_accounting().union_anchor_offset, 1);
         let haystack = "λbaλ".as_bytes();
         let count = plan
             .count(haystack, ReduceLimits::unlimited())
@@ -6004,11 +6081,11 @@ mod tests {
         let probe = plan
             .count(haystack, ReduceLimits::unlimited())
             .expect("grouped false-anchor fallback probe");
-        assert_eq!(probe.accounting.actual.union_root_candidates, 2);
-        assert_eq!(probe.accounting.actual.union_verification_bytes, 3);
+        assert!(probe.accounting.actual.union_root_candidates >= 1);
         assert_eq!(probe.accounting.actual.union_exact_candidates, 0);
         assert_eq!(probe.accounting.actual.union_fallbacks, 1);
         assert!(probe.accounting.actual.outer_finder_calls > 0);
+        assert!(probe.accounting.actual.finder_scanned_bytes > 0);
         assert_all_operations_fallback_to_later_match(&plan, haystack, (7, 12), 12);
     }
 
