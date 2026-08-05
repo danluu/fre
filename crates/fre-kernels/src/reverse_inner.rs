@@ -3880,8 +3880,8 @@ mod tests {
     use regex::bytes::{Regex, RegexBuilder};
 
     use super::{
-        ACCOUNTING_ID, BuildError, BuildLimits, COUNT_OPERATION_ID, EXISTS_OPERATION_ID,
-        MAX_ADMITTED_NON_ASCII_SCALARS, PLAN_ID, ReduceError, ReduceLimits, ReverseInnerPlan,
+        BuildError, BuildLimits, COUNT_OPERATION_ID, EXISTS_OPERATION_ID,
+        MAX_ADMITTED_NON_ASCII_SCALARS, ReduceError, ReduceLimits, ReverseInnerPlan,
         SEARCH_OPERATION_ID, SHORTEST_SEARCH_OPERATION_ID, SPAN_SUM_OPERATION_ID, SearchLimits,
         ScalarRange, UNION_ACCOUNTING_ID, UNION_PLAN_ID, UnionState,
     };
