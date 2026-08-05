@@ -1686,9 +1686,16 @@ fn correlated_columns_dimensions(
     patterns: usize,
     word_bytes: usize,
 ) -> Result<Option<(usize, usize)>, PackedLiteralSetError> {
-    if patterns < WIDE_BATCHED_SECONDARY_MIN_PATTERNS
+    // A two-byte wide language needs both columns to preserve row identity,
+    // and exact boundary masks make its complete verifier especially small.
+    // Wider languages retain the established admission threshold: enabling
+    // their full column stream for small dictionaries costs more than the
+    // incumbent packed search on common short-word inputs.
+    let narrow_pair = word_bytes == 2 && patterns >= 4;
+    let established_wide = patterns >= WIDE_BATCHED_SECONDARY_MIN_PATTERNS
+        && word_bytes >= WIDE_CORRELATED_MIN_WORD_BYTES;
+    if (!narrow_pair && !established_wide)
         || patterns > WIDE_CORRELATED_MAX_PATTERNS
-        || word_bytes < WIDE_CORRELATED_MIN_WORD_BYTES
         || word_bytes > WIDE_CORRELATED_MAX_WORD_BYTES
     {
         return Ok(None);
@@ -4330,10 +4337,15 @@ mod tests {
 
     #[test]
     fn correlated_columns_use_one_mask_word_through_pattern_64() {
-        assert!(correlated_columns_dimensions(64, 5).unwrap().is_some());
-        assert!(correlated_columns_dimensions(65, 5).unwrap().is_none());
+        assert!(correlated_columns_dimensions(4, 2).unwrap().is_some());
+        assert!(correlated_columns_dimensions(64, 2).unwrap().is_some());
+        assert!(correlated_columns_dimensions(16, 5).unwrap().is_some());
+        assert!(correlated_columns_dimensions(3, 2).unwrap().is_none());
+        assert!(correlated_columns_dimensions(4, 1).unwrap().is_none());
+        assert!(correlated_columns_dimensions(15, 5).unwrap().is_none());
         assert!(correlated_columns_dimensions(16, 4).unwrap().is_none());
-        assert!(correlated_columns_dimensions(16, 33).unwrap().is_none());
+        assert!(correlated_columns_dimensions(65, 2).unwrap().is_none());
+        assert!(correlated_columns_dimensions(4, 33).unwrap().is_none());
 
         let words = (0_usize..64)
             .map(|index| {
