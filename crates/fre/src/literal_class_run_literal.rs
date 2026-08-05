@@ -45,8 +45,8 @@ impl FiniteInspection<'_> {
         self,
         dispatch: SimdDispatchContext,
         limits: LiteralClassRunLiteralBuildLimits,
-    ) -> Result<BoundedLiteralClassRunPlan, LiteralClassRunLiteralBuildError> {
-        BoundedLiteralClassRunPlan::build_with_dispatch(
+    ) -> Result<Option<BoundedLiteralClassRunPlan>, LiteralClassRunLiteralBuildError> {
+        BoundedLiteralClassRunPlan::build_with_dispatch_if_admitted(
             dispatch,
             self.prefix,
             self.class.ranges(),

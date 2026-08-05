@@ -94,6 +94,7 @@ const FIXED_BUILD_WORK: usize = 32;
 const LITERAL_BUILD_WORK_PER_BYTE: usize = 4;
 const FINDER_BUILD_WORK_PER_BYTE: usize = 4;
 const ANCHOR_SELECTION_WORK: usize = 2;
+const BOUNDED_NATIVE_ADMISSION_WORK: usize = 1;
 const BOUNDED_FINDER_BUILD_WORK_PER_BYTE: usize = 16;
 const BOUNDED_FINDER_BUILD_FIXED_WORK: usize = 64;
 const RANGE_BUILD_WORK: usize = 8;
@@ -776,6 +777,24 @@ enum Anchor {
     Prefix,
     Suffix,
     CompleteAsciiWordSuffix,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BoundedNativeAdmission {
+    Unconditional,
+    RequireCostProof,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BoundedAnchorScoreMode {
+    LazyPreference,
+    AdmissionProof,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BoundedAnchorSelection {
+    preferred: Anchor,
+    strict_repetition: Option<Anchor>,
 }
 
 #[derive(Debug)]
@@ -3644,7 +3663,17 @@ impl BoundedLiteralClassRunPlan {
     where
         I: Iterator<Item = (u8, u8)>,
     {
-        Self::build_inner(None, prefix, ranges, suffix, minimum, maximum, limits)
+        Self::build_inner(
+            None,
+            prefix,
+            ranges,
+            suffix,
+            minimum,
+            maximum,
+            limits,
+            BoundedNativeAdmission::Unconditional,
+        )
+        .map(|plan| plan.expect("unconditional finite build cannot decline admission"))
     }
 
     pub fn build_with_dispatch<I>(
@@ -3667,6 +3696,38 @@ impl BoundedLiteralClassRunPlan {
             minimum,
             maximum,
             limits,
+            BoundedNativeAdmission::Unconditional,
+        )
+        .map(|plan| plan.expect("unconditional finite build cannot decline admission"))
+    }
+
+    /// Build this finite direct plan only when its immutable structure proves
+    /// a native advantage over the generic forward K0 fallback.
+    ///
+    /// A semantic decline is returned as `Ok(None)` before either literal or
+    /// Finder is allocated. Resource failures remain ordinary build errors so
+    /// callers cannot turn an exhausted construction budget into a fallback.
+    pub fn build_with_dispatch_if_admitted<I>(
+        dispatch: SimdDispatchContext,
+        prefix: &[u8],
+        ranges: I,
+        suffix: &[u8],
+        minimum: usize,
+        maximum: usize,
+        limits: BuildLimits,
+    ) -> Result<Option<Self>, BuildError>
+    where
+        I: Iterator<Item = (u8, u8)>,
+    {
+        Self::build_inner(
+            Some((dispatch, DispatchPolicy::Auto)),
+            prefix,
+            ranges,
+            suffix,
+            minimum,
+            maximum,
+            limits,
+            BoundedNativeAdmission::RequireCostProof,
         )
     }
 
@@ -3683,7 +3744,8 @@ impl BoundedLiteralClassRunPlan {
         minimum: usize,
         maximum: usize,
         limits: BuildLimits,
-    ) -> Result<Self, BuildError>
+        admission: BoundedNativeAdmission,
+    ) -> Result<Option<Self>, BuildError>
     where
         I: Iterator<Item = (u8, u8)>,
     {
@@ -3767,19 +3829,38 @@ impl BoundedLiteralClassRunPlan {
                         computation: "finite anchor and bound selection work",
                     })?,
             )?;
-            let preferred_anchor = bounded_preferred_anchor(prefix, suffix, &mut work)?;
+            let score_mode = match admission {
+                BoundedNativeAdmission::Unconditional => {
+                    BoundedAnchorScoreMode::LazyPreference
+                }
+                BoundedNativeAdmission::RequireCostProof => {
+                    BoundedAnchorScoreMode::AdmissionProof
+                }
+            };
+            let selection = bounded_anchor_selection(prefix, suffix, &mut work, score_mode)?;
             let ascii_scanner = build_ascii_scanner(
                 dispatch.filter(|_| class.is_ascii()),
                 class,
                 false,
                 &mut work,
             )?;
+            if admission == BoundedNativeAdmission::RequireCostProof {
+                work.charge(BOUNDED_NATIVE_ADMISSION_WORK)?;
+                if !bounded_native_cost_admitted(
+                    suffix.len(),
+                    maximum,
+                    selection,
+                    ascii_scanner.is_some(),
+                )? {
+                    return Ok(None);
+                }
+            }
             (
                 class,
                 class_ranges,
                 class_members,
                 ascii_scanner,
-                preferred_anchor,
+                selection.preferred,
                 work.used,
             )
         };
@@ -3790,7 +3871,7 @@ impl BoundedLiteralClassRunPlan {
         let suffix = copy_literal(suffix, "finite direct suffix")?;
         let suffix_bytes = suffix.len();
         record_literal_copy(&mut actual, suffix_bytes)?;
-        Ok(Self {
+        Ok(Some(Self {
             prefix: FinderBuilder::new().build_forward_owned(prefix),
             suffix: FinderBuilder::new().build_forward_owned(suffix),
             class,
@@ -3809,7 +3890,7 @@ impl BoundedLiteralClassRunPlan {
                 persistent_bytes,
                 peak_bytes: persistent_bytes,
             },
-        })
+        }))
     }
 
     #[must_use]
@@ -4483,17 +4564,57 @@ fn bounded_preferred_anchor(
     suffix: &[u8],
     work: &mut BuildWork<'_>,
 ) -> Result<Anchor, BuildError> {
+    bounded_anchor_selection(
+        prefix,
+        suffix,
+        work,
+        BoundedAnchorScoreMode::LazyPreference,
+    )
+    .map(|selection| selection.preferred)
+}
+
+fn bounded_anchor_selection(
+    prefix: &[u8],
+    suffix: &[u8],
+    work: &mut BuildWork<'_>,
+    mode: BoundedAnchorScoreMode,
+) -> Result<BoundedAnchorSelection, BuildError> {
     let prefix_frequency = bounded_anchor_frequency_score(prefix, work)?;
     let suffix_frequency = bounded_anchor_frequency_score(suffix, work)?;
-    match suffix_frequency.cmp(&prefix_frequency) {
-        core::cmp::Ordering::Less => return Ok(Anchor::Suffix),
-        core::cmp::Ordering::Greater => return Ok(Anchor::Prefix),
-        core::cmp::Ordering::Equal => {}
-    }
+    let frequency_order = suffix_frequency.cmp(&prefix_frequency);
+    let strict_repetition = if frequency_order == core::cmp::Ordering::Equal
+        || mode == BoundedAnchorScoreMode::AdmissionProof
+    {
+        bounded_repetition_preference(prefix, suffix, work)?
+    } else {
+        None
+    };
+    let preferred = match frequency_order {
+        core::cmp::Ordering::Less => Anchor::Suffix,
+        core::cmp::Ordering::Greater => Anchor::Prefix,
+        core::cmp::Ordering::Equal => match strict_repetition {
+            Some(anchor) => anchor,
+            None => {
+                work.charge(1)?;
+                if suffix.len() >= prefix.len() {
+                    Anchor::Suffix
+                } else {
+                    Anchor::Prefix
+                }
+            }
+        },
+    };
+    Ok(BoundedAnchorSelection {
+        preferred,
+        strict_repetition,
+    })
+}
 
-    // Period is strictly a frequency-tie proof. Keeping this branch lazy
-    // avoids charging the bounded quadratic analysis when byte rarity already
-    // chooses an anchor.
+fn bounded_repetition_preference(
+    prefix: &[u8],
+    suffix: &[u8],
+    work: &mut BuildWork<'_>,
+) -> Result<Option<Anchor>, BuildError> {
     let prefix_overlap = bounded_anchor_overlap_score(prefix, work)?;
     let suffix_overlap = bounded_anchor_overlap_score(suffix, work)?;
     work.charge(2)?;
@@ -4519,15 +4640,45 @@ fn bounded_preferred_anchor(
         })?;
     work.charge(1)?;
     match suffix_factor.cmp(&prefix_factor) {
-        core::cmp::Ordering::Less => Ok(Anchor::Suffix),
-        core::cmp::Ordering::Greater => Ok(Anchor::Prefix),
-        core::cmp::Ordering::Equal => {
-            work.charge(1)?;
-            if suffix.len() >= prefix.len() {
-                Ok(Anchor::Suffix)
-            } else {
-                Ok(Anchor::Prefix)
-            }
+        core::cmp::Ordering::Less => Ok(Some(Anchor::Suffix)),
+        core::cmp::Ordering::Greater => Ok(Some(Anchor::Prefix)),
+        core::cmp::Ordering::Equal => Ok(None),
+    }
+}
+
+fn bounded_native_cost_admitted(
+    suffix_width: usize,
+    maximum: usize,
+    selection: BoundedAnchorSelection,
+    has_ascii_scanner: bool,
+) -> Result<bool, BuildError> {
+    // A strictly less repetitive chosen anchor is sufficient on its own.
+    // Otherwise, require enough bounded-run service to amortize one sustained
+    // wide scan; prefix routing also pays the opposite suffix verification.
+    if selection.strict_repetition == Some(selection.preferred) {
+        return Ok(true);
+    }
+    if !has_ascii_scanner {
+        return Ok(false);
+    }
+    let horizon = maximum.checked_add(1).unwrap_or(usize::MAX);
+    let sustained_scan = ASCII_WIDE_BYTES.checked_mul(2).ok_or(
+        BuildError::ArithmeticOverflow {
+            computation: "finite native sustained scan horizon",
+        },
+    )?;
+    match selection.preferred {
+        Anchor::Suffix => Ok(horizon >= sustained_scan),
+        Anchor::Prefix => {
+            let required = sustained_scan.checked_add(suffix_width).ok_or(
+                BuildError::ArithmeticOverflow {
+                    computation: "finite native prefix verification horizon",
+                },
+            )?;
+            Ok(horizon >= required)
+        }
+        Anchor::CompleteAsciiWordSuffix => {
+            unreachable!("finite direct anchor is unguarded")
         }
     }
 }
@@ -7670,6 +7821,193 @@ mod tests {
                         && limit == baseline.work_upper_bound - 1
             ));
         }
+    }
+
+    #[test]
+    fn bounded_native_cost_gate_uses_direction_horizon_opposite_and_strict_period() {
+        let prefix = BoundedAnchorSelection {
+            preferred: Anchor::Prefix,
+            strict_repetition: None,
+        };
+        let suffix = BoundedAnchorSelection {
+            preferred: Anchor::Suffix,
+            strict_repetition: None,
+        };
+        let sustained = 2 * ASCII_WIDE_BYTES;
+        assert!(!bounded_native_cost_admitted(1, sustained - 2, suffix, true).unwrap());
+        assert!(bounded_native_cost_admitted(1, sustained - 1, suffix, true).unwrap());
+        assert!(!bounded_native_cost_admitted(1, sustained - 1, prefix, true).unwrap());
+        assert!(bounded_native_cost_admitted(1, sustained, prefix, true).unwrap());
+        for suffix_width in 1..=2 * ASCII_WIDE_BYTES {
+            let admitted_maximum = sustained + suffix_width - 1;
+            assert!(!bounded_native_cost_admitted(
+                suffix_width,
+                admitted_maximum - 1,
+                prefix,
+                true,
+            )
+            .unwrap());
+            assert!(bounded_native_cost_admitted(
+                suffix_width,
+                admitted_maximum,
+                prefix,
+                true,
+            )
+            .unwrap());
+        }
+        assert!(!bounded_native_cost_admitted(1, usize::MAX, prefix, false).unwrap());
+        assert!(!bounded_native_cost_admitted(1, usize::MAX, suffix, false).unwrap());
+
+        for anchor in [Anchor::Prefix, Anchor::Suffix] {
+            let strict = BoundedAnchorSelection {
+                preferred: anchor,
+                strict_repetition: Some(anchor),
+            };
+            assert!(bounded_native_cost_admitted(usize::MAX, 0, strict, false).unwrap());
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one matrix keeps semantic decline, exact threshold, period override, and resource propagation adjacent"
+    )]
+    fn bounded_admitted_build_declines_before_allocation_and_preserves_resource_errors() {
+        let ascii = |prefix: &[u8], suffix: &[u8], maximum, limits| {
+            BoundedLiteralClassRunPlan::build_with_dispatch_if_admitted(
+                SimdDispatchContext::capture(),
+                prefix,
+                [(b'0', b'0')].into_iter(),
+                suffix,
+                0,
+                maximum,
+                limits,
+            )
+        };
+
+        let prefix_selected = b"Q\x92";
+        assert!(ascii(
+            prefix_selected,
+            b"U",
+            2 * ASCII_WIDE_BYTES - 1,
+            BuildLimits::unlimited(),
+        )
+        .unwrap()
+        .is_none());
+        let admitted = ascii(
+            prefix_selected,
+            b"U",
+            2 * ASCII_WIDE_BYTES,
+            BuildLimits::unlimited(),
+        )
+        .unwrap()
+        .expect("one-byte verification fits after the sustained scan horizon");
+        assert_eq!(admitted.preferred_anchor, Anchor::Prefix);
+
+        let wide_unbordered_suffix = b"abaaaabb";
+        assert!(ascii(
+            b"QZ",
+            wide_unbordered_suffix,
+            2 * ASCII_WIDE_BYTES,
+            BuildLimits::unlimited(),
+        )
+        .unwrap()
+        .is_none());
+        assert!(ascii(
+            b"QZ",
+            wide_unbordered_suffix,
+            2 * ASCII_WIDE_BYTES + wide_unbordered_suffix.len() - 1,
+            BuildLimits::unlimited(),
+        )
+        .unwrap()
+        .is_some());
+
+        let unbordered_prefix = b"abaaaabb";
+        assert!(ascii(
+            unbordered_prefix,
+            b"QZ",
+            2 * ASCII_WIDE_BYTES - 2,
+            BuildLimits::unlimited(),
+        )
+        .unwrap()
+        .is_none());
+        let suffix_admitted = ascii(
+            unbordered_prefix,
+            b"QZ",
+            2 * ASCII_WIDE_BYTES - 1,
+            BuildLimits::unlimited(),
+        )
+        .unwrap()
+        .expect("suffix routing reaches the sustained scan horizon");
+        assert_eq!(suffix_admitted.preferred_anchor, Anchor::Suffix);
+
+        for (prefix, suffix, expected_anchor) in [
+            (b"QZ".as_slice(), b"aaaaaaaa".as_slice(), Anchor::Prefix),
+            (b"aaaaaaaa".as_slice(), b"QZ".as_slice(), Anchor::Suffix),
+        ] {
+            let plan = ascii(prefix, suffix, 0, BuildLimits::unlimited())
+                .unwrap()
+                .expect("strict repetition improvement overrides the horizon");
+            assert_eq!(plan.preferred_anchor, expected_anchor);
+        }
+
+        let without_ascii_scanner =
+            BoundedLiteralClassRunPlan::build_with_dispatch_if_admitted(
+                SimdDispatchContext::capture(),
+                b"QZ",
+                [(0x80, 0x80)].into_iter(),
+                wide_unbordered_suffix,
+                0,
+                usize::MAX,
+                BuildLimits::unlimited(),
+            )
+            .unwrap();
+        assert!(without_ascii_scanner.is_none());
+        let strict_without_ascii_scanner =
+            BoundedLiteralClassRunPlan::build_with_dispatch_if_admitted(
+                SimdDispatchContext::capture(),
+                b"QZ",
+                [(0x80, 0x80)].into_iter(),
+                b"aaaaaaaa",
+                0,
+                0,
+                BuildLimits::unlimited(),
+            )
+            .unwrap()
+            .expect("strict repetition improvement does not require SIMD");
+        assert_eq!(strict_without_ascii_scanner.preferred_anchor, Anchor::Prefix);
+
+        let baseline = admitted.build_accounting();
+        let exact = BuildLimits {
+            max_literal_bytes: baseline.literal_bytes,
+            max_class_ranges: baseline.class_ranges,
+            max_class_members: baseline.class_members,
+            max_build_work: baseline.work_upper_bound,
+            max_scratch_bytes: baseline.scratch_bytes,
+            max_persistent_bytes: baseline.persistent_bytes,
+            max_peak_bytes: baseline.peak_bytes,
+        };
+        assert!(ascii(prefix_selected, b"U", 2 * ASCII_WIDE_BYTES, exact)
+            .unwrap()
+            .is_some());
+        let below = BuildLimits {
+            max_build_work: baseline.work_upper_bound - 1,
+            ..exact
+        };
+        assert!(matches!(
+            ascii(prefix_selected, b"U", 2 * ASCII_WIDE_BYTES, below),
+            Err(BuildError::WorkLimit { needed, limit })
+                if needed == baseline.work_upper_bound
+                    && limit == baseline.work_upper_bound - 1
+        ));
+        let declined_resource_limit = BuildLimits {
+            max_literal_bytes: 0,
+            ..BuildLimits::unlimited()
+        };
+        assert!(matches!(
+            ascii(b"QZ", wide_unbordered_suffix, 0, declined_resource_limit),
+            Err(BuildError::LiteralBytesLimit { .. })
+        ));
     }
 
     #[test]

@@ -4906,39 +4906,41 @@ impl PortableBuilder {
                     self.limits.literal_class_run_literal,
                 )
                 .map_err(BuildError::LiteralClassRunLiteral)?;
-            let build = plan.build_accounting();
-            if let Ok(plan) = fre_exact_alloc::try_box_preserve(plan) {
-                return Ok(PortableRegex {
-                    source,
-                    capture_names,
-                    line_total_grep_plan,
-                    plan: PortablePlan::BoundedLiteralClassRun(plan),
-                    profile: profile.clone(),
-                    limits: self.limits,
-                    selection: self.selection,
-                    report: BuildReport {
+            if let Some(plan) = plan {
+                let build = plan.build_accounting();
+                if let Ok(plan) = fre_exact_alloc::try_box_preserve(plan) {
+                    return Ok(PortableRegex {
+                        source,
+                        capture_names,
+                        line_total_grep_plan,
+                        plan: PortablePlan::BoundedLiteralClassRun(plan),
                         profile: profile.clone(),
-                        admission,
-                        syntax,
-                        plan: PlanKind::LiteralClassRunLiteral,
-                        planner_work: fallback_planner_work,
-                        lowering: None,
-                        states: 0,
-                        edges: 0,
-                        plan_storage_bytes: build.persistent_bytes,
-                        source_storage_bytes,
-                        capture_name_storage_bytes,
-                        charged_persistent_bytes: 0,
-                        persistent_byte_limit: 0,
-                        captures_len,
-                        static_captures_len,
-                        minimum_match_bytes,
-                        required_literal: None,
-                        literal_class_run_literal: Some(build),
-                        forward_anchored: None,
-                    }
-                    .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
-                });
+                        limits: self.limits,
+                        selection: self.selection,
+                        report: BuildReport {
+                            profile: profile.clone(),
+                            admission,
+                            syntax,
+                            plan: PlanKind::LiteralClassRunLiteral,
+                            planner_work: fallback_planner_work,
+                            lowering: None,
+                            states: 0,
+                            edges: 0,
+                            plan_storage_bytes: build.persistent_bytes,
+                            source_storage_bytes,
+                            capture_name_storage_bytes,
+                            charged_persistent_bytes: 0,
+                            persistent_byte_limit: 0,
+                            captures_len,
+                            static_captures_len,
+                            minimum_match_bytes,
+                            required_literal: None,
+                            literal_class_run_literal: Some(build),
+                            forward_anchored: None,
+                        }
+                        .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
+                    });
+                }
             }
         }
         let lowered = fre_lower::lower_raw(
@@ -13573,6 +13575,88 @@ mod tests {
             .build()
             .unwrap();
         assert!(matches!(&forced.plan, PortablePlan::K0(_)));
+    }
+
+    #[test]
+    fn finite_two_barrier_native_cost_gate_declines_to_k0_at_exact_boundaries() {
+        for (pattern, native) in [
+            (r"Q\x92[0]{0,63}U", false),
+            (r"Q\x92[0]{0,64}U", true),
+            (r"abaaaabb[0]{0,62}QZ", false),
+            (r"abaaaabb[0]{0,63}QZ", true),
+            (r"QZ[0]{0,64}abaaaabb", false),
+            (r"QZ[0]{0,4}aaaaaaaa", true),
+            (r"aaaaaaaa[0]{0,4}QZ", true),
+        ] {
+            let regex = PortableBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            if native {
+                assert!(
+                    matches!(&regex.plan, PortablePlan::BoundedLiteralClassRun(_)),
+                    "pattern={pattern:?}"
+                );
+                assert_eq!(regex.build_report().plan, PlanKind::LiteralClassRunLiteral);
+                assert!(regex.build_report().literal_class_run_literal.is_some());
+                assert_eq!(regex.build_report().lowering, None);
+            } else {
+                assert!(matches!(&regex.plan, PortablePlan::K0(_)), "pattern={pattern:?}");
+                assert_eq!(regex.build_report().plan, PlanKind::K0);
+                assert_eq!(regex.build_report().literal_class_run_literal, None);
+                assert!(regex.build_report().lowering.is_some());
+            }
+        }
+
+        let pattern = r"QZ[0]{0,64}abaaaabb";
+        let regex = PortableBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let upstream = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        for haystack in [
+            b"".as_slice(),
+            b"--QZ0abaaaabb--",
+            b"QZ00000abaaaabb--QZabaaaabb",
+            b"QZx--QZ00abaaaabb",
+        ] {
+            let expected = upstream
+                .find(haystack)
+                .map(|matched| (matched.start(), matched.end()));
+            let actual = regex
+                .find(haystack, SearchLimits::unlimited())
+                .unwrap()
+                .0
+                .map(|matched| (matched.start(), matched.end()));
+            assert_eq!(actual, expected, "haystack={haystack:?}");
+        }
+
+        let mut limited = BuildLimits::default();
+        limited.literal_class_run_literal.max_literal_bytes = 0;
+        assert!(matches!(
+            PortableBuilder::new(pattern)
+                .unicode(false)
+                .limits(limited)
+                .build(),
+            Err(BuildError::LiteralClassRunLiteral(
+                fre_kernels::LiteralClassRunLiteralBuildError::LiteralBytesLimit { .. }
+            ))
+        ));
+
+        limited = BuildLimits::default();
+        limited.literal_class_run_literal.max_build_work = 0;
+        assert!(matches!(
+            PortableBuilder::new(pattern)
+                .unicode(false)
+                .limits(limited)
+                .build(),
+            Err(BuildError::LiteralClassRunLiteral(
+                fre_kernels::LiteralClassRunLiteralBuildError::WorkLimit { .. }
+            ))
+        ));
     }
 
     #[test]
