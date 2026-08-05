@@ -5855,6 +5855,31 @@ impl K0Workspace {
         self.construction
     }
 
+    /// Try to construct every direct forward and reverse row reachable from
+    /// the ordinary start plus a graph-bound continuation set.
+    ///
+    /// This is a compiler-private setup optimization. Construction happens in
+    /// a second workspace with an unlimited setup meter. The live workspace
+    /// and its continuation hints are replaced only after every reachable row
+    /// fits, so allocation failure, cache saturation, an unsupported shape, or
+    /// any checked construction error leaves the caller's runtime state
+    /// untouched. A workspace that has already learned any lazy state is also
+    /// left untouched instead of discarding useful source-independent work.
+    ///
+    /// The temporary workspace has the same fixed layout as `self`; successful
+    /// publication therefore does not change retained search scratch or any
+    /// runtime resource limit. The temporary allocation is released before
+    /// this method returns.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn compiler_private_try_prefill_resume_caches(
+        &mut self,
+        automaton: &Automaton,
+        resume_set: &mut K0ResumeSet,
+    ) -> bool {
+        prefill_bound_resume_caches_transaction(automaton, self, resume_set).unwrap_or(false)
+    }
+
     fn begin_invocation(
         &mut self,
         required_generations: u64,
@@ -16544,6 +16569,240 @@ fn expand_context_lazy_root(
         }
     }
     Ok(false)
+}
+
+/// Build a complete direct cache in temporary storage, then publish it with
+/// one infallible swap. Retained partial frontiers are assertion-free by
+/// construction, so raw byte-class representatives are a complete transition
+/// alphabet here; contextual transition stores deliberately decline.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the all-or-nothing setup transaction keeps eligibility, construction, validation, and publication adjacent"
+)]
+#[cold]
+#[inline(never)]
+fn prefill_bound_resume_caches_transaction(
+    automaton: &Automaton,
+    live: &mut K0Workspace,
+    resume_set: &mut K0ResumeSet,
+) -> Result<bool, SearchError> {
+    if live.bound_automaton_identity != automaton.identity()
+        || !resume_set.is_bound_to(automaton)
+        || automaton.stats().assertion_edges() != 0
+        || !live.lazy.is_allocated()
+        || live.lazy.context.is_allocated()
+        || live.lazy.initialized
+        || live.lazy.state_len != 0
+        || live.lazy.item_len != 0
+        || live.lazy.declined
+        || live.lazy.saturated
+        || (live.reverse.is_allocated()
+            && (live.reverse.context.is_allocated()
+                || live.reverse.initialized
+                || live.reverse.state_len != 0
+                || live.reverse.item_len != 0
+                || live.reverse.declined
+                || live.reverse.saturated))
+        || resume_set
+            .cached_states
+            .iter()
+            .any(|&state| state != LAZY_NO_STATE)
+    {
+        return Ok(false);
+    }
+
+    let mut staged =
+        K0Workspace::new_with_layout(automaton, WorkspaceLimits::unlimited(), live.layout)?;
+    if staged.lazy.context.is_allocated()
+        || staged.reverse.is_allocated() && staged.reverse.context.is_allocated()
+    {
+        return Ok(false);
+    }
+
+    let mut meter = WorkMeter::new(u64::MAX, 0);
+    if !prepare_lazy(automaton, &mut staged, &mut meter, 0, 0)? {
+        return Ok(false);
+    }
+
+    let hint_count = resume_set.cached_states.len();
+    if hint_count == 0 {
+        return Ok(false);
+    }
+    let mut staged_hints = allocate_slots(hint_count, LAZY_NO_STATE, resume_set.retained_bytes())?;
+    for (resume_state, hint) in staged_hints.iter_mut().enumerate() {
+        let (frontier, pending) = resume_set.frontier(resume_state)?;
+        let copy_work =
+            u64::try_from(frontier.len()).map_err(|_| SearchError::ArithmeticOverflow {
+                computation: "compiler-private resume prefill copy work",
+            })?;
+        meter.charge(copy_work, 0)?;
+        let scratch = staged.lazy.scratch.get_mut(..frontier.len()).ok_or(
+            SearchError::InternalInvariant {
+                detail: "compiler-private resume prefill exceeds lazy scratch",
+            },
+        )?;
+        scratch.copy_from_slice(frontier);
+        staged.lazy.scratch_len = frontier.len();
+        *hint = match staged.lazy.intern_speculative(pending, &mut meter, 0, 0)? {
+            LazyInterned::State(state) => state,
+            LazyInterned::BudgetDeclined | LazyInterned::CapacityFull => return Ok(false),
+        };
+    }
+
+    if !prefill_all_forward_direct_rows(automaton, &mut staged, &mut meter)? {
+        return Ok(false);
+    }
+    if staged.reverse.is_allocated() {
+        if !prepare_reverse_lazy(automaton, &mut staged, &mut meter, 0, 0)?
+            || !prefill_all_reverse_direct_rows(automaton, &mut staged, &mut meter)?
+        {
+            return Ok(false);
+        }
+    }
+
+    let stride = automaton.byte_classes().count();
+    let forward_cells =
+        staged
+            .lazy
+            .state_len
+            .checked_mul(stride)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "compiler-private forward prefill cells",
+            })?;
+    let published = usize::try_from(staged.lazy.direct_cells_published).map_err(|_| {
+        SearchError::InternalInvariant {
+            detail: "compiler-private forward publication count does not fit usize",
+        }
+    })?;
+    if staged.lazy.saturated
+        || published != forward_cells
+        || staged
+            .lazy
+            .rows
+            .get(..forward_cells)
+            .is_none_or(|rows| rows.contains(&LAZY_CELL_UNFILLED))
+    {
+        return Ok(false);
+    }
+    if staged.reverse.is_allocated() {
+        let reverse_cells = staged.reverse.state_len.checked_mul(stride).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "compiler-private reverse prefill cells",
+            },
+        )?;
+        if staged.reverse.saturated
+            || staged
+                .reverse
+                .rows
+                .get(..reverse_cells)
+                .is_none_or(|rows| rows.contains(&LAZY_CELL_UNFILLED))
+        {
+            return Ok(false);
+        }
+    }
+    if staged_hints.len() != resume_set.cached_states.len()
+        || staged_hints.len() != resume_set.cached_workspace_identities.len()
+    {
+        return Err(SearchError::InternalInvariant {
+            detail: "compiler-private resume prefill hint shape changed before publication",
+        });
+    }
+    if staged.lazy.retained_bytes()? != live.lazy.retained_bytes()?
+        || staged.reverse.retained_bytes()? != live.reverse.retained_bytes()?
+    {
+        // `Vec::try_reserve_exact` may legally retain more than requested.
+        // Refuse a replacement whose allocator-visible capacities would make
+        // the live workspace's already-published scratch accounting stale.
+        return Ok(false);
+    }
+
+    // No checked or allocating operation follows these publications. The
+    // ordinary Pike scratch, live generation, span cursor, accounting, and
+    // fixed retained-byte contract stay intact.
+    let staged_cache_identity = staged.lazy.cache_identity;
+    core::mem::swap(&mut live.lazy, &mut staged.lazy);
+    core::mem::swap(&mut live.reverse, &mut staged.reverse);
+    resume_set.cached_states.copy_from_slice(&staged_hints);
+    resume_set
+        .cached_workspace_identities
+        .fill(staged_cache_identity);
+    Ok(true)
+}
+
+fn prefill_all_forward_direct_rows(
+    automaton: &Automaton,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+) -> Result<bool, SearchError> {
+    let class_count = automaton.byte_classes().count();
+    let mut state = 0usize;
+    while state < workspace.lazy.state_len {
+        let state_u32 = u32::try_from(state).map_err(|_| SearchError::InternalInvariant {
+            detail: "compiler-private forward prefill state does not fit u32",
+        })?;
+        for class in 0..class_count {
+            let class = u8::try_from(class).map_err(|_| SearchError::InternalInvariant {
+                detail: "compiler-private forward prefill class does not fit u8",
+            })?;
+            let byte = automaton.byte_classes().representative(class).ok_or(
+                SearchError::InternalInvariant {
+                    detail: "compiler-private forward prefill class has no representative",
+                },
+            )?;
+            if matches!(
+                build_lazy_cached_transition(
+                    automaton, state_u32, byte, class, workspace, meter, 0, 0,
+                )?,
+                LazyTransition::Inline { .. }
+            ) {
+                return Ok(false);
+            }
+        }
+        state = state
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "compiler-private forward prefill state cursor",
+            })?;
+    }
+    Ok(true)
+}
+
+fn prefill_all_reverse_direct_rows(
+    automaton: &Automaton,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+) -> Result<bool, SearchError> {
+    let class_count = automaton.byte_classes().count();
+    let mut state = 0usize;
+    while state < workspace.reverse.state_len {
+        let state_u32 = u32::try_from(state).map_err(|_| SearchError::InternalInvariant {
+            detail: "compiler-private reverse prefill state does not fit u32",
+        })?;
+        for class in 0..class_count {
+            let class = u8::try_from(class).map_err(|_| SearchError::InternalInvariant {
+                detail: "compiler-private reverse prefill class does not fit u8",
+            })?;
+            let byte = automaton.byte_classes().representative(class).ok_or(
+                SearchError::InternalInvariant {
+                    detail: "compiler-private reverse prefill class has no representative",
+                },
+            )?;
+            if matches!(
+                build_reverse_cached_transition(
+                    automaton, state_u32, byte, class, workspace, meter, 0, 0,
+                )?,
+                ReverseTransition::Inline { .. }
+            ) {
+                return Ok(false);
+            }
+        }
+        state = state
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "compiler-private reverse prefill state cursor",
+            })?;
+    }
+    Ok(true)
 }
 
 fn lazy_initial_work_upper(automaton: &Automaton) -> Result<u64, SearchError> {
@@ -46471,6 +46730,86 @@ mod tests {
         assert!(span.lazy);
         assert!(span.reverse);
         assert_eq!(endpoint.contextual, span.contextual);
+    }
+
+    #[test]
+    fn compiler_private_resume_prefill_completes_forward_and_reverse_rows() {
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b'), (b'c', b'c')]);
+        let frontier = [1_u32];
+        let mut resume = K0ResumeSet::new(&plan, 1, 1, [(&frontier[..], false)]).unwrap();
+        let mut workspace =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let retained = workspace.retained_bytes();
+
+        assert!(workspace.compiler_private_try_prefill_resume_caches(&plan, &mut resume));
+        assert_eq!(workspace.retained_bytes(), retained);
+        assert!(workspace.lazy.initialized);
+        assert!(workspace.reverse.initialized);
+        assert!(!workspace.lazy.saturated);
+        assert!(!workspace.reverse.saturated);
+        assert!(usize::try_from(resume.cached_states[0])
+            .ok()
+            .is_some_and(|state| state < workspace.lazy.state_len));
+        assert_eq!(
+            resume.cached_workspace_identities[0],
+            workspace.lazy.cache_identity
+        );
+
+        let stride = plan.byte_classes().count();
+        let forward_cells = workspace.lazy.state_len.checked_mul(stride).unwrap();
+        let reverse_cells = workspace.reverse.state_len.checked_mul(stride).unwrap();
+        assert!(!workspace.lazy.rows[..forward_cells].contains(&super::LAZY_CELL_UNFILLED));
+        assert!(!workspace.reverse.rows[..reverse_cells].contains(&super::LAZY_CELL_UNFILLED));
+        assert_eq!(
+            usize::try_from(workspace.lazy.direct_cells_published).unwrap(),
+            forward_cells
+        );
+
+        let forward_states = workspace.lazy.state_len;
+        let reverse_states = workspace.reverse.state_len;
+        let published = workspace.lazy.direct_cells_published;
+        let mut ordinary = K0Workspace::new(&plan, WorkspaceLimits::unlimited()).unwrap();
+        for haystack in [b"zabcx".as_slice(), b"abcabc", b"xxxx", b"ab"] {
+            let expected = plan
+                .prepare::<Span>()
+                .search_with_workspace(haystack, &mut ordinary, SearchLimits::unlimited())
+                .unwrap()
+                .into_output();
+            let actual = plan
+                .prepare::<Span>()
+                .search_with_workspace(haystack, &mut workspace, SearchLimits::unlimited())
+                .unwrap()
+                .into_output();
+            assert_eq!(actual, expected, "source={haystack:?}");
+        }
+        assert_eq!(workspace.lazy.state_len, forward_states);
+        assert_eq!(workspace.reverse.state_len, reverse_states);
+        assert_eq!(workspace.lazy.direct_cells_published, published);
+    }
+
+    #[test]
+    fn compiler_private_resume_prefill_capacity_decline_is_transactional() {
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b'), (b'c', b'c')]);
+        let frontier = [1_u32];
+        let mut resume = K0ResumeSet::new(&plan, 1, 1, [(&frontier[..], false)]).unwrap();
+        let mut workspace =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+
+        // Force only the temporary transaction to admit its mandatory initial
+        // identity. The continuation identity cannot fit, so no staged row or
+        // hint may become visible in the live workspace.
+        let layout = workspace.layout;
+        workspace.layout.lazy_state_capacity = 1;
+        workspace.layout.lazy_item_capacity = 1;
+        let rows = workspace.lazy.rows.clone();
+        assert!(!workspace.compiler_private_try_prefill_resume_caches(&plan, &mut resume));
+        assert_eq!(workspace.lazy.rows, rows);
+        assert_eq!(workspace.lazy.state_len, 0);
+        assert_eq!(workspace.lazy.item_len, 0);
+        assert!(!workspace.lazy.initialized);
+        assert_eq!(resume.cached_states.as_slice(), &[super::LAZY_NO_STATE]);
+        assert_eq!(resume.cached_workspace_identities.as_slice(), &[0]);
+        workspace.layout = layout;
     }
 
     #[test]

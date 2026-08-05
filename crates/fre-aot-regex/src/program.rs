@@ -3917,6 +3917,41 @@ impl CompiledProgram {
         Ok(partial_workspace.state.claim_native_entry())
     }
 
+    /// Best-effort preparation of every reachable fallback row for a retained
+    /// partial machine.
+    ///
+    /// Prepared AOT runtimes call this once, outside matching. Construction is
+    /// transactional inside K0: a cache that cannot be completed leaves the
+    /// live workspace and every resume hint untouched. Ordinary one-shot
+    /// program searches deliberately do not call this slower setup seam.
+    #[doc(hidden)]
+    pub fn compiler_private_try_prefill_retained_fallback_with_workspace(
+        &self,
+        workspace: &mut ProgramWorkspace,
+    ) -> Result<bool, CompileError> {
+        if !workspace.identity.compatible(&self.identity) {
+            return Err(CompileError::InternalInvariant(
+                "fallback prefill workspace belongs to a different semantic program",
+            ));
+        }
+        if self.context_dfa.is_some()
+            || !matches!(self.engine, ProgramEngine::OrderedNfa)
+            || self.partial_dfa().is_none()
+        {
+            return Ok(false);
+        }
+        let (nfa, partial) = (&mut workspace.nfa, &mut workspace.partial);
+        let (Some(nfa), Some(resume)) = (
+            nfa.as_mut(),
+            partial
+                .as_deref_mut()
+                .and_then(|partial| partial.resume.as_mut()),
+        ) else {
+            return Ok(false);
+        };
+        Ok(nfa.compiler_private_try_prefill_resume_caches(&self.automaton, resume))
+    }
+
     /// Execute the separately prepared retained-row route.
     ///
     /// This is deliberately not selected by [`Self::search_with_workspace`].
