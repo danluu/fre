@@ -3803,6 +3803,160 @@ mod tests {
         }
     }
 
+    fn execute_ordinary_search(
+        plan: &PrefixClassAlternationPlan,
+        haystack: &[u8],
+        window: Window,
+        projection: SearchProjection,
+    ) -> (Option<(usize, usize)>, ReduceActualCounters) {
+        let operation = match projection {
+            SearchProjection::Exists => Operation::Exists,
+            SearchProjection::Selected => Operation::Search,
+            SearchProjection::EarliestEnd => Operation::Shortest,
+        };
+        let upper = plan
+            .search_preflight(
+                haystack,
+                window,
+                SearchLimits::unlimited(),
+                operation,
+                false,
+            )
+            .unwrap();
+        plan.execute_search(haystack, window, projection, upper, [None, None])
+            .unwrap()
+    }
+
+    #[test]
+    fn ordinary_execute_search_preserves_branch_zero_at_an_equal_start() {
+        let plan = PrefixClassAlternationPlan::build(
+            [b"abcd", b"ab"],
+            [[(b'x', b'x')].into_iter(), [(b'c', b'c')].into_iter()],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let haystack = b"abcdxxx!";
+        let window = Window::full(haystack);
+
+        let (selected, selected_actual) = execute_ordinary_search(
+            &plan,
+            haystack,
+            window,
+            SearchProjection::Selected,
+        );
+        assert_eq!(Some((0, 7)), selected);
+        assert_eq!(1, selected_actual.prefix_candidates);
+
+        let (exists, exists_actual) =
+            execute_ordinary_search(&plan, haystack, window, SearchProjection::Exists);
+        assert_eq!(Some((0, 5)), exists);
+        assert_eq!(1, exists_actual.prefix_candidates);
+
+        let (earliest, earliest_actual) = execute_ordinary_search(
+            &plan,
+            haystack,
+            window,
+            SearchProjection::EarliestEnd,
+        );
+        assert_eq!(Some((0, 3)), earliest);
+        assert_eq!(2, earliest_actual.prefix_candidates);
+    }
+
+    #[test]
+    fn ordinary_execute_search_retries_branch_one_after_equal_start_rejection() {
+        let plan = PrefixClassAlternationPlan::build(
+            [b"abcd", b"ab"],
+            [[(b'x', b'x')].into_iter(), [(b'c', b'c')].into_iter()],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let haystack = b"abcd!";
+        let window = Window::full(haystack);
+
+        for projection in [
+            SearchProjection::Selected,
+            SearchProjection::Exists,
+            SearchProjection::EarliestEnd,
+        ] {
+            let (matched, actual) =
+                execute_ordinary_search(&plan, haystack, window, projection);
+            assert_eq!(Some((0, 3)), matched, "projection={projection:?}");
+            assert_eq!(2, actual.prefix_candidates, "projection={projection:?}");
+            let expected_class_bytes = if projection == SearchProjection::Selected {
+                3
+            } else {
+                2
+            };
+            assert_eq!(
+                expected_class_bytes,
+                actual.class_bytes,
+                "projection={projection:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_execute_search_handles_duplicate_spans_inside_bounded_windows() {
+        let first_class = [(b'x', b'x')];
+        let second_class = [(b'c', b'd'), (b'x', b'x')];
+        let plan = PrefixClassAlternationPlan::build(
+            [b"abcd", b"ab"],
+            [
+                first_class.as_slice().iter().copied(),
+                second_class.as_slice().iter().copied(),
+            ],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let haystack = b"##abcdxxx!!abcdxxx$$";
+        let bounded = Window::new(11, 17);
+
+        assert_eq!(
+            vec![0..6],
+            reference_spans(r"abcd[x]+", &haystack[bounded.start()..bounded.end()])
+        );
+        assert_eq!(
+            vec![0..6],
+            reference_spans(r"ab[cdx]+", &haystack[bounded.start()..bounded.end()])
+        );
+        assert_eq!(
+            Some((11, 17)),
+            execute_ordinary_search(&plan, haystack, bounded, SearchProjection::Selected).0
+        );
+        assert_eq!(
+            Some((11, 16)),
+            execute_ordinary_search(&plan, haystack, bounded, SearchProjection::Exists).0
+        );
+        assert_eq!(
+            Some((11, 14)),
+            execute_ordinary_search(&plan, haystack, bounded, SearchProjection::EarliestEnd).0
+        );
+
+        let first_start_excluded = Window::new(3, 18);
+        assert_eq!(
+            Some((11, 18)),
+            execute_ordinary_search(
+                &plan,
+                haystack,
+                first_start_excluded,
+                SearchProjection::Selected,
+            )
+            .0
+        );
+        let every_start_excluded = Window::new(12, 18);
+        for projection in [
+            SearchProjection::Selected,
+            SearchProjection::Exists,
+            SearchProjection::EarliestEnd,
+        ] {
+            assert_eq!(
+                None,
+                execute_ordinary_search(&plan, haystack, every_start_excluded, projection).0,
+                "projection={projection:?}",
+            );
+        }
+    }
+
     #[test]
     #[cfg(not(feature = "static-dispatch"))]
     fn shared_class_extension_preserves_every_alignment_and_exact_boundary() {
