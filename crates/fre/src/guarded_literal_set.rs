@@ -252,9 +252,18 @@ struct CorrelatedColumns {
     verification_order: [u8; WIDE_CORRELATED_MAX_WORD_BYTES],
     columns: Box<[CorrelatedColumn]>,
     word_members: AsciiByteSetClassifier,
+    // Narrow pairs add a complete correlated verifier, but turning that fact
+    // into an unbounded packed-child handoff still has to amortize one native
+    // service quantum for every retained pattern byte and entry. Established
+    // wide dictionaries keep their prior zero-threshold policy.
+    minimum_batched_remainder_bytes: usize,
 }
 
 impl CorrelatedColumns {
+    fn admits_batched_remainder(&self, bytes: usize) -> bool {
+        bytes >= self.minimum_batched_remainder_bytes
+    }
+
     fn sample_minimum_candidates(&self) -> usize {
         if self.columns.len() >= WIDE_CORRELATED_LONG_WORD_BYTES {
             WIDE_CORRELATED_LONG_MIN_CANDIDATES
@@ -1186,6 +1195,12 @@ impl WideByteAnchor {
         self.secondary_columns[0].is_some()
     }
 
+    fn admits_correlated_remainder(&self, bytes: usize) -> bool {
+        self.correlated_columns
+            .as_ref()
+            .is_some_and(|columns| columns.admits_batched_remainder(bytes))
+    }
+
     fn find_correlated_start(
         &self,
         haystack: &[u8],
@@ -1715,6 +1730,7 @@ fn correlated_columns_dimensions(
         .checked_mul(word_bytes)
         .and_then(|work| work.checked_add(patterns))
         .and_then(|work| work.checked_add(ASCII_CLASSIFIER_BUILD_WORK))
+        .and_then(|work| work.checked_add(if narrow_pair { 3 } else { 0 }))
         .ok_or(PackedLiteralSetError::ArithmeticOverflow {
             computation: "guarded correlated-column construction work",
         })?;
@@ -1772,11 +1788,23 @@ fn build_correlated_columns(
     for pattern_index in 0..patterns {
         pattern_mask |= 1_u64 << pattern_index;
     }
+    let minimum_batched_remainder_bytes = if word_bytes == 2 {
+        word_bytes
+            .checked_add(1)
+            .and_then(|per_pattern| patterns.checked_mul(per_pattern))
+            .and_then(|coefficient| {
+                coefficient.checked_mul(WIDE_REJECTION_PACKED_PROBE_BYTES)
+            })
+            .expect("correlated-column dimensions bound the packed service threshold")
+    } else {
+        0
+    };
     CorrelatedColumns {
         pattern_mask,
         verification_order,
         columns: columns.into_boxed_slice(),
         word_members,
+        minimum_batched_remainder_bytes,
     }
 }
 
@@ -2732,15 +2760,15 @@ impl Plan {
                 .wide_anchor
                 .as_ref()
                 .is_some_and(|wide| wide.has_secondary_columns());
-        let batched_secondary = secondary_available
-            && self
-                .wide_anchor
-                .as_ref()
-                .is_some_and(|wide| wide.correlated_columns.is_some());
+        let batched_secondary_available = secondary_available
+            && self.wide_anchor.as_ref().is_some_and(|wide| {
+                wide.correlated_columns.is_some()
+            });
         let mut secondary_active = false;
-        let mut correlated_sample_available = batched_secondary;
+        let mut correlated_secondary_active = false;
+        let mut correlated_sample_available = batched_secondary_available;
         loop {
-            if secondary_active && batched_secondary {
+            if correlated_secondary_active {
                 let wide = self
                     .wide_anchor
                     .as_ref()
@@ -2819,6 +2847,10 @@ impl Plan {
                                 PackedProbeResult::ResumeAt(resume) => {
                                     cursor = resume;
                                     secondary_active = secondary_available;
+                                    correlated_secondary_active = batched_secondary_available
+                                        && wide.admits_correlated_remainder(
+                                            window.end().saturating_sub(cursor),
+                                        );
                                 }
                             }
                         }
@@ -2865,13 +2897,20 @@ impl Plan {
                     // dictionary. Skip it as one unit without a separate
                     // backward/forward segmentation pass.
                     cursor = word_end;
+                    let batched_secondary = batched_secondary_available
+                        && self.wide_anchor.as_ref().is_some_and(|wide| {
+                            wide.admits_correlated_remainder(
+                                window.end().saturating_sub(cursor),
+                            )
+                        });
                     let packed_sample_is_dense = batched_secondary
                         || self.wide_anchor.as_ref().is_some_and(|wide| {
                             wide.rejection_sample_is_dense(
                                 &haystack[cursor..window.end()],
                             )
                         });
-                    let correlated_sample_is_dense = correlated_sample_available
+                    let correlated_sample_is_dense = batched_secondary
+                        && correlated_sample_available
                         && self.wide_anchor.as_ref().is_some_and(|wide| {
                             wide.correlated_columns.as_ref().is_some_and(|columns| {
                                 columns.sample_has_packed_prefix_candidates(
@@ -2889,6 +2928,7 @@ impl Plan {
                     };
                     secondary_active = secondary_available
                         && (!batched_secondary || correlated_sample_is_dense);
+                    correlated_secondary_active = secondary_active && batched_secondary;
                     if probe_after_rejection
                         && let Some((probe, max_work)) = packed.take()
                     {
@@ -2907,6 +2947,7 @@ impl Plan {
                             PackedProbeResult::ResumeAt(resume) => {
                                 cursor = resume;
                                 secondary_active = secondary_available && !batched_secondary;
+                                correlated_secondary_active = false;
                             }
                         }
                     }
@@ -2944,7 +2985,12 @@ impl Plan {
                 }));
             }
             cursor = word_end;
-            let correlated_sample_is_dense = correlated_sample_available
+            let batched_secondary = batched_secondary_available
+                && self.wide_anchor.as_ref().is_some_and(|wide| {
+                    wide.admits_correlated_remainder(window.end().saturating_sub(cursor))
+                });
+            let correlated_sample_is_dense = batched_secondary
+                && correlated_sample_available
                 && !secondary_active
                 && self.wide_anchor.as_ref().is_some_and(|wide| {
                     wide.correlated_columns.as_ref().is_some_and(|columns| {
@@ -2958,6 +3004,7 @@ impl Plan {
             correlated_sample_available = false;
             if correlated_sample_is_dense {
                 secondary_active = true;
+                correlated_secondary_active = true;
                 continue;
             }
             if let Some((probe, max_work)) = packed.take() {
@@ -2979,6 +3026,7 @@ impl Plan {
                     PackedProbeResult::ResumeAt(resume) => {
                         cursor = resume;
                         secondary_active = secondary_available && !batched_secondary;
+                        correlated_secondary_active = false;
                     }
                 }
             }
@@ -4365,11 +4413,23 @@ mod tests {
         let plan = plan(&references);
         let wide = plan.wide_anchor.as_ref().unwrap();
         let correlated = wide.correlated_columns.as_ref().unwrap();
+        assert!(correlated.admits_batched_remainder(0));
         assert_eq!(correlated.pattern_mask, u64::MAX);
         assert!(correlated.matches(&words[63]));
         let mut recombined = words[63];
         recombined[4] = if recombined[4] == b'q' { b'r' } else { b'q' };
         assert!(!correlated.matches(&recombined));
+
+        let narrow_words: &[&[u8]] = &[b"aa", b"bc", b"ce", b"dg"];
+        let narrow = plan(narrow_words);
+        let narrow_correlated = narrow
+            .wide_anchor
+            .as_ref()
+            .and_then(|wide| wide.correlated_columns.as_ref())
+            .unwrap();
+        let exact_threshold = narrow_words.len() * 3 * WIDE_REJECTION_PACKED_PROBE_BYTES;
+        assert!(!narrow_correlated.admits_batched_remainder(exact_threshold - 1));
+        assert!(narrow_correlated.admits_batched_remainder(exact_threshold));
     }
 
     #[test]
