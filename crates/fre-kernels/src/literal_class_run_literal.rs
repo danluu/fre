@@ -4007,7 +4007,7 @@ impl BoundedLiteralClassRunPlan {
         };
         let matched = matched
             .map(|(start, end)| {
-                Ok((
+                Ok::<(usize, usize), ReduceError>((
                     window.start().checked_add(start).ok_or(
                         ReduceError::ArithmeticOverflow {
                             computation: "absolute finite match start",
