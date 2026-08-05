@@ -5648,6 +5648,8 @@ impl PortableRegex {
                     negative_prefilter_span_state: K0NegativePrefilterState::default(),
                     correlated_terminal_exists_state:
                         correlated_bounded_alternation::RouteState::default(),
+                    correlated_terminal_earliest_end_state:
+                        correlated_bounded_alternation::RouteState::default(),
                     correlated_terminal_span_state:
                         correlated_bounded_alternation::RouteState::default(),
                 }
@@ -6177,6 +6179,39 @@ impl PortableRegex {
         limits: SearchLimits,
     ) -> Result<(Option<usize>, SearchAccounting), SearchError> {
         self.shortest_match_window(haystack, SearchWindow::new(start, haystack.len()), limits)
+    }
+
+    /// Return only the first detected match end.
+    ///
+    /// Reusable callers should prefer
+    /// [`PortableSearchSession::shortest_match_value`], which can retain
+    /// operation-local K0 acceleration state across haystacks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same contract as [`Self::shortest_match`].
+    pub fn shortest_match_value(
+        &self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<Option<usize>, SearchError> {
+        self.shortest_match(haystack, limits)
+            .map(|(output, _)| output)
+    }
+
+    /// Return only the first detected match end at or after `start`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same contract as [`Self::shortest_match_at`].
+    pub fn shortest_match_at_value(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<Option<usize>, SearchError> {
+        self.shortest_match_at(haystack, start, limits)
+            .map(|(output, _)| output)
     }
 
     #[allow(
@@ -7562,6 +7597,7 @@ enum PortableSearchSessionPlan<'a> {
         negative_prefilter_exists_state: K0NegativePrefilterState,
         negative_prefilter_span_state: K0NegativePrefilterState,
         correlated_terminal_exists_state: correlated_bounded_alternation::RouteState,
+        correlated_terminal_earliest_end_state: correlated_bounded_alternation::RouteState,
         correlated_terminal_span_state: correlated_bounded_alternation::RouteState,
     },
 }
@@ -9031,6 +9067,164 @@ fn try_k0_correlated_terminal_exists(
     }
 }
 
+fn k0_correlated_fallback_earliest_end(
+    session: &mut K0SearchSession<'_>,
+    haystack: &[u8],
+    window: SearchWindow,
+    limits: SearchLimits,
+    first_unproved_start: usize,
+) -> Result<K0CorrelatedTerminalAttempt<Option<usize>>, SearchError> {
+    let fallback = SearchWindow::new(first_unproved_start.min(window.end()), window.end());
+    session
+        .search_window::<EarliestEnd>(haystack, fallback, limits)
+        .map(|report| K0CorrelatedTerminalAttempt::Complete {
+            output: report.into_output(),
+            won: false,
+        })
+        .map_err(SearchError::from)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the endpoint proof keeps its immutable plan, adaptive budget, and validated window together"
+)]
+fn try_k0_correlated_terminal_earliest_end(
+    session: &mut K0SearchSession<'_>,
+    plan: &correlated_bounded_alternation::Plan,
+    haystack: &[u8],
+    window: SearchWindow,
+    limits: SearchLimits,
+    incumbent_transition_work: u64,
+) -> Result<K0CorrelatedTerminalAttempt<Option<usize>>, SearchError> {
+    if !k0_correlated_geometry_allows(session, plan, haystack.len(), window, limits) {
+        return Ok(K0CorrelatedTerminalAttempt::Bypass);
+    }
+    let window_bytes = window.end().saturating_sub(window.start());
+    if plan.minimum_match_bytes() > window_bytes {
+        return Ok(K0CorrelatedTerminalAttempt::Complete {
+            output: None,
+            won: true,
+        });
+    }
+    let mut search_position = window
+        .start()
+        .checked_add(plan.minimum_match_bytes().saturating_sub(1))
+        .ok_or(SearchError::K0(K0SearchError::ArithmeticOverflow {
+            computation: "correlated terminal minimum earliest endpoint",
+        }))?;
+    let mut candidates = 0u64;
+    let mut verifier_work = 0u64;
+    loop {
+        let Some(terminal_position) =
+            plan.seek_terminal(haystack, search_position, window.end())
+        else {
+            let allowed_work = k0_correlated_progress_budget(
+                incumbent_transition_work,
+                window_bytes,
+                window_bytes,
+            );
+            return Ok(K0CorrelatedTerminalAttempt::Complete {
+                output: None,
+                won: k0_correlated_sidecar_work(
+                    window_bytes,
+                    candidates,
+                    verifier_work,
+                )
+                .is_some_and(|work| work <= allowed_work),
+            });
+        };
+        let endpoint = terminal_position.checked_add(1).ok_or(SearchError::K0(
+            K0SearchError::ArithmeticOverflow {
+                computation: "correlated terminal earliest endpoint",
+            },
+        ))?;
+        candidates = candidates.checked_add(1).ok_or(SearchError::K0(
+            K0SearchError::ArithmeticOverflow {
+                computation: "correlated terminal earliest candidate count",
+            },
+        ))?;
+        let progress = endpoint.saturating_sub(window.start());
+        let allowed_work = k0_correlated_progress_budget(
+            incumbent_transition_work,
+            progress,
+            window_bytes,
+        );
+        let Some(sidecar_work) = k0_correlated_sidecar_work(
+            progress,
+            candidates,
+            verifier_work,
+        ) else {
+            let first_unproved = k0_correlated_first_unproved_start(
+                window.start(),
+                terminal_position,
+                plan.maximum_match_bytes(),
+            );
+            return k0_correlated_fallback_earliest_end(
+                session,
+                haystack,
+                window,
+                limits,
+                first_unproved,
+            );
+        };
+        let Some(remaining_work) = allowed_work.checked_sub(sidecar_work) else {
+            let first_unproved = k0_correlated_first_unproved_start(
+                window.start(),
+                terminal_position,
+                plan.maximum_match_bytes(),
+            );
+            return k0_correlated_fallback_earliest_end(
+                session,
+                haystack,
+                window,
+                limits,
+                first_unproved,
+            );
+        };
+        let reverse_start = endpoint
+            .saturating_sub(plan.maximum_match_bytes())
+            .max(window.start());
+        let verification = session
+            .try_positive_match_ending_at(
+                haystack,
+                SearchWindow::new(reverse_start, endpoint),
+                endpoint,
+                K0PositiveEndLimits::new(remaining_work, endpoint - reverse_start),
+            )
+            .map_err(SearchError::from)?;
+        verifier_work = verifier_work
+            .checked_add(verification.receipt().work())
+            .ok_or(SearchError::K0(K0SearchError::ArithmeticOverflow {
+                computation: "correlated terminal earliest verifier work",
+            }))?;
+        match verification.outcome() {
+            K0PositiveEndOutcome::Matched => {
+                return Ok(K0CorrelatedTerminalAttempt::Complete {
+                    output: Some(endpoint),
+                    won: true,
+                });
+            }
+            K0PositiveEndOutcome::Rejected => {
+                search_position = endpoint;
+            }
+            K0PositiveEndOutcome::Declined => {
+                let first_unproved = k0_correlated_first_unproved_start(
+                    window.start(),
+                    terminal_position,
+                    plan.maximum_match_bytes(),
+                );
+                return k0_correlated_fallback_earliest_end(
+                    session,
+                    haystack,
+                    window,
+                    limits,
+                    first_unproved,
+                );
+            }
+        }
+    }
+}
+
 fn k0_correlated_fallback_span(
     session: &mut K0SearchSession<'_>,
     haystack: &[u8],
@@ -9801,6 +9995,132 @@ impl<'r> PortableSearchSession<'r> {
         limits: SearchLimits,
     ) -> Result<(Option<usize>, SearchAccounting), SearchError> {
         self.shortest_match_window(haystack, SearchWindow::new(start, haystack.len()), limits)
+    }
+
+    /// Return only the first detected match end, reusing operation-local K0
+    /// state when applicable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same contract as [`Self::shortest_match`].
+    pub fn shortest_match_value(
+        &mut self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<Option<usize>, SearchError> {
+        self.shortest_match_window_value(haystack, SearchWindow::full(haystack), limits)
+    }
+
+    /// Return only the first detected match end at or after `start`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same contract as [`Self::shortest_match_at`].
+    pub fn shortest_match_at_value(
+        &mut self,
+        haystack: &[u8],
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<Option<usize>, SearchError> {
+        self.shortest_match_window_value(
+            haystack,
+            SearchWindow::new(start, haystack.len()),
+            limits,
+        )
+    }
+
+    /// Return only the first detected match end wholly inside `window`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same contract as the accountingful
+    /// shortest-match operation.
+    pub fn shortest_match_window_value(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<Option<usize>, SearchError> {
+        match &mut self.plan {
+            PortableSearchSessionPlan::Native(regex) => regex
+                .shortest_match_window(haystack, window, limits)
+                .map(|(output, _)| output),
+            PortableSearchSessionPlan::K0 {
+                session,
+                correlated_terminal,
+                correlated_terminal_earliest_end_state,
+                ..
+            } => {
+                if let Some(plan) = *correlated_terminal {
+                    if k0_correlated_geometry_allows(
+                        session,
+                        plan,
+                        haystack.len(),
+                        window,
+                        limits,
+                    ) {
+                        let window_bytes = window.end().saturating_sub(window.start());
+                        let mut next_state = *correlated_terminal_earliest_end_state;
+                        match next_state.select(window_bytes) {
+                            correlated_bounded_alternation::Route::Bypass => {
+                                let report = session
+                                    .search_window::<EarliestEnd>(haystack, window, limits)
+                                    .map_err(SearchError::from)?;
+                                *correlated_terminal_earliest_end_state = next_state;
+                                return Ok(report.into_output());
+                            }
+                            correlated_bounded_alternation::Route::Learn { class_index } => {
+                                let report = session
+                                    .search_window::<EarliestEnd>(haystack, window, limits)
+                                    .map_err(SearchError::from)?;
+                                next_state.observe_incumbent(
+                                    class_index,
+                                    window_bytes,
+                                    report.accounting().work(),
+                                    report.accounting().boundaries(),
+                                    plan.maximum_match_bytes(),
+                                    plan.branch_count(),
+                                );
+                                *correlated_terminal_earliest_end_state = next_state;
+                                return Ok(report.into_output());
+                            }
+                            correlated_bounded_alternation::Route::Terminal {
+                                class_index,
+                                incumbent_transition_work,
+                            } => match try_k0_correlated_terminal_earliest_end(
+                                session,
+                                plan,
+                                haystack,
+                                window,
+                                limits,
+                                incumbent_transition_work,
+                            )? {
+                                K0CorrelatedTerminalAttempt::Bypass => {
+                                    let report = session
+                                        .search_window::<EarliestEnd>(haystack, window, limits)
+                                        .map_err(SearchError::from)?;
+                                    *correlated_terminal_earliest_end_state = next_state;
+                                    return Ok(report.into_output());
+                                }
+                                K0CorrelatedTerminalAttempt::Complete { output, won } => {
+                                    if won {
+                                        next_state.observe_terminal_success(class_index);
+                                    } else {
+                                        next_state.observe_terminal_loss(class_index);
+                                    }
+                                    *correlated_terminal_earliest_end_state = next_state;
+                                    return Ok(output);
+                                }
+                            },
+                        }
+                    }
+                }
+                session
+                    .search_window::<EarliestEnd>(haystack, window, limits)
+                    .map(fre_automata::SearchReport::into_output)
+                    .map_err(SearchError::from)
+            }
+        }
     }
 
     fn shortest_match_window(
