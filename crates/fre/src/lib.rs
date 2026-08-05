@@ -13666,7 +13666,7 @@ mod tests {
         assert_eq!(fre.build_report().plan, PlanKind::PackedLiteralSet);
         assert_eq!(
             fre.runtime_implementation_id(),
-            "guarded-ascii-word-literal-set.fixed-column-dictionary.v4",
+            "guarded-ascii-word-literal-set.fixed-column-packed-hybrid.v1",
         );
         let haystack = b"!z!a! czc";
         assert_eq!(

@@ -6,12 +6,14 @@
 //! ASCII word. The established route selects a fixed word column whose byte
 //! set fits a native one-to-three-byte scan. Languages without such a sparse
 //! column can retain an exact ASCII byte-set classifier, full-byte nonmember
-//! scanner, and one admitted packed-literal probe. Fixed-width languages may
-//! additionally retain exact pattern-identity columns for dense candidate
-//! streams. Every route either intersects all fixed columns or authenticates
-//! the complete maximal word in the source-order dictionary. In particular,
-//! `a|ab` on `ab` cannot be lost: lookup is performed on the complete word
-//! `ab`.
+//! scanner, and one admitted packed-literal probe. A fixed-width sparse route
+//! may retain the same exact packed owner, but enters it only after complete
+//! rejected words have accumulated one native service quantum of dictionary
+//! work. Fixed-width languages may additionally retain exact pattern-identity
+//! columns for dense candidate streams. Every route either intersects all
+//! fixed columns or authenticates the complete maximal word in the
+//! source-order dictionary. In particular, `a|ab` on `ab` cannot be lost:
+//! lookup is performed on the complete word `ab`.
 
 use core::fmt;
 use core::mem::size_of;
@@ -43,6 +45,8 @@ use crate::{
 
 /// Stable identity for the guarded fixed-column/dictionary composition.
 pub(crate) const PLAN_ID: &str = "guarded-ascii-word-literal-set.fixed-column-dictionary.v4";
+pub(crate) const FIXED_PACKED_PLAN_ID: &str =
+    "guarded-ascii-word-literal-set.fixed-column-packed-hybrid.v1";
 pub(crate) const ONE_BYTE_PLAN_ID: &str =
     "guarded-ascii-word-literal-set.one-byte-boundary-mask.v1";
 pub(crate) const WIDE_PACKED_PLAN_ID: &str =
@@ -1443,7 +1447,7 @@ fn select_fixed_byte_anchor(
     patterns: usize,
     dimensions: WordDimensions,
     max_build_work: usize,
-) -> Result<(FixedByteAnchor, usize, Option<usize>), PackedLiteralSetError> {
+) -> Result<(FixedByteAnchor, usize, Option<usize>, usize), PackedLiteralSetError> {
     let work_per_column =
         patterns
             .checked_add(3)
@@ -1522,6 +1526,7 @@ fn select_fixed_byte_anchor(
             dimensions.maximum_word_bytes,
             (dimensions.minimum_word_bytes == dimensions.maximum_word_bytes)
                 .then_some(dimensions.minimum_word_bytes),
+            selection_work,
         )
     })
     .ok_or(PackedLiteralSetError::UnsupportedTargetOrShape)
@@ -1768,6 +1773,82 @@ fn build_correlated_columns(
     }
 }
 
+fn build_optional_fixed_packed(
+    dictionary: &Dictionary,
+    patterns: usize,
+    pattern_bytes: usize,
+    fixed_word_bytes: Option<usize>,
+    base_build_work: usize,
+    plan_bytes: usize,
+    limits: PackedLiteralSetBuildLimits,
+    composite_persistent_limit: usize,
+) -> Result<Option<Box<PackedLiteralSetPlan>>, PackedLiteralSetError> {
+    if !fixed_word_bytes.is_some_and(|bytes| bytes >= 2)
+        || patterns > PACKED_LITERAL_SET_CERTIFIED_MAX_PATTERNS
+    {
+        return Ok(None);
+    }
+    let publication_work = patterns;
+    let child_build_work =
+        packed_literal_set_build_work_upper_bound_from_dimensions(patterns, pattern_bytes)?;
+    let combined_build_work = base_build_work
+        .checked_add(publication_work)
+        .and_then(|work| work.checked_add(child_build_work))
+        .ok_or(PackedLiteralSetError::ArithmeticOverflow {
+            computation: "guarded fixed-column packed construction work",
+        })?;
+    if combined_build_work > limits.max_build_work {
+        return Ok(None);
+    }
+    let packed_plan_bytes = plan_bytes
+        .checked_add(size_of::<PackedLiteralSetPlan>())
+        .ok_or(PackedLiteralSetError::ArithmeticOverflow {
+            computation: "guarded fixed-column packed owner bytes",
+        })?;
+    if packed_plan_bytes > composite_persistent_limit
+        || packed_plan_bytes > limits.max_build_bytes
+    {
+        return Ok(None);
+    }
+    let child_work = limits
+        .max_build_work
+        .checked_sub(base_build_work)
+        .and_then(|work| work.checked_sub(publication_work))
+        .expect("the optional fixed packed work was admitted prospectively");
+    let child_persistent_bytes = composite_persistent_limit
+        .checked_sub(packed_plan_bytes)
+        .expect("the optional fixed packed owner fits its persistent limit");
+    let child_build_bytes = limits
+        .max_build_bytes
+        .checked_sub(packed_plan_bytes)
+        .expect("the optional fixed packed owner fits its build-byte limit");
+    let mut pattern_refs = [&[][..]; PACKED_LITERAL_SET_CERTIFIED_MAX_PATTERNS];
+    for (index, slot) in pattern_refs[..patterns].iter_mut().enumerate() {
+        *slot = dictionary
+            .source_word(index)
+            .expect("a guarded dictionary retains every source word")
+            .bytes;
+    }
+    match PackedLiteralSetPlan::new(
+        &pattern_refs[..patterns],
+        PackedLiteralSetBuildLimits {
+            max_build_work: child_work,
+            max_build_bytes: child_build_bytes,
+            max_persistent_bytes: child_persistent_bytes,
+            ..limits
+        },
+    ) {
+        Ok(packed) => Ok(Some(Box::new(packed))),
+        Err(
+            PackedLiteralSetError::BuildWorkLimit { .. }
+            | PackedLiteralSetError::BuildBytesLimit { .. }
+            | PackedLiteralSetError::PersistentBytesLimit { .. }
+            | PackedLiteralSetError::UnsupportedTargetOrShape,
+        ) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 fn inclusive_ascii_range(set: AsciiByteSet) -> Option<(u8, u8)> {
     let words = set.words();
     let first_word = usize::from(words[0] == 0);
@@ -1798,6 +1879,7 @@ pub(crate) struct Plan {
     fixed_word_bytes: Option<usize>,
     dictionary: Dictionary,
     one_byte: Option<Box<SingleByteWordSet>>,
+    fixed_packed: Option<Box<PackedLiteralSetPlan>>,
     wide_anchor: Option<Box<WideByteAnchor>>,
 }
 
@@ -1873,14 +1955,14 @@ impl Plan {
                 dimensions,
                 remaining_build_work,
             ) {
-                Ok((anchor, maximum_word_bytes, fixed_word_bytes)) => {
+                Ok((anchor, maximum_word_bytes, fixed_word_bytes, selection_work)) => {
                     (
                         anchor,
                         None,
                         [None; WIDE_SECONDARY_COLUMN_LIMIT],
                         maximum_word_bytes,
                         fixed_word_bytes,
-                        0,
+                        selection_work,
                     )
                 }
                 Err(PackedLiteralSetError::UnsupportedTargetOrShape) => {
@@ -1995,10 +2077,30 @@ impl Plan {
                         #[cfg(target_arch = "aarch64")]
                         run_scanners_vector,
                     })),
+                    fixed_packed: None,
                     wide_anchor: None,
                 });
             }
         }
+        let base_build_work = dictionary_work
+            .checked_add(selection_work)
+            .ok_or(PackedLiteralSetError::ArithmeticOverflow {
+                computation: "guarded fixed-column construction work",
+            })?;
+        let fixed_packed = if wide_members.is_none() {
+            build_optional_fixed_packed(
+                &dictionary,
+                patterns,
+                pattern_bytes,
+                fixed_word_bytes,
+                base_build_work,
+                plan_bytes,
+                limits,
+                composite_persistent_limit,
+            )?
+        } else {
+            None
+        };
         let wide_anchor = if let Some(members) = wide_members {
             let total_build_work = dictionary_work
                 .checked_add(selection_work)
@@ -2165,6 +2267,7 @@ impl Plan {
             fixed_word_bytes,
             dictionary,
             one_byte: None,
+            fixed_packed,
             wide_anchor,
         })
     }
@@ -2181,6 +2284,11 @@ impl Plan {
             base.checked_add(size_of::<SingleByteWordSet>())
                 .expect("one-byte storage fits after successful construction")
         });
+        let base = self.fixed_packed.as_ref().map_or(base, |packed| {
+            base.checked_add(size_of::<PackedLiteralSetPlan>())
+                .and_then(|bytes| bytes.checked_add(packed.build_accounting().persistent_bytes))
+                .expect("fixed packed storage fits after successful construction")
+        });
         self.wide_anchor.as_ref().map_or(base, |wide| {
             base.checked_add(wide.storage_bytes())
                 .expect("wide-column storage fits after successful construction")
@@ -2192,6 +2300,8 @@ impl Plan {
             ONE_BYTE_PLAN_ID
         } else if self.wide_anchor.is_some() {
             WIDE_PACKED_PLAN_ID
+        } else if self.fixed_packed.is_some() {
+            FIXED_PACKED_PLAN_ID
         } else {
             PLAN_ID
         }
@@ -2368,8 +2478,30 @@ impl Plan {
                 self.value_packed_probe_work(window, upper_bounds, limits);
             self.search_window_value_wide(haystack, window, packed_probe_work)
         } else {
-            self.search_window_value_fixed(haystack, window)
+            let packed_probe_work =
+                self.fixed_value_packed_probe_work(window, upper_bounds, limits);
+            self.search_window_value_fixed(haystack, window, packed_probe_work)
         }
+    }
+
+    fn fixed_value_packed_probe_work(
+        &self,
+        window: SearchWindow,
+        upper_bounds: SearchUpperBounds,
+        limits: SearchLimits,
+    ) -> Option<usize> {
+        let packed = self.fixed_packed.as_ref()?;
+        let build = packed.build_accounting();
+        let coefficient = build.pattern_bytes.checked_add(build.patterns)?;
+        let positions = window
+            .end()
+            .checked_sub(window.start())?
+            .checked_add(1)?;
+        let packed_work = positions.checked_mul(coefficient)?;
+        let total_work = upper_bounds.total_work.checked_add(packed_work)?;
+        u64::try_from(total_work)
+            .is_ok_and(|needed| needed <= limits.max_work)
+            .then_some(packed_work)
     }
 
     fn value_packed_probe_work(
@@ -2433,8 +2565,15 @@ impl Plan {
         &self,
         haystack: &[u8],
         window: SearchWindow,
+        packed_probe_work: Option<usize>,
     ) -> Result<Option<Match>, SearchError> {
         let anchor = &self.anchor;
+        let mut packed = packed_probe_work.and_then(|work| {
+            self.fixed_packed
+                .as_ref()
+                .map(|packed| (packed.as_ref(), work))
+        });
+        let mut rejected_word_work = 0_usize;
         let mut cursor = window.start();
         loop {
             let scan_start =
@@ -2479,6 +2618,49 @@ impl Plan {
                         }));
                     }
                     cursor = word_end;
+                    if let Some((probe, max_work)) = packed.as_ref().copied() {
+                        let build = probe.build_accounting();
+                        let comparison_work = usize::try_from(
+                            usize::BITS.checked_sub(build.patterns.leading_zeros()).ok_or(
+                                SearchError::ArithmeticOverflow {
+                                    computation: "fixed packed rejection comparisons",
+                                },
+                            )?,
+                        )
+                        .map_err(|_| SearchError::ArithmeticOverflow {
+                            computation: "fixed packed rejection comparisons",
+                        })?;
+                        let rejection_work = candidate
+                            .len()
+                            .checked_mul(2)
+                            .and_then(|work| work.checked_add(comparison_work))
+                            .ok_or(SearchError::ArithmeticOverflow {
+                                computation: "fixed packed rejection work",
+                            })?;
+                        rejected_word_work = rejected_word_work
+                            .checked_add(rejection_work)
+                            .ok_or(SearchError::ArithmeticOverflow {
+                                computation: "accumulated fixed packed rejection work",
+                            })?;
+                        let service_quantum = build.simd_minimum_haystack_bytes.max(1);
+                        if rejected_word_work >= service_quantum
+                            && window.end().saturating_sub(cursor) >= service_quantum
+                        {
+                            packed = None;
+                            match self.probe_packed_value(
+                                probe,
+                                haystack,
+                                window,
+                                cursor,
+                                max_work,
+                                None,
+                            )? {
+                                PackedProbeResult::Exhausted => return Ok(None),
+                                PackedProbeResult::Match(matched) => return Ok(Some(matched)),
+                                PackedProbeResult::ResumeAt(resume) => cursor = resume,
+                            }
+                        }
+                    }
                     continue;
                 }
             }
@@ -3219,11 +3401,12 @@ mod tests {
     use core::mem::size_of;
 
     use super::{
-        ASCII_WIDE_BYTES, CorrelatedColumns, ONE_BYTE_PLAN_ID, PLAN_ID, PackedProbeResult,
-        Plan, SearchError, SingleByteWordSet, WIDE_CORRELATED_BOUNDARY_COLUMNS,
-        WIDE_PACKED_PLAN_ID, WIDE_PACKED_PREFIX_BYTES, WIDE_RANKED_COLUMN_LIMIT,
-        WIDE_REJECTION_PACKED_PROBE_BYTES, WIDE_SECONDARY_COLUMN_LIMIT, WideByteAnchor,
-        WideFindResult, correlated_columns_dimensions, extraction_limits,
+        ASCII_WIDE_BYTES, CorrelatedColumns, FIXED_PACKED_PLAN_ID, ONE_BYTE_PLAN_ID,
+        PLAN_ID, PackedProbeResult, Plan, SearchError, SingleByteWordSet,
+        WIDE_CORRELATED_BOUNDARY_COLUMNS, WIDE_PACKED_PLAN_ID, WIDE_PACKED_PREFIX_BYTES,
+        WIDE_RANKED_COLUMN_LIMIT, WIDE_REJECTION_PACKED_PROBE_BYTES,
+        WIDE_SECONDARY_COLUMN_LIMIT, WideByteAnchor, WideFindResult,
+        correlated_columns_dimensions, extraction_limits,
     };
     #[cfg(target_arch = "aarch64")]
     use super::{SingleByteMemberResult, SingleBytePrimary};
@@ -3311,6 +3494,123 @@ mod tests {
                 .unwrap();
             assert_eq!(actual, expected);
         }
+    }
+
+    #[test]
+    fn fixed_packed_hybrid_preserves_boundaries_windows_and_rejection_order() {
+        let plan = plan(&[b"ya", b"yb"]);
+        let Some(_) = plan.fixed_packed.as_ref() else {
+            return;
+        };
+        assert_eq!(plan.plan_id(), FIXED_PACKED_PLAN_ID);
+
+        let decoys = b"y9!y9!y9!y9!y9!y9!y9!y9!xyb!ybq!yb!";
+        assert_eq!(
+            plan.find_window_value(
+                decoys,
+                SearchWindow::full(decoys),
+                SearchLimits::unlimited(),
+            )
+            .unwrap(),
+            Some(Match { start: 32, end: 34 }),
+        );
+        for (haystack, window, expected) in [
+            (
+                b"!yb!".as_slice(),
+                SearchWindow::new(1, 3),
+                Some(Match { start: 1, end: 3 }),
+            ),
+            (
+                b"xyb!".as_slice(),
+                SearchWindow::new(1, 3),
+                None,
+            ),
+            (
+                b"!ybx".as_slice(),
+                SearchWindow::new(1, 3),
+                None,
+            ),
+        ] {
+            assert_eq!(
+                plan.find_window_value(haystack, window, SearchLimits::unlimited())
+                    .unwrap(),
+                expected,
+            );
+        }
+        for (haystack, expected) in [
+            (b"yb!".as_slice(), Some(Match { start: 0, end: 2 })),
+            (b"!!!yb!".as_slice(), Some(Match { start: 3, end: 5 })),
+            (b"~~~~".as_slice(), None),
+        ] {
+            assert_eq!(
+                plan.find_window_value(
+                    haystack,
+                    SearchWindow::full(haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_packed_hybrid_keeps_duplicate_source_priority() {
+        let plan = plan(&[b"ya", b"ya", b"yb"]);
+        let Some(_) = plan.fixed_packed.as_ref() else {
+            return;
+        };
+        assert_eq!(plan.dictionary.lookup(b"ya").unwrap().source_index, 0);
+        let haystack = b"y9!y9!y9!y9!y9!y9!ya!";
+        assert_eq!(
+            plan.find_window_value(
+                haystack,
+                SearchWindow::full(haystack),
+                SearchLimits::unlimited(),
+            )
+            .unwrap(),
+            Some(Match { start: 18, end: 20 }),
+        );
+    }
+
+    #[test]
+    fn fixed_packed_hybrid_storage_and_fallback_are_exact() {
+        let words: &[&[u8]] = &[b"ya", b"yb"];
+        let probe = plan(words);
+        let Some(packed) = probe.fixed_packed.as_ref() else {
+            return;
+        };
+        let dictionary_bytes = probe.dictionary.build_accounting().actual.persistent_bytes;
+        let packed_build = packed.build_accounting();
+        let exact_persistent = dictionary_bytes
+            + Plan::inline_storage_bytes()
+            + size_of::<PackedLiteralSetPlan>()
+            + packed_build.persistent_bytes;
+        assert_eq!(probe.storage_bytes(), exact_persistent);
+
+        let dictionary = dictionary_with_guards(
+            words,
+            Guard::LeftBoundary,
+            Guard::RightBoundary,
+        );
+        let dictionary_work =
+            usize::try_from(dictionary.build_accounting().actual.build_work).unwrap();
+        let selection_work = words.len() + words[0].len() * (words.len() + 3);
+        let base_persistent = dictionary_bytes + Plan::inline_storage_bytes();
+        let fallback = Plan::build(
+            dictionary,
+            PackedLiteralSetBuildLimits {
+                max_build_work: dictionary_work + selection_work,
+                max_build_bytes: base_persistent,
+                max_persistent_bytes: base_persistent,
+                ..PackedLiteralSetBuildLimits::default()
+            },
+            base_persistent,
+        )
+        .unwrap();
+        assert!(fallback.fixed_packed.is_none());
+        assert_eq!(fallback.plan_id(), PLAN_ID);
+        assert_eq!(fallback.storage_bytes(), base_persistent);
     }
 
     #[test]
