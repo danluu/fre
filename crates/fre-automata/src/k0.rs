@@ -82,6 +82,7 @@ const _: () = assert!(BYTE_ALPHABET == 1 << 8);
 // may reinvest unused row storage in more forward identities, but their
 // complete arena may never exceed the corresponding 256-state identity-row
 // layout's retained bytes or initialized slots.
+const LAZY_NARROW_MAX_STATES: usize = 64;
 const LAZY_MAX_STATES: usize = 256;
 // Keep cold and short direct runs in the ordinary executor. Once four
 // consecutive transitions have proved this invocation's row path warm, bulk
@@ -102,14 +103,26 @@ const _: () = assert!(DIRECT_LAZY_MAX_STATES <= usize::MAX / BYTE_ALPHABET);
 // is published so smaller warmed caches execute the original linear path.
 const LAZY_HASH_INDEX_MIN_STATES: usize = 16;
 const _: () = assert!(LAZY_HASH_INDEX_MIN_STATES <= LAZY_MAX_STATES);
+// Three consuming identities have exactly 31 reachable ordered/mode
+// identities. Keep that complete, correctness-promised domain on linear exact
+// comparison so bounded bucket saturation cannot weaken the <=3 guarantee.
+const EXACT_FORWARD_LAZY_STATE_CAPACITY: usize = 31;
+// Identity hashes select one fixed four-way bucket. Hashes are only hints:
+// every occupied way is authenticated against the exact mode and item list.
+// A full bucket declines optional publication and continues through the
+// already-sound inline frontier instead of walking an input-dependent probe
+// chain.
+const LAZY_IDENTITY_INDEX_WAYS: usize = 4;
 // Planning the first sixteen index entries keeps only those sixteen slots on
-// the stack. In the worst case entry `i` compares against all `i` earlier
-// slots for each of `i + 1` probes and advances after `i` collisions.
-const LAZY_HASH_INDEX_BOOTSTRAP_MAX_WORK: usize = (LAZY_HASH_INDEX_MIN_STATES - 1)
+// the stack. The complete preflight charges four bucket probes and up to `i`
+// comparisons with earlier planned slots for entry `i`, plus every eventual
+// index write. Reserving this bound makes threshold publication failure-atomic.
+const LAZY_HASH_INDEX_BOOTSTRAP_MAX_WORK: usize = LAZY_IDENTITY_INDEX_WAYS
     * LAZY_HASH_INDEX_MIN_STATES
-    * (2 * LAZY_HASH_INDEX_MIN_STATES - 1)
-    / 6
-    + (LAZY_HASH_INDEX_MIN_STATES - 1) * LAZY_HASH_INDEX_MIN_STATES;
+    * (LAZY_HASH_INDEX_MIN_STATES - 1)
+    / 2
+    + LAZY_IDENTITY_INDEX_WAYS * LAZY_HASH_INDEX_MIN_STATES
+    + LAZY_HASH_INDEX_MIN_STATES;
 const EXACT_LAZY_CAPACITY_MAX_ITEMS: usize = 3;
 const LAZY_CELL_ACCEPT: u32 = 1 << 31;
 const LAZY_CELL_RESTART: u32 = 1 << 30;
@@ -689,6 +702,21 @@ enum WorkspaceMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LazyCacheTier {
+    Narrow,
+    Wide,
+}
+
+impl LazyCacheTier {
+    const fn state_limit(self) -> usize {
+        match self {
+            Self::Narrow => LAZY_NARROW_MAX_STATES,
+            Self::Wide => LAZY_MAX_STATES,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SpanCursorBinding {
     automaton_identity: u64,
     limits: SearchLimits,
@@ -997,15 +1025,46 @@ impl WorkspaceLayout {
         Self::for_automaton_mode(automaton, WorkspaceMode::Endpoints)
     }
 
+    fn for_narrow_accelerated_automaton(
+        automaton: &Automaton,
+    ) -> Result<Self, SearchError> {
+        Self::for_automaton_mode_tier(
+            automaton,
+            WorkspaceMode::Endpoints,
+            LazyCacheTier::Narrow,
+        )
+    }
+
     pub(crate) fn for_bidirectional_automaton(automaton: &Automaton) -> Result<Self, SearchError> {
         Self::for_automaton_mode(automaton, WorkspaceMode::Bidirectional)
+    }
+
+    fn for_narrow_bidirectional_automaton(
+        automaton: &Automaton,
+    ) -> Result<Self, SearchError> {
+        Self::for_automaton_mode_tier(
+            automaton,
+            WorkspaceMode::Bidirectional,
+            LazyCacheTier::Narrow,
+        )
+    }
+
+    fn for_automaton_mode(
+        automaton: &Automaton,
+        mode: WorkspaceMode,
+    ) -> Result<Self, SearchError> {
+        Self::for_automaton_mode_tier(automaton, mode, LazyCacheTier::Wide)
     }
 
     #[allow(
         clippy::too_many_lines,
         reason = "one source-free transaction authenticates all three nested workspace layouts"
     )]
-    fn for_automaton_mode(automaton: &Automaton, mode: WorkspaceMode) -> Result<Self, SearchError> {
+    fn for_automaton_mode_tier(
+        automaton: &Automaton,
+        mode: WorkspaceMode,
+        tier: LazyCacheTier,
+    ) -> Result<Self, SearchError> {
         let states = automaton.stats().states();
         let edges = automaton.stats().edges();
         let zero_width_edges = automaton.stats().zero_width_edges();
@@ -1018,7 +1077,7 @@ impl WorkspaceLayout {
         let (lazy_state_capacity, lazy_item_capacity) = if mode == WorkspaceMode::Pike {
             (0, 0)
         } else {
-            lazy_capacities(automaton, automaton.byte_classes().count())?
+            lazy_capacities(automaton, automaton.byte_classes().count(), tier)?
         };
         let lazy_context_slots =
             if lazy_state_capacity != 0 && automaton.stats().assertion_edges() != 0 {
@@ -1028,7 +1087,7 @@ impl WorkspaceLayout {
             };
         let (reverse_state_capacity, reverse_item_capacity) =
             if mode == WorkspaceMode::Bidirectional && lazy_state_capacity != 0 {
-                reverse_capacities(automaton)?
+                reverse_capacities(automaton, tier)?
             } else {
                 (0, 0)
             };
@@ -1164,9 +1223,7 @@ impl WorkspaceLayout {
             7usize
                 .checked_add(usize::from(lazy_context_slots != 0))
                 .and_then(|value| {
-                    value.checked_add(usize::from(
-                        lazy_state_capacity >= LAZY_HASH_INDEX_MIN_STATES,
-                    ))
+                    value.checked_add(usize::from(lazy_index_admitted(lazy_state_capacity)))
                 })
                 .and_then(|value| value.checked_add(usize::from(lazy_item_capacity != 0)))
                 .ok_or(SearchError::ArithmeticOverflow {
@@ -1181,6 +1238,11 @@ impl WorkspaceLayout {
             let context_allocations = if reverse_context_slots == 0 { 0 } else { 2 };
             11usize
                 .checked_add(context_allocations)
+                .and_then(|value| {
+                    value.checked_add(usize::from(lazy_index_admitted(
+                        reverse_state_capacity,
+                    )))
+                })
                 .ok_or(SearchError::ArithmeticOverflow {
                     computation: "reverse workspace allocation count",
                 })?
@@ -1311,6 +1373,7 @@ enum LazyInterned {
 enum LazyIndexProbe {
     State(u32),
     Vacant(usize),
+    Full,
 }
 
 fn validate_lazy_capacity_full(
@@ -2315,13 +2378,22 @@ impl LazyWorkspace {
         meter: &mut WorkMeter,
         position: usize,
     ) -> Result<LazyIndexProbe, SearchError> {
-        let mut index_slot = lazy_index_start(hash, self.index.len())?;
-        for _ in 0..self.state_len {
-            let indexed = self.index[index_slot];
+        let begin = lazy_index_start(hash, self.index.len())?;
+        for way in 0..LAZY_IDENTITY_INDEX_WAYS {
+            meter.charge(1, position)?;
+            let index_slot = begin
+                .checked_add(way)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "lazy DFA identity-index way",
+                })?;
+            let indexed = *self.index.get(index_slot).ok_or(
+                SearchError::InternalInvariant {
+                    detail: "lazy DFA identity-index bucket is outside its arena",
+                },
+            )?;
             if indexed == LAZY_NO_STATE {
                 return Ok(LazyIndexProbe::Vacant(index_slot));
             }
-            meter.charge(1, position)?;
             let state = usize::try_from(indexed).map_err(|_| SearchError::InternalInvariant {
                 detail: "lazy DFA indexed state does not fit usize",
             })?;
@@ -2330,7 +2402,6 @@ impl LazyWorkspace {
                     detail: "lazy DFA index points outside the retained cache",
                 });
             }
-            index_slot = lazy_index_advance(index_slot, self.index.len())?;
             if self.modes[state] != u8::from(pending)
                 || self.hashes[state] != hash
                 || usize::try_from(self.lengths[state]).map_err(|_| {
@@ -2352,12 +2423,7 @@ impl LazyWorkspace {
                 return Ok(LazyIndexProbe::State(indexed));
             }
         }
-        if self.index.get(index_slot).copied() != Some(LAZY_NO_STATE) {
-            return Err(SearchError::InternalInvariant {
-                detail: "lazy DFA index has no publication slot",
-            });
-        }
-        Ok(LazyIndexProbe::Vacant(index_slot))
+        Ok(LazyIndexProbe::Full)
     }
 
     #[cold]
@@ -2367,7 +2433,7 @@ impl LazyWorkspace {
         final_hash: u64,
         meter: &mut WorkMeter,
         position: usize,
-    ) -> Result<[usize; LAZY_HASH_INDEX_MIN_STATES], SearchError> {
+    ) -> Result<Option<[usize; LAZY_HASH_INDEX_MIN_STATES]>, SearchError> {
         if self.index.is_empty()
             || self.state_len.checked_add(1) != Some(LAZY_HASH_INDEX_MIN_STATES)
         {
@@ -2386,9 +2452,20 @@ impl LazyWorkspace {
             } else {
                 self.hashes[state]
             };
-            let mut slot = lazy_index_start(hash, self.index.len())?;
-            let mut probes = 0usize;
-            loop {
+            let begin = lazy_index_start(hash, self.index.len())?;
+            let mut selected = None;
+            for way in 0..LAZY_IDENTITY_INDEX_WAYS {
+                meter.charge(1, position)?;
+                let slot = begin
+                    .checked_add(way)
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "lazy DFA index bootstrap way",
+                    })?;
+                if self.index.get(slot).copied() != Some(LAZY_NO_STATE) {
+                    return Err(SearchError::InternalInvariant {
+                        detail: "lazy DFA index bootstrap arena is not untouched",
+                    });
+                }
                 let mut occupied = false;
                 for &planned in &slots[..state] {
                     meter.charge(1, position)?;
@@ -2398,29 +2475,24 @@ impl LazyWorkspace {
                     }
                 }
                 if !occupied {
+                    selected = Some(slot);
                     break;
                 }
-                if probes >= state {
-                    return Err(SearchError::InternalInvariant {
-                        detail: "lazy DFA index bootstrap exceeded its occupied prefix",
-                    });
-                }
-                meter.charge(1, position)?;
-                slot = lazy_index_advance(slot, self.index.len())?;
-                probes = probes
-                    .checked_add(1)
-                    .ok_or(SearchError::ArithmeticOverflow {
-                        computation: "lazy DFA index bootstrap probes",
-                    })?;
             }
-            if self.index.get(slot).copied() != Some(LAZY_NO_STATE) {
-                return Err(SearchError::InternalInvariant {
-                    detail: "lazy DFA index bootstrap arena is not untouched",
-                });
-            }
+            let Some(slot) = selected else {
+                return Ok(None);
+            };
             slots[state] = slot;
         }
-        Ok(slots)
+        meter.charge(
+            u64::try_from(LAZY_HASH_INDEX_MIN_STATES).map_err(|_| {
+                SearchError::ArithmeticOverflow {
+                    computation: "lazy DFA index bootstrap publication work conversion",
+                }
+            })?,
+            position,
+        )?;
+        Ok(Some(slots))
     }
 
     #[allow(
@@ -2443,21 +2515,26 @@ impl LazyWorkspace {
                 })?;
         let can_publish = self.state_len < self.offsets.len() && item_end <= self.items.len();
         let publication_work = if can_publish { item_count.max(1) } else { 0 };
-        let use_index = self.state_len >= LAZY_HASH_INDEX_MIN_STATES;
+        let use_index = !self.index.is_empty() && self.state_len >= LAZY_HASH_INDEX_MIN_STATES;
         let bootstraps_index = can_publish
             && !self.index.is_empty()
             && self.state_len.checked_add(1) == Some(LAZY_HASH_INDEX_MIN_STATES);
-        let index_publication_work = if bootstraps_index {
+        let bootstrap_work = if bootstraps_index {
             LAZY_HASH_INDEX_BOOTSTRAP_MAX_WORK
         } else {
             0
         };
+        let indexed_lookup_states = if use_index {
+            LAZY_IDENTITY_INDEX_WAYS
+        } else {
+            self.state_len
+        };
+        let index_publication_work = usize::from(use_index && can_publish);
 
         // Learning is optional. Require the complete worst-case comparison and
         // publication allowance before doing any of it; otherwise continue
         // from the already-advanced frontier inline.
-        let comparison = self
-            .state_len
+        let comparison = indexed_lookup_states
             .checked_mul(
                 item_count
                     .checked_add(1)
@@ -2468,6 +2545,7 @@ impl LazyWorkspace {
             .and_then(|work| work.checked_add(item_count))
             .and_then(|work| work.checked_add(publication_work))
             .and_then(|work| work.checked_add(index_publication_work))
+            .and_then(|work| work.checked_add(bootstrap_work))
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "lazy DFA learning work",
             })?;
@@ -2497,6 +2575,7 @@ impl LazyWorkspace {
                     return Ok(LazyInterned::State(state));
                 }
                 LazyIndexProbe::Vacant(slot) => Some(slot),
+                LazyIndexProbe::Full => return Ok(LazyInterned::CapacityFull),
             }
         } else {
             if let Some(state) = self.probe_identity_linear(
@@ -2511,8 +2590,25 @@ impl LazyWorkspace {
         if !can_publish {
             return Ok(LazyInterned::CapacityFull);
         }
+        let next_state_len = self
+            .state_len
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "lazy DFA state count",
+            })?;
+        let indexed_state = u32::try_from(self.state_len).map_err(|_| {
+            SearchError::InternalInvariant {
+                detail: "lazy DFA state does not fit u32",
+            }
+        })?;
+        let encoded_item_count =
+            u32::try_from(item_count).map_err(|_| SearchError::InternalInvariant {
+                detail: "lazy DFA item count does not fit u32",
+            })?;
         let bootstrap = if bootstraps_index {
-            let slots = self.plan_index_bootstrap(hash, meter, position)?;
+            let Some(slots) = self.plan_index_bootstrap(hash, meter, position)? else {
+                return Ok(LazyInterned::CapacityFull);
+            };
             let mut states = [0_u32; LAZY_HASH_INDEX_MIN_STATES];
             for (state, encoded) in states.iter_mut().enumerate() {
                 *encoded = u32::try_from(state).map_err(|_| {
@@ -2525,24 +2621,19 @@ impl LazyWorkspace {
         } else {
             None
         };
-        let indexed_state = u32::try_from(self.state_len).map_err(|_| {
-            SearchError::InternalInvariant {
-                detail: "lazy DFA state does not fit u32",
-            }
-        })?;
         meter.charge(
             u64::try_from(publication_work).map_err(|_| SearchError::ArithmeticOverflow {
                 computation: "lazy DFA publication work conversion",
             })?,
             position,
         )?;
+        if insertion_slot.is_some() {
+            meter.charge(1, position)?;
+        }
         self.items[self.item_len..item_end].copy_from_slice(&self.scratch[..item_count]);
         let state = self.state_len;
         self.offsets[state] = self.item_len;
-        self.lengths[state] =
-            u32::try_from(item_count).map_err(|_| SearchError::InternalInvariant {
-                detail: "lazy DFA item count does not fit u32",
-            })?;
+        self.lengths[state] = encoded_item_count;
         self.modes[state] = u8::from(pending);
         self.hashes[state] = hash;
         if let Some(slot) = insertion_slot {
@@ -2554,12 +2645,7 @@ impl LazyWorkspace {
             }
         }
         self.item_len = item_end;
-        self.state_len = self
-            .state_len
-            .checked_add(1)
-            .ok_or(SearchError::ArithmeticOverflow {
-                computation: "lazy DFA state count",
-            })?;
+        self.state_len = next_state_len;
         self.scratch_len = 0;
         Ok(LazyInterned::State(indexed_state))
     }
@@ -2601,6 +2687,7 @@ struct ReverseWorkspace {
     offsets: Vec<usize>,
     lengths: Vec<u32>,
     hashes: Vec<u64>,
+    index: Vec<u32>,
     items: Vec<u32>,
     state_len: usize,
     item_len: usize,
@@ -2669,6 +2756,11 @@ impl ReverseWorkspace {
             offsets: allocate_slots(state_capacity, 0_usize, total_bytes)?,
             lengths: allocate_slots(state_capacity, 0_u32, total_bytes)?,
             hashes: allocate_slots(state_capacity, 0_u64, total_bytes)?,
+            index: allocate_slots(
+                lazy_index_slots(state_capacity)?,
+                LAZY_NO_STATE,
+                total_bytes,
+            )?,
             items: allocate_slots(layout.reverse_item_capacity, 0_u32, total_bytes)?,
             state_len: 0,
             item_len: 0,
@@ -2699,6 +2791,7 @@ impl ReverseWorkspace {
             offsets: Vec::new(),
             lengths: Vec::new(),
             hashes: Vec::new(),
+            index: Vec::new(),
             items: Vec::new(),
             state_len: 0,
             item_len: 0,
@@ -2810,6 +2903,7 @@ impl ReverseWorkspace {
             capacity_bytes::<usize>(&self.offsets, "reverse DFA offset bytes")?,
             capacity_bytes::<u32>(&self.lengths, "reverse DFA length bytes")?,
             capacity_bytes::<u64>(&self.hashes, "reverse DFA hash bytes")?,
+            capacity_bytes::<u32>(&self.index, "reverse DFA identity-index bytes")?,
             capacity_bytes::<u32>(&self.items, "reverse DFA item bytes")?,
         ] {
             total = total
@@ -3017,51 +3111,15 @@ impl ReverseWorkspace {
         Ok(0)
     }
 
-    fn intern_speculative(
-        &mut self,
+    #[inline]
+    fn probe_identity_linear(
+        &self,
+        hash: u64,
+        item_count: usize,
+        item_work: u64,
         meter: &mut WorkMeter,
-        core_reserve: u64,
         position: usize,
-    ) -> Result<LazyInterned, SearchError> {
-        let item_count = self.scratch_len;
-        let item_end =
-            self.item_len
-                .checked_add(item_count)
-                .ok_or(SearchError::ArithmeticOverflow {
-                    computation: "reverse DFA speculative item end",
-                })?;
-        let can_publish = self.state_len < self.offsets.len() && item_end <= self.items.len();
-        let publication_work = if can_publish { item_count.max(1) } else { 0 };
-        let comparison = self
-            .state_len
-            .checked_mul(
-                item_count
-                    .checked_add(1)
-                    .ok_or(SearchError::ArithmeticOverflow {
-                        computation: "reverse DFA comparison work",
-                    })?,
-            )
-            .and_then(|work| work.checked_add(item_count))
-            .and_then(|work| work.checked_add(publication_work))
-            .ok_or(SearchError::ArithmeticOverflow {
-                computation: "reverse DFA learning work",
-            })?;
-        let comparison =
-            u64::try_from(comparison).map_err(|_| SearchError::ArithmeticOverflow {
-                computation: "reverse DFA learning work conversion",
-            })?;
-        let Some(optional) = meter.remaining().checked_sub(core_reserve) else {
-            return Ok(LazyInterned::BudgetDeclined);
-        };
-        if comparison > optional {
-            return Ok(LazyInterned::BudgetDeclined);
-        }
-
-        let item_work = u64::try_from(item_count).map_err(|_| SearchError::ArithmeticOverflow {
-            computation: "reverse DFA item work",
-        })?;
-        meter.charge(item_work, position)?;
-        let hash = lazy_hash(&self.scratch[..item_count], false);
+    ) -> Result<Option<u32>, SearchError> {
         for state in 0..self.state_len {
             meter.charge(1, position)?;
             if self.hashes[state] != hash
@@ -3081,44 +3139,276 @@ impl ReverseWorkspace {
                 })?;
             meter.charge(item_work, position)?;
             if self.items.get(offset..end) == Some(&self.scratch[..item_count]) {
-                self.scratch_len = 0;
-                return Ok(LazyInterned::State(u32::try_from(state).map_err(|_| {
+                return Ok(Some(u32::try_from(state).map_err(|_| {
                     SearchError::InternalInvariant {
                         detail: "reverse DFA state does not fit u32",
                     }
                 })?));
             }
         }
+        Ok(None)
+    }
+
+    #[inline]
+    fn probe_identity_index(
+        &self,
+        hash: u64,
+        item_count: usize,
+        item_work: u64,
+        meter: &mut WorkMeter,
+        position: usize,
+    ) -> Result<LazyIndexProbe, SearchError> {
+        let begin = lazy_index_start(hash, self.index.len())?;
+        for way in 0..LAZY_IDENTITY_INDEX_WAYS {
+            meter.charge(1, position)?;
+            let index_slot = begin
+                .checked_add(way)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "reverse DFA identity-index way",
+                })?;
+            let indexed = *self.index.get(index_slot).ok_or(
+                SearchError::InternalInvariant {
+                    detail: "reverse DFA identity-index bucket is outside its arena",
+                },
+            )?;
+            if indexed == LAZY_NO_STATE {
+                return Ok(LazyIndexProbe::Vacant(index_slot));
+            }
+            let state = usize::try_from(indexed).map_err(|_| SearchError::InternalInvariant {
+                detail: "reverse DFA indexed state does not fit usize",
+            })?;
+            if state >= self.state_len {
+                return Err(SearchError::InternalInvariant {
+                    detail: "reverse DFA index points outside the retained cache",
+                });
+            }
+            if self.hashes[state] != hash
+                || usize::try_from(self.lengths[state]).map_err(|_| {
+                    SearchError::InternalInvariant {
+                        detail: "reverse DFA retained length does not fit usize",
+                    }
+                })? != item_count
+            {
+                continue;
+            }
+            let offset = self.offsets[state];
+            let end = offset
+                .checked_add(item_count)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "reverse DFA candidate state end",
+                })?;
+            meter.charge(item_work, position)?;
+            if self.items.get(offset..end) == Some(&self.scratch[..item_count]) {
+                return Ok(LazyIndexProbe::State(indexed));
+            }
+        }
+        Ok(LazyIndexProbe::Full)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn plan_index_bootstrap(
+        &self,
+        final_hash: u64,
+        meter: &mut WorkMeter,
+        position: usize,
+    ) -> Result<Option<[usize; LAZY_HASH_INDEX_MIN_STATES]>, SearchError> {
+        if self.index.is_empty()
+            || self.state_len.checked_add(1) != Some(LAZY_HASH_INDEX_MIN_STATES)
+        {
+            return Err(SearchError::InternalInvariant {
+                detail: "reverse DFA index bootstrap is outside its publication boundary",
+            });
+        }
+        let mut slots = [usize::MAX; LAZY_HASH_INDEX_MIN_STATES];
+        for state in 0..LAZY_HASH_INDEX_MIN_STATES {
+            let hash = if state == self.state_len {
+                final_hash
+            } else {
+                self.hashes[state]
+            };
+            let begin = lazy_index_start(hash, self.index.len())?;
+            let mut selected = None;
+            for way in 0..LAZY_IDENTITY_INDEX_WAYS {
+                meter.charge(1, position)?;
+                let slot = begin
+                    .checked_add(way)
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "reverse DFA index bootstrap way",
+                    })?;
+                if self.index.get(slot).copied() != Some(LAZY_NO_STATE) {
+                    return Err(SearchError::InternalInvariant {
+                        detail: "reverse DFA index bootstrap arena is not untouched",
+                    });
+                }
+                let mut occupied = false;
+                for &planned in &slots[..state] {
+                    meter.charge(1, position)?;
+                    if planned == slot {
+                        occupied = true;
+                        break;
+                    }
+                }
+                if !occupied {
+                    selected = Some(slot);
+                    break;
+                }
+            }
+            let Some(slot) = selected else {
+                return Ok(None);
+            };
+            slots[state] = slot;
+        }
+        meter.charge(
+            u64::try_from(LAZY_HASH_INDEX_MIN_STATES).map_err(|_| {
+                SearchError::ArithmeticOverflow {
+                    computation: "reverse DFA index bootstrap publication work conversion",
+                }
+            })?,
+            position,
+        )?;
+        Ok(Some(slots))
+    }
+
+    fn intern_speculative(
+        &mut self,
+        meter: &mut WorkMeter,
+        core_reserve: u64,
+        position: usize,
+    ) -> Result<LazyInterned, SearchError> {
+        let item_count = self.scratch_len;
+        let item_end =
+            self.item_len
+                .checked_add(item_count)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "reverse DFA speculative item end",
+                })?;
+        let can_publish = self.state_len < self.offsets.len() && item_end <= self.items.len();
+        let publication_work = if can_publish { item_count.max(1) } else { 0 };
+        let use_index = !self.index.is_empty() && self.state_len >= LAZY_HASH_INDEX_MIN_STATES;
+        let bootstraps_index = can_publish
+            && !self.index.is_empty()
+            && self.state_len.checked_add(1) == Some(LAZY_HASH_INDEX_MIN_STATES);
+        let indexed_lookup_states = if use_index {
+            LAZY_IDENTITY_INDEX_WAYS
+        } else {
+            self.state_len
+        };
+        let index_publication_work = usize::from(use_index && can_publish);
+        let bootstrap_work = if bootstraps_index {
+            LAZY_HASH_INDEX_BOOTSTRAP_MAX_WORK
+        } else {
+            0
+        };
+        let comparison = indexed_lookup_states
+            .checked_mul(
+                item_count
+                    .checked_add(1)
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "reverse DFA comparison work",
+                    })?,
+            )
+            .and_then(|work| work.checked_add(item_count))
+            .and_then(|work| work.checked_add(publication_work))
+            .and_then(|work| work.checked_add(index_publication_work))
+            .and_then(|work| work.checked_add(bootstrap_work))
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "reverse DFA learning work",
+            })?;
+        let comparison =
+            u64::try_from(comparison).map_err(|_| SearchError::ArithmeticOverflow {
+                computation: "reverse DFA learning work conversion",
+            })?;
+        let Some(optional) = meter.remaining().checked_sub(core_reserve) else {
+            return Ok(LazyInterned::BudgetDeclined);
+        };
+        if comparison > optional {
+            return Ok(LazyInterned::BudgetDeclined);
+        }
+
+        let item_work = u64::try_from(item_count).map_err(|_| SearchError::ArithmeticOverflow {
+            computation: "reverse DFA item work",
+        })?;
+        meter.charge(item_work, position)?;
+        let hash = lazy_hash(&self.scratch[..item_count], false);
+        let insertion_slot = if use_index {
+            match self.probe_identity_index(hash, item_count, item_work, meter, position)? {
+                LazyIndexProbe::State(state) => {
+                    self.scratch_len = 0;
+                    return Ok(LazyInterned::State(state));
+                }
+                LazyIndexProbe::Vacant(slot) => Some(slot),
+                LazyIndexProbe::Full => return Ok(LazyInterned::CapacityFull),
+            }
+        } else {
+            if let Some(state) =
+                self.probe_identity_linear(hash, item_count, item_work, meter, position)?
+            {
+                self.scratch_len = 0;
+                return Ok(LazyInterned::State(state));
+            }
+            None
+        };
         if !can_publish {
             return Ok(LazyInterned::CapacityFull);
         }
+        let next_state_len = self
+            .state_len
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "reverse DFA state count",
+            })?;
+        let indexed_state = u32::try_from(self.state_len).map_err(|_| {
+            SearchError::InternalInvariant {
+                detail: "reverse DFA state does not fit u32",
+            }
+        })?;
+        let encoded_item_count =
+            u32::try_from(item_count).map_err(|_| SearchError::InternalInvariant {
+                detail: "reverse DFA item count does not fit u32",
+            })?;
+        let bootstrap = if bootstraps_index {
+            let Some(slots) = self.plan_index_bootstrap(hash, meter, position)? else {
+                return Ok(LazyInterned::CapacityFull);
+            };
+            let mut states = [0_u32; LAZY_HASH_INDEX_MIN_STATES];
+            for (state, encoded) in states.iter_mut().enumerate() {
+                *encoded = u32::try_from(state).map_err(|_| {
+                    SearchError::InternalInvariant {
+                        detail: "reverse DFA bootstrap state does not fit u32",
+                    }
+                })?;
+            }
+            Some((slots, states))
+        } else {
+            None
+        };
         meter.charge(
             u64::try_from(publication_work).map_err(|_| SearchError::ArithmeticOverflow {
                 computation: "reverse DFA publication work conversion",
             })?,
             position,
         )?;
+        if insertion_slot.is_some() {
+            meter.charge(1, position)?;
+        }
         self.items[self.item_len..item_end].copy_from_slice(&self.scratch[..item_count]);
         let state = self.state_len;
         self.offsets[state] = self.item_len;
-        self.lengths[state] =
-            u32::try_from(item_count).map_err(|_| SearchError::InternalInvariant {
-                detail: "reverse DFA item count does not fit u32",
-            })?;
+        self.lengths[state] = encoded_item_count;
         self.hashes[state] = hash;
-        self.item_len = item_end;
-        self.state_len = self
-            .state_len
-            .checked_add(1)
-            .ok_or(SearchError::ArithmeticOverflow {
-                computation: "reverse DFA state count",
-            })?;
-        self.scratch_len = 0;
-        Ok(LazyInterned::State(u32::try_from(state).map_err(|_| {
-            SearchError::InternalInvariant {
-                detail: "reverse DFA state does not fit u32",
+        if let Some(slot) = insertion_slot {
+            self.index[slot] = indexed_state;
+        }
+        if let Some((slots, states)) = bootstrap {
+            for (slot, indexed) in slots.into_iter().zip(states) {
+                self.index[slot] = indexed;
             }
-        })?))
+        }
+        self.item_len = item_end;
+        self.state_len = next_state_len;
+        self.scratch_len = 0;
+        Ok(LazyInterned::State(indexed_state))
     }
 
     fn retain_scratch_as_frontier(&mut self) -> Result<(), SearchError> {
@@ -3876,19 +4166,37 @@ impl<'a> K0SearchSession<'a> {
             layout.construction_work <= limits.max_setup_work
                 && layout.logical_bytes <= limits.max_scratch_bytes
         };
-        let layout = if endpoint_eligible && bidirectional {
-            WorkspaceLayout::for_bidirectional_automaton(automaton)
-                .ok()
-                .filter(|layout| fits(*layout))
-        } else {
-            None
-        }
-        .or_else(|| {
-            endpoint_eligible
-                .then(|| WorkspaceLayout::for_accelerated_automaton(automaton).ok())
-                .flatten()
-                .filter(|layout| fits(*layout))
-        })
+        let admitted = |layout: Result<WorkspaceLayout, SearchError>| {
+            layout.ok().filter(|layout| fits(*layout))
+        };
+        // Preserve result capability before cache width. In particular, a
+        // narrow reverse cache still recovers exact spans, while a wide
+        // endpoint-only cache cannot. Every candidate depends only on the
+        // immutable automaton and caller-provided resource limits.
+        let layout = (endpoint_eligible && bidirectional)
+            .then(|| admitted(WorkspaceLayout::for_bidirectional_automaton(automaton)))
+            .flatten()
+            .or_else(|| {
+                (endpoint_eligible && bidirectional)
+                    .then(|| {
+                        admitted(WorkspaceLayout::for_narrow_bidirectional_automaton(
+                            automaton,
+                        ))
+                    })
+                    .flatten()
+            })
+            .or_else(|| {
+                endpoint_eligible
+                    .then(|| admitted(WorkspaceLayout::for_accelerated_automaton(automaton)))
+                    .flatten()
+            })
+            .or_else(|| {
+                endpoint_eligible
+                    .then(|| {
+                        admitted(WorkspaceLayout::for_narrow_accelerated_automaton(automaton))
+                    })
+                    .flatten()
+            })
         .map_or_else(
             || WorkspaceLayout::for_automaton(automaton),
             Result::<_, SearchError>::Ok,
@@ -16589,13 +16897,14 @@ fn unicode_assertion_matches(
 fn lazy_capacities(
     automaton: &Automaton,
     direct_class_count: usize,
+    tier: LazyCacheTier,
 ) -> Result<(usize, usize), SearchError> {
     let states = automaton.stats().states();
     if states == 0 || states > LAZY_MAX_ITEMS {
         return Ok((0, 0));
     }
     let consuming = automaton.stats().consuming_states();
-    let state_capacity = forward_lazy_state_capacity(consuming);
+    let state_capacity = forward_lazy_state_capacity_up_to(consuming, tier.state_limit());
     let legacy_item_capacity = ordered_partial_permutation_item_capacity(
         consuming,
         2,
@@ -16603,6 +16912,9 @@ fn lazy_capacities(
         "lazy DFA item capacity",
     )?;
     if automaton.stats().assertion_edges() != 0 {
+        return Ok((state_capacity, legacy_item_capacity));
+    }
+    if tier == LazyCacheTier::Narrow {
         return Ok((state_capacity, legacy_item_capacity));
     }
     if !(1..=BYTE_ALPHABET).contains(&direct_class_count) {
@@ -16675,8 +16987,13 @@ fn lazy_capacities(
     Ok((state_capacity, item_capacity))
 }
 
+const fn lazy_index_admitted(state_capacity: usize) -> bool {
+    state_capacity >= LAZY_HASH_INDEX_MIN_STATES
+        && state_capacity > EXACT_FORWARD_LAZY_STATE_CAPACITY
+}
+
 fn lazy_index_slots(state_capacity: usize) -> Result<usize, SearchError> {
-    if state_capacity < LAZY_HASH_INDEX_MIN_STATES {
+    if !lazy_index_admitted(state_capacity) {
         return Ok(0);
     }
     state_capacity
@@ -16688,40 +17005,44 @@ fn lazy_index_slots(state_capacity: usize) -> Result<usize, SearchError> {
 }
 
 fn lazy_index_start(hash: u64, slots: usize) -> Result<usize, SearchError> {
-    let mask = slots
+    if slots % LAZY_IDENTITY_INDEX_WAYS != 0 {
+        return Err(SearchError::InternalInvariant {
+            detail: "lazy DFA index does not have whole buckets",
+        });
+    }
+    let buckets = slots / LAZY_IDENTITY_INDEX_WAYS;
+    let mask = buckets
         .checked_sub(1)
-        .filter(|_| slots.is_power_of_two())
+        .filter(|_| buckets.is_power_of_two())
         .ok_or(SearchError::InternalInvariant {
-            detail: "lazy DFA index does not have power-of-two capacity",
+            detail: "lazy DFA index does not have power-of-two buckets",
         })?;
     let mask = u64::try_from(mask).map_err(|_| SearchError::ArithmeticOverflow {
         computation: "lazy DFA index mask conversion",
     })?;
-    usize::try_from(hash & mask).map_err(|_| SearchError::InternalInvariant {
-        detail: "lazy DFA index slot does not fit usize",
-    })
+    usize::try_from(hash & mask)
+        .map_err(|_| SearchError::InternalInvariant {
+            detail: "lazy DFA index bucket does not fit usize",
+        })?
+        .checked_mul(LAZY_IDENTITY_INDEX_WAYS)
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "lazy DFA index bucket start",
+        })
 }
 
-fn lazy_index_advance(slot: usize, slots: usize) -> Result<usize, SearchError> {
-    let next = slot.checked_add(1).ok_or(SearchError::ArithmeticOverflow {
-        computation: "lazy DFA index probe",
-    })?;
-    match next.cmp(&slots) {
-        core::cmp::Ordering::Less => Ok(next),
-        core::cmp::Ordering::Equal => Ok(0),
-        core::cmp::Ordering::Greater => Err(SearchError::InternalInvariant {
-            detail: "lazy DFA index probe starts outside the table",
-        }),
-    }
-}
-
-fn reverse_capacities(automaton: &Automaton) -> Result<(usize, usize), SearchError> {
+fn reverse_capacities(
+    automaton: &Automaton,
+    tier: LazyCacheTier,
+) -> Result<(usize, usize), SearchError> {
     let consuming = automaton.stats().consuming_edges();
     if consuming == 0 || consuming > LAZY_MAX_ITEMS {
         return Ok((0, 0));
     }
-    let state_capacity =
-        reverse_lazy_state_capacity(consuming, automaton.stats().assertion_edges() != 0);
+    let state_capacity = reverse_lazy_state_capacity_up_to(
+        consuming,
+        automaton.stats().assertion_edges() != 0,
+        tier.state_limit(),
+    );
     let item_capacity = ordered_partial_permutation_item_capacity(
         consuming,
         1,
@@ -16810,6 +17131,14 @@ fn forward_lazy_state_capacity_up_to(consuming_states: usize, state_limit: usize
 }
 
 fn reverse_lazy_state_capacity(consuming_edges: usize, contextual: bool) -> usize {
+    reverse_lazy_state_capacity_up_to(consuming_edges, contextual, LAZY_MAX_STATES)
+}
+
+fn reverse_lazy_state_capacity_up_to(
+    consuming_edges: usize,
+    contextual: bool,
+    state_limit: usize,
+) -> usize {
     if consuming_edges == 0 {
         return 0;
     }
@@ -16820,7 +17149,7 @@ fn reverse_lazy_state_capacity(consuming_edges: usize, contextual: bool) -> usiz
         consuming_edges,
         1,
         usize::from(contextual),
-        LAZY_MAX_STATES,
+        state_limit,
     )
 }
 
@@ -17013,6 +17342,7 @@ fn reverse_initialized_slots(
     } else {
         0
     };
+    let index_slots = lazy_index_slots(state_capacity)?;
     let context_hot_slots = if context_slots == 0 { 0 } else { state_capacity };
     states
         .checked_add(1)
@@ -17035,6 +17365,7 @@ fn reverse_initialized_slots(
                 .checked_mul(3)
                 .and_then(|meta| slots.checked_add(meta))
         })
+        .and_then(|slots| slots.checked_add(index_slots))
         .and_then(|slots| slots.checked_add(item_capacity))
         .ok_or(SearchError::ArithmeticOverflow {
             computation: "reverse lazy DFA initialized slots",
@@ -17065,6 +17396,7 @@ fn reverse_scratch_bytes(
     } else {
         0
     };
+    let index_slots = lazy_index_slots(state_capacity)?;
     let u32_slots = states
         .checked_add(1)
         .and_then(|slots| slots.checked_add(edges))
@@ -17075,6 +17407,7 @@ fn reverse_scratch_bytes(
         })
         .and_then(|slots| slots.checked_add(rows))
         .and_then(|slots| slots.checked_add(state_capacity))
+        .and_then(|slots| slots.checked_add(index_slots))
         .and_then(|slots| slots.checked_add(item_capacity))
         .ok_or(SearchError::ArithmeticOverflow {
             computation: "reverse lazy DFA u32 slots",
@@ -17248,7 +17581,7 @@ mod tests {
     };
 
     use super::{
-        classify_byte_delta_16, scratch_bytes, ContextTransitionSlot, WorkMeter,
+        classify_byte_delta_16, scratch_bytes, ContextTransitionSlot, WorkMeter, WorkspaceLayout,
         ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, BYTE_SET_BLOCK_BYTES, BYTE_SET_WIDE_BLOCK_BYTES,
         CONTEXT_INITIAL_SOURCE, INVOCATION_RESET_WORK, ROOT_RUN_SCANNER_SHAPE_MAX_WORK,
         WARM_EXISTS_INLINE_BYTES,
@@ -19982,6 +20315,20 @@ mod tests {
             contextual_layout.reverse_state_capacity,
             super::LAZY_MAX_STATES
         );
+        let contextual_narrow =
+            WorkspaceLayout::for_narrow_bidirectional_automaton(&contextual).unwrap();
+        assert_eq!(
+            contextual_narrow.lazy_state_capacity,
+            super::LAZY_NARROW_MAX_STATES
+        );
+        assert_eq!(
+            contextual_narrow.reverse_state_capacity,
+            super::LAZY_NARROW_MAX_STATES
+        );
+        assert!(contextual_narrow.logical_bytes() < contextual_layout.logical_bytes());
+        assert!(
+            contextual_narrow.construction_work() < contextual_layout.construction_work()
+        );
         let contextual_workspace =
             K0Workspace::new_bidirectional(&contextual, WorkspaceLimits::unlimited()).unwrap();
         assert!(contextual_workspace.lazy.rows.is_empty());
@@ -20149,6 +20496,62 @@ mod tests {
         assert_eq!(actual, None);
         assert!(accelerated.lazy.state_len > super::LAZY_MAX_STATES);
         assert!(!accelerated.lazy.saturated);
+
+        let mut narrow = K0Workspace::new_with_layout(
+            &plan,
+            WorkspaceLimits::unlimited(),
+            WorkspaceLayout::for_narrow_accelerated_automaton(&plan).unwrap(),
+        )
+        .unwrap();
+        let narrow_actual = plan
+            .prepare::<SelectedEnd>()
+            .search_with_workspace(&haystack, &mut narrow, SearchLimits::unlimited())
+            .unwrap()
+            .into_output();
+        assert_eq!(narrow_actual, expected);
+        assert!(narrow.lazy.state_len <= super::LAZY_NARROW_MAX_STATES);
+        assert!(narrow.lazy.saturated);
+
+        // Once every source-driven row in this cyclic corpus is retained, a
+        // second run neither learns identities nor exceeds affine per-byte
+        // transition work. Repeating the same complete stream exercises the
+        // cache independently of any benchmark-specific pattern selection.
+        let state_len = accelerated.lazy.state_len;
+        let item_len = accelerated.lazy.item_len;
+        let warm_one = plan
+            .prepare::<SelectedEnd>()
+            .search_with_workspace(&haystack, &mut accelerated, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(accelerated.lazy.state_len, state_len);
+        assert_eq!(accelerated.lazy.item_len, item_len);
+        let twice = haystack.repeat(2);
+        let _ = plan
+            .prepare::<SelectedEnd>()
+            .search_with_workspace(&twice, &mut accelerated, SearchLimits::unlimited())
+            .unwrap();
+        let warm_two = plan
+            .prepare::<SelectedEnd>()
+            .search_with_workspace(&twice, &mut accelerated, SearchLimits::unlimited())
+            .unwrap();
+        let four = haystack.repeat(4);
+        let _ = plan
+            .prepare::<SelectedEnd>()
+            .search_with_workspace(&four, &mut accelerated, SearchLimits::unlimited())
+            .unwrap();
+        let warm_four = plan
+            .prepare::<SelectedEnd>()
+            .search_with_workspace(&four, &mut accelerated, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(accelerated.lazy.state_len, state_len);
+        assert_eq!(accelerated.lazy.item_len, item_len);
+        assert!(
+            warm_two.accounting().transition_work()
+                <= warm_one.accounting().transition_work().checked_mul(2).unwrap()
+        );
+        assert!(
+            warm_four.accounting().transition_work()
+                <= warm_two.accounting().transition_work().checked_mul(2).unwrap()
+        );
     }
 
     #[test]
@@ -20459,28 +20862,25 @@ mod tests {
                 workspace.lazy.state_len
             );
             for expected in 0..workspace.lazy.state_len {
-                let mut slot = super::lazy_index_start(
+                let begin = super::lazy_index_start(
                     workspace.lazy.hashes[expected],
                     workspace.lazy.index.len(),
                 )
                 .unwrap();
-                let mut found = false;
-                for _ in 0..workspace.lazy.state_len {
-                    let indexed = workspace.lazy.index[slot];
-                    assert_ne!(indexed, super::LAZY_NO_STATE);
-                    if usize::try_from(indexed).unwrap() == expected {
-                        found = true;
-                        break;
-                    }
-                    slot = super::lazy_index_advance(slot, workspace.lazy.index.len()).unwrap();
-                }
+                let end = begin + super::LAZY_IDENTITY_INDEX_WAYS;
+                let found = workspace.lazy.index[begin..end]
+                    .iter()
+                    .copied()
+                    .filter(|&indexed| indexed != super::LAZY_NO_STATE)
+                    .any(|indexed| usize::try_from(indexed).unwrap() == expected);
                 assert!(found, "retained state {expected} is absent from its probe chain");
             }
         }
 
         assert_eq!(super::lazy_index_slots(15).unwrap(), 0);
-        assert_eq!(super::lazy_index_slots(16).unwrap(), 32);
-        assert_eq!(super::lazy_index_slots(17).unwrap(), 64);
+        assert_eq!(super::lazy_index_slots(31).unwrap(), 0);
+        assert_eq!(super::lazy_index_slots(32).unwrap(), 64);
+        assert_eq!(super::lazy_index_slots(33).unwrap(), 128);
         assert!(matches!(
             super::lazy_index_slots(usize::MAX),
             Err(SearchError::ArithmeticOverflow {
@@ -20561,7 +20961,7 @@ mod tests {
         );
         assert_eq!(linear_hit.consumed, 17);
 
-        // Items zero, 512, and 1024 share their low nine hash bits. The
+        // Items zero, 512, and 1024 share one fixed four-way bucket. The
         // threshold publication therefore exercises collisions while it
         // bootstraps all prior identities. One below the complete worst-case
         // reservation declines without publishing any index cell.
@@ -20604,7 +21004,7 @@ mod tests {
                 .intern_speculative(false, &mut boundary_publish, 0, 0),
             Ok(super::LazyInterned::State(15))
         );
-        assert_eq!(boundary_publish.consumed, 144);
+        assert!(boundary_publish.consumed <= u64::try_from(bootstrap_bound).unwrap());
         assert_eq!(workspace.lazy.state_len, super::LAZY_HASH_INDEX_MIN_STATES);
         assert_indexed(&workspace);
 
@@ -20636,7 +21036,7 @@ mod tests {
                 .intern_speculative(false, &mut clustered_publish, 0, 0),
             Ok(super::LazyInterned::State(16))
         );
-        assert_eq!(clustered_publish.consumed, 5);
+        assert_eq!(clustered_publish.consumed, 7);
 
         stage(&mut workspace, 1536);
         let mut clustered_hit = WorkMeter::new(u64::MAX, 0);
@@ -20662,6 +21062,229 @@ mod tests {
         assert_eq!(full_collision.consumed, 7);
         workspace.lazy.hashes[0] = initial_hash;
         assert_indexed(&workspace);
+
+        // A fifth distinct identity in the same bucket cannot displace an
+        // exact retained state. Publication declines before any logical cache
+        // length or index byte changes, leaving the staged frontier available
+        // to the caller's bounded inline continuation.
+        let before_state_len = workspace.lazy.state_len;
+        let before_item_len = workspace.lazy.item_len;
+        let before_index = workspace.lazy.index.clone();
+        stage(&mut workspace, 2048);
+        let mut bucket_full = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            workspace
+                .lazy
+                .intern_speculative(false, &mut bucket_full, 0, 0),
+            Ok(super::LazyInterned::CapacityFull)
+        );
+        assert_eq!(bucket_full.consumed, 5);
+        assert_eq!(workspace.lazy.state_len, before_state_len);
+        assert_eq!(workspace.lazy.item_len, before_item_len);
+        assert_eq!(workspace.lazy.index, before_index);
+        assert_eq!(workspace.lazy.scratch_len, 1);
+
+        // Indexed publication reserves its complete bounded probe, exact
+        // comparison, copy, and index-write envelope before consuming work.
+        stage(&mut workspace, 17);
+        let indexed_publication_bound = super::LAZY_IDENTITY_INDEX_WAYS * 2 + 3;
+        let mut indexed_refused = WorkMeter::new(
+            u64::try_from(indexed_publication_bound - 1).unwrap(),
+            0,
+        );
+        assert_eq!(
+            workspace
+                .lazy
+                .intern_speculative(false, &mut indexed_refused, 0, 0),
+            Ok(super::LazyInterned::BudgetDeclined)
+        );
+        assert_eq!(indexed_refused.consumed, 0);
+        assert_eq!(workspace.lazy.state_len, before_state_len);
+        let mut indexed_publish =
+            WorkMeter::new(u64::try_from(indexed_publication_bound).unwrap(), 0);
+        assert_eq!(
+            workspace
+                .lazy
+                .intern_speculative(false, &mut indexed_publish, 0, 0),
+            Ok(super::LazyInterned::State(
+                u32::try_from(before_state_len).unwrap()
+            ))
+        );
+        assert!(indexed_publish.consumed <= u64::try_from(indexed_publication_bound).unwrap());
+        assert_indexed(&workspace);
+
+        // The threshold transaction also fails closed when five of its first
+        // sixteen identities map to one four-way bucket. No partial index is
+        // visible, so the caller can retain the candidate as its inline
+        // frontier without authenticating an incomplete lookup structure.
+        let mut threshold_full =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        stage(&mut threshold_full, 0);
+        let mut threshold_meter = WorkMeter::new(u64::MAX, 0);
+        threshold_full
+            .lazy
+            .intern_initial(false, &mut threshold_meter, 0)
+            .unwrap();
+        for item in [512_u32, 1024, 1536] {
+            stage(&mut threshold_full, item);
+            assert!(matches!(
+                threshold_full.lazy.intern_speculative(
+                    false,
+                    &mut threshold_meter,
+                    0,
+                    0,
+                ),
+                Ok(super::LazyInterned::State(_))
+            ));
+        }
+        for item in 1..12_u32 {
+            stage(&mut threshold_full, item);
+            assert!(matches!(
+                threshold_full.lazy.intern_speculative(
+                    false,
+                    &mut threshold_meter,
+                    0,
+                    0,
+                ),
+                Ok(super::LazyInterned::State(_))
+            ));
+        }
+        assert_eq!(threshold_full.lazy.state_len, 15);
+        stage(&mut threshold_full, 2048);
+        assert_eq!(
+            threshold_full.lazy.intern_speculative(
+                false,
+                &mut threshold_meter,
+                0,
+                0,
+            ),
+            Ok(super::LazyInterned::CapacityFull)
+        );
+        assert_eq!(threshold_full.lazy.state_len, 15);
+        assert_eq!(threshold_full.lazy.scratch_len, 1);
+        assert!(threshold_full
+            .lazy
+            .index
+            .iter()
+            .all(|&state| state == super::LAZY_NO_STATE));
+    }
+
+    #[test]
+    fn reverse_lazy_identity_lookup_is_bounded_exact_and_failure_atomic() {
+        fn stage(workspace: &mut K0Workspace, item: u32) {
+            workspace.reverse.scratch[0] = item;
+            workspace.reverse.scratch_len = 1;
+        }
+
+        fn assert_indexed(workspace: &K0Workspace) {
+            assert_eq!(
+                workspace
+                    .reverse
+                    .index
+                    .iter()
+                    .filter(|&&state| state != super::LAZY_NO_STATE)
+                    .count(),
+                workspace.reverse.state_len
+            );
+            for expected in 0..workspace.reverse.state_len {
+                let begin = super::lazy_index_start(
+                    workspace.reverse.hashes[expected],
+                    workspace.reverse.index.len(),
+                )
+                .unwrap();
+                let end = begin + super::LAZY_IDENTITY_INDEX_WAYS;
+                assert!(workspace.reverse.index[begin..end]
+                    .iter()
+                    .copied()
+                    .filter(|&indexed| indexed != super::LAZY_NO_STATE)
+                    .any(|indexed| usize::try_from(indexed).unwrap() == expected));
+            }
+        }
+
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b'), (b'c', b'c'), (b'd', b'd')]);
+        let mut workspace =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        assert_eq!(workspace.reverse.index.len(), 128);
+
+        stage(&mut workspace, 0);
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(workspace.reverse.intern_initial(&mut meter, 0), Ok(0));
+        for item in 1..15_u32 {
+            stage(&mut workspace, item);
+            assert!(matches!(
+                workspace.reverse.intern_speculative(&mut meter, 0, 0),
+                Ok(super::LazyInterned::State(_))
+            ));
+        }
+        assert_eq!(workspace.reverse.state_len, 15);
+        assert!(workspace
+            .reverse
+            .index
+            .iter()
+            .all(|&state| state == super::LAZY_NO_STATE));
+
+        stage(&mut workspace, 15);
+        let linear_states = super::LAZY_HASH_INDEX_MIN_STATES - 1;
+        let bootstrap_bound = linear_states * 2
+            + 2
+            + super::LAZY_HASH_INDEX_BOOTSTRAP_MAX_WORK;
+        let mut refused =
+            WorkMeter::new(u64::try_from(bootstrap_bound - 1).unwrap(), 0);
+        assert_eq!(
+            workspace.reverse.intern_speculative(&mut refused, 0, 0),
+            Ok(super::LazyInterned::BudgetDeclined)
+        );
+        assert_eq!(refused.consumed, 0);
+        assert!(workspace
+            .reverse
+            .index
+            .iter()
+            .all(|&state| state == super::LAZY_NO_STATE));
+        let mut publish = WorkMeter::new(u64::try_from(bootstrap_bound).unwrap(), 0);
+        assert_eq!(
+            workspace.reverse.intern_speculative(&mut publish, 0, 0),
+            Ok(super::LazyInterned::State(15))
+        );
+        assert_indexed(&workspace);
+
+        for (item, state) in [(32_u32, 16_u32), (64, 17), (96, 18)] {
+            stage(&mut workspace, item);
+            let mut collision = WorkMeter::new(u64::MAX, 0);
+            assert_eq!(
+                workspace
+                    .reverse
+                    .intern_speculative(&mut collision, 0, 0),
+                Ok(super::LazyInterned::State(state))
+            );
+        }
+        assert_indexed(&workspace);
+
+        // Hash equality alone is never authoritative. Force state zero to
+        // share the complete hash and prove the exact item comparison skips it.
+        let initial_hash = workspace.reverse.hashes[0];
+        workspace.reverse.hashes[0] = super::lazy_hash(&[96], false);
+        stage(&mut workspace, 96);
+        let mut exact = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            workspace.reverse.intern_speculative(&mut exact, 0, 0),
+            Ok(super::LazyInterned::State(18))
+        );
+        workspace.reverse.hashes[0] = initial_hash;
+
+        let before_state_len = workspace.reverse.state_len;
+        let before_item_len = workspace.reverse.item_len;
+        let before_index = workspace.reverse.index.clone();
+        stage(&mut workspace, 128);
+        let mut full = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            workspace.reverse.intern_speculative(&mut full, 0, 0),
+            Ok(super::LazyInterned::CapacityFull)
+        );
+        assert_eq!(full.consumed, 5);
+        assert_eq!(workspace.reverse.state_len, before_state_len);
+        assert_eq!(workspace.reverse.item_len, before_item_len);
+        assert_eq!(workspace.reverse.index, before_index);
+        assert_eq!(workspace.reverse.scratch_len, 1);
     }
 
     #[test]
@@ -20778,9 +21401,7 @@ mod tests {
             .unwrap()
             .checked_add(7)
             .and_then(|work| {
-                work.checked_add(usize::from(
-                    forward_states >= super::LAZY_HASH_INDEX_MIN_STATES,
-                ))
+                work.checked_add(usize::from(super::lazy_index_admitted(forward_states)))
             })
             .and_then(|work| work.checked_add(usize::from(endpoint.lazy_item_capacity != 0)))
             .and_then(|work| u64::try_from(work).ok())
@@ -20873,6 +21494,11 @@ mod tests {
                 exact_full.reverse.items.len(),
                 reverse_items,
                 "{name}: reverse item storage"
+            );
+            assert_eq!(
+                exact_full.reverse.index.len(),
+                super::lazy_index_slots(reverse_states).unwrap(),
+                "{name}: reverse identity index"
             );
             if reverse_states == 0 {
                 assert_eq!(full, endpoint, "{name}: no reverse frontier");
@@ -21391,9 +22017,23 @@ mod tests {
             K0Workspace::new_accelerated(plan, WorkspaceLimits::unlimited()).unwrap();
         let mut bidirectional =
             K0Workspace::new_bidirectional(plan, WorkspaceLimits::unlimited()).unwrap();
+        let mut narrow_endpoint = K0Workspace::new_with_layout(
+            plan,
+            WorkspaceLimits::unlimited(),
+            WorkspaceLayout::for_narrow_accelerated_automaton(plan).unwrap(),
+        )
+        .unwrap();
+        let mut narrow_bidirectional = K0Workspace::new_with_layout(
+            plan,
+            WorkspaceLimits::unlimited(),
+            WorkspaceLayout::for_narrow_bidirectional_automaton(plan).unwrap(),
+        )
+        .unwrap();
         assert!(endpoint.lazy.context.is_allocated());
         assert!(bidirectional.lazy.context.is_allocated());
         assert!(bidirectional.reverse.context.is_allocated());
+        assert!(narrow_endpoint.lazy.context.is_allocated());
+        assert!(narrow_bidirectional.reverse.context.is_allocated());
 
         for haystack in haystacks {
             for start in 0..=haystack.len() {
@@ -21423,6 +22063,17 @@ mod tests {
                         got_exists, want_exists,
                         "contextual Exists mismatch plan={plan:?} source={haystack:?} window={window:?}"
                     );
+                    let narrow_exists = plan
+                        .prepare::<Exists>()
+                        .search_window_with_workspace(
+                            haystack,
+                            window,
+                            &mut narrow_endpoint,
+                            SearchLimits::unlimited(),
+                        )
+                        .unwrap()
+                        .into_output();
+                    assert_eq!(narrow_exists, want_exists);
 
                     let want_earliest = plan
                         .prepare::<EarliestEnd>()
@@ -21448,6 +22099,17 @@ mod tests {
                         got_earliest, want_earliest,
                         "contextual EarliestEnd mismatch plan={plan:?} source={haystack:?} window={window:?}"
                     );
+                    let narrow_earliest = plan
+                        .prepare::<EarliestEnd>()
+                        .search_window_with_workspace(
+                            haystack,
+                            window,
+                            &mut narrow_endpoint,
+                            SearchLimits::unlimited(),
+                        )
+                        .unwrap()
+                        .into_output();
+                    assert_eq!(narrow_earliest, want_earliest);
 
                     let want_selected = plan
                         .prepare::<SelectedEnd>()
@@ -21473,6 +22135,17 @@ mod tests {
                         got_selected, want_selected,
                         "contextual SelectedEnd mismatch plan={plan:?} source={haystack:?} window={window:?}"
                     );
+                    let narrow_selected = plan
+                        .prepare::<SelectedEnd>()
+                        .search_window_with_workspace(
+                            haystack,
+                            window,
+                            &mut narrow_endpoint,
+                            SearchLimits::unlimited(),
+                        )
+                        .unwrap()
+                        .into_output();
+                    assert_eq!(narrow_selected, want_selected);
 
                     let want_span = plan
                         .prepare::<Span>()
@@ -21498,6 +22171,17 @@ mod tests {
                         got_span, want_span,
                         "contextual Span mismatch plan={plan:?} source={haystack:?} window={window:?}"
                     );
+                    let narrow_span = plan
+                        .prepare::<Span>()
+                        .search_window_with_workspace(
+                            haystack,
+                            window,
+                            &mut narrow_bidirectional,
+                            SearchLimits::unlimited(),
+                        )
+                        .unwrap()
+                        .into_output();
+                    assert_eq!(narrow_span, want_span);
                 }
             }
         }
@@ -21506,6 +22190,9 @@ mod tests {
         assert!(bidirectional.lazy.initialized);
         assert!(bidirectional.reverse.is_allocated());
         assert!(!bidirectional.reverse.declined);
+        assert!(narrow_endpoint.lazy.initialized);
+        assert!(narrow_bidirectional.reverse.is_allocated());
+        assert!(!narrow_bidirectional.reverse.declined);
     }
 
     fn assert_chain_filter_matches_unspecialized(
@@ -27251,6 +27938,18 @@ mod tests {
                 K0Workspace::new_accelerated(plan, WorkspaceLimits::unlimited()).unwrap();
             let mut bidirectional =
                 K0Workspace::new_bidirectional(plan, WorkspaceLimits::unlimited()).unwrap();
+            let mut narrow_accelerated = K0Workspace::new_with_layout(
+                plan,
+                WorkspaceLimits::unlimited(),
+                WorkspaceLayout::for_narrow_accelerated_automaton(plan).unwrap(),
+            )
+            .unwrap();
+            let mut narrow_bidirectional = K0Workspace::new_with_layout(
+                plan,
+                WorkspaceLimits::unlimited(),
+                WorkspaceLayout::for_narrow_bidirectional_automaton(plan).unwrap(),
+            )
+            .unwrap();
             assert!(accelerated.retained_bytes() > pike.retained_bytes());
             assert!(bidirectional.retained_bytes() > accelerated.retained_bytes());
 
@@ -27282,6 +27981,17 @@ mod tests {
                             got_exists, want_exists,
                             "exists mismatch plan={plan:?}, source={haystack:?}, window={window:?}"
                         );
+                        let narrow_exists = plan
+                            .prepare::<Exists>()
+                            .search_window_with_workspace(
+                                haystack,
+                                window,
+                                &mut narrow_accelerated,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap()
+                            .into_output();
+                        assert_eq!(narrow_exists, want_exists);
 
                         let want_earliest = plan
                             .prepare::<EarliestEnd>()
@@ -27307,6 +28017,17 @@ mod tests {
                             got_earliest, want_earliest,
                             "earliest mismatch plan={plan:?}, source={haystack:?}, window={window:?}"
                         );
+                        let narrow_earliest = plan
+                            .prepare::<EarliestEnd>()
+                            .search_window_with_workspace(
+                                haystack,
+                                window,
+                                &mut narrow_bidirectional,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap()
+                            .into_output();
+                        assert_eq!(narrow_earliest, want_earliest);
 
                         let want_selected = plan
                             .prepare::<SelectedEnd>()
@@ -27332,6 +28053,17 @@ mod tests {
                             got_selected, want_selected,
                             "selected mismatch plan={plan:?}, source={haystack:?}, window={window:?}"
                         );
+                        let narrow_selected = plan
+                            .prepare::<SelectedEnd>()
+                            .search_window_with_workspace(
+                                haystack,
+                                window,
+                                &mut narrow_accelerated,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap()
+                            .into_output();
+                        assert_eq!(narrow_selected, want_selected);
 
                         let want_span = plan
                             .prepare::<Span>()
@@ -27357,6 +28089,17 @@ mod tests {
                             got_span, want_span,
                             "span mismatch plan={plan:?}, source={haystack:?}, window={window:?}"
                         );
+                        let narrow_span = plan
+                            .prepare::<Span>()
+                            .search_window_with_workspace(
+                                haystack,
+                                window,
+                                &mut narrow_bidirectional,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap()
+                            .into_output();
+                        assert_eq!(narrow_span, want_span);
                         checked = checked.checked_add(1).unwrap();
                     }
                 }
@@ -27366,6 +28109,9 @@ mod tests {
             assert!(bidirectional.lazy.initialized);
             assert!(bidirectional.reverse.initialized);
             assert!(!bidirectional.reverse.declined);
+            assert!(narrow_accelerated.lazy.initialized);
+            assert!(narrow_bidirectional.reverse.initialized);
+            assert!(!narrow_bidirectional.reverse.declined);
         }
         assert!(checked > 10_000);
     }
@@ -36112,6 +36858,100 @@ mod tests {
             ),
             Err(SearchError::WorkspaceSetupWorkLimitExceeded { limit, needed })
                 if limit == pike_setup.work() - 1 && needed == pike_setup.work()
+        ));
+    }
+
+    #[test]
+    fn selected_session_preserves_bidirectional_capability_before_cache_width() {
+        let plan = byte_chain(&[
+            (b'a', b'a'),
+            (b'b', b'b'),
+            (b'c', b'c'),
+            (b'd', b'd'),
+            (b'a', b'a'),
+            (b'b', b'b'),
+            (b'c', b'c'),
+        ]);
+        let wide_endpoint = WorkspaceLayout::for_accelerated_automaton(&plan).unwrap();
+        let narrow_endpoint =
+            WorkspaceLayout::for_narrow_accelerated_automaton(&plan).unwrap();
+        let wide_bidirectional = WorkspaceLayout::for_bidirectional_automaton(&plan).unwrap();
+        let narrow_bidirectional =
+            WorkspaceLayout::for_narrow_bidirectional_automaton(&plan).unwrap();
+
+        assert_eq!(narrow_endpoint.lazy_state_capacity, super::LAZY_NARROW_MAX_STATES);
+        assert_eq!(
+            narrow_bidirectional.reverse_state_capacity,
+            super::LAZY_NARROW_MAX_STATES
+        );
+        assert!(wide_endpoint.lazy_state_capacity > narrow_endpoint.lazy_state_capacity);
+        assert!(
+            wide_bidirectional.reverse_state_capacity
+                > narrow_bidirectional.reverse_state_capacity
+        );
+
+        let unlimited =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+        assert_eq!(unlimited.workspace.layout, wide_bidirectional);
+        assert!(unlimited.capabilities.reverse);
+
+        // Both a narrow bidirectional workspace and a wide endpoint workspace
+        // fit, while the wide bidirectional workspace does not. Exact-span
+        // capability takes precedence over the larger forward-only cache.
+        let capability_limits = WorkspaceLimits {
+            max_setup_work: narrow_bidirectional
+                .construction_work()
+                .max(wide_endpoint.construction_work()),
+            max_scratch_bytes: narrow_bidirectional
+                .logical_bytes()
+                .max(wide_endpoint.logical_bytes()),
+        };
+        assert!(wide_bidirectional.construction_work() > capability_limits.max_setup_work);
+        assert!(wide_bidirectional.logical_bytes() > capability_limits.max_scratch_bytes);
+        let capability =
+            K0SearchSession::new_selected(&plan, capability_limits, true, true).unwrap();
+        assert_eq!(capability.workspace.layout, narrow_bidirectional);
+        assert!(capability.capabilities.reverse);
+
+        let endpoint_narrow_limits = WorkspaceLimits {
+            max_setup_work: narrow_endpoint.construction_work(),
+            max_scratch_bytes: narrow_endpoint.logical_bytes(),
+        };
+        let endpoint_narrow =
+            K0SearchSession::new_selected(&plan, endpoint_narrow_limits, true, false).unwrap();
+        assert_eq!(endpoint_narrow.workspace.layout, narrow_endpoint);
+        assert!(endpoint_narrow.capabilities.lazy);
+        assert!(!endpoint_narrow.capabilities.reverse);
+
+        assert!(matches!(
+            K0Workspace::new_with_layout(
+                &plan,
+                WorkspaceLimits {
+                    max_setup_work: narrow_bidirectional.construction_work() - 1,
+                    max_scratch_bytes: narrow_bidirectional.logical_bytes(),
+                },
+                narrow_bidirectional,
+            ),
+            Err(SearchError::WorkspaceSetupWorkLimitExceeded { limit, needed })
+                if limit == narrow_bidirectional.construction_work() - 1
+                    && needed == narrow_bidirectional.construction_work()
+        ));
+        assert!(matches!(
+            K0Workspace::new_with_layout(
+                &plan,
+                WorkspaceLimits {
+                    max_setup_work: narrow_bidirectional.construction_work(),
+                    max_scratch_bytes: narrow_bidirectional.logical_bytes() - 1,
+                },
+                narrow_bidirectional,
+            ),
+            Err(SearchError::ResourceLimit {
+                resource: ResourceKind::ScratchBytes,
+                needed,
+                limit,
+            }) if needed == narrow_bidirectional.logical_bytes()
+                && limit == narrow_bidirectional.logical_bytes() - 1
         ));
     }
 
