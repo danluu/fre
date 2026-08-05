@@ -25,10 +25,12 @@ pub const ASCII_NONMEMBER_RUN_SCANNER_BUILD_WORK: usize = 128 + 1 + 1;
 
 /// Maximum physical classification work beyond the logically required work.
 ///
-/// AVX2 classifies a complete 32-byte block containing the first member. NEON
-/// classifies a complete 16-byte block and then scalar-recovers its boundary.
-/// Other leaves have no larger excess.
-pub const ASCII_NONMEMBER_RUN_MAX_CLASSIFICATION_OVERHEAD: usize = ASCII_WIDE_BYTES - 1;
+/// AVX2 classifies a complete 32-byte block containing the first member. The
+/// two-vector NEON loop can classify the following 16-byte half before it
+/// scalar-recovers a member in the first half. Other leaves have no larger
+/// excess: 16 speculative second-half lanes plus at most 16 reclassified
+/// recovery lanes make the tight global bound 32.
+pub const ASCII_NONMEMBER_RUN_MAX_CLASSIFICATION_OVERHEAD: usize = ASCII_WIDE_BYTES;
 
 const SELECTION_INPUT_BYTES: usize = ASCII_WIDE_BYTES;
 const NARROW_VECTOR_BYTES: u16 = 16;
@@ -37,7 +39,7 @@ const WIDE_VECTOR_BYTES: u16 = 32;
 
 const SCALAR_VARIANT_ID: &str = "ascii-byte-set.nonmember-run.scalar.v1";
 #[cfg(target_arch = "aarch64")]
-const NEON_VARIANT_ID: &str = "ascii-byte-set.nonmember-run.neon.v1";
+const NEON_VARIANT_ID: &str = "ascii-byte-set.nonmember-run.neon2x16.v1";
 #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
 const SVE2_MATCH16_VARIANT_ID: &str = "ascii-byte-set.nonmember-run.sve2-match16.v1";
 #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
@@ -272,40 +274,105 @@ unsafe fn scan_scalar_entry(
 #[cfg(target_arch = "aarch64")]
 #[allow(
     unsafe_code,
+    reason = "this private helper performs one exact NEON load after its caller proves NEON usable"
+)]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn member_lanes_neon(
+    columns: core::arch::aarch64::uint8x16_t,
+    high_nibble_bits: core::arch::aarch64::uint8x16_t,
+    bytes: &[u8; ASCII_NARROW_BYTES],
+) -> core::arch::aarch64::uint8x16_t {
+    use core::arch::aarch64::{
+        vandq_u8, vcgtq_u8, vdupq_n_u8, vld1q_u8, vqtbl1q_u8, vshrq_n_u8,
+    };
+
+    // SAFETY: the array contains exactly the sixteen initialized bytes loaded.
+    let input = unsafe { vld1q_u8(bytes.as_ptr()) };
+    let low_nibbles = vandq_u8(input, vdupq_n_u8(0x0f));
+    let high_nibbles = vshrq_n_u8::<4>(input);
+    let selected_columns = vqtbl1q_u8(columns, low_nibbles);
+    let selected_high_bits = vqtbl1q_u8(high_nibble_bits, high_nibbles);
+    let selected_bits = vandq_u8(selected_columns, selected_high_bits);
+    vcgtq_u8(selected_bits, vdupq_n_u8(0))
+}
+
+#[cfg(target_arch = "aarch64")]
+#[allow(
+    unsafe_code,
     reason = "this private target-feature leaf performs exact NEON loads only after retained dispatch proves NEON usable"
 )]
 #[target_feature(enable = "neon")]
 #[inline(never)]
 unsafe fn scan_neon(tables: &AsciiRunTables, bytes: &[u8]) -> AsciiNonMemberRunResult {
-    use core::arch::aarch64::{
-        vandq_u8, vcgtq_u8, vdupq_n_u8, vld1q_u8, vmaxvq_u8, vqtbl1q_u8, vshrq_n_u8,
-    };
+    use core::arch::aarch64::{vld1q_u8, vmaxvq_u8, vorrq_u8};
 
+    if bytes.len() < ASCII_NARROW_BYTES {
+        return scan_scalar(tables.set, bytes);
+    }
+    // SAFETY: both lookup tables contain exactly sixteen initialized bytes,
+    // and retained/static dispatch proved NEON before entering this leaf.
+    let (columns, high_nibble_bits) = unsafe {
+        (
+            vld1q_u8(tables.columns.as_ptr()),
+            vld1q_u8(HIGH_NIBBLE_BITS.as_ptr()),
+        )
+    };
     let mut nonmember_run_len = 0_usize;
     let mut examined_bytes = 0_usize;
-    let mut blocks = bytes.chunks_exact(ASCII_NARROW_BYTES);
-    for block in &mut blocks {
-        let block: &[u8; ASCII_NARROW_BYTES] = block
+    let mut groups = bytes.chunks_exact(ASCII_WIDE_BYTES);
+    for group in &mut groups {
+        let first: &[u8; ASCII_NARROW_BYTES] = group[..ASCII_NARROW_BYTES]
             .try_into()
-            .expect("chunks_exact yields one exact NEON block");
-        // SAFETY: `block` and both lookup tables are initialized exact-width
-        // arrays, and this leaf is reachable only with NEON authenticated.
-        let (input, columns, high_nibble_bits) = unsafe {
+            .expect("a two-vector group has one exact first NEON block");
+        let second: &[u8; ASCII_NARROW_BYTES] = group[ASCII_NARROW_BYTES..]
+            .try_into()
+            .expect("a two-vector group has one exact second NEON block");
+        // SAFETY: both array references prove their exact load extents and
+        // this leaf is itself entered only after NEON authorization.
+        let (first_members, second_members) = unsafe {
             (
-                vld1q_u8(block.as_ptr()),
-                vld1q_u8(tables.columns.as_ptr()),
-                vld1q_u8(HIGH_NIBBLE_BITS.as_ptr()),
+                member_lanes_neon(columns, high_nibble_bits, first),
+                member_lanes_neon(columns, high_nibble_bits, second),
             )
         };
-        let low_nibbles = vandq_u8(input, vdupq_n_u8(0x0f));
-        let high_nibbles = vshrq_n_u8::<4>(input);
-        let selected_columns = vqtbl1q_u8(columns, low_nibbles);
-        let selected_high_bits = vqtbl1q_u8(high_nibble_bits, high_nibbles);
-        let selected_bits = vandq_u8(selected_columns, selected_high_bits);
-        let member_lanes = vcgtq_u8(selected_bits, vdupq_n_u8(0));
+        examined_bytes = examined_bytes
+            .checked_add(ASCII_WIDE_BYTES)
+            .expect("a slice's two-vector group count fits in usize");
+        if vmaxvq_u8(vorrq_u8(first_members, second_members)) != 0 {
+            let (block_offset, block) = if vmaxvq_u8(first_members) != 0 {
+                (0_usize, first)
+            } else {
+                (ASCII_NARROW_BYTES, second)
+            };
+            let recovery = scan_scalar(tables.set, block);
+            return AsciiNonMemberRunResult::new(
+                nonmember_run_len
+                    .checked_add(block_offset)
+                    .and_then(|length| length.checked_add(recovery.nonmember_run_len()))
+                    .expect("a member lane stays within its two-vector group"),
+                examined_bytes
+                    .checked_add(recovery.examined_bytes())
+                    .expect("two-vector probing plus one scalar block fits in usize"),
+            );
+        }
+        nonmember_run_len = nonmember_run_len
+            .checked_add(ASCII_WIDE_BYTES)
+            .expect("a completed two-vector group stays within its slice");
+    }
+
+    let remainder = groups.remainder();
+    let mut tail = remainder;
+    if remainder.len() >= ASCII_NARROW_BYTES {
+        let block: &[u8; ASCII_NARROW_BYTES] = remainder[..ASCII_NARROW_BYTES]
+            .try_into()
+            .expect("a wide remainder has one exact NEON block");
+        // SAFETY: the block reference proves the exact load extent and this
+        // leaf is entered only after NEON authorization.
+        let member_lanes = unsafe { member_lanes_neon(columns, high_nibble_bits, block) };
         examined_bytes = examined_bytes
             .checked_add(ASCII_NARROW_BYTES)
-            .expect("a slice's vector block count fits in usize");
+            .expect("a trailing vector probe fits in usize");
         if vmaxvq_u8(member_lanes) != 0 {
             let recovery = scan_scalar(tables.set, block);
             return AsciiNonMemberRunResult::new(
@@ -320,8 +387,10 @@ unsafe fn scan_neon(tables: &AsciiRunTables, bytes: &[u8]) -> AsciiNonMemberRunR
         nonmember_run_len = nonmember_run_len
             .checked_add(ASCII_NARROW_BYTES)
             .expect("a completed vector block stays within its slice");
+        tail = &remainder[ASCII_NARROW_BYTES..];
     }
-    let tail = scan_scalar(tables.set, blocks.remainder());
+
+    let tail = scan_scalar(tables.set, tail);
     AsciiNonMemberRunResult::new(
         nonmember_run_len
             .checked_add(tail.nonmember_run_len())
@@ -509,7 +578,7 @@ const GENERIC_VARIANTS: [KernelVariant<ScanEntry>; 2] = [
         VectorKind::Fixed {
             bytes: NARROW_VECTOR_BYTES,
         },
-        ASCII_NARROW_BYTES,
+        ASCII_WIDE_BYTES,
         100,
         scan_entry!(scan_neon),
     ),
@@ -536,7 +605,7 @@ const SMALL_MEMBER_VARIANTS: [KernelVariant<ScanEntry>; 4] = [
         VectorKind::Fixed {
             bytes: NARROW_VECTOR_BYTES,
         },
-        ASCII_NARROW_BYTES,
+        ASCII_WIDE_BYTES,
         100,
         scan_entry!(scan_neon),
     ),
@@ -567,7 +636,7 @@ const GENERIC_VARIANTS: [KernelVariant<ScanEntry>; 2] = [
         VectorKind::Fixed {
             bytes: NARROW_VECTOR_BYTES,
         },
-        ASCII_NARROW_BYTES,
+        ASCII_WIDE_BYTES,
         100,
         scan_entry!(scan_neon),
     ),
@@ -665,7 +734,7 @@ const fn automatic_selection(table_mode: AsciiRunTableMode) -> SelectionReceipt 
                     bytes: NARROW_VECTOR_BYTES,
                 },
                 SELECTION_INPUT_BYTES,
-                ASCII_NARROW_BYTES,
+                ASCII_WIDE_BYTES,
             )
         }
     }
@@ -686,7 +755,7 @@ const fn automatic_selection(_table_mode: AsciiRunTableMode) -> SelectionReceipt
             bytes: NARROW_VECTOR_BYTES,
         },
         SELECTION_INPUT_BYTES,
-        ASCII_NARROW_BYTES,
+        ASCII_WIDE_BYTES,
     )
 }
 
@@ -964,13 +1033,16 @@ unsafe fn static_scan(
 #[cfg(test)]
 mod tests {
     use super::{
-        ASCII_NONMEMBER_RUN_MAX_CLASSIFICATION_OVERHEAD,
+        ASCII_NARROW_BYTES, ASCII_NONMEMBER_RUN_MAX_CLASSIFICATION_OVERHEAD,
         ASCII_NONMEMBER_RUN_SCANNER_BUILD_WORK, AsciiByteSetNonMemberScanner,
-        AsciiNonMemberRunResult, SCALAR_VARIANT_ID, SELECTION_INPUT_BYTES, scan_scalar,
+        ASCII_WIDE_BYTES, AsciiNonMemberRunResult, SCALAR_VARIANT_ID, SELECTION_INPUT_BYTES,
+        scan_scalar,
     };
     use crate::{AsciiByteSet, DispatchPolicy, Feature, VectorKind};
+    #[cfg(any(not(feature = "static-dispatch"), target_arch = "aarch64"))]
+    use crate::FeatureSet;
     #[cfg(not(feature = "static-dispatch"))]
-    use crate::{FeatureSet, SimdDispatchContext};
+    use crate::SimdDispatchContext;
 
     fn singleton(byte: u8) -> AsciiByteSet {
         assert!(byte.is_ascii());
@@ -1115,6 +1187,61 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_two_vector_groups_preserve_exact_boundary_and_work_accounting() {
+        if !crate::host().usable().contains(Feature::ArmNeon) {
+            return;
+        }
+        let set = AsciiByteSet::from_words([0x0000_0000_0001_ffff, 0]);
+        let scanner = AsciiByteSetNonMemberScanner::with_policy(
+            set,
+            DispatchPolicy::AllowOnly(FeatureSet::of(Feature::ArmNeon)),
+        )
+        .expect("the authentic AArch64 host supports the NEON scanner");
+        assert_eq!(
+            scanner.selection().variant_id,
+            "ascii-byte-set.nonmember-run.neon2x16.v1",
+        );
+        assert_eq!(scanner.selection().minimum_input_bytes, ASCII_WIDE_BYTES);
+
+        for len in 0_usize..=97 {
+            for boundary in 0..=len {
+                let mut bytes = vec![0x80; len];
+                if boundary < len {
+                    bytes[boundary] = 0;
+                }
+                let observed = scanner.scan_forward(&bytes);
+                assert_eq!(observed.nonmember_run_len(), boundary);
+                assert_eq!(
+                    observed.examined_bytes(),
+                    expected_neon_examined_bytes(len, boundary),
+                    "len={len} boundary={boundary}",
+                );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn expected_neon_examined_bytes(len: usize, boundary: usize) -> usize {
+        if boundary == len {
+            return len;
+        }
+        let group_start = (boundary / ASCII_WIDE_BYTES) * ASCII_WIDE_BYTES;
+        if group_start + ASCII_WIDE_BYTES <= len {
+            return group_start
+                + ASCII_WIDE_BYTES
+                + (boundary - group_start) % ASCII_NARROW_BYTES
+                + 1;
+        }
+        if len - group_start >= ASCII_NARROW_BYTES
+            && boundary < group_start + ASCII_NARROW_BYTES
+        {
+            return group_start + ASCII_NARROW_BYTES + (boundary - group_start) + 1;
+        }
+        boundary + 1
+    }
+
     #[test]
     fn mixed_high_and_ascii_nonmembers_continue_until_an_actual_member() {
         let bytes = [0x80, 0xff, b'!', 0x00, 0xc1];
@@ -1188,10 +1315,10 @@ mod tests {
                 assert_eq!(receipt.vector, VectorKind::Scalar);
                 assert_eq!(receipt.minimum_input_bytes, 0);
             }
-            "ascii-byte-set.nonmember-run.neon.v1" => {
+            "ascii-byte-set.nonmember-run.neon2x16.v1" => {
                 assert_eq!(receipt.required, crate::FeatureSet::of(Feature::ArmNeon));
                 assert_eq!(receipt.vector, VectorKind::Fixed { bytes: 16 });
-                assert_eq!(receipt.minimum_input_bytes, 16);
+                assert_eq!(receipt.minimum_input_bytes, 32);
             }
             "ascii-byte-set.nonmember-run.sse2-match16.v1" => {
                 assert_eq!(receipt.required, crate::FeatureSet::of(Feature::X86Sse2));
@@ -1221,6 +1348,7 @@ mod tests {
     #[test]
     fn construction_work_and_result_layout_are_exact() {
         assert_eq!(ASCII_NONMEMBER_RUN_SCANNER_BUILD_WORK, 130);
+        assert_eq!(ASCII_NONMEMBER_RUN_MAX_CLASSIFICATION_OVERHEAD, 32);
         assert_eq!(
             core::mem::size_of::<AsciiNonMemberRunResult>(),
             2 * core::mem::size_of::<usize>(),
