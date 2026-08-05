@@ -3956,7 +3956,7 @@ impl BoundedLiteralClassRunPlan {
         }
         self.find_prefix_value(&haystack[window.start()..window.end()])
             .map(|(start, end)| {
-                Ok((
+                Ok::<(usize, usize), ReduceError>((
                     window.start().checked_add(start).ok_or(
                         ReduceError::ArithmeticOverflow {
                             computation: "absolute finite value match start",
