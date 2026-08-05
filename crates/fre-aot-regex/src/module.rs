@@ -1203,11 +1203,11 @@ fn lower_native_partial_prepared(
     // receipt exactly matches the portable primary offset/membership and is a
     // supported SIMD tier.
     // The prepared emitter below is the sole caller of the resulting local
-    // core symbol. Before that call it validates the original raw ABI,
-    // authenticates preflight's bounded exact window, and reloads the same
-    // haystack and length. Status-specific payloads return in caller-saved
-    // registers to this wrapper. Keep that contract separate from every public
-    // native entry.
+    // core symbol. Before that call the authoritative runtime preflight
+    // validates the original raw ABI and authenticates a bounded exact
+    // window; the wrapper then reloads the same haystack and length. The
+    // native core returns status-specific payloads in caller-saved registers.
+    // Keep this explicit contract separate from every public native entry.
     let Some(native) = lower_native_dfa_with_entry_contract(
         view.native,
         target,
@@ -10225,7 +10225,7 @@ fn lower_x86_64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), Ob
 
 #[allow(
     clippy::too_many_lines,
-    reason = "the prepared SysV entry keeps validation, preflight, private native outcome, and continuation marshaling contiguous"
+    reason = "the prepared SysV entry keeps helper validation, preflight, private native outcome, and continuation marshaling contiguous"
 )]
 fn lower_x86_64_partial_prepared(
     view: &NativePartialProgramView<'_>,
@@ -10245,29 +10245,16 @@ fn lower_x86_64_partial_prepared(
     let native_selected_end = span_recovery.then(|| assembler.label()).transpose()?;
     let native_pending_ready = assembler.label()?;
     let native_invalid = assembler.label()?;
-    let invalid = assembler.label()?;
-    let invalid_handle = assembler.label()?;
     let fallback_runtime = assembler.label()?;
 
-    // Exclusive prepared ABI: handle, haystack, length, start, end, result.
-    assembler.instruction(&[0x48, 0x85, 0xff])?; // test rdi, rdi
-    assembler.branch(&[0x0f, 0x84], invalid_handle)?;
-    assembler.instruction(&[0x48, 0x85, 0xd2])?; // test rdx, rdx
-    assembler.branch(&[0x0f, 0x88], invalid)?;
-    assembler.instruction(&[0x49, 0x39, 0xd0])?; // cmp r8, rdx
-    assembler.branch(&[0x0f, 0x87], invalid)?;
-    assembler.instruction(&[0x4c, 0x39, 0xc1])?; // cmp rcx, r8
-    assembler.branch(&[0x0f, 0x87], invalid)?;
-    assembler.instruction(&[0x4d, 0x85, 0xc9])?; // test r9, r9
-    assembler.branch(&[0x0f, 0x84], invalid)?;
-    assembler.instruction(&[0x41, 0xf6, 0xc1, 0x07])?;
-    assembler.branch(&[0x0f, 0x85], invalid)?;
-    assembler.instruction(&[0x48, 0x85, 0xf6])?; // test rsi, rsi
-    assembler.branch(&[0x0f, 0x84], invalid)?;
-
-    // Preserve the portable executor's amortization floor. RAX is
-    // caller-saved, and the six public arguments remain untouched for the
-    // ordinary prepared-helper tail branch.
+    // The selected runtime helper is the sole raw-ABI validator. Short calls
+    // tail-branch to the ordinary helper, while longer calls enter native code
+    // only after the preflight helper has validated the same arguments and
+    // returned an authenticated exact window. Computing this wrapping length
+    // is safe for malformed windows: an underflow can only choose a helper,
+    // and both helpers reject it before reading either caller extent.
+    // RAX is caller-saved, and the six public arguments remain untouched for
+    // the ordinary prepared-helper tail branch.
     assembler.instruction(&[0x4c, 0x89, 0xc0])?; // mov r8, rax
     assembler.instruction(&[0x48, 0x29, 0xc8])?; // sub rcx, rax
     let minimum = u32::try_from(PARTIAL_DFA_MIN_INPUT_BYTES)
@@ -10425,13 +10412,6 @@ fn lower_x86_64_partial_prepared(
     assembler.bind(native_invalid)?;
     assembler.instruction(&[0xb8, 2, 0, 0, 0])?;
     assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
-    assembler.instruction(&[0xc3])?;
-
-    assembler.bind(invalid)?;
-    assembler.instruction(&[0xb8, 2, 0, 0, 0])?;
-    assembler.instruction(&[0xc3])?;
-    assembler.bind(invalid_handle)?;
-    assembler.instruction(&[0xb8, 5, 0, 0, 0])?;
     assembler.instruction(&[0xc3])?;
 
     assembler.bind(fallback_runtime)?;
@@ -16035,7 +16015,7 @@ fn lower_aarch64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), O
 
 #[allow(
     clippy::too_many_lines,
-    reason = "the prepared AAPCS64 entry keeps validation, preflight, private native outcome, and continuation marshaling contiguous"
+    reason = "the prepared AAPCS64 entry keeps helper validation, preflight, private native outcome, and continuation marshaling contiguous"
 )]
 fn lower_aarch64_partial_prepared(
     view: &NativePartialProgramView<'_>,
@@ -16051,27 +16031,11 @@ fn lower_aarch64_partial_prepared(
     let native_selected_end = span_recovery.then(|| assembler.label()).transpose()?;
     let native_pending_ready = assembler.label()?;
     let native_invalid = assembler.label()?;
-    let invalid = assembler.label()?;
-    let invalid_handle = assembler.label()?;
     let fallback_runtime = assembler.label()?;
 
-    // Exclusive prepared ABI: handle, haystack, length, start, end, result.
-    assembler.instruction(aarch64_cmp_x_imm(0, 0)?)?;
-    assembler.branch_cond(AARCH64_EQ, invalid_handle)?;
-    assembler.instruction(aarch64_cmp_x_imm(2, 0)?)?;
-    assembler.branch_cond(AARCH64_MI, invalid)?;
-    assembler.instruction(aarch64_cmp_x(4, 2)?)?;
-    assembler.branch_cond(AARCH64_HI, invalid)?;
-    assembler.instruction(aarch64_cmp_x(3, 4)?)?;
-    assembler.branch_cond(AARCH64_HI, invalid)?;
-    assembler.instruction(aarch64_cmp_x_imm(5, 0)?)?;
-    assembler.branch_cond(AARCH64_EQ, invalid)?;
-    assembler.instruction(aarch64_and_low_x(6, 5, 3)?)?;
-    assembler.instruction(aarch64_cmp_x_imm(6, 0)?)?;
-    assembler.branch_cond(AARCH64_NE, invalid)?;
-    assembler.instruction(aarch64_cmp_x_imm(1, 0)?)?;
-    assembler.branch_cond(AARCH64_EQ, invalid)?;
-
+    // The runtime helper is the sole raw-ABI validator. A wrapping subtraction
+    // can only select the ordinary helper or authenticated preflight; neither
+    // path reads caller memory until it has rejected malformed arguments.
     // X6 is caller-saved, and x0..x5 retain the ordinary prepared-helper ABI
     // for the short-window tail branch.
     assembler.instruction(aarch64_sub_x_reg(6, 4, 3)?)?;
@@ -16223,13 +16187,6 @@ fn lower_aarch64_partial_prepared(
     assembler.instruction(aarch64_movz_w(0, 2)?)?;
     assembler.instruction(aarch64_load_x_imm(30, 31, 72)?)?;
     assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
-    assembler.instruction(0xd65f_03c0)?;
-
-    assembler.bind(invalid)?;
-    assembler.instruction(aarch64_movz_w(0, 2)?)?;
-    assembler.instruction(0xd65f_03c0)?;
-    assembler.bind(invalid_handle)?;
-    assembler.instruction(aarch64_movz_w(0, 5)?)?;
     assembler.instruction(0xd65f_03c0)?;
 
     assembler.bind(fallback_runtime)?;
@@ -19900,7 +19857,7 @@ mod tests {
             .expect("partial prepared view");
 
         let (x86, x86_relocations) = lower_x86_64_partial_prepared(&view).unwrap();
-        assert_eq!(x86.len(), 402, "x86 compact-resume prepared wrapper size");
+        assert_eq!(x86.len(), 326, "x86 combined prepared wrapper size");
         assert_eq!(
             x86_relocations
                 .iter()
@@ -19919,7 +19876,10 @@ mod tests {
                 .iter()
                 .all(|relocation| relocation.symbol != PARTIAL_TABLE_SYMBOL)
         );
-        assert!(x86.starts_with(&[0x48, 0x85, 0xff]));
+        // The wrapper computes only the admission-floor dispatch before an
+        // authoritative runtime helper validates the raw ABI.
+        assert!(x86.starts_with(&[0x4c, 0x89, 0xc0, 0x48, 0x29, 0xc8]));
+        assert!(!x86.windows(3).any(|bytes| bytes == [0x48, 0x85, 0xff]));
         let mut x86_floor = vec![0x48, 0x3d];
         x86_floor.extend_from_slice(
             &u32::try_from(PARTIAL_DFA_MIN_INPUT_BYTES)
@@ -19962,8 +19922,8 @@ mod tests {
         let (aarch64, aarch64_relocations) = lower_aarch64_partial_prepared(&view).unwrap();
         assert_eq!(
             aarch64.len(),
-            400,
-            "AArch64 compact-resume prepared wrapper size"
+            324,
+            "AArch64 combined prepared wrapper size"
         );
         assert_eq!(
             aarch64_relocations
@@ -19988,6 +19948,7 @@ mod tests {
             .chunks_exact(4)
             .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
             .collect::<Vec<_>>();
+        assert_eq!(words.first(), Some(&aarch64_sub_x_reg(6, 4, 3).unwrap()));
         assert!(words.contains(&aarch64_sub_x_imm(31, 31, 80).unwrap()));
         assert!(words.contains(&aarch64_store_x(30, 31, 72).unwrap()));
         assert!(words.contains(&aarch64_mov_x(5, 2).unwrap()));
@@ -21424,13 +21385,17 @@ mod tests {
              uint32_t fre_aot_regex_runtime_search_exclusive_v1(\
                handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,size_t*r){{\
                fallback_calls++;\
-               if(h!=(handle_t)(uintptr_t)0x1234U||p!=haystack||n!=sizeof(haystack)||s!={window_start}U||r==NULL)return 89U;\
+               if(h==(handle_t)0)return 5U;\
+               if(p==NULL||r==NULL||s>e||e>n)return 2U;\
+               if(h!=(handle_t)(uintptr_t)0x1234U||p!=haystack||n!=sizeof(haystack)||s!={window_start}U)return 89U;\
                if(expect_path==1&&e=={final_hole_end}U){{r[0]={fallback_start}U;r[1]={fallback_end}U;return {fallback_status}U;}}\
                return 89U;}}\n\
              uint32_t fre_aot_regex_runtime_search_exclusive_partial_preflight_v1(\
                handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,size_t*r,const unsigned char*d,window_t*w){{\
-               preflight_calls++;if(h!=(handle_t)(uintptr_t)0x1234U||p!=haystack||n!=sizeof(haystack)||\
-                  s!={window_start}U||e!={window_end}U||r==NULL||w==NULL||memcmp(d,identity,32U)!=0)return 88U;\
+               preflight_calls++;if(h==(handle_t)0)return 5U;\
+               if(p==NULL||r==NULL||d==NULL||w==NULL||s>e||e>n)return 2U;\
+               if(h!=(handle_t)(uintptr_t)0x1234U||p!=haystack||n!=sizeof(haystack)||\
+                  s!={window_start}U||e!={window_end}U||memcmp(d,identity,32U)!=0)return 88U;\
                if(expect_path==2){{w->start={narrowed_start}U;w->end=e;return 6U;}}\
                if(expect_path==3){{r[0]=321U;r[1]=654U;return 76U;}}return 88U;}}\n\
              uint32_t fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v1(\
@@ -21463,7 +21428,22 @@ mod tests {
         .unwrap();
         writeln!(
             source,
-            "expect_path=0;r[0]=91U;r[1]=92U;status={symbol}((handle_t)0,haystack,sizeof(haystack),{window_start}U,{window_end}U,r);if(status!=5U||r[0]!=91U||r[1]!=92U)return 13;"
+            "expect_path=0;fallback_calls=0;preflight_calls=0;r[0]=91U;r[1]=92U;status={symbol}((handle_t)0,haystack,sizeof(haystack),{window_start}U,{window_end}U,r);if(status!=5U||r[0]!=91U||r[1]!=92U||fallback_calls!=0||preflight_calls!=1)return 13;"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "fallback_calls=0;preflight_calls=0;status={symbol}((handle_t)0,haystack,sizeof(haystack),{window_start}U,{window_start}U,r);if(status!=5U||fallback_calls!=1||preflight_calls!=0)return 14;"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "fallback_calls=0;preflight_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234U,haystack,sizeof(haystack),{window_end}U,{window_start}U,r);if(status!=2U||fallback_calls!=0||preflight_calls!=1)return 15;"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "fallback_calls=0;preflight_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234U,haystack,sizeof(haystack),sizeof(haystack),sizeof(haystack)+1U,r);if(status!=2U||fallback_calls!=1||preflight_calls!=0)return 16;"
         )
         .unwrap();
         source.push_str("return 0;}\n");
