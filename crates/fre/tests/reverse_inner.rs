@@ -2,8 +2,8 @@ use fre::{
     AggregateBuildAccounting, AggregateBuildError, AggregateBuildLimits, AggregateBuilder,
     AggregateExecutionDetails, AggregateExecutionSource, AggregatePlanIdentity, AggregatePlanKind,
     AggregateRetainedFullWindowUpperBounds, AggregateRunLimits, REVERSE_INNER_COUNT_OPERATION_ID,
-    REVERSE_INNER_SPAN_SUM_OPERATION_ID, ReverseInnerBuildError, ReverseInnerReduceError,
-    RustProfile,
+    REVERSE_INNER_SPAN_SUM_OPERATION_ID, REVERSE_INNER_UNION_ACCOUNTING_ID,
+    REVERSE_INNER_UNION_PLAN_ID, ReverseInnerBuildError, ReverseInnerReduceError, RustProfile,
 };
 use regex::bytes::{Regex, RegexBuilder};
 
@@ -58,6 +58,11 @@ fn unfactored_and_factored_tom_shapes_select_reverse_inner() {
         );
         assert_eq!(identity.kernel.literal_count, 2);
         assert_eq!(identity.kernel.literal_bytes, 10);
+        assert_eq!(identity.kernel.plan_id, REVERSE_INNER_UNION_PLAN_ID);
+        assert_eq!(
+            identity.kernel.accounting_id,
+            REVERSE_INNER_UNION_ACCOUNTING_ID
+        );
         assert!(identity.kernel.unicode);
         assert!(identity.kernel.greedy);
         assert!(identity.kernel.leftmost_first);
@@ -67,6 +72,8 @@ fn unfactored_and_factored_tom_shapes_select_reverse_inner() {
         };
         assert_eq!(build.literal_count, 2);
         assert_eq!(build.literal_bytes, 10);
+        assert_eq!(build.distinct_literal_first_bytes, 2);
+        assert!(build.adaptive_union);
         assert_eq!(
             count.build_report().retained_capacity_bytes,
             build.persistent_bytes
@@ -115,6 +122,23 @@ fn unfactored_and_factored_tom_shapes_select_reverse_inner() {
             expected.0
         );
     }
+}
+
+#[test]
+fn canonical_middle_literal_alternation_selects_adaptive_union() {
+    let pattern = r"[a-zλ]+(?:ab|cd|ef|gh)[a-zλ]+";
+    let plan = builder(pattern).build_count().expect("middle alternation build");
+    assert_eq!(plan.build_report().plan, AggregatePlanKind::ReverseInner);
+    let AggregatePlanIdentity::ReverseInner(identity) = plan.build_report().plan_identity else {
+        panic!("middle alternation retained another identity");
+    };
+    assert_eq!(identity.kernel.literal_count, 4);
+    assert_eq!(identity.kernel.plan_id, REVERSE_INNER_UNION_PLAN_ID);
+    let AggregateBuildAccounting::ReverseInner(build) = plan.build_report().build else {
+        panic!("middle alternation retained another build receipt");
+    };
+    assert!(build.adaptive_union);
+    assert_eq!(build.distinct_literal_first_bytes, 4);
 }
 
 #[test]

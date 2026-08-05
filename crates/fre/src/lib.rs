@@ -581,10 +581,12 @@ pub use fre_kernels::{
     PrefixClassUniformParticipationError, PrefixClassUniformParticipationIdentity,
     PrefixClassUniformParticipationInvocation, PrefixClassUniformParticipationLimits,
     PrefixClassUniformParticipationProspective, PrefixClassUniformParticipationResult,
-    PrefixClassUniformParticipationSchema, REVERSE_INNER_COUNT_OPERATION_ID,
-    REVERSE_INNER_EXISTS_OPERATION_ID,
-    REVERSE_INNER_MAX_LITERALS, REVERSE_INNER_PLAN_ID, REVERSE_INNER_SEARCH_OPERATION_ID,
+    PrefixClassUniformParticipationSchema, REVERSE_INNER_ACCOUNTING_ID,
+    REVERSE_INNER_COUNT_OPERATION_ID, REVERSE_INNER_EXISTS_OPERATION_ID,
+    REVERSE_INNER_MAX_ADMITTED_ASCII_SCALARS, REVERSE_INNER_MAX_LITERALS,
+    REVERSE_INNER_PLAN_ID, REVERSE_INNER_SEARCH_OPERATION_ID,
     REVERSE_INNER_SHORTEST_SEARCH_OPERATION_ID, REVERSE_INNER_SPAN_SUM_OPERATION_ID,
+    REVERSE_INNER_UNION_ACCOUNTING_ID, REVERSE_INNER_UNION_PLAN_ID,
     ReverseInnerActualCounters, ReverseInnerBuildAccounting, ReverseInnerBuildError,
     ReverseInnerBuildLimits, ReverseInnerOperation, ReverseInnerOperationIdentity,
     ReverseInnerPlan, ReverseInnerReduceAccounting, ReverseInnerReduceError,
@@ -5574,7 +5576,7 @@ impl PortablePlan {
             Self::GuardedLiteralSet(plan) => plan.plan_id(),
             Self::NullableOptionalChain(_) => nullable_optional_chain::PLAN_ID,
             Self::NullableFiniteTokenRepeat(_) => nullable_finite_token_repeat::PLAN_ID,
-            Self::ReverseInner(_) => REVERSE_INNER_PLAN_ID,
+            Self::ReverseInner(plan) => plan.plan_id(),
         }
     }
 }

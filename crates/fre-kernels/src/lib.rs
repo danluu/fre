@@ -534,10 +534,13 @@ pub use required_literal::{
     SearchLimits as RequiredLiteralSearchLimits,
 };
 pub use reverse_inner::{
+    ACCOUNTING_ID as REVERSE_INNER_ACCOUNTING_ID,
     BuildAccounting as ReverseInnerBuildAccounting, BuildError as ReverseInnerBuildError,
     BuildLimits as ReverseInnerBuildLimits, COUNT_OPERATION_ID as REVERSE_INNER_COUNT_OPERATION_ID,
-    CountResult as ReverseInnerCountResult, MAX_LITERALS as REVERSE_INNER_MAX_LITERALS,
+    CountResult as ReverseInnerCountResult,
     EXISTS_OPERATION_ID as REVERSE_INNER_EXISTS_OPERATION_ID,
+    MAX_ADMITTED_ASCII_SCALARS as REVERSE_INNER_MAX_ADMITTED_ASCII_SCALARS,
+    MAX_LITERALS as REVERSE_INNER_MAX_LITERALS,
     Operation as ReverseInnerOperation, OperationIdentity as ReverseInnerOperationIdentity,
     PLAN_ID as REVERSE_INNER_PLAN_ID, ReduceAccounting as ReverseInnerReduceAccounting,
     ReduceActualCounters as ReverseInnerActualCounters, ReduceError as ReverseInnerReduceError,
@@ -548,6 +551,8 @@ pub use reverse_inner::{
     SearchAccounting as ReverseInnerSearchAccounting, SearchError as ReverseInnerSearchError,
     SearchLimits as ReverseInnerSearchLimits, Semantics as ReverseInnerSemantics,
     SpanSumResult as ReverseInnerSpanSumResult,
+    UNION_ACCOUNTING_ID as REVERSE_INNER_UNION_ACCOUNTING_ID,
+    UNION_PLAN_ID as REVERSE_INNER_UNION_PLAN_ID,
 };
 pub use sparse_ordered_literal_aggregate::{
     ALGORITHM_ID as SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,

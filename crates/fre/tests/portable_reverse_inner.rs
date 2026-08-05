@@ -1,5 +1,6 @@
 use fre::{
-    PlanKind, PlanSelection, PortableBuilder, PortableFindIterLimits, SearchAccounting,
+    PlanKind, PlanSelection, PortableBuilder, PortableFindIterLimits,
+    REVERSE_INNER_UNION_ACCOUNTING_ID, REVERSE_INNER_UNION_PLAN_ID, SearchAccounting,
     SearchError, SearchLimits, SearchWindow,
 };
 use regex::bytes::{Regex, RegexBuilder};
@@ -143,10 +144,10 @@ fn every_small_window_matches_the_slice_oracle() {
 #[test]
 fn overlap_duplicates_and_source_order_do_not_change_group_zero() {
     for pattern in [
-        r"[ab]+aa[ab]+",
-        r"(?:[ab]+(?:aa)[ab]+|[ab]+(?:a)[ab]+|[ab]+(?:aa)[ab]+)",
-        r"[ab]+(?:(?:aa)[ab]+|(?:a)[ab]+|(?:aa)[ab]+)",
-        r"(([ab]+)(aa)([ab]+))|(([ab]+)(a)([ab]+))",
+        r"[abλ]+aa[abλ]+",
+        r"(?:[abλ]+(?:aa)[abλ]+|[abλ]+(?:a)[abλ]+|[abλ]+(?:aa)[abλ]+)",
+        r"[abλ]+(?:(?:aa)[abλ]+|(?:a)[abλ]+|(?:aa)[abλ]+)",
+        r"(([abλ]+)(aa)([abλ]+))|(([abλ]+)(a)([abλ]+))",
     ] {
         for haystack in [
             b"".as_slice(),
@@ -217,8 +218,8 @@ fn accounting_refuses_one_below_source_independent_work_bound() {
 
 #[test]
 fn calls_are_plan_local_and_observe_same_address_mutation() {
-    let aa = fre(r"[ab]+aa[ab]+");
-    let bb = fre(r"[ab]+bb[ab]+");
+    let aa = fre(r"[abλ]+aa[abλ]+");
+    let bb = fre(r"[abλ]+bb[abλ]+");
     let mut haystack = b"xaaabx".to_vec();
     let address = haystack.as_ptr();
     assert!(aa.is_match_value(&haystack, SearchLimits::unlimited()).unwrap());
@@ -227,6 +228,58 @@ fn calls_are_plan_local_and_observe_same_address_mutation() {
     assert_eq!(haystack.as_ptr(), address);
     assert!(!aa.is_match_value(&haystack, SearchLimits::unlimited()).unwrap());
     assert!(bb.is_match_value(&haystack, SearchLimits::unlimited()).unwrap());
+}
+
+#[test]
+fn middle_alternation_auto_uses_union_and_matches_force_k0() {
+    let pattern = r"[a-zλ]+(?:ab|cd|ef|gh)[a-zλ]+";
+    let automatic = fre(pattern);
+    let forced = PortableBuilder::new(pattern)
+        .unicode(true)
+        .plan_selection(PlanSelection::ForceK0)
+        .build()
+        .expect("forced K0 middle alternation");
+    assert_eq!(forced.build_report().plan, PlanKind::K0);
+    let haystack = b"xxabcdyy-\xce\xbbzzefqq\xce\xbb-absent";
+    let (_, accounting) = automatic
+        .find(haystack, SearchLimits::unlimited())
+        .expect("adaptive union search");
+    let SearchAccounting::ReverseInner(accounting) = accounting else {
+        panic!("middle alternation search retained another route");
+    };
+    assert_eq!(accounting.identity.plan_id, REVERSE_INNER_UNION_PLAN_ID);
+    assert_eq!(
+        accounting.identity.accounting_id,
+        REVERSE_INNER_UNION_ACCOUNTING_ID
+    );
+    assert_eq!(
+        automatic
+            .find_value(haystack, SearchLimits::unlimited())
+            .expect("automatic middle alternation search"),
+        forced
+            .find_value(haystack, SearchLimits::unlimited())
+            .expect("forced middle alternation search")
+    );
+}
+
+#[test]
+fn structural_gate_keeps_ascii_byte_dense_and_negated_classes_off_reverse_inner() {
+    for pattern in [
+        r"[a-z]+ab[a-z]+",
+        r"(?-u:[a-z]+ab[a-z]+)",
+        r"[\x00-\x7Fλ]+ab[\x00-\x7Fλ]+",
+        r"[^x]+ab[^x]+",
+    ] {
+        let automatic = PortableBuilder::new(pattern)
+            .unicode(true)
+            .build()
+            .expect("automatic structural-gate fallback");
+        assert_ne!(
+            automatic.build_report().plan,
+            PlanKind::ReverseInner,
+            "structurally broad class entered reverse-inner: {pattern}"
+        );
+    }
 }
 
 #[test]

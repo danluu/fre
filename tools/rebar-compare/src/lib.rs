@@ -90,9 +90,11 @@ use fre::{
     PortableSearchSession, PrefixClassAlternationBuildError, PrefixClassAlternationBuildLimits,
     PrefixClassAlternationReduceError, PrefixClassAlternationReduceLimits,
     PrefixClassUniformParticipationBuildLimits, REVERSE_INNER_COUNT_OPERATION_ID,
-    REVERSE_INNER_PLAN_ID, REVERSE_INNER_SPAN_SUM_OPERATION_ID, ReverseInnerBuildAccounting,
-    ReverseInnerBuildError, ReverseInnerBuildLimits, ReverseInnerReduceError,
-    ReverseInnerReduceLimits, RustProfile, SHEBANG_CAPTURE_PATTERN, SHEBANG_INSPECTION_WORK,
+    REVERSE_INNER_ACCOUNTING_ID, REVERSE_INNER_PLAN_ID,
+    REVERSE_INNER_SPAN_SUM_OPERATION_ID, REVERSE_INNER_UNION_ACCOUNTING_ID,
+    REVERSE_INNER_UNION_PLAN_ID, ReverseInnerBuildAccounting, ReverseInnerBuildError,
+    ReverseInnerBuildLimits, ReverseInnerReduceError, ReverseInnerReduceLimits, RustProfile,
+    SHEBANG_CAPTURE_PATTERN, SHEBANG_INSPECTION_WORK,
     SPACE_AROUND_OPERATOR_CAPTURE_PATTERN, SPACE_AROUND_OPERATOR_INSPECTION_WORK,
     SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID,
     SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID, STRING_QUOTE_PREFIX_CAPTURE_PATTERN,
@@ -11479,6 +11481,12 @@ fn reverse_inner_operation_limits(
         .map_err(|_| ExecutionError::fault("FRE reducer limit does not fit usize"))?;
     Ok(ReverseInnerReduceLimits {
         max_input_bytes: upper.input_bytes,
+        max_union_scan_calls: upper.union_scan_calls,
+        max_union_classifications: upper.union_classifications,
+        max_union_root_candidates: upper.union_root_candidates,
+        max_union_verification_bytes: upper.union_verification_bytes,
+        max_union_exact_candidates: upper.union_exact_candidates,
+        max_union_fallbacks: upper.union_fallbacks,
         max_finder_calls: upper.finder_calls,
         max_finder_scanned_bytes: upper.finder_scanned_bytes,
         max_decode_byte_checks: upper.decode_byte_checks,
@@ -13735,12 +13743,19 @@ fn reverse_inner_plan_identity_matches(
             LiteralAggregateOperation::SpanSum
         )
     );
+    let physical_identity_matches = if build.adaptive_union {
+        identity.kernel.plan_id == REVERSE_INNER_UNION_PLAN_ID
+            && identity.kernel.accounting_id == REVERSE_INNER_UNION_ACCOUNTING_ID
+    } else {
+        identity.kernel.plan_id == REVERSE_INNER_PLAN_ID
+            && identity.kernel.accounting_id == REVERSE_INNER_ACCOUNTING_ID
+    };
     operation_matches
         && report.selection == AggregatePlanSelection::Auto
         && report.plan == AggregatePlanKind::ReverseInner
         && report.continuation_strategy.is_none()
         && report.capture_semantics == AggregateCaptureSemantics::ErasedForWholeMatchOnly
-        && identity.kernel.plan_id == REVERSE_INNER_PLAN_ID
+        && physical_identity_matches
         && identity.kernel.operation_id == expected_operation_id
         && identity.kernel.operation == expected_operation
         && identity.kernel.semantics == fre::ReverseInnerSemantics::RustBytesUnicodeUtf8False
@@ -13757,7 +13772,16 @@ fn reverse_inner_plan_identity_matches(
         && build.retained_range_capacity == build.source_ranges
         && (1..=fre::REVERSE_INNER_MAX_LITERALS).contains(&build.literal_count)
         && build.literal_bytes >= build.literal_count
-        && build.allocations == build.literal_count.saturating_add(2)
+        && (1..=build.literal_count).contains(&build.distinct_literal_first_bytes)
+        && build.adaptive_union
+            == (build.literal_count >= 2
+                && build.retained_non_ascii_ranges != 0
+                && build.ascii_scalars <= fre::REVERSE_INNER_MAX_ADMITTED_ASCII_SCALARS)
+        && build.allocations
+            == build
+                .literal_count
+                .saturating_add(2)
+                .saturating_add(usize::from(build.adaptive_union))
         && build.scratch_bytes == 0
         && build.peak_bytes == build.persistent_bytes
         && report.retained_capacity_bytes == build.persistent_bytes
@@ -15293,6 +15317,12 @@ fn literal_class_run_literal_reduce_error(
 fn reverse_inner_reduce_error(source: &ReverseInnerReduceError, message: String) -> ExecutionError {
     match source {
         ReverseInnerReduceError::InputBytesLimit { .. }
+        | ReverseInnerReduceError::UnionScanCallsLimit { .. }
+        | ReverseInnerReduceError::UnionClassificationsLimit { .. }
+        | ReverseInnerReduceError::UnionRootCandidatesLimit { .. }
+        | ReverseInnerReduceError::UnionVerificationBytesLimit { .. }
+        | ReverseInnerReduceError::UnionExactCandidatesLimit { .. }
+        | ReverseInnerReduceError::UnionFallbacksLimit { .. }
         | ReverseInnerReduceError::FinderCallsLimit { .. }
         | ReverseInnerReduceError::FinderScannedBytesLimit { .. }
         | ReverseInnerReduceError::DecodeByteChecksLimit { .. }

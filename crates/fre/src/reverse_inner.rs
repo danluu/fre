@@ -1,6 +1,8 @@
 //! Allocation-free canonical-HIR proof for the Unicode reverse-inner reducer.
 
-use fre_kernels::REVERSE_INNER_MAX_LITERALS;
+use fre_kernels::{
+    REVERSE_INNER_MAX_ADMITTED_ASCII_SCALARS, REVERSE_INNER_MAX_LITERALS,
+};
 use regex_syntax::hir::{Class, ClassUnicode, Hir, HirKind};
 
 use crate::aggregate_construction::AggregateInspectionAttemptError;
@@ -154,14 +156,12 @@ fn inspect_factored<'a>(
         }
         literals[index] = branch.literal;
     }
-    Ok(Some(Inspection::Eligible {
-        class: left,
+    Ok(Some(eligible_inspection(
+        left,
         literals,
-        literal_count: branches.len(),
-        work: budget.work,
-        hir_nodes: budget.hir_nodes,
-        captures: budget.captures,
-    }))
+        branches.len(),
+        budget,
+    )?))
 }
 
 fn inspect_unfactored<'a>(
@@ -199,14 +199,7 @@ fn inspect_unfactored<'a>(
     let Some(class) = common_class else {
         return Ok(Inspection::Ineligible { work: budget.work });
     };
-    Ok(Inspection::Eligible {
-        class,
-        literals,
-        literal_count: branches.len(),
-        work: budget.work,
-        hir_nodes: budget.hir_nodes,
-        captures: budget.captures,
-    })
+    eligible_inspection(class, literals, branches.len(), budget)
 }
 
 fn inspect_single<'a>(
@@ -223,25 +216,104 @@ fn inspect_single<'a>(
     let Some(left) = class_plus(left, budget)? else {
         return Ok(Inspection::Ineligible { work: budget.work });
     };
-    let Some(literal) = literal_node(literal, budget)? else {
+    let Some((literals, literal_count)) = middle_literals(literal, budget)? else {
         return Ok(Inspection::Ineligible { work: budget.work });
     };
     let Some(right) = class_plus(right, budget)? else {
         return Ok(Inspection::Ineligible { work: budget.work });
     };
-    if !same_class(left, right, budget)? || !literal_is_ascii_member(left, literal, budget)? {
+    if !same_class(left, right, budget)? {
         return Ok(Inspection::Ineligible { work: budget.work });
     }
+    for literal in literals.iter().take(literal_count) {
+        if !literal_is_ascii_member(left, literal, budget)? {
+            return Ok(Inspection::Ineligible { work: budget.work });
+        }
+    }
+    eligible_inspection(left, literals, literal_count, budget)
+}
+
+fn middle_literals<'a>(
+    hir: &'a Hir,
+    budget: &mut Budget,
+) -> Result<Option<([&'a [u8]; REVERSE_INNER_MAX_LITERALS], usize)>, InspectionError> {
+    let hir = transparent(hir, budget)?;
     let mut literals = [&[][..]; REVERSE_INNER_MAX_LITERALS];
-    literals[0] = literal;
+    match hir.kind() {
+        HirKind::Literal(literal) => {
+            budget.charge(
+                literal
+                    .0
+                    .len()
+                    .checked_add(1)
+                    .ok_or(InspectionError::Overflow)?,
+            )?;
+            if literal.0.is_empty() {
+                return Ok(None);
+            }
+            literals[0] = literal.0.as_ref();
+            Ok(Some((literals, 1)))
+        }
+        HirKind::Alternation(branches) => {
+            budget.charge(1)?;
+            if branches.is_empty() || branches.len() > REVERSE_INNER_MAX_LITERALS {
+                return Ok(None);
+            }
+            for (index, branch) in branches.iter().enumerate() {
+                let Some(literal) = literal_node(branch, budget)? else {
+                    return Ok(None);
+                };
+                literals[index] = literal;
+            }
+            Ok(Some((literals, branches.len())))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn eligible_inspection<'a>(
+    class: &'a ClassUnicode,
+    literals: [&'a [u8]; REVERSE_INNER_MAX_LITERALS],
+    literal_count: usize,
+    budget: &mut Budget,
+) -> Result<Inspection<'a>, InspectionError> {
+    if !sparse_mixed_unicode_class(class, budget)? {
+        return Ok(Inspection::Ineligible { work: budget.work });
+    }
     Ok(Inspection::Eligible {
-        class: left,
+        class,
         literals,
-        literal_count: 1,
+        literal_count,
         work: budget.work,
         hir_nodes: budget.hir_nodes,
         captures: budget.captures,
     })
+}
+
+fn sparse_mixed_unicode_class(
+    class: &ClassUnicode,
+    budget: &mut Budget,
+) -> Result<bool, InspectionError> {
+    let mut ascii_scalars = 0_usize;
+    let mut has_non_ascii = false;
+    for range in class.ranges() {
+        budget.charge(1)?;
+        let start = u32::from(range.start());
+        let end = u32::from(range.end());
+        if start <= 0x7f {
+            let ascii_end = end.min(0x7f);
+            let population = usize::try_from(ascii_end - start + 1)
+                .map_err(|_| InspectionError::Overflow)?;
+            ascii_scalars = ascii_scalars
+                .checked_add(population)
+                .ok_or(InspectionError::Overflow)?;
+            if ascii_scalars > REVERSE_INNER_MAX_ADMITTED_ASCII_SCALARS {
+                return Ok(false);
+            }
+        }
+        has_non_ascii |= end > 0x7f;
+    }
+    Ok(has_non_ascii && ascii_scalars <= REVERSE_INNER_MAX_ADMITTED_ASCII_SCALARS)
 }
 
 fn full_branch<'a>(
@@ -451,6 +523,21 @@ mod tests {
     }
 
     #[test]
+    fn canonical_middle_literal_alternations_through_sixteen_are_eligible() {
+        let four: [&[u8]; 4] = [b"ab", b"cd", b"ef", b"gh"];
+        assert_eligible(r"[a-zλ]+(?:ab|cd|ef|gh)[a-zλ]+", &four);
+
+        let sixteen: [&[u8]; 16] = [
+            b"ab", b"cd", b"ef", b"gh", b"ij", b"kl", b"mn", b"op", b"qr", b"st",
+            b"uv", b"wx", b"yz", b"ba", b"dc", b"fe",
+        ];
+        assert_eligible(
+            r"[a-zλ]+(?:ab|cd|ef|gh|ij|kl|mn|op|qr|st|uv|wx|yz|ba|dc|fe)[a-zλ]+",
+            &sixteen,
+        );
+    }
+
+    #[test]
     fn transparent_captures_preserve_whole_match_eligibility() {
         let expected: [&[u8]; 2] = [b"herloc", b"olme"];
         let (_, _, captures) =
@@ -496,6 +583,24 @@ mod tests {
                     Inspection::Ineligible { .. }
                 ),
                 "unexpectedly admitted {pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_gate_rejects_ascii_only_byte_dense_and_negated_classes() {
+        for pattern in [
+            r"[a-z]+ab[a-z]+",
+            r"(?-u:[a-z]+ab[a-z]+)",
+            r"[\x00-\x7Fλ]+ab[\x00-\x7Fλ]+",
+            r"[^x]+ab[^x]+",
+        ] {
+            assert!(
+                matches!(
+                    inspect(&parse(pattern), usize::MAX).unwrap(),
+                    Inspection::Ineligible { .. }
+                ),
+                "unexpectedly admitted structurally broad class: {pattern}"
             );
         }
     }
