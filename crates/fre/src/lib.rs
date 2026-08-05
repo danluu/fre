@@ -79,6 +79,7 @@ mod capture_required_literal;
 mod capture_run_alternation;
 mod capture_word_run;
 mod captures;
+mod correlated_bounded_alternation;
 mod finite;
 mod finite_root;
 mod fixed_absolute;
@@ -3579,6 +3580,7 @@ impl PortableBuilder {
                 line_total_grep_plan,
                 plan: PortablePlan::K0(PortableK0Plan {
                     automaton,
+                    correlated_terminal: None,
                     mandatory_suffix: None,
                     mandatory_cut: None,
                     negative_prefilter: None,
@@ -4950,7 +4952,7 @@ impl PortableBuilder {
             mandatory_cut_plan = None;
             mandatory_cut_storage_bytes = 0;
         }
-        let negative_prefilter = try_build_k0_negative_prefilter(
+        let mut negative_prefilter = try_build_k0_negative_prefilter(
             &rust.hir,
             minimum_match_bytes,
             self.limits,
@@ -4964,11 +4966,68 @@ impl PortableBuilder {
                 .ok_or(BuildError::PersistentBytesOverflow)?,
         )?;
         fallback_planner_work = negative_prefilter.planner_work;
+        // Inspect this specialization only after every ordinary K0 sidecar.
+        // When it is eligible and fits beside the base automaton, it replaces
+        // those sidecars as one exclusive plan: its adaptive comparison and
+        // fallback are deliberately against raw K0, so retaining another
+        // route here would bypass and mis-train that incumbent.
+        let correlated_terminal_inspection = if self.selection == PlanSelection::Auto {
+            let inspection = correlated_bounded_alternation::inspect(
+                &rust.hir,
+                fallback_planner_work,
+                self.limits.max_planner_work,
+            )
+            .map_err(|error| match error {
+                correlated_bounded_alternation::InspectionError::WorkLimit {
+                    needed,
+                    limit,
+                } => BuildError::PlannerWorkLimit { needed, limit },
+                correlated_bounded_alternation::InspectionError::ArithmeticOverflow => {
+                    BuildError::InternalInvariant(
+                        "correlated bounded-alternation planner arithmetic overflow",
+                    )
+                }
+            })?;
+            fallback_planner_work = inspection.planner_work();
+            match inspection {
+                correlated_bounded_alternation::InspectionOutcome::Eligible(inspection) => {
+                    Some(inspection)
+                }
+                correlated_bounded_alternation::InspectionOutcome::Ineligible { .. } => None,
+            }
+        } else {
+            None
+        };
+        let candidate_correlated_terminal_storage_bytes = correlated_terminal_inspection
+            .as_ref()
+            .map_or(0, |_| correlated_bounded_alternation::Plan::storage_bytes());
+        let correlated_terminal_fits = candidate_correlated_terminal_storage_bytes
+            <= available_optional_bytes;
+        let correlated_terminal = if correlated_terminal_fits {
+            correlated_terminal_inspection
+                .map(|inspection| inspection.build(SimdDispatchContext::capture()))
+        } else {
+            None
+        };
+        if correlated_terminal.is_some() {
+            mandatory_suffix_plan = None;
+            mandatory_suffix_storage_bytes = 0;
+            mandatory_cut_plan = None;
+            mandatory_cut_storage_bytes = 0;
+            negative_prefilter.plan = None;
+            negative_prefilter.storage_bytes = 0;
+        }
+        let correlated_terminal_storage_bytes = if correlated_terminal.is_some() {
+            candidate_correlated_terminal_storage_bytes
+        } else {
+            0
+        };
         let plan_storage_bytes = automaton_stats
             .storage_bytes()
             .checked_add(mandatory_suffix_storage_bytes)
             .and_then(|bytes| bytes.checked_add(mandatory_cut_storage_bytes))
             .and_then(|bytes| bytes.checked_add(negative_prefilter.storage_bytes))
+            .and_then(|bytes| bytes.checked_add(correlated_terminal_storage_bytes))
             .ok_or(BuildError::PersistentBytesOverflow)?;
         Ok(PortableRegex {
             source,
@@ -4976,6 +5035,7 @@ impl PortableBuilder {
             line_total_grep_plan,
             plan: PortablePlan::K0(PortableK0Plan {
                 automaton,
+                correlated_terminal,
                 mandatory_suffix: mandatory_suffix_plan,
                 mandatory_cut: mandatory_cut_plan,
                 negative_prefilter: negative_prefilter.plan,
@@ -5219,6 +5279,7 @@ impl TryFrom<String> for PortableRegex {
 
 struct PortableK0Plan {
     automaton: Automaton,
+    correlated_terminal: Option<correlated_bounded_alternation::Plan>,
     mandatory_suffix: Option<K0MandatorySuffixPlan>,
     mandatory_cut: Option<K0MandatoryCutPlan>,
     negative_prefilter: Option<Box<K0NegativePrefilterPlan>>,
@@ -5577,6 +5638,7 @@ impl PortableRegex {
                 )?;
                 PortableSearchSessionPlan::K0 {
                     session,
+                    correlated_terminal: k0.correlated_terminal.as_ref(),
                     mandatory_suffix: k0.mandatory_suffix.as_ref(),
                     mandatory_cut: k0.mandatory_cut.as_ref(),
                     negative_prefilter: k0.negative_prefilter.as_deref(),
@@ -5584,6 +5646,10 @@ impl PortableRegex {
                     mandatory_suffix_span_state: K0NegativePrefilterState::default(),
                     negative_prefilter_exists_state: K0NegativePrefilterState::default(),
                     negative_prefilter_span_state: K0NegativePrefilterState::default(),
+                    correlated_terminal_exists_state:
+                        correlated_bounded_alternation::RouteState::default(),
+                    correlated_terminal_span_state:
+                        correlated_bounded_alternation::RouteState::default(),
                 }
             }
             _ => PortableSearchSessionPlan::Native(self),
@@ -7487,6 +7553,7 @@ enum PortableSearchSessionPlan<'a> {
     Native(&'a PortableRegex),
     K0 {
         session: K0SearchSession<'a>,
+        correlated_terminal: Option<&'a correlated_bounded_alternation::Plan>,
         mandatory_suffix: Option<&'a K0MandatorySuffixPlan>,
         mandatory_cut: Option<&'a K0MandatoryCutPlan>,
         negative_prefilter: Option<&'a K0NegativePrefilterPlan>,
@@ -7494,6 +7561,8 @@ enum PortableSearchSessionPlan<'a> {
         mandatory_suffix_span_state: K0NegativePrefilterState,
         negative_prefilter_exists_state: K0NegativePrefilterState,
         negative_prefilter_span_state: K0NegativePrefilterState,
+        correlated_terminal_exists_state: correlated_bounded_alternation::RouteState,
+        correlated_terminal_span_state: correlated_bounded_alternation::RouteState,
     },
 }
 
@@ -8700,6 +8769,25 @@ fn replay_k0_finite_proved_start(
     start: usize,
     maximum_match_bytes: usize,
 ) -> Result<Option<Match>, SearchError> {
+    replay_k0_finite_proved_start_with_exact_receipt(
+        session,
+        haystack,
+        window,
+        limits,
+        start,
+        maximum_match_bytes,
+    )
+    .map(|(output, _)| output)
+}
+
+fn replay_k0_finite_proved_start_with_exact_receipt(
+    session: &mut K0SearchSession<'_>,
+    haystack: &[u8],
+    window: SearchWindow,
+    limits: SearchLimits,
+    start: usize,
+    maximum_match_bytes: usize,
+) -> Result<(Option<Match>, bool), SearchError> {
     let replay_end = start
         .saturating_add(maximum_match_bytes)
         .min(window.end());
@@ -8708,16 +8796,483 @@ fn replay_k0_finite_proved_start(
         .search_proved_exact_start_selected_end_value(haystack, replay_window, limits)
         .map_err(SearchError::from)?
     {
-        Some(end) if start < end && end <= replay_end => Ok(Some(Match { start, end })),
+        Some(end) if start < end && end <= replay_end => {
+            Ok((Some(Match { start, end }), true))
+        }
         Some(_) | None => session
             .search_span_value(haystack, window, limits)
             .map(|found| {
-                found.map(|span| Match {
-                    start: span.start(),
-                    end: span.end(),
-                })
+                (
+                    found.map(|span| Match {
+                        start: span.start(),
+                        end: span.end(),
+                    }),
+                    false,
+                )
             })
             .map_err(SearchError::from),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum K0CorrelatedTerminalAttempt<T> {
+    Bypass,
+    Complete { output: T, won: bool },
+}
+
+fn k0_correlated_first_unproved_start(
+    window_start: usize,
+    terminal_position: usize,
+    maximum_match_bytes: usize,
+) -> usize {
+    terminal_position
+        .checked_sub(maximum_match_bytes)
+        .and_then(|position| position.checked_add(1))
+        .unwrap_or(window_start)
+        .max(window_start)
+}
+
+fn k0_correlated_progress_budget(
+    incumbent_transition_work: u64,
+    progress: usize,
+    window_bytes: usize,
+) -> u64 {
+    if window_bytes == 0 {
+        return 0;
+    }
+    let scaled = u128::from(incumbent_transition_work)
+        .saturating_mul(u128::try_from(progress).unwrap_or(u128::MAX))
+        / u128::try_from(window_bytes).unwrap_or(u128::MAX);
+    u64::try_from(scaled).unwrap_or(u64::MAX)
+}
+
+fn k0_correlated_sidecar_work(
+    progress: usize,
+    candidates: u64,
+    verifier_work: u64,
+) -> Option<u64> {
+    u64::try_from(progress)
+        .ok()?
+        .checked_add(candidates)?
+        .checked_add(verifier_work)
+}
+
+fn k0_correlated_geometry_allows(
+    session: &K0SearchSession<'_>,
+    plan: &correlated_bounded_alternation::Plan,
+    haystack_len: usize,
+    window: SearchWindow,
+    limits: SearchLimits,
+) -> bool {
+    if limits != SearchLimits::unlimited()
+        || window.start() > window.end()
+        || window.end() > haystack_len
+        || !session.positive_end_verifier_available()
+    {
+        return false;
+    }
+    let window_bytes = window.end().saturating_sub(window.start());
+    plan.maximum_match_bytes() != 0
+        && plan.maximum_match_bytes() <= window_bytes / K0_SUFFIX_FINITE_WIDTH_WINDOW_FACTOR
+}
+
+fn k0_correlated_fallback_exists(
+    session: &mut K0SearchSession<'_>,
+    haystack: &[u8],
+    window: SearchWindow,
+    limits: SearchLimits,
+    first_unproved_start: usize,
+) -> Result<K0CorrelatedTerminalAttempt<bool>, SearchError> {
+    let fallback = SearchWindow::new(first_unproved_start.min(window.end()), window.end());
+    session
+        .search_exists_value(haystack, fallback, limits)
+        .map(|output| K0CorrelatedTerminalAttempt::Complete { output, won: false })
+        .map_err(SearchError::from)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the endpoint proof keeps its immutable plan, adaptive budget, and validated window together"
+)]
+fn try_k0_correlated_terminal_exists(
+    session: &mut K0SearchSession<'_>,
+    plan: &correlated_bounded_alternation::Plan,
+    haystack: &[u8],
+    window: SearchWindow,
+    limits: SearchLimits,
+    incumbent_transition_work: u64,
+) -> Result<K0CorrelatedTerminalAttempt<bool>, SearchError> {
+    if !k0_correlated_geometry_allows(session, plan, haystack.len(), window, limits) {
+        return Ok(K0CorrelatedTerminalAttempt::Bypass);
+    }
+    let window_bytes = window.end().saturating_sub(window.start());
+    if plan.minimum_match_bytes() > window_bytes {
+        return Ok(K0CorrelatedTerminalAttempt::Complete {
+            output: false,
+            won: true,
+        });
+    }
+    let mut search_position = window
+        .start()
+        .checked_add(plan.minimum_match_bytes().saturating_sub(1))
+        .ok_or(SearchError::K0(K0SearchError::ArithmeticOverflow {
+            computation: "correlated terminal minimum endpoint",
+        }))?;
+    let mut candidates = 0u64;
+    let mut verifier_work = 0u64;
+    loop {
+        let Some(terminal_position) =
+            plan.seek_terminal(haystack, search_position, window.end())
+        else {
+            let allowed_work = k0_correlated_progress_budget(
+                incumbent_transition_work,
+                window_bytes,
+                window_bytes,
+            );
+            return Ok(K0CorrelatedTerminalAttempt::Complete {
+                output: false,
+                won: k0_correlated_sidecar_work(
+                    window_bytes,
+                    candidates,
+                    verifier_work,
+                )
+                .is_some_and(|work| work <= allowed_work),
+            });
+        };
+        let endpoint = terminal_position.checked_add(1).ok_or(SearchError::K0(
+            K0SearchError::ArithmeticOverflow {
+                computation: "correlated terminal endpoint",
+            },
+        ))?;
+        candidates = candidates.checked_add(1).ok_or(SearchError::K0(
+            K0SearchError::ArithmeticOverflow {
+                computation: "correlated terminal candidate count",
+            },
+        ))?;
+        let progress = endpoint.saturating_sub(window.start());
+        let allowed_work = k0_correlated_progress_budget(
+            incumbent_transition_work,
+            progress,
+            window_bytes,
+        );
+        let Some(sidecar_work) = k0_correlated_sidecar_work(
+            progress,
+            candidates,
+            verifier_work,
+        ) else {
+            let first_unproved = k0_correlated_first_unproved_start(
+                window.start(),
+                terminal_position,
+                plan.maximum_match_bytes(),
+            );
+            return k0_correlated_fallback_exists(
+                session,
+                haystack,
+                window,
+                limits,
+                first_unproved,
+            );
+        };
+        let Some(remaining_work) = allowed_work.checked_sub(sidecar_work) else {
+            let first_unproved = k0_correlated_first_unproved_start(
+                window.start(),
+                terminal_position,
+                plan.maximum_match_bytes(),
+            );
+            return k0_correlated_fallback_exists(
+                session,
+                haystack,
+                window,
+                limits,
+                first_unproved,
+            );
+        };
+        let reverse_start = endpoint
+            .saturating_sub(plan.maximum_match_bytes())
+            .max(window.start());
+        let verification = session
+            .try_positive_match_ending_at(
+                haystack,
+                SearchWindow::new(reverse_start, endpoint),
+                endpoint,
+                K0PositiveEndLimits::new(remaining_work, endpoint - reverse_start),
+            )
+            .map_err(SearchError::from)?;
+        verifier_work = verifier_work
+            .checked_add(verification.receipt().work())
+            .ok_or(SearchError::K0(K0SearchError::ArithmeticOverflow {
+                computation: "correlated terminal verifier work",
+            }))?;
+        match verification.outcome() {
+            K0PositiveEndOutcome::Matched => {
+                return Ok(K0CorrelatedTerminalAttempt::Complete {
+                    output: true,
+                    won: true,
+                });
+            }
+            K0PositiveEndOutcome::Rejected => {
+                search_position = endpoint;
+            }
+            K0PositiveEndOutcome::Declined => {
+                let first_unproved = k0_correlated_first_unproved_start(
+                    window.start(),
+                    terminal_position,
+                    plan.maximum_match_bytes(),
+                );
+                return k0_correlated_fallback_exists(
+                    session,
+                    haystack,
+                    window,
+                    limits,
+                    first_unproved,
+                );
+            }
+        }
+    }
+}
+
+fn k0_correlated_fallback_span(
+    session: &mut K0SearchSession<'_>,
+    haystack: &[u8],
+    window: SearchWindow,
+    limits: SearchLimits,
+    first_unproved_start: usize,
+) -> Result<K0CorrelatedTerminalAttempt<Option<Match>>, SearchError> {
+    let fallback = SearchWindow::new(first_unproved_start.min(window.end()), window.end());
+    session
+        .search_span_value(haystack, fallback, limits)
+        .map(|output| K0CorrelatedTerminalAttempt::Complete {
+            output: output.map(|span| Match {
+                start: span.start(),
+                end: span.end(),
+            }),
+            won: false,
+        })
+        .map_err(SearchError::from)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the endpoint proof keeps its immutable plan, adaptive budget, and validated window together"
+)]
+fn try_k0_correlated_terminal_span(
+    session: &mut K0SearchSession<'_>,
+    plan: &correlated_bounded_alternation::Plan,
+    haystack: &[u8],
+    window: SearchWindow,
+    limits: SearchLimits,
+    incumbent_transition_work: u64,
+) -> Result<K0CorrelatedTerminalAttempt<Option<Match>>, SearchError> {
+    if !k0_correlated_geometry_allows(session, plan, haystack.len(), window, limits) {
+        return Ok(K0CorrelatedTerminalAttempt::Bypass);
+    }
+    let window_bytes = window.end().saturating_sub(window.start());
+    if plan.minimum_match_bytes() > window_bytes {
+        return Ok(K0CorrelatedTerminalAttempt::Complete {
+            output: None,
+            won: true,
+        });
+    }
+    let mut search_position = window
+        .start()
+        .checked_add(plan.minimum_match_bytes().saturating_sub(1))
+        .ok_or(SearchError::K0(K0SearchError::ArithmeticOverflow {
+            computation: "correlated terminal minimum span endpoint",
+        }))?;
+    let mut candidates = 0u64;
+    let mut verifier_work = 0u64;
+    let mut best_start = None;
+    loop {
+        let search_end = best_start.map_or(window.end(), |start: usize| {
+            start
+                .saturating_add(plan.maximum_match_bytes())
+                .min(window.end())
+        });
+        let Some(terminal_position) = plan.seek_terminal(haystack, search_position, search_end)
+        else {
+            let progress = search_end.saturating_sub(window.start());
+            let allowed_work = k0_correlated_progress_budget(
+                incumbent_transition_work,
+                progress,
+                window_bytes,
+            );
+            let sidecar_work = k0_correlated_sidecar_work(
+                progress,
+                candidates,
+                verifier_work,
+            );
+            if let Some(start) = best_start {
+                let replay_bytes = start
+                    .saturating_add(plan.maximum_match_bytes())
+                    .min(window.end())
+                    .saturating_sub(start);
+                let replay_fits = session
+                    .positive_end_verifier_work_certificate(replay_bytes)
+                    .and_then(|work| sidecar_work?.checked_add(work))
+                    .is_some_and(|total| total <= allowed_work);
+                let (output, used_exact_replay) =
+                    replay_k0_finite_proved_start_with_exact_receipt(
+                        session,
+                        haystack,
+                        window,
+                        limits,
+                        start,
+                        plan.maximum_match_bytes(),
+                    )?;
+                return Ok(K0CorrelatedTerminalAttempt::Complete {
+                    output,
+                    won: replay_fits && used_exact_replay,
+                });
+            }
+            return Ok(K0CorrelatedTerminalAttempt::Complete {
+                output: None,
+                won: sidecar_work.is_some_and(|work| work <= allowed_work),
+            });
+        };
+        let endpoint = terminal_position.checked_add(1).ok_or(SearchError::K0(
+            K0SearchError::ArithmeticOverflow {
+                computation: "correlated terminal span endpoint",
+            },
+        ))?;
+        candidates = candidates.checked_add(1).ok_or(SearchError::K0(
+            K0SearchError::ArithmeticOverflow {
+                computation: "correlated terminal span candidate count",
+            },
+        ))?;
+        let progress = endpoint.saturating_sub(window.start());
+        let allowed_work = k0_correlated_progress_budget(
+            incumbent_transition_work,
+            progress,
+            window_bytes,
+        );
+        let Some(sidecar_work) = k0_correlated_sidecar_work(
+            progress,
+            candidates,
+            verifier_work,
+        ) else {
+            let first_unproved = k0_correlated_first_unproved_start(
+                window.start(),
+                terminal_position,
+                plan.maximum_match_bytes(),
+            );
+            if let Some(start) = best_start {
+                if first_unproved > start {
+                    let output = replay_k0_finite_proved_start(
+                        session,
+                        haystack,
+                        window,
+                        limits,
+                        start,
+                        plan.maximum_match_bytes(),
+                    )?;
+                    return Ok(K0CorrelatedTerminalAttempt::Complete {
+                        output,
+                        won: false,
+                    });
+                }
+            }
+            return k0_correlated_fallback_span(
+                session,
+                haystack,
+                window,
+                limits,
+                first_unproved,
+            );
+        };
+        if sidecar_work > allowed_work {
+            let first_unproved = k0_correlated_first_unproved_start(
+                window.start(),
+                terminal_position,
+                plan.maximum_match_bytes(),
+            );
+            if let Some(start) = best_start {
+                if first_unproved > start {
+                    let output = replay_k0_finite_proved_start(
+                        session,
+                        haystack,
+                        window,
+                        limits,
+                        start,
+                        plan.maximum_match_bytes(),
+                    )?;
+                    return Ok(K0CorrelatedTerminalAttempt::Complete {
+                        output,
+                        won: false,
+                    });
+                }
+            }
+            return k0_correlated_fallback_span(
+                session,
+                haystack,
+                window,
+                limits,
+                first_unproved,
+            );
+        }
+        let reverse_start = endpoint
+            .saturating_sub(plan.maximum_match_bytes())
+            .max(window.start());
+        let remaining_work = allowed_work.saturating_sub(sidecar_work);
+        let verification = session
+            .try_earliest_start_ending_at(
+                haystack,
+                SearchWindow::new(reverse_start, endpoint),
+                endpoint,
+                K0PositiveEndLimits::new(remaining_work, endpoint - reverse_start),
+            )
+            .map_err(SearchError::from)?;
+        verifier_work = verifier_work
+            .checked_add(verification.receipt().work())
+            .ok_or(SearchError::K0(K0SearchError::ArithmeticOverflow {
+                computation: "correlated terminal span verifier work",
+            }))?;
+        match verification.outcome() {
+            K0PositiveEndStartOutcome::Matched { start } => {
+                if start < reverse_start || start >= endpoint {
+                    return Err(SearchError::K0(K0SearchError::InternalInvariant {
+                        detail: "correlated terminal verifier returned an invalid start",
+                    }));
+                }
+                best_start = Some(best_start.map_or(start, |best: usize| best.min(start)));
+            }
+            K0PositiveEndStartOutcome::Rejected => {}
+            K0PositiveEndStartOutcome::Declined => {
+                if let Some(start) = best_start {
+                    let first_unproved = k0_correlated_first_unproved_start(
+                        window.start(),
+                        terminal_position,
+                        plan.maximum_match_bytes(),
+                    );
+                    if first_unproved > start {
+                        let output = replay_k0_finite_proved_start(
+                            session,
+                            haystack,
+                            window,
+                            limits,
+                            start,
+                            plan.maximum_match_bytes(),
+                        )?;
+                        return Ok(K0CorrelatedTerminalAttempt::Complete {
+                            output,
+                            won: false,
+                        });
+                    }
+                }
+                let first_unproved = k0_correlated_first_unproved_start(
+                    window.start(),
+                    terminal_position,
+                    plan.maximum_match_bytes(),
+                );
+                return k0_correlated_fallback_span(
+                    session,
+                    haystack,
+                    window,
+                    limits,
+                    first_unproved,
+                );
+            }
+        }
+        search_position = endpoint;
     }
 }
 
@@ -8951,13 +9506,66 @@ impl<'r> PortableSearchSession<'r> {
             }
             PortableSearchSessionPlan::K0 {
                 session,
+                correlated_terminal,
                 mandatory_suffix,
                 mandatory_cut,
                 negative_prefilter,
+                correlated_terminal_exists_state,
                 mandatory_suffix_exists_state,
                 negative_prefilter_exists_state,
                 ..
             } => {
+                if let Some(plan) = *correlated_terminal {
+                    if k0_correlated_geometry_allows(
+                        session,
+                        plan,
+                        haystack.len(),
+                        window,
+                        limits,
+                    ) {
+                        let window_bytes = window.end().saturating_sub(window.start());
+                        match correlated_terminal_exists_state.select(window_bytes) {
+                            correlated_bounded_alternation::Route::Bypass => {}
+                            correlated_bounded_alternation::Route::Learn { class_index } => {
+                                let report = session
+                                    .search_window::<Exists>(haystack, window, limits)
+                                    .map_err(SearchError::from)?;
+                                correlated_terminal_exists_state.observe_incumbent(
+                                    class_index,
+                                    window_bytes,
+                                    report.accounting().work(),
+                                    report.accounting().boundaries(),
+                                    plan.maximum_match_bytes(),
+                                    plan.branch_count(),
+                                );
+                                return Ok(report.into_output());
+                            }
+                            correlated_bounded_alternation::Route::Terminal {
+                                class_index,
+                                incumbent_transition_work,
+                            } => match try_k0_correlated_terminal_exists(
+                                session,
+                                plan,
+                                haystack,
+                                window,
+                                limits,
+                                incumbent_transition_work,
+                            )? {
+                                K0CorrelatedTerminalAttempt::Bypass => {}
+                                K0CorrelatedTerminalAttempt::Complete { output, won } => {
+                                    if won {
+                                        correlated_terminal_exists_state
+                                            .observe_terminal_success(class_index);
+                                    } else {
+                                        correlated_terminal_exists_state
+                                            .observe_terminal_loss(class_index);
+                                    }
+                                    return Ok(output);
+                                }
+                            },
+                        }
+                    }
+                }
                 let mut suffix_state_after_success = *mandatory_suffix_exists_state;
                 let mut finite_suffix_incumbent = None;
                 if let Some(suffix) = *mandatory_suffix {
@@ -9376,13 +9984,76 @@ impl<'r> PortableSearchSession<'r> {
             }
             PortableSearchSessionPlan::K0 {
                 session,
+                correlated_terminal,
                 mandatory_suffix,
                 mandatory_cut,
                 negative_prefilter,
+                correlated_terminal_span_state,
                 mandatory_suffix_span_state,
                 negative_prefilter_span_state,
                 ..
             } => {
+                if let Some(plan) = *correlated_terminal {
+                    if k0_correlated_geometry_allows(
+                        session,
+                        plan,
+                        haystack.len(),
+                        window,
+                        limits,
+                    ) {
+                        let window_bytes = window.end().saturating_sub(window.start());
+                        match correlated_terminal_span_state.select(window_bytes) {
+                            correlated_bounded_alternation::Route::Bypass => {}
+                            correlated_bounded_alternation::Route::Learn { class_index } => {
+                                let report = if window.end() == haystack.len() {
+                                    session.search_span_at_cursor(
+                                        haystack,
+                                        window.start(),
+                                        limits,
+                                    )
+                                } else {
+                                    session.search_window::<Span>(haystack, window, limits)
+                                }
+                                .map_err(SearchError::from)?;
+                                correlated_terminal_span_state.observe_incumbent(
+                                    class_index,
+                                    window_bytes,
+                                    report.accounting().work(),
+                                    report.accounting().boundaries(),
+                                    plan.maximum_match_bytes(),
+                                    plan.branch_count(),
+                                );
+                                return Ok(report.into_output().map(|span| Match {
+                                    start: span.start(),
+                                    end: span.end(),
+                                }));
+                            }
+                            correlated_bounded_alternation::Route::Terminal {
+                                class_index,
+                                incumbent_transition_work,
+                            } => match try_k0_correlated_terminal_span(
+                                session,
+                                plan,
+                                haystack,
+                                window,
+                                limits,
+                                incumbent_transition_work,
+                            )? {
+                                K0CorrelatedTerminalAttempt::Bypass => {}
+                                K0CorrelatedTerminalAttempt::Complete { output, won } => {
+                                    if won {
+                                        correlated_terminal_span_state
+                                            .observe_terminal_success(class_index);
+                                    } else {
+                                        correlated_terminal_span_state
+                                            .observe_terminal_loss(class_index);
+                                    }
+                                    return Ok(output);
+                                }
+                            },
+                        }
+                    }
+                }
                 let mut suffix_state_after_success = *mandatory_suffix_span_state;
                 let mut finite_suffix_incumbent = None;
                 if let Some(suffix) = *mandatory_suffix {
