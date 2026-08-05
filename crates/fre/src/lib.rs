@@ -13521,7 +13521,7 @@ mod tests {
 
     #[test]
     fn finite_two_barrier_route_matches_upstream_across_facade_projections() {
-        let pattern = r"QZ[01]{0,64}aa";
+        let pattern = r"aa[01]{0,64}QZ";
         let regex = PortableBuilder::new(pattern)
             .unicode(false)
             .build()
@@ -13539,15 +13539,15 @@ mod tests {
             .unicode(false)
             .build()
             .unwrap();
-        let mut long = b"--QZ".to_vec();
+        let mut long = b"--aa".to_vec();
         long.extend(core::iter::repeat_n(b'0', 63));
-        long.extend_from_slice(b"aa--");
+        long.extend_from_slice(b"QZ--");
         for haystack in [
             b"".as_slice(),
-            b"QZaa",
-            b"--QZ01aa--",
-            b"QZ2aa--QZ0aa",
-            b"QZQZ01aa--QZaa",
+            b"aaQZ",
+            b"--aa01QZ--",
+            b"aa2QZ--aa0QZ",
+            b"aaaa01QZ--aaQZ",
             long.as_slice(),
         ] {
             let expected_iter: Vec<_> = upstream
@@ -13630,7 +13630,7 @@ mod tests {
         let vector = finite_two_barrier_has_vector_scanner();
         for (pattern, native) in [
             (r"Q\x92[0]{0,63}U", false),
-            (r"Q\x92[0]{0,64}U", vector),
+            (r"Q\x92[0]{0,64}U", false),
             (r"abaaaabb[0]{0,62}QZ", false),
             (r"abaaaabb[0]{0,63}QZ", vector),
             (r"QZ[0]{0,64}abaaaabb", false),

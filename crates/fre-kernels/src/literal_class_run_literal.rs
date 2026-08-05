@@ -3846,7 +3846,6 @@ impl BoundedLiteralClassRunPlan {
             if admission == BoundedNativeAdmission::RequireCostProof {
                 work.charge(BOUNDED_NATIVE_ADMISSION_WORK)?;
                 if !bounded_native_cost_admitted(
-                    suffix.len(),
                     maximum,
                     selection,
                     bounded_ascii_scanner_has_vector(ascii_scanner.as_ref()),
@@ -4654,14 +4653,17 @@ fn bounded_repetition_preference(
 }
 
 fn bounded_native_cost_admitted(
-    suffix_width: usize,
     maximum: usize,
     selection: BoundedAnchorSelection,
     has_vector_scanner: bool,
 ) -> Result<bool, BuildError> {
     // A strictly less repetitive chosen anchor is sufficient on its own.
     // Otherwise, require enough bounded-run service to amortize one sustained
-    // wide scan; prefix routing also pays the opposite suffix verification.
+    // wide scan, and retain only the suffix-driven direction. Prefix-driven
+    // search competes with K0's mandatory-prefix machinery and loses that
+    // comparison as the input grows even when the bounded class scan itself
+    // is wide. A complete strict-period proof above remains sufficient in
+    // either direction.
     if selection.strict_full_width_repetition == Some(selection.preferred) {
         return Ok(true);
     }
@@ -4676,14 +4678,7 @@ fn bounded_native_cost_admitted(
     )?;
     match selection.preferred {
         Anchor::Suffix => Ok(horizon >= sustained_scan),
-        Anchor::Prefix => {
-            let required = sustained_scan.checked_add(suffix_width).ok_or(
-                BuildError::ArithmeticOverflow {
-                    computation: "finite native prefix verification horizon",
-                },
-            )?;
-            Ok(horizon >= required)
-        }
+        Anchor::Prefix => Ok(false),
         Anchor::CompleteAsciiWordSuffix => {
             unreachable!("finite direct anchor is unguarded")
         }
@@ -7859,7 +7854,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_native_cost_gate_uses_direction_horizon_opposite_and_strict_period() {
+    fn bounded_native_cost_gate_uses_suffix_horizon_and_strict_period() {
         let prefix = BoundedAnchorSelection {
             preferred: Anchor::Prefix,
             strict_full_width_repetition: None,
@@ -7869,36 +7864,19 @@ mod tests {
             strict_full_width_repetition: None,
         };
         let sustained = 2 * ASCII_WIDE_BYTES;
-        assert!(!bounded_native_cost_admitted(1, sustained - 2, suffix, true).unwrap());
-        assert!(bounded_native_cost_admitted(1, sustained - 1, suffix, true).unwrap());
-        assert!(!bounded_native_cost_admitted(1, sustained - 1, prefix, true).unwrap());
-        assert!(bounded_native_cost_admitted(1, sustained, prefix, true).unwrap());
-        for suffix_width in 1..=2 * ASCII_WIDE_BYTES {
-            let admitted_maximum = sustained + suffix_width - 1;
-            assert!(!bounded_native_cost_admitted(
-                suffix_width,
-                admitted_maximum - 1,
-                prefix,
-                true,
-            )
-            .unwrap());
-            assert!(bounded_native_cost_admitted(
-                suffix_width,
-                admitted_maximum,
-                prefix,
-                true,
-            )
-            .unwrap());
-        }
-        assert!(!bounded_native_cost_admitted(1, usize::MAX, prefix, false).unwrap());
-        assert!(!bounded_native_cost_admitted(1, usize::MAX, suffix, false).unwrap());
+        assert!(!bounded_native_cost_admitted(sustained - 2, suffix, true).unwrap());
+        assert!(bounded_native_cost_admitted(sustained - 1, suffix, true).unwrap());
+        assert!(!bounded_native_cost_admitted(sustained - 1, prefix, true).unwrap());
+        assert!(!bounded_native_cost_admitted(usize::MAX, prefix, true).unwrap());
+        assert!(!bounded_native_cost_admitted(usize::MAX, prefix, false).unwrap());
+        assert!(!bounded_native_cost_admitted(usize::MAX, suffix, false).unwrap());
 
         for anchor in [Anchor::Prefix, Anchor::Suffix] {
             let strict = BoundedAnchorSelection {
                 preferred: anchor,
                 strict_full_width_repetition: Some(anchor),
             };
-            assert!(bounded_native_cost_admitted(usize::MAX, 0, strict, false).unwrap());
+            assert!(bounded_native_cost_admitted(0, strict, false).unwrap());
         }
     }
 
@@ -7940,7 +7918,6 @@ mod tests {
         for scanner in [&fixed, &run] {
             assert!(!bounded_ascii_scanner_has_vector(Some(scanner)));
             assert!(!bounded_native_cost_admitted(
-                1,
                 usize::MAX,
                 selection,
                 bounded_ascii_scanner_has_vector(Some(scanner)),
@@ -7993,7 +7970,7 @@ mod tests {
             suffix.len() * full_prefix_period < prefix.len() * full_suffix_period,
             "the bytes beyond the sample invert the full-width preference"
         );
-        assert!(!bounded_native_cost_admitted(1, 0, selection, true).unwrap());
+        assert!(!bounded_native_cost_admitted(0, selection, true).unwrap());
 
         assert!(
             BoundedLiteralClassRunPlan::build_with_dispatch_if_admitted(
@@ -8045,10 +8022,7 @@ mod tests {
             BuildLimits::unlimited(),
         )
         .unwrap();
-        assert_eq!(threshold_plan.is_some(), has_vector_scanner);
-        if let Some(plan) = threshold_plan {
-            assert_eq!(plan.preferred_anchor, Anchor::Prefix);
-        }
+        assert!(threshold_plan.is_none());
 
         let wide_unbordered_suffix = b"abaaaabb";
         assert!(ascii(
@@ -8059,16 +8033,15 @@ mod tests {
         )
         .unwrap()
         .is_none());
-        assert_eq!(
+        assert!(
             ascii(
                 b"QZ",
                 wide_unbordered_suffix,
-                2 * ASCII_WIDE_BYTES + wide_unbordered_suffix.len() - 1,
+                usize::MAX,
                 BuildLimits::unlimited(),
             )
             .unwrap()
-            .is_some(),
-            has_vector_scanner
+            .is_none()
         );
 
         let unbordered_prefix = b"abaaaabb";
