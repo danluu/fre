@@ -76,7 +76,6 @@ const ORDINARY_START_FILTER_PROOF: StartFilterProof = StartFilterProof {
     relaxed_nullable: true,
 };
 const BYTE_ALPHABET: usize = 256;
-const DIRECT_ROW_STRIDE: u32 = 256;
 const _: () = assert!(BYTE_ALPHABET == 1 << 8);
 // Prepared compiled searches are deliberately allowed a larger bounded
 // determinization frontier than the original L1-sized cache. A direct row is
@@ -134,21 +133,24 @@ const CONTEXT_TRANSITION_MAX_BUCKETS: usize =
 const CONTEXT_EMPTY_SOURCE: u32 = u32::MAX;
 const CONTEXT_INITIAL_SOURCE: u32 = u32::MAX - 1;
 
-/// Index one direct byte row after its source state has been authenticated.
+/// Index one exact-class direct row after its source state has been authenticated.
 ///
 /// Every direct lazy arena is constructed with at most `LAZY_MAX_STATES`
 /// rows, and state publication never exceeds that fixed capacity. The const
-/// assertion above therefore proves this multiply/add cannot overflow. Keeping
-/// that shape proof outside the warmed transition loop removes the remaining
-/// fallible arithmetic branch from every warmed input byte; the final slice
-/// lookup still diagnoses a broken physical layout.
+/// assertion above and the immutable byte-class ceiling therefore prove this
+/// multiply/add cannot overflow. Keeping that shape proof outside the warmed
+/// transition loop removes the multiply from every warmed input byte; the
+/// final slice lookup still diagnoses a broken physical layout.
 #[allow(
     clippy::arithmetic_side_effects,
-    reason = "the fixed lazy-state ceiling and byte alphabet prove the row index fits usize"
+    reason = "the fixed lazy-state and byte-class ceilings prove the row index fits usize"
 )]
-fn direct_row_cell_index(state: usize, class: u8) -> usize {
+fn direct_row_cell_index(state: usize, class: u8, stride: u32) -> usize {
     debug_assert!(state < LAZY_MAX_STATES);
-    state * BYTE_ALPHABET + usize::from(class)
+    debug_assert!(stride != 0 && usize::try_from(stride).unwrap_or(usize::MAX) <= BYTE_ALPHABET);
+    debug_assert!(u32::from(class) < stride);
+    state * usize::try_from(stride).expect("the byte-class stride fits usize")
+        + usize::from(class)
 }
 
 /// Authenticate one direct-row source once, before entering a warmed loop.
@@ -156,8 +158,13 @@ fn direct_row_cell_index(state: usize, class: u8) -> usize {
 /// Direct transition cells retain `row_offset + 1` rather than `state + 1`.
 /// The zero value therefore remains the dead transition while a warmed edge
 /// can feed its decoded value directly to [`LazyWorkspace::direct_cell`] or
-/// [`ReverseWorkspace::direct_cell`] without rebuilding `state * 256`.
-fn direct_row_offset(state: u32) -> Result<u32, SearchError> {
+/// [`ReverseWorkspace::direct_cell`] without rebuilding `state * stride`.
+fn direct_row_offset(state: u32, stride: u32) -> Result<u32, SearchError> {
+    if stride == 0 || usize::try_from(stride).unwrap_or(usize::MAX) > BYTE_ALPHABET {
+        return Err(SearchError::InternalInvariant {
+            detail: "direct lazy row stride is outside the byte-class domain",
+        });
+    }
     let state = usize::try_from(state).map_err(|_| SearchError::InternalInvariant {
         detail: "direct lazy state does not fit usize",
     })?;
@@ -166,13 +173,15 @@ fn direct_row_offset(state: u32) -> Result<u32, SearchError> {
             detail: "direct lazy state is outside the cache ceiling",
         });
     }
-    u32::try_from(direct_row_cell_index(state, 0)).map_err(|_| SearchError::InternalInvariant {
-        detail: "direct lazy row offset does not fit u32",
+    u32::try_from(direct_row_cell_index(state, 0, stride)).map_err(|_| {
+        SearchError::InternalInvariant {
+            detail: "direct lazy row offset does not fit u32",
+        }
     })
 }
 
-fn direct_row_encoded_state(state: u32) -> Result<u32, SearchError> {
-    direct_row_offset(state)?
+fn direct_row_encoded_state(state: u32, stride: u32) -> Result<u32, SearchError> {
+    direct_row_offset(state, stride)?
         .checked_add(1)
         .filter(|encoded| *encoded <= LAZY_CELL_STATE_MASK)
         .ok_or(SearchError::InternalInvariant {
@@ -182,11 +191,12 @@ fn direct_row_encoded_state(state: u32) -> Result<u32, SearchError> {
 
 #[allow(
     clippy::arithmetic_side_effects,
-    reason = "authenticated direct row offsets are exact multiples of the fixed stride"
+    reason = "authenticated direct row offsets are exact multiples of the immutable stride"
 )]
-fn direct_row_state(row_offset: u32) -> u32 {
-    debug_assert_eq!(row_offset % DIRECT_ROW_STRIDE, 0);
-    row_offset / DIRECT_ROW_STRIDE
+fn direct_row_state(row_offset: u32, stride: u32) -> u32 {
+    debug_assert!(stride != 0 && usize::try_from(stride).unwrap_or(usize::MAX) <= BYTE_ALPHABET);
+    debug_assert_eq!(row_offset % stride, 0);
+    row_offset / stride
 }
 
 #[cfg(test)]
@@ -956,6 +966,7 @@ pub struct WorkspaceLayout {
     edges: usize,
     zero_width_edges: usize,
     closure_slots: usize,
+    direct_row_stride: u32,
     lazy_state_capacity: usize,
     lazy_item_capacity: usize,
     lazy_context_slots: usize,
@@ -1017,11 +1028,34 @@ impl WorkspaceLayout {
             } else {
                 0
             };
+        // Only assertion-free retained machines own direct rows. Canonicalize
+        // the irrelevant stride everywhere else so otherwise identical core
+        // or contextual workspaces remain shape-equal across immutable
+        // automata with different byte partitions.
+        let owns_direct_rows = (lazy_state_capacity != 0 && lazy_context_slots == 0)
+            || (reverse_state_capacity != 0 && reverse_context_slots == 0);
+        let direct_row_stride = if owns_direct_rows {
+            u32::try_from(automaton.byte_classes().count()).map_err(|_| {
+                SearchError::InternalInvariant {
+                    detail: "byte-class count does not fit the direct-row stride",
+                }
+            })?
+        } else {
+            1
+        };
+        if direct_row_stride == 0
+            || usize::try_from(direct_row_stride).unwrap_or(usize::MAX) > BYTE_ALPHABET
+        {
+            return Err(SearchError::InternalInvariant {
+                detail: "direct-row stride is outside the byte alphabet",
+            });
+        }
         let pike_bytes = scratch_bytes(states, edges, closure_slots)?;
         let lazy_bytes = lazy_scratch_bytes(
             states,
             lazy_state_capacity,
             lazy_item_capacity,
+            direct_row_stride,
             lazy_context_slots,
         )?;
         let reverse_bytes = reverse_scratch_bytes(
@@ -1029,6 +1063,7 @@ impl WorkspaceLayout {
             edges,
             reverse_state_capacity,
             reverse_item_capacity,
+            direct_row_stride,
             reverse_context_slots,
         )?;
         let logical_bytes = pike_bytes
@@ -1087,6 +1122,7 @@ impl WorkspaceLayout {
             states,
             lazy_state_capacity,
             lazy_item_capacity,
+            direct_row_stride,
             lazy_context_slots,
         )?;
         let reverse_initialized_slots = reverse_initialized_slots(
@@ -1094,6 +1130,7 @@ impl WorkspaceLayout {
             edges,
             reverse_state_capacity,
             reverse_item_capacity,
+            direct_row_stride,
             reverse_context_slots,
         )?;
         let initialized_slots = pike_initialized_slots
@@ -1174,6 +1211,7 @@ impl WorkspaceLayout {
             edges,
             zero_width_edges,
             closure_slots,
+            direct_row_stride,
             lazy_state_capacity,
             lazy_item_capacity,
             lazy_context_slots,
@@ -1522,10 +1560,14 @@ impl LazyLoopSkipPlans {
         self.entries.iter().flatten().copied().next()
     }
 
-    fn matching_slot(&self, candidate: LazyLoopSkipCandidate) -> Option<usize> {
+    fn matching_slot(
+        &self,
+        candidate: LazyLoopSkipCandidate,
+        direct_row_stride: u32,
+    ) -> Option<usize> {
         self.entries.iter().position(|entry| {
             entry.as_ref().is_some_and(|plan| {
-                direct_row_state(plan.row_offset) == candidate.state
+                direct_row_state(plan.row_offset, direct_row_stride) == candidate.state
                     && plan.start_action == candidate.start_action
                     && plan.scanner.words() == candidate.members
             })
@@ -1533,8 +1575,12 @@ impl LazyLoopSkipPlans {
     }
 
     #[cfg(test)]
-    fn find(&self, row_offset: u32) -> Option<(usize, &LazyLoopSkipPlan)> {
-        self.find_with_hint(row_offset, None)
+    fn find(
+        &self,
+        row_offset: u32,
+        direct_row_stride: u32,
+    ) -> Option<(usize, &LazyLoopSkipPlan)> {
+        self.find_with_hint(row_offset, None, direct_row_stride)
     }
 
     #[inline]
@@ -1542,6 +1588,7 @@ impl LazyLoopSkipPlans {
         &self,
         row_offset: u32,
         preferred_slot: Option<usize>,
+        direct_row_stride: u32,
     ) -> Option<(usize, &LazyLoopSkipPlan)> {
         if let Some(slot) = preferred_slot {
             if let Some(plan) = self.entries.get(slot).and_then(|entry| entry.as_ref()) {
@@ -1557,7 +1604,7 @@ impl LazyLoopSkipPlans {
                 }
             }
         }
-        let state = u8::try_from(direct_row_state(row_offset)).ok()?;
+        let state = u8::try_from(direct_row_state(row_offset, direct_row_stride)).ok()?;
         if !byte_bitmap_contains(self.state_members, state) {
             return None;
         }
@@ -1816,6 +1863,7 @@ struct LazyWorkspace {
     frontier: Vec<u32>,
     frontier_len: usize,
     rows: Vec<u32>,
+    direct_row_stride: u32,
     context: ContextTransitionStore,
     offsets: Vec<usize>,
     lengths: Vec<u32>,
@@ -1849,11 +1897,15 @@ impl LazyWorkspace {
         let state_capacity = layout.lazy_state_capacity;
         let item_capacity = layout.lazy_item_capacity;
         if state_capacity == 0 {
-            return Ok(Self::disabled());
+            return Ok(Self::disabled(layout.direct_row_stride));
         }
         let row_cells = if layout.lazy_context_slots == 0 {
             state_capacity
-                .checked_mul(BYTE_ALPHABET)
+                .checked_mul(usize::try_from(layout.direct_row_stride).map_err(|_| {
+                    SearchError::InternalInvariant {
+                        detail: "lazy DFA row stride does not fit usize",
+                    }
+                })?)
                 .ok_or(SearchError::ArithmeticOverflow {
                     computation: "lazy DFA row cells",
                 })?
@@ -1867,6 +1919,7 @@ impl LazyWorkspace {
             frontier: allocate_slots(layout.states, 0_u32, total_bytes)?,
             frontier_len: 0,
             rows: allocate_slots(row_cells, LAZY_CELL_UNFILLED, total_bytes)?,
+            direct_row_stride: layout.direct_row_stride,
             context: ContextTransitionStore::new(
                 layout.lazy_context_slots,
                 if layout.lazy_context_slots == 0 {
@@ -1904,7 +1957,7 @@ impl LazyWorkspace {
         })
     }
 
-    const fn disabled() -> Self {
+    const fn disabled(direct_row_stride: u32) -> Self {
         Self {
             automaton_identity: 0,
             scratch: Vec::new(),
@@ -1912,6 +1965,7 @@ impl LazyWorkspace {
             frontier: Vec::new(),
             frontier_len: 0,
             rows: Vec::new(),
+            direct_row_stride,
             context: ContextTransitionStore::disabled(),
             offsets: Vec::new(),
             lengths: Vec::new(),
@@ -2067,6 +2121,18 @@ impl LazyWorkspace {
             })
     }
 
+    fn row_offset(&self, state: u32) -> Result<u32, SearchError> {
+        direct_row_offset(state, self.direct_row_stride)
+    }
+
+    fn encoded_state(&self, state: u32) -> Result<u32, SearchError> {
+        direct_row_encoded_state(state, self.direct_row_stride)
+    }
+
+    fn row_state(&self, row_offset: u32) -> u32 {
+        direct_row_state(row_offset, self.direct_row_stride)
+    }
+
     fn cell(&self, state: u32, class: u8) -> Result<u32, SearchError> {
         let state = usize::try_from(state).map_err(|_| SearchError::InternalInvariant {
             detail: "lazy DFA transition state does not fit usize",
@@ -2076,8 +2142,13 @@ impl LazyWorkspace {
                 detail: "lazy DFA transition state is outside the cache",
             });
         }
+        if u32::from(class) >= self.direct_row_stride {
+            return Err(SearchError::InternalInvariant {
+                detail: "lazy DFA transition class is outside the direct row",
+            });
+        }
         debug_assert!(self.state_len <= LAZY_MAX_STATES);
-        let cell_index = direct_row_cell_index(state, class);
+        let cell_index = direct_row_cell_index(state, class, self.direct_row_stride);
         self.rows
             .get(cell_index)
             .copied()
@@ -2092,12 +2163,19 @@ impl LazyWorkspace {
         reason = "direct row offsets are bounded by the fixed lazy-state ceiling"
     )]
     fn direct_cell(&self, row_offset: u32, class: u8) -> Result<u32, SearchError> {
+        // Every production caller obtains this class from the same immutable,
+        // identity-bound automaton as this workspace. The one cold graph
+        // analyzer instead iterates exactly `0..byte_classes.count()`. Keep
+        // that proof off the warmed per-byte path.
+        debug_assert!(u32::from(class) < self.direct_row_stride);
         let row_offset =
             usize::try_from(row_offset).map_err(|_| SearchError::InternalInvariant {
                 detail: "lazy DFA direct row offset does not fit usize",
             })?;
-        debug_assert_eq!(row_offset % BYTE_ALPHABET, 0);
-        debug_assert!(row_offset / BYTE_ALPHABET < self.state_len);
+        let stride = usize::try_from(self.direct_row_stride)
+            .expect("the authenticated lazy direct-row stride fits usize");
+        debug_assert_eq!(row_offset % stride, 0);
+        debug_assert!(row_offset / stride < self.state_len);
         self.rows
             .get(row_offset + usize::from(class))
             .copied()
@@ -2115,8 +2193,13 @@ impl LazyWorkspace {
                 detail: "lazy DFA transition source is outside the cache",
             });
         }
+        if u32::from(class) >= self.direct_row_stride {
+            return Err(SearchError::InternalInvariant {
+                detail: "lazy DFA transition class is outside the direct row",
+            });
+        }
         debug_assert!(self.state_len <= LAZY_MAX_STATES);
-        let cell_index = direct_row_cell_index(state, class);
+        let cell_index = direct_row_cell_index(state, class, self.direct_row_stride);
         let slot = self
             .rows
             .get_mut(cell_index)
@@ -2506,6 +2589,7 @@ struct ReverseWorkspace {
     frontier: Vec<u32>,
     frontier_len: usize,
     rows: Vec<u32>,
+    direct_row_stride: u32,
     context: ContextTransitionStore,
     offsets: Vec<usize>,
     lengths: Vec<u32>,
@@ -2528,11 +2612,15 @@ impl ReverseWorkspace {
     ) -> Result<Self, SearchError> {
         let state_capacity = layout.reverse_state_capacity;
         if state_capacity == 0 {
-            return Ok(Self::disabled());
+            return Ok(Self::disabled(layout.direct_row_stride));
         }
         let row_cells = if layout.reverse_context_slots == 0 {
             state_capacity
-                .checked_mul(BYTE_ALPHABET)
+                .checked_mul(usize::try_from(layout.direct_row_stride).map_err(|_| {
+                    SearchError::InternalInvariant {
+                        detail: "reverse lazy DFA row stride does not fit usize",
+                    }
+                })?)
                 .ok_or(SearchError::ArithmeticOverflow {
                     computation: "reverse lazy DFA row cells",
                 })?
@@ -2561,6 +2649,7 @@ impl ReverseWorkspace {
             frontier: allocate_slots(layout.edges, 0_u32, total_bytes)?,
             frontier_len: 0,
             rows: allocate_slots(row_cells, LAZY_CELL_UNFILLED, total_bytes)?,
+            direct_row_stride: layout.direct_row_stride,
             context: ContextTransitionStore::new(
                 layout.reverse_context_slots,
                 if layout.reverse_context_slots == 0 {
@@ -2585,7 +2674,7 @@ impl ReverseWorkspace {
         Ok(reverse)
     }
 
-    const fn disabled() -> Self {
+    const fn disabled(direct_row_stride: u32) -> Self {
         Self {
             automaton_identity: 0,
             incoming_offsets: Vec::new(),
@@ -2598,6 +2687,7 @@ impl ReverseWorkspace {
             frontier: Vec::new(),
             frontier_len: 0,
             rows: Vec::new(),
+            direct_row_stride,
             context: ContextTransitionStore::disabled(),
             offsets: Vec::new(),
             lengths: Vec::new(),
@@ -2799,6 +2889,18 @@ impl ReverseWorkspace {
             })
     }
 
+    fn row_offset(&self, state: u32) -> Result<u32, SearchError> {
+        direct_row_offset(state, self.direct_row_stride)
+    }
+
+    fn encoded_state(&self, state: u32) -> Result<u32, SearchError> {
+        direct_row_encoded_state(state, self.direct_row_stride)
+    }
+
+    fn row_state(&self, row_offset: u32) -> u32 {
+        direct_row_state(row_offset, self.direct_row_stride)
+    }
+
     fn cell(&self, state: u32, class: u8) -> Result<u32, SearchError> {
         let state = usize::try_from(state).map_err(|_| SearchError::InternalInvariant {
             detail: "reverse DFA transition state does not fit usize",
@@ -2808,8 +2910,13 @@ impl ReverseWorkspace {
                 detail: "reverse DFA transition state is outside the cache",
             });
         }
+        if u32::from(class) >= self.direct_row_stride {
+            return Err(SearchError::InternalInvariant {
+                detail: "reverse DFA transition class is outside the direct row",
+            });
+        }
         debug_assert!(self.state_len <= LAZY_MAX_STATES);
-        let cell = direct_row_cell_index(state, class);
+        let cell = direct_row_cell_index(state, class, self.direct_row_stride);
         self.rows
             .get(cell)
             .copied()
@@ -2824,12 +2931,17 @@ impl ReverseWorkspace {
         reason = "direct row offsets are bounded by the fixed lazy-state ceiling"
     )]
     fn direct_cell(&self, row_offset: u32, class: u8) -> Result<u32, SearchError> {
+        // See the forward direct-row proof: every warmed class comes from the
+        // same immutable, identity-bound byte partition as this workspace.
+        debug_assert!(u32::from(class) < self.direct_row_stride);
         let row_offset =
             usize::try_from(row_offset).map_err(|_| SearchError::InternalInvariant {
                 detail: "reverse DFA direct row offset does not fit usize",
             })?;
-        debug_assert_eq!(row_offset % BYTE_ALPHABET, 0);
-        debug_assert!(row_offset / BYTE_ALPHABET < self.state_len);
+        let stride = usize::try_from(self.direct_row_stride)
+            .expect("the authenticated reverse direct-row stride fits usize");
+        debug_assert_eq!(row_offset % stride, 0);
+        debug_assert!(row_offset / stride < self.state_len);
         self.rows
             .get(row_offset + usize::from(class))
             .copied()
@@ -2847,8 +2959,13 @@ impl ReverseWorkspace {
                 detail: "reverse DFA transition source is outside the cache",
             });
         }
+        if u32::from(class) >= self.direct_row_stride {
+            return Err(SearchError::InternalInvariant {
+                detail: "reverse DFA transition class is outside the direct row",
+            });
+        }
         debug_assert!(self.state_len <= LAZY_MAX_STATES);
-        let cell = direct_row_cell_index(state, class);
+        let cell = direct_row_cell_index(state, class, self.direct_row_stride);
         *self
             .rows
             .get_mut(cell)
@@ -5004,7 +5121,7 @@ fn try_warm_direct_exists(
         return Ok(None);
     }
 
-    let initial_row = direct_row_offset(lazy.initial)?;
+    let initial_row = lazy.row_offset(lazy.initial)?;
     let (mut state, mut position, mut consumed, engine_candidate) =
         match warm_bounded_start(haystack, window, proof)? {
             WarmBoundedStart::Exhausted => return Ok(Some(false)),
@@ -5219,7 +5336,7 @@ fn continue_warm_direct_exists_loop<const LOOP_SKIP: bool>(
         if LOOP_SKIP {
             let selected = lazy
                 .loop_skip_plans
-                .find_with_hint(state, active_loop_slot);
+                .find_with_hint(state, active_loop_slot, lazy.direct_row_stride);
             let selected_slot = selected.map(|(slot, _)| slot);
             if selected_slot != active_loop_slot {
                 loop_probe.left_plan_state();
@@ -5346,7 +5463,7 @@ fn try_warm_direct_selected_end(
         return Ok(WarmDirectSelectedEnd::Declined);
     }
 
-    let initial_row = direct_row_offset(lazy.initial)?;
+    let initial_row = lazy.row_offset(lazy.initial)?;
     let mut state = initial_row;
     let mut position = window.start();
     let mut pending_end = initial_pending.then_some(window.start());
@@ -5502,7 +5619,7 @@ fn try_warm_proved_start_selected_end(
         return Ok(Some(window.start()));
     }
 
-    let mut state = direct_row_offset(lazy.initial)?;
+    let mut state = lazy.row_offset(lazy.initial)?;
     let mut position = window.start();
     let mut pending_end = initial_pending.then_some(window.start());
     let mut direct_steps = 0usize;
@@ -5646,7 +5763,7 @@ fn try_warm_direct_span_with_reverse(
         return Ok(WarmDirectSpan::Declined);
     }
 
-    let initial_row = direct_row_offset(lazy.initial)?;
+    let initial_row = lazy.row_offset(lazy.initial)?;
     let mut state = initial_row;
     let mut position = window.start();
     let mut pending_end = initial_pending.then_some(window.start());
@@ -5784,7 +5901,7 @@ fn try_warm_direct_span_with_reverse(
         return Ok(WarmDirectSpan::Declined);
     }
 
-    let mut state = direct_row_offset(reverse.initial)?;
+    let mut state = reverse.row_offset(reverse.initial)?;
     let mut cursor = selected_end;
     let mut candidate = None;
     while cursor > window.start() {
@@ -6978,7 +7095,7 @@ fn execute_lazy_loop(
             1,
         )));
     }
-    let initial_row = direct_row_offset(initial)?;
+    let initial_row = workspace.lazy.row_offset(initial)?;
     let mut state = LazyState::Cached(initial_row);
     let mut position = window.start();
     let mut boundaries = 0usize;
@@ -7057,7 +7174,7 @@ fn execute_lazy_loop(
                 if cell == LAZY_CELL_UNFILLED {
                     build_lazy_cached_transition(
                         automaton,
-                        direct_row_state(cached),
+                        workspace.lazy.row_state(cached),
                         byte,
                         class,
                         workspace,
@@ -8033,7 +8150,7 @@ fn finish_resume_lazy_cached_transition(
             .lazy
             .intern_speculative(next_pending, meter, core_reserve, position)?
         {
-            LazyInterned::State(next) => direct_row_encoded_state(next)?,
+            LazyInterned::State(next) => workspace.lazy.encoded_state(next)?,
             LazyInterned::BudgetDeclined => {
                 workspace.lazy.retain_scratch_as_frontier()?;
                 workspace.lazy.inline_start_action = start_action;
@@ -8506,7 +8623,7 @@ fn seed_lazy_resume_state(
         if cached_pending == pending
             && workspace.lazy.items.get(cached_offset..cached_end) == Some(seed)
         {
-            return Ok(LazyState::Cached(direct_row_offset(cached_hint)?));
+            return Ok(LazyState::Cached(workspace.lazy.row_offset(cached_hint)?));
         }
     }
     resume_set.cached_states[resume_state] = LAZY_NO_STATE;
@@ -8529,7 +8646,7 @@ fn seed_lazy_resume_state(
         {
             LazyInterned::State(state) => {
                 resume_set.cached_states[resume_state] = state;
-                return Ok(LazyState::Cached(direct_row_offset(state)?));
+                return Ok(LazyState::Cached(workspace.lazy.row_offset(state)?));
             }
             LazyInterned::BudgetDeclined => {
                 workspace.lazy.retain_scratch_as_frontier()?;
@@ -8684,7 +8801,7 @@ fn execute_lazy_resume_loop<const BATCH_WARM: bool>(
                 if cell == LAZY_CELL_UNFILLED {
                     build_resume_lazy_cached_transition(
                         automaton,
-                        direct_row_state(cached),
+                        workspace.lazy.row_state(cached),
                         byte,
                         class,
                         workspace,
@@ -8855,7 +8972,7 @@ fn execute_lazy_span_loop<const TRACK_START: bool, const LOOP_SKIP: bool>(
     }
     // Even a physically full cache retains useful prefix rows. Start from the
     // cached initial state and hand off only when an unfilled edge is reached.
-    let initial_row = direct_row_offset(initial)?;
+    let initial_row = workspace.lazy.row_offset(initial)?;
     let mut state = LazyState::Cached(initial_row);
     let mut position = window.start();
     let mut boundaries = 0usize;
@@ -8967,7 +9084,11 @@ fn execute_lazy_span_loop<const TRACK_START: bool, const LOOP_SKIP: bool>(
                 LazyState::Cached(row_offset) => workspace
                     .lazy
                     .loop_skip_plans
-                    .find_with_hint(row_offset, active_loop_slot),
+                    .find_with_hint(
+                        row_offset,
+                        active_loop_slot,
+                        workspace.lazy.direct_row_stride,
+                    ),
                 LazyState::Inline { .. } => None,
             };
             let selected_slot = selected.map(|(slot, _)| slot);
@@ -9039,7 +9160,7 @@ fn execute_lazy_span_loop<const TRACK_START: bool, const LOOP_SKIP: bool>(
                 if cell == LAZY_CELL_UNFILLED {
                     build_lazy_cached_transition(
                         automaton,
-                        direct_row_state(cached),
+                        workspace.lazy.row_state(cached),
                         byte,
                         class,
                         workspace,
@@ -10837,7 +10958,10 @@ fn try_publish_lazy_loop_skip_candidates(
     let mut unresolved_len = 0usize;
 
     for candidate in candidates.into_iter().flatten() {
-        if let Some(slot) = lazy.loop_skip_plans.matching_slot(candidate) {
+        if let Some(slot) = lazy
+            .loop_skip_plans
+            .matching_slot(candidate, lazy.direct_row_stride)
+        {
             if assigned[slot] {
                 return Err(SearchError::InternalInvariant {
                     detail: "direct loop publication selected one owner twice",
@@ -10887,7 +11011,7 @@ fn try_publish_lazy_loop_skip_candidates(
             });
         }
         byte_bitmap_insert(&mut target_members, state);
-        target_rows[slot] = Some(direct_row_offset(candidate.state)?);
+        target_rows[slot] = Some(lazy.row_offset(candidate.state)?);
     }
 
     let mut changed = [false; LAZY_LOOP_SKIP_PLAN_CAPACITY];
@@ -10975,8 +11099,8 @@ fn try_derive_lazy_loop_skip(
         let state_u32 = u32::try_from(state).map_err(|_| SearchError::InternalInvariant {
             detail: "lazy loop analysis state does not fit u32",
         })?;
-        let row_offset = direct_row_offset(state_u32)?;
-        let same_row_encoded = direct_row_encoded_state(state_u32)?;
+        let row_offset = workspace.lazy.row_offset(state_u32)?;
+        let same_row_encoded = workspace.lazy.encoded_state(state_u32)?;
         let mut propagate_members = [0_u64; 4];
         let mut drop_members = [0_u64; 4];
         for class_index in 0..automaton.byte_classes().count() {
@@ -11792,7 +11916,7 @@ fn finish_lazy_cached_transition(
             .lazy
             .intern_speculative(next_pending, meter, core_reserve, position)?
         {
-            LazyInterned::State(next) => direct_row_encoded_state(next)?,
+            LazyInterned::State(next) => workspace.lazy.encoded_state(next)?,
             LazyInterned::BudgetDeclined => {
                 workspace.lazy.retain_scratch_as_frontier()?;
                 workspace.lazy.inline_start_action = start_action;
@@ -12273,7 +12397,7 @@ fn finish_reverse_cached_transition(
             .reverse
             .intern_speculative(meter, core_reserve, position)?
         {
-            LazyInterned::State(next) => direct_row_encoded_state(next)?,
+            LazyInterned::State(next) => workspace.reverse.encoded_state(next)?,
             LazyInterned::BudgetDeclined => {
                 workspace.reverse.retain_scratch_as_frontier()?;
                 return Ok(ReverseTransition::Inline { reaches_start });
@@ -12459,7 +12583,7 @@ fn execute_positive_end_reverse_lazy_loop<const COMPLETE_FRONTIER: bool>(
             detail: "positive-end verifier has no initialized reverse state",
         });
     }
-    let mut state = ReverseState::Cached(direct_row_offset(initial)?);
+    let mut state = ReverseState::Cached(workspace.reverse.row_offset(initial)?);
     let mut cursor = endpoint;
     while cursor > window_start {
         if *reverse_source_bytes >= max_reverse_bytes {
@@ -12486,7 +12610,7 @@ fn execute_positive_end_reverse_lazy_loop<const COMPLETE_FRONTIER: bool>(
                 if cell == LAZY_CELL_UNFILLED {
                     build_positive_end_cached_transition(
                         automaton,
-                        direct_row_state(cached),
+                        workspace.reverse.row_state(cached),
                         byte,
                         class,
                         workspace,
@@ -12671,7 +12795,7 @@ fn execute_reverse_lazy_loop(
             detail: "initialized reverse DFA has no initial state",
         });
     }
-    let mut state = ReverseState::Cached(direct_row_offset(initial)?);
+    let mut state = ReverseState::Cached(workspace.reverse.row_offset(initial)?);
     let mut cursor = selected_end;
     let mut candidate = None;
     // The Accept-seeded state is the reverse automaton's selected-end
@@ -12694,7 +12818,7 @@ fn execute_reverse_lazy_loop(
                 if cell == LAZY_CELL_UNFILLED {
                     build_reverse_cached_transition(
                         automaton,
-                        direct_row_state(cached),
+                        workspace.reverse.row_state(cached),
                         byte,
                         class,
                         workspace,
@@ -12771,7 +12895,7 @@ fn execute_resume_reverse_lazy_loop(
             detail: "initialized reverse DFA has no initial state",
         });
     }
-    let mut state = ReverseState::Cached(direct_row_offset(initial)?);
+    let mut state = ReverseState::Cached(workspace.reverse.row_offset(initial)?);
     let mut cursor = selected_end;
     let mut candidate = None;
     // The Accept-seeded state is the reverse automaton's selected-end
@@ -12794,7 +12918,7 @@ fn execute_resume_reverse_lazy_loop(
                 if cell == LAZY_CELL_UNFILLED {
                     build_resume_reverse_cached_transition(
                         automaton,
-                        direct_row_state(cached),
+                        workspace.reverse.row_state(cached),
                         byte,
                         class,
                         workspace,
@@ -12966,7 +13090,7 @@ fn execute_selected_end_reverse_lazy_loop(
             detail: "initialized reverse DFA has no initial state",
         });
     }
-    let mut state = ReverseState::Cached(direct_row_offset(initial)?);
+    let mut state = ReverseState::Cached(workspace.reverse.row_offset(initial)?);
     let mut cursor = selected_end;
     let mut candidate = None;
     // The Accept-seeded state is the reverse automaton's selected-end
@@ -12989,7 +13113,7 @@ fn execute_selected_end_reverse_lazy_loop(
                 if cell == LAZY_CELL_UNFILLED {
                     build_selected_end_reverse_cached_transition(
                         automaton,
-                        direct_row_state(cached),
+                        workspace.reverse.row_state(cached),
                         byte,
                         class,
                         workspace,
@@ -16611,6 +16735,7 @@ fn lazy_initialized_slots(
     states: usize,
     state_capacity: usize,
     item_capacity: usize,
+    direct_row_stride: u32,
     context_slots: usize,
 ) -> Result<usize, SearchError> {
     if state_capacity == 0 {
@@ -16618,7 +16743,11 @@ fn lazy_initialized_slots(
     }
     let rows = if context_slots == 0 {
         state_capacity
-            .checked_mul(BYTE_ALPHABET)
+            .checked_mul(usize::try_from(direct_row_stride).map_err(|_| {
+                SearchError::InternalInvariant {
+                    detail: "lazy DFA row stride does not fit usize",
+                }
+            })?)
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "lazy DFA initialized row slots",
             })?
@@ -16647,6 +16776,7 @@ fn lazy_scratch_bytes(
     states: usize,
     state_capacity: usize,
     item_capacity: usize,
+    direct_row_stride: u32,
     context_slots: usize,
 ) -> Result<usize, SearchError> {
     if state_capacity == 0 {
@@ -16654,7 +16784,11 @@ fn lazy_scratch_bytes(
     }
     let rows = if context_slots == 0 {
         state_capacity
-            .checked_mul(BYTE_ALPHABET)
+            .checked_mul(usize::try_from(direct_row_stride).map_err(|_| {
+                SearchError::InternalInvariant {
+                    detail: "lazy DFA row stride does not fit usize",
+                }
+            })?)
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "lazy DFA row cells",
             })?
@@ -16720,6 +16854,7 @@ fn reverse_initialized_slots(
     edges: usize,
     state_capacity: usize,
     item_capacity: usize,
+    direct_row_stride: u32,
     context_slots: usize,
 ) -> Result<usize, SearchError> {
     if state_capacity == 0 {
@@ -16727,7 +16862,11 @@ fn reverse_initialized_slots(
     }
     let rows = if context_slots == 0 {
         state_capacity
-            .checked_mul(BYTE_ALPHABET)
+            .checked_mul(usize::try_from(direct_row_stride).map_err(|_| {
+                SearchError::InternalInvariant {
+                    detail: "reverse lazy DFA row stride does not fit usize",
+                }
+            })?)
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "reverse lazy DFA initialized row slots",
             })?
@@ -16767,6 +16906,7 @@ fn reverse_scratch_bytes(
     edges: usize,
     state_capacity: usize,
     item_capacity: usize,
+    direct_row_stride: u32,
     context_slots: usize,
 ) -> Result<usize, SearchError> {
     if state_capacity == 0 {
@@ -16774,7 +16914,11 @@ fn reverse_scratch_bytes(
     }
     let rows = if context_slots == 0 {
         state_capacity
-            .checked_mul(BYTE_ALPHABET)
+            .checked_mul(usize::try_from(direct_row_stride).map_err(|_| {
+                SearchError::InternalInvariant {
+                    detail: "reverse lazy DFA row stride does not fit usize",
+                }
+            })?)
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "reverse lazy DFA row cells",
             })?
@@ -16992,6 +17136,10 @@ mod tests {
 
     fn byte_class(automaton: &Automaton, byte: u8) -> u8 {
         automaton.byte_classes().class_of(byte)
+    }
+
+    fn direct_row_stride(automaton: &Automaton) -> u32 {
+        u32::try_from(automaton.byte_classes().count()).unwrap()
     }
 
     fn one_below_owner_free(work: u64) -> u64 {
@@ -18620,7 +18768,7 @@ mod tests {
         for &item in published_items {
             let item_index = usize::try_from(item.checked_sub(1).unwrap()).unwrap();
             let state = states_by_item[item_index];
-            let cell = super::direct_row_encoded_state(state).unwrap()
+            let cell = workspace.lazy.encoded_state(state).unwrap()
                 | super::LazyStartAction::Propagate.cell_bits();
             workspace
                 .lazy
@@ -18641,7 +18789,7 @@ mod tests {
             .flatten()
             .map(|plan| {
                 (
-                    super::direct_row_state(plan.row_offset),
+                    workspace.lazy.row_state(plan.row_offset),
                     plan.start_action,
                     plan.scanner.words(),
                 )
@@ -18659,7 +18807,7 @@ mod tests {
             .map(|plan| {
                 workspace
                     .lazy
-                    .item(super::direct_row_state(plan.row_offset), 0)
+                    .item(workspace.lazy.row_state(plan.row_offset), 0)
                     .unwrap()
             })
             .collect::<Vec<_>>();
@@ -18694,7 +18842,7 @@ mod tests {
             .iter()
             .enumerate()
             .find_map(|(slot, plan)| {
-                let state = super::direct_row_state(plan.as_ref()?.row_offset);
+                let state = workspace.lazy.row_state(plan.as_ref()?.row_offset);
                 (workspace.lazy.item(state, 0).unwrap() == item).then_some(slot)
             })
             .expect("a retained direct loop item has one physical owner slot")
@@ -18887,11 +19035,11 @@ mod tests {
         workspace.lazy.initial_kind = super::LazyInitialKind::Positive;
         workspace.lazy.initialized = true;
 
-        let initial_loop = super::direct_row_encoded_state(initial).unwrap()
+        let initial_loop = workspace.lazy.encoded_state(initial).unwrap()
             | super::LazyStartAction::Propagate.cell_bits();
-        let enter_second = super::direct_row_encoded_state(second).unwrap()
+        let enter_second = workspace.lazy.encoded_state(second).unwrap()
             | super::LazyStartAction::Propagate.cell_bits();
-        let second_loop = super::direct_row_encoded_state(second).unwrap()
+        let second_loop = workspace.lazy.encoded_state(second).unwrap()
             | super::LazyStartAction::Propagate.cell_bits();
         workspace
             .lazy
@@ -20051,6 +20199,7 @@ mod tests {
                 endpoint.states,
                 forward_states,
                 endpoint.lazy_item_capacity,
+                endpoint.direct_row_stride,
                 0,
             )
             .unwrap();
@@ -20066,6 +20215,7 @@ mod tests {
                 endpoint.states,
                 forward_states,
                 endpoint.lazy_item_capacity,
+                endpoint.direct_row_stride,
                 0,
             )
             .unwrap()
@@ -20096,7 +20246,9 @@ mod tests {
             .unwrap();
             assert_eq!(
                 exact_endpoint.lazy.rows.len(),
-                forward_states.checked_mul(super::BYTE_ALPHABET).unwrap(),
+                forward_states
+                    .checked_mul(usize::try_from(endpoint.direct_row_stride).unwrap())
+                    .unwrap(),
                 "{name}: forward row cells"
             );
             assert_eq!(
@@ -20155,7 +20307,9 @@ mod tests {
                 K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
             assert_eq!(
                 exact_full.reverse.rows.len(),
-                reverse_states.checked_mul(super::BYTE_ALPHABET).unwrap(),
+                reverse_states
+                    .checked_mul(usize::try_from(full.direct_row_stride).unwrap())
+                    .unwrap(),
                 "{name}: reverse row cells"
             );
             assert_eq!(
@@ -27402,7 +27556,7 @@ mod tests {
         assert_eq!(all.scan_forward(&source), source.len());
 
         let plan = full_byte_loop_class();
-        let cell = super::direct_row_encoded_state(0).unwrap()
+        let cell = super::direct_row_encoded_state(0, direct_row_stride(&plan)).unwrap()
             | super::LazyStartAction::Propagate.cell_bits();
         let mut workspace = direct_nonpending_loop_workspace(&plan, cell);
         let mut derive = WorkMeter::new(u64::MAX, 0);
@@ -27435,9 +27589,13 @@ mod tests {
             );
             for (item_index, state) in states_by_item.into_iter().enumerate() {
                 let expected = item_index < 4;
-                let row_offset = super::direct_row_offset(state).unwrap();
+                let row_offset = workspace.lazy.row_offset(state).unwrap();
                 assert_eq!(
-                    workspace.lazy.loop_skip_plans.find(row_offset).is_some(),
+                    workspace
+                        .lazy
+                        .loop_skip_plans
+                        .find(row_offset, workspace.lazy.direct_row_stride)
+                        .is_some(),
                     expected,
                     "graph item {}",
                     item_index + 1
@@ -27868,7 +28026,7 @@ mod tests {
             super::try_derive_lazy_loop_skip(&plan, &mut workspace, &mut initial).unwrap();
             assert_eq!(direct_loop_cache_items(&workspace), [2, 3, 4, 5]);
             let state = states_by_item[0];
-            let cell = super::direct_row_encoded_state(state).unwrap()
+            let cell = workspace.lazy.encoded_state(state).unwrap()
                 | super::LazyStartAction::Propagate.cell_bits();
             workspace
                 .lazy
@@ -27887,8 +28045,12 @@ mod tests {
         let upgrade_work = exact.consumed;
         assert_eq!(direct_loop_cache_items(&measured), [1, 2, 3, 4]);
         let evicted_state = measured_states[4];
-        let evicted_row = super::direct_row_offset(evicted_state).unwrap();
-        assert!(measured.lazy.loop_skip_plans.find(evicted_row).is_none());
+        let evicted_row = measured.lazy.row_offset(evicted_state).unwrap();
+        assert!(measured
+            .lazy
+            .loop_skip_plans
+            .find(evicted_row, measured.lazy.direct_row_stride)
+            .is_none());
         assert!(!super::byte_bitmap_contains(
             measured.lazy.loop_skip_plans.state_members,
             u8::try_from(evicted_state).unwrap(),
@@ -27930,13 +28092,18 @@ mod tests {
         let window = SearchWindow::full(&haystack);
 
         let mut ordinary = direct_two_state_loop_workspace(&plan);
-        let initial_row = super::direct_row_offset(ordinary.lazy.initial).unwrap();
-        let second_row = super::direct_row_offset(1).unwrap();
-        let initial_slot = ordinary.lazy.loop_skip_plans.find(initial_row).unwrap().0;
+        let initial_row = ordinary.lazy.row_offset(ordinary.lazy.initial).unwrap();
+        let second_row = ordinary.lazy.row_offset(1).unwrap();
+        let initial_slot = ordinary
+            .lazy
+            .loop_skip_plans
+            .find(initial_row, ordinary.lazy.direct_row_stride)
+            .unwrap()
+            .0;
         let (second_slot, second_contains_b) = ordinary
             .lazy
             .loop_skip_plans
-            .find(second_row)
+            .find(second_row, ordinary.lazy.direct_row_stride)
             .map(|(slot, plan)| (slot, plan.scanner.contains(b'b')))
             .unwrap();
         assert_ne!(initial_slot, second_slot);
@@ -28128,7 +28295,7 @@ mod tests {
         assert_eq!(direct_loop_cache_signature(&skipped_workspace), signature);
         assert_eq!(skipped_workspace.lazy.rows, rows);
         assert_eq!(skipped_workspace.lazy.direct_cells_published, published);
-        let second_row = super::direct_row_offset(1).unwrap();
+        let second_row = skipped_workspace.lazy.row_offset(1).unwrap();
         assert_eq!(
             skipped_workspace
                 .lazy
@@ -28375,7 +28542,7 @@ mod tests {
     #[test]
     fn direct_loop_plan_upgrades_transactionally_to_disjoint_high_members() {
         let plan = disjoint_ascii_and_high_loop_classes();
-        let cell = super::direct_row_encoded_state(0).unwrap()
+        let cell = super::direct_row_encoded_state(0, direct_row_stride(&plan)).unwrap()
             | super::LazyStartAction::Propagate.cell_bits();
 
         let mut measured = narrow_then_high_loop_workspace(&plan, cell);
@@ -28434,12 +28601,12 @@ mod tests {
 
     #[test]
     fn loop_skip_admits_narrow_ascii_classes_and_nonpending_states() {
-        let encoded = super::direct_row_encoded_state(0).unwrap();
-        let cell = encoded | super::LazyStartAction::Propagate.cell_bits();
         let mut singleton_work = None;
 
         for cardinality in [1_u8, 15, 16, 127] {
             let plan = ascii_loop_class(cardinality);
+            let encoded = super::direct_row_encoded_state(0, direct_row_stride(&plan)).unwrap();
+            let cell = encoded | super::LazyStartAction::Propagate.cell_bits();
             let mut workspace = direct_nonpending_loop_workspace(&plan, cell);
             assert_eq!(workspace.lazy.modes[0], 0, "class {cardinality}");
 
@@ -28462,6 +28629,8 @@ mod tests {
         }
 
         let plan = ascii_loop_class(1);
+        let encoded = super::direct_row_encoded_state(0, direct_row_stride(&plan)).unwrap();
+        let cell = encoded | super::LazyStartAction::Propagate.cell_bits();
         let analysis_work = singleton_work.unwrap();
         let mut refused = direct_nonpending_loop_workspace(&plan, cell);
         let rows = refused.lazy.rows.clone();
@@ -28514,8 +28683,9 @@ mod tests {
     #[test]
     fn loop_skip_rejects_accept_restart_and_nonself_cells() {
         let plan = ascii_loop_class(1);
-        let self_encoded = super::direct_row_encoded_state(0).unwrap();
-        let other_encoded = super::direct_row_encoded_state(1).unwrap();
+        let stride = direct_row_stride(&plan);
+        let self_encoded = super::direct_row_encoded_state(0, stride).unwrap();
+        let other_encoded = super::direct_row_encoded_state(1, stride).unwrap();
         let rejected = [
             (
                 "accept",
@@ -31006,6 +31176,7 @@ mod tests {
             full.edges,
             full.reverse_state_capacity,
             full.reverse_item_capacity,
+            full.direct_row_stride,
             full.reverse_context_slots,
         )
         .unwrap();
@@ -31670,20 +31841,61 @@ mod tests {
     }
 
     #[test]
-    fn direct_cache_uses_byte_classes_without_changing_the_physical_layout() {
+    fn direct_cache_uses_exact_byte_class_rows_for_every_raw_byte() {
         let plan = byte_chain(&[(b'a', b'c')]);
         pin_without_start_filter(&plan);
         let layout = super::WorkspaceLayout::for_accelerated_automaton(&plan).unwrap();
         let mut workspace =
             K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
         assert_eq!(super::BYTE_ALPHABET, 256);
+        let stride = plan.byte_classes().count();
+        assert_eq!(usize::try_from(layout.direct_row_stride).unwrap(), stride);
+        assert!(stride < super::BYTE_ALPHABET);
+        let exact_row_cells = layout.lazy_state_capacity.checked_mul(stride).unwrap();
+        let fixed_stride_cells = layout
+            .lazy_state_capacity
+            .checked_mul(super::BYTE_ALPHABET)
+            .unwrap();
+        assert_eq!(workspace.lazy.rows.len(), exact_row_cells);
         assert_eq!(
-            workspace.lazy.rows.len(),
-            layout.lazy_state_capacity * super::BYTE_ALPHABET
+            workspace.lazy.row_offset(1).unwrap() - workspace.lazy.row_offset(0).unwrap(),
+            layout.direct_row_stride
         );
         assert_eq!(
-            super::direct_row_offset(1).unwrap() - super::direct_row_offset(0).unwrap(),
-            256
+            fixed_stride_cells.checked_sub(exact_row_cells).unwrap(),
+            layout
+                .lazy_state_capacity
+                .checked_mul(super::BYTE_ALPHABET.checked_sub(stride).unwrap())
+                .unwrap()
+        );
+        let saved_row_bytes = fixed_stride_cells
+            .checked_sub(exact_row_cells)
+            .and_then(|cells| cells.checked_mul(core::mem::size_of::<u32>()))
+            .unwrap();
+        let exact_lazy_bytes = super::lazy_scratch_bytes(
+            layout.states,
+            layout.lazy_state_capacity,
+            layout.lazy_item_capacity,
+            layout.direct_row_stride,
+            layout.lazy_context_slots,
+        )
+        .unwrap();
+        let fixed_lazy_bytes = super::lazy_scratch_bytes(
+            layout.states,
+            layout.lazy_state_capacity,
+            layout.lazy_item_capacity,
+            u32::try_from(super::BYTE_ALPHABET).unwrap(),
+            layout.lazy_context_slots,
+        )
+        .unwrap();
+        assert_eq!(
+            fixed_lazy_bytes.checked_sub(exact_lazy_bytes).unwrap(),
+            saved_row_bytes
+        );
+        let pike = super::WorkspaceLayout::for_automaton(&plan).unwrap();
+        assert_eq!(
+            layout.logical_bytes().checked_sub(pike.logical_bytes()).unwrap(),
+            exact_lazy_bytes
         );
 
         let class = byte_class(&plan, b'a');
@@ -31736,6 +31948,57 @@ mod tests {
         );
         assert_eq!(second.consumed, 0, "an equivalent-byte hit does no closure work");
         assert_eq!(workspace.lazy.direct_cells_published, published + 1);
+
+        let row_offset = workspace.lazy.row_offset(state).unwrap();
+        for class_index in 0..stride {
+            let class = u8::try_from(class_index).unwrap();
+            if workspace.lazy.cell(state, class).unwrap() == super::LAZY_CELL_UNFILLED {
+                let representative = plan.byte_classes().representative(class).unwrap();
+                let mut meter = WorkMeter::new(u64::MAX, 0);
+                assert!(matches!(
+                    super::build_lazy_cached_transition(
+                        &plan,
+                        state,
+                        representative,
+                        class,
+                        &mut workspace,
+                        &mut meter,
+                        0,
+                        0,
+                    )
+                    .unwrap(),
+                    super::LazyTransition::Ready(_)
+                ));
+            }
+        }
+        for byte in u8::MIN..=u8::MAX {
+            let class = byte_class(&plan, byte);
+            let representative = plan.byte_classes().representative(class).unwrap();
+            assert_eq!(byte_class(&plan, representative), class, "raw byte {byte:#04x}");
+            let semantic_cell = workspace.lazy.cell(state, class).unwrap();
+            assert_eq!(
+                workspace.lazy.direct_cell(row_offset, class).unwrap(),
+                semantic_cell,
+                "raw byte {byte:#04x}"
+            );
+            let mut hit = WorkMeter::new(u64::MAX, 0);
+            assert_eq!(
+                super::build_lazy_cached_transition(
+                    &plan,
+                    state,
+                    byte,
+                    class,
+                    &mut workspace,
+                    &mut hit,
+                    0,
+                    0,
+                )
+                .unwrap(),
+                super::LazyTransition::Ready(semantic_cell),
+                "raw byte {byte:#04x}"
+            );
+            assert_eq!(hit.consumed, 0, "raw byte {byte:#04x}");
+        }
 
         let mut source = vec![b'a'];
         let address = source.as_ptr();
@@ -31792,7 +32055,7 @@ mod tests {
         );
         assert_eq!(
             workspace.lazy.rows.len(),
-            layout.lazy_state_capacity * super::BYTE_ALPHABET
+            exact_row_cells
         );
     }
 
@@ -31850,7 +32113,7 @@ mod tests {
         assert_eq!(workspace.reverse.cell(state, class).unwrap(), cell);
         assert_eq!(
             workspace.reverse.rows.len(),
-            layout.reverse_state_capacity * super::BYTE_ALPHABET
+            layout.reverse_state_capacity * plan.byte_classes().count()
         );
         assert_eq!(plan.bidirectional_workspace_layout().unwrap(), layout);
     }
@@ -31972,7 +32235,7 @@ mod tests {
         );
         assert_eq!(
             workspace.lazy.rows.len(),
-            layout.lazy_state_capacity * super::BYTE_ALPHABET
+            layout.lazy_state_capacity * plan.byte_classes().count()
         );
     }
 
@@ -32181,10 +32444,12 @@ mod tests {
     fn reverse_cache_is_bound_to_the_exact_immutable_automaton() {
         let first = byte_chain(&[(b'a', b'a'), (b'b', b'b')]);
         let second = byte_chain(&[(b'a', b'a'), (b'c', b'c')]);
-        assert_eq!(
-            first.bidirectional_workspace_layout().unwrap(),
-            second.bidirectional_workspace_layout().unwrap()
-        );
+        let first_layout = first.bidirectional_workspace_layout().unwrap();
+        let second_layout = second.bidirectional_workspace_layout().unwrap();
+        assert_ne!(first_layout.direct_row_stride, second_layout.direct_row_stride);
+        assert_eq!(first_layout.states, second_layout.states);
+        assert_eq!(first_layout.edges, second_layout.edges);
+        assert_eq!(first_layout.closure_slots, second_layout.closure_slots);
         let mut workspace =
             K0Workspace::new_bidirectional(&first, WorkspaceLimits::unlimited()).unwrap();
         assert_eq!(
@@ -32464,7 +32729,7 @@ mod tests {
         let initial = workspace.lazy.initial;
         let class = byte_class(&plan, b'a');
         let pending = workspace.lazy.cell(initial, class).unwrap() & super::LAZY_CELL_STATE_MASK;
-        let pending = super::direct_row_state(pending.checked_sub(1).unwrap());
+        let pending = workspace.lazy.row_state(pending.checked_sub(1).unwrap());
         assert_eq!(
             workspace.lazy.cell(pending, class).unwrap(),
             super::LAZY_CELL_UNFILLED
@@ -32550,10 +32815,13 @@ mod tests {
                 detail: "lazy DFA transition state is outside the cache",
             }
         );
-        let forward_row = super::direct_row_offset(forward_initial).unwrap();
+        let forward_row = forward.lazy.row_offset(forward_initial).unwrap();
         forward.lazy.rows.clear();
         assert_eq!(
-            forward.lazy.direct_cell(forward_row, b'a').unwrap_err(),
+            forward
+                .lazy
+                .direct_cell(forward_row, byte_class(&plan, b'a'))
+                .unwrap_err(),
             SearchError::InternalInvariant {
                 detail: "lazy DFA transition cell is outside the direct table",
             }
@@ -32573,10 +32841,13 @@ mod tests {
                 detail: "reverse DFA transition state is outside the cache",
             }
         );
-        let reverse_row = super::direct_row_offset(reverse_initial).unwrap();
+        let reverse_row = reverse.reverse.row_offset(reverse_initial).unwrap();
         reverse.reverse.rows.clear();
         assert_eq!(
-            reverse.reverse.direct_cell(reverse_row, b'a').unwrap_err(),
+            reverse
+                .reverse
+                .direct_cell(reverse_row, byte_class(&plan, b'a'))
+                .unwrap_err(),
             SearchError::InternalInvariant {
                 detail: "reverse DFA transition cell is outside the direct table",
             }
@@ -33193,7 +33464,11 @@ mod tests {
         assert_eq!(session.workspace.stack_len, stack_len);
 
         let initial_row = usize::try_from(
-            super::direct_row_offset(session.workspace.lazy.initial).unwrap(),
+            session
+                .workspace
+                .lazy
+                .row_offset(session.workspace.lazy.initial)
+                .unwrap(),
         )
         .unwrap();
         let first_cell = initial_row + usize::from(byte_class(&plan, b'a'));
@@ -33428,7 +33703,11 @@ mod tests {
         assert_eq!(session.workspace.lazy.rows, before_rows);
 
         let initial_row = usize::try_from(
-            super::direct_row_offset(session.workspace.lazy.initial).unwrap(),
+            session
+                .workspace
+                .lazy
+                .row_offset(session.workspace.lazy.initial)
+                .unwrap(),
         )
         .unwrap();
         let first_cell = initial_row + usize::from(byte_class(&plan, b'A'));
@@ -33927,7 +34206,11 @@ mod tests {
         );
         let proof = plan.start_filter_proof.get().unwrap();
         let forward_row = usize::try_from(
-            super::direct_row_offset(forward.workspace.lazy.initial).unwrap(),
+            forward
+                .workspace
+                .lazy
+                .row_offset(forward.workspace.lazy.initial)
+                .unwrap(),
         )
         .unwrap();
         let forward_cell = forward_row
@@ -33977,7 +34260,11 @@ mod tests {
             expected
         );
         let reverse_row = usize::try_from(
-            super::direct_row_offset(reverse.workspace.reverse.initial).unwrap(),
+            reverse
+                .workspace
+                .reverse
+                .row_offset(reverse.workspace.reverse.initial)
+                .unwrap(),
         )
         .unwrap();
         let reverse_cell = reverse_row
@@ -34678,7 +34965,11 @@ mod tests {
         assert_eq!(session.workspace.lazy.rows, before_rows);
 
         let initial_row = usize::try_from(
-            super::direct_row_offset(session.workspace.lazy.initial).unwrap(),
+            session
+                .workspace
+                .lazy
+                .row_offset(session.workspace.lazy.initial)
+                .unwrap(),
         )
         .unwrap();
         let first_cell = initial_row + usize::from(byte_class(&plan, b'A'));
@@ -35818,7 +36109,7 @@ mod tests {
         exit: ResumeBatchExit,
     ) {
         let ready = usize::from(super::RESUME_DIRECT_BATCH_MIN_READY) + 2;
-        let mut row = super::direct_row_offset(resume.cached_states[0]).unwrap();
+        let mut row = workspace.lazy.row_offset(resume.cached_states[0]).unwrap();
         let prefix_end = window.start().checked_add(ready).unwrap();
         for &byte in haystack.get(window.start()..prefix_end).unwrap() {
             assert_eq!(byte, b'a');
@@ -36170,7 +36461,7 @@ mod tests {
         contract: OutputContract,
     ) -> ((Option<MatchSpan>, usize), u64) {
         let state = super::LazyState::Cached(
-            super::direct_row_offset(resume.cached_states[0]).unwrap(),
+            workspace.lazy.row_offset(resume.cached_states[0]).unwrap(),
         );
         let mut meter = WorkMeter::new(u64::MAX, 0);
         let result = super::execute_lazy_resume_loop::<BATCH_WARM>(
