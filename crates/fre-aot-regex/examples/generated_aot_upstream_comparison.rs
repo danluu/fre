@@ -116,9 +116,10 @@ OPTIONS:
                          direct_resource_fallback,
                          prepared_runtime_assertion,
                          ordinary_runtime_resource_fallback, or
-                         prepared_runtime_resource_fallback. Retained resource
-                         fallbacks without a published native prepared entry
-                         use ordinary_runtime_resource_fallback.
+                         prepared_runtime_resource_fallback. Authenticated
+                         complete retained tables may use the self-contained
+                         direct_resource_fallback route; other retained rows
+                         without a prepared entry use the ordinary route.
   --measurement-order O  Timed engine order: upstream-native (default) or
                          native-upstream. All build/link/runtime preparation
                          completes before either timed phase.
@@ -133,9 +134,10 @@ OPTIONS:
   --force-retained-resource-fallback
                         Probe each source structurally, then force a canonical
                         decline that preserves nonempty DFA rows when the
-                        graph supports them. Retained rows must publish their
-                        native prepared entry. Keeps excluded exact-product
-                        and contextual rows in the printed diagnostic matrix.
+                        graph supports them. Incomplete rows publish a native
+                        prepared entry when eligible; authenticated complete
+                        rows may publish a self-contained direct entry. Keeps
+                        excluded exact-product and contextual diagnostic rows.
   --seed N               Measure one generated seed (decimal or 0x-prefixed).
                          Both grammar modes accept any new root seed.
   --grammar              Use the separate seeded grammar-generated diagnostic
@@ -1823,13 +1825,13 @@ fn retained_partial_stats(compiled: &CompiledRegex) -> Result<Option<PartialDfaS
         .map_err(|error| format!("partial-DFA statistics failed: {error}"))
 }
 
-fn is_self_contained_native_shape(
-    compiled: &CompiledRegex,
-    runtime_program_present: bool,
-    partial_dfa: Option<&PartialDfaStats>,
-) -> bool {
-    if runtime_program_present || compiled.module().required_runtime_symbol().is_some() {
-        return false;
+fn is_self_contained_native_shape(compiled: &CompiledRegex) -> Result<bool, String> {
+    if compiled.module().required_runtime_program().is_some()
+        || compiled.module().required_runtime_symbol().is_some()
+        || compiled.module().prepared_entry_symbol().is_some()
+        || compiled.receipt().runtime_helper_required
+    {
+        return Ok(false);
     }
     if matches!(
         compiled.receipt().engine,
@@ -1837,19 +1839,19 @@ fn is_self_contained_native_shape(
     ) || compiled.program().has_nfa_exact_product()
         && compiled.receipt().engine == EngineKind::OrderedNfa
     {
-        return true;
+        return Ok(true);
     }
-    compiled.receipt().engine == EngineKind::OrderedNfa
+    let partial_dfa = retained_partial_stats(compiled)?;
+    Ok(compiled.receipt().engine == EngineKind::OrderedNfa
         && compiled.receipt().engine_selection_reason
             == EngineSelectionReason::DeterminizationResourceLimit
-        && !compiled.receipt().runtime_helper_required
-        && partial_dfa.is_some_and(|stats| {
+        && partial_dfa.as_ref().is_some_and(|stats| {
             stats.complete_rows > 0
                 && stats.complete_rows == stats.discovered_states
                 && stats.resume_frontiers == 0
                 && stats.resume_items == 0
                 && stats.optimized_entry_supported
-        })
+        }))
 }
 
 fn compile_retained_resource_probe(
@@ -2021,11 +2023,7 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
                     spec.name
                 ));
             }
-            let self_contained_engine = is_self_contained_native_shape(
-                &aot,
-                runtime_program.is_some(),
-                partial_dfa.as_ref(),
-            );
+            let self_contained_engine = is_self_contained_native_shape(&aot)?;
             if runtime_program.is_none()
                 && (aot.module().required_runtime_symbol().is_some() || !self_contained_engine)
             {
@@ -3545,7 +3543,9 @@ fn print_partial_dfa_metadata(shapes: &[CompiledShape]) {
             format!("0x{:016x}", shape.spec.seed),
             shape.spec.output.name().to_owned(),
             shape.fallback_artifact_kind.to_owned(),
-            if partial.is_some() {
+            if partial.is_some() && shape.runtime_program.is_none() {
+                "retained_complete_direct_all_windows".to_owned()
+            } else if partial.is_some() {
                 "retained_partial_windows_ge_min".to_owned()
             } else {
                 "excluded_from_retained_partial".to_owned()
@@ -3928,6 +3928,7 @@ mod tests {
         assert!(aot.program().has_nfa_exact_product());
         assert!(aot.module().required_runtime_program().is_none());
         assert!(aot.module().required_runtime_symbol().is_none());
+        assert!(is_self_contained_native_shape(&aot).unwrap());
 
         let shape = CompiledShape {
             spec: grammar_patterns(&flat_grammar_config(Some(UNSEEN_TEST_SEED)))
@@ -3988,11 +3989,7 @@ mod tests {
         assert_eq!(partial.resume_frontiers, 0);
         assert_eq!(partial.resume_items, 0);
         assert!(partial.optimized_entry_supported);
-        assert!(is_self_contained_native_shape(
-            &retained,
-            false,
-            Some(&partial)
-        ));
+        assert!(is_self_contained_native_shape(&retained).unwrap());
     }
 
     #[test]
@@ -4062,6 +4059,7 @@ mod tests {
             assert!(runtime_program.is_some());
             assert!(partial_dfa.is_some());
             assert_eq!(aot.module().prepared_entry_symbol().is_some(), prepared);
+            assert!(!is_self_contained_native_shape(&aot).unwrap());
 
             let mut spec = base_spec.clone();
             spec.pattern = pattern.to_owned();
