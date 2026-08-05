@@ -68,15 +68,18 @@ enum InspectionMode {
         maximum_match_bytes: usize,
         branch_count: usize,
     },
-    Delimited {
-        branches: [DelimitedBranch; MAX_BRANCH_COUNT],
-        terminal_to_branch: [u8; 256],
-        minimum_match_bytes: usize,
-        branch_count: usize,
-    },
+    Delimited(DelimitedPlan),
 }
 
 impl Inspection {
+    pub(crate) const fn storage_bytes(&self) -> usize {
+        core::mem::size_of::<Plan>()
+            + match &self.mode {
+                InspectionMode::Bounded { .. } => 0,
+                InspectionMode::Delimited(_) => core::mem::size_of::<DelimitedPlan>(),
+            }
+    }
+
     pub(crate) fn build(self, dispatch: SimdDispatchContext) -> Plan {
         let terminal_seek = self.terminal_seek;
         let classifier = terminal_seek.requires_classifier().then(|| {
@@ -100,17 +103,7 @@ impl Inspection {
                     maximum_match_bytes,
                     branch_count,
                 },
-                InspectionMode::Delimited {
-                    branches,
-                    terminal_to_branch,
-                    minimum_match_bytes,
-                    branch_count,
-                } => PlanMode::Delimited {
-                    branches,
-                    terminal_to_branch,
-                    minimum_match_bytes,
-                    branch_count,
-                },
+                InspectionMode::Delimited(plan) => PlanMode::Delimited(Box::new(plan)),
             },
         }
     }
@@ -158,18 +151,21 @@ impl DelimitedBranch {
 }
 
 #[derive(Debug)]
+struct DelimitedPlan {
+    branches: [DelimitedBranch; MAX_BRANCH_COUNT],
+    terminal_to_branch: [u8; 256],
+    minimum_match_bytes: usize,
+    branch_count: usize,
+}
+
+#[derive(Debug)]
 enum PlanMode {
     Bounded {
         minimum_match_bytes: usize,
         maximum_match_bytes: usize,
         branch_count: usize,
     },
-    Delimited {
-        branches: [DelimitedBranch; MAX_BRANCH_COUNT],
-        terminal_to_branch: [u8; 256],
-        minimum_match_bytes: usize,
-        branch_count: usize,
-    },
+    Delimited(Box<DelimitedPlan>),
 }
 
 #[derive(Debug)]
@@ -180,42 +176,43 @@ pub(crate) struct Plan {
 }
 
 impl Plan {
-    pub(crate) const fn storage_bytes() -> usize {
+    pub(crate) fn storage_bytes(&self) -> usize {
         core::mem::size_of::<Self>()
+            + match &self.mode {
+                PlanMode::Bounded { .. } => 0,
+                PlanMode::Delimited(_) => core::mem::size_of::<DelimitedPlan>(),
+            }
     }
 
-    pub(crate) const fn minimum_match_bytes(&self) -> usize {
+    pub(crate) fn minimum_match_bytes(&self) -> usize {
         match &self.mode {
             PlanMode::Bounded {
                 minimum_match_bytes,
                 ..
-            }
-            | PlanMode::Delimited {
-                minimum_match_bytes,
-                ..
             } => *minimum_match_bytes,
+            PlanMode::Delimited(plan) => plan.minimum_match_bytes,
         }
     }
 
-    pub(crate) const fn maximum_match_bytes(&self) -> usize {
+    pub(crate) fn maximum_match_bytes(&self) -> usize {
         match &self.mode {
             PlanMode::Bounded {
                 maximum_match_bytes,
                 ..
             } => *maximum_match_bytes,
-            PlanMode::Delimited { .. } => 0,
+            PlanMode::Delimited(_) => 0,
         }
     }
 
-    pub(crate) const fn branch_count(&self) -> usize {
+    pub(crate) fn branch_count(&self) -> usize {
         match &self.mode {
-            PlanMode::Bounded { branch_count, .. }
-            | PlanMode::Delimited { branch_count, .. } => *branch_count,
+            PlanMode::Bounded { branch_count, .. } => *branch_count,
+            PlanMode::Delimited(plan) => plan.branch_count,
         }
     }
 
-    pub(crate) const fn is_exact_delimited(&self) -> bool {
-        matches!(&self.mode, PlanMode::Delimited { .. })
+    pub(crate) fn is_exact_delimited(&self) -> bool {
+        matches!(&self.mode, PlanMode::Delimited(_))
     }
 
     pub(crate) fn seek_terminal(
@@ -245,22 +242,17 @@ impl Plan {
         start: usize,
         end: usize,
     ) -> Option<(usize, usize)> {
-        let PlanMode::Delimited {
-            branches,
-            terminal_to_branch,
-            minimum_match_bytes,
-            ..
-        } = &self.mode
+        let PlanMode::Delimited(plan) = &self.mode
         else {
             return None;
         };
-        let mut position = start.checked_add(minimum_match_bytes.saturating_sub(1))?;
+        let mut position = start.checked_add(plan.minimum_match_bytes.saturating_sub(1))?;
         while position < end {
             let terminal_position = self.seek_terminal(haystack, position, end)?;
-            let branch_index = usize::from(terminal_to_branch[usize::from(
+            let branch_index = usize::from(plan.terminal_to_branch[usize::from(
                 haystack[terminal_position],
             )]);
-            if let Some(branch) = branches.get(branch_index) {
+            if let Some(branch) = plan.branches.get(branch_index) {
                 if let Some(matched) = authenticate_delimited_branch(
                     branch,
                     haystack,
@@ -694,12 +686,12 @@ fn inspect_exact_delimited_alternation(
     Ok(InspectionOutcome::Eligible(Inspection {
         terminal_words,
         terminal_seek,
-        mode: InspectionMode::Delimited {
+        mode: InspectionMode::Delimited(DelimitedPlan {
             branches: inspected,
             terminal_to_branch,
             minimum_match_bytes,
             branch_count: branches.len(),
-        },
+        }),
         planner_work: work,
     }))
 }
@@ -1039,6 +1031,15 @@ mod tests {
         (plan, work)
     }
 
+    fn inspection_storage_bytes(pattern: &str) -> usize {
+        let InspectionOutcome::Eligible(inspection) =
+            inspect(&parse(pattern), 0, u64::MAX).unwrap()
+        else {
+            panic!("exact delimited alternation was refused: {pattern:?}");
+        };
+        inspection.storage_bytes()
+    }
+
     #[test]
     fn exact_delimited_alternation_authenticates_branch_local_runs() {
         let (plan, _) = exact_plan(TARGET);
@@ -1098,7 +1099,28 @@ mod tests {
     fn planner_work_and_fixed_storage_are_exact_boundaries() {
         let hir = parse(TARGET);
         let (plan, exact_work) = exact_plan(TARGET);
-        assert_eq!(Plan::storage_bytes(), core::mem::size_of_val(&plan));
+        assert_eq!(
+            inspection_storage_bytes(TARGET),
+            plan.storage_bytes(),
+        );
+        assert_eq!(
+            plan.storage_bytes(),
+            core::mem::size_of_val(&plan) + core::mem::size_of::<super::DelimitedPlan>(),
+        );
+
+        let bounded = parse(
+            r"(?-u:\x10(?:\x70[\x30\x31]{0,16}\x60|\x71[\x36\x37]{1,16}\x61))",
+        );
+        let InspectionOutcome::Eligible(bounded) =
+            inspect(&bounded, 0, u64::MAX).unwrap()
+        else {
+            panic!("bounded correlated fixture was refused");
+        };
+        let bounded_storage_bytes = bounded.storage_bytes();
+        let bounded = bounded.build(SimdDispatchContext::capture());
+        assert_eq!(bounded_storage_bytes, bounded.storage_bytes());
+        assert_eq!(bounded.storage_bytes(), core::mem::size_of::<Plan>());
+
         assert!(matches!(
             inspect(&hir, 0, exact_work).unwrap(),
             InspectionOutcome::Eligible(_),

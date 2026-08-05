@@ -5506,7 +5506,7 @@ impl PortableBuilder {
         };
         let candidate_correlated_terminal_storage_bytes = correlated_terminal_inspection
             .as_ref()
-            .map_or(0, |_| correlated_bounded_alternation::Plan::storage_bytes());
+            .map_or(0, correlated_bounded_alternation::Inspection::storage_bytes);
         let correlated_terminal_fits = candidate_correlated_terminal_storage_bytes
             <= available_optional_bytes;
         let correlated_terminal = if correlated_terminal_fits {
