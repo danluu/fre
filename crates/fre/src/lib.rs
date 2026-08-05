@@ -12422,7 +12422,7 @@ const fn prefix_class_alternation_search_limits(
     }
 }
 
-const fn prefix_class_range_tuple(range: ClassBytesRange) -> (u8, u8) {
+fn prefix_class_range_tuple(range: ClassBytesRange) -> (u8, u8) {
     (range.start(), range.end())
 }
 
