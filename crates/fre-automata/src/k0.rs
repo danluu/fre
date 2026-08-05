@@ -107,12 +107,35 @@ const _: () = assert!(LAZY_HASH_INDEX_MIN_STATES <= LAZY_MAX_STATES);
 // identities. Keep that complete, correctness-promised domain on linear exact
 // comparison so the small-domain guarantee does not pay index setup or probes.
 const EXACT_FORWARD_LAZY_STATE_CAPACITY: usize = 31;
-// Identity hashes select one four-way primary bucket. Hashes are only hints:
-// every occupied slot is authenticated against the exact mode and item list.
-// A full primary bucket continues through deterministic wraparound overflow.
-// Since the table owns at least two slots per retained-state slot and never
-// deletes, a collision cannot exhaust the index before the identity arena.
+// Hashes are only hints: every occupied slot is authenticated against the
+// exact mode and item list. The forward cache retains the legacy exact-slot
+// start, while the reverse cache keeps its four-way bucket start. In both
+// cases a full first four probes continue through deterministic wraparound
+// overflow. Since the table owns at least two slots per retained-state slot
+// and never deletes, a collision cannot exhaust the index before the identity
+// arena.
 const LAZY_IDENTITY_INDEX_WAYS: usize = 4;
+// A direct arena may own more than the legacy 256 retained identities, but
+// that source-independent capacity is only potential until execution observes
+// a 257th distinct identity. Keep the live hash domain byte-for-byte identical
+// to the legacy 512-slot table until that boundary. The wide tail is already
+// owned and setup-charged; promotion therefore allocates nothing during
+// search.
+const LAZY_LEGACY_IDENTITY_INDEX_SLOTS: usize = LAZY_MAX_STATES * 2;
+const LAZY_IDENTITY_INDEX_PROMOTION_STATES: usize = LAZY_MAX_STATES + 1;
+// The complete direct arena has at most 16,385 identities, so its doubled,
+// power-of-two index has at most 65,536 slots. A fixed cold-path bitset plans
+// promotion transactionally without allocating or writing the live table.
+const LAZY_IDENTITY_INDEX_MAX_SLOTS: usize = 65_536;
+const LAZY_IDENTITY_INDEX_OCCUPANCY_WORDS: usize =
+    LAZY_IDENTITY_INDEX_MAX_SLOTS / 64;
+const _: () = assert!(u64::BITS == 64);
+const _: () = assert!(LAZY_LEGACY_IDENTITY_INDEX_SLOTS == 512);
+const _: () = assert!(LAZY_LEGACY_IDENTITY_INDEX_SLOTS.is_power_of_two());
+const _: () = assert!(LAZY_IDENTITY_INDEX_MAX_SLOTS.is_power_of_two());
+const _: () = assert!(DIRECT_LAZY_MAX_STATES * 2 <= LAZY_IDENTITY_INDEX_MAX_SLOTS);
+const _: () = assert!(DIRECT_LAZY_MAX_STATES * 2 > LAZY_IDENTITY_INDEX_MAX_SLOTS / 2);
+const _: () = assert!(LAZY_IDENTITY_INDEX_PROMOTION_STATES * 2 <= 1_024);
 // Planning the first sixteen index entries keeps only those sixteen slots on
 // the stack. For entry `i`, at most `i + 1` slots are probed. Comparisons with
 // earlier planned slots form one permutation plus the final vacant-slot scan.
@@ -1376,6 +1399,10 @@ enum LazyIndexProbe {
     Vacant(usize),
 }
 
+struct LazyIndexPromotionPlan {
+    slots: [usize; LAZY_IDENTITY_INDEX_PROMOTION_STATES],
+}
+
 fn validate_lazy_capacity_full(
     item_universe: usize,
     detail: &'static str,
@@ -2378,14 +2405,15 @@ impl LazyWorkspace {
         meter: &mut WorkMeter,
         position: usize,
     ) -> Result<LazyIndexProbe, SearchError> {
-        let mut index_slot = lazy_index_start(hash, self.index.len())?;
+        let index_slots = lazy_active_index_slots(self.index.len(), self.state_len);
+        let mut index_slot = lazy_forward_index_start(hash, index_slots)?;
         let probe_limit = self
             .state_len
             .checked_add(1)
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "lazy DFA identity-index probe limit",
             })?;
-        if probe_limit > self.index.len() {
+        if probe_limit > index_slots {
             return Err(SearchError::InternalInvariant {
                 detail: "lazy DFA identity-index probe bound exceeds its arena",
             });
@@ -2430,7 +2458,7 @@ impl LazyWorkspace {
                 }
             }
             if probe != self.state_len {
-                index_slot = lazy_index_advance(index_slot, self.index.len())?;
+                index_slot = lazy_index_advance(index_slot, index_slots)?;
             }
         }
         Err(SearchError::InternalInvariant {
@@ -2453,6 +2481,7 @@ impl LazyWorkspace {
                 detail: "lazy DFA index bootstrap is outside its publication boundary",
             });
         }
+        let index_slots = lazy_active_index_slots(self.index.len(), self.state_len);
 
         // Plan every insertion against the earlier planned slots before
         // publishing any index cell. The preflight reserves the complete
@@ -2464,7 +2493,7 @@ impl LazyWorkspace {
             } else {
                 self.hashes[state]
             };
-            let mut slot = lazy_index_start(hash, self.index.len())?;
+            let mut slot = lazy_forward_index_start(hash, index_slots)?;
             let mut selected = None;
             let probe_limit = state
                 .checked_add(1)
@@ -2491,7 +2520,7 @@ impl LazyWorkspace {
                     break;
                 }
                 if probe != state {
-                    slot = lazy_index_advance(slot, self.index.len())?;
+                    slot = lazy_index_advance(slot, index_slots)?;
                 }
             }
             let slot = selected.ok_or(SearchError::InternalInvariant {
@@ -2510,9 +2539,111 @@ impl LazyWorkspace {
         Ok(slots)
     }
 
+    /// Plan a complete narrow-to-wide identity-index rebuild without touching
+    /// the live table. The caller has already authenticated a miss in the
+    /// complete legacy domain and preflighted the worst-case work. Every
+    /// retained metadata identity is authoritative, while its hash is only a
+    /// placement hint; the resulting wide index will continue to authenticate
+    /// mode, length, and items on every lookup.
+    #[cold]
+    #[inline(never)]
+    fn plan_index_promotion(
+        &self,
+        final_hash: u64,
+        meter: &mut WorkMeter,
+        position: usize,
+    ) -> Result<LazyIndexPromotionPlan, SearchError> {
+        let source_slots = lazy_active_index_slots(self.index.len(), self.state_len);
+        if self.state_len != LAZY_MAX_STATES
+            || self.index.len() <= source_slots
+            || source_slots != LAZY_LEGACY_IDENTITY_INDEX_SLOTS
+            || self.index.len() > LAZY_IDENTITY_INDEX_MAX_SLOTS
+            || self.hashes.len() <= self.state_len
+        {
+            return Err(SearchError::InternalInvariant {
+                detail: "lazy DFA identity-index promotion is outside its exact boundary",
+            });
+        }
+
+        // The fixed bitset itself is search scratch. Charge every initialized
+        // word before constructing it so even this cold planning workspace is
+        // visible to the finite-work contract.
+        meter.charge(
+            u64::try_from(LAZY_IDENTITY_INDEX_OCCUPANCY_WORDS).map_err(|_| {
+                SearchError::ArithmeticOverflow {
+                    computation: "lazy DFA identity-index occupancy work conversion",
+                }
+            })?,
+            position,
+        )?;
+        let mut occupied = [0_u64; LAZY_IDENTITY_INDEX_OCCUPANCY_WORDS];
+        let mut slots = [usize::MAX; LAZY_IDENTITY_INDEX_PROMOTION_STATES];
+        for state in 0..LAZY_IDENTITY_INDEX_PROMOTION_STATES {
+            let hash = if state == self.state_len {
+                final_hash
+            } else {
+                self.hashes[state]
+            };
+            let mut slot = lazy_forward_index_start(hash, self.index.len())?;
+            let probe_limit = state
+                .checked_add(1)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "lazy DFA identity-index promotion probe limit",
+                })?;
+            let mut selected = None;
+            for probe in 0..probe_limit {
+                meter.charge(1, position)?;
+                let word = slot / 64;
+                let bit = u32::try_from(slot % 64).map_err(|_| {
+                    SearchError::InternalInvariant {
+                        detail: "lazy DFA identity-index promotion bit does not fit u32",
+                    }
+                })?;
+                let mask = 1_u64.checked_shl(bit).ok_or(
+                    SearchError::InternalInvariant {
+                        detail: "lazy DFA identity-index promotion bit is outside its word",
+                    },
+                )?;
+                let word = occupied.get_mut(word).ok_or(
+                    SearchError::InternalInvariant {
+                        detail: "lazy DFA identity-index promotion slot exceeds its bitset",
+                    },
+                )?;
+                if *word & mask == 0 {
+                    *word |= mask;
+                    selected = Some(slot);
+                    break;
+                }
+                if probe != state {
+                    slot = lazy_index_advance(slot, self.index.len())?;
+                }
+            }
+            slots[state] = selected.ok_or(SearchError::InternalInvariant {
+                detail: "lazy DFA identity-index promotion has no publication slot",
+            })?;
+        }
+
+        let publication_work = self
+            .index
+            .len()
+            .checked_add(LAZY_IDENTITY_INDEX_PROMOTION_STATES)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "lazy DFA identity-index promotion publication work",
+            })?;
+        meter.charge(
+            u64::try_from(publication_work).map_err(|_| {
+                SearchError::ArithmeticOverflow {
+                    computation: "lazy DFA identity-index promotion work conversion",
+                }
+            })?,
+            position,
+        )?;
+        Ok(LazyIndexPromotionPlan { slots })
+    }
+
     #[allow(
         clippy::too_many_lines,
-        reason = "one failure-atomic transaction reserves lookup, publication, and threshold bootstrap"
+        reason = "one failure-atomic transaction reserves lookup, publication, bootstrap, and wide promotion"
     )]
     fn intern_speculative(
         &mut self,
@@ -2534,8 +2665,18 @@ impl LazyWorkspace {
         let bootstraps_index = can_publish
             && !self.index.is_empty()
             && self.state_len.checked_add(1) == Some(LAZY_HASH_INDEX_MIN_STATES);
+        let promotes_index = can_publish
+            && use_index
+            && self.state_len == LAZY_MAX_STATES
+            && self.index.len()
+                > lazy_active_index_slots(self.index.len(), self.state_len);
         let bootstrap_work = if bootstraps_index {
             LAZY_HASH_INDEX_BOOTSTRAP_MAX_WORK
+        } else {
+            0
+        };
+        let promotion_work = if promotes_index {
+            lazy_index_promotion_max_work(self.index.len())?
         } else {
             0
         };
@@ -2551,7 +2692,7 @@ impl LazyWorkspace {
         } else {
             self.state_len
         };
-        let index_publication_work = usize::from(use_index && can_publish);
+        let index_publication_work = usize::from(use_index && can_publish && !promotes_index);
 
         // Learning is optional. Require the complete worst-case comparison and
         // publication allowance before doing any of it; otherwise continue
@@ -2568,6 +2709,7 @@ impl LazyWorkspace {
             .and_then(|work| work.checked_add(publication_work))
             .and_then(|work| work.checked_add(index_publication_work))
             .and_then(|work| work.checked_add(bootstrap_work))
+            .and_then(|work| work.checked_add(promotion_work))
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "lazy DFA learning work",
             })?;
@@ -2626,6 +2768,11 @@ impl LazyWorkspace {
             u32::try_from(item_count).map_err(|_| SearchError::InternalInvariant {
                 detail: "lazy DFA item count does not fit u32",
             })?;
+        let promotion = if promotes_index {
+            Some(self.plan_index_promotion(hash, meter, position)?)
+        } else {
+            None
+        };
         let bootstrap = if bootstraps_index {
             let slots = self.plan_index_bootstrap(hash, meter, position)?;
             let mut states = [0_u32; LAZY_HASH_INDEX_MIN_STATES];
@@ -2646,7 +2793,7 @@ impl LazyWorkspace {
             })?,
             position,
         )?;
-        if insertion_slot.is_some() {
+        if insertion_slot.is_some() && promotion.is_none() {
             meter.charge(1, position)?;
         }
         self.items[self.item_len..item_end].copy_from_slice(&self.scratch[..item_count]);
@@ -2655,12 +2802,23 @@ impl LazyWorkspace {
         self.lengths[state] = encoded_item_count;
         self.modes[state] = u8::from(pending);
         self.hashes[state] = hash;
-        if let Some(slot) = insertion_slot {
-            self.index[slot] = indexed_state;
-        }
-        if let Some((slots, states)) = bootstrap {
-            for (slot, indexed) in slots.into_iter().zip(states) {
-                self.index[slot] = indexed;
+        if let Some(promotion) = promotion {
+            // Planning and every clear/write charge completed before the first
+            // mutation. Rebuilding from authoritative metadata plus the new
+            // identity is therefore one allocation-free transaction.
+            self.index.fill(LAZY_NO_STATE);
+            for (state, slot) in promotion.slots.into_iter().enumerate() {
+                self.index[slot] = u32::try_from(state)
+                    .expect("the fixed identity-index promotion state fits u32");
+            }
+        } else {
+            if let Some(slot) = insertion_slot {
+                self.index[slot] = indexed_state;
+            }
+            if let Some((slots, states)) = bootstrap {
+                for (slot, indexed) in slots.into_iter().zip(states) {
+                    self.index[slot] = indexed;
+                }
             }
         }
         self.item_len = item_end;
@@ -17040,6 +17198,65 @@ fn lazy_index_slots(state_capacity: usize) -> Result<usize, SearchError> {
         })
 }
 
+/// Live identity-index domain for one retained-state boundary.
+///
+/// Capacities at or below the legacy ceiling are unchanged. A wider direct
+/// arena hashes into exactly the same 512-slot prefix until the first identity
+/// beyond that ceiling has been proved distinct and transactionally
+/// published. Thereafter `state_len` itself proves that the complete wide
+/// table was rebuilt.
+const fn lazy_active_index_slots(index_capacity: usize, state_len: usize) -> usize {
+    if state_len <= LAZY_MAX_STATES {
+        if index_capacity < LAZY_LEGACY_IDENTITY_INDEX_SLOTS {
+            index_capacity
+        } else {
+            LAZY_LEGACY_IDENTITY_INDEX_SLOTS
+        }
+    } else {
+        index_capacity
+    }
+}
+
+fn lazy_index_promotion_max_work(index_capacity: usize) -> Result<usize, SearchError> {
+    if index_capacity <= LAZY_LEGACY_IDENTITY_INDEX_SLOTS
+        || index_capacity > LAZY_IDENTITY_INDEX_MAX_SLOTS
+    {
+        return Err(SearchError::InternalInvariant {
+            detail: "lazy DFA identity-index promotion has an invalid wide arena",
+        });
+    }
+    // In the adversarial case every hash starts at one slot. Entry `i` then
+    // examines `i + 1` slots. Add one clear per already-owned wide slot and
+    // one publication per promoted identity.
+    LAZY_IDENTITY_INDEX_PROMOTION_STATES
+        .checked_mul(LAZY_IDENTITY_INDEX_PROMOTION_STATES + 1)
+        .and_then(|work| work.checked_div(2))
+        .and_then(|work| work.checked_add(LAZY_IDENTITY_INDEX_OCCUPANCY_WORDS))
+        .and_then(|work| work.checked_add(index_capacity))
+        .and_then(|work| work.checked_add(LAZY_IDENTITY_INDEX_PROMOTION_STATES))
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "lazy DFA identity-index promotion work",
+        })
+}
+
+/// Legacy forward identity placement, retained exactly through the 256-state
+/// physical domain and scaled only after promotion. Complete linear overflow
+/// remains authoritative, so this hash-derived slot is never an identity.
+fn lazy_forward_index_start(hash: u64, slots: usize) -> Result<usize, SearchError> {
+    let mask = slots
+        .checked_sub(1)
+        .filter(|_| slots.is_power_of_two())
+        .ok_or(SearchError::InternalInvariant {
+            detail: "lazy forward identity index does not have power-of-two capacity",
+        })?;
+    let mask = u64::try_from(mask).map_err(|_| SearchError::ArithmeticOverflow {
+        computation: "lazy forward identity-index mask conversion",
+    })?;
+    usize::try_from(hash & mask).map_err(|_| SearchError::InternalInvariant {
+        detail: "lazy forward identity-index slot does not fit usize",
+    })
+}
+
 fn lazy_index_start(hash: u64, slots: usize) -> Result<usize, SearchError> {
     if slots % LAZY_IDENTITY_INDEX_WAYS != 0 {
         return Err(SearchError::InternalInvariant {
@@ -20913,7 +21130,7 @@ mod tests {
                 workspace.lazy.state_len
             );
             for expected in 0..workspace.lazy.state_len {
-                let mut slot = super::lazy_index_start(
+                let mut slot = super::lazy_forward_index_start(
                     workspace.lazy.hashes[expected],
                     workspace.lazy.index.len(),
                 )
@@ -20945,6 +21162,26 @@ mod tests {
         assert_eq!(super::lazy_index_slots(31).unwrap(), 0);
         assert_eq!(super::lazy_index_slots(32).unwrap(), 64);
         assert_eq!(super::lazy_index_slots(33).unwrap(), 128);
+        assert_eq!(super::lazy_active_index_slots(0, usize::MAX), 0);
+        assert_eq!(super::lazy_active_index_slots(64, 0), 64);
+        assert_eq!(
+            super::lazy_active_index_slots(
+                super::LAZY_LEGACY_IDENTITY_INDEX_SLOTS,
+                super::LAZY_MAX_STATES,
+            ),
+            super::LAZY_LEGACY_IDENTITY_INDEX_SLOTS
+        );
+        assert_eq!(
+            super::lazy_active_index_slots(1_024, super::LAZY_MAX_STATES),
+            super::LAZY_LEGACY_IDENTITY_INDEX_SLOTS
+        );
+        assert_eq!(
+            super::lazy_active_index_slots(
+                1_024,
+                super::LAZY_IDENTITY_INDEX_PROMOTION_STATES,
+            ),
+            1_024
+        );
         assert!(matches!(
             super::lazy_index_slots(usize::MAX),
             Err(SearchError::ArithmeticOverflow {
@@ -21033,8 +21270,8 @@ mod tests {
         let boundary_hash = super::lazy_hash(&[1024], false);
         assert_ne!(initial_hash, boundary_hash);
         assert_eq!(
-            super::lazy_index_start(boundary_hash, workspace.lazy.index.len()).unwrap(),
-            super::lazy_index_start(initial_hash, workspace.lazy.index.len()).unwrap()
+            super::lazy_forward_index_start(boundary_hash, workspace.lazy.index.len()).unwrap(),
+            super::lazy_forward_index_start(initial_hash, workspace.lazy.index.len()).unwrap()
         );
         stage(&mut workspace, 1024);
         let linear_states = super::LAZY_HASH_INDEX_MIN_STATES.checked_sub(1).unwrap();
@@ -21089,8 +21326,8 @@ mod tests {
         let collision_hash = super::lazy_hash(&[1536], false);
         assert_ne!(initial_hash, collision_hash);
         assert_eq!(
-            super::lazy_index_start(collision_hash, workspace.lazy.index.len()).unwrap(),
-            super::lazy_index_start(initial_hash, workspace.lazy.index.len()).unwrap()
+            super::lazy_forward_index_start(collision_hash, workspace.lazy.index.len()).unwrap(),
+            super::lazy_forward_index_start(initial_hash, workspace.lazy.index.len()).unwrap()
         );
         stage(&mut workspace, 1536);
         let mut clustered_publish = WorkMeter::new(u64::MAX, 0);
@@ -21151,7 +21388,7 @@ mod tests {
         assert_eq!(workspace.lazy.item_len, before_item_len.checked_add(1).unwrap());
         assert_ne!(workspace.lazy.index, before_index);
         let primary_begin =
-            super::lazy_index_start(collision_hash, workspace.lazy.index.len()).unwrap();
+            super::lazy_forward_index_start(collision_hash, workspace.lazy.index.len()).unwrap();
         let pending_slot = workspace
             .lazy
             .index
@@ -21239,7 +21476,7 @@ mod tests {
         )
         .unwrap();
         for item in 0..candidate_limit {
-            let begin = super::lazy_index_start(
+            let begin = super::lazy_forward_index_start(
                 super::lazy_hash(&[item], false),
                 threshold_wrap.lazy.index.len(),
             )
@@ -21338,6 +21575,248 @@ mod tests {
         assert!(threshold_publish.consumed <= u64::try_from(threshold_bound).unwrap());
         assert_eq!(threshold_wrap.lazy.index[0], 15);
         assert_indexed(&threshold_wrap);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one boundary test proves legacy placement, atomic promotion, wraparound, retry, resources, and binding"
+    )]
+    fn forward_identity_index_promotes_only_for_the_257th_distinct_identity() {
+        fn stage(workspace: &mut K0Workspace, item: u32) {
+            workspace.lazy.scratch[0] = item;
+            workspace.lazy.scratch_len = 1;
+        }
+
+        fn assert_complete_index(workspace: &K0Workspace, index_slots: usize) {
+            assert_eq!(
+                workspace.lazy.index[..index_slots]
+                    .iter()
+                    .filter(|&&state| state != super::LAZY_NO_STATE)
+                    .count(),
+                workspace.lazy.state_len
+            );
+            for expected in 0..workspace.lazy.state_len {
+                let mut slot = super::lazy_forward_index_start(
+                    workspace.lazy.hashes[expected],
+                    index_slots,
+                )
+                .unwrap();
+                let mut found = false;
+                for probe in 0..=workspace.lazy.state_len {
+                    let indexed = workspace.lazy.index[slot];
+                    assert_ne!(
+                        indexed,
+                        super::LAZY_NO_STATE,
+                        "retained state {expected} follows a sentinel after {probe} probes",
+                    );
+                    if usize::try_from(indexed).unwrap() == expected {
+                        found = true;
+                        break;
+                    }
+                    slot = super::lazy_index_advance(slot, index_slots).unwrap();
+                }
+                assert!(found, "retained state {expected} is absent from its probe chain");
+            }
+        }
+
+        let ranges = [
+            (b'a', b'a'),
+            (b'b', b'b'),
+            (b'c', b'c'),
+            (b'd', b'd'),
+            (b'a', b'a'),
+            (b'b', b'b'),
+            (b'c', b'c'),
+            (b'd', b'd'),
+            (b'a', b'a'),
+            (b'b', b'b'),
+            (b'c', b'c'),
+            (b'd', b'd'),
+        ];
+        let plan = byte_chain(&ranges);
+        let layout = plan.accelerated_workspace_layout().unwrap();
+        let mut workspace =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let wide_slots = workspace.lazy.index.len();
+        assert!(workspace.lazy.offsets.len() > super::LAZY_MAX_STATES);
+        assert!(wide_slots > super::LAZY_LEGACY_IDENTITY_INDEX_SLOTS);
+        assert_eq!(workspace.retained_bytes(), layout.logical_bytes());
+
+        // Choose four retained identities and the boundary candidate in the
+        // final wide bucket. The fifth must wrap to slot zero after promotion.
+        // Every filler uses a distinct nonzero wide bucket so none can occupy
+        // that wrap slot before the boundary candidate.
+        let final_bucket = wide_slots
+            .checked_sub(super::LAZY_IDENTITY_INDEX_WAYS)
+            .unwrap();
+        let mut colliders = Vec::new();
+        let mut fillers = Vec::new();
+        let mut filler_bucket_used = vec![false; wide_slots];
+        let candidate_limit = wide_slots.checked_mul(8).unwrap();
+        for raw in 0..candidate_limit {
+            let item = u32::try_from(raw).unwrap();
+            let begin = super::lazy_forward_index_start(
+                super::lazy_hash(&[item], false),
+                wide_slots,
+            )
+            .unwrap();
+            if begin == final_bucket && colliders.len() < 5 {
+                colliders.push(item);
+            } else if begin != 0
+                && begin != final_bucket
+                && fillers.len() < super::LAZY_MAX_STATES - 4
+                && !filler_bucket_used[begin]
+            {
+                filler_bucket_used[begin] = true;
+                fillers.push(item);
+            }
+            if colliders.len() == 5 && fillers.len() == super::LAZY_MAX_STATES - 4 {
+                break;
+            }
+        }
+        assert_eq!(colliders.len(), 5);
+        assert_eq!(fillers.len(), super::LAZY_MAX_STATES - 4);
+
+        let mut retained = colliders[..4].to_vec();
+        retained.extend(fillers);
+        assert_eq!(retained.len(), super::LAZY_MAX_STATES);
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        for (state, item) in retained.into_iter().enumerate() {
+            stage(&mut workspace, item);
+            let interned = if state == 0 {
+                workspace
+                    .lazy
+                    .intern_initial(false, &mut meter, 0)
+                    .map(super::LazyInterned::State)
+            } else {
+                workspace
+                    .lazy
+                    .intern_speculative(false, &mut meter, 0, 0)
+            };
+            assert_eq!(
+                interned,
+                Ok(super::LazyInterned::State(u32::try_from(state).unwrap()))
+            );
+        }
+        assert_eq!(workspace.lazy.state_len, super::LAZY_MAX_STATES);
+        let legacy_slots = super::lazy_active_index_slots(
+            workspace.lazy.index.len(),
+            workspace.lazy.state_len,
+        );
+        assert_eq!(legacy_slots, super::LAZY_LEGACY_IDENTITY_INDEX_SLOTS);
+        assert!(workspace.lazy.index[legacy_slots..]
+            .iter()
+            .all(|&state| state == super::LAZY_NO_STATE));
+
+        // Reconstruct the legacy table independently. Every physical slot in
+        // the live prefix must match, proving the wide capacity has not
+        // changed placement or touched its tail through identity 256.
+        let mut legacy = vec![super::LAZY_NO_STATE; legacy_slots];
+        for state in 0..super::LAZY_MAX_STATES {
+            let mut slot = super::lazy_forward_index_start(
+                workspace.lazy.hashes[state],
+                legacy_slots,
+            )
+            .unwrap();
+            loop {
+                if legacy[slot] == super::LAZY_NO_STATE {
+                    legacy[slot] = u32::try_from(state).unwrap();
+                    break;
+                }
+                slot = super::lazy_index_advance(slot, legacy_slots).unwrap();
+            }
+        }
+        assert_eq!(&workspace.lazy.index[..legacy_slots], legacy.as_slice());
+        assert_complete_index(&workspace, legacy_slots);
+
+        // The complete worst-case reservation is checked before hashing or
+        // probing. One below leaves every retained byte and the staged
+        // candidate intact; retrying with the exact envelope succeeds.
+        stage(&mut workspace, colliders[4]);
+        let promotion_work =
+            super::lazy_index_promotion_max_work(workspace.lazy.index.len()).unwrap();
+        let promotion_bound = workspace
+            .lazy
+            .state_len
+            .checked_add(1)
+            .and_then(|work| work.checked_mul(2))
+            .and_then(|work| work.checked_add(2))
+            .and_then(|work| work.checked_add(promotion_work))
+            .unwrap();
+        let before_index = workspace.lazy.index.clone();
+        let before_items = workspace.lazy.items.clone();
+        let before_offsets = workspace.lazy.offsets.clone();
+        let before_lengths = workspace.lazy.lengths.clone();
+        let before_modes = workspace.lazy.modes.clone();
+        let before_hashes = workspace.lazy.hashes.clone();
+        let mut refused = WorkMeter::new(
+            u64::try_from(promotion_bound.checked_sub(1).unwrap()).unwrap(),
+            0,
+        );
+        assert_eq!(
+            workspace
+                .lazy
+                .intern_speculative(false, &mut refused, 0, 0),
+            Ok(super::LazyInterned::BudgetDeclined)
+        );
+        assert_eq!(refused.consumed, 0);
+        assert_eq!(workspace.lazy.state_len, super::LAZY_MAX_STATES);
+        assert_eq!(workspace.lazy.scratch_len, 1);
+        assert_eq!(workspace.lazy.index, before_index);
+        assert_eq!(workspace.lazy.items, before_items);
+        assert_eq!(workspace.lazy.offsets, before_offsets);
+        assert_eq!(workspace.lazy.lengths, before_lengths);
+        assert_eq!(workspace.lazy.modes, before_modes);
+        assert_eq!(workspace.lazy.hashes, before_hashes);
+
+        let mut promoted =
+            WorkMeter::new(u64::try_from(promotion_bound).unwrap(), 0);
+        assert_eq!(
+            workspace
+                .lazy
+                .intern_speculative(false, &mut promoted, 0, 0),
+            Ok(super::LazyInterned::State(
+                u32::try_from(super::LAZY_MAX_STATES).unwrap()
+            ))
+        );
+        assert!(promoted.consumed <= u64::try_from(promotion_bound).unwrap());
+        assert_eq!(
+            workspace.lazy.state_len,
+            super::LAZY_IDENTITY_INDEX_PROMOTION_STATES
+        );
+        assert_eq!(
+            super::lazy_active_index_slots(
+                workspace.lazy.index.len(),
+                workspace.lazy.state_len,
+            ),
+            wide_slots
+        );
+        assert_eq!(
+            workspace.lazy.index[0],
+            u32::try_from(super::LAZY_MAX_STATES).unwrap(),
+            "the fifth final-bucket identity must use complete wraparound"
+        );
+        assert_complete_index(&workspace, wide_slots);
+
+        stage(&mut workspace, colliders[4]);
+        let before_hit = workspace.lazy.index.clone();
+        let mut hit = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            workspace
+                .lazy
+                .intern_speculative(false, &mut hit, 0, 0),
+            Ok(super::LazyInterned::State(
+                u32::try_from(super::LAZY_MAX_STATES).unwrap()
+            ))
+        );
+        assert_eq!(workspace.lazy.index, before_hit);
+        assert_eq!(workspace.lazy.scratch_len, 0);
+        assert_eq!(workspace.retained_bytes(), layout.logical_bytes());
+
+        let same_shape = byte_chain(&ranges);
+        assert!(workspace.lazy.is_bound_to(&plan));
+        assert!(!workspace.lazy.is_bound_to(&same_shape));
     }
 
     #[test]
@@ -21660,6 +22139,14 @@ mod tests {
         assert_eq!(workspace.lazy.state_len, domain);
         assert_eq!(workspace.lazy.item_len, domain_items);
         assert!(!workspace.lazy.saturated);
+        assert_eq!(
+            super::lazy_active_index_slots(
+                workspace.lazy.index.len(),
+                workspace.lazy.state_len,
+            ),
+            workspace.lazy.index.len(),
+            "the exhaustive >256 domain must exercise the promoted table"
+        );
 
         let mut saw_overflow = false;
         for state in 0..workspace.lazy.state_len {
@@ -21670,7 +22157,7 @@ mod tests {
                 .iter()
                 .position(|&candidate| candidate == indexed)
                 .unwrap();
-            let begin = super::lazy_index_start(
+            let begin = super::lazy_forward_index_start(
                 workspace.lazy.hashes[state],
                 workspace.lazy.index.len(),
             )
@@ -28955,6 +29442,8 @@ mod tests {
         let lengths = session.workspace.lazy.lengths.clone();
         let items = session.workspace.lazy.items.clone();
         let modes = session.workspace.lazy.modes.clone();
+        let hashes = session.workspace.lazy.hashes.clone();
+        let index = session.workspace.lazy.index.clone();
         let published = session.workspace.lazy.direct_cells_published;
 
         haystack[super::WARM_EXISTS_INLINE_BYTES..run_end].fill(b'b');
@@ -28974,6 +29463,8 @@ mod tests {
         assert_eq!(session.workspace.lazy.lengths, lengths);
         assert_eq!(session.workspace.lazy.items, items);
         assert_eq!(session.workspace.lazy.modes, modes);
+        assert_eq!(session.workspace.lazy.hashes, hashes);
+        assert_eq!(session.workspace.lazy.index, index);
         assert_eq!(session.workspace.lazy.direct_cells_published, published);
         assert_eq!(
             session
@@ -35035,6 +35526,33 @@ mod tests {
             Some(3)
         );
         assert!(workspace.lazy.initialized);
+
+        let state_len = workspace.lazy.state_len;
+        let item_len = workspace.lazy.item_len;
+        let offsets = workspace.lazy.offsets.clone();
+        let lengths = workspace.lazy.lengths.clone();
+        let modes = workspace.lazy.modes.clone();
+        let hashes = workspace.lazy.hashes.clone();
+        let index = workspace.lazy.index.clone();
+        let items = workspace.lazy.items.clone();
+        assert_eq!(
+            second
+                .prepare::<SelectedEnd>()
+                .search_with_workspace(b"zac", &mut workspace, SearchLimits::unlimited())
+                .unwrap()
+                .into_output(),
+            Some(3)
+        );
+        assert!(workspace.lazy.is_bound_to(&first));
+        assert!(!workspace.lazy.is_bound_to(&second));
+        assert_eq!(workspace.lazy.state_len, state_len);
+        assert_eq!(workspace.lazy.item_len, item_len);
+        assert_eq!(workspace.lazy.offsets, offsets);
+        assert_eq!(workspace.lazy.lengths, lengths);
+        assert_eq!(workspace.lazy.modes, modes);
+        assert_eq!(workspace.lazy.hashes, hashes);
+        assert_eq!(workspace.lazy.index, index);
+        assert_eq!(workspace.lazy.items, items);
     }
 
     #[test]
