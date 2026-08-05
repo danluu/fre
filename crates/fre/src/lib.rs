@@ -15802,6 +15802,45 @@ mod tests {
         assert_eq!(actual_iter, expected_iter);
     }
 
+    fn assert_correlated_delimited_window_matches_upstream(
+        session: &mut super::PortableSearchSession<'_>,
+        upstream: &regex::bytes::Regex,
+        haystack: &[u8],
+        window: SearchWindow,
+    ) {
+        let expected = upstream
+            .find(&haystack[window.start()..window.end()])
+            .map(|matched| Match {
+                start: window.start() + matched.start(),
+                end: window.start() + matched.end(),
+            });
+        let expected_end = upstream
+            .shortest_match(&haystack[window.start()..window.end()])
+            .map(|end| window.start() + end);
+        assert_eq!(
+            session
+                .find_window_value(haystack, window, SearchLimits::unlimited())
+                .unwrap(),
+            expected,
+        );
+        assert_eq!(
+            session
+                .is_match_window_value(haystack, window, SearchLimits::unlimited())
+                .unwrap(),
+            expected.is_some(),
+        );
+        assert_eq!(
+            session
+                .shortest_match_window_value(
+                    haystack,
+                    window,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            expected_end,
+        );
+    }
+
     #[test]
     fn correlated_delimited_root_alternation_is_exhaustive_over_small_sources_and_windows() {
         const PATTERN: &str = r"(?-u:(?:ab[bc]*Z|q[de]*Y))";
@@ -15925,6 +15964,58 @@ mod tests {
             .search_session(SearchSessionLimits::unlimited())
             .unwrap();
 
+        let long_absent = vec![b'~'; BYTE_SET_BLOCK_BYTES * 8];
+        assert_correlated_delimited_session_matches_upstream(
+            &mut session,
+            &upstream,
+            &long_absent,
+        );
+
+        let late_start = BYTE_SET_BLOCK_BYTES * 5 + 3;
+        let mut late = vec![b'~'; BYTE_SET_BLOCK_BYTES * 8];
+        late[late_start..late_start + 6].copy_from_slice(b"qddddY");
+        assert_correlated_delimited_session_matches_upstream(
+            &mut session,
+            &upstream,
+            &late,
+        );
+        assert_correlated_delimited_window_matches_upstream(
+            &mut session,
+            &upstream,
+            &late,
+            SearchWindow::new(7, late.len() - 5),
+        );
+
+        let far_rejection = BYTE_SET_BLOCK_BYTES * 4 + 3;
+        let mut rejected_then_valid = vec![b'~'; BYTE_SET_BLOCK_BYTES * 8];
+        rejected_then_valid[far_rejection] = b'Z';
+        let valid_start = far_rejection + 7;
+        rejected_then_valid[valid_start..valid_start + 4]
+            .copy_from_slice(b"qddY");
+        assert_correlated_delimited_session_matches_upstream(
+            &mut session,
+            &upstream,
+            &rejected_then_valid,
+        );
+
+        let mut rejected_then_farther_valid = vec![b'~'; BYTE_SET_BLOCK_BYTES * 8];
+        rejected_then_farther_valid[far_rejection] = b'Z';
+        let farther_valid_start = far_rejection + BYTE_SET_BLOCK_BYTES * 2;
+        rejected_then_farther_valid[farther_valid_start..farther_valid_start + 4]
+            .copy_from_slice(b"qddY");
+        assert_correlated_delimited_session_matches_upstream(
+            &mut session,
+            &upstream,
+            &rejected_then_farther_valid,
+        );
+
+        let dense_false_terminals = vec![b'Z'; BYTE_SET_BLOCK_BYTES * 8];
+        assert_correlated_delimited_session_matches_upstream(
+            &mut session,
+            &upstream,
+            &dense_false_terminals,
+        );
+
         let mut haystack = vec![b'~'; BYTE_SET_BLOCK_BYTES * 6];
         haystack[1] = b'Z';
         let late = haystack.len() - 8;
@@ -15937,36 +16028,11 @@ mod tests {
 
         let window = SearchWindow::new(7, haystack.len() - 1);
         haystack[window.start() + 1] = b'Y';
-        let expected = upstream
-            .find(&haystack[window.start()..window.end()])
-            .map(|matched| Match {
-                start: window.start() + matched.start(),
-                end: window.start() + matched.end(),
-            });
-        let expected_end = upstream
-            .shortest_match(&haystack[window.start()..window.end()])
-            .map(|end| window.start() + end);
-        assert_eq!(
-            session
-                .find_window_value(&haystack, window, SearchLimits::unlimited())
-                .unwrap(),
-            expected,
-        );
-        assert_eq!(
-            session
-                .is_match_window_value(&haystack, window, SearchLimits::unlimited())
-                .unwrap(),
-            expected.is_some(),
-        );
-        assert_eq!(
-            session
-                .shortest_match_window_value(
-                    &haystack,
-                    window,
-                    SearchLimits::unlimited(),
-                )
-                .unwrap(),
-            expected_end,
+        assert_correlated_delimited_window_matches_upstream(
+            &mut session,
+            &upstream,
+            &haystack,
+            window,
         );
     }
 
@@ -16007,27 +16073,32 @@ mod tests {
             assert!(plan.is_exact_delimited());
         }
 
+        const SOURCE_BYTES: usize = BYTE_SET_BLOCK_BYTES * 8;
         let mut variants = Vec::new();
         for placements in [
             &[][..],
             &[(7_usize, b"abbbbZ".as_slice())][..],
-            &[(19_usize, b"rsttW".as_slice())][..],
+            &[(BYTE_SET_BLOCK_BYTES * 5 + 3, b"rsttW".as_slice())][..],
             &[
                 (3_usize, b"qdddY".as_slice()),
-                (31_usize, b"mnnnX".as_slice()),
-                (48_usize, b"abZ".as_slice()),
+                (BYTE_SET_BLOCK_BYTES * 4 + 1, b"mnnnX".as_slice()),
+                (BYTE_SET_BLOCK_BYTES * 6 + 2, b"abZ".as_slice()),
             ][..],
         ] {
-            let mut source = vec![b'~'; 64];
+            let mut source = vec![b'~'; SOURCE_BYTES];
             for &(start, bytes) in placements {
                 source[start..start + bytes.len()].copy_from_slice(bytes);
             }
             variants.push(source);
         }
-        variants.push(b"ZYXW".repeat(16));
-        assert!(variants.iter().all(|variant| variant.len() == 64));
+        variants.push(b"ZYXW".repeat(SOURCE_BYTES / 4));
+        assert!(
+            variants
+                .iter()
+                .all(|variant| variant.len() == SOURCE_BYTES)
+        );
 
-        let mut haystack = vec![0_u8; 64];
+        let mut haystack = vec![0_u8; SOURCE_BYTES];
         let address = haystack.as_ptr();
         let capacity = haystack.capacity();
         for variant in variants.iter().cycle().take(12) {

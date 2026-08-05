@@ -302,12 +302,12 @@ impl Plan {
     /// Speculatively search an exact-delimited plan while delimiter density
     /// continues to justify its dedicated source pass.
     ///
-    /// One physical byte-set classification block without a delimiter stops
-    /// the sidecar. A rejected delimiter is nevertheless useful progress:
-    /// admission proves that it partitions every branch, so K0 may resume at
-    /// the byte after it without reconsidering an earlier start. This keeps
-    /// absent and sparse-terminal sources on the mature K0 route while dense
-    /// rejection streams retain allocation-free exact authentication.
+    /// A memchr-family leaf searches the complete remaining window for its
+    /// first delimiter. Wider range/classified leaves stop after one physical
+    /// classification block without a delimiter. After any rejected delimiter,
+    /// every leaf returns to that one-block continuation rule: admission proves
+    /// that the delimiter partitions every branch, so the extra source pass is
+    /// earned by advancing K0's exact fallback floor past the rejected endpoint.
     pub(crate) fn probe_exact_delimited(
         &self,
         haystack: &[u8],
@@ -327,11 +327,20 @@ impl Plan {
         if search_position >= end {
             return ExactDelimitedProbe::Exhausted;
         }
+        let first_seek_spans_window = matches!(
+            self.terminal_seek,
+            SetSeek::One(_) | SetSeek::Two(_, _) | SetSeek::Three(_, _, _)
+        );
+        let mut initial_seek = true;
         let mut first_unproved_start = start;
         loop {
-            let probe_end = search_position
-                .saturating_add(BYTE_SET_BLOCK_BYTES)
-                .min(end);
+            let probe_end = if initial_seek && first_seek_spans_window {
+                end
+            } else {
+                search_position
+                    .saturating_add(BYTE_SET_BLOCK_BYTES)
+                    .min(end)
+            };
             let Some(terminal_position) =
                 self.seek_terminal(haystack, search_position, probe_end)
             else {
@@ -343,6 +352,7 @@ impl Plan {
                     }
                 };
             };
+            initial_seek = false;
             let branch_index = usize::from(plan.terminal_to_branch[usize::from(
                 haystack[terminal_position],
             )]);
@@ -1112,9 +1122,15 @@ mod tests {
         ExactDelimitedProbe, InspectionError, InspectionOutcome, Plan,
         SimdDispatchContext, inspect,
     };
+    use crate::pure_byte_class_repeat::SetSeek;
     use fre_kernels::BYTE_SET_BLOCK_BYTES;
 
     const TARGET: &str = r"(?-u:(?:ab[bc]*Z|q[de]*Y))";
+    const THREE_TERMINALS: &str = r"(?-u:(?:ab[bc]*Z|q[de]*Y|mn[no]*X))";
+    const RANGE_TERMINALS: &str =
+        r"(?-u:(?:a[bc]*W|d[ef]*X|g[hi]*Y|j[kl]*Z))";
+    const CLASSIFIED_TERMINALS: &str =
+        r"(?-u:(?:a[bc]*Q|d[ef]*T|g[hi]*X|j[kl]*Z))";
 
     fn parse(pattern: &str) -> regex_syntax::hir::Hir {
         ParserBuilder::new()
@@ -1174,49 +1190,84 @@ mod tests {
     }
 
     #[test]
-    fn exact_delimited_probe_falls_back_after_one_empty_physical_block() {
-        let (plan, _) = exact_plan(TARGET);
-        let short_absent = vec![b'~'; BYTE_SET_BLOCK_BYTES];
-        assert_eq!(
-            plan.probe_exact_delimited(&short_absent, 0, short_absent.len()),
-            ExactDelimitedProbe::Exhausted,
-        );
+    fn memchr_terminal_probe_spans_the_initial_remaining_window() {
+        for pattern in [TARGET, THREE_TERMINALS] {
+            let (plan, _) = exact_plan(pattern);
+            assert!(matches!(
+                plan.terminal_seek,
+                SetSeek::Two(_, _) | SetSeek::Three(_, _, _)
+            ));
 
-        let long_absent = vec![b'~'; BYTE_SET_BLOCK_BYTES * 4];
-        assert_eq!(
-            plan.probe_exact_delimited(&long_absent, 0, long_absent.len()),
-            ExactDelimitedProbe::Fallback {
-                first_unproved_start: 0,
-            },
-        );
+            let long_absent = vec![b'~'; BYTE_SET_BLOCK_BYTES * 6];
+            assert_eq!(
+                plan.probe_exact_delimited(&long_absent, 0, long_absent.len()),
+                ExactDelimitedProbe::Exhausted,
+                "pattern={pattern:?}",
+            );
+
+            let late_start = BYTE_SET_BLOCK_BYTES * 4 + 3;
+            let mut late = vec![b'~'; late_start + 6 + BYTE_SET_BLOCK_BYTES];
+            late[late_start..late_start + 6].copy_from_slice(b"qddddY");
+            assert_eq!(
+                plan.probe_exact_delimited(&late, 0, late.len()),
+                ExactDelimitedProbe::Match {
+                    start: late_start,
+                    end: late_start + 6,
+                },
+                "pattern={pattern:?}",
+            );
+        }
     }
 
     #[test]
-    fn exact_delimited_probe_boundary_is_exactly_one_classifier_block() {
-        let (plan, _) = exact_plan(TARGET);
-        let first_terminal = plan.minimum_match_bytes() - 1;
-        let included_terminal = first_terminal + BYTE_SET_BLOCK_BYTES - 1;
-        let mut included = vec![b'~'; included_terminal + 1];
-        included[included_terminal - 2..=included_terminal]
-            .copy_from_slice(b"abZ");
-        assert_eq!(
-            plan.probe_exact_delimited(&included, 0, included.len()),
-            ExactDelimitedProbe::Match {
-                start: included_terminal - 2,
-                end: included_terminal + 1,
-            },
-        );
+    fn range_and_classified_initial_probes_remain_one_block() {
+        for (pattern, expected_terminal) in [
+            (RANGE_TERMINALS, b'W'),
+            (CLASSIFIED_TERMINALS, b'Q'),
+        ] {
+            let (plan, _) = exact_plan(pattern);
+            if pattern == RANGE_TERMINALS {
+                assert!(matches!(plan.terminal_seek, SetSeek::Range { .. }));
+            } else {
+                assert!(matches!(plan.terminal_seek, SetSeek::Classified { .. }));
+            }
 
-        let excluded_terminal = first_terminal + BYTE_SET_BLOCK_BYTES;
-        let mut excluded = vec![b'~'; excluded_terminal + 1];
-        excluded[excluded_terminal - 2..=excluded_terminal]
-            .copy_from_slice(b"abZ");
-        assert_eq!(
-            plan.probe_exact_delimited(&excluded, 0, excluded.len()),
-            ExactDelimitedProbe::Fallback {
-                first_unproved_start: 0,
-            },
-        );
+            let long_absent = vec![b'~'; BYTE_SET_BLOCK_BYTES * 4];
+            assert_eq!(
+                plan.probe_exact_delimited(&long_absent, 0, long_absent.len()),
+                ExactDelimitedProbe::Fallback {
+                    first_unproved_start: 0,
+                },
+                "pattern={pattern:?}",
+            );
+
+            let included_terminal = plan.minimum_match_bytes() - 1
+                + BYTE_SET_BLOCK_BYTES - 1;
+            let mut included = vec![b'~'; included_terminal + 1];
+            included[included_terminal - 1] = b'a';
+            included[included_terminal] = expected_terminal;
+            assert_eq!(
+                plan.probe_exact_delimited(&included, 0, included.len()),
+                ExactDelimitedProbe::Match {
+                    start: included_terminal - 1,
+                    end: included_terminal + 1,
+                },
+                "pattern={pattern:?}",
+            );
+
+            let excluded_terminal = plan.minimum_match_bytes() - 1
+                + BYTE_SET_BLOCK_BYTES;
+            let mut excluded = vec![b'~'; excluded_terminal + 1];
+            excluded[excluded_terminal - 1] = b'a';
+            excluded[excluded_terminal] = expected_terminal;
+            assert_eq!(
+                plan.probe_exact_delimited(&excluded, 0, excluded.len()),
+                ExactDelimitedProbe::Fallback {
+                    first_unproved_start: 0,
+                },
+                "pattern={pattern:?}",
+            );
+        }
     }
 
     #[test]
@@ -1256,6 +1307,36 @@ mod tests {
             plan.probe_exact_delimited(&dense, 0, dense.len()),
             ExactDelimitedProbe::Exhausted,
             "a delimiter within every physical block keeps making proved progress",
+        );
+    }
+
+    #[test]
+    fn far_rejection_earns_only_one_block_of_continuation() {
+        let (plan, _) = exact_plan(TARGET);
+        let far_rejection = BYTE_SET_BLOCK_BYTES * 4 + 3;
+        let mut nearby_valid = vec![b'~'; BYTE_SET_BLOCK_BYTES * 8];
+        nearby_valid[far_rejection] = b'Z';
+        let nearby_start = far_rejection + 7;
+        nearby_valid[nearby_start..nearby_start + 4].copy_from_slice(b"qddY");
+        assert_eq!(
+            plan.probe_exact_delimited(&nearby_valid, 0, nearby_valid.len()),
+            ExactDelimitedProbe::Match {
+                start: nearby_start,
+                end: nearby_start + 4,
+            },
+            "the rejected far delimiter earns the immediately following block",
+        );
+
+        let mut farther_valid = vec![b'~'; BYTE_SET_BLOCK_BYTES * 8];
+        farther_valid[far_rejection] = b'Z';
+        let farther_start = far_rejection + BYTE_SET_BLOCK_BYTES * 2;
+        farther_valid[farther_start..farther_start + 4].copy_from_slice(b"qddY");
+        assert_eq!(
+            plan.probe_exact_delimited(&farther_valid, 0, farther_valid.len()),
+            ExactDelimitedProbe::Fallback {
+                first_unproved_start: far_rejection + 1,
+            },
+            "a rejection must not grant another unearned whole-window seek",
         );
     }
 
