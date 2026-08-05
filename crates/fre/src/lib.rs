@@ -13575,7 +13575,7 @@ mod tests {
         assert_eq!(fre.build_report().plan, PlanKind::PackedLiteralSet);
         assert_eq!(
             fre.runtime_implementation_id(),
-            "guarded-ascii-word-literal-set.fixed-column-dictionary.v3",
+            "guarded-ascii-word-literal-set.fixed-column-dictionary.v4",
         );
         let upstream = regex::bytes::RegexBuilder::new(pattern)
             .unicode(false)
@@ -13649,7 +13649,7 @@ mod tests {
             assert_eq!(fre.build_report().plan, PlanKind::PackedLiteralSet);
             assert_eq!(
                 fre.runtime_implementation_id(),
-                "guarded-ascii-word-literal-set.fixed-column-dictionary.v3",
+                "guarded-ascii-word-literal-set.fixed-column-dictionary.v4",
             );
             assert_eq!(
                 fre.find_value(b"x ab y", SearchLimits::unlimited())
@@ -13657,6 +13657,37 @@ mod tests {
                 Some(Match { start: 2, end: 4 }),
             );
         }
+    }
+
+    #[test]
+    fn equal_width_guarded_words_keep_later_matches_after_direct_rejection() {
+        let pattern = r"(?-u:\b(?:zza|azb|czc|dzd)\b)";
+        let fre = PortableBuilder::new(pattern).unicode(false).build().unwrap();
+        assert_eq!(fre.build_report().plan, PlanKind::PackedLiteralSet);
+        assert_eq!(
+            fre.runtime_implementation_id(),
+            "guarded-ascii-word-literal-set.fixed-column-dictionary.v4",
+        );
+        let haystack = b"!z!a! czc";
+        assert_eq!(
+            fre.find_value(haystack, SearchLimits::unlimited()).unwrap(),
+            Some(Match { start: 6, end: 9 }),
+        );
+        assert_eq!(
+            fre.find_window_value(
+                haystack,
+                SearchWindow::new(1, 9),
+                SearchLimits::unlimited(),
+            )
+            .unwrap(),
+            Some(Match { start: 6, end: 9 }),
+        );
+
+        let wide = PortableBuilder::new(r"(?-u:\b(?:_x|x1|AB|ab|z9)\b)")
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(wide.runtime_implementation_id(), "k0");
     }
 
     #[test]
