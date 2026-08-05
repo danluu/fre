@@ -17119,6 +17119,7 @@ fn capped_ordered_partial_permutations_up_to(
     total
 }
 
+#[cfg(test)]
 fn forward_lazy_state_capacity(consuming_states: usize) -> usize {
     forward_lazy_state_capacity_up_to(consuming_states, LAZY_MAX_STATES)
 }
@@ -17130,6 +17131,7 @@ fn forward_lazy_state_capacity_up_to(consuming_states: usize, state_limit: usize
     capped_ordered_partial_permutations_up_to(consuming_states, 2, 1, state_limit)
 }
 
+#[cfg(test)]
 fn reverse_lazy_state_capacity(consuming_edges: usize, contextual: bool) -> usize {
     reverse_lazy_state_capacity_up_to(consuming_edges, contextual, LAZY_MAX_STATES)
 }
@@ -20875,6 +20877,20 @@ mod tests {
                     .any(|indexed| usize::try_from(indexed).unwrap() == expected);
                 assert!(found, "retained state {expected} is absent from its probe chain");
             }
+            for bucket in workspace
+                .lazy
+                .index
+                .chunks_exact(super::LAZY_IDENTITY_INDEX_WAYS)
+            {
+                let mut saw_sentinel = false;
+                for &state in bucket {
+                    if state == super::LAZY_NO_STATE {
+                        saw_sentinel = true;
+                    } else {
+                        assert!(!saw_sentinel, "occupied index way follows a sentinel");
+                    }
+                }
+            }
         }
 
         assert_eq!(super::lazy_index_slots(15).unwrap(), 0);
@@ -21063,13 +21079,36 @@ mod tests {
         workspace.lazy.hashes[0] = initial_hash;
         assert_indexed(&workspace);
 
+        let before_state_len = workspace.lazy.state_len;
+        let before_item_len = workspace.lazy.item_len;
+        let before_index = workspace.lazy.index.clone();
+
+        // Pending mode is authenticated independently of the item sequence.
+        // Toggling the low item bit exactly cancels the pending hash bit, so
+        // this candidate has the complete hash of retained nonpending state
+        // 16. The full bucket must reject the alias and retain it for inline
+        // continuation instead of returning the cached state.
+        assert_eq!(super::lazy_hash(&[1537], true), collision_hash);
+        stage(&mut workspace, 1537);
+        let mut pending_collision = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            workspace
+                .lazy
+                .intern_speculative(true, &mut pending_collision, 0, 0),
+            Ok(super::LazyInterned::CapacityFull)
+        );
+        assert_eq!(pending_collision.consumed, 5);
+        assert_eq!(workspace.lazy.state_len, before_state_len);
+        assert_eq!(workspace.lazy.item_len, before_item_len);
+        assert_eq!(workspace.lazy.index, before_index);
+        workspace.lazy.retain_scratch_as_frontier().unwrap();
+        assert_eq!(workspace.lazy.frontier_len, 1);
+        assert_eq!(workspace.lazy.frontier[0], 1537);
+
         // A fifth distinct identity in the same bucket cannot displace an
         // exact retained state. Publication declines before any logical cache
         // length or index byte changes, leaving the staged frontier available
         // to the caller's bounded inline continuation.
-        let before_state_len = workspace.lazy.state_len;
-        let before_item_len = workspace.lazy.item_len;
-        let before_index = workspace.lazy.index.clone();
         stage(&mut workspace, 2048);
         let mut bucket_full = WorkMeter::new(u64::MAX, 0);
         assert_eq!(
@@ -21083,6 +21122,9 @@ mod tests {
         assert_eq!(workspace.lazy.item_len, before_item_len);
         assert_eq!(workspace.lazy.index, before_index);
         assert_eq!(workspace.lazy.scratch_len, 1);
+        workspace.lazy.retain_scratch_as_frontier().unwrap();
+        assert_eq!(workspace.lazy.frontier_len, 1);
+        assert_eq!(workspace.lazy.frontier[0], 2048);
 
         // Indexed publication reserves its complete bounded probe, exact
         // comparison, copy, and index-write envelope before consuming work.
@@ -21199,6 +21241,20 @@ mod tests {
                     .filter(|&indexed| indexed != super::LAZY_NO_STATE)
                     .any(|indexed| usize::try_from(indexed).unwrap() == expected));
             }
+            for bucket in workspace
+                .reverse
+                .index
+                .chunks_exact(super::LAZY_IDENTITY_INDEX_WAYS)
+            {
+                let mut saw_sentinel = false;
+                for &state in bucket {
+                    if state == super::LAZY_NO_STATE {
+                        saw_sentinel = true;
+                    } else {
+                        assert!(!saw_sentinel, "occupied index way follows a sentinel");
+                    }
+                }
+            }
         }
 
         let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b'), (b'c', b'c'), (b'd', b'd')]);
@@ -21285,6 +21341,9 @@ mod tests {
         assert_eq!(workspace.reverse.item_len, before_item_len);
         assert_eq!(workspace.reverse.index, before_index);
         assert_eq!(workspace.reverse.scratch_len, 1);
+        workspace.reverse.retain_scratch_as_frontier().unwrap();
+        assert_eq!(workspace.reverse.frontier_len, 1);
+        assert_eq!(workspace.reverse.frontier[0], 128);
     }
 
     #[test]
