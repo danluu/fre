@@ -14,16 +14,20 @@ use crate::{
 
 use super::{
     AARCH64_EQ, AARCH64_HS, AARCH64_LO, AARCH64_LS, AARCH64_NE, Aarch64Assembler,
-    Aarch64ExactSveKind, Aarch64Label, EMPTY_NATIVE_START_FILTER, NativeDfaLayout,
-    NativeStartFilter, NativeVectorFilter, ObjectError, X86Assembler, X86CandidateMask, X86Label,
-    X86StartFilterKind, aarch64_add_x_imm, aarch64_cmp_w_imm, aarch64_cmp_w_zero,
-    aarch64_cmp_x, aarch64_cmp_x_imm, aarch64_csel_x, aarch64_emit_candidate_any,
-    aarch64_emit_exact_sve_constants, aarch64_emit_first_candidate_in_batch,
-    aarch64_emit_first_candidate_lane, aarch64_emit_start_filter_address,
-    aarch64_emit_start_filter_batch_candidates, aarch64_emit_start_filter_constants,
-    aarch64_emit_start_filter_scalar_load, aarch64_emit_start_filter_vector_candidates,
-    aarch64_load_q, aarch64_mov_x, aarch64_orr_16b, aarch64_set_table_address, aarch64_sub_x_reg,
-    x86_emit_first_candidate_lane, x86_emit_start_filter_constants,
+    Aarch64ExactSveKind, Aarch64Label, Aarch64SveFilterKind, EMPTY_NATIVE_START_FILTER,
+    NativeDfaLayout, NativeStartFilter, NativeVectorFilter, ObjectError, X86Assembler,
+    X86CandidateMask, X86Label, X86StartFilterKind, aarch64_add_x_imm, aarch64_cmp_w_imm,
+    aarch64_cmp_w_zero, aarch64_cmp_x, aarch64_cmp_x_imm, aarch64_cmp_x_lsl, aarch64_csel_x,
+    aarch64_emit_candidate_any, aarch64_emit_exact_sve_constants,
+    aarch64_emit_first_candidate_in_batch, aarch64_emit_first_candidate_lane,
+    aarch64_emit_start_filter_address, aarch64_emit_start_filter_batch_candidates,
+    aarch64_emit_start_filter_constants, aarch64_emit_start_filter_scalar_load,
+    aarch64_emit_start_filter_vector_candidates, aarch64_load_q, aarch64_mov_x, aarch64_orr_16b,
+    aarch64_set_table_address, aarch64_sub_x_reg, aarch64_sve_addvl, aarch64_sve_and_b,
+    aarch64_sve_brkb_p0, aarch64_sve_cmpeq_b, aarch64_sve_cmphs_b, aarch64_sve_cntb,
+    aarch64_sve_dup_b_imm, aarch64_sve_incp_b, aarch64_sve_ld1b_vl, aarch64_sve_ld1rqb,
+    aarch64_sve_orr_b, aarch64_sve_ptest_p0, aarch64_sve_ptrue_b, aarch64_sve_whilelo_b,
+    aarch64_sve2_match_b, x86_emit_first_candidate_lane, x86_emit_start_filter_constants,
     x86_emit_start_filter_scalar_load, x86_emit_start_filter_vector_candidate,
 };
 
@@ -37,6 +41,12 @@ pub(super) struct NativeDfaLoopSkip {
     pub(super) state: u32,
     /// Table-relative byte address of the semantic state's forward row.
     pub(super) row_offset: u32,
+    /// Optional target-installed 16-byte table for SVE2 `MATCH`.
+    ///
+    /// Base SVE uses immediate constants and leaves this absent. Installation
+    /// is transactional and target-specific, so a failed optional allocation
+    /// retains the exact base-SVE lowering.
+    pub(super) sve2_match_table_offset: Option<u32>,
 }
 
 /// Select and address one interior loop after the transition row size is
@@ -64,6 +74,7 @@ pub(super) fn derive_native_dfa_loop_skip(
         accepting: plan.accepting,
         state: plan.state,
         row_offset,
+        sve2_match_table_offset: None,
     }))
 }
 
@@ -311,6 +322,197 @@ fn aarch64_restore_start_constants(
     Ok(())
 }
 
+const AARCH64_SVE_LOOP_FIRST_CONSTANT: u8 = 24;
+const AARCH64_SVE_LOOP_LAST_CONSTANT: u8 = 27;
+
+fn aarch64_sve_loop_constant(index: usize) -> Result<u8, ObjectError> {
+    AARCH64_SVE_LOOP_FIRST_CONSTANT
+        .checked_add(
+            u8::try_from(index)
+                .map_err(|_| ObjectError::ArithmeticOverflow("SVE loop-skip constant"))?,
+        )
+        .filter(|&register| register <= AARCH64_SVE_LOOP_LAST_CONSTANT)
+        .ok_or(ObjectError::InvalidModule(
+            "SVE loop-skip constant escaped Z24..Z27",
+        ))
+}
+
+/// Establish loop-local scalable constants without disturbing Z16..Z23.
+///
+/// Pure-SVE roots deliberately retain their graph-filter constants in
+/// Z16..Z23 across retries. Keeping this independent loop proof in Z24..Z27
+/// means an interior-loop exit needs no root-constant restoration. SVE2 uses
+/// the same first scratch register for its target-installed MATCH table.
+fn aarch64_emit_sve_loop_setup(
+    assembler: &mut Aarch64Assembler,
+    filter: NativeStartFilter,
+    kind: Aarch64SveFilterKind,
+) -> Result<(), ObjectError> {
+    if filter.scan_offset != 0 || filter.ranges().is_empty() {
+        return Err(ObjectError::InvalidModule("invalid SVE loop-skip filter"));
+    }
+    match kind {
+        Aarch64SveFilterKind::Sve => {
+            let required = filter.constant_count();
+            if required > usize::from(MAX_DFA_LOOP_VECTOR_CONSTANTS) {
+                return Err(ObjectError::InvalidModule("SVE loop-skip constant budget"));
+            }
+            for (index, range) in filter.ranges().iter().enumerate() {
+                if filter.is_exact() {
+                    let register = aarch64_sve_loop_constant(index)?;
+                    assembler.instruction(aarch64_sve_dup_b_imm(register, range.start)?)?;
+                } else {
+                    let low_index = index.checked_mul(2).ok_or(ObjectError::ArithmeticOverflow(
+                        "SVE loop-skip low constant",
+                    ))?;
+                    let high_index =
+                        low_index
+                            .checked_add(1)
+                            .ok_or(ObjectError::ArithmeticOverflow(
+                                "SVE loop-skip high constant",
+                            ))?;
+                    let low = aarch64_sve_loop_constant(low_index)?;
+                    let high = aarch64_sve_loop_constant(high_index)?;
+                    assembler.instruction(aarch64_sve_dup_b_imm(low, range.start)?)?;
+                    assembler.instruction(aarch64_sve_dup_b_imm(high, range.end)?)?;
+                }
+            }
+        }
+        Aarch64SveFilterKind::Sve2 { match_table_offset } => {
+            if !filter.is_exact() || filter.ranges().len() > 16 {
+                return Err(ObjectError::InvalidModule(
+                    "invalid SVE2 loop-skip MATCH filter",
+                ));
+            }
+            // LD1RQB is governed by P0, which the entry gate established for
+            // every byte lane before this one-time setup.
+            aarch64_set_table_address(assembler, 12, match_table_offset)?;
+            assembler.instruction(aarch64_sve_ld1rqb(AARCH64_SVE_LOOP_FIRST_CONSTANT, 12)?)?;
+        }
+    }
+    Ok(())
+}
+
+fn aarch64_emit_sve_loop_candidates(
+    assembler: &mut Aarch64Assembler,
+    filter: NativeStartFilter,
+    kind: Aarch64SveFilterKind,
+) -> Result<(), ObjectError> {
+    match kind {
+        Aarch64SveFilterKind::Sve2 { .. } => assembler
+            .instruction(aarch64_sve2_match_b(1, 0, AARCH64_SVE_LOOP_FIRST_CONSTANT)?)
+            .map(|_| ()),
+        Aarch64SveFilterKind::Sve if filter.is_exact() => {
+            for (index, _) in filter.ranges().iter().enumerate() {
+                let constant = aarch64_sve_loop_constant(index)?;
+                let comparison = if index == 0 { 1 } else { 2 };
+                assembler.instruction(aarch64_sve_cmpeq_b(comparison, 0, constant)?)?;
+                if index != 0 {
+                    assembler.instruction(aarch64_sve_orr_b(1, 1, 2)?)?;
+                }
+            }
+            Ok(())
+        }
+        Aarch64SveFilterKind::Sve => {
+            for (index, _) in filter.ranges().iter().enumerate() {
+                let low_index = index.checked_mul(2).ok_or(ObjectError::ArithmeticOverflow(
+                    "SVE loop-skip candidate low",
+                ))?;
+                let high_index =
+                    low_index
+                        .checked_add(1)
+                        .ok_or(ObjectError::ArithmeticOverflow(
+                            "SVE loop-skip candidate high",
+                        ))?;
+                let low = aarch64_sve_loop_constant(low_index)?;
+                let high = aarch64_sve_loop_constant(high_index)?;
+                let comparison = if index == 0 { 1 } else { 2 };
+                assembler.instruction(aarch64_sve_cmphs_b(comparison, 0, low)?)?;
+                // CMPLS(data, high) is the CMPHS(high, data) alias.
+                assembler.instruction(aarch64_sve_cmphs_b(3, high, 0)?)?;
+                assembler.instruction(aarch64_sve_and_b(comparison, comparison, 3)?)?;
+                if index != 0 {
+                    assembler.instruction(aarch64_sve_orr_b(1, 1, 2)?)?;
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Emit a vector-length-agnostic loop skipper over completed partial rows.
+///
+/// Full vectors use P0=all lanes. After at least one profitable full-vector
+/// probe, a final predicated tail uses WHILELO and cannot read beyond the
+/// authenticated window. BRKB+INCP selects the exact first exit lane without
+/// assuming any process vector length.
+fn aarch64_emit_sve_dfa_loop_skip(
+    assembler: &mut Aarch64Assembler,
+    plan: NativeDfaLoopSkip,
+    kind: Aarch64SveFilterKind,
+    ordinary: Aarch64Label,
+    exhausted: Aarch64Label,
+) -> Result<(), ObjectError> {
+    let vector = assembler.label()?;
+    let partial = assembler.label()?;
+    let hit = assembler.label()?;
+
+    aarch64_set_table_address(assembler, 12, plan.row_offset)?;
+    assembler.instruction(aarch64_cmp_x(11, 12)?)?;
+    assembler.branch_cond(AARCH64_NE, ordinary)?;
+    assembler.instruction(aarch64_sve_ptrue_b())?;
+    assembler.instruction(aarch64_sve_cntb(6)?)?;
+    assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+    // Version only when at least two runtime vectors remain. This is the
+    // scalable analogue of the existing SSE/AVX/ASIMD entry gate.
+    assembler.instruction(aarch64_cmp_x_lsl(12, 6, 1)?)?;
+    assembler.branch_cond(AARCH64_LO, ordinary)?;
+    aarch64_emit_sve_loop_setup(assembler, plan.filter, kind)?;
+
+    assembler.bind(vector)?;
+    assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+    assembler.instruction(aarch64_cmp_x(12, 6)?)?;
+    assembler.branch_cond(AARCH64_LO, partial)?;
+    aarch64_emit_start_filter_address(assembler, 0)?;
+    assembler.instruction(aarch64_sve_ld1b_vl(0, 12, 0)?)?;
+    aarch64_emit_sve_loop_candidates(assembler, plan.filter, kind)?;
+    assembler.instruction(aarch64_sve_ptest_p0(1)?)?;
+    assembler.branch_cond(AARCH64_NE, hit)?;
+    assembler.instruction(aarch64_sve_addvl(2, 2, 1)?)?;
+    if plan.accepting {
+        assembler.instruction(aarch64_mov_x(7, 2)?)?;
+    }
+    assembler.branch(vector)?;
+
+    assembler.bind(partial)?;
+    assembler.instruction(aarch64_sve_whilelo_b(0, 2, 3)?)?;
+    aarch64_emit_start_filter_address(assembler, 0)?;
+    assembler.instruction(aarch64_sve_ld1b_vl(0, 12, 0)?)?;
+    aarch64_emit_sve_loop_candidates(assembler, plan.filter, kind)?;
+    assembler.instruction(aarch64_sve_ptest_p0(1)?)?;
+    assembler.branch_cond(AARCH64_NE, hit)?;
+    assembler.instruction(aarch64_mov_x(2, 3)?)?;
+    if plan.accepting {
+        assembler.instruction(aarch64_mov_x(7, 3)?)?;
+    }
+    assembler.branch(exhausted)?;
+
+    assembler.bind(hit)?;
+    if plan.accepting {
+        assembler.instruction(aarch64_mov_x(12, 2)?)?;
+    }
+    assembler.instruction(aarch64_sve_brkb_p0(2, 1)?)?;
+    assembler.instruction(aarch64_sve_incp_b(2, 2)?)?;
+    if plan.accepting {
+        // Lane zero skips no accepting byte. Otherwise the exit position is
+        // exactly the end of the final skipped accepting transition.
+        assembler.instruction(aarch64_cmp_x(2, 12)?)?;
+        assembler.instruction(aarch64_csel_x(7, 7, 2, AARCH64_EQ)?)?;
+    }
+    assembler.branch(ordinary)?;
+    Ok(())
+}
+
 /// Emit one guarded `AArch64` loop skipper. ASIMD is used when selected by the
 /// explicit target feature set; the same graph proof still enables a compact
 /// scalar byte loop otherwise.
@@ -324,12 +526,16 @@ pub(super) fn aarch64_emit_dfa_loop_skip(
     plan: NativeDfaLoopSkip,
     layout: &NativeDfaLayout,
     vector_filter: Option<NativeVectorFilter>,
+    sve_kind: Option<Aarch64SveFilterKind>,
     use_asimd: bool,
     use_exact_asimd_lane: bool,
     exact_sve_kind: Option<Aarch64ExactSveKind>,
     ordinary: Aarch64Label,
     exhausted: Aarch64Label,
 ) -> Result<(), ObjectError> {
+    if let Some(kind) = sve_kind {
+        return aarch64_emit_sve_dfa_loop_skip(assembler, plan, kind, ordinary, exhausted);
+    }
     let vector = assembler.label()?;
     let single_vector = assembler.label()?;
     let batch_hit = assembler.label()?;
@@ -473,4 +679,144 @@ pub(super) fn aarch64_emit_dfa_loop_skip(
     }
     assembler.branch(ordinary)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ExitKind {
+        CompletedRow,
+        PartialHole,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct LoopOutcome {
+        position: usize,
+        pending_end: Option<usize>,
+        exhausted: bool,
+        exit_kind: ExitKind,
+    }
+
+    fn scalar_outcome(
+        length: usize,
+        exit_at: usize,
+        accepting: bool,
+        old_pending: Option<usize>,
+        exit_kind: ExitKind,
+    ) -> LoopOutcome {
+        let position = exit_at.min(length);
+        LoopOutcome {
+            position,
+            pending_end: if accepting && position != 0 {
+                Some(position)
+            } else {
+                old_pending
+            },
+            exhausted: exit_at >= length,
+            exit_kind,
+        }
+    }
+
+    fn scalable_outcome(
+        length: usize,
+        exit_at: usize,
+        vector_length: usize,
+        accepting: bool,
+        old_pending: Option<usize>,
+        exit_kind: ExitKind,
+    ) -> Option<LoopOutcome> {
+        if length < vector_length.checked_mul(2)? {
+            return None;
+        }
+        let mut position = 0_usize;
+        let mut pending_end = old_pending;
+        while length.checked_sub(position)? >= vector_length {
+            let block_end = position.checked_add(vector_length)?;
+            if (position..block_end).contains(&exit_at) {
+                let skipped = exit_at.checked_sub(position)?;
+                if accepting && skipped != 0 {
+                    pending_end = Some(exit_at);
+                }
+                return Some(LoopOutcome {
+                    position: exit_at,
+                    pending_end,
+                    exhausted: false,
+                    exit_kind,
+                });
+            }
+            position = block_end;
+            if accepting {
+                pending_end = Some(position);
+            }
+        }
+
+        if (position..length).contains(&exit_at) {
+            let skipped = exit_at.checked_sub(position)?;
+            if accepting && skipped != 0 {
+                pending_end = Some(exit_at);
+            }
+            Some(LoopOutcome {
+                position: exit_at,
+                pending_end,
+                exhausted: false,
+                exit_kind,
+            })
+        } else {
+            if accepting && position != length {
+                pending_end = Some(length);
+            }
+            Some(LoopOutcome {
+                position: length,
+                pending_end,
+                exhausted: true,
+                exit_kind,
+            })
+        }
+    }
+
+    #[test]
+    fn scalable_loop_model_exhausts_vls_tails_holes_and_acceptance() {
+        for vector_length in (16_usize..=256).step_by(16) {
+            for length in 0..vector_length * 2 {
+                assert!(
+                    scalable_outcome(
+                        length,
+                        length,
+                        vector_length,
+                        false,
+                        Some(7),
+                        ExitKind::CompletedRow,
+                    )
+                    .is_none(),
+                    "VL={vector_length}, length={length}"
+                );
+            }
+            // Every possible final predicate population is represented by
+            // one length in [2*VL, 3*VL], including an empty tail. Every
+            // possible first exit before or at that end is then checked.
+            for length in vector_length * 2..=vector_length * 3 {
+                for exit_at in 0..=length {
+                    for accepting in [false, true] {
+                        for exit_kind in [ExitKind::CompletedRow, ExitKind::PartialHole] {
+                            let expected =
+                                scalar_outcome(length, exit_at, accepting, Some(7), exit_kind);
+                            let actual = scalable_outcome(
+                                length,
+                                exit_at,
+                                vector_length,
+                                accepting,
+                                Some(7),
+                                exit_kind,
+                            )
+                            .expect("two-vector entry gate");
+                            assert_eq!(
+                                actual, expected,
+                                "VL={vector_length}, length={length}, exit={exit_at}, accepting={accepting}, kind={exit_kind:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

@@ -5,7 +5,8 @@
 //! whose *exit* bytes have a compact SIMD representation.
 //! Keeping one plan bounds the dispatch tax on every ordinary DFA iteration;
 //! target lowering may scan a run of loop bytes with SSE2, AVX2, AVX-512BW,
-//! or ASIMD and resume the ordinary transition loop at the first exit byte.
+//! ASIMD, SVE, or SVE2 and resume the ordinary transition loop at the first
+//! exit byte.
 
 #![allow(
     dead_code,

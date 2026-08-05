@@ -2579,7 +2579,7 @@ fn lower_native_dfa_with_entry_contract(
 ) -> Result<Option<NativeLowering>, ObjectError> {
     let vector_cost_model = native_vector_filter_cost_model_for_target(target, true);
     let relation_vector_owns_route = direct_relation_vector_owns_route(target);
-    let (mut data, layout) = build_native_dfa_table_with_cost_model(
+    let (mut data, mut layout) = build_native_dfa_table_with_cost_model(
         view,
         target.architecture,
         vector_cost_model,
@@ -2593,6 +2593,7 @@ fn lower_native_dfa_with_entry_contract(
     }
     let sve_filter_plan = install_aarch64_sve_filter_plan(&mut data, layout, target)?;
     let sve_suffix_kind = install_aarch64_sve_suffix_kind(&mut data, layout, target)?;
+    install_aarch64_sve_loop_storage(&mut data, &mut layout, target)?;
     if entry_contract == NativeDfaEntryContract::PreparedPartialCore && layout.partial.is_none() {
         return Err(ObjectError::InvalidModule(
             "trusted prepared core has no partial continuation layout",
@@ -2881,6 +2882,26 @@ fn selected_aarch64_sve_suffix_kind(
     )
 }
 
+fn selected_aarch64_sve_loop_kind(
+    layout: &NativeDfaLayout,
+    features: FeatureSet,
+    operating_system: OperatingSystem,
+) -> Option<Aarch64SveFilterKind> {
+    if operating_system != OperatingSystem::Linux
+        || !features.has(CpuFeature::Aarch64Sve)
+    {
+        return None;
+    }
+    let plan = layout.loop_skip?;
+    if features.has(CpuFeature::Aarch64Sve2)
+        && let Some(match_table_offset) = plan.sve2_match_table_offset
+    {
+        Some(Aarch64SveFilterKind::Sve2 { match_table_offset })
+    } else {
+        Some(Aarch64SveFilterKind::Sve)
+    }
+}
+
 fn install_aarch64_sve_suffix_kind(
     data: &mut Vec<u8>,
     layout: NativeDfaLayout,
@@ -2953,6 +2974,81 @@ fn install_aarch64_sve_suffix_kind_with_limit(
         data.push(range.start);
     }
     Ok(Some(Aarch64SveFilterKind::Sve2 { match_table_offset }))
+}
+
+/// Install the optional exact-byte table used by an SVE2 interior-loop
+/// skipper. Base SVE needs no data: its bounded range proof is materialized
+/// with immediate DUP constants in caller-saved Z24..Z27. Allocation and
+/// address pressure are therefore failure-atomic and retain that exact base
+/// lowering.
+fn install_aarch64_sve_loop_storage(
+    data: &mut Vec<u8>,
+    layout: &mut NativeDfaLayout,
+    target: Target,
+) -> Result<(), ObjectError> {
+    if target.architecture != Architecture::Aarch64
+        || target.operating_system != OperatingSystem::Linux
+        || !target.features.has(CpuFeature::Aarch64Sve)
+        || !target.features.has(CpuFeature::Aarch64Sve2)
+    {
+        return Ok(());
+    }
+    let Some(plan) = layout.loop_skip.as_mut() else {
+        return Ok(());
+    };
+    if plan.filter.ranges().is_empty() {
+        return Err(ObjectError::InvalidModule(
+            "SVE2 loop-skip filter is empty",
+        ));
+    }
+    if !plan.filter.is_exact() {
+        return Ok(());
+    }
+    // A singleton costs one immediate DUP plus one base-SVE compare. MATCH
+    // would add an address materialization and table load without removing a
+    // comparison; reserve SVE2 storage for multi-byte exact exit sets.
+    if plan.filter.ranges().len() == 1 {
+        return Ok(());
+    }
+    if plan.sve2_match_table_offset.is_some() {
+        return Err(ObjectError::InvalidModule(
+            "SVE2 loop-skip table was installed twice",
+        ));
+    }
+    let aligned = data
+        .len()
+        .checked_add(15)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "SVE2 loop-skip table alignment",
+        ))?
+        & !15;
+    let total = aligned
+        .checked_add(16)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "SVE2 loop-skip table bytes",
+        ))?;
+    let maximum_table_bytes = usize::try_from(i32::MAX)
+        .map_err(|_| ObjectError::ArithmeticOverflow("SVE2 loop-skip address limit"))?;
+    if total > maximum_table_bytes {
+        return Ok(());
+    }
+    let additional = total
+        .checked_sub(data.len())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "SVE2 loop-skip table reservation",
+        ))?;
+    if data.try_reserve_exact(additional).is_err() {
+        return Ok(());
+    }
+    let match_table_offset = u32::try_from(aligned)
+        .map_err(|_| ObjectError::ArithmeticOverflow("SVE2 loop-skip table offset"))?;
+    data.resize(aligned, 0);
+    let ranges = plan.filter.ranges();
+    for range in ranges.iter().cycle().take(16) {
+        data.push(range.start);
+    }
+    plan.sve2_match_table_offset = Some(match_table_offset);
+    Ok(())
 }
 
 fn install_aarch64_sve_filter_plan(
@@ -3349,16 +3445,17 @@ fn build_native_dfa_table_with_cost_model(
     }
     let suffix_filter = selected_suffix_filter;
     let forward_offset = transitions.table_prefix_bytes();
-    let loop_skip = if view.partial_discovered_states.is_some() {
-        None
-    } else {
-        module_dfa_loop_skip::derive_native_dfa_loop_skip(
-            &dfa,
-            view.output,
-            forward_offset,
-            row_bytes,
-        )?
-    };
+    // A retained partial exposes only completed rows in `dfa.forward_cells`.
+    // Hole destinations are outside that prefix and therefore cannot be
+    // mistaken for self-loops; they simply belong to a selected loop's exact
+    // exit set. The same graph proof is consequently valid for complete and
+    // incomplete native tables.
+    let loop_skip = module_dfa_loop_skip::derive_native_dfa_loop_skip(
+        &dfa,
+        view.output,
+        forward_offset,
+        row_bytes,
+    )?;
     let retains_asimd_candidate_mask = architecture == Architecture::Aarch64
         && (start_filter.is_some_and(|filter| !filter.ranges().is_empty())
             || requested_exact_start_byte_set.is_some()
@@ -3703,6 +3800,7 @@ fn build_native_dfa_table_with_cost_model(
                         row_bytes,
                         forward_states,
                         has_start_scanner,
+                        loop_skip.map(|plan| plan.state),
                         partial,
                         cells,
                     )?
@@ -3742,6 +3840,7 @@ fn build_native_dfa_table_with_cost_model(
                             row_bytes,
                             forward_states,
                             has_start_scanner,
+                            loop_skip.map(|plan| plan.state),
                             partial,
                             cells,
                         )?
@@ -5824,6 +5923,10 @@ fn pack_native_forward_cell(
     )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "partial packing needs semantic row, hole, flag, and accelerator inputs"
+)]
 fn pack_native_partial_forward_cell(
     next: u32,
     accepted: bool,
@@ -5831,6 +5934,7 @@ fn pack_native_partial_forward_cell(
     row_bytes: usize,
     complete_states: usize,
     initial_scannable: bool,
+    loop_state: Option<u32>,
     partial: NativePartialDfaLayout,
     cells: NativeCellEncoding,
 ) -> Result<u32, ObjectError> {
@@ -5846,7 +5950,7 @@ fn pack_native_partial_forward_cell(
             row_bytes,
             complete_states,
             initial_scannable,
-            None,
+            loop_state,
             cells,
         );
     }
@@ -14810,7 +14914,10 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
         && layout
             .suffix_filter
             .is_some_and(|suffix| use_aarch64_filter_batch(suffix.filter));
-    let use_asimd_loop = features.has(CpuFeature::Aarch64Asimd) && layout.loop_skip.is_some();
+    let sve_loop_kind = selected_aarch64_sve_loop_kind(&layout, features, operating_system);
+    let use_asimd_loop = sve_loop_kind.is_none()
+        && features.has(CpuFeature::Aarch64Asimd)
+        && layout.loop_skip.is_some();
     let pure_sve_filter = use_sve_filter && !features.has(CpuFeature::Aarch64Asimd);
     let prefix_relation_vector = layout
         .prefix_relation
@@ -15493,6 +15600,7 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
             plan,
             &layout,
             vector_filter,
+            sve_loop_kind,
             use_asimd_loop,
             use_exact_asimd_lane,
             exact_sve_kind,
@@ -16196,6 +16304,38 @@ mod tests {
         CompileLimitsV1, CompileMode, CompileRequest, CompiledRegex, DeterminizeLimits, EngineKind,
         MatchResult, ObjectFormat, SearchWindow, compile, emit_object,
     };
+
+    const PARTIAL_LOOP_PATTERN: &str = "A(?-u:[^Z])*Z|(?:ab|cd){2,8}";
+
+    fn partial_loop_limits() -> CompileLimitsV1 {
+        CompileLimitsV1 {
+            determinize: DeterminizeLimits {
+                max_states: 6,
+                ..DeterminizeLimits::default()
+            },
+            ..CompileLimitsV1::default()
+        }
+    }
+
+    fn compile_partial_loop(target: Target, output: OutputContract) -> CompiledRegex {
+        let compiled = compile(
+            CompileRequest::new(PARTIAL_LOOP_PATTERN, target)
+                .mode(CompileMode::Optimizing)
+                .output(output)
+                .limits(partial_loop_limits()),
+        )
+        .expect("partial self-loop compilation");
+        let view = compiled
+            .program()
+            .native_partial_dfa_view()
+            .expect("incomplete retained DFA with a completed loop row");
+        let layout = build_native_dfa_table_for_architecture(view.native, target.architecture)
+            .expect("partial loop native table")
+            .1;
+        assert!(layout.partial.is_some());
+        assert!(layout.loop_skip.is_some());
+        compiled
+    }
 
     fn identity_target_matrix() -> Vec<Target> {
         let x86_features = [
@@ -17951,7 +18091,7 @@ mod tests {
             );
         }
 
-        let (_, aarch64_layout) =
+        let (mut aarch64_data, aarch64_layout) =
             build_native_dfa_table_for_architecture(view, Architecture::Aarch64).unwrap();
         assert!(aarch64_layout.loop_skip.is_some());
         let aarch64 = lower_aarch64_dfa_for_operating_system_with_emission(
@@ -17998,8 +18138,19 @@ mod tests {
         let mixed_sve2 = FeatureSet::of(CpuFeature::Aarch64Asimd)
             .with(CpuFeature::Aarch64Sve)
             .with(CpuFeature::Aarch64Sve2);
+        let mixed_target = Target::aarch64_linux()
+            .with_features(mixed_sve2)
+            .unwrap();
+        let mut mixed_layout = aarch64_layout;
+        let mixed_data_len = aarch64_data.len();
+        install_aarch64_sve_loop_storage(
+            &mut aarch64_data,
+            &mut mixed_layout,
+            mixed_target,
+        )
+        .unwrap();
         let mixed = lower_aarch64_dfa_for_operating_system_with_emission(
-            aarch64_layout,
+            mixed_layout,
             mixed_sve2,
             OperatingSystem::Linux,
             None,
@@ -18071,17 +18222,22 @@ mod tests {
         assert!(mixed_words.contains(&aarch64_sve2_match_b(1, 0, 16).unwrap()));
         assert!(mixed_words.contains(&aarch64_ld1_three_16b(16, 6).unwrap()));
         assert!(
-            !mixed_words.contains(&aarch64_sve_cntb(6).unwrap()),
-            "mixed exact scanner redundantly resampled its retained vector length"
+            mixed_words.contains(&aarch64_sve_cntb(6).unwrap()),
+            "independently entered VLA loop did not sample its vector length"
         );
-        assert!(
+        assert_eq!(
             mixed_words
                 .iter()
                 .filter(|&&word| word == aarch64_sve_ld1rqb(16, 12).unwrap())
-                .count()
-                >= 2,
-            "mixed SVE2 constants were not restored after the ASIMD loop skipper"
+                .count(),
+            1,
+            "VLA loop must preserve the root SVE2 constant bank"
         );
+        assert!(mixed_words.contains(&aarch64_sve_dup_b_imm(24, b'Q').unwrap()));
+        assert!(mixed_words.contains(&aarch64_sve_cmpeq_b(1, 0, 24).unwrap()));
+        assert!(!mixed_words.contains(&aarch64_sve_ld1rqb(24, 12).unwrap()));
+        assert!(!mixed_words.contains(&aarch64_sve2_match_b(1, 0, 24).unwrap()));
+        assert_eq!(aarch64_data.len(), mixed_data_len);
     }
 
     #[test]
@@ -19845,47 +20001,81 @@ mod tests {
                 hole_token_base,
                 resume_states: 4,
             };
+            let completed = u32::try_from(complete_states).unwrap();
             for accepted in [false, true] {
-                for resume in 0_u32..partial.resume_states {
-                    let next = u32::try_from(complete_states).unwrap() + resume;
-                    let packed = pack_native_partial_forward_cell(
-                        next,
-                        accepted,
-                        0,
-                        row_bytes,
-                        complete_states,
-                        true,
-                        partial,
-                        cells,
-                    )
-                    .unwrap();
-                    assert_eq!(packed & cells.next_mask(), hole_token_base + resume);
-                    assert_ne!(packed & cells.accelerated(), 0);
-                    assert_eq!(packed & cells.accepts() != 0, accepted);
+                for initial_scannable in [false, true] {
+                    for loop_state in
+                        core::iter::once(None).chain((0..completed).map(Some))
+                    {
+                        for next in core::iter::once(NO_DFA_STATE).chain(0..completed) {
+                            let packed = pack_native_partial_forward_cell(
+                                next,
+                                accepted,
+                                0,
+                                row_bytes,
+                                complete_states,
+                                initial_scannable,
+                                loop_state,
+                                partial,
+                                cells,
+                            )
+                            .unwrap();
+                            let expected_accelerated = next != NO_DFA_STATE
+                                && ((initial_scannable && next == 0)
+                                    || loop_state == Some(next));
+                            assert_eq!(
+                                packed & cells.accelerated() != 0,
+                                expected_accelerated,
+                                "{cells:?}/{accepted}/{initial_scannable}/{loop_state:?}/{next}"
+                            );
+                            assert_eq!(packed & cells.accepts() != 0, accepted);
+                            assert_eq!(
+                                packed & cells.next_mask(),
+                                u32::try_from(
+                                    encode_native_next(
+                                        next,
+                                        0,
+                                        row_bytes,
+                                        complete_states,
+                                        cells,
+                                    )
+                                    .unwrap()
+                                )
+                                .unwrap()
+                            );
+                        }
+
+                        for resume in 0_u32..partial.resume_states {
+                            let next = completed + resume;
+                            let packed = pack_native_partial_forward_cell(
+                                next,
+                                accepted,
+                                0,
+                                row_bytes,
+                                complete_states,
+                                initial_scannable,
+                                loop_state,
+                                partial,
+                                cells,
+                            )
+                            .unwrap();
+                            assert_eq!(packed & cells.next_mask(), hole_token_base + resume);
+                            assert_ne!(packed & cells.accelerated(), 0);
+                            assert_eq!(packed & cells.accepts() != 0, accepted);
+                            assert!(packed & cells.next_mask() > hole_token_base - 1);
+                        }
+                    }
                 }
             }
-            let accepted_dead = pack_native_partial_forward_cell(
-                NO_DFA_STATE,
-                true,
-                0,
-                row_bytes,
-                complete_states,
-                true,
-                partial,
-                cells,
-            )
-            .unwrap();
-            assert_eq!(accepted_dead & cells.next_mask(), 0);
-            assert_ne!(accepted_dead & cells.accepts(), 0);
-            assert_eq!(accepted_dead & cells.accelerated(), 0);
             assert!(
                 pack_native_partial_forward_cell(
-                    u32::try_from(complete_states).unwrap() + partial.resume_states,
+                    completed + partial.resume_states,
                     false,
                     0,
                     row_bytes,
                     complete_states,
                     true,
+                    None,
                     partial,
                     cells,
                 )
@@ -19901,6 +20091,332 @@ mod tests {
             select_native_cell_encoding_with_holes(TransitionLayout::ClassMapped, 1, 1, 0, 16_255,),
             NativeCellEncoding::Wide32
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "every completed row, physical column, hole token, and metadata flag shares one table oracle"
+    )]
+    fn partial_loop_rows_preserve_exact_holes_flags_and_accelerator_dispatch() {
+        let compiled = compile_partial_loop(Target::x86_64_linux(), OutputContract::SelectedEnd);
+        let view = compiled.program().native_partial_dfa_view().unwrap();
+        for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+            let (data, layout) =
+                build_native_dfa_table_for_architecture(view.native, architecture).unwrap();
+            let partial = layout.partial.expect("partial native layout");
+            let plan = layout.loop_skip.expect("partial graph-derived loop");
+            assert!(!plan.accepting);
+            assert!(usize::try_from(plan.state).unwrap() < view.complete_rows);
+
+            let row_cells = layout.transitions.row_cells(view.dfa.class_count);
+            let row_bytes = row_cells * layout.cells.bytes();
+            let forward_offset = usize::try_from(layout.forward_offset).unwrap();
+            let mut saw_hole = false;
+            let mut saw_loop_hole = false;
+            let mut saw_loop_target = false;
+            let mut saw_accept = false;
+
+            for state in 0..view.complete_rows {
+                for physical_column in 0..row_cells {
+                    let class = match layout.transitions {
+                        TransitionLayout::ClassMapped => physical_column,
+                        TransitionLayout::DirectByte => {
+                            usize::from(view.dfa.byte_classes[physical_column])
+                        }
+                    };
+                    let cell = view.dfa.dfa.forward_cells
+                        [state * view.dfa.class_count + class];
+                    let offset = forward_offset
+                        + state * row_bytes
+                        + physical_column * layout.cells.bytes();
+                    let packed = match layout.cells {
+                        NativeCellEncoding::Compact16 => u32::from(u16::from_le_bytes(
+                            data[offset..offset + 2].try_into().unwrap(),
+                        )),
+                        NativeCellEncoding::Wide32 => {
+                            u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
+                        }
+                    };
+                    let semantic_hole = cell.next != NO_DFA_STATE
+                        && usize::try_from(cell.next).unwrap() >= view.complete_rows;
+                    let expected_token = if semantic_hole {
+                        partial.hole_token_base
+                            + cell.next
+                            - u32::try_from(view.complete_rows).unwrap()
+                    } else {
+                        u32::try_from(
+                            encode_native_next(
+                                cell.next,
+                                forward_offset,
+                                row_bytes,
+                                view.complete_rows,
+                                layout.cells,
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap()
+                    };
+                    let expected_accelerated = semantic_hole
+                        || (cell.next != NO_DFA_STATE
+                            && ((layout.has_start_scanner() && cell.next == 0)
+                                || cell.next == plan.state));
+                    assert_eq!(packed & layout.cells.next_mask(), expected_token);
+                    assert_eq!(
+                        packed & layout.cells.accelerated() != 0,
+                        expected_accelerated
+                    );
+                    assert_eq!(packed & layout.cells.accepts() != 0, cell.accepted);
+                    saw_hole |= semantic_hole;
+                    saw_loop_hole |= semantic_hole && u32::try_from(state).unwrap() == plan.state;
+                    saw_loop_target |= cell.next == plan.state;
+                    saw_accept |= cell.accepted;
+                }
+            }
+            assert!(saw_hole, "{architecture:?}");
+            assert!(saw_loop_hole, "{architecture:?}");
+            assert!(saw_loop_target, "{architecture:?}");
+            assert!(saw_accept, "{architecture:?}");
+
+            for byte in u8::MIN..=u8::MAX {
+                let class = usize::from(view.dfa.byte_classes[usize::from(byte)]);
+                let cell = view.dfa.dfa.forward_cells
+                    [usize::try_from(plan.state).unwrap() * view.dfa.class_count + class];
+                let semantic_exit = cell.next != plan.state || cell.accepted != plan.accepting;
+                let encoded_exit = plan
+                    .filter
+                    .ranges()
+                    .iter()
+                    .any(|range| range.start <= byte && byte <= range.end);
+                assert_eq!(encoded_exit, semantic_exit, "byte={byte}/{architecture:?}");
+            }
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::similar_names,
+        clippy::too_many_lines,
+        reason = "one partial graph proof is lowered through every supported scalar and vector dispatcher tier"
+    )]
+    fn partial_loop_dispatchers_cover_x86_and_aarch64_vector_tiers() {
+        let compiled = compile_partial_loop(Target::x86_64_linux(), OutputContract::SelectedEnd);
+        let view = compiled.program().native_partial_dfa_view().unwrap();
+        let (_, x86_layout) =
+            build_native_dfa_table_for_architecture(view.native, Architecture::X86_64).unwrap();
+        let x86_partial = x86_layout.partial.unwrap();
+        let x86_plan = x86_layout.loop_skip.unwrap();
+
+        let avx512 = FeatureSet::of(CpuFeature::X86Avx512F)
+            .with(CpuFeature::X86Avx512Bw)
+            .with(CpuFeature::X86Avx512Vl);
+        for (target, minimum_remaining) in [
+            (Target::x86_64_linux(), 32_u32),
+            (
+                Target::x86_64_linux()
+                    .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                    .unwrap(),
+                64,
+            ),
+            (
+                Target::x86_64_linux().with_features(avx512).unwrap(),
+                128,
+            ),
+        ] {
+            let lowering = lower_native_dfa_with_entry_contract(
+                view.native,
+                target,
+                NativeDfaEntryContract::PreparedPartialCore,
+            )
+            .unwrap()
+            .expect("x86 partial loop lowering");
+            let mut entry_gate = vec![0x48, 0x3d];
+            entry_gate.extend_from_slice(&minimum_remaining.to_le_bytes());
+            entry_gate.extend_from_slice(&[0x0f, 0x82]);
+            assert!(lowering.code.windows(entry_gate.len()).any(|code| code == entry_gate));
+
+            let mut row_guard = vec![0x49, 0x8d, 0x81];
+            row_guard.extend_from_slice(&x86_plan.row_offset.to_le_bytes());
+            row_guard.extend_from_slice(&[0x49, 0x39, 0xc2, 0x0f, 0x85]);
+            assert!(lowering.code.windows(row_guard.len()).any(|code| code == row_guard));
+
+            let mut hole_dispatch = vec![0x3d];
+            hole_dispatch.extend_from_slice(&x86_partial.hole_token_base.to_le_bytes());
+            let hole_compare = lowering
+                .code
+                .windows(hole_dispatch.len())
+                .position(|code| code == hole_dispatch)
+                .expect("x86 partial hole-base compare");
+            let branch = hole_compare + hole_dispatch.len();
+            assert!(
+                lowering.code.get(branch) == Some(&0x73)
+                    || lowering.code.get(branch..branch + 2) == Some([0x0f, 0x83].as_slice())
+            );
+        }
+
+        let (_, aarch64_layout) =
+            build_native_dfa_table_for_architecture(view.native, Architecture::Aarch64).unwrap();
+        let plan = aarch64_layout.loop_skip.unwrap();
+        assert!(plan.filter.is_exact());
+        assert_eq!(plan.filter.ranges().len(), 3);
+        let words = |code: &[u8]| {
+            code
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let lower = |target| {
+            lower_native_dfa_with_entry_contract(
+                view.native,
+                target,
+                NativeDfaEntryContract::PreparedPartialCore,
+            )
+            .unwrap()
+            .expect("AArch64 partial loop lowering")
+        };
+
+        let scalar = lower_aarch64_dfa_for_operating_system_with_emission(
+            aarch64_layout,
+            FeatureSet::EMPTY,
+            OperatingSystem::Linux,
+            None,
+        )
+        .unwrap();
+        let scalar_words = words(&scalar.code);
+        assert!(scalar_words.contains(&aarch64_cmp_x_imm(12, 8).unwrap()));
+        assert!(scalar_words.contains(&aarch64_cmp_x(6, 12).unwrap()));
+
+        let asimd = lower_aarch64_dfa_for_operating_system_with_emission(
+            aarch64_layout,
+            FeatureSet::of(CpuFeature::Aarch64Asimd),
+            OperatingSystem::Macos,
+            None,
+        )
+        .unwrap();
+        let asimd_words = words(&asimd.code);
+        assert!(asimd_words.contains(&aarch64_cmp_x_imm(12, 32).unwrap()));
+        assert!(asimd_words.contains(&aarch64_ld1_four_16b(16, 12).unwrap()));
+
+        let sve_features = FeatureSet::of(CpuFeature::Aarch64Sve);
+        let sve_target = Target::aarch64_linux().with_features(sve_features).unwrap();
+        let sve = lower(sve_target);
+        let sve_words = words(&sve.code);
+        for instruction in [
+            aarch64_sve_ptrue_b(),
+            aarch64_sve_cntb(6).unwrap(),
+            aarch64_cmp_x_lsl(12, 6, 1).unwrap(),
+            aarch64_sve_ld1b_vl(0, 12, 0).unwrap(),
+            aarch64_sve_dup_b_imm(24, plan.filter.ranges()[0].start).unwrap(),
+            aarch64_sve_cmpeq_b(1, 0, 24).unwrap(),
+            aarch64_sve_whilelo_b(0, 2, 3).unwrap(),
+            aarch64_sve_brkb_p0(2, 1).unwrap(),
+            aarch64_sve_incp_b(2, 2).unwrap(),
+            aarch64_sve_addvl(2, 2, 1).unwrap(),
+        ] {
+            assert!(sve_words.contains(&instruction), "base SVE {instruction:#010x}");
+        }
+
+        let sve2_features = sve_features.with(CpuFeature::Aarch64Sve2);
+        let sve2_target = Target::aarch64_linux().with_features(sve2_features).unwrap();
+        let sve2 = lower(sve2_target);
+        let sve2_words = words(&sve2.code);
+        assert!(sve2_words.contains(&aarch64_sve_ld1rqb(24, 12).unwrap()));
+        assert!(sve2_words.contains(&aarch64_sve2_match_b(1, 0, 24).unwrap()));
+        assert!(sve2_words.contains(&aarch64_cmp_x_lsl(12, 6, 1).unwrap()));
+        let expected_table = (0..16)
+            .map(|index| plan.filter.ranges()[index % plan.filter.ranges().len()].start)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &sve2.data[sve2.data.len() - expected_table.len()..],
+            expected_table
+        );
+
+        let mixed_features = FeatureSet::of(CpuFeature::Aarch64Asimd).union(sve2_features);
+        let mixed_target = Target::aarch64_linux()
+            .with_features(mixed_features)
+            .unwrap();
+        let mixed = lower(mixed_target);
+        let mixed_words = words(&mixed.code);
+        assert!(mixed_words.contains(&aarch64_sve2_match_b(1, 0, 24).unwrap()));
+        assert!(mixed_words.contains(&aarch64_cmp_x_lsl(12, 6, 1).unwrap()));
+
+        assert!(
+            selected_aarch64_sve_loop_kind(
+                &aarch64_layout,
+                mixed_features,
+                OperatingSystem::Macos,
+            )
+            .is_none()
+        );
+        let macos_mixed = lower_aarch64_dfa_for_operating_system_with_emission(
+            aarch64_layout,
+            mixed_features,
+            OperatingSystem::Macos,
+            None,
+        )
+        .unwrap();
+        let macos_words = macos_mixed
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(macos_words.contains(&aarch64_cmp_x_imm(12, 32).unwrap()));
+        assert!(!macos_words.contains(&aarch64_cmp_x_lsl(12, 6, 1).unwrap()));
+    }
+
+    #[test]
+    fn partial_range_loop_uses_vla_base_sve_on_sve2_targets() {
+        let limits = CompileLimitsV1 {
+            determinize: DeterminizeLimits {
+                max_states: 4,
+                ..DeterminizeLimits::default()
+            },
+            ..CompileLimitsV1::default()
+        };
+        let features = FeatureSet::of(CpuFeature::Aarch64Sve)
+            .with(CpuFeature::Aarch64Sve2);
+        let target = Target::aarch64_linux().with_features(features).unwrap();
+        let compiled = compile(
+            CompileRequest::new(
+                "A(?-u:[^Z])*Z|[b-c][a-b]{1,5}(?:x+|y+)",
+                target,
+            )
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::SelectedEnd)
+            .limits(limits),
+        )
+        .unwrap();
+        let view = compiled.program().native_partial_dfa_view().unwrap();
+        let layout = build_native_dfa_table_for_architecture(view.native, Architecture::Aarch64)
+            .unwrap()
+            .1;
+        let plan = layout.loop_skip.expect("partial range loop");
+        assert!(!plan.filter.is_exact());
+        assert_eq!(plan.filter.ranges().len(), 2);
+        let lowering = lower_native_dfa_with_entry_contract(
+            view.native,
+            target,
+            NativeDfaEntryContract::PreparedPartialCore,
+        )
+        .unwrap()
+        .expect("base-SVE range loop lowering");
+        let words = lowering
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        for instruction in [
+            aarch64_cmp_x_lsl(12, 6, 1).unwrap(),
+            aarch64_sve_dup_b_imm(24, plan.filter.ranges()[0].start).unwrap(),
+            aarch64_sve_dup_b_imm(25, plan.filter.ranges()[0].end).unwrap(),
+            aarch64_sve_cmphs_b(1, 0, 24).unwrap(),
+            aarch64_sve_cmphs_b(3, 25, 0).unwrap(),
+            aarch64_sve_whilelo_b(0, 2, 3).unwrap(),
+        ] {
+            assert!(words.contains(&instruction), "range SVE {instruction:#010x}");
+        }
+        assert!(!words.contains(&aarch64_sve_ld1rqb(24, 12).unwrap()));
+        assert!(!words.contains(&aarch64_sve2_match_b(1, 0, 24).unwrap()));
     }
 
     #[test]
@@ -21109,6 +21625,28 @@ mod tests {
     fn linked_host_partial_prepared_all_outputs_match_real_runtime() {
         use std::{fs, process::Command, time::SystemTime};
 
+        fn first_interior_hole(
+            view: &NativePartialProgramView<'_>,
+            bytes: &[u8],
+        ) -> Option<usize> {
+            let mut row = 0_usize;
+            let mut position = 0_usize;
+            while position < bytes.len() {
+                let class = usize::from(view.dfa.byte_classes[usize::from(bytes[position])]);
+                let cell = view.dfa.packed_cells.get(row.checked_add(class)?)?.raw();
+                position = position.checked_add(1)?;
+                let next = cell & !PARTIAL_CELL_ACCEPTED;
+                if next == PARTIAL_CELL_DEAD {
+                    return None;
+                }
+                if next >= PARTIAL_CELL_HOLE_BASE {
+                    return (position < bytes.len()).then_some(position);
+                }
+                row = usize::try_from(next).ok()?;
+            }
+            None
+        }
+
         fn local_selected_end(
             view: &NativePartialProgramView<'_>,
             bytes: &[u8],
@@ -21166,13 +21704,7 @@ mod tests {
                 .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
                 .unwrap();
         }
-        let limits = CompileLimitsV1 {
-            determinize: DeterminizeLimits {
-                max_states: 8,
-                ..DeterminizeLimits::default()
-            },
-            ..CompileLimitsV1::default()
-        };
+        let limits = partial_loop_limits();
         let current_exe = std::env::current_exe().expect("current test executable");
         let profile_dir = current_exe
             .parent()
@@ -21194,8 +21726,14 @@ mod tests {
             std::process::id()
         ));
         fs::create_dir_all(&directory).expect("create all-output linker directory");
-        let mut haystack = vec![b'!'; PARTIAL_DFA_MIN_INPUT_BYTES];
-        haystack.extend_from_slice(b"aQ");
+        let mut haystack = vec![b'!'; PARTIAL_DFA_MIN_INPUT_BYTES + 64];
+        haystack[0] = b'A';
+        haystack.push(b'Z');
+        let hole_exit = PARTIAL_DFA_MIN_INPUT_BYTES;
+        let mut hole_haystack = vec![b'!'; hole_exit + 65];
+        hole_haystack[0] = b'A';
+        hole_haystack[hole_exit] = b'a';
+        *hole_haystack.last_mut().unwrap() = b'Z';
         let no_match_len = PARTIAL_DFA_MIN_INPUT_BYTES + 64;
 
         for (case, output) in [
@@ -21207,7 +21745,7 @@ mod tests {
         .enumerate()
         {
             let compiled = compile(
-                CompileRequest::new("a+Q|[b-c][a-b]{1,5}(?:x+|y+)", target)
+                CompileRequest::new(PARTIAL_LOOP_PATTERN, target)
                     .mode(CompileMode::Optimizing)
                     .output(output)
                     .limits(limits),
@@ -21217,6 +21755,21 @@ mod tests {
                 .program()
                 .native_partial_dfa_view()
                 .unwrap_or_else(|| panic!("missing host partial view for {output:?}"));
+            let native_layout = build_native_dfa_table_for_architecture(
+                view.native,
+                target.architecture,
+            )
+            .unwrap()
+            .1;
+            let loop_skip = native_layout
+                .loop_skip
+                .unwrap_or_else(|| panic!("missing host partial loop for {output:?}"));
+            assert!(!loop_skip.accepting);
+            assert_eq!(loop_skip.filter.candidate_bytes, 3);
+            assert_eq!(
+                first_interior_hole(&view, &hole_haystack),
+                Some(hole_exit + 1)
+            );
             assert!(compiled.module().prepared_entry_symbol().is_some());
             assert_eq!(
                 compiled
@@ -21273,6 +21826,7 @@ mod tests {
                  extern uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t,const unsigned char*,size_t,size_t,size_t,result_t*);\n\
                  extern uint32_t fre_aot_regex_runtime_destroy_exclusive_v1(handle_t);\n\
                  static const unsigned char haystack[]={{{}}};\n\
+                 static const unsigned char hole_haystack[]={{{}}};\n\
                  static const unsigned char no_match[{no_match_len}]={{0}};\n\
                  static int prepare(handle_t*h){{return fre_aot_regex_runtime_prepare_exclusive_v1({program_symbol},{program_len}U,h)==0U;}}\n\
                  static int destroy(handle_t h){{return fre_aot_regex_runtime_destroy_exclusive_v1(h)==0U;}}\n\
@@ -21284,10 +21838,12 @@ mod tests {
                    if(ns!=bs||nr.start!=br.start||nr.end!=br.end)return 2;\
                    if(!destroy(native)||!destroy(baseline))return 3;return 0;}}\n\
                  int main(void){{int s=compare(haystack,sizeof(haystack),0U,sizeof(haystack));\
-                   if(s!=0)return 10+s;s=compare(no_match,sizeof(no_match),0U,sizeof(no_match));\
-                   if(s!=0)return 20+s;s=compare(haystack,sizeof(haystack),sizeof(haystack),sizeof(haystack));\
-                   return s==0?0:30+s;}}\n",
+                   if(s!=0)return 10+s;s=compare(hole_haystack,sizeof(hole_haystack),0U,sizeof(hole_haystack));\
+                   if(s!=0)return 20+s;s=compare(no_match,sizeof(no_match),0U,sizeof(no_match));\
+                   if(s!=0)return 30+s;s=compare(haystack,sizeof(haystack),sizeof(haystack),sizeof(haystack));\
+                   return s==0?0:40+s;}}\n",
                 c_bytes(&haystack),
+                c_bytes(&hole_haystack),
             );
             let c_path = directory.join(format!("prepared-{case}.c"));
             let executable = directory.join(format!("prepared-{case}"));
@@ -29101,6 +29657,22 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(asimd_words.contains(&aarch64_cmp_x_imm(12, 32).unwrap()));
         assert!(asimd_words.contains(&aarch64_ld1_four_16b(16, 12).unwrap()));
+
+        let sve_accepting = lower_aarch64_dfa_for_operating_system_with_emission(
+            accepting,
+            FeatureSet::of(CpuFeature::Aarch64Sve),
+            OperatingSystem::Linux,
+            None,
+        )
+        .unwrap();
+        let sve_accepting_words = sve_accepting
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(sve_accepting_words.contains(&aarch64_cmp_x_lsl(12, 6, 1).unwrap()));
+        assert!(sve_accepting_words.contains(&aarch64_mov_x(7, 3).unwrap()));
+        assert!(sve_accepting_words.contains(&aarch64_csel_x(7, 7, 2, AARCH64_EQ).unwrap()));
     }
 
     #[test]
@@ -29762,6 +30334,7 @@ mod tests {
                 class_row_bytes,
                 complete_states,
                 true,
+                None,
                 class_partial,
                 NativeCellEncoding::Compact16,
             )
@@ -29773,6 +30346,7 @@ mod tests {
                 direct_row_bytes,
                 complete_states,
                 true,
+                None,
                 direct_partial,
                 NativeCellEncoding::Compact16,
             )
