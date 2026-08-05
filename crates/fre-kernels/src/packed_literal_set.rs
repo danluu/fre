@@ -28,15 +28,16 @@ pub const CERTIFIED_MAX_PATTERNS: usize = MAX_FACTORED_PATTERNS;
 const MAX_FACTORED_COLUMNS: usize = 16;
 const MAX_FACTORED_ANCHOR_BYTES: usize = 3;
 const FACTORED_SIMD_MINIMUM_HAYSTACK_BYTES: usize = 32;
-// A native side filter verifies a bounded number of candidates itself. If
-// those candidates are all decoys, the packed searcher resumes after the last
-// start already disproved. Thus sparse inputs need only one source pass, while
-// dense decoys pay bounded work and never restart from byte zero.
+// A native side filter verifies a bounded number of candidates itself. Exact
+// shared columns may continue beyond that budget only while each adjacent
+// candidate gap independently buys the complete bounded envelope. If the
+// service gate closes, the packed searcher resumes after the last candidate
+// already disproved.
 const NATIVE_FILTER_CANDIDATE_BUDGET: usize = 4;
 const NATIVE_FILTER_MAX_RETAINED_PATTERN_BYTES: usize = 4 * 1024;
 // Retain only filters whose exact source-order verification fits in two
-// 16-byte blocks. After a rejection, another candidate is attempted only when
-// the proved skip amortizes all exact verification performed so far.
+// 16-byte blocks. Exact shared-column continuation requires every adjacent
+// candidate gap to amortize its own verification.
 const NATIVE_FILTER_MAX_CANDIDATE_VERIFICATION_WORK: usize = 32;
 // A one-byte common fragment is already represented by `SparseAnchor`. Two
 // bytes are the smallest exact fragment whose occurrence stream can prove
@@ -352,17 +353,24 @@ struct SharedColumns {
         reason = "retained as an exact construction certificate and asserted by tests"
     )]
     maximum_candidate_verification_work: usize,
-    // Starts that one rejected exact-column probe must disprove before its
-    // work is competitive with one minimum native packed-search quantum.
-    // Later probes owe the same quantum again, so the cumulative admission
-    // boundary grows monotonically with the number of attempts.
+    // Starts between two rejected exact-column probes that pay one unit of
+    // candidate work across a minimum native packed-search service. An
+    // unbounded continuation pays this coefficient for every probe in the
+    // complete frozen side-filter envelope.
     minimum_candidate_skip: usize,
     // Maximum complete haystack kept wholly on the native engine. Longer
     // haystacks start with the monotone common-byte proof and invoke the
     // native engine at most once, on the first start not disproved by the
-    // bounded exact-column filter.
+    // service-admitted exact-column filter.
     native_haystack_bytes: usize,
     columns: Box<[SharedColumnMask]>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SharedColumnsFilterResult {
+    Exhausted,
+    Match { start: usize, end: usize },
+    ResumeAt(usize),
 }
 
 impl SparseAnchor {
@@ -492,13 +500,52 @@ impl SharedColumns {
         Some(end)
     }
 
-    fn candidate_is_amortized(&self, candidate: usize, attempt: usize) -> Option<bool> {
-        let proved_skip = candidate.checked_add(1)?;
-        let completed_attempts = attempt.checked_add(1)?;
-        let required_skip = self
-            .minimum_candidate_skip
-            .checked_mul(completed_attempts)?;
-        Some(proved_skip >= required_skip)
+    fn minimum_continuation_skip(&self) -> Option<usize> {
+        self.minimum_candidate_skip
+            .checked_mul(NATIVE_FILTER_CANDIDATE_BUDGET)
+    }
+
+    fn continuation_is_amortized(&self, candidate: usize, next: usize) -> Option<bool> {
+        let proved_skip = next.checked_sub(candidate)?;
+        Some(proved_skip >= self.minimum_continuation_skip()?)
+    }
+
+    fn find_amortized(&self, haystack: &[u8]) -> SharedColumnsFilterResult {
+        // Candidate starts and the common-byte scan advance monotonically.
+        // Verify the current candidate first so an early exact match does not
+        // pay a look-ahead scan. After a rejection, continue only when the
+        // distance to the next candidate independently buys one native SIMD
+        // service quantum for every probe in the complete bounded side-filter
+        // envelope.
+        // No earlier gap can subsidize a later dense cluster. On rejection,
+        // resume the native engine at the exact next candidate, the first
+        // start not disproved by the monotone scan. The complete-native
+        // threshold above pays for the first bounded probe on every source
+        // entering the side filter.
+        let Some(mut candidate) = self.earliest_possible_start_from(haystack, 0) else {
+            return SharedColumnsFilterResult::Exhausted;
+        };
+        loop {
+            if let Some(end) = self.verify_at(haystack, candidate) {
+                return SharedColumnsFilterResult::Match {
+                    start: candidate,
+                    end,
+                };
+            }
+            let Some(after_candidate) = candidate.checked_add(1) else {
+                return SharedColumnsFilterResult::ResumeAt(candidate);
+            };
+            let Some(next) = self.earliest_possible_start_from(haystack, after_candidate) else {
+                return SharedColumnsFilterResult::Exhausted;
+            };
+            if !self
+                .continuation_is_amortized(candidate, next)
+                .unwrap_or(false)
+            {
+                return SharedColumnsFilterResult::ResumeAt(next);
+            }
+            candidate = next;
+        }
     }
 
     fn persistent_bytes(&self) -> usize {
@@ -787,26 +834,17 @@ fn find_native_shared_columns(
             .map(|matched| (matched.start(), matched.end()));
     }
 
-    let mut minimum_start = 0_usize;
-    for attempt in 0..NATIVE_FILTER_CANDIDATE_BUDGET {
-        let candidate = columns.earliest_possible_start_from(haystack, minimum_start)?;
-        let after_candidate = candidate.checked_add(1)?;
-        if !columns.candidate_is_amortized(candidate, attempt)? {
-            break;
-        }
-        if let Some(end) = columns.verify_at(haystack, candidate) {
-            return Some((candidate, end));
-        }
-        minimum_start = after_candidate;
-    }
-    searcher
-        .find(&haystack[minimum_start..])
-        .and_then(|matched| {
-            Some((
-                minimum_start.checked_add(matched.start())?,
-                minimum_start.checked_add(matched.end())?,
-            ))
-        })
+    let minimum_start = match columns.find_amortized(haystack) {
+        SharedColumnsFilterResult::Exhausted => return None,
+        SharedColumnsFilterResult::Match { start, end } => return Some((start, end)),
+        SharedColumnsFilterResult::ResumeAt(start) => start,
+    };
+    searcher.find(&haystack[minimum_start..]).and_then(|matched| {
+        Some((
+            minimum_start.checked_add(matched.start())?,
+            minimum_start.checked_add(matched.end())?,
+        ))
+    })
 }
 
 #[inline]
@@ -2051,25 +2089,40 @@ mod tests {
 
         let native_haystack_bytes = shared_columns.native_haystack_bytes;
 
-        // Admission is exact at every cumulative native-service boundary:
-        // one fewer disproved start rejects the exact probe, while the
-        // boundary itself pays one native quantum per completed attempt.
-        for attempt in 0..NATIVE_FILTER_CANDIDATE_BUDGET {
-            let required_skip = minimum_candidate_skip
-                .checked_mul(attempt.checked_add(1).unwrap())
-                .unwrap();
-            assert_eq!(
-                shared_columns.candidate_is_amortized(required_skip - 2, attempt),
-                Some(false)
-            );
-            assert_eq!(
-                shared_columns.candidate_is_amortized(required_skip - 1, attempt),
-                Some(true)
-            );
-        }
+        // Admission is local rather than cumulative. Every adjacent candidate
+        // gap must independently buy both one native service quantum and the
+        // complete bounded side-filter envelope. One byte below that exact
+        // boundary rejects continuation.
+        let minimum_continuation_skip = minimum_candidate_skip
+            .checked_mul(NATIVE_FILTER_CANDIDATE_BUDGET)
+            .unwrap();
+        assert_eq!(
+            shared_columns.minimum_continuation_skip(),
+            Some(minimum_continuation_skip)
+        );
+        assert_eq!(
+            shared_columns.continuation_is_amortized(
+                17,
+                17_usize
+                    .checked_add(minimum_continuation_skip)
+                    .unwrap()
+                    .checked_sub(1)
+                    .unwrap(),
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            shared_columns.continuation_is_amortized(
+                17,
+                17_usize
+                    .checked_add(minimum_continuation_skip)
+                    .unwrap(),
+            ),
+            Some(true)
+        );
 
-        // A long haystack with a candidate before one native quantum falls
-        // back without exact-column verification and remains observable.
+        // An early exact candidate remains observable without paying the
+        // continuation look-ahead.
         let early_start = 17_usize;
         let early_end = early_start.checked_add(4).unwrap();
         let mut early = vec![b'!'; native_haystack_bytes.checked_add(29).unwrap()];
@@ -2084,6 +2137,10 @@ mod tests {
         // No common byte is an exact negative proof; no native fallback is
         // needed after the monotone anchor scan exhausts the source.
         let absent = vec![b'!'; native_haystack_bytes.checked_add(29).unwrap()];
+        assert_eq!(
+            shared_columns.find_amortized(&absent),
+            super::SharedColumnsFilterResult::Exhausted,
+        );
         assert_eq!(
             plan.find(&absent, PackedLiteralSetSearchLimits::unlimited())
                 .unwrap()
@@ -2170,13 +2227,17 @@ mod tests {
             None
         );
 
-        // A common byte at the first candidate cannot amortize even one exact
-        // probe. It therefore hands the complete haystack to the single native
-        // fallback without first splitting off a native prefix.
+        // An adjacent common byte cannot amortize continuation. The first
+        // candidate was exactly rejected, so the single native fallback starts
+        // at the exact next unverified candidate.
         let dense_match = native_haystack_bytes.checked_add(73).unwrap();
         let dense_end = dense_match.checked_add(4).unwrap();
         let mut dense = vec![b'q'; dense_end.checked_add(16).unwrap()];
         dense[dense_match..dense_end].copy_from_slice(b"qbbh");
+        assert_eq!(
+            shared_columns.find_amortized(&dense),
+            super::SharedColumnsFilterResult::ResumeAt(1),
+        );
         let expected = searcher
             .find(&dense)
             .map(|matched| (matched.start(), matched.end()));
@@ -2188,25 +2249,54 @@ mod tests {
             expected
         );
 
-        // Four sparse, amortized false candidates consume the complete side
-        // budget. The one native fallback begins after the last rejected
-        // start and must still observe the later match.
-        let sparse_decoys = core::array::from_fn::<_, NATIVE_FILTER_CANDIDATE_BUDGET, _>(
+        // A large earlier gap cannot subsidize a later dense cluster. The
+        // native fallback resumes at the exact first candidate not covered by
+        // an independently paid rejection, rather than rescanning the proved
+        // sparse prefix.
+        let first_sparse = 0_usize;
+        let second_sparse = minimum_continuation_skip.checked_mul(2).unwrap();
+        let dense_after_credit = second_sparse.checked_add(1).unwrap();
+        let mut clustered = vec![b'!'; dense_after_credit.checked_add(37).unwrap()];
+        for start in [first_sparse, second_sparse, dense_after_credit] {
+            clustered[start..start.checked_add(4).unwrap()].copy_from_slice(b"qbzz");
+        }
+        assert_eq!(
+            shared_columns.find_amortized(&clustered),
+            super::SharedColumnsFilterResult::ResumeAt(dense_after_credit),
+        );
+
+        // Sparse candidates keep paying the exact-column continuation gate.
+        // More than the generic four-candidate side-filter budget remains on
+        // this one monotone common-byte stream; no unconditional native
+        // rescan is introduced before the later exact match.
+        const SPARSE_DECOYS: usize = 12;
+        let sparse_decoys = core::array::from_fn::<_, SPARSE_DECOYS, _>(
             |attempt| {
-                minimum_candidate_skip
+                minimum_continuation_skip
                     .checked_mul(attempt.checked_add(1).unwrap())
                     .unwrap()
                     .checked_sub(1)
                     .unwrap()
             },
         );
-        let sparse_match = native_haystack_bytes.checked_add(83).unwrap();
+        let sparse_match = minimum_continuation_skip
+            .checked_mul(SPARSE_DECOYS.checked_add(1).unwrap())
+            .unwrap()
+            .checked_sub(1)
+            .unwrap();
         let sparse_end = sparse_match.checked_add(4).unwrap();
         let mut sparse = vec![b'!'; sparse_end.checked_add(23).unwrap()];
         for start in sparse_decoys {
             sparse[start..start.checked_add(4).unwrap()].copy_from_slice(b"qbzz");
         }
         sparse[sparse_match..sparse_end].copy_from_slice(b"qbkg");
+        assert_eq!(
+            shared_columns.find_amortized(&sparse),
+            super::SharedColumnsFilterResult::Match {
+                start: sparse_match,
+                end: sparse_end,
+            }
+        );
         assert_eq!(
             plan.find(&sparse, PackedLiteralSetSearchLimits::unlimited())
                 .unwrap()
