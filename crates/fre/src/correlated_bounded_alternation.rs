@@ -80,32 +80,56 @@ impl Inspection {
             }
     }
 
-    pub(crate) fn build(self, dispatch: SimdDispatchContext) -> Plan {
-        let terminal_seek = self.terminal_seek;
+    pub(crate) fn build(
+        self,
+        dispatch: SimdDispatchContext,
+    ) -> Result<Plan, fre_exact_alloc::CopyError> {
+        self.build_with(dispatch, fre_exact_alloc::try_box_preserve)
+    }
+
+    fn build_with(
+        self,
+        dispatch: SimdDispatchContext,
+        allocate: impl FnOnce(
+            DelimitedPlan,
+        ) -> Result<
+            Box<DelimitedPlan>,
+            (fre_exact_alloc::CopyError, DelimitedPlan),
+        >,
+    ) -> Result<Plan, fre_exact_alloc::CopyError> {
+        let Self {
+            terminal_words,
+            terminal_seek,
+            mode,
+            ..
+        } = self;
+        let mode = match mode {
+            InspectionMode::Bounded {
+                minimum_match_bytes,
+                maximum_match_bytes,
+                branch_count,
+            } => PlanMode::Bounded {
+                minimum_match_bytes,
+                maximum_match_bytes,
+                branch_count,
+            },
+            InspectionMode::Delimited(plan) => PlanMode::Delimited(
+                allocate(plan).map_err(|(error, _)| error)?,
+            ),
+        };
         let classifier = terminal_seek.requires_classifier().then(|| {
             dispatch
                 .byte_set_classifier(
-                    ByteSet256::from_words(self.terminal_words),
+                    ByteSet256::from_words(terminal_words),
                     DispatchPolicy::Auto,
                 )
                 .expect("automatic byte-set dispatch retains a scalar fallback")
         });
-        Plan {
+        Ok(Plan {
             terminal_seek,
             classifier,
-            mode: match self.mode {
-                InspectionMode::Bounded {
-                    minimum_match_bytes,
-                    maximum_match_bytes,
-                    branch_count,
-                } => PlanMode::Bounded {
-                    minimum_match_bytes,
-                    maximum_match_bytes,
-                    branch_count,
-                },
-                InspectionMode::Delimited(plan) => PlanMode::Delimited(Box::new(plan)),
-            },
-        }
+            mode,
+        })
     }
 }
 
@@ -1026,7 +1050,9 @@ mod tests {
             panic!("exact delimited alternation was refused: {pattern:?}");
         };
         let work = inspection.planner_work;
-        let plan = inspection.build(SimdDispatchContext::capture());
+        let plan = inspection
+            .build(SimdDispatchContext::capture())
+            .unwrap();
         assert!(plan.is_exact_delimited());
         (plan, work)
     }
@@ -1117,7 +1143,9 @@ mod tests {
             panic!("bounded correlated fixture was refused");
         };
         let bounded_storage_bytes = bounded.storage_bytes();
-        let bounded = bounded.build(SimdDispatchContext::capture());
+        let bounded = bounded
+            .build(SimdDispatchContext::capture())
+            .unwrap();
         assert_eq!(bounded_storage_bytes, bounded.storage_bytes());
         assert_eq!(bounded.storage_bytes(), core::mem::size_of::<Plan>());
 
@@ -1160,5 +1188,20 @@ mod tests {
                 "unexpected exact-delimited admission: {pattern:?}",
             );
         }
+    }
+
+    #[test]
+    fn exact_delimited_owner_allocation_failure_is_recoverable() {
+        let InspectionOutcome::Eligible(inspection) =
+            inspect(&parse(TARGET), 0, u64::MAX).unwrap()
+        else {
+            panic!("exact delimited allocation fixture was refused");
+        };
+        let error = inspection
+            .build_with(SimdDispatchContext::capture(), |plan| {
+                Err((fre_exact_alloc::CopyError::AllocationFailed, plan))
+            })
+            .unwrap_err();
+        assert_eq!(error, fre_exact_alloc::CopyError::AllocationFailed);
     }
 }

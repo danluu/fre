@@ -5510,8 +5510,21 @@ impl PortableBuilder {
         let correlated_terminal_fits = candidate_correlated_terminal_storage_bytes
             <= available_optional_bytes;
         let correlated_terminal = if correlated_terminal_fits {
-            correlated_terminal_inspection
-                .map(|inspection| inspection.build(SimdDispatchContext::capture()))
+            match correlated_terminal_inspection {
+                Some(inspection) => match inspection.build(SimdDispatchContext::capture()) {
+                    Ok(plan) => Some(plan),
+                    Err(fre_exact_alloc::CopyError::LayoutOverflow) => {
+                        return Err(BuildError::InternalInvariant(
+                            "correlated terminal owner layout overflowed",
+                        ));
+                    }
+                    // This sidecar is optional and the ordinary K0 sidecars
+                    // remain live until publication succeeds. A refused owner
+                    // allocation therefore preserves that already-valid plan.
+                    Err(fre_exact_alloc::CopyError::AllocationFailed) => None,
+                },
+                None => None,
+            }
         } else {
             None
         };
