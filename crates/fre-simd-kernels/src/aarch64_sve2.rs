@@ -7,8 +7,9 @@
 )]
 
 use super::{
-    ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, AsciiMasks32, AsciiRunResult, AsciiRunTables,
-    AsciiWordSpaceMasks16, AsciiWordSpaceMasks32, AsciiWordSpaceTables, aarch64, scalar,
+    ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, AsciiMasks32, AsciiNonMemberRunResult, AsciiRunResult,
+    AsciiRunTables, AsciiWordSpaceMasks16, AsciiWordSpaceMasks32, AsciiWordSpaceTables, aarch64,
+    scalar,
 };
 use crate::byte_set::ByteSetTables;
 use crate::{BYTE_SET_WIDE_BLOCK_BYTES, ByteSetMask32};
@@ -689,6 +690,57 @@ fre_ascii_run_forward_sve2_asm:
     .size fre_ascii_run_forward_sve2_asm, .-fre_ascii_run_forward_sve2_asm
     .popsection
 
+    // SVE2 MATCH-until-member is the inverse traversal of the member-run
+    // scanner above. High bytes cannot match the construction-time ASCII set,
+    // so they extend the nonmember run without any separate ASCII barrier.
+    .pushsection .text.fre_ascii_nonmember_run_forward_sve2_asm, "ax", %progbits
+    .arch armv8-a+sve2
+    .p2align 2
+    .hidden fre_ascii_nonmember_run_forward_sve2_asm
+    .global fre_ascii_nonmember_run_forward_sve2_asm
+    .type fre_ascii_nonmember_run_forward_sve2_asm, %function
+fre_ascii_nonmember_run_forward_sve2_asm:
+    .cfi_startproc
+    ptrue p0.b, vl16
+    ld1rqb z0.b, p0/z, [x0]
+    mov x8, #0
+    cmp x2, #16
+    b.lo 3f
+1:
+    ld1b z2.b, p0/z, [x1, x8]
+    match p1.b, p0/z, z2.b, z0.b
+    ptest p0, p1.b
+    b.none 2f
+    b 4f
+
+2:
+    add x8, x8, #16
+    sub x10, x2, x8
+    cmp x10, #16
+    b.hs 1b
+3:
+    cmp x8, x2
+    b.hs 5f
+    whilelo p0.b, x8, x2
+    ld1b z2.b, p0/z, [x1, x8]
+    match p1.b, p0/z, z2.b, z0.b
+    ptest p0, p1.b
+    b.none 5f
+4:
+    brkb p3.b, p0/z, p1.b
+    cntp x10, p0, p3.b
+    add x0, x8, x10
+    cntp x11, p0, p0.b
+    add x1, x8, x11
+    ret
+5:
+    mov x0, x2
+    mov x1, x2
+    ret
+    .cfi_endproc
+    .size fre_ascii_nonmember_run_forward_sve2_asm, .-fre_ascii_nonmember_run_forward_sve2_asm
+    .popsection
+
     .pushsection .text.fre_ascii_run_backward_sve2_asm, "ax", %progbits
     .arch armv8-a+sve2
     .p2align 2
@@ -907,6 +959,11 @@ unsafe extern "C" {
         bytes: *const u8,
         len: usize,
     ) -> AsciiRunResult;
+    fn fre_ascii_nonmember_run_forward_sve2_asm(
+        match_values: *const u8,
+        bytes: *const u8,
+        len: usize,
+    ) -> AsciiNonMemberRunResult;
     fn fre_ascii_run_backward_sve2_asm(
         match_values: *const u8,
         bytes: *const u8,
@@ -1176,6 +1233,28 @@ pub(super) unsafe fn scan_run_forward_sve2(
     // extent.
     unsafe {
         fre_ascii_run_forward_sve2_asm(tables.match_values.as_ptr(), bytes.as_ptr(), bytes.len())
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "this private leaf calls reviewed SVE2 assembly only after retained dispatch proved SVE and SVE2 usable"
+)]
+#[inline(never)]
+pub(super) unsafe fn scan_nonmember_run_forward_sve2(
+    tables: &AsciiRunTables,
+    bytes: &[u8],
+) -> AsciiNonMemberRunResult {
+    // SAFETY: construction selects this entry only for a nonempty set of at
+    // most 16 ASCII values, fills every MATCH table lane with a valid member,
+    // and retained dispatch proves SVE plus SVE2 OS-usable. High bytes cannot
+    // match the table and the slice proves every predicated source extent.
+    unsafe {
+        fre_ascii_nonmember_run_forward_sve2_asm(
+            tables.match_values.as_ptr(),
+            bytes.as_ptr(),
+            bytes.len(),
+        )
     }
 }
 

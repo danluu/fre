@@ -14,8 +14,10 @@ use fre_kernel_ir::CheckedSearchWindow;
 use memchr::memmem::{Finder, FinderBuilder};
 
 pub use fre_simd_kernels::{
-    ASCII_CLASSIFIER_BUILD_WORK, ASCII_NARROW_BYTES, ASCII_RUN_SCANNER_BUILD_WORK,
-    ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier, AsciiByteSetRunScanner, AsciiSelection,
+    ASCII_CLASSIFIER_BUILD_WORK, ASCII_NARROW_BYTES,
+    ASCII_NONMEMBER_RUN_MAX_CLASSIFICATION_OVERHEAD, ASCII_NONMEMBER_RUN_SCANNER_BUILD_WORK,
+    ASCII_RUN_SCANNER_BUILD_WORK, ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier,
+    AsciiByteSetNonMemberScanner, AsciiByteSetRunScanner, AsciiNonMemberRunResult, AsciiSelection,
     AsciiWordSpaceClassifier, AsciiWordSpaceMasks16, AsciiWordSpaceMasks32, BYTE_SET_BLOCK_BYTES,
     BYTE_PAIR_BARRIER_GROUP_BYTES, BYTE_SET_CLASSIFIER_BUILD_WORK, BytePairBarrierScan,
     BytePairBarrierScanner, ByteSet256, ByteSetClassifier, DispatchPolicy, DispatchProfile, Feature,

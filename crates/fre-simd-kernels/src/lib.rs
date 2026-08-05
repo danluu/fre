@@ -6,9 +6,11 @@
 //! operation for an arbitrary 256-bit byte set.
 //! [`AsciiByteSetRunScanner`] retains a separate operation-specific choice and
 //! finds maximal member prefixes or suffixes without materializing positional
-//! lane masks. Calls do not detect CPU features or make dispatch decisions from
-//! varying haystack lengths. Private target-feature leaves are reachable only
-//! through handles built from [`fre_target_features::host`] facts.
+//! lane masks. [`AsciiByteSetNonMemberScanner`] instead finds maximal prefixes
+//! outside an ASCII set, including arbitrary high bytes. Calls do not detect
+//! CPU features or make dispatch decisions from varying haystack lengths.
+//! Private target-feature leaves are reachable only through handles built from
+//! [`fre_target_features::host`] facts.
 
 #![deny(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -43,6 +45,7 @@ mod byte_pair_barrier;
 mod byte_range;
 mod byte_set;
 mod byte_set4;
+mod nonmember_run;
 #[cfg_attr(
     feature = "static-dispatch",
     allow(
@@ -79,6 +82,10 @@ pub use byte_set::{
 pub use byte_set4::{
     classify_byte_set1_16, classify_byte_set1_32, classify_byte_set2_16, classify_byte_set2_32,
     classify_byte_set3_16, classify_byte_set3_32, classify_byte_set4_16, classify_byte_set4_32,
+};
+pub use nonmember_run::{
+    ASCII_NONMEMBER_RUN_MAX_CLASSIFICATION_OVERHEAD, ASCII_NONMEMBER_RUN_SCANNER_BUILD_WORK,
+    AsciiByteSetNonMemberScanner, AsciiNonMemberRunResult,
 };
 
 /// Number of bytes consumed by the narrow classifier operation.
@@ -212,6 +219,23 @@ impl SimdDispatchContext {
             policy,
             true,
         )
+    }
+
+    /// Build a scanner for a maximal prefix outside one ASCII byte set.
+    ///
+    /// Every byte above `0x7f` is outside the set and is consumed by the
+    /// scanner. This differs from ASCII-only complement scanning, where a high
+    /// byte is a barrier.
+    pub fn ascii_byte_set_nonmember_scanner(
+        self,
+        set: AsciiByteSet,
+        policy: DispatchPolicy,
+    ) -> Result<AsciiByteSetNonMemberScanner, UnsupportedRequiredFeatures> {
+        #[cfg(feature = "static-dispatch")]
+        if policy == DispatchPolicy::Auto {
+            return Ok(AsciiByteSetNonMemberScanner::from_static_profile(set));
+        }
+        AsciiByteSetNonMemberScanner::with_capabilities(set, self.capabilities, policy)
     }
 
     /// Build the token-phrase three-class classifier from this snapshot.
