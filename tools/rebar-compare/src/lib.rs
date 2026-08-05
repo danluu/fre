@@ -90,10 +90,12 @@ use fre::{
     PortableSearchSession, PrefixClassAlternationBuildError, PrefixClassAlternationBuildLimits,
     PrefixClassAlternationReduceError, PrefixClassAlternationReduceLimits,
     PrefixClassUniformParticipationBuildLimits, REVERSE_INNER_COUNT_OPERATION_ID,
-    REVERSE_INNER_ACCOUNTING_ID, REVERSE_INNER_PLAN_ID,
+    REVERSE_INNER_ACCOUNTING_ID, REVERSE_INNER_GROUPED_UNION_ACCOUNTING_ID,
+    REVERSE_INNER_GROUPED_UNION_PLAN_ID, REVERSE_INNER_PLAN_ID,
     REVERSE_INNER_SPAN_SUM_OPERATION_ID, REVERSE_INNER_UNION_ACCOUNTING_ID,
     REVERSE_INNER_UNION_PLAN_ID, ReverseInnerBuildAccounting, ReverseInnerBuildError,
-    ReverseInnerBuildLimits, ReverseInnerReduceError, ReverseInnerReduceLimits, RustProfile,
+    ReverseInnerBuildLimits, ReverseInnerReduceError, ReverseInnerReduceLimits,
+    ReverseInnerUnionMode, RustProfile,
     SHEBANG_CAPTURE_PATTERN, SHEBANG_INSPECTION_WORK,
     SPACE_AROUND_OPERATOR_CAPTURE_PATTERN, SPACE_AROUND_OPERATOR_INSPECTION_WORK,
     SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID,
@@ -13743,12 +13745,31 @@ fn reverse_inner_plan_identity_matches(
             LiteralAggregateOperation::SpanSum
         )
     );
-    let physical_identity_matches = if build.adaptive_union {
-        identity.kernel.plan_id == REVERSE_INNER_UNION_PLAN_ID
-            && identity.kernel.accounting_id == REVERSE_INNER_UNION_ACCOUNTING_ID
+    let union_shape = build.literal_count >= 2
+        && build.retained_non_ascii_ranges != 0
+        && build.non_ascii_scalars != 0
+        && build.non_ascii_scalars <= fre::REVERSE_INNER_MAX_ADMITTED_NON_ASCII_SCALARS
+        && build.ascii_scalars <= fre::REVERSE_INNER_MAX_ADMITTED_ASCII_SCALARS;
+    let expected_union_mode = if !union_shape {
+        ReverseInnerUnionMode::None
+    } else if build.distinct_literal_first_bytes == build.literal_count {
+        ReverseInnerUnionMode::AdaptiveFirstByte
     } else {
-        identity.kernel.plan_id == REVERSE_INNER_PLAN_ID
-            && identity.kernel.accounting_id == REVERSE_INNER_ACCOUNTING_ID
+        ReverseInnerUnionMode::GroupedFixedColumn
+    };
+    let physical_identity_matches = match build.union_mode {
+        ReverseInnerUnionMode::None => {
+            identity.kernel.plan_id == REVERSE_INNER_PLAN_ID
+                && identity.kernel.accounting_id == REVERSE_INNER_ACCOUNTING_ID
+        }
+        ReverseInnerUnionMode::AdaptiveFirstByte => {
+            identity.kernel.plan_id == REVERSE_INNER_UNION_PLAN_ID
+                && identity.kernel.accounting_id == REVERSE_INNER_UNION_ACCOUNTING_ID
+        }
+        ReverseInnerUnionMode::GroupedFixedColumn => {
+            identity.kernel.plan_id == REVERSE_INNER_GROUPED_UNION_PLAN_ID
+                && identity.kernel.accounting_id == REVERSE_INNER_GROUPED_UNION_ACCOUNTING_ID
+        }
     };
     operation_matches
         && report.selection == AggregatePlanSelection::Auto
@@ -13775,19 +13796,16 @@ fn reverse_inner_plan_identity_matches(
         && (1..=fre::REVERSE_INNER_MAX_LITERALS).contains(&build.literal_count)
         && build.literal_bytes >= build.literal_count
         && (1..=build.literal_count).contains(&build.distinct_literal_first_bytes)
+        && build.union_mode == expected_union_mode
         && build.adaptive_union
-            == (build.literal_count >= 2
-                && build.retained_non_ascii_ranges != 0
-                && build.non_ascii_scalars != 0
-                && build.non_ascii_scalars
-                    <= fre::REVERSE_INNER_MAX_ADMITTED_NON_ASCII_SCALARS
-                && build.ascii_scalars <= fre::REVERSE_INNER_MAX_ADMITTED_ASCII_SCALARS
-                && build.distinct_literal_first_bytes == build.literal_count)
+            == (build.union_mode == ReverseInnerUnionMode::AdaptiveFirstByte)
         && build.allocations
             == build
                 .literal_count
                 .saturating_add(2)
-                .saturating_add(usize::from(build.adaptive_union))
+                .saturating_add(usize::from(
+                    build.union_mode != ReverseInnerUnionMode::None,
+                ))
         && build.scratch_bytes == 0
         && build.peak_bytes == build.persistent_bytes
         && report.retained_capacity_bytes == build.persistent_bytes
@@ -24088,6 +24106,83 @@ mod tests {
             !absent_continuation
                 .build_report()
                 .authenticates_url_aggregate_identity()
+        );
+    }
+
+    #[test]
+    fn reverse_inner_adapter_distinguishes_v1_and_grouped_v2_receipts() {
+        let distinct = current_fre_rebar_aggregate_builder(
+            r"[a-zλ]+(?:ab|cd)[a-zλ]+",
+            true,
+            false,
+        )
+        .build_count()
+        .expect("distinct-root reverse-inner plan");
+        let grouped = current_fre_rebar_aggregate_builder(
+            r"[a-zλ]+(?:aab|abb)[a-zλ]+",
+            true,
+            false,
+        )
+        .build_count()
+        .expect("grouped reverse-inner plan");
+
+        for plan in [&distinct, &grouped] {
+            current_fre_rebar_validate_aggregate_identity(
+                plan.build_report(),
+                true,
+                "count",
+            )
+            .expect("reverse-inner receipt closes");
+        }
+
+        let AggregateBuildAccounting::ReverseInner(distinct_build) = distinct.build_report().build
+        else {
+            panic!("distinct-root plan retained another receipt");
+        };
+        let AggregateBuildAccounting::ReverseInner(grouped_build) = grouped.build_report().build
+        else {
+            panic!("grouped plan retained another receipt");
+        };
+        assert_eq!(
+            distinct_build.union_mode,
+            ReverseInnerUnionMode::AdaptiveFirstByte
+        );
+        assert!(distinct_build.adaptive_union);
+        assert_eq!(
+            grouped_build.union_mode,
+            ReverseInnerUnionMode::GroupedFixedColumn
+        );
+        assert!(!grouped_build.adaptive_union);
+
+        let mut forged_legacy_summary = grouped.build_report().clone();
+        let AggregateBuildAccounting::ReverseInner(ref mut build) =
+            forged_legacy_summary.build
+        else {
+            panic!("grouped plan retained another receipt");
+        };
+        build.adaptive_union = true;
+        assert!(
+            current_fre_rebar_validate_aggregate_identity(
+                &forged_legacy_summary,
+                true,
+                "count",
+            )
+            .is_err()
+        );
+
+        let mut forged_v1 = grouped.build_report().clone();
+        let AggregateBuildAccounting::ReverseInner(ref mut build) = forged_v1.build else {
+            panic!("grouped plan retained another receipt");
+        };
+        build.union_mode = ReverseInnerUnionMode::AdaptiveFirstByte;
+        build.adaptive_union = true;
+        let AggregatePlanIdentity::ReverseInner(ref mut identity) = forged_v1.plan_identity else {
+            panic!("grouped plan retained another identity");
+        };
+        identity.kernel.plan_id = REVERSE_INNER_UNION_PLAN_ID;
+        identity.kernel.accounting_id = REVERSE_INNER_UNION_ACCOUNTING_ID;
+        assert!(
+            current_fre_rebar_validate_aggregate_identity(&forged_v1, true, "count").is_err()
         );
     }
 

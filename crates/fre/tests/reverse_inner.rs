@@ -2,8 +2,10 @@ use fre::{
     AggregateBuildAccounting, AggregateBuildError, AggregateBuildLimits, AggregateBuilder,
     AggregateExecutionDetails, AggregateExecutionSource, AggregatePlanIdentity, AggregatePlanKind,
     AggregateRetainedFullWindowUpperBounds, AggregateRunLimits, REVERSE_INNER_COUNT_OPERATION_ID,
+    REVERSE_INNER_GROUPED_UNION_ACCOUNTING_ID, REVERSE_INNER_GROUPED_UNION_PLAN_ID,
     REVERSE_INNER_SPAN_SUM_OPERATION_ID, REVERSE_INNER_UNION_ACCOUNTING_ID,
-    REVERSE_INNER_UNION_PLAN_ID, ReverseInnerBuildError, ReverseInnerReduceError, RustProfile,
+    REVERSE_INNER_UNION_PLAN_ID, ReverseInnerBuildError, ReverseInnerReduceError,
+    ReverseInnerUnionMode, RustProfile,
 };
 use regex::bytes::{Regex, RegexBuilder};
 
@@ -138,7 +140,38 @@ fn canonical_middle_literal_alternation_selects_adaptive_union() {
         panic!("middle alternation retained another build receipt");
     };
     assert!(build.adaptive_union);
+    assert_eq!(build.union_mode, ReverseInnerUnionMode::AdaptiveFirstByte);
     assert_eq!(build.distinct_literal_first_bytes, 4);
+}
+
+#[test]
+fn shared_root_alternation_selects_grouped_union_identity() {
+    let pattern = r"[a-zλ]+(?:aab|abb)[a-zλ]+";
+    let plan = builder(pattern).build_count().expect("shared-root build");
+    assert_eq!(plan.build_report().plan, AggregatePlanKind::ReverseInner);
+    let AggregatePlanIdentity::ReverseInner(identity) = plan.build_report().plan_identity else {
+        panic!("shared-root alternation retained another identity");
+    };
+    assert_eq!(
+        identity.kernel.plan_id,
+        REVERSE_INNER_GROUPED_UNION_PLAN_ID
+    );
+    assert_eq!(
+        identity.kernel.accounting_id,
+        REVERSE_INNER_GROUPED_UNION_ACCOUNTING_ID
+    );
+    let AggregateBuildAccounting::ReverseInner(build) = plan.build_report().build else {
+        panic!("shared-root alternation retained another build receipt");
+    };
+    assert_eq!(build.union_mode, ReverseInnerUnionMode::GroupedFixedColumn);
+    assert!(!build.adaptive_union);
+    assert_eq!(build.distinct_literal_first_bytes, 1);
+    let haystack = b"qaabq-abb-qabbq";
+    assert_eq!(
+        plan.count_value(haystack, AggregateRunLimits::default())
+            .expect("shared-root count"),
+        aggregates(&oracle(pattern), haystack).0
+    );
 }
 
 #[test]

@@ -10,24 +10,26 @@
 //! whole-match span: that maximal run. Source-order priority can change an
 //! internal path or capture, but not count or matched-byte sum.
 //!
-//! Sparse mixed-Unicode classes retain one immutable literal-column anchor.
-//! Construction scores every column common to all literals and minimizes the
-//! worst exact-verification bucket, then total bucket collisions, with the
-//! earliest column as the final deterministic tie break. Search scans that
-//! anchor-byte union once and verifies only the source-ordered literal mask
-//! bound to the observed byte. Shared roots, prefixes, and duplicate literals
-//! therefore keep one monotone candidate stream without weakening exact
-//! authentication.
-//! Existence and earliest-end projections prove an exact literal with only
-//! its immediately preceding and following class scalars. Earliest-end keeps
-//! the best accepting end while scanning every later literal start that can
-//! still beat it. Selected-span and aggregate operations retain maximal-run
-//! recovery because their observable result is the complete greedy run.
-//! Dense false-root samples, or repeated exact roots whose complete class runs
-//! prove non-accepting, certify a fallback boundary and resume the incumbent
-//! independent `memmem` streams after the proved prefix. Other plans use
-//! those streams directly. A candidate's maximal run is
-//! recovered with bounded reverse and forward UTF-8 decoding. The strict
+//! Sparse mixed-Unicode classes with distinct literal-leading bytes retain the
+//! incumbent adaptive first-byte union. Shared-root classes instead retain one
+//! immutable literal-column anchor. Construction scores every column common to
+//! all shared-root literals and minimizes the worst exact-verification bucket,
+//! then total bucket collisions, with the earliest column as the final
+//! deterministic tie break. Search scans the selected byte union once and
+//! verifies only the source-ordered literal mask bound to the observed byte.
+//! Shared roots, prefixes, and duplicate literals therefore keep one monotone
+//! candidate stream without changing the distinct-root physical route.
+//! The grouped route proves the immediately preceding class scalar and each
+//! hypothetical literal's following class scalar before comparing its bytes.
+//! Every exact grouped candidate is therefore already locally accepting, and
+//! the carried boundary proof is reused by endpoint projections and maximal-
+//! run recovery. Earliest-end keeps the best accepting end while scanning
+//! every later literal start that can still beat it. Dense rejected starts
+//! consume a cumulative proof-work budget measured against monotone source
+//! progress; once work outruns progress, the incumbent independent `memmem`
+//! streams resume after the proved prefix. Other plans use those streams
+//! directly. A candidate's maximal run is recovered with bounded reverse and
+//! forward UTF-8 decoding. The strict
 //! interior is searched from `run_start + 1`, rather than by consuming a
 //! non-overlapping occurrence iterator. That detail is required for overlap
 //! completeness: class `a`, literal `aa`, and run `aaaa` has its only viable
@@ -53,13 +55,19 @@ use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptErro
 
 /// Stable identity of the admitted theorem and physical reducer.
 pub const PLAN_ID: &str = "reverse-inner.unicode-class-plus-ascii-literal-class-plus.v1";
-/// Physical identity of the sparse-mixed-Unicode grouped fixed-column union.
+/// Physical identity of the sparse-mixed-Unicode adaptive first-byte union.
 pub const UNION_PLAN_ID: &str =
+    "reverse-inner.sparse-mixed-unicode-class-plus-adaptive-literal-union.v1";
+/// Physical identity of the sparse-mixed-Unicode grouped fixed-column union.
+pub const GROUPED_UNION_PLAN_ID: &str =
     "reverse-inner.sparse-mixed-unicode-class-plus-grouped-fixed-column-union.v2";
 /// Accounting schema of the independent reusable finder form.
 pub const ACCOUNTING_ID: &str = "reverse-inner.independent-finder-accounting.v1";
-/// Accounting schema of the grouped fixed-column union plus incumbent form.
+/// Accounting schema of the adaptive first-byte union plus incumbent form.
 pub const UNION_ACCOUNTING_ID: &str =
+    "reverse-inner.adaptive-first-byte-union-accounting.v1";
+/// Accounting schema of the grouped fixed-column union plus incumbent form.
+pub const GROUPED_UNION_ACCOUNTING_ID: &str =
     "reverse-inner.grouped-fixed-column-union-accounting.v2";
 /// Stable identity of complete non-overlapping match counting.
 pub const COUNT_OPERATION_ID: &str = "reverse-inner.count.maximal-unicode-class-run.v1";
@@ -104,7 +112,7 @@ const UNION_LITERAL_CHECK_WORK: usize = 1;
 const UNION_ROOT_CANDIDATE_WORK: usize = 1;
 const UNION_EXACT_CANDIDATE_WORK: usize = 1;
 const UNION_FALLBACK_WORK: usize = 1;
-const UNION_PROVED_RUN_SAMPLES_BEFORE_FALLBACK: usize = 2;
+const ADAPTIVE_UNION_PROVED_RUN_SAMPLES_BEFORE_FALLBACK: usize = 2;
 
 /// Complete operation selected before source access.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -191,6 +199,17 @@ impl Default for BuildLimits {
     }
 }
 
+/// Construction-selected physical literal-union route.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnionMode {
+    /// Retain independent reusable literal finders only.
+    None,
+    /// Retain the incumbent distinct-first-byte union and its v1 hot path.
+    AdaptiveFirstByte,
+    /// Retain a shared-root fixed-column union and its v2 grouped hot path.
+    GroupedFixedColumn,
+}
+
 /// Auditable exact-capacity construction certificate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BuildAccounting {
@@ -204,8 +223,8 @@ pub struct BuildAccounting {
     pub literal_bytes: usize,
     pub literal_fingerprint: u64,
     pub distinct_literal_first_bytes: usize,
-    /// Selected byte offset common to every literal, or zero when the grouped
-    /// union is not admitted. `adaptive_union` disambiguates a real offset 0.
+    /// Selected byte offset common to every grouped literal, or zero otherwise.
+    /// `union_mode` disambiguates a real grouped offset zero.
     pub union_anchor_offset: usize,
     /// Exact population of the selected anchor-byte set.
     pub union_anchor_distinct_bytes: usize,
@@ -217,7 +236,10 @@ pub struct BuildAccounting {
     pub union_anchor_collision_pairs: usize,
     /// Complete prospective construction work for scoring every common column.
     pub union_anchor_selection_work: usize,
+    /// Legacy v1 summary: true only for the distinct-root adaptive route.
+    /// New callers should branch on `union_mode` for complete physical identity.
     pub adaptive_union: bool,
+    pub union_mode: UnionMode,
     pub work: usize,
     pub allocations: usize,
     pub allocated_bytes: usize,
@@ -425,10 +447,87 @@ struct UnionCandidate {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LeftBoundaryProof {
+    scalar_start: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GroupedUnionCandidate {
+    start: usize,
+    left_boundary: LeftBoundaryProof,
+    source_first_end: usize,
+    earliest_end: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UnionNext {
     Candidate(UnionCandidate),
     Exhausted,
     DenseFallback { resume_start: usize },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GroupedUnionNext {
+    Candidate(GroupedUnionCandidate),
+    Exhausted,
+    DenseFallback { resume_start: usize },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GroupedFallbackMeter {
+    epoch_start: usize,
+    proved_through: usize,
+    work_at_epoch: usize,
+}
+
+impl GroupedFallbackMeter {
+    const fn new(epoch_start: usize, work_at_epoch: usize) -> Self {
+        Self {
+            epoch_start,
+            proved_through: epoch_start,
+            work_at_epoch,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        proved_through: usize,
+        actual_work: usize,
+    ) -> Result<bool, ReduceError> {
+        if proved_through <= self.proved_through {
+            return Err(ReduceError::AccountingInvariant {
+                resource: "grouped-union strictly monotone fallback frontier",
+                actual: u64::try_from(proved_through).unwrap_or(u64::MAX),
+                upper: u64::try_from(self.proved_through).unwrap_or(u64::MAX),
+            });
+        }
+        let progress = proved_through.checked_sub(self.epoch_start).ok_or(
+            ReduceError::AccountingInvariant {
+                resource: "grouped-union monotone fallback progress",
+                actual: u64::try_from(proved_through).unwrap_or(u64::MAX),
+                upper: u64::try_from(self.epoch_start).unwrap_or(u64::MAX),
+            },
+        )?;
+        let charged_work = actual_work.checked_sub(self.work_at_epoch).ok_or(
+            ReduceError::AccountingInvariant {
+                resource: "grouped-union monotone charged work",
+                actual: u64::try_from(actual_work).unwrap_or(u64::MAX),
+                upper: u64::try_from(self.work_at_epoch).unwrap_or(u64::MAX),
+            },
+        )?;
+        self.proved_through = proved_through;
+        // One unit of charged work per proved byte is the scan itself. The
+        // remaining proof/verification work may consume one more linear pass;
+        // strictly exceeding that cumulative allowance selects the incumbent.
+        let extra_work = charged_work.saturating_sub(progress);
+        Ok(extra_work > progress)
+    }
+
+    fn reset(&mut self, epoch_start: usize, work_at_epoch: usize) {
+        self.epoch_start = epoch_start;
+        self.proved_through = epoch_start;
+        self.work_at_epoch = work_at_epoch;
+    }
 }
 
 /// Semantic refusal or checked construction-resource failure.
@@ -623,36 +722,16 @@ struct AnchorSelection {
 
 #[derive(Debug)]
 struct UnionState {
-    anchor_offset: usize,
-    anchor_byte_masks: [u16; 128],
+    first_byte_masks: [u16; 128],
     scanner: AsciiByteSetNonMemberScanner,
 }
 
 fn select_grouped_anchor(
     literals: &[&[u8]],
-    distinct_literal_first_bytes: usize,
     min_literal_bytes: usize,
-    max_literal_bytes: usize,
 ) -> Result<AnchorSelection, BuildError> {
     if literals.is_empty() {
         return Err(BuildError::EmptyLiteralSet);
-    }
-    if distinct_literal_first_bytes == literals.len() {
-        // Unit buckets and zero collisions are global minima. Offset zero is
-        // also the deterministic earliest tie, so the incumbent unique-root
-        // route needs no second literal traversal or column-scoring work.
-        return Ok(AnchorSelection {
-            offset: 0,
-            distinct_bytes: literals.len(),
-            max_bucket_literals: 1,
-            max_bucket_verification_work: max_literal_bytes.checked_add(
-                UNION_LITERAL_CHECK_WORK,
-            ).ok_or(BuildError::ArithmeticOverflow {
-                computation: "unique-root literal-union verification work",
-            })?,
-            collision_pairs: 0,
-            selection_work: 0,
-        });
     }
     let common_columns = min_literal_bytes;
     if common_columns == 0 {
@@ -940,7 +1019,6 @@ impl ReverseInnerPlan {
 
             let mut literal_bytes = 0_usize;
             let mut min_retained_literal_bytes = usize::MAX;
-            let mut max_retained_literal_bytes = 0_usize;
             let mut literal_fingerprint = 0xcbf2_9ce4_8422_2325_u64;
             let mut literal_first_words = [0_u64; 2];
             let mut distinct_literal_first_bytes = 0_usize;
@@ -957,7 +1035,6 @@ impl ReverseInnerPlan {
                 literal_bytes =
                     checked_add_build(literal_bytes, literal.len(), "literal byte total")?;
                 min_retained_literal_bytes = min_retained_literal_bytes.min(literal.len());
-                max_retained_literal_bytes = max_retained_literal_bytes.max(literal.len());
                 for &byte in *literal {
                     if !byte.is_ascii() {
                         return Err(BuildError::NonAsciiLiteral { index, byte });
@@ -1007,36 +1084,42 @@ impl ReverseInnerPlan {
                 && non_ascii_scalars != 0
                 && non_ascii_scalars <= MAX_ADMITTED_NON_ASCII_SCALARS
                 && ascii_scalars <= MAX_ADMITTED_ASCII_SCALARS;
-            let anchor_selection = if union_shape {
-                Some(select_grouped_anchor(
-                    literals,
-                    distinct_literal_first_bytes,
-                    min_retained_literal_bytes,
-                    max_retained_literal_bytes,
-                )?)
+            let union_mode = if !union_shape {
+                UnionMode::None
+            } else if distinct_literal_first_bytes == literals.len() {
+                UnionMode::AdaptiveFirstByte
+            } else {
+                UnionMode::GroupedFixedColumn
+            };
+            let anchor_selection = if union_mode == UnionMode::GroupedFixedColumn {
+                Some(select_grouped_anchor(literals, min_retained_literal_bytes)?)
             } else {
                 None
             };
-            let adaptive_union = anchor_selection.is_some();
-            if let Some(selection) = anchor_selection {
+            if union_mode != UnionMode::None {
                 let mask_work = literals
                     .len()
                     .checked_mul(UNION_MASK_BUILD_WORK_PER_LITERAL)
                     .ok_or(BuildError::ArithmeticOverflow {
                         computation: "literal-union mask construction work",
                     })?;
-                let anchor_set_work = if selection.offset == 0 {
-                    0
+                let selection_work = anchor_selection.map_or(0, |selection| selection.selection_work);
+                let anchor_set_work = if let Some(selection) = anchor_selection {
+                    if selection.offset == 0 {
+                        0
+                    } else {
+                        literals
+                            .len()
+                            .checked_mul(UNION_ANCHOR_SET_BUILD_WORK_PER_LITERAL)
+                            .ok_or(BuildError::ArithmeticOverflow {
+                                computation: "literal-union anchor-set construction work",
+                            })?
+                    }
                 } else {
-                    literals
-                        .len()
-                        .checked_mul(UNION_ANCHOR_SET_BUILD_WORK_PER_LITERAL)
-                        .ok_or(BuildError::ArithmeticOverflow {
-                            computation: "literal-union anchor-set construction work",
-                        })?
+                    0
                 };
                 work = work
-                    .checked_add(selection.selection_work)
+                    .checked_add(selection_work)
                     .and_then(|value| {
                         value.checked_add(ASCII_NONMEMBER_RUN_SCANNER_BUILD_WORK)
                     })
@@ -1062,7 +1145,7 @@ impl ReverseInnerPlan {
                 .ok_or(BuildError::ArithmeticOverflow {
                     computation: "finder capacity bytes",
                 })?;
-            let union_state_bytes = usize::from(adaptive_union)
+            let union_state_bytes = usize::from(union_mode != UnionMode::None)
                 .checked_mul(size_of::<UnionState>())
                 .ok_or(BuildError::ArithmeticOverflow {
                     computation: "literal-union state bytes",
@@ -1077,7 +1160,9 @@ impl ReverseInnerPlan {
             let allocations = usize::from(source_ranges != 0)
                 .checked_add(usize::from(!literals.is_empty()))
                 .and_then(|value| value.checked_add(literals.len()))
-                .and_then(|value| value.checked_add(usize::from(adaptive_union)))
+                .and_then(|value| {
+                    value.checked_add(usize::from(union_mode != UnionMode::None))
+                })
                 .ok_or(BuildError::ArithmeticOverflow {
                     computation: "persistent allocation count",
                 })?;
@@ -1138,51 +1223,86 @@ impl ReverseInnerPlan {
                 record_initialization(&mut actual, size_of::<Finder<'static>>(), false)?;
             }
 
-            let union_state = if let Some(selection) = anchor_selection {
-                let mut anchor_byte_masks = [0_u16; 128];
-                let mut anchor_words = if selection.offset == 0 {
-                    literal_first_words
-                } else {
-                    [0_u64; 2]
-                };
-                for (index, literal) in literals.iter().enumerate() {
-                    let shift = u32::try_from(index).map_err(|_| {
-                        BuildError::ArithmeticOverflow {
-                            computation: "literal-union mask shift",
-                        }
-                    })?;
-                    let bit = 1_u16.checked_shl(shift).ok_or(
-                        BuildError::ArithmeticOverflow {
-                            computation: "literal-union mask bit",
-                        },
-                    )?;
-                    let anchor = literal[selection.offset];
-                    anchor_byte_masks[usize::from(anchor)] |= bit;
-                    if selection.offset != 0 {
-                        let word = usize::from(anchor / 64);
-                        anchor_words[word] |= 1_u64 << (anchor % 64);
+            let union_state = match union_mode {
+                UnionMode::None => ExactBoxOrUsize::try_from_usize(0)
+                    .expect("zero is an exact inline literal-union tag"),
+                UnionMode::AdaptiveFirstByte => {
+                    let mut first_byte_masks = [0_u16; 128];
+                    for (index, literal) in literals.iter().enumerate() {
+                        let shift = u32::try_from(index).map_err(|_| {
+                            BuildError::ArithmeticOverflow {
+                                computation: "adaptive-union mask shift",
+                            }
+                        })?;
+                        let bit = 1_u16.checked_shl(shift).ok_or(
+                            BuildError::ArithmeticOverflow {
+                                computation: "adaptive-union mask bit",
+                            },
+                        )?;
+                        first_byte_masks[usize::from(literal[0])] |= bit;
                     }
+                    let scanner = dispatch
+                        .ascii_byte_set_nonmember_scanner(
+                            AsciiByteSet::from_words(literal_first_words),
+                            DispatchPolicy::Auto,
+                        )
+                        .expect("automatic adaptive-union dispatch retains a scalar fallback");
+                    let state = ExactBoxOrUsize::try_from_boxed(UnionState {
+                        first_byte_masks,
+                        scanner,
+                    })
+                    .map_err(|error| {
+                        allocation_error("adaptive-union state", union_state_bytes, error)
+                    })?;
+                    record_allocation(&mut actual, union_state_bytes)?;
+                    record_initialization(&mut actual, union_state_bytes, false)?;
+                    state
                 }
-                let scanner = dispatch
-                    .ascii_byte_set_nonmember_scanner(
-                        AsciiByteSet::from_words(anchor_words),
-                        DispatchPolicy::Auto,
-                    )
-                    .expect("automatic literal-union dispatch retains a scalar fallback");
-                let state = ExactBoxOrUsize::try_from_boxed(UnionState {
-                    anchor_offset: selection.offset,
-                    anchor_byte_masks,
-                    scanner,
-                })
-                .map_err(|error| {
-                    allocation_error("literal-union state", union_state_bytes, error)
-                })?;
-                record_allocation(&mut actual, union_state_bytes)?;
-                record_initialization(&mut actual, union_state_bytes, false)?;
-                state
-            } else {
-                ExactBoxOrUsize::try_from_usize(0)
-                    .expect("zero is an exact inline literal-union tag")
+                UnionMode::GroupedFixedColumn => {
+                    let selection = anchor_selection.expect(
+                        "grouped-union mode retains its construction-selected anchor",
+                    );
+                    let mut first_byte_masks = [0_u16; 128];
+                    let mut anchor_words = if selection.offset == 0 {
+                        literal_first_words
+                    } else {
+                        [0_u64; 2]
+                    };
+                    for (index, literal) in literals.iter().enumerate() {
+                        let shift = u32::try_from(index).map_err(|_| {
+                            BuildError::ArithmeticOverflow {
+                                computation: "grouped-union mask shift",
+                            }
+                        })?;
+                        let bit = 1_u16.checked_shl(shift).ok_or(
+                            BuildError::ArithmeticOverflow {
+                                computation: "grouped-union mask bit",
+                            },
+                        )?;
+                        let anchor = literal[selection.offset];
+                        first_byte_masks[usize::from(anchor)] |= bit;
+                        if selection.offset != 0 {
+                            let word = usize::from(anchor / 64);
+                            anchor_words[word] |= 1_u64 << (anchor % 64);
+                        }
+                    }
+                    let scanner = dispatch
+                        .ascii_byte_set_nonmember_scanner(
+                            AsciiByteSet::from_words(anchor_words),
+                            DispatchPolicy::Auto,
+                        )
+                        .expect("automatic grouped-union dispatch retains a scalar fallback");
+                    let state = ExactBoxOrUsize::try_from_boxed(UnionState {
+                        first_byte_masks,
+                        scanner,
+                    })
+                    .map_err(|error| {
+                        allocation_error("grouped-union state", union_state_bytes, error)
+                    })?;
+                    record_allocation(&mut actual, union_state_bytes)?;
+                    record_initialization(&mut actual, union_state_bytes, false)?;
+                    state
+                }
             };
 
             actual.initialized_bytes = actual
@@ -1217,7 +1337,8 @@ impl ReverseInnerPlan {
                     .map_or(0, |selection| selection.collision_pairs),
                 union_anchor_selection_work: anchor_selection
                     .map_or(0, |selection| selection.selection_work),
-                adaptive_union,
+                adaptive_union: union_mode == UnionMode::AdaptiveFirstByte,
+                union_mode,
                 work,
                 allocations,
                 allocated_bytes,
@@ -1274,10 +1395,10 @@ impl ReverseInnerPlan {
 
     #[must_use]
     pub const fn plan_id(&self) -> &'static str {
-        if self.build.adaptive_union {
-            UNION_PLAN_ID
-        } else {
-            PLAN_ID
+        match self.build.union_mode {
+            UnionMode::None => PLAN_ID,
+            UnionMode::AdaptiveFirstByte => UNION_PLAN_ID,
+            UnionMode::GroupedFixedColumn => GROUPED_UNION_PLAN_ID,
         }
     }
 
@@ -1288,10 +1409,10 @@ impl ReverseInnerPlan {
     const fn identity(&self, operation: Operation) -> OperationIdentity {
         OperationIdentity {
             plan_id: self.plan_id(),
-            accounting_id: if self.build.adaptive_union {
-                UNION_ACCOUNTING_ID
-            } else {
-                ACCOUNTING_ID
+            accounting_id: match self.build.union_mode {
+                UnionMode::None => ACCOUNTING_ID,
+                UnionMode::AdaptiveFirstByte => UNION_ACCOUNTING_ID,
+                UnionMode::GroupedFixedColumn => GROUPED_UNION_ACCOUNTING_ID,
             },
             operation_id: match operation {
                 Operation::Count => COUNT_OPERATION_ID,
@@ -1314,7 +1435,7 @@ impl ReverseInnerPlan {
     }
 
     /// Publish the source-free reduction and selected-search full-window
-    /// envelope. Adaptive-union existence and earliest-end receipts add their
+    /// envelope. Literal-union existence and earliest-end receipts add their
     /// adjacent-scalar proof envelope before checking search limits.
     pub fn full_window_upper_bounds(
         &self,
@@ -1500,12 +1621,13 @@ impl ReverseInnerPlan {
                     computation: "search window byte length",
                 })?;
         let mut upper = derive_upper_bounds(self.build, &self.finders, input_bytes)?;
-        if self.build.adaptive_union && projection != SearchProjection::Selected {
-            expand_union_endpoint_upper_bounds(
+        if self.build.union_mode == UnionMode::AdaptiveFirstByte
+            && projection != SearchProjection::Selected
+        {
+            expand_adaptive_union_endpoint_upper_bounds(
                 &mut upper,
                 input_bytes,
                 self.build.retained_non_ascii_ranges,
-                self.build.union_anchor_max_bucket_literals,
             )?;
         }
         let work_upper_bound = u64::try_from(upper.work).unwrap_or(u64::MAX);
@@ -1657,21 +1779,25 @@ impl ReverseInnerPlan {
             work: REDUCE_FIXED_WORK,
             ..ReduceActualCounters::default()
         };
-        if self.union_state().is_some() {
-            self.execute_union(haystack, window, operation, upper, actual)
-        } else {
-            self.execute_independent_from(
+        match self.build.union_mode {
+            UnionMode::AdaptiveFirstByte => {
+                self.execute_adaptive_union(haystack, window, operation, upper, actual)
+            }
+            UnionMode::GroupedFixedColumn => {
+                self.execute_grouped_union(haystack, window, operation, upper, actual)
+            }
+            UnionMode::None => self.execute_independent_from(
                 haystack,
                 window,
                 operation,
                 upper,
                 window.start(),
                 actual,
-            )
+            ),
         }
     }
 
-    fn next_union_candidate(
+    fn next_adaptive_union_candidate(
         &self,
         haystack: &[u8],
         mut scan_start: usize,
@@ -1681,27 +1807,280 @@ impl ReverseInnerPlan {
         let state = self
             .union_state()
             .ok_or(ReduceError::AccountingInvariant {
+                resource: "adaptive-union state",
+                actual: 0,
+                upper: 1,
+            })?;
+        let mut previous_scanned_through = scan_start;
+        while scan_start < ceiling {
+            let source = haystack.get(scan_start..ceiling).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "adaptive-union scan window",
+                },
+            )?;
+            actual.union_scan_calls = checked_add_reduce(
+                actual.union_scan_calls,
+                1,
+                "adaptive-union scan calls",
+            )?;
+            let scanned = state.scanner.scan_forward(source);
+            actual.union_classifications = checked_add_reduce(
+                actual.union_classifications,
+                scanned.examined_bytes(),
+                "adaptive-union classifications",
+            )?;
+            actual.work = checked_add_reduce(
+                actual.work,
+                scanned.examined_bytes(),
+                "adaptive-union classification work",
+            )?;
+            if scanned.nonmember_run_len() == source.len() {
+                return Ok(UnionNext::Exhausted);
+            }
+            let candidate_start = scan_start
+                .checked_add(scanned.nonmember_run_len())
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "adaptive-union candidate start",
+                })?;
+            let byte = *haystack.get(candidate_start).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "adaptive-union candidate byte",
+                },
+            )?;
+            let candidate_mask = *state.first_byte_masks.get(usize::from(byte)).ok_or(
+                ReduceError::AccountingInvariant {
+                    resource: "adaptive-union ASCII candidate byte",
+                    actual: u64::from(byte),
+                    upper: 0x7f,
+                },
+            )?;
+            if candidate_mask == 0 {
+                return Err(ReduceError::AccountingInvariant {
+                    resource: "adaptive-union candidate mask",
+                    actual: 0,
+                    upper: 1,
+                });
+            }
+            actual.union_root_candidates = checked_add_reduce(
+                actual.union_root_candidates,
+                1,
+                "adaptive-union root candidates",
+            )?;
+            actual.work = checked_add_reduce(
+                actual.work,
+                UNION_ROOT_CANDIDATE_WORK,
+                "adaptive-union root candidate work",
+            )?;
+
+            let mut matching_mask = 0_u16;
+            let mut verification_work = 0_usize;
+            let mut unchecked_mask = candidate_mask;
+            while unchecked_mask != 0 {
+                let shift = unchecked_mask.trailing_zeros();
+                let index = usize::try_from(shift).map_err(|_| {
+                    ReduceError::ArithmeticOverflow {
+                        computation: "adaptive-union candidate index",
+                    }
+                })?;
+                let bit = 1_u16.checked_shl(shift).ok_or(
+                    ReduceError::ArithmeticOverflow {
+                        computation: "adaptive-union candidate mask bit",
+                    },
+                )?;
+                unchecked_mask &= !bit;
+                let finder = self.finders.get(index).ok_or(
+                    ReduceError::AccountingInvariant {
+                        resource: "adaptive-union candidate finder",
+                        actual: u64::try_from(index).unwrap_or(u64::MAX),
+                        upper: u64::try_from(self.finders.len()).unwrap_or(u64::MAX),
+                    },
+                )?;
+                verification_work = checked_add_reduce(
+                    verification_work,
+                    UNION_LITERAL_CHECK_WORK,
+                    "adaptive-union local literal-check work",
+                )?;
+                actual.work = checked_add_reduce(
+                    actual.work,
+                    UNION_LITERAL_CHECK_WORK,
+                    "adaptive-union literal-check work",
+                )?;
+                let needle = finder.needle();
+                let candidate_end = candidate_start.checked_add(needle.len()).ok_or(
+                    ReduceError::ArithmeticOverflow {
+                        computation: "adaptive-union verification end",
+                    },
+                )?;
+                if candidate_end > ceiling {
+                    continue;
+                }
+                let candidate = haystack.get(candidate_start..candidate_end).ok_or(
+                    ReduceError::ArithmeticOverflow {
+                        computation: "adaptive-union verification window",
+                    },
+                )?;
+                actual.union_verification_bytes = checked_add_reduce(
+                    actual.union_verification_bytes,
+                    needle.len(),
+                    "adaptive-union verification bytes",
+                )?;
+                verification_work = checked_add_reduce(
+                    verification_work,
+                    needle.len(),
+                    "adaptive-union local verification work",
+                )?;
+                actual.work = checked_add_reduce(
+                    actual.work,
+                    needle.len(),
+                    "adaptive-union verification work",
+                )?;
+                if candidate == needle {
+                    matching_mask |= bit;
+                }
+            }
+
+            if matching_mask != 0 {
+                actual.union_exact_candidates = checked_add_reduce(
+                    actual.union_exact_candidates,
+                    1,
+                    "adaptive-union exact candidates",
+                )?;
+                actual.outer_candidates = checked_add_reduce(
+                    actual.outer_candidates,
+                    1,
+                    "adaptive-union outer candidates",
+                )?;
+                actual.work = checked_add_reduce(
+                    actual.work,
+                    UNION_EXACT_CANDIDATE_WORK,
+                    "adaptive-union exact candidate work",
+                )?;
+                return Ok(UnionNext::Candidate(UnionCandidate {
+                    start: candidate_start,
+                    matching_mask,
+                }));
+            }
+
+            let resume_start = candidate_start.checked_add(1).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "adaptive-union false-candidate progress",
+                },
+            )?;
+            let local_span = resume_start.checked_sub(previous_scanned_through).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "adaptive-union rejection sample span",
+                },
+            )?;
+            if verification_work > local_span {
+                actual.union_fallbacks = checked_add_reduce(
+                    actual.union_fallbacks,
+                    1,
+                    "adaptive-union fallbacks",
+                )?;
+                actual.work = checked_add_reduce(
+                    actual.work,
+                    UNION_FALLBACK_WORK,
+                    "adaptive-union fallback work",
+                )?;
+                return Ok(UnionNext::DenseFallback { resume_start });
+            }
+            previous_scanned_through = resume_start;
+            scan_start = resume_start;
+        }
+        Ok(UnionNext::Exhausted)
+    }
+
+    fn prove_grouped_left_boundary(
+        &self,
+        haystack: &[u8],
+        floor: usize,
+        candidate_start: usize,
+        actual: &mut ReduceActualCounters,
+    ) -> Result<Option<LeftBoundaryProof>, ReduceError> {
+        if candidate_start <= floor {
+            return Ok(None);
+        }
+        let preceding = decode_previous_scalar(haystack, floor, candidate_start)?;
+        charge_decode(preceding.byte_checks, actual)?;
+        let Some(scalar) = preceding.scalar else {
+            return Ok(None);
+        };
+        if preceding.width == 0 || !self.contains(scalar, actual)? {
+            return Ok(None);
+        }
+        let scalar_start = candidate_start.checked_sub(preceding.width).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "grouped-union proved left-boundary start",
+            },
+        )?;
+        Ok(Some(LeftBoundaryProof { scalar_start }))
+    }
+
+    fn prove_grouped_right_boundary(
+        &self,
+        haystack: &[u8],
+        literal_end: usize,
+        ceiling: usize,
+        actual: &mut ReduceActualCounters,
+    ) -> Result<Option<usize>, ReduceError> {
+        if literal_end >= ceiling {
+            return Ok(None);
+        }
+        let following_bytes = haystack.get(literal_end..ceiling).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "grouped-union following-scalar window",
+            },
+        )?;
+        let following = decode_scalar(following_bytes);
+        charge_decode(following.byte_checks, actual)?;
+        let Some(scalar) = following.scalar else {
+            return Ok(None);
+        };
+        if following.width == 0 || !self.contains(scalar, actual)? {
+            return Ok(None);
+        }
+        let accepting_end = literal_end.checked_add(following.width).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "grouped-union proved accepting end",
+            },
+        )?;
+        Ok(Some(accepting_end))
+    }
+
+    fn next_grouped_union_candidate(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        mut scan_start: usize,
+        candidate_ceiling: usize,
+        need_earliest_end: bool,
+        fallback: &mut GroupedFallbackMeter,
+        actual: &mut ReduceActualCounters,
+    ) -> Result<GroupedUnionNext, ReduceError> {
+        let state = self
+            .union_state()
+            .ok_or(ReduceError::AccountingInvariant {
                 resource: "literal-union state",
                 actual: 0,
                 upper: 1,
-        })?;
-        let mut previous_scanned_through = scan_start;
-        while scan_start < ceiling {
+            })?;
+        let anchor_offset = self.build.union_anchor_offset;
+        while scan_start < candidate_ceiling {
             // Every admitted literal owns this same in-bounds offset. Moving
             // the anchor scan to `scan_start + offset` therefore maps anchor
             // positions one-to-one onto candidate starts at or after
             // `scan_start`; neither an earlier start nor an overlap can be
-            // skipped. An anchor at or beyond `ceiling` cannot begin a
+            // skipped. An anchor at or beyond `candidate_ceiling` cannot begin a
             // literal that ends inside the checked window.
-            let anchor_scan_start = scan_start.checked_add(state.anchor_offset).ok_or(
+            let anchor_scan_start = scan_start.checked_add(anchor_offset).ok_or(
                 ReduceError::ArithmeticOverflow {
                     computation: "literal-union anchor scan start",
                 },
             )?;
-            if anchor_scan_start >= ceiling {
-                return Ok(UnionNext::Exhausted);
+            if anchor_scan_start >= candidate_ceiling {
+                return Ok(GroupedUnionNext::Exhausted);
             }
-            let source = haystack.get(anchor_scan_start..ceiling).ok_or(
+            let source = haystack.get(anchor_scan_start..candidate_ceiling).ok_or(
                 ReduceError::ArithmeticOverflow {
                     computation: "literal-union scan window",
                 },
@@ -1723,14 +2102,14 @@ impl ReverseInnerPlan {
                 "literal-union classification work",
             )?;
             if scanned.nonmember_run_len() == source.len() {
-                return Ok(UnionNext::Exhausted);
+                return Ok(GroupedUnionNext::Exhausted);
             }
             let anchor_position = anchor_scan_start
                 .checked_add(scanned.nonmember_run_len())
                 .ok_or(ReduceError::ArithmeticOverflow {
                     computation: "literal-union anchor position",
                 })?;
-            let candidate_start = anchor_position.checked_sub(state.anchor_offset).ok_or(
+            let candidate_start = anchor_position.checked_sub(anchor_offset).ok_or(
                 ReduceError::ArithmeticOverflow {
                     computation: "literal-union candidate start",
                 },
@@ -1740,7 +2119,7 @@ impl ReverseInnerPlan {
                     computation: "literal-union candidate byte",
                 },
             )?;
-            let candidate_mask = *state.anchor_byte_masks.get(usize::from(byte)).ok_or(
+            let candidate_mask = *state.first_byte_masks.get(usize::from(byte)).ok_or(
                 ReduceError::AccountingInvariant {
                     resource: "literal-union ASCII candidate byte",
                     actual: u64::from(byte),
@@ -1764,9 +2143,43 @@ impl ReverseInnerPlan {
                 UNION_ROOT_CANDIDATE_WORK,
                 "literal-union root candidate work",
             )?;
+            let resume_start = candidate_start.checked_add(1).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "grouped-union candidate progress",
+                },
+            )?;
+            let Some(left_boundary) = self.prove_grouped_left_boundary(
+                haystack,
+                window.start(),
+                candidate_start,
+                actual,
+            )? else {
+                if fallback.observe(resume_start, actual.work)? {
+                    actual.union_fallbacks = checked_add_reduce(
+                        actual.union_fallbacks,
+                        1,
+                        "grouped-union left-boundary fallbacks",
+                    )?;
+                    actual.work = checked_add_reduce(
+                        actual.work,
+                        UNION_FALLBACK_WORK,
+                        "grouped-union left-boundary fallback work",
+                    )?;
+                    return Ok(GroupedUnionNext::DenseFallback {
+                        resume_start: fallback.proved_through,
+                    });
+                }
+                scan_start = resume_start;
+                continue;
+            };
 
-            let mut matching_mask = 0_u16;
-            let mut verification_work = 0_usize;
+            // The left scalar is common to the complete bucket. Each literal
+            // length owns a distinct hypothetical right boundary, so prove
+            // that scalar before touching the literal bytes. An exact byte
+            // comparison can then return a locally accepting candidate whose
+            // two boundary seeds are safe to reuse without another decode.
+            let mut source_first_end = None::<usize>;
+            let mut earliest_end = None::<usize>;
             let mut unchecked_mask = candidate_mask;
             while unchecked_mask != 0 {
                 let shift = unchecked_mask.trailing_zeros();
@@ -1788,11 +2201,6 @@ impl ReverseInnerPlan {
                         upper: u64::try_from(self.finders.len()).unwrap_or(u64::MAX),
                     },
                 )?;
-                verification_work = checked_add_reduce(
-                    verification_work,
-                    UNION_LITERAL_CHECK_WORK,
-                    "literal-union local literal-check work",
-                )?;
                 actual.work = checked_add_reduce(
                     actual.work,
                     UNION_LITERAL_CHECK_WORK,
@@ -1804,7 +2212,15 @@ impl ReverseInnerPlan {
                         computation: "literal-union verification end",
                     },
                 )?;
-                if candidate_end > ceiling {
+                let Some(accepting_end) = self.prove_grouped_right_boundary(
+                    haystack,
+                    candidate_end,
+                    window.end(),
+                    actual,
+                )? else {
+                    continue;
+                };
+                if accepting_end > candidate_ceiling {
                     continue;
                 }
                 let candidate = haystack.get(candidate_start..candidate_end).ok_or(
@@ -1817,22 +2233,32 @@ impl ReverseInnerPlan {
                     needle.len(),
                     "literal-union verification bytes",
                 )?;
-                verification_work = checked_add_reduce(
-                    verification_work,
-                    needle.len(),
-                    "literal-union local verification work",
-                )?;
                 actual.work = checked_add_reduce(
                     actual.work,
                     needle.len(),
                     "literal-union verification work",
                 )?;
                 if candidate == needle {
-                    matching_mask |= bit;
+                    if source_first_end.is_none() {
+                        source_first_end = Some(accepting_end);
+                    }
+                    earliest_end = Some(
+                        earliest_end.map_or(accepting_end, |old| old.min(accepting_end)),
+                    );
+                    if !need_earliest_end {
+                        break;
+                    }
                 }
             }
 
-            if matching_mask != 0 {
+            if let Some(source_first_end) = source_first_end {
+                let earliest_end = earliest_end.ok_or(
+                    ReduceError::AccountingInvariant {
+                        resource: "grouped-union earliest accepting end",
+                        actual: 0,
+                        upper: 1,
+                    },
+                )?;
                 actual.union_exact_candidates = checked_add_reduce(
                     actual.union_exact_candidates,
                     1,
@@ -1848,46 +2274,39 @@ impl ReverseInnerPlan {
                     UNION_EXACT_CANDIDATE_WORK,
                     "literal-union exact candidate work",
                 )?;
-                return Ok(UnionNext::Candidate(UnionCandidate {
+                return Ok(GroupedUnionNext::Candidate(GroupedUnionCandidate {
                     start: candidate_start,
-                    matching_mask,
+                    left_boundary,
+                    source_first_end,
+                    earliest_end,
                 }));
             }
 
-            let resume_start = candidate_start.checked_add(1).ok_or(
-                ReduceError::ArithmeticOverflow {
-                    computation: "literal-union false-candidate progress",
-                },
-            )?;
-            let local_span = resume_start.checked_sub(previous_scanned_through).ok_or(
-                ReduceError::ArithmeticOverflow {
-                    computation: "literal-union rejection sample span",
-                },
-            )?;
-            if verification_work > local_span {
+            if fallback.observe(resume_start, actual.work)? {
                 actual.union_fallbacks = checked_add_reduce(
                     actual.union_fallbacks,
                     1,
-                    "literal-union fallbacks",
+                    "grouped-union false-candidate fallbacks",
                 )?;
                 actual.work = checked_add_reduce(
                     actual.work,
                     UNION_FALLBACK_WORK,
-                    "literal-union fallback work",
+                    "grouped-union false-candidate fallback work",
                 )?;
-                return Ok(UnionNext::DenseFallback { resume_start });
+                return Ok(GroupedUnionNext::DenseFallback {
+                    resume_start: fallback.proved_through,
+                });
             }
-            previous_scanned_through = resume_start;
             scan_start = resume_start;
         }
-        Ok(UnionNext::Exhausted)
+        Ok(GroupedUnionNext::Exhausted)
     }
 
     #[allow(
         clippy::too_many_lines,
         reason = "adaptive union traversal, certified fallback, and exact counters remain adjacent"
     )]
-    fn execute_union(
+    fn execute_adaptive_union(
         &self,
         haystack: &[u8],
         window: Window,
@@ -1898,7 +2317,7 @@ impl ReverseInnerPlan {
         let mut cursor = window.start();
         let mut unproductive_run_samples = 0_usize;
         loop {
-            let candidate = match self.next_union_candidate(
+            let candidate = match self.next_adaptive_union_candidate(
                 haystack,
                 cursor,
                 window.end(),
@@ -1910,7 +2329,7 @@ impl ReverseInnerPlan {
                         .outer_finder_calls
                         .checked_add(actual.inner_finder_calls)
                         .ok_or(ReduceError::ArithmeticOverflow {
-                            computation: "literal-union total finder calls",
+                            computation: "adaptive-union total finder calls",
                         })?;
                     verify_actual(actual, upper)?;
                     return Ok(actual);
@@ -2054,7 +2473,9 @@ impl ReverseInnerPlan {
                     1,
                     "literal-union unproductive run samples",
                 )?;
-                if unproductive_run_samples < UNION_PROVED_RUN_SAMPLES_BEFORE_FALLBACK {
+                if unproductive_run_samples
+                    < ADAPTIVE_UNION_PROVED_RUN_SAMPLES_BEFORE_FALLBACK
+                {
                     cursor = run_end;
                     continue;
                 }
@@ -2077,6 +2498,104 @@ impl ReverseInnerPlan {
                     actual,
                 );
             }
+            cursor = run_end;
+        }
+    }
+
+    fn execute_grouped_union(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        operation: Operation,
+        upper: ReduceUpperBounds,
+        mut actual: ReduceActualCounters,
+    ) -> Result<ReduceActualCounters, ReduceError> {
+        let mut cursor = window.start();
+        let mut fallback = GroupedFallbackMeter::new(window.start(), actual.work);
+        loop {
+            let candidate = match self.next_grouped_union_candidate(
+                haystack,
+                window,
+                cursor,
+                window.end(),
+                false,
+                &mut fallback,
+                &mut actual,
+            )? {
+                GroupedUnionNext::Candidate(candidate) => candidate,
+                GroupedUnionNext::Exhausted => {
+                    actual.finder_calls = actual
+                        .outer_finder_calls
+                        .checked_add(actual.inner_finder_calls)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "grouped-union total finder calls",
+                        })?;
+                    verify_actual(actual, upper)?;
+                    return Ok(actual);
+                }
+                GroupedUnionNext::DenseFallback { resume_start } => {
+                    return self.execute_independent_from(
+                        haystack,
+                        window,
+                        operation,
+                        upper,
+                        resume_start,
+                        actual,
+                    );
+                }
+            };
+            let run_start = self.scan_run_backward(
+                haystack,
+                window.start(),
+                candidate.left_boundary.scalar_start,
+                &mut actual,
+            )?;
+            let run_end = self.scan_run_forward(
+                haystack,
+                candidate.source_first_end,
+                window.end(),
+                &mut actual,
+            )?;
+            actual.run_events = checked_add_reduce(
+                actual.run_events,
+                1,
+                "grouped-union accepting run count",
+            )?;
+            actual.match_events = checked_add_reduce(
+                actual.match_events,
+                1,
+                "grouped-union match event count",
+            )?;
+            actual.count = actual.count.checked_add(1).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "grouped-union match count",
+                },
+            )?;
+            if operation == Operation::SpanSum {
+                let width = run_end.checked_sub(run_start).ok_or(
+                    ReduceError::ArithmeticOverflow {
+                        computation: "grouped-union matched run width",
+                    },
+                )?;
+                actual.span_sum = actual
+                    .span_sum
+                    .checked_add(u64::try_from(width).map_err(|_| {
+                        ReduceError::ArithmeticOverflow {
+                            computation: "grouped-union matched run width as u64",
+                        }
+                    })?)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "grouped-union matched byte sum",
+                    })?;
+            }
+            actual.work = actual
+                .work
+                .checked_add(RUN_WORK)
+                .and_then(|work| work.checked_add(MATCH_WORK))
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "grouped-union accepting run work",
+                })?;
+            fallback.reset(run_end, actual.work);
             cursor = run_end;
         }
     }
@@ -2275,46 +2794,66 @@ impl ReverseInnerPlan {
             work: REDUCE_FIXED_WORK,
             ..ReduceActualCounters::default()
         };
-        if self.union_state().is_some() {
-            if projection == SearchProjection::Selected {
-                self.execute_union_search(haystack, window, projection, upper, actual)
-            } else {
-                self.execute_union_endpoint_search(
-                    haystack,
-                    window,
-                    projection,
-                    upper,
-                    actual,
-                )
+        match self.build.union_mode {
+            UnionMode::AdaptiveFirstByte => {
+                if projection == SearchProjection::Selected {
+                    self.execute_adaptive_union_search(
+                        haystack,
+                        window,
+                        projection,
+                        upper,
+                        actual,
+                    )
+                } else {
+                    self.execute_adaptive_union_endpoint_search(
+                        haystack,
+                        window,
+                        projection,
+                        upper,
+                        actual,
+                    )
+                }
             }
-        } else {
-            self.execute_independent_search_from(
+            UnionMode::GroupedFixedColumn => {
+                if projection == SearchProjection::Selected {
+                    self.execute_grouped_union_search(
+                        haystack,
+                        window,
+                        projection,
+                        upper,
+                        actual,
+                    )
+                } else {
+                    self.execute_grouped_union_endpoint_search(
+                        haystack,
+                        window,
+                        projection,
+                        upper,
+                        actual,
+                    )
+                }
+            }
+            UnionMode::None => self.execute_independent_search_from(
                 haystack,
                 window,
                 projection,
                 upper,
                 window.start(),
                 actual,
-            )
+            ),
         }
     }
 
-    fn prove_union_endpoint_candidate(
+    fn prove_adaptive_union_endpoint_candidate(
         &self,
         haystack: &[u8],
         window: Window,
-        projection: SearchProjection,
         candidate: UnionCandidate,
         actual: &mut ReduceActualCounters,
     ) -> Result<Option<(usize, usize)>, SearchError> {
-        debug_assert!(projection != SearchProjection::Selected);
         if candidate.start <= window.start() {
             return Ok(None);
         }
-        // Admission proves every ASCII literal scalar belongs to the class.
-        // Only the scalar immediately on each side remains to be proved; no
-        // byte elsewhere in the surrounding maximal run can affect these
-        // endpoint projections.
         let preceding = decode_previous_scalar(haystack, window.start(), candidate.start)?;
         charge_decode(preceding.byte_checks, actual)?;
         let Some(preceding_scalar) = preceding.scalar else {
@@ -2323,73 +2862,68 @@ impl ReverseInnerPlan {
         if preceding.width == 0 || !self.contains(preceding_scalar, actual)? {
             return Ok(None);
         }
-        let start = candidate.start.checked_sub(preceding.width).ok_or(
-            ReduceError::ArithmeticOverflow {
-                computation: "literal-union endpoint accepting start",
-            },
-        )?;
-        // The selected anchor byte may bind several exact literals. Traverse
-        // the complete mask in source order. Existence publishes the first
-        // viable source branch; earliest-end compares every viable length and
-        // retains the source-earlier branch on an equal end.
-        let mut unchecked_mask = candidate.matching_mask;
-        let mut best = None::<(usize, usize)>;
-        while unchecked_mask != 0 {
-            let shift = unchecked_mask.trailing_zeros();
-            let candidate_index = usize::try_from(shift).map_err(|_| {
+
+        debug_assert!(candidate.matching_mask.is_power_of_two());
+        let candidate_index =
+            usize::try_from(candidate.matching_mask.trailing_zeros()).map_err(|_| {
                 ReduceError::ArithmeticOverflow {
-                    computation: "literal-union endpoint candidate index",
+                    computation: "adaptive-union endpoint candidate index",
                 }
             })?;
-            let bit = 1_u16.checked_shl(shift).ok_or(
-                ReduceError::ArithmeticOverflow {
-                    computation: "literal-union endpoint candidate mask bit",
-                },
-            )?;
-            unchecked_mask &= !bit;
-            let finder = self.finders.get(candidate_index).ok_or(
-                ReduceError::AccountingInvariant {
-                    resource: "literal-union endpoint finder",
-                    actual: u64::try_from(candidate_index).unwrap_or(u64::MAX),
-                    upper: u64::try_from(self.finders.len()).unwrap_or(u64::MAX),
-                },
-            )?;
-            let literal_end = candidate
-                .start
-                .checked_add(finder.needle().len())
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "literal-union endpoint literal end",
-                })?;
-            if literal_end >= window.end() {
-                continue;
-            }
-            let following_bytes = haystack.get(literal_end..window.end()).ok_or(
-                ReduceError::ArithmeticOverflow {
-                    computation: "literal-union endpoint following window",
-                },
-            )?;
-            let following = decode_scalar(following_bytes);
-            charge_decode(following.byte_checks, actual)?;
-            let Some(following_scalar) = following.scalar else {
-                continue;
-            };
-            if following.width == 0 || !self.contains(following_scalar, actual)? {
-                continue;
-            }
-            let end = literal_end.checked_add(following.width).ok_or(
-                ReduceError::ArithmeticOverflow {
-                    computation: "literal-union endpoint accepting end",
-                },
-            )?;
-            let matched = (start, end);
-            if projection == SearchProjection::Exists {
-                return Ok(Some(matched));
-            }
-            if best.map_or(true, |old| end < old.1) {
-                best = Some(matched);
-            }
+        let finder = self.finders.get(candidate_index).ok_or(
+            ReduceError::AccountingInvariant {
+                resource: "adaptive-union endpoint finder",
+                actual: u64::try_from(candidate_index).unwrap_or(u64::MAX),
+                upper: u64::try_from(self.finders.len()).unwrap_or(u64::MAX),
+            },
+        )?;
+        let literal_end = candidate
+            .start
+            .checked_add(finder.needle().len())
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "adaptive-union endpoint literal end",
+            })?;
+        if literal_end >= window.end() {
+            return Ok(None);
         }
-        Ok(best)
+        let following_bytes = haystack.get(literal_end..window.end()).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "adaptive-union endpoint following window",
+            },
+        )?;
+        let following = decode_scalar(following_bytes);
+        charge_decode(following.byte_checks, actual)?;
+        let Some(following_scalar) = following.scalar else {
+            return Ok(None);
+        };
+        if following.width == 0 || !self.contains(following_scalar, actual)? {
+            return Ok(None);
+        }
+
+        let start = candidate.start.checked_sub(preceding.width).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "adaptive-union endpoint accepting start",
+            },
+        )?;
+        let end = literal_end.checked_add(following.width).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "adaptive-union endpoint accepting end",
+            },
+        )?;
+        Ok(Some((start, end)))
+    }
+
+    fn project_grouped_union_candidate(
+        candidate: GroupedUnionCandidate,
+        projection: SearchProjection,
+    ) -> (usize, usize) {
+        debug_assert!(projection != SearchProjection::Selected);
+        let end = if projection == SearchProjection::EarliestEnd {
+            candidate.earliest_end
+        } else {
+            candidate.source_first_end
+        };
+        (candidate.left_boundary.scalar_start, end)
     }
 
     #[allow(
@@ -2435,7 +2969,7 @@ impl ReverseInnerPlan {
         clippy::too_many_lines,
         reason = "the monotone endpoint proof, earliest-end cutoff, and certified fallback remain adjacent"
     )]
-    fn execute_union_endpoint_search(
+    fn execute_adaptive_union_endpoint_search(
         &self,
         haystack: &[u8],
         window: Window,
@@ -2452,7 +2986,7 @@ impl ReverseInnerPlan {
             if cursor >= ceiling {
                 return finish_union_endpoint_execution(best, actual, upper);
             }
-            let candidate = match self.next_union_candidate(
+            let candidate = match self.next_adaptive_union_candidate(
                 haystack,
                 cursor,
                 ceiling,
@@ -2479,10 +3013,9 @@ impl ReverseInnerPlan {
                     computation: "literal-union endpoint overlapping progress",
                 },
             )?;
-            let proved = self.prove_union_endpoint_candidate(
+            let proved = self.prove_adaptive_union_endpoint_candidate(
                 haystack,
                 window,
-                projection,
                 candidate,
                 &mut actual,
             )?;
@@ -2508,7 +3041,7 @@ impl ReverseInnerPlan {
                 "literal-union endpoint unproductive candidate samples",
             )?;
             if unproductive_candidate_samples
-                < UNION_PROVED_RUN_SAMPLES_BEFORE_FALLBACK
+                < ADAPTIVE_UNION_PROVED_RUN_SAMPLES_BEFORE_FALLBACK
             {
                 cursor = resume_start;
                 continue;
@@ -2535,11 +3068,74 @@ impl ReverseInnerPlan {
         }
     }
 
+    fn execute_grouped_union_endpoint_search(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        projection: SearchProjection,
+        upper: ReduceUpperBounds,
+        mut actual: ReduceActualCounters,
+    ) -> Result<(Option<(usize, usize)>, ReduceActualCounters), SearchError> {
+        debug_assert!(projection != SearchProjection::Selected);
+        let mut cursor = window.start();
+        let mut best = None::<(usize, usize)>;
+        let mut fallback = GroupedFallbackMeter::new(window.start(), actual.work);
+        loop {
+            let ceiling = best.map_or(window.end(), |(_, end)| end);
+            if cursor >= ceiling {
+                return finish_union_endpoint_execution(best, actual, upper);
+            }
+            let candidate = match self.next_grouped_union_candidate(
+                haystack,
+                window,
+                cursor,
+                ceiling,
+                projection == SearchProjection::EarliestEnd,
+                &mut fallback,
+                &mut actual,
+            )? {
+                GroupedUnionNext::Candidate(candidate) => candidate,
+                GroupedUnionNext::Exhausted => {
+                    return finish_union_endpoint_execution(best, actual, upper);
+                }
+                GroupedUnionNext::DenseFallback { resume_start } => {
+                    return self.execute_union_endpoint_fallback(
+                        haystack,
+                        window,
+                        projection,
+                        upper,
+                        resume_start,
+                        best,
+                        actual,
+                    );
+                }
+            };
+            let resume_start = candidate.start.checked_add(1).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "grouped-union endpoint overlapping progress",
+                },
+            )?;
+            let matched = Self::project_grouped_union_candidate(candidate, projection);
+            if projection == SearchProjection::Exists {
+                return finish_union_endpoint_execution(Some(matched), actual, upper);
+            }
+            best = Some(best.map_or(matched, |old| {
+                if (matched.1, matched.0) < (old.1, old.0) {
+                    matched
+                } else {
+                    old
+                }
+            }));
+            fallback.reset(resume_start, actual.work);
+            cursor = resume_start;
+        }
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "adaptive union search, shortest semantics, and certified fallback remain adjacent"
     )]
-    fn execute_union_search(
+    fn execute_adaptive_union_search(
         &self,
         haystack: &[u8],
         window: Window,
@@ -2550,7 +3146,7 @@ impl ReverseInnerPlan {
         let mut cursor = window.start();
         let mut unproductive_run_samples = 0_usize;
         loop {
-            let candidate = match self.next_union_candidate(
+            let candidate = match self.next_adaptive_union_candidate(
                 haystack,
                 cursor,
                 window.end(),
@@ -2704,7 +3300,9 @@ impl ReverseInnerPlan {
                 1,
                 "search literal-union unproductive run samples",
             )?;
-            if unproductive_run_samples < UNION_PROVED_RUN_SAMPLES_BEFORE_FALLBACK {
+            if unproductive_run_samples
+                < ADAPTIVE_UNION_PROVED_RUN_SAMPLES_BEFORE_FALLBACK
+            {
                 cursor = run_end;
                 continue;
             }
@@ -2727,6 +3325,73 @@ impl ReverseInnerPlan {
                 actual,
             );
         }
+    }
+
+    fn execute_grouped_union_search(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        projection: SearchProjection,
+        upper: ReduceUpperBounds,
+        mut actual: ReduceActualCounters,
+    ) -> Result<(Option<(usize, usize)>, ReduceActualCounters), SearchError> {
+        debug_assert!(projection == SearchProjection::Selected);
+        let mut fallback = GroupedFallbackMeter::new(window.start(), actual.work);
+        let candidate = match self.next_grouped_union_candidate(
+            haystack,
+            window,
+            window.start(),
+            window.end(),
+            false,
+            &mut fallback,
+            &mut actual,
+        )? {
+            GroupedUnionNext::Candidate(candidate) => candidate,
+            GroupedUnionNext::Exhausted => {
+                return finish_search_execution(None, actual, upper);
+            }
+            GroupedUnionNext::DenseFallback { resume_start } => {
+                return self.execute_independent_search_from(
+                    haystack,
+                    window,
+                    projection,
+                    upper,
+                    resume_start,
+                    actual,
+                );
+            }
+        };
+        let run_start = self.scan_run_backward(
+            haystack,
+            window.start(),
+            candidate.left_boundary.scalar_start,
+            &mut actual,
+        )?;
+        let run_end = self.scan_run_forward(
+            haystack,
+            candidate.source_first_end,
+            window.end(),
+            &mut actual,
+        )?;
+        actual.run_events = checked_add_reduce(
+            actual.run_events,
+            1,
+            "search grouped-union accepting run count",
+        )?;
+        actual.match_events = checked_add_reduce(
+            actual.match_events,
+            1,
+            "search grouped-union match event count",
+        )?;
+        actual.count = 1;
+        actual.work = actual
+            .work
+            .checked_add(RUN_WORK)
+            .and_then(|work| work.checked_add(MATCH_WORK))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "search grouped-union accepting run work",
+            })?;
+        finish_search_execution(Some((run_start, run_end)), actual, upper)
     }
 
     fn execute_independent_search_from(
@@ -3100,7 +3765,7 @@ fn derive_upper_bounds(
         union_exact_candidates,
         union_fallbacks,
         union_work,
-    ) = if build.adaptive_union {
+    ) = if build.union_mode != UnionMode::None {
         let calls = input_bytes
             .checked_add(1)
             .ok_or(ReduceError::ArithmeticOverflow {
@@ -3210,18 +3875,56 @@ fn derive_upper_bounds(
         })?;
     // Reverse decoding may inspect a lead/continuation sequence twice while
     // validating it. Eight byte checks per source byte safely covers both
-    // directions, malformed prefixes, and the fixed literal holes.
-    let decode_byte_checks =
-        input_bytes
-            .checked_mul(16)
+    // directions, malformed prefixes, and the fixed literal holes. Grouped
+    // candidate admission additionally proves one left scalar per root and
+    // one hypothetical right scalar per literal in the largest anchor bucket.
+    let grouped_boundary_decode_checks = if build.union_mode == UnionMode::GroupedFixedColumn {
+        let following_checks = build
+            .union_anchor_max_bucket_literals
+            .checked_mul(4)
             .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "decode byte-check bound",
+                computation: "grouped-union following decode bound",
             })?;
+        let checks_per_root = following_checks.checked_add(8).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "grouped-union boundary decode bound per root",
+            },
+        )?;
+        input_bytes.checked_mul(checks_per_root).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "grouped-union boundary decode bound",
+            },
+        )?
+    } else {
+        0
+    };
+    let decode_byte_checks = input_bytes
+        .checked_mul(16)
+        .and_then(|checks| checks.checked_add(grouped_boundary_decode_checks))
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "decode byte-check bound",
+        })?;
     // A nonmember scalar can terminate candidate runs on both sides. Member
     // scalars belong to one disjoint run, so two tests per input byte is a
     // complete source-independent bound.
+    let grouped_boundary_membership_tests = if build.union_mode == UnionMode::GroupedFixedColumn {
+        let tests_per_root = build
+            .union_anchor_max_bucket_literals
+            .checked_add(1)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "grouped-union boundary membership bound per root",
+            })?;
+        input_bytes.checked_mul(tests_per_root).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "grouped-union boundary membership bound",
+            },
+        )?
+    } else {
+        0
+    };
     let membership_tests = input_bytes
         .checked_mul(2)
+        .and_then(|tests| tests.checked_add(grouped_boundary_membership_tests))
         .ok_or(ReduceError::ArithmeticOverflow {
             computation: "membership-test bound",
         })?;
@@ -3278,36 +3981,21 @@ fn derive_upper_bounds(
     })
 }
 
-fn expand_union_endpoint_upper_bounds(
+fn expand_adaptive_union_endpoint_upper_bounds(
     upper: &mut ReduceUpperBounds,
     input_bytes: usize,
     retained_non_ascii_ranges: usize,
-    max_bucket_literals: usize,
 ) -> Result<(), ReduceError> {
-    // Every exact union root can inspect one previous scalar (eight byte
-    // checks) plus one following scalar (four byte checks) for every retained
-    // literal in its worst-case bucket. The complete independent envelope
-    // remains available for certified fallback, so these probes are additive.
-    let following_decode_checks = max_bucket_literals.checked_mul(4).ok_or(
-        ReduceError::ArithmeticOverflow {
-            computation: "literal-union endpoint following decode bound",
-        },
-    )?;
-    let decode_checks_per_candidate = following_decode_checks.checked_add(8).ok_or(
-        ReduceError::ArithmeticOverflow {
-            computation: "literal-union endpoint decode checks per candidate",
-        },
-    )?;
+    // Every exact distinct-root candidate can inspect one previous scalar
+    // (eight byte checks) and its one following scalar (four byte checks).
+    // The complete independent envelope remains additive for fallback.
+    let decode_checks_per_candidate = 12_usize;
     let endpoint_decode_byte_checks = input_bytes
         .checked_mul(decode_checks_per_candidate)
         .ok_or(ReduceError::ArithmeticOverflow {
             computation: "literal-union endpoint decode byte-check bound",
         })?;
-    let membership_tests_per_candidate = max_bucket_literals.checked_add(1).ok_or(
-        ReduceError::ArithmeticOverflow {
-            computation: "literal-union endpoint membership tests per candidate",
-        },
-    )?;
+    let membership_tests_per_candidate = 2_usize;
     let endpoint_membership_tests = input_bytes
         .checked_mul(membership_tests_per_candidate)
         .ok_or(ReduceError::ArithmeticOverflow {
@@ -3881,9 +4569,10 @@ mod tests {
 
     use super::{
         BuildError, BuildLimits, COUNT_OPERATION_ID, EXISTS_OPERATION_ID,
+        GROUPED_UNION_ACCOUNTING_ID, GROUPED_UNION_PLAN_ID, GroupedFallbackMeter,
         MAX_ADMITTED_NON_ASCII_SCALARS, ReduceError, ReduceLimits, ReverseInnerPlan,
-        SEARCH_OPERATION_ID, SHORTEST_SEARCH_OPERATION_ID, SPAN_SUM_OPERATION_ID, SearchLimits,
-        ScalarRange, UNION_ACCOUNTING_ID, UNION_PLAN_ID, UnionState,
+        SEARCH_OPERATION_ID, SHORTEST_SEARCH_OPERATION_ID, SPAN_SUM_OPERATION_ID, ScalarRange,
+        SearchLimits, UNION_ACCOUNTING_ID, UNION_PLAN_ID, UnionMode, UnionState,
     };
     use crate::{DirectBuildAttemptActual, Window};
 
@@ -4031,7 +4720,11 @@ mod tests {
 
     #[test]
     fn exhaustive_union_endpoint_languages_match_regex_oracle() {
-        fn exercise(literals: &[&[u8]], pattern: &str, expected_union: bool) {
+        fn exercise(
+            literals: &[&[u8]],
+            pattern: &str,
+            expected_adaptive_union: bool,
+        ) {
             fn visit(
                 depth: usize,
                 maximum: usize,
@@ -4063,7 +4756,18 @@ mod tests {
 
             let ranges = [('a', 'd'), ('λ', 'λ')];
             let plan = plan(&ranges, literals);
-            assert_eq!(plan.build_accounting().adaptive_union, expected_union);
+            assert_eq!(
+                plan.build_accounting().adaptive_union,
+                expected_adaptive_union
+            );
+            assert_eq!(
+                plan.build_accounting().union_mode,
+                if expected_adaptive_union {
+                    UnionMode::AdaptiveFirstByte
+                } else {
+                    UnionMode::GroupedFixedColumn
+                }
+            );
             let regex = oracle(pattern);
             let tokens: [&[u8]; 8] = [
                 b"a",
@@ -4092,7 +4796,7 @@ mod tests {
         exercise(
             &[b"abc".as_slice(), b"ab".as_slice(), b"b".as_slice()],
             r"(?:[a-dλ]+abc[a-dλ]+|[a-dλ]+ab[a-dλ]+|[a-dλ]+b[a-dλ]+)",
-            true,
+            false,
         );
         exercise(
             &[b"abc".as_slice(), b"b".as_slice(), b"cd".as_slice()],
@@ -4322,6 +5026,7 @@ mod tests {
         .expect("baseline adaptive-union build");
         let build = baseline.into_plan().build_accounting();
         assert!(build.adaptive_union);
+        assert_eq!(build.union_mode, UnionMode::AdaptiveFirstByte);
         assert_eq!(build.allocations, build.literal_count + 3);
         assert_eq!(build.scratch_bytes, 0);
         let expected_allocated_bytes = build
@@ -4334,7 +5039,9 @@ mod tests {
                     .and_then(|finder_bytes| bytes.checked_add(finder_bytes))
             })
             .and_then(|bytes| bytes.checked_add(build.literal_bytes))
-            .and_then(|bytes| bytes.checked_add(size_of::<UnionState>()))
+            .and_then(|bytes| {
+                bytes.checked_add(size_of::<UnionState>())
+            })
             .expect("small exact allocation receipt");
         assert_eq!(build.allocated_bytes, expected_allocated_bytes);
         let expected_copied_bytes = build
@@ -4733,16 +5440,34 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_union_admission_uses_exact_sparse_scalar_boundaries_and_grouped_roots() {
+    fn union_modes_preserve_distinct_roots_and_group_only_shared_roots() {
         let ascii_64 = plan(&[('\0', '?'), ('λ', 'λ')], &[b"0", b"1"]);
         assert_eq!(ascii_64.build_accounting().ascii_scalars, 64);
         assert_eq!(ascii_64.build_accounting().non_ascii_scalars, 1);
         assert!(ascii_64.build_accounting().adaptive_union);
+        assert_eq!(
+            ascii_64.build_accounting().union_mode,
+            UnionMode::AdaptiveFirstByte
+        );
+        assert!(ascii_64.union_state().is_some());
+        assert_eq!(ascii_64.build_accounting().union_anchor_offset, 0);
+        assert_eq!(ascii_64.build_accounting().union_anchor_distinct_bytes, 0);
+        assert_eq!(
+            ascii_64
+                .build_accounting()
+                .union_anchor_max_bucket_literals,
+            0
+        );
+        assert_eq!(ascii_64.build_accounting().union_anchor_selection_work, 0);
+        assert_eq!(ascii_64.count_identity().plan_id, UNION_PLAN_ID);
+        assert_eq!(ascii_64.count_identity().accounting_id, UNION_ACCOUNTING_ID);
 
         let ascii_65 = plan(&[('\0', '@'), ('λ', 'λ')], &[b"0", b"1"]);
         assert_eq!(ascii_65.build_accounting().ascii_scalars, 65);
         assert_eq!(ascii_65.build_accounting().non_ascii_scalars, 1);
         assert!(!ascii_65.build_accounting().adaptive_union);
+        assert_eq!(ascii_65.build_accounting().union_mode, UnionMode::None);
+        assert!(ascii_65.union_state().is_none());
 
         let no_non_ascii = plan(&[('\0', '?')], &[b"0", b"1"]);
         assert_eq!(no_non_ascii.build_accounting().non_ascii_scalars, 0);
@@ -4789,7 +5514,17 @@ mod tests {
 
         let common_root = plan(&SMALL_CLASS, &[b"aa", b"ab"]);
         assert_eq!(common_root.build_accounting().distinct_literal_first_bytes, 1);
-        assert!(common_root.build_accounting().adaptive_union);
+        assert!(!common_root.build_accounting().adaptive_union);
+        assert_eq!(
+            common_root.build_accounting().union_mode,
+            UnionMode::GroupedFixedColumn
+        );
+        assert!(common_root.union_state().is_some());
+        assert_eq!(common_root.count_identity().plan_id, GROUPED_UNION_PLAN_ID);
+        assert_eq!(
+            common_root.count_identity().accounting_id,
+            GROUPED_UNION_ACCOUNTING_ID
+        );
         assert_eq!(common_root.build_accounting().union_anchor_offset, 1);
         assert_eq!(common_root.build_accounting().union_anchor_distinct_bytes, 2);
         assert_eq!(
@@ -4806,7 +5541,7 @@ mod tests {
         let middle_literals: [&[u8]; 4] = [b"aab", b"abb", b"acb", b"adb"];
         let middle = plan(&ranges, &middle_literals);
         let middle_build = middle.build_accounting();
-        assert!(middle_build.adaptive_union);
+        assert!(!middle_build.adaptive_union);
         assert_eq!(middle_build.distinct_literal_first_bytes, 1);
         assert_eq!(middle_build.union_anchor_offset, 1);
         assert_eq!(middle_build.union_anchor_distinct_bytes, 4);
@@ -4816,11 +5551,12 @@ mod tests {
         // Two 128-entry tables, then complete touched-bucket work for column
         // populations 1, 4, and 1.
         assert_eq!(middle_build.union_anchor_selection_work, 376);
-        let middle_state = middle.union_state().expect("middle-column union state");
-        assert_eq!(middle_state.anchor_offset, 1);
+        let middle_state = middle
+            .union_state()
+            .expect("middle-column union state");
         for (index, byte) in [b'a', b'b', b'c', b'd'].into_iter().enumerate() {
             assert_eq!(
-                middle_state.anchor_byte_masks[usize::from(byte)],
+                middle_state.first_byte_masks[usize::from(byte)],
                 1_u16 << index
             );
         }
@@ -4874,9 +5610,11 @@ mod tests {
         assert_eq!(tied_build.union_anchor_max_bucket_verification_work, 6);
         assert_eq!(tied_build.union_anchor_collision_pairs, 2);
         assert_eq!(tied_build.union_anchor_selection_work, 336);
-        let tied_state = tied.union_state().expect("deterministic tie union state");
-        assert_eq!(tied_state.anchor_byte_masks[usize::from(b'a')], 0b0011);
-        assert_eq!(tied_state.anchor_byte_masks[usize::from(b'b')], 0b1100);
+        let tied_state = tied
+            .union_state()
+            .expect("deterministic tie union state");
+        assert_eq!(tied_state.first_byte_masks[usize::from(b'a')], 0b0011);
+        assert_eq!(tied_state.first_byte_masks[usize::from(b'b')], 0b1100);
 
         let duplicate_literals: [&[u8]; 4] = [b"ab", b"ab", b"ac", b"ac"];
         let duplicates = plan(&ranges, &duplicate_literals);
@@ -4889,8 +5627,8 @@ mod tests {
         let duplicate_state = duplicates
             .union_state()
             .expect("duplicate grouped union state");
-        assert_eq!(duplicate_state.anchor_byte_masks[usize::from(b'b')], 0b0011);
-        assert_eq!(duplicate_state.anchor_byte_masks[usize::from(b'c')], 0b1100);
+        assert_eq!(duplicate_state.first_byte_masks[usize::from(b'b')], 0b0011);
+        assert_eq!(duplicate_state.first_byte_masks[usize::from(b'c')], 0b1100);
 
         let prefix_literals: [&[u8]; 4] = [b"b", b"ba", b"bab", b"baba"];
         let prefixes = plan(&ranges, &prefix_literals);
@@ -4904,7 +5642,7 @@ mod tests {
             prefixes
                 .union_state()
                 .expect("prefix grouped union state")
-                .anchor_byte_masks[usize::from(b'b')],
+                .first_byte_masks[usize::from(b'b')],
             0b1111
         );
     }
@@ -4933,7 +5671,7 @@ mod tests {
 
             let ranges = [('a', 'd'), ('λ', 'λ')];
             let plan = plan(&ranges, literals);
-            assert!(plan.build_accounting().adaptive_union);
+            assert!(!plan.build_accounting().adaptive_union);
             let regex = oracle(pattern);
             let tokens: [&[u8]; 8] = [
                 b"a",
@@ -4972,35 +5710,52 @@ mod tests {
         let haystack = b"qbabaq";
         let window = Window::full(haystack);
         let mut actual = super::ReduceActualCounters::default();
+        let mut fallback = GroupedFallbackMeter::new(window.start(), actual.work);
         let candidate = match plan
-            .next_union_candidate(haystack, window.start(), window.end(), &mut actual)
+            .next_grouped_union_candidate(
+                haystack,
+                window,
+                window.start(),
+                window.end(),
+                true,
+                &mut fallback,
+                &mut actual,
+            )
             .expect("same-start grouped candidate")
         {
-            super::UnionNext::Candidate(candidate) => candidate,
+            super::GroupedUnionNext::Candidate(candidate) => candidate,
             other => panic!("expected exact grouped candidate, got {other:?}"),
         };
         assert_eq!(candidate.start, 1);
-        assert_eq!(candidate.matching_mask, 0b111);
-        let source_first = plan
-            .prove_union_endpoint_candidate(
-                haystack,
-                window,
-                super::SearchProjection::Exists,
-                candidate,
-                &mut actual,
-            )
-            .expect("source-ordered grouped existence");
-        assert_eq!(source_first, Some((0, 6)));
-        let earliest = plan
-            .prove_union_endpoint_candidate(
-                haystack,
-                window,
-                super::SearchProjection::EarliestEnd,
-                candidate,
-                &mut actual,
-            )
-            .expect("all-length grouped earliest end");
-        assert_eq!(earliest, Some((0, 3)));
+        assert_eq!(candidate.left_boundary.scalar_start, 0);
+        assert_eq!(candidate.source_first_end, 6);
+        assert_eq!(candidate.earliest_end, 3);
+        let proof_counts = (
+            actual.decode_byte_checks,
+            actual.membership_tests,
+            actual.range_comparisons,
+            actual.work,
+        );
+        let source_first = ReverseInnerPlan::project_grouped_union_candidate(
+            candidate,
+            super::SearchProjection::Exists,
+        );
+        assert_eq!(source_first, (0, 6));
+        let earliest = ReverseInnerPlan::project_grouped_union_candidate(
+            candidate,
+            super::SearchProjection::EarliestEnd,
+        );
+        assert_eq!(earliest, (0, 3));
+        assert_eq!(
+            (
+                actual.decode_byte_checks,
+                actual.membership_tests,
+                actual.range_comparisons,
+                actual.work,
+            ),
+            proof_counts,
+            "carried grouped endpoints must not be re-proved"
+        );
         assert_eq!(
             plan.shortest(haystack, SearchLimits::unlimited())
                 .expect("public grouped shortest")
@@ -5013,6 +5768,152 @@ mod tests {
                 .0,
             Some((0, 6))
         );
+    }
+
+    #[test]
+    fn grouped_fallback_meter_is_cumulative_monotone_and_resettable() {
+        let mut tie = GroupedFallbackMeter::new(10, 100);
+        assert!(!tie.observe(15, 110).expect("exact two-pass tie"));
+        assert!(tie.observe(16, 113).expect("one work beyond tie"));
+
+        let mut sparse = GroupedFallbackMeter::new(0, 0);
+        assert!(!sparse.observe(10, 12).expect("first sparse rejection"));
+        assert!(!sparse.observe(20, 24).expect("second sparse rejection"));
+        assert!(!sparse.observe(30, 36).expect("third sparse rejection"));
+
+        let mut dense = GroupedFallbackMeter::new(0, 0);
+        assert!(!dense.observe(2, 3).expect("first dense rejection"));
+        assert!(dense.observe(4, 9).expect("cumulative dense rejection"));
+        dense.reset(12, 40);
+        assert!(!dense.observe(20, 48).expect("productive reset clears debt"));
+        assert!(matches!(
+            dense.observe(20, 49),
+            Err(ReduceError::AccountingInvariant { .. })
+        ));
+    }
+
+    #[test]
+    fn grouped_boundaries_precede_literal_bytes_and_fallback_keeps_overlap() {
+        let ranges = [('a', 'b'), ('λ', 'λ')];
+        let grouped_plan = plan(&ranges, &[b"ba", b"bb"]);
+        assert_eq!(
+            grouped_plan.build_accounting().union_mode,
+            UnionMode::GroupedFixedColumn
+        );
+        assert_eq!(grouped_plan.build_accounting().union_anchor_offset, 1);
+
+        let floor_rejected = grouped_plan
+            .count(b"ba-", ReduceLimits::unlimited())
+            .expect("candidate at the window floor");
+        assert_eq!(floor_rejected.count, 0);
+        assert_eq!(floor_rejected.accounting.actual.union_root_candidates, 1);
+        assert_eq!(floor_rejected.accounting.actual.union_verification_bytes, 0);
+        assert_eq!(floor_rejected.accounting.actual.union_exact_candidates, 0);
+
+        let haystack = b"babab";
+        let count = grouped_plan
+            .count(haystack, ReduceLimits::unlimited())
+            .expect("dense rejection followed by overlapping match");
+        assert_eq!(count.count, 1);
+        assert_eq!(count.accounting.actual.union_fallbacks, 1);
+        assert_all_operations_fallback_to_later_match(
+            &grouped_plan,
+            haystack,
+            (0, 5),
+            5,
+        );
+
+        let right_boundary_plan = plan(
+            &[('a', 'z'), ('λ', 'λ')],
+            &[b"za", b"zb"],
+        );
+        for rejected in [
+            b"qza-".as_slice(),
+            b"qza\xff",
+            b"qza",
+        ] {
+            let rejected_count = right_boundary_plan
+                .count(rejected, ReduceLimits::unlimited())
+                .expect("right-boundary rejection");
+            assert_eq!(rejected_count.count, 0, "haystack={rejected:?}");
+            assert_eq!(
+                rejected_count.accounting.actual.union_verification_bytes,
+                0,
+                "right boundary must reject before bytes: {rejected:?}"
+            );
+            assert_eq!(
+                rejected_count.accounting.actual.union_exact_candidates,
+                0,
+                "haystack={rejected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn grouped_carried_boundaries_avoid_endpoint_and_run_reproof() {
+        let plan = plan(&[('a', 'b'), ('λ', 'λ')], &[b"ba", b"bb"]);
+        let haystack = "λbaλ".as_bytes();
+        let count = plan
+            .count(haystack, ReduceLimits::unlimited())
+            .expect("grouped carried-proof count");
+        let (found, selected) = plan
+            .find(haystack, SearchLimits::unlimited())
+            .expect("grouped carried-proof selected span");
+        let (exists, endpoint) = plan
+            .is_match(haystack, SearchLimits::unlimited())
+            .expect("grouped carried-proof endpoint");
+        assert_eq!(count.count, 1);
+        assert_eq!(found, Some((0, haystack.len())));
+        assert!(exists);
+        assert_eq!(count.accounting.actual.inner_finder_calls, 0);
+        assert_eq!(selected.actual.inner_finder_calls, 0);
+        assert_eq!(endpoint.actual.inner_finder_calls, 0);
+        assert_eq!(
+            count.accounting.actual.decode_byte_checks,
+            endpoint.actual.decode_byte_checks
+        );
+        assert_eq!(
+            count.accounting.actual.membership_tests,
+            endpoint.actual.membership_tests
+        );
+    }
+
+    #[test]
+    fn grouped_sparse_rejections_do_not_fallback_by_case_count() {
+        let plan = plan(&[('a', 'z'), ('λ', 'λ')], &[b"za", b"zb"]);
+        let mut haystack = Vec::new();
+        for _ in 0..3 {
+            haystack.extend_from_slice(&[b'-'; 256]);
+            haystack.extend_from_slice(b"qza");
+        }
+        haystack.extend_from_slice(&[b'-'; 256]);
+        haystack.extend_from_slice(b"qzaq");
+        let regex = oracle(
+            r"(?:[a-zλ]+za[a-zλ]+|[a-zλ]+zb[a-zλ]+)",
+        );
+        assert_matches_oracle(&plan, &regex, &haystack);
+        let count = plan
+            .count(&haystack, ReduceLimits::unlimited())
+            .expect("sparse grouped rejections");
+        assert_eq!(count.count, 1);
+        assert!(count.accounting.actual.union_root_candidates >= 4);
+        assert_eq!(count.accounting.actual.union_fallbacks, 0);
+        let span = plan
+            .span_sum(&haystack, ReduceLimits::unlimited())
+            .expect("sparse grouped span sum");
+        let (_, selected) = plan
+            .find(&haystack, SearchLimits::unlimited())
+            .expect("sparse grouped selected search");
+        let (_, exists) = plan
+            .is_match(&haystack, SearchLimits::unlimited())
+            .expect("sparse grouped existence search");
+        let (_, shortest) = plan
+            .shortest(&haystack, SearchLimits::unlimited())
+            .expect("sparse grouped shortest search");
+        assert_eq!(span.accounting.actual.union_fallbacks, 0);
+        assert_eq!(selected.actual.union_fallbacks, 0);
+        assert_eq!(exists.actual.union_fallbacks, 0);
+        assert_eq!(shortest.actual.union_fallbacks, 0);
     }
 
     #[test]
@@ -5103,7 +6004,8 @@ mod tests {
         let probe = plan
             .count(haystack, ReduceLimits::unlimited())
             .expect("grouped false-anchor fallback probe");
-        assert_eq!(probe.accounting.actual.union_root_candidates, 1);
+        assert_eq!(probe.accounting.actual.union_root_candidates, 2);
+        assert_eq!(probe.accounting.actual.union_verification_bytes, 3);
         assert_eq!(probe.accounting.actual.union_exact_candidates, 0);
         assert_eq!(probe.accounting.actual.union_fallbacks, 1);
         assert!(probe.accounting.actual.outer_finder_calls > 0);
@@ -5190,10 +6092,27 @@ mod tests {
         )
         .expect("grouped baseline build");
         let build = baseline.into_plan().build_accounting();
-        assert!(build.adaptive_union);
+        assert!(!build.adaptive_union);
+        assert_eq!(build.union_mode, UnionMode::GroupedFixedColumn);
+        assert_eq!(build.allocations, build.literal_count + 3);
         assert_eq!(build.union_anchor_max_bucket_literals, 4);
         assert_eq!(build.union_anchor_collision_pairs, 6);
         assert!(build.union_anchor_selection_work > 0);
+        let expected_allocated_bytes = build
+            .source_ranges
+            .checked_mul(size_of::<ScalarRange>())
+            .and_then(|bytes| {
+                build
+                    .literal_count
+                    .checked_mul(size_of::<Finder<'static>>())
+                    .and_then(|finder_bytes| bytes.checked_add(finder_bytes))
+            })
+            .and_then(|bytes| bytes.checked_add(build.literal_bytes))
+            .and_then(|bytes| {
+                bytes.checked_add(size_of::<UnionState>())
+            })
+            .expect("grouped exact allocation receipt");
+        assert_eq!(build.allocated_bytes, expected_allocated_bytes);
         let exact_build = BuildLimits {
             max_source_ranges: build.source_ranges,
             max_literals: build.literal_count,
@@ -5236,9 +6155,37 @@ mod tests {
         let upper = plan
             .full_window_upper_bounds(haystack.len())
             .expect("grouped reduction bounds");
+        assert_eq!(
+            upper.decode_byte_checks,
+            (16 + 8 + 4 * build.union_anchor_max_bucket_literals) * haystack.len()
+        );
+        assert_eq!(
+            upper.membership_tests,
+            (2 + 1 + build.union_anchor_max_bucket_literals) * haystack.len()
+        );
         let exact_reduce = exact_reduce_limits(upper);
         plan.count(haystack, exact_reduce)
             .expect("exact grouped reduction limits");
+        assert!(matches!(
+            plan.count(
+                haystack,
+                ReduceLimits {
+                    max_decode_byte_checks: upper.decode_byte_checks - 1,
+                    ..exact_reduce
+                },
+            ),
+            Err(ReduceError::DecodeByteChecksLimit { .. })
+        ));
+        assert!(matches!(
+            plan.count(
+                haystack,
+                ReduceLimits {
+                    max_membership_tests: upper.membership_tests - 1,
+                    ..exact_reduce
+                },
+            ),
+            Err(ReduceError::MembershipTestsLimit { .. })
+        ));
         assert!(matches!(
             plan.count(
                 haystack,
@@ -5313,16 +6260,21 @@ mod tests {
         let build = plan.build_accounting();
         assert_eq!(build.literal_count, 16);
         assert_eq!(build.distinct_literal_first_bytes, 1);
-        assert!(build.adaptive_union);
+        assert!(!build.adaptive_union);
         assert_eq!(build.union_anchor_offset, 1);
         assert_eq!(build.union_anchor_distinct_bytes, 16);
         assert_eq!(build.union_anchor_max_bucket_literals, 1);
         assert_eq!(build.union_anchor_collision_pairs, 0);
-        assert_eq!(plan.count_identity().plan_id, UNION_PLAN_ID);
-        assert_eq!(plan.count_identity().accounting_id, UNION_ACCOUNTING_ID);
-        let state = plan.union_state().expect("sixteen-way grouped union state");
-        assert_eq!(state.anchor_byte_masks[usize::from(b'a')], 1);
-        assert_eq!(state.anchor_byte_masks[usize::from(b'p')], 1_u16 << 15);
+        assert_eq!(plan.count_identity().plan_id, GROUPED_UNION_PLAN_ID);
+        assert_eq!(
+            plan.count_identity().accounting_id,
+            GROUPED_UNION_ACCOUNTING_ID
+        );
+        let state = plan
+            .union_state()
+            .expect("sixteen-way grouped union state");
+        assert_eq!(state.first_byte_masks[usize::from(b'a')], 1);
+        assert_eq!(state.first_byte_masks[usize::from(b'p')], 1_u16 << 15);
         let absent = plan
             .count(b"qqqqqqqqqqqqqqqq", ReduceLimits::unlimited())
             .expect("grouped-column absent reduction");

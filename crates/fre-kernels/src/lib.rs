@@ -549,6 +549,8 @@ pub use reverse_inner::{
     BuildLimits as ReverseInnerBuildLimits, COUNT_OPERATION_ID as REVERSE_INNER_COUNT_OPERATION_ID,
     CountResult as ReverseInnerCountResult,
     EXISTS_OPERATION_ID as REVERSE_INNER_EXISTS_OPERATION_ID,
+    GROUPED_UNION_ACCOUNTING_ID as REVERSE_INNER_GROUPED_UNION_ACCOUNTING_ID,
+    GROUPED_UNION_PLAN_ID as REVERSE_INNER_GROUPED_UNION_PLAN_ID,
     MAX_ADMITTED_ASCII_SCALARS as REVERSE_INNER_MAX_ADMITTED_ASCII_SCALARS,
     MAX_ADMITTED_NON_ASCII_SCALARS as REVERSE_INNER_MAX_ADMITTED_NON_ASCII_SCALARS,
     MAX_LITERALS as REVERSE_INNER_MAX_LITERALS,
@@ -562,6 +564,7 @@ pub use reverse_inner::{
     SearchAccounting as ReverseInnerSearchAccounting, SearchError as ReverseInnerSearchError,
     SearchLimits as ReverseInnerSearchLimits, Semantics as ReverseInnerSemantics,
     SpanSumResult as ReverseInnerSpanSumResult,
+    UnionMode as ReverseInnerUnionMode,
     UNION_ACCOUNTING_ID as REVERSE_INNER_UNION_ACCOUNTING_ID,
     UNION_PLAN_ID as REVERSE_INNER_UNION_PLAN_ID,
 };
