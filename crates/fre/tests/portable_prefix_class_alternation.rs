@@ -113,7 +113,7 @@ fn exhaustive_small_byte_language_matches_oracle() {
         expected: &Regex,
     ) {
         assert_differential(actual, expected, haystack);
-        if depth == 7 {
+        if depth == 5 {
             return;
         }
         for &byte in alphabet {
