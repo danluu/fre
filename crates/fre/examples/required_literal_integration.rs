@@ -177,7 +177,7 @@ fn emit(
         PlanKind::UnicodeFoldedLiteral => "unicode-folded-literal-first-start-v1",
         PlanKind::UnicodeWordRun => "unicode-word-run-linear-v1",
         PlanKind::PureByteClassRepeat => "pure-byte-class-repeat-v1",
-        PlanKind::BoundedByteClassSequence => "bounded-byte-class-sequence-search-v1",
+        PlanKind::BoundedByteClassSequence => "bounded-byte-class-sequence-search-v2",
         PlanKind::FixedPredicateWord64 => "fixed-predicate-word64-first-match-v1",
     };
     let per_iteration = elapsed_ns / u128::try_from(ITERATIONS).unwrap();

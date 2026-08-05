@@ -30,6 +30,18 @@
 //! successor; every earlier start stops at its maximum while still inside the
 //! first class, and every later eligible start reaches the same successor
 //! boundary.
+//! A three-run sealed corridor, optionally followed by nullable suffix runs,
+//! whose fixed successor is disjoint from both preceding classes may instead
+//! select that successor as its search anchor.
+//! This is limited to a one-to-three-byte successor that is strictly smaller
+//! than the first class. Successor candidates are visited in source order and
+//! the two bounded runs are recovered backwards. Pairwise disjointness makes
+//! the first successful successor the leftmost match: an earlier successor
+//! cannot occur inside either preceding run, so a later match cannot begin on
+//! its left. After a fixed number of failed successor probes, search resumes
+//! with the ordinary first-run scanner immediately after the last probe. This
+//! bounds dense-decoy overhead without rescanning or skipping a possible
+//! match.
 //! The tail is therefore verified once per first-class run instead of once per
 //! member. Ordinarily a positive second run makes that physical-run collapse
 //! valid even when a later tail run is nullable. When the second run is the
@@ -37,10 +49,11 @@
 //! proves the same fact: a capped earlier start stops on another first-class
 //! byte and fails, while every viable suffix reaches the physical run end. For
 //! one immutable plan this is O(N), with a complete
-//! source-independent bound of `N * (maximum_tail_width + 16)` charged by the
-//! shared byte-class work meter. Fixed products remain with their established
-//! incumbent plans; every structurally eligible variable product is admitted,
-//! including small products that the earlier finite-language plans decline.
+//! source-independent bound of `N * (maximum_verification_width + 16)` charged
+//! by the shared byte-class work meter. Fixed products remain with their
+//! established incumbent plans; every structurally eligible variable product
+//! is admitted, including small products that the earlier finite-language
+//! plans decline.
 //! An absolute-start plan instead evaluates exactly one candidate at byte zero:
 //! it scans the first run only to its finite maximum and verifies the tail from
 //! that exact boundary. A window beginning after zero cannot satisfy the
@@ -56,9 +69,10 @@ use regex_syntax::hir::{Class, Hir, HirKind, Look};
 use crate::pure_byte_class_repeat::{Error as SeekError, SetSeek, WorkMeter, validate_window};
 use crate::{Match, SearchLimits, SearchWindow};
 
-pub const PLAN_ID: &str = "bounded-byte-class-sequence-search-v1";
+pub const PLAN_ID: &str = "bounded-byte-class-sequence-search-v2";
 
 const MAX_RUNS: usize = 16;
+const TAIL_ANCHOR_PROBE_LIMIT: u64 = 1;
 const NODE_INSPECTION_WORK: u64 = 1;
 const RANGE_INSPECTION_WORK: u64 = 1;
 const MEMBER_INSERTION_WORK: u64 = 1;
@@ -91,9 +105,9 @@ pub struct Accounting {
     pub work_upper_bound: u64,
     /// Exact work charged by the shared meter.
     pub actual_work: u64,
-    /// Exact number of first-run candidate seeks.
+    /// Exact number of selected-anchor candidate seeks.
     pub candidate_scans: u64,
-    /// Exact number of physical first/tail run scans.
+    /// Exact number of bounded run verifications.
     pub run_scans: u64,
     /// Exact number of emitted match events, zero or one for one search.
     pub match_events: u64,
@@ -199,6 +213,7 @@ pub(crate) struct Inspection {
     total_maximum: usize,
     anchored_start: bool,
     sealed_bridge: Option<SealedBridge>,
+    tail_seek: Option<SetSeek>,
     first_seek: SetSeek,
     first_run_end_seek: SetSeek,
     classifier_words: Option<[u64; 4]>,
@@ -227,6 +242,7 @@ struct Owner {
     total_maximum: usize,
     anchored_start: bool,
     sealed_bridge: Option<SealedBridge>,
+    tail_seek: Option<SetSeek>,
     first_seek: SetSeek,
     first_run_end_seek: SetSeek,
     classifier: Option<ByteSetClassifier>,
@@ -252,6 +268,7 @@ impl Plan {
         total_maximum: usize,
         anchored_start: bool,
         sealed_bridge: Option<SealedBridge>,
+        tail_seek: Option<SetSeek>,
         first_seek: SetSeek,
         first_run_end_seek: SetSeek,
         classifier_words: Option<[u64; 4]>,
@@ -291,6 +308,19 @@ impl Plan {
         debug_assert!(retained_runs[nullable_suffix_start..]
             .iter()
             .all(|run| run.minimum == 0));
+        if tail_seek.is_some() {
+            debug_assert!(!anchored_start);
+            debug_assert_eq!(last_required_run, 2);
+            debug_assert_eq!(
+                sealed_bridge,
+                Some(SealedBridge {
+                    index: 1,
+                    overlaps_successor: false,
+                })
+            );
+            debug_assert!(retained_runs[2].cardinality() < retained_runs[0].cardinality());
+            debug_assert!((1..=3).contains(&retained_runs[2].cardinality()));
+        }
         let classifier = classifier_words.map(|words| {
             dispatch
                 .byte_set_classifier(ByteSet256::from_words(words), DispatchPolicy::Auto)
@@ -304,6 +334,7 @@ impl Plan {
             total_maximum,
             anchored_start,
             sealed_bridge,
+            tail_seek,
             first_seek,
             first_run_end_seek,
             classifier,
@@ -417,29 +448,55 @@ impl Plan {
         if owner.anchored_start {
             return self.search_anchored(haystack, window, limits, shortest_last);
         }
-        let mut meter = WorkMeter::new(limits.max_work);
+        let meter = WorkMeter::new(limits.max_work);
+        if owner.tail_seek.is_some() {
+            return self.search_tail_anchored(haystack, window, shortest_last, meter);
+        }
+        self.search_forward(
+            haystack,
+            window,
+            window.start(),
+            shortest_last,
+            meter,
+            0,
+            0,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "adaptive handoff keeps the exact cursor and counters adjacent"
+    )]
+    fn search_forward(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        mut position: usize,
+        shortest_last: bool,
+        mut meter: WorkMeter,
+        mut candidate_scans: u64,
+        mut run_scans: u64,
+    ) -> Result<SearchState, SearchError> {
+        let owner = self.owner();
         let Some(last_start) = window.end().checked_sub(owner.total_minimum) else {
             return Ok(SearchState {
                 span: None,
                 meter,
-                candidate_scans: 0,
-                run_scans: 0,
+                candidate_scans,
+                run_scans,
             });
         };
-        if last_start < window.start() {
+        if last_start < position {
             return Ok(SearchState {
                 span: None,
                 meter,
-                candidate_scans: 0,
-                run_scans: 0,
+                candidate_scans,
+                run_scans,
             });
         }
         let candidate_end = last_start
             .checked_add(1)
             .expect("a last start before the window end advances once");
-        let mut position = window.start();
-        let mut candidate_scans = 0_u64;
-        let mut run_scans = 0_u64;
         while position < candidate_end {
             candidate_scans = candidate_scans
                 .checked_add(1)
@@ -498,6 +555,100 @@ impl Plan {
             position = run_end
                 .checked_add(1)
                 .expect("a first-run boundary before the window end advances once");
+        }
+        Ok(SearchState {
+            span: None,
+            meter,
+            candidate_scans,
+            run_scans,
+        })
+    }
+
+    fn search_tail_anchored(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        shortest_last: bool,
+        mut meter: WorkMeter,
+    ) -> Result<SearchState, SearchError> {
+        let owner = self.owner();
+        let tail_seek = owner
+            .tail_seek
+            .expect("the tail-anchored path retains its small successor seek");
+        let Some(mut position) = window.start().checked_add(owner.runs[0].minimum) else {
+            return Ok(SearchState {
+                span: None,
+                meter,
+                candidate_scans: 0,
+                run_scans: 0,
+            });
+        };
+        if position >= window.end() {
+            return Ok(SearchState {
+                span: None,
+                meter,
+                candidate_scans: 0,
+                run_scans: 0,
+            });
+        }
+
+        let mut candidate_scans = 0_u64;
+        let mut run_scans = 0_u64;
+        let mut failed_probes = 0_u64;
+        while position < window.end() {
+            candidate_scans = candidate_scans
+                .checked_add(1)
+                .ok_or(Error::CounterOverflow {
+                    counter: "candidate-scan",
+                })?;
+            let Some(successor) = tail_seek.seek(
+                haystack,
+                position,
+                window.end(),
+                &mut meter,
+                None,
+            )?
+            else {
+                break;
+            };
+            run_scans = run_scans.checked_add(2).ok_or(Error::CounterOverflow {
+                counter: "run-scan",
+            })?;
+            if let Some(span) = owner.verify_tail_anchor(
+                haystack,
+                window.start(),
+                successor,
+                window.end(),
+                shortest_last,
+                &mut meter,
+                &mut run_scans,
+            )? {
+                return Ok(SearchState {
+                    span: Some(span),
+                    meter,
+                    candidate_scans,
+                    run_scans,
+                });
+            }
+            position = successor
+                .checked_add(1)
+                .expect("a successor candidate before the window end advances once");
+            failed_probes = failed_probes
+                .checked_add(1)
+                .ok_or(Error::CounterOverflow {
+                    counter: "tail-probe",
+                })?;
+            if failed_probes == TAIL_ANCHOR_PROBE_LIMIT {
+                return self.search_forward(
+                    haystack,
+                    window,
+                    position,
+                    shortest_last,
+                    meter,
+                    candidate_scans,
+                    run_scans,
+                );
+            }
         }
         Ok(SearchState {
             span: None,
@@ -569,13 +720,19 @@ impl Plan {
             .end()
             .checked_sub(window.start())
             .expect("the caller validated ordered window bounds");
-        let Some(maximum_tail_width) = owner
-            .total_maximum
-            .checked_sub(owner.runs[0].maximum)
-        else {
-            return false;
+        let maximum_verification_width = if owner.tail_seek.is_some() {
+            owner.total_maximum
+        } else {
+            let Some(width) = owner
+                .total_maximum
+                .checked_sub(owner.runs[0].maximum)
+            else {
+                return false;
+            };
+            width
         };
-        let Some(per_candidate) = maximum_tail_width.checked_add(BYTE_SET_BLOCK_BYTES) else {
+        let Some(per_candidate) = maximum_verification_width.checked_add(BYTE_SET_BLOCK_BYTES)
+        else {
             return false;
         };
         u64::try_from(input_bytes)
@@ -598,14 +755,27 @@ impl Plan {
         if owner.anchored_start {
             return self.search_anchored_value(haystack, window, shortest_last);
         }
+        if owner.tail_seek.is_some() {
+            return self.search_tail_anchored_value(haystack, window, shortest_last);
+        }
+        self.search_forward_value(haystack, window, window.start(), shortest_last)
+    }
+
+    fn search_forward_value(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        mut position: usize,
+        shortest_last: bool,
+    ) -> Option<(usize, usize)> {
+        let owner = self.owner();
         let last_start = window.end().checked_sub(owner.total_minimum)?;
-        if last_start < window.start() {
+        if last_start < position {
             return None;
         }
         let candidate_end = last_start
             .checked_add(1)
             .expect("a last start before the window end advances once");
-        let mut position = window.start();
         while position < candidate_end {
             let Some(run_start) = owner.first_seek.seek_unmetered(
                 haystack,
@@ -645,6 +815,46 @@ impl Plan {
             position = run_end
                 .checked_add(1)
                 .expect("a first-run boundary before the window end advances once");
+        }
+        None
+    }
+
+    fn search_tail_anchored_value(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        shortest_last: bool,
+    ) -> Option<(usize, usize)> {
+        let owner = self.owner();
+        let tail_seek = owner
+            .tail_seek
+            .expect("the tail-anchored path retains its small successor seek");
+        let mut position = window.start().checked_add(owner.runs[0].minimum)?;
+        let mut failed_probes = 0_u64;
+        while position < window.end() {
+            let Some(successor) =
+                tail_seek.seek_unmetered(haystack, position, window.end(), None)
+            else {
+                break;
+            };
+            if let Some(span) = owner.verify_tail_anchor_value(
+                haystack,
+                window.start(),
+                successor,
+                window.end(),
+                shortest_last,
+            ) {
+                return Some(span);
+            }
+            position = successor
+                .checked_add(1)
+                .expect("a successor candidate before the window end advances once");
+            failed_probes = failed_probes
+                .checked_add(1)
+                .expect("the fixed tail-probe budget fits u64");
+            if failed_probes == TAIL_ANCHOR_PROBE_LIMIT {
+                return self.search_forward_value(haystack, window, position, shortest_last);
+            }
         }
         None
     }
@@ -689,10 +899,14 @@ impl Plan {
     ) -> Accounting {
         let input_bytes = window.end() - window.start();
         let owner = self.owner();
-        let maximum_tail_width = owner
-            .total_maximum
-            .saturating_sub(owner.runs[0].maximum);
-        let per_candidate = maximum_tail_width.saturating_add(BYTE_SET_BLOCK_BYTES);
+        let maximum_verification_width = if owner.tail_seek.is_some() {
+            owner.total_maximum
+        } else {
+            owner
+                .total_maximum
+                .saturating_sub(owner.runs[0].maximum)
+        };
+        let per_candidate = maximum_verification_width.saturating_add(BYTE_SET_BLOCK_BYTES);
         let work_upper_bound = u64::try_from(input_bytes)
             .unwrap_or(u64::MAX)
             .saturating_mul(u64::try_from(per_candidate).unwrap_or(u64::MAX));
@@ -712,6 +926,166 @@ impl Plan {
 }
 
 impl Owner {
+    fn verify_tail_anchor_value(
+        &self,
+        haystack: &[u8],
+        window_start: usize,
+        successor: usize,
+        end: usize,
+        shortest_last: bool,
+    ) -> Option<(usize, usize)> {
+        debug_assert!(self.tail_seek.is_some());
+        debug_assert_eq!(self.last_required_run, 2);
+        let first = self.runs[0];
+        let bridge = self.runs[1];
+        debug_assert!(first.minimum != 0);
+        debug_assert_eq!(bridge.minimum, 0);
+        debug_assert!(!first.overlaps(bridge));
+        debug_assert!(!first.overlaps(self.runs[2]));
+        debug_assert!(!bridge.overlaps(self.runs[2]));
+
+        let mut position = successor;
+        let mut consumed = 0_usize;
+        while consumed < bridge.maximum && position > window_start {
+            let previous = position
+                .checked_sub(1)
+                .expect("a reverse bridge cursor after the window start retreats once");
+            if !bridge.contains(haystack[previous]) {
+                break;
+            }
+            position = previous;
+            consumed = consumed
+                .checked_add(1)
+                .expect("one reverse bridge cannot exceed its finite maximum");
+        }
+
+        consumed = 0;
+        while consumed < first.maximum && position > window_start {
+            let previous = position
+                .checked_sub(1)
+                .expect("a reverse first-run cursor after the window start retreats once");
+            if !first.contains(haystack[previous]) {
+                break;
+            }
+            position = previous;
+            consumed = consumed
+                .checked_add(1)
+                .expect("one reverse first run cannot exceed its finite maximum");
+        }
+        if consumed < first.minimum {
+            return None;
+        }
+
+        let mut selected_end = successor
+            .checked_add(1)
+            .expect("a successor before the window end advances once");
+        if shortest_last {
+            return Some((position, selected_end));
+        }
+        for &run in self.runs[..self.run_count].iter().skip(3) {
+            debug_assert_eq!(run.minimum, 0);
+            let mut suffix_consumed = 0_usize;
+            while suffix_consumed < run.maximum && selected_end < end {
+                if !run.contains(haystack[selected_end]) {
+                    break;
+                }
+                selected_end = selected_end
+                    .checked_add(1)
+                    .expect("a nullable suffix cursor before the window end advances once");
+                suffix_consumed = suffix_consumed
+                    .checked_add(1)
+                    .expect("one nullable suffix cannot exceed its finite maximum");
+            }
+        }
+        Some((position, selected_end))
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the reverse verifier receives one immutable window and the shared exact counters"
+    )]
+    fn verify_tail_anchor(
+        &self,
+        haystack: &[u8],
+        window_start: usize,
+        successor: usize,
+        end: usize,
+        shortest_last: bool,
+        meter: &mut WorkMeter,
+        run_scans: &mut u64,
+    ) -> Result<Option<(usize, usize)>, SearchError> {
+        debug_assert!(self.tail_seek.is_some());
+        debug_assert_eq!(self.last_required_run, 2);
+        let first = self.runs[0];
+        let bridge = self.runs[1];
+        debug_assert!(first.minimum != 0);
+        debug_assert_eq!(bridge.minimum, 0);
+        debug_assert!(!first.overlaps(bridge));
+        debug_assert!(!first.overlaps(self.runs[2]));
+        debug_assert!(!bridge.overlaps(self.runs[2]));
+
+        let mut position = successor;
+        let mut consumed = 0_usize;
+        while consumed < bridge.maximum && position > window_start {
+            let previous = position
+                .checked_sub(1)
+                .expect("a reverse bridge cursor after the window start retreats once");
+            meter.charge(1)?;
+            if !bridge.contains(haystack[previous]) {
+                break;
+            }
+            position = previous;
+            consumed = consumed
+                .checked_add(1)
+                .expect("one reverse bridge cannot exceed its finite maximum");
+        }
+
+        consumed = 0;
+        while consumed < first.maximum && position > window_start {
+            let previous = position
+                .checked_sub(1)
+                .expect("a reverse first-run cursor after the window start retreats once");
+            meter.charge(1)?;
+            if !first.contains(haystack[previous]) {
+                break;
+            }
+            position = previous;
+            consumed = consumed
+                .checked_add(1)
+                .expect("one reverse first run cannot exceed its finite maximum");
+        }
+        if consumed < first.minimum {
+            return Ok(None);
+        }
+
+        let mut selected_end = successor
+            .checked_add(1)
+            .expect("a successor before the window end advances once");
+        if shortest_last {
+            return Ok(Some((position, selected_end)));
+        }
+        for &run in self.runs[..self.run_count].iter().skip(3) {
+            debug_assert_eq!(run.minimum, 0);
+            *run_scans = run_scans.checked_add(1).ok_or(Error::CounterOverflow {
+                counter: "run-scan",
+            })?;
+            let mut suffix_consumed = 0_usize;
+            while suffix_consumed < run.maximum && selected_end < end {
+                meter.charge(1)?;
+                if !run.contains(haystack[selected_end]) {
+                    break;
+                }
+                selected_end = selected_end
+                    .checked_add(1)
+                    .expect("a nullable suffix cursor before the window end advances once");
+                suffix_consumed = suffix_consumed
+                    .checked_add(1)
+                    .expect("one nullable suffix cannot exceed its finite maximum");
+            }
+        }
+        Ok(Some((position, selected_end)))
+    }
+
     /// Select one valid split between a nullable greedy class and its
     /// overlapping fixed-width successor. The earliest-end operation chooses
     /// the first valid split; selected-end/span retain regex greediness by
@@ -1017,6 +1391,7 @@ impl Inspection {
             self.total_maximum,
             self.anchored_start,
             self.sealed_bridge,
+            self.tail_seek,
             self.first_seek,
             self.first_run_end_seek,
             self.classifier_words,
@@ -1155,6 +1530,31 @@ pub(crate) fn inspect(
     let first_run_end_seek =
         SetSeek::build(complement, run_end_cardinality, member_classified);
     let run_end_classified = first_run_end_seek.requires_classifier();
+    let tail_seek = if !anchored_start {
+        sealed_bridge.and_then(|bridge| {
+            if bridge.index != 1 || bridge.overlaps_successor {
+                return None;
+            }
+            let successor = runs[2];
+            let successor_cardinality = successor.cardinality();
+            if !(1..=3).contains(&successor_cardinality)
+                || successor_cardinality >= cardinality
+            {
+                return None;
+            }
+            Some((successor, successor_cardinality))
+        })
+    } else {
+        None
+    };
+    let tail_seek = if let Some((successor, successor_cardinality)) = tail_seek {
+        charge_planner(&mut work, LEAF_SELECTION_WORK, max_planner_work)?;
+        let seek = SetSeek::build(successor.words, successor_cardinality, false);
+        debug_assert!(!seek.requires_classifier());
+        Some(seek)
+    } else {
+        None
+    };
     let classifier_words = if member_classified || run_end_classified {
         charge_planner(
             &mut work,
@@ -1177,6 +1577,7 @@ pub(crate) fn inspect(
         total_maximum,
         anchored_start,
         sealed_bridge,
+        tail_seek,
         first_seek,
         first_run_end_seek,
         classifier_words,
@@ -1957,7 +2358,7 @@ mod tests {
     }
 
     #[test]
-    fn sealed_disjoint_bridge_uses_the_sequential_tail_verifier() {
+    fn sealed_disjoint_bridge_uses_the_selective_tail_anchor() {
         let pattern =
             "(?-u:[WZ]){1,3}(?-u:[ab]){0,3}(?-u:[d])(?-u:[xy])?";
         let regex = build(pattern);
@@ -1972,6 +2373,7 @@ mod tests {
                 overlaps_successor: false,
             })
         );
+        assert_eq!(plan.owner().tail_seek, Some(SetSeek::One(b'd')));
 
         for (haystack, expected_start, shortest_end, greedy_end) in [
             (&b"Wd"[..], 0, 2, 2),
@@ -2014,6 +2416,134 @@ mod tests {
             .is_match(b"WWaaaad", SearchLimits::unlimited())
             .unwrap()
             .0);
+    }
+
+    #[test]
+    fn tail_anchor_falls_forward_after_dense_failed_successors() {
+        let pattern = r"(?-u:[\x10-\x17]){1,3}(?-u:[\x40-\x5f]){0,3}(?-u:\x7a)";
+        let regex = build(pattern);
+        let PortablePlan::BoundedByteClassSequence(plan) = &regex.plan else {
+            panic!("one disjoint corridor should retain the sequence plan");
+        };
+        assert_eq!(plan.owner().tail_seek, Some(SetSeek::One(0x7a)));
+
+        let haystack = [
+            vec![0x7a_u8; 9],
+            vec![0x12_u8, 0x16, 0x45, 0x45, 0x7a],
+        ]
+        .concat();
+        let (matched, receipt) = regex
+            .find(&haystack, SearchLimits::unlimited())
+            .expect("the dense-successor fallback should search");
+        assert_eq!(span(matched), Some((9, 14)));
+        let receipt = accounting(receipt);
+        assert!(receipt.candidate_scans > super::TAIL_ANCHOR_PROBE_LIMIT);
+        assert!(receipt.actual_work <= receipt.work_upper_bound);
+        assert_eq!(
+            span(
+                regex
+                    .find_value(&haystack, SearchLimits::unlimited())
+                    .expect("the unmetered dense-successor fallback should search"),
+            ),
+            Some((9, 14)),
+        );
+    }
+
+    #[test]
+    fn tail_anchor_requires_a_smaller_disjoint_successor() {
+        for pattern in [
+            "(?-u:[WZ]){1,16}(?-u:[ab]){0,16}(?-u:[de])",
+            r"(?-u:[\x10-\x17]){1,3}(?-u:[\x40-\x5f]){0,3}(?-u:[\x5a\x7a])",
+            r"\A(?-u:[\x10-\x17]){1,3}(?-u:[\x40-\x5f]){0,3}(?-u:\x7a)",
+        ] {
+            let regex = build(pattern);
+            let PortablePlan::BoundedByteClassSequence(plan) = &regex.plan else {
+                panic!("one bounded corridor should retain the sequence plan");
+            };
+            assert_eq!(plan.owner().tail_seek, None, "{pattern}");
+        }
+    }
+
+    #[test]
+    fn tail_anchor_search_and_construction_limits_are_exact() {
+        let pattern = r"(?-u:[\x10-\x17]){1,3}(?-u:[\x40-\x5f]){0,11}(?-u:\x7a)";
+        let haystack = [
+            vec![0x7a_u8, 0xa0, 0x7a, 0xb0],
+            vec![0x12_u8, 0x16, 0x45, 0x45, 0x45, 0x7a],
+        ]
+        .concat();
+        let regex = build(pattern);
+        let PortablePlan::BoundedByteClassSequence(plan) = &regex.plan else {
+            panic!("one disjoint corridor should retain the sequence plan");
+        };
+        assert_eq!(plan.owner().tail_seek, Some(SetSeek::One(0x7a)));
+
+        let (matched, measured) = regex
+            .find(&haystack, SearchLimits::unlimited())
+            .expect("the tail anchor should search");
+        assert_eq!(span(matched), Some((4, 10)));
+        let measured = accounting(measured);
+        assert!(measured.actual_work > 0);
+        assert!(measured.actual_work <= measured.work_upper_bound);
+
+        let exact_search = SearchLimits {
+            max_work: measured.actual_work,
+            max_scratch_bytes: 0,
+        };
+        let (matched, exact) = regex
+            .find(&haystack, exact_search)
+            .expect("the exact tail-anchor work limit should close");
+        assert_eq!(span(matched), Some((4, 10)));
+        assert_eq!(accounting(exact).actual_work, measured.actual_work);
+
+        let one_below_search = SearchLimits {
+            max_work: measured.actual_work - 1,
+            max_scratch_bytes: 0,
+        };
+        assert!(matches!(
+            regex.find(&haystack, one_below_search),
+            Err(FacadeSearchError::BoundedByteClassSequence(
+                Error::WorkLimit { limit, .. }
+            )) if limit == measured.actual_work - 1
+        ));
+
+        let measured_build = regex.build_report().clone();
+        let mut exact_limits = BuildLimits::default();
+        exact_limits.max_planner_work = measured_build.planner_work;
+        exact_limits.max_persistent_bytes = measured_build.charged_persistent_bytes;
+        let exact = PortableBuilder::new(pattern)
+            .unicode(false)
+            .limits(exact_limits)
+            .build()
+            .expect("the exact tail-anchor build limits should close");
+        assert_eq!(exact.runtime_implementation_id(), PLAN_ID);
+        assert_eq!(exact.build_report().planner_work, measured_build.planner_work);
+        assert_eq!(
+            exact.build_report().charged_persistent_bytes,
+            measured_build.charged_persistent_bytes
+        );
+
+        let mut planner_refusal = exact_limits;
+        planner_refusal.max_planner_work = measured_build.planner_work - 1;
+        assert!(matches!(
+            PortableBuilder::new(pattern)
+                .unicode(false)
+                .limits(planner_refusal)
+                .build(),
+            Err(BuildError::PlannerWorkLimit { limit, .. })
+                if limit == measured_build.planner_work - 1
+        ));
+
+        let mut persistent_refusal = exact_limits;
+        persistent_refusal.max_persistent_bytes = measured_build.charged_persistent_bytes - 1;
+        assert!(matches!(
+            PortableBuilder::new(pattern)
+                .unicode(false)
+                .limits(persistent_refusal)
+                .build(),
+            Err(BuildError::PersistentBytesLimit { limit, .. })
+                if limit == measured_build.charged_persistent_bytes - 1
+        ));
     }
 
     #[test]
