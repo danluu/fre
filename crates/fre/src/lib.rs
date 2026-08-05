@@ -10591,13 +10591,32 @@ impl<'r> PortableSearchSession<'r> {
                         window,
                         limits,
                     ) {
-                        return Ok(plan
-                            .find_exact_delimited(
-                                haystack,
-                                window.start(),
-                                window.end(),
-                            )
-                            .is_some());
+                        match plan.probe_exact_delimited(
+                            haystack,
+                            window.start(),
+                            window.end(),
+                        ) {
+                            correlated_bounded_alternation::ExactDelimitedProbe::Match {
+                                ..
+                            } => return Ok(true),
+                            correlated_bounded_alternation::ExactDelimitedProbe::Exhausted => {
+                                return Ok(false);
+                            }
+                            correlated_bounded_alternation::ExactDelimitedProbe::Fallback {
+                                first_unproved_start,
+                            } => {
+                                return session
+                                    .search_exists_value(
+                                        haystack,
+                                        SearchWindow::new(
+                                            first_unproved_start.min(window.end()),
+                                            window.end(),
+                                        ),
+                                        limits,
+                                    )
+                                    .map_err(SearchError::from);
+                            }
+                        }
                     }
                     if k0_correlated_geometry_allows(
                         session,
@@ -10947,13 +10966,34 @@ impl<'r> PortableSearchSession<'r> {
                         window,
                         limits,
                     ) {
-                        return Ok(plan
-                            .find_exact_delimited(
-                                haystack,
-                                window.start(),
-                                window.end(),
-                            )
-                            .map(|(_, end)| end));
+                        match plan.probe_exact_delimited(
+                            haystack,
+                            window.start(),
+                            window.end(),
+                        ) {
+                            correlated_bounded_alternation::ExactDelimitedProbe::Match {
+                                end,
+                                ..
+                            } => return Ok(Some(end)),
+                            correlated_bounded_alternation::ExactDelimitedProbe::Exhausted => {
+                                return Ok(None);
+                            }
+                            correlated_bounded_alternation::ExactDelimitedProbe::Fallback {
+                                first_unproved_start,
+                            } => {
+                                return session
+                                    .search_window::<EarliestEnd>(
+                                        haystack,
+                                        SearchWindow::new(
+                                            first_unproved_start.min(window.end()),
+                                            window.end(),
+                                        ),
+                                        limits,
+                                    )
+                                    .map(fre_automata::SearchReport::into_output)
+                                    .map_err(SearchError::from);
+                            }
+                        }
                     }
                     if k0_correlated_geometry_allows(
                         session,
@@ -11238,13 +11278,41 @@ impl<'r> PortableSearchSession<'r> {
                         window,
                         limits,
                     ) {
-                        return Ok(plan
-                            .find_exact_delimited(
-                                haystack,
-                                window.start(),
-                                window.end(),
-                            )
-                            .map(|(start, end)| Match { start, end }));
+                        match plan.probe_exact_delimited(
+                            haystack,
+                            window.start(),
+                            window.end(),
+                        ) {
+                            correlated_bounded_alternation::ExactDelimitedProbe::Match {
+                                start,
+                                end,
+                            } => return Ok(Some(Match { start, end })),
+                            correlated_bounded_alternation::ExactDelimitedProbe::Exhausted => {
+                                return Ok(None);
+                            }
+                            correlated_bounded_alternation::ExactDelimitedProbe::Fallback {
+                                first_unproved_start,
+                            } => {
+                                let fallback = SearchWindow::new(
+                                    first_unproved_start.min(window.end()),
+                                    window.end(),
+                                );
+                                let report = if fallback.end() == haystack.len() {
+                                    session.search_span_at_cursor(
+                                        haystack,
+                                        fallback.start(),
+                                        limits,
+                                    )
+                                } else {
+                                    session.search_window::<Span>(haystack, fallback, limits)
+                                }
+                                .map_err(SearchError::from)?;
+                                return Ok(report.into_output().map(|span| Match {
+                                    start: span.start(),
+                                    end: span.end(),
+                                }));
+                            }
+                        }
                     }
                     if k0_correlated_geometry_allows(
                         session,
@@ -15840,6 +15908,66 @@ mod tests {
                 haystack,
             );
         }
+    }
+
+    #[test]
+    fn correlated_delimited_sparse_fallback_preserves_operations_and_window_bounds() {
+        const PATTERN: &str = r"(?-u:(?:ab[bc]*Z|q[de]*Y))";
+        let regex = PortableBuilder::new(PATTERN)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let upstream = regex::bytes::RegexBuilder::new(PATTERN)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+
+        let mut haystack = vec![b'~'; BYTE_SET_BLOCK_BYTES * 6];
+        haystack[1] = b'Z';
+        let late = haystack.len() - 8;
+        haystack[late..late + 6].copy_from_slice(b"qddddY");
+        assert_correlated_delimited_session_matches_upstream(
+            &mut session,
+            &upstream,
+            &haystack,
+        );
+
+        let window = SearchWindow::new(7, haystack.len() - 1);
+        haystack[window.start() + 1] = b'Y';
+        let expected = upstream
+            .find(&haystack[window.start()..window.end()])
+            .map(|matched| Match {
+                start: window.start() + matched.start(),
+                end: window.start() + matched.end(),
+            });
+        let expected_end = upstream
+            .shortest_match(&haystack[window.start()..window.end()])
+            .map(|end| window.start() + end);
+        assert_eq!(
+            session
+                .find_window_value(&haystack, window, SearchLimits::unlimited())
+                .unwrap(),
+            expected,
+        );
+        assert_eq!(
+            session
+                .is_match_window_value(&haystack, window, SearchLimits::unlimited())
+                .unwrap(),
+            expected.is_some(),
+        );
+        assert_eq!(
+            session
+                .shortest_match_window_value(
+                    &haystack,
+                    window,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            expected_end,
+        );
     }
 
     #[test]

@@ -9,8 +9,8 @@
 //! reverse authentication without retaining haystack-dependent state.
 
 use fre_kernels::{
-    BYTE_SET_CLASSIFIER_BUILD_WORK, ByteSet256, ByteSetClassifier, DispatchPolicy,
-    SimdDispatchContext,
+    BYTE_SET_BLOCK_BYTES, BYTE_SET_CLASSIFIER_BUILD_WORK, ByteSet256,
+    ByteSetClassifier, DispatchPolicy, SimdDispatchContext,
 };
 use regex_syntax::hir::{Class, Hir, HirKind};
 
@@ -199,6 +199,13 @@ pub(crate) struct Plan {
     mode: PlanMode,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExactDelimitedProbe {
+    Match { start: usize, end: usize },
+    Exhausted,
+    Fallback { first_unproved_start: usize },
+}
+
 impl Plan {
     pub(crate) fn storage_bytes(&self) -> usize {
         core::mem::size_of::<Self>()
@@ -260,6 +267,7 @@ impl Plan {
     /// each terminal partitions the source: a later match cannot begin before
     /// an already inspected terminal. The first authenticated endpoint is
     /// therefore both the selected leftmost match and the earliest endpoint.
+    #[cfg(test)]
     pub(crate) fn find_exact_delimited(
         &self,
         haystack: &[u8],
@@ -289,6 +297,78 @@ impl Plan {
             position = terminal_position.checked_add(1)?;
         }
         None
+    }
+
+    /// Speculatively search an exact-delimited plan while delimiter density
+    /// continues to justify its dedicated source pass.
+    ///
+    /// One physical byte-set classification block without a delimiter stops
+    /// the sidecar. A rejected delimiter is nevertheless useful progress:
+    /// admission proves that it partitions every branch, so K0 may resume at
+    /// the byte after it without reconsidering an earlier start. This keeps
+    /// absent and sparse-terminal sources on the mature K0 route while dense
+    /// rejection streams retain allocation-free exact authentication.
+    pub(crate) fn probe_exact_delimited(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        end: usize,
+    ) -> ExactDelimitedProbe {
+        let PlanMode::Delimited(plan) = &self.mode
+        else {
+            return ExactDelimitedProbe::Fallback {
+                first_unproved_start: start,
+            };
+        };
+        let minimum_endpoint_offset = plan.minimum_match_bytes.saturating_sub(1);
+        let Some(mut search_position) = start.checked_add(minimum_endpoint_offset) else {
+            return ExactDelimitedProbe::Exhausted;
+        };
+        if search_position >= end {
+            return ExactDelimitedProbe::Exhausted;
+        }
+        let mut first_unproved_start = start;
+        loop {
+            let probe_end = search_position
+                .saturating_add(BYTE_SET_BLOCK_BYTES)
+                .min(end);
+            let Some(terminal_position) =
+                self.seek_terminal(haystack, search_position, probe_end)
+            else {
+                return if probe_end == end {
+                    ExactDelimitedProbe::Exhausted
+                } else {
+                    ExactDelimitedProbe::Fallback {
+                        first_unproved_start,
+                    }
+                };
+            };
+            let branch_index = usize::from(plan.terminal_to_branch[usize::from(
+                haystack[terminal_position],
+            )]);
+            if let Some(branch) = plan.branches.get(branch_index) {
+                if let Some((start, end)) = authenticate_delimited_branch(
+                    branch,
+                    haystack,
+                    first_unproved_start,
+                    terminal_position,
+                ) {
+                    return ExactDelimitedProbe::Match { start, end };
+                }
+            }
+
+            let Some(endpoint) = terminal_position.checked_add(1) else {
+                return ExactDelimitedProbe::Exhausted;
+            };
+            first_unproved_start = endpoint;
+            let Some(next_position) = endpoint.checked_add(minimum_endpoint_offset) else {
+                return ExactDelimitedProbe::Exhausted;
+            };
+            if next_position >= end {
+                return ExactDelimitedProbe::Exhausted;
+            }
+            search_position = next_position;
+        }
     }
 }
 
@@ -1029,8 +1109,10 @@ mod tests {
     use regex_syntax::ParserBuilder;
 
     use super::{
-        InspectionError, InspectionOutcome, Plan, SimdDispatchContext, inspect,
+        ExactDelimitedProbe, InspectionError, InspectionOutcome, Plan,
+        SimdDispatchContext, inspect,
     };
+    use fre_kernels::BYTE_SET_BLOCK_BYTES;
 
     const TARGET: &str = r"(?-u:(?:ab[bc]*Z|q[de]*Y))";
 
@@ -1088,6 +1170,92 @@ mod tests {
             plan.find_exact_delimited(b"xxabbbbbZyy", 3, 11),
             None,
             "a window may not reuse a delimiter before its start",
+        );
+    }
+
+    #[test]
+    fn exact_delimited_probe_falls_back_after_one_empty_physical_block() {
+        let (plan, _) = exact_plan(TARGET);
+        let short_absent = vec![b'~'; BYTE_SET_BLOCK_BYTES];
+        assert_eq!(
+            plan.probe_exact_delimited(&short_absent, 0, short_absent.len()),
+            ExactDelimitedProbe::Exhausted,
+        );
+
+        let long_absent = vec![b'~'; BYTE_SET_BLOCK_BYTES * 4];
+        assert_eq!(
+            plan.probe_exact_delimited(&long_absent, 0, long_absent.len()),
+            ExactDelimitedProbe::Fallback {
+                first_unproved_start: 0,
+            },
+        );
+    }
+
+    #[test]
+    fn exact_delimited_probe_boundary_is_exactly_one_classifier_block() {
+        let (plan, _) = exact_plan(TARGET);
+        let first_terminal = plan.minimum_match_bytes() - 1;
+        let included_terminal = first_terminal + BYTE_SET_BLOCK_BYTES - 1;
+        let mut included = vec![b'~'; included_terminal + 1];
+        included[included_terminal - 2..=included_terminal]
+            .copy_from_slice(b"abZ");
+        assert_eq!(
+            plan.probe_exact_delimited(&included, 0, included.len()),
+            ExactDelimitedProbe::Match {
+                start: included_terminal - 2,
+                end: included_terminal + 1,
+            },
+        );
+
+        let excluded_terminal = first_terminal + BYTE_SET_BLOCK_BYTES;
+        let mut excluded = vec![b'~'; excluded_terminal + 1];
+        excluded[excluded_terminal - 2..=excluded_terminal]
+            .copy_from_slice(b"abZ");
+        assert_eq!(
+            plan.probe_exact_delimited(&excluded, 0, excluded.len()),
+            ExactDelimitedProbe::Fallback {
+                first_unproved_start: 0,
+            },
+        );
+    }
+
+    #[test]
+    fn rejected_terminal_partitions_the_fallback_and_dense_streams_progress() {
+        let (plan, _) = exact_plan(TARGET);
+        let mut sparse = vec![b'~'; BYTE_SET_BLOCK_BYTES * 4];
+        sparse[plan.minimum_match_bytes() - 1] = b'Z';
+        let late = sparse.len() - 4;
+        sparse[late..late + 4].copy_from_slice(b"qddY");
+        assert_eq!(
+            plan.probe_exact_delimited(&sparse, 0, sparse.len()),
+            ExactDelimitedProbe::Fallback {
+                first_unproved_start: plan.minimum_match_bytes(),
+            },
+        );
+
+        let mut two_partitions = vec![b'~'; BYTE_SET_BLOCK_BYTES * 4];
+        let first = plan.minimum_match_bytes() - 1;
+        two_partitions[first] = b'Z';
+        let second_search_start = first + 1 + plan.minimum_match_bytes() - 1;
+        let second = second_search_start + BYTE_SET_BLOCK_BYTES - 1;
+        two_partitions[second] = b'Y';
+        assert_eq!(
+            plan.probe_exact_delimited(
+                &two_partitions,
+                0,
+                two_partitions.len(),
+            ),
+            ExactDelimitedProbe::Fallback {
+                first_unproved_start: second + 1,
+            },
+            "a terminal on the inclusive side of each block boundary advances the proof floor",
+        );
+
+        let dense = vec![b'Z'; BYTE_SET_BLOCK_BYTES * 4];
+        assert_eq!(
+            plan.probe_exact_delimited(&dense, 0, dense.len()),
+            ExactDelimitedProbe::Exhausted,
+            "a delimiter within every physical block keeps making proved progress",
         );
     }
 
