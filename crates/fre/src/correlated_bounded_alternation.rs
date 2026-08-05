@@ -1132,6 +1132,7 @@ mod tests {
         assert_eq!(
             error,
             InspectionError::WorkLimit {
+                actual: exact_work - 1,
                 needed: exact_work,
                 limit: exact_work - 1,
             },
