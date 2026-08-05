@@ -2478,18 +2478,16 @@ impl Plan {
                 self.value_packed_probe_work(window, upper_bounds, limits);
             self.search_window_value_wide(haystack, window, packed_probe_work)
         } else {
-            let packed_probe_work =
-                self.fixed_value_packed_probe_work(window, upper_bounds, limits);
-            self.search_window_value_fixed(haystack, window, packed_probe_work)
+            self.search_window_value_fixed(haystack, window, upper_bounds, limits)
         }
     }
 
-    fn fixed_value_packed_probe_work(
+    fn admit_fixed_value_packed_probe(
         &self,
         window: SearchWindow,
         upper_bounds: SearchUpperBounds,
         limits: SearchLimits,
-    ) -> Option<usize> {
+    ) -> Option<(&PackedLiteralSetPlan, usize, usize, usize)> {
         let packed = self.fixed_packed.as_ref()?;
         let build = packed.build_accounting();
         let coefficient = build.pattern_bytes.checked_add(build.patterns)?;
@@ -2501,7 +2499,12 @@ impl Plan {
         let total_work = upper_bounds.total_work.checked_add(packed_work)?;
         u64::try_from(total_work)
             .is_ok_and(|needed| needed <= limits.max_work)
-            .then_some(packed_work)
+            .then_some((
+                packed.as_ref(),
+                packed_work,
+                build.patterns,
+                build.simd_minimum_haystack_bytes.max(1),
+            ))
     }
 
     fn value_packed_probe_work(
@@ -2565,14 +2568,12 @@ impl Plan {
         &self,
         haystack: &[u8],
         window: SearchWindow,
-        packed_probe_work: Option<usize>,
+        upper_bounds: SearchUpperBounds,
+        limits: SearchLimits,
     ) -> Result<Option<Match>, SearchError> {
         let anchor = &self.anchor;
-        let mut packed = packed_probe_work.and_then(|work| {
-            self.fixed_packed
-                .as_ref()
-                .map(|packed| (packed.as_ref(), work))
-        });
+        let mut packed = None;
+        let mut packed_admission_checked = false;
         let mut rejected_word_work = 0_usize;
         let mut cursor = window.start();
         loop {
@@ -2618,10 +2619,17 @@ impl Plan {
                         }));
                     }
                     cursor = word_end;
-                    if let Some((probe, max_work)) = packed.as_ref().copied() {
-                        let build = probe.build_accounting();
+                    if !packed_admission_checked {
+                        packed = self.admit_fixed_value_packed_probe(
+                            window,
+                            upper_bounds,
+                            limits,
+                        );
+                        packed_admission_checked = true;
+                    }
+                    if let Some((probe, max_work, patterns, service_quantum)) = packed {
                         let comparison_work = usize::try_from(
-                            usize::BITS.checked_sub(build.patterns.leading_zeros()).ok_or(
+                            usize::BITS.checked_sub(patterns.leading_zeros()).ok_or(
                                 SearchError::ArithmeticOverflow {
                                     computation: "fixed packed rejection comparisons",
                                 },
@@ -2642,7 +2650,6 @@ impl Plan {
                             .ok_or(SearchError::ArithmeticOverflow {
                                 computation: "accumulated fixed packed rejection work",
                             })?;
-                        let service_quantum = build.simd_minimum_haystack_bytes.max(1);
                         if rejected_word_work >= service_quantum
                             && window.end().saturating_sub(cursor) >= service_quantum
                         {
@@ -3611,6 +3618,47 @@ mod tests {
         assert!(fallback.fixed_packed.is_none());
         assert_eq!(fallback.plan_id(), PLAN_ID);
         assert_eq!(fallback.storage_bytes(), base_persistent);
+    }
+
+    #[test]
+    fn fixed_packed_probe_admission_closes_at_the_first_rejection() {
+        let plan = plan(&[b"ya", b"yb"]);
+        let Some(packed) = plan.fixed_packed.as_ref() else {
+            return;
+        };
+        let haystack = b"y9!y9!y9!y9!y9!y9!yb!";
+        let window = SearchWindow::full(haystack);
+        let upper = plan.search_upper_bounds(haystack, window).unwrap();
+        let build = packed.build_accounting();
+        let positions = window.end() - window.start() + 1;
+        let packed_work = positions * (build.pattern_bytes + build.patterns);
+        let combined_work = upper.total_work + packed_work;
+        let limits = |work: usize| SearchLimits {
+            max_work: u64::try_from(work).unwrap(),
+            max_scratch_bytes: 0,
+        };
+
+        assert!(
+            plan.admit_fixed_value_packed_probe(
+                window,
+                upper,
+                limits(combined_work - 1),
+            )
+            .is_none(),
+        );
+        let admitted = plan
+            .admit_fixed_value_packed_probe(window, upper, limits(combined_work))
+            .unwrap();
+        assert_eq!(admitted.1, packed_work);
+        assert_eq!(admitted.2, build.patterns);
+        assert_eq!(admitted.3, build.simd_minimum_haystack_bytes.max(1));
+
+        let incumbent_only = limits(upper.total_work);
+        assert_eq!(
+            plan.find_window_value(haystack, window, incumbent_only)
+                .unwrap(),
+            Some(Match { start: 18, end: 20 }),
+        );
     }
 
     #[test]
