@@ -9,8 +9,9 @@
 //! reverse authentication without retaining haystack-dependent state.
 
 use fre_kernels::{
-    BYTE_SET_BLOCK_BYTES, BYTE_SET_CLASSIFIER_BUILD_WORK, ByteSet256,
-    ByteSetClassifier, DispatchPolicy, SimdDispatchContext,
+    BYTE_SET_BLOCK_BYTES, BYTE_SET_CLASSIFIER_BUILD_WORK, BYTE_SET_WIDE_BLOCK_BYTES, ByteSet256,
+    ByteSetClassifier, DispatchPolicy, SimdDispatchContext, classify_byte_set4_16,
+    classify_byte_set4_32,
 };
 use regex_syntax::hir::{Class, Hir, HirKind};
 
@@ -19,17 +20,24 @@ use crate::pure_byte_class_repeat::SetSeek;
 const NODE_INSPECTION_WORK: u64 = 1;
 const LITERAL_BYTE_WORK: u64 = 1;
 const RANGE_INSPECTION_WORK: u64 = 1;
+// One logical terminal insertion publishes every representation required by
+// its inspection route; the exact route includes the bitset, branch map, and
+// compact terminal-member table.
 const TERMINAL_INSERTION_WORK: u64 = 1;
 const ARITHMETIC_WORK: u64 = 1;
 const LEAF_SELECTION_WORK: u64 = 1;
 const SIZE_CLASS_STATES: usize = 4;
 const MAX_BACKOFF_CALLS: u8 = 64;
 const MAX_BRANCH_COUNT: usize = 8;
+const WIDE_TERMINAL_SCANNER_MAX_MEMBERS: usize = 8;
+const _: () = assert!(MAX_BRANCH_COUNT <= WIDE_TERMINAL_SCANNER_MAX_MEMBERS);
 const TERMINAL_WORK_PASSES_PER_BRANCH: usize = 64;
 const MAX_DELIMITED_LITERAL_BYTES: usize = 16;
 const NO_DELIMITED_BRANCH: u8 = u8::MAX;
 const CLASS_MEMBER_INSERTION_WORK: u64 = 1;
 const MEMBERSHIP_PROOF_WORK: u64 = 1;
+// One fixed choice between one and two compile-time-specialized set4 groups.
+const WIDE_TERMINAL_SCANNER_BUILD_WORK: u64 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InspectionError {
@@ -178,8 +186,128 @@ impl DelimitedBranch {
 struct DelimitedPlan {
     branches: [DelimitedBranch; MAX_BRANCH_COUNT],
     terminal_to_branch: [u8; 256],
+    terminal_scanner: DelimitedTerminalScanner,
     minimum_match_bytes: usize,
     branch_count: usize,
+}
+
+/// Immutable exact-terminal scanner local to one delimited plan.
+///
+/// Admission caps the branch and distinct-terminal counts at eight. Four
+/// terminals fit one compile-time-specialized set4 classifier; five through
+/// eight use a second group padded with an already admitted member. Padding
+/// cannot add a false positive, and ORing both masks retains the first source
+/// position in the complete mathematical set.
+#[derive(Clone, Copy, Debug)]
+struct DelimitedTerminalScanner {
+    members: [u8; WIDE_TERMINAL_SCANNER_MAX_MEMBERS],
+}
+
+impl DelimitedTerminalScanner {
+    #[inline]
+    fn seek(
+        &self,
+        haystack: &[u8],
+        position: usize,
+        end: usize,
+        cardinality: usize,
+    ) -> Option<usize> {
+        debug_assert!((4..=WIDE_TERMINAL_SCANNER_MAX_MEMBERS).contains(&cardinality));
+        let bytes = haystack.get(position..end)?;
+        let first = [
+            self.members[0],
+            self.members[1],
+            self.members[2],
+            self.members[3],
+        ];
+        let members = &self.members[..cardinality];
+        if cardinality == 4 {
+            return Self::seek_groups::<false>(bytes, position, first, first, members);
+        }
+        let padding = self.members[0];
+        let second = [
+            self.members[4],
+            if cardinality > 5 {
+                self.members[5]
+            } else {
+                padding
+            },
+            if cardinality > 6 {
+                self.members[6]
+            } else {
+                padding
+            },
+            if cardinality > 7 {
+                self.members[7]
+            } else {
+                padding
+            },
+        ];
+        Self::seek_groups::<true>(bytes, position, first, second, members)
+    }
+
+    #[inline]
+    fn seek_groups<const SECOND_GROUP: bool>(
+        bytes: &[u8],
+        position: usize,
+        first: [u8; 4],
+        second: [u8; 4],
+        members: &[u8],
+    ) -> Option<usize> {
+        let mut scanned = 0_usize;
+        let mut wide_blocks = bytes.chunks_exact(BYTE_SET_WIDE_BLOCK_BYTES);
+        for block in &mut wide_blocks {
+            let block: &[u8; BYTE_SET_WIDE_BLOCK_BYTES] = block
+                .try_into()
+                .expect("an exact wide chunk has the classifier width");
+            let mut member_mask = classify_byte_set4_32(first, block).member_mask();
+            if SECOND_GROUP {
+                member_mask |= classify_byte_set4_32(second, block).member_mask();
+            }
+            if member_mask != 0 {
+                let lane = usize::try_from(member_mask.trailing_zeros())
+                    .expect("a wide classifier lane fits usize");
+                return position
+                    .checked_add(scanned)
+                    .and_then(|block_start| block_start.checked_add(lane));
+            }
+            scanned = scanned
+                .checked_add(BYTE_SET_WIDE_BLOCK_BYTES)
+                .expect("completed wide blocks stay within one slice");
+        }
+
+        let mut narrow_blocks = wide_blocks
+            .remainder()
+            .chunks_exact(BYTE_SET_BLOCK_BYTES);
+        for block in &mut narrow_blocks {
+            let block: &[u8; BYTE_SET_BLOCK_BYTES] = block
+                .try_into()
+                .expect("an exact narrow chunk has the classifier width");
+            let mut member_mask = classify_byte_set4_16(first, block).member_mask();
+            if SECOND_GROUP {
+                member_mask |= classify_byte_set4_16(second, block).member_mask();
+            }
+            if member_mask != 0 {
+                let lane = usize::try_from(member_mask.trailing_zeros())
+                    .expect("a narrow classifier lane fits usize");
+                return position
+                    .checked_add(scanned)
+                    .and_then(|block_start| block_start.checked_add(lane));
+            }
+            scanned = scanned
+                .checked_add(BYTE_SET_BLOCK_BYTES)
+                .expect("completed narrow blocks stay within one slice");
+        }
+
+        for (relative, &byte) in narrow_blocks.remainder().iter().enumerate() {
+            if members.contains(&byte) {
+                return position
+                    .checked_add(scanned)
+                    .and_then(|tail_start| tail_start.checked_add(relative));
+            }
+        }
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -302,12 +430,13 @@ impl Plan {
     /// Speculatively search an exact-delimited plan while delimiter density
     /// continues to justify its dedicated source pass.
     ///
-    /// A memchr-family leaf searches the complete remaining window for its
-    /// first delimiter. Wider range/classified leaves stop after one physical
-    /// classification block without a delimiter. After any rejected delimiter,
-    /// every leaf returns to that one-block continuation rule: admission proves
-    /// that the delimiter partitions every branch, so the extra source pass is
-    /// earned by advancing K0's exact fallback floor past the rejected endpoint.
+    /// A memchr-family leaf or the terminal-local four-to-eight-member scanner
+    /// searches the complete initial remaining window. Continuation calls
+    /// through the shared range/classified leaves still stop after one physical
+    /// classification block. After any rejected delimiter, every leaf returns
+    /// to that one-block continuation rule: admission proves that the delimiter
+    /// partitions every branch, so the extra source pass is earned by advancing
+    /// K0's exact fallback floor past the rejected endpoint.
     pub(crate) fn probe_exact_delimited(
         &self,
         haystack: &[u8],
@@ -327,23 +456,35 @@ impl Plan {
         if search_position >= end {
             return ExactDelimitedProbe::Exhausted;
         }
-        let first_seek_spans_window = matches!(
+        let memchr_seek_spans_window = matches!(
             self.terminal_seek,
             SetSeek::One(_) | SetSeek::Two(_, _) | SetSeek::Three(_, _, _)
         );
+        let wide_seek_spans_window = (4..=WIDE_TERMINAL_SCANNER_MAX_MEMBERS)
+            .contains(&plan.branch_count);
         let mut initial_seek = true;
         let mut first_unproved_start = start;
         loop {
-            let probe_end = if initial_seek && first_seek_spans_window {
+            let probe_end = if initial_seek
+                && (memchr_seek_spans_window || wide_seek_spans_window)
+            {
                 end
             } else {
                 search_position
                     .saturating_add(BYTE_SET_BLOCK_BYTES)
                     .min(end)
             };
-            let Some(terminal_position) =
+            let terminal_position = if initial_seek && wide_seek_spans_window {
+                plan.terminal_scanner.seek(
+                    haystack,
+                    search_position,
+                    probe_end,
+                    plan.branch_count,
+                )
+            } else {
                 self.seek_terminal(haystack, search_position, probe_end)
-            else {
+            };
+            let Some(terminal_position) = terminal_position else {
                 return if probe_end == end {
                     ExactDelimitedProbe::Exhausted
                 } else {
@@ -705,6 +846,7 @@ fn inspect_exact_delimited_alternation(
     let mut inspected = [DelimitedBranch::EMPTY; MAX_BRANCH_COUNT];
     let mut terminal_words = [0_u64; 4];
     let mut terminal_to_branch = [NO_DELIMITED_BRANCH; 256];
+    let mut terminal_members = [0_u8; WIDE_TERMINAL_SCANNER_MAX_MEMBERS];
     let mut minimum_match_bytes = usize::MAX;
     for (branch_index, branch) in branches.iter().enumerate() {
         let Some(branch) = inspect_exact_delimited_branch(
@@ -726,6 +868,7 @@ fn inspect_exact_delimited_alternation(
         }
         terminal_to_branch[terminal_index] = u8::try_from(branch_index)
             .map_err(|_| InspectionError::ArithmeticOverflow)?;
+        terminal_members[branch_index] = terminal;
         let word = usize::from(terminal >> 6);
         let bit = u32::from(terminal & 63);
         terminal_words[word] |= 1_u64 << bit;
@@ -797,12 +940,23 @@ fn inspect_exact_delimited_alternation(
             max_planner_work,
         )?;
     }
+    if (4..=WIDE_TERMINAL_SCANNER_MAX_MEMBERS).contains(&branches.len()) {
+        charge(
+            &mut work,
+            WIDE_TERMINAL_SCANNER_BUILD_WORK,
+            max_planner_work,
+        )?;
+    }
+    let terminal_scanner = DelimitedTerminalScanner {
+        members: terminal_members,
+    };
     Ok(InspectionOutcome::Eligible(Inspection {
         terminal_words,
         terminal_seek,
         mode: InspectionMode::Delimited(DelimitedPlan {
             branches: inspected,
             terminal_to_branch,
+            terminal_scanner,
             minimum_match_bytes,
             branch_count: branches.len(),
         }),
@@ -1123,7 +1277,7 @@ mod tests {
         SimdDispatchContext, inspect,
     };
     use crate::pure_byte_class_repeat::SetSeek;
-    use fre_kernels::BYTE_SET_BLOCK_BYTES;
+    use fre_kernels::{BYTE_SET_BLOCK_BYTES, BYTE_SET_WIDE_BLOCK_BYTES};
 
     const TARGET: &str = r"(?-u:(?:ab[bc]*Z|q[de]*Y))";
     const THREE_TERMINALS: &str = r"(?-u:(?:ab[bc]*Z|q[de]*Y|mn[no]*X))";
@@ -1131,6 +1285,21 @@ mod tests {
         r"(?-u:(?:a[bc]*W|d[ef]*X|g[hi]*Y|j[kl]*Z))";
     const CLASSIFIED_TERMINALS: &str =
         r"(?-u:(?:a[bc]*Q|d[ef]*T|g[hi]*X|j[kl]*Z))";
+    const FIVE_TERMINALS: &str =
+        r"(?-u:(?:a[bc]*Q|d[ef]*T|g[hi]*X|j[kl]*Z|m[no]*V))";
+    const SIX_TERMINALS: &str =
+        r"(?-u:(?:a[bc]*Q|d[ef]*T|g[hi]*X|j[kl]*Z|m[no]*V|p[rs]*U))";
+    const SEVEN_TERMINALS: &str =
+        r"(?-u:(?:a[bc]*Q|d[ef]*T|g[hi]*X|j[kl]*Z|m[no]*V|p[rs]*U|s[uv]*R))";
+    const EIGHT_TERMINALS: &str =
+        r"(?-u:(?:a[bc]*Q|d[ef]*T|g[hi]*X|j[kl]*Z|m[no]*V|p[rs]*U|s[uv]*R|w[xy]*P))";
+    const WIDE_TERMINAL_PATTERNS: [(&str, usize); 5] = [
+        (CLASSIFIED_TERMINALS, 4),
+        (FIVE_TERMINALS, 5),
+        (SIX_TERMINALS, 6),
+        (SEVEN_TERMINALS, 7),
+        (EIGHT_TERMINALS, 8),
+    ];
 
     fn parse(pattern: &str) -> regex_syntax::hir::Hir {
         ParserBuilder::new()
@@ -1220,7 +1389,125 @@ mod tests {
     }
 
     #[test]
-    fn range_and_classified_initial_probes_remain_one_block() {
+    fn terminal_local_wide_scanner_covers_holey_members_blocks_and_tails() {
+        const RELATIVE_POSITIONS: [usize; 13] = [
+            0, 1, 7, 15, 16, 17, 31, 32, 33, 47, 48, 63, 64,
+        ];
+        for (pattern, cardinality) in WIDE_TERMINAL_PATTERNS {
+            let (plan, _) = exact_plan(pattern);
+            let super::PlanMode::Delimited(owner) = &plan.mode else {
+                panic!("wide terminal fixture lost its delimited owner");
+            };
+            assert_eq!(owner.branch_count, cardinality);
+            assert!(matches!(plan.terminal_seek, SetSeek::Classified { .. }));
+            let terminals = &owner.terminal_scanner.members[..cardinality];
+            let arbitrary_nonmembers = (u8::MIN..=u8::MAX)
+                .filter(|byte| !terminals.contains(byte))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                owner.terminal_scanner.seek(
+                    &arbitrary_nonmembers,
+                    0,
+                    arbitrary_nonmembers.len(),
+                    cardinality,
+                ),
+                None,
+                "padding introduced a false arbitrary-byte member; pattern={pattern:?}",
+            );
+
+            for offset in [0_usize, 1, 7, 15, 31] {
+                let absent = vec![b'~'; offset + 80];
+                assert_eq!(
+                    owner.terminal_scanner.seek(
+                        &absent,
+                        offset,
+                        absent.len(),
+                        cardinality,
+                    ),
+                    None,
+                );
+                for (ordinal, &terminal) in terminals.iter().enumerate() {
+                    for relative in RELATIVE_POSITIONS {
+                        let mut source = vec![b'~'; offset + relative + 9];
+                        source[offset + relative] = terminal;
+                        assert_eq!(
+                            owner.terminal_scanner.seek(
+                                &source,
+                                offset,
+                                source.len(),
+                                cardinality,
+                            ),
+                            Some(offset + relative),
+                            "pattern={pattern:?} ordinal={ordinal} offset={offset} relative={relative}",
+                        );
+                    }
+                }
+            }
+
+            let mut earliest = vec![b'~'; BYTE_SET_WIDE_BLOCK_BYTES * 3];
+            earliest[BYTE_SET_WIDE_BLOCK_BYTES + 5] =
+                owner.terminal_scanner.members[cardinality - 1];
+            earliest[BYTE_SET_BLOCK_BYTES - 1] =
+                owner.terminal_scanner.members[0];
+            assert_eq!(
+                owner.terminal_scanner.seek(
+                    &earliest,
+                    0,
+                    earliest.len(),
+                    cardinality,
+                ),
+                Some(BYTE_SET_BLOCK_BYTES - 1),
+                "pattern={pattern:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn four_five_and_eight_holey_terminals_span_absent_late_and_windowed_inputs() {
+        for (pattern, cardinality) in WIDE_TERMINAL_PATTERNS {
+            let (plan, _) = exact_plan(pattern);
+            assert_eq!(plan.branch_count(), cardinality);
+            assert!(matches!(plan.terminal_seek, SetSeek::Classified { .. }));
+
+            let long_absent = vec![b'~'; BYTE_SET_BLOCK_BYTES * 8];
+            assert_eq!(
+                plan.probe_exact_delimited(&long_absent, 0, long_absent.len()),
+                ExactDelimitedProbe::Exhausted,
+                "pattern={pattern:?}",
+            );
+
+            let late_start = BYTE_SET_BLOCK_BYTES * 5 + 3;
+            let mut late = vec![b'~'; late_start + 6 + BYTE_SET_BLOCK_BYTES];
+            late[late_start..late_start + 6].copy_from_slice(b"abbbbQ");
+            assert_eq!(
+                plan.probe_exact_delimited(&late, 0, late.len()),
+                ExactDelimitedProbe::Match {
+                    start: late_start,
+                    end: late_start + 6,
+                },
+                "pattern={pattern:?}",
+            );
+
+            late[0..2].copy_from_slice(b"aQ");
+            let window_start = 7;
+            let window_end = late.len() - 5;
+            assert_eq!(
+                plan.probe_exact_delimited(
+                    &late,
+                    window_start,
+                    window_end,
+                ),
+                ExactDelimitedProbe::Match {
+                    start: late_start,
+                    end: late_start + 6,
+                },
+                "pattern={pattern:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn shared_range_and_classified_continuations_remain_one_block() {
         for (pattern, expected_terminal) in [
             (RANGE_TERMINALS, b'W'),
             (CLASSIFIED_TERMINALS, b'Q'),
@@ -1235,37 +1522,35 @@ mod tests {
             let long_absent = vec![b'~'; BYTE_SET_BLOCK_BYTES * 4];
             assert_eq!(
                 plan.probe_exact_delimited(&long_absent, 0, long_absent.len()),
-                ExactDelimitedProbe::Fallback {
-                    first_unproved_start: 0,
-                },
+                ExactDelimitedProbe::Exhausted,
                 "pattern={pattern:?}",
             );
 
-            let included_terminal = plan.minimum_match_bytes() - 1
-                + BYTE_SET_BLOCK_BYTES - 1;
-            let mut included = vec![b'~'; included_terminal + 1];
-            included[included_terminal - 1] = b'a';
-            included[included_terminal] = expected_terminal;
+            let rejection = plan.minimum_match_bytes() - 1;
+            let mut farther_valid = vec![b'~'; BYTE_SET_BLOCK_BYTES * 5];
+            farther_valid[rejection] = expected_terminal;
+            let farther_start = rejection + BYTE_SET_BLOCK_BYTES * 2;
+            farther_valid[farther_start] = b'a';
+            farther_valid[farther_start + 1] = expected_terminal;
             assert_eq!(
-                plan.probe_exact_delimited(&included, 0, included.len()),
-                ExactDelimitedProbe::Match {
-                    start: included_terminal - 1,
-                    end: included_terminal + 1,
-                },
-                "pattern={pattern:?}",
-            );
-
-            let excluded_terminal = plan.minimum_match_bytes() - 1
-                + BYTE_SET_BLOCK_BYTES;
-            let mut excluded = vec![b'~'; excluded_terminal + 1];
-            excluded[excluded_terminal - 1] = b'a';
-            excluded[excluded_terminal] = expected_terminal;
-            assert_eq!(
-                plan.probe_exact_delimited(&excluded, 0, excluded.len()),
+                plan.probe_exact_delimited(
+                    &farther_valid,
+                    0,
+                    farther_valid.len(),
+                ),
                 ExactDelimitedProbe::Fallback {
-                    first_unproved_start: 0,
+                    first_unproved_start: rejection + 1,
                 },
-                "pattern={pattern:?}",
+                "a rejected initial terminal must not widen the shared continuation; pattern={pattern:?}",
+            );
+            assert_eq!(
+                plan.seek_terminal(
+                    &farther_valid,
+                    rejection + plan.minimum_match_bytes(),
+                    farther_valid.len(),
+                ),
+                Some(farther_start + 1),
+                "the unchanged shared seek still finds the later terminal when given the full range; pattern={pattern:?}",
             );
         }
     }
@@ -1341,6 +1626,48 @@ mod tests {
     }
 
     #[test]
+    fn wide_terminal_rejection_earns_exactly_one_shared_block() {
+        for (pattern, _) in WIDE_TERMINAL_PATTERNS {
+            let (plan, _) = exact_plan(pattern);
+            let far_rejection = BYTE_SET_BLOCK_BYTES * 4 + 3;
+            let mut nearby_valid = vec![b'~'; BYTE_SET_BLOCK_BYTES * 9];
+            nearby_valid[far_rejection] = b'Q';
+            let nearby_start = far_rejection + 7;
+            nearby_valid[nearby_start..nearby_start + 6]
+                .copy_from_slice(b"abbbbQ");
+            assert_eq!(
+                plan.probe_exact_delimited(
+                    &nearby_valid,
+                    0,
+                    nearby_valid.len(),
+                ),
+                ExactDelimitedProbe::Match {
+                    start: nearby_start,
+                    end: nearby_start + 6,
+                },
+                "the rejected wide-set terminal earns its immediately following block; pattern={pattern:?}",
+            );
+
+            let mut farther_valid = vec![b'~'; BYTE_SET_BLOCK_BYTES * 9];
+            farther_valid[far_rejection] = b'Q';
+            let farther_start = far_rejection + BYTE_SET_BLOCK_BYTES * 2;
+            farther_valid[farther_start..farther_start + 6]
+                .copy_from_slice(b"abbbbQ");
+            assert_eq!(
+                plan.probe_exact_delimited(
+                    &farther_valid,
+                    0,
+                    farther_valid.len(),
+                ),
+                ExactDelimitedProbe::Fallback {
+                    first_unproved_start: far_rejection + 1,
+                },
+                "a rejection must not grant the wide-set scanner another whole-window pass; pattern={pattern:?}",
+            );
+        }
+    }
+
+    #[test]
     fn one_minimum_excludes_the_left_literal_class_tail() {
         let (plan, _) = exact_plan(r"(?-u:(?:ab[bc]+Z|q[de]+Y))");
         assert_eq!(plan.find_exact_delimited(b"abZ~qY", 0, 6), None);
@@ -1372,16 +1699,49 @@ mod tests {
 
     #[test]
     fn planner_work_and_fixed_storage_are_exact_boundaries() {
-        let hir = parse(TARGET);
-        let (plan, exact_work) = exact_plan(TARGET);
         assert_eq!(
-            inspection_storage_bytes(TARGET),
-            plan.storage_bytes(),
+            core::mem::size_of::<super::DelimitedTerminalScanner>(),
+            super::WIDE_TERMINAL_SCANNER_MAX_MEMBERS,
         );
-        assert_eq!(
-            plan.storage_bytes(),
-            core::mem::size_of_val(&plan) + core::mem::size_of::<super::DelimitedPlan>(),
-        );
+        for pattern in [
+            TARGET,
+            CLASSIFIED_TERMINALS,
+            FIVE_TERMINALS,
+            EIGHT_TERMINALS,
+        ] {
+            let hir = parse(pattern);
+            let (plan, exact_work) = exact_plan(pattern);
+            assert_eq!(
+                inspection_storage_bytes(pattern),
+                plan.storage_bytes(),
+                "pattern={pattern:?}",
+            );
+            assert_eq!(
+                plan.storage_bytes(),
+                core::mem::size_of_val(&plan)
+                    + core::mem::size_of::<super::DelimitedPlan>(),
+                "pattern={pattern:?}",
+            );
+            assert!(matches!(
+                inspect(&hir, 0, exact_work).unwrap(),
+                InspectionOutcome::Eligible(_),
+            ));
+            let error = match inspect(&hir, 0, exact_work - 1) {
+                Err(error) => error,
+                Ok(_) => panic!(
+                    "one-below planner work unexpectedly succeeded: {pattern:?}"
+                ),
+            };
+            assert_eq!(
+                error,
+                InspectionError::WorkLimit {
+                    actual: exact_work - 1,
+                    needed: exact_work,
+                    limit: exact_work - 1,
+                },
+                "pattern={pattern:?}",
+            );
+        }
 
         let bounded = parse(
             r"(?-u:\x10(?:\x70[\x30\x31]{0,16}\x60|\x71[\x36\x37]{1,16}\x61))",
@@ -1397,23 +1757,6 @@ mod tests {
             .unwrap();
         assert_eq!(bounded_storage_bytes, bounded.storage_bytes());
         assert_eq!(bounded.storage_bytes(), core::mem::size_of::<Plan>());
-
-        assert!(matches!(
-            inspect(&hir, 0, exact_work).unwrap(),
-            InspectionOutcome::Eligible(_),
-        ));
-        let error = match inspect(&hir, 0, exact_work - 1) {
-            Err(error) => error,
-            Ok(_) => panic!("one-below planner work unexpectedly succeeded"),
-        };
-        assert_eq!(
-            error,
-            InspectionError::WorkLimit {
-                actual: exact_work - 1,
-                needed: exact_work,
-                limit: exact_work - 1,
-            },
-        );
     }
 
     #[test]

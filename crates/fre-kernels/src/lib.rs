@@ -19,10 +19,11 @@ pub use fre_simd_kernels::{
     ASCII_RUN_SCANNER_BUILD_WORK, ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier,
     AsciiByteSetNonMemberScanner, AsciiByteSetRunScanner, AsciiNonMemberRunResult, AsciiSelection,
     AsciiWordSpaceClassifier, AsciiWordSpaceMasks16, AsciiWordSpaceMasks32, BYTE_SET_BLOCK_BYTES,
-    BYTE_PAIR_BARRIER_GROUP_BYTES, BYTE_SET_CLASSIFIER_BUILD_WORK, BytePairBarrierScan,
-    BytePairBarrierScanner, ByteSet256, ByteSetClassifier, DispatchPolicy, DispatchProfile, Feature,
-    FeatureSet, SelectionReceipt, SimdDispatchContext, TuningClass, UnsupportedRequiredFeatures,
-    VectorKind, classify_byte_delta_16, dispatch_profile,
+    BYTE_PAIR_BARRIER_GROUP_BYTES, BYTE_SET_CLASSIFIER_BUILD_WORK, BYTE_SET_WIDE_BLOCK_BYTES,
+    BytePairBarrierScan, BytePairBarrierScanner, ByteSet256, ByteSetClassifier, DispatchPolicy,
+    DispatchProfile, Feature, FeatureSet, SelectionReceipt, SimdDispatchContext, TuningClass,
+    UnsupportedRequiredFeatures, VectorKind, classify_byte_delta_16, classify_byte_set4_16,
+    classify_byte_set4_32, dispatch_profile,
 };
 
 mod anchored_line_capture;
