@@ -57,7 +57,7 @@ use core::{fmt, mem::size_of};
 use fre_exact_alloc::CopyError;
 use fre_simd_kernels::{
     ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD, ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier,
-    AsciiByteSetRunScanner, DispatchPolicy, Feature, SimdDispatchContext,
+    AsciiByteSetRunScanner, DispatchPolicy, Feature, SimdDispatchContext, VectorKind,
 };
 use memchr::memmem::{Finder, FinderBuilder};
 
@@ -794,7 +794,7 @@ enum BoundedAnchorScoreMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BoundedAnchorSelection {
     preferred: Anchor,
-    strict_repetition: Option<Anchor>,
+    strict_full_width_repetition: Option<Anchor>,
 }
 
 #[derive(Debug)]
@@ -836,13 +836,12 @@ pub struct LiteralClassRunSearchPlan {
 /// suffix starts and conversely. The lower-frequency barrier can therefore
 /// drive every projection, and its first accepted candidate is both the
 /// selected match and the earliest end without replay or source-derived
-/// retained state. Equal-frequency barriers are ordered by the exact
-/// repetition factor proved by an immutable bounded prefix sample. If the
-/// retained literal has width `n` and the sample has primitive period `p`,
-/// full-literal occurrences are at least `p` bytes apart and can each
-/// re-service `n` Finder bytes. Thus `n/p` conservatively bounds repeated
-/// verification even beyond the sample. The smaller factor wins; literal
-/// width remains the final tie-breaker when the exact factors are equal.
+/// retained state. Equal-frequency barriers retain the established bounded-
+/// sample repetition preference: for literal width `n` and sampled primitive
+/// period `p`, the smaller `n/p` factor wins. This is a routing heuristic when
+/// either literal exceeds the sample; it becomes a strict native-admission
+/// proof only when the sample covers both complete literals. Literal width
+/// remains the final tie-breaker when the sampled factors are equal.
 #[derive(Debug)]
 pub struct BoundedLiteralClassRunPlan {
     prefix: Finder<'static>,
@@ -3850,7 +3849,7 @@ impl BoundedLiteralClassRunPlan {
                     suffix.len(),
                     maximum,
                     selection,
-                    ascii_scanner.is_some(),
+                    bounded_ascii_scanner_has_vector(ascii_scanner.as_ref()),
                 )? {
                     return Ok(None);
                 }
@@ -4559,6 +4558,7 @@ impl BoundedLiteralClassRunPlan {
     }
 }
 
+#[cfg(test)]
 fn bounded_preferred_anchor(
     prefix: &[u8],
     suffix: &[u8],
@@ -4582,7 +4582,7 @@ fn bounded_anchor_selection(
     let prefix_frequency = bounded_anchor_frequency_score(prefix, work)?;
     let suffix_frequency = bounded_anchor_frequency_score(suffix, work)?;
     let frequency_order = suffix_frequency.cmp(&prefix_frequency);
-    let strict_repetition = if frequency_order == core::cmp::Ordering::Equal
+    let sampled_repetition = if frequency_order == core::cmp::Ordering::Equal
         || mode == BoundedAnchorScoreMode::AdmissionProof
     {
         bounded_repetition_preference(prefix, suffix, work)?
@@ -4592,7 +4592,7 @@ fn bounded_anchor_selection(
     let preferred = match frequency_order {
         core::cmp::Ordering::Less => Anchor::Suffix,
         core::cmp::Ordering::Greater => Anchor::Prefix,
-        core::cmp::Ordering::Equal => match strict_repetition {
+        core::cmp::Ordering::Equal => match sampled_repetition {
             Some(anchor) => anchor,
             None => {
                 work.charge(1)?;
@@ -4604,9 +4604,16 @@ fn bounded_anchor_selection(
             }
         },
     };
+    let strict_full_width_repetition = if prefix.len() <= usize::from(u8::MAX)
+        && suffix.len() <= usize::from(u8::MAX)
+    {
+        sampled_repetition
+    } else {
+        None
+    };
     Ok(BoundedAnchorSelection {
         preferred,
-        strict_repetition,
+        strict_full_width_repetition,
     })
 }
 
@@ -4650,15 +4657,15 @@ fn bounded_native_cost_admitted(
     suffix_width: usize,
     maximum: usize,
     selection: BoundedAnchorSelection,
-    has_ascii_scanner: bool,
+    has_vector_scanner: bool,
 ) -> Result<bool, BuildError> {
     // A strictly less repetitive chosen anchor is sufficient on its own.
     // Otherwise, require enough bounded-run service to amortize one sustained
     // wide scan; prefix routing also pays the opposite suffix verification.
-    if selection.strict_repetition == Some(selection.preferred) {
+    if selection.strict_full_width_repetition == Some(selection.preferred) {
         return Ok(true);
     }
-    if !has_ascii_scanner {
+    if !has_vector_scanner {
         return Ok(false);
     }
     let horizon = maximum.checked_add(1).unwrap_or(usize::MAX);
@@ -4681,6 +4688,15 @@ fn bounded_native_cost_admitted(
             unreachable!("finite direct anchor is unguarded")
         }
     }
+}
+
+fn bounded_ascii_scanner_has_vector(scanner: Option<&AsciiClassScanner>) -> bool {
+    let vector = match scanner {
+        Some(AsciiClassScanner::Fixed(classifier)) => classifier.selection().wide().vector,
+        Some(AsciiClassScanner::Run(scanner)) => scanner.selection().vector,
+        None => return false,
+    };
+    !matches!(vector, VectorKind::Scalar)
 }
 
 fn bounded_anchor_frequency_score(
@@ -6624,6 +6640,25 @@ mod tests {
     const ASCII_WORD_RANGES: [(u8, u8); 4] =
         [(b'0', b'9'), (b'A', b'Z'), (b'_', b'_'), (b'a', b'z')];
 
+    fn bounded_test_auto_scanner_has_vector() -> bool {
+        let dispatch = SimdDispatchContext::capture();
+        let set = AsciiByteSet::from_words([1_u64 << u32::from(b'0'), 0]);
+        let scanner = if dispatch.capabilities().usable().contains(Feature::ArmSve) {
+            AsciiClassScanner::Run(
+                dispatch
+                    .ascii_byte_set_run_scanner(set, DispatchPolicy::Auto)
+                    .unwrap(),
+            )
+        } else {
+            AsciiClassScanner::Fixed(
+                dispatch
+                    .ascii_byte_set_classifier(set, DispatchPolicy::Auto)
+                    .unwrap(),
+            )
+        };
+        bounded_ascii_scanner_has_vector(Some(&scanner))
+    }
+
     fn plan() -> LiteralClassRunLiteralPlan {
         LiteralClassRunLiteralPlan::build(
             b"ab",
@@ -7827,11 +7862,11 @@ mod tests {
     fn bounded_native_cost_gate_uses_direction_horizon_opposite_and_strict_period() {
         let prefix = BoundedAnchorSelection {
             preferred: Anchor::Prefix,
-            strict_repetition: None,
+            strict_full_width_repetition: None,
         };
         let suffix = BoundedAnchorSelection {
             preferred: Anchor::Suffix,
-            strict_repetition: None,
+            strict_full_width_repetition: None,
         };
         let sustained = 2 * ASCII_WIDE_BYTES;
         assert!(!bounded_native_cost_admitted(1, sustained - 2, suffix, true).unwrap());
@@ -7861,10 +7896,118 @@ mod tests {
         for anchor in [Anchor::Prefix, Anchor::Suffix] {
             let strict = BoundedAnchorSelection {
                 preferred: anchor,
-                strict_repetition: Some(anchor),
+                strict_full_width_repetition: Some(anchor),
             };
             assert!(bounded_native_cost_admitted(usize::MAX, 0, strict, false).unwrap());
         }
+    }
+
+    #[test]
+    fn bounded_native_cost_gate_reads_actual_and_static_vector_receipts() {
+        let set = AsciiByteSet::from_words([1_u64 << u32::from(b'0'), 0]);
+        let fixed = AsciiClassScanner::Fixed(AsciiByteSetClassifier::new(set));
+        let run = AsciiClassScanner::Run(AsciiByteSetRunScanner::new(set));
+        // In compiler-static profiles these public accessors reconstruct the
+        // compiler-fixed receipts rather than reading retained runtime fields.
+        for scanner in [&fixed, &run] {
+            let expected = match scanner {
+                AsciiClassScanner::Fixed(classifier) => {
+                    !matches!(classifier.selection().wide().vector, VectorKind::Scalar)
+                }
+                AsciiClassScanner::Run(scanner) => {
+                    !matches!(scanner.selection().vector, VectorKind::Scalar)
+                }
+            };
+            assert_eq!(bounded_ascii_scanner_has_vector(Some(scanner)), expected);
+        }
+        assert!(!bounded_ascii_scanner_has_vector(None));
+    }
+
+    #[test]
+    #[cfg(not(feature = "static-dispatch"))]
+    fn bounded_native_cost_gate_rejects_retained_scalar_scanners() {
+        let set = AsciiByteSet::from_words([1_u64 << u32::from(b'0'), 0]);
+        let fixed = AsciiClassScanner::Fixed(
+            AsciiByteSetClassifier::with_policy(set, DispatchPolicy::Portable).unwrap(),
+        );
+        let run = AsciiClassScanner::Run(
+            AsciiByteSetRunScanner::with_policy(set, DispatchPolicy::Portable).unwrap(),
+        );
+        let selection = BoundedAnchorSelection {
+            preferred: Anchor::Suffix,
+            strict_full_width_repetition: None,
+        };
+        for scanner in [&fixed, &run] {
+            assert!(!bounded_ascii_scanner_has_vector(Some(scanner)));
+            assert!(!bounded_native_cost_admitted(
+                1,
+                usize::MAX,
+                selection,
+                bounded_ascii_scanner_has_vector(Some(scanner)),
+            )
+            .unwrap());
+        }
+    }
+
+    #[test]
+    fn bounded_sampled_period_cannot_override_horizon_past_its_proof_width() {
+        let mut unbordered_sample = vec![b'a'; usize::from(u8::MAX)];
+        unbordered_sample[0] = b'Q';
+        unbordered_sample[1] = b'Z';
+        let mut prefix = unbordered_sample.clone();
+        prefix.extend_from_slice(&unbordered_sample);
+
+        let mut suffix = Vec::with_capacity(usize::from(u8::MAX) + 1);
+        for index in 0..usize::from(u8::MAX) {
+            suffix.push(if index & 1 == 0 { b'Q' } else { b'Z' });
+        }
+        suffix.push(b'U');
+
+        let mut actual = DirectBuildAttemptActual::default();
+        let mut work = BuildWork::new(usize::MAX, &mut actual);
+        assert_eq!(
+            bounded_preferred_anchor(&prefix, &suffix, &mut work).unwrap(),
+            Anchor::Prefix,
+            "legacy preference still uses the bounded sample"
+        );
+
+        let mut actual = DirectBuildAttemptActual::default();
+        let mut work = BuildWork::new(usize::MAX, &mut actual);
+        let selection = bounded_anchor_selection(
+            &prefix,
+            &suffix,
+            &mut work,
+            BoundedAnchorScoreMode::AdmissionProof,
+        )
+        .unwrap();
+        assert_eq!(selection.preferred, Anchor::Prefix);
+        assert_eq!(selection.strict_full_width_repetition, None);
+
+        let mut actual = DirectBuildAttemptActual::default();
+        let mut work = BuildWork::new(usize::MAX, &mut actual);
+        let full_prefix_period = bounded_sample_primitive_period(&prefix, &mut work).unwrap();
+        let full_suffix_period = bounded_sample_primitive_period(&suffix, &mut work).unwrap();
+        assert_eq!(full_prefix_period, usize::from(u8::MAX));
+        assert_eq!(full_suffix_period, usize::from(u8::MAX) + 1);
+        assert!(
+            suffix.len() * full_prefix_period < prefix.len() * full_suffix_period,
+            "the bytes beyond the sample invert the full-width preference"
+        );
+        assert!(!bounded_native_cost_admitted(1, 0, selection, true).unwrap());
+
+        assert!(
+            BoundedLiteralClassRunPlan::build_with_dispatch_if_admitted(
+                SimdDispatchContext::capture(),
+                &prefix,
+                [(b'0', b'0')].into_iter(),
+                &suffix,
+                0,
+                0,
+                BuildLimits::unlimited(),
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[test]
@@ -7884,6 +8027,7 @@ mod tests {
                 limits,
             )
         };
+        let has_vector_scanner = bounded_test_auto_scanner_has_vector();
 
         let prefix_selected = b"Q\x92";
         assert!(ascii(
@@ -7894,15 +8038,17 @@ mod tests {
         )
         .unwrap()
         .is_none());
-        let admitted = ascii(
+        let threshold_plan = ascii(
             prefix_selected,
             b"U",
             2 * ASCII_WIDE_BYTES,
             BuildLimits::unlimited(),
         )
-        .unwrap()
-        .expect("one-byte verification fits after the sustained scan horizon");
-        assert_eq!(admitted.preferred_anchor, Anchor::Prefix);
+        .unwrap();
+        assert_eq!(threshold_plan.is_some(), has_vector_scanner);
+        if let Some(plan) = threshold_plan {
+            assert_eq!(plan.preferred_anchor, Anchor::Prefix);
+        }
 
         let wide_unbordered_suffix = b"abaaaabb";
         assert!(ascii(
@@ -7913,14 +8059,17 @@ mod tests {
         )
         .unwrap()
         .is_none());
-        assert!(ascii(
-            b"QZ",
-            wide_unbordered_suffix,
-            2 * ASCII_WIDE_BYTES + wide_unbordered_suffix.len() - 1,
-            BuildLimits::unlimited(),
-        )
-        .unwrap()
-        .is_some());
+        assert_eq!(
+            ascii(
+                b"QZ",
+                wide_unbordered_suffix,
+                2 * ASCII_WIDE_BYTES + wide_unbordered_suffix.len() - 1,
+                BuildLimits::unlimited(),
+            )
+            .unwrap()
+            .is_some(),
+            has_vector_scanner
+        );
 
         let unbordered_prefix = b"abaaaabb";
         assert!(ascii(
@@ -7931,15 +8080,17 @@ mod tests {
         )
         .unwrap()
         .is_none());
-        let suffix_admitted = ascii(
+        let suffix_threshold_plan = ascii(
             unbordered_prefix,
             b"QZ",
             2 * ASCII_WIDE_BYTES - 1,
             BuildLimits::unlimited(),
         )
-        .unwrap()
-        .expect("suffix routing reaches the sustained scan horizon");
-        assert_eq!(suffix_admitted.preferred_anchor, Anchor::Suffix);
+        .unwrap();
+        assert_eq!(suffix_threshold_plan.is_some(), has_vector_scanner);
+        if let Some(plan) = suffix_threshold_plan {
+            assert_eq!(plan.preferred_anchor, Anchor::Suffix);
+        }
 
         for (prefix, suffix, expected_anchor) in [
             (b"QZ".as_slice(), b"aaaaaaaa".as_slice(), Anchor::Prefix),
@@ -7977,6 +8128,16 @@ mod tests {
             .expect("strict repetition improvement does not require SIMD");
         assert_eq!(strict_without_ascii_scanner.preferred_anchor, Anchor::Prefix);
 
+        let exact_prefix = b"QZ";
+        let exact_suffix = b"aaaaaaaa";
+        let admitted = ascii(
+            exact_prefix,
+            exact_suffix,
+            0,
+            BuildLimits::unlimited(),
+        )
+        .unwrap()
+        .expect("strict repetition improvement provides an architecture-neutral receipt");
         let baseline = admitted.build_accounting();
         let exact = BuildLimits {
             max_literal_bytes: baseline.literal_bytes,
@@ -7987,7 +8148,7 @@ mod tests {
             max_persistent_bytes: baseline.persistent_bytes,
             max_peak_bytes: baseline.peak_bytes,
         };
-        assert!(ascii(prefix_selected, b"U", 2 * ASCII_WIDE_BYTES, exact)
+        assert!(ascii(exact_prefix, exact_suffix, 0, exact)
             .unwrap()
             .is_some());
         let below = BuildLimits {
@@ -7995,7 +8156,7 @@ mod tests {
             ..exact
         };
         assert!(matches!(
-            ascii(prefix_selected, b"U", 2 * ASCII_WIDE_BYTES, below),
+            ascii(exact_prefix, exact_suffix, 0, below),
             Err(BuildError::WorkLimit { needed, limit })
                 if needed == baseline.work_upper_bound
                     && limit == baseline.work_upper_bound - 1

@@ -3299,6 +3299,26 @@ pub struct PortableBuilder {
     pure_byte_class_repeat_allowed: bool,
 }
 
+fn try_box_bounded_literal_class_run_owner(
+    plan: BoundedLiteralClassRunPlan,
+    allocate: impl FnOnce(
+        BoundedLiteralClassRunPlan,
+    ) -> Result<
+        Box<BoundedLiteralClassRunPlan>,
+        (fre_exact_alloc::CopyError, BoundedLiteralClassRunPlan),
+    >,
+) -> Result<Box<BoundedLiteralClassRunPlan>, BuildError> {
+    allocate(plan).map_err(|(error, _)| match error {
+        fre_exact_alloc::CopyError::LayoutOverflow => BuildError::InternalInvariant(
+            "bounded literal/class-run search owner layout overflowed",
+        ),
+        fre_exact_alloc::CopyError::AllocationFailed => BuildError::AllocationFailed {
+            structure: "bounded literal/class-run search owner",
+            additional: 1,
+        },
+    })
+}
+
 impl PortableBuilder {
     /// Start from pinned Rust-regex defaults. Because the current lowerer has
     /// no Unicode-class compiler, callers commonly select [`Self::unicode`]
@@ -4908,39 +4928,41 @@ impl PortableBuilder {
                 .map_err(BuildError::LiteralClassRunLiteral)?;
             if let Some(plan) = plan {
                 let build = plan.build_accounting();
-                if let Ok(plan) = fre_exact_alloc::try_box_preserve(plan) {
-                    return Ok(PortableRegex {
-                        source,
-                        capture_names,
-                        line_total_grep_plan,
-                        plan: PortablePlan::BoundedLiteralClassRun(plan),
+                let plan = try_box_bounded_literal_class_run_owner(
+                    plan,
+                    fre_exact_alloc::try_box_preserve,
+                )?;
+                return Ok(PortableRegex {
+                    source,
+                    capture_names,
+                    line_total_grep_plan,
+                    plan: PortablePlan::BoundedLiteralClassRun(plan),
+                    profile: profile.clone(),
+                    limits: self.limits,
+                    selection: self.selection,
+                    report: BuildReport {
                         profile: profile.clone(),
-                        limits: self.limits,
-                        selection: self.selection,
-                        report: BuildReport {
-                            profile: profile.clone(),
-                            admission,
-                            syntax,
-                            plan: PlanKind::LiteralClassRunLiteral,
-                            planner_work: fallback_planner_work,
-                            lowering: None,
-                            states: 0,
-                            edges: 0,
-                            plan_storage_bytes: build.persistent_bytes,
-                            source_storage_bytes,
-                            capture_name_storage_bytes,
-                            charged_persistent_bytes: 0,
-                            persistent_byte_limit: 0,
-                            captures_len,
-                            static_captures_len,
-                            minimum_match_bytes,
-                            required_literal: None,
-                            literal_class_run_literal: Some(build),
-                            forward_anchored: None,
-                        }
-                        .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
-                    });
-                }
+                        admission,
+                        syntax,
+                        plan: PlanKind::LiteralClassRunLiteral,
+                        planner_work: fallback_planner_work,
+                        lowering: None,
+                        states: 0,
+                        edges: 0,
+                        plan_storage_bytes: build.persistent_bytes,
+                        source_storage_bytes,
+                        capture_name_storage_bytes,
+                        charged_persistent_bytes: 0,
+                        persistent_byte_limit: 0,
+                        captures_len,
+                        static_captures_len,
+                        minimum_match_bytes,
+                        required_literal: None,
+                        literal_class_run_literal: Some(build),
+                        forward_anchored: None,
+                    }
+                    .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
+                });
             }
         }
         let lowered = fre_lower::lower_raw(
@@ -11772,7 +11794,8 @@ mod tests {
         K0NegativePrefilterOutcome, Match, OperationSemantics, PlanKind, PlanSelection,
         PortableBuilder, PortableFindIterAccounting, PortableFindIterError, PortableFindIterLimits,
         PortableFindIterRunLimits, PortablePlan, PortableRegex, SearchAccounting, SearchError,
-        SearchLimits, SearchSessionLimits, SearchWindow, PortableSearchSessionPlan,
+        PortableSearchSessionPlan, SearchLimits, SearchSessionLimits, SearchWindow,
+        SimdDispatchContext,
         K0NegativePrefilterClassState, K0NegativePrefilterState,
         K0_NEGATIVE_PREFILTER_MAX_DISABLED_CALLS,
         K0_MANDATORY_CUT_BYTE_ENUMERATION_WORK, K0_MANDATORY_CUT_CARDINALITY_WORK,
@@ -11786,12 +11809,37 @@ mod tests {
         run_k0_finite_prefix_exists_hedge, run_k0_finite_prefix_span_hedge,
         run_k0_negative_prefilter, select_k0_finite_suffix_direct_route,
         select_k0_finite_suffix_route, try_build_k0_mandatory_cut,
-        try_k0_mandatory_suffix_span_start, BYTE_SET_BLOCK_BYTES,
+        try_box_bounded_literal_class_run_owner, try_k0_mandatory_suffix_span_start,
+        BYTE_SET_BLOCK_BYTES,
     };
     use fre_automata::{MandatoryCutAnalysisLimits, MaximumConsumedDistance};
-    use fre_kernels::FixedPredicateWord64SearchCursor;
+    use fre_kernels::{BoundedLiteralClassRunPlan, FixedPredicateWord64SearchCursor};
     use fre_lower::UnsupportedFeature;
     use std::fmt::Write as _;
+
+    fn finite_two_barrier_has_vector_scanner() -> bool {
+        let dispatch = SimdDispatchContext::capture();
+        let set = fre_kernels::AsciiByteSet::from_words([1_u64 << u32::from(b'0'), 0]);
+        let vector = if dispatch
+            .capabilities()
+            .usable()
+            .contains(fre_kernels::Feature::ArmSve)
+        {
+            dispatch
+                .ascii_byte_set_run_scanner(set, fre_kernels::DispatchPolicy::Auto)
+                .unwrap()
+                .selection()
+                .vector
+        } else {
+            dispatch
+                .ascii_byte_set_classifier(set, fre_kernels::DispatchPolicy::Auto)
+                .unwrap()
+                .selection()
+                .wide()
+                .vector
+        };
+        !matches!(vector, fre_kernels::VectorKind::Scalar)
+    }
 
     fn lowered_k0_mandatory_cut(
         pattern: &str,
@@ -13473,7 +13521,7 @@ mod tests {
 
     #[test]
     fn finite_two_barrier_route_matches_upstream_across_facade_projections() {
-        let pattern = r"ab[01]{0,64}xy";
+        let pattern = r"QZ[01]{0,64}aa";
         let regex = PortableBuilder::new(pattern)
             .unicode(false)
             .build()
@@ -13491,15 +13539,15 @@ mod tests {
             .unicode(false)
             .build()
             .unwrap();
-        let mut long = b"--ab".to_vec();
+        let mut long = b"--QZ".to_vec();
         long.extend(core::iter::repeat_n(b'0', 63));
-        long.extend_from_slice(b"xy--");
+        long.extend_from_slice(b"aa--");
         for haystack in [
             b"".as_slice(),
-            b"abxy",
-            b"--ab01xy--",
-            b"ab2xy--ab0xy",
-            b"abab01xy--abxy",
+            b"QZaa",
+            b"--QZ01aa--",
+            b"QZ2aa--QZ0aa",
+            b"QZQZ01aa--QZaa",
             long.as_slice(),
         ] {
             let expected_iter: Vec<_> = upstream
@@ -13579,11 +13627,12 @@ mod tests {
 
     #[test]
     fn finite_two_barrier_native_cost_gate_declines_to_k0_at_exact_boundaries() {
+        let vector = finite_two_barrier_has_vector_scanner();
         for (pattern, native) in [
             (r"Q\x92[0]{0,63}U", false),
-            (r"Q\x92[0]{0,64}U", true),
+            (r"Q\x92[0]{0,64}U", vector),
             (r"abaaaabb[0]{0,62}QZ", false),
-            (r"abaaaabb[0]{0,63}QZ", true),
+            (r"abaaaabb[0]{0,63}QZ", vector),
             (r"QZ[0]{0,64}abaaaabb", false),
             (r"QZ[0]{0,4}aaaaaaaa", true),
             (r"aaaaaaaa[0]{0,4}QZ", true),
@@ -13660,8 +13709,45 @@ mod tests {
     }
 
     #[test]
+    fn finite_two_barrier_owner_failures_are_fatal() {
+        for source in [
+            fre_exact_alloc::CopyError::LayoutOverflow,
+            fre_exact_alloc::CopyError::AllocationFailed,
+        ] {
+            let plan = BoundedLiteralClassRunPlan::build(
+                b"ab",
+                [(b'0', b'0')].into_iter(),
+                b"xy",
+                0,
+                64,
+                fre_kernels::LiteralClassRunLiteralBuildLimits::unlimited(),
+            )
+            .unwrap();
+            let error = try_box_bounded_literal_class_run_owner(plan, |plan| {
+                Err((source, plan))
+            })
+            .unwrap_err();
+            match source {
+                fre_exact_alloc::CopyError::LayoutOverflow => assert!(matches!(
+                    error,
+                    BuildError::InternalInvariant(
+                        "bounded literal/class-run search owner layout overflowed"
+                    )
+                )),
+                fre_exact_alloc::CopyError::AllocationFailed => assert!(matches!(
+                    error,
+                    BuildError::AllocationFailed {
+                        structure: "bounded literal/class-run search owner",
+                        additional: 1,
+                    }
+                )),
+            }
+        }
+    }
+
+    #[test]
     fn finite_two_barrier_route_enforces_exact_build_and_search_boundaries() {
-        let pattern = r"ab[01]{0,64}xy";
+        let pattern = r"QZ[01]{0,64}aa";
         let baseline = PortableBuilder::new(pattern)
             .unicode(false)
             .build()
@@ -13753,11 +13839,11 @@ mod tests {
 
     #[test]
     fn finite_two_barrier_sessions_retain_no_cross_plan_or_same_address_state() {
-        let first = PortableBuilder::new(r"ab[01]{0,64}xy")
+        let first = PortableBuilder::new(r"QZ[01]{0,64}aa")
             .unicode(false)
             .build()
             .unwrap();
-        let second = PortableBuilder::new(r"cd[23]{1,64}uv")
+        let second = PortableBuilder::new(r"QZ[23]{1,64}aa")
             .unicode(false)
             .build()
             .unwrap();
@@ -13775,7 +13861,7 @@ mod tests {
         let mut second_session = second
             .search_session(SearchSessionLimits::unlimited())
             .unwrap();
-        let mut same_allocation = b"--ab01xy--".to_vec();
+        let mut same_allocation = b"--QZ01aa--".to_vec();
         assert_eq!(
             first_session
                 .find_value(&same_allocation, SearchLimits::unlimited())
@@ -13783,7 +13869,7 @@ mod tests {
                 .map(|matched| (matched.start(), matched.end())),
             Some((2, 8))
         );
-        same_allocation.copy_from_slice(b"--cd23uv--");
+        same_allocation.copy_from_slice(b"--QZ23aa--");
         assert_eq!(
             second_session
                 .find_value(&same_allocation, SearchLimits::unlimited())
@@ -13797,7 +13883,7 @@ mod tests {
                 .unwrap(),
             None
         );
-        same_allocation.copy_from_slice(b"--ab00xy--");
+        same_allocation.copy_from_slice(b"--QZ00aa--");
         assert_eq!(
             first_session
                 .find_value(&same_allocation, SearchLimits::unlimited())
