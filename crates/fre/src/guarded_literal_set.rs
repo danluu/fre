@@ -217,14 +217,18 @@ const WIDE_CORRELATED_MIN_WORD_BYTES: usize = 5;
 const WIDE_CORRELATED_MAX_WORD_BYTES: usize = 32;
 const WIDE_CORRELATED_MAX_PATTERNS: usize = u64::BITS as usize;
 const WIDE_ASCII_BYTES: usize = 128;
+const WIDE_CORRELATED_BOUNDARY_COLUMNS: usize = 2;
+const WIDE_CORRELATED_DIRECT_EXACT_MAX_CANDIDATES: u32 = 2;
 const ONE_BYTE_SCALAR_PREFIX_BYTES: usize = 8;
 const ONE_BYTE_SCALAR_MEMBER_LIMIT: u32 = 4;
 #[cfg(target_arch = "aarch64")]
 const ONE_BYTE_DENSE_REJECTION_WORDS: usize = 4;
 #[cfg(target_arch = "aarch64")]
 const ONE_BYTE_DENSE_REJECTION_BYTES: usize = 64;
-const ASCII_WORD_SET_WORDS: [u64; 2] =
-    [0x03ff_0000_0000_0000, 0x07ff_fffe_87ff_fffe];
+const ASCII_WORD_MEMBERS: AsciiByteSet = AsciiByteSet::from_words([
+    0x03ff_0000_0000_0000,
+    0x07ff_fffe_87ff_fffe,
+]);
 
 #[derive(Clone, Copy, Debug)]
 struct WideColumn {
@@ -243,6 +247,7 @@ struct CorrelatedColumns {
     pattern_mask: u64,
     verification_order: [u8; WIDE_CORRELATED_MAX_WORD_BYTES],
     columns: Box<[CorrelatedColumn]>,
+    word_members: AsciiByteSetClassifier,
 }
 
 impl CorrelatedColumns {
@@ -291,6 +296,63 @@ impl CorrelatedColumns {
             }
         }
         true
+    }
+
+    fn fixed_word_boundary_candidates_32(
+        &self,
+        haystack: &[u8],
+        position: usize,
+        word_bytes: usize,
+        mut candidates: u32,
+    ) -> Option<u32> {
+        if candidates == 0 {
+            return Some(0);
+        }
+
+        let left_word_mask = if position == 0 {
+            let block_end = position.checked_add(ASCII_WIDE_BYTES)?;
+            let block: &[u8; ASCII_WIDE_BYTES] =
+                haystack.get(position..block_end)?.try_into().ok()?;
+            self.word_members.classify_32(block).member_mask() << 1
+        } else {
+            let block_start = position.checked_sub(1)?;
+            let block_end = block_start.checked_add(ASCII_WIDE_BYTES)?;
+            let block: &[u8; ASCII_WIDE_BYTES] =
+                haystack.get(block_start..block_end)?.try_into().ok()?;
+            self.word_members.classify_32(block).member_mask()
+        };
+        candidates &= !left_word_mask;
+        if candidates == 0 {
+            return Some(0);
+        }
+
+        let block_start = position.checked_add(word_bytes)?;
+        let remaining = haystack.len().checked_sub(block_start)?;
+        let right_word_mask = if remaining >= ASCII_WIDE_BYTES {
+            let block_end = block_start.checked_add(ASCII_WIDE_BYTES)?;
+            let block: &[u8; ASCII_WIDE_BYTES] =
+                haystack.get(block_start..block_end)?.try_into().ok()?;
+            self.word_members.classify_32(block).member_mask()
+        } else {
+            // A complete 32-start block has at least 31 real right-context
+            // bytes. When its final word ends at the haystack end, classify
+            // one byte to the left and shift that lane away. The new high lane
+            // is zero, exactly representing the synthetic nonword context at
+            // `haystack.len()`.
+            if remaining != ASCII_WIDE_BYTES.saturating_sub(1) {
+                return None;
+            }
+            let shifted_start = block_start.checked_sub(1)?;
+            let shifted_end = shifted_start.checked_add(ASCII_WIDE_BYTES)?;
+            let shifted: &[u8; ASCII_WIDE_BYTES] =
+                haystack.get(shifted_start..shifted_end)?.try_into().ok()?;
+            self.word_members.classify_32(shifted).member_mask() >> 1
+        };
+        Some(candidates & !right_word_mask)
+    }
+
+    fn should_filter_secondary_columns(candidates: u32) -> bool {
+        candidates.count_ones() > WIDE_CORRELATED_DIRECT_EXACT_MAX_CANDIDATES
     }
 
     fn sample_has_packed_prefix_candidates(
@@ -378,7 +440,7 @@ enum SingleBytePrimary {
 
 impl SingleByteWordSet {
     fn complete_word_set(&self) -> bool {
-        self.members.set().words() == ASCII_WORD_SET_WORDS
+        self.members.set() == ASCII_WORD_MEMBERS
     }
 
     fn block_context_work(haystack: &[u8], position: usize, lanes: usize) -> usize {
@@ -1140,18 +1202,30 @@ impl WideByteAnchor {
             let primary: &[u8; ASCII_WIDE_BYTES] =
                 haystack.get(primary_start..primary_end)?.try_into().ok()?;
             let mut candidates = self.members.classify_32(primary).member_mask();
-            for column in self.secondary_columns.iter().flatten() {
-                let block_start = position.checked_add(column.offset)?;
-                let block_end = block_start.checked_add(ASCII_WIDE_BYTES)?;
-                let block: &[u8; ASCII_WIDE_BYTES] =
-                    haystack.get(block_start..block_end)?.try_into().ok()?;
-                let classifier = column
-                    .classifier
-                    .as_ref()
-                    .expect("a published secondary column retains its classifier");
-                candidates &= classifier.classify_32(block).member_mask();
-                if candidates == 0 {
-                    break;
+            candidates = correlated.fixed_word_boundary_candidates_32(
+                haystack,
+                position,
+                word_bytes,
+                candidates,
+            )?;
+            // Once exact whole-word boundaries compact a block to at most two
+            // starts, direct identity checks are bounded by 64 column reads.
+            // Four 32-lane marginal filters would do twice that logical work
+            // and cannot distinguish cross-pattern byte recombinations.
+            if CorrelatedColumns::should_filter_secondary_columns(candidates) {
+                for column in self.secondary_columns.iter().flatten() {
+                    let block_start = position.checked_add(column.offset)?;
+                    let block_end = block_start.checked_add(ASCII_WIDE_BYTES)?;
+                    let block: &[u8; ASCII_WIDE_BYTES] =
+                        haystack.get(block_start..block_end)?.try_into().ok()?;
+                    let classifier = column
+                        .classifier
+                        .as_ref()
+                        .expect("a published secondary column retains its classifier");
+                    candidates &= classifier.classify_32(block).member_mask();
+                    if candidates == 0 {
+                        break;
+                    }
                 }
             }
             if candidates != 0 {
@@ -1159,11 +1233,7 @@ impl WideByteAnchor {
                     let relative = usize::try_from(candidates.trailing_zeros()).ok()?;
                     let start = position.checked_add(relative)?;
                     let end = start.checked_add(word_bytes)?;
-                    let possible_boundaries = (start == 0
-                        || !is_ascii_word(*haystack.get(start.checked_sub(1)?)?))
-                        && (end == haystack.len()
-                            || !is_ascii_word(*haystack.get(end)?));
-                    if possible_boundaries && correlated.matches(haystack.get(start..end)?) {
+                    if correlated.matches(haystack.get(start..end)?) {
                         return Some(start);
                     }
                     candidates &= candidates.checked_sub(1)?;
@@ -1620,7 +1690,8 @@ fn correlated_columns_dimensions(
     }
     // Each column initializes and scores 128 buckets, records every source
     // pattern, and performs at most `word_bytes` insertion comparisons plus
-    // two moves per comparison. The final term records the pattern mask.
+    // two moves per comparison. The final terms record the pattern mask and
+    // compile the exact ASCII-word boundary classifier.
     let per_column_work = WIDE_ASCII_BYTES
         .checked_mul(2)
         .and_then(|work| work.checked_add(patterns))
@@ -1631,6 +1702,7 @@ fn correlated_columns_dimensions(
     let initialization_work = per_column_work
         .checked_mul(word_bytes)
         .and_then(|work| work.checked_add(patterns))
+        .and_then(|work| work.checked_add(ASCII_CLASSIFIER_BUILD_WORK))
         .ok_or(PackedLiteralSetError::ArithmeticOverflow {
             computation: "guarded correlated-column construction work",
         })?;
@@ -1647,6 +1719,7 @@ fn build_correlated_columns(
     dictionary: &Dictionary,
     patterns: usize,
     word_bytes: usize,
+    word_members: AsciiByteSetClassifier,
 ) -> CorrelatedColumns {
     let mut columns = Vec::with_capacity(word_bytes);
     let mut verification_order = [0_u8; WIDE_CORRELATED_MAX_WORD_BYTES];
@@ -1691,6 +1764,7 @@ fn build_correlated_columns(
         pattern_mask,
         verification_order,
         columns: columns.into_boxed_slice(),
+        word_members,
     }
 }
 
@@ -1885,10 +1959,7 @@ impl Plan {
                         "automatic one-byte member dispatch retains a scalar fallback",
                     );
                 let word_classifier = dispatch
-                    .ascii_byte_set_classifier(
-                        AsciiByteSet::from_words(ASCII_WORD_SET_WORDS),
-                        DispatchPolicy::Auto,
-                    )
+                    .ascii_byte_set_classifier(ASCII_WORD_MEMBERS, DispatchPolicy::Auto)
                     .expect("automatic ASCII-word dispatch retains a scalar fallback");
                 #[cfg(target_arch = "aarch64")]
                 let candidate_nonmember_scanner = dispatch
@@ -1897,7 +1968,7 @@ impl Plan {
                 #[cfg(target_arch = "aarch64")]
                 let word_run_scanner = dispatch
                     .ascii_byte_set_run_scanner(
-                        AsciiByteSet::from_words(ASCII_WORD_SET_WORDS),
+                        ASCII_WORD_MEMBERS,
                         DispatchPolicy::Auto,
                     )
                     .expect("automatic ASCII-word run dispatch retains a scalar fallback");
@@ -2059,7 +2130,17 @@ impl Plan {
                     let admitted_build =
                         retained_bytes.is_some_and(|bytes| bytes <= limits.max_build_bytes);
                     (admitted_work && admitted_persistent && admitted_build).then(|| {
-                        Box::new(build_correlated_columns(&dictionary, patterns, word_bytes))
+                        let word_members = dispatch
+                            .ascii_byte_set_classifier(ASCII_WORD_MEMBERS, DispatchPolicy::Auto)
+                            .expect(
+                                "automatic ASCII-word dispatch retains a scalar fallback",
+                            );
+                        Box::new(build_correlated_columns(
+                            &dictionary,
+                            patterns,
+                            word_bytes,
+                            word_members,
+                        ))
                     })
                 } else {
                     None
@@ -2324,10 +2405,22 @@ impl Plan {
         let secondary_work = upper_bounds
             .anchor_positions
             .checked_mul(WIDE_SECONDARY_COLUMN_LIMIT)?;
+        let boundary_work = if self
+            .wide_anchor
+            .as_ref()
+            .is_some_and(|wide| wide.correlated_columns.is_some())
+        {
+            upper_bounds
+                .anchor_positions
+                .checked_mul(WIDE_CORRELATED_BOUNDARY_COLUMNS)?
+        } else {
+            0
+        };
         let Some(total) = packed_work
             .checked_add(upper_bounds.total_work)
             .and_then(|work| work.checked_add(rejection_sample_work))
             .and_then(|work| work.checked_add(secondary_work))
+            .and_then(|work| work.checked_add(boundary_work))
         else {
             return None;
         };
@@ -3126,7 +3219,8 @@ mod tests {
     use core::mem::size_of;
 
     use super::{
-        ONE_BYTE_PLAN_ID, PLAN_ID, PackedProbeResult, Plan, SearchError, SingleByteWordSet,
+        ASCII_WIDE_BYTES, CorrelatedColumns, ONE_BYTE_PLAN_ID, PLAN_ID, PackedProbeResult,
+        Plan, SearchError, SingleByteWordSet, WIDE_CORRELATED_BOUNDARY_COLUMNS,
         WIDE_PACKED_PLAN_ID, WIDE_PACKED_PREFIX_BYTES, WIDE_RANKED_COLUMN_LIMIT,
         WIDE_REJECTION_PACKED_PROBE_BYTES, WIDE_SECONDARY_COLUMN_LIMIT, WideByteAnchor,
         WideFindResult, correlated_columns_dimensions, extraction_limits,
@@ -3750,6 +3844,139 @@ mod tests {
         assert_eq!(
             wide.find_correlated_start(b"!pppppx!aaaaa!", 0, 14, plan.anchor.offset, 5),
             Some(8),
+        );
+    }
+
+    #[test]
+    fn correlated_boundary_candidates_match_scalar_real_context() {
+        let words: &[&[u8]] = &[
+            b"aaaaa", b"bbbbb", b"ccccc", b"ddddd", b"eeeee", b"fffff", b"ggggg",
+            b"hhhhh", b"iiiii", b"jjjjj", b"kkkkk", b"lllll", b"mmmmm", b"nnnnn",
+            b"ooooo", b"ppppp",
+        ];
+        let plan = plan(words);
+        let correlated = plan
+            .wide_anchor
+            .as_ref()
+            .and_then(|wide| wide.correlated_columns.as_ref())
+            .unwrap();
+        for byte in u8::MIN..=u8::MAX {
+            assert_eq!(
+                correlated.word_members.set().contains(byte),
+                super::is_ascii_word(byte),
+            );
+        }
+        let haystack = (0_usize..38)
+            .map(|index| match index % 6 {
+                0 => b'a',
+                1 => b'!',
+                2 => 0x80,
+                3 => b'_',
+                4 => b'9',
+                _ => 0xff,
+            })
+            .collect::<Vec<_>>();
+
+        for (position, initial) in [(0_usize, u32::MAX), (2, 0xa5a5_5a5a)] {
+            let mut expected = 0_u32;
+            for lane in 0..ASCII_WIDE_BYTES {
+                let lane_bit = 1_u32 << u32::try_from(lane).unwrap();
+                if initial & lane_bit == 0 {
+                    continue;
+                }
+                let start = position + lane;
+                let end = start + 5;
+                let left = start == 0 || !super::is_ascii_word(haystack[start - 1]);
+                let right = end == haystack.len() || !super::is_ascii_word(haystack[end]);
+                if left && right {
+                    expected |= lane_bit;
+                }
+            }
+            assert_eq!(
+                correlated.fixed_word_boundary_candidates_32(
+                    &haystack,
+                    position,
+                    5,
+                    initial,
+                ),
+                Some(expected),
+            );
+        }
+
+        assert!(!CorrelatedColumns::should_filter_secondary_columns(0));
+        assert!(!CorrelatedColumns::should_filter_secondary_columns(0b11));
+        assert!(CorrelatedColumns::should_filter_secondary_columns(0b111));
+    }
+
+    #[test]
+    fn correlated_boundary_scan_uses_context_outside_the_window() {
+        let words: &[&[u8]] = &[
+            b"aaaaa", b"bbbbb", b"ccccc", b"ddddd", b"eeeee", b"fffff", b"ggggg",
+            b"hhhhh", b"iiiii", b"jjjjj", b"kkkkk", b"lllll", b"mmmmm", b"nnnnn",
+            b"ooooo", b"ppppp",
+        ];
+        let plan = plan(words);
+        let wide = plan.wide_anchor.as_ref().unwrap();
+        let mut haystack = vec![b'!'; 96];
+        haystack[31..36].copy_from_slice(b"ppppp");
+
+        haystack[30] = 0x80;
+        haystack[36] = 0xff;
+        assert_eq!(
+            wide.find_correlated_start(&haystack, 0, 36, plan.anchor.offset, 5),
+            Some(31),
+        );
+
+        haystack[36] = b'x';
+        assert_eq!(
+            wide.find_correlated_start(&haystack, 0, 36, plan.anchor.offset, 5),
+            None,
+        );
+        haystack[36] = 0xff;
+        haystack[30] = b'x';
+        assert_eq!(
+            wide.find_correlated_start(&haystack, 0, 36, plan.anchor.offset, 5),
+            None,
+        );
+    }
+
+    #[test]
+    fn correlated_boundary_work_is_admitted_exactly() {
+        let words: &[&[u8]] = &[
+            b"aaaaa", b"bbbbb", b"ccccc", b"ddddd", b"eeeee", b"fffff", b"ggggg",
+            b"hhhhh", b"iiiii", b"jjjjj", b"kkkkk", b"lllll", b"mmmmm", b"nnnnn",
+            b"ooooo", b"ppppp",
+        ];
+        let plan = plan(words);
+        let wide = plan.wide_anchor.as_ref().unwrap();
+        let haystack = vec![b'!'; 256];
+        let window = SearchWindow::full(&haystack);
+        let upper = plan.search_upper_bounds(&haystack, window).unwrap();
+        let packed_build = wide.packed.build_accounting();
+        let positions = window.end() - window.start() + 1;
+        let packed_work = positions * (packed_build.pattern_bytes + packed_build.patterns);
+        let sample_work = (window.end() - window.start())
+            .min(WIDE_CORRELATED_SAMPLE_BYTES)
+            * (WIDE_PACKED_PREFIX_BYTES + 3);
+        let secondary_work = upper.anchor_positions * WIDE_SECONDARY_COLUMN_LIMIT;
+        let boundary_work = upper.anchor_positions * WIDE_CORRELATED_BOUNDARY_COLUMNS;
+        let threshold = upper.total_work
+            + packed_work
+            + sample_work
+            + secondary_work
+            + boundary_work;
+        let limits = |work: usize| SearchLimits {
+            max_work: u64::try_from(work).unwrap(),
+            max_scratch_bytes: 0,
+        };
+
+        assert_eq!(
+            plan.value_packed_probe_work(window, upper, limits(threshold)),
+            Some(packed_work),
+        );
+        assert_eq!(
+            plan.value_packed_probe_work(window, upper, limits(threshold - 1)),
+            None,
         );
     }
 
