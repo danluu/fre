@@ -69,7 +69,6 @@ mod anchored_word_capture;
 mod blocking_delimiter;
 mod bounded_byte_class_sequence;
 mod bounded_byte_class_repeat;
-mod bounded_literal_class_run;
 mod bounded_literal_pair;
 mod bounded_word_class;
 mod capture_absolute_full;
@@ -3975,6 +3974,7 @@ impl PortableBuilder {
             return Err(BuildError::RequiredLiteralShape);
         }
         let mut literal_class_run_work = required_work;
+        let mut deferred_bounded_literal_class_run = None;
         if self.selection == PlanSelection::Auto {
             let remaining = self
                 .limits
@@ -4004,7 +4004,10 @@ impl PortableBuilder {
                 literal_class_run_literal::InspectionOutcome::Eligible(inspection) => {
                     inspection.work
                 }
-                literal_class_run_literal::InspectionOutcome::Ineligible { work } => work,
+                literal_class_run_literal::InspectionOutcome::Ineligible { work, finite } => {
+                    deferred_bounded_literal_class_run = finite;
+                    work
+                }
             };
             literal_class_run_work = required_work
                 .checked_add(u64::try_from(inspection_work).map_err(|_| {
@@ -4896,65 +4899,46 @@ impl PortableBuilder {
         // This exact finite two-barrier language is deliberately last among
         // native plans. It replaces only an otherwise-generic K0 lowering;
         // every established direct specialization above retains precedence.
-        if self.selection == PlanSelection::Auto {
-            let inspection = bounded_literal_class_run::inspect(
-                &rust.hir,
-                fallback_planner_work,
-                self.limits.max_planner_work,
-            )
-            .map_err(|error| match error {
-                bounded_literal_class_run::InspectionError::WorkLimit { needed, limit } => {
-                    BuildError::PlannerWorkLimit { needed, limit }
-                }
-                bounded_literal_class_run::InspectionError::ArithmeticOverflow => {
-                    BuildError::InternalInvariant(
-                        "bounded literal/class-run inspection accounting overflowed",
-                    )
-                }
-            })?;
-            fallback_planner_work = inspection.planner_work();
-            if let bounded_literal_class_run::InspectionOutcome::Eligible(inspection) = inspection
-            {
-                let plan = inspection
-                    .build(
-                        SimdDispatchContext::capture(),
-                        self.limits.literal_class_run_literal,
-                    )
-                    .map_err(BuildError::LiteralClassRunLiteral)?;
-                let build = plan.build_accounting();
-                if let Ok(plan) = fre_exact_alloc::try_box_preserve(plan) {
-                    return Ok(PortableRegex {
-                        source,
-                        capture_names,
-                        line_total_grep_plan,
-                        plan: PortablePlan::BoundedLiteralClassRun(plan),
+        if let Some(inspection) = deferred_bounded_literal_class_run {
+            let plan = inspection
+                .build(
+                    SimdDispatchContext::capture(),
+                    self.limits.literal_class_run_literal,
+                )
+                .map_err(BuildError::LiteralClassRunLiteral)?;
+            let build = plan.build_accounting();
+            if let Ok(plan) = fre_exact_alloc::try_box_preserve(plan) {
+                return Ok(PortableRegex {
+                    source,
+                    capture_names,
+                    line_total_grep_plan,
+                    plan: PortablePlan::BoundedLiteralClassRun(plan),
+                    profile: profile.clone(),
+                    limits: self.limits,
+                    selection: self.selection,
+                    report: BuildReport {
                         profile: profile.clone(),
-                        limits: self.limits,
-                        selection: self.selection,
-                        report: BuildReport {
-                            profile: profile.clone(),
-                            admission,
-                            syntax,
-                            plan: PlanKind::LiteralClassRunLiteral,
-                            planner_work: fallback_planner_work,
-                            lowering: None,
-                            states: 0,
-                            edges: 0,
-                            plan_storage_bytes: build.persistent_bytes,
-                            source_storage_bytes,
-                            capture_name_storage_bytes,
-                            charged_persistent_bytes: 0,
-                            persistent_byte_limit: 0,
-                            captures_len,
-                            static_captures_len,
-                            minimum_match_bytes,
-                            required_literal: None,
-                            literal_class_run_literal: Some(build),
-                            forward_anchored: None,
-                        }
-                        .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
-                    });
-                }
+                        admission,
+                        syntax,
+                        plan: PlanKind::LiteralClassRunLiteral,
+                        planner_work: fallback_planner_work,
+                        lowering: None,
+                        states: 0,
+                        edges: 0,
+                        plan_storage_bytes: build.persistent_bytes,
+                        source_storage_bytes,
+                        capture_name_storage_bytes,
+                        charged_persistent_bytes: 0,
+                        persistent_byte_limit: 0,
+                        captures_len,
+                        static_captures_len,
+                        minimum_match_bytes,
+                        required_literal: None,
+                        literal_class_run_literal: Some(build),
+                        forward_anchored: None,
+                    }
+                    .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
+                });
             }
         }
         let lowered = fre_lower::lower_raw(
@@ -5931,13 +5915,13 @@ impl PortableRegex {
                 ))
             }
             PortablePlan::BoundedLiteralClassRun(plan) => {
-                let (matched, accounting) = plan.shortest_window(
+                let (matched, accounting) = plan.is_match_window(
                     haystack,
                     LiteralWindow::new(window.start(), window.end()),
                     literal_class_run_literal_limits(limits),
                 )?;
                 Ok((
-                    matched.is_some(),
+                    matched,
                     SearchAccounting::LiteralClassRunLiteral(accounting),
                 ))
             }
@@ -13737,6 +13721,64 @@ mod tests {
                 .map(|matched| (matched.start(), matched.end())),
             Some((2, 8))
         );
+    }
+
+    #[test]
+    fn finite_two_barrier_exists_routes_share_limits_in_native_sessions() {
+        for (pattern, haystack) in [
+            (
+                r"QZ[0-9]{0,64}aa",
+                b"--QZ12aa".as_slice(),
+            ),
+            (
+                r"aa[0-9]{0,64}QZ",
+                b"--aa12QZ".as_slice(),
+            ),
+        ] {
+            let regex = PortableBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            assert!(matches!(
+                &regex.plan,
+                PortablePlan::BoundedLiteralClassRun(_)
+            ));
+            let (matched, accounting) = regex
+                .is_match(haystack, SearchLimits::unlimited())
+                .unwrap();
+            assert!(matched);
+            let SearchAccounting::LiteralClassRunLiteral(accounting) = accounting else {
+                panic!("finite existence returned another accounting family");
+            };
+            let exact_work = u64::try_from(accounting.work).unwrap();
+            let exact = SearchLimits {
+                max_work: exact_work,
+                max_scratch_bytes: 0,
+            };
+            assert!(regex.is_match(haystack, exact).unwrap().0);
+            assert!(regex.is_match_value(haystack, exact).unwrap());
+
+            let mut session = regex
+                .search_session(SearchSessionLimits::unlimited())
+                .unwrap();
+            assert!(session.is_match(haystack, exact).unwrap().0);
+            assert!(session.is_match_value(haystack, exact).unwrap());
+
+            let one_below = SearchLimits {
+                max_work: exact_work - 1,
+                max_scratch_bytes: 0,
+            };
+            assert_eq!(
+                regex.is_match(haystack, one_below).unwrap_err(),
+                regex.is_match_value(haystack, one_below).unwrap_err()
+            );
+            assert_eq!(
+                session.is_match(haystack, one_below).unwrap_err(),
+                session
+                    .is_match_value(haystack, one_below)
+                    .unwrap_err()
+            );
+        }
     }
 
     #[test]

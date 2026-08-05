@@ -1,12 +1,16 @@
 //! Allocation-free structural admission for canonical one-byte-class runs.
 //! The reduction route retains strict `LITERAL? CLASS+ LITERAL?` invariants;
 //! the search-only route additionally admits a nonempty prefix before
-//! `CLASS*`, prefix/class overlap, singleton literal repetitions, and
-//! `\b ASCII_WORD_SUBSET+ WORD_SUFFIX \b`.
+//! `CLASS*`, prefix/class overlap, singleton literal repetitions,
+//! `\b ASCII_WORD_SUBSET+ WORD_SUFFIX \b`, and defers exact two-barrier
+//! `LITERAL CLASS{m,n} LITERAL` shapes for a later native-plan choice.
 
 use fre_kernels::{
+    BoundedLiteralClassRunPlan,
     LiteralClassRunLiteralBoundarySemantics as BoundarySemantics,
+    LiteralClassRunLiteralBuildError, LiteralClassRunLiteralBuildLimits,
     LiteralClassRunSearchMinimum as SearchRunMinimum,
+    SimdDispatchContext,
 };
 use regex_syntax::hir::{Class, ClassBytes, ClassUnicode, ClassUnicodeRange, Hir, HirKind, Look};
 
@@ -25,6 +29,33 @@ pub(super) struct Inspection<'a> {
     pub work: usize,
     pub hir_nodes: usize,
     pub captures: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct FiniteInspection<'a> {
+    prefix: &'a [u8],
+    class: InspectedClass<'a>,
+    suffix: &'a [u8],
+    minimum: usize,
+    maximum: usize,
+}
+
+impl FiniteInspection<'_> {
+    pub(super) fn build(
+        self,
+        dispatch: SimdDispatchContext,
+        limits: LiteralClassRunLiteralBuildLimits,
+    ) -> Result<BoundedLiteralClassRunPlan, LiteralClassRunLiteralBuildError> {
+        BoundedLiteralClassRunPlan::build_with_dispatch(
+            dispatch,
+            self.prefix,
+            self.class.ranges(),
+            self.suffix,
+            self.minimum,
+            self.maximum,
+            limits,
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -115,7 +146,10 @@ impl ExactSizeIterator for InspectedClassRanges<'_> {}
 #[derive(Clone, Copy, Debug)]
 pub(super) enum InspectionOutcome<'a> {
     Eligible(Inspection<'a>),
-    Ineligible { work: usize },
+    Ineligible {
+        work: usize,
+        finite: Option<FiniteInspection<'a>>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -154,7 +188,10 @@ impl Accounting {
     }
 
     const fn ineligible(&self) -> InspectionOutcome<'static> {
-        InspectionOutcome::Ineligible { work: self.work }
+        InspectionOutcome::Ineligible {
+            work: self.work,
+            finite: None,
+        }
     }
 }
 
@@ -165,7 +202,8 @@ impl Accounting {
 /// whole-match values only. Every node, literal byte, range, repetition-role
 /// check and boundary comparison is charged before it is inspected.
 pub(super) fn inspect(hir: &Hir, limit: usize) -> Result<InspectionOutcome<'_>, InspectionError> {
-    inspect_attempt(hir, limit).map_err(AggregateInspectionAttemptError::into_source)
+    let mut accounting = Accounting::default();
+    inspect_with_accounting(hir, limit, &mut accounting, true)
 }
 
 pub(super) fn inspect_attempt(
@@ -173,7 +211,7 @@ pub(super) fn inspect_attempt(
     limit: usize,
 ) -> Result<InspectionOutcome<'_>, AggregateInspectionAttemptError<InspectionError>> {
     let mut accounting = Accounting::default();
-    inspect_with_accounting(hir, limit, &mut accounting)
+    inspect_with_accounting(hir, limit, &mut accounting, false)
         .map_err(|source| AggregateInspectionAttemptError::new(source, accounting.work))
 }
 
@@ -185,6 +223,7 @@ fn inspect_with_accounting<'a>(
     hir: &'a Hir,
     limit: usize,
     accounting: &mut Accounting,
+    defer_finite: bool,
 ) -> Result<InspectionOutcome<'a>, InspectionError> {
     let root = peel_captures(hir, limit, accounting)?;
     let HirKind::Concat(parts) = root.kind() else {
@@ -251,14 +290,26 @@ fn inspect_with_accounting<'a>(
         return Ok(accounting.ineligible());
     };
     accounting.charge(3, limit)?;
+    if let Some(maximum) = repetition.max {
+        if !defer_finite {
+            return Ok(accounting.ineligible());
+        }
+        return inspect_finite_two_barrier_run(
+            prefix,
+            &repetition.sub,
+            suffix,
+            repetition.min,
+            maximum,
+            repetition.greedy,
+            limit,
+            accounting,
+        );
+    }
     let minimum = match repetition.min {
         0 => SearchRunMinimum::Zero,
         1 => SearchRunMinimum::One,
         _ => return Ok(accounting.ineligible()),
     };
-    if repetition.max.is_some() {
-        return Ok(accounting.ineligible());
-    }
     let lazy = !repetition.greedy;
     if lazy && (prefix.is_empty() || suffix.is_empty()) {
         return Ok(accounting.ineligible());
@@ -313,6 +364,65 @@ fn inspect_with_accounting<'a>(
         hir_nodes: accounting.hir_nodes,
         captures: accounting.captures,
     }))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the deferred finite proof retains the already-inspected exact HIR roles without a second traversal"
+)]
+fn inspect_finite_two_barrier_run<'a>(
+    prefix: &'a [u8],
+    repeated: &'a Hir,
+    suffix: &'a [u8],
+    minimum: u32,
+    maximum: u32,
+    greedy: bool,
+    limit: usize,
+    accounting: &mut Accounting,
+) -> Result<InspectionOutcome<'a>, InspectionError> {
+    if prefix.is_empty() || suffix.is_empty() || !greedy || maximum < minimum {
+        return Ok(accounting.ineligible());
+    }
+    let minimum = usize::try_from(minimum).map_err(|_| InspectionError::Overflow)?;
+    let maximum = usize::try_from(maximum).map_err(|_| InspectionError::Overflow)?;
+    let Some(class) = repeated_class(repeated, limit, accounting)? else {
+        return Ok(accounting.ineligible());
+    };
+    if class.is_unicode_all_non_ascii() {
+        return Ok(accounting.ineligible());
+    }
+    accounting.charge(1, limit)?;
+    if class_contains(
+        class,
+        *prefix.last().expect("nonempty finite prefix was checked"),
+        limit,
+        accounting,
+    )? {
+        return Ok(accounting.ineligible());
+    }
+    accounting.charge(1, limit)?;
+    if class_contains(class, suffix[0], limit, accounting)? {
+        return Ok(accounting.ineligible());
+    }
+    accounting.charge(1, limit)?;
+    let fixed = prefix
+        .len()
+        .checked_add(suffix.len())
+        .ok_or(InspectionError::Overflow)?;
+    accounting.charge(1, limit)?;
+    fixed
+        .checked_add(maximum)
+        .ok_or(InspectionError::Overflow)?;
+    Ok(InspectionOutcome::Ineligible {
+        work: accounting.work,
+        finite: Some(FiniteInspection {
+            prefix,
+            class,
+            suffix,
+            minimum,
+            maximum,
+        }),
+    })
 }
 
 fn inspect_complete_ascii_word_run<'a>(
@@ -717,7 +827,6 @@ mod tests {
     #[test]
     fn refuses_every_semantic_perturbation() {
         for pattern in [
-            r"ab[ ]{1,3}cd",
             r"ab[ ]cd",
             r"ab[ ]+cd|xy[ ]+zz",
             r"a[bc]+b",
@@ -735,6 +844,86 @@ mod tests {
                 InspectionOutcome::Ineligible { .. }
             ));
         }
+    }
+
+    #[test]
+    fn defers_exact_finite_two_barrier_shape_without_a_second_hir_walk() {
+        for (pattern, minimum, maximum) in [
+            (r"ab[0-9]{0,64}xy", 0, 64),
+            (r"(ab)([0-9]{2,8})(xy)", 2, 8),
+        ] {
+            let hir = hir(pattern);
+            let InspectionOutcome::Ineligible {
+                work,
+                finite: Some(finite),
+            } = inspect(&hir, usize::MAX).unwrap()
+            else {
+                panic!("expected deferred finite eligibility for {pattern:?}");
+            };
+            assert_eq!(finite.prefix, b"ab");
+            assert_eq!(finite.suffix, b"xy");
+            assert_eq!(finite.minimum, minimum);
+            assert_eq!(finite.maximum, maximum);
+            assert!(work > 0);
+            assert!(matches!(
+                inspect(&hir, work - 1),
+                Err(InspectionError::WorkLimit { needed, limit })
+                    if needed == work && limit == work - 1
+            ));
+            assert!(matches!(
+                inspect(&hir, work).unwrap(),
+                InspectionOutcome::Ineligible {
+                    finite: Some(_),
+                    ..
+                }
+            ));
+        }
+
+        for pattern in [
+            r"[0-9]{2,8}xy",
+            r"ab[0-9]{2,8}",
+            r"ab[b0-9]{2,8}xy",
+            r"ab[0-9]{2,8}3y",
+            r"ab[0-9]{2,8}?xy",
+        ] {
+            assert!(matches!(
+                inspect(&hir(pattern), usize::MAX).unwrap(),
+                InspectionOutcome::Ineligible { finite: None, .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn aggregate_attempt_retains_the_preexisting_finite_refusal_receipt() {
+        let hir = hir(r"ab[0-9]{2,8}xy");
+        let InspectionOutcome::Ineligible {
+            work: portable_work,
+            finite: Some(_),
+        } = inspect(&hir, usize::MAX).unwrap()
+        else {
+            panic!("portable inspection should retain the deferred proof");
+        };
+        let InspectionOutcome::Ineligible {
+            work: aggregate_work,
+            finite: None,
+        } = inspect_attempt(&hir, usize::MAX).unwrap()
+        else {
+            panic!("aggregate inspection should preserve its immediate refusal");
+        };
+        assert!(aggregate_work < portable_work);
+        assert!(matches!(
+            inspect_attempt(&hir, aggregate_work).unwrap(),
+            InspectionOutcome::Ineligible {
+                work,
+                finite: None
+            } if work == aggregate_work
+        ));
+        let error = inspect_attempt(&hir, aggregate_work - 1).unwrap_err();
+        assert!(matches!(
+            error.into_source(),
+            InspectionError::WorkLimit { needed, limit }
+                if needed == aggregate_work && limit == aggregate_work - 1
+        ));
     }
 
     #[test]

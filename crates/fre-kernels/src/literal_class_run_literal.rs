@@ -77,6 +77,8 @@ pub const GENERAL_SHORTEST_SEARCH_OPERATION_ID: &str =
     "literal-class-run-search.generalized.shortest-search.unicode-off.v1";
 pub const BOUNDED_SEARCH_PLAN_ID: &str =
     "literal-class-run-search.finite-two-barrier.unicode-off.v1";
+pub const BOUNDED_EXISTS_SEARCH_OPERATION_ID: &str =
+    "literal-class-run-search.finite-two-barrier.exists.unicode-off.v1";
 pub const BOUNDED_SEARCH_OPERATION_ID: &str =
     "literal-class-run-search.finite-two-barrier.search.unicode-off.v1";
 pub const BOUNDED_SHORTEST_SEARCH_OPERATION_ID: &str =
@@ -3830,6 +3832,18 @@ impl BoundedLiteralClassRunPlan {
         self.suffix.needle()
     }
 
+    fn bounded_scan_bytes(&self, remaining: usize) -> usize {
+        remaining.min(self.maximum.checked_add(1).unwrap_or(remaining))
+    }
+
+    const fn bounded_scan_classification_overhead(&self) -> usize {
+        match self.ascii_scanner {
+            Some(AsciiClassScanner::Run(_)) => ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD,
+            Some(AsciiClassScanner::Fixed(_)) => ASCII_WIDE_BYTES - 1,
+            None => 0,
+        }
+    }
+
     pub fn find(
         &self,
         haystack: &[u8],
@@ -3886,6 +3900,22 @@ impl BoundedLiteralClassRunPlan {
             .map_err(SearchError::from)
     }
 
+    pub fn is_match_window(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<(bool, SearchAccounting), SearchError> {
+        let (matched, accounting) = self.search_anchor_window(
+            haystack,
+            window,
+            limits,
+            self.exists_anchor,
+            BOUNDED_EXISTS_SEARCH_OPERATION_ID,
+        )?;
+        Ok((matched.is_some(), accounting))
+    }
+
     pub fn is_match_window_value(
         &self,
         haystack: &[u8],
@@ -3897,16 +3927,9 @@ impl BoundedLiteralClassRunPlan {
         if !meter.work_envelope_admitted
             || upper.anchor_candidates > limits.max_candidate_visits
         {
-            let projection = match self.exists_anchor {
-                Anchor::Prefix => SearchProjection::Selected,
-                Anchor::Suffix => SearchProjection::EarliestEnd,
-                Anchor::CompleteAsciiWordSuffix => {
-                    unreachable!("finite direct anchor is unguarded")
-                }
-            };
             return self
-                .search_window(haystack, window, limits, projection)
-                .map(|(matched, _)| matched.is_some());
+                .is_match_window(haystack, window, limits)
+                .map(|(matched, _)| matched);
         }
         let slice = &haystack[window.start()..window.end()];
         Ok(match self.exists_anchor {
@@ -3957,10 +3980,23 @@ impl BoundedLiteralClassRunPlan {
         limits: SearchLimits,
         projection: SearchProjection,
     ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
-        let anchor = match projection {
-            SearchProjection::Selected => Anchor::Prefix,
-            SearchProjection::EarliestEnd => Anchor::Suffix,
+        let (anchor, operation_id) = match projection {
+            SearchProjection::Selected => (Anchor::Prefix, BOUNDED_SEARCH_OPERATION_ID),
+            SearchProjection::EarliestEnd => {
+                (Anchor::Suffix, BOUNDED_SHORTEST_SEARCH_OPERATION_ID)
+            }
         };
+        self.search_anchor_window(haystack, window, limits, anchor, operation_id)
+    }
+
+    fn search_anchor_window(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+        anchor: Anchor,
+        operation_id: &'static str,
+    ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
         let (upper, window_bytes, meter) =
             self.search_preflight(haystack.len(), window, limits, anchor)?;
         let slice = &haystack[window.start()..window.end()];
@@ -3985,10 +4021,6 @@ impl BoundedLiteralClassRunPlan {
                 ))
             })
             .transpose()?;
-        let operation_id = match projection {
-            SearchProjection::Selected => BOUNDED_SEARCH_OPERATION_ID,
-            SearchProjection::EarliestEnd => BOUNDED_SHORTEST_SEARCH_OPERATION_ID,
-        };
         Ok((
             matched,
             SearchAccounting {
@@ -4055,17 +4087,32 @@ impl BoundedLiteralClassRunPlan {
             .ok_or(ReduceError::ArithmeticOverflow {
                 computation: "finite overlapping finder service",
             })?;
-        let classifications = input_bytes
-            .checked_mul(4)
-            .and_then(|logical| logical.checked_add(candidates))
-            .and_then(|logical| {
-                candidates
-                    .checked_mul(ASCII_WIDE_BYTES - 1)
-                    .and_then(|overhead| logical.checked_add(overhead))
-            })
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "finite class-run classifications",
-            })?;
+        let classification_overhead = self.bounded_scan_classification_overhead();
+        let global_classifications = candidates
+            .checked_mul(classification_overhead)
+            .and_then(|overhead| {
+                input_bytes
+                    .checked_add(candidates)
+                    .and_then(|logical| logical.checked_add(overhead))
+            });
+        // A run scanner can classify one failed vector block and then
+        // classify part of that same block again during scalar boundary
+        // recovery. Bound each supplied max+1 slice together with that
+        // scanner-specific terminal overhead.
+        let capped_classifications = self
+            .bounded_scan_bytes(input_bytes)
+            .checked_add(classification_overhead)
+            .and_then(|per_candidate| candidates.checked_mul(per_candidate));
+        let classifications = match (global_classifications, capped_classifications) {
+            (Some(global), Some(capped)) => global.min(capped),
+            (Some(global), None) => global,
+            (None, Some(capped)) => capped,
+            (None, None) => {
+                return Err(ReduceError::ArithmeticOverflow {
+                    computation: "finite bounded class-run classifications",
+                });
+            }
+        };
         let literal_comparisons = candidates.checked_mul(opposite_bytes).ok_or(
             ReduceError::ArithmeticOverflow {
                 computation: "finite opposite literal comparisons",
@@ -4134,8 +4181,19 @@ impl BoundedLiteralClassRunPlan {
             )? else {
                 return finish_search(None, actual, upper);
             };
+            let scan_bytes = self.bounded_scan_bytes(haystack.len().saturating_sub(prefix_end));
+            let scan_end = prefix_end.checked_add(scan_bytes).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "finite forward bounded scan end",
+                },
+            )?;
+            let scan_haystack = haystack.get(..scan_end).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "finite forward bounded scan window",
+                },
+            )?;
             let run_end = search_scan_class_run_forward(
-                haystack,
+                scan_haystack,
                 self.class,
                 self.ascii_scanner.as_ref(),
                 prefix_end,
@@ -4203,15 +4261,31 @@ impl BoundedLiteralClassRunPlan {
             )? else {
                 return finish_search(None, actual, upper);
             };
-            let run_start = search_scan_class_run_backward(
-                haystack,
+            let scan_bytes = self.bounded_scan_bytes(suffix_start);
+            let scan_floor = suffix_start.checked_sub(scan_bytes).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "finite backward bounded scan floor",
+                },
+            )?;
+            let scan_haystack = haystack.get(scan_floor..).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "finite backward bounded scan window",
+                },
+            )?;
+            let relative_run_start = search_scan_class_run_backward(
+                scan_haystack,
                 self.class,
                 self.ascii_scanner.as_ref(),
-                suffix_start,
+                scan_bytes,
                 &mut actual,
                 meter,
             )?
-            .unwrap_or(suffix_start);
+            .unwrap_or(scan_bytes);
+            let run_start = scan_floor.checked_add(relative_run_start).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "finite absolute backward run start",
+                },
+            )?;
             let run_len = suffix_start.checked_sub(run_start).ok_or(
                 ReduceError::ArithmeticOverflow {
                     computation: "finite backward run length",
@@ -4332,8 +4406,10 @@ impl BoundedLiteralClassRunPlan {
             let relative = self.prefix.find(haystack.get(cursor..)?)?;
             let start = cursor.checked_add(relative)?;
             let prefix_end = start.checked_add(self.prefix().len())?;
+            let scan_bytes = self.bounded_scan_bytes(haystack.len().checked_sub(prefix_end)?);
+            let scan_end = prefix_end.checked_add(scan_bytes)?;
             let run_end = scan_class_run_forward_value(
-                haystack,
+                haystack.get(..scan_end)?,
                 self.class,
                 self.ascii_scanner.as_ref(),
                 prefix_end,
@@ -4361,13 +4437,16 @@ impl BoundedLiteralClassRunPlan {
             let relative = self.suffix.find(haystack.get(cursor..)?)?;
             let suffix_start = cursor.checked_add(relative)?;
             let end = suffix_start.checked_add(self.suffix().len())?;
-            let run_start = scan_class_run_backward_value(
-                haystack,
+            let scan_bytes = self.bounded_scan_bytes(suffix_start);
+            let scan_floor = suffix_start.checked_sub(scan_bytes)?;
+            let relative_run_start = scan_class_run_backward_value(
+                haystack.get(scan_floor..)?,
                 self.class,
                 self.ascii_scanner.as_ref(),
-                suffix_start,
+                scan_bytes,
             )
-            .unwrap_or(suffix_start);
+            .unwrap_or(scan_bytes);
+            let run_start = scan_floor.checked_add(relative_run_start)?;
             let run_len = suffix_start.checked_sub(run_start)?;
             if run_len >= self.minimum && run_len <= self.maximum {
                 let start = run_start.checked_sub(self.prefix().len());
@@ -7690,6 +7769,229 @@ mod tests {
                 .unwrap(),
             Some((2, 8))
         );
+    }
+
+    #[test]
+    fn bounded_two_barrier_scans_only_maximum_plus_one_class_bytes() {
+        let plan = bounded_plan();
+        let mut haystack = b"ab".to_vec();
+        haystack.extend(core::iter::repeat_n(b'0', 4_096));
+        haystack.extend_from_slice(b"xy--");
+        let later_start = haystack.len();
+        haystack.extend_from_slice(b"ab1xy");
+        let expected = Some((later_start, later_start + 5));
+
+        let (selected, selected_accounting) =
+            plan.find(&haystack, SearchLimits::unlimited()).unwrap();
+        let (shortest, shortest_accounting) = plan
+            .shortest_window(
+                &haystack,
+                Window::full(&haystack),
+                SearchLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(selected, expected);
+        assert_eq!(shortest, expected.map(|(_, end)| end));
+        assert_eq!(selected_accounting.classifications, 5);
+        assert_eq!(shortest_accounting.classifications, 5);
+        assert!(selected_accounting.source_reads <= selected_accounting.source_reads_upper_bound);
+        assert!(shortest_accounting.source_reads <= shortest_accounting.source_reads_upper_bound);
+        assert_eq!(
+            plan.find_window_value(
+                &haystack,
+                Window::full(&haystack),
+                SearchLimits::unlimited(),
+            )
+            .unwrap(),
+            expected
+        );
+        assert_eq!(
+            plan.shortest_window_value(
+                &haystack,
+                Window::full(&haystack),
+                SearchLimits::unlimited(),
+            )
+            .unwrap(),
+            expected.map(|(_, end)| end)
+        );
+
+        let unbounded_maximum = BoundedLiteralClassRunPlan::build(
+            b"ab",
+            [(b'0', b'1')].into_iter(),
+            b"xy",
+            0,
+            usize::MAX,
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        assert_eq!(
+            unbounded_maximum
+                .find(b"ab000xy", SearchLimits::unlimited())
+                .unwrap()
+                .0,
+            Some((0, 7))
+        );
+    }
+
+    #[test]
+    fn bounded_zero_maximum_still_classifies_an_available_boundary() {
+        let plan = BoundedLiteralClassRunPlan::build(
+            b"ab",
+            [(b'0', b'1')].into_iter(),
+            b"xy",
+            0,
+            0,
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let (selected, selected_accounting) =
+            plan.find(b"abxy", SearchLimits::unlimited()).unwrap();
+        let (shortest, shortest_accounting) = plan
+            .shortest_window(
+                b"abxy",
+                Window::full(b"abxy"),
+                SearchLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(selected, Some((0, 4)));
+        assert_eq!(shortest, Some(4));
+        assert_eq!(selected_accounting.classifications, 1);
+        assert_eq!(shortest_accounting.classifications, 1);
+        assert_eq!(
+            plan.find(b"ab0xy", SearchLimits::unlimited()).unwrap().0,
+            None
+        );
+    }
+
+    #[test]
+    fn bounded_dispatched_terminal_recovery_fits_the_max_plus_one_upper_bound() {
+        let plan = BoundedLiteralClassRunPlan::build_with_dispatch(
+            SimdDispatchContext::capture(),
+            b"ab",
+            [(b'0', b'9')].into_iter(),
+            b"xy",
+            0,
+            15,
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        // Keep a complete max+1 scan slice after the prefix while placing the
+        // first nonmember inside it. SIMD run leaves may classify that failed
+        // block once as a vector and again while recovering the exact edge.
+        let haystack = b"ab000xy----------------";
+        let (matched, accounting) = plan
+            .find(haystack, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(matched, Some((0, 7)));
+        assert!(accounting.source_reads <= accounting.source_reads_upper_bound);
+        assert!(u64::try_from(accounting.work).unwrap() <= accounting.work_upper_bound);
+    }
+
+    #[test]
+    fn bounded_exists_accounting_and_value_routes_share_anchor_and_limits() {
+        let cases = [
+            (
+                BoundedLiteralClassRunPlan::build(
+                    b"QZ",
+                    [(b'0', b'9')].into_iter(),
+                    b"aa",
+                    0,
+                    2,
+                    BuildLimits::unlimited(),
+                )
+                .unwrap(),
+                Anchor::Prefix,
+                b"aaaaaaaaaaaaaaaa--QZ12aa".as_slice(),
+            ),
+            (
+                BoundedLiteralClassRunPlan::build(
+                    b"aa",
+                    [(b'0', b'9')].into_iter(),
+                    b"QZ",
+                    0,
+                    2,
+                    BuildLimits::unlimited(),
+                )
+                .unwrap(),
+                Anchor::Suffix,
+                b"aaaaaaaaaaaaaaaa--aa12QZ".as_slice(),
+            ),
+        ];
+        for (plan, expected_anchor, haystack) in cases {
+            assert_eq!(plan.exists_anchor, expected_anchor);
+            let (matched, accounting) = plan
+                .is_match_window(
+                    haystack,
+                    Window::full(haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap();
+            assert!(matched);
+            assert_eq!(
+                accounting.operation_id,
+                BOUNDED_EXISTS_SEARCH_OPERATION_ID
+            );
+            let exact_work = u64::try_from(accounting.work).unwrap();
+            let exact = SearchLimits {
+                max_work_upper_bound: exact_work,
+                max_candidate_visits: accounting.candidate_visits,
+                max_scratch_bytes: 0,
+            };
+            assert!(
+                plan.is_match_window(haystack, Window::full(haystack), exact)
+                    .unwrap()
+                    .0
+            );
+            assert!(
+                plan.is_match_window_value(haystack, Window::full(haystack), exact)
+                    .unwrap()
+            );
+
+            let one_below = SearchLimits {
+                max_work_upper_bound: exact_work - 1,
+                max_candidate_visits: usize::MAX,
+                max_scratch_bytes: 0,
+            };
+            let accounted = plan
+                .is_match_window(haystack, Window::full(haystack), one_below)
+                .unwrap_err();
+            let value = plan
+                .is_match_window_value(haystack, Window::full(haystack), one_below)
+                .unwrap_err();
+            assert_eq!(accounted, value);
+            assert!(matches!(
+                accounted,
+                SearchError::WorkLimit { needed, limit }
+                    if needed == exact_work && limit == exact_work - 1
+            ));
+
+            let one_below_candidates = SearchLimits {
+                max_work_upper_bound: u64::MAX,
+                max_candidate_visits: accounting.candidate_visits - 1,
+                max_scratch_bytes: 0,
+            };
+            let accounted = plan
+                .is_match_window(
+                    haystack,
+                    Window::full(haystack),
+                    one_below_candidates,
+                )
+                .unwrap_err();
+            let value = plan
+                .is_match_window_value(
+                    haystack,
+                    Window::full(haystack),
+                    one_below_candidates,
+                )
+                .unwrap_err();
+            assert_eq!(accounted, value);
+            assert!(matches!(
+                accounted,
+                SearchError::CandidateLimit { needed, limit }
+                    if needed == accounting.candidate_visits
+                        && limit == accounting.candidate_visits - 1
+            ));
+        }
     }
 
     #[test]
