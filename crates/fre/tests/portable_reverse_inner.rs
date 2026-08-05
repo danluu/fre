@@ -1,5 +1,5 @@
 use fre::{
-    PlanKind, PlanSelection, PortableBuilder, PortableFindIterLimits,
+    BuildLimits, PlanKind, PlanSelection, PortableBuilder, PortableFindIterLimits,
     REVERSE_INNER_UNION_ACCOUNTING_ID, REVERSE_INNER_UNION_PLAN_ID, SearchAccounting,
     SearchError, SearchLimits, SearchSessionLimits, SearchWindow,
 };
@@ -311,6 +311,9 @@ fn structural_gate_keeps_ascii_byte_dense_and_negated_classes_off_reverse_inner(
 
 #[test]
 fn structural_gate_uses_exact_ascii_and_non_ascii_population_boundaries() {
+    const CANONICAL_UNICODE_LETTER_RANGES: usize = 677;
+    let mut limits = BuildLimits::default();
+    limits.literal_class_run_literal.max_class_ranges = CANONICAL_UNICODE_LETTER_RANGES;
     for pattern in [
         r"[\x00-\x3Fλ]+01[\x00-\x3Fλ]+",
         r"[a\u{10000}-\u{53DDF}]+a[a\u{10000}-\u{53DDF}]+",
@@ -320,6 +323,7 @@ fn structural_gate_uses_exact_ascii_and_non_ascii_population_boundaries() {
         assert_eq!(
             PortableBuilder::new(pattern)
                 .unicode(true)
+                .limits(limits)
                 .build()
                 .expect("sparse boundary build")
                 .build_report()
@@ -337,6 +341,7 @@ fn structural_gate_uses_exact_ascii_and_non_ascii_population_boundaries() {
         assert_ne!(
             PortableBuilder::new(pattern)
                 .unicode(true)
+                .limits(limits)
                 .build()
                 .expect("broad boundary fallback build")
                 .build_report()
