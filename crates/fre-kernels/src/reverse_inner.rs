@@ -399,7 +399,6 @@ enum SearchProjection {
 struct UnionCandidate {
     start: usize,
     matching_mask: u16,
-    shortest_index: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1417,8 +1416,7 @@ impl ReverseInnerPlan {
         &self,
         haystack: &[u8],
         mut scan_start: usize,
-        scan_ceiling: usize,
-        verification_ceiling: usize,
+        ceiling: usize,
         actual: &mut ReduceActualCounters,
     ) -> Result<UnionNext, ReduceError> {
         let state = self
@@ -1429,8 +1427,8 @@ impl ReverseInnerPlan {
                 upper: 1,
             })?;
         let mut previous_scanned_through = scan_start;
-        while scan_start < scan_ceiling {
-            let source = haystack.get(scan_start..scan_ceiling).ok_or(
+        while scan_start < ceiling {
+            let source = haystack.get(scan_start..ceiling).ok_or(
                 ReduceError::ArithmeticOverflow {
                     computation: "literal-union scan window",
                 },
@@ -1490,7 +1488,6 @@ impl ReverseInnerPlan {
             )?;
 
             let mut matching_mask = 0_u16;
-            let mut shortest = None::<(usize, usize)>;
             let mut verification_work = 0_usize;
             let mut unchecked_mask = candidate_mask;
             while unchecked_mask != 0 {
@@ -1529,7 +1526,7 @@ impl ReverseInnerPlan {
                         computation: "literal-union verification end",
                     },
                 )?;
-                if candidate_end > verification_ceiling {
+                if candidate_end > ceiling {
                     continue;
                 }
                 let candidate = haystack.get(candidate_start..candidate_end).ok_or(
@@ -1554,31 +1551,10 @@ impl ReverseInnerPlan {
                 )?;
                 if candidate == needle {
                     matching_mask |= bit;
-                    // Simultaneously exact needles at one start are identical
-                    // through the shorter length. The shortest therefore has
-                    // the earliest possible following-scalar endpoint; source
-                    // order remains the tie-break because masks are ascending.
-                    let replace_shortest = shortest
-                        .is_none_or(|(_, old_length)| needle.len() < old_length);
-                    if replace_shortest {
-                        shortest = Some((index, needle.len()));
-                    }
                 }
             }
 
             if matching_mask != 0 {
-                let (shortest_index, _) = shortest.ok_or(
-                    ReduceError::AccountingInvariant {
-                        resource: "literal-union shortest exact candidate",
-                        actual: 0,
-                        upper: 1,
-                    },
-                )?;
-                let shortest_index = u8::try_from(shortest_index).map_err(|_| {
-                    ReduceError::ArithmeticOverflow {
-                        computation: "literal-union shortest candidate index",
-                    }
-                })?;
                 actual.union_exact_candidates = checked_add_reduce(
                     actual.union_exact_candidates,
                     1,
@@ -1597,7 +1573,6 @@ impl ReverseInnerPlan {
                 return Ok(UnionNext::Candidate(UnionCandidate {
                     start: candidate_start,
                     matching_mask,
-                    shortest_index,
                 }));
             }
 
@@ -1648,7 +1623,6 @@ impl ReverseInnerPlan {
             let candidate = match self.next_union_candidate(
                 haystack,
                 cursor,
-                window.end(),
                 window.end(),
                 &mut actual,
             )? {
@@ -2070,11 +2044,19 @@ impl ReverseInnerPlan {
             return Ok(None);
         }
 
-        let shortest_index = usize::from(candidate.shortest_index);
-        let finder = self.finders.get(shortest_index).ok_or(
+        // Adaptive-union admission requires distinct literal-leading bytes,
+        // so the observed root can bind exactly one literal.
+        debug_assert!(candidate.matching_mask.is_power_of_two());
+        let candidate_index =
+            usize::try_from(candidate.matching_mask.trailing_zeros()).map_err(|_| {
+                ReduceError::ArithmeticOverflow {
+                    computation: "literal-union endpoint candidate index",
+                }
+            })?;
+        let finder = self.finders.get(candidate_index).ok_or(
             ReduceError::AccountingInvariant {
                 resource: "literal-union endpoint finder",
-                actual: u64::try_from(shortest_index).unwrap_or(u64::MAX),
+                actual: u64::try_from(candidate_index).unwrap_or(u64::MAX),
                 upper: u64::try_from(self.finders.len()).unwrap_or(u64::MAX),
             },
         )?;
@@ -2178,7 +2160,6 @@ impl ReverseInnerPlan {
                 haystack,
                 cursor,
                 ceiling,
-                window.end(),
                 &mut actual,
             )? {
                 UnionNext::Candidate(candidate) => candidate,
@@ -2275,7 +2256,6 @@ impl ReverseInnerPlan {
             let candidate = match self.next_union_candidate(
                 haystack,
                 cursor,
-                window.end(),
                 window.end(),
                 &mut actual,
             )? {
@@ -4312,6 +4292,43 @@ mod tests {
         );
         assert!(selected_accounting.actual.run_events > 0);
         assert!(selected_accounting.actual.decode_byte_checks > 1_000);
+    }
+
+    #[test]
+    fn union_endpoint_fallback_retains_an_earlier_direct_match() {
+        let ranges = [('a', 'z'), ('λ', 'λ')];
+        let literals: [&[u8]; 2] = [b"abbbbb", b"bzzzz"];
+        let plan = plan(&ranges, &literals);
+        let regex = oracle(
+            r"(?:[a-zλ]+abbbbb[a-zλ]+|[a-zλ]+bzzzz[a-zλ]+)",
+        );
+        assert!(plan.build_accounting().adaptive_union);
+
+        // The leading `abbbbb` proves end 8. Its first internal `b` is then a
+        // dense false root for `bzzzz`, forcing the independent fallback.
+        // The first case exhausts that fallback; the second finds a later
+        // match. Both must retain the already-proved earlier end.
+        let no_later = b"qabbbbbq";
+        let (shortest, accounting) = plan
+            .shortest(no_later, SearchLimits::unlimited())
+            .expect("retained endpoint across exhausted fallback");
+        assert_eq!(shortest, Some(8));
+        assert_eq!(shortest, regex.shortest_match(no_later));
+        assert!(accounting.actual.union_fallbacks > 0);
+        assert!(accounting.actual.outer_finder_calls > 0);
+        assert!(accounting.actual.finder_calls > 0);
+        assert_eq!(accounting.actual.run_events, 0);
+
+        let later = b"qabbbbbq-qbzzzzq";
+        let (shortest, accounting) = plan
+            .shortest(later, SearchLimits::unlimited())
+            .expect("retained endpoint across matching fallback");
+        assert_eq!(shortest, Some(8));
+        assert_eq!(shortest, regex.shortest_match(later));
+        assert!(accounting.actual.union_fallbacks > 0);
+        assert!(accounting.actual.outer_finder_calls > 0);
+        assert!(accounting.actual.finder_calls > 0);
+        assert!(accounting.actual.run_events > 0);
     }
 
     #[test]
