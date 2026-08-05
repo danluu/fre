@@ -1823,6 +1823,35 @@ fn retained_partial_stats(compiled: &CompiledRegex) -> Result<Option<PartialDfaS
         .map_err(|error| format!("partial-DFA statistics failed: {error}"))
 }
 
+fn is_self_contained_native_shape(
+    compiled: &CompiledRegex,
+    runtime_program_present: bool,
+    partial_dfa: Option<&PartialDfaStats>,
+) -> bool {
+    if runtime_program_present || compiled.module().required_runtime_symbol().is_some() {
+        return false;
+    }
+    if matches!(
+        compiled.receipt().engine,
+        EngineKind::OrderedDfa | EngineKind::OrderedContextDfa
+    ) || compiled.program().has_nfa_exact_product()
+        && compiled.receipt().engine == EngineKind::OrderedNfa
+    {
+        return true;
+    }
+    compiled.receipt().engine == EngineKind::OrderedNfa
+        && compiled.receipt().engine_selection_reason
+            == EngineSelectionReason::DeterminizationResourceLimit
+        && !compiled.receipt().runtime_helper_required
+        && partial_dfa.is_some_and(|stats| {
+            stats.complete_rows > 0
+                && stats.complete_rows == stats.discovered_states
+                && stats.resume_frontiers == 0
+                && stats.resume_items == 0
+                && stats.optimized_entry_supported
+        })
+}
+
 fn compile_retained_resource_probe(
     spec: &SeededPatternSpec,
     target: Target,
@@ -1970,6 +1999,7 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
                 .module()
                 .required_runtime_program()
                 .map(|(symbol, bytes)| (symbol.to_owned(), bytes));
+            let partial_dfa = retained_partial_stats(&aot)?;
             let exact_product = aot.program().has_nfa_exact_product();
             if force_ordinary_fallback && runtime_program.is_none() && !exact_product {
                 return Err(format!(
@@ -1991,10 +2021,11 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
                     spec.name
                 ));
             }
-            let self_contained_engine = matches!(
-                aot.receipt().engine,
-                EngineKind::OrderedDfa | EngineKind::OrderedContextDfa
-            ) || exact_product && aot.receipt().engine == EngineKind::OrderedNfa;
+            let self_contained_engine = is_self_contained_native_shape(
+                &aot,
+                runtime_program.is_some(),
+                partial_dfa.as_ref(),
+            );
             if runtime_program.is_none()
                 && (aot.module().required_runtime_symbol().is_some() || !self_contained_engine)
             {
@@ -2003,7 +2034,6 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
                     spec.name
                 ));
             }
-            let partial_dfa = retained_partial_stats(&aot)?;
             let prepared_entry_published = aot.module().prepared_entry_symbol().is_some();
             if prepared_entry_published && (runtime_program.is_none() || partial_dfa.is_none()) {
                 return Err(format!(
@@ -2026,7 +2056,7 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
                 if let Some(stats) = partial_dfa {
                     if reason != EngineSelectionReason::DeterminizationResourceLimit
                         || aot.receipt().engine != EngineKind::OrderedNfa
-                        || runtime_program.is_none()
+                        || runtime_program.is_none() && !self_contained_engine
                         || stats.complete_rows == 0
                         || !stats.optimized_entry_supported
                     {
@@ -3915,29 +3945,104 @@ mod tests {
     }
 
     #[test]
+    fn complete_retained_direct_resource_fallback_is_self_contained() {
+        let target = Target::aarch64_macos()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .unwrap();
+        let pattern = "(?:ab|c){3,6}Z";
+        let complete = compile(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::SelectedEnd),
+        )
+        .expect("compile complete DFA probe");
+        let mut limits = CompileLimitsV1::default();
+        limits.determinize.max_work = complete
+            .receipt()
+            .dfa
+            .expect("complete DFA statistics")
+            .build_work
+            .checked_sub(1)
+            .expect("nonzero DFA work");
+        let retained = compile(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::SelectedEnd)
+                .limits(limits),
+        )
+        .expect("compile complete retained fallback");
+        let partial = retained_partial_stats(&retained)
+            .unwrap()
+            .expect("retained-row statistics");
+
+        assert_eq!(retained.receipt().engine, EngineKind::OrderedNfa);
+        assert_eq!(
+            retained.receipt().engine_selection_reason,
+            EngineSelectionReason::DeterminizationResourceLimit
+        );
+        assert!(!retained.program().has_nfa_exact_product());
+        assert!(retained.module().required_runtime_program().is_none());
+        assert!(retained.module().required_runtime_symbol().is_none());
+        assert!(!retained.receipt().runtime_helper_required);
+        assert_eq!(partial.complete_rows, partial.discovered_states);
+        assert_eq!(partial.resume_frontiers, 0);
+        assert_eq!(partial.resume_items, 0);
+        assert!(partial.optimized_entry_supported);
+        assert!(is_self_contained_native_shape(
+            &retained,
+            false,
+            Some(&partial)
+        ));
+    }
+
+    #[test]
     fn retained_resource_routes_track_the_published_prepared_symbol() {
-        let target = Target::x86_64_linux();
-        let limits = CompileLimitsV1 {
+        let prepared_limits = CompileLimitsV1 {
             determinize: fre_aot_regex::DeterminizeLimits {
                 max_states: 8,
                 ..fre_aot_regex::DeterminizeLimits::default()
             },
             ..CompileLimitsV1::default()
         };
-        let mut base_spec = grammar_patterns(&flat_grammar_config(Some(UNSEEN_TEST_SEED)))
+        let base_spec = grammar_patterns(&flat_grammar_config(Some(UNSEEN_TEST_SEED)))
             .into_iter()
             .next()
             .expect("grammar shape");
-        base_spec.output = OutputKind::SelectedEnd;
+        let ordinary_pattern = "[ab]+";
+        let ordinary_probe = compile(
+            CompileRequest::new(ordinary_pattern, Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span),
+        )
+        .expect("compile ordinary retained probe");
+        let ordinary_limits = CompileLimitsV1 {
+            determinize: fre_aot_regex::DeterminizeLimits {
+                max_work: ordinary_probe
+                    .receipt()
+                    .dfa
+                    .expect("ordinary complete DFA statistics")
+                    .build_work
+                    .checked_sub(1)
+                    .expect("ordinary DFA has nonzero work"),
+                ..fre_aot_regex::DeterminizeLimits::default()
+            },
+            ..CompileLimitsV1::default()
+        };
 
-        for (pattern, expected_route, prepared) in [
+        for (pattern, target, output, limits, expected_route, prepared) in [
             (
                 "a+Q|[b-c][a-b]{1,5}(?:x+|y+)|a*",
+                Target::x86_64_linux(),
+                OutputContract::SelectedEnd,
+                prepared_limits,
                 "prepared_runtime_resource_fallback",
                 true,
             ),
             (
-                r"(?-u:[\x00-\xFF])*(?:a+Q|[b-c][a-b]{1,5}(?:x+|y+))Z",
+                ordinary_pattern,
+                Target::x86_64_linux(),
+                OutputContract::Span,
+                ordinary_limits,
                 "ordinary_runtime_resource_fallback",
                 false,
             ),
@@ -3945,7 +4050,7 @@ mod tests {
             let aot = compile(
                 CompileRequest::new(pattern, target)
                     .mode(CompileMode::Optimizing)
-                    .output(OutputContract::SelectedEnd)
+                    .output(output)
                     .limits(limits),
             )
             .expect("compile retained route fixture");
@@ -3960,6 +4065,11 @@ mod tests {
 
             let mut spec = base_spec.clone();
             spec.pattern = pattern.to_owned();
+            spec.output = match output {
+                OutputContract::Span => OutputKind::Span,
+                OutputContract::Exists => OutputKind::Exists,
+                OutputContract::SelectedEnd => OutputKind::SelectedEnd,
+            };
             let shape = CompiledShape {
                 spec,
                 upstream: Regex::new(pattern).unwrap(),
