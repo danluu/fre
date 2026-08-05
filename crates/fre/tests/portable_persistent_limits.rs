@@ -51,14 +51,6 @@ fn plan_cases() -> Vec<(&'static str, PortableBuilder, PlanKind)> {
             PlanKind::UnicodeWordRun,
         ),
         (
-            "automatic K0",
-            PortableBuilder::new("^a+$")
-                .unicode(false)
-                .multi_line(true)
-                .line_terminator(b'\r'),
-            PlanKind::K0,
-        ),
-        (
             "forced K0",
             PortableBuilder::new("Sherlock")
                 .unicode(false)
@@ -120,6 +112,70 @@ fn total_persistent_limit_is_exact_across_every_portable_plan() {
             "unexpected one-below refusal for {name}: {error}"
         );
     }
+}
+
+#[test]
+fn automatic_k0_optional_persistent_refusal_preserves_the_mandatory_plan() {
+    let builder = PortableBuilder::new("^a+$")
+        .unicode(false)
+        .multi_line(true)
+        .line_terminator(b'\r');
+    let probe = builder.clone().build().expect("automatic K0 probe");
+    assert_eq!(probe.build_report().plan, PlanKind::K0);
+    let admitted_bytes = probe.build_report().charged_persistent_bytes;
+
+    let exact = builder
+        .clone()
+        .max_persistent_bytes(admitted_bytes)
+        .build()
+        .expect("exact automatic K0 sidecar boundary");
+    assert_eq!(exact.build_report().charged_persistent_bytes, admitted_bytes);
+
+    let declined_limit = admitted_bytes.checked_sub(1).unwrap();
+    let declined = builder
+        .clone()
+        .max_persistent_bytes(declined_limit)
+        .build()
+        .expect("optional automatic K0 sidecar refusal");
+    assert_eq!(declined.build_report().plan, PlanKind::K0);
+    assert!(declined.build_report().charged_persistent_bytes <= declined_limit);
+    assert!(
+        declined.build_report().plan_storage_bytes < exact.build_report().plan_storage_bytes
+    );
+
+    let mandatory_probe = builder
+        .clone()
+        .plan_selection(PlanSelection::ForceK0)
+        .build()
+        .expect("mandatory K0 probe");
+    let mandatory_bytes = mandatory_probe.build_report().charged_persistent_bytes;
+    assert!(mandatory_bytes < admitted_bytes);
+
+    let mandatory_exact = builder
+        .clone()
+        .max_persistent_bytes(mandatory_bytes)
+        .build()
+        .expect("exact mandatory automatic K0 boundary");
+    assert_eq!(mandatory_exact.build_report().plan, PlanKind::K0);
+    assert_eq!(
+        mandatory_exact.build_report().charged_persistent_bytes,
+        mandatory_bytes
+    );
+    assert_eq!(
+        mandatory_exact.build_report().plan_storage_bytes,
+        mandatory_probe.build_report().plan_storage_bytes
+    );
+    let error = builder
+        .max_persistent_bytes(mandatory_bytes.checked_sub(1).unwrap())
+        .build()
+        .expect_err("one-below mandatory automatic K0 storage must fail");
+    assert!(matches!(
+        error,
+        BuildError::PersistentBytesLimit {
+            needed,
+            limit,
+        } if needed == mandatory_bytes && limit == mandatory_bytes - 1
+    ));
 }
 
 #[test]
