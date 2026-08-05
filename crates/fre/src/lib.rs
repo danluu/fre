@@ -57,7 +57,7 @@ use core::fmt;
 
 use fre_kernels::FixedPredicateWord64SearchCursor;
 use memchr::{memchr, memchr2, memchr3};
-use regex_syntax::hir::{Hir, HirKind, Look};
+use regex_syntax::hir::{ClassBytesRange, Hir, HirKind, Look};
 
 mod aggregate;
 mod aggregate_construction;
@@ -560,7 +560,10 @@ pub use fre_kernels::{
     OrderedLiteralAggregateUpperBounds, PACKED_BOUNDED_PREFIX_LITERAL_COUNT_PLAN_ID,
     PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, PACKED_ORDERED_LITERAL_COUNT_PLAN_ID,
     PACKED_ORDERED_LITERAL_SPAN_SUM_PLAN_ID, PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID,
-    PREFIX_CLASS_ALTERNATION_PLAN_ID, PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID,
+    PREFIX_CLASS_ALTERNATION_EXISTS_OPERATION_ID, PREFIX_CLASS_ALTERNATION_PLAN_ID,
+    PREFIX_CLASS_ALTERNATION_SEARCH_OPERATION_ID,
+    PREFIX_CLASS_ALTERNATION_SHORTEST_SEARCH_OPERATION_ID,
+    PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID,
     PREFIX_CLASS_UNIFORM_PARTICIPATION_ACCOUNTING_VERSION,
     PREFIX_CLASS_UNIFORM_PARTICIPATION_ALGORITHM_VERSION,
     PREFIX_CLASS_UNIFORM_PARTICIPATION_OPERATION_ID, PREFIX_CLASS_UNIFORM_PARTICIPATION_PLAN_ID,
@@ -568,12 +571,15 @@ pub use fre_kernels::{
     PackedOrderedLiteralAggregateBuildAccounting, PackedOrderedLiteralAggregateBuildError,
     PackedOrderedLiteralAggregateBuildLimits, PackedOrderedLiteralAggregateOperationIdentity,
     PackedOrderedLiteralAggregateReduceError, PackedOrderedLiteralAggregateReduceLimits,
-    PackedOrderedLiteralAggregateUpperBounds, PrefixClassAlternationActualCounters,
+    DispatchedPrefixClassAlternationPlan, PackedOrderedLiteralAggregateUpperBounds,
+    PrefixClassAlternationActualCounters,
     PrefixClassAlternationBuildAccounting, PrefixClassAlternationBuildError,
     PrefixClassAlternationBuildLimits, PrefixClassAlternationOperationIdentity,
     PrefixClassAlternationReduceAccounting, PrefixClassAlternationReduceError,
     PrefixClassAlternationReduceLimits, PrefixClassAlternationRunScannerBuildAccounting,
-    PrefixClassAlternationSpanSumResult, PrefixClassAlternationUpperBounds,
+    PrefixClassAlternationSearchAccounting, PrefixClassAlternationSearchError,
+    PrefixClassAlternationSearchLimits, PrefixClassAlternationSpanSumResult,
+    PrefixClassAlternationUpperBounds, PrefixClassAlternationPlan,
     PrefixClassUniformParticipationAccounting, PrefixClassUniformParticipationActual,
     PrefixClassUniformParticipationAttempt, PrefixClassUniformParticipationAttemptError,
     PrefixClassUniformParticipationAttemptReceipt, PrefixClassUniformParticipationBuildAccounting,
@@ -1058,6 +1064,8 @@ pub enum PlanKind {
     LiteralClassRunLiteral,
     /// Ordered alternatives of `UNICODE_CLASS+ LITERAL UNICODE_CLASS+`.
     ReverseInner,
+    /// Ordered alternatives of `LITERAL BYTE_CLASS+` with two native anchors.
+    PrefixClassAlternation,
     /// Operation-specialized root byte class repeated one or more times.
     PureByteClassRepeat,
     /// Finite positive greedy byte-class sequence with deterministic boundaries.
@@ -1092,6 +1100,8 @@ pub enum BuildError {
     LiteralClassRunLiteral(LiteralClassRunLiteralBuildError),
     /// Reverse-inner proof revalidation or construction failure.
     ReverseInner(ReverseInnerBuildError),
+    /// Two-branch prefix/class proof revalidation or construction failure.
+    PrefixClassAlternation(PrefixClassAlternationBuildError),
     /// A forced required-literal request did not have the exact HIR shape.
     RequiredLiteralShape,
     /// Forward-anchored proof or construction failure.
@@ -1173,6 +1183,7 @@ impl BuildError {
             Self::RequiredLiteral(error) => required_literal_failure_class(error),
             Self::LiteralClassRunLiteral(error) => literal_class_run_literal_failure_class(error),
             Self::ReverseInner(error) => reverse_inner_failure_class(error),
+            Self::PrefixClassAlternation(error) => prefix_class_alternation_failure_class(error),
             Self::RequiredLiteralShape | Self::ForwardAnchoredShape => {
                 BuildFailureClass::Unsupported
             }
@@ -1270,6 +1281,32 @@ fn reverse_inner_failure_class(error: &ReverseInnerBuildError) -> BuildFailureCl
         }
         ReverseInnerBuildError::AllocationFailed { .. }
         | ReverseInnerBuildError::ArithmeticOverflow { .. } => BuildFailureClass::InternalFailure,
+        _ => BuildFailureClass::InternalFailure,
+    }
+}
+
+fn prefix_class_alternation_failure_class(
+    error: &PrefixClassAlternationBuildError,
+) -> BuildFailureClass {
+    match error {
+        PrefixClassAlternationBuildError::ShapeLimit { .. }
+        | PrefixClassAlternationBuildError::WorkLimit { .. }
+        | PrefixClassAlternationBuildError::ScratchLimit { .. }
+        | PrefixClassAlternationBuildError::PersistentLimit { .. }
+        | PrefixClassAlternationBuildError::PeakLimit { .. } => BuildFailureClass::ResourceLimit,
+        PrefixClassAlternationBuildError::EmptyPrefix { .. }
+        | PrefixClassAlternationBuildError::SelfOverlappingPrefix { .. }
+        | PrefixClassAlternationBuildError::EmptyClass { .. }
+        | PrefixClassAlternationBuildError::NonCanonicalClass { .. }
+        | PrefixClassAlternationBuildError::RunScannerDispatchUnavailable
+        | PrefixClassAlternationBuildError::NonAsciiRunScannerClass { .. } => {
+            BuildFailureClass::Unsupported
+        }
+        PrefixClassAlternationBuildError::RunScannerAllocationFailed { .. }
+        | PrefixClassAlternationBuildError::AllocationFailed { .. }
+        | PrefixClassAlternationBuildError::ArithmeticOverflow { .. } => {
+            BuildFailureClass::InternalFailure
+        }
         _ => BuildFailureClass::InternalFailure,
     }
 }
@@ -2549,6 +2586,9 @@ impl fmt::Display for BuildError {
             Self::ReverseInner(error) => {
                 write!(f, "reverse-inner construction failed: {error}")
             }
+            Self::PrefixClassAlternation(error) => {
+                write!(f, "prefix/class alternation construction failed: {error}")
+            }
             Self::RequiredLiteralShape => {
                 f.write_str("pattern is outside the forced required-literal HIR shape")
             }
@@ -2592,6 +2632,7 @@ impl std::error::Error for BuildError {
             Self::RequiredLiteral(error) => Some(error),
             Self::LiteralClassRunLiteral(error) => Some(error),
             Self::ReverseInner(error) => Some(error),
+            Self::PrefixClassAlternation(error) => Some(error),
             Self::ForwardAnchored(error) => Some(error),
             Self::RequiredLiteralShape
             | Self::ForwardAnchoredShape
@@ -2659,6 +2700,12 @@ impl From<LiteralClassRunLiteralBuildError> for BuildError {
 impl From<ReverseInnerBuildError> for BuildError {
     fn from(value: ReverseInnerBuildError) -> Self {
         Self::ReverseInner(value)
+    }
+}
+
+impl From<PrefixClassAlternationBuildError> for BuildError {
+    fn from(value: PrefixClassAlternationBuildError) -> Self {
+        Self::PrefixClassAlternation(value)
     }
 }
 
@@ -2858,6 +2905,8 @@ pub enum SearchAccounting {
     LiteralClassRunLiteral(LiteralClassRunLiteralSearchAccounting),
     /// Complete reverse-inner source-independent envelope and counters.
     ReverseInner(ReverseInnerSearchAccounting),
+    /// Complete two-prefix/class source-independent envelope and counters.
+    PrefixClassAlternation(PrefixClassAlternationSearchAccounting),
     /// Exact operation-specialized root byte-class repetition counters.
     PureByteClassRepeat(PureByteClassRepeatAccounting),
     /// Exact bounded byte-class sequence counters.
@@ -2892,6 +2941,7 @@ impl SearchAccounting {
             Self::RequiredLiteral(_) => PlanKind::RequiredLiteral,
             Self::LiteralClassRunLiteral(_) => PlanKind::LiteralClassRunLiteral,
             Self::ReverseInner(_) => PlanKind::ReverseInner,
+            Self::PrefixClassAlternation(_) => PlanKind::PrefixClassAlternation,
             Self::PureByteClassRepeat(_) => PlanKind::PureByteClassRepeat,
             Self::BoundedByteClassSequence(_) => PlanKind::BoundedByteClassSequence,
             Self::NullableOptionalChain(_) => PlanKind::RequiredLiteral,
@@ -2922,6 +2972,9 @@ impl SearchAccounting {
             Self::RequiredLiteral(accounting) => accounting.work_upper_bound,
             Self::LiteralClassRunLiteral(accounting) => accounting.work_upper_bound,
             Self::ReverseInner(accounting) => {
+                u64::try_from(accounting.upper_bounds.work).unwrap_or(u64::MAX)
+            }
+            Self::PrefixClassAlternation(accounting) => {
                 u64::try_from(accounting.upper_bounds.work).unwrap_or(u64::MAX)
             }
             Self::PureByteClassRepeat(accounting) => accounting.actual_work,
@@ -2969,6 +3022,7 @@ pub enum SearchError {
     RequiredLiteral(RequiredLiteralSearchError),
     LiteralClassRunLiteral(LiteralClassRunLiteralSearchError),
     ReverseInner(ReverseInnerSearchError),
+    PrefixClassAlternation(PrefixClassAlternationSearchError),
     PureByteClassRepeat(PureByteClassRepeatSearchError),
     BoundedByteClassSequence(BoundedByteClassSequenceSearchError),
     NullableOptionalChain(NullableOptionalChainSearchError),
@@ -2996,6 +3050,9 @@ impl fmt::Display for SearchError {
                 write!(f, "literal/class-run search failed: {error}")
             }
             Self::ReverseInner(error) => write!(f, "reverse-inner search failed: {error}"),
+            Self::PrefixClassAlternation(error) => {
+                write!(f, "prefix/class alternation search failed: {error}")
+            }
             Self::PureByteClassRepeat(error) => {
                 write!(f, "pure byte-class repeat search failed: {error}")
             }
@@ -3030,6 +3087,7 @@ impl std::error::Error for SearchError {
             Self::RequiredLiteral(error) => Some(error),
             Self::LiteralClassRunLiteral(error) => Some(error),
             Self::ReverseInner(error) => Some(error),
+            Self::PrefixClassAlternation(error) => Some(error),
             Self::PureByteClassRepeat(error) => Some(error),
             Self::BoundedByteClassSequence(error) => Some(error),
             Self::NullableOptionalChain(error) => Some(error),
@@ -3086,6 +3144,12 @@ impl From<LiteralClassRunLiteralSearchError> for SearchError {
 impl From<ReverseInnerSearchError> for SearchError {
     fn from(value: ReverseInnerSearchError) -> Self {
         Self::ReverseInner(value)
+    }
+}
+
+impl From<PrefixClassAlternationSearchError> for SearchError {
+    fn from(value: PrefixClassAlternationSearchError) -> Self {
+        Self::PrefixClassAlternation(value)
     }
 }
 
@@ -4297,11 +4361,201 @@ impl PortableBuilder {
                 });
             }
         }
-        let mut pure_byte_class_repeat_work = reverse_inner_work;
+        let mut prefix_class_alternation_work = reverse_inner_work;
+        if self.selection == PlanSelection::Auto {
+            let remaining = self
+                .limits
+                .max_planner_work
+                .checked_sub(reverse_inner_work)
+                .ok_or(BuildError::InternalInvariant(
+                    "reverse-inner planner work exceeded its enforced limit",
+                ))?;
+            let inspection_limit = usize::try_from(remaining).unwrap_or(usize::MAX);
+            let inspection = aggregate::inspect_prefix_class_alternation(
+                &rust.hir,
+                inspection_limit,
+            )
+            .map_err(|error| match error {
+                aggregate::PrefixClassInspectionError::WorkLimit { needed, .. } => {
+                    let needed = reverse_inner_work
+                        .saturating_add(u64::try_from(needed).unwrap_or(u64::MAX));
+                    BuildError::PlannerWorkLimit {
+                        needed,
+                        limit: self.limits.max_planner_work,
+                    }
+                }
+                aggregate::PrefixClassInspectionError::Overflow { .. } => {
+                    BuildError::InternalInvariant(
+                        "prefix/class ordinary-search inspection accounting overflowed",
+                    )
+                }
+            })?;
+            let (inspection_work, regret_work) = match &inspection {
+                aggregate::PrefixClassInspection::Eligible { work, .. } => (*work, 2_usize),
+                aggregate::PrefixClassInspection::PackedBoundedPrefixLiterals { work, .. }
+                | aggregate::PrefixClassInspection::Ineligible { work } => (*work, 0_usize),
+            };
+            let route_work = inspection_work.checked_add(regret_work).ok_or(
+                BuildError::InternalInvariant(
+                    "prefix/class ordinary-search regret accounting overflowed",
+                ),
+            )?;
+            prefix_class_alternation_work = reverse_inner_work
+                .checked_add(u64::try_from(route_work).map_err(|_| {
+                    BuildError::InternalInvariant(
+                        "prefix/class ordinary-search planner work does not fit u64",
+                    )
+                })?)
+                .ok_or(BuildError::InternalInvariant(
+                    "cumulative prefix/class ordinary-search planner work overflowed u64",
+                ))?;
+            if prefix_class_alternation_work > self.limits.max_planner_work {
+                return Err(BuildError::PlannerWorkLimit {
+                    needed: prefix_class_alternation_work,
+                    limit: self.limits.max_planner_work,
+                });
+            }
+            if let aggregate::PrefixClassInspection::Eligible {
+                prefixes,
+                classes,
+                hir_nodes,
+                captures,
+                ..
+            } = inspection
+                && prefixes.iter().all(|prefix| prefix.len() >= 2)
+            {
+                let expected_nodes = usize::try_from(syntax.hir_nodes).map_err(|_| {
+                    BuildError::InternalInvariant("syntax HIR-node count does not fit usize")
+                })?;
+                if hir_nodes != expected_nodes || captures != explicit_captures {
+                    return Err(BuildError::InternalInvariant(
+                        "syntax summary differs from prefix/class ordinary-search inspection",
+                    ));
+                }
+                let dispatch_gate_work = classes[0]
+                    .ranges()
+                    .len()
+                    .checked_add(classes[1].ranges().len())
+                    .and_then(|work| work.checked_add(2))
+                    .ok_or(BuildError::InternalInvariant(
+                        "prefix/class dispatch-gate accounting overflowed",
+                    ))?;
+                prefix_class_alternation_work = prefix_class_alternation_work
+                    .checked_add(u64::try_from(dispatch_gate_work).map_err(|_| {
+                        BuildError::InternalInvariant(
+                            "prefix/class dispatch-gate work does not fit u64",
+                        )
+                    })?)
+                    .ok_or(BuildError::InternalInvariant(
+                        "cumulative prefix/class dispatch-gate work overflowed u64",
+                    ))?;
+                if prefix_class_alternation_work > self.limits.max_planner_work {
+                    return Err(BuildError::PlannerWorkLimit {
+                        needed: prefix_class_alternation_work,
+                        limit: self.limits.max_planner_work,
+                    });
+                }
+                let dispatch = SimdDispatchContext::capture();
+                let all_ascii = classes.iter().all(|class| {
+                    class
+                        .ranges()
+                        .iter()
+                        .all(|range| range.end() <= 0x7f)
+                });
+                let run_scanners = PrefixClassAlternationPlan::run_scanners_usable(dispatch)
+                    && all_ascii;
+                let plan = if run_scanners {
+                    DispatchedPrefixClassAlternationPlan::build_with_dispatch(
+                        dispatch,
+                        prefixes,
+                        [
+                            classes[0]
+                                .ranges()
+                                .iter()
+                                .copied()
+                                .map(prefix_class_range_tuple),
+                            classes[1]
+                                .ranges()
+                                .iter()
+                                .copied()
+                                .map(prefix_class_range_tuple),
+                        ],
+                        prefix_class_alternation_build_limits(
+                            self.limits.literal_class_run_literal,
+                        ),
+                    )
+                    .map(PortablePlan::DispatchedPrefixClassAlternation)
+                } else {
+                    PrefixClassAlternationPlan::build(
+                        prefixes,
+                        [
+                            classes[0]
+                                .ranges()
+                                .iter()
+                                .copied()
+                                .map(prefix_class_range_tuple),
+                            classes[1]
+                                .ranges()
+                                .iter()
+                                .copied()
+                                .map(prefix_class_range_tuple),
+                        ],
+                        prefix_class_alternation_build_limits(
+                            self.limits.literal_class_run_literal,
+                        ),
+                    )
+                    .map(PortablePlan::PrefixClassAlternation)
+                }
+                .map_err(BuildError::PrefixClassAlternation)?;
+                let build = match &plan {
+                    PortablePlan::PrefixClassAlternation(plan) => plan.build_accounting(),
+                    PortablePlan::DispatchedPrefixClassAlternation(plan) => {
+                        plan.build_accounting()
+                    }
+                    _ => {
+                        return Err(BuildError::InternalInvariant(
+                            "prefix/class admission built another plan family",
+                        ));
+                    }
+                };
+                return Ok(PortableRegex {
+                    source,
+                    capture_names,
+                    line_total_grep_plan,
+                    plan,
+                    profile: profile.clone(),
+                    limits: self.limits,
+                    selection: self.selection,
+                    report: BuildReport {
+                        profile: profile.clone(),
+                        admission,
+                        syntax,
+                        plan: PlanKind::PrefixClassAlternation,
+                        planner_work: prefix_class_alternation_work,
+                        lowering: None,
+                        states: 0,
+                        edges: 0,
+                        plan_storage_bytes: build.persistent_bytes,
+                        source_storage_bytes,
+                        capture_name_storage_bytes,
+                        charged_persistent_bytes: 0,
+                        persistent_byte_limit: 0,
+                        captures_len,
+                        static_captures_len,
+                        minimum_match_bytes,
+                        required_literal: None,
+                        literal_class_run_literal: None,
+                        forward_anchored: None,
+                    }
+                    .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
+                });
+            }
+        }
+        let mut pure_byte_class_repeat_work = prefix_class_alternation_work;
         if self.selection == PlanSelection::Auto && self.pure_byte_class_repeat_allowed {
             let inspection = pure_byte_class_repeat::inspect(
                 &rust.hir,
-                reverse_inner_work,
+                prefix_class_alternation_work,
                 self.limits.max_planner_work,
             )
             .map_err(|error| match error {
@@ -5547,6 +5801,8 @@ enum PortablePlan {
     NullableFiniteTokenRepeat(Box<nullable_finite_token_repeat::Plan>),
     BoundedLiteralClassRun(Box<BoundedLiteralClassRunPlan>),
     ReverseInner(ReverseInnerPlan),
+    PrefixClassAlternation(PrefixClassAlternationPlan),
+    DispatchedPrefixClassAlternation(DispatchedPrefixClassAlternationPlan),
 }
 
 impl PortablePlan {
@@ -5578,6 +5834,8 @@ impl PortablePlan {
             Self::NullableOptionalChain(_) => nullable_optional_chain::PLAN_ID,
             Self::NullableFiniteTokenRepeat(_) => nullable_finite_token_repeat::PLAN_ID,
             Self::ReverseInner(plan) => plan.plan_id(),
+            Self::PrefixClassAlternation(_) => PREFIX_CLASS_ALTERNATION_PLAN_ID,
+            Self::DispatchedPrefixClassAlternation(plan) => plan.search_identity().plan_id,
         }
     }
 }
@@ -5759,6 +6017,21 @@ impl PortableRegex {
     ) -> Option<UnicodeFoldedLiteralSearchBuildAccounting> {
         match &self.plan {
             PortablePlan::UnicodeFoldedLiteral(plan) => Some(plan.build_accounting()),
+            _ => None,
+        }
+    }
+
+    /// Complete construction accounting for the admitted two-prefix/class
+    /// ordinary-search owner. Other plan families return `None`.
+    #[must_use]
+    pub fn prefix_class_alternation_build_accounting(
+        &self,
+    ) -> Option<PrefixClassAlternationBuildAccounting> {
+        match &self.plan {
+            PortablePlan::PrefixClassAlternation(plan) => Some(plan.build_accounting()),
+            PortablePlan::DispatchedPrefixClassAlternation(plan) => {
+                Some(plan.build_accounting())
+            }
             _ => None,
         }
     }
@@ -6113,6 +6386,22 @@ impl PortableRegex {
                 )?;
                 Ok((matched, SearchAccounting::ReverseInner(accounting)))
             }
+            PortablePlan::PrefixClassAlternation(plan) => {
+                let (matched, accounting) = plan.is_match_in(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    prefix_class_alternation_search_limits(limits),
+                )?;
+                Ok((matched, SearchAccounting::PrefixClassAlternation(accounting)))
+            }
+            PortablePlan::DispatchedPrefixClassAlternation(plan) => {
+                let (matched, accounting) = plan.is_match_in(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    prefix_class_alternation_search_limits(limits),
+                )?;
+                Ok((matched, SearchAccounting::PrefixClassAlternation(accounting)))
+            }
             PortablePlan::PureByteClassRepeat(plan) => {
                 let (matched, accounting) = plan.is_match_window(haystack, window, limits)?;
                 Ok((matched, SearchAccounting::PureByteClassRepeat(accounting)))
@@ -6339,6 +6628,22 @@ impl PortableRegex {
                     haystack,
                     LiteralWindow::new(window.start(), window.end()),
                     reverse_inner_search_limits(limits),
+                )
+                .map(|(matched, _)| matched)
+                .map_err(SearchError::from),
+            PortablePlan::PrefixClassAlternation(plan) => plan
+                .is_match_in(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    prefix_class_alternation_search_limits(limits),
+                )
+                .map(|(matched, _)| matched)
+                .map_err(SearchError::from),
+            PortablePlan::DispatchedPrefixClassAlternation(plan) => plan
+                .is_match_in(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    prefix_class_alternation_search_limits(limits),
                 )
                 .map(|(matched, _)| matched)
                 .map_err(SearchError::from),
@@ -6633,6 +6938,22 @@ impl PortableRegex {
                 )?;
                 Ok((end, SearchAccounting::ReverseInner(accounting)))
             }
+            PortablePlan::PrefixClassAlternation(plan) => {
+                let (end, accounting) = plan.shortest_in(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    prefix_class_alternation_search_limits(limits),
+                )?;
+                Ok((end, SearchAccounting::PrefixClassAlternation(accounting)))
+            }
+            PortablePlan::DispatchedPrefixClassAlternation(plan) => {
+                let (end, accounting) = plan.shortest_in(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    prefix_class_alternation_search_limits(limits),
+                )?;
+                Ok((end, SearchAccounting::PrefixClassAlternation(accounting)))
+            }
             PortablePlan::PureByteClassRepeat(plan) => {
                 let (end, accounting) = plan.earliest_end_window(haystack, window, limits)?;
                 Ok((end, SearchAccounting::PureByteClassRepeat(accounting)))
@@ -6851,6 +7172,22 @@ impl PortableRegex {
                 Ok((
                     matched.map(|(_, end)| end),
                     SearchAccounting::ReverseInner(accounting),
+                ))
+            }
+            PortablePlan::PrefixClassAlternation(plan) => {
+                let (matched, accounting) =
+                    plan.find(haystack, prefix_class_alternation_search_limits(limits))?;
+                Ok((
+                    matched.map(|(_, end)| end),
+                    SearchAccounting::PrefixClassAlternation(accounting),
+                ))
+            }
+            PortablePlan::DispatchedPrefixClassAlternation(plan) => {
+                let (matched, accounting) =
+                    plan.find(haystack, prefix_class_alternation_search_limits(limits))?;
+                Ok((
+                    matched.map(|(_, end)| end),
+                    SearchAccounting::PrefixClassAlternation(accounting),
                 ))
             }
             PortablePlan::PureByteClassRepeat(plan) => {
@@ -7333,6 +7670,28 @@ impl PortableRegex {
                     SearchAccounting::ReverseInner(accounting),
                 ))
             }
+            PortablePlan::PrefixClassAlternation(plan) => {
+                let (matched, accounting) = plan.find_in(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    prefix_class_alternation_search_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    SearchAccounting::PrefixClassAlternation(accounting),
+                ))
+            }
+            PortablePlan::DispatchedPrefixClassAlternation(plan) => {
+                let (matched, accounting) = plan.find_in(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    prefix_class_alternation_search_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    SearchAccounting::PrefixClassAlternation(accounting),
+                ))
+            }
             PortablePlan::PureByteClassRepeat(plan) => {
                 let (matched, accounting) = plan.find_window(haystack, window, limits)?;
                 Ok((matched, SearchAccounting::PureByteClassRepeat(accounting)))
@@ -7564,6 +7923,22 @@ impl PortableRegex {
                 )
                 .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
                 .map_err(SearchError::from),
+            PortablePlan::PrefixClassAlternation(plan) => plan
+                .find_in(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    prefix_class_alternation_search_limits(limits),
+                )
+                .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
+            PortablePlan::DispatchedPrefixClassAlternation(plan) => plan
+                .find_in(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    prefix_class_alternation_search_limits(limits),
+                )
+                .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
             PortablePlan::PureByteClassRepeat(plan) => plan
                 .find_window(haystack, window, limits)
                 .map(|(matched, _)| matched)
@@ -7770,6 +8145,28 @@ impl PortableRegex {
                     haystack,
                     window,
                     reverse_inner_search_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    u64::try_from(accounting.upper_bounds.work).unwrap_or(u64::MAX),
+                ))
+            }
+            PortablePlan::PrefixClassAlternation(plan) => {
+                let (matched, accounting) = plan.find_in(
+                    haystack,
+                    window,
+                    prefix_class_alternation_search_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    u64::try_from(accounting.upper_bounds.work).unwrap_or(u64::MAX),
+                ))
+            }
+            PortablePlan::DispatchedPrefixClassAlternation(plan) => {
+                let (matched, accounting) = plan.find_in(
+                    haystack,
+                    window,
+                    prefix_class_alternation_search_limits(limits),
                 )?;
                 Ok((
                     matched.map(|(start, end)| Match { start, end }),
@@ -11995,11 +12392,38 @@ const fn reverse_inner_build_limits(
     }
 }
 
+const fn prefix_class_alternation_build_limits(
+    limits: LiteralClassRunLiteralBuildLimits,
+) -> PrefixClassAlternationBuildLimits {
+    PrefixClassAlternationBuildLimits {
+        max_shape_units: limits
+            .max_literal_bytes
+            .saturating_add(limits.max_class_ranges.saturating_mul(2)),
+        max_build_work: limits.max_build_work,
+        max_scratch_bytes: limits.max_scratch_bytes,
+        max_persistent_bytes: limits.max_persistent_bytes,
+        max_peak_bytes: limits.max_peak_bytes,
+    }
+}
+
 const fn reverse_inner_search_limits(limits: SearchLimits) -> ReverseInnerSearchLimits {
     ReverseInnerSearchLimits {
         max_work_upper_bound: limits.max_work,
         max_scratch_bytes: limits.max_scratch_bytes,
     }
+}
+
+const fn prefix_class_alternation_search_limits(
+    limits: SearchLimits,
+) -> PrefixClassAlternationSearchLimits {
+    PrefixClassAlternationSearchLimits {
+        max_work_upper_bound: limits.max_work,
+        max_scratch_bytes: limits.max_scratch_bytes,
+    }
+}
+
+const fn prefix_class_range_tuple(range: ClassBytesRange) -> (u8, u8) {
+    (range.start(), range.end())
 }
 
 fn forward_anchored_limits(limits: SearchLimits) -> ForwardAnchoredSearchLimits {

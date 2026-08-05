@@ -73,13 +73,17 @@ use fre_simd_kernels::{
 };
 use memchr::memmem::{Finder, FinderBuilder};
 
-use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptError};
+use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptError, Window};
 
 pub const PLAN_ID: &str = "prefix-class-alternation.two-monotone-literal-streams.v1";
 pub const DISPATCHED_PLAN_ID: &str =
     "prefix-class-alternation.two-monotone-literal-streams.sve-run16.v1";
 pub const COUNT_OPERATION_ID: &str = "prefix-class-alternation.count.unicode-off.v1";
 pub const SPAN_SUM_OPERATION_ID: &str = "prefix-class-alternation.span-sum.unicode-off.v1";
+pub const EXISTS_OPERATION_ID: &str = "prefix-class-alternation.exists.unicode-off.v1";
+pub const SEARCH_OPERATION_ID: &str = "prefix-class-alternation.search.unicode-off.v1";
+pub const SHORTEST_SEARCH_OPERATION_ID: &str =
+    "prefix-class-alternation.shortest.unicode-off.v1";
 pub const UNIFORM_PARTICIPATION_PLAN_ID: &str =
     "prefix-class-alternation.uniform-participation.two-finder.v1";
 pub const DISPATCHED_UNIFORM_PARTICIPATION_PLAN_ID: &str =
@@ -118,6 +122,9 @@ enum ReduceImplementation {
 enum Operation {
     Count,
     SpanSum,
+    Exists,
+    Search,
+    Shortest,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -343,6 +350,8 @@ pub struct ReduceUpperBounds {
     pub haystack_bytes: usize,
     pub shape_units: usize,
     pub work: usize,
+    pub prefix_candidates: usize,
+    pub class_bytes: usize,
     pub match_events: usize,
     pub count: u64,
     pub span_sum: u64,
@@ -367,6 +376,44 @@ pub struct ReduceAccounting {
     pub actual: ReduceActualCounters,
 }
 
+/// Limits checked from a complete source-independent ordinary-search envelope.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SearchLimits {
+    pub max_work_upper_bound: u64,
+    pub max_scratch_bytes: usize,
+}
+
+impl SearchLimits {
+    #[must_use]
+    pub const fn unlimited() -> Self {
+        Self {
+            max_work_upper_bound: u64::MAX,
+            max_scratch_bytes: usize::MAX,
+        }
+    }
+}
+
+impl Default for SearchLimits {
+    fn default() -> Self {
+        Self {
+            max_work_upper_bound: 32_u64 << 30,
+            max_scratch_bytes: 0,
+        }
+    }
+}
+
+/// Source-independent search envelope and exact structural counters.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SearchAccounting {
+    pub identity: OperationIdentity,
+    pub window: Window,
+    pub upper_bounds: ReduceUpperBounds,
+    pub actual: ReduceActualCounters,
+}
+
+/// Ordinary search shares the reducer's checked arithmetic and limit errors.
+pub type SearchError = ReduceError;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CountResult {
     pub count: u64,
@@ -379,6 +426,13 @@ pub struct SpanSumResult {
     pub accounting: ReduceAccounting,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SearchProjection {
+    Exists,
+    Selected,
+    EarliestEnd,
+}
+
 /// Derive the complete source-free reduction envelope for a retained implementation.
 fn derive_reduce_upper_bounds(
     build: BuildAccounting,
@@ -387,6 +441,11 @@ fn derive_reduce_upper_bounds(
     operation: Operation,
 ) -> Result<ReduceUpperBounds, ReduceError> {
     let match_events = haystack_len;
+    let prefix_candidates = haystack_len
+        .checked_mul(2)
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "two prefix candidate streams",
+        })?;
     let scanner_overhead = match implementation {
         ReduceImplementation::Scalar => 0,
         ReduceImplementation::DispatchedRunScanners => match_events
@@ -395,6 +454,12 @@ fn derive_reduce_upper_bounds(
                 computation: "run scanner classification overhead",
             })?,
     };
+    let class_bytes = haystack_len
+        .checked_mul(4)
+        .and_then(|bytes| bytes.checked_add(scanner_overhead))
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "prefix probes, greedy class extension, and scanner overhead",
+        })?;
     let work = haystack_len
         .checked_mul(16)
         .and_then(|work| {
@@ -412,7 +477,7 @@ fn derive_reduce_upper_bounds(
         computation: "match event bound as u64",
     })?;
     let span_sum = match operation {
-        Operation::Count => 0,
+        Operation::Count | Operation::Exists | Operation::Search | Operation::Shortest => 0,
         Operation::SpanSum => {
             u64::try_from(haystack_len).map_err(|_| ReduceError::ArithmeticOverflow {
                 computation: "haystack length as span-sum bound",
@@ -423,6 +488,8 @@ fn derive_reduce_upper_bounds(
         haystack_bytes: haystack_len,
         shape_units: build.shape_units,
         work,
+        prefix_candidates,
+        class_bytes,
         match_events,
         count,
         span_sum,
@@ -807,12 +874,22 @@ impl std::error::Error for BuildError {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ReduceError {
+    InvalidWindow {
+        start: usize,
+        end: usize,
+        haystack_len: usize,
+    },
     WorkLimit { needed: usize, limit: usize },
     MatchEventsLimit { needed: usize, limit: usize },
     CountLimit { needed: u64, limit: u64 },
     SpanSumLimit { needed: u64, limit: u64 },
     ScratchLimit { needed: usize, limit: usize },
     PeakLimit { needed: usize, limit: usize },
+    AccountingInvariant {
+        resource: &'static str,
+        actual: usize,
+        upper: usize,
+    },
     ArithmeticOverflow { computation: &'static str },
 }
 
@@ -1202,6 +1279,31 @@ impl PrefixClassAlternationPlan {
         }
     }
 
+    #[must_use]
+    pub const fn exists_identity(&self) -> OperationIdentity {
+        self.search_operation_identity(EXISTS_OPERATION_ID)
+    }
+
+    #[must_use]
+    pub const fn search_identity(&self) -> OperationIdentity {
+        self.search_operation_identity(SEARCH_OPERATION_ID)
+    }
+
+    #[must_use]
+    pub const fn shortest_identity(&self) -> OperationIdentity {
+        self.search_operation_identity(SHORTEST_SEARCH_OPERATION_ID)
+    }
+
+    const fn search_operation_identity(&self, operation_id: &'static str) -> OperationIdentity {
+        OperationIdentity {
+            plan_id: PLAN_ID,
+            operation_id,
+            alternatives: 2,
+            unicode: false,
+            non_overlapping: true,
+        }
+    }
+
     /// Publish the scalar plan's exact source-free full-window count envelope.
     pub fn count_upper_bounds(
         &self,
@@ -1298,6 +1400,327 @@ impl PrefixClassAlternationPlan {
                 actual,
             },
         })
+    }
+
+    /// Find the selected leftmost-first span in the complete haystack.
+    pub fn find(
+        &self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
+        self.find_in(haystack, Window::full(haystack), limits)
+    }
+
+    /// Find the selected leftmost-first span wholly inside `window`.
+    pub fn find_in(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
+        self.search_in_with_run_scanners(
+            haystack,
+            window,
+            limits,
+            SearchProjection::Selected,
+            Operation::Search,
+            self.search_identity(),
+            [None, None],
+        )
+    }
+
+    /// Report whether a match exists in the complete haystack.
+    pub fn is_match(
+        &self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<(bool, SearchAccounting), SearchError> {
+        self.is_match_in(haystack, Window::full(haystack), limits)
+    }
+
+    /// Report whether a match exists wholly inside `window`.
+    pub fn is_match_in(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<(bool, SearchAccounting), SearchError> {
+        let (matched, accounting) = self.search_in_with_run_scanners(
+            haystack,
+            window,
+            limits,
+            SearchProjection::Exists,
+            Operation::Exists,
+            self.exists_identity(),
+            [None, None],
+        )?;
+        Ok((matched.is_some(), accounting))
+    }
+
+    /// Return the first accepting end offset in the complete haystack.
+    pub fn shortest(
+        &self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<(Option<usize>, SearchAccounting), SearchError> {
+        self.shortest_in(haystack, Window::full(haystack), limits)
+    }
+
+    /// Return the first accepting end offset wholly inside `window`.
+    pub fn shortest_in(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<(Option<usize>, SearchAccounting), SearchError> {
+        let (matched, accounting) = self.search_in_with_run_scanners(
+            haystack,
+            window,
+            limits,
+            SearchProjection::EarliestEnd,
+            Operation::Shortest,
+            self.shortest_identity(),
+            [None, None],
+        )?;
+        Ok((matched.map(|(_, end)| end), accounting))
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "projection, identity, and retained scanner choice remain authenticated at one search boundary"
+    )]
+    fn search_in_with_run_scanners(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+        projection: SearchProjection,
+        operation: Operation,
+        identity: OperationIdentity,
+        run_scanners: [Option<&AsciiByteSetRunScanner>; RUN_SCANNERS],
+    ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
+        let upper_bounds = self.search_preflight(
+            haystack,
+            window,
+            limits,
+            operation,
+            run_scanners[0].is_some(),
+        )?;
+        let (matched, actual) = self.execute_search(
+            haystack,
+            window,
+            projection,
+            upper_bounds,
+            run_scanners,
+        )?;
+        Ok((
+            matched,
+            SearchAccounting {
+                identity,
+                window,
+                upper_bounds,
+                actual,
+            },
+        ))
+    }
+
+    fn search_preflight(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+        operation: Operation,
+        run_scanners: bool,
+    ) -> Result<ReduceUpperBounds, SearchError> {
+        if window.start() > window.end() || window.end() > haystack.len() {
+            return Err(ReduceError::InvalidWindow {
+                start: window.start(),
+                end: window.end(),
+                haystack_len: haystack.len(),
+            });
+        }
+        let window_bytes = window.end().checked_sub(window.start()).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "prefix/class search window byte length",
+            },
+        )?;
+        let implementation = if run_scanners {
+            ReduceImplementation::DispatchedRunScanners
+        } else {
+            ReduceImplementation::Scalar
+        };
+        let upper_bounds =
+            derive_reduce_upper_bounds(self.build_accounting(), window_bytes, implementation, operation)?;
+        let work = u64::try_from(upper_bounds.work).unwrap_or(u64::MAX);
+        if work > limits.max_work_upper_bound {
+            return Err(ReduceError::WorkLimit {
+                needed: upper_bounds.work,
+                limit: usize::try_from(limits.max_work_upper_bound).unwrap_or(usize::MAX),
+            });
+        }
+        enforce_reduce(
+            upper_bounds.scratch_bytes,
+            limits.max_scratch_bytes,
+            ReduceResource::Scratch,
+        )?;
+        Ok(upper_bounds)
+    }
+
+    #[allow(
+        clippy::needless_range_loop,
+        clippy::too_many_lines,
+        reason = "the two monotone streams keep source reads, exact counters, and early-stop proofs adjacent"
+    )]
+    fn execute_search(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        projection: SearchProjection,
+        upper: ReduceUpperBounds,
+        run_scanners: [Option<&AsciiByteSetRunScanner>; RUN_SCANNERS],
+    ) -> Result<(Option<(usize, usize)>, ReduceActualCounters), SearchError> {
+        let input = haystack.get(window.start()..window.end()).ok_or(
+            ReduceError::InvalidWindow {
+                start: window.start(),
+                end: window.end(),
+                haystack_len: haystack.len(),
+            },
+        )?;
+        let bounded_haystack = haystack.get(..window.end()).ok_or(
+            ReduceError::InvalidWindow {
+                start: window.start(),
+                end: window.end(),
+                haystack_len: haystack.len(),
+            },
+        )?;
+        let mut streams = [
+            self.alternatives[0].finder.find_iter(input),
+            self.alternatives[1].finder.find_iter(input),
+        ];
+        let mut next = [None; 2];
+        for alternative in 0..2 {
+            next[alternative] = streams[alternative]
+                .next()
+                .map(|relative| {
+                    window.start().checked_add(relative).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "absolute prefix/class candidate start",
+                        },
+                    )
+                })
+                .transpose()?;
+        }
+
+        let mut prefix_candidates = 0_usize;
+        let mut class_bytes = 0_usize;
+        let mut earliest = None::<(usize, usize)>;
+        loop {
+            let alternative = match (next[0], next[1]) {
+                (None, None) => {
+                    return finish_search_execution(
+                        earliest,
+                        prefix_candidates,
+                        class_bytes,
+                        upper,
+                    );
+                }
+                (Some(_), None) => 0,
+                (None, Some(_)) => 1,
+                // Branch zero retains source priority on an equal start.
+                (Some(left), Some(right)) => usize::from(right < left),
+            };
+            let start = next[alternative].ok_or(ReduceError::ArithmeticOverflow {
+                computation: "selected prefix/class search candidate",
+            })?;
+            if projection == SearchProjection::EarliestEnd
+                && earliest.is_some_and(|(_, end)| start >= end)
+            {
+                return finish_search_execution(
+                    earliest,
+                    prefix_candidates,
+                    class_bytes,
+                    upper,
+                );
+            }
+            next[alternative] = streams[alternative]
+                .next()
+                .map(|relative| {
+                    window.start().checked_add(relative).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "next absolute prefix/class candidate start",
+                        },
+                    )
+                })
+                .transpose()?;
+            prefix_candidates = prefix_candidates.checked_add(1).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "ordinary prefix/class candidate count",
+                },
+            )?;
+            let prefix_end = start
+                .checked_add(self.alternatives[alternative].finder.needle().len())
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "ordinary prefix/class literal end",
+                })?;
+            if prefix_end >= window.end() {
+                continue;
+            }
+            let first_class_byte = *haystack.get(prefix_end).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "ordinary prefix/class first class byte",
+                },
+            )?;
+            class_bytes = class_bytes.checked_add(1).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "ordinary prefix/class classification count",
+                },
+            )?;
+            if !self.alternatives[alternative]
+                .class
+                .contains(first_class_byte)
+            {
+                continue;
+            }
+            let accepting_end = prefix_end.checked_add(1).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "ordinary prefix/class first accepting end",
+                },
+            )?;
+            match projection {
+                SearchProjection::Exists => {
+                    return finish_search_execution(
+                        Some((start, accepting_end)),
+                        prefix_candidates,
+                        class_bytes,
+                        upper,
+                    );
+                }
+                SearchProjection::Selected => {
+                    let extension = extend_greedy_class(
+                        bounded_haystack,
+                        accepting_end,
+                        self.alternatives[alternative].class,
+                        run_scanners[alternative],
+                    );
+                    class_bytes = class_bytes
+                        .checked_add(extension.physical_classifications)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "ordinary prefix/class greedy classifications",
+                        })?;
+                    return finish_search_execution(
+                        Some((start, extension.end)),
+                        prefix_candidates,
+                        class_bytes,
+                        upper,
+                    );
+                }
+                SearchProjection::EarliestEnd => {
+                    if earliest.is_none_or(|(_, old_end)| accepting_end < old_end) {
+                        earliest = Some((start, accepting_end));
+                    }
+                }
+            }
+        }
     }
 
     #[must_use]
@@ -2052,6 +2475,49 @@ impl PrefixClassAlternationPlan {
     }
 }
 
+fn finish_search_execution(
+    matched: Option<(usize, usize)>,
+    prefix_candidates: usize,
+    class_bytes: usize,
+    upper: ReduceUpperBounds,
+) -> Result<(Option<(usize, usize)>, ReduceActualCounters), SearchError> {
+    let matches = usize::from(matched.is_some());
+    verify_search_counter(
+        "prefix candidates",
+        prefix_candidates,
+        upper.prefix_candidates,
+    )?;
+    verify_search_counter("class bytes", class_bytes, upper.class_bytes)?;
+    verify_search_counter("match events", matches, upper.match_events)?;
+    Ok((
+        matched,
+        ReduceActualCounters {
+            prefix_candidates,
+            class_bytes,
+            matches,
+            count: u64::try_from(matches).map_err(|_| ReduceError::ArithmeticOverflow {
+                computation: "ordinary prefix/class match count as u64",
+            })?,
+            span_sum: 0,
+        },
+    ))
+}
+
+fn verify_search_counter(
+    resource: &'static str,
+    actual: usize,
+    upper: usize,
+) -> Result<(), SearchError> {
+    if actual <= upper {
+        return Ok(());
+    }
+    Err(ReduceError::AccountingInvariant {
+        resource,
+        actual,
+        upper,
+    })
+}
+
 impl DispatchedPrefixClassAlternationPlan {
     /// Build the distinct fixed-16 SVE owner from one caller-captured host
     /// snapshot. Hosts without OS-usable SVE are rejected before input access.
@@ -2299,6 +2765,31 @@ impl DispatchedPrefixClassAlternationPlan {
         }
     }
 
+    #[must_use]
+    pub const fn exists_identity(&self) -> OperationIdentity {
+        self.search_operation_identity(EXISTS_OPERATION_ID)
+    }
+
+    #[must_use]
+    pub const fn search_identity(&self) -> OperationIdentity {
+        self.search_operation_identity(SEARCH_OPERATION_ID)
+    }
+
+    #[must_use]
+    pub const fn shortest_identity(&self) -> OperationIdentity {
+        self.search_operation_identity(SHORTEST_SEARCH_OPERATION_ID)
+    }
+
+    const fn search_operation_identity(&self, operation_id: &'static str) -> OperationIdentity {
+        OperationIdentity {
+            plan_id: DISPATCHED_PLAN_ID,
+            operation_id,
+            alternatives: 2,
+            unicode: false,
+            non_overlapping: true,
+        }
+    }
+
     /// Publish the dispatched plan's exact source-free full-window count
     /// envelope, including retained run-scanner classifications.
     pub fn count_upper_bounds(
@@ -2347,6 +2838,83 @@ impl DispatchedPrefixClassAlternationPlan {
             self.span_sum_identity(),
             self.scanner_refs(),
         )
+    }
+
+    pub fn find(
+        &self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
+        self.find_in(haystack, Window::full(haystack), limits)
+    }
+
+    pub fn find_in(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
+        self.plan().search_in_with_run_scanners(
+            haystack,
+            window,
+            limits,
+            SearchProjection::Selected,
+            Operation::Search,
+            self.search_identity(),
+            self.scanner_refs(),
+        )
+    }
+
+    pub fn is_match(
+        &self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<(bool, SearchAccounting), SearchError> {
+        self.is_match_in(haystack, Window::full(haystack), limits)
+    }
+
+    pub fn is_match_in(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<(bool, SearchAccounting), SearchError> {
+        let (matched, accounting) = self.plan().search_in_with_run_scanners(
+            haystack,
+            window,
+            limits,
+            SearchProjection::Exists,
+            Operation::Exists,
+            self.exists_identity(),
+            self.scanner_refs(),
+        )?;
+        Ok((matched.is_some(), accounting))
+    }
+
+    pub fn shortest(
+        &self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<(Option<usize>, SearchAccounting), SearchError> {
+        self.shortest_in(haystack, Window::full(haystack), limits)
+    }
+
+    pub fn shortest_in(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<(Option<usize>, SearchAccounting), SearchError> {
+        let (matched, accounting) = self.plan().search_in_with_run_scanners(
+            haystack,
+            window,
+            limits,
+            SearchProjection::EarliestEnd,
+            Operation::Shortest,
+            self.shortest_identity(),
+            self.scanner_refs(),
+        )?;
+        Ok((matched.map(|(_, end)| end), accounting))
     }
 
     #[must_use]
