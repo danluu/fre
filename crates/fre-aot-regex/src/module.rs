@@ -3245,6 +3245,8 @@ fn build_native_dfa_table_with_cost_model(
     let mut selected_suffix_filter =
         if view.exact_product_width.is_some() || view.partial_discovered_states.is_some() {
             None
+        } else if let Some(requirement) = view.retained_suffix_requirement {
+            derive_retained_terminal_suffix_filter(view, requirement)?
         } else {
             derive_suffix_filter(view)?
         };
@@ -4547,6 +4549,69 @@ fn derive_suffix_filter(
     Ok(best)
 }
 
+/// Rebuild the exact terminal primary already authenticated by a complete
+/// retained fallback. The portable entry selected this aligned column before
+/// native lowering; choosing a different legal terminal or interior column
+/// here would only make the emitted receipt reject the otherwise safe direct
+/// route. Graph membership is checked again before any target lowering, and
+/// the final emitted-scanner receipt remains the publication authority.
+fn derive_retained_terminal_suffix_filter(
+    view: NativeProgramView<'_>,
+    requirement: NativeRetainedSuffixRequirement,
+) -> Result<Option<NativeSuffixFilter>, ObjectError> {
+    if view.dfa.initial_pending {
+        return Ok(None);
+    }
+    let suffix_sets = view.anchored_suffix.sets();
+    let minimum_width = u8::try_from(suffix_sets.len())
+        .map_err(|_| ObjectError::ArithmeticOverflow("native minimum retained suffix width"))?;
+    if minimum_width == 0 || minimum_width != requirement.minimum_width {
+        return Ok(None);
+    }
+    let scan_offset = usize::from(requirement.scan_offset);
+    let Some(required_set) = suffix_sets.iter().rev().nth(scan_offset) else {
+        return Ok(None);
+    };
+    if required_set.words() != requirement.membership {
+        return Ok(None);
+    }
+    let Some(mut filter) = filter_from_membership_words(
+        requirement.membership,
+        scan_offset,
+        false,
+    )? else {
+        return Ok(None);
+    };
+    filter.from_anchored_prefix = false;
+
+    let mut forward_sets = Vec::new();
+    forward_sets
+        .try_reserve_exact(suffix_sets.len())
+        .map_err(|_| ObjectError::InvalidModule("native retained suffix allocation failed"))?;
+    forward_sets.extend(suffix_sets.iter().rev().copied());
+    let mut vector_filter = derive_vector_filter(Some(filter), &forward_sets)?;
+    if let Some(columns) = &mut vector_filter {
+        for column in &mut columns.columns[..usize::from(columns.column_count)] {
+            column.from_anchored_prefix = false;
+        }
+    }
+    let scalar_filter = if vector_filter.is_none()
+        && estimated_filter_frequency_units(filter)
+            <= MAX_SCALAR_REFINEMENT_PRIMARY_FREQUENCY_UNITS
+    {
+        derive_scalar_aligned_filter(filter, &forward_sets)?
+    } else {
+        None
+    };
+    finish_terminal_suffix_filter(
+        view,
+        minimum_width,
+        filter,
+        vector_filter,
+        scalar_filter,
+    )
+}
+
 /// Build an independently determinized reverse proof for mandatory factors in
 /// the Exists contract. It can return directly for an Accept seed and can use
 /// one ordered forward replay for an interior seed after raising the semantic
@@ -4602,6 +4667,22 @@ fn derive_terminal_suffix_filter(
     else {
         return Ok(None);
     };
+    finish_terminal_suffix_filter(
+        view,
+        minimum_width,
+        filter,
+        vector_filter,
+        scalar_filter,
+    )
+}
+
+fn finish_terminal_suffix_filter(
+    view: NativeProgramView<'_>,
+    minimum_width: u8,
+    filter: NativeStartFilter,
+    vector_filter: Option<NativeVectorFilter>,
+    scalar_filter: Option<NativeVectorFilter>,
+) -> Result<Option<NativeSuffixFilter>, ObjectError> {
     let restart = if let Some(maximum_width) = view.max_match_width {
         let maximum_width = u64::try_from(maximum_width)
             .map_err(|_| ObjectError::ArithmeticOverflow("native maximum match width"))?;
@@ -17992,6 +18073,54 @@ mod tests {
         assert_eq!(restored_module.symbols(), compiled.module().symbols());
         assert_eq!(restored_module.relocations(), compiled.module().relocations());
         assert_eq!(restored_module.start_accelerator(), StartAccelerator::None);
+    }
+
+    #[test]
+    fn retained_suffix_requirement_owns_native_primary_selection() {
+        let target = Target::x86_64_linux();
+        let compiled = complete_forward_resource_fallback(
+            "[b-c][a-b]{1,10}xyz",
+            OutputContract::Exists,
+            target,
+        );
+        let mut view = compiled
+            .program()
+            .native_dfa_view()
+            .expect("complete retained suffix view");
+        let ordinary = derive_suffix_filter(view)
+            .unwrap()
+            .expect("ordinary suffix selection");
+        let mut carried = None;
+        for (position, set) in view.anchored_suffix.sets().iter().rev().enumerate() {
+            let scan_offset = u8::try_from(position).expect("small anchored suffix");
+            if scan_offset != ordinary.filter.scan_offset
+                && filter_from_membership_words(set.words(), position, false)
+                    .unwrap()
+                    .is_some()
+            {
+                carried = Some((scan_offset, set.words()));
+                break;
+            }
+        }
+        let (scan_offset, membership) =
+            carried.expect("a second representable terminal column");
+        let requirement = view
+            .retained_suffix_requirement
+            .as_mut()
+            .expect("portable retained suffix requirement");
+        requirement.scan_offset = scan_offset;
+        requirement.membership = membership;
+
+        let (_, layout) = build_native_dfa_table(view).expect("forced retained suffix layout");
+        let suffix = layout
+            .suffix_filter
+            .expect("carried terminal primary survives selection");
+        assert_eq!(suffix.filter.scan_offset, scan_offset);
+        assert_eq!(start_filter_membership(suffix.filter).unwrap(), membership);
+        assert!(
+            lower_native_dfa(view, target).unwrap().is_some(),
+            "an exact emitted receipt should publish the carried terminal primary"
+        );
     }
 
     #[test]
