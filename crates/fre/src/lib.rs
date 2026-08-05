@@ -5536,11 +5536,14 @@ impl PortableBuilder {
             negative_prefilter.plan = None;
             negative_prefilter.storage_bytes = 0;
         }
-        let correlated_terminal_storage_bytes = if correlated_terminal.is_some() {
-            candidate_correlated_terminal_storage_bytes
-        } else {
-            0
-        };
+        let correlated_terminal_storage_bytes = correlated_terminal
+            .as_ref()
+            .map_or(0, correlated_bounded_alternation::Plan::storage_bytes);
+        debug_assert!(
+            correlated_terminal.is_none()
+                || correlated_terminal_storage_bytes
+                    == candidate_correlated_terminal_storage_bytes
+        );
         let plan_storage_bytes = automaton_stats
             .storage_bytes()
             .checked_add(mandatory_suffix_storage_bytes)
