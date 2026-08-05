@@ -947,6 +947,10 @@ pub struct ReverseInnerPlan {
     non_ascii: ExactVec<ScalarRange>,
     finders: ExactVec<Finder<'static>>,
     union_state: ExactBoxOrUsize<UnionState>,
+    /// Construction-bound receipt cached before publication. Recomputing the
+    /// byte-wise digest while publishing every operation identity would make
+    /// receipt authentication part of the steady-state source path.
+    union_receipt_digest: u64,
     build: BuildAccounting,
 }
 
@@ -1405,11 +1409,13 @@ impl ReverseInnerPlan {
                 persistent_bytes,
                 peak_bytes,
             };
+            let union_receipt_digest = build.union_receipt_digest();
             Ok(Self {
                 ascii,
                 non_ascii,
                 finders,
                 union_state,
+                union_receipt_digest,
                 build,
             })
         })();
@@ -1486,7 +1492,7 @@ impl ReverseInnerPlan {
             literal_count: self.build.literal_count,
             literal_bytes: self.build.literal_bytes,
             literal_fingerprint: self.build.literal_fingerprint,
-            union_receipt_digest: self.build.union_receipt_digest(),
+            union_receipt_digest: self.union_receipt_digest,
             unicode: true,
             greedy: true,
             leftmost_first: true,
@@ -4646,6 +4652,20 @@ mod tests {
             .expect("eligible reverse-inner plan")
     }
 
+    fn assert_cached_receipt_identity(plan: &ReverseInnerPlan) {
+        let derived = plan.build_accounting().union_receipt_digest();
+        assert_eq!(plan.union_receipt_digest, derived);
+        for identity in [
+            plan.count_identity(),
+            plan.span_sum_identity(),
+            plan.search_identity(),
+            plan.exists_identity(),
+            plan.shortest_identity(),
+        ] {
+            assert_eq!(identity.union_receipt_digest, derived);
+        }
+    }
+
     fn oracle(pattern: &str) -> Regex {
         RegexBuilder::new(pattern)
             .unicode(true)
@@ -5502,6 +5522,7 @@ mod tests {
     #[test]
     fn union_modes_preserve_distinct_roots_and_group_only_shared_roots() {
         let ascii_64 = plan(&[('\0', '?'), ('λ', 'λ')], &[b"0", b"1"]);
+        assert_cached_receipt_identity(&ascii_64);
         assert_eq!(ascii_64.build_accounting().ascii_scalars, 64);
         assert_eq!(ascii_64.build_accounting().non_ascii_scalars, 1);
         assert!(ascii_64.build_accounting().adaptive_union);
@@ -5527,6 +5548,7 @@ mod tests {
         );
 
         let ascii_65 = plan(&[('\0', '@'), ('λ', 'λ')], &[b"0", b"1"]);
+        assert_cached_receipt_identity(&ascii_65);
         assert_eq!(ascii_65.build_accounting().ascii_scalars, 65);
         assert_eq!(ascii_65.build_accounting().non_ascii_scalars, 1);
         assert!(!ascii_65.build_accounting().adaptive_union);
@@ -5581,6 +5603,7 @@ mod tests {
         assert!(!near_universal.build_accounting().adaptive_union);
 
         let common_root = plan(&SMALL_CLASS, &[b"aa", b"ab"]);
+        assert_cached_receipt_identity(&common_root);
         assert_eq!(common_root.build_accounting().distinct_literal_first_bytes, 1);
         assert!(!common_root.build_accounting().adaptive_union);
         assert_eq!(
