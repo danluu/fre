@@ -111,7 +111,7 @@ fn assert_differential(actual: &fre::PortableRegex, expected: &Regex, haystack: 
         .collect();
     assert_eq!(actual_matches, expected_matches, "iter haystack={haystack:?}");
 
-    let session = actual
+    let mut session = actual
         .search_session(SearchSessionLimits::unlimited())
         .expect("native session");
     assert_eq!(
