@@ -2,7 +2,16 @@
 
 use fre::{
     BuildError, BuildLimits, PlanKind, PlanSelection, PortableBuilder, PortableFindIterLimits,
-    SearchAccounting, SearchError, SearchLimits, SearchSessionLimits, SearchWindow,
+    PortableFindIterRunLimits, SearchAccounting, SearchError, SearchLimits, SearchSessionLimits,
+    SearchWindow,
+};
+use fre_kernels::{
+    DispatchedPrefixClassAlternationPlan as KernelDispatchedPlan,
+    PrefixClassAlternationBuildLimits as KernelBuildLimits,
+    PrefixClassAlternationPlan as KernelPlan,
+    PrefixClassAlternationSearchAccounting as KernelSearchAccounting,
+    PrefixClassAlternationSearchLimits as KernelSearchLimits, SimdDispatchContext,
+    Window as KernelWindow,
 };
 use regex::bytes::{Regex, RegexBuilder};
 
@@ -26,6 +35,14 @@ fn automatic(pattern: &str) -> fre::PortableRegex {
         "pattern={pattern}",
     );
     regex
+}
+
+fn exact_kernel_limits(accounting: KernelSearchAccounting) -> KernelSearchLimits {
+    KernelSearchLimits {
+        max_work_upper_bound: u64::try_from(accounting.upper_bounds.work)
+            .expect("small kernel work bound"),
+        max_scratch_bytes: accounting.upper_bounds.scratch_bytes,
+    }
 }
 
 fn assert_differential(actual: &fre::PortableRegex, expected: &Regex, haystack: &[u8]) {
@@ -159,6 +176,22 @@ fn source_priority_duplicates_dense_rejections_and_long_runs_match_oracle() {
     for (pattern, haystack) in cases {
         assert_differential(&automatic(pattern), &oracle(pattern), haystack);
     }
+}
+
+#[test]
+fn equal_start_retries_branch_one_after_branch_zero_class_rejection() {
+    let pattern = r"(?:ab[0-9]+|ab[A-Z]+)";
+    let actual = automatic(pattern);
+    let expected = oracle(pattern);
+    let haystack = b"abQ";
+    assert_differential(&actual, &expected, haystack);
+    assert_eq!(
+        Some((0, 3)),
+        actual
+            .find_value(haystack, SearchLimits::unlimited())
+            .expect("equal-start branch-one match")
+            .map(|matched| (matched.start(), matched.end()))
+    );
 }
 
 #[test]
@@ -311,6 +344,88 @@ fn search_limits_use_the_published_source_independent_envelope() {
 }
 
 #[test]
+fn exists_shortest_and_invalid_end_preserve_operation_envelopes() {
+    let actual = automatic(PATTERN);
+    let haystack = b"xxab123!cdAZ";
+
+    let (expected_exists, exists_accounting) = actual
+        .is_match(haystack, SearchLimits::unlimited())
+        .expect("baseline existence search");
+    let SearchAccounting::PrefixClassAlternation(exists_accounting) = exists_accounting else {
+        panic!("prefix/class existence accounting was not selected")
+    };
+    assert_eq!(
+        fre::PREFIX_CLASS_ALTERNATION_EXISTS_OPERATION_ID,
+        exists_accounting.identity.operation_id
+    );
+    let exact_exists = SearchLimits {
+        max_work: u64::try_from(exists_accounting.upper_bounds.work)
+            .expect("small existence bound"),
+        max_scratch_bytes: exists_accounting.upper_bounds.scratch_bytes,
+    };
+    assert_eq!(
+        expected_exists,
+        actual
+            .is_match(haystack, exact_exists)
+            .expect("exact existence envelope")
+            .0
+    );
+    let below_exists = SearchLimits {
+        max_work: exact_exists.max_work.checked_sub(1).expect("positive bound"),
+        ..exact_exists
+    };
+    assert!(matches!(
+        actual.is_match(haystack, below_exists),
+        Err(SearchError::PrefixClassAlternation(_))
+    ));
+
+    let (expected_shortest, shortest_accounting) = actual
+        .shortest_match(haystack, SearchLimits::unlimited())
+        .expect("baseline shortest search");
+    let SearchAccounting::PrefixClassAlternation(shortest_accounting) = shortest_accounting else {
+        panic!("prefix/class shortest accounting was not selected")
+    };
+    assert_eq!(
+        fre::PREFIX_CLASS_ALTERNATION_SHORTEST_SEARCH_OPERATION_ID,
+        shortest_accounting.identity.operation_id
+    );
+    let exact_shortest = SearchLimits {
+        max_work: u64::try_from(shortest_accounting.upper_bounds.work)
+            .expect("small shortest bound"),
+        max_scratch_bytes: shortest_accounting.upper_bounds.scratch_bytes,
+    };
+    assert_eq!(
+        expected_shortest,
+        actual
+            .shortest_match(haystack, exact_shortest)
+            .expect("exact shortest envelope")
+            .0
+    );
+    let below_shortest = SearchLimits {
+        max_work: exact_shortest
+            .max_work
+            .checked_sub(1)
+            .expect("positive bound"),
+        ..exact_shortest
+    };
+    assert!(matches!(
+        actual.shortest_match(haystack, below_shortest),
+        Err(SearchError::PrefixClassAlternation(_))
+    ));
+
+    let invalid_end = haystack.len().checked_add(1).expect("small haystack");
+    let invalid = SearchWindow::new(0, invalid_end);
+    assert!(matches!(
+        actual.find_window(haystack, invalid, SearchLimits::unlimited()),
+        Err(SearchError::PrefixClassAlternation(_))
+    ));
+    assert!(matches!(
+        actual.is_match_window(haystack, invalid, SearchLimits::unlimited()),
+        Err(SearchError::PrefixClassAlternation(_))
+    ));
+}
+
+#[test]
 fn planner_and_persistent_limits_are_exact_at_publication() {
     let baseline = automatic(PATTERN);
     let report = baseline.build_report();
@@ -381,6 +496,301 @@ fn calls_are_plan_local_and_observe_same_address_mutation() {
     assert!(letters
         .is_match_value(&haystack, SearchLimits::unlimited())
         .unwrap());
+}
+
+#[test]
+fn accounting_iterator_and_native_session_observe_same_address_mutation() {
+    let actual = automatic(r"(?:ab[0-9]+|cd[0-9]+)");
+    let expected = [(1, 5), (6, 10), (11, 14)];
+    let mut haystack = b"xab12!cd34!ab5".to_vec();
+    let address = haystack.as_ptr();
+
+    {
+        let mut matches = actual
+            .find_iter(&haystack, PortableFindIterLimits::unlimited())
+            .expect("fresh accounting iterator");
+        assert_eq!(None, matches.workspace_setup_accounting());
+        let mut spans = Vec::new();
+        for matched in matches.by_ref() {
+            let matched = matched.expect("fresh accounting iterator item");
+            spans.push((matched.start(), matched.end()));
+        }
+        assert_eq!(expected.as_slice(), spans.as_slice());
+        let accounting = matches.accounting();
+        assert_eq!(expected.len(), accounting.matches);
+        assert_eq!(expected.len() + 1, accounting.search_calls);
+        assert!(accounting.work_or_linear_terms > 0);
+    }
+
+    let mut session = actual
+        .search_session(SearchSessionLimits::unlimited())
+        .expect("native prefix/class session");
+    assert_eq!(None, session.workspace_setup_accounting());
+    let (exists, exists_accounting) = session
+        .is_match(&haystack, SearchLimits::unlimited())
+        .expect("session existence");
+    assert!(exists);
+    assert!(matches!(
+        exists_accounting,
+        SearchAccounting::PrefixClassAlternation(_)
+    ));
+    let (shortest, shortest_accounting) = session
+        .shortest_match(&haystack, SearchLimits::unlimited())
+        .expect("session shortest");
+    assert_eq!(Some(4), shortest);
+    assert!(matches!(
+        shortest_accounting,
+        SearchAccounting::PrefixClassAlternation(_)
+    ));
+
+    {
+        let mut matches = session.find_iter(
+            &haystack,
+            PortableFindIterRunLimits::unlimited(),
+        );
+        let mut spans = Vec::new();
+        for matched in matches.by_ref() {
+            let matched = matched.expect("session accounting iterator item");
+            spans.push((matched.start(), matched.end()));
+        }
+        assert_eq!(expected.as_slice(), spans.as_slice());
+        let accounting = matches.accounting();
+        assert_eq!(expected.len(), accounting.matches);
+        assert_eq!(expected.len() + 1, accounting.search_calls);
+    }
+
+    haystack[3..5].copy_from_slice(b"AZ");
+    haystack[8..10].copy_from_slice(b"QR");
+    haystack[13] = b'Z';
+    assert_eq!(address, haystack.as_ptr());
+    assert!(!session
+        .is_match(&haystack, SearchLimits::unlimited())
+        .expect("mutated session existence")
+        .0);
+    assert_eq!(
+        None,
+        session
+            .shortest_match(&haystack, SearchLimits::unlimited())
+            .expect("mutated session shortest")
+            .0
+    );
+    let mut matches = session.find_iter(
+        &haystack,
+        PortableFindIterRunLimits::unlimited(),
+    );
+    assert!(matches.next().is_none());
+    let accounting = matches.accounting();
+    assert_eq!(0, accounting.matches);
+    assert_eq!(1, accounting.search_calls);
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the conditional dispatched parity grid keeps every ordinary projection and exact refusal adjacent"
+)]
+fn dispatched_ordinary_search_matches_scalar_across_windows_and_limits() {
+    let dispatch = SimdDispatchContext::capture();
+    let scalar = KernelPlan::build(
+        [b"ab", b"cd"],
+        [
+            [(b'0', b'9')].into_iter(),
+            [(b'A', b'Z')].into_iter(),
+        ],
+        KernelBuildLimits::unlimited(),
+    )
+    .expect("scalar prefix/class kernel");
+    let haystack = b"xab123!cdAZ!ab9cdQ";
+    let invalid = KernelWindow::new(0, haystack.len() + 1);
+    assert!(scalar
+        .shortest_in(haystack, invalid, KernelSearchLimits::unlimited())
+        .is_err());
+    if !KernelPlan::run_scanners_usable(dispatch) {
+        return;
+    }
+    let dispatched = KernelDispatchedPlan::build_with_dispatch(
+        dispatch,
+        [b"ab", b"cd"],
+        [
+            [(b'0', b'9')].into_iter(),
+            [(b'A', b'Z')].into_iter(),
+        ],
+        KernelBuildLimits::unlimited(),
+    )
+    .expect("dispatched prefix/class kernel");
+
+    for start in 0..=haystack.len() {
+        for end in start..=haystack.len() {
+            let window = KernelWindow::new(start, end);
+            assert_eq!(
+                scalar
+                    .find_in(haystack, window, KernelSearchLimits::unlimited())
+                    .expect("scalar window find")
+                    .0,
+                dispatched
+                    .find_in(haystack, window, KernelSearchLimits::unlimited())
+                    .expect("dispatched window find")
+                    .0,
+                "find window={start}..{end}",
+            );
+            assert_eq!(
+                scalar
+                    .is_match_in(haystack, window, KernelSearchLimits::unlimited())
+                    .expect("scalar window exists")
+                    .0,
+                dispatched
+                    .is_match_in(haystack, window, KernelSearchLimits::unlimited())
+                    .expect("dispatched window exists")
+                    .0,
+                "exists window={start}..{end}",
+            );
+            assert_eq!(
+                scalar
+                    .shortest_in(haystack, window, KernelSearchLimits::unlimited())
+                    .expect("scalar window shortest")
+                    .0,
+                dispatched
+                    .shortest_in(haystack, window, KernelSearchLimits::unlimited())
+                    .expect("dispatched window shortest")
+                    .0,
+                "shortest window={start}..{end}",
+            );
+        }
+    }
+
+    let full = KernelWindow::full(haystack);
+    let (scalar_find, scalar_find_accounting) = scalar
+        .find_in(haystack, full, KernelSearchLimits::unlimited())
+        .expect("scalar baseline find");
+    let (dispatched_find, dispatched_find_accounting) = dispatched
+        .find_in(haystack, full, KernelSearchLimits::unlimited())
+        .expect("dispatched baseline find");
+    let scalar_find_exact = exact_kernel_limits(scalar_find_accounting);
+    let dispatched_find_exact = exact_kernel_limits(dispatched_find_accounting);
+    assert_eq!(
+        scalar_find,
+        scalar
+            .find_in(haystack, full, scalar_find_exact)
+            .expect("scalar exact find")
+            .0
+    );
+    assert_eq!(
+        dispatched_find,
+        dispatched
+            .find_in(haystack, full, dispatched_find_exact)
+            .expect("dispatched exact find")
+            .0
+    );
+    assert!(scalar
+        .find_in(
+            haystack,
+            full,
+            KernelSearchLimits {
+                max_work_upper_bound: scalar_find_exact.max_work_upper_bound - 1,
+                ..scalar_find_exact
+            },
+        )
+        .is_err());
+    assert!(dispatched
+        .find_in(
+            haystack,
+            full,
+            KernelSearchLimits {
+                max_work_upper_bound: dispatched_find_exact.max_work_upper_bound - 1,
+                ..dispatched_find_exact
+            },
+        )
+        .is_err());
+
+    let (scalar_exists, scalar_exists_accounting) = scalar
+        .is_match_in(haystack, full, KernelSearchLimits::unlimited())
+        .expect("scalar baseline exists");
+    let (dispatched_exists, dispatched_exists_accounting) = dispatched
+        .is_match_in(haystack, full, KernelSearchLimits::unlimited())
+        .expect("dispatched baseline exists");
+    let scalar_exists_exact = exact_kernel_limits(scalar_exists_accounting);
+    let dispatched_exists_exact = exact_kernel_limits(dispatched_exists_accounting);
+    assert_eq!(
+        scalar_exists,
+        scalar
+            .is_match_in(haystack, full, scalar_exists_exact)
+            .expect("scalar exact exists")
+            .0
+    );
+    assert_eq!(
+        dispatched_exists,
+        dispatched
+            .is_match_in(haystack, full, dispatched_exists_exact)
+            .expect("dispatched exact exists")
+            .0
+    );
+    assert!(scalar
+        .is_match_in(
+            haystack,
+            full,
+            KernelSearchLimits {
+                max_work_upper_bound: scalar_exists_exact.max_work_upper_bound - 1,
+                ..scalar_exists_exact
+            },
+        )
+        .is_err());
+    assert!(dispatched
+        .is_match_in(
+            haystack,
+            full,
+            KernelSearchLimits {
+                max_work_upper_bound: dispatched_exists_exact.max_work_upper_bound - 1,
+                ..dispatched_exists_exact
+            },
+        )
+        .is_err());
+
+    let (scalar_shortest, scalar_shortest_accounting) = scalar
+        .shortest_in(haystack, full, KernelSearchLimits::unlimited())
+        .expect("scalar baseline shortest");
+    let (dispatched_shortest, dispatched_shortest_accounting) = dispatched
+        .shortest_in(haystack, full, KernelSearchLimits::unlimited())
+        .expect("dispatched baseline shortest");
+    let scalar_shortest_exact = exact_kernel_limits(scalar_shortest_accounting);
+    let dispatched_shortest_exact = exact_kernel_limits(dispatched_shortest_accounting);
+    assert_eq!(
+        scalar_shortest,
+        scalar
+            .shortest_in(haystack, full, scalar_shortest_exact)
+            .expect("scalar exact shortest")
+            .0
+    );
+    assert_eq!(
+        dispatched_shortest,
+        dispatched
+            .shortest_in(haystack, full, dispatched_shortest_exact)
+            .expect("dispatched exact shortest")
+            .0
+    );
+    assert!(scalar
+        .shortest_in(
+            haystack,
+            full,
+            KernelSearchLimits {
+                max_work_upper_bound: scalar_shortest_exact.max_work_upper_bound - 1,
+                ..scalar_shortest_exact
+            },
+        )
+        .is_err());
+    assert!(dispatched
+        .shortest_in(
+            haystack,
+            full,
+            KernelSearchLimits {
+                max_work_upper_bound: dispatched_shortest_exact.max_work_upper_bound - 1,
+                ..dispatched_shortest_exact
+            },
+        )
+        .is_err());
+
+    assert!(dispatched
+        .shortest_in(haystack, invalid, KernelSearchLimits::unlimited())
+        .is_err());
 }
 
 #[test]
