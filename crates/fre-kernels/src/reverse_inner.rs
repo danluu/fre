@@ -3738,7 +3738,7 @@ mod tests {
 
     #[test]
     fn exhaustive_union_endpoint_languages_match_regex_oracle() {
-        fn exercise(literals: &[&[u8]], pattern: &str) {
+        fn exercise(literals: &[&[u8]], pattern: &str, expected_union: bool) {
             fn visit(
                 depth: usize,
                 maximum: usize,
@@ -3770,7 +3770,7 @@ mod tests {
 
             let ranges = [('a', 'd'), ('λ', 'λ')];
             let plan = plan(&ranges, literals);
-            assert!(plan.build_accounting().adaptive_union);
+            assert_eq!(plan.build_accounting().adaptive_union, expected_union);
             let regex = oracle(pattern);
             let tokens: [&[u8]; 8] = [
                 b"a",
@@ -3789,14 +3789,22 @@ mod tests {
         exercise(
             &[b"abc".as_slice(), b"b".as_slice()],
             r"(?:[a-dλ]+abc[a-dλ]+|[a-dλ]+b[a-dλ]+)",
+            true,
         );
         exercise(
             &[b"a".as_slice(), b"bcd".as_slice()],
             r"(?:[a-dλ]+a[a-dλ]+|[a-dλ]+bcd[a-dλ]+)",
+            true,
         );
         exercise(
             &[b"abc".as_slice(), b"ab".as_slice(), b"b".as_slice()],
             r"(?:[a-dλ]+abc[a-dλ]+|[a-dλ]+ab[a-dλ]+|[a-dλ]+b[a-dλ]+)",
+            false,
+        );
+        exercise(
+            &[b"abc".as_slice(), b"b".as_slice(), b"cd".as_slice()],
+            r"(?:[a-dλ]+abc[a-dλ]+|[a-dλ]+b[a-dλ]+|[a-dλ]+cd[a-dλ]+)",
+            true,
         );
     }
 
