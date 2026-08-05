@@ -69,6 +69,7 @@ mod anchored_word_capture;
 mod blocking_delimiter;
 mod bounded_byte_class_sequence;
 mod bounded_byte_class_repeat;
+mod bounded_literal_class_run;
 mod bounded_literal_pair;
 mod bounded_word_class;
 mod capture_absolute_full;
@@ -698,7 +699,8 @@ use fre_automata::{
 };
 use fre_kernels::{
     ASCII_RUN_SCANNER_BUILD_WORK, AbsoluteEndFixedPlan, AsciiByteSet, AsciiByteSetRunScanner,
-    BYTE_SET_BLOCK_BYTES, BoundedRequiredLiteralPlan, DispatchedBoundedRequiredLiteralPlan,
+    BYTE_SET_BLOCK_BYTES, BoundedLiteralClassRunPlan, BoundedRequiredLiteralPlan,
+    DispatchedBoundedRequiredLiteralPlan,
     DispatchedForwardAnchoredPlan, DispatchedRequiredLiteralPlan, ForwardAnchoredBuildAccounting,
     ForwardAnchoredBuildError, ForwardAnchoredBuildLimits, ForwardAnchoredPlan,
     ForwardAnchoredSearchAccounting, ForwardAnchoredSearchError, ForwardAnchoredSearchLimits,
@@ -1223,6 +1225,7 @@ fn literal_class_run_literal_failure_class(
         | LiteralClassRunLiteralBuildError::InexactAsciiWordClass
         | LiteralClassRunLiteralBuildError::SuffixByteOutsideAsciiWordClass
         | LiteralClassRunLiteralBuildError::UnsupportedSearchMinimum
+        | LiteralClassRunLiteralBuildError::InvalidFiniteBounds { .. }
         | LiteralClassRunLiteralBuildError::ClassOutsideAsciiWord
         | LiteralClassRunLiteralBuildError::SuffixByteOutsideAsciiWord => {
             BuildFailureClass::Unsupported
@@ -4890,6 +4893,70 @@ impl PortableBuilder {
                 }
             }
         }
+        // This exact finite two-barrier language is deliberately last among
+        // native plans. It replaces only an otherwise-generic K0 lowering;
+        // every established direct specialization above retains precedence.
+        if self.selection == PlanSelection::Auto {
+            let inspection = bounded_literal_class_run::inspect(
+                &rust.hir,
+                fallback_planner_work,
+                self.limits.max_planner_work,
+            )
+            .map_err(|error| match error {
+                bounded_literal_class_run::InspectionError::WorkLimit { needed, limit } => {
+                    BuildError::PlannerWorkLimit { needed, limit }
+                }
+                bounded_literal_class_run::InspectionError::ArithmeticOverflow => {
+                    BuildError::InternalInvariant(
+                        "bounded literal/class-run inspection accounting overflowed",
+                    )
+                }
+            })?;
+            fallback_planner_work = inspection.planner_work();
+            if let bounded_literal_class_run::InspectionOutcome::Eligible(inspection) = inspection
+            {
+                let plan = inspection
+                    .build(
+                        SimdDispatchContext::capture(),
+                        self.limits.literal_class_run_literal,
+                    )
+                    .map_err(BuildError::LiteralClassRunLiteral)?;
+                let build = plan.build_accounting();
+                if let Ok(plan) = fre_exact_alloc::try_box_preserve(plan) {
+                    return Ok(PortableRegex {
+                        source,
+                        capture_names,
+                        line_total_grep_plan,
+                        plan: PortablePlan::BoundedLiteralClassRun(plan),
+                        profile: profile.clone(),
+                        limits: self.limits,
+                        selection: self.selection,
+                        report: BuildReport {
+                            profile: profile.clone(),
+                            admission,
+                            syntax,
+                            plan: PlanKind::LiteralClassRunLiteral,
+                            planner_work: fallback_planner_work,
+                            lowering: None,
+                            states: 0,
+                            edges: 0,
+                            plan_storage_bytes: build.persistent_bytes,
+                            source_storage_bytes,
+                            capture_name_storage_bytes,
+                            charged_persistent_bytes: 0,
+                            persistent_byte_limit: 0,
+                            captures_len,
+                            static_captures_len,
+                            minimum_match_bytes,
+                            required_literal: None,
+                            literal_class_run_literal: Some(build),
+                            forward_anchored: None,
+                        }
+                        .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
+                    });
+                }
+            }
+        }
         let lowered = fre_lower::lower_raw(
             &rust,
             OperationSemantics::CaptureFree,
@@ -5316,6 +5383,7 @@ enum PortablePlan {
     GuardedLiteralSet(guarded_literal_set::Plan),
     NullableOptionalChain(Box<nullable_optional_chain::Plan>),
     NullableFiniteTokenRepeat(Box<nullable_finite_token_repeat::Plan>),
+    BoundedLiteralClassRun(Box<BoundedLiteralClassRunPlan>),
 }
 
 impl PortablePlan {
@@ -5330,6 +5398,7 @@ impl PortablePlan {
             Self::DispatchedBoundedRequiredLiteral(required) => required.plan_id(),
             Self::LiteralClassRunLiteral(_) => fre_kernels::LITERAL_CLASS_RUN_LITERAL_PLAN_ID,
             Self::LiteralClassRunSearch(plan) => plan.plan_id(),
+            Self::BoundedLiteralClassRun(plan) => plan.plan_id(),
             Self::PureByteClassRepeat(_) => pure_byte_class_repeat::PLAN_ID,
             Self::BoundedByteClassRepeat(_) => bounded_byte_class_repeat::PLAN_ID,
             Self::ForwardAnchored(forward) => forward.plan_id(),
@@ -5861,6 +5930,17 @@ impl PortableRegex {
                     SearchAccounting::LiteralClassRunLiteral(accounting),
                 ))
             }
+            PortablePlan::BoundedLiteralClassRun(plan) => {
+                let (matched, accounting) = plan.shortest_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    literal_class_run_literal_limits(limits),
+                )?;
+                Ok((
+                    matched.is_some(),
+                    SearchAccounting::LiteralClassRunLiteral(accounting),
+                ))
+            }
             PortablePlan::PureByteClassRepeat(plan) => {
                 let (matched, accounting) = plan.is_match_window(haystack, window, limits)?;
                 Ok((matched, SearchAccounting::PureByteClassRepeat(accounting)))
@@ -6075,6 +6155,13 @@ impl PortableRegex {
                     literal_class_run_literal_limits(limits),
                 )
                 .map_err(SearchError::from),
+            PortablePlan::BoundedLiteralClassRun(plan) => plan
+                .is_match_window_value(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    literal_class_run_literal_limits(limits),
+                )
+                .map_err(SearchError::from),
             PortablePlan::PureByteClassRepeat(plan) => plan
                 .is_match_window_value(haystack, window, limits)
                 .map_err(SearchError::from),
@@ -6199,6 +6286,15 @@ impl PortableRegex {
         haystack: &[u8],
         limits: SearchLimits,
     ) -> Result<Option<usize>, SearchError> {
+        if let PortablePlan::BoundedLiteralClassRun(plan) = &self.plan {
+            return plan
+                .shortest_window_value(
+                    haystack,
+                    LiteralWindow::full(haystack),
+                    literal_class_run_literal_limits(limits),
+                )
+                .map_err(SearchError::from);
+        }
         self.shortest_match(haystack, limits)
             .map(|(output, _)| output)
     }
@@ -6214,6 +6310,15 @@ impl PortableRegex {
         start: usize,
         limits: SearchLimits,
     ) -> Result<Option<usize>, SearchError> {
+        if let PortablePlan::BoundedLiteralClassRun(plan) = &self.plan {
+            return plan
+                .shortest_window_value(
+                    haystack,
+                    LiteralWindow::new(start, haystack.len()),
+                    literal_class_run_literal_limits(limits),
+                )
+                .map_err(SearchError::from);
+        }
         self.shortest_match_at(haystack, start, limits)
             .map(|(output, _)| output)
     }
@@ -6325,6 +6430,14 @@ impl PortableRegex {
                 Ok((end, SearchAccounting::LiteralClassRunLiteral(accounting)))
             }
             PortablePlan::LiteralClassRunSearch(plan) => {
+                let (end, accounting) = plan.shortest_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    literal_class_run_literal_limits(limits),
+                )?;
+                Ok((end, SearchAccounting::LiteralClassRunLiteral(accounting)))
+            }
+            PortablePlan::BoundedLiteralClassRun(plan) => {
                 let (end, accounting) = plan.shortest_window(
                     haystack,
                     LiteralWindow::new(window.start(), window.end()),
@@ -6529,6 +6642,14 @@ impl PortableRegex {
                 ))
             }
             PortablePlan::LiteralClassRunSearch(plan) => {
+                let (matched, accounting) =
+                    plan.find(haystack, literal_class_run_literal_limits(limits))?;
+                Ok((
+                    matched.map(|(_, end)| end),
+                    SearchAccounting::LiteralClassRunLiteral(accounting),
+                ))
+            }
+            PortablePlan::BoundedLiteralClassRun(plan) => {
                 let (matched, accounting) =
                     plan.find(haystack, literal_class_run_literal_limits(limits))?;
                 Ok((
@@ -6994,6 +7115,17 @@ impl PortableRegex {
                     SearchAccounting::LiteralClassRunLiteral(accounting),
                 ))
             }
+            PortablePlan::BoundedLiteralClassRun(plan) => {
+                let (matched, accounting) = plan.find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    literal_class_run_literal_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    SearchAccounting::LiteralClassRunLiteral(accounting),
+                ))
+            }
             PortablePlan::PureByteClassRepeat(plan) => {
                 let (matched, accounting) = plan.find_window(haystack, window, limits)?;
                 Ok((matched, SearchAccounting::PureByteClassRepeat(accounting)))
@@ -7209,6 +7341,14 @@ impl PortableRegex {
                 )
                 .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
                 .map_err(SearchError::from),
+            PortablePlan::BoundedLiteralClassRun(plan) => plan
+                .find_window_value(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    literal_class_run_literal_limits(limits),
+                )
+                .map(|matched| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
             PortablePlan::PureByteClassRepeat(plan) => plan
                 .find_window(haystack, window, limits)
                 .map(|(matched, _)| matched)
@@ -7395,6 +7535,14 @@ impl PortableRegex {
                 ))
             }
             PortablePlan::LiteralClassRunSearch(plan) => {
+                let (matched, accounting) =
+                    plan.find_window(haystack, window, literal_class_run_literal_limits(limits))?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    accounting.work_upper_bound,
+                ))
+            }
+            PortablePlan::BoundedLiteralClassRun(plan) => {
                 let (matched, accounting) =
                     plan.find_window(haystack, window, literal_class_run_literal_limits(limits))?;
                 Ok((
@@ -13335,6 +13483,260 @@ mod tests {
             accounting,
             SearchAccounting::LiteralClassRunLiteral(_)
         ));
+    }
+
+    #[test]
+    fn finite_two_barrier_route_matches_upstream_across_facade_projections() {
+        let pattern = r"ab[01]{0,64}xy";
+        let regex = PortableBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert!(matches!(
+            &regex.plan,
+            PortablePlan::BoundedLiteralClassRun(_)
+        ));
+        assert_eq!(regex.build_report().plan, PlanKind::LiteralClassRunLiteral);
+        assert_eq!(regex.build_report().lowering, None);
+        assert_eq!(regex.build_report().states, 0);
+        assert!(regex.build_report().literal_class_run_literal.is_some());
+
+        let upstream = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let mut long = b"--ab".to_vec();
+        long.extend(core::iter::repeat_n(b'0', 63));
+        long.extend_from_slice(b"xy--");
+        for haystack in [
+            b"".as_slice(),
+            b"abxy",
+            b"--ab01xy--",
+            b"ab2xy--ab0xy",
+            b"abab01xy--abxy",
+            long.as_slice(),
+        ] {
+            let expected_iter: Vec<_> = upstream
+                .find_iter(haystack)
+                .map(|matched| (matched.start(), matched.end()))
+                .collect();
+            let actual_iter: Vec<_> = regex
+                .find_iter(haystack, PortableFindIterLimits::unlimited())
+                .unwrap()
+                .map(|matched| {
+                    let matched = matched.unwrap();
+                    (matched.start(), matched.end())
+                })
+                .collect();
+            assert_eq!(actual_iter, expected_iter, "haystack={haystack:?}");
+
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let window = SearchWindow::new(start, end);
+                    let expected = upstream
+                        .find(&haystack[start..end])
+                        .map(|matched| (start + matched.start(), start + matched.end()));
+                    let expected_shortest = upstream
+                        .shortest_match(&haystack[start..end])
+                        .map(|matched_end| start + matched_end);
+                    assert_eq!(
+                        regex
+                            .find_window(haystack, window, SearchLimits::unlimited())
+                            .unwrap()
+                            .0
+                            .map(|matched| (matched.start(), matched.end())),
+                        expected,
+                        "span haystack={haystack:?} window={start}..{end}"
+                    );
+                    assert_eq!(
+                        regex
+                            .find_window_value(haystack, window, SearchLimits::unlimited())
+                            .unwrap()
+                            .map(|matched| (matched.start(), matched.end())),
+                        expected,
+                        "value span haystack={haystack:?} window={start}..{end}"
+                    );
+                    assert_eq!(
+                        regex
+                            .shortest_match_window(
+                                haystack,
+                                window,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap()
+                            .0,
+                        expected_shortest,
+                        "shortest haystack={haystack:?} window={start}..{end}"
+                    );
+                    assert_eq!(
+                        regex
+                            .is_match_window_value(
+                                haystack,
+                                window,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap(),
+                        expected.is_some(),
+                        "exists haystack={haystack:?} window={start}..{end}"
+                    );
+                }
+            }
+        }
+
+        let forced = PortableBuilder::new(pattern)
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .unwrap();
+        assert!(matches!(&forced.plan, PortablePlan::K0(_)));
+    }
+
+    #[test]
+    fn finite_two_barrier_route_enforces_exact_build_and_search_boundaries() {
+        let pattern = r"ab[01]{0,64}xy";
+        let baseline = PortableBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let accounting = baseline
+            .build_report()
+            .literal_class_run_literal
+            .unwrap();
+        let exact_kernel = fre_kernels::LiteralClassRunLiteralBuildLimits {
+            max_literal_bytes: accounting.literal_bytes,
+            max_class_ranges: accounting.class_ranges,
+            max_class_members: accounting.class_members,
+            max_build_work: accounting.work_upper_bound,
+            max_scratch_bytes: accounting.scratch_bytes,
+            max_persistent_bytes: accounting.persistent_bytes,
+            max_peak_bytes: accounting.peak_bytes,
+        };
+        let exact = BuildLimits {
+            literal_class_run_literal: exact_kernel,
+            ..BuildLimits::default()
+        };
+        let exact_plan = PortableBuilder::new(pattern)
+            .unicode(false)
+            .limits(exact)
+            .build()
+            .unwrap();
+        assert!(matches!(
+            &exact_plan.plan,
+            PortablePlan::BoundedLiteralClassRun(_)
+        ));
+
+        let mut below = exact;
+        below.literal_class_run_literal.max_build_work -= 1;
+        assert!(matches!(
+            PortableBuilder::new(pattern)
+                .unicode(false)
+                .limits(below)
+                .build(),
+            Err(BuildError::LiteralClassRunLiteral(
+                fre_kernels::LiteralClassRunLiteralBuildError::WorkLimit { .. }
+            ))
+        ));
+        below = exact;
+        below.literal_class_run_literal.max_persistent_bytes -= 1;
+        assert!(matches!(
+            PortableBuilder::new(pattern)
+                .unicode(false)
+                .limits(below)
+                .build(),
+            Err(BuildError::LiteralClassRunLiteral(
+                fre_kernels::LiteralClassRunLiteralBuildError::PersistentLimit { .. }
+            ))
+        ));
+
+        // The empty window has exactly the fixed search charge on every SIMD
+        // implementation, so this boundary is architecture-independent.
+        let haystack = b"";
+        let (_, search) = baseline
+            .find(haystack, SearchLimits::unlimited())
+            .unwrap();
+        let SearchAccounting::LiteralClassRunLiteral(search) = search else {
+            panic!("finite two-barrier route returned another accounting family");
+        };
+        let exact_work = u64::try_from(search.work).unwrap();
+        assert!(
+            baseline
+                .find(
+                    haystack,
+                    SearchLimits {
+                        max_work: exact_work,
+                        max_scratch_bytes: 0,
+                    },
+                )
+                .is_ok()
+        );
+        assert!(matches!(
+            baseline.find(
+                haystack,
+                SearchLimits {
+                    max_work: exact_work - 1,
+                    max_scratch_bytes: 0,
+                },
+            ),
+            Err(SearchError::LiteralClassRunLiteral(
+                fre_kernels::LiteralClassRunLiteralSearchError::WorkLimit { needed, limit }
+            )) if needed == exact_work && limit == exact_work - 1
+        ));
+    }
+
+    #[test]
+    fn finite_two_barrier_sessions_retain_no_cross_plan_or_same_address_state() {
+        let first = PortableBuilder::new(r"ab[01]{0,64}xy")
+            .unicode(false)
+            .build()
+            .unwrap();
+        let second = PortableBuilder::new(r"cd[23]{1,64}uv")
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert!(matches!(
+            &first.plan,
+            PortablePlan::BoundedLiteralClassRun(_)
+        ));
+        assert!(matches!(
+            &second.plan,
+            PortablePlan::BoundedLiteralClassRun(_)
+        ));
+        let mut first_session = first
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        let mut second_session = second
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        let mut same_allocation = b"--ab01xy--".to_vec();
+        assert_eq!(
+            first_session
+                .find_value(&same_allocation, SearchLimits::unlimited())
+                .unwrap()
+                .map(|matched| (matched.start(), matched.end())),
+            Some((2, 8))
+        );
+        same_allocation.copy_from_slice(b"--cd23uv--");
+        assert_eq!(
+            second_session
+                .find_value(&same_allocation, SearchLimits::unlimited())
+                .unwrap()
+                .map(|matched| (matched.start(), matched.end())),
+            Some((2, 8))
+        );
+        assert_eq!(
+            first_session
+                .find_value(&same_allocation, SearchLimits::unlimited())
+                .unwrap(),
+            None
+        );
+        same_allocation.copy_from_slice(b"--ab00xy--");
+        assert_eq!(
+            first_session
+                .find_value(&same_allocation, SearchLimits::unlimited())
+                .unwrap()
+                .map(|matched| (matched.start(), matched.end())),
+            Some((2, 8))
+        );
     }
 
     #[test]
