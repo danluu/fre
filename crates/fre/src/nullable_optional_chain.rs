@@ -53,6 +53,14 @@ pub struct Accounting {
     pub finder_linear_terms: u64,
     pub backward_steps: usize,
     pub replay_cells: usize,
+    /// Peak scratch bytes admitted for the selected direct-prefix operation.
+    ///
+    /// Direct required-tail plans have a deliberately small, fixed scratch
+    /// ceiling. Keeping this counter narrow lets it occupy padding in the hot
+    /// accounting record instead of increasing every search result's size.
+    pub scratch_bytes: u16,
+    /// Peak scratch bytes actually instantiated on this execution path.
+    pub actual_scratch_bytes: u16,
     pub work_upper_bound: u64,
     pub actual_work: u64,
 }
@@ -62,6 +70,7 @@ pub struct Accounting {
 pub enum Error {
     InvalidWindow,
     WorkLimit { needed: u64, limit: u64 },
+    ScratchLimit { needed: usize, limit: usize },
     Literal(LiteralError),
     ArithmeticOverflow { computation: &'static str },
     InternalInvariant { detail: &'static str },
@@ -70,17 +79,21 @@ pub enum Error {
 impl core::fmt::Display for Error {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::InvalidWindow => formatter.write_str("invalid nullable optional-chain window"),
+            Self::InvalidWindow => formatter.write_str("invalid nullable required-tail window"),
             Self::WorkLimit { needed, limit } => write!(
                 formatter,
-                "nullable optional-chain search needs {needed} work, exceeding {limit}",
+                "nullable required-tail search needs {needed} work, exceeding {limit}",
+            ),
+            Self::ScratchLimit { needed, limit } => write!(
+                formatter,
+                "nullable required-tail search needs {needed} scratch bytes, exceeding {limit}",
             ),
             Self::Literal(error) => core::fmt::Display::fmt(error, formatter),
             Self::ArithmeticOverflow { computation } => {
-                write!(formatter, "nullable optional-chain overflow in {computation}")
+                write!(formatter, "nullable required-tail overflow in {computation}")
             }
             Self::InternalInvariant { detail } => {
-                write!(formatter, "nullable optional-chain invariant failed: {detail}")
+                write!(formatter, "nullable required-tail invariant failed: {detail}")
             }
         }
     }
@@ -92,6 +105,7 @@ impl std::error::Error for Error {
             Self::Literal(error) => Some(error),
             Self::InvalidWindow
             | Self::WorkLimit { .. }
+            | Self::ScratchLimit { .. }
             | Self::ArithmeticOverflow { .. }
             | Self::InternalInvariant { .. } => None,
         }
@@ -425,6 +439,8 @@ impl Plan {
             finder_linear_terms: actual.finder_linear_terms,
             backward_steps: actual.backward_steps,
             replay_cells: actual.replay_cells,
+            scratch_bytes: 0,
+            actual_scratch_bytes: 0,
             work_upper_bound,
             actual_work,
         })

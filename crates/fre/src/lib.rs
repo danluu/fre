@@ -91,6 +91,7 @@ mod line_capture;
 mod line_total_grep;
 mod literal_assertions;
 mod literal_class_run_literal;
+mod nullable_finite_token_repeat;
 mod nullable_optional_chain;
 pub mod operation_session;
 mod pure_byte_class_repeat;
@@ -134,6 +135,16 @@ pub use nullable_optional_chain::{
     Accounting as NullableOptionalChainAccounting, Error as NullableOptionalChainSearchError,
     Operation as NullableOptionalChainOperation, PLAN_ID as NULLABLE_OPTIONAL_CHAIN_PLAN_ID,
 };
+pub use nullable_finite_token_repeat::PLAN_ID as NULLABLE_FINITE_TOKEN_REPEAT_PLAN_ID;
+/// Compatibility-neutral accounting name for all nullable required-tail
+/// direct-prefix plans, including optional chains and finite-token repeats.
+pub type NullableRequiredTailAccounting = NullableOptionalChainAccounting;
+/// Compatibility-neutral operation name for all nullable required-tail
+/// direct-prefix plans, including optional chains and finite-token repeats.
+pub type NullableRequiredTailOperation = NullableOptionalChainOperation;
+/// Compatibility-neutral error name for all nullable required-tail
+/// direct-prefix plans, including optional chains and finite-token repeats.
+pub type NullableRequiredTailSearchError = NullableOptionalChainSearchError;
 pub use unicode_folded_literal::{
     UNICODE_FOLDED_LITERAL_ALGORITHM_ID, UNICODE_FOLDED_LITERAL_COUNT_OPERATION_ID,
     UNICODE_FOLDED_LITERAL_SEARCH_ALGORITHM_ID, UNICODE_FOLDED_LITERAL_SPAN_SUM_OPERATION_ID,
@@ -1031,8 +1042,8 @@ pub enum PlanKind {
     /// Bounded ordered finite-literal DFA used when packed search is ineligible.
     LiteralSetDfa,
     /// Proof-restricted required-tail native searches, including
-    /// `CLASS{min,max} SUFFIX` and tail-head-disjoint nullable optional-chain
-    /// prefixes. This is not JIT.
+    /// `CLASS{min,max} SUFFIX`, tail-head-disjoint nullable optional chains,
+    /// and bounded finite-token repetitions. This is not JIT.
     RequiredLiteral,
     /// Canonical literal/class-run search backed by one native literal anchor.
     LiteralClassRunLiteral,
@@ -2799,7 +2810,7 @@ pub enum SearchAccounting {
     PureByteClassRepeat(PureByteClassRepeatAccounting),
     /// Exact bounded byte-class sequence counters.
     BoundedByteClassSequence(BoundedByteClassSequenceAccounting),
-    /// Exact nullable optional-chain counters.
+    /// Exact nullable required-tail direct-prefix counters.
     NullableOptionalChain(NullableOptionalChainAccounting),
     /// Complete forward-boundary proof-bound and structural counters.
     ForwardAnchored(ForwardAnchoredSearchAccounting),
@@ -2934,7 +2945,7 @@ impl fmt::Display for SearchError {
                 write!(f, "bounded byte-class sequence search failed: {error}")
             }
             Self::NullableOptionalChain(error) => {
-                write!(f, "nullable optional-chain search failed: {error}")
+                write!(f, "nullable required-tail search failed: {error}")
             }
             Self::ForwardAnchored(error) => {
                 write!(f, "forward-anchored search failed: {error}")
@@ -4374,6 +4385,79 @@ impl PortableBuilder {
                 });
             }
         }
+        let mut nullable_finite_token_repeat_work = nullable_optional_chain_work;
+        if self.selection == PlanSelection::Auto && self.pure_byte_class_repeat_allowed {
+            let inspection = nullable_finite_token_repeat::inspect(
+                &rust.hir,
+                nullable_optional_chain_work,
+                self.limits.max_planner_work,
+            )?;
+            nullable_finite_token_repeat_work = inspection.planner_work();
+            if let nullable_finite_token_repeat::InspectionOutcome::Eligible(inspection) =
+                inspection
+            {
+                let plan_storage_bytes = inspection.plan_storage_bytes()?;
+                let charged_persistent_bytes = source_storage_bytes
+                    .checked_add(capture_name_storage_bytes)
+                    .and_then(|bytes| bytes.checked_add(plan_storage_bytes))
+                    .ok_or(BuildError::PersistentBytesOverflow)?;
+                if charged_persistent_bytes > self.limits.max_persistent_bytes {
+                    return Err(BuildError::PersistentBytesLimit {
+                        needed: charged_persistent_bytes,
+                        limit: self.limits.max_persistent_bytes,
+                    });
+                }
+                let plan = inspection.build(self.limits.literal)?;
+                if plan.storage_bytes()? != plan_storage_bytes {
+                    return Err(BuildError::InternalInvariant(
+                        "nullable finite-token storage projection changed during construction",
+                    ));
+                }
+                let plan = fre_exact_alloc::try_box_preserve(plan).map_err(|(error, _)| {
+                    match error {
+                        fre_exact_alloc::CopyError::LayoutOverflow => BuildError::InternalInvariant(
+                            "nullable finite-token owner layout overflowed",
+                        ),
+                        fre_exact_alloc::CopyError::AllocationFailed => {
+                            BuildError::AllocationFailed {
+                                structure: "nullable finite-token owner",
+                                additional: 1,
+                            }
+                        }
+                    }
+                })?;
+                return Ok(PortableRegex {
+                    source,
+                    capture_names,
+                    line_total_grep_plan,
+                    plan: PortablePlan::NullableFiniteTokenRepeat(plan),
+                    profile: profile.clone(),
+                    limits: self.limits,
+                    selection: self.selection,
+                    report: BuildReport {
+                        profile: profile.clone(),
+                        admission,
+                        syntax,
+                        plan: PlanKind::RequiredLiteral,
+                        planner_work: nullable_finite_token_repeat_work,
+                        lowering: None,
+                        states: 0,
+                        edges: 0,
+                        plan_storage_bytes,
+                        source_storage_bytes,
+                        capture_name_storage_bytes,
+                        charged_persistent_bytes,
+                        persistent_byte_limit: self.limits.max_persistent_bytes,
+                        captures_len,
+                        static_captures_len,
+                        minimum_match_bytes,
+                        required_literal: None,
+                        literal_class_run_literal: None,
+                        forward_anchored: None,
+                    },
+                });
+            }
+        }
         let retained_facade_bytes = source_storage_bytes
             .checked_add(capture_name_storage_bytes)
             .ok_or(BuildError::PersistentBytesOverflow)?;
@@ -4395,7 +4479,7 @@ impl PortableBuilder {
             &rust.hir,
             self.limits.literal_set.max_patterns,
             self.limits.literal_set.max_pattern_bytes,
-            nullable_optional_chain_work,
+            nullable_finite_token_repeat_work,
             self.limits.max_planner_work,
             derive_guarded_ascii_dictionary,
             guarded_literal_set::extraction_limits(
@@ -5166,6 +5250,7 @@ enum PortablePlan {
     BoundedByteClassSequence(bounded_byte_class_sequence::Plan),
     GuardedLiteralSet(guarded_literal_set::Plan),
     NullableOptionalChain(Box<nullable_optional_chain::Plan>),
+    NullableFiniteTokenRepeat(Box<nullable_finite_token_repeat::Plan>),
 }
 
 impl PortablePlan {
@@ -5194,6 +5279,7 @@ impl PortablePlan {
             Self::BoundedByteClassSequence(_) => bounded_byte_class_sequence::PLAN_ID,
             Self::GuardedLiteralSet(_) => guarded_literal_set::PLAN_ID,
             Self::NullableOptionalChain(_) => nullable_optional_chain::PLAN_ID,
+            Self::NullableFiniteTokenRepeat(_) => nullable_finite_token_repeat::PLAN_ID,
         }
     }
 }
@@ -5729,6 +5815,15 @@ impl PortableRegex {
                     SearchAccounting::NullableOptionalChain(accounting),
                 ))
             }
+            PortablePlan::NullableFiniteTokenRepeat(plan) => {
+                let (matched, accounting) = plan
+                    .is_match_window(haystack, window, limits)
+                    .map_err(SearchError::NullableOptionalChain)?;
+                Ok((
+                    matched,
+                    SearchAccounting::NullableOptionalChain(accounting),
+                ))
+            }
             PortablePlan::ForwardAnchored(forward) => {
                 let literal_window = LiteralWindow::new(window.start(), window.end());
                 let (matched, accounting) = forward.find_window(
@@ -5919,6 +6014,9 @@ impl PortableRegex {
                 .is_match_window_value(haystack, window, limits)
                 .map_err(SearchError::BoundedByteClassSequence),
             PortablePlan::NullableOptionalChain(plan) => plan
+                .is_match_window_value(haystack, window, limits)
+                .map_err(SearchError::NullableOptionalChain),
+            PortablePlan::NullableFiniteTokenRepeat(plan) => plan
                 .is_match_window_value(haystack, window, limits)
                 .map_err(SearchError::NullableOptionalChain),
             PortablePlan::ForwardAnchored(forward) => forward
@@ -6152,6 +6250,12 @@ impl PortableRegex {
                     .map_err(SearchError::NullableOptionalChain)?;
                 Ok((end, SearchAccounting::NullableOptionalChain(accounting)))
             }
+            PortablePlan::NullableFiniteTokenRepeat(plan) => {
+                let (end, accounting) = plan
+                    .earliest_end_window(haystack, window, limits)
+                    .map_err(SearchError::NullableOptionalChain)?;
+                Ok((end, SearchAccounting::NullableOptionalChain(accounting)))
+            }
             PortablePlan::ForwardAnchored(forward) => {
                 let literal_window = LiteralWindow::new(window.start(), window.end());
                 let (matched, accounting) = forward.find_window(
@@ -6347,6 +6451,12 @@ impl PortableRegex {
                 ))
             }
             PortablePlan::NullableOptionalChain(plan) => {
+                let (end, accounting) = plan
+                    .selected_end_window(haystack, SearchWindow::full(haystack), limits)
+                    .map_err(SearchError::NullableOptionalChain)?;
+                Ok((end, SearchAccounting::NullableOptionalChain(accounting)))
+            }
+            PortablePlan::NullableFiniteTokenRepeat(plan) => {
                 let (end, accounting) = plan
                     .selected_end_window(haystack, SearchWindow::full(haystack), limits)
                     .map_err(SearchError::NullableOptionalChain)?;
@@ -6756,6 +6866,15 @@ impl PortableRegex {
                     SearchAccounting::NullableOptionalChain(accounting),
                 ))
             }
+            PortablePlan::NullableFiniteTokenRepeat(plan) => {
+                let (matched, accounting) = plan
+                    .find_window(haystack, window, limits)
+                    .map_err(SearchError::NullableOptionalChain)?;
+                Ok((
+                    matched,
+                    SearchAccounting::NullableOptionalChain(accounting),
+                ))
+            }
             PortablePlan::ForwardAnchored(forward) => {
                 let literal_window = LiteralWindow::new(window.start(), window.end());
                 let (matched, accounting) = forward.find_window(
@@ -7010,6 +7129,9 @@ impl PortableRegex {
             PortablePlan::NullableOptionalChain(plan) => plan
                 .find_window_value(haystack, window, limits)
                 .map_err(SearchError::NullableOptionalChain),
+            PortablePlan::NullableFiniteTokenRepeat(plan) => plan
+                .find_window_value(haystack, window, limits)
+                .map_err(SearchError::NullableOptionalChain),
             PortablePlan::FixedPredicateWord64(plan) => plan
                 .find_window_value(
                     haystack,
@@ -7143,6 +7265,12 @@ impl PortableRegex {
                 Ok((matched, accounting.actual_work))
             }
             PortablePlan::NullableOptionalChain(plan) => {
+                let (matched, accounting) = plan
+                    .find_window(haystack, SearchWindow::new(start, haystack.len()), limits)
+                    .map_err(SearchError::NullableOptionalChain)?;
+                Ok((matched, accounting.actual_work))
+            }
+            PortablePlan::NullableFiniteTokenRepeat(plan) => {
                 let (matched, accounting) = plan
                     .find_window(haystack, SearchWindow::new(start, haystack.len()), limits)
                     .map_err(SearchError::NullableOptionalChain)?;
