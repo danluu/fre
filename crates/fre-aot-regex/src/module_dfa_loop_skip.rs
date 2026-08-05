@@ -13,11 +13,12 @@ use crate::{
 };
 
 use super::{
-    AARCH64_EQ, AARCH64_HS, AARCH64_LO, AARCH64_LS, AARCH64_NE, Aarch64Assembler, Aarch64Label,
-    EMPTY_NATIVE_START_FILTER, NativeDfaLayout, NativeStartFilter, NativeVectorFilter, ObjectError,
-    X86Assembler, X86CandidateMask, X86Label, X86StartFilterKind, aarch64_add_x_imm,
-    aarch64_cmp_w_imm, aarch64_cmp_w_zero, aarch64_cmp_x, aarch64_cmp_x_imm, aarch64_csel_x,
-    aarch64_emit_candidate_any, aarch64_emit_first_candidate_in_batch,
+    AARCH64_EQ, AARCH64_HS, AARCH64_LO, AARCH64_LS, AARCH64_NE, Aarch64Assembler,
+    Aarch64ExactSveKind, Aarch64Label, EMPTY_NATIVE_START_FILTER, NativeDfaLayout,
+    NativeStartFilter, NativeVectorFilter, ObjectError, X86Assembler, X86CandidateMask, X86Label,
+    X86StartFilterKind, aarch64_add_x_imm, aarch64_cmp_w_imm, aarch64_cmp_w_zero,
+    aarch64_cmp_x, aarch64_cmp_x_imm, aarch64_csel_x, aarch64_emit_candidate_any,
+    aarch64_emit_exact_sve_constants, aarch64_emit_first_candidate_in_batch,
     aarch64_emit_first_candidate_lane, aarch64_emit_start_filter_address,
     aarch64_emit_start_filter_batch_candidates, aarch64_emit_start_filter_constants,
     aarch64_emit_start_filter_scalar_load, aarch64_emit_start_filter_vector_candidates,
@@ -92,15 +93,19 @@ fn x86_restore_start_constants(
     layout: &NativeDfaLayout,
     vector_filter: Option<NativeVectorFilter>,
     kind: X86StartFilterKind,
-    use_exact_avx2: bool,
+    exact_vector_kind: Option<X86StartFilterKind>,
 ) -> Result<(), ObjectError> {
-    if use_exact_avx2 {
+    if let Some(exact_vector_kind) = exact_vector_kind {
         let storage = layout
             .exact_start_storage
             .ok_or(ObjectError::InvalidModule(
                 "x86 loop-skip restore lost exact scanner storage",
             ))?;
-        return super::x86_emit_exact_avx2_constants(assembler, storage);
+        return super::x86_emit_exact_vector_constants(
+            assembler,
+            storage,
+            exact_vector_kind,
+        );
     }
     if let Some(plan) = layout
         .prefix_relation
@@ -146,7 +151,7 @@ pub(super) fn x86_emit_dfa_loop_skip(
     layout: &NativeDfaLayout,
     vector_filter: Option<NativeVectorFilter>,
     kind: X86StartFilterKind,
-    use_exact_avx2: bool,
+    exact_vector_kind: Option<X86StartFilterKind>,
     ordinary: X86Label,
     exhausted: X86Label,
 ) -> Result<(), ObjectError> {
@@ -251,7 +256,7 @@ pub(super) fn x86_emit_dfa_loop_skip(
         layout,
         vector_filter,
         kind,
-        use_exact_avx2,
+        exact_vector_kind,
     )?;
     assembler.branch(&[0xe9], ordinary)?;
     Ok(())
@@ -261,6 +266,7 @@ fn aarch64_restore_start_constants(
     assembler: &mut Aarch64Assembler,
     layout: &NativeDfaLayout,
     vector_filter: Option<NativeVectorFilter>,
+    exact_sve_kind: Option<Aarch64ExactSveKind>,
 ) -> Result<(), ObjectError> {
     if layout.exact_start_byte_set.is_some() {
         let storage = layout
@@ -268,7 +274,11 @@ fn aarch64_restore_start_constants(
             .ok_or(ObjectError::InvalidModule(
                 "AArch64 loop-skip restore lost exact scanner storage",
             ))?;
-        return super::aarch64_emit_exact_asimd_constants(assembler, storage);
+        return if let Some(kind) = exact_sve_kind {
+            aarch64_emit_exact_sve_constants(assembler, storage, kind)
+        } else {
+            super::aarch64_emit_exact_asimd_constants(assembler, storage)
+        };
     }
     if let Some(plan) = layout
         .prefix_relation
@@ -316,6 +326,7 @@ pub(super) fn aarch64_emit_dfa_loop_skip(
     vector_filter: Option<NativeVectorFilter>,
     use_asimd: bool,
     use_exact_asimd_lane: bool,
+    exact_sve_kind: Option<Aarch64ExactSveKind>,
     ordinary: Aarch64Label,
     exhausted: Aarch64Label,
 ) -> Result<(), ObjectError> {
@@ -453,7 +464,12 @@ pub(super) fn aarch64_emit_dfa_loop_skip(
 
     assembler.bind(exit)?;
     if use_asimd {
-        aarch64_restore_start_constants(assembler, layout, vector_filter)?;
+        aarch64_restore_start_constants(
+            assembler,
+            layout,
+            vector_filter,
+            exact_sve_kind,
+        )?;
     }
     assembler.branch(ordinary)?;
     Ok(())

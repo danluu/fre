@@ -2069,8 +2069,9 @@ struct NativeExactSve2MatchStorage {
 /// cross-target inspection; `AArch64` additionally uses the byte-indexed LUT in
 /// its scalar lowering. `nibble_base` names three logical 16-byte tables.
 /// `AArch64` stores them directly, while x86 duplicates each 128-bit table into
-/// both AVX2 lanes and appends one duplicated `0x0f` index mask. Sparse SVE2
-/// sets append an independently authenticated MATCH representation.
+/// both AVX2 lanes and appends one duplicated `0x0f` index mask. AVX-512
+/// broadcasts the first stored 128-bit copy across all four ZMM lanes. Sparse
+/// SVE2 sets append an independently authenticated MATCH representation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NativeExactByteSetStorage {
     bitmap_offset: u32,
@@ -7446,6 +7447,44 @@ fn x86_emit_exact_avx2_constants(
     Ok(())
 }
 
+/// Broadcast the four canonical 32-byte exact-set tables into caller-saved
+/// ZMM registers. `VBROADCASTI32X4` replicates the canonical 128-bit table
+/// across all four lanes without increasing the immutable table footprint.
+/// The instruction needs AVX-512F, while the classifier below additionally
+/// needs AVX-512BW.
+fn x86_emit_exact_avx512_constants(
+    assembler: &mut X86Assembler,
+    storage: NativeExactByteSetStorage,
+) -> Result<(), ObjectError> {
+    for (table_index, destination) in [(0_u8, 1_u8), (1, 2), (2, 3), (3, 7)] {
+        let displacement = x86_exact_nibble_displacement(storage, table_index)?;
+        let modrm = 0x81_u8
+            | destination
+                .checked_mul(8)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "x86 AVX-512 exact constant register",
+                ))?;
+        let mut load = vec![0x62, 0xd2, 0x7d, 0x48, 0x5a, modrm];
+        load.extend_from_slice(&displacement.to_le_bytes());
+        assembler.instruction(&load)?; // vbroadcasti32x4 zmmN, disp32[r9]
+    }
+    Ok(())
+}
+
+fn x86_emit_exact_vector_constants(
+    assembler: &mut X86Assembler,
+    storage: NativeExactByteSetStorage,
+    kind: X86StartFilterKind,
+) -> Result<(), ObjectError> {
+    match kind {
+        X86StartFilterKind::Sse2 => Err(ObjectError::InvalidModule(
+            "x86 exact-set vector constants selected SSE2",
+        )),
+        X86StartFilterKind::Avx2 => x86_emit_exact_avx2_constants(assembler, storage),
+        X86StartFilterKind::Avx512Bw => x86_emit_exact_avx512_constants(assembler, storage),
+    }
+}
+
 /// Produce the exact 32-lane membership mask in EAX for one AVX2 block.
 ///
 /// YMM1/YMM2 are the low/high row banks, YMM3 maps high nibbles to bits, and
@@ -7470,6 +7509,50 @@ fn x86_emit_exact_avx2_candidates(
     assembler.instruction(&[0xc5, 0xfd, 0xd7, 0xc6])?; // vpmovmskb eax, ymm6
     assembler.instruction(&[0xf7, 0xd0])?; // invert: member lanes are one
     Ok(())
+}
+
+/// Produce the exact 64-lane membership mask in K1 for one AVX-512BW block.
+///
+/// ZMM1/ZMM2 are the low/high row banks, ZMM3 maps high nibbles to bits, and
+/// ZMM7 is `0x0f` in every byte. K2 selects the high row bank from each input
+/// byte's sign bit. `VPTESTMB` publishes exact nonzero membership directly as
+/// a 64-bit opmask, preserving lanes 32..63 for the common first-hit helper.
+fn x86_emit_exact_avx512_candidates(
+    assembler: &mut X86Assembler,
+    scan_offset: u8,
+) -> Result<(), ObjectError> {
+    x86_emit_start_filter_vector_load(assembler, X86StartFilterKind::Avx512Bw, scan_offset)?;
+    assembler.instruction(&[0x62, 0xf1, 0x5d, 0x48, 0x71, 0xd0, 0x04])?; // high nibbles zmm4
+    assembler.instruction(&[0x62, 0xf1, 0x7d, 0x48, 0xdb, 0xef])?; // low nibbles zmm5
+    assembler.instruction(&[0x62, 0xf1, 0x5d, 0x48, 0xdb, 0xe7])?; // mask high nibbles
+    assembler.instruction(&[0x62, 0xf2, 0x75, 0x48, 0x00, 0xf5])?; // low rows zmm6
+    assembler.instruction(&[0x62, 0xf2, 0x6d, 0x48, 0x00, 0xed])?; // high rows zmm5
+    assembler.instruction(&[0x62, 0xf2, 0x7e, 0x48, 0x29, 0xd0])?; // sign mask k2
+    assembler.instruction(&[0x62, 0xf1, 0x7f, 0x4a, 0x6f, 0xf5])?; // select high rows
+    assembler.instruction(&[0x62, 0xf2, 0x65, 0x48, 0x00, 0xe4])?; // exact high bits
+    assembler.instruction(&[0x62, 0xf1, 0x4d, 0x48, 0xdb, 0xf4])?; // intersect zmm6
+    assembler.instruction(&[0x62, 0xf2, 0x4d, 0x48, 0x26, 0xce])?; // members in k1
+    Ok(())
+}
+
+fn x86_emit_exact_vector_candidates(
+    assembler: &mut X86Assembler,
+    kind: X86StartFilterKind,
+    scan_offset: u8,
+) -> Result<X86CandidateMask, ObjectError> {
+    match kind {
+        X86StartFilterKind::Sse2 => Err(ObjectError::InvalidModule(
+            "x86 exact-set vector candidates selected SSE2",
+        )),
+        X86StartFilterKind::Avx2 => {
+            x86_emit_exact_avx2_candidates(assembler, scan_offset)?;
+            Ok(X86CandidateMask::MovemaskEax)
+        }
+        X86StartFilterKind::Avx512Bw => {
+            x86_emit_exact_avx512_candidates(assembler, scan_offset)?;
+            Ok(X86CandidateMask::Avx512K1)
+        }
+    }
 }
 
 fn x86_emit_start_filter_scalar_bound(
@@ -9024,8 +9107,11 @@ fn lower_x86_64_dfa_with_entry_contract(
         .or_else(|| layout.loop_skip.map(|skip| skip.filter));
     let filter_kind = (layout.exact_start_byte_set.is_some() || instruction_filter.is_some())
         .then(|| x86_start_filter_kind(features));
-    let use_exact_avx2 = layout.exact_start_byte_set.is_some()
-        && features.has(CpuFeature::X86Avx2);
+    let exact_vector_kind = if layout.exact_start_byte_set.is_some() {
+        filter_kind.filter(|kind| !matches!(kind, X86StartFilterKind::Sse2))
+    } else {
+        None
+    };
     let mut scanner_emission = None;
     let prefix_relation_vector = layout
         .prefix_relation
@@ -9158,11 +9244,11 @@ fn lower_x86_64_dfa_with_entry_contract(
         } else {
             x86_emit_start_filter_constants(&mut assembler, filter, kind, 1)?;
         }
-    } else if use_exact_avx2 {
+    } else if let Some(exact_vector_kind) = exact_vector_kind {
         let storage = layout.exact_start_storage.ok_or(ObjectError::InvalidModule(
-            "x86 AVX2 exact scanner has no canonical storage",
+            "x86 vector exact scanner has no canonical storage",
         ))?;
-        x86_emit_exact_avx2_constants(&mut assembler, storage)?;
+        x86_emit_exact_vector_constants(&mut assembler, storage, exact_vector_kind)?;
     }
 
     if layout.initial_pending {
@@ -9373,12 +9459,17 @@ fn lower_x86_64_dfa_with_entry_contract(
         scanner_emission = Some(NativeScannerEmission {
             scan_offset: exact.scan_offset,
             membership: exact.membership,
-            isa: if use_exact_avx2 {
-                NativeScannerIsa::X86Avx2
-            } else {
-                NativeScannerIsa::X86ScalarBitmap
+            isa: match exact_vector_kind {
+                Some(X86StartFilterKind::Avx2) => NativeScannerIsa::X86Avx2,
+                Some(X86StartFilterKind::Avx512Bw) => NativeScannerIsa::X86Avx512Bw,
+                Some(X86StartFilterKind::Sse2) => {
+                    return Err(ObjectError::InvalidModule(
+                        "x86 exact scanner selected an unsupported SSE2 vector route",
+                    ));
+                }
+                None => NativeScannerIsa::X86ScalarBitmap,
             },
-            vectorized: use_exact_avx2,
+            vectorized: exact_vector_kind.is_some(),
         });
         if layout.output != OutputContract::Exists {
             assembler.instruction(&[0x49, 0x83, 0xfb, 0xff])?; // cmp r11, -1
@@ -9391,26 +9482,32 @@ fn lower_x86_64_dfa_with_entry_contract(
         assembler.branch(&[0x0f, 0x85], scalar_scan)?;
 
         let scalar = assembler.label()?;
-        if use_exact_avx2 {
+        if let Some(exact_vector_kind) = exact_vector_kind {
             let vector = assembler.label()?;
             let vector_hit = assembler.label()?;
             assembler.bind(vector)?;
             assembler.instruction(&[0x48, 0x89, 0xc8])?; // remaining = end
             assembler.instruction(&[0x48, 0x29, 0xd0])?; // remaining -= position
-            let required = u32::from(exact.scan_offset).checked_add(32).ok_or(
-                ObjectError::ArithmeticOverflow("x86 exact AVX2 scanner bound"),
-            )?;
+            let required = u32::from(exact.scan_offset)
+                .checked_add(u32::from(exact_vector_kind.width()))
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "x86 exact vector scanner bound",
+                ))?;
             let mut compare = vec![0x48, 0x3d];
             compare.extend_from_slice(&required.to_le_bytes());
             assembler.instruction(&compare)?;
             assembler.branch(&[0x0f, 0x82], scalar)?;
-            x86_emit_exact_avx2_candidates(&mut assembler, exact.scan_offset)?;
-            assembler.instruction(&[0x85, 0xc0])?; // test exact lane mask
+            let candidate_mask = x86_emit_exact_vector_candidates(
+                &mut assembler,
+                exact_vector_kind,
+                exact.scan_offset,
+            )?;
+            x86_emit_candidate_nonzero(&mut assembler, candidate_mask)?;
             assembler.branch(&[0x0f, 0x85], vector_hit)?;
-            assembler.instruction(&[0x48, 0x83, 0xc2, 32])?;
+            assembler.instruction(&[0x48, 0x83, 0xc2, exact_vector_kind.width()])?;
             assembler.branch(&[0xe9], vector)?;
             assembler.bind(vector_hit)?;
-            x86_emit_first_candidate_lane(&mut assembler, X86CandidateMask::MovemaskEax)?;
+            x86_emit_first_candidate_lane(&mut assembler, candidate_mask)?;
             assembler.instruction(&[0x48, 0x01, 0xc2])?;
             assembler.branch(&[0xe9], candidate)?;
         } else {
@@ -9550,7 +9647,7 @@ fn lower_x86_64_dfa_with_entry_contract(
             &layout,
             vector_filter,
             kind,
-            use_exact_avx2,
+            exact_vector_kind,
             scalar_transition,
             finish,
         )?;
@@ -13765,9 +13862,11 @@ fn selected_aarch64_exact_sve_kind(
     features: FeatureSet,
     storage: NativeExactByteSetStorage,
 ) -> Option<Aarch64ExactSveKind> {
-    if aarch64_primary_scanner_isa(operating_system, features, true)
-        != Aarch64PrimaryScannerIsa::Sve
-    {
+    if !aarch64_primary_scanner_uses_sve(aarch64_primary_scanner_isa(
+        operating_system,
+        features,
+        true,
+    )) {
         return None;
     }
     if features.has(CpuFeature::Aarch64Sve2)
@@ -13898,6 +13997,7 @@ fn aarch64_emit_exact_sve_scanner(
     assembler: &mut Aarch64Assembler,
     exact: NativeExactByteSet,
     kind: Aarch64ExactSveKind,
+    retained_vector_length: Option<u8>,
     vector: Aarch64Label,
     scalar: Aarch64Label,
     candidate: Aarch64Label,
@@ -13908,7 +14008,15 @@ fn aarch64_emit_exact_sve_scanner(
 
     assembler.bind(vector)?;
     assembler.instruction(aarch64_sve_ptrue_b())?;
-    assembler.instruction(aarch64_sve_cntb(6)?)?;
+    // Mixed-capability roots sampled their runtime VL after every prepass and
+    // retain it in a leaf-scratch GPR across retries. Pure-SVE roots have no
+    // dispatch sample and materialize the same byte count here.
+    let vector_length = if let Some(vector_length) = retained_vector_length {
+        vector_length
+    } else {
+        assembler.instruction(aarch64_sve_cntb(6)?)?;
+        6
+    };
     assembler.bind(single)?;
     assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
     if exact.scan_offset != 0 {
@@ -13920,7 +14028,7 @@ fn aarch64_emit_exact_sve_scanner(
             u16::from(exact.scan_offset),
         )?)?;
     }
-    assembler.instruction(aarch64_cmp_x(12, 6)?)?;
+    assembler.instruction(aarch64_cmp_x(12, vector_length)?)?;
     assembler.branch_cond(AARCH64_LO, partial)?;
     aarch64_emit_exact_sve_candidates(assembler, kind, exact.scan_offset)?;
     assembler.instruction(aarch64_sve_ptest_p0(1)?)?;
@@ -13991,6 +14099,34 @@ fn aarch64_emit_exact_asimd_candidates(
     assembler.instruction(aarch64_and_16b(24, 24, 20)?)?;
     assembler.instruction(aarch64_cmtst_16b(24, 24, 24)?)?;
     aarch64_emit_candidate_any(assembler, 24)
+}
+
+fn aarch64_emit_exact_asimd_scanner(
+    assembler: &mut Aarch64Assembler,
+    exact: NativeExactByteSet,
+    vector: Aarch64Label,
+    scalar: Aarch64Label,
+    candidate: Aarch64Label,
+    use_exact_lane: bool,
+) -> Result<(), ObjectError> {
+    let vector_hit = use_exact_lane.then(|| assembler.label()).transpose()?;
+    assembler.bind(vector)?;
+    assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+    let required = u16::from(exact.scan_offset).checked_add(16).ok_or(
+        ObjectError::ArithmeticOverflow("AArch64 exact ASIMD scanner bound"),
+    )?;
+    assembler.instruction(aarch64_cmp_x_imm(12, required)?)?;
+    assembler.branch_cond(AARCH64_LO, scalar)?;
+    aarch64_emit_exact_asimd_candidates(assembler, exact.scan_offset)?;
+    assembler.branch_cond(AARCH64_NE, vector_hit.unwrap_or(scalar))?;
+    assembler.instruction(aarch64_add_x_imm(2, 2, 16)?)?;
+    assembler.branch(vector)?;
+    if let Some(vector_hit) = vector_hit {
+        assembler.bind(vector_hit)?;
+        aarch64_emit_first_candidate_lane(assembler, 24)?;
+        assembler.branch(candidate)?;
+    }
+    Ok(())
 }
 
 fn aarch64_emit_suffix_lower_bound(
@@ -14620,14 +14756,17 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
         && layout
             .start_filter
             .is_some_and(|filter| !filter.ranges().is_empty());
-    let use_exact_asimd = features.has(CpuFeature::Aarch64Asimd)
-        && layout.exact_start_byte_set.is_some();
     let exact_sve_kind = layout
         .exact_start_storage
         .filter(|_| layout.exact_start_byte_set.is_some())
         .and_then(|storage| {
             selected_aarch64_exact_sve_kind(operating_system, features, storage)
         });
+    let exact_use_runtime_vl_dispatch = exact_sve_kind.is_some()
+        && aarch64_primary_scanner_uses_runtime_vl_dispatch(primary_scanner_isa);
+    let use_exact_asimd = features.has(CpuFeature::Aarch64Asimd)
+        && layout.exact_start_byte_set.is_some()
+        && (exact_sve_kind.is_none() || exact_use_runtime_vl_dispatch);
     let mut scanner_emission = None;
     if sve_suffix_kind.is_some()
         && selected_aarch64_sve_suffix_kind(layout, features, operating_system).is_none()
@@ -14801,16 +14940,16 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
             let first_register = AARCH64_STANDALONE_FILTER_FIRST_CONSTANT;
             aarch64_emit_start_filter_constants(&mut assembler, filter, first_register)?;
         }
-    } else if use_exact_asimd {
-        let storage = layout.exact_start_storage.ok_or(ObjectError::InvalidModule(
-            "AArch64 ASIMD exact scanner has no canonical storage",
-        ))?;
-        aarch64_emit_exact_asimd_constants(&mut assembler, storage)?;
     } else if let Some(kind) = exact_sve_kind {
         let storage = layout.exact_start_storage.ok_or(ObjectError::InvalidModule(
             "AArch64 SVE exact scanner has no canonical storage",
         ))?;
         aarch64_emit_exact_sve_constants(&mut assembler, storage, kind)?;
+    } else if use_exact_asimd {
+        let storage = layout.exact_start_storage.ok_or(ObjectError::InvalidModule(
+            "AArch64 ASIMD exact scanner has no canonical storage",
+        ))?;
+        aarch64_emit_exact_asimd_constants(&mut assembler, storage)?;
     }
     let mut filter_batch_first_candidates = None;
 
@@ -14839,7 +14978,7 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
         aarch64_emit_sve_filter_setups(&mut assembler, filter, vector_filter, sve_filter_plan)?;
     }
 
-    if use_runtime_vl_dispatch {
+    if use_runtime_vl_dispatch || exact_use_runtime_vl_dispatch {
         // The suffix prepass cannot provide this value: its short-window
         // bypass reaches the root without executing its optional CNTB, and
         // the seeded-reverse prepass also owns X16. Sample only after every
@@ -15183,38 +15322,52 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
         let exact_scalar_loop = assembler.label()?;
         if let Some(kind) = exact_sve_kind {
             let exact_vector = assembler.label()?;
+            let exact_asimd_vector = exact_use_runtime_vl_dispatch
+                .then(|| assembler.label())
+                .transpose()?;
+            if let Some(exact_asimd_vector) = exact_asimd_vector {
+                assembler.branch_zero_w(
+                    AARCH64_MIXED_ROOT_WIDE_MODE_REGISTER,
+                    exact_asimd_vector,
+                )?;
+            }
             aarch64_emit_exact_sve_scanner(
                 &mut assembler,
                 exact,
                 kind,
+                exact_use_runtime_vl_dispatch
+                    .then_some(AARCH64_MIXED_ROOT_VL_REGISTER),
                 exact_vector,
                 exact_scalar,
                 candidate,
             )?;
+            if let Some(exact_asimd_vector) = exact_asimd_vector {
+                // SVE2 MATCH tables are not the nibble classifier consumed by
+                // ASIMD. Reload the canonical fixed-width constants only on
+                // the process-wide VL16 arm; a wider process never executes
+                // this block and retains the scalable constants above.
+                assembler.bind(exact_asimd_vector)?;
+                aarch64_emit_exact_asimd_constants(&mut assembler, storage)?;
+                let exact_asimd_scan = assembler.label()?;
+                aarch64_emit_exact_asimd_scanner(
+                    &mut assembler,
+                    exact,
+                    exact_asimd_scan,
+                    exact_scalar,
+                    candidate,
+                    use_exact_asimd_lane,
+                )?;
+            }
         } else if use_exact_asimd {
             let exact_vector = assembler.label()?;
-            let exact_vector_hit = assembler.label()?;
-            assembler.bind(exact_vector)?;
-            assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
-            let required = u16::from(exact.scan_offset).checked_add(16).ok_or(
-                ObjectError::ArithmeticOverflow("AArch64 exact ASIMD scanner bound"),
+            aarch64_emit_exact_asimd_scanner(
+                &mut assembler,
+                exact,
+                exact_vector,
+                exact_scalar,
+                candidate,
+                use_exact_asimd_lane,
             )?;
-            assembler.instruction(aarch64_cmp_x_imm(12, required)?)?;
-            assembler.branch_cond(AARCH64_LO, exact_scalar)?;
-            aarch64_emit_exact_asimd_candidates(&mut assembler, exact.scan_offset)?;
-            assembler.branch_cond(
-                AARCH64_NE,
-                if use_exact_asimd_lane {
-                    exact_vector_hit
-                } else {
-                    exact_scalar
-                },
-            )?;
-            assembler.instruction(aarch64_add_x_imm(2, 2, 16)?)?;
-            assembler.branch(exact_vector)?;
-            assembler.bind(exact_vector_hit)?;
-            aarch64_emit_first_candidate_lane(&mut assembler, 24)?;
-            assembler.branch(candidate)?;
         }
 
         assembler.bind(exact_scalar)?;
@@ -15315,6 +15468,7 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
             vector_filter,
             use_asimd_loop,
             use_exact_asimd_lane,
+            exact_sve_kind,
             scalar_transition,
             finish,
         )?;
@@ -16553,13 +16707,18 @@ mod tests {
                 Some(StartAccelerator::X86Avx512Bw),
             ),
             (
+                Target::x86_64_linux().with_features(avx512).unwrap(),
+                exact_pattern,
+                Some(StartAccelerator::X86Avx512Bw),
+            ),
+            (
                 Target::x86_64_linux()
                     .with_features(avx512_with_avx2)
                     .unwrap(),
                 exact_pattern,
-                // Arbitrary fragmented membership uses its authenticated
-                // AVX2 nibble classifier and remains valid on AVX-512 CPUs.
-                Some(StartAccelerator::X86Avx2),
+                // AVX-512 exact membership is independently selected even
+                // when the target also advertises AVX2 and AVX-512VL.
+                Some(StartAccelerator::X86Avx512Bw),
             ),
             (
                 Target::aarch64_linux(),
@@ -17355,7 +17514,7 @@ mod tests {
                 .find(|&byte| !expected[usize::from(byte)])
                 .expect("nonuniversal exact set");
 
-            for vector_width in [16_usize, 32] {
+            for vector_width in [16_usize, 32, 64] {
                 for scan_offset in [0_usize, usize::from(cardinality)] {
                     // Every address residue reaches the same first-lane result
                     // through the unaligned vector load.
@@ -17416,7 +17575,7 @@ mod tests {
                     }
 
                     // Every lane of one complete block is selected exactly,
-                    // including the AVX2 upper 128-bit lane.
+                    // including the upper AVX2 and AVX-512 lanes.
                     for first in 0..vector_width {
                         let mut haystack = vec![nonmember; scan_offset + vector_width];
                         haystack[scan_offset + first] = member;
@@ -17669,7 +17828,12 @@ mod tests {
     }
 
     #[test]
-    fn exact_avx2_and_asimd_backends_emit_authenticated_vector_receipts() {
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::too_many_lines,
+        reason = "decoded branch bitfields and one cross-ISA receipt remain bounded and auditable"
+    )]
+    fn exact_avx2_avx512_and_asimd_backends_emit_authenticated_vector_receipts() {
         // A dense arbitrary root set needs the exact nibble scanner, while its
         // singleton complement also admits the independent interior loop
         // skipper. This exercises restoration of the scanner's live tables.
@@ -17722,6 +17886,44 @@ mod tests {
             );
         }
 
+        let avx512 = FeatureSet::of(CpuFeature::X86Avx512F)
+            .with(CpuFeature::X86Avx512Bw);
+        let x86_avx512 = lower_x86_64_dfa_with_emission(x86_layout, avx512).unwrap();
+        let avx512_receipt = x86_avx512
+            .scanner
+            .expect("AVX-512 exact scanner receipt");
+        assert_eq!(avx512_receipt.isa, NativeScannerIsa::X86Avx512Bw);
+        assert!(avx512_receipt.vectorized);
+        assert!(retained_prefix_scanner_is_preserved(
+            Some(avx512_receipt),
+            requirement
+        ));
+        assert!(
+            x86_avx512
+                .code
+                .windows(5)
+                .filter(|window| *window == [0x62, 0xd2, 0x7d, 0x48, 0x5a])
+                .count()
+                >= 8,
+            "AVX-512 exact scanner did not restore all broadcast nibble constants after loop skip"
+        );
+        for opcode in [
+            [0x62, 0xf2, 0x7e, 0x48, 0x29, 0xd0].as_slice(),
+            [0x62, 0xf1, 0x7f, 0x4a, 0x6f, 0xf5].as_slice(),
+            [0x62, 0xf2, 0x4d, 0x48, 0x26, 0xce].as_slice(),
+            [0xc4, 0xe1, 0xf8, 0x98, 0xc9].as_slice(),
+            [0xc4, 0xe1, 0xfb, 0x93, 0xc1].as_slice(),
+            [0x48, 0x0f, 0xbc, 0xc0].as_slice(),
+        ] {
+            assert!(
+                x86_avx512
+                    .code
+                    .windows(opcode.len())
+                    .any(|window| window == opcode),
+                "AVX-512 exact classifier is missing {opcode:02x?}"
+            );
+        }
+
         let (_, aarch64_layout) =
             build_native_dfa_table_for_architecture(view, Architecture::Aarch64).unwrap();
         assert!(aarch64_layout.loop_skip.is_some());
@@ -17764,6 +17966,94 @@ mod tests {
                 .count()
                 >= 2,
             "ASIMD exact scanner did not restore nibble constants after loop skip"
+        );
+
+        let mixed_sve2 = FeatureSet::of(CpuFeature::Aarch64Asimd)
+            .with(CpuFeature::Aarch64Sve)
+            .with(CpuFeature::Aarch64Sve2);
+        let mixed = lower_aarch64_dfa_for_operating_system_with_emission(
+            aarch64_layout,
+            mixed_sve2,
+            OperatingSystem::Linux,
+            None,
+        )
+        .unwrap();
+        let mixed_receipt = mixed.scanner.expect("mixed SVE2 exact scanner receipt");
+        assert_eq!(mixed_receipt.isa, NativeScannerIsa::Aarch64Sve2);
+        assert!(retained_prefix_scanner_is_preserved(
+            Some(mixed_receipt),
+            requirement
+        ));
+        let mixed_words = mixed
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let retained_mode = aarch64_sub_x_imm(
+            AARCH64_MIXED_ROOT_WIDE_MODE_REGISTER,
+            AARCH64_MIXED_ROOT_VL_REGISTER,
+            AARCH64_SVE_MIN_VECTOR_BYTES,
+        )
+        .unwrap();
+        assert_eq!(
+            mixed_words
+                .windows(2)
+                .filter(|words| {
+                    words[0] == aarch64_sve_cntb(AARCH64_MIXED_ROOT_VL_REGISTER).unwrap()
+                        && words[1] == retained_mode
+                })
+                .count(),
+            1,
+            "mixed exact scanner must sample the process VL exactly once"
+        );
+        let mixed_dispatches = mixed_words
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &word)| {
+                (word & 0xff00_001f == 0x3400_0011).then_some((index, word))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mixed_dispatches.len(),
+            1,
+            "mixed exact scanner must have one VL16 dispatch"
+        );
+        let (dispatch, branch) = mixed_dispatches[0];
+        assert_eq!(
+            mixed_words.get(dispatch.checked_add(1).unwrap()),
+            Some(&aarch64_sve_ptrue_b()),
+            "wide mixed exact VL must fall through to SVE2"
+        );
+        let immediate = (((branch >> 5) & 0x7_ffff) << 13).cast_signed() >> 13;
+        let asimd_target = usize::try_from(
+            i32::try_from(dispatch)
+                .unwrap()
+                .checked_add(immediate)
+                .unwrap(),
+        )
+        .unwrap();
+        let asimd_prologue_end = asimd_target
+            .checked_add(6)
+            .unwrap()
+            .min(mixed_words.len());
+        assert!(
+            mixed_words[asimd_target..asimd_prologue_end]
+                .contains(&aarch64_ld1_three_16b(16, 6).unwrap()),
+            "VL16 dispatch did not reach the ASIMD exact constant reload"
+        );
+        assert!(mixed_words.contains(&aarch64_sve2_match_b(1, 0, 16).unwrap()));
+        assert!(mixed_words.contains(&aarch64_ld1_three_16b(16, 6).unwrap()));
+        assert!(
+            !mixed_words.contains(&aarch64_sve_cntb(6).unwrap()),
+            "mixed exact scanner redundantly resampled its retained vector length"
+        );
+        assert!(
+            mixed_words
+                .iter()
+                .filter(|&&word| word == aarch64_sve_ld1rqb(16, 12).unwrap())
+                .count()
+                >= 2,
+            "mixed SVE2 constants were not restored after the ASIMD loop skipper"
         );
     }
 
@@ -17838,6 +18128,37 @@ mod tests {
         }
         assert!(!base_words.contains(&aarch64_sve2_match_b(1, 0, 16).unwrap()));
 
+        let mixed_sve = FeatureSet::of(CpuFeature::Aarch64Asimd)
+            .with(CpuFeature::Aarch64Sve);
+        let mixed_base = lower_aarch64_dfa_for_operating_system_with_emission(
+            base_layout,
+            mixed_sve,
+            OperatingSystem::Linux,
+            None,
+        )
+        .unwrap();
+        let mixed_base_receipt = mixed_base
+            .scanner
+            .expect("mixed base-SVE exact scanner receipt");
+        assert_eq!(mixed_base_receipt.isa, NativeScannerIsa::Aarch64Sve);
+        assert!(retained_prefix_scanner_is_preserved(
+            Some(mixed_base_receipt),
+            base_requirement
+        ));
+        let mixed_base_words = mixed_base
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(mixed_base_words.contains(&aarch64_sve_tbl_b(6, 16, 5).unwrap()));
+        assert!(mixed_base_words.contains(&aarch64_ld1_three_16b(16, 6).unwrap()));
+        assert!(
+            mixed_base_words
+                .iter()
+                .any(|word| word & 0xff00_001f == 0x3400_0011),
+            "mixed base-SVE exact scanner must retain its VL16 ASIMD arm"
+        );
+
         for (pattern, cardinality, table_count, complement) in [
             (r"(?-u:[ACEGIKMOQ])+", 9_u32, 1_u8, false),
             (r"(?-u:[ACEGIKMOQSUWYaceg])+", 17, 2, false),
@@ -17910,6 +18231,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one encoding test keeps AVX2, AVX-512, and ASIMD displacement shapes together"
+    )]
     fn exact_nibble_vector_helpers_have_exact_encodings_and_displacement_boundaries() {
         let cases = [
             (0_u8, vec![0xc5, 0xfe, 0x6f, 0x04, 0x17]),
@@ -17932,6 +18257,75 @@ mod tests {
             )
             .unwrap();
             assert_eq!(assembler.finish().unwrap(), expected);
+        }
+
+        let avx512_cases = [
+            (0_u8, vec![0x62, 0xf1, 0x7f, 0x48, 0x6f, 0x04, 0x17]),
+            (
+                127,
+                vec![
+                    0x62, 0xf1, 0x7f, 0x48, 0x6f, 0x84, 0x17, 0x7f, 0x00, 0x00, 0x00,
+                ],
+            ),
+            (
+                128,
+                vec![
+                    0x62, 0xf1, 0x7f, 0x48, 0x6f, 0x84, 0x17, 0x80, 0x00, 0x00, 0x00,
+                ],
+            ),
+            (
+                255,
+                vec![
+                    0x62, 0xf1, 0x7f, 0x48, 0x6f, 0x84, 0x17, 0xff, 0x00, 0x00, 0x00,
+                ],
+            ),
+        ];
+        for (scan_offset, expected) in avx512_cases {
+            let mut assembler = X86Assembler::new();
+            x86_emit_start_filter_vector_load(
+                &mut assembler,
+                X86StartFilterKind::Avx512Bw,
+                scan_offset,
+            )
+            .unwrap();
+            assert_eq!(assembler.finish().unwrap(), expected);
+        }
+
+        let storage = NativeExactByteSetStorage {
+            bitmap_offset: 0,
+            aarch64_lut_offset: None,
+            nibble_base: 32,
+            sve2_match: None,
+        };
+        let mut assembler = X86Assembler::new();
+        x86_emit_exact_avx512_constants(&mut assembler, storage).unwrap();
+        assert_eq!(
+            assembler.finish().unwrap(),
+            [
+                0x62, 0xd2, 0x7d, 0x48, 0x5a, 0x89, 0x20, 0x00, 0x00, 0x00, 0x62, 0xd2,
+                0x7d, 0x48, 0x5a, 0x91, 0x40, 0x00, 0x00, 0x00, 0x62, 0xd2, 0x7d, 0x48,
+                0x5a, 0x99, 0x60, 0x00, 0x00, 0x00, 0x62, 0xd2, 0x7d, 0x48, 0x5a, 0xb9,
+                0x80, 0x00, 0x00, 0x00,
+            ]
+        );
+        let mut assembler = X86Assembler::new();
+        x86_emit_exact_avx512_candidates(&mut assembler, 0).unwrap();
+        let avx512_candidates = assembler.finish().unwrap();
+        // Independently assembled with AVX-512F+BW and without AVX-512VL.
+        for instruction in [
+            [0x62, 0xf1, 0x7f, 0x48, 0x6f, 0x04, 0x17].as_slice(),
+            [0x62, 0xf1, 0x5d, 0x48, 0x71, 0xd0, 0x04].as_slice(),
+            [0x62, 0xf2, 0x75, 0x48, 0x00, 0xf5].as_slice(),
+            [0x62, 0xf2, 0x7e, 0x48, 0x29, 0xd0].as_slice(),
+            [0x62, 0xf1, 0x7f, 0x4a, 0x6f, 0xf5].as_slice(),
+            [0x62, 0xf2, 0x4d, 0x48, 0x26, 0xce].as_slice(),
+        ] {
+            assert!(
+                avx512_candidates
+                    .windows(instruction.len())
+                    .any(|window| window == instruction),
+                "AVX-512 exact helper is missing {instruction:02x?}"
+            );
         }
 
         assert_eq!(aarch64_ld1_three_16b(16, 6).unwrap(), 0x4c40_60d0);
@@ -17978,6 +18372,24 @@ mod tests {
                     .with_features(FeatureSet::of(CpuFeature::X86Avx2))
                     .unwrap(),
                 StartAccelerator::X86Avx2,
+            ),
+            (
+                Target::x86_64_linux()
+                    .with_features(
+                        FeatureSet::of(CpuFeature::X86Avx512F)
+                            .with(CpuFeature::X86Avx512Bw),
+                    )
+                    .unwrap(),
+                StartAccelerator::X86Avx512Bw,
+            ),
+            (
+                Target::x86_64_macos()
+                    .with_features(
+                        FeatureSet::of(CpuFeature::X86Avx512F)
+                            .with(CpuFeature::X86Avx512Bw),
+                    )
+                    .unwrap(),
+                StartAccelerator::X86Avx512Bw,
             ),
             (
                 Target::aarch64_linux()
@@ -19847,13 +20259,15 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(
+        assert_eq!(
             lower_native_dfa(
                 fragmented.native,
                 Target::x86_64_linux().with_features(avx512).unwrap(),
             )
             .unwrap()
-            .is_none()
+            .expect("AVX-512 fragmented scanner")
+            .start_accelerator,
+            StartAccelerator::X86Avx512Bw
         );
         assert_eq!(
             lower_native_dfa(
@@ -25412,6 +25826,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one policy test keeps Linux mixed-VL and macOS fixed-width artifacts comparable"
+    )]
     fn aarch64_mixed_capabilities_follow_the_explicit_primary_scanner_policy() {
         let asimd = FeatureSet::of(CpuFeature::Aarch64Asimd);
         let mixed_sve = asimd.with(CpuFeature::Aarch64Sve);
@@ -25557,6 +25975,31 @@ mod tests {
         assert_eq!(
             mac_mixed.module().relocations(),
             mac_asimd.module().relocations()
+        );
+
+        let mac_exact_asimd = complete_forward_resource_fallback(
+            r"(?-u:[^Q])+",
+            OutputContract::SelectedEnd,
+            Target::aarch64_macos().with_features(asimd).unwrap(),
+        );
+        let mac_exact_mixed = complete_forward_resource_fallback(
+            r"(?-u:[^Q])+",
+            OutputContract::SelectedEnd,
+            Target::aarch64_macos()
+                .with_features(mixed_sve2)
+                .unwrap(),
+        );
+        assert_eq!(
+            mac_exact_mixed.module().start_accelerator(),
+            StartAccelerator::Aarch64Asimd
+        );
+        assert_eq!(
+            mac_exact_mixed.module().sections(),
+            mac_exact_asimd.module().sections()
+        );
+        assert_eq!(
+            mac_exact_mixed.module().relocations(),
+            mac_exact_asimd.module().relocations()
         );
     }
 
