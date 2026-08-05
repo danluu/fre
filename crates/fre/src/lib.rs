@@ -5462,29 +5462,44 @@ impl PortableBuilder {
         // those sidecars as one exclusive plan: its adaptive comparison and
         // fallback are deliberately against raw K0, so retaining another
         // route here would bypass and mis-train that incumbent.
-        let correlated_terminal_inspection = if self.selection == PlanSelection::Auto {
-            let inspection = correlated_bounded_alternation::inspect(
+        // Every planner after the generic K0 lowering is optional. A preceding
+        // sidecar may consume the final admitted work unit while declining its
+        // own publication; in that case there is no authority to begin this
+        // independent inspection. Preserve the already-valid K0 plan instead
+        // of turning one-below optional admission into a hard build failure.
+        let correlated_terminal_inspection = if self.selection == PlanSelection::Auto
+            && fallback_planner_work < self.limits.max_planner_work
+        {
+            match correlated_bounded_alternation::inspect(
                 &rust.hir,
                 fallback_planner_work,
                 self.limits.max_planner_work,
-            )
-            .map_err(|error| match error {
-                correlated_bounded_alternation::InspectionError::WorkLimit {
+            ) {
+                Ok(inspection) => {
+                    fallback_planner_work = inspection.planner_work();
+                    match inspection {
+                        correlated_bounded_alternation::InspectionOutcome::Eligible(
+                            inspection,
+                        ) => Some(inspection),
+                        correlated_bounded_alternation::InspectionOutcome::Ineligible {
+                            ..
+                        } => None,
+                    }
+                }
+                Err(correlated_bounded_alternation::InspectionError::WorkLimit {
+                    actual,
                     needed,
                     limit,
-                } => BuildError::PlannerWorkLimit { needed, limit },
-                correlated_bounded_alternation::InspectionError::ArithmeticOverflow => {
-                    BuildError::InternalInvariant(
+                }) => {
+                    debug_assert!(actual <= limit && needed > limit);
+                    fallback_planner_work = actual;
+                    None
+                }
+                Err(correlated_bounded_alternation::InspectionError::ArithmeticOverflow) => {
+                    return Err(BuildError::InternalInvariant(
                         "correlated bounded-alternation planner arithmetic overflow",
-                    )
+                    ));
                 }
-            })?;
-            fallback_planner_work = inspection.planner_work();
-            match inspection {
-                correlated_bounded_alternation::InspectionOutcome::Eligible(inspection) => {
-                    Some(inspection)
-                }
-                correlated_bounded_alternation::InspectionOutcome::Ineligible { .. } => None,
             }
         } else {
             None

@@ -28,7 +28,11 @@ const TERMINAL_WORK_PASSES_PER_BRANCH: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InspectionError {
-    WorkLimit { needed: u64, limit: u64 },
+    WorkLimit {
+        actual: u64,
+        needed: u64,
+        limit: u64,
+    },
     ArithmeticOverflow,
 }
 
@@ -556,7 +560,11 @@ fn charge(
         .checked_add(additional)
         .ok_or(InspectionError::ArithmeticOverflow)?;
     if needed > limit {
-        return Err(InspectionError::WorkLimit { needed, limit });
+        return Err(InspectionError::WorkLimit {
+            actual: *work,
+            needed,
+            limit,
+        });
     }
     *work = needed;
     Ok(())

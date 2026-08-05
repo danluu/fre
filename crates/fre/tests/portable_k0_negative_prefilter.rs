@@ -255,6 +255,31 @@ fn optional_sidecar_closes_planner_literal_and_persistent_limits() {
         build(PATTERN, PlanSelection::Auto, limits).k0_negative_prefilter_needle_bytes(),
         Some(9)
     );
+    // The final, incompatible correlated-alternation inspection consumes two
+    // exact work units after this sidecar: one for the root and one for the
+    // first non-literal prefix node. Both one-below boundaries must preserve
+    // the already-admitted sidecar without turning optional inspection into a
+    // hard build failure.
+    limits.max_planner_work -= 1;
+    let followup_declined = build(PATTERN, PlanSelection::Auto, limits);
+    assert_eq!(
+        followup_declined.k0_negative_prefilter_needle_bytes(),
+        Some(9)
+    );
+    assert_eq!(
+        followup_declined.build_report().planner_work,
+        limits.max_planner_work
+    );
+    limits.max_planner_work -= 1;
+    let followup_refused = build(PATTERN, PlanSelection::Auto, limits);
+    assert_eq!(
+        followup_refused.k0_negative_prefilter_needle_bytes(),
+        Some(9)
+    );
+    assert_eq!(
+        followup_refused.build_report().planner_work,
+        limits.max_planner_work
+    );
     limits.max_planner_work -= 1;
     assert_eq!(
         build(PATTERN, PlanSelection::Auto, limits).k0_negative_prefilter_needle_bytes(),
