@@ -75,6 +75,12 @@ pub const GENERAL_SEARCH_OPERATION_ID: &str =
     "literal-class-run-search.generalized.search.unicode-off.v1";
 pub const GENERAL_SHORTEST_SEARCH_OPERATION_ID: &str =
     "literal-class-run-search.generalized.shortest-search.unicode-off.v1";
+pub const BOUNDED_SEARCH_PLAN_ID: &str =
+    "literal-class-run-search.finite-two-barrier.unicode-off.v1";
+pub const BOUNDED_SEARCH_OPERATION_ID: &str =
+    "literal-class-run-search.finite-two-barrier.search.unicode-off.v1";
+pub const BOUNDED_SHORTEST_SEARCH_OPERATION_ID: &str =
+    "literal-class-run-search.finite-two-barrier.shortest-search.unicode-off.v1";
 pub(crate) const UNICODE_ALL_NON_ASCII_SEARCH_PLAN_ID: &str =
     "literal-class-run-search.unicode-all-non-ascii.v1";
 pub(crate) const UNICODE_ALL_NON_ASCII_SEARCH_OPERATION_ID: &str =
@@ -86,6 +92,8 @@ const FIXED_BUILD_WORK: usize = 32;
 const LITERAL_BUILD_WORK_PER_BYTE: usize = 4;
 const FINDER_BUILD_WORK_PER_BYTE: usize = 4;
 const ANCHOR_SELECTION_WORK: usize = 2;
+const BOUNDED_FINDER_BUILD_WORK_PER_BYTE: usize = 16;
+const BOUNDED_FINDER_BUILD_FIXED_WORK: usize = 64;
 const RANGE_BUILD_WORK: usize = 8;
 const RANGE_WORD_WORK: usize = 4;
 const FIXED_REDUCE_WORK: usize = 16;
@@ -610,6 +618,10 @@ pub enum BuildError {
     ArithmeticOverflow {
         computation: &'static str,
     },
+    InvalidFiniteBounds {
+        minimum: usize,
+        maximum: usize,
+    },
 }
 
 impl fmt::Display for BuildError {
@@ -789,6 +801,27 @@ pub struct LiteralClassRunSearchPlan {
     ascii_scanner: Option<AsciiClassScanner>,
     minimum: SearchRunMinimum,
     unicode_all_non_ascii: bool,
+    build: BuildAccounting,
+}
+
+/// Stateless direct search for one finite greedy class run between two exact
+/// nonempty literal barriers.
+///
+/// The builder proves that the prefix's final byte and suffix's first byte
+/// are outside the repeated class. Consequently a maximal forward run after
+/// a prefix occurrence and a maximal backward run before a suffix occurrence
+/// are the same unique repetition. Prefix occurrences therefore preserve
+/// selected-start order, while suffix occurrences preserve earliest-end
+/// order, without an automaton replay or source-derived retained state.
+#[derive(Debug)]
+pub struct BoundedLiteralClassRunPlan {
+    prefix: Finder<'static>,
+    suffix: Finder<'static>,
+    class: ByteClass,
+    ascii_scanner: Option<AsciiClassScanner>,
+    minimum: usize,
+    maximum: usize,
+    exists_anchor: Anchor,
     build: BuildAccounting,
 }
 
@@ -3588,6 +3621,808 @@ impl LiteralClassRunSearchPlan {
     }
 }
 
+impl BoundedLiteralClassRunPlan {
+    pub fn build<I>(
+        prefix: &[u8],
+        ranges: I,
+        suffix: &[u8],
+        minimum: usize,
+        maximum: usize,
+        limits: BuildLimits,
+    ) -> Result<Self, BuildError>
+    where
+        I: Iterator<Item = (u8, u8)>,
+    {
+        Self::build_inner(None, prefix, ranges, suffix, minimum, maximum, limits)
+    }
+
+    pub fn build_with_dispatch<I>(
+        dispatch: SimdDispatchContext,
+        prefix: &[u8],
+        ranges: I,
+        suffix: &[u8],
+        minimum: usize,
+        maximum: usize,
+        limits: BuildLimits,
+    ) -> Result<Self, BuildError>
+    where
+        I: Iterator<Item = (u8, u8)>,
+    {
+        Self::build_inner(
+            Some((dispatch, DispatchPolicy::Auto)),
+            prefix,
+            ranges,
+            suffix,
+            minimum,
+            maximum,
+            limits,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the finite direct builder keeps exact-shape revalidation and every retained allocation charge adjacent"
+    )]
+    fn build_inner<I>(
+        dispatch: Option<(SimdDispatchContext, DispatchPolicy)>,
+        prefix: &[u8],
+        mut ranges: I,
+        suffix: &[u8],
+        minimum: usize,
+        maximum: usize,
+        limits: BuildLimits,
+    ) -> Result<Self, BuildError>
+    where
+        I: Iterator<Item = (u8, u8)>,
+    {
+        if prefix.is_empty() {
+            return Err(BuildError::EmptyPrefix);
+        }
+        if suffix.is_empty() {
+            return Err(BuildError::EmptySuffix);
+        }
+        if minimum > maximum {
+            return Err(BuildError::InvalidFiniteBounds { minimum, maximum });
+        }
+        let literal_bytes = prefix
+            .len()
+            .checked_add(suffix.len())
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "finite literal byte total",
+            })?;
+        enforce_build(
+            literal_bytes,
+            limits.max_literal_bytes,
+            BuildResource::LiteralBytes,
+        )?;
+        let persistent_bytes = size_of::<Self>()
+            .checked_add(literal_bytes)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "finite direct persistent bytes",
+            })?;
+        enforce_build(
+            persistent_bytes,
+            limits.max_persistent_bytes,
+            BuildResource::Persistent,
+        )?;
+        enforce_build(persistent_bytes, limits.max_peak_bytes, BuildResource::Peak)?;
+        enforce_build(0, limits.max_scratch_bytes, BuildResource::Scratch)?;
+
+        let mut actual = DirectBuildAttemptActual::default();
+        let (class, class_ranges, class_members, ascii_scanner, exists_anchor, work_upper_bound) = {
+            let mut work = BuildWork::new(limits.max_build_work, &mut actual);
+            work.charge(size_of::<Self>())?;
+            work.charge(
+                literal_bytes
+                    .checked_mul(LITERAL_BUILD_WORK_PER_BYTE)
+                    .ok_or(BuildError::ArithmeticOverflow {
+                        computation: "finite literal copy work",
+                    })?,
+            )?;
+            work.charge(
+                literal_bytes
+                    .checked_mul(BOUNDED_FINDER_BUILD_WORK_PER_BYTE)
+                    .and_then(|finder| {
+                        BOUNDED_FINDER_BUILD_FIXED_WORK
+                            .checked_mul(2)
+                            .and_then(|fixed| finder.checked_add(fixed))
+                    })
+                    .ok_or(BuildError::ArithmeticOverflow {
+                        computation: "finite finder build work",
+                    })?,
+            )?;
+            let (class, class_ranges, class_members) =
+                build_class(&mut ranges, limits, &mut work)?;
+            work.charge(1)?;
+            if class.contains(*prefix.last().expect("nonempty prefix was checked")) {
+                return Err(BuildError::PrefixBoundaryInClass);
+            }
+            work.charge(1)?;
+            if class.contains(suffix[0]) {
+                return Err(BuildError::SuffixBoundaryInClass);
+            }
+            work.charge(
+                ANCHOR_SELECTION_WORK
+                    .checked_add(2)
+                    .ok_or(BuildError::ArithmeticOverflow {
+                        computation: "finite anchor and bound selection work",
+                    })?,
+            )?;
+            let prefix_score = bounded_anchor_score(prefix, &mut work)?;
+            let suffix_score = bounded_anchor_score(suffix, &mut work)?;
+            let exists_anchor = if suffix_score.0 < prefix_score.0
+                || (suffix_score.0 == prefix_score.0 && suffix_score.1 >= prefix_score.1)
+            {
+                Anchor::Suffix
+            } else {
+                Anchor::Prefix
+            };
+            let ascii_scanner = build_ascii_scanner(
+                dispatch.filter(|_| class.is_ascii()),
+                class,
+                false,
+                &mut work,
+            )?;
+            (
+                class,
+                class_ranges,
+                class_members,
+                ascii_scanner,
+                exists_anchor,
+                work.used,
+            )
+        };
+
+        let prefix = copy_literal(prefix, "finite direct prefix")?;
+        let prefix_bytes = prefix.len();
+        record_literal_copy(&mut actual, prefix_bytes)?;
+        let suffix = copy_literal(suffix, "finite direct suffix")?;
+        let suffix_bytes = suffix.len();
+        record_literal_copy(&mut actual, suffix_bytes)?;
+        Ok(Self {
+            prefix: FinderBuilder::new().build_forward_owned(prefix),
+            suffix: FinderBuilder::new().build_forward_owned(suffix),
+            class,
+            ascii_scanner,
+            minimum,
+            maximum,
+            exists_anchor,
+            build: BuildAccounting {
+                prefix_bytes,
+                suffix_bytes,
+                literal_bytes,
+                class_ranges,
+                class_members,
+                work_upper_bound,
+                scratch_bytes: 0,
+                persistent_bytes,
+                peak_bytes: persistent_bytes,
+            },
+        })
+    }
+
+    #[must_use]
+    pub const fn plan_id(&self) -> &'static str {
+        BOUNDED_SEARCH_PLAN_ID
+    }
+
+    #[must_use]
+    pub const fn build_accounting(&self) -> BuildAccounting {
+        self.build
+    }
+
+    #[must_use]
+    pub const fn minimum(&self) -> usize {
+        self.minimum
+    }
+
+    #[must_use]
+    pub const fn maximum(&self) -> usize {
+        self.maximum
+    }
+
+    fn prefix(&self) -> &[u8] {
+        self.prefix.needle()
+    }
+
+    fn suffix(&self) -> &[u8] {
+        self.suffix.needle()
+    }
+
+    pub fn find(
+        &self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
+        self.find_window(haystack, Window::full(haystack), limits)
+    }
+
+    pub fn find_window(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
+        self.search_window(haystack, window, limits, SearchProjection::Selected)
+    }
+
+    pub fn shortest_window(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<(Option<usize>, SearchAccounting), SearchError> {
+        let (matched, accounting) =
+            self.search_window(haystack, window, limits, SearchProjection::EarliestEnd)?;
+        Ok((matched.map(|(_, end)| end), accounting))
+    }
+
+    pub fn shortest_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<Option<usize>, SearchError> {
+        let (upper, _, meter) =
+            self.search_preflight(haystack.len(), window, limits, Anchor::Suffix)?;
+        if !meter.work_envelope_admitted
+            || upper.anchor_candidates > limits.max_candidate_visits
+        {
+            return self
+                .shortest_window(haystack, window, limits)
+                .map(|(matched, _)| matched);
+        }
+        self.find_suffix_value(&haystack[window.start()..window.end()])
+            .map(|(_, end)| {
+                window
+                    .start()
+                    .checked_add(end)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "absolute finite value shortest end",
+                    })
+            })
+            .transpose()
+            .map_err(SearchError::from)
+    }
+
+    pub fn is_match_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<bool, SearchError> {
+        let (upper, _, meter) =
+            self.search_preflight(haystack.len(), window, limits, self.exists_anchor)?;
+        if !meter.work_envelope_admitted
+            || upper.anchor_candidates > limits.max_candidate_visits
+        {
+            let projection = match self.exists_anchor {
+                Anchor::Prefix => SearchProjection::Selected,
+                Anchor::Suffix => SearchProjection::EarliestEnd,
+                Anchor::CompleteAsciiWordSuffix => {
+                    unreachable!("finite direct anchor is unguarded")
+                }
+            };
+            return self
+                .search_window(haystack, window, limits, projection)
+                .map(|(matched, _)| matched.is_some());
+        }
+        let slice = &haystack[window.start()..window.end()];
+        Ok(match self.exists_anchor {
+            Anchor::Prefix => self.find_prefix_value(slice).is_some(),
+            Anchor::Suffix => self.find_suffix_value(slice).is_some(),
+            Anchor::CompleteAsciiWordSuffix => unreachable!("finite direct anchor is unguarded"),
+        })
+    }
+
+    pub fn find_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<Option<(usize, usize)>, SearchError> {
+        let (upper, _, meter) =
+            self.search_preflight(haystack.len(), window, limits, Anchor::Prefix)?;
+        if !meter.work_envelope_admitted
+            || upper.anchor_candidates > limits.max_candidate_visits
+        {
+            return self
+                .find_window(haystack, window, limits)
+                .map(|(matched, _)| matched);
+        }
+        self.find_prefix_value(&haystack[window.start()..window.end()])
+            .map(|(start, end)| {
+                Ok((
+                    window.start().checked_add(start).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "absolute finite value match start",
+                        },
+                    )?,
+                    window.start().checked_add(end).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "absolute finite value match end",
+                        },
+                    )?,
+                ))
+            })
+            .transpose()
+            .map_err(SearchError::from)
+    }
+
+    fn search_window(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+        projection: SearchProjection,
+    ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
+        let anchor = match projection {
+            SearchProjection::Selected => Anchor::Prefix,
+            SearchProjection::EarliestEnd => Anchor::Suffix,
+        };
+        let (upper, window_bytes, meter) =
+            self.search_preflight(haystack.len(), window, limits, anchor)?;
+        let slice = &haystack[window.start()..window.end()];
+        let (matched, actual) = match anchor {
+            Anchor::Prefix => self.search_prefix(slice, upper, meter)?,
+            Anchor::Suffix => self.search_suffix(slice, upper, meter)?,
+            Anchor::CompleteAsciiWordSuffix => unreachable!("finite direct anchor is unguarded"),
+        };
+        let matched = matched
+            .map(|(start, end)| {
+                Ok((
+                    window.start().checked_add(start).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "absolute finite match start",
+                        },
+                    )?,
+                    window.start().checked_add(end).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "absolute finite match end",
+                        },
+                    )?,
+                ))
+            })
+            .transpose()?;
+        let operation_id = match projection {
+            SearchProjection::Selected => BOUNDED_SEARCH_OPERATION_ID,
+            SearchProjection::EarliestEnd => BOUNDED_SHORTEST_SEARCH_OPERATION_ID,
+        };
+        Ok((
+            matched,
+            SearchAccounting {
+                operation_id,
+                window_bytes,
+                assertion_context_bytes: 0,
+                candidate_visits_upper_bound: upper.anchor_candidates,
+                source_reads_upper_bound: upper.source_reads,
+                work_upper_bound: u64::try_from(upper.work).unwrap_or(u64::MAX),
+                scratch_bytes: 0,
+                candidate_visits: actual.anchor_candidates,
+                finder_calls: actual.finder_calls,
+                classifications: actual.classifications,
+                literal_comparisons: actual.literal_comparisons,
+                source_reads: actual.source_reads,
+                work: actual.work,
+            },
+        ))
+    }
+
+    fn search_preflight(
+        &self,
+        haystack_len: usize,
+        window: Window,
+        limits: SearchLimits,
+        anchor: Anchor,
+    ) -> Result<(ReduceUpperBounds, usize, SearchMeter), SearchError> {
+        if window.start() > window.end() || window.end() > haystack_len {
+            return Err(SearchError::InvalidWindow {
+                start: window.start(),
+                end: window.end(),
+                haystack_len,
+            });
+        }
+        let window_bytes =
+            window
+                .end()
+                .checked_sub(window.start())
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "finite search window bytes",
+                })?;
+        let upper = self.search_upper_bounds(window_bytes, anchor)?;
+        let meter = SearchMeter::new(upper, limits)?;
+        Ok((upper, window_bytes, meter))
+    }
+
+    fn search_upper_bounds(
+        &self,
+        input_bytes: usize,
+        anchor: Anchor,
+    ) -> Result<ReduceUpperBounds, ReduceError> {
+        let (anchor_bytes, opposite_bytes) = match anchor {
+            Anchor::Prefix => (self.prefix().len(), self.suffix().len()),
+            Anchor::Suffix => (self.suffix().len(), self.prefix().len()),
+            Anchor::CompleteAsciiWordSuffix => unreachable!("finite direct anchor is unguarded"),
+        };
+        let candidates = input_bytes
+            .checked_sub(anchor_bytes)
+            .and_then(|remaining| remaining.checked_add(1))
+            .unwrap_or(0);
+        let finder_scanned_bytes = candidates
+            .checked_mul(anchor_bytes.saturating_sub(1))
+            .and_then(|overlap| input_bytes.checked_add(overlap))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "finite overlapping finder service",
+            })?;
+        let classifications = input_bytes
+            .checked_mul(4)
+            .and_then(|logical| logical.checked_add(candidates))
+            .and_then(|logical| {
+                candidates
+                    .checked_mul(ASCII_WIDE_BYTES - 1)
+                    .and_then(|overhead| logical.checked_add(overhead))
+            })
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "finite class-run classifications",
+            })?;
+        let literal_comparisons = candidates.checked_mul(opposite_bytes).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "finite opposite literal comparisons",
+            },
+        )?;
+        let source_reads = finder_scanned_bytes
+            .checked_add(classifications)
+            .and_then(|reads| reads.checked_add(literal_comparisons))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "finite direct source reads",
+            })?;
+        let work = finder_scanned_bytes
+            .checked_mul(FINDER_SCAN_WORK)
+            .and_then(|value| value.checked_add(candidates.checked_mul(FINDER_CALL_WORK)?))
+            .and_then(|value| value.checked_add(candidates.checked_mul(ANCHOR_CANDIDATE_WORK)?))
+            .and_then(|value| value.checked_add(classifications.checked_mul(CLASSIFICATION_WORK)?))
+            .and_then(|value| {
+                value.checked_add(literal_comparisons.checked_mul(LITERAL_COMPARISON_WORK)?)
+            })
+            .and_then(|value| value.checked_add(candidates.checked_mul(RUN_WORK)?))
+            .and_then(|value| value.checked_add(candidates.checked_mul(MATCH_WORK)?))
+            .and_then(|value| value.checked_add(FIXED_REDUCE_WORK))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "finite direct search work",
+            })?;
+        Ok(ReduceUpperBounds {
+            input_bytes,
+            source_reads,
+            finder_scanned_bytes,
+            finder_calls: candidates,
+            anchor_candidates: candidates,
+            classifications,
+            literal_comparisons,
+            work,
+            run_events: candidates,
+            candidate_events: candidates,
+            match_events: candidates,
+            count: u64::try_from(candidates).unwrap_or(u64::MAX),
+            span_sum: u64::try_from(input_bytes).unwrap_or(u64::MAX),
+            scratch_bytes: 0,
+            persistent_bytes: self.build.persistent_bytes,
+            peak_bytes: self.build.peak_bytes,
+        })
+    }
+
+    fn search_prefix(
+        &self,
+        haystack: &[u8],
+        upper: ReduceUpperBounds,
+        meter: SearchMeter,
+    ) -> Result<(Option<(usize, usize)>, ReduceActualCounters), SearchError> {
+        // Prefix occurrences are enumerated by increasing start. After each
+        // occurrence, the maximal forward class run is the only possible
+        // greedy count: if it exceeds `maximum`, every shorter boundary is
+        // still a class byte and cannot begin the proved non-class suffix.
+        // The first accepted candidate is therefore the selected span.
+        let mut actual = new_search_actual();
+        let mut cursor = 0;
+        loop {
+            let Some((start, prefix_end)) = self.next_anchor(
+                &self.prefix,
+                haystack,
+                cursor,
+                &mut actual,
+                meter,
+            )? else {
+                return finish_search(None, actual, upper);
+            };
+            let run_end = search_scan_class_run_forward(
+                haystack,
+                self.class,
+                self.ascii_scanner.as_ref(),
+                prefix_end,
+                &mut actual,
+                meter,
+            )?
+            .unwrap_or(prefix_end);
+            let run_len = run_end.checked_sub(prefix_end).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "finite forward run length",
+                },
+            )?;
+            if run_len != 0 {
+                meter.ensure_work(&actual, RUN_WORK)?;
+                actual.runs = checked_add(actual.runs, 1, "finite forward run")?;
+                actual.work = checked_add(actual.work, RUN_WORK, "finite forward run work")?;
+            }
+            if run_len >= self.minimum && run_len <= self.maximum {
+                let end = run_end.checked_add(self.suffix().len()).ok_or(
+                    ReduceError::ArithmeticOverflow {
+                        computation: "finite selected end",
+                    },
+                )?;
+                if end <= haystack.len() {
+                    actual.candidates = checked_add(actual.candidates, 1, "finite candidate")?;
+                    if search_literal_equals(
+                        haystack,
+                        run_end,
+                        self.suffix(),
+                        &mut actual,
+                        meter,
+                    )? {
+                        let matched = (start, end);
+                        record_search_match(matched, &mut actual, meter)?;
+                        return finish_search(Some(matched), actual, upper);
+                    }
+                }
+            }
+            cursor = start.checked_add(1).ok_or(ReduceError::ArithmeticOverflow {
+                computation: "finite prefix progress",
+            })?;
+        }
+    }
+
+    fn search_suffix(
+        &self,
+        haystack: &[u8],
+        upper: ReduceUpperBounds,
+        meter: SearchMeter,
+    ) -> Result<(Option<(usize, usize)>, ReduceActualCounters), SearchError> {
+        // Fixed-width suffix occurrences are enumerated by increasing end.
+        // The maximal backward class run is the only possible repetition: if
+        // it exceeds `maximum`, a shorter count would make the proved
+        // non-class prefix end inside the run. Thus the first accepted suffix
+        // is exactly the earliest accepting end.
+        let mut actual = new_search_actual();
+        let mut cursor = 0;
+        loop {
+            let Some((suffix_start, end)) = self.next_anchor(
+                &self.suffix,
+                haystack,
+                cursor,
+                &mut actual,
+                meter,
+            )? else {
+                return finish_search(None, actual, upper);
+            };
+            let run_start = search_scan_class_run_backward(
+                haystack,
+                self.class,
+                self.ascii_scanner.as_ref(),
+                suffix_start,
+                &mut actual,
+                meter,
+            )?
+            .unwrap_or(suffix_start);
+            let run_len = suffix_start.checked_sub(run_start).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "finite backward run length",
+                },
+            )?;
+            if run_len != 0 {
+                meter.ensure_work(&actual, RUN_WORK)?;
+                actual.runs = checked_add(actual.runs, 1, "finite backward run")?;
+                actual.work = checked_add(actual.work, RUN_WORK, "finite backward run work")?;
+            }
+            if run_len >= self.minimum && run_len <= self.maximum {
+                if let Some(start) = run_start.checked_sub(self.prefix().len()) {
+                    actual.candidates = checked_add(actual.candidates, 1, "finite candidate")?;
+                    if search_literal_equals(
+                        haystack,
+                        start,
+                        self.prefix(),
+                        &mut actual,
+                        meter,
+                    )? {
+                        let matched = (start, end);
+                        record_search_match(matched, &mut actual, meter)?;
+                        return finish_search(Some(matched), actual, upper);
+                    }
+                }
+            }
+            cursor = suffix_start.checked_add(1).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "finite suffix progress",
+                },
+            )?;
+        }
+    }
+
+    fn next_anchor(
+        &self,
+        finder: &Finder<'static>,
+        haystack: &[u8],
+        cursor: usize,
+        actual: &mut ReduceActualCounters,
+        meter: SearchMeter,
+    ) -> Result<Option<(usize, usize)>, SearchError> {
+        let anchor_bytes = finder.needle().len();
+        let remaining = haystack.len().checked_sub(cursor).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "finite anchor remaining bytes",
+            },
+        )?;
+        if remaining < anchor_bytes {
+            return Ok(None);
+        }
+        meter.ensure_work(actual, FINDER_CALL_WORK)?;
+        actual.finder_calls = checked_add(actual.finder_calls, 1, "finite finder calls")?;
+        actual.work = checked_add(actual.work, FINDER_CALL_WORK, "finite finder call work")?;
+        let service_bytes = if meter.work_envelope_admitted {
+            remaining
+        } else {
+            meter.service_capacity(actual, FINDER_SCAN_WORK)?
+        };
+        if service_bytes < anchor_bytes {
+            let required = anchor_bytes.checked_mul(FINDER_SCAN_WORK).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "finite minimum finder service",
+                },
+            )?;
+            meter.ensure_work(actual, required)?;
+            return Err(SearchError::Kernel(ReduceError::AccountingInvariant {
+                resource: "metered finite anchor minimum service",
+                actual: 1,
+                upper: 0,
+            }));
+        }
+        let search_end = cursor.saturating_add(service_bytes).min(haystack.len());
+        let search = &haystack[cursor..search_end];
+        let Some(relative) = finder.find(search) else {
+            charge_finder_scan(actual, search.len())?;
+            if search_end != haystack.len() {
+                meter.ensure_work(actual, FINDER_SCAN_WORK)?;
+                return Err(SearchError::Kernel(ReduceError::AccountingInvariant {
+                    resource: "metered finite anchor continuation",
+                    actual: 1,
+                    upper: 0,
+                }));
+            }
+            return Ok(None);
+        };
+        let finder_service = relative.checked_add(anchor_bytes).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "finite successful finder service",
+            },
+        )?;
+        charge_finder_scan(actual, finder_service)?;
+        let start = cursor.checked_add(relative).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "finite anchor start",
+            },
+        )?;
+        let end = start.checked_add(anchor_bytes).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "finite anchor end",
+            },
+        )?;
+        meter.ensure_anchor_candidate(actual)?;
+        meter.ensure_work(actual, ANCHOR_CANDIDATE_WORK)?;
+        actual.anchor_candidates =
+            checked_add(actual.anchor_candidates, 1, "finite anchor candidates")?;
+        actual.work = checked_add(
+            actual.work,
+            ANCHOR_CANDIDATE_WORK,
+            "finite anchor candidate work",
+        )?;
+        Ok(Some((start, end)))
+    }
+
+    fn find_prefix_value(&self, haystack: &[u8]) -> Option<(usize, usize)> {
+        let mut cursor = 0;
+        while cursor <= haystack.len() {
+            let relative = self.prefix.find(haystack.get(cursor..)?)?;
+            let start = cursor.checked_add(relative)?;
+            let prefix_end = start.checked_add(self.prefix().len())?;
+            let run_end = scan_class_run_forward_value(
+                haystack,
+                self.class,
+                self.ascii_scanner.as_ref(),
+                prefix_end,
+            )
+            .unwrap_or(prefix_end);
+            let run_len = run_end.checked_sub(prefix_end)?;
+            if run_len >= self.minimum
+                && run_len <= self.maximum
+                && haystack
+                    .get(run_end..)
+                    .is_some_and(|remaining| remaining.starts_with(self.suffix()))
+            {
+                return run_end
+                    .checked_add(self.suffix().len())
+                    .map(|end| (start, end));
+            }
+            cursor = start.checked_add(1)?;
+        }
+        None
+    }
+
+    fn find_suffix_value(&self, haystack: &[u8]) -> Option<(usize, usize)> {
+        let mut cursor = 0;
+        while cursor <= haystack.len() {
+            let relative = self.suffix.find(haystack.get(cursor..)?)?;
+            let suffix_start = cursor.checked_add(relative)?;
+            let end = suffix_start.checked_add(self.suffix().len())?;
+            let run_start = scan_class_run_backward_value(
+                haystack,
+                self.class,
+                self.ascii_scanner.as_ref(),
+                suffix_start,
+            )
+            .unwrap_or(suffix_start);
+            let run_len = suffix_start.checked_sub(run_start)?;
+            if run_len >= self.minimum && run_len <= self.maximum {
+                let start = run_start.checked_sub(self.prefix().len());
+                if start.is_some_and(|start| {
+                    haystack
+                        .get(start..run_start)
+                        .is_some_and(|actual| actual == self.prefix())
+                }) {
+                    return start.map(|start| (start, end));
+                }
+            }
+            cursor = suffix_start.checked_add(1)?;
+        }
+        None
+    }
+}
+
+fn bounded_anchor_score(
+    literal: &[u8],
+    work: &mut BuildWork<'_>,
+) -> Result<(u16, usize), BuildError> {
+    let Some(&first_byte) = literal.first() else {
+        return Err(BuildError::MissingLiteralAnchor);
+    };
+    work.charge(1)?;
+    let first_rank = crate::packed_literal_anchor_frequency_rank(first_byte);
+    let Some(&second_byte) = literal.get(1) else {
+        return Ok((u16::from(first_rank) * 2, literal.len()));
+    };
+    work.charge(1)?;
+    let mut rare1 = (first_byte, first_rank);
+    let mut rare2 = (
+        second_byte,
+        crate::packed_literal_anchor_frequency_rank(second_byte),
+    );
+    if rare2.1 < rare1.1 {
+        core::mem::swap(&mut rare1, &mut rare2);
+    }
+    for &byte in literal
+        .iter()
+        .take(usize::from(u8::MAX))
+        .skip(2)
+    {
+        work.charge(1)?;
+        let rank = crate::packed_literal_anchor_frequency_rank(byte);
+        if rank < rare1.1 {
+            rare2 = rare1;
+            rare1 = (byte, rank);
+        } else if byte != rare1.0 && rank < rare2.1 {
+            rare2 = (byte, rank);
+        }
+    }
+    Ok((u16::from(rare1.1) + u16::from(rare2.1), literal.len()))
+}
+
 const fn new_search_actual() -> ReduceActualCounters {
     ReduceActualCounters {
         source_reads: 0,
@@ -4517,6 +5352,82 @@ fn scan_class_run_backward(
     }
 }
 
+fn scan_class_run_backward_value(
+    haystack: &[u8],
+    class: ByteClass,
+    scanner: Option<&AsciiClassScanner>,
+    end: usize,
+) -> Option<usize> {
+    match scanner {
+        Some(AsciiClassScanner::Run(scanner)) => {
+            let result = scanner.scan_backward(haystack.get(..end)?);
+            let run = result.member_run_len();
+            (run != 0).then(|| end - run)
+        }
+        Some(AsciiClassScanner::Fixed(classifier)) => {
+            scan_class_run_backward_fixed_value(haystack, class, classifier, end)
+        }
+        None => scan_class_run_backward_scalar_value(haystack, class, end),
+    }
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "loop guards prove each reverse block and cursor decrement remains in the slice"
+)]
+fn scan_class_run_backward_fixed_value(
+    haystack: &[u8],
+    class: ByteClass,
+    classifier: &AsciiByteSetClassifier,
+    end: usize,
+) -> Option<usize> {
+    let mut start = end;
+    for _ in 0..SIMD_SCALAR_PROOF_BYTES {
+        if start == 0 {
+            return (start != end).then_some(start);
+        }
+        let previous = start - 1;
+        if !class.contains(haystack[previous]) {
+            return (start != end).then_some(start);
+        }
+        start = previous;
+    }
+    while start >= ASCII_WIDE_BYTES {
+        let block_start = start - ASCII_WIDE_BYTES;
+        let block: &[u8; ASCII_WIDE_BYTES] = haystack[block_start..start]
+            .try_into()
+            .expect("the reverse fixed-width loop proves one complete block");
+        let members = classifier.classify_32(block).member_mask();
+        if members == u32::MAX {
+            start = block_start;
+            continue;
+        }
+        start -= usize::try_from(members.leading_ones())
+            .expect("a 32-bit member suffix fits usize");
+        return Some(start);
+    }
+    while start > 0 && class.contains(haystack[start - 1]) {
+        start -= 1;
+    }
+    (start != end).then_some(start)
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the loop guard proves each reverse cursor decrement remains in the slice"
+)]
+fn scan_class_run_backward_scalar_value(
+    haystack: &[u8],
+    class: ByteClass,
+    end: usize,
+) -> Option<usize> {
+    let mut start = end;
+    while start > 0 && class.contains(haystack[start - 1]) {
+        start -= 1;
+    }
+    (start != end).then_some(start)
+}
+
 fn scan_class_run_backward_direct(
     haystack: &[u8],
     scanner: &AsciiByteSetRunScanner,
@@ -5408,6 +6319,18 @@ mod tests {
         .unwrap()
     }
 
+    fn bounded_plan() -> BoundedLiteralClassRunPlan {
+        BoundedLiteralClassRunPlan::build(
+            b"ab",
+            [(b'0', b'1')].into_iter(),
+            b"xy",
+            0,
+            2,
+            BuildLimits::unlimited(),
+        )
+        .unwrap()
+    }
+
     fn unicode_generalized_plan() -> LiteralClassRunSearchPlan {
         LiteralClassRunSearchPlan::build_unicode_all_non_ascii(
             b"a",
@@ -5655,6 +6578,16 @@ mod tests {
                             .0,
                         expected_shortest,
                         "shortest haystack={haystack:?} window={start}..{end}"
+                    );
+                    assert_eq!(
+                        plan.shortest_window_value(
+                            haystack,
+                            window,
+                            SearchLimits::unlimited(),
+                        )
+                        .unwrap(),
+                        expected_shortest,
+                        "value shortest haystack={haystack:?} window={start}..{end}"
                     );
                     assert_eq!(
                         plan.is_match_window_value(haystack, window, SearchLimits::unlimited())
@@ -6517,6 +7450,246 @@ mod tests {
             ),
             Err(BuildError::WorkLimit { .. })
         ));
+    }
+
+    #[test]
+    fn bounded_two_barrier_selected_shortest_and_value_search_match_every_window() {
+        let plan = bounded_plan();
+        let oracle = RegexBuilder::new(r"ab[01]{0,2}xy")
+            .unicode(false)
+            .build()
+            .unwrap();
+        for haystack in [
+            b"".as_slice(),
+            b"abxy",
+            b"ab0xy",
+            b"ab01xy",
+            b"ab001xy--ab1xy",
+            b"zab01xy",
+            b"abab01xy",
+            b"ab2xy--ab0xy",
+            b"ab01xz--abxy",
+            b"ab01xyabxy",
+            b"xxab00xyyy",
+        ] {
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let window = Window::new(start, end);
+                    let expected = oracle
+                        .find(&haystack[start..end])
+                        .map(|matched| (start + matched.start(), start + matched.end()));
+                    let expected_shortest = oracle
+                        .shortest_match(&haystack[start..end])
+                        .map(|matched_end| start + matched_end);
+                    assert_eq!(
+                        plan.find_window(haystack, window, SearchLimits::unlimited())
+                            .unwrap()
+                            .0,
+                        expected,
+                        "selected haystack={haystack:?} window={start}..{end}"
+                    );
+                    assert_eq!(
+                        plan.find_window_value(haystack, window, SearchLimits::unlimited())
+                            .unwrap(),
+                        expected,
+                        "value span haystack={haystack:?} window={start}..{end}"
+                    );
+                    assert_eq!(
+                        plan.shortest_window(haystack, window, SearchLimits::unlimited())
+                            .unwrap()
+                            .0,
+                        expected_shortest,
+                        "shortest haystack={haystack:?} window={start}..{end}"
+                    );
+                    assert_eq!(
+                        plan.is_match_window_value(haystack, window, SearchLimits::unlimited())
+                            .unwrap(),
+                        expected.is_some(),
+                        "exists haystack={haystack:?} window={start}..{end}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_two_barrier_builder_and_search_limits_are_exactly_enforced() {
+        assert!(matches!(
+            BoundedLiteralClassRunPlan::build(
+                b"ab",
+                [(b'0', b'1')].into_iter(),
+                b"xy",
+                3,
+                2,
+                BuildLimits::unlimited(),
+            ),
+            Err(BuildError::InvalidFiniteBounds {
+                minimum: 3,
+                maximum: 2
+            })
+        ));
+        assert!(matches!(
+            BoundedLiteralClassRunPlan::build(
+                b"a0",
+                [(b'0', b'1')].into_iter(),
+                b"xy",
+                0,
+                2,
+                BuildLimits::unlimited(),
+            ),
+            Err(BuildError::PrefixBoundaryInClass)
+        ));
+        assert!(matches!(
+            BoundedLiteralClassRunPlan::build(
+                b"ab",
+                [(b'0', b'1')].into_iter(),
+                b"1y",
+                0,
+                2,
+                BuildLimits::unlimited(),
+            ),
+            Err(BuildError::SuffixBoundaryInClass)
+        ));
+
+        let baseline = bounded_plan().build_accounting();
+        let exact = BuildLimits {
+            max_literal_bytes: baseline.literal_bytes,
+            max_class_ranges: baseline.class_ranges,
+            max_class_members: baseline.class_members,
+            max_build_work: baseline.work_upper_bound,
+            max_scratch_bytes: baseline.scratch_bytes,
+            max_persistent_bytes: baseline.persistent_bytes,
+            max_peak_bytes: baseline.peak_bytes,
+        };
+        assert_eq!(
+            BoundedLiteralClassRunPlan::build(
+                b"ab",
+                [(b'0', b'1')].into_iter(),
+                b"xy",
+                0,
+                2,
+                exact,
+            )
+            .unwrap()
+            .build_accounting(),
+            baseline
+        );
+        let mut below = exact;
+        below.max_build_work -= 1;
+        assert!(matches!(
+            BoundedLiteralClassRunPlan::build(
+                b"ab",
+                [(b'0', b'1')].into_iter(),
+                b"xy",
+                0,
+                2,
+                below,
+            ),
+            Err(BuildError::WorkLimit { .. })
+        ));
+        below = exact;
+        below.max_persistent_bytes -= 1;
+        assert!(matches!(
+            BoundedLiteralClassRunPlan::build(
+                b"ab",
+                [(b'0', b'1')].into_iter(),
+                b"xy",
+                0,
+                2,
+                below,
+            ),
+            Err(BuildError::PersistentLimit { .. })
+        ));
+
+        let plan = bounded_plan();
+        let haystack = b"!!ab01xy";
+        let (_, accounting) = plan.find(haystack, SearchLimits::unlimited()).unwrap();
+        let exact_work = u64::try_from(accounting.work).unwrap();
+        assert!(
+            plan.find(
+                haystack,
+                SearchLimits {
+                    max_work_upper_bound: exact_work,
+                    max_candidate_visits: accounting.candidate_visits,
+                    max_scratch_bytes: 0,
+                },
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            plan.find(
+                haystack,
+                SearchLimits {
+                    max_work_upper_bound: exact_work - 1,
+                    max_candidate_visits: usize::MAX,
+                    max_scratch_bytes: 0,
+                },
+            ),
+            Err(SearchError::WorkLimit { needed, limit })
+                if needed == exact_work && limit == exact_work - 1
+        ));
+        assert!(matches!(
+            plan.find(
+                haystack,
+                SearchLimits {
+                    max_work_upper_bound: u64::MAX,
+                    max_candidate_visits: 0,
+                    max_scratch_bytes: 0,
+                },
+            ),
+            Err(SearchError::CandidateLimit {
+                needed: 1,
+                limit: 0
+            })
+        ));
+    }
+
+    #[test]
+    fn bounded_two_barrier_search_retains_no_cross_plan_or_source_state() {
+        let first = bounded_plan();
+        let second = BoundedLiteralClassRunPlan::build(
+            b"cd",
+            [(b'2', b'3')].into_iter(),
+            b"uv",
+            1,
+            2,
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let mut same_allocation = b"--ab01xy--".to_vec();
+        assert_eq!(
+            first
+                .find(&same_allocation, SearchLimits::unlimited())
+                .unwrap()
+                .0,
+            Some((2, 8))
+        );
+        same_allocation.copy_from_slice(b"--cd23uv--");
+        assert_eq!(
+            second
+                .find(&same_allocation, SearchLimits::unlimited())
+                .unwrap()
+                .0,
+            Some((2, 8))
+        );
+        assert_eq!(
+            first
+                .find(&same_allocation, SearchLimits::unlimited())
+                .unwrap()
+                .0,
+            None
+        );
+        same_allocation.copy_from_slice(b"--ab00xy--");
+        assert_eq!(
+            first
+                .find_window_value(
+                    &same_allocation,
+                    Window::full(&same_allocation),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            Some((2, 8))
+        );
     }
 
     #[test]

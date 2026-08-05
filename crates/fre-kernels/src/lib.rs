@@ -351,6 +351,10 @@ pub use literal_assertions::{
 };
 
 pub use literal_class_run_literal::{
+    BOUNDED_SEARCH_OPERATION_ID as BOUNDED_LITERAL_CLASS_RUN_SEARCH_OPERATION_ID,
+    BOUNDED_SEARCH_PLAN_ID as BOUNDED_LITERAL_CLASS_RUN_SEARCH_PLAN_ID,
+    BOUNDED_SHORTEST_SEARCH_OPERATION_ID as BOUNDED_LITERAL_CLASS_RUN_SHORTEST_SEARCH_OPERATION_ID,
+    BoundedLiteralClassRunPlan,
     BoundarySemantics as LiteralClassRunLiteralBoundarySemantics,
     BuildAccounting as LiteralClassRunLiteralBuildAccounting,
     BuildError as LiteralClassRunLiteralBuildError,
