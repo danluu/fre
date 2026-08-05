@@ -2323,6 +2323,7 @@ impl PrefixClassAlternationPlan {
         }
     }
 
+    #[inline(always)]
     #[allow(
         clippy::needless_range_loop,
         clippy::too_many_lines,
