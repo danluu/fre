@@ -795,6 +795,13 @@ enum BoundedAnchorScoreMode {
 struct BoundedAnchorSelection {
     preferred: Anchor,
     strict_full_width_repetition: Option<Anchor>,
+    strict_full_width_opposite_period: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BoundedRepetitionPreference {
+    preferred: Anchor,
+    opposite_primitive_period: usize,
 }
 
 #[derive(Debug)]
@@ -4592,7 +4599,7 @@ fn bounded_anchor_selection(
         core::cmp::Ordering::Less => Anchor::Suffix,
         core::cmp::Ordering::Greater => Anchor::Prefix,
         core::cmp::Ordering::Equal => match sampled_repetition {
-            Some(anchor) => anchor,
+            Some(preference) => preference.preferred,
             None => {
                 work.charge(1)?;
                 if suffix.len() >= prefix.len() {
@@ -4603,7 +4610,7 @@ fn bounded_anchor_selection(
             }
         },
     };
-    let strict_full_width_repetition = if prefix.len() <= usize::from(u8::MAX)
+    let strict_full_width = if prefix.len() <= usize::from(u8::MAX)
         && suffix.len() <= usize::from(u8::MAX)
     {
         sampled_repetition
@@ -4612,7 +4619,9 @@ fn bounded_anchor_selection(
     };
     Ok(BoundedAnchorSelection {
         preferred,
-        strict_full_width_repetition,
+        strict_full_width_repetition: strict_full_width.map(|proof| proof.preferred),
+        strict_full_width_opposite_period: strict_full_width
+            .map(|proof| proof.opposite_primitive_period),
     })
 }
 
@@ -4620,7 +4629,7 @@ fn bounded_repetition_preference(
     prefix: &[u8],
     suffix: &[u8],
     work: &mut BuildWork<'_>,
-) -> Result<Option<Anchor>, BuildError> {
+) -> Result<Option<BoundedRepetitionPreference>, BuildError> {
     let prefix_overlap = bounded_anchor_overlap_score(prefix, work)?;
     let suffix_overlap = bounded_anchor_overlap_score(suffix, work)?;
     work.charge(2)?;
@@ -4646,8 +4655,14 @@ fn bounded_repetition_preference(
         })?;
     work.charge(1)?;
     match suffix_factor.cmp(&prefix_factor) {
-        core::cmp::Ordering::Less => Ok(Some(Anchor::Suffix)),
-        core::cmp::Ordering::Greater => Ok(Some(Anchor::Prefix)),
+        core::cmp::Ordering::Less => Ok(Some(BoundedRepetitionPreference {
+            preferred: Anchor::Suffix,
+            opposite_primitive_period: prefix_overlap.primitive_period,
+        })),
+        core::cmp::Ordering::Greater => Ok(Some(BoundedRepetitionPreference {
+            preferred: Anchor::Prefix,
+            opposite_primitive_period: suffix_overlap.primitive_period,
+        })),
         core::cmp::Ordering::Equal => Ok(None),
     }
 }
@@ -4657,14 +4672,22 @@ fn bounded_native_cost_admitted(
     selection: BoundedAnchorSelection,
     has_vector_scanner: bool,
 ) -> Result<bool, BuildError> {
-    // A strictly less repetitive chosen anchor is sufficient on its own.
+    // A strictly less repetitive chosen anchor is sufficient on its own,
+    // except for a prefix-driven plan that must verify a uniform suffix.
+    // That degenerate opposite literal creates the same dense one-byte
+    // verification stream that K0's mandatory-prefix route already handles
+    // more efficiently. Period-two and wider exact roots remain admitted.
     // Otherwise, require enough bounded-run service to amortize one sustained
     // wide scan, and retain only the suffix-driven direction. Prefix-driven
     // search competes with K0's mandatory-prefix machinery and loses that
     // comparison as the input grows even when the bounded class scan itself
     // is wide. A complete strict-period proof above remains sufficient in
     // either direction.
-    if selection.strict_full_width_repetition == Some(selection.preferred) {
+    if selection.strict_full_width_repetition == Some(selection.preferred)
+        && selection.strict_full_width_opposite_period.is_some_and(|period| {
+            selection.preferred != Anchor::Prefix || period >= 2
+        })
+    {
         return Ok(true);
     }
     if !has_vector_scanner {
@@ -7858,10 +7881,12 @@ mod tests {
         let prefix = BoundedAnchorSelection {
             preferred: Anchor::Prefix,
             strict_full_width_repetition: None,
+            strict_full_width_opposite_period: None,
         };
         let suffix = BoundedAnchorSelection {
             preferred: Anchor::Suffix,
             strict_full_width_repetition: None,
+            strict_full_width_opposite_period: None,
         };
         let sustained = 2 * ASCII_WIDE_BYTES;
         assert!(!bounded_native_cost_admitted(sustained - 2, suffix, true).unwrap());
@@ -7875,9 +7900,16 @@ mod tests {
             let strict = BoundedAnchorSelection {
                 preferred: anchor,
                 strict_full_width_repetition: Some(anchor),
+                strict_full_width_opposite_period: Some(2),
             };
             assert!(bounded_native_cost_admitted(0, strict, false).unwrap());
         }
+        let uniform_prefix = BoundedAnchorSelection {
+            preferred: Anchor::Prefix,
+            strict_full_width_repetition: Some(Anchor::Prefix),
+            strict_full_width_opposite_period: Some(1),
+        };
+        assert!(!bounded_native_cost_admitted(usize::MAX, uniform_prefix, true).unwrap());
     }
 
     #[test]
@@ -7914,6 +7946,7 @@ mod tests {
         let selection = BoundedAnchorSelection {
             preferred: Anchor::Suffix,
             strict_full_width_repetition: None,
+            strict_full_width_opposite_period: None,
         };
         for scanner in [&fixed, &run] {
             assert!(!bounded_ascii_scanner_has_vector(Some(scanner)));
@@ -7959,6 +7992,7 @@ mod tests {
         .unwrap();
         assert_eq!(selection.preferred, Anchor::Prefix);
         assert_eq!(selection.strict_full_width_repetition, None);
+        assert_eq!(selection.strict_full_width_opposite_period, None);
 
         let mut actual = DirectBuildAttemptActual::default();
         let mut work = BuildWork::new(usize::MAX, &mut actual);
@@ -8065,8 +8099,20 @@ mod tests {
             assert_eq!(plan.preferred_anchor, Anchor::Suffix);
         }
 
+        assert!(
+            ascii(
+                b"QZ",
+                b"aaaaaaaa",
+                usize::MAX,
+                BuildLimits::unlimited(),
+            )
+            .unwrap()
+            .is_none(),
+            "a uniform suffix must not force prefix-driven native search"
+        );
         for (prefix, suffix, expected_anchor) in [
-            (b"QZ".as_slice(), b"aaaaaaaa".as_slice(), Anchor::Prefix),
+            (b"abaaaabb".as_slice(), b"abababab".as_slice(), Anchor::Prefix),
+            (b"abababab".as_slice(), b"abaaaabb".as_slice(), Anchor::Suffix),
             (b"aaaaaaaa".as_slice(), b"QZ".as_slice(), Anchor::Suffix),
         ] {
             let plan = ascii(prefix, suffix, 0, BuildLimits::unlimited())
@@ -8101,8 +8147,8 @@ mod tests {
             .expect("strict repetition improvement does not require SIMD");
         assert_eq!(strict_without_ascii_scanner.preferred_anchor, Anchor::Prefix);
 
-        let exact_prefix = b"QZ";
-        let exact_suffix = b"aaaaaaaa";
+        let exact_prefix = b"abaaaabb";
+        let exact_suffix = b"abababab";
         let admitted = ascii(
             exact_prefix,
             exact_suffix,

@@ -13634,8 +13634,10 @@ mod tests {
             (r"abaaaabb[0]{0,62}QZ", false),
             (r"abaaaabb[0]{0,63}QZ", vector),
             (r"QZ[0]{0,64}abaaaabb", false),
-            (r"QZ[0]{0,4}aaaaaaaa", true),
+            (r"QZ[0]{0,4}aaaaaaaa", false),
             (r"aaaaaaaa[0]{0,4}QZ", true),
+            (r"abaaaabb[0]{0,4}abababab", true),
+            (r"abababab[0]{0,4}abaaaabb", true),
         ] {
             let regex = PortableBuilder::new(pattern)
                 .unicode(false)
