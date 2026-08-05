@@ -581,6 +581,35 @@ fn specialized_aggregate_plan(model: &str, report: &AggregateBuildReport) -> Opt
     None
 }
 
+fn reverse_inner_aggregate_plan(model: &str, report: &AggregateBuildReport) -> &'static str {
+    let plan_id = match report.plan_identity {
+        AggregatePlanIdentity::ReverseInner(identity) => Some(identity.kernel.plan_id),
+        _ => None,
+    };
+    match (model == "compile", plan_id) {
+        (true, Some(fre::REVERSE_INNER_PLAN_ID)) => {
+            "compile-aggregate-reverse-inner-independent-v1"
+        }
+        (true, Some(fre::REVERSE_INNER_UNION_PLAN_ID)) => {
+            "compile-aggregate-reverse-inner-adaptive-union-v2"
+        }
+        (true, Some(fre::REVERSE_INNER_GROUPED_UNION_PLAN_ID)) => {
+            "compile-aggregate-reverse-inner-grouped-union-v2"
+        }
+        (false, Some(fre::REVERSE_INNER_PLAN_ID)) => {
+            "aggregate-reverse-inner-independent-v1"
+        }
+        (false, Some(fre::REVERSE_INNER_UNION_PLAN_ID)) => {
+            "aggregate-reverse-inner-adaptive-union-v2"
+        }
+        (false, Some(fre::REVERSE_INNER_GROUPED_UNION_PLAN_ID)) => {
+            "aggregate-reverse-inner-grouped-union-v2"
+        }
+        (true, _) => "compile-aggregate-reverse-inner-unrecognized",
+        (false, _) => "aggregate-reverse-inner-unrecognized",
+    }
+}
+
 fn aggregate_plan(model: &str, report: &AggregateBuildReport) -> &'static str {
     if let Some(plan) = specialized_aggregate_plan(model, report) {
         return plan;
@@ -608,7 +637,9 @@ fn aggregate_plan(model: &str, report: &AggregateBuildReport) -> &'static str {
         ("compile", AggregatePlanKind::LiteralClassRunLiteral, _) => {
             "compile-aggregate-literal-class-run-literal-v2"
         }
-        ("compile", AggregatePlanKind::ReverseInner, _) => "compile-aggregate-reverse-inner-v1",
+        ("compile", AggregatePlanKind::ReverseInner, _) => {
+            reverse_inner_aggregate_plan(model, report)
+        }
         ("compile", AggregatePlanKind::GraphemeScalarDfa, _) => {
             "compile-aggregate-grapheme-scalar-dfa"
         }
@@ -659,7 +690,7 @@ fn aggregate_plan(model: &str, report: &AggregateBuildReport) -> &'static str {
         (_, AggregatePlanKind::LiteralClassRunLiteral, _) => {
             "aggregate-literal-class-run-literal-v2"
         }
-        (_, AggregatePlanKind::ReverseInner, _) => "aggregate-reverse-inner-v1",
+        (_, AggregatePlanKind::ReverseInner, _) => reverse_inner_aggregate_plan(model, report),
         (_, AggregatePlanKind::BoundedLiteralPair, _) => "aggregate-bounded-literal-pair-v1",
         (_, AggregatePlanKind::GraphemeScalarDfa, _) => "aggregate-grapheme-scalar-dfa",
         (_, AggregatePlanKind::BoundedClassSequence, _) => "aggregate-bounded-class-sequence",
@@ -3016,6 +3047,90 @@ mod tests {
             .unwrap();
         nonformal.splice(start..start + needle.len(), replacement.iter().copied());
         assert!(Benchmark::parse(&nonformal).is_err());
+    }
+
+    #[test]
+    fn authenticates_all_reverse_inner_physical_plan_names() {
+        for (pattern, kernel_plan, operation_plan, compile_plan) in [
+            (
+                r"[a-zλ]+ab[a-zλ]+",
+                fre::REVERSE_INNER_PLAN_ID,
+                "aggregate-reverse-inner-independent-v1",
+                "compile-aggregate-reverse-inner-independent-v1",
+            ),
+            (
+                r"[a-zλ]+(?:ab|cd)[a-zλ]+",
+                fre::REVERSE_INNER_UNION_PLAN_ID,
+                "aggregate-reverse-inner-adaptive-union-v2",
+                "compile-aggregate-reverse-inner-adaptive-union-v2",
+            ),
+            (
+                r"[a-zλ]+(?:aab|abb)[a-zλ]+",
+                fre::REVERSE_INNER_GROUPED_UNION_PLAN_ID,
+                "aggregate-reverse-inner-grouped-union-v2",
+                "compile-aggregate-reverse-inner-grouped-union-v2",
+            ),
+        ] {
+            let benchmark = Benchmark {
+                name: "test/reverse-inner-physical-plan".to_owned(),
+                model: "count".to_owned(),
+                patterns: vec![pattern.to_owned()],
+                case_insensitive: false,
+                unicode: true,
+                haystack: b"qabq".to_vec(),
+                max_iters: 1,
+                max_warmup_iters: 0,
+                max_time: Duration::from_secs(1),
+                max_warmup_time: Duration::ZERO,
+            };
+            let count = aggregate_builder(&benchmark)
+                .build_count()
+                .expect("reverse-inner count plan");
+            assert_eq!(
+                count.build_report().plan,
+                AggregatePlanKind::ReverseInner
+            );
+            let AggregatePlanIdentity::ReverseInner(identity) =
+                count.build_report().plan_identity
+            else {
+                panic!("reverse-inner count retained another identity");
+            };
+            assert_eq!(identity.kernel.plan_id, kernel_plan);
+            assert_eq!(
+                aggregate_plan("count", count.build_report()),
+                operation_plan
+            );
+            current_fre_rebar_validate_aggregate_identity(count.build_report(), true, "count")
+                .expect("reverse-inner count identity");
+
+            let span_sum = aggregate_builder(&benchmark)
+                .build_span_sum()
+                .expect("reverse-inner span-sum plan");
+            assert_eq!(
+                aggregate_plan("count-spans", span_sum.build_report()),
+                operation_plan
+            );
+            current_fre_rebar_validate_aggregate_identity(
+                span_sum.build_report(),
+                true,
+                "count-spans",
+            )
+            .expect("reverse-inner span-sum identity");
+
+            let compile = aggregate_builder(&benchmark)
+                .build_compile()
+                .expect("reverse-inner compile plan");
+            assert_eq!(
+                aggregate_plan("compile", compile.build_report()),
+                compile_plan
+            );
+            current_fre_rebar_validate_aggregate_identity(
+                compile.build_report(),
+                true,
+                "compile",
+            )
+            .expect("reverse-inner compile identity");
+        }
     }
 
     #[test]

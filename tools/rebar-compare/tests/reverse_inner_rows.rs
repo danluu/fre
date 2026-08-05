@@ -7,8 +7,10 @@ use rebar_compare::{
 use regex::bytes::RegexBuilder;
 
 const PATTERN: &str = r"\pL+herloc\pL+|\pL+olme\pL+";
-const COMPILE_PLAN: &str = "compile-aggregate-reverse-inner-v1";
-const OPERATION_PLAN: &str = "aggregate-reverse-inner-v1";
+const COMPILE_PLAN: &str = "compile-aggregate-reverse-inner-adaptive-union-v2";
+const OPERATION_PLAN: &str = "aggregate-reverse-inner-adaptive-union-v2";
+const INDEPENDENT_PATTERN: &str = r"[a-zλ]+ab[a-zλ]+";
+const GROUPED_PATTERN: &str = r"[a-zλ]+(?:aab|abb)[a-zλ]+";
 
 fn fixture() -> Vec<u8> {
     let mut haystack = Vec::new();
@@ -20,8 +22,8 @@ fn fixture() -> Vec<u8> {
     haystack
 }
 
-fn expected(haystack: &[u8]) -> (u64, u64) {
-    let oracle = RegexBuilder::new(PATTERN)
+fn expected(pattern: &str, haystack: &[u8]) -> (u64, u64) {
+    let oracle = RegexBuilder::new(pattern)
         .unicode(true)
         .build()
         .expect("pinned Rust bytes regex accepts the benchmark pattern");
@@ -42,7 +44,7 @@ fn expected(haystack: &[u8]) -> (u64, u64) {
 #[test]
 fn first_and_steady_rows_use_reverse_inner() {
     let haystack = fixture();
-    let expected = expected(&haystack);
+    let expected = expected(PATTERN, &haystack);
     for (model, value) in [("count", expected.0), ("count-spans", expected.1)] {
         let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
             model,
@@ -65,9 +67,74 @@ fn first_and_steady_rows_use_reverse_inner() {
 }
 
 #[test]
+fn independent_and_grouped_rows_use_route_specific_plan_labels() {
+    for (pattern, haystack, kernel_plan, compile_plan, operation_plan) in [
+        (
+            INDEPENDENT_PATTERN,
+            b"qabq|xx|\xce\xbbabz|cabd".as_slice(),
+            fre::REVERSE_INNER_PLAN_ID,
+            "compile-aggregate-reverse-inner-independent-v1",
+            "aggregate-reverse-inner-independent-v1",
+        ),
+        (
+            GROUPED_PATTERN,
+            b"qaabq|qabbz|xaxb|zaabz".as_slice(),
+            fre::REVERSE_INNER_GROUPED_UNION_PLAN_ID,
+            "compile-aggregate-reverse-inner-grouped-union-v2",
+            "aggregate-reverse-inner-grouped-union-v2",
+        ),
+    ] {
+        let expected = expected(pattern, haystack);
+        let count = current_fre_rebar_aggregate_builder(pattern, true, false)
+            .build_count()
+            .expect("reverse-inner fixture count plan");
+        assert_eq!(count.build_report().schema_version, 48);
+        let AggregatePlanIdentity::ReverseInner(identity) = count.build_report().plan_identity
+        else {
+            panic!("reverse-inner fixture retained another identity");
+        };
+        assert_eq!(identity.kernel.plan_id, kernel_plan);
+        current_fre_rebar_validate_aggregate_identity(count.build_report(), true, "count")
+            .expect("reverse-inner fixture identity");
+
+        for (model, value) in [("count", expected.0), ("count-spans", expected.1)] {
+            let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
+                model,
+                &[pattern.to_string()],
+                true,
+                false,
+                haystack.len(),
+            )
+            .expect("reverse-inner fixture lifecycle");
+            assert_eq!(lifecycle.plan(), operation_plan);
+            assert_eq!(
+                lifecycle.execute(haystack).expect("first operation"),
+                value
+            );
+            assert_eq!(
+                lifecycle.execute(haystack).expect("steady operation"),
+                value
+            );
+        }
+
+        let patterns = [pattern.to_string()];
+        let compile = current_fre_rebar_aggregate_compile_lifecycle(
+            &patterns,
+            true,
+            false,
+            haystack.len(),
+        )
+        .expect("reverse-inner fixture compile lifecycle");
+        let artifact = compile.construct().expect("reverse-inner fixture construction");
+        assert_eq!(artifact.plan(&compile).unwrap(), compile_plan);
+        assert_eq!(artifact.verify(&compile, haystack).unwrap(), expected.0);
+    }
+}
+
+#[test]
 fn compile_and_retained_limit_paths_bind_the_typed_plan() {
     let haystack = fixture();
-    let expected = expected(&haystack);
+    let expected = expected(PATTERN, &haystack);
     let patterns = [PATTERN.to_string()];
     let compile =
         current_fre_rebar_aggregate_compile_lifecycle(&patterns, true, false, haystack.len())
@@ -79,7 +146,12 @@ fn compile_and_retained_limit_paths_bind_the_typed_plan() {
     let count = current_fre_rebar_aggregate_builder(PATTERN, true, false)
         .build_count()
         .expect("count plan");
+    assert_eq!(count.build_report().schema_version, 48);
     assert_eq!(count.build_report().plan, AggregatePlanKind::ReverseInner);
+    let AggregatePlanIdentity::ReverseInner(identity) = count.build_report().plan_identity else {
+        panic!("adaptive reverse-inner plan retained another identity");
+    };
+    assert_eq!(identity.kernel.plan_id, fre::REVERSE_INNER_UNION_PLAN_ID);
     current_fre_rebar_validate_aggregate_identity(count.build_report(), true, "count")
         .expect("count identity");
     let count_limits =
