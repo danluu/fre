@@ -8136,9 +8136,9 @@ mod tests {
         let strict_without_ascii_scanner =
             BoundedLiteralClassRunPlan::build_with_dispatch_if_admitted(
                 SimdDispatchContext::capture(),
-                b"QZ",
+                b"abaaaabb",
                 [(0x80, 0x80)].into_iter(),
-                b"aaaaaaaa",
+                b"abababab",
                 0,
                 0,
                 BuildLimits::unlimited(),
