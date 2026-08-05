@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use fre::{
     BuildError, BuildLimits, PlanKind, PlanSelection, PortableBuilder, PortableFindIterLimits,
     SearchAccounting, SearchError, SearchLimits, SearchSessionLimits, SearchWindow,
@@ -230,6 +232,28 @@ fn earliest_end_differs_from_selected_greedy_end() {
             .shortest_match(haystack, SearchLimits::unlimited())
             .unwrap()
             .0,
+    );
+}
+
+#[test]
+fn earliest_end_compares_live_starts_and_equal_start_alternatives() {
+    let later_start = automatic(r"(?:abcd[0-9]+|bc[d]+)");
+    let later_start_oracle = oracle(r"(?:abcd[0-9]+|bc[d]+)");
+    let haystack = b"abcd0";
+    assert_differential(&later_start, &later_start_oracle, haystack);
+    assert_eq!(Some(4), later_start_oracle.shortest_match(haystack));
+    assert_eq!(
+        Some(5),
+        later_start_oracle.find(haystack).map(|matched| matched.end())
+    );
+
+    let equal_start = automatic(r"(?:abcd[0-9]+|ab[c]+)");
+    let equal_start_oracle = oracle(r"(?:abcd[0-9]+|ab[c]+)");
+    assert_differential(&equal_start, &equal_start_oracle, haystack);
+    assert_eq!(Some(3), equal_start_oracle.shortest_match(haystack));
+    assert_eq!(
+        Some(5),
+        equal_start_oracle.find(haystack).map(|matched| matched.end())
     );
 }
 
