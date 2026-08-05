@@ -5,7 +5,7 @@
 //! right word-end boundary. A match is therefore exactly one complete maximal
 //! ASCII word. The established route selects a fixed word column whose byte
 //! set fits a native one-to-three-byte scan. Languages without such a sparse
-//! column can retain an exact ASCII byte-set classifier, complement-run
+//! column can retain an exact ASCII byte-set classifier, full-byte nonmember
 //! scanner, and one admitted packed-literal probe. Fixed-width languages may
 //! additionally retain exact pattern-identity columns for dense candidate
 //! streams. Every route either intersects all fixed columns or authenticates
@@ -21,11 +21,16 @@ use memchr::{memchr, memchr2, memchr3};
 use fre_kernels::{
     ASCII_CLASSIFIER_BUILD_WORK, ASCII_NARROW_BYTES, ASCII_RUN_SCANNER_BUILD_WORK,
     ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier, AsciiByteSetRunScanner,
-    DispatchPolicy, PACKED_LITERAL_SET_CERTIFIED_MAX_PATTERNS, PackedLiteralSetBuildLimits,
+    DispatchPolicy,
+    PACKED_LITERAL_SET_CERTIFIED_MAX_PATTERNS, PackedLiteralSetBuildLimits,
     PackedLiteralSetError, PackedLiteralSetPlan, PackedLiteralSetSearchLimits,
     SimdDispatchContext, Window as PackedWindow, classify_byte_delta_16,
     packed_literal_anchor_frequency_rank,
     packed_literal_set_build_work_upper_bound_from_dimensions,
+};
+#[cfg(target_arch = "aarch64")]
+use fre_kernels::{
+    ASCII_NONMEMBER_RUN_SCANNER_BUILD_WORK, AsciiByteSetNonMemberScanner, VectorKind,
 };
 
 use crate::{
@@ -38,6 +43,8 @@ use crate::{
 
 /// Stable identity for the guarded fixed-column/dictionary composition.
 pub(crate) const PLAN_ID: &str = "guarded-ascii-word-literal-set.fixed-column-dictionary.v4";
+pub(crate) const ONE_BYTE_PLAN_ID: &str =
+    "guarded-ascii-word-literal-set.one-byte-boundary-mask.v1";
 pub(crate) const WIDE_PACKED_PLAN_ID: &str =
     "guarded-ascii-word-literal-set.wide-column-packed-dictionary.v1";
 
@@ -96,6 +103,14 @@ enum WideFindResult {
     Exhausted,
     Anchor(usize),
     DenseHighResume(usize),
+}
+
+#[cfg(target_arch = "aarch64")]
+#[derive(Debug, Eq, PartialEq)]
+enum SingleByteMemberResult {
+    Exhausted,
+    Match(usize),
+    BoundaryResume(usize),
 }
 
 /// Allocation-free search failure.
@@ -202,6 +217,14 @@ const WIDE_CORRELATED_MIN_WORD_BYTES: usize = 5;
 const WIDE_CORRELATED_MAX_WORD_BYTES: usize = 32;
 const WIDE_CORRELATED_MAX_PATTERNS: usize = u64::BITS as usize;
 const WIDE_ASCII_BYTES: usize = 128;
+const ONE_BYTE_SCALAR_PREFIX_BYTES: usize = 8;
+const ONE_BYTE_SCALAR_MEMBER_LIMIT: u32 = 4;
+#[cfg(target_arch = "aarch64")]
+const ONE_BYTE_DENSE_REJECTION_WORDS: usize = 4;
+#[cfg(target_arch = "aarch64")]
+const ONE_BYTE_DENSE_REJECTION_BYTES: usize = 64;
+const ASCII_WORD_SET_WORDS: [u64; 2] =
+    [0x03ff_0000_0000_0000, 0x07ff_fffe_87ff_fffe];
 
 #[derive(Clone, Copy, Debug)]
 struct WideColumn {
@@ -332,6 +355,674 @@ struct WideByteAnchor {
     secondary_columns: [Option<WideColumn>; WIDE_SECONDARY_COLUMN_LIMIT],
     correlated_columns: Option<Box<CorrelatedColumns>>,
     packed: Box<PackedLiteralSetPlan>,
+}
+
+#[derive(Debug)]
+struct SingleByteWordSet {
+    members: AsciiByteSetClassifier,
+    words: AsciiByteSetClassifier,
+    #[cfg(target_arch = "aarch64")]
+    candidate_nonmembers: AsciiByteSetNonMemberScanner,
+    #[cfg(target_arch = "aarch64")]
+    word_runs: AsciiByteSetRunScanner,
+    #[cfg(target_arch = "aarch64")]
+    run_scanners_vector: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SingleBytePrimary {
+    Members,
+    ClassifiedMembers,
+    Boundaries,
+}
+
+impl SingleByteWordSet {
+    fn complete_word_set(&self) -> bool {
+        self.members.set().words() == ASCII_WORD_SET_WORDS
+    }
+
+    fn block_context_work(haystack: &[u8], position: usize, lanes: usize) -> usize {
+        usize::from(position != 0) + usize::from(position + lanes < haystack.len())
+    }
+
+    fn isolated_mask_16(
+        &self,
+        haystack: &[u8],
+        position: usize,
+        block: &[u8; ASCII_NARROW_BYTES],
+    ) -> u16 {
+        let words = self.words.classify_16(block).member_mask();
+        Self::isolated_mask_from_words_16(haystack, position, words)
+    }
+
+    fn isolated_mask_from_words_16(
+        haystack: &[u8],
+        position: usize,
+        words: u16,
+    ) -> u16 {
+        let left = u16::from(position != 0 && is_ascii_word(haystack[position - 1]));
+        let block_end = position + ASCII_NARROW_BYTES;
+        let right = u16::from(
+            block_end < haystack.len() && is_ascii_word(haystack[block_end]),
+        ) << (u16::BITS - 1);
+        words & !(words << 1 | left) & !(words >> 1 | right)
+    }
+
+    fn isolated_mask_32(
+        &self,
+        haystack: &[u8],
+        position: usize,
+        block: &[u8; ASCII_WIDE_BYTES],
+    ) -> u32 {
+        let words = self.words.classify_32(block).member_mask();
+        Self::isolated_mask_from_words_32(haystack, position, words)
+    }
+
+    fn isolated_mask_from_words_32(
+        haystack: &[u8],
+        position: usize,
+        words: u32,
+    ) -> u32 {
+        let left = u32::from(position != 0 && is_ascii_word(haystack[position - 1]));
+        let block_end = position + ASCII_WIDE_BYTES;
+        let right = u32::from(
+            block_end < haystack.len() && is_ascii_word(haystack[block_end]),
+        ) << (u32::BITS - 1);
+        words & !(words << 1 | left) & !(words >> 1 | right)
+    }
+
+    fn member_mask_16(
+        &self,
+        block: &[u8; ASCII_NARROW_BYTES],
+        mut isolated: u16,
+        complete_word_set: bool,
+    ) -> u16 {
+        if complete_word_set || isolated == 0 {
+            return isolated;
+        }
+        if isolated.count_ones() > ONE_BYTE_SCALAR_MEMBER_LIMIT {
+            return isolated & self.members.classify_16(block).member_mask();
+        }
+        let mut members = 0_u16;
+        while isolated != 0 {
+            let lane = isolated.trailing_zeros();
+            let lane_index = usize::try_from(lane).expect("a 16-byte lane fits usize");
+            if self.members.set().contains(block[lane_index]) {
+                members |= 1_u16 << lane;
+            }
+            isolated &= isolated - 1;
+        }
+        members
+    }
+
+    fn member_mask_32(
+        &self,
+        block: &[u8; ASCII_WIDE_BYTES],
+        mut isolated: u32,
+        complete_word_set: bool,
+    ) -> u32 {
+        if complete_word_set || isolated == 0 {
+            return isolated;
+        }
+        if isolated.count_ones() > ONE_BYTE_SCALAR_MEMBER_LIMIT {
+            return isolated & self.members.classify_32(block).member_mask();
+        }
+        let mut members = 0_u32;
+        while isolated != 0 {
+            let lane = isolated.trailing_zeros();
+            let lane_index = usize::try_from(lane).expect("a 32-byte lane fits usize");
+            if self.members.set().contains(block[lane_index]) {
+                members |= 1_u32 << lane;
+            }
+            isolated &= isolated - 1;
+        }
+        members
+    }
+
+    fn classify_block_16(
+        &self,
+        haystack: &[u8],
+        position: usize,
+        block: &[u8; ASCII_NARROW_BYTES],
+        primary: &mut Option<SingleBytePrimary>,
+        complete_word_set: bool,
+    ) -> (u16, usize) {
+        if complete_word_set {
+            let masks = self.words.classify_16(block);
+            let words = masks.member_mask();
+            if masks.ascii_mask() != u16::MAX {
+                *primary = Some(SingleBytePrimary::ClassifiedMembers);
+            } else if words == 0 {
+                *primary = Some(SingleBytePrimary::Members);
+            }
+            return (
+                Self::isolated_mask_from_words_16(haystack, position, words),
+                ASCII_NARROW_BYTES
+                    + Self::block_context_work(haystack, position, ASCII_NARROW_BYTES),
+            );
+        }
+        match primary {
+            None => {
+                let masks = self.members.classify_16(block);
+                let members = masks.member_mask();
+                if members == 0 {
+                    *primary = Some(if masks.ascii_mask() == u16::MAX {
+                        SingleBytePrimary::Members
+                    } else {
+                        SingleBytePrimary::ClassifiedMembers
+                    });
+                    return (0, ASCII_NARROW_BYTES);
+                }
+                let words = self.words.classify_16(block).member_mask();
+                let isolated =
+                    Self::isolated_mask_from_words_16(haystack, position, words);
+                *primary = Some(SingleBytePrimary::Boundaries);
+                (
+                    isolated & members,
+                    ASCII_NARROW_BYTES * 2
+                        + Self::block_context_work(
+                            haystack,
+                            position,
+                            ASCII_NARROW_BYTES,
+                        ),
+                )
+            }
+            Some(SingleBytePrimary::Members) => {
+                let members = self.members.classify_16(block).member_mask();
+                if members == 0 {
+                    (0, ASCII_NARROW_BYTES)
+                } else {
+                    let candidates =
+                        members & self.isolated_mask_16(haystack, position, block);
+                    if candidates == 0 {
+                        *primary = Some(SingleBytePrimary::Boundaries);
+                    }
+                    (
+                        candidates,
+                        ASCII_NARROW_BYTES * 2
+                            + Self::block_context_work(
+                                haystack,
+                                position,
+                                ASCII_NARROW_BYTES,
+                            ),
+                    )
+                }
+            }
+            Some(SingleBytePrimary::ClassifiedMembers) => {
+                let masks = self.members.classify_16(block);
+                let members = masks.member_mask();
+                if members == 0 {
+                    if masks.ascii_mask() == u16::MAX {
+                        *primary = Some(SingleBytePrimary::Members);
+                    }
+                    return (0, ASCII_NARROW_BYTES);
+                }
+                let words = self.words.classify_16(block).member_mask();
+                let isolated =
+                    Self::isolated_mask_from_words_16(haystack, position, words);
+                let candidates = members & isolated;
+                if candidates == 0 && masks.ascii_mask() == u16::MAX {
+                    *primary = Some(SingleBytePrimary::Boundaries);
+                }
+                (
+                    candidates,
+                    ASCII_NARROW_BYTES * 2
+                        + Self::block_context_work(
+                            haystack,
+                            position,
+                            ASCII_NARROW_BYTES,
+                        ),
+                )
+            }
+            Some(SingleBytePrimary::Boundaries) => {
+                let word_masks = self.words.classify_16(block);
+                let words = word_masks.member_mask();
+                let isolated = Self::isolated_mask_from_words_16(
+                    haystack,
+                    position,
+                    words,
+                );
+                let member_work = if isolated == 0 {
+                    0
+                } else if isolated.count_ones() > ONE_BYTE_SCALAR_MEMBER_LIMIT {
+                    ASCII_NARROW_BYTES
+                } else {
+                    usize::try_from(isolated.count_ones())
+                        .expect("a narrow isolated population fits usize")
+                };
+                let candidates = self.member_mask_16(block, isolated, false);
+                if word_masks.ascii_mask() != u16::MAX {
+                    *primary = Some(SingleBytePrimary::ClassifiedMembers);
+                } else if words == 0 {
+                    *primary = Some(SingleBytePrimary::Members);
+                } else if isolated != 0 && candidates == 0 {
+                    *primary = Some(SingleBytePrimary::Members);
+                }
+                (
+                    candidates,
+                    ASCII_NARROW_BYTES
+                        + member_work
+                        + Self::block_context_work(
+                            haystack,
+                            position,
+                            ASCII_NARROW_BYTES,
+                        ),
+                )
+            }
+        }
+    }
+
+    fn classify_block_32(
+        &self,
+        haystack: &[u8],
+        position: usize,
+        block: &[u8; ASCII_WIDE_BYTES],
+        primary: &mut Option<SingleBytePrimary>,
+        complete_word_set: bool,
+    ) -> (u32, usize) {
+        if complete_word_set {
+            let masks = self.words.classify_32(block);
+            let words = masks.member_mask();
+            if masks.ascii_mask() != u32::MAX {
+                *primary = Some(SingleBytePrimary::ClassifiedMembers);
+            } else if words == 0 {
+                *primary = Some(SingleBytePrimary::Members);
+            }
+            return (
+                Self::isolated_mask_from_words_32(haystack, position, words),
+                ASCII_WIDE_BYTES
+                    + Self::block_context_work(haystack, position, ASCII_WIDE_BYTES),
+            );
+        }
+        match primary {
+            None => {
+                let masks = self.members.classify_32(block);
+                let members = masks.member_mask();
+                if members == 0 {
+                    *primary = Some(if masks.ascii_mask() == u32::MAX {
+                        SingleBytePrimary::Members
+                    } else {
+                        SingleBytePrimary::ClassifiedMembers
+                    });
+                    return (0, ASCII_WIDE_BYTES);
+                }
+                let words = self.words.classify_32(block).member_mask();
+                let isolated =
+                    Self::isolated_mask_from_words_32(haystack, position, words);
+                *primary = Some(SingleBytePrimary::Boundaries);
+                (
+                    isolated & members,
+                    ASCII_WIDE_BYTES * 2
+                        + Self::block_context_work(haystack, position, ASCII_WIDE_BYTES),
+                )
+            }
+            Some(SingleBytePrimary::Members) => {
+                let members = self.members.classify_32(block).member_mask();
+                if members == 0 {
+                    (0, ASCII_WIDE_BYTES)
+                } else {
+                    let candidates =
+                        members & self.isolated_mask_32(haystack, position, block);
+                    if candidates == 0 {
+                        *primary = Some(SingleBytePrimary::Boundaries);
+                    }
+                    (
+                        candidates,
+                        ASCII_WIDE_BYTES * 2
+                            + Self::block_context_work(haystack, position, ASCII_WIDE_BYTES),
+                    )
+                }
+            }
+            Some(SingleBytePrimary::ClassifiedMembers) => {
+                let masks = self.members.classify_32(block);
+                let members = masks.member_mask();
+                if members == 0 {
+                    if masks.ascii_mask() == u32::MAX {
+                        *primary = Some(SingleBytePrimary::Members);
+                    }
+                    return (0, ASCII_WIDE_BYTES);
+                }
+                let words = self.words.classify_32(block).member_mask();
+                let isolated =
+                    Self::isolated_mask_from_words_32(haystack, position, words);
+                let candidates = members & isolated;
+                if candidates == 0 && masks.ascii_mask() == u32::MAX {
+                    *primary = Some(SingleBytePrimary::Boundaries);
+                }
+                (
+                    candidates,
+                    ASCII_WIDE_BYTES * 2
+                        + Self::block_context_work(haystack, position, ASCII_WIDE_BYTES),
+                )
+            }
+            Some(SingleBytePrimary::Boundaries) => {
+                let word_masks = self.words.classify_32(block);
+                let words = word_masks.member_mask();
+                let isolated = Self::isolated_mask_from_words_32(
+                    haystack,
+                    position,
+                    words,
+                );
+                let member_work = if isolated == 0 {
+                    0
+                } else if isolated.count_ones() > ONE_BYTE_SCALAR_MEMBER_LIMIT {
+                    ASCII_WIDE_BYTES
+                } else {
+                    usize::try_from(isolated.count_ones())
+                        .expect("a wide isolated population fits usize")
+                };
+                let candidates = self.member_mask_32(block, isolated, false);
+                if word_masks.ascii_mask() != u32::MAX {
+                    *primary = Some(SingleBytePrimary::ClassifiedMembers);
+                } else if words == 0 {
+                    *primary = Some(SingleBytePrimary::Members);
+                } else if isolated != 0 && candidates == 0 {
+                    *primary = Some(SingleBytePrimary::Members);
+                }
+                (
+                    candidates,
+                    ASCII_WIDE_BYTES
+                        + member_work
+                        + Self::block_context_work(haystack, position, ASCII_WIDE_BYTES),
+                )
+            }
+        }
+    }
+
+    fn scalar_matches(&self, haystack: &[u8], position: usize) -> bool {
+        self.members.set().contains(haystack[position])
+            && (position == 0 || !is_ascii_word(haystack[position - 1]))
+            && (position + 1 == haystack.len() || !is_ascii_word(haystack[position + 1]))
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn find_members_value(
+        &self,
+        haystack: &[u8],
+        mut position: usize,
+        end: usize,
+    ) -> SingleByteMemberResult {
+        debug_assert!(self.run_scanners_vector);
+        let mut rejection_sample_start = position;
+        let mut rejected_words = 0_usize;
+        while position < end {
+            let skipped = self
+                .candidate_nonmembers
+                .scan_forward(&haystack[position..end])
+                .nonmember_run_len();
+            position += skipped;
+            if position == end {
+                return SingleByteMemberResult::Exhausted;
+            }
+            debug_assert!(self.members.set().contains(haystack[position]));
+            if self.scalar_matches(haystack, position) {
+                return SingleByteMemberResult::Match(position);
+            }
+            let word_bytes = self
+                .word_runs
+                .scan_forward(&haystack[position..end])
+                .member_run_len();
+            debug_assert!(word_bytes != 0);
+            position += word_bytes;
+            rejected_words += 1;
+            if rejected_words == ONE_BYTE_DENSE_REJECTION_WORDS {
+                if position.saturating_sub(rejection_sample_start)
+                    <= ONE_BYTE_DENSE_REJECTION_BYTES
+                {
+                    return SingleByteMemberResult::BoundaryResume(position);
+                }
+                rejection_sample_start = position;
+                rejected_words = 0;
+            }
+        }
+        SingleByteMemberResult::Exhausted
+    }
+
+    fn find_value(&self, haystack: &[u8], window: SearchWindow) -> Option<usize> {
+        let complete_word_set = self.complete_word_set();
+        #[cfg(target_arch = "aarch64")]
+        let mut primary = (complete_word_set && self.run_scanners_vector)
+            .then_some(SingleBytePrimary::Members);
+        #[cfg(not(target_arch = "aarch64"))]
+        let mut primary = None;
+        let mut position = window.start();
+        let scalar_end = position
+            .saturating_add(ONE_BYTE_SCALAR_PREFIX_BYTES)
+            .min(window.end());
+        while position < scalar_end {
+            if self.scalar_matches(haystack, position) {
+                return Some(position);
+            }
+            position += 1;
+        }
+        while window.end().saturating_sub(position) >= ASCII_WIDE_BYTES {
+            #[cfg(target_arch = "aarch64")]
+            if self.run_scanners_vector
+                && matches!(
+                    primary,
+                    Some(
+                        SingleBytePrimary::Members | SingleBytePrimary::ClassifiedMembers
+                    )
+                )
+            {
+                match self.find_members_value(haystack, position, window.end()) {
+                    SingleByteMemberResult::Exhausted => return None,
+                    SingleByteMemberResult::Match(position) => return Some(position),
+                    SingleByteMemberResult::BoundaryResume(resume) => {
+                        position = resume;
+                        primary = Some(SingleBytePrimary::Boundaries);
+                        continue;
+                    }
+                }
+            }
+            let block_end = position + ASCII_WIDE_BYTES;
+            let block: &[u8; ASCII_WIDE_BYTES] = haystack[position..block_end]
+                .try_into()
+                .expect("a one-byte wide block was proved complete");
+            let (members, _) = self.classify_block_32(
+                haystack,
+                position,
+                block,
+                &mut primary,
+                complete_word_set,
+            );
+            if members != 0 {
+                let lane = usize::try_from(members.trailing_zeros())
+                    .expect("a 32-byte lane fits usize");
+                return Some(position + lane);
+            }
+            position = block_end;
+        }
+        if window.end().saturating_sub(position) >= ASCII_NARROW_BYTES {
+            let block_end = position + ASCII_NARROW_BYTES;
+            let block: &[u8; ASCII_NARROW_BYTES] = haystack[position..block_end]
+                .try_into()
+                .expect("a one-byte narrow block was proved complete");
+            let (members, _) = self.classify_block_16(
+                haystack,
+                position,
+                block,
+                &mut primary,
+                complete_word_set,
+            );
+            if members != 0 {
+                let lane = usize::try_from(members.trailing_zeros())
+                    .expect("a 16-byte lane fits usize");
+                return Some(position + lane);
+            }
+            position = block_end;
+        }
+        while position < window.end() {
+            if self.scalar_matches(haystack, position) {
+                return Some(position);
+            }
+            position += 1;
+        }
+        None
+    }
+
+    fn scalar_matches_counted(
+        &self,
+        haystack: &[u8],
+        position: usize,
+        actual: &mut SearchActual,
+    ) -> Result<bool, SearchError> {
+        actual.anchor_calls = checked_add(actual.anchor_calls, 1, "one-byte scalar calls")?;
+        actual.anchor_positions = checked_add(
+            actual.anchor_positions,
+            1,
+            "one-byte scalar positions",
+        )?;
+        actual.anchor_work = checked_add(actual.anchor_work, 1, "one-byte membership work")?;
+        if !self.members.set().contains(haystack[position]) {
+            return Ok(false);
+        }
+        actual.anchor_work = checked_add(actual.anchor_work, 1, "one-byte left-boundary work")?;
+        if position != 0 && is_ascii_word(haystack[position - 1]) {
+            return Ok(false);
+        }
+        actual.anchor_work = checked_add(actual.anchor_work, 1, "one-byte right-boundary work")?;
+        if position + 1 != haystack.len() && is_ascii_word(haystack[position + 1]) {
+            return Ok(false);
+        }
+        actual.candidate_words = checked_add(
+            actual.candidate_words,
+            1,
+            "one-byte isolated candidates",
+        )?;
+        Ok(true)
+    }
+
+    fn charge_block(
+        actual: &mut SearchActual,
+        lanes: usize,
+        members: u32,
+        block_work: usize,
+    ) -> Result<(), SearchError> {
+        actual.anchor_calls = checked_add(actual.anchor_calls, 1, "one-byte block calls")?;
+        actual.anchor_positions = checked_add(
+            actual.anchor_positions,
+            lanes,
+            "one-byte block positions",
+        )?;
+        actual.anchor_work = checked_add(
+            actual.anchor_work,
+            block_work,
+            "one-byte block-classification work",
+        )?;
+        let member_count = usize::try_from(members.count_ones())
+            .expect("one-byte block population fits usize");
+        actual.candidate_words = checked_add(
+            actual.candidate_words,
+            member_count,
+            "one-byte exact candidates",
+        )?;
+        Ok(())
+    }
+
+    fn find_counted(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        upper_bounds: SearchUpperBounds,
+    ) -> Result<(Option<Match>, SearchAccounting), SearchError> {
+        let complete_word_set = self.complete_word_set();
+        let mut primary = None;
+        let mut actual = SearchActual::default();
+        let mut position = window.start();
+        let scalar_end = position
+            .saturating_add(ONE_BYTE_SCALAR_PREFIX_BYTES)
+            .min(window.end());
+        while position < scalar_end {
+            if self.scalar_matches_counted(haystack, position, &mut actual)? {
+                let end = position + 1;
+                return close_search_accounting(
+                    Some(Match {
+                        start: position,
+                        end,
+                    }),
+                    upper_bounds,
+                    actual,
+                );
+            }
+            position += 1;
+        }
+        while window.end().saturating_sub(position) >= ASCII_WIDE_BYTES {
+            let block_end = position + ASCII_WIDE_BYTES;
+            let block: &[u8; ASCII_WIDE_BYTES] = haystack[position..block_end]
+                .try_into()
+                .expect("a counted one-byte wide block was proved complete");
+            let (members, block_work) = self.classify_block_32(
+                haystack,
+                position,
+                block,
+                &mut primary,
+                complete_word_set,
+            );
+            Self::charge_block(&mut actual, ASCII_WIDE_BYTES, members, block_work)?;
+            if members != 0 {
+                let lane = usize::try_from(members.trailing_zeros())
+                    .expect("a 32-byte lane fits usize");
+                let start = position + lane;
+                return close_search_accounting(
+                    Some(Match {
+                        start,
+                        end: start + 1,
+                    }),
+                    upper_bounds,
+                    actual,
+                );
+            }
+            position = block_end;
+        }
+        if window.end().saturating_sub(position) >= ASCII_NARROW_BYTES {
+            let block_end = position + ASCII_NARROW_BYTES;
+            let block: &[u8; ASCII_NARROW_BYTES] = haystack[position..block_end]
+                .try_into()
+                .expect("a counted one-byte narrow block was proved complete");
+            let (members, block_work) = self.classify_block_16(
+                haystack,
+                position,
+                block,
+                &mut primary,
+                complete_word_set,
+            );
+            Self::charge_block(
+                &mut actual,
+                ASCII_NARROW_BYTES,
+                u32::from(members),
+                block_work,
+            )?;
+            if members != 0 {
+                let lane = usize::try_from(members.trailing_zeros())
+                    .expect("a 16-byte lane fits usize");
+                let start = position + lane;
+                return close_search_accounting(
+                    Some(Match {
+                        start,
+                        end: start + 1,
+                    }),
+                    upper_bounds,
+                    actual,
+                );
+            }
+            position = block_end;
+        }
+        while position < window.end() {
+            if self.scalar_matches_counted(haystack, position, &mut actual)? {
+                return close_search_accounting(
+                    Some(Match {
+                        start: position,
+                        end: position + 1,
+                    }),
+                    upper_bounds,
+                    actual,
+                );
+            }
+            position += 1;
+        }
+        close_search_accounting(None, upper_bounds, actual)
+    }
 }
 
 impl WideByteAnchor {
@@ -1032,6 +1723,7 @@ pub(crate) struct Plan {
     maximum_word_bytes: usize,
     fixed_word_bytes: Option<usize>,
     dictionary: Dictionary,
+    one_byte: Option<Box<SingleByteWordSet>>,
     wide_anchor: Option<Box<WideByteAnchor>>,
 }
 
@@ -1142,6 +1834,100 @@ impl Plan {
                 }
                 Err(error) => return Err(error),
             };
+        if fixed_word_bytes == Some(1) {
+            if let Some(members) = wide_members {
+                let classifier_work = ASCII_CLASSIFIER_BUILD_WORK.checked_mul(2).ok_or(
+                    PackedLiteralSetError::ArithmeticOverflow {
+                        computation: "guarded one-byte classifier construction work",
+                    },
+                )?;
+                let route_work = classifier_work;
+                #[cfg(target_arch = "aarch64")]
+                let route_work = route_work
+                    .checked_add(ASCII_NONMEMBER_RUN_SCANNER_BUILD_WORK)
+                    .and_then(|work| work.checked_add(ASCII_RUN_SCANNER_BUILD_WORK))
+                    .ok_or(PackedLiteralSetError::ArithmeticOverflow {
+                        computation: "guarded one-byte route construction work",
+                    })?;
+                let total_build_work = dictionary_work
+                    .checked_add(selection_work)
+                    .and_then(|work| work.checked_add(route_work))
+                    .ok_or(PackedLiteralSetError::ArithmeticOverflow {
+                        computation: "guarded one-byte construction work",
+                    })?;
+                if total_build_work > limits.max_build_work {
+                    return Err(PackedLiteralSetError::BuildWorkLimit {
+                        needed: total_build_work,
+                        limit: limits.max_build_work,
+                    });
+                }
+                let one_byte_plan_bytes = plan_bytes
+                    .checked_add(size_of::<SingleByteWordSet>())
+                    .ok_or(PackedLiteralSetError::ArithmeticOverflow {
+                        computation: "guarded one-byte persistent bytes",
+                    })?;
+                if one_byte_plan_bytes > composite_persistent_limit {
+                    return Err(PackedLiteralSetError::PersistentBytesLimit {
+                        needed: one_byte_plan_bytes,
+                        limit: composite_persistent_limit,
+                    });
+                }
+                if one_byte_plan_bytes > limits.max_build_bytes {
+                    return Err(PackedLiteralSetError::BuildBytesLimit {
+                        needed: one_byte_plan_bytes,
+                        limit: limits.max_build_bytes,
+                    });
+                }
+                let dispatch = SimdDispatchContext::capture();
+                let member_classifier = dispatch
+                    .ascii_byte_set_classifier(members, DispatchPolicy::Auto)
+                    .expect(
+                        "automatic one-byte member dispatch retains a scalar fallback",
+                    );
+                let word_classifier = dispatch
+                    .ascii_byte_set_classifier(
+                        AsciiByteSet::from_words(ASCII_WORD_SET_WORDS),
+                        DispatchPolicy::Auto,
+                    )
+                    .expect("automatic ASCII-word dispatch retains a scalar fallback");
+                #[cfg(target_arch = "aarch64")]
+                let candidate_nonmember_scanner = dispatch
+                    .ascii_byte_set_nonmember_scanner(members, DispatchPolicy::Auto)
+                    .expect("automatic one-byte run dispatch retains a scalar fallback");
+                #[cfg(target_arch = "aarch64")]
+                let word_run_scanner = dispatch
+                    .ascii_byte_set_run_scanner(
+                        AsciiByteSet::from_words(ASCII_WORD_SET_WORDS),
+                        DispatchPolicy::Auto,
+                    )
+                    .expect("automatic ASCII-word run dispatch retains a scalar fallback");
+                #[cfg(target_arch = "aarch64")]
+                let run_scanners_vector = !matches!(
+                    candidate_nonmember_scanner.selection().vector,
+                    VectorKind::Scalar
+                ) && !matches!(
+                    word_run_scanner.selection().vector,
+                    VectorKind::Scalar
+                );
+                return Ok(Self {
+                    anchor,
+                    maximum_word_bytes,
+                    fixed_word_bytes,
+                    dictionary,
+                    one_byte: Some(Box::new(SingleByteWordSet {
+                        members: member_classifier,
+                        words: word_classifier,
+                        #[cfg(target_arch = "aarch64")]
+                        candidate_nonmembers: candidate_nonmember_scanner,
+                        #[cfg(target_arch = "aarch64")]
+                        word_runs: word_run_scanner,
+                        #[cfg(target_arch = "aarch64")]
+                        run_scanners_vector,
+                    })),
+                    wide_anchor: None,
+                });
+            }
+        }
         let wide_anchor = if let Some(members) = wide_members {
             let total_build_work = dictionary_work
                 .checked_add(selection_work)
@@ -1297,6 +2083,7 @@ impl Plan {
             maximum_word_bytes,
             fixed_word_bytes,
             dictionary,
+            one_byte: None,
             wide_anchor,
         })
     }
@@ -1309,6 +2096,10 @@ impl Plan {
             .persistent_bytes
             .checked_add(Self::inline_storage_bytes())
             .expect("successful guarded plan construction proved its persistent bytes");
+        let base = self.one_byte.as_ref().map_or(base, |_| {
+            base.checked_add(size_of::<SingleByteWordSet>())
+                .expect("one-byte storage fits after successful construction")
+        });
         self.wide_anchor.as_ref().map_or(base, |wide| {
             base.checked_add(wide.storage_bytes())
                 .expect("wide-column storage fits after successful construction")
@@ -1316,7 +2107,9 @@ impl Plan {
     }
 
     pub(crate) const fn plan_id(&self) -> &'static str {
-        if self.wide_anchor.is_some() {
+        if self.one_byte.is_some() {
+            ONE_BYTE_PLAN_ID
+        } else if self.wide_anchor.is_some() {
             WIDE_PACKED_PLAN_ID
         } else {
             PLAN_ID
@@ -1383,7 +2176,11 @@ impl Plan {
     ) -> Result<(Option<Match>, SearchAccounting), SearchError> {
         let upper_bounds = self.search_upper_bounds(haystack, window)?;
         enforce_limits(upper_bounds, limits)?;
-        self.search_window_anchor(haystack, window, upper_bounds)
+        if let Some(one_byte) = self.one_byte.as_ref() {
+            one_byte.find_counted(haystack, window, upper_bounds)
+        } else {
+            self.search_window_anchor(haystack, window, upper_bounds)
+        }
     }
 
     fn search_window_anchor(
@@ -1480,7 +2277,12 @@ impl Plan {
     ) -> Result<Option<Match>, SearchError> {
         let upper_bounds = self.search_upper_bounds(haystack, window)?;
         enforce_limits(upper_bounds, limits)?;
-        if self.wide_anchor.is_some() {
+        if let Some(one_byte) = self.one_byte.as_ref() {
+            Ok(one_byte.find_value(haystack, window).map(|start| Match {
+                start,
+                end: start + 1,
+            }))
+        } else if self.wide_anchor.is_some() {
             let packed_probe_work =
                 self.value_packed_probe_work(window, upper_bounds, limits);
             self.search_window_value_wide(haystack, window, packed_probe_work)
@@ -1995,6 +2797,36 @@ impl Plan {
                 haystack_len: haystack.len(),
             });
         }
+        let window_bytes = window.end().checked_sub(window.start()).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "guarded search window width",
+            },
+        )?;
+        if self.one_byte.is_some() {
+            let anchor_work = window_bytes.checked_mul(3).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "one-byte boundary-mask work bound",
+                },
+            )?;
+            let contextual_bytes = window_bytes
+                .checked_add(usize::from(window.start() != 0))
+                .and_then(|bytes| {
+                    bytes.checked_add(usize::from(window.end() < haystack.len()))
+                })
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "one-byte boundary context bound",
+                })?;
+            let candidate_words = window_bytes / 2 + window_bytes % 2;
+            return Ok(SearchUpperBounds {
+                anchor_positions: window_bytes,
+                anchor_work,
+                contextual_bytes,
+                candidate_words,
+                lookup_steps: 0,
+                total_work: anchor_work,
+                scratch_bytes: 0,
+            });
+        }
         let filter_positions = window
             .end()
             .checked_sub(window.start())
@@ -2294,17 +3126,20 @@ mod tests {
     use core::mem::size_of;
 
     use super::{
-        PLAN_ID, PackedProbeResult, Plan, SearchError, WIDE_PACKED_PLAN_ID,
-        WIDE_PACKED_PREFIX_BYTES, WIDE_RANKED_COLUMN_LIMIT,
+        ONE_BYTE_PLAN_ID, PLAN_ID, PackedProbeResult, Plan, SearchError, SingleByteWordSet,
+        WIDE_PACKED_PLAN_ID, WIDE_PACKED_PREFIX_BYTES, WIDE_RANKED_COLUMN_LIMIT,
         WIDE_REJECTION_PACKED_PROBE_BYTES, WIDE_SECONDARY_COLUMN_LIMIT, WideByteAnchor,
         WideFindResult, correlated_columns_dimensions, extraction_limits,
     };
+    #[cfg(target_arch = "aarch64")]
+    use super::{SingleByteMemberResult, SingleBytePrimary};
     use crate::{
         Match, SearchLimits, SearchWindow,
         guarded_ascii_word::{BuildDimensions, BuildLimits, Dictionary, Guard, SourceWord},
     };
     use fre_kernels::{
-        ASCII_CLASSIFIER_BUILD_WORK, ASCII_RUN_SCANNER_BUILD_WORK,
+        ASCII_CLASSIFIER_BUILD_WORK, ASCII_NONMEMBER_RUN_SCANNER_BUILD_WORK,
+        ASCII_RUN_SCANNER_BUILD_WORK,
         PackedLiteralSetBuildLimits, PackedLiteralSetError, PackedLiteralSetPlan,
     };
 
@@ -2417,6 +3252,272 @@ mod tests {
                 expected,
             );
         }
+    }
+
+    #[test]
+    fn wide_one_byte_sets_complete_boundaries_before_returning_members() {
+        let plan = plan(&[b"a", b"B", b"7", b"_"]);
+        assert_eq!(plan.plan_id(), ONE_BYTE_PLAN_ID);
+        assert!(plan.one_byte.is_some());
+        assert!(plan.wide_anchor.is_none());
+        let one_byte = plan.one_byte.as_ref().unwrap();
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert_eq!(
+                one_byte.find_members_value(b"aa!aa!aa!aa!aa!", 0, 15),
+                SingleByteMemberResult::BoundaryResume(11),
+            );
+            assert_eq!(
+                one_byte.find_members_value(
+                    &[0x80, 0xff, b'!', 0x00, 0xc1, b'!', b'a', b'!'],
+                    0,
+                    8,
+                ),
+                SingleByteMemberResult::Match(6),
+            );
+            assert_eq!(
+                one_byte.find_members_value(&[0x80, 0xff, b'!', 0x00, 0xc1], 0, 5),
+                SingleByteMemberResult::Exhausted,
+            );
+            let high_block = [0xff; 32];
+            let mut primary = None;
+            assert_eq!(
+                one_byte.classify_block_32(
+                    &high_block,
+                    0,
+                    &high_block,
+                    &mut primary,
+                    false,
+                ),
+                (0, 32),
+            );
+            assert_eq!(primary, Some(SingleBytePrimary::ClassifiedMembers));
+            let punctuation_block = [b'!'; 32];
+            assert_eq!(
+                one_byte.classify_block_32(
+                    &punctuation_block,
+                    0,
+                    &punctuation_block,
+                    &mut primary,
+                    false,
+                ),
+                (0, 32),
+            );
+            assert_eq!(primary, Some(SingleBytePrimary::Members));
+        }
+        let mut cutover_block = [b'z'; 32];
+        cutover_block[6] = b'a';
+        let isolated_four =
+            (1_u32 << 0) | (1_u32 << 2) | (1_u32 << 4) | (1_u32 << 6);
+        let isolated_five = isolated_four | (1_u32 << 8);
+        assert_eq!(
+            one_byte.member_mask_32(&cutover_block, isolated_four, false),
+            1_u32 << 6,
+        );
+        assert_eq!(
+            one_byte.member_mask_32(&cutover_block, isolated_five, false),
+            1_u32 << 6,
+        );
+
+        for (haystack, window, expected) in [
+            (b"a".as_slice(), SearchWindow::new(0, 1), Some(Match { start: 0, end: 1 })),
+            (b"xa!".as_slice(), SearchWindow::new(1, 2), None),
+            (b"!ax".as_slice(), SearchWindow::new(1, 2), None),
+            (
+                b"x!a!".as_slice(),
+                SearchWindow::new(2, 3),
+                Some(Match { start: 2, end: 3 }),
+            ),
+            (
+                b"\xffa\x80".as_slice(),
+                SearchWindow::new(1, 2),
+                Some(Match { start: 1, end: 2 }),
+            ),
+        ] {
+            let value = plan
+                .find_window_value(haystack, window, SearchLimits::unlimited())
+                .unwrap();
+            let (accounted, accounting) = plan
+                .find_window(haystack, window, SearchLimits::unlimited())
+                .unwrap();
+            assert_eq!(value, expected);
+            assert_eq!(accounted, expected);
+            assert_eq!(accounting.actual.lookup_steps, 0);
+            assert_eq!(accounting.upper_bounds.lookup_steps, 0);
+        }
+
+        for lane in [7_usize, 8, 15, 16, 31, 32, 63, 64, 95, 96] {
+            let mut haystack = vec![b'!'; 129];
+            haystack[lane] = b'a';
+            assert_eq!(
+                plan.find_window_value(
+                    &haystack,
+                    SearchWindow::full(&haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+                Some(Match {
+                    start: lane,
+                    end: lane + 1,
+                }),
+            );
+            let (accounted, accounting) = plan
+                .find_window(
+                    &haystack,
+                    SearchWindow::full(&haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap();
+            assert_eq!(
+                accounted,
+                Some(Match {
+                    start: lane,
+                    end: lane + 1,
+                }),
+            );
+            assert!(accounting.actual.total_work <= accounting.upper_bounds.total_work);
+        }
+
+        let mut haystack = vec![b'!'; 129];
+        let address = haystack.as_ptr();
+        for positions in [&[9_usize, 17, 25, 33][..], &[9_usize, 17, 25, 33, 41][..]] {
+            haystack.fill(b'!');
+            for &position in positions {
+                haystack[position] = b'z';
+            }
+            haystack[96] = b'_';
+            assert_eq!(haystack.as_ptr(), address);
+            assert_eq!(
+                plan.find_window_value(
+                    &haystack,
+                    SearchWindow::full(&haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+                Some(Match { start: 96, end: 97 }),
+            );
+        }
+
+        let mut phase_change = vec![b'!'; 129];
+        phase_change[40..80].fill(b'a');
+        phase_change[96] = b'_';
+        let expected = Some(Match { start: 96, end: 97 });
+        assert_eq!(
+            plan.find_window_value(
+                &phase_change,
+                SearchWindow::full(&phase_change),
+                SearchLimits::unlimited(),
+            )
+            .unwrap(),
+            expected,
+        );
+        assert_eq!(
+            plan.find_window(
+                &phase_change,
+                SearchWindow::full(&phase_change),
+                SearchLimits::unlimited(),
+            )
+            .unwrap()
+            .0,
+            expected,
+        );
+
+        let mut short_word_phase = vec![b'!'; 161];
+        for word_start in (40..104).step_by(3) {
+            short_word_phase[word_start..word_start + 2].fill(b'a');
+        }
+        short_word_phase[128] = b'_';
+        let expected = Some(Match {
+            start: 128,
+            end: 129,
+        });
+        assert_eq!(
+            plan.find_window_value(
+                &short_word_phase,
+                SearchWindow::full(&short_word_phase),
+                SearchLimits::unlimited(),
+            )
+            .unwrap(),
+            expected,
+        );
+        assert_eq!(
+            plan.find_window(
+                &short_word_phase,
+                SearchWindow::full(&short_word_phase),
+                SearchLimits::unlimited(),
+            )
+            .unwrap()
+            .0,
+            expected,
+        );
+
+        for (haystack, expected) in [
+            {
+                let mut haystack = vec![b'!'; 129];
+                haystack[40] = 0xff;
+                haystack[48] = b'a';
+                (haystack, Some(Match { start: 48, end: 49 }))
+            },
+            {
+                let mut haystack = vec![b'!'; 129];
+                haystack[40..80].fill(0xff);
+                haystack[96] = b'a';
+                (haystack, Some(Match { start: 96, end: 97 }))
+            },
+            {
+                let mut haystack = vec![b'!'; 52];
+                haystack[40] = 0xff;
+                haystack[50] = b'a';
+                (haystack, Some(Match { start: 50, end: 51 }))
+            },
+        ] {
+            assert_eq!(
+                plan.find_window_value(
+                    &haystack,
+                    SearchWindow::full(&haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+                expected,
+            );
+            assert_eq!(
+                plan.find_window(
+                    &haystack,
+                    SearchWindow::full(&haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .0,
+                expected,
+            );
+        }
+
+        let all_word_storage = (0_u8..=127)
+            .filter(|&byte| super::is_ascii_word(byte))
+            .map(|byte| [byte])
+            .collect::<Vec<_>>();
+        let all_word_refs = all_word_storage
+            .iter()
+            .map(|word| word.as_slice())
+            .collect::<Vec<_>>();
+        let all_words = plan(&all_word_refs);
+        assert_eq!(all_words.plan_id(), ONE_BYTE_PLAN_ID);
+        assert!(
+            all_words
+                .one_byte
+                .as_ref()
+                .is_some_and(|one_byte| one_byte.complete_word_set()),
+        );
+        assert_eq!(
+            all_words
+                .find_window_value(
+                    b"x!Z!",
+                    SearchWindow::new(2, 3),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            Some(Match { start: 2, end: 3 }),
+        );
     }
 
     #[test]
@@ -2682,6 +3783,125 @@ mod tests {
         let mut recombined = words[63];
         recombined[4] = if recombined[4] == b'q' { b'r' } else { b'q' };
         assert!(!correlated.matches(&recombined));
+    }
+
+    #[test]
+    fn one_byte_build_and_search_limits_close_exactly() {
+        let words: &[&[u8]] = &[b"a", b"B", b"7", b"_"];
+        assert_eq!(plan(&words[..3]).plan_id(), PLAN_ID);
+        let dictionary = dictionary_with_guards(words, Guard::LeftBoundary, Guard::RightBoundary);
+        let dictionary_work =
+            usize::try_from(dictionary.build_accounting().actual.build_work).unwrap();
+        let dictionary_bytes = dictionary.build_accounting().actual.persistent_bytes;
+        let patterns = words.len();
+        let fixed_selection = patterns + patterns + 3;
+        let wide_selection = patterns + 128 + WIDE_RANKED_COLUMN_LIMIT;
+        let exact_work = dictionary_work
+            + fixed_selection
+            + wide_selection
+            + ASCII_CLASSIFIER_BUILD_WORK * 2
+            + if cfg!(target_arch = "aarch64") {
+                ASCII_NONMEMBER_RUN_SCANNER_BUILD_WORK + ASCII_RUN_SCANNER_BUILD_WORK
+            } else {
+                0
+            };
+        let exact_persistent = dictionary_bytes
+            + Plan::inline_storage_bytes()
+            + size_of::<SingleByteWordSet>();
+        let exact_limits = PackedLiteralSetBuildLimits {
+            max_build_work: exact_work,
+            max_build_bytes: exact_persistent,
+            max_persistent_bytes: exact_persistent,
+            ..PackedLiteralSetBuildLimits::default()
+        };
+        let exact = Plan::build(dictionary, exact_limits, exact_persistent).unwrap();
+        assert_eq!(exact.plan_id(), ONE_BYTE_PLAN_ID);
+        assert_eq!(exact.storage_bytes(), exact_persistent);
+        assert!(exact.one_byte.is_some());
+        assert!(exact.wide_anchor.is_none());
+
+        for (limits, plan_limit, expected) in [
+            (
+                PackedLiteralSetBuildLimits {
+                    max_build_work: exact_work - 1,
+                    ..exact_limits
+                },
+                exact_persistent,
+                "work",
+            ),
+            (
+                PackedLiteralSetBuildLimits {
+                    max_build_bytes: exact_persistent - 1,
+                    ..exact_limits
+                },
+                exact_persistent,
+                "build bytes",
+            ),
+            (
+                PackedLiteralSetBuildLimits {
+                    max_persistent_bytes: exact_persistent - 1,
+                    ..exact_limits
+                },
+                exact_persistent,
+                "persistent bytes",
+            ),
+            (exact_limits, exact_persistent - 1, "plan persistent bytes"),
+        ] {
+            let error = Plan::build(
+                dictionary_with_guards(words, Guard::LeftBoundary, Guard::RightBoundary),
+                limits,
+                plan_limit,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    (&error, expected),
+                    (PackedLiteralSetError::BuildWorkLimit { .. }, "work")
+                        | (PackedLiteralSetError::BuildBytesLimit { .. }, "build bytes")
+                        | (
+                            PackedLiteralSetError::PersistentBytesLimit { .. },
+                            "persistent bytes" | "plan persistent bytes",
+                        )
+                ),
+                "unexpected {expected} error: {error}",
+            );
+        }
+
+        let haystack = b"x!z!z!z!z!z!_!";
+        let window = SearchWindow::new(1, haystack.len() - 1);
+        let upper = exact.search_upper_bounds(haystack, window).unwrap();
+        let window_bytes = window.end() - window.start();
+        assert_eq!(upper.anchor_positions, window_bytes);
+        assert_eq!(upper.anchor_work, window_bytes * 3);
+        assert_eq!(upper.total_work, window_bytes * 3);
+        assert_eq!(upper.candidate_words, window_bytes / 2 + window_bytes % 2);
+        assert_eq!(upper.contextual_bytes, window_bytes + 2);
+        assert_eq!(upper.lookup_steps, 0);
+        assert_eq!(upper.scratch_bytes, 0);
+        let limits = |work: usize| SearchLimits {
+            max_work: u64::try_from(work).unwrap(),
+            max_scratch_bytes: 0,
+        };
+        let expected = Some(Match {
+            start: haystack.len() - 2,
+            end: haystack.len() - 1,
+        });
+        assert_eq!(
+            exact.find_window_value(haystack, window, limits(upper.total_work))
+                .unwrap(),
+            expected,
+        );
+        let (accounted, accounting) = exact
+            .find_window(haystack, window, limits(upper.total_work))
+            .unwrap();
+        assert_eq!(accounted, expected);
+        assert!(accounting.actual.total_work <= upper.total_work);
+        assert_eq!(accounting.actual.lookup_steps, 0);
+        assert!(matches!(
+            exact.find_window_value(haystack, window, limits(upper.total_work - 1)),
+            Err(SearchError::WorkLimit { needed, limit })
+                if needed == u64::try_from(upper.total_work).unwrap() && limit + 1 == needed,
+        ));
     }
 
     #[test]
