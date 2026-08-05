@@ -77,11 +77,11 @@ const ORDINARY_START_FILTER_PROOF: StartFilterProof = StartFilterProof {
 };
 const BYTE_ALPHABET: usize = 256;
 const _: () = assert!(BYTE_ALPHABET == 1 << 8);
-// Prepared compiled searches are deliberately allowed a larger bounded
-// determinization frontier than the original L1-sized cache. A direct row is
-// still only touched for the current state, while retaining more identities
-// avoids falling back to an ordered closure on every subsequent byte once a
-// moderately branching unbounded expression crosses 64 subsets.
+// This is both the contextual-state ceiling and the reference state count for
+// the fixed direct-workspace resource budget. Assertion-free exact-class rows
+// may reinvest unused row storage in more forward identities, but their
+// complete arena may never exceed the corresponding 256-state identity-row
+// layout's retained bytes or initialized slots.
 const LAZY_MAX_STATES: usize = 256;
 // Keep cold and short direct runs in the ordinary executor. Once four
 // consecutive transitions have proved this invocation's row path warm, bulk
@@ -90,17 +90,26 @@ const RESUME_DIRECT_BATCH_MIN_READY: u8 = 4;
 const _: () = assert!(LAZY_MAX_STATES <= BYTE_ALPHABET);
 const _: () = assert!(LAZY_MAX_STATES <= usize::MAX / BYTE_ALPHABET);
 const LAZY_MAX_ITEMS: usize = 16_384;
+// Every nonempty retained identity consumes at least one item slot. Forward
+// execution can additionally retain one reachable empty identity, so this is
+// a source-independent direct-state ceiling before the resource solver
+// applies its tighter architecture- and class-count-dependent limit.
+const DIRECT_LAZY_MAX_STATES: usize = LAZY_MAX_ITEMS + 1;
+const _: () = assert!(DIRECT_LAZY_MAX_STATES <= usize::MAX / BYTE_ALPHABET);
 // Contiguous metadata wins for small retained sets. At sixteen identities the
 // fixed hash index crosses over safely in source-independent lookup stress.
 // Its arena is preallocated, but remains untouched until the sixteenth state
 // is published so smaller warmed caches execute the original linear path.
 const LAZY_HASH_INDEX_MIN_STATES: usize = 16;
 const _: () = assert!(LAZY_HASH_INDEX_MIN_STATES <= LAZY_MAX_STATES);
-const LAZY_HASH_INDEX_BOOTSTRAP_MAX_PROBES: usize =
-    LAZY_HASH_INDEX_MIN_STATES * (LAZY_HASH_INDEX_MIN_STATES - 1) / 2;
-const LAZY_HASH_INDEX_MAX_SLOTS: usize = LAZY_MAX_STATES * 2;
-const LAZY_HASH_INDEX_BOOTSTRAP_WORDS: usize = LAZY_HASH_INDEX_MAX_SLOTS / 64;
-const _: () = assert!(LAZY_HASH_INDEX_BOOTSTRAP_WORDS * 64 == LAZY_HASH_INDEX_MAX_SLOTS);
+// Planning the first sixteen index entries keeps only those sixteen slots on
+// the stack. In the worst case entry `i` compares against all `i` earlier
+// slots for each of `i + 1` probes and advances after `i` collisions.
+const LAZY_HASH_INDEX_BOOTSTRAP_MAX_WORK: usize = (LAZY_HASH_INDEX_MIN_STATES - 1)
+    * LAZY_HASH_INDEX_MIN_STATES
+    * (2 * LAZY_HASH_INDEX_MIN_STATES - 1)
+    / 6
+    + (LAZY_HASH_INDEX_MIN_STATES - 1) * LAZY_HASH_INDEX_MIN_STATES;
 const EXACT_LAZY_CAPACITY_MAX_ITEMS: usize = 3;
 const LAZY_CELL_ACCEPT: u32 = 1 << 31;
 const LAZY_CELL_RESTART: u32 = 1 << 30;
@@ -113,6 +122,7 @@ const LAZY_CELL_RESTART: u32 = 1 << 30;
 // remaining state field.
 const LAZY_CELL_START_PROPAGATE: u32 = 1 << 29;
 const LAZY_CELL_STATE_MASK: u32 = LAZY_CELL_START_PROPAGATE - 1;
+const _: () = assert!(DIRECT_LAZY_MAX_STATES * BYTE_ALPHABET <= (1_usize << 29).saturating_sub(1));
 const LAZY_CELL_UNFILLED: u32 = u32::MAX;
 const LAZY_NO_STATE: u32 = u32::MAX;
 #[cfg(test)]
@@ -135,22 +145,22 @@ const CONTEXT_INITIAL_SOURCE: u32 = u32::MAX - 1;
 
 /// Index one exact-class direct row after its source state has been authenticated.
 ///
-/// Every direct lazy arena is constructed with at most `LAZY_MAX_STATES`
-/// rows, and state publication never exceeds that fixed capacity. The const
-/// assertion above and the immutable byte-class ceiling therefore prove this
-/// multiply/add cannot overflow. Keeping that shape proof outside the warmed
-/// transition loop removes the multiply from every warmed input byte; the
-/// final slice lookup still diagnoses a broken physical layout.
+/// Every direct lazy arena is constructed below `DIRECT_LAZY_MAX_STATES`, and
+/// state publication never exceeds its fixed capacity. The const assertions
+/// above and the immutable byte-class ceiling therefore prove this
+/// multiply/add cannot overflow or exhaust the encoded cell field. Keeping
+/// that shape proof outside the warmed transition loop removes the multiply
+/// from every warmed input byte; the final slice lookup still diagnoses a
+/// broken physical layout.
 #[allow(
     clippy::arithmetic_side_effects,
-    reason = "the fixed lazy-state and byte-class ceilings prove the row index fits usize"
+    reason = "the fixed direct-state and byte-class ceilings prove the row index fits usize"
 )]
 fn direct_row_cell_index(state: usize, class: u8, stride: u32) -> usize {
-    debug_assert!(state < LAZY_MAX_STATES);
+    debug_assert!(state < DIRECT_LAZY_MAX_STATES);
     debug_assert!(stride != 0 && usize::try_from(stride).unwrap_or(usize::MAX) <= BYTE_ALPHABET);
     debug_assert!(u32::from(class) < stride);
-    state * usize::try_from(stride).expect("the byte-class stride fits usize")
-        + usize::from(class)
+    state * usize::try_from(stride).expect("the byte-class stride fits usize") + usize::from(class)
 }
 
 /// Authenticate one direct-row source once, before entering a warmed loop.
@@ -168,7 +178,7 @@ fn direct_row_offset(state: u32, stride: u32) -> Result<u32, SearchError> {
     let state = usize::try_from(state).map_err(|_| SearchError::InternalInvariant {
         detail: "direct lazy state does not fit usize",
     })?;
-    if state >= LAZY_MAX_STATES {
+    if state >= DIRECT_LAZY_MAX_STATES {
         return Err(SearchError::InternalInvariant {
             detail: "direct lazy state is outside the cache ceiling",
         });
@@ -1008,7 +1018,7 @@ impl WorkspaceLayout {
         let (lazy_state_capacity, lazy_item_capacity) = if mode == WorkspaceMode::Pike {
             (0, 0)
         } else {
-            lazy_capacities(automaton)?
+            lazy_capacities(automaton, automaton.byte_classes().count())?
         };
         let lazy_context_slots =
             if lazy_state_capacity != 0 && automaton.stats().assertion_edges() != 0 {
@@ -1529,9 +1539,10 @@ const LAZY_LOOP_SKIP_BITMAP_PUBLICATION_WORK: u64 = 1;
 /// already-compiled scanner byte-for-byte; only an evicted owner's slot is
 /// replaced. Runtime lookup checks the invocation's active owner first for the
 /// common same-state path, then slot zero for a cold common case.
-/// `state_members` acts as a negative filter before walking the remaining
-/// owners. A hit is always resolved against the exact row offset before any
-/// proof is used.
+/// `state_members` acts as a negative filter for the first 256 states before
+/// walking the remaining owners. Expanded state IDs walk the four exact
+/// owners directly. A hit is always resolved against the exact row offset
+/// before any proof is used.
 #[derive(Debug)]
 struct LazyLoopSkipPlans {
     entries: [Option<LazyLoopSkipPlan>; LAZY_LOOP_SKIP_PLAN_CAPACITY],
@@ -1575,11 +1586,7 @@ impl LazyLoopSkipPlans {
     }
 
     #[cfg(test)]
-    fn find(
-        &self,
-        row_offset: u32,
-        direct_row_stride: u32,
-    ) -> Option<(usize, &LazyLoopSkipPlan)> {
+    fn find(&self, row_offset: u32, direct_row_stride: u32) -> Option<(usize, &LazyLoopSkipPlan)> {
         self.find_with_hint(row_offset, None, direct_row_stride)
     }
 
@@ -1604,23 +1611,24 @@ impl LazyLoopSkipPlans {
                 }
             }
         }
-        let state = u8::try_from(direct_row_state(row_offset, direct_row_stride)).ok()?;
-        if !byte_bitmap_contains(self.state_members, state) {
+        let bitmap_member = u8::try_from(direct_row_state(row_offset, direct_row_stride))
+            .ok()
+            .map(|state| byte_bitmap_contains(self.state_members, state));
+        if bitmap_member == Some(false) {
             return None;
         }
-        let found = self
-            .entries
-            .iter()
-            .enumerate()
-            .find_map(|(slot, plan)| {
-                if preferred_slot == Some(slot) || slot == 0 {
-                    return None;
-                }
-                plan.as_ref()
-                    .filter(|plan| plan.row_offset == row_offset)
-                    .map(|plan| (slot, plan))
-            });
-        debug_assert!(found.is_some(), "direct loop state bitmap has no exact plan");
+        let found = self.entries.iter().enumerate().find_map(|(slot, plan)| {
+            if preferred_slot == Some(slot) || slot == 0 {
+                return None;
+            }
+            plan.as_ref()
+                .filter(|plan| plan.row_offset == row_offset)
+                .map(|plan| (slot, plan))
+        });
+        debug_assert!(
+            bitmap_member != Some(true) || found.is_some(),
+            "direct loop state bitmap has no exact plan"
+        );
         found
     }
 }
@@ -2147,7 +2155,7 @@ impl LazyWorkspace {
                 detail: "lazy DFA transition class is outside the direct row",
             });
         }
-        debug_assert!(self.state_len <= LAZY_MAX_STATES);
+        debug_assert!(self.state_len <= DIRECT_LAZY_MAX_STATES);
         let cell_index = direct_row_cell_index(state, class, self.direct_row_stride);
         self.rows
             .get(cell_index)
@@ -2160,7 +2168,7 @@ impl LazyWorkspace {
     /// Read a warmed direct transition using an already-authenticated row.
     #[allow(
         clippy::arithmetic_side_effects,
-        reason = "direct row offsets are bounded by the fixed lazy-state ceiling"
+        reason = "direct row offsets are bounded by the fixed direct-state ceiling"
     )]
     fn direct_cell(&self, row_offset: u32, class: u8) -> Result<u32, SearchError> {
         // Every production caller obtains this class from the same immutable,
@@ -2198,7 +2206,7 @@ impl LazyWorkspace {
                 detail: "lazy DFA transition class is outside the direct row",
             });
         }
-        debug_assert!(self.state_len <= LAZY_MAX_STATES);
+        debug_assert!(self.state_len <= DIRECT_LAZY_MAX_STATES);
         let cell_index = direct_row_cell_index(state, class, self.direct_row_stride);
         let slot = self
             .rows
@@ -2369,11 +2377,10 @@ impl LazyWorkspace {
         }
 
         // Plan every insertion against the earlier planned slots before
-        // publishing any index cell. The preflight reserves the triangular
+        // publishing any index cell. The preflight reserves the complete
         // worst case, so a work decline leaves the sentinel-only arena intact.
         let mut slots = [usize::MAX; LAZY_HASH_INDEX_MIN_STATES];
-        let mut occupied = [0_u64; LAZY_HASH_INDEX_BOOTSTRAP_WORDS];
-        for (state, planned_slot) in slots.iter_mut().enumerate() {
+        for state in 0..LAZY_HASH_INDEX_MIN_STATES {
             let hash = if state == self.state_len {
                 final_hash
             } else {
@@ -2382,15 +2389,15 @@ impl LazyWorkspace {
             let mut slot = lazy_index_start(hash, self.index.len())?;
             let mut probes = 0usize;
             loop {
-                let word = slot / 64;
-                let bit = 1_u64 << (slot % 64);
-                let cell = occupied
-                    .get_mut(word)
-                    .ok_or(SearchError::InternalInvariant {
-                        detail: "lazy DFA index bootstrap slot exceeds its fixed bitmap",
-                    })?;
-                if *cell & bit == 0 {
-                    *cell |= bit;
+                let mut occupied = false;
+                for &planned in &slots[..state] {
+                    meter.charge(1, position)?;
+                    if planned == slot {
+                        occupied = true;
+                        break;
+                    }
+                }
+                if !occupied {
                     break;
                 }
                 if probes >= state {
@@ -2411,7 +2418,7 @@ impl LazyWorkspace {
                     detail: "lazy DFA index bootstrap arena is not untouched",
                 });
             }
-            *planned_slot = slot;
+            slots[state] = slot;
         }
         Ok(slots)
     }
@@ -2441,7 +2448,7 @@ impl LazyWorkspace {
             && !self.index.is_empty()
             && self.state_len.checked_add(1) == Some(LAZY_HASH_INDEX_MIN_STATES);
         let index_publication_work = if bootstraps_index {
-            LAZY_HASH_INDEX_BOOTSTRAP_MAX_PROBES
+            LAZY_HASH_INDEX_BOOTSTRAP_MAX_WORK
         } else {
             0
         };
@@ -11000,17 +11007,23 @@ fn try_publish_lazy_loop_skip_candidates(
         let Some(candidate) = candidate else {
             continue;
         };
-        let state = u8::try_from(candidate.state).map_err(|_| {
-            SearchError::InternalInvariant {
-                detail: "direct loop publication state does not fit its fixed bitmap",
-            }
-        })?;
-        if byte_bitmap_contains(target_members, state) {
+        if target[..slot]
+            .iter()
+            .flatten()
+            .any(|previous| previous.state == candidate.state)
+        {
             return Err(SearchError::InternalInvariant {
                 detail: "direct loop publication retained one state twice",
             });
         }
-        byte_bitmap_insert(&mut target_members, state);
+        if let Ok(state) = u8::try_from(candidate.state) {
+            if byte_bitmap_contains(target_members, state) {
+                return Err(SearchError::InternalInvariant {
+                    detail: "direct loop publication retained one state twice",
+                });
+            }
+            byte_bitmap_insert(&mut target_members, state);
+        }
         target_rows[slot] = Some(lazy.row_offset(candidate.state)?);
     }
 
@@ -16573,13 +16586,86 @@ fn unicode_assertion_matches(
     ))
 }
 
-fn lazy_capacities(automaton: &Automaton) -> Result<(usize, usize), SearchError> {
+fn lazy_capacities(
+    automaton: &Automaton,
+    direct_class_count: usize,
+) -> Result<(usize, usize), SearchError> {
     let states = automaton.stats().states();
     if states == 0 || states > LAZY_MAX_ITEMS {
         return Ok((0, 0));
     }
     let consuming = automaton.stats().consuming_states();
     let state_capacity = forward_lazy_state_capacity(consuming);
+    let legacy_item_capacity = ordered_partial_permutation_item_capacity(
+        consuming,
+        2,
+        state_capacity,
+        "lazy DFA item capacity",
+    )?;
+    if automaton.stats().assertion_edges() != 0 {
+        return Ok((state_capacity, legacy_item_capacity));
+    }
+    if !(1..=BYTE_ALPHABET).contains(&direct_class_count) {
+        return Err(SearchError::InternalInvariant {
+            detail: "direct lazy byte-class count is outside the alphabet",
+        });
+    }
+
+    // Reinvest only resources that the former 256-cell identity rows would
+    // have retained and initialized. This keeps both memory and construction
+    // work source-independent and no larger than the legacy direct arena.
+    let legacy_stride =
+        u32::try_from(BYTE_ALPHABET).map_err(|_| SearchError::InternalInvariant {
+            detail: "byte alphabet does not fit the direct-row stride",
+        })?;
+    let byte_budget = lazy_scratch_bytes(
+        states,
+        state_capacity,
+        legacy_item_capacity,
+        legacy_stride,
+        0,
+    )?;
+    let initialized_slot_budget = lazy_initialized_slots(
+        states,
+        state_capacity,
+        legacy_item_capacity,
+        legacy_stride,
+        0,
+    )?;
+    let direct_stride =
+        u32::try_from(direct_class_count).map_err(|_| SearchError::InternalInvariant {
+            detail: "direct lazy byte-class count does not fit the row stride",
+        })?;
+    let maximum_state_capacity =
+        forward_lazy_state_capacity_up_to(consuming, DIRECT_LAZY_MAX_STATES);
+    let byte_limited_capacity = maximize_direct_state_capacity(
+        state_capacity,
+        maximum_state_capacity,
+        byte_budget,
+        |candidate| {
+            let items = ordered_partial_permutation_item_capacity(
+                consuming,
+                2,
+                candidate,
+                "lazy DFA item capacity",
+            )?;
+            lazy_scratch_bytes(states, candidate, items, direct_stride, 0)
+        },
+    )?;
+    let state_capacity = maximize_direct_state_capacity(
+        state_capacity,
+        byte_limited_capacity,
+        initialized_slot_budget,
+        |candidate| {
+            let items = ordered_partial_permutation_item_capacity(
+                consuming,
+                2,
+                candidate,
+                "lazy DFA item capacity",
+            )?;
+            lazy_initialized_slots(states, candidate, items, direct_stride, 0)
+        },
+    )?;
     let item_capacity = ordered_partial_permutation_item_capacity(
         consuming,
         2,
@@ -16645,33 +16731,82 @@ fn reverse_capacities(automaton: &Automaton) -> Result<(usize, usize), SearchErr
     Ok((state_capacity, item_capacity))
 }
 
+/// Find the greatest monotone capacity whose complete arena fits one legacy
+/// resource budget. Callers measure exact retained bytes and initialized
+/// slots, including metadata, the power-of-two identity index, aggregate item
+/// storage, and exact-class rows.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the authenticated ordered bounds make midpoint arithmetic exact"
+)]
+fn maximize_direct_state_capacity(
+    minimum: usize,
+    maximum: usize,
+    resource_budget: usize,
+    mut measure_for: impl FnMut(usize) -> Result<usize, SearchError>,
+) -> Result<usize, SearchError> {
+    if minimum > maximum || measure_for(minimum)? > resource_budget {
+        return Err(SearchError::InternalInvariant {
+            detail: "compact direct arena does not fit its legacy resource budget",
+        });
+    }
+    let mut accepted = minimum;
+    let mut upper = maximum;
+    while accepted < upper {
+        let candidate = accepted + (upper - accepted).div_ceil(2);
+        let fits = match measure_for(candidate) {
+            Ok(measure) => measure <= resource_budget,
+            // The measure is monotone. Overflow proves this candidate and
+            // every larger one exceed a representable budget; it cannot
+            // reject the already-representable legacy layout.
+            Err(SearchError::ArithmeticOverflow { .. }) => false,
+            Err(error) => return Err(error),
+        };
+        if fits {
+            accepted = candidate;
+        } else {
+            upper = candidate - 1;
+        }
+    }
+    Ok(accepted)
+}
+
 /// Count distinct ordered nonempty subsets, capped at the retained row limit.
 ///
 /// A closure generation admits each item at most once, but forward priority
 /// makes different orders distinct cache states. `modes` accounts for state
 /// identity outside the item sequence, while `empty_modes` admits only the
 /// semantically reachable empty identities.
-fn capped_ordered_partial_permutations(items: usize, modes: usize, empty_modes: usize) -> usize {
-    let mut total = empty_modes.min(LAZY_MAX_STATES);
+fn capped_ordered_partial_permutations_up_to(
+    items: usize,
+    modes: usize,
+    empty_modes: usize,
+    state_limit: usize,
+) -> usize {
+    let mut total = empty_modes.min(state_limit);
     let mut permutations = 1usize;
     let mut length = 1usize;
-    while length <= items && total < LAZY_MAX_STATES {
+    while length <= items && total < state_limit {
         let prior = length.saturating_sub(1);
         let remaining = items.saturating_sub(prior);
-        permutations = permutations.saturating_mul(remaining).min(LAZY_MAX_STATES);
+        permutations = permutations.saturating_mul(remaining).min(state_limit);
         total = total
             .saturating_add(permutations.saturating_mul(modes))
-            .min(LAZY_MAX_STATES);
+            .min(state_limit);
         length = length.saturating_add(1);
     }
     total
 }
 
 fn forward_lazy_state_capacity(consuming_states: usize) -> usize {
+    forward_lazy_state_capacity_up_to(consuming_states, LAZY_MAX_STATES)
+}
+
+fn forward_lazy_state_capacity_up_to(consuming_states: usize, state_limit: usize) -> usize {
     // Nonempty ordered subsets exist in both pending modes. Exactly one empty
     // identity is retainable: the pending nullable initial state in a direct
     // graph, or the nonpending restart state in a contextual graph.
-    capped_ordered_partial_permutations(consuming_states, 2, 1)
+    capped_ordered_partial_permutations_up_to(consuming_states, 2, 1, state_limit)
 }
 
 fn reverse_lazy_state_capacity(consuming_edges: usize, contextual: bool) -> usize {
@@ -16681,7 +16816,12 @@ fn reverse_lazy_state_capacity(consuming_edges: usize, contextual: bool) -> usiz
     // Reverse state identity is only its consuming-edge sequence. Contextual
     // initialization can additionally retain one empty sequence when the
     // current assertion mask disconnects every consuming predecessor.
-    capped_ordered_partial_permutations(consuming_edges, 1, usize::from(contextual))
+    capped_ordered_partial_permutations_up_to(
+        consuming_edges,
+        1,
+        usize::from(contextual),
+        LAZY_MAX_STATES,
+    )
 }
 
 /// Maximum aggregate item length of any retained set of distinct identities.
@@ -19592,6 +19732,426 @@ mod tests {
     }
 
     #[test]
+    fn direct_state_capacity_solver_treats_overflow_as_a_closed_upper_bound() {
+        let capacity = super::maximize_direct_state_capacity(2, usize::MAX, 10, |candidate| {
+            if candidate > 8 {
+                return Err(SearchError::ArithmeticOverflow {
+                    computation: "synthetic direct capacity bytes",
+                });
+            }
+            candidate
+                .checked_mul(2)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "synthetic direct capacity bytes",
+                })
+        })
+        .unwrap();
+        assert_eq!(capacity, 5);
+
+        assert!(matches!(
+            super::maximize_direct_state_capacity(2, 8, 10, |_| {
+                Err(SearchError::InternalInvariant {
+                    detail: "synthetic non-monotone failure",
+                })
+            }),
+            Err(SearchError::InternalInvariant {
+                detail: "synthetic non-monotone failure",
+            })
+        ));
+    }
+
+    #[test]
+    fn exact_class_capacity_rewards_narrow_rows_without_exceeding_legacy_resources() {
+        let consuming = 7;
+        let states = 8;
+        let legacy_states = super::forward_lazy_state_capacity(consuming);
+        let legacy_items = super::ordered_partial_permutation_item_capacity(
+            consuming,
+            2,
+            legacy_states,
+            "test legacy direct items",
+        )
+        .unwrap();
+        let legacy_stride = u32::try_from(super::BYTE_ALPHABET).unwrap();
+        let byte_budget =
+            super::lazy_scratch_bytes(states, legacy_states, legacy_items, legacy_stride, 0)
+                .unwrap();
+        let initialized_slot_budget =
+            super::lazy_initialized_slots(states, legacy_states, legacy_items, legacy_stride, 0)
+                .unwrap();
+        let structural_max =
+            super::forward_lazy_state_capacity_up_to(consuming, super::DIRECT_LAZY_MAX_STATES);
+        let capacity_for = |class_count: u32| {
+            let byte_limited = super::maximize_direct_state_capacity(
+                legacy_states,
+                structural_max,
+                byte_budget,
+                |candidate| {
+                    let items = super::ordered_partial_permutation_item_capacity(
+                        consuming,
+                        2,
+                        candidate,
+                        "test exact-class items",
+                    )?;
+                    super::lazy_scratch_bytes(states, candidate, items, class_count, 0)
+                },
+            )
+            .unwrap();
+            super::maximize_direct_state_capacity(
+                legacy_states,
+                byte_limited,
+                initialized_slot_budget,
+                |candidate| {
+                    let items = super::ordered_partial_permutation_item_capacity(
+                        consuming,
+                        2,
+                        candidate,
+                        "test exact-class items",
+                    )?;
+                    super::lazy_initialized_slots(states, candidate, items, class_count, 0)
+                },
+            )
+            .unwrap()
+        };
+
+        let one_class = capacity_for(1);
+        let five_classes = capacity_for(5);
+        let identity = capacity_for(legacy_stride);
+        assert!(one_class > five_classes);
+        assert!(five_classes > legacy_states);
+        assert_eq!(five_classes, 4_096);
+        assert_eq!(identity, legacy_states);
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(one_class, 5_826);
+        #[cfg(target_pointer_width = "32")]
+        assert_eq!(one_class, 6_887);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one matrix proves both resource bounds, directional exclusion, and contextual exclusion"
+    )]
+    fn exact_class_rows_expand_only_forward_direct_capacity_within_both_budgets() {
+        let ranges = [
+            (b'a', b'a'),
+            (b'b', b'b'),
+            (b'c', b'c'),
+            (b'd', b'd'),
+            (b'a', b'a'),
+            (b'b', b'b'),
+            (b'c', b'c'),
+        ];
+        let plan = byte_chain(&ranges);
+        let ordinary = plan.workspace_layout().unwrap();
+        let endpoint = plan.accelerated_workspace_layout().unwrap();
+        let full = plan.bidirectional_workspace_layout().unwrap();
+        assert_eq!(plan.stats().states(), 8);
+        assert_eq!(plan.stats().consuming_states(), 7);
+        assert_eq!(endpoint.direct_row_stride, 6);
+
+        let legacy_states = super::forward_lazy_state_capacity(7);
+        let legacy_items = super::ordered_partial_permutation_item_capacity(
+            7,
+            2,
+            legacy_states,
+            "test legacy forward items",
+        )
+        .unwrap();
+        let legacy_stride = u32::try_from(super::BYTE_ALPHABET).unwrap();
+        let byte_budget = super::lazy_scratch_bytes(
+            endpoint.states,
+            legacy_states,
+            legacy_items,
+            legacy_stride,
+            0,
+        )
+        .unwrap();
+        let slot_budget = super::lazy_initialized_slots(
+            endpoint.states,
+            legacy_states,
+            legacy_items,
+            legacy_stride,
+            0,
+        )
+        .unwrap();
+        let retained = super::lazy_scratch_bytes(
+            endpoint.states,
+            endpoint.lazy_state_capacity,
+            endpoint.lazy_item_capacity,
+            endpoint.direct_row_stride,
+            0,
+        )
+        .unwrap();
+        let initialized = super::lazy_initialized_slots(
+            endpoint.states,
+            endpoint.lazy_state_capacity,
+            endpoint.lazy_item_capacity,
+            endpoint.direct_row_stride,
+            0,
+        )
+        .unwrap();
+        assert_eq!(legacy_states, super::LAZY_MAX_STATES);
+        assert!(endpoint.lazy_state_capacity > legacy_states);
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(endpoint.lazy_state_capacity, 3_965);
+        assert_eq!(endpoint.lazy_item_capacity, super::LAZY_MAX_ITEMS);
+        assert!(retained <= byte_budget);
+        assert!(initialized <= slot_budget);
+        assert_eq!(
+            endpoint.logical_bytes() - ordinary.logical_bytes(),
+            retained
+        );
+
+        let next_state_capacity = endpoint.lazy_state_capacity + 1;
+        let next_items = super::ordered_partial_permutation_item_capacity(
+            7,
+            2,
+            next_state_capacity,
+            "test next forward items",
+        )
+        .unwrap();
+        let next_retained = super::lazy_scratch_bytes(
+            endpoint.states,
+            next_state_capacity,
+            next_items,
+            endpoint.direct_row_stride,
+            0,
+        )
+        .unwrap();
+        let next_initialized = super::lazy_initialized_slots(
+            endpoint.states,
+            next_state_capacity,
+            next_items,
+            endpoint.direct_row_stride,
+            0,
+        )
+        .unwrap();
+        assert!(next_retained > byte_budget || next_initialized > slot_budget);
+
+        assert_eq!(full.reverse_state_capacity, super::LAZY_MAX_STATES);
+        let workspace =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        assert_eq!(workspace.retained_bytes(), full.logical_bytes());
+        assert_eq!(
+            workspace.lazy.rows.len(),
+            endpoint.lazy_state_capacity * usize::try_from(endpoint.direct_row_stride).unwrap()
+        );
+        assert_eq!(
+            workspace.reverse.rows.len(),
+            full.reverse_state_capacity * usize::try_from(full.direct_row_stride).unwrap()
+        );
+        let final_state = u32::try_from(endpoint.lazy_state_capacity - 1).unwrap();
+        let encoded = super::direct_row_encoded_state(final_state, endpoint.direct_row_stride)
+            .unwrap();
+        assert!(encoded <= super::LAZY_CELL_STATE_MASK);
+        assert_eq!(
+            super::direct_row_state(encoded - 1, endpoint.direct_row_stride),
+            final_state
+        );
+
+        let contextual = Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: core::iter::once(StateRole::Split)
+                    .chain((0..7).map(|_| StateRole::Consume))
+                    .chain(core::iter::once(StateRole::Accept))
+                    .collect(),
+                edge_offsets: vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 8],
+                edge_targets: (1..=8).collect(),
+                edge_kinds: core::iter::once(EdgeKind::AssertLineStartLf)
+                    .chain((0..7).map(|_| EdgeKind::ByteRange))
+                    .collect(),
+                byte_starts: core::iter::once(0)
+                    .chain(ranges.iter().map(|&(start, _)| start))
+                    .collect(),
+                byte_ends: core::iter::once(0)
+                    .chain(ranges.iter().map(|&(_, end)| end))
+                    .collect(),
+            },
+            CompileLimits::default(),
+        )
+        .unwrap();
+        let contextual_layout = contextual.bidirectional_workspace_layout().unwrap();
+        assert_eq!(contextual_layout.direct_row_stride, 1);
+        assert_eq!(
+            contextual_layout.lazy_state_capacity,
+            super::LAZY_MAX_STATES
+        );
+        assert_eq!(
+            contextual_layout.reverse_state_capacity,
+            super::LAZY_MAX_STATES
+        );
+        let contextual_workspace =
+            K0Workspace::new_bidirectional(&contextual, WorkspaceLimits::unlimited()).unwrap();
+        assert!(contextual_workspace.lazy.rows.is_empty());
+        assert!(contextual_workspace.reverse.rows.is_empty());
+    }
+
+    #[test]
+    fn expanded_forward_state_ids_preserve_index_rows_and_loop_plan_lookup() {
+        let plan = byte_chain(&[
+            (b'a', b'a'),
+            (b'b', b'b'),
+            (b'c', b'c'),
+            (b'd', b'd'),
+            (b'a', b'a'),
+            (b'b', b'b'),
+            (b'c', b'c'),
+        ]);
+        let mut workspace =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        assert!(workspace.lazy.offsets.len() > super::LAZY_MAX_STATES);
+
+        workspace.lazy.scratch[0] = 10_000;
+        workspace.lazy.scratch_len = 1;
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            workspace.lazy.intern_initial(false, &mut meter, 0),
+            Ok(0)
+        );
+        for expected in 1..=300usize {
+            workspace.lazy.scratch[0] = u32::try_from(10_000 + expected).unwrap();
+            workspace.lazy.scratch_len = 1;
+            assert_eq!(
+                workspace
+                    .lazy
+                    .intern_speculative(false, &mut meter, 0, 0),
+                Ok(super::LazyInterned::State(u32::try_from(expected).unwrap()))
+            );
+        }
+        assert_eq!(workspace.lazy.state_len, 301);
+
+        workspace.lazy.scratch[0] = 10_300;
+        workspace.lazy.scratch_len = 1;
+        assert_eq!(
+            workspace
+                .lazy
+                .intern_speculative(false, &mut meter, 0, 0),
+            Ok(super::LazyInterned::State(300))
+        );
+
+        let high_state = 300_u32;
+        let high_row = workspace.lazy.row_offset(high_state).unwrap();
+        let encoded = workspace.lazy.encoded_state(high_state).unwrap();
+        workspace.lazy.set_cell(high_state, 0, encoded).unwrap();
+        assert_eq!(workspace.lazy.cell(high_state, 0).unwrap(), encoded);
+        assert_eq!(workspace.lazy.direct_cell(high_row, 0).unwrap(), encoded);
+        assert_eq!(workspace.lazy.row_state(encoded - 1), high_state);
+
+        let low_members = [1_u64 << 1, 0, 0, 0];
+        let high_members = [1_u64 << 2, 0, 0, 0];
+        let candidates = [
+            Some(super::LazyLoopSkipCandidate {
+                state: 10,
+                members: low_members,
+                start_action: super::LazyStartAction::Drop,
+            }),
+            Some(super::LazyLoopSkipCandidate {
+                state: high_state,
+                members: high_members,
+                start_action: super::LazyStartAction::Propagate,
+            }),
+            None,
+            None,
+        ];
+        let mut publication = WorkMeter::new(u64::MAX, 0);
+        assert!(super::try_publish_lazy_loop_skip_candidates(
+            &mut workspace.lazy,
+            candidates,
+            &mut publication,
+        )
+        .unwrap());
+        assert_eq!(workspace.lazy.loop_skip_plans.len(), 2);
+        assert_eq!(
+            super::byte_bitmap_cardinality(workspace.lazy.loop_skip_plans.state_members),
+            1
+        );
+        assert!(super::byte_bitmap_contains(
+            workspace.lazy.loop_skip_plans.state_members,
+            10
+        ));
+        let (slot, high_plan) = workspace
+            .lazy
+            .loop_skip_plans
+            .find(high_row, workspace.lazy.direct_row_stride)
+            .unwrap();
+        assert_eq!(slot, 1);
+        assert_eq!(high_plan.row_offset, high_row);
+        assert_eq!(high_plan.scanner.words(), high_members);
+        assert!(workspace
+            .lazy
+            .loop_skip_plans
+            .find(
+                workspace.lazy.row_offset(301).unwrap(),
+                workspace.lazy.direct_row_stride,
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn expanded_forward_capacity_retains_naturally_reached_subsets_past_legacy_ceiling() {
+        // `[ab]*a[ab]{8}z` tracks every `a` in the preceding nine-byte binary
+        // suffix while waiting for `z`. All nine-bit words therefore drive
+        // more than 256 real ordered subsets without accepting early.
+        let plan = Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: core::iter::once(StateRole::Split)
+                    .chain((0..11).map(|_| StateRole::Consume))
+                    .chain(core::iter::once(StateRole::Accept))
+                    .collect(),
+                edge_offsets: vec![0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 13],
+                edge_targets: vec![1, 2, 0, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+                edge_kinds: core::iter::repeat_n(EdgeKind::Epsilon, 2)
+                    .chain(core::iter::repeat_n(EdgeKind::ByteRange, 11))
+                    .collect(),
+                byte_starts: core::iter::repeat_n(0, 2)
+                    .chain([b'a', b'a'])
+                    .chain(core::iter::repeat_n(b'a', 8))
+                    .chain(core::iter::once(b'z'))
+                    .collect(),
+                byte_ends: core::iter::repeat_n(0, 2)
+                    .chain([b'b', b'a'])
+                    .chain(core::iter::repeat_n(b'b', 8))
+                    .chain(core::iter::once(b'z'))
+                    .collect(),
+            },
+            CompileLimits::default(),
+        )
+        .unwrap();
+        pin_without_start_filter(&plan);
+        let layout = plan.accelerated_workspace_layout().unwrap();
+        assert_eq!(layout.direct_row_stride, 6);
+        assert!(layout.lazy_state_capacity > super::LAZY_MAX_STATES);
+
+        let mut haystack = Vec::with_capacity(512 * 10);
+        for word in 0_u16..512 {
+            haystack.push(b'x');
+            for shift in (0..9).rev() {
+                haystack.push(if word & (1 << shift) == 0 { b'b' } else { b'a' });
+            }
+        }
+        let mut pike = K0Workspace::new(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let expected = plan
+            .prepare::<SelectedEnd>()
+            .search_with_workspace(&haystack, &mut pike, SearchLimits::unlimited())
+            .unwrap()
+            .into_output();
+        let mut accelerated =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let actual = plan
+            .prepare::<SelectedEnd>()
+            .search_with_workspace(&haystack, &mut accelerated, SearchLimits::unlimited())
+            .unwrap()
+            .into_output();
+        assert_eq!(actual, expected);
+        assert_eq!(actual, None);
+        assert!(accelerated.lazy.state_len > super::LAZY_MAX_STATES);
+        assert!(!accelerated.lazy.saturated);
+    }
+
+    #[test]
     fn contextual_hot_tags_are_exact_source_isolated_and_preserve_lookup_work() {
         let slots = super::contextual_transition_slots(2).unwrap();
         let mut store =
@@ -20003,7 +20563,7 @@ mod tests {
 
         // Items zero, 512, and 1024 share their low nine hash bits. The
         // threshold publication therefore exercises collisions while it
-        // bootstraps all prior identities. One below the triangular worst-case
+        // bootstraps all prior identities. One below the complete worst-case
         // reservation declines without publishing any index cell.
         let initial_hash = workspace.lazy.hashes[0];
         let boundary_hash = super::lazy_hash(&[1024], false);
@@ -20017,9 +20577,7 @@ mod tests {
         let bootstrap_bound = linear_states
             .checked_mul(2)
             .and_then(|work| work.checked_add(2))
-            .and_then(|work| {
-                work.checked_add(super::LAZY_HASH_INDEX_BOOTSTRAP_MAX_PROBES)
-            })
+            .and_then(|work| work.checked_add(super::LAZY_HASH_INDEX_BOOTSTRAP_MAX_WORK))
             .unwrap();
         let mut boundary_refused = WorkMeter::new(
             u64::try_from(bootstrap_bound.checked_sub(1).unwrap()).unwrap(),
@@ -20039,15 +20597,14 @@ mod tests {
             .iter()
             .all(|&state| state == super::LAZY_NO_STATE));
 
-        let mut boundary_publish =
-            WorkMeter::new(u64::try_from(bootstrap_bound).unwrap(), 0);
+        let mut boundary_publish = WorkMeter::new(u64::try_from(bootstrap_bound).unwrap(), 0);
         assert_eq!(
             workspace
                 .lazy
                 .intern_speculative(false, &mut boundary_publish, 0, 0),
             Ok(super::LazyInterned::State(15))
         );
-        assert_eq!(boundary_publish.consumed, 20);
+        assert_eq!(boundary_publish.consumed, 144);
         assert_eq!(workspace.lazy.state_len, super::LAZY_HASH_INDEX_MIN_STATES);
         assert_indexed(&workspace);
 
