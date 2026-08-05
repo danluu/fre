@@ -62,7 +62,7 @@
     reason = "all reducer arithmetic is preflight-bounded or checked; bitmap shifts use proved 0..=63 operands"
 )]
 
-use core::{fmt, mem::size_of, ops::Range};
+use core::{fmt, mem::size_of, num::NonZeroUsize, ops::Range};
 
 use fre_exact_alloc::{CopyError, try_box_preserve};
 #[cfg(not(feature = "static-dispatch"))]
@@ -980,6 +980,140 @@ pub struct DispatchedPrefixClassAlternationPlan {
     owner: RetainedDispatchedPrefixClassAlternationOwner,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrefixCandidateStreamState {
+    Need { from: usize },
+    Ready { start: usize, next_from: usize },
+    Exhausted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StoredPrefixCandidateStreamState {
+    ready_start: Option<NonZeroUsize>,
+    next_from: usize,
+}
+
+impl StoredPrefixCandidateStreamState {
+    const EXHAUSTED_FROM: usize = usize::MAX;
+
+    const fn need(from: usize) -> Self {
+        Self {
+            ready_start: None,
+            next_from: from,
+        }
+    }
+
+    const fn exhausted() -> Self {
+        Self {
+            ready_start: None,
+            next_from: Self::EXHAUSTED_FROM,
+        }
+    }
+
+    fn state(self) -> PrefixCandidateStreamState {
+        if let Some(start) = self.ready_start {
+            return PrefixCandidateStreamState::Ready {
+                start: start.get() - 1,
+                next_from: self.next_from,
+            };
+        }
+        if self.next_from == Self::EXHAUSTED_FROM {
+            PrefixCandidateStreamState::Exhausted
+        } else {
+            PrefixCandidateStreamState::Need {
+                from: self.next_from,
+            }
+        }
+    }
+
+    const fn set_need(&mut self, from: usize) {
+        *self = Self::need(from);
+    }
+
+    fn set_ready(&mut self, start: usize, next_from: usize) -> Result<(), SearchError> {
+        let encoded = start
+            .checked_add(1)
+            .and_then(NonZeroUsize::new)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "encoded retained prefix candidate start",
+            })?;
+        self.ready_start = Some(encoded);
+        self.next_from = next_from;
+        Ok(())
+    }
+
+    const fn set_exhausted(&mut self) {
+        *self = Self::exhausted();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PrefixClassAlternationCursorState {
+    streams: [StoredPrefixCandidateStreamState; 2],
+    window_end: usize,
+    next_start: usize,
+}
+
+impl PrefixClassAlternationCursorState {
+    const fn new() -> Self {
+        Self {
+            streams: [StoredPrefixCandidateStreamState::exhausted(); 2],
+            window_end: 0,
+            next_start: usize::MAX,
+        }
+    }
+
+    fn reset(&mut self, window: Window) {
+        self.streams = [
+            StoredPrefixCandidateStreamState::need(window.start()),
+            StoredPrefixCandidateStreamState::need(window.start()),
+        ];
+        self.window_end = window.end();
+        self.next_start = window.start();
+    }
+
+    fn prepare(&mut self, window: Window) -> bool {
+        if self.next_start != window.start() || self.window_end != window.end() {
+            self.reset(window);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn retain_match(&mut self, end: usize) {
+        self.next_start = end;
+    }
+
+    fn exhaust(&mut self) {
+        self.streams = [StoredPrefixCandidateStreamState::exhausted(); 2];
+        self.next_start = self.window_end;
+    }
+}
+
+/// Plan-and-source-bound continuation for monotone prefix/class iteration.
+///
+/// The capability retains both literal streams across successive
+/// non-overlapping searches. Its immutable borrows bind every retained
+/// candidate to exactly one plan and haystack. Independent searches should
+/// use [`PrefixClassAlternationPlan::find_in`].
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct PrefixClassAlternationSearchCursor<'p, 'h> {
+    plan: &'p PrefixClassAlternationPlan,
+    haystack: &'h [u8],
+    state: PrefixClassAlternationCursorState,
+}
+
+/// Dispatched counterpart of [`PrefixClassAlternationSearchCursor`].
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct DispatchedPrefixClassAlternationSearchCursor<'p, 'h> {
+    plan: &'p DispatchedPrefixClassAlternationPlan,
+    haystack: &'h [u8],
+    state: PrefixClassAlternationCursorState,
+}
+
 type RunScanners = [AsciiByteSetRunScanner; RUN_SCANNERS];
 
 #[derive(Debug)]
@@ -989,6 +1123,115 @@ struct DispatchedPrefixClassAlternationOwner {
 }
 
 type RetainedDispatchedPrefixClassAlternationOwner = Box<DispatchedPrefixClassAlternationOwner>;
+
+impl<'p, 'h> PrefixClassAlternationSearchCursor<'p, 'h> {
+    const fn new(plan: &'p PrefixClassAlternationPlan, haystack: &'h [u8]) -> Self {
+        Self {
+            plan,
+            haystack,
+            state: PrefixClassAlternationCursorState::new(),
+        }
+    }
+
+    /// Find one selected span while retaining both monotone literal streams.
+    ///
+    /// The third tuple element is the work charged to a containing iterator:
+    /// one complete suffix envelope on the first call after construction or a
+    /// reset and zero on contiguous continuations covered by that prepayment.
+    pub fn find_window(
+        &mut self,
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<(Option<(usize, usize)>, SearchAccounting, usize), SearchError> {
+        self.find_window_transaction(window, limits, false)
+    }
+
+    /// Search at or after `start` in the complete bound haystack.
+    pub fn find_at(
+        &mut self,
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<(Option<(usize, usize)>, SearchAccounting, usize), SearchError> {
+        self.find_window(Window::new(start, self.haystack.len()), limits)
+    }
+
+    /// The immutable source bound to this continuation.
+    #[must_use]
+    pub const fn haystack(&self) -> &'h [u8] {
+        self.haystack
+    }
+
+    fn find_window_transaction(
+        &mut self,
+        window: Window,
+        limits: SearchLimits,
+        inject_late_failure: bool,
+    ) -> Result<(Option<(usize, usize)>, SearchAccounting, usize), SearchError> {
+        self.plan.search_in_with_cursor_state(
+            self.haystack,
+            window,
+            limits,
+            self.plan.search_identity(),
+            [None, None],
+            &mut self.state,
+            inject_late_failure,
+        )
+    }
+
+    #[cfg(test)]
+    fn find_window_with_late_failure(
+        &mut self,
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<(Option<(usize, usize)>, SearchAccounting, usize), SearchError> {
+        self.find_window_transaction(window, limits, true)
+    }
+}
+
+impl<'p, 'h> DispatchedPrefixClassAlternationSearchCursor<'p, 'h> {
+    const fn new(
+        plan: &'p DispatchedPrefixClassAlternationPlan,
+        haystack: &'h [u8],
+    ) -> Self {
+        Self {
+            plan,
+            haystack,
+            state: PrefixClassAlternationCursorState::new(),
+        }
+    }
+
+    /// Find one selected span while retaining both monotone literal streams.
+    pub fn find_window(
+        &mut self,
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<(Option<(usize, usize)>, SearchAccounting, usize), SearchError> {
+        self.plan.plan().search_in_with_cursor_state(
+            self.haystack,
+            window,
+            limits,
+            self.plan.search_identity(),
+            self.plan.scanner_refs(),
+            &mut self.state,
+            false,
+        )
+    }
+
+    /// Search at or after `start` in the complete bound haystack.
+    pub fn find_at(
+        &mut self,
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<(Option<(usize, usize)>, SearchAccounting, usize), SearchError> {
+        self.find_window(Window::new(start, self.haystack.len()), limits)
+    }
+
+    /// The immutable source bound to this continuation.
+    #[must_use]
+    pub const fn haystack(&self) -> &'h [u8] {
+        self.haystack
+    }
+}
 
 impl PrefixClassAlternationPlan {
     /// Whether this captured host can retain the fixed-16 SVE scanner pair.
@@ -1402,6 +1645,16 @@ impl PrefixClassAlternationPlan {
         })
     }
 
+    /// Bind a monotone selected-span continuation to this plan and source.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn search_cursor<'p, 'h>(
+        &'p self,
+        haystack: &'h [u8],
+    ) -> PrefixClassAlternationSearchCursor<'p, 'h> {
+        PrefixClassAlternationSearchCursor::new(self, haystack)
+    }
+
     /// Find the selected leftmost-first span in the complete haystack.
     pub fn find(
         &self,
@@ -1522,6 +1775,236 @@ impl PrefixClassAlternationPlan {
                 actual,
             },
         ))
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the retained transaction keeps its identity, scanner proof, exact preflight, and test-only precommit fault at one publication boundary"
+    )]
+    fn search_in_with_cursor_state(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+        identity: OperationIdentity,
+        run_scanners: [Option<&AsciiByteSetRunScanner>; RUN_SCANNERS],
+        state: &mut PrefixClassAlternationCursorState,
+        inject_late_failure: bool,
+    ) -> Result<(Option<(usize, usize)>, SearchAccounting, usize), SearchError> {
+        // Refuse before even resetting a stale continuation. A retry with the
+        // admitted envelope must observe exactly the prior candidate state.
+        let upper_bounds = self.search_preflight(
+            haystack,
+            window,
+            limits,
+            Operation::Search,
+            run_scanners[0].is_some(),
+        )?;
+        let mut next = *state;
+        let reset = next.prepare(window);
+        let prepaid_work = if reset { upper_bounds.work } else { 0 };
+        let (matched, actual) = self.execute_search_with_cursor(
+            haystack,
+            window,
+            upper_bounds,
+            run_scanners,
+            &mut next,
+        )?;
+        if inject_late_failure {
+            return Err(ReduceError::AccountingInvariant {
+                resource: "injected prefix cursor precommit failure",
+                actual: 1,
+                upper: 0,
+            });
+        }
+        *state = next;
+        Ok((
+            matched,
+            SearchAccounting {
+                identity,
+                window,
+                upper_bounds,
+                actual,
+            },
+            prepaid_work,
+        ))
+    }
+
+    fn fill_cursor_stream(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        alternative: usize,
+        state: &mut StoredPrefixCandidateStreamState,
+    ) -> Result<(), SearchError> {
+        loop {
+            match state.state() {
+                PrefixCandidateStreamState::Exhausted => return Ok(()),
+                PrefixCandidateStreamState::Ready { start, .. }
+                    if start >= window.start() =>
+                {
+                    return Ok(());
+                }
+                PrefixCandidateStreamState::Ready { next_from, .. } => {
+                    state.set_need(next_from.max(window.start()));
+                }
+                PrefixCandidateStreamState::Need { from } => {
+                    let from = from.max(window.start());
+                    let search = haystack.get(from..window.end()).ok_or(
+                        ReduceError::InvalidWindow {
+                            start: window.start(),
+                            end: window.end(),
+                            haystack_len: haystack.len(),
+                        },
+                    )?;
+                    let Some(relative) = self.alternatives[alternative].finder.find(search) else {
+                        state.set_exhausted();
+                        return Ok(());
+                    };
+                    let start = from.checked_add(relative).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "retained prefix candidate start",
+                        },
+                    )?;
+                    // Admission proves the literal nonempty and that its first
+                    // byte does not recur in the remainder. Therefore no
+                    // occurrence can begin inside this consumed literal.
+                    let next_from = start
+                        .checked_add(self.alternatives[alternative].finder.needle().len())
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "retained prefix stream restart",
+                        })?;
+                    state.set_ready(start, next_from)?;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    #[allow(
+        clippy::needless_range_loop,
+        clippy::too_many_lines,
+        reason = "the two retained streams keep merge priority, candidate consumption, class reads, and continuation publication adjacent"
+    )]
+    fn execute_search_with_cursor(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        upper: ReduceUpperBounds,
+        run_scanners: [Option<&AsciiByteSetRunScanner>; RUN_SCANNERS],
+        continuation: &mut PrefixClassAlternationCursorState,
+    ) -> Result<(Option<(usize, usize)>, ReduceActualCounters), SearchError> {
+        let bounded_haystack = haystack.get(..window.end()).ok_or(
+            ReduceError::InvalidWindow {
+                start: window.start(),
+                end: window.end(),
+                haystack_len: haystack.len(),
+            },
+        )?;
+        let mut prefix_candidates = 0_usize;
+        let mut class_bytes = 0_usize;
+        loop {
+            for alternative in 0..2 {
+                self.fill_cursor_stream(
+                    haystack,
+                    window,
+                    alternative,
+                    &mut continuation.streams[alternative],
+                )?;
+            }
+            let alternative = match (
+                continuation.streams[0].state(),
+                continuation.streams[1].state(),
+            ) {
+                (
+                    PrefixCandidateStreamState::Exhausted,
+                    PrefixCandidateStreamState::Exhausted,
+                ) => {
+                    continuation.exhaust();
+                    return finish_search_execution(
+                        None,
+                        prefix_candidates,
+                        class_bytes,
+                        upper,
+                    );
+                }
+                (PrefixCandidateStreamState::Ready { .. }, PrefixCandidateStreamState::Exhausted) => 0,
+                (PrefixCandidateStreamState::Exhausted, PrefixCandidateStreamState::Ready { .. }) => 1,
+                (
+                    PrefixCandidateStreamState::Ready { start: left, .. },
+                    PrefixCandidateStreamState::Ready { start: right, .. },
+                ) => usize::from(right < left),
+                _ => {
+                    return Err(ReduceError::AccountingInvariant {
+                        resource: "retained prefix stream readiness",
+                        actual: 1,
+                        upper: 0,
+                    });
+                }
+            };
+            let PrefixCandidateStreamState::Ready { start, next_from } =
+                continuation.streams[alternative].state()
+            else {
+                return Err(ReduceError::AccountingInvariant {
+                    resource: "selected retained prefix stream",
+                    actual: 1,
+                    upper: 0,
+                });
+            };
+            continuation.streams[alternative].set_need(next_from);
+            prefix_candidates = prefix_candidates.checked_add(1).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "retained prefix candidate count",
+                },
+            )?;
+            let prefix_end = start
+                .checked_add(self.alternatives[alternative].finder.needle().len())
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "retained prefix literal end",
+                })?;
+            if prefix_end >= window.end() {
+                continue;
+            }
+            let first_class_byte = *haystack.get(prefix_end).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "retained prefix first class byte",
+                },
+            )?;
+            class_bytes = class_bytes.checked_add(1).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "retained prefix classification count",
+                },
+            )?;
+            if !self.alternatives[alternative]
+                .class
+                .contains(first_class_byte)
+            {
+                continue;
+            }
+            let accepting_end = prefix_end.checked_add(1).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "retained prefix first accepting end",
+                },
+            )?;
+            let extension = extend_greedy_class(
+                bounded_haystack,
+                accepting_end,
+                self.alternatives[alternative].class,
+                run_scanners[alternative],
+            );
+            class_bytes = class_bytes
+                .checked_add(extension.physical_classifications)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "retained prefix greedy classifications",
+                })?;
+            continuation.retain_match(extension.end);
+            return finish_search_execution(
+                Some((start, extension.end)),
+                prefix_candidates,
+                class_bytes,
+                upper,
+            );
+        }
     }
 
     fn search_preflight(
@@ -2840,6 +3323,16 @@ impl DispatchedPrefixClassAlternationPlan {
         )
     }
 
+    /// Bind a monotone selected-span continuation to this plan and source.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn search_cursor<'p, 'h>(
+        &'p self,
+        haystack: &'h [u8],
+    ) -> DispatchedPrefixClassAlternationSearchCursor<'p, 'h> {
+        DispatchedPrefixClassAlternationSearchCursor::new(self, haystack)
+    }
+
     pub fn find(
         &self,
         haystack: &[u8],
@@ -3955,6 +4448,346 @@ mod tests {
                 "projection={projection:?}",
             );
         }
+    }
+
+    fn retained_cursor_spans(
+        plan: &PrefixClassAlternationPlan,
+        haystack: &[u8],
+    ) -> (Vec<(usize, usize)>, usize, usize, usize) {
+        let mut cursor = plan.search_cursor(haystack);
+        let mut start = 0_usize;
+        let mut spans = Vec::new();
+        let mut charged_work = 0_usize;
+        let mut prefix_candidates = 0_usize;
+        let mut calls = 0_usize;
+        loop {
+            let (matched, accounting, charged) = cursor
+                .find_at(start, SearchLimits::unlimited())
+                .expect("retained prefix cursor search");
+            charged_work = charged_work.checked_add(charged).unwrap();
+            prefix_candidates = prefix_candidates
+                .checked_add(accounting.actual.prefix_candidates)
+                .unwrap();
+            calls = calls.checked_add(1).unwrap();
+            let Some(span) = matched else {
+                break;
+            };
+            start = span.1;
+            spans.push(span);
+        }
+        (spans, charged_work, prefix_candidates, calls)
+    }
+
+    #[test]
+    fn retained_cursor_joint_stream_work_is_linear_for_dense_matches() {
+        let class = [(b'0', b'9')];
+        for preferred_alternative in 0..2 {
+            let plan = if preferred_alternative == 0 {
+                PrefixClassAlternationPlan::build(
+                    [b"ab", b"xy"],
+                    [class.into_iter(), class.into_iter()],
+                    BuildLimits::unlimited(),
+                )
+                .unwrap()
+            } else {
+                PrefixClassAlternationPlan::build(
+                    [b"xy", b"ab"],
+                    [class.into_iter(), class.into_iter()],
+                    BuildLimits::unlimited(),
+                )
+                .unwrap()
+            };
+            let mut observations = Vec::new();
+            for repetitions in [64_usize, 128, 256] {
+                let haystack = b"ab0!".repeat(repetitions);
+                let baseline = plan
+                    .find_in(
+                        &haystack,
+                        Window::full(&haystack),
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap()
+                    .1;
+                let (spans, charged_work, candidates, calls) =
+                    retained_cursor_spans(&plan, &haystack);
+                assert_eq!(repetitions, spans.len());
+                assert_eq!(repetitions, candidates);
+                assert_eq!(repetitions + 1, calls);
+                assert_eq!(baseline.upper_bounds.work, charged_work);
+                assert!(spans
+                    .iter()
+                    .enumerate()
+                    .all(|(index, span)| *span == (4 * index, 4 * index + 3)));
+                let fixed = baseline
+                    .upper_bounds
+                    .work
+                    .checked_sub(16 * haystack.len())
+                    .unwrap();
+                observations.push((haystack.len(), charged_work, fixed));
+            }
+            let fixed = observations[0].2;
+            assert!(observations.iter().all(|observation| observation.2 == fixed));
+            assert_eq!(
+                2 * (observations[0].1 - fixed),
+                observations[1].1 - fixed,
+            );
+            assert_eq!(
+                4 * (observations[0].1 - fixed),
+                observations[2].1 - fixed,
+            );
+        }
+    }
+
+    #[test]
+    fn retained_cursor_inverse_stream_and_dense_rejections_are_linear() {
+        let digits = [(b'0', b'9')];
+        let letters = [(b'A', b'Z')];
+        let plan = PrefixClassAlternationPlan::build(
+            [b"ab", b"xy"],
+            [digits.into_iter(), letters.into_iter()],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+
+        let inverse = b"xyA!".repeat(96);
+        let (spans, charged_work, candidates, calls) = retained_cursor_spans(&plan, &inverse);
+        assert_eq!(96, spans.len());
+        assert_eq!(96, candidates);
+        assert_eq!(97, calls);
+        let inverse_upper = plan
+            .find_in(
+                &inverse,
+                Window::full(&inverse),
+                SearchLimits::unlimited(),
+            )
+            .unwrap()
+            .1
+            .upper_bounds;
+        assert_eq!(inverse_upper.work, charged_work);
+
+        let mut rejected = b"abx!".repeat(512);
+        rejected.extend_from_slice(b"ab7!");
+        let mut cursor = plan.search_cursor(&rejected);
+        let (late, accounting, first_charge) = cursor
+            .find_at(0, SearchLimits::unlimited())
+            .expect("dense rejection search");
+        assert_eq!(Some((2048, 2051)), late);
+        assert_eq!(513, accounting.actual.prefix_candidates);
+        assert_eq!(514, accounting.actual.class_bytes);
+        assert_eq!(accounting.upper_bounds.work, first_charge);
+        let (terminal, _, continuation_charge) = cursor
+            .find_at(2051, SearchLimits::unlimited())
+            .expect("dense rejection terminal search");
+        assert_eq!(None, terminal);
+        assert_eq!(0, continuation_charge);
+    }
+
+    #[test]
+    fn retained_cursor_preserves_equal_start_priority_and_retry() {
+        let plan = PrefixClassAlternationPlan::build(
+            [b"abcd", b"ab"],
+            [
+                [(b'x', b'x')].into_iter(),
+                [(b'c', b'c')].into_iter(),
+            ],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+
+        let accepted = b"abcdxxx!abcd!";
+        let mut accepted_cursor = plan.search_cursor(accepted);
+        let (first, first_accounting, first_charge) = accepted_cursor
+            .find_at(0, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(Some((0, 7)), first);
+        assert_eq!(1, first_accounting.actual.prefix_candidates);
+        assert!(first_charge > 0);
+        let (second, second_accounting, second_charge) = accepted_cursor
+            .find_at(7, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(Some((8, 11)), second);
+        assert_eq!(2, second_accounting.actual.prefix_candidates);
+        assert_eq!(0, second_charge);
+
+        let rejected = b"abcd!";
+        let mut rejected_cursor = plan.search_cursor(rejected);
+        let (retried, accounting, _) = rejected_cursor
+            .find_at(0, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(Some((0, 3)), retried);
+        assert_eq!(2, accounting.actual.prefix_candidates);
+    }
+
+    #[test]
+    fn retained_cursor_window_resets_and_failures_are_atomic() {
+        let plan = plan();
+        let haystack = b"!!aba!abzz!xy7!aba!";
+        let full = Window::full(haystack);
+        let baseline = plan
+            .find_in(haystack, full, SearchLimits::unlimited())
+            .unwrap();
+        let exact = SearchLimits {
+            max_work_upper_bound: u64::try_from(baseline.1.upper_bounds.work).unwrap(),
+            max_scratch_bytes: baseline.1.upper_bounds.scratch_bytes,
+        };
+        let mut cursor = plan.search_cursor(haystack);
+        let initial = cursor.state;
+        let one_below = SearchLimits {
+            max_work_upper_bound: exact.max_work_upper_bound - 1,
+            ..exact
+        };
+        assert!(cursor.find_window(full, one_below).is_err());
+        assert_eq!(initial, cursor.state);
+        assert!(cursor
+            .find_window_with_late_failure(full, exact)
+            .is_err());
+        assert_eq!(initial, cursor.state);
+
+        let (first, _, first_charge) = cursor.find_window(full, exact).unwrap();
+        assert_eq!(baseline.0, first);
+        assert_eq!(baseline.1.upper_bounds.work, first_charge);
+        let first = first.unwrap();
+        let continuation = Window::new(first.1, haystack.len());
+        let continuation_baseline = plan
+            .find_in(haystack, continuation, SearchLimits::unlimited())
+            .unwrap();
+        let continuation_exact = SearchLimits {
+            max_work_upper_bound: u64::try_from(continuation_baseline.1.upper_bounds.work).unwrap(),
+            max_scratch_bytes: continuation_baseline.1.upper_bounds.scratch_bytes,
+        };
+        let before_retry = cursor.state;
+        assert!(cursor
+            .find_window(
+                continuation,
+                SearchLimits {
+                    max_work_upper_bound: continuation_exact.max_work_upper_bound - 1,
+                    ..continuation_exact
+                },
+            )
+            .is_err());
+        assert_eq!(before_retry, cursor.state);
+        assert!(cursor
+            .find_window_with_late_failure(continuation, continuation_exact)
+            .is_err());
+        assert_eq!(before_retry, cursor.state);
+        let (second, _, second_charge) = cursor
+            .find_window(continuation, continuation_exact)
+            .unwrap();
+        assert_eq!(continuation_baseline.0, second);
+        assert_eq!(0, second_charge);
+
+        let skipped = Window::new(second.unwrap().1 + 1, haystack.len());
+        let expected_skipped = plan
+            .find_in(haystack, skipped, SearchLimits::unlimited())
+            .unwrap()
+            .0;
+        let (actual_skipped, _, reset_charge) = cursor
+            .find_window(skipped, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(expected_skipped, actual_skipped);
+        assert!(reset_charge > 0);
+
+        let shortened = Window::new(skipped.start(), haystack.len() - 1);
+        let expected_shortened = plan
+            .find_in(haystack, shortened, SearchLimits::unlimited())
+            .unwrap()
+            .0;
+        let (actual_shortened, _, end_reset_charge) = cursor
+            .find_window(shortened, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(expected_shortened, actual_shortened);
+        assert!(end_reset_charge > 0);
+    }
+
+    #[test]
+    fn retained_cursor_binding_is_plan_local_and_source_local() {
+        let digits = PrefixClassAlternationPlan::build(
+            [b"ab", b"xy"],
+            [
+                [(b'0', b'9')].into_iter(),
+                [(b'0', b'9')].into_iter(),
+            ],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let letters = PrefixClassAlternationPlan::build(
+            [b"ab", b"xy"],
+            [
+                [(b'A', b'Z')].into_iter(),
+                [(b'A', b'Z')].into_iter(),
+            ],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let mut haystack = b"!ab12!xyQ!".to_vec();
+        let address = haystack.as_ptr();
+        {
+            let mut digit_cursor = digits.search_cursor(&haystack);
+            let mut letter_cursor = letters.search_cursor(&haystack);
+            assert_eq!(digit_cursor.haystack().as_ptr(), letter_cursor.haystack().as_ptr());
+            assert_eq!(Some((1, 5)), digit_cursor.find_at(0, SearchLimits::unlimited()).unwrap().0);
+            assert_eq!(Some((6, 9)), letter_cursor.find_at(0, SearchLimits::unlimited()).unwrap().0);
+        }
+
+        haystack[3..5].copy_from_slice(b"AZ");
+        haystack[8] = b'7';
+        assert_eq!(address, haystack.as_ptr());
+        let mut digit_cursor = digits.search_cursor(&haystack);
+        let mut letter_cursor = letters.search_cursor(&haystack);
+        assert_eq!(Some((6, 9)), digit_cursor.find_at(0, SearchLimits::unlimited()).unwrap().0);
+        assert_eq!(Some((1, 5)), letter_cursor.find_at(0, SearchLimits::unlimited()).unwrap().0);
+    }
+
+    #[test]
+    fn dispatched_retained_cursor_matches_scalar_when_available() {
+        let dispatch = SimdDispatchContext::capture();
+        if !PrefixClassAlternationPlan::run_scanners_usable(dispatch) {
+            return;
+        }
+        let digits = [(b'0', b'9')];
+        let letters = [(b'A', b'Z')];
+        let scalar = PrefixClassAlternationPlan::build(
+            [b"ab", b"xy"],
+            [digits.into_iter(), letters.into_iter()],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let dispatched = DispatchedPrefixClassAlternationPlan::build_with_dispatch(
+            dispatch,
+            [b"ab", b"xy"],
+            [digits.into_iter(), letters.into_iter()],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let haystack = b"!ab123!xyAZ!ab9!xyQ!";
+        let expected = retained_cursor_spans(&scalar, haystack).0;
+        let upper = dispatched
+            .find_in(
+                haystack,
+                Window::full(haystack),
+                SearchLimits::unlimited(),
+            )
+            .unwrap()
+            .1
+            .upper_bounds;
+        let mut cursor = dispatched.search_cursor(haystack);
+        let mut actual = Vec::new();
+        let mut start = 0_usize;
+        let mut total_charge = 0_usize;
+        loop {
+            let (matched, accounting, charge) = cursor
+                .find_at(start, SearchLimits::unlimited())
+                .unwrap();
+            assert!(accounting.actual.prefix_candidates <= accounting.upper_bounds.prefix_candidates);
+            total_charge = total_charge.checked_add(charge).unwrap();
+            let Some(span) = matched else {
+                break;
+            };
+            start = span.1;
+            actual.push(span);
+        }
+        assert_eq!(expected, actual);
+        assert_eq!(upper.work, total_charge);
     }
 
     #[test]

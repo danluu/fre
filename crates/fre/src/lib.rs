@@ -55,7 +55,10 @@
 
 use core::fmt;
 
-use fre_kernels::FixedPredicateWord64SearchCursor;
+use fre_kernels::{
+    DispatchedPrefixClassAlternationSearchCursor, FixedPredicateWord64SearchCursor,
+    PrefixClassAlternationSearchCursor,
+};
 use memchr::{memchr, memchr2, memchr3};
 use regex_syntax::hir::{ClassBytesRange, Hir, HirKind, Look};
 
@@ -774,7 +777,7 @@ pub use unicode_word_run::{
 };
 
 /// Stable schema for facade-level explanation records.
-pub const EXPLAIN_SCHEMA_VERSION: u32 = 12;
+pub const EXPLAIN_SCHEMA_VERSION: u32 = 13;
 
 // Automatic ordinary search admits every fixed-width plan with an exact
 // one- or two-byte anchor. Construction already proves a word width of at
@@ -3308,7 +3311,9 @@ pub struct PortableFindIterAccounting {
     /// another search.
     pub suppressed_empty: usize,
     /// Sum of charged work or conservative linear terms from successful
-    /// contextual searches and UTF-8 empty-match progress.
+    /// contextual searches and UTF-8 empty-match progress. Native monotone
+    /// continuations may prepay one complete linear source envelope and then
+    /// contribute zero for covered non-overlapping restarts.
     pub work_or_linear_terms: u64,
     /// Exact byte classifications performed while advancing a text iterator
     /// to the next UTF-8 scalar boundary after a repeated empty match.
@@ -7403,15 +7408,11 @@ impl PortableRegex {
         haystack: &'h [u8],
         limits: PortableFindIterLimits,
     ) -> Result<PortableValueMatches<'r, 'h>, SearchError> {
-        let fixed_predicate_cursor = self.fixed_predicate_search_cursor(haystack);
+        let native_cursor = self.native_search_cursor(haystack);
         let session = self.search_session(limits.session)?;
         Ok(PortableValueMatches {
             session,
-            state: PortableValueMatchIterState::new(
-                haystack,
-                limits.run(),
-                fixed_predicate_cursor,
-            ),
+            state: PortableValueMatchIterState::new(haystack, limits.run(), native_cursor),
         })
     }
 
@@ -7429,7 +7430,7 @@ impl PortableRegex {
         limits: PortableFindIterLimits,
         empty_match_progress: EmptyMatchProgress,
     ) -> Result<PortableMatches<'r, 'h>, SearchError> {
-        let fixed_predicate_cursor = self.fixed_predicate_search_cursor(haystack);
+        let native_cursor = self.native_search_cursor(haystack);
         let session = self.search_session(limits.session)?;
         Ok(PortableMatches {
             session,
@@ -7437,7 +7438,7 @@ impl PortableRegex {
                 haystack,
                 limits.run(),
                 empty_match_progress,
-                fixed_predicate_cursor,
+                native_cursor,
             ),
         })
     }
@@ -8026,12 +8027,20 @@ impl PortableRegex {
         }
     }
 
-    fn fixed_predicate_search_cursor<'r, 'h>(
+    fn native_search_cursor<'r, 'h>(
         &'r self,
         haystack: &'h [u8],
-    ) -> Option<FixedPredicateWord64SearchCursor<'r, 'h>> {
+    ) -> Option<PortableNativeSearchCursor<'r, 'h>> {
         match &self.plan {
-            PortablePlan::FixedPredicateWord64(plan) => Some(plan.search_cursor(haystack)),
+            PortablePlan::FixedPredicateWord64(plan) => Some(
+                PortableNativeSearchCursor::FixedPredicate(plan.search_cursor(haystack)),
+            ),
+            PortablePlan::PrefixClassAlternation(plan) => Some(
+                PortableNativeSearchCursor::PrefixClass(plan.search_cursor(haystack)),
+            ),
+            PortablePlan::DispatchedPrefixClassAlternation(plan) => Some(
+                PortableNativeSearchCursor::DispatchedPrefixClass(plan.search_cursor(haystack)),
+            ),
             _ => None,
         }
     }
@@ -11581,10 +11590,10 @@ impl<'r> PortableSearchSession<'r> {
         haystack: &'h [u8],
         limits: PortableFindIterRunLimits,
     ) -> PortableSessionValueMatches<'s, 'r, 'h> {
-        let fixed_predicate_cursor = self.fixed_predicate_search_cursor(haystack);
+        let native_cursor = self.native_search_cursor(haystack);
         PortableSessionValueMatches {
             session: self,
-            state: PortableValueMatchIterState::new(haystack, limits, fixed_predicate_cursor),
+            state: PortableValueMatchIterState::new(haystack, limits, native_cursor),
         }
     }
 
@@ -11602,26 +11611,24 @@ impl<'r> PortableSearchSession<'r> {
         limits: PortableFindIterRunLimits,
         empty_match_progress: EmptyMatchProgress,
     ) -> PortableSessionMatches<'s, 'r, 'h> {
-        let fixed_predicate_cursor = self.fixed_predicate_search_cursor(haystack);
+        let native_cursor = self.native_search_cursor(haystack);
         PortableSessionMatches {
             session: self,
             state: PortableMatchIterState::new(
                 haystack,
                 limits,
                 empty_match_progress,
-                fixed_predicate_cursor,
+                native_cursor,
             ),
         }
     }
 
-    fn fixed_predicate_search_cursor<'h>(
+    fn native_search_cursor<'h>(
         &self,
         haystack: &'h [u8],
-    ) -> Option<FixedPredicateWord64SearchCursor<'r, 'h>> {
+    ) -> Option<PortableNativeSearchCursor<'r, 'h>> {
         match &self.plan {
-            PortableSearchSessionPlan::Native(regex) => {
-                regex.fixed_predicate_search_cursor(haystack)
-            }
+            PortableSearchSessionPlan::Native(regex) => regex.native_search_cursor(haystack),
             PortableSearchSessionPlan::K0 { .. } => None,
         }
     }
@@ -11728,12 +11735,65 @@ pub struct PortableSessionValueMatches<'s, 'r, 'h> {
     state: PortableValueMatchIterState<'r, 'h>,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum PortableNativeSearchCursor<'r, 'h> {
+    FixedPredicate(FixedPredicateWord64SearchCursor<'r, 'h>),
+    PrefixClass(PrefixClassAlternationSearchCursor<'r, 'h>),
+    DispatchedPrefixClass(DispatchedPrefixClassAlternationSearchCursor<'r, 'h>),
+}
+
+impl PortableNativeSearchCursor<'_, '_> {
+    fn find_at(
+        &mut self,
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<(Option<Match>, u64), SearchError> {
+        match self {
+            Self::FixedPredicate(cursor) => {
+                let (matched, accounting) = cursor
+                    .find_at(start, fixed_predicate_word64_search_limits(limits))
+                    .map_err(SearchError::from)?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    accounting.actual.work,
+                ))
+            }
+            Self::PrefixClass(cursor) => {
+                let (matched, _accounting, prepaid_work) = cursor
+                    .find_at(start, prefix_class_alternation_search_limits(limits))
+                    .map_err(SearchError::from)?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    u64::try_from(prepaid_work).unwrap_or(u64::MAX),
+                ))
+            }
+            Self::DispatchedPrefixClass(cursor) => {
+                let (matched, _accounting, prepaid_work) = cursor
+                    .find_at(start, prefix_class_alternation_search_limits(limits))
+                    .map_err(SearchError::from)?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    u64::try_from(prepaid_work).unwrap_or(u64::MAX),
+                ))
+            }
+        }
+    }
+
+    fn find_at_value(
+        &mut self,
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<Option<Match>, SearchError> {
+        self.find_at(start, limits).map(|(matched, _work)| matched)
+    }
+}
+
 #[derive(Debug)]
 enum PortableMatchIterState<'r, 'h> {
     General(PortableMatchIterCore<'h>),
-    FixedPredicate {
+    Native {
         core: PortableMatchIterCore<'h>,
-        cursor: FixedPredicateWord64SearchCursor<'r, 'h>,
+        cursor: PortableNativeSearchCursor<'r, 'h>,
     },
 }
 
@@ -11758,9 +11818,9 @@ enum EmptyMatchProgress {
 #[derive(Debug)]
 enum PortableValueMatchIterState<'r, 'h> {
     General(PortableValueMatchIterCore<'h>),
-    FixedPredicate {
+    Native {
         core: PortableValueMatchIterCore<'h>,
-        cursor: FixedPredicateWord64SearchCursor<'r, 'h>,
+        cursor: PortableNativeSearchCursor<'r, 'h>,
     },
 }
 
@@ -11875,11 +11935,11 @@ impl<'r, 'h> PortableValueMatchIterState<'r, 'h> {
     const fn new(
         haystack: &'h [u8],
         limits: PortableFindIterRunLimits,
-        fixed_predicate_cursor: Option<FixedPredicateWord64SearchCursor<'r, 'h>>,
+        native_cursor: Option<PortableNativeSearchCursor<'r, 'h>>,
     ) -> Self {
         let core = PortableValueMatchIterCore::new(haystack, limits);
-        match fixed_predicate_cursor {
-            Some(cursor) => Self::FixedPredicate { core, cursor },
+        match native_cursor {
+            Some(cursor) => Self::Native { core, cursor },
             None => Self::General(core),
         }
     }
@@ -11892,14 +11952,9 @@ impl<'r, 'h> PortableValueMatchIterState<'r, 'h> {
             Self::General(core) => core.next_match_with(|source, start, limits| {
                 session.find_iter_value_at(source, start, limits)
             }),
-            Self::FixedPredicate { core, cursor } => {
+            Self::Native { core, cursor } => {
                 core.next_match_with(|_source, start, limits| {
-                    cursor
-                        .find_at(start, fixed_predicate_word64_search_limits(limits))
-                        .map(|(matched, _accounting)| {
-                            matched.map(|(start, end)| Match { start, end })
-                        })
-                        .map_err(SearchError::from)
+                    cursor.find_at_value(start, limits)
                 })
             }
         }
@@ -12114,25 +12169,25 @@ impl<'r, 'h> PortableMatchIterState<'r, 'h> {
         haystack: &'h [u8],
         limits: PortableFindIterRunLimits,
         empty_match_progress: EmptyMatchProgress,
-        fixed_predicate_cursor: Option<FixedPredicateWord64SearchCursor<'r, 'h>>,
+        native_cursor: Option<PortableNativeSearchCursor<'r, 'h>>,
     ) -> Self {
         let core = PortableMatchIterCore::new(haystack, limits, empty_match_progress);
-        match fixed_predicate_cursor {
-            Some(cursor) => Self::FixedPredicate { core, cursor },
+        match native_cursor {
+            Some(cursor) => Self::Native { core, cursor },
             None => Self::General(core),
         }
     }
 
     const fn core(&self) -> &PortableMatchIterCore<'h> {
         match self {
-            Self::General(core) | Self::FixedPredicate { core, .. } => core,
+            Self::General(core) | Self::Native { core, .. } => core,
         }
     }
 
     #[cfg(test)]
     fn core_mut(&mut self) -> &mut PortableMatchIterCore<'h> {
         match self {
-            Self::General(core) | Self::FixedPredicate { core, .. } => core,
+            Self::General(core) | Self::Native { core, .. } => core,
         }
     }
 
@@ -12146,7 +12201,13 @@ impl<'r, 'h> PortableMatchIterState<'r, 'h> {
 
     #[cfg(test)]
     const fn is_fixed_predicate(&self) -> bool {
-        matches!(self, Self::FixedPredicate { .. })
+        matches!(
+            self,
+            Self::Native {
+                cursor: PortableNativeSearchCursor::FixedPredicate(_),
+                ..
+            }
+        )
     }
 
     fn next_match(
@@ -12157,16 +12218,8 @@ impl<'r, 'h> PortableMatchIterState<'r, 'h> {
             Self::General(core) => core.next_match_with(|source, start, limits| {
                 session.find_iter_at(source, start, limits)
             }),
-            Self::FixedPredicate { core, cursor } => {
-                core.next_match_with(|_source, start, limits| {
-                    let (matched, accounting) = cursor
-                        .find_at(start, fixed_predicate_word64_search_limits(limits))
-                        .map_err(SearchError::from)?;
-                    Ok((
-                        matched.map(|(start, end)| Match { start, end }),
-                        accounting.actual.work,
-                    ))
-                })
+            Self::Native { core, cursor } => {
+                core.next_match_with(|_source, start, limits| cursor.find_at(start, limits))
             }
         }
     }
@@ -12462,7 +12515,10 @@ mod tests {
         BYTE_SET_BLOCK_BYTES,
     };
     use fre_automata::{MandatoryCutAnalysisLimits, MaximumConsumedDistance};
-    use fre_kernels::{BoundedLiteralClassRunPlan, FixedPredicateWord64SearchCursor};
+    use fre_kernels::{
+        BoundedLiteralClassRunPlan, DispatchedPrefixClassAlternationSearchCursor,
+        FixedPredicateWord64SearchCursor, PrefixClassAlternationSearchCursor,
+    };
     use fre_lower::UnsupportedFeature;
     use std::fmt::Write as _;
 
@@ -15184,9 +15240,14 @@ mod tests {
     }
 
     #[test]
-    fn fixed_predicate_iterator_cursor_has_a_bounded_inline_layout() {
+    fn native_iterator_cursors_have_a_bounded_inline_layout() {
         let word = core::mem::size_of::<usize>();
         let cursor = core::mem::size_of::<FixedPredicateWord64SearchCursor<'static, 'static>>();
+        let prefix_cursor =
+            core::mem::size_of::<PrefixClassAlternationSearchCursor<'static, 'static>>();
+        let dispatched_prefix_cursor = core::mem::size_of::<
+            DispatchedPrefixClassAlternationSearchCursor<'static, 'static>,
+        >();
         let state = core::mem::size_of::<super::PortableMatchIterState<'static, 'static>>();
         let general = core::mem::size_of::<super::PortableMatchIterCore<'static>>();
         let source_cursor = core::mem::size_of::<fre_automata::K0SpanSourceCursor<'static>>();
@@ -15196,6 +15257,14 @@ mod tests {
             core::mem::align_of::<usize>()
         );
         assert!(cursor <= 10 * word, "cursor grew to {cursor} bytes");
+        assert!(
+            prefix_cursor <= 10 * word,
+            "prefix cursor grew to {prefix_cursor} bytes"
+        );
+        assert!(
+            dispatched_prefix_cursor <= 10 * word,
+            "dispatched prefix cursor grew to {dispatched_prefix_cursor} bytes"
+        );
         assert!(
             state >= cursor + source_cursor,
             "fixed iterator variant lost one of its two independent source cursors"

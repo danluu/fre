@@ -508,6 +508,10 @@ pub use prefix_class_alternation::{
     UniformParticipationResult as PrefixClassUniformParticipationResult,
     UniformParticipationSchema as PrefixClassUniformParticipationSchema,
 };
+#[doc(hidden)]
+pub use prefix_class_alternation::{
+    DispatchedPrefixClassAlternationSearchCursor, PrefixClassAlternationSearchCursor,
+};
 pub use required_internal_anchor::{
     BuildAccounting as RequiredInternalAnchorBuildAccounting,
     BuildError as RequiredInternalAnchorBuildError,

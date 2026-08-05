@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
 
 use fre::{
-    BuildError, BuildLimits, PlanKind, PlanSelection, PortableBuilder, PortableFindIterLimits,
-    PortableFindIterRunLimits, SearchAccounting, SearchError, SearchLimits, SearchSessionLimits,
-    SearchWindow,
+    BuildError, BuildLimits, PlanKind, PlanSelection, PortableBuilder, PortableFindIterError,
+    PortableFindIterLimits, PortableFindIterRunLimits, SearchAccounting, SearchError, SearchLimits,
+    SearchSessionLimits, SearchWindow,
 };
 use fre_kernels::{
     DispatchedPrefixClassAlternationPlan as KernelDispatchedPlan,
@@ -678,6 +678,76 @@ fn accounting_iterator_and_native_session_observe_same_address_mutation() {
     let accounting = matches.accounting();
     assert_eq!(0, accounting.matches);
     assert_eq!(1, accounting.search_calls);
+}
+
+#[test]
+fn native_iterator_prepays_one_affine_joint_stream_envelope() {
+    for pattern in [r"(?:ab[0-9]+|xy[A-Z]+)", r"(?:xy[A-Z]+|ab[0-9]+)"] {
+        let actual = automatic(pattern);
+        let mut observations = Vec::new();
+        for repetitions in [64_usize, 128, 256] {
+            let haystack = b"ab0!".repeat(repetitions);
+            let (_, baseline) = actual
+                .find(&haystack, SearchLimits::unlimited())
+                .expect("ordinary prefix/class baseline");
+            let SearchAccounting::PrefixClassAlternation(baseline) = baseline else {
+                panic!("prefix/class baseline accounting was not selected")
+            };
+            let mut matches = actual
+                .find_iter(&haystack, PortableFindIterLimits::unlimited())
+                .expect("retained prefix/class iterator");
+            let spans = matches
+                .by_ref()
+                .collect::<Result<Vec<_>, _>>()
+                .expect("retained prefix/class matches");
+            assert_eq!(repetitions, spans.len());
+            assert!(spans.iter().enumerate().all(|(index, matched)| {
+                (matched.start(), matched.end()) == (4 * index, 4 * index + 3)
+            }));
+            let accounting = matches.accounting();
+            assert_eq!(repetitions + 1, accounting.search_calls);
+            assert_eq!(repetitions, accounting.matches);
+            assert_eq!(
+                u64::try_from(baseline.upper_bounds.work).unwrap(),
+                accounting.work_or_linear_terms,
+            );
+            observations.push(accounting.work_or_linear_terms);
+
+            let value_spans = actual
+                .find_iter_value(&haystack, PortableFindIterLimits::unlimited())
+                .expect("retained value iterator")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("retained value matches");
+            assert_eq!(spans, value_spans);
+        }
+        let first_delta = observations[1].checked_sub(observations[0]).unwrap();
+        let second_delta = observations[2].checked_sub(observations[1]).unwrap();
+        assert_eq!(2 * first_delta, second_delta);
+    }
+}
+
+#[test]
+fn native_iterator_search_call_limit_stays_exact_with_retained_streams() {
+    let actual = automatic(r"(?:ab[0-9]+|xy[A-Z]+)");
+    let haystack = b"ab0!ab1!ab2!";
+    let limits = PortableFindIterLimits {
+        session: SearchSessionLimits::unlimited(),
+        search: SearchLimits::unlimited(),
+        max_search_calls: 3,
+    };
+    let mut matches = actual.find_iter(haystack, limits).unwrap();
+    for expected in [(0, 3), (4, 7), (8, 11)] {
+        let matched = matches.next().unwrap().unwrap();
+        assert_eq!(expected, (matched.start(), matched.end()));
+    }
+    assert_eq!(
+        Some(Err(PortableFindIterError::SearchCallLimit {
+            needed: 4,
+            limit: 3,
+        })),
+        matches.next(),
+    );
+    assert_eq!(None, matches.next());
 }
 
 #[test]
