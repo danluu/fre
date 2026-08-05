@@ -13,6 +13,11 @@
 //! Sparse mixed-Unicode classes with multiple distinct literal-leading bytes
 //! first scan their union, then verify the one literal bound to the observed
 //! root.
+//! Existence and earliest-end projections prove an exact literal with only
+//! its immediately preceding and following class scalars. Earliest-end keeps
+//! the best accepting end while scanning every later literal start that can
+//! still beat it. Selected-span and aggregate operations retain maximal-run
+//! recovery because their observable result is the complete greedy run.
 //! Dense false-root samples, or repeated exact roots whose complete class runs
 //! prove non-accepting, certify a fallback boundary and resume the incumbent
 //! independent `memmem` streams after the proved prefix. Other plans use
@@ -394,6 +399,7 @@ enum SearchProjection {
 struct UnionCandidate {
     start: usize,
     matching_mask: u16,
+    shortest_index: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1050,7 +1056,9 @@ impl ReverseInnerPlan {
         }
     }
 
-    /// Publish the source-free full-window envelope.
+    /// Publish the source-free reduction and selected-search full-window
+    /// envelope. Adaptive-union existence and earliest-end receipts add their
+    /// adjacent-scalar proof envelope before checking search limits.
     pub fn full_window_upper_bounds(
         &self,
         input_bytes: usize,
@@ -1194,7 +1202,7 @@ impl ReverseInnerPlan {
         projection: SearchProjection,
         operation: Operation,
     ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
-        let upper = self.search_preflight(haystack, window, limits)?;
+        let upper = self.search_preflight(haystack, window, limits, projection)?;
         let (matched, actual) = self.execute_search(haystack, window, projection, upper)?;
         debug_assert!(matches!(
             (projection, operation),
@@ -1218,6 +1226,7 @@ impl ReverseInnerPlan {
         haystack: &[u8],
         window: Window,
         limits: SearchLimits,
+        projection: SearchProjection,
     ) -> Result<ReduceUpperBounds, SearchError> {
         if window.start() > window.end() || window.end() > haystack.len() {
             return Err(ReduceError::InvalidWindow {
@@ -1233,7 +1242,14 @@ impl ReverseInnerPlan {
                 .ok_or(ReduceError::ArithmeticOverflow {
                     computation: "search window byte length",
                 })?;
-        let upper = derive_upper_bounds(self.build, &self.finders, input_bytes)?;
+        let mut upper = derive_upper_bounds(self.build, &self.finders, input_bytes)?;
+        if self.build.adaptive_union && projection != SearchProjection::Selected {
+            expand_union_endpoint_upper_bounds(
+                &mut upper,
+                input_bytes,
+                self.build.retained_non_ascii_ranges,
+            )?;
+        }
         let work_upper_bound = u64::try_from(upper.work).unwrap_or(u64::MAX);
         if work_upper_bound > limits.max_work_upper_bound {
             return Err(ReduceError::WorkLimit {
@@ -1401,7 +1417,8 @@ impl ReverseInnerPlan {
         &self,
         haystack: &[u8],
         mut scan_start: usize,
-        ceiling: usize,
+        scan_ceiling: usize,
+        verification_ceiling: usize,
         actual: &mut ReduceActualCounters,
     ) -> Result<UnionNext, ReduceError> {
         let state = self
@@ -1412,8 +1429,8 @@ impl ReverseInnerPlan {
                 upper: 1,
             })?;
         let mut previous_scanned_through = scan_start;
-        while scan_start < ceiling {
-            let source = haystack.get(scan_start..ceiling).ok_or(
+        while scan_start < scan_ceiling {
+            let source = haystack.get(scan_start..scan_ceiling).ok_or(
                 ReduceError::ArithmeticOverflow {
                     computation: "literal-union scan window",
                 },
@@ -1473,6 +1490,7 @@ impl ReverseInnerPlan {
             )?;
 
             let mut matching_mask = 0_u16;
+            let mut shortest = None::<(usize, usize)>;
             let mut verification_work = 0_usize;
             let mut unchecked_mask = candidate_mask;
             while unchecked_mask != 0 {
@@ -1511,7 +1529,7 @@ impl ReverseInnerPlan {
                         computation: "literal-union verification end",
                     },
                 )?;
-                if candidate_end > ceiling {
+                if candidate_end > verification_ceiling {
                     continue;
                 }
                 let candidate = haystack.get(candidate_start..candidate_end).ok_or(
@@ -1536,10 +1554,31 @@ impl ReverseInnerPlan {
                 )?;
                 if candidate == needle {
                     matching_mask |= bit;
+                    // Simultaneously exact needles at one start are identical
+                    // through the shorter length. The shortest therefore has
+                    // the earliest possible following-scalar endpoint; source
+                    // order remains the tie-break because masks are ascending.
+                    let replace_shortest = shortest
+                        .is_none_or(|(_, old_length)| needle.len() < old_length);
+                    if replace_shortest {
+                        shortest = Some((index, needle.len()));
+                    }
                 }
             }
 
             if matching_mask != 0 {
+                let (shortest_index, _) = shortest.ok_or(
+                    ReduceError::AccountingInvariant {
+                        resource: "literal-union shortest exact candidate",
+                        actual: 0,
+                        upper: 1,
+                    },
+                )?;
+                let shortest_index = u8::try_from(shortest_index).map_err(|_| {
+                    ReduceError::ArithmeticOverflow {
+                        computation: "literal-union shortest candidate index",
+                    }
+                })?;
                 actual.union_exact_candidates = checked_add_reduce(
                     actual.union_exact_candidates,
                     1,
@@ -1558,6 +1597,7 @@ impl ReverseInnerPlan {
                 return Ok(UnionNext::Candidate(UnionCandidate {
                     start: candidate_start,
                     matching_mask,
+                    shortest_index,
                 }));
             }
 
@@ -1608,6 +1648,7 @@ impl ReverseInnerPlan {
             let candidate = match self.next_union_candidate(
                 haystack,
                 cursor,
+                window.end(),
                 window.end(),
                 &mut actual,
             )? {
@@ -1983,7 +2024,17 @@ impl ReverseInnerPlan {
             ..ReduceActualCounters::default()
         };
         if self.union_state().is_some() {
-            self.execute_union_search(haystack, window, projection, upper, actual)
+            if projection == SearchProjection::Selected {
+                self.execute_union_search(haystack, window, projection, upper, actual)
+            } else {
+                self.execute_union_endpoint_search(
+                    haystack,
+                    window,
+                    projection,
+                    upper,
+                    actual,
+                )
+            }
         } else {
             self.execute_independent_search_from(
                 haystack,
@@ -1993,6 +2044,216 @@ impl ReverseInnerPlan {
                 window.start(),
                 actual,
             )
+        }
+    }
+
+    fn prove_union_endpoint_candidate(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        candidate: UnionCandidate,
+        actual: &mut ReduceActualCounters,
+    ) -> Result<Option<(usize, usize)>, SearchError> {
+        if candidate.start <= window.start() {
+            return Ok(None);
+        }
+        // Admission proves every ASCII literal scalar belongs to the class.
+        // Only the scalar immediately on each side remains to be proved; no
+        // byte elsewhere in the surrounding maximal run can affect these
+        // endpoint projections.
+        let preceding = decode_previous_scalar(haystack, window.start(), candidate.start)?;
+        charge_decode(preceding.byte_checks, actual)?;
+        let Some(preceding_scalar) = preceding.scalar else {
+            return Ok(None);
+        };
+        if preceding.width == 0 || !self.contains(preceding_scalar, actual)? {
+            return Ok(None);
+        }
+
+        let shortest_index = usize::from(candidate.shortest_index);
+        let finder = self.finders.get(shortest_index).ok_or(
+            ReduceError::AccountingInvariant {
+                resource: "literal-union endpoint finder",
+                actual: u64::try_from(shortest_index).unwrap_or(u64::MAX),
+                upper: u64::try_from(self.finders.len()).unwrap_or(u64::MAX),
+            },
+        )?;
+        let literal_end = candidate
+            .start
+            .checked_add(finder.needle().len())
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "literal-union endpoint literal end",
+            })?;
+        if literal_end >= window.end() {
+            return Ok(None);
+        }
+        let following_bytes = haystack.get(literal_end..window.end()).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "literal-union endpoint following window",
+            },
+        )?;
+        let following = decode_scalar(following_bytes);
+        charge_decode(following.byte_checks, actual)?;
+        let Some(following_scalar) = following.scalar else {
+            return Ok(None);
+        };
+        if following.width == 0 || !self.contains(following_scalar, actual)? {
+            return Ok(None);
+        }
+
+        let start = candidate.start.checked_sub(preceding.width).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "literal-union endpoint accepting start",
+            },
+        )?;
+        let end = literal_end.checked_add(following.width).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "literal-union endpoint accepting end",
+            },
+        )?;
+        Ok(Some((start, end)))
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the fallback preserves the checked window, projection, retained endpoint, and cumulative accounting"
+    )]
+    fn execute_union_endpoint_fallback(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        projection: SearchProjection,
+        upper: ReduceUpperBounds,
+        resume_start: usize,
+        best: Option<(usize, usize)>,
+        actual: ReduceActualCounters,
+    ) -> Result<(Option<(usize, usize)>, ReduceActualCounters), SearchError> {
+        let (fallback, actual) = self.execute_independent_search_from(
+            haystack,
+            window,
+            projection,
+            upper,
+            resume_start,
+            actual,
+        )?;
+        let selected = match (best, fallback) {
+            (Some(old), Some(new)) => Some(if (new.1, new.0) < (old.1, old.0) {
+                new
+            } else {
+                old
+            }),
+            (Some(old), None) => Some(old),
+            (None, Some(new)) => Some(new),
+            (None, None) => None,
+        };
+        if fallback.is_some() {
+            finish_search_execution(selected, actual, upper)
+        } else {
+            finish_union_endpoint_execution(selected, actual, upper)
+        }
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the monotone endpoint proof, earliest-end cutoff, and certified fallback remain adjacent"
+    )]
+    fn execute_union_endpoint_search(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        projection: SearchProjection,
+        upper: ReduceUpperBounds,
+        mut actual: ReduceActualCounters,
+    ) -> Result<(Option<(usize, usize)>, ReduceActualCounters), SearchError> {
+        debug_assert!(projection != SearchProjection::Selected);
+        let mut cursor = window.start();
+        let mut best = None::<(usize, usize)>;
+        let mut unproductive_candidate_samples = 0_usize;
+        loop {
+            let ceiling = best.map_or(window.end(), |(_, end)| end);
+            if cursor >= ceiling {
+                return finish_union_endpoint_execution(best, actual, upper);
+            }
+            let candidate = match self.next_union_candidate(
+                haystack,
+                cursor,
+                ceiling,
+                window.end(),
+                &mut actual,
+            )? {
+                UnionNext::Candidate(candidate) => candidate,
+                UnionNext::Exhausted => {
+                    return finish_union_endpoint_execution(best, actual, upper);
+                }
+                UnionNext::DenseFallback { resume_start } => {
+                    return self.execute_union_endpoint_fallback(
+                        haystack,
+                        window,
+                        projection,
+                        upper,
+                        resume_start,
+                        best,
+                        actual,
+                    );
+                }
+            };
+            let resume_start = candidate.start.checked_add(1).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "literal-union endpoint overlapping progress",
+                },
+            )?;
+            let proved = self.prove_union_endpoint_candidate(
+                haystack,
+                window,
+                candidate,
+                &mut actual,
+            )?;
+            if let Some(matched) = proved {
+                if projection == SearchProjection::Exists {
+                    return finish_union_endpoint_execution(Some(matched), actual, upper);
+                }
+                best = Some(best.map_or(matched, |old| {
+                    if (matched.1, matched.0) < (old.1, old.0) {
+                        matched
+                    } else {
+                        old
+                    }
+                }));
+                unproductive_candidate_samples = 0;
+                cursor = resume_start;
+                continue;
+            }
+
+            unproductive_candidate_samples = checked_add_reduce(
+                unproductive_candidate_samples,
+                1,
+                "literal-union endpoint unproductive candidate samples",
+            )?;
+            if unproductive_candidate_samples
+                < UNION_PROVED_RUN_SAMPLES_BEFORE_FALLBACK
+            {
+                cursor = resume_start;
+                continue;
+            }
+            actual.union_fallbacks = checked_add_reduce(
+                actual.union_fallbacks,
+                1,
+                "literal-union endpoint proof fallbacks",
+            )?;
+            actual.work = checked_add_reduce(
+                actual.work,
+                UNION_FALLBACK_WORK,
+                "literal-union endpoint proof fallback work",
+            )?;
+            return self.execute_union_endpoint_fallback(
+                haystack,
+                window,
+                projection,
+                upper,
+                resume_start,
+                best,
+                actual,
+            );
         }
     }
 
@@ -2014,6 +2275,7 @@ impl ReverseInnerPlan {
             let candidate = match self.next_union_candidate(
                 haystack,
                 cursor,
+                window.end(),
                 window.end(),
                 &mut actual,
             )? {
@@ -2739,6 +3001,68 @@ fn derive_upper_bounds(
     })
 }
 
+fn expand_union_endpoint_upper_bounds(
+    upper: &mut ReduceUpperBounds,
+    input_bytes: usize,
+    retained_non_ascii_ranges: usize,
+) -> Result<(), ReduceError> {
+    // Every exact union root can inspect at most one previous scalar (eight
+    // byte checks) and one following scalar (four byte checks). The complete
+    // independent envelope remains available for a certified fallback, so
+    // these endpoint probes are conservatively additive.
+    let endpoint_decode_byte_checks = input_bytes.checked_mul(12).ok_or(
+        ReduceError::ArithmeticOverflow {
+            computation: "literal-union endpoint decode byte-check bound",
+        },
+    )?;
+    let endpoint_membership_tests = input_bytes.checked_mul(2).ok_or(
+        ReduceError::ArithmeticOverflow {
+            computation: "literal-union endpoint membership-test bound",
+        },
+    )?;
+    let comparisons_per_membership =
+        binary_search_comparison_bound(retained_non_ascii_ranges).max(1);
+    let endpoint_range_comparisons = endpoint_membership_tests
+        .checked_mul(comparisons_per_membership)
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "literal-union endpoint range-comparison bound",
+        })?;
+    let endpoint_work = endpoint_decode_byte_checks
+        .checked_add(
+            endpoint_membership_tests
+                .checked_mul(MEMBERSHIP_WORK)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "literal-union endpoint membership work",
+                })?,
+        )
+        .and_then(|value| value.checked_add(endpoint_range_comparisons))
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "literal-union endpoint work",
+        })?;
+
+    upper.decode_byte_checks = checked_add_reduce(
+        upper.decode_byte_checks,
+        endpoint_decode_byte_checks,
+        "search decode byte-check bound",
+    )?;
+    upper.membership_tests = checked_add_reduce(
+        upper.membership_tests,
+        endpoint_membership_tests,
+        "search membership-test bound",
+    )?;
+    upper.range_comparisons = checked_add_reduce(
+        upper.range_comparisons,
+        endpoint_range_comparisons,
+        "search range-comparison bound",
+    )?;
+    upper.work = checked_add_reduce(
+        upper.work,
+        endpoint_work,
+        "search work bound",
+    )?;
+    Ok(())
+}
+
 fn find_strict_inner_candidate(
     finder: &Finder<'_>,
     haystack: &[u8],
@@ -2904,6 +3228,27 @@ fn finish_search_execution(
         })?;
     verify_actual(actual, upper)?;
     Ok((matched, actual))
+}
+
+fn finish_union_endpoint_execution(
+    matched: Option<(usize, usize)>,
+    mut actual: ReduceActualCounters,
+    upper: ReduceUpperBounds,
+) -> Result<(Option<(usize, usize)>, ReduceActualCounters), SearchError> {
+    if matched.is_some() {
+        actual.match_events = checked_add_reduce(
+            actual.match_events,
+            1,
+            "literal-union endpoint match event count",
+        )?;
+        actual.count = 1;
+        actual.work = checked_add_reduce(
+            actual.work,
+            MATCH_WORK,
+            "literal-union endpoint match work",
+        )?;
+    }
+    finish_search_execution(matched, actual, upper)
 }
 
 fn verify<T>(resource: &'static str, actual: T, upper: T) -> Result<(), ReduceError>
@@ -3392,6 +3737,70 @@ mod tests {
     }
 
     #[test]
+    fn exhaustive_union_endpoint_languages_match_regex_oracle() {
+        fn exercise(literals: &[&[u8]], pattern: &str) {
+            fn visit(
+                depth: usize,
+                maximum: usize,
+                tokens: &[&[u8]],
+                haystack: &mut Vec<u8>,
+                plan: &ReverseInnerPlan,
+                regex: &Regex,
+            ) {
+                let expected_exists = regex.is_match(haystack);
+                let expected_shortest = regex.shortest_match(haystack);
+                let (exists, _) = plan
+                    .is_match(haystack, SearchLimits::unlimited())
+                    .expect("exhaustive endpoint existence");
+                let (shortest, _) = plan
+                    .shortest(haystack, SearchLimits::unlimited())
+                    .expect("exhaustive endpoint shortest");
+                assert_eq!(exists, expected_exists, "haystack={haystack:?}");
+                assert_eq!(shortest, expected_shortest, "haystack={haystack:?}");
+                if depth == maximum {
+                    return;
+                }
+                for token in tokens {
+                    let old_len = haystack.len();
+                    haystack.extend_from_slice(token);
+                    visit(depth + 1, maximum, tokens, haystack, plan, regex);
+                    haystack.truncate(old_len);
+                }
+            }
+
+            let ranges = [('a', 'd'), ('λ', 'λ')];
+            let plan = plan(&ranges, literals);
+            assert!(plan.build_accounting().adaptive_union);
+            let regex = oracle(pattern);
+            let tokens: [&[u8]; 8] = [
+                b"a",
+                b"b",
+                b"c",
+                b"d",
+                "λ".as_bytes(),
+                "β".as_bytes(),
+                b"\xff",
+                b"\x80",
+            ];
+            let mut haystack = Vec::new();
+            visit(0, 4, &tokens, &mut haystack, &plan, &regex);
+        }
+
+        exercise(
+            &[b"abc".as_slice(), b"b".as_slice()],
+            r"(?:[a-dλ]+abc[a-dλ]+|[a-dλ]+b[a-dλ]+)",
+        );
+        exercise(
+            &[b"a".as_slice(), b"bcd".as_slice()],
+            r"(?:[a-dλ]+a[a-dλ]+|[a-dλ]+bcd[a-dλ]+)",
+        );
+        exercise(
+            &[b"abc".as_slice(), b"ab".as_slice(), b"b".as_slice()],
+            r"(?:[a-dλ]+abc[a-dλ]+|[a-dλ]+ab[a-dλ]+|[a-dλ]+b[a-dλ]+)",
+        );
+    }
+
+    #[test]
     fn deterministic_random_bytes_match_regex_oracle() {
         let plan = plan(&SMALL_CLASS, &SMALL_LITERALS);
         let regex = oracle(SMALL_PATTERN);
@@ -3460,6 +3869,9 @@ mod tests {
                 let (found, _) = plan
                     .find_in(haystack, window, SearchLimits::unlimited())
                     .expect("window search");
+                let (exists, _) = plan
+                    .is_match_in(haystack, window, SearchLimits::unlimited())
+                    .expect("window existence search");
                 let (shortest, _) = plan
                     .shortest_in(haystack, window, SearchLimits::unlimited())
                     .expect("window shortest search");
@@ -3469,6 +3881,7 @@ mod tests {
                     "window={start}..{end}"
                 );
                 assert_eq!(found, expected_find, "find window={start}..{end}");
+                assert_eq!(exists, expected_find.is_some(), "exists window={start}..{end}");
                 assert_eq!(
                     shortest, expected_shortest,
                     "shortest window={start}..{end}"
@@ -3844,6 +4257,114 @@ mod tests {
     }
 
     #[test]
+    fn union_endpoint_proof_skips_maximal_run_recovery_and_keeps_global_shortest() {
+        let ranges = [('a', 'z'), ('λ', 'λ')];
+        let literals: [&[u8]; 2] = [b"abcdef", b"b"];
+        let plan = plan(&ranges, &literals);
+        let regex = oracle(
+            r"(?:[a-zλ]+abcdef[a-zλ]+|[a-zλ]+b[a-zλ]+)",
+        );
+        assert!(plan.build_accounting().adaptive_union);
+
+        let mut haystack = Vec::new();
+        for _ in 0..512 {
+            haystack.extend_from_slice("λ".as_bytes());
+        }
+        let literal_start = haystack.len();
+        haystack.extend_from_slice(b"abcdef");
+        for _ in 0..512 {
+            haystack.extend_from_slice("λ".as_bytes());
+        }
+
+        let (exists, exists_accounting) = plan
+            .is_match(&haystack, SearchLimits::unlimited())
+            .expect("endpoint existence");
+        assert!(exists);
+        assert_eq!(exists_accounting.actual.run_events, 0);
+        assert_eq!(exists_accounting.actual.finder_calls, 0);
+
+        let (shortest, shortest_accounting) = plan
+            .shortest(&haystack, SearchLimits::unlimited())
+            .expect("endpoint shortest");
+        assert_eq!(shortest, regex.shortest_match(&haystack));
+        assert_eq!(shortest, Some(literal_start + 3));
+        assert_eq!(shortest_accounting.actual.run_events, 0);
+        assert_eq!(shortest_accounting.actual.finder_calls, 0);
+        assert_eq!(shortest_accounting.actual.union_exact_candidates, 2);
+
+        let (found, selected_accounting) = plan
+            .find(&haystack, SearchLimits::unlimited())
+            .expect("selected maximal run");
+        assert_eq!(found, Some((0, haystack.len())));
+        assert_eq!(
+            found,
+            regex
+                .find(&haystack)
+                .map(|matched| (matched.start(), matched.end()))
+        );
+        assert!(selected_accounting.actual.run_events > 0);
+        assert!(selected_accounting.actual.decode_byte_checks > 1_000);
+    }
+
+    #[test]
+    fn union_endpoint_search_bounds_are_exact_affine_and_limit_checked() {
+        let ranges = [('a', 'z'), ('λ', 'λ')];
+        let literals: [&[u8]; 2] = [b"abcdef", b"b"];
+        let plan = plan(&ranges, &literals);
+        assert!(plan.build_accounting().adaptive_union);
+
+        let mut work = [0_usize; 3];
+        for (index, length) in [256_usize, 512, 1_024].into_iter().enumerate() {
+            let haystack = vec![b'-'; length];
+            let (exists, exists_accounting) = plan
+                .is_match(&haystack, SearchLimits::unlimited())
+                .expect("affine endpoint existence");
+            let (shortest, shortest_accounting) = plan
+                .shortest(&haystack, SearchLimits::unlimited())
+                .expect("affine endpoint shortest");
+            assert!(!exists);
+            assert_eq!(shortest, None);
+            assert_eq!(
+                exists_accounting.upper_bounds,
+                shortest_accounting.upper_bounds
+            );
+            let upper = exists_accounting.upper_bounds;
+            assert_eq!(upper.decode_byte_checks, 28 * length);
+            assert_eq!(upper.membership_tests, 4 * length);
+            assert_eq!(upper.range_comparisons, 4 * length);
+            assert_eq!(exists_accounting.actual.run_events, 0);
+            assert_eq!(shortest_accounting.actual.run_events, 0);
+            work[index] = upper.work;
+        }
+        let first_delta = work[1] - work[0];
+        let second_delta = work[2] - work[1];
+        assert_eq!(second_delta, 2 * first_delta);
+
+        let haystack = vec![b'-'; 1_024];
+        let (_, accounting) = plan
+            .shortest(&haystack, SearchLimits::unlimited())
+            .expect("endpoint bound receipt");
+        let exact_work = u64::try_from(accounting.upper_bounds.work)
+            .expect("endpoint work bound as u64");
+        let exact = SearchLimits {
+            max_work_upper_bound: exact_work,
+            max_scratch_bytes: accounting.upper_bounds.scratch_bytes,
+        };
+        plan.shortest(&haystack, exact)
+            .expect("exact endpoint search limits");
+        assert!(matches!(
+            plan.shortest(
+                &haystack,
+                SearchLimits {
+                    max_work_upper_bound: exact_work - 1,
+                    ..exact
+                }
+            ),
+            Err(ReduceError::WorkLimit { .. })
+        ));
+    }
+
+    #[test]
     fn sparse_mixed_multi_literal_plan_uses_union_and_certified_fallback() {
         let plan = plan(&SMALL_CLASS, &SMALL_LITERALS);
         let build = plan.build_accounting();
@@ -4032,6 +4553,28 @@ mod tests {
         );
         assert_eq!(aa_receipt.identity.plan_id, UNION_PLAN_ID);
         assert_eq!(bb_receipt.identity.plan_id, UNION_PLAN_ID);
+        assert!(
+            aa.is_match(&haystack, SearchLimits::unlimited())
+                .expect("aa union endpoint before mutation")
+                .0
+        );
+        assert_eq!(
+            aa.shortest(&haystack, SearchLimits::unlimited())
+                .expect("aa union shortest before mutation")
+                .0,
+            Some(5)
+        );
+        assert!(
+            !bb.is_match(&haystack, SearchLimits::unlimited())
+                .expect("bb union endpoint before mutation")
+                .0
+        );
+        assert_eq!(
+            bb.shortest(&haystack, SearchLimits::unlimited())
+                .expect("bb union shortest before mutation")
+                .0,
+            None
+        );
 
         haystack[1..5].copy_from_slice(b"abbb");
         assert_eq!(haystack.as_ptr(), address);
@@ -4046,6 +4589,28 @@ mod tests {
                 .expect("bb union after mutation")
                 .0,
             Some((1, 5))
+        );
+        assert!(
+            !aa.is_match(&haystack, SearchLimits::unlimited())
+                .expect("aa union endpoint after mutation")
+                .0
+        );
+        assert_eq!(
+            aa.shortest(&haystack, SearchLimits::unlimited())
+                .expect("aa union shortest after mutation")
+                .0,
+            None
+        );
+        assert!(
+            bb.is_match(&haystack, SearchLimits::unlimited())
+                .expect("bb union endpoint after mutation")
+                .0
+        );
+        assert_eq!(
+            bb.shortest(&haystack, SearchLimits::unlimited())
+                .expect("bb union shortest after mutation")
+                .0,
+            Some(5)
         );
     }
 
