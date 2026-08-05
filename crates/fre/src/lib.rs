@@ -582,11 +582,15 @@ pub use fre_kernels::{
     PrefixClassUniformParticipationInvocation, PrefixClassUniformParticipationLimits,
     PrefixClassUniformParticipationProspective, PrefixClassUniformParticipationResult,
     PrefixClassUniformParticipationSchema, REVERSE_INNER_COUNT_OPERATION_ID,
-    REVERSE_INNER_MAX_LITERALS, REVERSE_INNER_PLAN_ID, REVERSE_INNER_SPAN_SUM_OPERATION_ID,
+    REVERSE_INNER_EXISTS_OPERATION_ID,
+    REVERSE_INNER_MAX_LITERALS, REVERSE_INNER_PLAN_ID, REVERSE_INNER_SEARCH_OPERATION_ID,
+    REVERSE_INNER_SHORTEST_SEARCH_OPERATION_ID, REVERSE_INNER_SPAN_SUM_OPERATION_ID,
     ReverseInnerActualCounters, ReverseInnerBuildAccounting, ReverseInnerBuildError,
     ReverseInnerBuildLimits, ReverseInnerOperation, ReverseInnerOperationIdentity,
-    ReverseInnerReduceAccounting, ReverseInnerReduceError, ReverseInnerReduceLimits,
-    ReverseInnerSemantics, ReverseInnerUpperBounds, SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+    ReverseInnerPlan, ReverseInnerReduceAccounting, ReverseInnerReduceError,
+    ReverseInnerReduceLimits, ReverseInnerSearchAccounting, ReverseInnerSearchError,
+    ReverseInnerSearchLimits, ReverseInnerSemantics, ReverseInnerUpperBounds,
+    SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
     SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID, SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
     SparseOrderedLiteralAggregateActualCounters, SparseOrderedLiteralAggregateBuildAccounting,
     SparseOrderedLiteralAggregateBuildError, SparseOrderedLiteralAggregateBuildLimits,
@@ -1049,6 +1053,8 @@ pub enum PlanKind {
     RequiredLiteral,
     /// Canonical literal/class-run search backed by one native literal anchor.
     LiteralClassRunLiteral,
+    /// Ordered alternatives of `UNICODE_CLASS+ LITERAL UNICODE_CLASS+`.
+    ReverseInner,
     /// Operation-specialized root byte class repeated one or more times.
     PureByteClassRepeat,
     /// Finite positive greedy byte-class sequence with deterministic boundaries.
@@ -1081,6 +1087,8 @@ pub enum BuildError {
     RequiredLiteral(RequiredLiteralBuildError),
     /// Literal/class-run proof revalidation or construction failure.
     LiteralClassRunLiteral(LiteralClassRunLiteralBuildError),
+    /// Reverse-inner proof revalidation or construction failure.
+    ReverseInner(ReverseInnerBuildError),
     /// A forced required-literal request did not have the exact HIR shape.
     RequiredLiteralShape,
     /// Forward-anchored proof or construction failure.
@@ -1161,6 +1169,7 @@ impl BuildError {
             },
             Self::RequiredLiteral(error) => required_literal_failure_class(error),
             Self::LiteralClassRunLiteral(error) => literal_class_run_literal_failure_class(error),
+            Self::ReverseInner(error) => reverse_inner_failure_class(error),
             Self::RequiredLiteralShape | Self::ForwardAnchoredShape => {
                 BuildFailureClass::Unsupported
             }
@@ -1233,6 +1242,31 @@ fn literal_class_run_literal_failure_class(
         | LiteralClassRunLiteralBuildError::ArithmeticOverflow { .. } => {
             BuildFailureClass::InternalFailure
         }
+        _ => BuildFailureClass::InternalFailure,
+    }
+}
+
+fn reverse_inner_failure_class(error: &ReverseInnerBuildError) -> BuildFailureClass {
+    match error {
+        ReverseInnerBuildError::SourceRangesLimit { .. }
+        | ReverseInnerBuildError::TooManyLiterals { .. }
+        | ReverseInnerBuildError::LiteralBytesLimit { .. }
+        | ReverseInnerBuildError::TotalLiteralBytesLimit { .. }
+        | ReverseInnerBuildError::WorkLimit { .. }
+        | ReverseInnerBuildError::ScratchLimit { .. }
+        | ReverseInnerBuildError::PersistentLimit { .. }
+        | ReverseInnerBuildError::PeakLimit { .. } => BuildFailureClass::ResourceLimit,
+        ReverseInnerBuildError::EmptyClass
+        | ReverseInnerBuildError::ReversedRange { .. }
+        | ReverseInnerBuildError::NonCanonicalRanges
+        | ReverseInnerBuildError::EmptyLiteralSet
+        | ReverseInnerBuildError::EmptyLiteral { .. }
+        | ReverseInnerBuildError::NonAsciiLiteral { .. }
+        | ReverseInnerBuildError::LiteralScalarOutsideClass { .. } => {
+            BuildFailureClass::Unsupported
+        }
+        ReverseInnerBuildError::AllocationFailed { .. }
+        | ReverseInnerBuildError::ArithmeticOverflow { .. } => BuildFailureClass::InternalFailure,
         _ => BuildFailureClass::InternalFailure,
     }
 }
@@ -2509,6 +2543,9 @@ impl fmt::Display for BuildError {
             Self::LiteralClassRunLiteral(error) => {
                 write!(f, "literal/class-run construction failed: {error}")
             }
+            Self::ReverseInner(error) => {
+                write!(f, "reverse-inner construction failed: {error}")
+            }
             Self::RequiredLiteralShape => {
                 f.write_str("pattern is outside the forced required-literal HIR shape")
             }
@@ -2551,6 +2588,7 @@ impl std::error::Error for BuildError {
             Self::LiteralSet(error) => Some(error),
             Self::RequiredLiteral(error) => Some(error),
             Self::LiteralClassRunLiteral(error) => Some(error),
+            Self::ReverseInner(error) => Some(error),
             Self::ForwardAnchored(error) => Some(error),
             Self::RequiredLiteralShape
             | Self::ForwardAnchoredShape
@@ -2612,6 +2650,12 @@ impl From<RequiredLiteralBuildError> for BuildError {
 impl From<LiteralClassRunLiteralBuildError> for BuildError {
     fn from(value: LiteralClassRunLiteralBuildError) -> Self {
         Self::LiteralClassRunLiteral(value)
+    }
+}
+
+impl From<ReverseInnerBuildError> for BuildError {
+    fn from(value: ReverseInnerBuildError) -> Self {
+        Self::ReverseInner(value)
     }
 }
 
@@ -2809,6 +2853,8 @@ pub enum SearchAccounting {
     RequiredLiteral(RequiredLiteralSearchAccounting),
     /// Complete literal/class-run source-independent envelope and counters.
     LiteralClassRunLiteral(LiteralClassRunLiteralSearchAccounting),
+    /// Complete reverse-inner source-independent envelope and counters.
+    ReverseInner(ReverseInnerSearchAccounting),
     /// Exact operation-specialized root byte-class repetition counters.
     PureByteClassRepeat(PureByteClassRepeatAccounting),
     /// Exact bounded byte-class sequence counters.
@@ -2842,6 +2888,7 @@ impl SearchAccounting {
             Self::LiteralSetDfa(_) => PlanKind::LiteralSetDfa,
             Self::RequiredLiteral(_) => PlanKind::RequiredLiteral,
             Self::LiteralClassRunLiteral(_) => PlanKind::LiteralClassRunLiteral,
+            Self::ReverseInner(_) => PlanKind::ReverseInner,
             Self::PureByteClassRepeat(_) => PlanKind::PureByteClassRepeat,
             Self::BoundedByteClassSequence(_) => PlanKind::BoundedByteClassSequence,
             Self::NullableOptionalChain(_) => PlanKind::RequiredLiteral,
@@ -2871,6 +2918,9 @@ impl SearchAccounting {
             }
             Self::RequiredLiteral(accounting) => accounting.work_upper_bound,
             Self::LiteralClassRunLiteral(accounting) => accounting.work_upper_bound,
+            Self::ReverseInner(accounting) => {
+                u64::try_from(accounting.upper_bounds.work).unwrap_or(u64::MAX)
+            }
             Self::PureByteClassRepeat(accounting) => accounting.actual_work,
             Self::BoundedByteClassSequence(accounting) => accounting.actual_work,
             Self::NullableOptionalChain(accounting) => accounting.actual_work,
@@ -2915,6 +2965,7 @@ pub enum SearchError {
     LiteralSetDfa(LiteralSetError),
     RequiredLiteral(RequiredLiteralSearchError),
     LiteralClassRunLiteral(LiteralClassRunLiteralSearchError),
+    ReverseInner(ReverseInnerSearchError),
     PureByteClassRepeat(PureByteClassRepeatSearchError),
     BoundedByteClassSequence(BoundedByteClassSequenceSearchError),
     NullableOptionalChain(NullableOptionalChainSearchError),
@@ -2941,6 +2992,7 @@ impl fmt::Display for SearchError {
             Self::LiteralClassRunLiteral(error) => {
                 write!(f, "literal/class-run search failed: {error}")
             }
+            Self::ReverseInner(error) => write!(f, "reverse-inner search failed: {error}"),
             Self::PureByteClassRepeat(error) => {
                 write!(f, "pure byte-class repeat search failed: {error}")
             }
@@ -2974,6 +3026,7 @@ impl std::error::Error for SearchError {
             Self::LiteralSetDfa(error) => Some(error),
             Self::RequiredLiteral(error) => Some(error),
             Self::LiteralClassRunLiteral(error) => Some(error),
+            Self::ReverseInner(error) => Some(error),
             Self::PureByteClassRepeat(error) => Some(error),
             Self::BoundedByteClassSequence(error) => Some(error),
             Self::NullableOptionalChain(error) => Some(error),
@@ -3024,6 +3077,12 @@ impl From<RequiredLiteralSearchError> for SearchError {
 impl From<LiteralClassRunLiteralSearchError> for SearchError {
     fn from(value: LiteralClassRunLiteralSearchError) -> Self {
         Self::LiteralClassRunLiteral(value)
+    }
+}
+
+impl From<ReverseInnerSearchError> for SearchError {
+    fn from(value: ReverseInnerSearchError) -> Self {
+        Self::ReverseInner(value)
     }
 }
 
@@ -4143,11 +4202,103 @@ impl PortableBuilder {
                 }
             }
         }
-        let mut pure_byte_class_repeat_work = literal_class_run_work;
+        let mut reverse_inner_work = literal_class_run_work;
+        if self.selection == PlanSelection::Auto {
+            let remaining = self
+                .limits
+                .max_planner_work
+                .checked_sub(literal_class_run_work)
+                .ok_or(BuildError::InternalInvariant(
+                    "literal/class-run planner work exceeded its enforced limit",
+                ))?;
+            let inspection_limit = usize::try_from(remaining).unwrap_or(usize::MAX);
+            let inspection = reverse_inner::inspect(&rust.hir, inspection_limit).map_err(
+                |error| match error {
+                    reverse_inner::InspectionError::WorkLimit { needed, .. } => {
+                        let needed = literal_class_run_work
+                            .saturating_add(u64::try_from(needed).unwrap_or(u64::MAX));
+                        BuildError::PlannerWorkLimit {
+                            needed,
+                            limit: self.limits.max_planner_work,
+                        }
+                    }
+                    reverse_inner::InspectionError::Overflow => BuildError::InternalInvariant(
+                        "reverse-inner inspection accounting overflowed",
+                    ),
+                },
+            )?;
+            let inspection_work = match &inspection {
+                reverse_inner::Inspection::Eligible { work, .. }
+                | reverse_inner::Inspection::Ineligible { work } => *work,
+            };
+            reverse_inner_work = literal_class_run_work
+                .checked_add(u64::try_from(inspection_work).map_err(|_| {
+                    BuildError::InternalInvariant("reverse-inner planner work does not fit u64")
+                })?)
+                .ok_or(BuildError::InternalInvariant(
+                    "cumulative reverse-inner planner work overflowed u64",
+                ))?;
+            if reverse_inner_work > self.limits.max_planner_work {
+                return Err(BuildError::PlannerWorkLimit {
+                    needed: reverse_inner_work,
+                    limit: self.limits.max_planner_work,
+                });
+            }
+            if let reverse_inner::Inspection::Eligible {
+                class,
+                literals,
+                literal_count,
+                ..
+            } = inspection
+            {
+                let plan = ReverseInnerPlan::build(
+                    class
+                        .ranges()
+                        .iter()
+                        .map(|range| (range.start(), range.end())),
+                    &literals[..literal_count],
+                    reverse_inner_build_limits(self.limits.literal_class_run_literal),
+                )
+                .map_err(BuildError::ReverseInner)?;
+                let build = plan.build_accounting();
+                return Ok(PortableRegex {
+                    source,
+                    capture_names,
+                    line_total_grep_plan,
+                    plan: PortablePlan::ReverseInner(plan),
+                    profile: profile.clone(),
+                    limits: self.limits,
+                    selection: self.selection,
+                    report: BuildReport {
+                        profile: profile.clone(),
+                        admission,
+                        syntax,
+                        plan: PlanKind::ReverseInner,
+                        planner_work: reverse_inner_work,
+                        lowering: None,
+                        states: 0,
+                        edges: 0,
+                        plan_storage_bytes: build.persistent_bytes,
+                        source_storage_bytes,
+                        capture_name_storage_bytes,
+                        charged_persistent_bytes: 0,
+                        persistent_byte_limit: 0,
+                        captures_len,
+                        static_captures_len,
+                        minimum_match_bytes,
+                        required_literal: None,
+                        literal_class_run_literal: None,
+                        forward_anchored: None,
+                    }
+                    .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
+                });
+            }
+        }
+        let mut pure_byte_class_repeat_work = reverse_inner_work;
         if self.selection == PlanSelection::Auto && self.pure_byte_class_repeat_allowed {
             let inspection = pure_byte_class_repeat::inspect(
                 &rust.hir,
-                literal_class_run_work,
+                reverse_inner_work,
                 self.limits.max_planner_work,
             )
             .map_err(|error| match error {
@@ -5392,6 +5543,7 @@ enum PortablePlan {
     NullableOptionalChain(Box<nullable_optional_chain::Plan>),
     NullableFiniteTokenRepeat(Box<nullable_finite_token_repeat::Plan>),
     BoundedLiteralClassRun(Box<BoundedLiteralClassRunPlan>),
+    ReverseInner(ReverseInnerPlan),
 }
 
 impl PortablePlan {
@@ -5422,6 +5574,7 @@ impl PortablePlan {
             Self::GuardedLiteralSet(plan) => plan.plan_id(),
             Self::NullableOptionalChain(_) => nullable_optional_chain::PLAN_ID,
             Self::NullableFiniteTokenRepeat(_) => nullable_finite_token_repeat::PLAN_ID,
+            Self::ReverseInner(_) => REVERSE_INNER_PLAN_ID,
         }
     }
 }
@@ -5949,6 +6102,14 @@ impl PortableRegex {
                     SearchAccounting::LiteralClassRunLiteral(accounting),
                 ))
             }
+            PortablePlan::ReverseInner(plan) => {
+                let (matched, accounting) = plan.is_match_in(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    reverse_inner_search_limits(limits),
+                )?;
+                Ok((matched, SearchAccounting::ReverseInner(accounting)))
+            }
             PortablePlan::PureByteClassRepeat(plan) => {
                 let (matched, accounting) = plan.is_match_window(haystack, window, limits)?;
                 Ok((matched, SearchAccounting::PureByteClassRepeat(accounting)))
@@ -6169,6 +6330,14 @@ impl PortableRegex {
                     LiteralWindow::new(window.start(), window.end()),
                     literal_class_run_literal_limits(limits),
                 )
+                .map_err(SearchError::from),
+            PortablePlan::ReverseInner(plan) => plan
+                .is_match_in(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    reverse_inner_search_limits(limits),
+                )
+                .map(|(matched, _)| matched)
                 .map_err(SearchError::from),
             PortablePlan::PureByteClassRepeat(plan) => plan
                 .is_match_window_value(haystack, window, limits)
@@ -6453,6 +6622,14 @@ impl PortableRegex {
                 )?;
                 Ok((end, SearchAccounting::LiteralClassRunLiteral(accounting)))
             }
+            PortablePlan::ReverseInner(plan) => {
+                let (end, accounting) = plan.shortest_in(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    reverse_inner_search_limits(limits),
+                )?;
+                Ok((end, SearchAccounting::ReverseInner(accounting)))
+            }
             PortablePlan::PureByteClassRepeat(plan) => {
                 let (end, accounting) = plan.earliest_end_window(haystack, window, limits)?;
                 Ok((end, SearchAccounting::PureByteClassRepeat(accounting)))
@@ -6663,6 +6840,14 @@ impl PortableRegex {
                 Ok((
                     matched.map(|(_, end)| end),
                     SearchAccounting::LiteralClassRunLiteral(accounting),
+                ))
+            }
+            PortablePlan::ReverseInner(plan) => {
+                let (matched, accounting) =
+                    plan.find(haystack, reverse_inner_search_limits(limits))?;
+                Ok((
+                    matched.map(|(_, end)| end),
+                    SearchAccounting::ReverseInner(accounting),
                 ))
             }
             PortablePlan::PureByteClassRepeat(plan) => {
@@ -7134,6 +7319,17 @@ impl PortableRegex {
                     SearchAccounting::LiteralClassRunLiteral(accounting),
                 ))
             }
+            PortablePlan::ReverseInner(plan) => {
+                let (matched, accounting) = plan.find_in(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    reverse_inner_search_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    SearchAccounting::ReverseInner(accounting),
+                ))
+            }
             PortablePlan::PureByteClassRepeat(plan) => {
                 let (matched, accounting) = plan.find_window(haystack, window, limits)?;
                 Ok((matched, SearchAccounting::PureByteClassRepeat(accounting)))
@@ -7357,6 +7553,14 @@ impl PortableRegex {
                 )
                 .map(|matched| matched.map(|(start, end)| Match { start, end }))
                 .map_err(SearchError::from),
+            PortablePlan::ReverseInner(plan) => plan
+                .find_in(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    reverse_inner_search_limits(limits),
+                )
+                .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
             PortablePlan::PureByteClassRepeat(plan) => plan
                 .find_window(haystack, window, limits)
                 .map(|(matched, _)| matched)
@@ -7556,6 +7760,17 @@ impl PortableRegex {
                 Ok((
                     matched.map(|(start, end)| Match { start, end }),
                     accounting.work_upper_bound,
+                ))
+            }
+            PortablePlan::ReverseInner(plan) => {
+                let (matched, accounting) = plan.find_in(
+                    haystack,
+                    window,
+                    reverse_inner_search_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    u64::try_from(accounting.upper_bounds.work).unwrap_or(u64::MAX),
                 ))
             }
             PortablePlan::PureByteClassRepeat(plan) => {
@@ -11758,6 +11973,28 @@ fn literal_class_run_literal_limits(limits: SearchLimits) -> LiteralClassRunLite
         // visits remain a separately metered kernel unit and must not inherit
         // a numerically unrelated work budget.
         max_candidate_visits: usize::MAX,
+        max_scratch_bytes: limits.max_scratch_bytes,
+    }
+}
+
+const fn reverse_inner_build_limits(
+    limits: LiteralClassRunLiteralBuildLimits,
+) -> ReverseInnerBuildLimits {
+    ReverseInnerBuildLimits {
+        max_source_ranges: limits.max_class_ranges,
+        max_literals: REVERSE_INNER_MAX_LITERALS,
+        max_literal_bytes: limits.max_literal_bytes,
+        max_total_literal_bytes: limits.max_literal_bytes,
+        max_build_work: limits.max_build_work,
+        max_scratch_bytes: limits.max_scratch_bytes,
+        max_persistent_bytes: limits.max_persistent_bytes,
+        max_peak_bytes: limits.max_peak_bytes,
+    }
+}
+
+const fn reverse_inner_search_limits(limits: SearchLimits) -> ReverseInnerSearchLimits {
+    ReverseInnerSearchLimits {
+        max_work_upper_bound: limits.max_work,
         max_scratch_bytes: limits.max_scratch_bytes,
     }
 }

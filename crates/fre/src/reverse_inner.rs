@@ -90,7 +90,6 @@ struct SuffixBranch<'a> {
     right: &'a ClassUnicode,
 }
 
-#[cfg(test)]
 pub(crate) fn inspect(hir: &Hir, limit: usize) -> Result<Inspection<'_>, InspectionError> {
     inspect_attempt(hir, limit).map_err(AggregateInspectionAttemptError::into_source)
 }
