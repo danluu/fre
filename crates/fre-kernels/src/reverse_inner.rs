@@ -3623,6 +3623,11 @@ mod tests {
             .and_then(|bytes| bytes.checked_add(size_of::<UnionState>()))
             .expect("small exact allocation receipt");
         assert_eq!(build.allocated_bytes, expected_allocated_bytes);
+        let expected_copied_bytes = build
+            .retained_non_ascii_ranges
+            .checked_mul(size_of::<ScalarRange>())
+            .and_then(|bytes| bytes.checked_add(build.literal_bytes))
+            .expect("small exact copied-byte receipt");
 
         let exact = BuildLimits {
             max_source_ranges: build.source_ranges,
@@ -3645,7 +3650,7 @@ mod tests {
         assert_eq!(actual.work, u64::try_from(build.work).unwrap());
         assert_eq!(actual.allocations, build.literal_count + 3);
         assert_eq!(actual.allocated_bytes, build.allocated_bytes);
-        assert_eq!(actual.copied_bytes, build.literal_bytes);
+        assert_eq!(actual.copied_bytes, expected_copied_bytes);
         assert_eq!(actual.live_persistent_bytes, build.persistent_bytes);
         assert_eq!(actual.peak_bytes, build.peak_bytes);
 
