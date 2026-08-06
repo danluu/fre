@@ -620,7 +620,7 @@ const PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL: usize = 11;
 
 const RUNTIME_SYMBOL_NAME: &str = "fre_aot_regex_runtime_search_v1";
 const PARTIAL_RUNTIME_SYMBOL_NAME: &str =
-    "fre_aot_regex_runtime_search_exclusive_from_partial_v1";
+    "fre_aot_regex_runtime_search_exclusive_from_partial_preflight_v1";
 const PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_v1";
 const PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME: &str =
@@ -21474,7 +21474,7 @@ mod tests {
                   s!={window_start}U||e!={window_end}U||r==NULL||w==NULL||memcmp(d,identity,32U)!=0)return 88U;\
                if(expect_path==2){{w->start={narrowed_start}U;w->end=e;return 6U;}}\
                if(expect_path==3){{r[0]=321U;r[1]=654U;return 76U;}}return 88U;}}\n\
-             uint32_t fre_aot_regex_runtime_search_exclusive_from_partial_v1(\
+             uint32_t fre_aot_regex_runtime_search_exclusive_from_partial_preflight_v1(\
                handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,size_t*r,\
                const unsigned char*d,size_t state,size_t position,uint32_t pending,size_t pend){{\
                if(expect_path!=2||h!=(handle_t)(uintptr_t)0x1234U||p!=haystack||n!=sizeof(haystack)||\
@@ -22071,7 +22071,7 @@ mod tests {
              uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,size_t*r){{\
                fallback_calls++;if(mode!=2||h!=(handle_t)(uintptr_t)0x1234U||p!=haystack||n!=sizeof(haystack)||s!=0U||e!=100U||r==NULL)return 89U;\
                r[0]=9U;r[1]=9U;return 77U;}}\n\
-             uint32_t fre_aot_regex_runtime_search_exclusive_from_partial_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,size_t*r,const unsigned char*d,size_t a,size_t b,uint32_t c,size_t z){{\
+             uint32_t fre_aot_regex_runtime_search_exclusive_from_partial_preflight_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,size_t*r,const unsigned char*d,size_t a,size_t b,uint32_t c,size_t z){{\
                (void)h;(void)p;(void)n;(void)s;(void)e;(void)r;(void)d;(void)a;(void)b;(void)c;(void)z;return 90U;}}\n\
              uint32_t fre_aot_regex_runtime_search_exclusive_partial_preflight_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,size_t*r,const unsigned char*d,window_t*w){{\
                preflight_calls++;if(h!=(handle_t)(uintptr_t)0x1234U||p!=haystack||n!=sizeof(haystack)||s!=0U||e!=sizeof(haystack)||r==NULL||w==NULL||memcmp(d,identity,32U)!=0)return 88U;\

@@ -2490,11 +2490,12 @@ impl PartialDfaRuntimeState {
     /// entry. Unlike the legacy two-call admission choreography, a decline
     /// here consumes one adaptive bypass: the combined preflight completes
     /// the search itself instead of tail-calling the ordinary entry to
-    /// consume it. The caller decides whether complete accelerators run
-    /// before admission or only on the declined path.
+    /// consume it. Every admitted call retains its exact authenticated window
+    /// until local completion, a hole continuation, or Span recovery settles
+    /// the transaction.
     fn claim_native_entry_for_combined_preflight(
         &mut self,
-        span_postflight_window: Option<SearchWindow>,
+        authenticated_window: SearchWindow,
     ) -> bool {
         debug_assert!(!self.native_entry_in_flight);
         debug_assert!(self.native_entry_window.is_none());
@@ -2502,9 +2503,7 @@ impl PartialDfaRuntimeState {
             false
         } else if self.bypass_remaining == 0 {
             self.native_entry_in_flight = true;
-            if let Some(window) = span_postflight_window {
-                self.native_entry_window = Some(window);
-            }
+            self.native_entry_window = Some(authenticated_window);
             true
         } else {
             self.bypass_remaining = self.bypass_remaining.saturating_sub(1);
@@ -3696,6 +3695,98 @@ impl CompiledProgram {
         Ok(found)
     }
 
+    /// Continue from a retained-row hole admitted by the immediately
+    /// preceding combined native preflight on this exact workspace.
+    ///
+    /// The single-use exact-window ticket replaces the repeated artifact,
+    /// workspace, engine, and retained-route authentication performed by
+    /// [`Self::search_from_retained_partial_resume_with_workspace`]. This is a
+    /// compiler/runtime-private seam: only the emitted wrapper that owns that
+    /// preflight transaction may invoke it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-window error before reading the haystack, or an
+    /// invariant/search error if no matching preflight transaction exists or
+    /// the emitted compact resume payload is malformed.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the trusted continuation retains the exact native resume payload"
+    )]
+    pub fn search_from_preflight_retained_partial_resume_with_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end: Option<usize>,
+    ) -> Result<MatchResult, CompileError> {
+        if window.start > window.end || window.end > haystack.len() {
+            return Err(CompileError::InvalidWindow {
+                start: window.start,
+                end: window.end,
+                haystack_len: haystack.len(),
+            });
+        }
+        let partial_workspace = workspace.partial.as_deref_mut().ok_or(
+            CompileError::InternalInvariant(
+                "preflight-authenticated partial resume has no retained workspace",
+            ),
+        )?;
+        if !partial_workspace.state.consume_native_entry_window(window) {
+            return Err(CompileError::InternalInvariant(
+                "partial resume window was not admitted by combined preflight",
+            ));
+        }
+        if resume_position <= window.start || resume_position >= window.end {
+            return Err(CompileError::InternalInvariant(
+                "preflight-authenticated partial resume position is not inside its window",
+            ));
+        }
+        let partial = self.partial_dfa().ok_or(CompileError::InternalInvariant(
+            "preflight-authenticated partial resume has no retained rows",
+        ))?;
+        let canonical_pending = partial.resume_pending(resume_state).ok_or(
+            CompileError::InternalInvariant(
+                "preflight-authenticated partial resume state is outside the artifact",
+            ),
+        )?;
+        if canonical_pending != pending_end.is_some() {
+            return Err(CompileError::InternalInvariant(
+                "preflight-authenticated pending mode disagrees with the artifact",
+            ));
+        }
+        if partial_workspace
+            .resume
+            .as_ref()
+            .is_none_or(|resume| !resume.is_bound_to(&self.automaton))
+        {
+            return Err(CompileError::InternalInvariant(
+                "preflight-authenticated partial resume has no K0 resume set",
+            ));
+        }
+        let found = self.search_nfa_from_partial_resume(
+            haystack,
+            window,
+            workspace.nfa.as_mut().ok_or(CompileError::InternalInvariant(
+                "preflight-authenticated partial resume has no K0 workspace",
+            ))?,
+            &mut partial_workspace.resume,
+            PartialDfaResume {
+                state: resume_state,
+                position: resume_position,
+                pending_end,
+            },
+        )?;
+        partial_workspace.state.observe_resume(
+            resume_position.saturating_sub(window.start),
+            window.end.saturating_sub(window.start),
+        );
+        Ok(found)
+    }
+
     /// Recover the selected start after an authenticated native retained-row
     /// completion produced only the selected endpoint.
     ///
@@ -3918,14 +4009,11 @@ impl CompiledProgram {
                 "retained partial preflight requires the universal ordered-NFA engine",
             ));
         }
-        let partial_dfa = self.partial_dfa().ok_or(CompileError::InternalInvariant(
-            "retained partial preflight requires retained rows",
-        ))?;
-        let span_postflight_eligible = self.output == OutputContract::Span
-            && self.exact_match_width.is_none()
-            && !partial_dfa.initial_pending()
-            && partial_dfa.native_incomplete_view().is_some();
-
+        if self.partial_dfa().is_none() {
+            return Err(CompileError::InternalInvariant(
+                "retained partial preflight requires retained rows",
+            ));
+        }
         let input_bytes = window.end.saturating_sub(window.start);
         let ProgramWorkspace { nfa, partial, .. } = workspace;
         let nfa = nfa.as_mut().ok_or(CompileError::InternalInvariant(
@@ -3952,9 +4040,7 @@ impl CompiledProgram {
                 && input_bytes >= PARTIAL_DFA_MIN_INPUT_BYTES
                 && partial_workspace
                     .state
-                    .claim_native_entry_for_combined_preflight(
-                        span_postflight_eligible.then_some(window),
-                    );
+                    .claim_native_entry_for_combined_preflight(window);
             if enter {
                 return Ok(RetainedPartialPreflight::Enter(window));
             }
@@ -3984,9 +4070,7 @@ impl CompiledProgram {
             && input_bytes >= PARTIAL_DFA_MIN_INPUT_BYTES
             && partial_workspace
                 .state
-                .claim_native_entry_for_combined_preflight(
-                    span_postflight_eligible.then_some(narrowed),
-                );
+                .claim_native_entry_for_combined_preflight(narrowed);
         if enter {
             Ok(RetainedPartialPreflight::Enter(narrowed))
         } else {
@@ -11862,8 +11946,9 @@ mod tests {
             let state = &other_workspace.partial.as_deref().unwrap().state;
             assert!(state.native_entry_in_flight, "{output:?}");
             assert_eq!(
-                state.native_entry_window, None,
-                "{output:?} paid Span postflight window bookkeeping"
+                state.native_entry_window,
+                Some(other_window),
+                "{output:?} did not retain its combined-preflight ticket"
             );
             assert!(
                 other
@@ -11915,15 +12000,15 @@ mod tests {
                 fixed.artifact_identity(),
             )
             .unwrap();
-        assert!(
-            matches!(outcome, RetainedPartialPreflight::Enter(_)),
-            "fixed-width Span did not admit retained rows: {outcome:?}"
-        );
+        let RetainedPartialPreflight::Enter(fixed_native_window) = outcome else {
+            panic!("fixed-width Span did not admit retained rows: {outcome:?}");
+        };
         let state = &fixed_workspace.partial.as_deref().unwrap().state;
         assert!(state.native_entry_in_flight);
         assert_eq!(
-            state.native_entry_window, None,
-            "fixed-width Span paid reverse postflight window bookkeeping"
+            state.native_entry_window,
+            Some(fixed_native_window),
+            "fixed-width Span did not retain its continuation ticket"
         );
 
         let plain = program(
@@ -12232,11 +12317,62 @@ mod tests {
         assert_eq!(state.bypass_remaining, 1);
         assert!(!state.native_entry_in_flight);
 
+        // Reaching the trusted continuation consumes its exact-window ticket
+        // even when the compact payload is malformed. A corrected payload
+        // cannot retry a transaction whose native outcome was already
+        // reported across the ABI boundary.
+        let mut malformed = limited.prepare_workspace().unwrap();
+        assert_eq!(
+            limited
+                .preflight_retained_partial_with_workspace(
+                    &haystack,
+                    original,
+                    &mut malformed,
+                    limited.artifact_identity(),
+                )
+                .unwrap(),
+            RetainedPartialPreflight::Enter(narrowed)
+        );
+        assert!(
+            limited
+                .search_from_preflight_retained_partial_resume_with_workspace(
+                    &haystack,
+                    narrowed,
+                    &mut malformed,
+                    resume.state,
+                    narrowed.start,
+                    resume.pending_end,
+                )
+                .is_err(),
+            "a boundary resume position was accepted"
+        );
+        assert!(
+            limited
+                .search_from_preflight_retained_partial_resume_with_workspace(
+                    &haystack,
+                    narrowed,
+                    &mut malformed,
+                    resume.state,
+                    resume.position,
+                    resume.pending_end,
+                )
+                .is_err(),
+            "a malformed continuation left its ticket reusable"
+        );
+        assert!(
+            !malformed
+                .partial
+                .as_deref()
+                .unwrap()
+                .state
+                .native_entry_in_flight
+        );
+
         // Two authenticated shallow holes are measured from the returned cut
         // window, not from the much earlier public window. That must engage
         // the shallow-exit backoff.
         let mut resumed = limited.prepare_workspace().unwrap();
-        for _ in 0..2 {
+        for attempt in 0..2 {
             assert_eq!(
                 limited
                     .preflight_retained_partial_with_workspace(
@@ -12248,21 +12384,44 @@ mod tests {
                     .unwrap(),
                 RetainedPartialPreflight::Enter(narrowed)
             );
+            let actual = if attempt == 0 {
+                limited.search_from_retained_partial_resume_with_workspace(
+                    &haystack,
+                    narrowed,
+                    &mut resumed,
+                    limited.artifact_identity(),
+                    resume.state,
+                    resume.position,
+                    resume.pending_end,
+                )
+            } else {
+                limited.search_from_preflight_retained_partial_resume_with_workspace(
+                    &haystack,
+                    narrowed,
+                    &mut resumed,
+                    resume.state,
+                    resume.position,
+                    resume.pending_end,
+                )
+            };
             assert_eq!(
-                limited
-                    .search_from_retained_partial_resume_with_workspace(
-                        &haystack,
-                        narrowed,
-                        &mut resumed,
-                        limited.artifact_identity(),
-                        resume.state,
-                        resume.position,
-                        resume.pending_end,
-                    )
-                    .unwrap(),
+                actual.unwrap(),
                 expected
             );
         }
+        assert!(
+            limited
+                .search_from_preflight_retained_partial_resume_with_workspace(
+                    &haystack,
+                    narrowed,
+                    &mut resumed,
+                    resume.state,
+                    resume.position,
+                    resume.pending_end,
+                )
+                .is_err(),
+            "the single-use preflight ticket was reused"
+        );
         let state = &resumed.partial.as_deref().unwrap().state;
         assert_eq!(state.consecutive_fallbacks, 2);
         assert_eq!(state.bypass_remaining, 16);

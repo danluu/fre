@@ -40,11 +40,14 @@
 //! root scanner should own an admitted search can instead use
 //! [`fre_aot_regex_runtime_search_exclusive_partial_native_root_preflight_v1`];
 //! that authenticated call admits first and runs the portable proofs only on
-//! a decline. If a native scan then reaches a partial-DFA hole, it can continue
-//! the same exclusive session through
-//! [`fre_aot_regex_runtime_search_exclusive_from_partial_v1`]. That entry
-//! authenticates the producer's exact artifact identity and compact canonical
-//! resume-state index before continuing K0 without replaying the prefix.
+//! a decline. If a native scan then reaches a partial-DFA hole, the current
+//! compiler continues the same exclusive session through
+//! [`fre_aot_regex_runtime_search_exclusive_from_partial_preflight_v1`]. Its
+//! single-use preflight ticket replaces repeated program authentication while
+//! the compact canonical resume-state index is still checked before K0
+//! continues without replaying the prefix. The fully authenticating
+//! [`fre_aot_regex_runtime_search_exclusive_from_partial_v1`] remains available
+//! for older generated objects.
 //! A variable-width Span table that completes locally with only its selected
 //! endpoint uses
 //! [`fre_aot_regex_runtime_search_exclusive_recover_partial_span_v1`] to
@@ -384,6 +387,25 @@ impl PreparedAotRegex {
                 window,
                 &mut self.workspace,
                 expected_artifact_identity,
+                resume_state,
+                resume_position,
+                pending_end,
+            )
+    }
+
+    fn search_from_preflight_retained_partial_resume(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end: Option<usize>,
+    ) -> Result<MatchResult, CompileError> {
+        self.program
+            .search_from_preflight_retained_partial_resume_with_workspace(
+                haystack,
+                window,
+                &mut self.workspace,
                 resume_state,
                 resume_position,
                 pending_end,
@@ -1114,6 +1136,70 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_from_partial_v1(
             haystack,
             SearchWindow::new(window_start, window_end),
             expected_artifact_identity,
+            resume_state,
+            resume_position,
+            pending_end,
+        ) else {
+            return STATUS_RUNTIME_FAILURE;
+        };
+        let (status, result) = encode_match_result(found);
+        result_ptr.write(result);
+        status
+    }))
+    .unwrap_or(STATUS_RUNTIME_FAILURE)
+}
+
+/// Continue the exact retained-row transaction admitted by combined native
+/// preflight without repeating its artifact and workspace authentication.
+///
+/// This compiler-private ABI deliberately retains the legacy continuation's
+/// argument layout so generated wrappers can select it by relocation alone.
+/// `expected_artifact_identity_ptr` is the same embedded identity passed to
+/// preflight, but its bytes are not read again. The preflight's single-use
+/// exact-window ticket authenticates the handle, program, workspace, and
+/// admitted window. Compact state, position, and pending mode remain checked
+/// before the K0 continuation executes.
+///
+/// # Safety
+///
+/// This function may only be called by the compiler-emitted wrapper after its
+/// immediately preceding preflight returned [`STATUS_PARTIAL_PREFLIGHT_ENTER`]
+/// and its local native core returned a hole for that exact transaction. All
+/// pointers, extents, alignment, disjointness, exclusive ownership, and
+/// compact payload requirements of
+/// [`fre_aot_regex_runtime_search_exclusive_from_partial_v1`] must still hold.
+#[unsafe(no_mangle)]
+#[allow(
+    unsafe_code,
+    clippy::too_many_arguments,
+    reason = "this compiler-private trusted continuation preserves the established machine ABI"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_from_partial_preflight_v1(
+    handle: FreAotRegexExclusiveHandleV1,
+    haystack_ptr: *const u8,
+    haystack_len: usize,
+    window_start: usize,
+    window_end: usize,
+    result_ptr: *mut FreAotRegexResultV1,
+    _expected_artifact_identity_ptr: *const u8,
+    resume_state: usize,
+    resume_position: usize,
+    pending_end_present: u32,
+    pending_end: usize,
+) -> u32 {
+    if pending_end_present > 1 {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: the compiler-owned preflight transaction established the live
+    // exclusive session and exact readable/writable extents; the function's
+    // private contract keeps them valid through this immediate continuation.
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        let prepared = &mut *handle.0.cast::<PreparedAotRegex>();
+        let haystack = std::slice::from_raw_parts(haystack_ptr, haystack_len);
+        let pending_end = (pending_end_present == 1).then_some(pending_end);
+        let Ok(found) = prepared.search_from_preflight_retained_partial_resume(
+            haystack,
+            SearchWindow::new(window_start, window_end),
             resume_state,
             resume_position,
             pending_end,
@@ -1933,6 +2019,9 @@ mod tests {
         ] {
             assert!(C_API_V1_HEADER.contains(symbol), "{symbol}");
         }
+        assert!(!C_API_V1_HEADER.contains(
+            "fre_aot_regex_runtime_search_exclusive_from_partial_preflight_v1"
+        ));
 
         let _: unsafe extern "C" fn(*const u8, usize, *mut FreAotRegexPreparedHandleV1) -> u32 =
             fre_aot_regex_runtime_prepare_v1;
@@ -1971,6 +2060,50 @@ mod tests {
             u32,
             usize,
         ) -> u32 = fre_aot_regex_runtime_search_exclusive_from_partial_v1;
+        let _: unsafe extern "C" fn(
+            FreAotRegexExclusiveHandleV1,
+            *const u8,
+            usize,
+            usize,
+            usize,
+            *mut FreAotRegexResultV1,
+            *const u8,
+            usize,
+            usize,
+            u32,
+            usize,
+        ) -> u32 = fre_aot_regex_runtime_search_exclusive_from_partial_preflight_v1;
+        let mut malformed_result = FreAotRegexResultV1 {
+            start: 123,
+            end: 456,
+        };
+        // SAFETY: the malformed pending-mode discriminator is rejected before
+        // any handle or pointer is dereferenced.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_search_exclusive_from_partial_preflight_v1(
+                    FreAotRegexExclusiveHandleV1::INVALID,
+                    std::ptr::null(),
+                    0,
+                    0,
+                    0,
+                    &raw mut malformed_result,
+                    std::ptr::null(),
+                    0,
+                    0,
+                    2,
+                    0,
+                )
+            },
+            STATUS_INVALID_ARGUMENT
+        );
+        assert_eq!(
+            malformed_result,
+            FreAotRegexResultV1 {
+                start: 123,
+                end: 456,
+            }
+        );
         let _: unsafe extern "C" fn(
             FreAotRegexExclusiveHandleV1,
             *const u8,
