@@ -13389,6 +13389,121 @@ mod tests {
     }
 
     #[test]
+    fn generated_partial_prefill_is_general_across_structural_families() {
+        let mut patterns = Vec::new();
+        for branch_count in [3_usize, 5, 8, 12] {
+            let branches = (0..branch_count)
+                .map(|index| {
+                    let lower = char::from(b'a' + u8::try_from(index).unwrap());
+                    let upper = char::from(b'A' + u8::try_from(index).unwrap());
+                    let maximum = 2 + index % 4;
+                    format!("{lower}{{1,{maximum}}}{upper}")
+                })
+                .collect::<Vec<_>>()
+                .join("|");
+            patterns.push((format!("(?:{branches})+(?:Q|RS)"), b"aAQ".to_vec()));
+        }
+        for depth in [3_usize, 5, 7, 9] {
+            let mut body = String::new();
+            let mut witness = Vec::new();
+            for index in 0..depth {
+                match index % 4 {
+                    0 => {
+                        body.push_str("[ab]{1,3}");
+                        witness.push(b'a');
+                    }
+                    1 => {
+                        body.push_str("(?:cd|ce)");
+                        witness.extend_from_slice(b"cd");
+                    }
+                    2 => {
+                        body.push_str("[f-h]+");
+                        witness.push(b'f');
+                    }
+                    _ => {
+                        body.push_str("(?:ij|k)");
+                        witness.push(b'k');
+                    }
+                }
+            }
+            witness.push(b'X');
+            patterns.push((format!("(?:{body})+(?:X|YZ)"), witness));
+        }
+        for width in [2_usize, 3, 4, 6] {
+            patterns.push((
+                format!(
+                    "(?:(?:ab|ba){{1,{width}}}|(?:cd|dc){{2,{}}}|[e-g]+)+(?:!|JK)",
+                    width + 2
+                ),
+                b"ab!".to_vec(),
+            ));
+        }
+
+        let mut partial = 0_usize;
+        let mut completed = 0_usize;
+        for (family, (pattern, witness)) in patterns.iter().enumerate() {
+            for output in [
+                OutputContract::Exists,
+                OutputContract::SelectedEnd,
+                OutputContract::Span,
+            ] {
+                let selected = [2_usize, 4, 8, 16, 32].into_iter().find_map(|max_states| {
+                    let compiled = program(
+                        pattern,
+                        output,
+                        CompileMode::Optimizing,
+                        DeterminizeLimits {
+                            max_states,
+                            ..DeterminizeLimits::default()
+                        },
+                    );
+                    compiled.partial_dfa().is_some().then_some((max_states, compiled))
+                });
+                let Some((max_states, compiled)) = selected else {
+                    continue;
+                };
+                partial += 1;
+                let mut workspace = compiled.prepare_workspace().unwrap();
+                let prefilled = compiled
+                    .compiler_private_try_prefill_retained_fallback_with_workspace(&mut workspace)
+                    .unwrap();
+                completed += usize::from(prefilled);
+                assert!(
+                    prefilled,
+                    "family={family} output={output:?} max_states={max_states}"
+                );
+
+                let reference = program(
+                    pattern,
+                    output,
+                    CompileMode::Fast,
+                    DeterminizeLimits::default(),
+                );
+                let mut source = vec![b'z'; 320];
+                source.extend_from_slice(witness);
+                source.extend_from_slice(&[b'z'; 64]);
+                source.extend_from_slice(witness);
+                for window in [
+                    SearchWindow::full(&source),
+                    SearchWindow::new(17, source.len()),
+                    SearchWindow::new(0, 320),
+                    SearchWindow::new(320, 320 + witness.len()),
+                ] {
+                    assert_eq!(
+                        compiled
+                            .search_optimized_with_workspace(&source, window, &mut workspace)
+                            .unwrap(),
+                        reference.search(&source, window).unwrap(),
+                        "family={family} output={output:?} max_states={max_states} window={window:?}"
+                    );
+                }
+            }
+        }
+        assert!(partial >= 24, "generated families did not retain enough partial machines");
+        assert_eq!(completed, partial);
+    }
+
+    #[test]
     fn retained_entry_preserves_complete_nfa_accelerators() {
         let pattern = r"[b-c][a-b]{1,10}z";
         let limits = DeterminizeLimits {
