@@ -3816,6 +3816,8 @@ impl PortableBuilder {
             storage_bytes: capture_name_storage_bytes,
         } = capture_name_metadata(&rust.hir, explicit_captures, syntax.hir_nodes)?;
         let minimum_match_bytes = rust.hir.properties().minimum_len();
+        let k0_absolute_end_proof =
+            K0AbsoluteEndProof::from_hir(&rust.hir, minimum_match_bytes);
         let line_total_grep_plan = line_total_grep::prove(&rust.hir);
         if self.utf8_start_guarded
             && !matches!(self.selection, PlanSelection::Auto | PlanSelection::ForceK0)
@@ -3845,6 +3847,7 @@ impl PortableBuilder {
                 line_total_grep_plan,
                 plan: PortablePlan::K0(PortableK0Plan {
                     automaton,
+                    absolute_end_proof: k0_absolute_end_proof,
                     correlated_terminal: None,
                     mandatory_suffix: None,
                     mandatory_cut: None,
@@ -5671,6 +5674,7 @@ impl PortableBuilder {
             line_total_grep_plan,
             plan: PortablePlan::K0(PortableK0Plan {
                 automaton,
+                absolute_end_proof: k0_absolute_end_proof,
                 correlated_terminal,
                 mandatory_suffix: mandatory_suffix_plan,
                 mandatory_cut: mandatory_cut_plan,
@@ -5913,8 +5917,29 @@ impl TryFrom<String> for PortableRegex {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct K0AbsoluteEndProof;
+
+impl K0AbsoluteEndProof {
+    fn from_hir(hir: &Hir, minimum_match_bytes: Option<usize>) -> Option<Self> {
+        let properties = hir.properties();
+        // A positive-width match with an unconditional absolute-end suffix
+        // can only end at the original haystack end. Exclude absolute-start
+        // geometry because it has no unanchored-window recovery benefit.
+        (matches!(minimum_match_bytes, Some(minimum) if minimum > 0)
+            && properties.look_set_suffix().contains(Look::End)
+            && !properties.look_set_prefix().contains(Look::Start))
+        .then_some(Self)
+    }
+}
+
+#[derive(Debug)]
 struct PortableK0Plan {
     automaton: Automaton,
+    // Inline construction proof: no HIR, source, haystack, or separately
+    // allocated owner is retained, so logical persistent-byte accounting is
+    // unchanged.
+    absolute_end_proof: Option<K0AbsoluteEndProof>,
     correlated_terminal: Option<correlated_bounded_alternation::Plan>,
     mandatory_suffix: Option<K0MandatorySuffixPlan>,
     mandatory_cut: Option<K0MandatoryCutPlan>,
@@ -6297,7 +6322,7 @@ impl PortableRegex {
                 )?;
                 PortableSearchSessionPlan::K0 {
                     session,
-                    correlated_terminal: k0.correlated_terminal.as_ref(),
+                    k0_plan: k0,
                     mandatory_suffix: k0.mandatory_suffix.as_ref(),
                     mandatory_cut: k0.mandatory_cut.as_ref(),
                     negative_prefilter: k0.negative_prefilter.as_deref(),
@@ -8565,7 +8590,7 @@ enum PortableSearchSessionPlan<'a> {
     Native(&'a PortableRegex),
     K0 {
         session: K0SearchSession<'a>,
-        correlated_terminal: Option<&'a correlated_bounded_alternation::Plan>,
+        k0_plan: &'a PortableK0Plan,
         mandatory_suffix: Option<&'a K0MandatorySuffixPlan>,
         mandatory_cut: Option<&'a K0MandatoryCutPlan>,
         negative_prefilter: Option<&'a K0NegativePrefilterPlan>,
@@ -8577,6 +8602,120 @@ enum PortableSearchSessionPlan<'a> {
         correlated_terminal_earliest_end_state: correlated_bounded_alternation::RouteState,
         correlated_terminal_span_state: correlated_bounded_alternation::RouteState,
     },
+}
+
+#[inline]
+fn k0_absolute_end_window_is_proven_empty(
+    proof: Option<K0AbsoluteEndProof>,
+    haystack_len: usize,
+    window: SearchWindow,
+) -> bool {
+    // Validate the complete public range before using this O(1) theorem.
+    // Invalid windows must still reach ordinary K0's authoritative error.
+    proof.is_some()
+        && window.start() <= window.end()
+        && window.end() <= haystack_len
+        && (window.start() == window.end() || window.end() < haystack_len)
+}
+
+#[inline]
+fn try_k0_absolute_end_exists(
+    session: &mut K0SearchSession<'_>,
+    proof: Option<K0AbsoluteEndProof>,
+    haystack: &[u8],
+    window: SearchWindow,
+    limits: SearchLimits,
+) -> Result<Option<bool>, SearchError> {
+    if proof.is_none()
+        || limits != SearchLimits::unlimited()
+        || window.start() > window.end()
+        || window.end() > haystack.len()
+    {
+        return Ok(None);
+    }
+    if window.end() < haystack.len() {
+        return Ok(Some(false));
+    }
+    let window_bytes = window.end().saturating_sub(window.start());
+    let Some(work_certificate) =
+        session.positive_end_verifier_work_certificate(window_bytes)
+    else {
+        return Ok(None);
+    };
+
+    // The immutable ordinary-K0 certificate bounds speculative verifier
+    // work; one source-window pass independently caps reverse byte traffic.
+    let reverse_limits = K0PositiveEndLimits::new(work_certificate, window_bytes);
+    let verification = session
+        .try_positive_match_ending_at(haystack, window, window.end(), reverse_limits)
+        .map_err(SearchError::from)?;
+    debug_assert!(verification.receipt().work() <= reverse_limits.max_work());
+    debug_assert!(
+        verification.receipt().reverse_source_bytes() <= reverse_limits.max_reverse_bytes()
+    );
+    match verification.outcome() {
+        K0PositiveEndOutcome::Matched => Ok(Some(true)),
+        K0PositiveEndOutcome::Rejected => Ok(Some(false)),
+        K0PositiveEndOutcome::Declined => Ok(None),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum K0AbsoluteEndSpanAttempt {
+    Declined,
+    Complete(Option<Match>),
+}
+
+#[inline]
+fn try_k0_absolute_end_span(
+    session: &mut K0SearchSession<'_>,
+    proof: Option<K0AbsoluteEndProof>,
+    haystack: &[u8],
+    window: SearchWindow,
+    limits: SearchLimits,
+) -> Result<K0AbsoluteEndSpanAttempt, SearchError> {
+    if proof.is_none()
+        || limits != SearchLimits::unlimited()
+        || window.start() > window.end()
+        || window.end() > haystack.len()
+    {
+        return Ok(K0AbsoluteEndSpanAttempt::Declined);
+    }
+    if window.end() < haystack.len() {
+        return Ok(K0AbsoluteEndSpanAttempt::Complete(None));
+    }
+    let window_bytes = window.end().saturating_sub(window.start());
+    let Some(work_certificate) =
+        session.positive_end_verifier_work_certificate(window_bytes)
+    else {
+        return Ok(K0AbsoluteEndSpanAttempt::Declined);
+    };
+
+    let reverse_limits = K0PositiveEndLimits::new(work_certificate, window_bytes);
+    let verification = session
+        .try_earliest_start_ending_at(haystack, window, window.end(), reverse_limits)
+        .map_err(SearchError::from)?;
+    debug_assert!(verification.receipt().work() <= reverse_limits.max_work());
+    debug_assert!(
+        verification.receipt().reverse_source_bytes() <= reverse_limits.max_reverse_bytes()
+    );
+    match verification.outcome() {
+        K0PositiveEndStartOutcome::Matched { start } => {
+            if start < window.start() || start >= window.end() {
+                return Err(SearchError::K0(K0SearchError::InternalInvariant {
+                    detail: "absolute-end verifier start escaped its positive window",
+                }));
+            }
+            Ok(K0AbsoluteEndSpanAttempt::Complete(Some(Match {
+                start,
+                end: window.end(),
+            })))
+        }
+        K0PositiveEndStartOutcome::Rejected => {
+            Ok(K0AbsoluteEndSpanAttempt::Complete(None))
+        }
+        K0PositiveEndStartOutcome::Declined => Ok(K0AbsoluteEndSpanAttempt::Declined),
+    }
 }
 
 // A negative literal pass pays for itself only on a reusable, sufficiently
@@ -10724,7 +10863,7 @@ impl<'r> PortableSearchSession<'r> {
             }
             PortableSearchSessionPlan::K0 {
                 session,
-                correlated_terminal,
+                k0_plan,
                 mandatory_suffix,
                 mandatory_cut,
                 negative_prefilter,
@@ -10733,7 +10872,16 @@ impl<'r> PortableSearchSession<'r> {
                 negative_prefilter_exists_state,
                 ..
             } => {
-                if let Some(plan) = *correlated_terminal {
+                let absolute_end_proof = k0_plan.absolute_end_proof;
+                let correlated_terminal = k0_plan.correlated_terminal.as_ref();
+                if k0_absolute_end_window_is_proven_empty(
+                    absolute_end_proof,
+                    haystack.len(),
+                    window,
+                ) {
+                    return Ok(false);
+                }
+                if let Some(plan) = correlated_terminal {
                     if k0_correlated_exact_delimited_allows(
                         plan,
                         haystack.len(),
@@ -11014,9 +11162,20 @@ impl<'r> PortableSearchSession<'r> {
                 }
                 let search_window = search_candidate_floor
                     .map_or(window, |start| SearchWindow::new(start, window.end()));
-                let result = session
-                    .search_exists_value(haystack, search_window, limits)
-                    .map_err(SearchError::from);
+                let absolute_end_result = try_k0_absolute_end_exists(
+                    session,
+                    absolute_end_proof,
+                    haystack,
+                    search_window,
+                    limits,
+                )?;
+                let result = if let Some(output) = absolute_end_result {
+                    Ok(output)
+                } else {
+                    session
+                        .search_exists_value(haystack, search_window, limits)
+                        .map_err(SearchError::from)
+                };
                 if result.is_ok() {
                     *mandatory_suffix_exists_state = suffix_state_after_success;
                     *negative_prefilter_exists_state = attempt.state_after_success;
@@ -11106,11 +11265,20 @@ impl<'r> PortableSearchSession<'r> {
                 .map(|(output, _)| output),
             PortableSearchSessionPlan::K0 {
                 session,
-                correlated_terminal,
+                k0_plan,
                 correlated_terminal_earliest_end_state,
                 ..
             } => {
-                if let Some(plan) = *correlated_terminal {
+                let absolute_end_proof = k0_plan.absolute_end_proof;
+                let correlated_terminal = k0_plan.correlated_terminal.as_ref();
+                if k0_absolute_end_window_is_proven_empty(
+                    absolute_end_proof,
+                    haystack.len(),
+                    window,
+                ) {
+                    return Ok(None);
+                }
+                if let Some(plan) = correlated_terminal {
                     if k0_correlated_exact_delimited_allows(
                         plan,
                         haystack.len(),
@@ -11208,6 +11376,15 @@ impl<'r> PortableSearchSession<'r> {
                             },
                         }
                     }
+                }
+                if let Some(matched) = try_k0_absolute_end_exists(
+                    session,
+                    absolute_end_proof,
+                    haystack,
+                    window,
+                    limits,
+                )? {
+                    return Ok(matched.then_some(window.end()));
                 }
                 session
                     .search_window::<EarliestEnd>(haystack, window, limits)
@@ -11413,7 +11590,7 @@ impl<'r> PortableSearchSession<'r> {
             }
             PortableSearchSessionPlan::K0 {
                 session,
-                correlated_terminal,
+                k0_plan,
                 mandatory_suffix,
                 mandatory_cut,
                 negative_prefilter,
@@ -11422,7 +11599,16 @@ impl<'r> PortableSearchSession<'r> {
                 negative_prefilter_span_state,
                 ..
             } => {
-                if let Some(plan) = *correlated_terminal {
+                let absolute_end_proof = k0_plan.absolute_end_proof;
+                let correlated_terminal = k0_plan.correlated_terminal.as_ref();
+                if k0_absolute_end_window_is_proven_empty(
+                    absolute_end_proof,
+                    haystack.len(),
+                    window,
+                ) {
+                    return Ok(None);
+                }
+                if let Some(plan) = correlated_terminal {
                     if k0_correlated_exact_delimited_allows(
                         plan,
                         haystack.len(),
@@ -12032,15 +12218,25 @@ impl<'r> PortableSearchSession<'r> {
                 }
                 let search_window = search_candidate_floor
                     .map_or(window, |start| SearchWindow::new(start, window.end()));
-                let result = session
-                    .search_span_value(haystack, search_window, limits)
-                    .map(|found| {
-                        found.map(|span| Match {
-                            start: span.start(),
-                            end: span.end(),
+                let absolute_end_attempt = try_k0_absolute_end_span(
+                    session,
+                    absolute_end_proof,
+                    haystack,
+                    search_window,
+                    limits,
+                )?;
+                let result = match absolute_end_attempt {
+                    K0AbsoluteEndSpanAttempt::Complete(output) => Ok(output),
+                    K0AbsoluteEndSpanAttempt::Declined => session
+                        .search_span_value(haystack, search_window, limits)
+                        .map(|found| {
+                            found.map(|span| Match {
+                                start: span.start(),
+                                end: span.end(),
+                            })
                         })
-                    })
-                    .map_err(SearchError::from);
+                        .map_err(SearchError::from),
+                };
                 if result.is_ok() {
                     *mandatory_suffix_span_state = suffix_state_after_success;
                     *negative_prefilter_span_state = attempt.state_after_success;
@@ -12137,12 +12333,15 @@ impl<'r> PortableSearchSession<'r> {
         let retained_root_run = match &self.plan {
             PortableSearchSessionPlan::K0 {
                 session,
-                correlated_terminal: None,
+                k0_plan,
                 mandatory_suffix: None,
                 mandatory_cut: None,
                 negative_prefilter: None,
                 ..
-            } => session.retained_root_run_cursor_available(),
+            } if k0_plan.correlated_terminal.is_none()
+                && k0_plan.absolute_end_proof.is_none() => {
+                session.retained_root_run_cursor_available()
+            }
             PortableSearchSessionPlan::Native(_)
             | PortableSearchSessionPlan::K0 { .. } => false,
         };
@@ -12986,10 +13185,10 @@ fn fixed_predicate_word64_search_limits(limits: SearchLimits) -> FixedPredicateW
 mod tests {
     use super::{
         Automaton, BuildError, BuildLimits, CanonicalPattern, CaptureFreeOperation,
-        CompatibilityProfile, GuardedLiteralSetSearchError, K0MandatoryCutPlan,
-        K0MandatorySuffixOutcome, K0MandatorySuffixPlan, K0FiniteSuffixRoute,
-        K0MandatorySuffixSpanOutcome, K0NegativePrefilterOutcome, Match, OperationSemantics,
-        PlanKind, PlanSelection,
+        CompatibilityProfile, GuardedLiteralSetSearchError, K0AbsoluteEndProof,
+        K0FiniteSuffixRoute, K0MandatoryCutPlan, K0MandatorySuffixOutcome,
+        K0MandatorySuffixPlan, K0MandatorySuffixSpanOutcome, K0NegativePrefilterOutcome, Match,
+        OperationSemantics, PlanKind, PlanSelection,
         PortableBuilder, PortableFindIterAccounting, PortableFindIterError, PortableFindIterLimits,
         PortableFindIterRunLimits, PortablePlan, PortableRegex, SearchAccounting, SearchError,
         PortableSearchSessionPlan, SearchLimits, SearchSessionLimits, SearchWindow,
@@ -13168,6 +13367,587 @@ mod tests {
             "synthetic mandatory-suffix plan remains within the builder limit",
         );
         regex
+    }
+
+    #[test]
+    fn k0_absolute_end_proof_requires_positive_absolute_nonstart_geometry() {
+        assert_eq!(core::mem::size_of::<K0AbsoluteEndProof>(), 0);
+        for (pattern, expected) in [
+            (r"(?-u:(?:ab|c+)\z)", true),
+            (r"(?-u:\b[a-z]+\z)", true),
+            (r"(?-u:(?:ab|c*)\z)", false),
+            (r"(?-u:\A(?:ab|c+)\z)", false),
+            (r"(?-u:(?:ab|c+))", false),
+            (r"(?m-u:(?:ab|c+)$)", false),
+        ] {
+            let regex = PortableBuilder::new(pattern)
+                .unicode(false)
+                .plan_selection(PlanSelection::ForceK0)
+                .build()
+                .expect("absolute-end proof fixture lowers through K0");
+            let PortablePlan::K0(plan) = &regex.plan else {
+                panic!("forced absolute-end proof fixture did not retain K0");
+            };
+            assert_eq!(
+                plan.absolute_end_proof.is_some(),
+                expected,
+                "pattern={pattern:?}",
+            );
+            assert_eq!(
+                regex.build_report().plan_storage_bytes,
+                plan.automaton.stats().storage_bytes(),
+                "forced K0 retains no separately allocated proof owner",
+            );
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one transaction covers mutation, range exactness, finite fallback, and invalid projections",
+    )]
+    fn k0_absolute_end_value_routes_rescan_mutation_and_preserve_range_authority() {
+        fn is_invalid_window<T>(result: Result<T, SearchError>) -> bool {
+            matches!(
+                result,
+                Err(SearchError::K0(
+                    fre_automata::SearchError::InvalidWindow { .. }
+                ))
+            )
+        }
+
+        let regex = PortableBuilder::new(r"(?-u:(?:ab|c+)\z)")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .expect("absolute-end value fixture lowers through K0");
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("absolute-end bidirectional session constructs");
+        let mut haystack = vec![b'x'; 16];
+        let address = haystack.as_ptr();
+        let end = haystack.len();
+        let ab_start = end.saturating_sub(2);
+        let full = SearchWindow::full(&haystack);
+        let check = |session: &mut super::PortableSearchSession<'_>,
+                     source: &[u8],
+                     window: SearchWindow,
+                     limits: SearchLimits,
+                     expected: Option<Match>| {
+            assert_eq!(
+                session
+                    .is_match_window_value(source, window, limits)
+                    .unwrap(),
+                expected.is_some(),
+            );
+            assert_eq!(
+                session
+                    .shortest_match_window_value(source, window, limits)
+                    .unwrap(),
+                expected.map(Match::end),
+            );
+            assert_eq!(
+                session.find_window_value(source, window, limits).unwrap(),
+                expected,
+            );
+        };
+
+        haystack[ab_start..end].copy_from_slice(b"ab");
+        check(
+            &mut session,
+            &haystack,
+            full,
+            SearchLimits::unlimited(),
+            Some(Match {
+                start: ab_start,
+                end,
+            }),
+        );
+
+        haystack[ab_start..end].copy_from_slice(b"xx");
+        assert_eq!(haystack.as_ptr(), address);
+        check(
+            &mut session,
+            &haystack,
+            full,
+            SearchLimits::unlimited(),
+            None,
+        );
+
+        let clipped_end = 8;
+        let clipped_start = clipped_end.saturating_sub(2);
+        haystack[clipped_start..clipped_end].copy_from_slice(b"ab");
+        let clipped = SearchWindow::new(2, clipped_end);
+        check(
+            &mut session,
+            &haystack,
+            clipped,
+            SearchLimits::unlimited(),
+            None,
+        );
+        let no_budget = SearchLimits {
+            max_work: 0,
+            max_scratch_bytes: 0,
+        };
+        for empty_window in [clipped, SearchWindow::new(end, end)] {
+            check(&mut session, &haystack, empty_window, no_budget, None);
+        }
+
+        let c_start = end.saturating_sub(4);
+        haystack[c_start..end].copy_from_slice(b"cccc");
+        assert_eq!(haystack.as_ptr(), address);
+        let expected = Some(Match {
+            start: c_start,
+            end,
+        });
+        check(
+            &mut session,
+            &haystack,
+            full,
+            SearchLimits::unlimited(),
+            expected,
+        );
+
+        let finite = SearchLimits {
+            max_work: u64::MAX - 1,
+            max_scratch_bytes: usize::MAX,
+        };
+        check(&mut session, &haystack, full, finite, expected);
+
+        let refused_scratch = SearchLimits {
+            max_work: u64::MAX,
+            max_scratch_bytes: 0,
+        };
+        assert!(session
+            .is_match_window_value(&haystack, full, refused_scratch)
+            .is_err());
+        assert!(session
+            .shortest_match_window_value(&haystack, full, refused_scratch)
+            .is_err());
+        assert!(session
+            .find_window_value(&haystack, full, refused_scratch)
+            .is_err());
+
+        for invalid in [
+            SearchWindow::new(5, 4),
+            SearchWindow::new(0, end.checked_add(1).unwrap()),
+        ] {
+            assert!(is_invalid_window(session.is_match_window_value(
+                &haystack,
+                invalid,
+                SearchLimits::unlimited(),
+            )));
+            assert!(is_invalid_window(session.shortest_match_window_value(
+                &haystack,
+                invalid,
+                SearchLimits::unlimited(),
+            )));
+            assert!(is_invalid_window(session.find_window_value(
+                &haystack,
+                invalid,
+                SearchLimits::unlimited(),
+            )));
+        }
+
+        assert_eq!(haystack.as_ptr(), address);
+        check(
+            &mut session,
+            &haystack,
+            full,
+            SearchLimits::unlimited(),
+            expected,
+        );
+    }
+
+    #[test]
+    fn k0_absolute_end_mandatory_suffix_completes_before_residual_reverse() {
+        let regex = PortableBuilder::new(
+            r"(?-u:(?:\bab[01]*|\bcd[23]*|\bef[45]*|\bgh[67]*)SUFFIX\z)",
+        )
+        .unicode(false)
+        .build()
+        .expect("absolute-end mandatory-suffix fixture builds automatically");
+        assert_eq!(regex.build_report().plan(), PlanKind::K0);
+        let PortablePlan::K0(plan) = &regex.plan else {
+            unreachable!();
+        };
+        assert!(plan.absolute_end_proof.is_some());
+        assert_eq!(
+            plan.mandatory_suffix
+                .as_ref()
+                .map(K0MandatorySuffixPlan::needle),
+            Some(b"SUFFIX".as_slice()),
+        );
+
+        let haystack = vec![b'!'; 4_096];
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("absolute-end mandatory-suffix session constructs");
+        assert!(!session
+            .is_match_window_value(
+                &haystack,
+                SearchWindow::full(&haystack),
+                SearchLimits::unlimited(),
+            )
+            .unwrap());
+        let PortableSearchSessionPlan::K0 {
+            mandatory_suffix_exists_state,
+            ..
+        } = &session.plan
+        else {
+            unreachable!();
+        };
+        assert_ne!(
+            *mandatory_suffix_exists_state,
+            K0NegativePrefilterState::default(),
+            "the retained suffix must complete the negative call before residual reverse",
+        );
+    }
+
+    #[test]
+    fn k0_absolute_end_proof_none_preserves_plan_session_layout_and_unrelated_state() {
+        #[allow(dead_code)]
+        struct PortableK0PlanWithoutAbsoluteEndProof {
+            automaton: Automaton,
+            correlated_terminal: Option<super::correlated_bounded_alternation::Plan>,
+            mandatory_suffix: Option<K0MandatorySuffixPlan>,
+            mandatory_cut: Option<K0MandatoryCutPlan>,
+            negative_prefilter: Option<Box<super::K0NegativePrefilterPlan>>,
+        }
+
+        assert_eq!(
+            core::mem::size_of::<&super::PortableK0Plan>(),
+            core::mem::size_of::<Option<&super::correlated_bounded_alternation::Plan>>(),
+            "the plan-bound proof borrow replaces the former correlated-plan word",
+        );
+        assert_eq!(
+            core::mem::align_of::<&super::PortableK0Plan>(),
+            core::mem::align_of::<Option<&super::correlated_bounded_alternation::Plan>>(),
+        );
+        let plan_size = core::mem::size_of::<super::PortableK0Plan>();
+        let previous_plan_size = core::mem::size_of::<PortableK0PlanWithoutAbsoluteEndProof>();
+        let plan_alignment = core::mem::align_of::<super::PortableK0Plan>();
+        assert_eq!(
+            plan_alignment,
+            core::mem::align_of::<PortableK0PlanWithoutAbsoluteEndProof>(),
+            "the inline proof must not increase plan-object alignment",
+        );
+        assert!(
+            plan_size.abs_diff(previous_plan_size) <= plan_alignment,
+            concat!(
+                "the inline tag may occupy at most one plan-alignment slot: ",
+                "previous={previous_plan_size}, current={plan_size}, alignment={plan_alignment}",
+            ),
+        );
+        let pattern = r"(?-u:(?:ab|c+))";
+        let plain = PortableBuilder::new(pattern)
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .expect("proof-none K0 fixture builds");
+        let mut proof_carrier = PortableBuilder::new(pattern)
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .expect("plan-layout comparison fixture builds");
+        let PortablePlan::K0(plain_plan) = &plain.plan else {
+            unreachable!();
+        };
+        assert!(plain_plan.absolute_end_proof.is_none());
+        let PortablePlan::K0(proof_plan) = &mut proof_carrier.plan else {
+            unreachable!();
+        };
+        proof_plan.absolute_end_proof = Some(K0AbsoluteEndProof);
+        assert_eq!(
+            core::mem::size_of_val(plain_plan),
+            core::mem::size_of_val(proof_plan),
+            "the inline proof value must not alter the private plan-object layout",
+        );
+        assert_eq!(
+            core::mem::align_of_val(plain_plan),
+            core::mem::align_of_val(proof_plan),
+        );
+        assert_eq!(
+            plain.build_report().plan_storage_bytes,
+            proof_carrier.build_report().plan_storage_bytes,
+            "the inline proof has no separately charged persistent owner",
+        );
+
+        let mut plain_session = plain
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("proof-none K0 session constructs");
+        let proof_session = proof_carrier
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("proof-carrying K0 session constructs");
+        assert_eq!(
+            core::mem::size_of_val(&plain_session.plan),
+            core::mem::size_of_val(&proof_session.plan),
+        );
+        assert_eq!(
+            core::mem::align_of_val(&plain_session.plan),
+            core::mem::align_of_val(&proof_session.plan),
+        );
+        assert_eq!(
+            plain_session.workspace_setup_accounting(),
+            proof_session.workspace_setup_accounting(),
+            "an inline immutable proof must not change K0 workspace setup",
+        );
+
+        let state_before = match &plain_session.plan {
+            PortableSearchSessionPlan::K0 {
+                k0_plan,
+                correlated_terminal_exists_state,
+                correlated_terminal_earliest_end_state,
+                correlated_terminal_span_state,
+                ..
+            } => {
+                assert!(k0_plan.absolute_end_proof.is_none());
+                (
+                    *correlated_terminal_exists_state,
+                    *correlated_terminal_earliest_end_state,
+                    *correlated_terminal_span_state,
+                )
+            }
+            PortableSearchSessionPlan::Native(_) => unreachable!(),
+        };
+        let haystack = b"zzabzz";
+        let window = SearchWindow::full(haystack);
+        assert!(plain_session
+            .is_match_window_value(haystack, window, SearchLimits::unlimited())
+            .unwrap());
+        assert_eq!(
+            plain_session
+                .shortest_match_window_value(haystack, window, SearchLimits::unlimited())
+                .unwrap(),
+            Some(4),
+        );
+        assert_eq!(
+            plain_session
+                .find_window_value(haystack, window, SearchLimits::unlimited())
+                .unwrap(),
+            Some(Match { start: 2, end: 4 }),
+        );
+        let state_after = match &plain_session.plan {
+            PortableSearchSessionPlan::K0 {
+                correlated_terminal_exists_state,
+                correlated_terminal_earliest_end_state,
+                correlated_terminal_span_state,
+                ..
+            } => (
+                *correlated_terminal_exists_state,
+                *correlated_terminal_earliest_end_state,
+                *correlated_terminal_span_state,
+            ),
+            PortableSearchSessionPlan::Native(_) => unreachable!(),
+        };
+        assert_eq!(state_after, state_before);
+    }
+
+    #[test]
+    fn k0_absolute_end_ignores_cross_plan_adaptive_state() {
+        let correlated = PortableBuilder::new(r"(?-u:(?:ab[bc]*Z|q[de]*Y))")
+            .unicode(false)
+            .build()
+            .expect("correlated transplant source builds");
+        let mut correlated_session = correlated
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("correlated transplant source session constructs");
+        let transplanted = match &mut correlated_session.plan {
+            PortableSearchSessionPlan::K0 {
+                k0_plan,
+                correlated_terminal_exists_state,
+                ..
+            } => {
+                assert!(k0_plan.correlated_terminal.is_some());
+                assert!(matches!(
+                    correlated_terminal_exists_state.select(16),
+                    super::correlated_bounded_alternation::Route::Learn { .. }
+                ));
+                *correlated_terminal_exists_state
+            }
+            PortableSearchSessionPlan::Native(_) => unreachable!(),
+        };
+
+        let regex = PortableBuilder::new(r"(?-u:(?:ab|c+)\z)")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .expect("absolute-end transplant destination builds");
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("absolute-end transplant destination session constructs");
+        let PortableSearchSessionPlan::K0 {
+            k0_plan,
+            correlated_terminal_exists_state,
+            correlated_terminal_earliest_end_state,
+            correlated_terminal_span_state,
+            ..
+        } = &mut session.plan
+        else {
+            unreachable!();
+        };
+        assert!(k0_plan.correlated_terminal.is_none());
+        *correlated_terminal_exists_state = transplanted;
+        *correlated_terminal_earliest_end_state = transplanted;
+        *correlated_terminal_span_state = transplanted;
+
+        let haystack = b"xxxxxxxxxxxxxxab";
+        let window = SearchWindow::full(haystack);
+        assert!(session
+            .is_match_window_value(haystack, window, SearchLimits::unlimited())
+            .unwrap());
+        assert_eq!(
+            session
+                .shortest_match_window_value(haystack, window, SearchLimits::unlimited())
+                .unwrap(),
+            Some(haystack.len()),
+        );
+        assert_eq!(
+            session
+                .find_window_value(haystack, window, SearchLimits::unlimited())
+                .unwrap(),
+            Some(Match {
+                start: haystack.len().saturating_sub(2),
+                end: haystack.len(),
+            }),
+        );
+        let PortableSearchSessionPlan::K0 {
+            correlated_terminal_exists_state,
+            correlated_terminal_earliest_end_state,
+            correlated_terminal_span_state,
+            ..
+        } = &session.plan
+        else {
+            unreachable!();
+        };
+        assert_eq!(*correlated_terminal_exists_state, transplanted);
+        assert_eq!(*correlated_terminal_earliest_end_state, transplanted);
+        assert_eq!(*correlated_terminal_span_state, transplanted);
+    }
+
+    #[test]
+    fn k0_absolute_end_endpoint_session_falls_through_without_reverse() {
+        let regex = PortableBuilder::new(r"(?-u:(?:ab|c+)\z)")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .expect("absolute-end endpoint fixture lowers through K0");
+        let mut haystack = vec![b'x'; 16];
+        let end = haystack.len();
+        let terminal_start = end.saturating_sub(3);
+        haystack[terminal_start..end].copy_from_slice(b"ccc");
+        let window = SearchWindow::full(&haystack);
+        let mut session = regex
+            .endpoint_search_session(SearchSessionLimits::unlimited())
+            .expect("absolute-end forward-only endpoint session constructs");
+        assert!(session
+            .is_match_window_value(&haystack, window, SearchLimits::unlimited())
+            .unwrap());
+        assert_eq!(
+            session
+                .shortest_match_window_value(&haystack, window, SearchLimits::unlimited())
+                .unwrap(),
+            Some(end),
+        );
+        assert_eq!(
+            session
+                .find_window_value(&haystack, window, SearchLimits::unlimited())
+                .unwrap(),
+            Some(Match {
+                start: terminal_start,
+                end,
+            }),
+        );
+    }
+
+    #[test]
+    fn k0_absolute_end_value_iterator_remains_terminal_and_at_most_once() {
+        let regex = PortableBuilder::new(r"(?-u:[a-z]+\z)")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .expect("absolute-end iterator fixture lowers through K0");
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("absolute-end iterator session constructs");
+        let PortableSearchSessionPlan::K0 {
+            session: k0_session,
+            k0_plan,
+            mandatory_suffix: None,
+            mandatory_cut: None,
+            negative_prefilter: None,
+            ..
+        } = &session.plan
+        else {
+            unreachable!();
+        };
+        assert!(k0_plan.absolute_end_proof.is_some());
+        assert!(
+            !k0_session.retained_root_run_cursor_available(),
+            "root-run inspection currently excludes every assertion-bearing graph",
+        );
+
+        let haystack = b"abc123xyz";
+        let actual = session
+            .find_iter_value(haystack, PortableFindIterRunLimits::unlimited())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(actual, vec![Match { start: 6, end: 9 }]);
+    }
+
+    #[test]
+    fn k0_absolute_end_reverse_uses_current_original_context_before_window_start() {
+        let regex = PortableBuilder::new(r"(?-u:\b[a-z]+\z)")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .expect("contextual absolute-end fixture lowers through K0");
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("contextual absolute-end session constructs");
+        let mut haystack = vec![b'a'; 17];
+        let address = haystack.as_ptr();
+        let end = haystack.len();
+        let window = SearchWindow::new(1, end);
+        let check = |session: &mut super::PortableSearchSession<'_>,
+                     source: &[u8],
+                     expected: Option<Match>| {
+            assert_eq!(
+                session
+                    .is_match_window_value(source, window, SearchLimits::unlimited())
+                    .unwrap(),
+                expected.is_some(),
+            );
+            assert_eq!(
+                session
+                    .shortest_match_window_value(
+                        source,
+                        window,
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap(),
+                expected.map(Match::end),
+            );
+            assert_eq!(
+                session
+                    .find_window_value(source, window, SearchLimits::unlimited())
+                    .unwrap(),
+                expected,
+            );
+        };
+
+        haystack[0] = b'0';
+        check(&mut session, &haystack, None);
+        haystack[0] = b'!';
+        assert_eq!(haystack.as_ptr(), address);
+        check(
+            &mut session,
+            &haystack,
+            Some(Match { start: 1, end }),
+        );
+        haystack[0] = b'0';
+        assert_eq!(haystack.as_ptr(), address);
+        check(&mut session, &haystack, None);
     }
 
     #[test]
@@ -17355,7 +18135,7 @@ mod tests {
 
         let PortableSearchSessionPlan::K0 {
             session: k0_session,
-            correlated_terminal: None,
+            k0_plan,
             mandatory_suffix: None,
             mandatory_cut: None,
             negative_prefilter: None,
@@ -17364,6 +18144,7 @@ mod tests {
         else {
             panic!("root-run value fixture unexpectedly retained a facade sidecar");
         };
+        assert!(k0_plan.correlated_terminal.is_none());
         assert!(k0_session.retained_root_run_cursor_available());
 
         {
@@ -17541,13 +18322,14 @@ mod tests {
         let mut session = regex
             .search_session(SearchSessionLimits::unlimited())
             .unwrap();
-        let PortableSearchSessionPlan::K0 {
-            correlated_terminal: Some(plan),
-            ..
-        } = &session.plan
+        let PortableSearchSessionPlan::K0 { k0_plan, .. } = &session.plan
         else {
             panic!("exact correlated alternation lost its K0 sidecar");
         };
+        let plan = k0_plan
+            .correlated_terminal
+            .as_ref()
+            .expect("exact correlated alternation lost its K0 sidecar");
         assert!(plan.is_exact_delimited());
 
         fn enumerate(
@@ -17748,13 +18530,14 @@ mod tests {
             .search_session(SearchSessionLimits::unlimited())
             .unwrap();
         for session in [&left_session, &right_session] {
-            let PortableSearchSessionPlan::K0 {
-                correlated_terminal: Some(plan),
-                ..
-            } = &session.plan
+            let PortableSearchSessionPlan::K0 { k0_plan, .. } = &session.plan
             else {
                 panic!("cross-plan fixture lost its exact sidecar");
             };
+            let plan = k0_plan
+                .correlated_terminal
+                .as_ref()
+                .expect("cross-plan fixture lost its exact sidecar");
             assert!(plan.is_exact_delimited());
         }
 
@@ -17856,13 +18639,11 @@ mod tests {
         let mut session = fre
             .search_session(super::SearchSessionLimits::unlimited())
             .unwrap();
-        let PortableSearchSessionPlan::K0 {
-            correlated_terminal: Some(_),
-            ..
-        } = &session.plan
+        let PortableSearchSessionPlan::K0 { k0_plan, .. } = &session.plan
         else {
             panic!("correlated value-iterator fixture lost its facade sidecar");
         };
+        assert!(k0_plan.correlated_terminal.is_some());
 
         // The first long, decoy-heavy search teaches the adaptive route. A
         // fresh iterator over the same immutable plan and source then starts
