@@ -3,16 +3,17 @@
 //! Each literal is proved non-self-overlapping by the sufficient condition
 //! that its first byte does not occur in its remainder. Consequently one
 //! persistent `memmem::Finder::find_iter` per alternative enumerates every
-//! literal occurrence without restarting selected-span searches. Merging the
-//! two monotone occurrence streams, then greedily extending the selected byte
-//! class, implements Rust's leftmost-first, non-overlapping whole-match
-//! semantics. Exists and earliest-end instead begin with both literal
-//! first-byte streams, authenticate the exact literals, and inspect exactly
-//! one following class member without constructing or extending a greedy
-//! match. A fixed noisy-anchor budget falls back to the retained literal
-//! streams, preserving low constants for dense first-byte rejection. Both
-//! routes are `O(N + Q)` with constant operation space. `N` is the haystack
-//! length; `Q` is retained literal bytes plus canonical class ranges.
+//! literal occurrence for aggregate reduction and retained exhaustive iterator
+//! continuation. One-shot selected-span, existence, and earliest-end searches
+//! instead begin with the union of both literal first bytes, authenticate the
+//! exact literals in source order, and inspect exactly one following class
+//! member. Selected-span search greedily extends only the winning class, so an
+//! early branch-zero match never first scans an absent peer Finder through the
+//! remaining window. A fixed noisy-anchor budget falls back from the first
+//! unprocessed start to the retained literal streams, preserving low constants
+//! for dense first-byte rejection. Both routes are `O(N + Q)` with constant
+//! operation space. `N` is the haystack length; `Q` is retained literal bytes
+//! plus canonical class ranges.
 //!
 //! Prospective resource ledger: compiler analysis charges each HIR inspection
 //! (1), fixed branch comparison (2 total), literal-byte/self-overlap comparison
@@ -32,14 +33,16 @@
 //! boundary preprocessing, and data-dependent stack/queue storage are zero;
 //! the fixed local frame is `O(1)` and covered by the 64-unit fixed term.
 //! Execution admits `16N + 8Q + 64`, `N` match events, and `N` count before
-//! iterator creation or haystack inspection; this covers both monotone
-//! candidate services, every candidate read/branch/start comparison, membership
-//! comparison, counter/cursor write, count conversion, and checked logical
-//! match-width accumulation. Span sum additionally reserves `N` matched bytes:
+//! iterator creation or haystack inspection; this covers either both monotone
+//! candidate services or the union scan and two exact literal verifiers, every
+//! candidate read/branch/start comparison, membership comparison,
+//! counter/cursor write, count conversion, and checked logical match-width
+//! accumulation. Span sum additionally reserves `N` matched bytes:
 //! positive non-overlapping spans cannot exceed the haystack length. Execution
 //! allocation, initialization, reserve, copy, deduplication, UTF-8/boundary
-//! preprocessing, and growing stack/queue storage are zero; its two iterators,
-//! two next-candidate slots, and scalar counters form an `O(1)` fixed frame.
+//! preprocessing, and growing stack/queue storage are zero; its at-most-two
+//! iterators, two next-candidate slots, and scalar counters form an `O(1)` fixed
+//! frame.
 //! Allocation failure is typed and never changes the selected route.
 //!
 //! A distinct dispatched owner is available only from one caller-captured
@@ -87,7 +90,7 @@ pub const DISPATCHED_PLAN_ID: &str =
 pub const COUNT_OPERATION_ID: &str = "prefix-class-alternation.count.unicode-off.v1";
 pub const SPAN_SUM_OPERATION_ID: &str = "prefix-class-alternation.span-sum.unicode-off.v1";
 pub const EXISTS_OPERATION_ID: &str = "prefix-class-alternation.exists.unicode-off.v1";
-pub const SEARCH_OPERATION_ID: &str = "prefix-class-alternation.search.unicode-off.v1";
+pub const SEARCH_OPERATION_ID: &str = "prefix-class-alternation.search.unicode-off.v2";
 pub const SHORTEST_SEARCH_OPERATION_ID: &str =
     "prefix-class-alternation.shortest.unicode-off.v1";
 pub const UNIFORM_PARTICIPATION_PLAN_ID: &str =
@@ -107,7 +110,7 @@ const SIMD_RUN_SCANNER_BUILD_WORK: usize = 128 + 1 + 1;
 const RUN_SCANNERS: usize = 2;
 // One narrow block bounds per-hit scalar overhead before exact Finders regain
 // the advantage on a dense, mostly false first-byte stream.
-const DIRECT_ENDPOINT_ANCHOR_BUDGET: usize = 16;
+const DIRECT_UNION_FALSE_ANCHOR_BUDGET: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OperationIdentity {
@@ -439,12 +442,6 @@ pub struct SpanSumResult {
 enum SearchProjection {
     Exists,
     Selected,
-    EarliestEnd,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum EndpointProjection {
-    Exists,
     EarliestEnd,
 }
 
@@ -1715,7 +1712,7 @@ impl PrefixClassAlternationPlan {
             haystack,
             window,
             limits,
-            EndpointProjection::Exists,
+            SearchProjection::Exists,
             Operation::Exists,
             self.exists_identity(),
         )?;
@@ -1742,7 +1739,7 @@ impl PrefixClassAlternationPlan {
             haystack,
             window,
             limits,
-            EndpointProjection::EarliestEnd,
+            SearchProjection::EarliestEnd,
             Operation::Shortest,
             self.shortest_identity(),
         )?;
@@ -1764,7 +1761,7 @@ impl PrefixClassAlternationPlan {
             Operation::Search,
             run_scanners[0].is_some(),
         )?;
-        let (matched, actual) = self.execute_search(
+        let (matched, actual) = self.execute_union_search(
             haystack,
             window,
             SearchProjection::Selected,
@@ -1787,13 +1784,18 @@ impl PrefixClassAlternationPlan {
         haystack: &[u8],
         window: Window,
         limits: SearchLimits,
-        projection: EndpointProjection,
+        projection: SearchProjection,
         operation: Operation,
         identity: OperationIdentity,
     ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
         let upper_bounds = self.search_preflight(haystack, window, limits, operation, false)?;
-        let (matched, actual) =
-            self.execute_endpoint_search(haystack, window, projection, upper_bounds)?;
+        let (matched, actual) = self.execute_union_search(
+            haystack,
+            window,
+            projection,
+            upper_bounds,
+            [None, None],
+        )?;
         Ok((
             matched,
             SearchAccounting {
@@ -1832,7 +1834,7 @@ impl PrefixClassAlternationPlan {
                 haystack,
                 window,
                 limits,
-                EndpointProjection::Exists,
+                SearchProjection::Exists,
                 operation,
                 identity,
             ),
@@ -1840,7 +1842,7 @@ impl PrefixClassAlternationPlan {
                 haystack,
                 window,
                 limits,
-                EndpointProjection::EarliestEnd,
+                SearchProjection::EarliestEnd,
                 operation,
                 identity,
             ),
@@ -2126,29 +2128,38 @@ impl PrefixClassAlternationPlan {
     /// remainder. Consequently the exact comparisons between successive
     /// first-byte hits cover disjoint source intervals except for their
     /// boundary byte. Across both alternatives this remains linear in the
-    /// window and needs no operation storage. Existence returns after one
-    /// exact literal and its first class member. Earliest-end retains only the
-    /// best `literal_end + 1` and never invokes greedy class extension. Dense
-    /// false anchors hand off once to the established exact-literal merge at
-    /// the first unprocessed start.
+    /// window and needs no operation storage. Selected search preserves source
+    /// order at an equal start and greedily extends only its winner. Existence
+    /// returns after one exact literal and its first class member. Earliest-end
+    /// retains only the best `literal_end + 1` and never invokes greedy class
+    /// extension. Dense false anchors hand off once to the established
+    /// exact-literal merge at the first unprocessed start.
     #[allow(
         clippy::needless_range_loop,
         reason = "the fixed two alternatives preserve source priority at equal candidate starts"
     )]
-    fn execute_endpoint_search(
+    fn execute_union_search(
         &self,
         haystack: &[u8],
         window: Window,
-        projection: EndpointProjection,
+        projection: SearchProjection,
         upper: ReduceUpperBounds,
+        run_scanners: [Option<&AsciiByteSetRunScanner>; RUN_SCANNERS],
     ) -> Result<(Option<(usize, usize)>, ReduceActualCounters), SearchError> {
+        let bounded_haystack = haystack.get(..window.end()).ok_or(
+            ReduceError::InvalidWindow {
+                start: window.start(),
+                end: window.end(),
+                haystack_len: haystack.len(),
+            },
+        )?;
         let first_bytes = [
             *self.alternatives[0]
                 .finder
                 .needle()
                 .first()
                 .ok_or(ReduceError::AccountingInvariant {
-                    resource: "empty first endpoint prefix",
+                    resource: "empty first union prefix",
                     actual: 1,
                     upper: 0,
                 })?,
@@ -2157,7 +2168,7 @@ impl PrefixClassAlternationPlan {
                 .needle()
                 .first()
                 .ok_or(ReduceError::AccountingInvariant {
-                    resource: "empty second endpoint prefix",
+                    resource: "empty second union prefix",
                     actual: 1,
                     upper: 0,
                 })?,
@@ -2199,22 +2210,22 @@ impl PrefixClassAlternationPlan {
             };
             let start = cursor.checked_add(relative).ok_or(
                 ReduceError::ArithmeticOverflow {
-                    computation: "direct endpoint candidate start",
+                    computation: "direct union candidate start",
                 },
             )?;
             cursor = start.checked_add(1).ok_or(
                 ReduceError::ArithmeticOverflow {
-                    computation: "direct endpoint candidate advance",
+                    computation: "direct union candidate advance",
                 },
             )?;
             anchor_candidates = anchor_candidates.checked_add(1).ok_or(
                 ReduceError::ArithmeticOverflow {
-                    computation: "direct endpoint anchor candidate count",
+                    computation: "direct union false-anchor budget count",
                 },
             )?;
             let first_byte = *haystack.get(start).ok_or(
                 ReduceError::ArithmeticOverflow {
-                    computation: "direct endpoint first-byte hit",
+                    computation: "direct union first-byte hit",
                 },
             )?;
             for alternative in 0..2 {
@@ -2224,7 +2235,7 @@ impl PrefixClassAlternationPlan {
                 let prefix = self.alternatives[alternative].finder.needle();
                 let prefix_end = start.checked_add(prefix.len()).ok_or(
                     ReduceError::ArithmeticOverflow {
-                        computation: "direct endpoint literal end",
+                        computation: "direct union literal end",
                     },
                 )?;
                 if prefix_end > window.end() {
@@ -2242,7 +2253,7 @@ impl PrefixClassAlternationPlan {
                 }
                 prefix_candidates = prefix_candidates.checked_add(1).ok_or(
                     ReduceError::ArithmeticOverflow {
-                        computation: "direct endpoint prefix candidate count",
+                        computation: "direct union prefix candidate count",
                     },
                 )?;
                 if prefix_end == window.end() {
@@ -2250,12 +2261,12 @@ impl PrefixClassAlternationPlan {
                 }
                 let first_class_byte = *haystack.get(prefix_end).ok_or(
                     ReduceError::ArithmeticOverflow {
-                        computation: "direct endpoint first class byte",
+                        computation: "direct union first class byte",
                     },
                 )?;
                 class_bytes = class_bytes.checked_add(1).ok_or(
                     ReduceError::ArithmeticOverflow {
-                        computation: "direct endpoint classification count",
+                        computation: "direct union classification count",
                     },
                 )?;
                 if !self.alternatives[alternative]
@@ -2266,11 +2277,11 @@ impl PrefixClassAlternationPlan {
                 }
                 let accepting_end = prefix_end.checked_add(1).ok_or(
                     ReduceError::ArithmeticOverflow {
-                        computation: "direct endpoint first accepting end",
+                        computation: "direct union first accepting end",
                     },
                 )?;
                 match projection {
-                    EndpointProjection::Exists => {
+                    SearchProjection::Exists => {
                         return finish_search_execution(
                             Some((start, accepting_end)),
                             prefix_candidates,
@@ -2278,39 +2289,56 @@ impl PrefixClassAlternationPlan {
                             upper,
                         );
                     }
-                    EndpointProjection::EarliestEnd => {
+                    SearchProjection::Selected => {
+                        let extension = extend_greedy_class(
+                            bounded_haystack,
+                            accepting_end,
+                            self.alternatives[alternative].class,
+                            run_scanners[alternative],
+                        );
+                        class_bytes = class_bytes
+                            .checked_add(extension.physical_classifications)
+                            .ok_or(ReduceError::ArithmeticOverflow {
+                                computation: "direct union greedy classifications",
+                            })?;
+                        return finish_search_execution(
+                            Some((start, extension.end)),
+                            prefix_candidates,
+                            class_bytes,
+                            upper,
+                        );
+                    }
+                    SearchProjection::EarliestEnd => {
                         if earliest.is_none_or(|(_, old_end)| accepting_end < old_end) {
                             earliest = Some((start, accepting_end));
                         }
                     }
                 }
             }
-            if earliest.is_none() && anchor_candidates >= DIRECT_ENDPOINT_ANCHOR_BUDGET {
+            if earliest.is_none()
+                && anchor_candidates >= DIRECT_UNION_FALSE_ANCHOR_BUDGET
+            {
                 // A first byte can be much denser than either complete
                 // literal. Bound scalar restart overhead, then resume from
                 // the first unprocessed start with the established Finder
                 // merge. The direct prefix is failure-only here, so combining
                 // both exact counter fragments preserves one atomic receipt.
                 let fallback_window = Window::new(cursor, window.end());
-                let fallback_projection = match projection {
-                    EndpointProjection::Exists => SearchProjection::Exists,
-                    EndpointProjection::EarliestEnd => SearchProjection::EarliestEnd,
-                };
                 let (matched, fallback) = self.execute_search(
                     haystack,
                     fallback_window,
-                    fallback_projection,
+                    projection,
                     upper,
-                    [None, None],
+                    run_scanners,
                 )?;
                 prefix_candidates = prefix_candidates
                     .checked_add(fallback.prefix_candidates)
                     .ok_or(ReduceError::ArithmeticOverflow {
-                        computation: "combined direct endpoint prefix candidates",
+                        computation: "combined direct union prefix candidates",
                     })?;
                 class_bytes = class_bytes.checked_add(fallback.class_bytes).ok_or(
                     ReduceError::ArithmeticOverflow {
-                        computation: "combined direct endpoint classifications",
+                        computation: "combined direct union classifications",
                     },
                 )?;
                 return finish_search_execution(
@@ -3649,7 +3677,7 @@ impl DispatchedPrefixClassAlternationPlan {
             haystack,
             window,
             limits,
-            EndpointProjection::Exists,
+            SearchProjection::Exists,
             Operation::Exists,
             self.exists_identity(),
         )?;
@@ -3674,7 +3702,7 @@ impl DispatchedPrefixClassAlternationPlan {
             haystack,
             window,
             limits,
-            EndpointProjection::EarliestEnd,
+            SearchProjection::EarliestEnd,
             Operation::Shortest,
             self.shortest_identity(),
         )?;
@@ -4593,7 +4621,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_execute_search_preserves_branch_zero_at_an_equal_start() {
+    fn direct_union_preserves_branch_zero_at_an_equal_proper_prefix_start() {
         let plan = PrefixClassAlternationPlan::build(
             [b"abcd", b"ab"],
             [[(b'x', b'x')].into_iter(), [(b'c', b'c')].into_iter()],
@@ -4628,7 +4656,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_execute_search_retries_branch_one_after_equal_start_rejection() {
+    fn direct_union_retries_branch_one_after_equal_start_rejection() {
         let plan = PrefixClassAlternationPlan::build(
             [b"abcd", b"ab"],
             [[(b'x', b'x')].into_iter(), [(b'c', b'c')].into_iter()],
@@ -4661,7 +4689,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_execute_search_handles_duplicate_spans_inside_bounded_windows() {
+    fn direct_union_handles_duplicate_spans_inside_bounded_windows() {
         let first_class = [(b'x', b'x')];
         let second_class = [(b'c', b'd'), (b'x', b'x')];
         let plan = PrefixClassAlternationPlan::build(
@@ -4722,11 +4750,32 @@ mod tests {
         }
     }
 
-    fn reference_endpoint_search(
+    #[test]
+    fn direct_selected_returns_early_winner_when_peer_prefix_is_absent() {
+        let class = [(b'0', b'9')];
+        let plan = PrefixClassAlternationPlan::build(
+            [b"ab", b"xy"],
+            [class.into_iter(), class.into_iter()],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let mut haystack = b"ab777!".to_vec();
+        haystack.resize(64 * 1024, b'!');
+
+        let (matched, accounting) = plan
+            .find(&haystack, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(Some((0, 5)), matched);
+        assert_eq!(1, accounting.actual.prefix_candidates);
+        assert_eq!(4, accounting.actual.class_bytes);
+        assert_eq!(SEARCH_OPERATION_ID, accounting.identity.operation_id);
+    }
+
+    fn reference_union_search(
         plan: &PrefixClassAlternationPlan,
         haystack: &[u8],
         window: Window,
-        projection: EndpointProjection,
+        projection: SearchProjection,
     ) -> Option<(usize, usize)> {
         let mut earliest = None;
         for start in window.start()..window.end() {
@@ -4751,8 +4800,17 @@ mod tests {
                 }
                 let candidate = (start, prefix_end + 1);
                 match projection {
-                    EndpointProjection::Exists => return Some(candidate),
-                    EndpointProjection::EarliestEnd => {
+                    SearchProjection::Exists => return Some(candidate),
+                    SearchProjection::Selected => {
+                        let extension = extend_greedy_class(
+                            &haystack[..window.end()],
+                            candidate.1,
+                            plan.alternatives[alternative].class,
+                            None,
+                        );
+                        return Some((start, extension.end));
+                    }
+                    SearchProjection::EarliestEnd => {
                         if earliest.is_none_or(|(_, old_end)| candidate.1 < old_end) {
                             earliest = Some(candidate);
                         }
@@ -4764,20 +4822,18 @@ mod tests {
     }
 
     #[test]
-    fn direct_endpoints_match_exhaustive_proper_prefix_high_byte_windows() {
+    fn direct_union_matches_exhaustive_proper_prefix_high_byte_windows() {
         fn visit(plan: &PrefixClassAlternationPlan, haystack: &mut Vec<u8>, depth: usize) {
             for start in 0..=haystack.len() {
                 for end in start..=haystack.len() {
                     let window = Window::new(start, end);
-                    for (projection, endpoint) in [
-                        (SearchProjection::Exists, EndpointProjection::Exists),
-                        (
-                            SearchProjection::EarliestEnd,
-                            EndpointProjection::EarliestEnd,
-                        ),
+                    for projection in [
+                        SearchProjection::Exists,
+                        SearchProjection::Selected,
+                        SearchProjection::EarliestEnd,
                     ] {
                         assert_eq!(
-                            reference_endpoint_search(plan, haystack, window, endpoint),
+                            reference_union_search(plan, haystack, window, projection),
                             execute_ordinary_search(plan, haystack, window, projection).0,
                             "haystack={haystack:?} window={start}..{end} projection={projection:?}",
                         );
@@ -4867,6 +4923,134 @@ mod tests {
                 assert_eq!(4 * haystack.len(), accounting.upper_bounds.class_bytes);
             }
         }
+    }
+
+    #[test]
+    fn direct_selected_dense_false_anchors_fall_back_with_exact_counters() {
+        let plan = PrefixClassAlternationPlan::build(
+            [b"ab", b"xy"],
+            [
+                [(b'0', b'9')].into_iter(),
+                [(b'0', b'9')].into_iter(),
+            ],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let repetitions = 4 * DIRECT_UNION_FALSE_ANCHOR_BUDGET;
+        let haystack = b"abq".repeat(repetitions);
+
+        let (matched, accounting) = plan
+            .find(&haystack, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(None, matched);
+        assert_eq!(repetitions, accounting.actual.prefix_candidates);
+        assert_eq!(repetitions, accounting.actual.class_bytes);
+        assert!(accounting.actual.prefix_candidates <= accounting.upper_bounds.prefix_candidates);
+        assert!(accounting.actual.class_bytes <= accounting.upper_bounds.class_bytes);
+    }
+
+    #[test]
+    fn direct_union_fallback_threshold_preserves_every_projection() {
+        let class = [(b'0', b'9')];
+        let plan = PrefixClassAlternationPlan::build(
+            [b"ab", b"xy"],
+            [class.into_iter(), class.into_iter()],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        for false_anchors in [
+            DIRECT_UNION_FALSE_ANCHOR_BUDGET - 1,
+            DIRECT_UNION_FALSE_ANCHOR_BUDGET,
+            DIRECT_UNION_FALSE_ANCHOR_BUDGET + 1,
+            2 * DIRECT_UNION_FALSE_ANCHOR_BUDGET,
+        ] {
+            let mut haystack = b"a!".repeat(false_anchors);
+            haystack.extend_from_slice(b"ab777!");
+            let window = Window::full(&haystack);
+            for projection in [
+                SearchProjection::Exists,
+                SearchProjection::Selected,
+                SearchProjection::EarliestEnd,
+            ] {
+                let expected = reference_union_search(&plan, &haystack, window, projection);
+                let (actual, counters) =
+                    execute_ordinary_search(&plan, &haystack, window, projection);
+                assert_eq!(
+                    expected, actual,
+                    "false_anchors={false_anchors} projection={projection:?}",
+                );
+                assert_eq!(
+                    1, counters.prefix_candidates,
+                    "false_anchors={false_anchors} projection={projection:?}",
+                );
+                let expected_class_bytes = if projection == SearchProjection::Selected {
+                    4
+                } else {
+                    1
+                };
+                assert_eq!(
+                    expected_class_bytes, counters.class_bytes,
+                    "false_anchors={false_anchors} projection={projection:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn direct_selected_fallback_resumes_at_first_unprocessed_overlap() {
+        let class = [(b'0', b'9')];
+        let plan = PrefixClassAlternationPlan::build(
+            [b"ab", b"bc"],
+            [class.into_iter(), class.into_iter()],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let mut haystack = b"a!".repeat(DIRECT_UNION_FALSE_ANCHOR_BUDGET - 1);
+        haystack.extend_from_slice(b"abc7");
+
+        let (matched, accounting) = plan
+            .find(&haystack, SearchLimits::unlimited())
+            .unwrap();
+        let rejected_start = 2 * (DIRECT_UNION_FALSE_ANCHOR_BUDGET - 1);
+        assert_eq!(Some((rejected_start + 1, rejected_start + 4)), matched);
+        assert_eq!(2, accounting.actual.prefix_candidates);
+        assert_eq!(2, accounting.actual.class_bytes);
+    }
+
+    #[test]
+    fn direct_selected_upper_bounds_identity_and_one_below_are_atomic() {
+        let plan = plan();
+        let haystack = b"##abzzz!tail";
+        let window = Window::new(2, 8);
+        let baseline = plan
+            .find_in(haystack, window, SearchLimits::unlimited())
+            .unwrap();
+        let window_bytes = window.end() - window.start();
+        let fixed = plan.build_accounting().shape_units * 8 + 64;
+        assert_eq!(Some((2, 7)), baseline.0);
+        assert_eq!(SEARCH_OPERATION_ID, baseline.1.identity.operation_id);
+        assert_eq!(window_bytes, baseline.1.upper_bounds.haystack_bytes);
+        assert_eq!(2 * window_bytes, baseline.1.upper_bounds.prefix_candidates);
+        assert_eq!(4 * window_bytes, baseline.1.upper_bounds.class_bytes);
+        assert_eq!(16 * window_bytes + fixed, baseline.1.upper_bounds.work);
+
+        let exact = SearchLimits {
+            max_work_upper_bound: u64::try_from(baseline.1.upper_bounds.work).unwrap(),
+            max_scratch_bytes: baseline.1.upper_bounds.scratch_bytes,
+        };
+        assert!(matches!(
+            plan.find_in(
+                haystack,
+                window,
+                SearchLimits {
+                    max_work_upper_bound: exact.max_work_upper_bound - 1,
+                    ..exact
+                },
+            ),
+            Err(ReduceError::WorkLimit { .. })
+        ));
+        let retry = plan.find_in(haystack, window, exact).unwrap();
+        assert_eq!(baseline, retry);
     }
 
     #[test]
@@ -5183,7 +5367,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_cursor_binding_is_plan_local_and_source_local() {
+    fn selected_and_retained_search_are_plan_local_across_same_address_mutation() {
         let digits = PrefixClassAlternationPlan::build(
             [b"ab", b"xy"],
             [
@@ -5204,6 +5388,14 @@ mod tests {
         .unwrap();
         let mut haystack = b"!ab12!xyQ!".to_vec();
         let address = haystack.as_ptr();
+        assert_eq!(
+            Some((1, 5)),
+            digits.find(&haystack, SearchLimits::unlimited()).unwrap().0,
+        );
+        assert_eq!(
+            Some((6, 9)),
+            letters.find(&haystack, SearchLimits::unlimited()).unwrap().0,
+        );
         {
             let mut digit_cursor = digits.search_cursor(&haystack);
             let mut letter_cursor = letters.search_cursor(&haystack);
@@ -5215,6 +5407,14 @@ mod tests {
         haystack[3..5].copy_from_slice(b"AZ");
         haystack[8] = b'7';
         assert_eq!(address, haystack.as_ptr());
+        assert_eq!(
+            Some((6, 9)),
+            digits.find(&haystack, SearchLimits::unlimited()).unwrap().0,
+        );
+        assert_eq!(
+            Some((1, 5)),
+            letters.find(&haystack, SearchLimits::unlimited()).unwrap().0,
+        );
         let mut digit_cursor = digits.search_cursor(&haystack);
         let mut letter_cursor = letters.search_cursor(&haystack);
         assert_eq!(Some((6, 9)), digit_cursor.find_at(0, SearchLimits::unlimited()).unwrap().0);
@@ -5271,6 +5471,95 @@ mod tests {
         }
         assert_eq!(expected, actual);
         assert_eq!(upper.work, total_charge);
+    }
+
+    #[test]
+    fn dispatched_one_shot_union_matches_scalar_across_fallback_threshold_when_available() {
+        let dispatch = SimdDispatchContext::capture();
+        if !PrefixClassAlternationPlan::run_scanners_usable(dispatch) {
+            return;
+        }
+        let class = [(b'0', b'9')];
+        let scalar = PrefixClassAlternationPlan::build(
+            [b"ab", b"xy"],
+            [class.into_iter(), class.into_iter()],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let dispatched = DispatchedPrefixClassAlternationPlan::build_with_dispatch(
+            dispatch,
+            [b"ab", b"xy"],
+            [class.into_iter(), class.into_iter()],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+
+        for false_anchors in [
+            DIRECT_UNION_FALSE_ANCHOR_BUDGET - 1,
+            DIRECT_UNION_FALSE_ANCHOR_BUDGET,
+            DIRECT_UNION_FALSE_ANCHOR_BUDGET + 1,
+            2 * DIRECT_UNION_FALSE_ANCHOR_BUDGET,
+        ] {
+            let mut haystack = b"a!".repeat(false_anchors);
+            haystack.extend_from_slice(b"ab777!");
+
+            let scalar_selected = scalar
+                .find(&haystack, SearchLimits::unlimited())
+                .unwrap();
+            let dispatched_selected = dispatched
+                .find(&haystack, SearchLimits::unlimited())
+                .unwrap();
+            assert_eq!(
+                scalar_selected.0, dispatched_selected.0,
+                "selected false_anchors={false_anchors}",
+            );
+            assert_eq!(
+                scalar_selected.1.actual.prefix_candidates,
+                dispatched_selected.1.actual.prefix_candidates,
+                "selected false_anchors={false_anchors}",
+            );
+            assert!(
+                dispatched_selected.1.actual.class_bytes
+                    <= dispatched_selected.1.upper_bounds.class_bytes
+            );
+            assert_eq!(
+                SEARCH_OPERATION_ID,
+                scalar_selected.1.identity.operation_id,
+            );
+            assert_eq!(
+                SEARCH_OPERATION_ID,
+                dispatched_selected.1.identity.operation_id,
+            );
+
+            let scalar_exists = scalar
+                .is_match(&haystack, SearchLimits::unlimited())
+                .unwrap();
+            let dispatched_exists = dispatched
+                .is_match(&haystack, SearchLimits::unlimited())
+                .unwrap();
+            assert_eq!(
+                scalar_exists.0, dispatched_exists.0,
+                "exists false_anchors={false_anchors}",
+            );
+            assert_eq!(
+                scalar_exists.1.actual, dispatched_exists.1.actual,
+                "exists accounting false_anchors={false_anchors}",
+            );
+            let scalar_shortest = scalar
+                .shortest(&haystack, SearchLimits::unlimited())
+                .unwrap();
+            let dispatched_shortest = dispatched
+                .shortest(&haystack, SearchLimits::unlimited())
+                .unwrap();
+            assert_eq!(
+                scalar_shortest.0, dispatched_shortest.0,
+                "earliest-end false_anchors={false_anchors}",
+            );
+            assert_eq!(
+                scalar_shortest.1.actual, dispatched_shortest.1.actual,
+                "earliest-end accounting false_anchors={false_anchors}",
+            );
+        }
     }
 
     #[test]
