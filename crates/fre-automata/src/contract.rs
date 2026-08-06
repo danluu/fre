@@ -591,8 +591,12 @@ impl<O: Operation> TypedPlan<'_, O> {
 
 impl TypedPlan<'_, Exists> {
     /// Return only existence through a caller-validated, authenticated
-    /// workspace. Unlimited warm calls may read immutable completed lazy rows
-    /// without constructing accounting that this value-only facade discards.
+    /// workspace. Unlimited warm calls may read completed lazy rows without
+    /// constructing accounting that this value-only facade discards. A direct
+    /// row's first unavailable transition hands off mutably at that exact byte
+    /// without replaying its already-filled prefix. The continuation may use a
+    /// retained loop proof or attempt publication when needed and capacity
+    /// permits it.
     ///
     /// # Errors
     ///

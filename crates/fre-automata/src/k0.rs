@@ -4950,13 +4950,16 @@ impl<'a> K0SearchSession<'a> {
     /// Project warm existence directly for value-only callers.
     ///
     /// The ordinary report-producing entry remains authoritative for finite
-    /// limits, cold cache/proof publication, unfilled transitions, and every
-    /// non-existence contract. Once an exact session has authenticated its
-    /// lazy cache and immutable start proof, an unlimited existence call can
-    /// read filled direct rows or contextual records without mutating the
-    /// workspace or constructing diagnostics that its caller will immediately
-    /// discard. Any unavailable transition declines before mutation and
-    /// re-enters the ordinary executor from the original state.
+    /// limits, cold cache/proof publication, unavailable contextual records,
+    /// and every non-existence contract. Once an exact session has
+    /// authenticated its lazy cache and immutable start proof, an unlimited
+    /// existence call can read filled direct rows or contextual records without
+    /// constructing diagnostics that its caller will immediately discard. A
+    /// direct-row miss hands off and continues at the first unread byte without
+    /// replaying the filled prefix; its continuation may use a retained loop
+    /// proof or attempt publication when needed and capacity permits. An
+    /// unavailable contextual record remains a transactional decline to the
+    /// ordinary executor.
     pub(crate) fn search_exists_value_untyped(
         &mut self,
         haystack: &[u8],
@@ -4968,7 +4971,7 @@ impl<'a> K0SearchSession<'a> {
             self.automaton,
             haystack,
             window,
-            &self.workspace,
+            &mut self.workspace,
             limits,
             self.capabilities,
         )? {
@@ -5161,15 +5164,15 @@ impl<'a> K0SearchSession<'a> {
     }
 }
 
-/// Try the immutable, already-filled direct rows or contextual records for
-/// one authenticated value call. Returning `None` is a transactional decline:
-/// neither retained cache nor invocation scratch has changed, so the ordinary
-/// executor can restart from the original window.
+/// Try already-filled direct rows or contextual records for one authenticated
+/// value call. A direct miss hands off mutably at its exact first unread byte;
+/// `None` remains a transactional decline for unsupported or contextual paths,
+/// so the ordinary executor can restart from the original window.
 fn try_authenticated_warm_exists_value(
     automaton: &Automaton,
     haystack: &[u8],
     window: SearchWindow,
-    workspace: &K0Workspace,
+    workspace: &mut K0Workspace,
     limits: SearchLimits,
     capabilities: LazyCapabilities,
 ) -> Result<Option<bool>, SearchError> {
@@ -5205,7 +5208,7 @@ fn try_authenticated_warm_exists_value(
     if proof.force_haystack_start || proof.relaxed_nullable != nullable_initial {
         return Ok(None);
     }
-    try_warm_direct_exists(automaton, haystack, window, &workspace.lazy, proof)
+    try_warm_direct_exists(automaton, haystack, window, workspace, proof)
 }
 
 /// Read one already-published contextual initial state.
@@ -5633,27 +5636,44 @@ enum WarmDirectSelectedEnd {
     Complete(Option<usize>),
 }
 
-/// Read one already-warmed assertion-free existence machine without changing
-/// its cache or invocation scratch.
+/// Exact invocation-local state at the first unpublished direct transition of
+/// a warm existence projection. Source-derived scanner cursors live only until
+/// the mutable handoff completes this same call.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct WarmDirectExistsContinuation {
+    initial_row: u32,
+    state: u32,
+    position: usize,
+    work: u64,
+    engine_candidate: Option<usize>,
+    retained_start_mask: RetainedStartMaskCursor,
+    adaptive_probe: AdaptiveStartProbe,
+    loop_probe: LazyLoopProbe,
+    active_loop_slot: Option<usize>,
+    first_loop_decided: bool,
+}
+
+/// Read one already-warmed assertion-free existence machine, handing off
+/// mutably if its filled prefix reaches a first unavailable direct transition.
 ///
 /// The first classifier-width prefix stays inline. If it cannot decide the
 /// complete result, the outlined executor consumes its exact stack-local DFA
 /// row and next unread source position; it never restarts the prefix. `None`
-/// remains a transactional cache decline, and saturated workspaces decline
-/// before reading any source byte.
+/// remains a transactional decline for unsupported paths, and saturated
+/// workspaces decline before reading any source byte.
 #[inline]
 #[allow(
     clippy::too_many_lines,
-    reason = "the complete inline prefix preserves one explicit transactional decline boundary"
+    reason = "the complete inline prefix preserves the exact mutable handoff boundary"
 )]
 fn try_warm_direct_exists(
     automaton: &Automaton,
     haystack: &[u8],
     window: SearchWindow,
-    lazy: &LazyWorkspace,
+    workspace: &mut K0Workspace,
     proof: &StartFilterProof,
 ) -> Result<Option<bool>, SearchError> {
-    if lazy.saturated {
+    if workspace.lazy.saturated {
         return Ok(None);
     }
     let haystack = haystack
@@ -5661,18 +5681,18 @@ fn try_warm_direct_exists(
         .ok_or(SearchError::InternalInvariant {
             detail: "warm existence window exceeds the validated haystack",
         })?;
-    match lazy.initial_kind {
+    match workspace.lazy.initial_kind {
         LazyInitialKind::NullablePrefix | LazyInitialKind::NullableTerminal => {
             return Ok(Some(true));
         }
         LazyInitialKind::Positive | LazyInitialKind::PositiveSingle => {}
         LazyInitialKind::Uninitialized => return Ok(None),
     }
-    if lazy.initial == LAZY_NO_STATE {
+    if workspace.lazy.initial == LAZY_NO_STATE {
         return Ok(None);
     }
 
-    let initial_row = lazy.row_offset(lazy.initial)?;
+    let initial_row = workspace.lazy.row_offset(workspace.lazy.initial)?;
     let (mut state, mut position, mut consumed, engine_candidate) =
         match warm_bounded_start(haystack, window, proof)? {
             WarmBoundedStart::Exhausted => return Ok(Some(false)),
@@ -5686,7 +5706,7 @@ fn try_warm_direct_exists(
                     automaton,
                     haystack,
                     window,
-                    lazy,
+                    workspace,
                     proof,
                     initial_row,
                     initial_row,
@@ -5718,9 +5738,32 @@ fn try_warm_direct_exists(
             })?;
         let byte = haystack[position];
         let class = automaton.byte_classes().class_of(byte);
-        let cell = lazy.direct_cell(state, class)?;
+        let cell = workspace.lazy.direct_cell(state, class)?;
         if cell == LAZY_CELL_UNFILLED {
-            return Ok(None);
+            return continue_mutable_warm_direct_exists(
+                automaton,
+                haystack,
+                window,
+                workspace,
+                proof,
+                WarmDirectExistsContinuation {
+                    initial_row,
+                    state,
+                    position,
+                    work: consumed.checked_sub(1).ok_or(
+                        SearchError::InternalInvariant {
+                            detail: "warm existence prefix omitted its current transition work",
+                        },
+                    )?,
+                    engine_candidate,
+                    retained_start_mask: RetainedStartMaskCursor::default(),
+                    adaptive_probe: AdaptiveStartProbe::default(),
+                    loop_probe: LazyLoopProbe::default(),
+                    active_loop_slot: None,
+                    first_loop_decided: false,
+                },
+            )
+            .map(Some);
         }
         // A Rust slice is no longer than `isize::MAX`; the validated ceiling
         // therefore proves this increment cannot overflow.
@@ -5748,7 +5791,7 @@ fn try_warm_direct_exists(
                 automaton,
                 haystack,
                 window,
-                lazy,
+                workspace,
                 proof,
                 initial_row,
                 state,
@@ -5766,7 +5809,7 @@ fn try_warm_direct_exists(
         automaton,
         haystack,
         window,
-        lazy,
+        workspace,
         proof,
         initial_row,
         state,
@@ -5785,7 +5828,7 @@ fn continue_warm_direct_exists(
     automaton: &Automaton,
     haystack: &[u8],
     window: SearchWindow,
-    lazy: &LazyWorkspace,
+    workspace: &mut K0Workspace,
     proof: &StartFilterProof,
     initial_row: u32,
     state: u32,
@@ -5793,12 +5836,12 @@ fn continue_warm_direct_exists(
     consumed: u64,
     engine_candidate: Option<usize>,
 ) -> Result<Option<bool>, SearchError> {
-    if lazy.loop_skip_plans.is_empty() {
+    if workspace.lazy.loop_skip_plans.is_empty() {
         continue_warm_direct_exists_loop::<false>(
             automaton,
             haystack,
             window,
-            lazy,
+            workspace,
             proof,
             initial_row,
             state,
@@ -5811,7 +5854,7 @@ fn continue_warm_direct_exists(
             automaton,
             haystack,
             window,
-            lazy,
+            workspace,
             proof,
             initial_row,
             state,
@@ -5832,7 +5875,7 @@ fn continue_warm_direct_exists_loop<const LOOP_SKIP: bool>(
     automaton: &Automaton,
     haystack: &[u8],
     window: SearchWindow,
-    lazy: &LazyWorkspace,
+    workspace: &mut K0Workspace,
     proof: &StartFilterProof,
     initial_row: u32,
     mut state: u32,
@@ -5840,7 +5883,7 @@ fn continue_warm_direct_exists_loop<const LOOP_SKIP: bool>(
     consumed: u64,
     mut engine_candidate: Option<usize>,
 ) -> Result<Option<bool>, SearchError> {
-    debug_assert!(!LOOP_SKIP || !lazy.loop_skip_plans.is_empty());
+    debug_assert!(!LOOP_SKIP || !workspace.lazy.loop_skip_plans.is_empty());
     let mut meter = WorkMeter::new(u64::MAX, consumed);
     let mut retained_start_mask = RetainedStartMaskCursor::default();
     let mut adaptive_probe = AdaptiveStartProbe::default();
@@ -5885,9 +5928,10 @@ fn continue_warm_direct_exists_loop<const LOOP_SKIP: bool>(
             }
         }
         if LOOP_SKIP {
-            let selected = lazy
+            let selected = workspace
+                .lazy
                 .loop_skip_plans
-                .find_with_hint(state, active_loop_slot, lazy.direct_row_stride);
+                .find_with_hint(state, active_loop_slot, workspace.lazy.direct_row_stride);
             let selected_slot = selected.map(|(slot, _)| slot);
             if selected_slot != active_loop_slot {
                 loop_probe.left_plan_state();
@@ -5929,9 +5973,32 @@ fn continue_warm_direct_exists_loop<const LOOP_SKIP: bool>(
         meter.charge(1, position)?;
         let byte = haystack[position];
         let class = automaton.byte_classes().class_of(byte);
-        let cell = lazy.direct_cell(state, class)?;
+        let cell = workspace.lazy.direct_cell(state, class)?;
         if cell == LAZY_CELL_UNFILLED {
-            return Ok(None);
+            return continue_mutable_warm_direct_exists(
+                automaton,
+                haystack,
+                window,
+                workspace,
+                proof,
+                WarmDirectExistsContinuation {
+                    initial_row,
+                    state,
+                    position,
+                    work: meter.consumed.checked_sub(1).ok_or(
+                        SearchError::InternalInvariant {
+                            detail: "warm existence continuation omitted its current transition work",
+                        },
+                    )?,
+                    engine_candidate,
+                    retained_start_mask,
+                    adaptive_probe,
+                    loop_probe,
+                    active_loop_slot,
+                    first_loop_decided: true,
+                },
+            )
+            .map(Some);
         }
         #[allow(
             clippy::arithmetic_side_effects,
@@ -5952,6 +6019,257 @@ fn continue_warm_direct_exists_loop<const LOOP_SKIP: bool>(
             .ok_or(SearchError::InternalInvariant {
                 detail: "warm existence encoded state underflowed",
             })?;
+    }
+}
+
+fn complete_mutable_warm_direct_exists(
+    automaton: &Automaton,
+    workspace: &mut K0Workspace,
+    window: SearchWindow,
+    meter: &mut WorkMeter,
+    found: bool,
+) -> Result<bool, SearchError> {
+    if window.end().saturating_sub(window.start()) >= LAZY_LOOP_SKIP_MIN_BYTES {
+        try_derive_lazy_loop_skip(automaton, workspace, meter)?;
+    }
+    Ok(found)
+}
+
+/// Publish and continue the exact first cache miss reached by an immutable
+/// warm Exists projection. Invocation setup replaces the probe's synthetic
+/// reset charge, while all completed scanner, loop-skip, and transition work
+/// is charged once. The already-consumed prefix is never replayed.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the mutable handoff retains every invocation-local scanner and loop cursor"
+)]
+#[inline(never)]
+fn continue_mutable_warm_direct_exists(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    proof: &StartFilterProof,
+    continuation: WarmDirectExistsContinuation,
+) -> Result<bool, SearchError> {
+    let haystack = haystack
+        .get(..window.end())
+        .ok_or(SearchError::InternalInvariant {
+            detail: "warm existence mutable handoff exceeded the validated haystack",
+        })?;
+    let mut setup = SetupAccounting::empty(workspace.retained_bytes, true);
+    let (mut meter, _) = prepare_bound_invocation(
+        automaton,
+        workspace,
+        window,
+        SearchLimits::unlimited(),
+        &mut setup,
+        true,
+        false,
+    )?;
+    let completed_work = continuation.work.checked_sub(INVOCATION_RESET_WORK).ok_or(
+        SearchError::InternalInvariant {
+            detail: "warm existence handoff omitted its invocation reset",
+        },
+    )?;
+    meter.charge(completed_work, continuation.position)?;
+    if !workspace.lazy.is_bound_to(automaton)
+        || !workspace.lazy.initialized
+        || workspace.lazy.declined
+    {
+        return Err(SearchError::InternalInvariant {
+            detail: "warm existence handoff lost its authenticated lazy workspace",
+        });
+    }
+
+    let mut state = LazyState::Cached(continuation.state);
+    let mut position = continuation.position;
+    let mut engine_candidate = continuation.engine_candidate;
+    let mut retained_start_mask = continuation.retained_start_mask;
+    let mut adaptive_probe = continuation.adaptive_probe;
+    let mut loop_probe = continuation.loop_probe;
+    let mut active_loop_slot = continuation.active_loop_slot;
+    // The scanner decision for the first unconsumed byte was already made by
+    // the immutable probe. Its outlined loop also evaluated loop skipping;
+    // the inline prefix did not, so let that origin select a retained loop
+    // before building precisely this first unavailable transition.
+    let mut first_unfilled = true;
+
+    loop {
+        if !first_unfilled && state == LazyState::Cached(continuation.initial_row) {
+            if let Some(scanner) = proof.scanner.as_ref() {
+                if position < window.end() {
+                    if let (Some(probe), Some(candidate)) =
+                        (proof.probe(), engine_candidate.take())
+                    {
+                        adaptive_probe.observe_restartable_rejection(
+                            probe,
+                            haystack,
+                            candidate,
+                            window.end(),
+                            &mut meter,
+                        )?;
+                    }
+                } else {
+                    engine_candidate = None;
+                }
+                position = next_start_candidate_adaptive(
+                    scanner,
+                    haystack,
+                    position,
+                    window.end(),
+                    proof.guard(),
+                    proof.probe(),
+                    &mut meter,
+                    &mut retained_start_mask,
+                    &mut adaptive_probe,
+                )?;
+                if position == window.end() {
+                    return complete_mutable_warm_direct_exists(
+                        automaton,
+                        workspace,
+                        window,
+                        &mut meter,
+                        false,
+                    );
+                }
+                if proof.probe().is_some() && adaptive_probe.samples_rejections() {
+                    engine_candidate = Some(position);
+                }
+            }
+        }
+
+        if (!first_unfilled || !continuation.first_loop_decided)
+            && !workspace.lazy.loop_skip_plans.is_empty()
+        {
+            let selected = match state {
+                LazyState::Cached(cached) => workspace.lazy.loop_skip_plans.find_with_hint(
+                    cached,
+                    active_loop_slot,
+                    workspace.lazy.direct_row_stride,
+                ),
+                LazyState::Inline { .. } => None,
+            };
+            let selected_slot = selected.map(|(slot, _)| slot);
+            if selected_slot != active_loop_slot {
+                loop_probe.left_plan_state();
+                active_loop_slot = selected_slot;
+            }
+            if let Some((_, plan)) = selected {
+                if loop_probe.is_ready(position)
+                    && haystack.len().saturating_sub(position) >= LAZY_LOOP_SKIP_MIN_BYTES
+                {
+                    let skipped = plan.scanner.scan_forward(&haystack[position..]);
+                    loop_probe.observe(position, skipped)?;
+                    if skipped != 0 {
+                        meter.charge_admitted(
+                            u64::try_from(skipped)
+                                .expect("mutable warm existence loop length fits u64"),
+                        );
+                        position = position.checked_add(skipped).ok_or(
+                            SearchError::ArithmeticOverflow {
+                                computation: "mutable warm existence loop source progress",
+                            },
+                        )?;
+                        if position == haystack.len() {
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        if position >= haystack.len() {
+            if position == haystack.len() {
+                return complete_mutable_warm_direct_exists(
+                    automaton,
+                    workspace,
+                    window,
+                    &mut meter,
+                    false,
+                );
+            }
+            return Err(SearchError::InternalInvariant {
+                detail: "mutable warm existence position exceeded the validated window",
+            });
+        }
+
+        meter.charge(1, position)?;
+        let byte = haystack[position];
+        let transition = match state {
+            LazyState::Cached(cached) => {
+                let class = automaton.byte_classes().class_of(byte);
+                let cell = workspace.lazy.direct_cell(cached, class)?;
+                if cell == LAZY_CELL_UNFILLED {
+                    build_lazy_cached_transition(
+                        automaton,
+                        workspace.lazy.row_state(cached),
+                        byte,
+                        class,
+                        workspace,
+                        &mut meter,
+                        0,
+                        position,
+                    )?
+                } else {
+                    LazyTransition::Ready(cell)
+                }
+            }
+            LazyState::Inline { pending } => build_lazy_inline_transition(
+                automaton,
+                byte,
+                pending,
+                workspace,
+                &mut meter,
+                position,
+            )?,
+        };
+        first_unfilled = false;
+        position = position
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "mutable warm existence source progress",
+            })?;
+        let (accepted, next) = match transition {
+            LazyTransition::Ready(cell) => {
+                let encoded = cell & LAZY_CELL_STATE_MASK;
+                (
+                    cell & LAZY_CELL_ACCEPT != 0,
+                    if encoded == 0 {
+                        None
+                    } else {
+                        Some(LazyState::Cached(encoded.checked_sub(1).ok_or(
+                            SearchError::InternalInvariant {
+                                detail: "mutable warm existence state encoding underflowed",
+                            },
+                        )?))
+                    },
+                )
+            }
+            LazyTransition::Inline { accepted, pending } => {
+                (accepted, Some(LazyState::Inline { pending }))
+            }
+        };
+        if accepted {
+            return complete_mutable_warm_direct_exists(
+                automaton,
+                workspace,
+                window,
+                &mut meter,
+                true,
+            );
+        }
+        let Some(next) = next else {
+            return complete_mutable_warm_direct_exists(
+                automaton,
+                workspace,
+                window,
+                &mut meter,
+                false,
+            );
+        };
+        state = next;
     }
 }
 
@@ -31295,13 +31613,13 @@ mod tests {
             "slot B must scan immediately rather than inherit slot A's cooldown"
         );
 
-        let warm = direct_two_state_loop_workspace(&plan);
+        let mut warm = direct_two_state_loop_workspace(&plan);
         assert_eq!(
             super::continue_warm_direct_exists_loop::<true>(
                 &plan,
                 &haystack,
                 window,
-                &warm.lazy,
+                &mut warm,
                 &super::ORDINARY_START_FILTER_PROOF,
                 initial_row,
                 initial_row,
@@ -38122,7 +38440,7 @@ mod tests {
                 &plan,
                 haystack,
                 window,
-                &session.workspace.lazy,
+                &mut session.workspace,
                 proof,
             ),
             Ok(Some(true)),
@@ -38402,7 +38720,7 @@ mod tests {
                 &plan,
                 &long_at_start,
                 SearchWindow::full(&long_at_start),
-                &session.workspace.lazy,
+                &mut session.workspace,
                 proof,
             ),
             Ok(Some(true)),
@@ -38445,7 +38763,7 @@ mod tests {
                 &plan,
                 &late,
                 SearchWindow::full(&late),
-                &session.workspace.lazy,
+                &mut session.workspace,
                 proof,
             ),
             Ok(Some(true)),
@@ -38483,11 +38801,332 @@ mod tests {
                 &plan,
                 &absent,
                 SearchWindow::full(&absent),
-                &absent_session.workspace.lazy,
+                &mut absent_session.workspace,
                 proof,
             ),
             Ok(Some(false)),
         );
+    }
+
+    #[test]
+    fn warm_value_exists_publishes_first_miss_without_prefix_replay() {
+        let match_len = WARM_EXISTS_INLINE_BYTES.checked_add(4).unwrap();
+        let plan = byte_chain(&vec![(b'a', b'a'); match_len]);
+        let warmed = vec![b'a'; match_len];
+        let mut novel = warmed.clone();
+        *novel.last_mut().unwrap() = b'x';
+        let window = SearchWindow::full(&novel);
+        let warm = |session: &mut K0SearchSession<'_>| {
+            assert!(
+                session
+                    .search_window::<Exists>(
+                        &warmed,
+                        SearchWindow::full(&warmed),
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap()
+                    .into_output()
+            );
+        };
+        let branch_row = |workspace: &K0Workspace| {
+            let mut row = workspace.lazy.row_offset(workspace.lazy.initial).unwrap();
+            for _ in 0..match_len - 1 {
+                let cell = workspace
+                    .lazy
+                    .direct_cell(row, byte_class(&plan, b'a'))
+                    .unwrap();
+                assert_ne!(cell, super::LAZY_CELL_UNFILLED);
+                row = (cell & super::LAZY_CELL_STATE_MASK)
+                    .checked_sub(1)
+                    .expect("the warmed prefix remains live");
+            }
+            row
+        };
+
+        let mut direct =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+        warm(&mut direct);
+        let proof = plan.start_filter_proof.get().unwrap();
+        let initial_row = direct
+            .workspace
+            .lazy
+            .row_offset(direct.workspace.lazy.initial)
+            .unwrap();
+        let row = branch_row(&direct.workspace);
+        let novel_class = byte_class(&plan, b'x');
+        assert_eq!(
+            direct.workspace.lazy.direct_cell(row, novel_class).unwrap(),
+            super::LAZY_CELL_UNFILLED
+        );
+        let consumed_prefix_cell = usize::try_from(initial_row)
+            .unwrap()
+            .checked_add(usize::from(byte_class(&plan, b'a')))
+            .unwrap();
+        direct.workspace.lazy.rows[consumed_prefix_cell] = super::LAZY_CELL_UNFILLED;
+        assert!(!super::continue_mutable_warm_direct_exists(
+            &plan,
+            &novel,
+            window,
+            &mut direct.workspace,
+            proof,
+            super::WarmDirectExistsContinuation {
+                initial_row,
+                state: row,
+                position: match_len - 1,
+                work: INVOCATION_RESET_WORK
+                    .checked_add(u64::try_from(match_len - 1).unwrap())
+                    .unwrap(),
+                ..super::WarmDirectExistsContinuation::default()
+            },
+        )
+        .unwrap());
+        assert_ne!(
+            direct.workspace.lazy.direct_cell(row, novel_class).unwrap(),
+            super::LAZY_CELL_UNFILLED,
+            "mutable continuation did not publish its first missing cell"
+        );
+        assert_eq!(
+            direct
+                .workspace
+                .lazy
+                .direct_cell(initial_row, byte_class(&plan, b'a'))
+                .unwrap(),
+            super::LAZY_CELL_UNFILLED,
+            "mutable continuation replayed an already-consumed prefix edge"
+        );
+
+        let mut integrated =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+        warm(&mut integrated);
+        let row = branch_row(&integrated.workspace);
+        assert_eq!(
+            integrated
+                .workspace
+                .lazy
+                .direct_cell(row, novel_class)
+                .unwrap(),
+            super::LAZY_CELL_UNFILLED
+        );
+        assert!(!integrated
+            .search_exists_value(&novel, window, SearchLimits::unlimited())
+            .unwrap());
+        assert_ne!(
+            integrated
+                .workspace
+                .lazy
+                .direct_cell(row, novel_class)
+                .unwrap(),
+            super::LAZY_CELL_UNFILLED
+        );
+        let rows = integrated.workspace.lazy.rows.clone();
+        let generation = integrated.workspace.generation;
+        assert!(!integrated
+            .search_exists_value(&novel, window, SearchLimits::unlimited())
+            .unwrap());
+        assert_eq!(integrated.workspace.lazy.rows, rows);
+        assert_eq!(integrated.workspace.generation, generation);
+    }
+
+    #[test]
+    fn warm_value_exists_matches_reports_after_same_address_source_changes() {
+        let plans = [
+            ascii_root_bytes(b"a"),
+            ascii_root_bytes(b"ac"),
+            ascii_root_bytes(b"abc"),
+            ascii_root_bytes(b"aceg"),
+            byte_chain(&[(b'A', b'Z'), (b'a', b'z'), (b'0', b'9')]),
+            a_star(true),
+            empty_or_ab(false),
+            asserted_line_a(),
+        ];
+        let haystacks = bounded_words(&[0x00, b'A', b'a', b'b', b'1', 0x80, 0xff], 3);
+        let mut mutable_handoffs = 0usize;
+        let mut comparisons = 0usize;
+
+        for plan in &plans {
+            let mut value =
+                K0SearchSession::new_selected(plan, WorkspaceLimits::unlimited(), true, true)
+                    .unwrap();
+            let mut reported =
+                K0SearchSession::new_selected(plan, WorkspaceLimits::unlimited(), true, true)
+                    .unwrap();
+            for haystack in &haystacks {
+                let mut source = haystack.clone();
+                for byte in &mut source {
+                    *byte = byte.wrapping_add(1);
+                }
+                let address = source.as_ptr();
+                for start in 0..=source.len() {
+                    for end in start..=source.len() {
+                        let window = SearchWindow::new(start, end);
+                        value
+                            .search_window::<Exists>(
+                                &source,
+                                window,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap();
+                        source.copy_from_slice(haystack);
+                        assert_eq!(source.as_ptr(), address);
+                        let published = value.workspace.lazy.direct_cells_published;
+                        let actual = value
+                            .search_exists_value(&source, window, SearchLimits::unlimited())
+                            .unwrap();
+                        mutable_handoffs = mutable_handoffs.saturating_add(usize::from(
+                            value.workspace.lazy.direct_cells_published > published,
+                        ));
+                        let expected = reported
+                            .search_window::<Exists>(haystack, window, SearchLimits::unlimited())
+                            .unwrap()
+                            .into_output();
+                        assert_eq!(actual, expected);
+                        comparisons = comparisons.saturating_add(1);
+                        for byte in &mut source {
+                            *byte = byte.wrapping_add(1);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(mutable_handoffs != 0);
+        assert!(comparisons > 29_000);
+    }
+
+    #[test]
+    fn warm_value_exists_first_miss_matches_ordinary_cache_mutation() {
+        let assert_equivalent = |left: &K0Workspace, right: &K0Workspace| {
+            assert_resume_cache_equivalent(left, right);
+            assert_eq!(
+                left.lazy.loop_skip_analyzed_at_cells,
+                right.lazy.loop_skip_analyzed_at_cells,
+            );
+            assert_eq!(
+                left.lazy.loop_skip_plans.state_members,
+                right.lazy.loop_skip_plans.state_members,
+            );
+            assert_eq!(
+                direct_loop_cache_signature(left),
+                direct_loop_cache_signature(right),
+            );
+        };
+
+        let match_len = WARM_EXISTS_INLINE_BYTES.checked_add(4).unwrap();
+        let plan = byte_chain(&vec![(b'a', b'a'); match_len]);
+        let warm = vec![b'a'; match_len];
+        let mut novel = warm.clone();
+        *novel.last_mut().unwrap() = b'x';
+        let mut proof_owner =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+        proof_owner
+            .search_window::<Exists>(
+                &warm,
+                SearchWindow::full(&warm),
+                SearchLimits::unlimited(),
+            )
+            .unwrap();
+        let mut value =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+        let mut ordinary =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+        for session in [&mut value, &mut ordinary] {
+            assert!(
+                session
+                    .search_window::<Exists>(
+                        &warm,
+                        SearchWindow::full(&warm),
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap()
+                    .into_output()
+            );
+        }
+        assert!(!value
+            .search_exists_value(
+                &novel,
+                SearchWindow::full(&novel),
+                SearchLimits::unlimited(),
+            )
+            .unwrap());
+        assert!(!ordinary
+            .search_window::<Exists>(
+                &novel,
+                SearchWindow::full(&novel),
+                SearchLimits::unlimited(),
+            )
+            .unwrap()
+            .into_output());
+        assert_equivalent(&value.workspace, &ordinary.workspace);
+
+        // Fill the retained state arena exactly, but do not try the next row
+        // until the novel value call. Both routes must cross into the same
+        // exact inline continuation without pretending that cell was retained.
+        let mut retained_states = 0usize;
+        let mut retained_items = 0usize;
+        loop {
+            let next_states = retained_states.checked_add(1).unwrap();
+            let next_items = retained_items.checked_add(next_states).unwrap();
+            if next_states > super::LAZY_MAX_STATES || next_items > super::LAZY_MAX_ITEMS {
+                break;
+            }
+            retained_states = next_states;
+            retained_items = next_items;
+        }
+        let depth = retained_states.checked_add(1).unwrap();
+        let plan = byte_chain(&vec![(b'a', b'a'); depth]);
+        let warm = vec![b'a'; retained_states.checked_sub(1).unwrap()];
+        let novel = vec![b'a'; retained_states];
+        let mut proof_owner =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+        proof_owner
+            .search_window::<Exists>(
+                &warm,
+                SearchWindow::full(&warm),
+                SearchLimits::unlimited(),
+            )
+            .unwrap();
+        let mut value =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+        let mut ordinary =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+        for session in [&mut value, &mut ordinary] {
+            assert!(!session
+                .search_window::<Exists>(
+                    &warm,
+                    SearchWindow::full(&warm),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output());
+            assert_eq!(session.workspace.lazy.state_len, retained_states);
+            assert_eq!(session.workspace.lazy.item_len, retained_items);
+            assert!(!session.workspace.lazy.saturated);
+        }
+        assert!(!value
+            .search_exists_value(
+                &novel,
+                SearchWindow::full(&novel),
+                SearchLimits::unlimited(),
+            )
+            .unwrap());
+        assert!(!ordinary
+            .search_window::<Exists>(
+                &novel,
+                SearchWindow::full(&novel),
+                SearchLimits::unlimited(),
+            )
+            .unwrap()
+            .into_output());
+        assert!(value.workspace.lazy.saturated);
+        assert!(ordinary.workspace.lazy.saturated);
+        assert_equivalent(&value.workspace, &ordinary.workspace);
     }
 
     #[test]
@@ -38576,7 +39215,7 @@ mod tests {
                 &plan,
                 &source,
                 window,
-                &session.workspace.lazy,
+                &mut session.workspace,
                 proof,
             ),
             Ok(None),
