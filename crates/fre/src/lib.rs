@@ -88,6 +88,7 @@ mod finite_root;
 mod fixed_absolute;
 mod forward_anchored;
 mod grapheme_scalar;
+mod k0_general_reverse_inner;
 pub mod guarded_ascii_word;
 mod guarded_literal_set;
 pub mod guarded_unicode_word;
@@ -3849,6 +3850,7 @@ impl PortableBuilder {
                     automaton,
                     absolute_end_proof: k0_absolute_end_proof,
                     correlated_terminal: None,
+                    reverse_inner: None,
                     mandatory_suffix: None,
                     mandatory_cut: None,
                     negative_prefilter: None,
@@ -5661,12 +5663,96 @@ impl PortableBuilder {
                 || correlated_terminal_storage_bytes
                     == candidate_correlated_terminal_storage_bytes
         );
+        // This general reverse-inner proof is deliberately later than every
+        // established specialization and is mutually exclusive with the
+        // correlated-terminal and absolute-end routes. It may coexist with
+        // ordinary K0 negative filters: those retain first refusal of cheap
+        // global negatives, while this sidecar authenticates variable-distance
+        // prefix boundaries for the remaining value-only Exists calls.
+        let reverse_inner_inspection = if correlated_terminal.is_none()
+            && k0_absolute_end_proof.is_none()
+            && self.selection == PlanSelection::Auto
+            && fallback_planner_work < self.limits.max_planner_work
+        {
+            match k0_general_reverse_inner::inspect(
+                &rust.hir,
+                explicit_captures,
+                fallback_planner_work,
+                self.limits.max_planner_work,
+            ) {
+                Ok(inspection) => {
+                    fallback_planner_work = inspection.planner_work();
+                    match inspection {
+                        k0_general_reverse_inner::InspectionOutcome::Eligible(inspection) => {
+                            Some(inspection)
+                        }
+                        k0_general_reverse_inner::InspectionOutcome::Ineligible { .. } => None,
+                    }
+                }
+                Err(k0_general_reverse_inner::InspectionError::WorkLimit {
+                    actual,
+                    needed,
+                    limit,
+                }) => {
+                    debug_assert!(actual <= limit && needed > limit);
+                    if fixed_predicate_declined {
+                        return Err(BuildError::PlannerWorkLimit { needed, limit });
+                    }
+                    fallback_planner_work = actual;
+                    None
+                }
+                Err(k0_general_reverse_inner::InspectionError::ArithmeticOverflow) => {
+                    return Err(BuildError::InternalInvariant(
+                        "general reverse-inner planner arithmetic overflow",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        let retained_optional_bytes = mandatory_suffix_storage_bytes
+            .checked_add(mandatory_cut_storage_bytes)
+            .and_then(|bytes| bytes.checked_add(negative_prefilter.storage_bytes))
+            .and_then(|bytes| bytes.checked_add(correlated_terminal_storage_bytes))
+            .ok_or(BuildError::PersistentBytesOverflow)?;
+        let reverse_inner_available_bytes = available_optional_bytes
+            .checked_sub(retained_optional_bytes)
+            .ok_or(BuildError::InternalInvariant(
+                "retained K0 sidecars exceeded their optional-byte budget",
+            ))?;
+        let reverse_inner = match reverse_inner_inspection {
+            Some(inspection) => inspection.build(
+                &automaton,
+                self.profile.options.line_terminator,
+                self.limits,
+                reverse_inner_available_bytes,
+            )?,
+            None => None,
+        };
+        // `LowerLimits` and `LiteralSetBuildLimits` each govern one
+        // construction invocation. The sidecar therefore keeps those two
+        // component receipts in its own immutable owner; the facade's
+        // cumulative `planner_work` remains the cross-planner global charge,
+        // while `BuildReport::lowering` continues to describe authoritative
+        // full-K0 lowering rather than conflating two independently limited
+        // graphs.
+        if reverse_inner.as_deref().is_some_and(|plan| {
+            plan.build_accounting().cumulative_planner_work != fallback_planner_work
+        }) {
+            return Err(BuildError::InternalInvariant(
+                "general reverse-inner receipt lost cumulative planner work",
+            ));
+        }
+        let reverse_inner_storage_bytes = reverse_inner
+            .as_deref()
+            .map_or(0, k0_general_reverse_inner::Plan::storage_bytes);
         let plan_storage_bytes = automaton_stats
             .storage_bytes()
             .checked_add(mandatory_suffix_storage_bytes)
             .and_then(|bytes| bytes.checked_add(mandatory_cut_storage_bytes))
             .and_then(|bytes| bytes.checked_add(negative_prefilter.storage_bytes))
             .and_then(|bytes| bytes.checked_add(correlated_terminal_storage_bytes))
+            .and_then(|bytes| bytes.checked_add(reverse_inner_storage_bytes))
             .ok_or(BuildError::PersistentBytesOverflow)?;
         Ok(PortableRegex {
             source,
@@ -5676,6 +5762,7 @@ impl PortableBuilder {
                 automaton,
                 absolute_end_proof: k0_absolute_end_proof,
                 correlated_terminal,
+                reverse_inner,
                 mandatory_suffix: mandatory_suffix_plan,
                 mandatory_cut: mandatory_cut_plan,
                 negative_prefilter: negative_prefilter.plan,
@@ -5941,6 +6028,7 @@ struct PortableK0Plan {
     // unchanged.
     absolute_end_proof: Option<K0AbsoluteEndProof>,
     correlated_terminal: Option<correlated_bounded_alternation::Plan>,
+    reverse_inner: Option<Box<k0_general_reverse_inner::Plan>>,
     mandatory_suffix: Option<K0MandatorySuffixPlan>,
     mandatory_cut: Option<K0MandatoryCutPlan>,
     negative_prefilter: Option<Box<K0NegativePrefilterPlan>>,
@@ -6247,7 +6335,10 @@ impl PortableRegex {
 
     /// Prepare allocation-free repeated searches over this immutable matcher.
     ///
-    /// K0 allocates and fully initializes one fixed-capacity workspace here.
+    /// K0 allocates and fully initializes its primary fixed-capacity workspace
+    /// here. One admitted capture-free Exists proof may also retain a second,
+    /// reverse-capable prefix workspace from the residual aggregate setup and
+    /// scratch limits. No source-dependent cursor is retained in either owner.
     /// Eligible byte graphs with a statically known positive minimum length
     /// retain a bounded forward endpoint cache plus a separate reverse cache
     /// for exact full-span recovery. Assertion-free nullable graphs retain a
@@ -6320,9 +6411,53 @@ impl PortableRegex {
                     endpoint_eligible,
                     bidirectional && positive,
                 )?;
+                let primary_setup = session.construction_accounting();
+                let reverse_inner = if bidirectional
+                    && let Some(plan) = k0.reverse_inner.as_deref()
+                {
+                    let residual = SearchSessionLimits {
+                        max_setup_work: limits
+                            .max_setup_work
+                            .checked_sub(primary_setup.work())
+                            .ok_or(K0SearchError::InternalInvariant {
+                                detail: "primary K0 setup exceeded its admitted work limit",
+                            })?,
+                        max_scratch_bytes: limits
+                            .max_scratch_bytes
+                            .checked_sub(primary_setup.retained_bytes())
+                            .ok_or(K0SearchError::InternalInvariant {
+                                detail: "primary K0 setup exceeded its admitted scratch limit",
+                            })?,
+                    };
+                    k0_general_reverse_inner::SearchSession::try_new(
+                        plan,
+                        &k0.automaton,
+                        &session,
+                        residual,
+                    )?
+                } else {
+                    None
+                };
+                let aggregate_setup = reverse_inner.as_ref().map_or(Ok(primary_setup), |sidecar| {
+                    session.aggregate_construction_accounting(
+                        sidecar.prefix_session(),
+                        k0_general_reverse_inner::SearchSession::owner_publication_work(),
+                        k0_general_reverse_inner::SearchSession::owner_bytes(),
+                    )
+                })?;
+                if aggregate_setup.work() > limits.max_setup_work
+                    || aggregate_setup.retained_bytes() > limits.max_scratch_bytes
+                {
+                    return Err(K0SearchError::InternalInvariant {
+                        detail: "aggregate K0 setup exceeded its residual admission",
+                    }
+                    .into());
+                }
                 PortableSearchSessionPlan::K0 {
                     session,
+                    aggregate_setup,
                     k0_plan: k0,
+                    reverse_inner,
                     mandatory_suffix: k0.mandatory_suffix.as_ref(),
                     mandatory_cut: k0.mandatory_cut.as_ref(),
                     negative_prefilter: k0.negative_prefilter.as_deref(),
@@ -8573,9 +8708,10 @@ impl PortableRegex {
 /// Operation-local reusable search state for one immutable portable matcher.
 ///
 /// This keeps construction-selected specialized plans unchanged. Only K0 owns
-/// mutable state, consisting of one fixed-capacity workspace plus bounded
-/// performance-only prefilter histories whose sizes are determined entirely
-/// by the validated plan.
+/// mutable state, consisting of its primary fixed-capacity workspace, one
+/// optional immutable-plan-bound prefix workspace, and bounded
+/// performance-only histories whose sizes are determined entirely by the
+/// validated plan. Neither workspace retains source positions or results.
 #[derive(Debug)]
 pub struct PortableSearchSession<'a> {
     plan: PortableSearchSessionPlan<'a>,
@@ -8590,7 +8726,9 @@ enum PortableSearchSessionPlan<'a> {
     Native(&'a PortableRegex),
     K0 {
         session: K0SearchSession<'a>,
+        aggregate_setup: SearchSessionSetupAccounting,
         k0_plan: &'a PortableK0Plan,
+        reverse_inner: Option<Box<k0_general_reverse_inner::SearchSession<'a>>>,
         mandatory_suffix: Option<&'a K0MandatorySuffixPlan>,
         mandatory_cut: Option<&'a K0MandatoryCutPlan>,
         negative_prefilter: Option<&'a K0NegativePrefilterPlan>,
@@ -10743,17 +10881,18 @@ impl<'r> PortableSearchSession<'r> {
         }
     }
 
-    /// One-time K0 workspace allocation and initialization facts.
+    /// Aggregate one-time K0 workspace allocation and initialization facts.
     ///
     /// Native specialized plans return `None` because the session allocates no
-    /// storage for them.
+    /// storage for them. Eligible general reverse-inner sessions include both
+    /// the primary and residual-admitted prefix workspaces in this receipt.
     #[must_use]
     pub const fn workspace_setup_accounting(&self) -> Option<SearchSessionSetupAccounting> {
         match &self.plan {
             PortableSearchSessionPlan::Native(_) => None,
-            PortableSearchSessionPlan::K0 { session, .. } => {
-                Some(session.construction_accounting())
-            }
+            PortableSearchSessionPlan::K0 {
+                aggregate_setup, ..
+            } => Some(*aggregate_setup),
         }
     }
 
@@ -10864,6 +11003,7 @@ impl<'r> PortableSearchSession<'r> {
             PortableSearchSessionPlan::K0 {
                 session,
                 k0_plan,
+                reverse_inner,
                 mandatory_suffix,
                 mandatory_cut,
                 negative_prefilter,
@@ -11158,6 +11298,85 @@ impl<'r> PortableSearchSession<'r> {
                         *mandatory_suffix_exists_state = suffix_state_after_success;
                         *negative_prefilter_exists_state = attempt.state_after_success;
                         return Ok(false);
+                    }
+                }
+                // The reverse-inner proof owns no semantic continuation: a
+                // fresh leftmost-start enumeration is created for this exact
+                // plan, haystack and original window. Other K0 filters have
+                // already retained first refusal of their cheap negatives.
+                // A narrowed candidate floor would change the proof context,
+                // so that case keeps the incumbent. The runtime absolute-end
+                // guard is defensive closure over the construction exclusion.
+                if absolute_end_proof.is_none()
+                    && limits == SearchLimits::unlimited()
+                    && search_candidate_floor.is_none()
+                    && let Some(reverse_inner) = reverse_inner.as_mut()
+                {
+                    let window_bytes = window.end().saturating_sub(window.start());
+                    let mut next_state = reverse_inner.staged_exists_route_state();
+                    match next_state.select(window_bytes) {
+                        k0_general_reverse_inner::Route::Bypass => {
+                            let result = session
+                                .search_exists_value(haystack, window, limits)
+                                .map_err(SearchError::from);
+                            if result.is_ok() {
+                                reverse_inner.publish_exists_route_state(next_state);
+                                *mandatory_suffix_exists_state = suffix_state_after_success;
+                                *negative_prefilter_exists_state = attempt.state_after_success;
+                            }
+                            return result;
+                        }
+                        k0_general_reverse_inner::Route::Learn { class_index } => {
+                            let report = session
+                                .search_window::<Exists>(haystack, window, limits)
+                                .map_err(SearchError::from)?;
+                            next_state.observe_incumbent(
+                                class_index,
+                                window_bytes,
+                                report.accounting().work(),
+                            );
+                            reverse_inner.publish_exists_route_state(next_state);
+                            *mandatory_suffix_exists_state = suffix_state_after_success;
+                            *negative_prefilter_exists_state = attempt.state_after_success;
+                            return Ok(report.into_output());
+                        }
+                        k0_general_reverse_inner::Route::Candidate {
+                            class_index,
+                            incumbent_work,
+                        } => match k0_general_reverse_inner::try_exists(
+                            session,
+                            reverse_inner,
+                            haystack,
+                            window,
+                            incumbent_work,
+                        )? {
+                            k0_general_reverse_inner::Attempt::Complete { output, won } => {
+                                next_state.observe_candidate_complete(class_index, won);
+                                reverse_inner.publish_exists_route_state(next_state);
+                                *mandatory_suffix_exists_state = suffix_state_after_success;
+                                *negative_prefilter_exists_state = attempt.state_after_success;
+                                return Ok(output);
+                            }
+                            k0_general_reverse_inner::Attempt::Fallback => {
+                                let result = session
+                                    .search_exists_value(haystack, window, limits)
+                                    .map_err(SearchError::from);
+                                if result.is_ok() {
+                                    // A bounded candidate refusal is a loss,
+                                    // not an unobserved trial. Publish its
+                                    // backoff only after the authoritative
+                                    // incumbent succeeds so errors remain
+                                    // transactional and repeated steady calls
+                                    // do not repay the same failed candidate.
+                                    next_state.observe_candidate_complete(class_index, false);
+                                    reverse_inner.publish_exists_route_state(next_state);
+                                    *mandatory_suffix_exists_state = suffix_state_after_success;
+                                    *negative_prefilter_exists_state =
+                                        attempt.state_after_success;
+                                }
+                                return result;
+                            }
+                        },
                     }
                 }
                 let search_window = search_candidate_floor
@@ -13610,6 +13829,7 @@ mod tests {
         struct PortableK0PlanWithoutAbsoluteEndProof {
             automaton: Automaton,
             correlated_terminal: Option<super::correlated_bounded_alternation::Plan>,
+            reverse_inner: Option<Box<super::k0_general_reverse_inner::Plan>>,
             mandatory_suffix: Option<K0MandatorySuffixPlan>,
             mandatory_cut: Option<K0MandatoryCutPlan>,
             negative_prefilter: Option<Box<super::K0NegativePrefilterPlan>>,

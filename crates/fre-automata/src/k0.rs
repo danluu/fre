@@ -4494,10 +4494,151 @@ impl<'a> K0SearchSession<'a> {
         })
     }
 
+    /// Construct an optional workspace only when a reverse-capable tier fits.
+    ///
+    /// This is the secondary-session constructor used by an immutable
+    /// facade-side proof. Each candidate layout is fully selected and checked
+    /// before its allocation begins. If neither fits, `None` preserves the
+    /// already-live primary K0 session.
+    #[doc(hidden)]
+    pub fn try_new_reverse_required(
+        automaton: &'a Automaton,
+        limits: WorkspaceLimits,
+    ) -> Result<Option<Self>, SearchError> {
+        Self::try_new_reverse_required_with(
+            automaton,
+            limits,
+            K0Workspace::new_with_layout,
+        )
+    }
+
+    fn try_new_reverse_required_with(
+        automaton: &'a Automaton,
+        limits: WorkspaceLimits,
+        mut construct: impl FnMut(
+            &Automaton,
+            WorkspaceLimits,
+            WorkspaceLayout,
+        ) -> Result<K0Workspace, SearchError>,
+    ) -> Result<Option<Self>, SearchError> {
+        let fits = |layout: WorkspaceLayout| {
+            layout.reverse_state_capacity != 0
+                && layout.construction_work <= limits.max_setup_work
+                && layout.logical_bytes <= limits.max_scratch_bytes
+        };
+        let finish = |workspace: K0Workspace| {
+            let capabilities = LazyCapabilities {
+                lazy: workspace.lazy.is_allocated(),
+                reverse: workspace.reverse.is_allocated(),
+                contextual: automaton.stats().assertion_edges() != 0,
+            };
+            if !capabilities.reverse || !workspace.reverse.is_bound_to(automaton) {
+                return Err(SearchError::InternalInvariant {
+                    detail: "reverse-required layout did not construct a bound reverse workspace",
+                });
+            }
+            Ok(Self {
+                automaton,
+                workspace,
+                capabilities,
+                span_start_proof: retained_span_cursor_start_proof(automaton),
+                root_run: None,
+            })
+        };
+
+        let wide = WorkspaceLayout::for_bidirectional_automaton(automaton)?;
+        if fits(wide) {
+            match construct(automaton, limits, wide) {
+                Ok(workspace) => return finish(workspace).map(Some),
+                // This is an optional secondary owner. A physical refusal
+                // cannot invalidate the already-live primary session. Do not
+                // attempt another physical construction: work completed by a
+                // partially allocated wide workspace has no successful setup
+                // receipt in which a narrower retry could be reported.
+                Err(
+                    SearchError::ScratchAllocationFailed { .. }
+                    | SearchError::ResourceLimit {
+                        resource: ResourceKind::ScratchBytes,
+                        ..
+                    },
+                ) => return Ok(None),
+                Err(error) => return Err(error),
+            }
+        }
+        let narrow = WorkspaceLayout::for_narrow_bidirectional_automaton(automaton)?;
+        if !fits(narrow) {
+            return Ok(None);
+        }
+        match construct(automaton, limits, narrow) {
+            Ok(workspace) => finish(workspace).map(Some),
+            Err(
+                SearchError::ScratchAllocationFailed { .. }
+                | SearchError::ResourceLimit {
+                    resource: ResourceKind::ScratchBytes,
+                    ..
+                },
+            ) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Constructor allocation and initialization charges.
     #[must_use]
     pub const fn construction_accounting(&self) -> SetupAccounting {
         self.workspace.construction_accounting()
+    }
+
+    /// Whether this session owns workspace state for this exact immutable
+    /// automaton instance.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn is_bound_to(&self, automaton: &Automaton) -> bool {
+        self.automaton.identity() == automaton.identity()
+            && self.workspace.bound_automaton_identity == automaton.identity()
+    }
+
+    /// Combine two simultaneously retained immutable-plan session receipts
+    /// plus one facade-owned heap owner that contains the secondary session.
+    #[doc(hidden)]
+    pub fn aggregate_construction_accounting(
+        &self,
+        secondary: &K0SearchSession<'_>,
+        owner_publication_work: u64,
+        owner_bytes: usize,
+    ) -> Result<SetupAccounting, SearchError> {
+        let primary = self.construction_accounting();
+        let secondary = secondary.construction_accounting();
+        Ok(SetupAccounting {
+            work: primary
+                .work
+                .checked_add(secondary.work)
+                .and_then(|work| work.checked_add(owner_publication_work))
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "aggregate K0 session setup work",
+                })?,
+            allocated_bytes: primary
+                .allocated_bytes
+                .checked_add(secondary.allocated_bytes)
+                .and_then(|bytes| bytes.checked_add(owner_bytes))
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "aggregate K0 session allocated bytes",
+                })?,
+            initialized_bytes: primary
+                .initialized_bytes
+                .checked_add(secondary.initialized_bytes)
+                .and_then(|bytes| bytes.checked_add(owner_bytes))
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "aggregate K0 session initialized bytes",
+                })?,
+            retained_bytes: primary
+                .retained_bytes
+                .checked_add(secondary.retained_bytes)
+                .and_then(|bytes| bytes.checked_add(owner_bytes))
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "aggregate K0 session retained bytes",
+                })?,
+            reused: false,
+        })
     }
 
     /// Whether source-bound span iteration can reuse an admitted root-run
@@ -4988,6 +5129,31 @@ impl<'a> K0SearchSession<'a> {
             self.capabilities,
         )
         .map(|report| report.found.is_some())
+    }
+
+    /// Check existence from one caller-authenticated exact start.
+    ///
+    /// Unlike the proved-start selected-end leaf, this operation assumes
+    /// neither that the start matches nor that it is globally earliest. The
+    /// original automaton remains authoritative, and the returned work is the
+    /// exact successful-invocation receipt used by the bounded outer route.
+    #[doc(hidden)]
+    pub fn search_exact_start_exists_value(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<(bool, u64), SearchError> {
+        validate_window(haystack, window)?;
+        let report = search_prevalidated_exact_start_with_authenticated_workspace(
+            self.automaton,
+            haystack,
+            window,
+            &mut self.workspace,
+            limits,
+            OutputContract::Exists,
+        )?;
+        Ok((report.found.is_some(), report.accounting.work()))
     }
 
     /// Project a warmed assertion-free selected endpoint without diagnostics.
@@ -19638,6 +19804,73 @@ mod tests {
             CompileLimits::default(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn reverse_required_physical_wide_failure_does_not_retry_narrow() {
+        let plan = byte_chain(&[
+            (b'a', b'a'),
+            (b'b', b'b'),
+            (b'c', b'c'),
+            (b'd', b'd'),
+            (b'a', b'a'),
+            (b'b', b'b'),
+            (b'c', b'c'),
+        ]);
+        let wide = WorkspaceLayout::for_bidirectional_automaton(&plan).unwrap();
+        let narrow = WorkspaceLayout::for_narrow_bidirectional_automaton(&plan).unwrap();
+        assert_ne!(wide, narrow);
+        let mut attempted = Vec::new();
+        let session = K0SearchSession::try_new_reverse_required_with(
+            &plan,
+            WorkspaceLimits::unlimited(),
+            |_, _, layout| {
+                attempted.push(layout);
+                Err(SearchError::ScratchAllocationFailed {
+                    requested: layout.logical_bytes(),
+                })
+            },
+        )
+        .unwrap();
+        assert!(session.is_none());
+        assert_eq!(attempted, [wide]);
+    }
+
+    #[test]
+    fn reverse_required_tries_narrow_only_after_wide_preadmission_decline() {
+        let plan = byte_chain(&[
+            (b'a', b'a'),
+            (b'b', b'b'),
+            (b'c', b'c'),
+            (b'd', b'd'),
+            (b'a', b'a'),
+            (b'b', b'b'),
+            (b'c', b'c'),
+        ]);
+        let wide = WorkspaceLayout::for_bidirectional_automaton(&plan).unwrap();
+        let narrow = WorkspaceLayout::for_narrow_bidirectional_automaton(&plan).unwrap();
+        let limits = WorkspaceLimits {
+            max_setup_work: narrow.construction_work(),
+            max_scratch_bytes: narrow.logical_bytes(),
+        };
+        assert!(
+            wide.construction_work() > limits.max_setup_work
+                || wide.logical_bytes() > limits.max_scratch_bytes
+        );
+        let mut attempted = Vec::new();
+        let session = K0SearchSession::try_new_reverse_required_with(
+            &plan,
+            limits,
+            |_, _, layout| {
+                attempted.push(layout);
+                Err(SearchError::ScratchAllocationFailed {
+                    requested: layout.logical_bytes(),
+                })
+            },
+        )
+        .unwrap();
+        assert!(session.is_none());
+        assert_eq!(attempted, [narrow]);
     }
 
     fn byte_class_then_range(
