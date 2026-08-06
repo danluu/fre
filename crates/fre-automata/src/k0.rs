@@ -325,6 +325,25 @@ const UNICODE_WORD_ENABLED_BY_CLASS: [u32; 9] = [
     1 << 13,
 ];
 
+// Pack the four byte-local boundary-family pair classes into one byte. The
+// observation path pays the neighboring-byte classification once, then every
+// dependency projection is one immutable table read plus a mask operation.
+// Unicode is deliberately absent: decoding remains lazy and memoized by the
+// prepared observation.
+const RAW_BOUNDARY_ENABLED_BY_PAIR_CLASS: [u32; 256] = {
+    let mut table = [0_u32; 256];
+    let mut packed = 0usize;
+    while packed < table.len() {
+        table[packed] = ABSOLUTE_ENABLED_BY_CLASS[packed & 0b11]
+            | CONFIGURED_LINE_ENABLED_BY_CLASS[(packed >> 2) & 0b11]
+            | CRLF_LINE_ENABLED_BY_CLASS[(packed >> 4) & 0b11]
+            | ASCII_WORD_ENABLED_BY_CLASS[(packed >> 6) & 0b11];
+        packed += 1;
+    }
+    table
+};
+const UNICODE_BOUNDARY_CLASS_UNPREPARED: u8 = u8::MAX;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ContextTransitionSlot {
     source: u32,
@@ -6033,9 +6052,10 @@ fn warm_context_initial_state(
 /// to the exact broader key used before dependency analysis completed.
 ///
 /// The retained dependency proof establishes that omitted assertion bits
-/// cannot affect the closure. The fallback still recomputes every broader bit
-/// from this invocation's source boundary, so it never aliases a raw context
-/// from another haystack or position and publishes no normalized record.
+/// cannot affect the closure. The fallback projects every broader bit from
+/// this invocation's shared boundary observation, so it never aliases a raw
+/// context from another haystack or position and publishes no normalized
+/// record.
 fn warm_context_initial_state_for_dependencies(
     automaton: &Automaton,
     haystack: &[u8],
@@ -6045,24 +6065,20 @@ fn warm_context_initial_state_for_dependencies(
     global_dependencies: u32,
 ) -> Result<Option<u32>, SearchError> {
     debug_assert_eq!(dependencies & !global_dependencies, 0);
-    let assertions = enabled_assertion_mask_unmetered_for_dependencies(
-        automaton,
-        dependencies,
+    let mut observation = PreparedBoundaryObservation::new(
+        automaton.line_terminator(),
         haystack,
         position,
+        global_dependencies,
     );
+    let assertions = observation.project(dependencies);
     if let Some(state) = warm_context_initial_state(lazy, assertions)? {
         return Ok(Some(state));
     }
     if dependencies == global_dependencies {
         return Ok(None);
     }
-    let exact_assertions = enabled_assertion_mask_unmetered_for_dependencies(
-        automaton,
-        global_dependencies,
-        haystack,
-        position,
-    );
+    let exact_assertions = observation.project(global_dependencies);
     if exact_assertions == assertions {
         return Ok(None);
     }
@@ -6091,12 +6107,13 @@ fn warm_context_transition_for_dependencies(
         hot.dependency_mask
     };
     debug_assert_eq!(dependencies & !global_dependencies, 0);
-    let assertions = enabled_assertion_mask_unmetered_for_dependencies(
-        automaton,
-        dependencies,
+    let mut observation = PreparedBoundaryObservation::new(
+        automaton.line_terminator(),
         haystack,
         destination,
+        global_dependencies,
     );
+    let assertions = observation.project(dependencies);
     let symbol = contextual_symbol_for_byte(automaton, byte, assertions);
     if let Some(cell) = lazy
         .context
@@ -6107,12 +6124,7 @@ fn warm_context_transition_for_dependencies(
     if dependencies == global_dependencies {
         return Ok(None);
     }
-    let exact_assertions = enabled_assertion_mask_unmetered_for_dependencies(
-        automaton,
-        global_dependencies,
-        haystack,
-        destination,
-    );
+    let exact_assertions = observation.project(global_dependencies);
     if exact_assertions == assertions {
         return Ok(None);
     }
@@ -20025,6 +20037,107 @@ fn enabled_assertion_mask_unmetered_for_dependencies(
         haystack,
         position,
     )
+}
+
+/// One full-haystack boundary observation shared by dependency projections.
+///
+/// Raw byte-derived properties are immutable after construction. Unicode word
+/// classification stays unprepared until a requested dependency needs it, and
+/// a broader raw-key retry reuses the same adjacent-scalar result.
+struct PreparedBoundaryObservation<'h> {
+    haystack: &'h [u8],
+    position: usize,
+    raw_enabled: u32,
+    global_dependencies: u32,
+    unicode_class: u8,
+    #[cfg(test)]
+    unicode_classifications: u8,
+}
+
+impl<'h> PreparedBoundaryObservation<'h> {
+    #[inline]
+    fn new(
+        line_terminator: u8,
+        haystack: &'h [u8],
+        position: usize,
+        global_dependencies: u32,
+    ) -> Self {
+        debug_assert!(position <= haystack.len());
+        let classifier = BoundaryContextClassifier::new(global_dependencies);
+        let raw_dependencies = global_dependencies & !classifier.unicode_word();
+        let raw_enabled = if raw_dependencies == 0 {
+            0
+        } else {
+            let before = position
+                .checked_sub(1)
+                .and_then(|index| haystack.get(index))
+                .copied();
+            let after = haystack.get(position).copied();
+            let absolute = binary_boundary_class(position == 0, position == haystack.len());
+            let configured_line = binary_boundary_class(
+                position == 0 || before == Some(line_terminator),
+                position == haystack.len() || after == Some(line_terminator),
+            );
+            let crlf_line = binary_boundary_class(
+                position == 0
+                    || before == Some(b'\n')
+                    || before == Some(b'\r') && after != Some(b'\n'),
+                position == haystack.len()
+                    || after == Some(b'\r')
+                    || after == Some(b'\n') && before != Some(b'\r'),
+            );
+            let ascii_word = binary_boundary_class(
+                before.is_some_and(is_ascii_word),
+                after.is_some_and(is_ascii_word),
+            );
+            let packed = absolute
+                | (configured_line << 2)
+                | (crlf_line << 4)
+                | (ascii_word << 6);
+            RAW_BOUNDARY_ENABLED_BY_PAIR_CLASS[packed] & raw_dependencies
+        };
+        Self {
+            haystack,
+            position,
+            raw_enabled,
+            global_dependencies,
+            unicode_class: UNICODE_BOUNDARY_CLASS_UNPREPARED,
+            #[cfg(test)]
+            unicode_classifications: 0,
+        }
+    }
+
+    #[inline]
+    fn project(&mut self, dependencies: u32) -> u32 {
+        debug_assert_eq!(dependencies & !self.global_dependencies, 0);
+        let unicode_dependencies = BoundaryContextClassifier::new(dependencies).unicode_word();
+        let mut enabled = self.raw_enabled & dependencies;
+        if unicode_dependencies != 0 {
+            let class = if self.unicode_class == UNICODE_BOUNDARY_CLASS_UNPREPARED {
+                let class = UnicodeLookMatcher::classify_prevalidated(self.haystack, self.position)
+                    .class();
+                self.unicode_class =
+                    u8::try_from(class).expect("Unicode boundary class fits in one byte");
+                #[cfg(test)]
+                {
+                    self.unicode_classifications = self
+                        .unicode_classifications
+                        .checked_add(1)
+                        .expect("test Unicode classification count remains bounded");
+                }
+                class
+            } else {
+                usize::from(self.unicode_class)
+            };
+            enabled |= UNICODE_WORD_ENABLED_BY_CLASS[class] & unicode_dependencies;
+        }
+        enabled
+    }
+
+    #[cfg(test)]
+    fn unicode_classifications(&self) -> u8 {
+        self.unicode_classifications
+    }
 }
 
 fn enabled_assertion_mask_with_classifier(
@@ -36424,6 +36537,245 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn prepared_boundary_observation_matches_every_dependency_subset() {
+        let all_dependencies = (1_u32 << super::ASSERTION_KIND_COUNT) - 1;
+        let fixtures = [
+            (b';', Vec::new()),
+            (b';', vec![b';']),
+            (b';', vec![b'\r', b'\n', b'a', b'_', b';']),
+            (b'\n', "é_β!".as_bytes().to_vec()),
+            (b';', vec![0xf0, 0x28, 0x8c, 0xbc]),
+            (b'\r', vec![b'a', 0xed, 0xa0, 0x80, b'_']),
+            (0xff, vec![0x80, b'a', 0xc3]),
+        ];
+
+        for (line_terminator, haystack) in fixtures {
+            for position in 0..=haystack.len() {
+                let mut observation = super::PreparedBoundaryObservation::new(
+                    line_terminator,
+                    &haystack,
+                    position,
+                    all_dependencies,
+                );
+                for dependencies in 0..=all_dependencies {
+                    let expected = super::enabled_assertion_mask_unmetered_with_classifier(
+                        crate::plan::BoundaryContextClassifier::new(dependencies),
+                        line_terminator,
+                        &haystack,
+                        position,
+                    );
+                    assert_eq!(
+                        observation.project(dependencies),
+                        expected,
+                        "dependencies={dependencies:#07x} terminator={line_terminator:#04x} source={haystack:?} position={position}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_boundary_observation_covers_every_configured_terminator_and_endpoint() {
+        let all_dependencies = (1_u32 << super::ASSERTION_KIND_COUNT) - 1;
+        for line_terminator in u8::MIN..=u8::MAX {
+            let haystacks = [
+                Vec::new(),
+                vec![line_terminator],
+                vec![b'\r', line_terminator, b'\n'],
+                vec![line_terminator, b'\r', b'\n', line_terminator],
+            ];
+            for haystack in haystacks {
+                for position in 0..=haystack.len() {
+                    let mut observation = super::PreparedBoundaryObservation::new(
+                        line_terminator,
+                        &haystack,
+                        position,
+                        all_dependencies,
+                    );
+                    assert_eq!(
+                        observation.project(all_dependencies),
+                        super::enabled_assertion_mask_unmetered_with_classifier(
+                            crate::plan::BoundaryContextClassifier::new(all_dependencies),
+                            line_terminator,
+                            &haystack,
+                            position,
+                        ),
+                        "terminator={line_terminator:#04x} source={haystack:?} position={position}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_boundary_observation_uses_full_haystack_at_window_edges() {
+        let plan = every_assertion().with_line_terminator(b';');
+        let dependencies = plan.boundary_context_classifier().assertions();
+        let haystack = b"x;a;y";
+        let window = SearchWindow::new(2, 3);
+        let absolute = EdgeKind::AssertHaystackStart.assertion_bit().unwrap()
+            | EdgeKind::AssertHaystackEnd.assertion_bit().unwrap();
+
+        for position in [window.start(), window.end()] {
+            let mut observation = super::PreparedBoundaryObservation::new(
+                plan.line_terminator(),
+                haystack,
+                position,
+                dependencies,
+            );
+            let got = observation.project(dependencies);
+            assert_eq!(
+                got,
+                super::enabled_assertion_mask_unmetered_for_dependencies(
+                    &plan,
+                    dependencies,
+                    haystack,
+                    position,
+                )
+            );
+            assert_eq!(got & absolute, 0, "position={position}");
+        }
+    }
+
+    #[test]
+    fn prepared_boundary_observation_classifies_unicode_only_once_when_requested() {
+        let plan = every_assertion().with_line_terminator(b';');
+        let global_dependencies = plan.boundary_context_classifier().assertions();
+        let unicode_dependencies = plan.boundary_context_classifier().unicode_word();
+        let raw_dependencies = global_dependencies & !unicode_dependencies;
+        let haystack = "aβ!".as_bytes();
+        let position = 1;
+        let mut observation = super::PreparedBoundaryObservation::new(
+            plan.line_terminator(),
+            haystack,
+            position,
+            global_dependencies,
+        );
+
+        assert_eq!(observation.unicode_classifications(), 0);
+        assert_eq!(
+            observation.project(raw_dependencies),
+            super::enabled_assertion_mask_unmetered_for_dependencies(
+                &plan,
+                raw_dependencies,
+                haystack,
+                position,
+            )
+        );
+        assert_eq!(observation.unicode_classifications(), 0);
+        assert_eq!(
+            observation.project(unicode_dependencies),
+            super::enabled_assertion_mask_unmetered_for_dependencies(
+                &plan,
+                unicode_dependencies,
+                haystack,
+                position,
+            )
+        );
+        assert_eq!(observation.unicode_classifications(), 1);
+        assert_eq!(
+            observation.project(global_dependencies),
+            super::enabled_assertion_mask_unmetered_for_dependencies(
+                &plan,
+                global_dependencies,
+                haystack,
+                position,
+            )
+        );
+        assert_eq!(observation.unicode_classifications(), 1);
+    }
+
+    #[test]
+    fn warm_dependency_projection_retries_raw_initial_and_transition_keys() {
+        let plan = full_byte_contextual_unicode_word_loop();
+        let global_dependencies = plan.boundary_context_classifier().assertions();
+        let dependencies = EdgeKind::AssertWordUnicode.assertion_bit().unwrap();
+        let haystack = b"a!";
+        let position = 1;
+        let mut observation = super::PreparedBoundaryObservation::new(
+            plan.line_terminator(),
+            haystack,
+            position,
+            global_dependencies,
+        );
+        let normalized_assertions = observation.project(dependencies);
+        let exact_assertions = observation.project(global_dependencies);
+        assert_ne!(normalized_assertions, exact_assertions);
+        assert_eq!(observation.unicode_classifications(), 1);
+
+        let mut workspace =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let initial_value = 1 | super::LAZY_CELL_RESTART;
+        publish_context_record(
+            &mut workspace.lazy.context,
+            super::CONTEXT_INITIAL_SOURCE,
+            super::contextual_initial_symbol(exact_assertions),
+            initial_value,
+        );
+        workspace.lazy.context.hot_initial.dependency_mask = dependencies;
+        assert_eq!(
+            workspace
+                .lazy
+                .context
+                .lookup_existing_prevalidated(
+                    super::CONTEXT_INITIAL_SOURCE,
+                    super::contextual_initial_symbol(normalized_assertions),
+                )
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            super::warm_context_initial_state_for_dependencies(
+                &plan,
+                haystack,
+                position,
+                &workspace.lazy,
+                dependencies,
+                global_dependencies,
+            )
+            .unwrap(),
+            Some(0)
+        );
+
+        let byte = b'a';
+        let transition_value = 1 | super::LAZY_CELL_START_PROPAGATE;
+        publish_context_record(
+            &mut workspace.lazy.context,
+            0,
+            super::contextual_symbol_for_byte(&plan, byte, exact_assertions),
+            transition_value,
+        );
+        workspace.lazy.context.hot[0].dependency_mask = dependencies;
+        let hot = workspace.lazy.context.hot_transition(0).unwrap();
+        assert_eq!(
+            workspace
+                .lazy
+                .context
+                .lookup_existing_with_hot_prevalidated(
+                    0,
+                    hot,
+                    super::contextual_symbol_for_byte(&plan, byte, normalized_assertions),
+                )
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            super::warm_context_transition_for_dependencies(
+                &plan,
+                haystack,
+                position,
+                &workspace.lazy,
+                0,
+                hot,
+                byte,
+                global_dependencies,
+            )
+            .unwrap(),
+            Some(transition_value)
+        );
     }
 
     #[test]
