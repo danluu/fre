@@ -22505,6 +22505,517 @@ mod tests {
         any(target_arch = "x86_64", target_arch = "aarch64"),
         any(target_os = "linux", target_os = "macos")
     ))]
+    fn scanner_free_correlated_pair_raw() -> fre_automata::RawPlan {
+        use fre_automata::{EdgeKind, RawPlan, StateRole};
+
+        // `a[ab]|[^a][^ab]`: both consumed columns cover the full byte
+        // alphabet, so no semantic root scanner exists, while correlation
+        // still leaves both matching and rejecting second-byte transitions.
+        RawPlan {
+            start: 0,
+            roles: vec![
+                StateRole::Split,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Accept,
+            ],
+            edge_offsets: vec![0, 2, 3, 4, 6, 8, 8],
+            edge_targets: vec![1, 3, 2, 5, 4, 4, 5, 5],
+            edge_kinds: vec![
+                EdgeKind::Epsilon,
+                EdgeKind::Epsilon,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+            ],
+            byte_starts: vec![0, 0, b'a', b'a', 0, b'b', 0, b'c'],
+            byte_ends: vec![0, 0, b'a', b'b', b'`', u8::MAX, b'`', u8::MAX],
+        }
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    fn scanner_free_pending_pair_raw() -> fre_automata::RawPlan {
+        use fre_automata::{EdgeKind, RawPlan, StateRole};
+
+        // `aa|a|[^a][^a]`: after the first `a`, the shorter lower-priority
+        // branch is pending while the higher-priority `aa` branch remains
+        // live. Both graph columns still cover every byte, so the second-byte
+        // hole is eligible for the scanner-free continuation ABI.
+        RawPlan {
+            start: 0,
+            roles: vec![
+                StateRole::Split,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Accept,
+            ],
+            edge_offsets: vec![0, 3, 4, 5, 6, 8, 10, 10],
+            edge_targets: vec![1, 3, 4, 2, 6, 6, 5, 5, 6, 6],
+            edge_kinds: vec![
+                EdgeKind::Epsilon,
+                EdgeKind::Epsilon,
+                EdgeKind::Epsilon,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+            ],
+            byte_starts: vec![0, 0, 0, b'a', b'a', b'a', 0, b'b', 0, b'b'],
+            byte_ends: vec![
+                0,
+                0,
+                0,
+                b'a',
+                b'a',
+                b'a',
+                b'`',
+                u8::MAX,
+                b'`',
+                u8::MAX,
+            ],
+        }
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    fn scanner_free_dynamic_program(
+        raw: fre_automata::RawPlan,
+        output: OutputContract,
+    ) -> CompiledProgram {
+        let automaton = fre_automata::Automaton::from_raw(
+            raw.clone(),
+            fre_automata::CompileLimits::default(),
+        )
+        .expect("validate scanner-free linked graph");
+        CompiledProgram::build(
+            raw,
+            automaton,
+            output,
+            CompileMode::Fast,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+            usize::MAX,
+        )
+        .expect("compile scanner-free linked graph")
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the linked witness records the exact warm-prefix and novel-cell contract explicitly"
+    )]
+    fn prove_scanner_free_dynamic_first_hole(
+        program: &CompiledProgram,
+        warm: &[u8],
+        novel: &[u8],
+        window: SearchWindow,
+        expected_position: usize,
+        expected_pending: Option<usize>,
+        expected: MatchResult,
+    ) {
+        let view = program
+            .native_dynamic_rows_view()
+            .expect("scanner-free dynamic proof view");
+        assert_eq!(view.root_requirement, None);
+        assert_eq!(expected_position, window.start().checked_add(1).unwrap());
+        assert_eq!(warm.len(), novel.len());
+        assert_eq!(
+            &warm[window.start()..expected_position],
+            &novel[window.start()..expected_position],
+            "the generated core must consume a common native prefix"
+        );
+        assert_ne!(
+            warm[expected_position], novel[expected_position],
+            "the next byte must select a transition class absent from the warm search"
+        );
+
+        let mut workspace = program.prepare_workspace().expect("dynamic proof workspace");
+        program
+            .search_optimized_with_workspace(warm, window, &mut workspace)
+            .expect("warm dynamic proof cache");
+        let (outcome, descriptor_address, cache_identity) = program
+            .preflight_dynamic_native_rows_with_workspace(
+                novel,
+                window,
+                &mut workspace,
+                program.artifact_identity(),
+            )
+            .expect("admit dynamic proof cache");
+        assert_eq!(outcome, crate::RetainedPartialPreflight::Enter(window));
+        assert_ne!((descriptor_address, cache_identity), (0, 0));
+        assert_eq!(
+            expected_pending,
+            expected_pending.filter(|pending| *pending == expected_position),
+            "a pending endpoint, when requested, belongs to the consumed prefix"
+        );
+        let mut oracle_workspace = program
+            .prepare_workspace()
+            .expect("independent dynamic-hole oracle workspace");
+        assert_eq!(
+            program
+                .search_optimized_with_workspace(novel, window, &mut oracle_workspace)
+                .expect("evaluate dynamic-hole witness independently"),
+            expected
+        );
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    struct LinkedDynamicFirstHoleCase<'a> {
+        warm: &'a [u8],
+        novel: &'a [u8],
+        expected_status: u32,
+        expected_start: usize,
+        expected_end: usize,
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the opt-in real-runtime linker fixture owns its complete generated C differential"
+    )]
+    fn link_real_dynamic_first_hole_cases(
+        program: &CompiledProgram,
+        target: Target,
+        label: &str,
+        window: SearchWindow,
+        cases: &[LinkedDynamicFirstHoleCase<'_>],
+    ) {
+        use std::{fs, process::Command, time::SystemTime};
+
+        fn c_bytes(bytes: &[u8]) -> String {
+            bytes
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+
+        let view = program
+            .native_dynamic_rows_view()
+            .expect("scanner-free dynamic program view");
+        assert_eq!(view.root_requirement, None);
+        let module = CompiledModule::lower(program, target).expect("lower scanner-free host object");
+        assert_eq!(
+            module.required_prepared_dynamic_rows_continue_runtime_symbol(),
+            Some(DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL_NAME)
+        );
+        assert_eq!(
+            module
+                .relocations()
+                .iter()
+                .filter(|relocation| relocation.symbol == DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL)
+                .count(),
+            1,
+            "scanner-free native core must own exactly one continuation call"
+        );
+        let object = crate::emit_object(
+            &module,
+            ObjectFormat::for_target(target),
+            usize::MAX,
+        )
+        .expect("emit scanner-free host object");
+        let symbol = module
+            .prepared_entry_symbol()
+            .expect("scanner-free prepared entry");
+        let (program_symbol, program_len) = module
+            .required_runtime_program()
+            .expect("scanner-free runtime program alias");
+
+        let current_exe = std::env::current_exe().expect("current test executable");
+        let profile_dir = current_exe
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("Cargo profile directory");
+        let static_runtime = profile_dir.join("libfre_aot_regex_runtime.a");
+        assert!(
+            static_runtime.is_file(),
+            "build the linked runtime first: cargo build -p fre-aot-regex-runtime --lib ({})",
+            static_runtime.display()
+        );
+
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-real-dynamic-hole-{}-{nonce}-{label}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("create dynamic-hole linker directory");
+        let object_path = directory.join("dynamic.o");
+        fs::write(&object_path, object).expect("write dynamic-hole object");
+
+        let mut source = format!(
+            "#include <stddef.h>\n#include <stdint.h>\n\
+             typedef void *handle_t;\
+             typedef struct{{size_t start;size_t end;}} result_t;\n\
+             extern const unsigned char {program_symbol}[];\n\
+             extern uint32_t {symbol}(handle_t,const unsigned char*,size_t,size_t,size_t,result_t*);\n\
+             extern uint32_t fre_aot_regex_runtime_prepare_exclusive_v1(const unsigned char*,size_t,handle_t*);\n\
+             extern uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t,const unsigned char*,size_t,size_t,size_t,result_t*);\n\
+             extern uint32_t fre_aot_regex_runtime_destroy_exclusive_v1(handle_t);\n\
+             static int prepare(handle_t *h){{return fre_aot_regex_runtime_prepare_exclusive_v1({program_symbol},{program_len}U,h)==0U;}}\n\
+             static int destroy(handle_t h){{return fre_aot_regex_runtime_destroy_exclusive_v1(h)==0U;}}\n\
+             static int run_case(const unsigned char *warm,const unsigned char *novel,size_t length,uint32_t expected_status,size_t expected_start,size_t expected_end,int base){{\
+               handle_t native=0,baseline=0;result_t wr={{91U,92U}},nr={{93U,94U}},br={{95U,96U}};\
+               if(!prepare(&native)||!prepare(&baseline))return base;\
+               uint32_t ws=fre_aot_regex_runtime_search_exclusive_v1(native,warm,length,{window_start}U,{window_end}U,&wr);\
+               if(ws!=1U)return base+1;\
+               uint32_t ns={symbol}(native,novel,length,{window_start}U,{window_end}U,&nr);\
+               uint32_t bs=fre_aot_regex_runtime_search_exclusive_v1(baseline,novel,length,{window_start}U,{window_end}U,&br);\
+               if(ns!=bs||nr.start!=br.start||nr.end!=br.end)return base+2;\
+               if(ns!=expected_status||nr.start!=expected_start||nr.end!=expected_end)return base+3;\
+               if(!destroy(native)||!destroy(baseline))return base+4;return 0;}}\n",
+            window_start = window.start(),
+            window_end = window.end(),
+        );
+        for (index, case) in cases.iter().enumerate() {
+            assert_eq!(case.warm.len(), case.novel.len());
+            writeln!(
+                source,
+                "static const unsigned char warm_{index}[]={{{}}};",
+                c_bytes(case.warm)
+            )
+            .expect("write warm C fixture");
+            writeln!(
+                source,
+                "static const unsigned char novel_{index}[]={{{}}};",
+                c_bytes(case.novel)
+            )
+            .expect("write novel C fixture");
+        }
+        source.push_str("int main(void){int status;\n");
+        for (index, case) in cases.iter().enumerate() {
+            let base = 10_usize
+                .checked_add(index.checked_mul(10).expect("case status stride"))
+                .expect("case status base");
+            writeln!(
+                source,
+                "status=run_case(warm_{index},novel_{index},sizeof(novel_{index}),{}U,{}U,{}U,{base});if(status!=0)return status;",
+                case.expected_status, case.expected_start, case.expected_end,
+            )
+            .expect("write dynamic-hole C case");
+        }
+        source.push_str("return 0;}\n");
+
+        let c_path = directory.join("dynamic.c");
+        let executable = directory.join("dynamic");
+        fs::write(&c_path, source).expect("write dynamic-hole C harness");
+        let c_compiler = if cfg!(target_os = "macos") {
+            "clang"
+        } else {
+            "cc"
+        };
+        let status = Command::new(c_compiler)
+            .arg("-O0")
+            .arg(&c_path)
+            .arg(&object_path)
+            .arg(&static_runtime)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .expect("link real-runtime dynamic-hole harness");
+        assert!(status.success(), "dynamic-hole harness failed to link");
+        let output = Command::new(&executable)
+            .output()
+            .expect("execute real-runtime dynamic-hole harness");
+        assert!(
+            output.status.success(),
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::remove_dir_all(&directory).expect("remove dynamic-hole linker directory");
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    #[ignore = "requires `cargo build -p fre-aot-regex-runtime --lib`; links scanner-free generated code to the real continuation runtime"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the opt-in test covers three value contracts, match/no-match, and pending priority in one real-runtime matrix"
+    )]
+    fn linked_host_scanner_free_dynamic_first_hole_uses_real_runtime() {
+        fn host_target() -> Target {
+            if cfg!(target_arch = "x86_64") {
+                if cfg!(target_os = "linux") {
+                    Target::x86_64_linux()
+                } else {
+                    Target::x86_64_macos()
+                }
+            } else if cfg!(target_os = "linux") {
+                Target::aarch64_linux()
+            } else {
+                Target::aarch64_macos()
+            }
+        }
+
+        let window_start = 5_usize;
+        let window_len = DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES
+            .checked_add(16)
+            .expect("linked dynamic window length");
+        let window_end = window_start
+            .checked_add(window_len)
+            .expect("linked dynamic window end");
+        let haystack_len = window_end
+            .checked_add(3)
+            .expect("linked dynamic haystack length");
+        let window = SearchWindow::new(window_start, window_end);
+
+        // Alternating `a,c` rejects both correlated alternatives at every
+        // candidate. The warm `aa` publishes the root `a` cell and only its
+        // second-byte `a` successor; changing that byte to `b` or `c` reaches
+        // a matching or rejecting hole after exactly one native transition.
+        let mut no_match = vec![b'!'; haystack_len];
+        for offset in 0..window_len {
+            no_match[window_start + offset] = if offset.is_multiple_of(2) { b'a' } else { b'c' };
+        }
+        let mut warm = no_match.clone();
+        warm[window_start + 1] = b'a';
+        let mut matching = no_match.clone();
+        matching[window_start + 1] = b'b';
+        let target = host_target();
+
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let program = scanner_free_dynamic_program(scanner_free_correlated_pair_raw(), output);
+            let view = program
+                .native_dynamic_rows_view()
+                .expect("fixed scanner-free dynamic view");
+            assert_eq!(view.root_requirement, None);
+            assert_eq!(view.exact_match_width, Some(2));
+            let (matched, absent, expected_status, expected_start, expected_end) = match output {
+                OutputContract::Exists => (
+                    MatchResult::Exists(true),
+                    MatchResult::Exists(false),
+                    1,
+                    0,
+                    0,
+                ),
+                OutputContract::SelectedEnd => (
+                    MatchResult::SelectedEnd(Some(window_start + 2)),
+                    MatchResult::SelectedEnd(None),
+                    1,
+                    window_start + 2,
+                    window_start + 2,
+                ),
+                OutputContract::Span => (
+                    MatchResult::Span(Some((window_start, window_start + 2))),
+                    MatchResult::Span(None),
+                    1,
+                    window_start,
+                    window_start + 2,
+                ),
+            };
+            prove_scanner_free_dynamic_first_hole(
+                &program,
+                &warm,
+                &matching,
+                window,
+                window_start + 1,
+                None,
+                matched,
+            );
+            prove_scanner_free_dynamic_first_hole(
+                &program,
+                &warm,
+                &no_match,
+                window,
+                window_start + 1,
+                None,
+                absent,
+            );
+            link_real_dynamic_first_hole_cases(
+                &program,
+                target,
+                &format!("{output:?}"),
+                window,
+                &[
+                    LinkedDynamicFirstHoleCase {
+                        warm: &warm,
+                        novel: &matching,
+                        expected_status,
+                        expected_start,
+                        expected_end,
+                    },
+                    LinkedDynamicFirstHoleCase {
+                        warm: &warm,
+                        novel: &no_match,
+                        expected_status: 0,
+                        expected_start: 0,
+                        expected_end: 0,
+                    },
+                ],
+            );
+        }
+
+        let pending_program = scanner_free_dynamic_program(
+            scanner_free_pending_pair_raw(),
+            OutputContract::SelectedEnd,
+        );
+        let pending_end = window_start + 1;
+        prove_scanner_free_dynamic_first_hole(
+            &pending_program,
+            &warm,
+            &matching,
+            window,
+            window_start + 1,
+            Some(pending_end),
+            MatchResult::SelectedEnd(Some(pending_end)),
+        );
+        link_real_dynamic_first_hole_cases(
+            &pending_program,
+            target,
+            "SelectedEndPending",
+            window,
+            &[LinkedDynamicFirstHoleCase {
+                warm: &warm,
+                novel: &matching,
+                expected_status: 1,
+                expected_start: pending_end,
+                expected_end: pending_end,
+            }],
+        );
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
     #[allow(
         clippy::needless_raw_string_hashes,
         clippy::too_many_lines,
