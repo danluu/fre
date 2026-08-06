@@ -9539,7 +9539,7 @@ fn try_warm_direct_exists(
     }
 
     let initial_row = workspace.lazy.row_offset(workspace.lazy.initial)?;
-    let (mut state, mut position, mut consumed, engine_candidate) =
+    let (mut state, mut position, consumed, engine_candidate) =
         match warm_bounded_start(haystack, window, proof)? {
             WarmBoundedStart::Exhausted => return Ok(Some(false)),
             WarmBoundedStart::ResumeAt { position, work } => {
@@ -9573,19 +9573,17 @@ fn try_warm_direct_exists(
             ),
         };
 
+    let mut direct_steps = 0usize;
     let inline_end = position
         .saturating_add(WARM_EXISTS_INLINE_BYTES)
         .min(window.end());
     while position < inline_end {
-        consumed = consumed
-            .checked_add(1)
-            .ok_or(SearchError::ArithmeticOverflow {
-                computation: "warm existence prefix work",
-            })?;
         let byte = haystack[position];
         let class = automaton.byte_classes().class_of(byte);
         let cell = workspace.lazy.direct_cell(state, class)?;
         if cell == LAZY_CELL_UNFILLED {
+            let consumed =
+                settled_warm_direct_exists_prefix_work(consumed, direct_steps)?;
             return continue_mutable_warm_direct_exists(
                 automaton,
                 haystack,
@@ -9596,11 +9594,7 @@ fn try_warm_direct_exists(
                     initial_row,
                     state,
                     position,
-                    work: consumed.checked_sub(1).ok_or(
-                        SearchError::InternalInvariant {
-                            detail: "warm existence prefix omitted its current transition work",
-                        },
-                    )?,
+                    work: consumed,
                     engine_candidate,
                     retained_start_mask: RetainedStartMaskCursor::default(),
                     adaptive_probe: AdaptiveStartProbe::default(),
@@ -9619,12 +9613,15 @@ fn try_warm_direct_exists(
         )]
         {
             position += 1;
+            direct_steps += 1;
         }
         if cell & LAZY_CELL_ACCEPT != 0 {
+            settled_warm_direct_exists_prefix_work(consumed, direct_steps)?;
             return Ok(Some(true));
         }
         let encoded = cell & LAZY_CELL_STATE_MASK;
         if encoded == 0 {
+            settled_warm_direct_exists_prefix_work(consumed, direct_steps)?;
             return Ok(Some(false));
         }
         state = encoded
@@ -9633,6 +9630,8 @@ fn try_warm_direct_exists(
                 detail: "warm existence encoded state underflowed",
             })?;
         if state == initial_row && proof.scanner.is_some() {
+            let consumed =
+                settled_warm_direct_exists_prefix_work(consumed, direct_steps)?;
             return continue_warm_direct_exists(
                 automaton,
                 haystack,
@@ -9647,6 +9646,7 @@ fn try_warm_direct_exists(
             );
         }
     }
+    let consumed = settled_warm_direct_exists_prefix_work(consumed, direct_steps)?;
     if position == window.end() {
         return Ok(Some(false));
     }
@@ -9663,6 +9663,26 @@ fn try_warm_direct_exists(
         consumed,
         engine_candidate,
     )
+}
+
+/// Settle the fixed inline prefix once at its first exit instead of checking
+/// the unlimited work counter before every already-published transition.
+/// `direct_steps` advances only after a filled transition, so a first cache
+/// miss naturally excludes its unread transition while accepting and dead
+/// exits include the transition that selected them.
+fn settled_warm_direct_exists_prefix_work(
+    consumed: u64,
+    direct_steps: usize,
+) -> Result<u64, SearchError> {
+    let direct_steps =
+        u64::try_from(direct_steps).map_err(|_| SearchError::ArithmeticOverflow {
+            computation: "warm existence prefix work",
+        })?;
+    consumed
+        .checked_add(direct_steps)
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "warm existence prefix work",
+        })
 }
 
 #[allow(
@@ -47235,6 +47255,29 @@ mod tests {
             super::complete_warm_direct_span(None, &meter, 1),
             Err(SearchError::ArithmeticOverflow {
                 computation: "search work counter"
+            })
+        ));
+    }
+
+    #[test]
+    fn warm_exists_batched_inline_prefix_preserves_exact_work_and_overflow() {
+        assert_eq!(
+            super::settled_warm_direct_exists_prefix_work(7, 0),
+            Ok(7),
+            "a first unavailable transition is not completed prefix work"
+        );
+        assert_eq!(
+            super::settled_warm_direct_exists_prefix_work(7, 2),
+            Ok(9)
+        );
+        assert_eq!(
+            super::settled_warm_direct_exists_prefix_work(u64::MAX - 2, 2),
+            Ok(u64::MAX)
+        );
+        assert!(matches!(
+            super::settled_warm_direct_exists_prefix_work(u64::MAX - 2, 3),
+            Err(SearchError::ArithmeticOverflow {
+                computation: "warm existence prefix work"
             })
         ));
     }
