@@ -10706,6 +10706,23 @@ fn execute_lazy_resume_loop<const BATCH_WARM: bool>(
     mut position: usize,
     mut pending_end: Option<usize>,
 ) -> Result<(Option<MatchSpan>, usize), SearchError> {
+    // Bind the resumed executor to the already-validated window ceiling once.
+    // Native retained rows and the portable partial executor both authenticate
+    // the resume position before reaching this private loop. Keep an explicit
+    // defensive check for internal callers, then advance a remaining-source
+    // slice with the logical position. `split_first` makes the loop-end test
+    // and source access one operation instead of repeating a full-haystack
+    // bounds check for each resumed byte.
+    let haystack = haystack
+        .get(..window.end())
+        .ok_or(SearchError::InternalInvariant {
+            detail: "resume DFA window exceeds the validated haystack",
+        })?;
+    let mut source = haystack
+        .get(position..)
+        .ok_or(SearchError::InternalInvariant {
+            detail: "resume source position exceeded the validated window",
+        })?;
     let earliest = matches!(
         contract,
         OutputContract::Exists | OutputContract::EarliestEnd
@@ -10724,7 +10741,7 @@ fn execute_lazy_resume_loop<const BATCH_WARM: bool>(
                 let batch_start = position;
                 let mut direct_steps = 0usize;
                 loop {
-                    if position == window.end() {
+                    let Some((&byte, remaining)) = source.split_first() else {
                         settle_resume_direct_steps(
                             meter,
                             batch_start,
@@ -10735,12 +10752,7 @@ fn execute_lazy_resume_loop<const BATCH_WARM: bool>(
                             pending_end.map(|end| MatchSpan::new(window.start(), end)),
                             boundaries,
                         ));
-                    }
-                    let byte = *haystack.get(position).ok_or(
-                        SearchError::InternalInvariant {
-                            detail: "resume source position exceeded the validated window",
-                        },
-                    )?;
+                    };
                     let class = automaton.byte_classes().class_of(byte);
                     let cell = workspace.lazy.direct_cell(cached, class)?;
                     if cell == LAZY_CELL_UNFILLED {
@@ -10757,6 +10769,7 @@ fn execute_lazy_resume_loop<const BATCH_WARM: bool>(
                         position += 1;
                         direct_steps += 1;
                     }
+                    source = remaining;
                     if cell & LAZY_CELL_ACCEPT != 0 {
                         pending_end = Some(position);
                         if earliest {
@@ -10801,18 +10814,13 @@ fn execute_lazy_resume_loop<const BATCH_WARM: bool>(
                 direct_ready_streak = 0;
             }
         }
-        if position == window.end() {
+        let Some((&byte, remaining)) = source.split_first() else {
             return Ok((
                 pending_end.map(|end| MatchSpan::new(window.start(), end)),
                 boundaries,
             ));
-        }
+        };
         meter.charge(1, position)?;
-        let byte = *haystack
-            .get(position)
-            .ok_or(SearchError::InternalInvariant {
-                detail: "resume source position exceeded the validated window",
-            })?;
         let mut warmed_direct = false;
         let transition = match state {
             LazyState::Cached(cached) => {
@@ -10845,6 +10853,7 @@ fn execute_lazy_resume_loop<const BATCH_WARM: bool>(
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "resume input position",
             })?;
+        source = remaining;
         boundaries = boundaries
             .checked_add(1)
             .ok_or(SearchError::ArithmeticOverflow {
