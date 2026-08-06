@@ -21266,9 +21266,34 @@ mod tests {
                 .expect("dynamic graph view");
             assert!(dynamic_view.root_requirement.is_some());
             assert!(compiled.module().prepared_entry_symbol().is_some());
-            assert_ne!(
+            let expected = match target.architecture {
+                Architecture::X86_64 => match x86_start_filter_kind(target.features) {
+                    X86StartFilterKind::Sse2 => StartAccelerator::X86Sse2,
+                    X86StartFilterKind::Avx2 => StartAccelerator::X86Avx2,
+                    X86StartFilterKind::Avx512Bw => StartAccelerator::X86Avx512Bw,
+                },
+                Architecture::Aarch64
+                    if target.operating_system == OperatingSystem::Linux
+                        && target.features.has(CpuFeature::Aarch64Sve2) =>
+                {
+                    StartAccelerator::Aarch64Sve2
+                }
+                Architecture::Aarch64
+                    if target.operating_system == OperatingSystem::Linux
+                        && target.features.has(CpuFeature::Aarch64Sve) =>
+                {
+                    StartAccelerator::Aarch64Sve
+                }
+                Architecture::Aarch64
+                    if target.features.has(CpuFeature::Aarch64Asimd) =>
+                {
+                    StartAccelerator::Aarch64Asimd
+                }
+                Architecture::Aarch64 => StartAccelerator::Scalar,
+            };
+            assert_eq!(
                 compiled.module().start_accelerator(),
-                StartAccelerator::None,
+                expected,
                 "dynamic root scanner receipt: {target:?}"
             );
             assert_eq!(
@@ -21334,6 +21359,179 @@ mod tests {
                     .count(),
                 1,
                 "{target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_root_filter_planning_is_exact_and_declines_unsupported_shapes() {
+        fn membership(bytes: impl IntoIterator<Item = u8>) -> [u64; 4] {
+            let mut words = [0_u64; 4];
+            for byte in bytes {
+                let byte = usize::from(byte);
+                words[byte / 64] |= 1_u64 << (byte % 64);
+            }
+            words
+        }
+
+        let exact_membership = membership([b'a', b'b']);
+        let exact = plan_dynamic_root_filter(NativeDynamicRootRequirement {
+            scan_offset: 7,
+            membership: exact_membership,
+        })
+        .unwrap()
+        .expect("two-byte exact dynamic root filter");
+        assert_eq!(exact.scan_offset, 7);
+        assert!(exact.from_anchored_prefix);
+        assert_eq!(start_filter_membership(exact).unwrap(), exact_membership);
+
+        for requirement in [
+            NativeDynamicRootRequirement {
+                scan_offset: 0,
+                membership: [0; 4],
+            },
+            NativeDynamicRootRequirement {
+                scan_offset: 0,
+                membership: membership(0_u8..=64),
+            },
+            NativeDynamicRootRequirement {
+                scan_offset: 0,
+                membership: membership((0_u8..9).map(|byte| byte * 2)),
+            },
+        ] {
+            assert_eq!(
+                plan_dynamic_root_filter(requirement).unwrap(),
+                None,
+                "unsupported dynamic scanner shape must retain scalar work: {requirement:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one code-byte audit keeps the cached count, loop ownership, and exit cleanup contract together"
+    )]
+    fn x86_dynamic_root_codegen_preserves_cached_count_loop_ownership_and_cleanup() {
+        fn occurrences(code: &[u8], needle: &[u8]) -> usize {
+            code.windows(needle.len())
+                .filter(|window| *window == needle)
+                .count()
+        }
+
+        let loop_count = u8::try_from(NATIVE_ROWS_LOOP_COUNT).unwrap();
+        let initial_row = u8::try_from(NATIVE_ROWS_INITIAL_ROW).unwrap();
+        let mut membership = [0_u64; 4];
+        let byte = usize::from(b'a');
+        membership[byte / 64] |= 1_u64 << (byte % 64);
+        let filter = plan_dynamic_root_filter(NativeDynamicRootRequirement {
+            scan_offset: 1,
+            membership,
+        })
+        .unwrap()
+        .expect("singleton dynamic root filter");
+        let avx512 =
+            FeatureSet::of(CpuFeature::X86Avx512F).with(CpuFeature::X86Avx512Bw);
+        for (features, accelerator, vzeroupper_count) in [
+            (FeatureSet::EMPTY, StartAccelerator::X86Sse2, 0),
+            (
+                FeatureSet::of(CpuFeature::X86Avx2),
+                StartAccelerator::X86Avx2,
+                3,
+            ),
+            (avx512, StartAccelerator::X86Avx512Bw, 3),
+        ] {
+            let emission = lower_x86_64_dynamic_rows_prepared(Some(filter), features).unwrap();
+            let scanner = emission.scanner.expect("dynamic root scanner receipt");
+            assert_eq!(scanner.start_accelerator(), accelerator);
+            assert_eq!(scanner.scan_offset, 1);
+            assert_eq!(scanner.membership, membership);
+            assert!(scanner.vectorized);
+            let code = emission.code.as_slice();
+
+            let count_load = [0x41, 0x8b, 0x43, loop_count];
+            assert_eq!(
+                occurrences(code, &count_load),
+                3,
+                "one entry load and one reload per vector/scalar candidate: {accelerator:?}"
+            );
+            assert_eq!(
+                occurrences(code, &[0xc5, 0xf8, 0x77]),
+                vzeroupper_count,
+                "every vectorized match/no-match/deopt exit needs cleanup: {accelerator:?}"
+            );
+
+            let table_start = code
+                .windows(5)
+                .position(|bytes| bytes == [0x44, 0x0f, 0xb6, 0x14, 0x17])
+                .expect("dynamic table transition");
+            let table_tail = table_start
+                + code[table_start..]
+                    .windows(6)
+                    .position(|bytes| bytes == [0x45, 0x89, 0xd0, 0x41, 0xff, 0xc8])
+                    .expect("dynamic table backedge state update")
+                + 6;
+            let (scan, _) =
+                x86_test_branch_target(code, table_tail).expect("dynamic table backedge");
+            assert_eq!(&code[scan..scan + 3], &[0x48, 0x39, 0xca]);
+
+            let root_compare = scan
+                + code[scan..table_start]
+                    .windows(4)
+                    .position(|bytes| bytes == [0x45, 0x3b, 0x43, initial_row])
+                    .expect("initial-row ownership check");
+            let (root_vector, _) = x86_test_branch_target(code, root_compare + 4)
+                .expect("initial row branches to the graph scanner");
+            assert_eq!(
+                &code[root_vector..root_vector + 6],
+                &[0x48, 0x89, 0xc8, 0x48, 0x29, 0xd0]
+            );
+            let count_test = root_compare
+                + code[root_compare..table_start]
+                    .windows(2)
+                    .position(|bytes| bytes == [0x85, 0xc0])
+                    .expect("cached learned-loop count test");
+            assert!(root_compare < count_test);
+            assert_eq!(occurrences(&code[scan..count_test], &count_load), 0);
+
+            let mut previous_loop_compare = count_test;
+            for loop_row in 0..NATIVE_ROWS_LOOP_ROW_CAPACITY {
+                let displacement = u8::try_from(native_rows_loop_row_offset(loop_row).unwrap())
+                    .unwrap();
+                let comparison = [0x45, 0x3b, 0x43, displacement];
+                let offset = count_test
+                    + code[count_test..table_start]
+                        .windows(comparison.len())
+                        .position(|bytes| bytes == comparison)
+                        .expect("active learned-loop row comparison");
+                assert!(previous_loop_compare < offset);
+                previous_loop_compare = offset;
+                if loop_row + 1 < NATIVE_ROWS_LOOP_ROW_CAPACITY {
+                    let live_count = u8::try_from(loop_row + 1).unwrap();
+                    assert!(code[offset..table_start]
+                        .windows(3)
+                        .any(|bytes| bytes == [0x83, 0xf8, live_count]));
+                }
+            }
+            assert!(previous_loop_compare < table_start);
+        }
+
+        let scalar = lower_x86_64_dynamic_rows_prepared(
+            None,
+            FeatureSet::of(CpuFeature::X86Avx2),
+        )
+        .unwrap();
+        assert_eq!(scalar.scanner, None);
+        assert!(scalar.code.windows(5).any(|bytes| {
+            bytes == [0x41, 0x83, 0x7b, loop_count, 0]
+        }));
+        assert_eq!(occurrences(&scalar.code, &[0x41, 0x8b, 0x43, loop_count]), 0);
+        assert_eq!(occurrences(&scalar.code, &[0xc5, 0xf8, 0x77]), 0);
+        for loop_row in 0..NATIVE_ROWS_LOOP_ROW_CAPACITY {
+            let displacement = u8::try_from(native_rows_loop_row_offset(loop_row).unwrap()).unwrap();
+            assert_eq!(
+                occurrences(&scalar.code, &[0x45, 0x3b, 0x43, displacement]),
+                0
             );
         }
     }
@@ -21447,6 +21645,8 @@ mod tests {
         let c_path = directory.join("dynamic.c");
         let executable = directory.join("dynamic");
         fs::write(&object, compiled.object()).expect("write dynamic object");
+        let initial_loop_assertion =
+            "if(status!=1||r.start!=0||r.end!=0||fallback_calls!=0||deopt_calls!=0||preflight_calls!=1)return 19;";
         let source = format!(
             r#"#include <stddef.h>
 #include <stdint.h>
@@ -21467,7 +21667,7 @@ extern uint32_t {symbol}(handle_t,const unsigned char*,size_t,size_t,size_t,resu
 static const unsigned char identity[32] = {{{identity}}};
 static unsigned char haystack[80];
 static unsigned char classes[256];
-static uint32_t cells[1];
+static uint32_t cells[2];
 static rows_t rows;
 static int mode, preflight_calls, fallback_calls, deopt_calls;
 static void init_rows(void) {{
@@ -21475,7 +21675,7 @@ static void init_rows(void) {{
   memset(&rows,0,sizeof(rows));
   rows.rows_address=(size_t)(uintptr_t)cells;
   rows.class_map_address=(size_t)(uintptr_t)classes;
-  rows.live_cells=1; rows.row_stride=1; rows.initial_row=0;
+  rows.live_cells=2; rows.row_stride=1; rows.initial_row=0;
   rows.unfilled_cell=UINT32_MAX; rows.accept_mask=UINT32_C(0x80000000);
   rows.next_row_token_mask=UINT32_C(0x7fffffff); rows.cache_identity=77;
 }}
@@ -21491,7 +21691,7 @@ uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t h,const unsigned cha
 uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r) {{
   deopt_calls++;
   if(h==NULL)return 5;
-  if(p!=haystack||n!=sizeof(haystack)||s!=5||e!=69||mode<5||mode>7)return 87;
+  if(p!=haystack||n!=sizeof(haystack)||s!=5||e!=69||mode<5||mode>11)return 87;
   r->start=123;r->end=456;return 77;
 }}
 uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_preflight_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*d,preflight_t*out) {{
@@ -21518,6 +21718,14 @@ int main(void) {{
   if(status!=77||r.start!=123||r.end!=456||fallback_calls!=0||deopt_calls!=1||preflight_calls!=1)return 15;
   mode=7;rows.initial_flags=1;r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
   if(status!=77||r.start!=123||r.end!=456||fallback_calls!=0||deopt_calls!=1||preflight_calls!=1)return 16;
+  init_rows();mode=8;cells[0]=2;cells[1]=2;r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
+  if(status!=0||r.start!=0||r.end!=0||fallback_calls!=0||deopt_calls!=0||preflight_calls!=1)return 18;
+  init_rows();mode=9;rows.learned_loop_row_count=1;rows.learned_loop_rows[0]=0;cells[0]=UINT32_C(0x80000000);r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
+  {initial_loop_assertion}
+  init_rows();mode=10;rows.learned_loop_row_count=1;rows.learned_loop_rows[0]=1;cells[0]=2;cells[1]=UINT32_C(0x80000000);r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
+  if(status!=77||r.start!=123||r.end!=456||fallback_calls!=0||deopt_calls!=1||preflight_calls!=1)return 20;
+  init_rows();mode=11;rows.learned_loop_row_count=5;r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
+  if(status!=77||r.start!=123||r.end!=456||fallback_calls!=0||deopt_calls!=1||preflight_calls!=1)return 21;
   mode=0;rows.initial_flags=0;r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}(NULL,haystack,sizeof(haystack),5,69,&r);
   if(status!=5||r.start!=91||r.end!=92||fallback_calls!=0||deopt_calls!=0||preflight_calls!=1)return 17;
   return 0;
