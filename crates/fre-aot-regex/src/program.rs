@@ -3750,6 +3750,12 @@ impl CompiledProgram {
                 "partial resume window was not admitted by combined preflight",
             ));
         }
+        let canonical_pending = self.preflight_partial_resume_pending(resume_state)?;
+        if canonical_pending != pending_end.is_some() {
+            return Err(CompileError::InternalInvariant(
+                "preflight-authenticated pending mode disagrees with the artifact",
+            ));
+        }
         self.search_from_consumed_preflight_retained_partial_resume_with_workspace(
             haystack,
             window,
@@ -3787,6 +3793,59 @@ impl CompiledProgram {
         resume_position: usize,
         pending_end: Option<usize>,
     ) -> Result<MatchResult, CompileError> {
+        let window = Self::take_preflight_partial_resume_ticket(haystack, workspace)?;
+        let canonical_pending = self.preflight_partial_resume_pending(resume_state)?;
+        if canonical_pending != pending_end.is_some() {
+            return Err(CompileError::InternalInvariant(
+                "preflight-authenticated pending mode disagrees with the artifact",
+            ));
+        }
+        self.search_from_consumed_preflight_retained_partial_resume_with_workspace(
+            haystack,
+            window,
+            workspace,
+            resume_state,
+            resume_position,
+            pending_end,
+        )
+    }
+
+    /// Continue a ticketed native hole while deriving pending mode from the
+    /// canonical resume state rather than a redundant machine-ABI flag.
+    ///
+    /// The raw endpoint is meaningful only when the authenticated resume state
+    /// carries pending priority. This is the private entry used by current AOT
+    /// wrappers; the checked Option-bearing seam above remains available for
+    /// direct callers and older runtime adapters.
+    #[doc(hidden)]
+    #[inline]
+    pub fn search_from_preflight_retained_partial_resume_ticket_inferred_with_workspace(
+        &self,
+        haystack: &[u8],
+        workspace: &mut ProgramWorkspace,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end: usize,
+    ) -> Result<MatchResult, CompileError> {
+        let window = Self::take_preflight_partial_resume_ticket(haystack, workspace)?;
+        let pending_end = self
+            .preflight_partial_resume_pending(resume_state)?
+            .then_some(pending_end);
+        self.search_from_consumed_preflight_retained_partial_resume_with_workspace(
+            haystack,
+            window,
+            workspace,
+            resume_state,
+            resume_position,
+            pending_end,
+        )
+    }
+
+    #[inline]
+    fn take_preflight_partial_resume_ticket(
+        haystack: &[u8],
+        workspace: &mut ProgramWorkspace,
+    ) -> Result<SearchWindow, CompileError> {
         let window = workspace
             .partial
             .as_deref_mut()
@@ -3805,16 +3864,22 @@ impl CompiledProgram {
                 haystack_len: haystack.len(),
             });
         }
-        self.search_from_consumed_preflight_retained_partial_resume_with_workspace(
-            haystack,
-            window,
-            workspace,
-            resume_state,
-            resume_position,
-            pending_end,
-        )
+        Ok(window)
     }
 
+    #[inline]
+    fn preflight_partial_resume_pending(
+        &self,
+        resume_state: usize,
+    ) -> Result<bool, CompileError> {
+        self.partial_dfa()
+            .and_then(|partial| partial.resume_pending(resume_state))
+            .ok_or(CompileError::InternalInvariant(
+                "preflight-authenticated partial resume state is outside the artifact",
+            ))
+    }
+
+    #[inline]
     fn search_from_consumed_preflight_retained_partial_resume_with_workspace(
         &self,
         haystack: &[u8],
@@ -3835,19 +3900,6 @@ impl CompiledProgram {
                 "preflight-authenticated partial resume has no retained workspace",
             ),
         )?;
-        let partial = self.partial_dfa().ok_or(CompileError::InternalInvariant(
-            "preflight-authenticated partial resume has no retained rows",
-        ))?;
-        let canonical_pending = partial.resume_pending(resume_state).ok_or(
-            CompileError::InternalInvariant(
-                "preflight-authenticated partial resume state is outside the artifact",
-            ),
-        )?;
-        if canonical_pending != pending_end.is_some() {
-            return Err(CompileError::InternalInvariant(
-                "preflight-authenticated pending mode disagrees with the artifact",
-            ));
-        }
         if partial_workspace
             .resume
             .as_ref()
@@ -11384,6 +11436,32 @@ mod tests {
         let expected = reference
             .search(&haystack, SearchWindow::full(&haystack))
             .expect("reference search");
+        let mut inferred = limited.prepare_workspace().expect("inferred workspace");
+        let window = SearchWindow::full(&haystack);
+        assert_eq!(
+            limited
+                .preflight_retained_partial_with_workspace(
+                    &haystack,
+                    window,
+                    &mut inferred,
+                    limited.artifact_identity(),
+                )
+                .expect("inferred preflight"),
+            RetainedPartialPreflight::Enter(window)
+        );
+        assert_eq!(
+            limited
+                .search_from_preflight_retained_partial_resume_ticket_inferred_with_workspace(
+                    &haystack,
+                    &mut inferred,
+                    resume.state,
+                    resume.position,
+                    0xfeed_face,
+                )
+                .expect("inferred no-pending resume"),
+            expected,
+            "a canonical no-pending state must ignore the raw endpoint word"
+        );
         let mut workspace = limited.prepare_workspace().expect("workspace");
         assert_eq!(
             limited
@@ -12639,13 +12717,14 @@ mod tests {
                     resume.pending_end,
                 )
             } else {
-                limited.search_from_preflight_retained_partial_resume_ticket_with_workspace(
-                    &haystack,
-                    &mut resumed,
-                    resume.state,
-                    resume.position,
-                    resume.pending_end,
-                )
+                limited
+                    .search_from_preflight_retained_partial_resume_ticket_inferred_with_workspace(
+                        &haystack,
+                        &mut resumed,
+                        resume.state,
+                        resume.position,
+                        resume.pending_end.unwrap_or(usize::MAX),
+                    )
             };
             assert_eq!(
                 actual.unwrap(),

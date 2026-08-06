@@ -42,10 +42,11 @@
 //! that authenticated call admits first and runs the portable proofs only on
 //! a decline. If a native scan then reaches a partial-DFA hole, the current
 //! compiler continues the same exclusive session through
-//! [`fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v1`].
+//! [`fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v2`].
 //! Its single-use preflight ticket replaces repeated program and window
-//! authentication while the compact canonical resume-state index is still
-//! checked before K0 continues without replaying the prefix. The fully authenticating
+//! authentication and supplies pending mode from the compact canonical
+//! resume-state index before K0 continues without replaying the prefix. The
+//! fully authenticating
 //! [`fre_aot_regex_runtime_search_exclusive_from_partial_v1`] remains available
 //! for older generated objects.
 //! A variable-width Span table that completes locally with only its selected
@@ -421,6 +422,23 @@ impl PreparedAotRegex {
     ) -> Result<MatchResult, CompileError> {
         self.program
             .search_from_preflight_retained_partial_resume_ticket_with_workspace(
+                haystack,
+                &mut self.workspace,
+                resume_state,
+                resume_position,
+                pending_end,
+            )
+    }
+
+    fn search_from_preflight_retained_partial_resume_ticket_inferred(
+        &mut self,
+        haystack: &[u8],
+        resume_state: usize,
+        resume_position: usize,
+        pending_end: usize,
+    ) -> Result<MatchResult, CompileError> {
+        self.program
+            .search_from_preflight_retained_partial_resume_ticket_inferred_with_workspace(
                 haystack,
                 &mut self.workspace,
                 resume_state,
@@ -1284,6 +1302,58 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_from_partial_pre
     .unwrap_or(STATUS_RUNTIME_FAILURE)
 }
 
+/// Continue a combined-preflight transaction without a redundant pending-mode
+/// argument.
+///
+/// The authenticated canonical resume state determines whether `pending_end`
+/// is meaningful. A no-pending state ignores that machine word; a pending
+/// state retains it as the selected endpoint already committed by native rows.
+/// The single-use workspace ticket supplies the admitted window exactly as in
+/// the compact-v1 entry.
+///
+/// # Safety
+///
+/// This function may only be called by the compiler-emitted wrapper after its
+/// immediately preceding combined preflight admitted local native execution
+/// for this handle and haystack. The handle, haystack, and result pointer must
+/// remain live, aligned, disjoint, and exclusively owned until this immediate
+/// continuation returns. `resume_state`, `resume_position`, and a meaningful
+/// `pending_end` must be the native core's authenticated outputs.
+#[unsafe(no_mangle)]
+#[allow(
+    unsafe_code,
+    clippy::too_many_arguments,
+    reason = "the compact compiler-private continuation maps one native payload"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v2(
+    handle: FreAotRegexExclusiveHandleV1,
+    haystack_ptr: *const u8,
+    haystack_len: usize,
+    result_ptr: *mut FreAotRegexResultV1,
+    resume_state: usize,
+    resume_position: usize,
+    pending_end: usize,
+) -> u32 {
+    // SAFETY: the compiler-owned ticket proves that the immediately preceding
+    // preflight authenticated these live allocations for exclusive use.
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        let prepared = &mut *handle.0.cast::<PreparedAotRegex>();
+        let haystack = std::slice::from_raw_parts(haystack_ptr, haystack_len);
+        let Ok(found) = prepared.search_from_preflight_retained_partial_resume_ticket_inferred(
+            haystack,
+            resume_state,
+            resume_position,
+            pending_end,
+        ) else {
+            return STATUS_RUNTIME_FAILURE;
+        };
+        let (status, result) = encode_match_result(found);
+        result_ptr.write(result);
+        status
+    }))
+    .unwrap_or(STATUS_RUNTIME_FAILURE)
+}
+
 /// Recover a Span start after an authenticated native retained-row completion
 /// selected only its endpoint.
 ///
@@ -2096,6 +2166,9 @@ mod tests {
         assert!(!C_API_V1_HEADER.contains(
             "fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v1"
         ));
+        assert!(!C_API_V1_HEADER.contains(
+            "fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v2"
+        ));
 
         let _: unsafe extern "C" fn(*const u8, usize, *mut FreAotRegexPreparedHandleV1) -> u32 =
             fre_aot_regex_runtime_prepare_v1;
@@ -2188,6 +2261,15 @@ mod tests {
             u32,
             usize,
         ) -> u32 = fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v1;
+        let _: unsafe extern "C" fn(
+            FreAotRegexExclusiveHandleV1,
+            *const u8,
+            usize,
+            *mut FreAotRegexResultV1,
+            usize,
+            usize,
+            usize,
+        ) -> u32 = fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v2;
         // SAFETY: the malformed discriminator is rejected before dereference.
         assert_eq!(
             unsafe {

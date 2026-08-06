@@ -402,8 +402,9 @@ struct NativeDfaEmission {
 /// public output or marshals the continuation only after classifying status.
 /// A match uses x86 R10/R11 or AArch64 X6/X7 for start/end (SelectedEnd uses
 /// only the latter). A resume uses x86 R10/RDX/R11 or AArch64 X6/X2/X7 for
-/// state/position/pending-end. Exists has no match payload and uses the same
-/// pending-end register with the no-pending sentinel on resume.
+/// state/position/pending-end. The canonical resume state already authenticates
+/// whether a pending endpoint exists, so the endpoint register is ignored for
+/// a no-pending state and need not be materialized by Exists.
 /// That local contract may therefore enter after the raw checks without
 /// weakening any public boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -620,7 +621,7 @@ const PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL: usize = 11;
 
 const RUNTIME_SYMBOL_NAME: &str = "fre_aot_regex_runtime_search_v1";
 const PARTIAL_RUNTIME_SYMBOL_NAME: &str =
-    "fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v1";
+    "fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v2";
 const PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_v1";
 const PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME: &str =
@@ -9881,9 +9882,6 @@ fn lower_x86_64_dfa_with_entry_contract(
         assembler.instruction(&subtract_base)?;
         if register_outcome {
             assembler.instruction(&[0x49, 0x89, 0xc2])?; // r10 = resume state
-            if layout.output == OutputContract::Exists {
-                assembler.instruction(&[0x49, 0xc7, 0xc3, 0xff, 0xff, 0xff, 0xff])?;
-            }
         } else {
             assembler.instruction(&[0x49, 0x89, 0x40, 0x10])?; // resume_state
             assembler.instruction(&[0x49, 0x89, 0x50, 0x18])?; // resume_position
@@ -10243,7 +10241,6 @@ fn lower_x86_64_partial_prepared(
     let native_match = assembler.label()?;
     let native_resume = assembler.label()?;
     let native_selected_end = span_recovery.then(|| assembler.label()).transpose()?;
-    let native_pending_ready = assembler.label()?;
     let native_invalid = assembler.label()?;
     let fallback_runtime = assembler.label()?;
 
@@ -10388,14 +10385,10 @@ fn lower_x86_64_partial_prepared(
 
     assembler.bind(native_resume)?;
     // Convert the core's r10/rdx/r11 state, position, and pending endpoint into
-    // the compact private ABI. Only pending mode and endpoint use SysV stack
-    // arguments; identity and window stay in the consumed preflight ticket.
-    assembler.instruction(&[0x4c, 0x89, 0x5c, 0x24, 0x08])?;
-    assembler.instruction(&[0x48, 0xc7, 0x04, 0x24, 0, 0, 0, 0])?;
-    assembler.instruction(&[0x49, 0x83, 0xfb, 0xff])?;
-    assembler.branch(&[0x0f, 0x84], native_pending_ready)?;
-    assembler.instruction(&[0x48, 0xc7, 0x04, 0x24, 1, 0, 0, 0])?;
-    assembler.bind(native_pending_ready)?;
+    // the compact private ABI. The canonical resume state supplies pending
+    // mode, so only the raw endpoint occupies a SysV stack argument; identity
+    // and window stay in the consumed preflight ticket.
+    assembler.instruction(&[0x4c, 0x89, 0x1c, 0x24])?;
     assembler.instruction(&[0x49, 0x89, 0xd1])?; // position -> r9
     assembler.instruction(&[0x4d, 0x89, 0xd0])?; // state -> r8
     assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
@@ -15695,16 +15688,14 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     assembler.branch(scan)?;
 
     assembler.bind(partial_resume)?;
-    if let Some(partial) = layout.partial {
+    if layout.partial.is_some() {
         assembler.instruction(aarch64_cmp_x(2, 3)?)?;
         assembler.branch_cond(AARCH64_EQ, finish)?;
-        aarch64_load_u32_constant(&mut assembler, 12, partial.hole_token_base)?;
+        // The sole incoming edge loaded this exact hole base into X12 for its
+        // unsigned range test. Keep that value live across the cold branch
+        // instead of rematerializing one or two constant instructions.
         assembler.instruction(aarch64_sub_x_reg(6, 6, 12)?)?;
-        if register_outcome {
-            if layout.output == OutputContract::Exists {
-                aarch64_load_u64_constant(&mut assembler, 7, u64::MAX)?;
-            }
-        } else {
+        if !register_outcome {
             assembler.instruction(aarch64_store_x(6, 4, 16)?)?;
             assembler.instruction(aarch64_store_x(2, 4, 24)?)?;
             if layout.output == OutputContract::Exists {
@@ -16029,7 +16020,6 @@ fn lower_aarch64_partial_prepared(
     let native_match = assembler.label()?;
     let native_resume = assembler.label()?;
     let native_selected_end = span_recovery.then(|| assembler.label()).transpose()?;
-    let native_pending_ready = assembler.label()?;
     let native_invalid = assembler.label()?;
     let fallback_runtime = assembler.label()?;
 
@@ -16165,15 +16155,11 @@ fn lower_aarch64_partial_prepared(
 
     assembler.bind(native_resume)?;
     // Convert the core's x6/x2/x7 state, position, and pending endpoint into
-    // the compact eight-register ABI; the preflight ticket owns the window.
+    // the compact seven-register ABI; the canonical resume state supplies
+    // pending mode and the preflight ticket owns the window.
     assembler.instruction(aarch64_mov_x(5, 2)?)?;
     assembler.instruction(aarch64_mov_x(4, 6)?)?;
-    assembler.instruction(aarch64_movz_w(6, 0)?)?;
-    aarch64_load_u64_constant(&mut assembler, 10, u64::MAX)?;
-    assembler.instruction(aarch64_cmp_x(7, 10)?)?;
-    assembler.branch_cond(AARCH64_EQ, native_pending_ready)?;
-    assembler.instruction(aarch64_movz_w(6, 1)?)?;
-    assembler.bind(native_pending_ready)?;
+    assembler.instruction(aarch64_mov_x(6, 7)?)?;
     assembler.instruction(aarch64_load_x_imm(0, 31, 0)?)?;
     assembler.instruction(aarch64_load_x_imm(1, 31, 8)?)?;
     assembler.instruction(aarch64_load_x_imm(2, 31, 16)?)?;
@@ -19857,7 +19843,7 @@ mod tests {
             .expect("partial prepared view");
 
         let (x86, x86_relocations) = lower_x86_64_partial_prepared(&view).unwrap();
-        assert_eq!(x86.len(), 326, "x86 combined prepared wrapper size");
+        assert_eq!(x86.len(), 303, "x86 combined prepared wrapper size");
         assert_eq!(
             x86_relocations
                 .iter()
@@ -19922,7 +19908,7 @@ mod tests {
         let (aarch64, aarch64_relocations) = lower_aarch64_partial_prepared(&view).unwrap();
         assert_eq!(
             aarch64.len(),
-            324,
+            296,
             "AArch64 combined prepared wrapper size"
         );
         assert_eq!(
@@ -21024,7 +21010,7 @@ mod tests {
                     );
                     for instruction in [
                         [0x4d, 0x89, 0x19].as_slice(),
-                        [0x4c, 0x89, 0x5c, 0x24, 0x08].as_slice(),
+                        [0x4c, 0x89, 0x1c, 0x24].as_slice(),
                         [0x49, 0x89, 0xd1].as_slice(),
                         [0x4d, 0x89, 0xd0].as_slice(),
                     ] {
@@ -21033,6 +21019,12 @@ mod tests {
                             "{target:?} omitted register-outcome marshaling {instruction:02x?}"
                         );
                     }
+                    assert!(
+                        !code
+                            .windows(4)
+                            .any(|bytes| bytes == [0x49, 0x83, 0xfb, 0xff]),
+                        "{target:?} retained redundant pending-mode classification"
+                    );
                 }
                 Architecture::Aarch64 => {
                     assert_eq!(
@@ -21082,10 +21074,14 @@ mod tests {
                         aarch64_store_x(7, 5, 0).unwrap(),
                         aarch64_mov_x(5, 2).unwrap(),
                         aarch64_mov_x(4, 6).unwrap(),
-                        aarch64_movz_w(6, 0).unwrap(),
+                        aarch64_mov_x(6, 7).unwrap(),
                     ] {
                         assert!(words.contains(&instruction), "{target:?}/{instruction:#x}");
                     }
+                    assert!(
+                        !words.contains(&aarch64_cmp_x(7, 10).unwrap()),
+                        "{target:?} retained redundant pending-mode classification"
+                    );
                 }
             }
         }
@@ -21372,8 +21368,7 @@ mod tests {
             .prepared_entry_symbol()
             .expect("prepared symbol");
         let identity = compiled.program().artifact_identity();
-        let pending_present = u8::from(hole.pending_end.is_some());
-        let pending_end = hole.pending_end.unwrap_or(0);
+        let pending_end = hole.pending_end.unwrap_or(usize::MAX);
         let mut source = format!(
             "#include <stddef.h>\n#include <stdint.h>\n#include <string.h>\n\
              typedef void *handle_t;typedef struct{{size_t start;size_t end;}} window_t;\n\
@@ -21398,12 +21393,12 @@ mod tests {
                   s!={window_start}U||e!={window_end}U||memcmp(d,identity,32U)!=0)return 88U;\
                if(expect_path==2){{w->start={narrowed_start}U;w->end=e;return 6U;}}\
                if(expect_path==3){{r[0]=321U;r[1]=654U;return 76U;}}return 88U;}}\n\
-             uint32_t fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v1(\
+             uint32_t fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v2(\
                handle_t h,const unsigned char*p,size_t n,size_t*r,\
-               size_t state,size_t position,uint32_t pending,size_t pend){{\
+               size_t state,size_t position,size_t pend){{\
                if(expect_path!=2||h!=(handle_t)(uintptr_t)0x1234U||p!=haystack||n!=sizeof(haystack)||\
                   r==NULL||\
-                  state!={}U||position!={}U||pending!={pending_present}U||pend!={pending_end}U)return 90U;\
+                  state!={}U||position!={}U||pend!={pending_end}U)return 90U;\
                r[0]=123U;r[1]=456U;return 77U;}}\n\
              int main(void){{size_t r[2]={{91U,92U}};uint32_t status;\n",
             c_bytes(&identity),
@@ -22010,8 +22005,8 @@ mod tests {
              uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,size_t*r){{\
                fallback_calls++;if(mode!=2||h!=(handle_t)(uintptr_t)0x1234U||p!=haystack||n!=sizeof(haystack)||s!=0U||e!=100U||r==NULL)return 89U;\
                r[0]=9U;r[1]=9U;return 77U;}}\n\
-             uint32_t fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v1(handle_t h,const unsigned char*p,size_t n,size_t*r,size_t a,size_t b,uint32_t c,size_t z){{\
-               (void)h;(void)p;(void)n;(void)r;(void)a;(void)b;(void)c;(void)z;return 90U;}}\n\
+             uint32_t fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v2(handle_t h,const unsigned char*p,size_t n,size_t*r,size_t a,size_t b,size_t z){{\
+               (void)h;(void)p;(void)n;(void)r;(void)a;(void)b;(void)z;return 90U;}}\n\
              uint32_t fre_aot_regex_runtime_search_exclusive_partial_preflight_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,size_t*r,const unsigned char*d,window_t*w){{\
                preflight_calls++;if(h!=(handle_t)(uintptr_t)0x1234U||p!=haystack||n!=sizeof(haystack)||s!=0U||e!=sizeof(haystack)||r==NULL||w==NULL||memcmp(d,identity,32U)!=0)return 88U;\
                if(mode==0){{r[0]=123U;r[1]=123U;return 1U;}}\
